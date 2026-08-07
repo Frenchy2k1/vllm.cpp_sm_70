@@ -79,6 +79,17 @@ extern "C" {
 // (spills) as hand-CUDA at BK=128.
 #include "gdn_decode_h48.h"
 #include "gdn_decode_h32.h"
+// KDA chunk-prefill family (Kimi-Linear; H=32). The FLA chunk_kda_with_fused_gate
+// forward: kda_gate_cumsum -> kkt(inter+intra) -> solve_tril (REUSES gdn_tril_h32)
+// -> recompute_w_u (kda_wu) -> chunk_delta_h (kda_deltah_h32) -> chunk_gla_o
+// (kda_gla_o). See triton_kernels/{kda_gate_cumsum,chunk_kda_kkt,recompute_w_u_kda,
+// chunk_gla_o}.py + chunk_delta_h.py (kda_deltah pin) + .agents/specs/kimi-linear.md §17.
+#include "kda_gate_cumsum.h"
+#include "kda_kkt_inter.h"
+#include "kda_kkt_intra.h"
+#include "kda_wu.h"
+#include "kda_deltah_h32.h"
+#include "kda_gla_o.h"
 }
 #endif
 
@@ -4603,6 +4614,13 @@ struct GdnAotModuleOnce {
   std::once_flag wu_h32;
   std::once_flag decode_h48;
   std::once_flag decode_h32;
+  // KDA chunk-prefill family (Kimi-Linear; H=32).
+  std::once_flag kda_gate_cumsum;
+  std::once_flag kda_kkt_inter;
+  std::once_flag kda_kkt_intra;
+  std::once_flag kda_wu;
+  std::once_flag kda_deltah_h32;
+  std::once_flag kda_gla_o;
 };
 
 GdnAotModuleOnce& GdnAotModules() {
@@ -4925,6 +4943,220 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
   return true;
 }
 #endif  // VLLM_CPP_TRITON
+
+// ===========================================================================
+// KDA CHUNK-PREFILL (kKdaChunkPrefill) — the chunked forward of the per-K-channel
+// gated-delta linear attention through the vendored FLA Triton-AOT cubins, vLLM's
+// ACTUAL prefill path (kimi_gdn_linear_attn.py:141 chunk_kda_with_fused_gate).
+// Mirrors LaunchChunkedPrefill's structure but for the KDA per-K-channel kernels;
+// decode (T==1) and any non-pinned shape fall back to the recurrence.
+// ===========================================================================
+#ifdef VLLM_CPP_TRITON
+void EnsureKdaChunkLoaded() {
+  auto& m = GdnAotModules();
+  std::call_once(m.kda_gate_cumsum, load_kda_gate_cumsum);
+  std::call_once(m.kda_kkt_inter, load_kda_kkt_inter);
+  std::call_once(m.kda_kkt_intra, load_kda_kkt_intra);
+  std::call_once(m.tril_h32, load_gdn_tril_h32);  // REUSE gdn_tril_h32 (byte-identical sig)
+  std::call_once(m.kda_wu, load_kda_wu);
+  std::call_once(m.kda_deltah_h32, load_kda_deltah_h32);
+  std::call_once(m.kda_gla_o, load_kda_gla_o);
+}
+
+template <typename Tin>
+__global__ void KdaToBf16Kernel(const Tin* in, __nv_bfloat16* out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(Load(in, i));  // Load handles f32/bf16
+}
+__global__ void KdaBf16ToF32Kernel(const __nv_bfloat16* in, float* out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __bfloat162float(in[i]);
+}
+void KdaCastTensorToBf16(cudaStream_t s, const Tensor& t, __nv_bfloat16* out, int64_t n) {
+  const unsigned nb = static_cast<unsigned>((n + 255) / 256);
+  if (t.dtype == DType::kBF16)
+    KdaToBf16Kernel<__nv_bfloat16><<<nb, 256, 0, s>>>(t.Ptr<__nv_bfloat16>(), out, n);
+  else
+    KdaToBf16Kernel<float><<<nb, 256, 0, s>>>(t.Ptr<float>(), out, n);
+  Check(cudaGetLastError(), "kda chunk cast->bf16 launch");
+}
+
+// The pinned Kimi KDA chunk-prefill orchestration (H=32, Dk=Dv=128, BT=64), a
+// single prefill sequence (state [1,H,Dv,Dk]). Exactly _chunk_kda_fwd_with_
+// cumulative_g's launch order. All scratch stream-ordered + freed on the queue.
+void LaunchKdaChunkPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                           const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                           const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                           const Tensor& qsl, const GdnArgs& /*args*/) {
+  constexpr int64_t H = 32, DK = 128, DV = 128, BT = 64;
+  const int64_t T = q_in.shape[0];
+  const int64_t NT = (T + BT - 1) / BT;  // chunks (single sequence)
+  const int32_t Ti = static_cast<int32_t>(T);
+  const int32_t NTi = static_cast<int32_t>(NT);
+  const int32_t NHi = static_cast<int32_t>(H);  // n_seq(1) * H
+  EnsureKdaChunkLoaded();
+  auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
+
+  // ── chunk metadata: chunk_indices [NT,2] and chunk_offsets [1]=0 (single seq).
+  int32_t* d_cidx = nullptr;
+  int32_t* d_boh = nullptr;
+  Check(cudaMallocAsync(&d_cidx, static_cast<size_t>(2 * NT) * sizeof(int32_t), s),
+        "kda chunk cidx alloc");
+  Check(cudaMallocAsync(&d_boh, sizeof(int32_t), s), "kda chunk boh alloc");
+  Check(cudaMemsetAsync(d_boh, 0, sizeof(int32_t), s), "kda chunk boh zero");
+  GdnBuildChunkIndices<<<1, 32, 0, s>>>(d_cidx, qsl.Ptr<int32_t>(), d_boh, 1);
+  Check(cudaGetLastError(), "kda chunk cidx build");
+
+  // ── bf16 casts of the Triton kernel inputs (q/k/v/g_raw/beta).
+  const size_t nqk = static_cast<size_t>(T) * H * DK;
+  const size_t nv = static_cast<size_t>(T) * H * DV;
+  const size_t nbeta = static_cast<size_t>(T) * H;
+  __nv_bfloat16 *qb = nullptr, *kb = nullptr, *vb = nullptr, *grb = nullptr, *betab = nullptr;
+  Check(cudaMallocAsync(&qb, nqk * sizeof(__nv_bfloat16), s), "kda chunk qb alloc");
+  Check(cudaMallocAsync(&kb, nqk * sizeof(__nv_bfloat16), s), "kda chunk kb alloc");
+  Check(cudaMallocAsync(&vb, nv * sizeof(__nv_bfloat16), s), "kda chunk vb alloc");
+  Check(cudaMallocAsync(&grb, nqk * sizeof(__nv_bfloat16), s), "kda chunk grb alloc");
+  Check(cudaMallocAsync(&betab, nbeta * sizeof(__nv_bfloat16), s), "kda chunk betab alloc");
+  KdaCastTensorToBf16(s, q_in, qb, static_cast<int64_t>(nqk));
+  KdaCastTensorToBf16(s, k, kb, static_cast<int64_t>(nqk));
+  KdaCastTensorToBf16(s, v, vb, static_cast<int64_t>(nv));
+  KdaCastTensorToBf16(s, g_raw, grb, static_cast<int64_t>(nqk));
+  KdaCastTensorToBf16(s, beta, betab, static_cast<int64_t>(nbeta));
+
+  // ── scratch (all [0,T)-indexed; the Triton kernels boundary_check the tail).
+  float* g_cum = nullptr;  // [T,H,DK] cumulative gate (exp2-space) f32
+  float* a_raw = nullptr;  // [T,H,BT] strictly-lower A f32
+  float* aqk = nullptr;    // [T,H,BT] causal Aqk f32
+  __nv_bfloat16* a_inv = nullptr;  // [T,H,BT] (I+A)^-1 bf16
+  __nv_bfloat16* w = nullptr;      // [T,H,DK] bf16
+  __nv_bfloat16* u = nullptr;      // [T,H,DV] bf16
+  __nv_bfloat16* kg = nullptr;     // [T,H,DK] bf16
+  __nv_bfloat16* hstate = nullptr; // [NT,H,DV,DK] bf16
+  __nv_bfloat16* v_new = nullptr;  // [T,H,DV] bf16
+  __nv_bfloat16* o_bf = nullptr;   // [T,H,DV] bf16 output
+  const size_t na = static_cast<size_t>(T) * H * BT;
+  const size_t nh = static_cast<size_t>(NT) * H * DV * DK;
+  Check(cudaMallocAsync(&g_cum, nqk * sizeof(float), s), "kda chunk g_cum alloc");
+  Check(cudaMallocAsync(&a_raw, na * sizeof(float), s), "kda chunk a_raw alloc");
+  Check(cudaMallocAsync(&aqk, na * sizeof(float), s), "kda chunk aqk alloc");
+  Check(cudaMallocAsync(&a_inv, na * sizeof(__nv_bfloat16), s), "kda chunk a_inv alloc");
+  Check(cudaMallocAsync(&w, nqk * sizeof(__nv_bfloat16), s), "kda chunk w alloc");
+  Check(cudaMallocAsync(&u, nv * sizeof(__nv_bfloat16), s), "kda chunk u alloc");
+  Check(cudaMallocAsync(&kg, nqk * sizeof(__nv_bfloat16), s), "kda chunk kg alloc");
+  Check(cudaMallocAsync(&hstate, nh * sizeof(__nv_bfloat16), s), "kda chunk hstate alloc");
+  Check(cudaMallocAsync(&v_new, nv * sizeof(__nv_bfloat16), s), "kda chunk v_new alloc");
+  Check(cudaMallocAsync(&o_bf, nv * sizeof(__nv_bfloat16), s), "kda chunk o_bf alloc");
+  // kkt writes only the lower/diagonal blocks of A; solve_tril writes only the 10
+  // lower 16x16 blocks of A_inv, and recompute_w_u reads the FULL [BT,BT] A_inv —
+  // so zero both (cudaMallocAsync returns dirty pool memory in a busy engine).
+  Check(cudaMemsetAsync(a_raw, 0, na * sizeof(float), s), "kda chunk a_raw zero");
+  Check(cudaMemsetAsync(a_inv, 0, na * sizeof(__nv_bfloat16), s), "kda chunk a_inv zero");
+
+  const CUdeviceptr Dqsl = D(qsl.Ptr<int32_t>());
+  const CUdeviceptr Dcidx = D(d_cidx);
+  CUresult r;
+  // (1) fused decay-gate + chunk cumsum: g_raw_bf16 (+a_log,dt_bias) -> g_cum.
+  r = kda_gate_cumsum_default(s, D(grb), D(a_log.data), D(g_cum), D(dt_bias.data), Dqsl, Dcidx,
+                              Ti, NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk gate_cumsum: non-success");
+  // (2)+(3) per-K-channel-gated K.Kᵀ + q.kᵀ -> A(strictly-lower), Aqk(causal).
+  r = kda_kkt_inter_default(s, D(qb), D(kb), D(g_cum), D(betab), D(a_raw), D(aqk), Dqsl, Dcidx, Ti,
+                            NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk kkt_inter: non-success");
+  r = kda_kkt_intra_default(s, D(qb), D(kb), D(g_cum), D(betab), D(a_raw), D(aqk), Dqsl, Dcidx, Ti,
+                            NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk kkt_intra: non-success");
+  // (4) invert the strictly-lower A (WY solve) -> A_inv (REUSE gdn_tril_h32).
+  r = gdn_tril_h32_default(s, D(a_raw), D(a_inv), Dqsl, Dcidx, Ti, NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk solve_tril: non-success");
+  // (5) recompute W, U (+ kg = k*exp2(gn-gk)); q/qg dead (STORE_QG=0).
+  r = kda_wu_default(s, 0, D(kb), 0, D(kg), D(vb), D(betab), D(w), D(u), D(a_inv), D(g_cum), Dqsl,
+                     Dcidx, Ti, NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk recompute_w_u: non-success");
+  // (6) chunked hidden-state scan: k=kg, v=u, gk=g_cum (g dead), h0=ht=state
+  //     -> h(snapshots), v_new, final state. state is fresh zeros (caller).
+  r = kda_deltah_h32_default(s, D(kg), D(u), D(w), D(v_new), 0, D(g_cum), D(hstate),
+                             D(state.data), D(state.data), Dqsl, D(d_boh), Ti, NHi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk delta_h: non-success");
+  // (7) GLA-style output with per-K gk decay -> o_bf.
+  r = kda_gla_o_default(s, D(qb), D(v_new), D(g_cum), D(hstate), D(o_bf), D(aqk), Dqsl, Dcidx, Ti,
+                        NTi);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda kda chunk gla_o: non-success");
+
+  // ── out <- o_bf (cast to f32 or copy bf16).
+  if (out.dtype == DType::kF32) {
+    const unsigned nbo = static_cast<unsigned>((static_cast<int64_t>(nv) + 255) / 256);
+    KdaBf16ToF32Kernel<<<nbo, 256, 0, s>>>(o_bf, out.Ptr<float>(), static_cast<int64_t>(nv));
+    Check(cudaGetLastError(), "kda chunk out cast launch");
+  } else {
+    Check(cudaMemcpyAsync(out.data, o_bf, nv * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, s),
+          "kda chunk out copy");
+  }
+
+  for (void* p : {static_cast<void*>(o_bf), static_cast<void*>(v_new), static_cast<void*>(hstate),
+                  static_cast<void*>(kg), static_cast<void*>(u), static_cast<void*>(w),
+                  static_cast<void*>(a_inv), static_cast<void*>(aqk), static_cast<void*>(a_raw),
+                  static_cast<void*>(g_cum), static_cast<void*>(betab), static_cast<void*>(grb),
+                  static_cast<void*>(vb), static_cast<void*>(kb), static_cast<void*>(qb),
+                  static_cast<void*>(d_boh), static_cast<void*>(d_cidx)})
+    Check(cudaFreeAsync(p, s), "kda chunk scratch free");
+}
+#endif  // VLLM_CPP_TRITON
+
+// Fused per-K-channel decay gate (kda_gate_cumsum's per-token gate, pre-cumsum):
+// g_dec[t,h,d] = -exp(a_log[h]) * softplus(g_raw[t,h,d] + dt_bias[h,d]) (beta=1).
+// Feeds the recurrence fallback when the chunk cubins are unavailable/mismatched.
+__global__ void KdaGateFromRawKernel(const float* g_raw, const float* a_log, const float* dt_bias,
+                                     bool has_bias, float* g_dec, int64_t T, int64_t H, int64_t Dk) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= T * H * Dk) return;
+  const int64_t d = idx % Dk;
+  const int64_t h = (idx / Dk) % H;
+  float x = g_raw[idx];
+  if (has_bias) x += dt_bias[h * Dk + d];
+  const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus(beta=1)
+  g_dec[idx] = -expf(a_log[h]) * sp;
+}
+
+void KdaChunkPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                               const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                               const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                               const Tensor& qsl, const GdnArgs& args) {
+  const int64_t T = q_in.shape[0];
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2];
+  if (T == 0 || hv_n == 0 || dv == 0) return;
+  cudaStream_t s = AsStream(q);
+  const bool has_bias = dt_bias.shape[0] != 0;
+#ifdef VLLM_CPP_TRITON
+  // Fire the vendored chunk cubins only at the exact pinned Kimi KDA geometry, with
+  // the baked scale, a real prompt (T>1), dt_bias present (HAS_BIAS=1 baked), and
+  // the runtime toggle on (VT_KDA_CHUNK_TRITON default ON; =0 restores recurrence).
+  const float baked_scale = 1.0f / std::sqrt(static_cast<float>(dk));
+  const bool geom_ok = (hk_n == 32 && hv_n == 32 && dk == 128 && dv == 128 && has_bias &&
+                        std::fabs(args.scale - baked_scale) <= 1e-6f * baked_scale && T > 1);
+  if (geom_ok && GdnTritonEnvOn("VT_KDA_CHUNK_TRITON")) {
+    LaunchKdaChunkPrefill(s, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, qsl, args);
+    return;
+  }
+#endif
+  // Fallback (non-Triton build, non-pinned shape, decode, or no bias): fuse the gate
+  // on device then run the exact per-K-channel recurrence (byte-for-byte the decode
+  // kernel). Produces the same math as the chunk path up to reduction order.
+  float* g_dec = nullptr;
+  const int64_t ng = T * hv_n * dk;
+  Check(cudaMallocAsync(&g_dec, static_cast<size_t>(ng) * sizeof(float), s),
+        "kda chunk fallback g_dec alloc");
+  const unsigned nb = static_cast<unsigned>((ng + 255) / 256);
+  KdaGateFromRawKernel<<<nb, 256, 0, s>>>(g_raw.Ptr<float>(), a_log.Ptr<float>(),
+                                          has_bias ? dt_bias.Ptr<float>() : nullptr, has_bias,
+                                          g_dec, T, hv_n, dk);
+  Check(cudaGetLastError(), "kda chunk fallback gate launch");
+  Tensor g_t = g_raw;  // same [T,Hv,Dk] f32 contiguous metadata
+  g_t.data = g_dec;
+  KdaGatedDeltaRuleKernelCuda(q, out, q_in, k, v, g_t, beta, state, qsl, args);
+  Check(cudaFreeAsync(g_dec, s), "kda chunk fallback g_dec free");
+}
 
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
@@ -5912,6 +6144,9 @@ struct Registrar {
     RegisterOp(
         OpId::kKdaGatedDeltaRule, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(&KdaGatedDeltaRuleKernelCuda)));
+    RegisterOp(
+        OpId::kKdaChunkPrefill, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<KdaChunkPrefillFn>(&KdaChunkPrefillKernelCuda)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCUDA,
         reinterpret_cast<void*>(

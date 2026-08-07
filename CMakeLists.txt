@@ -1530,6 +1530,64 @@ if(VLLM_CPP_CUDA)
       target_include_directories(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS_INCLUDE_DIR})
     endforeach()
 
+    # ── SANCTIONED Triton AOT: KDA chunk-prefill family (Kimi-Linear; H=32) ──────
+    # FLA ops/kda.py chunk_kda_with_fused_gate forward chain (5 net-new kernels +
+    # a NEW pin of chunk_delta_h.py). Dispatch TryKdaChunkPrefill (VT_KIMI_DEVICE_
+    # KDA_CHUNK) in cuda_gdn.cu (vt::KdaChunkPrefill); the #104 recurrent
+    # vt::KdaGatedDeltaRule stays the portable/decode fallback. Signatures pinned
+    # to the Kimi KDA geometry (H=32, K=V=128, BT=64, BC=16, NC=4); scalar
+    # constants (scale=K^-0.5, softplus beta/threshold, RCP_LN2, DOT_PRECISION)
+    # are baked as kernel literals (Triton AOT mis-packs fp32 scalars). Each line
+    # is byte-identical to the cmake/TritonAOTKernels.cmake declaration (the drift
+    # check compares the two). See .agents/specs/kimi-linear.md §17.
+    set(_KDA_GATE_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/kda_gate_cumsum.py")
+    set(_KDA_KKT_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_kda_kkt.py")
+    set(_KDA_WU_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/recompute_w_u_kda.py")
+    set(_KDA_DELTAH_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_delta_h.py")
+    set(_KDA_GLAO_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_gla_o.py")
+
+    add_triton_kernel(VT_KDA_GATE_CUMSUM_SRCS
+      "${_KDA_GATE_KPY}" kda_gate_cumsum_fwd_kernel kda_gate_cumsum
+      "*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 64, 1, 1"
+      "2,NT,32" 4 2)
+    target_sources(vllm PRIVATE ${VT_KDA_GATE_CUMSUM_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_GATE_CUMSUM_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_KKT_INTER_SRCS
+      "${_KDA_KKT_KPY}" chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter kda_kkt_inter
+      "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 64, 4, 1"
+      "NT,16,32" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_KKT_INTER_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_KKT_INTER_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_KKT_INTRA_SRCS
+      "${_KDA_KKT_KPY}" chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra kda_kkt_intra
+      "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 128, 1"
+      "NT,4,32" 4 2)
+    target_sources(vllm PRIVATE ${VT_KDA_KKT_INTRA_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_KKT_INTRA_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_WU_SRCS
+      "${_KDA_WU_KPY}" recompute_w_u_fwd_kernel kda_wu
+      "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 0, 1, 1"
+      "NT,32,1" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_WU_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_WU_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_DELTAH_H32_SRCS
+      "${_KDA_DELTAH_KPY}" chunk_gated_delta_rule_fwd_kernel_h_blockdim64 kda_deltah_h32
+      "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 32, 128, 128, 64, 64, 0, 1, 1, 1, 1, 1, 1"
+      "2,NH,1" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_DELTAH_H32_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_DELTAH_H32_SRCS_INCLUDE_DIR})
+
+    add_triton_kernel(VT_KDA_GLA_O_SRCS
+      "${_KDA_GLAO_KPY}" chunk_gla_fwd_kernel_o kda_gla_o
+      "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 1"
+      "2,NT,32" 4 3)
+    target_sources(vllm PRIVATE ${VT_KDA_GLA_O_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_KDA_GLA_O_SRCS_INCLUDE_DIR})
+
     # Vendored-tree bookkeeping (call ONCE, after the LAST add_triton_kernel):
     # REGEN writes the MANIFEST (generator versions + triton_kernels/*.py hashes
     # + per-base generation params); the normal builder path verifies those

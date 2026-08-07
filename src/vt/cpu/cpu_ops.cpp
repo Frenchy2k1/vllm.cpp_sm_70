@@ -1414,6 +1414,39 @@ void KdaGatedDeltaRuleKernel(Queue&, Tensor& out, const Tensor& q_in, const Tens
   });
 }
 
+// KDA CHUNK-PREFILL (kKdaChunkPrefill) — CPU reference. There is no portable
+// chunk kernel (the chunk path is the vendored FLA Triton-AOT cubins); the chunked
+// forward computes the SAME per-K-channel gated-delta output as the recurrence up
+// to reduction order, so the CPU reference fuses the gate exactly as FLA's
+// kda_gate_cumsum (g = -exp(a_log)*softplus(g_raw + dt_bias), beta=1 softplus) then
+// runs the proven KdaGatedDeltaRuleKernel recurrence. This keeps the op dual-
+// registered (CPU+CUDA) so the whole-forward CPU gate exercises the wiring; the
+// numerically-meaningful chunked-vs-recurrent comparison runs on the CUDA path.
+void KdaChunkPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                           const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                           const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                           const Tensor& qsl, const GdnArgs& args) {
+  const int64_t T = q_in.shape[0], hv_n = state.shape[1], dk = state.shape[3];
+  const bool has_bias = dt_bias.shape[0] != 0;
+  const float* alp = a_log.Ptr<float>();
+  const float* dbp = has_bias ? dt_bias.Ptr<float>() : nullptr;
+  std::vector<float> g_dec(static_cast<size_t>(T) * hv_n * dk);
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t h = 0; h < hv_n; ++h) {
+      const float a = -std::exp(alp[h]);
+      for (int64_t d = 0; d < dk; ++d) {
+        float x = LoadF32(g_raw, (t * hv_n + h) * dk + d);
+        if (has_bias) x += dbp[h * dk + d];
+        const float sp = x > 20.0f ? x : std::log1p(std::exp(x));  // softplus(beta=1)
+        g_dec[static_cast<size_t>((t * hv_n + h) * dk + d)] = a * sp;
+      }
+    }
+  }
+  Tensor g_t = g_raw;  // same [T,Hv,Dk] f32 contiguous metadata, gated data
+  g_t.data = g_dec.data();
+  KdaGatedDeltaRuleKernel(q, out, q_in, k, v, g_t, beta, state, qsl, args);
+}
+
 // SPECULATIVE (multi-token, slot-snapshotting) gated-delta-rule step.
 // Ported from vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @
 // e24d1b24 — fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN
@@ -2486,6 +2519,9 @@ struct Registrar {
     RegisterOp(
         OpId::kKdaGatedDeltaRule, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(&KdaGatedDeltaRuleKernel)));
+    RegisterOp(
+        OpId::kKdaChunkPrefill, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<KdaChunkPrefillFn>(&KdaChunkPrefillKernel)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCPU,
         reinterpret_cast<void*>(

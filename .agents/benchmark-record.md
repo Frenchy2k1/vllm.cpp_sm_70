@@ -19,6 +19,18 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## KIMI-CHUNK-KDA-P2 — chunk_kda prefill op lands + GB10-validated (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) recompute island REGRESSES 122→102/128 (worse than the recurrence's 122); vLLM ~5× faster on decode; the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, base `origin/main` `5548a731`, GB10 sm_121a, PR #111)
+
+Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy`; the vLLM arm SEQUENTIAL after ours at the §12 recipe (util 0.82, triton MoE, eager, seqs=1; min-avail 15 GiB, no reboot):
+
+| config | env | /128 | tok/s | first-step |
+|---|---|---|---|---|
+| control (recurrence, §15) | `DEVICE_COMPUTE=1 DEVICE_KDA=1` | 122 | 4.24 (steady) | 0.547s |
+| + chunk-prefill | `… DEVICE_KDA_CHUNK=1` | **102** | 4.08 (steady) | 0.522s |
+| vLLM (paged incremental) | util 0.82, triton MoE | (golden) | **~21 median** (16-tok aggregate; 25.3 cold-discarded) | TTFT n/a in 0.25.0 |
+
+**ours/vLLM ≈ 0.20 (vLLM ~5× faster on decode)** — a MEASURED distance (supersedes §14's "HW-forced-indirect"; vLLM 0.25.0 `RequestOutput.metrics` per-token times were absent so the vLLM figure is prefill-amortized 16-token aggregate = a FLOOR on the gap). Unit (RED-first, GB10): `test_ops_kda_chunk_prefill` 2/2·4 — chunk-vs-recurrence mean_abs **4.68e-5**, wrong-gate (a_log+1.0) **3.38e-3 = 72×**. GDN untouched (`test_ops_gdn` 66/66·4242, `test_ops_kda_recurrence` 4/4·8). Regen reproducible ×6 arches (only `kda_*`+MANIFEST changed; GDN cubins byte-identical; drift GREEN). **Why the regression:** the op is unit-correct, but the island's O(n²) recompute applies chunk EVERY decode step over the growing sequence — NOT vLLM's prefill=chunk/decode=recurrent split — so it coin-flips more near-ties than the recurrence (the recurrence matches vLLM's DECODE, both recurrent for t>0; the chunk only matches vLLM's PREFILL, t=0). `VT_KIMI_DEVICE_KDA_CHUNK` STAYS OFF; device-KDA (122, OFF) best. The op + regen are the validated prefill half of the REAL lever (e) paged-incremental decode (chunk-prefill ONCE + recurrent-decode over PERSISTENT state; kills the O(n²) — the coupled STRICT+speed lever). The chunk-every-step measurement PROVES the recompute vehicle cannot host the chunk lever.
+
 ## QUANT-CT-MXFP4-FLASH-PTXAS — the ptxas-lineage hypothesis is REFUTED three ways: vLLM's fa2 wheel ships NO sm_12x cubin (only CUDA-13.0 PTX-ISA-9.0 compute_80 PTX, driver-JIT'd on GB10), an "old CUDA 12.x ptxas" cannot even target sm_121a, and a same-params cuModule A/B shows our-PTX and vLLM's-OWN-PTX schedule the c8 decode kernel identically (~144 us) across driver-JIT / ptxas 13.0 / ptxas 13.2 — the +10 us/call engine gap is ENGINE CONTEXT, not flash codegen (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-PTXAS`, base `362a3c99`, GB10 sm_121a, PR #82)
 
 #75 attributed the residual +10 us/call c8 flash gap (ours ~167 vs vLLM ~157) to "vLLM's wheel `ptxas` SASS-scheduling quality (older CUDA 12.x lineage)" and OWED obtaining that ptxas and A/B'ing it. This row did. **The lineage hypothesis dies at the premise, then again at the measurement.**

@@ -175,6 +175,25 @@ bool DeviceKda() {
   return on;
 }
 
+// (4b) VT_KIMI_DEVICE_KDA_CHUNK — process the PROMPT-length KDA with the CHUNKED
+// prefill kernel family (vt::KdaChunkPrefill: the vendored FLA Triton-AOT cubins
+// kda_gate_cumsum -> kkt -> solve_tril -> recompute_w_u -> chunk_delta_h ->
+// chunk_gla_o) instead of the RECURRENT form, exactly as vLLM
+// (kimi_gdn_linear_attn.py:141 chunk_kda_with_fused_gate; decode stays recurrent).
+// This is the spec §15 STRICT residual (c): vLLM processes the prompt chunked, we
+// still recur — a different reduction ORDER coin-flips the p7 near-tie. Requires
+// VT_KIMI_DEVICE_KDA=1 (the recurrence is the T==1 / fallback path). Default OFF
+// (parity-enabler; flip ON only with the token gate green). The chunk op fuses the
+// gate on-device (raw g1 + a_log + dt_bias), so unlike the recurrent branch nothing
+// is host-rounded — the chunk kernels carry vLLM's exact bf16 path.
+bool DeviceKdaChunk() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_DEVICE_KDA_CHUNK");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 // (5) VT_KIMI_DEVICE_MLA — run the NoPE-MLA attention CORE (causal scores/softmax/
 // weighted-V) through the shared device op vt::Attention instead of the f64 host
 // softmax island. This is the MLA twin of VT_KIMI_DEVICE_KDA (spec §14/§15 residual
@@ -339,6 +358,36 @@ DBuf KdaRecurrenceIsland(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
   // ALREADY device-resident; only the elementwise gate (KdaDecayGate) + beta = sigmoid(b)
   // are computed on host and uploaded (small, numerically stable). Fresh zero state,
   // single sequence, qsl=[0,T] — the stateless full-sequence recurrence the island needs.
+  // ── CHUNK-PREFILL (VT_KIMI_DEVICE_KDA_CHUNK): route the whole prompt through the
+  // chunked FLA Triton-AOT cubins (vt::KdaChunkPrefill) — vLLM's ACTUAL prefill path
+  // — instead of the recurrence. The op fuses the gate on-device from the RAW g1
+  // projection + a_log + dt_bias (no host gate compute, no bf16 island rounding); only
+  // beta = sigmoid(braw) is the tiny host elementwise. T==1 (a single token) keeps the
+  // recurrence below (the op itself also falls back for T==1). Spec §17.
+  if (DeviceKda() && DeviceKdaChunk() && T > 1) {
+    std::vector<float> hbraw(static_cast<size_t>(T) * nh), hbeta(static_cast<size_t>(T) * nh);
+    braw.Download(d, hbraw.data());
+    for (size_t i = 0; i < hbeta.size(); ++i) hbeta[i] = static_cast<float>(Sigmoid(hbraw[i]));
+    DBuf dbeta(d, DType::kF32, {T, nh}, hbeta.data());
+    DBuf da_log(d, DType::kF32, {nh}, a_log.data());
+    DBuf ddt(d, DType::kF32, {static_cast<int64_t>(dt_bias.size())},
+             dt_bias.empty() ? nullptr : dt_bias.data());
+    DBuf dstate(d, DType::kF32, {1, nh, hd, hd});
+    dstate.Zero(d);
+    DBuf dcore(d, DType::kF32, {T, proj});
+    const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+    DBuf dqsl(d, DType::kI32, {2}, qsl);
+    Tensor qn3 = MakeTensor(qn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor kn3 = MakeTensor(kn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor vc3 = MakeTensor(vc.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor gr3 = MakeTensor(g1.ptr(), DType::kF32, d.q.device, {T, nh, hd});  // RAW gate proj
+    Tensor out3 = MakeTensor(dcore.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    const float scale = static_cast<float>(std::pow(static_cast<double>(hd), -0.5));
+    vt::KdaChunkPrefill(d.q, out3, qn3, kn3, vc3, gr3, dbeta.t(), da_log.t(), ddt.t(), dstate.t(),
+                        dqsl.t(), vt::GdnArgs{scale});
+    return dcore;
+  }
+
   if (DeviceKda()) {
     std::vector<float> dhg1(static_cast<size_t>(T) * proj),
         dhbraw(static_cast<size_t>(T) * nh);

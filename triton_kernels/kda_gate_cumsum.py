@@ -1,9 +1,8 @@
-# triton_kernels/kda_gate_cumsum.py  (STAGED — see .agents/specs/kimi-linear.md §17)
+# triton_kernels/kda_gate_cumsum.py  (KDA chunk-prefill kernel; see .agents/specs/kimi-linear.md §17)
 #
 # KDA chunk-prefill kernel 1/5: the fused decay-gate + chunk-local cumsum.
-# This is a STAGED authored harness body (Phase-1 spike). Phase-2 moves it to
-# triton_kernels/ and regenerates the sm_121a cubin (scripts/regen-triton-aot.sh)
-# together with the cmake/TritonAOTKernels.cmake declaration in §17.
+# VENDORED kernel source. Regenerate the per-arch cubins via scripts/regen-triton-aot.sh
+# together with the cmake/TritonAOTKernels.cmake + CMakeLists.txt declarations in §17.
 #
 # Ported VERBATIM FROM (vLLM oracle @ pin 555967922):
 #   vllm/third_party/flash_linear_attention/ops/kda.py:1182-1254
@@ -35,9 +34,13 @@ exp = tl.exp
 log = tl.log
 
 # fold + softplus constants pinned per the KDA driver (see header note 2).
-RCP_LN2 = 1.4426950408889634  # 1 / ln(2)
-SOFTPLUS_BETA = 1.0
-SOFTPLUS_THRESHOLD = 20.0
+# Instantiated as tl.constexpr: Triton 3.6 rejects a plain-float module global
+# accessed from a @jit kernel — the constexpr INSTANTIATION form
+# (`x = tl.constexpr(v)`) is required; the annotation form (`x: tl.constexpr = v`)
+# is NOT supported for module globals.
+RCP_LN2 = tl.constexpr(1.4426950408889634)  # 1 / ln(2)
+SOFTPLUS_BETA = tl.constexpr(1.0)
+SOFTPLUS_THRESHOLD = tl.constexpr(20.0)
 
 
 @triton.jit(do_not_specialize=["T", "NT"])

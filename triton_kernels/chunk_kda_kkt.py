@@ -1,10 +1,10 @@
-# triton_kernels/chunk_kda_kkt.py  (STAGED — see .agents/specs/kimi-linear.md §17)
+# triton_kernels/chunk_kda_kkt.py  (KDA chunk-prefill kernels; see .agents/specs/kimi-linear.md §17)
 #
 # KDA chunk-prefill kernels 2/5 + 3/5: the per-K-channel-gated scaled dot K@Kᵀ
 # (and q@kᵀ = Aqk), split intra-sub-inter + intra-sub-intra exactly as FLA. These
 # produce the strictly-lower-tri A (which solve_tril inverts) and the causal Aqk
-# (which chunk_gla_o consumes). STAGED authored harness bodies (Phase-1 spike);
-# Phase-2 moves the file to triton_kernels/ + regenerates both sm_121a cubins.
+# (which chunk_gla_o consumes). VENDORED kernel source; regenerate both cubins via
+# scripts/regen-triton-aot.sh.
 #
 # Ported VERBATIM FROM (vLLM oracle @ pin 555967922):
 #   vllm/third_party/flash_linear_attention/ops/kda.py

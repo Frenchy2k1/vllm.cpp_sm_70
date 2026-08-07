@@ -1112,6 +1112,111 @@ verdict is claimed here.
 
 ---
 
+## 18. chunk_kda PREFILL PHASE-2 LANDS + MEASURED: op correct (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) vehicle REGRESSES 122→102 — the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, #111)
+
+Phase-2 executes §17 end-to-end on GB10 (sm_121a). The `chunk_kda` prefill kernel family
+is regenerated, vendored, wired through the new op `vt::KdaChunkPrefill`, unit-gated
+RED-first, and run on the full 48.9B model against the §12 STRICT golden. **VERDICT: the op
+is CORRECT (unit-validated) but does NOT reach STRICT in the current O(n²)-recompute island —
+it REGRESSES 122→102/128 — because chunk-every-step ≠ vLLM's prefill=chunk / decode=recurrent
+split. The recurrence (device-KDA, §15) at 122/128 remains best. The op + the regen are the
+validated, reusable prefill half of the named real lever (e) paged-incremental decode.**
+
+### AOT regen (§17.1-§17.3) — DONE, all 6 arches, reproducible
+The 5 harness kernels moved into `triton_kernels/`; the 6 §17.3 declarations added to
+`cmake/TritonAOTKernels.cmake` (contract) + `CMakeLists.txt` (`add_triton_kernel`, byte-identical
+manifest lines). Regenerated the sm_121a cubins **and all 5 sibling arches** (sm_80/86/89/90a/100a)
+via `scripts/regen-triton-aot.sh -DVLLM_CPP_TRITON_VENDORED_ARCH=<arch>` (Triton 3.6.0, per-arch
+`cuda:CC:32`; ptxas is Triton's bundled one so a single GB10 cross-compiles every arch). **Triton
+3.6 rejected the plain-float module globals** (SOFTPLUS_BETA/THRESHOLD/RCP_LN2, DOT_PRECISION) that
+the Phase-1 harness baked — fixed to the `tl.constexpr(...)` INSTANTIATION form (the annotation form
+is unsupported for module globals); the regen ITSELF caught this (Phase-1 was only py_compile-clean).
+**Reproducibility VERIFIED per arch: only the new `kda_*` artifacts + the MANIFEST change; every
+existing GDN cubin is byte-identical** (so regenerating all arches did not perturb the gate models).
+`scripts/check-triton-aot-drift.sh` GREEN (rc=0) across all 6 arches; the CUDA-build configure-time
+drift guard also GREEN.
+
+### The op (§17.4) + wiring — DONE, builds -Werror clean
+`vt::KdaChunkPrefill` (OpId `kKdaChunkPrefill`): the exact `_chunk_kda_fwd_with_cumulative_g` 6-launch
+order (`kda_gate_cumsum` → `kkt_inter`+`kkt_intra` → `gdn_tril_h32` REUSE → `kda_wu` → `kda_deltah_h32`
+→ `kda_gla_o`), with the bf16 casts, `chunk_indices`/`chunk_offsets` build, and per-step scratch
+alloc/free (`cuda_gdn.cu` `KdaChunkPrefillKernelCuda`/`LaunchKdaChunkPrefill`). Takes the RAW gate
+projection g1 + a_log + dt_bias (kda_gate_cumsum fuses the gate on-device); beta=sigmoid(braw) is the
+only host elementwise. Dispatch guard fires only at the pinned Kimi geometry (H=32, Dk=Dv=128), baked
+scale, T>1, dt_bias present, `VLLM_CPP_TRITON`+`VT_KDA_CHUNK_TRITON`; else a device-gate+recurrence
+fallback. CPU reference (fuse gate → proven recurrence), dual-registered. Wired into the island via
+`VT_KIMI_DEVICE_KDA_CHUNK` (prefill T>1 → chunk; decode T==1 → the #104 recurrence — vLLM's own split),
+default OFF. `cuda_gdn.cu.o` compiles -Werror clean on sm_121a; full CUDA build 444/444 (kimi-linear-gen
++ tests), disk-safe (18G free throughout). runner-routing/fusion/model-checklist/protocol checks GREEN.
+
+### Unit gate (§17.5.1) — RED-first GREEN on GB10
+`tests/vt/test_ops_kda_chunk_prefill.cpp` (2/2·4): (a) CPU chunk == recurrence fed the fused gate,
+BIT-FOR-BIT; (b) CUDA — the 6 cubins vs the recurrence over an accumulating 3-chunk state: **mean_abs
+= 4.68e-5** (the chunk path tracks the f32 recurrence), while a perturbed-gate reference (a_log+1.0)
+diverges to **3.38e-3 = 72×** (RED case has teeth). GDN untouched (`test_ops_gdn` 66/66·4242),
+`test_ops_kda_recurrence` 4/4·8. So the 6-kernel orchestration is numerically CORRECT off the model.
+
+### Full 48.9B GB10 gate (§17.5.2) — chunk REGRESSES 122→102/128
+Single-load per config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB,
+NO reboot. Golden = the §12 STRICT `greedy_ids.npy`.
+
+| Config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1`) | /128 | tok/s | first-step | verdict |
+|---|---|---|---|---|---|
+| control (recurrence) | — | **122** | 4.24 | 0.547s | reproduces §15/§16 EXACTLY (p0-p6 16/16, p7 10/16) |
+| **+ chunk-prefill** | `DEVICE_KDA_CHUNK=1` | **102** | 4.08 | 0.522s | **REGRESSION** (p3 16→3, p6 16→11, p7 10→8) |
+
+**Why it regresses (the honest root cause).** The op is unit-correct (4.68e-5 vs the recurrence), but
+the island is the O(n²) full-recompute vehicle: at every decode step it re-processes [0, prompt+t] as
+ONE chunk-prefill from zero state. vLLM instead chunk-prefills the PROMPT once, then RECURRENT-decodes
+each token on the persistent state. The chunk kernels' bf16 reduction order differs from the recurrence
+by ~5e-5/layer — negligible per layer, but across 20 KDA layers × the greedy cascade it flips more
+near-ties than the recurrence does. Crucially, the recurrence (control) matches vLLM's DECODE (both
+recurrent for t>0) — which is why control's 122 > chunk's 102; the chunk only matches vLLM's PREFILL
+(t=0). Applying chunk to the decode steps too is NOT vLLM's arithmetic there. This is the §14 razor
+re-confirmed at the kernel level: an approximation of the wrong reduction structure coin-flips.
+
+### THE vLLM SPEED LADDER (§17.5.3) — matched config (util 0.82, triton MoE, eager, single-seq)
+vLLM arm run SEQUENTIAL after our arms (worker parked, `drop_caches`, memory-monitored, ONE attempt at
+the config that succeeded; a first attempt died on a driver PATH bug — FlashInfer's sampling JIT could
+not spawn `ninja` — NOT an OOM, box freed cleanly; fixed + re-run), the EXACT §12 recipe (the one that
+captured the golden safely). vLLM loaded at util 0.82 with **min-avail 15 GiB, NO reboot** (matches §12).
+
+| arm | tok/s | note |
+|---|---|---|
+| **vLLM** (util 0.82, triton MoE, eager, seqs=1) | **~21 median** (25.3 cold-discarded) | 16-token AGGREGATE (prefill+decode); paged incremental decode |
+| ours — recurrence (device-KDA) | **4.24** | STEADY decode over 127 steps |
+| ours — + chunk-prefill | **4.08** | STEADY; slower (more work/step, still O(n²)) |
+
+vLLM per-prompt 16-token aggregate: [0.55 (p0 COLD, discarded), 25.87, 16.94, 25.31, 17.44, 16.86,
+25.35, 25.58] tok/s — bimodal by prompt length (longer prompt → more prefill → lower aggregate). NOTE:
+vLLM 0.25.0's `RequestOutput.metrics` per-token times were NOT populated on this path, so TTFT could
+not be isolated and the vLLM number is the 16-token AGGREGATE (prefill amortized) — vLLM's TRUE steady
+decode is ≥ this, so the gap is a FLOOR. **ours/vLLM ≈ 0.20 — vLLM is ~5× faster on decode**, now a
+MEASURED distance (not the §14 "HW-forced-indirect" framing). Expected: ours is the O(n²) host-
+orchestrated FULL-RECOMPUTE (the 4.24 tok/s IS the recompute rate — it re-runs the whole sequence every
+step); vLLM is paged incremental decode. Closing this is the SAME paged-incremental-decode lever that
+closes STRICT (coupled). Neither of our levers closes it: chunk (4.08) is marginally SLOWER than the
+recurrence (4.24) because the 6-cubin chunk does more work per step over the growing sequence (still
+O(n²)). Ours prefill/TTFT proxy = first-step 0.52-0.55 s; vLLM prefill not isolable from this arm.
+
+### Verdict + default (parity-enablers)
+NO arm reaches STRICT (chunk 102 is a DIVERGENCE, worse than control's 122). Per parity-enablers,
+`VT_KIMI_DEVICE_KDA_CHUNK` STAYS **OFF** (a regression is not a flip); `VT_KIMI_DEVICE_KDA` also STAYS
+OFF (122 ≠ STRICT, K=3-deterministic golden). device-KDA (122/128, 4.24 tok/s) remains the best config.
+Row STAYS `ACTIVE`.
+
+### The real residual, now sharpened AND de-risked
+Closing p7 (and matching vLLM's decode) needs (e) **paged-incremental decode**: chunk-prefill the
+prompt ONCE (this validated `vt::KdaChunkPrefill` is exactly that prefill half) + RECURRENT-decode
+each token with a PERSISTENT KDA state (a decode/paged op, query_len≠key_len) — which ALSO kills the
+O(n²) recompute (the 4.24 tok/s is the recompute rate), so it is the STRICT lever AND the big speed
+lever, coupled. The `chunk_kda` kernels + the op are the reusable, GB10-validated prerequisites; the
+remaining brick is the persistent-state decode wiring + the paged NoPE-MLA (§16 residual d). The
+chunk-every-step measurement PROVES the recompute vehicle cannot host the chunk lever — it must be
+paged-incremental.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope
