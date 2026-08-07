@@ -312,4 +312,14 @@ bool HasPlatform(DeviceType type);
 // per-object device dispatch use `GetPlatform(<obj>.device.type)` (BACKEND-PLATFORM).
 Platform& CurrentPlatform();
 
+// The ORDER CurrentPlatform() probes device types in, exposed so it can be
+// ASSERTED rather than trusted (BACKEND-ROCM W0). This walk is the one place
+// adding a platform is not additive: a DeviceType missing from it registers
+// fine, answers every query correctly, and is then simply never selected — and
+// unlike a missing enum case, no compiler diagnostic fires. Exposing it lets
+// tests/vllm/platforms/test_platform.cpp assert that every DeviceType appears,
+// so the next backend cannot reintroduce that silence. Returns a pointer to a
+// static array of `count` entries.
+const DeviceType* CurrentPlatformPriority(size_t& count);
+
 }  // namespace vllm::platforms

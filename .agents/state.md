@@ -39708,6 +39708,101 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
 
   Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
   which blocks every shader written after it.
+## 2026-08-06T23:10 - BACKEND-ROCM W0: the AMD skeleton lands UNBUILT and says so - plus the one non-additive platform site the enum change uncovered
+
+<!-- state: 2026-08-06T23:10 -->
+
+Three contributors offered AMD hardware on [#41](https://github.com/mudler/vllm.cpp/issues/41)
+(gfx1151 Strix Halo, gfx1103 Radeon 780M, 4x gfx1100 7900 XTX). What they lacked
+was a bounded first task, so `BACKEND-ROCM` moves `INVENTORIED` -> `ACTIVE` with
+a W0 skeleton: `kROCM`, a `vt::Backend` over the HIP runtime, a `Platform`
+mirroring `vllm/platforms/rocm.py`, one registered op, the `VLLM_CPP_HIP` build
+switch, and the tests. Spec: [rocm-backend-w0.md](specs/rocm-backend-w0.md).
+Contributor guide: [docs/ROCM.md](../docs/ROCM.md).
+
+**The honesty line first, because it governs how every other sentence here reads:
+the three HIP translation units have NEVER BEEN COMPILED, by anyone.** No AMD GPU
+and no ROCm toolchain exists on any machine here. That is strictly weaker than
+this project's `build-supported` label (compiles, emits real machine code, no
+board has run it) - there is no build evidence at all. The word used in the file
+headers, the CMake configure output, `docs/BUILD.md` and the matrix row is
+UNBUILT, and no gate row moves to a passing state.
+
+**The design answer to "unbuildable here" was to move the DECISIONS out of the
+unbuildable files.** `include/vt/rocm/rocm_arch.h` is the gfx-name ->
+`(major, minor)` parse, ported 1:1 from `rocm.py:223-291`, deliberately HIP-free
+so it compiles and is unit-tested on a CPU-only box: 7 cases / 40 assertions
+including upstream's own worked examples (gfx90a->(9,0), gfx942->(9,4),
+gfx1100->(11,0), gfx1151->(11,5)), the `:sramecc+:xnack-` suffix strip, the
+decline-rather-than-guess cases upstream RAISES on, and `static_assert`s. What
+stays unbuilt is API glue whose failure mode is a compile error on the first
+contributor's machine - loud and cheap - rather than a wrong answer.
+
+**The load-bearing bool is `UnifiedMemory()`, and it is why the three boards are
+three different jobs.** The portable reference tier (`op_provider.h:186-224`)
+serves unimplemented ops from the CPU kernels, gated on unified memory because a
+CPU kernel dereferences HOST pointers. So an APU (gfx1151/gfx1103) can run a
+model end to end against ONE registered kernel, while on a discrete card the tier
+must NOT install and `GetOp` correctly throws. Implemented as
+`pageable_memory_access && integrated`, both probed - the same conjunction, for
+the same recorded reason, as `cuda_backend.cu:295-303` (pageable alone is HMM
+page migration, not aliasing).
+
+**RmsNorm is the one registered op, chosen for the test harness rather than for
+ease.** `test_backend_cross_device.cpp` walks every registered non-CPU backend,
+skips unregistered ops and compares the rest to the CPU backend at NMSE <= 5e-4
+from the same binary - so registering it hands a contributor a real numeric gate
+on their own silicon with no test to write. It is a CROSS-LANE REDUCTION, which
+is where a hipified kernel actually breaks (AMD wavefront 64 vs NVIDIA warp 32);
+the ported kernel reduces through `__syncthreads()` over shared memory, so it is
+width-agnostic, and that property is now stated where the next porter reads it.
+Ported from `cuda_ops.cu:96-126`; the `VT_RMSNORM_DECODE_FAST` paths are
+deliberately not ported (sm_121a-tuned, and W0 is not a speed milestone).
+
+**The finding worth carrying forward: `CurrentPlatform()` walks a hardcoded
+array, and that is the ONE place adding a platform is not additive.** A platform
+missing from `kCurrentPriority` (`platform.cpp:46-56`) registers fine, answers
+every query correctly and is simply NEVER SELECTED - and unlike a missing enum
+case, no `-Werror=switch` fires. `kROCM` was inserted after `kCUDA`, mirroring
+upstream's own probe order (`platforms/__init__.py:202-208` = {tpu, cuda, rocm,
+xpu, cpu}). The walk is now exposed as `CurrentPlatformPriority()` and
+`test_platform.cpp` gates that EVERY `DeviceType` appears in it and CPU is last,
+so the next backend cannot rediscover this silently. This qualifies
+[backends.md](backends.md)'s "adding a platform never touches engine code": true
+of the engine, with platform SELECTION as the single tested exception.
+
+The two NON-HIP legs are the exception and are not covered by that sentence:
+`platforms/rocm.cpp` and `test_rocm_backend.cpp` are plain C++ by design, and a
+non-HIP build now OBJECT-compiles both (`vllm_rocm_platform_syntax_check`, never
+linked, so a non-HIP build is unchanged) specifically so a later `Platform`
+interface change cannot break them silently for a contributor mid-bring-up.
+Compiled is not run.
+
+**Verified here (CPU tier, no GPU):** clean `-Werror` build - the enum addition
+forced exactly ONE switch site in the whole tree (`test_backend_cross_device.cpp:59`),
+which is itself evidence the seam holds; `test_rocm_arch` 40/40; `test_platform`
+10 cases / 76 assertions incl. the new walk gate; full `ctest`;
+`check-device-leakage` unchanged at 32 (a ROCm leg adds no CUDA references).
+**PENDING, hardware-blocked:** every HIP compile, `test_rocm_backend`, the
+cross-device RmsNorm comparison, and both `BACKEND-GATE-ROCM-*` rows.
+
+Deliberately out: attention (empty priority list, so selection throws loudly
+rather than naming absent kernels; `rocm.py:407` says ROCM_ATTN/TRITON_ATTN are
+the RDNA3-reachable entries at M3), hipGraph capture, `needs_weight_staging`
+(base-false: HIP does stage, but answering true today routes a model into a path
+with no kernels), fp8/MXFP4/AITER/RCCL. Multi-device registration IS in, at
+`Device{kROCM,i}`, because the 4-GPU box on #41 is why it should not be a
+device-0 hardcode.
+
+One documentation correction rides along: `cmake/hipify.py` imports
+`torch.utils.hipify`, so it is torch-dependent and we cannot reuse it. The
+strategic claim survives (upstream ships ONE `csrc/` for both, so the kernels are
+mechanically translatable) but a contributor's M3 route is ROCm `hipify-clang` or
+hand-translation, and `rocm_rmsnorm.hip` is the worked example.
+
+Next: a contributor's first `cmake -DVLLM_CPP_HIP=ON`. A compile error is the
+expected and most valuable outcome, and it belongs in this repo, not in a fork.
+
 ## MiniMax-H3 render bug CLOSED — wrong checkpoint PARTITION, not a code bug (`row/H3-RENDER-CLOSE` PR #77)
 <!-- state: 2026-08-06T23:55 -->
 
@@ -40260,6 +40355,424 @@ kept). Records: spec §8.8 + §8.2, STATUS/BENCHMARKS/FEATURES, benchmark-record
   before this merge (`check-fusion-consistency`, `minimax_h3_video_vae_device`),
   verified on `origin/main` itself. That one is not from this work.
 
+## 2026-08-07T04:10 - MiniMax-H3 ENCODER VISION SCATTER wired+gated; fl2va COHERENT via encoder vision path; ref2va grid RE-ATTRIBUTED to the reference-row assembly (row/H3-VISION-SCATTER, helper, PR #90)
+<!-- state: 2026-08-07T04:10 -->
+
+Closes the #86 framework residual and re-attributes the ref2va grid with a GB10 render A/B.
+
+**deepstack_visual_indexes CONFIRMED (was #86-inferred).** `{8,16,24}` grounded in the release
+config: H3's text_encoder/ IS Qwen3-VL-32B-Instruct, whose vision_config.deepstack_visual_indexes =
+[8,16,24], depth 27, text num_hidden_layers 64 (→50). Same as vllm-omni Qwen3VLMoeVisionConfig
+default and public Qwen/Qwen3-VL-30B-A3B. No value change; comment updated (minimax_h3_vision_gguf.cpp).
+
+**Deliverable 1 — DEVICE scatter+inject WIRED 1:1 + GATED.** MiniMaxH3EncoderTextForwardDevice
+(minimax_h3_encoder_device.cpp:103,216-243) now takes visual_pos_mask + per-tap deepstack blocks and
+ADDS each block into the masked visual rows after each of the first N decoder layers — device mirror of
+the gated host reference and upstream _deepstack_process (encoder.py:770-800). Merged masked_scatter
+into inputs_embeds stays the caller's job (upstream _encode). Text-only byte-identical (defaults).
+Gate: device keep-quant encoder test now runs WITH a visual mask + 2 DeepStack blocks → device==host
+max|diff| 3.8e-4 (≤2e-3), DeepStack moves conditioning (scale 1.006→1.062); PASS 1562 assertions.
+Host text tower + full vision tower + GGUF visual.* loader + MM processor all green. NVFP4 line-3503
+SIGSEGV is the known standalone-passing cross-test flake, not mine.
+
+**Driver --cond-image** routes an image through the encoder vision path (reuse: Qwen3VLImageProcessor →
+Qwen3VLVisionForward → merged+3 deepstack; ExpandImagePlaceholders; masked_scatter; Qwen3VLGetRopeIndex
+== H3 _get_rope_index for t==1, position math verified). Additive.
+
+**GB10 render A/B (256x256/22f/12steps).**
+- fl2va + --cond-image = COHERENT + matching (deliverable 3 PASS): FL2VA GGUF --dequant-bf16 +
+  --first-frame + --cond-image + --partition fl2va, conditioning [82,5120] (64 merged + 3 deepstack).
+  Frame 0 = coherent orange cat (keyframe); frame 21 = cat on a WINDOWSILL in warm sunlight (evolved
+  toward the prompt). No grid. Artifact ~/h3fp4/out_vs_fl2va.mp4. Vision conditioning is SOUND.
+- ref2va + --cond-image STILL GRIDS (deliverable 2, honest FAIL): Ref2VA NVFP4 --fp4-resident +
+  --ref-image + --cond-image + --partition ref2va, conditioning [82,5120], latent 7x16x16. Every frame
+  the same multicolour patch grid as #86. Artifact ~/h3fp4/out_vs_ref2va.mp4.
+
+**RE-ATTRIBUTION (evidence).** The "vision-enriched conditioning fixes the grid" hypothesis is REFUTED.
+NOT the encoder conditioning: (a) DiT forward math byte-exact (geometry ladder #74, device==host seq
+1920 #77); (b) SAME vision scatter path renders a COHERENT fl2va; (c) grid invariant to text-only vs
+vision-enriched prompt. Only difference: fl2va PINS output rows (keyframe), ref2va PREPENDS free-running
+reference rows. Residual = the ref2va reference-row conditioning ASSEMBLY (MiniMaxH3EncodeReferenceImages
+VAE-reference rows + minimax_h3_packed_sequence_ref2va_blocks noised-anchor layout + un-pinned target-row
+denoise), NOT prompt_embeds and NOT the DiT forward. Next: dump ref2va target-row VAE-input adjacency
+cosine (vs #77's 0.95 for coherent fl2va) + A/B the reference-row condition-noise.
+
+Box left clean (renders exited, GPU idle, gpu.lock released, worker stays parked, temp PNGs pruned,
+ckpts kept). Records: spec §8.9 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
+
+## 2026-08-07T04:15 - `/v1/videos` speaks OpenAI's Sora WIRE SHAPE, plus the MP4 content route
+
+<!-- state: 2026-08-07T04:15 -->
+
+Row `SERVE-VIDEOS-OAI`, claim `CLAIM-SERVE-VIDEOS-OAI`, branch
+`row/SERVE-VIDEOS-OAI`. Developer-directed: an unmodified OpenAI client must work
+against our `/v1/videos`, ADDITIVELY over the vLLM-Omni-derived fields we already
+take.
+
+**SPLIT, deliberately.** The original single change was 1241 non-exempt lines,
+over the 900 `check-pr-size.py` cap. It is split along its real seam rather than
+by trimming to fit: this row is the request/response WIRE SHAPE (no generation
+code, no VAE, no `examples/server` change), and REFERENCE CONDITIONING
+(`input_reference` -> fl2va plus the two `metadata` ref2va modalities) is a
+stacked follow-up row. Neither cap nor ratchet was raised.
+
+**Request aliases (`ParseVideoRequest`).** `model`, `size` ("1280x720") and
+`seconds` now land on the existing native members. `seconds` is accepted as a
+number OR a numeric string, because OpenAI's schema types it as a string enum
+("4"/"8"/"12") and a literal client would otherwise be rejected on a type.
+PRECEDENCE is defined and gated: the NATIVE field WINS (`width`/`height` over
+`size`, `duration` over `seconds`), which is what guarantees every body that
+parsed before means exactly what it meant before. It is applied PER-AXIS, so an
+explicit `width` alone still lets `size` supply the height. Both spellings are
+VALIDATED either way, so a malformed `size` is a 400 even when explicit
+`width`/`height` override it: a client is never told the whole request was
+understood when half of it was unreadable.
+
+**`model` warns, never rejects.** A Sora client sends "sora-2-pro"; this server
+generates with whatever video model it was started with, whose name the client
+cannot know. Refusing would defeat the compatibility and ignoring would hide a
+real mismatch, so the request is honoured and the divergence is STATED as a
+`warning` on the job, echoed for the job's whole life alongside the requested
+`model`.
+
+**`GET /v1/videos/{id}/content`.** Without it a caller can start and poll a job
+but never FETCH the result over HTTP. Unknown id -> 404; queued/running -> 409
+naming the status (a pending job must never answer with bytes: a partially muxed
+file would reach the client as a valid-looking truncated MP4); failed -> 500
+carrying the failure; a vanished output -> 500 rather than a 200 with zero bytes.
+
+**GATE (CPU, foreground).** `test_video_api` 11/11 (125 assertions),
+`test_openai_api_server` 40/40 (509), `server` builds clean. Additivity is gated
+over a REAL socket: with no `VideoRunner` all four routes are absent (a bare 404,
+no `ErrorResponse` envelope), with one they serve and the unknown-id 404 is ours.
+
+**Records.** spec §9 (rewritten to this row's scope), engine-matrix
+`SERVE-VIDEOS-OAI` (+1 row, `check-agent-record.py` ENGINE_ROWS 140 -> 141),
+coordination claim, USAGE, FEATURES (new Serving row), BENCHMARKS ("no number
+owed" with the reason), NOW.
+
+**STATUS: the `/v1/videos` line was PAID FOR by a compaction, not by headroom.**
+The page was 11 chars under its 284062 ratchet, so the checker's own remedy
+applied: the `OpenAI server` row's third cell was 1223 chars, the single largest
+wall-of-prose cell on the page and exactly what `MAX_CELL_CHARS` targets.
+Collapsed to 584 (which endpoints exist, which are flag-gated, which have
+handlers but no live backing on the async path) and the ratchet lowered
+284062 -> 283470 in the same change. MOVED, NOT DELETED -- the removed narrative
+was: the `/tokenize` raw-`prompt`-vs-chat-`messages` rendering note (in
+docs/USAGE.md), `--enable-tokenizer-info-endpoint` mirroring vLLM's
+`enable_tokenizer_info_endpoint` and surfacing the fields the BPE tokenizer can
+genuinely back, `--enable-server-dev-mode` mirroring `VLLM_SERVER_DEV_MODE`, the
+`CLAIM-C8-SERVE-PROD-WIRING` production-wiring attribution, the "pending an
+engine stat-logger / reset RPC accessor" reason for the two unbacked handlers,
+and the "prior-step GPU-overlap use-after-free; unblocks the 35B binding grid"
+attribution -- all of which are already carried by the `SERVE-ADMIN` and
+`SERVE-CLI` rows of .agents/engine-matrix.md and by docs/USAGE.md. The H3 model
+row was left BYTE-IDENTICAL to what `row/H3-VISION-SCATTER` (#90) landed: this
+row's note belongs on the serving surface, and re-writing another row's freshly
+landed binding text is how a keyed record acquires a silent VARIANT.
+
+**Residuals, named.** OpenAI's status vocabulary/id shape is not mirrored (ours
+stays queued/running/succeeded/failed, ids `vid_N`, no `object`/`progress`/
+`created_at`); reference conditioning is the stacked follow-up row; the
+real-weights leg rides the H3 GB10/disk window.
+
+**OUT-OF-ROW, carried here because it BLOCKS every merge: `main` itself was RED
+on the `agent-record` CI job** (run 31129401136, and every run since) --
+`check-fusion-consistency.py` flags `minimax_h3_video_vae_device.cpp` for three
+hand-called `vt::SiluAndMul` epilogues, so no PR could go green regardless of its
+contents. Repaired the way AGENTS.md names (fold, or take a CONSCIOUS allowlist
+entry), not by weakening the checker: a `merged-gemm-consistency-allowlist.txt`
+entry with the verified reason. w1 ALREADY ships merged `[2*ff_inner, dim]` and
+is ALREADY one `MatmulBT`, so nothing is unmerged; the seam is unusable because
+the VAE runs the whole block in f32 (a pixel decoder, not a logits path) where
+`UnquantizedMlpGateUpMethod`'s DBufs are kBF16, and every VAE Linear carries a
+rank-1 bias the bias-free method has no slot for -- plus the same up-front device
+staging vs `OwnedTensor`/`ResidentWeight` residency blocker the sibling
+`minimax_h3_device` entry already records. The checker keeps enforcing for every
+other model.
+
+**SECOND OUT-OF-ROW REPAIR, same reason: `check-role-discipline.py` FAILED on
+every feature PR.** CI checks out `refs/pull/N/merge`, a SYNTHETIC merge GitHub
+builds whose entire message is "Merge <head> into <base>". It names neither the
+row branch nor the PR, and it NEVER lands on main -- so a gate about MAIN's
+history was being run on a commit that is not main's history, and rejected it.
+Reproduced on an unrelated PR (#80, Vulkan) to prove it is not this row's doing.
+The fix reads the SECOND parent, which is the PR head: a merge of a branch whose
+own commits name the row IS arrival through a row PR, one hop away. NOT a
+weakening, and gated as such: a new test asserts that a merge naming no row
+anywhere (and a plain local `Merge branch 'wip'`) STILL fails. Suite 40/40.
+
+## 2026-08-07T04:40 - reference CONDITIONING over `/v1/videos`: `input_reference` -> fl2va, `metadata` -> ref2va
+
+<!-- state: 2026-08-07T04:40 -->
+
+Row `SERVE-VIDEOS-REFS`, claim `CLAIM-SERVE-VIDEOS-REFS`, branch
+`row/SERVE-VIDEOS-REFS`, STACKED on `SERVE-VIDEOS-OAI`. That row made an OpenAI
+client's body PARSE; this one makes its REFERENCES do something. Before it, no
+reference modality was reachable over HTTP at all: an image-to-video request
+generated silently from the prompt alone.
+
+**`input_reference` -> fl2va, NOT ref2va.** OpenAI documents it as the image the
+generated video STARTS FROM, which is exactly what fl2va expresses:
+`MiniMaxH3EncodeKeyframeCondRows` pins frame 0 OF THE OUTPUT to the supplied
+image (`imgvid_noise_aug = 1.0`). `MiniMaxH3EncodeReferenceImages` means
+something else entirely: whole reference images PREPENDED as their own blocks,
+i.e. subject or style guidance that never becomes a frame of the result. Mapping
+`input_reference` there would have silently changed what the API promises. With a
+reference and no explicit `task`, the task IS fl2va, and the image's aspect
+drives the default geometry through `MiniMaxH3ResolveShape`. The source is a
+filesystem path OR an RFC 2397 `data:` URL, decoded by the SAME
+`entrypoints::openai::DecodeDataUri` the chat multimodal parts use rather than a
+second, subtly different decoder; an http(s) URL is REFUSED BY NAME rather than
+stat-ed as a path and failing later with a confusing message.
+
+**The two modalities OpenAI has no slot for ride `metadata`.** H3 supports three
+(image, silent video, audio) and the Sora schema carries one, so the other two
+enter through the standard free-form string map every strict client already
+tolerates, rather than invented top-level fields that would fail a client's
+schema validation. The whole map is kept verbatim (unknown keys pass through
+untouched); two keys are lifted into typed fields.
+`metadata.input_reference_video` is a DIRECTORY of `frame_%06d.ppm` -- the exact
+layout `minimax-h3-gen` and this server WRITE, so one run's frames chain straight
+into the next request -- because no container demuxer is vendored; a `data:` URL
+cannot name a directory and is refused saying so.
+`metadata.input_reference_audio` is a 16-bit PCM WAV path or `data:` URL.
+
+**A video reference is SILENT, by construction and stated.**
+`MiniMaxH3EncodeReferenceVideo` emits `ref_audio_t == 0`, because the clip's own
+soundtrack would need the audio VAE encoder run over it. An audio reference
+supplied alongside ATTACHES to that same `kVideoAudio` block (its `ref_audio_t`
+claims exactly the rows just encoded), which is the layout `packed_sequence.py`
+builds; alone it is its own block.
+
+**Legality is enforced in the PARSER, not left to the pipeline.** The rule is the
+pipeline's own (`minimax_h3_pipeline.cpp:251`: fl2va keyframes and ref2va blocks
+are EXCLUSIVE), so an illegal pair is a 400 naming it rather than a failed job --
+and never a silently dropped reference, which is the failure that looks like it
+worked. Legal: none / image / video / audio / video+audio. Illegal:
+`input_reference` with either metadata reference.
+
+**Two refusals up front rather than deep in the denoise.** A reference image must
+be a binary PPM (P6): no PNG/JPEG codec is vendored, the same NAMED residual the
+chat multimodal path carries. And it must already be at the RESOLVED output
+geometry, because no image resampler is vendored -- a mis-sized keyframe would
+either abort inside the denoise or pin the wrong latent rows, so the refusal
+names both geometries. Both VAE ENCODER halves (video and audio) load LAZILY and
+ONCE each under one mutex: a text-to-video server must not pay for weights it
+never uses, and a server that does use them must not reload per request.
+
+**GATE (CPU, foreground).** `test_video_api` 14/14 (167 assertions),
+`test_openai_api_server` 41/41 (525), `server` builds clean. Each modality is
+gated as ARRIVING at the runner (a reference that parsed and then never reached
+the pipeline is the failure that looks like it worked), and an illegal pair is a
+400 that generates nothing (`calls == 0`).
+
+**Records.** spec §10, engine-matrix `SERVE-VIDEOS-REFS` (+1 row,
+`check-agent-record.py` ENGINE_ROWS 141 -> 142), coordination claim, USAGE
+(reference fields, the `metadata` block, the legality table), FEATURES/BENCHMARKS
+/STATUS rows updated IN PLACE (keyed tables), STATUS ratchet lowered
+284043 -> 284037 in the same change, NOW.
+
+**Residuals, named.** Reference images are binary PPM at the output resolution; a
+video reference is a frame DIRECTORY; OpenAI's real `input_reference` upload is
+multipart, ours is the JSON spelling; the real-weights leg rides the H3 GB10/disk
+window.
+## 2026-08-07T05:30 - MiniMax-H3 ref2va assembly bug FIXED + gated; render grid RE-ATTRIBUTED to the ref2va NVFP4 CHECKPOINT (NOT the assembly) (row/H3-REF2VA-ASSEMBLY, helper, PR #93)
+<!-- state: 2026-08-07T05:30 -->
+
+Took §8.9's residual (the ref2va reference-row assembly) and ran the §70 latent-bisection discipline at
+the assembly boundary: diffed the whole assembly vs upstream on CPU, found + fixed a real bug, extended
+the permanent gate to a ref2va-shaped rung, re-rendered on real weights — and the render DISPROVED
+§8.9's attribution.
+
+**REAL BUG FIXED (suspect #1).** `MiniMaxH3EncodeReferenceImages` (minimax_h3_pipeline.cpp:162) and
+`MiniMaxH3EncodeReferenceVideo` (:83) emitted the ref block with PATCHED dims (`ls.h/patch_size_h`), but
+`BuildMiniMaxH3PackedSequenceRef2va` (minimax_h3_packing.cpp:453) divides `block.latent_h/kPatchH` AGAIN,
+mirroring upstream packed_sequence.py:328-330 which takes the UNPATCHED latent (upstream feeds the raw
+latent: pipeline_minimax_h3.py:1141-1145 `visual_shape=(1,height//16,width//16)`). Double-division
+under-allocated the reference span by patch_h*patch_w (=4); the denoise pin-loop's `>=` check let the
+oversized encoded reference be SILENTLY TRUNCATED to its first quarter. Fix: emit raw `ls.{t,h,w}` in
+both encode fns. The other 3 suspects CLEARED by the same read: per-token timesteps mirror
+denoise_loop.py:109-118 exactly (minimax_h3.cpp:843-854); layout/grid/tags byte-exact vs upstream; #77
+output bookkeeping correct (upstream `video_rows[update_mask]` == our trailing-target slice).
+
+**GATES.** (1) goldens section 5c: a ref2va-shaped DiT-forward rung (image + video+audio reference blocks,
+8×8 geometry) forwarded through RefDiT with the ref2va timestep partition + audio update mask; C++ case
+"DiT-forward REF2VA rung matches upstream (reference rows, mixing)" gates layout + host/device logits
+(≤2e-5) + ref-row masking + target mixing (frac 1.0). Needed a 1-line RefDiT extension (honor
+audio_update_mask, upstream minimax_h3_transformer.py:1099-1101; our port already did). Goldens regen
+purely additive (635 inserts, 0 deletes). (2) RED-first encoded-vs-layout row-count invariant in the
+ref2va image+video subcases: reintroducing the bug fails 128==512 (16 encoded vs 4 allocated), restored →
+green. Suite 69/69, 52377 assertions (CPU Release, standalone — no line-3503 flake).
+
+**GB10 render A/B + ISOLATION (256×256/22f/12steps, fixed binary, incremental build in ~/h3fp4/src).**
+ref2va fp4-resident → grids; ref2va bf16 (no --fp4-resident) → ALSO grids (fp4 eliminated); t2va with
+ZERO reference assembly on the ref2va NVFP4 (--partition fl2va bypass, no refs/cond-image) → STILL grids
+(assembly eliminated); fl2va control (FL2VA GGUF + keyframe + --cond-image) → COHERENT (frame 0 orange
+cat matching keyframe, frame 21 cat on a windowsill in warm sunlight — no regression from the fix).
+Artifacts ~/h3fp4/out_{vs_ref2va,bf16_ref2va,t2va_nvfp4,vs_fl2va}.mp4.
+
+**RE-ATTRIBUTION (corrects §8.9 + §8.6).** The grid is NOT the assembly and NOT fp4. It correlates 1:1
+with the ref2va NVFP4 CHECKPOINT (minimax_h3_ref2va_nvfp4_full): every render loading it grids, every
+FL2VA-GGUF render is coherent. §8.9 varied only the prompt; §8.6 only the task — neither varied the
+checkpoint/quant, so both misattributed a checkpoint/loader defect. True residual = the NVFP4 DiT LOADER
+for this file (StreamMiniMaxH3Nvfp4ToDeviceBf16/Fp4): suspect fp32-island preservation (patch/time/output
+layers, minimax_h3_transformer.py:898-904), weight_scale_2 double-dequant, or tensor-name mapping for the
+1051-tensor file. Synthetic-NVFP4 gates proved the dequant MATH byte-exact but never loaded THIS file vs
+a coherent oracle. NEXT: a REF2VA GGUF (bf16, known-good loader) as checkpoint oracle — blocked on dgx
+disk (23 GiB free, 100% full; large dirs belong to other campaigns, not prunable). Fix + gates LAND
+regardless; box left clean (renders exited, gpu.lock released, worker stays parked, ckpts kept). Records:
+spec §8.10 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
+
+## 2026-08-07T05:35 - MiniMax-H3: half of every video was being discarded (audio duration), plus the user-facing docs the lane never had
+
+<!-- state: 2026-08-07T05:35 -->
+
+Branch `fix/h3-audio-duration-and-readme` (PR #68). Found by RENDERING, not by
+the suite.
+
+**THE BUG.** A 124-frame render silently muxed as **61 frames**. `audio_t` is the
+PER-CHANNEL latent length (the planner sets it from 40 Hz * duration) and the
+packed layout carries `audio_t * audio_channel` ROWS, one per (channel, step).
+The denormalize step divided by the channel count, so the decoded audio ran half
+the video's duration; because the muxer passes `-shortest`, that silently
+truncated the VIDEO to half its frames too. The fix is one line
+(`audio_steps = request.audio_t`), and it now agrees with the same function's own
+`target_audio_rows = request.audio_t * request.audio_channel` two lines up.
+
+**WHY THE SUITE WAS BLIND, which is the part worth keeping.** Every existing gate
+asserts shape SELF-CONSISTENCY, and a uniformly halved pipeline is perfectly
+self-consistent: the shapes agreed with each other, they were just half as long
+as the request asked for. `ffprobe` on the artifact exposed it. The gate added is
+the invariant that is NOT self-consistency: latent steps / 40 Hz must equal the
+video duration, to within one latent step, and the halved value is asserted to be
+off by more than a second.
+
+**A SECOND BUG FROM THE SAME SESSION, DROPPED RATHER THAN LANDED TWICE.**
+Conditioning PREPENDS rows to `img_pos`, so the denoise loop returns condition
+rows followed by the targets, and unpatchify was handed the whole set. This
+branch fixed it by carrying the layout's own `update_mask` out of the loop.
+`main` fixed the SAME bug independently in `row/H3-RENDER-CLOSE` by taking the
+TRAILING `target_video_rows`, with a `VT_CHECK` on the row accounting. On rebase
+the `update_mask` mechanism and its test were DROPPED: landing a second solution
+to a fixed bug is churn, and the positional form already ships gated. Recorded
+here so the alternative is not silently lost.
+
+**DOCS.** The video+audio generation path had no user-facing documentation at
+all, and the multimodal INPUT interface was documented WRONG: `vllm-cli
+--image/--video/--audio` does not exist, the CLI is text-only. Multimodal input
+is served over the OpenAI API as `image_url`, `video_url` and
+`input_audio`/`audio_url` content parts on `/v1/chat/completions`
+(`src/vllm/entrypoints/openai/chat_mm.cpp`), which was documented NOWHERE, so
+`docs/USAGE.md` now states it rather than the wrong claim merely being removed.
+README gains a News section led by video+audio generation, paid for INSIDE the
+30,000-char landing-page budget rather than by raising it.
+
+**Public docs.** The 19-line narrative this branch originally appended to
+`docs/BENCHMARKS.md` was a non-canonical H2 section and pushed the page over its
+prose budget: converted into three keyed ROWS (Thor render speed, render
+duration, quantization floor) with the forensics moved verbatim into
+`.agents/benchmark-record.md`, which is what that page's own checker instructs.
+
+**STATUS, paid for in place.** The page sits within 20 chars of its 283470
+ratchet, so the note was made to FIT rather than granted headroom: the H3 row's
+"(t2va-no-refs grids too)" forensic aside was dropped (the detail is spec §8.10,
+where #93 recorded it) and the duration result stated as "audio full-duration".
+Net -4 chars; the ratchet is untouched because it did not need to move.
+
+**THIRD-PARTY RECORD DAMAGE REPAIRED (out of row, carried here because it is the
+same file and it left `check-agent-record` RED on main).** `#93`'s squash-merge
+removed 130 lines from `specs/minimax-h3.md`: its branch predated `#71`/`#92`, so
+landing it DELETED `## 9` and `## 10` (the `/v1/videos` rows) and left two
+orphaned table fragments with no heading and no separator, which the record
+checker reports as `table has 4 pipes; expected 3` plus `no linked spec names
+exact stable token SERVE-VIDEOS-REFS` (the engine-matrix row pointed at a section
+that no longer existed). Repaired by restoring `## 9` and `## 10` VERBATIM from
+`548b0000` and cutting the orphans; `#93`'s own content is preserved byte-for-byte.
+This is the hazard AGENTS.md names: a keyed/structured record file merged from a
+stale base silently loses another row's section.
+
+**GATE (CPU, foreground).** `test_minimax_h3` full suite, plus the new duration
+case. No numbers changed by the doc work; the Thor speed figures are prior
+measurements now recorded in the scoreboard rather than new ones.
+
+[2026-08-07] H3-NVFP4-LOADER-DIFF (#94) — fp4 nibble-order loader bug FOUND+FIXED (byte-verified);
+grid 2nd defect isolated. Independent-oracle loader diff (no download): own fp8-e4m3fn+E2M1+bf16 math
+(each primitive byte-exact vs torch) vs the coherent FL2VA GGUF (gguf.quants). The two files are ONE base
+model — islands BYTE-IDENTICAL, every sampled projection (qkv/out/fc1/fc2/adaln blocks 0..45 + refiners)
+sign-agree 1.000. ROOT CAUSE: the community ckpt (converted_by "Star Ultimate Model Converter Pro") packs
+fp4 HIGH-first (element 2i in the high nibble) vs the modelopt low-first our DequantNvfp4ToBf16+Marlin
+assume; read low-first every adjacent pair is swapped -> scrambled matrix. Low-first corr 0.000; HIGH-first
+sign-agree 1.000 over 115M weights, corr 0.85->0.94 with |w| (NVFP4-vs-Q3K quant-noise floor). #93 three
+guesses (island preservation/weight_scale_2/name mapping) ALL wrong. FIX: nibble-swap (b>>4)|(b<<4) at load
+in the 3 H3 NVFP4 loaders (reference+bf16+fp4 streamers); H3-scoped, shared DequantNvfp4ToBf16 untouched
+(Laguna/DS4/Qwen3 stay low-first); default ON, VT_H3_NVFP4_LOWNIBBLE=1 reverts. BYTE-VERIFIED on GB10: the
+binary streamer dump of blocks.0.attn.qkv_proj[0:16] == the oracle HIGH-first row exactly, sign-matches the
+GGUF; params IDENTICAL between the files. BUT the render STILL grids: t2va, ref2va, AND fl2va-with-keyframe
+(output-pinned) all grid, while the FL2VA-GGUF control renders a coherent cat on IDENTICAL weights+params in
+the same build. So checkpoint content sound + loader dequant byte-correct + params identical + pinning does
+NOT rescue -> a SECOND, independent defect in the NVFP4 render PATH (device stream/forward), NOT the ckpt,
+nibble, fp4, or free-gen. fp4-resident Marlin arm grids differently again (3rd, Marlin-specific, only ever
+wiring-gated). NEXT: layer-by-layer activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream
+(identical weights; differ only in dequant source + island read bf16-disk vs f16-disk). Records: spec
+§8.11 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
+
+
+## 2026-08-07 — startup latency MEASURED (provisional): 36.51 s vs vLLM 221.51 s = 6.07x
+<!-- state: 2026-08-07T05:35 -->
+
+First numbers on the axis landed yesterday. Qwen3.6-27B-NVFP4 on GB10, 3
+interleaved repetitions, page cache dropped per leg, vLLM oracle 0.25.0:
+ours 37.94/36.51/35.88 (median **36.51 s**), vLLM 460.36/221.51/217.86 (warm
+median **221.51 s**), `startup_speedup_vs_vllm` **6.07**.
+
+vLLM's 460 s r1 is its one-time FlashInfer autotune + compile population, named
+in its own log (`saved 64 configs`; `init engine ... 259.42 s`, compilation
+46.43 s) versus r2 (`loaded 64 configs`; 26.95 s, compilation 11.73 s). Even
+warm, engine init is only ~27 s of ~221 s: most of vLLM's startup is process
+start, imports and weight load, which is where the gap actually lives. Our own
+cold-autotune start is 69.29 s, so our one-time cost is +33 s.
+
+**NOT binding, two reasons.** (a) A concurrent build session appeared at
+00:38:41 and overlapped r2/r3 of both arms, including BOTH warm-cache vLLM legs;
+the bias direction inflates our ratio. (b) The uncontended repeat completed our
+cold-cache r1 and then the box HARD-REBOOTED at ~00:54 during vLLM's
+cold-autotune leg (previous boot's journal ends mid-leg, no shutdown sequence,
+machine back at 01:31).
+
+**New hazard datum for [[gb10-unified-memory-oom-reboots-box]]:** the trigger was
+the COLD-autotune vLLM leg. The same `--gpu-memory-utilization 0.6` ran six times
+without incident in the first series with a warm autotune cache. Pre-warm vLLM's
+autotune cache BEFORE a series, not inside it.
+
+Process note: an aborted attempt to clear both autotune caches deleted
+`~/.cache/vllm.cpp/nvfp4_autotune` and `~/.cache/vllm/flashinfer_autotune_cache`
+and PARTIALLY deleted `~/.cache/vllm/torch_compile_cache` (root-owned files from
+a container refused `rm`). The autotune caches were repopulated by the runs; the
+torch compile cache was left partially cleared and self-heals on next vLLM start.
+
+Evidence: `dgx:~/work/vllm.cpp-online-gate/evidence/8f752ae5.../startup/27/`
+(series 1) and `dgx:~/work/startup-axis/clean-claim/.../startup/27/ours/r1.json`
+(the surviving cold-cache leg). Owed: one uncontended 3-rep series on a quiet box.
+[2026-08-07] H3-NVFP4-STREAM-DIFF (#95) — the #94 residual DIAGNOSED: there is NO discrete load-path
+defect. Ran #94's prescribed identical-weights activation diff (NVFP4-bf16 stream vs FL2VA-GGUF-bf16
+control, byte-identical inputs via encode-once pe.f32) + direct WEIGHT fingerprints, via an env-gated
+per-stage hook in MiniMaxH3DitForwardDevice (VT_H3_ACT_DUMP, byte-inert unset). FINDING: every weight,
+bias, fp32 island, output head, q/k-norm loads quant-noise-close to the coherent GGUF (qkv/out/fc/adaln
+2-6% rms = Q3K-vs-NVFP4 quantizer variance, sign-correct; ALL biases <0.1% apart incl adaln_b; islands
++heads quant-noise-close), and the RoPE cos/sin cache is BYTE-IDENTICAL — no scramble/transpose/mis-stride/
+wrong-dtype/wrong-shape. Both arms run the IDENTICAL forward, so the grid is 100% from the per-weight
+NVFP4-vs-Q3K quant delta on the SAME weights. Divergence FIRST appears at the token refiner (text_refined
+ratio 0.92, sampRelL2 0.48) + the block-0 attention INPUT (normed_pre_attn 0.89), NOT RoPE/GEMM/norm
+weights, and amplifies chaotically through the 50-block stack driven by the Qwen massive text activation
+(condition_proj absmax ~7.4e4); final latents DECORRELATED (sampRelL2 >1, not scale) -> chaotic trajectory.
+Render A/B re-confirmed same byte-inert build: NVFP4 t2va pale patch grid, FL2VA-GGUF t2va coherent orange
+cat. CONCLUSION: not a loader fix — residual = the community NVFP4 checkpoint's quant fidelity (Star
+Ultimate Model Converter Pro lineage; corr 0.85-0.94 to the coherent Q3K) x the DiT's massive-activation
+sensitivity. Clean-reference disambiguation blocked (bf16 132GiB = OOM on 1 GB10; same-finetune REF2VA-GGUF
+= 23G-disk-blocked); path forward = an official modelopt-NVFP4 ckpt. fp4-resident Marlin arm's separate
+grid untouched (wiring-gated-only). Diagnostic hooks landed byte-inert. Records: spec §8.12 + §8.2 row,
+STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
 - **2026-08-07 (later)** — **`VK-C`: cooperative-matrix GEMM tactic, VERIFIED ON
   GB10 (`CLAIM-VULKAN-FULL-1`, row `BACKEND-VULKAN`).**
 

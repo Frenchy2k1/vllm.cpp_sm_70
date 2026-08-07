@@ -14310,3 +14310,228 @@ UNRELATED CUDA case (line 3503, "an NVFP4 checkpoint loads into a runnable DiT")
 isolation (585 assertions) and runs BEFORE the new case — a pre-existing cross-test CUDA
 resource-accumulation flake, not this change; the new loader gate passes standalone (59
 assertions).
+
+## MiniMax-H3 ENCODER VISION SCATTER + ref2va re-attribution (`row/H3-VISION-SCATTER` PR #90, 2026-08-07, dgx sm_121a)
+
+Closes the #86 residual at the framework level and RE-ATTRIBUTES the ref2va grid with a GB10
+render A/B. Builds on #86 (real `visual.*` tower LOADS + fl2va COHERENT via VAE-keyframe).
+
+**`deepstack_visual_indexes` CONFIRMED (was #86-inferred).** `{8, 16, 24}` grounded in the
+release config: MiniMax-H3's `text_encoder/` IS Qwen3-VL-32B-Instruct
+(HF DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/config.json), whose
+`vision_config.deepstack_visual_indexes = [8, 16, 24]`, depth 27, text `num_hidden_layers = 64`
+(→ min(64,50)=50). Identical to vllm-omni `Qwen3VLMoeVisionConfig` default and public
+`Qwen/Qwen3-VL-30B-A3B-Instruct`. The #86 inference was right; no code value change.
+
+**Deliverable 1 — DEVICE scatter+inject WIRED 1:1 + GATED.** `MiniMaxH3EncoderTextForwardDevice`
+now takes the optional `visual_pos_mask` + per-tap `deepstack` blocks and ADDS each block into the
+masked visual rows after each of the first `len(deepstack)` decoder layers — device mirror of the
+gated host reference and upstream `_deepstack_process` (encoder.py:770-800). The merged masked_scatter
+into inputs_embeds stays the caller's job (upstream `_encode`, encoder.py:1071). Gate
+(`test_minimax_h3 :: "the DEVICE keep-quant encoder matches the host f32 reference"`): device forward
+now also runs WITH a visual mask + 2 DeepStack blocks → device==host max|diff| **3.8e-4** (≤ 2e-3)
+AND DeepStack moves the conditioning (scale 1.006→1.062). PASS, 1562 assertions. Host text tower,
+full vision tower, GGUF visual.* loader, MM processor all green. The full-suite SIGSEGV at line 3503
+(NVFP4 case) is the known cross-test CUDA flake — passes standalone (585 assertions), not this change.
+
+**Driver `--cond-image`** routes a reference image through the encoder vision path (reuse only:
+Qwen3VLImageProcessor → Qwen3VLVisionForward → merged+3 DeepStack; ExpandImagePlaceholders inserts nm
+image-pad tokens; masked_scatter; Qwen3VLGetRopeIndex == H3 `_get_rope_index` for t==1). Additive.
+
+**GB10 render A/B (256×256/22f/12steps).**
+- **Deliverable 3 — fl2va WITH the encoder vision path = COHERENT + matching (PASS).** FL2VA GGUF
+  `--dequant-bf16` + `--first-frame` + `--cond-image` + `--partition fl2va`, prompt "a fluffy orange
+  cat sitting on a windowsill in warm sunlight". conditioning=[82,5120] (16 prompt + 66-token vision
+  block: 64 merged + 2 markers). Frame 0 = coherent orange cat (keyframe); frame 21 = the cat on a
+  WINDOWSILL in warm sunlight — the clip EVOLVED toward the prompt. No grid. Artifact
+  `~/h3fp4/out_vs_fl2va.mp4` (+ out_vs_fl2va/frame_*.ppm). The vision conditioning is SOUND.
+- **Deliverable 2 — ref2va WITH the vision-enriched prompt STILL GRIDS (honest FAIL).** Ref2VA NVFP4
+  `--fp4-resident` + `--ref-image` (VAE reference rows) + `--cond-image` + `--partition ref2va`, same
+  prompt. conditioning=[82,5120] (64 merged + 3 DeepStack), 1 reference image, latent 7×16×16. Every
+  frame (0/10/21) is the same multicolour PATCH GRID as #86's text-only ref2va. Artifact
+  `~/h3fp4/out_vs_ref2va.mp4`.
+
+**RE-ATTRIBUTION (with evidence).** The "vision-enriched conditioning fixes the grid" hypothesis is
+REFUTED. The ref2va grid is NOT the encoder conditioning: (a) the DiT forward MATH is byte-exact vs
+upstream (geometry ladder green every rung #74; device==host at real seq 1920 #77); (b) the SAME
+vision scatter+DeepStack path renders a COHERENT fl2va-with-`--cond-image`; (c) the grid is INVARIANT
+to text-only (#86) vs vision-enriched prompts. The only difference between coherent fl2va and gridding
+ref2va: fl2va PINS output rows (keyframe cond rows) each step, ref2va PREPENDS free-running reference
+rows. So the residual is the **ref2va reference-row conditioning ASSEMBLY**
+(`MiniMaxH3EncodeReferenceImages` VAE-reference rows + `minimax_h3_packed_sequence_ref2va_blocks`
+noised-anchor layout + how the denoise loop conditions the un-pinned target rows), NOT the prompt and
+NOT the DiT forward. Next diagnostic: dump the ref2va target-row VAE-input adjacency-cosine (like #77's
+0.95 for coherent fl2va) to confirm the target rows are white, and A/B the reference-row condition-noise.
+
+## MiniMax-H3 ref2va ASSEMBLY fix + grid RE-ATTRIBUTED to the NVFP4 checkpoint (`row/H3-REF2VA-ASSEMBLY` PR #93, 2026-08-07, dgx sm_121a)
+
+Followed §8.9's residual (ref2va reference-row assembly), diffed it vs upstream, fixed a real bug,
+gated it, re-rendered — and the render DISPROVED the §8.9 attribution.
+
+**Real bug fixed.** `MiniMaxH3EncodeReferenceImages`/`Video` emitted PATCHED ref-block dims
+(`ls.h/patch_size_h`); `BuildMiniMaxH3PackedSequenceRef2va` divides `block.latent_h/kPatchH` AGAIN
+(mirroring upstream `packed_sequence.py:328-330`, which takes the UNPATCHED latent; upstream feeds the
+raw latent `visual_shape=(1,height//16,width//16)`, `pipeline_minimax_h3.py:1141-1145`). Double-division
+under-allocated the reference span by patch_h*patch_w (=4); the denoise pin-loop `>=` check silently
+TRUNCATED the oversized encoded reference to its first quarter. Fix = emit raw `ls.{t,h,w}`.
+
+**Gates.** goldens section 5c (ref2va-shaped DiT-forward rung: image + video+audio ref blocks, 8×8
+geometry, ref2va timestep partition + audio update mask, RefDiT) → C++ case "DiT-forward REF2VA rung
+matches upstream (reference rows, mixing)"; RED-first encoded-vs-layout row-count invariant
+(reintroducing the bug fails 128==512 = 16 encoded vs 4 allocated; restored green). Suite 69/69, 52377
+assertions. Goldens regen purely additive (635 inserts, 0 deletes).
+
+**GB10 render A/B + ISOLATION (256×256/22f/12steps, fixed incremental binary).**
+
+| Render | Checkpoint | Quant | Assembly | Result |
+|---|---|---|---|---|
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | fp4-resident | full | GRID |
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | bf16 dequant | full | GRID (fp4 eliminated) |
+| t2va (no refs, no cond-image, `--partition fl2va`) | ref2va NVFP4 | bf16 dequant | NONE | GRID (assembly eliminated) |
+| fl2va (keyframe + `--cond-image`) | FL2VA GGUF | bf16 | keyframe | COHERENT (cat→windowsill; no regression) |
+
+**Re-attribution (corrects §8.9 + §8.6).** The grid is NOT the ref2va assembly and NOT fp4 — it appears
+with the ENTIRE reference assembly removed, in both fp4 and bf16. It correlates 1:1 with the ref2va
+NVFP4 CHECKPOINT: every render loading `minimax_h3_ref2va_nvfp4_full` grids; every FL2VA-GGUF render is
+coherent. §8.9's A/B varied only the prompt, §8.6's only the task — neither varied the checkpoint/quant,
+so both misattributed a checkpoint/loader defect. True residual = the NVFP4 DiT loader for this file
+(`StreamMiniMaxH3Nvfp4ToDeviceBf16/Fp4`): suspect fp32-island preservation (patch/time/output layers,
+`minimax_h3_transformer.py:898-904`), `weight_scale_2` double-dequant, or the 1051-tensor name mapping.
+Synthetic-NVFP4 gates proved the dequant MATH byte-exact but never loaded THIS file vs a coherent oracle.
+Next: a REF2VA GGUF (bf16, known-good loader) as checkpoint oracle — dgx-disk-blocked (23 GiB free).
+Artifacts `~/h3fp4/out_{vs_ref2va,bf16_ref2va,t2va_nvfp4,vs_fl2va}.mp4`.
+
+## MiniMax-H3 — the Thor render-speed leg, the audio-duration bug, and the Q3_K_M quantization floor (2026-08-06)
+
+Moved out of `docs/BENCHMARKS.md` on landing: the scoreboard is a keyed table, so
+the measured results live there as three rows and the forensics live here.
+
+**Thor render speed (sm_110, no FlashAttention-2).** One Jetson Thor, 864x480 /
+124 frames / 50 steps, Q4_K_M DiT:
+
+| stage | measured |
+|---|---|
+| DiT forward | **34.6 s/step** (was 574.5 s before the attention work: **16.6x**) |
+| attention share of a step | 96% before, and the whole of that 16.6x |
+| full 50-step render | **~28 min** (was ~8 h) |
+
+The 16.6x is three landed changes and two MEASURED NEGATIVES: warp-per-query,
+then a chunked warp reduce-scatter (1.76x), then bf16 tensor cores via
+`mma.sync` (9.82x). Shared-memory K/V tiling (**23% SLOWER**) and register
+Q-blocking (**-0.8%**) were both measured and REVERTED. Both chased memory
+traffic, which is not the bound: one head's K+V is 3.9 MB against 32 MB of L2.
+Do not re-run either without a new reason.
+
+**Quantization floor: use Q4_K_M, not Q3_K_M.** H3's split-half RoPE produces
+channel-wise magnitude outliers that 3 bits cannot hold. A controlled A/B (same
+prompt, same seed, same code, only the DiT encoding changed) turned a murky
+lattice-covered silhouette into a photoreal close-up.
+
+**The audio-duration bug: a 124-frame render silently muxed as 61 frames.**
+`audio_t` is the PER-CHANNEL latent length (the planner sets it from 40 Hz *
+duration) and the packed layout carries `audio_t * audio_channel` ROWS, one per
+(channel, step). The denormalize step divided by the channel count, so the
+decoded audio ran half the video's duration; because the muxer passes
+`-shortest`, that silently truncated the VIDEO to half its frames too.
+
+Worth recording is WHY the suite was blind to it. Every existing gate asserts
+shape SELF-CONSISTENCY, and a uniformly halved pipeline is perfectly
+self-consistent: the shapes agreed with each other, they were just half as long
+as the request asked for. `ffprobe` on the artifact exposed it. The gate added
+is the invariant that is NOT self-consistency: latent steps / 40 Hz must equal
+the video duration, to within one latent step.
+
+(The sibling reference-leak bug found in the same render session, where
+conditioning rows reached unpatchify, was independently fixed on `main` by
+`row/H3-RENDER-CLOSE` taking the TRAILING target rows; this row's alternative
+`update_mask` mechanism was dropped rather than landed twice.)
+## MiniMax-H3 NVFP4 ref2va grid — independent-oracle loader diff: fp4 nibble-order bug FIXED, but a 2nd NVFP4-path defect remains (`row/H3-NVFP4-LOADER-DIFF` PR #94, 2026-08-07, dgx sm_121a)
+
+Followed #93's residual (the ref2va NVFP4 checkpoint/loader) with an independent-oracle loader diff — NO new download. Root-caused + fixed a REAL loader bug #93 mis-guessed, verified byte-exact, but the render still grids from a SECOND, independent defect that is NOT the checkpoint content and NOT the loader dequant.
+
+**Method.** An independent CPU dequant of `minimax_h3_ref2va_nvfp4_full.safetensors` (own fp8-e4m3fn + E2M1 + bf16 math; each primitive byte-EXACT vs torch, verified over all 256 fp8 bytes and 200k bf16 RNE cases) diffed against the coherent FL2VA GGUF via the maintained `gguf.quants` dequant (trusted, independent). The two files share the SAME base DiT: the islands (`condition_proj`, `time_embedder`, both patch projections, norms, `rope.inv_freq`) are BYTE-IDENTICAL, and every sampled projection (`qkv`/`out`/`fc1`/`fc2`/`adaln`, blocks 0..45 step 5 + both token_refiners) has sign-agreement 1.000 — so fl2va and ref2va are one model, and the coherent GGUF is a per-tensor oracle for the ref2va projections too.
+
+**Root cause (fixed).** The community checkpoint (metadata `converted_by: "Star Ultimate Model Converter Pro"`) packs the two fp4 elements per byte HIGH-first (element 2i in the high nibble, 2i+1 in the low) — the opposite of the modelopt standard our `DequantNvfp4ToBf16` + Marlin assume. Read low-first, every adjacent fp4 pair is swapped, so each projection matrix is internally scrambled: vs the coherent GGUF, low-first gives elementwise corr **0.000**; HIGH-first gives **sign-agreement 1.000 over 115M+ weights** and corr 0.85→0.94 rising with |w| (the NVFP4-vs-Q3_K quant-noise floor). Islands are bf16 (not nibble-packed) → byte-identical → exactly why #93/#86 misattributed. #93's three guesses (island preservation / weight_scale_2 / name mapping) were all wrong; none named the nibble order. Fix: swap the two nibbles of every packed byte at load (`(b>>4)|(b<<4)`) in the three H3 NVFP4 loaders (reference + bf16 streamer + fp4-resident Marlin streamer) → the file's high-first bytes become the standard low-first both arms expect. H3-scoped; shared `DequantNvfp4ToBf16` untouched (Laguna/DS4/Qwen3 stay low-first). Default ON; `VT_H3_NVFP4_LOWNIBBLE=1` reverts.
+
+**Fix BYTE-VERIFIED on GB10.** An env-gated dump of the actual streamer output: the binary's `blocks.0.attn.qkv_proj[0:16]` with the fix = `-0.0859 -0.0430 -0.1289 -0.0430 -0.0859 0.1719 -0.1289 0.2578 ...` = EXACTLY the independent oracle's HIGH-first row, sign-identical to the GGUF (`-0.0679 -0.0679 -0.1357 ...`). Derived params IDENTICAL between the two files (L=50 refL=2 H=5376 heads=56 ffn=14336 txt=5120 lat=24 alat=32 adaln=96768 …).
+
+**GB10 render A/B (256×256/22f/12steps).**
+
+| Render | Checkpoint | Quant | nibble | Result |
+|---|---|---|---|---|
+| t2va (no refs, `--partition fl2va`) | ref2va NVFP4 | bf16 | LOW (=1) | severe dark GRID (= #93 baseline) |
+| t2va (no refs, `--partition fl2va`) | ref2va NVFP4 | bf16 | HIGH (fix) | pale GRID (weights now correct; STILL grids) |
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | bf16 & fp4 | HIGH (fix) | GRID |
+| fl2va + keyframe (`--first-frame`) | ref2va NVFP4 | bf16 | HIGH (fix) | GRID (output-pinning does NOT rescue) |
+| t2va (no refs, `--partition fl2va`) | FL2VA GGUF | bf16 | — | COHERENT orange cat (control, this build) |
+| fl2va + keyframe (`--first-frame`) | FL2VA GGUF | bf16 | — | COHERENT (#93) |
+
+**RE-ATTRIBUTION (corrects #93 again).** The nibble fix CHANGES the output (low-first severe grid → high-first pale grid, so the swap IS applied) yet EVERY NVFP4 render grids — t2va, ref2va, AND fl2va-with-keyframe — while the fl2va-GGUF control (SAME weights, SAME params, verified byte-for-byte) renders a coherent cat in the same build and same task. So: the checkpoint CONTENT is sound (byte-matches the coherent GGUF), the loader dequant is now byte-correct (binary dump == oracle == GGUF-sign), the derived params are identical, and output-pinning (keyframe) does NOT rescue it (rules out free-generation divergence). The residual grid is therefore a SECOND, independent defect in the NVFP4 render PATH itself — the device stream / forward, NOT the checkpoint, NOT the fp4 nibble order, NOT free-gen. The fp4-resident Marlin arm additionally grids differently (a THIRD, Marlin-specific issue — that path was only ever wiring-gated, never correctness-gated). The nibble fix is the objectively-correct dequant (the file IS high-first) and lands default-ON (A/B via `VT_H3_NVFP4_LOWNIBBLE=1`); it is byte-verified but not yet render-validated, blocked on the second defect. Next diagnostic: layer-by-layer intermediate-activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream (identical weights) to locate where they diverge — the streamers are structurally identical except the dequant source and the island read (bf16-disk vs f16-disk), so the divergence is a candidate.
+
+Artifacts `~/h3fp4/{t2va_fix,t2va_nofix,ctrl_t2va,ab_bf16fix,ab_fix,ab_nofix,kf_nvfp4}.mp4`.
+
+## Rolled out of the scoreboard on 2026-08-07
+
+Moved verbatim from `docs/BENCHMARKS.md` by `scripts/roll-benchmark-record.py`. Nothing edited or deleted.
+
+## Startup latency
+
+**PROVISIONAL, not binding.** Qwen3.6-27B-NVFP4 on GB10, `--startup-only`, three
+interleaved ours/vLLM repetitions under one `/tmp/gpu` lock, page cache dropped
+before every launch, GPU proven idle before and after each leg. vLLM oracle
+0.25.0 in the same production config the throughput grid uses.
+
+| Repetition | vllm.cpp | vLLM 0.25.0 |
+|---|--:|--:|
+| r1 | 37.94 s | 460.36 s (cold FlashInfer autotune) |
+| r2 | 36.51 s | 221.51 s |
+| r3 | 35.88 s | 217.86 s |
+| **median** | **36.51 s** | **221.51 s** |
+
+**6.07x faster to first `/health`.** Our band is 35.88 to 37.94 s (±3%); vLLM's
+two warm legs agree within 1.7%.
+
+The 460 s vLLM leg is a genuine one-time-per-machine cost, and vLLM's own log
+names it: r1 `init engine (profile, create kv cache, warmup model) took 259.42 s
+(compilation: 46.43 s)` while the FlashInfer autotuner **saved** 64 configs;
+r2 `took 26.95 s (compilation: 11.73 s)` while it **loaded** them from
+`~/.cache/vllm/flashinfer_autotune_cache`. Note that even warm, vLLM's engine
+init is only ~27 s of its ~221 s: the rest is process start, imports and weight
+load, which is where our advantage actually comes from.
+
+Our equivalent one-time cost is **+33 s**: a separate quiet-box run with both
+autotune caches cleared measured our cold-cache start at **69.29 s** against the
+36.51 s warm median (`[VT_FP4_CACHE] loaded=0` vs `loaded=64 tuned=0`).
+
+### Why this is not binding yet
+
+1. **Contention.** A concurrent build session appeared on the box at 00:38:41,
+   overlapping r2 and r3 of both arms. Our numbers look unaffected (the
+   overlapped leg was our fastest), but both warm-cache vLLM legs are inside
+   that window and contention would bias vLLM slow, inflating the ratio.
+2. **The re-run died with the host.** The uncontended repeat completed our
+   cold-cache r1 (69.29 s) and then the box **hard-rebooted at ~00:54** during
+   vLLM's cold-autotune leg (`gpu_memory_utilization=0.6` on the 119 GiB unified
+   pool; the previous boot's journal ends mid-leg with no shutdown sequence).
+   This is the known GB10 unified-memory reboot hazard, now also reproduced with
+   a *cold-autotune* vLLM leg, which peaks higher than the warm one the first
+   series ran six times without incident.
+
+Repro: `scripts/dgx-online-serving.sh --startup-only --model 27 ...`; evidence
+under `dgx:~/work/vllm.cpp-online-gate/evidence/8f752ae5.../startup/27/`.
+Method and caveats: [.agents/specs/startup-latency-axis.md](../.agents/specs/startup-latency-axis.md).
+
+
+## MiniMax-H3 NVFP4 ref2va grid — the #94 residual DIAGNOSED: NO discrete load-path defect (identical-weights activation diff) (`row/H3-NVFP4-STREAM-DIFF` PR #95, 2026-08-07, dgx sm_121a)
+
+Ran #94's prescribed next diagnostic — a layer-by-layer activation diff of the NVFP4-bf16 stream vs the FL2VA-GGUF-bf16 control on BYTE-IDENTICAL inputs — plus direct WEIGHT fingerprints. The result REFUTES the "second NVFP4-render-path defect" hypothesis: there is **no discrete load-path materialization bug**. All weights load correctly; the residual grid is checkpoint-quantization fidelity × the DiT's massive-activation sensitivity.
+
+**Method.** Env-gated per-stage fingerprint hook inside `MiniMaxH3DitForwardDevice` (`VT_H3_ACT_DUMP`, byte-inert unset; `minimax_h3_device.cpp`): summary stats (mean/rms/absmax/finite) + a fixed positional-sample spread (catches transpose/scramble even when rms matches), at every embed/scatter/time stage, every block's adaln+post-attn+post-mlp, the final heads, the RoPE cos/sin cache, the block-0 attention internals (qkv/split/qknorm/rope/core/out_proj), and input-independent WEIGHT fingerprints for every island, bias, output head, q/k-norm and block-0/refiner-0 projection. Both arms: ONE small t2va forward (`--denoise-only --steps 2`, 256×256/22f, `--partition fl2va`) with byte-identical `--prompt-embeds pe.f32` (encoded once, reused → no encoder; both arms feed the SAME text conditioning) + identical seeded noise; final video checksum is DETERMINISTIC per arm (GGUF 9411.61, NVFP4 1160.19, reproduced across three runs).
+
+**Every loaded tensor is quant-noise-close; there is no scramble/transpose/mis-stride/wrong-dtype/wrong-shape.** Direct fingerprints (NVFP4 vs GGUF): `qkv_proj` rms 8.94e-2 vs 8.46e-2, `q_norm`/`k_norm` essentially identical (rms 1.086 vs 1.086), `out_proj` 8.47e-2 vs 8.14e-2, `fc1`/`fc2`/`adaln_w` within 2-6% (Q3_K-vs-NVFP4 quantizer variance, sign-correct); ALL biases identical (`adaln_b` 0.1554 vs 0.1554, `final_adaln_b`, `condition_b`, time biases all <0.1% apart); ALL fp32 islands and output heads (`video_patch_w` rms 0.22059 both, `video_out_w`, `audio_out_w`, `time_in/out_w`) quant-noise-close; and the **RoPE cos/sin cache is IDENTICAL** (same samples, rules out `rope.inv_freq`). Both arms run the IDENTICAL forward code, so the grid is 100% attributable to the per-weight NVFP4-vs-Q3_K quantization difference on the SAME weights (#94 proved sign-agreement 1.000 → same weights; dequant byte-verified).
+
+**Divergence profile (paired stage rms-ratio N/G, and sample-relative-L2):** embed video/audio/text-condition/adaln = 1.00 (quant noise); FIRST real divergence at the **token refiner** `text_refined` (0.92, sampRelL2 0.48); then `block.0.normed_pre_attn` (0.89 — the attention INPUT already diverges) → `qkv_out` (0.78) → `core_out` (0.78) → `out_proj` (0.60); amplifies through the 50-block stack; final latents are DECORRELATED (sampRelL2 >1, not scale-related). Driver: the Qwen massive text activation (`condition_proj` output absmax **~7.4e4**) makes the refiner/attention chaotically sensitive to the few-% weight quant delta. NVFP4 stays systematically lower-magnitude (→ "pale"). This is CHAOTIC trajectory divergence, not a fixable scramble/scale.
+
+**Render A/B re-confirmed in the same byte-inert build (256×256/22f/12steps, `pe.f32`, `VT_H3_ACT_DUMP` unset).** NVFP4 t2va = pale multicolour PATCH GRID every frame (0/10/21, per-patch uniform = degenerate latent); FL2VA-GGUF t2va = a COHERENT photorealistic orange cat on a windowsill. The diagnostic hooks are byte-inert (reproduce #94's outputs exactly).
+
+**CONCLUSION.** The mission's "2nd load-path defect" does not exist — our loader materializes the community NVFP4 file's weights faithfully (byte-verified). The residual is the **community NVFP4 checkpoint's quantization fidelity** (metadata `converted_by: "Star Ultimate Model Converter Pro"` — same dubious-converter lineage as the #94 nibble bug; corr to the coherent Q3_K only 0.85-0.94, well below the >0.99 a clean 4-bit quant gives) interacting with the DiT's massive-activation sensitivity. Definitively separating "poor community quant" from "inherent t2va-OOD sensitivity of these fl2va/ref2va finetunes" needs a clean reference — a bf16 ground truth (132 GiB host-f32 = OOM on one GB10) or a same-finetune REF2VA-GGUF control (disk-blocked, 23 GiB free) — both currently blocked; the path forward is an official modelopt-NVFP4 checkpoint, not a loader change. The #94 nibble fix stands as the objectively-correct dequant. The fp4-resident Marlin arm's separate grid stays a distinct, wiring-gated-only residual (untouched, per the mission). Artifacts `~/h3fp4/diff/{nvfp4_t2va,gguf_t2va}.mp4` + `{gguf,nvfp4}{2,3,4}.txt` fingerprints.

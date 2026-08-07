@@ -420,6 +420,7 @@ class RefDiT:
         infer_out_pos,
         cu_seqlens,
         refiner_cu_seqlens,
+        audio_update_mask=None,
     ):
         seq_len = int(x.shape[1])
         freqs = rope_freqs(self.inv_freq, img_position_ids)
@@ -478,6 +479,11 @@ class RefDiT:
         video = video.index_select(0, infer_out_pos)
         audio = audio.index_select(0, audio_pos)
         video = video * update_mask.to(torch.float32).unsqueeze(-1)
+        # ref2va: audio reference rows are pinned condition, so their DiT output is
+        # masked out too (minimax_h3_transformer.py:1099-1101). fl2va rungs have no
+        # audio condition and pass None, so this is a no-op there.
+        if audio_update_mask is not None:
+            audio = audio * audio_update_mask.to(torch.float32).unsqueeze(-1)
         return video, audio
 
 
@@ -1021,6 +1027,194 @@ def emit_dit_ladder(out, packed_sequence) -> None:
         emit_f64(out, f"{p}MixFraction", [r["mix_fraction"]])
 
 
+# ---------------------------------------------------------------------------
+# Section 5c: the DiT-forward REF2VA rung (reference rows).
+#
+# Every existing DiT-forward gate (section 5 + the 5b geometry ladder) runs the
+# FL2VA packed layout: a keyframe-cond prefix that shares the TARGET frame grid,
+# no audio reference rows, one update mask. The REF2VA assembly is structurally
+# different and was NEVER exercised through the DiT forward -- exactly the
+# recurring blind-spot class (spec section 8.9): a bug in the reference-row
+# assembly (VAE-reference row count, the ref-block position grid, the ref token
+# tags, the audio reference update mask) is invisible until a REF2VA layout is
+# actually forwarded. This rung builds a real ref2va layout via the upstream
+# minimax_h3_packed_sequence_ref2va_blocks (an image reference block + a
+# video+audio reference block prepended to the target video+audio) at real 8x8
+# spatial geometry, runs the RefDiT forward with the ref2va per-token timestep
+# partition (target video t_video, pinned video refs at the imgvid cond anchor
+# 0.999, target audio t_audio, pinned audio refs at 1.0), and gates the layout,
+# the video/audio logits and the target-row spatial-mixing probe. The C++ side
+# rebuilds it with BuildMiniMaxH3PackedSequenceRef2va, so the port's ref2va
+# packing AND its DiT forward over reference rows are both pinned to upstream.
+# ---------------------------------------------------------------------------
+
+# text_len, latent_t, latent_h, latent_w, audio_t, audio_channel
+REF2VA_DIT = dict(text_len=5, latent_t=2, latent_h=8, latent_w=8, audio_t=3, audio_channel=2)
+# One image reference + one video+audio reference, prepended in request order.
+REF2VA_DIT_BLOCKS = [
+    {"kind": "image", "latent_h": 8, "latent_w": 8},
+    {"kind": "video_audio", "ref_audio_t": 2, "latent_t": 2, "latent_h": 8, "latent_w": 8},
+]
+
+
+def _run_ladder_dit_ref2va(model, arch, packed, name):
+    """Mirror _run_ladder_dit but for a ref2va layout with reference rows.
+
+    The one structural difference is the AUDIO update mask: ref2va pins audio
+    reference rows (audio_update_mask False) at the audio-ref cond timestep and
+    masks their DiT output, so the timestep partition and the audio masking both
+    have to carry it. Everything else (scatter, refiner cu, the video mixing
+    probe) is identical to the fl2va helper.
+    """
+    seq_len = int(packed["seq_len"])
+    img_pos = packed["img_pos"].to(torch.long)
+    audio_pos = packed["audio_pos"].to(torch.long)
+    text_pos = packed["text_pos"].to(torch.long)
+    token_tags = packed["token_tags"].to(torch.long)
+    update_mask = packed["update_mask"].to(torch.bool)
+    audio_update_mask = packed["audio_update_mask"].to(torch.bool)
+    cu_seqlens = packed["cu_seqlens"].to(torch.int64)
+    img_position_ids = packed["img_position_ids"].to(torch.float32)[None]
+
+    video_width = arch["latents_dim"] * int(np.prod(arch["patch_size"]))
+    x = torch.zeros(1, seq_len, video_width, dtype=torch.float32)
+    x[0].index_copy_(
+        0,
+        img_pos,
+        torch.from_numpy(
+            h3_rand(f"ref2va_dit.{name}.video_rows", img_pos.shape[0] * video_width).astype(np.float32)
+        ).reshape(img_pos.shape[0], video_width),
+    )
+    audio_x = torch.zeros(1, seq_len, arch["audio_latents_dim"], dtype=torch.float32)
+    audio_x[0].index_copy_(
+        0,
+        audio_pos,
+        torch.from_numpy(
+            h3_rand(f"ref2va_dit.{name}.audio_rows",
+                    audio_pos.shape[0] * arch["audio_latents_dim"]).astype(np.float32)
+        ).reshape(audio_pos.shape[0], arch["audio_latents_dim"]),
+    )
+    prompt_embeds = torch.from_numpy(
+        h3_rand(f"ref2va_dit.{name}.prompt_embeds", text_pos.shape[0] * arch["text_dim"]).astype(np.float32)
+    ).reshape(text_pos.shape[0], arch["text_dim"])
+
+    # ref2va per-token timestep partition (denoise_loop.py:109-118): target rows at
+    # t_video/t_audio, pinned visual refs at the imgvid cond anchor, pinned audio
+    # refs at the audio-ref cond anchor, everything else at t_video.
+    t_video, t_audio, imgvid_cond_t, audio_ref_cond_t = 0.4, 0.35, 0.999, 1.0
+    timesteps = torch.full((seq_len,), t_video, dtype=torch.float32)
+    timesteps[img_pos[update_mask]] = t_video
+    timesteps[img_pos[~update_mask]] = imgvid_cond_t
+    timesteps[audio_pos[audio_update_mask]] = t_audio
+    timesteps[audio_pos[~audio_update_mask]] = audio_ref_cond_t
+    unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+    refiner_cu = torch.tensor([0, text_pos.shape[0], text_pos.shape[0]], dtype=torch.int64)
+
+    def forward(x_in):
+        return model(
+            x=x_in,
+            audio_x=audio_x,
+            img_position_ids=img_position_ids,
+            unique_timesteps=unique_timesteps,
+            inverse_indices=inverse_indices,
+            update_mask=update_mask,
+            token_tags=token_tags,
+            prompt_embeds=prompt_embeds,
+            img_pos=img_pos,
+            audio_pos=audio_pos,
+            text_pos=text_pos,
+            infer_out_pos=img_pos,
+            cu_seqlens=cu_seqlens,
+            refiner_cu_seqlens=refiner_cu,
+            audio_update_mask=audio_update_mask,
+        )
+
+    video_logits, audio_logits = forward(x)
+
+    # spatial-mixing probe over the video TARGET rows (identical to the fl2va helper).
+    target_local = [r for r in range(img_pos.shape[0]) if bool(update_mask[r])]
+    first_target = target_local[0]
+    x_pert = x.clone()
+    x_pert[0, int(img_pos[first_target]), :] += 1.0
+    video_pert, _ = forward(x_pert)
+    delta = (video_pert - video_logits).abs().amax(dim=-1)
+    other_targets = [r for r in target_local if r != first_target]
+    responded = sum(1 for r in other_targets if float(delta[r]) > _LADDER_MIX_EPS)
+    mix_fraction = responded / len(other_targets) if other_targets else -1.0
+
+    return dict(
+        seq_len=seq_len, img_pos=img_pos, audio_pos=audio_pos, text_pos=text_pos,
+        update_mask=update_mask, audio_update_mask=audio_update_mask, token_tags=token_tags,
+        cu_seqlens=cu_seqlens, img_position_ids=packed["img_position_ids"],
+        unique_timesteps=unique_timesteps, inverse_indices=inverse_indices,
+        video_logits=video_logits, audio_logits=audio_logits, video_width=video_width,
+        first_target=first_target, mix_delta=delta, mix_fraction=mix_fraction,
+    )
+
+
+def emit_dit_ladder_ref2va(out, packed_sequence) -> None:
+    out.write("// --- section 5c: DiT-forward REF2VA rung (reference rows, section 8.9) ---\n")
+    torch.manual_seed(0)
+    arch = ARCH
+    model = RefDiT(arch)
+
+    cfg = REF2VA_DIT
+    packed = packed_sequence.minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=cfg["text_len"],
+        latent_t=cfg["latent_t"],
+        latent_h=cfg["latent_h"],
+        latent_w=cfg["latent_w"],
+        audio_t=cfg["audio_t"],
+        ref_blocks=REF2VA_DIT_BLOCKS,
+        audio_channel=cfg["audio_channel"],
+    )
+    r = _run_ladder_dit_ref2va(model, arch, packed, "r2v")
+    p = "kH3Ref2vaDit"
+
+    for key, value in cfg.items():
+        emit_scalar(out, f"{p}_{key}", value)
+    emit_scalar(out, f"{p}_seq_len", r["seq_len"])
+    emit_scalar(out, f"{p}_num_img", int(r["img_pos"].shape[0]))
+    emit_scalar(out, f"{p}_num_audio", int(r["audio_pos"].shape[0]))
+    emit_scalar(out, f"{p}_num_text", int(r["text_pos"].shape[0]))
+    emit_scalar(out, f"{p}_num_unique", int(r["unique_timesteps"].shape[0]))
+    emit_scalar(out, f"{p}_video_width", int(r["video_width"]))
+    emit_scalar(out, f"{p}_first_target", int(r["first_target"]))
+    # The reference blocks, so the C++ side reconstructs the identical layout:
+    # kind is 0=image, 1=audio, 2=video_audio (MiniMaxH3RefBlock::Kind order).
+    kind_map = {"image": 0, "audio": 1, "video": 2, "video_audio": 2}
+    block_kinds, block_ra, block_lt, block_lh, block_lw = [], [], [], [], []
+    for b in REF2VA_DIT_BLOCKS:
+        block_kinds.append(kind_map[b["kind"]])
+        block_ra.append(int(b.get("ref_audio_t", 0)))
+        block_lt.append(int(b.get("latent_t", 0)))
+        block_lh.append(int(b.get("latent_h", 0)))
+        block_lw.append(int(b.get("latent_w", 0)))
+    emit_scalar(out, f"{p}_num_blocks", len(REF2VA_DIT_BLOCKS))
+    out.write("\n")
+    emit_i64(out, f"{p}BlockKinds", block_kinds)
+    emit_i64(out, f"{p}BlockRefAudioT", block_ra)
+    emit_i64(out, f"{p}BlockLatentT", block_lt)
+    emit_i64(out, f"{p}BlockLatentH", block_lh)
+    emit_i64(out, f"{p}BlockLatentW", block_lw)
+    # Layout tensors (gates BuildMiniMaxH3PackedSequenceRef2va through the DiT path).
+    emit_i64(out, f"{p}CuSeqlens", r["cu_seqlens"])
+    emit_i64(out, f"{p}ImgPos", r["img_pos"])
+    emit_i64(out, f"{p}AudioPos", r["audio_pos"])
+    emit_i64(out, f"{p}TextPos", r["text_pos"])
+    emit_i64(out, f"{p}UpdateMask", r["update_mask"].to(torch.int64))
+    emit_i64(out, f"{p}AudioUpdateMask", r["audio_update_mask"].to(torch.int64))
+    emit_i64(out, f"{p}TokenTags", r["token_tags"])
+    emit_f64(out, f"{p}ImgPositionIds", r["img_position_ids"])
+    emit_f32(out, f"{p}UniqueTimesteps", r["unique_timesteps"])
+    emit_i64(out, f"{p}InverseIndices", r["inverse_indices"])
+    # RefDiT forward + the spatial-mixing probe.
+    emit_f32(out, f"{p}VideoLogits", r["video_logits"])
+    emit_f32(out, f"{p}AudioLogits", r["audio_logits"])
+    emit_f32(out, f"{p}VideoMixDelta", r["mix_delta"])
+    emit_f64(out, f"{p}MixFraction", [r["mix_fraction"]])
+
+
 def emit_condition_noise(out, condition_noise, packed_tokens) -> None:
     """Section 7: condition-noise augmentation (condition_noise.py, VERBATIM).
 
@@ -1349,6 +1543,7 @@ def main() -> int:
         emit_scheduler(out, scheduling)
         emit_dit(out, packed)
         emit_dit_ladder(out, packed_sequence)
+        emit_dit_ladder_ref2va(out, packed_sequence)
         emit_planner(out, time_request)
         emit_condition_noise(out, condition_noise, packed_tokens)
         emit_reference_video(out)

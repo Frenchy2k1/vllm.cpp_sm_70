@@ -390,6 +390,39 @@ class RoleDiscipline(unittest.TestCase):
             [],
         )
 
+    def test_githubs_synthetic_pr_merge_is_accepted(self) -> None:
+        """`refs/pull/N/merge` names neither the branch nor the PR.
+
+        GitHub builds it as "Merge <head> into <base>" and CI checks out exactly
+        that commit, so before this every feature PR failed a gate about MAIN's
+        history on a commit that never lands on main. The reviewed content is the
+        SECOND parent: the PR head.
+        """
+        self.assertEqual(
+            discipline.commit_violations(
+                "abc1234", ["base", "head"],
+                "Merge 01cf15a1 into 4cfeee13", "",
+                ["src/vllm/a.cpp"],
+                ("feat(videos): a thing\n\nbranch `row/SERVE-VIDEOS-OAI`.",)),
+            [],
+        )
+
+    def test_a_merge_naming_no_row_anywhere_still_FAILS(self) -> None:
+        """The hole the case above must not open: a merge of a NON-row branch."""
+        problems = discipline.commit_violations(
+            "abc1234", ["base", "head"],
+            "Merge 01cf15a1 into 4cfeee13", "",
+            ["src/vllm/a.cpp"],
+            ("perf: hand-edit a kernel\n\nno branch, no PR",))
+        self.assertTrue(problems)
+        self.assertIn("without a reviewed", problems[0])
+        # And with no merged-branch messages at all (a plain local merge).
+        self.assertTrue(
+            discipline.commit_violations(
+                "abc1234", ["base", "head"], "Merge branch 'wip'", "",
+                ["src/vllm/a.cpp"])
+        )
+
     def test_squash_merge_with_pr_number_is_accepted(self) -> None:
         self.assertEqual(
             discipline.commit_violations(
