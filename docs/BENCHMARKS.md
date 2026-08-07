@@ -317,7 +317,7 @@ built on it rather than keeping the flattering one.
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
-| `/v1/videos` OpenAI (Sora) shape + ONE-SURFACE fold ROW 2 | **No number owed**: CPU serving-surface changes only; the video fold (ABI v12, seam-routed `/v1/videos`, thin clients) is byte-identical plumbing, no speed claim; server defaults now the ratified recipe (disclosed) | Speed stays the MiniMax-H3 FP4 row below; GB10 re-verify via the v12 ABI = named residual |
+| `/v1/videos` OpenAI + ONE-SURFACE ROW 2 | **No number owed:** ABI-v12 device selection is backend-dispatch plumbing; generation math and speed paths are unchanged | DSR 34→32; baseline/allowlist unchanged; 25/25 checker mutations. CPU tests CI-pending (local disk full) |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **Paged-incremental (§19) GB10: 18.9 tok/s @ 122/128 = coherent best.** bf16 stream REFUTED (§20/#118: 122→4/128 KDA repeat-loop, no speed win); STRICT unreachable (§14-§20 levers closed), p7 near-tie | vLLM ~21 (16-tok aggregate floor); ours **0.90× vLLM**. Last 0.10× + STRICT need vLLM's real kernels via the SERVER fold (scoped) |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |

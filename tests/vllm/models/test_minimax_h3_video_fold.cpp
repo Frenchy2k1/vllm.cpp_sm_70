@@ -124,6 +124,13 @@ void CheckAgainstGoldens(const std::string& out_dir) {
 
 }  // namespace
 
+TEST_CASE("minimax_h3 video fold: ABI device selectors map through DeviceType") {
+  CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(0) == vt::DeviceType::kCPU);
+  CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(1) == vt::DeviceType::kCUDA);
+  CHECK_THROWS(vllm::multimodal::MiniMaxH3VideoDeviceType(-1));
+  CHECK_THROWS(vllm::multimodal::MiniMaxH3VideoDeviceType(2));
+}
+
 // ─── ARM A: the library seam reproduces the pre-fold binary byte for byte ────
 TEST_CASE("minimax_h3 video fold: the library seam reproduces the pre-fold goldens") {
   FoldWorkspace ws;
