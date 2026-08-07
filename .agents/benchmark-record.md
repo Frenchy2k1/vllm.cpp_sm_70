@@ -15658,3 +15658,55 @@ itself.
 llvmpipe `test_vulkan_backend` **17/17 (873 assertions)** with the lever on AND
 off; opt-125m STRICT 6/6 (96/96), 0 declines, batching default.
 
+### The last two levers: one SUBSUMED, one UNESTABLISHED (2026-08-07, GB10)
+
+Both closed by measurement rather than built. Also fixes an observability
+regression `VK-A2` introduced.
+
+**Lever 4, Tier-1 fusion vocabulary — SUBSUMED BY `VK-A2`, not built.** The plan
+was to collapse `qkv_split -> rope_from_cache -> reshape_and_cache`, 672 dispatches
+into 224. Subtracting the per-dispatch floor from the batch-OFF profile shows what
+those ops actually COST once launch overhead is removed:
+
+| shader | measured | floor | REAL kernel work |
+|---|---:|---:|---:|
+| `vt_reshape_and_cache` | 11.2 ms | 10.3 | **0.9** |
+| `vt_silu_and_mul` | 10.3 | 10.3 | **0.0** |
+| `vt_rope_from_cache` | 9.7 | 10.3 | **0.0** |
+| `vt_qkv_split` | 9.5 | 10.3 | **0.0** |
+
+Their entire cost WAS the launch count, and batching already removed it. Fusing
+them now saves approximately nothing. GEMM is **64%** of real kernel work;
+`vt_rms_norm` is 22.5% and is genuine work rather than launch, so folding it would
+mean fusing INTO the GEMM — a much larger change than a vocabulary extension.
+
+**Lever 3, GEMV unroll — UNESTABLISHED at n=8, reverted.** Four independent
+accumulators keep four reads per lane in flight instead of one (memory-level
+parallelism, not instruction count). Correct: 17/17 and opt-125m STRICT 6/6.
+
+A first cross-session read said **0.99x**. Because a cross-session read is exactly
+what produced a false 1.2x for the subgroup tactic earlier today, the unroll factor
+was made a SPECIALIZATION CONSTANT so both arms run in one binary, and A/B'd
+interleaved:
+
+    unroll-4 faster in 5 of 8 pairs; ratios 0.92 0.95 1.00 1.03 1.08 1.10 1.11 1.18
+    arm medians 60.3 vs 60.4 tok/s
+
+A slight positive lean, well inside noise at this sample size, and 5/8 is not a
+majority. **Reverted**: a spec constant, an env lever, a tail loop and four
+accumulators is real complexity, and it has not been shown to buy anything. A
+larger sample could settle it; the honest state is "not established", which is not
+the same as the subgroup reduction's clean 4/8 wash.
+
+**OBSERVABILITY REGRESSION FROM `VK-A2`, fixed.** Per-shader TIME came from the
+per-dispatch fence wait. Batching submits many dispatches under ONE fence, so
+there is nothing to attribute and the profile printed **0.0 ms for every shader** —
+which reads as "these kernels are free" rather than "this was not measured". The
+dump now says so explicitly and prints counts only, pointing at
+`VT_VULKAN_BATCH=0` for per-kernel milliseconds. Restoring per-kernel time UNDER
+batching needs GPU timestamp queries (`vkCmdWriteTimestamp`), which is the proper
+Vulkan answer and is not built.
+
+**Blinding your own instrument is a cost of the optimisation, and it should be
+recorded as one.** Every lever this session was found with that profile.
+
