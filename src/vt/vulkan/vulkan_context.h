@@ -120,6 +120,20 @@ class VulkanContext {
   bool denorm_preserve_f32() const { return denorm_preserve_f32_; }
   bool signed_zero_inf_nan_preserve_f32() const { return sz_inf_nan_preserve_f32_; }
 
+  // --- COOPERATIVE MATRIX (VK-C). True iff the device exposes
+  // VK_KHR_cooperative_matrix AND reports a bf16 x bf16 -> f32 configuration at
+  // 16x16x16 with SUBGROUP scope AND has the subgroup size the committed SPIR-V
+  // assumes -- all four, because any one of them missing makes the coopmat
+  // pipeline unusable and the scalar tactic is always correct.
+  //
+  // MEASURED 2026-08-07: GB10 reports 11 configurations, all SUBGROUP scope,
+  // among them 16x16x16 bf16/bf16/f32/f32; llvmpipe exposes the extension NOT AT
+  // ALL. So this predicate is genuinely false on the only device CI can reach,
+  // which is why the scalar fallback is the tested-everywhere path and the
+  // coopmat path is dgx-gated.
+  bool coopmat_bf16_f32() const { return coopmat_bf16_f32_; }
+  uint32_t subgroup_size() const { return subgroup_size_; }
+
  private:
   VulkanContext();
   struct Pipeline;
@@ -146,6 +160,8 @@ class VulkanContext {
   bool unified_memory_ = false;
   bool denorm_preserve_f32_ = false;
   bool sz_inf_nan_preserve_f32_ = false;
+  bool coopmat_bf16_f32_ = false;
+  uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
   std::string device_name_;
 
