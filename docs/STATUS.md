@@ -67,7 +67,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; 3-rep grid 0.93-1.03x. Async batch-1 token-0 degeneration FIXED: `VT_ASYNC_DEVICE_MIRROR` default ON | Token-exact SYNC+ASYNC (RED→GREEN); c16 0.93x; `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) GREEN+RED but A/B NEUTRAL → OFF; c16 residual is prefill glue |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending. Async-serving P0 FIXED (`ROW-SERVE-ASYNC-DENSE-MIRROR`): classic-dense `Qwen3ForCausalLM` now honors the async device token-ids mirror; CPU-only -Werror test-guard fixes x2 | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **Async device-mirror (`ROW-SERVE-ASYNC-DENSE-MIRROR`, `f9c969ae`): the #31 fix ported to the classic dense family, dgx-VERIFIED.** The shared dense `EmbedInto` (qwen3.cpp) raced the async combine's device input-ids write against a stale host upload → token-0 degeneration on the depth-2 AsyncLLM serving path (quant-independent). `EmbedInto` now consumes the device override published by `ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` (27B-dense template); gate `test_qwen3_dense_async_serving` RED on `VT_ASYNC_DEVICE_MIRROR=0`, GREEN default, byte-identical mirror-off. dgx GB10: async gate RED→GREEN 0.6B+4B, SACRED 0.6B+4B 184/184 unchanged (byte-neutral sync path), memcheck 0 errors; Yi30/Qwen3-8B-MXFP4 default-config e2e coherent + 3/4 token-exact (p2 = oracle-ratified near-tie, gap 0.0000), closing the QUANT-CT-MXFP4 async-default residual. RESIDUAL: sibling InternLM2/Mistral/Llama scope one-liner; W4 bench RAN; FA2 GQA-swap default-ON, c2-c8 <1.0x. `FLASH-PTXAS` #82: codegen at PARITY (no ptxas lever); gap=engine context. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Revalidated after merging current upstream: local throughput is unchanged at 0.99997x its prior run; against the freshly measured pinned oracle it is 0.9971x. TTFT 0.7719x and host PSS 0.3127x pass; TPOT/ITL 1.1244x and VRAM 1.0014x remain open. Direct ON/OFF outputs remain 128/128 identical |
+| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete; throughput passes, latency/VRAM open | Exact GDN chunks default ON and byte-identical to rollback. Local A/B: total/output +2.152%, TTFT -2.945%, TPOT/ITL -1.920%; sealed-vLLM comparison 1.021x throughput, 1.086x TTFT, 1.025x TPOT, +233 MiB VRAM ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -1283,28 +1283,24 @@ regression.
 
 ## Performance detail
 
-**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** on the current
-`upstream/main` tree at `59674cf1d`, the uncontended three-repetition comparison
-on an RTX 5070 Ti measured 6611.207 total tok/s versus the pinned vLLM oracle at
-6630.481 tok/s (0.9971x). Mean TTFT is 730.403 versus 946.214 ms
-(PASS), peak/stable host PSS is 2.531/0.739 versus 8.093/4.422 GiB (PASS), while
-mean TPOT/ITL is 38.143 versus 33.924 ms and peak VRAM is 12850 versus 12832 MiB
-(OPEN). Local throughput is 0.99997x its previous run, a null result.
+**Local Qwen3.5-4B plain BF16 direct loader, throughput passed; latency and
+VRAM pending:** the benchmark now uses production `AsyncLLM`. Exact
+`(sequence, 8-token chunk)` causal-conv metadata is built once per step, shared
+across GDN layers and default ON. `VT_CONV_EXACT_CHUNKS=0` is a byte-identical
+same-binary rollback. Rebased-main graph-node `nsys` confirms the mechanism:
+causal-conv falls from **718.704 to 233.955 ms (3.072x)**, leaving **1.609x**
+to vLLM. The profiled whole run improves **2.272%** with identical token files.
 
-The failing TPOT axis has a corrected diagnosis as of the W4 work below: the
-per-step synchronization it was blamed on is the synchronous engine loop
-waiting for its own sampling, about one per step, not a removable defect in
-the async sampler. The device-resident sampled-token mirror is now default ON;
-this synchronous harness does not claim the remaining serving comparison.
-
-The earlier 5769.99 tok/s series remains VOID because a graphics consumer held
-the GPU at 11-13% utilization. Both arms gained about 14% once measured on an
-idle box; the harness now rejects that contention. The current 0.9971x result
-passed the same idle gate on all 18 legs.
+The enclosing A/B improves total/output **2.152%**, TTFT **2.945%**, TPOT/ITL
+**1.920%** and E2E latency **2.118%** without a local VRAM regression. Against
+the sealed same-workload vLLM baseline, throughput is **1.021246x PASS**; TTFT
+is **1.085812x OPEN**, TPOT/ITL **1.024597x OPEN**, and mean peak VRAM
+13053.3/12820 MiB OPEN. Fresh 18-leg oracle attempts were VOID JIT-environment
+runs and do not replace the sealed denominator.
 
 This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
 reproduction:
-[Qwen3.5-4B post-upstream revalidation](bench-evidence/qwen35-4b-upstream-20260805.md).
+[Qwen3.5-4B exact-chunk outcome](bench-evidence/qwen35-4b-sm120-main-20260807.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).

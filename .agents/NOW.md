@@ -9,8 +9,7 @@ benchmark record. Budget: 100 lines.
 
 ## Live claims
 
-Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
-`bench/qwen35-upstream-rebenchmark-20260805` on `upstream/main` @ `59674cf1d`.
+Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
@@ -20,7 +19,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | MiniMax-H3 lane | **bf16 shards STREAM both towers (DiT + encoder); Q4_K_M enc cond cos 0.9975, 3.5° med, DIFFUSE** | render A/B on saved embeds |
 | Kimi-Linear-48B | **ROW 7 fold LANDS (#122 §21): engine==CLI 128/128; golden 122/128; SACRED green; v13 tokens ABI** | ACTIVE: 19.0 tok/s vs vLLM ~21 (~0.90×) |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
-| Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
+| Qwen3.5-4B sm_120 | Exact chunks ON: rebased-main reprofile 3.072x kernel / +2.272% run; sealed-vLLM throughput 1.021x PASS. Latency/VRAM OPEN | Spike residual 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec, RSS -24% | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
@@ -49,8 +48,8 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 0. **`ROAD-V1-MEM`** KV auto-sizing spike LANDED (`specs/kv-sizing.md`, `READY`).
 1. **Spike the Parakeet encoder row** (vLLM carries it inside
    `nano_nemotron_vl.py`; the transducer half is NOT in vLLM: separate call).
-2. **Qwen3.5-4B serving follow-up:** bind the default-ON async-serving path
-   against the same oracle before attributing the remaining TPOT gap.
+2. **Qwen3.5-4B sm_120:** rebased branch is GREEN and reprofiled. Spike the
+   residual 1.609x conv gap; latency/VRAM and gate models stay open.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
