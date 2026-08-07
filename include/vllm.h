@@ -82,6 +82,18 @@ extern "C" {
  * default, so zero-filling the struct growth keeps a v9 engine byte-identical.
  * Scheduler policy (incl. SGLang's cache-aware LPM) is selected through the v9
  * string field .scheduling_policy = "lpm" — there is no separate int knob.
+ * v12: VIDEO+AUDIO GENERATION (ARCH-ONE-SURFACE ROW 2, MiniMax-H3) — the
+ * ratified video slice: an opaque vllm_video_engine loaded from the H3
+ * checkpoint set (vllm_video_engine_load/free, vllm_video_model_params +
+ * _default), one blocking vllm_video_generate (vllm_video_params + _default)
+ * producing a vllm_video_result (frame dir + WAV + geometry + the ffmpeg argv
+ * the CALLER may exec — the library spawns nothing), vllm_video_result_free,
+ * and the standalone vllm_video_mux_argv(+_free) composer the mux example
+ * client uses. Appended so zero values preserve behaviour; a pre-v12 caller
+ * that never touches the video symbols is byte-identical. Text and video
+ * handles refuse each other's checkpoints LOUDLY: vllm_video_engine_load on a
+ * text-model directory names vllm_engine_load, and vllm_engine_load on an H3
+ * checkpoint directory keeps failing exactly as at v11 (no config.json).
  * v11: AUDIO TRANSCRIPTION (ARCH-ONE-SURFACE fold #4) — vllm_transcribe /
  * vllm_transcription_params(_default) / vllm_transcription(_free), appended so
  * zero values preserve behaviour. vllm_engine_load now RESOLVES a
@@ -91,7 +103,7 @@ extern "C" {
  * message instead of serving, and vllm_transcribe on a TEXT handle does the
  * same. A pre-v11 caller that never loads a Parakeet directory is
  * byte-identical. */
-#define VLLM_ABI_VERSION 11
+#define VLLM_ABI_VERSION 12
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -514,6 +526,121 @@ VLLM_API vllm_status vllm_transcribe(vllm_engine* engine,
 /* Free the owned members of a transcription result and zero the struct. The
  * struct itself is caller storage. NULL is a no-op. */
 VLLM_API void vllm_transcription_free(vllm_transcription* out);
+
+
+/* ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────
+ * The video slice of the ONE-SURFACE fold: the SAME library pipeline the
+ * bundled server's /v1/videos routes and the minimax-h3-gen example drive
+ * (vllm::multimodal::MiniMaxH3VideoEngine), reachable by any embedder.
+ *
+ * A video engine is loaded from the H3 checkpoint SET (the release ships the
+ * DiT, the text encoder and the two VAEs as separate artifacts), not from one
+ * model directory — which is why this is a separate handle from vllm_engine.
+ * Loading a TEXT checkpoint here fails with VLLM_ERR_MODEL_LOAD naming
+ * vllm_engine_load; loading an H3 checkpoint with vllm_engine_load keeps
+ * failing exactly as before v12 (its directory carries no config.json).
+ *
+ * THE PROCESS BOUNDARY: the library writes frames + WAV and COMPOSES the
+ * ffmpeg argv, and spawns nothing. The caller execs mux_argv to get an MP4. */
+typedef struct vllm_video_engine vllm_video_engine;
+
+/* All paths; NULL/empty means "not supplied". Borrowed for the load call. */
+typedef struct vllm_video_model_params {
+  const char* dit_path;       /* GGUF | NVFP4 safetensors | bf16 shard dir */
+  const char* encoder_path;   /* H3-Encoder GGUF or bf16 shard dir */
+  const char* tokenizer_path; /* tokenizer.json (with an encoder) */
+  const char* video_vae_path;
+  const char* video_vae_config_path;
+  const char* audio_vae_path;
+  const char* audio_vae_config_path;
+  /* Fallback conditioning when no encoder is supplied: rows of text_dim,
+   * little-endian f32 (the pre-fold --prompt-embeds file). */
+  const char* prompt_embeds_path;
+  /* The served checkpoint PARTITION: "fl2va" (serves t2va+fl2va) or "ref2va".
+   * Community GGUF/NVFP4 files strip the release metadata and the two DiTs
+   * are byte-structurally identical, so it must be DECLARED; NULL/empty makes
+   * every generate refuse with the guidance (the #77 guard). */
+  const char* partition;
+  int32_t device;       /* 0 cpu, 1 cuda */
+  int32_t dequant_bf16; /* 0 keep-quant, 1 dequant/stream bf16 */
+  int32_t fp4_resident; /* NVFP4+cuda: keep FP4 packed, Marlin W4A16 GEMM */
+} vllm_video_model_params;
+
+typedef struct vllm_video_params {
+  const char* prompt;        /* encoded when the engine has an encoder */
+  int32_t width, height;     /* <= 0 => aspect-derived default canvas */
+  int32_t num_frames;        /* <= 1 => per-task default */
+  int32_t steps;             /* <= 0 => H3 default (50) */
+  uint64_t seed;
+  int32_t has_seed;          /* 0 => the fixed default noise streams */
+  const char* first_frame;   /* fl2va keyframes: binary PPM (P6) paths; */
+  const char* last_frame;    /* pin frame 0 / the last frame OF THE OUTPUT */
+  const char* ref_image;     /* ref2va: ONE whole reference image (PPM) */
+  const char* ref_video;     /* ref2va: a DIRECTORY of frame_%06d.ppm */
+  const char* ref_audio;     /* ref2va: a 16-bit PCM WAV path */
+  float noise_aug;           /* keyframe pinning strength; <= 0 => 1.0 */
+  /* Where frame_%06d.ppm + audio.wav land (created if absent). REQUIRED. */
+  const char* output_dir;
+} vllm_video_params;
+
+/* One finished generation. OWNERSHIP: every member is library-allocated;
+ * free the whole struct's members via vllm_video_result_free(out). */
+typedef struct vllm_video_result {
+  char* frame_dir;  /* holds frame_%06d.ppm */
+  char* audio_path; /* 16-bit PCM WAV */
+  int32_t frame_count, width, height, fps, sample_rate;
+  /* The ffmpeg argv the CALLER may exec to mux <output_dir>/video.mp4;
+   * argv[0] is "ffmpeg" (substitute a custom binary before exec'ing).
+   * mux_argv[mux_argc] is NULL, so it is execvp-ready. */
+  char** mux_argv;
+  int32_t mux_argc;
+} vllm_video_result;
+
+/* Zero-initialized params (every path NULL, cpu, keep-quant). */
+VLLM_API vllm_video_model_params vllm_video_model_params_default(void);
+/* Default generation params (all defaults resolved engine-side). */
+VLLM_API vllm_video_params vllm_video_params_default(void);
+
+/* Load the H3 checkpoint set and stage its weights once. On VLLM_OK, *out is
+ * a handle the caller frees via vllm_video_engine_free. On error, *out is
+ * NULL and vllm_last_error() carries the detail (a text-model directory maps
+ * to VLLM_ERR_MODEL_LOAD naming vllm_engine_load). */
+VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* params,
+                                            vllm_video_engine** out);
+VLLM_API void vllm_video_engine_free(vllm_video_engine* engine);
+
+/* Run one BLOCKING generation, filling *out. Serialized per engine handle.
+ * VLLM_ERR_INVALID_ARGUMENT for a missing output_dir / illegal reference
+ * combination; VLLM_ERR_RUNTIME when the pipeline refuses (undeclared or
+ * mismatched partition, missing conditioning, unreadable references) or the
+ * forward fails. On any non-OK status *out is zeroed. */
+VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
+                                         const vllm_video_params* params,
+                                         vllm_video_result* out);
+
+/* Free the owned members of a result and zero the struct. The struct itself
+ * is caller storage. NULL is a no-op. */
+VLLM_API void vllm_video_result_free(vllm_video_result* out);
+
+/* ── Standalone MP4 mux-argv composer ─────────────────────────────────────────
+ * The encoding contract (h264/yuv420p + AAC, -shortest, +faststart) is the
+ * library's; the caller execs. This is the engine-free entry the
+ * minimax-h3-mux example client uses to mux EXISTING frames + WAV. */
+typedef struct vllm_video_mux_params {
+  const char* frames;      /* printf-style pattern, e.g. dir/frame_%06d.ppm */
+  const char* audio_path;  /* NULL/empty => a silent clip */
+  const char* output_path; /* the .mp4 to write */
+  int32_t fps;             /* <= 0 => the H3 default (24) */
+  int32_t crf;             /* <= 0 => the library default (18) */
+} vllm_video_mux_params;
+
+VLLM_API vllm_video_mux_params vllm_video_mux_params_default(void);
+
+/* Compose the argv (argv[0] "ffmpeg"; *out_argv[*out_argc] is NULL so it is
+ * execvp-ready). The caller frees via vllm_video_mux_argv_free. */
+VLLM_API vllm_status vllm_video_mux_argv(const vllm_video_mux_params* params,
+                                         char*** out_argv, int32_t* out_argc);
+VLLM_API void vllm_video_mux_argv_free(char** argv, int32_t argc);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */
