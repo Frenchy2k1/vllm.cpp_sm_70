@@ -15618,3 +15618,43 @@ gate passes — but "empirically safe for two models" is not the bar for a defau
 
 **Closing that hazard is the gate on the default flip, and is the next task.**
 
+### VK-A2 DEFAULT-ON: the reference-tier hazard is closed by an existing seam (2026-08-07)
+
+The 2.62x batching win shipped OFF because the PORTABLE REFERENCE TIER runs CPU
+kernels directly over device memory with no per-call flush point — `Resolve`
+caches the provider function, so there appeared to be no seam.
+
+**There already was one.** `Backend::FlushPending` (`include/vt/backend.h:44-49`)
+exists for exactly this, is documented for exactly this, is already called by
+`op_provider.cpp` whenever a reference-tier kernel is selected, and Metal already
+implements it (M3c-1). Vulkan simply had not. The fix is one override.
+
+That is the second time in this campaign the framework already had the answer —
+the first was the fusion recipes. Looking for the seam before building one is
+cheaper than either.
+
+**`VT_VULKAN_BATCH` now defaults ON.** All three host-read paths drain first:
+`Copy`/`Memset` (host memcpy over the mapped allocation), `Synchronize`, and
+`FlushPending` for the reference tier.
+
+**A GATE THAT THE STRICT RUN COULD NOT PROVIDE.** opt-125m STRICT passes 6/6
+token-exact with batching on — and it would pass whether or not the hook existed,
+because OPT touches the reference tier only once, at setup, before any batch is
+open. So the hazard has its own gate: open a batch, resolve `kRopeNeox` (genuinely
+unimplemented natively on Vulkan), and assert `pending_batch() == 0` afterwards.
+
+**Verified by DISABLING the hook**: the gate goes red (`pending_batch() == 0` fails
+at 4 pending) and green again when restored. A gate never observed failing is a
+gate that has not been shown to test anything.
+
+**One bug caught in my own gate along the way.** The VK-A2 mechanism test
+re-derived the lever's default from the environment variable, so flipping the
+default to ON made it assert the wrong branch. It failed loudly, which was luck —
+a subtler duplication would have gone vacuously green. The context now exposes
+`batching_enabled()` and the test ASKS rather than restating. A predicate
+duplicated between an implementation and its gate will eventually disagree with
+itself.
+
+llvmpipe `test_vulkan_backend` **17/17 (873 assertions)** with the lever on AND
+off; opt-125m STRICT 6/6 (96/96), 0 declines, batching default.
+

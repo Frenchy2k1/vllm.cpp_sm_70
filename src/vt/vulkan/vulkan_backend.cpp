@@ -93,6 +93,14 @@ class VulkanBackend final : public Backend {
   // batching it is the caller's explicit "make results readable" point, and it is
   // what the tests and the engine use before touching device memory.
   void Synchronize(Queue&) override { VulkanContext::Get().FlushBatch(); }
+  // THE REFERENCE-TIER SAFETY HOOK (backend.h:44-49, the seam Metal already
+  // implements for M3c-1). op_provider.cpp calls this before running a PORTABLE
+  // CPU kernel, which reads and writes this backend's device memory DIRECTLY
+  // because Vulkan here is unified-memory. Without it, a batched-but-unsubmitted
+  // dispatch's writes would be invisible to that host kernel -- stale bytes, no
+  // error, no crash. This is what lets command-buffer batching be the DEFAULT
+  // rather than an opt-in lever.
+  void FlushPending() override { VulkanContext::Get().FlushBatch(); }
 
   // One process-wide VkQueue is shared by every vt::Queue: the queue handle is
   // the ORDERING domain and, with synchronous dispatch, every op is already
