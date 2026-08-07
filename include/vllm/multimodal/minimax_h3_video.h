@@ -126,6 +126,9 @@ class MiniMaxH3VideoEngine {
   MiniMaxH3VideoEngine& operator=(MiniMaxH3VideoEngine&&) noexcept;
   ~MiniMaxH3VideoEngine();
 
+  // The device selected by the queue created during Load().
+  vt::Device device() const;
+
   // True when an encoder tower is loaded (the request PROMPT conditions the
   // render); false => prompt_embeds_path conditioning (or Generate refuses).
   bool has_encoder() const;
