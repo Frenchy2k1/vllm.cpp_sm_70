@@ -285,10 +285,8 @@ and Voxtral (audio).
 **Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3 renders end to
 end: prompt -> Qwen3-VL-32B encoder -> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE
 -> MP4 with a stereo track. The project's first DIFFUSION architecture (no KV cache, no
-sampler, no logits); upstream is `vllm-project/vllm-omni`, beyond the parity pin. Five
-conditioning modes, each gated on the conditioning CHANGING the output rather than merely
-being accepted, and `POST /v1/videos`. Use **Q4_K_M**: 3 bits cannot hold the channel-wise
-outliers H3's split-half RoPE produces. Detail: [docs/STATUS.md](docs/STATUS.md).
+sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning modes and
+`POST /v1/videos`. Use **Q4_K_M**. Detail: [docs/STATUS.md](docs/STATUS.md).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
@@ -357,8 +355,9 @@ build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 
   --frames 124 --height 480 --width 864 --steps 50 --device cuda --out out.mp4
 ```
 
-Conditioning flags, the PPM convention that chains clips, and serving:
-[docs/USAGE.md](docs/USAGE.md).
+Weights: [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs)
+(DiT + encoder) and [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (VAEs,
+tokenizer). For SPEECH put the spoken line in the prompt. Recipe: [docs/USAGE.md](docs/USAGE.md).
 
 ## OpenAI-compatible server
 
