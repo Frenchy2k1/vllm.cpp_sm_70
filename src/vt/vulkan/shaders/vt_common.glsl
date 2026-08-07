@@ -57,6 +57,30 @@
 // llvmpipe. llama.cpp instead hardcodes 512 (rms_norm.comp:33) and 512/1024
 // elsewhere, which is faster but not universally valid; W0 chooses portability.
 // It is a power of two, which the halving tree reduction below requires.
+//
+// IT STAYS A #define, AND THAT IS A MEASURED DECISION — do not "improve" it into
+// a specialization constant (VK-A1, 2026-08-06). The workgroup size is written
+// down three times (here, each .comp's `local_size_x`, and kWorkgroupSize on the
+// host, which computes the workgroup COUNT from it), which is exactly the shape
+// a specialization constant is supposed to collapse. It cannot, here:
+//
+//   `layout(local_size_x_id = 0, ...)` makes glslang emit
+//   `ExecutionMode LocalSize 1 1 1` plus the LEGACY `BuiltIn WorkgroupSize`
+//   spec-constant vector. The modern `LocalSizeId` execution mode that would
+//   carry the real value needs SPIR-V 1.2 with VK_KHR_maintenance4 (core in
+//   Vulkan 1.3), and this backend targets vulkan1.1 on purpose. MEASURED
+//   consequence on llvmpipe: the literal LocalSize 1 wins, every workgroup runs
+//   ONE thread while the host still dispatches ceil(n/128) groups, and roughly
+//   1/128 of each tensor is computed — cross-device NMSE went from ~1e-14 to
+//   ~0.99 on ops as simple as kAdd.
+//
+// Making VT_TG a specialization constant WITHOUT specializing local_size_x is
+// worse than leaving it alone: it advertises a host-settable knob that silently
+// corrupts, since the shared-memory extent and the reduction tree would follow it
+// while the actual workgroup size would not. The specialization machinery
+// (vulkan_spirv.h spec_ids, GetPipeline) is still the right variant mechanism —
+// it is simply for axes like dtype, quant format and coopmat tier, where the
+// constant does not have to agree with the launch geometry.
 #define VT_TG 128u
 
 // Operand k is declared by each shader as a PAIR of blocks onto the same

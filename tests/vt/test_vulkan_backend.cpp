@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -47,9 +48,14 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // Independent of any device: this is a property of the CHECKED-IN artifact, so
   // it also gates the generator (scripts/gen-vulkan-spirv.py) on a box with no
   // Vulkan at all.
-  const size_t n = sizeof(vt::vulkan::kSpirvModules) / sizeof(vt::vulkan::kSpirvModules[0]);
-  CHECK(n == 7);
-  for (const auto& m : vt::vulkan::kSpirvModules) {
+  // The blobs live in vulkan_spirv.cpp, so the array is `extern` and of unknown
+  // bound here and the generated count is the only way to size it. That is the
+  // point of the split: at the target shader surface the words must not be
+  // re-parsed by every TU that merely needs the table.
+  const size_t n = vt::vulkan::kSpirvModuleCount;
+  CHECK(n == 14);
+  for (size_t mi = 0; mi < n; ++mi) {
+    const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
     REQUIRE(m.word_count > 5);          // a SPIR-V header alone is 5 words
     CHECK(m.words[0] == 0x07230203u);   // SPIR-V magic
@@ -57,15 +63,131 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // The eight registered ops are served by exactly these seven modules (kCastBf16
   // and kCastF32 share vt_cast), so a rename in either direction breaks here
   // rather than at pipeline-creation time on a device we might not have.
-  for (const char* want : {"vt_add", "vt_cast", "vt_fused_chain", "vt_layer_norm", "vt_relu",
-                           "vt_rms_norm", "vt_silu_and_mul"}) {
+  for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
+                           "vt_greedy_argmax", "vt_layer_norm", "vt_matmul",
+                           "vt_paged_attn", "vt_qkv_split", "vt_relu",
+                           "vt_reshape_and_cache", "vt_rms_norm",
+                           "vt_rope_from_cache", "vt_silu_and_mul"}) {
     bool found = false;
-    for (const auto& m : vt::vulkan::kSpirvModules) {
-      if (std::strcmp(m.name, want) == 0) found = true;
+    for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
+      if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
     }
     CAPTURE(want);
     CHECK(found);
   }
+}
+
+TEST_CASE("the committed SPIR-V table records each module's specialization constants") {
+  // Device-independent: a property of the checked-in artifact, so this also gates
+  // the generator on a box with no Vulkan.
+  //
+  // The host passes specialization values by constantID. Vulkan SILENTLY IGNORES
+  // a VkSpecializationMapEntry whose ID the module does not declare, so a drift
+  // between host and shader is WRONG NUMBERS, not a clean error. Recording the
+  // declared IDs alongside each blob is what lets GetPipeline check it.
+  for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
+    const auto& m = vt::vulkan::kSpirvModules[mi];
+    CAPTURE(m.name);
+    // Structural: the pointer and the count agree, and the IDs are sorted with no
+    // duplicates — GetPipeline builds VkSpecializationMapEntry positionally from
+    // this array, so an unsorted or duplicated ID would bind the wrong value.
+    CHECK((m.spec_ids == nullptr) == (m.spec_id_count == 0));
+    for (size_t i = 1; i < m.spec_id_count; ++i) {
+      CHECK(m.spec_ids[i - 1] < m.spec_ids[i]);
+    }
+    // vt_cast is the backend's FIRST variant axis: constants 0 and 1 are its
+    // source and destination dtype, so one module serves every (src, dst) pair
+    // instead of a module per pair. Every other W0 shader still declares none.
+    //
+    // The workgroup size is deliberately NOT such a constant — see the measured
+    // reason in src/vt/vulkan/shaders/vt_common.glsl (local_size_x_id emits
+    // LocalSize 1 1 1 at the vulkan1.1 target and computes ~1/128 of the tensor).
+    if (std::strcmp(m.name, "vt_cast") == 0) {
+      REQUIRE(m.spec_id_count == 2);  // src dtype, dst dtype
+      CHECK(m.spec_ids[0] == 0u);
+      CHECK(m.spec_ids[1] == 1u);
+    } else if (std::strcmp(m.name, "vt_embedding") == 0) {
+      // table dtype, out dtype, id width (i32 vs i64).
+      REQUIRE(m.spec_id_count == 3);
+      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_rope_from_cache") == 0) {
+      // q / k / cache dtype, the NeoX-vs-GPT-J pairing, and the position width.
+      REQUIRE(m.spec_id_count == 5);
+      for (uint32_t want = 0; want < 5; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_qkv_split") == 0) {
+      // source dtype, destination dtype.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_reshape_and_cache") == 0) {
+      // A single WIDTH selector, not a dtype code: this op moves bytes and
+      // converts nothing, so 32-bit and 16-bit are the only two paths.
+      REQUIRE(m.spec_id_count == 1);
+      CHECK(m.spec_ids[0] == 0u);
+    } else if (std::strcmp(m.name, "vt_paged_attn") == 0) {
+      // query / k-cache / v-cache / out dtype.
+      REQUIRE(m.spec_id_count == 4);
+      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul") == 0) {
+      // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
+      // ONE committed module, which is the argument for specialization constants
+      // over llama.cpp's module-per-#define in miniature.
+      REQUIRE(m.spec_id_count == 4);
+      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
+    } else {
+      CHECK(m.spec_id_count == 0);
+    }
+  }
+}
+
+TEST_CASE("Vulkan specializes pipelines per dtype pair and caches them separately") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // Two DIFFERENT dtype pairs through the same committed module. The results
+  // being right is necessary but not sufficient: a specialization that silently
+  // did nothing would also produce right results here, because the shader's
+  // defaults happen to be f32->f32. What proves the mechanism engaged is that the
+  // pipeline cache GREW BY TWO — one specialized pipeline per pair.
+  const size_t before = ctx.PipelineCacheSize();
+
+  const int64_t n = 300;  // not a multiple of the workgroup size
+  std::vector<float> src(n);
+  for (int64_t i = 0; i < n; ++i) src[i] = static_cast<float>(i) - 150.5f;
+
+  auto* f32_in = static_cast<float*>(vk.Alloc(n * sizeof(float)));
+  auto* bf16_mid = static_cast<uint16_t*>(vk.Alloc(n * sizeof(uint16_t)));
+  auto* f32_out = static_cast<float*>(vk.Alloc(n * sizeof(float)));
+  vk.Copy(q, f32_in, src.data(), n * sizeof(float));
+
+  Tensor t_f32_in = Tensor::Contiguous(f32_in, vt::DType::kF32, d, {n});
+  Tensor t_bf16 = Tensor::Contiguous(bf16_mid, vt::DType::kBF16, d, {n});
+  Tensor t_f32_out = Tensor::Contiguous(f32_out, vt::DType::kF32, d, {n});
+
+  vt::CastBf16(q, t_bf16, t_f32_in);   // f32 -> bf16 : one specialization
+  vt::CastF32(q, t_f32_out, t_bf16);   // bf16 -> f32 : a different one
+  vk.Synchronize(q);
+
+  CHECK(ctx.PipelineCacheSize() == before + 2);
+
+  // The round trip must be EXACTLY the CPU codec's, so this stays in the
+  // bit-exact tier rather than the NMSE tier: bf16 keeps the high 16 bits under
+  // round-to-nearest-even, so a value that survives the narrowing must come back
+  // identical.
+  std::vector<float> back(n);
+  vk.Copy(q, back.data(), f32_out, n * sizeof(float));
+  vk.Synchronize(q);
+  for (int64_t i = 0; i < n; ++i) {
+    CAPTURE(i);
+    CHECK(back[i] == vt::BF16ToF32(vt::F32ToBF16(src[i])));
+  }
+
+  vk.Free(f32_in);
+  vk.Free(bf16_mid);
+  vk.Free(f32_out);
+  vk.DestroyQueue(q);
 }
 
 TEST_CASE("Vulkan backend is registered on a Vulkan-capable host") {
@@ -206,10 +328,25 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
   CHECK_FALSE(rp.release_host_weights_after_upload);
   CHECK_FALSE(rp.uses_device_memory_pool);
 
-  // No Vulkan attention kernel exists yet, so the priority list is EMPTY by
-  // design (see src/vllm/platforms/vulkan.cpp) — selection must fail loudly
-  // rather than name a backend whose kernels are absent.
-  CHECK(p.get_attn_backend_priority().empty());
+  // Vulkan now HAS native kPagedAttention + kReshapeAndCache reading and writing
+  // the NHD layout FlashAttentionBackend::get_kv_cache_shape allocates, so the
+  // selector may reach FLASH_ATTN — on exactly the footing Metal reached it.
+  // This is what let OPT-125m run end to end on Vulkan.
+  {
+    vllm::platforms::AttnSelectorConfig cfg;
+    const auto prio = p.get_attn_backend_priority(cfg);
+    REQUIRE(prio.size() == 1);
+    CHECK(prio[0] == "FLASH_ATTN");
+  }
+  // MLA stays EMPTY, and that is a capability statement rather than a stub:
+  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla have no
+  // Vulkan kernel, so naming a backend here would route an MLA model into one
+  // that cannot serve it. Selection must fail loudly instead.
+  {
+    vllm::platforms::AttnSelectorConfig mla;
+    mla.use_mla = true;
+    CHECK(p.get_attn_backend_priority(mla).empty());
+  }
 }
 
 TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
@@ -218,18 +355,55 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   // work row cannot quietly claim more than it implements.
   for (vt::OpId op : {vt::OpId::kAdd, vt::OpId::kRelu, vt::OpId::kSiluAndMul,
                       vt::OpId::kCastBf16, vt::OpId::kCastF32, vt::OpId::kLayerNorm,
-                      vt::OpId::kRmsNorm, vt::OpId::kFusedChain}) {
+                      vt::OpId::kRmsNorm, vt::OpId::kFusedChain,
+                      // VK-B: the dense path's GEMM (both orientations) and the
+                      // two ends of the model, token ids in and out.
+                      vt::OpId::kMatmul, vt::OpId::kMatmulBT,
+                      vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax,
+                      // The attention block: paged attention (the one kernel
+                      // with no llama.cpp Vulkan counterpart), the KV write, the
+                      // QKV split and the rotary APPLY.
+                      vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache,
+                      vt::OpId::kQkvSplit, vt::OpId::kRopeFromCache}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  // Still stubbed — GEMM, attention, KV cache, quant, sampling. A partial backend
-  // is a supported state (src/vt/ops.cpp:104-111 throws on lookup). NO MODEL RUNS
-  // ON VULKAN.
-  for (vt::OpId op : {vt::OpId::kMatmul, vt::OpId::kMatmulBT, vt::OpId::kPagedAttention,
-                      vt::OpId::kReshapeAndCache, vt::OpId::kEmbedding,
-                      vt::OpId::kGreedyArgmax}) {
+  // No NATIVE Vulkan kernel yet for the rotary TABLE BUILD (kRopeCosSinCache and
+  // kRopeNeox both construct the angle in double -- deliberately left on the
+  // portable tier, mirroring vLLM's own split), quant, MoE, or the sampler beyond
+  // greedy argmax.
+  for (vt::OpId op : {vt::OpId::kRopeNeox, vt::OpId::kRopeCosSinCache,
+                      vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kMatmul, DeviceType::kVULKAN), std::runtime_error);
+  // ...but they no longer THROW, and this assertion used to say they did.
+  //
+  // Accelerator-seam work row S5 (af0b21ba) added the PORTABLE REFERENCE TIER:
+  // for a unified-memory device, a missed GetOp lazily installs the CPU kernel as
+  // a priority -1000 provider, below every native kernel. Vulkan is eligible (GB10
+  // integrated and llvmpipe both report unified), so every op the CPU backend has
+  // resolves here and runs ON THE HOST against shared memory — correct, and
+  // arbitrarily slow.
+  //
+  // The Metal sibling was updated for this (test_metal_backend.cpp:215-231); THIS
+  // file was not, and the assertion sat RED from the moment S5 landed because no
+  // CI leg builds the Vulkan backend and nobody built it locally. The mirrored
+  // form below is deliberate: the two backends should fail the same way.
+  //
+  // Measured on this tree (VK-A1, 2026-08-06): of 87 CPU-registered ops, 8 are
+  // NATIVE on Vulkan, 79 are served by the reference tier, and ZERO throw.
+  REQUIRE(vt::ReferenceTierEligible(DeviceType::kVULKAN));
+  // This must stay an op that is GENUINELY unimplemented natively, and it moves
+  // on as the backend fills in: kMatmul, then kPagedAttention, then
+  // kReshapeAndCache all had their turn and now have native kernels. kRopeNeox is
+  // the current one.
+  void* rope = nullptr;
+  CHECK_NOTHROW(rope = vt::GetOp(vt::OpId::kRopeNeox, DeviceType::kVULKAN));
+  CHECK(rope != nullptr);
+  // BY NAME, so a host kernel can never masquerade as a native Vulkan one (Risk 7).
+  const auto stats = vt::GetOpProviderStats(vt::OpId::kRopeNeox, DeviceType::kVULKAN);
+  REQUIRE(stats.last_selected != nullptr);
+  CHECK(std::string(stats.last_selected) == std::string(vt::kReferenceProviderName));
+  CHECK(vt::GetReferenceTierHits() > 0);
 }
 
 TEST_CASE("Vulkan float-controls are PROBED and reported, not assumed") {

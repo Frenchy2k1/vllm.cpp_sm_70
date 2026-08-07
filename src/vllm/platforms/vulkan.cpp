@@ -67,10 +67,22 @@ class VulkanPlatform final : public Platform {
   // back a backend whose kernels do not exist on this device. Work row V4 (the
   // port of llama.cpp's flash_attn.comp family) adds the kernel and the one-line
   // name here in the same change.
+  // interface.py get_attn_backend_cls. EMPTY until VK-B: the selector must not be
+  // able to hand out a backend whose kernels do not exist, and until Vulkan had
+  // native kPagedAttention + kReshapeAndCache the honest answer was "none".
+  //
+  // Both now exist and read/write the same NHD layout FlashAttentionBackend's
+  // get_kv_cache_shape allocates, so FLASH_ATTN is reachable on exactly the
+  // footing Metal reached it (metal.cpp:88-92).
+  //
+  // MLA still returns EMPTY, and that is not a stub: MLA needs
+  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla, none of
+  // which has a Vulkan kernel. Answering FLASH_ATTN there would route an MLA
+  // model into a backend that cannot serve it.
   std::vector<std::string> get_attn_backend_priority(
       const AttnSelectorConfig& cfg) const override {
-    (void)cfg;
-    return {};
+    if (cfg.use_mla) return {};
+    return {"FLASH_ATTN"};
   }
 };
 

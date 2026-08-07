@@ -210,6 +210,17 @@ const AttentionBackendRegistrar kFlashAttnCpu{vt::DeviceType::kCPU,
 const AttentionBackendRegistrar kFlashAttnMetal{vt::DeviceType::kMETAL,
                                                 FlashAttentionBackend::kName,
                                                 MakeFlashAttentionBackend};
+// ...and kVULKAN, on exactly the same footing (BACKEND-VULKAN work row VK-B). The
+// Vulkan kPagedAttention / kReshapeAndCache kernels
+// (src/vt/vulkan/shaders/vt_paged_attn.comp, vt_reshape_and_cache.comp) are ports
+// of the CPU pair and read and write the SAME NHD
+// (num_blocks, 2, block_size, num_kv_heads, head_size) layout get_kv_cache_shape
+// allocates -- that shared layout is the actual precondition for this line, not
+// the device name. So this is a NAME registration only, and
+// VulkanPlatform::get_attn_backend_priority is what decides whether it is reached.
+const AttentionBackendRegistrar kFlashAttnVulkan{vt::DeviceType::kVULKAN,
+                                                 FlashAttentionBackend::kName,
+                                                 MakeFlashAttentionBackend};
 }  // namespace
 
 }  // namespace vllm::v1

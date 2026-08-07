@@ -1,0 +1,58 @@
+#version 450
+// vt::Embedding — gather rows of the embedding table by token id.
+// Ported from src/vt/cpu/cpu_ops.cpp EmbeddingKernel (:661-672): out[i, :] =
+// table[ids[i], :], one output ELEMENT per invocation.
+//
+// ID DTYPE. vt::Embedding accepts i32 or i64 ids (cpu_ops.cpp:665 branches on
+// exactly that), so it is specialization constant 2. The ids operand is read
+// through the uint32_t view:
+//   i32 -> word [i]
+//   i64 -> word [2*i], the LOW half on little-endian
+// Reading only the low half is sound because an id is a vocabulary index, which
+// the CPU kernel range-checks against `v` and is therefore far below 2^31. Vulkan
+// has no 64-bit integer requirement at our 1.1 floor, so reconstructing the full
+// value would need VK_KHR_shader_int64 for nothing.
+//
+// NO RANGE CHECK, deliberately. cpu_ops.cpp:666 VT_CHECKs `0 <= id < v` and
+// throws; a shader cannot throw, and a per-element device-side branch would cost
+// the whole gather. vt::Embedding validates on the host before dispatch, so an
+// out-of-range id is already a caught error by the time this runs.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Tb32 { uint v[]; } T32;
+layout(binding = 1) readonly buffer Tb16 { uint16_t v[]; } T16;
+layout(binding = 2) readonly buffer Ib32 { uint v[]; } I32;
+layout(binding = 3) readonly buffer Ib16 { uint16_t v[]; } I16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+#define VT_ID_I32 0u
+#define VT_ID_I64 1u
+
+layout(constant_id = 0) const uint VT_EMB_TABLE_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_EMB_OUT_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_EMB_ID_DT = VT_ID_I32;
+
+layout(push_constant) uniform Params {
+  uint t;        // tokens
+  uint h;        // hidden size
+  uint table_off;
+  uint ids_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.t * p.h) { return; }
+  uint i = gid / p.h;  // token
+  uint j = gid % p.h;  // hidden lane
+
+  uint id_base = p.ids_off >> 2;
+  uint id = VT_EMB_ID_DT == VT_ID_I64 ? I32.v[id_base + 2u * i] : I32.v[id_base + i];
+
+  float val = VT_LOAD(T32, T16, VT_EMB_TABLE_DT, p.table_off, id * p.h + j);
+  VT_STORE(D32, D16, VT_EMB_OUT_DT, p.out_off, gid, val);
+}

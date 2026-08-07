@@ -1,0 +1,155 @@
+#version 450
+// vt::PagedAttention — block-paged attention over a KV cache.
+//
+// THIS IS THE ONE KERNEL IN THE BACKEND WITH NO VULKAN PORT SOURCE. llama.cpp's
+// Vulkan backend has no paged KV at all: `grep -l 'block_table\|paged'` over all
+// 132 .comp + 26 .glsl at pin 237ad9b96 returns NOTHING, because ggml attention
+// takes a contiguous KV buffer plus a mask. So the ONLINE-SOFTMAX SKELETON below
+// follows the shape of flash_attn.comp, while the BLOCK-TABLE INDIRECTION, the
+// GQA mapping and the windowing rules are ported from our own
+// src/vt/cpu/cpu_paged_attn.cpp PagedAttentionKernel (:52-171), which is also the
+// numeric oracle. Recorded as partial-from-scratch in porting-inventory §9.
+//
+// WHY ONLINE SOFTMAX AND NOT THE CPU'S THREE PASSES. The CPU kernel materialises
+// a `probs` array of (jmax-jmin+1) floats (cpu_paged_attn.cpp:121,131) — one slot
+// per key in the window, which is unbounded (thousands at long context). A shader
+// has no such allocation, so the passes are fused into the standard running
+// max/denominator recurrence. It computes the same mathematical result with a
+// different rounding order, which is why this op sits in the NMSE <= 5e-4 tier
+// rather than claiming bit-exactness against the CPU.
+//
+// PARALLELISATION: ONE WORKGROUP per (query token, query head), lanes split the
+// HEAD DIMENSION. The keys are walked sequentially by the whole workgroup, and
+// each key's q.k dot product is a cooperative vt_tg_sum across the lanes that own
+// the head-dim slices. This keeps the per-lane state to acc[] only, and matches
+// the CPU's structure of "one output row per unit of work".
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Qb32 { uint v[]; } Q32;
+layout(binding = 1) readonly buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 2) readonly buffer Kb32 { uint v[]; } K32;
+layout(binding = 3) readonly buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 4) readonly buffer Vb32 { uint v[]; } V32;
+layout(binding = 5) readonly buffer Vb16 { uint16_t v[]; } V16;
+layout(binding = 6) buffer Db32 { uint v[]; } D32;
+layout(binding = 7) buffer Db16 { uint16_t v[]; } D16;
+// Integer metadata, uint32 view only: block table, seq lens, query start loc.
+layout(binding = 8) readonly buffer BTb { uint v[]; } BT;
+layout(binding = 9) readonly buffer SLb { uint v[]; } SL;
+layout(binding = 10) readonly buffer QSLb { uint v[]; } QSL;
+
+layout(constant_id = 0) const uint VT_PA_Q_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PA_K_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_PA_V_DT = VT_DT_F32;
+layout(constant_id = 3) const uint VT_PA_OUT_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint total_q;
+  uint hq;          // query heads
+  uint d;           // head dim
+  uint block_size;  // KV page size
+  uint qpk;         // query heads per kv head (GQA ratio)
+  uint num_reqs;
+  uint causal;
+  int window_left;
+  int window_right;
+  uint kc_blk, kc_pg, kc_hd;  // k-cache strides, in ELEMENTS
+  uint vc_blk, vc_pg, vc_hd;
+  uint bt_row, bt_col;        // block-table strides, in elements
+  uint q_off, k_off, v_off, out_off;
+  uint bt_off, sl_off, qsl_off;
+  float scale;
+  float softcap;
+} p;
+
+// Per-lane accumulator over the lane's slice of the head dimension. Eight slots
+// covers d <= 8 * VT_TG = 1024, far above any head dim in the model matrix; the
+// host asserts it rather than trusting it.
+#define VT_PA_ACC_MAX 8
+
+void main() {
+  uint unit = gl_WorkGroupID.x;              // one workgroup per (token, head)
+  if (unit >= p.total_q * p.hq) { return; }
+  uint t = unit / p.hq;                      // query token (global)
+  uint h = unit % p.hq;                      // query head
+  uint g = h / p.qpk;                        // kv head (GQA)
+  uint tid = gl_LocalInvocationID.x;
+
+  // Which request owns token t, and where the request starts. query_start_loc is
+  // [num_reqs+1] and small, so a linear scan here is cheaper than the extra
+  // device buffer the CPU kernel precomputes on the host
+  // (cpu_paged_attn.cpp:103-117 builds tok_pos/tok_slen/tok_req arrays).
+  uint qsl_base = p.qsl_off >> 2;
+  uint r = 0u;
+  for (uint i = 0u; i < p.num_reqs; ++i) {
+    if (t >= QSL.v[qsl_base + i] && t < QSL.v[qsl_base + i + 1u]) { r = i; break; }
+  }
+  uint q0 = QSL.v[qsl_base + r];
+  uint query_len = QSL.v[qsl_base + r + 1u] - q0;
+  int seqlen = int(SL.v[(p.sl_off >> 2) + r]);
+  int pos = int(seqlen) - int(query_len) + int(t - q0);  // absolute position
+
+  // Window, exactly as cpu_paged_attn.cpp:126-130.
+  int jmin = p.window_left >= 0 ? max(0, pos - p.window_left) : 0;
+  int jmax = p.causal != 0u ? pos : seqlen - 1;
+  if (p.window_right >= 0) jmax = min(jmax, pos + p.window_right);
+  jmax = min(jmax, seqlen - 1);
+
+  uint qbase = (t * p.hq + h) * p.d;
+
+  float acc[VT_PA_ACC_MAX];
+  for (uint s = 0u; s < VT_PA_ACC_MAX; ++s) acc[s] = 0.0;
+  float m = -1.0 / 0.0;  // -inf
+  float l = 0.0;
+
+  if (jmax >= jmin) {
+    for (int j = jmin; j <= jmax; ++j) {
+      uint blk = BT.v[(p.bt_off >> 2) + uint(r) * p.bt_row + (uint(j) / p.block_size) * p.bt_col];
+      uint off = uint(j) % p.block_size;
+      uint kbase = blk * p.kc_blk + off * p.kc_pg + g * p.kc_hd;
+
+      // Cooperative q.k over the head dimension: each lane sums its own slice,
+      // then one tree reduction over the workgroup.
+      float partial = 0.0;
+      for (uint e = tid; e < p.d; e += VT_TG) {
+        partial += VT_LOAD(Q32, Q16, VT_PA_Q_DT, p.q_off, qbase + e)
+                 * VT_LOAD(K32, K16, VT_PA_K_DT, p.k_off, kbase + e);
+      }
+      // vt_tg_sum returns smem[0] to EVERY lane, and its leading barrier makes
+      // back-to-back calls in this loop safe (all lanes finish reading the
+      // previous total before the next call overwrites it). So no broadcast is
+      // needed: every lane derives the score from the same `dot` with the same
+      // instructions and therefore gets bit-identical results.
+      float dot = vt_tg_sum(tid, partial);
+      float s = dot * p.scale;
+      // cpu_paged_attn.cpp:144-145: optional cap * tanh(score / cap).
+      if (p.softcap > 0.0) s = p.softcap * tanh(s / p.softcap);
+
+      // Online softmax update. Equivalent to the CPU's max/exp/denominator
+      // passes, evaluated incrementally.
+      float m_new = max(m, s);
+      float corr = exp(m - m_new);   // 0 on the first key, since m == -inf
+      float w = exp(s - m_new);
+      l = l * corr + w;
+
+      uint vbase = blk * p.vc_blk + off * p.vc_pg + g * p.vc_hd;
+      uint slot = 0u;
+      for (uint e = tid; e < p.d; e += VT_TG, ++slot) {
+        acc[slot] = acc[slot] * corr
+                  + w * VT_LOAD(V32, V16, VT_PA_V_DT, p.v_off, vbase + e);
+      }
+      m = m_new;
+    }
+  }
+
+  // cpu_paged_attn.cpp:150 divides by the denominator once; an empty window
+  // (jmax < jmin) leaves the row untouched there, so it is left zero here.
+  float inv = l > 0.0 ? 1.0 / l : 0.0;
+  uint slot = 0u;
+  for (uint e = tid; e < p.d; e += VT_TG, ++slot) {
+    VT_STORE(D32, D16, VT_PA_OUT_DT, p.out_off, qbase + e, acc[slot] * inv);
+  }
+}

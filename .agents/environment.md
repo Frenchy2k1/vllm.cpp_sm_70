@@ -327,10 +327,24 @@ inner 4096, state 128; context 262144.
 - **Vulkan runtime is already usable and needs no acquisition.** dgx GB10
   enumerates as a real Vulkan `INTEGRATED_GPU` at API 1.4.312 (loader 1.4.328 +
   NVIDIA ICD) with `VK_KHR_cooperative_matrix` v2 and `VK_NV_cooperative_matrix2`;
-  the dev box enumerates `llvmpipe` (Vulkan 1.4.318, CPU) for GPU-free CI. Still
-  to install before Vulkan work: `libvulkan-dev`, `vulkan-tools`, and a
-  **current-SDK** `glslc` — Ubuntu's shaderc 2023.8 is too old for the coopmat2
-  feature probe and fails silently into the slow path.
+  the dev box enumerates `llvmpipe` (Vulkan 1.4.318, CPU) for GPU-free CI.
+  Optional still: `libvulkan-dev` and `vulkan-tools` (neither is needed to build
+  or gate — the backend `dlopen`s the loader and vendors the Khronos TYPE headers).
+- **Vulkan shader toolchain — glslang 16.5.0, installed 2026-08-06 (`VK-A1`).**
+  `$HOME/tools/glslang-16.5.0/bin/glslang`, from the upstream prebuilt Linux
+  x86_64 release tarball; no root, nothing linked (it is a build-time tool, never
+  a dependency — `.agents/discipline.md`). Put that directory on `PATH` to
+  regenerate committed SPIR-V with `scripts/gen-vulkan-spirv.py`.
+  **Two measured facts about the pin.** (1) `src/vt/vulkan/vulkan_spirv.h:16`
+  records `Glslang Version: 11:16.4.0`, but **16.4.0 ships NO release assets** —
+  only `16.5.0` and `main-tot` do, and Ubuntu packages `15.1.0` — so the recorded
+  version cannot be fetched and cannot back a CI gate. (2) The committed SPIR-V
+  nonetheless reproduces **byte-for-byte under 16.5.0** (`--check` passes, exit 0),
+  which proves the committed artifact is what it claims AND that the emitted
+  SPIR-V is stable across a glslang minor bump. The freshness gate therefore pins
+  the DOWNLOAD URL rather than asserting a version string.
+  The older note here — that Ubuntu's shaderc 2023.8 `glslc` is too old for the
+  coopmat2 feature probe — still holds and is why the system package is not used.
 - **No Intel GPU exists on any box here**, so `BACKEND-XPU` end-to-end work is
   HW-BLOCKED; only policy-port, compile coverage and oneAPI CPU-device unit
   numerics are available.

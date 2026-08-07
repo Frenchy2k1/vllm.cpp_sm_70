@@ -1,0 +1,60 @@
+#version 450
+// vt::QkvSplit — slice one fused QKV projection row into q, k and v.
+// Ported from src/vt/cpu/cpu_ops.cpp QkvSplitKernel (:2162-2176).
+//
+// Mirrors vLLM's `QKVParallelLinear` output split (`qkv.split([q_size, kv_size,
+// kv_size], dim=-1)` in every attention module), which is why the three widths
+// are independent rather than three equal thirds: under GQA k and v are narrower
+// than q.
+//
+// One invocation per OUTPUT element across all three destinations, so the three
+// slices are one dispatch rather than three. Dtypes are specialization constants
+// (source and the three destinations share one code here because every caller
+// splits a projection output into tensors of its own dtype).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Sb32 { uint v[]; } S32;
+layout(binding = 1) readonly buffer Sb16 { uint16_t v[]; } S16;
+layout(binding = 2) buffer Qb32 { uint v[]; } Q32;
+layout(binding = 3) buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 4) buffer Kb32 { uint v[]; } K32;
+layout(binding = 5) buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 6) buffer Vb32 { uint v[]; } V32;
+layout(binding = 7) buffer Vb16 { uint16_t v[]; } V16;
+
+layout(constant_id = 0) const uint VT_QKV_SRC_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_QKV_DST_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint tokens;
+  uint q_dim, k_dim, v_dim;
+  uint src_off, q_off, k_off, v_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint total = p.q_dim + p.k_dim + p.v_dim;
+  if (gid >= p.tokens * total) { return; }
+
+  uint i = gid / total;   // token
+  uint j = gid % total;   // column within the fused row
+  uint row = i * total;
+
+  // The column decides which destination this element belongs to; the source
+  // offset is the same fused row in every case (cpu_ops.cpp:2169-2173).
+  if (j < p.q_dim) {
+    VT_STORE(Q32, Q16, VT_QKV_DST_DT, p.q_off, i * p.q_dim + j,
+             VT_LOAD(S32, S16, VT_QKV_SRC_DT, p.src_off, row + j));
+  } else if (j < p.q_dim + p.k_dim) {
+    uint c = j - p.q_dim;
+    VT_STORE(K32, K16, VT_QKV_DST_DT, p.k_off, i * p.k_dim + c,
+             VT_LOAD(S32, S16, VT_QKV_SRC_DT, p.src_off, row + p.q_dim + c));
+  } else {
+    uint c = j - p.q_dim - p.k_dim;
+    VT_STORE(V32, V16, VT_QKV_DST_DT, p.v_off, i * p.v_dim + c,
+             VT_LOAD(S32, S16, VT_QKV_SRC_DT, p.src_off, row + p.q_dim + p.k_dim + c));
+  }
+}

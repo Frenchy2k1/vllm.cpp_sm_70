@@ -141,6 +141,14 @@ Tensor T2(void* p, Device d, int64_t r, int64_t c) {
 Tensor T1(void* p, Device d, int64_t n) {
   return Tensor::Contiguous(p, DType::kF32, d, {n});
 }
+// Integer operands: embedding ids (i32 or i64, both accepted by vt::Embedding)
+// and sampler token ids (i64 by contract).
+Tensor TI32(void* p, Device d, int64_t n) {
+  return Tensor::Contiguous(p, DType::kI32, d, {n});
+}
+Tensor TI64(void* p, Device d, int64_t n) {
+  return Tensor::Contiguous(p, DType::kI64, d, {n});
+}
 
 }  // namespace
 
@@ -343,6 +351,398 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
       Tensor to = T2(dsilu.ptr(), d, kRows, kCols / 2);
       vt::SiluAndMul(q, to, ta);
       CHECK(Nmse(ref_silu, dsilu.Download()) <= kNmseTol);
+    }
+    dev.DestroyQueue(q);
+  }
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("RopeFromCache matches the CPU oracle within NMSE <= 5e-4, both styles") {
+  // The APPLY half of vLLM's rotary split: the cos/sin table is built once (on
+  // the portable tier, in double) and this rotates q and k with it.
+  constexpr int64_t kTokens = 11, kHq = 4, kHk = 2, kD = 16, kRot = 16;
+  constexpr int64_t kMaxPos = 64;
+
+  const std::vector<float> q0 = RandomVec(kTokens * kHq * kD, 801);
+  const std::vector<float> k0 = RandomVec(kTokens * kHk * kD, 802);
+  const std::vector<float> cache = RandomVec(kMaxPos * kRot, 803, -1.0f, 1.0f);
+  // Positions are NOT 0..n-1: a kernel that used the token index instead of the
+  // position would pass on the identity mapping and fail here.
+  std::vector<int32_t> pos(kTokens);
+  for (int64_t i = 0; i < kTokens; ++i) pos[static_cast<size_t>(i)] = int32_t((i * 7 + 3) % kMaxPos);
+
+  // NeoX rotates (pair, pair+half); GPT-J style rotates (2*pair, 2*pair+1). They
+  // are different element pairings, so a kernel that hardcoded one passes half
+  // the models and silently corrupts the other half.
+  for (bool neox : {true, false}) {
+    CAPTURE(neox);
+    vt::RopeArgs args;
+    args.rotary_dim = kRot;
+    args.is_neox_style = neox;
+
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> refq = q0, refk = k0, ccache = cache;
+    std::vector<int32_t> cpos = pos;
+    {
+      Tensor tq = Tensor::Contiguous(refq.data(), DType::kF32, cd, {kTokens, kHq, kD});
+      Tensor tk = Tensor::Contiguous(refk.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      Tensor tc = Tensor::Contiguous(ccache.data(), DType::kF32, cd, {kMaxPos, kRot});
+      Tensor tp = Tensor::Contiguous(cpos.data(), DType::kI32, cd, {kTokens});
+      vt::RopeFromCache(cq, tq, &tk, tp, tc, args);
+    }
+    cpu.DestroyQueue(cq);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kRopeFromCache, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, kTokens * kHq * kD), dk(dev, q, kTokens * kHk * kD),
+          dc(dev, q, kMaxPos * kRot);
+      dq.Upload(q0);   // rotation is IN PLACE, so re-upload the pristine input
+      dk.Upload(k0);
+      dc.Upload(cache);
+      void* dpos = dev.Alloc(kTokens * sizeof(int32_t));
+      dev.Copy(q, dpos, pos.data(), kTokens * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kTokens, kHq, kD});
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+      Tensor tc = Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kMaxPos, kRot});
+      Tensor tp = Tensor::Contiguous(dpos, DType::kI32, d, {kTokens});
+      vt::RopeFromCache(q, tq, &tk, tp, tc, args);
+      dev.Synchronize(q);
+
+      CHECK(Nmse(refq, dq.Download()) <= kNmseTol);
+      CHECK(Nmse(refk, dk.Download()) <= kNmseTol);
+
+      dev.Free(dpos);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
+  // Byte movement, so the bar is memcmp against the CPU oracle, not NMSE.
+  constexpr int64_t kTokens = 9, kHk = 2, kD = 8, kBS = 4, kBlocks = 6;
+  constexpr int64_t kElems = kHk * kD;          // one token's page payload
+  constexpr int64_t kCacheN = kBlocks * kBS * kHk * kD;
+
+  const std::vector<float> knew = RandomVec(kTokens * kElems, 701);
+  const std::vector<float> vnew = RandomVec(kTokens * kElems, 702);
+  // Pre-existing cache contents: the padded-token case must leave these INTACT,
+  // so they cannot start as zeros or the check would pass vacuously.
+  const std::vector<float> kc0 = RandomVec(kCacheN, 703);
+  const std::vector<float> vc0 = RandomVec(kCacheN, 704);
+
+  // Slots are deliberately SCATTERED and out of order, and two tokens carry -1.
+  // Upstream pads the mapping and marks padded tokens negative (cpu_cache.cpp:60);
+  // a kernel that clamped instead of skipping would corrupt a real page, and one
+  // that read the i64 slot as unsigned would index astronomically out of range.
+  const std::vector<int64_t> slots = {20, -1, 3, 11, -1, 0, 23, 7, 15};
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ck = knew, cv = vnew, ref_kc = kc0, ref_vc = vc0;
+  std::vector<int64_t> cslots = slots;
+  {
+    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
+    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
+    Tensor tkc = Tensor::Contiguous(ref_kc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+    Tensor tvc = Tensor::Contiguous(ref_vc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+    Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+    vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
+  }
+  cpu.DestroyQueue(cq);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    DevBuf dk(dev, q, kTokens * kElems), dv(dev, q, kTokens * kElems),
+        dkc(dev, q, kCacheN), dvc(dev, q, kCacheN);
+    dk.Upload(knew);
+    dv.Upload(vnew);
+    dkc.Upload(kc0);   // seeded, so an untouched page must survive
+    dvc.Upload(vc0);
+    void* dsm = dev.Alloc(kTokens * sizeof(int64_t));
+    dev.Copy(q, dsm, slots.data(), kTokens * sizeof(int64_t));
+    dev.Synchronize(q);
+
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+    Tensor tsm = Tensor::Contiguous(dsm, DType::kI64, d, {kTokens});
+    vt::ReshapeAndCache(q, tk, tv, tkc, tvc, tsm);
+    dev.Synchronize(q);
+
+    const std::vector<float> got_kc = dkc.Download();
+    const std::vector<float> got_vc = dvc.Download();
+    CHECK(std::memcmp(ref_kc.data(), got_kc.data(), ref_kc.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(ref_vc.data(), got_vc.data(), ref_vc.size() * sizeof(float)) == 0);
+
+    dev.Free(dsm);
+    dev.DestroyQueue(q);
+  }
+}
+
+TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
+  // GQA prefill: Hq=4 query heads over Hk=2 kv heads, head dim 8, block size 4,
+  // one request of 37 tokens spanning 10 pages. Ragged on purpose -- 37 is not a
+  // multiple of the block size, so the last page is partly occupied and a kernel
+  // that walked whole pages would read past the sequence.
+  constexpr int64_t kT = 37, kHq = 4, kHk = 2, kD = 8, kBS = 4;
+  constexpr int64_t kBlocks = (kT + kBS - 1) / kBS;  // 10
+
+  const std::vector<float> query = RandomVec(kT * kHq * kD, 601);
+  const std::vector<float> kc = RandomVec(kBlocks * kBS * kHk * kD, 602);
+  const std::vector<float> vc = RandomVec(kBlocks * kBS * kHk * kD, 603);
+  std::vector<int32_t> block_table(kBlocks);
+  // A NON-IDENTITY mapping, so a kernel that ignored the block table and indexed
+  // the cache linearly would fail. Page j lives at cache block (kBlocks-1-j).
+  for (int64_t b = 0; b < kBlocks; ++b) {
+    block_table[static_cast<size_t>(b)] = static_cast<int32_t>(kBlocks - 1 - b);
+  }
+  const std::vector<int32_t> seq_lens = {static_cast<int32_t>(kT)};
+  const std::vector<int32_t> qsl = {0, static_cast<int32_t>(kT)};
+
+  // Three configurations, because they are different branches in the kernel and
+  // a single causal case would leave two of them unexercised.
+  struct Cfg { const char* name; bool causal; bool window; float softcap; };
+  const Cfg cfgs[] = {
+      {"causal", true, false, 0.0f},
+      {"causal+softcap", true, false, 30.0f},   // cap * tanh(s / cap)
+      {"sliding-window", true, true, 0.0f},     // window_left bounds jmin
+  };
+
+  for (const Cfg& cfg : cfgs) {
+    CAPTURE(cfg.name);
+    vt::PagedAttentionArgs args;
+    args.scale = 0.353553f;
+    args.causal = cfg.causal;
+    args.logits_soft_cap = cfg.softcap;
+    // Both bounds must be >= 0 (ops.cpp:2778). right = 0 is the causal
+    // sliding window: no future keys, at most 8 past ones.
+    if (cfg.window) args.window_size = vt::AttentionWindow{8, 0};
+
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cq_v = query, ckc = kc, cvc = vc, ref(kT * kHq * kD);
+    std::vector<int32_t> cbt = block_table, csl = seq_lens, cqsl = qsl;
+    {
+      Tensor tq = Tensor::Contiguous(cq_v.data(), DType::kF32, cd, {kT, kHq, kD});
+      Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+      Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+      Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
+      Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
+      Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kT, kHq, kD});
+      vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    }
+    cpu.DestroyQueue(cq);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, kT * kHq * kD), dkc(dev, q, kBlocks * kBS * kHk * kD),
+          dvc(dev, q, kBlocks * kBS * kHk * kD), dout(dev, q, kT * kHq * kD);
+      dq.Upload(query);
+      dkc.Upload(kc);
+      dvc.Upload(vc);
+      void* dbt = dev.Alloc(kBlocks * sizeof(int32_t));
+      void* dsl = dev.Alloc(sizeof(int32_t));
+      void* dqsl = dev.Alloc(2 * sizeof(int32_t));
+      dev.Copy(q, dbt, block_table.data(), kBlocks * sizeof(int32_t));
+      dev.Copy(q, dsl, seq_lens.data(), sizeof(int32_t));
+      dev.Copy(q, dqsl, qsl.data(), 2 * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kT, kHq, kD});
+      Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+      Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+      Tensor tbt = Tensor::Contiguous(dbt, DType::kI32, d, {1, kBlocks});
+      Tensor tsl = Tensor::Contiguous(dsl, DType::kI32, d, {1});
+      Tensor tqsl = Tensor::Contiguous(dqsl, DType::kI32, d, {2});
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kT, kHq, kD});
+      vt::PagedAttention(q, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+      dev.Synchronize(q);
+
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+
+      dev.Free(dbt);
+      dev.Free(dsl);
+      dev.Free(dqsl);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("Embedding gather and greedy argmax match the CPU oracle EXACTLY") {
+  // Neither op is arithmetic, so neither gets the NMSE tier: a gather must move
+  // the exact bytes, and an argmax must pick the exact index.
+  constexpr int64_t kVocab = 61;
+  constexpr int64_t kHidden = 40;
+  constexpr int64_t kTokens = 7;
+
+  const std::vector<float> table = RandomVec(kVocab * kHidden, 501);
+  // Ids chosen to include 0 and the last row, and to REPEAT — a gather that
+  // accidentally consumed ids positionally would pass on distinct ids.
+  const std::vector<int32_t> ids32 = {0, 60, 13, 13, 1, 59, 0};
+  std::vector<int64_t> ids64(ids32.begin(), ids32.end());
+
+  // Logits with a DELIBERATE TIE: row 0 has its maximum twice, at columns 2 and
+  // 5. The contract (cpu_sample.cpp:49, strict `>`) is that the FIRST wins, so a
+  // kernel that used `>=` or a tie-indifferent tree reduction returns 5 and fails
+  // here. That is a different token, not a rounding difference.
+  constexpr int64_t kRows = 3;
+  std::vector<float> logits(kRows * kVocab, 0.0f);
+  for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t c = 0; c < kVocab; ++c) logits[r * kVocab + c] = -1.0f * float(c + 1);
+  }
+  logits[0 * kVocab + 2] = 9.0f;
+  logits[0 * kVocab + 5] = 9.0f;   // tie with column 2; column 2 must win
+  logits[1 * kVocab + 60] = 5.0f;  // last column
+  logits[2 * kVocab + 0] = 5.0f;   // first column
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ctable = table, clogits = logits;
+  std::vector<int32_t> cids = ids32;
+  std::vector<float> ref_emb(kTokens * kHidden);
+  std::vector<int64_t> ref_tok(kRows);
+  {
+    Tensor tt = T2(ctable.data(), cd, kVocab, kHidden);
+    Tensor ti = TI32(cids.data(), cd, kTokens);
+    Tensor to = T2(ref_emb.data(), cd, kTokens, kHidden);
+    vt::Embedding(cq, to, tt, ti);
+    Tensor tl = T2(clogits.data(), cd, kRows, kVocab);
+    Tensor ttok = TI64(ref_tok.data(), cd, kRows);
+    vt::GreedyArgmax(cq, ttok, tl);
+  }
+  REQUIRE(ref_tok[0] == 2);  // the oracle itself must honour the tie-break
+
+  for (DeviceType dt : RegisteredDevices()) {
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    if (OpAvailable(vt::OpId::kEmbedding, dt)) {
+      DevBuf dtable(dev, q, kVocab * kHidden), demb(dev, q, kTokens * kHidden);
+      dtable.Upload(table);
+      // i32 and i64 ids are DIFFERENT index paths, so both are exercised.
+      for (bool wide : {false, true}) {
+        CAPTURE(wide);
+        void* dids = dev.Alloc(kTokens * (wide ? sizeof(int64_t) : sizeof(int32_t)));
+        if (wide) {
+          dev.Copy(q, dids, ids64.data(), kTokens * sizeof(int64_t));
+        } else {
+          dev.Copy(q, dids, ids32.data(), kTokens * sizeof(int32_t));
+        }
+        dev.Synchronize(q);
+        Tensor tt = T2(dtable.ptr(), d, kVocab, kHidden);
+        Tensor ti = wide ? TI64(static_cast<int64_t*>(dids), d, kTokens)
+                         : TI32(static_cast<int32_t*>(dids), d, kTokens);
+        Tensor to = T2(demb.ptr(), d, kTokens, kHidden);
+        vt::Embedding(q, to, tt, ti);
+        dev.Synchronize(q);
+        const std::vector<float> got = demb.Download();
+        // A gather moves bytes; equality is exact, not NMSE.
+        CHECK(std::memcmp(ref_emb.data(), got.data(), ref_emb.size() * sizeof(float)) == 0);
+        dev.Free(dids);
+      }
+    }
+
+    if (OpAvailable(vt::OpId::kGreedyArgmax, dt)) {
+      DevBuf dlog(dev, q, kRows * kVocab);
+      dlog.Upload(logits);
+      void* dtok = dev.Alloc(kRows * sizeof(int64_t));
+      Tensor tl = T2(dlog.ptr(), d, kRows, kVocab);
+      Tensor ttok = TI64(static_cast<int64_t*>(dtok), d, kRows);
+      vt::GreedyArgmax(q, ttok, tl);
+      dev.Synchronize(q);
+      std::vector<int64_t> got(kRows);
+      dev.Copy(q, got.data(), dtok, kRows * sizeof(int64_t));
+      dev.Synchronize(q);
+      for (int64_t r = 0; r < kRows; ++r) {
+        CAPTURE(r);
+        CHECK(got[r] == ref_tok[r]);
+      }
+      dev.Free(dtok);
+    }
+    dev.DestroyQueue(q);
+  }
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("GEMM matches the CPU oracle within NMSE <= 5e-4, both orientations") {
+  // Shapes are deliberately RAGGED and not multiples of the workgroup size, so a
+  // kernel that silently processed only whole tiles would fail rather than pass
+  // on a friendly shape. K is the reduction length and gets the awkward value.
+  constexpr int64_t kM = 13;
+  constexpr int64_t kK = 37;
+  constexpr int64_t kN = 9;
+
+  const std::vector<float> a = RandomVec(kM * kK, 401);
+  const std::vector<float> b = RandomVec(kK * kN, 402);   // [K,N] for Matmul
+  const std::vector<float> bt = RandomVec(kN * kK, 403);  // [N,K] for MatmulBT
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ca = a, cb = b, cbt = bt;
+  std::vector<float> ref_mm(kM * kN), ref_mmbt(kM * kN);
+  {
+    Tensor ta = T2(ca.data(), cd, kM, kK);
+    Tensor tb = T2(cb.data(), cd, kK, kN);
+    Tensor tbt = T2(cbt.data(), cd, kN, kK);
+    Tensor tmm = T2(ref_mm.data(), cd, kM, kN);
+    Tensor tmmbt = T2(ref_mmbt.data(), cd, kM, kN);
+    vt::Matmul(cq, tmm, ta, tb);
+    vt::MatmulBT(cq, tmmbt, ta, tbt);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    DevBuf da(dev, q, kM * kK), dout(dev, q, kM * kN);
+    da.Upload(a);
+    Tensor ta = T2(da.ptr(), d, kM, kK);
+    Tensor to = T2(dout.ptr(), d, kM, kN);
+
+    if (OpAvailable(vt::OpId::kMatmul, dt)) {
+      DevBuf db(dev, q, kK * kN);
+      db.Upload(b);
+      Tensor tb = T2(db.ptr(), d, kK, kN);
+      vt::Matmul(q, to, ta, tb);
+      CHECK(Nmse(ref_mm, dout.Download()) <= kNmseTol);
+    }
+    // MatmulBT is a DIFFERENT indexing path (the torch Linear [N,K] weight
+    // layout), not a transpose of the same code, so it gets its own case.
+    if (OpAvailable(vt::OpId::kMatmulBT, dt)) {
+      DevBuf dbt(dev, q, kN * kK);
+      dbt.Upload(bt);
+      Tensor tbt = T2(dbt.ptr(), d, kN, kK);
+      vt::MatmulBT(q, to, ta, tbt);
+      CHECK(Nmse(ref_mmbt, dout.Download()) <= kNmseTol);
     }
     dev.DestroyQueue(q);
   }
