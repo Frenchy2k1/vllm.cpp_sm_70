@@ -15037,3 +15037,47 @@ RSS, no compiler cache. Timings, for the record only: arm A 48 s for both files
 - The class of defect — an op whose validation accepts N dtypes while one
   provider implements 1 — is fixed at this call site only. A tree-wide sweep of
   "provider narrower than its op contract" is NOT done and is worth a row.
+VERDICT: device-KDA (122/128, 4.24 tok/s) is the NEW BEST on BOTH axes but STILL a DIVERGENCE (STRICT required, K=3-deterministic golden) → `VT_KIMI_DEVICE_KDA` STAYS OFF (parity-enablers). The residual is now a SINGLE near-tie (p7 pos-6). NAMED next brick to STRICT (+ more speed): the KDA chunked-prefill kernel family (vLLM processes the PROMPT with `chunk_kda`, we still run the recurrent form — regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or a native `chunk_kda` port) + paged `mla::ForwardMlaAttentionBlock` for the 7 NoPE-MLA layers + paged-incremental decode (persistent KDA state + MLA-KV, kills the remaining O(n²)). Row STAYS ACTIVE.
+
+### VK-E unblocked: identical weights in both containers (2026-08-07)
+
+The blocker recorded above — "no model on dgx loads in both engines" — is RESOLVED
+without needing `VK-D`. The stock `Qwen/Qwen3-0.6B` HF snapshot (cached on dgx)
+was converted to GGUF with **llama.cpp's own** `convert_hf_to_gguf.py`, so
+llama.cpp runs the GGUF and vllm.cpp runs the safetensors it was made from —
+**byte-identical weights by construction**, which removes the weight-identity
+doubt that makes a same-named-model comparison unfalsifiable.
+
+Toolchain note worth keeping: the converter needs `transformers` + `gguf` +
+`torch` and NO single interpreter on dgx had all three (the oracle venv has
+transformers but not gguf; system python has gguf+torch but not transformers).
+Resolved with **zero installs and zero disk** by borrowing transformers via
+`PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the system
+python. The oracle venv was deliberately NOT pip-installed into — it is the parity
+oracle and was expensive to repair.
+
+**llama.cpp Vulkan, full strength (`NV_coopmat2`), stock Qwen3-0.6B F16
+(1.40 GiB, 751.63 M params):**
+
+| test | t/s |
+|---|---:|
+| pp128 | **11,514.16 ± 388.21** |
+| tg32 | **160.91 ± 1.54** |
+
+Consistent with the finetune-GGUF run (11,730 / 161.4), which sanity-checks the
+measurement rather than the model.
+
+**vllm.cpp on Vulkan: the engine SELECTS Vulkan** (`[vt reference-tier] op=...
+device=3` — device 3 is `kVULKAN`) **and is orders of magnitude slower.** A
+4-prompt / 128-in / 32-out run did not finish inside 900 s, against llama.cpp's
+seconds. That is the expected shape and not a defect: **71 of 87 ops run on the
+portable CPU reference tier**, so this measures our HOST FALLBACK wearing a Vulkan
+label, not our Vulkan kernels. The reference tier announces itself per op, which
+is exactly why the slowness is attributable rather than mysterious.
+
+**Therefore no ratio is quoted.** A ratio here would be read as "our Vulkan vs
+llama.cpp's Vulkan" when it is really "our CPU tier vs llama.cpp's Vulkan". The
+comparison becomes meaningful when native coverage closes — the progress metric is
+`vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
+the RoPE table build, the sampler tail, and the remaining norm/glue set.
+>>>>>>> 814230a0 (bench(vulkan): VK-E unblocked with identical weights; ours quoted as NO RATIO)

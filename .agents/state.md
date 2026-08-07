@@ -41739,3 +41739,36 @@ ratchet, so the Parakeet line was TIGHTENED while gaining the RNN-T/TDT coverage
 and two more verified checkpoints; the page NET-SHRINKS to 284063 and the ratchet
 was LOWERED to match. `check-agent-record.py`'s MODEL row count goes 360 -> 361
 because a genuinely new row exists.
+- **2026-08-07 (later)** — **`VK-E` UNBLOCKED and the denominator is now a FAIR one;
+  ours deliberately quoted as NO RATIO (`CLAIM-VULKAN-FULL-1`).**
+
+  The blocker recorded earlier ("no model on dgx loads in both engines") is
+  resolved WITHOUT needing `VK-D`: the stock `Qwen/Qwen3-0.6B` snapshot was
+  converted to GGUF with **llama.cpp's own** `convert_hf_to_gguf.py`, so llama.cpp
+  runs the GGUF and vllm.cpp runs the safetensors it came from — **byte-identical
+  weights by construction**, which is what makes the pairing falsifiable instead
+  of merely same-named.
+
+  **llama.cpp Vulkan, `NV_coopmat2`, Qwen3-0.6B F16 (1.40 GiB, 751.63 M):
+  pp128 11,514.16 ± 388.21 t/s, tg32 160.91 ± 1.54 t/s.** Consistent with the
+  finetune-GGUF run (11,730 / 161.4), which sanity-checks the measurement.
+
+  **vllm.cpp SELECTS Vulkan** (`[vt reference-tier] op=… device=3`, device 3 =
+  `kVULKAN`) **and is orders of magnitude slower** — a 4-prompt/128-in/32-out run
+  did not finish in 900 s against llama.cpp's seconds. Expected, not a defect:
+  **71 of 87 ops run on the portable CPU reference tier**, so this measures our
+  HOST FALLBACK wearing a Vulkan label. The tier announces itself per op, which is
+  why the slowness is attributable rather than mysterious.
+
+  **★ NO RATIO IS QUOTED, deliberately.** A number here would be read as "our
+  Vulkan vs their Vulkan" when it is "our CPU tier vs their Vulkan". It becomes
+  meaningful when native coverage closes; the progress metric is
+  `vt::GetReferenceTierHits()` reaching 0, and for THIS model the remaining ops are
+  the RoPE table build, the sampler tail, and the residual norm/glue set.
+
+  Toolchain note: the converter needs `transformers`+`gguf`+`torch` and no single
+  interpreter on dgx had all three (oracle venv has transformers, not gguf; system
+  python has gguf+torch, not transformers). Solved with **zero installs and zero
+  disk** via `PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the
+  system python. The oracle venv was deliberately NOT pip-installed into — it is
+  the parity oracle and was expensive to repair.
