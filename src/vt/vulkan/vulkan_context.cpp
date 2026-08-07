@@ -77,7 +77,7 @@ const bool kBatchDispatch = [] {
 // Cap on dispatches per submit. Bounded so a batch cannot pin an unbounded number
 // of descriptor sets, and so the fence granularity stays coarse enough to be
 // worth batching but fine enough to bound latency.
-constexpr uint32_t kMaxBatch = 128;
+constexpr uint32_t kMaxBatch = 512;
 
 const std::chrono::steady_clock::time_point g_dispatch_t0 =
     std::chrono::steady_clock::now();
@@ -298,7 +298,27 @@ Probe ProbeDevice(VkInstance instance) {
 // The ring is bounded, so a pipeline used more than kDescriptorRing times in one
 // batch forces a flush. That is a throughput ceiling, never a correctness
 // question: the flush happens before the set is reused.
-constexpr uint32_t kDescriptorRing = 16;
+// MEASURED: 16 was the batch-length limiter, not kMaxBatch. vt_rms_norm runs 112
+// times per forward pass (4 per layer x 28 layers), so it exhausted a 16-deep ring
+// seven times per pass and forced a flush each time -- observed batches capped at
+// 40-46 dispatches against a kMaxBatch of 128. Every forced flush is a
+// vkQueueSubmit plus a blocking vkWaitForFences, and a host profile with the idle
+// CPU-threadpool spin suppressed puts 62% of on-CPU time in the kernel and the
+// NVIDIA driver against only 14% in our own code. So the submits ARE the host
+// cost, and the ring depth is what sets how many there are.
+constexpr uint32_t kDescriptorRing = 128;
+
+// EFFECTIVE ring depth, clamped to the allocated one. Exists so the ring can be
+// A/B'd in ONE binary: it was 16, which capped batches at 40-46 dispatches, and a
+// cross-BUILD comparison of two depths is the shape that produced a false 1.2x
+// reading for the subgroup tactic earlier in this campaign.
+const uint32_t kRingDepth = [] {
+  const char* v = std::getenv("VT_VULKAN_RING");
+  if (v == nullptr) return kDescriptorRing;
+  const int n = std::atoi(v);
+  if (n < 1) return 1u;
+  return n > static_cast<int>(kDescriptorRing) ? kDescriptorRing : static_cast<uint32_t>(n);
+}();
 
 struct VulkanContext::Pipeline {
   VkShaderModule module = VK_NULL_HANDLE;
@@ -950,7 +970,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // A pipeline that has consumed its whole descriptor ring must flush before it
   // can reuse set 0, because the GPU has not necessarily read the earlier ones
   // yet. Flushing also resets every pipeline's counter.
-  if (kBatchDispatch && (p.used_this_batch >= kDescriptorRing || batch_count_ >= kMaxBatch)) {
+  if (kBatchDispatch && (p.used_this_batch >= kRingDepth || batch_count_ >= kMaxBatch)) {
     FlushBatchLocked();
   }
 
