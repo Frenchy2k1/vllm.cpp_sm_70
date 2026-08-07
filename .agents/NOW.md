@@ -18,7 +18,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | **fl2va COHERENT; ref2va grid DIAGNOSED (#95): NO loader bug; bf16 13-shard DiT INDEXES** | residual = community-NVFP4 quant fidelity §8.12; no bf16 render yet |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | bf16 knobs **106→120/128**, NOT STRICT (§14, `row/KIMI-LINEAR-STRICT-SPEED`); default OFF | residual = device islands; 1.30 tok/s |
+| Kimi-Linear-48B (KDA/NoPE-MLA/MoE) | **`vt::KdaGatedDeltaRule` LANDED + GB10-MEASURED** (§15, `row/KIMI-KDA-DEVICE-KERNEL`): **106→122/128 + 1.35→4.24 tok/s (3.1×)**, beats §14's 120. OFF (122≠STRICT) | close p7: chunked-prefill/paged-MLA/incremental |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
@@ -67,7 +67,7 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` is the DEFAULT. Queue: 10 rows (6 audit-vacated, LANDED gate anchors; READ before picking). Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+`--require-role` is the DEFAULT. Queue: 10 rows; backfill 79 rows, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated

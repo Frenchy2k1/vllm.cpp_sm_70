@@ -1343,6 +1343,77 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
   });
 }
 
+// ── KDA per-K-channel-decay gated-delta recurrence (kKdaGatedDeltaRule) ────────
+// Byte-for-byte GdnHeadTokenStep EXCEPT the decay is per-K-channel: plain GDN
+// does `s_row[ki] *= exp(g_head)` (one scalar per value head), KDA does
+// `s_row[ki] *= exp(g[.,hv,ki])` (one log-decay per K channel), broadcast across
+// the Dv rows. Ported 1:1 from FLA fused_recurrent_gated_delta_rule_fwd_kernel
+// IS_KDA=True (`b_h *= exp(b_gk[None, :])`, fused_recurrent.py:136-137 @ 555967922).
+// All arithmetic f32 (FLA loads bf16 -> tl.float32); same reduction order as GDN.
+void KdaHeadTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Tensor& v_in,
+                      const Tensor& g, const Tensor& beta, float* s_head, int64_t tok,
+                      int64_t hv, int64_t hk, int64_t hk_n, int64_t hv_n, int64_t dk, int64_t dv,
+                      float scale, std::vector<float>& qbuf, std::vector<float>& kbuf,
+                      std::vector<float>& vbuf, std::vector<float>& decaybuf) {
+  const float beta_t = beta.Ptr<float>()[tok * hv_n + hv];
+  const float* g_row = g.Ptr<float>() + (tok * hv_n + hv) * dk;
+  for (int64_t ki = 0; ki < dk; ++ki) {
+    qbuf[static_cast<size_t>(ki)] = LoadF32(q_in, (tok * hk_n + hk) * dk + ki) * scale;
+    kbuf[static_cast<size_t>(ki)] = LoadF32(k_in, (tok * hk_n + hk) * dk + ki);
+    decaybuf[static_cast<size_t>(ki)] = std::exp(g_row[ki]);
+  }
+  for (int64_t vi = 0; vi < dv; ++vi) {
+    float* s_row = s_head + vi * dk;
+    float dot = 0.0f;  // (S * exp(g_channel)) @ k, fused with the per-channel decay
+    for (int64_t ki = 0; ki < dk; ++ki) {
+      s_row[ki] *= decaybuf[static_cast<size_t>(ki)];
+      dot += s_row[ki] * kbuf[static_cast<size_t>(ki)];
+    }
+    vbuf[static_cast<size_t>(vi)] =
+        (LoadF32(v_in, (tok * hv_n + hv) * dv + vi) - dot) * beta_t;
+  }
+  for (int64_t vi = 0; vi < dv; ++vi) {
+    float* s_row = s_head + vi * dk;
+    float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+    for (int64_t ki = 0; ki < dk; ++ki) {
+      s_row[ki] += vbuf[static_cast<size_t>(vi)] * kbuf[static_cast<size_t>(ki)];
+      o += s_row[ki] * qbuf[static_cast<size_t>(ki)];
+    }
+    StoreF32(out, (tok * hv_n + hv) * dv + vi, o);
+  }
+}
+
+void KdaGatedDeltaRuleKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
+                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                             const Tensor& qsl, const GdnArgs& args) {
+  const int64_t n = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
+                dk = state.shape[3];
+  const int32_t* qslp = qsl.Ptr<int32_t>();
+  VT_CHECK(qslp[0] == 0 && qslp[n] == q_in.shape[0],
+           "kda_gated_delta_rule: bad query_start_loc bounds");
+  for (int64_t s = 0; s < n; ++s) {
+    VT_CHECK(qslp[s + 1] >= qslp[s], "kda_gated_delta_rule: query_start_loc not monotonic");
+  }
+  const int64_t hk_n = q_in.shape[1];
+  const int64_t ratio = hv_n / hk_n;
+  const int64_t nitems = n * hv_n;
+  // Row-chunked over (SEQUENCE, VALUE-HEAD) exactly as GdnPrefillKernel — each
+  // (s, hv) owns a disjoint state block + output rows; sequential in tok.
+  ForRows(nitems, [&](int64_t r0, int64_t r1) {
+    std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
+        vbuf(static_cast<size_t>(dv)), decaybuf(static_cast<size_t>(dk));
+    for (int64_t item = r0; item < r1; ++item) {
+      const int64_t s = item / hv_n;
+      const int64_t hv = item % hv_n;
+      const int64_t hk = hv / ratio;
+      float* s_head = state.Ptr<float>() + (s * hv_n + hv) * dv * dk;
+      for (int64_t t = qslp[s]; t < qslp[s + 1]; ++t)
+        KdaHeadTokenStep(out, q_in, k, v, g, beta, s_head, t, hv, hk, hk_n, hv_n, dk, dv,
+                         args.scale, qbuf, kbuf, vbuf, decaybuf);
+    }
+  });
+}
+
 // SPECULATIVE (multi-token, slot-snapshotting) gated-delta-rule step.
 // Ported from vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @
 // e24d1b24 — fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN
@@ -2412,6 +2483,9 @@ struct Registrar {
         OpId::kGdnPackedDecode, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
             &GdnPackedDecodeKernel)));
+    RegisterOp(
+        OpId::kKdaGatedDeltaRule, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(&KdaGatedDeltaRuleKernel)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCPU,
         reinterpret_cast<void*>(

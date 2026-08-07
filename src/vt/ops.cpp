@@ -1826,6 +1826,49 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
       q, out, q_in, k, v, g, beta, state, query_start_loc, args);
 }
 
+void KdaGatedDeltaRule(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                       const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                       const Tensor& query_start_loc, const GdnArgs& args) {
+  constexpr const char* name = "kda_gated_delta_rule";
+  // Same contracts as GdnPrefill EXCEPT g is per-K-channel [T,Hv,Dk].
+  VT_CHECK(q_in.rank == 3 && k.rank == 3 && v.rank == 3 && out.rank == 3 && g.rank == 3 &&
+               beta.rank == 2 && state.rank == 4,
+           std::string(name) +
+               ": q/k [T,Hk,Dk], v/out [T,Hv,Dv], g [T,Hv,Dk], beta [T,Hv], state [N,Hv,Dv,Dk]");
+  const int64_t t = q_in.shape[0], hk = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv = v.shape[1], dv = v.shape[2];
+  VT_CHECK(k.shape[0] == t && k.shape[1] == hk && k.shape[2] == dk,
+           std::string(name) + ": k shape must match q");
+  VT_CHECK(v.shape[0] == t, std::string(name) + ": v token count must match q");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hv && out.shape[2] == dv,
+           std::string(name) + ": out must be [T,Hv,Dv]");
+  VT_CHECK(g.shape[0] == t && g.shape[1] == hv && g.shape[2] == dk,
+           std::string(name) + ": g must be [T,Hv,Dk] (per-K-channel decay)");
+  VT_CHECK(beta.shape[0] == t && beta.shape[1] == hv,
+           std::string(name) + ": beta must be [T,Hv]");
+  VT_CHECK(hk >= 1 && hv % hk == 0,
+           std::string(name) + ": Hv must be a multiple of Hk (GQA broadcast)");
+  VT_CHECK(state.shape[1] == hv && state.shape[2] == dv && state.shape[3] == dk,
+           std::string(name) + ": state must be [N,Hv,Dv,Dk]");
+  VT_CHECK(IsFloat(q_in.dtype) && IsFloat(k.dtype) && IsFloat(v.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float q/k/v, f32/bf16 out");
+  VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
+           std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
+  VT_CHECK(state.dtype == DType::kF32,
+           std::string(name) + ": state must be f32 (fresh-zeros or persistent, read/written f32)");
+  VT_CHECK(q_in.IsContiguous() && k.IsContiguous() && v.IsContiguous() && out.IsContiguous() &&
+               g.IsContiguous() && beta.IsContiguous() && state.IsContiguous(),
+           std::string(name) + ": contiguous required");
+  VT_CHECK(q_in.device == q.device && k.device == q.device && v.device == q.device &&
+               out.device == q.device && g.device == q.device && beta.device == q.device &&
+               state.device == q.device,
+           std::string(name) + ": device mismatch (q/k/v/out/g/beta/state/queue)");
+  VT_CHECK(args.scale > 0.0f, std::string(name) + ": args.scale must be set (> 0)");
+  CheckI32Meta(q, query_start_loc, state.shape[0] + 1, name, "query_start_loc");
+  reinterpret_cast<KdaGatedDeltaRuleFn>(GetOp(OpId::kKdaGatedDeltaRule, q.device.type))(
+      q, out, q_in, k, v, g, beta, state, query_start_loc, args);
+}
+
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx) {

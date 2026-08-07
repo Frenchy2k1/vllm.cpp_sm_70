@@ -156,6 +156,24 @@ bool IslandF32Acc() {
   }();
   return on;
 }
+
+// (4) VT_KIMI_DEVICE_KDA — run the KDA per-k-channel gated-delta RECURRENCE through the
+// device op vt::KdaGatedDeltaRule (the net-new per-channel-decay GDN kernel, cuda_gdn.cu
+// KdaScanKernel) instead of the f64 host recompute. This is the principled path to STRICT
+// AND the speed lever (spec §14): the recurrence runs vLLM's actual f32-on-bf16 arithmetic
+// (FLA fused_recurrent_gated_delta_rule_fwd_kernel IS_KDA=True) on device rather than a
+// host f64 recompute that is MORE precise than vLLM and coin-flips near-ties. The decay
+// gate `g = -exp(A_log)*softplus(f_b(f_a(x))+dt_bias)` and beta = sigmoid(b) stay host
+// (elementwise, numerically stable — the numerically-sensitive object is the recurrence).
+// Default OFF (parity-enabler: flip ON only with the token gate green). Independent of the
+// bf16-precision knobs (BF16_ISLANDS still rounds the gate inputs when both are set).
+bool DeviceKda() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_DEVICE_KDA");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
 // Round a running f64 accumulator to f32 precision when the knob is on (identity else).
 inline double AccR(double x) {
   static const bool f32 = IslandF32Acc();
@@ -281,6 +299,42 @@ DBuf KdaRecurrenceIsland(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
   const int64_t nh = p.kda_num_heads;
   const int64_t hd = p.kda_head_dim;
   const int64_t proj = nh * hd;
+
+  // ── DEVICE RECURRENCE (VT_KIMI_DEVICE_KDA): run the per-k-channel gated-delta
+  // recurrence on device via vt::KdaGatedDeltaRule (KdaScanKernel), vLLM's actual
+  // f32-on-bf16 arithmetic, instead of the host f64 recompute below. q_n/k_n/v are
+  // ALREADY device-resident; only the elementwise gate (KdaDecayGate) + beta = sigmoid(b)
+  // are computed on host and uploaded (small, numerically stable). Fresh zero state,
+  // single sequence, qsl=[0,T] — the stateless full-sequence recurrence the island needs.
+  if (DeviceKda()) {
+    std::vector<float> dhg1(static_cast<size_t>(T) * proj),
+        dhbraw(static_cast<size_t>(T) * nh);
+    g1.Download(d, dhg1.data());
+    braw.Download(d, dhbraw.data());
+    RoundHostBf16(dhg1);   // honor BF16_ISLANDS on the gate inputs
+    RoundHostBf16(dhbraw);
+    const std::vector<float> gch =
+        kimi_kda::KdaDecayGate(dhg1, a_log, dt_bias, T, nh, hd);  // [T,nh,hd] per-channel
+    std::vector<float> hbeta(static_cast<size_t>(T) * nh);
+    for (size_t i = 0; i < hbeta.size(); ++i)
+      hbeta[i] = static_cast<float>(Sigmoid(dhbraw[i]));
+    DBuf dg(d, DType::kF32, {T, nh, hd}, gch.data());
+    DBuf dbeta(d, DType::kF32, {T, nh}, hbeta.data());
+    DBuf dstate(d, DType::kF32, {1, nh, hd, hd});
+    dstate.Zero(d);
+    DBuf dcore(d, DType::kF32, {T, proj});
+    const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+    DBuf dqsl(d, DType::kI32, {2}, qsl);
+    Tensor qn3 = MakeTensor(qn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor kn3 = MakeTensor(kn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor vc3 = MakeTensor(vc.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor out3 = MakeTensor(dcore.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    const float scale = static_cast<float>(std::pow(static_cast<double>(hd), -0.5));
+    vt::KdaGatedDeltaRule(d.q, out3, qn3, kn3, vc3, dg.t(), dbeta.t(), dstate.t(), dqsl.t(),
+                          vt::GdnArgs{scale});
+    return dcore;
+  }
+
   std::vector<float> hqn(static_cast<size_t>(T) * proj), hkn(hqn.size()),
       hv(hqn.size()), hg1(hqn.size()), hbraw(static_cast<size_t>(T) * nh);
   qn.Download(d, hqn.data());
