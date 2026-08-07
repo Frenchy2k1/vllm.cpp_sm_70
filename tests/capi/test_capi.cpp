@@ -379,6 +379,72 @@ TEST_CASE("capi: two greedy completions of the same prompt are identical") {
   vllm_engine_free(eng);
 }
 
+// ─── (b1b) ABI v13 pre-tokenized completion ──────────────────────────────────
+TEST_CASE("capi: vllm_complete_tokens matches the string-prompt completion (ABI v13)") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  vllm_sampling_params sp = GreedyParams(6);
+  // The string leg: "hello" tokenizes to the single id 13 in the synthetic
+  // tokenizer (see the vllm_complete greedy case above).
+  vllm_completion via_str;
+  REQUIRE(vllm_complete(eng, "hello", &sp, &via_str) == VLLM_OK);
+
+  const int32_t prompt[1] = {13};
+  int32_t out_tokens[16] = {0};
+  int32_t n_out = -1;
+  vllm_completion via_tok;
+  const vllm_status st =
+      vllm_complete_tokens(eng, prompt, 1, &sp, out_tokens, 16, &n_out, &via_tok);
+  CHECK(st == VLLM_OK);
+  CHECK(n_out == 6);  // greedy max_tokens, all reported
+  // Hand-pinned synthetic-model greedy stream.  This is intentionally
+  // independent of the string leg: a broken implementation that merely
+  // reports six zero-initialized buffer entries must not satisfy ABI v12.
+  const int32_t expected_ids[6] = {22, 12, 14, 9, 13, 2};
+  for (int i = 0; i < 6; ++i) {
+    INFO("generated token index ", i);
+    CHECK(out_tokens[i] == expected_ids[i]);
+  }
+  REQUIRE(via_tok.text != nullptr);
+  // Same engine, same greedy params, same (single-token) prompt => the SAME
+  // deterministic completion through both entry points.
+  CHECK(std::string(via_tok.text) == std::string(via_str.text));
+  CHECK(via_tok.prompt_tokens == 1);
+  CHECK(via_tok.completion_tokens == 6);
+  REQUIRE(via_tok.finish_reason != nullptr);
+  CHECK(std::string(via_tok.finish_reason) == "length");
+
+  // A truncating buffer reports fewer ids but never changes the generation.
+  int32_t small[2] = {0};
+  int32_t n_small = -1;
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, small, 2, &n_small, nullptr) ==
+        VLLM_OK);
+  CHECK(n_small == 2);
+  CHECK(small[0] == out_tokens[0]);
+  CHECK(small[1] == out_tokens[1]);
+
+  // Null contracts.
+  CHECK(vllm_complete_tokens(nullptr, prompt, 1, &sp, out_tokens, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, nullptr, 1, &sp, out_tokens, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, prompt, 0, &sp, out_tokens, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, nullptr, 16, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, out_tokens, 16, nullptr,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  n_out = -1;
+  CHECK(vllm_complete_tokens(eng, prompt, 1, &sp, out_tokens, -1, &n_out,
+                             nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(n_out == 0);
+
+  vllm_completion_free(&via_str);
+  vllm_completion_free(&via_tok);
+  vllm_engine_free(eng);
+}
+
 // ─── (b2) ABI v8 custom logits processor: forces a token end-to-end ──────────
 namespace {
 // Force-a-token processor: state carried through vllm_logits_processor_user_data.
@@ -1228,7 +1294,7 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // slice (vllm_video_*) is ABI v12. The >= pin is the one check that can
   // catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
   // test_dlopen compare against the same macro and move with it.
-  CHECK(vllm_abi_version() >= 12);
+  CHECK(vllm_abi_version() >= 13);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────

@@ -67,9 +67,15 @@ std::unique_ptr<LoadedModel> LoadKimiLinearForCausalLM(
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
   }
+  // ROW 7 (§20.3): the ENGINE path loads the bf16-RESIDENT tower — NEVER the
+  // 183 GiB f32 MaterializeHost, which OOM-reboots the 119 GiB unified pool on
+  // the full 48.9B checkpoint (§13 pool math). With a load_queue (the engine's
+  // stage_on_load seam: CUDA context created BEFORE the weights — the GB10 load
+  // recipe) each large tensor is staged to d_dev and its host mirror released;
+  // with none (CPU / tests) the host bf16 bytes are kept and aliased.
   return std::make_unique<KimiLinearLoadedModel>(
-      registration,
-      LoadKimiLinearForCausalLMWeights(*source.safetensors, config));
+      registration, LoadKimiLinearResidentBf16Weights(*source.safetensors, config,
+                                                      source.load_queue));
 }
 
 void PrepareKimiLinearForCausalLM(LoadedModel& model, const HfConfig& config,
@@ -83,6 +89,17 @@ ForwardLogits ForwardKimiLinearForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
   auto& kl = static_cast<KimiLinearLoadedModel&>(model);
   const KimiLinearWeights& weights = kl.weights();
+  // ROW 7 (§20.3): the RUNNER path — real paged caches supplied (the runner
+  // always hands its allocated attn_kv + gdn_state groups) with bf16-resident
+  // weights — routes through the shared-paged-runner fold: KDA state in the
+  // MambaSpec group, NoPE-MLA latent in the paged MLA group, one forward per
+  // scheduler step, device-resident logits for the on-GPU sampler. Direct
+  // callers with no paged caches (the CLI/unit vehicles) keep the historical
+  // seams below, byte-identical.
+  if (input.gather_logits && weights.resident.resident && !input.attn_kv.empty() &&
+      !input.gdn_state.empty()) {
+    return KimiLinearModel::ForwardPaged(input, weights);
+  }
   if (input.gather_logits) {
     return KimiLinearModel::ForwardDevice(input.token_ids, input.positions,
                                           input.attn_meta, input.attn_kv, weights,
@@ -102,6 +119,9 @@ const ModelFactory kKimiLinearFactory{
     .forward = &ForwardKimiLinearForCausalLM,
     .make_kv_cache = &MakeKimiLinearKVCache,
     .is_dense_model = false,
+    // ROW 7 (§20.3): the engine selects the queue BEFORE loading so the 91.5 GiB
+    // bf16-resident tower stages per tensor into the CUDA context (§13 recipe).
+    .stage_on_load = true,
 };
 
 }  // namespace
@@ -135,7 +155,10 @@ v1::KVCacheConfig MakeKimiLinearKVCache(const HfConfig& config, int block_size,
           std::vector<std::vector<int64_t>>{
               {p.kda_conv_dim(), p.kda_short_conv_kernel_size - 1},
               {p.kda_num_heads, p.kda_head_dim, p.kda_head_dim}},
-          std::vector<vt::DType>{vt::DType::kBF16, vt::DType::kF32}));
+          // kda_state_dtype (mamba_utils.py:130-137): conv follows the CACHE
+          // dtype (model-dtype bf16 default; f32 under VT_KV_CACHE_F32 — the
+          // fold-identity A/B), recurrent state is always float32.
+          std::vector<vt::DType>{v1::ResolveKvCacheDType(), vt::DType::kF32}));
   return kv;
 }
 

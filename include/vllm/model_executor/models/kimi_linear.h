@@ -252,6 +252,13 @@ struct KdaResidentWeights {
 struct MlaResidentWeights {
   OwnedTensor q_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj;  // bf16
   std::vector<float> kv_a_layernorm;   // f32 [kv_lora]
+  // ROW 7 (§20.3c) — the ABSORBED decode forms for the paged-FA2 NoPE-MLA arm
+  // (mla::ForwardMlaAttentionBlock): W_UK_T [nah, qk_nope, kv_lora] and W_UV
+  // [nah, kv_lora, v_head] bf16, computed from kv_b_proj at LOAD time
+  // (mla::AbsorbKvBProjBf16 — the host bf16 bytes are released after staging, so
+  // absorption cannot be deferred). Populated by BOTH resident builders; empty
+  // only on a pre-fold checkpoint of the struct (the paged-FA2 arm refuses).
+  OwnedTensor w_uk_t, w_uv;
 };
 struct MlpResidentWeights {
   OwnedTensor gate_proj, up_proj, down_proj;  // bf16
@@ -560,6 +567,24 @@ class KimiLinearModel {
   static ForwardLogits ForwardDecodeStepIncremental(
       int32_t token, int64_t position, const KimiLinearWeights& weights,
       vt::Queue& queue, KimiDecodeCache& cache);
+
+  // ─── ROW 7 — THE SHARED-PAGED-RUNNER FOLD (§20.3, ARCH-ONE-SURFACE req 4) ────
+  // The born-on-the-runner PRODUCTION forward: the whole 27-layer hybrid over the
+  // runner's OWN paged state — the KDA conv+recurrent state lives in the runner's
+  // MambaSpec `gdn_state` group keyed by `gdn_meta.non_spec_state_indices_tensor`
+  // (mirror vLLM kimi_gdn_linear_attn._forward's (conv_state, recurrent_state)
+  // slot handling), and the NoPE-MLA latent-KV lives in the paged `attn_kv` MLA
+  // group written through vt::ConcatAndCacheMla at `attn_meta.slot_mapping`.
+  // Prefill = vt::KdaChunkPrefill (vLLM's prompt path; recurrence when the
+  // request continues an existing state); decode = vt::KdaGatedDeltaRule (T==1).
+  // Batched decode-first (nd decodes then np prefills, the GDN builder's
+  // segmentation); byte-for-byte the DeviceForwardBodyBf16Incremental per-token
+  // compute with the per-sequence host KimiDecodeCache replaced by the paged
+  // groups — which is what makes the CLI-incremental battery the fold-identity
+  // reference. Returns DEVICE-RESIDENT [rows,vocab] logits for the on-GPU
+  // sampler (the third MUST-route seam).
+  static ForwardLogits ForwardPaged(const ModelForwardInput& input,
+                                    const KimiLinearWeights& weights);
 };
 
 // KV-cache spec builder. The HETEROGENEOUS per-layer topology (spike §3): ONE MLA

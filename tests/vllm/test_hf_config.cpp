@@ -10,6 +10,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
 
@@ -387,6 +388,116 @@ TEST_CASE("LoadHfConfig mirrors sliding_window normalization from the text confi
     REQUIRE(cfg.sliding_window.has_value());
     CHECK(*cfg.sliding_window == 128);
   }
+}
+
+// ROW 7 / kimi-linear.md §20.3 B1 — KV enablement for the shared paged runner.
+// Kimi-Linear's config carries NO `layer_types` and NONE of the qwen3_5-style
+// explicit `linear_*` GDN-geometry keys: its KDA/full-attn split lives in the
+// nested `linear_attn_config` (transformers_utils/configs/kimi_linear.py:34-148,
+// `is_kda_layer(l) := (l+1) in kda_layers` :144-148 — the lists are 1-INDEXED).
+// LoadHfConfig must SYNTHESIZE the runner-facing fields from it so the runner's
+// MambaSpec shape check (runner.cpp:489-493) and the per-layer KDA-state /
+// MLA-page allocation loop (runner.cpp:625-) see the same geometry
+// MakeKimiLinearKVCache declares — instead of {0,0},{0,0,0} and an abort.
+TEST_CASE("LoadHfConfig synthesizes layer_types + GDN geometry from linear_attn_config") {
+  TempJson f(R"({
+    "model_type": "kimi_linear",
+    "architectures": ["KimiLinearForCausalLM"],
+    "hidden_size": 2304,
+    "num_hidden_layers": 8,
+    "vocab_size": 163840,
+    "num_attention_heads": 32,
+    "intermediate_size": 9216,
+    "rms_norm_eps": 1e-05,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "mla_use_nope": true,
+    "linear_attn_config": {
+      "kda_layers": [1, 2, 3, 5, 6, 7],
+      "full_attn_layers": [4, 8],
+      "num_heads": 32,
+      "head_dim": 128,
+      "short_conv_kernel_size": 4
+    },
+    "max_position_embeddings": 1048576
+  })");
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+
+  // GDN-group geometry sourced from linear_attn_config (num_k == num_v == the
+  // KDA num_heads; Dk == Dv == head_dim; conv kernel == short_conv_kernel_size),
+  // so the runner derives conv_dim = 2*Hk*Dk + Hv*Dv = 3*32*128 = 12288 and the
+  // ssm shape {32,128,128} — exactly MakeKimiLinearKVCache's MambaSpec.
+  CHECK(cfg.linear_num_key_heads == 32);
+  CHECK(cfg.linear_num_value_heads == 32);
+  CHECK(cfg.linear_key_head_dim == 128);
+  CHECK(cfg.linear_value_head_dim == 128);
+  CHECK(cfg.linear_conv_kernel_dim == 4);
+
+  // layer_types synthesized from the 1-indexed kda_layers list.
+  REQUIRE(cfg.layer_types.size() == 8);
+  const std::vector<std::string> expect = {
+      "linear_attention", "linear_attention", "linear_attention",
+      "full_attention",   "linear_attention", "linear_attention",
+      "linear_attention", "full_attention"};
+  for (size_t i = 0; i < expect.size(); ++i) CHECK(cfg.layer_types[i] == expect[i]);
+
+  // The raw doc still carries linear_attn_config for ParseKimiLinearParams.
+  CHECK(cfg.raw.contains("linear_attn_config"));
+}
+
+// The synthesis must be ADDITIVE: a config that carries the explicit qwen3_5
+// fields (kHybridJson has both layer_types AND linear_*) is untouched by it —
+// that path is byte-identical (asserted by the hybrid TEST_CASE above), and a
+// config with NEITHER (plain dense llama) stays all-zero / empty.
+TEST_CASE("LoadHfConfig linear_attn_config synthesis leaves non-Kimi configs untouched") {
+  TempJson f(kLlamaJson);
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  CHECK(cfg.linear_num_key_heads == 0);
+  CHECK(cfg.linear_num_value_heads == 0);
+  CHECK(cfg.linear_conv_kernel_dim == 0);
+  CHECK(cfg.layer_types.empty());
+}
+
+// The PRIORITY conjunct (`cfg.linear_num_key_heads == 0`): a config carrying
+// BOTH the explicit qwen3_5-style keys AND a linear_attn_config keeps the
+// EXPLICIT values — the synthesis never overwrites them. Drop the conjunct and
+// this case REDs (num_value_heads would become 4 == num_heads, key_head_dim 16,
+// conv 4). This makes B1 additive-by-construction, pinned rather than assumed.
+TEST_CASE("LoadHfConfig explicit linear_* fields WIN over linear_attn_config") {
+  TempJson f(R"({
+    "model_type": "qwen3_5_moe",
+    "architectures": ["Qwen3NextForCausalLM"],
+    "hidden_size": 64,
+    "num_hidden_layers": 3,
+    "vocab_size": 128,
+    "num_attention_heads": 4,
+    "layer_types": ["linear_attention", "full_attention", "linear_attention"],
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 8,
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 64,
+    "linear_conv_kernel_dim": 3,
+    "linear_attn_config": {
+      "kda_layers": [1, 2, 3],
+      "full_attn_layers": [],
+      "num_heads": 4,
+      "head_dim": 16,
+      "short_conv_kernel_size": 4
+    }
+  })");
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  // The explicit (qwen3_5-style, asymmetric) geometry survives verbatim ...
+  CHECK(cfg.linear_num_key_heads == 2);
+  CHECK(cfg.linear_num_value_heads == 8);
+  CHECK(cfg.linear_key_head_dim == 32);
+  CHECK(cfg.linear_value_head_dim == 64);
+  CHECK(cfg.linear_conv_kernel_dim == 3);
+  // ... and the explicit layer_types are NOT resynthesized from kda_layers
+  // (which would flip index 1 to linear_attention).
+  REQUIRE(cfg.layer_types.size() == 3);
+  CHECK(cfg.layer_types[1] == "full_attention");
 }
 
 TEST_CASE("LoadHfConfig throws when required fields are missing") {
