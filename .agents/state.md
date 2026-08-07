@@ -42227,3 +42227,29 @@ Voxtral remain off-registry (fold #9/#10 of the audit).
 
   Next levers, unstarted: wider per-lane GEMV loads, and Tier-1 vocabulary for the
   `qkv_split -> rope -> reshape_and_cache` chain (672 dispatches -> 224).
+
+## 2026-08-07 — Downloadable static-core server release matrix spiked (PR #129)
+<!-- state: 2026-08-07T23:45 -->
+
+`ENG-RELEASE-BINARIES` moves `INVENTORIED` -> `SPIKE`; no implementation or
+artifact is claimed. The accepted contract is
+`.agents/specs/release-binary-matrix.md`: backend/host-specific
+`vllm-server` archives, stable only after matching-hardware archive runtime and
+correctness gates, and preview for derived/build-only tuples.
+
+The initial matrix covers CPU x86_64+arm64, macOS arm64 Metal and opt-in MLX,
+Vulkan preview, an experimental literal-static x86_64-musl CPU feasibility
+lane, and ten separate CUDA SM artifacts (`80,86,87,89,90a,100a,103a,110,120a,121a`)
+with explicit host ABIs. Triton AOT is ON only for the six complete vendored
+trees (`80,86,89,90a,100a,121a`) and OFF for `87,103a,110,120a`; fat+AOT is
+forbidden. ROCm stays blocked because the HIP skeleton has never compiled on
+AMD hardware.
+
+The package contract adds a future server install/component target, extracted
+archive smoke, dependency and RPATH audits, independent evidence booleans,
+SHA256, SPDX SBOM, provenance, version and license records, and a tag/dry-run
+least-privilege workflow. The normal promise is static project core with honest
+external ffmpeg/platform/driver boundaries, not a magically static GPU stack.
+First implementation after fresh review is W1: install and package the existing
+static-core server; manifest, validator, CI, platform, and CUDA bricks follow as
+separate claims.
