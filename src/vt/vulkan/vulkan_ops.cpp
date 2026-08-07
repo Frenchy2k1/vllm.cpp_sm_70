@@ -488,11 +488,16 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     // the element count by the workgroup size and put the whole K reduction back
     // on a single lane. The workgroup cooperates on one element.
     const uint32_t groups = static_cast<uint32_t>(m * n);
-    const uint32_t spec[3] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
-                              DtypeCode(out.dtype)};
+    // VT_VULKAN_GEMV_UNROLL=1 forces the un-unrolled body, for the same-binary A/B.
+    static const uint32_t kUnroll = [] {
+      const char* v = std::getenv("VT_VULKAN_GEMV_UNROLL");
+      return (v != nullptr && std::strcmp(v, "1") == 0) ? 1u : 4u;
+    }();
+    const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
+                              DtypeCode(out.dtype), kUnroll};
     MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
                    static_cast<uint32_t>(k), a_off, b_off, out_off};
-    Go("vt_matmul_vec", bind, p, groups, spec, 3);
+    Go("vt_matmul_vec", bind, p, groups, spec, 4);
     return;
   }
 

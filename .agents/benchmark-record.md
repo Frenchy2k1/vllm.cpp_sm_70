@@ -15810,3 +15810,54 @@ llama.cpp's 160.9 — from ~19x at the start of the session, 10.2x overall.**
 
 opt-125m STRICT 6/6 token-exact; `test_vulkan_backend` 17/17.
 
+### Re-profile after the ring change: GPU-bound again, and a "void" result reversed (2026-08-07)
+
+**THE REGIME INVERTED TWICE IN ONE SESSION.** `VK-A2` batching cut GPU time and
+left the run HOST-bound at 26% GPU-busy. The descriptor-ring fix then cut the
+submits, and the bottleneck moved straight back:
+
+| | GPU busy (decode phase) |
+|---|---:|
+| before `VK-A2` | ~25% of a 1,092 ms run |
+| after `VK-A2` | **26%** -- host-bound |
+| after ring 16 -> 128 | **84%** -- GPU-bound again |
+
+**GPU timestamp profile at the new default** (32-token decode, 11,808 dispatches,
+288.7 ms GPU):
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 3504 | 157.9 | **54.7%** | 0.0451 |
+| `vt_paged_attn` | 896 | 66.4 | **23.0%** | 0.0741 |
+| `vt_rms_norm` | 3616 | 32.4 | 11.2% | 0.0090 |
+| `vt_matmul_coopmat` | 112 | 13.5 | 4.7% | 0.1203 |
+| the four small ops | 3584 | 15.0 | 4.4% | 0.0035-0.0059 |
+
+Host side, spin suppressed: kernel 45.6%, libc 17.7%, nvidia 17.7%, **our own code
+10.9%**.
+
+**★ A "NOT ESTABLISHED" RESULT REVERSED BY THE REGIME CHANGE, NOT BY NEW CODE.**
+The GEMV four-way unroll was measured earlier at **5/8 pairs, arm medians 60.3 vs
+60.4 tok/s**, and reverted as unproven. That verdict was taken while the GPU was
+26% busy — where a 10% GEMV win moves e2e by only 1.4%, far inside this box's
+noise. **5/8 was the expected result whether or not the change helped.**
+
+Re-tested unchanged in the new regime, where the same win is worth ~4.6% e2e:
+
+    unroll 4 vs 1, 8 interleaved pairs, one binary
+    7 of 8 pairs, median 1.055x, arm medians 91.7 vs 87.5 tok/s
+    ratios 0.983 1.048 1.049 1.050 1.059 1.063 1.077 1.096
+
+**Same code, same statistic, different regime: 5/8 -> 7/8.** Restored and shipped.
+
+**The durable lesson, and it is a correction to how this campaign has been
+measuring: A NEGATIVE RESULT IS REGIME-DEPENDENT.** "Not established" means "not
+resolvable against the noise floor *as the system stands now*", not "does not
+help". Every lever discarded while some other component dominates deserves a
+re-test once that component is fixed — and the discard should say which regime it
+was measured in. Re-check the subgroup-reduction wash (4/8, measured at 26% GPU
+busy) on the same grounds.
+
+Decode is now **91.7 tok/s: 50% of the 182 tok/s roof, 1.75x off llama.cpp's
+160.9**, from 8.59 at the start of the session.
+
