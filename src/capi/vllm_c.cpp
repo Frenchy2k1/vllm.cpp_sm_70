@@ -41,7 +41,9 @@
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"  // get_reasoning_parser
 #include "vllm/entrypoints/openai/reasoning_parsers/detect.h"  // DetectReasoningParser
 #include "vllm/model_executor/models/model_registry.h"  // refuse-by-task (v11)
+#include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
+#include "vllm/multimodal/minimax_h3_video.h"          // vllm_video_* (v12)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/transformers_utils/hf_config.h"  // PeekHfArchitectures (v11)
@@ -1110,6 +1112,223 @@ VLLM_API void vllm_transcription_free(vllm_transcription* out) {
   out->token_ids = nullptr;
   out->n_token_ids = 0;
   out->has_text = 0;
+}
+
+// ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────
+// Thin C wrappers over the ONE library seam
+// (vllm::multimodal::MiniMaxH3VideoEngine) the server's /v1/videos routes and
+// the minimax-h3-gen example drive — see include/vllm.h for the contract.
+
+VLLM_API vllm_video_model_params vllm_video_model_params_default(void) {
+  vllm_video_model_params p;
+  std::memset(&p, 0, sizeof(p));
+  return p;
+}
+
+VLLM_API vllm_video_params vllm_video_params_default(void) {
+  vllm_video_params p;
+  std::memset(&p, 0, sizeof(p));
+  return p;
+}
+
+namespace {
+
+std::string OrEmpty(const char* s) { return s == nullptr ? std::string() : std::string(s); }
+
+}  // namespace
+
+// The opaque video handle: owns the loaded checkpoint set + staged weights.
+struct vllm_video_engine {
+  std::unique_ptr<vllm::multimodal::MiniMaxH3VideoEngine> engine;
+};
+
+VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* params,
+                                            vllm_video_engine** out) {
+  if (out == nullptr) {
+    SetError("vllm_video_engine_load: out handle pointer is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out = nullptr;
+  if (params == nullptr || params->dit_path == nullptr || params->dit_path[0] == '\0') {
+    SetError("vllm_video_engine_load: params or params->dit_path is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::multimodal::MiniMaxH3VideoModelParams mp;
+    mp.dit_path = OrEmpty(params->dit_path);
+    mp.encoder_path = OrEmpty(params->encoder_path);
+    mp.tokenizer_path = OrEmpty(params->tokenizer_path);
+    mp.video_vae_path = OrEmpty(params->video_vae_path);
+    mp.video_vae_config_path = OrEmpty(params->video_vae_config_path);
+    mp.audio_vae_path = OrEmpty(params->audio_vae_path);
+    mp.audio_vae_config_path = OrEmpty(params->audio_vae_config_path);
+    mp.prompt_embeds_path = OrEmpty(params->prompt_embeds_path);
+    mp.partition = OrEmpty(params->partition);
+    mp.device = params->device;
+    mp.dequant_bf16 = params->dequant_bf16;
+    mp.fp4_resident = params->fp4_resident;
+    auto handle = std::make_unique<vllm_video_engine>();
+    handle->engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(mp);
+    *out = handle.release();
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_video_engine_load: ") + e.what());
+    return VLLM_ERR_MODEL_LOAD;
+  } catch (...) {
+    SetError("vllm_video_engine_load: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_video_engine_free(vllm_video_engine* engine) { delete engine; }
+
+namespace {
+
+// Copy an argv into the malloc'd, NULL-terminated shape the ABI promises.
+// Returns false on OOM (with everything allocated so far freed).
+bool DupArgv(const std::vector<std::string>& argv, char*** out_argv, int32_t* out_argc) {
+  char** arr = static_cast<char**>(std::calloc(argv.size() + 1, sizeof(char*)));
+  if (arr == nullptr) return false;
+  for (size_t i = 0; i < argv.size(); ++i) {
+    arr[i] = DupString(argv[i]);
+    if (arr[i] == nullptr) {
+      for (size_t k = 0; k < i; ++k) std::free(arr[k]);
+      std::free(arr);
+      return false;
+    }
+  }
+  arr[argv.size()] = nullptr;  // execvp-ready
+  *out_argv = arr;
+  *out_argc = static_cast<int32_t>(argv.size());
+  return true;
+}
+
+}  // namespace
+
+VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
+                                         const vllm_video_params* params,
+                                         vllm_video_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_video_generate: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  std::memset(out, 0, sizeof(*out));
+  if (engine == nullptr || params == nullptr) {
+    SetError("vllm_video_generate: engine or params is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (params->output_dir == nullptr || params->output_dir[0] == '\0') {
+    SetError("vllm_video_generate: output_dir is required (frames + WAV land there)");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::multimodal::MiniMaxH3VideoGenParams gen;
+    gen.prompt = OrEmpty(params->prompt);
+    gen.width = params->width;
+    gen.height = params->height;
+    gen.num_frames = params->num_frames;
+    gen.steps = params->steps;
+    gen.seed = params->seed;
+    gen.has_seed = params->has_seed != 0;
+    gen.first_frame_path = OrEmpty(params->first_frame);
+    gen.last_frame_path = OrEmpty(params->last_frame);
+    // A zeroed struct must preserve behaviour: <= 0 resolves to the exact-pin
+    // default (1.0), the value every pre-v12 consumer used.
+    gen.noise_aug = params->noise_aug > 0.0f ? static_cast<double>(params->noise_aug) : 1.0;
+    if (params->ref_image != nullptr && params->ref_image[0] != '\0') {
+      gen.ref_image_paths.push_back(params->ref_image);
+    }
+    gen.ref_video_dir = OrEmpty(params->ref_video);
+    gen.ref_audio_path = OrEmpty(params->ref_audio);
+    gen.output_dir = params->output_dir;
+
+    const vllm::multimodal::MiniMaxH3VideoResult result = engine->engine->Generate(gen);
+
+    vllm_video_result r;
+    std::memset(&r, 0, sizeof(r));
+    r.frame_dir = DupString(result.frame_dir);
+    r.audio_path = DupString(result.audio_path);
+    const bool argv_ok = DupArgv(result.mux_argv, &r.mux_argv, &r.mux_argc);
+    if (r.frame_dir == nullptr || r.audio_path == nullptr || !argv_ok) {
+      vllm_video_result_free(&r);
+      SetError("vllm_video_generate: out-of-memory copying the result");
+      return VLLM_ERR_RUNTIME;
+    }
+    r.frame_count = static_cast<int32_t>(result.frame_count);
+    r.width = static_cast<int32_t>(result.width);
+    r.height = static_cast<int32_t>(result.height);
+    r.fps = static_cast<int32_t>(result.fps);
+    r.sample_rate = static_cast<int32_t>(result.sample_rate);
+    *out = r;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_video_generate: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_video_generate: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_video_result_free(vllm_video_result* out) {
+  if (out == nullptr) return;
+  std::free(out->frame_dir);
+  std::free(out->audio_path);
+  if (out->mux_argv != nullptr) {
+    for (int32_t i = 0; i < out->mux_argc; ++i) std::free(out->mux_argv[i]);
+    std::free(out->mux_argv);
+  }
+  std::memset(out, 0, sizeof(*out));
+}
+
+VLLM_API vllm_video_mux_params vllm_video_mux_params_default(void) {
+  vllm_video_mux_params p;
+  std::memset(&p, 0, sizeof(p));
+  return p;
+}
+
+VLLM_API vllm_status vllm_video_mux_argv(const vllm_video_mux_params* params,
+                                         char*** out_argv, int32_t* out_argc) {
+  if (out_argv == nullptr || out_argc == nullptr) {
+    SetError("vllm_video_mux_argv: out_argv/out_argc is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out_argv = nullptr;
+  *out_argc = 0;
+  if (params == nullptr || params->frames == nullptr || params->frames[0] == '\0' ||
+      params->output_path == nullptr || params->output_path[0] == '\0') {
+    SetError("vllm_video_mux_argv: frames (a printf-style pattern) and output_path are required");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::MiniMaxH3MuxRequest request;  // the library's encoding contract
+    request.frame_pattern = params->frames;
+    request.audio_path = OrEmpty(params->audio_path);
+    request.output_path = params->output_path;
+    if (params->fps > 0) request.fps = params->fps;
+    if (params->crf > 0) request.crf = params->crf;
+    const std::vector<std::string> argv = vllm::MiniMaxH3BuildMp4MuxArgs(request);
+    if (!DupArgv(argv, out_argv, out_argc)) {
+      SetError("vllm_video_mux_argv: out-of-memory copying the argv");
+      return VLLM_ERR_RUNTIME;
+    }
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_video_mux_argv: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_video_mux_argv: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_video_mux_argv_free(char** argv, int32_t argc) {
+  if (argv == nullptr) return;
+  for (int32_t i = 0; i < argc; ++i) std::free(argv[i]);
+  std::free(argv);
 }
 
 VLLM_API void vllm_string_free(char* s) { std::free(s); }

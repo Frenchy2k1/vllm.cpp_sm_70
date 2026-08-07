@@ -50,6 +50,12 @@ vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
+# ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
+# pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
+# branch base (frames + WAV byte-identical, mux argv pinned).
+vllm_cpp_add_test(test_minimax_h3_video_fold vllm/models/test_minimax_h3_video_fold.cpp)
+target_compile_definitions(test_minimax_h3_video_fold PRIVATE
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
@@ -666,7 +672,8 @@ target_include_directories(test_bench PRIVATE ${CMAKE_SOURCE_DIR}/examples/bench
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
-  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

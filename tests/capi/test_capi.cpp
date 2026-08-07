@@ -1224,10 +1224,11 @@ TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(vllm_abi_version() == VLLM_ABI_VERSION);
   // The engine-config growth (max_num_batched_tokens / scheduling_policy /
   // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10; the
-  // transcription slice (vllm_transcribe) is ABI v11. The >= pin is the one
-  // check that can catch a WRONG bump: the == VLLM_ABI_VERSION assertions here
-  // and in test_dlopen compare against the same macro and move with it.
-  CHECK(vllm_abi_version() >= 11);
+  // transcription slice (vllm_transcribe) is ABI v11; the video-generation
+  // slice (vllm_video_*) is ABI v12. The >= pin is the one check that can
+  // catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
+  // test_dlopen compare against the same macro and move with it.
+  CHECK(vllm_abi_version() >= 12);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────
@@ -1369,3 +1370,261 @@ TEST_CASE("capi v11: vllm_transcribe argument contract") {
   vllm_transcription_free(nullptr);
   vllm_engine_free(eng);
 }
+
+// ─── ABI v12: video+audio generation (ARCH-ONE-SURFACE ROW 2) ────────────────
+// The video slice gated THROUGH the public ABI on the fold fixture: the same
+// tiny checkpoint set + goldens the PRE-fold minimax-h3-gen binary rendered at
+// the branch base (tests/vllm/models/fixtures/minimax_h3_video_fold). What the
+// library-seam gate (test_minimax_h3_video_fold) proves for the C++ entry
+// point, this proves for the C marshalling on top of it.
+
+#include "../vllm/models/minimax_h3_video_fold_fixture.h"
+
+namespace {
+
+std::string ReadAllBytes(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  REQUIRE_MESSAGE(in.good(), "cannot open ", path);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// A pid-unique fixture + output workspace, torn down with the test.
+struct VideoFoldWorkspace {
+  std::string root, fixture;
+  VideoFoldWorkspace() {
+    static int counter = 0;
+    root = "/tmp/vllm_capi_video_" + std::to_string(::getpid()) + "_" +
+           std::to_string(counter++);
+    std::filesystem::create_directories(root);
+    fixture = root + "/fixture";
+    minimax_h3_fold::WriteFoldFixture(fixture);
+  }
+  ~VideoFoldWorkspace() {
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+  }
+};
+
+// Owned strings so the borrowed const char* fields stay alive per call.
+struct VideoFixtureParams {
+  std::string dit, vvae, vcfg, avae, acfg, embeds;
+  vllm_video_model_params mp;
+  explicit VideoFixtureParams(const std::string& dir)
+      : dit(dir + "/dit.gguf"),
+        vvae(dir + "/video_vae.safetensors"),
+        vcfg(dir + "/video_vae_config.json"),
+        avae(dir + "/audio_vae.safetensors"),
+        acfg(dir + "/audio_vae_config.json"),
+        embeds(dir + "/prompt_embeds.f32") {
+    mp = vllm_video_model_params_default();
+    mp.dit_path = dit.c_str();
+    mp.video_vae_path = vvae.c_str();
+    mp.video_vae_config_path = vcfg.c_str();
+    mp.audio_vae_path = avae.c_str();
+    mp.audio_vae_config_path = acfg.c_str();
+    mp.prompt_embeds_path = embeds.c_str();
+    mp.partition = "fl2va";
+  }
+};
+
+}  // namespace
+
+TEST_CASE("capi v12: the zero-value/default contract") {
+  // Zero values must preserve behaviour: the _default() constructors return
+  // fully zeroed structs (cpu, keep-quant, no paths, unseeded, and — via the
+  // documented <=0 mapping — noise_aug 1.0). The golden e2e case below runs
+  // on exactly these defaults (t2va), which pins every zero-value resolution
+  // EXCEPT noise_aug: that mapping only fires on a keyframe render, which the
+  // tiny fixture cannot express (the fl2va VAE-encoder half is the real
+  // 128-channel geometry). It is pinned at the seam level instead
+  // (MiniMaxH3VideoGenParams.noise_aug defaults to 1.0; the capi maps <=0
+  // onto it) — an honest, disclosed edge of this contract test.
+  const vllm_video_model_params mp = vllm_video_model_params_default();
+  CHECK(mp.dit_path == nullptr);
+  CHECK(mp.encoder_path == nullptr);
+  CHECK(mp.tokenizer_path == nullptr);
+  CHECK(mp.video_vae_path == nullptr);
+  CHECK(mp.video_vae_config_path == nullptr);
+  CHECK(mp.audio_vae_path == nullptr);
+  CHECK(mp.audio_vae_config_path == nullptr);
+  CHECK(mp.prompt_embeds_path == nullptr);
+  CHECK(mp.partition == nullptr);
+  CHECK(mp.device == 0);
+  CHECK(mp.dequant_bf16 == 0);
+  CHECK(mp.fp4_resident == 0);
+
+  const vllm_video_params vp = vllm_video_params_default();
+  CHECK(vp.prompt == nullptr);
+  CHECK(vp.width == 0);
+  CHECK(vp.height == 0);
+  CHECK(vp.num_frames == 0);
+  CHECK(vp.steps == 0);
+  CHECK(vp.seed == 0);
+  CHECK(vp.has_seed == 0);
+  CHECK(vp.first_frame == nullptr);
+  CHECK(vp.last_frame == nullptr);
+  CHECK(vp.ref_image == nullptr);
+  CHECK(vp.ref_video == nullptr);
+  CHECK(vp.ref_audio == nullptr);
+  CHECK(vp.noise_aug == 0.0f);  // <= 0 resolves engine-side to the 1.0 pin
+  CHECK(vp.output_dir == nullptr);
+
+  const vllm_video_mux_params mx = vllm_video_mux_params_default();
+  CHECK(mx.frames == nullptr);
+  CHECK(mx.audio_path == nullptr);
+  CHECK(mx.output_path == nullptr);
+  CHECK(mx.fps == 0);  // <= 0 resolves to the H3 default 24
+  CHECK(mx.crf == 0);  // <= 0 resolves to the library default 18
+}
+
+TEST_CASE("capi v12: vllm_video_generate reproduces the pre-fold goldens") {
+  VideoFoldWorkspace ws;
+  VideoFixtureParams fp(ws.fixture);
+  vllm_video_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK,
+                  vllm_last_error());
+  REQUIRE(eng != nullptr);
+
+  const std::string out_dir = ws.root + "/out";
+  vllm_video_params vp = vllm_video_params_default();
+  vp.num_frames = 5;
+  vp.height = 32;
+  vp.width = 32;
+  vp.steps = 3;
+  vp.output_dir = out_dir.c_str();
+
+  vllm_video_result out;
+  REQUIRE_MESSAGE(vllm_video_generate(eng, &vp, &out) == VLLM_OK,
+                  vllm_last_error());
+  CHECK(std::string(out.frame_dir) == out_dir);
+  CHECK(std::string(out.audio_path) == out_dir + "/audio.wav");
+  CHECK(out.frame_count == 8);
+  CHECK(out.width == 32);
+  CHECK(out.height == 32);
+  CHECK(out.fps == 24);
+  CHECK(out.sample_rate == 32000);
+
+  const std::string golden_dir = MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR;
+  for (int f = 0; f < 8; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06d.ppm", f);
+    INFO("frame ", f);
+    CHECK(ReadAllBytes(out_dir + name) == ReadAllBytes(golden_dir + name));
+  }
+  CHECK(ReadAllBytes(out_dir + "/audio.wav") ==
+        ReadAllBytes(golden_dir + "/audio.wav"));
+
+  // The mux argv is execvp-ready (NULL-terminated) and byte-matches the
+  // pre-fold `minimax-h3-mux --print-only` capture.
+  REQUIRE(out.mux_argv != nullptr);
+  REQUIRE(out.mux_argc > 0);
+  CHECK(out.mux_argv[out.mux_argc] == nullptr);
+  std::string joined;
+  for (int32_t i = 0; i < out.mux_argc; ++i) {
+    joined += (i == 0 ? "" : " ") + std::string(out.mux_argv[i]);
+  }
+  std::string golden_argv = ReadAllBytes(golden_dir + "/golden_mux_argv.txt");
+  while (!golden_argv.empty() &&
+         (golden_argv.back() == '\n' || golden_argv.back() == '\r')) {
+    golden_argv.pop_back();
+  }
+  size_t pos = 0;
+  while ((pos = golden_argv.find("W/", pos)) != std::string::npos) {
+    golden_argv.replace(pos, 1, out_dir);
+    pos += out_dir.size() + 1;
+  }
+  CHECK(joined == golden_argv);
+
+  vllm_video_result_free(&out);
+  CHECK(out.frame_dir == nullptr);
+  CHECK(out.mux_argv == nullptr);
+  vllm_video_result_free(&out);  // double-free is a safe no-op
+  vllm_video_result_free(nullptr);
+  vllm_video_engine_free(eng);
+}
+
+TEST_CASE("capi v12: text and video engines refuse each other's checkpoints") {
+  // Direction 1: vllm_video_engine_load on a TEXT/transcription checkpoint
+  // directory fails LOUDLY, naming vllm_engine_load as the right entry point.
+  VideoFoldWorkspace ws;
+  const std::string text_dir = ParakeetFixture("ctc");
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = text_dir.c_str();
+  vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
+  CHECK(vllm_video_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("vllm_engine_load") !=
+        std::string::npos);
+
+  // Direction 2: vllm_engine_load on the H3 checkpoint directory keeps
+  // failing EXACTLY as it did at v11 (captured at the branch base): status 2
+  // with the missing-config.json cause — the fold changed nothing here.
+  vllm_model_params tmp = vllm_model_params_default();
+  tmp.model_path = ws.fixture.c_str();
+  vllm_engine* text_eng = nullptr;
+  CHECK(vllm_engine_load(&tmp, &text_eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(text_eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("config.json") != std::string::npos);
+}
+
+TEST_CASE("capi v12: video argument contract") {
+  VideoFoldWorkspace ws;
+
+  // Null/missing load arguments.
+  vllm_video_engine* eng = nullptr;
+  CHECK(vllm_video_engine_load(nullptr, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  vllm_video_model_params empty = vllm_video_model_params_default();
+  CHECK(vllm_video_engine_load(&empty, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_video_engine_load(&empty, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  // A missing VAE is a load error with the cause named.
+  VideoFixtureParams no_vae(ws.fixture);
+  no_vae.mp.video_vae_path = nullptr;
+  CHECK(vllm_video_engine_load(&no_vae.mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(std::string(vllm_last_error()).find("video_vae") != std::string::npos);
+
+  // Generate-side contract on a good engine.
+  VideoFixtureParams fp(ws.fixture);
+  REQUIRE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK);
+  vllm_video_result out;
+  vllm_video_params vp = vllm_video_params_default();
+  CHECK(vllm_video_generate(nullptr, &vp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_video_generate(eng, nullptr, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_video_generate(eng, &vp, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  // output_dir is required.
+  CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("output_dir") != std::string::npos);
+  // An illegal reference combination surfaces as a runtime refusal.
+  const std::string out_dir = ws.root + "/out";
+  vp.output_dir = out_dir.c_str();
+  vp.first_frame = "/nonexistent.ppm";
+  vp.ref_video = ws.fixture.c_str();
+  CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("exclusive") != std::string::npos);
+  vllm_video_engine_free(eng);
+  vllm_video_engine_free(nullptr);  // no-op
+
+  // The standalone mux composer: contract + golden byte-match.
+  char** argv = nullptr;
+  int32_t argc = 0;
+  CHECK(vllm_video_mux_argv(nullptr, &argv, &argc) == VLLM_ERR_INVALID_ARGUMENT);
+  vllm_video_mux_params mx = vllm_video_mux_params_default();
+  CHECK(vllm_video_mux_argv(&mx, &argv, &argc) == VLLM_ERR_INVALID_ARGUMENT);
+  mx.frames = "frames_%06d.ppm";
+  mx.output_path = "silent.mp4";
+  REQUIRE(vllm_video_mux_argv(&mx, &argv, &argc) == VLLM_OK);
+  REQUIRE(argv != nullptr);
+  REQUIRE(argc > 0);
+  CHECK(argv[argc] == nullptr);  // execvp-ready
+  std::string joined;
+  for (int32_t i = 0; i < argc; ++i) joined += (i == 0 ? "" : " ") + std::string(argv[i]);
+  std::string golden = ReadAllBytes(std::string(MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR) +
+                                    "/golden_mux_argv_silent.txt");
+  while (!golden.empty() && (golden.back() == '\n' || golden.back() == '\r')) {
+    golden.pop_back();
+  }
+  CHECK(joined == golden);
+  vllm_video_mux_argv_free(argv, argc);
+  vllm_video_mux_argv_free(nullptr, 3);  // no-op
+}
+

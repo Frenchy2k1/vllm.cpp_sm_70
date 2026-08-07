@@ -94,7 +94,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 <!-- supported-arch-table:begin -->
 | Architecture | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
-| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (NVFP4, GDN hybrid) | strict 235/235 text, image+video 32/32 vs vLLM 0.25.0 | gate model: at or above vLLM |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (NVFP4, GDN hybrid) | strict 235/235 text, image+video 32/32 vs vLLM 0.25.0 | gate model: at or above vLLM. CUDA/CPU only; the off-CUDA host-pointer bug (#125) is fixed but unrun |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
 | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |
@@ -162,7 +162,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = the community ckpt's own quant fidelity, NO loader bug (§8.12); DiT loads GGUF/NVFP4/bf16-13-shard, encoder loads GGUF or bf16-14-shard | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = that ckpt's own quant fidelity (§8.12); GGUF/NVFP4/bf16-shard loaders; **embedder-reachable since ABI v12** (`vllm_video_*`, `/v1/videos` = same seam) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them
@@ -232,7 +232,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
 
 #### C-ABI capability coverage <!-- abi-capability-table:begin -->
-- Which capabilities an embedder drives through the flat C ABI (`include/vllm.h`, the only installed header), gated by `scripts/check-surface-coverage.py`: a `reachable` row names an entry point that exists; an `embedder-unreachable` row is tracked in `scripts/abi-capability-allowlist.txt` against its fold row (`ARCH-ONE-SURFACE`). The ABI is text-generation-complete; the four `embedder-unreachable` rows are the open capability gaps.
+- Which capabilities an embedder drives through the flat C ABI (`include/vllm.h`, the only installed header), gated by `scripts/check-surface-coverage.py`: a `reachable` row names an entry point that exists; an `embedder-unreachable` row is tracked in `scripts/abi-capability-allowlist.txt` against its fold row (`ARCH-ONE-SURFACE`). The ABI is text-generation-complete; the two `embedder-unreachable` rows are the open capability gaps.
 
 | Capability | C-ABI surface | Embedder-reachable |
 |---|---|---|
@@ -245,7 +245,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Custom logits processor | `vllm_logits_processor` | reachable |
 | Embeddings / pooling | none | embedder-unreachable |
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
-| Video+audio generation (MiniMax-H3) | none | embedder-unreachable |
+| Video+audio generation (MiniMax-H3) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv` | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out

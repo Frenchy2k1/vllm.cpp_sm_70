@@ -103,14 +103,16 @@ EXPECTED_PUBLIC = frozenset({"vllm.h"})
 # as folds land (developer-directed 2026-08-07: no permanent exemptions, the allowlist
 # shrinks). A new internal-reacher cannot be added without consciously RAISING this
 # ceiling — a reviewable red flag, which is the point. Lower it as each example is folded
-# onto the public ABI. 11 since the ROW 1 Parakeet fold (2026-08-07:
-# parakeet_transcribe became a clean vllm.h client; before it, 12 = server + the 4
-# spec-named drivers + minimax_h3_mux + parakeet_transcribe + the 5 dev/diagnostic
-# tools; examples/cli is the clean baseline).
+# onto the public ABI. 9 since the ROW 2 MiniMax-H3 video fold (2026-08-08:
+# minimax_h3_gen AND minimax_h3_mux became clean vllm.h clients of the v12
+# vllm_video_* slice); 11 after the ROW 1 Parakeet fold (2026-08-07:
+# parakeet_transcribe); before it, 12 = server + the 4 spec-named drivers +
+# minimax_h3_mux + parakeet_transcribe + the 5 dev/diagnostic tools;
+# examples/cli is the clean baseline.
 # COUPLED: the ratchet claims in .agents/specs/surface-coverage-2026-08-07.md and the
 # state log, and the equality pin in tests/scripts/test_check_surface_coverage.py, must
 # move in the SAME change as this constant.
-MAX_INTERNAL_REACHING = 11
+MAX_INTERNAL_REACHING = 9
 
 # An include INTO the internal C++ tree: `#include "vllm/..."` (the engine/model/layer
 # headers under include/vllm/, NOT the flat public "vllm.h"), `#include "vt/..."` (the
