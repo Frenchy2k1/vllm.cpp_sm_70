@@ -14593,6 +14593,58 @@ Full 48.9B model on GB10 (sm_121a clean CUDA build, cutlass-4.5.0, 14 GDN AOT sy
 FLIP LEDGER (deterministic golden arbitrates): the two levers interact — island bf16-input rounding fixes p2 but repeats p3; the bf16 residual stream (vLLM `fused_add_rms_norm` order) re-stabilizes p3. At 120/128 the SOLE divergence is p7 position 8 (golden deterministically `18705`, ours `58084`), a single near-tie that cascades to 8/16 on p7. Further precision-"matching" (output bf16, f32 accum) is a coin-flip that regresses — it is not vLLM's actual GDN-Triton/FA2 kernel arithmetic. Host-precision-matching PLATEAUS at 120/128.
 
 VERDICT: NO arm STRICT (K=3-deterministic golden → STRICT required, not distributional); default STAYS OFF (parity-enablers). NAMED residual (= also the speed lever): the device islands — a NEW per-channel-decay GDN kernel (`g[T,H,D]`; `vt::GdnDecode`/`GdnPrefill` carry only per-head `g[T,Hv]`, ops.h:1797/1846 — NOT a drop-in) + paged `mla::ForwardMlaAttentionBlock` (FA2). Speed HW-forced-indirect: 1.30 tok/s (O(n²) recompute + host islands, invariant to the numeric knobs); vLLM cannot serve Kimi-Linear-48B at bf16 on one GB10 (oracle capture needed util 0.82 for a single-seq eager run) so a direct `vllm bench throughput` arm is infeasible. Row STAYS ACTIVE.
+<<<<<<< HEAD
+>>>>>>> origin/main
+
+## VK-E, llama.cpp Vulkan comparison — DENOMINATOR MEASURED, our arm BLOCKED (2026-08-07, GB10)
+
+**llama.cpp Vulkan baseline, at FULL STRENGTH.** Built from our pinned source
+`237ad9b96`, `-DGGML_VULKAN=ON`, GB10, under `$HOME/gpu.lock`. Runtime banner:
+`NVIDIA GB10 | uma: 1 | fp16: 1 | bf16: 1 | warp size: 32 | int dot: 1 |
+matrix cores: NV_coopmat2`.
+
+| model | test | t/s |
+|---|---|---:|
+| qwen3 0.6B F16 (1.11 GiB) | pp128 | **11,730.14 ± 238.49** |
+| qwen3 0.6B F16 (1.11 GiB) | tg32 | **161.37 ± 1.20** |
+
+**★ THE BUILD-TOOLCHAIN TRAP, CONFIRMED AND AVOIDED.** The fan-out spike predicted
+Ubuntu's `glslc` (shaderc 2023.8) would be too old for llama.cpp's coopmat2 probe.
+It is, and the effect is larger than "coopmat2": configured against the packaged
+glslc, llama.cpp reports
+
+    GL_KHR_cooperative_matrix        supported
+    GL_NV_cooperative_matrix2        NOT supported
+    GL_NV_cooperative_matrix_decode_vector NOT supported
+    GL_EXT_integer_dot_product       NOT supported
+    GL_EXT_bfloat16                  NOT supported
+
+— i.e. FOUR of its five Vulkan fast paths silently disabled, including its best
+NVIDIA one. Benchmarking against that would have handicapped the reference and
+flattered us, which is the exact inverse of the "denominator is the reference's
+PRODUCTION config" rule. Fixed by building shaderc from source on dgx
+(`v2026.4-dev`, `/tmp/shaderc/b/glslc/glslc`) and passing
+`-DVulkan_GLSLC_EXECUTABLE=`; all five then report `supported` and the runtime
+banner confirms `matrix cores: NV_coopmat2`. **Any future llama.cpp-Vulkan number
+from this box MUST check that banner** — the packaged glslc produces a build that
+looks fine and quietly runs the slow paths.
+
+**OUR ARM IS BLOCKED, and not for the reason expected.** The known limit was op
+coverage (16 of 87 native, the rest on the portable CPU tier). The ACTUAL blocker
+hit first: **no model on dgx loads in both engines.** Our GGUF path rejects the
+plain `qwen3` architecture (`qwen3_5_gguf_weights.cpp:829`, "unexpected
+architecture 'qwen3'" — the Qwen3.5 family loader), and llama.cpp cannot load our
+`la-f16.gguf` (Laguna, a vllm.cpp-side architecture). The two engines support
+DISJOINT GGUF sets among the models present.
+
+So VK-E's e2e comparison is not merely "we would lose"; it cannot be RUN yet. It
+needs either a GGUF architecture both load (a plain Llama/Qwen3 GGUF our loader
+accepts, or safetensors on our side against the same weights), or the quant tier
+(`VK-D`) so a shared quantised model is meaningful. Recorded as the binding
+blocker rather than papered over with a mismatched pair of numbers.
+
+**No vllm.cpp Vulkan number is claimed here.** The denominator above stands alone.
+=======
 
 ## 2026-08-07 — Kimi-Linear-48B: per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` — 106→122/128 AND 3.1× speed (the §14 residual, MEASURED on GB10)
 
@@ -14609,3 +14661,4 @@ The §14 named residual ("a NEW per-channel-decay GDN kernel `g[T,H,D]`; `vt::Gd
 RESULT (the §14 thesis CONFIRMED): the device recurrence — vLLM's ACTUAL f32-on-bf16 arithmetic — moves **106→122/128** (prompts 0-6 all 16/16; only p7 diverges at pos-6, got `387` vs golden `11`, a comma near-tie) AND is **3.1× FASTER (1.35→4.24 tok/s)**. It beats BOTH the control (106) AND §14's host-precision best (120, which needed both bf16 knobs), and FIXES the p2 divergence the f64 host path had — because it runs the right arithmetic, not a coin-flip. The §14 bf16 knobs are now SUPERSEDED + COUNTERPRODUCTIVE: device-KDA + bf16 REGRESSES 122→90 (reintroducing p3's `163586×` repeat loop) — they were tuned to compensate for the f64 host island's over-precision. The speed win = the device recurrence kills the per-step host Download/f64-recompute/upload round-trip and runs the O(T²) recurrence in parallel on the GPU.
 
 VERDICT: device-KDA (122/128, 4.24 tok/s) is the NEW BEST on BOTH axes but STILL a DIVERGENCE (STRICT required, K=3-deterministic golden) → `VT_KIMI_DEVICE_KDA` STAYS OFF (parity-enablers). The residual is now a SINGLE near-tie (p7 pos-6). NAMED next brick to STRICT (+ more speed): the KDA chunked-prefill kernel family (vLLM processes the PROMPT with `chunk_kda`, we still run the recurrent form — regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or a native `chunk_kda` port) + paged `mla::ForwardMlaAttentionBlock` for the 7 NoPE-MLA layers + paged-incremental decode (persistent KDA state + MLA-KV, kills the remaining O(n²)). Row STAYS ACTIVE.
+>>>>>>> origin/main

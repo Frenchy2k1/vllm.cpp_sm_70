@@ -345,6 +345,17 @@ inner 4096, state 128; context 262144.
   the DOWNLOAD URL rather than asserting a version string.
   The older note here — that Ubuntu's shaderc 2023.8 `glslc` is too old for the
   coopmat2 feature probe — still holds and is why the system package is not used.
+- **dgx Vulkan/llama.cpp comparison toolchain (2026-08-07, `VK-E`).** apt:
+  `glslc`, `glslang-tools`, `libvulkan-dev`, `spirv-headers`. **Ubuntu's `glslc`
+  is shaderc 2023.8 and is NOT USABLE for a fair llama.cpp-Vulkan build** — it
+  disables FOUR of five fast paths (`GL_NV_cooperative_matrix2`,
+  `..._decode_vector`, `GL_EXT_integer_dot_product`, `GL_EXT_bfloat16`), leaving
+  only `GL_KHR_cooperative_matrix`, and the build still configures and runs. A
+  source-built shaderc `v2026.4-dev` lives at `/tmp/shaderc/b/glslc/glslc`; pass
+  `-DVulkan_GLSLC_EXECUTABLE=` to it. **Verify the runtime banner says
+  `matrix cores: NV_coopmat2` before trusting any number.** llama.cpp at pin
+  `237ad9b96` is unpacked at `~/lcpp-vk` with `build-vk/bin/llama-bench` built.
+
 - **No Intel GPU exists on any box here**, so `BACKEND-XPU` end-to-end work is
   HW-BLOCKED; only policy-port, compile coverage and oneAPI CPU-device unit
   numerics are available.
