@@ -26,6 +26,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
+| `/v1/videos` OpenAI shape (`row/SERVE-VIDEOS-OAI`) | **PR open**: Sora `model`/`size`/`seconds` + `GET /{id}/content`, CPU-gated | Follow-up row: reference conditioning |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -47,29 +48,26 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
    `conformer_encoder.py` as the audio encoder of `nano_nemotron_vl.py`, which we
    already carry `MODEL-MM-nano-nemotron-vl-*` rows for, so it is owed mirror work.
    The transducer decode half (RNN-T/TDT/CTC) is NOT in vLLM: separate scope call.
-2. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
-   speed-pending; bind the default-ON async-serving path against the same oracle
-   before attributing the remaining TPOT gap.
+2. **Qwen3.5-4B serving follow-up:** bind the default-ON async-serving path
+   against the same oracle before attributing the remaining TPOT gap.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Claim triage + live-state audit DONE
-   (10 unevidenced rows → `READY`, 11 claims retired, 9 amended); `STATUS.md`
-   ratcheted; `AGENTS.md` tiered. REMAINING: anchor backfill
-   (6 model rows need a DECISION); record-era rollover BLOCKED on `DONE` rows
-   bound to `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
-   ★ The gate SELF-BLINDS on those same 10 (audit §➁a); its fix owes an 8-row
-   adjudication. workflow.md states the `ACTIVE` precondition.
+5. **Protocol substrate — partly done.** Triage/audit, `STATUS.md` ratchet and
+   the `AGENTS.md` tiering are DONE. REMAINING: anchor backfill (6 model rows
+   need a DECISION); record-era rollover BLOCKED on `DONE` rows bound to
+   `parity-ledger.md` LINE anchors (re-anchor by ROW ID). ★ The gate SELF-BLINDS
+   on the 10 audited rows (audit §➁a); its fix owes an 8-row adjudication.
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` is the DEFAULT. Queue: 10 rows — 6 are audit-vacated, with LANDED gate anchors; READ before picking. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+`--require-role` is the DEFAULT. Queue: 10 rows (6 audit-vacated, LANDED gate anchors; READ before picking). Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated

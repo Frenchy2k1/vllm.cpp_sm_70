@@ -1745,4 +1745,315 @@ TEST_CASE("api_server: /v1/videos rejects a malformed body with 400") {
   CHECK(h.server.handle_videos_sync("{not json").status == 400);
   // A body that parses but carries no prompt is equally a client error.
   CHECK(h.server.handle_videos_sync(R"({"num_inference_steps":4})").status == 400);
+  // An OpenAI field we cannot read is a 400 too, never a silent default geometry.
+  CHECK(h.server.handle_videos_sync(R"({"prompt":"x","size":"720p"})").status == 400);
+  CHECK(h.server.handle_videos(R"({"prompt":"x","seconds":"soon"})").status == 400);
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI's Sora shape over the routes: the request aliases reach the runner, a
+// model mismatch is stated rather than swallowed, and GET /v1/videos/{id}/content
+// hands back the finished MP4 (the endpoint is unusable without it).
+// ---------------------------------------------------------------------------
+
+namespace {
+// A scratch file that removes itself, standing in for the runner's muxed .mp4.
+class ScratchFile {
+ public:
+  explicit ScratchFile(const std::string& contents) {
+    static std::atomic<long long> counter{0};
+    path_ = (std::filesystem::temp_directory_path() /
+             ("vllm_cpp_video_" +
+              std::to_string(std::chrono::steady_clock::now()
+                                 .time_since_epoch()
+                                 .count()) +
+              "_" + std::to_string(counter.fetch_add(1)) + ".mp4"))
+                .string();
+    std::ofstream out(path_, std::ios::binary);
+    out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  }
+  ~ScratchFile() {
+    std::error_code ec;
+    std::filesystem::remove(path_, ec);
+  }
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+// A minimal MP4 `ftyp` box: BINARY, with embedded NULs, so a body that arrived
+// truncated or text-mangled cannot compare equal by accident.
+std::string FakeMp4Bytes() {
+  static constexpr unsigned char kBytes[] = {
+      0x00, 0x00, 0x00, 0x18, 'f',  't',  'y',  'p',  'm',  'p',  '4',
+      '2',  0x00, 0x00, 0x00, 0x00, 'm',  'p',  '4',  '2',  'i',  's',
+      'o',  'm',  0x00, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02};
+  return std::string(reinterpret_cast<const char*>(kBytes), sizeof(kBytes));
+}
+}  // namespace
+
+TEST_CASE("api_server: the OpenAI request aliases reach the runner unchanged") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  vllm::openai::VideoRequest seen;
+  h.server.set_video_runner(
+      [&](const vllm::openai::VideoRequest& req) -> std::string {
+        seen = req;
+        return "/tmp/out.mp4";
+      });
+
+  // The exact body an unmodified OpenAI client sends. Every value differs from
+  // the field default, so this proves the parser ran end to end.
+  ApiServer::DispatchResult r = h.server.handle_videos_sync(R"({
+    "model": "test-model", "prompt": "a cat on a skateboard",
+    "size": "1280x720", "seconds": "8"
+  })");
+  REQUIRE(r.status == 200);
+  CHECK(seen.prompt == "a cat on a skateboard");
+  CHECK(seen.width == 1280);
+  CHECK(seen.height == 720);
+  CHECK(seen.duration_seconds == doctest::Approx(8.0));
+  CHECK(seen.model == "test-model");
+  // The served model was named, so nothing is warned about.
+  nlohmann::json body = nlohmann::json::parse(r.body);
+  CHECK(body.at("model") == "test-model");
+  CHECK_FALSE(body.contains("warning"));
+}
+
+TEST_CASE("api_server: an unserved `model` warns on the job but still generates") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  bool ran = false;
+  h.server.set_video_runner(
+      [&](const vllm::openai::VideoRequest&) -> std::string {
+        ran = true;
+        return "/tmp/out.mp4";
+      });
+
+  // A Sora client cannot know the local video model's name, so refusing would
+  // defeat the compatibility; ignoring would hide a real mismatch.
+  ApiServer::DispatchResult r =
+      h.server.handle_videos_sync(R"({"model":"sora-2-pro","prompt":"x"})");
+  REQUIRE(r.status == 200);
+  CHECK(ran);
+  nlohmann::json body = nlohmann::json::parse(r.body);
+  CHECK(body.at("status") == "succeeded");
+  CHECK(body.at("model") == "sora-2-pro");
+  REQUIRE(body.contains("warning"));
+  const std::string warning = body.at("warning").get<std::string>();
+  CHECK(warning.find("sora-2-pro") != std::string::npos);
+  CHECK(warning.find("test-model") != std::string::npos);
+
+  // The note survives on the polled record, not just the create response.
+  ApiServer::DispatchResult status =
+      h.server.handle_video_status(body.at("id").get<std::string>());
+  REQUIRE(status.status == 200);
+  CHECK(nlohmann::json::parse(status.body).at("warning") == warning);
+}
+
+TEST_CASE("api_server: GET /v1/videos/{id}/content serves the finished MP4") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  // The scratch file outlives the server: ~ApiServer joins the async workers, so
+  // it must be destroyed after them, not before.
+  const std::string expected = FakeMp4Bytes();
+  const ScratchFile mp4(expected);
+  ServerHarness h(c, w, Fixture());
+
+  SUBCASE("unknown id is a 404") {
+    h.server.set_video_runner(
+        [path = mp4.path()](const vllm::openai::VideoRequest&) -> std::string { return path; });
+    ApiServer::DispatchResult r = h.server.handle_video_content("vid_nope");
+    CHECK(r.status == 404);
+    CHECK(nlohmann::json::parse(r.body).at("error").at("type") == "NotFoundError");
+  }
+
+  SUBCASE("an unfinished job is a 409 naming its status, never a truncated file") {
+    // The runner blocks until released, so the async job is genuinely mid-flight.
+    // Both captures are BY VALUE: the worker thread outlives this scope's locals.
+    auto release = std::make_shared<std::atomic<bool>>(false);
+    h.server.set_video_runner(
+        [release, path = mp4.path()](const vllm::openai::VideoRequest&) -> std::string {
+          while (!release->load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          return path;
+        });
+    ApiServer::DispatchResult started =
+        h.server.handle_videos(R"({"prompt":"a cat"})");
+    REQUIRE(started.status == 200);
+    const std::string id =
+        nlohmann::json::parse(started.body).at("id").get<std::string>();
+
+    ApiServer::DispatchResult r = h.server.handle_video_content(id);
+    CHECK(r.status == 409);
+    CHECK(r.content_type == "application/json");  // an error, not zero bytes of mp4
+    const std::string message = nlohmann::json::parse(r.body)
+                                    .at("error")
+                                    .at("message")
+                                    .get<std::string>();
+    CHECK(message.find(id) != std::string::npos);
+    // It says WHICH pending state, so the client knows to keep polling.
+    CHECK((message.find("queued") != std::string::npos ||
+           message.find("running") != std::string::npos));
+    CHECK(r.body.find("ftyp") == std::string::npos);  // no bytes of the file leaked
+
+    // Released, the SAME id now serves the bytes: 409 meant "not yet", not "no".
+    release->store(true);
+    std::string final_status;
+    for (int i = 0; i < 400; ++i) {
+      final_status = nlohmann::json::parse(h.server.handle_video_status(id).body)
+                         .at("status")
+                         .get<std::string>();
+      if (final_status == "succeeded" || final_status == "failed") break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(final_status == "succeeded");
+    ApiServer::DispatchResult after = h.server.handle_video_content(id);
+    REQUIRE(after.status == 200);
+    CHECK(after.body == FakeMp4Bytes());
+  }
+
+  SUBCASE("a failed job surfaces the failure, not an empty body") {
+    h.server.set_video_runner(
+        [](const vllm::openai::VideoRequest&) -> std::string {
+          throw std::runtime_error("ffmpeg exited 1");
+        });
+    ApiServer::DispatchResult sync_result =
+        h.server.handle_videos_sync(R"({"prompt":"a cat"})");
+    REQUIRE(sync_result.status == 500);
+    // The sync failure path still creates the job record, so its id is pollable.
+    ApiServer::DispatchResult listed = h.server.handle_video_status("vid_1");
+    REQUIRE(listed.status == 200);
+    CHECK(nlohmann::json::parse(listed.body).at("status") == "failed");
+
+    ApiServer::DispatchResult r = h.server.handle_video_content("vid_1");
+    CHECK(r.status == 500);
+    CHECK(nlohmann::json::parse(r.body)
+              .at("error")
+              .at("message")
+              .get<std::string>()
+              .find("ffmpeg exited 1") != std::string::npos);
+  }
+
+  SUBCASE("a succeeded job hands back the exact bytes as video/mp4") {
+    h.server.set_video_runner(
+        [path = mp4.path()](const vllm::openai::VideoRequest&) -> std::string { return path; });
+    ApiServer::DispatchResult done =
+        h.server.handle_videos_sync(R"({"prompt":"a cat"})");
+    REQUIRE(done.status == 200);
+    const std::string id = nlohmann::json::parse(done.body).at("id").get<std::string>();
+
+    ApiServer::DispatchResult r = h.server.handle_video_content(id);
+    REQUIRE(r.status == 200);
+    CHECK(r.content_type == "video/mp4");
+    CHECK(r.body.size() == expected.size());
+    CHECK(r.body == expected);  // byte-exact, embedded NUL included
+  }
+
+  SUBCASE("an output that vanished is a 500, not a 200 with zero bytes") {
+    std::string path;
+    {
+      const ScratchFile doomed(expected);
+      path = doomed.path();
+      h.server.set_video_runner(
+          [path](const vllm::openai::VideoRequest&) -> std::string { return path; });
+      ApiServer::DispatchResult done =
+          h.server.handle_videos_sync(R"({"prompt":"a cat"})");
+      REQUIRE(done.status == 200);
+    }  // the file is removed here, while the job record still points at it
+    ApiServer::DispatchResult r = h.server.handle_video_content("vid_1");
+    CHECK(r.status == 500);
+    CHECK(nlohmann::json::parse(r.body)
+              .at("error")
+              .at("message")
+              .get<std::string>()
+              .find("not readable") != std::string::npos);
+  }
+}
+
+TEST_CASE("api_server: the /v1/videos routes do not exist without a runner") {
+  // ADDITIVE + OPT-IN is load-bearing: a server built without video support must
+  // be byte-identical to before, which only a REAL socket can prove (the handler
+  // returning 500 says nothing about whether the route was registered).
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  auto with_server = [](ServerHarness& h, auto&& body) {
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&h]() { h.server.serve(); });
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(5, 0);
+    body(client);
+    h.server.stop();
+    server_thread.join();
+  };
+
+  SUBCASE("no runner: every video route 404s, and the core routes are unaffected") {
+    ServerHarness h(c, w, Fixture());
+    with_server(h, [](httplib::Client& client) {
+      auto async_post =
+          client.Post("/v1/videos", R"({"prompt":"a cat"})", "application/json");
+      REQUIRE(async_post);
+      CHECK(async_post->status == 404);  // 200 once a runner is attached
+      auto sync_post = client.Post("/v1/videos/sync", R"({"prompt":"a cat"})",
+                                   "application/json");
+      REQUIRE(sync_post);
+      CHECK(sync_post->status == 404);
+      auto status = client.Get("/v1/videos/vid_1");
+      REQUIRE(status);
+      CHECK(status->status == 404);
+      auto content = client.Get("/v1/videos/vid_1/content");
+      REQUIRE(content);
+      CHECK(content->status == 404);
+      // Not OUR 404: the route is absent, so no ErrorResponse envelope is emitted.
+      CHECK(content->body.find("NotFoundError") == std::string::npos);
+      CHECK(status->body.find("NotFoundError") == std::string::npos);
+
+      auto health = client.Get("/health");
+      REQUIRE(health);
+      CHECK(health->status == 200);
+    });
+  }
+
+  SUBCASE("with a runner: all four routes serve, content included") {
+    const std::string expected = FakeMp4Bytes();
+    const ScratchFile mp4(expected);
+    ServerHarness h(c, w, Fixture());
+    h.server.set_video_runner(
+        [path = mp4.path()](const vllm::openai::VideoRequest&) -> std::string { return path; });
+    with_server(h, [&](httplib::Client& client) {
+      auto created =
+          client.Post("/v1/videos/sync",
+                      R"({"model":"sora-2-pro","prompt":"a cat","size":"1280x720"})",
+                      "application/json");
+      REQUIRE(created);
+      REQUIRE(created->status == 200);
+      const std::string id =
+          nlohmann::json::parse(created->body).at("id").get<std::string>();
+
+      auto status = client.Get(("/v1/videos/" + id).c_str());
+      REQUIRE(status);
+      CHECK(status->status == 200);
+      CHECK(nlohmann::json::parse(status->body).at("status") == "succeeded");
+
+      auto content = client.Get(("/v1/videos/" + id + "/content").c_str());
+      REQUIRE(content);
+      REQUIRE(content->status == 200);
+      CHECK(content->get_header_value("Content-Type") == "video/mp4");
+      CHECK(content->body == expected);
+
+      // Now the 404 IS ours: the route exists and the handler rejected the id.
+      auto missing = client.Get("/v1/videos/vid_absent/content");
+      REQUIRE(missing);
+      CHECK(missing->status == 404);
+      CHECK(nlohmann::json::parse(missing->body).at("error").at("type") ==
+            "NotFoundError");
+    });
+  }
 }

@@ -4,7 +4,9 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -274,6 +276,18 @@ ApiServer::DispatchResult VideoJsonOk(std::string body) {
 
 }  // namespace
 
+std::string ApiServer::video_model_warning(
+    const ::vllm::openai::VideoRequest& request) const {
+  // OpenAI clients send the SORA model name ("sora-2-pro"); this server generates
+  // with whatever video model it was started with, whose name they cannot know.
+  // Refusing would defeat the compatibility, and ignoring would hide a real
+  // mismatch, so the request is honoured and the divergence is STATED on the job.
+  if (request.model.empty() || models_.is_base_model(request.model)) return {};
+  return "requested model '" + request.model +
+         "' is not a served model ('" + models_.model_name() +
+         "'); generated with the video model this server was started with";
+}
+
 ApiServer::DispatchResult ApiServer::handle_videos(
     const std::string& request_body) {
   // vLLM-Omni's ASYNC video endpoint: validate, enqueue, and return the job id
@@ -290,7 +304,8 @@ ApiServer::DispatchResult ApiServer::handle_videos(
     return MakeError(400, "BadRequestError", e.what());
   }
 
-  const std::string id = video_jobs_.Create();
+  const std::string id =
+      video_jobs_.Create(request.model, video_model_warning(request));
   std::thread worker([this, id, request]() {
     try {
       video_jobs_.MarkRunning(id);
@@ -335,7 +350,8 @@ ApiServer::DispatchResult ApiServer::handle_videos_sync(
     return MakeError(400, "BadRequestError", e.what());
   }
 
-  const std::string id = video_jobs_.Create();
+  const std::string id =
+      video_jobs_.Create(request.model, video_model_warning(request));
   try {
     video_jobs_.MarkRunning(id);
     video_jobs_.MarkSucceeded(id, video_runner_(request));
@@ -355,6 +371,49 @@ ApiServer::DispatchResult ApiServer::handle_video_status(
     return MakeError(404, "NotFoundError", "Unknown video job: " + job_id);
   }
   return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
+}
+
+ApiServer::DispatchResult ApiServer::handle_video_content(
+    const std::string& job_id) const {
+  // OpenAI's GET /v1/videos/{video_id}/content. Without it a caller can start and
+  // poll a job but never FETCH the result over HTTP, which makes the endpoint
+  // unusable to anyone without a filesystem view of the server.
+  ::vllm::openai::VideoJob job;
+  if (!video_jobs_.Get(job_id, &job)) {
+    return MakeError(404, "NotFoundError", "Unknown video job: " + job_id);
+  }
+  if (job.status == ::vllm::openai::VideoJobStatus::kFailed) {
+    return MakeError(500, "InternalServerError",
+                     "Video job " + job_id + " failed: " + job.error);
+  }
+  if (job.status != ::vllm::openai::VideoJobStatus::kSucceeded) {
+    // A pending job must NEVER answer with bytes: a partially muxed file would
+    // reach the client as a valid-looking, truncated MP4.
+    return MakeError(409, "ConflictError",
+                     std::string("Video job ") + job_id + " is not finished (status: " +
+                         ::vllm::openai::VideoJobStatusName(job.status) +
+                         "); poll GET /v1/videos/" + job_id + " until it succeeds");
+  }
+
+  std::ifstream file(job.output_path, std::ios::binary);
+  if (!file) {
+    return MakeError(500, "InternalServerError",
+                     "Video job " + job_id + " succeeded but its output is not "
+                     "readable: " + job.output_path);
+  }
+  std::string bytes((std::istreambuf_iterator<char>(file)),
+                    std::istreambuf_iterator<char>());
+  if (!file.eof() && file.fail()) {
+    return MakeError(500, "InternalServerError",
+                     "Video job " + job_id + " output could not be read in full: " +
+                         job.output_path);
+  }
+
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "video/mp4";
+  out.body = std::move(bytes);
+  return out;
 }
 
 ApiServer::DispatchResult ApiServer::handle_metrics() const {
@@ -769,6 +828,14 @@ void ApiServer::register_routes() {
                               httplib::Response& res) {
                   write(handle_videos_sync(req.body), res);
                 });
+    // Registered BEFORE the bare-id pattern so the intent is readable in one
+    // place; the two cannot collide in any case, since `[^/]+` stops at the '/'
+    // and httplib full-matches the path.
+    server.Get(R"(/v1/videos/([^/]+)/content)",
+               [this, write](const httplib::Request& req,
+                             httplib::Response& res) {
+                 write(handle_video_content(req.matches[1]), res);
+               });
     server.Get(R"(/v1/videos/([^/]+))",
                [this, write](const httplib::Request& req,
                              httplib::Response& res) {
