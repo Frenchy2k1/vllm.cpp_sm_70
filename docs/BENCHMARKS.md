@@ -4,6 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
+| **Binary release matrix (inventoried)** | `ENG-RELEASE-BINARIES`: backend-specific `vllm-server` archives plus fully-static feasibility | **PENDING:** spike in progress; no archive, runtime validation, or release-performance result exists yet | n/a |
 | **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |
 | **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
 | **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |

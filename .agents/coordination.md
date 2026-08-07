@@ -118,6 +118,22 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Server binary release-matrix spike (`ENG-RELEASE-BINARIES`, 2026-08-07,
+`CLAIM-ENG-RELEASE-BINARIES-SPIKE`).** Codex (GPT-5), isolated worktree
+`/home/mudler/_git/vllm.cpp-release-binaries`, branch
+`row/ENG-RELEASE-BINARIES`, base `origin/main` `9cb799cb`. Records/spec-only
+claim for issue #117 and the user-approved hybrid stable/preview downloadable
+server-bundle matrix, including the fully-static feasibility boundary. Owns
+only NEW `.agents/specs/release-binary-matrix.md`, the new
+`ENG-RELEASE-BINARIES` engine-matrix row, its single roadmap portfolio link,
+this claim, the required current-state checkpoint in `docs/STATUS.md` and
+`docs/BENCHMARKS.md`, the engine inventory count pin in
+`scripts/check-agent-record.py`, `.agents/NOW.md`, and the append-only
+`.agents/state.md`.
+No release workflow, CMake/package implementation, source, test, model, kernel,
+generated fixture, download, build, GPU, or service change is in scope. Draft
+PR is the claim; exact PR number is added after GitHub allocates it.
+
 **CPU grouped keep-quant GEMM activation-dtype P0 (`QUANT-GGUF-CIQ-GEMM`,
 2026-08-06, `CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`).** Claude Code
 (claude-opus-5), isolated worktree `/home/mudler/_git/vllmcpp-ciq-grouped`,
