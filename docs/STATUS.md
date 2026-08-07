@@ -411,7 +411,7 @@ Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kerne
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (16 native, 71 on CPU tier; opt-125m
-exact, coopmat 11-33x; e2e dispatch-bound, no num
+exact, coopmat 11-33x; e2e 5.9 vs llama.cpp 161
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 skeleton:
 backend, platform, 1 of 106 ops; **its HIP sources have never been compiled by
 anyone** — weaker than "build-supported", since no AMD board is here;

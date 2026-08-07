@@ -15195,3 +15195,60 @@ second confirmed defect.
 NO vllm.cpp number at all, not even a slow one. The workload never produced a
 completion at any size attempted (4 prompts/128/32 at 900 s; 1 prompt/32/8 at
 2400 s).
+
+#### RESOLVED: it was a GPU HANG, not slowness. VK-E now has BOTH arms.
+
+Everything above about "orders of magnitude slower", "per-op synchronous dispatch
+is the measured bottleneck" and "the dispatch count looks 10x high" was diagnosing
+a **hang**. All three readings are superseded.
+
+**How it was found.** Dispatch instrumentation showed ~300 submits in 1.2 s then
+total silence, with NO slow-dispatch line — and that absence was the clue, because
+the timing print runs only after the fence wait RETURNS. Tracing each submit
+BEFORE the wait named the culprit immediately:
+`#368 vt_matmul_coopmat groups=9496` — the lm_head GEMM at **M=1**.
+
+**The defect (mine, merged earlier this session).** `coopMatLoad` reads a FULL
+16x16 tile with no masking. At M=1 it read 15 rows, ~30 KB, past the end of the
+activation buffer; the GPU faulted and `vkWaitForFences(UINT64_MAX)` never
+returned. The shader's own comment claimed ragged M/N were safe "because the store
+is bounds-checked" — the store guard cannot help when the fault is on the LOAD.
+
+**Why the correctness gate missed it.** That gate used M=20, N=12 *specifically*
+to exercise ragged shapes and passed: the out-of-bounds read stayed inside the
+allocation, and its garbage rows were discarded by the bounds-checked store.
+Raggedness alone was not sufficient — the read has to LEAVE the allocation to
+fault, which needs a large N against a small operand, i.e. lm_head at decode.
+
+**Fix:** the tactic requires `m % 16 == 0 && n % 16 == 0` alongside `k % 16 == 0`;
+decode falls back to the scalar kernel, where coopmat would have wasted 15/16 of
+every tile anyway. A masked/padded load is the better long-term answer, not
+attempted here. New gate asserts the DECLINE at M=1, N=17 — expressible only as a
+tactic assertion, since the bad path hangs rather than returning a wrong number.
+
+**vllm.cpp Vulkan, GB10, Qwen3-0.6B bf16 safetensors (fix applied):**
+
+| workload | E2E | prefill tok/s | decode tok/s (per stream) |
+|---|---:|---:|---:|
+| 32 in / 8 out | **1,125.9 ms** | 28.42 | **8.59** |
+| 128 in / 32 out | **5,571.1 ms** | 22.98 | **5.85** |
+
+**The comparison, finally on both sides** (same weights; llama.cpp on the GGUF
+converted from this snapshot by its own script):
+
+| engine | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| llama.cpp Vulkan (`NV_coopmat2`) | **11,514** (pp128) | **160.9** (tg32) |
+| vllm.cpp Vulkan | 22.98 | 5.85 |
+
+That is roughly **500x on prefill** and **27x on decode** in llama.cpp's favour, and
+those ratios are honest but not yet diagnostic: 71 of 87 ops still run on the
+portable CPU tier, dispatch is still one submit + fence-wait per op (`VK-A2`
+unbuilt), and the scalar GEMM now serves every decode GEMM because coopmat
+declines at M=1. Each of those is a named, separately measurable lever.
+
+**Method lesson, the durable part:** a run that "never finishes" is not a slow run
+until proven so. Three separate attributions were published from indirect signals
+(op-coverage counts, CPU%, GPU-utilisation%) before anyone instrumented the thing
+that was actually blocking. The dispatch tracer cost minutes and answered it
+outright.

@@ -41865,3 +41865,52 @@ because a genuinely new row exists.
   reasoning ahead of measurement.
 
   dgx left clean: no process, GPU lock released.
+
+- **2026-08-07 (RESOLVED)** — **★ It was a GPU HANG, not slowness. A coopmat
+  out-of-bounds LOAD faulted the GPU; the fence never signalled. Fixed, and VK-E
+  now has BOTH arms (`CLAIM-VULKAN-FULL-1`).**
+
+  **Three published attributions in this session were all wrong**, each inferred
+  from an indirect signal instead of instrumenting the thing that was blocking:
+  (1) "the CPU reference tier, 71/87 ops" — from an op count; refuted by CPU 1.6 %.
+  (2) "GPU-bound" — from GPU-utilisation %, which on Tegra cannot separate compute
+  from a resident context polling a fence. (3) "per-op synchronous dispatch is the
+  measured bottleneck, ~96 waits/s" — the waits were real but they were the
+  driver's `poll()` loop spinning on ONE fence that never completed.
+
+  **The find.** Dispatch instrumentation showed ~300 submits in 1.2 s then
+  silence, with NO slow-dispatch line — and that ABSENCE was the clue, because the
+  timing print only runs after the wait returns. Tracing each submit BEFORE the
+  wait named it at once: `#368 vt_matmul_coopmat groups=9496`, the lm_head GEMM at
+  **M=1**.
+
+  **The defect, mine, merged earlier today.** `coopMatLoad` reads a FULL 16x16
+  tile with no masking; at M=1 it read 15 rows (~30 KB) past the activation
+  buffer, faulting the GPU so `vkWaitForFences(UINT64_MAX)` never returned. The
+  shader's comment claimed ragged M/N were safe "because the store is
+  bounds-checked" — the store guard cannot help when the fault is on the LOAD.
+
+  **Why my own gate missed it.** It used M=20, N=12 *specifically* to exercise
+  ragged shapes and passed: the OOB read stayed INSIDE the allocation and its
+  garbage rows were discarded by the bounds-checked store. Raggedness was not
+  enough — the read must LEAVE the allocation to fault, which needs a large N
+  against a small operand, i.e. lm_head at decode.
+
+  **Fix:** tactic requires `m % 16 == 0 && n % 16 == 0` too; decode falls back to
+  scalar (where coopmat would waste 15/16 of a tile anyway). New gate asserts the
+  DECLINE at M=1, N=17 — expressible only as a tactic assertion, since the bad
+  path hangs rather than returning a wrong number. GB10: 13/13, 509 assertions.
+
+  **Result: 40+ minutes of not-finishing became 1,125 ms.**
+
+  | engine (same weights) | prefill tok/s | decode tok/s |
+  |---|---:|---:|
+  | llama.cpp Vulkan `NV_coopmat2` | **11,514** | **160.9** |
+  | vllm.cpp Vulkan | 22.98 | 5.85 |
+
+  ~500x prefill / ~27x decode behind — honest, and not yet diagnostic: 71/87 ops
+  still on the CPU tier, dispatch is still one submit+fence per op (`VK-A2`
+  unbuilt), and the scalar GEMM now serves every decode GEMM since coopmat
+  declines at M=1. Each is a named, separately measurable lever.
+
+  **Durable lesson: a run that never finishes is not a slow run until proven so.**

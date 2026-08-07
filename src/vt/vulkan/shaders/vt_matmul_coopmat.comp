@@ -85,8 +85,15 @@ const uint VT_CM = 16u;  // the reported M = N = K tile extent
 shared float vt_cm_spill[VT_CM * VT_CM];
 
 void main() {
-  // Output tile coordinates. Tiles cover ceil(m/16) x ceil(n/16); edge tiles are
-  // handled by the bounds-checked store below rather than by a separate kernel.
+  // Output tile coordinates. THE HOST GUARANTEES m % 16 == 0 AND n % 16 == 0, so
+  // every tile is whole.
+  //
+  // That guarantee is load-bearing and was learned the hard way: `coopMatLoad`
+  // below reads a FULL 16x16 tile with no masking, so a partial tile reads past
+  // the end of the operand. The bounds-checked store does NOT rescue that -- the
+  // fault happens on the LOAD. At lm_head with M=1 this read ~30 KB past a small
+  // activation buffer, faulted the GPU, and the fence never signalled: an
+  // infinite vkWaitForFences that presents as a HANG rather than an error.
   uint tiles_n = (p.n + VT_CM - 1u) / VT_CM;
   uint tile = gl_WorkGroupID.x;
   if (tile >= ((p.m + VT_CM - 1u) / VT_CM) * tiles_n) { return; }
