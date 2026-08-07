@@ -257,7 +257,8 @@ implementer sub-agent prompts are tracked artifacts checked by
 `check-protocol-consistency` (orchestration harness step 5/5), and
 `check-gate-commands` pins the 25 record rows that name a gate command able to
 FAIL. That pin is exact, not shrink-only: gaining a gate command reddens it too,
-so the set is never re-pinned silently in either direction.
+so the set is never re-pinned silently in either direction. Since 2026-08-07,
+a PR verified green merges in that same session (disposition rule).
 
 **Hardware.** NVIDIA GB10 / DGX Spark (sm_121a) for CUDA, `dgx.casa` aarch64 for
 CPU, Apple M4 for Metal. GB10's 119 GiB pool is unified, so host and device

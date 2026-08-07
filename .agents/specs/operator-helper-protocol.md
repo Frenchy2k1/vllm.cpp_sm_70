@@ -117,7 +117,22 @@ PR is the claim.
 1. **Merge pass first.** The first action of an operator session is to review
    open PRs and merge what is ready. Integration debt is what kills parallel
    setups; doing this last means never doing it.
-2. **Features only via sub-agents.** The operator may drive feature work, but
+2. **Disposition before the session ends — verified means MERGED.** Moving
+   integration from direct pushes to PRs moved the merge to the end of the
+   loop, and the observed failure mode (2026-08-07: ten open PRs, several
+   already verified green) is that the end never comes. So disposition is part
+   of verification, not a later session's job. A PR whose merge gates
+   (§ Gates below) this session has seen green is merged IN THIS SESSION,
+   immediately — "verified, ready to merge" is not a terminal state. A PR
+   that is superseded, out of scope, or whose row is abandoned is CLOSED with
+   a one-line reason on its thread, never left to rot. A session never ends
+   with an undispositioned PR among those it opened, verified, or reviewed:
+   each is merged, closed with its reason, or explicitly parked with its named
+   blocker (red gate, missing hardware, awaiting rework) stated on the PR
+   thread. The sole exception is a DECLARED headless run, which never merges;
+   it records "verified green at `<sha>`, READY-TO-MERGE" in `state.md` so
+   the next interactive session's merge pass is mechanical.
+3. **Features only via sub-agents.** The operator may drive feature work, but
    only by dispatching sub-agents or a dynamic workflow — never by writing the
    feature itself. Enforced mechanically: see § Enforcement.
    The loop itself lives in the manual agents actually read —
@@ -132,13 +147,13 @@ PR is the claim.
    is a finding and none of the seventeen found so far was visible in a diff.
    **Never fix findings yourself**: a controller fix pollutes the context that
    exists to coordinate, and skips review entirely.
-3. **Directly permitted, because review needs it:** reading any diff, running
+4. **Directly permitted, because review needs it:** reading any diff, running
    any gate, resolving merge conflicts, fixing doc obligations, retuning a
    ratchet, and running benchmarks. An operator that cannot touch anything
    cannot review competently and degrades into a rubber stamp. The distinction
    is *implementing a feature* versus *integrating one*.
-4. **Sole owner of `main`,** and of the GPU (§ Dependencies).
-5. Never force-push `main`. A bad push is repaired with a follow-up commit.
+5. **Sole owner of `main`,** and of the GPU (§ Dependencies).
+6. Never force-push `main`. A bad push is repaired with a follow-up commit.
 
 ## Helper rules
 
@@ -199,6 +214,11 @@ depend on who reviews:
 4. evidence in the PR body matches what the record now says;
 5. no speed number that did not come from the operator's serialized runs.
 
+When all five hold, merging is an OBLIGATION, not an option: it happens in the
+same session that saw them hold (operator rule 2). When one can never hold —
+the row is superseded, the approach was abandoned, a competing PR landed
+first — the PR is closed with that reason, not left open.
+
 ### The record-merge rule (hard, and the failure is SILENT)
 
 `docs/STATUS.md`, `docs/BENCHMARKS.md`, `docs/FEATURES.md`, `.agents/NOW.md`,
@@ -258,6 +278,13 @@ FAILING gate by default; `--no-require-role` is the explicit opt-out, and a
 
 - **Decided (user, 2026-08-04):** operator may drive features, but only via
   sub-agents; claims PR-derived.
+- **Directed (user, 2026-08-07):** the PR-based flow was leaving verified work
+  unmerged — sessions opened PRs, verified them, and ended without integrating
+  (ten open PRs that day). Operator rule 2 is the fix: a PR verified good
+  in-session merges in that same session, an irrelevant/superseded one closes
+  with a recorded reason, and parking requires a named blocker. Only a
+  declared headless run defers the merge, and it must record READY-TO-MERGE
+  with the verified head SHA.
 - **Corrected (user, 2026-08-04):** the first draft made environment-derivation
   the PRIMARY way to determine the role. That is circular — the common case is
   several sessions started from ONE environment, indistinguishable until a role

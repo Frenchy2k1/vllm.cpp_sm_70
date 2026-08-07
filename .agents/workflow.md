@@ -20,7 +20,7 @@ role this session did not choose, re-claim rather than inherit it.
 
 | What are you here to do? | Claim | What it means |
 |---|---|---|
-| A long or multi-step campaign — several changes, a benchmark grid, a whole row block | `scripts/agent-role.py claim operator` | Owns `main` and the GPU. Merges PRs first. Drives feature work through sub-agents rather than writing it. One at a time, repo-wide. |
+| A long or multi-step campaign — several changes, a benchmark grid, a whole row block | `scripts/agent-role.py claim operator` | Owns `main` and the GPU. Merges PRs first, and dispositions every PR before ending: verified-good merges in-session, superseded/irrelevant closes with a reason. Drives feature work through sub-agents rather than writing it. One at a time, repo-wide. |
 | One scoped change — a fix, a port, a single row | `scripts/agent-role.py claim helper --row <ROW-ID>` | Isolated worktree on `row/<ROW-ID>`, draft PR opened at the START. That PR **is** the claim. Never touches `main`. |
 | Just looking — reading code, answering a question | `scripts/agent-role.py claim read-only` | No lock, no worktree, no claim. Passes a plain preflight; `scripts/agent-preflight.sh --staged` refuses it. |
 
@@ -173,7 +173,13 @@ Run `scripts/agent-onboard.py --probe` to see what is still unresolved.
    - commit the completed in-scope change with the required trailers;
    - integrate, push, open a PR, or leave the commit local exactly as selected
      by `developer-preferences.md`. The project protocol itself grants no push,
-     merge, force-update, or remote-host authority.
+     merge, force-update, or remote-host authority. Opening a PR does not end
+     the obligation: a PR verified good in-session is MERGED in that same
+     session (by the operator, the only role that merges), and a PR that has
+     become irrelevant or superseded is CLOSED with a recorded reason — the
+     disposition rule in
+     [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
+     "Verified, ready to merge" is not a state a session may end in.
 
 <!-- orchestration-loop:begin -->
 ### Running a row through sub-agents
@@ -205,6 +211,14 @@ one worktree.
 4. Findings go back to a fresh implementer, then a **scoped re-review** of the
    fix diff only. **Never fix findings yourself** — a controller fix pollutes
    the context that exists to coordinate, and skips review entirely.
+5. **Disposition the PR in THIS session.** When the re-review is clean and you
+   have run the row's gate green on the PR head, MERGE NOW — verification and
+   integration are one motion, and a verified-green PR left open is how the
+   2026-08-07 ten-PR backlog was built. A PR that proved superseded or out of
+   scope is CLOSED with a one-line reason on its thread. End no session with an
+   undispositioned PR among those it opened, verified, or reviewed: merged,
+   closed with its reason, or parked with its blocker named on the thread
+   ([protocol](specs/operator-helper-protocol.md)).
 
 A gate command must exit nonzero on failure. Never `true`, never `echo ok`,
 never piped — `cmd | tail` reports `tail`'s status, not the command's.
@@ -216,7 +230,9 @@ rows and the reason. Growth is welcome; silent growth is not.
 
 Interactive is the default. In a **declared** headless run, decide rather than
 ask, record every decision in [state.md](state.md), park what will not go
-green, and never merge.
+green, and never merge — instead record each verified-green PR as
+"READY-TO-MERGE at `<sha>`" in [state.md](state.md) so the next interactive
+session's merge pass is mechanical.
 <!-- orchestration-loop:end -->
 
 ## Obligated public surfaces
