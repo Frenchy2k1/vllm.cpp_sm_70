@@ -64,12 +64,68 @@ ANCHORS = {
     ),
 }
 
+LIFECYCLE_RECORD_MUTATIONS = (
+    (
+        ".agents/engine-matrix.md",
+        "`SPIKE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "engine-matrix release lifecycle",
+    ),
+    (
+        ".agents/engine-matrix.md",
+        "gaps remain; no install/archive/publish implementation",
+        "gaps closed; install/archive/publish implementation complete",
+        "engine-matrix release lifecycle",
+    ),
+    (
+        ".agents/roadmap_v1.md",
+        "`SPIKE` | Fresh review of PR #129",
+        "`DONE` | Fresh review of PR #129",
+        "roadmap release lifecycle",
+    ),
+    (
+        ".agents/roadmap_v1.md",
+        "bundle work; no archive exists",
+        "bundle work complete; archive exists",
+        "roadmap release lifecycle",
+    ),
+    (
+        ".agents/coordination.md",
+        "| `ACTIVE` | 2026-08-07 — user-reviewed revision complete: primary fat "
+        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
+        "`SPIKE`; awaiting fresh review |",
+        "| `DONE` | 2026-08-07 — user-reviewed revision complete: primary fat "
+        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
+        "`SPIKE`; awaiting fresh review |",
+        "coordination release lifecycle",
+    ),
+    (
+        ".agents/coordination.md",
+        "no CMake, workflow, source, test, or artifact implementation",
+        "CMake, workflow, source, test, and artifact implementation complete",
+        "coordination release lifecycle",
+    ),
+    (
+        ".agents/coordination.md",
+        "row stays `SPIKE`; awaiting fresh review",
+        "row is `DONE`; release shipped",
+        "coordination release lifecycle",
+    ),
+    (
+        ".agents/state.md",
+        "`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation "
+        "is\nclaimed.",
+        "`ENG-RELEASE-BINARIES` is `DONE`, with archive and implementation.",
+        "state release lifecycle",
+    ),
+)
+
 BENCHMARKS_RELEASE_ROW = (
     "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary "
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
     "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, "
-    "and 18 tests. No archive, staged smoke, runtime, correctness, or performance "
+    "and 19 tests. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
@@ -77,7 +133,7 @@ BENCHMARKS_RELEASE_ROW = (
 STATUS_RELEASE_FRAGMENTS = (
     "Supported subset; bundles SPIKED, no artifacts",
     "primary fat CUDA/adaptive CPU, W1-W13/W10-W12 policy, pending claims, and "
-    "18-test inventory mutation-gated; per-SM diagnostics optional; no "
+    "19-test inventory mutation-gated; per-SM diagnostics optional; no "
     "archive/runtime claim",
 )
 
@@ -112,7 +168,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 18 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 19 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -170,6 +226,7 @@ REQUIRED_TEST_METHODS = (
     "test_each_work_dependency_edge_is_pinned",
     "test_optional_w12_does_not_block_w13",
     "test_each_required_record_anchor_is_fail_closed",
+    "test_release_lifecycle_and_honesty_are_fail_closed",
     "test_public_release_rows_remain_pending",
     "test_human_w12_is_optional_and_cannot_replace_w10",
     "test_human_primary_artifact_contract_matches_machine_block",
@@ -183,6 +240,7 @@ TEST_LITERAL_INVENTORIES = {
     "PRIMARY_CUDA_SMS": PRIMARY_CUDA_SMS,
     "EXPECTED_DEPS": {work: ",".join(deps) for work, deps in WORK_DEPS.items()},
     "RECORD_ANCHORS": ANCHORS,
+    "LIFECYCLE_RECORD_MUTATIONS": LIFECYCLE_RECORD_MUTATIONS,
     "PUBLIC_PENDING_MUTATIONS": PUBLIC_PENDING_MUTATIONS,
     "W10_W12_HUMAN_MUTATIONS": W10_W12_HUMAN_MUTATIONS,
     "PRIMARY_ARTIFACT_PROSE_MUTATIONS": PRIMARY_ARTIFACT_PROSE_MUTATIONS,
@@ -203,6 +261,11 @@ TEST_INVENTORY_CONSUMERS = {
         "test_each_required_record_anchor_is_fail_closed",
         ("relative", "anchor"),
         True,
+    ),
+    "LIFECYCLE_RECORD_MUTATIONS": (
+        "test_release_lifecycle_and_honesty_are_fail_closed",
+        ("relative", "before", "after", "reason"),
+        False,
     ),
     "PUBLIC_PENDING_MUTATIONS": (
         "test_public_release_rows_remain_pending",
@@ -239,6 +302,15 @@ EXPECTED_FIELDS = {
 WORK_ROW = re.compile(
     r"^\|\s*(W(?:[1-9]|1[0-3]))\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|",
     re.M,
+)
+
+STATE_RELEASE_HEADING = (
+    "## 2026-08-07 — Release matrix revised: fat CUDA and adaptive CPU are the "
+    "primary downloads"
+)
+STATE_RELEASE_LIFECYCLE = (
+    "`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation "
+    "is claimed."
 )
 
 
@@ -296,6 +368,117 @@ def _normalize_deps(cell: str) -> tuple[str, ...]:
 
 def _normalize_prose(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _table_record(
+    root: Path,
+    relative: str,
+    prefix: str,
+    cell_count: int,
+    label: str,
+    errors: list[str],
+) -> tuple[str, ...] | None:
+    path = root / relative
+    if not path.is_file():
+        errors.append(f"{label} record {relative} is missing")
+        return None
+    rows = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith(prefix)
+    ]
+    if len(rows) != 1:
+        errors.append(
+            f"{label} record must have exactly one row starting {prefix!r}; "
+            f"found {len(rows)}"
+        )
+        return None
+    cells = tuple(cell.strip() for cell in rows[0].split("|")[1:-1])
+    if len(cells) != cell_count:
+        errors.append(
+            f"{label} record must have {cell_count} cells; found {len(cells)}"
+        )
+        return None
+    return cells
+
+
+def _release_lifecycle_errors(root: Path) -> list[str]:
+    errors: list[str] = []
+
+    engine = _table_record(
+        root,
+        ".agents/engine-matrix.md",
+        "| `ENG-RELEASE-BINARIES` |",
+        9,
+        "engine-matrix release lifecycle",
+        errors,
+    )
+    if engine is not None and (
+        engine[7] != "`SPIKE`"
+        or "gaps remain; no install/archive/publish implementation" not in engine[4]
+    ):
+        errors.append(
+            "engine-matrix release lifecycle must stay SPIKE and state that the "
+            "gaps remain with no install/archive/publish implementation"
+        )
+
+    roadmap = _table_record(
+        root,
+        ".agents/roadmap_v1.md",
+        "| REL | `ROAD-V1-RELEASE` |",
+        7,
+        "roadmap release lifecycle",
+        errors,
+    )
+    if roadmap is not None and (
+        roadmap[5] != "`SPIKE`" or "no archive exists" not in roadmap[6]
+    ):
+        errors.append(
+            "roadmap release lifecycle must stay SPIKE and state that no archive "
+            "exists"
+        )
+
+    coordination = _table_record(
+        root,
+        ".agents/coordination.md",
+        "| `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        8,
+        "coordination release lifecycle",
+        errors,
+    )
+    if coordination is not None and (
+        coordination[6] != "`ACTIVE`"
+        or "no CMake, workflow, source, test, or artifact implementation"
+        not in coordination[5]
+        or "row stays `SPIKE`; awaiting fresh review" not in coordination[7]
+    ):
+        errors.append(
+            "coordination release lifecycle must keep the claim ACTIVE while the "
+            "row stays SPIKE, awaiting review, with no implementation"
+        )
+
+    state_path = root / ".agents/state.md"
+    if not state_path.is_file():
+        errors.append("state release lifecycle record .agents/state.md is missing")
+    else:
+        state_text = state_path.read_text(encoding="utf-8")
+        if state_text.count(STATE_RELEASE_HEADING) != 1:
+            errors.append(
+                "state release lifecycle must have exactly one revised-release "
+                "checkpoint"
+            )
+        else:
+            start = state_text.index(STATE_RELEASE_HEADING) + len(
+                STATE_RELEASE_HEADING
+            )
+            end = state_text.find("\n## ", start)
+            section = state_text[start:] if end < 0 else state_text[start:end]
+            if STATE_RELEASE_LIFECYCLE not in _normalize_prose(section):
+                errors.append(
+                    "state release lifecycle must say ENG-RELEASE-BINARIES remains "
+                    "SPIKE with no archive or implementation claimed"
+                )
+    return errors
 
 
 def _top_level_literal(tree: ast.Module, name: str) -> tuple[object, int]:
@@ -478,6 +661,7 @@ def contract_errors(root: Path) -> list[str]:
         path = root / relative
         if not path.is_file() or anchor not in path.read_text(encoding="utf-8"):
             errors.append(f"{relative} is missing required release anchor {anchor!r}")
+    errors.extend(_release_lifecycle_errors(root))
     benchmarks = root / "docs/BENCHMARKS.md"
     if not benchmarks.is_file() or BENCHMARKS_RELEASE_ROW not in benchmarks.read_text(
         encoding="utf-8"
