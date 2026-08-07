@@ -40716,3 +40716,40 @@ nibble, fp4, or free-gen. fp4-resident Marlin arm grids differently again (3rd, 
 wiring-gated). NEXT: layer-by-layer activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream
 (identical weights; differ only in dequant source + island read bf16-disk vs f16-disk). Records: spec
 §8.11 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
+
+
+## 2026-08-07 — startup latency MEASURED (provisional): 36.51 s vs vLLM 221.51 s = 6.07x
+
+First numbers on the axis landed yesterday. Qwen3.6-27B-NVFP4 on GB10, 3
+interleaved repetitions, page cache dropped per leg, vLLM oracle 0.25.0:
+ours 37.94/36.51/35.88 (median **36.51 s**), vLLM 460.36/221.51/217.86 (warm
+median **221.51 s**), `startup_speedup_vs_vllm` **6.07**.
+
+vLLM's 460 s r1 is its one-time FlashInfer autotune + compile population, named
+in its own log (`saved 64 configs`; `init engine ... 259.42 s`, compilation
+46.43 s) versus r2 (`loaded 64 configs`; 26.95 s, compilation 11.73 s). Even
+warm, engine init is only ~27 s of ~221 s: most of vLLM's startup is process
+start, imports and weight load, which is where the gap actually lives. Our own
+cold-autotune start is 69.29 s, so our one-time cost is +33 s.
+
+**NOT binding, two reasons.** (a) A concurrent build session appeared at
+00:38:41 and overlapped r2/r3 of both arms, including BOTH warm-cache vLLM legs;
+the bias direction inflates our ratio. (b) The uncontended repeat completed our
+cold-cache r1 and then the box HARD-REBOOTED at ~00:54 during vLLM's
+cold-autotune leg (previous boot's journal ends mid-leg, no shutdown sequence,
+machine back at 01:31).
+
+**New hazard datum for [[gb10-unified-memory-oom-reboots-box]]:** the trigger was
+the COLD-autotune vLLM leg. The same `--gpu-memory-utilization 0.6` ran six times
+without incident in the first series with a warm autotune cache. Pre-warm vLLM's
+autotune cache BEFORE a series, not inside it.
+
+Process note: an aborted attempt to clear both autotune caches deleted
+`~/.cache/vllm.cpp/nvfp4_autotune` and `~/.cache/vllm/flashinfer_autotune_cache`
+and PARTIALLY deleted `~/.cache/vllm/torch_compile_cache` (root-owned files from
+a container refused `rm`). The autotune caches were repopulated by the runs; the
+torch compile cache was left partially cleared and self-heals on next vLLM start.
+
+Evidence: `dgx:~/work/vllm.cpp-online-gate/evidence/8f752ae5.../startup/27/`
+(series 1) and `dgx:~/work/startup-axis/clean-claim/.../startup/27/ours/r1.json`
+(the surviving cold-cache leg). Owed: one uncontended 3-rep series on a quiet box.
