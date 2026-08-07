@@ -69,7 +69,7 @@ BENCHMARKS_RELEASE_ROW = (
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
     "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, "
-    "and 15 tests. No archive, staged smoke, runtime, correctness, or performance "
+    "and 18 tests. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
@@ -77,7 +77,7 @@ BENCHMARKS_RELEASE_ROW = (
 STATUS_RELEASE_FRAGMENTS = (
     "Supported subset; bundles SPIKED, no artifacts",
     "primary fat CUDA/adaptive CPU, W1-W13/W10-W12 policy, pending claims, and "
-    "15-test inventory mutation-gated; per-SM diagnostics optional; no "
+    "18-test inventory mutation-gated; per-SM diagnostics optional; no "
     "archive/runtime claim",
 )
 
@@ -108,6 +108,56 @@ WORK_CONTENT = {
     ),
 }
 
+PUBLIC_PENDING_MUTATIONS = (
+    (
+        "docs/BENCHMARKS.md",
+        "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
+        "W1-W13/W10-W12 policy, public pending states, and 18 tests. No archive, "
+        "staged smoke, runtime, correctness, or performance evidence",
+        "**SHIPPED:** archive, runtime, correctness, and performance evidence "
+        "complete",
+        "docs/BENCHMARKS.md release row",
+    ),
+    (
+        "docs/STATUS.md",
+        "Supported subset; bundles SPIKED, no artifacts",
+        "Supported; bundles SHIPPED with runtime evidence",
+        "docs/STATUS.md release row",
+    ),
+)
+
+W10_W12_HUMAN_MUTATIONS = (
+    (
+        "optional single-SM CUDA diagnostic/performance variants",
+        "required primary single-SM CUDA release variants replacing W10",
+        "W12 deliverable",
+    ),
+    (
+        "generated from the same explicit matrix and evidence; never advertised "
+        "as the primary KISS download or used to bypass W10",
+        "the primary KISS download; W10 may be bypassed",
+        "W12 exit gate",
+    ),
+)
+
+PRIMARY_ARTIFACT_PROSE_MUTATIONS = (
+    (
+        "The primary CPU download is\none conservative-baseline, runtime-adaptive "
+        "binary per OS+host ABI; the primary\nCUDA download is one fat binary per "
+        "OS+host ABI containing every supported SM.",
+        "The primary CPU download is one binary per ISA; the primary CUDA "
+        "download is one binary per SM.",
+        "human primary CPU/CUDA contract",
+    ),
+    (
+        "For x86_64, the baseline must run without AVX2: portable/SSE2 code "
+        "remains\ncallable, and higher instructions live only in per-function or "
+        "per-TU tiers.",
+        "For x86_64, AVX2 is required by the baseline.",
+        "human x86_64 no-AVX2 contract",
+    ),
+)
+
 REQUIRED_TEST_METHODS = (
     "test_repository_contract_passes",
     "test_spec_identity_is_fail_closed",
@@ -123,8 +173,53 @@ REQUIRED_TEST_METHODS = (
     "test_public_release_rows_remain_pending",
     "test_human_w12_is_optional_and_cannot_replace_w10",
     "test_human_primary_artifact_contract_matches_machine_block",
+    "test_primary_cuda_mutation_inventory_literal_is_pinned",
+    "test_work_dependency_mutation_inventory_literal_is_pinned",
+    "test_each_semantic_inventory_consumer_is_pinned",
     "test_required_mutation_test_inventory_is_pinned",
 )
+
+TEST_LITERAL_INVENTORIES = {
+    "PRIMARY_CUDA_SMS": PRIMARY_CUDA_SMS,
+    "EXPECTED_DEPS": {work: ",".join(deps) for work, deps in WORK_DEPS.items()},
+    "RECORD_ANCHORS": ANCHORS,
+    "PUBLIC_PENDING_MUTATIONS": PUBLIC_PENDING_MUTATIONS,
+    "W10_W12_HUMAN_MUTATIONS": W10_W12_HUMAN_MUTATIONS,
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS": PRIMARY_ARTIFACT_PROSE_MUTATIONS,
+}
+
+TEST_INVENTORY_CONSUMERS = {
+    "PRIMARY_CUDA_SMS": (
+        "test_each_primary_cuda_sm_is_required",
+        ("sm",),
+        False,
+    ),
+    "EXPECTED_DEPS": (
+        "test_each_work_dependency_edge_is_pinned",
+        ("work", "deps"),
+        True,
+    ),
+    "RECORD_ANCHORS": (
+        "test_each_required_record_anchor_is_fail_closed",
+        ("relative", "anchor"),
+        True,
+    ),
+    "PUBLIC_PENDING_MUTATIONS": (
+        "test_public_release_rows_remain_pending",
+        ("relative", "before", "after", "reason"),
+        False,
+    ),
+    "W10_W12_HUMAN_MUTATIONS": (
+        "test_human_w12_is_optional_and_cannot_replace_w10",
+        ("before", "after", "reason"),
+        False,
+    ),
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS": (
+        "test_human_primary_artifact_contract_matches_machine_block",
+        ("before", "after", "reason"),
+        False,
+    ),
+}
 
 EXPECTED_FIELDS = {
     "identity": IDENTITY,
@@ -203,6 +298,60 @@ def _normalize_prose(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _top_level_literal(tree: ast.Module, name: str) -> tuple[object, int]:
+    declarations = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        )
+    ]
+    if len(declarations) != 1:
+        return None, len(declarations)
+    try:
+        return ast.literal_eval(declarations[0].value), 1
+    except (TypeError, ValueError, SyntaxError):
+        return None, 1
+
+
+def _target_names(target: ast.expr) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, (ast.Tuple, ast.List)) and all(
+        isinstance(item, ast.Name) for item in target.elts
+    ):
+        return tuple(item.id for item in target.elts)
+    return ()
+
+
+def _iterates_inventory(
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+    inventory: str,
+    target_names: tuple[str, ...],
+    mapping_items: bool,
+) -> bool:
+    for node in ast.walk(method):
+        if not isinstance(node, ast.For) or _target_names(node.target) != target_names:
+            continue
+        if not mapping_items and isinstance(node.iter, ast.Name):
+            if node.iter.id == inventory:
+                return True
+        if (
+            mapping_items
+            and isinstance(node.iter, ast.Call)
+            and not node.iter.args
+            and not node.iter.keywords
+            and isinstance(node.iter.func, ast.Attribute)
+            and node.iter.func.attr == "items"
+            and isinstance(node.iter.func.value, ast.Name)
+            and node.iter.func.value.id == inventory
+        ):
+            return True
+    return False
+
+
 def _test_inventory_errors(root: Path) -> list[str]:
     path = root / TEST_PATH
     if not path.is_file():
@@ -212,12 +361,13 @@ def _test_inventory_errors(root: Path) -> list[str]:
     except SyntaxError as error:
         return [f"required mutation-test inventory is not valid Python: {error}"]
 
-    methods = [
-        node.name
+    method_nodes = [
+        node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name.startswith("test_")
     ]
+    methods = [node.name for node in method_nodes]
     expected = set(REQUIRED_TEST_METHODS)
     actual = set(methods)
     errors: list[str] = []
@@ -228,24 +378,36 @@ def _test_inventory_errors(root: Path) -> list[str]:
             f"{sorted(expected)}, found {len(methods)} {sorted(methods)}"
         )
 
-    declarations = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "REQUIRED_TEST_METHODS"
-            for target in node.targets
-        )
-    ]
-    try:
-        declared = tuple(ast.literal_eval(declarations[0].value))
-    except (IndexError, TypeError, ValueError, SyntaxError):
-        declared = ()
-    if len(declarations) != 1 or declared != REQUIRED_TEST_METHODS:
+    declared, declaration_count = _top_level_literal(tree, "REQUIRED_TEST_METHODS")
+    if declaration_count != 1 or declared != REQUIRED_TEST_METHODS:
         errors.append(
             "required mutation-test inventory declaration does not match the "
             "checker's exact count and names"
         )
+
+    for inventory, expected_value in TEST_LITERAL_INVENTORIES.items():
+        declared_value, count = _top_level_literal(tree, inventory)
+        if count != 1 or declared_value != expected_value:
+            errors.append(
+                f"semantic mutation inventory {inventory} must be one explicit "
+                "top-level literal matching the checker's independent production "
+                f"contract; found {declared_value!r}"
+            )
+
+    methods_by_name = {node.name: node for node in method_nodes}
+    for inventory, (
+        method_name,
+        target_names,
+        mapping_items,
+    ) in TEST_INVENTORY_CONSUMERS.items():
+        method = methods_by_name.get(method_name)
+        if method is None or not _iterates_inventory(
+            method, inventory, target_names, mapping_items
+        ):
+            errors.append(
+                f"semantic mutation inventory {inventory} is not consumed by "
+                f"{method_name} through its required literal iteration"
+            )
     return errors
 
 

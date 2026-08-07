@@ -42,10 +42,26 @@ REQUIRED_TEST_METHODS = (
     "test_public_release_rows_remain_pending",
     "test_human_w12_is_optional_and_cannot_replace_w10",
     "test_human_primary_artifact_contract_matches_machine_block",
+    "test_primary_cuda_mutation_inventory_literal_is_pinned",
+    "test_work_dependency_mutation_inventory_literal_is_pinned",
+    "test_each_semantic_inventory_consumer_is_pinned",
     "test_required_mutation_test_inventory_is_pinned",
 )
 
-ANCHORS = {
+PRIMARY_CUDA_SMS = (
+    "80",
+    "86",
+    "87",
+    "89",
+    "90a",
+    "100a",
+    "103a",
+    "110",
+    "120a",
+    "121a",
+)
+
+RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
     ".agents/NOW.md": "| Release | SPIKE | #129 |",
@@ -80,6 +96,56 @@ EXPECTED_DEPS = {
     "W12": "W1,W2,W5,W6,W7",
     "W13": "W5,W7,W8,W9,W10,W11",
 }
+
+PUBLIC_PENDING_MUTATIONS = (
+    (
+        "docs/BENCHMARKS.md",
+        "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
+        "W1-W13/W10-W12 policy, public pending states, and 18 tests. No archive, "
+        "staged smoke, runtime, correctness, or performance evidence",
+        "**SHIPPED:** archive, runtime, correctness, and performance evidence "
+        "complete",
+        "docs/BENCHMARKS.md release row",
+    ),
+    (
+        "docs/STATUS.md",
+        "Supported subset; bundles SPIKED, no artifacts",
+        "Supported; bundles SHIPPED with runtime evidence",
+        "docs/STATUS.md release row",
+    ),
+)
+
+W10_W12_HUMAN_MUTATIONS = (
+    (
+        "optional single-SM CUDA diagnostic/performance variants",
+        "required primary single-SM CUDA release variants replacing W10",
+        "W12 deliverable",
+    ),
+    (
+        "generated from the same explicit matrix and evidence; never advertised "
+        "as the primary KISS download or used to bypass W10",
+        "the primary KISS download; W10 may be bypassed",
+        "W12 exit gate",
+    ),
+)
+
+PRIMARY_ARTIFACT_PROSE_MUTATIONS = (
+    (
+        "The primary CPU download is\none conservative-baseline, runtime-adaptive "
+        "binary per OS+host ABI; the primary\nCUDA download is one fat binary per "
+        "OS+host ABI containing every supported SM.",
+        "The primary CPU download is one binary per ISA; the primary CUDA "
+        "download is one binary per SM.",
+        "human primary CPU/CUDA contract",
+    ),
+    (
+        "For x86_64, the baseline must run without AVX2: portable/SSE2 code "
+        "remains\ncallable, and higher instructions live only in per-function or "
+        "per-TU tiers.",
+        "For x86_64, AVX2 is required by the baseline.",
+        "human x86_64 no-AVX2 contract",
+    ),
+)
 
 
 def run_checker(root: Path) -> subprocess.CompletedProcess[str]:
@@ -159,14 +225,12 @@ class AcceptedDesignMutations(unittest.TestCase):
         )
 
     def test_each_primary_cuda_sm_is_required(self) -> None:
-        for sm in ("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a"):
+        for sm in PRIMARY_CUDA_SMS:
             with self.subTest(sm=sm):
                 self.assert_mutation_fails(
                     "primary_cuda_sms=80,86,87,89,90a,100a,103a,110,120a,121a",
                     "primary_cuda_sms=" + ",".join(
-                        value
-                        for value in ("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a")
-                        if value != sm
+                        value for value in PRIMARY_CUDA_SMS if value != sm
                     ),
                     "primary CUDA SM set",
                 )
@@ -228,7 +292,7 @@ class WorkGraphMutations(unittest.TestCase):
 
 class RecordAnchorMutations(unittest.TestCase):
     def test_each_required_record_anchor_is_fail_closed(self) -> None:
-        for relative, anchor in ANCHORS.items():
+        for relative, anchor in RECORD_ANCHORS.items():
             with self.subTest(path=relative), RepoCopy() as root:
                 mutate(root, relative, anchor)
                 result = run_checker(root)
@@ -240,21 +304,7 @@ class HumanContractMutations(unittest.TestCase):
     SPEC = ".agents/specs/release-binary-matrix.md"
 
     def test_public_release_rows_remain_pending(self) -> None:
-        mutations = (
-            (
-                "docs/BENCHMARKS.md",
-                "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, and 15 tests. No archive, staged smoke, runtime, correctness, or performance evidence",
-                "**SHIPPED:** archive, runtime, correctness, and performance evidence complete",
-                "docs/BENCHMARKS.md release row",
-            ),
-            (
-                "docs/STATUS.md",
-                "Supported subset; bundles SPIKED, no artifacts",
-                "Supported; bundles SHIPPED with runtime evidence",
-                "docs/STATUS.md release row",
-            ),
-        )
-        for relative, before, after, reason in mutations:
+        for relative, before, after, reason in PUBLIC_PENDING_MUTATIONS:
             with self.subTest(path=relative), RepoCopy() as root:
                 mutate(root, relative, before, after)
                 result = run_checker(root)
@@ -262,19 +312,7 @@ class HumanContractMutations(unittest.TestCase):
                 self.assertIn(reason, result.stdout + result.stderr)
 
     def test_human_w12_is_optional_and_cannot_replace_w10(self) -> None:
-        mutations = (
-            (
-                "optional single-SM CUDA diagnostic/performance variants",
-                "required primary single-SM CUDA release variants replacing W10",
-                "W12 deliverable",
-            ),
-            (
-                "generated from the same explicit matrix and evidence; never advertised as the primary KISS download or used to bypass W10",
-                "the primary KISS download; W10 may be bypassed",
-                "W12 exit gate",
-            ),
-        )
-        for before, after, reason in mutations:
+        for before, after, reason in W10_W12_HUMAN_MUTATIONS:
             with self.subTest(reason=reason), RepoCopy() as root:
                 mutate(root, self.SPEC, before, after)
                 result = run_checker(root)
@@ -282,32 +320,101 @@ class HumanContractMutations(unittest.TestCase):
                 self.assertIn(reason, result.stdout + result.stderr)
 
     def test_human_primary_artifact_contract_matches_machine_block(self) -> None:
-        mutations = (
-            (
-                "The primary CPU download is\none conservative-baseline, runtime-adaptive binary per OS+host ABI; the primary\nCUDA download is one fat binary per OS+host ABI containing every supported SM.",
-                "The primary CPU download is one binary per ISA; the primary CUDA download is one binary per SM.",
-                "human primary CPU/CUDA contract",
-            ),
-            (
-                "For x86_64, the baseline must run without AVX2: portable/SSE2 code remains\ncallable, and higher instructions live only in per-function or per-TU tiers.",
-                "For x86_64, AVX2 is required by the baseline.",
-                "human x86_64 no-AVX2 contract",
-            ),
-        )
-        for before, after, reason in mutations:
+        for before, after, reason in PRIMARY_ARTIFACT_PROSE_MUTATIONS:
             with self.subTest(reason=reason), RepoCopy() as root:
                 mutate(root, self.SPEC, before, after)
                 result = run_checker(root)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(reason, result.stdout + result.stderr)
 
+    def test_primary_cuda_mutation_inventory_literal_is_pinned(self) -> None:
+        with RepoCopy() as root:
+            mutate(
+                root,
+                "tests/scripts/test_check_release_binary_contract.py",
+                '    "120a",\n    "121a",\n)\n\nRECORD_ANCHORS',
+                '    "120a",\n)\n\nRECORD_ANCHORS',
+            )
+            result = run_checker(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("PRIMARY_CUDA_SMS", result.stdout + result.stderr)
+
+    def test_work_dependency_mutation_inventory_literal_is_pinned(self) -> None:
+        with RepoCopy() as root:
+            mutate(
+                root,
+                "tests/scripts/test_check_release_binary_contract.py",
+                '    "W2": "W1",',
+                '    "W2": "",',
+            )
+            result = run_checker(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("EXPECTED_DEPS", result.stdout + result.stderr)
+
+    def test_each_semantic_inventory_consumer_is_pinned(self) -> None:
+        mutations = (
+            ("for sm in PRIMARY_CUDA_SMS:", "for sm in ():", "PRIMARY_CUDA_SMS"),
+            (
+                "for work, deps in EXPECTED_DEPS.items():",
+                "for work, deps in {}.items():",
+                "EXPECTED_DEPS",
+            ),
+            (
+                "for relative, anchor in RECORD_ANCHORS.items():",
+                "for relative, anchor in {}.items():",
+                "RECORD_ANCHORS",
+            ),
+            (
+                "for relative, before, after, reason in PUBLIC_PENDING_MUTATIONS:",
+                "for relative, before, after, reason in ():",
+                "PUBLIC_PENDING_MUTATIONS",
+            ),
+            (
+                "for before, after, reason in W10_W12_HUMAN_MUTATIONS:",
+                "for before, after, reason in ():",
+                "W10_W12_HUMAN_MUTATIONS",
+            ),
+            (
+                "for before, after, reason in PRIMARY_ARTIFACT_PROSE_MUTATIONS:",
+                "for before, after, reason in ():",
+                "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+            ),
+        )
+        for before, after, inventory in mutations:
+            with self.subTest(inventory=inventory), RepoCopy() as root:
+                mutate(
+                    root,
+                    "tests/scripts/test_check_release_binary_contract.py",
+                    before,
+                    after,
+                )
+                result = run_checker(root)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn(inventory, result.stdout + result.stderr)
+
     def test_required_mutation_test_inventory_is_pinned(self) -> None:
         for method in REQUIRED_TEST_METHODS:
-            with self.subTest(method=method), RepoCopy() as root:
-                delete_test_method(root, method)
-                result = run_checker(root)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("required mutation-test inventory", result.stdout + result.stderr)
+            for mutation in ("delete", "rename"):
+                with self.subTest(method=method, mutation=mutation), RepoCopy() as root:
+                    if mutation == "delete":
+                        delete_test_method(root, method)
+                    else:
+                        mutate(
+                            root,
+                            "tests/scripts/test_check_release_binary_contract.py",
+                            f"    def {method}(",
+                            f"    def renamed_{method}(",
+                        )
+                    result = run_checker(root)
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    self.assertIn(
+                        "required mutation-test inventory",
+                        result.stdout + result.stderr,
+                    )
 
 
 if __name__ == "__main__":
