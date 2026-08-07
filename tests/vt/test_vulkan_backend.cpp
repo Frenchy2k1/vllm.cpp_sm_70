@@ -17,6 +17,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <limits>
@@ -826,6 +827,123 @@ TEST_CASE("greedy argmax tree-reduces the vocabulary and keeps the first-wins ti
     CHECK(run(l) == 10);
   }
 
+  vk.DestroyQueue(q);
+}
+
+TEST_CASE("VK-A2 batching records many dispatches per submit and stays byte-exact") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  // Asked, not re-derived. An earlier version of this gate recomputed the lever's
+  // default from the environment and asserted the WRONG branch as soon as the
+  // default flipped on -- it failed loudly, but a subtler duplication would just
+  // have gone vacuous.
+  const bool batching = ctx.batching_enabled();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // WHAT THIS ASSERTS IS THE MECHANISM, because the RESULTS cannot show it:
+  // batching runs the same kernels in the same order, so a batch that silently
+  // degrades to one dispatch per submit computes identical numbers and every
+  // value check still passes. Without a pending-count assertion this whole path
+  // could stop batching and no gate would notice -- the same failure shape the
+  // coopmat tactic needed PipelineExistsFor for.
+  constexpr int64_t kN = 4096;
+  constexpr int kOps = 6;
+
+  std::vector<float> a(kN, 1.5f), b(kN, 2.25f);
+  void* da = vk.Alloc(kN * sizeof(float));
+  void* db = vk.Alloc(kN * sizeof(float));
+  auto* dout = static_cast<float*>(vk.Alloc(kN * sizeof(float)));
+  vk.Copy(q, da, a.data(), a.size() * sizeof(float));
+  vk.Copy(q, db, b.data(), b.size() * sizeof(float));
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {kN});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {kN});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {kN});
+
+  // Issue several dependent ops with NO intervening host read, which is the only
+  // way a batch can accumulate.
+  for (int i = 0; i < kOps; ++i) vt::Add(q, to, ta, tb);
+  const uint32_t pending = ctx.pending_batch();
+  CAPTURE(pending);
+
+  if (batching) {
+    // More than one dispatch is in flight, i.e. the submit really was deferred.
+    CHECK(pending > 1u);
+  } else {
+    // Default build: every dispatch submitted and waited, so nothing is ever
+    // pending. This half keeps the assertion honest on the default path rather
+    // than making the test vacuous when the lever is off.
+    CHECK(pending == 0u);
+  }
+
+  // Flushing must make the writes visible to a plain host read -- Copy is a
+  // memcpy over mapped memory, so a missing flush shows up as stale bytes here.
+  std::vector<float> got(kN, 0.0f);
+  vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+  vk.Synchronize(q);
+  CHECK(ctx.pending_batch() == 0u);
+  for (int64_t i = 0; i < kN; i += 512) {
+    CAPTURE(i);
+    CHECK(got[static_cast<size_t>(i)] == doctest::Approx(3.75f));
+  }
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
+TEST_CASE("a REFERENCE-TIER op drains the batch before it touches device memory") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  if (!ctx.batching_enabled()) return;  // nothing is ever pending with the lever off
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // THE HAZARD THIS CLOSES, and why it needed its own gate. The portable
+  // reference tier runs a HOST kernel directly over device memory, which is only
+  // sound because this backend is unified. With batching, a dispatch may be
+  // recorded and NOT yet submitted, so that host kernel would read bytes the GPU
+  // has not written -- silently, with no error and no crash.
+  //
+  // The opt-125m STRICT gate passes with batching on, but it CANNOT prove this:
+  // OPT touches the reference tier only at setup, before any batch is open. So it
+  // would pass whether or not the hook exists. This asserts the hook FIRES.
+  constexpr int64_t kN = 1024;
+  std::vector<float> a(kN, 1.0f);
+  void* da = vk.Alloc(kN * sizeof(float));
+  void* db = vk.Alloc(kN * sizeof(float));
+  auto* dout = static_cast<float*>(vk.Alloc(kN * sizeof(float)));
+  vk.Copy(q, da, a.data(), a.size() * sizeof(float));
+  vk.Copy(q, db, a.data(), a.size() * sizeof(float));
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {kN});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {kN});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {kN});
+  for (int i = 0; i < 4; ++i) vt::Add(q, to, ta, tb);
+  REQUIRE(ctx.pending_batch() > 0u);  // a batch really is open
+
+  // Resolving a reference-tier op is what op_provider.cpp routes through
+  // Backend::FlushPending. kRopeNeox is the op this file already names as
+  // genuinely unimplemented natively on Vulkan.
+  REQUIRE(vt::ReferenceTierEligible(DeviceType::kVULKAN));
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kRopeNeox, DeviceType::kVULKAN));
+  void* ref = vt::GetOp(vt::OpId::kRopeNeox, DeviceType::kVULKAN);
+  CHECK(ref != nullptr);
+
+  // THE ASSERTION: resolving that host kernel drained the batch. Had FlushPending
+  // stayed the base class's no-op, this would still read > 0 and the host kernel
+  // would go on to read stale device memory.
+  CHECK(ctx.pending_batch() == 0u);
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
   vk.DestroyQueue(q);
 }
 
