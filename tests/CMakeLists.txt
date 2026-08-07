@@ -870,6 +870,8 @@ if(VLLM_CPP_TRITON)
     COMMAND test_ops_gdn
       "--test-case=CUDA gdn Triton AOT concurrent first load is safe across two queues")
 endif()
+vllm_cpp_add_test(test_ops_kda_recurrence vt/test_ops_kda_recurrence.cpp)
+target_include_directories(test_ops_kda_recurrence PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
