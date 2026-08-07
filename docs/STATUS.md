@@ -394,8 +394,8 @@ The correctness form and the full D0-D14 measured chronology live in
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
-Vulkan (16 native kernels, 71 on the CPU tier; opt-125m
-runs e2e token-exact;
+Vulkan (16 native kernels, 71 on CPU tier; opt-125m
+e2e token-exact, llvmpipe;
 [campaign](../.agents/specs/vulkan-full-support.md)), and the full tool-calling
 template surface. **Scale-out / distributed execution is scoped but unbuilt**
 (2026-07-28): the engine is single-GPU today — no NCCL / tensor-parallel /
