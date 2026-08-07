@@ -934,6 +934,188 @@ TEST_CASE("minimax_h3: DiT device-vs-host forward holds at the REAL head_dim=128
   }
 }
 
+// The DiT-forward REF2VA rung (goldens section 5c). Every other DiT-forward gate
+// runs the FL2VA layout (keyframe-cond prefix sharing the target frame grid, no
+// audio reference rows). The ref2va reference-row assembly -- image/video/audio
+// reference blocks PREPENDED with their OWN position grid, a separate audio update
+// mask, the pinned reference rows carrying the CONDITION timestep -- was never
+// forwarded through the DiT, which is exactly how the section 8.9 ref2va grid hid:
+// the pure-math layout was gated (goldens section 2) but nothing forwarded a
+// ref2va layout end-to-end. This case builds the SAME upstream ref2va layout with
+// BuildMiniMaxH3PackedSequenceRef2va, runs the host AND device DiT forward against
+// the RefDiT oracle, and asserts the reference rows are masked out and the target
+// rows spatially couple. It pins the port's ref2va packing and its DiT forward over
+// reference rows to upstream in one gate.
+TEST_CASE("minimax_h3: DiT-forward REF2VA rung matches upstream (reference rows, mixing)") {
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = weights->params;
+  vt::Queue q{Cpu(), nullptr};
+  const MiniMaxH3DitDeviceWeights staged = StageMiniMaxH3DitWeights(q, p, weights->views);
+
+  // (1) Reconstruct the reference blocks the generator emitted (kind: 0=image,
+  // 1=audio, 2=video_audio) and rebuild the identical ref2va layout.
+  std::vector<MiniMaxH3RefBlock> blocks(static_cast<size_t>(vllm_test::kH3Ref2vaDit_num_blocks));
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    blocks[i].kind = static_cast<MiniMaxH3RefBlock::Kind>(vllm_test::kH3Ref2vaDitBlockKinds[i]);
+    blocks[i].ref_audio_t = vllm_test::kH3Ref2vaDitBlockRefAudioT[i];
+    blocks[i].latent_t = vllm_test::kH3Ref2vaDitBlockLatentT[i];
+    blocks[i].latent_h = vllm_test::kH3Ref2vaDitBlockLatentH[i];
+    blocks[i].latent_w = vllm_test::kH3Ref2vaDitBlockLatentW[i];
+  }
+  const MiniMaxH3PackedSequence packed = vllm::BuildMiniMaxH3PackedSequenceRef2va(
+      vllm_test::kH3Ref2vaDit_text_len, vllm_test::kH3Ref2vaDit_latent_t,
+      vllm_test::kH3Ref2vaDit_latent_h, vllm_test::kH3Ref2vaDit_latent_w,
+      vllm_test::kH3Ref2vaDit_audio_t, blocks, vllm_test::kH3Ref2vaDit_audio_channel);
+
+  const int64_t seq_len = packed.seq_len;
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+  const int64_t video_width = p.video_row_width();
+  REQUIRE(seq_len == vllm_test::kH3Ref2vaDit_seq_len);
+  REQUIRE(num_img == vllm_test::kH3Ref2vaDit_num_img);
+  REQUIRE(num_audio == vllm_test::kH3Ref2vaDit_num_audio);
+  REQUIRE(num_text == vllm_test::kH3Ref2vaDit_num_text);
+
+  CheckI64(packed.cu_seqlens, vllm_test::kH3Ref2vaDitCuSeqlens,
+           std::size(vllm_test::kH3Ref2vaDitCuSeqlens));
+  CheckI64(packed.img_pos, vllm_test::kH3Ref2vaDitImgPos, std::size(vllm_test::kH3Ref2vaDitImgPos));
+  CheckI64(packed.audio_pos, vllm_test::kH3Ref2vaDitAudioPos,
+           std::size(vllm_test::kH3Ref2vaDitAudioPos));
+  CheckI64(packed.text_pos, vllm_test::kH3Ref2vaDitTextPos,
+           std::size(vllm_test::kH3Ref2vaDitTextPos));
+  CheckI64(packed.update_mask, vllm_test::kH3Ref2vaDitUpdateMask,
+           std::size(vllm_test::kH3Ref2vaDitUpdateMask));
+  CheckI64(packed.audio_update_mask, vllm_test::kH3Ref2vaDitAudioUpdateMask,
+           std::size(vllm_test::kH3Ref2vaDitAudioUpdateMask));
+  CheckI64(packed.token_tags, vllm_test::kH3Ref2vaDitTokenTags,
+           std::size(vllm_test::kH3Ref2vaDitTokenTags));
+  // The FP64 position grid over reference + target rows feeds RoPE; gate BIT-EXACT.
+  REQUIRE(packed.img_position_ids.size() == std::size(vllm_test::kH3Ref2vaDitImgPositionIds));
+  for (size_t i = 0; i < packed.img_position_ids.size(); ++i) {
+    CHECK(packed.img_position_ids[i] == vllm_test::kH3Ref2vaDitImgPositionIds[i]);
+  }
+
+  // (2) Build the DiT inputs: scatter the same rung-seeded random rows, and carry
+  // the ref2va audio_update_mask + the emitted timestep partition.
+  auto build_inputs = [&](std::vector<float>& x, std::vector<float>& audio_x,
+                          std::vector<float>& prompt, std::vector<float>& unique,
+                          std::vector<int64_t>& inverse, std::vector<int32_t>& refiner_cu,
+                          MiniMaxH3DitInputs& in) {
+    x.assign(static_cast<size_t>(seq_len * video_width), 0.0f);
+    const std::vector<float> vrows = MakeParam("ref2va_dit.r2v.video_rows", num_img * video_width, 1.0);
+    for (int64_t r = 0; r < num_img; ++r) {
+      std::memcpy(x.data() + packed.img_pos[static_cast<size_t>(r)] * video_width,
+                  vrows.data() + r * video_width, static_cast<size_t>(video_width) * sizeof(float));
+    }
+    audio_x.assign(static_cast<size_t>(seq_len * p.audio_latents_dim), 0.0f);
+    const std::vector<float> arows =
+        MakeParam("ref2va_dit.r2v.audio_rows", num_audio * p.audio_latents_dim, 1.0);
+    for (int64_t r = 0; r < num_audio; ++r) {
+      std::memcpy(audio_x.data() + packed.audio_pos[static_cast<size_t>(r)] * p.audio_latents_dim,
+                  arows.data() + r * p.audio_latents_dim,
+                  static_cast<size_t>(p.audio_latents_dim) * sizeof(float));
+    }
+    prompt = MakeParam("ref2va_dit.r2v.prompt_embeds", num_text * p.text_dim, 1.0);
+    unique.assign(vllm_test::kH3Ref2vaDitUniqueTimesteps,
+                  vllm_test::kH3Ref2vaDitUniqueTimesteps + std::size(vllm_test::kH3Ref2vaDitUniqueTimesteps));
+    inverse.assign(vllm_test::kH3Ref2vaDitInverseIndices,
+                   vllm_test::kH3Ref2vaDitInverseIndices + std::size(vllm_test::kH3Ref2vaDitInverseIndices));
+    refiner_cu = {0, static_cast<int32_t>(num_text), static_cast<int32_t>(num_text)};
+    in = MiniMaxH3DitInputs{};
+    in.seq_len = seq_len;
+    in.x = x.data();
+    in.audio_x = audio_x.data();
+    in.img_position_ids = packed.img_position_ids.data();
+    in.unique_timesteps = unique.data();
+    in.num_unique_timesteps = static_cast<int64_t>(unique.size());
+    in.inverse_indices = inverse.data();
+    in.token_tags = packed.token_tags.data();
+    in.prompt_embeds = prompt.data();
+    in.img_pos = packed.img_pos.data();
+    in.num_img_pos = num_img;
+    in.audio_pos = packed.audio_pos.data();
+    in.num_audio_pos = num_audio;
+    in.text_pos = packed.text_pos.data();
+    in.num_text_pos = num_text;
+    in.infer_out_pos = packed.img_pos.data();
+    in.num_infer_out_pos = num_img;
+    in.update_mask = packed.update_mask.data();
+    in.audio_update_mask = packed.audio_update_mask.data();
+    in.cu_seqlens = packed.cu_seqlens.data();
+    in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+    in.refiner_cu_seqlens = refiner_cu.data();
+    in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+  };
+
+  std::vector<float> x, audio_x, prompt, unique;
+  std::vector<int64_t> inverse;
+  std::vector<int32_t> refiner_cu;
+  MiniMaxH3DitInputs in;
+  build_inputs(x, audio_x, prompt, unique, inverse, refiner_cu, in);
+  REQUIRE(static_cast<int64_t>(unique.size()) == vllm_test::kH3Ref2vaDit_num_unique);
+
+  // (3) HOST + DEVICE forward vs the RefDiT oracle.
+  const MiniMaxH3DitOutputs host = MiniMaxH3DitForward(Cpu(), p, weights->views, in, vt::DType::kF32);
+  const double hv = MaxAbsDiff(host.video_logits, vllm_test::kH3Ref2vaDitVideoLogits, host.video_logits.size());
+  const double ha = MaxAbsDiff(host.audio_logits, vllm_test::kH3Ref2vaDitAudioLogits, host.audio_logits.size());
+  INFO("host: video max|diff| = " << hv << ", audio max|diff| = " << ha);
+  CHECK(hv <= 2e-5);
+  CHECK(ha <= 2e-5);
+
+  const MiniMaxH3DitOutputs dev = MiniMaxH3DitForwardDevice(q, p, staged.weights, in, vt::DType::kF32);
+  const double dv = MaxAbsDiff(dev.video_logits, vllm_test::kH3Ref2vaDitVideoLogits, dev.video_logits.size());
+  const double da = MaxAbsDiff(dev.audio_logits, vllm_test::kH3Ref2vaDitAudioLogits, dev.audio_logits.size());
+  INFO("device: video max|diff| = " << dv << ", audio max|diff| = " << da);
+  CHECK(dv <= 2e-5);
+  CHECK(da <= 2e-5);
+
+  // The pinned reference rows (video AND audio) must be masked to zero in the output.
+  for (int64_t r = 0; r < num_img; ++r) {
+    if (packed.update_mask[static_cast<size_t>(r)]) continue;
+    for (int64_t i = 0; i < video_width; ++i)
+      CHECK(host.video_logits[static_cast<size_t>(r * video_width + i)] == 0.0f);
+  }
+  for (int64_t r = 0; r < num_audio; ++r) {
+    if (packed.audio_update_mask[static_cast<size_t>(r)]) continue;
+    for (int64_t i = 0; i < p.audio_latents_dim; ++i)
+      CHECK(host.audio_logits[static_cast<size_t>(r * p.audio_latents_dim + i)] == 0.0f);
+  }
+
+  // (4) SPATIAL-MIXING probe: perturb the first video-TARGET token and require the
+  // response to match the oracle and to couple every other target token through the
+  // packed bidirectional attention (the property the section 8.9 grid lacked).
+  std::vector<float> xp, ap, pp, up;
+  std::vector<int64_t> ip;
+  std::vector<int32_t> rc;
+  MiniMaxH3DitInputs inp;
+  build_inputs(xp, ap, pp, up, ip, rc, inp);
+  const int64_t pert_pos = packed.img_pos[static_cast<size_t>(vllm_test::kH3Ref2vaDit_first_target)];
+  for (int64_t i = 0; i < video_width; ++i) xp[static_cast<size_t>(pert_pos * video_width + i)] += 1.0f;
+  const MiniMaxH3DitOutputs pert = MiniMaxH3DitForward(Cpu(), p, weights->views, inp, vt::DType::kF32);
+  std::vector<float> delta(static_cast<size_t>(num_img), 0.0f);
+  for (int64_t r = 0; r < num_img; ++r) {
+    float worst = 0.0f;
+    for (int64_t i = 0; i < video_width; ++i) {
+      const size_t idx = static_cast<size_t>(r * video_width + i);
+      worst = std::max(worst, std::abs(pert.video_logits[idx] - host.video_logits[idx]));
+    }
+    delta[static_cast<size_t>(r)] = worst;
+  }
+  CHECK(MaxAbsDiff(delta, vllm_test::kH3Ref2vaDitVideoMixDelta, delta.size()) <= 2e-5);
+  int64_t responded = 0, others = 0;
+  for (int64_t r = 0; r < num_img; ++r) {
+    if (!packed.update_mask[static_cast<size_t>(r)]) continue;
+    if (r == vllm_test::kH3Ref2vaDit_first_target) continue;
+    ++others;
+    if (delta[static_cast<size_t>(r)] > kLadderMixEps) ++responded;
+  }
+  const double frac = others > 0 ? static_cast<double>(responded) / static_cast<double>(others) : -1.0;
+  INFO("ref2va mix fraction port=" << frac << " oracle=" << vllm_test::kH3Ref2vaDitMixFraction[0]);
+  CHECK(frac == doctest::Approx(vllm_test::kH3Ref2vaDitMixFraction[0]).epsilon(1e-9));
+  CHECK(vllm_test::kH3Ref2vaDitMixFraction[0] >= 0.999);
+}
+
 // Brick H3-2b. The DEVICE-RESIDENT forward runs the same graph with every
 // activation in device memory. It is NOT bit-identical to the CPU reference and
 // does not claim to be -- it reuses the tuned SHARED vt:: ops (vt::RmsNorm reduces
@@ -2740,6 +2922,29 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
     CHECK(blocks[0].latent_t >= 1);
     REQUIRE(!ref_rows.empty());
 
+    // INVARIANT (RED-first, the spec section 8.9 ref2va-grid root cause): the
+    // encoded reference row COUNT must equal exactly what the packed layout
+    // allocates for the reference span. MiniMaxH3EncodeReferenceImages returns the
+    // RAW VAE-latent grid in its block; BuildMiniMaxH3PackedSequenceRef2va (mirroring
+    // upstream) applies the DiT [1,2,2] patch division itself. If the encode
+    // PRE-divides (the bug that shipped the grid), the layout under-allocates the
+    // reference by patch_h*patch_w and the denoise loop silently truncates the
+    // pinned reference to its first quarter -- coherence-destroying but non-throwing,
+    // because keyframe_cond_rows is then LONGER than the layout and passes the
+    // pin-loop's `>=` check. Nothing else in the suite couples encoded-rows to
+    // layout-rows: the section-2 layout gate hand-builds unpatched blocks, and the
+    // denoise round-trip below only checks finiteness + motion. This is the coupling.
+    const vllm::MiniMaxH3PackedSequence ref_layout =
+        vllm::BuildMiniMaxH3PackedSequenceRef2va(req.text_len, req.latent_t, req.latent_h,
+                                                 req.latent_w, req.audio_t, blocks,
+                                                 req.audio_channel);
+    int64_t layout_ref_rows = 0;
+    for (const uint8_t upd : ref_layout.update_mask) layout_ref_rows += (upd == 0 ? 1 : 0);
+    const int64_t block_grid_rows =
+        (blocks[0].latent_h / p.patch_size_h) * (blocks[0].latent_w / p.patch_size_w);
+    CHECK(layout_ref_rows == block_grid_rows);
+    CHECK(layout_ref_rows * p.video_row_width() == static_cast<int64_t>(ref_rows.size()));
+
     const int64_t frame_rows = (req.latent_h / p.patch_size_h) * (req.latent_w / p.patch_size_w);
     const std::vector<float> prompt = MakeParam("ref2va.prompt", req.text_len * p.text_dim, 0.2);
     const std::vector<float> nv =
@@ -2813,6 +3018,18 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
         vllm::MiniMaxH3EncodeReferenceImages(ecfg, ew, p, {image}, IH, IW, &iblocks);
     REQUIRE(iblocks.size() == 1);
     CHECK(vrows.size() > irows.size());
+
+    // Same encoded-vs-layout row-count invariant as the image path (section 8.9):
+    // the RAW-latent block dims the video encode emits must produce a layout whose
+    // reference span holds exactly the encoded rows. A patch-pre-division here would
+    // silently truncate the pinned video reference, so pin it in the suite too.
+    {
+      const vllm::MiniMaxH3PackedSequence vlayout = vllm::BuildMiniMaxH3PackedSequenceRef2va(
+          4, 2, 4, 4, 4, {vb}, 2);
+      int64_t vref_rows = 0;
+      for (const uint8_t upd : vlayout.update_mask) vref_rows += (upd == 0 ? 1 : 0);
+      CHECK(vref_rows * p.video_row_width() == static_cast<int64_t>(vrows.size()));
+    }
 
     vllm::MiniMaxH3T2vaRequest req;
     req.text_len = 4;
