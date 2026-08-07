@@ -87,6 +87,16 @@ if(VLLM_CPP_VULKAN)
   target_link_libraries(vulkan-gemm-ab PRIVATE vllm::vllm)
   target_include_directories(vulkan-gemm-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
   vllm_cpp_set_warnings(vulkan-gemm-ab)
+
+  # vulkan-dispatch-floor: the VK-A2 sizing measurement. Sweeps ONE op across a
+  # 65,536x range of element counts to separate per-dispatch overhead from real
+  # kernel cost -- two causes that produce an identical wall clock but imply
+  # opposite fixes. Same Vulkan-only condition, same reason.
+  add_executable(vulkan-dispatch-floor
+                 ${CMAKE_SOURCE_DIR}/benchmarks/vulkan_dispatch_floor.cpp)
+  target_link_libraries(vulkan-dispatch-floor PRIVATE vllm::vllm)
+  target_include_directories(vulkan-dispatch-floor PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  vllm_cpp_set_warnings(vulkan-dispatch-floor)
 endif()
 
 # parakeet-transcribe: the ASR driver — real WAV, real pretrained

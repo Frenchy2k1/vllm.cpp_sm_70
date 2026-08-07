@@ -487,7 +487,12 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   const uint32_t logits_off = bind.AddU32Only(logits, "argmax: logits");
   const uint32_t out_off = bind.AddU32Only(token_ids, "argmax: token_ids");
   ArgmaxParams p{static_cast<uint32_t>(n), static_cast<uint32_t>(v), logits_off, out_off};
-  Go("vt_greedy_argmax", bind, p, FlatGroupCount(n));
+  // ONE WORKGROUP PER ROW, matching vt_rms_norm's convention -- the shader
+  // tree-reduces the vocabulary across the workgroup's lanes. NOT
+  // FlatGroupCount(n), which would allot one INVOCATION per row and leave the
+  // vocabulary scan serial; at decode n is 1, so that dispatched a single lane
+  // and measured 10.03 ms per call.
+  Go("vt_greedy_argmax", bind, p, static_cast<uint32_t>(n));
 }
 
 // cpu_paged_attn.cpp:52-171 PagedAttentionKernel. ONE WORKGROUP per (query
