@@ -15123,3 +15123,41 @@ directly, and a `VT_VULKAN_COOPMAT=0` A/B isolates (2). None of that was run her
 **Lesson, recorded because it recurs:** "we know why it is slow" is a claim like
 any other. The op-coverage number (16/87) made the CPU-tier story feel obvious
 enough to write down without checking `top`, and it was wrong.
+
+#### ATTRIBUTION MEASURED: per-op synchronous dispatch, not compute and not the CPU tier
+
+The previous note left the cause "UNMEASURED". It is now measured, and it is
+candidate (1).
+
+**Method.** `gdb -p` stack samples of the main thread plus `/proc/<pid>/status`
+context-switch deltas, taken on the live run (Qwen3-0.6B, 1 prompt / 32 in /
+8 out, ~34 min elapsed at sampling).
+
+| evidence | value |
+|---|---|
+| stack samples in `poll()` inside `VulkanContext::Dispatch` | **6 of 6** |
+| call path | `LLMEngine::step` → `GPUModelRunner::execute_model` → `Qwen3DenseModel::ForwardDevice` → `ForwardLayers` → `MatmulGeneric<true>` → `Go<…>` → `Dispatch` → NVIDIA driver `poll()` |
+| voluntary context switches | 202,770 → 203,730 in 10 s = **~96 blocking waits/s** |
+| process CPU | 1.6 % |
+
+**Arithmetic that makes it unambiguous.** Qwen3-0.6B is ~0.6 B params, so ~1.2
+GFLOP per token position; 40 positions plus lm_head is roughly **48-60 GFLOP**. Our
+NAIVE scalar Vulkan GEMM was measured at **52 GFLOP/s** on Thor. Even entirely on
+the slow kernel the compute is **~1-2 SECONDS**. Wall clock was ~34 minutes, so
+**>99 % of the time is dispatch round-trip latency, not arithmetic.**
+
+**Mechanism.** `VulkanContext::Dispatch` records a command buffer, submits it and
+FENCE-WAITS, for EVERY op — the W0 skeleton's documented "correct, not fast"
+design. At ~96 waits/s the model's per-token dispatch count turns into minutes.
+The GPU's reported 96 % "utilisation" is the driver context being resident while
+we poll, NOT compute saturation; on Tegra/GB10 that counter cannot distinguish the
+two, which is precisely why it misled the first attribution.
+
+**This retires the "71 of 87 ops on the CPU tier" explanation for THIS workload.**
+Op coverage is a real limitation, but it is not what makes the e2e run slow here.
+
+**Consequence for the roadmap.** `VK-A2` (async submission + command-buffer reuse,
+`SupportsGraphCapture()` via a pre-recorded `VkCommandBuffer`) was scoped in the
+campaign spec as "the single biggest speed lever" and deferred. It is now the
+MEASURED bottleneck, and it outranks further native-kernel work for anything
+end-to-end: more native ops would each still pay a ~10 ms round trip.
