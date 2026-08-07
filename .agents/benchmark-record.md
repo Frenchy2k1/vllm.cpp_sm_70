@@ -15754,3 +15754,59 @@ direction.
 These ops do essentially no work. Abandoning the fusion lever was right, and this
 is the measurement that proves it instead of inferring it.
 
+### Host-side orchestration: the descriptor ring was capping batches — 1.51x (2026-08-07, GB10)
+
+`VK-A2` moved the bottleneck off the GPU (busy 26%). This is the first host-side
+lever, and it was found by profiling rather than guessing.
+
+**FIRST, A MISATTRIBUTION AVOIDED.** `perf record` put **62.87% of on-CPU time in
+`vt::cpu::Threadpool::ThreadReady`** — which looks damning on a Vulkan run. It is
+llama.cpp's `ggml_graph_compute_poll_for_work` ported 1:1: a `1024*128*poll`
+busy-wait, `poll=50`, across `hardware_concurrency` (20) threads. So it is IDLE
+SPIN, and `perf` samples on-CPU time, which a spinning thread dominates while
+contributing nothing.
+
+Tested rather than assumed, with `VLLM_CPP_CPU_THREADS=1` (19 fewer spinners), 8
+interleaved pairs: **4/8, 1.018x — a wash.** A profile percentage is not an
+attribution. It did, however, drown everything else, so the real profile needed
+the spin suppressed.
+
+**THE REAL HOST PROFILE**, `VLLM_CPP_CPU_THREADS=1`, by shared object:
+
+| | share |
+|---|---:|
+| `[kernel.kallsyms]` | **40.5%** |
+| `[nvidia]` | **21.9%** |
+| `libc` | 15.2% |
+| **our own code** | **13.7%** |
+| `libnvidia-eglcore`, `libstdc++`, rest | 7.0% |
+
+**62% of host time is kernel plus driver; only 14% is ours.** So the host cost is
+submissions and syscalls, not our C++ logic.
+
+**THE CAUSE: `kDescriptorRing = 16` was the batch-length limiter, not `kMaxBatch`.**
+Observed flushes were 40-46 dispatches against a cap of 128. `vt_rms_norm` runs
+**112 times per forward pass** (4 per layer x 28 layers), so it exhausted a 16-deep
+ring **seven times per pass** and forced a submit each time. Every forced flush is
+a `vkQueueSubmit` plus a blocking `vkWaitForFences`.
+
+Ring 16 -> 128 (and `kMaxBatch` 128 -> 512). Batches now reach **368 dispatches —
+an entire forward pass in ONE submit.**
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_RING` the only variable, one binary:**
+
+| | ring 128 | ring 16 |
+|---|---:|---:|
+| decode tok/s (median) | **87.3** | 57.7 |
+| per-pair ratios | 1.44 1.47 1.49 1.50 1.52 1.58 1.62 1.63 | |
+| result | **1.51x, 8 of 8 pairs** | |
+
+The ring depth was made a RUNTIME value first, so both arms run in one binary —
+a cross-build comparison is what produced a false 1.2x for the subgroup tactic
+earlier today.
+
+**Decode is now 87.3 tok/s: 48% of the 182 tok/s bandwidth roof, and 1.84x off
+llama.cpp's 160.9 — from ~19x at the start of the session, 10.2x overall.**
+
+opt-125m STRICT 6/6 token-exact; `test_vulkan_backend` 17/17.
+
