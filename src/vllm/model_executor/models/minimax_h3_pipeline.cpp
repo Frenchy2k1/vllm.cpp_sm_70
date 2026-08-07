@@ -110,12 +110,16 @@ std::vector<float> MiniMaxH3EncodeReferenceVideo(
   if (out_block != nullptr) {
     // kVideoAudio is the only kind that carries a temporal extent -- kImage counts
     // exactly one frame regardless of latent_t. ref_audio_t stays 0: silent.
+    // Dims are the RAW VAE latent (t, h, w). BuildMiniMaxH3PackedSequenceRef2va
+    // applies the DiT [1,2,2] patch division ITSELF (it mirrors upstream
+    // minimax_h3_packed_sequence_ref2va_blocks, which takes the unpatched latent and
+    // divides by _PATCH_{H,W} once) -- pre-dividing here would double-count the patch.
     MiniMaxH3RefBlock b;
     b.kind = MiniMaxH3RefBlock::Kind::kVideoAudio;
     b.ref_audio_t = 0;
-    b.latent_t = ls.t / dit_params.patch_size_t;
-    b.latent_h = ls.h / dit_params.patch_size_h;
-    b.latent_w = ls.w / dit_params.patch_size_w;
+    b.latent_t = ls.t;
+    b.latent_h = ls.h;
+    b.latent_w = ls.w;
     *out_block = b;
   }
   return rows;
@@ -185,12 +189,22 @@ std::vector<float> MiniMaxH3EncodeReferenceImages(
         dit_params.patch_size_h, dit_params.patch_size_w);
     rows.insert(rows.end(), patched.begin(), patched.end());
     if (out_blocks != nullptr) {
-      // The block declares the PATCHED grid, which is what occupies packed rows.
+      // The block declares the RAW VAE-latent grid (t, h, w).
+      // BuildMiniMaxH3PackedSequenceRef2va applies the DiT [1,2,2] patch division
+      // ITSELF, mirroring upstream minimax_h3_packed_sequence_ref2va_blocks, which
+      // takes the unpatched latent and divides by _PATCH_{H,W} once
+      // (pipeline_minimax_h3.py:1141-1145 sets visual_shape = (1, height//16,
+      // width//16), the RAW latent, NOT the patched grid). Pre-dividing here
+      // double-counted the patch: it under-allocated the reference rows by
+      // patch_h*patch_w (=4), silently truncating the pinned reference to its first
+      // quarter and positioning it on a shrunken grid -- the ref2va patch grid
+      // (spec section 8.9). The encoded row COUNT is invariant-gated in
+      // test_minimax_h3.cpp so this convention cannot silently drift again.
       MiniMaxH3RefBlock b;
       b.kind = MiniMaxH3RefBlock::Kind::kImage;
-      b.latent_t = ls.t / dit_params.patch_size_t;
-      b.latent_h = ls.h / dit_params.patch_size_h;
-      b.latent_w = ls.w / dit_params.patch_size_w;
+      b.latent_t = ls.t;
+      b.latent_h = ls.h;
+      b.latent_w = ls.w;
       out_blocks->push_back(b);
     }
   }

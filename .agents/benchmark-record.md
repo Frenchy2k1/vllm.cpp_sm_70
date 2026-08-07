@@ -14362,3 +14362,41 @@ rows. So the residual is the **ref2va reference-row conditioning ASSEMBLY**
 noised-anchor layout + how the denoise loop conditions the un-pinned target rows), NOT the prompt and
 NOT the DiT forward. Next diagnostic: dump the ref2va target-row VAE-input adjacency-cosine (like #77's
 0.95 for coherent fl2va) to confirm the target rows are white, and A/B the reference-row condition-noise.
+
+## MiniMax-H3 ref2va ASSEMBLY fix + grid RE-ATTRIBUTED to the NVFP4 checkpoint (`row/H3-REF2VA-ASSEMBLY` PR #93, 2026-08-07, dgx sm_121a)
+
+Followed §8.9's residual (ref2va reference-row assembly), diffed it vs upstream, fixed a real bug,
+gated it, re-rendered — and the render DISPROVED the §8.9 attribution.
+
+**Real bug fixed.** `MiniMaxH3EncodeReferenceImages`/`Video` emitted PATCHED ref-block dims
+(`ls.h/patch_size_h`); `BuildMiniMaxH3PackedSequenceRef2va` divides `block.latent_h/kPatchH` AGAIN
+(mirroring upstream `packed_sequence.py:328-330`, which takes the UNPATCHED latent; upstream feeds the
+raw latent `visual_shape=(1,height//16,width//16)`, `pipeline_minimax_h3.py:1141-1145`). Double-division
+under-allocated the reference span by patch_h*patch_w (=4); the denoise pin-loop `>=` check silently
+TRUNCATED the oversized encoded reference to its first quarter. Fix = emit raw `ls.{t,h,w}`.
+
+**Gates.** goldens section 5c (ref2va-shaped DiT-forward rung: image + video+audio ref blocks, 8×8
+geometry, ref2va timestep partition + audio update mask, RefDiT) → C++ case "DiT-forward REF2VA rung
+matches upstream (reference rows, mixing)"; RED-first encoded-vs-layout row-count invariant
+(reintroducing the bug fails 128==512 = 16 encoded vs 4 allocated; restored green). Suite 69/69, 52377
+assertions. Goldens regen purely additive (635 inserts, 0 deletes).
+
+**GB10 render A/B + ISOLATION (256×256/22f/12steps, fixed incremental binary).**
+
+| Render | Checkpoint | Quant | Assembly | Result |
+|---|---|---|---|---|
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | fp4-resident | full | GRID |
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | bf16 dequant | full | GRID (fp4 eliminated) |
+| t2va (no refs, no cond-image, `--partition fl2va`) | ref2va NVFP4 | bf16 dequant | NONE | GRID (assembly eliminated) |
+| fl2va (keyframe + `--cond-image`) | FL2VA GGUF | bf16 | keyframe | COHERENT (cat→windowsill; no regression) |
+
+**Re-attribution (corrects §8.9 + §8.6).** The grid is NOT the ref2va assembly and NOT fp4 — it appears
+with the ENTIRE reference assembly removed, in both fp4 and bf16. It correlates 1:1 with the ref2va
+NVFP4 CHECKPOINT: every render loading `minimax_h3_ref2va_nvfp4_full` grids; every FL2VA-GGUF render is
+coherent. §8.9's A/B varied only the prompt, §8.6's only the task — neither varied the checkpoint/quant,
+so both misattributed a checkpoint/loader defect. True residual = the NVFP4 DiT loader for this file
+(`StreamMiniMaxH3Nvfp4ToDeviceBf16/Fp4`): suspect fp32-island preservation (patch/time/output layers,
+`minimax_h3_transformer.py:898-904`), `weight_scale_2` double-dequant, or the 1051-tensor name mapping.
+Synthetic-NVFP4 gates proved the dequant MATH byte-exact but never loaded THIS file vs a coherent oracle.
+Next: a REF2VA GGUF (bf16, known-good loader) as checkpoint oracle — dgx-disk-blocked (23 GiB free).
+Artifacts `~/h3fp4/out_{vs_ref2va,bf16_ref2va,t2va_nvfp4,vs_fl2va}.mp4`.
