@@ -1,0 +1,121 @@
+# ONE SURFACE — every capability ships through the C ABI
+
+Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE, remediation NOT started.**
+
+## The defect
+
+`include/vllm.h` (`VLLM_ABI_VERSION 10`, 19 symbols) exposes **text completion and
+chat only**: `vllm_engine_load/free`, `vllm_complete{,_stream}`, `vllm_chat{,_stream}`,
+`vllm_request_*`, `vllm_sampling_params_default`, `vllm_model_params_default`,
+`vllm_abi_version`, `vllm_version`, `vllm_last_error`, `vllm_string_free`,
+`vllm_completion_free`.
+
+Everything else this project can do lives in `examples/`, where no embedder can
+reach it. Found when LocalAI's `vllm-cpp` backend, which `dlopen`s this ABI, needed
+video generation: the capability was complete, gated and shipping, and from the
+outside it did not exist.
+
+## Audit — this is NOT only video
+
+None of these four architectures appear in `model_registry.cpp`, so none is
+reachable through `vllm_engine_load`:
+
+| capability | only reachable via | example size |
+|---|---|---|
+| MiniMax-H3 video+audio generation | `examples/minimax_h3_gen`, `examples/server` `/v1/videos` | 415 lines |
+| Laguna | `examples/laguna_gen` | 415 lines |
+| Kimi-Linear | `examples/kimi_linear_gen` (owns forward logic) | 288 lines |
+| DeepSeek-V4 | `examples/deepseek_v4_gen` | 240 lines |
+
+`examples/server/main.cpp` also carries 54 direct `MiniMaxH3` references, i.e. it
+re-implements wiring rather than consuming a library entry point. So HTTP and FFI
+can drift, and have.
+
+Three of these own real generation logic, not just argv parsing:
+`kimi_linear_gen`, `minimax_h3_gen`, `server` all reference `DenoiseLoop` /
+`GenerateT2va` / `ForwardDevice` directly.
+
+## Why the gates never caught it
+
+Every one of these paths is well tested. `test_minimax_h3` alone runs 75 cases and
+55,000+ assertions. **No gate asks whether a CONSUMER can reach a capability**, so a
+second-class path stays green forever. That is the hole this row closes.
+
+## Target state
+
+llama.cpp is the model: a library of reusable pieces callable from anywhere, with
+`llama-cli` / `llama-server` as consumers rather than privileged holders of
+behaviour.
+
+1. Each capability gets a C ABI entry point, appended so zero values preserve
+   existing behaviour, `VLLM_ABI_VERSION` bumped, `vllm_abi_version()` truthful.
+2. The library does the work. `src/vllm/` still spawns NOTHING — the ratified
+   ffmpeg boundary stands: the library produces artifacts and argv, the caller
+   invokes.
+3. `examples/` is REFACTORED onto the entry point. Two implementations of one
+   capability is the defect, not the fix.
+4. `examples/server` routes through the SAME entry point, so HTTP and FFI cannot
+   drift.
+
+## Proposed ABI shape for video (first slice)
+
+Mirrors the existing engine idiom: an opaque handle, a params struct with a
+`_default()`, an explicit free, `vllm_last_error` for diagnosis.
+
+```c
+typedef struct vllm_video_engine vllm_video_engine;
+
+typedef struct {                  /* all paths; empty means "not supplied" */
+  const char* dit_path;           /* GGUF or sharded dir */
+  const char* encoder_path;       /* GGUF or sharded dir */
+  const char* tokenizer_path;
+  const char* video_vae_path;     const char* video_vae_config_path;
+  const char* audio_vae_path;     const char* audio_vae_config_path;
+  int32_t device;                 /* 0 cpu, 1 cuda */
+  int32_t dequant_bf16;           /* 0 keep-quant, 1 stream bf16 */
+} vllm_video_model_params;
+
+typedef struct {
+  const char* prompt;
+  int32_t width, height, num_frames, steps;
+  uint64_t seed; int32_t has_seed;
+  const char* first_frame;  const char* last_frame;   /* fl2va keyframes */
+  const char* ref_image;    const char* ref_video;    /* ref2va */
+  const char* ref_audio;
+  float noise_aug;
+} vllm_video_params;
+
+typedef struct {                  /* the library WRITES these, spawns nothing */
+  const char* frame_dir;          /* frame_%06d.ppm */
+  const char* audio_path;         /* 16-bit PCM WAV */
+  int32_t frame_count, width, height, fps, sample_rate;
+  const char* const* mux_argv;    /* argv the CALLER may exec (ffmpeg) */
+  int32_t mux_argc;
+} vllm_video_result;
+```
+
+`mux_argv` is what keeps the ffmpeg boundary intact while still letting an
+embedder produce an MP4 without reinventing the command: the library composes it
+(`MiniMaxH3BuildMp4MuxArgs` already does exactly this), the caller executes it.
+
+## Order of work
+
+1. **This row**: the T0 directive in `AGENTS.md` + `.agents/directives.md`, and this
+   audit. Documentation only.
+2. **Video ABI slice**: the entry points above, `minimax_h3_gen` refactored onto
+   them, `examples/server` `/v1/videos` routed through them, ABI bumped to 11.
+3. **A GATE** so this cannot regress: a check that every capability named in
+   `docs/FEATURES.md` as supported has an ABI path, or is explicitly listed as
+   embedder-unreachable with a reason. Without this, the directive is a note.
+   **Operator-directed 2026-08-07: the gate runs in `scripts/agent-preflight.sh`
+   — before every commit/push — as well as in CI.** Same for the
+   include-boundary companion check (examples/* may include only the public
+   exported headers). Being CI-only would let a whole session build on an
+   unreachable capability before the first PR run says no.
+4. The remaining three (Laguna, Kimi-Linear, DeepSeek-V4), which most likely want
+   registry entries rather than bespoke entry points.
+
+## NOT claimed
+
+No ABI work has been done. The shape above is a proposal, not an implementation,
+and it has not been reviewed against an embedder other than LocalAI.

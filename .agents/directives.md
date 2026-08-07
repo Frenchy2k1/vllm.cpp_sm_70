@@ -506,3 +506,46 @@ derived metric), and verify the reference's rationale actually applies to YOUR m
 situation before you build the fix. Full method:
 [.agents/parity-lever-protocol.md](parity-lever-protocol.md) § The STRUCTURAL lens.
 
+## Standing directive — ONE SURFACE: every capability ships through the C ABI
+
+**A capability is DONE when `include/vllm.h` exposes it, not when an example can
+do it.**
+
+`examples/` and `examples/server` are THIN CLIENTS over the same library entry
+points an external embedder receives. They may own argv parsing, process spawning
+(the ratified ffmpeg boundary), file writing and printing. They may NOT own
+generation logic that has no ABI path, because anything that lives only there is
+unreachable to every embedder.
+
+### Why this is T0
+
+Video generation shipped end to end through `examples/minimax_h3_gen` and the
+server's `/v1/videos` routes, gated to hundreds of assertions, while
+`VLLM_ABI_VERSION` stayed at 10 with 18 text-only symbols and zero video entry
+points. LocalAI's `vllm-cpp` backend `dlopen`s exactly that ABI. So a capability
+this project had fully built and tested was, from an embedder's view, absent. The
+tests were green the whole time: no gate asks "can a consumer reach this?"
+
+llama.cpp is the model. Its library is a set of reusable pieces callable from
+anywhere; `llama-cli` and `llama-server` are consumers of that library, not
+privileged holders of behaviour.
+
+### What this requires of a new capability
+
+1. A C ABI entry point in `include/vllm.h`, appended so zero values preserve
+   existing behaviour, with `VLLM_ABI_VERSION` bumped and `vllm_abi_version()`
+   truthful.
+2. The library doing the work, with `src/vllm/` still spawning NOTHING (the
+   ffmpeg boundary stands: the library produces artifacts and argv, the caller
+   invokes).
+3. `examples/` REFACTORED onto that entry point rather than keeping a parallel
+   implementation. Two code paths for one capability is the defect this directive
+   exists to prevent.
+4. `examples/server` routed through the same entry point, so HTTP and FFI cannot
+   drift.
+
+### The check to apply before calling a capability done
+
+Ask: *could someone who only has `libvllm` and `vllm.h` do this?* If the honest
+answer is "no, they would have to shell out to our example binary", it is not
+done.

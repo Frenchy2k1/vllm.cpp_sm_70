@@ -58,6 +58,17 @@ version, this list is the reminder.
   mirror it including all its modes. Never ask the user how a feature should
   behave, only genuine product/scope calls.
   ([full](.agents/directives.md#standing-directive--mirror-vllm-across-all-features-dont-ask-mirror))
+- **ONE SURFACE: every capability ships through the C ABI.** A capability is not
+  done when an example can do it, it is done when `include/vllm.h` can. Examples
+  and `examples/server` are THIN CLIENTS of the same library entry points an
+  embedder gets: they may parse argv, spawn ffmpeg and print, and they may not own
+  logic that has no ABI path. The failure this prevents actually happened: video
+  generation worked end to end through `minimax-h3-gen` and `/v1/videos` for weeks
+  while the ABI stayed text-only (v10, 18 symbols, zero video), so LocalAI's
+  backend, which `dlopen`s that ABI, could not reach it at all. llama.cpp is the
+  model to follow: reusable library pieces, callable from anywhere, with the
+  binaries as consumers rather than as the only door.
+  ([full](.agents/directives.md#standing-directive--one-surface-every-capability-ships-through-the-c-abi))
 - **Ground every check in the whole execution chain**, not just the vLLM repo:
   flashinfer, cutlass, cuBLASLt, DeepGEMM, torch/Inductor. Cite `file:line` on
   both sides. Never declare a lever unreachable without dumping the generated
