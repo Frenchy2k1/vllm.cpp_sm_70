@@ -195,7 +195,10 @@ H3 seam. That violated the already-landed accelerator seam and raised the DSR
 exactly 0=CPU / 1=CUDA, maps it once through `MiniMaxH3VideoDeviceType`, and
 creates one queue through `GetBackend(device_type)`; the queue's device is then
 the engine device. The DSR gate is RED-first (34 vs baseline 32), then GREEN at
-32 with no baseline or allowlist change; all 25 checker mutations pass. The
-fold/unit/CPU build is explicitly pending in GitHub CI because the shared local
-filesystem reached 100% during the from-scratch build and the operator stopped
-this helper's build to protect unrelated work.
+32 with no baseline or allowlist change; all 25 checker mutations pass. Review
+also mutation-gates the operational contract through the real load path: a
+counting CUDA backend returns a distinctive CPU:7 queue, and the loaded engine
+must report that exact device after exactly one `CreateQueue` call. The original
+second-queue mutation was false-GREEN at 5/135, then RED at `2 == 1`; deleting
+the queue-device reuse is independently RED. The final CPU fold target is GREEN
+at 6 cases / 137 assertions in the isolated `/dev/shm` build.

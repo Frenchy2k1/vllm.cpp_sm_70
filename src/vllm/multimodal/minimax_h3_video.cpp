@@ -274,6 +274,7 @@ MiniMaxH3VideoEngine::MiniMaxH3VideoEngine(MiniMaxH3VideoEngine&&) noexcept = de
 MiniMaxH3VideoEngine& MiniMaxH3VideoEngine::operator=(MiniMaxH3VideoEngine&&) noexcept = default;
 MiniMaxH3VideoEngine::~MiniMaxH3VideoEngine() = default;
 
+vt::Device MiniMaxH3VideoEngine::device() const { return impl_->device; }
 bool MiniMaxH3VideoEngine::has_encoder() const { return impl_->has_encoder; }
 bool MiniMaxH3VideoEngine::has_prompt_embeds() const { return !impl_->prompt_embeds.empty(); }
 
