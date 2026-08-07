@@ -101,6 +101,7 @@ class CommittedArtifact(unittest.TestCase):
     SPECIALIZED = {
         "vt_cast": "src and dst dtype",
         "vt_matmul": "a/b/out dtype plus the b orientation",
+        "vt_matmul_coopmat": "the b orientation and the output dtype",
         "vt_embedding": "table/out dtype plus the id width",
         "vt_paged_attn": "query/k-cache/v-cache/out dtype",
         "vt_reshape_and_cache": "the 32- vs 16-bit copy width",

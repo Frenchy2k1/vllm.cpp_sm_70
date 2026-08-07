@@ -40773,3 +40773,61 @@ sensitivity. Clean-reference disambiguation blocked (bf16 132GiB = OOM on 1 GB10
 = 23G-disk-blocked); path forward = an official modelopt-NVFP4 ckpt. fp4-resident Marlin arm's separate
 grid untouched (wiring-gated-only). Diagnostic hooks landed byte-inert. Records: spec §8.12 + §8.2 row,
 STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
+- **2026-08-07 (later)** — **`VK-C`: cooperative-matrix GEMM tactic, VERIFIED ON
+  GB10 (`CLAIM-VULKAN-FULL-1`, row `BACKEND-VULKAN`).**
+
+  ```
+  NVIDIA GB10:  coopmat bf16xbf16->f32 16x16x16 SUBGROUP: YES, subgroup size 32
+                bf16 GEMM tactic: COOPMAT
+                bf16 GEMM NMSE vs the f32 oracle: 0.000000
+                test_vulkan_backend 12/12, 491 assertions
+  llvmpipe:     coopmat: no -> tactic: scalar, coopmat module NEVER BUILT
+  ```
+
+  **The shape was dictated by hardware, not chosen.** Probing GB10 first returned
+  11 configurations, ALL SUBGROUP scope: f16->f16 and f16->f32 at 16x16x16 /
+  16x8x16 / 16x8x8, u8/s8->u32/s32 at 16x16x32 / 16x8x32, and **16x16x16
+  bf16/bf16/f32/f32** — our model dtype with our f32-accumulate contract. Vulkan
+  matches configurations EXACTLY (no nearest-fit), so the shader is written to
+  that one tuple and the host predicate asks for it and nothing else.
+
+  **★ THE GATE THAT ALMOST WASN'T.** The pre-existing cross-device GEMM case uses
+  **f32** operands, and the tactic requires bf16 — so it passed on GB10 while
+  exercising the coopmat path NOT AT ALL. Numbers alone can never distinguish a
+  working tactic from a silent fallback, because the scalar kernel is equally
+  correct. `VulkanContext::PipelineExistsFor(module)` was added for this, and the
+  load-bearing assertion is the TACTIC, not the NMSE: coopmat where the device
+  has it, scalar where it does not, and on llvmpipe the coopmat module asserted
+  never built (selecting it there would fail at pipeline creation). Same failure
+  shape as the op-provider decline counters, and it would have read as success.
+
+  NMSE 0.0 is expected rather than suspicious: the test inputs are exactly
+  representable in bf16, so the products are exact and f32 accumulation of 32
+  terms has nothing to round — which isolates the TILE ORDERING as the thing under
+  test rather than input narrowing.
+
+  **Two traps avoided because they were already on record.** The workgroup size is
+  a LITERAL 32, not `local_size_x_id` (that spelling emits `LocalSize 1 1 1` at
+  vulkan1.1 — the trap measured earlier in this campaign), so the SPIR-V is
+  compiled FOR subgroup 32 and the host refuses the tactic otherwise. And the
+  result is ALWAYS spilled through shared memory: a direct `coopMatStore` would
+  target the uint32 view this backend binds, i.e. store a `coopmat<float>` through
+  a uint pointer, which **glslang accepts without complaint** — and no
+  CI-reachable device can execute a coopmat shader, so it would never have
+  surfaced. A direct-store fast path is a legitimate later refinement, but it is a
+  SPEED change and belongs behind a hardware A/B.
+
+  **Selection is four HARD requirements**, each a fallback to the always-correct
+  scalar kernel: exact configuration reported; subgroup size 32; BOTH operands
+  bf16 (every configuration takes bf16/f16/int8, so f32 can never use this path —
+  hardware, not policy); and K % 16 == 0, because a ragged K tail cannot be masked
+  inside a cooperative-matrix load and truncating it would silently drop
+  dot-product terms. Ragged M and N are fine — the store is bounds-checked, and
+  the gate uses M=20, N=12 to exercise exactly that.
+
+  **NO SPEED NUMBER.** The tactic is correct and it engages; whether it is FASTER
+  than the scalar kernel is unmeasured, and an A/B against the scalar path on GB10
+  is what `VK-C` still owes. Numerics also do not match the scalar tactic
+  bit-for-bit and do not claim to: the scalar kernel walks K sequentially per
+  output element to match the CPU's order, while a cooperative matrix accumulates
+  a tile at a time in a hardware-defined order.

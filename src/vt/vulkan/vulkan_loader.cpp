@@ -78,6 +78,13 @@ void LoadInstanceFunctions(VkInstance instance) {
            std::string("vulkan: instance entry point missing: ") + #name);
   VT_VK_INSTANCE_FUNCS(VT_VK_LOAD_INSTANCE)
 #undef VT_VK_LOAD_INSTANCE
+  // Optional tier: resolve, but do NOT check. A null here means the device does
+  // not have the extension, which is a supported state the caller branches on.
+#define VT_VK_LOAD_INSTANCE_OPT(name)                                          \
+  g_api.name =                                                                 \
+      reinterpret_cast<PFN_##name>(g_api.vkGetInstanceProcAddr(instance, #name));
+  VT_VK_INSTANCE_FUNCS_OPTIONAL(VT_VK_LOAD_INSTANCE_OPT)
+#undef VT_VK_LOAD_INSTANCE_OPT
 }
 
 void LoadDeviceFunctions(VkDevice device) {

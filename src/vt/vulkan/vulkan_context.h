@@ -78,6 +78,14 @@ class VulkanContext {
                 const void* push_constants, uint32_t push_size, uint32_t group_count_x,
                 const uint32_t* spec_values = nullptr, uint32_t spec_count = 0);
 
+  // Was a pipeline for this SPIR-V module ever created? The cache key is the
+  // module name plus its specialization values, so this asks "did any variant of
+  // `name` get built", which is the only honest way for a test to prove that a
+  // TACTIC actually ran rather than merely that the results were right. A gate
+  // that checks numbers alone passes identically when the fallback served the
+  // call -- the same trap the op-provider decline counters exist for.
+  bool PipelineExistsFor(const std::string& name) const;
+
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
   // silently reusing an existing one — which would look identical in the results.
@@ -120,6 +128,20 @@ class VulkanContext {
   bool denorm_preserve_f32() const { return denorm_preserve_f32_; }
   bool signed_zero_inf_nan_preserve_f32() const { return sz_inf_nan_preserve_f32_; }
 
+  // --- COOPERATIVE MATRIX (VK-C). True iff the device exposes
+  // VK_KHR_cooperative_matrix AND reports a bf16 x bf16 -> f32 configuration at
+  // 16x16x16 with SUBGROUP scope AND has the subgroup size the committed SPIR-V
+  // assumes -- all four, because any one of them missing makes the coopmat
+  // pipeline unusable and the scalar tactic is always correct.
+  //
+  // MEASURED 2026-08-07: GB10 reports 11 configurations, all SUBGROUP scope,
+  // among them 16x16x16 bf16/bf16/f32/f32; llvmpipe exposes the extension NOT AT
+  // ALL. So this predicate is genuinely false on the only device CI can reach,
+  // which is why the scalar fallback is the tested-everywhere path and the
+  // coopmat path is dgx-gated.
+  bool coopmat_bf16_f32() const { return coopmat_bf16_f32_; }
+  uint32_t subgroup_size() const { return subgroup_size_; }
+
  private:
   VulkanContext();
   struct Pipeline;
@@ -146,6 +168,8 @@ class VulkanContext {
   bool unified_memory_ = false;
   bool denorm_preserve_f32_ = false;
   bool sz_inf_nan_preserve_f32_ = false;
+  bool coopmat_bf16_f32_ = false;
+  uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
   std::string device_name_;
 
