@@ -421,6 +421,45 @@ bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k, int64_t m,
          m % 16 == 0 && n % 16 == 0;
 }
 
+// GEMV TACTIC SELECTION (VK-F). Same shape of contract as the coopmat predicate
+// above -- every requirement is a hard one, and failing any of them runs the
+// always-correct scalar kernel instead.
+//
+// The problem this solves is COALESCING, measured: vt_matmul was ~55% of all GPU
+// time in an e2e decode run. It puts one invocation on each output element and
+// loops K there, so for MatmulBT lane j reads b[j*k + q] and adjacent lanes land
+// k*2 bytes apart -- each pulling its own cache line to use 2 bytes of it. The
+// GEMV shader instead gives each output element a workgroup whose lanes stride K,
+// so adjacent lanes read adjacent addresses.
+//
+//   * MatmulBT ONLY. In the other orientation vt_matmul reads b[q*n + j], which
+//     is ALREADY coalesced across lanes; the GEMV shape would make that strided
+//     and strictly worse. This is not a universally better kernel and the
+//     predicate does not pretend otherwise.
+//   * m == 1, the decode shape. One workgroup per output element is the right
+//     trade only when there are few of them: at prefill m*n workgroups would each
+//     do k/128 multiplies, and prefill is the coopmat tactic's job anyway.
+//   * k >= the workgroup width, so the strided loop actually has work for every
+//     lane. Below that most lanes contribute a zero partial and the reduction
+//     costs more than the loop saves.
+//
+// ACCUMULATION ORDER: the K reduction becomes a tree, so this tactic does NOT
+// share the CPU's accumulation order -- it sits in the NMSE tier alongside
+// coopmat. That is why it is gated on a token-exactness run and not on an NMSE
+// bound alone.
+bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
+  // VT_VULKAN_GEMV=0 forces the scalar tactic, for the same single reason the
+  // coopmat lever exists: a same-binary A/B, so the arms differ in exactly one
+  // thing. Default ON.
+  static const bool kDisabled = [] {
+    const char* v = std::getenv("VT_VULKAN_GEMV");
+    return v != nullptr && std::strcmp(v, "0") == 0;
+  }();
+  if (kDisabled) return false;
+  if (!bt || m != 1) return false;
+  return k >= static_cast<int64_t>(kWorkgroupSize);
+}
+
 template <bool kBT>
 void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1];
@@ -441,6 +480,19 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
                    static_cast<uint32_t>(k), a_off, b_off, out_off};
     Go("vt_matmul_coopmat", bind, p, tiles, spec, 2);
+    return;
+  }
+
+  if (GemvMatmulUsable(kBT, k, m)) {
+    // ONE WORKGROUP PER OUTPUT ELEMENT -- not FlatGroupCount, which would divide
+    // the element count by the workgroup size and put the whole K reduction back
+    // on a single lane. The workgroup cooperates on one element.
+    const uint32_t groups = static_cast<uint32_t>(m * n);
+    const uint32_t spec[3] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
+                              DtypeCode(out.dtype)};
+    MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
+                   static_cast<uint32_t>(k), a_off, b_off, out_off};
+    Go("vt_matmul_vec", bind, p, groups, spec, 3);
     return;
   }
 
