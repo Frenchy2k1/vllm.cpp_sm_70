@@ -683,6 +683,68 @@ TEST_CASE("kimi-linear W7 device: NoPE-MLA layer matches the W2 host reference")
   for (size_t i = 0; i < dev.size(); ++i) CHECK(Close(dev[i], ref[i], 1e-4, 1e-5));
 }
 
+// ─── (g2) device MLA attention core (VT_KIMI_DEVICE_MLA): pad-V + vt::Attention ─
+// RED-first gate for the device NoPE-MLA attention wiring (spec §15 residual (d)):
+// the pad-V vt::Attention core (value padded qk_head_dim=qk with zeros; out[:, :, :vh]
+// is exact) matches a from-first-principles causal-softmax reference at the Kimi MLA
+// geometry (asymmetric qk=qn+qr vs v=vh, k_pe shared across heads). vt::Attention runs
+// f32 softmax (vLLM's FA2 regime), the reference f64 — a tight rtol, not bit-exact.
+TEST_CASE("kimi-linear W7 device: NoPE-MLA device attention core (pad-V) matches a softmax reference") {
+  KimiLinearParams p;
+  p.num_attention_heads = 3;
+  p.qk_nope_head_dim = 8;
+  p.qk_rope_head_dim = 4;  // qk = 12
+  p.v_head_dim = 8;
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim, qr = p.qk_rope_head_dim, qk = qn + qr;
+  const int64_t vh = p.v_head_dim, kvw = nah * (qn + vh), T = 7;
+
+  const std::vector<float> q = Rand(T * nah * qk, 401);
+  const std::vector<float> kv = Rand(T * kvw, 402);
+  const std::vector<float> kpe = Rand(T * qr, 403);
+
+  // Reference: per-head causal softmax over [k_nope | k_pe(shared)], weighted v (f64).
+  const double scale = std::pow(static_cast<double>(qk), -0.5);
+  std::vector<float> ref(static_cast<size_t>(T) * nah * vh, 0.0f);
+  std::vector<double> sc(static_cast<size_t>(T));
+  for (int64_t h = 0; h < nah; ++h)
+    for (int64_t t = 0; t < T; ++t) {
+      const float* q_nope = &q[t * nah * qk + h * qk];
+      const float* q_pe = q_nope + qn;
+      double mx = -INFINITY;
+      for (int64_t s = 0; s <= t; ++s) {
+        const float* k_nope = &kv[s * kvw + h * (qn + vh)];
+        const float* kp = &kpe[s * qr];
+        double dot = 0.0;
+        for (int64_t dd = 0; dd < qn; ++dd) dot += static_cast<double>(q_nope[dd]) * k_nope[dd];
+        for (int64_t dd = 0; dd < qr; ++dd) dot += static_cast<double>(q_pe[dd]) * kp[dd];
+        dot *= scale;
+        sc[static_cast<size_t>(s)] = dot;
+        mx = std::max(mx, dot);
+      }
+      double sum = 0.0;
+      for (int64_t s = 0; s <= t; ++s) {
+        const double e = std::exp(sc[static_cast<size_t>(s)] - mx);
+        sc[static_cast<size_t>(s)] = e;
+        sum += e;
+      }
+      float* ot = &ref[t * nah * vh + h * vh];
+      for (int64_t dd = 0; dd < vh; ++dd) {
+        double acc = 0.0;
+        for (int64_t s = 0; s <= t; ++s) {
+          const float* vs = &kv[s * kvw + h * (qn + vh) + qn];
+          acc += (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]);
+        }
+        ot[dd] = static_cast<float>(acc);
+      }
+    }
+
+  vt::Queue qcpu = CpuQueue();
+  const std::vector<float> dev = vllm::KimiMlaAttnCoreDevice(q, kv, kpe, p, T, qcpu);
+  REQUIRE(dev.size() == ref.size());
+  for (size_t i = 0; i < dev.size(); ++i) CHECK(Close(dev[i], ref[i], 3e-3, 3e-4));
+}
+
 // ─── (h) MoE block + dense MLP: device compute == the W2 reference ────────────
 TEST_CASE("kimi-linear W7 device: MoE block + dense MLP match the W2 host reference") {
   KimiLinearParams p;

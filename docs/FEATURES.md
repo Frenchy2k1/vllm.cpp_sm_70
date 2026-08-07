@@ -119,7 +119,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
-| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | e2e runs bf16-resident; per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` landed+GB10-measured: 106→122/128 (7/8 exact) + 1.35→4.24 tok/s (3.1×), not STRICT | default off; beats §14's bf16-knob 120; residual = KDA chunked-prefill + paged FA2 MLA + incremental (§15) |
+| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | e2e runs bf16-resident; KDA device op `vt::KdaGatedDeltaRule` GB10: 106→122/128 + 1.35→4.24 tok/s, not STRICT; `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE 122→109 (§16) | default off; STRICT residual = chunk_kda prefill + paged FA2 MLA + incremental (§16) |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
@@ -250,7 +250,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | e2e RUNS (bf16-resident §13); per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` LANDED+GB10: 106→122/128 + 4.24 tok/s (3.1×), beats §14's 120, NOT STRICT; default OFF | p7 near-tie left; residual = KDA chunked-prefill + paged FA2 MLA + incremental decode (§15) |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | e2e RUNS (bf16-resident §13); KDA device op `vt::KdaGatedDeltaRule` GB10: 106→122/128 + 4.24 tok/s (3.1×), NOT STRICT, default OFF; `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE 122→109 (§16) | p7 near-tie; STRICT residual = chunk_kda prefill + paged FA2 MLA + incremental decode (§16) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
