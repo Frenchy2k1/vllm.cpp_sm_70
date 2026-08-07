@@ -1,0 +1,87 @@
+#version 450
+// vt::MatmulBT at DECODE — the GEMV tactic. One workgroup per output element,
+// lanes splitting K, tree-reduced.
+//
+// Structure ported from llama.cpp's mul_mat_vec.comp (a workgroup per output row,
+// lanes striding the reduction dimension, workgroup reduction at the end); the
+// per-element semantics remain our own cpu_ops.cpp MatmulChunked (:187-249), the
+// same oracle vt_matmul.comp answers to.
+//
+// WHY THIS EXISTS: COALESCING, NOT ARITHMETIC. A measured per-shader profile put
+// vt_matmul at ~55% of all GPU time in an e2e decode run, at 0.497 ms/call over
+// 792 calls. That kernel assigns one invocation per OUTPUT ELEMENT and loops K on
+// it, so for MatmulBT (b is [N,K], the torch Linear layout every model uses) lane
+// j reads b[j*k + q]. At a fixed q, adjacent lanes are k*2 bytes apart -- 2 KB for
+// a 1024-wide K. Every lane pulls its own 128-byte cache line to consume 2 bytes
+// of it, so a 128-lane workgroup fetches ~16 KB to use 256: a 64x waste of
+// bandwidth on a kernel that is entirely bandwidth-bound.
+//
+// Here lane t reads b[j*k + t], so adjacent lanes read ADJACENT addresses and the
+// same 128 lanes fetch 2 fully-used cache lines instead of 128 barely-used ones.
+// The arithmetic is identical; only the assignment of work to lanes changes.
+//
+// BT-ONLY, DELIBERATELY. In the other orientation b is [K,N] and vt_matmul reads
+// b[q*n + j] -- consecutive lanes already hit consecutive addresses, so that path
+// is ALREADY coalesced and this shape would make it strided and worse. The host
+// predicate refuses anything but MatmulBT for that reason, rather than treating
+// this as a universally better kernel.
+//
+// ACCUMULATION ORDER CHANGES, AND THAT IS A REAL COST. vt_matmul keeps each
+// output element's whole K reduction on one lane specifically to share the CPU's
+// accumulation order rather than merely a tolerance. A tree reduction cannot: each
+// lane sums a strided subset and the partials merge pairwise, so results sit in
+// the NMSE tier against the CPU, exactly as the coopmat tactic already does. This
+// is why the tactic is gated on a token-exactness run and not on an NMSE bound
+// alone -- a decode GEMM feeds the sampler, where a changed low bit can change a
+// token.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+// Same dtype axes as vt_matmul, minus the orientation: this module is MatmulBT by
+// construction, so VT_MM_BT would only ever be 1 and is not a variant here.
+layout(constant_id = 0) const uint VT_MM_A_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_MM_B_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_MM_OUT_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint n;
+  uint k;
+  uint a_off;
+  uint b_off;
+  uint out_off;
+} p;
+
+void main() {
+  // One workgroup per output element, laid out exactly like vt_matmul's flat gid
+  // so the two tactics write the same element for the same index.
+  uint gid = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  if (gid >= p.m * p.n) { return; }
+  uint i = gid / p.n;  // output row
+  uint j = gid % p.n;  // output column
+
+  uint a_row = i * p.k;
+  uint b_row = j * p.k;  // MatmulBT: b is [N,K] row-major
+
+  // Strided by VT_TG so adjacent lanes touch adjacent elements -- the whole point.
+  float partial = 0.0;
+  for (uint q = tid; q < p.k; q += VT_TG) {
+    float av = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q);
+    float bv = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q);
+    partial += av * bv;
+  }
+
+  float acc = vt_tg_sum(tid, partial);
+  if (tid != 0u) { return; }
+  VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, gid, acc);
+}

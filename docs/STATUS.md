@@ -410,8 +410,8 @@ Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kerne
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
-Vulkan (16 native; opt-125m exact, coopmat
-11-33x, argmax 18.9x; 5.9 vs llama.cpp 161
+Vulkan (opt-125m exact, GEMV 1.8x,
+argmax 18.9x, subgroup VOID; 27x off llama.cpp
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 skeleton:
 backend, platform, 1 of 106 ops; **its HIP sources have never been compiled by
 anyone** — weaker than "build-supported", since no AMD board is here;

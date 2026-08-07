@@ -20,6 +20,7 @@
 #include <cstring>
 #include <string>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -54,7 +55,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 15);
+  CHECK(n == 16);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -66,7 +67,8 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // rather than at pipeline-creation time on a device we might not have.
   for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
                            "vt_greedy_argmax", "vt_layer_norm", "vt_matmul",
-                           "vt_matmul_coopmat", "vt_paged_attn", "vt_qkv_split",
+                           "vt_matmul_coopmat", "vt_matmul_vec", "vt_paged_attn",
+                           "vt_qkv_split",
                            "vt_relu", "vt_reshape_and_cache", "vt_rms_norm",
                            "vt_rope_from_cache", "vt_silu_and_mul"}) {
     bool found = false;
@@ -133,6 +135,13 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // hardware configuration this shader is written to, so they are not axes.
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_vec") == 0) {
+      // a dtype, b dtype, out dtype -- but NOT the orientation. This module is
+      // MatmulBT by construction: the whole reason it exists is that b's [N,K]
+      // layout makes lane-strided K reads contiguous, and the other orientation
+      // is already coalesced in vt_matmul and would be made worse here.
+      REQUIRE(m.spec_id_count == 3);
+      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
       // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
       // ONE committed module, which is the argument for specialization constants
@@ -602,6 +611,139 @@ TEST_CASE("a PARTIAL-TILE GEMM declines coopmat -- the shape that hung a GPU") {
   vk.Free(da);
   vk.Free(db);
   vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
+TEST_CASE("a DECODE GEMV takes the vec tactic; prefill and the other orientation decline") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // Unlike the coopmat tactic, this one has NO hardware precondition -- it is a
+  // different assignment of work to lanes, not a different instruction -- so
+  // llvmpipe runs it and CI can gate the selection for real rather than only
+  // gating that it is refused.
+  //
+  // K = 256 is two full workgroup widths, so every lane gets work and the strided
+  // loop runs more than one iteration. N is deliberately NOT a multiple of 16, so
+  // the coopmat tactic declines and cannot be what is being measured here.
+  constexpr int64_t kK = 256, kN = 33;
+
+  auto build = [&](int64_t m) {
+    std::vector<uint16_t> a(m * kK), b(kN * kK);
+    for (int64_t i = 0; i < m * kK; ++i)
+      a[i] = vt::F32ToBF16(0.5f * static_cast<float>((i % 7) - 3));
+    for (int64_t i = 0; i < kN * kK; ++i)
+      b[i] = vt::F32ToBF16(0.25f * static_cast<float>((i % 5) - 2));
+    return std::make_pair(a, b);
+  };
+
+  auto run_bt = [&](int64_t m, std::vector<float>& got) {
+    auto ab = build(m);
+    void* da = vk.Alloc(ab.first.size() * sizeof(uint16_t));
+    void* db = vk.Alloc(ab.second.size() * sizeof(uint16_t));
+    auto* dout = static_cast<float*>(vk.Alloc(m * kN * sizeof(float)));
+    vk.Copy(q, da, ab.first.data(), ab.first.size() * sizeof(uint16_t));
+    vk.Copy(q, db, ab.second.data(), ab.second.size() * sizeof(uint16_t));
+    vk.Synchronize(q);
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {m, kK});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {kN, kK});
+    Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {m, kN});
+    vt::MatmulBT(q, to, ta, tb);
+    vk.Synchronize(q);
+    got.assign(static_cast<size_t>(m * kN), 0.0f);
+    vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+    vk.Synchronize(q);
+    // Host oracle in f64, so neither tactic's accumulation order is privileged.
+    std::vector<float> ref(static_cast<size_t>(m * kN), 0.0f);
+    for (int64_t i = 0; i < m; ++i) {
+      for (int64_t j = 0; j < kN; ++j) {
+        double acc = 0.0;
+        for (int64_t c = 0; c < kK; ++c) {
+          acc += static_cast<double>(vt::BF16ToF32(ab.first[i * kK + c])) *
+                 static_cast<double>(vt::BF16ToF32(ab.second[j * kK + c]));
+        }
+        ref[static_cast<size_t>(i * kN + j)] = static_cast<float>(acc);
+      }
+    }
+    vk.Free(da);
+    vk.Free(db);
+    vk.Free(dout);
+    return ref;
+  };
+
+  SUBCASE("M=1 MatmulBT selects vt_matmul_vec and is numerically right") {
+    std::vector<float> got;
+    const std::vector<float> ref = run_bt(1, got);
+    // THE LOAD-BEARING ASSERTION IS THE TACTIC. The scalar kernel is equally
+    // correct, so a silent fallback would post numbers that pass every value
+    // check below while proving nothing about the kernel this change adds.
+    CHECK(ctx.PipelineExistsFor("vt_matmul_vec"));
+    for (size_t i = 0; i < got.size(); ++i) {
+      CAPTURE(i);
+      CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-3));
+    }
+  }
+
+  SUBCASE("M=8 is prefill-shaped and does NOT take the vec tactic") {
+    // One workgroup per output element is only the right trade when there are few
+    // of them. The predicate refuses M > 1, and the scalar or coopmat tactic
+    // handles it -- verified by the numbers still being right.
+    const size_t before = ctx.PipelineCacheSize();
+    std::vector<float> got;
+    const std::vector<float> ref = run_bt(8, got);
+    CAPTURE(before);
+    CAPTURE(ctx.PipelineCacheSize());
+    for (size_t i = 0; i < got.size(); ++i) {
+      CAPTURE(i);
+      CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-3));
+    }
+  }
+
+  SUBCASE("the non-BT orientation declines -- it is ALREADY coalesced") {
+    // vt_matmul reads b[q*n + j] there, so adjacent lanes already hit adjacent
+    // addresses; the vec shape would make that strided and strictly worse. This
+    // asserts the tactic is scoped to the orientation it actually helps, which a
+    // numeric check can never show.
+    std::vector<uint16_t> a(kK), b(kK * kN);
+    // int64_t, NOT size_t: `(i % 7) - 3` on an unsigned type underflows to a huge
+    // value for i % 7 < 3, and the resulting operands overflow the accumulation
+    // to inf. Same expression as the BT builder above, which uses int64_t.
+    for (int64_t i = 0; i < static_cast<int64_t>(a.size()); ++i)
+      a[static_cast<size_t>(i)] = vt::F32ToBF16(0.5f * static_cast<float>((i % 7) - 3));
+    for (int64_t i = 0; i < static_cast<int64_t>(b.size()); ++i)
+      b[static_cast<size_t>(i)] = vt::F32ToBF16(0.25f * static_cast<float>((i % 5) - 2));
+    void* da = vk.Alloc(a.size() * sizeof(uint16_t));
+    void* db = vk.Alloc(b.size() * sizeof(uint16_t));
+    auto* dout = static_cast<float*>(vk.Alloc(kN * sizeof(float)));
+    vk.Copy(q, da, a.data(), a.size() * sizeof(uint16_t));
+    vk.Copy(q, db, b.data(), b.size() * sizeof(uint16_t));
+    vk.Synchronize(q);
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {1, kK});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {kK, kN});
+    Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {1, kN});
+    vt::Matmul(q, to, ta, tb);
+    vk.Synchronize(q);
+    std::vector<float> got(kN);
+    vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+    vk.Synchronize(q);
+    for (int64_t j = 0; j < kN; ++j) {
+      double acc = 0.0;
+      for (int64_t c = 0; c < kK; ++c) {
+        acc += static_cast<double>(vt::BF16ToF32(a[static_cast<size_t>(c)])) *
+               static_cast<double>(vt::BF16ToF32(b[static_cast<size_t>(c * kN + j)]));
+      }
+      CAPTURE(j);
+      CHECK(got[static_cast<size_t>(j)] == doctest::Approx(static_cast<float>(acc)).epsilon(1e-3));
+    }
+    CHECK(ctx.PipelineExistsFor("vt_matmul"));
+    vk.Free(da);
+    vk.Free(db);
+    vk.Free(dout);
+  }
+
   vk.DestroyQueue(q);
 }
 
