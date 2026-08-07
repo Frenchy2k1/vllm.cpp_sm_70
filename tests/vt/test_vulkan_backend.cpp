@@ -137,12 +137,13 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_vec") == 0) {
-      // a dtype, b dtype, out dtype -- but NOT the orientation. This module is
-      // MatmulBT by construction: the whole reason it exists is that b's [N,K]
-      // layout makes lane-strided K reads contiguous, and the other orientation
-      // is already coalesced in vt_matmul and would be made worse here.
-      REQUIRE(m.spec_id_count == 3);
-      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
+      // a dtype, b dtype, out dtype and the UNROLL factor -- but NOT the
+      // orientation. This module is MatmulBT by construction: the whole reason it
+      // exists is that b's [N,K] layout makes lane-strided K reads contiguous, and
+      // the other orientation is already coalesced in vt_matmul and would be made
+      // worse here. The unroll rides a spec constant so both arms are ONE module.
+      REQUIRE(m.spec_id_count == 4);
+      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
       // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
       // ONE committed module, which is the argument for specialization constants
