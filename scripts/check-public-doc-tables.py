@@ -358,6 +358,15 @@ STATUS_RATCHET = {
     # so it went out and "argmax 18.9x" came in. The per-shader time profile that
     # replaces it, and the 55%-of-GPU-time GEMM finding it points at, are detail
     # and live in .agents/benchmark-record.md rather than on this page. Net -9.
+
+    #
+    #
+    # 283442 since 2026-08-07 (measured 283442): the Vulkan row now carries the GEMV
+    # tactic (1.8x) and drops the coopmat microbenchmark, which is a COMPONENT
+    # number and lives in .agents/benchmark-record.md. The llama.cpp gap stayed
+    # on the page deliberately - it was the first thing that fit when trimming,
+    # and dropping the unflattering number to satisfy a size limit is how a
+    # status page starts reading better than the code. Net -4.
     "chars": 279200,
     "h2_sections": 11,
     "long_paragraphs": 89,
