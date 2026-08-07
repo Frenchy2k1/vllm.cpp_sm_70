@@ -213,6 +213,18 @@ class VulkanContext {
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
   void FlushBatchLocked();           // caller holds mutex_
+  // GPU TIMESTAMP PROFILING. Batching submits many dispatches under ONE fence,
+  // so the per-dispatch fence wait that used to attribute time to a shader no
+  // longer exists. Timestamps written into the command buffer are the only way to
+  // recover per-kernel GPU time once submissions are batched -- and they measure
+  // the GPU directly rather than a host-side wait, so they are strictly better
+  // evidence than what they replace.
+  //
+  // Allocated and written ONLY when VT_VULKAN_DISPATCH_STATS is set, so a
+  // production dispatch pays nothing.
+  void* query_pool_ = nullptr;       // VkQueryPool
+  double timestamp_period_ns_ = 0.0; // 0 => device cannot timestamp; profiling off
+  void* batch_names_ = nullptr;      // std::vector<std::string>*, one per recorded dispatch
   bool batch_open_ = false;          // a command buffer is recording
   uint32_t batch_count_ = 0;         // dispatches recorded into it
   void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
