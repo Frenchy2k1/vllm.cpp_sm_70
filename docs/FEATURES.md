@@ -64,7 +64,7 @@ are our reading of their documented behavior, not measurements.
 | Format | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ☐ |
-| GGUF k-quants and i-quants | ✅ | ☐ | ☐ | ✅ |
+| GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE took a bf16-activation regression in `b4f5610a`; found by bisect and fixed 2026-08-06) | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |

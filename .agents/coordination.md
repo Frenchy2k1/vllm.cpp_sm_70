@@ -118,6 +118,24 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**CPU grouped keep-quant GEMM activation-dtype P0 (`QUANT-GGUF-CIQ-GEMM`,
+2026-08-06, `CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`).** Claude Code
+(claude-opus-5), isolated worktree `/home/mudler/_git/vllmcpp-ciq-grouped`,
+branch `row/QUANT-GGUF-CIQ-GEMM-grouped-act-dtype`, base `main` `1e4d159b`.
+Fixes the CPU provider of `kMatmulBTQuantGrouped`, which addressed the
+activation and output row views as `float*`/`kF32` regardless of dtype and so
+mis-strode and mis-decoded every bf16/f16 activation — the P0 that made
+CPU-only `test_qwen36_gguf_engine` emit 16/16 token-0 from `b4f5610a`
+(bisect-confirmed) onward. Owns `src/vt/cpu/cpu_quant_gemm.cpp`, NEW cases in
+`tests/vt/test_ops_quant_dot.cpp`, the `QUANT-GGUF-CIQ-GEMM` row, this claim,
+the `docs/STATUS.md`/`docs/BENCHMARKS.md`/`docs/FEATURES.md` checkpoint
+(including the STATUS ratchet, LOWERED not raised), `.agents/benchmark-record.md`,
+`.agents/NOW.md` and append-only `.agents/state.md`. **CPU-ONLY by developer
+instruction: no GPU regression suite, no SACRED set, no CUDA test or benchmark
+was run.** GPU-host discipline: every dgx step (CPU build + the 17 GB/25 GB
+model runs) ran inside ONE `flock /tmp/gpu` hold, serially, never a build
+concurrent with a model run.
+
 **Interactive CLI chat/complete spike (`SERVE-CLI-CHAT`, 2026-08-01,
 `CLAIM-SERVE-CLI-CHAT-SPIKE`).** Codex (GPT-5), isolated worktree
 `/home/mudler/.cache/sdd/localai-org-maint-bot-vllm.cpp/codex-serve-cli-chat-spike`,
