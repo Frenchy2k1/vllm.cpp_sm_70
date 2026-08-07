@@ -4,6 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
+| **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |

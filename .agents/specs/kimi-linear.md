@@ -979,7 +979,7 @@ kernel, we still run the RECURRENT form; a different reduction order coin-flips 
 near-tie" — is here scoped, grounded, and DE-RISKED to the point of mechanical execution.
 This section is the **AOT regen recipe + pinned-config record** the mission asks for.
 The authored Triton harness bodies are STAGED in
-[`.agents/specs/kda-chunk-aot/`](kda-chunk-aot/) (CI-safe: the drift check globs
+`.agents/specs/kda-chunk-aot/` (NOT yet committed; CI-safe: the drift check globs
 `triton_kernels/*.py` non-recursively, so a staged sibling directory does not gate).
 **Phase-2** moves them into `triton_kernels/`, adds the declarations below to
 `cmake/TritonAOTKernels.cmake`, regenerates the sm_121a cubins
