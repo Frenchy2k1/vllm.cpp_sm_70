@@ -33,6 +33,14 @@
 > appending fields whose zero value keeps existing behavior byte-identical, and only bumps on an
 > incompatible change. If you embed us, embed through that header.
 
+## News
+
+- **2026-08** **MiniMax-H3 video + audio generation lands.** A 33 B joint video+audio diffusion
+  transformer, prompt to MP4 with a stereo track, on one Jetson Thor. Attention got **16.6x**
+  faster on the way (bf16 tensor cores): a 50-step 864x480 render went ~8 h to ~28 min.
+- **2026-08** Audio input (Whisper, Voxtral) and image+video input (Qwen3-VL, Qwen3.6-27B)
+  correctness-complete, single-sequence path.
+
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
 carry **every feature people actually want**. No Python and no PyTorch at inference time.
@@ -84,17 +92,19 @@ point on this curve:
 | vLLM (tok/s) | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
 
-We are ahead at all six, but the margins in the middle are thin. Our run-to-run noise band is 0.5%,
-and c2 through c32 land between 0.7% and 1.7%, so treat those as ties. Only c1, at 4.5%, is clearly
-outside the noise. The tokens come out identical either way, and the install is 66 MiB against
+We are ahead at all six, but only c1 at 4.5% is clearly outside our 0.5% run-to-run noise band, so
+treat c2 through c32 as ties. The tokens are identical either way, and the install is 66 MiB against
 9.1 GiB.
 
-Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, with no Python stack behind
-it:
+Cold start to first `/health`: **36.5 s vs vLLM's 221.5 s (6.1x)**, provisional
+([detail](.agents/benchmark-record.md)).
+
+Peak host memory is a clean win at **24.88 GiB vs vLLM's 28.18 GiB**, with no Python stack behind it:
 
 ![What you install: a 9.1 GiB venv, or one 66 MiB binary](benchmarks/media/footprint.png)
 
 And we hold every other engine to the same treatment: same model, same workload, same box.
+
 
 ### vs llama.cpp, on CPU, from the same GGUF file
 
@@ -104,10 +114,10 @@ And we hold every other engine to the same treatment: same model, same workload,
 | decode | 24.7 tok/s | 25.4 | 0.97x (tie) |
 | peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
 
-Decode lands inside llama.cpp's own run-to-run spread, so that row is a tie, and the memory difference
-is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap, and it goes our way. The
-tokens are **byte-identical to llama.cpp's greedy decode**. Single-stream only: we have not measured
-concurrent serving against llama.cpp's server.
+Decode lands inside llama.cpp's own run-to-run spread, so that row is a tie, and the memory gap is
+30 MiB on a 2.8 GiB working set. Prefill is the only real gap, and it goes our way. The tokens are
+**byte-identical to llama.cpp's greedy decode**. Single-stream only: we have not measured concurrent
+serving against llama.cpp's server.
 
 ### vs MLX-LM, on Apple M4, warm b=1
 
@@ -270,6 +280,15 @@ and Voxtral (audio).
 | Qwen3-VL (image + video) | Qwen3-VL-4B-Instruct | - | Strict token-exact 32/32 (image) | Speed-pending |
 | Qwen3.6-27B vision (image + video) | Qwen3.6-27B | - | Strict token-exact 32/32 | Speed-pending |
 | Voxtral (audio) | Voxtral-Mini-3B-2507 | - | Near-tie-robust (decoder 48/48 exact) | Speed-pending |
+| **MiniMax-H3 (video + audio GENERATION)** | MiniMaxAI/MiniMax-H3 | Q4_K_M / NVFP4 | Renders 864x480 / 124f with audio | **34.6 s/step, one Jetson Thor** |
+
+**Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3 renders end to
+end: prompt -> Qwen3-VL-32B encoder -> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE
+-> MP4 with a stereo track. The project's first DIFFUSION architecture (no KV cache, no
+sampler, no logits); upstream is `vllm-project/vllm-omni`, beyond the parity pin. Five
+conditioning modes, each gated on the conditioning CHANGING the output rather than merely
+being accepted, and `POST /v1/videos`. Use **Q4_K_M**: 3 bits cannot hold the channel-wise
+outliers H3's split-half RoPE produces. Detail: [docs/STATUS.md](docs/STATUS.md).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
@@ -286,11 +305,11 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | Backend | Hardware | State |
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
-| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, compiles to real machine code, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
+| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | Skeleton: 8 ops plus the fusion catalogue cross-check against CPU and CUDA. No model runs yet |
-| **ROCm** | AMD GPUs | Roadmap, no code yet. Bring-up is open for contribution: [docs/ROCM.md](docs/ROCM.md), [#41](https://github.com/mudler/vllm.cpp/issues/41) |
+| **ROCm** | AMD GPUs | W0 skeleton (backend, platform, 1 op). HIP sources **never compiled**, no AMD board here. Open: [docs/ROCM.md](docs/ROCM.md), [#41](https://github.com/mudler/vllm.cpp/issues/41) |
 | **Intel XPU / ANE** | Intel, Apple Neural Engine | Spiked or roadmap |
 
 Per-arch build flags, per-op coverage, and the quantization format table:
@@ -324,6 +343,22 @@ build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt "The capital of Fr
 
 `vllm-bench` (throughput/latency harness) and `tokenize` (tokenizer smoke tool) ship alongside it.
 All flags, including `--speculative-config`: [docs/USAGE.md](docs/USAGE.md).
+
+### Multimodal INPUT and video GENERATION
+
+Multimodal INPUT goes through `/v1/chat/completions` content parts (`image_url`,
+`video_url`, `input_audio`). Video GENERATION:
+
+```sh
+build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \
+  --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
+  --video-vae video_vae.safetensors --audio-vae audio_vae.safetensors \
+  --prompt "A golden retriever runs across a sunlit beach" \
+  --frames 124 --height 480 --width 864 --steps 50 --device cuda --out out.mp4
+```
+
+Conditioning flags, the PPM convention that chains clips, and serving:
+[docs/USAGE.md](docs/USAGE.md).
 
 ## OpenAI-compatible server
 

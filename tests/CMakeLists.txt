@@ -648,6 +648,16 @@ vllm_cpp_add_test(test_backend vt/test_backend.cpp)
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
 # exactness checks) on a plain CPU build.
 vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
+# The ROCm GCN-arch capability parse (BACKEND-ROCM W0). UNCONDITIONAL by design:
+# include/vt/rocm/rocm_arch.h is deliberately free of HIP headers so the one part
+# of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
+# AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
+vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+if(VLLM_CPP_HIP)
+  # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
+  # case no-ops when the build has HIP but the box has no AMD GPU.
+  vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
 endif()

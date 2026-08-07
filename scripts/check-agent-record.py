@@ -257,7 +257,22 @@ ENGINE_PREFIXES = (
 # the same change — the heads/`SequencePooler`/`DispatchPooler` composite — not a
 # new row.) Bumped for a real new row, never to make a failing state transition
 # pass.
-ENGINE_ROWS = 140
+# 141 since 2026-08-06: +`SERVE-VIDEOS-OAI` (the `/v1/videos` request surface in
+# OpenAI's Sora shape plus `GET /v1/videos/{id}/content`) — a real new serving
+# capability, not a restatement of the MiniMax-H3 model row: an OpenAI video
+# client works unmodified, the MP4 is fetchable over HTTP at all, and the
+# fl2va/ref2va exclusivity is enforced at the request boundary. CPU-landed +
+# gated, `PARTIAL`, `CLAIM-SERVE-VIDEOS-OAI`, spec `specs/minimax-h3.md` §9.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 142 since 2026-08-06: +`SERVE-VIDEOS-REFS` (reference CONDITIONING over
+# `/v1/videos`: `input_reference` -> fl2va, plus the two `metadata` ref2va
+# modalities) — a real new capability stacked on `SERVE-VIDEOS-OAI`, not a
+# restatement of it: that row made an OpenAI body PARSE, this one makes its
+# references reach the pipeline. Before it no reference modality was reachable
+# over HTTP at all. CPU-landed + gated, `CLAIM-SERVE-VIDEOS-REFS`, spec
+# `specs/minimax-h3.md` §10.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 142
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

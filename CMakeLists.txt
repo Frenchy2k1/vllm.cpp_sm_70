@@ -49,6 +49,26 @@ set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUT
 # and into tests/vt/test_backend_cross_device.cpp during the CUDA regressions it
 # must not touch. So Vulkan is opt-in: -DVLLM_CPP_VULKAN=ON.
 set(VLLM_CPP_VULKAN "AUTO" CACHE STRING "Build the Vulkan backend: ON, OFF, or AUTO (=OFF)")
+# Tri-state like the three above (BACKEND-ROCM W0). AUTO resolves OFF for the
+# same reason Vulkan's does, plus one specific to this skeleton: it has NEVER
+# BEEN COMPILED by anyone (no AMD GPU on the authoring machine), so AUTO-enabling
+# it wherever /opt/rocm happens to exist would turn a green build red on a
+# machine whose owner asked for nothing. Opt in with -DVLLM_CPP_HIP=ON, which is
+# exactly what a contributor on issue #41 is asked to do first.
+set(VLLM_CPP_HIP "AUTO" CACHE STRING "Build the ROCm/HIP backend: ON, OFF, or AUTO (=OFF)")
+# Target gfx architecture(s), semicolon-separated, e.g. "gfx1100" or
+# "gfx1100;gfx1151". EMPTY (the default) means: pass no --offload-arch at all and
+# let hipcc target the installed GPU. That is the right default for a contributor
+# building on the machine they will run on, which is every case today. The
+# validated set is upstream's HIP_SUPPORTED_ARCHS (vllm/CMakeLists.txt:52 @ pin
+# 555967922); a value outside it configures with a WARNING rather than an error,
+# because a newer ROCm may know an arch that list does not.
+set(VLLM_CPP_HIP_ARCHITECTURES "" CACHE STRING
+  "Target gfx arch(es) for the ROCm backend, e.g. gfx1100 (empty = hipcc default)")
+# ROCm installation prefix. Mirrors upstream's ROCM_PATH (vllm/CMakeLists.txt:54-60)
+# with the same default and the same override, so a TheRock/nightly install in a
+# non-standard prefix is one flag away.
+set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation prefix")
 # The MLX acceleration PROVIDER for the Metal dense GEMM (BACKEND-ACCEL-PROVIDER
 # work row M5, .agents/specs/metal-mlx-reuse-study.md §6.2). Default OFF and
 # deliberately NOT tri-state: unlike a PLATFORM, a provider is a CONFIGURATION
@@ -220,6 +240,66 @@ elseif(VLLM_CPP_VULKAN)
   set(VLLM_CPP_VULKAN ON)
 else()
   set(VLLM_CPP_VULKAN OFF)
+endif()
+
+# Resolve the tri-state VLLM_CPP_HIP (BACKEND-ROCM W0). Unlike Vulkan there IS
+# something to detect — a HIP toolchain — but AUTO still resolves OFF (see the
+# option's comment). ON is where detection happens, and it FAILS LOUDLY rather
+# than silently downgrading: a contributor who typed -DVLLM_CPP_HIP=ON and got a
+# green CPU-only build would have no way to notice the backend was not built,
+# which is the exact failure mode the CUTLASS note in docs/BUILD.md exists for.
+if(VLLM_CPP_HIP STREQUAL "AUTO")
+  set(VLLM_CPP_HIP OFF)
+elseif(VLLM_CPP_HIP)
+  # CMake's own HIP language support (>= 3.21; we require 3.24) understands .hip
+  # sources, which is why upstream calls enable_language(HIP) explicitly rather
+  # than leaning on torch's setup (vllm/CMakeLists.txt:196-202).
+  include(CheckLanguage)
+  check_language(HIP)
+  if(NOT CMAKE_HIP_COMPILER)
+    message(FATAL_ERROR
+      "VLLM_CPP_HIP=ON but no HIP compiler was found.\n"
+      "  Install ROCm (hipcc), or point at it with -DROCM_PATH=<prefix> / "
+      "-DCMAKE_HIP_COMPILER=<path to hipcc>, or configure with -DVLLM_CPP_HIP=OFF.\n"
+      "  Looked with ROCM_PATH=${ROCM_PATH}.")
+  endif()
+  enable_language(HIP)
+  # Matches upstream's CMAKE_HIP_STANDARD 20 (vllm/CMakeLists.txt:20-21). The vt
+  # headers the .hip TUs include are C++20.
+  set(CMAKE_HIP_STANDARD 20)
+  set(CMAKE_HIP_STANDARD_REQUIRED ON)
+  # The same IEEE-as-written pin every other language in this build gets. It is
+  # NOT cosmetic here: tests/vt/test_backend_cross_device.cpp compares this
+  # backend against the CPU kernels at NMSE <= 5e-4, and a contracted multiply-add
+  # in the RmsNorm reduction is exactly the kind of drift that budget is meant to
+  # catch rather than absorb.
+  add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>)
+  set(VLLM_CPP_HIP ON)
+else()
+  set(VLLM_CPP_HIP OFF)
+endif()
+
+if(VLLM_CPP_HIP)
+  # Upstream's validated arch list, verbatim (vllm/CMakeLists.txt:52 @ pin
+  # 555967922). Used only to WARN: an unknown value is passed through to hipcc,
+  # which is the component that actually knows what it supports.
+  set(VLLM_CPP_HIP_SUPPORTED_ARCHS
+    "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201")
+  foreach(arch IN LISTS VLLM_CPP_HIP_ARCHITECTURES)
+    if(NOT arch IN_LIST VLLM_CPP_HIP_SUPPORTED_ARCHS)
+      message(WARNING "VLLM_CPP_HIP_ARCHITECTURES contains '${arch}', which is not in "
+        "upstream vLLM's validated set. Passing it to hipcc anyway.")
+    endif()
+  endforeach()
+  if(VLLM_CPP_HIP_ARCHITECTURES)
+    message(STATUS "ROCm backend: ENABLED for arch(es) [${VLLM_CPP_HIP_ARCHITECTURES}]")
+  else()
+    message(STATUS "ROCm backend: ENABLED, hipcc default arch (set "
+      "-DVLLM_CPP_HIP_ARCHITECTURES=gfx#### to target explicitly)")
+  endif()
+  message(STATUS "ROCm backend: NEVER COMPILED UPSTREAM OF YOU — this skeleton has no "
+    "build report from any machine. Please report success or failure on "
+    "https://github.com/mudler/vllm.cpp/issues/41")
 endif()
 
 if(VLLM_CPP_METAL)
@@ -927,6 +1007,63 @@ if(VLLM_CPP_VULKAN)
     # ONE TU's compile time instead of every TU that includes the table.
     src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
+endif()
+# --- ROCm/HIP backend (BACKEND-ROCM W0 skeleton) ------------------------------
+# Purely ADDITIVE like the Metal and Vulkan blocks above: a source list, a PUBLIC
+# compile definition the tests gate on, and one link library. No existing source
+# file and no line of the CPU/CUDA/Metal/Vulkan build changes when it is on.
+#
+# **NEVER COMPILED.** These four TUs have no build report from any machine. The
+# arch parse they depend on (include/vt/rocm/rocm_arch.h) is deliberately NOT
+# here: it is a HIP-free header compiled and unit-tested in every build,
+# including CPU-only CI. See tests/vt/test_rocm_arch.cpp.
+if(VLLM_CPP_HIP)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_HIP)
+  target_sources(vllm PRIVATE
+    src/vllm/platforms/rocm.cpp
+    src/vt/rocm/rocm_backend.hip
+    src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_ops.hip)
+  if(VLLM_CPP_HIP_ARCHITECTURES)
+    set_source_files_properties(
+      src/vt/rocm/rocm_backend.hip
+      src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_ops.hip
+      PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
+  endif()
+  # Prefer the absolute path inside ${ROCM_PATH}/lib, fall back to the bare name,
+  # which is upstream's own resolution order (vllm/CMakeLists.txt:335-341).
+  find_library(VLLM_CPP_AMDHIP64_LIB NAMES amdhip64 libamdhip64.so
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64)
+  if(VLLM_CPP_AMDHIP64_LIB)
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_AMDHIP64_LIB})
+  else()
+    target_link_libraries(vllm PUBLIC amdhip64)
+  endif()
+else()
+  # BIT-ROT GUARD (BACKEND-ROCM W0). The ROCm platform leg is deliberately plain
+  # C++ with no HIP header, which means it CAN be compiled on a machine with no
+  # ROCm — and if we do not, nothing on any maintainer machine ever compiles it,
+  # so the next change to the `Platform` interface breaks it silently and the
+  # breakage is discovered by a contributor mid-bring-up. Compiling it as an
+  # OBJECT library that is never linked keeps it honest at the cost of one TU.
+  #
+  # Not linked ANYWHERE on purpose: the object is built and discarded, so the
+  # platform's static registrar cannot run and a non-HIP build is byte-identical
+  # to what it was. This is a syntax/type gate, not a build of the backend — the
+  # HIP TUs still have no build report from anyone.
+  # The HIP-gated TEST is in here for the same reason: it is the first thing a
+  # contributor runs, it is also plain C++, and a stale assertion in it would
+  # read as a backend bug on their machine rather than as our drift.
+  add_library(vllm_rocm_platform_syntax_check OBJECT
+    src/vllm/platforms/rocm.cpp
+    tests/vt/test_rocm_backend.cpp)
+  target_include_directories(vllm_rocm_platform_syntax_check PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include)
+  target_include_directories(vllm_rocm_platform_syntax_check SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_rocm_platform_syntax_check PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_rocm_platform_syntax_check)
 endif()
 if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)

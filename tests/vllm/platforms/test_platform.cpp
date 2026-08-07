@@ -94,8 +94,9 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   // (or the DGX CUDA build) an accelerator IS registered and wins.
   Platform& current = CurrentPlatform();
   const bool has_accelerator =
-      HasPlatform(DeviceType::kCUDA) || HasPlatform(DeviceType::kXPU) ||
-      HasPlatform(DeviceType::kVULKAN) || HasPlatform(DeviceType::kMETAL);
+      HasPlatform(DeviceType::kCUDA) || HasPlatform(DeviceType::kROCM) ||
+      HasPlatform(DeviceType::kXPU) || HasPlatform(DeviceType::kVULKAN) ||
+      HasPlatform(DeviceType::kMETAL);
   if (has_accelerator) {
     // Accelerator-first: the process platform is the accelerator, not CPU.
     CHECK_FALSE(current.is_cpu());
@@ -106,6 +107,32 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   }
   // Device-correct invariant on every tier: the CPU platform is always CPU.
   CHECK(GetPlatform(DeviceType::kCPU).is_cpu());
+}
+
+// The ratchet for the ONE place a new platform is not additive (BACKEND-ROCM W0,
+// found while adding kROCM: the platform registered correctly and would never
+// have been selected, because CurrentPlatform() walks a hardcoded array and no
+// -Werror=switch fires on an array). Two properties, both cheap, both on the
+// CPU tier:
+//   1. EVERY DeviceType appears in the walk. This is the one that would have
+//      caught the omission.
+//   2. CPU is LAST. The walk is accelerator-first by contract; a CPU entry that
+//      drifted earlier would shadow every accelerator behind it.
+TEST_CASE("every DeviceType is in the CurrentPlatform priority walk, CPU last") {
+  size_t count = 0;
+  const DeviceType* priority = vllm::platforms::CurrentPlatformPriority(count);
+  REQUIRE(priority != nullptr);
+  REQUIRE(count == vt::kNumDeviceTypes);
+
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    const DeviceType type = static_cast<DeviceType>(i);
+    bool found = false;
+    for (size_t j = 0; j < count; ++j) {
+      if (priority[j] == type) found = true;
+    }
+    CHECK_MESSAGE(found, "DeviceType missing from the walk: ", vt::DeviceTypeName(type));
+  }
+  CHECK(priority[count - 1] == DeviceType::kCPU);
 }
 
 // A reserved DeviceType with no platform behind it must throw, never hand back a

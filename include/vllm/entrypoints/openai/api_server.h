@@ -111,9 +111,14 @@ class ApiServer {
   // POST /v1/videos       -> enqueue, return {id, status} immediately
   // POST /v1/videos/sync  -> run to completion, return the .mp4 path
   // GET  /v1/videos/{id}  -> job status
+  // GET  /v1/videos/{id}/content -> the finished MP4 bytes (video/mp4)
   DispatchResult handle_videos(const std::string& request_body);
   DispatchResult handle_videos_sync(const std::string& request_body);
   DispatchResult handle_video_status(const std::string& job_id) const;
+  // OpenAI's download endpoint. Unknown id -> 404; a job that has not finished ->
+  // 409 naming its status (NEVER a truncated file); a failed job -> 500 carrying
+  // the failure. Only a succeeded job yields bytes, and only the whole file.
+  DispatchResult handle_video_content(const std::string& job_id) const;
 
   DispatchResult handle_metrics() const;
   // POST /tokenize, POST /detokenize (serve/tokenize/api_router.py). Registered
@@ -232,6 +237,11 @@ class ApiServer {
   bool tokenizer_info_enabled_ = false;
   std::function<bool(bool, bool)> reset_prefix_cache_;
   std::function<int(const std::vector<std::string>&)> abort_requests_;
+
+  // The non-fatal note a `model` naming something we do not serve earns (empty
+  // when absent or matching). See the definition for why it is not a rejection.
+  std::string video_model_warning(
+      const ::vllm::openai::VideoRequest& request) const;
 
   // Opaque httplib::Server (pimpl keeps third_party/httplib.h out of this
   // header — only api_server.cpp and the smoke test pull it in).

@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-06 -->
+<!-- now-updated: 2026-08-07 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -9,23 +9,24 @@ benchmark record. Budget: 100 lines.
 
 ## Live claims
 
-Working head: `bench/qwen35-upstream-rebenchmark-20260805`, one benchmark
-checkpoint on `upstream/main` at `59674cf1d`.
+Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
+`bench/qwen35-upstream-rebenchmark-20260805` on `upstream/main` @ `59674cf1d`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W`) | vLLM K-run when convenient |
-| DeepSeek-V4-Flash decode | **Closed: beats ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact); phase-2 residency NEG, default-OFF | — |
+| Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
-| Invocation-parity prevention | CI guard + AGENTS.md checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **vision tower RUNS on real weights + fl2va COHERENT** (`H3-CONDITIONED-E2E` PR#86: `visual.*` loader+probe; fl2va matched cat; ref2va grids) | scatter feats→embeds + DeepStack→text tower |
+| Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
+| MiniMax-H3 lane | **fl2va COHERENT; ref2va NVFP4 grid DIAGNOSED (#95): NO loader bug** | weights/islands/RoPE all quant-noise-close to coherent GGUF; residual = community-NVFP4 quant fidelity §8.12 |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
-| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
+| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
+| `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
+| `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -47,29 +48,26 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
    `conformer_encoder.py` as the audio encoder of `nano_nemotron_vl.py`, which we
    already carry `MODEL-MM-nano-nemotron-vl-*` rows for, so it is owed mirror work.
    The transducer decode half (RNN-T/TDT/CTC) is NOT in vLLM: separate scope call.
-2. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
-   speed-pending; bind the default-ON async-serving path against the same oracle
-   before attributing the remaining TPOT gap.
+2. **Qwen3.5-4B serving follow-up:** bind the default-ON async-serving path
+   against the same oracle before attributing the remaining TPOT gap.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Claim triage + live-state audit DONE
-   (10 unevidenced rows → `READY`, 11 claims retired, 9 amended); `STATUS.md`
-   ratcheted; `AGENTS.md` tiered. REMAINING: anchor backfill
-   (6 model rows need a DECISION); record-era rollover BLOCKED on `DONE` rows
-   bound to `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
-   ★ The gate SELF-BLINDS on those same 10 (audit §➁a); its fix owes an 8-row
-   adjudication. workflow.md states the `ACTIVE` precondition.
+5. **Protocol substrate — partly done.** Triage/audit, `STATUS.md` ratchet and
+   the `AGENTS.md` tiering are DONE. REMAINING: anchor backfill (6 model rows
+   need a DECISION); record-era rollover BLOCKED on `DONE` rows bound to
+   `parity-ledger.md` LINE anchors (re-anchor by ROW ID). ★ The gate SELF-BLINDS
+   on the 10 audited rows (audit §➁a); its fix owes an 8-row adjudication.
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` is the DEFAULT. Queue: 10 rows — 6 are audit-vacated, with LANDED gate anchors; READ before picking. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+`--require-role` is the DEFAULT. Queue: 10 rows (6 audit-vacated, LANDED gate anchors; READ before picking). Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated

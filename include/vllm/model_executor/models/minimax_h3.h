@@ -1065,10 +1065,22 @@ MiniMaxH3EncoderDeviceWeights StageMiniMaxH3EncoderWeights(
 // its ggml blocks with no dequantization. `positions` is [3, seq] (the M-RoPE
 // temporal/height/width axes); for a pure text prompt all three are the token
 // index. Returns [seq, hidden] f32.
+//
+// DeepStack (image/video conditioning): `visual_pos_mask` is [seq] (1 at each
+// visual-token row) and `deepstack` is one [num_visual, hidden] block per tap.
+// After each of the FIRST `len(deepstack)` decoder layers, each block is ADDED to
+// the masked rows — the device mirror of MiniMaxH3EncoderTextForward's DeepStack
+// and of upstream `MiniMaxH3Qwen3VLTextModel._deepstack_process` (encoder.py:770-800,
+// `hidden_states[visual_pos_masks] += visual_embeds`). Text-only prompts pass the
+// defaults (no mask, no blocks) and the path is byte-identical to before. The
+// MERGED-feature masked_scatter into `inputs_embeds` is the CALLER's job (upstream
+// `_encode` does it on inputs_embeds before the tower runs); this forward consumes
+// the already-scattered stream, exactly like the host reference.
 std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     vt::Queue& queue, const MiniMaxH3EncoderConfig& config,
     const MiniMaxH3EncoderDeviceWeights& weights, const std::vector<float>& inputs_embeds,
-    const int64_t* positions, int64_t seq);
+    const int64_t* positions, int64_t seq, const uint8_t* visual_pos_mask = nullptr,
+    const std::vector<std::vector<float>>& deepstack = {});
 
 MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
                                                           int64_t max_layers = 0);
@@ -1287,6 +1299,25 @@ class SafetensorsFile;
 // `weight_scale` + F32 scalar `weight_scale_2`) and are dequantized through the
 // project's existing NVFP4 path; the fp32/bf16 islands are read as-is.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file);
+
+// The community `lilcheaty/MiniMax-H3-NVFP4` checkpoints (metadata converted_by
+// "Star Ultimate Model Converter Pro") pack the two fp4 elements per byte in the
+// OPPOSITE nibble order to the modelopt standard our DequantNvfp4ToBf16 and the
+// Marlin W4A16 path assume: element 2i is in the HIGH nibble, 2i+1 in the LOW.
+// Read low-first, every adjacent fp4 pair is swapped, scrambling each projection
+// matrix so the DiT cannot denoise and every render grids. Verified against the
+// coherent FL2VA GGUF (same base weights: islands byte-identical): reading the
+// file low-first gives elementwise corr 0.000 vs the GGUF; high-first gives 100%
+// sign-agreement over 115M+ weights and corr rising 0.85->0.94 with |w| (the pure
+// NVFP4-vs-Q3_K quant-noise floor). Swapping the two nibbles of every packed byte
+// at load turns the file's high-first bytes into the standard low-first bytes both
+// the bf16 dequant and the Marlin fp4-resident path expect -- one transform fixes
+// BOTH arms. Scoped to the H3 NVFP4 loaders; the shared DequantNvfp4ToBf16 stays
+// low-first for the modelopt checkpoints (Laguna / DeepSeek-V4 / Qwen3-32B).
+// Default ON; VT_H3_NVFP4_LOWNIBBLE=1 opts out (the pre-fix behavior, for A/B).
+bool MiniMaxH3Nvfp4HighNibbleFirst();
+// Swap the two 4-bit nibbles of every byte in [src, src+n) into dst (sized n).
+void MiniMaxH3Nvfp4SwapNibbles(const uint8_t* src, size_t n, uint8_t* dst);
 
 // The per-step inputs of one denoise step (minimax_h3_transformer.py:986-1102).
 // Row-major host buffers; the forward stages them onto `device` itself.

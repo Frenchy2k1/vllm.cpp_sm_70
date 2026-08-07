@@ -103,7 +103,8 @@ std::vector<float> BuildEncoderRopeCache(const int64_t* positions, int64_t seq,
 std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     vt::Queue& queue, const MiniMaxH3EncoderConfig& config,
     const MiniMaxH3EncoderDeviceWeights& weights, const std::vector<float>& inputs_embeds,
-    const int64_t* positions, int64_t seq) {
+    const int64_t* positions, int64_t seq, const uint8_t* visual_pos_mask,
+    const std::vector<std::vector<float>>& deepstack) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
 
@@ -214,6 +215,34 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     }
     vt::MatmulBT(d.q, attn_out.t(), act.t(), weights.Get(p + "mlp.down_proj.weight"));
     vt::Add(d.q, h.t(), h.t(), attn_out.t());
+
+    // DeepStack: ADD the visual features into the visual-token rows, for the FIRST
+    // len(deepstack) layers only (encoder.py:792-799; host mirror
+    // MiniMaxH3EncoderTextForward). Upstream `_deepstack_process` does
+    // `hidden_states[visual_pos_masks, :] += visual_embeds`; we scatter the block
+    // into a [seq, hidden] additive buffer at the masked rows and add on device.
+    // Text-only prompts leave `deepstack` empty and this never runs.
+    if (layer < static_cast<int64_t>(deepstack.size())) {
+      VT_CHECK(visual_pos_mask != nullptr,
+               "minimax_h3 encoder device: deepstack embeds require a visual position mask");
+      const std::vector<float>& embeds = deepstack[static_cast<size_t>(layer)];
+      std::vector<float> add_host(static_cast<size_t>(seq * hidden), 0.0f);
+      int64_t visual_index = 0;
+      for (int64_t s = 0; s < seq; ++s) {
+        if (!visual_pos_mask[s]) continue;
+        VT_CHECK((visual_index + 1) * hidden <= static_cast<int64_t>(embeds.size()),
+                 "minimax_h3 encoder device: deepstack block has fewer rows than masked positions");
+        for (int64_t i = 0; i < hidden; ++i) {
+          add_host[static_cast<size_t>(s * hidden + i)] =
+              embeds[static_cast<size_t>(visual_index * hidden + i)];
+        }
+        ++visual_index;
+      }
+      VT_CHECK(visual_index * hidden == static_cast<int64_t>(embeds.size()),
+               "minimax_h3 encoder device: deepstack block row count != masked positions");
+      DBuf add_dev(d, DType::kF32, {seq, hidden}, add_host.data());
+      vt::Add(d.q, h.t(), h.t(), add_dev.t());
+    }
   }
 
   // NO final RMSNorm: H3 reads the UNNORMALIZED truncated output.

@@ -53,6 +53,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/qwen3_vl_text.h"  // Qwen3VLGetRopeIndex + MmImageSpan
 #include "vllm/multimodal/qwen3vl_processor.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vt/backend.h"
@@ -202,6 +203,8 @@ int main(int argc, char** argv) {
   std::string decode_latent_path;  // diagnostic: decode a dumped VAE-input latent
   std::string roundtrip_path;      // diagnostic: encode->decode a real image
   std::string prompt_image_path;   // diagnostic: run an image through the vision tower
+  std::string cond_image_path;     // route an image through the ENCODER vision path
+                                   // (merged scatter into prompt_embeds + DeepStack)
   std::vector<std::string> ref_image_paths;
   std::string ref_video_prefix, ref_audio_path;
   // The served checkpoint PARTITION. Community GGUF/NVFP4 files strip the release
@@ -234,6 +237,7 @@ int main(int argc, char** argv) {
       else if (f == "--decode-latent") decode_latent_path = Need(argc, argv, ++i, f);
       else if (f == "--roundtrip") roundtrip_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt-image") prompt_image_path = Need(argc, argv, ++i, f);
+      else if (f == "--cond-image") cond_image_path = Need(argc, argv, ++i, f);
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -595,13 +599,61 @@ int main(int argc, char** argv) {
         const vllm::tok::Tokenizer tokenizer =
             tokenizer_path.empty() ? vllm::tok::Tokenizer::FromGguf(ef)
                                    : vllm::tok::Tokenizer::FromHfJson(tokenizer_path);
-        const std::vector<int32_t> ids = tokenizer.Encode(prompt);
+        std::vector<int32_t> ids = tokenizer.Encode(prompt);
         VT_CHECK(!ids.empty(), "minimax-h3-gen: the prompt tokenized to nothing");
         std::cerr << "  prompt tokens = " << ids.size() << "\n";
-        // DIAGNOSTIC (env-gated): dump the raw prompt token ids so the tokenization
-        // can be diffed against upstream `minimax_h3_text_only_ids` (verbatim prompt,
-        // add_special_tokens=False). A BOS/template mismatch shifts every text row and
-        // feeds the 32B tower a different string -> different conditioning.
+
+        // --cond-image routes a reference image through the ENCODER VISION PATH
+        // (upstream _encode, encoder.py:1064-1101): the vision tower's MERGED features
+        // masked_scatter into inputs_embeds at the image-pad positions, and its 3
+        // DeepStack blocks inject into the first N text layers. This is the residual
+        // #86 left open — the vision features now REACH the DiT via prompt_embeds.
+        std::vector<uint8_t> visual_mask;             // 1 at each image-pad row
+        std::vector<std::vector<float>> deepstack;    // 3 x [nm, hidden] taps
+        std::vector<float> merged;                    // [nm, hidden] merged features
+        std::array<int64_t, 3> vgrid{1, 0, 0};
+        int64_t vsmerge = 2;
+        const bool have_vision = !cond_image_path.empty();
+        if (have_vision) {
+          VT_CHECK(device_name == "cuda",
+                   "minimax-h3-gen: --cond-image needs --device cuda (the vision tower is "
+                   "device-resident)");
+          const vllm::multimodal::Qwen3VLVisionConfig vcfg = vllm::MiniMaxH3EncoderVisionConfig();
+          const vllm::multimodal::Qwen3VLVisionWeights vw = vllm::LoadQwen3VLVisionFromGguf(ef, vcfg);
+          vsmerge = vcfg.spatial_merge_size;
+          int64_t cih = 0, ciw = 0;
+          const std::vector<uint8_t> rgb = ReadPpmAsHwcU8(cond_image_path, &cih, &ciw);
+          std::cerr << "  cond-image " << ciw << "x" << cih << "\n";
+          vllm::multimodal::Qwen3VLProcessorConfig pcfg;  // patch16/temporal2/merge2/0.5-norm
+          pcfg.merge_size = static_cast<int>(vsmerge);
+          const vllm::multimodal::Qwen3VLImageProcessor proc(pcfg);
+          const vllm::multimodal::ImageKwargs kw = proc.ProcessImage(rgb.data(), cih, ciw);
+          vgrid = kw.image_grid_thw;
+          vt::Backend& vbackend = vt::GetBackend(vt::DeviceType::kCUDA);
+          vllm::multimodal::Qwen3VLVisionCapture cap;
+          (void)vllm::multimodal::Qwen3VLVisionForward(kw.pixel_values_bf16, vgrid, vw, vcfg,
+                                                       vbackend, &cap);
+          merged = std::move(cap.merger_out);
+          deepstack = std::move(cap.deepstack_out);
+          const int64_t nm = vgrid[0] * vgrid[1] * vgrid[2] / (vsmerge * vsmerge);
+          std::cerr << "  cond-image: grid=[" << vgrid[0] << "," << vgrid[1] << "," << vgrid[2]
+                    << "] merged=" << nm << " deepstack=" << deepstack.size() << "\n";
+          // Prepend a vision block <vision_start><image_pad><vision_end>, then expand
+          // the single image_pad into nm image_token_id copies (the mm processor).
+          std::vector<int32_t> pre = {pcfg.vision_start_token_id, pcfg.image_token_id,
+                                      pcfg.vision_end_token_id};
+          pre.insert(pre.end(), ids.begin(), ids.end());
+          std::vector<std::array<int, 2>> placeholders;
+          ids = vllm::multimodal::ExpandImagePlaceholders(
+              pre, pcfg.image_token_id, static_cast<int>(vsmerge),
+              {{vgrid[0], vgrid[1], vgrid[2]}}, &placeholders);
+          VT_CHECK(!placeholders.empty(),
+                   "minimax-h3-gen: cond-image placeholder expansion produced none");
+        }
+
+        // DIAGNOSTIC (env-gated): dump the (possibly expanded) token ids so the
+        // tokenization can be diffed against upstream. A template mismatch shifts
+        // every text row and feeds the 32B tower a different string.
         if (const char* dd = std::getenv("VT_H3_DUMP_INPUTS")) {
           if (std::FILE* fp = std::fopen((std::string(dd) + "/prompt_token_ids.i32").c_str(), "wb")) {
             std::fwrite(ids.data(), sizeof(int32_t), ids.size(), fp);
@@ -611,12 +663,47 @@ int main(int argc, char** argv) {
             std::cerr << "\n";
           }
         }
-        const std::vector<float> embeds = vllm::MiniMaxH3EncoderEmbedTokens(enc, ids);
-        // Text-only: all three M-RoPE axes are the token index.
+
         const int64_t seq = static_cast<int64_t>(ids.size());
+        std::vector<float> embeds = vllm::MiniMaxH3EncoderEmbedTokens(enc, ids);
         std::vector<int64_t> pos(static_cast<size_t>(3 * seq));
-        for (int64_t a = 0; a < 3; ++a) {
-          for (int64_t s = 0; s < seq; ++s) pos[static_cast<size_t>(a * seq + s)] = s;
+        if (!have_vision) {
+          // Text-only: all three M-RoPE axes are the token index.
+          for (int64_t a = 0; a < 3; ++a) {
+            for (int64_t s = 0; s < seq; ++s) pos[static_cast<size_t>(a * seq + s)] = s;
+          }
+        } else {
+          // masked_scatter the merged features into the image-pad rows + build the
+          // visual position mask (upstream `inputs_embeds.masked_scatter(image_mask,
+          // image_embeds)` + `_get_placeholder_mask`).
+          const int32_t IMG = vllm::multimodal::Qwen3VLProcessorConfig{}.image_token_id;
+          visual_mask.assign(static_cast<size_t>(seq), 0);
+          const int64_t hidden = ec.hidden_size;
+          int64_t vi = 0, off = -1;
+          for (int64_t s = 0; s < seq; ++s) {
+            if (ids[static_cast<size_t>(s)] != IMG) continue;
+            if (off < 0) off = s;
+            visual_mask[static_cast<size_t>(s)] = 1;
+            VT_CHECK((vi + 1) * hidden <= static_cast<int64_t>(merged.size()),
+                     "minimax-h3-gen: merged vision rows < image-pad tokens");
+            for (int64_t i = 0; i < hidden; ++i)
+              embeds[static_cast<size_t>(s * hidden + i)] =
+                  merged[static_cast<size_t>(vi * hidden + i)];
+            ++vi;
+          }
+          VT_CHECK(vi * hidden == static_cast<int64_t>(merged.size()),
+                   "minimax-h3-gen: merged vision rows != image-pad tokens");
+          // M-RoPE positions. Qwen3VLGetRopeIndex is byte-equivalent to H3's own
+          // _get_rope_index for a single-frame image (t==1): text runs sequentially,
+          // the image block takes the 3D vision grid, and the next text advances by
+          // max(llm_h, llm_w). Layout is [3, seq] flattened as [axis*seq + s].
+          vllm::multimodal::MmImageSpan span{off, {vgrid[0], vgrid[1], vgrid[2]}};
+          int64_t delta = 0;
+          const std::vector<int32_t> p3 =
+              vllm::multimodal::Qwen3VLGetRopeIndex(ids, {span}, vsmerge, &delta);
+          VT_CHECK(static_cast<int64_t>(p3.size()) == 3 * seq,
+                   "minimax-h3-gen: rope index produced the wrong count");
+          for (size_t i = 0; i < pos.size(); ++i) pos[i] = static_cast<int64_t>(p3[i]);
         }
         vt::Device enc_dev{};
         if (device_name == "cuda") {
@@ -627,9 +714,10 @@ int main(int argc, char** argv) {
         if (enc_dev.type != vt::DeviceType::kCPU) eq = eb.CreateQueue();
         const vllm::MiniMaxH3EncoderDeviceWeights staged =
             vllm::StageMiniMaxH3EncoderWeights(eq, enc);
-        std::cerr << "  encoding prompt...\n";
-        encoded_prompt =
-            vllm::MiniMaxH3EncoderTextForwardDevice(eq, ec, staged, embeds, pos.data(), seq);
+        std::cerr << "  encoding prompt" << (have_vision ? " (vision-conditioned)" : "") << "...\n";
+        encoded_prompt = vllm::MiniMaxH3EncoderTextForwardDevice(
+            eq, ec, staged, embeds, pos.data(), seq,
+            have_vision ? visual_mask.data() : nullptr, deepstack);
         std::cerr << "  conditioning = [" << seq << ", " << ec.hidden_size << "]\n";
         // Persisting the conditioning makes a checkpoint A/B CONTROLLED: two DiTs
         // can then be compared on byte-identical text conditioning instead of two
