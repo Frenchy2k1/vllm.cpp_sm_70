@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <limits>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -601,6 +602,88 @@ TEST_CASE("a PARTIAL-TILE GEMM declines coopmat -- the shape that hung a GPU") {
   vk.Free(da);
   vk.Free(db);
   vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
+TEST_CASE("greedy argmax tree-reduces the vocabulary and keeps the first-wins tie-break") {
+  if (!VulkanPresent()) return;
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // The kernel changed from one INVOCATION per row scanning the vocabulary
+  // serially (10.03 ms/call measured, 10% of all GPU time in an e2e run) to one
+  // WORKGROUP per row with a tree reduction. A reduction can be fast and still
+  // wrong in ways a single max VALUE never reveals, so what is asserted here is
+  // the INDEX, under the two conditions a reduction actually breaks.
+  //
+  // kV is deliberately NOT a multiple of the 128-lane workgroup, so the last
+  // lane's chunk is short and the empty-range path is exercised.
+  constexpr int64_t kV = 1000;
+
+  auto run = [&](const std::vector<float>& logits) {
+    void* dl = vk.Alloc(logits.size() * sizeof(float));
+    void* dt = vk.Alloc(2 * sizeof(int64_t));
+    vk.Copy(q, dl, logits.data(), logits.size() * sizeof(float));
+    vk.Synchronize(q);
+    Tensor tl = Tensor::Contiguous(dl, vt::DType::kF32, d, {1, kV});
+    Tensor tt = Tensor::Contiguous(dt, vt::DType::kI64, d, {1});
+    vt::GreedyArgmax(q, tt, tl);
+    vk.Synchronize(q);
+    int64_t got = -1;
+    vk.Copy(q, &got, dt, sizeof(int64_t));
+    vk.Synchronize(q);
+    vk.Free(dl);
+    vk.Free(dt);
+    return got;
+  };
+
+  SUBCASE("a plain maximum is found across the whole vocabulary") {
+    std::vector<float> l(kV, 0.0f);
+    // Past lane 0's chunk, so a scan that only ever covered chunk 0 -- the shape
+    // of the old single-lane kernel's parallel replacement done wrong -- misses it.
+    l[777] = 5.0f;
+    CHECK(run(l) == 777);
+  }
+
+  SUBCASE("ties resolve to the LOWEST index, including across lane boundaries") {
+    std::vector<float> l(kV, 0.0f);
+    // 8 and 900 land in different lanes' chunks, so the winner is decided by the
+    // MERGE, not by either lane's own scan. A merge written with `>=` instead of
+    // `>` -- the natural way to write it -- returns 900 here and passes every
+    // check that only looks at the maximum value.
+    l[8] = 3.0f;
+    l[900] = 3.0f;
+    CHECK(run(l) == 8);
+  }
+
+  SUBCASE("ties within a single lane's chunk also resolve to the lowest index") {
+    std::vector<float> l(kV, 0.0f);
+    l[3] = 2.0f;
+    l[4] = 2.0f;
+    CHECK(run(l) == 3);
+  }
+
+  SUBCASE("a NaN POISONS the scan exactly as the CPU kernel's does") {
+    // cpu_sample.cpp:49 compares with `x > best`, which is false for every NaN.
+    // A NaN adopted as the running best therefore blocks every later candidate,
+    // and the CPU returns the index it was holding -- here 0, the initial one.
+    // This is the case a STRIDED split would get wrong: the lane covering 500
+    // would never see the NaN at 0 and would return 500, disagreeing with the CPU
+    // oracle on a diverged model. Contiguous chunks are what make it agree.
+    std::vector<float> l(kV, 0.0f);
+    l[0] = std::numeric_limits<float>::quiet_NaN();
+    l[500] = 9.0f;
+    CHECK(run(l) == 0);
+  }
+
+  SUBCASE("a NaN AFTER the running maximum does not displace it") {
+    std::vector<float> l(kV, 0.0f);
+    l[10] = 7.0f;
+    l[600] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(run(l) == 10);
+  }
+
   vk.DestroyQueue(q);
 }
 

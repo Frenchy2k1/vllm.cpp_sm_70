@@ -8,13 +8,37 @@
 // golden, so a different tie-break is a different token and a failed gate, not a
 // rounding difference.
 //
-// ONE INVOCATION PER ROW, scanning the vocabulary sequentially. That is O(V) on a
-// single lane and slow for a 150k vocabulary, and it is the correct starting
-// point anyway: a parallel tree reduction has to carry the index alongside the
-// value AND break ties toward the lower index at every merge step to preserve the
-// contract above, which is a separate change with its own gate. Decode rows are
-// few (one per sequence), so the row dimension is not where the parallelism is
-// missing.
+// ONE WORKGROUP PER ROW, tree-reduced. The previous version put one INVOCATION on
+// each row and scanned the vocabulary on a single lane, which a measured profile
+// showed costing 10.03 ms per call -- 10% of all GPU time in an e2e decode run,
+// from 8 calls. A 151,936-entry scan on one lane reads 608 KB serially through a
+// single thread; the row dimension is 1 at decode, so `groups=1` left the device
+// idle. That earlier note reasoned "decode rows are few, so the row dimension is
+// not where the parallelism is missing" -- correct, and exactly why the
+// VOCABULARY dimension had to become the parallel one instead.
+//
+// THE MERGE IS ORDER-INDEPENDENT, AND HAS TO BE. The obvious rule -- "keep the
+// left operand unless the right is strictly greater" -- looks like it reproduces
+// first-wins, and it does not. A halving tree does NOT combine lanes in index
+// order: lane 0 absorbs lane 16 (and everything lane 16 already swallowed) long
+// before it ever meets lane 1. With V=1000 and equal maxima at 8 and 900, lane 0
+// is holding index 900 by the time lane 1 offers index 8, the values tie, the
+// strict `>` keeps what it has, and the kernel returns 900 where the CPU returns
+// 8. That is a different token from a gate that only checks the maximum VALUE.
+//
+// So ties are broken on the INDEX explicitly, which makes the merge associative
+// and commutative under (value descending, index ascending) and therefore correct
+// for any tree shape.
+//
+// NaN, AND WHY ONLY LANE 0 SEEDS FROM ITS FIRST ELEMENT. `x > best` is false for
+// every NaN, so the CPU scan can never ADOPT one -- a NaN can only become the
+// running best by being the value the scan STARTED from, i.e. element 0. When it
+// does, nothing afterwards compares strictly greater than it and the CPU returns
+// index 0. Seeding every lane from its own first element would invent poisoning
+// the CPU does not have: a NaN at the head of some middle chunk would mask a real
+// maximum inside that same chunk. Lane 0 therefore seeds from element 0 to
+// reproduce the one poisoning path that exists, and every other lane starts at
+// -inf so a NaN is skipped there exactly as the CPU skips it.
 //
 // logits are f32 by contract (cpu_sample.cpp:42 reads Ptr<float>), so there is no
 // dtype axis here.
@@ -33,25 +57,71 @@ layout(push_constant) uniform Params {
   uint out_off;
 } p;
 
-void main() {
-  uint i = gl_GlobalInvocationID.x;
-  if (i >= p.n) { return; }
+// Paired reduction state. vt_common.glsl's vt_tg_sum carries a value only, and an
+// argmax has to carry the index alongside it.
+shared float vt_am_val[VT_TG];
+shared uint vt_am_idx[VT_TG];
 
-  uint row = (p.logits_off >> 2) + i * p.v;
-  float best_v = uintBitsToFloat(L32.v[row]);
-  uint best = 0u;
-  for (uint j = 1u; j < p.v; ++j) {
-    float x = uintBitsToFloat(L32.v[row + j]);
+// No real vocabulary index can collide with this, so an empty or all-skipped lane
+// always loses the index tie-break to a lane that saw data.
+const uint VT_AM_NONE = 0xFFFFFFFFu;
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  if (row >= p.n) { return; }
+
+  uint rbase = (p.logits_off >> 2) + row * p.v;
+
+  // Contiguous ascending chunk per lane. Striding would coalesce better, but it
+  // is the seeding above -- not the merge -- that depends on lane 0 owning
+  // element 0, and contiguous chunks keep that relationship obvious.
+  uint chunk = (p.v + VT_TG - 1u) / VT_TG;
+  uint lo = tid * chunk;
+  uint hi = min(lo + chunk, p.v);
+
+  float best_v = -1.0 / 0.0;
+  uint best = VT_AM_NONE;
+  if (tid == 0u && p.v > 0u) {
+    // The CPU's initialiser, NaN included -- see the header.
+    best_v = uintBitsToFloat(L32.v[rbase]);
+    best = 0u;
+    lo = 1u;
+  }
+  for (uint j = lo; j < hi; ++j) {
+    float x = uintBitsToFloat(L32.v[rbase + j]);
     if (x > best_v) {  // strict `>`: first occurrence of the max wins
       best_v = x;
       best = j;
     }
   }
 
+  vt_am_val[tid] = best_v;
+  vt_am_idx[tid] = best;
+  barrier();
+
+  for (uint s = VT_TG / 2u; s > 0u; s >>= 1) {
+    if (tid < s) {
+      float rv = vt_am_val[tid + s];
+      uint ri = vt_am_idx[tid + s];
+      // Strictly greater wins; an exact tie goes to the LOWER index. Both
+      // comparisons are false against a NaN, so a NaN held by lane 0 is never
+      // displaced -- which is the CPU's behaviour -- while a NaN elsewhere was
+      // never adopted in the first place.
+      if (rv > vt_am_val[tid] || (rv == vt_am_val[tid] && ri < vt_am_idx[tid])) {
+        vt_am_val[tid] = rv;
+        vt_am_idx[tid] = ri;
+      }
+    }
+    barrier();
+  }
+
+  if (tid != 0u) { return; }
+
   // token_ids is i64 (cpu_sample.cpp:43 writes Ptr<int64_t>). Write the low word
   // and zero the high one: an argmax result is a vocabulary index, non-negative
   // and far below 2^31, so no 64-bit integer support is needed at our 1.1 floor.
-  uint out_base = (p.out_off >> 2) + 2u * i;
-  O32.v[out_base] = best;
+  uint out_base = (p.out_off >> 2) + 2u * row;
+  O32.v[out_base] = vt_am_idx[0];
   O32.v[out_base + 1u] = 0u;
 }
