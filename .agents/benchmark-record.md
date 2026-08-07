@@ -15324,3 +15324,58 @@ splitting K coalesces those reads; that is the next change, and it moves the K
 reduction off the CPU's accumulation order into the NMSE tier, so it needs the
 token-exactness gate rather than an NMSE bound.
 
+### VK-F: the GEMV tactic — the 55% lever, cut to ~35% (2026-08-07, GB10)
+
+The profile above put `vt_matmul` at ~55% of GPU time. It is a COALESCING problem,
+not an arithmetic one, and the fix is a different assignment of work to lanes.
+
+**The defect.** `vt_matmul` gives each OUTPUT ELEMENT one invocation and loops K
+there. For `MatmulBT` — b is `[N,K]`, the torch Linear layout every model uses —
+lane `j` reads `b[j*k + q]`, so at a fixed `q` adjacent lanes are `k*2` bytes
+apart: 2 KB for a 1024-wide K. Every lane pulls its own 128-byte cache line to
+consume 2 bytes of it, so a 128-lane workgroup fetches ~16 KB to use 256 — a
+**64x waste of bandwidth** on a kernel that is entirely bandwidth-bound.
+
+**The tactic.** `vt_matmul_vec` gives each output element a WORKGROUP whose lanes
+stride K, so lane `t` reads `b[j*k + t]` and adjacent lanes read adjacent
+addresses — 2 fully-used cache lines instead of 128 barely-used ones. Structure
+from llama.cpp `mul_mat_vec.comp`; per-element semantics still our own
+`cpu_ops.cpp` `MatmulChunked`.
+
+**Scoped, not universal.** `MatmulBT` only: in the other orientation `vt_matmul`
+reads `b[q*n + j]`, which is ALREADY coalesced across lanes, and the vec shape
+would make it strided and strictly worse. Plus `m == 1` (one workgroup per output
+element is only the right trade when there are few) and `k >= 128`. The gate
+asserts the DECLINE in both directions, not just the win.
+
+**RESULT — interleaved paired A/B, `VT_VULKAN_GEMV` the only variable, same
+binary.** The first attempt ran the arms in BLOCKS and had to be thrown away: the
+OFF arm degraded monotonically (20.70 -> 13.55 -> 6.70 tok/s) because it ran last,
+so drift aligned with the arm. Re-run interleaved, 8 pairs:
+
+| metric | GEMV on | GEMV off | result |
+|---|---:|---:|---|
+| GEMM ms/call (median) | 0.2359 | 0.4256 | **1.80x**, ON faster in **7 of 8 pairs** |
+| GEMM share of GPU time | ~35% | ~53% | the lever is spent down, not gone |
+| decode tok/s (median) | 16.22 | 11.70 | 1.39x, ON faster in 5 of 8 — WEAK, quoted as such |
+
+The kernel claim is the strong one (7/8, direct metric). The e2e decode claim is
+5/8 and sits inside this box's known 2.1x run-to-run swing, so it is recorded as
+suggestive rather than established.
+
+**CORRECTNESS: the accumulation order changed, and that needed the strict gate.**
+The K reduction is now a tree, so unlike the scalar kernel this tactic does NOT
+share the CPU's accumulation order — it joins coopmat in the NMSE tier. A decode
+GEMM feeds the sampler, where a changed low bit is a changed TOKEN, so an NMSE
+bound would not have been enough. **opt-125m STRICT: 6/6 prompts token-exact
+(96/96 tokens) vs the vLLM 0.25.0 oracle, all 9 ops on device type 3, 0 declines.**
+
+**Gates.** llvmpipe `test_vulkan_backend` **15/15 (858 assertions)**, GB10
+**15/15 (856)**. The new tactic has NO hardware precondition — it is a lane
+assignment, not an instruction — so unlike coopmat, CI can gate the SELECTION for
+real rather than only gating that it is refused.
+
+**Still open.** GEMM remains ~35% of GPU time, so the lever is not exhausted:
+wider per-lane loads and subgroup reductions in place of shared memory are the
+obvious next steps. `vt_rms_norm` is now the second cost at ~18%.
+
