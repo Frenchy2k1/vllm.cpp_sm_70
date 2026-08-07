@@ -28,7 +28,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
-| Release binaries | **SPIKE** (#129) | Fresh review; then W1 install/package target |
+| Release binaries | **SPIKE** fat CUDA/adaptive CPU (#129) | W1 per-source gencode |
 | Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 1 LANDED (#121)**: Parakeet ASR on the surface (`vllm_transcribe` v11, `/v1/audio/transcriptions`, ratchet 12→11) | Next fold row |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
