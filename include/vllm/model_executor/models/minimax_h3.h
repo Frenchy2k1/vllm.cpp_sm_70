@@ -1300,6 +1300,25 @@ class SafetensorsFile;
 // project's existing NVFP4 path; the fp32/bf16 islands are read as-is.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file);
 
+// The community `lilcheaty/MiniMax-H3-NVFP4` checkpoints (metadata converted_by
+// "Star Ultimate Model Converter Pro") pack the two fp4 elements per byte in the
+// OPPOSITE nibble order to the modelopt standard our DequantNvfp4ToBf16 and the
+// Marlin W4A16 path assume: element 2i is in the HIGH nibble, 2i+1 in the LOW.
+// Read low-first, every adjacent fp4 pair is swapped, scrambling each projection
+// matrix so the DiT cannot denoise and every render grids. Verified against the
+// coherent FL2VA GGUF (same base weights: islands byte-identical): reading the
+// file low-first gives elementwise corr 0.000 vs the GGUF; high-first gives 100%
+// sign-agreement over 115M+ weights and corr rising 0.85->0.94 with |w| (the pure
+// NVFP4-vs-Q3_K quant-noise floor). Swapping the two nibbles of every packed byte
+// at load turns the file's high-first bytes into the standard low-first bytes both
+// the bf16 dequant and the Marlin fp4-resident path expect -- one transform fixes
+// BOTH arms. Scoped to the H3 NVFP4 loaders; the shared DequantNvfp4ToBf16 stays
+// low-first for the modelopt checkpoints (Laguna / DeepSeek-V4 / Qwen3-32B).
+// Default ON; VT_H3_NVFP4_LOWNIBBLE=1 opts out (the pre-fix behavior, for A/B).
+bool MiniMaxH3Nvfp4HighNibbleFirst();
+// Swap the two 4-bit nibbles of every byte in [src, src+n) into dst (sized n).
+void MiniMaxH3Nvfp4SwapNibbles(const uint8_t* src, size_t n, uint8_t* dst);
+
 // The per-step inputs of one denoise step (minimax_h3_transformer.py:986-1102).
 // Row-major host buffers; the forward stages them onto `device` itself.
 struct MiniMaxH3DitInputs {

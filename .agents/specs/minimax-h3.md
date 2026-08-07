@@ -400,7 +400,7 @@ vLLM-Omni H3 modules at `vllm_omni/diffusion/models/minimax_h3/`; serving in
 | WebSocket `/v1/video/chat/stream`, `/v1/realtime/video` | `api_server.py:1593,1610` | — | **MISSING** (streaming/realtime) |
 | Request schema (prompt, size/w/h, num_frames, fps, seed, steps, refs) | `protocol/videos.py:97-249` | request contract (W7) | **PARTIAL** (core fields; frame-interp/lora/generate_sound absent) |
 | H3 knobs via `extra_params.{task,duration,flow_shift,audio_flow_shift}` | `pipeline:1034,403,1157-1158` | planner reads task/duration/shift | **DONE** |
-| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va reference-row assembly FIXED + gated (§8.10, the block-dim double-division) — but ref2va still grids, now RE-ATTRIBUTED to the ref2va NVFP4 CHECKPOINT/loader (t2va-zero-assembly grids too), NOT the assembly | **PARTIAL** (vision→conditioning scatter + ref2va assembly DONE; residual = the NVFP4 DiT loader for the ref2va checkpoint, §8.10) |
+| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va reference-row assembly FIXED + gated (§8.10) — ref2va still grids; the NVFP4 fp4 nibble-order loader bug is now FOUND+FIXED (byte-verified, §8.11) but the grid PERSISTS from a 2nd NVFP4-render-path defect (checkpoint content + loader dequant + params all byte-match the coherent GGUF) | **PARTIAL** (vision→conditioning scatter + ref2va assembly + NVFP4 nibble loader DONE; residual = the 2nd NVFP4-render-path defect, §8.11) |
 | Output: joint video+audio, 24 fps, 32 kHz stereo | `pipeline:106-111,1187` | frames + WAV + MP4 mux (W7) | **DONE** |
 | Scheduler: euler-ancestral rectified flow (single) | `scheduling_...euler_ancestral.py`; `time_request.py:34-61` | `MiniMaxH3EulerEta0Step` / `MiniMaxH3TimeShiftSigmas` | **DONE** |
 | CFG: distilled, no CFG (guidance params accepted+ignored; `cfg_parallel_size==1`) | `pipeline:250,275-276` | no CFG branch | **DONE** (matches) |
@@ -858,55 +858,7 @@ carries. Before it, no reference modality was reachable over HTTP at all.
 | Dependencies | Row `SERVE-VIDEOS-OAI` (§9), stacked. Code: `MiniMaxH3Encode{KeyframeCondRows,ReferenceVideo,ReferenceAudio}`, `MiniMaxH3ReadWav`, `DecodeDataUri`. Runtime: `--video-vae` for an image or video reference, `--audio-vae` for an audio reference (both encoder halves, loaded lazily and once). No new download, no GPU. |
 | Work breakdown | (1) `input_reference` parsing (path or `data:` URL) -> fl2va, with the geometry refusal; (2) the `metadata` map + the video/audio reference keys; (3) the combination rule in the parser; (4) the `examples/server` runner branches; (5) both test files; (6) docs + record. |
 | Risks/decisions | `input_reference` -> fl2va, NOT ref2va: OpenAI documents it as the frame the video starts from; ref2va would silently change what the API promises. The two extra modalities go in `metadata` rather than new top-level fields, so a strict client's schema validation still passes. Combination legality is enforced in the PARSER, not left to the pipeline, so a supplied reference is never silently dropped. |
-
-### 10.1 `input_reference` is fl2va, not ref2va
-
-OpenAI documents it as the image the video STARTS FROM, which is what
-`MiniMaxH3EncodeKeyframeCondRows` expresses (frame 0 of the output pinned to the
-image, `imgvid_noise_aug = 1.0`). `MiniMaxH3EncodeReferenceImages` prepends whole
-reference images as their own blocks — guidance that never becomes a frame — so
-mapping it there would have changed what the API promises. With a reference image
-and no explicit `task`, the task IS `fl2va`, and the image's aspect drives the
-default resolution through `MiniMaxH3ResolveShape`.
-
-Two limits, both refused up front rather than deep in the denoise: the image must
-be a binary PPM (P6), because no PNG/JPEG codec is vendored (the same NAMED
-residual the chat multimodal path carries), and it must already be at the
-resolved output geometry, because no image resampler is vendored. The refusal
-names both geometries.
-
-### 10.2 The two reference modalities OpenAI has no slot for
-
-H3 has three (image, silent video, audio); the Sora schema carries one. The other
-two enter through `metadata`, the standard OpenAI free-form string map that
-strict clients tolerate, rather than invented top-level fields that would fail a
-client's schema validation. The whole map is kept verbatim.
-
-- `metadata.input_reference_video` — a DIRECTORY of `frame_%06d.ppm`, the exact
-  layout `minimax-h3-gen` and the server WRITE, so clips chain. No demuxer is
-  vendored, hence a frame directory rather than a container; a `data:` URL cannot
-  name a directory and is refused by name.
-  `MiniMaxH3EncodeReferenceVideo` emits `ref_audio_t == 0`: the clip is SILENT.
-- `metadata.input_reference_audio` — a 16-bit PCM WAV path or `data:` URL, read
-  by the existing `MiniMaxH3ReadWav` and encoded by
-  `MiniMaxH3EncodeReferenceAudio`. Supplied with a video reference it ATTACHES to
-  that block (one `kVideoAudio` block carrying both, the layout
-  `packed_sequence.py` builds); alone it is its own block.
-
-LEGALITY is the pipeline's own rule (`minimax_h3_pipeline.cpp:251`: fl2va
-keyframes and ref2va blocks are exclusive), enforced in the PARSER so it is a 400
-naming the pair rather than a failed job — and never a silently dropped
-reference, which is the failure that looks like it worked. Legal: none / image /
-video / audio / video+audio. Illegal: `input_reference` with either metadata
-reference.
-
-### 10.3 Status
-
-- **CPU-LANDED + gated.** `test_video_api` 14/14 (167 assertions),
-  `test_openai_api_server` 41/41 (525), `server` builds clean. Each modality is
-  gated as ARRIVING at the runner, and an illegal pair is a 400 that generates
-  nothing (`calls == 0`).
-- **Residuals, named.** Reference images are binary PPM at the output resolution;
-  a video reference is a frame DIRECTORY; OpenAI's real `input_reference` upload
-  is multipart, ours is the JSON spelling.
-- **Real-weights leg** rides the same GB10/disk window as §8.
+| OpenAI | Lands on | Notes |
+| `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
+| `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
+| `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
