@@ -41800,3 +41800,41 @@ because a genuinely new row exists.
   op-coverage figure made the CPU-tier story feel obvious enough to write into the
   record without checking `top`, and it was wrong. The op count says what COULD be
   slow, not what IS.
+
+- **2026-08-07 (attribution MEASURED)** — **The Vulkan e2e bottleneck is PER-OP
+  SYNCHRONOUS DISPATCH. Both of my earlier explanations were wrong.**
+
+  Prompted by the right question — "26 minutes for 1 prompt is a lot, are we sure
+  it's all right?" — because that number is not merely slow, it is
+  ~1000x more than any kernel inefficiency can explain.
+
+  **Arithmetic first.** Qwen3-0.6B is ~0.6 B params → ~1.2 GFLOP per token
+  position; 40 positions plus lm_head ≈ **48-60 GFLOP**. Our NAIVE scalar Vulkan
+  GEMM measures **52 GFLOP/s**. So even entirely on the slow kernel the compute is
+  **1-2 SECONDS** against ~34 minutes of wall clock. The kernels cannot be the
+  story.
+
+  **Measured.** `gdb -p` stack samples: **6 of 6** in `poll()` inside the NVIDIA
+  driver, called from `VulkanContext::Dispatch`, under
+  `ForwardLayers → MatmulGeneric<true>`. `/proc/<pid>/status`: 202,770 → 203,730
+  voluntary context switches in 10 s = **~96 blocking waits/second**. Process CPU
+  1.6 %. So the run is neither hung nor computing — it is WAITING, ~99 % of the
+  time.
+
+  **`Dispatch` records, submits and FENCE-WAITS for every single op** — the W0
+  skeleton's documented "correct, not fast" design. The GPU's 96 % "utilisation"
+  is the driver context being resident while we poll, not compute saturation;
+  on Tegra/GB10 that counter cannot separate the two, which is exactly how it
+  misled me into the GPU-bound reading after the CPU-tier reading.
+
+  **Two wrong claims retired, in order:** (1) "it is the CPU reference tier,
+  71/87 ops" — refuted by CPU 1.6 %; (2) "it is GPU-bound" — technically true of
+  the utilisation counter, false as an attribution, since the GPU is idle-waiting
+  inside our own fence. Op coverage is a real limitation but is NOT what makes
+  this workload slow.
+
+  **Roadmap consequence.** `VK-A2` (async submission + command-buffer reuse,
+  `SupportsGraphCapture()` via pre-recorded `VkCommandBuffer`) was scoped in the
+  campaign spec as "the single biggest speed lever", deferred, and is now the
+  MEASURED bottleneck. It outranks further native-kernel work for anything
+  end-to-end: every additional native op would still pay a ~10 ms round trip.
