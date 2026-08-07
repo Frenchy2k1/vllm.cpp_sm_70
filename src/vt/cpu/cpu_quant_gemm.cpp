@@ -217,6 +217,25 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a,
 // BYTE-IDENTICAL to the per-expert kMatmulBTQuant path the DeepSeek-V4 forward
 // used before. The CUDA provider fuses this into one launch; this CPU provider is
 // the correctness reference (and the tiny-model doctest's grouped path).
+//
+// DTYPE CONTRACT (P0 fix, 2026-08-06). `vt::MatmulBTQuantGrouped` accepts ANY
+// float activation and an f32/bf16 output (ops.cpp:220-221), and the CUDA
+// provider honours all three activation dtypes (cuda_quant_dot.cu:1868-1871).
+// The row views below must therefore be addressed through `act.dtype` /
+// `out.dtype`, NOT assumed f32: this kernel used to advance a `float*` by
+// `act.stride[0]` and declare the row `kF32` regardless, so a bf16/f16
+// activation was BOTH mis-strode (2x too far per row) and mis-decoded (two
+// bf16 lanes read as one f32). Every caller and test happened to pass f32/f32
+// until qwen3_5's grouped MoE (`KqGrouped`, bf16 activations, commit b4f5610a)
+// became the first non-f32 caller, which is why the CUDA gate was byte-exact
+// while CPU decoded token-0 garbage. Gated per dtype in
+// tests/vt/test_ops_quant_dot.cpp.
+//
+// The `repacked`/`q8_0_aligned` layout markers are carried onto the slice for
+// the same reason `KqResidentSlice` (qwen3_5.cpp) inherits them: dropping
+// `repacked` makes `kMatmulBTQuant` read i8mm-interleaved bytes as plain q8_0,
+// which is the CIQ-G7 all-zero-token failure mode (state.md 2026-07-23).
+// `Tensor::Slice` throws on a repacked weight, so the slice is built by hand.
 void MatmulBTQuantGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
                                 const Tensor& weight, const Tensor& expert_ids) {
   const int64_t P = out.shape[0];
@@ -224,19 +243,25 @@ void MatmulBTQuantGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
   const int64_t K = act.shape[1];
   const bool bcast = (act.shape[0] == 1 && P > 1);  // broadcast a shared hidden across experts
   const size_t row_bytes = RowSizeBytes(weight.dtype, K);
+  const size_t act_elem = SizeOf(act.dtype);
+  const size_t out_elem = SizeOf(out.dtype);
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
   for (int64_t p = 0; p < P; ++p) {
     const int64_t e = eids[p];
     Tensor a_row = Tensor::Contiguous(
-        static_cast<float*>(act.data) + static_cast<size_t>(bcast ? 0 : p) * act.stride[0],
-        DType::kF32, act.device, {1, K});
+        static_cast<uint8_t*>(act.data) + static_cast<size_t>(bcast ? 0 : p) *
+                                              static_cast<size_t>(act.stride[0]) * act_elem,
+        act.dtype, act.device, {1, K});
     Tensor o_row = Tensor::Contiguous(
-        static_cast<float*>(out.data) + static_cast<size_t>(p) * N, out.dtype, out.device,
-        {1, N});
+        static_cast<uint8_t*>(out.data) +
+            static_cast<size_t>(p) * static_cast<size_t>(N) * out_elem,
+        out.dtype, out.device, {1, N});
     Tensor w{};
     w.data = static_cast<uint8_t*>(weight.data) + static_cast<size_t>(e) * N * row_bytes;
     w.dtype = weight.dtype;
     w.device = weight.device;
+    w.repacked = weight.repacked;
+    w.q8_0_aligned = weight.q8_0_aligned;
     w.rank = 2;
     w.shape[0] = N;
     w.shape[1] = K;

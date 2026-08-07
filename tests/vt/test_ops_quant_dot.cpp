@@ -845,3 +845,169 @@ TEST_CASE("G3 MatmulBTQuant matches per-row vec_dot exactly (no GEMM drift)") {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// GROUPED keep-quant GEMM (kMatmulBTQuantGrouped) — the ACTIVATION/OUTPUT DTYPE
+// contract.
+//
+// `vt::MatmulBTQuantGrouped` accepts ANY float activation (`IsFloat`) and an
+// f32/bf16 output (`IsOutFloat`) — ops.cpp:220-221 — and the CUDA provider
+// honours all three activation dtypes (cuda_quant_dot.cu:1868-1871). Every
+// pre-existing caller and test happened to pass f32/f32, so the CPU provider's
+// f32-only row addressing was never exercised; qwen3_5's grouped MoE
+// (`KqGrouped`, bf16 activations) was the first bf16 caller and produced
+// garbage on CPU.
+//
+// The contract, stated once per dtype: grouped over the stacked [E*N,K] tower
+// is BIT-IDENTICAL to `vt::MatmulBTQuant` on the per-expert [N,K] row-slice,
+// for the SAME activation bytes. Any dtype the op ACCEPTS must satisfy it.
+namespace {
+
+// The stacked tower + P (token,expert) pairs the grouped op consumes.
+struct GroupedFixture {
+  std::vector<uint8_t> tower;  // [E*N, K] block-quant
+  std::vector<float> a_f32;    // [P, K] activation, f32 master copy
+  std::vector<int32_t> eids;   // [P]
+};
+
+GroupedFixture MakeGrouped(const WeightCase& c, int64_t E, int64_t N, int64_t K,
+                           int64_t P, uint32_t seed) {
+  GroupedFixture f;
+  f.tower = RandomBlocks(c, E * N * (K / c.block_elems), seed);
+  f.a_f32.resize(static_cast<size_t>(P * K));
+  GenerateData(1.0F, f.a_f32.size(), f.a_f32.data());
+  f.eids.resize(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p)
+    f.eids[static_cast<size_t>(p)] = static_cast<int32_t>((p * 3 + 1) % E);
+  return f;
+}
+
+// One expert's [N,K] row-slice of the stacked tower, as kMatmulBTQuant sees it.
+vt::Tensor ExpertSlice(const GroupedFixture& f, const WeightCase& c, int64_t e,
+                       int64_t N, int64_t K, vt::Device dev) {
+  vt::Tensor w{};
+  w.data = const_cast<uint8_t*>(f.tower.data()) +
+           static_cast<size_t>(e) * N * vt::RowSizeBytes(c.dtype, K);
+  w.dtype = c.dtype;
+  w.device = dev;
+  w.rank = 2;
+  w.shape[0] = N;
+  w.shape[1] = K;
+  w.stride[0] = K;
+  w.stride[1] = 1;
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("grouped keep-quant GEMM == per-expert slice for EVERY accepted "
+          "activation dtype (f32/f16/bf16)") {
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t E = 4;
+  const int64_t N = 6;
+  const int64_t P = 5;
+
+  for (const WeightCase& c : kWeightCases) {
+    CAPTURE(std::string(c.name));
+    const int64_t K = 2 * c.block_elems;
+    const GroupedFixture f = MakeGrouped(c, E, N, K, P, 0xA5A5U);
+
+    for (vt::DType adt : {vt::DType::kF32, vt::DType::kF16, vt::DType::kBF16}) {
+      CAPTURE(static_cast<int>(adt));
+
+      // The SAME activation values in the dtype under test. f16/bf16 round the
+      // f32 master, so both arms below read the identical rounded bytes — any
+      // difference is the op's row addressing, never the rounding.
+      std::vector<float> a32(f.a_f32.size());
+      std::vector<uint16_t> a16(f.a_f32.size());
+      for (size_t i = 0; i < f.a_f32.size(); ++i) {
+        if (adt == vt::DType::kF32) {
+          a32[i] = f.a_f32[i];
+        } else if (adt == vt::DType::kF16) {
+          a16[i] = vt::F32ToF16(f.a_f32[i]);
+        } else {
+          a16[i] = vt::F32ToBF16(f.a_f32[i]);
+        }
+      }
+      void* adata = adt == vt::DType::kF32 ? static_cast<void*>(a32.data())
+                                           : static_cast<void*>(a16.data());
+
+      // (A) ONE grouped launch over the stacked tower.
+      std::vector<float> og(static_cast<size_t>(P * N), 0.0F);
+      {
+        std::vector<int32_t> ids = f.eids;
+        vt::Tensor at = vt::Tensor::Contiguous(adata, adt, q.device, {P, K});
+        vt::Tensor ot =
+            vt::Tensor::Contiguous(og.data(), vt::DType::kF32, q.device, {P, N});
+        vt::Tensor eid =
+            vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+        vt::Tensor wt = vt::Tensor::Contiguous(const_cast<uint8_t*>(f.tower.data()), vt::DType::kF32,
+                                               q.device, {E * N, K});
+        wt.dtype = c.dtype;  // block dtype: elementwise strides are inert
+        vt::MatmulBTQuantGrouped(q, ot, at, wt, eid);
+      }
+
+      // (B) P per-expert kMatmulBTQuant calls on the same slices/rows.
+      std::vector<float> op(static_cast<size_t>(P * N), 0.0F);
+      for (int64_t p = 0; p < P; ++p) {
+        void* arow = adt == vt::DType::kF32
+                         ? static_cast<void*>(a32.data() + p * K)
+                         : static_cast<void*>(a16.data() + p * K);
+        vt::Tensor at = vt::Tensor::Contiguous(arow, adt, q.device, {1, K});
+        vt::Tensor ot = vt::Tensor::Contiguous(op.data() + p * N,
+                                               vt::DType::kF32, q.device, {1, N});
+        vt::Tensor wt = ExpertSlice(f, c, f.eids[static_cast<size_t>(p)], N, K,
+                                    q.device);
+        vt::MatmulBTQuant(q, ot, at, wt);
+      }
+
+      REQUIRE(og.size() == op.size());
+      CHECK(std::memcmp(og.data(), op.data(), og.size() * sizeof(float)) == 0);
+    }
+  }
+}
+
+TEST_CASE("grouped keep-quant GEMM == per-expert slice for a BF16 output") {
+  // `IsOutFloat` accepts bf16, and StoreOutF32 writes it — but the grouped
+  // kernel must also STRIDE the output rows by the output dtype.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t E = 4;
+  const int64_t N = 6;
+  const int64_t P = 5;
+
+  for (const WeightCase& c : kWeightCases) {
+    CAPTURE(std::string(c.name));
+    const int64_t K = 2 * c.block_elems;
+    const GroupedFixture f = MakeGrouped(c, E, N, K, P, 0x1234U);
+
+    std::vector<uint16_t> og(static_cast<size_t>(P * N), 0);
+    {
+      std::vector<int32_t> ids = f.eids;
+      vt::Tensor at = vt::Tensor::Contiguous(
+          const_cast<float*>(f.a_f32.data()), vt::DType::kF32, q.device, {P, K});
+      vt::Tensor ot =
+          vt::Tensor::Contiguous(og.data(), vt::DType::kBF16, q.device, {P, N});
+      vt::Tensor eid =
+          vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+      vt::Tensor wt = vt::Tensor::Contiguous(const_cast<uint8_t*>(f.tower.data()), vt::DType::kF32,
+                                             q.device, {E * N, K});
+      wt.dtype = c.dtype;
+      vt::MatmulBTQuantGrouped(q, ot, at, wt, eid);
+    }
+
+    std::vector<uint16_t> op(static_cast<size_t>(P * N), 0);
+    for (int64_t p = 0; p < P; ++p) {
+      vt::Tensor at = vt::Tensor::Contiguous(
+          const_cast<float*>(f.a_f32.data()) + p * K, vt::DType::kF32, q.device,
+          {1, K});
+      vt::Tensor ot = vt::Tensor::Contiguous(op.data() + p * N, vt::DType::kBF16,
+                                             q.device, {1, N});
+      vt::Tensor wt =
+          ExpertSlice(f, c, f.eids[static_cast<size_t>(p)], N, K, q.device);
+      vt::MatmulBTQuant(q, ot, at, wt);
+    }
+
+    REQUIRE(og.size() == op.size());
+    CHECK(std::memcmp(og.data(), op.data(), og.size() * sizeof(uint16_t)) == 0);
+  }
+}
