@@ -42227,3 +42227,44 @@ Voxtral remain off-registry (fold #9/#10 of the audit).
 
   Next levers, unstarted: wider per-lane GEMV loads, and Tier-1 vocabulary for the
   `qkv_split -> rope -> reshape_and_cache` chain (672 dispatches -> 224).
+
+- **2026-08-07 (issue #125, AMD)** — **★ An external Vulkan-on-AMD report found a
+  bug that is NOT AMD-specific: `qwen3_5.cpp` hands a HOST pointer to a DEVICE
+  kernel on every non-CUDA backend.**
+
+  Reporter `fprimex` on AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, Slackware,
+  RADV implied). Two failures, neither about AMD:
+
+  **(1) FP8 Qwen3.6-27B is unsupported on EVERY device.** The dense loader calls
+  `LoadMergedBf16RawNK` unconditionally for `linear_attn.in_proj_*`; only the
+  MoE/35B leg has `LoadFp8Raw`. Device-independent — it fails identically on GB10.
+
+  **(2) `vulkan: embedding: table points outside every Vulkan allocation`.**
+  VERIFIED IN SOURCE: `qwen3_5.cpp:795` gates weight upload on
+  `needs_weight_staging()`, which is `true` **only on CUDA**
+  (`cuda.cpp:67`; base default `false` at `interface.h:218`, and `VulkanPlatform`
+  does not override). So on Vulkan it aliases the mmap'd HOST bytes into a Tensor
+  tagged `kVULKAN`, and the first native kernel — embedding — throws.
+
+  **The shared framework helper was ALREADY FIXED for exactly this**, and says so:
+  `dense_attn_block.h:186-189` reads *"HOST-POINTER ALIASING IS A CPU PROPERTY,
+  NOT A 'NOT-CUDA' PROPERTY"* and uses `is_cpu()`. **25 model files include it.
+  `qwen3_5.cpp` does not** — it carries a duplicate with a different, still
+  CUDA-only, predicate. This is the off-framework-model hazard
+  [[decode-framework-routing-audit]] names, caught in the wild by a user.
+
+  **So Qwen3.6-27B/35B cannot run on Vulkan OR Metal on ANY box, including ours.**
+  It went unnoticed because the only model ever run e2e on Vulkan is opt-125m,
+  which routes through the FIXED helper. Nothing about AMD, RADV or wave64 is
+  implicated — and no Vulkan capability probe ever ran, because it died before the
+  first dispatch.
+
+  Second instance, same file: `ResidentWeightF32` (`:836`) hands out
+  `std::vector<float>::data()` under the same predicate — it will throw next.
+
+  **The discriminating test to ask for: run opt-125m on gfx1151.** It is the one
+  model proven token-exact on Vulkan and it takes the fixed path. If it works,
+  there is no AMD-specific defect in evidence at all.
+
+  Their build predates command-buffer batching (their `vulkan_backend.cpp:144` is
+  our `:164` today), so none of today's work is implicated either.
