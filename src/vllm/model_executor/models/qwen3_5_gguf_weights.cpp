@@ -140,7 +140,7 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
 }
 
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
-                       int64_t row_offset, const GgufFile* mmap_src, bool nk) {
+                       int64_t row_offset, const GgufFile* mmap_src, bool nk, bool elem_kn_repack) {
   VT_CHECK(KeepF16DType(tensor.ggml_type),
            "qwen3_5 gguf: keep-f16 on a non-f16 encoding for " + tensor.name);
   VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
@@ -161,6 +161,20 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
   // a [vocab, H] gather table (embedding), read row-wise by EmbeddingKernel.
   o.nk = nk;
   const uint8_t* src = tensor.data + begin;
+
+  // KERNEL-GEMM-CPU-TILED lever 2: transpose [N,K] -> [K,N] so vt::MatmulBT
+  // reaches the transpose-free nk/nkm kernels (1.16x to 1.30x on dgx,
+  // byte-identical). Only for the MatmulBT orientation: an `nk == false` tensor
+  // is an embedding gather table read row-wise by EmbeddingKernel, which would
+  // read transposed bytes as garbage. Rewrites the buffer, so like the quant
+  // repack branches it always COPIES and drops the now-dead source pages.
+  if (elem_kn_repack && nk && vt::cpu::ElemRepackEligible(o.dtype, n, k)) {
+    o.bytes.assign(src, src + bytes);
+    vt::cpu::ElemRepackWeight(o.dtype, o.bytes.data(), n, k);
+    o.elem_kn_repacked = true;
+    if (mmap_src != nullptr) mmap_src->DropSpanResidency(src, bytes);
+    return o;
+  }
 
   if (mmap_src == nullptr) {
     o.bytes.assign(src, src + bytes);  // copy into an owned buffer
@@ -233,7 +247,8 @@ OwnedTensor OwnGgufKeptSlice(const GgufFile& g, const GgufLoadPolicy& pol,
   VT_CHECK(r == GgufResidency::kKeepF16,
            "qwen3_5 gguf: OwnGgufKeptSlice called for a non-keep residency on " +
                t.name);
-  return OwnGgufF16(t, n, k, row_offset, MmapSrc(g, pol), /*nk=*/true);
+  return OwnGgufF16(t, n, k, row_offset, MmapSrc(g, pol), /*nk=*/true,
+                    pol.elem_kn_repack);
 }
 
 bool HasTensor(const GgufFile& g, const std::string& name) {
@@ -735,8 +750,9 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   // historical bf16 expansion. A quantized embedding is never keep-eligible.
   if (embed_r == GgufResidency::kKeepF16) {
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
+    // Embedding gather table: never repacked (EmbeddingKernel reads it row-wise).
     *embed = OwnGgufF16(et, et.shape[0], et.shape[1], 0, MmapSrc(g, pol),
-                        /*nk=*/false);
+                        /*nk=*/false, /*elem_kn_repack=*/false);
   } else {
     VT_CHECK(embed_r == GgufResidency::kExpandBf16,
              "qwen3_5 gguf: the embedding table cannot keep quant blocks");

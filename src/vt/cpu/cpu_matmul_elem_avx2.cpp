@@ -233,6 +233,34 @@ void BtM4Avx2(const float* af, int64_t a_stride, const void* bv, int64_t k, floa
   }
 }
 
+// M-blocked [K,N]. No transpose, so the 2 weight vectors per p are simply
+// reused across kMrAvx2 activation rows. Same per-output p order.
+template <ElemKind K>
+void NkM4Avx2(const float* af, int64_t a_stride, const void* bv, int64_t k, int64_t n,
+              float* acc) {
+  using T = typename ElemA<K>::T;
+  const T* b = static_cast<const T*>(bv);
+  __m256 A[kMrAvx2][2];
+  for (int r = 0; r < kMrAvx2; ++r) {
+    A[r][0] = _mm256_setzero_ps();
+    A[r][1] = _mm256_setzero_ps();
+  }
+  for (int64_t p = 0; p < k; ++p) {
+    const T* row = b + p * n;
+    const __m256 w0 = LoadX8<K>(row);
+    const __m256 w1 = LoadX8<K>(row + 8);
+    for (int r = 0; r < kMrAvx2; ++r) {
+      const __m256 av = _mm256_set1_ps(af[r * a_stride + p]);
+      A[r][0] = _mm256_add_ps(A[r][0], _mm256_mul_ps(w0, av));
+      A[r][1] = _mm256_add_ps(A[r][1], _mm256_mul_ps(w1, av));
+    }
+  }
+  for (int r = 0; r < kMrAvx2; ++r) {
+    _mm256_storeu_ps(acc + r * kElemLanes, A[r][0]);
+    _mm256_storeu_ps(acc + r * kElemLanes + 8, A[r][1]);
+  }
+}
+
 }  // namespace
 
 void FillAvx2Tier(ElemGemmTierTable* t) {
@@ -248,6 +276,9 @@ void FillAvx2Tier(ElemGemmTierTable* t) {
   t->btm[kF32i] = &BtM4Avx2<ElemKind::kF32>;
   t->btm[kF16i] = &BtM4Avx2<ElemKind::kF16>;
   t->btm[kBF16i] = &BtM4Avx2<ElemKind::kBF16>;
+  t->nkm[kF32i] = &NkM4Avx2<ElemKind::kF32>;
+  t->nkm[kF16i] = &NkM4Avx2<ElemKind::kF16>;
+  t->nkm[kBF16i] = &NkM4Avx2<ElemKind::kBF16>;
   t->mr = kMrAvx2;
   t->name = "avx2";
 }

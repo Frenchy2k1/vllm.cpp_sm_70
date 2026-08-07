@@ -66,6 +66,10 @@ struct OwnedTensor {
   // Same total bytes; set only on the owned (copy) residency (the transform
   // rewrites the buffer, so it cannot ride the read-only mmap borrow).
   bool q8_0_aligned = false;
+  // KERNEL-GEMM-CPU-TILED lever 2: the [N,K] elementwise bytes were transposed
+  // to [K,N] at load. Carried to vt::Tensor::elem_kn_repacked; shape stays
+  // [N,K]. Opt-in (VT_CPU_ELEM_KN_REPACK=1) and CPU-only, see the flag comment.
+  bool elem_kn_repacked = false;
 
   // A synchronized direct-device load may discard the host staging buffer while
   // retaining an authoritative d_dev/d_dev_f32 copy. Empty() is used as model

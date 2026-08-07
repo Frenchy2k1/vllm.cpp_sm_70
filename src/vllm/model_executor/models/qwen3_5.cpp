@@ -802,8 +802,23 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // garbage. Only ever true on the CPU keep-quant path (a staged device never
     // repacks), so it is inert everywhere else.
     t.repacked = w.repacked;
+    // Same reasoning for the elementwise [N,K] -> [K,N] repack: without this the
+    // kernel would read transposed bytes as a plain [N,K] weight. Set only on
+    // this CPU-resident construction, which is exactly where MatmulBTKernel
+    // consumes it; a staged device weight is never elem-repacked.
+    t.elem_kn_repacked = w.elem_kn_repacked;
     return t;
   }
+  // AUDIT GUARD (KERNEL-GEMM-CPU-TILED lever 2). Only the CPU MatmulBTKernel
+  // honours elem_kn_repacked, and the staging path below uploads bytes verbatim
+  // and returns a tensor WITHOUT the marker, so a repacked weight reaching a
+  // staged device would be read as plain [N,K] and produce garbage silently.
+  // VT_CPU_ELEM_KN_REPACK is CPU-only and the loader policy cannot see the
+  // device, so this is where the invariant is enforced: fail loudly at load
+  // rather than corrupt tokens at inference.
+  VT_CHECK(!w.elem_kn_repacked,
+           "qwen3_5: an elem_kn_repacked ([K,N]) weight reached device staging; "
+           "VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);

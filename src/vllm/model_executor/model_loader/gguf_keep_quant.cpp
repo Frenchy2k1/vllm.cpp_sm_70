@@ -217,6 +217,20 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // QuantRepackActive() is the single source of the on/off decision, so the
   // loader and the kernel can never disagree about whether repack is live.
   p.quant_repack = p.keep_quant && !p.cpu_ref && vt::cpu::QuantRepackActive();
+  // KERNEL-GEMM-CPU-TILED lever 2, elementwise [N,K] -> [K,N] repack-at-load.
+  // OPT-IN ONLY (default false) because the repacked bytes are transposed and
+  // only the CPU MatmulBTKernel honours Tensor.elem_kn_repacked today; see the
+  // field comment. Forced off by the oracle switch like every other load
+  // transform, so VT_CPU_REF=1 still reproduces the historical load.
+  // Gated on the CPU platform, not just the env var. Only the CPU
+  // MatmulBTKernel honours Tensor::elem_kn_repacked, and a staged device would
+  // upload the transposed bytes and read them as [N,K]. CurrentPlatform() is
+  // the same seam GgufQuantComputeAvailable() above already uses to decide a
+  // load transform, so the policy CAN see this and should not be left to a
+  // runtime backstop alone (ResidentWeight also VT_CHECKs, belt and braces).
+  p.elem_kn_repack = !p.cpu_ref && EnvOnOr("VT_CPU_ELEM_KN_REPACK", false) &&
+                     vllm::platforms::CurrentPlatform().device_type() ==
+                         vt::DeviceType::kCPU;
   return p;
 }
 

@@ -398,6 +398,13 @@ them, each in its own ISA-flagged TU. Byte-identical to the portable tier on eve
 widening adds OUTPUT lanes, each output's K reduction stays sequential, and products are
 mul-then-add, never FMA. Speed is indicative only, the x86 box is VOID for timing.
 
+CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07): M-blocked `[K,N]` micro-kernels on every
+tier, the `mr` dispatch degated from `[N,K]` only (it forced mr=1 on `[K,N]`, so a 131-row activation
+re-read the whole weight 131 times), and an opt-in load-time `[N,K]` to `[K,N]` repack
+(`VT_CPU_ELEM_KN_REPACK`, CPU-only, default off) so `vt::MatmulBT` can reach that family at all.
+Byte-identical: both orientations accumulate each output over K in strict increasing order, so the
+repack is a layout choice and never a numerical one.
+
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
@@ -939,39 +946,11 @@ run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ e
 
 (2026-08-01 nsys state and Q8_0-GEMV-lever framing superseded by the 2026-08-04 binding parity line; detail in the benchmark record.)
 Row `ACTIVE`; see docs/BENCHMARKS.md.
-**Last-mile campaign — Bricks 0 and 1 (2026-07-30): the keep-quant GEMM roofline profile, then the
-`__dp4a` vectorized-dequant matvec (Q2_K grouped 2.35x, IQ2_XXS flat and grid-serialization-bound).
-Bit-identical; decode 8.01 -> 8.51 tok/s.** Per-brick forensics, profiler tables and the refuted
-framings live in [.agents/benchmark-record.md](../.agents/benchmark-record.md).
-**Last-mile campaign — Brick 1b: IQ2_XXS grid-lookup fix (`__constant__` → GLOBAL) — the flat kernel unblocked,
-+12.5% (2026-07-30, base `f6c34252`, branch `deepseek-v4-last-mile`, commit `e4d8845b`, NOT pushed).** Brick 1's
-finding: IQ2_XXS grouped stayed at ~19% of peak because `d_iq2xxs_grid[256]` is `__constant__` and the 32 warp
-lanes read DIFFERENT indices → divergent constant reads serialize ~32×/warp. FIX: moved `d_iq2xxs_grid` +
-`d_ksigns_iq2xs` to `__device__` GLOBAL (L2-cached, cross-lane parallel; llama.cpp's mmvq does the same).
-BIT-IDENTICAL (same literals): `test_cuda_quant_dot` **2/2·105601 nmse≤1e-6 ZERO drift**; `test_cuda_deepseek_v4`
-18/18; `test_deepseek_v4_gguf_load` 12/12; real model resident-default TOKEN-IDENTICAL "…Paris.". **RESULT:
-IQ2_XXS grouped 2.45× (median 265→108 µs; 19% → 46% of peak — now memory-bound-ish like Q2_K 56% / Q8_0 63%;
-22.8% → 10.0% of step). Decode 8.51 → 9.58 tok/s (+12.5%, 5 stable warm) vs ds4 16.5 (~58% of ds4;
-campaign-cumulative host 6.44 → 9.58 = +49%).** The grouped-MoE dequant lever (Bricks 1+1b) is DONE. NEXT:
-Brick 2 (activation-quant fusion, ~14% launch-bound) → Brick 3 (Q8_0 coalescing, 43% at 63% of peak). STOPPED
-for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
-**Last-mile campaign — Brick 2: routed gate/up activation preq-reuse (broadcast) — bit-exact +4.6% (2026-07-30,
-base `67bb8d1c` after rebase, branch `deepseek-v4-last-mile`, commit `99d2b282`→amended, NOT pushed).** The
-resident-decode routed experts fed `xrep` — topk-identical copies of the shared hidden x — into the gate + up
-grouped GEMMs, re-quantizing an IDENTICAL row per expert (6× redundant) + a per-layer topk `AsyncCopyF`. FIX
-(ds4's preq pattern): the grouped providers (Q8_K + Q8_0) detect a 1-row activation (`act.shape[0]==1 && P>1`) →
-quantize ONE row, kernels read block-set 0 for all p (`bcast`); the resident forward (eager + graph) passes x
-with `act_rows=1`, dropping xrep. BIT-IDENTICAL (identical input → identical block-quant → identical dot):
-`test_cuda_quant_dot` **2/2·105601 nmse≤1e-6**; `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load`
-**13/13·631** (+1 broadcast==replicated BYTE-IDENTICAL + RED-first case); real 80.7 GB model resident-default
-TOKEN-IDENTICAL "…Paris." (ids byte-equal to host `=0`). **RESULT (nsys re-profile, 50 tok): `QuantizeQ8K`
-9.8%→7.3%, `QuantizeQ8_0` 4.5%→4.7% (bucket ~14.3%→~12.0%). Decode 9.58 → 10.02 tok/s (+4.6%, 6 stable warm runs
-9.99–10.04; nvidia-smi 92% util)** (host `=0` 8.47→8.50, MoE host path unchanged) vs ds4 16.5 (~61% of ds4;
-campaign-cumulative host 6.44 → 10.02 = +56%). HONEST: the quant bucket is LAUNCH-bound (fixed per-launch
-overhead dominates → cutting per-launch rows 6→1 barely moves the %); the +4.6% comes mostly from eliminating
-the 6×/layer xrep host-copies. Remaining quant lever = LAUNCH-COUNT reduction (fuse quant into GEMM / dedup
-gate+up). NEXT: Brick 3 (Q8_0 coalescing — now **45%** of step at 63% of peak, the dominant lever). STOPPED for
-review. Rollback `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Bricks 0 to 2 (2026-07-30): the keep-quant GEMM roofline profile, the `__dp4a`
+vectorized-dequant matvec, the IQ2_XXS grid-lookup fix (`__constant__` to GLOBAL) and routed gate/up
+activation preq-reuse. Every step bit-identical; decode 8.01 -> 10.02 tok/s.** Per-brick forensics,
+profiler tables and the refuted framings live in
+[.agents/benchmark-record.md](../.agents/benchmark-record.md).
 **Last-mile campaign — Brick 3: Q8_0 GEMM vectorized dp4a dot — BIT-EXACT but NEAR-FLAT +0.5% (the Q8_0 matvec is
 at the 34-byte-block MEMORY WALL) (2026-07-30, base `dd6cc93c`, branch `deepseek-v4-last-mile`, commit
 `91e51aea`→amended, NOT pushed).** `QuantDotGemmQ8_0Kernel` (+grouped, ~45% of step at 63% of BW peak) read the 32

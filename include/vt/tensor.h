@@ -38,6 +38,21 @@ struct Tensor {
   // block byte order differs. Mutually exclusive with `repacked` (CPU i8mm).
   bool q8_0_aligned = false;
 
+  // KERNEL-GEMM-CPU-TILED lever 2: this is a [N,K] elementwise (f32/f16/bf16)
+  // weight whose BYTES were transposed at load into [K,N]. Storage only, and
+  // the SHAPE still reads [N,K] so `vt::MatmulBT`'s contract is unchanged for
+  // every caller. Set by the loader via `vt::cpu::ElemRepackWeight`, consumed
+  // by `MatmulBTKernel`, which then presents the buffer as the [K,N] tensor it
+  // literally is and takes the transpose-free `nk`/`nkm` micro-kernels.
+  //
+  // Bit-exactness: the two orientations produce BYTE-IDENTICAL results for the
+  // same logical weight (both accumulate each output over K in strict
+  // increasing order; measured on dgx at every conformer shape), so this is a
+  // pure layout choice and never a numerical one. Ignored on every other op and
+  // on non-CPU devices. Mutually exclusive with the block-quant flags above,
+  // which apply to block dtypes this one never does.
+  bool elem_kn_repacked = false;
+
   static Tensor Contiguous(void* data, DType dtype, Device device,
                            std::initializer_list<int64_t> shape);
 
