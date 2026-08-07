@@ -52,21 +52,26 @@ const bool kDispatchStats = [] {
 }();
 // COMMAND-BUFFER BATCHING (VK-A2), VT_VULKAN_BATCH.
 //
-// DEFAULT OFF, deliberately, and this is the one place in this backend where a
-// measured win does NOT immediately become the default. Batching is only sound if
-// EVERY host read of device memory flushes first, and this backend has a host-read
-// path that is not a method on it: the PORTABLE REFERENCE TIER runs CPU kernels
-// directly against the shared mapped allocation for any op with no native Vulkan
-// kernel. Backend::Copy/Memset/Synchronize flush, but a reference-tier op reading
-// a buffer a pending dispatch has not yet written would read STALE BYTES, with no
-// error and no crash -- the failure mode this campaign has already paid for twice.
+// DEFAULT ON. `=0` forces the per-dispatch submit-and-wait path, as a bisect
+// lever and for the same-binary A/B that measured this (decode 2.62x, 8 of 8
+// interleaved pairs on GB10).
 //
-// Flipping the default is a separate change that must first make the reference
-// tier flush. Until then this measures the ceiling honestly without shipping a
-// silent-corruption path.
+// Batching is sound only if EVERY host read of device memory drains the batch
+// first, and there are exactly three such paths. Backend::Copy and Memset are
+// host memcpy over the persistently mapped allocation, and Synchronize is the
+// caller's explicit "make results readable" point -- all three flush. The third
+// is not a method on this backend at all: the PORTABLE REFERENCE TIER runs CPU
+// kernels DIRECTLY over device memory for any op with no native Vulkan kernel,
+// which is sound only because this backend is unified-memory.
+//
+// That last one is covered by `Backend::FlushPending` (backend.h:44-49), which
+// op_provider.cpp calls before dispatching a reference-tier kernel and which the
+// Vulkan backend implements. Without it a host kernel would read bytes a pending
+// dispatch had not written -- silently, with no error, which is the failure mode
+// this campaign has already paid for twice.
 const bool kBatchDispatch = [] {
   const char* v = std::getenv("VT_VULKAN_BATCH");
-  return v != nullptr && std::strcmp(v, "0") != 0;
+  return v == nullptr || std::strcmp(v, "0") != 0;
 }();
 
 // Cap on dispatches per submit. Bounded so a batch cannot pin an unbounded number
@@ -788,6 +793,8 @@ size_t VulkanContext::PipelineCacheSize() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   return static_cast<std::map<std::string, Pipeline>*>(pipelines_)->size();
 }
+
+bool VulkanContext::batching_enabled() const { return kBatchDispatch; }
 
 uint32_t VulkanContext::pending_batch() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));

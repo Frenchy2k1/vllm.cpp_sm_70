@@ -128,6 +128,12 @@ class VulkanContext {
   // allocation, so a pending batch means the host reads STALE bytes -- silently,
   // with no error. Backend::Copy, Memset and Synchronize all flush.
   void FlushBatch();
+  // Whether dispatch batching is active. Exposed so a test never has to restate
+  // the default: the VK-A2 gate originally re-derived it from the environment
+  // variable and silently asserted the wrong branch the moment the default
+  // flipped from off to on. A predicate duplicated between an implementation and
+  // its gate is a predicate that will disagree with itself.
+  bool batching_enabled() const;
   // Dispatches currently recorded and not yet submitted. For the gate: batching
   // is invisible in results by construction (same kernels, same order), so a test
   // has to assert the MECHANISM rather than the numbers.
