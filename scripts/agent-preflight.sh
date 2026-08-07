@@ -171,6 +171,19 @@ for suite in "${SUITES[@]}"; do
   run "$suite" python3 "tests/scripts/$suite.py"
 done
 
+# The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
+# --staged block: `--staged` inspects staged paths and is therefore VACUOUS after
+# `git commit`, which is when preflight normally runs -- so the obligation went
+# unchecked for a whole series and PR #80 landed eight commits that reddened
+# documentation-checkpoint on main, where a diff-scoped range is never re-covered.
+# Gating this on --staged would reproduce that hole exactly.
+if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
+   [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
+  echo "Committed range vs origin/main:"
+  run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
+    --base origin/main --head HEAD
+fi
+
 if [ "$STAGED" -eq 1 ]; then
   echo "Staged change:"
   run "doc-checkpoint --staged" python3 scripts/check-doc-checkpoint.py --staged
