@@ -140,6 +140,23 @@ bool QuantRepackActive();
 // the normal path — correct, just unrepacked.
 bool QuantRepackEligible(DType weight_dtype, int64_t n, int64_t k);
 
+// --- ELEMENTWISE repack-at-load (KERNEL-GEMM-CPU-TILED lever 2) -------------
+// The non-quant sibling of the block repack above, declared here for the same
+// reason: the loader needs it and `src/vt/cpu/cpu_matmul_elem.h` is private.
+//
+// Transposes an ELEMENTWISE (f32/f16/bf16) [N,K] matmul weight into [K,N] so
+// `vt::MatmulBT` reaches the transpose-free `nk`/`nkm` micro-kernels, measured
+// 1.16x to 1.30x on dgx and BYTE-IDENTICAL (both orientations accumulate each
+// output over K in strict increasing order). Pure permutation: same bytes, same
+// count, so no product and no sum can change.
+//
+// The caller must set `Tensor.elem_kn_repacked` on the resulting weight. Only
+// the CPU `MatmulBTKernel` honours that flag, so a repacked buffer handed to
+// any other consumer would be read as [N,K] and be garbage; the loader keeps
+// this opt-in (VT_CPU_ELEM_KN_REPACK=1) for exactly that reason.
+bool ElemRepackEligible(DType weight_dtype, int64_t n, int64_t k);
+void ElemRepackWeight(DType weight_dtype, uint8_t* bytes, int64_t n, int64_t k);
+
 // Repack a [N,K] q8_0 weight buffer IN PLACE into the block_q8_0x4 interleave.
 // `blocks` holds N*(K/32) plain BlockQ8_0 on entry and N/4 groups of (K/32)
 // BlockQ8_0x4 on return (same total bytes). Requires QuantRepackEligible.

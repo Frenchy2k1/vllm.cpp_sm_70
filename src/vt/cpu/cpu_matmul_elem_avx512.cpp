@@ -172,6 +172,24 @@ void BtM6Avx512(const float* af, int64_t a_stride, const void* bv, int64_t k, fl
   }
 }
 
+// M-blocked [K,N]. One 16-wide weight load per p, reused across kMrAvx512 rows,
+// no transpose. Same per-output p order.
+template <ElemKind K>
+void NkM6Avx512(const float* af, int64_t a_stride, const void* bv, int64_t k, int64_t n,
+                float* acc) {
+  using T = typename ElemZ<K>::T;
+  const T* b = static_cast<const T*>(bv);
+  __m512 A[kMrAvx512];
+  for (int r = 0; r < kMrAvx512; ++r) A[r] = _mm512_setzero_ps();
+  for (int64_t p = 0; p < k; ++p) {
+    const __m512 w = LoadX16<K>(b + p * n);
+    for (int r = 0; r < kMrAvx512; ++r) {
+      A[r] = _mm512_add_ps(A[r], _mm512_mul_ps(w, _mm512_set1_ps(af[r * a_stride + p])));
+    }
+  }
+  for (int r = 0; r < kMrAvx512; ++r) _mm512_storeu_ps(acc + r * kElemLanes, A[r]);
+}
+
 }  // namespace
 
 void FillAvx512Tier(ElemGemmTierTable* t) {
@@ -187,6 +205,9 @@ void FillAvx512Tier(ElemGemmTierTable* t) {
   t->btm[kF32i] = &BtM6Avx512<ElemKind::kF32>;
   t->btm[kF16i] = &BtM6Avx512<ElemKind::kF16>;
   t->btm[kBF16i] = &BtM6Avx512<ElemKind::kBF16>;
+  t->nkm[kF32i] = &NkM6Avx512<ElemKind::kF32>;
+  t->nkm[kF16i] = &NkM6Avx512<ElemKind::kF16>;
+  t->nkm[kBF16i] = &NkM6Avx512<ElemKind::kBF16>;
   t->mr = kMrAvx512;
   t->name = "avx512";
 }

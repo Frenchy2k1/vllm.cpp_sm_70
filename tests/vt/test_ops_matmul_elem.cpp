@@ -13,6 +13,7 @@
 // the 16 output lanes) and thread counts.
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,7 @@
 
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/quant.h"
 #include "vt/cpu/cpu_matmul_elem.h"    // via -I src
 #include "vt/cpu/cpu_threadpool.h"  // Threadpool::SwapForTesting
 
@@ -269,6 +271,73 @@ TEST_CASE("elementwise CPU GEMM: inf/nan weight patterns match the scalar conver
       std::vector<uint8_t> want;
       RefGemm(true, 1, n, k, a, wref, DType::kF32, &want);
       CHECK(std::memcmp(got.data(), want.data(), want.size()) == 0);
+    }
+  }
+}
+
+// KERNEL-GEMM-CPU-TILED lever 2. A loader-repacked weight ([N,K] bytes
+// transposed to [K,N], shape unchanged) must give BYTE-IDENTICAL results to the
+// same logical weight left alone. This is the whole justification for the
+// repack: it is a layout choice, never a numerical one. If it ever stops being
+// byte-identical the repack must be reverted, not the gate loosened.
+TEST_CASE("elementwise CPU GEMM: load-time [N,K]->[K,N] repack is byte-identical") {
+  for (int kind = 0; kind < 3; ++kind) {
+    const vt::DType dt = (kind == 0)   ? vt::DType::kF32
+                         : (kind == 1) ? vt::DType::kF16
+                                       : vt::DType::kBF16;
+    // Ragged K and N on purpose: the tail paths must agree too.
+    for (const auto& shape : std::vector<std::array<int64_t, 3>>{
+             {1, 64, 32}, {4, 96, 48}, {7, 33, 16}, {17, 128, 64}, {33, 65, 80}}) {
+      const int64_t m = shape[0], k = shape[1], n = shape[2];
+      CAPTURE(kind);
+      CAPTURE(m);
+      CAPTURE(k);
+      CAPTURE(n);
+
+      std::vector<float> a(static_cast<size_t>(m * k));
+      for (size_t i = 0; i < a.size(); ++i) a[i] = 0.013f * (float)((i % 71) - 35);
+      std::vector<float> wf(static_cast<size_t>(n * k));
+      for (size_t i = 0; i < wf.size(); ++i) wf[i] = 0.011f * (float)((i % 83) - 41);
+
+      const size_t esz = vt::SizeOf(dt);
+      std::vector<uint8_t> plain(wf.size() * esz), repacked(wf.size() * esz);
+      for (size_t i = 0; i < wf.size(); ++i) {
+        if (dt == vt::DType::kF32) {
+          std::memcpy(plain.data() + i * esz, &wf[i], esz);
+        } else if (dt == vt::DType::kF16) {
+          const uint16_t h = vt::F32ToF16(wf[i]);
+          std::memcpy(plain.data() + i * esz, &h, esz);
+        } else {
+          const uint16_t h = vt::F32ToBF16(wf[i]);
+          std::memcpy(plain.data() + i * esz, &h, esz);
+        }
+      }
+      repacked = plain;
+      REQUIRE(vt::cpu::ElemRepackEligible(dt, n, k));
+      vt::cpu::ElemRepackWeight(dt, repacked.data(), n, k);
+
+      Queue q = CpuQueue();
+      std::vector<float> out_plain(static_cast<size_t>(m * n), 0.0f);
+      std::vector<float> out_repacked(static_cast<size_t>(m * n), 0.0f);
+
+      vt::Tensor ta = vt::Tensor::Contiguous(a.data(), vt::DType::kF32,
+                                             Cpu(), {m, k});
+      vt::Tensor tb = vt::Tensor::Contiguous(plain.data(), dt,
+                                             Cpu(), {n, k});
+      vt::Tensor tbr = vt::Tensor::Contiguous(repacked.data(), dt,
+                                              Cpu(), {n, k});
+      tbr.elem_kn_repacked = true;
+      vt::Tensor to = vt::Tensor::Contiguous(out_plain.data(), vt::DType::kF32,
+                                             Cpu(), {m, n});
+      vt::Tensor tor = vt::Tensor::Contiguous(out_repacked.data(), vt::DType::kF32,
+                                              Cpu(), {m, n});
+
+      vt::MatmulBT(q, to, ta, tb);
+      vt::MatmulBT(q, tor, ta, tbr);
+
+      // memcmp, not Approx: the claim is byte-identity.
+      CHECK(std::memcmp(out_plain.data(), out_repacked.data(),
+                        out_plain.size() * sizeof(float)) == 0);
     }
   }
 }

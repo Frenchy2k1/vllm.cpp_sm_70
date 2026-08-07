@@ -344,7 +344,13 @@ STATUS_RATCHET = {
     # in an abridged form; the fuller originals already live in
     # .agents/benchmark-record.md, so the duplicates collapsed to their binding
     # result plus a pointer. Nothing was lost, only de-duplicated. Net -1755.
-    "chars": 281700,
+    #
+    # 279200 since 2026-08-07 (measured 279167): the transpose-free [K,N] row
+    # owes this page a status line, paid for the same way and out of the same
+    # duplication. Bricks 1b and 2 folded into the same one-line binding result
+    # as Bricks 0 and 1; the fuller originals stay in
+    # .agents/benchmark-record.md. Net -2501.
+    "chars": 279200,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

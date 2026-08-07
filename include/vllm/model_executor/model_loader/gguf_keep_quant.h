@@ -257,6 +257,20 @@ struct GgufLoadPolicy {
   // residency. VT_CPU_QUANT_REPACK=0 is the same-binary A/B opt-out (it also
   // turns off the kernel probe, so the two can never disagree).
   bool quant_repack = false;
+  // KERNEL-GEMM-CPU-TILED lever 2: transpose ELEMENTWISE (f32/f16/bf16) [N,K]
+  // matmul weights to [K,N] at load so `vt::MatmulBT` reaches the
+  // transpose-free `nk`/`nkm` micro-kernels (1.16x to 1.30x on dgx,
+  // byte-identical). Like quant_repack it rewrites the buffer and so forces the
+  // COPY residency for the tensors it touches.
+  //
+  // DEFAULT OFF, opt in with VT_CPU_ELEM_KN_REPACK=1, and that default is
+  // deliberate: the repacked bytes are TRANSPOSED, so any consumer that reads
+  // the tensor as [N,K] without honouring `Tensor.elem_kn_repacked` would read
+  // garbage. Only the CPU `MatmulBTKernel` honours it today. Turning this on by
+  // default requires auditing every non-CPU consumer of these weights first;
+  // until then a wrong default would be a silent correctness bug, not a slow
+  // path.
+  bool elem_kn_repack = false;
   // Optional observer; null in production.
   GgufRoutingAudit audit;
 

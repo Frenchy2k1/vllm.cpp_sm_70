@@ -54,11 +54,24 @@ using ElemNk16Fn = void (*)(const float* af, const void* b, int64_t k, int64_t n
 using ElemBtMFn = void (*)(const float* af, int64_t a_stride, const void* b, int64_t k,
                            float* acc);
 
+// The same [K,N] kernel over `mr` ACTIVATION ROWS at once (acc is mr*16, row
+// major). The [K,N] orientation needs no transpose, so what M blocking
+// amortizes here is the WEIGHT LOAD itself: one 16-wide load per p is reused by
+// every activation row instead of being re-read once per row. Like ElemBtMFn it
+// touches no output's accumulation order (lane l still accumulates output l
+// over p in strict increasing order), so it is bit-exact.
+//
+// Before this existed, cpu_ops.cpp forced mr=1 on the [K,N] path, so a
+// 131-row activation re-read the whole weight 131 times.
+using ElemNkMFn = void (*)(const float* af, int64_t a_stride, const void* b, int64_t k,
+                           int64_t n, float* acc);
+
 struct ElemGemmTierTable {
   ElemBt16Fn bt[static_cast<int>(ElemKind::kCount)];
   ElemNk16Fn nk[static_cast<int>(ElemKind::kCount)];
   ElemBtMFn btm[static_cast<int>(ElemKind::kCount)];
-  int mr;  // activation rows per btm call (1 = no M blocking)
+  ElemNkMFn nkm[static_cast<int>(ElemKind::kCount)];
+  int mr;  // activation rows per btm/nkm call (1 = no M blocking)
   const char* name;
 };
 
@@ -70,6 +83,9 @@ struct ElemGemmTierTable {
 void FillAvx2Tier(ElemGemmTierTable* t);
 void FillAvx512Tier(ElemGemmTierTable* t);  // cpu_matmul_elem_avx512.cpp
 #endif
+
+// The [N,K] -> [K,N] load-time repack entry points are declared in the PUBLIC
+// vt/quant.h (the loader needs them and this header is private).
 
 // Selected ONCE per process: compile-time ISA plus a runtime feature probe
 // (mirrors ggml's `ggml_cpu_has_*` discipline, ggml-cpu.c). The portable

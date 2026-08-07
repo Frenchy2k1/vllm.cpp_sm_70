@@ -2,6 +2,8 @@
 // anchors and the recorded "vectorize across OUTPUT columns, not along K"
 // deviation that keeps every result bit-identical to the scalar reference.
 #include "cpu_matmul_elem.h"
+#include "vt/quant.h"
+#include <vector>
 
 #include <cstdlib>
 #include <cstring>
@@ -74,6 +76,32 @@ void Nk16Portable(const float* af, const void* bv, int64_t k, int64_t n, float* 
     }
   }
   for (int l = 0; l < kElemLanes; ++l) acc[l] = s[l];
+}
+
+// M-blocked portable [K,N] kernel. Unlike the [N,K] side there IS something to
+// amortize without any transpose: the 16-wide weight load per p is shared by
+// every activation row. Accumulation order per output is unchanged.
+constexpr int kMrNkPortable = 4;
+
+template <ElemKind K>
+void NkM4Portable(const float* af, int64_t a_stride, const void* bv, int64_t k,
+                  int64_t n, float* acc) {
+  using E = Elem<K>;
+  const typename E::T* b = static_cast<const typename E::T*>(bv);
+  float s[kMrNkPortable][kElemLanes];
+  for (int r = 0; r < kMrNkPortable; ++r)
+    for (int l = 0; l < kElemLanes; ++l) s[r][l] = 0.0f;
+  for (int64_t p = 0; p < k; ++p) {
+    const typename E::T* row = b + p * n;
+    float w[kElemLanes];
+    for (int l = 0; l < kElemLanes; ++l) w[l] = E::Cvt(row[l]);
+    for (int r = 0; r < kMrNkPortable; ++r) {
+      const float av = af[r * a_stride + p];
+      for (int l = 0; l < kElemLanes; ++l) s[r][l] += av * w[l];
+    }
+  }
+  for (int r = 0; r < kMrNkPortable; ++r)
+    for (int l = 0; l < kElemLanes; ++l) acc[r * kElemLanes + l] = s[r][l];
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +246,29 @@ void Nk16Neon(const float* af, const void* bv, int64_t k, int64_t n, float* acc)
   vst1q_f32(acc + 4, a1);
   vst1q_f32(acc + 8, a2);
   vst1q_f32(acc + 12, a3);
+}
+
+// M-blocked NEON [K,N] kernel: no transpose, the 4 weight vectors per p are
+// shared across kMrNeon activation rows.
+template <ElemKind K>
+void NkM4Neon(const float* af, int64_t a_stride, const void* bv, int64_t k,
+              int64_t n, float* acc) {
+  using E = Elem<K>;
+  const typename E::T* b = static_cast<const typename E::T*>(bv);
+  float32x4_t A[kMrNeon][4];
+  for (int r = 0; r < kMrNeon; ++r)
+    for (int g = 0; g < 4; ++g) A[r][g] = vdupq_n_f32(0.0f);
+  for (int64_t p = 0; p < k; ++p) {
+    const typename E::T* row = b + p * n;
+    float32x4_t w[4];
+    for (int g = 0; g < 4; ++g) w[g] = LoadV4<K>(row + 4 * g);
+    for (int r = 0; r < kMrNeon; ++r) {
+      const float32x4_t av = vdupq_n_f32(af[r * a_stride + p]);
+      for (int g = 0; g < 4; ++g) A[r][g] = vaddq_f32(A[r][g], vmulq_f32(w[g], av));
+    }
+  }
+  for (int r = 0; r < kMrNeon; ++r)
+    for (int g = 0; g < 4; ++g) vst1q_f32(acc + r * kElemLanes + 4 * g, A[r][g]);
 }
 
 #endif  // __aarch64__
@@ -423,11 +474,61 @@ __attribute__((target("f16c"))) void Nk16F16c(const float* af, const void* bv, i
   for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + 4 * g, A[g]);
 }
 
+// M-blocked [K,N] f16 under F16C, sibling of Nk16F16c. Separate from
+// NkM2Sse2<kF16> because the f16 widen needs the F16C target attribute, which
+// is exactly how Bt16F16c/BtM2F16c are already handled.
+__attribute__((target("f16c"))) void NkM2F16c(const float* af, int64_t a_stride,
+                                              const void* bv, int64_t k, int64_t n,
+                                              float* acc) {
+  const uint16_t* b = static_cast<const uint16_t*>(bv);
+  __m128 A[kMrSse2][4];
+  for (int r = 0; r < kMrSse2; ++r)
+    for (int g = 0; g < 4; ++g) A[r][g] = _mm_setzero_ps();
+  for (int64_t p = 0; p < k; ++p) {
+    const uint16_t* row = b + p * n;
+    __m128 w[4];
+    for (int g = 0; g < 4; ++g) {
+      w[g] = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + 4 * g)));
+    }
+    for (int r = 0; r < kMrSse2; ++r) {
+      const __m128 av = _mm_set1_ps(af[r * a_stride + p]);
+      for (int g = 0; g < 4; ++g) A[r][g] = _mm_add_ps(A[r][g], _mm_mul_ps(w[g], av));
+    }
+  }
+  for (int r = 0; r < kMrSse2; ++r)
+    for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + r * kElemLanes + 4 * g, A[r][g]);
+}
+
 #endif  // x86-64
 
 constexpr int kF32 = static_cast<int>(ElemKind::kF32);
 constexpr int kF16 = static_cast<int>(ElemKind::kF16);
 constexpr int kBF16 = static_cast<int>(ElemKind::kBF16);
+
+#if defined(__x86_64__) || defined(_M_X64)
+// M-blocked SSE2 [K,N] kernel: no transpose, so unlike BtM2Sse2 the register
+// budget is 4 weight vectors plus kMrSse2*4 accumulators, which leaves room.
+template <ElemKind K>
+void NkM2Sse2(const float* af, int64_t a_stride, const void* bv, int64_t k,
+              int64_t n, float* acc) {
+  using E = Elem<K>;
+  const typename E::T* b = static_cast<const typename E::T*>(bv);
+  __m128 A[kMrSse2][4];
+  for (int r = 0; r < kMrSse2; ++r)
+    for (int g = 0; g < 4; ++g) A[r][g] = _mm_setzero_ps();
+  for (int64_t p = 0; p < k; ++p) {
+    const typename E::T* row = b + p * n;
+    __m128 w[4];
+    for (int g = 0; g < 4; ++g) w[g] = LoadX4<K>(row + 4 * g);
+    for (int r = 0; r < kMrSse2; ++r) {
+      const __m128 av = _mm_set1_ps(af[r * a_stride + p]);
+      for (int g = 0; g < 4; ++g) A[r][g] = _mm_add_ps(A[r][g], _mm_mul_ps(w[g], av));
+    }
+  }
+  for (int r = 0; r < kMrSse2; ++r)
+    for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + r * kElemLanes + 4 * g, A[r][g]);
+}
+#endif
 
 ElemGemmTierTable BuildPortableTier() {
   ElemGemmTierTable t{};
@@ -437,7 +538,13 @@ ElemGemmTierTable BuildPortableTier() {
   t.nk[kF32] = &Nk16Portable<ElemKind::kF32>;
   t.nk[kF16] = &Nk16Portable<ElemKind::kF16>;
   t.nk[kBF16] = &Nk16Portable<ElemKind::kBF16>;
-  t.mr = 1;  // no M blocking: the portable tier has no transpose to amortize
+  t.nkm[kF32] = &NkM4Portable<ElemKind::kF32>;
+  t.nkm[kF16] = &NkM4Portable<ElemKind::kF16>;
+  t.nkm[kBF16] = &NkM4Portable<ElemKind::kBF16>;
+  // btm stays null (no transpose to amortize on [N,K] here), but the [K,N]
+  // side amortizes the WEIGHT LOAD, so mr is now meaningful for nkm. The
+  // cpu_ops dispatch guards each family on its own function pointer.
+  t.mr = kMrNkPortable;
   t.name = "portable";
   return t;
 }
@@ -465,6 +572,9 @@ ElemGemmTierTable BuildTier() {
   t.btm[kF32] = &BtM4Neon<ElemKind::kF32>;
   t.btm[kF16] = &BtM4Neon<ElemKind::kF16>;
   t.btm[kBF16] = &BtM4Neon<ElemKind::kBF16>;
+  t.nkm[kF32] = &NkM4Neon<ElemKind::kF32>;
+  t.nkm[kF16] = &NkM4Neon<ElemKind::kF16>;
+  t.nkm[kBF16] = &NkM4Neon<ElemKind::kBF16>;
   t.mr = kMrNeon;
   t.name = "neon";
 #elif defined(__x86_64__) || defined(_M_X64)
@@ -474,12 +584,15 @@ ElemGemmTierTable BuildTier() {
   t.nk[kBF16] = &Nk16Sse2<ElemKind::kBF16>;
   t.btm[kF32] = &BtM2Sse2<ElemKind::kF32>;
   t.btm[kBF16] = &BtM2Sse2<ElemKind::kBF16>;
+  t.nkm[kF32] = &NkM2Sse2<ElemKind::kF32>;
+  t.nkm[kBF16] = &NkM2Sse2<ElemKind::kBF16>;
   t.mr = kMrSse2;
   t.name = "sse2";
   if (__builtin_cpu_supports("f16c")) {
     t.bt[kF16] = &Bt16F16c;
     t.nk[kF16] = &Nk16F16c;
     t.btm[kF16] = &BtM2F16c;
+    t.nkm[kF16] = &NkM2F16c;
     t.name = "sse2+f16c";
   } else {
     // No f16 M-blocked kernel without F16C: fall back to the 1-row path for
@@ -510,6 +623,28 @@ bool ElemKindOf(DType dt, ElemKind* out) {
     case DType::kF16: *out = ElemKind::kF16; return true;
     case DType::kBF16: *out = ElemKind::kBF16; return true;
     default: return false;
+  }
+}
+
+bool ElemRepackEligible(DType weight_dtype, int64_t n, int64_t k) {
+  ElemKind kind;
+  if (!ElemKindOf(weight_dtype, &kind)) return false;  // block dtypes: not ours
+  return n > 0 && k > 0;
+}
+
+void ElemRepackWeight(DType weight_dtype, uint8_t* bytes, int64_t n, int64_t k) {
+  VT_CHECK(ElemRepackEligible(weight_dtype, n, k),
+           "elem_repack_weight: weight is not repack-eligible");
+  const size_t esz = SizeOf(weight_dtype);
+  const size_t total = static_cast<size_t>(n) * static_cast<size_t>(k) * esz;
+  // Not in-place-safe, so snapshot first. Same total size either way.
+  std::vector<uint8_t> src(bytes, bytes + total);
+  for (int64_t r = 0; r < n; ++r) {
+    for (int64_t c = 0; c < k; ++c) {
+      const uint8_t* from = src.data() + (static_cast<size_t>(r) * k + c) * esz;
+      uint8_t* to = bytes + (static_cast<size_t>(c) * n + r) * esz;
+      std::memcpy(to, from, esz);
+    }
   }
 }
 

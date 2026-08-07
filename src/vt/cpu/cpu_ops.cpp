@@ -132,7 +132,14 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
     for (int64_t i = iir1; i < i_hi; ++i) {
       WidenRowToF32(a.dtype, ElemPtr(a, i * a_rs), k, af.data() + (i - iir1) * k);
     }
-    const int mr = (kBT && tier.btm[bi] != nullptr) ? tier.mr : 1;
+    // M blocking applies to BOTH orientations. It used to be gated on kBT, so
+    // the [K,N] path always ran mr=1 and re-read the whole weight tile once per
+    // activation row (a 131-row activation read it 131 times). Each family is
+    // guarded on its own function pointer because a tier may provide one and
+    // not the other (the portable tier has no btm, having no transpose to
+    // amortize, but its nkm still amortizes the weight load).
+    const ElemNkMFn nkm_fn = tier.nkm[bi];
+    const int mr = (kBT ? (tier.btm[bi] != nullptr) : (nkm_fn != nullptr)) ? tier.mr : 1;
     for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
       const int64_t j_hi = std::min(iir0 + blck_0, ir0_end);
       int64_t i = iir1;
@@ -141,7 +148,11 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
       if (j_hi - iir0 == blck_0 && mr > 1) {
         float accm[kElemLanes * 8];
         for (; i + mr <= i_hi; i += mr) {
-          tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
+          if (kBT) {
+            tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
+          } else {
+            nkm_fn(af.data() + (i - iir1) * k, k, ElemPtr(b, iir0), k, n, accm);
+          }
           for (int r = 0; r < mr; ++r) {
             for (int64_t j = iir0; j < j_hi; ++j) {
               StoreF32(out, (i + r) * n + j, accm[r * kElemLanes + (j - iir0)]);
@@ -183,6 +194,16 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
 // re-chunk per-thread when the grid is < nth*4 or NUMA (:1404-1408, IsNuma()
 // stubbed false); each thread starts at chunk ith then steals via the atomic
 // cursor (:1415-1442). num_rows_per_vec_dot is 1 for our scalar dot (no mmla).
+// VT_CPU_MATMUL_STEAL: same-binary A/B for the decode-shape chunk policy above.
+// Read once; default OFF keeps the ggml-mirrored behaviour byte-for-byte.
+bool MatmulStealEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_CPU_MATMUL_STEAL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 template <bool kBT>
 void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1];
@@ -215,7 +236,21 @@ void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
 
     // If the chunking is poor for the number of threads on this setup, scrap
     // the whole plan. Re-chunk it by thread.
-    if (nchunk0 * nchunk1 < nth * 4 || IsNuma()) {
+    //
+    // VT_CPU_MATMUL_STEAL=1 (default OFF) SKIPS this collapse. Rationale, and
+    // why it is an opt-in A/B rather than a new default: the collapse is a
+    // faithful port of ggml (ggml-cpu.c:1404-1408), so changing it by default
+    // would be an unmirrored deviation. But it has a cost this project has not
+    // measured. At decode shapes it rewrites the grid to exactly `nth` chunks
+    // and the loop below then breaks after one chunk each, so a 20-thread
+    // decode GEMV becomes 20 EQUAL STATIC chunks gated by the slowest core,
+    // with the self-balancing steal cursor switched off. On a heterogeneous
+    // core complex (GB10 mixes core classes) that is a straggler trap.
+    // Skipping the collapse keeps the fine-grained grid and lets stealing
+    // balance it. Byte-identity is unaffected either way: every output's
+    // reduction is local and sequential over K (see MatmulOneChunk), so which
+    // thread computes which output changes nothing.
+    if ((nchunk0 * nchunk1 < nth * 4 && !MatmulStealEnabled()) || IsNuma()) {
       nchunk0 = nr0 > nr1 ? nth : 1;  // parallelize by weight rows (N)
       nchunk1 = nr0 > nr1 ? 1 : nth;  // parallelize by src1 rows (M)
     }
@@ -239,7 +274,9 @@ void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
 
       MatmulOneChunk<kBT>(out, a, b, k, n, ir0_start, ir0_end, ir1_start, ir1_end);
 
-      if (nth >= nchunk0 * nchunk1) {
+      // Same switch: the early break is what makes the collapsed grid a pure
+      // static partition. With stealing enabled we keep pulling chunks.
+      if (nth >= nchunk0 * nchunk1 && !MatmulStealEnabled()) {
         break;
       }
 
@@ -256,6 +293,21 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 // accumulation order to MatmulKernel (sequential over K), so on CPU the two
 // orientations are bit-identical for the same logical weight.
 void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  // KERNEL-GEMM-CPU-TILED lever 2: a loader-repacked weight keeps its [N,K]
+  // SHAPE (so this op's contract is unchanged for callers) but its BYTES are
+  // [K,N]. Present it as the [K,N] tensor it literally is and take the
+  // transpose-free path. Byte-identical by the same argument the comment above
+  // MatmulBTKernel already states: both orientations accumulate each output
+  // over K in strict increasing order.
+  if (b.elem_kn_repacked) {
+    Tensor bkn = b;
+    bkn.shape[0] = b.shape[1];   // K
+    bkn.shape[1] = b.shape[0];   // N
+    bkn.stride[0] = b.shape[0];  // one [K,N] row is N elements
+    bkn.stride[1] = 1;
+    MatmulChunked<false>(out, a, bkn);
+    return;
+  }
   MatmulChunked<true>(out, a, b);
 }
 

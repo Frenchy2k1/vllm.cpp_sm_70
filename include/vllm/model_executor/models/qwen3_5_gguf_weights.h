@@ -101,9 +101,15 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
 //
 // Throws when the tensor is not F16, on a bad slice, when the rows fall outside
 // the tensor's validated span, or when a borrowed span is not inside the mapping.
+// `elem_kn_repack` transposes an `nk` weight's bytes [N,K] -> [K,N] at load so
+// `vt::MatmulBT` reaches the transpose-free CPU micro-kernels
+// (KERNEL-GEMM-CPU-TILED lever 2); it marks `OwnedTensor::elem_kn_repacked` and
+// is ignored for a gather table (`nk == false`). Defaulted OFF so every existing
+// caller, including tests/vllm/test_gguf_keep_quant.cpp, is unchanged.
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
                        int64_t row_offset = 0,
-                       const GgufFile* mmap_src = nullptr, bool nk = true);
+                       const GgufFile* mmap_src = nullptr, bool nk = true,
+                       bool elem_kn_repack = false);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape
