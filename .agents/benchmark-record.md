@@ -15562,3 +15562,59 @@ prefill-ONLY. A true `prefill_throughput = total_input / sum(TTFT)` is now
 reported alongside it; `sum_prefill` was already being accumulated and discarded
 with `(void)sum_prefill`.
 
+### VK-A2: command-buffer batching — decode 2.62x, 8/8 pairs (2026-08-07, GB10)
+
+The lever this campaign twice mis-ranked. It was first published as "the measured
+bottleneck" (wrong), then measured at a 1.15x ceiling and set aside (right at the
+time), then predicted to grow — and it did, to 49% of GPU time once argmax and the
+GEMV landed.
+
+**THE BLOCKER, now solved.** `VulkanContext::Pipeline` held ONE `VkDescriptorSet`,
+updated per dispatch. That is sound only because each dispatch waited on a fence
+before the next touched the set. **A descriptor set is read at EXECUTION time, not
+record time**, so batching two dispatches of the same pipeline would have the
+second `vkUpdateDescriptorSets` overwrite the first's operands before the GPU ran
+either — silent garbage, not an error. Each pipeline now owns a ring of 16 sets,
+and a pipeline that exhausts its ring forces a flush.
+
+Between recorded dispatches there is a `VkMemoryBarrier`
+(COMPUTE->COMPUTE, SHADER_WRITE->SHADER_READ|WRITE): decode ops are sequentially
+dependent, so without it the batch would run them concurrently.
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_BATCH` the only variable:**
+
+| metric | batched | per-op | result |
+|---|---:|---:|---|
+| decode tok/s (median) | **64.5** | 24.8 | **2.62x, 8 of 8 pairs** |
+| per-pair ratios | 1.79 / 1.87 / 1.96 / 2.26 / 2.98 / 3.02 / 3.52 / 3.55 | | every pair a win |
+| prefill tok/s (median) | ~142 | ~135 | ~1.05x, as expected |
+
+Batches run **40-46 dispatches per submit**. Prefill barely moves, which is the
+right shape: it has fewer, larger kernels, so it was never floor-bound.
+
+**Decode is now 35% of the 182 tok/s bandwidth roof, up from 11%, and the gap to
+llama.cpp's 160.9 tok/s is 2.5x, down from ~19x on this workload.**
+
+**Correctness: opt-125m STRICT 6/6 token-exact (96/96), 0 declines, with batches
+of 40-46 actually recorded** — verified after catching that the first "pass" was a
+STALE BINARY (only `test_vulkan_backend` had been rebuilt), which reported zero
+flushes and a green gate. A gate that passes on a binary without the change is
+worth nothing.
+
+**The new gate asserts the MECHANISM**, because results cannot show it: batching
+runs the same kernels in the same order, so a batch silently degrading to one
+dispatch per submit computes identical numbers. It asserts `pending_batch() > 1`
+with the lever on and `== 0` with it off, so neither arm is vacuous.
+
+**DEFAULT OFF, and this is the one measured win in this campaign that does not
+immediately become the default.** Batching is sound only if every host read of
+device memory flushes first. `Backend::Copy`/`Memset`/`Synchronize` now do. The
+PORTABLE REFERENCE TIER does not and cannot yet: it runs CPU kernels directly
+against the shared mapped allocation, and `Resolve` caches the provider function,
+so there is no per-call seam to flush at. An op with no native Vulkan kernel would
+read STALE BYTES with no error. For the models that run on Vulkan today the
+reference tier fires once, at setup (`kRopeCosSinCache`), which is why the STRICT
+gate passes — but "empirically safe for two models" is not the bar for a default.
+
+**Closing that hazard is the gate on the default flip, and is the next task.**
+
