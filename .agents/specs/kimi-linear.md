@@ -1359,6 +1359,109 @@ the last ~10% speed land.
 
 ---
 
+## 20. bf16-STREAM CLOSE + PRODUCTION RUNNER FOLD (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, #113 follow-on)
+<!-- state: 2026-08-07 -->
+
+The #113 follow-on double-close: (1) the §19-named **bf16 residual stream end-to-end** (the ONE
+lever both verdicts point at — STRICT via matching vLLM's bf16 rounding on p7, speed via killing
+the 3% CastBf16 + f32↔bf16 round-trips) and (2) the **paged-FA2 MLA decode** (§16 residual d) —
+PLUS a coordinator-directed **production runner fold** (the born-on-runner MUST-route seam): fold
+Kimi's decode onto `ModelRegistry::Forward` so `/v1/completions` serves it at the fast rate, not
+just the `examples/kimi_linear_gen` CLI.
+
+### 20.1 bf16 residual stream (residual #1) — MEASURED-NEGATIVE / REFUTED (`VT_KIMI_BF16_STREAM`, default OFF)
+The partial §14 `VT_KIMI_BF16_RESIDUAL` knob (RoundDevBf16 rounding f32 STORAGE in place) was
+SUPERSEDED by a STRUCTURAL bf16 stream, mirroring `deepseek_v2.cpp:479-615`
+(`DeepseekV2Model::ForwardBody`/`RunLayer`, byte-exact vs the vLLM oracle): `hidden`/`res`/normed-
+`dhn`/block-outputs are bf16 `DBuf`s; `vt::FusedChain(kFusedAddRmsNormStd)` carries the bf16
+add+RMSNorm (the CPU/CUDA kernel rounds the residual store to bf16 and computes the RMSNorm variance
+over that bf16-rounded sum — vLLM's ACTUAL `fused_add_rms_norm` order, `cpu_ops.cpp:326-332`, NOT
+§14's f32-pre-store-sum). Impl (`kimi_linear_device.cpp`): `StreamDType()`/`Bf16Stream()`; `GemmBf16`
+elides the per-GEMM `CastBf16` when the act is already bf16; `AddRmsNormS` builds a LOSSLESS bf16 norm
+weight (CUDA `RmsNorm`/`FusedChain` require `weight.dtype==x.dtype`, cuda_ops.cu:452,3480); `ToStream`
+rounds each block output; the MoE per-expert gather strides in the stream dtype. Applied IDENTICALLY
+to `DeviceForwardBodyBf16` (recompute) + `…Incremental` (paged decode). CPU tiny gate: 15/15·875 with
+the knob OFF (byte-identical); with it ON, case-(l)'s 1e-5 logit tolerance trips (19 tiny assertions)
+but the greedy-TOKEN check (incremental==recompute) STILL PASSES — the state-carry wiring is correct,
+the 1e-5 tol is just too tight for bf16.
+
+**GB10 FULL 48.9B 128-gate — MEASURED NEGATIVE (single-load/config, `flock $HOME/gpu.lock`,
+`drop_caches`, min-avail 18G, NO reboot; §12 golden md5 `bfa5bdbf…`; CONTROL reproduces §19 EXACTLY
+3×):**
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1 DEVICE_KDA_CHUNK=1`, `--incremental`) | /128 | tok/s |
+|---|---|---|---|
+| CONTROL (f32 stream) | — | **122** | 18.9-19.0 |
+| **+bf16 stream** | `BF16_STREAM=1` | **4** | 19.8 |
+| bf16 stream, recompute+f64-island (diagnostic, no device-KDA, non-incremental) | `BF16_STREAM=1` | **5** | 1.47 |
+
+**REFUTED on BOTH axes.** The bf16 residual stream REGRESSES 122→4/128 — the KDA recurrence
+DESTABILIZES into degenerate REPEAT LOOPS (p1 `15383,387,15383,387…`, p2 `220,16,25,220,16,25…`,
+p4 `220,2466,25…`), the §14/§15 "bf16 destabilizes KDA" pathology, now confirmed STRUCTURALLY. The
+diagnostic (recompute+f64-island, the closest analog to §14's BF16_RESIDUAL=106) collapses to 5/128
+because the STRUCTURAL stream computes the RMSNorm variance over the bf16-ROUNDED residual (vLLM-
+faithful) — EVEN LESS stable than §14's f32-variance approximation; both bf16 variants sit far below
+the f32 control's 122. **No speed win:** 18.9→19.8 is within noise (the removed CastBf16 is a memory-
+bound decode's ~3% that overlaps the GEMVs; the added `ToStream` + bf16-norm-weight casts offset it).
+This REFUTES the §19 hypothesis that "a bf16 residual stream closes p7 AND wins speed." Combined with
+§14 (host-precision plateau 120), §15 (device-KDA 122), §16 (device-MLA 109), §18 (chunk-every-step
+102): **p7 is an INTRINSIC near-tie; 122/128 @ 18.9 tok/s (0.90× vLLM) is Kimi-Linear's coherent
+best; STRICT is NOT reachable by residual-precision OR device-island approximation — only by vLLM's
+ACTUAL fused kernels via the full runner fold (§20.3).** The knob STAYS as a documented-MEASURED-
+NEGATIVE A/B (default OFF), per the §14/§16 precedent.
+
+### 20.2 paged-FA2 MLA decode (residual #2) — the MLA HALF of the runner fold (§20.3c)
+The incremental `MlaSoftmaxIslandInc` host f64 softmax (D2H `dq` + H2D `out` per NoPE-MLA layer per
+step) is a per-step host round-trip (part of the ~15% decode host-idle, §19). The principled fix is
+the paged device decode attention over the runner's MLA `attn_kv` group — i.e. `ForwardMlaAttentionBlock`
+run IN the runner (§20.3c), NOT a CLI-only device MLA (the coordinator's "don't build more CLI-only
+machinery"). Grounded in DeepSeek-V2's MLA decode (`mla::ForwardMlaAttentionBlock` / `vt::MlaDecodeAttention`,
+the geometry cousin; Kimi dims §16: nah=32, qk=192, v=128, NoPE ⇒ identity RoPE, no q-lora, scale
+qk**-0.5). NOTE §16 already MEASURED the WHOLE-sequence `vt::Attention` approximation NEGATIVE
+(122→109), so the decode must use vLLM's ACTUAL FA2 tiling (the paged MLA op), not an approximation.
+
+### 20.3 production runner fold (coordinator directive; ARCH-ONE-SURFACE req 4) — SCOPED, ENABLING-BLOCKED
+`KimiLinearModel::ForwardDevice` (the runner forward, bound at `kimi_linear_registry.cpp:87`)
+`KimiLinearModel::ForwardDevice` (the runner forward, bound at `kimi_linear_registry.cpp:87`)
+today routes the full model to `ForwardDeviceCompute` — the O(n²) recompute (4.24 tok/s) — and
+`(void)attn_meta;(void)attn_kv;` (`kimi_linear_device.cpp`), so the SERVER serves at the slow
+rate; the fast paged-incremental path is CLI-only. The fold routes Kimi's decode through the
+runner's prefill/decode phase (`attn_meta`) + the het-KV groups the runner already declares
+(`MakeKimiLinearKVCache`: MLA latent `attn_kv` + KDA MambaSpec `gdn_state`). ENABLING PREREQUISITE
+(measured this campaign): Kimi's `config.json` has **NO `layer_types`** (the KDA/full-attn split
+lives in `linear_attn_config.{kda_layers,full_attn_layers}`), AND Kimi lacks the qwen3_5 `linear_num_
+key_heads`/`linear_key_head_dim`/… fields the runner derives GDN geometry from. So the runner **ABORTS
+on Kimi's KV setup TODAY**: with the KDA MambaSpec group declared, `gdn_group_id_>=0`, and the
+`VT_CHECK(mamba_spec->shapes == {conv_dim,conv_state_len},{Hv,Dv,Dk})` at **`runner.cpp:489-493`**
+compares Kimi's `{12288,3},{32,128,128}` against the config-derived `{0,0},{0,0,0}` → HARD FAIL.
+MEASURED-by-reading, not run (a server smoke would need the 91.5 GiB load). The fold's landing points
+(file:line): (a) synthesize `layer_types` + source the GDN geometry from `linear_attn_config`
+(`runner.cpp:464-493` + config parse) so the runner allocates the two groups without aborting;
+(b) a Kimi KDA-paged block (`vt::KdaChunkPrefill` prefill / `vt::KdaGatedDeltaRule` decode + conv
+gather/scatter over `gdn_state` slots keyed by `non_spec_state_indices` — NOT `GdnBlockPaged`,
+which is per-HEAD-scalar `vt::GdnDecode`); (c) a NoPE-MLA-paged block via `ForwardMlaAttentionBlock`
+(identity-RoPE, NoPE scale) over the paged MLA `attn_kv` (= residual #2 runner-side); (d) bind the
+paged forward in `ForwardDevice`. Gates: engine token-identity (paged-engine == CLI-incremental,
+then vs the §12 STRICT golden) + a `/v1/completions` server smoke (streamed, coherent, rate
+consistent with the CLI 18.9 tok/s). This is the `ARCH-ONE-SURFACE` req 4 (a capability is DONE only
+when `include/vllm.h` exposes it; the CLI is a thin client). It is a substantial multi-brick, runner-
+touching integration (the shared qwen3_5 GDN path — regression risk to the gate models) — NOT one-
+campaign-completable to production quality; SCOPED here as the named born-on-runner residual.
+
+### 20.4 Status — bf16-stream REFUTED; runner fold SCOPED (ARCH-ONE-SURFACE req 4)
+- **bf16 residual stream (20.1): MEASURED-NEGATIVE / REFUTED** on GB10 (122→4/128, repeat-loop
+  destabilization; no speed win). The §19 "bf16 stream closes p7 + wins speed" hypothesis is
+  refuted. Knob kept default-OFF, documented-measured-negative (§14/§16 precedent).
+- **STRICT (128/128): NOT reachable** by any residual-precision or device-island lever tried
+  (§14-§20). p7 is an INTRINSIC near-tie; **122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best.**
+- **SERVER runner fold (20.3): SCOPED, enabling-blocked** — the runner aborts on Kimi's KV today
+  (`runner.cpp:489-493`); the fold is the named born-on-runner residual with the file:line landing
+  points above. NOT landed this campaign (multi-brick, runner-touching, gate-model regression risk).
+- Row STAYS `ACTIVE` on the SERVER fold + the last 0.10× speed (both need vLLM's ACTUAL kernels via
+  the paged fold — the same lever, coupled). The STRICT thread is CLOSED as a definitive near-tie.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope

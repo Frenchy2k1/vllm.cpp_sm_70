@@ -244,6 +244,41 @@ void RoundDevBf16(const Dev& d, DBuf& x) {
   vt::CastF32(d.q, out, b.t());
 }
 
+// (6) VT_KIMI_BF16_STREAM — carry the inter-layer residual stream in bf16 END-TO-END,
+// exactly as vLLM (DeepseekV2Model::ForwardBody / deepseek_v2.cpp:479-615: hidden /
+// residual / normed-hidden / block-outputs all bf16; fused_add_rms_norm rounds the
+// residual store to bf16). This SUPERSEDES the partial VT_KIMI_BF16_RESIDUAL knob (spec
+// §14, which rounded f32 STORAGE in place): the STRUCTURAL bf16 storage IS vLLM's
+// rounding AND removes the per-GEMM CastBf16 on every residual-fed projection (the
+// decode-decomposition's 3% CastBf16, spec §19) plus the f32<->bf16 round-trips. The
+// projection OUTPUTS stay f32 (the KDA/MLA islands read f32 unchanged), so the ONLY
+// numeric change vs the f32 stream is the residual add/norm rounding to bf16 at each
+// layer boundary — the isolated p7-STRICT lever (spec §13/§14 root cause). Default OFF
+// (parity-enabler: flip only with the token gate green at the flipped default); when ON,
+// VT_KIMI_BF16_RESIDUAL's manual RoundDevBf16 is redundant and skipped.
+bool Bf16Stream() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_BF16_STREAM");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+inline DType StreamDType() { return Bf16Stream() ? DType::kBF16 : DType::kF32; }
+
+// Cast a block output DBuf to the residual-stream dtype (identity when already `sdt`;
+// f32 -> bf16 round for the bf16 stream — the o_proj/down/combine GEMM's bf16 store,
+// done as a separate cast so the block internals stay dtype-agnostic). RNE-equal to a
+// (bf16,bf16)->bf16 MatmulBT store, so numerically vLLM-faithful.
+DBuf ToStream(const Dev& d, DBuf&& out, DType sdt) {
+  if (out.t().dtype == sdt) return std::move(out);
+  Tensor ot = out.t();
+  std::vector<int64_t> shape(ot.shape, ot.shape + ot.rank);
+  DBuf s(d, sdt, shape);
+  Tensor st = s.t();
+  vt::CastBf16(d.q, st, ot);  // f32 -> bf16 (sdt is bf16 in the non-identity case)
+  return s;
+}
+
 // Device-resident weight view. On CPU this ALIASES the host f32 bytes exactly as
 // dense_attn::ResidentWeight does for a CPU device (host-pointer aliasing is a CPU
 // property); the CUDA staging over materialized OwnedTensors is the born-on-runner
@@ -281,10 +316,17 @@ inline Tensor ResidentBf16W(const Dev& d, const OwnedTensor& w,
 // projection numerics (cuda_matmul.cu:3); the residual stream stays f32.
 void GemmBf16(const Dev& d, Tensor& out, const Tensor& act, const OwnedTensor& w,
               int64_t N, int64_t K) {
+  Tensor wt = ResidentBf16W(d, w, {N, K});
+  // bf16 residual stream (VT_KIMI_BF16_STREAM): the activation is ALREADY bf16, so the
+  // per-GEMM CastBf16 (the decode-decomposition's 3%, spec §19) is elided — feed the
+  // bf16 activation straight into the (bf16,bf16)->out MatmulBT.
+  if (act.dtype == DType::kBF16) {
+    vt::MatmulBT(d.q, out, act, wt);
+    return;
+  }
   const int64_t T = act.shape[0];
   DBuf ab(d, DType::kBF16, {T, K});
   vt::CastBf16(d.q, ab.t(), act);
-  Tensor wt = ResidentBf16W(d, w, {N, K});
   vt::MatmulBT(d.q, out, ab.t(), wt);
 }
 
@@ -298,6 +340,25 @@ void AddRmsNorm(const Dev& d, DBuf& out, const Tensor& x, const Tensor& w, DBuf&
   } else {
     vt::RmsNorm(d.q, out.t(), x, w, vt::RmsNormArgs{eps, false}, &res.t());
   }
+}
+
+// Stream-dtype-aware residual add+RMSNorm for the bf16 device forward. The residual-
+// stream norm weights are kept host f32 (ReadF32 from the bf16 checkpoint — the value
+// IS already a bf16 value); the CUDA RmsNorm/FusedChain kernels REQUIRE
+// weight.dtype == x.dtype (cuda_ops.cu:452,3480), so for the bf16 stream the f32-stored
+// (= bf16-valued) weight is cast to bf16 (LOSSLESS) before the norm — matching vLLM's
+// bf16 norm weight exactly. For the f32 stream this aliases the host f32 bytes (WF32),
+// byte-identical to the plain AddRmsNorm above.
+void AddRmsNormS(const Dev& d, DBuf& out, const Tensor& x, const std::vector<float>& wv,
+                 int64_t H, DBuf& res, float eps, DType sdt) {
+  if (sdt == DType::kF32) {
+    AddRmsNorm(d, out, x, WF32(d, wv, {H}), res, eps);
+    return;
+  }
+  DBuf wf(d, DType::kF32, {H}, wv.data());
+  DBuf wb(d, DType::kBF16, {H});
+  vt::CastBf16(d.q, wb.t(), wf.t());
+  AddRmsNorm(d, out, x, wb.t(), res, eps);
 }
 
 // silu(gate@x) * (up@x) -> down@(...) — a gated SwiGLU MLP via the shared vt:: ops
@@ -1055,12 +1116,15 @@ DBuf MoeBlockDeviceBf16(const Dev& d, const MoeResidentWeights& w, const Tensor&
   for (int64_t t = 0; t < T; ++t)
     for (int64_t j = 0; j < k; ++j)
       lists[static_cast<size_t>(ids[static_cast<size_t>(t * k + j)])].push_back({t, j});
-  const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+  // Gather per-expert rows in the STREAM dtype (bf16 stream: dh is bf16, so the row
+  // stride is the bf16 width and xg is bf16 — SwiGluDeviceBf16's GemmBf16 reads it
+  // straight; f32 stream: unchanged f32 gather). Grounding deepseek_v2.cpp MoeBlock.
+  const size_t row_bytes = static_cast<size_t>(H) * vt::SizeOf(dh.dtype);
   for (int64_t e = 0; e < E; ++e) {
     const auto& list = lists[static_cast<size_t>(e)];
     if (list.empty()) continue;
     const int64_t n = static_cast<int64_t>(list.size());
-    DBuf xg(d, DType::kF32, {n, H});
+    DBuf xg(d, dh.dtype, {n, H});
     for (int64_t r = 0; r < n; ++r)
       d.b.Copy(d.q, static_cast<char*>(xg.ptr()) + static_cast<size_t>(r) * row_bytes,
                static_cast<const char*>(dh.data) +
@@ -1111,51 +1175,62 @@ DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
   VT_CHECK(static_cast<int64_t>(rw.layers.size()) == L,
            "KimiLinear bf16 device compute: resident layer count != num_hidden_layers");
 
-  // embed (bf16 table -> f32 out) -> residual stream.
-  DBuf hidden(d, DType::kF32, {T, H});
+  // The residual-stream dtype: bf16 END-TO-END (VT_KIMI_BF16_STREAM, vLLM's regime,
+  // mirroring deepseek_v2.cpp:479-615) or f32 (default). The bf16 stream removes the
+  // per-GEMM CastBf16 (projections read the bf16 stream directly) AND rounds the
+  // residual add/norm to bf16 at every layer boundary (the p7-STRICT lever); the
+  // partial VT_KIMI_BF16_RESIDUAL RoundDevBf16 is then redundant and skipped.
+  const DType sdt = StreamDType();
+  const bool round_res = Bf16Residual() && sdt == DType::kF32;
+
+  // embed (bf16 table -> stream out) -> residual stream.
+  DBuf hidden(d, sdt, {T, H});
   {
     DBuf dids(d, DType::kI32, {T}, token_ids.data());
     Tensor htab = ResidentBf16W(d, rw.embed_tokens, {V, H});
     Tensor hh = hidden.t();
     vt::Embedding(d.q, hh, htab, dids.t());
   }
-  const bool bf16_res = Bf16Residual();
-  if (bf16_res) RoundDevBf16(d, hidden);  // vLLM embed output is bf16
-  DBuf res(d, DType::kF32, {T, H});
+  if (round_res) RoundDevBf16(d, hidden);  // vLLM embed output is bf16
+  DBuf res(d, sdt, {T, H});
   res.Zero(d);
   Tensor hcur = hidden.t();
   std::shared_ptr<void> hold;
 
   for (int64_t l = 0; l < L; ++l) {
     const KimiLinearLayerResidentWeights& lw = rw.layers[static_cast<size_t>(l)];
-    DBuf dhn(d, DType::kF32, {T, H});
-    AddRmsNorm(d, dhn, hcur, WF32(d, lw.input_layernorm, {H}), res, eps);
-    if (bf16_res) RoundDevBf16(d, res);  // vLLM stores residual bf16 (variance saw f32 sum)
-    DBuf attn = lw.is_kda ? KdaLayerDeviceBf16(d, lw.kda, dhn.t(), p, T)
-                          : MlaLayerDeviceBf16(d, lw.mla, dhn.t(), p, T);
-    if (bf16_res) RoundDevBf16(d, attn);  // vLLM attn_output is bf16
-    DBuf dh2(d, DType::kF32, {T, H});
-    AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
-    if (bf16_res) RoundDevBf16(d, res);
-    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
-    if (bf16_res) RoundDevBf16(d, mlp);  // vLLM mlp output is bf16
+    DBuf dhn(d, sdt, {T, H});
+    AddRmsNormS(d, dhn, hcur, lw.input_layernorm, H, res, eps, sdt);
+    if (round_res) RoundDevBf16(d, res);
+    DBuf attn = ToStream(d,
+                         lw.is_kda ? KdaLayerDeviceBf16(d, lw.kda, dhn.t(), p, T)
+                                   : MlaLayerDeviceBf16(d, lw.mla, dhn.t(), p, T),
+                         sdt);
+    if (round_res) RoundDevBf16(d, attn);
+    DBuf dh2(d, sdt, {T, H});
+    AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps, sdt);
+    if (round_res) RoundDevBf16(d, res);
+    DBuf mlp = ToStream(d,
+                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
+                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
+                        sdt);
+    if (round_res) RoundDevBf16(d, mlp);
     auto* held = new DBuf(std::move(mlp));
     hcur = held->t();
     hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
   }
 
-  DBuf dnorm(d, DType::kF32, {T, H});
-  AddRmsNorm(d, dnorm, hcur, WF32(d, rw.final_norm, {H}), res, eps);
+  DBuf dnorm(d, sdt, {T, H});
+  AddRmsNormS(d, dnorm, hcur, rw.final_norm, H, res, eps, sdt);
 
   // logits_indices gather-before-lm_head, in REQUEST order.
   Tensor src = dnorm.t();
-  DBuf dgather(d, DType::kF32,
+  DBuf dgather(d, sdt,
                logits_indices.empty()
                    ? std::vector<int64_t>{1, 1}
                    : std::vector<int64_t>{static_cast<int64_t>(logits_indices.size()), H});
   if (!logits_indices.empty()) {
-    const size_t rb = static_cast<size_t>(H) * sizeof(float);
+    const size_t rb = static_cast<size_t>(H) * vt::SizeOf(sdt);
     char* dp = static_cast<char*>(dgather.ptr());
     const char* sp = static_cast<const char*>(dnorm.ptr());
     for (size_t i = 0; i < logits_indices.size(); ++i) {
@@ -1479,17 +1554,21 @@ DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& wei
   VT_CHECK(static_cast<int64_t>(rw.layers.size()) == L,
            "KimiLinear incremental: resident layer count != num_hidden_layers");
   const bool use_chunk = DeviceKdaChunk();
+  // Residual-stream dtype (VT_KIMI_BF16_STREAM), byte-for-byte the same treatment as
+  // DeviceForwardBodyBf16 (recompute) so the paged-incremental path stays token-
+  // identical to recompute (the Gate A / case-(l) byte-exact state-carry proof).
+  const DType sdt = StreamDType();
+  const bool round_res = Bf16Residual() && sdt == DType::kF32;
 
-  DBuf hidden(d, DType::kF32, {T, H});
+  DBuf hidden(d, sdt, {T, H});
   {
     DBuf dids(d, DType::kI32, {T}, token_ids.data());
     Tensor htab = ResidentBf16W(d, rw.embed_tokens, {V, H});
     Tensor hh = hidden.t();
     vt::Embedding(d.q, hh, htab, dids.t());
   }
-  const bool bf16_res = Bf16Residual();
-  if (bf16_res) RoundDevBf16(d, hidden);
-  DBuf res(d, DType::kF32, {T, H});
+  if (round_res) RoundDevBf16(d, hidden);
+  DBuf res(d, sdt, {T, H});
   res.Zero(d);
   Tensor hcur = hidden.t();
   std::shared_ptr<void> hold;
@@ -1497,37 +1576,41 @@ DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& wei
   int64_t kda_idx = 0, mla_idx = 0;
   for (int64_t l = 0; l < L; ++l) {
     const KimiLinearLayerResidentWeights& lw = rw.layers[static_cast<size_t>(l)];
-    DBuf dhn(d, DType::kF32, {T, H});
-    AddRmsNorm(d, dhn, hcur, WF32(d, lw.input_layernorm, {H}), res, eps);
-    if (bf16_res) RoundDevBf16(d, res);
-    DBuf attn = lw.is_kda
-                    ? KdaLayerDeviceBf16Inc(d, lw.kda, dhn.t(), p, T,
-                                            cache.kda[static_cast<size_t>(kda_idx++)],
-                                            is_prefill, use_chunk)
-                    : MlaLayerDeviceBf16Inc(d, lw.mla, dhn.t(), p, T, base_pos,
-                                            cache.mla[static_cast<size_t>(mla_idx++)]);
-    if (bf16_res) RoundDevBf16(d, attn);
-    DBuf dh2(d, DType::kF32, {T, H});
-    AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
-    if (bf16_res) RoundDevBf16(d, res);
-    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
-    if (bf16_res) RoundDevBf16(d, mlp);
+    DBuf dhn(d, sdt, {T, H});
+    AddRmsNormS(d, dhn, hcur, lw.input_layernorm, H, res, eps, sdt);
+    if (round_res) RoundDevBf16(d, res);
+    DBuf attn = ToStream(
+        d,
+        lw.is_kda ? KdaLayerDeviceBf16Inc(d, lw.kda, dhn.t(), p, T,
+                                          cache.kda[static_cast<size_t>(kda_idx++)],
+                                          is_prefill, use_chunk)
+                  : MlaLayerDeviceBf16Inc(d, lw.mla, dhn.t(), p, T, base_pos,
+                                          cache.mla[static_cast<size_t>(mla_idx++)]),
+        sdt);
+    if (round_res) RoundDevBf16(d, attn);
+    DBuf dh2(d, sdt, {T, H});
+    AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps, sdt);
+    if (round_res) RoundDevBf16(d, res);
+    DBuf mlp = ToStream(d,
+                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
+                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
+                        sdt);
+    if (round_res) RoundDevBf16(d, mlp);
     auto* held = new DBuf(std::move(mlp));
     hcur = held->t();
     hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
   }
 
-  DBuf dnorm(d, DType::kF32, {T, H});
-  AddRmsNorm(d, dnorm, hcur, WF32(d, rw.final_norm, {H}), res, eps);
+  DBuf dnorm(d, sdt, {T, H});
+  AddRmsNormS(d, dnorm, hcur, rw.final_norm, H, res, eps, sdt);
 
   Tensor src = dnorm.t();
-  DBuf dgather(d, DType::kF32,
+  DBuf dgather(d, sdt,
                logits_indices.empty()
                    ? std::vector<int64_t>{1, 1}
                    : std::vector<int64_t>{static_cast<int64_t>(logits_indices.size()), H});
   if (!logits_indices.empty()) {
-    const size_t rb = static_cast<size_t>(H) * sizeof(float);
+    const size_t rb = static_cast<size_t>(H) * vt::SizeOf(sdt);
     char* dp = static_cast<char*>(dgather.ptr());
     const char* sp = static_cast<const char*>(dnorm.ptr());
     for (size_t i = 0; i < logits_indices.size(); ++i) {
