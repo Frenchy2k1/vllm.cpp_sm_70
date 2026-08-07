@@ -41023,3 +41023,40 @@ is required") is now IMPLEMENTED as the additive device op `vt::KdaGatedDeltaRul
   (`chunk_kda`; regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or native port)
   + paged `mla::ForwardMlaAttentionBlock` (7 NoPE-MLA layers) + paged-incremental decode. Row `ACTIVE`.
   Box left clean (artifacts removed, memory restored, worker parked, no reboot).
+
+- **2026-08-07 (later)** — **`VK-E`: llama.cpp-Vulkan DENOMINATOR MEASURED; our arm
+  BLOCKED on a shared model, not on op coverage (`CLAIM-VULKAN-FULL-1`).**
+
+  llama.cpp built from our pinned `237ad9b96` with `-DGGML_VULKAN=ON`, GB10, under
+  `$HOME/gpu.lock`, banner `matrix cores: NV_coopmat2`:
+  **qwen3-0.6B F16 — pp128 11,730.14 ± 238.49 t/s, tg32 161.37 ± 1.20 t/s.**
+
+  **★ THE BUILD-TOOLCHAIN TRAP, CONFIRMED — and bigger than predicted.** The
+  fan-out spike warned Ubuntu's `glslc` (shaderc 2023.8) was too old for
+  llama.cpp's coopmat2 probe. Measured: it disables **four of five** Vulkan fast
+  paths — `GL_NV_cooperative_matrix2`, `GL_NV_cooperative_matrix_decode_vector`,
+  `GL_EXT_integer_dot_product` and `GL_EXT_bfloat16` all report "not supported by
+  glslc", leaving only `GL_KHR_cooperative_matrix`. Benchmarking that would have
+  handicapped the reference and FLATTERED US — the inverse of the
+  "denominator is the reference's production config" rule. Fixed by building
+  shaderc from source on dgx (`v2026.4-dev`) and passing
+  `-DVulkan_GLSLC_EXECUTABLE=`. **Any future llama.cpp-Vulkan number from this box
+  must check the runtime banner for `NV_coopmat2`** — the packaged glslc yields a
+  build that configures, compiles and runs while quietly taking the slow paths.
+
+  **Our arm could not run, and the blocker was NOT the expected one.** The known
+  limit was op coverage (16 of 87 native). What actually stopped it first:
+  **no model on dgx loads in both engines.** Our GGUF path rejects the plain
+  `qwen3` architecture (`qwen3_5_gguf_weights.cpp:829` — that loader is the
+  Qwen3.5 family), and llama.cpp cannot load `la-f16.gguf` (Laguna, our own
+  architecture). The two engines support DISJOINT GGUF sets among what is present.
+
+  So VK-E is not "we would lose"; it CANNOT BE RUN yet. It needs a GGUF
+  architecture both accept, or `VK-D` (the quant tier) so a shared quantised model
+  is meaningful, or a safetensors-vs-GGUF pairing over identical weights. Recorded
+  as the binding blocker rather than papered over with a mismatched pair of
+  numbers. **No vllm.cpp Vulkan number is claimed.**
+
+  dgx gained `glslc`, `glslang-tools`, `libvulkan-dev`, `spirv-headers` (apt) and
+  a source-built shaderc at `/tmp/shaderc`; llama.cpp at the pin is unpacked at
+  `~/lcpp-vk` with `build-vk/bin/llama-bench` ready.
