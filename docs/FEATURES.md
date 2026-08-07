@@ -119,7 +119,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
-| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | e2e runs bf16-resident, near-tie 106/128 (numerics) | 1.59 tok/s, default off |
+| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | e2e runs bf16-resident; bf16-regime knobs 106→120/128 (7/8 exact), not STRICT | 1.30 tok/s, default off; residual = device islands (§14) |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
@@ -250,7 +250,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident): host RSS 1.7 GiB, min-avail 21 GiB, no OOM. Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle); STRICT path = device islands + bf16 stream |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | e2e RUNS (bf16-resident §13); bf16-regime knobs 106→120/128 (7/8 exact), NOT STRICT; default OFF | bf16 residual+island-inputs → 120/128 best (§14); 1 near-tie left. STRICT+speed residual = device islands (per-channel GDN kernel + paged FA2). 1.30 tok/s; vLLM HW-can't-serve bf16 on 1 GB10 |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
