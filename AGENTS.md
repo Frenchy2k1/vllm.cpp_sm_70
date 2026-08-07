@@ -54,6 +54,23 @@ These survive any context pressure. Each links to its full statement in
 [.agents/directives.md](.agents/directives.md); the linked text is the binding
 version, this list is the reminder.
 
+<!-- pre-claim-intake:begin -->
+### Verify the gap before claiming or implementing
+
+An issue, roadmap row, or helper-queue result is a lead, not proof that work is
+still open. Before claiming a row or starting implementation:
+
+1. **Search open issues and pull requests** for duplicates and active ownership.
+2. Read `.agents/NOW.md`, run `scripts/ready-for-helper.py` when applicable, and
+   read the roadmap row, its owning matrix row, and `.agents/coordination.md`.
+3. Inspect the **current code, tests, and relevant evidence anchors** and
+   **confirm that the recorded gap still exists** at the current branch head.
+4. **Record the issue/PR search and exact current code/test anchors** in the
+   committed spike or PR.
+5. If the gap has landed, is claimed, or no longer matches the record, **stop and
+   reconcile the task instead of starting duplicate work**.
+<!-- pre-claim-intake:end -->
+
 - **Mirror vLLM.** Feature parity across all features; when vLLM has an answer,
   mirror it including all its modes. Never ask the user how a feature should
   behave, only genuine product/scope calls.

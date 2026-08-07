@@ -430,21 +430,22 @@ the number stays in the README and the label says *speed-pending*.
 
 | Doc | What is in it |
 |---|---|
-| [docs/USAGE.md](docs/USAGE.md) | CLI, OpenAI server (endpoints + flags), C ABI, C++ API |
-| [docs/BUILD.md](docs/BUILD.md) | Build recipes per backend, every CMake option, hardware and quantization state |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The measured evidence: per-axis grids, memory, reproduction recipes |
-| [docs/FEATURES.md](docs/FEATURES.md) | Feature-by-feature comparison against vLLM, SGLang and llama.cpp |
-| [docs/STATUS.md](docs/STATUS.md) | Per-capability lifecycle ledger, active gaps, next gate |
-| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | The SGLang-inspired knobs, and when to turn them on |
+| [Contribute](CONTRIBUTING.md) | Agent contribution guide |
+| [docs/USAGE.md](docs/USAGE.md) | CLI, server endpoints/flags, C ABI and C++ API |
+| [docs/BUILD.md](docs/BUILD.md) | Backend recipes, CMake options, hardware and quantization |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured grids, memory and repro recipes |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature comparison: vLLM, SGLang and llama.cpp |
+| [docs/STATUS.md](docs/STATUS.md) | Capability lifecycle, gaps and next gate |
+| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | SGLang knobs and when to use them |
 | [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |
-| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | KV offload to CPU/disk, LMCache client, KV events |
+| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | CPU/disk KV offload, LMCache and events |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Runtime environment variables |
 
-The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md):
-the append-only [`.agents/state.md`](.agents/state.md), the
-[parity ledger](.agents/parity-ledger.md), and the [model matrix](.agents/model-matrix.md). The
-portfolio-completion plan is
-[`.agents/specs/roadmap-v1-completion.md`](.agents/specs/roadmap-v1-completion.md).
+The canonical project record is indexed by [AGENTS.md](AGENTS.md) and lives
+under [`.agents/`](.agents/). See [current state](.agents/state.md),
+[parity evidence](.agents/parity-ledger.md), the
+[model inventory](.agents/model-matrix.md), and the
+[portfolio roadmap](.agents/specs/roadmap-v1-completion.md).
 
 ## Credits, and what we borrow
 
