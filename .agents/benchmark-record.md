@@ -14310,3 +14310,55 @@ UNRELATED CUDA case (line 3503, "an NVFP4 checkpoint loads into a runnable DiT")
 isolation (585 assertions) and runs BEFORE the new case — a pre-existing cross-test CUDA
 resource-accumulation flake, not this change; the new loader gate passes standalone (59
 assertions).
+
+## MiniMax-H3 ENCODER VISION SCATTER + ref2va re-attribution (`row/H3-VISION-SCATTER` PR #90, 2026-08-07, dgx sm_121a)
+
+Closes the #86 residual at the framework level and RE-ATTRIBUTES the ref2va grid with a GB10
+render A/B. Builds on #86 (real `visual.*` tower LOADS + fl2va COHERENT via VAE-keyframe).
+
+**`deepstack_visual_indexes` CONFIRMED (was #86-inferred).** `{8, 16, 24}` grounded in the
+release config: MiniMax-H3's `text_encoder/` IS Qwen3-VL-32B-Instruct
+(HF DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/config.json), whose
+`vision_config.deepstack_visual_indexes = [8, 16, 24]`, depth 27, text `num_hidden_layers = 64`
+(→ min(64,50)=50). Identical to vllm-omni `Qwen3VLMoeVisionConfig` default and public
+`Qwen/Qwen3-VL-30B-A3B-Instruct`. The #86 inference was right; no code value change.
+
+**Deliverable 1 — DEVICE scatter+inject WIRED 1:1 + GATED.** `MiniMaxH3EncoderTextForwardDevice`
+now takes the optional `visual_pos_mask` + per-tap `deepstack` blocks and ADDS each block into the
+masked visual rows after each of the first `len(deepstack)` decoder layers — device mirror of the
+gated host reference and upstream `_deepstack_process` (encoder.py:770-800). The merged masked_scatter
+into inputs_embeds stays the caller's job (upstream `_encode`, encoder.py:1071). Gate
+(`test_minimax_h3 :: "the DEVICE keep-quant encoder matches the host f32 reference"`): device forward
+now also runs WITH a visual mask + 2 DeepStack blocks → device==host max|diff| **3.8e-4** (≤ 2e-3)
+AND DeepStack moves the conditioning (scale 1.006→1.062). PASS, 1562 assertions. Host text tower,
+full vision tower, GGUF visual.* loader, MM processor all green. The full-suite SIGSEGV at line 3503
+(NVFP4 case) is the known cross-test CUDA flake — passes standalone (585 assertions), not this change.
+
+**Driver `--cond-image`** routes a reference image through the encoder vision path (reuse only:
+Qwen3VLImageProcessor → Qwen3VLVisionForward → merged+3 DeepStack; ExpandImagePlaceholders inserts nm
+image-pad tokens; masked_scatter; Qwen3VLGetRopeIndex == H3 `_get_rope_index` for t==1). Additive.
+
+**GB10 render A/B (256×256/22f/12steps).**
+- **Deliverable 3 — fl2va WITH the encoder vision path = COHERENT + matching (PASS).** FL2VA GGUF
+  `--dequant-bf16` + `--first-frame` + `--cond-image` + `--partition fl2va`, prompt "a fluffy orange
+  cat sitting on a windowsill in warm sunlight". conditioning=[82,5120] (16 prompt + 66-token vision
+  block: 64 merged + 2 markers). Frame 0 = coherent orange cat (keyframe); frame 21 = the cat on a
+  WINDOWSILL in warm sunlight — the clip EVOLVED toward the prompt. No grid. Artifact
+  `~/h3fp4/out_vs_fl2va.mp4` (+ out_vs_fl2va/frame_*.ppm). The vision conditioning is SOUND.
+- **Deliverable 2 — ref2va WITH the vision-enriched prompt STILL GRIDS (honest FAIL).** Ref2VA NVFP4
+  `--fp4-resident` + `--ref-image` (VAE reference rows) + `--cond-image` + `--partition ref2va`, same
+  prompt. conditioning=[82,5120] (64 merged + 3 DeepStack), 1 reference image, latent 7×16×16. Every
+  frame (0/10/21) is the same multicolour PATCH GRID as #86's text-only ref2va. Artifact
+  `~/h3fp4/out_vs_ref2va.mp4`.
+
+**RE-ATTRIBUTION (with evidence).** The "vision-enriched conditioning fixes the grid" hypothesis is
+REFUTED. The ref2va grid is NOT the encoder conditioning: (a) the DiT forward MATH is byte-exact vs
+upstream (geometry ladder green every rung #74; device==host at real seq 1920 #77); (b) the SAME
+vision scatter+DeepStack path renders a COHERENT fl2va-with-`--cond-image`; (c) the grid is INVARIANT
+to text-only (#86) vs vision-enriched prompts. The only difference between coherent fl2va and gridding
+ref2va: fl2va PINS output rows (keyframe cond rows) each step, ref2va PREPENDS free-running reference
+rows. So the residual is the **ref2va reference-row conditioning ASSEMBLY**
+(`MiniMaxH3EncodeReferenceImages` VAE-reference rows + `minimax_h3_packed_sequence_ref2va_blocks`
+noised-anchor layout + how the denoise loop conditions the un-pinned target rows), NOT the prompt and
+NOT the DiT forward. Next diagnostic: dump the ref2va target-row VAE-input adjacency-cosine (like #77's
+0.95 for coherent fl2va) to confirm the target rows are white, and A/B the reference-row condition-noise.
