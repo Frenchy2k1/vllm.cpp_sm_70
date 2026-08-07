@@ -63,7 +63,7 @@ TEST_CASE("video api: request parsing applies H3 defaults and rejects bad input"
 
 // ---------------------------------------------------------------------------
 // OpenAI's Sora video shape (developers.openai.com/api/docs/guides/video-generation):
-// {model, prompt, size:"<w>x<h>", seconds}. These are ALIASES
+// {model, prompt, size:"<w>x<h>", seconds, input_reference}. These are ALIASES
 // onto the native fields, so an OpenAI client works unmodified while every
 // existing body keeps its exact meaning.
 //
@@ -168,6 +168,114 @@ TEST_CASE("video api: `model` is recorded, never a parse failure") {
   CHECK(ParseVideoRequest(R"({"prompt":"x"})").model.empty());
 }
 
+TEST_CASE("video api: `input_reference` accepts a path or a data: URL") {
+  const VideoRequest path =
+      ParseVideoRequest(R"({"prompt":"x","input_reference":"/tmp/first.ppm"})");
+  CHECK(path.input_reference_path == "/tmp/first.ppm");
+  CHECK(path.input_reference_bytes.empty());
+  CHECK(path.has_input_reference());
+
+  // "hi" base64-encoded, with the media type preserved for the runner.
+  const VideoRequest inline_data = ParseVideoRequest(
+      R"({"prompt":"x","input_reference":"data:image/x-portable-pixmap;base64,aGk="})");
+  CHECK(inline_data.input_reference_path.empty());
+  CHECK(inline_data.input_reference_media_type == "image/x-portable-pixmap");
+  REQUIRE(inline_data.input_reference_bytes.size() == 2);
+  CHECK(inline_data.input_reference_bytes[0] == 'h');
+  CHECK(inline_data.input_reference_bytes[1] == 'i');
+
+  CHECK_FALSE(ParseVideoRequest(R"({"prompt":"x"})").has_input_reference());
+
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","input_reference":""})"));
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","input_reference":5})"));
+  // A broken data: URL must be a specific 400, not a path named "data:...".
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","input_reference":"data:image/png;base64,@@@"})"));
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","input_reference":"data:image/png,raw"})"));
+  // An http(s) URL is refused BY NAME rather than treated as a filesystem path.
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","input_reference":"https://x/i.png"})"));
+}
+
+// ---------------------------------------------------------------------------
+// The two reference modalities OpenAI has no slot for. H3 supports THREE (image,
+// silent video, audio) and the Sora schema carries one, so the other two ride in
+// `metadata` — a standard OpenAI free-form string map, which strict clients
+// tolerate, rather than invented top-level fields that would fail validation.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("video api: `metadata` carries the video and audio references") {
+  const VideoRequest r = ParseVideoRequest(R"({
+    "prompt":"x",
+    "metadata":{"input_reference_video":"/tmp/prev_job",
+                "input_reference_audio":"/tmp/voice.wav",
+                "trace_id":"abc-123"}
+  })");
+  // A DIRECTORY of frame_%06d.ppm — the layout minimax-h3-gen writes, so clips chain.
+  CHECK(r.input_reference_video_dir == "/tmp/prev_job");
+  CHECK(r.has_input_reference_video());
+  CHECK(r.input_reference_audio_path == "/tmp/voice.wav");
+  CHECK(r.has_input_reference_audio());
+  CHECK_FALSE(r.has_input_reference());  // the image slot stayed empty
+  // Free-form means free-form: keys we do not act on survive untouched.
+  CHECK(r.metadata.at("trace_id") == "abc-123");
+  CHECK(r.metadata.size() == 3);
+
+  // The audio reference takes an inline data: URL too ("hi" base64).
+  const VideoRequest inline_audio = ParseVideoRequest(
+      R"({"prompt":"x","metadata":{"input_reference_audio":"data:audio/wav;base64,aGk="}})");
+  CHECK(inline_audio.input_reference_audio_path.empty());
+  REQUIRE(inline_audio.input_reference_audio_bytes.size() == 2);
+  CHECK(inline_audio.has_input_reference_audio());
+
+  // Absent metadata leaves every reference empty.
+  const VideoRequest none = ParseVideoRequest(R"({"prompt":"x"})");
+  CHECK(none.metadata.empty());
+  CHECK_FALSE(none.has_input_reference_video());
+  CHECK_FALSE(none.has_input_reference_audio());
+
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","metadata":"nope"})"));       // not an object
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","metadata":{"k":7}})"));      // not a string map
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","metadata":{"input_reference_video":""}})"));
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","metadata":{"input_reference_audio":""}})"));
+  // A directory cannot be a data: URL, and saying so beats a confusing open() later.
+  CHECK_THROWS(ParseVideoRequest(
+      R"({"prompt":"x","metadata":{"input_reference_video":"data:video/mp4;base64,aGk="}})"));
+  CHECK_THROWS(ParseVideoRequest(
+      R"({"prompt":"x","metadata":{"input_reference_audio":"https://x/a.wav"}})"));
+}
+
+TEST_CASE("video api: only the pipeline's legal reference combinations are accepted") {
+  // The rule is minimax_h3_pipeline.cpp:251 — fl2va keyframes and ref2va
+  // reference blocks are EXCLUSIVE. `input_reference` is fl2va; the metadata
+  // references are ref2va blocks.
+  auto parses = [](const char* body) {
+    ParseVideoRequest(body);
+    return true;
+  };
+
+  // LEGAL: each alone, and video+audio together (one kVideoAudio block).
+  CHECK(parses(R"({"prompt":"x","input_reference":"/tmp/f0.ppm"})"));
+  CHECK(parses(R"({"prompt":"x","metadata":{"input_reference_video":"/tmp/clip"}})"));
+  CHECK(parses(R"({"prompt":"x","metadata":{"input_reference_audio":"/tmp/a.wav"}})"));
+  const VideoRequest both = ParseVideoRequest(
+      R"({"prompt":"x","metadata":{"input_reference_video":"/tmp/clip",
+                                   "input_reference_audio":"/tmp/a.wav"}})");
+  CHECK(both.has_input_reference_video());
+  CHECK(both.has_input_reference_audio());
+
+  // ILLEGAL: fl2va + ref2va. REJECTED, never silently dropped — a dropped
+  // reference is the failure that looks like it worked.
+  CHECK_THROWS(ParseVideoRequest(
+      R"({"prompt":"x","input_reference":"/tmp/f0.ppm",
+          "metadata":{"input_reference_video":"/tmp/clip"}})"));
+  CHECK_THROWS(ParseVideoRequest(
+      R"({"prompt":"x","input_reference":"/tmp/f0.ppm",
+          "metadata":{"input_reference_audio":"/tmp/a.wav"}})"));
+  CHECK_THROWS(ParseVideoRequest(
+      R"({"prompt":"x","input_reference":"/tmp/f0.ppm",
+          "metadata":{"input_reference_video":"/tmp/clip",
+                      "input_reference_audio":"/tmp/a.wav"}})"));
+}
+
 TEST_CASE("video api: a whole OpenAI-shaped body parses, keeping our rich fields") {
   // The exact shape an unmodified OpenAI client sends, plus our native knobs
   // alongside: this is ADDITIVE compatibility, not a replacement.
@@ -176,7 +284,8 @@ TEST_CASE("video api: a whole OpenAI-shaped body parses, keeping our rich fields
     "prompt": "a cat on a skateboard",
     "size": "1280x720",
     "seconds": "8",
-    "task": "t2va",
+    "input_reference": "/tmp/frame0.ppm",
+    "task": "fl2va",
     "extra_params": {"num_frames": 97, "num_inference_steps": 30, "flow_shift": 9.5,
                      "audio_flow_shift": 2.5, "seed": 4242}
   })");
@@ -185,7 +294,8 @@ TEST_CASE("video api: a whole OpenAI-shaped body parses, keeping our rich fields
   CHECK(r.width == 1280);
   CHECK(r.height == 720);
   CHECK(r.duration_seconds == doctest::Approx(8.0));
-  CHECK(r.task == "t2va");
+  CHECK(r.input_reference_path == "/tmp/frame0.ppm");
+  CHECK(r.task == "fl2va");
   CHECK(r.num_frames == 97);
   CHECK(r.num_inference_steps == 30);   // default 50
   CHECK(r.flow_shift == doctest::Approx(9.5));        // default 12.0

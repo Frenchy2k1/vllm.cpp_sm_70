@@ -148,9 +148,11 @@ open("out.mp4", "wb").write(client.videos.download_content(video.id).read())
 | `model` | OpenAI | Recorded and echoed back. A name this server does not serve is a `warning` on the job, never a rejection: the video model is chosen at startup |
 | `size` | OpenAI | `"<width>x<height>"`, e.g. `"1280x720"`. Whole pixels, both positive |
 | `seconds` | OpenAI | Duration, as a number or a numeric string (`8` and `"8"` both work) |
+| `input_reference` | OpenAI | The image the video starts from. A filesystem path or a `data:` URL |
+| `metadata` | OpenAI | Free-form string map, passed through untouched. Two keys are acted on: `input_reference_video` and `input_reference_audio` (see below) |
 | `width`, `height` | native | Output geometry in pixels |
 | `duration` | native | Duration in seconds |
-| `task` | native | `t2va`, `fl2va`, `ref2va`; defaults to `t2va` |
+| `task` | native | `t2va`, `fl2va`, `ref2va`; resolved from the inputs when omitted |
 | `num_frames`, `num_inference_steps`, `flow_shift`, `audio_flow_shift`, `seed` | native | The H3 generation knobs. Accepted at the top level or nested under `extra_params` |
 
 **Precedence.** When a body carries both spellings of one value, the **native
@@ -158,6 +160,63 @@ field wins**: `width`/`height` beat `size`, `duration` beats `seconds`. That
 direction keeps every request that parses today meaning exactly what it meant
 before. Both spellings are validated either way, so a malformed `size` is a 400
 even when explicit `width`/`height` would have overridden it.
+
+**`input_reference` maps to fl2va first-frame conditioning.** OpenAI documents
+it as the image the generated video starts from, which is what fl2va expresses:
+the supplied image is pinned as frame 0 of the output. H3's other image mode,
+ref2va, prepends whole reference images as their own blocks (subject or style
+guidance that never becomes a frame), so it stays reachable only through the
+native `task` field and the `minimax-h3-gen` CLI. Two limits: the image must be
+a **binary PPM (P6)** (no PNG or JPEG codec is vendored, the same residual the
+chat multimodal path carries), and it must already be at the output resolution
+(no image resampler is vendored). A mismatch is refused with the resolved
+geometry in the message.
+
+### Video and audio references (`metadata`)
+
+H3 supports three reference modalities and OpenAI's schema has a slot for one,
+so the other two enter through `metadata`, the standard OpenAI free-form string
+map. Strict clients tolerate it, and no invented top-level field breaks their
+schema validation. Unknown metadata keys are passed through untouched.
+
+```jsonc
+{
+  "prompt": "the same scene, at dusk",
+  "metadata": {
+    "input_reference_video": "/tmp/vllm_h3_videos/job0",  // DIR of frame_%06d.ppm
+    "input_reference_audio": "/tmp/voice.wav"             // 16-bit PCM WAV, or a data: URL
+  }
+}
+```
+
+`input_reference_video` is a **directory of `frame_%06d.ppm`**, which is exactly
+what this server and `minimax-h3-gen` write, so one run's frames chain straight
+into the next request. It is not a container file: no demuxer is vendored.
+
+**A video reference is SILENT.** `MiniMaxH3EncodeReferenceVideo` emits a
+`kVideoAudio` block with `ref_audio_t == 0`, so the clip contributes no sound of
+its own. Supplying `input_reference_audio` alongside it attaches the audio to
+that same block (one block carrying both, the layout upstream builds); without
+it the reference is picture only. That is a real limitation, not an omission.
+
+**Legal combinations.** fl2va keyframes and ref2va reference blocks are
+exclusive in the pipeline itself
+([`minimax_h3_pipeline.cpp`](../src/vllm/model_executor/models/minimax_h3_pipeline.cpp)),
+so the request parser enforces the same rule and returns a 400 naming the
+offending pair rather than dropping a reference you supplied.
+
+| `input_reference` | `metadata.input_reference_video` | `metadata.input_reference_audio` | |
+|---|---|---|---|
+| (none) | (none) | (none) | t2va, prompt only |
+| image | (none) | (none) | fl2va, the image is frame 0 |
+| (none) | clip | (none) | ref2va, silent video reference |
+| (none) | (none) | WAV | ref2va, audio reference |
+| (none) | clip | WAV | ref2va, one block carrying both |
+| image | clip and/or WAV | | **400**: keyframe and reference conditioning are exclusive |
+
+The video reference needs `--video-vae` (the encoder half of the same file) and
+the audio reference needs `--audio-vae`; both load lazily, once, on the first
+request that asks for them.
 
 ### The job lifecycle
 

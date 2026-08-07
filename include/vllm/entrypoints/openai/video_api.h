@@ -5,7 +5,7 @@
 //   POST /v1/videos/sync  -> run to completion, return the MP4 in the body
 //
 // It ALSO speaks OpenAI's Sora video shape, so an OpenAI client works unmodified:
-//   POST /v1/videos            {model, prompt, size:"WxH", seconds}
+//   POST /v1/videos            {model, prompt, size:"WxH", seconds, input_reference}
 //   GET  /v1/videos/{id}       job status
 //   GET  /v1/videos/{id}/content  the finished MP4 bytes (video/mp4)
 // The OpenAI spellings are ALIASES onto the native fields, never replacements —
@@ -29,8 +29,8 @@ namespace vllm::openai {
 
 // One parsed /v1/videos request. Mirrors the fields vLLM-Omni accepts; anything
 // absent falls back to H3's documented defaults via the shape planner. The
-// OpenAI-spelled fields (`model`, `size`, `seconds`) land on the SAME members,
-// so nothing downstream learns a second vocabulary.
+// OpenAI-spelled fields (`model`, `size`, `seconds`, `input_reference`) land on
+// the SAME members, so nothing downstream learns a second vocabulary.
 struct VideoRequest {
   std::string prompt;
   // OpenAI `model` ("sora-2-pro", ...). RECORDED, never a hard failure: the video
@@ -47,6 +47,38 @@ struct VideoRequest {
   double audio_flow_shift = 3.0;   // audio
   int64_t seed = 0;
   bool has_seed = false;
+
+  // OpenAI `input_reference` — the image an image-to-video request starts from.
+  // Exactly one of these is populated (see ParseVideoRequest): a filesystem path,
+  // or the bytes of an inline RFC 2397 `data:` URL plus its declared media type.
+  std::string input_reference_path;
+  std::vector<uint8_t> input_reference_bytes;
+  std::string input_reference_media_type;
+
+  bool has_input_reference() const {
+    return !input_reference_path.empty() || !input_reference_bytes.empty();
+  }
+
+  // OpenAI `metadata`: a free-form string->string map every strict client already
+  // tolerates. H3 supports THREE reference modalities and OpenAI's schema has a
+  // slot for exactly one (the image), so the other two enter here rather than as
+  // invented top-level fields that would fail a client's schema validation. The
+  // whole map is kept verbatim (unknown keys are passed through untouched); the
+  // two keys we act on are lifted out below.
+  //   metadata.input_reference_video — a DIRECTORY of frame_%06d.ppm, the exact
+  //     layout `minimax-h3-gen` writes, so one run's output chains into the next.
+  //     SILENT: the clip carries no audio unless input_reference_audio is also
+  //     given (the audio VAE's encoder is a separate call).
+  //   metadata.input_reference_audio — a 16-bit PCM WAV path or `data:` URL.
+  std::map<std::string, std::string> metadata;
+  std::string input_reference_video_dir;
+  std::string input_reference_audio_path;
+  std::vector<uint8_t> input_reference_audio_bytes;
+
+  bool has_input_reference_video() const { return !input_reference_video_dir.empty(); }
+  bool has_input_reference_audio() const {
+    return !input_reference_audio_path.empty() || !input_reference_audio_bytes.empty();
+  }
 };
 
 // Parse OpenAI's `size` — "<width>x<height>", e.g. "1280x720" — into its two
@@ -59,6 +91,15 @@ void ParseVideoSize(const std::string& size, int64_t* width, int64_t* height);
 // Parse + validate a request body. Throws (VT_CHECK) with a specific message on
 // malformed input rather than silently defaulting, so a bad request is a 400 with
 // a reason instead of a surprising generation.
+//
+// REFERENCE COMBINATIONS are checked here, not left to the pipeline, because a
+// reference the caller supplied and we quietly dropped is the failure that looks
+// like it worked. The rule is the pipeline's own
+// (minimax_h3_pipeline.cpp:251): fl2va keyframes and ref2va reference blocks are
+// EXCLUSIVE. `input_reference` is fl2va; the metadata video/audio references are
+// ref2va. So legal: nothing; input_reference alone; video alone; audio alone;
+// video+audio (one kVideoAudio block carrying both). Illegal, and a 400 naming
+// the pair: input_reference together with either metadata reference.
 //
 // PRECEDENCE, when a body carries both spellings of one value: the NATIVE field
 // WINS (`width`/`height` over `size`, `duration` over `seconds`). The OpenAI

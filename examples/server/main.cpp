@@ -32,8 +32,11 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -89,6 +92,105 @@ namespace {
 namespace fs = std::filesystem;
 using vllm::HfConfig;
 using vllm::Qwen3_5MoeWeights;
+
+// Decode a binary PPM (P6) into [3, H, W] floats in [-1, 1] — the layout the H3
+// video-VAE encoder takes. It reads from BYTES rather than a path so one decoder
+// serves both spellings of `input_reference` (a filesystem path and an inline
+// data: URL). PPM is the only still-image container this tree can read: no PNG /
+// JPEG codec is vendored, which is the same NAMED residual the chat multimodal
+// path carries (see chat_mm.h), not a limitation of this endpoint.
+std::vector<float> DecodePpmChw(const std::string& bytes, int64_t* out_h,
+                                int64_t* out_w) {
+  std::istringstream in(bytes, std::ios::binary);
+  std::string magic;
+  in >> magic;
+  if (magic != "P6") {
+    throw std::runtime_error(
+        "input_reference: not a binary PPM (P6); no PNG/JPEG codec is vendored, "
+        "so a reference image must be supplied as binary PPM");
+  }
+  auto next_int = [&]() {
+    int v = 0;
+    while (in >> std::ws, in.peek() == '#') { std::string skip; std::getline(in, skip); }
+    in >> v;
+    return v;
+  };
+  const int w = next_int(), h = next_int(), maxv = next_int();
+  if (w <= 0 || h <= 0 || maxv <= 0) {
+    throw std::runtime_error("input_reference: bad PPM header");
+  }
+  in.get();  // the single whitespace byte before the payload
+  std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
+  in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+  if (!in) throw std::runtime_error("input_reference: truncated PPM payload");
+  std::vector<float> chw(rgb.size());
+  const int64_t plane = static_cast<int64_t>(w) * h;
+  for (int64_t i = 0; i < plane; ++i) {
+    for (int64_t c = 0; c < 3; ++c) {
+      chw[static_cast<size_t>(c * plane + i)] =
+          static_cast<float>(rgb[static_cast<size_t>(i * 3 + c)]) / (maxv * 0.5f) - 1.0f;
+    }
+  }
+  if (out_h != nullptr) *out_h = h;
+  if (out_w != nullptr) *out_w = w;
+  return chw;
+}
+
+// The bytes behind one reference: the parser hands us either a path or the
+// already-decoded payload of a data: URL.
+std::string ReadReferenceBytes(const std::string& field, const std::string& path,
+                               const std::vector<uint8_t>& inline_bytes) {
+  if (!inline_bytes.empty()) return std::string(inline_bytes.begin(), inline_bytes.end());
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error(field + ": cannot open " + path);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// A ref2va VIDEO reference: DIR/frame_%06d.ppm, the exact layout minimax_h3_gen
+// and this server's own muxer WRITE, so one run's frames chain straight into the
+// next request. Returns [C, T, H, W] in [-1, 1] (the encoder's clip layout);
+// no container demuxer is vendored, which is why this is a frame directory.
+std::vector<float> ReadReferenceClipChw(const std::string& dir, int64_t* out_t,
+                                        int64_t* out_h, int64_t* out_w) {
+  std::vector<float> per_frame;  // frame-major [T][C,H,W]
+  int64_t frames = 0, fh = 0, fw = 0;
+  for (int64_t k = 0;; ++k) {
+    char name[512];
+    std::snprintf(name, sizeof(name), "%s/frame_%06lld.ppm", dir.c_str(),
+                  static_cast<long long>(k));
+    std::ifstream probe(name, std::ios::binary);
+    if (!probe) break;
+    const std::string bytes((std::istreambuf_iterator<char>(probe)),
+                            std::istreambuf_iterator<char>());
+    int64_t h = 0, w = 0;
+    const std::vector<float> frame = DecodePpmChw(bytes, &h, &w);
+    if (frames == 0) { fh = h; fw = w; }
+    if (h != fh || w != fw) {
+      throw std::runtime_error(
+          "metadata.input_reference_video: every frame_%06d.ppm must have the same size");
+    }
+    per_frame.insert(per_frame.end(), frame.begin(), frame.end());
+    ++frames;
+  }
+  if (frames == 0) {
+    throw std::runtime_error("metadata.input_reference_video: no frame_%06d.ppm files in " + dir);
+  }
+  // [T][C,H,W] -> [C,T,H,W], the causal 3-D encoder's layout.
+  std::vector<float> chw(per_frame.size());
+  const int64_t plane = fh * fw;
+  for (int64_t c = 0; c < 3; ++c) {
+    for (int64_t k = 0; k < frames; ++k) {
+      for (int64_t e = 0; e < plane; ++e) {
+        chw[static_cast<size_t>((c * frames + k) * plane + e)] =
+            per_frame[static_cast<size_t>(k * 3 * plane + c * plane + e)];
+      }
+    }
+  }
+  *out_t = frames;
+  *out_h = fh;
+  *out_w = fw;
+  return chw;
+}
 
 struct Args {
   std::string model_dir;
@@ -613,6 +715,18 @@ int main(int argc, char** argv) {
       vllm::MiniMaxH3PartitionInfo partition_info;
       vt::Device device;
       std::atomic<int64_t> counter{0};
+      // The two VAEs' ENCODER halves, for the reference modalities: the video VAE
+      // encodes an `input_reference` image and a `metadata.input_reference_video`
+      // clip, the audio VAE encodes a `metadata.input_reference_audio` waveform.
+      // Loaded LAZILY and ONCE each: a text-to-video server must not pay for
+      // weights it never uses, and a server that does use them must not reload
+      // per request.
+      std::string video_vae_path, audio_vae_path;
+      std::mutex encoder_mutex;
+      bool video_encoder_loaded = false, audio_encoder_loaded = false;
+      vllm::MiniMaxH3AudioVaeWeights video_encoder_weights, audio_encoder_weights;
+      vllm::MiniMaxH3EncoderFcn3dConfig video_encoder_cfg;
+      vllm::MiniMaxH3AudioVaeEncoderConfig audio_encoder_cfg;
     };
     std::shared_ptr<VideoState> video;
     if (!args.video_dit.empty()) {
@@ -677,6 +791,8 @@ int main(int argc, char** argv) {
       video->workdir = args.video_workdir;
       video->ffmpeg = args.video_ffmpeg;
       video->partition_info = vllm::MiniMaxH3PartitionFromFlag(args.video_partition);
+      video->video_vae_path = args.video_vae;
+      video->audio_vae_path = args.audio_vae;
       if (args.video_device == "cuda") {
         video->device = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
       }
@@ -722,13 +838,50 @@ int main(int argc, char** argv) {
               "video generation needs conditioning: start the server with "
               "--video-encoder (to condition on the prompt) or --video-prompt-embeds");
         }
+        // OpenAI `input_reference` -> fl2va FIRST-FRAME conditioning.
+        //
+        // WHY fl2va and not ref2va: OpenAI documents input_reference as the image
+        // the generated video STARTS FROM (image-to-video), which is exactly what
+        // fl2va expresses — MiniMaxH3EncodeKeyframeCondRows pins frame 0 OF THE
+        // OUTPUT to the supplied image. ref2va
+        // (MiniMaxH3EncodeReferenceImages) means something else: whole reference
+        // images PREPENDED to the sequence as their own blocks, i.e. subject or
+        // style guidance that never becomes a frame of the result. Mapping
+        // input_reference there would silently change what the API promises. The
+        // ref2va modalities OpenAI has no slot for enter through `metadata`
+        // (input_reference_video / input_reference_audio) instead; the parser has
+        // already refused the combinations the pipeline forbids.
+        std::vector<float> reference_chw;
+        int64_t reference_h = 0, reference_w = 0;
+        if (req.has_input_reference()) {
+          reference_chw = DecodePpmChw(
+              ReadReferenceBytes("input_reference", req.input_reference_path,
+                                 req.input_reference_bytes),
+              &reference_h, &reference_w);
+        }
+        std::vector<float> reference_clip;
+        int64_t clip_t = 0, clip_h = 0, clip_w = 0;
+        if (req.has_input_reference_video()) {
+          reference_clip = ReadReferenceClipChw(req.input_reference_video_dir, &clip_t,
+                                                &clip_h, &clip_w);
+        }
+
         const vllm::MiniMaxH3DitParams& p = video->dit.params;
         vllm::MiniMaxH3T2vaRequest r;
         r.partition = video->partition_info;  // #77 guard: MiniMaxH3GenerateT2va
                                               // refuses a task this partition can't serve.
+        // With a reference image and no explicit task, the task IS fl2va; a
+        // metadata reference means ref2va. The image aspect also drives the
+        // default resolution (_resolve_shape).
+        const bool has_ref2va =
+            req.has_input_reference_video() || req.has_input_reference_audio();
+        const std::string task =
+            !req.task.empty()
+                ? req.task
+                : (req.has_input_reference() ? "fl2va" : (has_ref2va ? "ref2va" : "t2va"));
         const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
-            req.task.empty() ? "t2va" : req.task, req.duration_seconds, req.num_frames,
-            req.height, req.width, 0, 0);
+            task, req.duration_seconds, req.num_frames, req.height, req.width,
+            reference_w, reference_h);
         r.latent_t = plan.latent_t;
         r.num_frames = plan.num_frames;
         r.latent_h = plan.height / vllm::kMiniMaxH3VaeRatio;
@@ -743,6 +896,97 @@ int main(int argc, char** argv) {
         r.audio_latents_mean = video->audio_stats.mean;
         r.audio_latents_std = video->audio_stats.std_dev;
         r.text_len = static_cast<int64_t>(conditioning.size()) / p.text_dim;
+
+        // Both VAE encoder halves load at most once, under one lock, whichever
+        // reference modality asks for them first.
+        auto ensure_video_encoder = [&]() {
+          if (video->video_vae_path.empty()) {
+            throw std::runtime_error(
+                "a video/image reference needs the video VAE ENCODER half: start "
+                "the server with --video-vae");
+          }
+          if (video->video_encoder_loaded) return;
+          const vllm::SafetensorsFile vf = vllm::SafetensorsFile::Open(video->video_vae_path);
+          video->video_encoder_weights = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vf);
+          video->video_encoder_cfg = vllm::MiniMaxH3EncoderFcn3dConfig{};
+          video->video_encoder_cfg.z_channels = 2 * p.latents_dim;  // mean | logvar
+          video->video_encoder_loaded = true;
+        };
+        auto ensure_audio_encoder = [&]() {
+          if (video->audio_vae_path.empty()) {
+            throw std::runtime_error(
+                "metadata.input_reference_audio needs the audio VAE ENCODER half: "
+                "start the server with --audio-vae");
+          }
+          if (video->audio_encoder_loaded) return;
+          const vllm::SafetensorsFile af = vllm::SafetensorsFile::Open(video->audio_vae_path);
+          video->audio_encoder_weights = vllm::LoadMiniMaxH3AudioVaeEncoderWeights(af);
+          video->audio_encoder_cfg = vllm::MiniMaxH3AudioVaeEncoderConfig{};
+          video->audio_encoder_cfg.vae_latent_channels = p.audio_latents_dim;
+          video->audio_encoder_loaded = true;
+        };
+
+        if (req.has_input_reference()) {
+          if (reference_h != plan.height || reference_w != plan.width) {
+            // No image resampler is vendored, and a mis-sized keyframe would
+            // either abort deep in the denoise or pin the wrong latent rows. Say
+            // so up front, with the geometry we resolved.
+            throw std::runtime_error(
+                "input_reference is " + std::to_string(reference_w) + "x" +
+                std::to_string(reference_h) + " but this request resolved to " +
+                std::to_string(plan.width) + "x" + std::to_string(plan.height) +
+                "; supply the reference at the output size (or pass a matching "
+                "`size`): no image resampler is vendored");
+          }
+          std::lock_guard<std::mutex> guard(video->encoder_mutex);
+          ensure_video_encoder();
+          r.keyframe_frame_indices = {0};  // FIRST frame; upstream also allows {-1}/{0,-1}
+          r.imgvid_noise_aug = 1.0;        // pin the frame exactly
+          r.keyframe_cond_rows = vllm::MiniMaxH3EncodeKeyframeCondRows(
+              video->video_encoder_cfg, video->video_encoder_weights, p, {reference_chw},
+              reference_h, reference_w, r.latent_t, r.imgvid_noise_aug, {});
+        } else if (has_ref2va) {
+          // ── ref2va REFERENCE BLOCKS. Exclusive with the fl2va branch above
+          // (minimax_h3_pipeline.cpp:251), which the parser already enforced. ──
+          std::lock_guard<std::mutex> guard(video->encoder_mutex);
+          std::vector<vllm::MiniMaxH3RefBlock> blocks;
+          if (req.has_input_reference_video()) {
+            ensure_video_encoder();
+            vllm::MiniMaxH3RefBlock block{};
+            r.keyframe_cond_rows = vllm::MiniMaxH3EncodeReferenceVideo(
+                video->video_encoder_cfg, video->video_encoder_weights, p, reference_clip,
+                clip_t, clip_h, clip_w, &block);
+            // SILENT by construction: MiniMaxH3EncodeReferenceVideo emits
+            // ref_audio_t == 0 because the clip's own soundtrack would need the
+            // audio VAE encoder run over it. An audio reference below ATTACHES to
+            // this block, which is the layout packed_sequence.py builds.
+            blocks.push_back(block);
+          }
+          if (req.has_input_reference_audio()) {
+            ensure_audio_encoder();
+            const std::string wav_bytes = ReadReferenceBytes(
+                "metadata.input_reference_audio", req.input_reference_audio_path,
+                req.input_reference_audio_bytes);
+            int64_t samples_per_channel = 0;
+            const std::vector<float> waveform = vllm::MiniMaxH3ReadWav(
+                wav_bytes, vllm::kMiniMaxH3AudioChannels, vllm::kMiniMaxH3AudioSampleRate,
+                &samples_per_channel);
+            vllm::MiniMaxH3RefBlock audio_block{};
+            r.audio_ref_rows = vllm::MiniMaxH3EncodeReferenceAudio(
+                video->audio_encoder_cfg, video->audio_encoder_weights, waveform,
+                vllm::kMiniMaxH3AudioChannels, samples_per_channel, video->audio_stats.mean,
+                video->audio_stats.std_dev, /*noise_aug=*/1.0, {}, &audio_block);
+            if (!blocks.empty() &&
+                blocks[0].kind == vllm::MiniMaxH3RefBlock::Kind::kVideoAudio) {
+              // The reference video now HAS sound: one kVideoAudio block carries
+              // both, so its ref_audio_t must claim exactly the rows just encoded.
+              blocks[0].ref_audio_t = audio_block.ref_audio_t;
+            } else {
+              blocks.push_back(audio_block);
+            }
+          }
+          r.ref_blocks = blocks;
+        }
 
         const int64_t frame_rows =
             (r.latent_h / p.patch_size_h) * (r.latent_w / p.patch_size_w);

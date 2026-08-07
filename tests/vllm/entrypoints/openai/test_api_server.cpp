@@ -1808,18 +1808,75 @@ TEST_CASE("api_server: the OpenAI request aliases reach the runner unchanged") {
   // the field default, so this proves the parser ran end to end.
   ApiServer::DispatchResult r = h.server.handle_videos_sync(R"({
     "model": "test-model", "prompt": "a cat on a skateboard",
-    "size": "1280x720", "seconds": "8"
+    "size": "1280x720", "seconds": "8", "input_reference": "/tmp/frame0.ppm"
   })");
   REQUIRE(r.status == 200);
   CHECK(seen.prompt == "a cat on a skateboard");
   CHECK(seen.width == 1280);
   CHECK(seen.height == 720);
   CHECK(seen.duration_seconds == doctest::Approx(8.0));
+  CHECK(seen.input_reference_path == "/tmp/frame0.ppm");
+  CHECK(seen.has_input_reference());
   CHECK(seen.model == "test-model");
   // The served model was named, so nothing is warned about.
   nlohmann::json body = nlohmann::json::parse(r.body);
   CHECK(body.at("model") == "test-model");
   CHECK_FALSE(body.contains("warning"));
+}
+
+TEST_CASE("api_server: every reference modality reaches the runner, or is refused") {
+  // H3 has three reference modalities and OpenAI's schema carries one, so the
+  // other two ride in `metadata`. What matters is that each one ARRIVES at the
+  // runner (the library gates already prove a reference changes the output);
+  // a reference that parsed and then never reached the pipeline is the failure
+  // that looks like it worked.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  vllm::openai::VideoRequest seen;
+  int calls = 0;
+  h.server.set_video_runner(
+      [&](const vllm::openai::VideoRequest& req) -> std::string {
+        seen = req;
+        ++calls;
+        return "/tmp/out.mp4";
+      });
+
+  SUBCASE("the metadata video + audio references arrive together") {
+    REQUIRE(h.server
+                .handle_videos_sync(R"({"prompt":"x","metadata":{
+                    "input_reference_video":"/tmp/prev_job",
+                    "input_reference_audio":"/tmp/voice.wav",
+                    "trace_id":"abc-123"}})")
+                .status == 200);
+    CHECK(calls == 1);
+    CHECK(seen.input_reference_video_dir == "/tmp/prev_job");
+    CHECK(seen.input_reference_audio_path == "/tmp/voice.wav");
+    CHECK(seen.metadata.at("trace_id") == "abc-123");  // free-form keys pass through
+    CHECK_FALSE(seen.has_input_reference());
+  }
+
+  SUBCASE("the audio reference arrives alone, as inline bytes") {
+    REQUIRE(h.server
+                .handle_videos_sync(
+                    R"({"prompt":"x","metadata":{"input_reference_audio":"data:audio/wav;base64,aGk="}})")
+                .status == 200);
+    CHECK(calls == 1);
+    REQUIRE(seen.input_reference_audio_bytes.size() == 2);
+    CHECK(seen.input_reference_audio_bytes[0] == 'h');
+    CHECK_FALSE(seen.has_input_reference_video());
+  }
+
+  SUBCASE("fl2va + ref2va is a 400 and the runner is never reached") {
+    ApiServer::DispatchResult r = h.server.handle_videos_sync(
+        R"({"prompt":"x","input_reference":"/tmp/f0.ppm",
+            "metadata":{"input_reference_audio":"/tmp/a.wav"}})");
+    CHECK(r.status == 400);
+    CHECK(calls == 0);  // nothing generated from a half-honoured request
+    const std::string message =
+        nlohmann::json::parse(r.body).at("error").at("message").get<std::string>();
+    CHECK(message.find("exclusive") != std::string::npos);
+  }
 }
 
 TEST_CASE("api_server: an unserved `model` warns on the job but still generates") {

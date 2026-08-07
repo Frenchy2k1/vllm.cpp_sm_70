@@ -264,7 +264,15 @@ ENGINE_PREFIXES = (
 # fl2va/ref2va exclusivity is enforced at the request boundary. CPU-landed +
 # gated, `PARTIAL`, `CLAIM-SERVE-VIDEOS-OAI`, spec `specs/minimax-h3.md` §9.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 141
+# 142 since 2026-08-06: +`SERVE-VIDEOS-REFS` (reference CONDITIONING over
+# `/v1/videos`: `input_reference` -> fl2va, plus the two `metadata` ref2va
+# modalities) — a real new capability stacked on `SERVE-VIDEOS-OAI`, not a
+# restatement of it: that row made an OpenAI body PARSE, this one makes its
+# references reach the pipeline. Before it no reference modality was reachable
+# over HTTP at all. CPU-landed + gated, `CLAIM-SERVE-VIDEOS-REFS`, spec
+# `specs/minimax-h3.md` §10.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 142
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
