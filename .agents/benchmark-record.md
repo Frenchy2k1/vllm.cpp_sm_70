@@ -14594,3 +14594,52 @@ FLIP LEDGER (deterministic golden arbitrates): the two levers interact — islan
 
 VERDICT: NO arm STRICT (K=3-deterministic golden → STRICT required, not distributional); default STAYS OFF (parity-enablers). NAMED residual (= also the speed lever): the device islands — a NEW per-channel-decay GDN kernel (`g[T,H,D]`; `vt::GdnDecode`/`GdnPrefill` carry only per-head `g[T,Hv]`, ops.h:1797/1846 — NOT a drop-in) + paged `mla::ForwardMlaAttentionBlock` (FA2). Speed HW-forced-indirect: 1.30 tok/s (O(n²) recompute + host islands, invariant to the numeric knobs); vLLM cannot serve Kimi-Linear-48B at bf16 on one GB10 (oracle capture needed util 0.82 for a single-seq eager run) so a direct `vllm bench throughput` arm is infeasible. Row STAYS ACTIVE.
 >>>>>>> origin/main
+
+## VK-E, llama.cpp Vulkan comparison — DENOMINATOR MEASURED, our arm BLOCKED (2026-08-07, GB10)
+
+**llama.cpp Vulkan baseline, at FULL STRENGTH.** Built from our pinned source
+`237ad9b96`, `-DGGML_VULKAN=ON`, GB10, under `$HOME/gpu.lock`. Runtime banner:
+`NVIDIA GB10 | uma: 1 | fp16: 1 | bf16: 1 | warp size: 32 | int dot: 1 |
+matrix cores: NV_coopmat2`.
+
+| model | test | t/s |
+|---|---|---:|
+| qwen3 0.6B F16 (1.11 GiB) | pp128 | **11,730.14 ± 238.49** |
+| qwen3 0.6B F16 (1.11 GiB) | tg32 | **161.37 ± 1.20** |
+
+**★ THE BUILD-TOOLCHAIN TRAP, CONFIRMED AND AVOIDED.** The fan-out spike predicted
+Ubuntu's `glslc` (shaderc 2023.8) would be too old for llama.cpp's coopmat2 probe.
+It is, and the effect is larger than "coopmat2": configured against the packaged
+glslc, llama.cpp reports
+
+    GL_KHR_cooperative_matrix        supported
+    GL_NV_cooperative_matrix2        NOT supported
+    GL_NV_cooperative_matrix_decode_vector NOT supported
+    GL_EXT_integer_dot_product       NOT supported
+    GL_EXT_bfloat16                  NOT supported
+
+— i.e. FOUR of its five Vulkan fast paths silently disabled, including its best
+NVIDIA one. Benchmarking against that would have handicapped the reference and
+flattered us, which is the exact inverse of the "denominator is the reference's
+PRODUCTION config" rule. Fixed by building shaderc from source on dgx
+(`v2026.4-dev`, `/tmp/shaderc/b/glslc/glslc`) and passing
+`-DVulkan_GLSLC_EXECUTABLE=`; all five then report `supported` and the runtime
+banner confirms `matrix cores: NV_coopmat2`. **Any future llama.cpp-Vulkan number
+from this box MUST check that banner** — the packaged glslc produces a build that
+looks fine and quietly runs the slow paths.
+
+**OUR ARM IS BLOCKED, and not for the reason expected.** The known limit was op
+coverage (16 of 87 native, the rest on the portable CPU tier). The ACTUAL blocker
+hit first: **no model on dgx loads in both engines.** Our GGUF path rejects the
+plain `qwen3` architecture (`qwen3_5_gguf_weights.cpp:829`, "unexpected
+architecture 'qwen3'" — the Qwen3.5 family loader), and llama.cpp cannot load our
+`la-f16.gguf` (Laguna, a vllm.cpp-side architecture). The two engines support
+DISJOINT GGUF sets among the models present.
+
+So VK-E's e2e comparison is not merely "we would lose"; it cannot be RUN yet. It
+needs either a GGUF architecture both load (a plain Llama/Qwen3 GGUF our loader
+accepts, or safetensors on our side against the same weights), or the quant tier
+(`VK-D`) so a shared quantised model is meaningful. Recorded as the binding
+blocker rather than papered over with a mismatched pair of numbers.
+
+**No vllm.cpp Vulkan number is claimed here.** The denominator above stands alone.
