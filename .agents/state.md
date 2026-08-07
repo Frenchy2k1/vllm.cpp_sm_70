@@ -42185,3 +42185,45 @@ Voxtral remain off-registry (fold #9/#10 of the audit).
   Pre-existing red, NOT from this work: `test_bench` fails on any Vulkan-ON build
   (synthetic engine's host-allocated embedding table is not a Vulkan allocation).
   Verified identical on unmodified HEAD before attributing.
+
+- **2026-08-07 (VK-A2 default-on)** — **★ Vulkan decode 8.59 -> 59.3 tok/s on
+  PRODUCTION DEFAULTS, 6.9x in one session (`CLAIM-VULKAN-FULL-1`).**
+
+  | | session start | now (no env set) |
+  |---|---:|---:|
+  | decode tok/s | 8.59 | **59.3** |
+  | % of the 182 tok/s bandwidth roof | 5% | **33%** |
+  | gap to llama.cpp 160.9 | ~19x | **2.7x** |
+
+  **`VK-A2` was the lever, at 2.62x (8/8 interleaved pairs), and its blocker was
+  never "defer the submit".** `Pipeline` held ONE `VkDescriptorSet`, and a
+  descriptor set is read at EXECUTION time — batching two dispatches of one
+  pipeline would let the second overwrite the first's operands before either ran.
+  Each pipeline now owns a ring of 16, plus a memory barrier between dispatches.
+
+  **The default flip was unblocked by a seam that already existed.**
+  `Backend::FlushPending` is documented for exactly the reference-tier host-read
+  hazard and already called by `op_provider.cpp`; Metal implemented it, Vulkan had
+  not. **Second time this campaign the framework already had the answer** — the
+  first was the fusion recipes. Look for the seam before building one.
+
+  **Ratio of shipped to discarded work: 3 of 6 levers were NEGATIVE and reverted
+  or left off** — subgroup reduction (4/8 wash), Tier-1 fusion (fuses 0
+  dispatches), and `VK-A2` itself when first measured (1.15x ceiling, correct at
+  the time; it only became the top lever once the others shrank everything else).
+
+  **Two gate lessons.** (1) A gate the STRICT run cannot provide: opt-125m passes
+  with or without the FlushPending hook, because OPT hits the reference tier once
+  at setup. The hazard needed its own gate, and it was **verified by disabling the
+  hook** — red at 4 pending, green restored. (2) My VK-A2 mechanism test
+  re-derived the lever's default from the environment and asserted the wrong
+  branch the moment the default flipped; the context now exposes
+  `batching_enabled()` and the test ASKS. A predicate duplicated between an
+  implementation and its gate will disagree with itself.
+
+  Also fixed: the "~500x behind on prefill" figure was a METRIC ARTIFACT
+  (`input_throughput` divided by the whole run). Real prefill is now measured:
+  **137.7 tok/s**.
+
+  Next levers, unstarted: wider per-lane GEMV loads, and Tier-1 vocabulary for the
+  `qkv_split -> rope -> reshape_and_cache` chain (672 dispatches -> 224).
