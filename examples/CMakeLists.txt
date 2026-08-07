@@ -64,17 +64,22 @@ if(VLLM_CPP_SERVER)
 endif()
 
 # minimax-h3-mux: muxes MiniMax-H3 PPM frames + WAV into an MP4 by invoking
-# ffmpeg. This is the RATIFIED home of that process spawn (developer decision
-# 2026-08-03): the library builds the artifacts and the argv, examples/ runs it.
+# ffmpeg — a THIN client of the public C ABI (include/vllm.h + vllm::shared
+# ONLY, like vllm-cli), per the ONE SURFACE directive. This is the RATIFIED
+# home of that process spawn (developer decision 2026-08-03): the library
+# composes the argv (vllm_video_mux_argv), examples/ runs it.
 add_executable(minimax-h3-mux minimax_h3_mux/main.cpp)
-target_link_libraries(minimax-h3-mux PRIVATE vllm::vllm)
+target_link_libraries(minimax-h3-mux PRIVATE vllm::shared)
 vllm_cpp_set_warnings(minimax-h3-mux)
 
-# minimax-h3-gen: the ASSEMBLY driver — opens the real checkpoints, runs the whole
-# t2va path and writes an MP4. Lives here because it invokes ffmpeg (the ratified
-# boundary) and because it is a driver, not library surface.
+# minimax-h3-gen: MiniMax-H3 video generation end to end — a THIN client of
+# the public C ABI (ARCH-ONE-SURFACE ROW 2). The assembly pipeline it used to
+# own privately lives in the library behind vllm_video_engine_load +
+# vllm_video_generate; the fold gate holds its frames + WAV byte-identical to
+# the pre-fold binary. Lives here because it invokes ffmpeg (the ratified
+# boundary).
 add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
-target_link_libraries(minimax-h3-gen PRIVATE vllm::vllm)
+target_link_libraries(minimax-h3-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(minimax-h3-gen)
 
 # vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar

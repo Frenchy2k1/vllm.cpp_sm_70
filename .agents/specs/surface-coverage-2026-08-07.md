@@ -24,7 +24,7 @@ The four surfaces, and the public boundary the guard draws:
 
 | Rank | Gap | Registered | Servable | C-ABI | Where the capability actually lives |
 |---|---|---|---|---|---|
-| 1 | **MiniMax-H3 video+audio generation** | NO (off-registry diffusion) | `/v1/videos` ONLY via an example-injected `VideoRunner` | NO | `examples/minimax_h3_gen` + `examples/minimax_h3_mux` (whole pipeline) |
+| 1 | **MiniMax-H3 video+audio generation** | **CLOSED (ROW 2)**: still off-registry (a diffusion lane, not a text arch) but library-owned end to end | **`/v1/videos` through the library seam** (`MiniMaxH3VideoEngine` + `MiniMaxH3VideoGenParamsFromRequest`; the server keeps only flag plumbing + the ffmpeg exec) | **`vllm_video_*` (ABI v12)** | library seam `vllm::multimodal::MiniMaxH3VideoEngine`; both examples are clean ABI clients |
 | 2 | **Laguna fast decode** | yes, but forward is a stub | no (stub `VT_CHECK`s non-bf16) | no | `examples/laguna_gen` (keep-quant GGUF + NVFP4 W4A4) |
 | 3 | **DeepSeek-V4 fast decode** | yes, but forward is a W3 stub | no (stub) | no | `examples/deepseek_v4_gen` (keep-quant GGUF) |
 | 4 | **Audio transcription** | **CLOSED (ROW 1)**: Parakeet CTC/RNNT/TDT registered (transcription-only; Whisper/Voxtral still off-registry) | **live `/v1/audio/transcriptions`** (task-conditional; the run_batch line stays a residual) | **`vllm_transcribe` (ABI v11)** | library seam `ParakeetTranscriber`; example is a clean ABI client |
@@ -60,7 +60,7 @@ All three drivers run a PRIVATE host-argmax greedy loop, not the on-GPU sampler.
 
 | Lane | Registered | Code (file:line) | Server | C-ABI | Driver |
 |---|---|---|---|---|---|
-| MiniMax-H3 video+audio GEN | NO | `minimax_h3*.cpp` (~22 TUs), vt op `kMiniMaxH3` | `/v1/videos` via `set_video_runner` (example-injected only; `api_server.h:167`, `api_server.cpp:818`; library never sets it) | NO | `examples/minimax_h3_gen`, `examples/minimax_h3_mux` |
+| MiniMax-H3 video+audio GEN | NO (diffusion lane; **ROW 2** made it library-owned without a registry entry) | `minimax_h3*.cpp` (~22 TUs) + the **`minimax_h3_video.cpp` seam** (ROW 2), vt op `kMiniMaxH3` | `/v1/videos` via `set_video_runner`, the runner now a thin exec wrapper over the LIBRARY seam (`MiniMaxH3VideoGenParamsFromRequest` -> `Generate` -> exec argv) | **`vllm_video_engine_load` / `vllm_video_generate` / `vllm_video_result_free` / `vllm_video_mux_argv` (ABI v12)** | `examples/minimax_h3_gen`, `examples/minimax_h3_mux` = thin `vllm.h` clients |
 | Parakeet/FastConformer ASR | **YES (ROW 1)**: ParakeetForCTC/RNNT/TDT, `parakeet_registry.cpp` (SupportsTranscription-only; text paths refuse by task) | `parakeet_transcription.cpp` seam composes encoder/transducer/audio-processor; the example's private `ReadWav16BitMono`/`LoadVocab`/`DecodeIds` are DELETED (`vllm::Tokenizer` now decodes Metaspace split=true) | **`/v1/audio/transcriptions`** (task-conditional) | **`vllm_transcribe` (ABI v11)** | `examples/parakeet_transcribe` = thin `vllm.h` client |
 | Voxtral audio->text | NO (`VoxtralForConditionalGeneration` unregistered) | `voxtral.cpp` (`vllm::multimodal`) | NO (`/v1/audio/transcriptions` = `run_batch.cpp:188` residual) | NO | tests-only reachability |
 | Whisper audio encoder | NO | `whisper_audio.cpp:174` | NO | NO | tests-only callers |
@@ -77,11 +77,13 @@ Public boundary = `#include "vllm.h"` only. 13 example units; `examples/cli` (vl
 links `vllm::shared`, `#include "vllm.h"` only, `cli/main.cpp:16`) is the sole clean ABI
 client. **ROW 1 UPDATE (2026-08-07): `parakeet_transcribe` is the SECOND clean ABI
 client** — the Parakeet fold rewrote it against `vllm.h` + `vllm::shared` only, and the
-ratchet fell 12 -> 11. The remaining 11 reach `include/vllm/**` / `vt/**` and are
-transition-tracked in `scripts/example-abi-allowlist.txt`:
+ratchet fell 12 -> 11. **ROW 2 UPDATE (2026-08-08): `minimax_h3_gen` and
+`minimax_h3_mux` are the THIRD and FOURTH clean ABI clients** (the video fold, ABI
+v12 `vllm_video_*`), and the ratchet fell 11 -> 9. The remaining 9 reach
+`include/vllm/**` / `vt/**` and are transition-tracked in
+`scripts/example-abi-allowlist.txt`:
 
-- Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `kimi_linear_gen`,
-  `minimax_h3_gen`, `minimax_h3_mux`, `server`.
+- Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `kimi_linear_gen`, `server`.
 - Dev/diagnostic (internal-by-nature, folded for consistency): `bench` (via
   `bench_core.h`), `tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench`.
 - Out of the gated `examples/` tree: `benchmarks/vulkan_gemm_ab.cpp` (Vulkan A/B harness).
@@ -89,7 +91,7 @@ transition-tracked in `scripts/example-abi-allowlist.txt`:
 **Policy (developer-directed 2026-08-07): no permanent exemptions.** Every allowlist entry
 — drivers AND dev/diagnostic tools — is a transition-tracker pointing at a fold row; the
 guard fails on any internal include not tracked, and a shrink-only ratchet
-(`MAX_INTERNAL_REACHING`, 11 since ROW 1) means the count can only fall as folds land, never grow to
+(`MAX_INTERNAL_REACHING`, 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
 admit a new violation. The public header set is DERIVED from the CMake install rules
 (exactly `include/vllm.h` today), not hardcoded. The guard catches BOTH breach vectors: a
 `#include "vllm/..."|"vt/..."|"src/..."` AND a CMake `-I` grant into the internal tree
@@ -128,7 +130,7 @@ lanes are leaves of `ARCH-ONE-SURFACE` (do not open parallel rows).
 
 | # | Fold | Grow ABI (new `vllm.h` surface) | Then rewrite / delete | Effort | Depends on |
 |---|---|---|---|---|---|
-| 1 | Video+audio gen | `vllm_video_generate` + job/status/content entry points (mirror `/v1/videos`; carry the `VideoRunner` internally, not example-injected) | rewrite `minimax_h3_gen`/`server` as clients; delete driver glue | L | H3 loaders; ffmpeg-mux boundary (ratified in `examples/`) |
+| 1 | Video+audio gen | **DONE (ROW 2, 2026-08-08)**: `vllm_video_engine_load`/`vllm_video_generate`/`vllm_video_result_free` + `vllm_video_mux_argv` (ABI v12); `/v1/videos` routes through the SAME `MiniMaxH3VideoEngine` seam (job/status/content stay `VideoJobStore`-served; the runner is now a thin exec wrapper the example injects, because the SPAWN stays in examples/ — the ratified ffmpeg boundary) | **DONE**: `minimax_h3_gen` + `minimax_h3_mux` rewritten as `vllm.h` clients (frames+WAV byte-identical to the pre-fold binary on the fold fixture); server driver glue deleted (54 -> 7 H3 refs, all seam type names) | L | H3 loaders; ffmpeg-mux boundary (ratified in `examples/`) |
 | 2 | Laguna fast decode | make the registered `LagunaForCausalLM` forward route the keep-quant/NVFP4 device path (retire the stub); load keep-quant GGUF/NVFP4 dirs through `vllm_engine_load` | rewrite `laguna_gen`; delete `LagunaForwardGguf*` | M | keep-quant load in the engine loader |
 | 3 | DeepSeek-V4 fast decode | same as (2) for `DeepseekV4ForCausalLM`; real MLA paged KV (retire the W3 stub) | rewrite `deepseek_v4_gen`; delete `DeepseekV4ForwardGguf*` | M | MLA paged-KV topology |
 | 4 | Audio transcription | **DONE (ROW 1, 2026-08-07)**: `vllm_transcribe` (ABI v11) + live `/v1/audio/transcriptions`; ParakeetForCTC/RNNT/TDT registered (SupportsTranscription mirror, refuse-by-task) | **DONE**: `parakeet_transcribe` rewritten as a `vllm.h` client (byte-identical transcript goldens); route live, task-conditional | M | encoder→text seam (LANDED: `ParakeetTranscriber`) |

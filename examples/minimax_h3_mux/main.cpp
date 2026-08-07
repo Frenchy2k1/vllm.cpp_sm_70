@@ -1,18 +1,18 @@
 // minimax-h3-mux: muxes a MiniMax-H3 clip (PPM frames + WAV) into an MP4 by
-// INVOKING ffmpeg.
+// INVOKING ffmpeg — a THIN CLIENT of the public C ABI (include/vllm.h) and
+// nothing else, per the ONE SURFACE directive (ARCH-ONE-SURFACE ROW 2).
 //
-// THIS FILE IS THE RATIFIED HOME OF THE PROCESS SPAWN. The developer's decision
-// (2026-08-03): "re: ffmpeg invocation, correct - let's keep in the examples
-// only". So the split is deliberate and load-bearing:
+// THIS FILE IS THE RATIFIED HOME OF THE PROCESS SPAWN. The developer's
+// decision (2026-08-03): "re: ffmpeg invocation, correct - let's keep in the
+// examples only". So the split is deliberate and load-bearing:
 //
-//   src/vllm/  builds the ARTIFACTS (MiniMaxH3WritePpmFrame, MiniMaxH3WriteWav)
-//              and the ARGV (MiniMaxH3BuildMp4MuxArgs) -- and spawns NOTHING.
-//   examples/  (here) performs the invocation.
+//   the LIBRARY  writes the artifacts and composes the ARGV — reachable here
+//                through vllm_video_mux_argv (and, for a whole generation,
+//                vllm_video_generate's result) — and spawns NOTHING.
+//   examples/    (here) performs the invocation.
 //
-// That is also why `/v1/videos` takes a caller-supplied `VideoRunner` callback
-// rather than muxing itself: RunFfmpeg below is precisely the piece a server
-// embedder plugs into ApiServer::set_video_runner, and it lives outside the
-// library on purpose. Keep it that way -- do not move fork/exec into src/vllm/.
+// The argv printed below is byte-identical to the pre-fold binary's
+// (--print-only golden, tests/vllm/models/fixtures/minimax_h3_video_fold).
 //
 // Usage:
 //   minimax-h3-mux --frames <pattern> --out <out.mp4> [--audio <in.wav>]
@@ -26,15 +26,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
-#include <exception>
-#include <iostream>
-#include <stdexcept>
+#include <cstring>
 #include <string>
 #include <vector>
 
-#include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm.h"
 
 namespace {
 
@@ -49,87 +47,100 @@ int RunFfmpeg(const std::vector<std::string>& args) {
   c_args.push_back(nullptr);
 
   const pid_t pid = fork();
-  if (pid < 0) throw std::runtime_error("fork failed");
+  if (pid < 0) {
+    std::fprintf(stderr, "error: fork failed\n");
+    return -1;
+  }
   if (pid == 0) {
     execvp(c_args[0], c_args.data());
-    // Only reached if exec failed; _exit (not exit) so the child never runs the
-    // parent's atexit handlers or flushes its buffers a second time.
+    // Only reached if exec failed; _exit (not exit) so the child never runs
+    // the parent's atexit handlers or flushes its buffers a second time.
     _exit(127);
   }
   int status = 0;
-  if (waitpid(pid, &status, 0) < 0) throw std::runtime_error("waitpid failed");
+  if (waitpid(pid, &status, 0) < 0) {
+    std::fprintf(stderr, "error: waitpid failed\n");
+    return -1;
+  }
   if (WIFSIGNALED(status)) {
-    throw std::runtime_error("ffmpeg died on signal " +
-                             std::to_string(WTERMSIG(status)));
+    std::fprintf(stderr, "error: ffmpeg died on signal %d\n", WTERMSIG(status));
+    return -1;
   }
   return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-std::string Need(int argc, char** argv, int i, const std::string& flag) {
-  if (i >= argc) throw std::runtime_error("missing value for " + flag);
+const char* Need(int argc, char** argv, int i, const char* flag) {
+  if (i >= argc) {
+    std::fprintf(stderr, "error: missing value for %s\n", flag);
+    std::exit(2);
+  }
   return argv[i];
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  vllm::MiniMaxH3MuxRequest request;
+  vllm_video_mux_params request = vllm_video_mux_params_default();
   std::string ffmpeg = "ffmpeg";
   bool print_only = false;
 
-  try {
-    for (int i = 1; i < argc; ++i) {
-      const std::string flag = argv[i];
-      if (flag == "--frames") {
-        request.frame_pattern = Need(argc, argv, ++i, flag);
-      } else if (flag == "--audio") {
-        request.audio_path = Need(argc, argv, ++i, flag);
-      } else if (flag == "--out") {
-        request.output_path = Need(argc, argv, ++i, flag);
-      } else if (flag == "--fps") {
-        request.fps = std::stoll(Need(argc, argv, ++i, flag));
-      } else if (flag == "--crf") {
-        request.crf = std::stoll(Need(argc, argv, ++i, flag));
-      } else if (flag == "--ffmpeg") {
-        ffmpeg = Need(argc, argv, ++i, flag);
-      } else if (flag == "--print-only") {
-        print_only = true;
-      } else {
-        throw std::runtime_error("unknown argument: " + flag);
-      }
-    }
-    if (request.frame_pattern.empty() || request.output_path.empty()) {
-      std::cerr << "usage: minimax-h3-mux --frames <pattern> --out <out.mp4> "
-                   "[--audio <in.wav>] [--fps N] [--crf N] [--ffmpeg <path>] "
-                   "[--print-only]\n";
+  for (int i = 1; i < argc; ++i) {
+    const std::string flag = argv[i];
+    if (flag == "--frames") {
+      request.frames = Need(argc, argv, ++i, "--frames");
+    } else if (flag == "--audio") {
+      request.audio_path = Need(argc, argv, ++i, "--audio");
+    } else if (flag == "--out") {
+      request.output_path = Need(argc, argv, ++i, "--out");
+    } else if (flag == "--fps") {
+      request.fps = std::atoi(Need(argc, argv, ++i, "--fps"));
+    } else if (flag == "--crf") {
+      request.crf = std::atoi(Need(argc, argv, ++i, "--crf"));
+    } else if (flag == "--ffmpeg") {
+      ffmpeg = Need(argc, argv, ++i, "--ffmpeg");
+    } else if (flag == "--print-only") {
+      print_only = true;
+    } else {
+      std::fprintf(stderr, "error: unknown argument: %s\n", flag.c_str());
       return 2;
     }
+  }
+  if (request.frames == nullptr || request.output_path == nullptr) {
+    std::fprintf(stderr,
+                 "usage: minimax-h3-mux --frames <pattern> --out <out.mp4> "
+                 "[--audio <in.wav>] [--fps N] [--crf N] [--ffmpeg <path>] "
+                 "[--print-only]\n");
+    return 2;
+  }
 
-    // The LIBRARY decides the encoding contract (h264/yuv420p + AAC, -shortest,
-    // +faststart); this file only runs it.
-    std::vector<std::string> args = vllm::MiniMaxH3BuildMp4MuxArgs(request);
-    if (!args.empty()) args[0] = ffmpeg;
-
-    for (size_t i = 0; i < args.size(); ++i) {
-      std::cout << (i == 0 ? "" : " ") << args[i];
-    }
-    std::cout << "\n";
-    if (print_only) return 0;
-
-    const int status = RunFfmpeg(args);
-    if (status == 127) {
-      std::cerr << "failed to exec '" << ffmpeg
-                << "' — is ffmpeg installed and on PATH?\n";
-      return 127;
-    }
-    if (status != 0) {
-      std::cerr << "ffmpeg exited " << status << "\n";
-      return status;
-    }
-    std::cout << "wrote " << request.output_path << "\n";
-    return 0;
-  } catch (const std::exception& e) {
-    std::cerr << "error: " << e.what() << "\n";
+  // The LIBRARY decides the encoding contract (h264/yuv420p + AAC, -shortest,
+  // +faststart); this file only runs it.
+  char** mux_argv = nullptr;
+  int32_t mux_argc = 0;
+  if (vllm_video_mux_argv(&request, &mux_argv, &mux_argc) != VLLM_OK) {
+    std::fprintf(stderr, "error: %s\n", vllm_last_error());
     return 1;
   }
+  std::vector<std::string> args(mux_argv, mux_argv + mux_argc);
+  vllm_video_mux_argv_free(mux_argv, mux_argc);
+  if (!args.empty()) args[0] = ffmpeg;
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    std::printf("%s%s", i == 0 ? "" : " ", args[i].c_str());
+  }
+  std::printf("\n");
+  if (print_only) return 0;
+
+  const int status = RunFfmpeg(args);
+  if (status == 127) {
+    std::fprintf(stderr, "failed to exec '%s' — is ffmpeg installed and on PATH?\n",
+                 ffmpeg.c_str());
+    return 127;
+  }
+  if (status != 0) {
+    std::fprintf(stderr, "ffmpeg exited %d\n", status);
+    return status;
+  }
+  std::printf("wrote %s\n", request.output_path);
+  return 0;
 }

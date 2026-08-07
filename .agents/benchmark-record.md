@@ -15710,3 +15710,154 @@ Vulkan answer and is not built.
 **Blinding your own instrument is a cost of the optimisation, and it should be
 recorded as one.** Every lever this session was found with that profile.
 
+### GPU timestamp profiling restored — and the workload is now HOST-BOUND (2026-08-07, GB10)
+
+`VK-A2` blinded the per-shader time profile (one fence per batch, nothing to
+attribute). GPU timestamp queries restore it, and they are strictly BETTER
+evidence than what they replace: `vkCmdWriteTimestamp` brackets each dispatch on
+the DEVICE timeline, so this measures GPU execution rather than a host-side fence
+wait that also contained launch latency.
+
+Probed, not assumed: `timestampComputeAndGraphics` and a non-zero
+`timestampPeriod`, else profiling stays off and says so. The pool and the
+timestamp commands exist only under `VT_VULKAN_DISPATCH_STATS`, so production
+pays nothing.
+
+**MEASURED GPU TIME, batching on, Qwen3-0.6B decode:**
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 792 | 42.2 | **51.8%** | 0.0533 |
+| `vt_paged_attn` | 224 | 13.0 | 15.9% | 0.0579 |
+| `vt_matmul_coopmat` | 112 | 11.9 | 14.6% | 0.1061 |
+| `vt_rms_norm` | 904 | 9.2 | 11.3% | 0.0102 |
+| `vt_rope_from_cache` | 224 | 1.5 | 1.8% | 0.0066 |
+| `vt_reshape_and_cache` | 224 | 1.0 | 1.3% | 0.0047 |
+| `vt_silu_and_mul` | 224 | 0.9 | 1.1% | 0.0039 |
+| `vt_qkv_split` | 224 | 0.8 | 1.0% | 0.0038 |
+| **TOTAL** | 2952 | **81.4** | | |
+
+**★ THE HEADLINE: GPU busy is 81.4 ms of a 314.5 ms run — 26%. SEVENTY-FOUR
+PERCENT OF THE RUN IS HOST-SIDE.** Before `VK-A2` the same workload was ~276 ms of
+GPU time in ~1,092 ms. Batching removed 195 ms of GPU time and, in doing so,
+moved the bottleneck OFF the GPU entirely.
+
+**Every remaining GPU-side lever is now bounded by 26%.** Even an infinitely fast
+GEMM buys at most 51.8% of 26% = 13% of the run. The next lever is host
+orchestration — the same conclusion the CUDA campaign reached
+(`profile-full-step-not-just-kernels`), arrived at here from the opposite
+direction.
+
+**It also settles the fusion question DIRECTLY** rather than by subtraction:
+`qkv_split` 0.0038, `silu_and_mul` 0.0039, `reshape_and_cache` 0.0047 and
+`rope_from_cache` 0.0066 ms/call are **8-14% of the old 0.046 ms launch floor**.
+These ops do essentially no work. Abandoning the fusion lever was right, and this
+is the measurement that proves it instead of inferring it.
+
+### Host-side orchestration: the descriptor ring was capping batches — 1.51x (2026-08-07, GB10)
+
+`VK-A2` moved the bottleneck off the GPU (busy 26%). This is the first host-side
+lever, and it was found by profiling rather than guessing.
+
+**FIRST, A MISATTRIBUTION AVOIDED.** `perf record` put **62.87% of on-CPU time in
+`vt::cpu::Threadpool::ThreadReady`** — which looks damning on a Vulkan run. It is
+llama.cpp's `ggml_graph_compute_poll_for_work` ported 1:1: a `1024*128*poll`
+busy-wait, `poll=50`, across `hardware_concurrency` (20) threads. So it is IDLE
+SPIN, and `perf` samples on-CPU time, which a spinning thread dominates while
+contributing nothing.
+
+Tested rather than assumed, with `VLLM_CPP_CPU_THREADS=1` (19 fewer spinners), 8
+interleaved pairs: **4/8, 1.018x — a wash.** A profile percentage is not an
+attribution. It did, however, drown everything else, so the real profile needed
+the spin suppressed.
+
+**THE REAL HOST PROFILE**, `VLLM_CPP_CPU_THREADS=1`, by shared object:
+
+| | share |
+|---|---:|
+| `[kernel.kallsyms]` | **40.5%** |
+| `[nvidia]` | **21.9%** |
+| `libc` | 15.2% |
+| **our own code** | **13.7%** |
+| `libnvidia-eglcore`, `libstdc++`, rest | 7.0% |
+
+**62% of host time is kernel plus driver; only 14% is ours.** So the host cost is
+submissions and syscalls, not our C++ logic.
+
+**THE CAUSE: `kDescriptorRing = 16` was the batch-length limiter, not `kMaxBatch`.**
+Observed flushes were 40-46 dispatches against a cap of 128. `vt_rms_norm` runs
+**112 times per forward pass** (4 per layer x 28 layers), so it exhausted a 16-deep
+ring **seven times per pass** and forced a submit each time. Every forced flush is
+a `vkQueueSubmit` plus a blocking `vkWaitForFences`.
+
+Ring 16 -> 128 (and `kMaxBatch` 128 -> 512). Batches now reach **368 dispatches —
+an entire forward pass in ONE submit.**
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_RING` the only variable, one binary:**
+
+| | ring 128 | ring 16 |
+|---|---:|---:|
+| decode tok/s (median) | **87.3** | 57.7 |
+| per-pair ratios | 1.44 1.47 1.49 1.50 1.52 1.58 1.62 1.63 | |
+| result | **1.51x, 8 of 8 pairs** | |
+
+The ring depth was made a RUNTIME value first, so both arms run in one binary —
+a cross-build comparison is what produced a false 1.2x for the subgroup tactic
+earlier today.
+
+**Decode is now 87.3 tok/s: 48% of the 182 tok/s bandwidth roof, and 1.84x off
+llama.cpp's 160.9 — from ~19x at the start of the session, 10.2x overall.**
+
+opt-125m STRICT 6/6 token-exact; `test_vulkan_backend` 17/17.
+
+### Re-profile after the ring change: GPU-bound again, and a "void" result reversed (2026-08-07)
+
+**THE REGIME INVERTED TWICE IN ONE SESSION.** `VK-A2` batching cut GPU time and
+left the run HOST-bound at 26% GPU-busy. The descriptor-ring fix then cut the
+submits, and the bottleneck moved straight back:
+
+| | GPU busy (decode phase) |
+|---|---:|
+| before `VK-A2` | ~25% of a 1,092 ms run |
+| after `VK-A2` | **26%** -- host-bound |
+| after ring 16 -> 128 | **84%** -- GPU-bound again |
+
+**GPU timestamp profile at the new default** (32-token decode, 11,808 dispatches,
+288.7 ms GPU):
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 3504 | 157.9 | **54.7%** | 0.0451 |
+| `vt_paged_attn` | 896 | 66.4 | **23.0%** | 0.0741 |
+| `vt_rms_norm` | 3616 | 32.4 | 11.2% | 0.0090 |
+| `vt_matmul_coopmat` | 112 | 13.5 | 4.7% | 0.1203 |
+| the four small ops | 3584 | 15.0 | 4.4% | 0.0035-0.0059 |
+
+Host side, spin suppressed: kernel 45.6%, libc 17.7%, nvidia 17.7%, **our own code
+10.9%**.
+
+**★ A "NOT ESTABLISHED" RESULT REVERSED BY THE REGIME CHANGE, NOT BY NEW CODE.**
+The GEMV four-way unroll was measured earlier at **5/8 pairs, arm medians 60.3 vs
+60.4 tok/s**, and reverted as unproven. That verdict was taken while the GPU was
+26% busy — where a 10% GEMV win moves e2e by only 1.4%, far inside this box's
+noise. **5/8 was the expected result whether or not the change helped.**
+
+Re-tested unchanged in the new regime, where the same win is worth ~4.6% e2e:
+
+    unroll 4 vs 1, 8 interleaved pairs, one binary
+    7 of 8 pairs, median 1.055x, arm medians 91.7 vs 87.5 tok/s
+    ratios 0.983 1.048 1.049 1.050 1.059 1.063 1.077 1.096
+
+**Same code, same statistic, different regime: 5/8 -> 7/8.** Restored and shipped.
+
+**The durable lesson, and it is a correction to how this campaign has been
+measuring: A NEGATIVE RESULT IS REGIME-DEPENDENT.** "Not established" means "not
+resolvable against the noise floor *as the system stands now*", not "does not
+help". Every lever discarded while some other component dominates deserves a
+re-test once that component is fixed — and the discard should say which regime it
+was measured in. Re-check the subgroup-reduction wash (4/8, measured at 26% GPU
+busy) on the same grounds.
+
+Decode is now **91.7 tok/s: 50% of the 182 tok/s roof, 1.75x off llama.cpp's
+160.9**, from 8.59 at the start of the session.
+

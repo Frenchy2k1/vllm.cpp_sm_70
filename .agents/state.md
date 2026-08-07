@@ -42228,6 +42228,47 @@ Voxtral remain off-registry (fold #9/#10 of the audit).
   Next levers, unstarted: wider per-lane GEMV loads, and Tier-1 vocabulary for the
   `qkv_split -> rope -> reshape_and_cache` chain (672 dispatches -> 224).
 
+- **2026-08-07 (issue #125, AMD)** — **★ An external Vulkan-on-AMD report found a
+  bug that is NOT AMD-specific: `qwen3_5.cpp` hands a HOST pointer to a DEVICE
+  kernel on every non-CUDA backend.**
+
+  Reporter `fprimex` on AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, Slackware,
+  RADV implied). Two failures, neither about AMD:
+
+  **(1) FP8 Qwen3.6-27B is unsupported on EVERY device.** The dense loader calls
+  `LoadMergedBf16RawNK` unconditionally for `linear_attn.in_proj_*`; only the
+  MoE/35B leg has `LoadFp8Raw`. Device-independent — it fails identically on GB10.
+
+  **(2) `vulkan: embedding: table points outside every Vulkan allocation`.**
+  VERIFIED IN SOURCE: `qwen3_5.cpp:795` gates weight upload on
+  `needs_weight_staging()`, which is `true` **only on CUDA**
+  (`cuda.cpp:67`; base default `false` at `interface.h:218`, and `VulkanPlatform`
+  does not override). So on Vulkan it aliases the mmap'd HOST bytes into a Tensor
+  tagged `kVULKAN`, and the first native kernel — embedding — throws.
+
+  **The shared framework helper was ALREADY FIXED for exactly this**, and says so:
+  `dense_attn_block.h:186-189` reads *"HOST-POINTER ALIASING IS A CPU PROPERTY,
+  NOT A 'NOT-CUDA' PROPERTY"* and uses `is_cpu()`. **25 model files include it.
+  `qwen3_5.cpp` does not** — it carries a duplicate with a different, still
+  CUDA-only, predicate. This is the off-framework-model hazard
+  [[decode-framework-routing-audit]] names, caught in the wild by a user.
+
+  **So Qwen3.6-27B/35B cannot run on Vulkan OR Metal on ANY box, including ours.**
+  It went unnoticed because the only model ever run e2e on Vulkan is opt-125m,
+  which routes through the FIXED helper. Nothing about AMD, RADV or wave64 is
+  implicated — and no Vulkan capability probe ever ran, because it died before the
+  first dispatch.
+
+  Second instance, same file: `ResidentWeightF32` (`:836`) hands out
+  `std::vector<float>::data()` under the same predicate — it will throw next.
+
+  **The discriminating test to ask for: run opt-125m on gfx1151.** It is the one
+  model proven token-exact on Vulkan and it takes the fixed path. If it works,
+  there is no AMD-specific defect in evidence at all.
+
+  Their build predates command-buffer batching (their `vulkan_backend.cpp:144` is
+  our `:164` today), so none of today's work is implicated either.
+
 ## 2026-08-07 — Downloadable static-core server release matrix spiked (PR #129)
 <!-- state: 2026-08-07T23:45 -->
 
@@ -42279,3 +42320,68 @@ DotProd/i8mm and future real-kernel tiers. Exact CPU+OS-state probes, compiled
 tier manifests, forced-tier mutation tests, and execution on feature-poor and
 feature-rich hosts/emulation are release gates. W1 is now the CUDA per-source
 gencode prerequisite; multi-SM AOT and CPU ISA audits precede bundle work.
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 2: MiniMax-H3 video+audio generation folded onto the ONE surface (PR #123)
+<!-- state: 2026-08-08T04:30 -->
+
+**What landed (`row/H3-VIDEO-ABI`, task #283; fold order: grow ABI -> rewrite
+examples -> delete parallel impl).**
+- FOLD GATE FIRST: `tests/vllm/models/minimax_h3_video_fold_fixture.h` writes a
+  deterministic tiny checkpoint set (857KB F32 ComfyUI-GGUF DiT at the :3786
+  reduced geometry + on-disk reduced ViT3D/BigVGAN VAEs + prompt embeds); the
+  PRE-fold `minimax-h3-gen` binary at the branch base (fc636c76) rendered it
+  (--partition fl2va --steps 3 --frames 5 --height/width 32, CPU, keep-quant)
+  and its 8 frames + WAV + both `minimax-h3-mux --print-only` argv lines are
+  COMMITTED goldens (`fixtures/minimax_h3_video_fold/`). Determinism proven
+  (two runs, diff clean).
+- W1 seam: `vllm::multimodal::MiniMaxH3VideoEngine` (`minimax_h3_video.{h,cpp}`)
+  absorbs the example's 1293-line assembly driver AND the server's 354-line
+  /v1/videos twin: 4 DiT loader arms (GGUF keep-quant / dequant-bf16
+  host+streamed / bf16-shard stream / NVFP4 bf16+fp4-resident stream), VAE
+  decoder + lazy encoder halves, the H3-Encoder tower staged once (GGUF or
+  bf16 shards), the #77 partition guard, fl2va/ref2va conditioning, the
+  byte-exact splitmix64 Box-Muller noise streams (VT_H3_GAUSSIAN_NOISE
+  honored; seeded requests derive audio via splitmix64), artifact writing +
+  mux argv. Library SPAWNS NOTHING (mkdir -p became std::filesystem; ffmpeg
+  stays caller-side). `MiniMaxH3VideoGenParamsFromRequest` = the ONE
+  /v1/videos mapping.
+- W2 ABI: `vllm_video_engine(_load/_free)`, `vllm_video_model_params(_default)`,
+  `vllm_video_params(_default)`, `vllm_video_generate`, `vllm_video_result(_free)`
+  + `vllm_video_mux_argv((_params_default)/_free)`; VLLM_ABI_VERSION 11 -> 12,
+  test_capi floor >= 12. As-shipped deltas vs the ratified proposal argued in
+  the spec (+prompt_embeds_path/+partition/+fp4_resident/+output_dir/+mux
+  composer; -task/-duration; ONE ref_image). Refuse-both-directions pinned:
+  video-load on a text dir names vllm_engine_load; vllm_engine_load on the H3
+  dir fails byte-for-byte as captured at v11.
+- W3 server: the VideoState block is DELETED; /v1/videos = seam Load + a
+  runner lambda (FromRequest -> Generate -> fork/execvp(mux_argv)). Direct
+  MiniMaxH3 refs 54 -> 7 (all seam type names). DISCLOSED numeric deltas on
+  the server arm (no goldens existed; the drift WAS the defect): legacy
+  single-stream uniform noise -> the ratified shared recipe; host-f32 GGUF
+  default -> keep-quant; new `--video-dequant-bf16`.
+- W4 examples: `minimax_h3_gen` (1293 -> 216 lines) + `minimax_h3_mux` are
+  `vllm.h`+`vllm::shared` thin clients; BOTH byte-identical to the pre-fold
+  binaries on the fixture (frames+WAV cmp clean; mux argv diff clean).
+  Ratchet: both allowlist rows removed, `MAX_INTERNAL_REACHING` 11 -> 9 +
+  equality pin + spec claims moved; abi-capability video row closed; FEATURES
+  video row -> reachable naming the four symbols.
+
+**Gates.** 3-arm fold gate `test_minimax_h3_video_fold` 4/131 GREEN (seam ==
+replicated pre-fold pipeline == committed goldens, byte-identical; guard
+refusals; FromRequest field-complete). test_capi 40/373 incl. the v12 golden
+e2e THROUGH the C marshalling; vllm_capi_c_check strict-C11 green.
+test_minimax_h3 75/75 unchanged. test_openai_api_server 45/566 incl. the
+socket-level "routes do not exist without a runner" 404 pin; test_video_api
+14/14. check-surface-coverage green with the SHRINK enforced + its 46-test
+mutation suite green.
+
+**Residuals (honest).** (1) GB10 real-video re-verification through the v12
+ABI + folded server (real checkpoints; box on the Kimi campaign — CPU fold
+gates are the landed evidence). (2) The pre-fold example's diagnostic modes
+(--denoise-only/--dump-params/--encoder-only/--save-embeds/--decode-latent/
+--roundtrip/--prompt-image/--cond-image/--dry-run, multi --ref-image) were
+deleted with the private pipeline; capabilities remain library/test-reachable;
+the GB10 speed recipe must move to the seam. (3) Server-arm numeric deltas
+disclosed above. (4) The CPU host-f32 GGUF arm is off the ABI (keep-quant is
+the gated arm). (5) /v1/videos job/status/content stay VideoJobStore-served
+(unchanged); no async-job C-ABI shape yet.

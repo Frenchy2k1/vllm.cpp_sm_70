@@ -42,22 +42,21 @@
 #include <string>
 #include <utility>
 #include <vector>
-#ifdef VT_BENCH_PROFILE_CONTROL
 #include <atomic>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef VT_BENCH_PROFILE_CONTROL
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
 #endif
 
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
-#include "vllm/model_executor/models/minimax_h3.h"
-#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include <fstream>
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
@@ -70,6 +69,7 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
@@ -96,103 +96,30 @@ namespace fs = std::filesystem;
 using vllm::HfConfig;
 using vllm::Qwen3_5MoeWeights;
 
-// Decode a binary PPM (P6) into [3, H, W] floats in [-1, 1] — the layout the H3
-// video-VAE encoder takes. It reads from BYTES rather than a path so one decoder
-// serves both spellings of `input_reference` (a filesystem path and an inline
-// data: URL). PPM is the only still-image container this tree can read: no PNG /
-// JPEG codec is vendored, which is the same NAMED residual the chat multimodal
-// path carries (see chat_mm.h), not a limitation of this endpoint.
-std::vector<float> DecodePpmChw(const std::string& bytes, int64_t* out_h,
-                                int64_t* out_w) {
-  std::istringstream in(bytes, std::ios::binary);
-  std::string magic;
-  in >> magic;
-  if (magic != "P6") {
-    throw std::runtime_error(
-        "input_reference: not a binary PPM (P6); no PNG/JPEG codec is vendored, "
-        "so a reference image must be supplied as binary PPM");
+// Run an argv to completion and return its exit status — the ONE process
+// spawn in the MiniMax-H3 path, and it lives HERE, in examples/, by the
+// developer-ratified 2026-08-03 decision: the library (the
+// MiniMaxH3VideoEngine seam behind /v1/videos) writes the artifacts and
+// BUILDS this argv, and spawns nothing.
+int RunFfmpegArgv(const std::vector<std::string>& args) {
+  std::vector<char*> c_args;
+  c_args.reserve(args.size() + 1);
+  for (const std::string& arg : args) {
+    c_args.push_back(const_cast<char*>(arg.c_str()));
   }
-  auto next_int = [&]() {
-    int v = 0;
-    while (in >> std::ws, in.peek() == '#') { std::string skip; std::getline(in, skip); }
-    in >> v;
-    return v;
-  };
-  const int w = next_int(), h = next_int(), maxv = next_int();
-  if (w <= 0 || h <= 0 || maxv <= 0) {
-    throw std::runtime_error("input_reference: bad PPM header");
+  c_args.push_back(nullptr);
+  const pid_t pid = fork();
+  if (pid < 0) throw std::runtime_error("fork failed");
+  if (pid == 0) {
+    execvp(c_args[0], c_args.data());
+    _exit(127);  // exec failed; never run the parent's atexit handlers
   }
-  in.get();  // the single whitespace byte before the payload
-  std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
-  in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
-  if (!in) throw std::runtime_error("input_reference: truncated PPM payload");
-  std::vector<float> chw(rgb.size());
-  const int64_t plane = static_cast<int64_t>(w) * h;
-  for (int64_t i = 0; i < plane; ++i) {
-    for (int64_t c = 0; c < 3; ++c) {
-      chw[static_cast<size_t>(c * plane + i)] =
-          static_cast<float>(rgb[static_cast<size_t>(i * 3 + c)]) / (maxv * 0.5f) - 1.0f;
-    }
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) throw std::runtime_error("waitpid failed");
+  if (WIFSIGNALED(status)) {
+    throw std::runtime_error("ffmpeg died on signal " + std::to_string(WTERMSIG(status)));
   }
-  if (out_h != nullptr) *out_h = h;
-  if (out_w != nullptr) *out_w = w;
-  return chw;
-}
-
-// The bytes behind one reference: the parser hands us either a path or the
-// already-decoded payload of a data: URL.
-std::string ReadReferenceBytes(const std::string& field, const std::string& path,
-                               const std::vector<uint8_t>& inline_bytes) {
-  if (!inline_bytes.empty()) return std::string(inline_bytes.begin(), inline_bytes.end());
-  std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error(field + ": cannot open " + path);
-  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-// A ref2va VIDEO reference: DIR/frame_%06d.ppm, the exact layout minimax_h3_gen
-// and this server's own muxer WRITE, so one run's frames chain straight into the
-// next request. Returns [C, T, H, W] in [-1, 1] (the encoder's clip layout);
-// no container demuxer is vendored, which is why this is a frame directory.
-std::vector<float> ReadReferenceClipChw(const std::string& dir, int64_t* out_t,
-                                        int64_t* out_h, int64_t* out_w) {
-  std::vector<float> per_frame;  // frame-major [T][C,H,W]
-  int64_t frames = 0, fh = 0, fw = 0;
-  for (int64_t k = 0;; ++k) {
-    char name[512];
-    std::snprintf(name, sizeof(name), "%s/frame_%06lld.ppm", dir.c_str(),
-                  static_cast<long long>(k));
-    std::ifstream probe(name, std::ios::binary);
-    if (!probe) break;
-    const std::string bytes((std::istreambuf_iterator<char>(probe)),
-                            std::istreambuf_iterator<char>());
-    int64_t h = 0, w = 0;
-    const std::vector<float> frame = DecodePpmChw(bytes, &h, &w);
-    if (frames == 0) { fh = h; fw = w; }
-    if (h != fh || w != fw) {
-      throw std::runtime_error(
-          "metadata.input_reference_video: every frame_%06d.ppm must have the same size");
-    }
-    per_frame.insert(per_frame.end(), frame.begin(), frame.end());
-    ++frames;
-  }
-  if (frames == 0) {
-    throw std::runtime_error("metadata.input_reference_video: no frame_%06d.ppm files in " + dir);
-  }
-  // [T][C,H,W] -> [C,T,H,W], the causal 3-D encoder's layout.
-  std::vector<float> chw(per_frame.size());
-  const int64_t plane = fh * fw;
-  for (int64_t c = 0; c < 3; ++c) {
-    for (int64_t k = 0; k < frames; ++k) {
-      for (int64_t e = 0; e < plane; ++e) {
-        chw[static_cast<size_t>((c * frames + k) * plane + e)] =
-            per_frame[static_cast<size_t>(k * 3 * plane + c * plane + e)];
-      }
-    }
-  }
-  *out_t = frames;
-  *out_h = fh;
-  *out_w = fw;
-  return chw;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 struct Args {
@@ -214,7 +141,10 @@ struct Args {
   int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
   std::string video_partition;  // served partition (fl2va|ref2va); see the #77 guard
-  bool video_keep_quant = false;
+  // Keep-quant is the library seam's DEFAULT arm; --video-dequant-bf16 selects
+  // the bf16 dequant/stream arm (the throughput trade the gen example ships).
+  // --video-keep-quant is still accepted (it names the default).
+  bool video_dequant_bf16 = false;
   int cuda_profile_graph_replays = 0;  // trace-only diagnostic build seam.
   int cuda_profile_graph_batch = 0;  // 0 => accepted c16 trace contract.
   std::string benchmark_shutdown_fifo;  // paired trace-only control path.
@@ -353,7 +283,10 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--video-partition") {
       a.video_partition = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-keep-quant") {
-      a.video_keep_quant = true;
+      // the seam's default arm; accepted for pre-fold CLI compatibility
+      a.video_dequant_bf16 = false;
+    } else if (flag == "--video-dequant-bf16") {
+      a.video_dequant_bf16 = true;
     } else if (flag == "--enable-server-dev-mode") {
       a.enable_server_dev_mode = true;
     } else if (flag == "--enable-prefix-caching" ||
@@ -737,122 +670,38 @@ int main(int argc, char** argv) {
     // /reset_prefix_cache stay unwired (no live backing on the AsyncLLM path) —
     // see ConfigureUtilityEndpoints + specs/{utility,admin}-endpoints.md. ────────
     // ── MiniMax-H3 video generation. OPT-IN: with no --video-dit the routes are
-    // never registered and the server is byte-identical to before. The runner is a
-    // CALLBACK because src/vllm/ must not spawn processes — the ffmpeg invocation
-    // is allowed here, in examples/, by the developer's ratified decision. ───────
-    struct VideoState {
-      vllm::MiniMaxH3GgufDit dit;
-      vllm::MiniMaxH3VideoVaeDecoderConfig video_cfg;
-      vllm::MiniMaxH3AudioVaeConfig audio_cfg;
-      vllm::MiniMaxH3LatentStats video_stats, audio_stats;
-      vllm::MiniMaxH3AudioVaeWeights video_weights, audio_weights;
-      std::vector<float> prompt_embeds;   // fallback when no encoder is configured
-      // Encoder staged ONCE: staging the 32B tower costs ~162 s, so per-request
-      // staging would dominate every generation.
-      bool has_encoder = false;
-      vllm::MiniMaxH3EncoderConfig enc_config;
-      vllm::MiniMaxH3EncoderQuantWeights enc_host;
-      vllm::MiniMaxH3EncoderDeviceWeights enc_staged;
-      std::unique_ptr<vllm::tok::Tokenizer> tokenizer;
-      vt::Queue enc_queue{};
-      std::string workdir, ffmpeg;
-      // The served partition (fl2va|ref2va). Resolved ONCE at load from
-      // --video-partition; the per-request guard in MiniMaxH3GenerateT2va refuses a
-      // task this partition does not serve (the #77 follow-up).
-      vllm::MiniMaxH3PartitionInfo partition_info;
-      vt::Device device;
-      std::atomic<int64_t> counter{0};
-      // The two VAEs' ENCODER halves, for the reference modalities: the video VAE
-      // encodes an `input_reference` image and a `metadata.input_reference_video`
-      // clip, the audio VAE encodes a `metadata.input_reference_audio` waveform.
-      // Loaded LAZILY and ONCE each: a text-to-video server must not pay for
-      // weights it never uses, and a server that does use them must not reload
-      // per request.
-      std::string video_vae_path, audio_vae_path;
-      std::mutex encoder_mutex;
-      bool video_encoder_loaded = false, audio_encoder_loaded = false;
-      vllm::MiniMaxH3AudioVaeWeights video_encoder_weights, audio_encoder_weights;
-      vllm::MiniMaxH3EncoderFcn3dConfig video_encoder_cfg;
-      vllm::MiniMaxH3AudioVaeEncoderConfig audio_encoder_cfg;
-    };
-    std::shared_ptr<VideoState> video;
+    // never registered and the server is byte-identical to before. The whole
+    // pipeline lives in the LIBRARY seam (vllm::multimodal::MiniMaxH3VideoEngine,
+    // ARCH-ONE-SURFACE ROW 2) — the SAME entry point the C ABI's vllm_video_*
+    // and the minimax-h3-gen example drive, so HTTP and FFI cannot drift. This
+    // file keeps exactly what an example may own: flag plumbing, the job
+    // directory, and the ONE process spawn (ffmpeg, ratified 2026-08-03 — the
+    // library builds the argv and spawns nothing). ────────────────────────────
+    std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> video_engine;
     if (!args.video_dit.empty()) {
-      video = std::make_shared<VideoState>();
       std::cerr << "server: loading MiniMax-H3 video checkpoints...\n";
-      if (args.video_dit.size() > 5 &&
-          args.video_dit.compare(args.video_dit.size() - 5, 5, ".gguf") == 0) {
-        const vllm::GgufFile f = vllm::GgufFile::Open(args.video_dit);
-        video->dit = vllm::LoadMiniMaxH3DitFromGguf(f, args.video_keep_quant);
-      } else {
-        const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(args.video_dit);
-        video->dit = vllm::LoadMiniMaxH3DitFromNvfp4(f);
-      }
-      if (!args.video_vae_config.empty()) {
-        std::ifstream in(args.video_vae_config);
-        nlohmann::json j;
-        in >> j;
-        video->video_cfg = vllm::ParseMiniMaxH3VideoVaeDecoderConfig(j, &video->video_stats);
-      }
-      if (!args.audio_vae_config.empty()) {
-        std::ifstream in(args.audio_vae_config);
-        nlohmann::json j;
-        in >> j;
-        video->audio_cfg = vllm::ParseMiniMaxH3AudioVaeConfig(j, &video->audio_stats);
-      }
-      {
-        const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(args.video_vae);
-        video->video_weights = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(f);
-      }
-      {
-        const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(args.audio_vae);
-        video->audio_weights = vllm::LoadMiniMaxH3AudioVaeWeights(f);
-      }
-      if (!args.video_prompt_embeds.empty()) {
-        std::ifstream in(args.video_prompt_embeds, std::ios::binary | std::ios::ate);
-        const std::streamsize n = in.tellg();
-        in.seekg(0);
-        video->prompt_embeds.resize(static_cast<size_t>(n) / sizeof(float));
-        in.read(reinterpret_cast<char*>(video->prompt_embeds.data()), n);
-      }
-      if (!args.video_encoder.empty()) {
-        std::cerr << "server: loading MiniMax-H3 encoder (keep-quant)...\n";
-        const vllm::GgufFile ef = vllm::GgufFile::Open(args.video_encoder);
-        video->enc_host = vllm::LoadMiniMaxH3EncoderFromGguf(ef, args.video_encoder_max_layers);
-        video->enc_config = video->enc_host.config;
-        // The ComfyUI-style encoder export is WEIGHTS ONLY, so the vocab comes from
-        // the checkpoint tokenizer.json unless the GGUF happens to embed one.
-        video->tokenizer = std::make_unique<vllm::tok::Tokenizer>(
-            args.video_tokenizer.empty()
-                ? vllm::tok::Tokenizer::FromGguf(ef)
-                : vllm::tok::Tokenizer::FromHfJson(args.video_tokenizer));
-        video->enc_queue = vt::Queue{video->device, nullptr};
-        if (video->device.type != vt::DeviceType::kCPU) {
-          video->enc_queue = vt::GetBackend(video->device.type).CreateQueue();
-        }
-        std::cerr << "server: staging encoder to device (once)...\n";
-        video->enc_staged = vllm::StageMiniMaxH3EncoderWeights(video->enc_queue, video->enc_host);
-        video->has_encoder = true;
-        std::cerr << "server: encoder ready (layers=" << video->enc_config.num_hidden_layers
-                  << ", hidden=" << video->enc_config.hidden_size << ")\n";
-      }
-      video->workdir = args.video_workdir;
-      video->ffmpeg = args.video_ffmpeg;
-      video->partition_info = vllm::MiniMaxH3PartitionFromFlag(args.video_partition);
-      video->video_vae_path = args.video_vae;
-      video->audio_vae_path = args.audio_vae;
-      if (args.video_device == "cuda") {
-        video->device = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
-      }
-      std::cerr << "server: /v1/videos on (dit layers=" << video->dit.params.num_layers
-                << ", device=" << args.video_device
-                << (args.video_keep_quant ? ", keep-quant" : "") << ")\n";
-      // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT into
-      // conditioning needs the H3-Encoder (a 32B tower + tokenizer), which is not
-      // wired here. Until it is, every request is conditioned on the SAME supplied
-      // embeddings, so the prompt text does NOT steer the output.
-      if (video->has_encoder) {
+      vllm::multimodal::MiniMaxH3VideoModelParams vmp;
+      vmp.dit_path = args.video_dit;
+      vmp.encoder_path = args.video_encoder;
+      vmp.tokenizer_path = args.video_tokenizer;
+      vmp.video_vae_path = args.video_vae;
+      vmp.video_vae_config_path = args.video_vae_config;
+      vmp.audio_vae_path = args.audio_vae;
+      vmp.audio_vae_config_path = args.audio_vae_config;
+      vmp.prompt_embeds_path = args.video_prompt_embeds;
+      vmp.partition = args.video_partition;
+      vmp.device = args.video_device == "cuda" ? 1 : 0;
+      vmp.dequant_bf16 = args.video_dequant_bf16 ? 1 : 0;
+      vmp.encoder_max_layers = args.video_encoder_max_layers;
+      video_engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(vmp);
+      std::cerr << "server: /v1/videos on (device=" << args.video_device
+                << (args.video_dequant_bf16 ? ", dequant-bf16" : ", keep-quant") << ")\n";
+      // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT
+      // into conditioning needs the H3-Encoder; without one every request is
+      // conditioned on the SAME supplied embeddings.
+      if (video_engine->has_encoder()) {
         std::cerr << "server: /v1/videos conditions on the request PROMPT\n";
-      } else if (video->prompt_embeds.empty()) {
+      } else if (!video_engine->has_prompt_embeds()) {
         std::cerr << "server: WARNING /v1/videos has neither --video-encoder nor "
                      "--video-prompt-embeds; requests will be REJECTED\n";
       } else {
@@ -860,238 +709,25 @@ int main(int argc, char** argv) {
                      "--video-encoder to condition on it\n";
       }
 
-      server.set_video_runner([video](const vllm::openai::VideoRequest& req) -> std::string {
-        // REAL text conditioning when an encoder is configured: tokenize the
-        // request prompt, gather its rows from the block-quant table, and run the
-        // already-staged tower.
-        std::vector<float> conditioning;
-        if (video->has_encoder) {
-          const std::vector<int32_t> ids = video->tokenizer->Encode(req.prompt);
-          if (ids.empty()) throw std::runtime_error("the prompt tokenized to nothing");
-          const std::vector<float> embeds =
-              vllm::MiniMaxH3EncoderEmbedTokens(video->enc_host, ids);
-          const int64_t eseq = static_cast<int64_t>(ids.size());
-          std::vector<int64_t> epos(static_cast<size_t>(3 * eseq));
-          for (int64_t a = 0; a < 3; ++a) {
-            for (int64_t s = 0; s < eseq; ++s) epos[static_cast<size_t>(a * eseq + s)] = s;
-          }
-          vllm::MiniMaxH3EncoderConfig ec = video->enc_config;
-          conditioning = vllm::MiniMaxH3EncoderTextForwardDevice(
-              video->enc_queue, ec, video->enc_staged, embeds, epos.data(), eseq);
-        } else if (!video->prompt_embeds.empty()) {
-          conditioning = video->prompt_embeds;
-        } else {
-          throw std::runtime_error(
-              "video generation needs conditioning: start the server with "
-              "--video-encoder (to condition on the prompt) or --video-prompt-embeds");
+      auto counter = std::make_shared<std::atomic<int64_t>>(0);
+      const std::string workdir = args.video_workdir;
+      const std::string ffmpeg = args.video_ffmpeg;
+      server.set_video_runner([video_engine, counter, workdir,
+                               ffmpeg](const vllm::openai::VideoRequest& req) -> std::string {
+        const int64_t id = counter->fetch_add(1);
+        const std::string dir = workdir + "/job" + std::to_string(id);
+        // The library-owned request mapping + generation: conditioning, task
+        // resolution, the #77 partition guard, reference encoding, artifacts.
+        const vllm::multimodal::MiniMaxH3VideoResult out = video_engine->Generate(
+            vllm::multimodal::MiniMaxH3VideoGenParamsFromRequest(req, dir));
+        // The ONE process spawn: exec the argv the library composed.
+        std::vector<std::string> argv_mux = out.mux_argv;
+        if (!argv_mux.empty()) argv_mux[0] = ffmpeg;
+        const int status = RunFfmpegArgv(argv_mux);
+        if (status != 0) {
+          throw std::runtime_error("ffmpeg exited " + std::to_string(status));
         }
-        // OpenAI `input_reference` -> fl2va FIRST-FRAME conditioning.
-        //
-        // WHY fl2va and not ref2va: OpenAI documents input_reference as the image
-        // the generated video STARTS FROM (image-to-video), which is exactly what
-        // fl2va expresses — MiniMaxH3EncodeKeyframeCondRows pins frame 0 OF THE
-        // OUTPUT to the supplied image. ref2va
-        // (MiniMaxH3EncodeReferenceImages) means something else: whole reference
-        // images PREPENDED to the sequence as their own blocks, i.e. subject or
-        // style guidance that never becomes a frame of the result. Mapping
-        // input_reference there would silently change what the API promises. The
-        // ref2va modalities OpenAI has no slot for enter through `metadata`
-        // (input_reference_video / input_reference_audio) instead; the parser has
-        // already refused the combinations the pipeline forbids.
-        std::vector<float> reference_chw;
-        int64_t reference_h = 0, reference_w = 0;
-        if (req.has_input_reference()) {
-          reference_chw = DecodePpmChw(
-              ReadReferenceBytes("input_reference", req.input_reference_path,
-                                 req.input_reference_bytes),
-              &reference_h, &reference_w);
-        }
-        std::vector<float> reference_clip;
-        int64_t clip_t = 0, clip_h = 0, clip_w = 0;
-        if (req.has_input_reference_video()) {
-          reference_clip = ReadReferenceClipChw(req.input_reference_video_dir, &clip_t,
-                                                &clip_h, &clip_w);
-        }
-
-        const vllm::MiniMaxH3DitParams& p = video->dit.params;
-        vllm::MiniMaxH3T2vaRequest r;
-        r.partition = video->partition_info;  // #77 guard: MiniMaxH3GenerateT2va
-                                              // refuses a task this partition can't serve.
-        // With a reference image and no explicit task, the task IS fl2va; a
-        // metadata reference means ref2va. The image aspect also drives the
-        // default resolution (_resolve_shape).
-        const bool has_ref2va =
-            req.has_input_reference_video() || req.has_input_reference_audio();
-        const std::string task =
-            !req.task.empty()
-                ? req.task
-                : (req.has_input_reference() ? "fl2va" : (has_ref2va ? "ref2va" : "t2va"));
-        const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
-            task, req.duration_seconds, req.num_frames, req.height, req.width,
-            reference_w, reference_h);
-        r.latent_t = plan.latent_t;
-        r.num_frames = plan.num_frames;
-        r.latent_h = plan.height / vllm::kMiniMaxH3VaeRatio;
-        r.latent_w = plan.width / vllm::kMiniMaxH3VaeRatio;
-        r.audio_t = plan.audio_t;
-        r.audio_channel = vllm::kMiniMaxH3AudioChannels;
-        r.num_steps = req.num_inference_steps;
-        r.video_shift = req.flow_shift;
-        r.audio_shift = req.audio_flow_shift;
-        r.video_latents_mean = video->video_stats.mean;
-        r.video_latents_std = video->video_stats.std_dev;
-        r.audio_latents_mean = video->audio_stats.mean;
-        r.audio_latents_std = video->audio_stats.std_dev;
-        r.text_len = static_cast<int64_t>(conditioning.size()) / p.text_dim;
-
-        // Both VAE encoder halves load at most once, under one lock, whichever
-        // reference modality asks for them first.
-        auto ensure_video_encoder = [&]() {
-          if (video->video_vae_path.empty()) {
-            throw std::runtime_error(
-                "a video/image reference needs the video VAE ENCODER half: start "
-                "the server with --video-vae");
-          }
-          if (video->video_encoder_loaded) return;
-          const vllm::SafetensorsFile vf = vllm::SafetensorsFile::Open(video->video_vae_path);
-          video->video_encoder_weights = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vf);
-          video->video_encoder_cfg = vllm::MiniMaxH3EncoderFcn3dConfig{};
-          video->video_encoder_cfg.z_channels = 2 * p.latents_dim;  // mean | logvar
-          video->video_encoder_loaded = true;
-        };
-        auto ensure_audio_encoder = [&]() {
-          if (video->audio_vae_path.empty()) {
-            throw std::runtime_error(
-                "metadata.input_reference_audio needs the audio VAE ENCODER half: "
-                "start the server with --audio-vae");
-          }
-          if (video->audio_encoder_loaded) return;
-          const vllm::SafetensorsFile af = vllm::SafetensorsFile::Open(video->audio_vae_path);
-          video->audio_encoder_weights = vllm::LoadMiniMaxH3AudioVaeEncoderWeights(af);
-          video->audio_encoder_cfg = vllm::MiniMaxH3AudioVaeEncoderConfig{};
-          video->audio_encoder_cfg.vae_latent_channels = p.audio_latents_dim;
-          video->audio_encoder_loaded = true;
-        };
-
-        if (req.has_input_reference()) {
-          if (reference_h != plan.height || reference_w != plan.width) {
-            // No image resampler is vendored, and a mis-sized keyframe would
-            // either abort deep in the denoise or pin the wrong latent rows. Say
-            // so up front, with the geometry we resolved.
-            throw std::runtime_error(
-                "input_reference is " + std::to_string(reference_w) + "x" +
-                std::to_string(reference_h) + " but this request resolved to " +
-                std::to_string(plan.width) + "x" + std::to_string(plan.height) +
-                "; supply the reference at the output size (or pass a matching "
-                "`size`): no image resampler is vendored");
-          }
-          std::lock_guard<std::mutex> guard(video->encoder_mutex);
-          ensure_video_encoder();
-          r.keyframe_frame_indices = {0};  // FIRST frame; upstream also allows {-1}/{0,-1}
-          r.imgvid_noise_aug = 1.0;        // pin the frame exactly
-          r.keyframe_cond_rows = vllm::MiniMaxH3EncodeKeyframeCondRows(
-              video->video_encoder_cfg, video->video_encoder_weights, p, {reference_chw},
-              reference_h, reference_w, r.latent_t, r.imgvid_noise_aug, {});
-        } else if (has_ref2va) {
-          // ── ref2va REFERENCE BLOCKS. Exclusive with the fl2va branch above
-          // (minimax_h3_pipeline.cpp:251), which the parser already enforced. ──
-          std::lock_guard<std::mutex> guard(video->encoder_mutex);
-          std::vector<vllm::MiniMaxH3RefBlock> blocks;
-          if (req.has_input_reference_video()) {
-            ensure_video_encoder();
-            vllm::MiniMaxH3RefBlock block{};
-            r.keyframe_cond_rows = vllm::MiniMaxH3EncodeReferenceVideo(
-                video->video_encoder_cfg, video->video_encoder_weights, p, reference_clip,
-                clip_t, clip_h, clip_w, &block);
-            // SILENT by construction: MiniMaxH3EncodeReferenceVideo emits
-            // ref_audio_t == 0 because the clip's own soundtrack would need the
-            // audio VAE encoder run over it. An audio reference below ATTACHES to
-            // this block, which is the layout packed_sequence.py builds.
-            blocks.push_back(block);
-          }
-          if (req.has_input_reference_audio()) {
-            ensure_audio_encoder();
-            const std::string wav_bytes = ReadReferenceBytes(
-                "metadata.input_reference_audio", req.input_reference_audio_path,
-                req.input_reference_audio_bytes);
-            int64_t samples_per_channel = 0;
-            const std::vector<float> waveform = vllm::MiniMaxH3ReadWav(
-                wav_bytes, vllm::kMiniMaxH3AudioChannels, vllm::kMiniMaxH3AudioSampleRate,
-                &samples_per_channel);
-            vllm::MiniMaxH3RefBlock audio_block{};
-            r.audio_ref_rows = vllm::MiniMaxH3EncodeReferenceAudio(
-                video->audio_encoder_cfg, video->audio_encoder_weights, waveform,
-                vllm::kMiniMaxH3AudioChannels, samples_per_channel, video->audio_stats.mean,
-                video->audio_stats.std_dev, /*noise_aug=*/1.0, {}, &audio_block);
-            if (!blocks.empty() &&
-                blocks[0].kind == vllm::MiniMaxH3RefBlock::Kind::kVideoAudio) {
-              // The reference video now HAS sound: one kVideoAudio block carries
-              // both, so its ref_audio_t must claim exactly the rows just encoded.
-              blocks[0].ref_audio_t = audio_block.ref_audio_t;
-            } else {
-              blocks.push_back(audio_block);
-            }
-          }
-          r.ref_blocks = blocks;
-        }
-
-        const int64_t frame_rows =
-            (r.latent_h / p.patch_size_h) * (r.latent_w / p.patch_size_w);
-        std::vector<float> nv(static_cast<size_t>(r.latent_t * frame_rows *
-                                                  p.video_row_width()));
-        std::vector<float> na(static_cast<size_t>(r.audio_t * r.audio_channel *
-                                                  p.audio_latents_dim));
-        uint64_t x = req.has_seed ? static_cast<uint64_t>(req.seed) : 0x5EED1234ULL;
-        auto fill = [&x](std::vector<float>& o) {
-          for (float& value : o) {
-            x += 0x9E3779B97F4A7C15ULL;
-            uint64_t z = x;
-            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-            z ^= z >> 31;
-            value = static_cast<float>((z >> 11) * 0x1.0p-53 * 2.0 - 1.0);
-          }
-        };
-        fill(nv);
-        fill(na);
-
-        const vllm::MiniMaxH3T2vaResult out = vllm::MiniMaxH3GenerateT2va(
-            video->device, r, p, video->dit.weights, video->video_cfg, video->video_weights,
-            video->audio_cfg, video->audio_weights, conditioning, nv, na,
-            vt::DType::kBF16);
-
-        const int64_t id = video->counter.fetch_add(1);
-        const std::string dir = video->workdir + "/job" + std::to_string(id);
-        if (std::system(("mkdir -p '" + dir + "'").c_str()) != 0) {
-          throw std::runtime_error("cannot create " + dir);
-        }
-        for (int64_t f = 0; f < out.frame_shape.t; ++f) {
-          char name[512];
-          std::snprintf(name, sizeof(name), "%s/frame_%06lld.ppm", dir.c_str(),
-                        static_cast<long long>(f));
-          std::ofstream fo(name, std::ios::binary);
-          const std::string bytes =
-              vllm::MiniMaxH3WritePpmFrame(out.frames, out.frame_shape, f);
-          fo.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        }
-        const std::string wav = dir + "/audio.wav";
-        {
-          std::ofstream fo(wav, std::ios::binary);
-          const std::string bytes = vllm::MiniMaxH3WriteWav(
-              out.waveform, out.audio_channels, out.audio_samples_per_channel,
-              out.sample_rate);
-          fo.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        }
-        vllm::MiniMaxH3MuxRequest mux;
-        mux.frame_pattern = dir + "/frame_%06d.ppm";
-        mux.audio_path = wav;
-        mux.output_path = dir + "/video.mp4";
-        std::vector<std::string> argv_mux = vllm::MiniMaxH3BuildMp4MuxArgs(mux);
-        if (!argv_mux.empty()) argv_mux[0] = video->ffmpeg;
-        std::string cmd;
-        for (const std::string& a : argv_mux) cmd += "'" + a + "' ";
-        if (std::system(cmd.c_str()) != 0) throw std::runtime_error("ffmpeg failed");
-        return mux.output_path;
+        return out.mux_output_path;
       });
     }
 
