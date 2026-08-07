@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,25 @@ CONTRACT_PATHS = (
     ".agents/state.md",
     "docs/STATUS.md",
     "docs/BENCHMARKS.md",
+    "tests/scripts/test_check_release_binary_contract.py",
+)
+
+REQUIRED_TEST_METHODS = (
+    "test_repository_contract_passes",
+    "test_spec_identity_is_fail_closed",
+    "test_each_primary_cuda_sm_is_required",
+    "test_primary_cuda_must_stay_one_fat_binary_per_host_abi",
+    "test_per_sm_cuda_must_not_become_primary",
+    "test_primary_cpu_must_stay_one_adaptive_binary_per_host_abi",
+    "test_x86_64_baseline_must_not_require_avx2",
+    "test_work_table_has_explicit_deps_column",
+    "test_each_work_dependency_edge_is_pinned",
+    "test_optional_w12_does_not_block_w13",
+    "test_each_required_record_anchor_is_fail_closed",
+    "test_public_release_rows_remain_pending",
+    "test_human_w12_is_optional_and_cannot_replace_w10",
+    "test_human_primary_artifact_contract_matches_machine_block",
+    "test_required_mutation_test_inventory_is_pinned",
 )
 
 ANCHORS = {
@@ -92,6 +112,27 @@ def mutate(root: Path, relative: str, before: str, after: str = "") -> None:
     if before not in text:
         raise AssertionError(f"mutation target missing in {relative}: {before!r}")
     path.write_text(text.replace(before, after, 1), encoding="utf-8")
+
+
+def delete_test_method(root: Path, method: str) -> None:
+    relative = "tests/scripts/test_check_release_binary_contract.py"
+    path = root / relative
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    matches = [
+        node
+        for node in ast.walk(ast.parse(text))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == method
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one method {method!r}, found {len(matches)}")
+    node = matches[0]
+    start = min(
+        [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
+    ) - 1
+    del lines[start : node.end_lineno]
+    path.write_text("".join(lines), encoding="utf-8")
 
 
 class LiveContract(unittest.TestCase):
@@ -193,6 +234,80 @@ class RecordAnchorMutations(unittest.TestCase):
                 result = run_checker(root)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"{relative} is missing required release anchor", result.stdout + result.stderr)
+
+
+class HumanContractMutations(unittest.TestCase):
+    SPEC = ".agents/specs/release-binary-matrix.md"
+
+    def test_public_release_rows_remain_pending(self) -> None:
+        mutations = (
+            (
+                "docs/BENCHMARKS.md",
+                "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, and 15 tests. No archive, staged smoke, runtime, correctness, or performance evidence",
+                "**SHIPPED:** archive, runtime, correctness, and performance evidence complete",
+                "docs/BENCHMARKS.md release row",
+            ),
+            (
+                "docs/STATUS.md",
+                "Supported subset; bundles SPIKED, no artifacts",
+                "Supported; bundles SHIPPED with runtime evidence",
+                "docs/STATUS.md release row",
+            ),
+        )
+        for relative, before, after, reason in mutations:
+            with self.subTest(path=relative), RepoCopy() as root:
+                mutate(root, relative, before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
+
+    def test_human_w12_is_optional_and_cannot_replace_w10(self) -> None:
+        mutations = (
+            (
+                "optional single-SM CUDA diagnostic/performance variants",
+                "required primary single-SM CUDA release variants replacing W10",
+                "W12 deliverable",
+            ),
+            (
+                "generated from the same explicit matrix and evidence; never advertised as the primary KISS download or used to bypass W10",
+                "the primary KISS download; W10 may be bypassed",
+                "W12 exit gate",
+            ),
+        )
+        for before, after, reason in mutations:
+            with self.subTest(reason=reason), RepoCopy() as root:
+                mutate(root, self.SPEC, before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
+
+    def test_human_primary_artifact_contract_matches_machine_block(self) -> None:
+        mutations = (
+            (
+                "The primary CPU download is\none conservative-baseline, runtime-adaptive binary per OS+host ABI; the primary\nCUDA download is one fat binary per OS+host ABI containing every supported SM.",
+                "The primary CPU download is one binary per ISA; the primary CUDA download is one binary per SM.",
+                "human primary CPU/CUDA contract",
+            ),
+            (
+                "For x86_64, the baseline must run without AVX2: portable/SSE2 code remains\ncallable, and higher instructions live only in per-function or per-TU tiers.",
+                "For x86_64, AVX2 is required by the baseline.",
+                "human x86_64 no-AVX2 contract",
+            ),
+        )
+        for before, after, reason in mutations:
+            with self.subTest(reason=reason), RepoCopy() as root:
+                mutate(root, self.SPEC, before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
+
+    def test_required_mutation_test_inventory_is_pinned(self) -> None:
+        for method in REQUIRED_TEST_METHODS:
+            with self.subTest(method=method), RepoCopy() as root:
+                delete_test_method(root, method)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("required mutation-test inventory", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
