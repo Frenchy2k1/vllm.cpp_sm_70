@@ -14469,3 +14469,56 @@ Followed #93's residual (the ref2va NVFP4 checkpoint/loader) with an independent
 **RE-ATTRIBUTION (corrects #93 again).** The nibble fix CHANGES the output (low-first severe grid → high-first pale grid, so the swap IS applied) yet EVERY NVFP4 render grids — t2va, ref2va, AND fl2va-with-keyframe — while the fl2va-GGUF control (SAME weights, SAME params, verified byte-for-byte) renders a coherent cat in the same build and same task. So: the checkpoint CONTENT is sound (byte-matches the coherent GGUF), the loader dequant is now byte-correct (binary dump == oracle == GGUF-sign), the derived params are identical, and output-pinning (keyframe) does NOT rescue it (rules out free-generation divergence). The residual grid is therefore a SECOND, independent defect in the NVFP4 render PATH itself — the device stream / forward, NOT the checkpoint, NOT the fp4 nibble order, NOT free-gen. The fp4-resident Marlin arm additionally grids differently (a THIRD, Marlin-specific issue — that path was only ever wiring-gated, never correctness-gated). The nibble fix is the objectively-correct dequant (the file IS high-first) and lands default-ON (A/B via `VT_H3_NVFP4_LOWNIBBLE=1`); it is byte-verified but not yet render-validated, blocked on the second defect. Next diagnostic: layer-by-layer intermediate-activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream (identical weights) to locate where they diverge — the streamers are structurally identical except the dequant source and the island read (bf16-disk vs f16-disk), so the divergence is a candidate.
 
 Artifacts `~/h3fp4/{t2va_fix,t2va_nofix,ctrl_t2va,ab_bf16fix,ab_fix,ab_nofix,kf_nvfp4}.mp4`.
+
+## Rolled out of the scoreboard on 2026-08-07
+
+Moved verbatim from `docs/BENCHMARKS.md` by `scripts/roll-benchmark-record.py`. Nothing edited or deleted.
+
+## Startup latency
+
+**PROVISIONAL, not binding.** Qwen3.6-27B-NVFP4 on GB10, `--startup-only`, three
+interleaved ours/vLLM repetitions under one `/tmp/gpu` lock, page cache dropped
+before every launch, GPU proven idle before and after each leg. vLLM oracle
+0.25.0 in the same production config the throughput grid uses.
+
+| Repetition | vllm.cpp | vLLM 0.25.0 |
+|---|--:|--:|
+| r1 | 37.94 s | 460.36 s (cold FlashInfer autotune) |
+| r2 | 36.51 s | 221.51 s |
+| r3 | 35.88 s | 217.86 s |
+| **median** | **36.51 s** | **221.51 s** |
+
+**6.07x faster to first `/health`.** Our band is 35.88 to 37.94 s (±3%); vLLM's
+two warm legs agree within 1.7%.
+
+The 460 s vLLM leg is a genuine one-time-per-machine cost, and vLLM's own log
+names it: r1 `init engine (profile, create kv cache, warmup model) took 259.42 s
+(compilation: 46.43 s)` while the FlashInfer autotuner **saved** 64 configs;
+r2 `took 26.95 s (compilation: 11.73 s)` while it **loaded** them from
+`~/.cache/vllm/flashinfer_autotune_cache`. Note that even warm, vLLM's engine
+init is only ~27 s of its ~221 s: the rest is process start, imports and weight
+load, which is where our advantage actually comes from.
+
+Our equivalent one-time cost is **+33 s**: a separate quiet-box run with both
+autotune caches cleared measured our cold-cache start at **69.29 s** against the
+36.51 s warm median (`[VT_FP4_CACHE] loaded=0` vs `loaded=64 tuned=0`).
+
+### Why this is not binding yet
+
+1. **Contention.** A concurrent build session appeared on the box at 00:38:41,
+   overlapping r2 and r3 of both arms. Our numbers look unaffected (the
+   overlapped leg was our fastest), but both warm-cache vLLM legs are inside
+   that window and contention would bias vLLM slow, inflating the ratio.
+2. **The re-run died with the host.** The uncontended repeat completed our
+   cold-cache r1 (69.29 s) and then the box **hard-rebooted at ~00:54** during
+   vLLM's cold-autotune leg (`gpu_memory_utilization=0.6` on the 119 GiB unified
+   pool; the previous boot's journal ends mid-leg with no shutdown sequence).
+   This is the known GB10 unified-memory reboot hazard, now also reproduced with
+   a *cold-autotune* vLLM leg, which peaks higher than the warm one the first
+   series ran six times without incident.
+
+Repro: `scripts/dgx-online-serving.sh --startup-only --model 27 ...`; evidence
+under `dgx:~/work/vllm.cpp-online-gate/evidence/8f752ae5.../startup/27/`.
+Method and caveats: [.agents/specs/startup-latency-axis.md](../.agents/specs/startup-latency-axis.md).
+
+

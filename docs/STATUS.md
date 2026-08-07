@@ -31,9 +31,9 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 
 ## Capability status
 
-Startup-latency axis (2026-08-06): `GATING / number-pending`. Cold launch-to-first-`/health` is
-measurable on both arms through one shared probe, cache-drop enforced per leg. **No ours-vs-vLLM
-number exists yet**; next gate is the 3-repetition interleaved dgx run.
+Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to first `/health`,
+27B-NVFP4 on GB10: **36.51 s vs vLLM 0.25.0's 221.51 s = 6.07x** (medians of 3). Not binding: 3 of
+6 legs contended, uncontended repeat died with a host reboot.
 [Detail](../.agents/specs/startup-latency-axis.md).
 
 Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.

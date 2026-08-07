@@ -1,6 +1,6 @@
 # Startup latency as a measured axis (cold launch to first `/health`)
 
-Status: **harness LANDED 2026-08-06; number PENDING.**
+Status: **harness LANDED 2026-08-06; number MEASURED PROVISIONAL 2026-08-07, binding re-run owed.**
 Rows: none new — this extends the existing `SERVE-GATE-ONLINE` harness
 (`.agents/specs/cuda-online-serving-gate.md`). `benchmark_binding=false`:
 a server-lifecycle axis, no kernel, no forward, no throughput denominator.
@@ -85,13 +85,51 @@ Upstream test to port: none. vLLM has no startup-latency test; this is a
 harness axis, recorded as a deviation in the sense of
 `porting-inventory.md` §9 (measurement tooling is ours, not a vLLM mirror).
 
+## Result (provisional)
+
+Qwen3.6-27B-NVFP4, GB10, 3 interleaved repetitions, vLLM oracle 0.25.0.
+
+| Repetition | ours | vLLM |
+|---|--:|--:|
+| r1 | 37.94 s | 460.36 s (cold FlashInfer autotune) |
+| r2 | 36.51 s | 221.51 s |
+| r3 | 35.88 s | 217.86 s |
+| **median** | **36.51 s** | **221.51 s** |
+
+`startup_speedup_vs_vllm` = **6.07**. Ours spans 35.88-37.94 s (±3%); vLLM's two
+warm legs agree within 1.7%.
+
+Attribution from vLLM's own log rather than inference: r1 `init engine ... took
+259.42 s (compilation: 46.43 s)` with the autotuner **saving** 64 configs; r2
+`took 26.95 s (compilation: 11.73 s)` **loading** them. Even warm, engine init is
+only ~27 s of ~221 s, so the bulk of vLLM's startup is process start, imports and
+weight load. Our own cold-autotune start is **69.29 s** (+33 s over warm), from a
+separate run with both caches cleared.
+
+## Why it is NOT binding
+
+1. **Contention.** A concurrent build session appeared on the box at 00:38:41 and
+   overlapped r2/r3 of both arms. Both warm-cache vLLM legs sit inside it.
+   Contention biases vLLM slow, so the ratio is more likely overstated than
+   understated. Our arm looks unaffected (the overlapped leg was our fastest).
+2. **The uncontended repeat was destroyed by a host hard-reboot.** It completed
+   our cold-cache r1 (69.29 s), then the box rebooted at ~00:54 during vLLM's
+   cold-autotune leg; the previous boot's journal ends mid-leg with no shutdown
+   sequence, and the machine came back at 01:31.
+
+### New hazard datum
+
+The known GB10 unified-memory reboot hazard now has a *cold-autotune* trigger:
+the first series ran `vllm serve --gpu-memory-utilization 0.6` six times without
+incident, but the leg that took the box down was the one where FlashInfer was
+autotuning from scratch, which peaks higher than the cached path. Treat a
+cold-autotune vLLM leg on GB10 as higher risk than a warm one, and prefer
+pre-warming vLLM's autotune cache before a series rather than inside it.
+
 ## Open
 
-- **The number.** Not measured. On 2026-08-06 dgx.casa root was at 100%
-  (20 GiB free) with no existing CUDA `server` build, so the ours arm could not
-  be built. Reclaiming the untagged 7.37 GB docker image plus the 4.4 GB builder
-  cache was authorized; the run is owed after that.
+- **A binding number.** Uncontended 3-rep re-run on a quiet box, both autotune
+  caches in matched states, no concurrent session for the whole window.
 - 35B and `q3mxfp4` arms after 27B.
-- Whether startup should become a standing column of the `--execute` grid
-  summary. The stamps are already recorded there for free; only the aggregation
-  is missing.
+- Whether startup becomes a standing column of the `--execute` grid summary. The
+  stamps are already recorded there for free; only the aggregation is missing.
