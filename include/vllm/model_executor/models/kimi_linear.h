@@ -434,6 +434,13 @@ std::vector<float> KimiMoeBlockForwardDevice(const MoeHostWeights& w,
                                              const std::vector<float>& hidden_normed,
                                              const KimiLinearParams& p,
                                              int64_t num_tokens, vt::Queue& queue);
+// Device MLA attention CORE only (VT_KIMI_DEVICE_MLA path: pad-V + vt::Attention),
+// host-in / host-out — the RED-first CPU gate for the NoPE-MLA device attention wiring.
+std::vector<float> KimiMlaAttnCoreDevice(const std::vector<float>& q_host,
+                                         const std::vector<float>& kv_host,
+                                         const std::vector<float>& kpe_host,
+                                         const KimiLinearParams& p, int64_t num_tokens,
+                                         vt::Queue& queue);
 std::vector<float> KimiDenseMlpForwardDevice(const MlpHostWeights& w,
                                              const std::vector<float>& hidden_normed,
                                              const KimiLinearParams& p,

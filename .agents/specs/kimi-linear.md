@@ -913,6 +913,65 @@ aot.sh`), or a native `chunk_kda` port. Row STAYS `ACTIVE`.
 
 ---
 
+## 16. DEVICE NoPE-MLA attention lever MEASURED-NEGATIVE; STRICT still owed the ACTUAL FA2/chunk_kda kernels (2026-08-07, `row/KIMI-STRICT-CLOSE`, #107)
+
+The §15 residual (d) — "the 7 NoPE-MLA layers still use a host f64 softmax island … closing p7
+needs paged `mla::ForwardMlaAttentionBlock`" — was attempted in its device-COMPUTE form (the §15
+device-KDA pattern applied to the MLA half) and MEASURED-NEGATIVE on GB10. The one-brick STRICT-close
+did NOT land; the honest verdict re-confirms §14's razor.
+
+**Implementation (`kimi_linear_device.cpp`, additive, default OFF).** New knob `VT_KIMI_DEVICE_MLA` +
+helper `MlaAttnCoreDevice`: the NoPE causal softmax over per-head `[k_nope|k_pe(shared)]`/`v` runs
+through the shared device op `vt::Attention` (f32 online max-subtracted softmax — vLLM's FA2
+accumulation regime) instead of the f64 host `MlaSoftmaxIsland`. `vt::Attention` carries a single
+head-dim for q/k/v while MLA is asymmetric (`qk = qk_nope+qk_rope = 192`, `v = 128`), so the value is
+PADDED to `qk` with zeros — the weighted sum over the zero tail is 0, so `out[:, :, :v]` is byte-exact
+to the unpadded math (softmax weights depend only on `q·k`). q views `dq` directly as `[T,nah,192]`;
+key is built per `(t,h)` as `[k_nope | k_pe(broadcast)]`. Wired into both the f32 and bf16
+`MlaSoftmaxIsland` paths. MLA dims VERIFIED from the real 48.9B `config.json` (not the K3 numbers):
+`nah=32, qk_nope=128, qk_rope=64, v_head_dim=128, kv_lora=512, q_lora=None`; 7 full-attn/MLA layers
+(`full_attn_layers=[4,8,12,16,20,24,27]`), 20 KDA.
+
+**Unit gate (RED-first, CPU) GREEN.** `test_kimi_linear_forward` **14/14·825** (was 13/13·656) —
+NEW case (g2) `KimiMlaAttnCoreDevice` (pad-V + `vt::Attention`) == a from-first-principles f64
+causal-softmax reference at the Kimi MLA geometry (rtol 3e-3). RED-first verified: a perturbed scale
+fails 108 assertions. Env-gated whole-forward runs green (`VT_KIMI_DEVICE_MLA=1` alone and with
+`VT_KIMI_DEVICE_KDA=1`, 14/14·825). Same on the GB10 CUDA binary (210 GDN + 23 KDA syms linked).
+
+**Full 48.9B GB10 gate — MEASURED NEGATIVE (single-load per config, `flock $HOME/gpu.lock`, min-avail
+21 GiB, no reboot; the golden is the §12 STRICT `greedy_ids.npy`).**
+
+| Config | env (all `VT_KIMI_DEVICE_COMPUTE=1`) | /128 | tok/s | verdict |
+|---|---|---|---|---|
+| control (device-KDA) | `DEVICE_KDA=1` | 122 | 4.24 | reproduces §15 EXACTLY (p0-p6 16/16, p7 10/16) |
+| **+ device-MLA** | `DEVICE_KDA=1 DEVICE_MLA=1` | **109** | **3.89** | **REGRESSION both axes** |
+
+**Why negative (the §14 razor, re-proven).** device-KDA WORKS (106→122) because the recurrence is the
+SAME algorithm as vLLM's decode kernel, just f32-on-bf16 — it matches. But vLLM's MLA prefill uses
+**FA2** (a specific flash tiling/reduction order); `vt::Attention`'s plain f32 online-softmax is the
+right MATH but a DIFFERENT reduction ORDER, so — exactly like §14's host-precision-matching plateau —
+it COIN-FLIPS near-ties: it BREAKS p3 16/16→3/16 (into the same `163586×` degenerate repeat the §14
+bf16 knobs caused) while p7 stays diverged at 10/16. And it is SLOWER (4.24→3.89): the per-`(t,h)`
+key/value build copies + the 192-dim pad-V waste add overhead to the O(n²) recompute path. An
+approximation of vLLM's kernel is not enough — only the ACTUAL kernel matches.
+
+**Verdict + default.** `VT_KIMI_DEVICE_MLA` STAYS **OFF**, kept as a documented-MEASURED-NEGATIVE A/B
+knob (parity-lever precedent: §14's `ISLAND_F32ACC`/output-bf16). device-KDA (122/128, 4.24 tok/s)
+remains the best config, itself default OFF (122 ≠ STRICT). Row STAYS `ACTIVE`.
+
+**STRICT residual, sharpened by this measurement.** p7 (and now the coin-flip class generally) needs
+vLLM's ACTUAL kernels, NOT a device approximation: (c) the **chunk_kda** prefill kernel family
+(`chunk_kda_scaled_dot_kkt` + `recompute_w_u` + `chunk_gla_fwd_o_gk` + `fused_kda_gate_chunk_cumsum`,
+FLA `ops/kda.py`) — mirror-first via a Triton-AOT regen for sm_121a (`scripts/regen-triton-aot.sh` +
+new `triton_kernels/*.py`), the spec's named prime suspect; (d) the paged
+`mla::ForwardMlaAttentionBlock` (FA2) for the 7 NoPE-MLA layers — NOT the `vt::Attention` approximation
+tried here; (e) **paged-incremental decode** — coupled with (d) because it needs a decode/paged
+attention op (`query_len ≠ key_len`), which `vt::Attention` cannot express; it kills the O(n²)
+full-recompute (the current 4.24 tok/s is the recompute rate). Each is a substantial multi-kernel
+brick, not a one-shot; recorded as the named follow-on.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope

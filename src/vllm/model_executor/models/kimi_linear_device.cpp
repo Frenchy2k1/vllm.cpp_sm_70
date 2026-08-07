@@ -174,6 +174,39 @@ bool DeviceKda() {
   }();
   return on;
 }
+
+// (5) VT_KIMI_DEVICE_MLA — run the NoPE-MLA attention CORE (causal scores/softmax/
+// weighted-V) through the shared device op vt::Attention instead of the f64 host
+// softmax island. This is the MLA twin of VT_KIMI_DEVICE_KDA (spec §14/§15 residual
+// (d)): the host island runs an f64 softmax that is MORE precise than vLLM's FA2 and
+// coin-flips near-ties, whereas vt::Attention runs the f32 max-subtracted online-
+// softmax accumulation vLLM's kernels use (cpu_ops AttentionKernel / cuda_ops). The
+// MLA attention has asymmetric head dims (qk = qk_nope+qk_rope = 192, v = 128), which
+// vt::Attention (single head-dim D for q/k/v) does not express directly, so the value
+// is PADDED to the qk head-dim with zeros (weighted-sum over the zero tail = 0) and the
+// out[:, :, :v] slice is the true attention core — bit-exact to the unpadded math since
+// softmax weights depend only on q·k. Requires VT_KIMI_DEVICE_COMPUTE=1. Independent of
+// the bf16-precision knobs (BF16_ISLANDS still rounds the q/kv/kpe inputs when both are
+// set — applied on device before the attention).
+//
+// ★ MEASURED NEGATIVE (2026-08-07, GB10 full 48.9B gate, spec §16) — kept as a
+// documented-negative A/B knob, DEFAULT OFF. On the device-KDA best config
+// (VT_KIMI_DEVICE_KDA=1), adding VT_KIMI_DEVICE_MLA REGRESSES 122→109/128 AND slows
+// 4.24→3.89 tok/s: (1) vt::Attention's f32 online max-subtracted softmax is NOT vLLM's
+// FA2 reduction ORDER — it is a DIFFERENT approximation, so it coin-flips near-ties (it
+// BREAKS p3 16/16→3/16 into the `163586×` repeat loop while p7 stays diverged), the same
+// §14 plateau class; (2) the per-(t,h) key/value build copies + the 192-dim pad-V waste
+// ADD overhead to the O(n²) recompute path. The principled MLA-half STRICT lever is
+// vLLM's ACTUAL FA2 via paged mla::ForwardMlaAttentionBlock (residual d, coupled with
+// paged-incremental decode e), NOT this softmax approximation — this negative is the
+// measurement that proves the approximation is not enough.
+bool DeviceMla() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_DEVICE_MLA");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
 // Round a running f64 accumulator to f32 precision when the knob is on (identity else).
 inline double AccR(double x) {
   static const bool f32 = IslandF32Acc();
@@ -393,12 +426,86 @@ DBuf KdaRecurrenceIsland(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
   return DBuf(d, DType::kF32, {T, proj}, core.data());  // upload back to device
 }
 
+// ── DEVICE MLA attention CORE (VT_KIMI_DEVICE_MLA): the NoPE causal softmax over the
+// per-head k_nope|k_pe / v, run through the shared device op vt::Attention (f32 online
+// softmax — vLLM's FA2 regime) instead of the f64 host recompute. MLA has asymmetric
+// head dims (qk = qk_nope+qk_rope, v = v_head_dim), which vt::Attention (one head-dim D
+// for q/k/v) does not express, so the value is PADDED to qk with zeros: the weighted sum
+// over the zero tail is 0, so out[:, :, :vh] is the exact attention core (softmax weights
+// depend only on q·k, which is unaffected by the padded v). q is already laid out per head
+// as [q_nope(qn) | q_pe(qr)] so dq views directly as [T,nah,qk]; key is built per (t,h) as
+// [k_nope(qn) | k_pe(qr, SHARED across heads)] and value as [v(vh) | 0]. Scale = qk^-0.5,
+// matching the host island / kimi_linear_forward.cpp:223. Returns [T, nah*v_head_dim].
+DBuf MlaAttnCoreDevice(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
+                       const KimiLinearParams& p, int64_t T) {
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t kvw = nah * (qn + vh);
+
+  DBuf key(d, DType::kF32, {T, nah, qk});
+  DBuf val(d, DType::kF32, {T, nah, qk});
+  val.Zero(d);  // pad-V: the [vh, qk) tail stays 0
+  {
+    const size_t qkb = static_cast<size_t>(qk) * sizeof(float);
+    const size_t qnb = static_cast<size_t>(qn) * sizeof(float);
+    const size_t qrb = static_cast<size_t>(qr) * sizeof(float);
+    const size_t vhb = static_cast<size_t>(vh) * sizeof(float);
+    const char* kv = static_cast<const char*>(dkv.ptr());
+    const char* kpe = static_cast<const char*>(dkpe.ptr());
+    char* kp = static_cast<char*>(key.ptr());
+    char* vp = static_cast<char*>(val.ptr());
+    for (int64_t t = 0; t < T; ++t) {
+      const char* kpe_t = kpe + static_cast<size_t>(t) * qrb;
+      for (int64_t h = 0; h < nah; ++h) {
+        const char* src =
+            kv + (static_cast<size_t>(t) * kvw + static_cast<size_t>(h) * (qn + vh)) *
+                     sizeof(float);
+        char* kdst = kp + (static_cast<size_t>(t) * nah + h) * qkb;
+        char* vdst = vp + (static_cast<size_t>(t) * nah + h) * qkb;
+        d.b.Copy(d.q, kdst, src, qnb);          // k_nope[qn]
+        d.b.Copy(d.q, kdst + qnb, kpe_t, qrb);  // k_pe[qr] (shared across heads)
+        d.b.Copy(d.q, vdst, src + qnb, vhb);    // v[vh]; the [vh,qk) tail stays 0
+      }
+    }
+  }
+  // VT_KIMI_BF16_ISLANDS: round the attention inputs to bf16 precision on device
+  // (matching the host island's RoundHostBf16), before the f32 softmax.
+  if (Bf16Islands()) {
+    RoundDevBf16(d, dq);
+    RoundDevBf16(d, key);
+    RoundDevBf16(d, val);
+  }
+  Tensor query = MakeTensor(dq.ptr(), DType::kF32, d.q.device, {T, nah, qk});
+  DBuf attn(d, DType::kF32, {T, nah, qk});
+  const float scale = static_cast<float>(std::pow(static_cast<double>(qk), -0.5));
+  vt::Attention(d.q, attn.t(), query, key.t(), val.t(), vt::AttentionArgs{scale, true});
+
+  // slice out[:, :, :vh] -> [T, nah*vh] (the pad-V tail is 0 by construction).
+  DBuf out(d, DType::kF32, {T, nah * vh});
+  {
+    const size_t qkb = static_cast<size_t>(qk) * sizeof(float);
+    const size_t vhb = static_cast<size_t>(vh) * sizeof(float);
+    const char* ap = static_cast<const char*>(attn.ptr());
+    char* op = static_cast<char*>(out.ptr());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t h = 0; h < nah; ++h)
+        d.b.Copy(d.q, op + (static_cast<size_t>(t) * nah + h) * vhb,
+                 ap + (static_cast<size_t>(t) * nah + h) * qkb, vhb);
+  }
+  return out;
+}
+
 // ── HOST-FALLBACK ISLAND: the materialized-MHA attention CORE (causal softmax over
 // the per-head k_nope|k_pe / v, NoPE so no RoPE). Identical math to kimi_linear_
 // forward.cpp:223-258; shared by the f32 and bf16 MLA paths (only the projections
-// feeding dq/dkv/dkpe differ). Returns [T, nah*v_head_dim].
+// feeding dq/dkv/dkpe differ). Returns [T, nah*v_head_dim]. When VT_KIMI_DEVICE_MLA is
+// set, the attention core runs on device via vt::Attention (MlaAttnCoreDevice) instead.
 DBuf MlaSoftmaxIsland(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
                       const KimiLinearParams& p, int64_t T) {
+  if (DeviceMla()) return MlaAttnCoreDevice(d, dq, dkv, dkpe, p, T);
   const int64_t nah = p.num_attention_heads;
   const int64_t qn = p.qk_nope_head_dim;
   const int64_t qr = p.qk_rope_head_dim;
@@ -1042,6 +1149,29 @@ std::vector<float> KimiNoPEMlaLayerForwardDevice(const MlaLayerHostWeights& w,
   DBuf dh(d, DType::kF32, {num_tokens, p.hidden_size}, hidden_normed.data());
   DBuf out = MlaLayerDevice(d, w, dh.t(), p, num_tokens);
   std::vector<float> h(static_cast<size_t>(num_tokens) * p.hidden_size);
+  out.Download(d, h.data());
+  return h;
+}
+
+// Device MLA attention CORE only (pad-V + vt::Attention), host-in / host-out — the
+// dedicated RED-first CPU gate for the VT_KIMI_DEVICE_MLA wiring, independent of the
+// env flag. q [T,nah*qk], kv [T,nah*(qn+vh)], kpe [T,qr] -> [T,nah*vh].
+std::vector<float> KimiMlaAttnCoreDevice(const std::vector<float>& q_host,
+                                         const std::vector<float>& kv_host,
+                                         const std::vector<float>& kpe_host,
+                                         const KimiLinearParams& p, int64_t num_tokens,
+                                         vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qk = p.qk_nope_head_dim + p.qk_rope_head_dim;
+  const int64_t vh = p.v_head_dim;
+  const int64_t kvw = nah * (p.qk_nope_head_dim + vh);
+  const int64_t qr = p.qk_rope_head_dim;
+  DBuf dq(d, DType::kF32, {num_tokens, nah * qk}, q_host.data());
+  DBuf dkv(d, DType::kF32, {num_tokens, kvw}, kv_host.data());
+  DBuf dkpe(d, DType::kF32, {num_tokens, qr}, kpe_host.data());
+  DBuf out = MlaAttnCoreDevice(d, dq, dkv, dkpe, p, num_tokens);
+  std::vector<float> h(static_cast<size_t>(num_tokens) * nah * vh);
   out.Download(d, h.data());
   return h;
 }
