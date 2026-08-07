@@ -400,7 +400,7 @@ vLLM-Omni H3 modules at `vllm_omni/diffusion/models/minimax_h3/`; serving in
 | WebSocket `/v1/video/chat/stream`, `/v1/realtime/video` | `api_server.py:1593,1610` | — | **MISSING** (streaming/realtime) |
 | Request schema (prompt, size/w/h, num_frames, fps, seed, steps, refs) | `protocol/videos.py:97-249` | request contract (W7) | **PARTIAL** (core fields; frame-interp/lora/generate_sound absent) |
 | H3 knobs via `extra_params.{task,duration,flow_shift,audio_flow_shift}` | `pipeline:1034,403,1157-1158` | planner reads task/duration/shift | **DONE** |
-| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va reference-row assembly FIXED + gated (§8.10) — ref2va still grids; the NVFP4 fp4 nibble-order loader bug is now FOUND+FIXED (byte-verified, §8.11) but the grid PERSISTS from a 2nd NVFP4-render-path defect (checkpoint content + loader dequant + params all byte-match the coherent GGUF) | **PARTIAL** (vision→conditioning scatter + ref2va assembly + NVFP4 nibble loader DONE; residual = the 2nd NVFP4-render-path defect, §8.11) |
+| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va reference-row assembly FIXED + gated (§8.10) — ref2va still grids; the NVFP4 fp4 nibble-order loader bug is now FOUND+FIXED (byte-verified, §8.11) but the grid PERSISTS — DIAGNOSED (§8.12): NO discrete load-path defect (activation diff + weight fingerprints: every weight/bias/island/head/RoPE loads quant-noise-close to the coherent GGUF, byte-identical RoPE); residual = the community NVFP4 checkpoint's quant fidelity × the DiT's Qwen massive-activation sensitivity, chaotic — not a loader fix | **PARTIAL** (vision→conditioning scatter + ref2va assembly + NVFP4 nibble loader DONE; ref2va NVFP4 render residual = checkpoint quant fidelity, no loader bug, §8.12) |
 | Output: joint video+audio, 24 fps, 32 kHz stereo | `pipeline:106-111,1187` | frames + WAV + MP4 mux (W7) | **DONE** |
 | Scheduler: euler-ancestral rectified flow (single) | `scheduling_...euler_ancestral.py`; `time_request.py:34-61` | `MiniMaxH3EulerEta0Step` / `MiniMaxH3TimeShiftSigmas` | **DONE** |
 | CFG: distilled, no CFG (guidance params accepted+ignored; `cfg_parallel_size==1`) | `pipeline:250,275-276` | no CFG branch | **DONE** (matches) |
@@ -774,6 +774,32 @@ the un-pinned target rows on them), NOT the prompt_embeds and NOT the DiT forwar
 dump the ref2va target-row VAE-input latent adjacency-cosine (like #77 did for the coherent fl2va,
 0.95) to confirm the target rows are white, and A/B the reference-row condition-noise vs a clean
 anchor.
+
+## 8.12 THE #94 RESIDUAL DIAGNOSED — no discrete load-path defect (`row/H3-NVFP4-STREAM-DIFF` PR #95, 2026-08-07)
+
+Ran #94's prescribed identical-weights activation diff (NVFP4-bf16 stream vs FL2VA-GGUF-bf16
+control, byte-identical inputs) plus direct WEIGHT fingerprints via an env-gated per-stage hook
+in `MiniMaxH3DitForwardDevice` (`VT_H3_ACT_DUMP`, byte-inert unset). **Result: there is NO discrete
+load-path materialization bug.** Every weight, bias, fp32 island, output head, q/k-norm, and the
+RoPE cos/sin cache load quant-noise-close to the coherent GGUF (no scramble/transpose/mis-stride/
+wrong-dtype/wrong-shape); the RoPE cache is byte-identical; the dequant is byte-verified (§8.11).
+Both arms run the IDENTICAL forward, so the grid is 100% attributable to the per-weight
+NVFP4-vs-Q3_K quantization difference on the SAME weights.
+
+The divergence FIRST appears (beyond quant noise) at the **token refiner** and the block-0
+attention INPUT — NOT RoPE, NOT a projection/norm weight — and amplifies chaotically through the
+50-block stack, driven by the Qwen massive text activation (`condition_proj` output absmax ~7.4e4);
+the two arms' final latents are DECORRELATED (sample-relative-L2 >1, not scale-related). Render A/B
+re-confirmed in the same byte-inert build: NVFP4 t2va = pale patch grid, FL2VA-GGUF t2va = coherent
+orange cat. **The residual is the community NVFP4 file's quantization fidelity** (same
+`Star Ultimate Model Converter Pro` lineage as the #94 nibble bug; corr to the coherent Q3_K only
+0.85-0.94) times the DiT's massive-activation sensitivity — a CHECKPOINT-quality issue, not a
+loader fix. Definitively separating "poor community quant" from "inherent t2va-OOD sensitivity of
+these fl2va/ref2va finetunes" needs a clean bf16 ground truth (132 GiB host-f32 = OOM on one GB10)
+or a same-finetune REF2VA-GGUF control (disk-blocked, 23 GiB free); the path forward is an official
+modelopt-NVFP4 checkpoint. The fp4-resident Marlin arm's separate grid stays a distinct,
+wiring-gated-only residual (untouched). Full forensics + the divergence profile: the
+`row/H3-NVFP4-STREAM-DIFF` benchmark-record entry.
 
 ## 9. W-OAI — the `/v1/videos` OpenAI (Sora) WIRE SHAPE, 2026-08-06
 

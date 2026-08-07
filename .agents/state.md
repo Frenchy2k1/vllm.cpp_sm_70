@@ -40719,6 +40719,7 @@ wiring-gated). NEXT: layer-by-layer activation diff of the NVFP4-bf16 stream vs 
 
 
 ## 2026-08-07 — startup latency MEASURED (provisional): 36.51 s vs vLLM 221.51 s = 6.07x
+<!-- state: 2026-08-07T05:35 -->
 
 First numbers on the axis landed yesterday. Qwen3.6-27B-NVFP4 on GB10, 3
 interleaved repetitions, page cache dropped per leg, vLLM oracle 0.25.0:
@@ -40753,3 +40754,22 @@ torch compile cache was left partially cleared and self-heals on next vLLM start
 Evidence: `dgx:~/work/vllm.cpp-online-gate/evidence/8f752ae5.../startup/27/`
 (series 1) and `dgx:~/work/startup-axis/clean-claim/.../startup/27/ours/r1.json`
 (the surviving cold-cache leg). Owed: one uncontended 3-rep series on a quiet box.
+[2026-08-07] H3-NVFP4-STREAM-DIFF (#95) — the #94 residual DIAGNOSED: there is NO discrete load-path
+defect. Ran #94's prescribed identical-weights activation diff (NVFP4-bf16 stream vs FL2VA-GGUF-bf16
+control, byte-identical inputs via encode-once pe.f32) + direct WEIGHT fingerprints, via an env-gated
+per-stage hook in MiniMaxH3DitForwardDevice (VT_H3_ACT_DUMP, byte-inert unset). FINDING: every weight,
+bias, fp32 island, output head, q/k-norm loads quant-noise-close to the coherent GGUF (qkv/out/fc/adaln
+2-6% rms = Q3K-vs-NVFP4 quantizer variance, sign-correct; ALL biases <0.1% apart incl adaln_b; islands
++heads quant-noise-close), and the RoPE cos/sin cache is BYTE-IDENTICAL — no scramble/transpose/mis-stride/
+wrong-dtype/wrong-shape. Both arms run the IDENTICAL forward, so the grid is 100% from the per-weight
+NVFP4-vs-Q3K quant delta on the SAME weights. Divergence FIRST appears at the token refiner (text_refined
+ratio 0.92, sampRelL2 0.48) + the block-0 attention INPUT (normed_pre_attn 0.89), NOT RoPE/GEMM/norm
+weights, and amplifies chaotically through the 50-block stack driven by the Qwen massive text activation
+(condition_proj absmax ~7.4e4); final latents DECORRELATED (sampRelL2 >1, not scale) -> chaotic trajectory.
+Render A/B re-confirmed same byte-inert build: NVFP4 t2va pale patch grid, FL2VA-GGUF t2va coherent orange
+cat. CONCLUSION: not a loader fix — residual = the community NVFP4 checkpoint's quant fidelity (Star
+Ultimate Model Converter Pro lineage; corr 0.85-0.94 to the coherent Q3K) x the DiT's massive-activation
+sensitivity. Clean-reference disambiguation blocked (bf16 132GiB = OOM on 1 GB10; same-finetune REF2VA-GGUF
+= 23G-disk-blocked); path forward = an official modelopt-NVFP4 ckpt. fp4-resident Marlin arm's separate
+grid untouched (wiring-gated-only). Diagnostic hooks landed byte-inert. Records: spec §8.12 + §8.2 row,
+STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
