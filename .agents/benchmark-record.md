@@ -14535,3 +14535,22 @@ Ran #94's prescribed next diagnostic — a layer-by-layer activation diff of the
 **Render A/B re-confirmed in the same byte-inert build (256×256/22f/12steps, `pe.f32`, `VT_H3_ACT_DUMP` unset).** NVFP4 t2va = pale multicolour PATCH GRID every frame (0/10/21, per-patch uniform = degenerate latent); FL2VA-GGUF t2va = a COHERENT photorealistic orange cat on a windowsill. The diagnostic hooks are byte-inert (reproduce #94's outputs exactly).
 
 **CONCLUSION.** The mission's "2nd load-path defect" does not exist — our loader materializes the community NVFP4 file's weights faithfully (byte-verified). The residual is the **community NVFP4 checkpoint's quantization fidelity** (metadata `converted_by: "Star Ultimate Model Converter Pro"` — same dubious-converter lineage as the #94 nibble bug; corr to the coherent Q3_K only 0.85-0.94, well below the >0.99 a clean 4-bit quant gives) interacting with the DiT's massive-activation sensitivity. Definitively separating "poor community quant" from "inherent t2va-OOD sensitivity of these fl2va/ref2va finetunes" needs a clean reference — a bf16 ground truth (132 GiB host-f32 = OOM on one GB10) or a same-finetune REF2VA-GGUF control (disk-blocked, 23 GiB free) — both currently blocked; the path forward is an official modelopt-NVFP4 checkpoint, not a loader change. The #94 nibble fix stands as the objectively-correct dequant. The fp4-resident Marlin arm's separate grid stays a distinct, wiring-gated-only residual (untouched, per the mission). Artifacts `~/h3fp4/diff/{nvfp4_t2va,gguf_t2va}.mp4` + `{gguf,nvfp4}{2,3,4}.txt` fingerprints.
+
+---
+
+## 2026-08-07 — Kimi-Linear-48B W7-speed STRICT lever: bf16 regime 106→120/128, plateaus (device islands the residual)
+
+Full 48.9B model on GB10 (sm_121a clean CUDA build, cutlass-4.5.0, 14 GDN AOT symbols; CPU gate `test_kimi_linear_forward` 13/13·656 in the CUDA binary), §12 8-prompt×16-token gate vs the STRICT deterministic golden. Three env-gated numeric knobs added to `kimi_linear_device.cpp` (default OFF, byte-identical). Both flock locks, reclaim-wait ≥90 GiB between every reload, min-avail ≥115 GiB, no reboot.
+
+| Config | env | TOKEN MATCH /128 | tok/s | note |
+|---|---|---|---|---|
+| control | (none) | 106 | 1.31 | reproduces §13 baseline exactly (build integrity) |
+| residual only | `VT_KIMI_BF16_RESIDUAL` | 106 | 1.61 | net-zero: shuffles flips, BREAKS p3 into `163586×` repeat |
+| islands only | `VT_KIMI_BF16_ISLANDS` | 106 | 1.30 | fixes p2, destabilizes p3 — net-zero |
+| **residual + islands** | both | **120** | 1.30 | **BEST**: p0–p6 all 16/16; only p7 pos-8 flips (`18705`→`58084`) |
+| + island-output bf16 | (islands, out-round) | 90 | 1.32 | REGRESSION — reverted |
+| + f32 accumulation | `…VT_KIMI_ISLAND_F32ACC` | 91–106 | 0.84 | NEGATIVE — kept as documented A/B |
+
+FLIP LEDGER (deterministic golden arbitrates): the two levers interact — island bf16-input rounding fixes p2 but repeats p3; the bf16 residual stream (vLLM `fused_add_rms_norm` order) re-stabilizes p3. At 120/128 the SOLE divergence is p7 position 8 (golden deterministically `18705`, ours `58084`), a single near-tie that cascades to 8/16 on p7. Further precision-"matching" (output bf16, f32 accum) is a coin-flip that regresses — it is not vLLM's actual GDN-Triton/FA2 kernel arithmetic. Host-precision-matching PLATEAUS at 120/128.
+
+VERDICT: NO arm STRICT (K=3-deterministic golden → STRICT required, not distributional); default STAYS OFF (parity-enablers). NAMED residual (= also the speed lever): the device islands — a NEW per-channel-decay GDN kernel (`g[T,H,D]`; `vt::GdnDecode`/`GdnPrefill` carry only per-head `g[T,Hv]`, ops.h:1797/1846 — NOT a drop-in) + paged `mla::ForwardMlaAttentionBlock` (FA2). Speed HW-forced-indirect: 1.30 tok/s (O(n²) recompute + host islands, invariant to the numeric knobs); vLLM cannot serve Kimi-Linear-48B at bf16 on one GB10 (oracle capture needed util 0.82 for a single-seq eager run) so a direct `vllm bench throughput` arm is infeasible. Row STAYS ACTIVE.
