@@ -126,7 +126,14 @@ version, this list is the reminder.
   helper works in an isolated worktree on `row/<ROW-ID>` and opens a DRAFT PR at
   the START: that PR **is** the claim. The operator merges PRs first thing, owns
   `main` and the GPU, and drives feature work through sub-agents rather than
-  writing it — the loop is written down in
+  writing it. **A PR verified good in-session is merged in that SAME session**
+  — gates green on its head plus a clean review make merging an obligation,
+  not an option, and "verified, ready to merge" is not a state a session may
+  end in (that is how the 2026-08-07 ten-PR backlog was built). A PR that has
+  become superseded or irrelevant is CLOSED with a recorded reason; anything
+  else parked open must name its blocker on the thread. Only a DECLARED
+  headless run defers the merge, recording "READY-TO-MERGE at `<sha>`" in
+  `.agents/state.md`. The loop is written down in
   [workflow.md § Running a row through sub-agents](.agents/workflow.md#running-a-row-through-sub-agents)
   and its two sub-agent contracts are tracked artifacts
   ([implementer](.agents/prompts/implementer.md),
