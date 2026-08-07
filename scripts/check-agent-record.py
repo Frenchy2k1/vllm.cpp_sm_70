@@ -292,7 +292,13 @@ ENGINE_PREFIXES = (
 # over HTTP at all. CPU-landed + gated, `CLAIM-SERVE-VIDEOS-REFS`, spec
 # `specs/minimax-h3.md` §10.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 142
+# 143 since 2026-08-07: +`ENG-RELEASE-BINARIES` (downloadable, backend-specific
+# server bundles and their static/runtime dependency contract) — a real
+# distribution capability requested in issue #117, not a restatement of the
+# server implementation. Inventoried while its release-matrix spike is written;
+# no packaging support is claimed by the count bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 143
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
