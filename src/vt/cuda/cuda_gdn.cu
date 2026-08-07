@@ -2643,6 +2643,115 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
 }
 
 // ===========================================================================
+// KDA per-K-channel-decay sequential scan (kKdaGatedDeltaRule).
+//
+// Byte-for-byte GdnScanKernel EXCEPT the state decay is per-K-channel: GDN uses
+// one scalar `decay = expf(g[t*hv_n+hv])` for the whole [Dv,Dk] state; KDA stages
+// a per-K vector `decay[ki] = expf(g[(t*hv_n+hv)*dk + ki])` in shared memory and
+// applies `s_row[ki] *= decay[ki]`. Ported 1:1 from FLA
+// fused_recurrent_gated_delta_rule_fwd_kernel IS_KDA=True
+// (`b_h *= exp(b_gk[None, :])`, third_party/flash_linear_attention/ops/
+// fused_recurrent.py:136-137 @ pin 555967922). All state math f32; q/k must be
+// l2-normalized by the caller (as GdnScan). The shared GDN kernels are untouched.
+template <typename Tin, typename Tout, typename TState>
+__global__ void KdaScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
+                              const float* g, const float* beta, TState* state,
+                              const int32_t* qsl, const int32_t* state_idx,
+                              int64_t state_slots, int64_t hk_n, int64_t dk,
+                              int64_t hv_n, int64_t dv, float scale) {
+  const int64_t s = blockIdx.y;   // sequence
+  const int64_t hv = blockIdx.x;  // v-head
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t state_slot = state_idx != nullptr ? state_idx[s] : s;
+  if (state_slot < 0 || state_slot >= state_slots) {
+    const int64_t begin = qsl != nullptr ? qsl[s] : s;
+    const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+    for (int64_t t = begin; t < end; ++t)
+      for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x)
+        Store(out, (t * hv_n + hv) * dv + vi, 0.0f);
+    return;
+  }
+  extern __shared__ float smem[];  // [dk] q'  then [dk] k  then [dk] per-K decay
+  float* q_sh = smem;
+  float* k_sh = smem + dk;
+  float* d_sh = smem + 2 * dk;
+  TState* s_head = state + (state_slot * hv_n + hv) * dv * dk;  // [Dv, Dk]
+  const int64_t begin = qsl != nullptr ? qsl[s] : s;
+  const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+  for (int64_t t = begin; t < end; ++t) {
+    for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
+      q_sh[i] = Load(q, (t * hk_n + hk) * dk + i) * scale;
+      k_sh[i] = Load(k, (t * hk_n + hk) * dk + i);
+      d_sh[i] = expf(g[(t * hv_n + hv) * dk + i]);  // per-K-channel decay
+    }
+    __syncthreads();
+    const float beta_t = beta[t * hv_n + hv];
+    for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x) {
+      TState* s_row = s_head + vi * dk;
+      float dot = 0.0f;  // (S * exp(g_channel)) @ k, fused with the per-channel decay
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        const float decayed = Load(s_row, ki) * d_sh[ki];
+        dot += decayed * k_sh[ki];
+      }
+      const float vp = (Load(v, (t * hv_n + hv) * dv + vi) - dot) * beta_t;
+      float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        const float updated = Load(s_row, ki) * d_sh[ki] + vp * k_sh[ki];
+        Store(s_row, ki, updated);
+        o += updated * q_sh[ki];
+      }
+      Store(out, (t * hv_n + hv) * dv + vi, o);
+    }
+    __syncthreads();  // all reads of the staged rows done before next token's load
+  }
+}
+
+template <typename Tin, typename Tout>
+void LaunchKdaScan(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                   const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                   const int32_t* qsl, int64_t n, const GdnArgs& args) {
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v.shape[1], dv = v.shape[2];
+  const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n));
+  const size_t shmem = 3 * static_cast<size_t>(dk) * sizeof(float);  // q' + k + decay
+  KdaScanKernel<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
+      out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+      beta.Ptr<float>(), state.Ptr<float>(), qsl, nullptr, state.shape[0], hk_n, dk, hv_n, dv,
+      args.scale);
+  Check(cudaGetLastError(), "kda scan launch");
+}
+
+void KdaGatedDeltaRuleKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                                 const Tensor& v, const Tensor& g, const Tensor& beta,
+                                 Tensor& state, const Tensor& qsl, const GdnArgs& args) {
+  constexpr const char* name = "kda_gated_delta_rule";
+  VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
+           std::string("cuda ") + name + ": unsupported q dtype (f32/bf16 only)");
+  VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+           std::string("cuda ") + name + ": q/k/v dtypes must match");
+  const int64_t n = state.shape[0];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  if (n == 0 || hv_n == 0 || dv == 0) return;
+  VT_CHECK(n <= kMaxGridY, std::string("cuda ") + name + ": too many sequences (grid.y limit)");
+  VT_CHECK(3 * static_cast<size_t>(dk) * sizeof(float) <= 48 * 1024,
+           std::string("cuda ") + name + ": Dk too large for the shared q'/k/decay staging");
+  cudaStream_t s = AsStream(q);
+  const int32_t* qsl_ptr = qsl.Ptr<int32_t>();
+  if (q_in.dtype == DType::kF32) {
+    if (out.dtype == DType::kF32)
+      LaunchKdaScan<float, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+    else
+      LaunchKdaScan<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+  } else {
+    if (out.dtype == DType::kF32)
+      LaunchKdaScan<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+    else
+      LaunchKdaScan<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n,
+                                                  args);
+  }
+}
+
+// ===========================================================================
 // Chunk-parallel GDN prefill scan (gdn-semantics.md §7 "chunked oracle").
 //
 // Mirrors vLLM's FLA chunked gated delta rule (fla/ops/chunk.py + sub-ops).
@@ -5800,6 +5909,9 @@ struct Registrar {
         OpId::kGdnPackedDecode, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
             &GdnPackedDecodeKernelCuda)));
+    RegisterOp(
+        OpId::kKdaGatedDeltaRule, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(&KdaGatedDeltaRuleKernelCuda)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCUDA,
         reinterpret_cast<void*>(
