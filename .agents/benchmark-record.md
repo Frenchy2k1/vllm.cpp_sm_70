@@ -15252,3 +15252,75 @@ until proven so. Three separate attributions were published from indirect signal
 (op-coverage counts, CPU%, GPU-utilisation%) before anyone instrumented the thing
 that was actually blocking. The dispatch tracer cost minutes and answered it
 outright.
+
+### VK-A2/VK-F: the three named levers, MEASURED — two are dead, one is 55% (2026-08-07, GB10)
+
+The `VK-E` record above named three levers off the back of a 500x/27x gap and
+called them "separately measurable". Measuring them first killed two.
+
+**Instrumented, not inferred.** `VT_VULKAN_DISPATCH_STATS` grew a per-shader TIME
+profile alongside the count histogram, and a new `vulkan-dispatch-floor` benchmark
+sweeps one op across a 65,536x range of element counts.
+
+**Lever 1, "71 of 87 ops on the portable CPU tier" — IRRELEVANT in steady state.**
+The e2e run fires exactly ONE reference-tier op, `kRopeCosSinCache` (op=65), which
+builds the rotary table ONCE at setup. Every op in the per-token loop is already
+native: the histogram is `vt_rms_norm` 904, `vt_matmul` 792, `vt_paged_attn` /
+`vt_qkv_split` / `vt_reshape_and_cache` / `vt_rope_from_cache` / `vt_silu_and_mul`
+224 each, `vt_matmul_coopmat` 112, and 8 apiece of cast/embedding/argmax. The
+count is a REGISTRY-COVERAGE fact and was quoted as a hot-path one.
+
+**Lever 2, per-op synchronous dispatch (`VK-A2`) — CEILING 1.15x, REJECTED as the
+primary lever.** The floor benchmark is the decisive part: `kAdd` costs **0.046
+ms/dispatch and is DEAD FLAT from 256 to 262,144 elements** — a 1,024x change in
+work with no change in time — then finally rises past ~1M. So 0.046 ms is pure
+per-dispatch overhead. Against the model's measured 0.357 ms average, overhead is
+**13%**; the other 87% is real kernel execution. Perfect batching of all 2,952
+dispatches saves 136 ms of 1,054 = **1.15x**, against a 19-27x gap. This is the
+lever I had already published as "the measured bottleneck" and would have built
+first.
+
+**Lever 3, kernel quality — CONFIRMED, and it is where everything is.**
+
+| shader | count | % of GPU time | ms/call |
+|---|---:|---:|---:|
+| `vt_matmul` (scalar) | 792 | **49.3%** | 0.4971 |
+| `vt_rms_norm` | 904 | 18.3% | 0.1619 |
+| `vt_greedy_argmax` | 8 | **10.0%** | **10.0316** |
+| `vt_paged_attn` | 224 | 6.6% | 0.2368 |
+| `vt_matmul_coopmat` | 112 | 6.2% | 0.4455 |
+
+**FIRST FIX: greedy argmax, 10.03 -> 0.53 ms/call (18.9x), share 10.0% -> 0.6%.**
+The shader put ONE INVOCATION on each row and scanned the vocabulary serially; at
+decode there is one row, so `groups=1` walked 151,936 entries on a single lane
+while the device idled. Now one WORKGROUP per row with a tree reduction.
+
+**The gate caught a bug in the first version of that reduction, and it is the
+interesting part.** "Keep the left operand unless the right is strictly greater"
+looks like it reproduces the CPU's first-wins tie-break. It does not: a halving
+tree does NOT combine lanes in index order — lane 0 absorbs lane 16, and
+everything lane 16 already swallowed, long before it meets lane 1. With equal
+maxima at 8 and 900 the kernel returned **900** where the CPU returns 8. A
+different token, from a kernel whose maximum VALUE was perfectly correct. Ties are
+now broken on the INDEX explicitly, which makes the merge associative and
+commutative and therefore correct for any tree shape.
+
+Second subtlety, same fix: `x > best` is false for every NaN, so the CPU can never
+ADOPT one — a NaN only becomes the running best by being the value the scan
+STARTED from, element 0. Seeding every lane from its own first element would
+invent poisoning the CPU does not have, masking a real maximum inside that chunk.
+Only lane 0 seeds from element 0; the rest start at -inf.
+
+**MEASUREMENT DISCIPLINE: absolute totals on this box are unusable.** Five
+identical repeats spread **322.5 to 684.3 ms, a 2.1x swing**, and a cold run read
+799-879 ms — consistent with the recorded GB10 reload-swing effect. Per-shader
+SHARE is stable across the same five runs (`vt_matmul` 54.8% +/- 2.7, argmax 0.58%
++/- 0.08), so shares are what is quoted here and totals are not.
+
+**NEXT: `vt_matmul` at ~55% of GPU time.** It is one invocation per OUTPUT ELEMENT
+with a sequential K loop, so at decode (M=1, MatmulBT) consecutive lanes read
+addresses K*4 bytes apart — every load its own cache line. A GEMV shape with lanes
+splitting K coalesces those reads; that is the next change, and it moves the K
+reduction off the CPU's accumulation order into the NMSE tier, so it needs the
+token-exactness gate rather than an NMSE bound.
+
