@@ -41990,3 +41990,44 @@ because a genuinely new row exists.
   (gate-model regression risk) — NOT landed this campaign; named born-on-runner residual, spec §20.3.
 - Row STAYS `ACTIVE` on the SERVER fold + the last 0.10× speed. Worker was PARKED during GPU work;
   RESTORE at campaign end.
+
+## Surface-coverage audit + the ONE SURFACE recurrence guard land (2026-08-07, `ARCH-ONE-SURFACE`, `row/SURFACE-COVERAGE-AUDIT`, PR #120)
+<!-- state: 2026-08-07T20:35 -->
+
+**What.** The user-directed CLI-fragmentation audit: capabilities keep landing in
+a per-model CLI instead of the shared runner / engine / OpenAI server / C-ABI.
+Code-grounded sweep of all 30 registered archs + the off-registry lanes across
+four surfaces (`.agents/specs/surface-coverage-2026-08-07.md`). **21 of 30 text
+archs are fully on-framework.** Seven gap lanes: (1) MiniMax-H3 video+audio gen
+off-registry, served over `/v1/videos` ONLY via an example-injected `VideoRunner`
+(`api_server.h:167`); (2) Laguna and (3) DeepSeek-V4 registered but engine
+forwards are stubs (`laguna.cpp:156`; `deepseek_v4_registry.cpp:22`) — real decode
+in `laguna-gen`/`deepseek-v4-gen`; (4) transcription (Parakeet/Voxtral/Whisper
+off-registry, `parakeet-transcribe` CLI-only); (5) Kimi-Linear incremental; (6)
+embeddings/pooling (pooler landed, never invoked live); (7) multimodal input over
+HTTP/ABI. Also: `vllm_engine_load` is never CI-gated on a real model load.
+
+**Guard (the deliverable = ONE SURFACE order-of-work item 3).**
+`scripts/check-surface-coverage.py`, two axes, mutation-tested (helper +
+subprocess seams), wired into `scripts/agent-preflight.sh` + CI. Axis 1: every
+`examples/*` unit is a thin client of the public `include/vllm.h` (DERIVED from
+the CMake install rules) or tracked in `scripts/example-abi-allowlist.txt` with a
+fold row — NO permanent exemptions, shrink-only ratchet (`MAX_INTERNAL_REACHING=12`),
+catches BOTH `#include` (`["<]` forms) AND `-I ${CMAKE_SOURCE_DIR}/src` grants.
+Only `examples/cli` is clean; 12 units tracked (incl. the new `parakeet-transcribe`,
+caught on rebase). Axis 2: every `docs/FEATURES.md` `abi-capability-table` row
+names a C-ABI symbol present in `vllm.h` (comments stripped; 7 reachable) or is a
+tracked `embedder-unreachable` row (4). `check-supported-models.py` is NOT a
+substitute (tolerates non-registered lanes).
+
+**Corrections.** FEATURES: Laguna/DeepSeek-V4 speed cells name the `-gen` CLI +
+stub forward. `.agents/specs/one-surface-abi.md`: its ":20-21" "none registered"
+claim was FALSE for 3 of 4 (Laguna/Kimi/DeepSeek-V4 ARE registered, only H3 is
+not) — corrected WITHOUT closing rows; stale sizes fixed; gate marked LANDED.
+
+**Residuals.** REBASED onto `b8493d57` (Kimi #118); `ARCH-ONE-SURFACE` /
+`.agents/specs/one-surface-abi.md` exists, references resolve. Fold lanes are its
+leaves (Kimi runner fold #279, Parakeet ASR #280). Reviewer findings 1-8 applied
+(quoted+angle includes, comment-stripped ABI tokenize, subprocess enforcement
+tests, ratchet equality pin, reachable-row-removal design note, meta-gap note). No
+CUDA build; no perf number owed; STATUS inside its char ratchet.

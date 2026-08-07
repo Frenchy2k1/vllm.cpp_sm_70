@@ -27,6 +27,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
+| Surface coverage (`ARCH-ONE-SURFACE`) | **Guard LANDS** `check-surface-coverage.py` (2 axes): examples+FEATURES caps→ABI or tracked | PR #120 |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -56,11 +57,10 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Triage/audit, `STATUS.md` ratchet and
-   the `AGENTS.md` tiering are DONE. REMAINING: anchor backfill (6 model rows
-   need a DECISION); record-era rollover BLOCKED on `DONE` rows bound to
-   `parity-ledger.md` LINE anchors (re-anchor by ROW ID). ★ The gate SELF-BLINDS
-   on the 10 audited rows (audit §➁a); its fix owes an 8-row adjudication.
+5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
+   `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
+   DECISION); record-era rollover BLOCKED on `DONE` rows bound to
+   `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
@@ -70,8 +70,8 @@ START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
 `--require-role` is the DEFAULT. Queue: 10 rows; backfill 79 rows, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
-OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
-(`ROAD-V1-D6`).
+OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs have
+rows**; llama.cpp's 11 extra devices IN SCOPE, spike-gated (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 

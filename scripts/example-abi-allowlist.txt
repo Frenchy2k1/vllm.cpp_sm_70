@@ -1,0 +1,39 @@
+# Example ABI-boundary allowlist — the TRANSITION TRACKER for scripts/check-surface-coverage.py
+# (axis 1, the example include-boundary lint).
+#
+# TARGET INVARIANT (developer-directed 2026-08-07, the ONE SURFACE directive / row
+# ARCH-ONE-SURFACE, .agents/specs/one-surface-abi.md): every unit under examples/ is a
+# THIN CLIENT of the public surface — the flat C ABI include/vllm.h, the ONLY header
+# `make install` ships (CMakeLists.txt:1757; the packaged vllm_shared PUBLIC-includes
+# exactly that one header, CMakeLists.txt:1712-1717) — never of the internal C++ tree
+# (vllm/..., vt/..., src/...). examples/cli (vllm-cli) is the clean baseline: it
+# `#include "vllm.h"` ONLY and links vllm::shared, so it is NOT listed here.
+#
+# Each line below is an example unit whose sources STILL reach into internal headers,
+# accepted as a KNOWN, TRACKED state so the gate stays green while the fold is scheduled.
+# It is NOT an end state. Per gap the fold order is fixed: (1) GROW the public ABI
+# entry point, (2) REWRITE the example against include/vllm.h, (3) DELETE the parallel
+# implementation. Removing a line here — after the example becomes a clean public-ABI
+# client — is the enforcement gate closing (a stale entry for a now-clean example REDS,
+# exactly like the runner-routing allowlist). A NEW internal-reaching example with no
+# entry REDS: that is the "CLI-only capability landed silently" defect this gate exists
+# to stop.
+#
+# Format: `examples/<unit> | fold=<ROW-ID> | <reason + what is CLI-only>`.
+
+# --- Capability drivers whose FAST PATH is reachable ONLY here, not through the ABI ---
+examples/deepseek_v4_gen | fold=ARCH-ONE-SURFACE | DeepSeek-V4-Flash keep-quant GGUF greedy decode (DeepseekV4ForwardGguf(Cached) + DeepseekV4KvCache) is CLI-only; the registered DeepseekV4ForCausalLM forward is a W3-W8 stub (deepseek_v4_registry.cpp:22). Grow ABI keep-quant GGUF load+decode, rewrite as ABI client, delete the bespoke forward
+examples/laguna_gen | fold=ARCH-ONE-SURFACE | Laguna-S-2.1 keep-quant GGUF (multi-shard) + NVFP4 W4A4 device-resident decode (LagunaForwardGguf(Cached), Marlin residents, fp4-shared) is CLI-only; registered LagunaForCausalLM forward VT_CHECK(false)s on non-bf16 (laguna.cpp:156). Grow ABI, rewrite as client, delete bespoke forward
+examples/kimi_linear_gen | fold=ARCH-ONE-SURFACE | Kimi-Linear-48B bf16-resident streaming loader + §18/§19 paged-incremental decode (ForwardPrefillIncremental/ForwardDecodeStepIncremental/KimiDecodeCache) is CLI-only (the recompute forward IS shared). Grow ABI incremental-decode path, rewrite as client, delete
+examples/parakeet_transcribe | fold=ARCH-ONE-SURFACE | Parakeet/FastConformer ASR (audio transcription) runs only here (parakeet_encoder/parakeet_transducer + parakeet_audio_processor); Parakeet is off-registry (no REGISTER_VLLM_MODEL) and there is no transcription C-ABI. Grow the ABI transcription entry point, rewrite as client, delete the driver
+examples/minimax_h3_gen | fold=ARCH-ONE-SURFACE | The ENTIRE MiniMax-H3 video+audio diffusion pipeline (DiT + text encoder + VAEs + fl2va/ref2va + vision tower + ffmpeg) is CLI-only; MiniMaxH3 is off-registry (no REGISTER_VLLM_MODEL). Grow the video-gen ABI slice (ARCH-ONE-SURFACE order-of-work), rewrite as client, delete the driver glue
+examples/minimax_h3_mux | fold=ARCH-ONE-SURFACE | H3 PPM+WAV->MP4 ffmpeg mux helper (MiniMaxH3BuildMp4MuxArgs + fork/execvp) reaches internal minimax_h3 headers; the video-gen ABI slice should expose the assembled artifact so the mux can be a client (or fold into the video ABI). Grow ABI, rewrite, delete
+examples/server | fold=ARCH-ONE-SURFACE | The reference OpenAI server constructs the engine, metrics, video_runner and mm seam directly from internal C++ headers (LoadedEngine/AsyncLLM, minimax_h3.h, chat_mm). It should stand on the public surface (C ABI, or a curated public C++ API the ABI wraps). Grow the surface, rewrite the server against it
+
+# --- Dev / diagnostic tools: NO permanent exemption (developer-directed 2026-08-07) ---
+# Every one is a transition-tracker like the drivers above; the allowlist only shrinks.
+examples/bench | fold=ARCH-ONE-SURFACE | vllm-bench builds the engine via internal headers (examples/bench/bench_core.h) to measure throughput/latency. Fold: drive the loaded-engine arm through the ABI (a bench entry point / vllm_engine_load timings), then rewrite as a client
+examples/tokenize | fold=ARCH-ONE-SURFACE | Tokenizer diagnostic uses internal gguf_reader.h + tok:: (tokenizer.h). Fold: expose tokenize/detokenize on the ABI (the server already serves /tokenize), then rewrite as a client
+examples/dump_container | fold=ARCH-ONE-SURFACE | GGUF/safetensors container inspector uses 2 internal loader/reader headers (+ its own 136-line sha256). Fold: a container-introspection ABI entry point, then rewrite as a client
+examples/dequant_nvfp4 | fold=ARCH-ONE-SURFACE | NVFP4 dequant diagnostic uses internal nvfp4_dequant.h + safetensors_reader.h. Fold: a dequant/introspection ABI entry point, then rewrite as a client
+examples/quant_gemm_bench | fold=ARCH-ONE-SURFACE | Op-level quant-GEMM GFLOP/s harness includes 5 internal vt/* op headers AND takes a private -I into src/ (examples/CMakeLists.txt, the deepest breach). Fold: an op-bench ABI entry point, then rewrite as a client

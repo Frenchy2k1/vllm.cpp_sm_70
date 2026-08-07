@@ -1557,6 +1557,12 @@ runtime-verified yet.
 
 ## Serving and API notes
 
+- **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
+  `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
+  on-framework; the recurring defect (a capability in a per-model CLI) is in seven
+  lanes. Guard `scripts/check-surface-coverage.py` (two axes, preflight + CI):
+  every `examples/*` unit is a client of `include/vllm.h` or tracked to a fold
+  row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
   GDN and attention-free default off, mirroring vLLM), and it now has an
   end-to-end cache-ON gate on `Qwen/Qwen3-4B` (a shared common prefix reused

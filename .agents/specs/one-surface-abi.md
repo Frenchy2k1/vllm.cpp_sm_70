@@ -17,19 +17,30 @@ outside it did not exist.
 
 ## Audit — this is NOT only video
 
-None of these four architectures appear in `model_registry.cpp`, so none is
-reachable through `vllm_engine_load`:
+**CORRECTED 2026-08-07 (`row/SURFACE-COVERAGE-AUDIT`).** The original claim here —
+"None of these four architectures appear in `model_registry.cpp`" — is FALSE for 3 of 4:
+`LagunaForCausalLM` (`laguna_registry.cpp:131`), `KimiLinearForCausalLM`
+(`kimi_linear_registry.cpp:142`) and `DeepseekV4ForCausalLM` (`deepseek_v4_registry.cpp:150`)
+ARE registered; only MiniMax-H3 is off-registry. Registration did not make the capability
+reachable, though — each registered arch still fails ONE SURFACE differently, so the rows
+stay OPEN. The complete, code-grounded matrix (all 30 archs + every off-registry lane) is
+`.agents/specs/surface-coverage-2026-08-07.md`.
 
-| capability | only reachable via | example size |
-|---|---|---|
-| MiniMax-H3 video+audio generation | `examples/minimax_h3_gen`, `examples/server` `/v1/videos` | 415 lines |
-| Laguna | `examples/laguna_gen` | 415 lines |
-| Kimi-Linear | `examples/kimi_linear_gen` (owns forward logic) | 288 lines |
-| DeepSeek-V4 | `examples/deepseek_v4_gen` | 240 lines |
+| capability | registered? | why still off-surface | only real path via | example size |
+|---|---|---|---|---|
+| MiniMax-H3 video+audio gen | NO | no arch, no video C-ABI; served via example-injected `VideoRunner` | `examples/minimax_h3_gen`, `examples/server` `/v1/videos` | 1293 lines |
+| Laguna | YES | keep-quant/NVFP4 decode example-only; registry forward `VT_CHECK`s non-bf16; GGUF dispatch unreachable | `examples/laguna_gen` | 415 lines |
+| Kimi-Linear | YES | registry leg is a stateless recompute reference; §18/§19 incremental entry points are private | `examples/kimi_linear_gen` | 318 lines |
+| DeepSeek-V4 | YES | KV spec is a "never exercised" stub; registry forward discards attn_meta/kv | `examples/deepseek_v4_gen` | 240 lines |
 
-`examples/server/main.cpp` also carries 54 direct `MiniMaxH3` references, i.e. it
-re-implements wiring rather than consuming a library entry point. So HTTP and FFI
-can drift, and have.
+This table also UNDER-COUNTS: it omits Parakeet ASR (a 5th off-surface capability, landed
+`fd2259d8`) and the partial internal-reachers `minimax_h3_mux`, `bench`, `tokenize`,
+`dump_container`, `dequant_nvfp4`, `quant_gemm_bench` — 12 of 13 example binaries include
+non-public headers today (only `examples/cli` is clean). The full list is the audit spec.
+
+`examples/server/main.cpp` also carries ~32 internal includes (54 direct `MiniMaxH3`
+references), i.e. it re-implements wiring rather than consuming a library entry point. So
+HTTP and FFI can drift, and have.
 
 Three of these own real generation logic, not just argv parsing:
 `kimi_linear_gen`, `minimax_h3_gen`, `server` all reference `DenoiseLoop` /
@@ -112,6 +123,15 @@ embedder produce an MP4 without reinventing the command: the library composes it
    include-boundary companion check (examples/* may include only the public
    exported headers). Being CI-only would let a whole session build on an
    unreachable capability before the first PR run says no.
+   **LANDED 2026-08-07 (`row/SURFACE-COVERAGE-AUDIT`):** `scripts/check-surface-coverage.py`
+   (two axes — the FEATURES capability-reachability check bound to `include/vllm.h`, and the
+   examples/* include-boundary check with the public set DERIVED from the CMake install
+   rules), wired into BOTH `scripts/agent-preflight.sh` and CI, with 46 mutation tests. No
+   permanent dev-tool exemption: every internal-reaching example is a transition-tracker row
+   in `scripts/example-abi-allowlist.txt` pointing at its fold row, shrink-only ratchet. NB:
+   `check-supported-models.py:22-24` is NOT a substitute — it deliberately tolerates
+   non-registered lanes (the exact class Parakeet occupies), so it cannot enforce
+   reachability.
 4. The remaining three (Laguna, Kimi-Linear, DeepSeek-V4), which most likely want
    registry entries rather than bespoke entry points.
 
