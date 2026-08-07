@@ -16,10 +16,14 @@
 //   - e2el: end-to-end per-request latency                 (serve.py:616)
 //   mean/median/std/percentile reduction over each         (serve.py:726-758)
 // Our ADDITION (labeled separately): a prefill-vs-decode token-throughput split
-// — Input(prefill) tok/s = total_input/dur, Output(decode) tok/s =
-// total_output/dur (== serve.py output_throughput) — which is exactly the
-// gate #1 measurement ("prefill AND decode throughput at large concurrency",
-// .agents/gates.md). We drive the engine in DELTA output mode (like a streaming
+// — Input tok/s = total_input/dur, Output(decode) tok/s = total_output/dur
+// (== serve.py output_throughput) — which is exactly the gate #1 measurement
+// ("prefill AND decode throughput at large concurrency", .agents/gates.md).
+// Both divide by the WHOLE run, which is right for a saturated many-request run
+// and misleading at low concurrency; a separate `prefill_throughput` divides by
+// the time actually spent in prefill and is the figure comparable to
+// llama-bench's pp128. See the field comment for how conflating the two
+// produced a bogus cross-engine prefill ratio. We drive the engine in DELTA output mode (like a streaming
 // serve client) so TTFT/ITL are observed the same way serve.py observes them.
 //
 // This header is deliberately header-only + inline so both the CLI
@@ -118,7 +122,16 @@ struct BenchResult {
   std::vector<std::vector<int32_t>> output_token_ids;
   double request_throughput = 0.0;       // req/s
   double output_throughput = 0.0;        // tok/s  (decode)
-  double input_throughput = 0.0;         // tok/s  (prefill) — our split
+  double input_throughput = 0.0;         // tok/s  input/WHOLE run — our split
+  // TRUE prefill rate: input tokens divided by the time actually spent in
+  // prefill (the sum of TTFTs), NOT by the whole run. `input_throughput` above
+  // divides by total duration, which is the right shape for a saturated
+  // many-request run but degenerates badly at low concurrency: for a 1-prompt
+  // 32-in/8-out run it reports 32/E2EL, i.e. it charges the whole DECODE to
+  // prefill. That is how a "~500x behind llama.cpp on prefill" figure got
+  // quoted against llama-bench's pp128, which is prefill-ONLY. This field is
+  // the one comparable to pp128.
+  double prefill_throughput = 0.0;       // tok/s  input/sum(TTFT)
   double total_token_throughput = 0.0;   // tok/s
   double mean_per_stream_decode = 0.0;   // 1000/mean_tpot, tok/s per stream
   // ms statistics (mean/median/p99), like serve.py.
@@ -574,7 +587,11 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   res.input_throughput = dur_s > 0 ? static_cast<double>(total_in) / dur_s : 0.0;
   res.total_token_throughput =
       dur_s > 0 ? static_cast<double>(total_in + total_out) / dur_s : 0.0;
-  (void)sum_prefill;
+  // sum_prefill is the sum of per-request TTFTs, i.e. the time actually spent
+  // producing the input tokens. It was already being accumulated and then
+  // discarded.
+  res.prefill_throughput =
+      sum_prefill > 0 ? static_cast<double>(total_in) / sum_prefill : 0.0;
   const double mean_tpot = Mean(tpots);
   res.mean_per_stream_decode = mean_tpot > 0 ? 1.0 / mean_tpot : 0.0;
   (void)sum_decode;
@@ -659,7 +676,8 @@ inline void PrintReport(const BenchConfig& cfg, const BenchResult& r,
   line_f("Median E2EL (ms):", r.median_e2el_ms);
   line_f("P99 E2EL (ms):", r.p99_e2el_ms);
   sep("Prefill vs Decode split (gate #1)");
-  line_f("Input (prefill) token throughput (tok/s):", r.input_throughput);
+  line_f("Input token throughput (tok/s, over whole run):", r.input_throughput);
+  line_f("Prefill token throughput (tok/s, in/TTFT):", r.prefill_throughput);
   line_f("Output (decode) token throughput (tok/s):", r.output_throughput);
   line_f("Mean per-stream decode rate (tok/s):", r.mean_per_stream_decode);
   if (r.spec_on) {

@@ -15492,4 +15492,73 @@ A CPU-only records/tooling change, no measurement.
   transcription, Kimi-Linear incremental, embeddings/pooling, mm-input) each carry
   a ranked fold in `.agents/specs/surface-coverage-2026-08-07.md`; their speed
   gates are owed by the folds themselves, not by this change.
+### VK-F: Tier-1 fusion NEGATIVE, and the dispatch floor is now 49% (2026-08-07, GB10)
+
+**Two findings that reorder the whole lever list.**
+
+**1. `VT_FUSED_TIER=1` on Vulkan is a NEGATIVE — because it fuses NOTHING.**
+
+The portable fusion framework already exists (`include/vt/recipes.h`,
+`.agents/specs/portable-fusion-framework.md`), Vulkan already registers the
+Tier-1 interpreter (`kFusedChain` -> `vt_fused_chain`), and Qwen3 already calls
+`vt::FusedChain(..., kFusedAddRmsNormStd, ...)` with `VT_FUSED_CHAIN_ADOPT` ON.
+Only `VT_FUSED_TIER` defaulted to 0, so every call was realized as the Tier-0
+composite. That looked like a free lever: flip the flag.
+
+It engages, and it is correct — 456 `vt_fused_chain` dispatches versus 0, gate
+15/15, and opt-125m STRICT 6/6 token-exact under tier 1. **And the dispatch count
+is IDENTICAL in both arms: 2,952.**
+
+    tier 0:  vt_rms_norm 904
+    tier 1:  vt_rms_norm 448  +  vt_fused_chain 456  =  904
+
+`kFusedAddRmsNormStd` is (residual add + RMS norm), and `vt_rms_norm` ALREADY
+does both in a single dispatch through its `has_res` path. There was nothing to
+fuse. Tier 1 swapped a specialized kernel for a generic recipe interpreter and
+lost accordingly: **314.7 ms vs 275.8 ms total GPU, tier 1 faster in only 2 of 8
+interleaved pairs.** `VT_FUSED_TIER` stays 0.
+
+**The durable lesson: fusion that does not REMOVE a dispatch is not fusion.** The
+recipe adoption was real and the framework worked exactly as designed; the recipe
+in play simply described something one kernel already did.
+
+**2. The dispatch floor has grown from 13% to 49% of GPU time.**
+
+This is the growth predicted when `VK-A2` was first measured and set aside. Total
+GPU time fell from ~1,054 ms to 275.8 ms as argmax and the GEMV landed, while the
+per-dispatch floor (0.046 ms x 2,952 = 135.8 ms) did not move at all.
+
+The small ops are now almost pure launch overhead:
+
+| shader | calls | ms/call | vs the 0.046 ms floor |
+|---|---:|---:|---:|
+| `vt_rms_norm` | 904 | 0.0806 | 1.75x |
+| `vt_reshape_and_cache` | 224 | 0.0500 | 1.09x |
+| `vt_silu_and_mul` | 224 | 0.0462 | **1.00x** |
+| `vt_rope_from_cache` | 224 | 0.0433 | **0.94x** |
+| `vt_qkv_split` | 224 | 0.0422 | **0.92x** |
+
+Those 1,800 dispatches cost 113.6 ms of which **73% is launch overhead**. Several
+sit AT or BELOW the measured floor, which is the signature of a kernel that does
+no meaningful work relative to being launched at all.
+
+**So making these kernels faster is pointless; only removing dispatches helps.**
+`VK-A2` (command-buffer batching) is no longer a 1.15x afterthought — it is the
+top lever, and its ceiling is higher than the fence cost alone because batching
+also recovers the pipelining lost when the GPU idles between every submit.
+
+**Fusion is still worth having, but for the DISPATCH COUNT, not the kernel time.**
+The collapsible chain is `qkv_split -> rope_from_cache -> reshape_and_cache`:
+224x3 = 672 dispatches that could be 224, removing 448 launches. `kAttnQkNormRope`
+exists as a recipe but is composite-only — the Tier-1 vocabulary is
+`{kAdd,kMul,kSilu,kSigmoid,kRmsNorm}`, so extending it is shared-framework work
+that every backend inherits, not a Vulkan shader.
+
+**Also corrected here: the "~500x behind on prefill" figure was a metric
+artifact.** `bench_core.h` computed `input_throughput = total_input / WHOLE run
+duration`, so a 1-prompt 32-in/8-out run reported 32/E2EL and charged the entire
+decode to prefill. It was being compared against llama-bench `pp128`, which is
+prefill-ONLY. A true `prefill_throughput = total_input / sum(TTFT)` is now
+reported alongside it; `sum_prefill` was already being accumulated and discarded
+with `(void)sum_prefill`.
 
