@@ -19,6 +19,50 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## KIMI-BF16-STREAM — bf16 residual stream end-to-end REFUTED (122→4/128, KDA repeat-loop destabilization, no speed win); STRICT is NOT reachable by residual-precision (§14-§20 all closed); 122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best; SERVER runner fold scoped (runner aborts on Kimi's KV today) (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, base `origin/main` `2f029a10`, GB10 sm_121a, PR #118)
+
+The #113 follow-on tested the §19-named residual #1 — the bf16 residual stream END-TO-END, framed as
+"the ONE lever both verdicts point at" (STRICT via vLLM bf16 rounding on p7 + speed via killing the 3%
+CastBf16). Implemented STRUCTURALLY (bf16 `DBuf`s for hidden/residual/normed-hidden/block-outputs via
+`vt::FusedChain(kFusedAddRmsNormStd)`, mirroring `deepseek_v2.cpp:479-615`; supersedes the partial §14
+RoundDevBf16 knob), gated behind `VT_KIMI_BF16_STREAM` (default OFF). Clean-from-`origin/main` `2f029a10`
+CUDA build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=…cutlass-4.5.0`, nvcc 13.0.88, Release), built in `/dev/shm`. CPU gate
+`test_kimi_linear_forward` 15/15·875 with the knob OFF (byte-identical); knob ON keeps the greedy-TOKEN
+state-carry check (incremental==recompute) but trips case-(l)'s 1e-5 logit tol (too tight for bf16).
+
+**GB10 full 48.9B 128-gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored,
+min-avail 18G, NO reboot; §12 golden md5 `bfa5bdbf…`; CONTROL reproduces §19's 122 EXACTLY, 3×):**
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1 DEVICE_KDA_CHUNK=1`, `--incremental`) | /128 | tok/s (steady) |
+|---|---|---|---|
+| CONTROL (f32 stream) | — | **122** | 18.9-19.0 |
+| **+bf16 stream** | `VT_KIMI_BF16_STREAM=1` | **4** | 19.8 |
+| bf16 stream, recompute+f64-island (diagnostic) | `VT_KIMI_BF16_STREAM=1` (no device-KDA, non-incremental) | **5** | 1.47 |
+
+- **REFUTED on BOTH axes.** bf16 residual REGRESSES 122→4/128: the KDA recurrence DESTABILIZES into
+  degenerate REPEAT LOOPS (p1 `15383,387,15383,387…`, p2 `220,16,25,…`, p4 `220,2466,25,…`) — the
+  §14/§15 "bf16 destabilizes KDA" pathology, confirmed STRUCTURALLY. **No speed win** (18.9→19.8, within
+  noise; the removed CastBf16 is a memory-bound decode's ~3% that overlaps the GEMVs, offset by the added
+  `ToStream` + bf16-norm-weight casts).
+- **Diagnostic (5/128 vs §14's f32-variance BF16_RESIDUAL=106):** the STRUCTURAL stream computes the
+  RMSNorm variance over the bf16-ROUNDED residual (vLLM's ACTUAL `fused_add_rms_norm` order,
+  `cpu_ops.cpp:326-332`) — MORE vLLM-faithful yet EVEN LESS stable than §14's f32-variance approximation.
+  Both bf16 variants sit far below the f32 control's 122 ⇒ the direction is dead in ALL variance
+  treatments.
+- **STRICT verdict, definitive:** with §14 (host-precision plateau 120), §15 (device-KDA 122), §16
+  (device-MLA 109), §18 (chunk-every-step 102), and now bf16-stream (4-5) — **p7 is an INTRINSIC near-tie;
+  122/128 @ 18.9 tok/s (0.90× vLLM) is Kimi-Linear's coherent best; STRICT is NOT reachable by residual-
+  precision or device-island approximation.** The only remaining STRICT/speed path is vLLM's ACTUAL fused
+  kernels via the full runner fold.
+- **SERVER runner fold (ARCH-ONE-SURFACE req 4): scoped, enabling-blocked.** The runner ABORTS on Kimi's
+  KV today — `VT_CHECK(mamba_spec->shapes == …)` at `runner.cpp:489-493` fails because Kimi lacks the
+  qwen3_5 `linear_*` config fields + `layer_types` (its KDA split lives in `linear_attn_config`). The fold
+  = synthesize layer_types + source GDN geometry from `linear_attn_config` + a Kimi KDA-paged block
+  (`KdaChunkPrefill`/`KdaGatedDeltaRule` over `gdn_state`) + a NoPE-MLA-paged block (`ForwardMlaAttentionBlock`
+  identity-RoPE) + bind in `ForwardDevice`; a multi-brick runner-touching integration (gate-model regression
+  risk), NOT landed this campaign. `VT_KIMI_BF16_STREAM` kept default-OFF as a documented-measured-negative.
+
 ## KIMI-PAGED-INCREMENTAL — paged-incremental decode LANDS the 5× speed win (4.23→18.9 tok/s, 0.20×→0.90× vLLM); Gate A token-identical to recompute; STRICT NOT reached (p7 intrinsic near-tie, 122/128); decode is 90% cuBLAS-GEMV-parity (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`, base `origin/main` `68b394bc`, commit `f9ba4a9c`, GB10 sm_121a, PR #113)
 
 Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 18-21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy` (md5 `bfa5bdbf…`). vLLM ~21 stands from #111 (re-run only ours). The §18 lever (e) built: prefill-once (KDA recurrent+conv state carried, NoPE-MLA latent-KV cached) + recurrent decode-step; mirrors vLLM `kimi_gdn_linear_attn._forward` (prefill=`chunk_kda_with_fused_gate` / decode=`fused_recurrent_kda`) at `vllm-src` `a4e3cb4`.

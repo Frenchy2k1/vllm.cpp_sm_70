@@ -119,7 +119,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
-| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Paged-incremental decode (§19) MEASURED GB10: 18.9 tok/s (4.5× over recompute, 0.90× vLLM ~21)**; Gate A token-identical to recompute (122/128); not STRICT (p7 near-tie) | default off (opt-in `--incremental`); 5× decode gap (0.20×) closed to ~1.1× |
+| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Paged-incremental decode (§19) GB10: 18.9 tok/s (0.90× vLLM) @ 122/128 = coherent best**; STRICT unreachable (bf16 stream REFUTED §20/#118 122→4/128; p7 intrinsic near-tie) | CLI opt-in `--incremental`; SERVER fold scoped (ARCH-ONE-SURFACE req 4; runner aborts on Kimi KV) |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
@@ -252,7 +252,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Paged-incremental decode (§19) MEASURED GB10: 18.9 tok/s = 4.5× over recompute 4.23, 0.90× vLLM ~21**; Gate A token-identical to recompute (122/128); NOT STRICT (p7 intrinsic near-tie), default OFF | speed lever LANDS (5× gap 0.20×→0.90×); STRICT owed (p7); residual = per-step GEMVs + host orchestration |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Paged-incremental (§19) GB10: 18.9 tok/s (0.90× vLLM) @ 122/128 = coherent best**; STRICT unreachable: bf16 stream REFUTED (§20/#118: 122→4/128), §14-§20 all levers closed, p7 near-tie | speed lever LANDS (0.90×); STRICT closed as near-tie; SERVER fold scoped (ARCH-ONE-SURFACE req 4) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
