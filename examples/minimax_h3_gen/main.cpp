@@ -31,6 +31,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cmath>
@@ -51,8 +53,10 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/multimodal/qwen3vl_processor.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vt/backend.h"
+#include "vt/dtype.h"
 
 namespace {
 
@@ -118,6 +122,31 @@ std::vector<float> ReadPpmAsChw(const std::string& path, int64_t* out_h, int64_t
   return chw;
 }
 
+// A binary PPM (P6) reader that returns HWC uint8 [0,255] -- the layout the shared
+// Qwen3-VL image processor expects (it does its own rescale + 0.5/0.5 normalize).
+std::vector<uint8_t> ReadPpmAsHwcU8(const std::string& path, int64_t* out_h, int64_t* out_w) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open " + path);
+  std::string magic;
+  in >> magic;
+  if (magic != "P6") throw std::runtime_error(path + ": not a binary PPM (P6)");
+  auto next_int = [&]() {
+    int v = 0;
+    while (in >> std::ws, in.peek() == '#') { std::string skip; std::getline(in, skip); }
+    in >> v;
+    return v;
+  };
+  const int w = next_int(), h = next_int(), maxv = next_int();
+  if (w <= 0 || h <= 0 || maxv <= 0) throw std::runtime_error(path + ": bad PPM header");
+  in.get();  // the single whitespace byte before the payload
+  std::vector<uint8_t> rgb(static_cast<size_t>(w) * h * 3);
+  in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+  if (!in) throw std::runtime_error(path + ": truncated PPM payload");
+  if (out_h != nullptr) *out_h = h;
+  if (out_w != nullptr) *out_w = w;
+  return rgb;
+}
+
 // The WAV reader lives in the LIBRARY (MiniMaxH3ReadWav), next to the writer and
 // unit-gated with it; this only opens the file. Returns CHANNEL-MAJOR samples in
 // [-1, 1], mono repeated up to kMiniMaxH3AudioChannels, and REFUSES a sample rate
@@ -172,6 +201,7 @@ int main(int argc, char** argv) {
   std::string first_frame_path, last_frame_path;
   std::string decode_latent_path;  // diagnostic: decode a dumped VAE-input latent
   std::string roundtrip_path;      // diagnostic: encode->decode a real image
+  std::string prompt_image_path;   // diagnostic: run an image through the vision tower
   std::vector<std::string> ref_image_paths;
   std::string ref_video_prefix, ref_audio_path;
   // The served checkpoint PARTITION. Community GGUF/NVFP4 files strip the release
@@ -203,6 +233,7 @@ int main(int argc, char** argv) {
       else if (f == "--dump-params") dump_params = true;
       else if (f == "--decode-latent") decode_latent_path = Need(argc, argv, ++i, f);
       else if (f == "--roundtrip") roundtrip_path = Need(argc, argv, ++i, f);
+      else if (f == "--prompt-image") prompt_image_path = Need(argc, argv, ++i, f);
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -229,12 +260,15 @@ int main(int argc, char** argv) {
     // no VAEs, no conditioning, no output path. Requiring them would make the one
     // tool that works on a checkpoint too large to load unusable on exactly that
     // checkpoint.
+    // --prompt-image runs the vision tower ONLY (from --encoder); it needs no DiT/VAE/out.
+    const bool vision_probe = !prompt_image_path.empty();
     const bool diag_vae_only = !decode_latent_path.empty() || !roundtrip_path.empty();
     const bool need_vaes = !denoise_only && !dump_params && !diag_vae_only;
     const bool need_cond = !dump_params && !diag_vae_only;
-    // --decode-latent / --roundtrip need NO DiT and NO conditioning (their own blocks
-    // validate their inputs); the shared check below would otherwise reject --dit.
-    if (!diag_vae_only &&
+    // --decode-latent / --roundtrip / --prompt-image need NO DiT and NO conditioning
+    // (their own blocks validate their inputs); the shared check below would otherwise
+    // reject --dit.
+    if (!diag_vae_only && !vision_probe &&
         (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
          (need_vaes && out_path.empty()) ||
          (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {
@@ -414,6 +448,72 @@ int main(int argc, char** argv) {
                 vllm::MiniMaxH3WritePpmFrame(result.frames, result.frame_shape, 0));
       std::cerr << "roundtrip: wrote " << workdir << "/roundtrip.ppm ("
                 << result.frame_shape.w << "x" << result.frame_shape.h << ")\n";
+      return 0;
+    }
+
+    // --- --prompt-image DIAGNOSTIC: route a real image through the shared Qwen3-VL
+    // image processor + the encoder's VISION tower, loaded from the encoder GGUF's
+    // visual.* tensors (the piece the record reconciliation found missing, spec §8.8).
+    // Reports the conditioning feature stats -- the REAL-WEIGHTS proof that the vision
+    // tower now runs. Scattering the merged/deepstack features into the DiT-conditioning
+    // path (merge into prompt_embeds + DeepStack inject into the device text tower) is
+    // the tracked residual; this probe stops after the tower.
+    if (!prompt_image_path.empty()) {
+      if (encoder_path.empty())
+        throw std::runtime_error("--prompt-image needs --encoder (the vision weights live in it)");
+      if (device_name != "cuda")
+        throw std::runtime_error(
+            "--prompt-image needs --device cuda (the vision tower is device-resident)");
+      std::cerr << "loading encoder vision tower from " << encoder_path << "\n";
+      const vllm::GgufFile ef = vllm::GgufFile::Open(encoder_path);
+      const vllm::multimodal::Qwen3VLVisionConfig vcfg = vllm::MiniMaxH3EncoderVisionConfig();
+      const vllm::multimodal::Qwen3VLVisionWeights vw = vllm::LoadQwen3VLVisionFromGguf(ef, vcfg);
+      std::cerr << "  vision weights: depth=" << vcfg.depth << " hidden=" << vcfg.hidden_size
+                << " heads=" << vcfg.num_heads << " out=" << vcfg.out_hidden_size
+                << " deepstack=" << vw.deepstack_mergers.size() << "\n";
+
+      int64_t ih = 0, iw = 0;
+      const std::vector<uint8_t> rgb = ReadPpmAsHwcU8(prompt_image_path, &ih, &iw);
+      std::cerr << "  image " << iw << "x" << ih << "\n";
+      vllm::multimodal::Qwen3VLProcessorConfig pcfg;  // patch16/temporal2/merge2/0.5-norm
+      pcfg.merge_size = static_cast<int>(vcfg.spatial_merge_size);
+      const vllm::multimodal::Qwen3VLImageProcessor proc(pcfg);
+      const vllm::multimodal::ImageKwargs kw = proc.ProcessImage(rgb.data(), ih, iw);
+      const std::array<int64_t, 3> grid = kw.image_grid_thw;
+      const int64_t tokens = grid[0] * grid[1] * grid[2];
+      const int64_t merge = vcfg.spatial_merge_size * vcfg.spatial_merge_size;
+      std::cerr << "  grid_thw=[" << grid[0] << "," << grid[1] << "," << grid[2]
+                << "] tokens=" << tokens << " merged=" << (tokens / merge) << "\n";
+
+      vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCUDA);
+      vllm::multimodal::Qwen3VLVisionCapture cap;
+      const std::vector<float> tower = vllm::multimodal::Qwen3VLVisionForward(
+          kw.pixel_values_bf16, grid, vw, vcfg, backend, &cap);
+      const int64_t nm = tokens / merge;
+      const int64_t width =
+          vcfg.out_hidden_size *
+          (1 + static_cast<int64_t>(vcfg.deepstack_visual_indexes.size()));
+      auto stats = [&](const std::vector<float>& v, const char* tag) {
+        double s = 0, s2 = 0, mx = 0;
+        bool fin = true;
+        for (float f : v) {
+          if (!std::isfinite(f)) fin = false;
+          s += f;
+          s2 += double(f) * f;
+          mx = std::max(mx, std::fabs(static_cast<double>(f)));
+        }
+        const double n = v.empty() ? 1.0 : static_cast<double>(v.size());
+        std::cerr << "  " << tag << ": n=" << v.size() << " finite=" << (fin ? "yes" : "NO")
+                  << " mean=" << (s / n) << " rms=" << std::sqrt(s2 / n) << " maxabs=" << mx
+                  << "\n";
+      };
+      std::cerr << "  tower out = [" << nm << ", " << width << "]\n";
+      stats(tower, "tower_concat");
+      stats(cap.merger_out, "merged");
+      for (size_t d = 0; d < cap.deepstack_out.size(); ++d)
+        stats(cap.deepstack_out[d], ("deepstack_" + std::to_string(d)).c_str());
+      std::cout << "prompt-image: vision tower RAN on real weights; merged=[" << nm << ","
+                << vcfg.out_hidden_size << "] + " << cap.deepstack_out.size() << " deepstack\n";
       return 0;
     }
 

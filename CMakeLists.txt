@@ -500,6 +500,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_vae_loader.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_gguf.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
+  src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp

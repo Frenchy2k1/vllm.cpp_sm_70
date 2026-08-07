@@ -40134,3 +40134,87 @@ this <1 GiB microbench) - run-1 data is on disk and decisive.
 
   Still on the reference tier: quant, MoE, GDN/MLA, the rotary TABLE build and
   every sampler beyond greedy argmax.
+## 2026-08-07T01:45 - MiniMax-H3 encoder VISION TOWER — record reconciled + real-weights loader wired (row/H3-CONDITIONED-E2E, helper, DRAFT PR)
+<!-- state: 2026-08-07T01:45 -->
+
+**Record reconciliation (the mission's first ask — do not re-port what exists).** Two prior
+lanes contradicted: #26/W3 recorded the vision tower "W3 COMPLETE … FULL vision tower at
+6.0e-8 … only the MM processor remains" (spec :101,:162-163); #77 recorded "encoder vision
+tower still unported" (:565-566). Read the actual code — BOTH are true of DIFFERENT halves:
+- The tower MATH exists as a CPU scalar f32 reference: `MiniMaxH3VisionBlockForward`
+  (`minimax_h3_encoder.cpp:311`), `MiniMaxH3VisionPosEmbedInterpolate` (:430),
+  `MiniMaxH3VisionRotary` (:500), `PatchMerger` (:545), `MiniMaxH3VisionTowerForward` (:572).
+  Gated ONLY in `test_minimax_h3.cpp` (:3942/:4041) at REDUCED DIMS with SYNTHETIC weights.
+- It is NEVER wired to real weights: `LoadMiniMaxH3EncoderFromGguf`
+  (`minimax_h3_encoder_gguf.cpp:47`) loads the TEXT tower only (`model.layers.*`+embed) and
+  SKIPS every `visual.*` tensor; `MiniMaxH3EncoderTextForwardDevice`
+  (`minimax_h3_encoder_device.cpp:103`) is text-only with NO deepstack arg; the driver
+  (`examples/minimax_h3_gen/main.cpp:476-547`) + server run text only. So: math CPU-gated
+  synthetic, ZERO real-weights wiring (no `visual.*` loader, no image→patch path on H3, no
+  device vision forward, no merge/DeepStack inject). #26 understated (loader/forward/inject
+  all absent), #77 was right in what matters. `MiniMaxH3VisionTowerForward` reads every weight
+  as a FLAT f32 buffer keyed by name (dims from config), so a loader need only produce correct
+  flat dequant.
+
+**Encoder-arm decision — reuse in place, NO download (disk floor 15G / ~23G free honoured).**
+The on-box encoder `~/h3fp4/ckpt/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` (14 GiB, ComfyUI-format,
+already serving TEXT conditioning) DOES carry the full vision tower — MEASURED via a minimal
+GGUF parser: `visual.blocks.{0..26}` (27; Q4_K/Q5_K), `visual.patch_embed.proj.weight` (F16
+`[16,16,6,1152]`), `visual.pos_embed.weight` (F16 `[2304,1152]`=48²), `visual.merger.*`, and
+`visual.deepstack_merger_list.{0,1,2}` (3 real DeepStack mergers). Names map 1:1 to
+`Qwen3VLVisionWeights`. Geometry (checkpoint + state.md :23310-23318, the Qwen3.6-27B vision
+config that shares this tower): hidden 1152 / 16 heads (hd 72) / depth 27 / intermediate 4304 /
+out_hidden 5120 / patch 16 / temporal 2 / merge 2 / pos 2304. The ONLY value not in the
+weights-only GGUF is `deepstack_visual_indexes` (which text layers the DeepStack taps inject
+into) — inferred, flagged as the residual for a bit-correct conditioned render.
+
+**Reuse path (mission-mandated).** The image processor already exists + is gated:
+`multimodal::Qwen3VLImageProcessor::ProcessImage` (patch16/temporal2/merge2/0.5-norm →
+pixel_values+grid_thw), `ExpandImagePlaceholders`; the device tower
+`multimodal::Qwen3VLVisionForward` + `PrepareVisionDeviceWeights` (`qwen3_vl_vision.cpp`).
+Only NEW code is the GGUF `visual.*`→`Qwen3VLVisionWeights` loader, mirroring the safetensors
+`LoadQwen3VLVisionWeights` (`qwen3_vl.cpp:417`) but dequantizing Q4_K/Q5_K (ComfyUI reshapes
+non-256-aligned rows to ne0=256; dequant preserves the flat row-major order the tower reads
+as `[out,in]`) + converting F16 patch/pos.
+
+**IN FLIGHT this row:** the GGUF vision loader + a CPU/real-weights vision-tower gate + driver
+`--prompt-image` probe. HONEST residual: the full vision-ENRICHED DiT render (DeepStack scatter
+into the DEVICE text tower changing the frames) needs the exact deepstack indexes + a
+device-text DeepStack/merge extension + an on-box GPU render; recorded in the benchmark record.
+Records: spec §8.8, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Pre-existing
+preflight red (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+## 2026-08-07T03:20 - MiniMax-H3 vision tower GB10-VERIFIED on real weights; fl2va COHERENT, ref2va STILL GRIDS (row/H3-CONDITIONED-E2E, helper, PR #86)
+<!-- state: 2026-08-07T03:20 -->
+
+Landed on dgx (git-archive of HEAD over `~/h3fp4/src`, golden md5 unchanged, incremental CUDA
+build, flock, worker parked). New loader `LoadQwen3VLVisionFromGguf` + CPU gate + driver
+`--prompt-image` probe.
+
+**Deliverable 1 (vision tower → real weights) DONE + VERIFIED.** CPU gate `test_minimax_h3 ::
+"the encoder GGUF visual.* loader dequantizes the vision tower"` passes standalone (59
+assertions). Real-weights probe on dgx: `--prompt-image` loaded the real `visual.*` tower (27
+blocks / hidden 1152 / 16 heads / out 5120 / 3 DeepStack mergers), stock Qwen3VLImageProcessor
+→ grid [1,32,32]=1024 tokens→256 merged, `Qwen3VLVisionForward` → [256,20480] ALL FINITE +
+non-degenerate (merged rms 1.45 / maxabs 29.1 = Qwen massive-activation; 3 deepstack finite).
+
+**Deliverable 2 renders (frame-sanity, visually inspected).**
+- **fl2va COHERENT (PASS):** FL2VA GGUF `--dequant-bf16` (~66 GB, free 117→23 G, no OOM) +
+  real `--first-frame` (VAE-keyframe) + `--partition fl2va`, 512×512/22f/12steps. All 22 frames
+  a coherent photorealistic orange cat on a wooden table matching the conditioning frame — no
+  grid. (VAE-keyframe path, not the vision tower.)
+- **ref2va STILL GRIDS (FAIL, honest vs the mission's expectation):** Ref2VA NVFP4
+  `--fp4-resident` (~16 GB, free→63 G) + real `--ref-image` + `--partition ref2va`,
+  256×256/22f → every frame a multicolour patch grid. Landing the tower LOADER does NOT fix it:
+  it is a loader+probe, NOT yet scattered into the DiT render-conditioning, so this render never
+  used it. fl2va (same session) is coherent ⇒ DiT/VAE/partition sound; the ref2va grid is
+  specific to the ref2va conditioning assembly. The `--ref-video` VAE encode is a slow
+  single-thread CPU 3D-CNN path (abandoned the 5×512 attempt at 98% CPU / 0% GPU).
+
+**RESIDUAL (the true deliverable-2 fix):** scatter the vision-tower merged features into
+prompt_embeds + DeepStack inject into the DEVICE text tower (`MiniMaxH3EncoderTextForwardDevice`
+has no deepstack arg yet) + confirm the exact `deepstack_visual_indexes` (inferred {8,16,24}) —
+then re-test whether the vision-enriched prompt fixes ref2va. Suite note: full `test_minimax_h3`
+SIGSEGVs at an UNRELATED CUDA case (line 3503) that PASSES in isolation (585) and runs before
+the new case — pre-existing cross-test CUDA resource-accumulation flake, not this change.
+Box left clean (no procs, GPU idle, locks released, worker parked, my artifacts pruned, ckpts
+kept). Records: spec §8.8 + §8.2, STATUS/BENCHMARKS/FEATURES, benchmark-record, NOW.
