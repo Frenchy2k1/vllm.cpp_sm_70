@@ -9,6 +9,38 @@ request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
 `CLAIM-ENG-RELEASE-BINARIES-SPIKE` in draft PR
 [#129](https://github.com/mudler/vllm.cpp/pull/129).
 
+<!-- release-binary-contract:begin -->
+identity=ENG-RELEASE-BINARIES
+lifecycle=SPIKE
+primary_cuda_artifact=one-fat-binary-per-os-host-abi
+primary_cuda_sms=80,86,87,89,90a,100a,103a,110,120a,121a
+per_sm_cuda=optional-non-primary
+primary_cpu_artifact=one-adaptive-binary-per-os-host-abi
+x86_64_baseline=portable-sse2-without-avx2
+work_W12_policy=optional-non-blocking
+archive_claims=pending
+runtime_claims=pending
+required_anchor_paths=.agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,.agents/coordination.md,.agents/state.md,docs/STATUS.md,docs/BENCHMARKS.md
+work_W1=
+work_W2=W1
+work_W3=
+work_W4=
+work_W5=
+work_W6=
+work_W7=W1,W2,W3,W4,W5,W6
+work_W8=W5,W7
+work_W9=W3,W4,W5,W6,W7
+work_W10=W1,W2,W5,W6,W7
+work_W11=W5,W6,W7
+work_W12=W1,W2,W5,W6,W7
+work_W13=W5,W7,W8,W9,W10,W11
+<!-- release-binary-contract:end -->
+
+The block above is consumed by `scripts/check-release-binary-contract.py`; its
+values and the human-readable work table below must change together through a
+new reviewed design decision. In particular W12 is optional and is deliberately
+absent from W13's dependency set.
+
 ## Scope and product contract
 
 The deliverable is a downloadable, backend-specific `vllm-server` bundle. The
@@ -380,21 +412,21 @@ Each work unit is a separate claim with its own red-first checker change and
 fresh review. No unit advances this row beyond `ACTIVE` until its gates pass;
 the present checkpoint stays `SPIKE`.
 
-| Work | Deliverable | Exit gate |
-|---|---|---|
-| W1 | cross-family CUDA fat-build prerequisite: per-source gencode narrowing over all ten supported SMs | clean x86_64-host fat build; per-TU `cuobjdump` mutation proves every compatible SM present and every incompatible SM absent |
-| W2 | multi-SM Triton AOT embedding, namespacing, manifest and exact runtime dispatch | all six available trees coexist in one fat binary; exact-SM dispatch tests plus portable fallback for the four unavailable trees; wrong-tree mutation red |
-| W3 | x86_64 CPU ISA-dispatch inventory and completion | SSE2/portable baseline runs without AVX2; current F16C/AVX2/AVX-512 tiers forced and executed; exact OS-state probes; VNNI/AMX listed only for real gated kernels; no `-march=native` |
-| W4 | aarch64 CPU ISA-dispatch inventory and completion | NEON/portable baseline plus independently forced DotProd/i8mm where kernels exist; exact Linux HWCAP/Darwin sysctl gates; poor/rich host or emulation execution |
-| W5 | versioned release-manifest generator and schema with independent per-SM and per-CPU-tier evidence | fixtures distinguish absent, false, failed and true; compiled tiers/SMs, required probes, dependencies and host ABI are mandatory |
-| W6 | canonical `vllm-server` output name, install component, and staging/package target for the existing static-core server | install into empty prefix; extracted help smoke; existing library install unchanged |
-| W7 | staged archive validator: allowlist, dependency/RPATH, fat-SM/AOT and adaptive-CPU audits, SHA256, VERSION, licenses and SPDX SBOM | Linux fixture/archive tests red-first; no build paths, missing SM, unsafe ISA tier or undeclared dependency accepted |
-| W8 | least-privilege dry-run/tag workflow, immutable artifact handoff, provenance and protected publish stages | permissions checker plus dry run proves no release is created and publish cannot consume unverified bytes |
-| W9 | primary adaptive CPU bundles: Linux glibc x86_64+aarch64 and experimental x86_64 musl literal-static | glibc binaries execute baseline and supported rich tiers on matching hosts/emulation before stable; musl remains preview |
-| W10 | primary Linux CUDA fat bundles for x86_64 and aarch64 host ABIs | each extracted archive contains all ten SMs and six exact AOT trees; per-SM evidence remains independent; no host ABI is inferred from the other |
-| W11 | macOS arm64 native-Metal/MLX and Linux Vulkan bundles | native Metal runtime-gated; MLX/Vulkan preview until exact archive gates; dependencies and install names audited |
-| W12 | optional single-SM CUDA diagnostic/performance variants | generated from the same explicit matrix and evidence; never advertised as the primary KISS download or used to bypass W10 |
-| W13 | release index/docs and retention policy generated from manifests | every link, checksum, channel, host ABI, compiled tier/SM, driver boundary and limitation matches published bytes |
+| Work | Deps | Deliverable | Exit gate |
+|---|---|---|---|
+| W1 | — | cross-family CUDA fat-build prerequisite: per-source gencode narrowing over all ten supported SMs | clean x86_64-host fat build; per-TU `cuobjdump` mutation proves every compatible SM present and every incompatible SM absent |
+| W2 | W1 | multi-SM Triton AOT embedding, namespacing, manifest and exact runtime dispatch | all six available trees coexist in one fat binary; exact-SM dispatch tests plus portable fallback for the four unavailable trees; wrong-tree mutation red |
+| W3 | — | x86_64 CPU ISA-dispatch inventory and completion | SSE2/portable baseline runs without AVX2; current F16C/AVX2/AVX-512 tiers forced and executed; exact OS-state probes; VNNI/AMX listed only for real gated kernels; no `-march=native` |
+| W4 | — | aarch64 CPU ISA-dispatch inventory and completion | NEON/portable baseline plus independently forced DotProd/i8mm where kernels exist; exact Linux HWCAP/Darwin sysctl gates; poor/rich host or emulation execution |
+| W5 | — | versioned release-manifest generator and schema with independent per-SM and per-CPU-tier evidence | fixtures distinguish absent, false, failed and true; compiled tiers/SMs, required probes, dependencies and host ABI are mandatory |
+| W6 | — | canonical `vllm-server` output name, install component, and staging/package target for the existing static-core server | install into empty prefix; extracted help smoke; existing library install unchanged |
+| W7 | W1, W2, W3, W4, W5, W6 | staged archive validator: allowlist, dependency/RPATH, fat-SM/AOT and adaptive-CPU audits, SHA256, VERSION, licenses and SPDX SBOM | Linux fixture/archive tests red-first; no build paths, missing SM, unsafe ISA tier or undeclared dependency accepted |
+| W8 | W5, W7 | least-privilege dry-run/tag workflow, immutable artifact handoff, provenance and protected publish stages | permissions checker plus dry run proves no release is created and publish cannot consume unverified bytes |
+| W9 | W3, W4, W5, W6, W7 | primary adaptive CPU bundles: Linux glibc x86_64+aarch64 and experimental x86_64 musl literal-static | glibc binaries execute baseline and supported rich tiers on matching hosts/emulation before stable; musl remains preview |
+| W10 | W1, W2, W5, W6, W7 | primary Linux CUDA fat bundles for x86_64 and aarch64 host ABIs | each extracted archive contains all ten SMs and six exact AOT trees; per-SM evidence remains independent; no host ABI is inferred from the other |
+| W11 | W5, W6, W7 | macOS arm64 native-Metal/MLX and Linux Vulkan bundles | native Metal runtime-gated; MLX/Vulkan preview until exact archive gates; dependencies and install names audited |
+| W12 | W1, W2, W5, W6, W7 | optional single-SM CUDA diagnostic/performance variants | generated from the same explicit matrix and evidence; never advertised as the primary KISS download or used to bypass W10 |
+| W13 | W5, W7, W8, W9, W10, W11 | release index/docs and retention policy generated from manifests | every link, checksum, channel, host ABI, compiled tier/SM, driver boundary and limitation matches published bytes |
 
 ROCm remains blocked outside these work units until its backend row first
 compiles on AMD hardware. A new lane is added by changing this matrix and its

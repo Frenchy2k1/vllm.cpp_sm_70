@@ -56,6 +56,7 @@ done
 
 CHECKERS=(
   check-agent-record
+  check-release-binary-contract
   check-role-discipline
   claim-view
   check-readme-structure
@@ -74,6 +75,7 @@ CHECKERS=(
 
 SUITES=(
   test_agent_record
+  test_check_release_binary_contract
   test_agent_role
   test_agent_onboard
   test_claim_view
