@@ -15710,3 +15710,47 @@ Vulkan answer and is not built.
 **Blinding your own instrument is a cost of the optimisation, and it should be
 recorded as one.** Every lever this session was found with that profile.
 
+### GPU timestamp profiling restored — and the workload is now HOST-BOUND (2026-08-07, GB10)
+
+`VK-A2` blinded the per-shader time profile (one fence per batch, nothing to
+attribute). GPU timestamp queries restore it, and they are strictly BETTER
+evidence than what they replace: `vkCmdWriteTimestamp` brackets each dispatch on
+the DEVICE timeline, so this measures GPU execution rather than a host-side fence
+wait that also contained launch latency.
+
+Probed, not assumed: `timestampComputeAndGraphics` and a non-zero
+`timestampPeriod`, else profiling stays off and says so. The pool and the
+timestamp commands exist only under `VT_VULKAN_DISPATCH_STATS`, so production
+pays nothing.
+
+**MEASURED GPU TIME, batching on, Qwen3-0.6B decode:**
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 792 | 42.2 | **51.8%** | 0.0533 |
+| `vt_paged_attn` | 224 | 13.0 | 15.9% | 0.0579 |
+| `vt_matmul_coopmat` | 112 | 11.9 | 14.6% | 0.1061 |
+| `vt_rms_norm` | 904 | 9.2 | 11.3% | 0.0102 |
+| `vt_rope_from_cache` | 224 | 1.5 | 1.8% | 0.0066 |
+| `vt_reshape_and_cache` | 224 | 1.0 | 1.3% | 0.0047 |
+| `vt_silu_and_mul` | 224 | 0.9 | 1.1% | 0.0039 |
+| `vt_qkv_split` | 224 | 0.8 | 1.0% | 0.0038 |
+| **TOTAL** | 2952 | **81.4** | | |
+
+**★ THE HEADLINE: GPU busy is 81.4 ms of a 314.5 ms run — 26%. SEVENTY-FOUR
+PERCENT OF THE RUN IS HOST-SIDE.** Before `VK-A2` the same workload was ~276 ms of
+GPU time in ~1,092 ms. Batching removed 195 ms of GPU time and, in doing so,
+moved the bottleneck OFF the GPU entirely.
+
+**Every remaining GPU-side lever is now bounded by 26%.** Even an infinitely fast
+GEMM buys at most 51.8% of 26% = 13% of the run. The next lever is host
+orchestration — the same conclusion the CUDA campaign reached
+(`profile-full-step-not-just-kernels`), arrived at here from the opposite
+direction.
+
+**It also settles the fusion question DIRECTLY** rather than by subtraction:
+`qkv_split` 0.0038, `silu_and_mul` 0.0039, `reshape_and_cache` 0.0047 and
+`rope_from_cache` 0.0066 ms/call are **8-14% of the old 0.046 ms launch floor**.
+These ops do essentially no work. Abandoning the fusion lever was right, and this
+is the measurement that proves it instead of inferring it.
+
