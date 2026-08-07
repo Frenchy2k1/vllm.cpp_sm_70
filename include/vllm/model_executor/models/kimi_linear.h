@@ -306,6 +306,39 @@ struct KimiLinearWeights {
   KimiLinearResidentWeights resident{};
 };
 
+// ─── PAGED-INCREMENTAL DECODE STATE (§18 lever e) ──────────────────────────────
+// The persistent per-sequence state that turns the O(n²) full-recompute vehicle
+// (ForwardDeviceCompute re-runs [0..prompt+t] every step — the 4.24 tok/s rate)
+// into vLLM's paged-incremental decode: chunk/recurrent-PREFILL the prompt ONCE,
+// capturing the KDA recurrent state + short-conv taps per KDA layer and the paged
+// latent-KV per NoPE-MLA layer, then RECURRENT-decode each token from the CARRIED
+// state (mirrors kimi_gdn_linear_attn.py:233-268 prefill=chunk / decode=recurrent).
+// Kept host-resident f32 (GB10 unified pool: the up/download is a cheap memcpy) so
+// it survives across the per-token forward calls byte-identically. Sizes at the real
+// 48.9B config: KDA state 20 layers × 32 heads × 128×128 f32 = 40 MiB, conv taps
+// 20 × 3 × 12288 × 3 f32 ≈ 8 MiB, MLA latent-KV 7 layers × T × (8192+64) f32 (≈2 MiB
+// at T≈36) — well inside the §13 budget.
+struct KimiKdaLayerCache {
+  // Short-conv taps [proj*(K-1)] for q/k/v (the last K-1 token values); the
+  // CausalConv1dFwd final-state carry (mamba conv decode). Empty => fresh zeros.
+  std::vector<float> conv_q, conv_k, conv_v;
+  // The gated-delta recurrent state [nh*hd*hd] f32 (KdaGatedDeltaRule state in/out).
+  std::vector<float> recurrent;
+};
+struct KimiMlaLayerCache {
+  // Growing paged latent-KV: per cached token, kv[kvw]=nah*(qk_nope+v_head_dim)
+  // (per-head k_nope|v) and kpe[qr] (the shared rope key). Appended one row per
+  // token in prefill (all prompt tokens) and per decode step.
+  std::vector<float> kv;
+  std::vector<float> kpe;
+};
+struct KimiDecodeCache {
+  std::vector<KimiKdaLayerCache> kda;  // one per KDA layer (in KDA-layer order)
+  std::vector<KimiMlaLayerCache> mla;  // one per NoPE-MLA layer (in MLA-layer order)
+  int64_t seq_len = 0;                 // tokens absorbed so far (prompt + generated)
+  bool prefilled = false;              // ForwardPrefillIncremental ran
+};
+
 // Load `KimiLinearForCausalLM` safetensors. Throws BY NAME (never silent zeros) on
 // the FIRST enumerated tensor absent from the shards, and on a rank/shape mismatch
 // for the tensors whose geometry is unambiguous from the config (the 2-D
@@ -499,6 +532,34 @@ class KimiLinearModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+
+  // ─── PAGED-INCREMENTAL DECODE (§18 lever e) ──────────────────────────────────
+  // The paged-incremental twin of ForwardDeviceCompute: instead of re-running the
+  // whole [0..prompt+t] sequence every step (O(n²), the 4.24 tok/s vehicle), it
+  // PREFILLS the prompt ONCE (capturing the KDA recurrent+conv state per KDA layer
+  // and the latent-KV per NoPE-MLA layer into `cache`), then decodes ONE token per
+  // step from the CARRIED state — killing the recompute (vLLM's decode regime).
+  //
+  // ForwardPrefillIncremental: runs the `prompt` tokens through the bf16 device
+  // forward, filling `cache` (sizes the per-layer caches, appends the prompt's KV,
+  // captures the KDA states) and returns the DEVICE-RESIDENT last-token logits (via
+  // `logits_indices`, request order). Uses the CHUNKED KDA prefill (vt::KdaChunk
+  // Prefill — vLLM's prefill path) when VT_KIMI_DEVICE_KDA_CHUNK=1, else the
+  // recurrence (byte-exact vs ForwardDeviceCompute's device-KDA path — the
+  // token-identity gate).
+  static ForwardLogits ForwardPrefillIncremental(
+      const std::vector<int32_t>& prompt, const std::vector<int32_t>& positions,
+      const KimiLinearWeights& weights, vt::Queue& queue, KimiDecodeCache& cache,
+      const std::vector<int32_t>& logits_indices = {});
+
+  // ForwardDecodeStepIncremental: advances ONE token from the carried `cache` — the
+  // KDA layers via the recurrence (vt::KdaGatedDeltaRule, T==1) from the carried
+  // state; the NoPE-MLA layers via a causal softmax of the 1 query over the carried
+  // latent-KV (query_len=1, key_len=cache.seq_len+1). Returns the DEVICE-RESIDENT
+  // [1,vocab] logits of the new token. `cache.seq_len` advances by one.
+  static ForwardLogits ForwardDecodeStepIncremental(
+      int32_t token, int64_t position, const KimiLinearWeights& weights,
+      vt::Queue& queue, KimiDecodeCache& cache);
 };
 
 // KV-cache spec builder. The HETEROGENEOUS per-layer topology (spike §3): ONE MLA

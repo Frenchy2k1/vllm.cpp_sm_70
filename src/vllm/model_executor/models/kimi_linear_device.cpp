@@ -1175,6 +1175,377 @@ DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
   return logits;
 }
 
+// ═══ PAGED-INCREMENTAL DECODE (§18 lever e) ═════════════════════════════════════
+// The paged-incremental twin of DeviceForwardBodyBf16: instead of re-running the
+// whole [0..prompt+t] sequence every step (the O(n²) recompute vehicle — 4.24 tok/s),
+// PREFILL the prompt ONCE (capturing the KDA recurrent+conv state per KDA layer and
+// the latent-KV per NoPE-MLA layer into a persistent KimiDecodeCache) then advance one
+// token per step from the CARRIED state — vLLM's decode regime
+// (kimi_gdn_linear_attn.py prefill=chunk / decode=recurrent). The per-layer/per-token
+// compute is byte-IDENTICAL to the recompute path (same vt:: ops, same reduction
+// orders); the ONLY structural change is that the KDA recurrence / short conv carry
+// their state and the MLA attention reads a growing KV cache instead of re-projecting
+// the whole prefix. That makes the incremental path token-EXACT vs ForwardDeviceCompute
+// at the same numeric config (the token-identity gate) while doing O(1) projection/MoE
+// work per step instead of O(n).
+
+// Short conv (silu) with host-persistent tap carry (mamba conv decode). Prefill: fresh
+// zero state (has_initial=0), capture the final K-1 taps into `state`. Decode: upload
+// the carried `state` (has_initial=1), advance, rewrite it. Same CausalConv1dFwd op as
+// the recompute ConvSilu, so byte-exact over the same token window.
+DBuf ConvSiluInc(const Dev& d, const Tensor& x, const std::vector<float>& weight,
+                 int64_t T, int64_t C, int64_t K, std::vector<float>& state,
+                 bool is_prefill) {
+  DBuf out(d, DType::kF32, {T, C});
+  DBuf cs(d, DType::kF32, {1, C, K - 1});
+  const bool carried = !is_prefill && !state.empty();
+  if (carried)
+    d.b.Copy(d.q, cs.ptr(), state.data(), state.size() * sizeof(float));
+  else
+    cs.Zero(d);
+  const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+  const int32_t his[1] = {carried ? 1 : 0};
+  DBuf dqsl(d, DType::kI32, {2}, qsl);
+  DBuf dhis(d, DType::kI32, {1}, his);
+  vt::CausalConv1dFwd(d.q, out.t(), x, WF32(d, weight, {C, K}), nullptr, cs.t(), dqsl.t(),
+                      dhis.t(), vt::CausalConv1dArgs{true});
+  state.resize(static_cast<size_t>(C) * (K - 1));
+  cs.Download(d, state.data());  // carry the final K-1 taps
+  return out;
+}
+
+// KDA per-k-channel gated-delta recurrence with host-persistent recurrent-state carry.
+// Prefill: fresh zero state, optional CHUNK path (vt::KdaChunkPrefill — vLLM's prefill,
+// VT_KIMI_DEVICE_KDA_CHUNK=1) else the recurrence; capture the final state. Decode: the
+// recurrence (vt::KdaGatedDeltaRule, T==1) from the carried state, rewrite it. The gate
+// (g = -exp(A_log)*softplus(f_b(f_a(x))+dt_bias)) + beta = sigmoid(braw) are computed
+// EXACTLY as the recompute KdaRecurrenceIsland device-KDA branch, so recurrence-prefill
+// + recurrence-decode is byte-exact vs the recompute device-KDA path.
+DBuf KdaRecurrenceIslandInc(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
+                            DBuf& braw, const std::vector<float>& a_log,
+                            const std::vector<float>& dt_bias, const KimiLinearParams& p,
+                            int64_t T, std::vector<float>& rec_state, bool is_prefill,
+                            bool use_chunk) {
+  const int64_t nh = p.kda_num_heads;
+  const int64_t hd = p.kda_head_dim;
+  const int64_t proj = nh * hd;
+  const float scale = static_cast<float>(std::pow(static_cast<double>(hd), -0.5));
+
+  DBuf dstate(d, DType::kF32, {1, nh, hd, hd});
+  const bool carried = !is_prefill && !rec_state.empty();
+  if (carried)
+    d.b.Copy(d.q, dstate.ptr(), rec_state.data(), rec_state.size() * sizeof(float));
+  else
+    dstate.Zero(d);
+
+  DBuf dcore(d, DType::kF32, {T, proj});
+  const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+  DBuf dqsl(d, DType::kI32, {2}, qsl);
+  Tensor qn3 = MakeTensor(qn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+  Tensor kn3 = MakeTensor(kn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+  Tensor vc3 = MakeTensor(vc.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+  Tensor out3 = MakeTensor(dcore.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+
+  // beta = sigmoid(braw), rounded like the recompute island (BF16_ISLANDS default off).
+  std::vector<float> hbraw(static_cast<size_t>(T) * nh);
+  braw.Download(d, hbraw.data());
+  RoundHostBf16(hbraw);
+  std::vector<float> hbeta(hbraw.size());
+  for (size_t i = 0; i < hbeta.size(); ++i) hbeta[i] = static_cast<float>(Sigmoid(hbraw[i]));
+  DBuf dbeta(d, DType::kF32, {T, nh}, hbeta.data());
+
+  if (use_chunk && is_prefill && T > 1) {
+    // vLLM's PROMPT path: the chunk kernels fuse the gate on device from the RAW g1.
+    DBuf da_log(d, DType::kF32, {nh}, a_log.data());
+    DBuf ddt(d, DType::kF32, {static_cast<int64_t>(dt_bias.size())},
+             dt_bias.empty() ? nullptr : dt_bias.data());
+    Tensor gr3 = MakeTensor(g1.ptr(), DType::kF32, d.q.device, {T, nh, hd});  // RAW gate proj
+    vt::KdaChunkPrefill(d.q, out3, qn3, kn3, vc3, gr3, dbeta.t(), da_log.t(), ddt.t(),
+                        dstate.t(), dqsl.t(), vt::GdnArgs{scale});
+  } else {
+    std::vector<float> hg1(static_cast<size_t>(T) * proj);
+    g1.Download(d, hg1.data());
+    RoundHostBf16(hg1);
+    const std::vector<float> gch =
+        kimi_kda::KdaDecayGate(hg1, a_log, dt_bias, T, nh, hd);  // [T,nh,hd] per-channel
+    DBuf dg(d, DType::kF32, {T, nh, hd}, gch.data());
+    vt::KdaGatedDeltaRule(d.q, out3, qn3, kn3, vc3, dg.t(), dbeta.t(), dstate.t(), dqsl.t(),
+                          vt::GdnArgs{scale});
+  }
+  rec_state.resize(static_cast<size_t>(nh) * hd * hd);
+  dstate.Download(d, rec_state.data());  // carry the final recurrent state
+  return dcore;
+}
+
+// NoPE-MLA causal-softmax attention over a GROWING host latent-KV cache — the paged
+// incremental twin of MlaSoftmaxIsland. Each of the T query rows sits at global
+// position base_pos + t and attends the cached keys [0 .. base_pos+t] (causal). Same
+// f64 online-softmax math and same ascending-s reduction order as the recompute
+// island, so byte-exact vs it: prefill (base_pos=0, T=P) reproduces the whole-sequence
+// island; decode (base_pos=seq_len, T=1) attends the full carried prefix. `cache_kv`
+// / `cache_kpe` already hold base_pos+T tokens (appended by the caller).
+DBuf MlaSoftmaxIslandInc(const Dev& d, DBuf& dq, const std::vector<float>& cache_kv,
+                         const std::vector<float>& cache_kpe, const KimiLinearParams& p,
+                         int64_t T, int64_t base_pos) {
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t kvw = nah * (qn + vh);
+  std::vector<float> hq(static_cast<size_t>(T) * nah * qk);
+  dq.Download(d, hq.data());
+  RoundHostBf16(hq);  // BF16_ISLANDS on the query (cache_kv/kpe rounded at append time)
+  const double scale = std::pow(static_cast<double>(qk), -0.5);
+  std::vector<float> out(static_cast<size_t>(T) * nah * vh, 0.0f);
+  std::vector<double> sc;
+  for (int64_t h = 0; h < nah; ++h) {
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t nkeys = base_pos + t + 1;  // causal: attends [0 .. base_pos+t]
+      sc.assign(static_cast<size_t>(nkeys), 0.0);
+      const float* q_nope = &hq[static_cast<size_t>(t * nah * qk + h * qk)];
+      const float* q_pe = q_nope + qn;
+      double mx = -INFINITY;
+      for (int64_t s = 0; s < nkeys; ++s) {
+        const float* k_nope = &cache_kv[static_cast<size_t>(s * kvw + h * (qn + vh))];
+        const float* kpe = &cache_kpe[static_cast<size_t>(s * qr)];
+        double dot = 0.0;
+        for (int64_t dd = 0; dd < qn; ++dd)
+          dot = AccR(dot + static_cast<double>(q_nope[dd]) * k_nope[dd]);
+        for (int64_t dd = 0; dd < qr; ++dd)
+          dot = AccR(dot + static_cast<double>(q_pe[dd]) * kpe[dd]);
+        dot = AccR(dot * scale);
+        sc[static_cast<size_t>(s)] = dot;
+        mx = std::max(mx, dot);
+      }
+      double sum = 0.0;
+      for (int64_t s = 0; s < nkeys; ++s) {
+        const double e = AccR(std::exp(sc[static_cast<size_t>(s)] - mx));
+        sc[static_cast<size_t>(s)] = e;
+        sum = AccR(sum + e);
+      }
+      float* ot = &out[static_cast<size_t>(t * nah * vh + h * vh)];
+      for (int64_t dd = 0; dd < vh; ++dd) {
+        double acc = 0.0;
+        for (int64_t s = 0; s < nkeys; ++s) {
+          const float* vs = &cache_kv[static_cast<size_t>(s * kvw + h * (qn + vh) + qn)];
+          acc = AccR(acc + (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]));
+        }
+        ot[dd] = static_cast<float>(acc);
+      }
+    }
+  }
+  return DBuf(d, DType::kF32, {T, nah * vh}, out.data());
+}
+
+// KDA layer — incremental (state-carrying) form of KdaLayerDeviceBf16. Byte-identical
+// projections/convs/L2norm/gated-norm; the convs and the recurrence carry their state
+// through `cache`.
+DBuf KdaLayerDeviceBf16Inc(const Dev& d, const KdaResidentWeights& w, const Tensor& dh,
+                           const KimiLinearParams& p, int64_t T, KimiKdaLayerCache& cache,
+                           bool is_prefill, bool use_chunk) {
+  const int64_t H = p.hidden_size;
+  const int64_t nh = p.kda_num_heads;
+  const int64_t hd = p.kda_head_dim;
+  const int64_t proj = nh * hd;
+  const int64_t K = p.kda_short_conv_kernel_size;
+
+  DBuf rq(d, DType::kF32, {T, proj});
+  GemmBf16(d, rq.t(), dh, w.q_proj, proj, H);
+  DBuf rk(d, DType::kF32, {T, proj});
+  GemmBf16(d, rk.t(), dh, w.k_proj, proj, H);
+  DBuf rv(d, DType::kF32, {T, proj});
+  GemmBf16(d, rv.t(), dh, w.v_proj, proj, H);
+  DBuf qc = ConvSiluInc(d, rq.t(), w.q_conv, T, proj, K, cache.conv_q, is_prefill);
+  DBuf kc = ConvSiluInc(d, rk.t(), w.k_conv, T, proj, K, cache.conv_k, is_prefill);
+  DBuf vc = ConvSiluInc(d, rv.t(), w.v_conv, T, proj, K, cache.conv_v, is_prefill);
+
+  DBuf qn(d, DType::kF32, {T, proj});
+  DBuf kn(d, DType::kF32, {T, proj});
+  {
+    Tensor qc3 = MakeTensor(qc.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor qn3 = MakeTensor(qn.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor kc3 = MakeTensor(kc.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor kn3 = MakeTensor(kn.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    vt::L2Norm(d.q, qn3, qc3, vt::L2NormArgs{1e-6f});
+    vt::L2Norm(d.q, kn3, kc3, vt::L2NormArgs{1e-6f});
+  }
+
+  DBuf braw(d, DType::kF32, {T, nh});
+  GemmBf16(d, braw.t(), dh, w.b_proj, nh, H);
+  DBuf fa(d, DType::kF32, {T, hd});
+  GemmBf16(d, fa.t(), dh, w.f_a_proj, hd, H);
+  DBuf g1(d, DType::kF32, {T, proj});
+  GemmBf16(d, g1.t(), fa.t(), w.f_b_proj, proj, hd);
+  DBuf ga(d, DType::kF32, {T, hd});
+  GemmBf16(d, ga.t(), dh, w.g_a_proj, hd, H);
+  DBuf g2(d, DType::kF32, {T, proj});
+  GemmBf16(d, g2.t(), ga.t(), w.g_b_proj, proj, hd);
+
+  DBuf dcore = KdaRecurrenceIslandInc(d, qn, kn, vc, g1, braw, w.a_log, w.dt_bias, p, T,
+                                      cache.recurrent, is_prefill, use_chunk);
+
+  DBuf dcn(d, DType::kF32, {T, proj});
+  {
+    Tensor x3 = MakeTensor(dcore.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor g3 = MakeTensor(g2.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor o3 = MakeTensor(dcn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    vt::RmsNormGated(d.q, o3, x3, g3, WF32(d, w.o_norm, {hd}),
+                     vt::RmsNormGatedArgs{p.rms_norm_eps, /*sigmoid_gate=*/true});
+  }
+  DBuf out(d, DType::kF32, {T, H});
+  GemmBf16(d, out.t(), dcn.t(), w.o_proj, H, proj);
+  return out;
+}
+
+// NoPE-MLA layer — incremental form of MlaLayerDeviceBf16. Byte-identical projections;
+// the per-token latent-KV (kv[kvw] | kpe[qr]) is appended to `cache` and the attention
+// runs over the growing cache (query_len=T, key_len=base_pos+T).
+DBuf MlaLayerDeviceBf16Inc(const Dev& d, const MlaResidentWeights& w, const Tensor& dh,
+                           const KimiLinearParams& p, int64_t T, int64_t base_pos,
+                           KimiMlaLayerCache& cache) {
+  const int64_t H = p.hidden_size;
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t L = p.kv_lora_rank;
+  const int64_t kvw = nah * (qn + vh);
+
+  DBuf dq(d, DType::kF32, {T, nah * qk});
+  GemmBf16(d, dq.t(), dh, w.q_proj, nah * qk, H);
+  DBuf dlat(d, DType::kF32, {T, L + qr});
+  GemmBf16(d, dlat.t(), dh, w.kv_a_proj_with_mqa, L + qr, H);
+
+  DBuf dkvc(d, DType::kF32, {T, L});
+  DBuf dkpe(d, DType::kF32, {T, qr});
+  {
+    const size_t rl = static_cast<size_t>(L + qr) * sizeof(float);
+    const char* src = static_cast<const char*>(dlat.ptr());
+    char* pc = static_cast<char*>(dkvc.ptr());
+    char* pp = static_cast<char*>(dkpe.ptr());
+    for (int64_t t = 0; t < T; ++t) {
+      d.b.Copy(d.q, pc + static_cast<size_t>(t) * L * sizeof(float),
+               src + static_cast<size_t>(t) * rl, static_cast<size_t>(L) * sizeof(float));
+      d.b.Copy(d.q, pp + static_cast<size_t>(t) * qr * sizeof(float),
+               src + static_cast<size_t>(t) * rl + static_cast<size_t>(L) * sizeof(float),
+               static_cast<size_t>(qr) * sizeof(float));
+    }
+  }
+  DBuf dkvcn(d, DType::kF32, {T, L});
+  vt::RmsNorm(d.q, dkvcn.t(), dkvc.t(), WF32(d, w.kv_a_layernorm, {L}),
+              vt::RmsNormArgs{p.rms_norm_eps, false});
+  DBuf dkv(d, DType::kF32, {T, kvw});
+  GemmBf16(d, dkv.t(), dkvcn.t(), w.kv_b_proj, kvw, L);
+
+  // append the T tokens' kv[kvw] and kpe[qr] to the growing cache (bf16-round at append
+  // time under BF16_ISLANDS, matching the recompute island's per-token rounding).
+  std::vector<float> hkv(static_cast<size_t>(T) * kvw), hkpe(static_cast<size_t>(T) * qr);
+  dkv.Download(d, hkv.data());
+  dkpe.Download(d, hkpe.data());
+  RoundHostBf16(hkv);
+  RoundHostBf16(hkpe);
+  cache.kv.insert(cache.kv.end(), hkv.begin(), hkv.end());
+  cache.kpe.insert(cache.kpe.end(), hkpe.begin(), hkpe.end());
+
+  DBuf dout = MlaSoftmaxIslandInc(d, dq, cache.kv, cache.kpe, p, T, base_pos);
+  DBuf attn(d, DType::kF32, {T, H});
+  GemmBf16(d, attn.t(), dout.t(), w.o_proj, H, nah * vh);
+  return attn;
+}
+
+// The whole paged-incremental device forward over `token_ids` (prefill: the prompt at
+// base_pos=0; decode: one token at base_pos=cache.seq_len), carrying `cache`. Returns
+// the DEVICE-RESIDENT [rows,vocab] logits. Byte-for-byte the DeviceForwardBodyBf16
+// residual-stream structure with the KDA/MLA layers swapped for their state-carrying
+// Inc forms.
+DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& weights,
+                                      const std::vector<int32_t>& token_ids,
+                                      int64_t base_pos, KimiDecodeCache& cache,
+                                      bool is_prefill,
+                                      const std::vector<int32_t>& logits_indices) {
+  const KimiLinearResidentWeights& rw = weights.resident;
+  const KimiLinearParams& p = weights.params;
+  const int64_t H = p.hidden_size;
+  const int64_t V = p.vocab_size;
+  const int64_t L = p.num_hidden_layers;
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const float eps = p.rms_norm_eps;
+  VT_CHECK(T > 0, "KimiLinear incremental: empty token sequence");
+  VT_CHECK(rw.resident,
+           "KimiLinear incremental: bf16-resident weights required (paged-incremental "
+           "decode is the full-model device path)");
+  VT_CHECK(static_cast<int64_t>(rw.layers.size()) == L,
+           "KimiLinear incremental: resident layer count != num_hidden_layers");
+  const bool use_chunk = DeviceKdaChunk();
+
+  DBuf hidden(d, DType::kF32, {T, H});
+  {
+    DBuf dids(d, DType::kI32, {T}, token_ids.data());
+    Tensor htab = ResidentBf16W(d, rw.embed_tokens, {V, H});
+    Tensor hh = hidden.t();
+    vt::Embedding(d.q, hh, htab, dids.t());
+  }
+  const bool bf16_res = Bf16Residual();
+  if (bf16_res) RoundDevBf16(d, hidden);
+  DBuf res(d, DType::kF32, {T, H});
+  res.Zero(d);
+  Tensor hcur = hidden.t();
+  std::shared_ptr<void> hold;
+
+  int64_t kda_idx = 0, mla_idx = 0;
+  for (int64_t l = 0; l < L; ++l) {
+    const KimiLinearLayerResidentWeights& lw = rw.layers[static_cast<size_t>(l)];
+    DBuf dhn(d, DType::kF32, {T, H});
+    AddRmsNorm(d, dhn, hcur, WF32(d, lw.input_layernorm, {H}), res, eps);
+    if (bf16_res) RoundDevBf16(d, res);
+    DBuf attn = lw.is_kda
+                    ? KdaLayerDeviceBf16Inc(d, lw.kda, dhn.t(), p, T,
+                                            cache.kda[static_cast<size_t>(kda_idx++)],
+                                            is_prefill, use_chunk)
+                    : MlaLayerDeviceBf16Inc(d, lw.mla, dhn.t(), p, T, base_pos,
+                                            cache.mla[static_cast<size_t>(mla_idx++)]);
+    if (bf16_res) RoundDevBf16(d, attn);
+    DBuf dh2(d, DType::kF32, {T, H});
+    AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
+    if (bf16_res) RoundDevBf16(d, res);
+    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
+                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
+    if (bf16_res) RoundDevBf16(d, mlp);
+    auto* held = new DBuf(std::move(mlp));
+    hcur = held->t();
+    hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
+  }
+
+  DBuf dnorm(d, DType::kF32, {T, H});
+  AddRmsNorm(d, dnorm, hcur, WF32(d, rw.final_norm, {H}), res, eps);
+
+  Tensor src = dnorm.t();
+  DBuf dgather(d, DType::kF32,
+               logits_indices.empty()
+                   ? std::vector<int64_t>{1, 1}
+                   : std::vector<int64_t>{static_cast<int64_t>(logits_indices.size()), H});
+  if (!logits_indices.empty()) {
+    const size_t rb = static_cast<size_t>(H) * sizeof(float);
+    char* dp = static_cast<char*>(dgather.ptr());
+    const char* sp = static_cast<const char*>(dnorm.ptr());
+    for (size_t i = 0; i < logits_indices.size(); ++i) {
+      const int32_t idx = logits_indices[i];
+      VT_CHECK(idx >= 0 && idx < T, "KimiLinear incremental: logits index out of range");
+      d.b.Copy(d.q, dp + i * rb, sp + static_cast<size_t>(idx) * rb, rb);
+    }
+    src = dgather.t();
+  }
+  const int64_t n_out = src.shape[0];
+
+  const bool tied = p.tie_word_embeddings || rw.lm_head.Empty();
+  const OwnedTensor& lm = tied ? rw.embed_tokens : rw.lm_head;
+  DBuf logits(d, DType::kF32, {n_out, V});
+  GemmBf16(d, logits.t(), src, lm, V, H);
+  return logits;
+}
+
 }  // namespace
 
 // ─── per-op device wrappers (host-in / host-out) — the per-op CPU gates ────────
@@ -1281,6 +1652,48 @@ ForwardLogits KimiLinearModel::ForwardDeviceCompute(
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = bf16 ? DeviceForwardBodyBf16(d, weights, token_ids, logits_indices)
                       : DeviceForwardBody(d, weights, token_ids, logits_indices);
+  const int64_t n_out = dlogits.t().shape[0];
+  return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
+}
+
+// ─── PAGED-INCREMENTAL DECODE (§18 lever e) — public entry points ──────────────
+ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
+    const std::vector<int32_t>& prompt, const std::vector<int32_t>& positions,
+    const KimiLinearWeights& weights, vt::Queue& queue, KimiDecodeCache& cache,
+    const std::vector<int32_t>& logits_indices) {
+  (void)positions;  // NoPE-MLA + recurrence: causal masking is by cache length, no RoPE
+  VT_CHECK(weights.resident.resident,
+           "KimiLinear ForwardPrefillIncremental: bf16-resident weights required (§13)");
+  const KimiLinearParams& p = weights.params;
+  int64_t nkda = 0, nmla = 0;
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l)
+    (p.is_kda_layer(l) ? nkda : nmla)++;
+  cache.kda.assign(static_cast<size_t>(nkda), KimiKdaLayerCache{});
+  cache.mla.assign(static_cast<size_t>(nmla), KimiMlaLayerCache{});
+  cache.seq_len = 0;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dlogits = DeviceForwardBodyBf16Incremental(d, weights, prompt, /*base_pos=*/0, cache,
+                                                  /*is_prefill=*/true, logits_indices);
+  cache.seq_len = static_cast<int64_t>(prompt.size());
+  cache.prefilled = true;
+  const int64_t n_out = dlogits.t().shape[0];
+  return WrapDeviceLogits(std::move(dlogits), n_out, p.vocab_size);
+}
+
+ForwardLogits KimiLinearModel::ForwardDecodeStepIncremental(
+    int32_t token, int64_t position, const KimiLinearWeights& weights, vt::Queue& queue,
+    KimiDecodeCache& cache) {
+  (void)position;  // causal masking is by cache.seq_len; NoPE so no positional term
+  VT_CHECK(cache.prefilled,
+           "KimiLinear ForwardDecodeStepIncremental: call ForwardPrefillIncremental first");
+  VT_CHECK(weights.resident.resident,
+           "KimiLinear ForwardDecodeStepIncremental: bf16-resident weights required (§13)");
+  const std::vector<int32_t> ids = {token};
+  const std::vector<int32_t> li = {0};  // the single decoded token's logits
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dlogits = DeviceForwardBodyBf16Incremental(d, weights, ids, /*base_pos=*/cache.seq_len,
+                                                  cache, /*is_prefill=*/false, li);
+  cache.seq_len += 1;
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }
