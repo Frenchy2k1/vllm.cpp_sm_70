@@ -45,6 +45,11 @@ from an implementer's self-review, and the reviewers found them by MUTATING code
 rather than reading diffs: eleven tests passed with the thing they named
 deleted, and not one was visible by reading. That instruction is the deliverable,
 so it is tracked and pinned phrase by phrase, not merely present as a file.
+
+Before any claim or implementation, the same two normative documents also
+carry one verbatim PRE-CLAIM INTAKE block. It prevents a roadmap description or
+issue from being treated as proof that a gap still exists without checking the
+live claims, code, tests, and evidence first.
 """
 
 from __future__ import annotations
@@ -60,6 +65,39 @@ ROOT = Path(__file__).resolve().parents[1]
 # Both documents must carry the contract, because both are read as normative:
 # AGENTS.md is the canonical index, workflow.md is the session operating manual.
 CONTRACT_DOCUMENTS = ("AGENTS.md", ".agents/workflow.md")
+
+INTAKE_DOCUMENTS = CONTRACT_DOCUMENTS
+INTAKE_BEGIN = "<!-- pre-claim-intake:begin -->"
+INTAKE_END = "<!-- pre-claim-intake:end -->"
+INTAKE_REQUIRED = (
+    "Before claiming a row or starting implementation",
+    "Search open issues and pull requests",
+    ".agents/NOW.md",
+    "scripts/ready-for-helper.py",
+    "roadmap row",
+    "owning matrix row",
+    ".agents/coordination.md",
+    "current code, tests, and relevant evidence anchors",
+    "confirm that the recorded gap still exists",
+    "Record the issue/PR search and exact current code/test anchors",
+    "reconcile the task instead of starting duplicate work",
+)
+INTAKE_BODY = """
+### Verify the gap before claiming or implementing
+
+An issue, roadmap row, or helper-queue result is a lead, not proof that work is
+still open. Before claiming a row or starting implementation:
+
+1. **Search open issues and pull requests** for duplicates and active ownership.
+2. Read `.agents/NOW.md`, run `scripts/ready-for-helper.py` when applicable, and
+   read the roadmap row, its owning matrix row, and `.agents/coordination.md`.
+3. Inspect the **current code, tests, and relevant evidence anchors** and
+   **confirm that the recorded gap still exists** at the current branch head.
+4. **Record the issue/PR search and exact current code/test anchors** in the
+   committed spike or PR.
+5. If the gap has landed, is claimed, or no longer matches the record, **stop and
+   reconcile the task instead of starting duplicate work**.
+"""
 
 BEGIN = "<!-- doc-obligation-contract:begin -->"
 END = "<!-- doc-obligation-contract:end -->"
@@ -202,6 +240,39 @@ def document_errors(name: str, text: str, expected: tuple[str, ...]) -> list[str
     return errors
 
 
+def intake_block(text: str) -> str | None:
+    """Return the exact intake body, or None for missing/malformed markers."""
+    if text.count(INTAKE_BEGIN) != 1 or text.count(INTAKE_END) != 1:
+        return None
+    start = text.find(INTAKE_BEGIN)
+    end = text.find(INTAKE_END, start + len(INTAKE_BEGIN))
+    if end == -1:
+        return None
+    return text[start + len(INTAKE_BEGIN) : end]
+
+
+def intake_document_errors(name: str, text: str) -> list[str]:
+    """Return pre-claim intake problems for one normative document."""
+    block = intake_block(text)
+    if block is None:
+        return [
+            f"{name} is missing the pre-claim intake block "
+            f"({INTAKE_BEGIN} ... {INTAKE_END})"
+        ]
+    lowered = block.lower()
+    errors = [
+        f"{name} intake omits {needle!r}"
+        for needle in INTAKE_REQUIRED
+        if needle.lower() not in lowered
+    ]
+    if block != INTAKE_BODY:
+        errors.append(
+            f"{name} pre-claim intake block changed; copy the canonical "
+            "INTAKE_BODY verbatim"
+        )
+    return errors
+
+
 def interview_errors(text: str) -> list[str]:
     """The role interview must live where agents read it, not only in a gate."""
     if INTERVIEW_MARKER not in text:
@@ -273,6 +344,7 @@ def main() -> int:
     expected = obligated_surfaces()
     failures: list[str] = []
     blocks: dict[str, list[str] | None] = {}
+    intake_blocks: dict[str, str] = {}
 
     interview = ROOT / INTERVIEW_DOCUMENT
     if not interview.exists():
@@ -292,6 +364,26 @@ def main() -> int:
         failures.extend(loop_errors(loop_doc.read_text(encoding="utf-8")))
 
     failures.extend(prompt_errors())
+
+    for name in INTAKE_DOCUMENTS:
+        path = ROOT / name
+        if not path.exists():
+            failures.append(f"{name} does not exist")
+            continue
+        text = path.read_text(encoding="utf-8")
+        failures.extend(intake_document_errors(name, text))
+        block = intake_block(text)
+        if block is not None:
+            intake_blocks[name] = block
+
+    if len(intake_blocks) == len(INTAKE_DOCUMENTS):
+        distinct_intake = set(intake_blocks.values())
+        if len(distinct_intake) > 1:
+            failures.append(
+                "the pre-claim intake block differs between "
+                f"{' and '.join(INTAKE_DOCUMENTS)}; both must carry the same "
+                "block verbatim"
+            )
 
     for name in CONTRACT_DOCUMENTS:
         path = ROOT / name
@@ -327,7 +419,8 @@ def main() -> int:
             "the block. The sub-agent prompts in "
             f"{', '.join(PROMPT_REQUIRED)} must carry their binding "
             "instructions verbatim; a prompt that lives only in an operator's "
-            "head is not a protocol.",
+            "head is not a protocol. The pre-claim intake block must appear "
+            f"verbatim in {' and '.join(INTAKE_DOCUMENTS)}.",
             file=sys.stderr,
         )
         return 1
@@ -338,7 +431,8 @@ def main() -> int:
         f"scripts/check-doc-checkpoint.py, {INTERVIEW_DOCUMENT} carries the "
         f"role interview and the orchestration loop, and "
         f"{len(PROMPT_REQUIRED)} sub-agent prompts carry their binding "
-        "instructions."
+        "instructions, and both normative documents carry the same pre-claim "
+        "intake."
     )
     return 0
 

@@ -38,6 +38,23 @@ consistency = _load("protocol_consistency", "scripts/check-protocol-consistency.
 
 EXPECTED = ("docs/STATUS.md", "docs/BENCHMARKS.md", "docs/FEATURES.md")
 
+# Deliberately independent of consistency.INTAKE_REQUIRED. If the production
+# tuple is narrowed, a mutation loop derived from that tuple cannot notice the
+# omitted requirement; this literal contract makes the narrowing itself red.
+EXPECTED_INTAKE_REQUIRED = (
+    "Before claiming a row or starting implementation",
+    "Search open issues and pull requests",
+    ".agents/NOW.md",
+    "scripts/ready-for-helper.py",
+    "roadmap row",
+    "owning matrix row",
+    ".agents/coordination.md",
+    "current code, tests, and relevant evidence anchors",
+    "confirm that the recorded gap still exists",
+    "Record the issue/PR search and exact current code/test anchors",
+    "reconcile the task instead of starting duplicate work",
+)
+
 
 def _tracked_paths(prefix: str) -> set[str] | None:
     """Paths git knows under `prefix`, or None when this is not a checkout.
@@ -78,7 +95,9 @@ def _prompt_tree(files: dict[str, str]):
 
 
 @contextlib.contextmanager
-def _repo_copy(workflow_text: str, *, prompts: bool = True):
+def _repo_copy(
+    workflow_text: str, *, agents_text: str | None = None, prompts: bool = True
+):
     """Run consistency.main() against a copy of the repo's own documents.
 
     Only `.agents/workflow.md` is substituted, so a red from this helper is
@@ -93,7 +112,10 @@ def _repo_copy(workflow_text: str, *, prompts: bool = True):
             ROOT / "scripts/check-doc-checkpoint.py",
             root / "scripts/check-doc-checkpoint.py",
         )
-        shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
+        if agents_text is None:
+            shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
+        else:
+            (root / "AGENTS.md").write_text(agents_text, encoding="utf-8")
         if prompts:
             shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
         (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
@@ -179,6 +201,130 @@ class LiveTree(unittest.TestCase):
     def test_every_contract_document_exists(self) -> None:
         for name in consistency.CONTRACT_DOCUMENTS:
             self.assertTrue((ROOT / name).exists(), name)
+
+
+class PreClaimIntakeTests(unittest.TestCase):
+    """Starting work from stale record prose must be a red protocol gate."""
+
+    STRIP = re.compile(
+        r"<!-- pre-claim-intake:begin -->.*?"
+        r"<!-- pre-claim-intake:end -->\n?",
+        re.S,
+    )
+
+    def _documents(self) -> dict[str, str]:
+        return {
+            name: (ROOT / name).read_text(encoding="utf-8")
+            for name in consistency.INTAKE_DOCUMENTS
+        }
+
+    def test_checker_exposes_independent_intake_requirements(self):
+        self.assertEqual(
+            getattr(consistency, "INTAKE_REQUIRED", ()),
+            EXPECTED_INTAKE_REQUIRED,
+            "INTAKE_REQUIRED must exactly match the test-owned intake contract",
+        )
+
+    def test_both_normative_documents_carry_one_identical_intake_block(self):
+        documents = self._documents()
+        blocks = []
+        for name, document_text in documents.items():
+            with self.subTest(document=name):
+                self.assertEqual(document_text.count(consistency.INTAKE_BEGIN), 1)
+                self.assertEqual(document_text.count(consistency.INTAKE_END), 1)
+                block = consistency.intake_block(document_text)
+                self.assertIsNotNone(block)
+                blocks.append(block)
+        self.assertEqual(blocks[0], blocks[1])
+
+    def test_each_required_intake_instruction_is_pinned_individually(self):
+        self.assertEqual(consistency.INTAKE_REQUIRED, EXPECTED_INTAKE_REQUIRED)
+        for name, document_text in self._documents().items():
+            block = consistency.intake_block(document_text)
+            self.assertIsNotNone(block)
+            for needle in EXPECTED_INTAKE_REQUIRED:
+                with self.subTest(document=name, needle=needle):
+                    damaged_block = block.replace(needle, "")
+                    self.assertNotEqual(damaged_block, block)
+                    damaged = document_text.replace(block, damaged_block, 1)
+                    self.assertNotEqual(damaged, document_text)
+                    errors = consistency.intake_document_errors(name, damaged)
+                    self.assertTrue(any("intake omits" in error for error in errors))
+
+    def test_main_fails_when_either_intake_block_is_removed(self):
+        documents = self._documents()
+        for name in consistency.INTAKE_DOCUMENTS:
+            with self.subTest(document=name):
+                damaged = self.STRIP.sub("", documents[name])
+                self.assertNotEqual(damaged, documents[name])
+                agents = damaged if name == "AGENTS.md" else documents["AGENTS.md"]
+                workflow = (
+                    damaged
+                    if name == ".agents/workflow.md"
+                    else documents[".agents/workflow.md"]
+                )
+                with _repo_copy(workflow, agents_text=agents) as run:
+                    code, _, err = run()
+                self.assertEqual(code, 1)
+                self.assertIn("pre-claim intake", err)
+
+    def test_main_fails_when_normative_intake_copies_differ(self):
+        documents = self._documents()
+        workflow = documents[".agents/workflow.md"].replace(
+            EXPECTED_INTAKE_REQUIRED[1],
+            EXPECTED_INTAKE_REQUIRED[1] + " with a different instruction",
+            1,
+        )
+        with _repo_copy(workflow, agents_text=documents["AGENTS.md"]) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1)
+        self.assertIn("intake block differs", err)
+
+    def test_main_fails_when_both_copies_lose_a_required_instruction(self):
+        # This is independent of the copy-drift check: if both documents are
+        # identically damaged, only the canonical requirements can make main()
+        # red. Name the reviewed regression literally so narrowing the
+        # production tuple cannot narrow this mutation along with it.
+        needle = "scripts/ready-for-helper.py"
+        documents = self._documents()
+        damaged = {}
+        for name, document_text in documents.items():
+            block = consistency.intake_block(document_text)
+            self.assertIsNotNone(block)
+            damaged_block = block.replace(needle, "")
+            self.assertNotEqual(damaged_block, block)
+            damaged[name] = document_text.replace(block, damaged_block, 1)
+        with _repo_copy(
+            damaged[".agents/workflow.md"], agents_text=damaged["AGENTS.md"]
+        ) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1)
+        self.assertIn("intake omits 'scripts/ready-for-helper.py'", err)
+
+    def test_main_rejects_identically_drifted_intake_copies(self):
+        # This mutation keeps every required substring and changes both copies
+        # in the same way. Only comparison with the canonical INTAKE_BODY can
+        # reject it; copy equality and the required-needle checks both pass.
+        documents = self._documents()
+        damaged = {}
+        for name, document_text in documents.items():
+            block = consistency.intake_block(document_text)
+            self.assertIsNotNone(block)
+            damaged_block = block + "\nThe same checks still apply."
+            for needle in EXPECTED_INTAKE_REQUIRED:
+                self.assertIn(needle, damaged_block)
+            damaged[name] = document_text.replace(block, damaged_block, 1)
+        self.assertEqual(
+            consistency.intake_block(damaged["AGENTS.md"]),
+            consistency.intake_block(damaged[".agents/workflow.md"]),
+            "the fixture must drift both normative copies identically",
+        )
+        with _repo_copy(
+            damaged[".agents/workflow.md"], agents_text=damaged["AGENTS.md"]
+        ) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1)
+        self.assertIn("canonical INTAKE_BODY", err)
 
 
 class InterviewBlockTests(unittest.TestCase):

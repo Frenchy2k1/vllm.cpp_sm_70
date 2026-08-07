@@ -46,6 +46,23 @@ stay `PENDING`.
 Run `scripts/agent-onboard.py --probe` to see what is still unresolved.
 <!-- role-interview:end -->
 
+<!-- pre-claim-intake:begin -->
+### Verify the gap before claiming or implementing
+
+An issue, roadmap row, or helper-queue result is a lead, not proof that work is
+still open. Before claiming a row or starting implementation:
+
+1. **Search open issues and pull requests** for duplicates and active ownership.
+2. Read `.agents/NOW.md`, run `scripts/ready-for-helper.py` when applicable, and
+   read the roadmap row, its owning matrix row, and `.agents/coordination.md`.
+3. Inspect the **current code, tests, and relevant evidence anchors** and
+   **confirm that the recorded gap still exists** at the current branch head.
+4. **Record the issue/PR search and exact current code/test anchors** in the
+   committed spike or PR.
+5. If the gap has landed, is claimed, or no longer matches the record, **stop and
+   reconcile the task instead of starting duplicate work**.
+<!-- pre-claim-intake:end -->
+
 0. **Declare your role** before anything else, if this session has not already:
    `scripts/agent-role.py show` (exit 3 = undeclared), then the answer from the
    interview above. A role keys on the WORKTREE, so one worktree is one role and
