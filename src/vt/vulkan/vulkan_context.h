@@ -103,6 +103,18 @@ class VulkanContext {
   // name -> count, sorted by count descending. For the diagnostic dump.
   std::vector<std::pair<std::string, uint64_t>> DispatchHistogram() const;
 
+  // name -> total fence-wait milliseconds, sorted descending. COUNTS NAME THE
+  // SHAPE OF A RUN; ONLY TIME NAMES THE LEVER. A measured 0.046 ms per-dispatch
+  // floor against a 0.357 ms observed average proved that 87% of this backend's
+  // dispatch cost is real kernel execution, not submission overhead -- so the
+  // question stopped being "how many dispatches" and became "which kernel", and
+  // a histogram of counts cannot answer that. The two differ wildly: the most
+  // FREQUENT shader is routinely not the most EXPENSIVE one.
+  //
+  // Submission is synchronous, so the fence wait brackets that dispatch and
+  // nothing else, and these sum to the run's GPU time rather than overlapping.
+  std::vector<std::pair<std::string, double>> DispatchTimeMs() const;
+
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
   // silently reusing an existing one — which would look identical in the results.
@@ -177,6 +189,7 @@ class VulkanContext {
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
   void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
+  void* dispatch_ms_ = nullptr;      // std::map<std::string, double>*
   uint64_t dispatch_total_ = 0;
   void* pipelines_ = nullptr;        // std::map<std::string, Pipeline>*
   void* mutex_ = nullptr;            // std::mutex*

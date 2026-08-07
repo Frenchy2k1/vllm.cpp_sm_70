@@ -468,6 +468,7 @@ VulkanContext::VulkanContext() {
 
   pipelines_ = new std::map<std::string, Pipeline>();
   dispatch_hist_ = new std::map<std::string, uint64_t>();
+  dispatch_ms_ = new std::map<std::string, double>();
 
   // VT_VULKAN_DISPATCH_STATS=1 dumps the per-shader histogram at exit. Registered
   // with atexit rather than printed from a destructor because this context is a
@@ -482,10 +483,25 @@ VulkanContext::VulkanContext() {
       const VulkanContext& ctx = Get();
       std::fprintf(stderr, "[vt vulkan] TOTAL DISPATCHES: %llu\n",
                    static_cast<unsigned long long>(ctx.dispatch_count()));
-      for (const auto& kv : ctx.DispatchHistogram()) {
-        std::fprintf(stderr, "[vt vulkan]   %-24s %llu\n", kv.first.c_str(),
-                     static_cast<unsigned long long>(kv.second));
+      std::map<std::string, uint64_t> counts;
+      for (const auto& kv : ctx.DispatchHistogram()) counts[kv.first] = kv.second;
+      const auto times = ctx.DispatchTimeMs();
+      double total_ms = 0.0;
+      for (const auto& kv : times) total_ms += kv.second;
+      // Sorted by TIME, not count. The ordering is the point: reading a
+      // count-sorted list is how a cheap shader that runs often gets mistaken
+      // for the bottleneck.
+      std::fprintf(stderr, "[vt vulkan] %-24s %8s %10s %7s %10s\n", "shader",
+                   "count", "total ms", "%", "ms/call");
+      for (const auto& kv : times) {
+        const uint64_t n = counts[kv.first];
+        std::fprintf(stderr, "[vt vulkan] %-24s %8llu %10.1f %6.1f%% %10.4f\n",
+                     kv.first.c_str(), static_cast<unsigned long long>(n), kv.second,
+                     total_ms > 0 ? 100.0 * kv.second / total_ms : 0.0,
+                     n > 0 ? kv.second / double(n) : 0.0);
       }
+      std::fprintf(stderr, "[vt vulkan] %-24s %8llu %10.1f\n", "TOTAL",
+                   static_cast<unsigned long long>(ctx.dispatch_count()), total_ms);
     });
   }
   mutex_ = new std::mutex();
@@ -706,6 +722,15 @@ uint64_t VulkanContext::dispatch_count() const {
   return dispatch_total_;
 }
 
+std::vector<std::pair<std::string, double>> VulkanContext::DispatchTimeMs() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& ms = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
+  std::vector<std::pair<std::string, double>> out(ms.begin(), ms.end());
+  std::sort(out.begin(), out.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  return out;
+}
+
 std::vector<std::pair<std::string, uint64_t>> VulkanContext::DispatchHistogram() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   const auto& hist = *static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_);
@@ -818,6 +843,9 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   if (kDispatchStats) {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - wait_t0).count();
+    // Attributed to the shader that just ran. Accumulated OUTSIDE the dispatch
+    // mutex would race; this whole function already holds it.
+    (*static_cast<std::map<std::string, double>*>(dispatch_ms_))[name] += ms;
     if (ms > 200.0) {
       std::fprintf(stderr, "[vt vulkan] SLOW dispatch %-22s %8.1f ms  groups=%u\n",
                    name.c_str(), ms, group_count_x);

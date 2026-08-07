@@ -350,6 +350,14 @@ STATUS_RATCHET = {
     # duplication. Bricks 1b and 2 folded into the same one-line binding result
     # as Bricks 0 and 1; the fuller originals stay in
     # .agents/benchmark-record.md. Net -2501.
+    #
+    # 283446 since 2026-08-07 (measured 283446): the Vulkan row swapped a
+    # SUPERSEDED number for two shipped ones. "71 on CPU tier" was a
+    # registry-coverage count being read as a hot-path one - a profile showed
+    # exactly ONE reference-tier op fires per run (kRopeCosSinCache, at setup) -
+    # so it went out and "argmax 18.9x" came in. The per-shader time profile that
+    # replaces it, and the 55%-of-GPU-time GEMM finding it points at, are detail
+    # and live in .agents/benchmark-record.md rather than on this page. Net -9.
     "chars": 279200,
     "h2_sections": 11,
     "long_paragraphs": 89,
