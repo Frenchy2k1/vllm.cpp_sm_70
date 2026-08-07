@@ -39,6 +39,7 @@ REQUIRED_TEST_METHODS = (
     "test_each_work_dependency_edge_is_pinned",
     "test_optional_w12_does_not_block_w13",
     "test_each_required_record_anchor_is_fail_closed",
+    "test_release_lifecycle_and_honesty_are_fail_closed",
     "test_public_release_rows_remain_pending",
     "test_human_w12_is_optional_and_cannot_replace_w10",
     "test_human_primary_artifact_contract_matches_machine_block",
@@ -81,6 +82,62 @@ RECORD_ANCHORS = {
     ),
 }
 
+LIFECYCLE_RECORD_MUTATIONS = (
+    (
+        ".agents/engine-matrix.md",
+        "`SPIKE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "engine-matrix release lifecycle",
+    ),
+    (
+        ".agents/engine-matrix.md",
+        "gaps remain; no install/archive/publish implementation",
+        "gaps closed; install/archive/publish implementation complete",
+        "engine-matrix release lifecycle",
+    ),
+    (
+        ".agents/roadmap_v1.md",
+        "`SPIKE` | Fresh review of PR #129",
+        "`DONE` | Fresh review of PR #129",
+        "roadmap release lifecycle",
+    ),
+    (
+        ".agents/roadmap_v1.md",
+        "bundle work; no archive exists",
+        "bundle work complete; archive exists",
+        "roadmap release lifecycle",
+    ),
+    (
+        ".agents/coordination.md",
+        "| `ACTIVE` | 2026-08-07 — user-reviewed revision complete: primary fat "
+        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
+        "`SPIKE`; awaiting fresh review |",
+        "| `DONE` | 2026-08-07 — user-reviewed revision complete: primary fat "
+        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
+        "`SPIKE`; awaiting fresh review |",
+        "coordination release lifecycle",
+    ),
+    (
+        ".agents/coordination.md",
+        "no CMake, workflow, source, test, or artifact implementation",
+        "CMake, workflow, source, test, and artifact implementation complete",
+        "coordination release lifecycle",
+    ),
+    (
+        ".agents/coordination.md",
+        "row stays `SPIKE`; awaiting fresh review",
+        "row is `DONE`; release shipped",
+        "coordination release lifecycle",
+    ),
+    (
+        ".agents/state.md",
+        "`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation "
+        "is\nclaimed.",
+        "`ENG-RELEASE-BINARIES` is `DONE`, with archive and implementation.",
+        "state release lifecycle",
+    ),
+)
+
 EXPECTED_DEPS = {
     "W1": "",
     "W2": "W1",
@@ -101,7 +158,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 18 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 19 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -299,6 +356,25 @@ class RecordAnchorMutations(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"{relative} is missing required release anchor", result.stdout + result.stderr)
 
+    def test_release_lifecycle_and_honesty_are_fail_closed(self) -> None:
+        for relative, before, after, reason in LIFECYCLE_RECORD_MUTATIONS:
+            with self.subTest(path=relative, mutation=before), RepoCopy() as root:
+                mutate(root, relative, before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
+
+        with RepoCopy() as root:
+            mutate(
+                root,
+                "tests/scripts/test_check_release_binary_contract.py",
+                '        "engine-matrix release lifecycle",',
+                '        "renamed engine lifecycle",',
+            )
+            result = run_checker(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("LIFECYCLE_RECORD_MUTATIONS", result.stdout + result.stderr)
+
 
 class HumanContractMutations(unittest.TestCase):
     SPEC = ".agents/specs/release-binary-matrix.md"
@@ -363,6 +439,11 @@ class HumanContractMutations(unittest.TestCase):
                 "for relative, anchor in RECORD_ANCHORS.items():",
                 "for relative, anchor in {}.items():",
                 "RECORD_ANCHORS",
+            ),
+            (
+                "for relative, before, after, reason in LIFECYCLE_RECORD_MUTATIONS:",
+                "for relative, before, after, reason in ():",
+                "LIFECYCLE_RECORD_MUTATIONS",
             ),
             (
                 "for relative, before, after, reason in PUBLIC_PENDING_MUTATIONS:",
