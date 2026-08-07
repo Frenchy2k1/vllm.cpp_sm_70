@@ -101,6 +101,7 @@ enum class OpId : uint8_t {
   kGdnDecode,
   kGdnSpecDecode,
   kGdnPackedDecode,
+  kKdaGatedDeltaRule,
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
@@ -851,6 +852,11 @@ using GdnPackedDecodeFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
              const Tensor&, const Tensor&, Tensor&, const Tensor&,
              const GdnArgs&);
+// Per-k-channel-decay gated-delta recurrence (KDA). Same shape as GdnPrefillFn;
+// the ONLY difference is g is [T,Hv,Dk] (per-channel) not [T,Hv] (per-head).
+using KdaGatedDeltaRuleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                     const Tensor&, const Tensor&, Tensor&, const Tensor&,
+                                     const GdnArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -1804,6 +1810,29 @@ void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                 const Tensor& g, const Tensor& beta, Tensor& state,
                 const Tensor& query_start_loc, const GdnArgs& args);
+
+// Kimi Delta Attention (KDA) gated-delta recurrence — the PER-K-CHANNEL-DECAY
+// variant of GdnPrefill. Ported 1:1 from FLA's
+// fused_recurrent_gated_delta_rule_fwd_kernel with IS_KDA=True (third_party/
+// flash_linear_attention/ops/fused_recurrent.py:88-175 @ pin 555967922; the KDA
+// wrapper is ops/kda.py:109-146 fused_recurrent_kda). The plain-GDN kernel
+// (IS_KDA=False) applies a PER-HEAD scalar decay `b_h *= exp(b_g)`; KDA applies a
+// PER-K-CHANNEL decay `b_h *= exp(b_gk[None, :])` — so `g` here is [T,Hv,Dk]
+// (one log-decay per K channel of the value head's [Dv,Dk] state), broadcast
+// across the Dv rows. Everything else is byte-for-byte GdnPrefill's recurrence
+// (decay -> predict -> beta -> rank-1 update -> read-out, all in f32):
+//   S[:,k] *= exp(g[hv,k]);  v' = (v - S @ k) * beta[hv];  S += outer(v',k);
+//   out = S @ (q*scale)
+// The shared GDN kernels are UNTOUCHED (Qwen3.6 27B/35B GDN gate byte-identical);
+// KDA lands as this additive per-channel op. q_in/k [T,Hk,Dk] MUST be
+// l2-normalized by the caller (as GdnPrefill; upstream fuses it via
+// USE_QK_L2NORM_IN_KERNEL, exact per gdn-semantics.md §4). v/out [T,Hv,Dv],
+// g [T,Hv,Dk] f32 per-channel log-decay, beta [T,Hv] f32 (per-head sigmoid(b)),
+// state [N,Hv,Dv,Dk] f32 in/out (zeros for fresh sequences),
+// query_start_loc [N+1] i32. For KDA Hk==Hv; GQA broadcast supported for reuse.
+void KdaGatedDeltaRule(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                       const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                       const Tensor& query_start_loc, const GdnArgs& args);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and

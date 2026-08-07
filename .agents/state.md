@@ -40965,3 +40965,61 @@ question is UNBLOCKED, not answered.
 
 Next: `row/H3-BF16-SHARDED-STREAM` (device streamer), then the operator runs the real
 13-shard bf16 DiT.
+## 2026-08-07T12:30 — Kimi-Linear: per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` LANDED (the §14 STRICT+speed residual, one object)
+<!-- state: 2026-08-07T12:30 -->
+KIMI-KDA-DEVICE-KERNEL (`row/KIMI-KDA-DEVICE-KERNEL`, helper) — the §14 named residual ("`vt::GdnDecode`/
+`GdnPrefill` carry only a per-HEAD scalar decay `g[T,Hv]`; a NEW per-channel-decay GDN kernel `g[T,H,D]`
+is required") is now IMPLEMENTED as the additive device op `vt::KdaGatedDeltaRule`.
+
+  **Grounding (1:1, file:line both sides @ 555967922).** KDA decode REUSES the GDN recurrence kernel —
+  `fused_recurrent_kda` (kda.py:109-146) calls `fused_recurrent_gated_delta_rule_fwd_kernel` with
+  `IS_KDA=True` (fused_recurrent.py:88-175). The SOLE net-new numeric: GDN does `b_h *= exp(b_g)`
+  (per-HEAD scalar, :132-134), KDA does `b_h *= exp(b_gk[None,:])` (per-K-CHANNEL, :136-137) — `g` is
+  `[T,Hv,Dk]`, broadcast across Dv rows. Everything else (decay→predict→beta→rank-1→read-out, f32 on
+  bf16 loads) is byte-for-byte GDN's recurrence. Shared GDN kernels UNTOUCHED (`test_ops_gdn` 58/58·1825).
+
+  **Landed.** OpId `kKdaGatedDeltaRule` + Fn typedef + wrapper/validation (ops.h, ops.cpp); CPU
+  `KdaHeadTokenStep`/`KdaGatedDeltaRuleKernel` (cpu_ops.cpp, GdnHeadTokenStep with a per-`ki` decay
+  vector); CUDA `KdaScanKernel`/`KdaGatedDeltaRuleKernelCuda` (cuda_gdn.cu, GdnScanKernel + a 3rd
+  shared-mem dk-array for the per-K decay). Dual-registered CPU+CUDA.
+
+  **Unit gate RED-first (`tests/vt/test_ops_kda_recurrence.cpp`) 3/3·6 CPU-green:** (1) broadcast-`g`
+  == `vt::GdnPrefill` BIT-IDENTICAL (out+state exact float ==) — ties the op to a landed reference with
+  zero new numerics; (2) distinct per-channel vs the f64 island reference (atol 1e-4 rtol 3e-3);
+  (3) validation rejects per-head g + unset scale; (+CPU↔CUDA parity, GPU-pending). `test_kimi_kda`
+  14/14, `test_kimi_linear_forward` 13/13·656 unchanged (default AND with `VT_KIMI_DEVICE_KDA=1` on CPU).
+
+  **Wiring (opt-in OFF).** `KdaRecurrenceIsland` gains a `VT_KIMI_DEVICE_KDA` branch: device-resident
+  q_n/k_n/v feed `vt::KdaGatedDeltaRule` (fresh zero state, qsl=[0,T]); decay gate + beta stay host
+  (stable). Requires `VT_KIMI_DEVICE_COMPUTE=1`. Default OFF (parity-enabler) = f64 host path production.
+  env-doc: `VT_KIMI_DEVICE_KDA` + the two pre-existing H3 `VT_H3_ACT_*` documented (env-doc gate green).
+
+  **Why STRICT (the §14 razor).** §14 proved host-precision-matching PLATEAUS at 120/128 (f64 island is
+  MORE precise than vLLM, coin-flips near-ties; f32-acc knob regressed 120→91-106). This op runs vLLM's
+  ACTUAL f32-on-bf16 recurrence on device, not a host approximation — the principled STRICT lever AND
+  the per-step device recurrence the paged-incremental-decode speed rewrite needs.
+
+  **GPU-VERIFIED + FULL GATE MEASURED on GB10 (2026-08-07, sm_121a, clean Release CUDA build, Triton-AOT
+  vendored, cutlass-4.5.0).** Kernel GPU-verify: `test_ops_kda_recurrence` **4/4·8** on the CUDA binary
+  (CPU↔CUDA parity confirms KdaScanKernel == CPU kernel on Blackwell); `test_ops_gdn` 66/66·4242 (GDN
+  untouched); `test_kimi_kda` 14/14; 23 KDA symbols linked. Full 48.9B 128-token gate vs the §12 STRICT
+  golden, single-load per config, memory-safe (host RSS peak 1.7 GiB, min-avail 21 GiB, freed cleanly
+  between configs, NO reboot):
+
+  | config | env | /128 | tok/s |
+  |---|---|---|---|
+  | control (f64 host) | `DEVICE_COMPUTE=1` | 106 | 1.35 |
+  | **device-KDA** | `DEVICE_COMPUTE=1 DEVICE_KDA=1` | **122** | **4.24** |
+  | device-KDA + bf16 | `…DEVICE_KDA=1 BF16_RESIDUAL BF16_ISLANDS` | 90 | 4.19 |
+
+  **RESULT (§14 thesis CONFIRMED):** the device recurrence (vLLM's ACTUAL f32-on-bf16 arithmetic) moves
+  **106→122/128** (prompts 0-6 all 16/16; only p7 diverges pos-6, `387` vs golden `11`, a comma near-tie)
+  AND is **3.1× faster (1.35→4.24 tok/s)** — beats BOTH the control (106) AND §14's host-precision best
+  (120). It FIXES the p2 divergence the f64 path had (right arithmetic, not a coin-flip). The §14 bf16
+  knobs are now SUPERSEDED + COUNTERPRODUCTIVE (device-KDA + bf16 REGRESSES 122→90, reintroduces p3's
+  `163586×` repeat loop). Speed win = the device recurrence kills the host Download/f64-recompute/upload
+  round-trip and runs O(T²) in parallel on GPU. `VT_KIMI_DEVICE_KDA` STAYS OFF (122 is a DIVERGENCE, not
+  STRICT). Residual = the SINGLE p7 near-tie → the recorded next brick: KDA chunked-prefill family
+  (`chunk_kda`; regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or native port)
+  + paged `mla::ForwardMlaAttentionBlock` (7 NoPE-MLA layers) + paged-incremental decode. Row `ACTIVE`.
+  Box left clean (artifacts removed, memory restored, worker parked, no reboot).
