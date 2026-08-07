@@ -395,7 +395,7 @@ The correctness form and the full D0-D14 measured chronology live in
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (16 native kernels, 71 on CPU tier; opt-125m
-e2e exact, llvmpipe; coopmat dgx-only;
+e2e exact, llvmpipe; coopmat unrun
 [campaign](../.agents/specs/vulkan-full-support.md)), and the full tool-calling
 template surface. **Scale-out is scoped but unbuilt**
 (2026-07-28): the engine is single-GPU — no NCCL / tensor-parallel /

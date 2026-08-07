@@ -1,0 +1,153 @@
+#version 450
+// vt::Matmul / vt::MatmulBT — COOPERATIVE-MATRIX tactic (VK-C).
+//
+// The tensor-core path. `vt_matmul.comp` remains the portable scalar tactic and
+// the correctness reference; this one is selected only where the device reports
+// the exact configuration it is written to, and the host falls back to the
+// scalar kernel everywhere else.
+//
+// SHAPE IS DICTATED BY HARDWARE, NOT CHOSEN. GB10 reports 11 cooperative-matrix
+// configurations (probed 2026-08-07), all SUBGROUP scope, and this shader is
+// written to exactly one of them:
+//
+//     MxNxK = 16x16x16,  A=bf16  B=bf16  C=f32  R=f32,  scope=SUBGROUP
+//
+// Vulkan matches configurations EXACTLY -- there is no nearest-fit -- so the host
+// predicate (VulkanContext::coopmat_bf16_f32) asks for that tuple and nothing
+// else. Two consequences follow and neither is a policy choice: f32 operands can
+// never use this path (every reported configuration takes bf16/f16/int8 inputs),
+// and a device offering only f16 or int8 configurations correctly gets the scalar
+// tactic.
+//
+// PORTED FROM llama.cpp `vulkan-shaders/mul_mm_cm2.comp` @ pin 237ad9b96 for its
+// STRUCTURE -- one subgroup owning a 16x16 output tile, K walked in steps of 16,
+// `coopMatMulAdd` accumulating in f32 across the whole K loop. The per-element
+// semantics (which operand is transposed, the f32 accumulate, the single round on
+// store) come from our own cpu_ops.cpp MatmulChunked, which is the numeric
+// oracle for both tactics.
+//
+// NUMERICS: THIS TACTIC DOES NOT MATCH THE SCALAR ONE BIT-FOR-BIT, and does not
+// claim to. The scalar kernel walks K sequentially per output element precisely
+// so its accumulation ORDER matches the CPU's; a cooperative matrix accumulates a
+// 16x16x16 tile at a time in an order the hardware defines. Both accumulate in
+// f32 and round once on store, so both sit inside the NMSE <= 5e-4 bar against
+// the CPU oracle -- but only the scalar one shares the CPU's order. That is why
+// the scalar tactic stays the reference and this is gated against it.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#include "vt_common.glsl"
+
+// ONE SUBGROUP PER OUTPUT TILE, and the workgroup is exactly one subgroup wide so
+// the map from gl_WorkGroupID to a 16x16 tile needs no intra-workgroup
+// bookkeeping. gl_ScopeSubgroup distributes each matrix across a subgroup, so a
+// wider workgroup would mean several subgroups racing for the same tile.
+//
+// The size is a LITERAL 32, not a specialization constant, and that is the same
+// measured constraint recorded in vt_common.glsl: `local_size_x_id` makes glslang
+// emit `ExecutionMode LocalSize 1 1 1` plus the legacy BuiltIn WorkgroupSize
+// vector at the vulkan1.1 target, which silently runs one thread per workgroup.
+// So the committed SPIR-V is compiled FOR subgroup size 32 and the host refuses
+// the tactic on any device reporting otherwise (VulkanContext::subgroup_size),
+// rather than the size travelling as a constant.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { bfloat16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { bfloat16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+// b orientation, exactly as in the scalar kernel:
+//   0 -> b is [K,N] row-major   (vt::Matmul)
+//   1 -> b is [N,K] row-major   (vt::MatmulBT, the torch Linear weight layout)
+layout(constant_id = 0) const uint VT_MM_BT = 0u;
+// Output storage dtype. A and B are bf16 by the configuration above; only the
+// destination varies.
+layout(constant_id = 1) const uint VT_MM_OUT_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint n;
+  uint k;
+  uint a_off;
+  uint b_off;
+  uint out_off;
+} p;
+
+const uint VT_CM = 16u;  // the reported M = N = K tile extent
+
+// Spill buffer for the edge/non-f32 store path. Declared at file scope because a
+// shared declaration cannot live inside a function.
+shared float vt_cm_spill[VT_CM * VT_CM];
+
+void main() {
+  // Output tile coordinates. Tiles cover ceil(m/16) x ceil(n/16); edge tiles are
+  // handled by the bounds-checked store below rather than by a separate kernel.
+  uint tiles_n = (p.n + VT_CM - 1u) / VT_CM;
+  uint tile = gl_WorkGroupID.x;
+  if (tile >= ((p.m + VT_CM - 1u) / VT_CM) * tiles_n) { return; }
+  uint tile_m = (tile / tiles_n) * VT_CM;
+  uint tile_n = (tile % tiles_n) * VT_CM;
+
+  coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator> acc =
+      coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator>(0.0);
+
+  // K is walked in whole 16-wide steps. A ragged K tail cannot be masked inside a
+  // cooperative matrix load, so the HOST only selects this tactic when k % 16 ==
+  // 0; the assert-by-construction is that this loop covers exactly k.
+  for (uint k0 = 0u; k0 < p.k; k0 += VT_CM) {
+    coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseA> ma;
+    coopmat<bfloat16_t, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseB> mb;
+
+    // A is [M,K] row-major: element (i, q) at a_off/2 + i*k + q, stride k.
+    coopMatLoad(ma, A16.v, (p.a_off >> 1) + tile_m * p.k + k0, p.k, gl_CooperativeMatrixLayoutRowMajor);
+
+    if (VT_MM_BT == 1u) {
+      // b is [N,K]: the tile we need is rows [tile_n, tile_n+16) at columns
+      // [k0, k0+16), which is B^T in the multiply -- loaded as COLUMN major so
+      // the same memory serves as the B operand without a transpose pass.
+      coopMatLoad(mb, B16.v, (p.b_off >> 1) + tile_n * p.k + k0, p.k,
+                  gl_CooperativeMatrixLayoutColumnMajor);
+    } else {
+      // b is [K,N]: element (q, j) at b_off/2 + q*n + j, stride n.
+      coopMatLoad(mb, B16.v, (p.b_off >> 1) + k0 * p.n + tile_n, p.n,
+                  gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    acc = coopMatMulAdd(ma, mb, acc);
+  }
+
+  // ALWAYS SPILL THROUGH SHARED MEMORY, then write elementwise. One path, not a
+  // fast path plus an edge path, and deliberately so:
+  //
+  //   * TYPE SAFETY. A direct coopMatStore into the destination would have to
+  //     target the uint32 view this backend binds (VT_STORE reaches f32 storage
+  //     through floatBitsToUint), i.e. store a coopmat<float> through a uint
+  //     pointer. glslang ACCEPTS that without complaint, which is exactly why it
+  //     is not relied on -- and no device reachable from CI can execute a coopmat
+  //     shader at all, so the mistake would not surface here.
+  //   * A ragged M or N needs bounds checking that a cooperative-matrix store
+  //     cannot express, and a non-f32 destination needs the dtype conversion
+  //     VT_STORE does. Both already require this pass.
+  //
+  // The cost is one shared-memory round trip per 16x16 tile. A direct-store fast
+  // path for the full-tile f32 case is a legitimate later refinement, but it is a
+  // SPEED change and belongs behind an A/B on real hardware, not in the landing
+  // that first has to be correct.
+  //
+  // RowMajor into shared memory keeps the (row, col) mapping the spec defines, so
+  // the elementwise pass below is layout-agnostic.
+  coopMatStore(acc, vt_cm_spill, 0, VT_CM, gl_CooperativeMatrixLayoutRowMajor);
+  barrier();
+  for (uint idx = gl_LocalInvocationID.x; idx < VT_CM * VT_CM; idx += gl_WorkGroupSize.x) {
+    uint r = idx / VT_CM;
+    uint c = idx % VT_CM;
+    if (tile_m + r >= p.m || tile_n + c >= p.n) continue;
+    VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, (tile_m + r) * p.n + (tile_n + c),
+             vt_cm_spill[idx]);
+  }
+}
