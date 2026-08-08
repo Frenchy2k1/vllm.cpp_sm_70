@@ -1,45 +1,20 @@
-// Weight loader for the `Gemma4ForConditionalGeneration` text backbone
-// (unsloth/gemma-4-E4B-it, BF16) — MODEL-GEMMA4 G1. Loads the language_model
-// stack into Gemma4Weights (gemma4.h) via the shared dense_weight_loaders.h
-// helpers, VERIFIED against the checkpoint's safetensors header (2130 tensors;
-// the 336 language_model.* tensors mapped below, mm towers skipped).
-//
-// Grounding: vllm/model_executor/models/gemma4.py — load_weights (:1625-1728)
-// strips the `language_model.` prefix (:1644); packed_modules_mapping
-// (:1536-1546) qkv_proj<-[q,k,v]_proj, gate_up_proj<-[gate,up]_proj;
-// tie_word_embeddings (:1566-1567) — lm_head aliases embed_tokens, checkpoint has
-// no lm_head.weight; skip mm weights audio_tower/vision_tower/embed_audio/
-// embed_vision (:1716-1723).
-//
-// Name map (unsloth/gemma-4-E4B-it, wrapper prefix `model.language_model.`):
-//   model.language_model.embed_tokens.weight              -> embed_tokens [V,H]
-//   model.language_model.embed_tokens_per_layer.weight    -> embed_tokens_per_layer [V, ple*L]
-//   model.language_model.per_layer_model_projection.weight-> per_layer_model_projection [ple*L, H]
-//   model.language_model.per_layer_projection_norm.weight -> per_layer_projection_norm [ple]
-//   model.language_model.norm.weight                      -> final_norm [H]
-//   ...layers.N.input_layernorm.weight                    -> input_layernorm [H]
-//   ...layers.N.post_attention_layernorm.weight           -> post_attention_ln [H]
-//   ...layers.N.pre_feedforward_layernorm.weight          -> pre_feedforward_ln [H]
-//   ...layers.N.post_feedforward_layernorm.weight         -> post_feedforward_ln [H]
-//   ...layers.N.post_per_layer_input_norm.weight          -> post_per_layer_input_norm [H]
-//   ...layers.N.per_layer_input_gate.weight               -> per_layer_input_gate [ple,H]
-//   ...layers.N.per_layer_projection.weight               -> per_layer_projection [H,ple]
-//   ...layers.N.layer_scalar                              -> layer_scalar [1]
-//   ...layers.N.self_attn.{q,k,v}_proj.weight             -> merged qkv_proj (raw-NK)
-//   ...layers.N.self_attn.o_proj.weight                   -> o_proj (raw-NK)
-//   ...layers.N.self_attn.{q,k}_norm.weight               -> q_norm/k_norm [Dh]
-//   ...layers.N.mlp.{gate,up}_proj.weight                 -> merged gate_up_proj (raw-NK)
-//   ...layers.N.mlp.down_proj.weight                      -> down_proj (raw-NK)
+// Weight loader: Gemma4 E4B PLE / 12B dense BF16 / 26B-A4B MoE BF16 fused experts.
+#include <cmath>
+// Experts are mmap-borrowed (30GB host cannot hold full BF16 MoE).
 #include "vllm/model_executor/models/gemma4.h"
 
+#include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/model_executor/models/gemma4_moe.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -48,17 +23,13 @@ namespace {
 using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
 using dense_loaders::LoadMergedBf16RawNK;
+using dense_loaders::MakeOwned;
 
-// HfConfig::raw is the FULL config.json (hf_config.cpp:414); the Gemma-4
-// language-model scalars (layer_types, global_head_dim, num_kv_shared_layers,
-// tie_word_embeddings) are nested under `text_config` in the mm wrapper. Read
-// them through this view — top-level for a plain config, text_config otherwise.
 const nlohmann::json& TextCfg(const nlohmann::json& raw) {
   const auto it = raw.find("text_config");
   if (it != raw.end() && it->is_object()) return *it;
   return raw;
 }
-
 bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
   const auto it = doc.find(key);
   if (it == doc.end() || it->is_null() || !it->is_boolean()) return fallback;
@@ -70,25 +41,20 @@ int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   return it->get<int64_t>();
 }
 
-// Per-layer attention topology derived from the config (gemma4.py:441-489,
-// :572-593). full_attention layers use global_head_dim; the last
-// num_kv_shared_layers reuse the last non-shared layer of the same type's K/V.
 struct LayerTopo {
   std::vector<bool> is_full;
   std::vector<bool> is_shared;
   std::vector<int64_t> head_dim;
-  std::vector<int64_t> kv_target;  // -1 for self, else source layer index
+  std::vector<int64_t> kv_target;
 };
 
 LayerTopo MakeTopo(const HfConfig& cfg) {
   const nlohmann::json& raw = TextCfg(cfg.raw);
   const int64_t L = cfg.num_hidden_layers;
-  const int64_t head_dim_sliding = cfg.head_dim;  // text_config head_dim (256)
-  const int64_t head_dim_full =
-      RawInt(raw, "global_head_dim", cfg.head_dim);  // 512
+  const int64_t head_dim_sliding = cfg.head_dim;
+  const int64_t head_dim_full = RawInt(raw, "global_head_dim", cfg.head_dim);
   const int64_t num_shared = RawInt(raw, "num_kv_shared_layers", 0);
   const int64_t first_shared = L - num_shared;
-
   LayerTopo t;
   t.is_full.assign(static_cast<size_t>(L), false);
   const auto it = raw.find("layer_types");
@@ -106,7 +72,6 @@ LayerTopo MakeTopo(const HfConfig& cfg) {
     t.head_dim[static_cast<size_t>(l)] = full ? head_dim_full : head_dim_sliding;
     if (num_shared > 0 && l >= first_shared) {
       t.is_shared[static_cast<size_t>(l)] = true;
-      // Last non-shared layer (< first_shared) of the same attention type.
       int64_t target = -1;
       for (int64_t p = first_shared - 1; p >= 0; --p) {
         if (t.is_full[static_cast<size_t>(p)] == full) {
@@ -120,8 +85,81 @@ LayerTopo MakeTopo(const HfConfig& cfg) {
   return t;
 }
 
-Gemma4LayerWeights LoadGemma4Layer(const TensorResolver& get, int64_t layer,
-                                   const LayerTopo& topo) {
+// Borrow BF16 tensor from mmap (no host copy). Keepalive = shards shared_ptr.
+OwnedTensor BorrowBf16(const StTensor& t, std::shared_ptr<const void> owner,
+                       const std::vector<int64_t>& shape_override = {}) {
+  VT_CHECK(t.dtype == "BF16", "gemma4: expected BF16 borrow");
+  std::vector<int64_t> shape = shape_override.empty() ? t.shape : shape_override;
+  OwnedTensor o;
+  o.dtype = vt::DType::kBF16;
+  o.rank = static_cast<int>(shape.size());
+  VT_CHECK(o.rank <= vt::kMaxRank, "gemma4: rank");
+  int64_t n = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[static_cast<size_t>(i)];
+    n *= shape[static_cast<size_t>(i)];
+  }
+  VT_CHECK(static_cast<size_t>(n) * 2 == t.nbytes, "gemma4: borrow size mismatch");
+  o.bytes = OwnedBytes::Borrow(t.data, t.nbytes, std::move(owner));
+  return o;
+}
+
+Gemma4MoeLayerWeights LoadMoeBf16(
+    const TensorResolver& get, const std::string& base, int64_t E, int64_t top_k,
+    int64_t moe_I, int64_t H, std::shared_ptr<const void> owner) {
+  Gemma4MoeLayerWeights m;
+  m.enabled = true;
+  m.top_k = static_cast<int>(top_k);
+  m.moe_intermediate = moe_I;
+  m.router_scale = LoadBf16Direct(get, base + "router.scale");
+  m.router_proj = LoadMergedBf16RawNK(get, {base + "router.proj.weight"});
+  m.per_expert_scale = LoadBf16Direct(get, base + "router.per_expert_scale");
+  // Fuse scale * H^{-0.5} into router proj once at load.
+  {
+    VT_CHECK(m.router_proj.nk && m.router_proj.shape[0] == E &&
+                 m.router_proj.shape[1] == H,
+             "gemma4 moe: router_proj shape");
+    const float rsqrt_h = 1.f / std::sqrt(static_cast<float>(H));
+    const auto* sc = reinterpret_cast<const uint16_t*>(m.router_scale.bytes.data());
+    const auto* ps = reinterpret_cast<const uint16_t*>(m.router_proj.bytes.data());
+    m.router_proj_fused = MakeOwned(vt::DType::kBF16, {E, H});
+    m.router_proj_fused.nk = true;
+    auto* pd = reinterpret_cast<uint16_t*>(m.router_proj_fused.bytes.data());
+    for (int64_t e = 0; e < E; ++e)
+      for (int64_t j = 0; j < H; ++j)
+        pd[e * H + j] = vt::F32ToBF16(vt::BF16ToF32(ps[e * H + j]) *
+                                      vt::BF16ToF32(sc[j]) * rsqrt_h);
+  }
+  m.pre_feedforward_layernorm_2 =
+      LoadBf16Direct(get, base + "pre_feedforward_layernorm_2.weight");
+  m.post_feedforward_layernorm_1 =
+      LoadBf16Direct(get, base + "post_feedforward_layernorm_1.weight");
+  m.post_feedforward_layernorm_2 =
+      LoadBf16Direct(get, base + "post_feedforward_layernorm_2.weight");
+
+  // Fused: gate_up [E, 2I, H], down [E, H, I] — rank 3 exceeds kMaxRank=4 ok (3<=4)
+  const StTensor& gu = get(base + "experts.gate_up_proj");
+  const StTensor& dn = get(base + "experts.down_proj");
+  VT_CHECK(gu.shape.size() == 3 && gu.shape[0] == E && gu.shape[1] == 2 * moe_I &&
+               gu.shape[2] == H,
+           "gemma4 moe: gate_up expected [E,2I,H]");
+  VT_CHECK(dn.shape.size() == 3 && dn.shape[0] == E && dn.shape[1] == H &&
+               dn.shape[2] == moe_I,
+           "gemma4 moe: down expected [E,H,I]");
+  m.experts.gate_up = BorrowBf16(gu, owner);
+  m.experts.down = BorrowBf16(dn, owner);
+  m.experts.num_experts = E;
+  m.experts.intermediate = moe_I;
+  m.experts.hidden = H;
+  return m;
+}
+
+Gemma4LayerWeights LoadGemma4Layer(
+    const TensorResolver& get, const std::unordered_set<std::string>& names,
+    int64_t layer, const LayerTopo& topo, bool load_ple, int64_t num_q_heads,
+    int64_t num_kv_heads_sliding, int64_t num_kv_heads_full, bool enable_moe,
+    int64_t num_experts, int64_t top_k, int64_t moe_I, int64_t H,
+    std::shared_ptr<const void> owner) {
   const std::string base =
       "model.language_model.layers." + std::to_string(layer) + ".";
   const std::string sa = base + "self_attn.";
@@ -132,8 +170,9 @@ Gemma4LayerWeights LoadGemma4Layer(const TensorResolver& get, int64_t layer,
   w.is_kv_shared = topo.is_shared[static_cast<size_t>(layer)];
   w.head_dim = topo.head_dim[static_cast<size_t>(layer)];
   w.kv_target_layer = topo.kv_target[static_cast<size_t>(layer)];
+  w.num_kv_heads =
+      w.is_full_attention ? num_kv_heads_full : num_kv_heads_sliding;
 
-  // Four PLAIN RMSNorm weights (gemma4.py:632-641).
   w.input_layernorm = LoadBf16Direct(get, base + "input_layernorm.weight");
   w.post_attention_layernorm =
       LoadBf16Direct(get, base + "post_attention_layernorm.weight");
@@ -142,30 +181,114 @@ Gemma4LayerWeights LoadGemma4Layer(const TensorResolver& get, int64_t layer,
   w.post_feedforward_layernorm =
       LoadBf16Direct(get, base + "post_feedforward_layernorm.weight");
 
-  // PLE per-layer components (gemma4.py:680-707).
-  w.per_layer_input_gate =
-      LoadMergedBf16RawNK(get, {base + "per_layer_input_gate.weight"});
-  w.per_layer_projection =
-      LoadMergedBf16RawNK(get, {base + "per_layer_projection.weight"});
-  w.post_per_layer_input_norm =
-      LoadBf16Direct(get, base + "post_per_layer_input_norm.weight");
-  w.layer_scalar = LoadBf16Direct(get, base + "layer_scalar");
+  if (load_ple) {
+    w.per_layer_input_gate =
+        LoadMergedBf16RawNK(get, {base + "per_layer_input_gate.weight"});
+    w.per_layer_projection =
+        LoadMergedBf16RawNK(get, {base + "per_layer_projection.weight"});
+    w.post_per_layer_input_norm =
+        LoadBf16Direct(get, base + "post_per_layer_input_norm.weight");
+  }
+  if (names.count(base + "layer_scalar"))
+    w.layer_scalar = LoadBf16Direct(get, base + "layer_scalar");
 
-  // QKVParallelLinear merged (q,k,v output-row order), o_proj. No bias
-  // (attention_bias=false). Shared layers still carry q/k/v_proj in the
-  // checkpoint (verified); the forward reuses the target layer's K/V and
-  // discards this layer's K/V, but we load them for a complete, verifiable map.
-  w.attn.qkv_proj = LoadMergedBf16RawNK(
-      get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+  const std::string v_name = sa + "v_proj.weight";
+  w.k_eq_v = names.count(v_name) == 0;
+  if (w.k_eq_v) {
+    w.attn.qkv_proj = LoadMergedBf16RawNK(
+        get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "k_proj.weight"});
+  } else {
+    w.attn.qkv_proj = LoadMergedBf16RawNK(
+        get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+  }
   w.attn.o_proj = LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
-  // Per-head PLAIN Q/K RMSNorm (gemma4.py:434-435). V-norm is weight-less.
   w.attn.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   w.attn.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
 
-  // GeGLU MLP (gemma4.py:234-247): merged gate_up (gate,up), then down.
+  if (w.attn.qkv_proj.rank >= 1 && num_q_heads > 0 && w.num_kv_heads > 0) {
+    const int64_t rows = w.attn.qkv_proj.shape[0];
+    const int64_t denom = num_q_heads + 2 * w.num_kv_heads;
+    if (denom > 0 && rows % denom == 0) {
+      const int64_t dh = rows / denom;
+      if (dh > 0) w.head_dim = dh;
+    }
+  }
+
   w.mlp.gate_up_proj =
       LoadMergedBf16RawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
   w.mlp.down_proj = LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+
+  if (enable_moe && names.count(base + "experts.gate_up_proj")) {
+    w.moe = LoadMoeBf16(get, base, num_experts, top_k, moe_I, H, owner);
+  }
+  return w;
+}
+
+Gemma4Weights LoadImpl(const std::vector<SafetensorsFile>& shards,
+                       const HfConfig& config,
+                       std::shared_ptr<const void> shards_owner) {
+  std::unordered_map<std::string, const SafetensorsFile*> where;
+  std::unordered_set<std::string> names;
+  for (const SafetensorsFile& shard : shards) {
+    for (const std::string& name : shard.Names()) {
+      where[name] = &shard;
+      names.insert(name);
+    }
+  }
+  const TensorResolver get = [&where](const std::string& name) -> const StTensor& {
+    auto it = where.find(name);
+    VT_CHECK(it != where.end(), "gemma4: tensor not found: " + name);
+    return it->second->Get(name);
+  };
+
+  VT_CHECK(config.num_hidden_layers > 0, "gemma4: num_hidden_layers");
+  const nlohmann::json& text = TextCfg(config.raw);
+  const int64_t H = config.hidden_size;
+  const int64_t ple_cfg = RawInt(text, "hidden_size_per_layer_input", 0);
+  const bool load_ple =
+      ple_cfg > 0 &&
+      names.count("model.language_model.embed_tokens_per_layer.weight") > 0;
+  const bool enable_moe =
+      RawBool(text, "enable_moe_block", false) ||
+      names.count("model.language_model.layers.0.experts.gate_up_proj") > 0 ||
+      names.count("model.language_model.layers.0.router.proj.weight") > 0;
+  const int64_t num_experts = RawInt(text, "num_experts", 0);
+  const int64_t top_k = RawInt(text, "top_k_experts", 8);
+  const int64_t moe_I = RawInt(text, "moe_intermediate_size", 0);
+
+  if (enable_moe) {
+    VT_CHECK(shards_owner != nullptr,
+             "gemma4 MoE BF16 requires safetensors_owned keepalive for expert mmap");
+  }
+
+  const LayerTopo topo = MakeTopo(config);
+  Gemma4Weights w;
+  w.tie_word_embeddings = RawBool(text, "tie_word_embeddings", true);
+  w.embed_tokens = LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
+  if (load_ple) {
+    w.embed_tokens_per_layer =
+        LoadBf16Direct(get, "model.language_model.embed_tokens_per_layer.weight");
+    w.per_layer_model_projection = LoadMergedBf16RawNK(
+        get, {"model.language_model.per_layer_model_projection.weight"});
+    w.per_layer_projection_norm =
+        LoadBf16Direct(get, "model.language_model.per_layer_projection_norm.weight");
+  }
+  w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
+  if (!w.tie_word_embeddings && names.count("lm_head.weight"))
+    w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
+
+  // Keep shards alive for borrowed experts
+  w.shards_keepalive = shards_owner;
+
+  const int64_t Hq = config.num_attention_heads;
+  const int64_t Hkv_slide = config.num_key_value_heads;
+  const int64_t Hkv_full = RawInt(text, "num_global_key_value_heads", Hkv_slide);
+  w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    w.layers.push_back(LoadGemma4Layer(get, names, l, topo, load_ple, Hq, Hkv_slide,
+                                       Hkv_full, enable_moe, num_experts, top_k, moe_I,
+                                       H, shards_owner));
+  }
   return w;
 }
 
@@ -173,41 +296,15 @@ Gemma4LayerWeights LoadGemma4Layer(const TensorResolver& get, int64_t layer,
 
 Gemma4Weights LoadGemma4ForConditionalGenerationWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
-  std::unordered_map<std::string, const SafetensorsFile*> where;
-  for (const SafetensorsFile& shard : shards)
-    for (const std::string& name : shard.Names()) where[name] = &shard;
-  const TensorResolver get =
-      [&where](const std::string& name) -> const StTensor& {
-    auto it = where.find(name);
-    VT_CHECK(it != where.end(), "gemma4: tensor not found: " + name);
-    return it->second->Get(name);
-  };
+  // Dense 12B path: no owner needed. MoE will throw if experts present without owner.
+  return LoadImpl(shards, config, nullptr);
+}
 
-  VT_CHECK(config.num_hidden_layers > 0,
-           "gemma4: num_hidden_layers must be positive");
-
-  const LayerTopo topo = MakeTopo(config);
-
-  Gemma4Weights w;
-  // Gemma-4 ties embeddings by default (text_config.tie_word_embeddings=true).
-  w.tie_word_embeddings = RawBool(TextCfg(config.raw), "tie_word_embeddings", true);
-
-  w.embed_tokens = LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
-  w.embed_tokens_per_layer =
-      LoadBf16Direct(get, "model.language_model.embed_tokens_per_layer.weight");
-  w.per_layer_model_projection = LoadMergedBf16RawNK(
-      get, {"model.language_model.per_layer_model_projection.weight"});
-  w.per_layer_projection_norm =
-      LoadBf16Direct(get, "model.language_model.per_layer_projection_norm.weight");
-  w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
-  if (!w.tie_word_embeddings) {
-    w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
-  }
-
-  w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
-    w.layers.push_back(LoadGemma4Layer(get, l, topo));
-  return w;
+Gemma4Weights LoadGemma4ForConditionalGenerationWeightsOwned(
+    std::shared_ptr<const std::vector<SafetensorsFile>> shards,
+    const HfConfig& config) {
+  VT_CHECK(shards != nullptr, "gemma4: null shards");
+  return LoadImpl(*shards, config, std::shared_ptr<const void>(shards, shards.get()));
 }
 
 }  // namespace vllm
