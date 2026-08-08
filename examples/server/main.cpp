@@ -62,9 +62,11 @@
 #include <fstream>
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
+#include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
+#include "vllm/v1/metrics/loggers.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/detect.h"
 #include "vllm/entrypoints/openai/tool_parsers/detect.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -178,6 +180,15 @@ struct Args {
   // routers only under `if envs.VLLM_SERVER_DEV_MODE` (api_server.py:238). Off by
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
+  bool verbose = false;
+  // Gemma4 HF/vLLM: --default-chat-template-kwargs enable_thinking (default OFF).
+  bool enable_thinking = false;
+  // Request logging (Python vLLM --enable-log-requests parity). Default ON.
+  bool enable_log_requests = true;
+  bool enable_log_outputs = false;
+  int max_log_len = 256;
+  // Attach Prometheus logger + GET /metrics (default ON for solid Hermes serve).
+  bool enable_metrics = true;
   // Scheduling policy: "fcfs" (default), "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy), or "lpm" (SGLang's
   // cache-aware longest-prefix-match admission ordering, ENG-SGLANG-BEHAVIOR-FLAG;
@@ -225,6 +236,11 @@ struct Args {
          "               [--enable-force-include-usage]\n"
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
+         "               [--verbose]\n"
+         "               [--enable-thinking|--no-enable-thinking]\n"
+         "               [--enable-log-requests|--disable-log-requests]\n"
+         "               [--enable-log-outputs] [--max-log-len N]\n"
+         "               [--enable-metrics|--disable-metrics]\n"
          "               [--[no-]enable-prefix-caching]\n"
          "               [--[no-]enable-radix-attention]\n"
          "               [--scheduling-policy fcfs|priority|lpm]\n"
@@ -319,6 +335,24 @@ Args ParseArgs(int argc, char** argv) {
       a.video_dequant_bf16 = true;
     } else if (flag == "--enable-server-dev-mode") {
       a.enable_server_dev_mode = true;
+    } else if (flag == "--verbose" || flag == "-v") {
+      a.verbose = true;
+    } else if (flag == "--enable-thinking") {
+      a.enable_thinking = true;
+    } else if (flag == "--no-enable-thinking") {
+      a.enable_thinking = false;
+    } else if (flag == "--enable-log-requests") {
+      a.enable_log_requests = true;
+    } else if (flag == "--disable-log-requests") {
+      a.enable_log_requests = false;
+    } else if (flag == "--enable-log-outputs") {
+      a.enable_log_outputs = true;
+    } else if (flag == "--max-log-len") {
+      a.max_log_len = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--enable-metrics") {
+      a.enable_metrics = true;
+    } else if (flag == "--disable-metrics") {
+      a.enable_metrics = false;
     } else if (flag == "--enable-prefix-caching" ||
                flag == "--no-enable-prefix-caching" ||
                flag == "--enable-radix-attention" ||
@@ -416,6 +450,26 @@ Args ParseArgs(int argc, char** argv) {
 int main(int argc, char** argv) {
   try {
     const Args args = ParseArgs(argc, argv);
+    if (args.verbose) {
+      setenv("VT_SERVER_VERBOSE", "1", /*overwrite=*/1);
+      std::cerr << "server: verbose stage logging enabled (debug_stages)\n";
+    }
+    {
+      vllm::entrypoints::openai::RequestLogConfig log_cfg;
+      log_cfg.enable_log_requests = args.enable_log_requests;
+      log_cfg.enable_log_outputs = args.enable_log_outputs || args.verbose;
+      log_cfg.max_log_len = args.max_log_len;
+      log_cfg.debug_stages = args.verbose ||
+                             (std::getenv("VT_SERVER_VERBOSE") &&
+                              std::getenv("VT_SERVER_VERBOSE")[0] == '1');
+      vllm::entrypoints::openai::ConfigureRequestLogger(log_cfg);
+      std::cerr << "server: request logging "
+                << (log_cfg.enable_log_requests ? "ON" : "OFF")
+                << " outputs=" << (log_cfg.enable_log_outputs ? "ON" : "OFF")
+                << " max_log_len=" << log_cfg.max_log_len
+                << " debug_stages=" << (log_cfg.debug_stages ? "ON" : "OFF")
+                << "\n";
+    }
 
     const fs::path dir(args.model_dir);
     const std::string config_path = (dir / "config.json").string();
@@ -666,9 +720,13 @@ int main(int argc, char** argv) {
       const std::string eos =
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
       chat_prompt_fn =
-          vllm::entrypoints::MakeChatTemplatePromptFn(chat_template, bos, eos);
-      std::cerr << "server: using chat template from " << tokenizer_config_path
-                << "\n";
+          vllm::entrypoints::MakeChatTemplatePromptFn(
+              chat_template, bos, eos, args.enable_thinking);
+      std::cerr << "server: using chat template (" << chat_template.size()
+                << " chars) from " << tokenizer_config_path
+                << " or sibling chat_template.jinja"
+                << " enable_thinking="
+                << (args.enable_thinking ? "true" : "false") << "\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";
@@ -854,6 +912,17 @@ int main(int argc, char** argv) {
               << (args.enable_server_dev_mode ? ", /abort_requests on (dev-mode)"
                                               : "")
               << "\n";
+
+    // Prometheus /metrics (Python vLLM always-on family names).
+    std::unique_ptr<vllm::v1::metrics::PrometheusStatLogger> prom_logger;
+    if (args.enable_metrics) {
+      prom_logger = std::make_unique<vllm::v1::metrics::PrometheusStatLogger>(
+          served_model_name, loaded->max_model_len(), /*engine_index=*/0);
+      // Sync engine path records on step(); async may under-report until fully wired.
+      loaded->engine().set_stat_logger(prom_logger.get());
+      server.set_metrics_logger(prom_logger.get());
+      std::cerr << "server: GET /metrics enabled (PrometheusStatLogger)\n";
+    }
 
     std::cerr << "server: listening on http://" << args.host << ":" << args.port
               << " (model '" << served_model_name << "', HTTP worker pool ";

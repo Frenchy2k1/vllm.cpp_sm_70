@@ -25,9 +25,15 @@ struct Gemma4Fp8ExpertMats {
   // Lazy host BF16 cache after first dequant (decode reuse).
   mutable std::vector<uint16_t> cached_gu;  // [2I,H]
   mutable std::vector<uint16_t> cached_dn;  // [H,I]
+  mutable bool host_pinned = false;
   // Lazy device BF16 copy on compute GPU (avoids H2D every token).
   mutable void* dev_gu = nullptr;  // [2I,H] bf16
   mutable void* dev_dn = nullptr;  // [H,I] bf16
+  // Native FP8 on device (VT_GEMMA4_FP8_NATIVE=1): half weight bandwidth vs BF16.
+  mutable void* dev_fp8_gu = nullptr;  // u8 [2I,H] gate|up
+  mutable void* dev_fp8_dn = nullptr;  // u8 [H,I]
+  mutable void* dev_s_gu = nullptr;    // bf16 [2I]
+  mutable void* dev_s_dn = nullptr;    // bf16 [H]
 };
 
 struct Gemma4FusedExperts {
@@ -74,8 +80,30 @@ size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
                                    int num_gpus);
 size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights, int num_gpus);
 
+// Peer-copy one resident expert (fused stacks on src_dev) into dst buffers on
+// compute_dev. Returns false if peer path unavailable.
+bool PeerCopyGemma4ExpertSlice(int src_dev, const void* gate_up_base,
+                               const void* down_base, int expert_id, int64_t I,
+                               int64_t H, int compute_dev, void* gate_up_dst,
+                               void* down_dst);
+
+// hipHostRegister BF16 expert cache for faster H2D (no-op if already pinned).
+void PinGemma4Fp8ExpertHostCache(const Gemma4Fp8ExpertMats& ex);
+
 // Dequant one FP8 expert into host BF16 gate_up[2I,H] and down[H,I] (caller-owned).
+// Fills permanent host cache (decode path). Prefer Ephemeral for bulk upload.
 void DequantGemma4Fp8ExpertToBf16(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H,
                                   uint16_t* gate_up_out, uint16_t* down_out);
+// Same dequant without retaining permanent host BF16 cache (resident upload).
+void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_t I,
+                                           int64_t H, uint16_t* gate_up_out,
+                                           uint16_t* down_out);
+
+// Fused top-k ExpertGeGLU (T=1). Opt-in VT_GEMMA4_FUSED_EXPERTS=1.
+// Returns false if disabled/unsupported — caller uses serial hipBLAS path.
+bool RunGemma4FusedTopkExpertGeGLU(vt::Queue& q, void* ysum, const void* x,
+                                   const uint16_t* const* gu_ptrs,
+                                   const uint16_t* const* dn_ptrs, const float* wts, int G,
+                                   int64_t I, int64_t H);
 
 }  // namespace vllm

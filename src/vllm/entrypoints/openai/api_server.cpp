@@ -4,6 +4,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/metrics/loggers.h"
@@ -209,6 +211,9 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
                      "The model does not support Chat Completions API "
                      "(transcription-only server)");
   }
+  {
+    LogHttpIngress("POST", "/v1/chat/completions", request_body.size());
+  }
   // chat_completion/api_router.py:53 (create_chat_completion).
   nlohmann::json body;
   try {
@@ -239,6 +244,7 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
   } catch (const std::exception& e) {
     std::cerr << "api-server: 500 endpoint=/v1/chat/completions model="
               << request.model.value_or("") << " what=" << e.what() << "\n";
+    LogRequestError("", "/v1/chat/completions", e.what());
     return MakeError(500, "InternalServerError", e.what());
   }
 

@@ -63,19 +63,22 @@ class ChatTemplateError : public std::runtime_error {
 //                         branch. Empty => the `tools` variable is an empty list
 //                         (falsy). The `tojson` filter is a minja builtin.
 // Throws ChatTemplateError on any parse or evaluation error.
+// chat_template_kwargs: optional Jinja variables (vLLM
+// --default-chat-template-kwargs). Supported keys today: enable_thinking (bool).
 std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
     const std::string& bos_token = "", const std::string& eos_token = "",
-    const std::vector<openai::ChatCompletionToolsParam>& tools = {});
+    const std::vector<openai::ChatCompletionToolsParam>& tools = {},
+    bool enable_thinking = false);
 
-// Adapt a chat template to Task 2's ChatPromptFn seam (serving_chat.h). The
-// returned callable renders `template_str` for the messages + generation flag it
-// is handed, so an OpenAIServingChat constructed with it applies the real chat
-// template instead of DefaultChatPromptFallback.
+// Adapt a chat template to Task 2's ChatPromptFn seam (serving_chat.h).
+// enable_thinking defaults false for agent/Hermes latency (Gemma4 empty thought
+// block when false — HF/vLLM recipe parity).
 openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
                                               std::string bos_token = "",
-                                              std::string eos_token = "");
+                                              std::string eos_token = "",
+                                              bool enable_thinking = false);
 
 // Load the `chat_template` string out of a tokenizer_config.json file. Handles
 // both the plain-string form and the list-of-{name,template} form (picks the

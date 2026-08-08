@@ -1,12 +1,23 @@
 // Ported from: vllm/model_executor/layers/quantization/modelopt.py (NVFP4 W4A16 dequant) @ e24d1b24
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <thread>
+#include <vector>
 
 #include "vt/dtype.h"
 
 namespace vllm {
+namespace {
+// >0 while expert-level parallel prefetch holds workers (avoid nested storms).
+std::atomic<int> g_fp8_dequant_outer_parallel{0};
+}  // namespace
+
+void Fp8DequantBeginOuterParallel() { g_fp8_dequant_outer_parallel.fetch_add(1); }
+void Fp8DequantEndOuterParallel() { g_fp8_dequant_outer_parallel.fetch_sub(1); }
 
 float F8E4M3ToF32(uint8_t byte) {
   // IEEE fp8-e4m3fn: 1 sign | 4 exp | 3 mantissa, bias 7, finite (no inf),
@@ -90,13 +101,37 @@ void DequantFp8ChannelToBf16(const uint8_t* weight_f8, const uint16_t* scale_bf1
   VT_CHECK(weight_f8 != nullptr && scale_bf16 != nullptr && out_bf16 != nullptr,
            "fp8 channel dequant: null");
   VT_CHECK(N > 0 && K > 0, "fp8 channel dequant: dims");
-  for (int64_t n = 0; n < N; ++n) {
-    const float s = vt::BF16ToF32(scale_bf16[n]);
-    const uint8_t* wr = weight_f8 + n * K;
-    uint16_t* orow = out_bf16 + n * K;
-    for (int64_t k = 0; k < K; ++k)
-      orow[k] = vt::F32ToBF16(F8E4M3ToF32(wr[k]) * s);
+
+  auto row_work = [&](int64_t n0, int64_t n1) {
+    for (int64_t n = n0; n < n1; ++n) {
+      const float s = vt::BF16ToF32(scale_bf16[n]);
+      const uint8_t* wr = weight_f8 + n * K;
+      uint16_t* orow = out_bf16 + n * K;
+      for (int64_t k = 0; k < K; ++k)
+        orow[k] = vt::F32ToBF16(F8E4M3ToF32(wr[k]) * s);
+    }
+  };
+
+  // Parallelize over output rows when large enough (MoE expert I/H dims).
+  // Skip when already under expert-level parallel prefetch.
+  const int hw = static_cast<int>(std::thread::hardware_concurrency());
+  const int nt = (N >= 64 && hw > 1 && g_fp8_dequant_outer_parallel.load() == 0)
+                     ? std::min(hw, 8)
+                     : 1;
+  if (nt == 1) {
+    row_work(0, N);
+    return;
   }
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<size_t>(nt));
+  const int64_t chunk = (N + nt - 1) / nt;
+  for (int t = 0; t < nt; ++t) {
+    const int64_t n0 = static_cast<int64_t>(t) * chunk;
+    const int64_t n1 = std::min(N, n0 + chunk);
+    if (n0 >= n1) break;
+    pool.emplace_back(row_work, n0, n1);
+  }
+  for (auto& th : pool) th.join();
 }
 
 }  // namespace vllm

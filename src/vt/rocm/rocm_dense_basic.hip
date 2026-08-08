@@ -79,6 +79,18 @@ __global__ void GeluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
   }
 }
 
+// gate[i] and up[i] already separate (no pack) — MoE ExpertGeGLU hot path.
+template <typename Tin, typename Tout>
+__global__ void GeluMulSepK(Tout* out, const Tin* gate, const Tin* up, int64_t n) {
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += gridDim.x * blockDim.x) {
+    const float g = Ld(gate, idx);
+    const float u = Ld(up, idx);
+    const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    St(out, idx, 0.5f * g * (1.0f + tanhf(inner)) * u);
+  }
+}
+
 template <typename Tin, typename Tout>
 __global__ void SiluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
@@ -261,6 +273,24 @@ void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   else
     VT_CHECK(false, "rocm gelu_and_mul dtype");
   Check(hipGetLastError(), "gelu_and_mul");
+}
+
+// Separate gate/up GeGLU (no pack). n = T * I elements.
+void GeluMulSeparateRocm(Queue& q, void* out, const void* gate, const void* up, int64_t n,
+                         DType dtype) {
+  if (n == 0) return;
+  hipStream_t st = AsStream(q);
+  if (dtype == DType::kBF16)
+    GeluMulSepK<__hip_bfloat16, __hip_bfloat16><<<GridFor(n), kBlock, 0, st>>>(
+        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(gate),
+        static_cast<const __hip_bfloat16*>(up), n);
+  else if (dtype == DType::kF32)
+    GeluMulSepK<float, float><<<GridFor(n), kBlock, 0, st>>>(
+        static_cast<float*>(out), static_cast<const float*>(gate), static_cast<const float*>(up),
+        n);
+  else
+    VT_CHECK(false, "rocm gelu_mul_sep dtype");
+  Check(hipGetLastError(), "gelu_mul_sep");
 }
 
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
