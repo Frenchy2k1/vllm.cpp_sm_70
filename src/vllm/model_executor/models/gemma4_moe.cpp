@@ -1,4 +1,4 @@
-// Gemma-4 MoE BF16 fused experts — load-fused router, GPU MulScalar accumulate.
+// Gemma-4 MoE BF16 fused experts runtime (host stream + same-device resident).
 #include "vllm/model_executor/models/gemma4_moe.h"
 
 #include <algorithm>
@@ -8,7 +8,6 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_attn_block.h"
-#include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/device_pool.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -23,8 +22,35 @@ using dense_attn::ResidentWeight;
 using vt::DType;
 using vt::Tensor;
 
-void ExpertGeGLUFromFused(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
-                          const uint16_t* down_e, int64_t I, int64_t H) {
+void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
+                       const uint16_t* down_e, int64_t I, int64_t H) {
+  const int64_t T = x.shape[0];
+  const vt::Device dev = d.q.device;
+  Tensor gate_w =
+      Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {I, H});
+  Tensor up_w = Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e + I * H), DType::kBF16,
+                                   dev, {I, H});
+  Tensor down_w =
+      Tensor::Contiguous(const_cast<uint16_t*>(down_e), DType::kBF16, dev, {H, I});
+  DBuf gate(d, DType::kBF16, {T, I});
+  DBuf up(d, DType::kBF16, {T, I});
+  vt::MatmulBT(d.q, gate.t(), x, gate_w);
+  vt::MatmulBT(d.q, up.t(), x, up_w);
+  DBuf gu(d, DType::kBF16, {T, 2 * I});
+  const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
+  for (int64_t t = 0; t < T; ++t) {
+    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row,
+             static_cast<const char*>(gate.ptr()) + static_cast<size_t>(t) * row, row);
+    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row + row,
+             static_cast<const char*>(up.ptr()) + static_cast<size_t>(t) * row, row);
+  }
+  DBuf act(d, DType::kBF16, {T, I});
+  vt::GeluAndMul(d.q, act.t(), gu.t());
+  vt::MatmulBT(d.q, out.t(), act.t(), down_w);
+}
+
+void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
+                     const uint16_t* down_e, int64_t I, int64_t H) {
   const int64_t T = x.shape[0];
   DBuf gate_w(d, DType::kBF16, {I, H}, gate_up_e);
   DBuf up_w(d, DType::kBF16, {I, H}, gate_up_e + I * H);
@@ -68,6 +94,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
 
   Dev d{vt::GetBackend(q.device.type), q};
   const vt::RmsNormArgs plain{rms_eps, false};
+  const int compute_dev = q.device.index;
 
   DBuf rn(d, DType::kBF16, {T, H});
   {
@@ -94,11 +121,14 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     for (int64_t e = 0; e < E; ++e) hscale[static_cast<size_t>(e)] = vt::BF16ToF32(pe[e]);
   }
 
-  const auto* gu_base =
-      reinterpret_cast<const uint16_t*>(moe.experts.gate_up.bytes.data());
-  const auto* dn_base = reinterpret_cast<const uint16_t*>(moe.experts.down.bytes.data());
+  const auto& ex = moe.experts;
   const int64_t gu_stride = 2 * I * H;
   const int64_t dn_stride = H * I;
+  const bool same_dev =
+      ex.gate_up_dev != nullptr && ex.down_dev != nullptr && ex.dev_id == compute_dev;
+
+  const auto* gu_host = reinterpret_cast<const uint16_t*>(ex.gate_up.bytes.data());
+  const auto* dn_host = reinterpret_cast<const uint16_t*>(ex.down.bytes.data());
 
   DBuf acc(d, DType::kBF16, {T, H});
   acc.Zero(d);
@@ -133,9 +163,17 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     for (int i = 0; i < top_k; ++i) {
       const int e = idx[static_cast<size_t>(i)];
       DBuf y(d, DType::kBF16, {1, H});
-      ExpertGeGLUFromFused(d, y, xin.t(), gu_base + static_cast<int64_t>(e) * gu_stride,
-                           dn_base + static_cast<int64_t>(e) * dn_stride, I, H);
-      // Host axpy (device MulScalar path hung on some ROCm builds)
+      if (same_dev) {
+        auto* gu = static_cast<const uint16_t*>(ex.gate_up_dev) +
+                   static_cast<int64_t>(e) * gu_stride;
+        auto* dn =
+            static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
+        ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
+      } else {
+        // Other-GPU resident or host stream: H2D from mmap (still correct).
+        ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
+                        dn_host + static_cast<int64_t>(e) * dn_stride, I, H);
+      }
       d.b.Synchronize(d.q);
       std::vector<uint16_t> hy(static_cast<size_t>(H)), hs(static_cast<size_t>(H));
       d.b.Copy(d.q, hy.data(), y.ptr(), hy.size() * 2);

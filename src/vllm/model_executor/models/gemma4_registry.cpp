@@ -25,11 +25,16 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/models/gemma4.h"
+#include "vllm/model_executor/models/gemma4_moe.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 
 namespace vllm {
 namespace {
@@ -90,9 +95,16 @@ std::unique_ptr<LoadedModel> LoadGemma4ForConditionalGeneration(
 void PrepareGemma4ForConditionalGeneration(LoadedModel& model,
                                            const HfConfig& config,
                                            vt::Queue& queue) {
-  (void)model;
   (void)config;
   (void)queue;
+  const char* env = std::getenv("VT_GEMMA4_RESIDENT_EXPERTS");
+  if (env == nullptr || env[0] != '1') return;
+  auto& gemma = static_cast<Gemma4LoadedModel&>(model);
+  Gemma4Weights& w = const_cast<Gemma4Weights&>(gemma.weights());
+  int ngpu = 2;  // Upload clamps to hipGetDeviceCount
+  if (const char* g = std::getenv("VT_GEMMA4_RESIDENT_GPUS"))
+    ngpu = std::max(1, std::atoi(g));
+  UploadGemma4ExpertsResidentForWeights(w, ngpu);
 }
 
 ForwardLogits ForwardGemma4ForConditionalGeneration(
