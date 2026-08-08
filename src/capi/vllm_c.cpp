@@ -615,7 +615,7 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         ep.device = vllm::Device::kCPU;
         break;
       case 2:
-        ep.device = vllm::Device::kCUDA;
+        ep.device = vllm::Device::kNamedPlatform;
         break;
       default:
         SetError(
@@ -646,7 +646,7 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         // explicit CUDA ask cannot be served and is REFUSED rather than
         // silently downgraded (the same never-substitute rule as the text
         // engine, vllm/config/device.py:61-66).
-        if (ep.device == vllm::Device::kCUDA) {
+        if (ep.device == vllm::Device::kNamedPlatform) {
           SetError(
               "vllm_engine_load: device 'cuda' was requested but this "
               "transcription-only checkpoint serves on the CPU pipeline; use "
