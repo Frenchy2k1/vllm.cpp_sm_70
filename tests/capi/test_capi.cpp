@@ -1298,11 +1298,29 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // slice (vllm_video_*) is ABI v12; the pre-tokenized completion entry
   // point (vllm_complete_tokens) is ABI v13; the device-selection field
   // (vllm_model_params.device) is ABI v14; the embeddings slice (vllm_embed /
-  // vllm_embedding_result_free) is ABI v15. The >= pin is the one check that
+  // vllm_embedding_result_free) is ABI v15; the KV-pool sizing knobs
+  // (vllm_model_params.gpu_memory_utilization / kv_cache_memory_bytes,
+  // ROAD-V1-MEM M1) are ABI v16. The >= pin is the one check that
   // can catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
   // test_dlopen compare against the same macro and move with it (the #121
   // lesson: an == floor moves with the macro and proves nothing).
-  CHECK(vllm_abi_version() >= 15);
+  CHECK(vllm_abi_version() >= 16);
+}
+
+// ─── ABI v16: KV-pool sizing knobs (ROAD-V1-MEM M1) ──────────────────────────
+TEST_CASE("capi: v16 KV-sizing knobs default and round-trip") {
+  vllm_model_params p = vllm_model_params_default();
+  // num_blocks now defaults to AUTO (0), not the historical 256; the resolver
+  // still falls back to 256, so the zero-struct behaviour is unchanged.
+  CHECK(p.num_blocks == 0);
+  // gpu_memory_utilization defaults to vLLM's 0.92; kv_cache_memory_bytes unset.
+  CHECK(p.gpu_memory_utilization == doctest::Approx(0.92));
+  CHECK(p.kv_cache_memory_bytes == 0);
+  // The appended fields are writable POD (borrowed for the load call only).
+  p.gpu_memory_utilization = 0.85;
+  p.kv_cache_memory_bytes = int64_t{4} * 1024 * 1024 * 1024;
+  CHECK(p.gpu_memory_utilization == doctest::Approx(0.85));
+  CHECK(p.kv_cache_memory_bytes == int64_t{4} * 1024 * 1024 * 1024);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────

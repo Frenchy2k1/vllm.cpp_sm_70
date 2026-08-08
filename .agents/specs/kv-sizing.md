@@ -1,8 +1,9 @@
 # KV-cache auto-sizing — `ROAD-V1-MEM` M0 spike
 
 Row: `ROAD-V1-MEM` (issue [#83](https://github.com/mudler/vllm.cpp/issues/83),
-user-directed 2026-08-06). Status: **M0 SPIKE (design + source-grounding, no
-code).** Parity pin: vLLM `555967922` (0.26.0.dev0).
+user-directed 2026-08-06). Status: **M1 + M2 LANDED (absolute-bytes knob +
+group-aware divisor, CPU); M3 profile run dgx-gated.** Parity pin: vLLM
+`555967922` (0.26.0.dev0).
 
 ## The gap (we are BEHIND vLLM on this axis)
 
@@ -56,6 +57,20 @@ Key properties to carry over:
 ## Our design (additive, mirror-faithful, default flips to auto)
 
 W-plan (all CPU/design except the profile run, which is GPU-gated):
+
+**LANDED (M1 + M2, CPU, 2026-08-08):** `EngineParams` gained
+`gpu_memory_utilization` (0.92) + `kv_cache_memory_bytes`; `num_blocks` became
+the override (default 0 = auto). The C ABI mirrors both at **v16**
+(`vllm_model_params.gpu_memory_utilization` / `.kv_cache_memory_bytes`, appended,
+zero-value preserves behaviour). `--gpu-memory-utilization` / `--kv-cache-memory`
+on `examples/server` + `examples/cli`. `ResolveNumBlocks`
+(`model_loader.cpp`) applies the precedence `num_blocks > kv_cache_memory_bytes >
+256`; the absolute-bytes branch divides by `KVBytesPerBlock(kv_cfg)`
+(`kv_cache_interface.cpp`, M2), a group-aware sum over attention specs
+(GDN/Mamba excluded). Gates: `test_kv_cache_interface` KVBytesPerBlock 5/5 (dense
+/ MLA / hybrid / het-KV per-layer / divisor), `test_capi` v16 round-trip, full
+CPU suites green. **M3 (the util profile run) stays dgx-gated** — until it lands
+the util branch falls back to 256, so the default path is byte-identical.
 
 - **M1 — the knobs on our surfaces.** Add to `EngineParams` (and mirror on the C
   ABI `vllm_model_params`, at the next ABI bump — the field is appended,

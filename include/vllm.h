@@ -130,7 +130,7 @@ extern "C" {
  * vllm_embed, and vllm_embed on a text engine names vllm_complete — the
  * SupportsTranscription-refusal precedent (v11) applied to the pooling task.
  * Purely additive — no struct changed; zero values preserve behaviour. */
-#define VLLM_ABI_VERSION 15
+#define VLLM_ABI_VERSION 16
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -181,7 +181,12 @@ typedef struct vllm_model_params {
   const char* tokenizer_config_path;
   /* KV-cache block size (tokens per block). <= 0 => 32. */
   int32_t block_size;
-  /* Number of KV-cache blocks to allocate. <= 0 => 256. */
+  /* KV-cache block count OVERRIDE (vLLM num_gpu_blocks_override). > 0 pins the
+   * pool to exactly this many blocks. <= 0 => AUTO: the pool is sized by the
+   * v16 sizing knobs below (kv_cache_memory_bytes, then gpu_memory_utilization),
+   * falling back to 256 when neither is set. A zero-initialized struct therefore
+   * still yields 256 blocks — behaviour is unchanged from before the sizing
+   * knobs existed. */
   int32_t num_blocks;
   /* Max sequence length. <= 0 => config.max_position_embeddings. */
   int32_t max_model_len;
@@ -295,6 +300,28 @@ typedef struct vllm_model_params {
    * (vllm_video_model_params.device: 0 cpu, 1 cuda) shifted by the auto slot.
    * Any other value fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
   int32_t device;
+  /* ── KV-pool sizing (ABI v16) ──────────────────────────────────────────────
+   * Two knobs mirroring vLLM's CacheConfig, resolved together with num_blocks
+   * above in the order: num_blocks (override) > kv_cache_memory_bytes > the
+   * gpu_memory_utilization profile path. num_blocks retains its meaning as the
+   * explicit override (num_gpu_blocks_override); leave it 0 to reach these.
+   *
+   * gpu_memory_utilization: the fraction of free device memory the whole engine
+   * may consume (weights + activations + KV), mirroring vLLM
+   * CacheConfig.gpu_memory_utilization (default 0.92). 0.0 => 0.92. This is the
+   * DEFAULT sizing path in vLLM, but it needs a device profile run that measures
+   * the non-KV footprint; that profile run is not implemented yet
+   * (ROAD-V1-MEM M3), so until it lands a struct with both other knobs unset
+   * still falls back to the historical 256-block default — the zero-initialized
+   * struct's behaviour is unchanged from pre-v16. */
+  double gpu_memory_utilization;
+  /* kv_cache_memory_bytes: an ABSOLUTE KV-pool size in bytes. When > 0 it sizes
+   * the block count directly (num_blocks = kv_cache_memory_bytes / bytes-per-
+   * block, computed from the model's own KV geometry) and IGNORES
+   * gpu_memory_utilization, mirroring vLLM CacheConfig.kv_cache_memory_bytes
+   * (cache.py:182,189). 0 => unset. A budget smaller than a single KV block
+   * fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
+  int64_t kv_cache_memory_bytes;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────

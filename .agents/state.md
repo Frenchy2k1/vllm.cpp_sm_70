@@ -43278,3 +43278,24 @@ the unified free-memory and the default 0.92 is not unconditionally safe there.
 Row moved INVENTORIED→READY (roadmap_v1 + feature-matrix §2). M1-M4 are the impl
 rows this unblocks; M1/M2/M4-CPU are CPU-completable, M3 (profile run) is
 dgx-gated. Records-only spike (no code).
+
+
+## 2026-08-08 — ROAD-V1-MEM M1+M2 LANDED: absolute --kv-cache-memory knob + group-aware bytes-per-block (CPU brick)
+<!-- state: 2026-08-08T23:30 -->
+
+The absolute `--kv-cache-memory` KV-pool knob is live: `ResolveNumBlocks`
+(`model_loader.cpp`) applies the vLLM precedence `num_blocks (override) >
+kv_cache_memory_bytes > 256`, dividing the byte budget by `KVBytesPerBlock`
+(`kv_cache_interface.cpp`, M2) — a group-aware sum over attention specs that
+mirrors the runner's own per-layer `num_blocks * page_size_bytes()` allocation,
+excluding GDN/Mamba state (per-sequence-slot, not per-block). `EngineParams`
+gained `gpu_memory_utilization` (0.92) + `kv_cache_memory_bytes` and `num_blocks`
+became the override (default 0 = auto → 256 fallback, byte-identical default
+path). Mirrored on the C ABI at v16 (`vllm_model_params.gpu_memory_utilization` /
+`.kv_cache_memory_bytes`, appended, zero-value preserves behaviour);
+`--gpu-memory-utilization` / `--kv-cache-memory` on `examples/server` +
+`examples/cli`. Gates: `test_kv_cache_interface` KVBytesPerBlock 5/5 (dense /
+MLA no-factor-2 / hybrid-excludes-mamba / het-KV per-layer / divisor),
+`test_capi` 49/49 incl. v16 round-trip, `test_model_loader_gguf` 3/3, CPU build
+clean -Werror. M3 (the `gpu_memory_utilization` device profile run) stays
+dgx-gated; until it lands the util branch falls back to 256. Row `M1+M2 DONE`.
