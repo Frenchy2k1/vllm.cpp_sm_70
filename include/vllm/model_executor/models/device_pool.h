@@ -119,6 +119,34 @@ class DevicePool {
     free_[key].push_back(p);
   }
 
+  // Release every RETAINED block back to the driver, and report the bytes freed.
+  //
+  // The pool earns its keep WITHIN a phase, where the same size classes recur
+  // every step and cudaMalloc/cudaFree would be a sync storm. Across a PHASE
+  // CHANGE the retained classes are the wrong shapes for what comes next, so on
+  // an UNCAPPED pool (`device_pool_cap_bytes == 0`, which is GB10/Thor today)
+  // they are pure headroom loss at exactly the moment the next phase wants its
+  // own working set. Draining at that boundary costs one cudaFree per retained
+  // block, once, and is what keeps a big-canvas MiniMax-H3 VAE decode from
+  // meeting the driver's OOM on top of 50 steps of denoise scratch.
+  //
+  // SAFETY: `free_` only ever holds blocks a DBuf already returned, so nothing
+  // live is touched. Under VT_POOL_BYPASS the free list is always empty (Put
+  // frees straight through) and this is a no-op.
+  size_t Drain(vt::Backend& b) {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t freed = 0;
+    for (auto& entry : free_) {
+      for (void* p : entry.second) {
+        b.Free(p);
+        freed += entry.first;
+      }
+    }
+    free_.clear();
+    retained_ = 0;
+    return freed;
+  }
+
   ~DevicePool() {
     if (std::getenv("VT_POOL_STATS") != nullptr) {
       const uint64_t h = hits_.load(), m = misses_.load();

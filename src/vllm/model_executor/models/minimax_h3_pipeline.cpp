@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/device_pool.h"  // ActivePool()/DevicePool::Drain
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -476,12 +477,31 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
   // scalar reference; at real resolutions it is the stage that does not finish. It
   // stays the CPU path, and stays the thing the device path is gated against.
   if (device.type != vt::DeviceType::kCPU) {
-    vt::Queue vq = vt::GetBackend(device.type).CreateQueue();
+    vt::Backend& vae_backend = vt::GetBackend(device.type);
+    // PHASE CHANGE: denoise is done, the VAE decode is next. The denoise left the
+    // scratch pool holding every activation size class it touched, and on an
+    // UNCAPPED pool (GB10/Thor: `device_pool_cap_bytes == 0`) those blocks are
+    // never returned to the driver. The decode allocates DIFFERENT classes, so it
+    // cannot reuse any of them -- they are pure headroom loss at the one moment
+    // the decode needs its own working set. At the REF canvas (1344x768/124f)
+    // that is the difference between a decode that fits and one that takes the
+    // BOX DOWN: measured 85 GiB resident at this point against a ~18 GiB decode
+    // in a 122 GiB unified pool, and the driver OOM (NV_ERR_NO_MEMORY) rebooted
+    // the machine. Draining costs one cudaFree per retained block, once.
+    const size_t drained = ActivePool()->Drain(vae_backend);
+    if (std::getenv("VT_POOL_STATS") != nullptr) {
+      std::fprintf(stderr, "[h3] drained %.2f GiB of denoise scratch before VAE decode\n",
+                   static_cast<double>(drained) / (1024.0 * 1024.0 * 1024.0));
+    }
+    vt::Queue vq = vae_backend.CreateQueue();
     const MiniMaxH3VideoVaeDeviceWeights staged_vae =
         StageMiniMaxH3VideoVaeWeights(vq, video_config, video_weights);
-    // Upstream's video path is decode_base -> decode_temporal: chunked in TIME,
-    // and NOT spatially tiled (decoder_tiling defaults false and the shipped
-    // config does not set it).
+    // Upstream's video path is decode_base -> decode_temporal: chunked in TIME.
+    // decode_temporal then composes SPATIAL tiling per chunk whenever
+    // `decoder_tiling` is set, which it is by DEFAULT (minimax_h3.h: `bool
+    // decoder_tiling = true`) -- required, not optional, because the ViT3D's RoPE
+    // is length-normalized over the grid it is handed. A real canvas therefore
+    // decodes as 256-px tiles inside each temporal chunk.
     result.frames = MiniMaxH3VideoVaeDecodeTemporalDevice(
         device, video_config, staged_vae, video_latent, request.latent_t, request.latent_h,
         request.latent_w, request.num_frames, &result.frame_shape);
