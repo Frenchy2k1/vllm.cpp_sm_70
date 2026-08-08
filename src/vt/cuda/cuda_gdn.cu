@@ -842,6 +842,114 @@ __global__ void CausalConv1dFwdRegKernel(Tout* out, const Tin* x, const Tin* w,
   }
 }
 
+// Width-four experiment used by Qwen3.5. Unlike the sealed runtime-width kernel
+// above, K and the number of channels owned by each lane are compile-time
+// constants. ChannelsPerThread=1 isolates width specialization at the same
+// 128-channel tile; ChannelsPerThread=2 covers two coalesced 128-channel stripes
+// and therefore matches upstream's 256-channel feature tile.
+template <int ChannelsPerThread, typename Tin, typename Tout, typename THas>
+__global__ void CausalConv1dFwdRegK4Kernel(
+    Tout* out, const Tin* x, const Tin* w, const Tin* bias, float* conv_state,
+    const int32_t* qsl, const THas* his, int64_t c_dim, int64_t x_row_stride,
+    bool silu, int chunked, const int32_t* batch_ptr,
+    const int32_t* token_chunk_offset_ptr, int exact) {
+  static_assert(ChannelsPerThread == 1 || ChannelsPerThread == 2);
+  constexpr int64_t k = 4;
+  constexpr int64_t width = k - 1;
+  constexpr int64_t channels_per_block = kConvRegN * ChannelsPerThread;
+
+  const int64_t program = blockIdx.y;
+  const int64_t s = exact ? batch_ptr[program] : program;
+  const int64_t begin = qsl[s];
+  const int64_t t_len = qsl[s + 1] - begin;
+  const int64_t chunk_m = exact ? kConvExactM : kConvRegM;
+  const int64_t token_offset = exact
+                                   ? static_cast<int64_t>(token_chunk_offset_ptr[program]) *
+                                         kConvExactM
+                                   : (chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM
+                                              : 0);
+  if (token_offset > 0 && token_offset >= t_len) return;
+  const int64_t token_end =
+      ((chunked || exact) && token_offset + chunk_m < t_len) ? token_offset + chunk_m : t_len;
+  const bool init = his[s] != 0;
+
+  int64_t channels[ChannelsPerThread];
+  bool active[ChannelsPerThread];
+  float* state_rows[ChannelsPerThread];
+  float biases[ChannelsPerThread];
+  float weights[ChannelsPerThread][k];
+  float windows[ChannelsPerThread][k];
+
+  // Load both stripes' initial history before processing either stripe. This
+  // matches the intended duplicated-register experiment without extending the
+  // baseline state-read/write exposure across an entire first-stripe token loop.
+#pragma unroll
+  for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+    const int64_t c = static_cast<int64_t>(blockIdx.x) * channels_per_block +
+                      threadIdx.x + static_cast<int64_t>(lane_channel) * kConvRegN;
+    channels[lane_channel] = c;
+    active[lane_channel] = c < c_dim;
+    if (!active[lane_channel]) continue;
+    float* srow = conv_state + (s * c_dim + c) * width;
+    state_rows[lane_channel] = srow;
+    biases[lane_channel] = bias != nullptr ? Load(bias, c) : 0.0f;
+#pragma unroll
+    for (int j = 0; j < k; ++j) weights[lane_channel][j] = Load(w, c * k + j);
+#pragma unroll
+    for (int j = 0; j < width; ++j) {
+      const int64_t ti = token_offset - width + j;
+      float v = 0.0f;
+      if (ti >= 0) {
+        v = Load(x, (begin + ti) * x_row_stride + c);
+      } else if (init) {
+        v = srow[width + ti];
+      }
+      windows[lane_channel][j] = v;
+    }
+    windows[lane_channel][width] =
+        token_offset < t_len ? Load(x, (begin + token_offset) * x_row_stride + c) : 0.0f;
+  }
+
+  for (int64_t t = token_offset; t < token_end; ++t) {
+#pragma unroll
+    for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+      if (!active[lane_channel]) continue;
+      const int64_t c = channels[lane_channel];
+      float acc = biases[lane_channel];
+#pragma unroll
+      for (int j = 0; j < k; ++j)
+        acc += weights[lane_channel][j] * windows[lane_channel][j];
+      Store(out, (begin + t) * c_dim + c, silu ? Silu(acc) : acc);
+#pragma unroll
+      for (int j = 0; j < width; ++j)
+        windows[lane_channel][j] = windows[lane_channel][j + 1];
+      const int64_t nt = t + 1;
+      windows[lane_channel][width] =
+          nt < t_len ? Load(x, (begin + nt) * x_row_stride + c) : 0.0f;
+    }
+  }
+
+  if (token_end == t_len) {
+#pragma unroll
+    for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+      if (!active[lane_channel]) continue;
+      const int64_t c = channels[lane_channel];
+      float* srow = state_rows[lane_channel];
+#pragma unroll
+      for (int j = 0; j < width; ++j) {
+        const int64_t tj = t_len - width + j;
+        float v = 0.0f;
+        if (tj >= 0) {
+          v = Load(x, (begin + tj) * x_row_stride + c);
+        } else if (init) {
+          v = srow[width + tj];
+        }
+        srow[j] = v;
+      }
+    }
+  }
+}
+
 // Toggle: DEFAULT ON (VT_CONV_REG=0 restores the tiled/scalar path). Read per call
 // (prefill dispatch is coarse — one launch/step — so the getenv is negligible and
 // in-process CUDA tests can flip the selection). Predicate factored to
@@ -852,6 +960,56 @@ bool ConvRegEnabled() {
 
 bool ConvExactChunksEnabled() {
   return ConvExactChunksFlagIsOn(std::getenv("VT_CONV_EXACT_CHUNKS"));
+}
+
+template <int ChannelsPerThread, typename Tin, typename Tout>
+void LaunchConvFwdRegK4(cudaStream_t s, Tensor& out, const Tensor& x,
+                        const Tensor& w, const Tensor* bias, Tensor& conv_state,
+                        const Tensor& qsl, const Tensor& his,
+                        const CausalConv1dArgs& args, int64_t chan_tiles) {
+  static_assert(ChannelsPerThread == 1 || ChannelsPerThread == 2);
+  const int64_t n = conv_state.shape[0], c = x.shape[1];
+  const int64_t total_tokens = x.shape[0];
+  const int64_t x_rs = x.stride[0];
+  int64_t grid_z = 1;
+  int chunked = 0;
+  const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
+  int64_t grid_y = n;
+  if (exact) {
+    grid_y = args.batch_ptr->shape[0];
+    VT_CHECK(grid_y <= kMaxGridY,
+             "cuda causal_conv1d_fwd(reg-k4): too many exact chunk programs");
+  } else if (n <= kConvRegChunkMaxSeqs) {
+    const int64_t z = (total_tokens + kConvRegM - 1) / kConvRegM;
+    if (z >= 1 && z <= kMaxGridY) {
+      grid_z = z;
+      chunked = 1;
+    }
+  }
+  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(grid_y),
+                  static_cast<unsigned>(grid_z));
+  const dim3 block(kConvRegN);
+  const int32_t* batch_ptr = exact ? args.batch_ptr->Ptr<int32_t>() : nullptr;
+  const int32_t* token_chunk_offset_ptr =
+      exact ? args.token_chunk_offset_ptr->Ptr<int32_t>() : nullptr;
+  if (his.dtype == DType::kI8) {
+    CausalConv1dFwdRegK4Kernel<ChannelsPerThread, Tin, Tout, int8_t>
+        <<<grid, block, 0, s>>>(
+            out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+            bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+            qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs,
+            args.silu_activation, chunked, batch_ptr, token_chunk_offset_ptr,
+            exact ? 1 : 0);
+  } else {
+    CausalConv1dFwdRegK4Kernel<ChannelsPerThread, Tin, Tout, int32_t>
+        <<<grid, block, 0, s>>>(
+            out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+            bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+            qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs,
+            args.silu_activation, chunked, batch_ptr, token_chunk_offset_ptr,
+            exact ? 1 : 0);
+  }
+  Check(cudaGetLastError(), "causal_conv1d_fwd(reg-k4) launch");
 }
 
 // Register-window launcher (VT_CONV_REG=1). The default exact descriptor maps
@@ -865,6 +1023,18 @@ void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
                       const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
                       const Tensor& his, const CausalConv1dArgs& args) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
+  const ConvChannelTileLaunchContract channel_contract =
+      ConvChannelTileLaunchContractFor(std::getenv("VT_CONV_CHANNEL_TILE"), c, k);
+  if (channel_contract.arm == ConvChannelTileArm::kWidthFour) {
+    LaunchConvFwdRegK4<1, Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args,
+                                    channel_contract.feature_blocks);
+    return;
+  }
+  if (channel_contract.arm == ConvChannelTileArm::kWidthFourTwoChannels) {
+    LaunchConvFwdRegK4<2, Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args,
+                                    channel_contract.feature_blocks);
+    return;
+  }
   const int64_t total_tokens = x.shape[0];
   const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   VT_CHECK(k - 1 <= kConvRegMaxW, "cuda causal_conv1d_fwd(reg): conv width exceeds kConvRegMaxW");

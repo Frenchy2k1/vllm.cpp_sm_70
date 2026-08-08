@@ -17,6 +17,9 @@
 
 using vt::cuda::ConvRegFlagIsOn;
 using vt::cuda::ConvExactChunksFlagIsOn;
+using vt::cuda::ConvChannelTileArm;
+using vt::cuda::ConvChannelTileArmFromEnv;
+using vt::cuda::ConvChannelTileLaunchContractFor;
 using vt::cuda::GdnPostConvFastFlagIsOn;
 using vt::cuda::GdnPostConvSplitFlagIsOn;
 using vt::cuda::GdnPostConvTokenTileFlagIsOn;
@@ -48,6 +51,47 @@ TEST_CASE("VT_CONV_EXACT_CHUNKS defaults ON; only a '0'-leading value rolls back
   CHECK_FALSE(ConvExactChunksFlagIsOn("0abc"));
   CHECK(ConvExactChunksFlagIsOn("1"));
   CHECK(ConvExactChunksFlagIsOn("on"));
+}
+
+TEST_CASE("VT_CONV_CHANNEL_TILE selects only the three named experiment arms") {
+  CHECK(ConvChannelTileArmFromEnv(nullptr) == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv("0") == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv("1") == ConvChannelTileArm::kWidthFour);
+  CHECK(ConvChannelTileArmFromEnv("2") == ConvChannelTileArm::kWidthFourTwoChannels);
+
+  // Invalid spellings must preserve the sealed runtime-width baseline.
+  CHECK(ConvChannelTileArmFromEnv("") == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv("00") == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv("10") == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv("3") == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv("on") == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileArmFromEnv(" 2") == ConvChannelTileArm::kRuntimeWidth);
+}
+
+TEST_CASE("causal-conv channel arms keep block 128 and tile 128/128/256 channels") {
+  const auto baseline = ConvChannelTileLaunchContractFor("0", 8192, 4);
+  const auto width_four = ConvChannelTileLaunchContractFor("1", 8192, 4);
+  const auto two_channels = ConvChannelTileLaunchContractFor("2", 8192, 4);
+  CHECK(baseline.arm == ConvChannelTileArm::kRuntimeWidth);
+  CHECK(width_four.arm == ConvChannelTileArm::kWidthFour);
+  CHECK(two_channels.arm == ConvChannelTileArm::kWidthFourTwoChannels);
+  CHECK(baseline.threads_per_block == 128);
+  CHECK(width_four.threads_per_block == 128);
+  CHECK(two_channels.threads_per_block == 128);
+  CHECK(baseline.feature_blocks == 64);
+  CHECK(width_four.feature_blocks == 64);
+  CHECK(two_channels.feature_blocks == 32);
+
+  // Partial feature tiles round up, including the second channel stripe.
+  CHECK(ConvChannelTileLaunchContractFor("0", 129, 4).feature_blocks == 2);
+  CHECK(ConvChannelTileLaunchContractFor("1", 129, 4).feature_blocks == 2);
+  CHECK(ConvChannelTileLaunchContractFor("2", 129, 4).feature_blocks == 1);
+  CHECK(ConvChannelTileLaunchContractFor("2", 257, 4).feature_blocks == 2);
+
+  // Width-specialized arms are not valid for any other convolution width.
+  CHECK(ConvChannelTileLaunchContractFor("1", 8192, 3).arm ==
+        ConvChannelTileArm::kRuntimeWidth);
+  CHECK(ConvChannelTileLaunchContractFor("2", 8192, 5).feature_blocks == 64);
 }
 
 TEST_CASE("VT_GDN_POSTCONV_SPLIT defaults OFF (opt-in); a non-'0' value enables it") {

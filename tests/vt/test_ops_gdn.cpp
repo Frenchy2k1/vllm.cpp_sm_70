@@ -707,6 +707,25 @@ std::vector<float> Unpack(const std::vector<uint8_t>& b, DType dt) {
   return out;
 }
 
+void CheckBytesEqual(const std::vector<uint8_t>& got,
+                     const std::vector<uint8_t>& want) {
+  REQUIRE(got.size() == want.size());
+  size_t bad = 0;
+  size_t first_bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (got[i] != want[i]) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(first_bad);
+    CAPTURE(got[first_bad]);
+    CAPTURE(want[first_bad]);
+  }
+  CHECK(bad == 0);
+}
+
 void CheckClose(const std::vector<float>& got, const std::vector<float>& want, float atol,
                 float rtol) {
   REQUIRE(got.size() == want.size());
@@ -2392,14 +2411,28 @@ TEST_CASE("CUDA causal_conv1d_update decode-fast (VT_CONV_UPDATE_FAST) matches r
 // ("1" reg / "0" tiled; launcher reads getenv per call) so it is default-independent.
 void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,
                                 int64_t c, int64_t k, bool with_bias, bool silu, const Combo& cb,
-                                uint32_t seed, bool i8_mask = false) {
+                                uint32_t seed, bool i8_mask = false,
+                                int64_t row_padding = 0) {
+  CAPTURE(c);
+  CAPTURE(k);
+  CAPTURE(static_cast<int>(cb.in));
+  CAPTURE(static_cast<int>(cb.out));
+  CAPTURE(row_padding);
   const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
   const int64_t t = qsl.back();
   const auto xf = RandomF32(static_cast<size_t>(t * c), seed, -3.0f, 3.0f);
   const auto wf = RandomF32(static_cast<size_t>(c * k), seed + 1, -1.0f, 1.0f);
   const auto bf = RandomF32(static_cast<size_t>(c), seed + 2, -1.0f, 1.0f);
   const auto stf = RandomF32(static_cast<size_t>(n * c * (k - 1)), seed + 3, -2.0f, 2.0f);
-  const auto xb = Pack(xf, cb.in);
+  const int64_t x_row_stride = c + row_padding;
+  std::vector<float> x_storage(static_cast<size_t>(t * x_row_stride), -12345.0f);
+  for (int64_t token = 0; token < t; ++token) {
+    for (int64_t channel = 0; channel < c; ++channel) {
+      x_storage[static_cast<size_t>(token * x_row_stride + channel)] =
+          xf[static_cast<size_t>(token * c + channel)];
+    }
+  }
+  const auto xb = Pack(x_storage, cb.in);
   const auto wb = Pack(wf, cb.in);
   const auto bb = Pack(bf, cb.in);
   const auto stb = Pack(stf, DType::kF32);
@@ -2408,7 +2441,8 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
 
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
-  DeviceTensor dx(gpu, gq.q, cb.in, {t, c}, xb.data());
+  DeviceTensor dx(gpu, gq.q, cb.in, {t, x_row_stride}, xb.data());
+  Tensor x_view = RowView(dx.tensor().data, cb.in, Gpu(), t, c, x_row_stride);
   DeviceTensor dw(gpu, gq.q, cb.in, {c, k}, wb.data());
   DeviceTensor db(gpu, gq.q, cb.in, {c}, bb.data());
   DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
@@ -2434,10 +2468,12 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
                         {static_cast<int64_t>(chunk_offsets.size())},
                         chunk_offsets.data());
 
-  auto run = [&](bool reg, bool exact, std::vector<uint8_t>& out_bytes,
+  auto run = [&](bool reg, bool exact, const char* channel_arm,
+                 std::vector<uint8_t>& out_bytes,
                  std::vector<uint8_t>& st_bytes) {
     ::setenv("VT_CONV_REG", reg ? "1" : "0", 1);
     ::setenv("VT_CONV_EXACT_CHUNKS", exact ? "1" : "0", 1);
+    ::setenv("VT_CONV_CHANNEL_TILE", channel_arm, 1);
     DeviceTensor dst(gpu, gq.q, DType::kF32, {n, c, k - 1}, stb.data());  // fresh state per arm
     DeviceTensor dout(gpu, gq.q, cb.out, {t, c});
     gpu.Memset(gq.q, dout.tensor().data, 0x5a, static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
@@ -2448,7 +2484,7 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
       run_args.batch_ptr = &batch_tensor;
       run_args.token_chunk_offset_ptr = &offsets_tensor;
     }
-    vt::CausalConv1dFwd(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
+    vt::CausalConv1dFwd(gq.q, dout.tensor(), x_view, dw.tensor(),
                         with_bias ? &db.tensor() : nullptr, dst.tensor(), dqsl.tensor(),
                         dhis.tensor(), exact ? run_args : args);
     out_bytes.resize(static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
@@ -2457,15 +2493,24 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
     dst.Download(gq.q, st_bytes.data());
   };
   std::vector<uint8_t> out_tiled, st_tiled, out_reg, st_reg, out_exact, st_exact;
-  run(/*reg=*/false, /*exact=*/false, out_tiled, st_tiled);
-  run(/*reg=*/true, /*exact=*/false, out_reg, st_reg);
-  run(/*reg=*/true, /*exact=*/true, out_exact, st_exact);
+  std::vector<uint8_t> out_width_four, st_width_four, out_two_channels,
+      st_two_channels;
+  run(/*reg=*/false, /*exact=*/false, "0", out_tiled, st_tiled);
+  run(/*reg=*/true, /*exact=*/false, "0", out_reg, st_reg);
+  run(/*reg=*/true, /*exact=*/true, "0", out_exact, st_exact);
+  run(/*reg=*/true, /*exact=*/true, "1", out_width_four, st_width_four);
+  run(/*reg=*/true, /*exact=*/true, "2", out_two_channels, st_two_channels);
   ::unsetenv("VT_CONV_REG");
   ::unsetenv("VT_CONV_EXACT_CHUNKS");
+  ::unsetenv("VT_CONV_CHANNEL_TILE");
   CHECK(out_reg == out_tiled);  // out activation byte-identical
   CHECK(st_reg == st_tiled);    // rolled conv_state byte-identical
   CHECK(out_exact == out_tiled);  // exact descriptor changes only work assignment
   CHECK(st_exact == st_tiled);
+  CheckBytesEqual(out_width_four, out_exact);  // compile-time K=4, one channel per lane
+  CheckBytesEqual(st_width_four, st_exact);
+  CheckBytesEqual(out_two_channels, out_exact);  // compile-time K=4, two channels per lane
+  CheckBytesEqual(st_two_channels, st_exact);
 }
 
 TEST_CASE("CUDA causal_conv1d_fwd register kernel (VT_CONV_REG) matches tiled 0-ulp") {
@@ -2495,6 +2540,11 @@ TEST_CASE("CUDA causal_conv1d_fwd register kernel (VT_CONV_REG) matches tiled 0-
   // i8 has_initial_state mask, no bias, silu.
   RunConvFwdRegByteExactCase({0, 33, 70}, {1, 0}, 1024, 4, false, true, kCudaCombos[0], seed + 30,
                              /*i8_mask=*/true);
+  // Partial 256-channel tile plus the production packed-row stride. Unequal exact
+  // chunks cover fresh and initial state and leave the parent-row padding unread.
+  RunConvFwdRegByteExactCase({0, 2, 19, 28}, {0, 1, 0}, 385, 4, true, true,
+                             kCudaCombos[2], seed + 40, /*i8_mask=*/false,
+                             /*row_padding=*/37);
 }
 
 // VT_GDN_POSTCONV_SPLIT: the per-V-head split post-conv kernel (GdnPostConvSplitKernel)
