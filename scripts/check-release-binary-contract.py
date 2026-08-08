@@ -126,17 +126,15 @@ BENCHMARKS_RELEASE_ROW = (
     "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary "
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
-    "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, "
-    "and 25 tests. No archive, staged smoke, runtime, correctness, or performance "
+    "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states; "
+    "25 tests GREEN. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
     "Supported (subset); bundles SPIKED, no artifacts",
-    "primary fat CUDA/adaptive CPU, W1-W13/W10-W12 policy, pending claims, and "
-    "25-test inventory mutation-gated; per-SM diagnostics optional; no "
-    "archive/runtime claim",
+    "[Release spike](../.agents/specs/release-binary-matrix.md): pending.",
 )
 
 HUMAN_CONTRACT = {
@@ -170,7 +168,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 25 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states; 25 tests GREEN. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
