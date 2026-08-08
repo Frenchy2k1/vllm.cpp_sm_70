@@ -11,7 +11,7 @@
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
-| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
+| **vLLM** | Laguna-S-2.1 NVFP4 (118B/8B MoE), GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
@@ -116,9 +116,12 @@ caveat that vLLM pre-reserves a fixed fraction up front while we allocate the KV
 blocks the workload needs. Real difference in operating footprint, not evidence
 of a lower per-token KV cost.
 
-### Laguna-XS-2.1 (NVFP4)
+### Laguna-S-2.1 (NVFP4)
 
-Both arms NVFP4, single request, batch 1, GB10.
+`poolside/Laguna-S-2.1-NVFP4`, 118B total / ~8B active MoE, 48 layers,
+256 experts, ~67 GiB. Both arms NVFP4, single request, batch 1, GB10. The local
+checkpoint directory is named `laguna-xs-nvfp4`, which is where the "Laguna-XS"
+label in earlier revisions of this page came from; the measured model is S-2.1.
 
 | Arm | Decode tok/s | Ratio |
 |---|---:|---:|
@@ -322,7 +325,7 @@ built on it rather than keeping the flattering one.
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
-| Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
+| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | Tensor parallelism (task #287 spike, 2026-08-08) | **No number owed** (`benchmark_binding=false`): records-only scope at pin `555967922` ([spec](../.agents/specs/tensor-parallelism-spike.md)). CPU-completable bricks TP-W1..W4+W7 gate on token-exactness, not speed | Perf gate is TP-W6: at or above vLLM TP=2 on every axis, same 2-GPU box (PENDING-HW) |
@@ -360,7 +363,7 @@ built on it rather than keeping the flattering one.
 |---|---|
 | vLLM online grid | `.agents/specs/competitive-benchmarks.md`, evidence under `dgx:~/work/vllm.cpp-online-gate/evidence/` |
 | CPU vs llama.cpp | Same GGUF both arms, 3 reps under one `flock $HOME/gpu.lock`; `VT_GGUF_KEEP_F16=0` reproduces the pre-L7 baseline |
-| Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu`; `drop_caches` first, create the CUDA context before loading weights |
+| Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu` (that directory holds the S-2.1 checkpoint); `drop_caches` first, create the CUDA context before loading weights |
 | DeepSeek-V4-Flash decode | `deepseek-v4-gen --gpu --kv-cache` on `ds4flash.gguf`, captured under tmux |
 | Metal vs MLX-LM | Paired A/B harness, interleaved runs, cold legs discarded |
 | Vulkan vs llama.cpp Vulkan | Not yet runnable (no model runs on Vulkan). Planned harness in `.agents/specs/vulkan-full-support.md` §5.2 |
