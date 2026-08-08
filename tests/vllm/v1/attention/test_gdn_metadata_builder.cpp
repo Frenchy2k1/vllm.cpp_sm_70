@@ -22,6 +22,7 @@
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
 
 using vllm::v1::CommonAttentionMetadata;
+using vllm::v1::ComputeCausalConv1dMetadata;
 using vllm::v1::GDNAttentionBackend;
 using vllm::v1::GDNAttentionMetadata;
 using vllm::v1::GDNAttentionMetadataBuilder;
@@ -114,6 +115,16 @@ TEST_CASE("GDN build: mixed decode + prefill (decode-first)") {
   CHECK(*meta.prefill_state_indices == std::vector<int32_t>{110});
   REQUIRE(meta.prefill_has_initial_state.has_value());
   CHECK(*meta.prefill_has_initial_state == std::vector<uint8_t>{0});
+}
+
+TEST_CASE("GDN metadata: causal-conv programs enumerate each sequence chunk once") {
+  // Unequal lengths distinguish the exact flattened descriptor from a rectangular
+  // sequence x chunk grid. BLOCK_M=8 yields 1+2+3 programs, with no padded work.
+  const auto chunks = ComputeCausalConv1dMetadata(
+      std::vector<int32_t>{0, 1, 10, 27});
+  CHECK(chunks.batch_ptr == std::vector<int32_t>{0, 1, 1, 2, 2, 2});
+  CHECK(chunks.token_chunk_offset_ptr ==
+        std::vector<int32_t>{0, 0, 1, 0, 1, 2});
 }
 
 // Decode-only batch: all query_len==1. num_prefills==0 ⇒ has_initial_state and
@@ -504,6 +515,8 @@ void CheckMetaEqual(const GDNAttentionMetadata& a, const GDNAttentionMetadata& b
   CHECK(a.prefill_query_start_loc == b.prefill_query_start_loc);
   CHECK(a.prefill_state_indices == b.prefill_state_indices);
   CHECK(a.prefill_has_initial_state == b.prefill_has_initial_state);
+  CHECK(a.batch_ptr == b.batch_ptr);
+  CHECK(a.token_chunk_offset_ptr == b.token_chunk_offset_ptr);
   CHECK(a.spec_query_start_loc == b.spec_query_start_loc);
   CHECK(a.spec_state_indices_tensor == b.spec_state_indices_tensor);
   CHECK(a.spec_state_indices_num_cols == b.spec_state_indices_num_cols);

@@ -15124,7 +15124,6 @@ llama.cpp's Vulkan" when it is really "our CPU tier vs llama.cpp's Vulkan". The
 comparison becomes meaningful when native coverage closes — the progress metric is
 `vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
 the RoPE table build, the sampler tail, and the remaining norm/glue set.
-
 #### CORRECTION (2026-08-07, same session): the vllm.cpp Vulkan arm is GPU-BOUND, not CPU-bound
 
 The entry above attributes vllm.cpp's slowness to "our HOST FALLBACK wearing a
@@ -15983,71 +15982,75 @@ Recorded because the hypothesis was specific and the refutation is reusable: thi
 is the second kernel this session where a barrier-count argument looked compelling
 and measured flat (the subgroup GEMV was the first).
 
-### ★ RAGGED M: a one-line predicate was costing 21.5x on prefill (2026-08-08, GB10)
+## 2026-08-07 — sm_120 exact GDN causal-conv chunks: 3.069x kernel, +2.152% enclosing
 
-The largest win of this campaign, and it was self-inflicted.
+**Disposition:** ACCEPTED and reproduced on clean current-main transplant
+`upstream/main` `f91a5917a`. Exact chunks default ON; latency, VRAM and
+27B/35B gates stay open.
 
-**How it was found.** Two GDN increments moved coverage 11 -> 3 and speed not at
-all, so a prefill-dominated run was profiled with GPU timestamps:
+The metadata builder enumerates exact `(sequence, 8-token chunk)` work, uploads
+its two i32 descriptors once per step and shares them across GDN layers. The
+register kernel consumes one descriptor per `grid.y`.
+`VT_CONV_EXACT_CHUNKS=0` is the same-binary whole-sequence rollback;
+`VT_CONV_REG=0` selects tiled/scalar.
 
-    vt_matmul   433 calls   409,611.9 ms   99.9% of GPU   945.99 ms/call
+**Correctness.** RED compile evidence:
+`/tmp/vllm-agent-runs/gdn-exact-red-escalated.json`. Focused host metadata and
+flags, affected Qwen fixtures, full CUDA GDN and cached Qwen3.5-4B 3/3·1672
+were green. Three production ON/OFF pairs had identical token files for all
+128 requests × 128 outputs.
 
-The UNTILED SCALAR kernel — the portable correctness tier — was carrying every
-prefill GEMM at ~96 GFLOP/s, roughly **1% of what GB10 can do**. GPU busy was 95%
-of wall, so prefill was never host-bound, and the remaining reference-tier ops
-accounted for ~0.1%. **Three prior structural attributions were wrong; the
-timestamp profile settled it in one run.**
+**Same-binary profile.** Manifest
+`/tmp/vllm-agent-runs/qwen35-conv-exact-ab-profile.json`; rollback/default
+traces `/tmp/qwen35-conv-exact-{off,on}.nsys-rep`. Rollback: 1728 calls,
+720.047171 ms, 416.694 us mean. Exact: 1728 calls, 234.607112 ms, 135.768 us.
+That is **3.069x**, saving 485.440 ms. Exact `grid.y=279/280/282` work counts
+replace dominant `(64,28..32,1)` whole-sequence grids, confirming the proposed
+mechanism. Pinned-vLLM same-tool total is 145.421 ms; residual **1.613x**.
 
-**Why coopmat declined, measured not reasoned.** Both obvious candidates were
-excluded by reading the source: every dimension is a whole tile (5120, 17408,
-256) and activations are bf16 (`DBuf dx(d, DType::kBF16, ...)`). The predicate had
-to be made to report itself, gated behind `VT_VULKAN_DISPATCH_STATS`:
+**Enclosing A/B.** Manifest
+`/tmp/vllm-agent-runs/qwen35-conv-exact-local-ab.json`; evidence root
+`/tmp/qwen35-conv-exact-local-ab-20260807`. Three alternating pairs under one
+GPU lock and a 25 GiB user-systemd scope:
 
-    coopmat DECLINED: M is not a multiple of 16  (a.dtype=2 b.dtype=2 m=17 k=5120 n=10240)
-
-**`m = tokens + 1`.** A 512-token prompt gives m=513, and `513 % 16 == 1`. Every
-prefill GEMM, at every prompt length, fell to the scalar kernel.
-
-**The cause was my own hang fix from the previous day.** `coopMatLoad` reads a
-full 16x16 tile unmasked, so at M=1 it read ~30 KB past the activation buffer and
-the fence never signalled. That was fixed by requiring `m % 16 == 0 && n % 16 ==
-0` — correct, and it is why the 27B runs at all instead of hanging. The note left
-at the time read *"a masked/padded load is the better long-term answer, not
-attempted here."* That deferred work WAS the prefill bottleneck. It went unnoticed
-because the only model then running on Vulkan was opt-125m, whose small GEMMs made
-the scalar path cheap.
-
-**The fix: shift the trailing tile back, do not mask.** A tile that would overrun
-M slides down to start at `M-16`, so it reads only REAL rows. Exact, not
-approximate: a result row depends solely on that row of A and on B, never on which
-tile computed it, so the rows shared with the previous tile recompute to
-bit-identical values and the duplicate stores write the same bytes. It needs
-`M >= 16`, which the predicate now requires in place of `M % 16 == 0`; below that
-there is no in-bounds 16-row window, and decode (M=1) is served by the GEMV
-tactic.
-
-**MEASURED, GB10, Qwen3.6-27B, 512-token prefill:**
-
-| | before | after | |
+| Axis | rollback | exact default | ratio |
 |---|---:|---:|---:|
-| GEMM ms/call | 945.99 | 30.40 | **31.1x** |
-| prefill tok/s | 1.18 | 25.41 | **21.5x** |
-| E2E ms | 433,321 | 20,192 | **21.5x** |
+| total | 6641.800 tok/s | 6784.743 tok/s | 1.02152x |
+| output | 734.433 tok/s | 750.237 tok/s | 1.02152x |
+| TTFT | 1048.927 ms | 1018.040 ms | 0.97055x |
+| TPOT / ITL | 35.420 ms | 34.740 ms | 0.98080x |
+| E2E | 5547.687 ms | 5430.180 ms | 0.97882x |
 
-`vt_matmul` is gone from the profile; `vt_matmul_coopmat` carries 432 calls at
-30.4 ms. 21.5x is far outside this box's 2.1x noise band, so it is callable at
-n=1. A 512-token prefill is now **20.1 s against llama.cpp's ~1.1 s — 18x behind,
-down from 244x.**
+Against sealed vLLM, exact local is **1.021246x** throughput,
+**1.085812x** TTFT and **1.024597x** TPOT. Exact peak VRAM
+13044/13058/13058 MiB, mean 13053.3, versus old local 13054 and vLLM 12820.
 
-**Gate: 26/26, 1563 assertions on GB10.** The new ragged-M case asserts the TACTIC
-(`PipelineExistsFor("vt_matmul_coopmat")`) and exactness at M=17, and it
-short-circuits on llvmpipe, which has no coopmat — the local run shows 1020
-assertions, the GB10 run 1563. A gate that cannot run on the CI device has to be
-run on the device that has the feature, or it proves nothing.
+**VOID oracle attempts.** `qwen35-conv-exact-default-full-compare.json` exposed
+the missing live-driver link path; the harness now adds `/run/opengl-driver/lib`
+to `LIBRARY_PATH`. `qwen35-conv-exact-default-full-compare-rerun.json` reached
+13/18 legs before a transient Torch bytecode read invalidated Triton AOT cache
+keys. Neither attempt supersedes the sealed denominator. Full evidence:
+`docs/bench-evidence/qwen35-4b-sm120-main-20260807.md`.
 
-**The durable lesson: a correctness fix can silently become a performance cliff,
-and a selection predicate that can route an entire model onto the correctness tier
-should be able to SAY SO.** Reading the source excluded the two candidates a human
-would guess and pointed at neither; the predicate's own report named it
-immediately. That diagnostic now ships behind the stats flag.
+**Clean-transplant reproduction (`f91a5917a`).** Contained CPU/CUDA rebuild;
+focused CPU 6/6, full CUDA GDN 66/66·4300, cached 4B 3/3·1672. Same-binary
+graph-node traces `/tmp/qwen35-conv-exact-transplant-{off,on}.nsys-rep` and
+token files reproduce the mechanism with byte identity: rollback 1728 calls /
+720.216507 ms / 416.792 us, exact 1728 / 234.379395 ms / 135.636 us =
+**3.072866x**. Profiled enclosing totals are 6587.66→6727.35 tok/s
+(**1.021205x**), TTFT 1058.73→1025.46 ms, TPOT 35.70→35.04 ms and E2E
+5592.69→5475.91 ms. The transplanted result is therefore reproduced, not merely
+carried from its old branch. Against the sealed vLLM conv trace, residual is
+**1.611730x**.
 
+**Post-rebase reproduction (`3d2581551` on `upstream/main` `48a54141f`).** The
+contained rebuild and all three gates remain green: focused 6/6, CUDA GDN
+66/66·4300, cached 4B 3/3·1672. Fresh graph-node traces and token files under
+`/tmp/qwen35-conv-exact-rebase-3d2581551-{off,on}.*` are byte-identical.
+Rollback is 1728 calls / 718.704016 ms / 415.917 us; exact is 1728 /
+233.954533 ms / 135.390 us = **3.07198x**. Profiled enclosing totals are
+6589.65→6739.34 tok/s (**1.02272x**), TTFT 1057.63→1022.70 ms, TPOT
+35.70→34.99 ms and E2E 5590.92→5466.20 ms. The result therefore survives the
+27-commit main advance; against the sealed vLLM conv trace the residual is
+**1.60881x**. Trace SHA-256: rollback `6a5dde18e...f97c47`, exact
+`f47fb9cc...7aecf9`; both token files `83fcdc45...453545`.

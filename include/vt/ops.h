@@ -449,6 +449,13 @@ struct CausalConv1dArgs {
   // Upstream `activation` is "silu"/"swish" (→ silu) or None (→ identity);
   // Qwen GDN always uses silu (gdn-semantics.md §2).
   bool silu_activation = true;
+  // Optional exact upstream prefill work descriptor, both i32 [num_programs]
+  // on the queue device. Entry p owns sequence batch_ptr[p] and its
+  // token_chunk_offset_ptr[p]-th 8-token chunk. CUDA consumes these when the
+  // default CUDA path is selected; VT_CONV_EXACT_CHUNKS=0 restores the legacy mapping and
+  // CPU keeps its scalar reference.
+  const Tensor* batch_ptr = nullptr;
+  const Tensor* token_chunk_offset_ptr = nullptr;
 };
 
 struct L2NormArgs {

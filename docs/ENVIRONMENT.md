@@ -84,6 +84,7 @@ portable/reference path. In normal operation leave them unset.
 | `VT_GPU_SAMPLE` | on (CUDA) | Host-side sampling instead of on-GPU sampling |
 | `VT_GDN_PACKED_DECODE` | on (CUDA GDN) | Unpacked GDN decode path |
 | `VT_CONV_REG` | on (CUDA GDN) | The non-register-tiled short causal convolution |
+| `VT_CONV_EXACT_CHUNKS` | on (CUDA GDN prefill) | Use `=0` for the legacy sequence-serial causal-conv mapping; default mirrors vLLM's exact `(sequence, 8-token chunk)` descriptor and is byte-identical |
 | `VT_FA2_PREFILL` | on (CUDA) | The portable prefill attention instead of the vendored FA2 |
 | `VT_FA2_DECODE` | on (CUDA) | The portable decode attention instead of the vendored FA2 |
 | `VT_FA2_DECODE_4B` | on (CUDA, Qwen3.5-4B) | The portable paged decode attention instead of the ratio-4 vendored FA2 path; the 27B and 35B selectors are unchanged |

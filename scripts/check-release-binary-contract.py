@@ -566,23 +566,23 @@ TEST_INVENTORY_CONSUMERS = {
 }
 
 TEST_INVENTORY_BODY_DIGESTS = {
-    "PRIMARY_CUDA_SMS": "5dc05132f5f24f0b2add406cb5682031b05d1940d2189728543b53a375d15125",
-    "EXACT_MACHINE_FIELDS": "8fa2ec5fca092a1092052a1426c37b66b8b8be49290e0e6e414e555dcbdad8dc",
-    "EXPECTED_DEPS": "4f8d345df7b467312869355f15153e04b77a0fd7005ea60ad86db40cc55ae6a2",
-    "HUMAN_WORK_IDS": "363c9494815086a53c3112792afe3c1651256d06a519e6fbeed43b78e865d922",
-    "RECORD_ANCHORS": "0e15f59b43bd4e70535055ccbcb41c500f89006fe9df4c2e58b0cfd0a00205f1",
-    "LIFECYCLE_RECORD_MUTATIONS": "79de0584503bb8c1cc1463169d8741455714c1d252136a89294e532878ec996a",
-    "PUBLIC_PENDING_MUTATIONS": "507e58eb51f04ab03db0cea484513da5cb0a7fdd2d6f6f332004e09106682fd3",
-    "W10_W12_HUMAN_MUTATIONS": "1fcb8914c91dc01052f7f26a45cbbaebe01c211bc0e692f70df3d62b13a963bf",
-    "PRIMARY_ARTIFACT_PROSE_MUTATIONS": "1fcb8914c91dc01052f7f26a45cbbaebe01c211bc0e692f70df3d62b13a963bf",
-    "GUARD_MAP_KEYS": "06691dc7239166ac458c9999d545938f7c8afb5021cb347d0fa6bdd0dac2a082",
-    "INVENTORY_CONSUMER_METHODS": "5754b33de9ca699665d4f612f8089371dbc7d9ce583422ffeb48a33499575eab",
-    "CONSUMER_FLOW_MUTATIONS": "a2d05b5bea24a09c6c5313f4e65d259a9b7e984f6450aa74309f790b3e81de8a",
-    "UNKNOWN_MACHINE_FIELD_MUTATIONS": "1d9242dabe625e43b909709ed0a40915d55fd6610c06bab3e696dc803745e0b8",
-    "HUMAN_WORK_DEPS": "800c69c64c995030fff12ccfbe2bb0002193c17cbe28aeca52c584cf15c2b675",
-    "BACKEND_POLICY_PROSE_MUTATIONS": "df80167a6da67c499ba1fdebda15e8c5250b46eccebb329973d7e63f7c6d0763",
-    "PREFLIGHT_WIRING_MUTATIONS": "635f1f49d2e04eb662e61d97f8e4128569d98b8af327fd33d3093451f3f24f7e",
-    "CI_WIRING_MUTATIONS": "ce2cb4b0c5c71431861c9af57b15468205ee335387120b48b150d7244a008885",
+    "PRIMARY_CUDA_SMS": "43e348a6fefad920d5ac461ef34868d20c05af64d3c9f032c62af469a358dee9",
+    "EXACT_MACHINE_FIELDS": "f7389b004be2b5665456e893abfa8ebb1b404c84711e86aba9673fcf8775c971",
+    "EXPECTED_DEPS": "b7d4608bab17632a8a02e7da6f7b8f656415c9ed08dc4ee18f7268709ec91512",
+    "HUMAN_WORK_IDS": "49195d0f7cd3f40d48c9f1282e4b9ead9571ca3a546c449c427801cac8fc8bdd",
+    "RECORD_ANCHORS": "5d354a9ed8590deccdc62890e403af66a21c416cb45e9788aacc4dce14364500",
+    "LIFECYCLE_RECORD_MUTATIONS": "ab35f4e72fe180cd3ef4675939d5ff8c709aff4c0474412d47ee78988c61199d",
+    "PUBLIC_PENDING_MUTATIONS": "69a3fc11686ccea3856b61f473796499466dc234e4aca952fce79bef2157714d",
+    "W10_W12_HUMAN_MUTATIONS": "17cb0586bf5ea235ba668bd0a4ae90345a33e125f211909e7f97267ec9e59dc8",
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS": "17cb0586bf5ea235ba668bd0a4ae90345a33e125f211909e7f97267ec9e59dc8",
+    "GUARD_MAP_KEYS": "701e4821bee926c2e074dbf2b97ff4a93bebb610cc6bed76e06063cab8974758",
+    "INVENTORY_CONSUMER_METHODS": "916894a32d88026a883cc1f316d949eb116ee1fced36d635b585d7bf3372b01d",
+    "CONSUMER_FLOW_MUTATIONS": "6f69f9e361d38c325fbc455c31ec7211578131368624312e024448afdfc01e83",
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS": "8d10128593c67c64cde8cbe7e58faa9a9ade0d4bde391d24474fd04d6392ed6b",
+    "HUMAN_WORK_DEPS": "54a501b903eb3c97023084393666f9f63d289ab9a78e22f389c32bfc1711573b",
+    "BACKEND_POLICY_PROSE_MUTATIONS": "c5fea18a668932c4768cb9feb4746fd444b3df7e7ec15df1a588141898d28f2d",
+    "PREFLIGHT_WIRING_MUTATIONS": "d442c6d188efd624bffc9e94a7750d6a527c7b693affde5cbc33304f9e95272e",
+    "CI_WIRING_MUTATIONS": "7e20ed4d041fee98f96bb751e4435ad266d75ec8fbc9c5e1197a5d21940a6424",
 }
 
 EXACT_MACHINE_FIELDS = {
@@ -1137,9 +1137,28 @@ def _inventory_loop(
     return matches[0] if len(matches) == 1 else None
 
 
+_VERSION_ONLY_AST_FIELDS = frozenset({"type_params"})
+
+
+def _canonical_ast(value: object) -> object:
+    """Return a Python-version-stable representation of an AST value."""
+    if isinstance(value, ast.AST):
+        return (
+            type(value).__name__,
+            tuple(
+                (name, _canonical_ast(field_value))
+                for name, field_value in ast.iter_fields(value)
+                if name not in _VERSION_ONLY_AST_FIELDS
+            ),
+        )
+    if isinstance(value, list):
+        return tuple(_canonical_ast(item) for item in value)
+    return value
+
+
 def _consumer_body_digest(loop: ast.For) -> str:
     body = ast.Module(body=loop.body, type_ignores=[])
-    serialized = ast.dump(body, include_attributes=False).encode("utf-8")
+    serialized = repr(_canonical_ast(body)).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
 
 
