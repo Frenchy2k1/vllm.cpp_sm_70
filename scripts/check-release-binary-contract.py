@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import os
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -16,6 +20,8 @@ BEGIN = "<!-- release-binary-contract:begin -->"
 END = "<!-- release-binary-contract:end -->"
 SPEC_PATH = ".agents/specs/release-binary-matrix.md"
 TEST_PATH = "tests/scripts/test_check_release_binary_contract.py"
+PREFLIGHT_PATH = "scripts/agent-preflight.sh"
+CI_PATH = ".github/workflows/ci.yml"
 
 IDENTITY = "ENG-RELEASE-BINARIES"
 PRIMARY_CUDA_SMS = (
@@ -49,7 +55,7 @@ WORK_DEPS = {
 ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | SPIKE | #129 |",
+    ".agents/NOW.md": "| Release | SPIKE; 30/30 | #129 |",
     ".agents/coordination.md": (
         "| `CLAIM-ENG-RELEASE-BINARIES-SPIKE` | "
         "`ENG-RELEASE-BINARIES` |"
@@ -59,7 +65,7 @@ ANCHORS = {
         "are the primary downloads"
     ),
     "docs/STATUS.md": (
-        "[Release spike](../.agents/specs/release-binary-matrix.md)"
+        "#129: SPIKE∅"
     ),
     "docs/BENCHMARKS.md": (
         "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`:"
@@ -127,14 +133,134 @@ BENCHMARKS_RELEASE_ROW = (
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
     "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states; "
-    "25 tests GREEN. No archive, staged smoke, runtime, correctness, or performance "
+    "30 tests GREEN. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
-    "Supported (subset); bundles SPIKED, no artifacts",
-    "[Release spike](../.agents/specs/release-binary-matrix.md): pending.",
+    "Supported (subset); #129: SPIKE∅",
+)
+
+BACKEND_POLICY_PROSE = {
+    "Metal release channel": (
+        "| `macos-arm64-metal` | stable after M-series runtime gate |"
+    ),
+    "MLX release channel": (
+        "| `macos-arm64-metal-mlx` | preview until its exact bundled MLX tuple "
+        "is runtime/correctness-gated |"
+    ),
+    "Vulkan release channel": "| `linux-x86_64-glibc-vulkan` | preview |",
+    "musl experimental CPU-only policy": (
+        "| `linux-x86_64-musl-cpu-static` | experimental preview | "
+        "literal-static feasibility lane; CPU only; see the static boundary below |"
+    ),
+    "ROCm release channel": "| ROCm/HIP | blocked |",
+    "external host GPU-driver boundary": "it never claims to bundle a GPU driver.",
+    "musl CPU-only/no-GPU boundary": (
+        "The one literal-static experiment is "
+        "`linux-x86_64-musl-cpu-static`. It is CPU-only"
+    ),
+}
+
+BACKEND_POLICY_PROSE_MUTATIONS = (
+    (
+        "| `macos-arm64-metal` | stable after M-series runtime gate |",
+        "| `macos-arm64-metal` | preview |",
+        "Metal release channel",
+    ),
+    (
+        "| `macos-arm64-metal-mlx` | preview until its exact bundled MLX tuple "
+        "is runtime/correctness-gated |",
+        "| `macos-arm64-metal-mlx` | stable |",
+        "MLX release channel",
+    ),
+    (
+        "| `linux-x86_64-glibc-vulkan` | preview |",
+        "| `linux-x86_64-glibc-vulkan` | stable |",
+        "Vulkan release channel",
+    ),
+    (
+        "| `linux-x86_64-musl-cpu-static` | experimental preview | literal-static "
+        "feasibility lane; CPU only; see the static boundary below |",
+        "| `linux-x86_64-musl-cpu-static` | stable | literal-static feasibility "
+        "lane with CUDA |",
+        "musl experimental CPU-only policy",
+    ),
+    (
+        "| ROCm/HIP | blocked |",
+        "| ROCm/HIP | preview |",
+        "ROCm release channel",
+    ),
+    (
+        "it never claims to bundle a GPU driver.",
+        "it bundles the GPU driver.",
+        "external host GPU-driver boundary",
+    ),
+    (
+        "The one literal-static experiment is\n"
+        "`linux-x86_64-musl-cpu-static`. It is CPU-only",
+        "The one literal-static experiment is\n"
+        "`linux-x86_64-musl-cpu-static`. It includes GPU runtimes",
+        "musl CPU-only/no-GPU boundary",
+    ),
+)
+
+PREFLIGHT_WIRING_MUTATIONS = (
+    ("  check-release-binary-contract\n", "", "preflight CHECKERS"),
+    ("  test_check_release_binary_contract\n", "", "preflight SUITES"),
+    (
+        'for checker in "${CHECKERS[@]}"; do',
+        'for checker in "${CHECKERS[@]}"; do\n  continue',
+        "execute release CHECKERS",
+    ),
+    (
+        'for suite in "${SUITES[@]}"; do',
+        'for suite in "${SUITES[@]}"; do\n  continue',
+        "execute release SUITES",
+    ),
+    ("CHECKERS=(\n", "INERT_CHECKERS=(\n", "preflight CHECKERS"),
+    ("SUITES=(\n", "INERT_SUITES=(\n", "preflight SUITES"),
+)
+
+CI_WIRING_MUTATIONS = (
+    (
+        "          python3 scripts/check-release-binary-contract.py\n",
+        "",
+        "CI checker",
+    ),
+    (
+        "          python3 tests/scripts/test_check_release_binary_contract.py\n",
+        "",
+        "CI step",
+    ),
+    (
+        "          python3 scripts/check-release-binary-contract.py\n"
+        "          python3 tests/scripts/test_check_release_binary_contract.py\n",
+        "          if false; then\n"
+        "            python3 scripts/check-release-binary-contract.py\n"
+        "            python3 tests/scripts/test_check_release_binary_contract.py\n"
+        "          fi\n",
+        "direct active commands",
+    ),
+    (
+        "          python3 scripts/check-release-binary-contract.py\n",
+        '          echo "python3 scripts/check-release-binary-contract.py"\n',
+        "direct active commands",
+    ),
+    (
+        "      - name: Accepted binary-release design and record anchors stay in sync\n"
+        "        run: |\n",
+        "      - name: Accepted binary-release design and record anchors stay in sync\n"
+        "        if: ${{ false }}\n"
+        "        run: |\n",
+        "direct active commands",
+    ),
+    (
+        "  agent-record:\n",
+        "  agent-record:\n    if: ${{ false }}\n",
+        "direct active commands",
+    ),
 )
 
 HUMAN_CONTRACT = {
@@ -168,7 +294,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states; 25 tests GREEN. No archive, "
+        "W1-W13/W10-W12 policy, public pending states; 30 tests GREEN. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -176,8 +302,8 @@ PUBLIC_PENDING_MUTATIONS = (
     ),
     (
         "docs/STATUS.md",
-        "Supported (subset); bundles SPIKED, no artifacts",
-        "Supported; bundles SHIPPED with runtime evidence",
+        "Supported (subset); #129: SPIKE∅",
+        "Supported; #129: SHIPPED",
         "docs/STATUS.md release row",
     ),
 )
@@ -240,6 +366,11 @@ REQUIRED_TEST_METHODS = (
     "test_each_semantic_inventory_consumer_body_is_pinned",
     "test_checker_guard_map_keysets_are_exact",
     "test_required_mutation_test_inventory_is_pinned",
+    "test_backend_policy_machine_fields_are_required",
+    "test_backend_policy_prose_is_fail_closed",
+    "test_preflight_and_ci_wiring_is_an_executable_contract",
+    "test_preflight_wiring_mutations_fail",
+    "test_ci_wiring_mutations_fail",
 )
 
 EXPECTED_TEST_LITERAL_INVENTORY_KEYS = (
@@ -257,6 +388,9 @@ EXPECTED_TEST_LITERAL_INVENTORY_KEYS = (
     "UNKNOWN_MACHINE_FIELD_MUTATIONS",
     "HUMAN_WORK_DEPS",
     "GUARD_MAP_KEYS",
+    "BACKEND_POLICY_PROSE_MUTATIONS",
+    "PREFLIGHT_WIRING_MUTATIONS",
+    "CI_WIRING_MUTATIONS",
 )
 
 EXPECTED_TEST_INVENTORY_CONSUMER_KEYS = (
@@ -274,6 +408,9 @@ EXPECTED_TEST_INVENTORY_CONSUMER_KEYS = (
     "UNKNOWN_MACHINE_FIELD_MUTATIONS",
     "HUMAN_WORK_DEPS",
     "GUARD_MAP_KEYS",
+    "BACKEND_POLICY_PROSE_MUTATIONS",
+    "PREFLIGHT_WIRING_MUTATIONS",
+    "CI_WIRING_MUTATIONS",
 )
 
 EXPECTED_GUARD_MAP_KEYS = {
@@ -288,6 +425,13 @@ TEST_LITERAL_INVENTORIES = {
         "work_W12_policy": "optional-non-blocking",
         "archive_claims": "pending",
         "runtime_claims": "pending",
+        "metal_channel": "stable-after-runtime-gate",
+        "mlx_channel": "preview",
+        "vulkan_channel": "preview",
+        "musl_channel": "experimental-preview",
+        "musl_scope": "cpu-only-no-gpu",
+        "rocm_channel": "blocked",
+        "gpu_driver_boundary": "external-host-never-bundled",
         "required_anchor_paths": (
             ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
             ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
@@ -318,6 +462,9 @@ TEST_LITERAL_INVENTORIES = {
             "test_human_primary_artifact_contract_matches_machine_block"
         ),
         "GUARD_MAP_KEYS": "test_checker_guard_map_keysets_are_exact",
+        "BACKEND_POLICY_PROSE_MUTATIONS": "test_backend_policy_prose_is_fail_closed",
+        "PREFLIGHT_WIRING_MUTATIONS": "test_preflight_wiring_mutations_fail",
+        "CI_WIRING_MUTATIONS": "test_ci_wiring_mutations_fail",
     },
     "CONSUMER_FLOW_MUTATIONS": ("continue", "break", "wrap_false"),
     "UNKNOWN_MACHINE_FIELD_MUTATIONS": (("unexpected_field", "x"),),
@@ -325,6 +472,9 @@ TEST_LITERAL_INVENTORIES = {
         work: ",".join(deps) for work, deps in WORK_DEPS.items()
     },
     "GUARD_MAP_KEYS": EXPECTED_GUARD_MAP_KEYS,
+    "BACKEND_POLICY_PROSE_MUTATIONS": BACKEND_POLICY_PROSE_MUTATIONS,
+    "PREFLIGHT_WIRING_MUTATIONS": PREFLIGHT_WIRING_MUTATIONS,
+    "CI_WIRING_MUTATIONS": CI_WIRING_MUTATIONS,
 }
 
 TEST_INVENTORY_CONSUMERS = {
@@ -398,6 +548,21 @@ TEST_INVENTORY_CONSUMERS = {
         ("guard_map", "keys"),
         True,
     ),
+    "BACKEND_POLICY_PROSE_MUTATIONS": (
+        "test_backend_policy_prose_is_fail_closed",
+        ("before", "after", "reason"),
+        False,
+    ),
+    "PREFLIGHT_WIRING_MUTATIONS": (
+        "test_preflight_wiring_mutations_fail",
+        ("before", "after", "reason"),
+        False,
+    ),
+    "CI_WIRING_MUTATIONS": (
+        "test_ci_wiring_mutations_fail",
+        ("before", "after", "reason"),
+        False,
+    ),
 }
 
 TEST_INVENTORY_BODY_DIGESTS = {
@@ -415,6 +580,9 @@ TEST_INVENTORY_BODY_DIGESTS = {
     "CONSUMER_FLOW_MUTATIONS": "a2d05b5bea24a09c6c5313f4e65d259a9b7e984f6450aa74309f790b3e81de8a",
     "UNKNOWN_MACHINE_FIELD_MUTATIONS": "1d9242dabe625e43b909709ed0a40915d55fd6610c06bab3e696dc803745e0b8",
     "HUMAN_WORK_DEPS": "800c69c64c995030fff12ccfbe2bb0002193c17cbe28aeca52c584cf15c2b675",
+    "BACKEND_POLICY_PROSE_MUTATIONS": "df80167a6da67c499ba1fdebda15e8c5250b46eccebb329973d7e63f7c6d0763",
+    "PREFLIGHT_WIRING_MUTATIONS": "635f1f49d2e04eb662e61d97f8e4128569d98b8af327fd33d3093451f3f24f7e",
+    "CI_WIRING_MUTATIONS": "ce2cb4b0c5c71431861c9af57b15468205ee335387120b48b150d7244a008885",
 }
 
 EXACT_MACHINE_FIELDS = {
@@ -422,6 +590,13 @@ EXACT_MACHINE_FIELDS = {
     "work_W12_policy": "optional-non-blocking",
     "archive_claims": "pending",
     "runtime_claims": "pending",
+    "metal_channel": "stable-after-runtime-gate",
+    "mlx_channel": "preview",
+    "vulkan_channel": "preview",
+    "musl_channel": "experimental-preview",
+    "musl_scope": "cpu-only-no-gpu",
+    "rocm_channel": "blocked",
+    "gpu_driver_boundary": "external-host-never-bundled",
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
@@ -509,6 +684,291 @@ def _normalize_deps(cell: str) -> tuple[str, ...]:
 
 def _normalize_prose(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def backend_policy_errors(spec_text: str) -> list[str]:
+    """Return drift from the accepted backend release-channel boundaries."""
+
+    normalized = _normalize_prose(spec_text)
+    return [
+        f"{reason} must remain {statement!r}"
+        for reason, statement in BACKEND_POLICY_PROSE.items()
+        if _normalize_prose(statement) not in normalized
+    ]
+
+
+def _without_line_comments(text: str) -> str:
+    """Remove shell comments while preserving quoted hash characters."""
+
+    cleaned: list[str] = []
+    for line in text.splitlines():
+        quoted = False
+        escaped = False
+        kept: list[str] = []
+        for char in line:
+            if escaped:
+                kept.append(char)
+                escaped = False
+                continue
+            if char == "\\" and quoted:
+                kept.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                quoted = not quoted
+                kept.append(char)
+                continue
+            if char == "#" and not quoted:
+                break
+            kept.append(char)
+        cleaned.append("".join(kept))
+    return "\n".join(cleaned)
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _literal_block(lines: list[str], header_index: int) -> list[str]:
+    parent_indent = _indent(lines[header_index])
+    raw: list[str] = []
+    for candidate in lines[header_index + 1 :]:
+        if not candidate.strip():
+            raw.append("")
+            continue
+        if _indent(candidate) <= parent_indent:
+            break
+        raw.append(candidate)
+    nonblank = [line for line in raw if line.strip()]
+    if not nonblank:
+        return []
+    content_indent = min(_indent(line) for line in nonblank)
+    return [line[content_indent:] if line.strip() else "" for line in raw]
+
+
+def _yaml_mapping(
+    line: str, indent: int, sequence: bool = False
+) -> tuple[str, str] | None:
+    if _indent(line) != indent:
+        return None
+    content = line[indent:]
+    if sequence:
+        if not content.startswith("-"):
+            return None
+        content = content[1:].lstrip()
+        if not content:
+            return None
+    match = re.match(
+        r"^(?P<key>'[^']*'|\"[^\"]*\"|[^:#]+?)\s*:\s*(?P<value>.*)$",
+        content,
+    )
+    if match is None:
+        return None
+    key = match.group("key").strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {"'", '"'}:
+        key = key[1:-1]
+    return key.strip(), match.group("value").strip()
+
+
+def _unconditional_ci_run_blocks(text: str) -> list[list[str]]:
+    """Return direct run blocks owned by unconditional Actions jobs and steps."""
+
+    lines = text.splitlines()
+    blocks: list[list[str]] = []
+    jobs_index = next((i for i, line in enumerate(lines) if line == "jobs:"), None)
+    if jobs_index is None:
+        return blocks
+    job_starts = [
+        i
+        for i in range(jobs_index + 1, len(lines))
+        if (mapping := _yaml_mapping(lines[i], 2)) is not None
+        and mapping[1] == ""
+    ]
+    for job_pos, job_start in enumerate(job_starts):
+        job_end = (
+            job_starts[job_pos + 1]
+            if job_pos + 1 < len(job_starts)
+            else len(lines)
+        )
+        job_lines = lines[job_start + 1 : job_end]
+        job_fields = {
+            mapping[0]
+            for line in job_lines
+            if (mapping := _yaml_mapping(line, 4)) is not None
+        }
+        if "if" in job_fields:
+            continue
+        steps_offset = next(
+            (
+                i
+                for i, line in enumerate(job_lines)
+                if _yaml_mapping(line, 4) == ("steps", "")
+            ),
+            None,
+        )
+        if steps_offset is None:
+            continue
+        steps_start = job_start + 1 + steps_offset + 1
+        step_starts = [
+            i
+            for i in range(steps_start, job_end)
+            if _indent(lines[i]) == 6 and lines[i][6:].startswith("-")
+        ]
+        for step_pos, step_start in enumerate(step_starts):
+            step_end = (
+                step_starts[step_pos + 1]
+                if step_pos + 1 < len(step_starts)
+                else job_end
+            )
+            step_fields: dict[str, tuple[str, int]] = {}
+            first = _yaml_mapping(lines[step_start], 6, sequence=True)
+            if first is not None:
+                step_fields[first[0]] = (first[1], step_start)
+            for index in range(step_start + 1, step_end):
+                mapping = _yaml_mapping(lines[index], 8)
+                if mapping is not None:
+                    step_fields[mapping[0]] = (mapping[1], index)
+            if {"if", "continue-on-error", "shell"} & step_fields.keys():
+                continue
+            run = step_fields.get("run")
+            if run is not None and re.fullmatch(r"\|[-+]?", run[0]):
+                blocks.append(_literal_block(lines, run[1]))
+    return blocks
+
+
+def _direct_commands(block: list[str]) -> list[list[str]] | None:
+    commands: list[list[str]] = []
+    for line in block:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line != line.lstrip():
+            return None
+        try:
+            argv = shlex.split(stripped, comments=True, posix=True)
+        except ValueError:
+            return None
+        if not argv or any(token in {";", "&&", "||", "|", "&"} for token in argv):
+            return None
+        commands.append(argv)
+    return commands
+
+
+def _active_ci_commands(ci_text: str) -> set[tuple[str, ...]]:
+    commands: set[tuple[str, ...]] = set()
+    for block in _unconditional_ci_run_blocks(ci_text):
+        parsed = _direct_commands(block)
+        if parsed is not None:
+            commands.update(tuple(command) for command in parsed)
+    return commands
+
+
+def _ci_has_active_release_step(ci_text: str) -> bool:
+    expected = [
+        ["python3", "scripts/check-release-binary-contract.py"],
+        ["python3", "tests/scripts/test_check_release_binary_contract.py"],
+    ]
+    return any(
+        _direct_commands(block) == expected
+        for block in _unconditional_ci_run_blocks(ci_text)
+    )
+
+
+def _bash_array_values(text: str, name: str) -> list[str] | None:
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == f"{name}=("]
+    if len(starts) != 1:
+        return None
+    values: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        if line.strip() == ")":
+            return values
+        try:
+            values.extend(shlex.split(line, comments=True, posix=True))
+        except ValueError:
+            return None
+    return None
+
+
+def _trace_preflight_commands(text: str) -> tuple[int, list[tuple[str, ...]]]:
+    """Execute preflight with shims and return every Python argv it owns."""
+
+    with tempfile.TemporaryDirectory(prefix="vllm-release-preflight-trace-") as temporary:
+        root = Path(temporary)
+        script = root / PREFLIGHT_PATH
+        script.parent.mkdir(parents=True)
+        script.write_text(text, encoding="utf-8")
+        script.chmod(0o700)
+        (root / ".agents").mkdir()
+        (root / ".agents/NOW.md").write_text("trace-only\n", encoding="utf-8")
+        shim_dir = root / "shim"
+        shim_dir.mkdir()
+        trace = root / "python.trace"
+        python = shim_dir / "python3"
+        python.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\0' \"$@\" >> \"$VLLM_RELEASE_TRACE\"\n"
+            "printf '\\0' >> \"$VLLM_RELEASE_TRACE\"\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o700)
+        git = shim_dir / "git"
+        git.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        git.chmod(0o700)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
+        environment["VLLM_RELEASE_TRACE"] = str(trace)
+        result = subprocess.run(
+            ["bash", str(script), "--quiet", "--no-require-role"],
+            cwd=root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        raw = trace.read_bytes() if trace.exists() else b""
+    invocations = []
+    for record in raw.split(b"\0\0"):
+        if record:
+            invocations.append(
+                tuple(token.decode("utf-8") for token in record.split(b"\0") if token)
+            )
+    return result.returncode, invocations
+
+
+def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
+    """Require this checker and suite to execute through preflight and CI."""
+
+    errors: list[str] = []
+    uncommented = _without_line_comments(preflight_text)
+    checkers = _bash_array_values(uncommented, "CHECKERS")
+    suites = _bash_array_values(uncommented, "SUITES")
+    if checkers is None or "check-release-binary-contract" not in checkers:
+        errors.append("release checker is missing from preflight CHECKERS")
+    if suites is None or "test_check_release_binary_contract" not in suites:
+        errors.append("release mutation suite is missing from preflight SUITES")
+    returncode, invocations = _trace_preflight_commands(preflight_text)
+    checker_argv = ("scripts/check-release-binary-contract.py",)
+    suite_argv = ("tests/scripts/test_check_release_binary_contract.py",)
+    if invocations.count(checker_argv) != 1:
+        errors.append("preflight does not execute release CHECKERS through its checker loop")
+    if invocations.count(suite_argv) != 1:
+        errors.append("preflight does not execute release SUITES through its suite loop")
+    if returncode != 0:
+        errors.append(f"instrumented preflight execution failed with rc={returncode}")
+    active = _active_ci_commands(ci_text)
+    if ("python3", "scripts/check-release-binary-contract.py") not in active:
+        errors.append("release checker is missing from the explicit CI checker step")
+    if (
+        "python3",
+        "tests/scripts/test_check_release_binary_contract.py",
+    ) not in active:
+        errors.append("release mutation suite is missing from the explicit CI step")
+    if not _ci_has_active_release_step(ci_text):
+        errors.append(
+            "CI release step must contain checker and suite as direct active commands"
+        )
+    return errors
 
 
 def _table_record(
@@ -861,6 +1321,7 @@ def contract_errors(root: Path) -> list[str]:
             errors.append(
                 f"{label} must match the accepted machine-readable release contract"
             )
+    errors.extend(backend_policy_errors(text))
 
     for relative, anchor in ANCHORS.items():
         path = root / relative
@@ -885,6 +1346,17 @@ def contract_errors(root: Path) -> list[str]:
         errors.append(
             "docs/STATUS.md release row must stay SPIKED with no artifacts and no "
             "runtime claim"
+        )
+    preflight = root / PREFLIGHT_PATH
+    ci = root / CI_PATH
+    if not preflight.is_file() or not ci.is_file():
+        errors.append("release checker wiring inputs are missing")
+    else:
+        errors.extend(
+            wiring_errors(
+                preflight.read_text(encoding="utf-8"),
+                ci.read_text(encoding="utf-8"),
+            )
         )
     errors.extend(_test_inventory_errors(root))
     return errors

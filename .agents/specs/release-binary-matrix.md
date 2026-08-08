@@ -20,6 +20,13 @@ x86_64_baseline=portable-sse2-without-avx2
 work_W12_policy=optional-non-blocking
 archive_claims=pending
 runtime_claims=pending
+metal_channel=stable-after-runtime-gate
+mlx_channel=preview
+vulkan_channel=preview
+musl_channel=experimental-preview
+musl_scope=cpu-only-no-gpu
+rocm_channel=blocked
+gpu_driver_boundary=external-host-never-bundled
 required_anchor_paths=.agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,.agents/coordination.md,.agents/state.md,docs/STATUS.md,docs/BENCHMARKS.md
 work_W1=
 work_W2=W1
@@ -40,6 +47,13 @@ The block above is consumed by `scripts/check-release-binary-contract.py`; its
 values and the human-readable work table below must change together through a
 new reviewed design decision. In particular W12 is optional and is deliberately
 absent from W13's dependency set.
+
+The same checker owns its execution path: it requires itself and its 30-test
+mutation suite as direct commands in an unconditional CI step, and executes an
+instrumented copy of preflight to prove both named arrays reach their real
+loops. The suite independently mutates the Metal, MLX, Vulkan, musl, ROCm and
+external-driver policies above; quoted, conditional, inert or deleted wiring is
+not accepted as execution.
 
 ## Scope and product contract
 
