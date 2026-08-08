@@ -199,6 +199,35 @@ class ProbeFieldsComeFromResolve(unittest.TestCase):
         self.assertEqual(state["mode"], "interactive")
         self.assertEqual(state["reason"], "declared")
         self.assertIs(state["blocked_by_other_operator"], False)
+        self.assertEqual(state["branch"], "master")
+        self.assertEqual(
+            state["worktree"],
+            subprocess.check_output(
+                ["git", "rev-parse", "--absolute-git-dir"],
+                cwd=self.repo,
+                text=True,
+            ).strip(),
+        )
+
+    def test_probe_projects_real_helper_worktree_identity_and_branch(self) -> None:
+        helper = self.worktree("probe-helper")
+        claimed = self.claim(
+            helper, "a", "helper", "--row", "PROBE-REAL-WORKTREE"
+        )
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+
+        state = self.probe_in(helper)
+
+        self.assertEqual(state["branch"], "probe-helper")
+        self.assertEqual(
+            state["worktree"],
+            subprocess.check_output(
+                ["git", "rev-parse", "--absolute-git-dir"],
+                cwd=helper,
+                text=True,
+            ).strip(),
+        )
+        self.assertNotEqual(state["worktree"], str(helper))
 
     def test_probe_reports_a_mode_that_was_declared(self) -> None:
         # The other half of the mode pin: a hardcoded "interactive" survives the
@@ -306,10 +335,9 @@ class PreflightWiringTests(unittest.TestCase):
     def test_opt_out_flag_exists(self):
         self.assertIn("--no-require-role", self.TEXT)
 
-    def test_failure_text_carries_the_interview(self):
-        # An error code alone gets routed around. The gate must say what to ask.
-        self.assertIn("claim read-only", self.TEXT)
-        self.assertIn("claim helper --row", self.TEXT)
+    def test_failure_text_points_to_the_canonical_entrypoint(self):
+        # Preflight remains a backstop, but the role interview has one owner.
+        self.assertIn("scripts/agent-start.py", self.TEXT)
 
     def test_staged_refuses_read_only(self):
         self.assertIn("read-only", self.TEXT)
@@ -329,6 +357,9 @@ class PreflightWiringTests(unittest.TestCase):
 
     def test_onboard_suite_is_registered(self):
         self.assertIn("test_agent_onboard", self.TEXT)
+
+    def test_agent_start_suite_is_registered(self):
+        self.assertIn("test_agent_start", self.TEXT)
 
     def test_read_only_alone_does_not_satisfy_a_write_gate(self):
         # agent-role.py show exits 0 for read-only, so --require-role is

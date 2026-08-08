@@ -11,8 +11,12 @@ Each controlled paragraph names exactly the rule it implements.
 
 [POL-AUTH-PRECEDENCE] Resolve conflicts in this order: repository `AGENTS.md`, the applicable registry row, that row's procedure, then task evidence. Report an unresolved contradiction before changing state.
 
+<!-- session-entrypoint:begin -->
+[POL-BOOT-ENTRYPOINT] Start every session with `scripts/agent-start.py`. Supply `--intent operator|helper|read-only` and a known helper `--row` when the opening request is explicit; otherwise relay its source-owned welcome verbatim and ask what work the contributor intends. Follow its printed claim action, rerun it from materialized state, and only then run `scripts/agent-preflight.sh`. The command is non-interactive and never claims, locks, creates a worktree, or mutates a gate.
+<!-- session-entrypoint:end -->
+
 <!-- role-interview:begin -->
-[POL-BOOT-ROLE] Begin with `scripts/agent-role.py show`. If no valid role exists, ask what work the developer intends and run `scripts/agent-role.py claim operator` for a multi-step integration campaign, `scripts/agent-role.py claim helper --row <ID>` for one scoped task, or `scripts/agent-role.py claim read-only` for inspection. Add `--headless` only when the developer explicitly declares an unattended run; never infer it.
+[POL-BOOT-ROLE] Use the entrypoint's reported worktree role. If none exists, ask what work the developer intends and run `scripts/agent-role.py claim operator` for a multi-step integration campaign, `scripts/agent-role.py claim helper --row <ID>` for one scoped task, or `scripts/agent-role.py claim read-only` for inspection. Add `--headless` only when the developer explicitly declares an unattended run; never infer it.
 <!-- role-interview:end -->
 
 [POL-BOOT-NOW] After role resolution, read `.agents/NOW.md` as the one-read live snapshot; consult the append-only state tail only when the task needs deeper history.

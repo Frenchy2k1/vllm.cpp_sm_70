@@ -63,11 +63,11 @@ both gate models, reproduced 2–3x on an idle box. See the
    `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
 
 **Operator/helper protocol**
-([spec](workflow.md)): roles DECLARED then MATERIALIZED
-into a lock or worktree+PR; operator merges PRs first and does features only via
-sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
-START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` is the DEFAULT. Queue: 10 rows; backfill 79 rows, 30 anchored.
+([spec](workflow.md)): roles materialize as a lock or worktree+PR; operator
+integrates/delegates, helpers use `row/<ROW-ID>` worktrees and a start-time DRAFT
+PR as the claim. **W0-W5 LANDED**; role discipline ENFORCING,
+`--require-role` is the DEFAULT. `agent-start.py` is the universal first command
+and source-only welcome/router. Queue: 10 rows; backfill 79 rows, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs have

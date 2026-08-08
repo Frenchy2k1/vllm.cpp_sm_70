@@ -1,6 +1,7 @@
 rule_id,scope,trigger,requirement,enforcement,waiver_class,procedure
 POL-AUTH-REGISTRY,repository,any policy decision,Use policy.csv as the sole repository-policy authority.,scripts/check-policy.py,never,.agents/workflow.md
 POL-AUTH-PRECEDENCE,repository,repository instructions conflict,Apply AGENTS then the selected policy rule then its procedure then task evidence.,scripts/check-policy.py,never,.agents/workflow.md
+POL-BOOT-ENTRYPOINT,session,at session start,Run agent-start before role declaration preflight or task state.,scripts/check-protocol-consistency.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-BOOT-ROLE,session,before task work,Resolve or declare the worktree role before reading task state or editing.,scripts/check-role-discipline.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-BOOT-NOW,session,after role resolution,Read NOW.md before deeper task records.,scripts/check-now-current.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-BOOT-TASK,session,after NOW,Read only the claimed task and its linked procedures and evidence.,scripts/check-policy.py,expiring,.agents/workflow.md

@@ -42614,6 +42614,25 @@ tier manifests, forced-tier mutation tests, and execution on feature-poor and
 feature-rich hosts/emulation are release gates. W1 is now the CUDA per-source
 gencode prerequisite; multi-SM AOT and CPU ISA audits precede bundle work.
 
+## 2026-08-08 — Universal, source-owned agent session entrypoint (`SESSION-ONBOARDING-UX`)
+<!-- state: 2026-08-08T00:00 -->
+
+`scripts/agent-start.py` is now the mandatory, non-interactive first command for
+every session. It consumes `agent-onboard.py`'s real probe and renders stable
+welcome/action blocks; only an undeclared session without explicit intent gets
+the compact ASCII welcome. Declared and explicit-intent routes suppress it,
+print exact non-mutating next actions, respect operator lock conflicts, helper
+row/queue state, declared mode, and environment status without values.
+
+The onboarding probe now projects `branch` and the real per-worktree git-dir
+identity from `agent-role.py`; real CLI/worktree tests prevent renderer fixtures
+from masking a missing projection. Preflight keeps all flags and role gates but
+points undeclared sessions to the canonical entrypoint. The post-cutover policy
+registry, generated bootstrap, procedure, and protocol-consistency mutations
+bind start-before-preflight without copying banner text into Markdown. This
+governance checkpoint changes no engine, kernel, model, correctness, or
+performance path; the benchmark disposition is NOT APPLICABLE.
+
 ## 2026-08-08 — ARCH-ONE-SURFACE ROW 2: MiniMax-H3 video+audio generation folded onto the ONE surface (PR #123)
 <!-- state: 2026-08-08T04:30 -->
 
@@ -42982,8 +43001,6 @@ removing only `; #129: SPIKE∅`; the compact clause consumes the existing
 279150-character ratchet exactly. `ENG-RELEASE-BINARIES` remains `SPIKE`: there
 is no archive, runtime, correctness or performance evidence.
 
-
-
 ## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
 <!-- state: 2026-08-08T21:00 -->
 
@@ -43052,7 +43069,6 @@ RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
 F79-4 remain open on the landed tree; the review's merge-and-fix map is the
 binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
 as the lane's own next steps.
-
 
 ## 2026-08-08 — ROCm approach-(b): unified memory true by construction on integrated APUs
 <!-- state: 2026-08-08T21:30 -->
@@ -43246,7 +43262,6 @@ the unified free-memory and the default 0.92 is not unconditionally safe there.
 Row moved INVENTORIED→READY (roadmap_v1 + feature-matrix §2). M1-M4 are the impl
 rows this unblocks; M1/M2/M4-CPU are CPU-completable, M3 (profile run) is
 dgx-gated. Records-only spike (no code).
-
 
 ## 2026-08-08 — ROAD-V1-MEM M1+M2 LANDED: absolute --kv-cache-memory knob + group-aware bytes-per-block (CPU brick)
 <!-- state: 2026-08-08T23:30 -->

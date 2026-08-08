@@ -375,7 +375,7 @@ class ConsolidationMutations(unittest.TestCase):
         self.assertTrue(any("12 KiB" in error for error in self.errors()))
 
         shutil.copy2(ROOT / "AGENTS.md", path)
-        self.mutate("AGENTS.md", "1. Resolve the worktree role", "1. Read task state before role; then resolve the worktree role")
+        self.mutate("AGENTS.md", "1. Run `scripts/agent-start.py`", "1. Read task state before running `scripts/agent-start.py`")
         self.assertTrue(any("boot block" in error for error in self.errors()))
 
         shutil.copy2(ROOT / "AGENTS.md", path)

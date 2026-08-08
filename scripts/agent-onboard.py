@@ -132,6 +132,12 @@ def probe() -> dict:
         # operator` when that will fail.
         "blocked_by_other_operator": bool(state.get("operator_held_by_other")),
         "reason": state.get("reason"),
+        # The role tool owns both facts. Keep the branch from resolve() and
+        # expose the same per-worktree identity used by role markers/locks so
+        # downstream routers report real materialized state rather than a
+        # renderer fixture's invented fields.
+        "branch": state.get("branch"),
+        "worktree": role_mod.worktree_id(),
         # resolve() now carries this (step 2). Still read with .get and still
         # rendered as a DEFAULT when absent: headless is never inferred, so a
         # state that carries no mode must not read as a declaration either.
@@ -155,6 +161,8 @@ def render_probe(state: dict) -> str:
         )
     lines = [
         f"role: {role}{row}   mode: {mode}",
+        f"branch: {state.get('branch') or 'unavailable'}   "
+        f"worktree: {state.get('worktree') or 'unavailable'}",
         f".env: {state['env']}"
         + (f" (unset: {', '.join(state['env_missing'])})" if state["env_missing"] else ""),
         queue_line,
