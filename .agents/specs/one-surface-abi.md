@@ -213,13 +213,18 @@ Shared loading now passes that canonical name to `FindPlatformByName`, then
 propagates the registered platform's `DeviceType`; no CUDA `DeviceType` literal
 remains in the shared selector. This is a real abstraction rather than textual
 evasion: the pure resolver test supplies `kXPU` and requires `kXPU` back, while
-the registry test walks every registered canonical device name. Explicit CPU
-still ignores the accelerator lookup, absent CUDA still throws before model
-path I/O, the C ABI still maps slot 2, and H3 dispatch is untouched.
+an isolated integration target registers a distinctive XPU-shaped platform and
+backend, requires exact canonical-name lookup (rejecting prefix and malformed
+near-matches), and proves the production selector propagates that platform type
+into the created queue. Explicit CPU still ignores the accelerator lookup,
+absent CUDA still throws before model path I/O, the C ABI still maps slot 2,
+and H3 dispatch is untouched.
 
 RED was the focused compiler failure for the missing enum/API/signature plus
 the inherited checker result (`kcuda=7`, DSR 39). GREEN is DSR 32 with
 `kcuda=0`, unchanged baseline/allowlist, all 25 checker mutations, and a CPU
 Release `-Werror` build: `test_platform` 11/11·85,
-`test_loaded_engine_dense` 9/9·65 and `test_capi` 45/45·428. No CUDA runtime was
-used; the existing GPU A/B residual remains.
+`test_device_selection` 2/2·11, `test_loaded_engine_dense` 9/9·65 and
+`test_capi` 45/45·428. Each of the three review mutations (wrong returned
+platform identity, forced-CPU selector input and prefix name matching) is RED.
+No CUDA runtime was used; the existing GPU A/B residual remains.

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
@@ -127,6 +128,13 @@ struct EngineParams {
   // server as --device.
   vllm::Device device = vllm::Device::kAuto;
 };
+
+// The shared queue-selection seam used by every LoadedEngine construction
+// path. Exposed from this internal header so the explicit named-platform path
+// can be gated with a distinctive registered platform/backend rather than a
+// parallel pure-policy copy.
+vt::Queue SelectQueueForModel(std::string_view architecture,
+                              vllm::Device device);
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
 // runner -> Executor -> EngineCore; Input/OutputProcessor -> LLMEngine) for a
