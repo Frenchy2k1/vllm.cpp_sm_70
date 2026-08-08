@@ -320,6 +320,13 @@ GPUModelRunner::GPUModelRunner(
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
+  // model's runner pools instead of sampling — build the PoolingRunner over
+  // the model-owned Pooler. Null for every text arch (byte-identical).
+  if (model_->registration().info.is_pooling_model &&
+      model_->pooler() != nullptr) {
+    pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
+  }
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -353,6 +360,13 @@ GPUModelRunner::GPUModelRunner(
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
+  // model's runner pools instead of sampling — build the PoolingRunner over
+  // the model-owned Pooler. Null for every text arch (byte-identical).
+  if (model_->registration().info.is_pooling_model &&
+      model_->pooler() != nullptr) {
+    pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
+  }
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -1470,12 +1484,102 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
   return out;
 }
 
+// ARCH-ONE-SURFACE ROW 6: the pooling counterpart of sample_tokens. Mirror of
+// gpu/model_runner.py:1586-1607 (pool instead of sample) over the landed
+// PoolingRunner (pool/pooling_runner.py:29-42). The stashed forward result of
+// the pooling arch is the [rows, hidden] POST-FINAL-NORM HIDDEN (the model has
+// no lm_head — adapters.py:135-151), already gathered at logits_indices on the
+// default path, which for LAST pooling IS upstream's
+// `hidden_states[input_batch.logits_indices]` (pooling_runner.py:36).
+ModelRunnerOutput GPUModelRunner::pool_tokens() {
+  const int num_reqs = exec_state_.num_reqs;
+  const int64_t hidden = exec_state_.logits.vocab;  // == hidden_size here
+  ForwardLogits& fl = exec_state_.logits;
+  VT_CHECK(!fl.on_device(),
+           "pool_tokens: the pooling forward returns a HOST hidden carrier");
+
+  // One hidden row per request. Default (gather ON): the forward already
+  // gathered the per-request last-token rows. VT_LOGITS_GATHER=0: re-gather on
+  // host from the full [num_actual_tokens, hidden] rows, exactly as the text
+  // host path re-gathers logits.
+  std::vector<float> gathered;
+  const float* rows = nullptr;
+  if (fl.rows == num_reqs) {
+    rows = fl.host.data();
+  } else {
+    gathered.resize(static_cast<size_t>(num_reqs) * static_cast<size_t>(hidden));
+    for (int i = 0; i < num_reqs; ++i) {
+      const int row = exec_state_.step.logits_indices[static_cast<size_t>(i)];
+      std::memcpy(gathered.data() + static_cast<size_t>(i) *
+                                        static_cast<size_t>(hidden),
+                  fl.host.data() + static_cast<size_t>(row) *
+                                       static_cast<size_t>(hidden),
+                  static_cast<size_t>(hidden) * sizeof(float));
+    }
+    rows = gathered.data();
+  }
+  vt::Tensor hidden_rows = vt::Tensor::Contiguous(
+      const_cast<float*>(rows), vt::DType::kF32, vt::Device{vt::DeviceType::kCPU, 0},
+      {static_cast<int64_t>(num_reqs), hidden});
+
+  // PoolingMetadata over the GATHERED buffer: one row per sequence (first ==
+  // last == i), task embed, activation ON — the unconditional L2 normalize of
+  // pooling_runner.py:38 (a per-request use_activation knob is the matryoshka/
+  // dimensions residual, named in the row spec).
+  vllm::PoolingMetadata md;
+  for (int i = 0; i < num_reqs; ++i) {
+    md.pooling_cursor.first_token_indices.push_back(i);
+    md.pooling_cursor.last_token_indices.push_back(i);
+    md.pooling_cursor.prompt_lens.push_back(1);
+    md.pooling_cursor.seq_lens.push_back(1);
+    md.pooling_cursor.num_scheduled_tokens.push_back(1);
+    vllm::PoolingParams pp;
+    pp.task = vllm::PoolingTask::kEmbed;
+    pp.use_activation = true;
+    md.pooling_params.push_back(pp);
+    md.tasks.push_back(vllm::PoolingTask::kEmbed);
+  }
+  vllm::PoolerOutput pooled = pooling_runner_->Pool(hidden_rows, md);
+  VT_CHECK(static_cast<int>(pooled.size()) == num_reqs,
+           "pool_tokens: pooler must return one vector per request");
+
+  // Validity = the request's whole prompt has been seen (seq_lens == prompt_len,
+  // pooling_runner.py:40-41). Our discard mask is the SAME predicate
+  // (step.seq_lens[i] < num_tokens_no_spec[i] == still consuming prefill), so a
+  // chunked-prefill row reports nullopt and the request keeps running.
+  ModelRunnerOutput out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.sampled_token_ids.reserve(static_cast<size_t>(num_reqs));
+  out.pooler_output.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+    out.req_ids.push_back(req_id);
+    out.req_id_to_index[req_id] = i;
+    out.sampled_token_ids.push_back({});  // a pooling step samples NOTHING
+    if (exec_state_.discard[static_cast<size_t>(i)] != 0) {
+      out.pooler_output.push_back(std::nullopt);
+    } else {
+      out.pooler_output.push_back(std::move(pooled[static_cast<size_t>(i)]));
+    }
+  }
+  return out;
+}
+
 ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::optional<GrammarOutput>& grammar_output) {
   ModelRunnerOutput out;
   const int num_reqs = exec_state_.num_reqs;
   if (num_reqs == 0) {
     return out;  // 0-token flush step (nothing sampled).
+  }
+
+  // POOLING ROUTING (ARCH-ONE-SURFACE ROW 6), mirroring the model-level task
+  // split of gpu/model_runner.py:1586-1607: on a POOLING model the step's
+  // output is the POOLED DATA, never a sampled token. pooling_runner_ is set
+  // iff the registration declares is_pooling_model (ctor), so every text arch
+  // takes the sampler path below byte-identically.
+  if (pooling_runner_ != nullptr) {
+    return pool_tokens();
   }
 
   std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
@@ -2165,6 +2269,13 @@ void GPUModelRunner::replay_last_sampled_ops(AsyncDeviceInputs& dev) {
 
 std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
     const std::optional<GrammarOutput>& grammar_output) {
+  // ARCH-ONE-SURFACE ROW 6: pooling models resolve async scheduling OFF
+  // (config/vllm.py:1068-1073 mirror in LoadedEngine::ResolveAsyncEnabled), so
+  // the depth-2 async sampler must never see one — refuse loudly rather than
+  // run the device sampler over hidden states.
+  VT_CHECK(pooling_runner_ == nullptr,
+           "sample_tokens_async: pooling models use the synchronous scheduler "
+           "(async scheduling is disabled for pooling, config/vllm.py:1068)");
   // When async is NOT engaged (production default), degenerate to the byte-
   // identical synchronous path wrapped as a ready output — so a caller in the
   // depth-2 loop can always call sample_tokens_async without branching, yet the

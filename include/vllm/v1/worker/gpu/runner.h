@@ -79,6 +79,7 @@
 #include "vllm/v1/worker/gpu/input_batch.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
+#include "vllm/v1/worker/gpu/pool/pooling_runner.h"  // PoolingRunner (pooling arch)
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -333,6 +334,18 @@ class GPUModelRunner final : public ModelRunnerBase {
                  std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
                  std::vector<PagedKvCache> draft_kv = {});
 
+  // ARCH-ONE-SURFACE ROW 6: the pooling counterpart of sample_tokens (mirror
+  // of gpu/model_runner.py:1586-1607 + pool/pooling_runner.py:29-42). Consumes
+  // the stashed forward result — for the pooling arch those are the
+  // [rows, hidden] post-final-norm hidden states, NOT vocab logits — applies
+  // the model's Pooler via pooling_runner_, and returns a ModelRunnerOutput
+  // whose pooler_output carries one pooled vector per fully-prefilled request
+  // (nullopt for rows still consuming prefill chunks — the same
+  // seq_len == prompt_len validity predicate as is_valid, pooling_runner.py:
+  // 40-41, which our discard mask already computes). sampled_token_ids rows
+  // stay EMPTY: a pooling step samples nothing.
+  ModelRunnerOutput pool_tokens();
+
   // Allocate the per-full-attn-layer paged KV buffers + the per-GDN-layer
   // persistent mamba ssm/conv buffers from the KVCacheConfig groups.
   void initialize_kv_cache(const KVCacheConfig& kv_cache_config);
@@ -378,6 +391,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Queue queue_;
   InputBatch input_batch_;
   Sampler sampler_;
+  // ARCH-ONE-SURFACE ROW 6 (mirror of gpu/model_runner.py:368-369
+  // `if self.is_pooling_model ...: self.pooling_runner = PoolingRunner(model)`):
+  // non-null iff the loaded model's registration declares is_pooling_model and
+  // the model owns a Pooler. sample_tokens then routes to pool_tokens() — the
+  // POOLED DATA takes the place of sampled tokens (model_runner.py:1586-1607).
+  // Null for every text arch: the sampler path below is byte-identical.
+  std::unique_ptr<vllm::PoolingRunner> pooling_runner_;
 
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;

@@ -43,9 +43,9 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 
 | State | Rows |
 |---|---|
-| INVENTORIED | 315 |
+| INVENTORIED | 314 |
 | PARTIAL | 19 |
-| ACTIVE | 9 |
+| ACTIVE | 10 |
 | SPIKE | 6 |
 | BLOCKED | 5 |
 | DONE | 3 |
@@ -53,7 +53,7 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 | GATING | 1 |
 | **Total** | **361** |
 
-Engaged architectures (the 47 non-`INVENTORIED` rows):
+Engaged architectures (the 48 non-`INVENTORIED` rows):
 
 | Support | Architecture | Family / example | Status | Row |
 |---|---|---|---|---|
@@ -67,6 +67,7 @@ Engaged architectures (the 47 non-`INVENTORIED` rows):
 | 🚧 | `ParakeetForRNNT` / `ParakeetForTDT` (transducer heads) | Parakeet RNN-T and TDT ASR: the decode half of the same family, likewise an audio COMPONENT and not a registry arch (vLLM has no transducer call site at all) | P6 LANDED 2026-08-07 on CPU: LSTM prediction network, joint network, TDT duration head and the greedy transducer loop, gated against dumped HuggingFace `ParakeetForRNNT` / `ParakeetForTDT` oracles from transformers `main` with the emitted sequence and per-step durations EXACT, plus an independent in-test LSTM reference. Real transcripts verified on `nvidia/parakeet-rnnt-0.6b` and `-tdt-0.6b-v3`, token ids EXACT vs HF `generate()` end to end. **Corrects the P4 record**, which called the transducer unmirrored off the locally installed transformers 5.3.0. No CUDA, no GPU suite, no aarch64, no speed number; `.nemo`-only checkpoints out of reach. **ONE-SURFACE ROW 1 (2026-08-07): `ParakeetForRNNT`/`ParakeetForTDT` registered** (BEYOND-PIN, transcription-only refuse-by-task) and served through the same `vllm_transcribe` / `/v1/audio/transcriptions` / thin-client surface as the CTC head | `MODEL-AUDIO-PARAKEET-TRANSDUCER` |
 | ✅ | `OPTForCausalLM` | OPT-125m | STRICT token-exact 6/6 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-opt-optfor-causal-lm` |
 | ✅ | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | SACRED gate 8/8 token-exact vs vLLM 0.25.0; speed short (attributed, W9) | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` |
+| 🚧 | `LlamaModel` (embedding conversion) | The first POOLING arch (ARCH-ONE-SURFACE ROW 6): upstream `_EMBEDDING_MODELS` maps `LlamaModel` onto the Llama backbone via `as_embedding_model` (registry.py:230 + adapters.py:230) | LIVE 2026-08-08 on `row/EMBEDDINGS-ONE-SURFACE` (PR #137): `is_pooling_model=true`, text paths refuse by task; `vllm_embed` (ABI v15) + task-conditional `/v1/embeddings`; fold gate 4/4-231 on the committed synthetic fixture (engine path == direct registry path + f64 LAST+normalize ref). Residual: real embedding checkpoint + `LLM(task="embed")` oracle cosine; the other 7 memberships unregistered | `MODEL-EMBED-llama-llama-for-causal-lm` |
 | ✅ | `LlamaForCausalLM` | Llama-3.2-1B dense (+ Yi + `InternLM3ForCausalLM` aliases) | STRICT token-exact 16/16 vs vLLM 0.25.0; speed pending. Llama-alias checkpoints gated 2026-07-26: Yi (`01-ai/Yi-Coder-1.5B-Chat`, arch=LlamaForCausalLM, zero delta) 16/16; InternLM3 (`internlm3-8b-instruct`, one alias line, plain-Llama+dynamic rope) 16/16 — CLOSES the recent-dense TEXT tier | `MODEL-TEXT-llama-llama-for-causal-lm` |
 | ✅ | `MistralForCausalLM` | Mistral-7B-v0.3 dense | full paged-engine SACRED gate 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-mistral-mistral-for-causal-lm` |
 | ✅ | `Qwen3_5MTP` | Qwen3.5 MTP draft (spec-decode) | `DONE` 2026-07-26: k=1 MTP spec-decode e2e on the 27B GDN hybrid — three-way token-exact at c1 (our-ON == vLLM `--speculative-config mtp` == our-OFF, acceptance 16/16), c1 above vLLM every-axis + c2-c8 on-par-or-above, mixed-batch concurrency bit-exact, server/CLI/C-ABI `--speculative-config`; spec-OFF byte-identical | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` |
@@ -292,7 +293,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-EMBED-bert-with-rope-gte-new-model` | `GteNewModel` | `registry.py:221`; `vllm/model_executor/models/bert_with_rope.py::GteNewModel` | embedding / text | encoder attention; pooler; FusedMoE/grouped GEMM | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-EMBED-jina-jina-embeddings-v5-model` | `JinaEmbeddingsV5Model` | `registry.py:222`; `vllm/model_executor/models/jina.py::JinaEmbeddingsV5Model` | embedding / text | encoder attention; pooler | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-EMBED-llama-llama-bidirectional-model` | `LlamaBidirectionalModel` | `registry.py:223`; `vllm/model_executor/models/llama.py::LlamaBidirectionalModel` | embedding / text | encoder attention; pooler; sliding-window attention | ☐ required | `INVENTORIED` | none | unassigned |
-| `MODEL-EMBED-llama-llama-for-causal-lm` | `LlamaModel`, `CwmForCausalLM`, `InternLM3ForCausalLM`, `IQuestCoderForCausalLM`, `LlamaForCausalLM`, `LLaMAForCausalLM`, `TeleChat3ForCausalLM`, `MistralModel` | `registry.py:224-231`; `vllm/model_executor/models/llama.py::LlamaForCausalLM` | embedding / text | encoder attention; pooler; sliding-window attention | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-llama-llama-for-causal-lm` | `LlamaModel`, `CwmForCausalLM`, `InternLM3ForCausalLM`, `IQuestCoderForCausalLM`, `LlamaForCausalLM`, `LLaMAForCausalLM`, `TeleChat3ForCausalLM`, `MistralModel` | `registry.py:224-231`; `vllm/model_executor/models/llama.py::LlamaForCausalLM` | embedding / text | encoder attention; pooler; sliding-window attention | [embeddings-one-surface](specs/embeddings-one-surface.md) | `ACTIVE` | ARCH-ONE-SURFACE ROW 6 (2026-08-08, in flight on `row/EMBEDDINGS-ONE-SURFACE` PR #137): the `LlamaModel` membership is REGISTERED + LIVE (`as_embedding_model` mirror, adapters.py:230 — `is_pooling_model=true`, bare-prefix loader, pooling forward `Qwen3DenseModel::ForwardHidden`, engine-step `pool_tokens`, `vllm_embed` ABI v15 + `/v1/embeddings`); registration `src/vllm/model_executor/models/llama_embedding_registry.cpp:132`; fold gate `tests/vllm/models/test_llama_embedding_fold.cpp:206` 4/4-231 on the committed synthetic fixture. RESIDUALS: the other 7 memberships (incl. `MistralModel`) unregistered; REAL-checkpoint (e5-mistral class) + `LLM(task="embed")` oracle cosine gate not run (synthetic-fixture arm only; no cosine-vs-oracle number fabricated) | `CLAIM-EMBEDDINGS-ONE-SURFACE` |
 | `MODEL-EMBED-modernbert-modern-bert-model` | `ModernBertModel` | `registry.py:232`; `vllm/model_executor/models/modernbert.py::ModernBertModel` | embedding / text | encoder attention; pooler; sliding-window attention | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-EMBED-bert-with-rope-nomic-bert-model` | `NomicBertModel` | `registry.py:233`; `vllm/model_executor/models/bert_with_rope.py::NomicBertModel` | embedding / text | encoder attention; pooler; FusedMoE/grouped GEMM | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-EMBED-phi3-phi3-for-causal-lm` | `Phi3ForCausalLM` | `registry.py:234`; `vllm/model_executor/models/phi3.py::Phi3ForCausalLM` | embedding / text | encoder attention; pooler | ☐ required | `INVENTORIED` | none | unassigned |

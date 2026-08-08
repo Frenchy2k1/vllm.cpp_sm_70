@@ -118,4 +118,50 @@ LlamaWeights LoadLlamaForCausalLMWeights(
   return w;
 }
 
+LlamaWeights LoadLlamaModelEmbeddingWeights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
+  // ARCH-ONE-SURFACE ROW 6: the `LlamaModel` EMBEDDING checkpoint loader —
+  // the SAME name map as LoadLlamaForCausalLMWeights (LoadLlamaLayer above is
+  // the single source of it), with the two as_embedding_model deltas:
+  //   1. BOTH name layouts load (adapters.py:178-181 candidate_prefixes
+  //      ["", "model."]): a bare `LlamaModel` checkpoint names its tensors
+  //      `embed_tokens.weight` / `layers.N...` / `norm.weight` (no "model."
+  //      prefix); a `*ForCausalLM`-layout export keeps the prefix. The
+  //      resolver maps the canonical "model."-prefixed ask onto whichever
+  //      layout the shards actually carry.
+  //   2. NO lm_head, ever (adapters.py:135-151 replaces the output layer with
+  //      a missing-layer stage): tie_word_embeddings is forced true so the
+  //      pooling forward — which never multiplies by an output layer — has a
+  //      well-formed container, and a checkpoint lm_head.weight is ignored.
+  std::unordered_map<std::string, const SafetensorsFile*> where;
+  for (const SafetensorsFile& shard : shards)
+    for (const std::string& name : shard.Names()) where[name] = &shard;
+  const TensorResolver get =
+      [&where](const std::string& name) -> const StTensor& {
+    std::string key = name;
+    auto it = where.find(key);
+    if (it == where.end() && key.rfind("model.", 0) == 0) {
+      key = key.substr(6);  // the bare `*Model` layout
+      it = where.find(key);
+    }
+    VT_CHECK(it != where.end(), "llama embedding: tensor not found: " + name);
+    return it->second->Get(key);
+  };
+
+  VT_CHECK(config.num_hidden_layers > 0,
+           "llama embedding: num_hidden_layers must be positive");
+
+  LlamaWeights w;
+  w.tie_word_embeddings = true;  // no output layer on the pooling forward
+  w.attention_bias = RawBool(config.raw, "attention_bias", false);
+
+  w.embed_tokens = LoadBf16Direct(get, "model.embed_tokens.weight");
+  w.final_norm = LoadBf16Direct(get, "model.norm.weight");
+
+  w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+    w.layers.push_back(LoadLlamaLayer(get, l, w.attention_bias));
+  return w;
+}
+
 }  // namespace vllm

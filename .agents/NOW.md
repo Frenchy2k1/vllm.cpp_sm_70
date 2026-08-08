@@ -30,7 +30,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | `BACKEND-ROCM` | **(b) fix in, unverified; W0 green 4 archs** | compile + 2 new ctests + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **LANDED** ([spec](specs/tensor-parallelism-spike.md)); DSpark rider grounded | dispatch TP-W1 (CPU-able) |
 | Release | SPIKE; 30/30 | #129 |
-| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 LANDED; #139 repair CPU-GREEN**: ABI v14 stable; registry-resolved named platform; DSR 39→32; execution guard 52/52 | Fresh re-review #139; CUDA A/B residual |
+| Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139 IN; **ROW 6 IN REVIEW (#137): embeddings LIVE — `LlamaModel` arch, PoolingRunner in the step, `vllm_embed` v15, `/v1/embeddings`, fold gate 4/4-231, 9 kills** | Merge #137; real-ckpt oracle cosine residual |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -46,10 +46,8 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 
 ## Next actions
 
-1. **Spike the Parakeet encoder row.** Upstream vLLM has `parakeet.py` +
-   `conformer_encoder.py` as the audio encoder of `nano_nemotron_vl.py`, which we
-   already carry `MODEL-MM-nano-nemotron-vl-*` rows for, so it is owed mirror work.
-   The transducer decode half (RNN-T/TDT/CTC) is NOT in vLLM: separate scope call.
+1. **Spike the Parakeet encoder row** (vLLM carries it inside
+   `nano_nemotron_vl.py`; the transducer half is NOT in vLLM: separate call).
 2. **Qwen3.5-4B serving follow-up:** bind the default-ON async-serving path
    against the same oracle before attributing the remaining TPOT gap.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);

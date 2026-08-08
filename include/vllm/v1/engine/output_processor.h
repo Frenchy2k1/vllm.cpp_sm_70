@@ -129,10 +129,15 @@ class RequestState {
   // CompletionOutput/RequestOutput honoring output_kind. Returns nullopt when
   // FINAL_ONLY-and-not-finished or a stream_interval hold-back suppresses this
   // step's output. kv_transfer_params deferred (see header).
+  // `pooling_output` (ARCH-ONE-SURFACE ROW 6; upstream make_request_output's
+  // pooling_output parameter, output_processor.py:272): the finished POOLING
+  // request's pooled vector, attached to RequestOutput::pooling_output.
+  // nullopt on every generation output -> byte-identical text path.
   std::optional<RequestOutput> make_request_output(
       const std::vector<int32_t>& new_token_ids,
       std::optional<FinishReason> finish_reason,
-      std::optional<std::string> stop_reason);
+      std::optional<std::string> stop_reason,
+      std::optional<std::vector<float>> pooling_output = std::nullopt);
 
   std::string request_id;
   std::string external_req_id;  // == request_id at T0 (see header).

@@ -95,6 +95,9 @@ struct vllm_engine {
   // the HTTP server's worker pool). Guarded by chat_mutex for the lazy build.
   std::mutex chat_mutex;
   std::unique_ptr<vllm::entrypoints::openai::OpenAIServingChat> chat_serving;
+  // ABI v15: serialize vllm_embed batches per handle (the pooling path drives
+  // the SYNCHRONOUS LLMEngine, not the AsyncLLM the text entry points share).
+  std::mutex embed_mutex;
 };
 
 // One non-blocking callback-delivery request. The AsyncLLM output handler owns
@@ -146,9 +149,22 @@ void ClearError() { g_last_error.clear(); }
 // A transcription-only handle (Parakeet) reports an actionable error instead
 // of dereferencing the null LoadedEngine — the SupportsTranscription-only
 // mirror of vLLM excluding "generate" from supported_tasks
-// (vllm/model_executor/models/interfaces.py:1118).
+// (vllm/model_executor/models/interfaces.py:1118). Since ABI v15 the SAME
+// guard also refuses a POOLING (embedding) engine: its model has no
+// text-generation path either (is_pooling_model && !is_text_generation_model,
+// the mirror of vLLM's runner_type validation, config/model.py:607-613) —
+// running generate on it would sample over hidden states.
 bool RequireTextEngine(const vllm_engine* engine, const char* fn) {
-  if (engine->loaded != nullptr) return true;
+  if (engine->loaded != nullptr) {
+    if (engine->loaded->is_pooling_model()) {
+      SetError(std::string(fn) +
+               ": this engine was loaded from a pooling (embedding) "
+               "checkpoint; it has no text-generation path — use vllm_embed "
+               "or the server's /v1/embeddings");
+      return false;
+    }
+    return true;
+  }
   SetError(std::string(fn) +
            ": this engine was loaded from a transcription-only checkpoint "
            "(Parakeet); it has no text-generation path — use vllm_transcribe");
@@ -784,6 +800,11 @@ VLLM_API vllm_status vllm_complete_tokens(
     SetError("vllm_complete_tokens: out_tokens is null with max_out_tokens > 0");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  // Refuse-by-task (ABI v15 tightening): v13 shipped this entry point without
+  // the v11 guard, so a transcription-only handle would deref the null
+  // LoadedEngine here; the same guard now also refuses pooling engines.
+  if (!RequireTextEngine(engine, "vllm_complete_tokens"))
+    return VLLM_ERR_INVALID_ARGUMENT;
   try {
     const vllm::SamplingParams sp =
         ToSamplingParams(*params, vllm::RequestOutputKind::kCumulative);
@@ -1225,6 +1246,127 @@ VLLM_API void vllm_transcription_free(vllm_transcription* out) {
   out->token_ids = nullptr;
   out->n_token_ids = 0;
   out->has_text = 0;
+}
+
+// ── Embeddings (ABI v15, ARCH-ONE-SURFACE ROW 6) ────────────────────────────
+// The pooling slice of the ONE surface: the SAME registry forward +
+// PoolingRunner engine step the server's /v1/embeddings drives
+// (LLMEngine::embed -> pool_tokens, the mirror of LLM.embed /
+// entrypoints/pooling/offline.py:65-119 with pooling_task="embed").
+
+VLLM_API vllm_status vllm_embed(vllm_engine* engine, const char* const* texts,
+                                int32_t n_texts, vllm_embedding_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_embed: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->values = nullptr;
+  out->n_embeddings = 0;
+  out->dim = 0;
+  out->prompt_tokens = 0;
+  if (engine == nullptr || texts == nullptr) {
+    SetError("vllm_embed: engine or texts is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (n_texts <= 0) {
+    SetError("vllm_embed: n_texts must be > 0");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  for (int32_t i = 0; i < n_texts; ++i) {
+    if (texts[i] == nullptr) {
+      SetError("vllm_embed: texts[" + std::to_string(i) + "] is null");
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+  }
+  // Refuse-by-task, the other direction of RequireTextEngine: only a POOLING
+  // (embedding) engine serves this entry point — the mirror of vLLM refusing
+  // `--runner pooling` on a non-pooling model (config/model.py:612-617).
+  if (engine->loaded == nullptr) {
+    SetError(
+        "vllm_embed: this engine was loaded from a transcription-only "
+        "checkpoint (Parakeet); use vllm_transcribe");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (!engine->loaded->is_pooling_model()) {
+    SetError(
+        "vllm_embed: this engine was loaded from a text-generation "
+        "checkpoint; it has no pooling path — use vllm_complete / vllm_chat "
+        "(embedding checkpoints resolve to a pooling architecture, e.g. "
+        "LlamaModel)");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    // Serialize embed batches per handle: the pooling path drives the
+    // SYNCHRONOUS LLMEngine step loop (async scheduling resolves OFF for
+    // pooling models, config/vllm.py:1068-1073 mirror).
+    std::lock_guard<std::mutex> lock(engine->embed_mutex);
+    const vllm::tok::Tokenizer& tokenizer = engine->loaded->tokenizer();
+    vllm::v1::LLMEngine& e = engine->loaded->engine();
+
+    std::vector<std::vector<float>> vectors;
+    vectors.reserve(static_cast<size_t>(n_texts));
+    int64_t total_prompt_tokens = 0;
+    for (int32_t i = 0; i < n_texts; ++i) {
+      // The serving tokenization applies the template's special tokens
+      // (add_special_tokens=True on the OpenAI embedding path).
+      std::vector<int32_t> ids = tokenizer.EncodeWithSpecialTokens(texts[i]);
+      if (ids.empty()) {
+        SetError("vllm_embed: texts[" + std::to_string(i) +
+                 "] tokenized to an empty prompt");
+        return VLLM_ERR_INVALID_ARGUMENT;
+      }
+      total_prompt_tokens += static_cast<int64_t>(ids.size());
+      const std::string request_id =
+          "embed-" + std::to_string(engine->next_request_id.fetch_add(1));
+      vllm::RequestOutput ro =
+          e.embed(std::move(ids), vllm::PoolingParams{}, request_id);
+      if (!ro.finished || !ro.pooling_output.has_value()) {
+        SetError("vllm_embed: engine produced no pooled output");
+        return VLLM_ERR_RUNTIME;
+      }
+      vectors.push_back(std::move(*ro.pooling_output));
+    }
+
+    const size_t dim = vectors.empty() ? 0 : vectors[0].size();
+    for (const std::vector<float>& v : vectors) {
+      if (v.size() != dim || dim == 0) {
+        SetError("vllm_embed: inconsistent embedding dimensions");
+        return VLLM_ERR_RUNTIME;
+      }
+    }
+    float* values = static_cast<float*>(
+        std::malloc(static_cast<size_t>(n_texts) * dim * sizeof(float)));
+    if (values == nullptr) {
+      SetError("vllm_embed: out-of-memory copying embeddings");
+      return VLLM_ERR_RUNTIME;
+    }
+    for (int32_t i = 0; i < n_texts; ++i) {
+      std::memcpy(values + static_cast<size_t>(i) * dim,
+                  vectors[static_cast<size_t>(i)].data(),
+                  dim * sizeof(float));
+    }
+    out->values = values;
+    out->n_embeddings = n_texts;
+    out->dim = static_cast<int32_t>(dim);
+    out->prompt_tokens = static_cast<int32_t>(total_prompt_tokens);
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_embed: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_embed: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out) {
+  if (out == nullptr) return;
+  std::free(out->values);
+  out->values = nullptr;
+  out->n_embeddings = 0;
+  out->dim = 0;
+  out->prompt_tokens = 0;
 }
 
 // ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────

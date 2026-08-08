@@ -58,6 +58,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/layers/pooler/pooling_params.h"  // PoolingParams
 #include "vllm/multimodal/inputs.h"            // multimodal::MultiModalFeatureSpec
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"       // BlockHash, BlockHasher
@@ -173,6 +174,14 @@ struct Request {
   // model's EOS token id (for the stop check) rides on sampling_params, as
   // sampling_params.eos_token_id — read it there, matching upstream check_stop.
   SamplingParams sampling_params;
+  // pooling_params (upstream Request.pooling_params, vllm/v1/request.py;
+  // ARCH-ONE-SURFACE ROW 6): set iff this is a POOLING-task request. The
+  // scheduler finishes such a request as soon as the runner produced its
+  // pooled output (scheduler.py:1718-1721 mirror); nullopt on every generation
+  // request keeps the text path byte-identical. sampling_params above stays a
+  // benign greedy default for the pooling case (the InputBatch admit reads it;
+  // the sampler is never invoked on a pooling model's step).
+  std::optional<PoolingParams> pooling_params;
   // structured_output_request (request.py:87-92): the per-request structured
   // output state (constraint params + the compiled grammar), or nullopt when the
   // request has no structured-output constraint. Populated at construction from

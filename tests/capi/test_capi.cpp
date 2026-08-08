@@ -12,6 +12,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1296,11 +1297,12 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // transcription slice (vllm_transcribe) is ABI v11; the video-generation
   // slice (vllm_video_*) is ABI v12; the pre-tokenized completion entry
   // point (vllm_complete_tokens) is ABI v13; the device-selection field
-  // (vllm_model_params.device) is ABI v14. The >= pin is the one check that
+  // (vllm_model_params.device) is ABI v14; the embeddings slice (vllm_embed /
+  // vllm_embedding_result_free) is ABI v15. The >= pin is the one check that
   // can catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
   // test_dlopen compare against the same macro and move with it (the #121
   // lesson: an == floor moves with the macro and proves nothing).
-  CHECK(vllm_abi_version() >= 14);
+  CHECK(vllm_abi_version() >= 15);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────
@@ -1838,4 +1840,124 @@ TEST_CASE("capi v14: explicit cpu forces the CPU queue at the EngineParams seam"
         doctest::Contains("device 'cuda' was requested but no CUDA platform"),
         std::runtime_error);
   }
+}
+
+// ─── ABI v15: embeddings (ARCH-ONE-SURFACE ROW 6) ────────────────────────────
+// The embeddings slice gated THROUGH the public ABI on the committed tiny
+// LlamaModel fixture (tests/vllm/models/fixtures/llama_embed_e2e): a REAL
+// checkpoint-directory load through vllm_engine_load, then vllm_embed through
+// the SAME registry forward + PoolingRunner engine step the fold gate
+// (test_llama_embedding_fold) anchors. Plus the argument contract and the
+// refuse-by-task pins in BOTH directions (the v11 precedent applied to the
+// pooling task).
+
+namespace {
+std::string LlamaEmbedFixture() { return std::string(LLAMA_EMBED_FIXTURE_DIR); }
+}  // namespace
+
+TEST_CASE("capi v15: vllm_embed embeds through the public ABI (fixture load)") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = LlamaEmbedFixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+  REQUIRE(eng != nullptr);
+
+  const char* texts[2] = {"the quick brown fox", "the lazy dog"};
+  vllm_embedding_result out;
+  REQUIRE(vllm_embed(eng, texts, 2, &out) == VLLM_OK);
+  REQUIRE(out.values != nullptr);
+  CHECK(out.n_embeddings == 2);
+  CHECK(out.dim == 64);  // the fixture's hidden_size
+  CHECK(out.prompt_tokens > 0);
+  // Each embedding is unit-L2 (the pooling normalize ran) and the two DIFFER
+  // (different prompts pool different last-token hiddens).
+  double delta = 0.0;
+  for (int32_t r = 0; r < out.n_embeddings; ++r) {
+    double l2 = 0.0;
+    for (int32_t c = 0; c < out.dim; ++c) {
+      const double v = out.values[r * out.dim + c];
+      l2 += v * v;
+    }
+    CHECK(std::sqrt(l2) == doctest::Approx(1.0).epsilon(1e-5));
+  }
+  for (int32_t c = 0; c < out.dim; ++c) {
+    delta += std::abs(static_cast<double>(out.values[c]) -
+                      static_cast<double>(out.values[out.dim + c]));
+  }
+  CHECK(delta > 1e-3);
+
+  vllm_embedding_result_free(&out);
+  CHECK(out.values == nullptr);  // zeroed after free
+  CHECK(out.n_embeddings == 0);
+  vllm_embedding_result_free(&out);  // double-free is a safe no-op
+  vllm_embedding_result_free(nullptr);
+  vllm_engine_free(eng);
+}
+
+TEST_CASE("capi v15: refuse-by-task in both directions (pooling vs text)") {
+  // Pooling handle: every text entry point refuses with the actionable message
+  // instead of driving generation over hidden states.
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = LlamaEmbedFixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* emb = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &emb) == VLLM_OK);
+
+  vllm_sampling_params sp = vllm_sampling_params_default();
+  vllm_completion comp;
+  CHECK(vllm_complete(emb, "hello", &sp, &comp) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("pooling (embedding)") !=
+        std::string::npos);
+  CHECK(std::string(vllm_last_error()).find("vllm_embed") != std::string::npos);
+  char* chat_out = nullptr;
+  CHECK(vllm_chat(emb, "{\"messages\":[]}", &chat_out) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("vllm_embed") != std::string::npos);
+  {
+    const int32_t prompt_ids[1] = {0};
+    int32_t out_ids[4];
+    int32_t n_out = 0;
+    CHECK(vllm_complete_tokens(emb, prompt_ids, 1, &sp, out_ids, 4, &n_out,
+                               nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(std::string(vllm_last_error()).find("vllm_embed") !=
+          std::string::npos);
+  }
+  vllm_engine_free(emb);
+
+  // Text handle: vllm_embed refuses symmetrically, naming the text entry
+  // points.
+  vllm_engine* text = MakeSyntheticEngine();
+  REQUIRE(text != nullptr);
+  const char* texts[1] = {"hello"};
+  vllm_embedding_result out;
+  CHECK(vllm_embed(text, texts, 1, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("text-generation") !=
+        std::string::npos);
+  CHECK(std::string(vllm_last_error()).find("vllm_complete") !=
+        std::string::npos);
+  vllm_engine_free(text);
+}
+
+TEST_CASE("capi v15: vllm_embed argument contract") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = LlamaEmbedFixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+
+  const char* texts[2] = {"the fox", nullptr};
+  vllm_embedding_result out;
+  // Null engine / texts / out; non-positive n_texts; a NULL texts entry.
+  CHECK(vllm_embed(nullptr, texts, 1, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, nullptr, 1, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, 1, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, 0, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, -3, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_embed(eng, texts, 2, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("texts[1]") != std::string::npos);
+  // On every refused call *out stays zeroed.
+  CHECK(out.values == nullptr);
+  CHECK(out.n_embeddings == 0);
+  vllm_engine_free(eng);
 }

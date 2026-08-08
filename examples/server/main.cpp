@@ -435,6 +435,77 @@ int main(int argc, char** argv) {
           transcription_only = false;  // unknown arch: the text path diagnoses
         }
       }
+      // ── POOLING TASK DISPATCH (ARCH-ONE-SURFACE ROW 6): a model dir whose
+      // architectures resolve to a POOLING registration (is_pooling_model,
+      // e.g. "LlamaModel" — vLLM _EMBEDDING_MODELS registry.py:230) serves
+      // /v1/embeddings through the ONE engine path (LoadedEngine ->
+      // LLMEngine::embed -> registry forward -> PoolingRunner) — the same
+      // path vllm_embed drives — and registers NO generate routes (vLLM's
+      // task-conditional registration, api_server.py:255-265). ──────────────
+      bool pooling_model = false;
+      if (!archs.empty()) {
+        try {
+          pooling_model =
+              vllm::ModelRegistry::Resolve(std::span<const std::string>(archs))
+                  .info.is_pooling_model;
+        } catch (const std::exception&) {
+          pooling_model = false;  // unknown arch: the text path diagnoses
+        }
+      }
+      if (pooling_model) {
+        std::cerr << "server: pooling (embedding) model (" << archs[0]
+                  << "); serving /v1/embeddings\n";
+        vllm::entrypoints::EngineParams embed_params;
+        embed_params.block_size = args.block_size;
+        embed_params.num_blocks = args.num_blocks;
+        embed_params.max_model_len = args.max_model_len;
+        embed_params.max_num_seqs = args.max_num_seqs;
+        embed_params.max_num_batched_tokens = args.max_num_batched_tokens;
+        embed_params.enable_prefix_caching = args.enable_prefix_caching;
+        auto loaded_embed = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
+            vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
+                                                          embed_params));
+        namespace oai = vllm::entrypoints::openai;
+        oai::OpenAIServingModels embed_models(served_model_name);
+        oai::ApiServer embed_server(embed_models, vllm::Version());
+        auto embed_mutex = std::make_shared<std::mutex>();
+        auto embed_counter = std::make_shared<std::atomic<uint64_t>>(0);
+        embed_server.set_embedder(
+            [loaded_embed, embed_mutex, embed_counter](
+                const std::vector<std::string>& inputs) {
+              // Serialize batches: the pooling path drives the SYNCHRONOUS
+              // LLMEngine (async scheduling resolves OFF for pooling models).
+              std::lock_guard<std::mutex> lock(*embed_mutex);
+              oai::ApiServer::EmbeddingBatch batch;
+              for (const std::string& text : inputs) {
+                std::vector<int32_t> ids =
+                    loaded_embed->tokenizer().EncodeWithSpecialTokens(text);
+                if (ids.empty()) {
+                  throw std::runtime_error(
+                      "input tokenized to an empty prompt");
+                }
+                batch.prompt_tokens += static_cast<int64_t>(ids.size());
+                vllm::RequestOutput ro = loaded_embed->engine().embed(
+                    std::move(ids), vllm::PoolingParams{},
+                    "embd-" + std::to_string(embed_counter->fetch_add(1)));
+                if (!ro.finished || !ro.pooling_output.has_value()) {
+                  throw std::runtime_error(
+                      "engine produced no pooled output");
+                }
+                batch.embeddings.push_back(std::move(*ro.pooling_output));
+              }
+              return batch;
+            });
+        std::cerr << "server: listening on http://" << args.host << ":"
+                  << args.port << "\n";
+        if (!embed_server.listen(args.host, args.port)) {
+          std::cerr << "server: failed to bind " << args.host << ":"
+                    << args.port << "\n";
+          return 1;
+        }
+        return 0;
+      }
+
       if (transcription_only) {
         std::cerr << "server: transcription-only model (" << archs[0]
                   << "); serving /v1/audio/transcriptions\n";

@@ -97,6 +97,9 @@ Request Request::FromEngineCoreRequest(const EngineCoreRequest& request,
   // ordinary text path -> byte-identical hashes.
   req.cache_salt = request.cache_salt;
   req.lora_name = request.lora_name;
+  // Pooling-task marker (ARCH-ONE-SURFACE ROW 6; upstream Request.pooling_params,
+  // vllm/v1/request.py). nullopt on every generation request -> byte-identical.
+  req.pooling_params = request.pooling_params;
   // Now install the hasher and compute the initial block hashes over the fully
   // populated request.
   req.block_hasher_ = std::move(block_hasher);

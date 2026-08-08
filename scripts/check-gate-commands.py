@@ -244,6 +244,11 @@ RUNNABLE_BASELINE = frozenset({
     "KERNEL-GEMM-CPU-ELEM",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
+    # ARCH-ONE-SURFACE ROW 6 (2026-08-08): embeddings-one-surface.md carries a
+    # runnable Gates section (preflight + the fold/capi/server suites) for the
+    # two rows it activates.
+    "MODEL-EMBED-llama-llama-for-causal-lm",
+    "SERVE-POOLING-ENDPOINTS",
     "KV-SLIDING-WINDOW-SPEC",
     "LOAD-SAFETENSORS-DIRECT-DENSE",
     "MODEL-FACTORY-registry",

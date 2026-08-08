@@ -113,6 +113,13 @@ struct RequestOutput {
   std::optional<PromptLogprobs> prompt_logprobs;
   // Whether the whole request is finished.
   bool finished = false;
+  // pooling_output (ARCH-ONE-SURFACE ROW 6): the pooled vector of a finished
+  // POOLING-task request (task=embed: the L2-normalized last-token embedding).
+  // RECORDED DEVIATION: upstream wraps pooled results in a separate
+  // PoolingRequestOutput/PoolingOutput class pair (vllm/outputs.py); ours rides
+  // the ONE RequestOutput as an optional field so every existing consumer of
+  // the generation shape is byte-identical (nullopt there).
+  std::optional<std::vector<float>> pooling_output;
 
   // Convenience accessor mirroring the `finished` attribute (upstream exposes
   // the plain attribute; provided here for parity with the *Output helpers).

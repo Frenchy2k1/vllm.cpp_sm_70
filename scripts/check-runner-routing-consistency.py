@@ -303,13 +303,16 @@ def resolve_alias(cls: str, alias: dict[str, str]) -> str:
     return cls
 
 
+_IS_POOLING = re.compile(r"\.is_pooling_model\s*=\s*true")
+
+
 @dataclass(frozen=True)
 class ModelRoute:
     """The decode-routing verdict for one REGISTER_VLLM_MODEL registration."""
     name: str                      # allowlist key (registry stem minus _registry)
     reg_file: str
     forward_fn: str
-    classification: str            # DEVICE | HOST | REFUSE | NONE
+    classification: str            # DEVICE | HOST | REFUSE | POOLING | NONE
     private_generate_loop: bool    # invariant (b): ships a *GenerateCore host loop
     device_source: str = ""        # which delegated class supplied the device seam
     activation: str = "BF16_RESIDENT"  # invariant (c): F32_STREAM | BF16_RESIDENT
@@ -402,7 +405,17 @@ def scan_registrations(
         }
         device_source = ""
         classification = "NONE"
-        if classify_with_helpers(body, text) == "DEVICE":
+        # POOLING registrations (ARCH-ONE-SURFACE ROW 6): a registry TU that
+        # declares `.is_pooling_model = true` registers a NON-GENERATIVE model -
+        # its forward is a HIDDEN-STATE producer for the PoolingRunner (the
+        # engine pools instead of sampling, gpu/model_runner.py:1586-1607), so
+        # the device-resident-LOGITS seam does not apply BY DESIGN, exactly as
+        # a refuse-by-name stub decodes nothing. Classified explicitly (never
+        # the silently-exempt NONE bucket) and excluded from the HOST-drift
+        # gate; the bf16-activation invariant still applies to its body.
+        if _IS_POOLING.search(strip_comments(text)):
+            classification = "POOLING"
+        elif classify_with_helpers(body, text) == "DEVICE":
             classification, device_source = "DEVICE", fn
         for cls in delegated_classes:
             impl = fd_bodies.get(cls)
@@ -411,7 +424,7 @@ def scan_registrations(
                 impl_class = classify_with_helpers(impl[1], file_text.get(impl[0], ""))
                 if impl_class == "DEVICE" and classification != "DEVICE":
                     classification, device_source = "DEVICE", cls
-        if classification != "DEVICE":
+        if classification not in ("DEVICE", "POOLING"):
             # Not device-reachable: rank the delegated ForwardDevice impls, else the
             # hook body itself, as HOST > REFUSE > NONE.
             impl_classes = [
@@ -522,6 +535,7 @@ def main() -> int:
     n_device = sum(1 for r in scanned.values() if r.classification == "DEVICE")
     n_host = sum(1 for r in scanned.values() if r.classification == "HOST")
     n_refuse = sum(1 for r in scanned.values() if r.classification == "REFUSE")
+    n_pooling = sum(1 for r in scanned.values() if r.classification == "POOLING")
     n_none = sum(1 for r in scanned.values() if r.classification == "NONE")
     n_f32 = sum(1 for r in scanned.values() if r.activation == "F32_STREAM")
     n_bf16 = sum(
@@ -566,7 +580,9 @@ def main() -> int:
             f"OK (runner-routing): {len(scanned)} registered model(s); "
             f"{n_device} return device-resident logits on the runner, "
             f"{n_host} host-logits off-framework ({len(allowlisted)} allowlisted), "
-            f"{n_refuse} refuse-by-name stub(s) skipped, {n_none} no-logit-producer."
+            f"{n_refuse} refuse-by-name stub(s) skipped, "
+            f"{n_pooling} pooling (hidden-state producer(s) for the PoolingRunner), "
+            f"{n_none} no-logit-producer."
         )
 
     # Invariant (c): bf16-resident activations (no hand-rolled f32 host stream).

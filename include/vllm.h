@@ -118,8 +118,19 @@ extern "C" {
  * CUDA platform; when it is absent the load FAILS with VLLM_ERR_MODEL_LOAD —
  * an explicitly named device is never silently substituted, device.py:61-66).
  * Appended at the END of vllm_model_params so a zero-initialized struct keeps
- * the pre-v14 engine byte-identical. */
-#define VLLM_ABI_VERSION 14
+ * the pre-v14 engine byte-identical.
+ * v15: vllm_embed / vllm_embedding_result(_free) — EMBEDDINGS through the ONE
+ * surface (ARCH-ONE-SURFACE fold ROW 6). An engine loaded from a POOLING
+ * (embedding) checkpoint — a directory whose config.json architectures resolve
+ * to a pooling registration, e.g. "LlamaModel" (the mirror of vLLM's
+ * _EMBEDDING_MODELS registry.py:230 + as_embedding_model adapters.py:230) —
+ * embeds text through the SAME registry forward + PoolingRunner engine step
+ * the server's /v1/embeddings drives. Text and pooling handles refuse each
+ * other's tasks LOUDLY: vllm_complete/vllm_chat on a pooling engine name
+ * vllm_embed, and vllm_embed on a text engine names vllm_complete — the
+ * SupportsTranscription-refusal precedent (v11) applied to the pooling task.
+ * Purely additive — no struct changed; zero values preserve behaviour. */
+#define VLLM_ABI_VERSION 15
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -581,6 +592,44 @@ VLLM_API vllm_status vllm_transcribe(vllm_engine* engine,
 /* Free the owned members of a transcription result and zero the struct. The
  * struct itself is caller storage. NULL is a no-op. */
 VLLM_API void vllm_transcription_free(vllm_transcription* out);
+
+
+/* ── Embeddings (ABI v15) ─────────────────────────────────────────────────────
+ * The embeddings/pooling slice of the ONE-SURFACE fold: an engine loaded from
+ * a POOLING (embedding) checkpoint — config.json architectures resolving to a
+ * pooling registration such as "LlamaModel" — turns text into L2-normalized
+ * embedding vectors through the SAME registry forward + PoolingRunner engine
+ * step the bundled server's /v1/embeddings drives (task=embed, LAST-token
+ * pooling: the mirror of vLLM's as_embedding_model conversion). Loading such a
+ * checkpoint uses the ordinary vllm_engine_load; the handle then serves ONLY
+ * the embedding entry point (the text/chat entry points refuse, naming this
+ * one, and vice versa on a text handle). */
+
+/* One embedding batch result. OWNERSHIP: `values` is library-allocated; free
+ * via vllm_embedding_result_free(out). Row-major: embedding i occupies
+ * values[i*dim .. (i+1)*dim). */
+typedef struct vllm_embedding_result {
+  float* values;          /* n_embeddings * dim floats, row-major */
+  int32_t n_embeddings;   /* == the number of input texts */
+  int32_t dim;            /* the model's hidden size */
+  int32_t prompt_tokens;  /* total input tokens (the OpenAI usage mirror) */
+} vllm_embedding_result;
+
+/* Embed n_texts NUL-terminated UTF-8 strings on a pooling-capable engine
+ * handle, filling *out (one embedding per text, input order). BLOCKING; the
+ * texts are tokenized with the checkpoint's tokenizer and each prompt runs one
+ * engine prefill + pool step. Returns VLLM_OK on success;
+ * VLLM_ERR_INVALID_ARGUMENT for a text-generation handle (use vllm_complete /
+ * vllm_chat there), a NULL texts/out, an n_texts <= 0, or a NULL entry in
+ * texts; VLLM_ERR_RUNTIME when tokenization or the forward fails. On any
+ * non-OK status *out is zeroed and vllm_last_error() carries the detail. */
+VLLM_API vllm_status vllm_embed(vllm_engine* engine,
+                                const char* const* texts, int32_t n_texts,
+                                vllm_embedding_result* out);
+
+/* Free the owned members of an embedding result and zero the struct. The
+ * struct itself is caller storage. NULL is a no-op. */
+VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out);
 
 
 /* ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────

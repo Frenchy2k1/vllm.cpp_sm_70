@@ -80,6 +80,12 @@ vllm_cpp_add_test(test_qwen3_dflash_forward vllm/models/test_qwen3_dflash_forwar
 target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
 target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ARCH-ONE-SURFACE fold ROW 6: embeddings through the registry/runner path on
+# the committed tiny LlamaModel fixture (see scripts/mm/llama_embed_fixture_gen.py).
+vllm_cpp_add_test(test_llama_embedding_fold
+  vllm/models/test_llama_embedding_fold.cpp)
+target_compile_definitions(test_llama_embedding_fold PRIVATE
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
 vllm_cpp_add_test(test_mistral_forward vllm/models/test_mistral_forward.cpp)
 target_include_directories(test_mistral_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_gemma3_load vllm/models/test_gemma3_load.cpp)
@@ -647,7 +653,11 @@ if(VLLM_CPP_SERVER)
   # library transcription seam on the committed parakeet_e2e fixture
   # (ARCH-ONE-SURFACE ROW 1).
   target_compile_definitions(test_openai_api_server PRIVATE
-    PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
+    PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
+    # /v1/embeddings dispatch + socket smoke run against the REAL engine path
+    # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
+    # (ARCH-ONE-SURFACE ROW 6).
+    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
@@ -677,7 +687,8 @@ vllm_cpp_add_test(test_capi capi/test_capi.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
-  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

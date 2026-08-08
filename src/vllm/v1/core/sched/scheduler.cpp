@@ -775,7 +775,24 @@ EngineCoreOutputs Scheduler::update_from_output(
       new_token_ids = std::move(result.first);
       stopped = result.second;
     }
-    // DEFERRED: pooling stop.
+    // Pooling stop (ARCH-ONE-SURFACE ROW 6; scheduler.py:1718-1721 `elif
+    // request.pooling_params and pooler_output is not None`): a POOLING request
+    // finishes as soon as the runner produced its pooled output. The runner
+    // reports nullopt for a row still consuming prefill chunks (the
+    // is_valid=false rows, pooling_runner.py:40-41), so such a request keeps
+    // running. pooler_output is EMPTY on every generation step -> the text path
+    // above is byte-identical.
+    std::optional<std::vector<float>> pooler_output;
+    if (!model_runner_output.pooler_output.empty() &&
+        req_index < static_cast<int>(model_runner_output.pooler_output.size())) {
+      pooler_output =
+          model_runner_output.pooler_output[static_cast<std::size_t>(req_index)];
+    }
+    if (new_token_ids.empty() && request->pooling_params.has_value() &&
+        pooler_output.has_value()) {
+      request->status = RequestStatus::kFinishedStopped;
+      stopped = true;
+    }
 
     // scheduler.py:1636-1651: advance the structured-output FSM by the sampled
     // tokens. Only when the request produced tokens and the manager says the FSM
@@ -838,11 +855,14 @@ EngineCoreOutputs Scheduler::update_from_output(
     // (upstream's `if new_token_ids or ... or stopped`). A partial-prefill
     // request that produced neither is skipped: "EngineCore returns no partial
     // prefill outputs".
-    if (!new_token_ids.empty() || stopped) {
+    if (!new_token_ids.empty() || pooler_output.has_value() || stopped) {
       EngineCoreOutput out;
       out.request_id = req_id;
       out.new_token_ids = new_token_ids;
       out.finish_reason = finish_reason;
+      // Pooled data rides the output to the frontend (scheduler.py:1837
+      // `pooling_output=pooler_output`); nullopt on every generation output.
+      out.pooling_output = std::move(pooler_output);
       out.new_logprobs = std::move(new_logprobs);
       out.new_prompt_logprobs_tensors = std::move(new_prompt_logprobs_tensors);
       // stop_reason is int|str|None upstream; our EngineCoreOutput carries an

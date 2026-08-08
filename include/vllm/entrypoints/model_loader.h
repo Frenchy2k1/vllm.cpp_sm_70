@@ -213,6 +213,14 @@ class LoadedEngine {
       std::optional<vt::DeviceType> named_platform_type);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
+  // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
+  // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
+  // this — text-generation refuses on a pooling engine (naming vllm_embed /
+  // /v1/embeddings) and embed refuses on a text engine — the mirror of vLLM
+  // validating runner_type against the model class (config/model.py:607-613).
+  bool is_pooling_model() const {
+    return model_->registration().info.is_pooling_model;
+  }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,
   // online/server callers use this frontend rather than the synchronous
   // LLMEngine over the same scheduler/executor.
@@ -258,8 +266,12 @@ class LoadedEngine {
   // CPU construction-matrix test can assert it directly over the
   // runner_supports_async x VT_ASYNC_SCHED matrix without a disk load. Applies
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
+  // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
+  // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
+  // byte-identical text path.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
-                                  bool runner_supports_async);
+                                  bool runner_supports_async,
+                                  bool is_pooling_model = false);
 
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight

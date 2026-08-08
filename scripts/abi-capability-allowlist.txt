@@ -19,5 +19,4 @@
 #
 # Format: `<normalized capability label> | fold=<ROW-ID> | <reason: what exists, what the ABI lacks, fold order>`.
 
-embeddings / pooling | fold=ARCH-ONE-SURFACE | Engine-side pooler landed (ENG-POOLER-SEQ: pooler/{dispatch_pooler,methods,heads,poolers}.cpp + pool/pooling_runner) but PoolingRunner is never invoked by the live step, no arch sets is_pooling_model, /v1/embeddings is a run_batch "does not support endpoint" residual, and vllm.h has no embed/pool symbol. Fold: grow ABI pooling entry point, wire the live route, register a pooling arch
 multimodal input (image/audio/video) | fold=ARCH-ONE-SURFACE | vllm_chat/vllm_chat_stream are text-only (vllm.h:440,451); the C-ABI's EnsureChatServing never sets the mm seam (src/capi/vllm_c.cpp), and even the server's Qwen3-VL image seam does not run the vision tower in the live engine step (MM-SERVE-E2E residual). Fold: grow ABI multimodal-input entry point + the engine mm-forward

@@ -3,6 +3,8 @@
 // dependency deviation.
 #include "vllm/entrypoints/openai/api_server.h"
 
+#include <atomic>
+#include <ctime>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -362,6 +364,113 @@ ApiServer::DispatchResult ApiServer::handle_audio_transcriptions(
     // Undecodable audio (not RIFF/WAVE, not PCM16 mono, wrong sample rate) is
     // a caller error; the pipeline names the cause.
     return MakeError(400, "BadRequestError", e.what());
+  }
+}
+
+ApiServer::DispatchResult ApiServer::handle_embeddings(
+    const std::string& request_body) const {
+  // Mirror of vLLM pooling/embed/api_router.py:28 `create_embedding` over the
+  // EmbeddingCompletionRequest shape (embed/protocol.py:34: `model` + `input`
+  // as ONE string or an ARRAY of strings) and the EmbeddingResponse shape
+  // (embed/protocol.py:173-185). The embedding itself runs through the ONE
+  // engine path (LLMEngine::embed -> registry forward -> PoolingRunner) — the
+  // same code path vllm_embed drives, so HTTP and FFI cannot drift.
+  if (!embedder_) {
+    // The api_router `if handler is None` mirror (embed/api_router.py:22-25);
+    // the socket layer never registers the route without an embedder.
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Embeddings API");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                     std::string("invalid JSON body: ") + e.what());
+  }
+  if (!body.is_object()) {
+    return MakeError(400, "BadRequestError", "request body must be an object");
+  }
+  // model: honoured like every other serving handler — an unknown name is 404.
+  if (body.contains("model") && body["model"].is_string() &&
+      !models_.is_base_model(body["model"].get<std::string>())) {
+    return MakeError(404, "NotFoundError",
+                     "The model `" + body["model"].get<std::string>() +
+                         "` does not exist.");
+  }
+  // encoding_format: float (the default) only; base64 is a NAMED residual.
+  if (body.contains("encoding_format") && body["encoding_format"].is_string() &&
+      body["encoding_format"].get<std::string>() != "float") {
+    return MakeError(400, "BadRequestError",
+                     "encoding_format '" +
+                         body["encoding_format"].get<std::string>() +
+                         "' is not supported (supported: float; base64 is a "
+                         "named residual)");
+  }
+  if (body.contains("dimensions") && !body["dimensions"].is_null()) {
+    // Matryoshka truncation is a NAMED residual of this fold (the pooler op
+    // supports it; the request plumb does not yet).
+    return MakeError(400, "BadRequestError",
+                     "dimensions is not supported yet (named residual)");
+  }
+  // input: ONE string or an ARRAY of strings (embed/protocol.py:34
+  // EmbeddingCompletionRequest via CompletionRequestMixin). Token-array
+  // inputs are a NAMED residual.
+  std::vector<std::string> inputs;
+  if (!body.contains("input")) {
+    return MakeError(400, "BadRequestError", "input is required");
+  }
+  if (body["input"].is_string()) {
+    inputs.push_back(body["input"].get<std::string>());
+  } else if (body["input"].is_array()) {
+    for (const nlohmann::json& item : body["input"]) {
+      if (!item.is_string()) {
+        return MakeError(400, "BadRequestError",
+                         "input must be a string or an array of strings "
+                         "(token-array inputs are a named residual)");
+      }
+      inputs.push_back(item.get<std::string>());
+    }
+    if (inputs.empty()) {
+      return MakeError(400, "BadRequestError",
+                       "input must contain at least one string");
+    }
+  } else {
+    return MakeError(400, "BadRequestError",
+                     "input must be a string or an array of strings");
+  }
+
+  try {
+    const EmbeddingBatch batch = embedder_(inputs);
+    if (batch.embeddings.size() != inputs.size()) {
+      return MakeError(500, "InternalServerError",
+                       "embedder returned a mismatched batch");
+    }
+    nlohmann::json data = nlohmann::json::array();
+    for (size_t i = 0; i < batch.embeddings.size(); ++i) {
+      data.push_back(nlohmann::json{
+          {"index", static_cast<int64_t>(i)},
+          {"object", "embedding"},
+          {"embedding", batch.embeddings[i]},
+      });
+    }
+    // id: "embd-<counter>" (upstream f"embd-{random_uuid()}",
+    // embed/protocol.py:180 — the serving_completion.h counter stand-in).
+    static std::atomic<uint64_t> embd_counter{0};
+    DispatchResult r;
+    r.body = nlohmann::json{
+        {"id", "embd-" + std::to_string(embd_counter.fetch_add(1))},
+        {"object", "list"},
+        {"created", static_cast<int64_t>(std::time(nullptr))},
+        {"model", models_.model_name()},
+        {"data", std::move(data)},
+        {"usage",
+         nlohmann::json{{"prompt_tokens", batch.prompt_tokens},
+                        {"total_tokens", batch.prompt_tokens}}},
+    }.dump();
+    return r;
+  } catch (const std::exception& e) {
+    return MakeError(500, "InternalServerError", e.what());
   }
 }
 
@@ -904,6 +1013,19 @@ void ApiServer::register_routes() {
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_server_info(), res);
              });
+
+  if (embedder_) {
+    // Embeddings (ARCH-ONE-SURFACE ROW 6). Registered ONLY when an embedder is
+    // attached (task-conditional, the api_server.py:255-265 supported_tasks
+    // mirror), so a text server answers 404 at the route table — and an
+    // embedding server, having no completion_/chat_ handlers, answers 404 on
+    // the generate routes the same way.
+    server.Post("/v1/embeddings",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_embeddings(req.body), res);
+                });
+  }
 
   if (transcriber_) {
     // Parakeet ASR (ARCH-ONE-SURFACE ROW 1). Registered ONLY when a
