@@ -494,6 +494,95 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
     dev.Free(dsm);
     dev.DestroyQueue(q);
   }
+
+  // --- Unbind flash layout: single (blocks,2,bs,H,D) allocation, K/V strided ---
+  // Matches dense_attn::KvSlice — the layout the engine really feeds.
+  {
+    const int64_t within = kBS * kHk * kD;
+    std::vector<float> combined(static_cast<size_t>(kBlocks * 2 * within));
+    for (int64_t b = 0; b < kBlocks; ++b)
+      for (int64_t e = 0; e < within; ++e) {
+        combined[static_cast<size_t>((b * 2 + 0) * within + e)] =
+            kc0[static_cast<size_t>(b * within + e)];
+        combined[static_cast<size_t>((b * 2 + 1) * within + e)] =
+            vc0[static_cast<size_t>(b * within + e)];
+      }
+    std::vector<float> ref_comb = combined;
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ck = knew, cv = vnew, cslots_f;
+      std::vector<int64_t> cslots = slots;
+      Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      Tensor tcomb =
+          Tensor::Contiguous(ref_comb.data(), DType::kF32, cd, {kBlocks * 2 * within});
+      auto slice = [&](int which) {
+        Tensor t = tcomb;
+        t.data = static_cast<char*>(t.data) +
+                 static_cast<size_t>(which) * static_cast<size_t>(within) * sizeof(float);
+        t.rank = 4;
+        t.shape[0] = kBlocks;
+        t.shape[1] = kBS;
+        t.shape[2] = kHk;
+        t.shape[3] = kD;
+        t.stride[0] = 2 * within;
+        t.stride[1] = kHk * kD;
+        t.stride[2] = kD;
+        t.stride[3] = 1;
+        return t;
+      };
+      Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+      Tensor tkc = slice(0), tvc = slice(1);
+      vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
+      cpu.DestroyQueue(cq);
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      CAPTURE("unbind");
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dk(dev, q, kTokens * kElems), dv(dev, q, kTokens * kElems),
+          dcomb(dev, q, kBlocks * 2 * within);
+      dk.Upload(knew);
+      dv.Upload(vnew);
+      dcomb.Upload(combined);
+      void* dsm = dev.Alloc(kTokens * sizeof(int64_t));
+      dev.Copy(q, dsm, slots.data(), kTokens * sizeof(int64_t));
+      dev.Synchronize(q);
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+      Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+      Tensor tcomb =
+          Tensor::Contiguous(dcomb.ptr(), DType::kF32, d, {kBlocks * 2 * within});
+      auto slice = [&](int which) {
+        Tensor t = tcomb;
+        t.data = static_cast<char*>(t.data) +
+                 static_cast<size_t>(which) * static_cast<size_t>(within) * sizeof(float);
+        t.rank = 4;
+        t.shape[0] = kBlocks;
+        t.shape[1] = kBS;
+        t.shape[2] = kHk;
+        t.shape[3] = kD;
+        t.stride[0] = 2 * within;
+        t.stride[1] = kHk * kD;
+        t.stride[2] = kD;
+        t.stride[3] = 1;
+        return t;
+      };
+      Tensor tsm = Tensor::Contiguous(dsm, DType::kI64, d, {kTokens});
+      Tensor tkc = slice(0), tvc = slice(1);
+      vt::ReshapeAndCache(q, tk, tv, tkc, tvc, tsm);
+      dev.Synchronize(q);
+      const std::vector<float> got = dcomb.Download();
+      CHECK(std::memcmp(ref_comb.data(), got.data(), ref_comb.size() * sizeof(float)) == 0);
+      dev.Free(dsm);
+      dev.DestroyQueue(q);
+    }
+  }
 }
 
 TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
@@ -584,6 +673,71 @@ TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
 
       CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
 
+      dev.Free(dbt);
+      dev.Free(dsl);
+      dev.Free(dqsl);
+      dev.DestroyQueue(q);
+    }
+  }
+
+  // --- DECODE shape: one new query token over a filled cache (Tq=1, seq=kT).
+  // This is the path multi-token generation hits after prefill; a prefill-only
+  // test leaves it unexercised.
+  {
+    constexpr int64_t kTq = 1;
+    const std::vector<float> q_dec = RandomVec(kTq * kHq * kD, 701);
+    const std::vector<int32_t> sl_dec = {static_cast<int32_t>(kT)};
+    const std::vector<int32_t> qsl_dec = {0, 1};
+    vt::PagedAttentionArgs dargs;
+    dargs.scale = 0.353553f;
+    dargs.causal = true;
+
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cq_v = q_dec, ckc = kc, cvc = vc, ref(kTq * kHq * kD);
+    std::vector<int32_t> cbt = block_table, csl = sl_dec, cqsl = qsl_dec;
+    {
+      Tensor tq = Tensor::Contiguous(cq_v.data(), DType::kF32, cd, {kTq, kHq, kD});
+      Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+      Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+      Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
+      Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
+      Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kTq, kHq, kD});
+      vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, dargs);
+    }
+    cpu.DestroyQueue(cq);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      CAPTURE("decode");
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dq(dev, q, kTq * kHq * kD), dkc(dev, q, kBlocks * kBS * kHk * kD),
+          dvc(dev, q, kBlocks * kBS * kHk * kD), dout(dev, q, kTq * kHq * kD);
+      dq.Upload(q_dec);
+      dkc.Upload(kc);
+      dvc.Upload(vc);
+      void* dbt = dev.Alloc(kBlocks * sizeof(int32_t));
+      void* dsl = dev.Alloc(sizeof(int32_t));
+      void* dqsl = dev.Alloc(2 * sizeof(int32_t));
+      dev.Copy(q, dbt, block_table.data(), kBlocks * sizeof(int32_t));
+      dev.Copy(q, dsl, sl_dec.data(), sizeof(int32_t));
+      dev.Copy(q, dqsl, qsl_dec.data(), 2 * sizeof(int32_t));
+      dev.Synchronize(q);
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kTq, kHq, kD});
+      Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+      Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+      Tensor tbt = Tensor::Contiguous(dbt, DType::kI32, d, {1, kBlocks});
+      Tensor tsl = Tensor::Contiguous(dsl, DType::kI32, d, {1});
+      Tensor tqsl = Tensor::Contiguous(dqsl, DType::kI32, d, {2});
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kTq, kHq, kD});
+      vt::PagedAttention(q, to, tq, tkc, tvc, tbt, tsl, tqsl, dargs);
+      dev.Synchronize(q);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
       dev.Free(dbt);
       dev.Free(dsl);
       dev.Free(dqsl);

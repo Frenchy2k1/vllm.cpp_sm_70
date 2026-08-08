@@ -27,7 +27,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
-| `BACKEND-ROCM` | **(b) fix in, unverified; W0 green 4 archs** | compile + 2 new ctests + M2 ([spec](specs/rocm-unified-memory-b.md)) |
+| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **LANDED** ([spec](specs/tensor-parallelism-spike.md)); DSpark rider grounded | dispatch TP-W1 (CPU-able) |
 | Release | SPIKE; 30/30 | #129 |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139 IN; **ROW 6 IN REVIEW (#137): embeddings LIVE — `LlamaModel` arch, PoolingRunner in the step, `vllm_embed` v15, `/v1/embeddings`, fold gate 4/4-231, 9 kills** | Merge #137; real-ckpt oracle cosine residual |

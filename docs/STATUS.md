@@ -414,7 +414,8 @@ Vulkan (opt-125m exact, GEMV 1.8x; 22 native, +6 GDN glue gated,
 recurrences host-tier; qwen3_5 #125 fixed, VERIFIED on 27B; CUDA build repaired
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in —
-**blind-written, unverified** — M2 unblocks on verification;
+**blind-written, unverified** — M2 unblocks on verification; gfx1201 hipBLAS +
+Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
 [guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's

@@ -132,6 +132,19 @@ Read-only observability; none change output.
 | `VT_H3_ACT_DUMP` | unset | Path to which ONE MiniMax-H3 device DiT forward writes a per-STAGE activation FINGERPRINT: mean/rms/absmax/finite plus a fixed set of positional sample values, for every stage and for the input-independent weight classes (islands, biases, output heads). Two weight arms running the SAME graph on the SAME inputs (e.g. an NVFP4-bf16 stream vs a GGUF-bf16 control) can then be diffed layer by layer: a JUMP at a stage names the guilty tensor class, and a scramble/transpose is caught by the positional samples even when rms matches. This is the instrument that REFUTED a #94 load-path defect (spec §8.12). Byte-identical to production when unset (no file is opened) |
 | `VT_H3_ACT_CALL` | 0 | Which forward `VT_H3_ACT_DUMP` captures, as a 0-based call index within the process. Only that one forward dumps, so a single small render (`--denoise-only --steps 1`) yields exactly one clean fingerprint file instead of 50 overwrites. Read only when `VT_H3_ACT_DUMP` is set |
 
+## ROCm + Gemma-4 residency (contributor #140)
+
+Discrete-ROCm (gfx1201) bring-up knobs from PR #140. Off by default; no effect
+on CUDA/CPU builds beyond the documented behavior.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads the Gemma-4 MoE experts resident on the GPU(s) after the first use instead of streaming them per step (discrete-ROCm optimization). No-op (with a stderr note) on a binary built without `-DVLLM_CPP_HIP` |
+| `VT_GEMMA4_RESIDENT_GPUS` | `2` | Number of GPUs across which resident Gemma-4 experts are spread; clamped to the ROCm device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded, to fit a smaller VRAM budget. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VT_ROCM_ATTN_CPU_REF` | unset | `=1` routes ROCm paged attention through the CPU reference kernel instead of the HIP kernel — a correctness A/B for the ROCm attention bring-up |
+| `VT_DEBUG_SAMPLED` | unset | `=1` prints the per-step sampled token id(s) to stderr (sampling-loop debug). Read-only; does not change output. Read once per token, so it does not stall the hot loop |
+
 ## Kernel-internal knobs (deferred)
 
 The remaining variables (roughly 120 `VT_GDN_*`, `VT_FP4_*`, `VT_FP8_*`,

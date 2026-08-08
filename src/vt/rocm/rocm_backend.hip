@@ -183,6 +183,19 @@ class RocmBackend final : public Backend {
   // path, this assumption is the first suspect, and the fix would be tracking
   // the branch per-pointer, not a global switch.
   void Free(void* p) override { Check(hipFree(p), "hipFree"); }
+  // Page-locked host memory so sampler D2H is a real async copy and the host
+  // can read sampled token ids (default Backend::AllocPinned is Alloc →
+  // hipMalloc on this backend, which is DEVICE memory — reading it as host is
+  // UB and breaks multi-token greedy decode on discrete GPUs).
+  void* AllocPinned(size_t bytes) override {
+    void* p = nullptr;
+    Check(hipHostMalloc(&p, bytes == 0 ? 1 : bytes, hipHostMallocDefault),
+          "hipHostMalloc");
+    return p;
+  }
+  void FreePinned(void* p) override {
+    if (p != nullptr) Check(hipHostFree(p), "hipHostFree");
+  }
   void Memset(Queue& q, void* p, int value, size_t bytes) override {
     Check(hipMemsetAsync(p, value, bytes, AsStream(q)), "hipMemsetAsync");
   }
