@@ -1689,6 +1689,19 @@ this claim will meet. The tiled row is speed-gatable on dgx.
 
 ## Closing and archival
 
+- 2026-08-08: `CLAIM-ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2` CLOSED on draft PR
+  #139. Base `b44ad337` inherited PR #136's seven shared-layer CUDA literals
+  (DSR 39 vs baseline 32). The repair keeps ABI-v14 0/1/2 and the public
+  `auto`/`cpu`/`cuda` names, represents slot 2 internally as a named-platform
+  selection, resolves its canonical name through `FindPlatformByName`, and
+  propagates the registry's `DeviceType` without a backend-specific shared
+  branch. RED-first compiler failure pinned the new seam; the non-CUDA `kXPU`
+  resolver assertion kills a hidden constant return. GREEN: DSR 32
+  (`kcuda=0`) with baseline/allowlist unchanged; checker mutations 25/25;
+  CPU Release `-Werror` `test_platform` 11/11·85,
+  `test_loaded_engine_dense` 9/9·65, `test_capi` 45/45·428. H3 source was
+  untouched; no CUDA execution, download, benchmark or service change.
+
 A block closes only when every row in its declared scope is `DONE`. In the same
 change:
 

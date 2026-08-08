@@ -42520,3 +42520,152 @@ records main-wholesale + these rows re-applied. (4) Explicit
 names for xpu/vulkan/metal/rocm are additive later; auto reaches them today.
 (5) The transcription stack refuses explicit cuda (CPU pipeline) — revisit
 when an accelerated transcription path exists.
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 8 device leakage repaired through the platform registry (PR #139)
+<!-- state: 2026-08-08T13:00 -->
+
+Current main `b44ad337` inherited PR #136 with seven CUDA enum literals in the
+shared device config/loader: DSR was 39 vs the immutable baseline 32
+(`kcuda=7`). RED-first focused tests required a platform-neutral ABI enum tag,
+a canonical-name registry lookup and an optional resolved `DeviceType`; the
+old API failed to compile on each missing seam.
+
+The ABI and public behavior are unchanged: values remain 0=auto, 1=cpu,
+2=cuda; parsing and `DeviceName()` still expose `"cuda"`; absent CUDA still
+fails loudly before model-path I/O; explicit CPU still bypasses accelerator
+selection. Internally slot 2 is `Device::kNamedPlatform`; shared loading calls
+`FindPlatformByName(DeviceName(device))` and propagates the registered
+platform's type. A mutation-sensitive test supplies `kXPU` and requires
+`kXPU` back, so replacing the propagation with a hidden CUDA constant is RED.
+The platform test walks every registered canonical name and pins missing-name
+failure.
+
+GREEN in `/dev/shm/vllm-device-leakage-build`, CPU Release, CUDA OFF,
+`-Werror`: `test_platform` 11/11 cases · 85 assertions;
+`test_loaded_engine_dense` 9/9 · 65; `test_capi` 45/45 · 428. The leakage
+checker reports DSR 32 (`kcuda=0`, `is_cuda=0`, `cuda_inc=0`, `vt_ifdef=32`)
+with baseline/allowlist unchanged, and its mutation suite is 25/25. H3 source
+is untouched. No CUDA runtime, model download, service action, benchmark or
+release artifact occurred; the existing CUDA-build A/B remains pending.
+
+## 2026-08-08 — PR #139 device-selector test registration made non-vacuous
+<!-- state: 2026-08-08T14:00 -->
+
+Review found that deleting `test_device_selection` from `tests/CMakeLists.txt`
+left preflight green: the standalone integration test existed but no tree gate
+required CI to build or execute it. `scripts/check-test-registration.py` now
+requires the exact target/source invocation and verifies that the shared
+`vllm_cpp_add_test` helper both creates the executable and registers it with
+CTest. The checker and its 15-test mutation suite run in preflight and the
+explicit agent-record CI lane. Deleting the target invocation, substituting its
+source, deleting either helper registration, duplicating the target, or dropping
+the guard's preflight/CI wiring is RED. The loader header now states explicitly
+that internal `Device::kNamedPlatform` is the stable public/wire value and name
+`2="cuda"`; behavior and ABI are unchanged. No GPU, model, benchmark or speed
+claim is involved; CUDA A/B remains pending.
+
+## 2026-08-08 — PR #139 registration guard follows configured semantics
+<!-- state: 2026-08-08T15:00 -->
+
+Mutation re-review proved the text scanner vacuous under five semantic deaths:
+the target in a CMake bracket comment, false conditional, or quoted string; the
+helper registration in a false conditional; and both CI commands behind `if
+false`. The checker now configures a disposable CPU-only project, reads CMake's
+File-API codemodel for the exact executable/source pair, and reads CTest JSON for
+the registered test. The CI half parses the dedicated YAML literal block into
+exact direct argv, rejecting control flow and inert quoted text. The expanded
+23-test suite makes all five survivors RED, pins every mutation case's outcome
+assertion, and preserves the original 15 cases. A fresh CPU Release `-Werror`
+configure exposes `test_device_selection` through both build-target help and
+CTest JSON, builds it, and runs the focused selector/platform/loader/C-ABI set
+4/4 green. No behavior, ABI, performance, model, GPU, or CUDA A/B claim changed.
+
+## 2026-08-08 — PR #139 registration guard proves execution, not presence
+<!-- state: 2026-08-08T16:00 -->
+
+Final mutation review found five more critical survivors in the guard itself.
+CTest accepted a required test by name while its helper executed `cmake -E
+true`; GitHub Actions commands counted inside a step/job disabled by `if`;
+preflight names counted in an inert array instead of the executed
+`CHECKERS`/`SUITES`; deleting both mutation assertion-helper assertions left the
+suite green; and deleting M19 plus shrinking the in-file numeric range made a
+smaller suite self-approve.
+
+The repair binds every claim to execution. After CMake File-API identifies the
+single executable artifact, the disposable configure materializes that path and
+CTest JSON must resolve to it as the exact sole argv. The Actions parser accepts
+only a canonical literal run block owned by an unconditional job and step.
+Preflight parses the named arrays and requires the actual checker/suite loops to
+consume them. Wrapper bodies are inspected for their direct production call and
+`assertTrue`, and the 27 numbered mutations are pinned in an external manifest;
+the 34-test suite also mutates both integrity mechanisms directly.
+
+All five real review mutations are RED in a scratch exact-head tree (each rc=1),
+as are wrong-binary, extra-argv, job-level condition and loop-rebinding nearby
+weakenings. Baseline checker + suite are GREEN. This is CPU-only test/governance
+hardening: selector behavior, ABI, DSR 32, performance, model state, CUDA A/B and
+release state are unchanged.
+
+## 2026-08-08 — PR #139 registration guard executes every claimed layer
+<!-- state: 2026-08-08T17:00 -->
+
+The preceding checkpoint was later mutation-reviewed as insufficient: it still
+accepted a disabled CTest, non-gating quoted/spaced Actions fields, preflight
+loop headers whose bodies never executed, and tandem suite/manifest shrinkage.
+Its 34-test conclusion is superseded by this checkpoint, without rewriting that
+historical entry. The comprehensive repair replaces source-shape inference at
+each boundary.
+CMake File-API now selects Release from a multi-config codemodel and the CTest
+query uses the same explicit configuration; the exact executable command must
+be present and the test must not be `DISABLED`. The Actions subset parser
+normalizes quoted/spaced keys and accepts the dedicated exact-argv block only
+when its job/step has no `if`, `continue-on-error`, or custom `shell`. Preflight
+is executed in a disposable tree with instrumented `python3`/`git` shims; the
+checker and suite argv must each be observed exactly once, making a `true` body,
+immediate `continue`, false outer branch, or unset array red.
+
+Mutation-suite integrity is now owned by the production checker, a third layer:
+it pins the canonical manifest path plus SHA-256 and the suite's named integrity
+method/wrapper contracts. Tandem suite+manifest deletion/rename of M18, redirect
+to a byte-identical alternate manifest, and integrity-test deletion all fail.
+This proves resistance to those two-layer tandem shrinks, not to an arbitrary
+simultaneous rewrite of all three checker layers. RED-first was 50 discovered
+tests with 11 failures + 9 missing-contract errors; GREEN is 50/50 plus the
+shipped-tree checker. CPU-only governance hardening; selector behavior, ABI, DSR
+32, performance, model state, CUDA A/B and release state remain unchanged.
+
+## 2026-08-08 — PR #139 canonical manifest-path guard made independently observable
+<!-- state: 2026-08-08T18:00 -->
+
+Final mutation review deleted only the production check that rejects a
+non-canonical mutation-manifest path and the 50-test suite remained green. M40
+was not discriminating: it rewrote the suite wrapper source, while its broad
+`canonical manifest` assertion could be satisfied by the independent wrapper
+shape error.
+
+M42 now calls `mutation_suite_integrity_errors` with the unchanged canonical
+suite source and a byte-for-byte copy of the manifest at an alternate path, and
+requires the sole exact error `mutation suite must use the canonical manifest
+path`. The external inventory includes M42 and its production-owned SHA-256 was
+updated, so dropping the test or its manifest entry is independently red. The
+exact delete-only production mutation now fails only M42 (1/51), while the
+baseline checker and suite are green at 51/51. CPU-only governance hardening;
+selector behavior, ABI, DSR 32, performance, model state, CUDA A/B and release
+state remain unchanged.
+
+## 2026-08-08 — PR #139 M42 outcome assertion is production-pinned
+<!-- state: 2026-08-08T19:00 -->
+
+Scoped re-review deleted M42's sole path-outcome `assertEqual`, but the suite
+stayed green because its unrelated byte-identity `assertTrue` satisfied the
+generic mutation-case shape check. The production checker now parses M42 and
+requires `assertEqual(errors, ["mutation suite must use the canonical manifest
+path"])` exactly. M43 deletes that assertion and replaces its diagnostic in
+turn; both mutations produce the dedicated M42 contract error. The external
+inventory and production-owned digest now pin M43 as well.
+
+The direct destructive proofs are red: deleting M42's outcome assertion fails
+the shipped-tree check and M43, while deleting the production path guard still
+fails M42 itself. Baseline checker plus suite are green at 52/52. This remains
+CPU-only governance hardening; selector behavior, ABI, DSR 32, performance,
+model state, CUDA A/B and release state are unchanged.
