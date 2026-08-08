@@ -22,11 +22,12 @@ add_executable(laguna-gen laguna_gen/main.cpp)
 target_link_libraries(laguna-gen PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(laguna-gen)
 
-# kimi-linear-gen: the single-GB10 Kimi-Linear-48B-A3B full-model e2e harness (§13
-# bf16-resident loader/forward — greedy decode the 8-prompt golden battery through
-# the bf16 ForwardDeviceCompute and token-compare to the STRICT oracle golden).
+# kimi-linear-gen: the Kimi-Linear-48B-A3B golden token battery, a THIN CLIENT
+# of the public C ABI (ONE SURFACE / ROW 7 §20.3 B4): vllm_engine_load + the
+# v13 vllm_complete_tokens over the pre-tokenized golden prompts. Links the
+# packaged shared library like vllm-cli — no internal headers.
 add_executable(kimi-linear-gen kimi_linear_gen/main.cpp)
-target_link_libraries(kimi-linear-gen PRIVATE vllm::vllm)
+target_link_libraries(kimi-linear-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(kimi-linear-gen)
 
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1

@@ -2,7 +2,7 @@
 
 <!-- now-updated: 2026-08-07 -->
 
-Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
+Read this FIRST. A SNAPSHOT: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
 append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md) and the
 benchmark record. Budget: 100 lines.
@@ -19,7 +19,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | **bf16 shards STREAM both towers (DiT + encoder); Q4_K_M enc cond cos 0.9975, 3.5° med, DIFFUSE** | render A/B on saved embeds |
-| Kimi-Linear-48B | **Best: 122/128, 18.9 tok/s (0.90× vLLM); bf16 stream refuted; strict blocked by p7 near-tie** | ACTIVE: server fold + 0.10× |
+| Kimi-Linear-48B | **ROW 7 fold LANDS (#122 §21): engine==CLI 128/128; golden 122/128; SACRED green; v13 tokens ABI** | ACTIVE: 19.0 tok/s vs vLLM ~21 (~0.90×) |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
@@ -29,7 +29,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
 | Release | SPIKE | #129 |
-| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 2 LANDED (#123)**: H3 video on the surface (`vllm_video_*` v12, `/v1/videos` via the seam, both examples thin clients, ratchet 11→9); ROW 1 (#121) before it | GB10 re-verify residual; next fold row |
+| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 IN REVIEW (`row/DEVICE-KNOB`)**: ABI v14 `device` knob, absent-cuda fails loud, `--device` on server+cli; **#135 H3 device-seam repair IN** (ABI 0/1 via `DeviceType`, DSR 32) | Merge after review; CUDA A/B |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

@@ -53,6 +53,7 @@
 #include <thread>
 #endif
 
+#include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
@@ -133,6 +134,14 @@ struct Args {
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
+  // --device: explicit device selection for the TEXT engine (ARCH-ONE-SURFACE
+  // ROW 8), the vLLM DeviceConfig.device names this build serves: "auto"
+  // (default — the accelerator-first probe, byte-identical to before the flag),
+  // "cpu" (force the CPU queue), "cuda" (require CUDA; an absent device fails
+  // startup LOUDLY, never a silent fallback). The video engine keeps its own
+  // --video-device below: the two engines are loaded from different
+  // checkpoints and may legitimately serve on different devices.
+  std::string device = "auto";
   // --- MiniMax-H3 video generation (opt-in; absent => /v1/videos is unregistered
   // and the server behaves exactly as before). ---
   std::string video_dit, video_vae, video_vae_config, audio_vae, audio_vae_config;
@@ -198,6 +207,7 @@ struct Args {
          "[--num-blocks N] [--max-model-len N]\n"
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
+         "               [--device auto|cpu|cuda]\n"
          "               [--cuda-profile-graph-replays N]\n"
          "               [--cuda-profile-graph-batch N]\n"
          "               [--benchmark-shutdown-fifo F]\n"
@@ -244,6 +254,11 @@ Args ParseArgs(int argc, char** argv) {
       a.max_num_seqs = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-num-batched-tokens") {
       a.max_num_batched_tokens = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--device") {
+      // Text-engine device selection (mirrors vLLM's DeviceConfig.device
+      // names). Validated by vllm::DeviceFromString at engine construction;
+      // --video-device (below) stays the video engine's separate knob.
+      a.device = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--cuda-profile-graph-replays") {
       a.cuda_profile_graph_replays =
           std::stoi(NextArg(argc, argv, i, argv[0]));
@@ -457,6 +472,12 @@ int main(int argc, char** argv) {
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
+    // --device: explicit device selection (ARCH-ONE-SURFACE ROW 8). "auto"
+    // (default) keeps the accelerator-first probe byte-identical; an unknown
+    // name throws HERE (a startup error), and an explicitly named ABSENT
+    // device fails FromModelDir loudly — never a silent fallback
+    // (vllm/config/device.py:61-66).
+    engine_params.device = vllm::DeviceFromString(args.device);
     // Reject an unknown policy string (mirrors upstream SchedulingPolicy(value)).
     engine_params.policy = vllm::SchedulerPolicyFromString(args.scheduling_policy);
     // ENG-SGLANG-BEHAVIOR-FLAG (SW1): `lpm` needs prefix caching to have any

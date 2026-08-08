@@ -19,7 +19,9 @@
 // hidden 64, latents 8/6) + a video-VAE whose PARSED config reproduces the
 // reduced ViT3D decoder of the "WHOLE t2va path composes end to end" case, and
 // the same reduced BigVGAN audio VAE. Render request: --partition fl2va
-// --frames 5 --height 32 --width 32 --steps 3 (latent 2x2x2, audio_t 8).
+// --keep-quant --frames 5 --height 32 --width 32 --steps 3 (latent 2x2x2,
+// audio_t 8) — keep-quant is the arm the goldens were captured on
+// (FixtureModelParams sets dequant_bf16 = 0, test_minimax_h3_video_fold.cpp).
 #pragma once
 
 #include <cstdint>

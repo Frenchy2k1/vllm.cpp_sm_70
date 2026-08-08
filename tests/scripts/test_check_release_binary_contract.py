@@ -36,8 +36,10 @@ REQUIRED_TEST_METHODS = (
     "test_per_sm_cuda_must_not_become_primary",
     "test_primary_cpu_must_stay_one_adaptive_binary_per_host_abi",
     "test_x86_64_baseline_must_not_require_avx2",
+    "test_each_exact_machine_field_is_fail_closed",
     "test_work_table_has_explicit_deps_column",
     "test_each_work_dependency_edge_is_pinned",
+    "test_each_human_work_row_id_occurs_exactly_once",
     "test_optional_w12_does_not_block_w13",
     "test_each_required_record_anchor_is_fail_closed",
     "test_release_lifecycle_and_honesty_are_fail_closed",
@@ -67,7 +69,9 @@ PRIMARY_CUDA_SMS = (
 GUARD_MAP_KEYS = {
     "TEST_LITERAL_INVENTORIES": (
         "PRIMARY_CUDA_SMS",
+        "EXACT_MACHINE_FIELDS",
         "EXPECTED_DEPS",
+        "HUMAN_WORK_IDS",
         "RECORD_ANCHORS",
         "LIFECYCLE_RECORD_MUTATIONS",
         "PUBLIC_PENDING_MUTATIONS",
@@ -77,7 +81,9 @@ GUARD_MAP_KEYS = {
     ),
     "TEST_INVENTORY_CONSUMERS": (
         "PRIMARY_CUDA_SMS",
+        "EXACT_MACHINE_FIELDS",
         "EXPECTED_DEPS",
+        "HUMAN_WORK_IDS",
         "RECORD_ANCHORS",
         "LIFECYCLE_RECORD_MUTATIONS",
         "PUBLIC_PENDING_MUTATIONS",
@@ -179,11 +185,27 @@ EXPECTED_DEPS = {
     "W13": "W5,W7,W8,W9,W10,W11",
 }
 
+HUMAN_WORK_IDS = (
+    "W1",
+    "W2",
+    "W3",
+    "W4",
+    "W5",
+    "W6",
+    "W7",
+    "W8",
+    "W9",
+    "W10",
+    "W11",
+    "W12",
+    "W13",
+)
+
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 20 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 22 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -191,7 +213,7 @@ PUBLIC_PENDING_MUTATIONS = (
     ),
     (
         "docs/STATUS.md",
-        "Supported subset; bundles SPIKED, no artifacts",
+        "Supported (subset); bundles SPIKED, no artifacts",
         "Supported; bundles SHIPPED with runtime evidence",
         "docs/STATUS.md release row",
     ),
@@ -228,6 +250,18 @@ PRIMARY_ARTIFACT_PROSE_MUTATIONS = (
         "human x86_64 no-AVX2 contract",
     ),
 )
+
+EXACT_MACHINE_FIELDS = {
+    "lifecycle": "SPIKE",
+    "work_W12_policy": "optional-non-blocking",
+    "archive_claims": "pending",
+    "runtime_claims": "pending",
+    "required_anchor_paths": (
+        ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
+        ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
+        "docs/BENCHMARKS.md"
+    ),
+}
 
 
 def run_checker(root: Path) -> subprocess.CompletedProcess[str]:
@@ -418,6 +452,21 @@ class AcceptedDesignMutations(unittest.TestCase):
             "x86_64 baseline",
         )
 
+    def test_each_exact_machine_field_is_fail_closed(self) -> None:
+        for field, expected in EXACT_MACHINE_FIELDS.items():
+            with self.subTest(field=field), RepoCopy() as root:
+                mutate(
+                    root,
+                    self.SPEC,
+                    f"{field}={expected}",
+                    f"{field}=BROKEN",
+                )
+                result = run_checker(root)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn("expected", result.stdout + result.stderr)
+
 
 class WorkGraphMutations(unittest.TestCase):
     SPEC = ".agents/specs/release-binary-matrix.md"
@@ -436,6 +485,38 @@ class WorkGraphMutations(unittest.TestCase):
                 result = run_checker(root)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{work} dependencies", result.stdout + result.stderr)
+
+    def test_each_human_work_row_id_occurs_exactly_once(self) -> None:
+        for work in HUMAN_WORK_IDS:
+            with self.subTest(work=work, mutation="duplicate"), RepoCopy() as root:
+                path = root / self.SPEC
+                row = next(
+                    line
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.startswith(f"| {work} |")
+                )
+                mutate(root, self.SPEC, row, f"{row}\n{row}")
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("exactly once", result.stdout + result.stderr)
+
+        with self.subTest(mutation="missing"), RepoCopy() as root:
+            path = root / self.SPEC
+            row = next(
+                line
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("| W1 |")
+            )
+            mutate(root, self.SPEC, row)
+            result = run_checker(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("missing", result.stdout + result.stderr)
+
+        with self.subTest(mutation="unexpected"), RepoCopy() as root:
+            mutate(root, self.SPEC, "| W13 |", "| W14 |")
+            result = run_checker(root)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("unexpected", result.stdout + result.stderr)
 
     def test_optional_w12_does_not_block_w13(self) -> None:
         with RepoCopy() as root:

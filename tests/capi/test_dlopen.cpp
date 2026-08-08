@@ -39,6 +39,9 @@ using fn_complete = vllm_status (*)(vllm_engine*, const char*,
 using fn_complete_stream = vllm_status (*)(vllm_engine*, const char*,
                                            const vllm_sampling_params*,
                                            vllm_token_callback, void*);
+using fn_complete_tokens = vllm_status (*)(vllm_engine*, const int32_t*, int32_t,
+                                           const vllm_sampling_params*, int32_t*,
+                                           int32_t, int32_t*, vllm_completion*);
 using fn_request_submit = vllm_status (*)(vllm_engine*, const char*,
                                           const vllm_sampling_params*,
                                           vllm_token_callback, void*,
@@ -83,6 +86,7 @@ TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
   auto p_engine_free = Sym<fn_engine_free>(lib, "vllm_engine_free");
   auto p_complete = Sym<fn_complete>(lib, "vllm_complete");
   auto p_complete_stream = Sym<fn_complete_stream>(lib, "vllm_complete_stream");
+  auto p_complete_tokens = Sym<fn_complete_tokens>(lib, "vllm_complete_tokens");
   auto p_request_submit = Sym<fn_request_submit>(lib, "vllm_request_submit");
   auto p_request_cancel = Sym<fn_request_cancel>(lib, "vllm_request_cancel");
   auto p_request_wait = Sym<fn_request_wait>(lib, "vllm_request_wait");
@@ -103,6 +107,7 @@ TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
   CHECK(sp.repetition_penalty > 0.0f);  // a zeroed struct would be invalid.
   (void)p_complete;
   (void)p_complete_stream;
+  (void)p_complete_tokens;
   (void)p_request_submit;
   (void)p_request_cancel;
   (void)p_request_wait;

@@ -42385,3 +42385,138 @@ the GB10 speed recipe must move to the seam. (3) Server-arm numeric deltas
 disclosed above. (4) The CPU host-f32 GGUF arm is off the ABI (keep-quant is
 the gated arm). (5) /v1/videos job/status/content stay VideoJobStore-served
 (unchanged); no async-job C-ABI shape yet.
+
+## 2026-08-08 — ROW 7: Kimi-Linear FOLDED onto the shared paged runner (engine==CLI 128/128; golden 122/128 profile; speed residual named)
+<!-- state: 2026-08-08T05:00 -->
+`row/KIMI-RUNNER-FOLD` (#122), ARCH-ONE-SURFACE ROW 7 / kimi-linear.md §20.3→§21, task #281.
+The full digits and file:line map live in spec §21; the binding facts:
+
+- **B1**: `LoadHfConfig` synthesizes `layer_types` + GDN geometry from `linear_attn_config`
+  (additive; `runner.cpp` untouched) — the §20.3 runner ABORT is gone.
+- **B2/B3**: `KimiLinearModel::ForwardPaged` — KDA over the paged `gdn_state` group
+  (`KdaChunkPrefill` prefill / `KdaGatedDeltaRule` decode, conv in vLLM's chunk(3) layout);
+  NoPE-MLA latent through `ConcatAndCacheMla` with **`mla::ForwardMlaAttentionBlock` DEFAULT-ON**
+  (GB10-ruled: that arm reproduces the golden's 122/128 near-tie profile EXACTLY; the diagnostic
+  f64-island arm measured 111/128 = the §19 GPU M-tiling near-tie class, not a paging bug).
+- **B4**: engine loads the bf16-resident tower (`stage_on_load`, §13 recipe);
+  `vllm_complete_tokens` (ABI v13 after the #123 video-v12 rebase); `kimi_linear_gen` = thin `vllm.h` client; allowlist kimi row removed (merged ratchet 8 with #123's two minimax removals);
+  CLI reference leg preserved as env-gated `test_kimi_linear_fold_gate`.
+- **Gate A**: engine==CLI **128/128 BYTE-IDENTICAL** (p7 got-strings equal); vs golden **122/128**
+  (>=122 bound MET). SACRED re-run post-fold: 35B 315/315, 27B 235/235. CPU: paged suite 8/8·206
+  (logits byte-equal, mutation-verified ×4), ctest 351/351.
+- **The async-mirror catch**: round-1 engine leg diverged 9/128 — ForwardPaged embedded the host
+  ids the DEFAULT-ON async device mirror leaves stale; fixed by honoring `device_token_ids`
+  (RED-first CPU pin). ★ AUDIT RESIDUAL: models outside qwen3_5/kimi still ignore this field —
+  any of them served on GB10 through the async engine would hit the same divergence.
+- **SPEED (honest)**: server stream **19.0 tok/s wall** (48 tok incl. prefill+warmup — the
+  production-surface anchor) vs CLI 18.93 (reproduced) vs vLLM ~21 → ~0.90×, >= vLLM NOT met.
+  The example's two-length diffs (16.9 N=64; 9.8-11.5 N=16) ran the long leg first and cold, so
+  warmup pollutes the subtraction — measurement caveat recorded. Residual levers: device KDA decay
+  gate + beta (per-step host islands), grouped MoE via the shared seam, decode graph.
+- **Tokenizer**: Kimi ships tiktoken-only; converted to tokenizer.json via transformers
+  TikTokenConverter (round-trip verified) → `~/kimi-linear-engine-dir` for the engine/server legs;
+  a shippable-converter residual is noted.
+- **vLLM same-session re-measure: ABORTED BY BOX REBOOT** (util 0.82 + torch.compile/graph
+  capture pushed the unified pool below the floor at 00:25 — reproduces the §19 measured
+  box-safety violation; NOT retried per the safety mandate). Denominator stays the #111
+  recorded ~21 floor. Box recovered clean; worker auto-restored (--restart=always).
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 2 device dispatch repaired (PR #135; replaces #134)
+<!-- state: 2026-08-08T05:00 -->
+
+The H3 ABI-v12 fold introduced two literal `GetBackend(kCUDA)` calls in
+`src/vllm/multimodal/minimax_h3_video.cpp`, raising the shared-layer DSR from
+its immutable 32 floor to 34 and blocking unrelated main-based work. RED was
+captured with `check-device-leakage.py --report` (`kcuda=2`, exit 1).
+
+The repair keeps the public contract 0=CPU / 1=CUDA, validates that selector in
+`MiniMaxH3VideoDeviceType`, converts once to `vt::DeviceType`, and creates one
+queue through `GetBackend(device_type)`; the queue's device becomes the engine
+device. The fold test pins 0, 1 and both rejected values. GREEN locally:
+DSR=32 at the unchanged baseline, no allowlist added, and the checker mutation
+suite is 25/25. No GPU/download/benchmark/release-row work occurred.
+
+Honest pending gate: the from-scratch CPU build was stopped at the operator's
+request when the shared filesystem reached 100%; compile/fold/C-ABI/H3 tests
+are NOT locally claimed and must run in GitHub CI before merge.
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 8: explicit device selection through the ONE surface (`row/DEVICE-KNOB`, task #284)
+<!-- state: 2026-08-08T12:00 -->
+
+**What.** The smallest fold row: an embedder can now ASK for a device instead
+of inheriting the accelerator-first probe. Mirrors vLLM's `DeviceConfig.device`
+names (`${VLLM_SOURCE}/vllm/config/device.py:13` `Device = Literal["auto",
+"cuda", "cpu", ...]`; explicit assignment is VERBATIM, never substituted,
+device.py:61-66; upstream's `--device` CLI flag itself was removed in v0.10,
+`bc8a8ce5e`, so the ABI field mirrors the surviving config surface).
+
+- W1 ABI: `vllm_model_params.device` appended (int32, 0=auto/1=cpu/2=cuda —
+  0 MUST be auto for the zero-value contract; cpu-before-cuda follows the v12
+  `vllm_video_model_params.device` precedent shifted by the auto slot).
+  `VLLM_ABI_VERSION` -> 14 per the operator's version-collision correction
+  (#122 Kimi `vllm_complete_tokens` reconciles to v13 at its landing; this
+  branch pre-rebase shows v12 -> v14 with the gap named in the changelog).
+  Floor pin advanced to `>= 14` (the #121 == lesson). New
+  `include/vllm/config/device.h` + `src/vllm/config/device.cpp`
+  (`vllm::Device`, `DeviceFromString`, `DeviceName`), ported from
+  vllm/config/device.py @ 555967922.
+- W2 plumb: `EngineParams::device` -> `SelectQueue(architecture, device)`.
+  Explicit arms route through `LoadedEngine::ResolveExplicitDeviceType(device,
+  cuda_platform_registered)` — pure, so the CPU tier gates the full matrix
+  including "explicit cpu beats a REGISTERED accelerator". Explicit cpu never
+  consults the probe; explicit cuda requires the registered kCUDA platform
+  (cuda.cpp Registrar == usable GPU) and THROWS the pinned message otherwise;
+  queue-creation failure on the explicit arm PROPAGATES (no try/catch), unlike
+  the auto arm's byte-identical catch-and-fall-back. `FromModelDir` resolves
+  an explicit device BEFORE any path/config I/O (mirror of DeviceConfig
+  resolving at config time, arg_utils.py:1878), so the device error is never
+  masked by a path error — which is also what makes the capi plumb pinnable
+  with no loadable checkpoint. capi validates 0/1/2 (else
+  VLLM_ERR_INVALID_ARGUMENT) and refuses explicit cuda on the CPU-hosted
+  transcription stack instead of silently downgrading.
+- W3 thin clients: `--device auto|cpu|cuda` on `vllm-cli` (ABI field only,
+  local name->int map) and `examples/server` (`vllm::DeviceFromString` ->
+  `EngineParams.device`; `--video-device` untouched — separate engine,
+  separate checkpoint, may legitimately differ).
+- W5 (the #123 review's 3 MINORS, closed): c_header_compile.c now actually
+  references the v11 transcription + v12 video entry points + the v14 field
+  (its "references every ABI entry point" claim went stale at v10); the v12
+  changelog block moved to chronological position (after v11); the H3 fold
+  fixture's flag list gained `--keep-quant` (matches test:85 + the capture).
+
+**Gates.** Full CPU build -Werror clean (fresh tree). test_capi 44 cases
+(4 new v14 + floor >= 14) green; test_loaded_engine_dense +3 device cases
+green; test_dlopen green; test_openai_api_server + the new explicit-cpu
+serving smoke green; test_minimax_h3_video_fold green (vllm.h touched);
+test_model_loader_gguf + test_platform green. check-surface-coverage green
+(capability row added, ratchet UNTOUCHED — 8 after the #122 rebase below;
+9 at first write). STATUS ratchet: paid for the
+new line by removing a stale back-to-back merge DUPLICATE of the metrics
+narrative (nothing lost), ratchet 279200 -> 279150 (measured 279108).
+
+**Mutation kills (each RED then reverted).** M1 default device=2 ->
+zero-contract 3 fails; M2 capi 0->kCUDA -> zero-contract bogus-path arm RED
+(the auto arm must report the PATH, not a device); M3 range validation
+dropped -> range test 6 fails; M4 capi drops the device=2 mapping -> plumb
+pin RED; M5 FromModelDir early resolve removed -> capi plumb pin + the
+device-before-path test both RED; M6 ctor passes kAuto -> EngineParams-seam
+ctor-throw arm RED; M7 SelectQueue explicit arm catch-and-fallback -> same
+test RED; M8 policy hands explicit-cpu to a registered accelerator -> matrix
+RED; M9 DeviceFromString "cuda"->kCPU -> parse test RED; M10 ABI macro left
+at 12 -> floor pin RED. Not uniquely killable (disclosed): the api_server
+smoke (same seams as M6-M8), c_header_compile (a compile-time reference),
+the two doc-only minors.
+
+**Residuals (honest).** (1) CUDA-build A/B — auto->CUDA vs explicit-cpu->CPU
+vs explicit-cuda->CUDA on a GPU box — not run (no dgx in scope); the CPU tier
+pins that half via the pure matrix. (2) The 0-as-explicit-cpu vs 0-as-auto
+distinction is behaviorally invisible on a CPU-only tier at the queue level;
+pinned structurally (matrix + the bogus-path capi arm) and named for the
+CUDA-build pass. (3) EXECUTED post-#122 (9f772cad): rebased onto main — v14 sits
+on v13 (changelog now v10..v14 chronological, the minor-#2 v12 move kept),
+c_header_compile composes main's `vllm_complete_tokens` reference with the
+v14 field, floor pin stays >= 14, allowlist ratchet inherited at 8, keyed
+records main-wholesale + these rows re-applied. (4) Explicit
+names for xpu/vulkan/metal/rocm are additive later; auto reaches them today.
+(5) The transcription stack refuses explicit cuda (CPU pipeline) — revisit
+when an accelerated transcription path exists.
