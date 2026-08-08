@@ -308,6 +308,15 @@ void detail::ValidateGdnAttentionMetadata(
   }
   VT_CHECK(prefill_qsl.back() == np_tok,
            "qwen3_5: prefill query offsets must span prefill tokens");
+  VT_CHECK(metadata.batch_ptr.has_value() &&
+               metadata.token_chunk_offset_ptr.has_value(),
+           "qwen3_5: missing exact causal-conv chunk metadata");
+  const v1::CausalConv1dMetadata expected_conv =
+      v1::ComputeCausalConv1dMetadata(full_qsl);
+  VT_CHECK(*metadata.batch_ptr == expected_conv.batch_ptr &&
+               *metadata.token_chunk_offset_ptr ==
+                   expected_conv.token_chunk_offset_ptr,
+           "qwen3_5: causal-conv chunk metadata does not exactly cover query offsets");
 }
 
 bool detail::CanUseGdnDecodeGraphSize(int64_t real_batch,
@@ -3198,6 +3207,9 @@ struct StepDevInputs {
   DBuf gdn_prefill_qsl;        // i32 [num_prefills+1]
   DBuf gdn_prefill_has_initial;  // i8 [num_prefills]
   bool has_gdn_prefill_meta = false;
+  DBuf gdn_conv_batch_ptr;  // i32 [num exact conv programs]
+  DBuf gdn_conv_token_chunk_offsets;  // i32 [num exact conv programs]
+  bool has_gdn_conv_chunks = false;
   bool indexed_gdn_state_io = false;
   // ── Spec-decode device tensors (SPEC-MTP I5a). Uploaded ONCE per step (shared
   // by every GDN layer's spec branch), only when the step carries drafts
@@ -3260,6 +3272,9 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
       DBuf(d, DType::kI32, {1}),  // prefill qsl stub
       DBuf(d, DType::kI8, {1}),   // prefill has-initial stub
       false,
+      DBuf(d, DType::kI32, {1}),  // exact conv batch-ptr stub
+      DBuf(d, DType::kI32, {1}),  // exact conv chunk-offset stub
+      false,
       indexed_state_io,
       DBuf(d, DType::kI32, {1}),  // spec state-idx stub
       DBuf(d, DType::kI32, {1}),  // spec qsl stub
@@ -3314,6 +3329,17 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
         {static_cast<int64_t>(gm.prefill_has_initial_state->size())},
         gm.prefill_has_initial_state->data());
     s.has_gdn_prefill_meta = true;
+  }
+  if (gm.num_prefills > 0 && gm.batch_ptr.has_value() &&
+      gm.token_chunk_offset_ptr.has_value()) {
+    s.gdn_conv_batch_ptr = DBuf(
+        d, DType::kI32, {static_cast<int64_t>(gm.batch_ptr->size())},
+        gm.batch_ptr->data());
+    s.gdn_conv_token_chunk_offsets = DBuf(
+        d, DType::kI32,
+        {static_cast<int64_t>(gm.token_chunk_offset_ptr->size())},
+        gm.token_chunk_offset_ptr->data());
+    s.has_gdn_conv_chunks = true;
   }
   // ── Spec-decode tensor upload (SPEC-MTP I5a). The six device tensors the GDN
   // spec branch of GdnBlockPaged reads (mirror qwen_gdn_linear_attn.py:
@@ -3491,11 +3517,17 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   }
   DBuf dconv_ns(d, convdt, {nns_tok, conv_dim});
   {
+    VT_CHECK(sdi.has_gdn_conv_chunks,
+             "gdn paged mixed spec: exact causal-conv chunks must be uploaded");
+    Tensor conv_batch_ptr = sdi.gdn_conv_batch_ptr.t();
+    Tensor conv_chunk_offsets = sdi.gdn_conv_token_chunk_offsets.t();
+    vt::CausalConv1dArgs conv_args{true, &conv_batch_ptr,
+                                   &conv_chunk_offsets};
     DBuf dcs(d, DType::kF32, {np, conv_dim, Kw - 1});
     vt::GdnStateGather(d.q, dcs.t(), state.conv_state, sdi.gdn_state_idx.t());
     vt::CausalConv1dFwd(d.q, dconv_ns.t(), mixed_ns.t(), dcw, nullptr, dcs.t(),
                         sdi.gdn_non_spec_qsl.t(), sdi.gdn_has_initial.t(),
-                        vt::CausalConv1dArgs{true});
+                        conv_args);
     Tensor conv_cache = state.conv_state;
     vt::GdnStateScatter(d.q, conv_cache, dcs.t(), sdi.gdn_state_idx.t());
   }
@@ -3749,6 +3781,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // cache on CUDA → upcast; f32 cache on CPU → direct), run the f32
     // CausalConv1dFwd, then downcast + scatter back to the cache.
     const std::vector<int64_t> cs_shape = {nreq, conv_dim, Kw - 1};
+    VT_CHECK(sdi.has_gdn_conv_chunks,
+             "gdn paged: exact causal-conv chunks must be uploaded");
+    Tensor conv_batch_ptr = sdi.gdn_conv_batch_ptr.t();
+    Tensor conv_chunk_offsets = sdi.gdn_conv_token_chunk_offsets.t();
+    vt::CausalConv1dArgs conv_args{true, &conv_batch_ptr,
+                                   &conv_chunk_offsets};
     if (indexed_state_io) {
       VT_CHECK(sdi.has_gdn_idx && sdi.has_gdn_prefill_meta,
                "indexed GDN conv requires persistent non-spec metadata");
@@ -3758,7 +3796,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       vt::CausalConv1dFwd(d.q, dconv.t(), mixed, dcw, nullptr,
                           dcs.t(), sdi.gdn_non_spec_qsl.t(),
                           sdi.gdn_has_initial.t(),
-                          vt::CausalConv1dArgs{true});
+                          conv_args);
       Tensor conv_cache = state.conv_state;
       vt::GdnStateScatter(d.q, conv_cache, dcs.t(),
                           sdi.gdn_state_idx.t());
@@ -3772,7 +3810,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       DBuf dhis(d, DType::kI32, {nreq}, his.data());
       vt::CausalConv1dFwd(d.q, dconv.t(), mixed, dcw, nullptr,
                           dcs.t(), dqsl.t(), dhis.t(),
-                          vt::CausalConv1dArgs{true});
+                          conv_args);
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
     }
   } else {
@@ -5781,6 +5819,9 @@ StepDevInputs BuildFullAttnStepDevInputs(Dev d,
       DBuf(d, DType::kI32, {1}),  // gdn_prefill_qsl stub
       DBuf(d, DType::kI8, {1}),   // gdn_prefill_has_initial stub
       false,                       // has_gdn_prefill_meta
+      DBuf(d, DType::kI32, {1}),  // gdn_conv_batch_ptr stub
+      DBuf(d, DType::kI32, {1}),  // gdn_conv_token_chunk_offsets stub
+      false,                       // has_gdn_conv_chunks
       false,                       // indexed_gdn_state_io (no GDN layers)
       DBuf(d, DType::kI32, {1}),  // gdn_spec_state_idx stub
       DBuf(d, DType::kI32, {1}),  // gdn_spec_qsl stub
@@ -7135,6 +7176,10 @@ static std::vector<int32_t> VLGenerateCoreGdn(
     g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(qlen)};
     g.prefill_state_indices = std::vector<int32_t>{0};
     g.prefill_has_initial_state = std::vector<uint8_t>{0};
+    const v1::CausalConv1dMetadata conv =
+        v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
+    g.batch_ptr = conv.batch_ptr;
+    g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
     return g;
   };
   auto gdn_decode_meta = [&]() {
@@ -7565,6 +7610,8 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
   gm_out.prefill_query_start_loc.reset();
   gm_out.prefill_state_indices.reset();
   gm_out.prefill_has_initial_state.reset();
+  gm_out.batch_ptr.reset();
+  gm_out.token_chunk_offset_ptr.reset();
   (void)B;
 }
 
@@ -7792,6 +7839,9 @@ struct Qwen3_5DecodeGraph::Impl {
       CopyInPlace(gdn_meta.prefill_query_start_loc, gm.prefill_query_start_loc);
       CopyInPlace(gdn_meta.prefill_state_indices, gm.prefill_state_indices);
       CopyInPlace(gdn_meta.prefill_has_initial_state, gm.prefill_has_initial_state);
+      CopyInPlace(gdn_meta.batch_ptr, gm.batch_ptr);
+      CopyInPlace(gdn_meta.token_chunk_offset_ptr,
+                  gm.token_chunk_offset_ptr);
       gdn_meta.num_prefills = gm.num_prefills;
       gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
       gdn_meta.num_decodes = gm.num_decodes;
@@ -8110,6 +8160,9 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       CopyInPlace(gdn_meta.prefill_query_start_loc, gm.prefill_query_start_loc);
       CopyInPlace(gdn_meta.prefill_state_indices, gm.prefill_state_indices);
       CopyInPlace(gdn_meta.prefill_has_initial_state, gm.prefill_has_initial_state);
+      CopyInPlace(gdn_meta.batch_ptr, gm.batch_ptr);
+      CopyInPlace(gdn_meta.token_chunk_offset_ptr,
+                  gm.token_chunk_offset_ptr);
       gdn_meta.num_prefills = gm.num_prefills;
       gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
       gdn_meta.num_decodes = gm.num_decodes;

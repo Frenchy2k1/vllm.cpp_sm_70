@@ -18,6 +18,7 @@
 #include "vt/cuda/gdn_prefill_conv.h"
 
 using vt::cuda::ConvRegFlagIsOn;
+using vt::cuda::ConvExactChunksFlagIsOn;
 using vt::cuda::GdnPostConvFastFlagIsOn;
 using vt::cuda::GdnPostConvSplitFlagIsOn;
 
@@ -38,6 +39,15 @@ TEST_CASE("VT_CONV_REG defaults ON; only a '0'-leading value rolls back") {
   CHECK_FALSE(ConvRegFlagIsOn("0"));
   CHECK_FALSE(ConvRegFlagIsOn("0abc"));
   CHECK_FALSE(ConvRegFlagIsOn("00"));
+}
+
+TEST_CASE("VT_CONV_EXACT_CHUNKS defaults ON; only a '0'-leading value rolls back") {
+  CHECK(ConvExactChunksFlagIsOn(nullptr));
+  CHECK(ConvExactChunksFlagIsOn(""));
+  CHECK_FALSE(ConvExactChunksFlagIsOn("0"));
+  CHECK_FALSE(ConvExactChunksFlagIsOn("0abc"));
+  CHECK(ConvExactChunksFlagIsOn("1"));
+  CHECK(ConvExactChunksFlagIsOn("on"));
 }
 
 TEST_CASE("VT_GDN_POSTCONV_SPLIT defaults OFF (opt-in); a non-'0' value enables it") {

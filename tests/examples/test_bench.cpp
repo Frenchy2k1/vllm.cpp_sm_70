@@ -1,5 +1,5 @@
 // Smoke test for the M2.1 benchmark harness (examples/bench/bench_core.h): drive
-// the SYNTHETIC CPU engine through the full admission + step() measurement loop
+// the SYNTHETIC CPU engine through the production AsyncLLM measurement loop
 // and assert it produces sane metrics. The NUMBERS are meaningless (toy weights)
 // — this asserts the HARNESS: all N requests finish, throughput > 0, TTFT > 0,
 // and the token accounting is coherent. The real parity numbers come from a GB10
@@ -25,6 +25,12 @@ TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {
   cfg.temperature = 0.0;  // greedy => deterministic, exactly output_len tokens.
 
   const BenchResult r = RunBench(cfg);
+
+  // The comparison harness must exercise the production AsyncLLM frontend.
+  // Before the SERVE-CLI-BENCH B1 repair it called synchronous
+  // LoadedEngine::engine() even when async scheduling resolved enabled.
+  CHECK(r.async_frontend);
+  CHECK(r.max_concurrent_batches >= 1);
 
   // All N requests finished through the engine loop.
   CHECK(r.completed == cfg.num_prompts);
