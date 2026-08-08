@@ -75,18 +75,32 @@ void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_u
 
 }  // namespace
 
+// Ensure FP8 expert has BF16 cache filled (idempotent).
+void EnsureGemma4Fp8ExpertCached(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H) {
+  if (!ex.cached_gu.empty() && !ex.cached_dn.empty() &&
+      static_cast<int64_t>(ex.cached_gu.size()) == 2 * I * H &&
+      static_cast<int64_t>(ex.cached_dn.size()) == H * I) {
+    return;
+  }
+  ex.cached_gu.resize(static_cast<size_t>(2 * I * H));
+  ex.cached_dn.resize(static_cast<size_t>(H * I));
+  DequantFp8ChannelToBf16(ex.gate_w.bytes.data(),
+                          reinterpret_cast<const uint16_t*>(ex.gate_s.bytes.data()), I, H,
+                          ex.cached_gu.data());
+  DequantFp8ChannelToBf16(ex.up_w.bytes.data(),
+                          reinterpret_cast<const uint16_t*>(ex.up_s.bytes.data()), I, H,
+                          ex.cached_gu.data() + I * H);
+  DequantFp8ChannelToBf16(ex.down_w.bytes.data(),
+                          reinterpret_cast<const uint16_t*>(ex.down_s.bytes.data()), H, I,
+                          ex.cached_dn.data());
+}
+
 void DequantGemma4Fp8ExpertToBf16(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H,
                                   uint16_t* gate_up_out, uint16_t* down_out) {
   VT_CHECK(gate_up_out && down_out, "fp8 expert dequant null out");
-  DequantFp8ChannelToBf16(ex.gate_w.bytes.data(),
-                          reinterpret_cast<const uint16_t*>(ex.gate_s.bytes.data()), I, H,
-                          gate_up_out);
-  DequantFp8ChannelToBf16(ex.up_w.bytes.data(),
-                          reinterpret_cast<const uint16_t*>(ex.up_s.bytes.data()), I, H,
-                          gate_up_out + I * H);
-  DequantFp8ChannelToBf16(ex.down_w.bytes.data(),
-                          reinterpret_cast<const uint16_t*>(ex.down_s.bytes.data()), H, I,
-                          down_out);
+  EnsureGemma4Fp8ExpertCached(ex, I, H);
+  std::memcpy(gate_up_out, ex.cached_gu.data(), ex.cached_gu.size() * sizeof(uint16_t));
+  std::memcpy(down_out, ex.cached_dn.data(), ex.cached_dn.size() * sizeof(uint16_t));
 }
 
 Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
@@ -148,9 +162,6 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
   const auto* dn_host =
       ex.down.Empty() ? nullptr : reinterpret_cast<const uint16_t*>(ex.down.bytes.data());
 
-  std::vector<uint16_t> fp8_gu(static_cast<size_t>(gu_stride));
-  std::vector<uint16_t> fp8_dn(static_cast<size_t>(dn_stride));
-
   DBuf acc(d, DType::kBF16, {T, H});
   acc.Zero(d);
 
@@ -191,9 +202,9 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             static_cast<const uint16_t*>(ex.down_dev) + static_cast<int64_t>(e) * dn_stride;
         ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
       } else if (ex.is_fp8) {
-        DequantGemma4Fp8ExpertToBf16(ex.fp8[static_cast<size_t>(e)], I, H, fp8_gu.data(),
-                                     fp8_dn.data());
-        ExpertGeGLUHost(d, y, xin.t(), fp8_gu.data(), fp8_dn.data(), I, H);
+        const auto& fex = ex.fp8[static_cast<size_t>(e)];
+        EnsureGemma4Fp8ExpertCached(fex, I, H);
+        ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H);
       } else {
         ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
                         dn_host + static_cast<int64_t>(e) * dn_stride, I, H);
