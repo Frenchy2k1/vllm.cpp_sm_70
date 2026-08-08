@@ -21,7 +21,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Kimi-Linear-48B | **ROW 7 fold LANDS (#122 §21): engine==CLI 128/128; golden 122/128; SACRED green; v13 tokens ABI** | ACTIVE: 19.0 tok/s vs vLLM ~21 (~0.90×) |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| RPi5 A76 CPU | **R3 GREEN**: 16/16 x86-token exact, PMU | Q8 dot 20.1% cycles; SDOT then asm A/B |
+| RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec, RSS -24% | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |

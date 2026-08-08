@@ -39569,6 +39569,154 @@ AAPCS64 implementation in one QEMU-built binary, using the portable checksums,
 PMU fixture and full-model run as recursive gates. No speedup or llama.cpp
 parity is claimed at this checkpoint.
 
+## 2026-08-06T17:50 - KERNEL-CPU-A76-Q8-DOT spiked
+<!-- state: 2026-08-06T17:50 -->
+
+R3's zero-loss physical-Pi trace selects the portable Q8_0 x Q8_0 dot as the
+first assembly candidate: it consumes 20.10% of Qwen3.5-2B user cycles on a
+Cortex-A76 with DotProd but no i8mm. New row `KERNEL-CPU-A76-Q8-DOT` and spike
+`.agents/specs/cpu-a76-q8-dot.md` bind the comparison to three same-binary arms:
+portable scalar, exact-order compiler SDOT, and scheduled AAPCS64 assembly.
+
+The assembly arm is not accepted merely for using SDOT or beating scalar. It
+must beat the C++ intrinsic in physical-Pi cycles and wall time with identical
+operation checksums and model tokens, a proven ABI/disassembly contract, and no
+enclosing Qwen regression. QEMU remains build/smoke-only and source will not be
+compiled on the Pi. No optimized implementation or speed claim exists at this
+spike checkpoint.
+
+## 2026-08-06T17:50 - KERNEL-CPU-A76-Q8-DOT spiked
+<!-- state: 2026-08-06T17:50 -->
+
+R3's zero-loss physical-Pi trace selects the portable Q8_0 x Q8_0 dot as the
+first assembly candidate: it consumes 20.10% of Qwen3.5-2B user cycles on a
+Cortex-A76 with DotProd but no i8mm. New row `KERNEL-CPU-A76-Q8-DOT` and spike
+`.agents/specs/cpu-a76-q8-dot.md` bind the comparison to three same-binary arms:
+portable scalar, exact-order compiler SDOT, and scheduled AAPCS64 assembly.
+
+The assembly arm is not accepted merely for using SDOT or beating scalar. It
+must beat the C++ intrinsic in physical-Pi cycles and wall time with identical
+operation checksums and model tokens, a proven ABI/disassembly contract, and no
+enclosing Qwen regression. QEMU remains build/smoke-only and source will not be
+compiled on the Pi. No optimized implementation or speed claim exists at this
+spike checkpoint.
+
+## 2026-08-06T19:45 - KERNEL-CPU-A76-Q8-DOT R4-R5 assembly win
+<!-- state: 2026-08-06T19:45 -->
+
+`CLAIM-KERNEL-CPU-A76-Q8-DOT` closes W1-W5 and moves the kernel row from
+`SPIKE` to `GATING`. ARM64 was never compiled on the Pi: local buildx/QEMU
+with Ubuntu 24.04/GCC 13.3 built the assembly TU, ran `test_ops_quant_dot`
+20/20 (150,258 assertions) and executed an explicit assembly smoke before
+export. Final binary SHA-256 values are `vllm-bench`
+`9eb57cf3760eaade9dcef03dda1648556577c44199369ad38bf42083efbc70a9`
+and `vllm-cpu-kernel-bench`
+`a94dad30411651901e4f6ed8aaf14efb735e09f0412bb8f8788873fdfd7a6818`.
+
+The implementation keeps the portable Q8_0 dot as the universal fallback,
+adds a GCC/ACLE exact-order SDOT control, and adds an AAPCS64 two-block leaf.
+Linux HWCAP gates DotProd; MIDR implementer `0x41`, part `0xd0b` gates the
+automatic assembly selection. Only `cpu_quant_dot_sdot.cpp` receives
+`-march=armv8.2-a+dotprod+fp16`. Explicit benchmark overrides remain available
+through `VT_CPU_Q8_DOT=portable|sdot|a76-asm`; `auto` selects assembly only on
+Cortex-A76+DotProd and otherwise stays portable.
+
+Final disassembly proves the compiler gap. GCC's 216-byte `VecDotQ8Sdot` has a
+48-byte stack frame and a one-block loop whose two adjacent SDOTs feed one
+dependent accumulator. The 276-byte assembly valid path is a leaf with no
+stack traffic, overlaps two independent `v4`/`v20` block chains, post-indexes
+the 68-byte Q8 pair, uses only caller-saved registers and retains original
+per-block f32 accumulation order. Invalid K/`nrc` tail-branches to the C++
+contract checker.
+
+Physical-Pi evidence is one same-binary interleaved series per shape, seven
+outer repetitions per arm, ondemand up to 2.4 GHz and `throttled=0x0`.
+Assembly versus compiler SDOT medians: M=1/T1 614,414.75 vs 637,738.5 ns
+(**+3.66%**), cycles 1,469,048 vs 1,517,121 and instructions 3,664,537.5 vs
+4,076,185.5; M=128/T1 75,537,409 vs 79,579,829 ns (**+5.08%**); M=128/T4
+19,887,768 vs 20,649,426 ns (**+3.69%**). Retired instructions fall
+9.74-10.24%. The named negative is M=1/T4, 480,210 vs 468,798.25 ns
+(**-2.43%**) and 4.32% more cycles despite 8.77% fewer instructions,
+selecting the threadpool partition as W6
+rather than hiding it.
+
+All portable/compiler/assembly fixture arms are checksum-identical. The three
+64-token Qwen repetitions for each arm are also byte-identical to the x86
+golden SHA-256
+`0ec98eabb23e4148d540fcf79a2fe61678fb90fe462cdf28134af7a42fe6a826`.
+Median assembly versus compiler SDOT: TTFT 1,307.27 vs 1,327.91 ms
+(**1.55% lower**), TPOT 367.67 vs 367.85 ms (0.05% lower, neutral), E2E
+24,470.20 vs 24,502.52 ms (**0.13% lower**). Against portable, assembly
+lowers TTFT 33.40%, E2E 2.67% and raises output throughput 2.75%. A final
+`auto` 16-token run selected assembly, matched the original x86 golden and
+reported TTFT 1,305.62 ms / TPOT 362.63 ms / E2E 6,745.08 ms without
+throttling.
+
+Binding commands, all raw-file SHA-256 values, the four shape tables and
+disassembly excerpts are indexed at
+`docs/bench-evidence/rpi5-a76-q8-dot-20260806.md`. W6 remains open for the
+M=1/T4 scheduler interaction, the still-dominant BF16 GEMM, peak memory,
+concurrency and the same-file Pi llama.cpp floor. No Pi competitor-parity
+claim is made.
+
+## 2026-08-06T19:45 - KERNEL-CPU-A76-Q8-DOT R4-R5 assembly win
+<!-- state: 2026-08-06T19:45 -->
+
+`CLAIM-KERNEL-CPU-A76-Q8-DOT` closes W1-W5 and moves the kernel row from
+`SPIKE` to `GATING`. ARM64 was never compiled on the Pi: local buildx/QEMU
+with Ubuntu 24.04/GCC 13.3 built the assembly TU, ran `test_ops_quant_dot`
+20/20 (150,258 assertions) and executed an explicit assembly smoke before
+export. Final binary SHA-256 values are `vllm-bench`
+`9eb57cf3760eaade9dcef03dda1648556577c44199369ad38bf42083efbc70a9`
+and `vllm-cpu-kernel-bench`
+`a94dad30411651901e4f6ed8aaf14efb735e09f0412bb8f8788873fdfd7a6818`.
+
+The implementation keeps the portable Q8_0 dot as the universal fallback,
+adds a GCC/ACLE exact-order SDOT control, and adds an AAPCS64 two-block leaf.
+Linux HWCAP gates DotProd; MIDR implementer `0x41`, part `0xd0b` gates the
+automatic assembly selection. Only `cpu_quant_dot_sdot.cpp` receives
+`-march=armv8.2-a+dotprod+fp16`. Explicit benchmark overrides remain available
+through `VT_CPU_Q8_DOT=portable|sdot|a76-asm`; `auto` selects assembly only on
+Cortex-A76+DotProd and otherwise stays portable.
+
+Final disassembly proves the compiler gap. GCC's 216-byte `VecDotQ8Sdot` has a
+48-byte stack frame and a one-block loop whose two adjacent SDOTs feed one
+dependent accumulator. The 276-byte assembly valid path is a leaf with no
+stack traffic, overlaps two independent `v4`/`v20` block chains, post-indexes
+the 68-byte Q8 pair, uses only caller-saved registers and retains original
+per-block f32 accumulation order. Invalid K/`nrc` tail-branches to the C++
+contract checker.
+
+Physical-Pi evidence is one same-binary interleaved series per shape, seven
+outer repetitions per arm, ondemand up to 2.4 GHz and `throttled=0x0`.
+Assembly versus compiler SDOT medians: M=1/T1 614,414.75 vs 637,738.5 ns
+(**+3.66%**), cycles 1,469,048 vs 1,517,121 and instructions 3,664,537.5 vs
+4,076,185.5; M=128/T1 75,537,409 vs 79,579,829 ns (**+5.08%**); M=128/T4
+19,887,768 vs 20,649,426 ns (**+3.69%**). Retired instructions fall
+9.74-10.24%. The named negative is M=1/T4, 480,210 vs 468,798.25 ns
+(**-2.43%**) and 4.32% more cycles despite 8.77% fewer instructions,
+selecting the threadpool partition as W6
+rather than hiding it.
+
+All portable/compiler/assembly fixture arms are checksum-identical. The three
+64-token Qwen repetitions for each arm are also byte-identical to the x86
+golden SHA-256
+`0ec98eabb23e4148d540fcf79a2fe61678fb90fe462cdf28134af7a42fe6a826`.
+Median assembly versus compiler SDOT: TTFT 1,307.27 vs 1,327.91 ms
+(**1.55% lower**), TPOT 367.67 vs 367.85 ms (0.05% lower, neutral), E2E
+24,470.20 vs 24,502.52 ms (**0.13% lower**). Against portable, assembly
+lowers TTFT 33.40%, E2E 2.67% and raises output throughput 2.75%. A final
+`auto` 16-token run selected assembly, matched the original x86 golden and
+reported TTFT 1,305.62 ms / TPOT 362.63 ms / E2E 6,745.08 ms without
+throttling.
+
+Binding commands, all raw-file SHA-256 values, the four shape tables and
+disassembly excerpts are indexed at
+`docs/bench-evidence/rpi5-a76-q8-dot-20260806.md`. W6 remains open for the
+M=1/T4 scheduler interaction, the still-dominant BF16 GEMM, peak memory,
+concurrency and the same-file Pi llama.cpp floor. No Pi competitor-parity
+claim is made.
+
 ## 2026-08-06T20:30 - H3 render-coherence ROOT-CAUSED by latent bisection: VAE is FINE (round-trip coherent), the DiT emits a spatially-WHITE latent at real geometry
 <!-- state: 2026-08-06T20:30 -->
 
@@ -39690,6 +39838,64 @@ full canvas, real per-token timesteps) is fed with RANDOM data in the harness; a
 real-weights activation diff of the DiT inputs at real geometry is the untested
 surface #70 did not isolate. Pre-existing preflight red
 (check-fusion-consistency minimax_h3_video_vae_device) is NOT this row's.
+
+## 2026-08-06 — RPi5 same-file llama.cpp floor measured
+<!-- state: 2026-08-06T21:30 -->
+
+The four-core Cortex-A76 lane now has its independent same-file competitor
+result. Official llama.cpp tag b9892 (`ee445f93d`) was built locally for
+AArch64 under QEMU with GCC 13.3, DotProd+FP16, OpenMP and no accelerator
+backend, then copied to the execution-only Pi. The historical project object
+`237ad9b96` is unavailable from both recorded remotes; b9892's Q8/Arm/repack
+and Qwen3.5 line anchors match the project record exactly, and the binding
+evidence records this reconstruction plus the actual binary SHA.
+
+The vllm.cpp nominal input length 16 tokenized to 17 tokens. Three clean
+vllm.cpp reps and llama.cpp pp17/tg64/pp17+tg64 (three timed samples after
+warmups) were all unthrottled. Medians/means: vllm.cpp prefill 12.81 tok/s,
+decode 2.55 tok/s, output-equivalent E2E 2.46 tok/s, E2E 26,018.39 ms;
+llama.cpp 27.77 / 3.91 / 3.77 tok/s, E2E 16,998.49 ms. Ratios are 0.461x
+prefill and 0.653x decode/E2E, so the Pi speed floor is NOT MET. vllm.cpp wins
+peak RSS, 2.841 vs 3.747 GiB (24.2% less). A separate same-text 64-token greedy
+CLI check is byte-identical after trailing-newline normalization, SHA-256
+`a5a630d7e9774c2300f5dda67a085d43ab1cf9125480c37208ae1c24a2eb25e0`.
+
+An initial `/proc` sampler that forked two `awk` processes every 50 ms is
+explicitly VOID because it inflated load and slowed both arms. Accepted
+throughput ran with no sampler; RSS ran separately with a once-per-second
+shell-builtin `VmHWM` reader. Full commands, samples, pins and raw hashes are
+in `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`. R6 now owns a measured
+2.17x prefill / 1.53x decode speed gap, with fresh cross-engine profiling and
+the already-dominant BF16 GEMM first; M1/T4 and concurrency remain open.
+
+## 2026-08-06 — RPi5 same-file llama.cpp floor measured
+<!-- state: 2026-08-06T21:30 -->
+
+The four-core Cortex-A76 lane now has its independent same-file competitor
+result. Official llama.cpp tag b9892 (`ee445f93d`) was built locally for
+AArch64 under QEMU with GCC 13.3, DotProd+FP16, OpenMP and no accelerator
+backend, then copied to the execution-only Pi. The historical project object
+`237ad9b96` is unavailable from both recorded remotes; b9892's Q8/Arm/repack
+and Qwen3.5 line anchors match the project record exactly, and the binding
+evidence records this reconstruction plus the actual binary SHA.
+
+The vllm.cpp nominal input length 16 tokenized to 17 tokens. Three clean
+vllm.cpp reps and llama.cpp pp17/tg64/pp17+tg64 (three timed samples after
+warmups) were all unthrottled. Medians/means: vllm.cpp prefill 12.81 tok/s,
+decode 2.55 tok/s, output-equivalent E2E 2.46 tok/s, E2E 26,018.39 ms;
+llama.cpp 27.77 / 3.91 / 3.77 tok/s, E2E 16,998.49 ms. Ratios are 0.461x
+prefill and 0.653x decode/E2E, so the Pi speed floor is NOT MET. vllm.cpp wins
+peak RSS, 2.841 vs 3.747 GiB (24.2% less). A separate same-text 64-token greedy
+CLI check is byte-identical after trailing-newline normalization, SHA-256
+`a5a630d7e9774c2300f5dda67a085d43ab1cf9125480c37208ae1c24a2eb25e0`.
+
+An initial `/proc` sampler that forked two `awk` processes every 50 ms is
+explicitly VOID because it inflated load and slowed both arms. Accepted
+throughput ran with no sampler; RSS ran separately with a once-per-second
+shell-builtin `VmHWM` reader. Full commands, samples, pins and raw hashes are
+in `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`. R6 now owns a measured
+2.17x prefill / 1.53x decode speed gap, with fresh cross-engine profiling and
+the already-dominant BF16 GEMM first; M1/T4 and concurrency remain open.
 
 ## 2026-08-06T21:45 - QUANT-CT-MXFP4-FLASH-OCCUPANCY: the owed matched-c8 flash ncu diff - occupancy is IDENTICAL (8.33%), the gap is an irreducible-for-us ptxas SASS-scheduling quality difference (matched vLLM's exact reg+instr, still +10us), NO lever on our stack
 <!-- state: 2026-08-06T21:45 -->
@@ -42777,6 +42983,8 @@ removing only `; #129: SPIKE∅`; the compact clause consumes the existing
 is no archive, runtime, correctness or performance evidence.
 
 
+<<<<<<< ours
+
 ## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
 <!-- state: 2026-08-08T21:00 -->
 
@@ -42816,3 +43024,64 @@ scoping stays a future spike.
 Rows moved: none in lifecycle (`BACKEND-DISTRIBUTED-TP`/`PAR-TP` stay
 `READY`, now pointing at the new spec; `SPEC-DSPARK` stays `INVENTORIED`).
 Next: dispatch TP-W1 (GroupCoordinator-analog) — CPU-completable, no HW wait.
+=======
+
+## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
+<!-- state: 2026-08-08T21:00 -->
+
+The external RPi5/Cortex-A76 stack lands as two prepared branches off
+`b38f78a7`: `prep/land-65` (PR #65, PMU kernel-bench harness + lane records)
+and `prep/land-79` (PR #79, the Q8_0 SDOT/AAPCS64 tier), keyed records merged
+by the resolution law (main wholesale + in-lane rows; state pure-append in
+anchor order). The mutation review's fix map applied: F65-1 (ONE-SURFACE
+allowlist entry for `examples/cpu_kernel_bench`, ratchet 8->9 with a dated
+operator exception), F79-5 (KERNEL count 50->51 on top of main, their dated
+comment transplanted), F79-6 (the two RPi5 BENCHMARKS.md paragraphs are keyed
+table rows pointing at `docs/bench-evidence/rpi5-*.md`; the STATUS.md CPU cell
+condensed inside the char/cell ratchets), and F79-1: the new
+`test_ops_quant_dot` A76 byte-equality case referenced
+`QuantTraits(kQ8_0).vec_dot` — the SELECTED kernel, i.e. the assembly tier on
+a real A76 — so its CHECKs were a self-comparison. A true-portable seam
+`vt::cpu::QuantQ8PortableVecDot()` (quants.c:400 order) is exported next to
+the existing sdot/asm getters, the reference arm retargeted, and a new
+seam-pinning case compares the portable kernel byte-equal against an
+independent in-test transcription of the exact order on EVERY platform
+(contraction-robust: mul and fma candidates). Mutation kill verified on x86:
+reversing the portable block accumulation order REDs exactly that case
+(2 assertions, blocks=3/64), green on revert; 23/23 cases, 150231 assertions.
+
+RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
+F79-4 remain open on the landed tree; the review's merge-and-fix map is the
+binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
+as the lane's own next steps.
+>>>>>>> theirs
+
+## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
+<!-- state: 2026-08-08T21:00 -->
+
+The external RPi5/Cortex-A76 stack lands as two prepared branches off
+`b38f78a7`: `prep/land-65` (PR #65, PMU kernel-bench harness + lane records)
+and `prep/land-79` (PR #79, the Q8_0 SDOT/AAPCS64 tier), keyed records merged
+by the resolution law (main wholesale + in-lane rows; state pure-append in
+anchor order). The mutation review's fix map applied: F65-1 (ONE-SURFACE
+allowlist entry for `examples/cpu_kernel_bench`, ratchet 8->9 with a dated
+operator exception), F79-5 (KERNEL count 50->51 on top of main, their dated
+comment transplanted), F79-6 (the two RPi5 BENCHMARKS.md paragraphs are keyed
+table rows pointing at `docs/bench-evidence/rpi5-*.md`; the STATUS.md CPU cell
+condensed inside the char/cell ratchets), and F79-1: the new
+`test_ops_quant_dot` A76 byte-equality case referenced
+`QuantTraits(kQ8_0).vec_dot` — the SELECTED kernel, i.e. the assembly tier on
+a real A76 — so its CHECKs were a self-comparison. A true-portable seam
+`vt::cpu::QuantQ8PortableVecDot()` (quants.c:400 order) is exported next to
+the existing sdot/asm getters, the reference arm retargeted, and a new
+seam-pinning case compares the portable kernel byte-equal against an
+independent in-test transcription of the exact order on EVERY platform
+(contraction-robust: mul and fma candidates). Mutation kill verified on x86:
+reversing the portable block accumulation order REDs exactly that case
+(2 assertions, blocks=3/64), green on revert; 23/23 cases, 150231 assertions.
+
+RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
+F79-4 remain open on the landed tree; the review's merge-and-fix map is the
+binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
+as the lane's own next steps.
+
