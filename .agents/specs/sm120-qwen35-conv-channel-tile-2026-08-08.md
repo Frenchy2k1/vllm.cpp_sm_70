@@ -3,8 +3,9 @@
 **Rows:** `KERNEL-SSM-MAMBA`, feeding `ROAD-V1-C2-LOCAL-BF16`.
 **Hardware/workload:** RTX 5070 Ti (`sm_120`), Qwen3.5-4B plain BF16,
 128 ShareGPT requests, 128 output tokens, concurrency 32,
-`max_num_batched_tokens=2048`, 1,280 KV blocks, greedy. **Lifecycle:** spike;
-implementation and release-model gates are pending.
+`max_num_batched_tokens=2048`, 1,280 KV blocks, greedy. **Lifecycle:**
+implemented and byte-exact; arm 1 is a locally positive opt-in, arm 2 is
+falsified, and default/release-model gates remain pending.
 
 ## Measured selection
 
@@ -124,3 +125,49 @@ substitute for them.
 
 No GEMM claim is made. A later GEMM selection separately owes the four-axis,
 same-tool invocation-parity proof.
+
+## Implementation and measured outcome
+
+`VT_CONV_CHANNEL_TILE` now exposes the three specified arms. The production
+launcher and portable tests share one callback dispatcher, so deleting either
+specialized branch is mutation-pinned without adding a production trace hook.
+The CUDA matrix compares output and final state against arm 0 over BF16/F32,
+initial/fresh state, exact unequal chunks, short sequences, partial channels
+and padded rows. A first serial-stripe arm 2 failed that matrix because stripe
+1 could overwrite the shared state before stripe 2 read its initial history;
+the accepted kernel preloads both stripes before processing either.
+
+The first production profile series was VOID: the test targets had rebuilt the
+CUDA library but `vllm-bench` had not been relinked, and all three traces proved
+they still launched `CausalConv1dFwdRegKernel` at grid 64/registers 43. After
+explicitly rebuilding `vllm-bench`, the same-binary graph-node series proved
+the intended dispatch and measured:
+
+| Arm | Kernel/grid/registers | Conv total | Dominant 279/280 mean | Whole total | TTFT | TPOT / ITL |
+|---|---|---:|---:|---:|---:|---:|
+| 0 runtime width | runtime / 64 / 43 | 234.605 ms | 149.546 / 149.480 us | 6759.39 tok/s | 1016.69 ms | 34.91 ms |
+| 1 K=4, one channel | K4<1> / 64 / 52 | **219.506 ms** | **140.133 / 139.982 us** | **6767.62 tok/s** | **1013.82 ms** | **34.88 ms** |
+| 2 K=4, two channels | K4<2> / 32 / 58 | 228.401 ms | 145.586 / 145.468 us | 6757.19 tok/s | 1017.61 ms | 34.91 ms |
+
+Arm 1 improves the selected kernel total **6.436%** and every observed
+enclosing axis (total/output +0.122%, TTFT -0.282%, TPOT/ITL -0.086%, E2E
+-0.123%). Contrary to the initial register hypothesis, specialization raises
+the CUPTI register count 43→52; the win is therefore dead runtime-width work,
+not higher occupancy. Arm 2 halves feature blocks but raises registers to 58,
+is **4.052% slower than arm 1**, and is neutral/slightly negative end to end;
+the 256-channel hypothesis is falsified on sm_120.
+
+All rebuilt-series token files have SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Portable tests pass 9/9·88, CUDA GDN 67/67·4631, and Qwen3.5 paged-forward
+4/4·8. Arm 1 remains opt-in because its enclosing movement is small and the
+repeated local plus hardware-unavailable 27B/35B default gates remain open.
+
+Final reports:
+
+- arm 0 `/tmp/qwen35-conv-rebuilt-arm0-565a26fcc.nsys-rep`, SHA-256
+  `39d383dd878fc340a3cfaaee79a4addcb4eccb181439e9b4725f724f4569a6eb`;
+- arm 1 `/tmp/qwen35-conv-rebuilt-arm1-565a26fcc.nsys-rep`, SHA-256
+  `c8799ac0b4cdf997d383fe8a690b223be882dce3b1ee1a6fff35a62d75f7cf85`;
+- arm 2 `/tmp/qwen35-conv-rebuilt-arm2-565a26fcc.nsys-rep`, SHA-256
+  `3d38793571539864b23688fd9a85966debbf1e7c48fe8a1a2509438a45ee0452`.
