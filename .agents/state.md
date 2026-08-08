@@ -42269,6 +42269,58 @@ Voxtral remain off-registry (fold #9/#10 of the audit).
   Their build predates command-buffer batching (their `vulkan_backend.cpp:144` is
   our `:164` today), so none of today's work is implicated either.
 
+## 2026-08-07 — Downloadable static-core server release matrix spiked (PR #129)
+<!-- state: 2026-08-07T23:45 -->
+
+`ENG-RELEASE-BINARIES` moves `INVENTORIED` -> `SPIKE`; no implementation or
+artifact is claimed. The accepted contract is
+`.agents/specs/release-binary-matrix.md`: backend/host-specific
+`vllm-server` archives, stable only after matching-hardware archive runtime and
+correctness gates, and preview for derived/build-only tuples.
+
+The initial matrix covers CPU x86_64+arm64, macOS arm64 Metal and opt-in MLX,
+Vulkan preview, an experimental literal-static x86_64-musl CPU feasibility
+lane, and ten separate CUDA SM artifacts (`80,86,87,89,90a,100a,103a,110,120a,121a`)
+with explicit host ABIs. Triton AOT is ON only for the six complete vendored
+trees (`80,86,89,90a,100a,121a`) and OFF for `87,103a,110,120a`; fat+AOT is
+forbidden. ROCm stays blocked because the HIP skeleton has never compiled on
+AMD hardware.
+
+The package contract adds a future server install/component target, extracted
+archive smoke, dependency and RPATH audits, independent evidence booleans,
+SHA256, SPDX SBOM, provenance, version and license records, and a tag/dry-run
+least-privilege workflow. The normal promise is static project core with honest
+external ffmpeg/platform/driver boundaries, not a magically static GPU stack.
+First implementation after fresh review is W1: install and package the existing
+static-core server; manifest, validator, CI, platform, and CUDA bricks follow as
+separate claims.
+
+## 2026-08-07 — Release matrix revised: fat CUDA and adaptive CPU are the primary downloads
+<!-- state: 2026-08-07T23:55 -->
+
+User review changed the KISS artifact unit without changing lifecycle:
+`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation is
+claimed. This explicitly supersedes the prior checkpoint's single-SM-primary
+and fat+AOT-prohibited design. Primary downloads are now one binary per
+OS+host ABI: adaptive CPU and fat CUDA. One ELF cannot cross x86_64/aarch64 or
+libc/OS ABIs.
+
+CUDA primary artifacts cover all ten supported SMs
+(`80,86,87,89,90a,100a,103a,110,120a,121a`) in each Linux x86_64/aarch64 host
+binary. This makes two known gaps prerequisites: per-source gencode must make
+cross-family fat builds compile, and Triton AOT must embed and runtime-select all
+six available exact-SM trees (`80,86,89,90a,100a,121a`) while the other four
+use portable CUDA fallbacks. Per-SM archives remain optional diagnostics, not
+primary downloads. Stable/preview evidence stays per SM and is never inferred.
+
+CPU primary artifacts use a conservative baseline with runtime ISA dispatch,
+never global `-march=native`: x86_64 portable/SSE2 plus only real F16C/AVX2/
+AVX-512 and later gated tiers; aarch64 portable/NEON plus independently probed
+DotProd/i8mm and future real-kernel tiers. Exact CPU+OS-state probes, compiled
+tier manifests, forced-tier mutation tests, and execution on feature-poor and
+feature-rich hosts/emulation are release gates. W1 is now the CUDA per-source
+gencode prerequisite; multi-SM AOT and CPU ISA audits precede bundle work.
+
 ## 2026-08-08 — ARCH-ONE-SURFACE ROW 2: MiniMax-H3 video+audio generation folded onto the ONE surface (PR #123)
 <!-- state: 2026-08-08T04:30 -->
 
@@ -42617,3 +42669,22 @@ the shipped-tree check and M43, while deleting the production path guard still
 fails M42 itself. Baseline checker plus suite are green at 52/52. This remains
 CPU-only governance hardening; selector behavior, ABI, DSR 32, performance,
 model state, CUDA A/B and release state are unchanged.
+
+## 2026-08-08 — PR #129 release contract binds backend policy and guard execution
+<!-- state: 2026-08-08T20:00 -->
+
+Final mutation review found that the accepted release checker did not bind five
+backend channel decisions or its own CI/preflight execution, and that its
+`docs/STATUS.md` edit replaced unrelated OpenAI/Sora endpoint prose. The repair
+adds exact machine and human guards for Metal, MLX, Vulkan, experimental
+CPU-only musl, blocked ROCm, and the external host GPU-driver boundary.
+
+The release checker now accepts only direct argv in an unconditional Actions
+job/step and executes preflight under Python/Git shims to prove the checker and
+suite each run once through the named loops. Nineteen new semantic/wiring
+mutations are red, and their inventories, consumer bodies and 30 named tests are
+production-pinned. The full release suite is 30/30 and the shared executable
+registration guard remains 52/52. The OpenAI row is byte-identical to main after
+removing only `; #129: SPIKE∅`; the compact clause consumes the existing
+279150-character ratchet exactly. `ENG-RELEASE-BINARIES` remains `SPIKE`: there
+is no archive, runtime, correctness or performance evidence.
