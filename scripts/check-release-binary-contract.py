@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import re
 import sys
 from collections import Counter
@@ -126,7 +127,7 @@ BENCHMARKS_RELEASE_ROW = (
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
     "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, "
-    "and 22 tests. No archive, staged smoke, runtime, correctness, or performance "
+    "and 25 tests. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
@@ -134,7 +135,7 @@ BENCHMARKS_RELEASE_ROW = (
 STATUS_RELEASE_FRAGMENTS = (
     "Supported (subset); bundles SPIKED, no artifacts",
     "primary fat CUDA/adaptive CPU, W1-W13/W10-W12 policy, pending claims, and "
-    "22-test inventory mutation-gated; per-SM diagnostics optional; no "
+    "25-test inventory mutation-gated; per-SM diagnostics optional; no "
     "archive/runtime claim",
 )
 
@@ -169,7 +170,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 22 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 25 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -233,9 +234,12 @@ REQUIRED_TEST_METHODS = (
     "test_public_release_rows_remain_pending",
     "test_human_w12_is_optional_and_cannot_replace_w10",
     "test_human_primary_artifact_contract_matches_machine_block",
+    "test_unknown_machine_fields_are_fail_closed",
+    "test_each_human_work_dependency_is_pinned",
     "test_primary_cuda_mutation_inventory_literal_is_pinned",
     "test_work_dependency_mutation_inventory_literal_is_pinned",
     "test_each_semantic_inventory_consumer_is_pinned",
+    "test_each_semantic_inventory_consumer_body_is_pinned",
     "test_checker_guard_map_keysets_are_exact",
     "test_required_mutation_test_inventory_is_pinned",
 )
@@ -250,6 +254,10 @@ EXPECTED_TEST_LITERAL_INVENTORY_KEYS = (
     "PUBLIC_PENDING_MUTATIONS",
     "W10_W12_HUMAN_MUTATIONS",
     "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+    "INVENTORY_CONSUMER_METHODS",
+    "CONSUMER_FLOW_MUTATIONS",
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS",
+    "HUMAN_WORK_DEPS",
     "GUARD_MAP_KEYS",
 )
 
@@ -263,6 +271,10 @@ EXPECTED_TEST_INVENTORY_CONSUMER_KEYS = (
     "PUBLIC_PENDING_MUTATIONS",
     "W10_W12_HUMAN_MUTATIONS",
     "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+    "INVENTORY_CONSUMER_METHODS",
+    "CONSUMER_FLOW_MUTATIONS",
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS",
+    "HUMAN_WORK_DEPS",
     "GUARD_MAP_KEYS",
 )
 
@@ -291,6 +303,29 @@ TEST_LITERAL_INVENTORIES = {
     "PUBLIC_PENDING_MUTATIONS": PUBLIC_PENDING_MUTATIONS,
     "W10_W12_HUMAN_MUTATIONS": W10_W12_HUMAN_MUTATIONS,
     "PRIMARY_ARTIFACT_PROSE_MUTATIONS": PRIMARY_ARTIFACT_PROSE_MUTATIONS,
+    "INVENTORY_CONSUMER_METHODS": {
+        "PRIMARY_CUDA_SMS": "test_each_primary_cuda_sm_is_required",
+        "EXACT_MACHINE_FIELDS": "test_each_exact_machine_field_is_fail_closed",
+        "EXPECTED_DEPS": "test_each_work_dependency_edge_is_pinned",
+        "HUMAN_WORK_IDS": "test_each_human_work_row_id_occurs_exactly_once",
+        "RECORD_ANCHORS": "test_each_required_record_anchor_is_fail_closed",
+        "LIFECYCLE_RECORD_MUTATIONS": (
+            "test_release_lifecycle_and_honesty_are_fail_closed"
+        ),
+        "PUBLIC_PENDING_MUTATIONS": "test_public_release_rows_remain_pending",
+        "W10_W12_HUMAN_MUTATIONS": (
+            "test_human_w12_is_optional_and_cannot_replace_w10"
+        ),
+        "PRIMARY_ARTIFACT_PROSE_MUTATIONS": (
+            "test_human_primary_artifact_contract_matches_machine_block"
+        ),
+        "GUARD_MAP_KEYS": "test_checker_guard_map_keysets_are_exact",
+    },
+    "CONSUMER_FLOW_MUTATIONS": ("continue", "break", "wrap_false"),
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS": (("unexpected_field", "x"),),
+    "HUMAN_WORK_DEPS": {
+        work: ",".join(deps) for work, deps in WORK_DEPS.items()
+    },
     "GUARD_MAP_KEYS": EXPECTED_GUARD_MAP_KEYS,
 }
 
@@ -340,11 +375,48 @@ TEST_INVENTORY_CONSUMERS = {
         ("before", "after", "reason"),
         False,
     ),
+    "INVENTORY_CONSUMER_METHODS": (
+        "test_each_semantic_inventory_consumer_body_is_pinned",
+        ("inventory", "method"),
+        True,
+    ),
+    "CONSUMER_FLOW_MUTATIONS": (
+        "test_each_semantic_inventory_consumer_body_is_pinned",
+        ("mutation",),
+        False,
+    ),
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS": (
+        "test_unknown_machine_fields_are_fail_closed",
+        ("field", "value"),
+        False,
+    ),
+    "HUMAN_WORK_DEPS": (
+        "test_each_human_work_dependency_is_pinned",
+        ("work", "expected"),
+        True,
+    ),
     "GUARD_MAP_KEYS": (
         "test_checker_guard_map_keysets_are_exact",
         ("guard_map", "keys"),
         True,
     ),
+}
+
+TEST_INVENTORY_BODY_DIGESTS = {
+    "PRIMARY_CUDA_SMS": "5dc05132f5f24f0b2add406cb5682031b05d1940d2189728543b53a375d15125",
+    "EXACT_MACHINE_FIELDS": "8fa2ec5fca092a1092052a1426c37b66b8b8be49290e0e6e414e555dcbdad8dc",
+    "EXPECTED_DEPS": "4f8d345df7b467312869355f15153e04b77a0fd7005ea60ad86db40cc55ae6a2",
+    "HUMAN_WORK_IDS": "363c9494815086a53c3112792afe3c1651256d06a519e6fbeed43b78e865d922",
+    "RECORD_ANCHORS": "0e15f59b43bd4e70535055ccbcb41c500f89006fe9df4c2e58b0cfd0a00205f1",
+    "LIFECYCLE_RECORD_MUTATIONS": "79de0584503bb8c1cc1463169d8741455714c1d252136a89294e532878ec996a",
+    "PUBLIC_PENDING_MUTATIONS": "507e58eb51f04ab03db0cea484513da5cb0a7fdd2d6f6f332004e09106682fd3",
+    "W10_W12_HUMAN_MUTATIONS": "1fcb8914c91dc01052f7f26a45cbbaebe01c211bc0e692f70df3d62b13a963bf",
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS": "1fcb8914c91dc01052f7f26a45cbbaebe01c211bc0e692f70df3d62b13a963bf",
+    "GUARD_MAP_KEYS": "06691dc7239166ac458c9999d545938f7c8afb5021cb347d0fa6bdd0dac2a082",
+    "INVENTORY_CONSUMER_METHODS": "5754b33de9ca699665d4f612f8089371dbc7d9ce583422ffeb48a33499575eab",
+    "CONSUMER_FLOW_MUTATIONS": "a2d05b5bea24a09c6c5313f4e65d259a9b7e984f6450aa74309f790b3e81de8a",
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS": "1d9242dabe625e43b909709ed0a40915d55fd6610c06bab3e696dc803745e0b8",
+    "HUMAN_WORK_DEPS": "800c69c64c995030fff12ccfbe2bb0002193c17cbe28aeca52c584cf15c2b675",
 }
 
 EXACT_MACHINE_FIELDS = {
@@ -580,18 +652,19 @@ def _target_names(target: ast.expr) -> tuple[str, ...]:
     return ()
 
 
-def _iterates_inventory(
+def _inventory_loop(
     method: ast.FunctionDef | ast.AsyncFunctionDef,
     inventory: str,
     target_names: tuple[str, ...],
     mapping_items: bool,
-) -> bool:
+) -> ast.For | None:
+    matches: list[ast.For] = []
     for node in ast.walk(method):
         if not isinstance(node, ast.For) or _target_names(node.target) != target_names:
             continue
         if not mapping_items and isinstance(node.iter, ast.Name):
             if node.iter.id == inventory:
-                return True
+                matches.append(node)
         if (
             mapping_items
             and isinstance(node.iter, ast.Call)
@@ -602,8 +675,14 @@ def _iterates_inventory(
             and isinstance(node.iter.func.value, ast.Name)
             and node.iter.func.value.id == inventory
         ):
-            return True
-    return False
+            matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _consumer_body_digest(loop: ast.For) -> str:
+    body = ast.Module(body=loop.body, type_ignores=[])
+    serialized = ast.dump(body, include_attributes=False).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def _test_inventory_errors(root: Path) -> list[str]:
@@ -684,12 +763,23 @@ def _test_inventory_errors(root: Path) -> list[str]:
             continue
         method_name, target_names, mapping_items = TEST_INVENTORY_CONSUMERS[inventory]
         method = methods_by_name.get(method_name)
-        if method is None or not _iterates_inventory(
-            method, inventory, target_names, mapping_items
-        ):
+        loop = (
+            None
+            if method is None
+            else _inventory_loop(method, inventory, target_names, mapping_items)
+        )
+        if loop is None:
             errors.append(
                 f"semantic mutation inventory {inventory} is not consumed by "
                 f"{method_name} through its required literal iteration"
+            )
+            continue
+        actual_digest = _consumer_body_digest(loop)
+        expected_digest = TEST_INVENTORY_BODY_DIGESTS[inventory]
+        if actual_digest != expected_digest:
+            errors.append(
+                f"semantic mutation inventory {inventory} consumer body drifted; "
+                f"expected {expected_digest}, found {actual_digest}"
             )
     return errors
 
@@ -707,6 +797,11 @@ def contract_errors(root: Path) -> list[str]:
         errors.append(f"release contract is missing fields: {sorted(missing)}")
     if extra:
         errors.append(f"release contract has unknown fields: {sorted(extra)}")
+    if set(fields) != set(EXPECTED_FIELDS):
+        errors.append(
+            "release contract schema has missing or unknown fields: "
+            f"expected {sorted(EXPECTED_FIELDS)}, found {sorted(fields)}"
+        )
     for key, expected in EXPECTED_FIELDS.items():
         if fields.get(key) != expected:
             errors.append(_field_error(key, fields.get(key), expected))
@@ -739,6 +834,11 @@ def contract_errors(root: Path) -> list[str]:
                 f"{work} dependencies in work table are {rows.get(work)!r}; "
                 f"expected {expected!r}"
             )
+    if rows != WORK_DEPS:
+        errors.append(
+            "human work-table dependency mirror drifted: "
+            f"expected {WORK_DEPS!r}, found {rows!r}"
+        )
 
     work_content = {
         work: (_normalize_prose(deliverable), _normalize_prose(exit_gate))
