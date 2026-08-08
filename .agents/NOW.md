@@ -2,7 +2,7 @@
 
 <!-- now-updated: 2026-08-07 -->
 
-Read this FIRST. A SNAPSHOT: what is live,
+Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
 append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md) and the
 benchmark record. Budget: 100 lines.
@@ -42,7 +42,7 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 [benchmark-protocol.md](benchmark-protocol.md). Parity pin: vLLM `555967922`
 (0.26.0.dev0).
 
-Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
+AGENTS.md: STRUCTURAL lens (same kernel, different
 throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
