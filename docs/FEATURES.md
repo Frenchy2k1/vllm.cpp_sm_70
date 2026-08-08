@@ -179,7 +179,7 @@ the registered engine forward.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| Other methods (ngram-gpu, suffix, dspark, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
+| Other methods (ngram-gpu, suffix, dspark, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried; dspark re-grounded at the pin 2026-08-08 (V2-only DFlash-derived block drafter; Qwen3 + Gemma4 targets are ours) | ✅ | ◐ |
 
 ## Structured output and tool calling
 
@@ -259,7 +259,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Mode | vllm.cpp | vLLM | SGLang |
 |---|---|---|---|
-| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run | ✅ | ✅ |
+| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run; end-to-end scope spiked at the pin 2026-08-08 (TP-W1..W4+W7 CPU-completable) | ✅ | ✅ |
 | Collective / process-group abstraction | ✅ CPU + NCCL transport | ✅ | ✅ |
 | Pipeline parallel (PP) | ☐ spike written | ✅ | ✅ |
 | Expert parallel (EP) + EPLB | ☐ spike written | ✅ | ✅ |

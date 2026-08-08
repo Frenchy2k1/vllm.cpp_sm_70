@@ -28,6 +28,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
+| TP spike #287 (PR #143) | **LANDED** ([spec](specs/tensor-parallelism-spike.md)); DSpark rider grounded | dispatch TP-W1 (CPU-able) |
 | Release | SPIKE; 30/30 | #129 |
 | Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 LANDED; #139 repair CPU-GREEN**: ABI v14 stable; registry-resolved named platform; DSR 39→32; execution guard 52/52 | Fresh re-review #139; CUDA A/B residual |
 
@@ -42,8 +43,6 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 [benchmark-protocol.md](benchmark-protocol.md). Parity pin: vLLM `555967922`
 (0.26.0.dev0).
 
-Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
-throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 

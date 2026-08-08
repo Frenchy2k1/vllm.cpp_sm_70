@@ -42688,3 +42688,43 @@ registration guard remains 52/52. The OpenAI row is byte-identical to main after
 removing only `; #129: SPIKE∅`; the compact clause consumes the existing
 279150-character ratchet exactly. `ENG-RELEASE-BINARIES` remains `SPIKE`: there
 is no archive, runtime, correctness or performance evidence.
+
+## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
+<!-- state: 2026-08-08T21:00 -->
+
+`CLAIM-TP-SPIKE-287` (`row/SPIKE-TENSOR-PARALLELISM`, draft PR #143,
+records-only). The dedicated TP scope spike is committed:
+`.agents/specs/tensor-parallelism-spike.md`, building on the #50-era TP spec,
+the scale-out W1/W2 lanes and the #164 mode enumeration instead of re-deriving
+them.
+
+What it established: (1) S1 — a 14-row at-pin (`555967922`, SHA-verified)
+inventory of everything TP touches, each with our seam and a
+REUSE/PARTIAL/NEW verdict; roughly 40% of the end-to-end surface is already
+landed or directly reusable. (2) The landed-vs-claimed audit of scale-out
+W1/W2: the `vt::Communicator` stack, OpId routing, per-device registry, NCCL
+TU and the four forward all-reduce seams are REAL; but the tp handle
+dead-ends at the layer boundary (`qwen3.cpp:92-136` defaults), NO production
+loader passes `tp` into `LoadMergedBf16RawNK`, and the only tp>1 driver is
+the toy MLP test. (3) S2 — thread-per-rank orchestration (recorded deviation;
+multiproc returns at multi-node), additive TP>1 branch through
+`ModelRegistry::Forward` with TP=1 byte-identical, `tensor_parallel_size` on
+`vllm_model_params` at the next ABI bump (base is v14), and the
+per-weight-class sharded-load map (merged-column done; row/vocab/NVFP4/GGUF
+mapped). (4) S3 — the TP2-on-CPU token-exact gate design over the W1
+in-process transport (synthetic-dense CI tier + real-0.6B env-gated tier),
+plus the honesty finding: upstream's own TP=2 test asserts greedy equality
+vs HF, not vs TP1 (`test_basic_correctness.py:204`), and at the pin
+`use_all_gather()` defaults True so every TP rank all-gathers full logits and
+samples identically. (5) S4 — TP-W0..W7 ranked bricks; TP-W1..W4 and TP-W7
+are CPU-completable now, TP-W5/W6 are PENDING-HW (no ≥2-GPU box).
+
+RIDER (USER 2026-08-08): DSpark speculator re-grounded at the pin —
+`specs/dspark-speculator-note.md`; `SPEC-DSPARK` + the feature-matrix row
+refreshed (V2-runner-only DFlash-derived block drafter; both target families
+are our registered archs; slots beside the landed MTP/DFlash lanes). Full
+scoping stays a future spike.
+
+Rows moved: none in lifecycle (`BACKEND-DISTRIBUTED-TP`/`PAR-TP` stay
+`READY`, now pointing at the new spec; `SPEC-DSPARK` stays `INVENTORIED`).
+Next: dispatch TP-W1 (GroupCoordinator-analog) — CPU-completable, no HW wait.
