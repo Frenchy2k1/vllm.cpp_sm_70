@@ -46,7 +46,25 @@ namespace {
 // a PARTIAL backend decline a model whose kernels it has not registered, instead
 // of being selected and then failing deep inside a kernel bind. Empty means "no
 // model resolved yet", which is treated as no constraint.
-vt::Queue SelectQueue(std::string_view architecture) {
+//
+// ARCH-ONE-SURFACE ROW 8: `device` is the caller's explicit selection
+// (EngineParams::device / vllm_model_params.device). kAuto keeps the
+// accelerator-first probe below byte-identical; an EXPLICIT selection routes
+// through LoadedEngine::ResolveExplicitDeviceType and — unlike the auto arm —
+// a failure to serve the named device PROPAGATES instead of falling back to
+// CPU (mirror of vLLM never substituting an explicitly named device,
+// vllm/config/device.py:61-66).
+vt::Queue SelectQueue(std::string_view architecture, vllm::Device device) {
+  if (device != vllm::Device::kAuto) {
+    const vt::DeviceType resolved = LoadedEngine::ResolveExplicitDeviceType(
+        device, vllm::platforms::HasPlatform(vt::DeviceType::kCUDA));
+    if (resolved == vt::DeviceType::kCPU) {
+      return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    }
+    // No try/catch here on purpose: an explicit accelerator whose queue cannot
+    // be created must FAIL the load loudly, never silently serve on CPU.
+    return vt::GetBackend(resolved).CreateQueue();
+  }
   // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
   // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
   // on-device instead of the CPU dequant reference.
@@ -458,6 +476,39 @@ bool LoadedEngine::ResolveEnablePrefixCaching(const EngineParams& params,
   return !model_info.is_hybrid && !model_info.has_inner_state;
 }
 
+// ARCH-ONE-SURFACE ROW 8: the explicit arms of the device-selection policy —
+// see the contract in model_loader.h. Ported semantics:
+// vllm/config/device.py:61-66 @ 555967922 (an explicit device string is
+// assigned VERBATIM — never substituted), with the loud failure upstream
+// raises when the named device cannot serve (torch/worker init on an absent
+// CUDA device; our analogue is the unregistered kCUDA platform,
+// src/vllm/platforms/cuda.cpp Registrar — kCUDA registers only when a usable
+// GPU probed).
+vt::DeviceType LoadedEngine::ResolveExplicitDeviceType(
+    vllm::Device requested, bool cuda_platform_registered) {
+  switch (requested) {
+    case vllm::Device::kCPU:
+      // Explicit CPU never consults the accelerator probe: even on a
+      // CUDA-capable build/process this selects the CPU queue.
+      return vt::DeviceType::kCPU;
+    case vllm::Device::kCUDA:
+      if (!cuda_platform_registered) {
+        throw std::runtime_error(
+            "device 'cuda' was requested but no CUDA platform is available in "
+            "this build/process (an explicitly named device is never silently "
+            "replaced — mirror of vllm/config/device.py:61-66; use device=auto "
+            "or device=cpu, or run a CUDA build on a machine with a usable "
+            "GPU)");
+      }
+      return vt::DeviceType::kCUDA;
+    case vllm::Device::kAuto:
+      break;  // auto resolves through the probe in SelectQueue, not here.
+  }
+  throw std::invalid_argument(
+      "ResolveExplicitDeviceType resolves only explicit device selections "
+      "(cpu/cuda); auto resolves through the accelerator-first probe");
+}
+
 bool LoadedEngine::EnsureNoneHash() {
   // Idempotent: init_none_hash just (re)assigns the NONE_HASH global.
   //
@@ -648,7 +699,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
       runner_(config_, *model_, kv_cfg_,
               preselected_queue != nullptr
                   ? *preselected_queue
-                  : SelectQueue(model_->registration().architecture),
+                  : SelectQueue(model_->registration().architecture,
+                                params.device),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
@@ -813,6 +865,19 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
+  // ARCH-ONE-SURFACE ROW 8: resolve an EXPLICIT device selection up front,
+  // BEFORE any path/config/weight I/O — the mirror of vLLM resolving
+  // DeviceConfig at config-creation time, ahead of the model load
+  // (vllm/engine/arg_utils.py:1878 builds DeviceConfig first;
+  // device.py __post_init__ resolves immediately). An explicitly named absent
+  // device therefore fails HERE, loudly, and is never masked by a later
+  // path/tokenizer error. The result is discarded: SelectQueue re-runs the
+  // SAME ResolveExplicitDeviceType when it actually creates the queue, so the
+  // policy has exactly one owner.
+  if (params.device != vllm::Device::kAuto) {
+    (void)ResolveExplicitDeviceType(
+        params.device, vllm::platforms::HasPlatform(vt::DeviceType::kCUDA));
+  }
   const fs::path dir(model_dir);
 
   // A single `.gguf` file: config + weights + tokenizer all come from the
@@ -997,7 +1062,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // Select before loading so an eligible discrete-CUDA dense loader stages each
   // completed layer to the exact queue the runner will use. If construction
   // fails before the runner takes over, destroy the selected native stream.
-  vt::Queue load_queue = SelectQueue(registration.architecture);
+  vt::Queue load_queue = SelectQueue(registration.architecture, params.device);
   try {
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards, &load_queue));

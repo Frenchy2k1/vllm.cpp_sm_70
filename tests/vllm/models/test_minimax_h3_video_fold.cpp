@@ -40,7 +40,6 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "minimax_h3_video_fold_fixture.h"
-#include "vt/backend.h"
 
 namespace {
 
@@ -101,38 +100,6 @@ vllm::multimodal::MiniMaxH3VideoGenParams FixtureGenParams(const std::string& ou
 // 2 x the ViT3D decoder's fixed patch_size_t 4).
 constexpr int kGoldenFrames = 8;
 
-class CountingCudaBackend final : public vt::Backend {
- public:
-  void* Alloc(size_t) override { return nullptr; }
-  void Free(void*) override {}
-  void Memset(vt::Queue&, void*, int, size_t) override {}
-  void Copy(vt::Queue&, void*, const void*, size_t) override {}
-  vt::Queue CreateQueue() override {
-    ++create_queue_calls;
-    return vt::Queue{vt::Device{vt::DeviceType::kCPU, 7}, nullptr};
-  }
-  bool UnifiedMemory() const override { return true; }
-
-  int create_queue_calls = 0;
-};
-
-class ScopedCudaBackendRegistration {
- public:
-  explicit ScopedCudaBackendRegistration(vt::Backend* replacement)
-      : previous_(vt::TryGetBackend(vt::DeviceType::kCUDA)) {
-    vt::RegisterBackend(vt::DeviceType::kCUDA, replacement);
-  }
-  ~ScopedCudaBackendRegistration() {
-    if (previous_ != nullptr) vt::RegisterBackend(vt::DeviceType::kCUDA, previous_);
-  }
-
-  ScopedCudaBackendRegistration(const ScopedCudaBackendRegistration&) = delete;
-  ScopedCudaBackendRegistration& operator=(const ScopedCudaBackendRegistration&) = delete;
-
- private:
-  vt::Backend* previous_;
-};
-
 void CheckAgainstGoldens(const std::string& out_dir) {
   for (int f = 0; f < kGoldenFrames; ++f) {
     char name[64];
@@ -156,26 +123,6 @@ void CheckAgainstGoldens(const std::string& out_dir) {
 }
 
 }  // namespace
-
-TEST_CASE("minimax_h3 video fold: ABI device selectors map through DeviceType") {
-  CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(0) == vt::DeviceType::kCPU);
-  CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(1) == vt::DeviceType::kCUDA);
-  CHECK_THROWS(vllm::multimodal::MiniMaxH3VideoDeviceType(-1));
-  CHECK_THROWS(vllm::multimodal::MiniMaxH3VideoDeviceType(2));
-}
-
-TEST_CASE("minimax_h3 video fold: CUDA load creates exactly one queue") {
-  FoldWorkspace ws;
-  static CountingCudaBackend backend;
-  backend.create_queue_calls = 0;
-  const ScopedCudaBackendRegistration registration(&backend);
-
-  vllm::multimodal::MiniMaxH3VideoModelParams mp = FixtureModelParams(ws.fixture);
-  mp.device = 1;
-  auto engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(mp);
-  CHECK(backend.create_queue_calls == 1);
-  CHECK(engine->device() == (vt::Device{vt::DeviceType::kCPU, 7}));
-}
 
 // ─── ARM A: the library seam reproduces the pre-fold binary byte for byte ────
 TEST_CASE("minimax_h3 video fold: the library seam reproduces the pre-fold goldens") {

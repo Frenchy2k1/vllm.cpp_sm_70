@@ -46,7 +46,9 @@
 #include <cstring>
 #endif
 
+#include "vllm/config/device.h"
 #include "vllm/config/scheduler.h"
+#include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
@@ -2308,4 +2310,46 @@ TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
 
   h.server.stop();
   server_thread.join();
+}
+
+// ─── ARCH-ONE-SURFACE ROW 8: the server's --device seam ──────────────────────
+// The exact chain examples/server/main.cpp drives for `--device cpu`:
+// vllm::DeviceFromString -> EngineParams.device -> LoadedEngine (SelectQueue's
+// explicit arm) -> async_engine() -> the OpenAI serving stack — here over the
+// synthetic in-memory model (no disk), asserting the device-selected engine
+// SERVES and sits on the CPU queue. The policy matrix (cpu beats a registered
+// accelerator; explicit cuda never falls back) is test_loaded_engine_dense.cpp;
+// the C-ABI plumb is test_capi.cpp.
+TEST_CASE("api_server: an explicit-cpu device-selected engine serves /v1/completions") {
+  const HfConfig c = MakeConfig();
+  vllm::entrypoints::EngineParams params;
+  params.block_size = kBlockSize;
+  params.num_blocks = 32;
+  params.max_model_len = kMaxModelLen;
+  params.max_num_seqs = 8;
+  // The server's own parse of `--device cpu` (an unknown name throws there at
+  // startup; pinned in test_loaded_engine_dense.cpp).
+  params.device = vllm::DeviceFromString("cpu");
+  vllm::entrypoints::LoadedEngine loaded(c, MakeWeights(c), BuildFixture(),
+                                         params);
+  // The observable seam: the runner of the explicitly-cpu engine is on the CPU
+  // device (on a CUDA build this is the force-CPU pin; auto would select CUDA).
+  CHECK(loaded.runner().device().type == vt::DeviceType::kCPU);
+
+  OpenAIServingModels models("test-model");
+  OpenAIServingCompletion completion(loaded.async_engine(), "test-model",
+                                     /*enable_force_include_usage=*/false);
+  OpenAIServingChat chat(loaded.async_engine(), "test-model", InVocabChatPrompt,
+                         "hermes", /*reasoning_parser_name=*/std::string(),
+                         /*enable_force_include_usage=*/false);
+  ApiServer server(completion, chat, models, "9.9.9");
+
+  const std::string body =
+      R"({"model":"test-model","prompt":"hello","max_tokens":5,"temperature":0.0})";
+  ApiServer::DispatchResult r = server.handle_completions(body);
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("object") == "text_completion");
+  CHECK(j.at("choices").at(0).at("finish_reason") == "length");
+  CHECK(j.at("usage").at("completion_tokens") == 5);
 }

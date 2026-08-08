@@ -6,7 +6,7 @@
 // vllm_last_error().
 //
 //   vllm-cli --model <dir> --prompt "<text>"
-//            [--tokenizer-config <path>]
+//            [--tokenizer-config <path>] [--device auto|cpu|cuda]
 //            [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]
 //            [--seed S] [--stream]
 //
@@ -36,13 +36,17 @@ struct Args {
   bool have_seed = false;
   bool stream = false;
   std::string speculative_config;  // vLLM --speculative-config JSON; "" => off.
+  // --device (ABI v14): "auto" (default probe), "cpu", or "cuda" — the names
+  // of vLLM's DeviceConfig.device this build serves. Mapped to the int the ABI
+  // takes (0/1/2) in ParseArgs; an unknown name is rejected there.
+  int32_t device = 0;
 };
 
 void Usage(const char* argv0, std::FILE* out) {
   std::fprintf(
       out,
       "usage: %s --model <dir> --prompt \"<text>\"\n"
-      "          [--tokenizer-config <path>]\n"
+      "          [--tokenizer-config <path>] [--device auto|cpu|cuda]\n"
       "          [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]\n"
       "          [--seed S] [--stream]\n"
       "          [--speculative-config '<json>']\n"
@@ -90,6 +94,26 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       a.stream = true;
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i);
+    } else if (flag == "--device") {
+      // The vLLM DeviceConfig.device names (auto/cpu/cuda) -> the ABI int
+      // (vllm_model_params.device: 0=auto, 1=cpu, 2=cuda). An unknown name is
+      // a usage error, mirroring vLLM rejecting a non-Literal device value.
+      const std::string device = NextArg(argc, argv, i);
+      if (device == "auto") {
+        a.device = 0;
+      } else if (device == "cpu") {
+        a.device = 1;
+      } else if (device == "cuda") {
+        a.device = 2;
+      } else {
+        std::fprintf(stderr,
+                     "vllm-cli: unknown --device '%s' (expected auto, cpu, or "
+                     "cuda)\n",
+                     device.c_str());
+        Usage(argv[0], stderr);
+        exit_code = 2;
+        return false;
+      }
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], stdout);
       exit_code = 0;
@@ -150,6 +174,10 @@ int main(int argc, char** argv) {
   if (!args.speculative_config.empty()) {
     mp.speculative_config = args.speculative_config.c_str();
   }
+  // --device: explicit device selection (ABI v14). 0 (the default) keeps the
+  // accelerator-first probe; an explicitly named absent device fails the load
+  // below with the library's message (never a silent fallback).
+  mp.device = args.device;
 
   vllm_engine* engine = nullptr;
   std::fprintf(stderr, "vllm-cli: loading model from %s\n",

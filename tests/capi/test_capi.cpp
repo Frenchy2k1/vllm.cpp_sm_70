@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -25,7 +26,9 @@
 #include <nlohmann/json.hpp>
 
 #include "capi/engine_handle.h"
+#include "vllm/config/device.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/platforms/interface.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/bpe.h"
@@ -1291,10 +1294,13 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // The engine-config growth (max_num_batched_tokens / scheduling_policy /
   // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10; the
   // transcription slice (vllm_transcribe) is ABI v11; the video-generation
-  // slice (vllm_video_*) is ABI v12. The >= pin is the one check that can
-  // catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
-  // test_dlopen compare against the same macro and move with it.
-  CHECK(vllm_abi_version() >= 13);
+  // slice (vllm_video_*) is ABI v12; the pre-tokenized completion entry
+  // point (vllm_complete_tokens) is ABI v13; the device-selection field
+  // (vllm_model_params.device) is ABI v14. The >= pin is the one check that
+  // can catch a WRONG bump: the == VLLM_ABI_VERSION assertions here and in
+  // test_dlopen compare against the same macro and move with it (the #121
+  // lesson: an == floor moves with the macro and proves nothing).
+  CHECK(vllm_abi_version() >= 14);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────
@@ -1694,3 +1700,142 @@ TEST_CASE("capi v12: video argument contract") {
   vllm_video_mux_argv_free(nullptr, 3);  // no-op
 }
 
+
+// ─── ABI v14: explicit device selection (ARCH-ONE-SURFACE ROW 8) ─────────────
+// The device knob: 0=auto (the byte-identical accelerator-first probe), 1=cpu,
+// 2=cuda — the vLLM DeviceConfig.device names (vllm/config/device.py:13). The
+// pure policy matrix (explicit cpu beats a registered accelerator; explicit
+// cuda never falls back) is gated in test_loaded_engine_dense.cpp; here the
+// C-ABI wire contract and the params->EngineParams->SelectQueue plumb.
+
+namespace {
+// A synthetic engine over an explicit EngineParams device selection, sharing
+// MakeSyntheticEngine's stack.
+vllm_engine* MakeSyntheticEngineWithDevice(vllm::Device device) {
+  const HfConfig c = MakeConfig();
+  EngineParams params = SyntheticParams();
+  params.device = device;
+  auto loaded = std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(),
+                                               params);
+  return vllm::capi::MakeEngineHandle(std::move(loaded));
+}
+}  // namespace
+
+TEST_CASE("capi v14: the device zero-value/default contract") {
+  // The default is 0 == auto — a zero-initialized struct and
+  // vllm_model_params_default() agree, so a pre-v14 caller's zero-filled
+  // growth keeps the accelerator-first probe engine byte-identical.
+  const vllm_model_params def = vllm_model_params_default();
+  CHECK(def.device == 0);
+  vllm_model_params zeroed;
+  std::memset(&zeroed, 0, sizeof(zeroed));
+  CHECK(zeroed.device == def.device);
+
+  // The zero value maps to AUTO, not to an explicit device: with device left
+  // at the default and a bogus path, the load must report the PATH (the auto
+  // arm defers to the probe and never resolves an explicit device up front).
+  // A mutation that maps 0 to an explicit cuda would surface the device error
+  // here instead — on the CPU tier that is the distinguishable half; 0-as-
+  // explicit-cpu is behaviorally identical on this tier and is pinned by the
+  // pure policy matrix in test_loaded_engine_dense.cpp plus the CUDA-build
+  // residual named in the spec.
+  vllm_model_params bogus = vllm_model_params_default();
+  bogus.model_path = "/nonexistent/vllm-cpp/model/dir";
+  vllm_engine* probe_eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&bogus, &probe_eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(probe_eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("not a directory") !=
+        std::string::npos);
+
+  // Behavior: on a CPU-only process the auto probe resolves CPU, so an
+  // explicit-cpu engine must generate EXACTLY what the default (auto) engine
+  // generates. (Guarded: on an accelerator build auto legitimately selects the
+  // accelerator, and byte-equality with a CPU run is not the contract.)
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+    vllm_engine* auto_eng = MakeSyntheticEngine();  // device unset == kAuto
+    vllm_engine* cpu_eng = MakeSyntheticEngineWithDevice(vllm::Device::kCPU);
+    REQUIRE(auto_eng != nullptr);
+    REQUIRE(cpu_eng != nullptr);
+    vllm_sampling_params sp = GreedyParams(6);
+    vllm_completion a{};
+    vllm_completion b{};
+    REQUIRE(vllm_complete(auto_eng, "hello world", &sp, &a) == VLLM_OK);
+    REQUIRE(vllm_complete(cpu_eng, "hello world", &sp, &b) == VLLM_OK);
+    CHECK(std::string(a.text) == std::string(b.text));
+    CHECK(a.completion_tokens == b.completion_tokens);
+    vllm_completion_free(&a);
+    vllm_completion_free(&b);
+    vllm_engine_free(auto_eng);
+    vllm_engine_free(cpu_eng);
+  }
+}
+
+TEST_CASE("capi v14: device range validates before any load work") {
+  // An out-of-range device is a CALLER error caught before FromModelDir — the
+  // bogus path must NOT be what fails here.
+  for (const int32_t bad : {static_cast<int32_t>(3), static_cast<int32_t>(-1),
+                            static_cast<int32_t>(7)}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.device = bad;
+    vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng == nullptr);
+    CHECK(std::string(vllm_last_error())
+              .find("device must be 0 (auto), 1 (cpu), or 2 (cuda)") !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("capi v14: explicit cuda on a CUDA-less process fails LOUD (plumb pin)") {
+  if (vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+    return;  // CUDA build/box: the explicit-cuda arm resolves; nothing to pin.
+  }
+  // device=2 with a bogus path: the DEVICE error must surface, not the path
+  // error — FromModelDir resolves an explicit device BEFORE any I/O, so this
+  // pins the whole capi -> EngineParams -> FromModelDir plumb (an implementation
+  // that drops params->device would report the path instead and go RED here).
+  vllm_model_params p = vllm_model_params_default();
+  p.model_path = "/nonexistent/vllm-cpp/model/dir";
+  p.device = 2;  // cuda
+  vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error())
+            .find("device 'cuda' was requested but no CUDA platform") !=
+        std::string::npos);
+
+  // device=1 (cpu) on the same bogus path proceeds to the path and reports IT —
+  // the plumb forwards the field's VALUE, not a constant.
+  p.device = 1;  // cpu
+  eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("not a directory") !=
+        std::string::npos);
+}
+
+TEST_CASE("capi v14: explicit cpu forces the CPU queue at the EngineParams seam") {
+  // The observable queue seam: an engine constructed with device=kCPU runs its
+  // runner on the CPU device. On the CPU tier this is trivially true of auto as
+  // well; on a CUDA build it is the force-CPU pin (the runner would otherwise
+  // sit on the CUDA queue). The CPU-tier statement of "cpu beats a registered
+  // accelerator" is the pure matrix in test_loaded_engine_dense.cpp.
+  const HfConfig c = MakeConfig();
+  EngineParams params = SyntheticParams();
+  params.device = vllm::Device::kCPU;
+  LoadedEngine loaded(c, MakeWeights(c), BuildFixture(), params);
+  CHECK(loaded.runner().device().type == vt::DeviceType::kCPU);
+
+  // And the ctor-path plumb (LoadedEngine's own SelectQueue call, the arm the
+  // GGUF/MoE branches take): explicit cuda on a CUDA-less process must throw
+  // the pinned message out of construction — never silently build on CPU.
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+    EngineParams cuda_params = SyntheticParams();
+    cuda_params.device = vllm::Device::kCUDA;
+    CHECK_THROWS_WITH_AS(
+        LoadedEngine(MakeConfig(), MakeWeights(c), BuildFixture(), cuda_params),
+        doctest::Contains("device 'cuda' was requested but no CUDA platform"),
+        std::runtime_error);
+  }
+}

@@ -375,7 +375,14 @@ STATUS_RATCHET = {
     # subgroup-reduction outcome, paid for by dropping the native-kernel COUNT,
     # which is derivable from the linked campaign doc while a void result is not
     # derivable from anywhere. Net -0.
-    "chars": 279200,
+    #
+    # 279150 since 2026-08-08 (measured 279111 after the #122 rebase): the ONE-SURFACE ROW 8 device
+    # knob owes this page a status line, paid for by removing a STALE MERGE
+    # DUPLICATE in the metrics paragraph (the same "matching vLLM's own
+    # mapping ... behavioural CPU gate ... remaining work" narrative appeared
+    # twice back to back; the longer, newer version stays). Nothing was lost,
+    # only de-duplicated. Net -92.
+    "chars": 279150,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

@@ -162,7 +162,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT; ref2va ckpt-limited (§8.12); GGUF/NVFP4/bf16 loaders; ABI v12 `vllm_video_*` uses generic `DeviceType` dispatch (DSR 32) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = that ckpt's own quant fidelity (§8.12); GGUF/NVFP4/bf16-shard loaders; **embedder-reachable since ABI v12** (`vllm_video_*`, `/v1/videos` = same seam) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them
@@ -247,6 +247,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Embeddings / pooling | none | embedder-unreachable |
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
 | Video+audio generation (MiniMax-H3) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv` | reachable |
+| Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out
