@@ -48,7 +48,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | GPU | Workload and basis | vllm.cpp | vLLM | Ratio | Status |
 |---|---|---:|---:|---:|---|
 | RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 233.955 ms | 145.421 ms | **1.609x slower** | Rebased-main exact chunks ON; rollback 718.704 ms, so local is **3.072x faster** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
-| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, fused post-conv total | 228.150 ms | 108.035 ms | **2.112x slower** | Token-tile SPIKE; split grid rejected at 448.365 ms, tokens exact |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, fused post-conv total | 122.587 ms | 108.035 ms | **1.135x slower** | Opt-in tile is exact and **1.859x faster** than 227.887 ms fast megablock; all axes improved; default/release gates open ([spec](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-27B NVFP4, historical normalized prefill | 0.43 us/token/layer | 0.18 us/token/layer | **2.39x slower** | Directional only: unequal token clusters, older pin ([ledger](../.agents/parity-ledger.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-35B NVFP4, later local kernel A/B | 321.148 us c1; 960.313 us c6 | - | `PENDING` | Register vs tiled improved 4.7%/7.3%; no paired vLLM denominator ([record](../.agents/specs/gdn-prefill-conv-reg-2026-07-18.md)) |
 | Jetson Thor (`sm_110`), AGX Orin (`sm_87`) | No matched GDN workload | - | - | `PENDING` | Runtime correctness only; no causal-conv speed trace |

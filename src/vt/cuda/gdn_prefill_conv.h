@@ -60,6 +60,8 @@
 #ifndef VT_CUDA_GDN_PREFILL_CONV_H_
 #define VT_CUDA_GDN_PREFILL_CONV_H_
 
+#include <cstdint>
+
 namespace vt::cuda {
 
 // Pure predicate for the VT_CONV_REG contract: DEFAULT ON. The register-window
@@ -117,6 +119,20 @@ inline bool GdnPostConvSplitFlagIsOn(const char* env_value) {
 //       environment value is present AND its first char is '0' (rollback).
 inline bool GdnPostConvFastFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
+}
+
+// Experimental spelling of vLLM's fused post-conv work partition: 16 tokens per
+// block, one Q/K or V head per grid.y program, four warps. It remains opt-in until
+// same-binary correctness and performance gates close; unset and '0' keep the
+// byte-identical fast megablock default above.
+inline bool GdnPostConvTokenTileFlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] != '0';
+}
+
+inline constexpr int64_t kGdnPostConvTokenTileTokens = 16;
+
+inline constexpr int64_t GdnPostConvTokenTileGridX(int64_t tokens) {
+  return (tokens + kGdnPostConvTokenTileTokens - 1) / kGdnPostConvTokenTileTokens;
 }
 
 }  // namespace vt::cuda

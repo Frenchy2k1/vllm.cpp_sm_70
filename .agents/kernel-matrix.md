@@ -172,6 +172,17 @@ and the profiled enclosing workload improves **2.272%**; pinned vLLM remains
 Lifecycle stays `INVENTORIED` because generic Mamba coverage and the 27B/35B
 release gates are unchanged. [Spec and evidence](specs/sm120-qwen35-conv-chunking-2026-08-07.md).
 
+**2026-08-08 `KERNEL-SSM-MAMBA` checkpoint.** The opt-in
+`VT_GDN_POSTCONV_TOKEN_TILE` path ports vLLM/FLA's 16-token, per-head,
+four-warp post-conv schedule for 128-wide Q/K/V heads. It preserves the current
+128-lane reduction tree exactly while retaining Q/K values in registers.
+Qwen3.5-4B sm_120 graph-node time is **227.887→122.587 ms (1.859x)** with
+byte-identical production tokens and every enclosing axis positive; the
+same-tool vLLM residual is **1.135x**. Portable 6/6, CUDA GDN 67/67·4384 and
+cached 4B 3/3·1672 pass. It remains opt-in pending repeated and 27B/35B gates;
+generic Mamba lifecycle stays `INVENTORIED`.
+[Spike and result](specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+
 ## Count invariants
 
 - This table has exactly 35 practical kernel-family rows.

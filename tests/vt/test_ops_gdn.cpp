@@ -2526,6 +2526,7 @@ void RunGdnPostConvSplitByteExactCase(int64_t t, int64_t hk, int64_t hv, int64_t
   auto run = [&](bool split, std::vector<uint8_t>& q, std::vector<uint8_t>& k,
                  std::vector<uint8_t>& v, std::vector<uint8_t>& g, std::vector<uint8_t>& b) {
     ::setenv("VT_GDN_POSTCONV_SPLIT", split ? "1" : "0", 1);
+    ::setenv("VT_GDN_POSTCONV_TOKEN_TILE", "0", 1);
     DeviceTensor dq_(gpu, gq.q, qkv_dt, {t, hk, dk});
     DeviceTensor dk_(gpu, gq.q, qkv_dt, {t, hk, dk});
     DeviceTensor dv_(gpu, gq.q, qkv_dt, {t, hv, dv});
@@ -2549,6 +2550,7 @@ void RunGdnPostConvSplitByteExactCase(int64_t t, int64_t hk, int64_t hv, int64_t
   run(/*split=*/false, q0, k0, v0, g0, b0);
   run(/*split=*/true, q1, k1, v1, g1, b1);
   ::unsetenv("VT_GDN_POSTCONV_SPLIT");
+  ::unsetenv("VT_GDN_POSTCONV_TOKEN_TILE");
   CHECK(q1 == q0);
   CHECK(k1 == k0);
   CHECK(v1 == v0);
@@ -2577,6 +2579,115 @@ TEST_CASE("CUDA gdn_post_conv split kernel (VT_GDN_POSTCONV_SPLIT) matches megab
       }
     }
   }
+}
+
+// Port of vLLM tests/kernels/test_fused_gdn_post_conv.py's BLOCK_T=16
+// correctness sweep for the production 128-wide head. The experimental CUDA
+// tile folds the first two levels of the 128-lane reduction into each warp lane
+// in the same arithmetic order, so all five outputs must remain byte-exact
+// against the shipped fast kernel (stronger than upstream's BF16 tolerance).
+void RunGdnPostConvTokenTileCase(int64_t t, int64_t hk, int64_t hv, uint32_t seed) {
+  constexpr int64_t dk = 128;
+  constexpr int64_t dv = 128;
+  const int64_t key_dim = hk * dk;
+  const int64_t value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const auto convf = RandomF32(static_cast<size_t>(t * conv_dim), seed, -1.5f, 1.5f);
+  const auto araw = RandomF32(static_cast<size_t>(t * hv), seed + 1, -1.0f, 1.0f);
+  const auto braw = RandomF32(static_cast<size_t>(t * hv), seed + 2, -1.0f, 1.0f);
+  const auto alog = RandomF32(static_cast<size_t>(hv), seed + 3, -1.0f, 1.0f);
+  const auto dtb = RandomF32(static_cast<size_t>(hv), seed + 4, -1.0f, 1.0f);
+  const auto convb = Pack(convf, DType::kBF16);
+  constexpr int64_t gate_prefix = 2;
+  constexpr int64_t gate_suffix = 3;
+  const int64_t gate_stride = gate_prefix + 2 * hv + gate_suffix;
+  std::vector<float> packed_ba(static_cast<size_t>(t * gate_stride), 7.5f);
+  for (int64_t row = 0; row < t; ++row) {
+    for (int64_t head = 0; head < hv; ++head) {
+      packed_ba[static_cast<size_t>(row * gate_stride + gate_prefix + head)] =
+          braw[static_cast<size_t>(row * hv + head)];
+      packed_ba[static_cast<size_t>(row * gate_stride + gate_prefix + hv + head)] =
+          araw[static_cast<size_t>(row * hv + head)];
+    }
+  }
+  const vt::L2NormArgs args{1e-6f};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dconv(gpu, gq.q, DType::kBF16, {t, conv_dim}, convb.data());
+  DeviceTensor dpacked_ba(gpu, gq.q, DType::kF32, {t, gate_stride}, packed_ba.data());
+  Tensor dbraw = dpacked_ba.tensor().Slice(1, gate_prefix, gate_prefix + hv);
+  Tensor daraw = dpacked_ba.tensor().Slice(1, gate_prefix + hv, gate_prefix + 2 * hv);
+  DeviceTensor dalog(gpu, gq.q, DType::kF32, {hv}, alog.data());
+  DeviceTensor ddtb(gpu, gq.q, DType::kF32, {hv}, dtb.data());
+
+  auto run = [&](bool token_tile, std::vector<uint8_t>& q, std::vector<uint8_t>& k,
+                 std::vector<uint8_t>& v, std::vector<uint8_t>& g,
+                 std::vector<uint8_t>& b) {
+    ::setenv("VT_GDN_POSTCONV_SPLIT", "0", 1);
+    ::setenv("VT_GDN_POSTCONV_FAST", "1", 1);
+    ::setenv("VT_GDN_POSTCONV_TOKEN_TILE", token_tile ? "1" : "0", 1);
+    DeviceTensor dq_(gpu, gq.q, DType::kBF16, {t, hk, dk});
+    DeviceTensor dk_(gpu, gq.q, DType::kBF16, {t, hk, dk});
+    DeviceTensor dv_(gpu, gq.q, DType::kBF16, {t, hv, dv});
+    DeviceTensor dg_(gpu, gq.q, DType::kF32, {t, hv});
+    DeviceTensor db_(gpu, gq.q, DType::kF32, {t, hv});
+    vt::GdnPostConv(gq.q, dq_.tensor(), dk_.tensor(), dv_.tensor(), dg_.tensor(), db_.tensor(),
+                    dconv.tensor(), daraw, dbraw, dalog.tensor(), ddtb.tensor(), args);
+    q.resize(static_cast<size_t>(t * key_dim) * vt::SizeOf(DType::kBF16));
+    k.resize(q.size());
+    v.resize(static_cast<size_t>(t * value_dim) * vt::SizeOf(DType::kBF16));
+    g.resize(static_cast<size_t>(t * hv) * vt::SizeOf(DType::kF32));
+    b.resize(g.size());
+    dq_.Download(gq.q, q.data());
+    dk_.Download(gq.q, k.data());
+    dv_.Download(gq.q, v.data());
+    dg_.Download(gq.q, g.data());
+    db_.Download(gq.q, b.data());
+  };
+
+  std::vector<uint8_t> q0, k0, v0, g0, b0, q1, k1, v1, g1, b1;
+  run(/*token_tile=*/false, q0, k0, v0, g0, b0);
+  run(/*token_tile=*/true, q1, k1, v1, g1, b1);
+  ::unsetenv("VT_GDN_POSTCONV_SPLIT");
+  ::unsetenv("VT_GDN_POSTCONV_FAST");
+  ::unsetenv("VT_GDN_POSTCONV_TOKEN_TILE");
+
+  const std::vector<float> q1f = Unpack(q1, DType::kBF16);
+  const std::vector<float> k1f = Unpack(k1, DType::kBF16);
+  CHECK(q1 == q0);
+  CHECK(k1 == k0);
+  CHECK(v1 == v0);
+  CHECK(g1 == g0);
+  CHECK(b1 == b0);
+  for (const std::vector<float>* values : {&q1f, &k1f}) {
+    bool all_finite = true;
+    float max_norm_error = 0.0f;
+    for (int64_t row = 0; row < t * hk; ++row) {
+      float sum = 0.0f;
+      for (int64_t j = 0; j < dk; ++j) {
+        const float value = (*values)[static_cast<size_t>(row * dk + j)];
+        all_finite = all_finite && std::isfinite(value);
+        sum += value * value;
+      }
+      max_norm_error = std::max(max_norm_error, std::abs(std::sqrt(sum) - 1.0f));
+    }
+    CHECK(all_finite);
+    CHECK(max_norm_error < 1e-2f);
+  }
+}
+
+TEST_CASE("CUDA gdn_post_conv 16-token tile matches upstream BF16 contract") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 9900;
+  for (int64_t t : {1, 16, 17, 128, 512, 2048}) {
+    CAPTURE(t);
+    RunGdnPostConvTokenTileCase(t, 4, 8, seed++);
+  }
+  RunGdnPostConvTokenTileCase(17, 16, 32, seed);  // upstream 35B shape
 }
 
 TEST_CASE("CUDA l2norm matches CPU (rank 2 and 3)") {

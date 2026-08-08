@@ -3,8 +3,9 @@
 **Rows:** `KERNEL-SSM-MAMBA`, feeding `ROAD-V1-C2-LOCAL-BF16`.
 **Hardware/workload:** RTX 5070 Ti (`sm_120`), Qwen3.5-4B plain BF16,
 128 ShareGPT requests, 128 output tokens, concurrency 32,
-`max_num_batched_tokens=2048`, 1,280 KV blocks, greedy. **Lifecycle:** SPIKE;
-implementation and performance disposition pending.
+`max_num_batched_tokens=2048`, 1,280 KV blocks, greedy. **Lifecycle:**
+IMPLEMENTED, byte-exact and locally faster, but opt-in pending repeated and
+release-model gates.
 
 ## Measured selection
 
@@ -116,3 +117,54 @@ extrapolated.
 Rollback is `VT_GDN_POSTCONV_TOKEN_TILE=0` (or unset while the experiment is
 opt-in), which retains the current default fast megablock without changing any
 loader, scheduler or model route.
+
+## Implementation outcome
+
+`GdnPostConvTokenTileKernel` now implements the specified four-warp,
+16-token/per-head work partition for `Dk==Dv==128`. Q/K activations remain in
+registers through the reduction and normalized store; V/g/beta share the same
+tile. The dispatch is opt-in through `VT_GDN_POSTCONV_TOKEN_TILE=1`, the slower
+explicit split retains priority, and every unsupported shape stays on the
+existing fast megablock.
+
+The first warp reduction was a useful negative result. Sequentially summing the
+four lane-owned squares before the 32-lane shuffle retained the kernel speedup
+but changed production tokens: fast/tile token SHA-256
+`83fcdc45...453545`/`1d496ff0...b9756`. The accepted implementation reproduces
+the existing 128-lane tree exactly: first `(i+i+64)`, then the two resident
+partials `(i+i+32)`, followed by shuffle offsets `16,8,4,2,1`. This restores
+byte identity while keeping the values in registers.
+
+Final same-binary graph-node traces have 1,728 calls per arm:
+
+| Arm | Total GPU time | Mean call | Total throughput | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| fast megablock | 227.887066 ms | 131.879 us | 6,734.82 tok/s | 1,024.14 ms | 35.01 ms | 5,469.87 ms |
+| token tile | **122.587027 ms** | **70.942 us** | **6,770.62 tok/s** | **1,015.43 ms** | **34.85 ms** | **5,440.81 ms** |
+
+The tile is **1.859x faster** at the selected kernel and improves the enclosing
+profile on every observed axis: total/output throughput +0.532%, TTFT -0.850%,
+TPOT -0.457%, E2E -0.531%. It closes the same-tool vLLM gap from 2.112x to
+**1.135x** (122.587027/108.034870 ms). Both final token files have SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+
+Tests are stronger than the upstream BF16 tolerance: portable flag/grid 6/6,
+CUDA GDN 67/67 and 4,384 assertions over partial/exact tiles, production and
+small shapes, packed BA views with non-zero offsets/wider row strides, exact
+q/k/v/g/beta bytes, finiteness and unit norms; cached Qwen3.5-4B 3/3 and 1,672
+assertions. `T=0` is pinned by the portable no-work grid contract because local
+kernel tensor descriptors require positive dimensions; the runtime sweep covers
+`T={1,16,17,128,512,2048}`.
+
+Final evidence:
+
+- fast trace `/tmp/qwen35-postconv-tile-exact-fast.nsys-rep`, SHA-256
+  `c75e2cb27797827b3d25d40204d745b3dfa36c4be8bd17a8464229c1b70bcadc`;
+- tile trace `/tmp/qwen35-postconv-tile-exact-tile.nsys-rep`, SHA-256
+  `a0eb1808e216a39d1350deabe7722e1b9081940183c512cefdb10afd2706f418`;
+- rejected arithmetic traces `/tmp/qwen35-postconv-tile-wip-{fast,tile}.nsys-rep`,
+  SHA-256 `c2d8872e...b774` / `1c42d489...d66b`.
+
+Default ON remains deliberately unclaimed. One local 4B profile does not close
+the required repeated A/B or the unavailable Qwen3.6-27B/35B release-model
+correctness/performance gates.
