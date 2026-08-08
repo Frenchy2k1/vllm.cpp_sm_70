@@ -415,28 +415,30 @@ recurrences host-tier; qwen3_5 host-ptr fixed (#125), unrun off-CUDA
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 skeleton:
 backend, platform, 1 of 106 ops; **its HIP sources have never been compiled by
 anyone** — weaker than "build-supported", since no AMD board is here;
-[guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped but unbuilt**
-(2026-07-28): the engine is single-GPU today — no NCCL / tensor-parallel /
-process-group code in `src/`. One `vt::` collective / process-group abstraction with
-backend-specific transports (NCCL / RDMA / MLX-ring) covers all three legs —
-multi-GPU tensor+pipeline parallel, multiple DGX Sparks over the ConnectX-7
-200GbE RoCE/RDMA cable (the path that lets DeepSeek-V4-Flash fp8 ~167 GiB run
-across 2×119 GiB Sparks), and MLX multi-node over Thunderbolt — mirroring vLLM's
-`device_communicators`; `world_size==1` stays byte-identical. Two legs landed
-CPU-gated (2026-07-28): `vt::Communicator` collectives proven by an in-process
-multi-rank cross-rank sum, and same-host multi-GPU tensor parallel (multi-device
-backend registry, collective `OpId` routing, the NCCL transport behind
-`-DVLLM_CPP_NCCL=ON`, and `TensorParallel` in the Qwen3-dense forward proven
-**equal to the unsharded tp=1 forward**; `tp_size==1` byte-identical). The
-**real TP-2 multi-GPU RUN + the NCCL build-verify remain HW-blocked** (no ≥2-GPU
-box), as do pipeline parallel, multi-Spark and MLX. Scope, seam map and
-per-attempt narrative:
-[.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
-Every parallelism MODE vLLM has (tensor / pipeline / data / expert / sequence /
-context parallel) is enumerated, upstream-grounded and priority-ranked in
-[.agents/specs/parallelism-modes.md](../.agents/specs/parallelism-modes.md)
-— with the honest note that vLLM's "sequence parallel" is a
-tensor-parallel compilation pass, not a separate parallel axis.
+[guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
+CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
+with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
+`device_communicators` across multi-GPU TP+PP, 2×DGX-Spark over ConnectX-7
+RoCE (the DeepSeek-V4-Flash fp8 ~167 GiB across 2×119 GiB path), and MLX
+multi-node; `world_size==1` stays byte-identical. Landed: `vt::Communicator`
+(in-process multi-rank CPU gate) and the same-host TP wiring
+(multi-device registry, `OpId` routing, the NCCL transport behind
+`-DVLLM_CPP_NCCL=ON`, `TensorParallel` in the Qwen3-dense forward equal to
+tp=1). The **real TP-2 GPU run + NCCL build-verify remain HW-blocked** (no
+≥2-GPU box), as do PP, multi-Spark and MLX
+([scale-out spec](../.agents/specs/scale-out-distributed.md); every
+parallelism mode is enumerated and ranked in
+[parallelism-modes](../.agents/specs/parallelism-modes.md), noting vLLM's
+"sequence parallel" is a TP compilation pass, not an axis).
+**Tensor parallelism is scoped end-to-end at the pin** (#287,
+[tensor-parallelism-spike](../.agents/specs/tensor-parallelism-spike.md)):
+~40% of the TP surface already landed/reusable; the landed TP wiring
+dead-ends at the layer boundary (no loader shards yet); bricks TP-W1..W4+W7
+(through an engine-level TP2-on-CPU token-exact gate) are CPU-completable
+NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
+(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is grounded
+and inventoried ([note](../.agents/specs/dspark-speculator-note.md)); full
+scope is a future spike.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the
