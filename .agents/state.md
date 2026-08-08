@@ -42527,3 +42527,29 @@ assertion, and preserves the original 15 cases. A fresh CPU Release `-Werror`
 configure exposes `test_device_selection` through both build-target help and
 CTest JSON, builds it, and runs the focused selector/platform/loader/C-ABI set
 4/4 green. No behavior, ABI, performance, model, GPU, or CUDA A/B claim changed.
+
+## 2026-08-08 — PR #139 registration guard proves execution, not presence
+<!-- state: 2026-08-08T16:00 -->
+
+Final mutation review found five more critical survivors in the guard itself.
+CTest accepted a required test by name while its helper executed `cmake -E
+true`; GitHub Actions commands counted inside a step/job disabled by `if`;
+preflight names counted in an inert array instead of the executed
+`CHECKERS`/`SUITES`; deleting both mutation assertion-helper assertions left the
+suite green; and deleting M19 plus shrinking the in-file numeric range made a
+smaller suite self-approve.
+
+The repair binds every claim to execution. After CMake File-API identifies the
+single executable artifact, the disposable configure materializes that path and
+CTest JSON must resolve to it as the exact sole argv. The Actions parser accepts
+only a canonical literal run block owned by an unconditional job and step.
+Preflight parses the named arrays and requires the actual checker/suite loops to
+consume them. Wrapper bodies are inspected for their direct production call and
+`assertTrue`, and the 27 numbered mutations are pinned in an external manifest;
+the 34-test suite also mutates both integrity mechanisms directly.
+
+All five real review mutations are RED in a scratch exact-head tree (each rc=1),
+as are wrong-binary, extra-argv, job-level condition and loop-rebinding nearby
+weakenings. Baseline checker + suite are GREEN. This is CPU-only test/governance
+hardening: selector behavior, ABI, DSR 32, performance, model state, CUDA A/B and
+release state are unchanged.
