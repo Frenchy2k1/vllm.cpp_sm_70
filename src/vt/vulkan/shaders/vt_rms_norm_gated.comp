@@ -1,0 +1,77 @@
+#version 450
+// vt::RmsNormGated — the GDN output norm (gdn-semantics.md §5,
+// norm_before_gate=True, group_size=None):
+//     out = x * rsqrt(mean(x^2) + eps) * w * act(gate),  act = silu | sigmoid
+// Ported 1:1 from src/vt/cpu/cpu_ops.cpp:1210-1235 RmsNormGatedKernel.
+//
+// SILU IS SPELLED `z / (1 + exp(-z))`, not `z * sigmoid(z)`. That is the CPU
+// reference's spelling (cpu_ops.cpp:916 `Silu`) and the two differ by a rounding
+// step, so writing the other one would put this kernel a ulp off its own oracle
+// for no reason.
+//
+// THE GATE MAY BE A PADDED-ROW rank-3 view. On the merged-qkvz path the gate is
+// the `z` slice of one fused projection viewed as [T,Hv,D], so its token stride
+// exceeds Hv*D while the inner [Hv,D] block stays contiguous
+// (src/vt/ops.cpp:1798-1810). The CPU kernel maps super-row i to
+// (token = i / gate_group, head = i % gate_group) and honours that outer stride;
+// a contiguous rank-2 gate degenerates to gate_group == 1 and
+// gate_outer == d, which reproduces the flat indexing byte-for-byte.
+//
+// Dispatch shape: ONE WORKGROUP PER ROW with a shared-memory tree reduction,
+// exactly like vt_rms_norm (llama.cpp `vulkan-shaders/rms_norm.comp:37-83`
+// @ 237ad9b96). The tree changes the ACCUMULATION ORDER of the mean-square
+// relative to the CPU's sequential loop, so this kernel is in the NMSE tier, not
+// the bit-exact tier — the same trade vt_rms_norm already makes. The scale is
+// `1.0 / sqrt(...)`, NOT `inversesqrt` (vt_common.glsl § DELIBERATE DIVERGENCES).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Xb32 { uint v[]; } X32;
+layout(binding = 1) readonly buffer Xb16 { uint16_t v[]; } X16;
+layout(binding = 2) readonly buffer Zb32 { uint v[]; } Z32;
+layout(binding = 3) readonly buffer Zb16 { uint16_t v[]; } Z16;
+layout(binding = 4) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 5) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(binding = 6) buffer Db32 { uint v[]; } D32;
+layout(binding = 7) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint rows;        // x.Numel() / d  (T for rank-2, T*Hv for rank-3)
+  uint d;           // the normalized (innermost) dim
+  uint x_dt, z_dt, w_dt, out_dt;
+  uint sigmoid_gate;  // 0 = silu, 1 = sigmoid (RmsNormGatedArgs::sigmoid_gate)
+  uint gate_group;    // gate.rank == 3 ? gate.shape[1] : 1
+  uint gate_outer;    // gate.stride[0], in ELEMENTS
+  uint x_off, z_off, w_off, out_off;
+  float eps;
+} p;
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint rbase = row * p.d;
+
+  float partial = 0.0;
+  for (uint j = tid; j < p.d; j += VT_TG) {
+    float v = VT_LOAD(X32, X16, p.x_dt, p.x_off, rbase + j);
+    partial += v * v;
+  }
+  float sumsq = vt_tg_sum(tid, partial);
+  float inv = 1.0 / sqrt(sumsq / float(p.d) + p.eps);
+
+  // cpu_ops.cpp:1228 — (i / gate_group) * gate_outer + (i % gate_group) * d.
+  uint gbase = (row / p.gate_group) * p.gate_outer + (row % p.gate_group) * p.d;
+
+  for (uint j = tid; j < p.d; j += VT_TG) {
+    float z = VT_LOAD(Z32, Z16, p.z_dt, p.z_off, gbase + j);
+    float act = p.sigmoid_gate != 0u ? (1.0 / (1.0 + exp(-z)))   // Sigmoid
+                                     : (z / (1.0 + exp(-z)));    // Silu
+    // Multiplication ORDER matches cpu_ops.cpp:1232 left to right:
+    // ((x * inv) * w) * act.
+    float xv = VT_LOAD(X32, X16, p.x_dt, p.x_off, rbase + j);
+    float wj = VT_LOAD(W32, W16, p.w_dt, p.w_off, j);
+    VT_STORE(D32, D16, p.out_dt, p.out_off, rbase + j, xv * inv * wj * act);
+  }
+}
