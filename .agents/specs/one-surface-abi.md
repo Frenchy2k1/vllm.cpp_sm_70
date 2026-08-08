@@ -228,9 +228,13 @@ Release `-Werror` build: `test_platform` 11/11·85,
 `test_capi` 45/45·428. Each of the three review mutations (wrong returned
 platform identity, forced-CPU selector input and prefix name matching) is RED.
 The standalone selector target is non-vacuous under
-`scripts/check-test-registration.py`: the guard requires its exact source
-invocation and proves that `vllm_cpp_add_test` still creates an executable and
-registers it with CTest. Its 15/15 mutation suite kills deletion of the target,
-source substitution, deletion of either helper registration, duplication and
-loss of preflight/CI wiring.
+`scripts/check-test-registration.py`: a disposable CPU-only CMake configure and
+File-API codemodel query prove that the target exists with its exact source,
+then CTest JSON proves that the configured target is registered. The workflow
+guard parses the dedicated YAML literal block into exact direct command argv,
+so commands hidden behind shell control flow or quoted as inert text do not
+count. Its 23/23 mutation suite kills deletion/source substitution/duplication,
+CMake bracket comments and false conditionals, inactive helper bodies, inert CI
+shell branches, quoted CI text, loss of preflight/CI wiring, and deletion of a
+mutation case's outcome assertion.
 No CUDA runtime was used; the existing GPU A/B residual remains.
