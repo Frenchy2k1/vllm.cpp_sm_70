@@ -43335,3 +43335,21 @@ Gates: `check-device-leakage` RED→GREEN (`kcuda=0`, DSR 32 == baseline 32);
 `check-doc-checkpoint` is RED on `1a021b1b` itself (that policy commit touched
 70+ `.agents/` files without docs/BENCHMARKS.md + docs/FEATURES.md); it validates
 HEAD, so it self-heals as compliant commits land.
+
+## 2026-08-09 — Review failures are an enforced until-PASS continuation loop
+<!-- state: 2026-08-09T00:10 -->
+
+Governance task `review-failure-continuation` closes the gap found by the fresh
+review of the universal session entrypoint. `POL-REVIEW-NO-REPAIR` now requires
+every actionable in-scope `FAIL` to return to a fresh implementer, run focused
+and full gates, and reach a fresh scoped reviewer; that cycle repeats until
+`PASS`. Attempt and retry budgets are scheduling controls, never terminal
+blockers for a correctable finding. Only explicit developer direction or a
+precise external authority/resource blocker may stop the cycle short of
+`PASS`, and the coordinating/operator session still never repairs findings.
+
+The closed operator grammar adds `OP-CONTINUE` and removes the generic
+`STOP-BLOCKER` escape in favor of exact authority, resource, developer, and
+remote-state stops. Policy, T0, workflow, prompt, prompt checker, protocol
+checker, and mutation suites move together; no product or benchmark code
+changes, so the public benchmark result remains NOT APPLICABLE.

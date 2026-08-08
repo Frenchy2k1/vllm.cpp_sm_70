@@ -699,6 +699,11 @@ class OrchestrationLoopTests(unittest.TestCase):
             "mutate, not read",
             "run the row's gate yourself",
             "never fix findings yourself",
+            "repeat this cycle until pass",
+            "attempt and retry budgets are scheduling controls",
+            "never terminal blockers for correctable findings",
+            "explicit developer direction",
+            "precise external authority or resource blocker",
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, lowered)
@@ -773,6 +778,11 @@ class OrchestrationLoopTests(unittest.TestCase):
                 "mutate, not read",
                 "run the row's gate yourself",
                 "never fix findings yourself",
+                "repeat this cycle until pass",
+                "attempt and retry budgets are scheduling controls",
+                "never terminal blockers for correctable findings",
+                "explicit developer direction",
+                "precise external authority or resource blocker",
             },
             "LOOP_REQUIRED no longer enforces exactly the phrases this suite "
             "demands; narrowing one is how the gate stops catching what it was "
