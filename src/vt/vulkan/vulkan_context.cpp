@@ -35,6 +35,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -545,6 +546,7 @@ VulkanContext::VulkanContext() {
   dispatch_hist_ = new std::map<std::string, uint64_t>();
   dispatch_ms_ = new std::map<std::string, double>();
   batch_names_ = new std::vector<std::string>();
+  batch_buffers_ = new std::set<void*>();
   // TWO timestamps per dispatch (before and after), for a whole batch. Created
   // only under the stats flag: a query pool is cheap, but writing timestamps adds
   // commands to every dispatch and production must not pay for a diagnostic.
@@ -897,17 +899,54 @@ uint32_t VulkanContext::pending_batch() const {
   return batch_count_;
 }
 
-void VulkanContext::FlushBatch() {
+void VulkanContext::FlushIfBatchTouches(void* buffer, const char* why) {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
-  FlushBatchLocked();
+  if (!batch_open_) return;
+  // A host pointer (nullptr) cannot alias a bound VkBuffer, so it never forces a
+  // drain. Otherwise drain only on a genuine intersection with the open batch.
+  if (buffer == nullptr) return;
+  const auto& bound = *static_cast<std::set<void*>*>(batch_buffers_);
+  if (bound.find(buffer) == bound.end()) return;
+  FlushBatchLocked(why);
+}
+
+void VulkanContext::FlushBatch(const char* why) {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  FlushBatchLocked(why);
 }
 
 // Ends the open command buffer, submits it, and WAITS. The wait is what makes
 // every descriptor set in the batch free to reuse and every write visible to the
 // host, so it is not an optimisation to drop: without it the reset below would
 // race the GPU.
-void VulkanContext::FlushBatchLocked() {
+void VulkanContext::FlushBatchLocked(const char* why) {
   if (!batch_open_) return;
+  if (kDispatchStats) {
+    static std::mutex fw_mu;
+    static std::map<std::string, std::pair<uint64_t, uint64_t>> fw;  // reason -> (count, dispatches)
+    static bool reg = false;
+    std::lock_guard<std::mutex> g(fw_mu);
+    auto& e = fw[why];
+    e.first += 1;
+    e.second += batch_count_;
+    if (!reg) {
+      reg = true;
+      static auto* snap = &fw;
+      static auto* snap_mu = &fw_mu;
+      std::atexit([] {
+        std::lock_guard<std::mutex> g2(*snap_mu);
+        std::fprintf(stderr, "[vt vulkan] FLUSH TRIGGERS  %-16s %10s %12s %8s\n",
+                     "reason", "flushes", "dispatches", "avg");
+        for (const auto& kv : *snap) {
+          std::fprintf(stderr, "[vt vulkan]                %-16s %10llu %12llu %8.1f\n",
+                       kv.first.c_str(),
+                       static_cast<unsigned long long>(kv.second.first),
+                       static_cast<unsigned long long>(kv.second.second),
+                       kv.second.first ? double(kv.second.second) / double(kv.second.first) : 0.0);
+        }
+      });
+    }
+  }
   const VulkanApi& vk = Api();
   auto device = Unpack<VkDevice>(device_);
   auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
@@ -951,6 +990,7 @@ void VulkanContext::FlushBatchLocked() {
   for (auto& kv : *static_cast<std::map<std::string, Pipeline>*>(pipelines_)) {
     kv.second.used_this_batch = 0;
   }
+  static_cast<std::set<void*>*>(batch_buffers_)->clear();
   batch_open_ = false;
   batch_count_ = 0;
 }
@@ -996,7 +1036,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // can reuse set 0, because the GPU has not necessarily read the earlier ones
   // yet. Flushing also resets every pipeline's counter.
   if (kBatchDispatch && (p.used_this_batch >= kRingDepth || batch_count_ >= kMaxBatch)) {
-    FlushBatchLocked();
+    FlushBatchLocked(p.used_this_batch >= kRingDepth ? "ring-full" : "batch-cap");
   }
 
   VkDescriptorSet set = kBatchDispatch ? p.sets[p.used_this_batch] : p.sets[0];
@@ -1072,6 +1112,10 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   }
 
   if (kBatchDispatch) {
+    auto& bound = *static_cast<std::set<void*>*>(batch_buffers_);
+    for (uint32_t i = 0; i < buffer_count; ++i) {
+      bound.insert(const_cast<void*>(buffers[i]));
+    }
     ++p.used_this_batch;
     ++batch_count_;
     return;  // submitted by FlushBatch, at the next host read or Synchronize

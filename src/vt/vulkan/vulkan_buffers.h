@@ -50,6 +50,10 @@ struct Resolved {
   uint32_t offset = 0;     // BYTE offset from the buffer's start
 };
 Resolved Resolve(const void* ptr, const char* what);
+// Non-throwing: returns {nullptr, 0} when `ptr` is not inside any Vulkan
+// allocation. Needed to ask "is this pointer device memory?" of an arbitrary
+// host pointer without treating the answer NO as an error.
+Resolved TryResolve(const void* ptr);
 
 }  // namespace vt::vulkan
 
