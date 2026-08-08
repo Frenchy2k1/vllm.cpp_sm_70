@@ -314,6 +314,23 @@ class CommandLineContract(unittest.TestCase):
 
 
 class RepositoryRegistry(unittest.TestCase):
+    def test_review_failure_policy_requires_continuation_until_pass(self) -> None:
+        rule = load_policy(ROOT)["POL-REVIEW-NO-REPAIR"]
+        for clause in (
+            "actionable in-scope findings",
+            "fresh implementer",
+            "without repair in the coordinating session",
+            "focused and full gates",
+            "fresh scoped review",
+            "until PASS",
+            "attempt budgets never terminate correctable findings",
+            "explicit developer direction",
+            "precise external authority or resource blocker",
+        ):
+            with self.subTest(clause=clause):
+                self.assertIn(clause, rule.requirement)
+        self.assertEqual(rule.waiver_class, "never")
+
     def test_accepted_design_inventory_passes_schema(self) -> None:
         rules = load_policy(ROOT)
         self.assertLessEqual(len(rules), 60)
@@ -375,7 +392,7 @@ class ConsolidationMutations(unittest.TestCase):
         self.assertTrue(any("12 KiB" in error for error in self.errors()))
 
         shutil.copy2(ROOT / "AGENTS.md", path)
-        self.mutate("AGENTS.md", "1. Resolve the worktree role", "1. Read task state before role; then resolve the worktree role")
+        self.mutate("AGENTS.md", "1. Run `scripts/agent-start.py`", "1. Read task state before running `scripts/agent-start.py`")
         self.assertTrue(any("boot block" in error for error in self.errors()))
 
         shutil.copy2(ROOT / "AGENTS.md", path)

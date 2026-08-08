@@ -8,7 +8,7 @@ and evidence. If prose conflicts with the registry, the registry wins.
 ## Boot order
 
 <!-- policy-boot:begin -->
-1. Resolve the worktree role with `python3 scripts/agent-role.py show`; claim the developer-selected role only when no valid role exists.
+1. Run `scripts/agent-start.py`; pass explicit intent when known, follow its role action, and rerun it after declaration.
 2. Resolve `.env` and `.agents/developer-preferences.md` from the shared checkout, requesting only values required by the current task.
 3. Read `.agents/NOW.md` for the live snapshot.
 4. Read `.agents/policy.csv`, then the procedure named by each applicable rule.
@@ -28,6 +28,7 @@ byte-for-byte. Do not edit it independently.
 
 <!-- policy-t0:begin -->
 - `POL-AUTH-REGISTRY` — Use policy.csv as the sole repository-policy authority.
+- `POL-BOOT-ENTRYPOINT` — Run agent-start before role declaration preflight or task state.
 - `POL-ROLE-DECLARED` — Declare operator helper or read-only and keep the role state consistent with the worktree.
 - `POL-SPIKE-FIRST` — Commit a complete spike spec before a row enters READY or ACTIVE.
 - `POL-MIRROR-VLLM` — Mirror every applicable vLLM mode instead of inventing product behavior.
@@ -35,7 +36,7 @@ byte-for-byte. Do not edit it independently.
 - `POL-CORRECTNESS-GATE` — Pass the declared token-exact or ratified distributional correctness gate before performance acceptance.
 - `POL-PREFLIGHT` — Run the applicable preflight and prevent a failed gate from being followed by a push.
 - `POL-REVIEW-FRESH` — Use a fresh reviewer that performs static review and targeted scratch mutation.
-- `POL-REVIEW-NO-REPAIR` — Return findings to a fresh implementer and do not repair them in the coordinating session.
+- `POL-REVIEW-NO-REPAIR` — Return actionable in-scope findings to a fresh implementer without repair in the coordinating session and repeat focused and full gates plus fresh scoped review until PASS; attempt budgets never terminate correctable findings and only explicit developer direction or a precise external authority or resource blocker may stop the loop.
 - `POL-OPERATOR-VERIFY` — Run the claimed gate instead of trusting an implementer report.
 - `POL-ONE-SURFACE` — Expose every shipped capability through include/vllm.h and keep examples as thin clients of the same library surface.
 - `POL-EVIDENCE-PRESERVE` — Move evidence without deleting it.
@@ -92,6 +93,7 @@ combination. Historical policy and evidence are archived under
 ## Essential commands
 
 ```sh
+scripts/agent-start.py
 python3 scripts/agent-role.py show
 scripts/agent-preflight.sh
 scripts/agent-preflight.sh --staged

@@ -83,6 +83,7 @@ SUITES=(
   test_check_release_binary_contract
   test_agent_role
   test_agent_onboard
+  test_agent_start
   test_claim_view
   test_upstream_inventory
   test_doc_checkpoint
@@ -121,11 +122,8 @@ if role_line=$(python3 scripts/agent-role.py show 2>&1); then
   printf '  \033[32mok\033[0m   %s\n' "$role_line"
 else
   printf '  \033[33m--\033[0m   %s\n' "$(printf '%s' "$role_line" | head -1)"
-  printf '       This session has not declared a role. Ask what the work is:\n'
-  printf '         a long or multi-step campaign  -> scripts/agent-role.py claim operator\n'
-  printf '         one scoped change              -> scripts/agent-role.py claim helper --row <ROW-ID>\n'
-  printf '         just reading or answering      -> scripts/agent-role.py claim read-only\n'
-  printf '       Add --headless to an unattended run. See .agents/workflow.md.\n'
+  printf '       This session has not declared a role. Run scripts/agent-start.py\n'
+  printf '       for the canonical role interview and exact next actions.\n'
   if [ "$REQUIRE_ROLE" -eq 1 ]; then
     failed+=("role-undeclared")
   fi

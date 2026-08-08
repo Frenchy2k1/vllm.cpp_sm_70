@@ -458,6 +458,52 @@ class InterviewBlockTests(unittest.TestCase):
                 self.assertTrue(consistency.interview_errors(text.replace(needle, "")))
 
 
+class SessionEntrypointTests(unittest.TestCase):
+    def _manual(self) -> str:
+        return (ROOT / consistency.ENTRYPOINT_DOCUMENT).read_text(encoding="utf-8")
+
+    def test_workflow_carries_start_before_preflight(self):
+        text = self._manual()
+        self.assertEqual(text.count(consistency.ENTRYPOINT_MARKER), 1)
+        self.assertEqual(text.count(consistency.ENTRYPOINT_END), 1)
+        self.assertEqual(consistency.entrypoint_errors(text), [])
+
+    def test_missing_or_reordered_entrypoint_is_rejected(self):
+        missing = consistency.entrypoint_errors("run preflight")
+        self.assertTrue(any("session-entrypoint" in error for error in missing))
+        reordered = "\n".join(
+            (
+                consistency.ENTRYPOINT_MARKER,
+                "Run scripts/agent-preflight.sh.",
+                "Run scripts/agent-start.py --intent helper.",
+                consistency.ENTRYPOINT_END,
+            )
+        )
+        self.assertTrue(
+            any(
+                "before preflight" in error
+                for error in consistency.entrypoint_errors(reordered)
+            )
+        )
+
+    def test_each_required_route_is_mutation_bound(self):
+        text = self._manual()
+        for needle in consistency.ENTRYPOINT_REQUIRED:
+            with self.subTest(needle=needle):
+                self.assertTrue(
+                    consistency.entrypoint_errors(text.replace(needle, ""))
+                )
+
+    def test_main_calls_the_entrypoint_gate(self):
+        text = self._manual()
+        damaged = text.replace("scripts/agent-start.py", "", 1)
+        self.assertNotEqual(damaged, text)
+        with _repo_copy(damaged) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1)
+        self.assertIn("session entrypoint", err)
+
+
 class InterviewWiring(unittest.TestCase):
     """The checker must CALL interview_errors, not merely define it.
 
@@ -653,6 +699,11 @@ class OrchestrationLoopTests(unittest.TestCase):
             "mutate, not read",
             "run the row's gate yourself",
             "never fix findings yourself",
+            "repeat this cycle until pass",
+            "attempt and retry budgets are scheduling controls",
+            "never terminal blockers for correctable findings",
+            "explicit developer direction",
+            "precise external authority or resource blocker",
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, lowered)
@@ -727,6 +778,11 @@ class OrchestrationLoopTests(unittest.TestCase):
                 "mutate, not read",
                 "run the row's gate yourself",
                 "never fix findings yourself",
+                "repeat this cycle until pass",
+                "attempt and retry budgets are scheduling controls",
+                "never terminal blockers for correctable findings",
+                "explicit developer direction",
+                "precise external authority or resource blocker",
             },
             "LOOP_REQUIRED no longer enforces exactly the phrases this suite "
             "demands; narrowing one is how the gate stops catching what it was "

@@ -1,5 +1,13 @@
 # Session onboarding — ask, don't assume
 
+<!-- session-entrypoint:begin -->
+Every session first runs `scripts/agent-start.py`. Explicit work supplies
+`--intent operator|helper|read-only` and a known helper row, suppressing the
+first-time welcome. Follow the printed claim instruction, rerun the entrypoint
+from materialized state, and then run `scripts/agent-preflight.sh`. The router
+is non-interactive and owns no role, lock, worktree, environment value, or gate.
+<!-- session-entrypoint:end -->
+
 User-directed 2026-08-06. Status: **IMPLEMENTED 2026-08-06**, except the one
 piece § Enforcement marks DEFERRED (refusal on write paths other than
 `preflight --staged`). This document is the contract; § Work breakdown records

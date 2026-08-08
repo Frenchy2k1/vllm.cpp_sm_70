@@ -47,6 +47,7 @@ PROCEDURE_BUDGETS = {
 }
 T0_RULE_IDS = (
     "POL-AUTH-REGISTRY",
+    "POL-BOOT-ENTRYPOINT",
     "POL-ROLE-DECLARED",
     "POL-SPIKE-FIRST",
     "POL-MIRROR-VLLM",
@@ -61,7 +62,7 @@ T0_RULE_IDS = (
     "POL-PR-DISPOSITION",
 )
 BOOT_BLOCK = """<!-- policy-boot:begin -->
-1. Resolve the worktree role with `python3 scripts/agent-role.py show`; claim the developer-selected role only when no valid role exists.
+1. Run `scripts/agent-start.py`; pass explicit intent when known, follow its role action, and rerun it after declaration.
 2. Resolve `.env` and `.agents/developer-preferences.md` from the shared checkout, requesting only values required by the current task.
 3. Read `.agents/NOW.md` for the live snapshot.
 4. Read `.agents/policy.csv`, then the procedure named by each applicable rule.

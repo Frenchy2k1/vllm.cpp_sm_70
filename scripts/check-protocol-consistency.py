@@ -49,6 +49,18 @@ INTERVIEW_DOCUMENT = ".agents/workflow.md"
 INTERVIEW_MARKER = "<!-- role-interview:begin -->"
 INTERVIEW_REQUIRED = ("claim operator", "claim helper --row", "claim read-only", "--headless")
 
+# The authoritative policy routes session start through one executable before
+# role declaration and preflight. Welcome copy stays in source, not context.
+ENTRYPOINT_DOCUMENT = ".agents/workflow.md"
+ENTRYPOINT_MARKER = "<!-- session-entrypoint:begin -->"
+ENTRYPOINT_END = "<!-- session-entrypoint:end -->"
+ENTRYPOINT_REQUIRED = (
+    "POL-BOOT-ENTRYPOINT",
+    "scripts/agent-start.py",
+    "--intent",
+    "scripts/agent-preflight.sh",
+)
+
 # The same manual must carry the operator's LOOP. The prompts handed to
 # sub-agents cannot by themselves tell the operator how to run one, and
 # the three rules that carry the whole return are exactly the ones an operator
@@ -70,6 +82,11 @@ LOOP_REQUIRED = (
     "mutate, not read",
     "run the row's gate yourself",
     "never fix findings yourself",
+    "repeat this cycle until pass",
+    "attempt and retry budgets are scheduling controls",
+    "never terminal blockers for correctable findings",
+    "explicit developer direction",
+    "precise external authority or resource blocker",
 )
 
 CUTOVER_WIRING = {
@@ -89,7 +106,10 @@ CUTOVER_WIRING = {
         "tests/scripts/test_agent_gates.py",
         ".agents/policy-cutover",
     ),
-    ".githooks/pre-push": ("check-policy.py", "check-prompt-contract.py"),
+    ".githooks/pre-push": (
+        "CHECKERS=(check-policy.py",
+        "check-prompt-contract.py",
+    ),
     "scripts/agent-ready.py": (
         "REMOTE_UNVERIFIED",
         "if not run_local_preflight():",
@@ -164,6 +184,39 @@ def interview_errors(text: str) -> list[str]:
         for needle in INTERVIEW_REQUIRED
         if needle not in text
     ]
+
+
+def entrypoint_block(text: str) -> str | None:
+    """Return the bounded universal-entrypoint procedure, when complete."""
+    start = text.find(ENTRYPOINT_MARKER)
+    if start == -1:
+        return None
+    end = text.find(ENTRYPOINT_END, start)
+    if end == -1:
+        return None
+    return text[start + len(ENTRYPOINT_MARKER) : end]
+
+
+def entrypoint_errors(text: str) -> list[str]:
+    """Require the canonical start command to precede preflight."""
+    block = entrypoint_block(text)
+    if block is None:
+        return [
+            f"{ENTRYPOINT_DOCUMENT} is missing the session-entrypoint block "
+            f"({ENTRYPOINT_MARKER} ... {ENTRYPOINT_END})"
+        ]
+    errors = [
+        f"{ENTRYPOINT_DOCUMENT} session entrypoint omits {needle!r}"
+        for needle in ENTRYPOINT_REQUIRED
+        if needle not in block
+    ]
+    start = block.find("scripts/agent-start.py")
+    preflight = block.find("scripts/agent-preflight.sh")
+    if start != -1 and preflight != -1 and start > preflight:
+        errors.append(
+            f"{ENTRYPOINT_DOCUMENT} session entrypoint must route agent-start before preflight"
+        )
+    return errors
 
 
 def loop_block(text: str) -> str | None:
@@ -251,6 +304,12 @@ def main() -> int:
             interview_errors(interview.read_text(encoding="utf-8"))
         )
 
+    entrypoint = ROOT / ENTRYPOINT_DOCUMENT
+    if not entrypoint.exists():
+        failures.append(f"{ENTRYPOINT_DOCUMENT} does not exist")
+    else:
+        failures.extend(entrypoint_errors(entrypoint.read_text(encoding="utf-8")))
+
     # INTERVIEW_DOCUMENT and LOOP_DOCUMENT are the same manual today, but the
     # two obligations are independent and either may move, so each resolves its
     # own path rather than sharing one read.
@@ -270,8 +329,12 @@ def main() -> int:
             "Public-document policy rows must fully parse through "
             "scripts/check-doc-checkpoint.py. The role interview is the block between "
             f"{INTERVIEW_MARKER} and its :end in {INTERVIEW_DOCUMENT}; it must "
-            "name every answer agent-role.py accepts. The operator's loop is "
-            f"the block between {LOOP_MARKER} and its :end in {LOOP_DOCUMENT}; "
+            "name every answer agent-role.py accepts. The session entrypoint is "
+            f"the block between {ENTRYPOINT_MARKER} "
+            f"and {ENTRYPOINT_END} in {ENTRYPOINT_DOCUMENT}; it must route "
+            "scripts/agent-start.py before scripts/agent-preflight.sh. "
+            f"The operator's loop is the block between {LOOP_MARKER} and its "
+            f":end in {LOOP_DOCUMENT}; "
             f"it must carry {', '.join(repr(n) for n in LOOP_REQUIRED)} inside "
             "the block. Every runtime prompt must satisfy the closed grammar "
             "in scripts/check-prompt-contract.py; unknown prose is a failure.",
@@ -282,7 +345,8 @@ def main() -> int:
     print(
         "OK: public-document policy matches scripts/check-doc-checkpoint.py, "
         f"{INTERVIEW_DOCUMENT} carries the "
-        f"role interview and the orchestration loop, all runtime prompts satisfy "
+        "role interview, universal session entrypoint, and orchestration loop, "
+        "all runtime prompts satisfy "
         "the closed semantic contract, and cutover wiring is complete."
     )
     return 0
