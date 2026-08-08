@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = ("src", "include")
-SCAN_SUFFIXES = (".cpp", ".cc", ".cu", ".cuh", ".c", ".h", ".hpp", ".hh")
+SCAN_SUFFIXES = (".cpp", ".cc", ".cu", ".cuh", ".c", ".h", ".hpp", ".hh", ".hip")
 ENV_DOC = ROOT / "docs/ENVIRONMENT.md"
 ALLOWLIST = ROOT / "scripts/env-doc-allowlist.txt"
 

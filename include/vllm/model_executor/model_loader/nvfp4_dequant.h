@@ -76,4 +76,12 @@ void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
 void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
                       int64_t numel, uint16_t* out_bf16);
 
+// Channel-wise FP8 (compressed-tensors / llm-compressor FP8_DYNAMIC weights):
+//   weight_f8     [N, K]  F8_E4M3
+//   scale_bf16    [N] or [N,1]  bf16 per-output-channel scale
+//   out_bf16      [N, K]
+//   out[n,k] = bf16( f8(w[n,k]) * bf16_to_f32(scale[n]) )
+void DequantFp8ChannelToBf16(const uint8_t* weight_f8, const uint16_t* scale_bf16,
+                             int64_t N, int64_t K, uint16_t* out_bf16);
+
 }  // namespace vllm

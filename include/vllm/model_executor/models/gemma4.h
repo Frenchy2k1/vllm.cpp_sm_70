@@ -53,6 +53,7 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"          // PagedKvCache, ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
+#include "vllm/model_executor/models/gemma4_moe.h"       // MoE AWQ layer weights
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/kv_cache_interface.h"
@@ -97,9 +98,13 @@ struct Gemma4LayerWeights {
   OwnedTensor layer_scalar;               // bf16 [1]  (learned per-layer scalar)
   Gemma4AttnWeights attn;
   Gemma4MlpWeights mlp;
+  // Parallel MoE (26B-A4B): empty when enable_moe_block=false (12B dense).
+  Gemma4MoeLayerWeights moe;
   bool is_full_attention = false;  // layer_type == "full_attention"
   bool is_kv_shared = false;       // layer_idx >= num_layers - num_kv_shared_layers
+  bool k_eq_v = false;             // no v_proj; V shares K (attention_k_eq_v)
   int64_t head_dim = 0;            // 512 full / 256 sliding
+  int64_t num_kv_heads = 0;        // may differ full vs sliding (global vs local GQA)
   int64_t kv_target_layer = -1;    // for shared layers: source of K/V (-1 = self)
 };
 
@@ -115,14 +120,18 @@ struct Gemma4Weights {
   OwnedTensor final_norm;               // bf16 [H]  (model.norm, plain RMSNorm)
   OwnedTensor lm_head;                  // bf16 [H, vocab] Matmul-B; EMPTY when tied
   std::vector<Gemma4LayerWeights> layers;
+  // Keeps safetensors mmaps alive for borrowed fused expert tensors (26B MoE).
+  std::shared_ptr<const void> shards_keepalive;
 };
 
-// Load the `Gemma4ForConditionalGeneration` text backbone (unsloth/gemma-4-E4B-it)
-// safetensors into Gemma4Weights. Name map strips the mm wrapper's
-// `model.language_model.` prefix; the vision/audio towers + embed_vision/
-// embed_audio projectors are SKIPPED (handled by the future G2/G3 towers).
+// Dense / small loads (shards need not outlive weights).
 Gemma4Weights LoadGemma4ForConditionalGenerationWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
+// MoE BF16: experts mmap-borrowed; pass FromSafetensorsOwned shared_ptr.
+Gemma4Weights LoadGemma4ForConditionalGenerationWeightsOwned(
+    std::shared_ptr<const std::vector<SafetensorsFile>> shards,
+    const HfConfig& config);
 
 // The Gemma-4 text backbone forward. Per decoder layer (gemma4.py:709-767):
 //   r=h; input_layernorm(h) -> attn(Q/K/V plain-norm, V weight-less norm, dual

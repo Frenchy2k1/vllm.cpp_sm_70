@@ -25,11 +25,16 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/models/gemma4.h"
+#include "vllm/model_executor/models/gemma4_moe.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 
 namespace vllm {
 namespace {
@@ -81,15 +86,25 @@ std::unique_ptr<LoadedModel> LoadGemma4ForConditionalGeneration(
   }
   return std::make_unique<Gemma4LoadedModel>(
       registration,
-      LoadGemma4ForConditionalGenerationWeights(*source.safetensors, config));
+      source.safetensors_owned
+          ? LoadGemma4ForConditionalGenerationWeightsOwned(source.safetensors_owned,
+                                                           config)
+          : LoadGemma4ForConditionalGenerationWeights(*source.safetensors, config));
 }
 
 void PrepareGemma4ForConditionalGeneration(LoadedModel& model,
                                            const HfConfig& config,
                                            vt::Queue& queue) {
-  (void)model;
   (void)config;
   (void)queue;
+  const char* env = std::getenv("VT_GEMMA4_RESIDENT_EXPERTS");
+  if (env == nullptr || env[0] != '1') return;
+  auto& gemma = static_cast<Gemma4LoadedModel&>(model);
+  Gemma4Weights& w = const_cast<Gemma4Weights&>(gemma.weights());
+  int ngpu = 2;  // Upload clamps to hipGetDeviceCount
+  if (const char* g = std::getenv("VT_GEMMA4_RESIDENT_GPUS"))
+    ngpu = std::max(1, std::atoi(g));
+  UploadGemma4ExpertsResidentForWeights(w, ngpu);
 }
 
 ForwardLogits ForwardGemma4ForConditionalGeneration(
@@ -159,6 +174,13 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
           ? config.raw.at("text_config")
           : config.raw;
   const int num_kv_heads = static_cast<int>(config.num_key_value_heads);
+  const int num_kv_heads_full = [&]() {
+    if (const auto it = raw.find("num_global_key_value_heads");
+        it != raw.end() && it->is_number_integer()) {
+      return it->get<int>();
+    }
+    return num_kv_heads;
+  }();
   const int head_dim_sliding = static_cast<int>(config.head_dim);  // 256
   int head_dim_full = head_dim_sliding;                            // 512
   if (const auto it = raw.find("global_head_dim");
@@ -168,11 +190,6 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
   const vt::DType kv_dtype = v1::ResolveKvCacheDType();
   const int64_t L = config.num_hidden_layers;
 
-  // Per-layer full_attention flag from config.layer_types (gemma4.py:441-489);
-  // a missing/short array defaults a layer to sliding (head_dim_sliding). This
-  // mirrors gemma4_weights.cpp::MakeTopo (allocation only needs head_dim; YOCO
-  // kv_target is handled in the forward, not here — G1c would DEDUP the shared
-  // layers' unused buffers).
   std::vector<bool> is_full(static_cast<size_t>(L), false);
   if (const auto it = raw.find("layer_types");
       it != raw.end() && it->is_array()) {
@@ -188,14 +205,15 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"fa"},
       std::make_shared<v1::FullAttentionSpec>(
-          block_size, num_kv_heads, std::max(head_dim_sliding, head_dim_full),
-          kv_dtype));
+          block_size, std::max(num_kv_heads, num_kv_heads_full),
+          std::max(head_dim_sliding, head_dim_full), kv_dtype));
   kv.per_layer_attn_specs.reserve(static_cast<size_t>(L));
   for (int64_t l = 0; l < L; ++l) {
-    const int hd = is_full[static_cast<size_t>(l)] ? head_dim_full
-                                                   : head_dim_sliding;
+    const bool full = is_full[static_cast<size_t>(l)];
+    const int hd = full ? head_dim_full : head_dim_sliding;
+    const int hkv = full ? num_kv_heads_full : num_kv_heads;
     kv.per_layer_attn_specs.push_back(std::make_shared<v1::FullAttentionSpec>(
-        block_size, num_kv_heads, hd, kv_dtype));
+        block_size, hkv, hd, kv_dtype));
   }
   return kv;
 }
@@ -214,5 +232,10 @@ std::unique_ptr<LoadedModel> BorrowGemma4LoadedModel(const Gemma4Weights& weight
 
 REGISTER_VLLM_MODEL(gemma4, "Gemma4ForConditionalGeneration", kGemma4Factory,
                     kGemma4Info)
+// google/gemma-4-12B-it (and other "unified" HF exports) advertise this arch
+// name with model_type gemma4_unified. Same text backbone factory; the weight
+// loader tolerates no-PLE dense layouts (hidden_size_per_layer_input==0).
+REGISTER_VLLM_MODEL(gemma4_unified, "Gemma4UnifiedForConditionalGeneration",
+                    kGemma4Factory, kGemma4Info)
 
 }  // namespace vllm

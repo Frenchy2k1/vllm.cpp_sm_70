@@ -77,7 +77,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV4ForCausalLM', "
       "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
-      "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
+      "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "

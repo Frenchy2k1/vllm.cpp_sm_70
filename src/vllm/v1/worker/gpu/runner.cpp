@@ -85,6 +85,31 @@ static bool AsyncRunnerEnvDefault() {
   return AsyncRunnerFlagIsOn(std::getenv("VT_ASYNC_RUNNER"));
 }
 
+// Async input-combine reads the sampled token id back on the host between
+// steps. Where that read is valid the default-ON async path stays on:
+//   - kCPU: host and device memory are the same allocation, so the read is
+//     always valid. This path was correct, default-ON, and contract-tested
+//     before the ROCm work; it MUST stay true (else the CPU backend silently
+//     regresses to synchronous depth-1).
+//   - kCUDA: the sampled id is device-mirrored (async_device_mirror()).
+// A DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) is the real hazard: the non-CUDA
+// leg of sample_tokens_async Synchronizes and then host-dereferences dev_ids,
+// which is a device Alloc — valid on CPU/UMA, garbage off-device. That is the
+// root cause of the "!" tokens on the lab R9700 (2026-08-07), not an embed
+// race. Keep those queues synchronous until a HIP sampled-token mirror or a D2H
+// copy of dev_ids lands.
+// TODO(rocm): an INTEGRATED non-CUDA GPU reports UnifiedMemory()==true (see
+// row/ROCM-UNIFIED-MEMORY-B), where the alias is valid and async would be safe;
+// route it through the backend UnifiedMemory() seam once reachable here.
+static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
+  if (queue.device.type == vt::DeviceType::kCPU) return true;
+#ifdef VLLM_CPP_CUDA
+  if (queue.device.type == vt::DeviceType::kCUDA) return true;
+#endif
+  (void)queue;
+  return false;
+}
+
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each
 // execute_model step prints the request count and the live/free recurrent-state
 // slot geometry to std::cerr. Read ONCE (never per-step getenv); bounded to the
@@ -319,7 +344,8 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
-  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
+                         QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -359,7 +385,8 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
-  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
+                         QueueSupportsAsyncInputCombine(queue_);
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
@@ -1647,6 +1674,17 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::vector<int32_t>& toks = sampler_output.sampled_token_ids[
         static_cast<size_t>(i)];
     out.sampled_token_ids.push_back(toks);
+
+    // Lab debug: VT_DEBUG_SAMPLED=1 prints every greedy token id. Read ONCE at
+    // static-init — never a per-token getenv in the sampling hot loop (matches
+    // the "read once, never per-step getenv" discipline stated above).
+    static const bool kDebugSampled = [] {
+      const char* e = std::getenv("VT_DEBUG_SAMPLED");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (kDebugSampled && !toks.empty()) {
+      std::fprintf(stderr, "vt-debug sampled req=%d tok=%d\n", i, toks.front());
+    }
 
     // Write-back: append each sampled token to slot i's token row so it becomes
     // the input at its position next step. num_tokens_no_spec is the next free
