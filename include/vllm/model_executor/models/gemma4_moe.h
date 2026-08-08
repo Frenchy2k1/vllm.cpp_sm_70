@@ -16,12 +16,15 @@ struct Gemma4Weights;
 
 // One FP8 expert (compressed-tensors channel scales). Host mmap borrows.
 struct Gemma4Fp8ExpertMats {
-  OwnedTensor gate_w;  // F8 as U8 [I,H]
+  OwnedTensor gate_w;  // F8 as I8 [I,H]
   OwnedTensor gate_s;  // BF16 [I] or [I,1]
   OwnedTensor up_w;
   OwnedTensor up_s;
   OwnedTensor down_w;  // F8 [H,I]
   OwnedTensor down_s;  // BF16 [H]
+  // Lazy host BF16 cache after first dequant (decode reuse).
+  mutable std::vector<uint16_t> cached_gu;  // [2I,H]
+  mutable std::vector<uint16_t> cached_dn;  // [H,I]
 };
 
 struct Gemma4FusedExperts {
