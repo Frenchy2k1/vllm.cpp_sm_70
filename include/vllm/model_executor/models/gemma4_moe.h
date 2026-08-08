@@ -1,4 +1,4 @@
-// Gemma-4 MoE (26B-A4B) BF16 fused experts — mmap host + optional device-resident.
+// Gemma-4 MoE experts: BF16 fused (Google) or FP8 per-expert (Firworks) + resident.
 #pragma once
 
 #include <cstddef>
@@ -14,17 +14,31 @@ namespace vllm {
 
 struct Gemma4Weights;
 
+// One FP8 expert (compressed-tensors channel scales). Host mmap borrows.
+struct Gemma4Fp8ExpertMats {
+  OwnedTensor gate_w;  // F8 as U8 [I,H]
+  OwnedTensor gate_s;  // BF16 [I] or [I,1]
+  OwnedTensor up_w;
+  OwnedTensor up_s;
+  OwnedTensor down_w;  // F8 [H,I]
+  OwnedTensor down_s;  // BF16 [H]
+};
+
 struct Gemma4FusedExperts {
-  OwnedTensor gate_up;  // bf16 [E, 2I, H] host mmap borrow
+  // Google BF16 fused stacks (optional).
+  OwnedTensor gate_up;  // bf16 [E, 2I, H]
   OwnedTensor down;     // bf16 [E, H, I]
+  // Firworks FP8 per-expert (optional). size()==E when is_fp8.
+  bool is_fp8 = false;
+  std::vector<Gemma4Fp8ExpertMats> fp8;
   int64_t num_experts = 0;
   int64_t intermediate = 0;
   int64_t hidden = 0;
-  // Optional full-stack device copy (VT_GEMMA4_RESIDENT_EXPERTS=1).
+  // Optional device-resident BF16 fused stacks after Prepare.
   mutable void* gate_up_dev = nullptr;
   mutable void* down_dev = nullptr;
-  mutable int dev_id = -1;  // HIP device; -1 = host stream
-  bool Empty() const { return gate_up.Empty(); }
+  mutable int dev_id = -1;
+  bool Empty() const { return gate_up.Empty() && fp8.empty(); }
 };
 
 struct Gemma4MoeLayerWeights {
@@ -50,12 +64,12 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
                               const vt::Tensor& router_in, const vt::Tensor& expert_in,
                               int64_t T, int64_t H, float rms_eps);
 
-// Upload each enabled layer's fused experts to a HIP device.
-// num_gpus<=1 → all on device 0; else layer L → device (L % num_gpus).
-// Returns total bytes placed on devices. Partial success still returns >0.
 size_t UploadGemma4ExpertsResident(std::vector<Gemma4MoeLayerWeights>& layers,
                                    int num_gpus);
-// Overload: upload each layer.moe in a full Gemma4Weights.
 size_t UploadGemma4ExpertsResidentForWeights(Gemma4Weights& weights, int num_gpus);
+
+// Dequant one FP8 expert into host BF16 gate_up[2I,H] and down[H,I] (caller-owned).
+void DequantGemma4Fp8ExpertToBf16(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H,
+                                  uint16_t* gate_up_out, uint16_t* down_out);
 
 }  // namespace vllm
