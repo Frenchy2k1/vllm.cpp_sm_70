@@ -46,9 +46,12 @@ REQUIRED_TEST_METHODS = (
     "test_public_release_rows_remain_pending",
     "test_human_w12_is_optional_and_cannot_replace_w10",
     "test_human_primary_artifact_contract_matches_machine_block",
+    "test_unknown_machine_fields_are_fail_closed",
+    "test_each_human_work_dependency_is_pinned",
     "test_primary_cuda_mutation_inventory_literal_is_pinned",
     "test_work_dependency_mutation_inventory_literal_is_pinned",
     "test_each_semantic_inventory_consumer_is_pinned",
+    "test_each_semantic_inventory_consumer_body_is_pinned",
     "test_checker_guard_map_keysets_are_exact",
     "test_required_mutation_test_inventory_is_pinned",
 )
@@ -77,6 +80,10 @@ GUARD_MAP_KEYS = {
         "PUBLIC_PENDING_MUTATIONS",
         "W10_W12_HUMAN_MUTATIONS",
         "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+        "INVENTORY_CONSUMER_METHODS",
+        "CONSUMER_FLOW_MUTATIONS",
+        "UNKNOWN_MACHINE_FIELD_MUTATIONS",
+        "HUMAN_WORK_DEPS",
         "GUARD_MAP_KEYS",
     ),
     "TEST_INVENTORY_CONSUMERS": (
@@ -89,6 +96,10 @@ GUARD_MAP_KEYS = {
         "PUBLIC_PENDING_MUTATIONS",
         "W10_W12_HUMAN_MUTATIONS",
         "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+        "INVENTORY_CONSUMER_METHODS",
+        "CONSUMER_FLOW_MUTATIONS",
+        "UNKNOWN_MACHINE_FIELD_MUTATIONS",
+        "HUMAN_WORK_DEPS",
         "GUARD_MAP_KEYS",
     ),
 }
@@ -205,7 +216,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 22 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 25 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -261,6 +272,41 @@ EXACT_MACHINE_FIELDS = {
         ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
         "docs/BENCHMARKS.md"
     ),
+}
+
+INVENTORY_CONSUMER_METHODS = {
+    "PRIMARY_CUDA_SMS": "test_each_primary_cuda_sm_is_required",
+    "EXACT_MACHINE_FIELDS": "test_each_exact_machine_field_is_fail_closed",
+    "EXPECTED_DEPS": "test_each_work_dependency_edge_is_pinned",
+    "HUMAN_WORK_IDS": "test_each_human_work_row_id_occurs_exactly_once",
+    "RECORD_ANCHORS": "test_each_required_record_anchor_is_fail_closed",
+    "LIFECYCLE_RECORD_MUTATIONS": "test_release_lifecycle_and_honesty_are_fail_closed",
+    "PUBLIC_PENDING_MUTATIONS": "test_public_release_rows_remain_pending",
+    "W10_W12_HUMAN_MUTATIONS": "test_human_w12_is_optional_and_cannot_replace_w10",
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS": (
+        "test_human_primary_artifact_contract_matches_machine_block"
+    ),
+    "GUARD_MAP_KEYS": "test_checker_guard_map_keysets_are_exact",
+}
+
+CONSUMER_FLOW_MUTATIONS = ("continue", "break", "wrap_false")
+
+UNKNOWN_MACHINE_FIELD_MUTATIONS = (("unexpected_field", "x"),)
+
+HUMAN_WORK_DEPS = {
+    "W1": "",
+    "W2": "W1",
+    "W3": "",
+    "W4": "",
+    "W5": "",
+    "W6": "",
+    "W7": "W1,W2,W3,W4,W5,W6",
+    "W8": "W5,W7",
+    "W9": "W3,W4,W5,W6,W7",
+    "W10": "W1,W2,W5,W6,W7",
+    "W11": "W5,W6,W7",
+    "W12": "W1,W2,W5,W6,W7",
+    "W13": "W5,W7,W8,W9,W10,W11",
 }
 
 
@@ -390,6 +436,107 @@ def bypass_checker_keyset_enforcement(root: Path) -> None:
     path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf-8")
 
 
+def mutate_inventory_consumer_flow(
+    root: Path, inventory: str, mutation: str
+) -> None:
+    relative = "tests/scripts/test_check_release_binary_contract.py"
+    path = root / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    method_name = INVENTORY_CONSUMER_METHODS[inventory]
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    loops = []
+    for node in ast.walk(method):
+        if not isinstance(node, ast.For):
+            continue
+        source = node.iter
+        if isinstance(source, ast.Name) and source.id == inventory:
+            loops.append(node)
+        elif (
+            isinstance(source, ast.Call)
+            and isinstance(source.func, ast.Attribute)
+            and isinstance(source.func.value, ast.Name)
+            and source.func.value.id == inventory
+            and source.func.attr == "items"
+        ):
+            loops.append(node)
+    if len(loops) != 1:
+        raise AssertionError(
+            f"expected one {inventory} consumer loop in {method_name}, found {len(loops)}"
+        )
+    loop = loops[0]
+    if mutation == "continue":
+        loop.body.insert(0, ast.Continue())
+    elif mutation == "break":
+        loop.body.insert(0, ast.Break())
+    elif mutation == "wrap_false":
+        loop.body = [ast.If(test=ast.Constant(False), body=loop.body, orelse=[])]
+    else:
+        raise AssertionError(f"unknown consumer-flow mutation {mutation!r}")
+    path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf-8")
+
+
+def bypass_unknown_field_enforcement(root: Path) -> None:
+    relative = "scripts/check-release-binary-contract.py"
+    path = root / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "extra"
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one unknown-field equality, found {len(matches)}"
+        )
+    matches[0].test = ast.Constant(False)
+    path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf-8")
+
+
+def mutate_human_work_dependency(root: Path, work: str, replacement: str) -> None:
+    relative = ".agents/specs/release-binary-matrix.md"
+    path = root / relative
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    matches = [index for index, line in enumerate(lines) if line.startswith(f"| {work} |")]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one human work row {work}, found {len(matches)}")
+    index = matches[0]
+    cells = lines[index].split("|")
+    cells[2] = f" {replacement} "
+    lines[index] = "|".join(cells)
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def bypass_human_work_dependency_enforcement(root: Path) -> None:
+    relative = "scripts/check-release-binary-contract.py"
+    path = root / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        left = node.test.left
+        if (
+            isinstance(left, ast.Call)
+            and isinstance(left.func, ast.Attribute)
+            and isinstance(left.func.value, ast.Name)
+            and left.func.value.id == "rows"
+            and left.func.attr == "get"
+        ):
+            matches.append(node)
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one human dependency equality, found {len(matches)}"
+        )
+    matches[0].test = ast.Constant(False)
+    path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf-8")
+
+
 class LiveContract(unittest.TestCase):
     def test_repository_contract_passes(self) -> None:
         result = run_checker(ROOT)
@@ -467,6 +614,22 @@ class AcceptedDesignMutations(unittest.TestCase):
                 )
                 self.assertIn("expected", result.stdout + result.stderr)
 
+    def test_unknown_machine_fields_are_fail_closed(self) -> None:
+        for field, value in UNKNOWN_MACHINE_FIELD_MUTATIONS:
+            with self.subTest(field=field), RepoCopy() as root:
+                mutate(
+                    root,
+                    self.SPEC,
+                    "lifecycle=SPIKE",
+                    f"lifecycle=SPIKE\n{field}={value}",
+                )
+                bypass_unknown_field_enforcement(root)
+                result = run_checker(root)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn("unknown fields", result.stdout + result.stderr)
+
 
 class WorkGraphMutations(unittest.TestCase):
     SPEC = ".agents/specs/release-binary-matrix.md"
@@ -485,6 +648,20 @@ class WorkGraphMutations(unittest.TestCase):
                 result = run_checker(root)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{work} dependencies", result.stdout + result.stderr)
+
+    def test_each_human_work_dependency_is_pinned(self) -> None:
+        for work, expected in HUMAN_WORK_DEPS.items():
+            with self.subTest(work=work, expected=expected), RepoCopy() as root:
+                mutate_human_work_dependency(root, work, "W99")
+                bypass_human_work_dependency_enforcement(root)
+                result = run_checker(root)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn(
+                    "human work-table dependency mirror",
+                    result.stdout + result.stderr,
+                )
 
     def test_each_human_work_row_id_occurs_exactly_once(self) -> None:
         for work in HUMAN_WORK_IDS:
@@ -653,6 +830,26 @@ class HumanContractMutations(unittest.TestCase):
                     result.returncode, 0, result.stdout + result.stderr
                 )
                 self.assertIn(inventory, result.stdout + result.stderr)
+
+    def test_each_semantic_inventory_consumer_body_is_pinned(self) -> None:
+        for inventory, method in INVENTORY_CONSUMER_METHODS.items():
+            for mutation in CONSUMER_FLOW_MUTATIONS:
+                with (
+                    self.subTest(
+                        inventory=inventory,
+                        method=method,
+                        mutation=mutation,
+                    ),
+                    RepoCopy() as root,
+                ):
+                    mutate_inventory_consumer_flow(root, inventory, mutation)
+                    result = run_checker(root)
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    output = result.stdout + result.stderr
+                    self.assertIn(inventory, output)
+                    self.assertIn("consumer body", output)
 
     def test_checker_guard_map_keysets_are_exact(self) -> None:
         for guard_map, keys in GUARD_MAP_KEYS.items():
