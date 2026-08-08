@@ -85,8 +85,8 @@ const uint VT_CM = 16u;  // the reported M = N = K tile extent
 shared float vt_cm_spill[VT_CM * VT_CM];
 
 void main() {
-  // Output tile coordinates. THE HOST GUARANTEES m % 16 == 0 AND n % 16 == 0, so
-  // every tile is whole.
+  // Output tile coordinates. THE HOST GUARANTEES n % 16 == 0 and m >= 16; a
+  // ragged M is handled by the tile shift below.
   //
   // That guarantee is load-bearing and was learned the hard way: `coopMatLoad`
   // below reads a FULL 16x16 tile with no masking, so a partial tile reads past
@@ -99,6 +99,21 @@ void main() {
   if (tile >= ((p.m + VT_CM - 1u) / VT_CM) * tiles_n) { return; }
   uint tile_m = (tile / tiles_n) * VT_CM;
   uint tile_n = (tile % tiles_n) * VT_CM;
+
+  // RAGGED M, HANDLED BY SHIFTING THE LAST TILE BACK rather than masking the
+  // load. A trailing tile would read rows past M -- the fault described above --
+  // so it is slid down to start at M-16 and therefore reads only REAL rows.
+  //
+  // This is exact, not an approximation. A result row depends solely on that row
+  // of A and on B, never on which tile computed it, so the rows this tile shares
+  // with its predecessor are recomputed to bit-identical values. The duplicate
+  // stores write the same bytes to the same addresses; the values are equal, so
+  // the interleaving cannot matter.
+  //
+  // It requires M >= 16, which the host predicate enforces. Below that there is
+  // no in-bounds 16-row window at all, and the decode path (M=1) is served by the
+  // GEMV tactic instead.
+  if (tile_m + VT_CM > p.m) { tile_m = p.m - VT_CM; }
 
   coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator> acc =
       coopmat<float, gl_ScopeSubgroup, VT_CM, VT_CM, gl_MatrixUseAccumulator>(0.0);
