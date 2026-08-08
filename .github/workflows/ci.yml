@@ -76,6 +76,10 @@ jobs:
         run: |
           python3 scripts/check-surface-coverage.py
           python3 tests/scripts/test_check_surface_coverage.py
+      - name: Critical regression tests remain executable and CTest-registered
+        run: |
+          python3 scripts/check-test-registration.py
+          python3 tests/scripts/test_check_test_registration.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py

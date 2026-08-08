@@ -303,6 +303,12 @@ void RegisterPlatform(DeviceType type, Platform* platform);
 Platform& GetPlatform(DeviceType type);
 bool HasPlatform(DeviceType type);
 
+// Find a registered platform by vt::DeviceTypeName(), or nullptr when that
+// canonical user-facing name has no usable platform in this process. This is
+// the shared explicit-device seam: callers name a platform without branching
+// on a backend-specific DeviceType literal.
+Platform* FindPlatformByName(std::string_view name);
+
 // The process's active compute platform: the highest-priority registered
 // accelerator, else CPU — mirrors vLLM resolving `current_platform` by probing
 // for an accelerator and falling back to CPU. This answers ONLY the process-level

@@ -15,6 +15,7 @@
 
 using vllm::platforms::CurrentPlatform;
 using vllm::platforms::DeviceCapability;
+using vllm::platforms::FindPlatformByName;
 using vllm::platforms::GetPlatform;
 using vllm::platforms::HasPlatform;
 using vllm::platforms::Platform;
@@ -100,6 +101,21 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   // in test_attn_backend_registry.cpp.
   const std::vector<std::string> cpu_priority{"CPU_ATTN", "FLASH_ATTN"};
   CHECK(cpu.get_attn_backend_priority() == cpu_priority);
+}
+
+TEST_CASE("platform registry resolves canonical names without device-specific callers") {
+  REQUIRE(FindPlatformByName("cpu") != nullptr);
+  CHECK(FindPlatformByName("cpu")->device_type() == DeviceType::kCPU);
+  CHECK(FindPlatformByName("not-a-platform") == nullptr);
+
+  size_t count = 0;
+  const DeviceType* priority = vllm::platforms::CurrentPlatformPriority(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (!HasPlatform(priority[i])) continue;
+    CAPTURE(vt::DeviceTypeName(priority[i]));
+    CHECK(FindPlatformByName(vt::DeviceTypeName(priority[i])) ==
+          &GetPlatform(priority[i]));
+  }
 }
 
 TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") {

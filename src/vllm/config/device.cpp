@@ -15,7 +15,7 @@ Device DeviceFromString(const std::string& value) {
     return Device::kCPU;
   }
   if (value == "cuda") {
-    return Device::kCUDA;
+    return Device::kNamedPlatform;
   }
   // Mirrors pydantic rejecting a value outside the Device Literal
   // (vllm/config/device.py:13). "tpu"/"xpu" are upstream names this build
@@ -31,7 +31,7 @@ const char* DeviceName(Device device) {
       return "auto";
     case Device::kCPU:
       return "cpu";
-    case Device::kCUDA:
+    case Device::kNamedPlatform:
       return "cuda";
   }
   return "invalid";

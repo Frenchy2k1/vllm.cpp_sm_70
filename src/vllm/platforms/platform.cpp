@@ -73,6 +73,16 @@ Platform& GetPlatform(DeviceType type) {
 
 bool HasPlatform(DeviceType type) { return Registry()[Index(type)] != nullptr; }
 
+Platform* FindPlatformByName(std::string_view name) {
+  for (size_t i = 0; i < vt::kNumDeviceTypes; ++i) {
+    Platform* platform = Registry()[i];
+    if (platform == nullptr) continue;
+    const DeviceType type = static_cast<DeviceType>(i);
+    if (name == vt::DeviceTypeName(type)) return platform;
+  }
+  return nullptr;
+}
+
 Platform& CurrentPlatform() {
   for (DeviceType type : kCurrentPriority) {
     Platform* p = Registry()[static_cast<size_t>(type)];

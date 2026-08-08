@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
@@ -120,13 +121,22 @@ struct EngineParams {
   // vLLM's DeviceConfig.device (vllm/config/device.py). kAuto (default) keeps
   // the accelerator-first probe that has always selected the queue — the
   // byte-identical default. kCPU forces the CPU queue without consulting the
-  // probe; kCUDA requires the CUDA platform and the load fails LOUD when it is
+  // probe. The INTERNAL value Device::kNamedPlatform is the tag for the stable
+  // PUBLIC/WIRE request whose value and name remain 2="cuda"; it resolves that
+  // canonical name through the platform registry and fails LOUD when CUDA is
   // absent (never a silent fallback — an explicit device is assigned verbatim
   // upstream, device.py:61-66). Exposed on the C ABI as
   // vllm_model_params.device (ABI v14: 0=auto, 1=cpu, 2=cuda) and on the
   // server as --device.
   vllm::Device device = vllm::Device::kAuto;
 };
+
+// The shared queue-selection seam used by every LoadedEngine construction
+// path. Exposed from this internal header so the explicit named-platform path
+// can be gated with a distinctive registered platform/backend rather than a
+// parallel pure-policy copy.
+vt::Queue SelectQueueForModel(std::string_view architecture,
+                              vllm::Device device);
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
 // runner -> Executor -> EngineCore; Input/OutputProcessor -> LLMEngine) for a
@@ -188,7 +198,8 @@ class LoadedEngine {
   // registering fake global platforms:
   //   * kCPU  -> vt::DeviceType::kCPU unconditionally — an explicit CPU ask
   //     never consults the accelerator probe, even when CUDA is registered;
-  //   * kCUDA -> vt::DeviceType::kCUDA when cuda_platform_registered, else
+  //   * kNamedPlatform -> the DeviceType returned by the canonical-name
+  //     platform lookup, else
   //     THROWS std::runtime_error naming the device (fail LOUD; the mirror of
   //     vLLM assigning an explicit device verbatim and never substituting
   //     another — vllm/config/device.py:61-66);
@@ -197,8 +208,9 @@ class LoadedEngine {
   //     std::invalid_argument if passed.
   // SelectQueue routes its explicit arms through THIS function, so the gate on
   // it pins the production policy, not a parallel copy.
-  static vt::DeviceType ResolveExplicitDeviceType(vllm::Device requested,
-                                                  bool cuda_platform_registered);
+  static vt::DeviceType ResolveExplicitDeviceType(
+      vllm::Device requested,
+      std::optional<vt::DeviceType> named_platform_type);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,
