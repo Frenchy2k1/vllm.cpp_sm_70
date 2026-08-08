@@ -25,3 +25,9 @@ persistent-batch, paged-KV design.
 
 Packaging is llama.cpp-style: usable as a library (`libvllm` + stable C API),
 with example CLI / OpenAI-server binaries shipped from this repo.
+
+`MANIFESTO.md` is the public statement of this mission: the "why" the landing
+page links from its header. It deliberately carries no benchmark numbers, so it
+stays quotable without ageing — `docs/BENCHMARKS.md` and `docs/STATUS.md` hold
+the measurements and the open gaps. Keep it and this file saying the same thing;
+the README only ever links to it, because the landing page is budgeted.
