@@ -327,6 +327,53 @@ the umbrella, not a substitute for them.
 | **VK-H** | **Attention variants + samplers** (16 ops) | B (samplers), G (attn variants) | **83/83 — closes the op surface** |
 | **VK-I** | **AMD/RDNA (or Arc) bring-up** | hardware acquisition | The staging path for non-host-visible memory, and the gate re-run where Vulkan actually matters |
 
+### 6.0 `VK-G` partial: the two GATED-DELTA RECURRENCES landed — 2026-08-08
+
+`row/BACKEND-VULKAN-GDN-CORE`. `kGdnPrefill` and `kGdnDecode` are native; the
+Vulkan module count goes 22 -> 24 and the GDN family 6 -> 8. `kCausalConv1dFwd`,
+`kRopeCosSinCache` and `kAttnQkNormRopeGate` stay on the reference tier.
+
+**What was ported, and from where.** Per-step arithmetic 1:1 from
+`src/vt/cpu/cpu_ops.cpp:1280-1311` `GdnHeadTokenStep`; dispatch shape and state
+handling from our own `src/vt/cuda/cuda_gdn.cu:2417-2503` `GdnDecodeFusedKernel`
+— one workgroup per (sequence, value-head, BV-value-tile), the `[BV,Dk]` state
+slice staged into shared memory by a coalesced load and written back once, `NW`
+lanes per value row splitting the `Dk` contraction. `BV=16`, `NW=8` are what
+Vulkan's GUARANTEED 16 KB of shared memory allows at `VT_TG=128`; `BV=32` would
+need 18 KB. Both shaders share one step body, `vt_gdn_recurrence.glsl`.
+
+**THE ONE STRUCTURAL ADDITION over the CUDA kernel, and it is the prefill lever.**
+CUDA's fused kernel is a DECODE kernel, so its coalesced load/store pair brackets
+a single step. Prefill runs the SAME staged tile through the whole token range,
+so a 512-token prompt touches the `[Dv,Dk]` state twice instead of ~2048 times.
+That is legal because the VALUE ROW is an independent axis — row `vi` of `S` only
+ever depends on itself, `k`, `q`, `decay`, `beta` and `v[vi]` — which CUDA already
+exploits as its `grid.x` value tiling; only the sequence position is sequential,
+and it stays sequential inside the workgroup.
+
+**Measured (llvmpipe, correctness only — no speed claim is made or owed here).**
+NMSE vs the CPU oracle in the same binary: prefill out `1.47e-14`, prefill
+carried state `6.43e-15`, bf16 arm `0`; decode (indexed cache) out `1.64e-14` and
+cache `3.31e-15`, decode (compact state) out `1.75e-14`. `test_vulkan_backend`
+25/25 cases, 1020/1020 assertions. `test_opt_paged_engine` with
+`VLLM_CPP_DEVICE=vulkan` still 6/6 token-exact (96/96), 0 declines.
+
+**NOT measured: any speed number.** Local Vulkan is llvmpipe. The 27B
+prefill/decode re-run on GB10, and the reference-tier count that goes with it,
+are OWED and are the only thing that can turn the structure above into a result.
+
+**A LATENT SEAM DEFECT THIS ROW HAD TO FIX.** `GetOpFallback` threw for any
+native kernel that declined per-call, because the portable reference tier
+installs only on a GetOp MISS and an op with a native kernel never misses. The
+pre-existing `vt_paged_attn` fp8-KV decline had the same hole and had simply
+never been exercised. `src/vt/op_provider.cpp` now installs the tier on that path
+and drains the backend before handing a HOST kernel device memory.
+
+**NOT taken, deliberately.** Rewriting the two passes as
+`o = decay*(S·q) + v'*(k·q)` would read the state once instead of twice, but it
+is an algebraic reassociation and would move the numbers off the CPU reference's
+rounding for a saving that cannot be measured on llvmpipe. Recorded, not shipped.
+
 ### 6.1 `VK-A1` landed — 2026-08-06 (`CLAIM-VULKAN-FULL-1`)
 
 **DECISION: keep the committed-SPIR-V route; make SPECIALIZATION CONSTANTS the

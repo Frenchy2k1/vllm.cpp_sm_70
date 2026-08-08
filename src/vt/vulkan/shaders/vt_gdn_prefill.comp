@@ -1,0 +1,78 @@
+#version 450
+// vt::GdnPrefill (kGdnPrefill) — the gated-delta-rule recurrence over a varlen
+// prompt. Ported 1:1 from src/vt/cpu/cpu_ops.cpp:1331-1366 GdnPrefillKernel; the
+// per-token arithmetic and the shared-memory state tiling both live in
+// vt_gdn_recurrence.glsl, which cites its sources.
+//
+// THE GRID IS THE CPU KERNEL'S PARALLEL AXIS, ONE STEP FINER. cpu_ops.cpp:1342-1349
+// row-chunks over the (SEQUENCE, VALUE-HEAD) product, and records why: sequences
+// alone left the whole recurrence single-threaded. This shader adds the VALUE-ROW
+// tile that our CUDA kernel already uses as its grid.x (cuda_gdn.cu:2421), so the
+// axis is (sequence, value-head, BV-value-tile) — flattened into
+// gl_WorkGroupID.x as ((s * Hv + hv) * NV + i_v) because Vulkan's guaranteed
+// workgroup-count limit is per dimension and one dimension is enough.
+//
+// THE SEQUENCE STAYS SEQUENTIAL, INSIDE THE WORKGROUP, and that is the point of
+// the shape: the [BV,Dk] state tile is staged into shared memory ONCE, run
+// through every token of this sequence, and written back ONCE. The CPU reference
+// and our CUDA decode kernel both stream the state per token; a 512-token prompt
+// touches it twice here instead of 2048 times.
+//
+// `s` is derived from gl_WorkGroupID, so the token range [qsl[s], qsl[s+1]) is
+// UNIFORM across the workgroup — required, because every step below contains
+// barriers and a barrier reached by only part of a workgroup is undefined.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Qb32 { uint v[]; } Q32;   // q [T,Hk,Dk]
+layout(binding = 1) readonly buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 2) readonly buffer Kb32 { uint v[]; } K32;   // k [T,Hk,Dk]
+layout(binding = 3) readonly buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 4) readonly buffer Vb32 { uint v[]; } V32;   // v [T,Hv,Dv]
+layout(binding = 5) readonly buffer Vb16 { uint16_t v[]; } V16;
+layout(binding = 6) buffer Ob32 { uint v[]; } O32;            // out [T,Hv,Dv]
+layout(binding = 7) buffer Ob16 { uint16_t v[]; } O16;
+// FOUR OPERANDS ARE BOUND THROUGH THE 32-BIT VIEW ONLY. g, beta and the state are
+// f32 BY CONTRACT on this device (src/vt/ops.cpp:1629-1643: g/beta always, and
+// the fp16/bf16 state is a CUDA-only extension), and query_start_loc is i32, so a
+// dtype-erased pair would be a branch that can never take its other side.
+layout(binding = 8) readonly buffer Gb { uint v[]; } G;       // g [T,Hv], f32
+layout(binding = 9) readonly buffer Eb { uint v[]; } BETA;    // beta [T,Hv], f32
+layout(binding = 10) buffer Sb { uint v[]; } S;               // state [N,Hv,Dv,Dk], f32
+layout(binding = 11) readonly buffer Mb { uint v[]; } QSL;    // query_start_loc [N+1], i32
+
+layout(constant_id = 0) const uint VT_PC_QKV_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PC_OUT_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint hk, dk, hv, dv;
+  uint nv;            // value tiles per (sequence, head): ceil(Dv / VT_GDN_BV)
+  uint ratio;         // Hv / Hk, the GQA broadcast
+  uint has_idx;       // decode only; 0 here
+  uint n_state_rows;  // decode only; state.shape[0]
+  uint q_off, k_off, v_off, out_off, g_off, beta_off, state_off, meta_off;
+  float scale;
+} p;
+
+#include "vt_gdn_recurrence.glsl"
+
+void main() {
+  uint wg = gl_WorkGroupID.x;
+  uint i_v = wg % p.nv;
+  uint sh = wg / p.nv;
+  uint h_v = sh % p.hv;
+  uint s = sh / p.hv;
+  uint h_k = h_v / p.ratio;
+  uint vbase = i_v * VT_GDN_BV;
+
+  vt_gdn_setup(vbase);
+  vt_gdn_load_tile(s, h_v, vbase);
+  // An EMPTY sequence (qsl[s+1] == qsl[s]) runs no steps and stores the tile back
+  // unchanged, which is what the CPU reference's `for (t = qslp[s]; ...)` does.
+  int t0 = int(QSL.v[(p.meta_off >> 2) + s]);
+  int t1 = int(QSL.v[(p.meta_off >> 2) + s + 1u]);
+  for (int t = t0; t < t1; ++t) { vt_gdn_step(uint(t), h_v, h_k); }
+  vt_gdn_store_tile(s, h_v, vbase);
+}

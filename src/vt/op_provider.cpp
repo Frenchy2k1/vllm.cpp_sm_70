@@ -374,11 +374,32 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
                                  "' is not registered for this op/device");
   const ProviderCaps caps = GetDeviceProviderCaps(device);
   const OpProvider* next = Choose(slot, caps, floor);
+  // NOTHING BELOW: install the portable reference tier and re-select. Resolve()
+  // installs it only on a GetOp MISS, so an op whose device HAS a native kernel
+  // never gets one — and a native kernel that declines per-call then had nothing
+  // to fall back to and threw. That is the wrong answer twice over: the tier is
+  // the whole reason a declining kernel is preferable to a throwing one
+  // (op_provider.h § DECLINE-AND-FALL-BACK), and before the native kernel existed
+  // this very shape resolved to the tier and worked. `floor` stays valid across
+  // the install because providers[] is a fixed array appended in place.
+  if (next == nullptr && MaybeInstallReferenceTier(op, device)) {
+    next = Choose(slot, caps, floor);
+  }
   slot.declines.fetch_add(1, std::memory_order_relaxed);
   VT_CHECK(next != nullptr,
            std::string("provider '") + declining_provider + "' declined op " +
                std::to_string(static_cast<int>(op)) + " on device type " +
                std::to_string(static_cast<int>(device)) + " and no provider is below it");
+  // The reference tier is a HOST kernel about to read and write DEVICE memory,
+  // exactly as in GetOp above — and GetOp's drain is keyed on the SELECTED
+  // provider, which on this path is the declining NATIVE one, so it never fires.
+  // Without this a backend that defers submission (Vulkan batches command
+  // buffers) hands the host kernel bytes the device has not written yet, and it
+  // does so SILENTLY.
+  if (std::strcmp(next->name, kReferenceProviderName) == 0) {
+    Backend* b = TryGetBackend(device);
+    if (b != nullptr) b->FlushPending();
+  }
   return next->fn;
 }
 

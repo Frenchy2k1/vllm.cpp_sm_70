@@ -207,6 +207,15 @@ struct GdnPostConvParams {
   uint32_t g_off, beta_off, alog_off, dtb_off;
   float eps;
 };
+// ONE block for BOTH recurrences: vt_gdn_prefill and vt_gdn_decode share their
+// step body through an include, so they must also share their push layout. The
+// prefill shader ignores has_idx / n_state_rows (they are the decode state-row
+// indirection) rather than each op carrying a block that drifts from the other.
+struct GdnRecurrenceParams {
+  uint32_t hk, dk, hv, dv, nv, ratio, has_idx, n_state_rows;
+  uint32_t q_off, k_off, v_off, out_off, g_off, beta_off, state_off, meta_off;
+  float scale;
+};
 
 // Vulkan only GUARANTEES 128 bytes of push-constant space (maxPushConstantsSize);
 // staying inside it is what keeps this backend portable without a probe.
@@ -225,6 +234,8 @@ static_assert(sizeof(GdnPostConvParams) <= 128,
 static_assert(sizeof(RmsNormGatedParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(GdnStateGatherParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(GdnRecurrenceParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
@@ -837,10 +848,10 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
 // before this row every one of these ops fell to the PORTABLE CPU REFERENCE TIER
 // on Vulkan — correct, and running on the host against shared memory.
 //
+// The two RECURRENCES themselves (kGdnPrefill / kGdnDecode) landed in the
+// follow-up row BACKEND-VULKAN-GDN-CORE and are at the bottom of this section.
+//
 // WHAT IS DELIBERATELY NOT HERE, so a later row does not have to re-derive it:
-//   * kGdnPrefill / kGdnDecode — the chunked gated-delta recurrences. They are
-//     not glue; they are the model's linear-attention core and a project of
-//     their own. They stay on the reference tier.
 //   * kRopeCosSinCache — the rotary TABLE BUILD, which constructs its angles in
 //     `double` (cpu_ops.cpp RopeCosSinCacheKernel). GLSL has no f64 here and
 //     emulating it would be a numerics divergence in the one place vLLM itself
@@ -1088,6 +1099,130 @@ void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tens
   Go("vt_gdn_post_conv", bind, p, static_cast<uint32_t>(t * (hk + hv)), spec, 3);
 }
 
+// ---------------------------------------------------------------------------
+// The two GATED-DELTA RECURRENCES (BACKEND-VULKAN-GDN-CORE). These are not glue:
+// they ARE Qwen3.6's linear-attention core, and with the glue above already
+// native they were the whole of what the model still ran on the host — a 512
+// token prompt spent ~280 s in kGdnPrefill on the reference tier.
+//
+// The shaders (src/vt/vulkan/shaders/vt_gdn_prefill.comp, vt_gdn_decode.comp and
+// the shared vt_gdn_recurrence.glsl) carry the port provenance and the tile
+// geometry. What the HOST has to get right is only the grid and the decline.
+// ---------------------------------------------------------------------------
+
+// Must equal VT_GDN_BV / VT_GDN_MAX_DK in vt_gdn_recurrence.glsl. Duplicated
+// rather than shared because the shader constants are in GLSL and the SPIR-V is
+// committed, so nothing can compute one from the other — the gate in
+// tests/vt/test_vulkan_backend.cpp exercises a Dv that is NOT a multiple of the
+// tile so a drift shows up as wrong numbers there rather than in a model run.
+constexpr int64_t kGdnTileRows = 16;
+constexpr int64_t kGdnMaxDk = 128;
+
+// Shared grid + binding setup for the two recurrences. Returns false when this
+// backend cannot serve the shape and the caller must decline to the next
+// provider.
+bool GdnRecurrenceCommon(const Tensor& out, const Tensor& q_in, const Tensor& k,
+                         const Tensor& v, const Tensor& g, const Tensor& beta,
+                         const Tensor& state, Binder& bind, GdnRecurrenceParams& p,
+                         uint32_t spec[2], float scale) {
+  const int64_t hv = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  const int64_t hk = q_in.shape[1];
+  // PER-CALL REFUSAL rather than a throw, the same seam vt_paged_attn uses for an
+  // fp8 KV cache: declining forwards to the portable reference tier, which is
+  // correct for every shape, instead of REMOVING a capability the backend already
+  // had. Two reasons to decline.
+  //   * Dk beyond the shared tile's compile-time extent. The tile has to be sized
+  //     at compile time against Vulkan's GUARANTEED 16 KB of shared memory, and
+  //     the real gate dim is 128.
+  //   * q/k/v disagreeing on dtype. One specialization constant covers the three
+  //     (they come out of one GdnPostConv dispatch and always agree), and CUDA
+  //     asserts the same thing (cuda_gdn.cu:2577).
+  if (dk > kGdnMaxDk || dk <= 0) return false;
+  if (k.dtype != q_in.dtype || v.dtype != q_in.dtype) return false;
+  const uint32_t q_off = bind.Add(q_in, "gdn recurrence: q");
+  const uint32_t k_off = bind.Add(k, "gdn recurrence: k");
+  const uint32_t v_off = bind.Add(v, "gdn recurrence: v");
+  const uint32_t out_off = bind.Add(out, "gdn recurrence: out");
+  // g, beta and the state are f32 by the op contract on this device
+  // (src/vt/ops.cpp:1629-1643 — a compressed state is CUDA-only), so one binding
+  // each rather than a dtype-erased pair whose 16-bit half could never be taken.
+  const uint32_t g_off = bind.AddU32Only(g, "gdn recurrence: g");
+  const uint32_t beta_off = bind.AddU32Only(beta, "gdn recurrence: beta");
+  const uint32_t state_off = bind.AddU32Only(state, "gdn recurrence: state");
+  spec[0] = DtypeCode(q_in.dtype);
+  spec[1] = DtypeCode(out.dtype);
+  p.hk = static_cast<uint32_t>(hk);
+  p.dk = static_cast<uint32_t>(dk);
+  p.hv = static_cast<uint32_t>(hv);
+  p.dv = static_cast<uint32_t>(dv);
+  p.nv = static_cast<uint32_t>((dv + kGdnTileRows - 1) / kGdnTileRows);
+  p.ratio = static_cast<uint32_t>(hv / hk);
+  p.has_idx = 0;
+  p.n_state_rows = static_cast<uint32_t>(state.shape[0]);
+  p.q_off = q_off;
+  p.k_off = k_off;
+  p.v_off = v_off;
+  p.out_off = out_off;
+  p.g_off = g_off;
+  p.beta_off = beta_off;
+  p.state_off = state_off;
+  p.meta_off = 0;
+  p.scale = scale;
+  return true;
+}
+
+// cpu_ops.cpp:1331-1366 GdnPrefillKernel. ONE WORKGROUP PER
+// (sequence, value-head, value-tile) — the CPU kernel's own (SEQUENCE,
+// VALUE-HEAD) chunking plus the value-row tile our CUDA kernel already uses as
+// its grid.x (cuda_gdn.cu:2421). NOT FlatGroupCount: the whole workgroup
+// cooperates on one tile, and the sequence stays sequential inside it.
+void GdnPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                      const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                      const Tensor& query_start_loc, const GdnArgs& args) {
+  const int64_t n = state.shape[0], hv = state.shape[1], dv = state.shape[2];
+  if (n == 0 || hv == 0 || dv == 0) return;
+  Binder bind;
+  GdnRecurrenceParams p{};
+  uint32_t spec[2] = {0, 0};
+  if (!GdnRecurrenceCommon(out, q_in, k, v, g, beta, state, bind, p, spec, args.scale)) {
+    auto next = reinterpret_cast<GdnPrefillFn>(
+        GetOpFallback(OpId::kGdnPrefill, DeviceType::kVULKAN, kNativeProviderName));
+    next(q, out, q_in, k, v, g, beta, state, query_start_loc, args);
+    return;
+  }
+  p.meta_off = bind.AddU32Only(query_start_loc, "gdn_prefill: query_start_loc");
+  Go("vt_gdn_prefill", bind, p, static_cast<uint32_t>(n * hv * p.nv), spec, 2);
+}
+
+// cpu_ops.cpp:1368-1396 GdnDecodeKernel, one step per batch token. Same grid with
+// the sequence axis replaced by the batch — cuda_gdn.cu:2513's
+// (NV, n*Hv) flattened.
+void GdnDecodeKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                     const Tensor* state_idx, const GdnArgs& args) {
+  const int64_t batch = q_in.shape[0], hv = state.shape[1], dv = state.shape[2];
+  if (batch == 0 || hv == 0 || dv == 0) return;
+  Binder bind;
+  GdnRecurrenceParams p{};
+  uint32_t spec[2] = {0, 0};
+  if (!GdnRecurrenceCommon(out, q_in, k, v, g, beta, state, bind, p, spec, args.scale)) {
+    auto next = reinterpret_cast<GdnDecodeFn>(
+        GetOpFallback(OpId::kGdnDecode, DeviceType::kVULKAN, kNativeProviderName));
+    next(q, out, q_in, k, v, g, beta, state, state_idx, args);
+    return;
+  }
+  // Binding 11 is always written: a descriptor a shader statically uses must be
+  // valid even on the path that never reads it. With has_idx == 0 it aliases the
+  // state buffer and is dead.
+  if (state_idx != nullptr) {
+    p.has_idx = 1;
+    p.meta_off = bind.AddU32Only(*state_idx, "gdn_decode: state_idx");
+  } else {
+    p.meta_off = bind.AddU32Only(state, "gdn_decode: state");
+  }
+  Go("vt_gdn_decode", bind, p, static_cast<uint32_t>(batch * hv * p.nv), spec, 2);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -1128,10 +1263,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kFusedChain, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernel)));
-    // BACKEND-VULKAN-GDN: the GDN glue family. kGdnPrefill/kGdnDecode (the
-    // recurrences), kCausalConv1dFwd (the prefill conv) and kRopeCosSinCache (the
-    // double-precision rotary table, deliberately host-side) stay on the portable
-    // reference tier; see the block comment above these kernels.
+    // BACKEND-VULKAN-GDN: the GDN glue family. kCausalConv1dFwd (the prefill
+    // conv) and kRopeCosSinCache (the double-precision rotary table, deliberately
+    // host-side) stay on the portable reference tier; see the block comment above
+    // these kernels.
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16Kernel)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kVULKAN,
@@ -1145,6 +1280,11 @@ struct Registrar {
         reinterpret_cast<void*>(static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernel)));
     RegisterOp(OpId::kGdnPostConv, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernel)));
+    // BACKEND-VULKAN-GDN-CORE: the two recurrences.
+    RegisterOp(OpId::kGdnPrefill, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
+    RegisterOp(OpId::kGdnDecode, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
   }
 } registrar;
 
