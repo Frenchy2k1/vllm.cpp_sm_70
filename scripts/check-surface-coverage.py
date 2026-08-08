@@ -114,7 +114,7 @@ EXPECTED_PUBLIC = frozenset({"vllm.h"})
 # COUPLED: the ratchet claims in .agents/specs/surface-coverage-2026-08-07.md and the
 # state log, and the equality pin in tests/scripts/test_check_surface_coverage.py, must
 # move in the SAME change as this constant.
-MAX_INTERNAL_REACHING = 8
+MAX_INTERNAL_REACHING = 9
 
 # An include INTO the internal C++ tree: `#include "vllm/..."` (the engine/model/layer
 # headers under include/vllm/, NOT the flat public "vllm.h"), `#include "vt/..."` (the

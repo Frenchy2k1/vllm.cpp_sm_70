@@ -73,7 +73,7 @@ JSON sub-config, not a separate surface) — the model for how the others should
 
 ## Example include-graph audit (guard axis 1)
 
-Public boundary = `#include "vllm.h"` only. 13 example units; `examples/cli` (vllm-cli,
+Public boundary = `#include "vllm.h"` only. 14 example units; `examples/cli` (vllm-cli,
 links `vllm::shared`, `#include "vllm.h"` only, `cli/main.cpp:16`) is the sole clean ABI
 client. **ROW 1 UPDATE (2026-08-07): `parakeet_transcribe` is the SECOND clean ABI
 client** — the Parakeet fold rewrote it against `vllm.h` + `vllm::shared` only, and the
@@ -84,19 +84,24 @@ v12 `vllm_video_*`), and the ratchet fell 11 -> 9. **ROW 7 UPDATE (2026-08-07):
 made the fast paged-incremental decode the ENGINE's production path, grew
 `vllm_complete_tokens` (ABI v13, pre-tokenized completion returning generated token
 ids) and rewrote the example against `vllm.h` + `vllm::shared` only; the ratchet fell
-9 -> 8. The remaining 8 reach `include/vllm/**` / `vt/**` and are transition-tracked
-in `scripts/example-abi-allowlist.txt`:
+9 -> 8. **RATCHET EXCEPTION (2026-08-08): 8 -> 9 — conscious operator exception** —
+external contribution #65 (`examples/cpu_kernel_bench`, the RPi5/Cortex-A76 PMU
+kernel-bench harness) predates the guard; dev-tool class, fold row
+`ARCH-ONE-SURFACE` (the same op-bench ABI fold as `quant_gemm_bench`); the ratchet
+re-shrinks when the bench folds. The remaining 9 reach `include/vllm/**` / `vt/**`
+and are transition-tracked in `scripts/example-abi-allowlist.txt`:
 
 - Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `server`.
 - Dev/diagnostic (internal-by-nature, folded for consistency): `bench` (via
-  `bench_core.h`), `tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench`.
+  `bench_core.h`), `tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench`,
+  `cpu_kernel_bench`.
 - Out of the gated `examples/` tree: `benchmarks/vulkan_gemm_ab.cpp` (Vulkan A/B harness).
 
 **Policy (developer-directed 2026-08-07): no permanent exemptions.** Every allowlist entry
 — drivers AND dev/diagnostic tools — is a transition-tracker pointing at a fold row; the
 guard fails on any internal include not tracked, and a shrink-only ratchet
-(`MAX_INTERNAL_REACHING`, 8 since ROW 7; 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
-admit a new violation. The public header set is DERIVED from the CMake install rules
+(`MAX_INTERNAL_REACHING`, 9 since the 2026-08-08 #65 operator exception; 8 since ROW 7; 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
+admit a new violation (the sole recorded exception: the dated #65 note above). The public header set is DERIVED from the CMake install rules
 (exactly `include/vllm.h` today), not hardcoded. The guard catches BOTH breach vectors: a
 `#include "vllm/..."|"vt/..."|"src/..."` AND a CMake `-I` grant into the internal tree
 (`target_include_directories(<target> ... ${CMAKE_SOURCE_DIR}/src)` — `quant-gemm-bench`,
