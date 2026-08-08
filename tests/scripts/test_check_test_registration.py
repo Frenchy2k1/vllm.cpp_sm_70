@@ -546,6 +546,24 @@ class SuiteIntegrityTests(unittest.TestCase):
         )
         self.assertTrue(any("integrity method is missing" in error for error in errors), errors)
 
+    def test_M42_byte_identical_alternate_manifest_path_fails(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        manifest = mod.MUTATION_MANIFEST.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory(
+            prefix="vllm-registration-manifest-"
+        ) as temporary:
+            alternate = Path(temporary) / mod.MUTATION_MANIFEST.name
+            alternate.write_text(manifest, encoding="utf-8")
+            self.assertTrue(
+                alternate.read_bytes() == mod.MUTATION_MANIFEST.read_bytes()
+            )
+            errors = mod.mutation_suite_integrity_errors(
+                source, manifest_path=alternate
+            )
+        self.assertEqual(
+            errors, ["mutation suite must use the canonical manifest path"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

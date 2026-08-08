@@ -29,7 +29,7 @@ CI = ROOT / ".github/workflows/ci.yml"
 MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
 MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
 MUTATION_MANIFEST_SHA256 = (
-    "de1ca9c1d42620896a5dfa2c46eb5f18f2f8273ed6e9c0546ca56a2852ea8608"
+    "36f00928fe7bbafaedcee27ede937d0a8a80d9c504eebddc18b8f3205f03eabf"
 )
 
 REQUIRED_TESTS = {
