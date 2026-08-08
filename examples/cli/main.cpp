@@ -8,14 +8,16 @@
 //   vllm-cli --model <dir> --prompt "<text>"
 //            [--tokenizer-config <path>] [--device auto|cpu|cuda]
 //            [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]
-//            [--seed S] [--stream]
+//            [--seed S] [--stream] [--repeat N]
 //            [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
 //
 // <dir> holds config.json, tokenizer.json and the *.safetensors shards (T0:
 // safetensors only). Loading a real checkpoint is a GPU/dgx concern; on a CPU
 // box `--help` / bad-args still work without a model (smoke-tested in CI).
+// --repeat N runs N completions after one load (warm bench / decode tok-s).
 #include "vllm.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +38,7 @@ struct Args {
   unsigned long long seed = 0;
   bool have_seed = false;
   bool stream = false;
+  int repeat = 1;  // load once, complete N times (warm tok/s)
   std::string speculative_config;  // vLLM --speculative-config JSON; "" => off.
   // --device (ABI v14): "auto" (default probe), "cpu", or "cuda" — the names
   // of vLLM's DeviceConfig.device this build serves. Mapped to the int the ABI
@@ -54,12 +57,13 @@ void Usage(const char* argv0, std::FILE* out) {
       "usage: %s --model <dir> --prompt \"<text>\"\n"
       "          [--tokenizer-config <path>] [--device auto|cpu|cuda]\n"
       "          [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]\n"
-      "          [--seed S] [--stream]\n"
+      "          [--seed S] [--stream] [--repeat N]\n"
       "          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]\n"
       "          [--speculative-config '<json>']\n"
       "\n"
-      "Runs one completion over the vllm.cpp C ABI (libvllm). <dir> holds\n"
-      "config.json, tokenizer.json and the *.safetensors shards.\n",
+      "Runs completion(s) over the vllm.cpp C ABI (libvllm). <dir> holds\n"
+      "config.json, tokenizer.json and the *.safetensors shards.\n"
+      "--repeat N: load once, run N blocking completions (for warm tok/s).\n",
       argv0);
 }
 
@@ -99,6 +103,9 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       a.have_seed = true;
     } else if (flag == "--stream") {
       a.stream = true;
+    } else if (flag == "--repeat") {
+      a.repeat = std::atoi(NextArg(argc, argv, i));
+      if (a.repeat < 1) a.repeat = 1;
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i);
     } else if (flag == "--gpu-memory-utilization") {
@@ -218,6 +225,9 @@ int main(int argc, char** argv) {
   int rc = 0;
   if (args.stream) {
     // ── Streaming: print deltas as they arrive. ──────────────────────────────
+    if (args.repeat != 1) {
+      std::fprintf(stderr, "vllm-cli: --repeat with --stream not supported; using 1\n");
+    }
     st = vllm_complete_stream(engine, args.prompt.c_str(), &sp, &StreamPrintCb,
                               nullptr);
     std::fputc('\n', stdout);
@@ -227,20 +237,33 @@ int main(int argc, char** argv) {
       rc = 1;
     }
   } else {
-    // ── Blocking: run to completion, then print the whole text. ──────────────
-    vllm_completion out;
-    st = vllm_complete(engine, args.prompt.c_str(), &sp, &out);
-    if (st != VLLM_OK) {
-      std::fprintf(stderr, "vllm-cli: completion failed (status %d): %s\n",
-                   static_cast<int>(st), vllm_last_error());
-      rc = 1;
-    } else {
-      std::fputs(out.text != nullptr ? out.text : "", stdout);
-      std::fputc('\n', stdout);
+    // ── Blocking: load once, optionally repeat for warm tok/s. ───────────────
+    for (int r = 0; r < args.repeat; ++r) {
+      vllm_completion out{};
+      const auto t0 = std::chrono::steady_clock::now();
+      st = vllm_complete(engine, args.prompt.c_str(), &sp, &out);
+      const auto t1 = std::chrono::steady_clock::now();
+      const double secs =
+          std::chrono::duration<double>(t1 - t0).count();
+      if (st != VLLM_OK) {
+        std::fprintf(stderr, "vllm-cli: completion failed (status %d): %s\n",
+                     static_cast<int>(st), vllm_last_error());
+        rc = 1;
+        break;
+      }
+      if (r == 0 || args.repeat == 1) {
+        std::fputs(out.text != nullptr ? out.text : "", stdout);
+        std::fputc('\n', stdout);
+      }
+      const int ct = out.completion_tokens;
+      const double tps = (secs > 0.0 && ct > 0) ? (static_cast<double>(ct) / secs) : 0.0;
       std::fprintf(stderr,
-                   "vllm-cli: finish_reason=%s prompt_tokens=%d completion_tokens=%d\n",
+                   "vllm-cli: run=%d/%d finish_reason=%s prompt_tokens=%d "
+                   "completion_tokens=%d secs=%.3f tok_s=%.3f\n",
+                   r + 1, args.repeat,
                    out.finish_reason != nullptr ? out.finish_reason : "(none)",
-                   out.prompt_tokens, out.completion_tokens);
+                   out.prompt_tokens, ct, secs, tps);
+      std::fflush(stderr);
       vllm_completion_free(&out);
     }
   }

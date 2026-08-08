@@ -227,37 +227,81 @@ void LLMEngine::abort_request(const std::string& request_id) {
 RequestOutput LLMEngine::generate(const std::string& prompt,
                                   SamplingParams params,
                                   const std::string& request_id, int priority) {
-  // The LLM.generate / _run_engine driver for one request (offline_utils.py:591):
-  //   while self.llm_engine.has_unfinished_requests():
-  //       for output in self.llm_engine.step():
-  //           if output.finished: outputs.append(output)
+  // Offline driver for ONE request. CRITICAL: wait only until *this* request_id
+  // finishes — not has_unfinished_requests() globally. Otherwise a concurrent
+  // chat/async job (e.g. huge Hermes SOUL) pins every blocking generate forever.
   add_request(request_id, prompt, std::move(params), priority);
   RequestOutput result;
-  while (has_unfinished_requests()) {
+  int idle_steps = 0;
+  int steps = 0;
+  constexpr int kMaxIdleSteps = 100000;  // safety; max_tokens should stop sooner
+  while (true) {
     std::vector<RequestOutput> step_outputs = step();
+    ++steps;
+    bool saw_self = false;
+    bool self_finished = false;
     for (RequestOutput& out : step_outputs) {
+      if (out.request_id != request_id) continue;
+      saw_self = true;
       if (out.finished) {
         result = std::move(out);
+        self_finished = true;
       }
     }
+    if (self_finished) break;
+    if (!saw_self) {
+      ++idle_steps;
+      if (idle_steps >= kMaxIdleSteps) {
+        abort_request(request_id);
+        result.request_id = request_id;
+        result.finished = true;
+        break;
+      }
+    } else {
+      idle_steps = 0;
+    }
+    // If our request vanished without a finished output, stop.
+    if (!has_unfinished_requests() && !self_finished) {
+      break;
+    }
   }
+  (void)steps;
   return result;
 }
 
 RequestOutput LLMEngine::generate(std::vector<int32_t> prompt_token_ids,
                                   SamplingParams params,
                                   const std::string& request_id, int priority) {
-  // TokensPrompt single-request driver (mirrors the string generate loop).
   add_request(request_id, std::move(prompt_token_ids), std::move(params),
               priority);
   RequestOutput result;
-  while (has_unfinished_requests()) {
+  int idle_steps = 0;
+  constexpr int kMaxIdleSteps = 100000;
+  while (true) {
     std::vector<RequestOutput> step_outputs = step();
+    bool saw_self = false;
+    bool self_finished = false;
     for (RequestOutput& out : step_outputs) {
+      if (out.request_id != request_id) continue;
+      saw_self = true;
       if (out.finished) {
         result = std::move(out);
+        self_finished = true;
       }
     }
+    if (self_finished) break;
+    if (!saw_self) {
+      ++idle_steps;
+      if (idle_steps >= kMaxIdleSteps) {
+        abort_request(request_id);
+        result.request_id = request_id;
+        result.finished = true;
+        break;
+      }
+    } else {
+      idle_steps = 0;
+    }
+    if (!has_unfinished_requests() && !self_finished) break;
   }
   return result;
 }
@@ -265,19 +309,20 @@ RequestOutput LLMEngine::generate(std::vector<int32_t> prompt_token_ids,
 RequestOutput LLMEngine::embed(std::vector<int32_t> prompt_token_ids,
                                PoolingParams pooling_params,
                                const std::string& request_id, int priority) {
-  // The single-request pooling driver (LLM.embed / offline.py:65-119 mirror):
-  // add the pooling request, then loop step() until it finishes. The finished
-  // RequestOutput carries the pooled vector in pooling_output.
   add_pooling_request(request_id, std::move(prompt_token_ids),
                       std::move(pooling_params), priority);
   RequestOutput result;
-  while (has_unfinished_requests()) {
+  while (true) {
     std::vector<RequestOutput> step_outputs = step();
+    bool self_finished = false;
     for (RequestOutput& out : step_outputs) {
-      if (out.finished) {
+      if (out.request_id == request_id && out.finished) {
         result = std::move(out);
+        self_finished = true;
       }
     }
+    if (self_finished) break;
+    if (!has_unfinished_requests()) break;
   }
   return result;
 }
@@ -285,18 +330,35 @@ RequestOutput LLMEngine::embed(std::vector<int32_t> prompt_token_ids,
 RequestOutput LLMEngine::generate(multimodal::MultiModalInputs mm_inputs,
                                   SamplingParams params,
                                   const std::string& request_id, int priority) {
-  // Multimodal single-request driver (mirrors the tokens generate loop). The
-  // step() forward consumes the carried mm_features on the GPU worker
-  // (MM-SERVE-E2E) — this driver only proves the loop terminates.
   add_request(request_id, std::move(mm_inputs), std::move(params), priority);
   RequestOutput result;
-  while (has_unfinished_requests()) {
+  int idle_steps = 0;
+  constexpr int kMaxIdleSteps = 100000;
+  while (true) {
     std::vector<RequestOutput> step_outputs = step();
+    bool saw_self = false;
+    bool self_finished = false;
     for (RequestOutput& out : step_outputs) {
+      if (out.request_id != request_id) continue;
+      saw_self = true;
       if (out.finished) {
         result = std::move(out);
+        self_finished = true;
       }
     }
+    if (self_finished) break;
+    if (!saw_self) {
+      ++idle_steps;
+      if (idle_steps >= kMaxIdleSteps) {
+        abort_request(request_id);
+        result.request_id = request_id;
+        result.finished = true;
+        break;
+      }
+    } else {
+      idle_steps = 0;
+    }
+    if (!has_unfinished_requests() && !self_finished) break;
   }
   return result;
 }

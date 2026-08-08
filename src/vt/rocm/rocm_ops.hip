@@ -36,6 +36,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                               const PagedAttentionArgs& args);
 void GeluTanhKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void GeluErfKernelRocm(Queue& q, Tensor& out, const Tensor& x);
+void MoeRouterTopKKernelRocm(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
+                             const MoeRouterTopKArgs& args, const Tensor* bias);
 
 namespace {
 
@@ -90,6 +92,9 @@ struct Registrar {
     RegisterOp(OpId::kPagedAttention, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<PagedAttentionFn>(&PagedAttentionKernelRocm)));
+    RegisterOp(OpId::kMoeRouterTopK, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelRocm)));
   }
 } registrar;
 

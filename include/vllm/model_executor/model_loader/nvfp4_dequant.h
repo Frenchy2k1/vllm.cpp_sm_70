@@ -84,4 +84,8 @@ void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
 void DequantFp8ChannelToBf16(const uint8_t* weight_f8, const uint16_t* scale_bf16,
                              int64_t N, int64_t K, uint16_t* out_bf16);
 
+// Nesting guards: expert-level parallel prefetch serializes row-parallel dequant.
+void Fp8DequantBeginOuterParallel();
+void Fp8DequantEndOuterParallel();
+
 }  // namespace vllm

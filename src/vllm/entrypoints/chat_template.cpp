@@ -109,22 +109,9 @@ std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
     const std::string& bos_token, const std::string& eos_token,
-    const std::vector<openai::ChatCompletionToolsParam>& tools) {
+    const std::vector<openai::ChatCompletionToolsParam>& tools,
+    bool enable_thinking) {
   try {
-    // Render the template LITERALLY, exactly as transformers'
-    // `apply_chat_template` does: parse the raw Jinja source and render it with
-    // transformers' whitespace policy (trim_blocks / lstrip_blocks, no trailing
-    // newline). We deliberately use minja's low-level engine rather than its
-    // high-level `chat_template` wrapper: that wrapper runs a heuristic
-    // capability probe (6+ speculative renders per construction, plus stderr
-    // diagnostics) and a "polyfill" pass that rewrites the message list (merging
-    // the system role into a user turn, injecting a synthetic tools system
-    // prompt, ...). None of that is transformers behavior, and the probe
-    // misfires on templates that do not echo message content verbatim. The
-    // low-level path is the faithful, quiet, per-request-cheap equivalent.
-    //
-    // Parser::parse throws on a syntax error; render() throws on an evaluation
-    // error. Both surface below as ChatTemplateError.
     std::shared_ptr<minja::TemplateNode> root = minja::Parser::parse(
         template_str, minja::Options{/*trim_blocks=*/true,
                                      /*lstrip_blocks=*/true,
@@ -133,17 +120,14 @@ std::string apply_chat_template(
     nlohmann::ordered_json top = nlohmann::ordered_json::object();
     top["messages"] = BuildMessages(messages);
     top["add_generation_prompt"] = add_generation_prompt;
-    // Context::make's default parent is minja::Context::builtins(), which
-    // provides the standard Jinja filters/functions/tests (tojson, upper, map,
-    // selectattr, is-tests, ...) the real templates rely on.
+    // vLLM/HF: enable_thinking controls Gemma4 CoT channel (default false).
+    top["enable_thinking"] = enable_thinking;
     std::shared_ptr<minja::Context> context =
         minja::Context::make(minja::Value(top));
     context->set("bos_token", minja::Value(bos_token));
     context->set("eos_token", minja::Value(eos_token));
-    // An empty tools array is falsy in Jinja (`{% if tools %}` skips), matching
-    // transformers passing tools=None.
+    context->set("enable_thinking", minja::Value(enable_thinking));
     context->set("tools", minja::Value(BuildTools(tools)));
-    // Some templates (e.g. Llama 3.x) call strftime_now(fmt) for the date line.
     const auto now = std::chrono::system_clock::now();
     context->set(
         "strftime_now",
@@ -174,14 +158,15 @@ std::string apply_chat_template(
 
 openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
                                               std::string bos_token,
-                                              std::string eos_token) {
+                                              std::string eos_token,
+                                              bool enable_thinking) {
   return [tmpl = std::move(template_str), bos = std::move(bos_token),
-          eos = std::move(eos_token)](
+          eos = std::move(eos_token), enable_thinking](
              const std::vector<openai::ChatMessage>& messages,
              bool add_generation_prompt,
              const std::vector<openai::ChatCompletionToolsParam>& tools) {
     return apply_chat_template(tmpl, messages, add_generation_prompt, bos, eos,
-                               tools);
+                               tools, enable_thinking);
   };
 }
 
@@ -200,27 +185,43 @@ std::string LoadChatTemplateFromConfig(
                             e.what());
   }
   auto it = doc.find("chat_template");
-  if (it == doc.end() || it->is_null()) {
-    throw ChatTemplateError("tokenizer_config.json has no 'chat_template': " +
-                            tokenizer_config_path);
-  }
-  if (it->is_string()) return it->get<std::string>();
-  // List-of-{name,template} form: pick "default", else the first.
-  if (it->is_array()) {
-    const nlohmann::json* chosen = nullptr;
-    for (const auto& entry : *it) {
-      if (entry.is_object() && entry.value("name", std::string()) == "default") {
-        chosen = &entry;
-        break;
+  if (it != doc.end() && !it->is_null()) {
+    if (it->is_string()) return it->get<std::string>();
+    // List-of-{name,template} form: pick "default", else the first.
+    if (it->is_array()) {
+      const nlohmann::json* chosen = nullptr;
+      for (const auto& entry : *it) {
+        if (entry.is_object() && entry.value("name", std::string()) == "default") {
+          chosen = &entry;
+          break;
+        }
+      }
+      if (!chosen && !it->empty()) chosen = &it->front();
+      if (chosen && chosen->contains("template") &&
+          (*chosen)["template"].is_string()) {
+        return (*chosen)["template"].get<std::string>();
       }
     }
-    if (!chosen && !it->empty()) chosen = &it->front();
-    if (chosen && chosen->contains("template") &&
-        (*chosen)["template"].is_string()) {
-      return (*chosen)["template"].get<std::string>();
-    }
+    throw ChatTemplateError("unrecognized 'chat_template' shape in " +
+                            tokenizer_config_path);
   }
-  throw ChatTemplateError("unrecognized 'chat_template' shape in " +
+
+  // Sibling chat_template.jinja (HF layout for Gemma4 / many multimodal models).
+  std::string dir = tokenizer_config_path;
+  const auto slash = dir.find_last_of("/\\");
+  if (slash != std::string::npos) dir.resize(slash + 1);
+  else dir.clear();
+  const std::string jinja_path = dir + "chat_template.jinja";
+  std::ifstream jf(jinja_path, std::ios::binary);
+  if (jf) {
+    std::ostringstream ss;
+    ss << jf.rdbuf();
+    std::string tmpl = ss.str();
+    if (!tmpl.empty()) return tmpl;
+  }
+
+  throw ChatTemplateError("tokenizer_config.json has no 'chat_template' and no "
+                          "sibling chat_template.jinja: " +
                           tokenizer_config_path);
 }
 

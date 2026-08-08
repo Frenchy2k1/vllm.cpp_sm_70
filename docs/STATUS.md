@@ -2215,3 +2215,11 @@ and outside this repo.
 **Agent onboarding:** [session](../.agents/specs/session-onboarding.md) +
 [entry](../.agents/specs/developer-agent-protocol-entrypoint.md) implemented;
 documentation-only.
+
+## 2026-08-08 — Gemma4 ROCm fused helpers via portable vt:: seam (#154)
+
+Model files (`gemma4.cpp`, `gemma4_moe.cpp`) no longer call `vt::rocm::*` directly.
+Fused paths go through `include/vt/fused_ops.h` (`vt::RmsNormPlusAdd`,
+`DualRmsNormPlusRes`, `GeluMulSeparate`, `MatmulBTAlphaBeta`, `MatmulBTFp8Channel`,
+`ExpertGeGLUBf16TopKM1`). ROCm fast path under `VLLM_CPP_HIP`; non-HIP stubs for
+peer/pin/resident upload. `check-device-leakage` holds baseline.

@@ -4,9 +4,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -23,6 +27,73 @@
 namespace vllm::v1 {
 
 namespace {
+
+// Prefill progress (chunked prefill). ON if VT_SERVER_PREFILL_PROGRESS=1 or
+// VT_SERVER_VERBOSE=1. Rate-limited ~2 Hz per request.
+bool PrefillProgressEnabled() {
+  static const bool on = [] {
+    const char* p = std::getenv("VT_SERVER_PREFILL_PROGRESS");
+    if (p && p[0] == '0') return false;
+    if (p && p[0] == '1') return true;
+    const char* v = std::getenv("VT_SERVER_VERBOSE");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+
+void MaybeLogPrefillProgress(const Request& request) {
+  if (!PrefillProgressEnabled()) return;
+  const int prompt = request.num_prompt_tokens > 0 ? request.num_prompt_tokens
+                                                   : request.NumTokens();
+  if (prompt <= 0) return;
+  const int computed = request.num_computed_tokens;
+  // Decode phase: computed exceeds prompt once generation tokens append.
+  if (computed > prompt && !request.is_prefill_chunk) return;
+
+  using clock = std::chrono::steady_clock;
+  struct State {
+    clock::time_point last{};
+    int last_computed = -1;
+    bool logged_done = false;
+  };
+  static std::mutex mu;
+  static std::unordered_map<std::string, State> states;
+  std::lock_guard<std::mutex> lock(mu);
+  State& st = states[request.request_id];
+  const auto now = clock::now();
+  const bool done = !request.is_prefill_chunk && computed >= prompt;
+  if (done) {
+    if (!st.logged_done) {
+      std::cerr << "INFO prefill id=" << request.request_id
+                << " computed=" << std::min(computed, prompt) << "/" << prompt
+                << " (100%) status=done\n";
+      std::cerr.flush();
+      st.logged_done = true;
+    }
+    if (states.size() > 64) {
+      for (auto it = states.begin(); it != states.end();) {
+        if (it->second.logged_done)
+          it = states.erase(it);
+        else
+          ++it;
+      }
+    }
+    return;
+  }
+
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last).count();
+  if (st.last_computed >= 0 && ms < 500 && (computed - st.last_computed) < 2048) {
+    return;
+  }
+  st.last = now;
+  st.last_computed = computed;
+  const int shown = std::min(computed, prompt);
+  const double pct = 100.0 * static_cast<double>(shown) / static_cast<double>(prompt);
+  std::cerr << "INFO prefill id=" << request.request_id << " computed=" << shown
+            << "/" << prompt << " (" << pct << "%) status=running\n";
+  std::cerr.flush();
+}
 
 // Map the config-level policy onto the request-queue policy.
 //   kLPM (ENG-SGLANG-BEHAVIOR-FLAG) rides on the FCFS deque: the queue mechanics
@@ -977,6 +1048,7 @@ void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
     // needs a grammar bitmask this step.
     scheduler_output.has_structured_output_requests |=
         request->use_structured_output() && !request->is_prefill_chunk;
+    MaybeLogPrefillProgress(*request);
   }
   // Flush the finished / preempted id sets (assign fresh sets so the already
   // copied-out scheduler_output is unaffected).

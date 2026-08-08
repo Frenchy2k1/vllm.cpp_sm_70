@@ -31,8 +31,11 @@
 // residual, not a correctness gap).
 #include "vllm/model_executor/models/gemma4.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -49,6 +52,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/fused_ops.h"
 
 namespace vllm {
 namespace {
@@ -210,18 +214,37 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
            "gemma4: KV cache head dims mismatch this layer (heterogeneous KV — "
            "runner must allocate per-layer head_dim; see gemma4.h G1 note)");
 
-  // Merged QKVParallelLinear: D1 folds the shared-input q/k/v GEMMs to ONE
-  // MatmulBT over the merged [qdim+2kdim,H] owner + a contiguous QkvSplit
-  // (MergedQkvEnabled(), VT_QWEN3_QKV_MERGE default ON; =0 = byte-identical
-  // 3-shard). The QKV GEMM is uniform across all Gemma-4 layers — the
-  // heterogeneous sliding/shared-KV/norm handling downstream is unaffected.
-  DBuf q(d, adt, {T, qdim});
-  DBuf k(d, adt, {T, kdim});
-  DBuf v(d, adt, {T, kdim});
+  // TLS temps across layers (decode T=1 thrash).
+  struct AttnTls {
+    int dev = -1;
+    int64_t T = 0, qdim = 0, kdim = 0, Hq = 0, Dh = 0;
+    std::optional<DBuf> q, k, v, qkv, attn;
+  };
+  static thread_local AttnTls tls;
+  if (tls.dev != d.q.device.index || tls.T != T || tls.qdim != qdim || tls.kdim != kdim ||
+      tls.Hq != Hq || tls.Dh != Dh) {
+    tls.q.emplace(d, adt, std::vector<int64_t>{T, qdim});
+    tls.k.emplace(d, adt, std::vector<int64_t>{T, kdim});
+    tls.v.emplace(d, adt, std::vector<int64_t>{T, kdim});
+    tls.qkv.emplace(d, adt, std::vector<int64_t>{T, qdim + 2 * kdim});
+    tls.attn.emplace(d, adt, std::vector<int64_t>{T, Hq, Dh});
+    tls.dev = d.q.device.index;
+    tls.T = T;
+    tls.qdim = qdim;
+    tls.kdim = kdim;
+    tls.Hq = Hq;
+    tls.Dh = Dh;
+  }
+  DBuf& q = *tls.q;
+  DBuf& k = *tls.k;
+  DBuf& v = *tls.v;
+  DBuf& qkv = *tls.qkv;
+  DBuf& attn = *tls.attn;
+
+  // Merged QKVParallelLinear: one MatmulBT + QkvSplit (default).
   {
     Tensor wqkv = ResidentWeight(d, w.attn.qkv_proj);
     if (MergedQkvEnabled()) {
-      DBuf qkv(d, adt, {T, qdim + 2 * kdim});
       vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
       vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
     } else {
@@ -273,9 +296,10 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
     Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
     Tensor kw = k3;
     Tensor vw = v3;
-    DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
-    DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
+    // Cast buffers only when dtype differs (rare for bf16 KV).
     if (kv.dtype != adt) {
+      DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
+      DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
       if (kv.dtype == DType::kBF16) {
         vt::CastBf16(d.q, kcast.t(), k3);
         vt::CastBf16(d.q, vcast.t(), v3);
@@ -285,17 +309,19 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
       }
       kw = kcast.t();
       vw = vcast.t();
+      Tensor k_cache = KvSlice(kv, d.q.device, 0);
+      Tensor v_cache = KvSlice(kv, d.q.device, 1);
+      vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
+    } else {
+      Tensor k_cache = KvSlice(kv, d.q.device, 0);
+      Tensor v_cache = KvSlice(kv, d.q.device, 1);
+      vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
     }
-    Tensor k_cache = KvSlice(kv, d.q.device, 0);
-    Tensor v_cache = KvSlice(kv, d.q.device, 1);
-    vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
   }
 
-  // Paged GQA attention: scale = 1.0 (Q/K norms carry the scale). Reads the
-  // target layer's populated cache for shared layers.
+  // Paged GQA attention: scale = 1.0 (Q/K norms carry the scale).
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
-  DBuf attn(d, adt, {T, Hq, Dh});
   vt::PagedAttentionArgs pa{1.0f, meta.causal};
   if (g.attn_logit_softcap > 0.0f) pa.logits_soft_cap = g.attn_logit_softcap;
   pa.query_start_loc_host = meta.query_start_loc.data();
@@ -307,7 +333,7 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 
   Tensor o_in = Reshape(attn.t(), {T, Hq * Dh});
   Tensor wo = ResidentWeight(d, w.attn.o_proj);
-  DBuf o(d, DType::kBF16, {T, H});
+  DBuf o(d, DType::kBF16, {T, H});  // returned — not TLS
   vt::MatmulBT(d.q, o.t(), o_in, wo);
   return o;
 }
@@ -315,11 +341,25 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 // GeGLU MLP (gemma4.py::Gemma4MLP).
 DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
                     const Tensor& dh2, int64_t T) {
-  // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam
-  // (layers::UnquantizedMlpGateUpGeluMethod). Byte-for-byte the inline sequence —
-  // folds Gemma-4 onto the shared MlpGateUpMethodBase descriptor. (Tier-C1,
-  // arch-fusion-fold-plan-2026-07-30.)
-  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(&w.gate_up_proj, I).Apply(d, dh2);
+  // Dense GeGLU: TLS reuse of large gate_up [T,2I] + act [T,I] across layers.
+  Tensor wgu = ResidentWeight(d, w.gate_up_proj);
+  struct MlpTls {
+    int dev = -1;
+    int64_t T = 0, I = 0;
+    std::optional<DBuf> gu, act;
+  };
+  static thread_local MlpTls tls;
+  if (tls.dev != d.q.device.index || tls.T != T || tls.I != I) {
+    tls.gu.emplace(d, DType::kBF16, std::vector<int64_t>{T, 2 * I});
+    tls.act.emplace(d, DType::kBF16, std::vector<int64_t>{T, I});
+    tls.dev = d.q.device.index;
+    tls.T = T;
+    tls.I = I;
+  }
+  DBuf& gu = *tls.gu;
+  DBuf& act = *tls.act;
+  vt::MatmulBT(d.q, gu.t(), dh2, wgu);
+  vt::GeluAndMul(d.q, act.t(), gu.t());
   Tensor wd = ResidentWeight(d, w.down_proj);
   DBuf down(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, down.t(), act.t(), wd);
@@ -443,6 +483,24 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     vt::MulScalar(d.q, ple_input.t(), ple_input.t(), g.input_scale);
   }
 
+  // Layout [L,T,ple] so each layer's slice is one contiguous D2D (not T row gathers).
+  DBuf ple_by_layer(d, DType::kBF16,
+                    ple > 0 ? std::vector<int64_t>{L, T, ple} : std::vector<int64_t>{1, 1, 1});
+  if (ple > 0) {
+    const size_t row = static_cast<size_t>(ple) * sizeof(uint16_t);
+    const auto* src = static_cast<const char*>(ple_input.ptr());
+    auto* dst = static_cast<char*>(ple_by_layer.ptr());
+    for (int64_t t = 0; t < T; ++t) {
+      for (int64_t li = 0; li < L; ++li) {
+        const size_t s_off =
+            (static_cast<size_t>(t) * static_cast<size_t>(L) + static_cast<size_t>(li)) * row;
+        const size_t d_off =
+            (static_cast<size_t>(li) * static_cast<size_t>(T) + static_cast<size_t>(t)) * row;
+        CopyRow(d, dst + d_off, src + s_off, row);
+      }
+    }
+  }
+
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
 
   // hidden state stream (each layer fully materializes h; no separate residual).
@@ -452,6 +510,53 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   const size_t ple_row_bytes = static_cast<size_t>(ple) * sizeof(uint16_t);
 
+  // Decode/prefill layer scratch reused across L (pool thrash was real on 30L MoE).
+  struct LayerTls {
+    int dev = -1;
+    int64_t T = 0, H = 0, I = 0, ple = 0;
+    std::optional<DBuf> dhn, attn_n, h1, dh2, h2, moe_in, n1, n2, sum, n3, mlp_n;
+    std::optional<DBuf> gate_lin, ple_l, gated, contrib;
+  };
+  static thread_local LayerTls lt;
+  if (lt.dev != d.q.device.index || lt.T != T || lt.H != H || lt.I != I || lt.ple != ple) {
+    auto mk = [&](int64_t a, int64_t b) {
+      return DBuf(d, DType::kBF16, std::vector<int64_t>{a, b});
+    };
+    lt.dhn.emplace(mk(T, H));
+    lt.attn_n.emplace(mk(T, H));
+    lt.h1.emplace(mk(T, H));
+    lt.dh2.emplace(mk(T, H));
+    lt.h2.emplace(mk(T, H));
+    lt.moe_in.emplace(mk(T, H));
+    lt.n1.emplace(mk(T, H));
+    lt.n2.emplace(mk(T, H));
+    lt.sum.emplace(mk(T, H));
+    lt.n3.emplace(mk(T, H));
+    lt.mlp_n.emplace(mk(T, H));
+    lt.contrib.emplace(mk(T, H));
+    if (ple > 0) {
+      lt.gate_lin.emplace(mk(T, ple));
+      lt.ple_l.emplace(mk(T, ple));
+      lt.gated.emplace(mk(T, ple));
+    } else {
+      lt.gate_lin.reset();
+      lt.ple_l.reset();
+      lt.gated.reset();
+    }
+    lt.dev = d.q.device.index;
+    lt.T = T;
+    lt.H = H;
+    lt.I = I;
+    lt.ple = ple;
+  }
+  DBuf& dhn = *lt.dhn;
+  DBuf& h1 = *lt.h1;
+  DBuf& dh2 = *lt.dh2;
+  DBuf& h2 = *lt.h2;
+  DBuf& moe_in = *lt.moe_in;
+  const size_t th_bytes = static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(uint16_t);
+  DBuf& contrib = *lt.contrib;
+
   for (int64_t l = 0; l < L; ++l) {
     const Gemma4LayerWeights& w = weights.layers[static_cast<size_t>(l)];
     const int64_t Dh = w.head_dim;
@@ -460,101 +565,106 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     std::optional<int64_t> window;
     if (!full) window = g.sliding_window;
 
-    // Which cache to attend: own for non-shared, target's for YOCO-shared.
     const int64_t kv_idx = w.is_kv_shared ? w.kv_target_layer : l;
     VT_CHECK(kv_idx >= 0 && kv_idx < L, "gemma4: bad kv target layer");
     const PagedKvCache& kv = attn_kv[static_cast<size_t>(kv_idx)];
 
-    // r = hidden; dhn = input_layernorm(hidden)  [standalone plain]
     Tensor w_in = ResidentWeight(d, w.input_layernorm, {H});
-    DBuf dhn(d, DType::kBF16, {T, H});
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, plain);
+
+    static const bool layer_prof = [] {
+      const char* e = std::getenv("VT_GEMMA4_PROFILE");
+      return e && e[0] == '1';
+    }();
+    using clock = std::chrono::steady_clock;
+    const auto t0 = layer_prof ? clock::now() : clock::time_point{};
 
     DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
                                 ones_dh, full ? &prop_cache.t() : nullptr, window,
                                 g.rope_theta_sliding);
 
-    // attn_n = post_attention_layernorm(attn) [standalone]; hidden = attn_n + r
     Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
-    DBuf attn_n(d, DType::kBF16, {T, H});
-    vt::RmsNorm(d.q, attn_n.t(), attn.t(), w_pa, plain);
-    DBuf h1(d, DType::kBF16, {T, H});
-    vt::Add(d.q, h1.t(), attn_n.t(), hidden.t());
+    // h1 = rmsnorm(attn) + hidden  (one kernel)
+    vt::RmsNormPlusAdd(d.q, h1.t(), attn.t(), w_pa, hidden.t(), plain);
 
-    // dh2 = pre_feedforward_layernorm(h1); mlp; post_feedforward_layernorm; +h1
-    // MoE (26B-A4B): parallel dense MLP + MoE on residual (sglang gemma4_causal).
+    if (layer_prof) d.b.Synchronize(d.q);
+    const auto t1 = layer_prof ? clock::now() : clock::time_point{};
+
     Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
-    DBuf dh2(d, DType::kBF16, {T, H});
     vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
     DBuf mlp = Gemma4MlpBlock(d, w.mlp, H, I, dh2.t(), T);
 
-    DBuf h2(d, DType::kBF16, {T, H});
+    if (layer_prof) d.b.Synchronize(d.q);
+    const auto t2 = layer_prof ? clock::now() : clock::time_point{};
+
     if (w.moe.enabled) {
-      // residual for router = h1 (post-attn residual stream)
-      DBuf moe_in(d, DType::kBF16, {T, H});
       Tensor w_pf2 = ResidentWeight(d, w.moe.pre_feedforward_layernorm_2, {H});
       vt::RmsNorm(d.q, moe_in.t(), h1.t(), w_pf2, plain);
       Gemma4MoeScratch moe_out =
           RunGemma4Moe(d.q, w.moe, /*router_in=*/h1.t(), /*expert_in=*/moe_in.t(), T, H, eps);
       Tensor w_p1 = ResidentWeight(d, w.moe.post_feedforward_layernorm_1, {H});
       Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
-      DBuf n1(d, DType::kBF16, {T, H});
-      DBuf n2(d, DType::kBF16, {T, H});
-      vt::RmsNorm(d.q, n1.t(), mlp.t(), w_p1, plain);
-      vt::RmsNorm(d.q, n2.t(), moe_out.tensor, w_p2, plain);
-      DBuf sum(d, DType::kBF16, {T, H});
-      vt::Add(d.q, sum.t(), n1.t(), n2.t());
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      DBuf n3(d, DType::kBF16, {T, H});
-      vt::RmsNorm(d.q, n3.t(), sum.t(), w_pff, plain);
-      vt::Add(d.q, h2.t(), n3.t(), h1.t());
+      // h2 = rmsnorm(rmsnorm(mlp)+rmsnorm(moe), w_pff) + h1  — one fused kernel
+      vt::DualRmsNormPlusRes(d.q, h2.t(), mlp.t(), w_p1, moe_out.tensor, w_p2, w_pff,
+                                       h1.t(), plain);
     } else {
       Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-      DBuf mlp_n(d, DType::kBF16, {T, H});
-      vt::RmsNorm(d.q, mlp_n.t(), mlp.t(), w_pff, plain);
-      vt::Add(d.q, h2.t(), mlp_n.t(), h1.t());
+      vt::RmsNormPlusAdd(d.q, h2.t(), mlp.t(), w_pff, h1.t(), plain);
     }
 
-    // --- PLE (gemma4.py:753-761): gate = gelu(gate_lin(h2)); gated = gate *
-    // ple_l; contrib = post_per_layer_input_norm(proj(gated)); h2 += contrib. ---
+    if (layer_prof) {
+      d.b.Synchronize(d.q);
+      const auto t3 = clock::now();
+      static std::atomic<uint64_t> n{0}, us_attn{0}, us_mlp{0}, us_moe{0};
+      auto us = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+      };
+      us_attn.fetch_add(static_cast<uint64_t>(us(t0, t1)), std::memory_order_relaxed);
+      us_mlp.fetch_add(static_cast<uint64_t>(us(t1, t2)), std::memory_order_relaxed);
+      us_moe.fetch_add(static_cast<uint64_t>(us(t2, t3)), std::memory_order_relaxed);
+      const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (c == 32 || c % 128 == 0) {
+        std::fprintf(stderr,
+                     "gemma4 layer profile: calls=%llu attn_us=%.1f mlp_us=%.1f moe_us=%.1f "
+                     "(attn%%=%.0f mlp%%=%.0f moe%%=%.0f)\n",
+                     static_cast<unsigned long long>(c),
+                     static_cast<double>(us_attn.load()) / c,
+                     static_cast<double>(us_mlp.load()) / c,
+                     static_cast<double>(us_moe.load()) / c,
+                     100.0 * us_attn.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1),
+                     100.0 * us_mlp.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1),
+                     100.0 * us_moe.load() / (us_attn.load() + us_mlp.load() + us_moe.load() + 1));
+      }
+    }
+
     if (ple > 0) {
       Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
-      DBuf gate_lin(d, DType::kBF16, {T, ple});
+      DBuf& gate_lin = *lt.gate_lin;
+      DBuf& ple_l = *lt.ple_l;
+      DBuf& gated = *lt.gated;
       vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
-      DBuf gate_in(d, DType::kBF16, {T, 2 * ple});  // [gate_lin | ple_l]
-      // Assemble [T, 2*ple]: row t = [gate_lin[t] | ple_input[t, l, :]].
-      auto* gi = static_cast<char*>(gate_in.ptr());
-      const auto* gl = static_cast<const char*>(gate_lin.ptr());
-      const auto* pin = static_cast<const char*>(ple_input.ptr());
-      const size_t two = static_cast<size_t>(2 * ple) * sizeof(uint16_t);
-      for (int64_t t = 0; t < T; ++t) {
-        CopyRow(d, gi + static_cast<size_t>(t) * two,
-                gl + static_cast<size_t>(t) * ple_row_bytes, ple_row_bytes);
-        const size_t src_off =
-            (static_cast<size_t>(t) * static_cast<size_t>(L) +
-             static_cast<size_t>(l)) *
-            ple_row_bytes;
-        CopyRow(d, gi + static_cast<size_t>(t) * two + ple_row_bytes,
-                pin + src_off, ple_row_bytes);
-      }
-      DBuf gated(d, DType::kBF16, {T, ple});
-      vt::GeluAndMul(d.q, gated.t(), gate_in.t());  // gelu_tanh(gate_lin)*ple_l
+      // Contiguous [T,ple] slice for this layer from [L,T,ple] layout.
+      const size_t layer_bytes = static_cast<size_t>(T) * ple_row_bytes;
+      const char* src = static_cast<const char*>(ple_by_layer.ptr()) +
+                        static_cast<size_t>(l) * layer_bytes;
+      d.b.Copy(d.q, ple_l.ptr(), src, layer_bytes);
+      vt::GeluMulSeparate(d.q, gated.ptr(), gate_lin.ptr(), ple_l.ptr(), T * ple,
+                                    DType::kBF16);
 
       Tensor wp = ResidentWeight(d, w.per_layer_projection, {H, ple});
-      DBuf contrib(d, DType::kBF16, {T, H});
       vt::MatmulBT(d.q, contrib.t(), gated.t(), wp);
       Tensor w_pln = ResidentWeight(d, w.post_per_layer_input_norm, {H});
       vt::RmsNorm(d.q, contrib.t(), contrib.t(), w_pln, plain);
       vt::Add(d.q, h2.t(), h2.t(), contrib.t());
     }
 
-    // Per-layer learned scalar (gemma4.py:707,765).
     if (!w.layer_scalar.Empty()) {
       const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
       vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
     }
 
-    hidden = std::move(h2);
+    d.b.Copy(d.q, hidden.ptr(), h2.ptr(), th_bytes);
   }
 
   // Final norm (plain RMSNorm, standalone — residual is None in vLLM).

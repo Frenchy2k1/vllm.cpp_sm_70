@@ -840,6 +840,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp
+  src/vllm/entrypoints/openai/request_logger.cpp
   src/vllm/entrypoints/openai/serving_models.cpp
   src/vllm/entrypoints/openai/run_batch.cpp
   src/vllm/entrypoints/openai/tool_parsers/abstract.cpp
@@ -912,6 +913,7 @@ add_library(vllm STATIC
   src/vt/op_provider.cpp
   src/vt/communicator.cpp
   src/vt/ops.cpp
+  src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
   src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
@@ -1145,6 +1147,10 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_matmul_hipblaslt.hip
     src/vt/rocm/rocm_paged_attn.hip
     src/vt/rocm/rocm_gemma4_experts.hip
+    src/vt/rocm/rocm_gemma4_fused_experts.hip
+    src/vt/rocm/rocm_gemma4_expert_geglu.hip
+    src/vt/rocm/rocm_fp8_channel_gemv.hip
+    src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
@@ -1155,6 +1161,10 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_matmul_hipblaslt.hip
       src/vt/rocm/rocm_paged_attn.hip
       src/vt/rocm/rocm_gemma4_experts.hip
+      src/vt/rocm/rocm_gemma4_fused_experts.hip
+      src/vt/rocm/rocm_gemma4_expert_geglu.hip
+      src/vt/rocm/rocm_fp8_channel_gemv.hip
+      src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
