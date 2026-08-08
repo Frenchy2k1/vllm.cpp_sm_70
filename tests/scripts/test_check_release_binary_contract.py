@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-release-binary-contract.py"
+CHECKER_SPEC = importlib.util.spec_from_file_location(
+    "check_release_binary_contract", CHECKER
+)
+assert CHECKER_SPEC is not None and CHECKER_SPEC.loader is not None
+checker = importlib.util.module_from_spec(CHECKER_SPEC)
+CHECKER_SPEC.loader.exec_module(checker)
 
 CONTRACT_PATHS = (
     "scripts/check-release-binary-contract.py",
@@ -25,6 +32,8 @@ CONTRACT_PATHS = (
     ".agents/state.md",
     "docs/STATUS.md",
     "docs/BENCHMARKS.md",
+    ".github/workflows/ci.yml",
+    "scripts/agent-preflight.sh",
     "tests/scripts/test_check_release_binary_contract.py",
 )
 
@@ -54,6 +63,11 @@ REQUIRED_TEST_METHODS = (
     "test_each_semantic_inventory_consumer_body_is_pinned",
     "test_checker_guard_map_keysets_are_exact",
     "test_required_mutation_test_inventory_is_pinned",
+    "test_backend_policy_machine_fields_are_required",
+    "test_backend_policy_prose_is_fail_closed",
+    "test_preflight_and_ci_wiring_is_an_executable_contract",
+    "test_preflight_wiring_mutations_fail",
+    "test_ci_wiring_mutations_fail",
 )
 
 PRIMARY_CUDA_SMS = (
@@ -85,6 +99,9 @@ GUARD_MAP_KEYS = {
         "UNKNOWN_MACHINE_FIELD_MUTATIONS",
         "HUMAN_WORK_DEPS",
         "GUARD_MAP_KEYS",
+        "BACKEND_POLICY_PROSE_MUTATIONS",
+        "PREFLIGHT_WIRING_MUTATIONS",
+        "CI_WIRING_MUTATIONS",
     ),
     "TEST_INVENTORY_CONSUMERS": (
         "PRIMARY_CUDA_SMS",
@@ -101,13 +118,16 @@ GUARD_MAP_KEYS = {
         "UNKNOWN_MACHINE_FIELD_MUTATIONS",
         "HUMAN_WORK_DEPS",
         "GUARD_MAP_KEYS",
+        "BACKEND_POLICY_PROSE_MUTATIONS",
+        "PREFLIGHT_WIRING_MUTATIONS",
+        "CI_WIRING_MUTATIONS",
     ),
 }
 
 RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | SPIKE | #129 |",
+    ".agents/NOW.md": "| Release | SPIKE; 30/30 | #129 |",
     ".agents/coordination.md": (
         "| `CLAIM-ENG-RELEASE-BINARIES-SPIKE` | "
         "`ENG-RELEASE-BINARIES` |"
@@ -117,7 +137,7 @@ RECORD_ANCHORS = {
         "are the primary downloads"
     ),
     "docs/STATUS.md": (
-        "[Release spike](../.agents/specs/release-binary-matrix.md)"
+        "#129: SPIKE∅"
     ),
     "docs/BENCHMARKS.md": (
         "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`:"
@@ -216,7 +236,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states; 25 tests GREEN. No archive, "
+        "W1-W13/W10-W12 policy, public pending states; 30 tests GREEN. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -224,8 +244,8 @@ PUBLIC_PENDING_MUTATIONS = (
     ),
     (
         "docs/STATUS.md",
-        "Supported (subset); bundles SPIKED, no artifacts",
-        "Supported; bundles SHIPPED with runtime evidence",
+        "Supported (subset); #129: SPIKE∅",
+        "Supported; #129: SHIPPED",
         "docs/STATUS.md release row",
     ),
 )
@@ -267,6 +287,13 @@ EXACT_MACHINE_FIELDS = {
     "work_W12_policy": "optional-non-blocking",
     "archive_claims": "pending",
     "runtime_claims": "pending",
+    "metal_channel": "stable-after-runtime-gate",
+    "mlx_channel": "preview",
+    "vulkan_channel": "preview",
+    "musl_channel": "experimental-preview",
+    "musl_scope": "cpu-only-no-gpu",
+    "rocm_channel": "blocked",
+    "gpu_driver_boundary": "external-host-never-bundled",
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
@@ -287,6 +314,9 @@ INVENTORY_CONSUMER_METHODS = {
         "test_human_primary_artifact_contract_matches_machine_block"
     ),
     "GUARD_MAP_KEYS": "test_checker_guard_map_keysets_are_exact",
+    "BACKEND_POLICY_PROSE_MUTATIONS": "test_backend_policy_prose_is_fail_closed",
+    "PREFLIGHT_WIRING_MUTATIONS": "test_preflight_wiring_mutations_fail",
+    "CI_WIRING_MUTATIONS": "test_ci_wiring_mutations_fail",
 }
 
 CONSUMER_FLOW_MUTATIONS = ("continue", "break", "wrap_false")
@@ -308,6 +338,132 @@ HUMAN_WORK_DEPS = {
     "W12": "W1,W2,W5,W6,W7",
     "W13": "W5,W7,W8,W9,W10,W11",
 }
+
+BACKEND_POLICY_FIELDS = {
+    "metal_channel": "stable-after-runtime-gate",
+    "mlx_channel": "preview",
+    "vulkan_channel": "preview",
+    "musl_channel": "experimental-preview",
+    "musl_scope": "cpu-only-no-gpu",
+    "rocm_channel": "blocked",
+    "gpu_driver_boundary": "external-host-never-bundled",
+}
+
+BACKEND_POLICY_PROSE_MUTATIONS = (
+    (
+        "| `macos-arm64-metal` | stable after M-series runtime gate |",
+        "| `macos-arm64-metal` | preview |",
+        "Metal release channel",
+    ),
+    (
+        "| `macos-arm64-metal-mlx` | preview until its exact bundled MLX tuple "
+        "is runtime/correctness-gated |",
+        "| `macos-arm64-metal-mlx` | stable |",
+        "MLX release channel",
+    ),
+    (
+        "| `linux-x86_64-glibc-vulkan` | preview |",
+        "| `linux-x86_64-glibc-vulkan` | stable |",
+        "Vulkan release channel",
+    ),
+    (
+        "| `linux-x86_64-musl-cpu-static` | experimental preview | literal-static "
+        "feasibility lane; CPU only; see the static boundary below |",
+        "| `linux-x86_64-musl-cpu-static` | stable | literal-static feasibility "
+        "lane with CUDA |",
+        "musl experimental CPU-only policy",
+    ),
+    (
+        "| ROCm/HIP | blocked |",
+        "| ROCm/HIP | preview |",
+        "ROCm release channel",
+    ),
+    (
+        "it never claims to bundle a GPU driver.",
+        "it bundles the GPU driver.",
+        "external host GPU-driver boundary",
+    ),
+    (
+        "The one literal-static experiment is\n"
+        "`linux-x86_64-musl-cpu-static`. It is CPU-only",
+        "The one literal-static experiment is\n"
+        "`linux-x86_64-musl-cpu-static`. It includes GPU runtimes",
+        "musl CPU-only/no-GPU boundary",
+    ),
+)
+
+PREFLIGHT_WIRING_MUTATIONS = (
+    (
+        "  check-release-binary-contract\n",
+        "",
+        "preflight CHECKERS",
+    ),
+    (
+        "  test_check_release_binary_contract\n",
+        "",
+        "preflight SUITES",
+    ),
+    (
+        'for checker in "${CHECKERS[@]}"; do',
+        'for checker in "${CHECKERS[@]}"; do\n  continue',
+        "execute release CHECKERS",
+    ),
+    (
+        'for suite in "${SUITES[@]}"; do',
+        'for suite in "${SUITES[@]}"; do\n  continue',
+        "execute release SUITES",
+    ),
+    (
+        "CHECKERS=(\n",
+        "INERT_CHECKERS=(\n",
+        "preflight CHECKERS",
+    ),
+    (
+        "SUITES=(\n",
+        "INERT_SUITES=(\n",
+        "preflight SUITES",
+    ),
+)
+
+CI_WIRING_MUTATIONS = (
+    (
+        "          python3 scripts/check-release-binary-contract.py\n",
+        "",
+        "CI checker",
+    ),
+    (
+        "          python3 tests/scripts/test_check_release_binary_contract.py\n",
+        "",
+        "CI step",
+    ),
+    (
+        "          python3 scripts/check-release-binary-contract.py\n"
+        "          python3 tests/scripts/test_check_release_binary_contract.py\n",
+        "          if false; then\n"
+        "            python3 scripts/check-release-binary-contract.py\n"
+        "            python3 tests/scripts/test_check_release_binary_contract.py\n"
+        "          fi\n",
+        "direct active commands",
+    ),
+    (
+        "          python3 scripts/check-release-binary-contract.py\n",
+        '          echo "python3 scripts/check-release-binary-contract.py"\n',
+        "direct active commands",
+    ),
+    (
+        "      - name: Accepted binary-release design and record anchors stay in sync\n"
+        "        run: |\n",
+        "      - name: Accepted binary-release design and record anchors stay in sync\n"
+        "        if: ${{ false }}\n"
+        "        run: |\n",
+        "direct active commands",
+    ),
+    (
+        "  agent-record:\n",
+        "  agent-record:\n    if: ${{ false }}\n",
+        "direct active commands",
+    ),
+)
 
 
 def run_checker(root: Path) -> subprocess.CompletedProcess[str]:
@@ -541,6 +697,42 @@ class LiveContract(unittest.TestCase):
     def test_repository_contract_passes(self) -> None:
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class MissingReviewGuardTests(unittest.TestCase):
+    def test_backend_policy_machine_fields_are_required(self) -> None:
+        for field, value in BACKEND_POLICY_FIELDS.items():
+            with self.subTest(field=field):
+                self.assertEqual(checker.EXPECTED_FIELDS[field], value)
+
+    def test_preflight_and_ci_wiring_is_an_executable_contract(self) -> None:
+        preflight = (ROOT / "scripts/agent-preflight.sh").read_text(encoding="utf-8")
+        ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(checker.wiring_errors(preflight, ci), [])
+
+    def test_backend_policy_prose_is_fail_closed(self) -> None:
+        for before, after, reason in BACKEND_POLICY_PROSE_MUTATIONS:
+            with self.subTest(reason=reason), RepoCopy() as root:
+                mutate(root, ".agents/specs/release-binary-matrix.md", before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
+
+    def test_preflight_wiring_mutations_fail(self) -> None:
+        for before, after, reason in PREFLIGHT_WIRING_MUTATIONS:
+            with self.subTest(reason=reason, mutation=before), RepoCopy() as root:
+                mutate(root, "scripts/agent-preflight.sh", before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
+
+    def test_ci_wiring_mutations_fail(self) -> None:
+        for before, after, reason in CI_WIRING_MUTATIONS:
+            with self.subTest(reason=reason, mutation=before), RepoCopy() as root:
+                mutate(root, ".github/workflows/ci.yml", before, after)
+                result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout + result.stderr)
 
 
 class AcceptedDesignMutations(unittest.TestCase):
