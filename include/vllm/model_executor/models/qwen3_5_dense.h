@@ -31,6 +31,8 @@
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, GdnStateCache + v1 attention metadata
+#include <functional>
+
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Gdn/FullAttn weights, TensorResolver
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
@@ -95,11 +97,14 @@ struct Qwen3_5DenseLayerWeights {
   DenseMlpWeights mlp;                   // every layer has a dense MLP
 };
 
-// Whole dense-model text weights. lm_head is bf16 (unquantized in the 27B).
+// Whole dense-model text weights. `lm_head` is always materialized bf16 here, but
+// the CHECKPOINT may store it BF16, FP8 (per-channel scale) or ModelOpt NVFP4 —
+// the 27B NVFP4 publishers disagree, and revisions of one repo disagree with each
+// other (issue #164). LoadLmHeadAnyDtype dequantizes all three to this operand.
 struct Qwen3_5DenseWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
-  OwnedTensor lm_head;       // bf16 [H, vocab]  (unquantized -> Matmul-B layout)
+  OwnedTensor lm_head;       // bf16 [H, vocab]  (dequantized -> Matmul-B layout)
   // Mirrors tie_word_embeddings: logits reuse embed_tokens as raw [V,H]
   // torch-Linear storage, so no second host/device owner is created.
   bool tied_lm_head = false;
@@ -121,6 +126,15 @@ bool IsQwen27QuantizedLinear(const std::string& name);
 // reciprocates the global scale), rounds to bf16, and transposes. Exposed for
 // unit testing. The `<proj>.input_global_scale` (activation divisor) is ignored
 // on this bf16-activation correctness path (notes §3.4 / §5 step-6a).
+// `lm_head` across the three storage forms the 27B NVFP4 publishers actually ship
+// (issue #164): BF16, FP8 `+_scale` (per-output-channel or per-tensor), and NVFP4
+// `+_scale` `+_scale_2`/`+_global_scale`. Always returns bf16 [in, out] Matmul-B,
+// so a BF16 head is byte-identical to the previous LoadBf16Transposed call.
+// `has` probes optional companion tensors. Exported for the loader gate.
+OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get,
+                               const std::function<bool(const std::string&)>& has,
+                               const std::string& name);
+
 OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
                                              const std::string& proj);
 

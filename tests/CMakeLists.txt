@@ -1337,6 +1337,9 @@ target_include_directories(test_mistral_paged_engine PRIVATE
 # 0 multi-valued cells). Checkpoint-gated, dgx-only.
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
   vllm/models/test_qwen3_32b_nvfp4a16_load.cpp)
+
+vllm_cpp_add_test(test_qwen3_5_lm_head_dtypes
+  vllm/models/test_qwen3_5_lm_head_dtypes.cpp)
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine
   vllm/models/test_qwen3_32b_nvfp4a16_paged_engine.cpp)
 target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
