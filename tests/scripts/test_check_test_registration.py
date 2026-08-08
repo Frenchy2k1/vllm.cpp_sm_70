@@ -564,6 +564,27 @@ class SuiteIntegrityTests(unittest.TestCase):
             errors, ["mutation suite must use the canonical manifest path"]
         )
 
+    def test_M43_M42_keeps_exact_path_outcome_assertion(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        assertion = (
+            "        self.assertEqual(\n"
+            '            errors, ["mutation suite must use the canonical manifest path"]\n'
+            "        )\n"
+        )
+        for label, replacement in {
+            "deleted": "",
+            "wrong diagnostic": "        self.assertEqual(errors, [])\n",
+        }.items():
+            with self.subTest(mutation=label):
+                mutated = source.replace(assertion, replacement, 1)
+                self.assertNotEqual(mutated, source)
+                errors = _suite_integrity_errors(mutated)
+                self.assertTrue(
+                    "test_M42 must assert the exact canonical-manifest path diagnostic"
+                    in errors,
+                    errors,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

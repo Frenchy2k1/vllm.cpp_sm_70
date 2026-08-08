@@ -42600,3 +42600,20 @@ exact delete-only production mutation now fails only M42 (1/51), while the
 baseline checker and suite are green at 51/51. CPU-only governance hardening;
 selector behavior, ABI, DSR 32, performance, model state, CUDA A/B and release
 state remain unchanged.
+
+## 2026-08-08 — PR #139 M42 outcome assertion is production-pinned
+<!-- state: 2026-08-08T19:00 -->
+
+Scoped re-review deleted M42's sole path-outcome `assertEqual`, but the suite
+stayed green because its unrelated byte-identity `assertTrue` satisfied the
+generic mutation-case shape check. The production checker now parses M42 and
+requires `assertEqual(errors, ["mutation suite must use the canonical manifest
+path"])` exactly. M43 deletes that assertion and replaces its diagnostic in
+turn; both mutations produce the dedicated M42 contract error. The external
+inventory and production-owned digest now pin M43 as well.
+
+The direct destructive proofs are red: deleting M42's outcome assertion fails
+the shipped-tree check and M43, while deleting the production path guard still
+fails M42 itself. Baseline checker plus suite are green at 52/52. This remains
+CPU-only governance hardening; selector behavior, ABI, DSR 32, performance,
+model state, CUDA A/B and release state are unchanged.
