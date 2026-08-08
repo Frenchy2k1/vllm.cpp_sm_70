@@ -13,9 +13,13 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/gemma4_moe.h"
 #include "vt/dtype.h"
+
+#include <cmath>
+#include <cstring>
 
 namespace vllm {
 namespace {
@@ -104,9 +108,57 @@ OwnedTensor BorrowBf16(const StTensor& t, std::shared_ptr<const void> owner,
   return o;
 }
 
-Gemma4MoeLayerWeights LoadMoeBf16(
-    const TensorResolver& get, const std::string& base, int64_t E, int64_t top_k,
-    int64_t moe_I, int64_t H, std::shared_ptr<const void> owner) {
+OwnedTensor BorrowBytes(const StTensor& t, vt::DType dt, size_t elem_size,
+                        std::shared_ptr<const void> owner) {
+  OwnedTensor o;
+  o.dtype = dt;
+  o.rank = static_cast<int>(t.shape.size());
+  VT_CHECK(o.rank <= vt::kMaxRank, "gemma4: rank");
+  int64_t n = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = t.shape[static_cast<size_t>(i)];
+    n *= t.shape[static_cast<size_t>(i)];
+  }
+  VT_CHECK(static_cast<size_t>(n) * elem_size == t.nbytes, "gemma4: borrow bytes size");
+  o.bytes = OwnedBytes::Borrow(t.data, t.nbytes, std::move(owner));
+  return o;
+}
+
+// FP8 + channel scale → owned BF16 raw-NK [N,K]
+OwnedTensor LoadFp8ChannelToBf16RawNk(const TensorResolver& get, const std::string& base) {
+  const StTensor& w = get(base + ".weight");
+  const StTensor& s = get(base + ".weight_scale");
+  VT_CHECK(w.dtype == "F8_E4M3", "gemma4 fp8: expected F8_E4M3 for " + base);
+  VT_CHECK(s.dtype == "BF16", "gemma4 fp8: expected BF16 scale for " + base);
+  VT_CHECK(w.shape.size() == 2, "gemma4 fp8: rank-2 weight");
+  const int64_t N = w.shape[0], K = w.shape[1];
+  VT_CHECK(s.shape[0] == N, "gemma4 fp8: scale N");
+  OwnedTensor o = MakeOwned(vt::DType::kBF16, {N, K});
+  o.nk = true;
+  DequantFp8ChannelToBf16(w.data, reinterpret_cast<const uint16_t*>(s.data), N, K,
+                          reinterpret_cast<uint16_t*>(o.bytes.data()));
+  MaybeReleaseSourcePages(w.data, w.nbytes);
+  MaybeReleaseSourcePages(s.data, s.nbytes);
+  return o;
+}
+
+void FuseRouter(Gemma4MoeLayerWeights& m, int64_t E, int64_t H) {
+  VT_CHECK(m.router_proj.nk && m.router_proj.shape[0] == E && m.router_proj.shape[1] == H,
+           "gemma4 moe: router_proj shape");
+  const float rsqrt_h = 1.f / std::sqrt(static_cast<float>(H));
+  const auto* sc = reinterpret_cast<const uint16_t*>(m.router_scale.bytes.data());
+  const auto* ps = reinterpret_cast<const uint16_t*>(m.router_proj.bytes.data());
+  m.router_proj_fused = MakeOwned(vt::DType::kBF16, {E, H});
+  m.router_proj_fused.nk = true;
+  auto* pd = reinterpret_cast<uint16_t*>(m.router_proj_fused.bytes.data());
+  for (int64_t e = 0; e < E; ++e)
+    for (int64_t j = 0; j < H; ++j)
+      pd[e * H + j] =
+          vt::F32ToBF16(vt::BF16ToF32(ps[e * H + j]) * vt::BF16ToF32(sc[j]) * rsqrt_h);
+}
+
+Gemma4MoeLayerWeights LoadMoeCommonRouter(const TensorResolver& get, const std::string& base,
+                                          int64_t /*E*/, int64_t top_k, int64_t moe_I) {
   Gemma4MoeLayerWeights m;
   m.enabled = true;
   m.top_k = static_cast<int>(top_k);
@@ -114,30 +166,20 @@ Gemma4MoeLayerWeights LoadMoeBf16(
   m.router_scale = LoadBf16Direct(get, base + "router.scale");
   m.router_proj = LoadMergedBf16RawNK(get, {base + "router.proj.weight"});
   m.per_expert_scale = LoadBf16Direct(get, base + "router.per_expert_scale");
-  // Fuse scale * H^{-0.5} into router proj once at load.
-  {
-    VT_CHECK(m.router_proj.nk && m.router_proj.shape[0] == E &&
-                 m.router_proj.shape[1] == H,
-             "gemma4 moe: router_proj shape");
-    const float rsqrt_h = 1.f / std::sqrt(static_cast<float>(H));
-    const auto* sc = reinterpret_cast<const uint16_t*>(m.router_scale.bytes.data());
-    const auto* ps = reinterpret_cast<const uint16_t*>(m.router_proj.bytes.data());
-    m.router_proj_fused = MakeOwned(vt::DType::kBF16, {E, H});
-    m.router_proj_fused.nk = true;
-    auto* pd = reinterpret_cast<uint16_t*>(m.router_proj_fused.bytes.data());
-    for (int64_t e = 0; e < E; ++e)
-      for (int64_t j = 0; j < H; ++j)
-        pd[e * H + j] = vt::F32ToBF16(vt::BF16ToF32(ps[e * H + j]) *
-                                      vt::BF16ToF32(sc[j]) * rsqrt_h);
-  }
   m.pre_feedforward_layernorm_2 =
       LoadBf16Direct(get, base + "pre_feedforward_layernorm_2.weight");
   m.post_feedforward_layernorm_1 =
       LoadBf16Direct(get, base + "post_feedforward_layernorm_1.weight");
   m.post_feedforward_layernorm_2 =
       LoadBf16Direct(get, base + "post_feedforward_layernorm_2.weight");
+  return m;
+}
 
-  // Fused: gate_up [E, 2I, H], down [E, H, I] — rank 3 exceeds kMaxRank=4 ok (3<=4)
+Gemma4MoeLayerWeights LoadMoeBf16(
+    const TensorResolver& get, const std::string& base, int64_t E, int64_t top_k,
+    int64_t moe_I, int64_t H, std::shared_ptr<const void> owner) {
+  Gemma4MoeLayerWeights m = LoadMoeCommonRouter(get, base, E, top_k, moe_I);
+  FuseRouter(m, E, H);
   const StTensor& gu = get(base + "experts.gate_up_proj");
   const StTensor& dn = get(base + "experts.down_proj");
   VT_CHECK(gu.shape.size() == 3 && gu.shape[0] == E && gu.shape[1] == 2 * moe_I &&
@@ -148,9 +190,45 @@ Gemma4MoeLayerWeights LoadMoeBf16(
            "gemma4 moe: down expected [E,H,I]");
   m.experts.gate_up = BorrowBf16(gu, owner);
   m.experts.down = BorrowBf16(dn, owner);
+  m.experts.is_fp8 = false;
   m.experts.num_experts = E;
   m.experts.intermediate = moe_I;
   m.experts.hidden = H;
+  return m;
+}
+
+// Firworks / per-expert FP8 MoELinear export.
+Gemma4MoeLayerWeights LoadMoeFp8PerExpert(
+    const TensorResolver& get, const std::string& base, int64_t E, int64_t top_k,
+    int64_t moe_I, int64_t H, std::shared_ptr<const void> owner) {
+  Gemma4MoeLayerWeights m = LoadMoeCommonRouter(get, base, E, top_k, moe_I);
+  FuseRouter(m, E, H);
+  m.experts.is_fp8 = true;
+  m.experts.num_experts = E;
+  m.experts.intermediate = moe_I;
+  m.experts.hidden = H;
+  m.experts.fp8.resize(static_cast<size_t>(E));
+  for (int64_t e = 0; e < E; ++e) {
+    const std::string eb = base + "experts." + std::to_string(e) + ".";
+    auto& ex = m.experts.fp8[static_cast<size_t>(e)];
+    const StTensor& gw = get(eb + "gate_proj.weight");
+    const StTensor& gs = get(eb + "gate_proj.weight_scale");
+    const StTensor& uw = get(eb + "up_proj.weight");
+    const StTensor& us = get(eb + "up_proj.weight_scale");
+    const StTensor& dw = get(eb + "down_proj.weight");
+    const StTensor& ds = get(eb + "down_proj.weight_scale");
+    VT_CHECK(gw.dtype == "F8_E4M3" && gw.shape.size() == 2 && gw.shape[0] == moe_I &&
+                 gw.shape[1] == H,
+             "gemma4 fp8 expert gate shape");
+    VT_CHECK(dw.dtype == "F8_E4M3" && dw.shape[0] == H && dw.shape[1] == moe_I,
+             "gemma4 fp8 expert down shape");
+    ex.gate_w = BorrowBytes(gw, vt::DType::kI8, 1, owner);
+    ex.gate_s = BorrowBytes(gs, vt::DType::kBF16, 2, owner);
+    ex.up_w = BorrowBytes(uw, vt::DType::kI8, 1, owner);
+    ex.up_s = BorrowBytes(us, vt::DType::kBF16, 2, owner);
+    ex.down_w = BorrowBytes(dw, vt::DType::kI8, 1, owner);
+    ex.down_s = BorrowBytes(ds, vt::DType::kBF16, 2, owner);
+  }
   return m;
 }
 
@@ -192,16 +270,30 @@ Gemma4LayerWeights LoadGemma4Layer(
   if (names.count(base + "layer_scalar"))
     w.layer_scalar = LoadBf16Direct(get, base + "layer_scalar");
 
+  const bool fp8_attn = names.count(sa + "q_proj.weight_scale") > 0;
   const std::string v_name = sa + "v_proj.weight";
   w.k_eq_v = names.count(v_name) == 0;
-  if (w.k_eq_v) {
+  if (fp8_attn) {
+    OwnedTensor q = LoadFp8ChannelToBf16RawNk(get, sa + "q_proj");
+    OwnedTensor k = LoadFp8ChannelToBf16RawNk(get, sa + "k_proj");
+    OwnedTensor v = w.k_eq_v ? k : LoadFp8ChannelToBf16RawNk(get, sa + "v_proj");
+    const int64_t nq = q.shape[0], nk = k.shape[0], nv = v.shape[0];
+    w.attn.qkv_proj = MakeOwned(vt::DType::kBF16, {nq + nk + nv, H});
+    w.attn.qkv_proj.nk = true;
+    auto* dst = reinterpret_cast<uint16_t*>(w.attn.qkv_proj.bytes.data());
+    std::memcpy(dst, q.bytes.data(), q.bytes.size());
+    std::memcpy(dst + nq * H, k.bytes.data(), k.bytes.size());
+    std::memcpy(dst + (nq + nk) * H, v.bytes.data(), v.bytes.size());
+    w.attn.o_proj = LoadFp8ChannelToBf16RawNk(get, sa + "o_proj");
+  } else if (w.k_eq_v) {
     w.attn.qkv_proj = LoadMergedBf16RawNK(
         get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "k_proj.weight"});
+    w.attn.o_proj = LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
   } else {
     w.attn.qkv_proj = LoadMergedBf16RawNK(
         get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+    w.attn.o_proj = LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
   }
-  w.attn.o_proj = LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
   w.attn.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   w.attn.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
 
@@ -214,12 +306,28 @@ Gemma4LayerWeights LoadGemma4Layer(
     }
   }
 
-  w.mlp.gate_up_proj =
-      LoadMergedBf16RawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
-  w.mlp.down_proj = LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+  if (names.count(mlp + "gate_proj.weight_scale")) {
+    OwnedTensor g = LoadFp8ChannelToBf16RawNk(get, mlp + "gate_proj");
+    OwnedTensor u = LoadFp8ChannelToBf16RawNk(get, mlp + "up_proj");
+    const int64_t Ig = g.shape[0];
+    w.mlp.gate_up_proj = MakeOwned(vt::DType::kBF16, {Ig + u.shape[0], H});
+    w.mlp.gate_up_proj.nk = true;
+    auto* dst = reinterpret_cast<uint16_t*>(w.mlp.gate_up_proj.bytes.data());
+    std::memcpy(dst, g.bytes.data(), g.bytes.size());
+    std::memcpy(dst + Ig * H, u.bytes.data(), u.bytes.size());
+    w.mlp.down_proj = LoadFp8ChannelToBf16RawNk(get, mlp + "down_proj");
+  } else {
+    w.mlp.gate_up_proj =
+        LoadMergedBf16RawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
+    w.mlp.down_proj = LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+  }
 
-  if (enable_moe && names.count(base + "experts.gate_up_proj")) {
-    w.moe = LoadMoeBf16(get, base, num_experts, top_k, moe_I, H, owner);
+  if (enable_moe) {
+    if (names.count(base + "experts.gate_up_proj")) {
+      w.moe = LoadMoeBf16(get, base, num_experts, top_k, moe_I, H, owner);
+    } else if (names.count(base + "experts.0.gate_proj.weight")) {
+      w.moe = LoadMoeFp8PerExpert(get, base, num_experts, top_k, moe_I, H, owner);
+    }
   }
   return w;
 }
@@ -251,6 +359,7 @@ Gemma4Weights LoadImpl(const std::vector<SafetensorsFile>& shards,
   const bool enable_moe =
       RawBool(text, "enable_moe_block", false) ||
       names.count("model.language_model.layers.0.experts.gate_up_proj") > 0 ||
+      names.count("model.language_model.layers.0.experts.0.gate_proj.weight") > 0 ||
       names.count("model.language_model.layers.0.router.proj.weight") > 0;
   const int64_t num_experts = RawInt(text, "num_experts", 0);
   const int64_t top_k = RawInt(text, "top_k_experts", 8);

@@ -85,4 +85,18 @@ void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
   }
 }
 
+void DequantFp8ChannelToBf16(const uint8_t* weight_f8, const uint16_t* scale_bf16,
+                             int64_t N, int64_t K, uint16_t* out_bf16) {
+  VT_CHECK(weight_f8 != nullptr && scale_bf16 != nullptr && out_bf16 != nullptr,
+           "fp8 channel dequant: null");
+  VT_CHECK(N > 0 && K > 0, "fp8 channel dequant: dims");
+  for (int64_t n = 0; n < N; ++n) {
+    const float s = vt::BF16ToF32(scale_bf16[n]);
+    const uint8_t* wr = weight_f8 + n * K;
+    uint16_t* orow = out_bf16 + n * K;
+    for (int64_t k = 0; k < K; ++k)
+      orow[k] = vt::F32ToBF16(F8E4M3ToF32(wr[k]) * s);
+  }
+}
+
 }  // namespace vllm
