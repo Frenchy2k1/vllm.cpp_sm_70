@@ -1019,26 +1019,15 @@ void LaunchConvFwdRegK4(cudaStream_t s, Tensor& out, const Tensor& x,
 // chunks): it chunks grid.z only for <=4 sequences, and serially streams each
 // whole sequence for larger batches.
 template <typename Tin, typename Tout>
-void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                      const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
-                      const Tensor& his, const CausalConv1dArgs& args) {
+void LaunchConvFwdRegRuntime(cudaStream_t s, Tensor& out, const Tensor& x,
+                             const Tensor& w, const Tensor* bias,
+                             Tensor& conv_state, const Tensor& qsl,
+                             const Tensor& his, const CausalConv1dArgs& args,
+                             int64_t chan_tiles) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
-  const ConvChannelTileLaunchContract channel_contract =
-      ConvChannelTileLaunchContractFor(std::getenv("VT_CONV_CHANNEL_TILE"), c, k);
-  if (channel_contract.arm == ConvChannelTileArm::kWidthFour) {
-    LaunchConvFwdRegK4<1, Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args,
-                                    channel_contract.feature_blocks);
-    return;
-  }
-  if (channel_contract.arm == ConvChannelTileArm::kWidthFourTwoChannels) {
-    LaunchConvFwdRegK4<2, Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args,
-                                    channel_contract.feature_blocks);
-    return;
-  }
   const int64_t total_tokens = x.shape[0];
   const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   VT_CHECK(k - 1 <= kConvRegMaxW, "cuda causal_conv1d_fwd(reg): conv width exceeds kConvRegMaxW");
-  const int64_t chan_tiles = (c + kConvRegN - 1) / kConvRegN;
   int64_t gridZ = 1;
   int chunked = 0;
   const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
@@ -1074,6 +1063,28 @@ void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
         batch_ptr, token_chunk_offset_ptr, exact ? 1 : 0);
   }
   Check(cudaGetLastError(), "causal_conv1d_fwd(reg) launch");
+}
+
+template <typename Tin, typename Tout>
+void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x,
+                      const Tensor& w, const Tensor* bias, Tensor& conv_state,
+                      const Tensor& qsl, const Tensor& his,
+                      const CausalConv1dArgs& args) {
+  const int64_t c = x.shape[1], k = w.shape[1];
+  DispatchConvChannelTileLaunch(
+      std::getenv("VT_CONV_CHANNEL_TILE"), c, k,
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegRuntime<Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                           his, args, contract.feature_blocks);
+      },
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegK4<1, Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                        his, args, contract.feature_blocks);
+      },
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegK4<2, Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                        his, args, contract.feature_blocks);
+      });
 }
 
 // Dispatch on the toggles. reg (VT_CONV_REG, default ON) wins; else tiled

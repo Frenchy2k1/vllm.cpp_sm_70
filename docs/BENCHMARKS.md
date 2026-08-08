@@ -47,7 +47,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 
 | GPU | Workload and basis | vllm.cpp | vLLM | Ratio | Status |
 |---|---|---:|---:|---:|---|
-| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 233.955 ms | 145.421 ms | **1.609x slower** | Exact chunks: 3.072x faster. K=4 one-/two-channel arms are byte-exact; production A/B `PENDING`, no speed claim ([spike](../.agents/specs/sm120-qwen35-conv-channel-tile-2026-08-08.md)) |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 233.955 ms | 145.421 ms | **1.609x slower** | Exact chunks: 3.072x faster. K=4 arms are byte-exact; shared selector is mutation-gated. A/B `PENDING`; no speed claim ([spike](../.agents/specs/sm120-qwen35-conv-channel-tile-2026-08-08.md)) |
 | RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, fused post-conv total | 122.587 ms | 108.035 ms | **1.135x slower** | Opt-in tile is exact and **1.859x faster** than 227.887 ms fast megablock; all axes improved; default/release gates open ([spec](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-27B NVFP4, historical normalized prefill | 0.43 us/token/layer | 0.18 us/token/layer | **2.39x slower** | Directional only: unequal token clusters, older pin ([ledger](../.agents/parity-ledger.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-35B NVFP4, later local kernel A/B | 321.148 us c1; 960.313 us c6 | - | `PENDING` | Register vs tiled improved 4.7%/7.3%; no paired vLLM denominator ([record](../.agents/specs/gdn-prefill-conv-reg-2026-07-18.md)) |

@@ -132,6 +132,29 @@ inline constexpr ConvChannelTileLaunchContract ConvChannelTileLaunchContractFor(
   };
 }
 
+// One shared dispatch seam for both the CUDA launcher and portable tests. Keeping
+// the arm selection here means the tests exercise the exact branch logic used in
+// production without adding a launch counter or other debug state to the hot path.
+// The callbacks inline away at each call site and receive the already-resolved
+// geometry, including runtime-width fallback for unsupported shapes.
+template <typename RuntimeWidthLaunch, typename WidthFourLaunch,
+          typename WidthFourTwoChannelsLaunch>
+inline decltype(auto) DispatchConvChannelTileLaunch(
+    const char* env_value, int64_t channels, int64_t kernel_width,
+    RuntimeWidthLaunch&& runtime_width_launch,
+    WidthFourLaunch&& width_four_launch,
+    WidthFourTwoChannelsLaunch&& width_four_two_channels_launch) {
+  const ConvChannelTileLaunchContract contract =
+      ConvChannelTileLaunchContractFor(env_value, channels, kernel_width);
+  if (contract.arm == ConvChannelTileArm::kWidthFour) {
+    return width_four_launch(contract);
+  }
+  if (contract.arm == ConvChannelTileArm::kWidthFourTwoChannels) {
+    return width_four_two_channels_launch(contract);
+  }
+  return runtime_width_launch(contract);
+}
+
 // Pure predicate for the VT_GDN_POSTCONV_SPLIT contract: DEFAULT OFF (OPT-IN). The
 // split post-conv kernel (GdnPostConvSplitKernel) is BIT-IDENTICAL (0-ulp) to the
 // shipped GdnPostConvKernel by construction, but the DGX nsys A/B measured it
