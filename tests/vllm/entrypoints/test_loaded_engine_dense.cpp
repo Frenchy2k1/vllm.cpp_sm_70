@@ -457,33 +457,39 @@ TEST_CASE("loaded_engine: prefix caching mirrors model-capability defaults") {
 // registered accelerator") that a CPU-only process could otherwise never
 // exercise. SelectQueue routes its explicit arms through THIS function
 // (model_loader.cpp), so these pins bind the production policy, not a copy.
-TEST_CASE("loaded_engine: ResolveExplicitDeviceType — cpu never probes, cuda never falls back") {
+TEST_CASE("loaded_engine: ResolveExplicitDeviceType uses the named platform without fallback") {
   using vllm::Device;
 
-  // Explicit CPU resolves CPU regardless of what is registered. The `true` arm
-  // is the CUDA-build pin: a registered accelerator must NOT win over an
+  // Explicit CPU resolves CPU regardless of what the name lookup found. The
+  // non-CPU value is the accelerator-build pin: a registered accelerator must
+  // NOT win over an
   // explicit cpu ask (the fold-ROW-8 defect was that an embedder could not ASK
   // for CPU at all).
-  CHECK(LoadedEngine::ResolveExplicitDeviceType(Device::kCPU, true) ==
+  CHECK(LoadedEngine::ResolveExplicitDeviceType(
+            Device::kCPU, std::optional{vt::DeviceType::kXPU}) ==
         vt::DeviceType::kCPU);
-  CHECK(LoadedEngine::ResolveExplicitDeviceType(Device::kCPU, false) ==
+  CHECK(LoadedEngine::ResolveExplicitDeviceType(Device::kCPU, std::nullopt) ==
         vt::DeviceType::kCPU);
 
-  // Explicit CUDA with the platform registered resolves CUDA.
-  CHECK(LoadedEngine::ResolveExplicitDeviceType(Device::kCUDA, true) ==
-        vt::DeviceType::kCUDA);
+  // The explicit named-platform arm returns what the registry found. kXPU is
+  // deliberate mutation sensitivity: a hidden CUDA constant cannot satisfy it.
+  CHECK(LoadedEngine::ResolveExplicitDeviceType(
+            Device::kNamedPlatform, std::optional{vt::DeviceType::kXPU}) ==
+        vt::DeviceType::kXPU);
 
   // Explicit CUDA WITHOUT the platform throws the pinned message — never a
   // silent CPU fallback (mirror of vLLM assigning an explicit device verbatim,
   // vllm/config/device.py:61-66).
   CHECK_THROWS_WITH_AS(
-      LoadedEngine::ResolveExplicitDeviceType(Device::kCUDA, false),
+      LoadedEngine::ResolveExplicitDeviceType(Device::kNamedPlatform,
+                                              std::nullopt),
       doctest::Contains("device 'cuda' was requested but no CUDA platform"),
       std::runtime_error);
 
   // kAuto is not an explicit selection: it resolves through the probe inside
   // SelectQueue, and this seam refuses it rather than guessing.
-  CHECK_THROWS_AS(LoadedEngine::ResolveExplicitDeviceType(Device::kAuto, true),
+  CHECK_THROWS_AS(
+      LoadedEngine::ResolveExplicitDeviceType(Device::kAuto, std::nullopt),
                   std::invalid_argument);
 }
 
@@ -493,7 +499,7 @@ TEST_CASE("loaded_engine: DeviceFromString mirrors the vLLM Device names") {
   // — the strings the server's --device flag consumes.
   CHECK(vllm::DeviceFromString("auto") == Device::kAuto);
   CHECK(vllm::DeviceFromString("cpu") == Device::kCPU);
-  CHECK(vllm::DeviceFromString("cuda") == Device::kCUDA);
+  CHECK(vllm::DeviceFromString("cuda") == Device::kNamedPlatform);
   CHECK_THROWS_WITH_AS(vllm::DeviceFromString("tpu"),
                        doctest::Contains("Unknown device: tpu"),
                        std::invalid_argument);
@@ -505,10 +511,10 @@ TEST_CASE("loaded_engine: DeviceFromString mirrors the vLLM Device names") {
   // the auto slot.
   CHECK(static_cast<int32_t>(Device::kAuto) == 0);
   CHECK(static_cast<int32_t>(Device::kCPU) == 1);
-  CHECK(static_cast<int32_t>(Device::kCUDA) == 2);
+  CHECK(static_cast<int32_t>(Device::kNamedPlatform) == 2);
   CHECK(std::string(vllm::DeviceName(Device::kAuto)) == "auto");
   CHECK(std::string(vllm::DeviceName(Device::kCPU)) == "cpu");
-  CHECK(std::string(vllm::DeviceName(Device::kCUDA)) == "cuda");
+  CHECK(std::string(vllm::DeviceName(Device::kNamedPlatform)) == "cuda");
 }
 
 TEST_CASE("loaded_engine: FromModelDir resolves an explicit absent device BEFORE any path I/O") {
@@ -517,11 +523,11 @@ TEST_CASE("loaded_engine: FromModelDir resolves an explicit absent device BEFORE
   // arg_utils.py:1878, device.py __post_init__). This is also what makes the
   // EngineParams->FromModelDir plumb pinnable on the CPU tier with no loadable
   // checkpoint: a bogus path + device=cuda must report the DEVICE, not the path.
-  if (vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
+  if (vllm::platforms::FindPlatformByName("cuda") != nullptr) {
     return;  // CUDA build/box: the explicit-cuda arm resolves; nothing to pin.
   }
   EngineParams params;
-  params.device = vllm::Device::kCUDA;
+  params.device = vllm::Device::kNamedPlatform;
   CHECK_THROWS_WITH_AS(
       LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/model/dir", params),
       doctest::Contains("device 'cuda' was requested but no CUDA platform"),

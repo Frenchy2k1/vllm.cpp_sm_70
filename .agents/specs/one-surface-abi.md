@@ -1,6 +1,6 @@
 # ONE SURFACE — every capability ships through the C ABI
 
-Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE; remediation IN PROGRESS — ROW 1 (Parakeet ASR / audio transcription) LANDED 2026-08-07: ABI v11 `vllm_transcribe`, live `/v1/audio/transcriptions`, registry refuse-by-task, example folded, ratchet 12 -> 11. ROW 2 (MiniMax-H3 video+audio generation) LANDED 2026-08-08 (`row/H3-VIDEO-ABI`, task #283): ABI v12 `vllm_video_engine_load`/`vllm_video_generate`/`vllm_video_result_free` + `vllm_video_mux_argv` over the `MiniMaxH3VideoEngine` library seam, `/v1/videos` routed through the SAME seam, both H3 examples rewritten as `vllm.h` clients byte-identical to the pre-fold binary, ratchet 11 -> 9. GB10 real-video re-verification is a NAMED RESIDUAL (box on the Kimi campaign). ROW 8 (explicit device selection) LANDED 2026-08-08 (`row/DEVICE-KNOB`, task #284): ABI v14 `vllm_model_params.device` (0=auto/1=cpu/2=cuda, the vLLM `DeviceConfig.device` names) -> `EngineParams::device` -> `SelectQueue`; explicit cpu forces the CPU queue without probing, an explicitly named ABSENT device fails LOUD before any model I/O (the vllm/config/device.py:61-66 never-substitute mirror), `--device` on server + cli as pure field consumers; the #123 review's three MINOR findings closed in the same change (c_header_compile.c now references the v11+v12 surface + the v14 field; the v12 changelog block moved to chronological position; the fold fixture's flag list gained `--keep-quant`). CUDA-build A/B (auto->CUDA vs explicit-cpu->CPU on a GPU box) is a NAMED RESIDUAL — the CPU tier pins that half through the pure `ResolveExplicitDeviceType` matrix instead.**
+Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE; remediation IN PROGRESS — ROW 1 (Parakeet ASR / audio transcription) LANDED 2026-08-07: ABI v11 `vllm_transcribe`, live `/v1/audio/transcriptions`, registry refuse-by-task, example folded, ratchet 12 -> 11. ROW 2 (MiniMax-H3 video+audio generation) LANDED 2026-08-08 (`row/H3-VIDEO-ABI`, task #283): ABI v12 `vllm_video_engine_load`/`vllm_video_generate`/`vllm_video_result_free` + `vllm_video_mux_argv` over the `MiniMaxH3VideoEngine` library seam, `/v1/videos` routed through the SAME seam, both H3 examples rewritten as `vllm.h` clients byte-identical to the pre-fold binary, ratchet 11 -> 9. GB10 real-video re-verification is a NAMED RESIDUAL (box on the Kimi campaign). ROW 8 (explicit device selection) LANDED 2026-08-08 (`row/DEVICE-KNOB`, task #284): ABI v14 `vllm_model_params.device` (0=auto/1=cpu/2=cuda, the vLLM `DeviceConfig.device` names) -> `EngineParams::device` -> `SelectQueue`; explicit cpu forces the CPU queue without probing, an explicitly named ABSENT device fails LOUD before any model I/O (the vllm/config/device.py:61-66 never-substitute mirror), `--device` on server + cli as pure field consumers; PR #139 follow-up removes PR #136's seven shared CUDA literals by resolving the stable public name through the platform registry and propagating its `DeviceType` (DSR 39 -> 32, `kcuda=0`, baseline/allowlist unchanged). CUDA-build A/B (auto->CUDA vs explicit-cpu->CPU on a GPU box) is a NAMED RESIDUAL — the CPU tier pins that half through the pure `ResolveExplicitDeviceType` matrix instead.**
 
 ## The defect
 
@@ -202,3 +202,24 @@ must report that exact device after exactly one `CreateQueue` call. The original
 second-queue mutation was false-GREEN at 5/135, then RED at `2 == 1`; deleting
 the queue-device reuse is independently RED. The final CPU fold target is GREEN
 at 6 cases / 137 assertions in the isolated `/dev/shm` build.
+
+### ROW 8 shared-device follow-up (`row/ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2`, PR #139)
+
+PR #136 implemented ABI-v14 explicit selection correctly but encoded its CUDA
+identity seven times in shared configuration/loading code, regressing DSR from
+32 to 39. The repair preserves the wire values and public names exactly:
+`Device::kNamedPlatform` remains integer 2 and `DeviceName()` remains `"cuda"`.
+Shared loading now passes that canonical name to `FindPlatformByName`, then
+propagates the registered platform's `DeviceType`; no CUDA `DeviceType` literal
+remains in the shared selector. This is a real abstraction rather than textual
+evasion: the pure resolver test supplies `kXPU` and requires `kXPU` back, while
+the registry test walks every registered canonical device name. Explicit CPU
+still ignores the accelerator lookup, absent CUDA still throws before model
+path I/O, the C ABI still maps slot 2, and H3 dispatch is untouched.
+
+RED was the focused compiler failure for the missing enum/API/signature plus
+the inherited checker result (`kcuda=7`, DSR 39). GREEN is DSR 32 with
+`kcuda=0`, unchanged baseline/allowlist, all 25 checker mutations, and a CPU
+Release `-Werror` build: `test_platform` 11/11·85,
+`test_loaded_engine_dense` 9/9·65 and `test_capi` 45/45·428. No CUDA runtime was
+used; the existing GPU A/B residual remains.
