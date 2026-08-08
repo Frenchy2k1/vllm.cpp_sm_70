@@ -389,7 +389,19 @@ STATUS_RATCHET = {
     # community-green, approach-(b) F6 fix in blind-unverified, M2 on
     # verification — paid for inside the same parenthetical; the board/arch
     # detail lives in docs/ROCM.md and .agents/backend-matrix.md. Net -12.
-    "chars": 279130,
+    #
+    # 276960 since 2026-08-08 (measured 276945): the container-image lane
+    # (`ENG-RELEASE-CONTAINERS`, issue #170) owes this page a status line, paid
+    # for OUT of the page. The Tier-A1 fold paragraph was a run-by-run log of a
+    # 2026-07-30 branch - down to a literal `commit <this>, NOT pushed` - on a
+    # page whose contract is ONE binding current-state line per capability. It
+    # collapsed to its binding result plus pointers, with the run detail already
+    # present in .agents/benchmark-record.md, .agents/state.md and
+    # specs/arch-fusion-fold-plan-2026-07-30.md. The unflattering parts were kept
+    # ON the page deliberately: only OLMo-2 has a committed golden, Granite and
+    # StableLM skip rather than gate, dflash and deepseek_v2 are build-verified
+    # only. Nothing was lost, only de-duplicated. Net -2185.
+    "chars": 276960,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,
