@@ -81,6 +81,57 @@ inline bool ConvExactChunksFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
 }
 
+// Three-arm same-binary experiment for the remaining prefill causal-conv gap.
+// Arm 0 is the sealed runtime-width kernel. Arms 1 and 2 are valid only for the
+// production width K=4: respectively one and two channels per 128-thread lane.
+// Unset and every spelling except the exact strings "1" and "2" preserve arm 0.
+enum class ConvChannelTileArm : uint8_t {
+  kRuntimeWidth = 0,
+  kWidthFour = 1,
+  kWidthFourTwoChannels = 2,
+};
+
+inline constexpr ConvChannelTileArm ConvChannelTileArmFromEnv(const char* env_value) {
+  if (env_value != nullptr && env_value[0] == '1' && env_value[1] == '\0') {
+    return ConvChannelTileArm::kWidthFour;
+  }
+  if (env_value != nullptr && env_value[0] == '2' && env_value[1] == '\0') {
+    return ConvChannelTileArm::kWidthFourTwoChannels;
+  }
+  return ConvChannelTileArm::kRuntimeWidth;
+}
+
+inline constexpr ConvChannelTileArm ResolveConvChannelTileArm(ConvChannelTileArm requested,
+                                                              int64_t channels,
+                                                              int64_t kernel_width) {
+  if (requested != ConvChannelTileArm::kRuntimeWidth &&
+      (channels <= 0 || kernel_width != 4)) {
+    return ConvChannelTileArm::kRuntimeWidth;
+  }
+  return requested;
+}
+
+struct ConvChannelTileLaunchContract {
+  ConvChannelTileArm arm;
+  int64_t feature_blocks;
+  int64_t threads_per_block;
+};
+
+inline constexpr int64_t kConvChannelTileThreads = 128;
+
+inline constexpr ConvChannelTileLaunchContract ConvChannelTileLaunchContractFor(
+    const char* env_value, int64_t channels, int64_t kernel_width) {
+  const ConvChannelTileArm arm = ResolveConvChannelTileArm(
+      ConvChannelTileArmFromEnv(env_value), channels, kernel_width);
+  const int64_t channels_per_block =
+      arm == ConvChannelTileArm::kWidthFourTwoChannels ? 256 : 128;
+  return ConvChannelTileLaunchContract{
+      arm,
+      channels > 0 ? (channels + channels_per_block - 1) / channels_per_block : 0,
+      kConvChannelTileThreads,
+  };
+}
+
 // Pure predicate for the VT_GDN_POSTCONV_SPLIT contract: DEFAULT OFF (OPT-IN). The
 // split post-conv kernel (GdnPostConvSplitKernel) is BIT-IDENTICAL (0-ulp) to the
 // shipped GdnPostConvKernel by construction, but the DGX nsys A/B measured it
