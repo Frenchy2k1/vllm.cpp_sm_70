@@ -204,6 +204,13 @@ float RunVecDot(vt::DType wtype, const uint8_t* wq, const uint8_t* aq,
   return s;
 }
 
+float RunVecDotFn(vt::cpu::VecDotFn fn, const uint8_t* wq,
+                  const uint8_t* aq, int64_t k) {
+  float s = 0.0F;
+  fn(static_cast<int>(k), &s, 0, wq, 0, aq, 0, 1);
+  return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -583,6 +590,133 @@ TEST_CASE("G3 dot_product_error within upstream bound (test-quantize-fns:86)") {
   CHECK(err < kMaxDotProductError);
 }
 
+TEST_CASE("KERNEL-CPU-A76-Q8-DOT explicit SDOT and assembly match portable") {
+  const vt::cpu::VecDotFn sdot = vt::cpu::QuantQ8SdotVecDot();
+  const vt::cpu::VecDotFn assembly = vt::cpu::QuantQ8A76AsmVecDot();
+  CHECK((sdot == nullptr) == (assembly == nullptr));
+  if (sdot == nullptr) {
+    CHECK_FALSE(vt::cpu::QuantQ8SdotActive());
+    CHECK_FALSE(vt::cpu::QuantQ8A76AsmActive());
+    return;
+  }
+  CHECK(vt::cpu::QuantQ8SdotActive());
+
+  // The TRUE portable reference. QuantTraits(kQ8_0).vec_dot is the SELECTED
+  // kernel — on a real A76 that is the assembly tier, and referencing it here
+  // made every byte-equality CHECK below a self-comparison.
+  const vt::cpu::VecDotFn portable = vt::cpu::QuantQ8PortableVecDot();
+  for (int blocks : {1, 2, 3, 5, 64}) {
+    CAPTURE(blocks);
+    const int64_t k = 32 * blocks;
+    std::vector<uint8_t> wq =
+        RandomBlocks(kWeightCases[1], blocks, 0xA760U + blocks);
+    std::vector<float> act(static_cast<size_t>(k));
+    GenerateData(0.75F, act.size(), act.data());
+    std::vector<uint8_t> aq =
+        QuantizeActivation(vt::DType::kQ8_0, act.data(), k);
+
+    // Offset both buffers by one byte: Q8 blocks are 34 bytes and therefore
+    // alternate natural alignment in real rows. All three tiers must accept
+    // an unaligned block base without reading beyond the final block.
+    std::vector<uint8_t> wu(wq.size() + 2, 0xA5);
+    std::vector<uint8_t> au(aq.size() + 2, 0x5A);
+    std::memcpy(wu.data() + 1, wq.data(), wq.size());
+    std::memcpy(au.data() + 1, aq.data(), aq.size());
+    const float ref = RunVecDotFn(portable, wu.data() + 1, au.data() + 1, k);
+    CHECK(RunVecDotFn(sdot, wu.data() + 1, au.data() + 1, k) == ref);
+    CHECK(RunVecDotFn(assembly, wu.data() + 1, au.data() + 1, k) == ref);
+  }
+
+  auto check_edge_blocks = [&](uint16_t wd, uint16_t ad, bool zero_payload) {
+    constexpr int blocks = 2;
+    constexpr int block_bytes = 34;
+    std::vector<uint8_t> wq(blocks * block_bytes);
+    std::vector<uint8_t> aq(blocks * block_bytes);
+    for (int ib = 0; ib < blocks; ++ib) {
+      uint8_t* wb = wq.data() + ib * block_bytes;
+      uint8_t* ab = aq.data() + ib * block_bytes;
+      std::memcpy(wb, &wd, sizeof(wd));
+      std::memcpy(ab, &ad, sizeof(ad));
+      for (int j = 0; j < 32; ++j) {
+        wb[2 + j] = zero_payload
+                        ? 0
+                        : static_cast<uint8_t>((j & 1) != 0 ? 127 : -128);
+        ab[2 + j] = zero_payload
+                        ? 0
+                        : static_cast<uint8_t>((j & 2) != 0 ? -128 : 127);
+      }
+    }
+    const float ref = RunVecDotFn(portable, wq.data(), aq.data(), 64);
+    CHECK(RunVecDotFn(sdot, wq.data(), aq.data(), 64) == ref);
+    CHECK(RunVecDotFn(assembly, wq.data(), aq.data(), 64) == ref);
+  };
+  check_edge_blocks(vt::F32ToF16(1.0F), vt::F32ToF16(1.0F), true);
+  check_edge_blocks(/*maximum finite f16=*/0x7BFFU,
+                    /*minimum normal negative f16=*/0x8400U, false);
+
+  std::vector<uint8_t> one(34, 0);
+  float out = 0.0F;
+  CHECK_THROWS(sdot(33, &out, 0, one.data(), 0, one.data(), 0, 1));
+  CHECK_THROWS(assembly(32, &out, 0, one.data(), 0, one.data(), 0, 2));
+}
+
+TEST_CASE(
+    "KERNEL-CPU-A76-Q8-DOT portable seam pins the quants.c:400 order on every "
+    "platform") {
+  // The A76 case above can only execute its byte-equality CHECKs on a DotProd
+  // core (the sdot/assembly getters are null elsewhere). This case pins the
+  // reference arm ITSELF everywhere: QuantQ8PortableVecDot must be the exact
+  // per-block accumulation order of the portable kernel — an independent
+  // scalar transcription here, compared byte-equal — so a perturbation of the
+  // portable order (or a seam regression back to the SELECTED kernel wired to
+  // a different tier) is RED on x86 too, not only on a physical A76.
+  const vt::cpu::VecDotFn portable = vt::cpu::QuantQ8PortableVecDot();
+  REQUIRE(portable != nullptr);
+  for (int blocks : {1, 3, 64}) {
+    CAPTURE(blocks);
+    const int64_t k = 32 * blocks;
+    const std::vector<uint8_t> wq =
+        RandomBlocks(kWeightCases[1], blocks, 0x9700U + blocks);
+    std::vector<float> act(static_cast<size_t>(k));
+    GenerateData(0.25F, act.size(), act.data());
+    const std::vector<uint8_t> aq =
+        QuantizeActivation(vt::DType::kQ8_0, act.data(), k);
+
+    // Two references sharing the SAME per-block order, differing only in
+    // whether the final multiply-add is fused: the portable TU may legally
+    // compile `sumf += sumi * dx * dy` either way (-ffp-contract), and pinning
+    // one form would break on the other compiler regime. An accumulation-ORDER
+    // mutation moves BOTH candidates, so the pin holds in both regimes.
+    constexpr int kBlockBytes = 34;  // f16 scale + 32 int8 payload
+    float ref_mul = 0.0F;
+    float ref_fma = 0.0F;
+    for (int ib = 0; ib < blocks; ++ib) {
+      const uint8_t* xb = wq.data() + static_cast<size_t>(ib) * kBlockBytes;
+      const uint8_t* yb = aq.data() + static_cast<size_t>(ib) * kBlockBytes;
+      uint16_t xd = 0;
+      uint16_t yd = 0;
+      std::memcpy(&xd, xb, sizeof(xd));
+      std::memcpy(&yd, yb, sizeof(yd));
+      int sumi = 0;
+      for (int j = 0; j < 32; ++j) {
+        sumi += static_cast<int>(static_cast<int8_t>(xb[2 + j])) *
+                static_cast<int>(static_cast<int8_t>(yb[2 + j]));
+      }
+      // quants.c:400 order: the two f16 scales multiply FIRST, then sumi.
+      const float d = vt::F16ToF32(xd) * vt::F16ToF32(yd);
+      // volatile pins the separately-rounded product so THIS TU cannot itself
+      // be contracted into the fma form.
+      volatile float prod = static_cast<float>(sumi) * d;
+      ref_mul += prod;
+      ref_fma = std::fmaf(static_cast<float>(sumi), d, ref_fma);
+    }
+    const float got = RunVecDotFn(portable, wq.data(), aq.data(), k);
+    CAPTURE(got);
+    CAPTURE(ref_mul);
+    CAPTURE(ref_fma);
+    CHECK((got == ref_mul || got == ref_fma));
+  }
+}
 // ---------------------------------------------------------------------------
 // G3 — the GEMM wiring (kMatmulBTQuant), ported MUL_MAT cases
 // ---------------------------------------------------------------------------

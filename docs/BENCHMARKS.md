@@ -12,7 +12,7 @@
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
-| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: **PENDING** | byte-identical on binding arm; Pi pending |
+| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
@@ -160,15 +160,14 @@ host mirror is freed once the device Marlin resident is built.
 
 ## llama.cpp, CPU
 
-| RPi5/A76 portable baseline (R2-R3, `GATING` arm) | Result |
+| RPi5/A76 arm (R4-R6, `GATING`) | Result |
 |---|---|
-| Scope | 4-core A76, DotProd, no i8mm; the 20-core binding arm does NOT transfer. QEMU-built, Pi-executed unthrottled 2.4 GHz; Q8_K_XL SHA pinned in the [RPi5 spike](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) |
-| Correctness | 16/16 tokens exact vs the x86 golden; fixture checksums exact in every arm |
-| Q8_0 M=1/N=3072/K=2048 | 1,554,115 ns @1 thread; 742,585 ns @4 threads |
-| Q8_0 M=128 | 197,061,735 ns @1 thread; 49,890,756 ns @4 threads |
-| 16-token model arm | TTFT 1,961.99 ms; TPOT/ITL 366.91 ms; 2.14 tok/s output (portable denominator only) |
-| `cycles:u` 64-token trace (zero loss) | BF16 GEMM 57.76%; portable Q8 dot 20.10% |
-| `PENDING` | SDOT/assembly A/B; 3 interleaved full-model reps; peak memory; same-file llama.cpp floor |
+| Scope | 4-core A76, DotProd, no i8mm; 20-core binding arm does NOT transfer. buildx/QEMU-built, Pi-executed unthrottled; hashes pinned in the [campaign spec](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) |
+| Assembly vs compiler SDOT (one GCC 13.3 binary) | AAPCS64 leaf wall +3.66% M1/T1, +5.08% M128/T1, +3.69% M128/T4, with 9.74-10.24% fewer instructions; M1/T4 is the -2.43% residual ([assembly evidence](bench-evidence/rpi5-a76-q8-dot-20260806.md)) |
+| 64-token Qwen model gate | Byte-identical across x86, portable, SDOT and assembly arms; asm vs SDOT median TTFT -1.55%, TPOT neutral, E2E -0.13%; vs portable TTFT -33.40%, E2E -2.67%. Cortex-A76+DotProd selects assembly by default |
+| Same-file llama.cpp floor (pp17/tg64) | **NOT MET on speed**: prefill 12.81 vs 27.77 tok/s (0.461x), decode 2.55 vs 3.91 (0.653x), E2E 26,018.39 vs 16,998.49 ms ([competitor evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)) |
+| Peak RSS | **2.841 vs 3.747 GiB, 24.2% less**; 3 clean unthrottled reps; same-text 64-token greedy output byte-identical after trailing-newline normalization |
+| `PENDING` | Pi concurrency; BF16 GEMM / speed closure (the 2.17x prefill, 1.53x decode gap profiling is W6) |
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.
