@@ -39274,6 +39274,35 @@ render. Comparability: vLLM-Omni CANNOT serve a quantized H3 on one GPU
 (BF16-only in practice; source-audited `a4ea67a2`) -> HW/loader-forced-indirect,
 DeepSeek-GGUF precedent. Draft PR is the claim.
 
+## 2026-08-06T15:05 - BACKEND-CPU Raspberry Pi 5 Cortex-A76 campaign spiked
+<!-- state: 2026-08-06T15:05 -->
+
+Draft PR #65 (`row/BACKEND-CPU`) records the target before implementation:
+Qwen3.5-2B UD-Q8_K_XL, SHA-256
+`a53988df91157d78acaf3c95e22db179d13f6236061bdb86576494dc99b1bc3b`, on
+the four-core Raspberry Pi 5 Cortex-A76. Read-only hardware inspection proved
+ASIMD/FP16/RDM/DotProd and no i8mm, 64 KiB L1D/L1I + 512 KiB L2 per core,
+shared 2 MiB L3, and a real `armv8_cortex_a76` Linux PMU exposing cycles,
+instructions, frontend/backend stalls, branch, TLB and L1/L2/L3/LL-cache
+events. The existing Arm MMLA/repack fast path is therefore inert on this
+target; an SDOT route is a candidate, not yet a result.
+
+The committed leaf spec `.agents/specs/rpi5-cortex-a76-cpu-optimization.md`
+pins the sequence: generalized PMU-backed kernel harness; x86 vLLM/current-CPU
+goldens; portable Pi 16-token bring-up; trace-derived reached-loop inventory;
+C++/NEON/SDOT experiments; assembly only after a measured compiler gap; and
+recursive kernel→op→block→model/serving A/B after every accepted lever. A
+causal PMU improvement may remain in the experimental stack before wall clock
+moves, but no optimized provider becomes default without enclosing-scope
+evidence and no area closes until every lever family has a disposition with
+less than 1% predicted end-to-end residual. Same-file llama.cpp at project pin
+`237ad9b96` is the Pi speed/memory floor; vLLM will not run on the Pi.
+
+No Pi model run, correctness result, throughput number or assembly kernel is
+claimed at this checkpoint. `docs/BENCHMARKS.md` records `PENDING`; the prior
+20-core Arm/i8mm binding result remains intact and explicitly does not transfer.
+Next: R1 harness, then exact-hash model transfer and portable bring-up.
+
 ## 2026-08-06T15:40 - QUANT-CT-MXFP4-FUSED-GLUE W0: the funded glue-fusion-into-Marlin kernel is SOURCE-REFUTED; residual is flash-dominant, not glue
 <!-- state: 2026-08-06T15:40 -->
 
@@ -39404,6 +39433,33 @@ green + valid mp4, yet a non-scene). fp4 speed path is CLOSED. Box left clean (G
 idle, locks free, worker down, disk ≥15 G; checkpoint cached for reruns). Benchmark
 record + spec §8 + STATUS/BENCHMARKS/FEATURES + model-matrix/roadmap updated.
 
+## 2026-08-06T16:39 - BACKEND-CPU R1 PMU harness CPU-gated
+<!-- state: 2026-08-06T16:39 -->
+
+`examples/cpu_kernel_bench/main.cpp` adds the review-capped
+`vllm-cpu-kernel-bench` vt-op substrate without changing a production kernel.
+The initial fixture covers `MatmulBTQuant` Q8_0/Q4_K/Q6_K with M/N/K/thread,
+provider, warmup/iteration, hot/L2/L3/stream pressure and text/JSON controls.
+Inputs are deterministic and every timing/counter pass must preserve the same
+FNV checksum. Hot cases calibrate calls per sample until clock-read overhead is
+below 0.1%; cold profiles expose an invalid timing instead of hiding overhead.
+
+Linux counters use `perf_event_open` directly. Generic passes and four
+Cortex-A76 raw groups repeat cycles/instructions alongside stalls, branch,
+L1/L2/LL-cache and TLB events; counts are scaled by enabled/running time and
+each pass reports `ok`, `partial`, `multiplexed`, `unscheduled` or
+`unsupported`. The JSON also records IPC, logical bytes/bandwidth, compiler
+features, CPU/affinity/migration, frequency, governor, temperature and
+Raspberry Pi `get_throttled` output when `vcgencmd` exists.
+
+GCC 15.2 CPU build passed `-Wall -Wextra -Werror`; clang-format is clean;
+CTest `test_cpu_kernel_bench_cli` passed its deterministic JSON-schema,
+invalid-input and structured-counter cases. Direct x86 executions passed at
+1 and 4 threads, including a model-shaped Q8_0 decode fixture, and generic PMU
+groups returned real counts. Those x86 timings are tool validation only and
+are not binding performance evidence. Pi PMU execution, Qwen correctness and
+llama.cpp comparison remain `PENDING`; next is R1-on-Pi, then R2 bring-up.
+
 ## 2026-08-06T16:44 - DOCS-SUPPORTED-MODELS-MATRIX: public per-architecture supported list is now CI-bound to the C++ registry
 <!-- state: 2026-08-06T16:44 -->
 
@@ -39481,6 +39537,37 @@ functional code ships. The +450 us/step flash residual is occupancy/L2, NOT the 
 count; NEXT lever = lift flash occupancy above 8.3% (register pressure / `__launch_bounds__`)
 or cut the barrier/smem stalls. No default flip (no throughput win). Full tables in
 `.agents/benchmark-record.md` (QUANT-CT-MXFP4-FLASH-AUDIT) + the spec. Box left clean.
+
+## 2026-08-06T17:45 - BACKEND-CPU R2-R3 portable Pi baseline green
+<!-- state: 2026-08-06T17:45 -->
+
+The CPU-only ARM64 build now runs entirely through local Docker buildx/QEMU;
+the Pi remains execution-only. Ubuntu 24.04/GCC 13.3 built and linked
+`vllm-bench` plus `vllm-cpu-kernel-bench`, and QEMU executed the quantized
+matmul smoke. Exported binaries and the pinned 2.83 GB Q8_K_XL model were
+SHA-256-gated before deployment into `~/vllm-cpp-assembly`.
+
+R2 correctness is GREEN. The Pi generated the exact x86 current-engine golden
+over 16/16 tokens; the token file SHA-256 is
+`684f55a32355c0ccb6ce9c987273981f077b9591a46db07aea68561eb6432966`.
+Portable Q8 operation checksums were exact at one and four threads: decode
+M=1/N=3072/K=2048 `0xd6aec014c0050fda`, prefill M=128
+`0xa89baff1f3a4e360`.
+
+R3's idle, unthrottled 2.4 GHz baseline measured the M=1 fixture at 1,554,115
+ns median / 8.10 GFLOP/s on one core and 742,585 ns / 16.94 GFLOP/s on four;
+the M=128 fixture measured 197,061,735 ns and 49,890,756 ns (3.95x). The
+16-token model arm measured 2.14 output tok/s, TTFT 1,961.99 ms and TPOT/ITL
+366.91 ms. A separate 64-token `perf record -e cycles:u -c 1000000` captured
+241K samples with zero loss: `Bt16Neon` 57.76%, portable
+`VecDotQ8_0Q8_0` 20.10%, thread-ready 6.45%, `F16ToF32` 4.87%.
+
+The real model therefore reaches a material scalar Q8 dot hot spot. Existing
+Arm acceleration requires i8mm, which the A76 lacks; DotProd is available.
+R4/R5 will compare an exact-order C++ SDOT intrinsic against a scheduled
+AAPCS64 implementation in one QEMU-built binary, using the portable checksums,
+PMU fixture and full-model run as recursive gates. No speedup or llama.cpp
+parity is claimed at this checkpoint.
 
 ## 2026-08-06T20:30 - H3 render-coherence ROOT-CAUSED by latent bisection: VAE is FINE (round-trip coherent), the DiT emits a spatially-WHITE latent at real geometry
 <!-- state: 2026-08-06T20:30 -->
@@ -42688,6 +42775,7 @@ registration guard remains 52/52. The OpenAI row is byte-identical to main after
 removing only `; #129: SPIKE∅`; the compact clause consumes the existing
 279150-character ratchet exactly. `ENG-RELEASE-BINARIES` remains `SPIKE`: there
 is no archive, runtime, correctness or performance evidence.
+
 
 ## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
 <!-- state: 2026-08-08T21:00 -->

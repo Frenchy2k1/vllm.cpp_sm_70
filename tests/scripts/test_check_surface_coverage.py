@@ -330,10 +330,12 @@ class ShippedTreeTests(unittest.TestCase):
         reaching |= set(mod.internal_include_dir_grant_units(mod.read(mod.EXAMPLES_CMAKE)))
         self.assertLessEqual(len(reaching), mod.MAX_INTERNAL_REACHING)
 
-    def test_ratchet_ceiling_pinned_at_8(self) -> None:
+    def test_ratchet_ceiling_pinned_at_9(self) -> None:
         # EQUALITY pin: a ceiling bump (up OR down) must move this line + the ratchet claims in
         # the spec/state, so the change is test-visible and reviewed, never silent.
-        self.assertEqual(mod.MAX_INTERNAL_REACHING, 8)
+        # 9 = conscious operator exception 2026-08-08 (external contribution #65,
+        # examples/cpu_kernel_bench dev-tool; re-shrinks when the bench folds).
+        self.assertEqual(mod.MAX_INTERNAL_REACHING, 9)
 
     def test_capability_green(self) -> None:
         cap_allow, allow_errors = mod.parse_allowlist(mod.read(mod.CAP_ALLOWLIST))
