@@ -50,6 +50,21 @@ Two more example binaries ship alongside it:
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
 
+### Quantized checkpoints: which `lm_head` forms load
+
+Publishers do not agree on how the output head is stored, and a single repo can
+change it between revisions. For the Qwen3.6 dense family we accept all three
+forms in use, so pick a checkpoint by its quality, not by its head:
+
+| `lm_head.weight` | Companion tensors | Seen in |
+|---|---|---|
+| `BF16` | none | `unsloth/Qwen3.6-27B-NVFP4` @`890bdef7` |
+| `F8_E4M3` | `lm_head.weight_scale` (per-output-channel or per-tensor) | `unsloth/Qwen3.6-27B-NVFP4` @`ccdaab7e` |
+| `U8` NVFP4 | `lm_head.weight_scale` + `weight_scale_2` (ModelOpt) or `weight_global_scale` (compressed-tensors) | `nvidia/Qwen3.6-27B-NVFP4` |
+
+The head is dequantized to BF16 at load, so all three cost the same memory once
+running. Any other dtype fails at load with a message naming what it saw.
+
 ## OpenAI-compatible server
 
 `server` is a small HTTP server speaking the OpenAI API. Source:
