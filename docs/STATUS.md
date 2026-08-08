@@ -421,7 +421,7 @@ Parakeet ASR (2026-08-07): *CPU-correct, ON THE ONE SURFACE (ROW 1)*. Ids exact 
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (opt-125m exact, GEMV 1.8x; 24 native, +8 GDN incl. BOTH
-recurrences; 27B prefill 21.5x on GB10; qwen3_5 #125 VERIFIED; CUDA build repaired
+recurrences; 27B prefill 21.5x, decode 2.99 vs llama.cpp 4.35; #125 VERIFIED; CUDA build fixed
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in —
 **blind-written, unverified** — M2 unblocks on verification; gfx1201 hipBLAS +

@@ -82,17 +82,32 @@ class VulkanBackend final : public Backend {
   // error and no crash. The flush is a no-op when nothing is pending, and when
   // batching is off there is never anything pending.
   void Memset(Queue&, void* p, int value, size_t bytes) override {
-    VulkanContext::Get().FlushBatch();
+    VulkanContext::Get().FlushIfBatchTouches(TryResolve(p).buffer, "memset");
     std::memset(p, value, bytes);
   }
+  // DRAIN ONLY ON A REAL DEPENDENCY. MEASURED: this unconditional flush was 2,081
+  // of 2,193 flushes in a 27B decode -- 95% -- averaging 3.2 dispatches each, so
+  // command-buffer batching was almost entirely defeated and every host memcpy
+  // paid a full submit-plus-blocking-fence round trip. Ring exhaustion and the
+  // batch cap never fired once.
+  //
+  // A drain is required exactly when the copy touches memory the OPEN batch is
+  // using: reading a buffer the batch writes would see bytes the GPU has not
+  // written, and writing one the batch reads would change operands mid-flight.
+  // If the batch never bound the buffer -- the common case, since activations
+  // flow forward into freshly allocated ones -- neither hazard exists and the
+  // batch can keep accumulating. A pointer outside every Vulkan allocation is
+  // plain host memory and can never alias a bound buffer.
   void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
-    VulkanContext::Get().FlushBatch();
+    auto& ctx = VulkanContext::Get();
+    ctx.FlushIfBatchTouches(TryResolve(dst).buffer, "copy-dst");
+    ctx.FlushIfBatchTouches(TryResolve(src).buffer, "copy-src");
     std::memcpy(dst, src, bytes);
   }
   // Synchronize was a no-op while every dispatch waited on its own fence. With
   // batching it is the caller's explicit "make results readable" point, and it is
   // what the tests and the engine use before touching device memory.
-  void Synchronize(Queue&) override { VulkanContext::Get().FlushBatch(); }
+  void Synchronize(Queue&) override { VulkanContext::Get().FlushBatch("synchronize"); }
   // THE REFERENCE-TIER SAFETY HOOK (backend.h:44-49, the seam Metal already
   // implements for M3c-1). op_provider.cpp calls this before running a PORTABLE
   // CPU kernel, which reads and writes this backend's device memory DIRECTLY
@@ -100,7 +115,7 @@ class VulkanBackend final : public Backend {
   // dispatch's writes would be invisible to that host kernel -- stale bytes, no
   // error, no crash. This is what lets command-buffer batching be the DEFAULT
   // rather than an opt-in lever.
-  void FlushPending() override { VulkanContext::Get().FlushBatch(); }
+  void FlushPending() override { VulkanContext::Get().FlushBatch("reference-tier"); }
 
   // One process-wide VkQueue is shared by every vt::Queue: the queue handle is
   // the ORDERING domain and, with synchronous dispatch, every op is already
@@ -145,6 +160,20 @@ bool UnregisterAllocation(void* base, void** out_buffer, void** out_memory) {
   *out_memory = it->second.memory;
   m.erase(it);
   return true;
+}
+
+Resolved TryResolve(const void* ptr) {
+  const auto addr = reinterpret_cast<uintptr_t>(ptr);
+  std::lock_guard<std::mutex> g(AllocMutex());
+  auto& m = AllocMap();
+  auto it = m.upper_bound(addr);
+  if (it != m.begin()) {
+    --it;
+    if (addr >= it->first && addr < it->first + it->second.bytes) {
+      return Resolved{it->second.buffer, static_cast<uint32_t>(addr - it->first)};
+    }
+  }
+  return Resolved{};
 }
 
 Resolved Resolve(const void* ptr, const char* what) {
