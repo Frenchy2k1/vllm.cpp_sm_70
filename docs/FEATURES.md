@@ -202,7 +202,7 @@ the registered engine forward.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ☐ (W0 skeleton, HIP never compiled) | ✅ | ✅ | ✅ |
+| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
@@ -279,7 +279,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
 | Embedding / reranking models | Engine side only | Pooler and runner path landed, no model architecture registered |
-| ROCm | W0 skeleton, unbuilt | Backend + platform + 1 op (RmsNorm); the HIP sources have never been compiled by anyone (no AMD board here). Open: [ROCM.md](ROCM.md), [#41](https://github.com/mudler/vllm.cpp/issues/41) |
+| ROCm | W0 verified by community, model e2e pending | Backend + platform + 1 op, ctest-green on gfx1151/1103/1100/1201 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix in (managed allocs, unverified); M2 unblocks with it. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | Scoped, spike owed | No profiling; KV pool is a hand-typed `--num-blocks`. Target: auto-size to the declared workload, optional total-footprint cap, refuse before allocating |

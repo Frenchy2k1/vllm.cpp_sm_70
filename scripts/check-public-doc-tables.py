@@ -382,7 +382,14 @@ STATUS_RATCHET = {
     # mapping ... behavioural CPU gate ... remaining work" narrative appeared
     # twice back to back; the longer, newer version stays). Nothing was lost,
     # only de-duplicated. Net -92.
-    "chars": 279150,
+    #
+    # 279130 since 2026-08-08 (measured 279120 after the #145/#151 rebases): the ROCm
+    # entry in "Not supported yet" swapped "HIP never compiled" (falsified by
+    # the four #41 community build reports) for the current binding state — W0
+    # community-green, approach-(b) F6 fix in blind-unverified, M2 on
+    # verification — paid for inside the same parenthetical; the board/arch
+    # detail lives in docs/ROCM.md and .agents/backend-matrix.md. Net -12.
+    "chars": 279130,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

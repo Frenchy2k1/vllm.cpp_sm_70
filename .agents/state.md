@@ -43085,3 +43085,35 @@ F79-4 remain open on the landed tree; the review's merge-and-fix map is the
 binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
 as the lane's own next steps.
 
+
+## 2026-08-08 — ROCm approach-(b): unified memory true by construction on integrated APUs
+<!-- state: 2026-08-08T21:30 -->
+
+Implements the maintainer-ratified approach (b) from issue #41 F6 (decision
+comment 2026-08-08, quoted verbatim in `specs/rocm-unified-memory-b.md`): on a
+ROCm device probing `Integrated=1 && ManagedMemory=1 &&
+ConcurrentManagedAccess=1`, `RocmBackend::Alloc` allocates through
+`hipMallocManaged(hipMemAttachGlobal)` and `UnifiedMemory()` returns true
+exactly then — the host-dereference contract the CPU reference tier needs
+becomes API-guaranteed on XNACK-less RDNA3 APUs (gfx1151/gfx1103), where the
+W0 CUDA-shaped probe read `PageableMemoryAccess=0` and blocked M2. The W0
+conjunction stays as ground 1; `Free` stays `hipFree` (API-documented for both
+alloc paths); inherited `AllocPinned` rides the same branch via its
+delegate-to-`Alloc` base; discrete devices are byte-identical (branch provably
+dead at `Integrated=0`, gated by a new runtime test through the new HIP-free
+probes `ManagedAllocActive`/`IntegratedDevice`). F6's decisive experiment
+(kernel write → host read, no copy) is now a standing test. Also absorbed:
+issue #41 F1/F3 — when `ROCM_PATH` exists, the configure derives
+`CMAKE_HIP_COMPILER_ROCM_ROOT`, seeds `--rocm-path` into `CMAKE_HIP_FLAGS`,
+and exports `ROCM_PATH`, each only when unset, making Arch/TheRock layouts
+configure flag-free (F2 was downstream of the unidentified compiler). NO
+upstream analog to mirror (vLLM allocates via torch; `rocm.py:75-77,909-910`
+only names the APUs): recorded as ADDITIVE deviation, porting-inventory §9.14.
+
+Blind-written under this lane's policy — no AMD hardware or hipcc here; the
+CPU gates (preflight, `vllm_rocm_platform_syntax_check` -Werror
+object-compile of the platform + test TUs) are the only ones run. Community
+owes: the (b) delta's first compile, the two new ctest cases, a flag-free
+Arch/TheRock configure log, and the unblocked M2 on gfx1151/gfx1103 —
+itemized in the spec's verification table and on the #41 handoff comment
+(PR #144, `row/ROCM-UNIFIED-MEMORY-B`).

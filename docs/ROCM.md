@@ -1,12 +1,19 @@
 # ROCm (AMD GPU) backend — contributor guide
 
-**State today: the W0 skeleton is committed, and no HIP source in it has ever
-been compiled.** `kROCM` exists, `-DVLLM_CPP_HIP=ON` exists, and there is a
-`vt::Backend`, a `Platform`, and exactly one registered kernel (RmsNorm). The
-plain-C++ parts compile and are tested here; the three `.hip` files have not been
-built by anyone, because no maintainer machine has an AMD GPU. **Your first HIP
-compile is genuinely the first**, and a failure is the expected outcome rather
-than a sign you did something wrong.
+**State today: the W0 skeleton is community-verified on four architectures, and
+the F6 unified-memory fix (approach (b)) is committed but unverified.**
+[Issue #41](https://github.com/mudler/vllm.cpp/issues/41) board owners compiled
+the HIP sources clean and ran the ctest gates on gfx1151 (Strix Halo), gfx1103
+(Radeon 780M), gfx1100 (4x 7900 XTX) and gfx1201 (2x R9700) — M0 and M1 MET on
+all four, with two runtime-teardown caveats recorded in §7. Their headline
+finding, F6: `UnifiedMemory()` probed **false** on the RDNA3 APUs, because
+XNACK-less RDNA reports `PageableMemoryAccess=0`, so the zero-kernel reference
+tier the whole unified-memory plan rests on did not install and M2 was blocked.
+The ratified fix (§3.1) allocates through `hipMallocManaged` on integrated
+managed-capable devices so host access is API-guaranteed — written blind like
+the skeleton before it, so **the (b) branch owes the same community compile+run
+evidence W0 already earned**; a compile error in it is useful data, not a
+mistake on your side.
 
 This page exists because several people offered hardware in
 [issue #41](https://github.com/mudler/vllm.cpp/issues/41), and it answers the
@@ -14,9 +21,11 @@ three questions that decide whether that goes anywhere: what a backend actually
 *is* in this codebase, what to write first on the hardware you own, and what
 "done" means. The design record behind the skeleton, including what was
 deliberately left out, is
-[.agents/specs/rocm-backend-w0.md](../.agents/specs/rocm-backend-w0.md).
+[.agents/specs/rocm-backend-w0.md](../.agents/specs/rocm-backend-w0.md); the
+unified-memory decision record is
+[.agents/specs/rocm-unified-memory-b.md](../.agents/specs/rocm-unified-memory-b.md).
 
-Everything here is checked against the tree on 2026-08-06. Where a number is
+Everything here is checked against the tree on 2026-08-08. Where a number is
 counted, the command that counts it is given, because these numbers drift.
 
 ## 1. Why ROCm is the cheapest backend to add
@@ -56,13 +65,13 @@ on a real machine, and what has not.
 |---|---|---|
 | Device enum | [`include/vt/device.h`](../include/vt/device.h) | ✅ compiled; the enum forced exactly one switch site tree-wide |
 | — | [`include/vt/rocm/rocm_arch.h`](../include/vt/rocm/rocm_arch.h) — gfx name → `(major, minor)`, ported 1:1 from `rocm.py:223` | ✅ **unit-tested**, 40 assertions, no GPU needed |
-| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) — the 6 `vt::Backend` virtuals | ❌ **never compiled** |
-| Op table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) — one `RegisterOp` line | ❌ never compiled |
-| Kernel | [`src/vt/rocm/rocm_rmsnorm.hip`](../src/vt/rocm/rocm_rmsnorm.hip) | ❌ never compiled |
-| Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) — mirrors `vllm/platforms/rocm.py` | ✅ compiles `-Werror` (plain C++, object-compiled in every build as a bit-rot guard); never *run* |
+| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) — the 6 `vt::Backend` virtuals | ✅ W0 compiled + ctest-run on gfx1151/1103/1100/1201 (#41) — ❌ the approach-(b) delta is **unbuilt** |
+| Op table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) — one `RegisterOp` line | ✅ compiled + run on the same four boards |
+| Kernel | [`src/vt/rocm/rocm_rmsnorm.hip`](../src/vt/rocm/rocm_rmsnorm.hip) | ✅ NMSE ≤ 5e-4 vs the CPU oracle on all four boards (F5: RDNA is wave32, the wave64 hazard moves to a future gfx9 board) |
+| Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) — mirrors `vllm/platforms/rocm.py` | ✅ compiles `-Werror` everywhere; ✅ run on the four boards |
 | Attention | *(none yet — `get_attn_backend_priority()` returns empty)* | — |
-| Build | `VLLM_CPP_HIP` in [`CMakeLists.txt`](../CMakeLists.txt) | ✅ the OFF path and the fail-without-hipcc path |
-| Test | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | ✅ compiles (same guard) — ❌ never run |
+| Build | `VLLM_CPP_HIP` in [`CMakeLists.txt`](../CMakeLists.txt) | ✅ ON-path configure+build on the four boards (Arch/TheRock now auto-hinted, §5 M0); ✅ the OFF path and the fail-without-hipcc path |
+| Test | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | ✅ W0 cases run green (1044 assertions in the #41 tables) — ❌ the two approach-(b) cases never run |
 
 So the shape is decided and the parts that hold a *decision* are tested; what
 you are validating is the API glue. Adding your own op is one line in
@@ -113,13 +122,60 @@ Two rules that keep this honest: `VT_OP_PROVIDER_STATS=1` prints the first time
 each `(op, device)` falls back, and `GetReferenceTierHits()` **must be 0 in any
 performance measurement**. A non-zero value means you benchmarked the CPU.
 
+### 3.1 The F6 fix: unified memory true by construction (approach (b))
+
+Issue #41's headline finding (F6, measured on gfx1151, confirmed on gfx1103):
+XNACK-less RDNA3 APUs report `hipDeviceAttributeIntegrated=1` but
+`hipDeviceAttributePageableMemoryAccess=0`, so the W0 probe (CUDA's own
+conjunction, integrated AND pageable) answered `UnifiedMemory() == false` on the
+very boards the zero-kernel plan was written for — even though host dereference
+of `hipMalloc` memory demonstrably worked there. The attribute answers the
+opposite question (device reading pageable host memory) from the one the tier
+needs (host reading device allocations); the two coincide on NVIDIA integrated
+parts and come apart on RDNA.
+
+The maintainer decision (#41, 2026-08-08) is approach **(b)** — make the claim
+true by construction rather than gate on an architectural accident:
+
+> On a device reporting hipDeviceAttributeIntegrated=1 (and ManagedMemory=1 +
+> ConcurrentManagedAccess=1), Backend::Alloc in the ROCm backend uses
+> hipMallocManaged instead of hipMalloc, and UnifiedMemory() returns true
+> exactly then — host access becomes API-guaranteed rather than architecturally
+> incidental, which is the standard this gate exists to hold.
+
+What each device class gets:
+
+| Device class | `Backend::Alloc` | `UnifiedMemory()` | Reference tier | M2 |
+|---|---|---|---|---|
+| Integrated + managed-capable (gfx1151, gfx1103: all three attributes probed 1) | `hipMallocManaged(hipMemAttachGlobal)` | **true**, by construction | installs — a model runs with one native kernel | unblocked |
+| Integrated, NOT managed-capable (no known board; the probes default to 0 on error) | `hipMalloc` | false unless the W0 conjunction holds | does not install | blocked — post the probe triple on #41 |
+| Discrete (gfx1100, gfx1201, MI50...) | `hipMalloc` — the managed branch is provably dead (`Integrated=0`) | false | never installs (memory-safety gate) | native kernels required, unchanged |
+
+The free path is `hipFree` for both branches: the HIP runtime API documents it
+as the release call for `hipMalloc` and `hipMallocManaged` allocations alike,
+mirroring `cudaFree`. `Backend::AllocPinned` inherits the base delegation to
+`Alloc` (`src/vt/backend.cpp:19`), so pinned blocks ride the same branch and
+stay host-accessible — coherent with its contract (`include/vt/backend.h:76-78`).
+Introspection for tests and bug reports:
+`vt::rocm::ManagedAllocActive(index)` / `IntegratedDevice(index)` in
+[`include/vt/rocm/rocm_runtime.h`](../include/vt/rocm/rocm_runtime.h) report
+which path the silicon took, and `tests/vt/test_rocm_backend.cpp` gates that the
+alloc path and the `UnifiedMemory()` claim move together — including F6's
+decisive experiment (kernel writes, host reads back, **no copy**) as a standing
+test.
+
+Approach (a) — gate the tier on `Integrated` alone — remains the recorded
+fallback **if managed allocations measure slower on gfx1151: measure, don't
+assume** (the maintainer decision, verbatim). Decision record:
+[.agents/specs/rocm-unified-memory-b.md](../.agents/specs/rocm-unified-memory-b.md).
+
 ## 4. Pick your first task from your hardware
 
 | Hardware | Arch | Memory | Start here |
 |---|---|---|---|
-| Strix Halo / GTR9 Pro 128GB | gfx1151 | unified | **Build M0/M1, then M2.** Once it compiles, the reference tier means a model runs with no further kernel written. Closest analogue to GB10, so the residency-policy question in §6 is yours |
-| Radeon 780M iGPU | gfx1103 | shared | **Build M0/M1**, same path, smaller models. Best position to find every place a "CUDA" assumption is really an "NVIDIA" assumption. A vLLM-ROCm oracle is unlikely on this board, so M4 stays PENDING there — fine, and to be said rather than papered over |
-| 4x 7900 XTX | gfx1100 | discrete | **Build M0/M1, then the kernel path**, since the reference tier cannot install on a dGPU and a model needs real kernels. The only board that can host a vLLM-ROCm oracle for M4 and, later, multi-GPU TP — the backend already registers all four at `Device{kROCM, i}` |
+| Strix Halo / GTR9 Pro 128GB | gfx1151 | unified | M0/M1 **MET** (#41). Now: **verify the §3.1 fix, then M2** (§5.2) — the reference tier means a model runs with no further kernel written. Closest analogue to GB10, so the residency-policy question in §6 is yours |
+| Radeon 780M iGPU | gfx1103 | shared | M0/M1 **MET** (#41). Same §5.2 path, smaller models. Best position to find every place a "CUDA" assumption is really an "NVIDIA" assumption. A vLLM-ROCm oracle is unlikely on this board, so M4 stays PENDING there — fine, and to be said rather than papered over |
+| 4x 7900 XTX | gfx1100 | discrete | M0/M1 **MET** (#41, with the #132 caveat). Now **the kernel path**, since the reference tier cannot install on a dGPU and a model needs real kernels. The only board class that can host a vLLM-ROCm oracle for M4 and, later, multi-GPU TP — the backend already registers all four at `Device{kROCM, i}`. gfx1201 (2x R9700) is on the same discrete lane via PR #140 |
 
 These do not collide. Two people can be on M0/M1/M2 on unified parts while a
 third does the hipify pass, and the discrete board is what turns the result into
@@ -127,26 +183,83 @@ a gated backend.
 
 ## 5. Milestones as concrete PRs
 
-**M0 — build. WRITTEN, unverified.** Tri-state `VLLM_CPP_HIP`, hipcc detection
-that fails loudly, `VLLM_CPP_HIP_ARCHITECTURES`, `ROCM_PATH`. What remains is
-for someone to run it. Acceptance: `cmake -DVLLM_CPP_HIP=ON` configures and
-`cmake --build` produces a binary. **This is the open task.**
+**M0 — build. MET** on gfx1151, gfx1103, gfx1100 and gfx1201 (#41 tables).
+Tri-state `VLLM_CPP_HIP`, hipcc detection that fails loudly,
+`VLLM_CPP_HIP_ARCHITECTURES`, `ROCM_PATH`. The Arch/TheRock findings F1/F3 are
+now absorbed into the configure: when `ROCM_PATH` points at a real install
+(default `/opt/rocm`), CMake derives `CMAKE_HIP_COMPILER_ROCM_ROOT`, seeds
+`--rocm-path` into `CMAKE_HIP_FLAGS`, and exports `ROCM_PATH` into the
+environment — each only when you have not set it yourself. The manual
+three-flag workaround from the gfx1151 report
+(`-DCMAKE_HIP_COMPILER_ROCM_ROOT=... -DCMAKE_HIP_FLAGS=--rocm-path=...` on top
+of `-DROCM_PATH`) is therefore **legacy**: still honoured if passed, no longer
+required. F2 (raw `--whole-archive` reaching the clang driver) was downstream
+of the unidentified compiler and disappears with F1/F3 — if you still see it,
+your compiler identification failed and that configure log is the thing to
+post. *The absorption itself is untested on a real Arch/TheRock layout — a
+configure log from one, with no manual flags, is wanted evidence on #41.*
 
-**M1 — platform + backend. WRITTEN, unverified.** `rocm_backend.hip`,
-`platforms/rocm.cpp`, the `kROCM` enum, the capability parse (tested), and one
-registered op. Acceptance: `ctest -R 'rocm|cross_device'` green on the device —
-which also means the RmsNorm kernel matched the CPU oracle at NMSE ≤ 5e-4, so
-seam 3 is proven end to end.
+**M1 — platform + backend. MET** on the same four boards: `ctest -R
+'rocm|cross_device'` green, RmsNorm within NMSE ≤ 5e-4 of the CPU oracle on
+real silicon — with two runtime caveats, both teardown-related, in §5.1 below.
 
-Expect M0/M1 to need fixes. A compile error in `rocm_backend.hip` is the single
-most valuable thing anyone can report right now, and it belongs in this repo
-rather than in a fork.
+**M2 — first model end to end. UNBLOCKED-UNVERIFIED on unified parts** by the
+§3.1 fix: assert `ReferenceTierEligible(kROCM)` and run a small dense model.
+Acceptance: greedy token parity against the **CPU backend** on the same build,
+plus the `VT_OP_PROVIDER_STATS=1` output showing which ops fell back, which is
+your kernel to-do list, sorted by real usage rather than by guesswork.
 
-**M2 — first model end to end.** On a unified part this is mostly free: assert
-`ReferenceTierEligible(kROCM)` and run a small dense model. Acceptance: greedy
-token parity against the **CPU backend** on the same build, plus the
-`VT_OP_PROVIDER_STATS=1` output showing which ops fell back, which is your
-kernel to-do list, sorted by real usage rather than by guesswork.
+### 5.1 Known runtime issues on the #41 boards
+
+- **TheRock nightly teardown hang (gfx1103).** All three test binaries print
+  `Status: SUCCESS!` and then never exit, so `ctest` times out waiting.
+  arch-btw's GDB backtrace pins it inside `libamdhip64.so.7` during
+  `__cxa_finalize`/`_dl_fini`, waiting on HSA `AsyncEventsLoop` threads stuck
+  in an `ioctl` wait — an upstream runtime teardown deadlock in the TheRock
+  nightly (`10.1.0a20260731`), not a vllm.cpp bug. Treat "SUCCESS printed, then
+  hang" as a PASS of the test body plus this known issue; report the ROCm
+  build you saw it on.
+- **`-O0` hostcall teardown race ([#132](https://github.com/mudler/vllm.cpp/issues/132),
+  gfx1100).** A no-build-type compile leaves the RmsNorm kernels with
+  hidden-hostcall metadata at `-O0`; ROCm CLR's listener handshake can then
+  deadlock the process finalizer under CPU saturation (intermittent, 14/20 at
+  48 threads). Validated avoidance: build with an optimization level
+  (`-DCMAKE_BUILD_TYPE=Release`), which removes the hostcall path entirely.
+
+### 5.2 The sequence for board owners, post-F6-fix
+
+Everything below assumes the tree at or after the approach-(b) change. On
+Arch/TheRock, no compiler flags beyond `ROCM_PATH` should now be needed — if
+that is false, the configure log is finding number one.
+
+```sh
+cmake -S . -B build-hip -DVLLM_CPP_HIP=ON -DCMAKE_BUILD_TYPE=Release \
+      -DROCM_PATH=/opt/rocm        # or your TheRock dist prefix
+cmake --build build-hip -j
+ctest --test-dir build-hip -R 'rocm|cross_device' --output-on-failure
+```
+
+What to report on #41, in the M0/M1 table shape already in use there:
+
+1. The configure/compile/link results, and whether any manual flag was still
+   required (that would mean §5's F1/F3 absorption missed your layout).
+2. The new probe triple printed by `test_rocm_backend` — `integrated`,
+   `managed-alloc`, `UnifiedMemory()` — plus the pass/fail of the two
+   approach-(b) cases ("alloc path and UnifiedMemory() move together",
+   "kernel-written value is host-readable with no copy").
+3. On an APU, the M2 attempt: a small dense model through the CLI. `--device`
+   has no `rocm` literal yet; `auto` (the default) selects ROCm on an AMD box
+   with no CUDA via the platform priority walk. E.g.:
+
+   ```sh
+   VT_OP_PROVIDER_STATS=1 ./build-hip/examples/vllm-cli \
+     --model <a small dense HF model dir> \
+     --prompt 'The capital of France is' --max-tokens 8 --temperature 0
+   ```
+
+   Post the generated tokens, whether they match the same command with
+   `--device cpu`, and the `VT_OP_PROVIDER_STATS` fallback list — that list is
+   the prioritized M3 kernel to-do for your board.
 
 **M3 — kernels + attention.** Hipify `src/vt/cuda/` family by family, starting
 with what M2's fallback log actually hit: layernorm, rope, activations, glue,

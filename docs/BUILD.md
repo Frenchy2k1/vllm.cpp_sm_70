@@ -109,17 +109,18 @@ cmake -S . -B build-vulkan -DVLLM_CPP_VULKAN=ON
 cmake --build build-vulkan -j
 ```
 
-## ROCm build (AMD GPUs) — never yet compiled
+## ROCm build (AMD GPUs) — community-verified W0, blind F6 fix
 
-> **Read this before you file a bug.** The HIP sources in this tree have **never
-> been compiled by anyone.** There is no AMD GPU and no ROCm toolchain on any
-> machine the maintainers use, so unlike every other backend here this one has no
-> build report at all — not even "it compiles". If it fails for you, that is the
-> expected first outcome and the most useful thing you can report. Please do,
-> on [issue #41](https://github.com/mudler/vllm.cpp/issues/41).
+> The W0 HIP sources compiled clean and passed `ctest -R 'rocm|cross_device'`
+> on four community boards — gfx1151, gfx1103, gfx1100, gfx1201
+> ([issue #41](https://github.com/mudler/vllm.cpp/issues/41)). The
+> unified-memory fix on top of them (approach (b),
+> [docs/ROCM.md §3.1](ROCM.md)) was again written with **no AMD GPU or ROCm
+> toolchain on any maintainer machine**, so a compile error in it is expected,
+> useful, and belongs on #41.
 
 ```sh
-cmake -S . -B build-hip -DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1100
+cmake -S . -B build-hip -DVLLM_CPP_HIP=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-hip -j
 ctest --test-dir build-hip -R 'rocm|cross_device'
 ```
@@ -128,14 +129,22 @@ ctest --test-dir build-hip -R 'rocm|cross_device'
 installed GPU, which is what you want when building on the machine you will run
 on. The validated names are upstream vLLM's `HIP_SUPPORTED_ARCHS`; anything else
 configures with a warning and is passed to hipcc anyway. If ROCm lives outside
-`/opt/rocm`, point at it with `-DROCM_PATH=<prefix>`.
+`/opt/rocm`, point at it with `-DROCM_PATH=<prefix>`. When `ROCM_PATH` names a
+real install, the configure now derives the compiler hints from it
+(`CMAKE_HIP_COMPILER_ROCM_ROOT`, `--rocm-path` in `CMAKE_HIP_FLAGS`, the
+`ROCM_PATH` environment variable — each only if you have not set it), which is
+what makes Arch and TheRock dist-tarball layouts configure without the manual
+flags issue #41's gfx1151 report needed. An explicit `-DCMAKE_BUILD_TYPE` (any
+optimizing one) matters on ROCm: a `-O0` device build trips a CLR teardown race
+([#132](https://github.com/mudler/vllm.cpp/issues/132)).
 
 `-DVLLM_CPP_HIP=ON` **fails the configure** when no HIP compiler is found rather
 than quietly producing a CPU-only build, for the same reason the CUTLASS note
 above exists: a silent downgrade is indistinguishable from success.
 
 What exists today is the W0 skeleton — the `vt::Backend`, the `Platform`, one
-registered kernel (RmsNorm), and the tests that gate them. What that does and
+registered kernel (RmsNorm), and the tests that gate them — plus the approach-(b)
+unified-memory branch for integrated APUs. What that does and
 does not get you, and where to start on your specific board, is
 [docs/ROCM.md](ROCM.md).
 
