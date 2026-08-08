@@ -15955,4 +15955,31 @@ It is **not** justified on speed, and nothing measured here says otherwise.
 
 **Next lever for 27B Vulkan speed is `kGdnPrefill`/`kGdnDecode`** — that is where
 the prefill time sits, and a materially larger piece of work than the six glue ops.
+### paged_attn barrier batching: REFUTED, reverted (2026-08-07, GB10)
 
+With the run GPU-bound again, `vt_paged_attn` is the second cost at 23.0%. It runs
+ONE WORKGROUP per (query token, query head) with lanes splitting the head
+dimension, and calls `vt_tg_sum` **once per key** — 2 + log2(128) = 9 barriers to
+combine ONE multiply per lane, since `d = 128` equals the workgroup width. At 0.0741
+ms/call over ~48 keys that is 1.54 us per key, which looked barrier-bound.
+
+Batched four keys per reduction round: four independent sums pushed through ONE
+barrier sequence, with the online softmax still consuming them STRICTLY IN KEY
+ORDER so `m`/`l`/`acc` evolve identically. **Bit-identical, not NMSE-tier** — and
+opt-125m STRICT 6/6 with 1152 `kPagedAttention` selections confirmed it.
+
+**4x fewer barriers bought 1.6%: 0.0741 -> 0.0729 ms/call, share 23.0% -> 22.8%.**
+
+**The barriers were not the cost.** Per key the kernel gathers 128 K elements AND
+128 V elements through the block table — roughly 512 B of scattered reads against
+one multiply per lane. `vt_paged_attn` is **memory-bound on the KV gather**, not
+barrier-bound.
+
+Reverted: 2 KiB of shared memory and a restructured loop for nothing measurable.
+The next attempt on this kernel should target the GATHER — KV layout, vectorised
+loads, or caching the K/V slice across the query heads that share a KV head —
+**not** the reduction.
+
+Recorded because the hypothesis was specific and the refutation is reusable: this
+is the second kernel this session where a barrier-count argument looked compelling
+and measured flat (the subgroup GEMV was the first).
