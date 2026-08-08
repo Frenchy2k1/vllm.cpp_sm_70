@@ -127,7 +127,15 @@ class VulkanContext {
   // Copy/Memset are plain memcpy over the persistently mapped, host-coherent
   // allocation, so a pending batch means the host reads STALE bytes -- silently,
   // with no error. Backend::Copy, Memset and Synchronize all flush.
-  void FlushBatch();
+  // `why` attributes the flush to its TRIGGER. Measured: a 27B decode does 212
+  // flushes per TOKEN, most carrying only 1-2 dispatches, so batching is being
+  // defeated by something other than the ring. Which trigger fires decides the
+  // fix, and guessing has been wrong five times this session.
+  void FlushBatch(const char* why = "explicit");
+  // Drains only if `buffer` (a packed VkBuffer, or nullptr for host memory) was
+  // bound by a dispatch in the currently open batch. See Backend::Copy for why
+  // that is the exact condition.
+  void FlushIfBatchTouches(void* buffer, const char* why);
   // Whether dispatch batching is active. Exposed so a test never has to restate
   // the default: the VK-A2 gate originally re-derived it from the environment
   // variable and silently asserted the wrong branch the moment the default
@@ -212,7 +220,7 @@ class VulkanContext {
   void* scratch_buffer_ = nullptr;   // VkBuffer
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
-  void FlushBatchLocked();           // caller holds mutex_
+  void FlushBatchLocked(const char* why = "explicit");  // caller holds mutex_
   // GPU TIMESTAMP PROFILING. Batching submits many dispatches under ONE fence,
   // so the per-dispatch fence wait that used to attribute time to a shader no
   // longer exists. Timestamps written into the command buffer are the only way to
@@ -227,6 +235,7 @@ class VulkanContext {
   void* batch_names_ = nullptr;      // std::vector<std::string>*, one per recorded dispatch
   bool batch_open_ = false;          // a command buffer is recording
   uint32_t batch_count_ = 0;         // dispatches recorded into it
+  void* batch_buffers_ = nullptr;    // std::set<void*>*, buffers the open batch bound
   void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
   void* dispatch_ms_ = nullptr;      // std::map<std::string, double>*
   uint64_t dispatch_total_ = 0;

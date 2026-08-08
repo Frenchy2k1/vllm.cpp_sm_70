@@ -585,6 +585,29 @@ bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
     return v != nullptr && std::strcmp(v, "0") == 0;
   }();
   if (kDisabled) return false;
+
+  // WHY IT DECLINED, once per distinct reason, under VT_VULKAN_DISPATCH_STATS.
+  // Same reasoning as the coopmat predicate above: a 27B decode profile showed the
+  // UNTILED SCALAR kernel still taking 256 calls at 12.53 ms -- one per output
+  // token, and the largest single per-call cost in decode -- and no amount of
+  // reading the source says WHICH clause sent it there.
+  if (kCoopMatWhy) {
+    const char* why = nullptr;
+    if (!bt) why = "not MatmulBT (b is [K,N]; that layout is already coalesced)";
+    else if (m != 1) why = "M is not 1 (not a decode-shaped GEMV)";
+    else if (k < static_cast<int64_t>(kWorkgroupSize)) why = "K is below one workgroup width";
+    if (why != nullptr) {
+      static std::mutex gseen_mu;
+      static std::set<std::string> gseen;
+      std::lock_guard<std::mutex> g(gseen_mu);
+      if (gseen.insert(std::string(why)).second) {
+        std::fprintf(stderr, "[vt vulkan] gemv DECLINED: %s  (bt=%d m=%lld k=%lld)\n",
+                     why, bt ? 1 : 0, (long long)m, (long long)k);
+        std::fflush(stderr);
+      }
+    }
+  }
+
   if (!bt || m != 1) return false;
   return k >= static_cast<int64_t>(kWorkgroupSize);
 }
