@@ -309,9 +309,9 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
-| **Vulkan** | Portable GPU | Skeleton: 8 ops plus the fusion catalogue cross-check against CPU and CUDA. No model runs yet |
-| **ROCm** | AMD GPUs | W0 skeleton (backend, platform, 1 op). HIP sources **never compiled**, no AMD board here. Open: [docs/ROCM.md](docs/ROCM.md), [#41](https://github.com/mudler/vllm.cpp/issues/41) |
-| **Intel XPU / ANE** | Intel, Apple Neural Engine | Spiked or roadmap |
+| **Vulkan** | Portable GPU | 24 native ops; `opt-125m` STRICT token-exact, Qwen3.6-27B runs e2e |
+| **ROCm** | AMD GPUs | W0 skeleton; a contributor ran gfx1201 on 2x R9700 ([#140](https://github.com/mudler/vllm.cpp/pull/140)). No AMD board here: [docs/ROCM.md](docs/ROCM.md) |
+| **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
 Per-arch build flags, per-op coverage, and the quantization format table:
 [docs/BUILD.md](docs/BUILD.md).
