@@ -121,7 +121,9 @@ struct EngineParams {
   // vLLM's DeviceConfig.device (vllm/config/device.py). kAuto (default) keeps
   // the accelerator-first probe that has always selected the queue — the
   // byte-identical default. kCPU forces the CPU queue without consulting the
-  // probe; kCUDA requires the CUDA platform and the load fails LOUD when it is
+  // probe. The INTERNAL value Device::kNamedPlatform is the tag for the stable
+  // PUBLIC/WIRE request whose value and name remain 2="cuda"; it resolves that
+  // canonical name through the platform registry and fails LOUD when CUDA is
   // absent (never a silent fallback — an explicit device is assigned verbatim
   // upstream, device.py:61-66). Exposed on the C ABI as
   // vllm_model_params.device (ABI v14: 0=auto, 1=cpu, 2=cuda) and on the
