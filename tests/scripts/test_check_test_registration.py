@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import unittest
@@ -19,6 +20,13 @@ SPEC.loader.exec_module(mod)
 
 
 PASSING_CMAKE = """
+cmake_minimum_required(VERSION 3.20)
+project(registration_guard LANGUAGES CXX)
+enable_testing()
+add_library(vllm_core INTERFACE)
+add_library(vllm::vllm ALIAS vllm_core)
+add_library(vllm_test_main INTERFACE)
+
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
@@ -27,6 +35,15 @@ endfunction()
 
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
+"""
+
+PASSING_CI = """jobs:
+  checks:
+    steps:
+      - name: Critical regression tests remain executable and CTest-registered
+        run: |
+          python3 scripts/check-test-registration.py
+          python3 tests/scripts/test_check_test_registration.py
 """
 
 
@@ -95,6 +112,58 @@ class RegistrationMutationTests(unittest.TestCase):
         )
         self.assert_error(mutated, "does not register that executable with CTest")
 
+    def test_M13_bracket_commented_target_fails(self) -> None:
+        mutated = PASSING_CMAKE.replace(
+            "vllm_cpp_add_test(test_device_selection\n"
+            "  vllm/entrypoints/test_device_selection.cpp)",
+            "#[[\nvllm_cpp_add_test(test_device_selection\n"
+            "  vllm/entrypoints/test_device_selection.cpp)\n]]",
+        )
+        self.assertNotEqual(mutated, PASSING_CMAKE)
+        self.assert_error(mutated, "missing required test target test_device_selection")
+
+    def test_M14_target_in_false_conditional_fails(self) -> None:
+        mutated = PASSING_CMAKE.replace(
+            "vllm_cpp_add_test(test_device_selection\n"
+            "  vllm/entrypoints/test_device_selection.cpp)",
+            "if(FALSE)\n"
+            "  vllm_cpp_add_test(test_device_selection\n"
+            "    vllm/entrypoints/test_device_selection.cpp)\n"
+            "endif()",
+        )
+        self.assertNotEqual(mutated, PASSING_CMAKE)
+        self.assert_error(mutated, "missing required test target test_device_selection")
+
+    def test_M15_quoted_target_text_fails(self) -> None:
+        mutated = PASSING_CMAKE.replace(
+            "vllm_cpp_add_test(test_device_selection\n"
+            "  vllm/entrypoints/test_device_selection.cpp)",
+            'set(dead "vllm_cpp_add_test(test_device_selection '
+            'vllm/entrypoints/test_device_selection.cpp)")',
+        )
+        self.assertNotEqual(mutated, PASSING_CMAKE)
+        self.assert_error(mutated, "missing required test target test_device_selection")
+
+    def test_M16_helper_registration_in_false_conditional_fails(self) -> None:
+        mutated = PASSING_CMAKE.replace(
+            "  add_test(NAME ${name} COMMAND ${name})",
+            "  if(FALSE)\n"
+            "    add_test(NAME ${name} COMMAND ${name})\n"
+            "  endif()",
+        )
+        self.assertNotEqual(mutated, PASSING_CMAKE)
+        self.assert_error(mutated, "is not registered with CTest")
+
+    def test_M17_helper_executable_in_false_conditional_fails(self) -> None:
+        mutated = PASSING_CMAKE.replace(
+            "  add_executable(${name} ${ARGN})",
+            "  if(FALSE)\n"
+            "    add_executable(${name} ${ARGN})\n"
+            "  endif()",
+        )
+        self.assertNotEqual(mutated, PASSING_CMAKE)
+        self.assert_error(mutated, "missing required test target test_device_selection")
+
 
 class WiringMutationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -102,10 +171,7 @@ class WiringMutationTests(unittest.TestCase):
             "CHECKERS=(\n  check-test-registration\n)\n"
             "SUITES=(\n  test_check_test_registration\n)\n"
         )
-        self.ci = (
-            "python3 scripts/check-test-registration.py\n"
-            "python3 tests/scripts/test_check_test_registration.py\n"
-        )
+        self.ci = PASSING_CI
 
     def assert_wiring_error(self, preflight: str, ci: str, needle: str) -> None:
         errors = mod.wiring_errors(preflight, ci)
@@ -123,19 +189,86 @@ class WiringMutationTests(unittest.TestCase):
         self.assert_wiring_error(mutated, self.ci, "preflight SUITES")
 
     def test_M11_deleting_ci_checker_fails(self) -> None:
-        mutated = self.ci.replace("python3 scripts/check-test-registration.py\n", "")
+        mutated = self.ci.replace(
+            "          python3 scripts/check-test-registration.py\n", ""
+        )
         self.assert_wiring_error(self.preflight, mutated, "CI checker")
 
     def test_M12_deleting_ci_suite_fails(self) -> None:
         mutated = self.ci.replace(
-            "python3 tests/scripts/test_check_test_registration.py\n", ""
+            "          python3 tests/scripts/test_check_test_registration.py\n", ""
         )
         self.assert_wiring_error(self.preflight, mutated, "CI mutation suite")
+
+    def test_M18_ci_commands_behind_false_shell_branch_fail(self) -> None:
+        mutated = self.ci.replace(
+            "          python3 scripts/check-test-registration.py\n"
+            "          python3 tests/scripts/test_check_test_registration.py\n",
+            "          if false; then\n"
+            "            python3 scripts/check-test-registration.py\n"
+            "            python3 tests/scripts/test_check_test_registration.py\n"
+            "          fi\n",
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(self.preflight, mutated, "direct active commands")
+
+    def test_M19_ci_commands_as_quoted_text_fail(self) -> None:
+        mutated = self.ci.replace(
+            "          python3 scripts/check-test-registration.py\n",
+            '          echo "python3 scripts/check-test-registration.py"\n',
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(self.preflight, mutated, "direct active commands")
 
 
 class ShippedTreeTests(unittest.TestCase):
     def test_shipped_tree_is_registered_and_wired(self) -> None:
         self.assertEqual(mod.check_tree(ROOT), [])
+
+
+class SuiteIntegrityTests(unittest.TestCase):
+    def test_mutation_cases_keep_their_outcome_assertions(self) -> None:
+        """Make deleting a mutation's only meaningful assertion turn RED."""
+
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        methods = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        mutation_names = {f"test_M{index}_" for index in range(1, 20)}
+        matched: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        for prefix in mutation_names:
+            candidates = [
+                (name, method) for name, method in methods.items() if name.startswith(prefix)
+            ]
+            self.assertEqual(len(candidates), 1, prefix)
+            name, method = candidates[0]
+            matched[name] = method
+
+        for name, method in matched.items():
+            calls = {
+                call.func.attr
+                for call in ast.walk(method)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            }
+            self.assertTrue(
+                {"assert_error", "assert_wiring_error"} & calls,
+                f"{name} has no semantic outcome assertion",
+            )
+
+        for name in {
+            "test_minimal_complete_registration_passes",
+            "test_complete_preflight_and_ci_wiring_passes",
+            "test_shipped_tree_is_registered_and_wired",
+        }:
+            method = methods[name]
+            calls = {
+                call.func.attr
+                for call in ast.walk(method)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            }
+            self.assertIn("assertEqual", calls, name)
 
 
 if __name__ == "__main__":

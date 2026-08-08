@@ -42511,3 +42511,19 @@ the guard's preflight/CI wiring is RED. The loader header now states explicitly
 that internal `Device::kNamedPlatform` is the stable public/wire value and name
 `2="cuda"`; behavior and ABI are unchanged. No GPU, model, benchmark or speed
 claim is involved; CUDA A/B remains pending.
+
+## 2026-08-08 — PR #139 registration guard follows configured semantics
+<!-- state: 2026-08-08T15:00 -->
+
+Mutation re-review proved the text scanner vacuous under five semantic deaths:
+the target in a CMake bracket comment, false conditional, or quoted string; the
+helper registration in a false conditional; and both CI commands behind `if
+false`. The checker now configures a disposable CPU-only project, reads CMake's
+File-API codemodel for the exact executable/source pair, and reads CTest JSON for
+the registered test. The CI half parses the dedicated YAML literal block into
+exact direct argv, rejecting control flow and inert quoted text. The expanded
+23-test suite makes all five survivors RED, pins every mutation case's outcome
+assertion, and preserves the original 15 cases. A fresh CPU Release `-Werror`
+configure exposes `test_device_selection` through both build-target help and
+CTest JSON, builds it, and runs the focused selector/platform/loader/C-ABI set
+4/4 green. No behavior, ABI, performance, model, GPU, or CUDA A/B claim changed.
