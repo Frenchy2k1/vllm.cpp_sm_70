@@ -26,6 +26,12 @@ namespace vllm {
 class GgufFile;
 class SafetensorsFile;
 struct ForwardLogits;
+// BACKEND-DISTRIBUTED-TP TP-W1: the per-rank tensor-parallel handle (comm +
+// rank), defined in tensor_parallel.h. Forward-declared so the shared registry
+// seam does not pull the TP/communicator headers; a LoadedModel carries an
+// optional BORROWED pointer to it, set only when tp_size>1 (null = single-GPU,
+// byte-identical).
+struct TensorParallel;
 struct GdnStateCache;
 struct PagedKvCache;
 struct Qwen3_5DenseWeights;
@@ -149,12 +155,23 @@ class LoadedModel {
   virtual std::unique_ptr<Qwen3_5MTPModel> BuildMtpDraft(
       const HfConfig& config) const;
 
+  // ── BACKEND-DISTRIBUTED-TP TP-W1: per-rank tensor-parallel handle ──────────
+  // The optional TP group (comm + rank) this model instance runs under. BORROWED
+  // (owned by the executor/runner for this instance's lifetime), set only when
+  // tp_size>1; null on the single-GPU path so tp-aware layers take the
+  // whole-tensor, byte-identical branch (tensor_parallel.h: null ⇒ tp_size()==1
+  // ⇒ every collective a no-op, parallel_state.py:638 bypass). Consumed by
+  // TP-W2's forward/loader plumbing; here it is the carrier only.
+  const TensorParallel* tensor_parallel() const { return tensor_parallel_; }
+  void set_tensor_parallel(const TensorParallel* tp) { tensor_parallel_ = tp; }
+
  protected:
   explicit LoadedModel(const ModelRegistration& registration)
       : registration_(registration) {}
 
  private:
   const ModelRegistration& registration_;
+  const TensorParallel* tensor_parallel_ = nullptr;
 };
 
 // MM-ENGINE-FORWARD: one multimodal (vision/audio-language) forward step's

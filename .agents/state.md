@@ -43299,3 +43299,26 @@ MLA no-factor-2 / hybrid-excludes-mamba / het-KV per-layer / divisor),
 `test_capi` 49/49 incl. v16 round-trip, `test_model_loader_gguf` 3/3, CPU build
 clean -Werror. M3 (the `gpu_memory_utilization` device profile run) stays
 dgx-gated; until it lands the util branch falls back to 256. Row `M1+M2 DONE`.
+
+## 2026-08-08 — TP-W1 LANDED: rank-layout group table (parallel_layout.h) + LoadedModel TP handle
+<!-- state: 2026-08-08T23:45 -->
+
+First tensor-parallelism implementation brick off the landed TP spike (#287,
+specs/tensor-parallelism-spike.md §S4). Ported vLLM's rank-layout math
+(`parallel_state.py:1718` initialize_model_parallel, :1784-1804
+`arange(world).reshape(external_dp, dp, pp, pcp, tp)` with TP innermost, TP
+group = `all_ranks.view(-1, tp)`) into `include/vllm/distributed/parallel_layout.h`:
+a general `AxisGroup` reshape-stride primitive (so PP/DP groups are mechanical),
+`TpGroup`/`AllTpGroups`, and thread-local current-rank accessors
+(`SetCurrentTensorParallel`/`CurrentTpRank`/`CurrentTpWorldSize`) — our
+thread-per-rank analog (spec S2a) of vLLM's process-global `get_tp_group`. Added
+a borrowed per-rank `TensorParallel*` to `LoadedModel` (forward-declared, default
+null = single-GPU byte-identical; consumed by TP-W2). Gate
+`tests/vllm/distributed/test_parallel_layout.cpp` 6/6·413: the group math == an
+INDEPENDENT explicit `arange().reshape()` oracle for a mixed
+EDP2×DP2×PP2×PCP1×TP2=16 layout AND TP∈{1,2,4,8}, plus tp=1 singleton-group
+inertness and thread_local isolation. No regression: existing `test_tp_forward`
+2/2·60 and `test_communicator` 8/8·50 unchanged (the LoadedModel field is
+additive/byte-neutral). Header-only, no CMake wiring beyond the test. Next: TP-W2
+(row/input-dim shard + rank-0 bias + per-rank Hq/Hkv + QKV kv-replication + vocab
+embed/lm_head + logits all-gather).
