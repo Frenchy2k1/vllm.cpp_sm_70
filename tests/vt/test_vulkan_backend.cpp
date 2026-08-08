@@ -991,6 +991,76 @@ TEST_CASE("a REFERENCE-TIER op drains the batch before it touches device memory"
   vk.DestroyQueue(q);
 }
 
+TEST_CASE("a RAGGED-M GEMM takes coopmat and is exact -- the shifted trailing tile") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  if (!ctx.coopmat_bf16_f32() || ctx.subgroup_size() != 32) return;  // scalar device
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // M = 17 IS THE SHAPE THAT COST A 100x. Prompt length gives m = tokens + 1, so
+  // every prefill M is one past a tile boundary: 513 % 16 == 1. The old predicate
+  // required m % 16 == 0, so every 27B prefill GEMM fell to the untiled scalar
+  // kernel -- measured at 99.9% of GPU time and ~96 GFLOP/s.
+  //
+  // The trailing tile now slides back to start at M-16, so it reads only real
+  // rows. Rows 1..15 are therefore computed TWICE, by both tiles, and this test
+  // exists to prove those duplicate writes are bit-identical rather than merely
+  // close: a row's result depends only on that row of A and on B.
+  constexpr int64_t kM = 17, kK = 32, kN = 32;
+
+  std::vector<uint16_t> a(kM * kK), b(kN * kK);
+  for (int64_t i = 0; i < kM * kK; ++i)
+    a[static_cast<size_t>(i)] = vt::F32ToBF16(0.5f * static_cast<float>((i % 7) - 3));
+  for (int64_t i = 0; i < kN * kK; ++i)
+    b[static_cast<size_t>(i)] = vt::F32ToBF16(0.25f * static_cast<float>((i % 5) - 2));
+
+  void* da = vk.Alloc(a.size() * sizeof(uint16_t));
+  void* db = vk.Alloc(b.size() * sizeof(uint16_t));
+  auto* dout = static_cast<float*>(vk.Alloc(kM * kN * sizeof(float)));
+  vk.Copy(q, da, a.data(), a.size() * sizeof(uint16_t));
+  vk.Copy(q, db, b.data(), b.size() * sizeof(uint16_t));
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {kM, kK});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {kN, kK});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {kM, kN});
+  vt::MatmulBT(q, to, ta, tb);
+  vk.Synchronize(q);
+
+  // THE TACTIC IS THE LOAD-BEARING ASSERTION. The scalar kernel is equally
+  // correct, so numbers alone cannot show that a ragged M now reaches the tensor
+  // cores -- which is the entire point of the change.
+  CHECK(ctx.PipelineExistsFor("vt_matmul_coopmat"));
+
+  std::vector<float> got(static_cast<size_t>(kM * kN));
+  vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+  vk.Synchronize(q);
+
+  // Exact against a host oracle in f64. Row 16 (only the shifted tile) and rows
+  // 1..15 (BOTH tiles) must agree; a wrong shift shows up as a wrong or
+  // duplicated row rather than as noise.
+  for (int64_t i = 0; i < kM; ++i) {
+    for (int64_t j = 0; j < kN; ++j) {
+      double acc = 0.0;
+      for (int64_t c = 0; c < kK; ++c) {
+        acc += static_cast<double>(vt::BF16ToF32(a[static_cast<size_t>(i * kK + c)])) *
+               static_cast<double>(vt::BF16ToF32(b[static_cast<size_t>(j * kK + c)]));
+      }
+      CAPTURE(i);
+      CAPTURE(j);
+      CHECK(got[static_cast<size_t>(i * kN + j)] ==
+            doctest::Approx(static_cast<float>(acc)).epsilon(1e-3));
+    }
+  }
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
 TEST_CASE("Vulkan float-controls are PROBED and reported, not assumed") {
   if (!VulkanPresent()) return;
   // The relaxed-precision knobs Vulkan leaves implementation-defined. We cannot
