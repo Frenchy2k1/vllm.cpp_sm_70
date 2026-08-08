@@ -40,8 +40,6 @@ namespace vllm::entrypoints {
 
 namespace fs = std::filesystem;
 
-namespace {
-
 // `architecture` is the model's registered architecture string. It is what lets
 // a PARTIAL backend decline a model whose kernels it has not registered, instead
 // of being selected and then failing deep inside a kernel bind. Empty means "no
@@ -54,7 +52,8 @@ namespace {
 // a failure to serve the named device PROPAGATES instead of falling back to
 // CPU (mirror of vLLM never substituting an explicitly named device,
 // vllm/config/device.py:61-66).
-vt::Queue SelectQueue(std::string_view architecture, vllm::Device device) {
+vt::Queue SelectQueueForModel(std::string_view architecture,
+                              vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(device));
@@ -99,6 +98,8 @@ vt::Queue SelectQueue(std::string_view architecture, vllm::Device device) {
   }
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
+
+namespace {
 
 bool DirectDeviceLoadRequested() {
   const char* release = std::getenv("VT_RELEASE_HOST_WEIGHTS");
@@ -704,8 +705,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
       runner_(config_, *model_, kv_cfg_,
               preselected_queue != nullptr
                   ? *preselected_queue
-                  : SelectQueue(model_->registration().architecture,
-                                params.device),
+                  : SelectQueueForModel(model_->registration().architecture,
+                                        params.device),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
@@ -876,9 +877,9 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // (vllm/engine/arg_utils.py:1878 builds DeviceConfig first;
   // device.py __post_init__ resolves immediately). An explicitly named absent
   // device therefore fails HERE, loudly, and is never masked by a later
-  // path/tokenizer error. The result is discarded: SelectQueue re-runs the
-  // SAME ResolveExplicitDeviceType when it actually creates the queue, so the
-  // policy has exactly one owner.
+  // path/tokenizer error. The result is discarded: SelectQueueForModel re-runs
+  // the SAME ResolveExplicitDeviceType when it actually creates the queue, so
+  // the policy has exactly one owner.
   if (params.device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(params.device));
@@ -1071,7 +1072,8 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // Select before loading so an eligible discrete-CUDA dense loader stages each
   // completed layer to the exact queue the runner will use. If construction
   // fails before the runner takes over, destroy the selected native stream.
-  vt::Queue load_queue = SelectQueue(registration.architecture, params.device);
+  vt::Queue load_queue =
+      SelectQueueForModel(registration.architecture, params.device);
   try {
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
