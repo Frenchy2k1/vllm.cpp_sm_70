@@ -16,6 +16,7 @@
 // cross-backend oracle in the project.
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -56,7 +57,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 22);
+  CHECK(n == 24);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -75,7 +76,9 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
                            // BACKEND-VULKAN-GDN: the GDN / conv1d glue family.
                            "vt_causal_conv1d_update", "vt_gdn_post_conv",
                            "vt_gdn_state_gather", "vt_gdn_state_scatter",
-                           "vt_rms_norm_gated", "vt_sigmoid_gate_bf16"}) {
+                           "vt_rms_norm_gated", "vt_sigmoid_gate_bf16",
+                           // BACKEND-VULKAN-GDN-CORE: the two recurrences.
+                           "vt_gdn_prefill", "vt_gdn_decode"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -166,6 +169,16 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // a_log and dt_bias are f32 by contract and are therefore NOT axes.
       REQUIRE(m.spec_id_count == 3);
       for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_gdn_prefill") == 0 ||
+               std::strcmp(m.name, "vt_gdn_decode") == 0) {
+      // The shared q/k/v dtype and the out dtype. TWO, not four: g, beta and the
+      // state are f32 by contract (a compressed state is CUDA-only,
+      // src/vt/ops.cpp:1631-1638) and the host DECLINES a call whose q/k/v
+      // disagree, so a third dtype constant here would mean the shader had grown
+      // past what the op promises. Both modules assert the same list because they
+      // share one step body (vt_gdn_recurrence.glsl) and must stay in lockstep.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else {
       CHECK(m.spec_id_count == 0);
     }
@@ -402,7 +415,11 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       // GDN hybrid (Qwen3.6-27B) hits on every step.
                       vt::OpId::kSigmoidGateBf16, vt::OpId::kRmsNormGated,
                       vt::OpId::kGdnStateGather, vt::OpId::kGdnStateScatter,
-                      vt::OpId::kCausalConv1dUpdate, vt::OpId::kGdnPostConv}) {
+                      vt::OpId::kCausalConv1dUpdate, vt::OpId::kGdnPostConv,
+                      // BACKEND-VULKAN-GDN-CORE: the two gated-delta recurrences
+                      // themselves, which are where a GDN hybrid's prefill time
+                      // actually was.
+                      vt::OpId::kGdnPrefill, vt::OpId::kGdnDecode}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // No NATIVE Vulkan kernel yet for the rotary TABLE BUILD (kRopeCosSinCache and
@@ -410,15 +427,11 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   // portable tier, mirroring vLLM's own split), quant, MoE, or the sampler beyond
   // greedy argmax.
   //
-  // kGdnPrefill / kGdnDecode are ALSO deliberately absent and stay listed here:
-  // they are the chunked gated-delta recurrences, the model's linear-attention
-  // core rather than glue, and BACKEND-VULKAN-GDN scoped them out rather than
-  // ship them unverified. kCausalConv1dFwd (the prefill conv) is out for a
-  // narrower reason -- its state write-back needs a different dispatch shape than
-  // the decode update, see src/vt/vulkan/vulkan_ops.cpp.
+  // kCausalConv1dFwd (the prefill conv) is out for a narrower reason -- its state
+  // write-back needs a different dispatch shape than the decode update, see
+  // src/vt/vulkan/vulkan_ops.cpp.
   for (vt::OpId op : {vt::OpId::kRopeNeox, vt::OpId::kRopeCosSinCache,
                       vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK,
-                      vt::OpId::kGdnPrefill, vt::OpId::kGdnDecode,
                       vt::OpId::kCausalConv1dFwd}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
@@ -1538,6 +1551,426 @@ TEST_CASE("the fused GDN post-conv preamble runs NATIVELY on Vulkan, all five ou
   compare("v_out", vvo, cvo, kT * kValDim);
   compare("g_out", vgo, cgo, kT * kHv);
   compare("beta_out", vbo, cbo, kT * kHv);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+// ===========================================================================
+// BACKEND-VULKAN-GDN-CORE — the two gated-delta RECURRENCES.
+//
+// Same contract as the glue gates above: the oracle is our own CPU backend in
+// the same binary, and every case asserts the MECHANISM as well as the numbers,
+// because on this unified-memory device an unregistered op resolves to the CPU
+// reference tier and returns answers IDENTICAL to the oracle.
+//
+// THE SHAPES ARE CHOSEN AGAINST THE TILE GEOMETRY, not for roundness
+// (src/vt/vulkan/shaders/vt_gdn_recurrence.glsl: BV=16 state rows per workgroup,
+// NW=8 lanes cooperating on each):
+//   Dv = 19  -> ceil(19/16) = 2 value tiles and the second has only 3 valid rows,
+//               so the tile tail's zero-fill and the guarded store-back both run;
+//   Dk = 20  -> ceil(20/8) = 3 columns per lane, and lane 7's slice starts PAST
+//               the end (c1 < c0), so a lane contributing an EMPTY partial to the
+//               row reduction still has to reach every barrier;
+//   Hv/Hk = 6/2 -> a GQA broadcast ratio of 3, not 1.
+// A shape that was a multiple of everything would pass with all three wrong.
+// ===========================================================================
+namespace {
+
+constexpr int64_t kGdnHk = 2, kGdnHv = 6, kGdnDk = 20, kGdnDv = 19;
+
+// g is a LOG decay and beta a gate in (0,1). Feeding the raw spread would make
+// exp(g) > 1 and GROW the carried state instead of contracting it, which is the
+// opposite of the regime the recurrence runs in — and would let a sign error in
+// the decay hide inside a plausible-looking NMSE.
+std::vector<float> GdnDecays(size_t n, uint32_t seed) {
+  std::vector<float> v = Spread(n, 2.0f, seed);
+  for (float& x : v) x = -std::fabs(x);
+  return v;
+}
+std::vector<float> GdnBetas(size_t n, uint32_t seed) {
+  std::vector<float> v = Spread(n, 3.0f, seed);
+  for (float& x : v) x = 1.0f / (1.0f + std::exp(-x));
+  return v;
+}
+
+std::vector<uint16_t> ToBf16(const std::vector<float>& v) {
+  std::vector<uint16_t> o(v.size());
+  for (size_t i = 0; i < v.size(); ++i) o[i] = vt::F32ToBF16(v[i]);
+  return o;
+}
+
+}  // namespace
+
+TEST_CASE("the GDN PREFILL recurrence runs NATIVELY on Vulkan and matches the CPU oracle") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // Three sequences of lengths 5, 0 and 3. The EMPTY one is the interesting case:
+  // its workgroups must stage their state tile, run no steps, and write it back
+  // UNCHANGED — the CPU reference's `for (t = qslp[s]; t < qslp[s+1]; ...)`.
+  constexpr int64_t kN = 3, kT = 8;
+  const std::vector<int32_t> qsl = {0, 5, 5, 8};
+  constexpr int64_t kQk = kT * kGdnHk * kGdnDk;
+  constexpr int64_t kVo = kT * kGdnHv * kGdnDv;
+  constexpr int64_t kGb = kT * kGdnHv;
+  constexpr int64_t kRowElems = kGdnHv * kGdnDv * kGdnDk;
+  constexpr int64_t kSt = kN * kRowElems;
+
+  const std::vector<float> qv = Spread(kQk, 1.0f, 101u);
+  const std::vector<float> kv = Spread(kQk, 1.0f, 103u);
+  const std::vector<float> vv = Spread(kVo, 2.0f, 107u);
+  const std::vector<float> gv = GdnDecays(kGb, 109u);
+  const std::vector<float> bv = GdnBetas(kGb, 113u);
+  const std::vector<float> s0 = Spread(kSt, 0.5f, 127u);
+
+  vt::GdnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(kGdnDk));
+
+  Buf vqb(vk, kQk, 4), vkb(vk, kQk, 4), vvb(vk, kVo, 4), vob(vk, kVo, 4);
+  Buf vgb(vk, kGb, 4), vbb(vk, kGb, 4), vsb(vk, kSt, 4), vlb(vk, kN + 1, 4);
+  Buf cqb(cpu, kQk, 4), ckb(cpu, kQk, 4), cvb(cpu, kVo, 4), cob(cpu, kVo, 4);
+  Buf cgb(cpu, kGb, 4), cbb(cpu, kGb, 4), csb(cpu, kSt, 4), clb(cpu, kN + 1, 4);
+
+  vk.Copy(vq, vqb.p(), qv.data(), kQk * 4);
+  vk.Copy(vq, vkb.p(), kv.data(), kQk * 4);
+  vk.Copy(vq, vvb.p(), vv.data(), kVo * 4);
+  vk.Copy(vq, vgb.p(), gv.data(), kGb * 4);
+  vk.Copy(vq, vbb.p(), bv.data(), kGb * 4);
+  vk.Copy(vq, vsb.p(), s0.data(), kSt * 4);
+  vk.Copy(vq, vlb.p(), qsl.data(), (kN + 1) * 4);
+  std::memcpy(cqb.p(), qv.data(), kQk * 4);
+  std::memcpy(ckb.p(), kv.data(), kQk * 4);
+  std::memcpy(cvb.p(), vv.data(), kVo * 4);
+  std::memcpy(cgb.p(), gv.data(), kGb * 4);
+  std::memcpy(cbb.p(), bv.data(), kGb * 4);
+  std::memcpy(csb.p(), s0.data(), kSt * 4);
+  std::memcpy(clb.p(), qsl.data(), (kN + 1) * 4);
+  vk.Synchronize(vq);
+
+  auto qk_t = [](void* p, Device dev, vt::DType dt) {
+    return Tensor::Contiguous(p, dt, dev, {kT, kGdnHk, kGdnDk});
+  };
+  auto vo_t = [](void* p, Device dev, vt::DType dt) {
+    return Tensor::Contiguous(p, dt, dev, {kT, kGdnHv, kGdnDv});
+  };
+  auto gb_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kGdnHv});
+  };
+  auto st_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kN, kGdnHv, kGdnDv, kGdnDk});
+  };
+
+  Tensor vqt = qk_t(vqb.p(), vd, vt::DType::kF32), vkt = qk_t(vkb.p(), vd, vt::DType::kF32);
+  Tensor vvt = vo_t(vvb.p(), vd, vt::DType::kF32), vot = vo_t(vob.p(), vd, vt::DType::kF32);
+  Tensor vgt = gb_t(vgb.p(), vd), vbt = gb_t(vbb.p(), vd), vst = st_t(vsb.p(), vd);
+  Tensor vlt = Tensor::Contiguous(vlb.p(), vt::DType::kI32, vd, {kN + 1});
+  Tensor cqt = qk_t(cqb.p(), cd, vt::DType::kF32), ckt = qk_t(ckb.p(), cd, vt::DType::kF32);
+  Tensor cvt = vo_t(cvb.p(), cd, vt::DType::kF32), cot = vo_t(cob.p(), cd, vt::DType::kF32);
+  Tensor cgt = gb_t(cgb.p(), cd), cbt = gb_t(cbb.p(), cd), cst = st_t(csb.p(), cd);
+  Tensor clt = Tensor::Contiguous(clb.p(), vt::DType::kI32, cd, {kN + 1});
+
+  vt::GdnPrefill(cq, cot, cqt, ckt, cvt, cgt, cbt, cst, clt, args);
+  vt::GdnPrefill(vq, vot, vqt, vkt, vvt, vgt, vbt, vst, vlt, args);
+  vk.Synchronize(vq);
+
+  CHECK(ctx.PipelineExistsFor("vt_gdn_prefill"));
+  CHECK(RanNative(vt::OpId::kGdnPrefill));
+
+  std::vector<float> got_out(kVo), got_state(kSt);
+  vk.Copy(vq, got_out.data(), vob.p(), kVo * 4);
+  vk.Copy(vq, got_state.data(), vsb.p(), kSt * 4);
+  vk.Synchronize(vq);
+  const std::vector<float> ref_out(cob.as<float>(), cob.as<float>() + kVo);
+  const std::vector<float> ref_state(csb.as<float>(), csb.as<float>() + kSt);
+  const double nmse_out = NmseOf(ref_out, got_out);
+  const double nmse_state = NmseOf(ref_state, got_state);
+  MESSAGE("gdn_prefill out NMSE vs the CPU oracle: " << nmse_out);
+  MESSAGE("gdn_prefill CARRIED STATE NMSE vs the CPU oracle: " << nmse_state);
+  CHECK(nmse_out <= kGdnNmseTol);
+  // The state is asserted SEPARATELY from the output because it is the part that
+  // carries: a kernel that decayed correctly but wrote its tile back to the wrong
+  // rows would still produce a plausible `out`.
+  CHECK(nmse_state <= kGdnNmseTol);
+
+  // Sequence 1 is EMPTY, so its state block must come back BIT-IDENTICAL to what
+  // it went in as — not merely close. This catches a store-back that wrote a
+  // decayed or zeroed tile for a zero-length token range.
+  CHECK(std::memcmp(got_state.data() + kRowElems, s0.data() + kRowElems,
+                    static_cast<size_t>(kRowElems) * 4) == 0);
+
+  // --- bf16 arm: proof the dtype specialization actually engaged --------------
+  // The numbers alone would not prove it. The shader's DEFAULT specialization is
+  // f32/f32, so a silently-ignored VkSpecializationMapEntry would read bf16 bytes
+  // as f32 — the exact failure this backend's spec-id bookkeeping exists for — and
+  // a NEW pipeline appearing in the cache is what says the value was bound.
+  const size_t pipelines_before = ctx.PipelineCacheSize();
+  const std::vector<uint16_t> q16 = ToBf16(qv), k16 = ToBf16(kv), v16 = ToBf16(vv);
+  Buf vq16(vk, kQk, 2), vk16(vk, kQk, 2), vv16(vk, kVo, 2), vo16(vk, kVo, 2);
+  Buf cq16(cpu, kQk, 2), ck16(cpu, kQk, 2), cv16(cpu, kVo, 2), co16(cpu, kVo, 2);
+  vk.Copy(vq, vq16.p(), q16.data(), kQk * 2);
+  vk.Copy(vq, vk16.p(), k16.data(), kQk * 2);
+  vk.Copy(vq, vv16.p(), v16.data(), kVo * 2);
+  vk.Copy(vq, vsb.p(), s0.data(), kSt * 4);  // reset the carried state
+  std::memcpy(cq16.p(), q16.data(), kQk * 2);
+  std::memcpy(ck16.p(), k16.data(), kQk * 2);
+  std::memcpy(cv16.p(), v16.data(), kVo * 2);
+  std::memcpy(csb.p(), s0.data(), kSt * 4);
+  vk.Synchronize(vq);
+
+  Tensor vq16t = qk_t(vq16.p(), vd, vt::DType::kBF16);
+  Tensor vk16t = qk_t(vk16.p(), vd, vt::DType::kBF16);
+  Tensor vv16t = vo_t(vv16.p(), vd, vt::DType::kBF16);
+  Tensor vo16t = vo_t(vo16.p(), vd, vt::DType::kBF16);
+  Tensor cq16t = qk_t(cq16.p(), cd, vt::DType::kBF16);
+  Tensor ck16t = qk_t(ck16.p(), cd, vt::DType::kBF16);
+  Tensor cv16t = vo_t(cv16.p(), cd, vt::DType::kBF16);
+  Tensor co16t = vo_t(co16.p(), cd, vt::DType::kBF16);
+
+  vt::GdnPrefill(cq, co16t, cq16t, ck16t, cv16t, cgt, cbt, cst, clt, args);
+  vt::GdnPrefill(vq, vo16t, vq16t, vk16t, vv16t, vgt, vbt, vst, vlt, args);
+  vk.Synchronize(vq);
+  CHECK(ctx.PipelineCacheSize() == pipelines_before + 1);
+
+  std::vector<uint16_t> got16(kVo);
+  vk.Copy(vq, got16.data(), vo16.p(), kVo * 2);
+  vk.Synchronize(vq);
+  std::vector<float> got16_f(kVo), ref16_f(kVo);
+  for (int64_t i = 0; i < kVo; ++i) {
+    got16_f[i] = vt::BF16ToF32(got16[i]);
+    ref16_f[i] = vt::BF16ToF32(co16.as<uint16_t>()[i]);
+  }
+  const double nmse16 = NmseOf(ref16_f, got16_f);
+  MESSAGE("gdn_prefill out NMSE (bf16 q/k/v and bf16 out): " << nmse16);
+  CHECK(nmse16 <= kGdnNmseTol);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("the GDN DECODE recurrence runs NATIVELY on Vulkan, indexed and compact") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // The cache has MORE rows than the batch and the indices are scrambled, so a
+  // kernel that used the token index as its state row would pass a
+  // batch-rows-only test and corrupt this one. Index 1 is NEGATIVE — fla's NULL
+  // block — whose output row must come back ZEROED.
+  constexpr int64_t kBatch = 5, kSlots = 7;
+  const std::vector<int32_t> idx = {3, -1, 0, 6, 1};
+  constexpr int64_t kQk = kBatch * kGdnHk * kGdnDk;
+  constexpr int64_t kVo = kBatch * kGdnHv * kGdnDv;
+  constexpr int64_t kGb = kBatch * kGdnHv;
+  constexpr int64_t kRowElems = kGdnHv * kGdnDv * kGdnDk;
+  constexpr int64_t kSt = kSlots * kRowElems;
+
+  const std::vector<float> qv = Spread(kQk, 1.0f, 211u);
+  const std::vector<float> kv = Spread(kQk, 1.0f, 223u);
+  const std::vector<float> vv = Spread(kVo, 2.0f, 227u);
+  const std::vector<float> gv = GdnDecays(kGb, 229u);
+  const std::vector<float> bv = GdnBetas(kGb, 233u);
+  const std::vector<float> s0 = Spread(kSt, 0.5f, 239u);
+
+  vt::GdnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(kGdnDk));
+
+  Buf vqb(vk, kQk, 4), vkb(vk, kQk, 4), vvb(vk, kVo, 4), vob(vk, kVo, 4);
+  Buf vgb(vk, kGb, 4), vbb(vk, kGb, 4), vsb(vk, kSt, 4), vib(vk, kBatch, 4);
+  Buf cqb(cpu, kQk, 4), ckb(cpu, kQk, 4), cvb(cpu, kVo, 4), cob(cpu, kVo, 4);
+  Buf cgb(cpu, kGb, 4), cbb(cpu, kGb, 4), csb(cpu, kSt, 4), cib(cpu, kBatch, 4);
+
+  vk.Copy(vq, vqb.p(), qv.data(), kQk * 4);
+  vk.Copy(vq, vkb.p(), kv.data(), kQk * 4);
+  vk.Copy(vq, vvb.p(), vv.data(), kVo * 4);
+  vk.Copy(vq, vgb.p(), gv.data(), kGb * 4);
+  vk.Copy(vq, vbb.p(), bv.data(), kGb * 4);
+  vk.Copy(vq, vsb.p(), s0.data(), kSt * 4);
+  vk.Copy(vq, vib.p(), idx.data(), kBatch * 4);
+  std::memcpy(cqb.p(), qv.data(), kQk * 4);
+  std::memcpy(ckb.p(), kv.data(), kQk * 4);
+  std::memcpy(cvb.p(), vv.data(), kVo * 4);
+  std::memcpy(cgb.p(), gv.data(), kGb * 4);
+  std::memcpy(cbb.p(), bv.data(), kGb * 4);
+  std::memcpy(csb.p(), s0.data(), kSt * 4);
+  std::memcpy(cib.p(), idx.data(), kBatch * 4);
+  vk.Synchronize(vq);
+
+  auto qk_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kBatch, kGdnHk, kGdnDk});
+  };
+  auto vo_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kBatch, kGdnHv, kGdnDv});
+  };
+  auto gb_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kBatch, kGdnHv});
+  };
+  auto st_t = [](void* p, Device dev, int64_t rows) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {rows, kGdnHv, kGdnDv, kGdnDk});
+  };
+
+  Tensor vqt = qk_t(vqb.p(), vd), vkt = qk_t(vkb.p(), vd);
+  Tensor vvt = vo_t(vvb.p(), vd), vot = vo_t(vob.p(), vd);
+  Tensor vgt = gb_t(vgb.p(), vd), vbt = gb_t(vbb.p(), vd);
+  Tensor vst = st_t(vsb.p(), vd, kSlots);
+  Tensor vit = Tensor::Contiguous(vib.p(), vt::DType::kI32, vd, {kBatch});
+  Tensor cqt = qk_t(cqb.p(), cd), ckt = qk_t(ckb.p(), cd);
+  Tensor cvt = vo_t(cvb.p(), cd), cot = vo_t(cob.p(), cd);
+  Tensor cgt = gb_t(cgb.p(), cd), cbt = gb_t(cbb.p(), cd);
+  Tensor cst = st_t(csb.p(), cd, kSlots);
+  Tensor cit = Tensor::Contiguous(cib.p(), vt::DType::kI32, cd, {kBatch});
+
+  vt::GdnDecode(cq, cot, cqt, ckt, cvt, cgt, cbt, cst, args, &cit);
+  vt::GdnDecode(vq, vot, vqt, vkt, vvt, vgt, vbt, vst, args, &vit);
+  vk.Synchronize(vq);
+
+  CHECK(ctx.PipelineExistsFor("vt_gdn_decode"));
+  CHECK(RanNative(vt::OpId::kGdnDecode));
+
+  std::vector<float> got_out(kVo), got_state(kSt);
+  vk.Copy(vq, got_out.data(), vob.p(), kVo * 4);
+  vk.Copy(vq, got_state.data(), vsb.p(), kSt * 4);
+  vk.Synchronize(vq);
+  const std::vector<float> ref_out(cob.as<float>(), cob.as<float>() + kVo);
+  const std::vector<float> ref_state(csb.as<float>(), csb.as<float>() + kSt);
+  const double nmse_out = NmseOf(ref_out, got_out);
+  const double nmse_state = NmseOf(ref_state, got_state);
+  MESSAGE("gdn_decode (indexed cache) out NMSE vs the CPU oracle: " << nmse_out);
+  MESSAGE("gdn_decode (indexed cache) CACHE NMSE vs the CPU oracle: " << nmse_state);
+  CHECK(nmse_out <= kGdnNmseTol);
+  CHECK(nmse_state <= kGdnNmseTol);
+
+  // The NULL block's output row is asserted DIRECTLY: if both kernels wrongly ran
+  // the recurrence for it, the comparison above would still be green.
+  bool null_row_zero = true;
+  for (int64_t e = 0; e < kGdnHv * kGdnDv; ++e) {
+    if (got_out[kGdnHv * kGdnDv + e] != 0.0f) null_row_zero = false;
+  }
+  CHECK(null_row_zero);
+  // Cache slots 2, 4 and 5 are named by no index and must still hold their
+  // ORIGINAL bytes — proof the indirection wrote only where it was told to.
+  for (int64_t slot : {2, 4, 5}) {
+    CAPTURE(slot);
+    CHECK(std::memcmp(got_state.data() + slot * kRowElems, s0.data() + slot * kRowElems,
+                      static_cast<size_t>(kRowElems) * 4) == 0);
+  }
+
+  // --- the COMPACT path: no state_idx, one state row per token ----------------
+  Buf vsc(vk, kBatch * kRowElems, 4), csc(cpu, kBatch * kRowElems, 4);
+  vk.Copy(vq, vsc.p(), s0.data(), kBatch * kRowElems * 4);
+  std::memcpy(csc.p(), s0.data(), kBatch * kRowElems * 4);
+  vk.Synchronize(vq);
+  Tensor vsct = st_t(vsc.p(), vd, kBatch), csct = st_t(csc.p(), cd, kBatch);
+  vt::GdnDecode(cq, cot, cqt, ckt, cvt, cgt, cbt, csct, args, nullptr);
+  vt::GdnDecode(vq, vot, vqt, vkt, vvt, vgt, vbt, vsct, args, nullptr);
+  vk.Synchronize(vq);
+
+  std::vector<float> got_c(kVo), got_sc(kBatch * kRowElems);
+  vk.Copy(vq, got_c.data(), vob.p(), kVo * 4);
+  vk.Copy(vq, got_sc.data(), vsc.p(), kBatch * kRowElems * 4);
+  vk.Synchronize(vq);
+  const std::vector<float> ref_c(cob.as<float>(), cob.as<float>() + kVo);
+  const std::vector<float> ref_sc(csc.as<float>(), csc.as<float>() + kBatch * kRowElems);
+  const double nmse_c = NmseOf(ref_c, got_c);
+  MESSAGE("gdn_decode (compact state) out NMSE vs the CPU oracle: " << nmse_c);
+  CHECK(nmse_c <= kGdnNmseTol);
+  CHECK(NmseOf(ref_sc, got_sc) <= kGdnNmseTol);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("a GDN recurrence wider than the shared tile DECLINES to the reference tier") {
+  if (!VulkanPresent()) return;
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // Dk = 132 is past VT_GDN_MAX_DK, so the [BV,Dk] tile would not fit Vulkan's
+  // GUARANTEED 16 KB of shared memory. The kernel must forward through the
+  // provider seam rather than throw or index past the array: declining preserves a
+  // capability the reference tier already had, which is what GetOpFallback is for.
+  // Asserted through the DECLINE COUNTER, because `last_selected` still names
+  // vt-native — the native provider WAS selected, and then forwarded.
+  constexpr int64_t kN = 1, kT = 2, kHk = 1, kHv = 1, kDk = 132, kDv = 4;
+  constexpr int64_t kQk = kT * kHk * kDk, kVo = kT * kHv * kDv, kGb = kT * kHv;
+  constexpr int64_t kSt = kN * kHv * kDv * kDk;
+  const std::vector<int32_t> qsl = {0, 2};
+  const std::vector<float> qv = Spread(kQk, 1.0f, 307u), kv = Spread(kQk, 1.0f, 311u);
+  const std::vector<float> vv = Spread(kVo, 2.0f, 313u);
+  const std::vector<float> gv = GdnDecays(kGb, 317u), bv = GdnBetas(kGb, 331u);
+  const std::vector<float> s0 = Spread(kSt, 0.5f, 337u);
+  vt::GdnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(kDk));
+
+  Buf vqb(vk, kQk, 4), vkb(vk, kQk, 4), vvb(vk, kVo, 4), vob(vk, kVo, 4);
+  Buf vgb(vk, kGb, 4), vbb(vk, kGb, 4), vsb(vk, kSt, 4), vlb(vk, kN + 1, 4);
+  Buf cqb(cpu, kQk, 4), ckb(cpu, kQk, 4), cvb(cpu, kVo, 4), cob(cpu, kVo, 4);
+  Buf cgb(cpu, kGb, 4), cbb(cpu, kGb, 4), csb(cpu, kSt, 4), clb(cpu, kN + 1, 4);
+  vk.Copy(vq, vqb.p(), qv.data(), kQk * 4);
+  vk.Copy(vq, vkb.p(), kv.data(), kQk * 4);
+  vk.Copy(vq, vvb.p(), vv.data(), kVo * 4);
+  vk.Copy(vq, vgb.p(), gv.data(), kGb * 4);
+  vk.Copy(vq, vbb.p(), bv.data(), kGb * 4);
+  vk.Copy(vq, vsb.p(), s0.data(), kSt * 4);
+  vk.Copy(vq, vlb.p(), qsl.data(), (kN + 1) * 4);
+  std::memcpy(cqb.p(), qv.data(), kQk * 4);
+  std::memcpy(ckb.p(), kv.data(), kQk * 4);
+  std::memcpy(cvb.p(), vv.data(), kVo * 4);
+  std::memcpy(cgb.p(), gv.data(), kGb * 4);
+  std::memcpy(cbb.p(), bv.data(), kGb * 4);
+  std::memcpy(csb.p(), s0.data(), kSt * 4);
+  std::memcpy(clb.p(), qsl.data(), (kN + 1) * 4);
+  vk.Synchronize(vq);
+
+  auto qk_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHk, kDk});
+  };
+  auto vo_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHv, kDv});
+  };
+  auto gb_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHv});
+  };
+  auto st_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kN, kHv, kDv, kDk});
+  };
+  Tensor vqt = qk_t(vqb.p(), vd), vkt = qk_t(vkb.p(), vd);
+  Tensor vvt = vo_t(vvb.p(), vd), vot = vo_t(vob.p(), vd);
+  Tensor vgt = gb_t(vgb.p(), vd), vbt = gb_t(vbb.p(), vd), vst = st_t(vsb.p(), vd);
+  Tensor vlt = Tensor::Contiguous(vlb.p(), vt::DType::kI32, vd, {kN + 1});
+  Tensor cqt = qk_t(cqb.p(), cd), ckt = qk_t(ckb.p(), cd);
+  Tensor cvt = vo_t(cvb.p(), cd), cot = vo_t(cob.p(), cd);
+  Tensor cgt = gb_t(cgb.p(), cd), cbt = gb_t(cbb.p(), cd), cst = st_t(csb.p(), cd);
+  Tensor clt = Tensor::Contiguous(clb.p(), vt::DType::kI32, cd, {kN + 1});
+
+  const auto before = vt::GetOpProviderStats(vt::OpId::kGdnPrefill, DeviceType::kVULKAN);
+  CHECK_NOTHROW(vt::GdnPrefill(vq, vot, vqt, vkt, vvt, vgt, vbt, vst, vlt, args));
+  vk.Synchronize(vq);
+  const auto after = vt::GetOpProviderStats(vt::OpId::kGdnPrefill, DeviceType::kVULKAN);
+  CHECK(after.declines == before.declines + 1);
+
+  // And it still computed the right answer on the tier it forwarded to — BIT-EXACT
+  // this time, because the same host code ran both sides.
+  vt::GdnPrefill(cq, cot, cqt, ckt, cvt, cgt, cbt, cst, clt, args);
+  std::vector<float> got(kVo);
+  vk.Copy(vq, got.data(), vob.p(), kVo * 4);
+  vk.Synchronize(vq);
+  CHECK(std::memcmp(got.data(), cob.p(), static_cast<size_t>(kVo) * 4) == 0);
 
   vk.DestroyQueue(vq);
   cpu.DestroyQueue(cq);

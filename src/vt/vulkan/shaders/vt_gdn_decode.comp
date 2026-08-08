@@ -1,0 +1,96 @@
+#version 450
+// vt::GdnDecode (kGdnDecode) — ONE gated-delta step per batch token. Ported 1:1
+// from src/vt/cpu/cpu_ops.cpp:1368-1396 GdnDecodeKernel for the semantics, and
+// from src/vt/cuda/cuda_gdn.cu:2417-2503 GdnDecodeFusedKernel for the shape; the
+// step body and the shared-memory state tiling live in vt_gdn_recurrence.glsl,
+// which cites both.
+//
+// This is the SAME shader as vt_gdn_prefill with the token loop collapsed to one
+// iteration, which is not a coincidence: the CPU kernels differ only in their
+// parallel axis (batch here, (sequence, value-head) there) and in the state-row
+// indirection below. The recurrence carries nothing across tokens at T==1, so the
+// tile's coalesced load/store pair brackets a single step — exactly CUDA's fused
+// decode kernel.
+//
+// state_idx (fla ssm_state_indices, cuda_gdn.cu:2432-2443): when present the
+// block reads and writes persistent-cache row state_idx[i_n] rather than row
+// i_n. A NEGATIVE index is fla's NULL block: zero the output row and skip. The
+// UPPER bound is guarded here too, which CUDA does not do, for the reason
+// vt_gdn_state_gather.comp states: the CPU's host-side range VT_CHECK would need
+// a host read of device memory, which on this backend means draining the dispatch
+// batch on every call, so the device analogue is a guard that writes nothing
+// wild. i_n is fixed by the workgroup id, so the branch is UNIFORM and taking it
+// before any barrier is safe.
+//
+// EXPECT NO LARGE DECODE WIN FROM THIS. Batch-1 decode of a 27B model is
+// weight-bandwidth bound, not recurrence bound; this kernel exists so the op
+// leaves the host reference tier and so the whole GDN block runs on one device,
+// not because the recurrence was the decode cost.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// IDENTICAL BINDINGS TO vt_gdn_prefill, and that is a requirement rather than a
+// tidiness: GLSL functions cannot take buffer blocks as parameters, so the shared
+// step in vt_gdn_recurrence.glsl names these instances directly.
+layout(binding = 0) readonly buffer Qb32 { uint v[]; } Q32;   // q [T,Hk,Dk]
+layout(binding = 1) readonly buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 2) readonly buffer Kb32 { uint v[]; } K32;   // k [T,Hk,Dk]
+layout(binding = 3) readonly buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 4) readonly buffer Vb32 { uint v[]; } V32;   // v [T,Hv,Dv]
+layout(binding = 5) readonly buffer Vb16 { uint16_t v[]; } V16;
+layout(binding = 6) buffer Ob32 { uint v[]; } O32;            // out [T,Hv,Dv]
+layout(binding = 7) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 8) readonly buffer Gb { uint v[]; } G;       // g [T,Hv], f32
+layout(binding = 9) readonly buffer Eb { uint v[]; } BETA;    // beta [T,Hv], f32
+layout(binding = 10) buffer Sb { uint v[]; } S;               // state [N,Hv,Dv,Dk], f32
+// state_idx [T], i32. Aliases the state buffer when the caller passed none
+// (p.has_idx == 0) — a descriptor a shader statically uses must be valid even on
+// the path that never reads it, the same arrangement vt_gdn_state_gather uses for
+// its optional has_initial_state.
+layout(binding = 11) readonly buffer Mb { uint v[]; } IDX;
+
+layout(constant_id = 0) const uint VT_PC_QKV_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PC_OUT_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint hk, dk, hv, dv;
+  uint nv;            // value tiles per (token, head): ceil(Dv / VT_GDN_BV)
+  uint ratio;         // Hv / Hk, the GQA broadcast
+  uint has_idx;       // 1 => the state row is IDX[i_n], else i_n
+  uint n_state_rows;  // state.shape[0], for the bounds guard
+  uint q_off, k_off, v_off, out_off, g_off, beta_off, state_off, meta_off;
+  float scale;
+} p;
+
+#include "vt_gdn_recurrence.glsl"
+
+void main() {
+  uint wg = gl_WorkGroupID.x;
+  uint i_v = wg % p.nv;
+  uint nh = wg / p.nv;
+  uint h_v = nh % p.hv;
+  uint i_n = nh / p.hv;  // decode token == sequence
+  uint h_k = h_v / p.ratio;
+  uint vbase = i_v * VT_GDN_BV;
+
+  vt_gdn_setup(vbase);
+
+  uint srow = i_n;
+  if (p.has_idx != 0u) {
+    int si = int(IDX.v[(p.meta_off >> 2) + i_n]);
+    if (si < 0 || uint(si) >= p.n_state_rows) {  // fla NULL block; see the header
+      if (vt_gdn_vrow < p.dv && vt_gdn_wk == 0u) {
+        VT_STORE(O32, O16, VT_PC_OUT_DT, p.out_off,
+                 (i_n * p.hv + h_v) * p.dv + vt_gdn_vrow, 0.0);
+      }
+      return;
+    }
+    srow = uint(si);
+  }
+
+  vt_gdn_load_tile(srow, h_v, vbase);
+  vt_gdn_step(i_n, h_v, h_k);
+  vt_gdn_store_tile(srow, h_v, vbase);
+}
