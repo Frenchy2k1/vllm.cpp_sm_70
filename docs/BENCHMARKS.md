@@ -296,7 +296,7 @@ graphed decode all match, and the audit is
 [recorded](../.agents/specs/benchmark-equivalence-audit-2026-07-15.md). The
 2026-08-04/08 governance checkpoints (record/CI substrate, anchor backfill,
 operator/helper W0-W5, upstream/device inventory, onboarding probe, and the
-universal `agent-start.py` entrypoint) touched no engine code and moved no
+review-hardened `agent-start.py` entrypoint) touched no engine code and moved no
 number: **NOT APPLICABLE**, nothing to reproduce.
 
 The PR #28 sanitizer repair is also NOT APPLICABLE to performance: both full

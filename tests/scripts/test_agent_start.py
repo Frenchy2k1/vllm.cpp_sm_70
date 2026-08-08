@@ -117,6 +117,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("MODEL-READY", out)
         self.assertNotIn("claim helper --row <ROW-ID>", out)
         self.assertNotIn("claim helper --row ENGINE-READY", out)
+        self.assertNotIn("ROW-ID", out)
 
     def test_helper_without_row_distinguishes_unavailable_and_empty_queue(self):
         unavailable = self.render(
@@ -191,6 +192,23 @@ class RendererTests(unittest.TestCase):
         self.assertIn("operator lock held elsewhere", out)
         self.assertNotIn("scripts/agent-role.py claim operator", out)
         self.assertNotIn("claim helper", out)
+
+    def test_first_time_route_surfaces_operator_lock_before_role_choice(self):
+        out = self.render(
+            state(
+                blocked_by_other_operator=True,
+                reason="operator lock held elsewhere",
+            )
+        )
+        self.assertIn("WELCOME: RELAY VERBATIM", out)
+        self.assertIn("operator lock is held by another live worktree", out)
+        self.assertIn("operator lock held elsewhere", out)
+        self.assertNotIn(
+            "Use the matching scripts/agent-role.py claim command.", out
+        )
+        self.assertIn(
+            "If the contributor chooses operator, report the conflict", out
+        )
 
     def test_environment_reports_status_only_and_never_secret_values(self):
         secret = "TOP-SECRET-TOKEN"

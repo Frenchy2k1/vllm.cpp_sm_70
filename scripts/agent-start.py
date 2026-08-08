@@ -116,7 +116,8 @@ def _helper_without_row(state: dict) -> list[str]:
         lines.append("   READY queue is empty; create and spike a scoped row.")
     lines.extend(
         [
-            "2. Rerun scripts/agent-start.py --intent helper --row ROW-ID.",
+            "2. Rerun scripts/agent-start.py with --intent helper and --row",
+            "   set to the selected row's actual ID.",
             "3. Run the printed claim command, then rerun agent-start.",
             "4. Run scripts/agent-preflight.sh after the role is declared.",
         ]
@@ -130,6 +131,22 @@ def _undeclared_actions(
     lines = _status_lines(state)
 
     if intent is None:
+        if state.get("blocked_by_other_operator"):
+            reason = state.get("reason") or "reason unavailable"
+            lines.extend(
+                [
+                    "BLOCKED OPTION: the operator lock is held by another live worktree.",
+                    f"Reason: {reason}",
+                    "1. Relay only the welcome block above verbatim.",
+                    "2. Then ask what the contributor is here to do.",
+                    "3. If the contributor chooses operator, report the conflict;",
+                    "   do not run a known-failing claim or select another role.",
+                    "4. For helper or read-only, use the matching claim command.",
+                    "5. After claiming, rerun scripts/agent-start.py.",
+                    "6. Then run scripts/agent-preflight.sh.",
+                ]
+            )
+            return lines
         lines.extend(
             [
                 "1. Relay only the welcome block above verbatim.",
