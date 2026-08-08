@@ -230,6 +230,31 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("static review", text.lower())
         self.assertIn("full declared gate", text.lower())
 
+    def test_operator_continues_actionable_failures_until_pass(self) -> None:
+        continue_row = (
+            "- `OP-CONTINUE` | required | For every actionable in-scope reviewer "
+            "FAIL dispatch a fresh implementer, run focused and full gates, and "
+            "dispatch a fresh scoped reviewer; repeat until PASS because attempt "
+            "or retry budgets are scheduling controls and never terminal blockers."
+        )
+        stop_rows = (
+            "- `STOP-AUTHORITY` | BLOCKED | A required external action exceeds "
+            "Authority and the precise missing authority is named.",
+            "- `STOP-RESOURCE` | BLOCKED | A required external resource is "
+            "unavailable and the precise resource is named.",
+            "- `STOP-DEVELOPER` | BLOCKED | The developer explicitly directs the "
+            "review loop to stop before PASS.",
+            "- `STOP-REMOTE` | REMOTE_UNVERIFIED | Required remote state cannot be queried.",
+        )
+        text = self.shipped("operator")
+        self.assertIn(continue_row, prompt_contract.METHOD_ROWS["operator"])
+        self.assertIn(continue_row, text)
+        self.assertEqual(prompt_contract.STOP_ROWS["operator"], stop_rows)
+        for row in stop_rows:
+            with self.subTest(row=row):
+                self.assertIn(row, text)
+        self.assertNotIn("STOP-BLOCKER", text)
+
     def test_reviewer_findings_are_first_structured_and_severity_ordered(self) -> None:
         text = self.shipped("reviewer")
         finding = prompt_contract.OUTPUT_ROWS["reviewer"][0]

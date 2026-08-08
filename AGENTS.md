@@ -36,7 +36,7 @@ byte-for-byte. Do not edit it independently.
 - `POL-CORRECTNESS-GATE` — Pass the declared token-exact or ratified distributional correctness gate before performance acceptance.
 - `POL-PREFLIGHT` — Run the applicable preflight and prevent a failed gate from being followed by a push.
 - `POL-REVIEW-FRESH` — Use a fresh reviewer that performs static review and targeted scratch mutation.
-- `POL-REVIEW-NO-REPAIR` — Return findings to a fresh implementer and do not repair them in the coordinating session.
+- `POL-REVIEW-NO-REPAIR` — Return actionable in-scope findings to a fresh implementer without repair in the coordinating session and repeat focused and full gates plus fresh scoped review until PASS; attempt budgets never terminate correctable findings and only explicit developer direction or a precise external authority or resource blocker may stop the loop.
 - `POL-OPERATOR-VERIFY` — Run the claimed gate instead of trusting an implementer report.
 - `POL-ONE-SURFACE` — Expose every shipped capability through include/vllm.h and keep examples as thin clients of the same library surface.
 - `POL-EVIDENCE-PRESERVE` — Move evidence without deleting it.

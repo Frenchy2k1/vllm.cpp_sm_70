@@ -82,6 +82,11 @@ LOOP_REQUIRED = (
     "mutate, not read",
     "run the row's gate yourself",
     "never fix findings yourself",
+    "repeat this cycle until pass",
+    "attempt and retry budgets are scheduling controls",
+    "never terminal blockers for correctable findings",
+    "explicit developer direction",
+    "precise external authority or resource blocker",
 )
 
 CUTOVER_WIRING = {

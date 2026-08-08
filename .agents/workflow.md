@@ -96,7 +96,7 @@ gates.
 <!-- orchestration-loop:begin -->
 [POL-REVIEW-FRESH] After focused and full gates pass on an immutable head from a fresh [implementer](prompts/implementer.md), dispatch a fresh [reviewer](prompts/reviewer.md), never the agent that wrote the code, to perform both static inspection and targeted scratch mutations of the claimed guarantees—mutate, not read. Review output identifies commands, mutations, findings, and the reviewed SHA.
 
-[POL-REVIEW-NO-REPAIR] A coordinating/operator session never repairs a reviewer finding: never fix findings yourself. Send the bounded finding and evidence to a fresh implementer, rerun focused and full gates, then use a fresh scoped reviewer.
+[POL-REVIEW-NO-REPAIR] Never fix findings yourself in a coordinating session. Each actionable in-scope reviewer FAIL and its evidence return to a fresh implementer for focused and full gates then a fresh scoped reviewer. Repeat this cycle until PASS. Attempt and retry budgets are scheduling controls and never terminal blockers for correctable findings. Stop only on explicit developer direction or a precise external authority or resource blocker.
 
 [POL-OPERATOR-VERIFY] The operator independently checks the immutable head: run the row's gate yourself. Implementer or reviewer summaries are evidence inputs, not gate results.
 
