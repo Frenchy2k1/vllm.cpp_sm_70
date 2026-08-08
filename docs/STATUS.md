@@ -431,10 +431,11 @@ tp=1). The **real TP-2 GPU run + NCCL build-verify remain HW-blocked** (no
 parallelism mode is enumerated and ranked in
 [parallelism-modes](../.agents/specs/parallelism-modes.md), noting vLLM's
 "sequence parallel" is a TP compilation pass, not an axis).
+**Shared layer names no device**: async readback is a `Backend` capability.
+
 **Tensor parallelism is scoped end-to-end at the pin** (#287,
 [tensor-parallelism-spike](../.agents/specs/tensor-parallelism-spike.md)):
-~40% of the TP surface already landed/reusable; the landed TP wiring
-dead-ends at the layer boundary (no loader shards yet); **TP-W1 LANDED** (group table); W2..W4+W7
+~40% of the TP surface landed/reusable; **TP-W1 LANDED** (group table); W2..W4+W7
 (the engine-level TP2-on-CPU token-exact gate) are CPU-completable
 NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
 (DFlash-derived block drafter for our Qwen3 + Gemma4 families) is grounded

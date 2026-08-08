@@ -86,28 +86,19 @@ static bool AsyncRunnerEnvDefault() {
 }
 
 // Async input-combine reads the sampled token id back on the host between
-// steps. Where that read is valid the default-ON async path stays on:
-//   - kCPU: host and device memory are the same allocation, so the read is
-//     always valid. This path was correct, default-ON, and contract-tested
-//     before the ROCm work; it MUST stay true (else the CPU backend silently
-//     regresses to synchronous depth-1).
-//   - kCUDA: the sampled id is device-mirrored (async_device_mirror()).
-// A DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) is the real hazard: the non-CUDA
-// leg of sample_tokens_async Synchronizes and then host-dereferences dev_ids,
-// which is a device Alloc — valid on CPU/UMA, garbage off-device. That is the
-// root cause of the "!" tokens on the lab R9700 (2026-08-07), not an embed
-// race. Keep those queues synchronous until a HIP sampled-token mirror or a D2H
-// copy of dev_ids lands.
-// TODO(rocm): an INTEGRATED non-CUDA GPU reports UnifiedMemory()==true (see
-// row/ROCM-UNIFIED-MEMORY-B), where the alias is valid and async would be safe;
-// route it through the backend UnifiedMemory() seam once reachable here.
+// steps. Whether that read is VALID is a backend CAPABILITY, not a device name:
+// ask the backend (vt::Backend::SupportsAsyncSampledTokenReadback, backend.h),
+// which answers true for CPU (host and device memory are one allocation) and
+// CUDA (the sampled id is device-mirrored, async_device_mirror()), and false for
+// a DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) whose sample_tokens_async leg
+// host-dereferences a device Alloc — the root cause of the "!" tokens on the lab
+// R9700 (2026-08-07). An absent backend (device not built into this binary)
+// yields nullptr and therefore false, which also subsumes the old
+// #ifdef VLLM_CPP_CUDA guard. Keeping the question on the backend is what stops
+// this device-agnostic shared layer from naming a device (check-device-leakage).
 static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
-  if (queue.device.type == vt::DeviceType::kCPU) return true;
-#ifdef VLLM_CPP_CUDA
-  if (queue.device.type == vt::DeviceType::kCUDA) return true;
-#endif
-  (void)queue;
-  return false;
+  const vt::Backend* backend = vt::TryGetBackend(queue.device.type);
+  return backend != nullptr && backend->SupportsAsyncSampledTokenReadback();
 }
 
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each

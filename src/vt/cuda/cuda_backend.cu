@@ -188,6 +188,9 @@ class CudaBackend final : public Backend {
   bool SupportsGraphCapture() const override { return true; }
   // S7: CUDA has a secondary stream for the MoE shared-expert overlap fork.
   bool SupportsAuxStream() const override { return true; }
+  // The sampled token id is device-mirrored (async_device_mirror()), so the
+  // between-steps host readback the depth-2 async input-combine needs is valid.
+  bool SupportsAsyncSampledTokenReadback() const override { return true; }
   void BeginCapture(Queue& q) override {
     Check(cudaStreamBeginCapture(AsStream(q), cudaStreamCaptureModeThreadLocal),
           "cudaStreamBeginCapture");
