@@ -28,6 +28,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
+| Release | SPIKE; 30/30 | #129 |
 | Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 LANDED; #139 repair CPU-GREEN**: ABI v14 stable; registry-resolved named platform; DSR 39→32; execution guard 52/52 | Fresh re-review #139; CUDA A/B residual |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
