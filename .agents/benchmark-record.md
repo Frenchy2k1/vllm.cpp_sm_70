@@ -16054,3 +16054,53 @@ Rollback is 1728 calls / 718.704016 ms / 415.917 us; exact is 1728 /
 27-commit main advance; against the sealed vLLM conv trace the residual is
 **1.60881x**. Trace SHA-256: rollback `6a5dde18e...f97c47`, exact
 `f47fb9cc...7aecf9`; both token files `83fcdc45...453545`.
+### Decode: the batch was being drained by every host memcpy (2026-08-08, GB10)
+
+Goal is llama.cpp Vulkan's **4.35 tok/s** on Qwen3.6-27B decode. We were at 2.74,
+with **GPU busy only 56% of wall** and both decode GEMMs already near the
+bandwidth roof (`vt_matmul_vec` 90%, lm_head 74%) — so the entire gap is host.
+
+**MEASURED, not guessed: 212 flushes per TOKEN**, most carrying 1-2 dispatches.
+Command-buffer batching was almost entirely defeated. Attributing each flush to
+its trigger settled why in one run:
+
+| trigger | flushes | avg dispatches |
+|---|---:|---:|
+| `copy` | **2081** | 3.2 |
+| `reference-tier` | 112 | 10.0 |
+| ring-full / batch-cap | **0** | — |
+
+The ring depth and batch cap — the two things previously tuned — **never fired
+once**. `Backend::Copy` drained the batch unconditionally, so every host memcpy
+paid a full submit-plus-blocking-fence round trip.
+
+**A drain is required only on a real dependency:** when the copy touches memory the
+OPEN batch bound. Reading a buffer the batch writes would see bytes the GPU has not
+written; writing one it reads would change operands mid-flight. If the batch never
+bound the buffer — the common case, since activations flow forward into freshly
+allocated ones — neither hazard exists. A pointer outside every Vulkan allocation
+is plain host memory and can never alias a bound buffer, so it never drains.
+
+**Result: flushes 212 -> 114 per token, decode 2.74 -> 2.99 tok/s (1.09x)**, with
+opt-125m STRICT 6/6 token-exact and 26/26 on GB10.
+
+**What remains, and it is architectural.** `copy-src` (3201) and `copy-dst` (3072)
+still account for 98 of the 114 flushes: the 27B forward moves activations through
+HOST vectors between ops, so it round-trips host<->device ~100 times per token.
+llama.cpp never does this — its whole graph runs and then one readback happens, so
+its mid-graph submits carry no fence at all and a single wait lands at step end
+(`ggml-vulkan.cpp:15709`, `:16344`). Closing that is a model-level change to
+`qwen3_5.cpp` (a device-resident forward), not a backend one, and it is the
+remaining 1.45x.
+
+`reference-tier` is a further 16 flushes/token from `kCausalConv1dFwd` and
+`kAttnQkNormRopeGate` still on the host — worth ~14% of flushes.
+
+**Also ruled out by the sweep of llama.cpp's backend:** pre-recorded/replayed
+command buffers do not exist upstream (`graph_plan_* = NULL`, `:17708-17711`;
+`eOneTimeSubmit`, `:8086`), so there is no CUDA-graph analogue to port. They submit
+MORE often than us, not fewer — every ~100 nodes, deliberately, to overlap host
+recording with GPU execution — and their descriptor sets are fungible across
+pipelines (one global layout, bump-allocated, `:6996-7009`, `:8137`), so ring
+exhaustion cannot force a flush at all. Our submit-then-block idiom is, in their
+code, a debug-only path behind `GGML_VK_SERIALIZE_SUBMISSIONS` (`:17016-17035`).
