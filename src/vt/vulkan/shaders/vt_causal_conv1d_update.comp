@@ -1,0 +1,94 @@
+#version 450
+// vt::CausalConv1dUpdate — the GDN decode-step depthwise causal conv
+// (gdn-semantics.md §3, `causal_conv1d_update` at seqlen == 1): read the OLD
+// K-1 taps, emit one output token, then roll the window left and append the RAW
+// x sample.
+// Ported 1:1 from src/vt/cpu/cpu_ops.cpp:1081-1127 CausalConv1dUpdateKernel.
+//
+// ONE INVOCATION PER (token, channel), which is exactly the CPU kernel's
+// row-chunking unit (cpu_ops.cpp:1096 `ForRows(batch * c_dim, ...)`) and is what
+// makes the read-old-then-roll safe WITHOUT any barrier: each (bt, c) pair owns
+// its own conv_state row slice and its own output element, so the roll at the end
+// races with nothing. Batch rows map to DISTINCT cache slots by contract
+// (src/vt/ops.cpp:1687-1696), so two invocations never share a row.
+//
+// THE STATE ROW IS f32 AND BOUND THROUGH THE 32-BIT VIEW ONLY. On this backend
+// conv_state is f32 by contract (src/vt/ops.cpp: bf16 conv_state is CUDA-only),
+// so a dtype-erased load would be a branch that can never take its other side.
+//
+// THE ROW MAY BE PHYSICALLY WIDER THAN THE WINDOW. For spec-decode rollback the
+// row is widened to (K-1) + num_spec taps; the non-spec update operates on the
+// LEADING K-1 taps at the row's PHYSICAL stride `state_len`
+// (cpu_ops.cpp:1088-1092, mirroring vLLM causal_conv1d.py:66-69). At num_spec == 0
+// state_len == width and the addressing is byte-identical.
+//
+// A NEGATIVE conv_state_index IS NOT AN ERROR: it is upstream's NULL block and
+// the token is SKIPPED (cpu_ops.cpp:1103), leaving both the output element and
+// the cache row untouched.
+//
+// ACCUMULATION ORDER IS THE CPU'S: bias, then taps j = 0..K-2 in order, then the
+// x term. Kept sequential on one invocation rather than tree-reduced across
+// lanes precisely so this kernel stays in the bit-comparable tier with its
+// reference instead of only the NMSE tier.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Ob32 { uint v[]; } O32;
+layout(binding = 1) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 2) readonly buffer Xb32 { uint v[]; } X32;
+layout(binding = 3) readonly buffer Xb16 { uint16_t v[]; } X16;
+layout(binding = 4) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 5) readonly buffer Wb16 { uint16_t v[]; } W16;
+// bias; aliases the weight when the caller passed none (p.has_bias == 0).
+layout(binding = 6) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 7) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 8) buffer Sb { uint v[]; } ST;    // conv_state, f32
+// conv_state_indices, i32; aliases conv_state when absent (p.has_idx == 0).
+layout(binding = 9) readonly buffer Ib { uint v[]; } IDX;
+
+layout(push_constant) uniform Params {
+  uint batch;        // x.shape[0]
+  uint c_dim;        // x.shape[1]
+  uint k;            // weight.shape[1]
+  uint width;        // k - 1
+  uint state_len;    // conv_state.shape[2] — the PHYSICAL row width
+  uint x_rs;         // x.stride[0], in elements (x may be a padded-row view)
+  uint n_state_rows; // conv_state.shape[0], for the bounds guard
+  uint has_bias, has_idx, silu;
+  uint out_dt, x_dt, w_dt, bias_dt;
+  uint out_off, x_off, w_off, bias_off, st_off, idx_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.batch * p.c_dim) { return; }
+  uint bt = gid / p.c_dim;
+  uint c = gid % p.c_dim;
+
+  uint srow_row = bt;
+  if (p.has_idx != 0u) {
+    int ci = int(IDX.v[(p.idx_off >> 2) + bt]);
+    if (ci < 0) { return; }                          // NULL block, skip
+    if (uint(ci) >= p.n_state_rows) { return; }      // device analogue of the
+    srow_row = uint(ci);                             // host-side range VT_CHECK
+  }
+  // cpu_ops.cpp:1109-1111 — raw pointer arithmetic over the f32 state, so the
+  // row base is srow_row * c_dim * state_len + c * state_len.
+  uint srow = (p.st_off >> 2) + (srow_row * p.c_dim + c) * p.state_len;
+
+  float xt = VT_LOAD(X32, X16, p.x_dt, p.x_off, bt * p.x_rs + c);
+  float acc = p.has_bias != 0u ? VT_LOAD(B32, B16, p.bias_dt, p.bias_off, c) : 0.0;
+  for (uint j = 0u; j < p.width; ++j) {
+    acc += VT_LOAD(W32, W16, p.w_dt, p.w_off, c * p.k + j) * uintBitsToFloat(ST.v[srow + j]);
+  }
+  acc += VT_LOAD(W32, W16, p.w_dt, p.w_off, c * p.k + p.width) * xt;
+  // Silu spelled `acc / (1 + exp(-acc))`, the CPU reference's spelling
+  // (cpu_ops.cpp:916) — `acc * sigmoid(acc)` is a different rounding.
+  VT_STORE(O32, O16, p.out_dt, p.out_off, bt * p.c_dim + c,
+           p.silu != 0u ? (acc / (1.0 + exp(-acc))) : acc);
+
+  for (uint j = 0u; j + 1u < p.width; ++j) { ST.v[srow + j] = ST.v[srow + j + 1u]; }
+  if (p.width > 0u) { ST.v[srow + p.width - 1u] = floatBitsToUint(xt); }
+}

@@ -56,22 +56,26 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 16);
+  CHECK(n == 22);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
     REQUIRE(m.word_count > 5);          // a SPIR-V header alone is 5 words
     CHECK(m.words[0] == 0x07230203u);   // SPIR-V magic
   }
-  // The eight registered ops are served by exactly these seven modules (kCastBf16
-  // and kCastF32 share vt_cast), so a rename in either direction breaks here
-  // rather than at pipeline-creation time on a device we might not have.
+  // Every registered op is served by one of these modules (kCastBf16 and kCastF32
+  // share vt_cast), so a rename in either direction breaks here rather than at
+  // pipeline-creation time on a device we might not have.
   for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
                            "vt_greedy_argmax", "vt_layer_norm", "vt_matmul",
                            "vt_matmul_coopmat", "vt_matmul_vec", "vt_paged_attn",
                            "vt_qkv_split",
                            "vt_relu", "vt_reshape_and_cache", "vt_rms_norm",
-                           "vt_rope_from_cache", "vt_silu_and_mul"}) {
+                           "vt_rope_from_cache", "vt_silu_and_mul",
+                           // BACKEND-VULKAN-GDN: the GDN / conv1d glue family.
+                           "vt_causal_conv1d_update", "vt_gdn_post_conv",
+                           "vt_gdn_state_gather", "vt_gdn_state_scatter",
+                           "vt_rms_norm_gated", "vt_sigmoid_gate_bf16"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -150,6 +154,18 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // over llama.cpp's module-per-#define in miniature.
       REQUIRE(m.spec_id_count == 4);
       for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_sigmoid_gate_bf16") == 0) {
+      // ONE axis, and the count is the assertion: the gate is f32 and the output
+      // bf16 by the op contract (src/vt/ops.cpp:3327-3334), so only the attention
+      // operand varies. A second constant appearing here would mean someone
+      // widened the shader past what the op actually promises.
+      REQUIRE(m.spec_id_count == 1);
+      CHECK(m.spec_ids[0] == 0u);
+    } else if (std::strcmp(m.name, "vt_gdn_post_conv") == 0) {
+      // conv dtype, the shared q/k/v dtype, the shared araw/braw dtype. g/beta,
+      // a_log and dt_bias are f32 by contract and are therefore NOT axes.
+      REQUIRE(m.spec_id_count == 3);
+      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
     } else {
       CHECK(m.spec_id_count == 0);
     }
@@ -381,15 +397,29 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       // with no llama.cpp Vulkan counterpart), the KV write, the
                       // QKV split and the rotary APPLY.
                       vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache,
-                      vt::OpId::kQkvSplit, vt::OpId::kRopeFromCache}) {
+                      vt::OpId::kQkvSplit, vt::OpId::kRopeFromCache,
+                      // BACKEND-VULKAN-GDN: the GDN / conv1d glue family that a
+                      // GDN hybrid (Qwen3.6-27B) hits on every step.
+                      vt::OpId::kSigmoidGateBf16, vt::OpId::kRmsNormGated,
+                      vt::OpId::kGdnStateGather, vt::OpId::kGdnStateScatter,
+                      vt::OpId::kCausalConv1dUpdate, vt::OpId::kGdnPostConv}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // No NATIVE Vulkan kernel yet for the rotary TABLE BUILD (kRopeCosSinCache and
   // kRopeNeox both construct the angle in double -- deliberately left on the
   // portable tier, mirroring vLLM's own split), quant, MoE, or the sampler beyond
   // greedy argmax.
+  //
+  // kGdnPrefill / kGdnDecode are ALSO deliberately absent and stay listed here:
+  // they are the chunked gated-delta recurrences, the model's linear-attention
+  // core rather than glue, and BACKEND-VULKAN-GDN scoped them out rather than
+  // ship them unverified. kCausalConv1dFwd (the prefill conv) is out for a
+  // narrower reason -- its state write-back needs a different dispatch shape than
+  // the decode update, see src/vt/vulkan/vulkan_ops.cpp.
   for (vt::OpId op : {vt::OpId::kRopeNeox, vt::OpId::kRopeCosSinCache,
-                      vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK}) {
+                      vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK,
+                      vt::OpId::kGdnPrefill, vt::OpId::kGdnDecode,
+                      vt::OpId::kCausalConv1dFwd}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // ...but they no longer THROW, and this assertion used to say they did.
@@ -967,4 +997,548 @@ TEST_CASE("Vulkan float-controls are PROBED and reported, not assumed") {
   // What we DO require: the workgroup-count limit must cover the dispatches the
   // skeleton makes (one workgroup per row).
   CHECK(ctx.max_workgroup_count_x() >= 65535u);
+}
+
+// ===========================================================================
+// BACKEND-VULKAN-GDN — numeric gates for the GDN / conv1d glue family.
+//
+// THE ORACLE IS OUR OWN CPU BACKEND, evaluated in the SAME binary on the SAME
+// inputs, which is the contract tests/vt/test_backend_cross_device.cpp already
+// states. It is used here rather than there because these ops need shapes with
+// structure — padded gate strides, widened cache rows, NULL cache indices — that
+// the generic harness does not generate.
+//
+// EVERY CASE ALSO ASSERTS THE MECHANISM, not only the numbers. On a unified
+// device an unregistered op silently resolves to the portable CPU reference tier
+// and produces answers that are not merely close to the oracle but IDENTICAL to
+// it, so a numbers-only gate would pass just as green with no shader written at
+// all. `PipelineExistsFor` proves a Vulkan pipeline for the intended module was
+// built, and the provider's `last_selected` name proves the call did not fall
+// through to the host. Both, because either alone has a hole: a pipeline can
+// exist from an earlier case in the same process, and a provider can be selected
+// for a shape whose kernel then declines.
+// ===========================================================================
+namespace {
+
+// Deterministic, library-independent filler. A fixed LCG rather than
+// std::mt19937 so both backends see byte-identical inputs regardless of standard
+// library version, spread over a range that actually exercises sigmoid and
+// softplus instead of sitting in their linear middle.
+std::vector<float> Spread(size_t n, float scale, uint32_t seed) {
+  std::vector<float> v(n);
+  uint32_t s = seed | 1u;
+  for (size_t i = 0; i < n; ++i) {
+    s = s * 1664525u + 1013904223u;
+    v[i] = (static_cast<float>(s >> 8) / 8388608.0f - 1.0f) * scale;
+  }
+  return v;
+}
+
+double NmseOf(const std::vector<float>& ref, const std::vector<float>& got) {
+  REQUIRE(ref.size() == got.size());
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double dd = static_cast<double>(ref[i]) - static_cast<double>(got[i]);
+    num += dd * dd;
+    den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+  }
+  return den == 0.0 ? num : num / den;
+}
+
+// The already-ported bar for reducing / arithmetic kernels
+// (tests/vt/test_backend_cross_device.cpp, itself from llama.cpp
+// test-quantize-fns:17-28). NOT bit-exactness: a workgroup tree reduction does
+// not preserve the CPU tier's fixed sequential accumulation order.
+constexpr double kGdnNmseTol = 5e-4;
+
+// Owns one allocation on a backend. Deliberately not retrofitted onto the cases
+// above, which predate this row — rewriting them would put unrelated churn in
+// this change.
+class Buf {
+ public:
+  Buf(Backend& b, size_t elems, size_t elem_bytes) : b_(b), p_(b.Alloc(elems * elem_bytes)) {}
+  ~Buf() { b_.Free(p_); }
+  Buf(const Buf&) = delete;
+  Buf& operator=(const Buf&) = delete;
+  void* p() const { return p_; }
+  template <typename T>
+  T* as() const { return static_cast<T*>(p_); }
+
+ private:
+  Backend& b_;
+  void* p_;
+};
+
+// Was this op served by the NATIVE Vulkan kernel on its last call, BY NAME? The
+// reference tier registers under a different name, so this is what separates
+// "the shader ran" from "the host kernel ran and the numbers matched".
+bool RanNative(vt::OpId op) {
+  const auto stats = vt::GetOpProviderStats(op, DeviceType::kVULKAN);
+  return stats.last_selected != nullptr &&
+         std::string(stats.last_selected) == std::string(vt::kNativeProviderName);
+}
+
+}  // namespace
+
+TEST_CASE("GDN sigmoid output-gate runs NATIVELY on Vulkan and matches the CPU oracle") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // 300 is deliberately NOT a multiple of the 128-wide workgroup, so the tail
+  // guard is exercised rather than assumed.
+  constexpr int64_t kN = 300;
+  const std::vector<float> attn = Spread(kN, 3.0f, 11u);
+  const std::vector<float> gate = Spread(kN, 6.0f, 29u);  // wide: sigmoid saturates
+
+  Buf va(vk, kN, 4), vg(vk, kN, 4), vo(vk, kN, 2);
+  Buf ca(cpu, kN, 4), cg(cpu, kN, 4), co(cpu, kN, 2);
+  vk.Copy(vq, va.p(), attn.data(), kN * 4);
+  vk.Copy(vq, vg.p(), gate.data(), kN * 4);
+  std::memcpy(ca.p(), attn.data(), kN * 4);
+  std::memcpy(cg.p(), gate.data(), kN * 4);
+  vk.Synchronize(vq);
+
+  Tensor vat = Tensor::Contiguous(va.p(), vt::DType::kF32, vd, {kN});
+  Tensor vgt = Tensor::Contiguous(vg.p(), vt::DType::kF32, vd, {kN});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kBF16, vd, {kN});
+  Tensor cat = Tensor::Contiguous(ca.p(), vt::DType::kF32, cd, {kN});
+  Tensor cgt = Tensor::Contiguous(cg.p(), vt::DType::kF32, cd, {kN});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kBF16, cd, {kN});
+
+  vt::SigmoidGateBf16(cq, cot, cat, cgt);
+  vt::SigmoidGateBf16(vq, vot, vat, vgt);
+  vk.Synchronize(vq);
+
+  CHECK(ctx.PipelineExistsFor("vt_sigmoid_gate_bf16"));
+  CHECK(RanNative(vt::OpId::kSigmoidGateBf16));
+
+  std::vector<uint16_t> got(kN);
+  vk.Copy(vq, got.data(), vo.p(), kN * 2);
+  vk.Synchronize(vq);
+  std::vector<float> ref_f(kN), got_f(kN);
+  for (int64_t i = 0; i < kN; ++i) {
+    ref_f[i] = vt::BF16ToF32(co.as<uint16_t>()[i]);
+    got_f[i] = vt::BF16ToF32(got[i]);
+  }
+  const double nmse = NmseOf(ref_f, got_f);
+  MESSAGE("sigmoid_gate_bf16 NMSE vs the CPU oracle: " << nmse);
+  CHECK(nmse <= kGdnNmseTol);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("gated RMSNorm runs NATIVELY on Vulkan: silu, sigmoid, and a padded gate") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // D = 300 > the 128-wide workgroup, so each lane walks the row in a strided
+  // loop and the tree reduction is genuinely over partial sums.
+  constexpr int64_t kRows = 5, kD = 300;
+  const std::vector<float> x = Spread(kRows * kD, 2.0f, 7u);
+  const std::vector<float> z = Spread(kRows * kD, 4.0f, 13u);
+  const std::vector<float> w = Spread(kD, 1.5f, 17u);
+
+  Buf vx(vk, kRows * kD, 4), vz(vk, kRows * kD, 4), vw(vk, kD, 4), vo(vk, kRows * kD, 4);
+  Buf cx(cpu, kRows * kD, 4), cz(cpu, kRows * kD, 4), cw(cpu, kD, 4), co(cpu, kRows * kD, 4);
+  vk.Copy(vq, vx.p(), x.data(), x.size() * 4);
+  vk.Copy(vq, vz.p(), z.data(), z.size() * 4);
+  vk.Copy(vq, vw.p(), w.data(), w.size() * 4);
+  std::memcpy(cx.p(), x.data(), x.size() * 4);
+  std::memcpy(cz.p(), z.data(), z.size() * 4);
+  std::memcpy(cw.p(), w.data(), w.size() * 4);
+  vk.Synchronize(vq);
+
+  Tensor vxt = Tensor::Contiguous(vx.p(), vt::DType::kF32, vd, {kRows, kD});
+  Tensor vzt = Tensor::Contiguous(vz.p(), vt::DType::kF32, vd, {kRows, kD});
+  Tensor vwt = Tensor::Contiguous(vw.p(), vt::DType::kF32, vd, {kD});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kF32, vd, {kRows, kD});
+  Tensor cxt = Tensor::Contiguous(cx.p(), vt::DType::kF32, cd, {kRows, kD});
+  Tensor czt = Tensor::Contiguous(cz.p(), vt::DType::kF32, cd, {kRows, kD});
+  Tensor cwt = Tensor::Contiguous(cw.p(), vt::DType::kF32, cd, {kD});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kF32, cd, {kRows, kD});
+
+  for (bool sigmoid_gate : {false, true}) {
+    vt::RmsNormGatedArgs args;
+    args.eps = 1e-6f;
+    args.sigmoid_gate = sigmoid_gate;
+    vt::RmsNormGated(cq, cot, cxt, czt, cwt, args);
+    vt::RmsNormGated(vq, vot, vxt, vzt, vwt, args);
+    vk.Synchronize(vq);
+    std::vector<float> got(kRows * kD), ref(kRows * kD);
+    vk.Copy(vq, got.data(), vo.p(), got.size() * 4);
+    vk.Synchronize(vq);
+    std::memcpy(ref.data(), co.p(), ref.size() * 4);
+    const double nmse = NmseOf(ref, got);
+    // Assembled OUTSIDE the macro: MESSAGE(x << y) hands the expression to the
+    // doctest MessageBuilder, so a flag written inside renders as "1".
+    const std::string line = std::string("rmsnorm_gated (") +
+                             (sigmoid_gate ? "sigmoid" : "silu") +
+                             ") NMSE vs the CPU oracle: " + std::to_string(nmse);
+    MESSAGE(line);
+    CHECK(nmse <= kGdnNmseTol);
+  }
+  CHECK(ctx.PipelineExistsFor("vt_rms_norm_gated"));
+  CHECK(RanNative(vt::OpId::kRmsNormGated));
+
+  // THE PADDED-ROW rank-3 GATE, which is the shape the merged-qkvz path actually
+  // produces: the gate is the `z` slice of one fused projection, so its TOKEN
+  // stride exceeds Hv*D while the inner block stays contiguous. A shader that
+  // ignored gate.stride[0] would still pass the rank-2 case above, so this is the
+  // assertion that the stride is honoured at all.
+  constexpr int64_t kT = 3, kHv = 2, kDv = 64, kPad = 16;
+  constexpr int64_t kZStride = kHv * kDv + kPad;
+  const std::vector<float> x3 = Spread(kT * kHv * kDv, 2.0f, 23u);
+  const std::vector<float> z3 = Spread(kT * kZStride, 4.0f, 31u);
+  const std::vector<float> w3 = Spread(kDv, 1.5f, 37u);
+
+  Buf vx3(vk, kT * kHv * kDv, 4), vz3(vk, kT * kZStride, 4), vw3(vk, kDv, 4),
+      vo3(vk, kT * kHv * kDv, 4);
+  Buf cx3(cpu, kT * kHv * kDv, 4), cz3(cpu, kT * kZStride, 4), cw3(cpu, kDv, 4),
+      co3(cpu, kT * kHv * kDv, 4);
+  vk.Copy(vq, vx3.p(), x3.data(), x3.size() * 4);
+  vk.Copy(vq, vz3.p(), z3.data(), z3.size() * 4);
+  vk.Copy(vq, vw3.p(), w3.data(), w3.size() * 4);
+  std::memcpy(cx3.p(), x3.data(), x3.size() * 4);
+  std::memcpy(cz3.p(), z3.data(), z3.size() * 4);
+  std::memcpy(cw3.p(), w3.data(), w3.size() * 4);
+  vk.Synchronize(vq);
+
+  auto padded_gate = [](void* p, Device dev) {
+    Tensor t = Tensor::Contiguous(p, vt::DType::kF32, dev, {kT, kHv, kDv});
+    t.stride[0] = kZStride;  // the padded TOKEN stride; inner dims stay packed
+    return t;
+  };
+  Tensor vx3t = Tensor::Contiguous(vx3.p(), vt::DType::kF32, vd, {kT, kHv, kDv});
+  Tensor vo3t = Tensor::Contiguous(vo3.p(), vt::DType::kF32, vd, {kT, kHv, kDv});
+  Tensor vw3t = Tensor::Contiguous(vw3.p(), vt::DType::kF32, vd, {kDv});
+  Tensor cx3t = Tensor::Contiguous(cx3.p(), vt::DType::kF32, cd, {kT, kHv, kDv});
+  Tensor co3t = Tensor::Contiguous(co3.p(), vt::DType::kF32, cd, {kT, kHv, kDv});
+  Tensor cw3t = Tensor::Contiguous(cw3.p(), vt::DType::kF32, cd, {kDv});
+  Tensor vz3t = padded_gate(vz3.p(), vd);
+  Tensor cz3t = padded_gate(cz3.p(), cd);
+
+  vt::RmsNormGatedArgs args3;
+  args3.eps = 1e-6f;
+  vt::RmsNormGated(cq, co3t, cx3t, cz3t, cw3t, args3);
+  vt::RmsNormGated(vq, vo3t, vx3t, vz3t, vw3t, args3);
+  vk.Synchronize(vq);
+  std::vector<float> got3(kT * kHv * kDv), ref3(kT * kHv * kDv);
+  vk.Copy(vq, got3.data(), vo3.p(), got3.size() * 4);
+  vk.Synchronize(vq);
+  std::memcpy(ref3.data(), co3.p(), ref3.size() * 4);
+  const double nmse3 = NmseOf(ref3, got3);
+  MESSAGE("rmsnorm_gated (padded rank-3 gate) NMSE vs the CPU oracle: " << nmse3);
+  CHECK(nmse3 <= kGdnNmseTol);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("GDN state gather/scatter run NATIVELY on Vulkan and are BIT-EXACT") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // BIT-EXACT, not NMSE: these two ops move f32 words and compute nothing, so
+  // anything short of equality would be hiding a bug (the tier
+  // vt_reshape_and_cache is already gated in).
+  //
+  // The cache inner dim is WIDER than the working one (6 vs 4) — the
+  // spec-decode-widened conv row. That shape is the whole reason the kernel walks
+  // channels at the cache's physical stride, and a shader that assumed the
+  // contiguous fast path would pass a same-width test and corrupt this one.
+  constexpr int64_t kCacheRows = 5, kC = 3, kCacheInner = 6, kWorkInner = 4;
+  constexpr int64_t kRows = 3;
+  constexpr int64_t kCacheElems = kCacheRows * kC * kCacheInner;
+  constexpr int64_t kWorkElems = kRows * kC * kWorkInner;
+  const std::vector<float> cache_init = Spread(kCacheElems, 5.0f, 41u);
+  const std::vector<int32_t> idx = {4, 0, 2};
+  // Request 1 has NO initial state: its working row must come back ZEROED, not
+  // copied. i8 is the interesting width — it is why the shader reads the flag
+  // byte-wise through the 32-bit view instead of needing VK_KHR_8bit_storage.
+  //
+  // THREE ELEMENTS IS ALSO THREE BYTES, and that is deliberate: it is the shape
+  // that caught the sub-word allocation bug this row fixed. A 3-byte VkBuffer's
+  // `uint[]` view has ZERO elements, so every flag read back as false and the
+  // gather zeroed rows it should have copied — silently, because the read is
+  // robust rather than faulting. AllocBuffer now rounds every buffer up to a
+  // whole 32-bit word (src/vt/vulkan/vulkan_context.cpp), and keeping this length
+  // at 3 is what keeps that fix gated. Do not "tidy" it to 4.
+  const std::vector<int8_t> his = {1, 0, 1};
+
+  Buf vc(vk, kCacheElems, 4), vw(vk, kWorkElems, 4), vi(vk, kRows, 4), vh(vk, kRows, 1);
+  Buf cc(cpu, kCacheElems, 4), cw(cpu, kWorkElems, 4), ci(cpu, kRows, 4), ch(cpu, kRows, 1);
+  vk.Copy(vq, vc.p(), cache_init.data(), kCacheElems * 4);
+  vk.Copy(vq, vi.p(), idx.data(), kRows * 4);
+  vk.Copy(vq, vh.p(), his.data(), kRows);
+  std::memcpy(cc.p(), cache_init.data(), kCacheElems * 4);
+  std::memcpy(ci.p(), idx.data(), kRows * 4);
+  std::memcpy(ch.p(), his.data(), kRows);
+  vk.Synchronize(vq);
+
+  auto cache_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kCacheRows, kC, kCacheInner});
+  };
+  auto work_t = [](void* p, Device dev) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kRows, kC, kWorkInner});
+  };
+  Tensor vct = cache_t(vc.p(), vd), vwt = work_t(vw.p(), vd);
+  Tensor cct = cache_t(cc.p(), cd), cwt = work_t(cw.p(), cd);
+  Tensor vit = Tensor::Contiguous(vi.p(), vt::DType::kI32, vd, {kRows});
+  Tensor cit = Tensor::Contiguous(ci.p(), vt::DType::kI32, cd, {kRows});
+  Tensor vht = Tensor::Contiguous(vh.p(), vt::DType::kI8, vd, {kRows});
+  Tensor cht = Tensor::Contiguous(ch.p(), vt::DType::kI8, cd, {kRows});
+
+  vt::GdnStateGather(cq, cwt, cct, cit, &cht);
+  vt::GdnStateGather(vq, vwt, vct, vit, &vht);
+  vk.Synchronize(vq);
+  CHECK(ctx.PipelineExistsFor("vt_gdn_state_gather"));
+  CHECK(RanNative(vt::OpId::kGdnStateGather));
+
+  std::vector<float> got(kWorkElems);
+  vk.Copy(vq, got.data(), vw.p(), kWorkElems * 4);
+  vk.Synchronize(vq);
+  CHECK(std::memcmp(got.data(), cw.p(), kWorkElems * 4) == 0);
+  // The zeroing is asserted DIRECTLY, not left to the memcmp: if both kernels
+  // wrongly copied row 1, the comparison above would still be green.
+  bool row1_zero = true;
+  for (int64_t e = 0; e < kC * kWorkInner; ++e) {
+    if (got[kC * kWorkInner + e] != 0.0f) row1_zero = false;
+  }
+  CHECK(row1_zero);
+
+  // Scatter new working rows back and compare the WHOLE cache, so an over-wide
+  // write into the widened row's tail columns is caught.
+  const std::vector<float> work_new = Spread(kWorkElems, 9.0f, 43u);
+  vk.Copy(vq, vw.p(), work_new.data(), kWorkElems * 4);
+  std::memcpy(cw.p(), work_new.data(), kWorkElems * 4);
+  vk.Synchronize(vq);
+  vt::GdnStateScatter(cq, cct, cwt, cit);
+  vt::GdnStateScatter(vq, vct, vwt, vit);
+  vk.Synchronize(vq);
+  CHECK(ctx.PipelineExistsFor("vt_gdn_state_scatter"));
+  CHECK(RanNative(vt::OpId::kGdnStateScatter));
+
+  std::vector<float> cache_got(kCacheElems);
+  vk.Copy(vq, cache_got.data(), vc.p(), kCacheElems * 4);
+  vk.Synchronize(vq);
+  CHECK(std::memcmp(cache_got.data(), cc.p(), kCacheElems * 4) == 0);
+  // And cache row 1, which no index names, still holds its ORIGINAL bytes —
+  // proof the scatter wrote only where it was told to.
+  CHECK(std::memcmp(cache_got.data() + kC * kCacheInner,
+                    cache_init.data() + kC * kCacheInner,
+                    static_cast<size_t>(kC * kCacheInner) * 4) == 0);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("the decode causal conv1d update runs NATIVELY on Vulkan, state roll included") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // conv_state has MORE rows than the batch and is addressed through
+  // conv_state_indices — the in-place indexed decode path the model takes. A
+  // NEGATIVE index is upstream's NULL block and must leave both the output
+  // element and the cache row alone.
+  constexpr int64_t kBatch = 4, kC = 5, kK = 4, kWidth = kK - 1;
+  constexpr int64_t kStateRows = 6, kStateLen = kWidth;
+  const std::vector<float> x = Spread(kBatch * kC, 2.0f, 53u);
+  const std::vector<float> w = Spread(kC * kK, 1.0f, 59u);
+  const std::vector<float> bias = Spread(kC, 0.5f, 61u);
+  const std::vector<float> state0 = Spread(kStateRows * kC * kStateLen, 3.0f, 67u);
+  const std::vector<int32_t> cidx = {5, 1, -1, 0};  // token 2 -> NULL block
+
+  Buf vx(vk, kBatch * kC, 4), vw(vk, kC * kK, 4), vb(vk, kC, 4), vo(vk, kBatch * kC, 4),
+      vs(vk, kStateRows * kC * kStateLen, 4), vi(vk, kBatch, 4);
+  Buf cx(cpu, kBatch * kC, 4), cw(cpu, kC * kK, 4), cb(cpu, kC, 4), co(cpu, kBatch * kC, 4),
+      cs(cpu, kStateRows * kC * kStateLen, 4), cci(cpu, kBatch, 4);
+  vk.Copy(vq, vx.p(), x.data(), x.size() * 4);
+  vk.Copy(vq, vw.p(), w.data(), w.size() * 4);
+  vk.Copy(vq, vb.p(), bias.data(), bias.size() * 4);
+  vk.Copy(vq, vs.p(), state0.data(), state0.size() * 4);
+  vk.Copy(vq, vi.p(), cidx.data(), cidx.size() * 4);
+  // The output buffer is pre-seeded so the NULL-block token's element can be
+  // checked for having been LEFT ALONE rather than merely being plausible.
+  const std::vector<float> out_seed(kBatch * kC, -12345.0f);
+  vk.Copy(vq, vo.p(), out_seed.data(), out_seed.size() * 4);
+  std::memcpy(cx.p(), x.data(), x.size() * 4);
+  std::memcpy(cw.p(), w.data(), w.size() * 4);
+  std::memcpy(cb.p(), bias.data(), bias.size() * 4);
+  std::memcpy(cs.p(), state0.data(), state0.size() * 4);
+  std::memcpy(cci.p(), cidx.data(), cidx.size() * 4);
+  std::memcpy(co.p(), out_seed.data(), out_seed.size() * 4);
+  vk.Synchronize(vq);
+
+  Tensor vxt = Tensor::Contiguous(vx.p(), vt::DType::kF32, vd, {kBatch, kC});
+  Tensor vwt = Tensor::Contiguous(vw.p(), vt::DType::kF32, vd, {kC, kK});
+  Tensor vbt = Tensor::Contiguous(vb.p(), vt::DType::kF32, vd, {kC});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kF32, vd, {kBatch, kC});
+  Tensor vst = Tensor::Contiguous(vs.p(), vt::DType::kF32, vd, {kStateRows, kC, kStateLen});
+  Tensor vit = Tensor::Contiguous(vi.p(), vt::DType::kI32, vd, {kBatch});
+  Tensor cxt = Tensor::Contiguous(cx.p(), vt::DType::kF32, cd, {kBatch, kC});
+  Tensor cwt = Tensor::Contiguous(cw.p(), vt::DType::kF32, cd, {kC, kK});
+  Tensor cbt = Tensor::Contiguous(cb.p(), vt::DType::kF32, cd, {kC});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kF32, cd, {kBatch, kC});
+  Tensor cst = Tensor::Contiguous(cs.p(), vt::DType::kF32, cd, {kStateRows, kC, kStateLen});
+  Tensor citt = Tensor::Contiguous(cci.p(), vt::DType::kI32, cd, {kBatch});
+
+  vt::CausalConv1dArgs args;  // silu_activation defaults true, as Qwen GDN uses
+  vt::CausalConv1dUpdate(cq, cot, cxt, cwt, &cbt, cst, args, &citt);
+  vt::CausalConv1dUpdate(vq, vot, vxt, vwt, &vbt, vst, args, &vit);
+  vk.Synchronize(vq);
+
+  CHECK(ctx.PipelineExistsFor("vt_causal_conv1d_update"));
+  CHECK(RanNative(vt::OpId::kCausalConv1dUpdate));
+
+  std::vector<float> got(kBatch * kC), ref(kBatch * kC);
+  vk.Copy(vq, got.data(), vo.p(), got.size() * 4);
+  vk.Synchronize(vq);
+  std::memcpy(ref.data(), co.p(), ref.size() * 4);
+  const double nmse = NmseOf(ref, got);
+  MESSAGE("causal_conv1d_update NMSE vs the CPU oracle: " << nmse);
+  CHECK(nmse <= kGdnNmseTol);
+  // The NULL-block token kept its seed.
+  for (int64_t c = 0; c < kC; ++c) {
+    CAPTURE(c);
+    CHECK(got[2 * kC + c] == -12345.0f);
+  }
+
+  // THE ROLLED STATE IS THE HALF A NUMBERS-ONLY OUTPUT CHECK MISSES: the output
+  // reads the OLD taps, so a kernel that never rolled the window would produce a
+  // perfect first step and diverge from the second one onward.
+  std::vector<float> state_got(kStateRows * kC * kStateLen);
+  vk.Copy(vq, state_got.data(), vs.p(), state_got.size() * 4);
+  vk.Synchronize(vq);
+  const std::vector<float> state_ref(cs.as<float>(), cs.as<float>() + state_got.size());
+  CHECK(std::memcmp(state_got.data(), state_ref.data(), state_got.size() * 4) == 0);
+  // Spelled out independently of the oracle: the roll writes the RAW x sample
+  // into the last tap, so if BOTH kernels skipped the roll the memcmp above
+  // would still be green.
+  for (int64_t bt = 0; bt < kBatch; ++bt) {
+    if (cidx[static_cast<size_t>(bt)] < 0) continue;
+    for (int64_t c = 0; c < kC; ++c) {
+      CAPTURE(bt);
+      CAPTURE(c);
+      const int64_t slot = cidx[static_cast<size_t>(bt)];
+      const int64_t last = (slot * kC + c) * kStateLen + kWidth - 1;
+      CHECK(state_got[static_cast<size_t>(last)] == x[static_cast<size_t>(bt * kC + c)]);
+    }
+  }
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("the fused GDN post-conv preamble runs NATIVELY on Vulkan, all five outputs") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  constexpr int64_t kT = 3, kHk = 2, kDk = 64, kHv = 2, kDv = 32;
+  constexpr int64_t kKeyDim = kHk * kDk, kValDim = kHv * kDv;
+  constexpr int64_t kConvDim = 2 * kKeyDim + kValDim;
+  const std::vector<float> conv = Spread(kT * kConvDim, 2.0f, 71u);
+  // araw is spread WIDE on purpose: softplus has two branches (the > 20
+  // pass-through and the log1p one) and a narrow range would only ever reach one.
+  const std::vector<float> araw = Spread(kT * kHv, 25.0f, 73u);
+  const std::vector<float> braw = Spread(kT * kHv, 4.0f, 79u);
+  const std::vector<float> a_log = Spread(kHv, 1.0f, 83u);
+  const std::vector<float> dt_bias = Spread(kHv, 1.0f, 89u);
+
+  Buf vconv(vk, kT * kConvDim, 4), va(vk, kT * kHv, 4), vb(vk, kT * kHv, 4), val(vk, kHv, 4),
+      vdt(vk, kHv, 4);
+  Buf vqo(vk, kT * kKeyDim, 4), vko(vk, kT * kKeyDim, 4), vvo(vk, kT * kValDim, 4),
+      vgo(vk, kT * kHv, 4), vbo(vk, kT * kHv, 4);
+  Buf cconv(cpu, kT * kConvDim, 4), ca(cpu, kT * kHv, 4), cb(cpu, kT * kHv, 4),
+      cal(cpu, kHv, 4), cdt(cpu, kHv, 4);
+  Buf cqo(cpu, kT * kKeyDim, 4), cko(cpu, kT * kKeyDim, 4), cvo(cpu, kT * kValDim, 4),
+      cgo(cpu, kT * kHv, 4), cbo(cpu, kT * kHv, 4);
+
+  vk.Copy(vq, vconv.p(), conv.data(), conv.size() * 4);
+  vk.Copy(vq, va.p(), araw.data(), araw.size() * 4);
+  vk.Copy(vq, vb.p(), braw.data(), braw.size() * 4);
+  vk.Copy(vq, val.p(), a_log.data(), a_log.size() * 4);
+  vk.Copy(vq, vdt.p(), dt_bias.data(), dt_bias.size() * 4);
+  std::memcpy(cconv.p(), conv.data(), conv.size() * 4);
+  std::memcpy(ca.p(), araw.data(), araw.size() * 4);
+  std::memcpy(cb.p(), braw.data(), braw.size() * 4);
+  std::memcpy(cal.p(), a_log.data(), a_log.size() * 4);
+  std::memcpy(cdt.p(), dt_bias.data(), dt_bias.size() * 4);
+  vk.Synchronize(vq);
+
+  auto run = [&](Queue& q, Device dev, const Buf& bconv, const Buf& ba, const Buf& bb,
+                 const Buf& bal, const Buf& bdt, const Buf& bq, const Buf& bk, const Buf& bv,
+                 const Buf& bg, const Buf& bbeta) {
+    Tensor tconv = Tensor::Contiguous(bconv.p(), vt::DType::kF32, dev, {kT, kConvDim});
+    Tensor ta = Tensor::Contiguous(ba.p(), vt::DType::kF32, dev, {kT, kHv});
+    Tensor tb = Tensor::Contiguous(bb.p(), vt::DType::kF32, dev, {kT, kHv});
+    Tensor tal = Tensor::Contiguous(bal.p(), vt::DType::kF32, dev, {kHv});
+    Tensor tdt = Tensor::Contiguous(bdt.p(), vt::DType::kF32, dev, {kHv});
+    Tensor tq = Tensor::Contiguous(bq.p(), vt::DType::kF32, dev, {kT, kHk, kDk});
+    Tensor tk = Tensor::Contiguous(bk.p(), vt::DType::kF32, dev, {kT, kHk, kDk});
+    Tensor tv = Tensor::Contiguous(bv.p(), vt::DType::kF32, dev, {kT, kHv, kDv});
+    Tensor tg = Tensor::Contiguous(bg.p(), vt::DType::kF32, dev, {kT, kHv});
+    Tensor tbeta = Tensor::Contiguous(bbeta.p(), vt::DType::kF32, dev, {kT, kHv});
+    vt::L2NormArgs l2args;
+    vt::GdnPostConv(q, tq, tk, tv, tg, tbeta, tconv, ta, tb, tal, tdt, l2args);
+  };
+  run(cq, cd, cconv, ca, cb, cal, cdt, cqo, cko, cvo, cgo, cbo);
+  run(vq, vd, vconv, va, vb, val, vdt, vqo, vko, vvo, vgo, vbo);
+  vk.Synchronize(vq);
+
+  CHECK(ctx.PipelineExistsFor("vt_gdn_post_conv"));
+  CHECK(RanNative(vt::OpId::kGdnPostConv));
+
+  // ALL FIVE outputs are compared. The kernel writes them from two different
+  // branches of one dispatch (q/k from the head-slot branch, v/g/beta from the
+  // other), so checking a subset would leave a whole branch unasserted.
+  auto compare = [&](const char* what, const Buf& dev_buf, const Buf& host_buf, int64_t n) {
+    std::vector<float> got(static_cast<size_t>(n));
+    vk.Copy(vq, got.data(), dev_buf.p(), got.size() * 4);
+    vk.Synchronize(vq);
+    const std::vector<float> ref(host_buf.as<float>(), host_buf.as<float>() + n);
+    const double nmse = NmseOf(ref, got);
+    const std::string line =
+        std::string("gdn_post_conv ") + what + " NMSE vs the CPU oracle: " + std::to_string(nmse);
+    MESSAGE(line);
+    CHECK(nmse <= kGdnNmseTol);
+  };
+  compare("q_out", vqo, cqo, kT * kKeyDim);
+  compare("k_out", vko, cko, kT * kKeyDim);
+  compare("v_out", vvo, cvo, kT * kValDim);
+  compare("g_out", vgo, cgo, kT * kHv);
+  compare("beta_out", vbo, cbo, kT * kHv);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
 }

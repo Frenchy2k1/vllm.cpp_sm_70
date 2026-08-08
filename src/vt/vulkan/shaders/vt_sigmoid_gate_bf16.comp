@@ -1,0 +1,46 @@
+#version 450
+// vt::SigmoidGateBf16 — out[i] = bf16(attn[i] * sigmoid(gate[i])), the sigmoid
+// output-gate applied to the attention result before o_proj.
+// Ported 1:1 from src/vt/cpu/cpu_ops.cpp:2272-2279 SigmoidGateBf16Kernel, whose
+// body is `StoreF32(out, i, LoadF32(attn, i) * Sigmoid(LoadF32(gate, i)))` with
+// Sigmoid = 1/(1+exp(-x)) (cpu_ops.cpp:2222). vt_sigmoid in vt_common.glsl is
+// that expression verbatim.
+//
+// TWO OF THE THREE DTYPES ARE FIXED BY THE OP CONTRACT, not by this shader:
+// `out` is bf16 and `gate` is f32 (src/vt/ops.cpp:3327-3334 — the sigmoid INPUT
+// must not be rounded). Only `attn` varies (f32 from the fallback attention,
+// bf16 from the FA-2 prefill path), so it is the single specialization axis and
+// the other two are compile-time constants here. Writing them as constants is
+// not a shortcut: it means a caller that violated the contract would fail the
+// host-side VT_CHECK rather than silently get a shader that quietly obliged.
+//
+// Flat: one invocation per element, the same shape as vt_relu / vt_silu_and_mul.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) readonly buffer Gb32 { uint v[]; } G32;
+layout(binding = 3) readonly buffer Gb16 { uint16_t v[]; } G16;
+layout(binding = 4) buffer Ob32 { uint v[]; } O32;
+layout(binding = 5) buffer Ob16 { uint16_t v[]; } O16;
+
+// The attention operand's storage dtype (VT_DT_F32 or VT_DT_BF16). One module
+// serves both; the branch folds away at pipeline creation.
+layout(constant_id = 0) const uint VT_SG_ATTN_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint n;
+  uint a_off, g_off, o_off;
+} p;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= p.n) { return; }
+  float a = VT_LOAD(A32, A16, VT_SG_ATTN_DT, p.a_off, i);
+  float g = VT_LOAD(G32, G16, VT_DT_F32, p.g_off, i);
+  // Round to bf16 exactly ONCE, on store, like the CPU reference's StoreF32.
+  VT_STORE(O32, O16, VT_DT_BF16, p.o_off, i, a * vt_sigmoid(g));
+}
