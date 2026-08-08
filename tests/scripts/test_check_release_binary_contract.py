@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-release-binary-contract.py"
 
 CONTRACT_PATHS = (
+    "scripts/check-release-binary-contract.py",
     ".agents/specs/release-binary-matrix.md",
     ".agents/engine-matrix.md",
     ".agents/roadmap_v1.md",
@@ -46,6 +47,7 @@ REQUIRED_TEST_METHODS = (
     "test_primary_cuda_mutation_inventory_literal_is_pinned",
     "test_work_dependency_mutation_inventory_literal_is_pinned",
     "test_each_semantic_inventory_consumer_is_pinned",
+    "test_checker_guard_map_keysets_are_exact",
     "test_required_mutation_test_inventory_is_pinned",
 )
 
@@ -61,6 +63,29 @@ PRIMARY_CUDA_SMS = (
     "120a",
     "121a",
 )
+
+GUARD_MAP_KEYS = {
+    "TEST_LITERAL_INVENTORIES": (
+        "PRIMARY_CUDA_SMS",
+        "EXPECTED_DEPS",
+        "RECORD_ANCHORS",
+        "LIFECYCLE_RECORD_MUTATIONS",
+        "PUBLIC_PENDING_MUTATIONS",
+        "W10_W12_HUMAN_MUTATIONS",
+        "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+        "GUARD_MAP_KEYS",
+    ),
+    "TEST_INVENTORY_CONSUMERS": (
+        "PRIMARY_CUDA_SMS",
+        "EXPECTED_DEPS",
+        "RECORD_ANCHORS",
+        "LIFECYCLE_RECORD_MUTATIONS",
+        "PUBLIC_PENDING_MUTATIONS",
+        "W10_W12_HUMAN_MUTATIONS",
+        "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+        "GUARD_MAP_KEYS",
+    ),
+}
 
 RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
@@ -158,7 +183,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 19 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 20 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -207,7 +232,12 @@ PRIMARY_ARTIFACT_PROSE_MUTATIONS = (
 
 def run_checker(root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(CHECKER), "--root", str(root)],
+        [
+            sys.executable,
+            str(root / "scripts/check-release-binary-contract.py"),
+            "--root",
+            str(root),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -256,6 +286,74 @@ def delete_test_method(root: Path, method: str) -> None:
     ) - 1
     del lines[start : node.end_lineno]
     path.write_text("".join(lines), encoding="utf-8")
+
+
+def mutate_checker_guard_map(
+    root: Path, guard_map: str, mutation: str, key: str
+) -> None:
+    relative = "scripts/check-release-binary-contract.py"
+    path = root / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == guard_map
+            for target in node.targets
+        )
+    ]
+    if len(assignments) != 1 or not isinstance(assignments[0].value, ast.Dict):
+        raise AssertionError(f"expected one literal guard map {guard_map!r}")
+    mapping = assignments[0].value
+    keys = [ast.literal_eval(node) for node in mapping.keys]
+
+    if mutation == "add":
+        if key in keys:
+            raise AssertionError(f"guard key already exists in {guard_map}: {key}")
+        mapping.keys.append(ast.Constant(value=key))
+        mapping.values.append(ast.Constant(value=None))
+    else:
+        if keys.count(key) != 1:
+            raise AssertionError(
+                f"expected one guard key {key!r} in {guard_map}, found {keys.count(key)}"
+            )
+        index = keys.index(key)
+        if mutation == "delete":
+            del mapping.keys[index]
+            del mapping.values[index]
+        elif mutation == "rename":
+            mapping.keys[index] = ast.Constant(value=f"RENAMED_{key}")
+        else:
+            raise AssertionError(f"unknown guard-map mutation {mutation!r}")
+
+    path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf-8")
+
+
+def bypass_checker_keyset_enforcement(root: Path) -> None:
+    relative = "scripts/check-release-binary-contract.py"
+    path = root / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        left = node.test.left
+        if (
+            isinstance(left, ast.Call)
+            and isinstance(left.func, ast.Name)
+            and left.func.id == "tuple"
+            and len(left.args) == 1
+            and isinstance(left.args[0], ast.Name)
+            and left.args[0].id == "guard_map"
+        ):
+            matches.append(node)
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one guard-map keyset enforcement, found {len(matches)}"
+        )
+    matches[0].test = ast.Constant(value=False)
+    path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf-8")
 
 
 class LiveContract(unittest.TestCase):
@@ -408,8 +506,8 @@ class HumanContractMutations(unittest.TestCase):
             mutate(
                 root,
                 "tests/scripts/test_check_release_binary_contract.py",
-                '    "120a",\n    "121a",\n)\n\nRECORD_ANCHORS',
-                '    "120a",\n)\n\nRECORD_ANCHORS',
+                '    "120a",\n    "121a",\n)\n\nGUARD_MAP_KEYS',
+                '    "120a",\n)\n\nGUARD_MAP_KEYS',
             )
             result = run_checker(root)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -474,6 +572,51 @@ class HumanContractMutations(unittest.TestCase):
                     result.returncode, 0, result.stdout + result.stderr
                 )
                 self.assertIn(inventory, result.stdout + result.stderr)
+
+    def test_checker_guard_map_keysets_are_exact(self) -> None:
+        for guard_map, keys in GUARD_MAP_KEYS.items():
+            for key in keys:
+                for mutation in ("delete", "rename"):
+                    with (
+                        self.subTest(
+                            guard_map=guard_map,
+                            key=key,
+                            mutation=mutation,
+                        ),
+                        RepoCopy() as root,
+                    ):
+                        mutate_checker_guard_map(root, guard_map, mutation, key)
+                        result = run_checker(root)
+                        self.assertNotEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+                        self.assertIn(
+                            "semantic mutation guard map keyset",
+                            result.stdout + result.stderr,
+                        )
+
+            with self.subTest(guard_map=guard_map, mutation="add"), RepoCopy() as root:
+                mutate_checker_guard_map(root, guard_map, "add", "EXTRA_GUARD")
+                result = run_checker(root)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn(
+                    "semantic mutation guard map keyset",
+                    result.stdout + result.stderr,
+                )
+
+            with (
+                self.subTest(guard_map=guard_map, mutation="bypass"),
+                RepoCopy() as root,
+            ):
+                mutate_checker_guard_map(root, guard_map, "delete", keys[0])
+                bypass_checker_keyset_enforcement(root)
+                result = run_checker(root)
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn(keys[0], result.stdout + result.stderr)
 
     def test_required_mutation_test_inventory_is_pinned(self) -> None:
         for method in REQUIRED_TEST_METHODS:

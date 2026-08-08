@@ -125,7 +125,7 @@ BENCHMARKS_RELEASE_ROW = (
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
     "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, "
-    "and 19 tests. No archive, staged smoke, runtime, correctness, or performance "
+    "and 20 tests. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
@@ -133,7 +133,7 @@ BENCHMARKS_RELEASE_ROW = (
 STATUS_RELEASE_FRAGMENTS = (
     "Supported subset; bundles SPIKED, no artifacts",
     "primary fat CUDA/adaptive CPU, W1-W13/W10-W12 policy, pending claims, and "
-    "19-test inventory mutation-gated; per-SM diagnostics optional; no "
+    "20-test inventory mutation-gated; per-SM diagnostics optional; no "
     "archive/runtime claim",
 )
 
@@ -168,7 +168,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 19 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 20 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -233,8 +233,36 @@ REQUIRED_TEST_METHODS = (
     "test_primary_cuda_mutation_inventory_literal_is_pinned",
     "test_work_dependency_mutation_inventory_literal_is_pinned",
     "test_each_semantic_inventory_consumer_is_pinned",
+    "test_checker_guard_map_keysets_are_exact",
     "test_required_mutation_test_inventory_is_pinned",
 )
+
+EXPECTED_TEST_LITERAL_INVENTORY_KEYS = (
+    "PRIMARY_CUDA_SMS",
+    "EXPECTED_DEPS",
+    "RECORD_ANCHORS",
+    "LIFECYCLE_RECORD_MUTATIONS",
+    "PUBLIC_PENDING_MUTATIONS",
+    "W10_W12_HUMAN_MUTATIONS",
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+    "GUARD_MAP_KEYS",
+)
+
+EXPECTED_TEST_INVENTORY_CONSUMER_KEYS = (
+    "PRIMARY_CUDA_SMS",
+    "EXPECTED_DEPS",
+    "RECORD_ANCHORS",
+    "LIFECYCLE_RECORD_MUTATIONS",
+    "PUBLIC_PENDING_MUTATIONS",
+    "W10_W12_HUMAN_MUTATIONS",
+    "PRIMARY_ARTIFACT_PROSE_MUTATIONS",
+    "GUARD_MAP_KEYS",
+)
+
+EXPECTED_GUARD_MAP_KEYS = {
+    "TEST_LITERAL_INVENTORIES": EXPECTED_TEST_LITERAL_INVENTORY_KEYS,
+    "TEST_INVENTORY_CONSUMERS": EXPECTED_TEST_INVENTORY_CONSUMER_KEYS,
+}
 
 TEST_LITERAL_INVENTORIES = {
     "PRIMARY_CUDA_SMS": PRIMARY_CUDA_SMS,
@@ -244,6 +272,7 @@ TEST_LITERAL_INVENTORIES = {
     "PUBLIC_PENDING_MUTATIONS": PUBLIC_PENDING_MUTATIONS,
     "W10_W12_HUMAN_MUTATIONS": W10_W12_HUMAN_MUTATIONS,
     "PRIMARY_ARTIFACT_PROSE_MUTATIONS": PRIMARY_ARTIFACT_PROSE_MUTATIONS,
+    "GUARD_MAP_KEYS": EXPECTED_GUARD_MAP_KEYS,
 }
 
 TEST_INVENTORY_CONSUMERS = {
@@ -281,6 +310,11 @@ TEST_INVENTORY_CONSUMERS = {
         "test_human_primary_artifact_contract_matches_machine_block",
         ("before", "after", "reason"),
         False,
+    ),
+    "GUARD_MAP_KEYS": (
+        "test_checker_guard_map_keysets_are_exact",
+        ("guard_map", "keys"),
+        True,
     ),
 }
 
@@ -568,7 +602,33 @@ def _test_inventory_errors(root: Path) -> list[str]:
             "checker's exact count and names"
         )
 
-    for inventory, expected_value in TEST_LITERAL_INVENTORIES.items():
+    guard_maps = (
+        (
+            "TEST_LITERAL_INVENTORIES",
+            EXPECTED_TEST_LITERAL_INVENTORY_KEYS,
+            TEST_LITERAL_INVENTORIES,
+        ),
+        (
+            "TEST_INVENTORY_CONSUMERS",
+            EXPECTED_TEST_INVENTORY_CONSUMER_KEYS,
+            TEST_INVENTORY_CONSUMERS,
+        ),
+    )
+    for name, expected_keys, guard_map in guard_maps:
+        if tuple(guard_map) != expected_keys:
+            errors.append(
+                "semantic mutation guard map keyset drifted for "
+                f"{name}: expected {expected_keys!r}, found {tuple(guard_map)!r}"
+            )
+
+    for inventory in EXPECTED_TEST_LITERAL_INVENTORY_KEYS:
+        if inventory not in TEST_LITERAL_INVENTORIES:
+            errors.append(
+                "semantic mutation guard map TEST_LITERAL_INVENTORIES is missing "
+                f"expected entry {inventory}"
+            )
+            continue
+        expected_value = TEST_LITERAL_INVENTORIES[inventory]
         declared_value, count = _top_level_literal(tree, inventory)
         if count != 1 or declared_value != expected_value:
             errors.append(
@@ -578,11 +638,14 @@ def _test_inventory_errors(root: Path) -> list[str]:
             )
 
     methods_by_name = {node.name: node for node in method_nodes}
-    for inventory, (
-        method_name,
-        target_names,
-        mapping_items,
-    ) in TEST_INVENTORY_CONSUMERS.items():
+    for inventory in EXPECTED_TEST_INVENTORY_CONSUMER_KEYS:
+        if inventory not in TEST_INVENTORY_CONSUMERS:
+            errors.append(
+                "semantic mutation guard map TEST_INVENTORY_CONSUMERS is missing "
+                f"expected entry {inventory}"
+            )
+            continue
+        method_name, target_names, mapping_items = TEST_INVENTORY_CONSUMERS[inventory]
         method = methods_by_name.get(method_name)
         if method is None or not _iterates_inventory(
             method, inventory, target_names, mapping_items
