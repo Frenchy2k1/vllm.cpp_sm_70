@@ -186,6 +186,8 @@ vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffol
 # N tokens with the context advancing). The DEVICE forward stays refuse-by-name
 # (born-on-runner W6/W7). .agents/specs/kimi-linear.md §5.
 vllm_cpp_add_test(test_kimi_linear_forward vllm/models/test_kimi_linear_forward.cpp)
+vllm_cpp_add_test(test_kimi_linear_paged vllm/models/test_kimi_linear_paged.cpp)
+vllm_cpp_add_test(test_kimi_linear_fold_gate vllm/models/test_kimi_linear_fold_gate.cpp)
 
 # KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
 # reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B

@@ -1,6 +1,6 @@
 # ONE SURFACE — every capability ships through the C ABI
 
-Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE; remediation IN PROGRESS — ROW 1 (Parakeet ASR / audio transcription) LANDED 2026-08-07: ABI v11 `vllm_transcribe`, live `/v1/audio/transcriptions`, registry refuse-by-task, example folded, ratchet 12 -> 11. ROW 2 (MiniMax-H3 video+audio generation) LANDED 2026-08-08 (`row/H3-VIDEO-ABI`, task #283): ABI v12 `vllm_video_engine_load`/`vllm_video_generate`/`vllm_video_result_free` + `vllm_video_mux_argv` over the `MiniMaxH3VideoEngine` library seam, `/v1/videos` routed through the SAME seam, both H3 examples rewritten as `vllm.h` clients byte-identical to the pre-fold binary, ratchet 11 -> 9. GB10 real-video re-verification is a NAMED RESIDUAL (box on the Kimi campaign).**
+Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE; remediation IN PROGRESS — ROW 1 (Parakeet ASR / audio transcription) LANDED 2026-08-07: ABI v11 `vllm_transcribe`, live `/v1/audio/transcriptions`, registry refuse-by-task, example folded, ratchet 12 -> 11. ROW 2 (MiniMax-H3 video+audio generation) LANDED 2026-08-08 (`row/H3-VIDEO-ABI`, task #283): ABI v12 `vllm_video_engine_load`/`vllm_video_generate`/`vllm_video_result_free` + `vllm_video_mux_argv` over the `MiniMaxH3VideoEngine` library seam, `/v1/videos` routed through the SAME seam, both H3 examples rewritten as `vllm.h` clients byte-identical to the pre-fold binary, ratchet 11 -> 9. GB10 real-video re-verification is a NAMED RESIDUAL (box on the Kimi campaign). ROW 8 (explicit device selection) LANDED 2026-08-08 (`row/DEVICE-KNOB`, task #284): ABI v14 `vllm_model_params.device` (0=auto/1=cpu/2=cuda, the vLLM `DeviceConfig.device` names) -> `EngineParams::device` -> `SelectQueue`; explicit cpu forces the CPU queue without probing, an explicitly named ABSENT device fails LOUD before any model I/O (the vllm/config/device.py:61-66 never-substitute mirror), `--device` on server + cli as pure field consumers; the #123 review's three MINOR findings closed in the same change (c_header_compile.c now references the v11+v12 surface + the v14 field; the v12 changelog block moved to chronological position; the fold fixture's flag list gained `--keep-quant`). CUDA-build A/B (auto->CUDA vs explicit-cpu->CPU on a GPU box) is a NAMED RESIDUAL — the CPU tier pins that half through the pure `ResolveExplicitDeviceType` matrix instead.**
 
 ## The defect
 
@@ -186,3 +186,19 @@ defaulted to the host-f32 GGUF arm — it now shares the ratified recipe
 HTTP-vs-CLI drift this row exists to prevent; (3) multi-image ref2va on the
 ABI. Laguna/DeepSeek/Kimi fast decode, embeddings and multimodal input remain
 open rows of this program.
+
+### ROW 2 device-selection follow-up (`row/ARCH-ONE-SURFACE`, PR #135; replaces #134)
+
+The ABI-v12 fold introduced two literal `GetBackend(kCUDA)` calls in the shared
+H3 seam. That violated the already-landed accelerator seam and raised the DSR
+`kcuda` bucket from its hard floor 0 to 2. The repair keeps the public contract
+exactly 0=CPU / 1=CUDA, maps it once through `MiniMaxH3VideoDeviceType`, and
+creates one queue through `GetBackend(device_type)`; the queue's device is then
+the engine device. The DSR gate is RED-first (34 vs baseline 32), then GREEN at
+32 with no baseline or allowlist change; all 25 checker mutations pass. Review
+also mutation-gates the operational contract through the real load path: a
+counting CUDA backend returns a distinctive CPU:7 queue, and the loaded engine
+must report that exact device after exactly one `CreateQueue` call. The original
+second-queue mutation was false-GREEN at 5/135, then RED at `2 == 1`; deleting
+the queue-device reuse is independently RED. The final CPU fold target is GREEN
+at 6 cases / 137 assertions in the isolated `/dev/shm` build.

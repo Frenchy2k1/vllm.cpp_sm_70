@@ -4,7 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
-| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, and 20 tests. No archive, staged smoke, runtime, correctness, or performance evidence | n/a |
+| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, and 22 tests. No archive, staged smoke, runtime, correctness, or performance evidence | n/a |
 | **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |
 | **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
 | **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |
@@ -308,7 +308,7 @@ built on it rather than keeping the flattering one.
 
 | Track | Status | Next gate |
 |---|---|---|
-| Surface coverage (`ARCH-ONE-SURFACE`) | **No number owed**: a CPU records/tooling change (the ONE SURFACE audit + `scripts/check-surface-coverage.py` guard, two axes, preflight + CI); no kernel or generation path touched | Fold-plan lanes carry their own gates; guard keeps CLI-only capabilities from landing untracked |
+| Surface coverage (`ARCH-ONE-SURFACE`) | **No number owed**: CPU tooling/plumbing (guard; ROW 8 device knob, ABI v14 `device`, zero value = the probe, byte-identical); no kernel path touched | Fold lanes carry their own gates; ROW 8 CUDA-build A/B = named residual |
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
@@ -318,9 +318,9 @@ built on it rather than keeping the flattering one.
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
-| `/v1/videos` OpenAI (Sora) shape + ONE-SURFACE fold ROW 2 | **No number owed**: CPU serving-surface changes only; the video fold (ABI v12, seam-routed `/v1/videos`, thin clients) is byte-identical plumbing, no speed claim; server defaults now the ratified recipe (disclosed) | Speed stays the MiniMax-H3 FP4 row below; GB10 re-verify via the v12 ABI = named residual |
+| `/v1/videos` OpenAI + ONE-SURFACE ROW 2 | **No number owed:** ABI-v12 device selection is backend-dispatch plumbing; generation math and speed paths are unchanged | DSR 34→32; baseline/allowlist unchanged; 25/25 checker mutations; CPU fold 6/137, including one-queue/device-provenance mutations |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **Paged-incremental (§19) GB10: 18.9 tok/s @ 122/128 = coherent best.** bf16 stream REFUTED (§20/#118: 122→4/128 KDA repeat-loop, no speed win); STRICT unreachable (§14-§20 levers closed), p7 near-tie | vLLM ~21 (16-tok aggregate floor); ours **0.90× vLLM**. Last 0.10× + STRICT need vLLM's real kernels via the SERVER fold (scoped) |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **RUNNER FOLD LANDS (ROW 7, §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (near-tie profile); FA2 MLA default-ON; SACRED green.** Server 19.0 tok/s wall; CLI 18.93 reproduced | vLLM ~21 (#111 floor; in-session re-measure ABORTED by GB10 reboot at util 0.82, §21): **~0.90×**, >= vLLM NOT met; residual = KDA host islands + grouped MoE + decode graph |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |

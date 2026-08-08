@@ -79,11 +79,15 @@ client. **ROW 1 UPDATE (2026-08-07): `parakeet_transcribe` is the SECOND clean A
 client** — the Parakeet fold rewrote it against `vllm.h` + `vllm::shared` only, and the
 ratchet fell 12 -> 11. **ROW 2 UPDATE (2026-08-08): `minimax_h3_gen` and
 `minimax_h3_mux` are the THIRD and FOURTH clean ABI clients** (the video fold, ABI
-v12 `vllm_video_*`), and the ratchet fell 11 -> 9. The remaining 9 reach
-`include/vllm/**` / `vt/**` and are transition-tracked in
-`scripts/example-abi-allowlist.txt`:
+v12 `vllm_video_*`), and the ratchet fell 11 -> 9. **ROW 7 UPDATE (2026-08-07):
+`kimi_linear_gen` is the FIFTH clean ABI client** — the Kimi-Linear paged-runner fold
+made the fast paged-incremental decode the ENGINE's production path, grew
+`vllm_complete_tokens` (ABI v13, pre-tokenized completion returning generated token
+ids) and rewrote the example against `vllm.h` + `vllm::shared` only; the ratchet fell
+9 -> 8. The remaining 8 reach `include/vllm/**` / `vt/**` and are transition-tracked
+in `scripts/example-abi-allowlist.txt`:
 
-- Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `kimi_linear_gen`, `server`.
+- Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `server`.
 - Dev/diagnostic (internal-by-nature, folded for consistency): `bench` (via
   `bench_core.h`), `tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench`.
 - Out of the gated `examples/` tree: `benchmarks/vulkan_gemm_ab.cpp` (Vulkan A/B harness).
@@ -91,7 +95,7 @@ v12 `vllm_video_*`), and the ratchet fell 11 -> 9. The remaining 9 reach
 **Policy (developer-directed 2026-08-07): no permanent exemptions.** Every allowlist entry
 — drivers AND dev/diagnostic tools — is a transition-tracker pointing at a fold row; the
 guard fails on any internal include not tracked, and a shrink-only ratchet
-(`MAX_INTERNAL_REACHING`, 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
+(`MAX_INTERNAL_REACHING`, 8 since ROW 7; 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
 admit a new violation. The public header set is DERIVED from the CMake install rules
 (exactly `include/vllm.h` today), not hardcoded. The guard catches BOTH breach vectors: a
 `#include "vllm/..."|"vt/..."|"src/..."` AND a CMake `-I` grant into the internal tree
@@ -137,7 +141,7 @@ lanes are leaves of `ARCH-ONE-SURFACE` (do not open parallel rows).
 | 5 | Kimi-Linear incremental | expose the incremental decode path through the runner/engine (the recompute forward already routes) | rewrite `kimi_linear_gen` | S–M | `KimiDecodeCache` on the runner |
 | 6 | Embeddings/pooling | `vllm_embed`/pooling entry point + live `/v1/embeddings`; register a pooling arch (`is_pooling_model=true`); invoke `PoolingRunner` in the step | — | M | pooler live-wiring |
 | 7 | Multimodal input | multimodal-content entry point on `vllm_chat`; run the vision/audio tower in the engine step (`mm_features`→`ModelForwardInput.mm`) | wire `chat_mm` seam into the ABI | L | `MM-SERVE-E2E` engine mm-forward residual |
-| 8 | Device-selection knob | `device` field on `vllm_model_params` (absent today) → `EngineParams` → `SelectQueue`; `--device` on server + cli | additive | S | mirror vLLM `--device`/`DeviceConfig` |
+| 8 | Device-selection knob | **DONE (ROW 8, 2026-08-08, `row/DEVICE-KNOB`)**: `vllm_model_params.device` (ABI v14: 0=auto/1=cpu/2=cuda, the vLLM `DeviceConfig.device` names, device.py:13) → `EngineParams::device` → `SelectQueue` explicit arms via `LoadedEngine::ResolveExplicitDeviceType`; explicit cpu never probes, explicit ABSENT cuda fails LOUD before any model I/O (device.py:61-66 never-substitute mirror); `--device` on server + cli | **DONE**: both thin clients consume the field; zero value byte-identical (auto probe) | S | mirror vLLM `--device`/`DeviceConfig` |
 | 9 | Voxtral + audio chat seam | register `VoxtralForConditionalGeneration` + fold `VoxtralGenerateGreedy` into the registry forward; audio-capable chat fn + an engine consumer for `AudioKwargs` mm_features | rewrite tests→clients | M | mirror upstream `voxtral.py:309`, `SupportsTranscription` |
 | 10 | Gemma-4 audio e2e | bf16 device audio forward + audio→text merge (residual `gemma4_audio.h:41`); USM log-mel front end | fold into the registered mm forward | M | `MM-SERVE-E2E` |
 | 11 | Tokenizer/bench ABI + real-load gate | `vllm_tokenize`/`vllm_detokenize`; token-id/count fields on the stream callback for bench; **gate `vllm_engine_load` on a REAL tiny checkpoint at least once** (today bad-path only, `test_capi.cpp:474`) | rewrite `tokenize`/`bench` as clients | S-M | `/tokenize` route exists (`api_server.cpp:432`) |

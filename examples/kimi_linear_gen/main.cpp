@@ -1,75 +1,36 @@
-// kimi-linear-gen — the §13 full-model e2e harness for Kimi-Linear-48B-A3B on one
-// GB10. It loads the bf16-RESIDENT weights (LoadKimiLinearResidentBf16Weights — NEVER
-// the 183 GiB f32 MaterializeHost; the pool-math path stages each large matmul weight
-// to cudaMalloc'd d_dev and ReleaseHost's its host mirror, so the LOAD peak holds only
-// one tensor's host bytes on top of the growing ~91.5 GiB device residency) and greedy-
-// decodes the §12 8-prompt battery x N tokens through the bf16 ForwardDeviceCompute
-// (VT_KIMI_DEVICE_COMPUTE arm), comparing token-exact to the STRICT oracle golden
-// (tests/parity/goldens/kimi_linear_greedy/greedy_ids.npy).
+// kimi-linear-gen — THIN PUBLIC-ABI CLIENT (ONE SURFACE / ROW 7, §20.3 B4).
 //
-// GB10 load recipe (context-first + shard-release, mirror examples/laguna_gen/
-// main.cpp:185-237): create the CUDA context BEFORE loading weights (the driver's
-// reservation would OOM against the page-cache pressure of a post-load reservation),
-// then drop the mmap'd shards after the memcpy loader.
+// The Kimi-Linear greedy token battery against the STRICT oracle golden, driven
+// ENTIRELY through the flat C ABI (include/vllm.h): vllm_engine_load builds the
+// full engine (the bf16-resident §13 loader + the shared paged runner the fold
+// landed — KDA state in the MambaSpec group, NoPE-MLA latent in the paged MLA
+// group), and vllm_complete_tokens (ABI v13) generates from the golden's
+// pre-tokenized prompts. The former private harness (bf16-resident loader +
+// KimiDecodeCache incremental decode driven through internal headers) is gone:
+// the fast paged-incremental decode IS the engine's production path now, so
+// this example is exactly what an embedder with only libvllm + vllm.h can do.
 //
-//   kimi-linear-gen --model <hf-snapshot-dir> --golden <golden-dir>
-//                   [--gpu] [--steps N] [--prompts M] [--load-only]
+//   kimi-linear-gen --model <hf-snapshot-dir> [--golden <dir>] [--steps N]
+//                   [--prompts M] [--load-only]
+//
+// The golden dir layout matches the §12 capture: p{i}_prompt.i32 (raw LE int32
+// token ids) + greedy_ids.npy ([P,T] <i4/<i8 C-order).
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
 
-#include "vllm/model_executor/model_loader/safetensors_reader.h"
-#include "vllm/model_executor/models/kimi_linear.h"
-#include "vllm/transformers_utils/hf_config.h"
-#include "vt/backend.h"
-#include "vt/device.h"
+#include "vllm.h"
 
 namespace fs = std::filesystem;
 
 namespace {
-
-double CurResidentGiB() {
-  std::ifstream f("/proc/self/status");
-  std::string line;
-  while (std::getline(f, line))
-    if (line.rfind("VmRSS:", 0) == 0) {
-      long kb = 0;
-      std::sscanf(line.c_str() + 6, "%ld", &kb);
-      return static_cast<double>(kb) / (1024.0 * 1024.0);
-    }
-  return 0.0;
-}
-double PeakResidentGiB() {
-  std::ifstream f("/proc/self/status");
-  std::string line;
-  while (std::getline(f, line))
-    if (line.rfind("VmHWM:", 0) == 0) {
-      long kb = 0;
-      std::sscanf(line.c_str() + 6, "%ld", &kb);
-      return static_cast<double>(kb) / (1024.0 * 1024.0);
-    }
-  return 0.0;
-}
-
-std::vector<vllm::SafetensorsFile> OpenSafetensorsDir(const std::string& dir) {
-  std::vector<std::string> paths;
-  for (const auto& e : fs::directory_iterator(dir))
-    if (e.is_regular_file() && e.path().extension() == ".safetensors")
-      paths.push_back(e.path().string());
-  if (paths.empty()) throw std::runtime_error("no *.safetensors shards in " + dir);
-  std::sort(paths.begin(), paths.end());
-  std::vector<vllm::SafetensorsFile> shards;
-  shards.reserve(paths.size());
-  for (const std::string& p : paths) shards.push_back(vllm::SafetensorsFile::Open(p));
-  return shards;
-}
 
 // Read a raw little-endian int32 file (the golden p{i}_prompt.i32 prompts).
 std::vector<int32_t> ReadI32File(const std::string& path) {
@@ -102,7 +63,6 @@ NpyInts ReadNpyInts(const std::string& path) {
   const bool i8 = header.find("<i8") != std::string::npos;
   const bool i4 = header.find("<i4") != std::string::npos;
   if (!i8 && !i4) throw std::runtime_error("npy dtype not <i4/<i8: " + header);
-  // parse the shape tuple "'shape': (P, T)" (or "(P,)" / "(N,)").
   NpyInts out;
   const size_t sp = header.find("'shape':");
   const size_t lp = header.find('(', sp);
@@ -138,7 +98,12 @@ NpyInts ReadNpyInts(const std::string& path) {
 int main(int argc, char** argv) {
   std::string model, golden;
   int steps = 16, prompts = 8;
-  bool use_gpu = false, load_only = false, incremental = false;
+  // The golden battery is short (prompt ~40 + 16 continuations); a bounded
+  // max_model_len keeps the engine's per-request token tables sized for the
+  // battery rather than the checkpoint's 1M context. Override with
+  // --max-model-len for longer runs.
+  int max_model_len = 4096;
+  bool load_only = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -146,67 +111,40 @@ int main(int argc, char** argv) {
     else if (a == "--golden") golden = next();
     else if (a == "--steps") steps = std::atoi(next());
     else if (a == "--prompts") prompts = std::atoi(next());
-    else if (a == "--gpu") use_gpu = true;
+    else if (a == "--max-model-len") max_model_len = std::atoi(next());
     else if (a == "--load-only") load_only = true;
-    else if (a == "--incremental") incremental = true;  // §18 paged-incremental decode
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty()) {
     std::fprintf(stderr,
-                 "usage: --model <hf-snapshot-dir> [--golden <dir>] [--gpu] "
-                 "[--steps N] [--prompts M] [--load-only]\n");
+                 "usage: --model <hf-snapshot-dir> [--golden <dir>] [--steps N] "
+                 "[--prompts M] [--load-only]\n");
     return 2;
   }
 
-  // Create the CUDA context BEFORE loading weights (GB10 load recipe).
-  vt::Backend* gpu_backend = nullptr;
-  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-  if (use_gpu) {
-    gpu_backend = &vt::GetBackend(vt::DeviceType::kCUDA);
-    q = gpu_backend->CreateQueue();
-    std::fprintf(stderr, "[kimi] GPU context reserved on CUDA device %d (before load)\n",
-                 q.device.index);
-  } else {
-    std::fprintf(stderr, "[kimi] CPU queue (won't fit the full model — smoke only)\n");
+  std::fprintf(stderr, "[kimi] libvllm %s (ABI %d, header %d)\n", vllm_version(),
+               vllm_abi_version(), VLLM_ABI_VERSION);
+
+  vllm_model_params mp = vllm_model_params_default();
+  mp.model_path = model.c_str();
+  mp.max_model_len = max_model_len;
+  vllm_engine* eng = nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  const vllm_status lst = vllm_engine_load(&mp, &eng);
+  const auto t1 = std::chrono::steady_clock::now();
+  if (lst != VLLM_OK) {
+    std::fprintf(stderr, "[kimi] engine load FAILED: %s\n", vllm_last_error());
+    return 1;
+  }
+  std::fprintf(stderr, "[kimi] engine loaded in %.1fs\n",
+               std::chrono::duration<double>(t1 - t0).count());
+  if (load_only) {
+    vllm_engine_free(eng);
+    return 0;
   }
 
-  const std::string config_path = (fs::path(model) / "config.json").string();
-  std::fprintf(stderr, "[kimi] config %s\n", config_path.c_str());
-  const vllm::HfConfig config = vllm::LoadHfConfig(config_path);
-  std::vector<vllm::SafetensorsFile> shards = OpenSafetensorsDir(model);
-  std::fprintf(stderr,
-               "[kimi] %zu safetensors shard(s); loading bf16-resident tower "
-               "(RSS before %.1f GiB)...\n",
-               shards.size(), CurResidentGiB());
-
-  const auto t0 = std::chrono::steady_clock::now();
-  vllm::KimiLinearWeights w = vllm::LoadKimiLinearResidentBf16Weights(
-      shards, config, use_gpu ? &q : nullptr);
-  const auto t1 = std::chrono::steady_clock::now();
-  std::fprintf(stderr,
-               "[kimi] LOADED bf16-resident: layers=%lld experts=%lld vocab=%lld | "
-               "load %.1fs | RSS %.1f GiB PEAK %.1f GiB\n",
-               (long long)w.params.num_hidden_layers, (long long)w.params.num_experts,
-               (long long)w.params.vocab_size,
-               std::chrono::duration<double>(t1 - t0).count(), CurResidentGiB(),
-               PeakResidentGiB());
-
-  // Drop the mmap'd shards (the loader copied every tensor into owned buffers).
-  const size_t n_shards = shards.size();
-  shards.clear();
-  shards.shrink_to_fit();
-  std::fprintf(stderr, "[kimi] released %zu mmap'd shard(s); RSS %.1f GiB\n", n_shards,
-               CurResidentGiB());
-  if (load_only) return 0;
-
-  // Greedy decode + compare to the STRICT golden.
-  const int64_t V = w.params.vocab_size;
-  vllm::v1::CommonAttentionMetadata attn_meta{};
-  std::vector<vllm::PagedKvCache> attn_kv;
-  vt::Backend& be = vt::GetBackend(q.device.type);
-
   NpyInts gold;
-  bool have_golden = !golden.empty();
+  const bool have_golden = !golden.empty();
   if (have_golden) {
     gold = ReadNpyInts((fs::path(golden) / "greedy_ids.npy").string());
     std::fprintf(stderr, "[kimi] golden greedy_ids shape [%lld,%lld]\n",
@@ -214,78 +152,59 @@ int main(int argc, char** argv) {
                  (long long)(gold.shape.size() > 1 ? gold.shape[1] : 0));
   }
 
+  vllm_sampling_params sp = vllm_sampling_params_default();
+  sp.temperature = 0.0f;  // greedy
+  sp.max_tokens = steps;
+  sp.ignore_eos = 1;
+
   int total = 0, matched = 0;
-  double first_tok_s = 0.0;
-  int steady_steps = 0;
-  double steady_s = 0.0;
+  double first_prompt_full_s = 0.0, first_prompt_one_s = 0.0;
   for (int pi = 0; pi < prompts; ++pi) {
     std::vector<int32_t> prompt;
     if (have_golden) {
       const std::string pp =
           (fs::path(golden) / ("p" + std::to_string(pi) + "_prompt.i32")).string();
-      prompt = ReadI32File(pp);
+      try { prompt = ReadI32File(pp); } catch (const std::exception& e) {
+        std::fprintf(stderr, "[kimi] prompt %d: %s — skip\n", pi, e.what());
+        continue;
+      }
     }
     if (prompt.empty()) { std::fprintf(stderr, "[kimi] prompt %d empty, skip\n", pi); continue; }
 
-    std::vector<int32_t> seq = prompt;
-    std::vector<int32_t> gen;
-    auto argmax_row = [&](const vllm::ForwardLogits& fl) {
-      std::vector<float> row(static_cast<size_t>(V));
-      be.Copy(q, row.data(), fl.device_tensor.data, row.size() * sizeof(float));
-      be.Synchronize(q);
-      int best = 0;
-      float bv = row[0];
-      for (int64_t o = 1; o < V; ++o)
-        if (row[static_cast<size_t>(o)] > bv) { bv = row[static_cast<size_t>(o)]; best = static_cast<int>(o); }
-      return best;
-    };
-    if (incremental) {
-      // §18 paged-incremental: PREFILL the prompt ONCE (fills the cache), then decode
-      // one token per step from the CARRIED state — no O(n²) recompute.
-      vllm::KimiDecodeCache cache;
-      std::vector<int32_t> positions(prompt.size());
-      for (size_t t = 0; t < prompt.size(); ++t) positions[t] = static_cast<int32_t>(t);
-      const std::vector<int32_t> li = {static_cast<int32_t>(prompt.size() - 1)};
-      const auto tp0 = std::chrono::steady_clock::now();
-      vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardPrefillIncremental(
-          prompt, positions, w, q, cache, li);
-      int best = argmax_row(fl);
-      const auto tp1 = std::chrono::steady_clock::now();
-      if (pi == 0) first_tok_s = std::chrono::duration<double>(tp1 - tp0).count();
-      gen.push_back(best);
-      for (int s = 1; s < steps; ++s) {
-        const auto ts = std::chrono::steady_clock::now();
-        vllm::ForwardLogits d = vllm::KimiLinearModel::ForwardDecodeStepIncremental(
-            best, cache.seq_len, w, q, cache);
-        best = argmax_row(d);
-        const auto te = std::chrono::steady_clock::now();
-        steady_s += std::chrono::duration<double>(te - ts).count();
-        ++steady_steps;
-        gen.push_back(best);
-      }
-    } else {
-      for (int s = 0; s < steps; ++s) {
-        std::vector<int32_t> positions(seq.size());
-        for (size_t t = 0; t < seq.size(); ++t) positions[t] = static_cast<int32_t>(t);
-        const std::vector<int32_t> li = {static_cast<int32_t>(seq.size() - 1)};
-        const auto ts = std::chrono::steady_clock::now();
-        vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDeviceCompute(
-            seq, positions, attn_meta, attn_kv, w, q, li);
-        int best = argmax_row(fl);
-        const auto te = std::chrono::steady_clock::now();
-        const double dt = std::chrono::duration<double>(te - ts).count();
-        if (pi == 0 && s == 0) first_tok_s = dt;
-        else { steady_s += dt; ++steady_steps; }
-        gen.push_back(best);
-        seq.push_back(best);
+    std::vector<int32_t> gen(static_cast<size_t>(steps), 0);
+    int32_t n_gen = 0;
+    const auto ts = std::chrono::steady_clock::now();
+    const vllm_status st = vllm_complete_tokens(
+        eng, prompt.data(), static_cast<int32_t>(prompt.size()), &sp, gen.data(),
+        static_cast<int32_t>(gen.size()), &n_gen, nullptr);
+    const auto te = std::chrono::steady_clock::now();
+    if (st != VLLM_OK) {
+      std::fprintf(stderr, "[kimi] prompt %d FAILED: %s\n", pi, vllm_last_error());
+      vllm_engine_free(eng);
+      return 1;
+    }
+    if (pi == 0) {
+      first_prompt_full_s = std::chrono::duration<double>(te - ts).count();
+      // Two-length diff for the steady decode rate: re-run the same prompt at
+      // max_tokens=1 and subtract (prefix caching is off by default on the
+      // hybrid archs, so both runs pay the same prefill).
+      vllm_sampling_params sp1 = sp;
+      sp1.max_tokens = 1;
+      int32_t one_tok = 0;
+      int32_t n_one = 0;
+      const auto u0 = std::chrono::steady_clock::now();
+      if (vllm_complete_tokens(eng, prompt.data(),
+                               static_cast<int32_t>(prompt.size()), &sp1, &one_tok,
+                               1, &n_one, nullptr) == VLLM_OK) {
+        const auto u1 = std::chrono::steady_clock::now();
+        first_prompt_one_s = std::chrono::duration<double>(u1 - u0).count();
       }
     }
 
-    // compare to golden row pi.
     if (have_golden && pi < (gold.shape.empty() ? 0 : static_cast<int>(gold.shape[0]))) {
       const int64_t T = gold.shape.size() > 1 ? gold.shape[1] : 0;
       int row_match = 0;
-      const int n = static_cast<int>(std::min<int64_t>(T, steps));
+      const int n = static_cast<int>(std::min<int64_t>(T, n_gen));
       std::string got, exp;
       for (int t = 0; t < n; ++t) {
         const int64_t g = gold.data[static_cast<size_t>(pi) * T + t];
@@ -295,13 +214,15 @@ int main(int argc, char** argv) {
         ++total;
         if (static_cast<int64_t>(o) == g) { ++matched; ++row_match; }
       }
-      std::fprintf(stderr, "[kimi] prompt %d: %d/%d tokens match golden\n", pi, row_match, n);
-      if (row_match != n) {
-        std::fprintf(stderr, "        got: %s\n        exp: %s\n", got.c_str(), exp.c_str());
-      }
+      std::fprintf(stderr, "[kimi] prompt %d: %d/%d tokens match golden\n", pi,
+                   row_match, n);
+      if (row_match != n)
+        std::fprintf(stderr, "        got: %s\n        exp: %s\n", got.c_str(),
+                     exp.c_str());
     } else {
       std::string got;
-      for (int t = 0; t < steps; ++t) got += std::to_string(gen[static_cast<size_t>(t)]) + ",";
+      for (int t = 0; t < n_gen; ++t)
+        got += std::to_string(gen[static_cast<size_t>(t)]) + ",";
       std::fprintf(stderr, "[kimi] prompt %d gen: %s\n", pi, got.c_str());
     }
   }
@@ -309,10 +230,15 @@ int main(int argc, char** argv) {
   if (have_golden)
     std::fprintf(stderr, "\n[kimi] TOKEN MATCH: %d/%d  (%s)\n", matched, total,
                  matched == total ? "STRICT PASS" : "DIVERGENCE");
-  if (steady_steps > 0)
-    std::fprintf(stderr, "[kimi] first-step %.3fs | steady %.3f s/step (%.2f tok/s) over %d steps\n",
-                 first_tok_s, steady_s / steady_steps, steady_steps / steady_s, steady_steps);
-  std::fprintf(stderr, "[kimi] RSS %.1f GiB PEAK %.1f GiB\n", CurResidentGiB(),
-               PeakResidentGiB());
+  if (first_prompt_full_s > 0.0 && first_prompt_one_s > 0.0 && steps > 1) {
+    const double steady = (first_prompt_full_s - first_prompt_one_s) /
+                          static_cast<double>(steps - 1);
+    std::fprintf(stderr,
+                 "[kimi] p0 wall %.3fs (N=%d) vs %.3fs (N=1) => steady %.3f "
+                 "s/tok (%.2f tok/s, two-length diff)\n",
+                 first_prompt_full_s, steps, first_prompt_one_s, steady,
+                 steady > 0 ? 1.0 / steady : 0.0);
+  }
+  vllm_engine_free(eng);
   return (have_golden && matched != total) ? 1 : 0;
 }

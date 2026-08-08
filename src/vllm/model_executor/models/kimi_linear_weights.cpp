@@ -32,6 +32,7 @@
 #include "vllm/model_executor/models/kimi_linear.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -42,6 +43,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"  // dense_loaders::LoadBf16Direct/MakeOwned
+#include "vllm/model_executor/models/mla_attention.h"          // mla::AbsorbKvBProjBf16 (ROW 7)
 #include "vllm/platforms/interface.h"                          // platforms::GetPlatform (is_cpu)
 #include "vt/backend.h"                                        // vt::GetBackend (device staging)
 #include "vt/dtype.h"
@@ -513,6 +515,43 @@ KimiLinearWeights LoadKimiLinearForCausalLMWeights(
 }
 
 // ─── bf16-RESIDENT loader + builder + stager (§13) ─────────────────────────────
+
+// ROW 7 (§20.3c): absorb kv_b_proj into the decode bmm forms W_UK_T/W_UV at LOAD
+// time (mla::AbsorbKvBProjBf16 — mla_attention.py:875-962). Must run while the
+// kv_b host bf16 bytes are live: the staging path releases them, so the caller
+// loads kv_b WITHOUT staging, absorbs here, then stages all three. The absorbed
+// forms power the paged-FA2 NoPE-MLA arm (mla::ForwardMlaAttentionBlock).
+static void AbsorbKimiMla(MlaResidentWeights& m, const KimiLinearParams& p,
+                          vt::Queue* stage_queue) {
+  mla::MlaBlockDims dm;
+  dm.hidden_size = p.hidden_size;
+  dm.num_heads = p.num_attention_heads;
+  dm.qk_nope_head_dim = p.qk_nope_head_dim;
+  dm.qk_rope_head_dim = p.qk_rope_head_dim;
+  dm.v_head_dim = p.v_head_dim;
+  dm.kv_lora_rank = p.kv_lora_rank;
+  dm.q_lora_rank = 0;  // the no-q-lora branch (kimi_linear.py:214-215)
+  dm.rms_norm_eps = p.rms_norm_eps;
+  // NoPE: plain qk_head_dim^-0.5, no YaRN (mla_use_nope, rotary_emb=None) —
+  // kimi_linear.py:212 `self.scaling = self.qk_head_dim**-0.5`.
+  dm.scale = static_cast<float>(
+      std::pow(static_cast<double>(dm.qk_head_dim()), -0.5));
+  VT_CHECK(m.kv_b_proj.HasHostBytes(),
+           "kimi resident: kv_b_proj host bytes must be live for absorption");
+  const auto* w = reinterpret_cast<const uint16_t*>(m.kv_b_proj.bytes.data());
+  mla::AbsorbedKvBProj ab = mla::AbsorbKvBProjBf16(w, dm);
+  const auto own = [&](const std::vector<uint16_t>& v,
+                       const std::vector<int64_t>& shape) {
+    OwnedTensor o = dense_loaders::MakeOwned(vt::DType::kBF16, shape);
+    std::memcpy(o.bytes.data(), v.data(), v.size() * sizeof(uint16_t));
+    if (stage_queue != nullptr) StageKimiResidentBf16(*stage_queue, o);
+    return o;
+  };
+  m.w_uk_t =
+      own(ab.w_uk_t, {dm.num_heads, dm.qk_nope_head_dim, dm.kv_lora_rank});
+  m.w_uv = own(ab.w_uv, {dm.num_heads, dm.kv_lora_rank, dm.v_head_dim});
+}
+
 void StageKimiResidentBf16(vt::Queue& queue, const OwnedTensor& w) {
   if (w.d_dev || !w.HasHostBytes()) return;  // already staged / nothing to stage
   // CPU: the device forward aliases the host bytes directly (host-pointer aliasing is
@@ -595,7 +634,11 @@ KimiLinearWeights LoadKimiLinearResidentBf16Weights(
       m.q_proj = big(a + "q_proj.weight");
       m.kv_a_proj_with_mqa = big(a + "kv_a_proj_with_mqa.weight");
       m.kv_a_layernorm = vecf(a + "kv_a_layernorm.weight");
-      m.kv_b_proj = big(a + "kv_b_proj.weight");
+      // kv_b: load WITHOUT immediate staging so the host bf16 bytes are live for
+      // the W_UK_T/W_UV absorption (ROW 7 §20.3c), then stage it like the rest.
+      m.kv_b_proj = dense_loaders::LoadBf16Direct(get, a + "kv_b_proj.weight");
+      AbsorbKimiMla(m, p, stage_queue);
+      if (stage_queue != nullptr) StageKimiResidentBf16(*stage_queue, m.kv_b_proj);
       m.o_proj = big(a + "o_proj.weight");
     }
 
@@ -679,6 +722,7 @@ KimiLinearResidentWeights BuildKimiResidentFromHost(const KimiLinearHostWeights&
       rm.kv_b_proj = Bf16OwnedFromF32(hm.kv_b_proj);
       rm.o_proj = Bf16OwnedFromF32(hm.o_proj);
       rm.kv_a_layernorm = hm.kv_a_layernorm;
+      AbsorbKimiMla(rm, p, /*stage_queue=*/nullptr);  // ROW 7 §20.3c
     }
     rl.is_moe = hl.is_moe;
     if (hl.is_moe) {

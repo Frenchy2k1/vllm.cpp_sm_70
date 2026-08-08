@@ -7,6 +7,7 @@ import argparse
 import ast
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 
@@ -125,15 +126,15 @@ BENCHMARKS_RELEASE_ROW = (
     "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
     "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
     "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states, "
-    "and 20 tests. No archive, staged smoke, runtime, correctness, or performance "
+    "and 22 tests. No archive, staged smoke, runtime, correctness, or performance "
     "evidence "
     "| n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
-    "Supported subset; bundles SPIKED, no artifacts",
+    "Supported (subset); bundles SPIKED, no artifacts",
     "primary fat CUDA/adaptive CPU, W1-W13/W10-W12 policy, pending claims, and "
-    "20-test inventory mutation-gated; per-SM diagnostics optional; no "
+    "22-test inventory mutation-gated; per-SM diagnostics optional; no "
     "archive/runtime claim",
 )
 
@@ -168,7 +169,7 @@ PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
         "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states, and 20 tests. No archive, "
+        "W1-W13/W10-W12 policy, public pending states, and 22 tests. No archive, "
         "staged smoke, runtime, correctness, or performance evidence",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
@@ -176,7 +177,7 @@ PUBLIC_PENDING_MUTATIONS = (
     ),
     (
         "docs/STATUS.md",
-        "Supported subset; bundles SPIKED, no artifacts",
+        "Supported (subset); bundles SPIKED, no artifacts",
         "Supported; bundles SHIPPED with runtime evidence",
         "docs/STATUS.md release row",
     ),
@@ -222,8 +223,10 @@ REQUIRED_TEST_METHODS = (
     "test_per_sm_cuda_must_not_become_primary",
     "test_primary_cpu_must_stay_one_adaptive_binary_per_host_abi",
     "test_x86_64_baseline_must_not_require_avx2",
+    "test_each_exact_machine_field_is_fail_closed",
     "test_work_table_has_explicit_deps_column",
     "test_each_work_dependency_edge_is_pinned",
+    "test_each_human_work_row_id_occurs_exactly_once",
     "test_optional_w12_does_not_block_w13",
     "test_each_required_record_anchor_is_fail_closed",
     "test_release_lifecycle_and_honesty_are_fail_closed",
@@ -239,7 +242,9 @@ REQUIRED_TEST_METHODS = (
 
 EXPECTED_TEST_LITERAL_INVENTORY_KEYS = (
     "PRIMARY_CUDA_SMS",
+    "EXACT_MACHINE_FIELDS",
     "EXPECTED_DEPS",
+    "HUMAN_WORK_IDS",
     "RECORD_ANCHORS",
     "LIFECYCLE_RECORD_MUTATIONS",
     "PUBLIC_PENDING_MUTATIONS",
@@ -250,7 +255,9 @@ EXPECTED_TEST_LITERAL_INVENTORY_KEYS = (
 
 EXPECTED_TEST_INVENTORY_CONSUMER_KEYS = (
     "PRIMARY_CUDA_SMS",
+    "EXACT_MACHINE_FIELDS",
     "EXPECTED_DEPS",
+    "HUMAN_WORK_IDS",
     "RECORD_ANCHORS",
     "LIFECYCLE_RECORD_MUTATIONS",
     "PUBLIC_PENDING_MUTATIONS",
@@ -266,7 +273,19 @@ EXPECTED_GUARD_MAP_KEYS = {
 
 TEST_LITERAL_INVENTORIES = {
     "PRIMARY_CUDA_SMS": PRIMARY_CUDA_SMS,
+    "EXACT_MACHINE_FIELDS": {
+        "lifecycle": "SPIKE",
+        "work_W12_policy": "optional-non-blocking",
+        "archive_claims": "pending",
+        "runtime_claims": "pending",
+        "required_anchor_paths": (
+            ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
+            ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
+            "docs/BENCHMARKS.md"
+        ),
+    },
     "EXPECTED_DEPS": {work: ",".join(deps) for work, deps in WORK_DEPS.items()},
+    "HUMAN_WORK_IDS": tuple(WORK_DEPS),
     "RECORD_ANCHORS": ANCHORS,
     "LIFECYCLE_RECORD_MUTATIONS": LIFECYCLE_RECORD_MUTATIONS,
     "PUBLIC_PENDING_MUTATIONS": PUBLIC_PENDING_MUTATIONS,
@@ -281,10 +300,20 @@ TEST_INVENTORY_CONSUMERS = {
         ("sm",),
         False,
     ),
+    "EXACT_MACHINE_FIELDS": (
+        "test_each_exact_machine_field_is_fail_closed",
+        ("field", "expected"),
+        True,
+    ),
     "EXPECTED_DEPS": (
         "test_each_work_dependency_edge_is_pinned",
         ("work", "deps"),
         True,
+    ),
+    "HUMAN_WORK_IDS": (
+        "test_each_human_work_row_id_occurs_exactly_once",
+        ("work",),
+        False,
     ),
     "RECORD_ANCHORS": (
         "test_each_required_record_anchor_is_fail_closed",
@@ -318,23 +347,31 @@ TEST_INVENTORY_CONSUMERS = {
     ),
 }
 
+EXACT_MACHINE_FIELDS = {
+    "lifecycle": "SPIKE",
+    "work_W12_policy": "optional-non-blocking",
+    "archive_claims": "pending",
+    "runtime_claims": "pending",
+    "required_anchor_paths": (
+        ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
+        ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
+        "docs/BENCHMARKS.md"
+    ),
+}
+
 EXPECTED_FIELDS = {
     "identity": IDENTITY,
-    "lifecycle": "SPIKE",
     "primary_cuda_artifact": "one-fat-binary-per-os-host-abi",
     "primary_cuda_sms": ",".join(PRIMARY_CUDA_SMS),
     "per_sm_cuda": "optional-non-primary",
     "primary_cpu_artifact": "one-adaptive-binary-per-os-host-abi",
     "x86_64_baseline": "portable-sse2-without-avx2",
-    "work_W12_policy": "optional-non-blocking",
-    "archive_claims": "pending",
-    "runtime_claims": "pending",
-    "required_anchor_paths": ",".join(ANCHORS),
+    **EXACT_MACHINE_FIELDS,
     **{f"work_{work}": ",".join(deps) for work, deps in WORK_DEPS.items()},
 }
 
 WORK_ROW = re.compile(
-    r"^\|\s*(W(?:[1-9]|1[0-3]))\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|",
+    r"^\|\s*(W[0-9]+)\s*\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|",
     re.M,
 )
 
@@ -684,11 +721,18 @@ def contract_errors(root: Path) -> list[str]:
     if header not in text:
         errors.append("release work table is missing its explicit Deps column")
     parsed_rows = WORK_ROW.findall(text)
-    rows = {work: _normalize_deps(deps) for work, deps, _, _ in parsed_rows}
-    if set(rows) != set(WORK_DEPS):
+    work_counts = Counter(work for work, _, _, _ in parsed_rows)
+    expected_work = set(WORK_DEPS)
+    missing_work = sorted(expected_work - set(work_counts))
+    unexpected_work = sorted(set(work_counts) - expected_work)
+    duplicate_work = sorted(work for work, count in work_counts.items() if count > 1)
+    if missing_work or unexpected_work or duplicate_work:
         errors.append(
-            f"release work table rows are {sorted(rows)}; expected W1-W13 exactly"
+            "release work table IDs must occur exactly once; "
+            f"missing={missing_work}, unexpected={unexpected_work}, "
+            f"duplicates={duplicate_work}"
         )
+    rows = {work: _normalize_deps(deps) for work, deps, _, _ in parsed_rows}
     for work, expected in WORK_DEPS.items():
         if rows.get(work) != expected:
             errors.append(

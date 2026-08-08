@@ -17,7 +17,10 @@ static bool c_header_token_cb(const char* delta_text, bool finished,
 }
 
 /* Instantiate the POD structs + a status value so the C compiler actually lays
- * them out, and reference every ABI entry point so the declarations are used. */
+ * them out, and reference every ABI entry point so the declarations are used —
+ * including the v11 transcription slice, the v12 video slice, and the v14
+ * device field (this file went stale between v10 and v12; the claim above is
+ * only honest if new surface lands HERE in the same change). */
 int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
   vllm_model_params mp = vllm_model_params_default();
   vllm_sampling_params sp = vllm_sampling_params_default();
@@ -26,12 +29,21 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
   vllm_request* request = NULL;
   vllm_status st = VLLM_OK;
 
+  mp.device = 0; /* ABI v14: 0=auto (the accelerator-first probe default). */
+
   st = vllm_engine_load(&mp, &eng);
   if (st == VLLM_OK) {
     st = vllm_complete(eng, prompt, &sp, &out);
     vllm_completion_free(&out);
     vllm_string_free(out.text);
     st = vllm_complete_stream(eng, prompt, &sp, cb, /*user_data=*/NULL);
+    {
+      const int32_t prompt_ids[1] = {1};
+      int32_t out_ids[4];
+      int32_t n_out = 0;
+      st = vllm_complete_tokens(eng, prompt_ids, 1, &sp, out_ids, 4, &n_out,
+                                /*out=*/NULL);
+    }
     st = vllm_request_submit(eng, prompt, &sp, cb, /*user_data=*/NULL,
                              &request);
     if (request != NULL) {
@@ -41,7 +53,46 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
       st = vllm_request_wait(request);
       vllm_request_free(request);
     }
+
+    /* Chat entry points (ABI v3). */
+    {
+      char* response_json = NULL;
+      st = vllm_chat(eng, "{}", &response_json);
+      vllm_string_free(response_json);
+      st = vllm_chat_stream(eng, "{}", cb, /*user_data=*/NULL);
+    }
+
+    /* Audio transcription (ABI v11). */
+    {
+      vllm_transcription_params tp = vllm_transcription_params_default();
+      vllm_transcription transcript;
+      st = vllm_transcribe(eng, &tp, &transcript);
+      vllm_transcription_free(&transcript);
+    }
+
     vllm_engine_free(eng);
+  }
+
+  /* Video+audio generation (ABI v12): the separate vllm_video_engine handle
+   * plus the engine-free mux-argv composer. */
+  {
+    vllm_video_model_params vmp = vllm_video_model_params_default();
+    vllm_video_params vp = vllm_video_params_default();
+    vllm_video_engine* veng = NULL;
+    st = vllm_video_engine_load(&vmp, &veng);
+    if (st == VLLM_OK) {
+      vllm_video_result vres;
+      st = vllm_video_generate(veng, &vp, &vres);
+      vllm_video_result_free(&vres);
+      vllm_video_engine_free(veng);
+    }
+    {
+      vllm_video_mux_params mux = vllm_video_mux_params_default();
+      char** mux_argv = NULL;
+      int32_t mux_argc = 0;
+      st = vllm_video_mux_argv(&mux, &mux_argv, &mux_argc);
+      vllm_video_mux_argv_free(mux_argv, mux_argc);
+    }
   }
 
   (void)vllm_last_error();
