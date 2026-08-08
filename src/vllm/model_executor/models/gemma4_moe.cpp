@@ -95,6 +95,31 @@ void EnsureGemma4Fp8ExpertCached(const Gemma4Fp8ExpertMats& ex, int64_t I, int64
                           ex.cached_dn.data());
 }
 
+// Host BF16 cache + device upload once (subsequent tokens use device GEMM path).
+bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I,
+                                   int64_t H) {
+  EnsureGemma4Fp8ExpertCached(ex, I, H);
+  if (ex.dev_gu != nullptr && ex.dev_dn != nullptr) return true;
+  const size_t gu_b = static_cast<size_t>(2 * I * H) * sizeof(uint16_t);
+  const size_t dn_b = static_cast<size_t>(H * I) * sizeof(uint16_t);
+  void* gu = nullptr;
+  void* dn = nullptr;
+  try {
+    gu = d.b.Alloc(gu_b);
+    dn = d.b.Alloc(dn_b);
+    d.b.Copy(d.q, gu, ex.cached_gu.data(), gu_b);
+    d.b.Copy(d.q, dn, ex.cached_dn.data(), dn_b);
+    d.b.Synchronize(d.q);
+    ex.dev_gu = gu;
+    ex.dev_dn = dn;
+    return true;
+  } catch (...) {
+    if (gu) d.b.Free(gu);
+    if (dn) d.b.Free(dn);
+    return false;  // fall back to host H2D path
+  }
+}
+
 void DequantGemma4Fp8ExpertToBf16(const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H,
                                   uint16_t* gate_up_out, uint16_t* down_out) {
   VT_CHECK(gate_up_out && down_out, "fp8 expert dequant null out");
@@ -203,8 +228,13 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
         ExpertGeGLUDevice(d, y, xin.t(), gu, dn, I, H);
       } else if (ex.is_fp8) {
         const auto& fex = ex.fp8[static_cast<size_t>(e)];
-        EnsureGemma4Fp8ExpertCached(fex, I, H);
-        ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H);
+        if (EnsureGemma4Fp8ExpertOnDevice(d, fex, I, H)) {
+          ExpertGeGLUDevice(d, y, xin.t(), static_cast<const uint16_t*>(fex.dev_gu),
+                            static_cast<const uint16_t*>(fex.dev_dn), I, H);
+        } else {
+          EnsureGemma4Fp8ExpertCached(fex, I, H);
+          ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H);
+        }
       } else {
         ExpertGeGLUHost(d, y, xin.t(), gu_host + static_cast<int64_t>(e) * gu_stride,
                         dn_host + static_cast<int64_t>(e) * dn_stride, I, H);

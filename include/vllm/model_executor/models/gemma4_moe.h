@@ -25,6 +25,9 @@ struct Gemma4Fp8ExpertMats {
   // Lazy host BF16 cache after first dequant (decode reuse).
   mutable std::vector<uint16_t> cached_gu;  // [2I,H]
   mutable std::vector<uint16_t> cached_dn;  // [H,I]
+  // Lazy device BF16 copy on compute GPU (avoids H2D every token).
+  mutable void* dev_gu = nullptr;  // [2I,H] bf16
+  mutable void* dev_dn = nullptr;  // [H,I] bf16
 };
 
 struct Gemma4FusedExperts {
