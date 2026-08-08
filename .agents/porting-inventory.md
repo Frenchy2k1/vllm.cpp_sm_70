@@ -977,6 +977,23 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     the sole possible source. **Method rule this earns: a grep against the
     installed package is not evidence about upstream. Record the version you
     measured, and check `main` before writing "no upstream" into the record.**
+14. **ROCm integrated-APU managed allocation (`BACKEND-ROCM` W1, approach (b)
+    from issue #41 F6, maintainer-ratified 2026-08-08).** On a device probing
+    `hipDeviceAttributeIntegrated=1` + `ManagedMemory=1` +
+    `ConcurrentManagedAccess=1`, `RocmBackend::Alloc` uses
+    `hipMallocManaged(hipMemAttachGlobal)` and `UnifiedMemory()` returns true
+    exactly then, so the CPU reference tier's host-dereference contract is
+    API-guaranteed on XNACK-less RDNA3 APUs (gfx1151/gfx1103 measure
+    `PageableMemoryAccess=0`, vetoing the CUDA-shaped W0 probe even though the
+    aliasing holds). **No upstream analog exists to mirror:** allocation is
+    torch's job in vLLM, `vllm/platforms/rocm.py` knows the APUs only as
+    device-name map entries (`rocm.py:75-77`) plus `is_navi`
+    (`rocm.py:909-910`), and `csrc/` has no `hipMallocManaged` call at the
+    pin — so this is ADDITIVE, grounded in the issue-41 measurements
+    (community F6 report), not in an upstream file. Discrete devices are
+    byte-identical to W0 (`Integrated=0` kills the branch). Spec:
+    `specs/rocm-unified-memory-b.md`; blind-written, community compile+ctest
+    evidence PENDING.
 
 ## 10. E2E test suites (T0 deliverable)
 

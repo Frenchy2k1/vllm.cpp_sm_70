@@ -1,13 +1,15 @@
-// ROCm leg of the vt::Backend seam (BACKEND-ROCM, W0 skeleton).
+// ROCm leg of the vt::Backend seam (BACKEND-ROCM, W0 skeleton + W1 approach-(b)
+// unified-memory fix).
 //
-// **UNBUILT.** No AMD GPU exists on the authoring machine, so this translation
-// unit has never been compiled by anyone. That is weaker than the project's
-// "build-supported" label (which means it compiles and emits real machine code)
-// and it must not be quoted as such until a contributor reports a build. It is
-// written to be the smallest possible thing a first compile can be wrong about:
-// the one piece with a DECISION in it (the gfx capability parse) was lifted out
-// into include/vt/rocm/rocm_arch.h, which IS compiled and unit-tested on a
-// CPU-only box (tests/vt/test_rocm_arch.cpp, 40 assertions).
+// BUILD STATE, kept honest per issue #41: the W0 version of this TU was
+// compiled clean AND ran its ctest gates on community boards — gfx1151 (Strix
+// Halo, jimmykarily), gfx1103 (Radeon 780M, arch-btw), gfx1100 (4x 7900 XTX,
+// VikashLoomba) and gfx1201 (2x R9700, bakon11). The approach-(b) DELTA in this
+// revision is again written blind (no AMD GPU on the authoring machine) and
+// owes the same community compile evidence before it may be called anything
+// stronger. The one piece with a DECISION in it (the gfx capability parse)
+// remains lifted out into include/vt/rocm/rocm_arch.h, which IS compiled and
+// unit-tested on a CPU-only box (tests/vt/test_rocm_arch.cpp, 40 assertions).
 //
 // SHAPE: src/vt/cuda/cuda_backend.cu, virtual for virtual, including its
 // unified-memory reasoning (see UnifiedMemory below) and its multi-device
@@ -50,13 +52,16 @@ void Check(hipError_t err, const char* what) {
 
 hipStream_t AsStream(const Queue& q) { return static_cast<hipStream_t>(q.handle); }
 
-// One probe per device, cached: the registrar needs the residency attributes and
-// the capability together, and hipGetDeviceProperties is not free. Mirrors
-// vt/cuda/cuda_device_caps.h, kept local because there is no second consumer yet.
+// One probe gathers the residency attributes and the capability together.
+// Mirrors vt/cuda/cuda_device_caps.h in shape but is NOT cached (every consumer
+// is init-time or test-time, never per-step), and stays file-local: the public
+// probes below re-run it rather than exporting the struct.
 struct DeviceCaps {
   bool valid = false;
   bool integrated = false;
   bool pageable_memory_access = false;
+  bool managed_memory = false;
+  bool concurrent_managed_access = false;
   int major = 0;
   int minor = 0;
   std::string gcn_arch;
@@ -89,27 +94,94 @@ DeviceCaps ProbeDevice(int index) noexcept {
   }
   caps.integrated = integrated != 0;
   caps.pageable_memory_access = pageable != 0;
+  // The MANAGED-memory attributes decide the approach-(b) allocation branch
+  // below. A failed probe of either must not unregister the device the way the
+  // two probes above do: both default to 0, which disables the managed branch
+  // and the unified claim — the safe direction (an APU then behaves like W0:
+  // registered, discrete-shaped, no CPU fallback tier).
+  int managed = 0;
+  int concurrent = 0;
+  if (hipDeviceGetAttribute(&managed, hipDeviceAttributeManagedMemory, index) != hipSuccess) {
+    managed = 0;
+  }
+  if (hipDeviceGetAttribute(&concurrent, hipDeviceAttributeConcurrentManagedAccess, index) !=
+      hipSuccess) {
+    concurrent = 0;
+  }
+  caps.managed_memory = managed != 0;
+  caps.concurrent_managed_access = concurrent != 0;
   caps.valid = true;
   return caps;
+}
+
+// APPROACH (b) FROM ISSUE #41 F6, maintainer-ratified 2026-08-08: "On a device
+// reporting hipDeviceAttributeIntegrated=1 (and ManagedMemory=1 +
+// ConcurrentManagedAccess=1), Backend::Alloc in the ROCm backend uses
+// hipMallocManaged instead of hipMalloc, and UnifiedMemory() returns true
+// exactly then — host access becomes API-guaranteed rather than architecturally
+// incidental."
+//
+// Why the W0 probe alone was not enough (measured on gfx1151, confirmed on
+// gfx1103): XNACK-less RDNA3 APUs report Integrated=1 but
+// PageableMemoryAccess=0, so the CUDA-shaped conjunction below read false even
+// though host dereference of hipMalloc memory demonstrably worked — an
+// architectural accident this project refuses to gate memory safety on. The
+// managed route makes the aliasing a documented API property instead. All three
+// attributes measured 1 on gfx1151 (Strix Halo) and gfx1103 (Radeon 780M).
+//
+// A discrete card reports Integrated=0, so this returns false — the branch is
+// provably dead — on every dGPU, and the discrete path stays byte-identical to
+// W0.
+bool UseManagedAlloc(const DeviceCaps& caps) noexcept {
+  return caps.integrated && caps.managed_memory && caps.concurrent_managed_access;
 }
 
 class RocmBackend final : public Backend {
  public:
   // Non-throwing by design: constructed during static init by the registrar,
   // which probes the device beforehand. Same contract as CudaBackend.
-  RocmBackend(int device, bool unified_memory, int major, int minor) noexcept
-      : device_(device), unified_memory_(unified_memory), major_(major), minor_(minor) {}
+  RocmBackend(int device, bool unified_memory, bool managed_alloc, int major, int minor) noexcept
+      : device_(device),
+        unified_memory_(unified_memory),
+        managed_alloc_(managed_alloc),
+        major_(major),
+        minor_(minor) {}
 
   int DeviceCapabilityMajor() const override { return major_; }
   int DeviceCapabilityMinor() const override { return minor_; }
 
-  // hipMalloc's alignment is at least 256 bytes, as cudaMalloc's is, which
-  // satisfies the >= 64B contract Backend::Alloc owes StepArena.
+  // Both branches satisfy the >= 64B contract Backend::Alloc owes StepArena:
+  // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
+  // allocations are at least page-granular.
   void* Alloc(size_t bytes) override {
     void* p = nullptr;
-    Check(hipMalloc(&p, bytes), "hipMalloc");
+    if (managed_alloc_ && bytes > 0) {
+      // Approach (b), issue #41 F6: on an integrated managed-capable device,
+      // every Backend::Alloc block is a MANAGED allocation, so host access to
+      // it is guaranteed by the API (ManagedMemory=1 +
+      // ConcurrentManagedAccess=1 are preconditions of this branch), which is
+      // exactly the property UnifiedMemory()==true advertises and the CPU
+      // reference tier depends on. hipMemAttachGlobal (the API default) keeps
+      // the block accessible from every stream and every device.
+      //
+      // The bytes==0 case stays on hipMalloc so the zero-size contract
+      // (success, nullptr out) is byte-identical to W0 on every device rather
+      // than resting on hipMallocManaged's less-documented zero-size behavior.
+      Check(hipMallocManaged(&p, bytes, hipMemAttachGlobal), "hipMallocManaged");
+    } else {
+      Check(hipMalloc(&p, bytes), "hipMalloc");
+    }
     return p;
   }
+  // ONE free path for both Alloc branches, deliberately: the HIP runtime API
+  // documents hipFree as the release call for hipMalloc AND hipMallocManaged
+  // allocations (there is no hipFreeManaged; hipHostFree is for hipHostMalloc
+  // only), mirroring cudaFree, whose documentation likewise covers
+  // cudaMallocManaged memory. Certainty: HIGH — API-documented on both sides —
+  // but stated rather than assumed because this file is written blind: if a
+  // board ever reports hipErrorInvalidValue from this call on the managed
+  // path, this assumption is the first suspect, and the fix would be tracking
+  // the branch per-pointer, not a global switch.
   void Free(void* p) override { Check(hipFree(p), "hipFree"); }
   void Memset(Queue& q, void* p, int value, size_t bytes) override {
     Check(hipMemsetAsync(p, value, bytes, AsStream(q)), "hipMemsetAsync");
@@ -141,16 +213,24 @@ class RocmBackend final : public Backend {
   // would be memory corruption, so the tier must stay off and unimplemented ops
   // must throw instead.
   //
-  // The conjunction is deliberate and is CudaBackend's own (cuda_backend.cu:295-
-  // 303): pageable-memory-access ALONE is not enough, because a discrete part can
-  // report it while the driver services host pointers through HMM page migration.
-  // That is not the zero-copy aliasing this contract needs, so an INTEGRATED GPU
-  // is additionally required. Probed, never inferred from the gfx name.
+  // TRUE on exactly two grounds, both API-anchored, computed by the registrar:
+  //   1. The W0 conjunction, CudaBackend's own (cuda_backend.cu:295-303):
+  //      Integrated AND PageableMemoryAccess. Pageable-memory-access ALONE is
+  //      not enough, because a discrete part can report it while the driver
+  //      services host pointers through HMM page migration — not the zero-copy
+  //      aliasing this contract needs. Kept byte-for-byte for any part that
+  //      reports both (NVIDIA-style integrated semantics).
+  //   2. The approach-(b) managed branch (UseManagedAlloc above): every
+  //      Backend::Alloc block on this device is hipMallocManaged memory, so
+  //      host access is guaranteed by construction. This is the route
+  //      XNACK-less RDNA3 APUs take, where ground 1 reads false (issue #41 F6).
+  // Probed, never inferred from the gfx name.
   bool UnifiedMemory() const override { return unified_memory_; }
 
  private:
   int device_ = 0;
   bool unified_memory_ = false;
+  bool managed_alloc_ = false;
   int major_ = 0;
   int minor_ = 0;
 };
@@ -176,8 +256,11 @@ struct Registrar {
     for (int i = 0; i < count; ++i) {
       const DeviceCaps caps = ProbeDevice(i);
       if (!caps.valid) continue;
-      backends.push_back(std::make_unique<RocmBackend>(
-          i, caps.pageable_memory_access && caps.integrated, caps.major, caps.minor));
+      const bool managed_alloc = UseManagedAlloc(caps);
+      const bool unified =
+          managed_alloc || (caps.pageable_memory_access && caps.integrated);
+      backends.push_back(
+          std::make_unique<RocmBackend>(i, unified, managed_alloc, caps.major, caps.minor));
       RegisterBackend(Device{DeviceType::kROCM, i}, backends.back().get());
     }
   }
@@ -195,6 +278,19 @@ bool DeviceAvailable() noexcept {
 std::string DeviceArchName(int index) noexcept {
   const DeviceCaps caps = ProbeDevice(index);
   return caps.gcn_arch;
+}
+
+bool IntegratedDevice(int index) noexcept {
+  const DeviceCaps caps = ProbeDevice(index);
+  return caps.valid && caps.integrated;
+}
+
+bool ManagedAllocActive(int index) noexcept {
+  // Answers from the SAME pure predicate over the SAME probe the registrar
+  // used, so this cannot drift from what the registered backend decided at
+  // static init: the attributes are immutable hardware properties.
+  const DeviceCaps caps = ProbeDevice(index);
+  return caps.valid && UseManagedAlloc(caps);
 }
 
 }  // namespace vt::rocm

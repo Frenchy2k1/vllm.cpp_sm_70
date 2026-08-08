@@ -251,6 +251,52 @@ endif()
 if(VLLM_CPP_HIP STREQUAL "AUTO")
   set(VLLM_CPP_HIP OFF)
 elseif(VLLM_CPP_HIP)
+  # F1/F3 ABSORPTION (issue #41, jimmykarily's gfx1151 findings; layout also
+  # confirmed by arch-btw on gfx1103/TheRock). Arch and TheRock dist layouts
+  # install the compiler at ${ROCM_PATH}/lib/llvm/bin instead of
+  # ${ROCM_PATH}/llvm/bin, so clang's walk-up-from-InstalledDir autodetection
+  # derives the ROCm root as ${ROCM_PATH}/lib and finds neither the HIP headers
+  # (F1) nor the hip-lang CMake package (F3: CMakeDetermineHIPCompiler
+  # hard-fails). The unidentified-compiler fallout also broke the LINKER:
+  # prefix expansion on the --whole-archive link options further down (F2) —
+  # one root cause, three unrelated-looking failures. The report's finding:
+  # ROCM_PATH was advertised by our own FATAL_ERROR below but only ever used
+  # for find_library, so on those layouts the documented flag did not do what
+  # its error message promised.
+  #
+  # Fix: derive the three hints the report set by hand from ROCM_PATH — and
+  # ONLY where unset, so an explicit -DCMAKE_HIP_FLAGS /
+  # -DCMAKE_HIP_COMPILER_ROCM_ROOT / exported HIPFLAGS/ROCM_PATH environment
+  # always wins, and a machine whose ROCM_PATH does not exist on disk (hipcc
+  # found elsewhere on PATH) configures byte-identically to before. On the
+  # standard /opt/rocm layout the values filled are exactly what clang/CMake
+  # autodetect anyway. Upstream vLLM honours ROCM_PATH the same way
+  # (vllm/CMakeLists.txt:54-60 @ pin 555967922). All three must be set BEFORE
+  # check_language/enable_language: the report measured that the ROOT hint
+  # alone regresses the compiler identification, because the identification
+  # try-compile then has no --rocm-path.
+  if(EXISTS "${ROCM_PATH}")
+    # CMake's own ROCm-root probe (F3), consulted by CMakeDetermineHIPCompiler.
+    if(NOT DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
+      set(CMAKE_HIP_COMPILER_ROCM_ROOT "${ROCM_PATH}")
+    endif()
+    # clang's own ROCm-root flag (F1). Rides CMAKE_HIP_FLAGS so the
+    # compiler-identification try-compile sees it too; pre-seeded as the cache
+    # entry enable_language(HIP) would otherwise create empty. Skipped when the
+    # user passed -DCMAKE_HIP_FLAGS or exported HIPFLAGS, which must keep
+    # winning.
+    if(NOT DEFINED CACHE{CMAKE_HIP_FLAGS} AND NOT DEFINED ENV{HIPFLAGS})
+      set(CMAKE_HIP_FLAGS "--rocm-path=${ROCM_PATH}" CACHE STRING
+        "Flags used by the HIP compiler during all build types.")
+    endif()
+    # hipcc/hipconfig read ROCM_PATH from the environment (the mechanism the
+    # report validated: `ROCM_PATH=/opt/rocm hipcc` compiles where bare hipcc
+    # cannot), and the environment also reaches check_language's sub-configure
+    # below, which forwards no cache variables.
+    if(NOT DEFINED ENV{ROCM_PATH})
+      set(ENV{ROCM_PATH} "${ROCM_PATH}")
+    endif()
+  endif()
   # CMake's own HIP language support (>= 3.21; we require 3.24) understands .hip
   # sources, which is why upstream calls enable_language(HIP) explicitly rather
   # than leaning on torch's setup (vllm/CMakeLists.txt:196-202).
