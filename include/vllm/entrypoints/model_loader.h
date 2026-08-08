@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 
+#include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
@@ -114,6 +115,17 @@ struct EngineParams {
   // only enables the seam. Non-safetensors (GGUF) checkpoints lack `mtp.*`, so an
   // MTP config over a GGUF source is rejected.
   std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt;
+
+  // ARCH-ONE-SURFACE fold ROW 8: explicit device selection, the mirror of
+  // vLLM's DeviceConfig.device (vllm/config/device.py). kAuto (default) keeps
+  // the accelerator-first probe that has always selected the queue — the
+  // byte-identical default. kCPU forces the CPU queue without consulting the
+  // probe; kCUDA requires the CUDA platform and the load fails LOUD when it is
+  // absent (never a silent fallback — an explicit device is assigned verbatim
+  // upstream, device.py:61-66). Exposed on the C ABI as
+  // vllm_model_params.device (ABI v14: 0=auto, 1=cpu, 2=cuda) and on the
+  // server as --device.
+  vllm::Device device = vllm::Device::kAuto;
 };
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
@@ -170,6 +182,23 @@ class LoadedEngine {
                                         int max_model_len, bool is_dense_arch);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
+  // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
+  // behind SelectQueue, factored pure over the "is the CUDA platform
+  // registered" probe answer so the CPU tier can gate the whole matrix without
+  // registering fake global platforms:
+  //   * kCPU  -> vt::DeviceType::kCPU unconditionally — an explicit CPU ask
+  //     never consults the accelerator probe, even when CUDA is registered;
+  //   * kCUDA -> vt::DeviceType::kCUDA when cuda_platform_registered, else
+  //     THROWS std::runtime_error naming the device (fail LOUD; the mirror of
+  //     vLLM assigning an explicit device verbatim and never substituting
+  //     another — vllm/config/device.py:61-66);
+  //   * kAuto is NOT resolved here (it resolves through the accelerator-first
+  //     probe inside SelectQueue, byte-identical to pre-ROW-8) and throws
+  //     std::invalid_argument if passed.
+  // SelectQueue routes its explicit arms through THIS function, so the gate on
+  // it pins the production policy, not a parallel copy.
+  static vt::DeviceType ResolveExplicitDeviceType(vllm::Device requested,
+                                                  bool cuda_platform_registered);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,

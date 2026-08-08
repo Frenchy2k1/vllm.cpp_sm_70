@@ -35,18 +35,11 @@
 #include <string>
 #include <vector>
 
-#include "vt/device.h"
-
 namespace vllm::openai {
 struct VideoRequest;  // entrypoints/openai/video_api.h
 }
 
 namespace vllm::multimodal {
-
-// Map the stable public video ABI device selector onto the runtime's generic
-// backend key. The ABI remains 0=CPU / 1=CUDA; callers below this seam dispatch
-// only through the returned DeviceType.
-vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device);
 
 // ── Load-time parameters (the checkpoint set; the C ABI mirror is
 // vllm_video_model_params). Empty string == "not supplied". ─────────────────
@@ -125,9 +118,6 @@ class MiniMaxH3VideoEngine {
   MiniMaxH3VideoEngine(MiniMaxH3VideoEngine&&) noexcept;
   MiniMaxH3VideoEngine& operator=(MiniMaxH3VideoEngine&&) noexcept;
   ~MiniMaxH3VideoEngine();
-
-  // The device selected by the queue created during Load().
-  vt::Device device() const;
 
   // True when an encoder tower is loaded (the request PROMPT conditions the
   // render); false => prompt_embeds_path conditioning (or Generate refuses).

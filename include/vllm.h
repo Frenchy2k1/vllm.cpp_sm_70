@@ -82,6 +82,15 @@ extern "C" {
  * default, so zero-filling the struct growth keeps a v9 engine byte-identical.
  * Scheduler policy (incl. SGLang's cache-aware LPM) is selected through the v9
  * string field .scheduling_policy = "lpm" — there is no separate int knob.
+ * v11: AUDIO TRANSCRIPTION (ARCH-ONE-SURFACE fold #4) — vllm_transcribe /
+ * vllm_transcription_params(_default) / vllm_transcription(_free), appended so
+ * zero values preserve behaviour. vllm_engine_load now RESOLVES a
+ * transcription-only checkpoint (Parakeet CTC/RNNT/TDT, the vLLM
+ * SupportsTranscription mirror) into a transcription engine: the text entry
+ * points on such a handle report VLLM_ERR_INVALID_ARGUMENT with an actionable
+ * message instead of serving, and vllm_transcribe on a TEXT handle does the
+ * same. A pre-v11 caller that never loads a Parakeet directory is
+ * byte-identical.
  * v12: VIDEO+AUDIO GENERATION (ARCH-ONE-SURFACE ROW 2, MiniMax-H3) — the
  * ratified video slice: an opaque vllm_video_engine loaded from the H3
  * checkpoint set (vllm_video_engine_load/free, vllm_video_model_params +
@@ -94,23 +103,23 @@ extern "C" {
  * handles refuse each other's checkpoints LOUDLY: vllm_video_engine_load on a
  * text-model directory names vllm_engine_load, and vllm_engine_load on an H3
  * checkpoint directory keeps failing exactly as at v11 (no config.json).
- * v11: AUDIO TRANSCRIPTION (ARCH-ONE-SURFACE fold #4) — vllm_transcribe /
- * vllm_transcription_params(_default) / vllm_transcription(_free), appended so
- * zero values preserve behaviour. vllm_engine_load now RESOLVES a
- * transcription-only checkpoint (Parakeet CTC/RNNT/TDT, the vLLM
- * SupportsTranscription mirror) into a transcription engine: the text entry
- * points on such a handle report VLLM_ERR_INVALID_ARGUMENT with an actionable
- * message instead of serving, and vllm_transcribe on a TEXT handle does the
- * same. A pre-v11 caller that never loads a Parakeet directory is
- * byte-identical.
  * v13: vllm_complete_tokens — blocking completion from a PRE-TOKENIZED prompt
  * (vLLM's TokensPrompt), returning the generated token ids (and optionally the
  * detokenized vllm_completion). The entry point for embedders that manage
  * their own tokenization and for token-exact gates/benchmarks that compare
  * whole token streams against a reference (the Kimi-Linear paged-runner fold
  * battery, ARCH-ONE-SURFACE ROW 7, is the first consumer). Purely additive —
- * no struct changed. */
-#define VLLM_ABI_VERSION 13
+ * no struct changed.
+ * v14: vllm_model_params.device — EXPLICIT DEVICE SELECTION (ARCH-ONE-SURFACE
+ * fold ROW 8), the mirror of vLLM's DeviceConfig.device names
+ * (vllm/config/device.py:13): 0=auto (the byte-identical default — the
+ * accelerator-first platform probe that has always selected the queue), 1=cpu
+ * (force the CPU queue even on an accelerator build), 2=cuda (require the
+ * CUDA platform; when it is absent the load FAILS with VLLM_ERR_MODEL_LOAD —
+ * an explicitly named device is never silently substituted, device.py:61-66).
+ * Appended at the END of vllm_model_params so a zero-initialized struct keeps
+ * the pre-v14 engine byte-identical. */
+#define VLLM_ABI_VERSION 14
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -257,6 +266,24 @@ typedef struct vllm_model_params {
    * SGLang's cache-aware LPM) is a SEPARATE knob — the v9 string field
    * .scheduling_policy = "lpm", not an int here. */
   int32_t enable_jump_forward;
+  /* ── Device selection (ABI v14) ────────────────────────────────────────────
+   * Which device the text-generation engine serves on, mirroring vLLM's
+   * DeviceConfig.device names (vllm/config/device.py:13 — Device =
+   * Literal["auto", "cuda", "cpu", ...]):
+   *   0 => AUTO (the byte-identical default): the accelerator-first platform
+   *        probe that has always selected the queue (CUDA first, CPU
+   *        fallback; on other builds ROCm/XPU/Vulkan/Metal probe in between);
+   *   1 => CPU: force the CPU queue even when an accelerator is available;
+   *   2 => CUDA: require the CUDA platform. When it is absent in this
+   *        build/process the load FAILS with VLLM_ERR_MODEL_LOAD and a
+   *        message naming the device — an explicitly named device is NEVER
+   *        silently replaced by another (mirror of vLLM assigning an explicit
+   *        device verbatim, device.py:61-66).
+   * 0 must stay auto so a zero-initialized struct preserves pre-v14 behaviour;
+   * the cpu-before-cuda value order follows the v12 precedent
+   * (vllm_video_model_params.device: 0 cpu, 1 cuda) shifted by the auto slot.
+   * Any other value fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
+  int32_t device;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────

@@ -218,13 +218,6 @@ void FillNoise(std::vector<float>& out, uint64_t seed) {
 
 // ── the engine ───────────────────────────────────────────────────────────────
 
-vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device) {
-  if (device != 0 && device != 1) {
-    throw std::runtime_error("minimax_h3 video: device must be 0 (cpu) or 1 (cuda)");
-  }
-  return static_cast<vt::DeviceType>(device);
-}
-
 struct MiniMaxH3VideoEngine::Impl {
   MiniMaxH3VideoModelParams params;
   vt::Device device{};
@@ -274,7 +267,6 @@ MiniMaxH3VideoEngine::MiniMaxH3VideoEngine(MiniMaxH3VideoEngine&&) noexcept = de
 MiniMaxH3VideoEngine& MiniMaxH3VideoEngine::operator=(MiniMaxH3VideoEngine&&) noexcept = default;
 MiniMaxH3VideoEngine::~MiniMaxH3VideoEngine() = default;
 
-vt::Device MiniMaxH3VideoEngine::device() const { return impl_->device; }
 bool MiniMaxH3VideoEngine::has_encoder() const { return impl_->has_encoder; }
 bool MiniMaxH3VideoEngine::has_prompt_embeds() const { return !impl_->prompt_embeds.empty(); }
 
@@ -283,7 +275,9 @@ std::unique_ptr<MiniMaxH3VideoEngine> MiniMaxH3VideoEngine::Load(
   if (params.dit_path.empty()) {
     throw std::runtime_error("minimax_h3 video: dit_path is required");
   }
-  const vt::DeviceType device_type = MiniMaxH3VideoDeviceType(params.device);
+  if (params.device != 0 && params.device != 1) {
+    throw std::runtime_error("minimax_h3 video: device must be 0 (cpu) or 1 (cuda)");
+  }
   auto engine = std::unique_ptr<MiniMaxH3VideoEngine>(new MiniMaxH3VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
   Impl& im = *engine->impl_;
@@ -294,8 +288,8 @@ std::unique_ptr<MiniMaxH3VideoEngine> MiniMaxH3VideoEngine::Load(
   // load recipe). This throws — loudly — when no CUDA backend is registered.
   vt::Queue stream_queue{};
   if (params.device == 1) {
-    stream_queue = vt::GetBackend(device_type).CreateQueue();
-    im.device = stream_queue.device;
+    im.device = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+    stream_queue = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
   }
 
   // ── 1. DiT: the four loader arms of the pre-fold driver ────────────────────

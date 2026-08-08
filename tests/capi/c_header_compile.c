@@ -17,7 +17,10 @@ static bool c_header_token_cb(const char* delta_text, bool finished,
 }
 
 /* Instantiate the POD structs + a status value so the C compiler actually lays
- * them out, and reference every ABI entry point so the declarations are used. */
+ * them out, and reference every ABI entry point so the declarations are used —
+ * including the v11 transcription slice, the v12 video slice, and the v14
+ * device field (this file went stale between v10 and v12; the claim above is
+ * only honest if new surface lands HERE in the same change). */
 int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
   vllm_model_params mp = vllm_model_params_default();
   vllm_sampling_params sp = vllm_sampling_params_default();
@@ -25,6 +28,8 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
   vllm_token_callback cb = &c_header_token_cb;
   vllm_request* request = NULL;
   vllm_status st = VLLM_OK;
+
+  mp.device = 0; /* ABI v14: 0=auto (the accelerator-first probe default). */
 
   st = vllm_engine_load(&mp, &eng);
   if (st == VLLM_OK) {
@@ -48,7 +53,46 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
       st = vllm_request_wait(request);
       vllm_request_free(request);
     }
+
+    /* Chat entry points (ABI v3). */
+    {
+      char* response_json = NULL;
+      st = vllm_chat(eng, "{}", &response_json);
+      vllm_string_free(response_json);
+      st = vllm_chat_stream(eng, "{}", cb, /*user_data=*/NULL);
+    }
+
+    /* Audio transcription (ABI v11). */
+    {
+      vllm_transcription_params tp = vllm_transcription_params_default();
+      vllm_transcription transcript;
+      st = vllm_transcribe(eng, &tp, &transcript);
+      vllm_transcription_free(&transcript);
+    }
+
     vllm_engine_free(eng);
+  }
+
+  /* Video+audio generation (ABI v12): the separate vllm_video_engine handle
+   * plus the engine-free mux-argv composer. */
+  {
+    vllm_video_model_params vmp = vllm_video_model_params_default();
+    vllm_video_params vp = vllm_video_params_default();
+    vllm_video_engine* veng = NULL;
+    st = vllm_video_engine_load(&vmp, &veng);
+    if (st == VLLM_OK) {
+      vllm_video_result vres;
+      st = vllm_video_generate(veng, &vp, &vres);
+      vllm_video_result_free(&vres);
+      vllm_video_engine_free(veng);
+    }
+    {
+      vllm_video_mux_params mux = vllm_video_mux_params_default();
+      char** mux_argv = NULL;
+      int32_t mux_argc = 0;
+      st = vllm_video_mux_argv(&mux, &mux_argv, &mux_argc);
+      vllm_video_mux_argv_free(mux_argv, mux_argc);
+    }
   }
 
   (void)vllm_last_error();

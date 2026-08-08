@@ -464,6 +464,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.scheduling_policy = nullptr;   // NULL => "fcfs" (ABI v9).
   p.kv_transfer_config = nullptr;  // NULL => no connector (ABI v9).
   p.enable_jump_forward = 0;       // 0 => env-resolved, default OFF (ABI v10).
+  p.device = 0;  // 0 => auto: the accelerator-first probe (ABI v14).
   return p;
 }
 
@@ -601,6 +602,26 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
             "or 2 (off)");
         return VLLM_ERR_INVALID_ARGUMENT;
     }
+    // ABI v14: explicit device selection (0=auto, 1=cpu, 2=cuda), mirroring
+    // vLLM's DeviceConfig.device names (vllm/config/device.py:13). 0 leaves
+    // ep.device at kAuto — the byte-identical accelerator-first probe. An
+    // explicitly named device that is ABSENT fails inside FromModelDir, before
+    // any model I/O, and reports VLLM_ERR_MODEL_LOAD with a message naming the
+    // device (never a silent fallback — device.py:61-66).
+    switch (params->device) {
+      case 0:
+        break;  // auto (the default probe) — ep.device stays kAuto.
+      case 1:
+        ep.device = vllm::Device::kCPU;
+        break;
+      case 2:
+        ep.device = vllm::Device::kCUDA;
+        break;
+      default:
+        SetError(
+            "vllm_engine_load: device must be 0 (auto), 1 (cpu), or 2 (cuda)");
+        return VLLM_ERR_INVALID_ARGUMENT;
+    }
 
     // ABI v11 task dispatch: a directory whose config.json architectures
     // resolve to a SupportsTranscription-ONLY registration (Parakeet
@@ -621,6 +642,17 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         peek = nullptr;
       }
       if (peek != nullptr && peek->info.supports_transcription_only) {
+        // ABI v14: the transcription stack is a CPU-hosted pipeline; an
+        // explicit CUDA ask cannot be served and is REFUSED rather than
+        // silently downgraded (the same never-substitute rule as the text
+        // engine, vllm/config/device.py:61-66).
+        if (ep.device == vllm::Device::kCUDA) {
+          SetError(
+              "vllm_engine_load: device 'cuda' was requested but this "
+              "transcription-only checkpoint serves on the CPU pipeline; use "
+              "device=auto or device=cpu");
+          return VLLM_ERR_INVALID_ARGUMENT;
+        }
         auto* handle = new vllm_engine;
         handle->transcriber =
             std::make_unique<vllm::multimodal::ParakeetTranscriber>(
