@@ -36,8 +36,9 @@ Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to firs
 6 legs contended, uncontended repeat died with a host reboot.
 [Detail](../.agents/specs/startup-latency-axis.md).
 
-Protocol (2026-08-07): PR disposition — verified-good PRs MERGE in-session, superseded
-CLOSE with a reason; prompt pair tracked, 25 gate rows exact-pinned.
+Protocol (2026-08-08): `agent-start.py` → claim → preflight; review FAIL →
+fresh implementer → both gates → fresh review until PASS. Budgets cannot stop
+it; registry/prompt mutation gates bind it. Verified PRs merge; obsolete close.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by

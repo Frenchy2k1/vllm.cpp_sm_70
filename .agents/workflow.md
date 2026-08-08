@@ -11,8 +11,12 @@ Each controlled paragraph names exactly the rule it implements.
 
 [POL-AUTH-PRECEDENCE] Resolve conflicts in this order: repository `AGENTS.md`, the applicable registry row, that row's procedure, then task evidence. Report an unresolved contradiction before changing state.
 
+<!-- session-entrypoint:begin -->
+[POL-BOOT-ENTRYPOINT] Start every session with `scripts/agent-start.py`. Supply `--intent operator|helper|read-only` and a known helper `--row` when the opening request is explicit; otherwise relay its source-owned welcome verbatim and ask what work the contributor intends. Follow its printed claim action, rerun it from materialized state, and only then run `scripts/agent-preflight.sh`. The command is non-interactive and never claims, locks, creates a worktree, or mutates a gate.
+<!-- session-entrypoint:end -->
+
 <!-- role-interview:begin -->
-[POL-BOOT-ROLE] Begin with `scripts/agent-role.py show`. If no valid role exists, ask what work the developer intends and run `scripts/agent-role.py claim operator` for a multi-step integration campaign, `scripts/agent-role.py claim helper --row <ID>` for one scoped task, or `scripts/agent-role.py claim read-only` for inspection. Add `--headless` only when the developer explicitly declares an unattended run; never infer it.
+[POL-BOOT-ROLE] Use the entrypoint's reported worktree role. If none exists, ask what work the developer intends and run `scripts/agent-role.py claim operator` for a multi-step integration campaign, `scripts/agent-role.py claim helper --row <ID>` for one scoped task, or `scripts/agent-role.py claim read-only` for inspection. Add `--headless` only when the developer explicitly declares an unattended run; never infer it.
 <!-- role-interview:end -->
 
 [POL-BOOT-NOW] After role resolution, read `.agents/NOW.md` as the one-read live snapshot; consult the append-only state tail only when the task needs deeper history.
@@ -92,7 +96,7 @@ gates.
 <!-- orchestration-loop:begin -->
 [POL-REVIEW-FRESH] After focused and full gates pass on an immutable head from a fresh [implementer](prompts/implementer.md), dispatch a fresh [reviewer](prompts/reviewer.md), never the agent that wrote the code, to perform both static inspection and targeted scratch mutations of the claimed guarantees—mutate, not read. Review output identifies commands, mutations, findings, and the reviewed SHA.
 
-[POL-REVIEW-NO-REPAIR] A coordinating/operator session never repairs a reviewer finding: never fix findings yourself. Send the bounded finding and evidence to a fresh implementer, rerun focused and full gates, then use a fresh scoped reviewer.
+[POL-REVIEW-NO-REPAIR] Never fix findings yourself in a coordinating session. Each actionable in-scope reviewer FAIL and its evidence return to a fresh implementer for focused and full gates then a fresh scoped reviewer. Repeat this cycle until PASS. Attempt and retry budgets are scheduling controls and never terminal blockers for correctable findings. Stop only on explicit developer direction or a precise external authority or resource blocker.
 
 [POL-OPERATOR-VERIFY] The operator independently checks the immutable head: run the row's gate yourself. Implementer or reviewer summaries are evidence inputs, not gate results.
 

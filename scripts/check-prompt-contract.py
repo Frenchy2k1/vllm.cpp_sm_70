@@ -69,6 +69,7 @@ METHOD_ROWS = {
     ),
     "operator": (
         "- `OP-DELEGATE` | required | Delegate implementation and repairs to fresh implementers.",
+        "- `OP-CONTINUE` | required | For every actionable in-scope reviewer FAIL dispatch a fresh implementer, run focused and full gates, and dispatch a fresh scoped reviewer; repeat until PASS because attempt or retry budgets are scheduling controls and never terminal blockers.",
         "- `OP-VERIFY` | required | Run claimed verification on the returned commit without trusting the implementer report.",
         "- `OP-REVIEW` | required | Dispatch a fresh reviewer for independent static review and targeted scratch mutation.",
         "- `OP-DISPOSITION` | required | Merge a verified PR in-session or close an obsolete PR with its recorded reason.",
@@ -116,9 +117,10 @@ STOP_ROWS = {
         "- `STOP-EVIDENCE` | FAIL | Required source, diff, test, or gate evidence is unavailable.",
     ),
     "operator": (
-        "- `STOP-AUTHORITY` | BLOCKED | A required action exceeds Authority.",
+        "- `STOP-AUTHORITY` | BLOCKED | A required external action exceeds Authority and the precise missing authority is named.",
+        "- `STOP-RESOURCE` | BLOCKED | A required external resource is unavailable and the precise resource is named.",
+        "- `STOP-DEVELOPER` | BLOCKED | The developer explicitly directs the review loop to stop before PASS.",
         "- `STOP-REMOTE` | REMOTE_UNVERIFIED | Required remote state cannot be queried.",
-        "- `STOP-BLOCKER` | BLOCKED | Non-terminal work cannot name its blocker on the PR.",
     ),
 }
 
