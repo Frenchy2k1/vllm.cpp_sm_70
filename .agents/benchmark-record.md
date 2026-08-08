@@ -17619,3 +17619,56 @@ thermal / cache-drop / memory-return). Build contract: RelWithDebInfo, nvcc
 4.5.0, TRITON=ON, BENCH_PROFILE_CONTROL=OFF. SACRED `test_qwen36_paged_engine`
 passed as the harness's own precondition.
 
+## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
+
+**Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
+Locally positive and token-safe; default and release-model gates remain open.
+
+**Selection and falsification.** On exact-chunks `c3bb0f39a`, the accepted
+Qwen3.5-4B/c32/1,280-block graph-node trace measured fast megablock
+228.150171 ms and the existing per-V-head split 448.364941 ms across 1,728
+calls. Both token files were identical. The split is 1.965x slower and the
+enclosing run 0.97% slower, so V-only launch decomposition is rejected.
+Pinned vLLM's same-tool `_fused_post_conv_kernel` is 108.034870 ms across 1,923
+calls. Source comparison instead selected vLLM/FLA's 16-token, per-head,
+four-warp schedule and Q/K register reuse.
+
+**Implementation and numerical mutant.** `GdnPostConvTokenTileKernel` maps one
+block to `(16 tokens, one Q/K or V head)` and one warp to four tokens. Each Q/K
+lane retains features `lane+{0,32,64,96}` across normalization. The first
+implementation summed those four squares sequentially before a warp reduction:
+kernel time improved 227.731960→122.472980 ms and enclosing throughput
+6731.69→6773.85 tok/s, but the tile token SHA
+`1d496ff0f989978155d8e900c7a5500a43db26816dead8e035310d0bf9cb9756`
+did not match fast `83fcdc45...453545`; REJECTED. Reproducing the current
+128-lane tree exactly—`(i+i+64)`, then `(i+i+32)`, then shuffle offsets
+16/8/4/2/1—restored byte identity without restoring the reload/barrier costs.
+
+**Final same-binary profile.** One `/tmp/gpu` lock, 22/25 GiB user-systemd
+scope, `--cuda-graph-trace=node`, identical production workload and binary:
+
+| Axis | fast megablock | token tile | change |
+|---|---:|---:|---:|
+| post-conv GPU total, 1,728 calls | 227.887066 ms | **122.587027 ms** | **1.858982x faster** |
+| mean post-conv call | 131.879 us | **70.942 us** | **46.21% lower** |
+| total throughput | 6734.82 tok/s | **6770.62 tok/s** | **+0.532%** |
+| output throughput | 744.72 tok/s | **748.68 tok/s** | **+0.532%** |
+| TTFT | 1024.14 ms | **1015.43 ms** | **-0.850%** |
+| TPOT / ITL | 35.01 ms | **34.85 ms** | **-0.457%** |
+| E2E | 5469.87 ms | **5440.81 ms** | **-0.531%** |
+
+The vLLM kernel residual is now **1.134699x**, down from 2.112x. Final token
+files are identical, full SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Portable flag/grid tests pass 6/6·50; CUDA GDN passes 67/67·4384 including
+partial/exact tiles, packed BA non-zero views/wider row strides, byte-exact five
+outputs, finiteness and norms; cached Qwen3.5-4B passes 3/3·1672.
+
+**Evidence.** Final fast/tile traces
+`/tmp/qwen35-postconv-tile-exact-{fast,tile}.nsys-rep`, SHA-256
+`c75e2cb...bcadc` / `a0eb1808...f418`; token files beside them. Rejected
+arithmetic traces `/tmp/qwen35-postconv-tile-wip-{fast,tile}.nsys-rep`, SHA-256
+`c2d8872e...b774` / `1c42d489...d66b`. Selection traces and exact recipes are
+in [the spike/result](specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+One local profile is not extrapolated to the unavailable Qwen3.6-27B/35B gates;
+the flag therefore remains opt-in.

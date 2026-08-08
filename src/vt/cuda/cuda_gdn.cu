@@ -1384,7 +1384,101 @@ __global__ void GdnPostConvFastKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, flo
   }
 }
 
-// Split post-conv (VT_GDN_POSTCONV_SPLIT, default ON) — grid (T, Hk+Hv), mirroring
+// Experimental 1:1 CUDA spelling of vLLM/FLA's post-conv launch schedule:
+// grid=(ceil(T,16), Hk+Hv), BLOCK_T=16, four warps. Each warp owns four tokens
+// in the tile. For Q/K, each lane keeps four feature values in registers across
+// the float32 norm reduction and normalized store, eliminating the fast kernel's
+// second conv read and all shared-memory barriers. For V, the same mapping gives
+// four coalesced 32-element copy waves per token and lane zero computes gating.
+// Arithmetic and strides otherwise retain the local GdnPostConv contract.
+template <typename Tqkv, typename Tconv, typename Tgate>
+__global__ void GdnPostConvTokenTileKernel(
+    Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out, float* beta_out,
+    const Tconv* conv, const Tgate* araw, const Tgate* braw, const float* a_log,
+    const float* dt_bias, int64_t t, int64_t hk, int64_t dk, int64_t hv, int64_t dv,
+    int64_t a_row_stride, int64_t b_row_stride, float eps) {
+  constexpr int kWarps = 4;
+  constexpr int kFeaturesPerLane = 4;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int64_t tile_start = static_cast<int64_t>(blockIdx.x) * kGdnPostConvTokenTileTokens;
+  const int64_t head = blockIdx.y;
+  const int64_t key_dim = hk * dk;
+  const int64_t value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+
+  if (head < hk) {
+#pragma unroll
+    for (int tile_token = warp; tile_token < kGdnPostConvTokenTileTokens;
+         tile_token += kWarps) {
+      const int64_t tok = tile_start + tile_token;
+      if (tok >= t) continue;
+      const int64_t row = tok * conv_dim;
+      const Tconv* qin = conv + row + head * dk;
+      const Tconv* kin = conv + row + key_dim + head * dk;
+      Tqkv* qo = q_out + (tok * hk + head) * dk;
+      Tqkv* ko = k_out + (tok * hk + head) * dk;
+
+      float qv[kFeaturesPerLane];
+      float kv[kFeaturesPerLane];
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        qv[item] = Load(qin, feature);
+        kv[item] = Load(kin, feature);
+      }
+      // Reproduce the fast kernel's 128-lane shared reduction exactly. Its first
+      // two levels are (i+i+64), then (i+i+32); those four terms are resident in
+      // this lane. The remaining 32-lane tree is the same 16,8,4,2,1 order.
+      float qsum = (qv[0] * qv[0] + qv[2] * qv[2]) +
+                   (qv[1] * qv[1] + qv[3] * qv[3]);
+      float ksum = (kv[0] * kv[0] + kv[2] * kv[2]) +
+                   (kv[1] * kv[1] + kv[3] * kv[3]);
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        qsum += __shfl_down_sync(0xffffffffu, qsum, offset);
+        ksum += __shfl_down_sync(0xffffffffu, ksum, offset);
+      }
+      qsum = __shfl_sync(0xffffffffu, qsum, 0);
+      ksum = __shfl_sync(0xffffffffu, ksum, 0);
+      const float qinv = 1.0f / sqrtf(qsum + eps);
+      const float kinv = 1.0f / sqrtf(ksum + eps);
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        Store(qo, feature, qv[item] * qinv);
+        Store(ko, feature, kv[item] * kinv);
+      }
+    }
+  } else {
+    const int64_t value_head = head - hk;
+#pragma unroll
+    for (int tile_token = warp; tile_token < kGdnPostConvTokenTileTokens;
+         tile_token += kWarps) {
+      const int64_t tok = tile_start + tile_token;
+      if (tok >= t) continue;
+      const int64_t row = tok * conv_dim;
+      const Tconv* vin = conv + row + 2 * key_dim + value_head * dv;
+      Tqkv* vo = v_out + tok * value_dim + value_head * dv;
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        Store(vo, feature, Load(vin, feature));
+      }
+      if (lane == 0) {
+        const int64_t idx = tok * hv + value_head;
+        const float av = Load(araw, tok * a_row_stride + value_head);
+        const float bv = Load(braw, tok * b_row_stride + value_head);
+        const float x = av + dt_bias[value_head];
+        const float sp = x > 20.0f ? x : log1pf(expf(x));
+        g_out[idx] = -expf(a_log[value_head]) * sp;
+        beta_out[idx] = 1.0f / (1.0f + expf(-bv));
+      }
+    }
+  }
+}
+
+// Split post-conv (VT_GDN_POSTCONV_SPLIT, opt-in) — grid (T, Hk+Hv), mirroring
 // vLLM's grid (ceil(L,BLOCK_T), H+HV) in _fused_post_conv_kernel:57-149 where each V
 // head is its own program. The shipped GdnPostConvKernel packs the ENTIRE
 // value_dim = Hv*Dv copy + all Hv gating scalars into ONE grid.y block per token
@@ -1457,7 +1551,7 @@ __global__ void GdnPostConvSplitKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, fl
   }
 }
 
-// Toggle: DEFAULT ON (VT_GDN_POSTCONV_SPLIT=0 restores the single-megablock kernel).
+// Toggle: DEFAULT OFF; a present non-'0'-leading value selects the split kernel.
 // Read per call (post-conv dispatch is coarse — one launch/step).
 bool GdnPostConvSplitEnabled() {
   return GdnPostConvSplitFlagIsOn(std::getenv("VT_GDN_POSTCONV_SPLIT"));
@@ -1480,12 +1574,21 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
   // VT_GDN_POSTCONV_SPLIT (opt-in): grid (T, Hk+Hv) — each V head its own block
   // (mirrors vLLM). =0 (default) uses the single-megablock grid (T, Hk+1).
   const bool split = GdnPostConvSplitEnabled();
+  // VT_GDN_POSTCONV_TOKEN_TILE (opt-in): the full upstream 16-token,
+  // per-head/four-warp schedule. The explicit split control keeps priority when
+  // both experimental flags are set. Only the production 128-wide heads route.
+  const bool token_tile =
+      !split && GdnPostConvTokenTileFlagIsOn(std::getenv("VT_GDN_POSTCONV_TOKEN_TILE")) &&
+      dk == 128 && dv == 128;
   // VT_GDN_POSTCONV_FAST: byte-identical megablock at 128 threads + 128-bit V copy.
   // Only for the Dk==Dv==128 gate dims (16B alignment + value_dim%8==0); mutually
   // exclusive with the split (both target the same megablock). See predicate.
-  const bool fast = !split && GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) &&
-                    dk == 128 && dv == 128;
-  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(split ? hk + hv : hk + 1));
+  const bool fast = !split && !token_tile &&
+                    GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) && dk == 128 &&
+                    dv == 128;
+  const unsigned grid_x = static_cast<unsigned>(token_tile ? GdnPostConvTokenTileGridX(t) : t);
+  const unsigned grid_y = static_cast<unsigned>((split || token_tile) ? hk + hv : hk + 1);
+  dim3 grid(grid_x, grid_y);
   cudaStream_t s = AsStream(q);
   // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
   // input-side bf16 GDN path (VT_GDN_IN_BF16); the conv read upcasts to f32.
@@ -1493,7 +1596,13 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
-    if (fast) {
+    if (token_tile) {
+      GdnPostConvTokenTileKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+          beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),
+          a_log.Ptr<float>(), dt_bias.Ptr<float>(), t, hk, dk, hv, dv, araw.stride[0],
+          braw.stride[0], args.eps);
+    } else if (fast) {
       GdnPostConvFastKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
           q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
           beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),

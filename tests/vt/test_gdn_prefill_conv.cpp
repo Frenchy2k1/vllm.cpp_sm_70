@@ -8,11 +8,9 @@
 // (src/vt/cuda/gdn_prefill_conv.h): the VT_CONV_REG and VT_GDN_POSTCONV_SPLIT flag
 // predicates. The kernels themselves are CUDA-only; their BIT-EXACT (0-ulp) parity
 // vs the shipped kernels is a DGX-gated CUDA check (tests/vt/test_ops_gdn.cpp). This
-// suite pins the portable default-ON / '0'-rollback parse so the contract is
-// regression-covered on every platform, not just DGX. (Both defaults are ON because
-// each kernel is bit-identical to its predecessor by construction — never-slower and
-// token-safe — mirroring vLLM's register-resident FLA causal_conv1d and its per-V-head
-// fused post-conv grid.)
+// suite pins the portable default/rollback parse so the contract is regression-covered
+// on every platform, not just CUDA. The register-window and fast-megablock paths default
+// ON; the slower split and not-yet-gate-validated token tile remain opt-in.
 #include <doctest/doctest.h>
 
 #include "vt/cuda/gdn_prefill_conv.h"
@@ -21,6 +19,8 @@ using vt::cuda::ConvRegFlagIsOn;
 using vt::cuda::ConvExactChunksFlagIsOn;
 using vt::cuda::GdnPostConvFastFlagIsOn;
 using vt::cuda::GdnPostConvSplitFlagIsOn;
+using vt::cuda::GdnPostConvTokenTileFlagIsOn;
+using vt::cuda::GdnPostConvTokenTileGridX;
 
 TEST_CASE("VT_CONV_REG defaults ON; only a '0'-leading value rolls back") {
   // Default (unset) is ON: CausalConv1dFwdRegKernel's output (both `out` and the
@@ -84,4 +84,26 @@ TEST_CASE("VT_GDN_POSTCONV_FAST defaults ON; only a '0'-leading value rolls back
   CHECK_FALSE(GdnPostConvFastFlagIsOn("0"));
   CHECK_FALSE(GdnPostConvFastFlagIsOn("0abc"));
   CHECK_FALSE(GdnPostConvFastFlagIsOn("00"));
+}
+
+TEST_CASE("VT_GDN_POSTCONV_TOKEN_TILE defaults OFF; a non-'0' value enables it") {
+  CHECK_FALSE(GdnPostConvTokenTileFlagIsOn(nullptr));
+  CHECK_FALSE(GdnPostConvTokenTileFlagIsOn("0"));
+  CHECK_FALSE(GdnPostConvTokenTileFlagIsOn("0abc"));
+  CHECK_FALSE(GdnPostConvTokenTileFlagIsOn("00"));
+  CHECK(GdnPostConvTokenTileFlagIsOn(""));
+  CHECK(GdnPostConvTokenTileFlagIsOn("1"));
+  CHECK(GdnPostConvTokenTileFlagIsOn("on"));
+  CHECK(GdnPostConvTokenTileFlagIsOn(" 0"));
+}
+
+TEST_CASE("GDN post-conv token tile covers each ceil(T/16) work item") {
+  CHECK(GdnPostConvTokenTileGridX(0) == 0);
+  CHECK(GdnPostConvTokenTileGridX(1) == 1);
+  CHECK(GdnPostConvTokenTileGridX(15) == 1);
+  CHECK(GdnPostConvTokenTileGridX(16) == 1);
+  CHECK(GdnPostConvTokenTileGridX(17) == 2);
+  CHECK(GdnPostConvTokenTileGridX(127) == 8);
+  CHECK(GdnPostConvTokenTileGridX(128) == 8);
+  CHECK(GdnPostConvTokenTileGridX(2048) == 128);
 }
