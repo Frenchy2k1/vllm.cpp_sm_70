@@ -37,12 +37,10 @@
 
 ## News
 
-- **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default, matches
-  the vLLM oracle token for token, and decodes **45.45 tok/s vs vLLM's 41.94**.
-- **2026-08** **Vulkan runs a model end to end.** `opt-125m` greedy is STRICT token-exact on 24
-  native ops. Decode **8.59 to 91.7 tok/s (10.7x)**; llama.cpp Vulkan stays **2.62x** ahead.
-- **2026-08** **MiniMax-H3 video + audio generation lands.** A 33 B joint video+audio diffusion
-  transformer on one Jetson Thor: a 50-step 864x480 render, ~8 h to ~28 min.
+- **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
+  matches the vLLM oracle token for token, and decodes **45.45 vs 41.94 tok/s**.
+- **2026-08** **Vulkan runs a model end to end.** `opt-125m` greedy is STRICT token-exact on
+  24 native ops. Decode **8.59 to 91.7 tok/s (10.7x)**; llama.cpp Vulkan stays **2.62x** ahead.
 
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
