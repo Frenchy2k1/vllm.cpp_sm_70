@@ -188,7 +188,8 @@ class LoadedEngine {
   // registering fake global platforms:
   //   * kCPU  -> vt::DeviceType::kCPU unconditionally — an explicit CPU ask
   //     never consults the accelerator probe, even when CUDA is registered;
-  //   * kCUDA -> vt::DeviceType::kCUDA when cuda_platform_registered, else
+  //   * kNamedPlatform -> the DeviceType returned by the canonical-name
+  //     platform lookup, else
   //     THROWS std::runtime_error naming the device (fail LOUD; the mirror of
   //     vLLM assigning an explicit device verbatim and never substituting
   //     another — vllm/config/device.py:61-66);
@@ -197,8 +198,9 @@ class LoadedEngine {
   //     std::invalid_argument if passed.
   // SelectQueue routes its explicit arms through THIS function, so the gate on
   // it pins the production policy, not a parallel copy.
-  static vt::DeviceType ResolveExplicitDeviceType(vllm::Device requested,
-                                                  bool cuda_platform_registered);
+  static vt::DeviceType ResolveExplicitDeviceType(
+      vllm::Device requested,
+      std::optional<vt::DeviceType> named_platform_type);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,

@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-07 -->
+<!-- now-updated: 2026-08-08 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -28,7 +28,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
-| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 IN REVIEW (`row/DEVICE-KNOB`)**: ABI v14 `device` knob, absent-cuda fails loud, `--device` on server+cli; **#135 H3 device-seam repair IN** (ABI 0/1 via `DeviceType`, DSR 32) | Merge after review; CUDA A/B |
+| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 LANDED; #139 repair CPU-GREEN**: ABI v14 stable; named platform resolves via registry; DSR 39→32 (`kcuda=0`), H3 untouched | Review #139; CUDA A/B residual |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

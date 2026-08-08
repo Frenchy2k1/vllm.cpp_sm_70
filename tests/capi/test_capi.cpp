@@ -1832,7 +1832,7 @@ TEST_CASE("capi v14: explicit cpu forces the CPU queue at the EngineParams seam"
   // the pinned message out of construction — never silently build on CPU.
   if (!vllm::platforms::HasPlatform(vt::DeviceType::kCUDA)) {
     EngineParams cuda_params = SyntheticParams();
-    cuda_params.device = vllm::Device::kCUDA;
+    cuda_params.device = vllm::Device::kNamedPlatform;
     CHECK_THROWS_WITH_AS(
         LoadedEngine(MakeConfig(), MakeWeights(c), BuildFixture(), cuda_params),
         doctest::Contains("device 'cuda' was requested but no CUDA platform"),

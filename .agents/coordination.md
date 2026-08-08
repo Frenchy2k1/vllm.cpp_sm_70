@@ -118,20 +118,6 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
-**ONE-SURFACE device-selection leakage repair (`ARCH-ONE-SURFACE`,
-2026-08-08, `CLAIM-ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2`).** Codex (GPT-5),
-isolated worktree
-`/home/mudler/_git/vllm.cpp-arch-one-surface-device-leakage-v2`, branch
-`row/ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2`, base `origin/main` `b44ad337`.
-Repairs the inherited PR #136 DSR regression without weakening the baseline or
-allowlist: generic device configuration and model loading must route through
-the platform/backend abstraction while preserving ABI-v14 auto/CPU/CUDA
-selection, loud absent-CUDA failure, and the restored H3 seam. Owns
-`include/vllm/config/device.h`, `src/vllm/config/device.cpp`,
-`src/vllm/entrypoints/model_loader.cpp`, focused CPU tests, the existing
-ONE-SURFACE specs/records and required public checkpoint surfaces. CPU-only;
-no CUDA execution, model download, benchmark, or service change.
-
 **CPU grouped keep-quant GEMM activation-dtype P0 (`QUANT-GGUF-CIQ-GEMM`,
 2026-08-06, `CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`).** Claude Code
 (claude-opus-5), isolated worktree `/home/mudler/_git/vllmcpp-ciq-grouped`,
@@ -1683,6 +1669,19 @@ this claim will meet. The tiled row is speed-gatable on dgx.
 | 11 | `ENG-EXPERT-STREAM` (D4 first leaf) | corrected spike accepted after live Marlin/loader verification | claim W0 nsys + fresh c1 baseline; then W1 CPU cache policy and W2 bank-only loader/reader/pread as independent performance checkpoints before W3 dispatch | `READY` |
 
 ## Closing and archival
+
+- 2026-08-08: `CLAIM-ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2` CLOSED on draft PR
+  #139. Base `b44ad337` inherited PR #136's seven shared-layer CUDA literals
+  (DSR 39 vs baseline 32). The repair keeps ABI-v14 0/1/2 and the public
+  `auto`/`cpu`/`cuda` names, represents slot 2 internally as a named-platform
+  selection, resolves its canonical name through `FindPlatformByName`, and
+  propagates the registry's `DeviceType` without a backend-specific shared
+  branch. RED-first compiler failure pinned the new seam; the non-CUDA `kXPU`
+  resolver assertion kills a hidden constant return. GREEN: DSR 32
+  (`kcuda=0`) with baseline/allowlist unchanged; checker mutations 25/25;
+  CPU Release `-Werror` `test_platform` 11/11·85,
+  `test_loaded_engine_dense` 9/9·65, `test_capi` 45/45·428. H3 source was
+  untouched; no CUDA execution, download, benchmark or service change.
 
 A block closes only when every row in its declared scope is `DONE`. In the same
 change:

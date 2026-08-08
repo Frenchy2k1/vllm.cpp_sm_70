@@ -31,7 +31,9 @@ namespace vllm {
 enum class Device : int32_t {
   kAuto = 0,  // platform-probed, upstream's "auto" default (device.py:20).
   kCPU = 1,   // force the CPU queue even when an accelerator is present.
-  kCUDA = 2,  // require the CUDA platform; absent => the load fails LOUD.
+  // ABI v14 slot 2 currently names "cuda". Keep the enum platform-neutral:
+  // shared selection resolves DeviceName() through the platform registry.
+  kNamedPlatform = 2,
 };
 
 // Parse the wire/CLI name ("auto" | "cpu" | "cuda" — the supported subset of

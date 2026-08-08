@@ -1563,9 +1563,10 @@ runtime-verified yet.
   lanes. Guard `scripts/check-surface-coverage.py` (two axes, preflight + CI):
   every `examples/*` unit is a client of `include/vllm.h` or tracked to a fold
   row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
-  ROW 8 ABI-v14 device selection is behavior-complete, but #136 regressed its
-  shared-layer DSR 32->39; generic-seam repair is pending with the baseline
-  unchanged. CUDA-build A/B remains the named residual.
+  ROW 8 ABI-v14 device selection is behavior-complete; #139 repairs #136's
+  shared-layer DSR 39->32 through registry/name resolution (`kcuda=0`) with the
+  baseline and allowlist unchanged. CPU selector/platform/C-ABI gates are
+  green; CUDA-build A/B remains the named residual.
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
   GDN and attention-free default off, mirroring vLLM), and it now has an
   end-to-end cache-ON gate on `Qwen/Qwen3-4B` (a shared common prefix reused
