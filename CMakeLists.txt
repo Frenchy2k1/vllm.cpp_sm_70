@@ -645,6 +645,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/opt_weights.cpp
   src/vllm/model_executor/models/opt.cpp
   src/vllm/model_executor/models/llama_registry.cpp
+  src/vllm/model_executor/models/llama_embedding_registry.cpp
   src/vllm/model_executor/models/llama_weights.cpp
   src/vllm/model_executor/models/mistral_registry.cpp
   src/vllm/model_executor/models/mistral_weights.cpp

@@ -162,6 +162,22 @@ class Qwen3DenseModel {
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
+
+  // POOLING forward (ARCH-ONE-SURFACE ROW 6): the same embed + layer stack,
+  // stopping after the final RMSNorm (+ the logits_indices gather) with NO
+  // lm_head — the forward of an as_embedding_model conversion
+  // (vllm/model_executor/models/adapters.py:135-151 replaces the output layer
+  // with a missing-layer stage; the pooler consumes the post-final-norm
+  // hidden). Returns a HOST ForwardLogits carrier of [n_out, hidden_size] f32
+  // rows (`vocab` == hidden_size on this path); the engine's pooling branch
+  // hands them to the landed PoolingRunner. Additive: no text caller routes
+  // here, and the lm_head tail above is byte-identical.
+  static ForwardLogits ForwardHidden(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
 };
 
 // SHARED pure-dense decode CUDA-graph driver — the sibling of Qwen3MoeDecodeGraph

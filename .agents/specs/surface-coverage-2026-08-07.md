@@ -29,7 +29,7 @@ The four surfaces, and the public boundary the guard draws:
 | 3 | **DeepSeek-V4 fast decode** | yes, but forward is a W3 stub | no (stub) | no | `examples/deepseek_v4_gen` (keep-quant GGUF) |
 | 4 | **Audio transcription** | **CLOSED (ROW 1)**: Parakeet CTC/RNNT/TDT registered (transcription-only; Whisper/Voxtral still off-registry) | **live `/v1/audio/transcriptions`** (task-conditional; the run_batch line stays a residual) | **`vllm_transcribe` (ABI v11)** | library seam `ParakeetTranscriber`; example is a clean ABI client |
 | 5 | **Kimi-Linear incremental decode** | yes (recompute forward IS shared) | recompute only | no | `examples/kimi_linear_gen` (§18/§19 paged-incremental + resident loader) |
-| 6 | **Embeddings / pooling** | NO (all `is_pooling_model=false`) | no (`/v1/embeddings` = residual) | no | engine-side pooler exists (`ENG-POOLER-SEQ`), never invoked live |
+| 6 | **Embeddings / pooling** | **CLOSED (ROW 6, 2026-08-08)**: `LlamaModel` registered `is_pooling_model=true`; `PoolingRunner` invoked task-gated in the engine step | **live `/v1/embeddings`** (task-conditional; 404 both directions) | **`vllm_embed` (ABI v15)** | ONE engine path: `LoadedEngine -> LLMEngine::embed -> registry forward -> PoolingRunner` |
 | 7 | **Multimodal input over HTTP/ABI** | 5 archs `supports_multimodal` | image seam only; tower not run in engine step | no (text-only chat) | `chat_mm.cpp` seam; towers test-only |
 
 21 of 30 registered text archs are fully on-framework (registry + runner + server + ABI):
@@ -64,7 +64,7 @@ All three drivers run a PRIVATE host-argmax greedy loop, not the on-GPU sampler.
 | Parakeet/FastConformer ASR | **YES (ROW 1)**: ParakeetForCTC/RNNT/TDT, `parakeet_registry.cpp` (SupportsTranscription-only; text paths refuse by task) | `parakeet_transcription.cpp` seam composes encoder/transducer/audio-processor; the example's private `ReadWav16BitMono`/`LoadVocab`/`DecodeIds` are DELETED (`vllm::Tokenizer` now decodes Metaspace split=true) | **`/v1/audio/transcriptions`** (task-conditional) | **`vllm_transcribe` (ABI v11)** | `examples/parakeet_transcribe` = thin `vllm.h` client |
 | Voxtral audio->text | NO (`VoxtralForConditionalGeneration` unregistered) | `voxtral.cpp` (`vllm::multimodal`) | NO (`/v1/audio/transcriptions` = `run_batch.cpp:188` residual) | NO | tests-only reachability |
 | Whisper audio encoder | NO | `whisper_audio.cpp:174` | NO | NO | tests-only callers |
-| Pooling / embeddings | NO (`is_pooling_model=false` in all 27) | `layers/pooler/*.cpp`, `pool/pooling_runner` (`ENG-POOLER-SEQ`) | NO (`/v1/embeddings` = residual) | NO | `PoolingRunner` test-only |
+| Pooling / embeddings | **YES (ROW 6)**: `LlamaModel` (`llama_embedding_registry.cpp`, `is_pooling_model=true`; other `_EMBEDDING_MODELS` memberships still off) | `layers/pooler/*.cpp`, `pool/pooling_runner` (`ENG-POOLER-SEQ`) + the live engine-step invocation (`runner.cpp pool_tokens`) | **`/v1/embeddings`** (task-conditional) | **`vllm_embed` (ABI v15)** | fold gate `test_llama_embedding_fold` |
 | Multimodal INPUT | 5 archs `supports_multimodal` (Gemma4, KimiK3, Qwen3VL, Qwen3.5/-Moe) | towers `qwen3_vl_vision.cpp:374`, `gemma4_vision.cpp:170`; **Gemma-4 AUDIO USM tower is STANDALONE** (Gemma-4 text+image route via `ModelRegistry::Forward`, audio does NOT) | image seam only, raw-RGB, no stream, **tower not run in live step** (`chat_mm.cpp`; runner never consumes `mm_features`) | NO (text-only; `vllm_c.cpp` sets no mm seam) | — |
 | MTP / DFlash / ngram speculators | NO (sub-config / draft checkpoint; EAGLE unwired) | `spec_decode/{mtp,dflash}/speculator.cpp`, `ngram_proposer.cpp` | via `speculative_config` | via `speculative_config` (`vllm.h:172`) | — |
 
@@ -119,10 +119,11 @@ before it.
 
 Bound to `include/vllm.h` by the marked `abi-capability-table` in `docs/FEATURES.md`.
 The ABI is text-generation-complete (completion, chat, async, structured output, tool +
-reasoning parsers, speculative config, custom logits processor — 7 `reachable` rows). 4
-`embedder-unreachable` rows, each tracked in `scripts/abi-capability-allowlist.txt`
-against `ARCH-ONE-SURFACE`: embeddings/pooling, audio transcription, video+audio
-generation, multimodal input.
+reasoning parsers, speculative config, custom logits processor — 7 `reachable` rows).
+ROW 1 (audio transcription, v11), ROW 2 (video+audio generation, v12) and ROW 6
+(embeddings/pooling, v15) each flipped their row `reachable`; ONE
+`embedder-unreachable` row remains, tracked in `scripts/abi-capability-allowlist.txt`
+against `ARCH-ONE-SURFACE`: multimodal input.
 
 **Severity note — the ABI happy path is itself untested.** `vllm_engine_load` is never
 CI-gated on a REAL model load: `tests/capi/test_capi.cpp` covers only the bad-path error
@@ -144,7 +145,7 @@ lanes are leaves of `ARCH-ONE-SURFACE` (do not open parallel rows).
 | 3 | DeepSeek-V4 fast decode | same as (2) for `DeepseekV4ForCausalLM`; real MLA paged KV (retire the W3 stub) | rewrite `deepseek_v4_gen`; delete `DeepseekV4ForwardGguf*` | M | MLA paged-KV topology |
 | 4 | Audio transcription | **DONE (ROW 1, 2026-08-07)**: `vllm_transcribe` (ABI v11) + live `/v1/audio/transcriptions`; ParakeetForCTC/RNNT/TDT registered (SupportsTranscription mirror, refuse-by-task) | **DONE**: `parakeet_transcribe` rewritten as a `vllm.h` client (byte-identical transcript goldens); route live, task-conditional | M | encoder→text seam (LANDED: `ParakeetTranscriber`) |
 | 5 | Kimi-Linear incremental | expose the incremental decode path through the runner/engine (the recompute forward already routes) | rewrite `kimi_linear_gen` | S–M | `KimiDecodeCache` on the runner |
-| 6 | Embeddings/pooling | `vllm_embed`/pooling entry point + live `/v1/embeddings`; register a pooling arch (`is_pooling_model=true`); invoke `PoolingRunner` in the step | — | M | pooler live-wiring |
+| 6 | Embeddings/pooling | **DONE (ROW 6, 2026-08-08)**: `vllm_embed`/`vllm_embedding_result_free` (ABI v15) + live task-conditional `/v1/embeddings`; `LlamaModel` registered `is_pooling_model=true` (as_embedding_model mirror); `PoolingRunner` invoked in the step (pool-instead-of-sample + scheduler pooling stop) | **DONE**: no example existed to rewrite (the capability was test-only); fold gate re-anchors the lane's cosine gate through the registry path | M | pooler live-wiring (LANDED) |
 | 7 | Multimodal input | multimodal-content entry point on `vllm_chat`; run the vision/audio tower in the engine step (`mm_features`→`ModelForwardInput.mm`) | wire `chat_mm` seam into the ABI | L | `MM-SERVE-E2E` engine mm-forward residual |
 | 8 | Device-selection knob | **DONE (ROW 8, 2026-08-08, `row/DEVICE-KNOB`; leakage follow-up PR #139)**: `vllm_model_params.device` (ABI v14: 0=auto/1=cpu/2=cuda, the vLLM `DeviceConfig.device` names, device.py:13) → `EngineParams::device` → `SelectQueue`; the stable public name resolves through `FindPlatformByName` and its registered `DeviceType` is propagated without a shared CUDA literal; explicit cpu never probes, explicit ABSENT cuda fails LOUD before model I/O; DSR 32 / `kcuda=0` | **DONE**: both thin clients consume the field; zero value byte-identical (auto probe) | S | mirror vLLM `--device`/`DeviceConfig` |
 | 9 | Voxtral + audio chat seam | register `VoxtralForConditionalGeneration` + fold `VoxtralGenerateGreedy` into the registry forward; audio-capable chat fn + an engine consumer for `AudioKwargs` mm_features | rewrite tests→clients | M | mirror upstream `voxtral.py:309`, `SupportsTranscription` |

@@ -215,12 +215,20 @@ void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
 // `hidden` DBuf reassignment (RunLayer's `hidden = MlpBlock(...)`) never disturbs
 // the persistent embedding — the copy is a pure device->device data move, so the
 // layer sequence and its output are BYTE-IDENTICAL to the pre-split forward.
+// `return_hidden` (ARCH-ONE-SURFACE ROW 6, default false = byte-identical
+// text path): when true, STOP after the final RMSNorm (+ the logits_indices
+// gather) and return the [n_out, H] hidden rows upcast to f32 — the pooling
+// forward of an embedding conversion, whose model has NO lm_head at all
+// (adapters.py:135-151: as_embedding_model replaces the output layer with a
+// missing-layer stage; the pooler consumes the post-final-norm hidden). Every
+// existing caller leaves the default, so the lm_head tail is untouched.
 DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const std::vector<int32_t>& positions,
                    const CommonAttentionMetadata& attn_meta,
                    const std::vector<PagedKvCache>& attn_kv,
                    const Qwen3DenseWeights& weights, const HfConfig& config,
-                   const std::vector<int32_t>& logits_indices) {
+                   const std::vector<int32_t>& logits_indices,
+                   bool return_hidden = false) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -254,13 +262,6 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
-  // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
-  // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
-  // Matmul-B [H,vocab] lm_head via vt::Matmul.
-  const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
-  Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
-                   : ResidentWeight(d, weights.lm_head);
-
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   Tensor src = dnorm.t();
@@ -272,6 +273,23 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     src = dgather.t();
   }
   const int64_t n_out = src.shape[0];
+
+  // ARCH-ONE-SURFACE ROW 6 pooling tail: the post-final-norm hidden rows,
+  // upcast bf16 -> f32 (vt::CastF32), with NO lm_head — an embedding-converted
+  // checkpoint has no output layer to multiply by. Never taken by any text
+  // caller (return_hidden defaults false).
+  if (return_hidden) {
+    DBuf dhid(d, DType::kF32, {n_out, H});
+    vt::CastF32(d.q, dhid.t(), src);
+    return dhid;
+  }
+
+  // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
+  // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
+  // Matmul-B [H,vocab] lm_head via vt::Matmul.
+  const bool tied = weights.tie_word_embeddings || weights.lm_head.Empty();
+  Tensor lm = tied ? ResidentWeight(d, weights.embed_tokens, {vocab, H})
+                   : ResidentWeight(d, weights.lm_head);
   DBuf logits(d, DType::kF32, {n_out, vocab});
   if (tied)
     vt::MatmulBT(d.q, logits.t(), src, lm);
@@ -289,12 +307,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Qwen3DenseWeights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 bool return_hidden = false) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   DBuf hidden(d, DType::kBF16, {T, config.hidden_size});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, attn_kv, weights, config,
-                       logits_indices);
+                       logits_indices, return_hidden);
 }
 
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -410,6 +429,30 @@ ForwardLogits Qwen3DenseModel::ForwardDevice(
                              config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
+}
+
+ForwardLogits Qwen3DenseModel::ForwardHidden(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
+    const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+    const std::vector<int32_t>& logits_indices) {
+  // ARCH-ONE-SURFACE ROW 6: the POOLING forward — the same embed + layer stack
+  // as Forward/ForwardDevice, stopping after the final RMSNorm (+ gather) with
+  // NO lm_head, mirroring an as_embedding_model conversion whose output layer
+  // is a missing-layer stage (adapters.py:135-151). The [n_out, H] f32 rows are
+  // downloaded to the host carrier: the landed pooler ops are host-side, and an
+  // embedding batch is one prefill (no per-step decode loop to keep resident).
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dhidden = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
+                             config, logits_indices, /*return_hidden=*/true);
+  const int64_t n_out = dhidden.t().shape[0];
+  const int64_t H = config.hidden_size;
+  ForwardLogits fl;
+  fl.rows = n_out;
+  fl.vocab = H;  // the carrier's row width IS the hidden size on this path
+  fl.host.resize(static_cast<size_t>(n_out) * static_cast<size_t>(H));
+  dhidden.Download(d, fl.host.data());
+  return fl;
 }
 
 // ─── Qwen3DenseDecodeGraph (shared pure-dense decode CUDA-graph driver) ───────

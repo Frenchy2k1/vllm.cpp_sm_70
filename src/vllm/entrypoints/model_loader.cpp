@@ -553,9 +553,14 @@ vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
 // ResolveAsyncScheduling(runner_supports_async) yields runner_supports_async
 // (when otherwise compatible).
 bool LoadedEngine::ResolveAsyncEnabled(
-    const vllm::SchedulerConfig& scheduler_config, bool runner_supports_async) {
-  return vllm::AsyncSchedulingEnabled(
-      scheduler_config.ResolveAsyncScheduling(runner_supports_async));
+    const vllm::SchedulerConfig& scheduler_config, bool runner_supports_async,
+    bool is_pooling_model) {
+  // Pooling models resolve async scheduling OFF (the mirror of vLLM disabling
+  // it by default for pooling models, vllm/config/vllm.py:1068-1073) — the
+  // landed is_pooling_model arm of ResolveAsyncScheduling, wired here since
+  // ARCH-ONE-SURFACE ROW 6. false (every text arch) is byte-identical.
+  return vllm::AsyncSchedulingEnabled(scheduler_config.ResolveAsyncScheduling(
+      runner_supports_async, is_pooling_model));
 }
 
 std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
@@ -734,7 +739,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
               max_model_len_,
               params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_num_batched_tokens_, params.policy),
-          runner_.runner_supports_async())),
+          runner_.runner_supports_async(),
+          model_->registration().info.is_pooling_model)),
       max_concurrent_batches_(MakeSchedulerConfig(
                                   max_model_len_,
                                   params.max_num_seqs > 0 ? params.max_num_seqs

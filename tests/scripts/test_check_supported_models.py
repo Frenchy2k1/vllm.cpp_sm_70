@@ -106,10 +106,14 @@ class DriftTests(unittest.TestCase):
     def test_unrepresentable_registered_arch_fails_the_self_check(self) -> None:
         # A registered string the FEATURES arch-token pattern cannot express must
         # surface as an error, never be silently excluded from the comparison.
-        registered = REGISTERED | {"WeirdModel"}
+        # (ARCH-ONE-SURFACE ROW 6 widened the pattern to bare `*Model` archs —
+        # the upstream _EMBEDDING_MODELS naming, e.g. `LlamaModel` — so the
+        # unrepresentable example is now a suffix the pattern still cannot
+        # express, not a `*Model` name.)
+        registered = REGISTERED | {"WeirdArchitecture"}
         errors = chk.supported_models_errors(registered, _features(TWO))
         self.assertTrue(any("do not match the FEATURES arch-token pattern" in e for e in errors), errors)
-        self.assertTrue(any("WeirdModel" in e for e in errors), errors)
+        self.assertTrue(any("WeirdArchitecture" in e for e in errors), errors)
 
 
 class ScopingTests(unittest.TestCase):

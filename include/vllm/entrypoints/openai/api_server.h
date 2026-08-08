@@ -138,6 +138,18 @@ class ApiServer {
   DispatchResult handle_audio_transcriptions(
       const std::string& file_bytes, const std::string& response_format) const;
 
+  // POST /v1/embeddings (ARCH-ONE-SURFACE ROW 6). Mirror of vLLM's
+  // pooling/embed/api_router.py:28 `create_embedding` over the
+  // EmbeddingCompletionRequest shape (embed/protocol.py:34: `model`, `input`
+  // as ONE string or an ARRAY of strings) and the EmbeddingResponse shape
+  // (embed/protocol.py:173-185: id "embd-...", object "list", data rows
+  // {index, object:"embedding", embedding:[...]}, usage prompt/total tokens).
+  // Token-array inputs, `dimensions` (matryoshka) and `encoding_format:
+  // "base64"` are NAMED RESIDUALS -> 400. Registered ONLY when an embedder is
+  // attached (the transcriber precedent), so a text server answers 404 at the
+  // route table.
+  DispatchResult handle_embeddings(const std::string& request_body) const;
+
   DispatchResult handle_videos(const std::string& request_body);
   DispatchResult handle_videos_sync(const std::string& request_body);
   DispatchResult handle_video_status(const std::string& job_id) const;
@@ -207,6 +219,22 @@ class ApiServer {
     transcriber_ = std::move(transcriber);
   }
 
+  // Attach the embedding seam backing POST /v1/embeddings (ARCH-ONE-SURFACE
+  // ROW 6). ADDITIVE and OPT-IN like the transcriber above: absent => route
+  // unregistered => 404, byte-identical to a server without pooling. The
+  // callback wraps the ONE engine path (LoadedEngine -> LLMEngine::embed ->
+  // the registry forward + PoolingRunner step) — the SAME path vllm_embed
+  // drives — so HTTP and FFI cannot drift. Returns one embedding per input
+  // (input order) + the total prompt token count for the usage block; throws
+  // to fail the request (-> 500).
+  struct EmbeddingBatch {
+    std::vector<std::vector<float>> embeddings;
+    int64_t prompt_tokens = 0;
+  };
+  using EmbedFn =
+      std::function<EmbeddingBatch(const std::vector<std::string>& inputs)>;
+  void set_embedder(EmbedFn embedder) { embedder_ = std::move(embedder); }
+
   // Attach the tokenizer + max_model_len backing /tokenize and /detokenize
   // (non-owning; must outlive the server).
   void set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
@@ -269,6 +297,7 @@ class ApiServer {
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
   ::vllm::openai::VideoRunner video_runner_;
   TranscribeFn transcriber_;
+  EmbedFn embedder_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;
   // Background workers for the ASYNC endpoint. Joined in ~ApiServer, which is
   // why they are joinable threads and not detached: a detached worker would

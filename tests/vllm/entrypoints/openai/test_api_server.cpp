@@ -18,6 +18,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -2352,4 +2354,185 @@ TEST_CASE("api_server: an explicit-cpu device-selected engine serves /v1/complet
   CHECK(j.at("object") == "text_completion");
   CHECK(j.at("choices").at(0).at("finish_reason") == "length");
   CHECK(j.at("usage").at("completion_tokens") == 5);
+}
+
+// ─── /v1/embeddings (ARCH-ONE-SURFACE ROW 6) ─────────────────────────────────
+// Task-conditional like /v1/audio/transcriptions: a TEXT server never
+// registers the route; a pooling (embedding) server registers it and NOT the
+// generate routes — vLLM's supported_tasks-conditional registration
+// (api_server.py:255-265) + pooling/embed/api_router.py:28 semantics. The
+// embedder wraps the REAL engine path (LoadedEngine::FromModelDir on the
+// committed llama_embed_e2e fixture -> LLMEngine::embed -> the registry
+// forward + PoolingRunner step), the SAME path vllm_embed drives.
+
+namespace {
+
+struct EmbedHarness {
+  vllm::entrypoints::openai::OpenAIServingModels models{"llama-embed-fixture"};
+  ApiServer server{models, "test-version"};
+  std::shared_ptr<vllm::entrypoints::LoadedEngine> loaded;
+  std::shared_ptr<std::mutex> mutex = std::make_shared<std::mutex>();
+
+  EmbedHarness() {
+    vllm::entrypoints::EngineParams params;
+    params.max_model_len = 64;
+    loaded = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
+        vllm::entrypoints::LoadedEngine::FromModelDir(
+            std::string(LLAMA_EMBED_FIXTURE_DIR), params));
+    auto engine = loaded;
+    auto mu = mutex;
+    auto counter = std::make_shared<std::atomic<uint64_t>>(0);
+    server.set_embedder(
+        [engine, mu, counter](const std::vector<std::string>& inputs) {
+          std::lock_guard<std::mutex> lock(*mu);
+          ApiServer::EmbeddingBatch batch;
+          for (const std::string& text : inputs) {
+            std::vector<int32_t> ids =
+                engine->tokenizer().EncodeWithSpecialTokens(text);
+            REQUIRE(!ids.empty());
+            batch.prompt_tokens += static_cast<int64_t>(ids.size());
+            vllm::RequestOutput ro = engine->engine().embed(
+                std::move(ids), vllm::PoolingParams{},
+                "embd-" + std::to_string(counter->fetch_add(1)));
+            REQUIRE(ro.finished);
+            REQUIRE(ro.pooling_output.has_value());
+            batch.embeddings.push_back(std::move(*ro.pooling_output));
+          }
+          return batch;
+        });
+  }
+};
+
+}  // namespace
+
+TEST_CASE("api_server: embeddings dispatch — OpenAI shape over the engine path") {
+  EmbedHarness h;
+
+  // ONE string input.
+  ApiServer::DispatchResult r = h.server.handle_embeddings(
+      R"({"model":"llama-embed-fixture","input":"the quick brown fox"})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("object") == "list");
+  CHECK(j.at("model") == "llama-embed-fixture");
+  CHECK(std::string(j.at("id")).rfind("embd-", 0) == 0);
+  REQUIRE(j.at("data").size() == 1);
+  CHECK(j.at("data").at(0).at("object") == "embedding");
+  CHECK(j.at("data").at(0).at("index") == 0);
+  REQUIRE(j.at("data").at(0).at("embedding").is_array());
+  CHECK(j.at("data").at(0).at("embedding").size() == 64);  // hidden_size
+  // Unit L2: the pooling normalize ran.
+  double l2 = 0.0;
+  for (const auto& v : j.at("data").at(0).at("embedding"))
+    l2 += v.get<double>() * v.get<double>();
+  CHECK(std::sqrt(l2) == doctest::Approx(1.0).epsilon(1e-5));
+  CHECK(j.at("usage").at("prompt_tokens").get<int64_t>() > 0);
+  CHECK(j.at("usage").at("total_tokens") == j.at("usage").at("prompt_tokens"));
+
+  // ARRAY input: one embedding per string, input order.
+  r = h.server.handle_embeddings(
+      R"({"input":["the quick brown fox","the lazy dog"]})");
+  CHECK(r.status == 200);
+  j = json::parse(r.body);
+  REQUIRE(j.at("data").size() == 2);
+  CHECK(j.at("data").at(1).at("index") == 1);
+
+  // Malformed / unsupported requests.
+  CHECK(h.server.handle_embeddings("not json").status == 400);
+  CHECK(h.server.handle_embeddings(R"({"model":"x"})").status == 404);
+  CHECK(h.server.handle_embeddings(R"({"input":42})").status == 400);
+  CHECK(h.server.handle_embeddings(R"({"input":[]})").status == 400);
+  CHECK(h.server.handle_embeddings(R"({"input":[[1,2]]})").status == 400);
+  CHECK(h.server
+            .handle_embeddings(
+                R"({"input":"x","encoding_format":"base64"})")
+            .status == 400);
+  CHECK(h.server.handle_embeddings(R"({"input":"x","dimensions":16})").status ==
+        400);
+}
+
+TEST_CASE("api_server: embeddings without an embedder is a 500, not a crash") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r = server.handle_embeddings(R"({"input":"x"})");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message") ==
+        "The model does not support Embeddings API");
+}
+
+TEST_CASE("api_server: embeddings socket smoke; generate routes 404 on the "
+          "embedding server") {
+  EmbedHarness h;
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+
+    auto res = client.Post("/v1/embeddings",
+                           R"({"input":"the quick brown fox"})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(json::parse(res->body).at("data").at(0).at("embedding").size() == 64);
+
+    // The generate routes are NOT registered on an embedding server (the
+    // task-conditional registration, both directions).
+    auto completions = client.Post("/v1/completions", "{}", "application/json");
+    REQUIRE(completions);
+    CHECK(completions->status == 404);
+    auto chat = client.Post("/v1/chat/completions", "{}", "application/json");
+    REQUIRE(chat);
+    CHECK(chat->status == 404);
+
+    // Liveness + discovery still serve.
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+    auto models_res = client.Get("/v1/models");
+    REQUIRE(models_res);
+    CHECK(json::parse(models_res->body).at("data").at(0).at("id") ==
+          "llama-embed-fixture");
+  }
+
+  h.server.stop();
+  server_thread.join();
+}
+
+TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
+  // The reverse pin, the exact twin of "the audio routes do not exist on a
+  // TEXT server": task-conditional registration means a TEXT-engine server (no
+  // embedder attached) must answer 404 from the ROUTE TABLE — a well-formed
+  // request that the handler WOULD accept proves the route was never
+  // registered (an `if (true)` registration mutation answers 200/400 from the
+  // handler instead and only THIS test reds).
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+    auto res = client.Post("/v1/embeddings", R"({"input":"hello"})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+  }
+
+  h.server.stop();
+  server_thread.join();
 }

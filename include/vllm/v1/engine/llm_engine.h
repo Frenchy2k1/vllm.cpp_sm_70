@@ -112,6 +112,21 @@ class LLMEngine {
                           multimodal::MultiModalInputs mm_inputs,
                           SamplingParams params, int priority = 0);
 
+  // add_pooling_request (ARCH-ONE-SURFACE ROW 6): the POOLING-task counterpart
+  // of the tokens add_request — upstream's `params: SamplingParams |
+  // PoolingParams` union (llm_engine.py add_request) collapses here to an
+  // explicit pooling entry point. Builds the request via process_inputs_tokens
+  // with a benign greedy SamplingParams (the sampler is never invoked on a
+  // pooling model's step) and attaches the PoolingParams; the scheduler
+  // finishes it as soon as the runner pooled its prompt
+  // (scheduler.py:1718-1721). Only meaningful on an engine whose model
+  // registration declares is_pooling_model — on a text model the request would
+  // never produce pooled data (the entrypoints refuse it before here).
+  std::string add_pooling_request(const std::string& request_id,
+                                  std::vector<int32_t> prompt_token_ids,
+                                  PoolingParams pooling_params,
+                                  int priority = 0);
+
   // step (llm_engine.py:296): get the EngineCore outputs -> process_outputs ->
   // abort any reqs the detokenizer stopped -> return the RequestOutputs.
   std::vector<RequestOutput> step();
@@ -158,6 +173,15 @@ class LLMEngine {
   RequestOutput generate(multimodal::MultiModalInputs mm_inputs,
                          SamplingParams params, const std::string& request_id = "0",
                          int priority = 0);
+
+  // embed (ARCH-ONE-SURFACE ROW 6): the single-request pooling driver — the
+  // mirror of LLM.embed's add-then-run loop (entrypoints/pooling/offline.py:
+  // 65-119, pooling_task="embed"). Adds the pooling request, then loops step()
+  // until it finishes; the returned RequestOutput carries the pooled vector in
+  // pooling_output.
+  RequestOutput embed(std::vector<int32_t> prompt_token_ids,
+                      PoolingParams pooling_params = {},
+                      const std::string& request_id = "0", int priority = 0);
 
   // The rolling prefix-cache hit rate (queries/hits in TOKENS over the most
   // recent 1000 requests). See EngineCore::prefix_cache_metrics.

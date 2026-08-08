@@ -70,6 +70,14 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
       vllm_transcription_free(&transcript);
     }
 
+    /* Embeddings (ABI v15). */
+    {
+      const char* texts[1] = {"strict-C embed reference"};
+      vllm_embedding_result emb;
+      st = vllm_embed(eng, texts, 1, &emb);
+      vllm_embedding_result_free(&emb);
+    }
+
     vllm_engine_free(eng);
   }
 

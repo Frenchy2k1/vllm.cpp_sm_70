@@ -182,8 +182,10 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
 std::optional<RequestOutput> RequestState::make_request_output(
     const std::vector<int32_t>& new_token_ids,
     std::optional<FinishReason> finish_reason,
-    std::optional<std::string> stop_reason) {
-  // output_processor.py:272-331 (text path; pooling / parent_req deferred).
+    std::optional<std::string> stop_reason,
+    std::optional<std::vector<float>> pooling_output) {
+  // output_processor.py:272-331 (text + pooling; parent_req deferred for
+  // pooling — a pooling request is always n==1).
   const bool finished = finish_reason.has_value();
   const bool final_only = output_kind == RequestOutputKind::kFinalOnly;
 
@@ -240,7 +242,13 @@ std::optional<RequestOutput> RequestState::make_request_output(
     out_external_req_id = parent_req->external_req_id();
   }
 
-  return NewRequestOutput(out_external_req_id, std::move(outputs), out_finished);
+  RequestOutput ro =
+      NewRequestOutput(out_external_req_id, std::move(outputs), out_finished);
+  // ARCH-ONE-SURFACE ROW 6 (output_processor.py:319 pooling branch; recorded
+  // deviation: upstream returns a separate PoolingRequestOutput class — ours
+  // carries the pooled vector as an optional field on the ONE RequestOutput).
+  ro.pooling_output = std::move(pooling_output);
+  return ro;
 }
 
 RequestOutput RequestState::NewRequestOutput(
@@ -449,9 +457,10 @@ OutputProcessorOutput OutputProcessor::process_outputs(
       req_state.logprobs_processor->update_from_output(eco);
     }
 
-    // 4) Create and handle the RequestOutput (:650-666).
+    // 4) Create and handle the RequestOutput (:650-666). The pooled vector of
+    //    a finished pooling request rides through (ARCH-ONE-SURFACE ROW 6).
     std::optional<RequestOutput> request_output = req_state.make_request_output(
-        new_token_ids, finish_reason, stop_reason);
+        new_token_ids, finish_reason, stop_reason, eco.pooling_output);
     if (request_output.has_value()) {
       // streaming_input deferred (false) -> no finished=false override.
       if (req_state.queue != nullptr) {

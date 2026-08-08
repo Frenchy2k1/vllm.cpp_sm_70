@@ -13,7 +13,8 @@
 //
 // DEFERRED upstream fields, intentionally omitted — later units slot these in
 // without reshaping the structs:
-//   EngineCoreRequest: mm_features (multimodal), pooling_params, lora_request,
+//   EngineCoreRequest: mm_features (multimodal) and pooling_params are now
+//     PRESENT (pooling_params since ARCH-ONE-SURFACE ROW 6); lora_request,
 //     cache_salt, data_parallel_rank, prompt_embeds, prompt_is_token_ids,
 //     client_index, current_wave, trace_headers, resumable,
 //     external_req_id, reasoning_ended / reasoning_parser_kwargs,
@@ -22,17 +23,17 @@
 //   SamplerOutput: logprobs_tensors now carries the real LogprobsTensors payload
 //     (vllm/v1/outputs.py, ported at M1.7); the sampler's gather_logprobs fills
 //     it. It stays std::optional (None => no logprobs requested this step).
-//   ModelRunnerOutput: logprobs (LogprobsLists) and prompt_logprobs_dict are
-//     now PRESENT (ROAD-V1-C7 SAMPLE-LOGPROBS payload); pooler_output,
-//     kv_connector_output / ec_connector_output (P/D KV transfer),
+//   ModelRunnerOutput: logprobs (LogprobsLists), prompt_logprobs_dict (ROAD-V1-C7
+//     SAMPLE-LOGPROBS) and pooler_output (ARCH-ONE-SURFACE ROW 6) are now
+//     PRESENT; kv_connector_output / ec_connector_output (P/D KV transfer),
 //     num_nans_in_logits, cudagraph_stats, routed_experts, and the
 //     with_kv_conn_output_only / EMPTY_MODEL_RUNNER_OUTPUT helpers stay deferred.
 //   EngineCoreOutput: new_logprobs / new_prompt_logprobs_tensors are now PRESENT
 //     (ROAD-V1-C7); events (EngineCoreEvent) is now PRESENT
 //     (SERVE-RESPONSE-METRICS — the per-request QUEUED/SCHEDULED/PREEMPTED
-//     timing events the scheduler drains onto each output); pooling_output,
-//     kv_transfer_params, trace_headers, prefill_stats, routed_experts,
-//     num_nans_in_logits deferred.
+//     timing events the scheduler drains onto each output); pooling_output is
+//     now PRESENT (ARCH-ONE-SURFACE ROW 6); kv_transfer_params, trace_headers,
+//     prefill_stats, routed_experts, num_nans_in_logits deferred.
 //   EngineCoreOutputs: scheduler_stats (SchedulerStats), utility_output,
 //     finished_requests, wave_complete / start_wave (DP wave signalling), and
 //     the __post_init__ monotonic-timestamp default (the frontend stamps it).
@@ -57,6 +58,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/layers/pooler/pooling_params.h"  // PoolingParams (pooling seam)
 #include "vllm/multimodal/inputs.h"  // multimodal::MultiModalFeatureSpec (mm seam)
 #include "vllm/sampling_params.h"
 #include "vllm/v1/metrics/stats.h"  // vllm::v1::SchedulerStats (per-step stats)
@@ -97,6 +99,13 @@ struct EngineCoreRequest {
   // carried into Request.lora_name for the prefix-cache extra-key path. nullopt
   // for a base-model request. Full LoRA runtime is LORA-RUNTIME.
   std::optional<std::string> lora_name = std::nullopt;
+  // pooling_params (EngineCoreRequest.pooling_params, ARCH-ONE-SURFACE ROW 6):
+  // set iff this is a POOLING-task request (upstream `params: SamplingParams |
+  // PoolingParams` — the union collapses to sampling_params + this optional).
+  // nullopt on every generation request -> byte-identical text path. Carried
+  // into Request::pooling_params; the scheduler's pooling stop
+  // (scheduler.py:1718-1721 mirror) fires only when it is set.
+  std::optional<PoolingParams> pooling_params = std::nullopt;
 };
 
 // SamplerOutput (vllm/v1/outputs.py): the raw sampler result for a step.
@@ -139,6 +148,13 @@ struct ModelRunnerOutput {
   // tensor SOURCE (lm_head over prompt positions) is a runner/prefill addition
   // (SAMPLE-PROMPT-LOGPROBS); the OUTPUT plumbing below consumes it 1:1.
   std::map<std::string, LogprobsTensors> prompt_logprobs_dict;
+  // pooler_output (ModelRunnerOutput.pooler_output, vllm/v1/outputs.py;
+  // ARCH-ONE-SURFACE ROW 6): one entry per req in `req_ids` order on a POOLING
+  // model's step — the pooled vector, or nullopt while the request is still
+  // consuming prefill chunks (the is_valid=false rows,
+  // pool/pooling_runner.py:40-41). EMPTY (size 0) on every generation step ->
+  // byte-identical text path.
+  std::vector<std::optional<std::vector<float>>> pooler_output;
 };
 
 // DraftTokenIds (vllm/v1/outputs.py:310-315): the drafter's proposal for the
@@ -179,6 +195,11 @@ struct EngineCoreOutput {
   // IterationStats.update_from_events (stats.py:428-450) to fill the request's
   // queue/prefill/inference timing intervals + the preemption counter.
   std::optional<std::vector<EngineCoreEvent>> events;
+  // pooling_output (EngineCoreOutput.pooling_output, ARCH-ONE-SURFACE ROW 6):
+  // the pooled vector of a finished POOLING request (scheduler.py:1837
+  // `pooling_output=pooler_output`). nullopt on every generation output ->
+  // byte-identical text path.
+  std::optional<std::vector<float>> pooling_output;
 
   // finished (property): a request is finished iff finish_reason is set.
   bool Finished() const { return finish_reason.has_value(); }

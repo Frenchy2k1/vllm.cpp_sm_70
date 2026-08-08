@@ -139,6 +139,12 @@ class DriftModelTests(unittest.TestCase):
         # tree's live case.
         scanned = mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR)
         self.assertEqual(scanned["deepseek_v4"].classification, "DEVICE")
+        # ARCH-ONE-SURFACE ROW 6: a registry TU declaring `.is_pooling_model =
+        # true` is a NON-GENERATIVE registration — a hidden-state producer for
+        # the PoolingRunner, classified POOLING explicitly (deleting the
+        # checker's pooling arm would drop it into NONE and red the bucket pin
+        # below).
+        self.assertEqual(scanned["llama_embedding"].classification, "POOLING")
         # No registered model may sit in the silently-exempt NONE bucket at all.
         self.assertEqual(
             sorted(n for n, r in scanned.items() if r.classification == "NONE"), []

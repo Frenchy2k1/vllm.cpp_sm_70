@@ -113,6 +113,41 @@ std::string LLMEngine::add_request(const std::string& request_id,
   return req_id;
 }
 
+std::string LLMEngine::add_pooling_request(const std::string& request_id,
+                                           std::vector<int32_t> prompt_token_ids,
+                                           PoolingParams pooling_params,
+                                           int priority) {
+  // ARCH-ONE-SURFACE ROW 6 — the POOLING-task add. Mirrors the tokens
+  // add_request step-for-step; the SamplingParams are a benign greedy default
+  // (temperature 0, max_tokens 1) because the InputBatch admit reads them but
+  // the sampler is NEVER invoked on a pooling model's step (the runner routes
+  // to pool_tokens, model_runner.py:1586-1607 mirror). The PoolingParams ride
+  // the EngineCoreRequest into Request::pooling_params, which arms the
+  // scheduler's pooling stop (scheduler.py:1718-1721).
+  SamplingParams greedy;
+  greedy.temperature = 0.0;
+  greedy.max_tokens = 1;
+  EngineCoreRequest request = input_processor_.process_inputs_tokens(
+      request_id, std::move(prompt_token_ids), std::move(greedy),
+      /*arrival_time=*/std::nullopt, priority);
+  if (!pooling_params.task.has_value()) {
+    pooling_params.task = PoolingTask::kEmbed;
+  }
+  if (!pooling_params.use_activation.has_value()) {
+    pooling_params.use_activation = true;  // pooling_runner.py:38 F.normalize
+  }
+  request.pooling_params = std::move(pooling_params);
+  const std::string req_id = request.request_id;
+
+  output_processor_.add_request(request, /*prompt=*/std::nullopt,
+                                /*request_index=*/0);
+
+  auto req = std::make_unique<Request>(
+      Request::FromEngineCoreRequest(request, block_hasher_));
+  engine_core_.add_request(std::move(req));
+  return req_id;
+}
+
 void LLMEngine::FanOutParallelSampling(const EngineCoreRequest& request,
                                        std::optional<std::string> prompt) {
   // llm_engine.py:280-291. Build the shared ParentRequest, then register n child
@@ -215,6 +250,26 @@ RequestOutput LLMEngine::generate(std::vector<int32_t> prompt_token_ids,
   // TokensPrompt single-request driver (mirrors the string generate loop).
   add_request(request_id, std::move(prompt_token_ids), std::move(params),
               priority);
+  RequestOutput result;
+  while (has_unfinished_requests()) {
+    std::vector<RequestOutput> step_outputs = step();
+    for (RequestOutput& out : step_outputs) {
+      if (out.finished) {
+        result = std::move(out);
+      }
+    }
+  }
+  return result;
+}
+
+RequestOutput LLMEngine::embed(std::vector<int32_t> prompt_token_ids,
+                               PoolingParams pooling_params,
+                               const std::string& request_id, int priority) {
+  // The single-request pooling driver (LLM.embed / offline.py:65-119 mirror):
+  // add the pooling request, then loop step() until it finishes. The finished
+  // RequestOutput carries the pooled vector in pooling_output.
+  add_pooling_request(request_id, std::move(prompt_token_ids),
+                      std::move(pooling_params), priority);
   RequestOutput result;
   while (has_unfinished_requests()) {
     std::vector<RequestOutput> step_outputs = step();

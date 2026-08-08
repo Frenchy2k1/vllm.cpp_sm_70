@@ -114,6 +114,15 @@ class LoadedModel {
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
 
+  // ARCH-ONE-SURFACE ROW 6: the model-owned Pooler of a POOLING model — the
+  // mirror of upstream `VllmModelForPooling.pooler` (as_embedding_model wires
+  // `self.pooler = DispatchPooler.for_embedding(...)`, adapters.py:248-257).
+  // Non-null iff the registration's info.is_pooling_model; the GPU runner
+  // builds its PoolingRunner over exactly this pooler (the mirror of
+  // gpu/model_runner.py:368-369 `PoolingRunner(self.model)`). Default null:
+  // every text-generation model is byte-identical.
+  virtual const class Pooler* pooler() const { return nullptr; }
+
   // ── SPEC-MTP I5d-pre: typed access to the MTP draft, without breaking the
   //    type-erasure of this base. Only the concrete Qwen3.5 dense/MoE
   //    LoadedModel (which owns the target Qwen3_5DenseWeights/Qwen3_5MoeWeights)

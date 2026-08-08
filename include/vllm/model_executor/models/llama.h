@@ -50,6 +50,14 @@ using LlamaModel = Qwen3DenseModel;
 LlamaWeights LoadLlamaForCausalLMWeights(const std::vector<SafetensorsFile>& shards,
                                          const HfConfig& config);
 
+// `LlamaModel` EMBEDDING checkpoint loader (ARCH-ONE-SURFACE ROW 6): the same
+// name map, accepting BOTH the "model."-prefixed and the bare `*Model` tensor
+// layouts (vllm/model_executor/models/adapters.py:178-181 candidate_prefixes
+// ["", "model."]) and never loading an lm_head (the as_embedding_model
+// conversion has no output layer, adapters.py:135-151).
+LlamaWeights LoadLlamaModelEmbeddingWeights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
 // Per-family config hook (mirrors ParseQwen3ForCausalLMConfig). LoadHfConfig
 // already materializes + validates every consumed Llama field, including the
 // llama3 rope_scaling dictionary; this explicit no-op hook is the family's

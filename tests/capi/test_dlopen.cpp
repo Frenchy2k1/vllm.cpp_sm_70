@@ -30,6 +30,9 @@ namespace {
 // declarations in vllm.h; a header-less consumer would type them by hand.
 using fn_version = const char* (*)(void);
 using fn_abi_version = int32_t (*)(void);
+using fn_embed = vllm_status (*)(vllm_engine*, const char* const*, int32_t,
+                                 vllm_embedding_result*);
+using fn_embed_free = void (*)(vllm_embedding_result*);
 using fn_model_params_default = vllm_model_params (*)(void);
 using fn_sampling_params_default = vllm_sampling_params (*)(void);
 using fn_engine_load = vllm_status (*)(const vllm_model_params*, vllm_engine**);
@@ -94,6 +97,12 @@ TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
   auto p_request_error = Sym<fn_request_error>(lib, "vllm_request_error");
   auto p_request_free = Sym<fn_request_free>(lib, "vllm_request_free");
   auto p_string_free = Sym<fn_string_free>(lib, "vllm_string_free");
+  // ABI v15 (ARCH-ONE-SURFACE ROW 6): the embeddings entry points resolve.
+  auto p_embed = Sym<fn_embed>(lib, "vllm_embed");
+  auto p_embed_free = Sym<fn_embed_free>(lib, "vllm_embedding_result_free");
+  (void)p_embed;
+  // A NULL free is the documented no-op — drivable with no model loaded.
+  p_embed_free(nullptr);
   auto p_completion_free = Sym<fn_completion_free>(lib, "vllm_completion_free");
   auto p_last_error = Sym<fn_last_error>(lib, "vllm_last_error");
 
