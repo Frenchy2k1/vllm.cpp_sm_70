@@ -44,7 +44,8 @@
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpGeluMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/glue
 #include "vllm/model_executor/models/device_pool.h"       // Pool
-#include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
+#include "vllm/model_executor/models/gemma4_moe.h"
+#include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -201,7 +202,7 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
                      double rope_theta_sliding) {
   const int64_t H = g.hidden;
   const int64_t Hq = g.num_q_heads;
-  const int64_t Hkv = g.num_kv_heads;
+  const int64_t Hkv = w.num_kv_heads > 0 ? w.num_kv_heads : g.num_kv_heads;
   const float eps = 1e-6f;  // rms_norm_eps (E4B)
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   const DType adt = DType::kBF16;
@@ -408,12 +409,14 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   }
 
   // --- Per-Layer Embeddings precompute (gemma4.py:845-898). ---
-  // ple_emb = embed_tokens_per_layer(ids) * sqrt(ple)         -> [T, L*ple]
-  // ple_proj = (per_layer_model_projection @ tok) * hidden^-0.5 -> [T, L*ple]
-  //            reshape [T,L,ple]; RMSNorm(plain) over ple.
-  // ple_input = (ple_proj + ple_emb) * rsqrt(2)               -> [T, L, ple]
-  DBuf ple_input(d, DType::kBF16, {T, L, ple});
-  {
+  // Skipped when hidden_size_per_layer_input==0 (google/gemma-4-12B-it dense).
+  DBuf ple_input(d, DType::kBF16, ple > 0 ? std::vector<int64_t>{T, L, ple}
+                                          : std::vector<int64_t>{1, 1, 1});
+  if (ple > 0) {
+    // ple_emb = embed_tokens_per_layer(ids) * sqrt(ple)         -> [T, L*ple]
+    // ple_proj = (per_layer_model_projection @ tok) * hidden^-0.5 -> [T, L*ple]
+    //            reshape [T,L,ple]; RMSNorm(plain) over ple.
+    // ple_input = (ple_proj + ple_emb) * rsqrt(2)               -> [T, L, ple]
     const int64_t LP = L * ple;
     DBuf ple_emb(d, DType::kBF16, {T, LP});
     {
@@ -479,19 +482,42 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     vt::Add(d.q, h1.t(), attn_n.t(), hidden.t());
 
     // dh2 = pre_feedforward_layernorm(h1); mlp; post_feedforward_layernorm; +h1
+    // MoE (26B-A4B): parallel dense MLP + MoE on residual (sglang gemma4_causal).
     Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {T, H});
     vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
     DBuf mlp = Gemma4MlpBlock(d, w.mlp, H, I, dh2.t(), T);
-    Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
-    DBuf mlp_n(d, DType::kBF16, {T, H});
-    vt::RmsNorm(d.q, mlp_n.t(), mlp.t(), w_pff, plain);
+
     DBuf h2(d, DType::kBF16, {T, H});
-    vt::Add(d.q, h2.t(), mlp_n.t(), h1.t());
+    if (w.moe.enabled) {
+      // residual for router = h1 (post-attn residual stream)
+      DBuf moe_in(d, DType::kBF16, {T, H});
+      Tensor w_pf2 = ResidentWeight(d, w.moe.pre_feedforward_layernorm_2, {H});
+      vt::RmsNorm(d.q, moe_in.t(), h1.t(), w_pf2, plain);
+      Gemma4MoeScratch moe_out =
+          RunGemma4Moe(d.q, w.moe, /*router_in=*/h1.t(), /*expert_in=*/moe_in.t(), T, H, eps);
+      Tensor w_p1 = ResidentWeight(d, w.moe.post_feedforward_layernorm_1, {H});
+      Tensor w_p2 = ResidentWeight(d, w.moe.post_feedforward_layernorm_2, {H});
+      DBuf n1(d, DType::kBF16, {T, H});
+      DBuf n2(d, DType::kBF16, {T, H});
+      vt::RmsNorm(d.q, n1.t(), mlp.t(), w_p1, plain);
+      vt::RmsNorm(d.q, n2.t(), moe_out.tensor, w_p2, plain);
+      DBuf sum(d, DType::kBF16, {T, H});
+      vt::Add(d.q, sum.t(), n1.t(), n2.t());
+      Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
+      DBuf n3(d, DType::kBF16, {T, H});
+      vt::RmsNorm(d.q, n3.t(), sum.t(), w_pff, plain);
+      vt::Add(d.q, h2.t(), n3.t(), h1.t());
+    } else {
+      Tensor w_pff = ResidentWeight(d, w.post_feedforward_layernorm, {H});
+      DBuf mlp_n(d, DType::kBF16, {T, H});
+      vt::RmsNorm(d.q, mlp_n.t(), mlp.t(), w_pff, plain);
+      vt::Add(d.q, h2.t(), mlp_n.t(), h1.t());
+    }
 
     // --- PLE (gemma4.py:753-761): gate = gelu(gate_lin(h2)); gated = gate *
     // ple_l; contrib = post_per_layer_input_norm(proj(gated)); h2 += contrib. ---
-    {
+    if (ple > 0) {
       Tensor wg = ResidentWeight(d, w.per_layer_input_gate, {ple, H});
       DBuf gate_lin(d, DType::kBF16, {T, ple});
       vt::MatmulBT(d.q, gate_lin.t(), h2.t(), wg);
@@ -523,8 +549,10 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     }
 
     // Per-layer learned scalar (gemma4.py:707,765).
-    const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
-    vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
+    if (!w.layer_scalar.Empty()) {
+      const double scalar = static_cast<double>(ReadBf16Scalar(w.layer_scalar));
+      vt::MulScalar(d.q, h2.t(), h2.t(), scalar);
+    }
 
     hidden = std::move(h2);
   }
