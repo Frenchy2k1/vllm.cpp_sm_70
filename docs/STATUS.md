@@ -36,10 +36,9 @@ Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to firs
 6 legs contended, uncontended repeat died with a host reboot.
 [Detail](../.agents/specs/startup-latency-axis.md).
 
-Protocol (2026-08-08): non-mutating `agent-start.py` is the first command; its
-source-only welcome appears without role/intent and routes claim →
-preflight → resume. Verified PRs MERGE in-session; superseded PRs CLOSE with a
-reason.
+Protocol (2026-08-08): non-mutating `agent-start.py` runs first: welcome only
+without role/intent; lock conflicts surface; no placeholder claim commands;
+claim → preflight → resume. Verified PRs MERGE; superseded PRs CLOSE with reason.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
