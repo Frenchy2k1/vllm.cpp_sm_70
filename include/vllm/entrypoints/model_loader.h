@@ -8,6 +8,7 @@
 #ifndef VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 #define VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,7 +58,28 @@ struct DflashDraft {
 // valid.
 struct EngineParams {
   int block_size = 32;     // KV block size (tokens/block).
-  int num_blocks = 256;    // KV blocks to allocate.
+  // KV pool sizing (ROAD-V1-MEM). Precedence mirrors vLLM's cache knobs, applied
+  // in ResolveNumBlocks (model_loader.cpp):
+  //   1. num_blocks > 0            -> used verbatim (vLLM num_gpu_blocks_override)
+  //   2. kv_cache_memory_bytes > 0 -> num_blocks = kv_cache_memory_bytes /
+  //                                   KVBytesPerBlock(kv_cfg) (absolute pool size,
+  //                                   IGNORES gpu_memory_utilization, cache.py:189)
+  //   3. otherwise                 -> the gpu_memory_utilization profile path,
+  //                                   which needs a device profile run (M3, not
+  //                                   yet implemented) and so falls back to 256.
+  // num_blocks now defaults to 0 ("auto") so a caller can reach knob 2/3 without
+  // an explicit override; the resolved fallback when nothing sizes the pool is
+  // still 256, so the default path is byte-identical to before this field's
+  // default changed.
+  int num_blocks = 0;      // 0 => auto (resolved: override > bytes > 256).
+  // Fraction of free device memory the whole engine may consume (weights +
+  // activations + KV), mirroring vLLM CacheConfig.gpu_memory_utilization
+  // (cache.py:68). Used only by the M3 profile path; inert until that lands.
+  double gpu_memory_utilization = 0.92;
+  // Absolute KV-pool size in bytes (0 = unset). When > 0 it sizes the block
+  // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
+  // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
+  int64_t kv_cache_memory_bytes = 0;
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
   int max_num_seqs = 8;    // max concurrent sequences.
   // Per-step token budget (the chunked-prefill knob). 0 => the bounded PER-ARCH
@@ -310,6 +332,24 @@ class LoadedEngine {
   static vllm::v1::KVCacheConfig MakeKVCacheMaybeSpec(
       const LoadedModel& model, const HfConfig& config, int block_size,
       int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec);
+  // ROAD-V1-MEM M1: resolve the KV block count from the sizing knobs against the
+  // model's own per-block byte geometry. `probe` is a KVCacheConfig already
+  // built for this model (its num_blocks is ignored; only the group/page
+  // geometry is read). Precedence: num_blocks override > absolute
+  // kv_cache_memory_bytes / KVBytesPerBlock(probe) > the gpu_memory_utilization
+  // profile path (M3, not yet implemented) which falls back to 256. Throws
+  // VLLM_ERR-shaped std::runtime_error when an absolute byte budget is smaller
+  // than a single KV block.
+  static int ResolveNumBlocks(const EngineParams& params,
+                              const vllm::v1::KVCacheConfig& probe);
+  // ROAD-V1-MEM M1: MakeKVCacheMaybeSpec with the block count resolved from the
+  // sizing knobs (builds a probe config to read the per-block geometry, then
+  // rebuilds at the resolved count only when it differs — the geometry itself is
+  // block-count-independent, so this is at most one extra metadata build).
+  static vllm::v1::KVCacheConfig MakeKVCacheResolved(
+      const LoadedModel& model, const HfConfig& config, int block_size,
+      const EngineParams& params,
+      const std::optional<vllm::SpeculativeConfig>& spec);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();

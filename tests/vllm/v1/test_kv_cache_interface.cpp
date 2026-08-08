@@ -33,8 +33,10 @@
 #include "vllm/v1/kv_cache_spec_registry.h"
 #include "vt/dtype.h"
 
+using vllm::v1::AttentionSpec;
 using vllm::v1::ChunkedLocalAttentionSpec;
 using vllm::v1::FullAttentionSpec;
+using vllm::v1::KVBytesPerBlock;
 using vllm::v1::KVCacheConfig;
 using vllm::v1::KVCacheGroupSpec;
 using vllm::v1::KVCacheSpec;
@@ -412,4 +414,76 @@ TEST_CASE("KVCacheConfig has_mamba_layers / needs_kv_cache_zeroing") {
        KVCacheGroupSpec{{"mamba_layer"}, new_mamba_spec()}}};
   CHECK(hybrid.has_mamba_layers());
   CHECK(hybrid.needs_kv_cache_zeroing());
+}
+
+// ─── KVBytesPerBlock (ROAD-V1-MEM M2) ────────────────────────────────────────
+// The marginal device bytes the paged KV pool grows by per additional block:
+// group-aware, mirroring the runner's own `num_blocks * page_size_bytes()`
+// per-attention-layer allocation, with GDN/Mamba state (per-sequence-slot, not
+// per-block) contributing nothing.
+
+TEST_CASE("KVBytesPerBlock: dense group weighted by layer count") {
+  auto ref = new_kv_cache_spec();  // page_size_bytes == 16384
+  // One FullAttention group spanning two layers -> 2 * 16384.
+  KVCacheConfig config{
+      /*num_blocks=*/10,
+      /*kv_cache_tensors=*/{},
+      /*kv_cache_groups=*/{KVCacheGroupSpec{{"layer1", "layer2"}, ref}}};
+  CHECK(KVBytesPerBlock(config) == 2 * 16384);
+}
+
+TEST_CASE("KVBytesPerBlock: MLA drops the K+V factor 2") {
+  // DeepSeek 576-wide latent, bf16, block 16 -> 18432 (from the MLA spec test).
+  auto mla = std::make_shared<vllm::v1::MLAAttentionSpec>(
+      /*block_size=*/16, /*head_size=*/576, DType::kBF16);
+  KVCacheConfig config{
+      /*num_blocks=*/10,
+      /*kv_cache_tensors=*/{},
+      /*kv_cache_groups=*/{KVCacheGroupSpec{{"mla_layer"}, mla}}};
+  CHECK(KVBytesPerBlock(config) == 18432);
+}
+
+TEST_CASE("KVBytesPerBlock: hybrid excludes the Mamba group") {
+  // The gate-model shape: one attention layer + one GDN/Mamba layer. Only the
+  // attention layer scales with the block count in the runner.
+  KVCacheConfig hybrid{
+      /*num_blocks=*/10,
+      /*kv_cache_tensors=*/{},
+      /*kv_cache_groups=*/
+      {KVCacheGroupSpec{{"attn_layer"}, new_kv_cache_spec()},
+       KVCacheGroupSpec{{"mamba_layer"}, new_mamba_spec()}}};
+  CHECK(KVBytesPerBlock(hybrid) == 16384);  // NOT 16384 + mamba page
+}
+
+TEST_CASE("KVBytesPerBlock: heterogeneous per-layer specs sum, GDN nulls skip") {
+  // Gemma-4-style het-KV: per_layer_attn_specs published, one spec per non-GDN
+  // layer, null for GDN layers. When populated it wins over the group specs.
+  auto small = std::make_shared<FullAttentionSpec>(
+      /*block_size=*/16, /*num_kv_heads=*/1, /*head_size=*/64, DType::kF32);
+  // 16 * 1 * (64 + 64) * 4 = 8192.
+  CHECK(small->page_size_bytes() == 8192);
+  auto big = new_kv_cache_spec();  // 16384
+  KVCacheConfig config{
+      /*num_blocks=*/10,
+      /*kv_cache_tensors=*/{},
+      // Groups present but IGNORED because per_layer_attn_specs is populated.
+      /*kv_cache_groups=*/{KVCacheGroupSpec{{"g"}, new_kv_cache_spec()}}};
+  config.per_layer_attn_specs = {
+      std::static_pointer_cast<AttentionSpec>(big),
+      std::static_pointer_cast<AttentionSpec>(small),
+      nullptr,  // a GDN/linear layer contributes nothing
+  };
+  CHECK(KVBytesPerBlock(config) == 16384 + 8192);
+}
+
+TEST_CASE("KVBytesPerBlock: the M1 absolute-bytes divisor") {
+  // The exact arithmetic ResolveNumBlocks does for --kv-cache-memory: a budget
+  // divided by the per-block bytes yields the block count (floored).
+  KVCacheConfig config{
+      /*num_blocks=*/10,
+      /*kv_cache_tensors=*/{},
+      /*kv_cache_groups=*/{KVCacheGroupSpec{{"layer1"}, new_kv_cache_spec()}}};
+  const int64_t bpb = KVBytesPerBlock(config);  // 16384
+  const int64_t budget = int64_t{16384} * 100 + 1;  // 100 blocks + a remainder
+  CHECK(budget / bpb == 100);
 }

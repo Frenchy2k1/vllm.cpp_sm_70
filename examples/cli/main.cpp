@@ -9,6 +9,7 @@
 //            [--tokenizer-config <path>] [--device auto|cpu|cuda]
 //            [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]
 //            [--seed S] [--stream]
+//            [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
 //
 // <dir> holds config.json, tokenizer.json and the *.safetensors shards (T0:
 // safetensors only). Loading a real checkpoint is a GPU/dgx concern; on a CPU
@@ -40,6 +41,11 @@ struct Args {
   // of vLLM's DeviceConfig.device this build serves. Mapped to the int the ABI
   // takes (0/1/2) in ParseArgs; an unknown name is rejected there.
   int32_t device = 0;
+  // --gpu-memory-utilization / --kv-cache-memory (ABI v16): KV-pool sizing.
+  // gpu_memory_utilization is inert until the M3 profile run lands;
+  // kv_cache_memory_bytes (> 0) sizes the block count directly.
+  double gpu_memory_utilization = 0.92;
+  long long kv_cache_memory_bytes = 0;
 };
 
 void Usage(const char* argv0, std::FILE* out) {
@@ -49,6 +55,7 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--tokenizer-config <path>] [--device auto|cpu|cuda]\n"
       "          [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]\n"
       "          [--seed S] [--stream]\n"
+      "          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]\n"
       "          [--speculative-config '<json>']\n"
       "\n"
       "Runs one completion over the vllm.cpp C ABI (libvllm). <dir> holds\n"
@@ -94,6 +101,10 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       a.stream = true;
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i);
+    } else if (flag == "--gpu-memory-utilization") {
+      a.gpu_memory_utilization = std::atof(NextArg(argc, argv, i));
+    } else if (flag == "--kv-cache-memory") {
+      a.kv_cache_memory_bytes = std::strtoll(NextArg(argc, argv, i), nullptr, 10);
     } else if (flag == "--device") {
       // The vLLM DeviceConfig.device names (auto/cpu/cuda) -> the ABI int
       // (vllm_model_params.device: 0=auto, 1=cpu, 2=cuda). An unknown name is
@@ -178,6 +189,10 @@ int main(int argc, char** argv) {
   // accelerator-first probe; an explicitly named absent device fails the load
   // below with the library's message (never a silent fallback).
   mp.device = args.device;
+  // KV-pool sizing knobs (ABI v16). Defaults leave the historical 256-block
+  // behaviour; --kv-cache-memory sizes the pool from an absolute byte budget.
+  mp.gpu_memory_utilization = args.gpu_memory_utilization;
+  mp.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
 
   vllm_engine* engine = nullptr;
   std::fprintf(stderr, "vllm-cli: loading model from %s\n",

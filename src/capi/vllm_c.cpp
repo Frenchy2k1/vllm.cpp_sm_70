@@ -469,7 +469,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.model_path = nullptr;
   p.tokenizer_config_path = nullptr;
   p.block_size = 32;
-  p.num_blocks = 256;
+  p.num_blocks = 0;  // 0 => auto: sized by the v16 knobs, else 256.
   p.max_model_len = 0;
   p.max_num_seqs = 8;
   p.tool_parser = nullptr;  // AUTO-detect from the chat template (ABI v4).
@@ -481,6 +481,8 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.kv_transfer_config = nullptr;  // NULL => no connector (ABI v9).
   p.enable_jump_forward = 0;       // 0 => env-resolved, default OFF (ABI v10).
   p.device = 0;  // 0 => auto: the accelerator-first probe (ABI v14).
+  p.gpu_memory_utilization = 0.92;  // vLLM default fraction (ABI v16).
+  p.kv_cache_memory_bytes = 0;      // 0 => unset (ABI v16).
   return p;
 }
 
@@ -526,7 +528,15 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
   try {
     vllm::entrypoints::EngineParams ep;
     if (params->block_size > 0) ep.block_size = params->block_size;
+    // ABI v16: num_blocks is the OVERRIDE (> 0 pins the count); <= 0 leaves the
+    // EngineParams auto default (0) so ResolveNumBlocks applies the sizing knobs.
     if (params->num_blocks > 0) ep.num_blocks = params->num_blocks;
+    // ABI v16 KV sizing: gpu_memory_utilization (<= 0 keeps the 0.92 default) and
+    // the absolute kv_cache_memory_bytes override (0 => unset).
+    if (params->gpu_memory_utilization > 0.0)
+      ep.gpu_memory_utilization = params->gpu_memory_utilization;
+    if (params->kv_cache_memory_bytes > 0)
+      ep.kv_cache_memory_bytes = params->kv_cache_memory_bytes;
     if (params->max_model_len > 0) ep.max_model_len = params->max_model_len;
     if (params->max_num_seqs > 0) ep.max_num_seqs = params->max_num_seqs;
     // ABI v9: chunked-prefill per-step token budget. <= 0 leaves the per-arch

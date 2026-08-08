@@ -9,6 +9,7 @@
 //          [--tokenizer-config <tokenizer_config.json>]
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
+//          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
 //          [--max-num-seqs N] [--max-num-batched-tokens N]
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
@@ -130,7 +131,15 @@ struct Args {
   std::string tokenizer_config;  // default: <model_dir>/tokenizer_config.json
   std::string served_model_name;  // default: the model dir name
   int block_size = 32;
-  int num_blocks = 256;
+  // --num-blocks is the KV block-count OVERRIDE (0 => auto: sized by the knobs
+  // below, else the 256-block fallback). ROAD-V1-MEM M1.
+  int num_blocks = 0;
+  // --gpu-memory-utilization: fraction of free device memory for the whole
+  // engine (needs the M3 profile run; inert until then). --kv-cache-memory: an
+  // absolute KV-pool size in bytes that sizes the block count directly (0 =>
+  // unset).
+  double gpu_memory_utilization = 0.92;
+  long long kv_cache_memory_bytes = 0;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
@@ -205,6 +214,8 @@ struct Args {
       << " --model <dir> [--host H] [--port P] [--tokenizer-config F]\n"
          "               [--served-model-name N] [--block-size N] "
          "[--num-blocks N] [--max-model-len N]\n"
+         "               [--gpu-memory-utilization F] "
+         "[--kv-cache-memory BYTES]\n"
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--device auto|cpu|cuda]\n"
@@ -248,6 +259,10 @@ Args ParseArgs(int argc, char** argv) {
       a.block_size = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--num-blocks") {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--gpu-memory-utilization") {
+      a.gpu_memory_utilization = std::stod(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--kv-cache-memory") {
+      a.kv_cache_memory_bytes = std::stoll(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-model-len") {
       a.max_model_len = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-num-seqs") {
@@ -458,6 +473,8 @@ int main(int argc, char** argv) {
         vllm::entrypoints::EngineParams embed_params;
         embed_params.block_size = args.block_size;
         embed_params.num_blocks = args.num_blocks;
+        embed_params.gpu_memory_utilization = args.gpu_memory_utilization;
+        embed_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
         embed_params.max_model_len = args.max_model_len;
         embed_params.max_num_seqs = args.max_num_seqs;
         embed_params.max_num_batched_tokens = args.max_num_batched_tokens;
@@ -539,6 +556,8 @@ int main(int argc, char** argv) {
     vllm::entrypoints::EngineParams engine_params;
     engine_params.block_size = args.block_size;
     engine_params.num_blocks = args.num_blocks;
+    engine_params.gpu_memory_utilization = args.gpu_memory_utilization;
+    engine_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;

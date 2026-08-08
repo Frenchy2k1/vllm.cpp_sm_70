@@ -380,6 +380,23 @@ struct KVCacheConfig {
   bool needs_kv_cache_zeroing() const { return has_mamba_layers(); }
 };
 
+// The marginal device bytes the paged KV pool grows by per additional block
+// (ROAD-V1-MEM M2). This is exactly the runner's own per-block allocation math
+// (gpu/runner.cpp: each non-GDN layer allocates `num_blocks * page_bytes`),
+// summed over every attention layer:
+//   - when `per_layer_attn_specs` is populated (heterogeneous-KV models such as
+//     Gemma-4), the sum runs over those per-layer specs (null entries — the
+//     GDN/linear layers — contribute nothing);
+//   - otherwise it runs over `kv_cache_groups`, each attention-spec group
+//     weighted by the number of layers it covers.
+// GDN / Mamba state does NOT scale with the block count in our runner (it is
+// sized per running sequence slot, not per block), so Mamba groups contribute
+// zero here — matching what the block budget actually buys. The divisor is thus
+// group-aware and correct for dense, MLA (no K+V factor 2), sliding-window,
+// heterogeneous-per-layer, and hybrid architectures alike. Throws only if a
+// spec's own `page_size_bytes()` throws (deferred quantized-KV math).
+int64_t KVBytesPerBlock(const KVCacheConfig& config);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_KV_CACHE_INTERFACE_H_

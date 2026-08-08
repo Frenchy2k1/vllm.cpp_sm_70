@@ -131,4 +131,32 @@ bool KVCacheConfig::has_mamba_layers() const {
   return false;
 }
 
+int64_t KVBytesPerBlock(const KVCacheConfig& config) {
+  // Heterogeneous-KV path (Gemma-4 G1b): one attention spec per non-GDN layer,
+  // GDN/linear layers left null. Mirror the runner's per-layer allocation.
+  if (!config.per_layer_attn_specs.empty()) {
+    int64_t bytes = 0;
+    for (const auto& spec : config.per_layer_attn_specs) {
+      if (spec != nullptr) {
+        bytes += spec->page_size_bytes();
+      }
+    }
+    return bytes;
+  }
+  // Uniform path: sum each attention group's page over the layers it covers.
+  // Mamba/GDN groups do not scale with the block count in our runner, so they
+  // are skipped (dynamic_cast to AttentionSpec fails for MambaSpec).
+  int64_t bytes = 0;
+  for (const auto& group : config.kv_cache_groups) {
+    const auto* attn =
+        dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get());
+    if (attn == nullptr) {
+      continue;
+    }
+    bytes += attn->page_size_bytes() *
+             static_cast<int64_t>(group.layer_names.size());
+  }
+  return bytes;
+}
+
 }  // namespace vllm::v1

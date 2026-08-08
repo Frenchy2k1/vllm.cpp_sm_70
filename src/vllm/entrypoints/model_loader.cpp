@@ -658,6 +658,57 @@ vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
   return ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
 }
 
+int LoadedEngine::ResolveNumBlocks(const EngineParams& params,
+                                   const vllm::v1::KVCacheConfig& probe) {
+  // 1. Explicit override wins (vLLM num_gpu_blocks_override).
+  if (params.num_blocks > 0) {
+    return params.num_blocks;
+  }
+  // 2. Absolute KV-pool budget. IGNORES gpu_memory_utilization, exactly like
+  //    vLLM CacheConfig (cache.py:189). num_blocks = budget / bytes-per-block.
+  if (params.kv_cache_memory_bytes > 0) {
+    const int64_t bytes_per_block = vllm::v1::KVBytesPerBlock(probe);
+    if (bytes_per_block <= 0) {
+      throw std::runtime_error(
+          "ResolveNumBlocks: model reports zero KV bytes per block; cannot size "
+          "the pool from --kv-cache-memory");
+    }
+    const int64_t n = params.kv_cache_memory_bytes / bytes_per_block;
+    if (n <= 0) {
+      throw std::invalid_argument(
+          "kv_cache_memory_bytes (" +
+          std::to_string(params.kv_cache_memory_bytes) +
+          ") is smaller than a single KV block (" +
+          std::to_string(bytes_per_block) +
+          " bytes); raise --kv-cache-memory or set an explicit --num-blocks");
+    }
+    return static_cast<int>(n);
+  }
+  // 3. gpu_memory_utilization profile path (ROAD-V1-MEM M3): needs a real device
+  //    profile run to measure the non-KV footprint before the free-memory
+  //    fraction can be turned into a block count. Until that lands, fall back to
+  //    the historical default so the default path is byte-identical.
+  // TODO(ROAD-V1-MEM M3): profile run -> available_kv = free*util - non_kv.
+  return 256;
+}
+
+vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
+    const LoadedModel& model, const HfConfig& config, int block_size,
+    const EngineParams& params,
+    const std::optional<vllm::SpeculativeConfig>& spec) {
+  // The per-block byte geometry is independent of the block count, so build a
+  // probe at the override-or-256 count, read its geometry to resolve the real
+  // count, and only rebuild when the resolved count differs.
+  const int probe_blocks = params.num_blocks > 0 ? params.num_blocks : 256;
+  vllm::v1::KVCacheConfig probe =
+      MakeKVCacheMaybeSpec(model, config, block_size, probe_blocks, spec);
+  const int resolved = ResolveNumBlocks(params, probe);
+  if (resolved == probe_blocks) {
+    return probe;
+  }
+  return MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
     : LoadedEngine(std::move(config),
@@ -697,10 +748,12 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // the byte-identical decode path (jump-forward is inert until enabled).
       jump_forward_enabled_(
           vllm::v1::JumpForwardEnabled(params.enable_jump_forward)),
-      kv_cfg_(MakeKVCacheMaybeSpec(
+      // ROAD-V1-MEM M1: resolve the block count from the sizing knobs
+      // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
+      // model's own per-block byte geometry.
+      kv_cfg_(MakeKVCacheResolved(
           *model_, config_, params.block_size > 0 ? params.block_size : 32,
-          params.num_blocks > 0 ? params.num_blocks : 256,
-          resolved_spec_config_)),
+          params, resolved_spec_config_)),
       // runner_ FIRST (W3): the async-scheduling flip reads
       // runner_.runner_supports_async(). SPEC-MTP I5d: when speculation is on,
       // pass the resolved config + the MTP draft (built from the retained mtp.*
