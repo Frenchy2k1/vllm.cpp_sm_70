@@ -30,6 +30,7 @@ minicpm         # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod; pending FOLD-M
 minicpm3        # SwiGLU dense MLP (MLA arch) -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
 phi3            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
 gemma4_vision   # GeGLU vision-tower MLP -> UnquantizedMlpGateUpGeluMethod + a clamp-epilogue hook (Tier C2); pending FOLD-MIGRATE
+gemma4_moe      # known-drift pending fold: the ROCm/Gemma-4 MoE path has a merged [2I,H] GeGLU operand but launches gate/up separately for host-backed and device-resident expert weights; fold both through a shared merged-GEMM MoE descriptor without changing its residency fallback
 
 laguna  # known-drift pending fold: Laguna NVFP4 resident/graph decode hand-rolls the shared-expert SwiGLU epilogue; fold onto layers::MlpGateUp seam is part of the decode/runtime framework-routing port (AGENTS.md 3rd seam)
 

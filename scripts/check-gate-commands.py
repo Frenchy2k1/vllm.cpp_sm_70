@@ -244,10 +244,11 @@ RUNNABLE_BASELINE = frozenset({
     "KERNEL-GEMM-CPU-ELEM",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
-    # ARCH-ONE-SURFACE ROW 6 (2026-08-08): embeddings-one-surface.md carries a
-    # runnable Gates section (preflight + the fold/capi/server suites) for the
-    # two rows it activates.
-    "MODEL-EMBED-llama-llama-for-causal-lm",
+    # ARCH-ONE-SURFACE ROW 6 (2026-08-08): SERVE remains gated, while the
+    # merged MODEL row legitimately moved ACTIVE -> PARTIAL because only one
+    # of eight upstream embedding memberships is live. Re-pin removes that
+    # model row from this lifecycle-scoped runnable population; its completed
+    # fold commands remain preserved in embeddings-one-surface.md.
     "SERVE-POOLING-ENDPOINTS",
     "KV-SLIDING-WINDOW-SPEC",
     "LOAD-SAFETENSORS-DIRECT-DENSE",

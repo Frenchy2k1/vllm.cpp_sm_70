@@ -39,8 +39,9 @@ Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to firs
 Protocol (2026-08-07): PR disposition — verified-good PRs MERGE in-session, superseded
 CLOSE with a reason; prompt pair tracked, 25 gate rows exact-pinned.
 
-Release-contract AST pins pass all 30 tests on Python 3.12/3.13 (2026-08-08);
-semantic body-flow pinning is unchanged and runtime behaviour is unaffected.
+Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
+3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;
+embeddings #137 is landed/partial, not an active claim. No runtime change.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
