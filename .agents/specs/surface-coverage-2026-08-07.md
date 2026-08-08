@@ -79,11 +79,15 @@ client. **ROW 1 UPDATE (2026-08-07): `parakeet_transcribe` is the SECOND clean A
 client** — the Parakeet fold rewrote it against `vllm.h` + `vllm::shared` only, and the
 ratchet fell 12 -> 11. **ROW 2 UPDATE (2026-08-08): `minimax_h3_gen` and
 `minimax_h3_mux` are the THIRD and FOURTH clean ABI clients** (the video fold, ABI
-v12 `vllm_video_*`), and the ratchet fell 11 -> 9. The remaining 9 reach
-`include/vllm/**` / `vt/**` and are transition-tracked in
-`scripts/example-abi-allowlist.txt`:
+v12 `vllm_video_*`), and the ratchet fell 11 -> 9. **ROW 7 UPDATE (2026-08-07):
+`kimi_linear_gen` is the FIFTH clean ABI client** — the Kimi-Linear paged-runner fold
+made the fast paged-incremental decode the ENGINE's production path, grew
+`vllm_complete_tokens` (ABI v13, pre-tokenized completion returning generated token
+ids) and rewrote the example against `vllm.h` + `vllm::shared` only; the ratchet fell
+9 -> 8. The remaining 8 reach `include/vllm/**` / `vt/**` and are transition-tracked
+in `scripts/example-abi-allowlist.txt`:
 
-- Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `kimi_linear_gen`, `server`.
+- Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `server`.
 - Dev/diagnostic (internal-by-nature, folded for consistency): `bench` (via
   `bench_core.h`), `tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench`.
 - Out of the gated `examples/` tree: `benchmarks/vulkan_gemm_ab.cpp` (Vulkan A/B harness).
@@ -91,7 +95,7 @@ v12 `vllm_video_*`), and the ratchet fell 11 -> 9. The remaining 9 reach
 **Policy (developer-directed 2026-08-07): no permanent exemptions.** Every allowlist entry
 — drivers AND dev/diagnostic tools — is a transition-tracker pointing at a fold row; the
 guard fails on any internal include not tracked, and a shrink-only ratchet
-(`MAX_INTERNAL_REACHING`, 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
+(`MAX_INTERNAL_REACHING`, 8 since ROW 7; 9 since ROW 2; 11 since ROW 1) means the count can only fall as folds land, never grow to
 admit a new violation. The public header set is DERIVED from the CMake install rules
 (exactly `include/vllm.h` today), not hardcoded. The guard catches BOTH breach vectors: a
 `#include "vllm/..."|"vt/..."|"src/..."` AND a CMake `-I` grant into the internal tree

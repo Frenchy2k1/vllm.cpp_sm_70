@@ -264,6 +264,11 @@ struct ModelFactory {
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
+  // ROW 7 (kimi-linear.md §20.3): the loader wants a `ModelSource::load_queue`
+  // selected BEFORE the weights load — the GB10 recipe (CUDA context first, then
+  // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
+  // Default false: every existing arch's engine load path is byte-identical.
+  bool stage_on_load = false;
 };
 
 struct ModelRegistration {

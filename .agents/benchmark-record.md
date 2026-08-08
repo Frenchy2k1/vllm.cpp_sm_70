@@ -15861,3 +15861,49 @@ busy) on the same grounds.
 Decode is now **91.7 tok/s: 50% of the 182 tok/s roof, 1.75x off llama.cpp's
 160.9**, from 8.59 at the start of the session.
 
+
+## 2026-08-07 — ROW 7 Kimi-Linear runner fold: GB10 campaign (`row/KIMI-RUNNER-FOLD` #122)
+
+Build: /dev/shm/kimifold, CUDA 121a, CUTLASS 4.5.0, FA2, Triton AOT sm_121a. Golden md5
+`bfa5bdbf` (§12). flock $HOME/gpu.lock + /tmp/gpu, drop_caches per leg, worker parked,
+min-avail >= 21G, no reboot. Engine legs: `kimi-linear-gen` thin ABI client
+(`vllm_engine_load` + `vllm_complete_tokens`, max_model_len 4096) over
+`~/kimi-linear-engine-dir` (snapshot symlinks + TikTokenConverter tokenizer.json).
+
+| leg | config | /128 | steady tok/s | note |
+|---|---|---|---|---|
+| SACRED 35B | `test_qwen36_paged_engine` post-fold | 2/2·315 | — | PASS |
+| SACRED 27B | `test_qwen27_paged_engine` post-fold | 1/1·235 | — | PASS |
+| CLI reference | `test_kimi_linear_fold_gate`, §19 config | **122** | 18.93 (120 steps) | reproduces §19; p7 10/16 got == §19 |
+| engine round 1 | FA2 unset (exact arm), pre-mirror-fix | 9 | 13.07 (16-step diff) | STALE HOST IDS (async device mirror) — root-caused, fixed |
+| engine exact arm | post-fix, `VT_KIMI_PAGED_MLA_FA2=0` | 111 | 11.46 (16-step diff) | §19 M-tiling near-tie class: p7→16/16, p4 15/16, p2 token-1 cascade 0/16 |
+| **engine FA2 arm** | post-fix (now DEFAULT) | **122** | 9.81 (16-step diff) | **p0-p6 16/16 + p7 got byte-equal CLI ⇒ engine==CLI 128/128** |
+| engine FA2, N=64 | async sched | 122-profile (p0/p1 16/16) | **16.87** | two-length diff N=64 vs N=1 — the honest steady rate |
+| engine FA2, N=64 | `VT_ASYNC_SCHED=0` | 122-profile | 16.11 | async is NOT the gap |
+| default-bind | flipped-default binary, no env | **122** | 9.44 (16-step diff) | binds the shipped default |
+
+Server smoke (`examples/server`, /v1/completions, converted tokenizer): STREAMED 48 tokens
+in 2.52 s = 19.0 tok/s WALL (incl. prefill + first-request warmup — a lower bound on steady
+decode); non-streamed haiku coherent; /v1/models lists the model.
+
+Verdicts: Gate A engine==CLI 128/128 BYTE-IDENTICAL; golden >= 122 bound MET (122, same
+profile). Speed: the SERVER 19.0 tok/s wall is the production-surface anchor (~0.90× the
+#111 vLLM ~21 floor; CLI 18.93 reproduced) — NOT >= vLLM. MEASUREMENT CAVEAT: the example's
+two-length diffs (N=64 16.9; N=16 9.8-11.5) run the LONG leg first and cold, so one-time
+CUDA warmup pollutes the subtraction — the diffs UNDERSTATE steady decode; anchor on the
+server wall (or run the short leg first / a warmup pass). Residual = per-step KDA host
+islands (beta/g1 downloads + host decay gate per layer), grouped MoE via the shared seam,
+decode graph. Exact-island arm kept as diagnostic (VT_KIMI_PAGED_MLA_FA2=0), its 111/128
+recorded as the §19 M-tiling near-tie regime, not a bug.
+
+vLLM same-session re-measure: ATTEMPTED and ABORTED BY BOX REBOOT. The leg (oracle venv,
+util 0.82 — the #111-precedented config, no tracing, worker parked, 95G+ free at launch)
+loaded all 20 shards and reached torch.compile/graph capture, then the box HARD-REBOOTED
+at 00:25:32 (journal boot logs; min-avail had sat at the 15-17G floor during load). This
+REPRODUCES the §19 finding that vLLM@0.82 + any additional pressure sits below the
+life-critical floor on the 119G unified pool — per the safety mandate ("do not retry
+higher", and now: do not retry AT 0.82 with compile/capture on), the leg is NOT retried.
+The DENOMINATOR for this campaign therefore remains the #111 recorded floor (~21 tok/s,
+16-token aggregate, same prompts/workload). Box recovered clean: single reboot, GPU
+visible, local-ai-worker auto-restored by --restart=always; /dev/shm build tree gone
+(campaign complete; all gate logs under $HOME).

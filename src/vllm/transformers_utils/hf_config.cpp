@@ -395,6 +395,60 @@ HfConfig LoadHfConfig(const std::string& path) {
     cfg.linear_conv_kernel_dim = GetInt(text, "linear_conv_kernel_dim", 0);
     cfg.mamba_ssm_dtype = GetString(text, "mamba_ssm_dtype");
 
+    // Kimi-Linear (`KimiLinearForCausalLM`) KV enablement for the shared paged
+    // runner (kimi-linear.md §20.3 B1). Kimi's config carries NO `layer_types`
+    // and NONE of the explicit qwen3_5-style `linear_*` keys read above: its
+    // KDA/full-attn split and GDN-group geometry live in the nested
+    // `linear_attn_config` (upstream transformers_utils/configs/kimi_linear.py
+    // :34-148; `is_kda_layer(l) := (l+1) in kda_layers` :144-148 — the layer
+    // lists are 1-INDEXED; `num_heads`/`head_dim`/`short_conv_kernel_size`
+    // :109-119 are what MambaStateShapeCalculator.kda_state_shape derives the
+    // conv/recurrent state from, mamba_utils.py:270-294). Synthesize the typed
+    // runner-facing fields from it so the runner's MambaSpec consistency check
+    // (runner.cpp `expected_conv_shape`/`expected_ssm_shape`) and its per-layer
+    // linear-attention/full-attention allocation loop see the same geometry
+    // `MakeKimiLinearKVCache` declares. ADDITIVE by construction: configs that
+    // carry the explicit fields (the qwen3_5/qwen3-next family) never enter —
+    // the explicit branch above already populated them — and configs with no
+    // `linear_attn_config` (every other arch) skip it entirely. KDA has
+    // num_k_heads == num_v_heads == num_heads and Dk == Dv == head_dim
+    // (kimi_gdn_linear_attn.py:120-141), so conv_dim = 2*Hk*Dk + Hv*Dv equals
+    // kda_state_shape's 3*num_heads*head_dim.
+    if (cfg.linear_num_key_heads == 0 && text.contains("linear_attn_config") &&
+        text["linear_attn_config"].is_object()) {
+      const nlohmann::json& lac = text["linear_attn_config"];
+      const int64_t kda_heads = GetInt(lac, "num_heads", 0);
+      const int64_t kda_head_dim = GetInt(lac, "head_dim", 0);
+      const int64_t kda_conv = GetInt(lac, "short_conv_kernel_size", 0);
+      const bool has_kda_layers = lac.contains("kda_layers") &&
+                                  lac["kda_layers"].is_array() &&
+                                  !lac["kda_layers"].empty();
+      if (kda_heads > 0 && kda_head_dim > 0 && kda_conv > 0 && has_kda_layers) {
+        cfg.linear_num_key_heads = kda_heads;
+        cfg.linear_num_value_heads = kda_heads;
+        cfg.linear_key_head_dim = kda_head_dim;
+        cfg.linear_value_head_dim = kda_head_dim;
+        cfg.linear_conv_kernel_dim = kda_conv;
+        if (cfg.layer_types.empty() && cfg.num_hidden_layers > 0) {
+          std::vector<bool> is_kda(static_cast<size_t>(cfg.num_hidden_layers),
+                                   false);
+          for (const nlohmann::json& e : lac["kda_layers"]) {
+            if (!e.is_number_integer()) continue;
+            const int64_t one_indexed = e.get<int64_t>();
+            if (one_indexed >= 1 && one_indexed <= cfg.num_hidden_layers) {
+              is_kda[static_cast<size_t>(one_indexed - 1)] = true;
+            }
+          }
+          cfg.layer_types.reserve(static_cast<size_t>(cfg.num_hidden_layers));
+          for (int64_t l = 0; l < cfg.num_hidden_layers; ++l) {
+            cfg.layer_types.push_back(is_kda[static_cast<size_t>(l)]
+                                          ? "linear_attention"
+                                          : "full_attention");
+          }
+        }
+      }
+    }
+
     // Partial rotary factor. When the key is absent, upstream Qwen-family
     // config classes default it to 0.25 (qwen3_next.py:240, qwen3_5_moe.py:92);
     // all other models default to full rotary (1.0). The wrapper carries the
