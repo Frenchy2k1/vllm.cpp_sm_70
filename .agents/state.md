@@ -43290,3 +43290,33 @@ inertness and thread_local isolation. No regression: existing `test_tp_forward`
 additive/byte-neutral). Header-only, no CMake wiring beyond the test. Next: TP-W2
 (row/input-dim shard + rank-0 bias + per-rank Hq/Hkv + QKV kv-replication + vocab
 embed/lm_head + logits all-gather).
+
+## 2026-08-08 — FIX: device-leakage regression on main (async readback becomes a Backend capability) — unblocks 3 contributor PRs
+<!-- state: 2026-08-09T00:05 -->
+
+`check-device-leakage` was RED on main (`1a021b1b`, and back through `c05cee1d`):
+`src/vllm/v1/worker/gpu/runner.cpp:107` named `vt::DeviceType::kCUDA` in the
+device-agnostic shared layer (DSR bucket `kcuda` 1 > baseline 0). It came in with
+the `QueueSupportsAsyncInputCombine` rescope during the PR #140 fix round — our
+regression, and it was failing CI on all three open contributor PRs (#127, #154,
+#155), exactly as richiejp reported in #127's "Honest gaps". Premise verified in
+the tree before acting (not taken on report).
+
+FIX mirrors the `SupportsAuxStream` precedent the guard's own message prescribes:
+move the question onto the backend. New
+`vt::Backend::SupportsAsyncSampledTokenReadback()` (backend.h, base **false**),
+overridden true by CPU (host and device memory are one allocation) and CUDA (the
+sampled id is device-mirrored). The runner now asks
+`vt::TryGetBackend(queue.device.type)` — nullptr (device not built) yields false,
+which also subsumes the old `#ifdef VLLM_CPP_CUDA` guard. SEMANTICS UNCHANGED:
+CPU async-ON, CUDA async-ON, discrete non-CUDA (ROCm gfx1201) async-OFF — the
+"!"-token hazard that motivated the original rescope stays closed, and the ROCm
+TODO now points at the override rather than at a device branch.
+
+Gates: `check-device-leakage` RED→GREEN (`kcuda=0`, DSR 32 == baseline 32);
+`test_async_llm` 8/8·347, `test_engine_core` 6/6·44, `test_llm_engine` 11/11·204
+(CPU still resolves async-ON, the regression this could have caused); clean
+-Werror CPU build. SEPARATE pre-existing main breakage recorded, not fixed here:
+`check-doc-checkpoint` is RED on `1a021b1b` itself (that policy commit touched
+70+ `.agents/` files without docs/BENCHMARKS.md + docs/FEATURES.md); it validates
+HEAD, so it self-heals as compliant commits land.

@@ -28,7 +28,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
-| TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + `LoadedModel` TP handle (6/6) | dispatch TP-W2 (linears + loader) |
+| TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | SPIKE; 30/30 | #129 |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139 IN; **ROW 6 IN REVIEW (#137): embeddings LIVE — `LlamaModel` arch, PoolingRunner in the step, `vllm_embed` v15, `/v1/embeddings`, fold gate 4/4-231, 9 kills** | Merge #137; real-ckpt oracle cosine residual |
 

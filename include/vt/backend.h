@@ -121,6 +121,25 @@ class Backend {
   // the DSR scan) so the model file stops naming a device at the aux-stream gate.
   virtual bool SupportsAuxStream() const { return false; }
 
+  // Whether the host may validly read the SAMPLED TOKEN ID back between steps,
+  // which is what the depth-2 async input-combine path requires
+  // (gpu/runner.cpp: QueueSupportsAsyncInputCombine). Base false — a DISCRETE
+  // non-CUDA GPU (e.g. ROCm gfx1201) is the hazard: the non-CUDA leg of
+  // sample_tokens_async Synchronizes and then host-dereferences `dev_ids`, a
+  // device Alloc that is garbage off-device (the "!"-token corruption on the lab
+  // R9700, 2026-08-07), so those queues MUST stay synchronous. Overridden true
+  // by CPU (host and device memory are the same allocation, so the read is
+  // always valid) and by CUDA (the sampled id is device-mirrored,
+  // async_device_mirror()). This is the capability the runner's
+  // `device == kCUDA` gate actually asked; it lives on Backend (src/vt, off the
+  // DSR scan) so the device-agnostic shared layer stops naming a device — the
+  // same move SupportsAuxStream made for the aux-stream gate.
+  // TODO(rocm): an INTEGRATED non-CUDA GPU reports UnifiedMemory()==true (see
+  // row/ROCM-UNIFIED-MEMORY-B), where the alias IS valid; such a backend may
+  // override this true once a HIP sampled-token mirror or a D2H copy of dev_ids
+  // lands.
+  virtual bool SupportsAsyncSampledTokenReadback() const { return false; }
+
   // Optional graph/command capture (CUDA Graphs / Metal ICB / Vulkan CB).
   virtual bool SupportsGraphCapture() const { return false; }
   virtual void BeginCapture(Queue& q);
