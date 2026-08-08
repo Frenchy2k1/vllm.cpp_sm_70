@@ -1565,8 +1565,8 @@ runtime-verified yet.
   row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
   ROW 8 ABI-v14 device selection is behavior-complete; #139 repairs #136's
   shared-layer DSR 39->32 through registry/name resolution (`kcuda=0`) with the
-  baseline/allowlist unchanged. A distinctive-platform test pins exact-name/type
-  propagation (2/2·11); other CPU gates are green. CUDA A/B remains.
+  baseline/allowlist unchanged. CPU gates: selector 2/2·11; executable/CTest
+  registration guard 15/15. CUDA A/B remains.
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
   GDN and attention-free default off, mirroring vLLM), and it now has an
   end-to-end cache-ON gate on `Qwen/Qwen3-4B` (a shared common prefix reused

@@ -227,4 +227,10 @@ Release `-Werror` build: `test_platform` 11/11·85,
 `test_device_selection` 2/2·11, `test_loaded_engine_dense` 9/9·65 and
 `test_capi` 45/45·428. Each of the three review mutations (wrong returned
 platform identity, forced-CPU selector input and prefix name matching) is RED.
+The standalone selector target is non-vacuous under
+`scripts/check-test-registration.py`: the guard requires its exact source
+invocation and proves that `vllm_cpp_add_test` still creates an executable and
+registers it with CTest. Its 15/15 mutation suite kills deletion of the target,
+source substitution, deletion of either helper registration, duplication and
+loss of preflight/CI wiring.
 No CUDA runtime was used; the existing GPU A/B residual remains.

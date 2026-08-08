@@ -42495,3 +42495,19 @@ checker reports DSR 32 (`kcuda=0`, `is_cuda=0`, `cuda_inc=0`, `vt_ifdef=32`)
 with baseline/allowlist unchanged, and its mutation suite is 25/25. H3 source
 is untouched. No CUDA runtime, model download, service action, benchmark or
 release artifact occurred; the existing CUDA-build A/B remains pending.
+
+## 2026-08-08 — PR #139 device-selector test registration made non-vacuous
+<!-- state: 2026-08-08T14:00 -->
+
+Review found that deleting `test_device_selection` from `tests/CMakeLists.txt`
+left preflight green: the standalone integration test existed but no tree gate
+required CI to build or execute it. `scripts/check-test-registration.py` now
+requires the exact target/source invocation and verifies that the shared
+`vllm_cpp_add_test` helper both creates the executable and registers it with
+CTest. The checker and its 15-test mutation suite run in preflight and the
+explicit agent-record CI lane. Deleting the target invocation, substituting its
+source, deleting either helper registration, duplicating the target, or dropping
+the guard's preflight/CI wiring is RED. The loader header now states explicitly
+that internal `Device::kNamedPlatform` is the stable public/wire value and name
+`2="cuda"`; behavior and ABI are unchanged. No GPU, model, benchmark or speed
+claim is involved; CUDA A/B remains pending.
