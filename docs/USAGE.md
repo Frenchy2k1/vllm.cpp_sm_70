@@ -6,6 +6,15 @@ the reference behind it. Per-capability lifecycle state is
 [docs/STATUS.md](STATUS.md); measured numbers are
 [docs/BENCHMARKS.md](BENCHMARKS.md).
 
+## Starting an agent-assisted contribution
+
+Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
+for a new contributor with no declared role or explicit intent, prints the
+welcome that the agent should relay. An explicit request can use
+`--intent operator|helper|read-only` and a helper `--row ID`. Follow its printed
+claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
+The entrypoint is non-interactive and does not mutate the checkout.
+
 ## Running inference (CLI)
 
 `vllm-cli` runs a one-shot completion through the C ABI. Source:
@@ -435,4 +444,3 @@ Useful for measurement: `--denoise-only` times the DiT loop without loading the 
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
-
