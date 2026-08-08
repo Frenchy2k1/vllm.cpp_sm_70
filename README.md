@@ -26,6 +26,8 @@
 > used here only to name the upstream project this port mirrors and is measured against. See
 > [Trademarks](#trademarks).
 
+> **Why this exists:** [MANIFESTO.md](MANIFESTO.md).
+
 > ⚠️ **Under heavy development.** This project moves fast right now: internals, CLI flags, and
 > server behavior can change between commits, so expect breakage if you track `main`.
 > The one thing we keep disciplined is the **C ABI** in [`include/vllm.h`](include/vllm.h):
