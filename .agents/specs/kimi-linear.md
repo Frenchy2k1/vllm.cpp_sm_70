@@ -1462,6 +1462,103 @@ campaign-completable to production quality; SCOPED here as the named born-on-run
 
 ---
 
+## 21. ROW 7 — FOLDED ONTO THE SHARED PAGED RUNNER; engine==CLI 128/128 IDENTITY, golden 122/128 PROFILE PRESERVED (2026-08-07, `row/KIMI-RUNNER-FOLD`, #122)
+<!-- state: 2026-08-07 -->
+The §20.3-scoped production runner fold LANDS (ARCH-ONE-SURFACE ROW 7, task #281): Kimi-Linear's
+decode runs THROUGH `ModelRegistry::Forward` on the runner's OWN paged state, the engine/server
+serve it at the paged-incremental class of rate, and `examples/kimi_linear_gen` is a thin
+public-ABI client (`vllm.h` + `vllm::shared`).
+
+### The bricks (file:line)
+- **B1 — KV enablement** (`src/vllm/transformers_utils/hf_config.cpp`): `LoadHfConfig` synthesizes
+  `layer_types` + the GDN-group geometry (`linear_num_key/value_heads`, `linear_key/value_head_dim`,
+  `linear_conv_kernel_dim`) from Kimi's nested `linear_attn_config` (configs/kimi_linear.py:34-148,
+  1-indexed `kda_layers`), so the §20.3 runner ABORT (the MambaSpec check against config-derived
+  {0,0},{0,0,0}) is gone and the per-layer loop allocates 20 KDA state groups + 7 MLA latent pages.
+  ADDITIVE: explicit-field configs (qwen3_5) never enter the branch; `runner.cpp` UNTOUCHED.
+- **B2 — KDA-paged block** (`kimi_linear_device.cpp` `KdaLayerPagedBf16`): `vt::KdaChunkPrefill` for
+  fresh prefills (vLLM's prompt path; `VT_KIMI_PAGED_KDA_CHUNK=0` A/B) / `vt::KdaGatedDeltaRule`
+  (T==1) for decode + continuing prefills over the paged `gdn_state` group keyed by
+  `non_spec_state_indices` (GdnStateGather/Scatter); conv taps via `CausalConv1dFwd` (varlen) /
+  `CausalConv1dUpdate` (decode) in vLLM's `conv_state.chunk(3)` [q|k|v] row layout. NOT per-head
+  `GdnBlockPaged` — KDA's per-K-channel decay needs the KDA ops; the shared GDN kernels untouched.
+- **B3 — NoPE-MLA-paged block**: latent rows written through `vt::ConcatAndCacheMla` at
+  `attn_meta.slot_mapping` (bf16 pages — vLLM's cache dtype; the KDA conv cache dtype now also
+  follows `ResolveKvCacheDType`, mirroring `kda_state_dtype`'s cache-dtype override). TWO arms:
+  **PRODUCTION = `mla::ForwardMlaAttentionBlock`** — vLLM's ACTUAL absorbed-MQA decode / FA2
+  prefill, identity-RoPE (cos=1/sin=0), scale qk^-0.5, load-time `AbsorbKvBProjBf16` into new
+  `MlaResidentWeights::w_uk_t/w_uv` (`VT_KIMI_PAGED_MLA_FA2`, default ON — GB10-ruled below); the
+  DIAGNOSTIC arm (`=0`) is the exact f64 softmax island over kv_b-up-projected paged rows, the
+  CPU fold-identity vehicle.
+- **B4 — ONE SURFACE**: the registry loader loads the bf16-RESIDENT tower through the engine
+  (`ModelFactory::stage_on_load`: queue selected BEFORE the load — CUDA context first + per-tensor
+  stage-and-release, the §13 recipe; `model_loader.cpp` queue branch, additive); ENG-ASYNC-SCHED W4
+  honored (`ForwardPaged` embeds `device_token_ids` — the async device mirror leaves host ids
+  deliberately stale; missing this was a measured GB10 9/128 divergence, RED-first CPU-pinned);
+  `vllm_complete_tokens` (ABI v13) — pre-tokenized completion returning generated ids;
+  `examples/kimi_linear_gen` REWRITTEN as a thin `vllm.h` client; example-abi-allowlist kimi row
+  REMOVED (merged ratchet 8, with #123's two minimax removals); the CLI-incremental REFERENCE leg preserved as the env-gated
+  `tests/vllm/models/test_kimi_linear_fold_gate.cpp` (VT_KIMI_MODEL_DIR/VT_KIMI_GOLDEN_DIR).
+
+### Gates (GB10 dgx.casa, /dev/shm CUDA build — CUTLASS 4.5.0 + FA2 + Triton AOT sm_121a; golden md5 `bfa5bdbf`; flock both locks, drop_caches, worker parked, min-avail ≥ 21G, NO reboot)
+- **CPU**: `test_kimi_linear_paged` 8/8·206 — (a) runner allocates Kimi's het-KV groups from a REAL
+  config.json; (b) paged-runner tokens == CLI tokens (f32 AND production bf16 caches); (b2)
+  `ForwardPaged` logits BYTE-EQUAL the CLI logits at every step (real GDN builder; mutation-RED on
+  dropped ssm scatter / zeroed decode state / dropped conv scatter / dropped MLA cache write); (b3)
+  `device_token_ids` over stale host ids; shared-MLA-arm greedy == exact-arm greedy + f32-page
+  rejection; batched-prefill distinct KDA slots; (c) 2-request slot isolation. `test_hf_config`
+  17/17·180, `test_capi` 35/35·290 (ABI v13 case mutation-verified), full ctest **351/351**.
+- **SACRED (re-run AFTER the fold, same build)**: 35B `test_qwen36_paged_engine` **2/2·315 PASS**;
+  27B `test_qwen27_paged_engine` **1/1·235 PASS** — the shared GDN/runner path is untouched.
+- **Gate A — fold identity (the binding §20.3 gate)**: reference leg (CLI-incremental,
+  §19-winning config, via `test_kimi_linear_fold_gate`) reproduces §19 EXACTLY — **122/128 @
+  18.93 tok/s** (p7 10/16, got-string byte-equal to §19). Engine leg (thin ABI client →
+  `vllm_engine_load` + `vllm_complete_tokens`, FA2 arm): **ENGINE == CLI 128/128 BYTE-IDENTICAL**
+  — p0-p6 16/16 vs golden AND p7's full 16-token got-string equal to the CLI's
+  (`276,6315,7275,382,2512,2470,387,658,18705,58084,824,2234,397,73874,2366,16626`). vs the
+  golden: **122/128 — the SAME near-tie profile** (≥122 bound MET, no drop).
+- **The FA2-default ruling (measured, 2 arms)**: FA2 arm 122/128 == the golden profile → DEFAULT ON
+  (vLLM's actual kernels + parity-enablers-ship-as-defaults). The diagnostic exact-island arm
+  measured **111/128** — the §19-documented GPU M-dimension-tiling near-tie class (re-up-projecting
+  the whole prefix at M=S vs the CLI's M=T append-time GEMM): p7 flips TOWARD golden (16/16!), p4
+  one flip that recovers, p2's token-1 flip cascades 0/16. NOT a paging bug (CPU byte-exact; FA2
+  shares every projection + cache write). Kept as the documented diagnostic arm.
+- **The async-mirror catch (round 1)**: the first engine run DIVERGED 9/128 — `ForwardPaged`
+  embedded the host `token_ids` the DEFAULT-ON async device mirror deliberately leaves STALE for
+  decode rows. Fixed by honoring `device_token_ids` (the qwen3_5 DeviceTokenIdsScope contract);
+  CPU-pinned RED-first. Models outside qwen3_5/kimi still ignore this field — flagged as a
+  repo-wide audit residual.
+- **SPEED**: the SERVER stream is the cleanest production-surface anchor — **48 tokens / 2.52 s =
+  19.0 tok/s wall** (including prefill + first-request warmup ⇒ a LOWER bound on steady decode),
+  i.e. the fold PRESERVES the §19 paged-incremental class (CLI reference 18.93 reproduced;
+  **~0.90× the #111 vLLM ~21 floor**). The example's two-length diffs read lower (N=64: 16.9
+  async / 16.1 sync; N=16: 9.8-11.5) because their long leg runs FIRST and cold — one-time CUDA
+  warmup pollutes the subtraction; recorded as a measurement caveat, not a regression. ≥ vLLM ~21
+  is still NOT met; the residual levers: device KDA decay gate + beta (kill the per-step host
+  islands ForwardPaged kept from the CLI), grouped MoE via the shared seam, decode CUDA graph.
+- **Tokenizer enablement (server surface)**: Kimi ships tiktoken-only; converted to
+  `tokenizer.json` via `transformers` `TikTokenConverter` (encode round-trip verified vs the slow
+  remote-code tokenizer) — staged as `~/kimi-linear-engine-dir` (snapshot symlinks + the converted
+  tokenizer). A shippable-converter residual is noted.
+- **Server smoke (`/v1/completions` through `examples/server`, the ONE-SURFACE deliverable)**:
+  PASS — model listed (`/v1/models`), STREAMED completion coherent ("The capital of France is" →
+  " Paris. The …", 48 tokens / 2.52 s = **19.0 tok/s streamed wall** — consistent with the CLI
+  18.93 class), non-streamed haiku coherent, greedy `finish_reason: length`, usage populated.
+- **vLLM same-session re-measure: ABORTED — BOX REBOOT.** The #111-precedented config (oracle
+  venv, util 0.82, no tracing) loaded 20/20 shards then hard-rebooted the box at torch.compile/
+  graph capture (min-avail had sat at the 15-17G floor) — reproducing §19's measured box-safety
+  finding. NOT retried per the safety mandate; the denominator remains the #111 recorded ~21
+  floor (same prompts/workload). Box recovered clean; worker auto-restored.
+
+### Status
+Row `ACTIVE`: ROW 7 fold LANDED — engine/server surface serves Kimi via the shared paged runner at
+122/128-profile fidelity; STRICT remains CLOSED (§20, intrinsic near-tie); the speed residual is
+now the last open thread (server surface ~19.0 tok/s wall vs vLLM ~21, ~0.90×; levers: per-step
+host-island removal (device decay gate + beta), MoE grouped GEMM through the shared seam, decode
+CUDA graph).
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope

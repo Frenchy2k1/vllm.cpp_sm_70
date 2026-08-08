@@ -722,6 +722,87 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
   }
 }
 
+VLLM_API vllm_status vllm_complete_tokens(
+    vllm_engine* engine, const int32_t* prompt_tokens, int32_t n_prompt_tokens,
+    const vllm_sampling_params* params, int32_t* out_tokens,
+    int32_t max_out_tokens, int32_t* n_out_tokens, vllm_completion* out) {
+  if (n_out_tokens != nullptr) *n_out_tokens = 0;
+  if (out != nullptr) {
+    out->text = nullptr;
+    out->finish_reason = nullptr;
+    out->prompt_tokens = 0;
+    out->completion_tokens = 0;
+  }
+  if (engine == nullptr || prompt_tokens == nullptr || params == nullptr ||
+      n_out_tokens == nullptr) {
+    SetError(
+        "vllm_complete_tokens: engine, prompt_tokens, params or n_out_tokens "
+        "is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (n_prompt_tokens <= 0) {
+    SetError("vllm_complete_tokens: n_prompt_tokens must be > 0");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (max_out_tokens < 0) {
+    SetError("vllm_complete_tokens: max_out_tokens must be >= 0");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (out_tokens == nullptr && max_out_tokens > 0) {
+    SetError("vllm_complete_tokens: out_tokens is null with max_out_tokens > 0");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    const vllm::SamplingParams sp =
+        ToSamplingParams(*params, vllm::RequestOutputKind::kCumulative);
+    vllm::v1::AsyncLLM& e = engine->loaded->async_engine();
+    const std::string request_id =
+        std::to_string(engine->next_request_id.fetch_add(1));
+    RequestGuard guard{e, request_id};
+    // The PRE-TOKENIZED add_request overload (vLLM TokensPrompt): builds the
+    // request from prompt_token_ids directly, skipping tokenization.
+    std::vector<int32_t> ids(prompt_tokens, prompt_tokens + n_prompt_tokens);
+    vllm::v1::AsyncRequest request = e.add_request(request_id, std::move(ids), sp);
+    vllm::RequestOutput result;
+    for (;;) {
+      result = e.get_output(request);
+      if (result.finished) break;
+    }
+    guard.disarm();
+
+    if (result.outputs.empty()) {
+      SetError("vllm_complete_tokens: engine produced no output sequence");
+      return VLLM_ERR_RUNTIME;
+    }
+    const vllm::CompletionOutput& o = result.outputs[0];
+    const int32_t n =
+        std::min<int32_t>(static_cast<int32_t>(o.token_ids.size()), max_out_tokens);
+    for (int32_t i = 0; i < n; ++i) out_tokens[i] = o.token_ids[static_cast<size_t>(i)];
+    *n_out_tokens = n;
+    if (out != nullptr) {
+      char* text = DupString(vllm::entrypoints::openai::SanitizeUtf8(o.text));
+      if (text == nullptr) {
+        SetError("vllm_complete_tokens: out-of-memory copying completion text");
+        return VLLM_ERR_RUNTIME;
+      }
+      out->text = text;
+      out->finish_reason = o.finish_reason.has_value()
+                               ? CanonicalFinishReason(*o.finish_reason)
+                               : nullptr;
+      out->prompt_tokens = static_cast<int32_t>(result.prompt_token_ids.size());
+      out->completion_tokens = static_cast<int32_t>(o.token_ids.size());
+    }
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_complete_tokens: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_complete_tokens: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
 VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
                                           const char* prompt,
                                           const vllm_sampling_params* params,

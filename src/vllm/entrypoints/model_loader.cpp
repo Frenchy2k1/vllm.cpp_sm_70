@@ -975,7 +975,16 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // Live architecture dispatch: consume config.architectures in order and let
   // the matched registration own the weight-name map/loader. Unknown dense
   // configs now reject instead of falling through num_experts == 0.
-  if (!registration.factory->is_dense_model || !DirectDeviceLoadRequested()) {
+  //
+  // ROW 7 (kimi-linear.md §20.3): a factory with `stage_on_load` (Kimi-Linear's
+  // 91.5 GiB bf16-resident loader) takes the queue-selected branch below so the
+  // CUDA context exists BEFORE the weights load and each tensor stages then
+  // releases its host mirror (the §13 GB10 recipe). Every other arch resolves
+  // this condition exactly as before — byte-identical.
+  const bool queue_load =
+      (registration.factory->is_dense_model && DirectDeviceLoadRequested()) ||
+      registration.factory->stage_on_load;
+  if (!queue_load) {
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards));
     maybe_attach_mtp(*model);

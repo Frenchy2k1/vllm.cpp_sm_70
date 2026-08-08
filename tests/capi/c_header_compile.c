@@ -32,6 +32,13 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
     vllm_completion_free(&out);
     vllm_string_free(out.text);
     st = vllm_complete_stream(eng, prompt, &sp, cb, /*user_data=*/NULL);
+    {
+      const int32_t prompt_ids[1] = {1};
+      int32_t out_ids[4];
+      int32_t n_out = 0;
+      st = vllm_complete_tokens(eng, prompt_ids, 1, &sp, out_ids, 4, &n_out,
+                                /*out=*/NULL);
+    }
     st = vllm_request_submit(eng, prompt, &sp, cb, /*user_data=*/NULL,
                              &request);
     if (request != NULL) {
