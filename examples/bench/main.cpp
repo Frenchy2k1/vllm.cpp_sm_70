@@ -1,7 +1,7 @@
 // vllm-bench — the M2.1 throughput/latency benchmark harness for vllm.cpp.
 //
 // This is the tool that MEASURES gate #1 (throughput parity vs vLLM,
-// .agents/gates.md): it drives the V1 LLMEngine step() loop at a fixed
+// .agents/gates.md): it drives the production V1 AsyncLLM frontend at a fixed
 // concurrency and reports request/output/total token throughput plus
 // TTFT/TPOT/ITL/E2EL, with a prefill-vs-decode split. The metrics + report
 // format mirror `vllm bench serve` / `vllm bench throughput`
@@ -48,7 +48,7 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--output-token-ids <json>]\n"
       "          [--speculative-config <json>]\n"
       "\n"
-      "Throughput/latency benchmark over the vllm.cpp V1 LLMEngine, mirroring\n"
+      "Throughput/latency benchmark over the vllm.cpp V1 AsyncLLM, mirroring\n"
       "`vllm bench serve` metrics. With no --model, a synthetic CPU engine runs\n"
       "(numbers meaningless; smoke only). Defaults: --num-prompts 8 "
       "--input-len 16\n"

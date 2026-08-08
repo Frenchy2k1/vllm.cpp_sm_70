@@ -32,15 +32,12 @@
 //
 // ─── DEFERRED upstream fields (T0 gate models never exercise them) ──────────
 //   * Triton-kernel launch metadata: chunk_indices / chunk_offsets (FLA chunk
-//     kernel) and nums_dict / batch_ptr / token_chunk_offset_ptr (Triton
-//     causal_conv1d). OMITTED: our sequential C++ vt::GdnPrefill /
-//     vt::GdnSpecDecode and
-//     vt::CausalConv1dFwd consume `prefill_query_start_loc` + a
-//     `has_initial_state` mask DIRECTLY (ops.h — GdnPrefill takes
-//     query_start_loc; CausalConv1dFwd takes query_start_loc + has_initial_state),
-//     so the chunk/conv-tile precompute has no C++ consumer. Upstream itself
-//     tolerates them being None — the FLA ops recompute on the fly
-//     (gdn-semantics.md §8).
+//     kernel) and nums_dict. The causal-conv batch_ptr /
+//     token_chunk_offset_ptr pair IS ported below and consumed by the optional
+//     exact-chunk CUDA dispatch; our sequential C++ vt::GdnPrefill /
+//     vt::GdnSpecDecode still consume query_start_loc directly. Upstream itself
+//     tolerates the remaining FLA fields being None — those ops recompute on
+//     the fly (gdn-semantics.md §8).
 //   * the FLA/cutedsl prefill-backend selection.
 #ifndef VLLM_V1_ATTENTION_BACKENDS_GDN_ATTN_H_
 #define VLLM_V1_ATTENTION_BACKENDS_GDN_ATTN_H_
@@ -76,6 +73,19 @@ inline constexpr int32_t kNullStateSlot = -1;
 // num_prefill_tokens}.
 std::tuple<int, int, int, int> SplitDecodesAndPrefills(
     const CommonAttentionMetadata& m, int decode_threshold = 1);
+
+// Exact causal-conv work descriptor from upstream
+// utils.py::compute_causal_conv1d_metadata @ the parity pin. One program owns
+// one (sequence, 8-token chunk); unequal sequence lengths therefore launch no
+// rectangular padding work. Built from the already-host-resident cu_seqlens so
+// it introduces no device-to-host synchronization.
+inline constexpr int32_t kCausalConv1dBlockM = 8;
+struct CausalConv1dMetadata {
+  std::vector<int32_t> batch_ptr;
+  std::vector<int32_t> token_chunk_offset_ptr;
+};
+CausalConv1dMetadata ComputeCausalConv1dMetadata(
+    const std::vector<int32_t>& query_start_loc_cpu);
 
 // The GDN prefill/decode/spec segmentation for one batched step.
 // (Upstream @dataclass GDNAttentionMetadata, gdn_attn.py:42-79.) Field names
@@ -130,6 +140,13 @@ struct GDNAttentionMetadata : AttentionMetadata {
   std::optional<std::vector<int32_t>> prefill_query_start_loc;
   std::optional<std::vector<int32_t>> prefill_state_indices;
   std::optional<std::vector<uint8_t>> prefill_has_initial_state;
+
+  // Flattened exact causal-conv program map over the WHOLE non-spec stream.
+  // Mixed batches include their leading decode rows because causal_conv1d_fn
+  // consumes that whole stream before recurrence segmentation. None when there
+  // is no prefill and the single-token update kernel is selected instead.
+  std::optional<std::vector<int32_t>> batch_ptr;
+  std::optional<std::vector<int32_t>> token_chunk_offset_ptr;
 
   // ── Spec-decode segmentation (SPEC-MTP I4; gdn_attn.py:189-326) ────────────
   // All nullopt / 0 unless the step actually carries drafts.

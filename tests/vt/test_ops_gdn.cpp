@@ -2416,25 +2416,56 @@ void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vect
                     i8_mask ? static_cast<const void*>(his_i8.data())
                             : static_cast<const void*>(his.data()));
 
-  auto run = [&](bool reg, std::vector<uint8_t>& out_bytes, std::vector<uint8_t>& st_bytes) {
+  std::vector<int32_t> batch_ptr;
+  std::vector<int32_t> chunk_offsets;
+  for (int32_t s = 0; s < n; ++s) {
+    const int32_t len = qsl[static_cast<size_t>(s + 1)] -
+                        qsl[static_cast<size_t>(s)];
+    const int32_t chunks = (len + 7) / 8;  // upstream BLOCK_M=8
+    for (int32_t chunk = 0; chunk < chunks; ++chunk) {
+      batch_ptr.push_back(s);
+      chunk_offsets.push_back(chunk);
+    }
+  }
+  DeviceTensor dbatch(gpu, gq.q, DType::kI32,
+                      {static_cast<int64_t>(batch_ptr.size())},
+                      batch_ptr.data());
+  DeviceTensor doffsets(gpu, gq.q, DType::kI32,
+                        {static_cast<int64_t>(chunk_offsets.size())},
+                        chunk_offsets.data());
+
+  auto run = [&](bool reg, bool exact, std::vector<uint8_t>& out_bytes,
+                 std::vector<uint8_t>& st_bytes) {
     ::setenv("VT_CONV_REG", reg ? "1" : "0", 1);
+    ::setenv("VT_CONV_EXACT_CHUNKS", exact ? "1" : "0", 1);
     DeviceTensor dst(gpu, gq.q, DType::kF32, {n, c, k - 1}, stb.data());  // fresh state per arm
     DeviceTensor dout(gpu, gq.q, cb.out, {t, c});
     gpu.Memset(gq.q, dout.tensor().data, 0x5a, static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
+    Tensor batch_tensor = dbatch.tensor();
+    Tensor offsets_tensor = doffsets.tensor();
+    CausalConv1dArgs run_args{silu};
+    if (exact) {
+      run_args.batch_ptr = &batch_tensor;
+      run_args.token_chunk_offset_ptr = &offsets_tensor;
+    }
     vt::CausalConv1dFwd(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
                         with_bias ? &db.tensor() : nullptr, dst.tensor(), dqsl.tensor(),
-                        dhis.tensor(), args);
+                        dhis.tensor(), exact ? run_args : args);
     out_bytes.resize(static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
     st_bytes.resize(stb.size());
     dout.Download(gq.q, out_bytes.data());
     dst.Download(gq.q, st_bytes.data());
   };
-  std::vector<uint8_t> out_tiled, st_tiled, out_reg, st_reg;
-  run(/*reg=*/false, out_tiled, st_tiled);
-  run(/*reg=*/true, out_reg, st_reg);
+  std::vector<uint8_t> out_tiled, st_tiled, out_reg, st_reg, out_exact, st_exact;
+  run(/*reg=*/false, /*exact=*/false, out_tiled, st_tiled);
+  run(/*reg=*/true, /*exact=*/false, out_reg, st_reg);
+  run(/*reg=*/true, /*exact=*/true, out_exact, st_exact);
   ::unsetenv("VT_CONV_REG");
+  ::unsetenv("VT_CONV_EXACT_CHUNKS");
   CHECK(out_reg == out_tiled);  // out activation byte-identical
   CHECK(st_reg == st_tiled);    // rolled conv_state byte-identical
+  CHECK(out_exact == out_tiled);  // exact descriptor changes only work assignment
+  CHECK(st_exact == st_tiled);
 }
 
 TEST_CASE("CUDA causal_conv1d_fwd register kernel (VT_CONV_REG) matches tiled 0-ulp") {

@@ -63,7 +63,11 @@ if test -n "${VLLM_CUDA_HOME:-}"; then
   vllm_path=$cuda_combined/bin:$(dirname "$ninja"):$(dirname "$host_cxx"):$PATH
   vllm_ld_library_path=$(dirname "$libstdcpp"):$cuda_combined/lib:/run/opengl-driver/lib
   vllm_cpath=$cuda_combined/include
-  vllm_library_path=$cuda_combined/lib
+  # FlashInfer JIT links the CUDA driver with plain `c++ -lcuda`. The venv
+  # toolkit carries cudart but the live driver belongs to the host, so expose
+  # both roots to the compiler's library search (LD_LIBRARY_PATH alone is only
+  # a runtime lookup and does not satisfy this link step).
+  vllm_library_path=$cuda_combined/lib:/run/opengl-driver/lib
   vllm_nix_ldflags="-L$cuda_combined/lib -L/run/opengl-driver/lib"
 else
 cudart=$(sed -n 's/^CUDA_CUDART:[^=]*=//p' "$cmake_cache")
