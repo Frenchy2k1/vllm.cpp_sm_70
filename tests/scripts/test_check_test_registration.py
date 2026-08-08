@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -62,61 +64,11 @@ done
 
 
 def _suite_integrity_errors(source: str) -> list[str]:
-    """Return semantic holes in this mutation suite's own proof machinery."""
+    """Exercise the production-owned, canonical mutation-suite contract."""
 
-    tree = ast.parse(source)
-    methods = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    manifest = {
-        line
-        for line in (ROOT / "tests/scripts/check_test_registration_mutations.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-        if line and not line.startswith("#")
-    }
-    errors: list[str] = []
-    actual = {name for name in methods if name.startswith("test_M")}
-    if actual != manifest:
-        errors.append("mutation inventory differs from fixed manifest")
-
-    for name in sorted(actual & manifest):
-        calls = {
-            call.func.attr
-            for call in ast.walk(methods[name])
-            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-        }
-        if not {"assert_error", "assert_wiring_error"} & calls:
-            errors.append(f"{name} has no semantic outcome assertion")
-
-    for name, production_call in {
-        "assert_error": "registration_errors",
-        "assert_wiring_error": "wiring_errors",
-    }.items():
-        method = methods.get(name)
-        if method is None:
-            errors.append(f"{name} helper is missing")
-            continue
-        calls = [call for call in ast.walk(method) if isinstance(call, ast.Call)]
-        if not any(
-            isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "self"
-            and call.func.attr == "assertTrue"
-            for call in calls
-        ):
-            errors.append(f"{name} has no direct semantic assertion")
-        if not any(
-            isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "mod"
-            and call.func.attr == production_call
-            for call in calls
-        ):
-            errors.append(f"{name} does not call {production_call}")
-    return errors
+    return mod.mutation_suite_integrity_errors(
+        source, manifest_path=mod.MUTATION_MANIFEST
+    )
 
 
 class RegistrationMutationTests(unittest.TestCase):
@@ -266,6 +218,26 @@ class RegistrationMutationTests(unittest.TestCase):
             mutated, "must execute configured target test_device_selection exactly"
         )
 
+    def test_M28_disabled_ctest_fails(self) -> None:
+        mutated = PASSING_CMAKE.replace(
+            "  add_test(NAME ${name} COMMAND ${name})",
+            "  add_test(NAME ${name} COMMAND ${name})\n"
+            "  set_tests_properties(${name} PROPERTIES DISABLED TRUE)",
+        )
+        self.assertNotEqual(mutated, PASSING_CMAKE)
+        self.assert_error(mutated, "must not be DISABLED")
+
+    def test_ninja_multi_config_resolves_release_ctest_command(self) -> None:
+        old_generator = os.environ.get("CMAKE_GENERATOR")
+        os.environ["CMAKE_GENERATOR"] = "Ninja Multi-Config"
+        try:
+            self.assertEqual(mod.registration_errors(PASSING_CMAKE), [])
+        finally:
+            if old_generator is None:
+                os.environ.pop("CMAKE_GENERATOR", None)
+            else:
+                os.environ["CMAKE_GENERATOR"] = old_generator
+
 
 class WiringMutationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -370,6 +342,78 @@ class WiringMutationTests(unittest.TestCase):
         self.assertNotEqual(mutated, self.preflight)
         self.assert_wiring_error(mutated, self.ci, "execute SUITES")
 
+    def test_M29_ci_continue_on_error_fails(self) -> None:
+        mutated = self.ci.replace(
+            "        run: |\n", "        continue-on-error: true\n        run: |\n"
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(self.preflight, mutated, "direct active commands")
+
+    def test_M30_ci_quoted_false_condition_fails(self) -> None:
+        mutated = self.ci.replace(
+            "        run: |\n", "        'if': ${{ false }}\n        run: |\n"
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(self.preflight, mutated, "direct active commands")
+
+    def test_M31_ci_spaced_false_condition_fails(self) -> None:
+        mutated = self.ci.replace(
+            "        run: |\n", "        if : ${{ false }}\n        run: |\n"
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(self.preflight, mutated, "direct active commands")
+
+    def test_M32_ci_inert_shell_fails(self) -> None:
+        mutated = self.ci.replace(
+            "        run: |\n", "        shell: /bin/true {0}\n        run: |\n"
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(self.preflight, mutated, "direct active commands")
+
+    def test_M33_preflight_checker_loop_noop_body_fails(self) -> None:
+        mutated = self.preflight.replace(
+            '  python3 "scripts/$checker.py"', "  true"
+        )
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(mutated, self.ci, "execute CHECKERS")
+
+    def test_M34_preflight_suite_loop_noop_body_fails(self) -> None:
+        mutated = self.preflight.replace(
+            '  python3 "tests/scripts/$suite.py"', "  true"
+        )
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(mutated, self.ci, "execute SUITES")
+
+    def test_M35_preflight_checker_loop_immediate_continue_fails(self) -> None:
+        mutated = self.preflight.replace(
+            'for checker in "${CHECKERS[@]}"; do\n',
+            'for checker in "${CHECKERS[@]}"; do\n  continue\n',
+        )
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(mutated, self.ci, "execute CHECKERS")
+
+    def test_M36_preflight_loops_behind_false_outer_branch_fail(self) -> None:
+        loop_block = (
+            'for checker in "${CHECKERS[@]}"; do\n'
+            '  python3 "scripts/$checker.py"\n'
+            "done\n"
+            'for suite in "${SUITES[@]}"; do\n'
+            '  python3 "tests/scripts/$suite.py"\n'
+            "done\n"
+        )
+        mutated = self.preflight.replace(loop_block, "if false; then\n" + loop_block + "fi\n")
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(mutated, self.ci, "execute CHECKERS")
+        self.assert_wiring_error(mutated, self.ci, "execute SUITES")
+
+    def test_M37_preflight_unsets_checkers_before_loop_fails(self) -> None:
+        mutated = self.preflight.replace(
+            'for checker in "${CHECKERS[@]}"; do',
+            'unset CHECKERS\nfor checker in "${CHECKERS[@]}"; do',
+        )
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(mutated, self.ci, "execute CHECKERS")
+
 
 class ShippedTreeTests(unittest.TestCase):
     def test_shipped_tree_is_registered_and_wired(self) -> None:
@@ -436,6 +480,71 @@ class SuiteIntegrityTests(unittest.TestCase):
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
             }
             self.assertIn("assertEqual", calls, name)
+
+    def test_suite_integrity_contract_is_pinned(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        self.assertEqual(_suite_integrity_errors(source), [])
+
+    def test_M38_deleting_M18_and_manifest_entry_fails(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "test_M18_ci_commands_behind_false_shell_branch_fail"
+        )
+        lines = source.splitlines(keepends=True)
+        mutated_source = "".join(lines[: method.lineno - 1] + lines[method.end_lineno :])
+        manifest = mod.MUTATION_MANIFEST.read_text(encoding="utf-8")
+        mutated_manifest = manifest.replace(
+            "test_M18_ci_commands_behind_false_shell_branch_fail\n", ""
+        )
+        errors = mod.mutation_suite_integrity_errors(
+            mutated_source, manifest_text=mutated_manifest
+        )
+        self.assertTrue(any("pinned digest" in error for error in errors), errors)
+
+    def test_M39_renaming_M18_and_manifest_entry_fails(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        old = "test_M18_ci_commands_behind_false_shell_branch_fail"
+        new = "test_M18_ci_commands_hidden_by_false_shell_branch_fail"
+        mutated_source = source.replace(old, new)
+        manifest = mod.MUTATION_MANIFEST.read_text(encoding="utf-8")
+        mutated_manifest = manifest.replace(old, new)
+        errors = mod.mutation_suite_integrity_errors(
+            mutated_source, manifest_text=mutated_manifest
+        )
+        self.assertTrue(any("pinned digest" in error for error in errors), errors)
+
+    def test_M40_redirecting_suite_to_alternate_manifest_fails(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        mutated = source.replace(
+            "source, manifest_path=mod.MUTATION_MANIFEST",
+            'source, manifest_path=ROOT / "tests/scripts/alternate_mutations.txt"',
+            1,
+        )
+        self.assertNotEqual(mutated, source)
+        errors = mod.mutation_suite_integrity_errors(
+            mutated, manifest_text=mod.MUTATION_MANIFEST.read_text(encoding="utf-8")
+        )
+        self.assertTrue(any("canonical manifest" in error for error in errors), errors)
+
+    def test_M41_deleting_manifest_integrity_test_fails(self) -> None:
+        source = Path(__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "test_suite_integrity_contract_is_pinned"
+        )
+        lines = source.splitlines(keepends=True)
+        mutated = "".join(lines[: method.lineno - 1] + lines[method.end_lineno :])
+        errors = mod.mutation_suite_integrity_errors(
+            mutated, manifest_text=mod.MUTATION_MANIFEST.read_text(encoding="utf-8")
+        )
+        self.assertTrue(any("integrity method is missing" in error for error in errors), errors)
 
 
 if __name__ == "__main__":
