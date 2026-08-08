@@ -1129,3 +1129,67 @@ the projections never touch a host buffer), total peak **51.95 GiB** of the 122 
 UNIFIED pool. Streamer counters on the real checkpoint:
 `layers=50 tensors=400 direct=350 converted=200 fused=100`, i.e. the shard path ran
 and every projection took the no-host-copy upload.
+
+## 8.16 The REF CANVAS renders COHERENT — 1344x768/124f measured end to end, and the pipeline's own decode OOMs there (2026-08-08, `row/H3-REF-CANVAS-RENDER`, Thor sm_110)
+
+§8.4 left the vllm-omni REF canvas (768x1344, 124f) UNRUN — "a full 50-step render is
+~2.85 h, so it was not run (largest-fitting-config honesty)". This row RAN it, on Thor
+(sm_110, 122.8 GiB unified, no FA2 so the portable fallback attention throughout), and
+measured every stage. **The render is COHERENT at the REF canvas** on the matching
+partition; the §8.4 white latent does NOT reproduce.
+
+**Config:** `MiniMax-H3-FL2VA-Q4_K_M.gguf` (`--dequant-bf16`), `--partition fl2va`,
+task **t2va** (no reference image), 1344x768, 124 frames, 50 steps, seq_len 38080,
+176.3 s/forward, `VT_H3_DUMP_DIR` on.
+
+| Stage | Metric | Value | Reference |
+|---|---|---|---|
+| init noise | adj-cell cosine | **0.0019** | white by construction (control) |
+| init noise | r_W / r_H / r_T | 0.999 / 1.001 / 0.999 | 1.0 == spatially white |
+| VAE-input latent | adj-cell cosine | **0.8924** | §8.4 white 0.06; real encode 0.789; §8.6 coherent 0.9467 |
+| VAE-input latent | r_W / r_H / r_T | 0.347 / 0.313 / 0.311 | well below the 1.0 white floor |
+| decoded frames | period-16 seam ratio | **1.15** | == the known-good 864x480 render (1.15); ref2va-on-FL2VA was 2.28 |
+
+`r` is mean|adjacent diff| / E|X-Y| along one axis: 1.0 for spatially white, lower when
+correlated. Calibrated before use on synthetic latents (white 1.00, smooth field 0.44,
+smooth+30% per-cell noise 0.86), so the instrument is known to separate the two cases.
+
+**Task/partition is what the earlier grids were.** Renders passing `--ref-image` against
+the FL2VA partition are ref2va-on-FL2VA, the combination §8.6 identified and §8.7's guard
+now REJECTS at the CLI. Measured on the same canvas and prompt: ref2va-on-FL2VA **2.28**,
+t2va pre-guard binary **1.87**, t2va on the guarded binary with Gaussian init noise
+**1.15**. The artifact SCALES WITH CANVAS (864x480 showed 1.15 while 1344x768 showed 2.28
+on the same mismatch), which is why small-canvas runs looked acceptable and the REF canvas
+did not.
+
+**NEW BUG — the pipeline decode OOMs at the REF canvas.** The 50-step denoise completed
+and the latent dump was written; VAE decode then exhausted the GPU pool and REBOOTED the
+box (`NVRM: GPU0 ... Out of memory [NV_ERR_NO_MEMORY] ... _memdescAllocInternal`, kernel
+log, ~1 min after the dump, box down ~2 min later). The dequantised bf16 DiT stays
+resident through `MiniMaxH3VideoVaeDecodeTemporalDevice`. Decoding the SAME dumped latent
+standalone — VAE only, no DiT resident — completes with room to spare and produced the
+1.15 frames above. So generation is correct at the REF canvas and the DECODE is what does
+not fit alongside the model.
+
+**FIXED in this row — `DevicePool::Drain` at the phase change.** The scratch pool is
+UNCAPPED on this platform (`cuda.cpp:98`, `device_pool_cap_bytes = 0`), so every block a
+`DBuf` returns across 50 denoise steps is retained forever, keyed by size class. The VAE
+decode then asks for DIFFERENT classes, cannot reuse any of them, and `cudaMalloc`s on
+top. `MiniMaxH3GenerateT2va` now drains the pool once at the denoise -> decode boundary.
+Measured on the REF canvas: **10.25 GiB released**, the render completed (124 frames +
+32 kHz audio, no reboot), and the pool still served **99.92%** of allocations from the
+free list (`hits=98475 misses=75 distinct-classes=8`) — draining at a PHASE boundary does
+not cost the within-phase reuse the pool exists for. Capping the pool platform-wide was
+REJECTED: it would charge every CUDA model the cudaMalloc/cudaFree sync storm the pool was
+built to avoid, for a problem that only appears at one phase change.
+
+`--keep-quant` was tried first as a no-code workaround and is NOT one: it OOM-killed the
+box ~8 min in, during weight staging, before a single denoise step.
+
+**Residuals.** (1) No full 124-frame MP4 with audio at the REF canvas yet — blocked on the
+OOM above. (2) The audio latent has no `VT_H3_DUMP_DIR` hook, so the audio arm is
+unmeasured; it was diagnosed only through the shared-sequence argument. (3) `--roundtrip`
+and `--decode-latent` went with the pre-fold binary (documented at
+`minimax_h3_gen/main.cpp:31-36`), so replaying a dumped latent through the VAE now needs a
+throwaway harness against `MiniMaxH3VideoVaeDecodeTemporalDevice`; a `--decode-latent` on
+the ABI would have turned this row's 3 h re-render into a 2 min decode.
