@@ -308,7 +308,14 @@ ENGINE_PREFIXES = (
 # server implementation. Inventoried while its release-matrix spike is written;
 # no packaging support is claimed by the count bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 143
+# 144 since 2026-08-08: +`ENG-RELEASE-CONTAINERS` (published GHCR container
+# images built by GitHub Actions — a distribution channel distinct from the
+# downloadable archives in `ENG-RELEASE-BINARIES`: different artifact format,
+# registry, tag contract, multi-arch manifest and publish flow, sharing only the
+# staged bundle. User-directed, issue #170; inventoried while its spike is
+# written, and no image, workflow or registry package is claimed by the bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 144
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
