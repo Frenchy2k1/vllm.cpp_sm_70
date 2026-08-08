@@ -266,6 +266,10 @@ GDNAttentionMetadata PrefillGdnMeta(int64_t T, int32_t sidx) {
   g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
   g.prefill_state_indices = std::vector<int32_t>{sidx};
   g.prefill_has_initial_state = std::vector<uint8_t>{0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
+  g.batch_ptr = conv.batch_ptr;
+  g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
   return g;
 }
 
@@ -441,6 +445,10 @@ TEST_CASE("qwen35 paged: GDN state zeroing protects a fresh req in a mixed batch
   gm.prefill_query_start_loc = gm.non_spec_query_start_loc;
   gm.prefill_state_indices = std::vector<int32_t>{0, 1};
   gm.prefill_has_initial_state = std::vector<uint8_t>{0, 0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+  gm.batch_ptr = conv.batch_ptr;
+  gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
 
   const std::vector<float> batch = Qwen3_5Model::Forward(
       ids, pos, am, gm, pool.attn_kv, pool.gdn_state, w, c, q);

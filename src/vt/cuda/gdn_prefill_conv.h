@@ -71,6 +71,14 @@ inline bool ConvRegFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
 }
 
+// Exact upstream (sequence, token-chunk) dispatch: DEFAULT ON, with `0` as the
+// same-binary rollback to the legacy sequence-serial / rectangular-grid mapping.
+// On sm_120 Qwen3.5-4B c32 the paired graph-node trace measured the causal-conv
+// family at 720.047 -> 234.607 ms (3.07x), with byte-identical output tokens.
+inline bool ConvExactChunksFlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
 // Pure predicate for the VT_GDN_POSTCONV_SPLIT contract: DEFAULT OFF (OPT-IN). The
 // split post-conv kernel (GdnPostConvSplitKernel) is BIT-IDENTICAL (0-ulp) to the
 // shipped GdnPostConvKernel by construction, but the DGX nsys A/B measured it

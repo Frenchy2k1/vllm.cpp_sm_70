@@ -9,7 +9,7 @@
 | **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
 | **DSR fix: async readback capability (2026-08-08)** | **No number owed**: behavior-neutral (CPU/CUDA async-ON, discrete non-CUDA async-OFF, unchanged); moves a `kCUDA` check onto `Backend`, unblocking red CI on #127/#154/#155 |
 | **`ROAD-V1-MEM` M1+M2 (2026-08-08)** | KV auto-sizing CPU brick: `--kv-cache-memory` sizes the pool from a byte budget via the group-aware `KVBytesPerBlock` divisor (ABI v16, CPU-gated). M3 profile run dgx-gated |
-| **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |
+| **Record/checker repair 2026-08-07–08** | Restored red record/env gates; made release AST semantic pins Python 3.12/3.13-stable; recorded merged Gemma-4 MoE as known merged-GEMM drift and closed the stale embeddings claim. No runtime/performance change |
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
@@ -33,7 +33,16 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
-| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | 3/9 | 0.9971x throughput after the upstream update; TTFT and host PSS win. TPOT/ITL 1.1244x and VRAM remain open ([evidence](bench-evidence/qwen35-4b-upstream-20260805.md)) |
+| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | throughput + host PSS | Exact chunks ON: total **1.021x PASS**; TTFT **1.086x**, TPOT **1.025x**, VRAM **1.018x OPEN**; local A/B **+2.152%** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+
+### GDN prefill causal-convolution by GPU
+
+| GPU | Workload and basis | vllm.cpp | vLLM | Ratio | Status |
+|---|---|---:|---:|---:|---|
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 233.955 ms | 145.421 ms | **1.609x slower** | Rebased-main exact chunks ON; rollback 718.704 ms, so local is **3.072x faster** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| GB10 (`sm_121a`) | Qwen3.6-27B NVFP4, historical normalized prefill | 0.43 us/token/layer | 0.18 us/token/layer | **2.39x slower** | Directional only: unequal token clusters, older pin ([ledger](../.agents/parity-ledger.md)) |
+| GB10 (`sm_121a`) | Qwen3.6-35B NVFP4, later local kernel A/B | 321.148 us c1; 960.313 us c6 | - | `PENDING` | Register vs tiled improved 4.7%/7.3%; no paired vLLM denominator ([record](../.agents/specs/gdn-prefill-conv-reg-2026-07-18.md)) |
+| Jetson Thor (`sm_110`), AGX Orin (`sm_87`) | No matched GDN workload | - | - | `PENDING` | Runtime correctness only; no causal-conv speed trace |
 
 ### Qwen3.6-27B by concurrency
 

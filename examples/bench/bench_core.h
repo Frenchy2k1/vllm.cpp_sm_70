@@ -44,6 +44,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -56,6 +57,7 @@
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/llm_engine.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
@@ -113,6 +115,12 @@ struct RequestRecord {
 
 // ── Aggregated result (field names mirror serve.py BenchmarkMetrics). ──────────
 struct BenchResult {
+  // Auditable engine selection. The comparison harness uses the production
+  // AsyncLLM frontend even when async scheduling resolves OFF (then the core's
+  // queue depth is one), matching vLLM's frontend across the ON/OFF control.
+  bool async_frontend = false;
+  bool async_scheduling_enabled = false;
+  int max_concurrent_batches = 1;
   int completed = 0;
   double duration_s = 0.0;
   int64_t total_input = 0;
@@ -428,9 +436,11 @@ inline SamplingParams MakeSampling(const BenchConfig& cfg, int req_index) {
 
 // ─────────────────────────────── The harness ──────────────────────────────────
 // Creates the engine (synthetic if cfg.model_path is empty, else loaded from the
-// dir/.gguf), builds N prompts, then drives the V1 engine step() loop admitting
-// up to C requests at a time until all N finish — timing everything with
-// steady_clock. Returns the aggregated metrics.
+// dir/.gguf), builds N prompts, then drives the production AsyncLLM frontend,
+// admitting up to C requests at a time until all N finish — timing everything
+// with steady_clock. Async scheduling OFF still uses AsyncLLM with a depth-1
+// core queue, so the ON/OFF comparison changes only scheduler/runner behavior.
+// Returns the aggregated metrics.
 inline BenchResult RunBench(const BenchConfig& cfg) {
   using Clock = std::chrono::steady_clock;
 
@@ -495,9 +505,10 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     }
   }
 
-  vllm::v1::LLMEngine& engine = loaded->engine();
+  vllm::v1::AsyncLLM& engine = loaded->async_engine();
 
   std::map<std::string, RequestRecord> records;
+  std::map<std::string, vllm::v1::AsyncRequest> active;
   const Clock::time_point t0 = Clock::now();
   auto now_s = [&]() {
     return std::chrono::duration<double>(Clock::now() - t0).count();
@@ -513,8 +524,9 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
       RequestRecord rec;
       rec.arrival_s = now_s();
       records[rid] = rec;
-      engine.add_request(rid, prompts[static_cast<size_t>(next)],
-                         MakeSampling(cfg, next));
+      active.emplace(
+          rid, engine.add_request(rid, prompts[static_cast<size_t>(next)],
+                                  MakeSampling(cfg, next)));
       ++next;
       ++in_flight;
     }
@@ -522,7 +534,15 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
 
   admit();
   while (done < cfg.num_prompts) {
-    for (RequestOutput& out : engine.step()) {
+    bool observed_output = false;
+    for (auto it = active.begin(); it != active.end();) {
+      std::optional<RequestOutput> ready = engine.get_output_nowait(it->second);
+      if (!ready.has_value()) {
+        ++it;
+        continue;
+      }
+      observed_output = true;
+      RequestOutput& out = *ready;
       RequestRecord& rec = records[out.request_id];
       if (rec.prompt_tokens == 0 && !out.prompt_token_ids.empty()) {
         rec.prompt_tokens = static_cast<int>(out.prompt_token_ids.size());
@@ -546,9 +566,18 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
         rec.completion_s = now_s();
         --in_flight;
         ++done;
+        it = active.erase(it);
+      } else {
+        ++it;
       }
     }
     admit();  // keep C in flight as requests finish.
+    if (!observed_output) {
+      // The output-handler thread will publish the next per-request DELTA.
+      // Yield rather than block on an arbitrary request: blocking on one
+      // collector can delay ready outputs for other requests and distort ITL.
+      std::this_thread::yield();
+    }
   }
 
   const double dur_s = now_s();
@@ -576,6 +605,9 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   }
 
   BenchResult res;
+  res.async_frontend = true;
+  res.async_scheduling_enabled = loaded->async_scheduling_enabled();
+  res.max_concurrent_batches = loaded->max_concurrent_batches();
   res.output_token_ids.resize(static_cast<size_t>(cfg.num_prompts));
   res.completed = done;
   res.duration_s = dur_s;
@@ -651,6 +683,10 @@ inline void PrintReport(const BenchConfig& cfg, const BenchResult& r,
   };
 
   std::fprintf(out, "\n============= vllm.cpp Benchmark Result =============\n");
+  std::fprintf(out, "%-42s %-12s\n", "Engine frontend:",
+               r.async_frontend ? "AsyncLLM" : "LLMEngine");
+  line_i("Async scheduling enabled:", r.async_scheduling_enabled ? 1 : 0);
+  line_i("Maximum concurrent batches:", r.max_concurrent_batches);
   line_i("Successful requests:", r.completed);
   line_i("Maximum request concurrency:", cfg.concurrency);
   line_f("Benchmark duration (s):", r.duration_s);

@@ -53,6 +53,29 @@ std::tuple<int, int, int, int> SplitDecodesAndPrefills(
   return {num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens};
 }
 
+CausalConv1dMetadata ComputeCausalConv1dMetadata(
+    const std::vector<int32_t>& qsl) {
+  if (qsl.empty() || qsl.front() != 0) {
+    throw std::invalid_argument(
+        "causal-conv metadata: query_start_loc must start at zero");
+  }
+  CausalConv1dMetadata out;
+  for (size_t s = 0; s + 1 < qsl.size(); ++s) {
+    const int32_t len = qsl[s + 1] - qsl[s];
+    if (len < 0) {
+      throw std::invalid_argument(
+          "causal-conv metadata: query_start_loc must be monotonic");
+    }
+    const int32_t chunks =
+        (len + kCausalConv1dBlockM - 1) / kCausalConv1dBlockM;
+    for (int32_t chunk = 0; chunk < chunks; ++chunk) {
+      out.batch_ptr.push_back(static_cast<int32_t>(s));
+      out.token_chunk_offset_ptr.push_back(chunk);
+    }
+  }
+  return out;
+}
+
 GDNAttentionMetadata GDNAttentionMetadataBuilder::build(
     int common_prefix_len, const CommonAttentionMetadata& m, bool fast_build) {
   // The non-spec entry point IS the spec build with both spec arguments null:
@@ -331,6 +354,15 @@ GDNAttentionMetadata GDNAttentionMetadataBuilder::build(
       meta.prefill_state_indices = non_spec_state_indices;
       meta.prefill_has_initial_state = has_initial_state;
     }
+
+    // The conv forward consumes the WHOLE non-spec stream, including leading
+    // decode rows in a mixed step. Mirror upstream's exact flattened program
+    // descriptor once here; the runner uploads it once and all GDN layers reuse
+    // it. This replaces the old n<=4 rectangular-grid approximation.
+    const CausalConv1dMetadata conv =
+        ComputeCausalConv1dMetadata(*non_spec_query_start_loc);
+    meta.batch_ptr = conv.batch_ptr;
+    meta.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
   }
   // else: has_initial_state / prefill_* stay nullopt (gdn_attn.py:405).
 

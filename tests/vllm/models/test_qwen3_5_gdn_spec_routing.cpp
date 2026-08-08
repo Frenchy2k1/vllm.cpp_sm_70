@@ -259,6 +259,10 @@ GDNAttentionMetadata MixedMeta(int Tp) {
   g.prefill_state_indices = std::vector<int32_t>{2};
   g.prefill_query_start_loc = std::vector<int32_t>{0, Tp};
   g.prefill_has_initial_state = std::vector<uint8_t>{0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
+  g.batch_ptr = conv.batch_ptr;
+  g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
   return g;
 }
 
@@ -274,6 +278,10 @@ GDNAttentionMetadata PrefillMeta(int Tp, int slot) {
   g.prefill_state_indices = std::vector<int32_t>{slot};
   g.prefill_query_start_loc = std::vector<int32_t>{0, Tp};
   g.prefill_has_initial_state = std::vector<uint8_t>{0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
+  g.batch_ptr = conv.batch_ptr;
+  g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
   return g;
 }
 

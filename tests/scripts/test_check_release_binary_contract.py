@@ -1024,6 +1024,20 @@ class HumanContractMutations(unittest.TestCase):
                 self.assertIn(inventory, result.stdout + result.stderr)
 
     def test_each_semantic_inventory_consumer_body_is_pinned(self) -> None:
+        loop = ast.parse(
+            "for item in ITEMS:\n"
+            "    def identity(value):\n"
+            "        return value\n"
+        ).body[0]
+        self.assertIsInstance(loop, ast.For)
+        baseline = checker._consumer_body_digest(loop)
+        nested = next(
+            node for node in ast.walk(loop) if isinstance(node, ast.FunctionDef)
+        )
+        nested._fields = (*nested._fields, "type_params")
+        nested.type_params = []
+        self.assertEqual(checker._consumer_body_digest(loop), baseline)
+
         for inventory, method in INVENTORY_CONSUMER_METHODS.items():
             for mutation in CONSUMER_FLOW_MUTATIONS:
                 with (

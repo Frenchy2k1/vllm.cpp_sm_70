@@ -701,6 +701,7 @@ void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tens
 // directly — never a value the window mutated). See gdn_prefill_conv.h.
 constexpr int kConvRegN = 128;    // channels per block (blockDim.x; coalesced x/out)
 constexpr int kConvRegM = 32;     // token chunk per block (grid.z parallelism)
+constexpr int kConvExactM = 8;    // upstream compute_causal_conv1d_metadata BLOCK_M
 constexpr int kConvRegMaxW = 8;   // max supported width (k-1); Qwen GDN k=4 -> 3
 constexpr int64_t kConvRegChunkMaxSeqs = 4;  // chunk the token axis only for few seqs
 
@@ -709,21 +710,28 @@ __global__ void CausalConv1dFwdRegKernel(Tout* out, const Tin* x, const Tin* w,
                                          const Tin* bias, float* conv_state,
                                          const int32_t* qsl, const THas* his, int64_t c_dim,
                                          int64_t x_row_stride, int64_t k, bool silu,
-                                         int chunked) {
+                                         int chunked, const int32_t* batch_ptr,
+                                         const int32_t* token_chunk_offset_ptr, int exact) {
   const int64_t width = k - 1;
-  const int64_t s = blockIdx.y;                                                   // sequence
+  const int64_t program = blockIdx.y;
+  const int64_t s = exact ? batch_ptr[program] : program;                         // sequence
   const int64_t c = static_cast<int64_t>(blockIdx.x) * kConvRegN + threadIdx.x;   // channel
   const bool active = c < c_dim;
   const int64_t begin = qsl[s];
   const int64_t t_len = qsl[s + 1] - begin;
 
   // Token range this block owns. chunked: [chunk*M, chunk*M+M); else whole sequence.
-  const int64_t token_offset = chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM : 0;
+  const int64_t chunk_m = exact ? kConvExactM : kConvRegM;
+  const int64_t token_offset = exact
+                                   ? static_cast<int64_t>(token_chunk_offset_ptr[program]) *
+                                         kConvExactM
+                                   : (chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM
+                                              : 0);
   // Skip chunks past the sequence end — except chunk 0, which still runs the state
   // write-back (also the only path when t_len == 0).
   if (token_offset > 0 && token_offset >= t_len) return;
   const int64_t token_end =
-      (chunked && token_offset + kConvRegM < t_len) ? token_offset + kConvRegM : t_len;
+      ((chunked || exact) && token_offset + chunk_m < t_len) ? token_offset + chunk_m : t_len;
 
   const bool init = his[s] != 0;
   float* srow = active ? conv_state + (s * c_dim + c) * width : nullptr;
@@ -790,13 +798,16 @@ bool ConvRegEnabled() {
   return ConvRegFlagIsOn(std::getenv("VT_CONV_REG"));
 }
 
-// Register-window launcher (VT_CONV_REG=1). grid = (channel-tiles, sequences, chunks).
-// grid.z chunks the token axis only for few (kConvRegChunkMaxSeqs) sequences, where
-// one block per (channel-tile, seq) would under-occupy on a long prefill; gridZ must
-// cover the LONGEST sequence — without a host-side max we bound it by
-// cdiv(total_tokens, M) (exact for n==1, over-provisions by <= n for n>1, and the
-// early-return blocks are ~free). For many sequences grid.z==1 and each block streams
-// its whole sequence (the channel-tile x seq grid already occupies).
+bool ConvExactChunksEnabled() {
+  return ConvExactChunksFlagIsOn(std::getenv("VT_CONV_EXACT_CHUNKS"));
+}
+
+// Register-window launcher (VT_CONV_REG=1). The default exact descriptor maps
+// grid.y to a flattened list of (sequence, 8-token chunk) programs, mirroring
+// upstream and launching neither rectangular padding nor sequence-serial work.
+// VT_CONV_EXACT_CHUNKS=0 restores the legacy grid=(channel tiles, sequences,
+// chunks): it chunks grid.z only for <=4 sequences, and serially streams each
+// whole sequence for larger batches.
 template <typename Tin, typename Tout>
 void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                       const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
@@ -808,26 +819,37 @@ void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
   const int64_t chan_tiles = (c + kConvRegN - 1) / kConvRegN;
   int64_t gridZ = 1;
   int chunked = 0;
-  if (n <= kConvRegChunkMaxSeqs) {
+  const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
+  int64_t gridY = n;
+  if (exact) {
+    gridY = args.batch_ptr->shape[0];
+    VT_CHECK(gridY <= kMaxGridY,
+             "cuda causal_conv1d_fwd(reg): too many exact chunk programs");
+  } else if (n <= kConvRegChunkMaxSeqs) {
     const int64_t z = (total_tokens + kConvRegM - 1) / kConvRegM;
     if (z >= 1 && z <= kMaxGridY) {
       gridZ = z;
       chunked = 1;
     }
   }
-  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(n),
+  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(gridY),
                   static_cast<unsigned>(gridZ));
   const dim3 block(kConvRegN);
+  const int32_t* batch_ptr = exact ? args.batch_ptr->Ptr<int32_t>() : nullptr;
+  const int32_t* token_chunk_offset_ptr =
+      exact ? args.token_chunk_offset_ptr->Ptr<int32_t>() : nullptr;
   if (his.dtype == DType::kI8) {
     CausalConv1dFwdRegKernel<Tin, Tout, int8_t><<<grid, block, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation, chunked);
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation, chunked,
+        batch_ptr, token_chunk_offset_ptr, exact ? 1 : 0);
   } else {
     CausalConv1dFwdRegKernel<Tin, Tout, int32_t><<<grid, block, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation, chunked);
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation, chunked,
+        batch_ptr, token_chunk_offset_ptr, exact ? 1 : 0);
   }
   Check(cudaGetLastError(), "causal_conv1d_fwd(reg) launch");
 }
