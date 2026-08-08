@@ -471,6 +471,25 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                    static_cast<long long>(dit_params.latents_dim),
                    static_cast<long long>(video_per_channel));
     }
+    // The AUDIO arm of the same boundary. Without this the audio latent is the one
+    // stage of the pipeline that can only be reasoned about, never measured: the
+    // video arm has been bisected repeatedly (§8.16) while every audio claim has
+    // been inferred from the two modalities sharing one attention sequence.
+    // Layout matches the video dump's convention: [C][audio_t * audio_channel],
+    // channel-major, exactly what `denormalize` above indexes.
+    const std::string apath = std::string(dump_dir) + "/vae_input_audio_latent.f32";
+    if (std::FILE* af = std::fopen(apath.c_str(), "wb")) {
+      std::fwrite(audio_latent.data(), sizeof(float), audio_latent.size(), af);
+      std::fclose(af);
+      std::fprintf(stderr,
+                   "[h3-dump] wrote %s (%zu floats, channels=%lld per_channel=%lld "
+                   "audio_t=%lld audio_channel=%lld)\n",
+                   apath.c_str(), audio_latent.size(),
+                   static_cast<long long>(dit_params.audio_latents_dim),
+                   static_cast<long long>(audio_steps * request.audio_channel),
+                   static_cast<long long>(audio_steps),
+                   static_cast<long long>(request.audio_channel));
+    }
   }
 
   // On a device, run the ViT3D decoder device-resident. The portable decoder is a
