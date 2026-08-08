@@ -25,7 +25,7 @@ ZERO='0000000000000000000000000000000000000000'
 # The checkers and the paths they read. Keep both lists in sync with
 # scripts/agent-preflight.sh's CHECKERS entries for the same two gates.
 CHECKERS=(check-policy.py check-prompt-contract.py check-readme-structure.py check-public-doc-tables.py)
-# AGENTS.md + .env.example are exported too. check-policy.py asserts AGENTS.md is
+# AGENTS.md + .env.example are exported too. The policy checker asserts AGENTS.md is
 # a non-symlink regular file (policy_contract.py:428) and resolves its Markdown
 # links against this sandbox, so omitting either made EVERY push fail here while
 # passing in the real tree ("AGENTS.md must be a non-symlink regular file", then
