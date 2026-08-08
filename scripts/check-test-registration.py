@@ -29,7 +29,7 @@ CI = ROOT / ".github/workflows/ci.yml"
 MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
 MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
 MUTATION_MANIFEST_SHA256 = (
-    "36f00928fe7bbafaedcee27ede937d0a8a80d9c504eebddc18b8f3205f03eabf"
+    "46ac35fc533e345aa7735aeffde9d49524598998bdca1b784bd872d21a012803"
 )
 
 REQUIRED_TESTS = {
@@ -621,6 +621,32 @@ def mutation_suite_integrity_errors(
         }
         if not {"assert_error", "assert_wiring_error", "assertTrue"} & calls:
             errors.append(f"{name} has no semantic outcome assertion")
+
+    m42 = methods.get("test_M42_byte_identical_alternate_manifest_path_fails")
+    m42_path_assertion = False
+    if m42 is not None:
+        for call in _method_calls(m42):
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "self"
+                and call.func.attr == "assertEqual"
+                and len(call.args) == 2
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == "errors"
+                and isinstance(call.args[1], ast.List)
+                and len(call.args[1].elts) == 1
+                and isinstance(call.args[1].elts[0], ast.Constant)
+                and call.args[1].elts[0].value
+                == "mutation suite must use the canonical manifest path"
+            ):
+                continue
+            m42_path_assertion = True
+            break
+    if not m42_path_assertion:
+        errors.append(
+            "test_M42 must assert the exact canonical-manifest path diagnostic"
+        )
 
     for name, production_call in {
         "assert_error": "registration_errors",

@@ -1565,7 +1565,7 @@ runtime-verified yet.
   row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
   ROW 8 ABI-v14 device selection is behavior-complete; #139 repairs #136's
   shared-layer DSR 39->32 through registry/name resolution (`kcuda=0`) with the
-  baseline unchanged. CPU: selector 2/2·11; semantic execution guard 51/51
+  baseline unchanged. CPU: selector 2/2·11; semantic execution guard 52/52
   (CTest config/enabled, CI/preflight, manifest integrity). CUDA A/B remains.
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
   GDN and attention-free default off, mirroring vLLM), and it now has an

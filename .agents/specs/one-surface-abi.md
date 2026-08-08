@@ -241,7 +241,7 @@ disposable copy with instrumented `python3`/`git` shims and requires the checker
 and suite argv to occur exactly once, so empty bodies, `continue`, an outer false
 branch, and an unset array are all red.
 
-The 51/51 suite covers the earlier registration deaths plus disabled CTest,
+The 52/52 suite covers the earlier registration deaths plus disabled CTest,
 non-gating Actions variants, and the preflight execution variants. Its mutation
 inventory is protected by a third, independent layer in the production checker:
 the canonical path and content SHA-256 are pinned there, as are the named
@@ -250,7 +250,10 @@ suite and manifest, redirecting the suite to a byte-identical manifest, or
 deleting the integrity test is therefore red. A distinct direct test passes the
 unchanged canonical suite source with a byte-identical alternate manifest path
 and requires only the exact path-specific error; deleting the production path
-guard now makes that test red. This is precisely a claim of
+guard now makes that test red. The production-owned AST contract separately
+requires M42 to retain `assertEqual(errors, [the exact path diagnostic])`, so
+deleting or replacing that outcome assertion cannot be masked by M42's
+independent byte-identity assertion. This is precisely a claim of
 resistance to tandem two-layer suite/manifest shrinkage; it does not claim to
 resist an arbitrary simultaneous rewrite of the suite, manifest, and production
 checker.
