@@ -636,10 +636,35 @@ VulkanContext& VulkanContext::Get() {
 void* VulkanContext::AllocBuffer(size_t bytes, void** out_buffer, void** out_memory) {
   const VulkanApi& vk = Api();
   auto device = Unpack<VkDevice>(device_);
-  // A zero-length VkBuffer is invalid; round up so a 0-byte request still yields
-  // a distinct freeable pointer (the CPU backend's contract, which vt::StepArena
-  // relies on). Same treatment as the Metal skeleton.
-  const VkDeviceSize len = bytes == 0 ? 1 : static_cast<VkDeviceSize>(bytes);
+  // ROUNDED UP TO A WHOLE 32-BIT WORD, and that is a CORRECTNESS requirement of
+  // this backend's storage model, not tidiness.
+  //
+  // Every operand is bound as a `uint32_t[]` view (and, for float operands, also
+  // as a `uint16_t[]` one) over the WHOLE buffer — vt_common.glsl § STORAGE
+  // MODEL. An array of `uint` over a buffer of N bytes has floor(N/4) elements,
+  // so a buffer whose length is not a multiple of 4 has a TRUNCATED 32-bit view
+  // and its last partial word is unreachable. Under robustBufferAccess that read
+  // returns zero; without it, it is undefined. Either way it is silent.
+  //
+  // MEASURED (BACKEND-VULKAN-GDN): a 3-byte i8 `has_initial_state[3]` — the GDN
+  // per-request "does this row have a prior state" flag, which the gather shader
+  // reads byte-wise through the 32-bit view precisely so it need not require
+  // VK_KHR_8bit_storage — produced a 0-element view, every flag read back as
+  // false, and the gather ZEROED rows it should have copied. The gate caught it
+  // as a memcmp mismatch against the CPU oracle.
+  //
+  // Nothing before that read a non-multiple-of-4 buffer through the 32-bit view
+  // (f32/i32/i64 lengths are multiples of 4 by construction, and 16-bit dtypes go
+  // through the 16-bit view), which is why the skeleton lived with it. The fix
+  // belongs HERE rather than in one shader: any future byte- or word-granular
+  // read of a small operand would hit the same edge.
+  //
+  // A zero-length VkBuffer is also invalid, and the rounding covers that too: a
+  // 0-byte request still yields a distinct freeable pointer, which is the CPU
+  // backend's contract and what vt::StepArena relies on. Only the BUFFER LENGTH
+  // grows; the mapped pointer and every byte the caller wrote are untouched, so
+  // Copy/Memset stay bit-exact.
+  const VkDeviceSize len = bytes == 0 ? 4 : static_cast<VkDeviceSize>((bytes + 3) & ~size_t{3});
 
   VkBufferCreateInfo bci{};
   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;

@@ -1,0 +1,56 @@
+#version 450
+// vt::GdnStateScatter — write the compact f32 working state rows back into the
+// paged GDN cache slots named by state_idx. The inverse of vt_gdn_state_gather.
+// Ported 1:1 from src/vt/cpu/cpu_ops.cpp:1709-1745 GdnStateScatterKernel.
+//
+// Same two structural notes as the gather, for the same reasons:
+//   * ONE indexing path. The CPU's contiguous fast path is the widened path with
+//     cache_inner == work_inner, so only the general form is written here.
+//   * the CPU's per-index VT_CHECK against cache.shape[0] would need a host read
+//     of device memory, which on this backend is only correct after draining the
+//     dispatch batch; the device analogue is the bounds guard, and here it
+//     matters MORE than in the gather — this kernel WRITES the cache, so an
+//     unguarded out-of-range index would corrupt another request's page rather
+//     than merely produce a stale local row.
+//
+// Note there is no has_initial_state here and no zeroing: a scatter always
+// writes what the working buffer holds (cpu_ops.cpp:1725-1743).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Cb32 { uint v[]; } C32;           // cache (dest)
+layout(binding = 1) buffer Cb16 { uint16_t v[]; } C16;
+layout(binding = 2) readonly buffer Wb32 { uint v[]; } WK32; // working (f32 src)
+layout(binding = 3) readonly buffer Wb16 { uint16_t v[]; } WK16;
+layout(binding = 4) readonly buffer Ib { uint v[]; } IDX;    // state_idx, i32
+
+layout(push_constant) uniform Params {
+  uint rows;
+  uint work_row;
+  uint work_inner;
+  uint cache_inner;
+  uint cache_row;
+  uint n_cache_rows;
+  uint work_dt, cache_dt;
+  uint cache_off, work_off, idx_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.rows * p.work_row) { return; }
+  uint r = gid / p.work_row;
+  uint e = gid % p.work_row;
+
+  int ci = int(IDX.v[(p.idx_off >> 2) + r]);
+  if (ci < 0 || uint(ci) >= p.n_cache_rows) { return; }  // see the header note
+
+  uint m = e / p.work_inner;
+  uint ee = e % p.work_inner;
+  uint src = r * p.work_row + e;
+  uint dst = uint(ci) * p.cache_row + m * p.cache_inner + ee;
+
+  VT_STORE(C32, C16, p.cache_dt, p.cache_off, dst,
+           VT_LOAD(WK32, WK16, p.work_dt, p.work_off, src));
+}

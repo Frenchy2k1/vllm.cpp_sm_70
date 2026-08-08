@@ -1,0 +1,136 @@
+#version 450
+// vt::GdnPostConv — the fused GDN post-convolution preamble: split the mixed
+// q|k|v conv output, L2-normalize q and k per head, copy v, and derive the decay
+// g and the gate beta from the raw a/b projections. ONE launch in place of
+// GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta.
+// Ported 1:1 from src/vt/cpu/cpu_ops.cpp:2337-2417 GdnPostConvKernel; the fusion
+// itself mirrors upstream
+// vllm/model_executor/layers/fla/ops/fused_gdn_prefill_post_conv.py
+// `_fused_post_conv_kernel`, whose grid is (L, H + HV).
+//
+// THE GRID IS UPSTREAM'S, and that is what makes one dispatch cover four
+// different shapes of work: workgroup (i, j) with j < Hk does the q/k L2-norm for
+// head j of token i, and j >= Hk does the v copy AND the g/beta gating for head
+// j - Hk. `j` is derived from gl_WorkGroupID, so it is UNIFORM across the
+// workgroup — which is required, because both branches contain barriers
+// (vt_tg_sum) and a barrier reached by only part of a workgroup is undefined.
+//
+// FOUR OPERANDS ARE BOUND THROUGH THE 32-BIT VIEW ONLY. g_out, beta_out, a_log
+// and dt_bias are f32 BY CONTRACT (src/vt/ops.cpp:3459-3463), so a dtype-erased
+// pair of bindings would be a branch that can never take its other side; the
+// three axes that genuinely vary — conv, the q/k/v triple, and the a/b pair —
+// are specialization constants.
+//
+// SOFTPLUS IS COMPUTED WITH A REAL log1p. GLSL has no log1p and
+// `log(1.0 + exp(x))` loses the whole value once exp(x) drops below 2^-24: the
+// CPU reference is `std::log1p(std::exp(x))` (cpu_ops.cpp:2410) and a shader that
+// returned 0 where the oracle returns 9e-14 would be wrong in the only regime
+// this branch exists for. The identity below is the standard cancellation-free
+// form (Goldberg): scale log(u) by y/(u-1), which is exactly 1 in the regime
+// where u-1 == y and corrects the rounding of `1 + y` otherwise.
+//
+// The reduction is a workgroup tree, so the L2 sum-of-squares does NOT share the
+// CPU's accumulation order: NMSE tier, like every other reducing kernel here.
+// The scale is `1.0 / sqrt(ss + eps)` — a PLAIN sum of squares, not a mean
+// (gdn-semantics.md §4) — and not `inversesqrt`
+// (vt_common.glsl § DELIBERATE DIVERGENCES).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Cb32 { uint v[]; } C32;   // conv
+layout(binding = 1) readonly buffer Cb16 { uint16_t v[]; } C16;
+layout(binding = 2) buffer Qb32 { uint v[]; } Q32;
+layout(binding = 3) buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 4) buffer Kb32 { uint v[]; } K32;
+layout(binding = 5) buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 6) buffer Vb32 { uint v[]; } V32;
+layout(binding = 7) buffer Vb16 { uint16_t v[]; } V16;
+layout(binding = 8) readonly buffer Ab32 { uint v[]; } A32;   // araw
+layout(binding = 9) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 10) readonly buffer Bb32 { uint v[]; } B32;  // braw
+layout(binding = 11) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 12) buffer Gb { uint v[]; } G;               // g_out, f32
+layout(binding = 13) buffer Eb { uint v[]; } BETA;            // beta_out, f32
+layout(binding = 14) readonly buffer Lb { uint v[]; } ALOG;   // a_log, f32
+layout(binding = 15) readonly buffer Tb { uint v[]; } DTB;    // dt_bias, f32
+
+layout(constant_id = 0) const uint VT_PC_CONV_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_PC_QKV_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_PC_AB_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint t;
+  uint hk, dk;
+  uint hv, dv;
+  uint key_dim;    // hk * dk
+  uint value_dim;  // hv * dv
+  uint conv_dim;   // 2 * key_dim + value_dim
+  uint a_rs, b_rs; // araw/braw stride[0], in elements (may be padded)
+  uint conv_off, q_off, k_off, v_off, a_off, b_off;
+  uint g_off, beta_off, alog_off, dtb_off;
+  float eps;
+} p;
+
+// log1p(y) for y >= 0, cancellation-free. See the header note.
+float vt_log1p(float y) {
+  float u = 1.0 + y;
+  return u == 1.0 ? y : log(u) * (y / (u - 1.0));
+}
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint lanes = p.hk + p.hv;
+  uint i = gl_WorkGroupID.x / lanes;  // token
+  uint j = gl_WorkGroupID.x % lanes;  // head slot, UNIFORM per workgroup
+  uint row = i * p.conv_dim;
+
+  if (j < p.hk) {
+    // q/k: split then L2-norm over Dk, per head (cpu_ops.cpp:2350-2366).
+    uint h = j;
+    uint qbase = row + h * p.dk;
+    uint kbase = row + p.key_dim + h * p.dk;
+    float qp = 0.0;
+    float kp = 0.0;
+    for (uint e = tid; e < p.dk; e += VT_TG) {
+      float qv = VT_LOAD(C32, C16, VT_PC_CONV_DT, p.conv_off, qbase + e);
+      float kv = VT_LOAD(C32, C16, VT_PC_CONV_DT, p.conv_off, kbase + e);
+      qp += qv * qv;
+      kp += kv * kv;
+    }
+    float qss = vt_tg_sum(tid, qp);
+    float kss = vt_tg_sum(tid, kp);
+    float qinv = 1.0 / sqrt(qss + p.eps);
+    float kinv = 1.0 / sqrt(kss + p.eps);
+    for (uint e = tid; e < p.dk; e += VT_TG) {
+      uint o = (i * p.hk + h) * p.dk + e;
+      VT_STORE(Q32, Q16, VT_PC_QKV_DT, p.q_off, o,
+               VT_LOAD(C32, C16, VT_PC_CONV_DT, p.conv_off, qbase + e) * qinv);
+      VT_STORE(K32, K16, VT_PC_QKV_DT, p.k_off, o,
+               VT_LOAD(C32, C16, VT_PC_CONV_DT, p.conv_off, kbase + e) * kinv);
+    }
+    return;
+  }
+
+  uint h = j - p.hk;
+  // v: plain copy of this head's slice (cpu_ops.cpp:2368-2370).
+  for (uint e = tid; e < p.dv; e += VT_TG) {
+    VT_STORE(V32, V16, VT_PC_QKV_DT, p.v_off, i * p.value_dim + h * p.dv + e,
+             VT_LOAD(C32, C16, VT_PC_CONV_DT, p.conv_off,
+                     row + 2u * p.key_dim + h * p.dv + e));
+  }
+  // g/beta from a/b + A_log/dt_bias (gdn-semantics.md §6, cpu_ops.cpp:2372-2381).
+  // One element per head, so one lane does it; the rest of the workgroup is
+  // already busy with the v copy above.
+  if (tid == 0u) {
+    uint idx = i * p.hv + h;
+    float x = VT_LOAD(A32, A16, VT_PC_AB_DT, p.a_off, i * p.a_rs + h) +
+              uintBitsToFloat(DTB.v[(p.dtb_off >> 2) + h]);
+    float sp = x > 20.0 ? x : vt_log1p(exp(x));  // softplus, threshold 20
+    float alog = uintBitsToFloat(ALOG.v[(p.alog_off >> 2) + h]);
+    G.v[(p.g_off >> 2) + idx] = floatBitsToUint(-exp(alog) * sp);
+    float braw = VT_LOAD(B32, B16, VT_PC_AB_DT, p.b_off, i * p.b_rs + h);
+    BETA.v[(p.beta_off >> 2) + idx] = floatBitsToUint(vt_sigmoid(braw));
+  }
+}
