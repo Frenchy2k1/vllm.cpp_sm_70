@@ -262,7 +262,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Mode | vllm.cpp | vLLM | SGLang |
 |---|---|---|---|
-| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run; end-to-end scope spiked at the pin 2026-08-08 (TP-W1..W4+W7 CPU-completable) | ✅ | ✅ |
+| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run; TP-W1 LANDED 2026-08-08 (rank-layout group table + per-rank handle); TP-W2..W4+W7 CPU-completable | ✅ | ✅ |
 | Collective / process-group abstraction | ✅ CPU + NCCL transport | ✅ | ✅ |
 | Pipeline parallel (PP) | ☐ spike written | ✅ | ✅ |
 | Expert parallel (EP) + EPLB | ☐ spike written | ✅ | ✅ |

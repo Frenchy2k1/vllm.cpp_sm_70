@@ -434,8 +434,8 @@ parallelism mode is enumerated and ranked in
 **Tensor parallelism is scoped end-to-end at the pin** (#287,
 [tensor-parallelism-spike](../.agents/specs/tensor-parallelism-spike.md)):
 ~40% of the TP surface already landed/reusable; the landed TP wiring
-dead-ends at the layer boundary (no loader shards yet); bricks TP-W1..W4+W7
-(through an engine-level TP2-on-CPU token-exact gate) are CPU-completable
+dead-ends at the layer boundary (no loader shards yet); **TP-W1 LANDED** (group table); W2..W4+W7
+(the engine-level TP2-on-CPU token-exact gate) are CPU-completable
 NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
 (DFlash-derived block drafter for our Qwen3 + Gemma4 families) is grounded
 and inventoried ([note](../.agents/specs/dspark-speculator-note.md)); full
