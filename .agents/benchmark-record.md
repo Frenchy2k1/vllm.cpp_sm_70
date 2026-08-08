@@ -15907,3 +15907,52 @@ The DENOMINATOR for this campaign therefore remains the #111 recorded floor (~21
 16-token aggregate, same prompts/workload). Box recovered clean: single reboot, GPU
 visible, local-ai-worker auto-restored by --restart=always; /dev/shm build tree gone
 (campaign complete; all gate logs under $HOME).
+
+### 27B Vulkan re-run with the six GDN kernels: coverage MEASURED, speed NOT (2026-08-08, GB10)
+
+The GDN merge claimed the six new kernels would stop the reference-tier fallbacks.
+That was an inference from registration. This run makes it a measurement.
+
+**REFERENCE-TIER OPS: 11 -> 5.** Exactly the six that got kernels are gone —
+`kCausalConv1dUpdate`, `kRmsNormGated`, `kSigmoidGateBf16`, `kGdnPostConv`,
+`kGdnStateGather`, `kGdnStateScatter`.
+
+Still on the host, and each for a stated reason:
+
+| op | why |
+|---|---|
+| `kGdnPrefill`, `kGdnDecode` | chunked gated-delta recurrences, deliberately out of scope |
+| `kCausalConv1dFwd` | started and abandoned; its state write-back reads the OLD row while other tokens of the sequence still need it |
+| `kRopeCosSinCache` | **BY DESIGN** — double-precision table, mirrors vLLM's own split |
+| `kAttnQkNormRopeGate` | not attempted |
+
+**SPEED DID NOT MOVE, AND IS NOT CALLABLE.** decode 2.65 -> 2.40 tok/s, prefill
+2.22 -> 1.82, E2E 616.7 -> 709.1 s. That reads as a 9-18% regression and **it is
+n=1 per arm on a box that swung 2.1x run-to-run on the 0.6B**. Inside the noise
+band in both directions; calling it a regression would be the same error as
+calling it a win.
+
+**And no speed change was EXPECTED.** `kGdnPrefill`/`kGdnDecode` — the heavy
+recurrence cores — are still on the host. The six that landed are GLUE. Moving
+glue off the CPU while the dominant work stays there is a coverage and correctness
+result, not a throughput one.
+
+This is the regime effect recorded earlier today, applied prospectively for once:
+with the recurrence cores dominating, a glue-op improvement cannot clear the noise
+floor, so this measurement **cannot** resolve whether the six kernels are faster
+than their CPU counterparts. Re-measure them AFTER `kGdnPrefill`/`kGdnDecode`
+land, and treat today's numbers as unresolved rather than negative.
+
+**What the GDN merge IS justified on:** coverage (11 -> 5 fallbacks, measured),
+correctness (`test_vulkan_backend` 22/22 with 977 assertions on GB10 hardware, not
+just llvmpipe; opt-125m STRICT 6/6 with 0 declines), and the backend-wide
+sub-word buffer bug it exposed — `AllocBuffer` sized buffers at exactly the
+requested bytes while every operand is read through a `uint32_t[]` view, so a
+3-byte flag array gave a ZERO-element view and read false silently under
+robustBufferAccess.
+
+It is **not** justified on speed, and nothing measured here says otherwise.
+
+**Next lever for 27B Vulkan speed is `kGdnPrefill`/`kGdnDecode`** — that is where
+the prefill time sits, and a materially larger piece of work than the six glue ops.
+
