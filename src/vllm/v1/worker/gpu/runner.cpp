@@ -85,6 +85,20 @@ static bool AsyncRunnerEnvDefault() {
   return AsyncRunnerFlagIsOn(std::getenv("VT_ASYNC_RUNNER"));
 }
 
+// Async scheduling without a device-resident sampled-token mirror races the
+// embed against host-side token reads and degenerates greedy decode (token-0
+// loops / wrong continuations). The mirror is CUDA-only today
+// (async_device_mirror()). On discrete ROCm (and any non-CUDA GPU queue) keep
+// the synchronous path unless/until a HIP mirror lands — lab R9700 2026-08-07:
+// VT_ASYNC_SCHED=0 restored first-token parity with CPU; async ON produced "!".
+static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
+#ifdef VLLM_CPP_CUDA
+  if (queue.device.type == vt::DeviceType::kCUDA) return true;
+#endif
+  (void)queue;
+  return false;
+}
+
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each
 // execute_model step prints the request count and the live/free recurrent-state
 // slot geometry to std::cerr. Read ONCE (never per-step getenv); bounded to the
@@ -319,7 +333,8 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
-  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
+                         QueueSupportsAsyncInputCombine(queue_);
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -352,7 +367,8 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
-  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
+                         QueueSupportsAsyncInputCombine(queue_);
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -1543,6 +1559,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::vector<int32_t>& toks = sampler_output.sampled_token_ids[
         static_cast<size_t>(i)];
     out.sampled_token_ids.push_back(toks);
+
+    // Lab debug: VT_DEBUG_SAMPLED=1 prints every greedy token id.
+    if (const char* e = std::getenv("VT_DEBUG_SAMPLED");
+        e != nullptr && e[0] == '1' && !toks.empty()) {
+      std::fprintf(stderr, "vt-debug sampled req=%d tok=%d\n", i, toks.front());
+    }
 
     // Write-back: append each sampled token to slot i's token row so it becomes
     // the input at its position next step. num_tokens_no_spec is the next free

@@ -604,6 +604,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/mistral_weights.cpp
   src/vllm/model_executor/models/gemma4_registry.cpp
   src/vllm/model_executor/models/gemma4_weights.cpp
+  src/vllm/model_executor/models/gemma4_moe.cpp
   src/vllm/model_executor/models/gemma4.cpp
   src/vllm/model_executor/models/gemma4_mm.cpp
   src/vllm/model_executor/models/gemma3_registry.cpp
@@ -1080,11 +1081,19 @@ if(VLLM_CPP_HIP)
     src/vllm/platforms/rocm.cpp
     src/vt/rocm/rocm_backend.hip
     src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_embedding.hip
+    src/vt/rocm/rocm_dense_basic.hip
+    src/vt/rocm/rocm_matmul_hipblaslt.hip
+    src/vt/rocm/rocm_paged_attn.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
       src/vt/rocm/rocm_backend.hip
       src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_embedding.hip
+      src/vt/rocm/rocm_dense_basic.hip
+      src/vt/rocm/rocm_matmul_hipblaslt.hip
+      src/vt/rocm/rocm_paged_attn.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
@@ -1096,6 +1105,27 @@ if(VLLM_CPP_HIP)
     target_link_libraries(vllm PUBLIC ${VLLM_CPP_AMDHIP64_LIB})
   else()
     target_link_libraries(vllm PUBLIC amdhip64)
+  endif()
+  # hipBLAS + hipBLASLt — dense GEMM (ROCm math libraries).
+  find_path(VLLM_CPP_HIPBLAS_INCLUDE hipblas/hipblas.h
+    PATHS ${ROCM_PATH}/include /opt/rocm/include)
+  find_library(VLLM_CPP_HIPBLAS_LIB NAMES hipblas
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64 /opt/rocm/lib /opt/rocm/lib64)
+  find_path(VLLM_CPP_HIPBLASLT_INCLUDE hipblaslt/hipblaslt.h
+    PATHS ${ROCM_PATH}/include /opt/rocm/include)
+  find_library(VLLM_CPP_HIPBLASLT_LIB NAMES hipblaslt
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64 /opt/rocm/lib /opt/rocm/lib64)
+  if(VLLM_CPP_HIPBLAS_INCLUDE AND VLLM_CPP_HIPBLAS_LIB)
+    target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLAS_INCLUDE})
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLAS_LIB})
+    message(STATUS "ROCm hipBLAS: ${VLLM_CPP_HIPBLAS_LIB}")
+  else()
+    message(FATAL_ERROR "VLLM_CPP_HIP=ON requires hipBLAS (libhipblas + hipblas/hipblas.h).")
+  endif()
+  if(VLLM_CPP_HIPBLASLT_INCLUDE AND VLLM_CPP_HIPBLASLT_LIB)
+    target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_INCLUDE})
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_LIB})
+    message(STATUS "ROCm hipBLASLt: ${VLLM_CPP_HIPBLASLT_LIB}")
   endif()
 else()
   # BIT-ROT GUARD (BACKEND-ROCM W0). The ROCm platform leg is deliberately plain
