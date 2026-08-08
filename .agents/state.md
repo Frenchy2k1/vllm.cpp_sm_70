@@ -43252,3 +43252,29 @@ porting-inventory §9 rows for the from-scratch HIP kernels; F8 HIP-side fixes
 2-GPU target, dev_id on the Gemma4Fp8ExpertMats lazy cache, hipBLASLt-linked-
 but-unused); the paged-attn serial-key decode shape; all HIP-runtime evidence is
 PENDING-community (no AMD HW here — CPU build+link+tests are the operator gate).
+
+## 2026-08-08 — ROAD-V1-MEM M0 spike LANDED: KV-cache auto-sizing design (specs/kv-sizing.md), row READY
+<!-- state: 2026-08-08T23:00 -->
+
+Autonomous roadmap pickup after MXFP4 confirmed TERMINAL (STATUS.md:101 /
+BENCHMARKS.md:346: c1 1.020x parity, c2-c8 0.962-0.969 engine-context-bound,
+FLASH-PTXAS #82 proved codegen at parity — e2e Qwen3-8B-MXFP4 3/4 token-exact,
+p2 near-tie 0.0000). Scanned roadmap_v1; picked `ROAD-V1-MEM` (#83, user-directed
+2026-08-06) — the M0 spike was OWED and we are measurably BEHIND vLLM (KV pool is
+a raw hand-typed `--num-blocks`).
+
+`.agents/specs/kv-sizing.md` written, grounded at the pin: vLLM's 3 knobs
+(`config/cache.py`: gpu_memory_utilization 0.92 default / kv_cache_memory_bytes
+absolute override / num_gpu_blocks_override) + the profile-run formula
+(`gpu_worker.py:497-599`: `available_kv = free*util − non_kv − cudagraph`,
+`num_blocks = available_kv / bytes_per_block`). Our design: additive knobs on
+EngineParams + the C ABI (appended field, zero=auto), group-aware
+`bytes_per_block` over the runner's existing per-layer KV geometry (dense / MLA /
+het-KV), a device profile run, pre-flight error (not OOM), token-exact-vs-explicit
+gate, default flips to auto. GB10 caveat carried: the unified pool means util
+reserves HOST RAM (gb10-unified-memory-oom-reboots-box), so the profile run reads
+the unified free-memory and the default 0.92 is not unconditionally safe there.
+
+Row moved INVENTORIED→READY (roadmap_v1 + feature-matrix §2). M1-M4 are the impl
+rows this unblocks; M1/M2/M4-CPU are CPU-completable, M3 (profile run) is
+dgx-gated. Records-only spike (no code).

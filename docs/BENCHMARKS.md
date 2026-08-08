@@ -7,6 +7,7 @@
 | **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states; 30 tests GREEN. No archive, staged smoke, runtime, correctness, or performance evidence | n/a |
 | **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |
 | **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
+| **`ROAD-V1-MEM` M0 spike (2026-08-08)** | KV-cache auto-sizing DESIGN grounded at the pin (`specs/kv-sizing.md`); no code, no number; we are behind vLLM here and this row unblocks the M1-M4 impl. Records/scoping only, nothing to reproduce |
 | **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
