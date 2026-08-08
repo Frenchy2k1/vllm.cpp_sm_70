@@ -118,6 +118,20 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**ONE-SURFACE device-selection leakage repair (`ARCH-ONE-SURFACE`,
+2026-08-08, `CLAIM-ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2`).** Codex (GPT-5),
+isolated worktree
+`/home/mudler/_git/vllm.cpp-arch-one-surface-device-leakage-v2`, branch
+`row/ARCH-ONE-SURFACE-DEVICE-LEAKAGE-V2`, base `origin/main` `b44ad337`.
+Repairs the inherited PR #136 DSR regression without weakening the baseline or
+allowlist: generic device configuration and model loading must route through
+the platform/backend abstraction while preserving ABI-v14 auto/CPU/CUDA
+selection, loud absent-CUDA failure, and the restored H3 seam. Owns
+`include/vllm/config/device.h`, `src/vllm/config/device.cpp`,
+`src/vllm/entrypoints/model_loader.cpp`, focused CPU tests, the existing
+ONE-SURFACE specs/records and required public checkpoint surfaces. CPU-only;
+no CUDA execution, model download, benchmark, or service change.
+
 **CPU grouped keep-quant GEMM activation-dtype P0 (`QUANT-GGUF-CIQ-GEMM`,
 2026-08-06, `CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`).** Claude Code
 (claude-opus-5), isolated worktree `/home/mudler/_git/vllmcpp-ciq-grouped`,
