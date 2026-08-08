@@ -28,9 +28,9 @@ So test porting is part of the mirror obligation, not an optional extra.
 3. **Traceability is 1:1 and named**: keep our test case names derived from
    upstream ones (`test_schedule_spec_decode` → `TEST_CASE("schedule_spec_decode …")`)
    and record the upstream→ours test-file mapping in
-   [porting-inventory.md](porting-inventory.md) alongside the code mapping, so
+   [porting-inventory.md](../porting-inventory.md) alongside the code mapping, so
    the upstream sync cycle can diff TEST deltas mechanically.
-4. **Upstream sync ports test deltas too** ([upstream-sync.md](upstream-sync.md)):
+4. **Upstream sync ports test deltas too** ([upstream-sync.md](../upstream-sync.md)):
    when a synced vLLM PR touches `tests/`, the port includes the test delta.
    A PR that only changes tests still gets synced — it's a spec change.
 5. **Specs must inventory their tests**: every `.agents/specs/<slug>.md`

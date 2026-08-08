@@ -401,7 +401,7 @@ ranges. The `gemma*.py` anchors above are against pin `e24d1b24`.
 
 ### Tests to port
 
-Per [`.agents/test-porting.md`](../test-porting.md). Unlike GLM (which had almost no
+Per [`.agents/porting.md`](../porting.md). Unlike GLM (which had almost no
 upstream text-correctness coverage), **Gemma HAS upstream text-generation correctness
 entries** — a genuine executable spec. Nothing below is ported by this spike (spec
 only); this is the inventory that binds the implementing Ws.
@@ -422,14 +422,14 @@ only); this is the inventory that binds the implementing Ws.
 attention" — the interleaved sliding/global pattern IS the upstream spec for the
 sliding-window wiring, and it is directly portable. This is a stronger executable spec
 than GLM had; our SACRED oracle is still our own pinned-vLLM comparison per
-[`.agents/gates.md`](../gates.md), but the interleaved-attention behaviour is
+[`.agents/verification.md`](../verification.md), but the interleaved-attention behaviour is
 upstream-gated.
 
 ### Gates
 
 1. **Correctness (SACRED), `Gemma3ForCausalLM` on `google/gemma-3-1b-it` bf16.**
    Token-exact vs the pinned vLLM 0.25.0 oracle, greedy, identical prompt set. Gate
-   form selected BY MEASUREMENT per [`near-tie-distributional-gate`](../gates.md): run
+   form selected BY MEASUREMENT per [`near-tie-distributional-gate`](../verification.md): run
    vLLM's own greedy K=5 first. A 1.0B dense model is in the small-dense near-tie
    regime (cf. Qwen3-0.6B), so a distributional (our token in vLLM's K-run set) fallback
    is *permitted only if measured*; otherwise STRICT.

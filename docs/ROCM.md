@@ -271,13 +271,13 @@ the Triton/ROCm attention path.
 
 **M4 — correctness gate.** Greedy token parity against a vLLM-ROCm oracle on the
 same hardware, same workload, following
-[.agents/gates.md](../.agents/gates.md) and the near-tie methodology. Where
+[verification procedure](../.agents/verification.md) and the near-tie methodology. Where
 vLLM's own greedy output is non-deterministic, the gate is distributional (ours
 inside vLLM's K-run set), not token-exact.
 
 **M5 — speed.** `vllm bench throughput` on the same box, quant-matched, against
 the same model. The bar is vLLM, not llama.cpp. Method and honesty rules:
-[.agents/benchmark-protocol.md](../.agents/benchmark-protocol.md) and
+[verification procedure](../.agents/verification.md) and
 [docs/BENCHMARKS.md](BENCHMARKS.md).
 
 Each milestone is a PR, or several. Do not stack M3 kernels into one change: one

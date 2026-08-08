@@ -9,7 +9,7 @@ Milestones decompose into **workable units** (one unit ≈ one focused PR an
 agent can pick up, implement, test, and ledger in a session or few). Order
 within a milestone is roughly dependency order. Every unit's Definition of
 Done (DoD) includes: mirrored-structure sources with upstream-commit headers,
-tests per [discipline.md](../discipline.md), inventory markers flipped, ledger
+tests per [discipline.md](porting-discipline-legacy.md), inventory markers flipped, ledger
 row appended, state log updated.
 
 Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.

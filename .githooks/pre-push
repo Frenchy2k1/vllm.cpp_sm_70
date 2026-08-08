@@ -24,7 +24,7 @@ ZERO='0000000000000000000000000000000000000000'
 
 # The checkers and the paths they read. Keep both lists in sync with
 # scripts/agent-preflight.sh's CHECKERS entries for the same two gates.
-CHECKERS=(check-readme-structure.py check-public-doc-tables.py)
+CHECKERS=(check-policy.py check-prompt-contract.py check-readme-structure.py check-public-doc-tables.py)
 EXPORT_PATHS=(README.md docs scripts .agents)
 
 shas=()

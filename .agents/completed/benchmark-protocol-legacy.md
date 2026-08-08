@@ -27,7 +27,7 @@ it becomes binding once the spike proves the workload/features are equivalent.
 output lengths, sampling, cache/prefix state, concurrency and serving features.
 If conversion is necessary, record it and do not turn the converted result into
 a binding floor until correctness/quality equivalence is established. Full
-matrix: [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md).
+matrix: [specs/competitive-benchmarks.md](../specs/competitive-benchmarks.md).
 
 **Cache policy is part of the workload, never an incidental default.** CUDA
 serving has at least two independent gates: a cache-neutral/cache-off workload
@@ -87,8 +87,8 @@ measured separately. Missing hardware leaves the row in `GATING` with an exact
 handoff recipe; it never converts an unmeasured milestone into `DONE`.
 
 Every feature/iteration checkpoint also updates the public
-[`README.md`](../README.md) stage and
-[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) disposition **in the same
+[`README.md`](../../README.md) stage and
+[`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) disposition **in the same
 change**. This includes an attempted benchmark that fails closed: record it as
 `FAILED` or `VOID`, name why no ratio is binding, and retain the exact next
 reproduction command. A CPU-only/non-performance feature records
@@ -110,10 +110,10 @@ checkpoint.
    serving, include the low-concurrency sweep when latency/scheduling could
    change. For new backends, the area spike fixes representative models that fit
    the hardware without pretending a small-model gate proves 27B/35B scale.
-5. **Record every axis + every ratio** in [parity-ledger.md](parity-ledger.md),
+5. **Record every axis + every ratio** in [parity-ledger.md](../parity-ledger.md),
    then refresh the concise accepted/pending/failed/void summary in
-   [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) and the current stage in
-   [`README.md`](../README.md). A ledger row that leaves ANY axis below an
+   [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) and the current stage in
+   [`README.md`](../../README.md). A ledger row that leaves ANY axis below an
    applicable floor is an open gap.
 
 ## Reproduction is a GATE
@@ -162,7 +162,7 @@ rumor; a reproducible run is evidence.
   server files may instead be evicted with `POSIX_FADV_DONTNEED` only when a
   retained report hashes that inventory and `mincore(2)` proves **zero resident
   pages** afterward; an unverified/best-effort advisory call does not qualify.
-  See [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md)
+  See [specs/competitive-benchmarks.md](../specs/competitive-benchmarks.md)
   § "Folded: spark-bench".
 
 If a result cannot be reproduced on demand under these rules, it does not count
@@ -181,5 +181,5 @@ toward the gate.
   every axis, both models**. Post-MVP backend rows additionally remain open while
   below their applicable native floor.
 
-See also: [gates.md](gates.md) (the MVP gates), [parity-lever-protocol.md](parity-lever-protocol.md)
+See also: [gates.md](mvp-gates-legacy.md) (the MVP gates), [parity-lever-protocol.md](../parity-lever-protocol.md)
 (how to find the levers to close a below-vLLM axis).

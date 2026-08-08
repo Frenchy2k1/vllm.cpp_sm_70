@@ -1,326 +1,129 @@
-# How we work — agent operating manual
+# Workflow — session, coordination, and delivery
 
-This project is structured so **any agent (or engineer) can pick it up cold**
-and continue. Follow this protocol every session.
+This is the operating method. [Policy](policy.csv) is the sole rule registry;
+this file gives executable procedure without restating a second policy source.
+Each controlled paragraph names exactly the rule it implements.
 
-## Session protocol
+## Bootstrap and authority
+
+<!-- policy-procedure:begin -->
+[POL-AUTH-REGISTRY] Treat `.agents/policy.csv` as the complete rule inventory. Use this procedure for method and the task records for facts; neither can add or weaken a registry rule.
+
+[POL-AUTH-PRECEDENCE] Resolve conflicts in this order: repository `AGENTS.md`, the applicable registry row, that row's procedure, then task evidence. Report an unresolved contradiction before changing state.
 
 <!-- role-interview:begin -->
-### First question of every session
-
-`scripts/agent-preflight.sh` fails until this session has declared a role. Ask
-what the work is — not which role the developer wants, which is vocabulary they
-should not have to learn first.
-
-**Run `scripts/agent-role.py show` before asking.** The marker is keyed on the
-WORKTREE and has no TTL, so a checkout that ever claimed carries that role into
-every later session silently, and preflight will not prompt. "First question of
-every session" is therefore first question per WORKTREE: if `show` reports a
-role this session did not choose, re-claim rather than inherit it.
-
-| What are you here to do? | Claim | What it means |
-|---|---|---|
-| A long or multi-step campaign — several changes, a benchmark grid, a whole row block | `scripts/agent-role.py claim operator` | Owns `main` and the GPU. Merges PRs first, and dispositions every PR before ending: verified-good merges in-session, superseded/irrelevant closes with a reason. Drives feature work through sub-agents rather than writing it. One at a time, repo-wide. |
-| One scoped change — a fix, a port, a single row | `scripts/agent-role.py claim helper --row <ROW-ID>` | Isolated worktree on `row/<ROW-ID>`, draft PR opened at the START. That PR **is** the claim. Never touches `main`. |
-| Just looking — reading code, answering a question | `scripts/agent-role.py claim read-only` | No lock, no worktree, no claim. Passes a plain preflight; `scripts/agent-preflight.sh --staged` refuses it. |
-
-`read-only` is a declared **absence** of claim, not a third role. Escalating is
-one command. Its refusal is NARROW, and saying otherwise would be the drift this
-manual exists to prevent: `scripts/agent-preflight.sh --staged` is the ONLY
-write path that refuses a `read-only` session. `git commit`, `git push`, the
-`gate && git push` chain (that preflight runs WITHOUT `--staged`) and every
-record or matrix edit all proceed unimpeded. Past staging, `read-only` is the
-honour system, not a guard — repo-wide write refusal is not built.
-
-Add `--headless` when the developer has said the run is unattended: decide,
-record each decision in `.agents/state.md`, never block, never merge, park what
-will not go green. Headless is **declared, never inferred** — not from the hour,
-not from silence, not from a long task.
-
-`.env` is asked **just in time**: when a gate needs a value, ask for that value
-and write it with `scripts/agent-onboard.py --env-set KEY=VALUE`. Never walk the
-whole template up front, and never infer a value from a username, a path or a
-machine identity. Unanswered means empty, and empty means the gates that need it
-stay `PENDING`.
-
-Run `scripts/agent-onboard.py --probe` to see what is still unresolved.
+[POL-BOOT-ROLE] Begin with `scripts/agent-role.py show`. If no valid role exists, ask what work the developer intends and run `scripts/agent-role.py claim operator` for a multi-step integration campaign, `scripts/agent-role.py claim helper --row <ID>` for one scoped task, or `scripts/agent-role.py claim read-only` for inspection. Add `--headless` only when the developer explicitly declares an unattended run; never infer it.
 <!-- role-interview:end -->
 
-<!-- pre-claim-intake:begin -->
-### Verify the gap before claiming or implementing
+[POL-BOOT-NOW] After role resolution, read `.agents/NOW.md` as the one-read live snapshot; consult the append-only state tail only when the task needs deeper history.
 
-An issue, roadmap row, or helper-queue result is a lead, not proof that work is
-still open. Before claiming a row or starting implementation:
+[POL-BOOT-TASK] After NOW, read only the claimed spec, owning matrix/roadmap row, coordination entry, linked evidence, and the procedures selected by applicable policy rows.
 
-1. **Search open issues and pull requests** for duplicates and active ownership.
-2. Read `.agents/NOW.md`, run `scripts/ready-for-helper.py` when applicable, and
-   read the roadmap row, its owning matrix row, and `.agents/coordination.md`.
-3. Inspect the **current code, tests, and relevant evidence anchors** and
-   **confirm that the recorded gap still exists** at the current branch head.
-4. **Record the issue/PR search and exact current code/test anchors** in the
-   committed spike or PR.
-5. If the gap has landed, is claimed, or no longer matches the record, **stop and
-   reconcile the task instead of starting duplicate work**.
-<!-- pre-claim-intake:end -->
+[POL-INTAKE-REVALIDATE] Before claiming or implementing, search current code and tests plus open issues, pull requests, NOW, coordination, and owning rows. Record exact anchors in the spike. If the gap already landed, is claimed, or no longer matches its record, stop implementation and reconcile the task first.
 
-0. **Declare your role** before anything else, if this session has not already:
-   `scripts/agent-role.py show` (exit 3 = undeclared), then the answer from the
-   interview above. A role keys on the WORKTREE, so one worktree is one role and
-   it survives the loss of a session id. Helpers then create their worktree,
-   `row/<ROW-ID>` branch and DRAFT PR immediately — the draft PR is the claim.
-   `scripts/ready-for-helper.py` lists what a helper may pick. Full protocol:
-   [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
-   The environment is asked the same way — never inferred — but per VALUE and
-   only when a gate needs it, against the `.env.example` template and
-   [environment registration](environment.md#registering-your-own-environment).
-1. **Orient**: read [NOW.md](NOW.md) FIRST — it is the one-Read resume surface
-   (live claims, current gate, next actions) and is rewritten in place every
-   checkpoint. The state tail is trustworthy only below the
-   `<!-- state-order:enforced-below -->` marker, where every entry carries a
-   sortable anchor and `scripts/check-state-order.py` proves the order; above it
-   the record is frozen history that a union merge already interleaved. Then
-   read `AGENTS.md` (index), the untracked
-   `developer-preferences.md` when present, the top-level
-   [roadmap_v1.md](roadmap_v1.md) row, its owning area matrix row,
-   [coordination.md](coordination.md), and only the current carry-forward plus
-   newest/relevant entries in [state.md](state.md). Search by stable row ID and
-   inspect the tail; do not load the append-only state or parity ledger from
-   beginning to end merely because it exists.
-2. **Claim one stable row ID for coordinated roadmap work**: when parallel
-   work is enabled or the task joins an existing claim block, add the
-   sub-agent/worktree/branch and owned files to the coordination table before
-   editing. One focused row or explicitly listed row block per PR; split
-   oversized rows in the area matrix first. A single-agent ad hoc task does not
-   create a claim merely to satisfy ceremony.
-3. **Spike first**: create `.agents/specs/<slug>.md` and move the row through
-   `INVENTORIED -> SPIKE -> READY`. The spike must cover upstream + dependency
-   dispatch, tests to port, gates, hardware, dependencies, and row-sized work.
-   Implementation must not start from a missing spike. The spike must be in the
-   reviewable change before implementation and committed before integration.
-4. **Read upstream first**: before implementing any subsystem, read the
-   upstream Python at the paths listed in
-   [porting-inventory.md](porting-inventory.md) — port, don't reinvent
-   ([discipline.md](discipline.md)).
-5. **Tests -> code**: port the upstream tests listed in the spike and use the
-   parity harness before filling implementation anchors.
-6. **Close the loop** (Definition of Done for every feature/iteration
-   checkpoint). `scripts/agent-preflight.sh --staged` runs every record gate and
-   its mutation suite in one command and prints [NOW.md](NOW.md); run it at
-   session start and again before committing. Governance, review and Git-housekeeping work runs its relevant
-   checks without claiming a feature-state change; touching a path classified
-   as a checkpoint by `check-doc-checkpoint.py` still retains that checker's
-   same-change public-document contract:
-   - `python3 scripts/check-agent-record.py` and
-     `python3 tests/scripts/test_agent_record.py` pass (canonical tables, stable
-     IDs, semantic row fields, lifecycle/spec/claim/DONE integrity, pinned
-     inventory size, and mutation proof that malformed rows fail);
-   - `python3 scripts/check-doc-checkpoint.py --staged` and
-     `python3 tests/scripts/test_doc_checkpoint.py` pass: every feature or
-     iteration checkpoint updates the obligated public surfaces below in the
-     same change, even when the honest result is pending, failed, or void;
-   - **for a SERIES of commits, additionally
-     `python3 scripts/check-doc-checkpoint.py --base origin/main --head HEAD`.**
-     `--staged` inspects the STAGED paths only, so it is VACUOUS when nothing is
-     staged — running it after `git commit` (the natural order, and what
-     `agent-preflight.sh` does) checks nothing at all. CI is DIFF-scoped over the
-     whole pushed range and checks EVERY commit independently, so a branch that
-     defers its doc update into a following `record(...)` commit passes locally
-     and fails on `main`, where the range can never be re-covered. This is not
-     hypothetical: PR #80 (Vulkan) landed eight such commits and reddened
-     `documentation-checkpoint` for its range (state log, 2026-08-07). A feature
-     commit carries its OWN STATUS/BENCHMARKS update; if the numbers are not yet
-     known, write the pending/void line with its reason;
-   - tests green (op-parity / behavioral / e2e as applicable);
-   - every feature/milestone that can plausibly affect speed, latency,
-     scheduling, memory traffic, loading, or peak memory completes its own
-     [benchmark-protocol](benchmark-protocol.md) checkpoint: same-binary
-     pre/post A/B, fresh same-box applicable floor (vLLM, llama.cpp, or the
-     backend-native oracle), correctness first, every applicable axis, and
-     2–3 uncontended reproducing runs. Do not stack a second speed-sensitive
-     milestone before the first checkpoint is recorded; unavailable hardware
-     leaves the row `GATING` with the exact handoff recipe rather than `DONE`;
-   - **committing parity goldens BEFORE their runner? In the SAME commit, add
-     the op to `PendingRunnerOps()` in `tests/parity/test_op_parity.cpp`** —
-     the harness scans golden dirs eagerly and hard-FAILs an op with no runner
-     (anti-stale-golden gate). Skipping this reddens CI until the runner lands
-     (burned us twice: M0.8 MoE, M0.9 qwen36). The runner task removes the
-     entry; the milestone close-out asserts the set is empty of its ops. Always
-     verify CI green after any commit that touches goldens when the developer
-     preferences authorize a push and CI access; otherwise return the exact CI
-     handoff.
-   - ported files carry upstream path + commit headers;
-   - [porting-inventory.md](porting-inventory.md) status markers flipped;
-   - [parity-ledger.md](parity-ledger.md) row appended (what it does vs vLLM,
-     upstream refs);
-   - owning area-matrix row has exact implementation + test/evidence anchors;
-   - [roadmap_v1.md](roadmap_v1.md) portfolio row and
-     [coordination.md](coordination.md) claim updated;
-   - **`docs/STATUS.md` per-capability status** updated at every
-     feature/iteration checkpoint — not only at feature closure: the ONE binding
-     current-state line for the capability this change moves, with its exact
-     lifecycle stage, active gaps, and next gate. **NOT `README.md`** — the
-     README is a user-facing landing page and changes only when a user-visible
-     HEADLINE shifts (new architecture family, new backend or quantization
-     format, changed headline numbers, changed pre-release caveat). A
-     family/backend becomes ✅ only when parity-tested per
-     [discipline.md](discipline.md);
-   - **`docs/FEATURES.md` row** updated in the same change whenever a
-     feature/model/backend/quantization surface moves;
-   - **[NOW.md](NOW.md) refreshed** in the same change as the `state.md` append
-     below (live claims, current gate, next actions, stamp) —
-     `scripts/check-now-current.py` gates both its budget and its freshness;
-   - **`docs/BENCHMARKS.md` benchmark disposition** updated at that same
-     checkpoint with accepted comparable numbers or an explicit
-     `PENDING`/`NOT APPLICABLE`/`FAILED`/`VOID` result and next reproduction
-     recipe; partial evidence never becomes a public ratio;
-   - all live status surfaces remain **current-state snapshots**: replace the
-     prior checkpoint instead of appending chronology, and compact any
-     accumulated superseded narratives to the binding result, exact present
-     evidence/caveat, and next action. Detailed attempt history belongs only in
-     append-only `state.md` / `parity-ledger.md`, Git, or an era-closed
-     `completed/` document. Never rewrite entries inside an open era; at a
-     roadmap/campaign boundary atomically freeze the raw files in `completed/`,
-     seed concise live carry-forward files, and repair all live links;
-   - [state.md](state.md) entry appended (what landed, what's next), below the
-     `<!-- state-order:enforced-below -->` marker and carrying a
-     `<!-- state: YYYY-MM-DD -->` anchor on the line after its heading, so the
-     tail stays genuinely newest-last. After a union merge of two worktrees'
-     appends, repair the order with
-     `python3 scripts/sort-state-tail.py --apply`;
-   - commit the completed in-scope change with the required trailers;
-   - integrate, push, open a PR, or leave the commit local exactly as selected
-     by `developer-preferences.md`. The project protocol itself grants no push,
-     merge, force-update, or remote-host authority. Opening a PR does not end
-     the obligation: a PR verified good in-session is MERGED in that same
-     session (by the operator, the only role that merges), and a PR that has
-     become irrelevant or superseded is CLOSED with a recorded reason — the
-     disposition rule in
-     [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
-     "Verified, ready to merge" is not a state a session may end in.
+[POL-CONFIG-SHARED] Resolve `.env` and `.agents/developer-preferences.md` through the shared checkout configuration described by their tracked examples; do not manufacture per-worktree alternatives.
 
+[POL-CONFIG-JIT] Request only a missing environment or permission value needed by the current gate. An empty value remains unavailable and its dependent gate remains `PENDING`.
+
+[POL-CONFIG-NO-WEAKEN] Apply preferences only to operational choices such as remote use, downloads, hosts, services, Git integration, or delegation; never use preferences to reduce correctness, evidence, attribution, lifecycle, testing, or documentation obligations.
+
+[POL-ROLE-DECLARED] Keep role state consistent with the worktree. Read-only performs no writes; a helper changes only its task branch/worktree; the operator owns integration and shared resources.
+
+[POL-HELPER-TASK] A helper claim uses one known matrix row ID or one explicit governance task ID. Reject invented, duplicate, closed, or ambiguous identifiers.
+
+[POL-HELPER-WORKTREE] Materialize helper work in the exact linked worktree and `row/<ID>` branch created for the claim. Do not reuse a foreign worktree, branch, marker, or task identity.
+
+[POL-HELPER-PR] When remote operations are authorized, open a draft PR at helper start and use its exact repository, branch, and head as the remote claim. Without authority, report the remote step as pending.
+
+[POL-REMOTE-UNKNOWN] If the remote cannot be queried or its identity cannot be established, report `REMOTE_UNVERIFIED`; unknown state is neither absence nor success and authorizes no destructive cleanup.
+
+[POL-OPERATOR-BOUNDARY] The operator coordinates feature implementation through bounded implementer and reviewer tasks, owns main integration and the GPU, and avoids writing an implementation that should be independently reviewed.
+
+[POL-PREFLIGHT] Run network-independent `scripts/agent-preflight.sh` at session start and its staged form before committing. Before remote handoff run `scripts/agent-ready.py`; before integration run `scripts/agent-integration.py --base origin/main`. A remote failure is never converted to local success. Before pushing, rerun the applicable local gate and chain success directly to the exact-SHA push; hooks are only bypassable convenience backstops, never proof.
+<!-- policy-procedure:end -->
+
+## Intake, claims, and readiness
+
+<!-- policy-procedure:begin -->
+[POL-SPIKE-FIRST] Before a row becomes `READY` or `ACTIVE`, verify the gap against current code, tests, issues, PRs, NOW, coordination, and owning records, then commit `.agents/specs/<slug>.md` with scope, upstream anchors, design, risks, tests, gates, evidence, and stop conditions.
+
+[POL-READY-SPEC] Advertise helper work only when the committed spec is reachable from the advertised base and its declared executable gate has a demonstrated failing mutation that the unmodified tree passes.
+
+[POL-READY-HARDWARE] Mark readiness with either a CPU-runnable gate or the exact required hardware, architecture, toolchain, host authorization, and contention protocol.
+
+[POL-READY-DEPS] Parse and prove dependencies complete, reject duplicate or unknown rows, and establish that no local or remote live claim already owns the task before offering it.
+
+[POL-ROW-SYNC] Whenever lifecycle state changes, update the portfolio roadmap row and its owning area matrix row in the same change with exact source, code, test, evidence, spec, state, and owner anchors.
+
+[POL-KEYED-MERGE] Reconcile keyed documents by taking the target branch version wholesale and reapplying the scoped edit. Verify unrelated keys byte-for-byte; union-append only append-only logs.
+
+[POL-EVIDENCE-PRESERVE] Compact by moving superseded detail to a clearly named file under `.agents/completed/` while retaining links and provenance. Never discard evidence to reduce context.
+<!-- policy-procedure:end -->
+
+## Implementation and delegated prompts
+
+<!-- policy-procedure:begin -->
+[POL-PROMPT-ENVELOPE] Every delegated task supplies the goal, relevant context, exact scope and exclusions, constraints, done-when conditions, required evidence, allowed authority, output contract, and stop conditions. Missing binding context produces `NEEDS_CONTEXT`.
+
+[POL-PROMPT-BOUNDARIES] Use the versioned tool-neutral contracts in `.agents/prompts/`; keep method, output fields, authority, and stop rows machine-parseable, bounded, and independent of a named agent vendor or runtime.
+
+[POL-CHECKER-CHANGE] A checker-semantics change uses a governance task naming every affected policy ID and includes a red-before test or mutation, green-after evidence, and synchronized registry and procedure changes.
+
+[POL-NO-REPORT-ONLY] For every applicable rule, record exactly one result: satisfied, narrowly waived, pending external authority/resource, or failing. A permanent report-only result never completes a task.
+
+[POL-WAIVER-EXACT] A waiver identifies one rule and one concrete task, PR, commit, path, gate, or hardware target; it names an owner, reason, evidence, and future expiry, and is used only when that rule's waiver class permits it.
+
+[POL-PATH-CLASSIFICATION] Classify policy, checker, documentation, script, test, CI, generated, binary, and product paths explicitly when computing scope. Never hide mutable files behind a blanket directory exclusion.
+
+[POL-PR-SIZE] Keep every explicit path class within its reviewed budget. Split unrelated work or cite one valid exact waiver before marking a PR ready.
+
+[POL-ONE-SURFACE] A capability reaches `DONE` only when `include/vllm.h` exposes it through the stable C ABI, implementation state flows through the shared library entry point, and CLI/server examples are thin clients of that same surface. Run `scripts/check-surface-coverage.py` and its mutation suite; a feature reachable only through example internals remains open.
+<!-- policy-procedure:end -->
+
+Implementation starts from the committed spike. Write or port the smallest
+test that fails for the intended reason, capture the red result, implement the
+minimal complete behavior, and obtain green focused tests before broader
+validation. The verification and porting procedures define their respective
+gates.
+
+## Review and disposition
+
+<!-- policy-procedure:begin -->
 <!-- orchestration-loop:begin -->
-### Running a row through sub-agents
+[POL-REVIEW-FRESH] After focused and full gates pass on an immutable head from a fresh [implementer](prompts/implementer.md), dispatch a fresh [reviewer](prompts/reviewer.md), never the agent that wrote the code, to perform both static inspection and targeted scratch mutations of the claimed guarantees—mutate, not read. Review output identifies commands, mutations, findings, and the reviewed SHA.
 
-If you claimed `operator` in the role interview above, this is the loop. It sits
-BELOW the numbered protocol on purpose: steps 0–6 apply to every role, this
-section only to an operator, and a helper skipping an operator-only heading must
-never skip "Declare your role". You decompose, dispatch, verify and integrate;
-you do not write the feature. Tasks run **serially** — never two implementers in
-one worktree.
+[POL-REVIEW-NO-REPAIR] A coordinating/operator session never repairs a reviewer finding: never fix findings yourself. Send the bounded finding and evidence to a fresh implementer, rerun focused and full gates, then use a fresh scoped reviewer.
 
-1. Dispatch a **fresh** implementer ([prompt](prompts/implementer.md)). It works
-   TDD, commits in its own worktree, and returns the SHA.
-2. **Run the row's gate yourself.** Never take the implementer's word for
-   "done": if done is the author's own opinion of its work, the loop has no
-   floor at all.
-3. Dispatch a **fresh** reviewer ([prompt](prompts/reviewer.md)) —
-   never the agent that wrote the code. Its binding instruction is to
-   **mutate, not read**: delete the line each test names, re-run, and a test
-   that stays green is a finding. Seventeen such tests are known as of
-   2026-08-06 — eleven across the two branches that built this protocol, six
-   more on this one — a gate's own default satisfied by an unrelated line, a
-   probe with five hardcoded fields, a cannot-fail rule that rejected nothing,
-   a wiring test green even with its gate in report mode — and **not one was
-   visible by reading a diff**. Read that as a dated floor, not a running
-   total: the reviewer prompt still carries the earlier floor of eleven, and
-   these counts only grow. A reviewer who reads is worth very little. The whole
-   return is in the mutation step.
-4. Findings go back to a fresh implementer, then a **scoped re-review** of the
-   fix diff only. **Never fix findings yourself** — a controller fix pollutes
-   the context that exists to coordinate, and skips review entirely.
-5. **Disposition the PR in THIS session.** When the re-review is clean and you
-   have run the row's gate green on the PR head, MERGE NOW — verification and
-   integration are one motion, and a verified-green PR left open is how the
-   2026-08-07 ten-PR backlog was built. A PR that proved superseded or out of
-   scope is CLOSED with a one-line reason on its thread. End no session with an
-   undispositioned PR among those it opened, verified, or reviewed: merged,
-   closed with its reason, or parked with its blocker named on the thread
-   ([protocol](specs/operator-helper-protocol.md)).
+[POL-OPERATOR-VERIFY] The operator independently checks the immutable head: run the row's gate yourself. Implementer or reviewer summaries are evidence inputs, not gate results.
 
-A gate command must exit nonzero on failure. Never `true`, never `echo ok`,
-never piped — `cmd | tail` reports `tail`'s status, not the command's.
-`scripts/check-gate-commands.py` pins the SET of rows that already carry a gate
-command, and it is an **exact pin**, not a shrink-only floor: a row may never
-lose one, and a row that gains one turns the suite red just the same. Any
-movement, up or down, re-pins `RUNNABLE_BASELINE` in the same change, naming the
-rows and the reason. Growth is welcome; silent growth is not.
-
-Interactive is the default. In a **declared** headless run, decide rather than
-ask, record every decision in [state.md](state.md), park what will not go
-green, and never merge — instead record each verified-green PR as
-"READY-TO-MERGE at `<sha>`" in [state.md](state.md) so the next interactive
-session's merge pass is mechanical.
+[POL-PR-DISPOSITION] After independent verification and clean review, merge the PR in that session when authorized. Close obsolete or superseded PRs with a recorded reason; otherwise record the exact external blocker. Only an explicitly declared headless run may record `READY-TO-MERGE at <sha>` for later disposition.
 <!-- orchestration-loop:end -->
 
-## Obligated public surfaces
+[POL-PR-REQUIRED] Deliver feature, policy, checker, documentation, or record changes through a PR unless one exact unexpired emergency waiver authorizes the named change.
+<!-- policy-procedure:end -->
 
-These are the surfaces `scripts/check-doc-checkpoint.py` enforces, declared here
-so the manual can never drift from the gate. `scripts/check-protocol-consistency.py`
-asserts this block equals the checker's constants and matches AGENTS.md verbatim;
-changing one without the other is a red build. `README.md` is deliberately absent
-— pointing the per-checkpoint obligation at the README is what drifted it from a
-landing page into a status log.
+## Commit, documents, and handoff
 
-<!-- doc-obligation-contract:begin -->
-| Public surface | Owed by |
-|---|---|
-| `docs/STATUS.md` | every feature/iteration checkpoint |
-| `docs/BENCHMARKS.md` | every feature/iteration checkpoint |
-| `docs/FEATURES.md` | any change to a feature/model/backend/quantization surface |
-<!-- doc-obligation-contract:end -->
+<!-- policy-procedure:begin -->
+[POL-COMMIT-TRAILERS] Every post-cutover commit uses Git-parsed `Following-Agents-Protocol: true`; assisted commits also use `AI-Assisted: true` and a syntactically valid `Assisted-by:` trailer.
 
-## Tabular lifecycle
+[POL-AI-ATTRIBUTION] Attribute assistance with `Assisted-by: AGENT:MODEL [TOOL]`. AI tools never add `Signed-off-by` or `Co-Authored-By`; the human contributor remains responsible for review and understanding.
 
-| State | Meaning | Required before entering |
-|---|---|---|
-| `INVENTORIED` | Upstream item is listed; spike is not complete | Stable ID + upstream anchor |
-| `SPIKE` | A named agent is investigating and writing the spec | Coordination claim + worktree |
-| `READY` | Spike is merged; implementation can be claimed | Real spec link + tests/gates/dependencies |
-| `ACTIVE` | Implementation is in flight | Implementation claim + owned files |
-| `GATING` | Code exists; required parity/perf gates are running | Code anchors + ported tests |
-| `PARTIAL` | Some modes work; missing modes are explicit | Code/test anchors for the working subset |
-| `DONE` | Whole row scope is merged and gated | Code + tests/evidence + spec + ledger anchor + exact closing commit |
-| `BLOCKED` | External dependency prevents progress | Concrete blocker + unblocking condition |
-| `ANCHOR-BACKFILL` | Legacy code exists but the new evidence contract is incomplete | Honest working-scope note; cannot count as `DONE` |
+[POL-DOC-STATUS] Update `docs/STATUS.md` at every feature or iteration checkpoint so each capability reports the current accepted, pending, failed, or blocked state with anchors.
 
-**`ACTIVE` carries a Git precondition, and it is GATED.**
-`scripts/audit-live-rows.py --check` runs in `scripts/agent-preflight.sh` and in
-CI, and it fails the whole repo when any row sits in `ACTIVE` with neither a
-`row/<ID>` branch carrying commits not yet on `origin/main`, nor a commit
-already on `origin/main` naming the row ID as a whole token. So materialize the
-claim (worktree + `row/<ID>` branch) before you write `ACTIVE`, and name the
-stable row ID in every commit message for that row. **When the gate is red, the
-answer is never to relax it:** either the work is real, in which case it needs
-its `row/<ID>` branch, or the row does not belong in `ACTIVE` and moves to the
-state its evidence actually satisfies (`READY` is the legality floor — see
-[specs/live-state-audit-2026-08-06.md](specs/live-state-audit-2026-08-06.md)).
-Nothing in the record teaches this reflex by example yet: zero rows currently
-classify `IN-FLIGHT`, and zero reach `LANDED` through a branch.
+[POL-DOC-BENCHMARKS] Update the keyed rows in `docs/BENCHMARKS.md` at every feature or iteration checkpoint, including accepted and current pending/failed/void results plus reproducible recipes.
 
-Support inventories retain `DONE` rows permanently. When a roadmap execution
-block has no open rows, archive its plan/report under `completed/` and point the
-portfolio row at that archive; do not erase current support evidence.
+[POL-DOC-FEATURES] Update keyed `docs/FEATURES.md` rows whenever a feature, model, backend, or quantization surface changes; keep forensic detail in the evidence record.
 
-All implementation and test/evidence anchors resolve to a permitted local path
-class and an in-range line. `DONE` uses the closing commit in `Owner`, an exact
-parity-ledger line, and a commit present in Git history. The CI mutation suite
-must prove wrong-class links, out-of-range lines, missing claims/spec identity,
-and false closure commits are rejected.
+[POL-DOC-USAGE] Update `docs/USAGE.md` when commands, C API, configuration, installation, or user workflows change, with runnable examples that use the public surface.
 
-## Practicalities
+[POL-DOC-README] Change `README.md` only for a user-visible landing-page headline, positioning, primary quick start, or top-level capability shift; routine checkpoints belong in purpose-specific docs.
 
-- Run builds and benchmarks only on hosts selected by
-  `developer-preferences.md`. Coordinated claims use distinct build/evidence
-  directories and the selected `${GPU_LOCK}` policy whenever work may contend.
-  A sole owner may run correctness work lock-free after verifying idleness if
-  the preference file permits it; every benchmark/A-B/profile sequence remains
-  uncontended and holds one exclusion mechanism across all arms. Compilation,
-  read-only device inspection and file transfer do not require a GPU lock.
-  Ettore-host examples and model locations are factual entries in
-  [environment.md](environment.md), not defaults for other developers.
-- Benchmarks are honest: same box, same model files, request-rate sweeps,
-  report TTFT/ITL/throughput; no cherry-picking. Numbers go in the ledger.
-- Upstream sync procedure: [upstream-sync.md](upstream-sync.md). When syncing,
-  add newly-landed upstream features to the inventory with vLLM PR refs.
-- Blocked or made a judgment call? Record it in state.md so the next session
-  (or the user) sees it.
+[POL-NOW-COUPLING] Treat `.agents/NOW.md` as a bounded live snapshot, not a log. Rewrite it in the same change as every `.agents/state.md` append.
+
+[POL-STATE-ORDER] Append state entries below `<!-- state-order:enforced-below -->` with a sortable date anchor in oldest-to-newest order; repair interleaving with `scripts/sort-state-tail.py --apply`.
+<!-- policy-procedure:end -->
+
+An unfinished-work handoff records the immutable head, live claim, exact source
+and evidence roots, commands and results, prohibitions, blocker, and first
+resume command in state/coordination, with NOW refreshed when state changes.

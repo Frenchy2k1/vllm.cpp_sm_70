@@ -85,7 +85,7 @@ exact-equivalence preflight, NOT on SGLang runnability.
 
 ---
 
-## 3. The correctness gate (SGLang analogue of gates.md)
+## 3. The correctness gate (SGLang analogue of verification.md)
 
 **Same ratified near-tie methodology as the vLLM oracle** (MEMORY:
 [[near-tie-distributional-gate]]). SGLang is stood up as a greedy token capturer
@@ -119,11 +119,11 @@ AND vs vLLM on the shared model, with the DISTINCT-behavior A/B token-neutral.
 
 ---
 
-## 4. The performance gate (SGLang analogue of benchmark-protocol.md)
+## 4. The performance gate (SGLang analogue of verification.md)
 
 **Every-axis, same workload, idle box, reproduced — identical rigor to the vLLM
 perf gate.** SGLang is the binding floor wherever it is faster
-([benchmark-protocol.md](../benchmark-protocol.md) "Additional competitor floor").
+([verification.md](../verification.md) "Additional competitor floor").
 
 - **Axes (all of them, both gate models where they fit):** total + output
   throughput, req/s (higher-is-better, ours ≥ SGLang); TTFT, TPOT/ITL
@@ -136,7 +136,7 @@ perf gate.** SGLang is the binding floor wherever it is faster
   capacity, warmup, request order, and a MEASURED hit/reuse proof. For hybrid
   Qwen cache-ON, vLLM must be run with `mamba_cache_mode=align` — comparing
   SGLang's default radix cache against vLLM's default-off hybrid policy is a
-  configuration comparison and cannot bind (benchmark-protocol.md §cache).
+  configuration comparison and cannot bind (verification.md §cache).
 - **Equivalence preflight is a precondition (the existing P1/P2 work).** Before
   any number binds, prove same model/quant, same prompt tokens + token-ID
   counts, same sampling, same concurrency, same cache capacity/policy, same

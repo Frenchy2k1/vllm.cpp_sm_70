@@ -25,7 +25,7 @@ a per-developer profile, not a per-session decision.
 
 Every piece of this already exists as prose or tooling. None of it fires.
 
-- `.agents/specs/operator-helper-protocol.md` already says the session "ASKS
+- `.agents/workflow.md` already says the session "ASKS
   before doing anything else", and explains why derivation cannot work: several
   sessions launch from the same checkout, so nothing distinguishes them until a
   role has already been taken.
@@ -89,7 +89,7 @@ answer, and the answer is something the developer already knows.
 `read-only` is **not a third role.** It is a declared *absence* of claim,
 recorded so the gate can tell "decided not to claim" from "never asked". The
 two-role model in
-[operator-helper-protocol.md](operator-helper-protocol.md) is unchanged.
+[operator-helper-protocol.md](../workflow.md) is unchanged.
 
 It exists because the alternative punishes the most common session. Forcing a
 question-answering session to claim `operator` would take the repo-wide lock and

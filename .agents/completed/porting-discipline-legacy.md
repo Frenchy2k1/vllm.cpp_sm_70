@@ -91,4 +91,4 @@
   vs logits/greedy-decode, server vs OpenAI conformance. Upstream vLLM
   (Python) is a test-time oracle only — never a runtime dependency.
 - **We port Model Runner V2** (`vllm/v1/worker/gpu/`), not the legacy runner —
-  see [vllm-v1-v2.md](vllm-v1-v2.md).
+  see [vllm-v1-v2.md](../vllm-v1-v2.md).

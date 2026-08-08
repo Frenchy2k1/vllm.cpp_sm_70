@@ -359,7 +359,7 @@ Named cases mapped to work rows (the ones that drive design, not the full 56):
   `test_cache_hit_local_and_external*` (`:3524`, `:3645`, `:3656`, `:3682`) —
   SKIP-marked to `KV-EXTERNAL-CACHE`.
 
-Per [test-porting.md](../test-porting.md):6, every case that cannot pass yet is
+Per [porting.md](../porting.md):6, every case that cannot pass yet is
 checked in SKIPPED with a tracked row reason — the convention already used at
 `tests/vllm/v1/test_single_type_kv_cache_manager.cpp:1050-1086` — never dropped.
 
@@ -383,7 +383,7 @@ checked in SKIPPED with a tracked row reason — the convention already used at
 5. **Every-axis performance (W3, W6, W9 — DGX GB10):** match or beat vLLM on
    total and output throughput, req/s, TTFT, TPOT/ITL and peak memory at the
    large-concurrency operating point, per
-   [benchmark-protocol.md](../benchmark-protocol.md). A caching change that
+   [verification.md](../verification.md). A caching change that
    raises hit rate but regresses ANY axis is a failed change, not a win. Where
    SGLang is the faster applicable reference, it binds too
    (`BACKEND-GATE-CUDA-SGLANG-PREFIX`).

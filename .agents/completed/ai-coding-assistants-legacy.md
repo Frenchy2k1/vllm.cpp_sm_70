@@ -38,7 +38,7 @@ an unreviewed change. If you cannot explain and defend a line, do not submit it.
 
 Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`. This is a
 deliberate speed-bump: it asserts the contributor has **read
-[AGENTS.md](../AGENTS.md)** and follows this project's protocol (mirror vLLM,
+[AGENTS.md](../../AGENTS.md)** and follows this project's protocol (mirror vLLM,
 ground every check in vLLM source, compare vs the vLLM oracle on the identical
 workload, keep the parity ledger updated, etc.). CI (`commit-protocol-tag` in
 `.github/workflows/ci.yml`) rejects any commit lacking it, so a contributor who

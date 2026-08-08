@@ -290,13 +290,13 @@ bit-reproducibility, `NoContraction` is the lever.
 `BACKEND-GATE-VULKAN-LLAMACPP` / `BENCH-VK-LLAMA` activate at `VK-E`:
 
 - **Same device** (GB10), **same GGUF file**, **same workload**, under
-  [benchmark-protocol.md](../benchmark-protocol.md), holding `${GPU_LOCK}`.
+  [verification.md](../verification.md), holding `${GPU_LOCK}`.
 - Competitor is **llama.cpp built with its Vulkan backend**, pinned at
   `237ad9b96` — the same commit we port from. `llama-bench` + server.
 - **Three columns are recorded every time, not one:** ours-Vulkan,
   llama.cpp-Vulkan, and **ours-CUDA on the same box**. The third is free (same
   binary, same box, already wired) and it is the honest ceiling context — see §0.
-- Per [benchmark gate statistics](../benchmark-protocol.md): calibrate bands from
+- Per [benchmark gate statistics](../verification.md): calibrate bands from
   noise, discard cold first legs, reproduce 2-3x on an idle box. **Wall-clock e2e
   on GB10 swings with reload** — use steady-state or `ncu`-anchored measurement.
 
@@ -472,7 +472,7 @@ landed rather than re-deriving it. Item 8 is `VK-A1`'s (§6) and `VK-C`'s.
 
 ## 7. Tests
 
-Per [test-porting.md](../test-porting.md). Vulkan has **no upstream vLLM tests to
+Per [porting.md](../porting.md). Vulkan has **no upstream vLLM tests to
 port** — the inventory is explicit about reuse vs. new authorship.
 
 | Test | Disposition |

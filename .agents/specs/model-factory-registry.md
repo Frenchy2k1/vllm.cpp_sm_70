@@ -106,7 +106,7 @@ unimplemented arch; no capability metadata; no generic factory test.
 
 | Upstream surface | Local destination | Notes / deviations |
 |---|---|---|
-| `_ModelRegistry` + `models` dict + `resolve_model_cls` loop | new `include/vllm/model_executor/models/model_registry.h` + `src/vllm/model_executor/models/model_registry.cpp` (supersede the thin `registry.{h,cpp}`) — `ModelFactory`, `ModelRegistry::Resolve(const HfConfig&)`, `SupportedArchs()` | type-erased factory returns a `LoadedModel` the runner/loader hold behind an interface; files carry the upstream `file:line` header per discipline.md |
+| `_ModelRegistry` + `models` dict + `resolve_model_cls` loop | new `include/vllm/model_executor/models/model_registry.h` + `src/vllm/model_executor/models/model_registry.cpp` (supersede the thin `registry.{h,cpp}`) — `ModelFactory`, `ModelRegistry::Resolve(const HfConfig&)`, `SupportedArchs()` | type-erased factory returns a `LoadedModel` the runner/loader hold behind an interface; files carry the upstream `file:line` header per porting.md |
 | `_raise_for_unsupported` (`registry.py:1051-1082`) | `RaiseForUnsupported(archs, supported)` in the same TU | strings byte-identical; assert against oracle in a T-parity test |
 | `_PREVIOUSLY_SUPPORTED_MODELS`, `_OOT_SUPPORTED_MODELS` (`registry.py:701-743`) | static `const` maps in `model_registry.cpp` | ported verbatim (32 + 4 entries); refreshed by the upstream-sync cycle |
 | `_ModelInfo` consumed subset (`registry.py:746-796`) | `struct ModelInfo` (POD) attached to each registration | only fields our loader/runner read; extend as task rows land |
@@ -138,7 +138,7 @@ unimplemented arch; no capability metadata; no generic factory test.
   is replaced by `ModelRegistry::Resolve`, BOTH gate models stay token-exact —
   re-run the merged greedy gates (35B MoE + 27B dense, 16/16 token-for-token vs
   the pip-vLLM oracle) and confirm no throughput/memory regression per the
-  every-axis rule ([gates.md](../gates.md), [benchmark-protocol.md](../benchmark-protocol.md)).
+  every-axis rule ([verification.md](../verification.md), [verification.md](../verification.md)).
 - **CI:** `tests/vllm/models/test_model_registry.cpp` green on CPU;
   `python3 scripts/check-agent-record.py` + `python3 tests/scripts/test_agent_record.py` green.
 - **First family (its own leaf, not this row):** e2e token-exact 16/16 vs oracle on
@@ -209,7 +209,7 @@ as the first new family:
   near-zero new kernel work — the ideal shakedown for reject-unknown + the
   per-family plug-in.
 - **Cheap, CI-friendly oracle.** Tiny Llama checkpoints (TinyLlama, Llama-3.2-1B)
-  run on CPU in CI and under the pinned vLLM oracle, matching gates.md's
+  run on CPU in CI and under the pinned vLLM oracle, matching verification.md's
   "CI-runnable on CPU (0.6B model)" pattern for a token-exact gate.
 
 ## Risks/decisions

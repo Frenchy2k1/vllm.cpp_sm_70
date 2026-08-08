@@ -244,7 +244,7 @@ is or becomes `DONE`; the two Qwen rows stay `PARTIAL` and the Gemma-4 rows move
 to `SPIKE` with a BLOCKED-for-now verdict.
 
 ### Tests to port (inventory only — nothing ported here)
-Per [`.agents/test-porting.md`](../test-porting.md):
+Per [`.agents/porting.md`](../porting.md):
 | Upstream test | Tier | Ours (increment) |
 |---|---|---|
 | `tests/multimodal/test_processing.py` (processor + placeholder expansion) | T-unit | processor-parity vs vLLM's processor output (M1) |

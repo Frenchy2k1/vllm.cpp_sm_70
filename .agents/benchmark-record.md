@@ -10688,7 +10688,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   performance or broader roadmap execution.
 
 The complete contract is in the
-[benchmark protocol](benchmark-protocol.md) and
+[benchmark protocol](verification.md) and
 [online serving gate spec](specs/cuda-online-serving-gate.md).
 
 **Breadth sweep note (2026-07-21):** the active phase is model-architecture breadth (recent-first), each held to token-exact + vLLM-speed on every axis. Ranked queue + CUDA-arch additivity audit: [.agents/specs/breadth-sweep-plan.md](specs/breadth-sweep-plan.md). CUDA archs beyond same-family sm_120 are HW-blocked (only GB10 testable).
@@ -15124,7 +15124,6 @@ llama.cpp's Vulkan" when it is really "our CPU tier vs llama.cpp's Vulkan". The
 comparison becomes meaningful when native coverage closes — the progress metric is
 `vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
 the RoPE table build, the sampler tail, and the remaining norm/glue set.
->>>>>>> 814230a0 (bench(vulkan): VK-E unblocked with identical weights; ours quoted as NO RATIO)
 
 #### CORRECTION (2026-08-07, same session): the vllm.cpp Vulkan arm is GPU-BOUND, not CPU-bound
 

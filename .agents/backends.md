@@ -107,12 +107,12 @@ upstream platform PR ports mechanically.
 
 ## Non-negotiables
 
-- The NVIDIA gate (see [gates.md](gates.md)) is not delayed by portability
+- The NVIDIA gate (see [verification.md](verification.md)) is not delayed by portability
   work: M0.2 bakes the interface requirements above (cheap now, unpayable
   later); backend implementations are post-MVP.
 - A new backend lands like any port: parity harness (same golden dumps —
   they are backend-independent), behavioral suites unchanged, benchmark
-  honesty per [benchmark-protocol.md](benchmark-protocol.md). `DONE` additionally
+  honesty per [verification.md](verification.md). `DONE` additionally
   requires match-or-beat against the applicable native floor: llama.cpp for
   CPU/GGUF and Vulkan, oMLX/MLX-LM for Apple MLX, production vLLM for its native
   platforms, plus the SGLang low-concurrency CUDA sweep. The canonical status
