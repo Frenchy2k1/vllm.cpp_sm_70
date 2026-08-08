@@ -15982,3 +15982,72 @@ loads, or caching the K/V slice across the query heads that share a KV head —
 Recorded because the hypothesis was specific and the refutation is reusable: this
 is the second kernel this session where a barrier-count argument looked compelling
 and measured flat (the subgroup GEMV was the first).
+
+### ★ RAGGED M: a one-line predicate was costing 21.5x on prefill (2026-08-08, GB10)
+
+The largest win of this campaign, and it was self-inflicted.
+
+**How it was found.** Two GDN increments moved coverage 11 -> 3 and speed not at
+all, so a prefill-dominated run was profiled with GPU timestamps:
+
+    vt_matmul   433 calls   409,611.9 ms   99.9% of GPU   945.99 ms/call
+
+The UNTILED SCALAR kernel — the portable correctness tier — was carrying every
+prefill GEMM at ~96 GFLOP/s, roughly **1% of what GB10 can do**. GPU busy was 95%
+of wall, so prefill was never host-bound, and the remaining reference-tier ops
+accounted for ~0.1%. **Three prior structural attributions were wrong; the
+timestamp profile settled it in one run.**
+
+**Why coopmat declined, measured not reasoned.** Both obvious candidates were
+excluded by reading the source: every dimension is a whole tile (5120, 17408,
+256) and activations are bf16 (`DBuf dx(d, DType::kBF16, ...)`). The predicate had
+to be made to report itself, gated behind `VT_VULKAN_DISPATCH_STATS`:
+
+    coopmat DECLINED: M is not a multiple of 16  (a.dtype=2 b.dtype=2 m=17 k=5120 n=10240)
+
+**`m = tokens + 1`.** A 512-token prompt gives m=513, and `513 % 16 == 1`. Every
+prefill GEMM, at every prompt length, fell to the scalar kernel.
+
+**The cause was my own hang fix from the previous day.** `coopMatLoad` reads a
+full 16x16 tile unmasked, so at M=1 it read ~30 KB past the activation buffer and
+the fence never signalled. That was fixed by requiring `m % 16 == 0 && n % 16 ==
+0` — correct, and it is why the 27B runs at all instead of hanging. The note left
+at the time read *"a masked/padded load is the better long-term answer, not
+attempted here."* That deferred work WAS the prefill bottleneck. It went unnoticed
+because the only model then running on Vulkan was opt-125m, whose small GEMMs made
+the scalar path cheap.
+
+**The fix: shift the trailing tile back, do not mask.** A tile that would overrun
+M slides down to start at `M-16`, so it reads only REAL rows. Exact, not
+approximate: a result row depends solely on that row of A and on B, never on which
+tile computed it, so the rows shared with the previous tile recompute to
+bit-identical values and the duplicate stores write the same bytes. It needs
+`M >= 16`, which the predicate now requires in place of `M % 16 == 0`; below that
+there is no in-bounds 16-row window, and decode (M=1) is served by the GEMV
+tactic.
+
+**MEASURED, GB10, Qwen3.6-27B, 512-token prefill:**
+
+| | before | after | |
+|---|---:|---:|---:|
+| GEMM ms/call | 945.99 | 30.40 | **31.1x** |
+| prefill tok/s | 1.18 | 25.41 | **21.5x** |
+| E2E ms | 433,321 | 20,192 | **21.5x** |
+
+`vt_matmul` is gone from the profile; `vt_matmul_coopmat` carries 432 calls at
+30.4 ms. 21.5x is far outside this box's 2.1x noise band, so it is callable at
+n=1. A 512-token prefill is now **20.1 s against llama.cpp's ~1.1 s — 18x behind,
+down from 244x.**
+
+**Gate: 26/26, 1563 assertions on GB10.** The new ragged-M case asserts the TACTIC
+(`PipelineExistsFor("vt_matmul_coopmat")`) and exactness at M=17, and it
+short-circuits on llvmpipe, which has no coopmat — the local run shows 1020
+assertions, the GB10 run 1563. A gate that cannot run on the CI device has to be
+run on the device that has the feature, or it proves nothing.
+
+**The durable lesson: a correctness fix can silently become a performance cliff,
+and a selection predicate that can route an entire model onto the correctness tier
+should be able to SAY SO.** Reading the source excluded the two candidates a human
+would guess and pointed at neither; the predicate's own report named it
+immediately. That diagnostic now ships behind the stats flag.
+

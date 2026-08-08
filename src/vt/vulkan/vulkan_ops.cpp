@@ -32,6 +32,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,12 @@
 
 namespace vt::vulkan {
 namespace {
+
+// Gated on the same flag as the dispatch profile; costs nothing when unset.
+const bool kCoopMatWhy = [] {
+  const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
+  return v != nullptr && std::strcmp(v, "0") != 0;
+}();
 
 // Storage dtype -> the shader-side code (vt_common.glsl VT_DT_*).
 uint32_t DtypeCode(DType d) {
@@ -478,6 +486,41 @@ bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k, int64_t m,
   if (kDisabled) return false;
 
   const VulkanContext& ctx = VulkanContext::Get();
+
+  // WHY IT DECLINED, reported once per distinct reason under
+  // VT_VULKAN_DISPATCH_STATS. A 27B prefill measured 99.9% of GPU time in the
+  // UNTILED SCALAR kernel at ~96 GFLOP/s -- roughly 1% of what this device can do
+  // -- because this predicate was returning false for every GEMM, and reading the
+  // source did not reveal which clause. Shapes were whole tiles and activations
+  // were bf16, so the obvious two candidates were both excluded by inspection and
+  // the answer still had to be measured. A selection predicate that can silently
+  // route an entire model onto the correctness tier should be able to say so.
+  if (kCoopMatWhy) {
+    const char* why = nullptr;
+    if (!ctx.coopmat_bf16_f32()) why = "device reports no bf16->f32 16x16x16 SUBGROUP config";
+    else if (ctx.subgroup_size() != 32) why = "subgroup size is not 32";
+    else if (a.dtype != DType::kBF16) why = "operand a is not bf16";
+    else if (b.dtype != DType::kBF16) why = "operand b is not bf16";
+    else if (k % 16 != 0) why = "K is not a multiple of 16";
+    else if (m < 16) why = "M is below one 16-row tile";
+    else if (n % 16 != 0) why = "N is not a multiple of 16";
+    if (why != nullptr) {
+      static std::mutex seen_mu;
+      static std::set<std::string> seen;
+      std::string key = std::string(why) + "|" + std::to_string(static_cast<int>(a.dtype)) +
+                        "," + std::to_string(static_cast<int>(b.dtype));
+      std::lock_guard<std::mutex> g(seen_mu);
+      if (seen.insert(key).second) {
+        std::fprintf(stderr,
+                     "[vt vulkan] coopmat DECLINED: %s  (a.dtype=%d b.dtype=%d "
+                     "m=%lld k=%lld n=%lld)\n",
+                     why, static_cast<int>(a.dtype), static_cast<int>(b.dtype),
+                     (long long)m, (long long)k, (long long)n);
+        std::fflush(stderr);
+      }
+    }
+  }
+
   return ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32 &&
          a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0 &&
          // M AND N MUST ALSO BE WHOLE TILES. `coopMatLoad` reads a FULL 16x16
@@ -493,7 +536,18 @@ bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k, int64_t m,
          // inside the allocation and its garbage rows were discarded by the
          // bounds-checked store. Raggedness alone was not enough; the read has to
          // leave the allocation to fault.
-         m % 16 == 0 && n % 16 == 0;
+         //
+         // M NEED ONLY BE AT LEAST ONE WHOLE TILE, not a multiple of one. The
+         // shader slides a trailing tile back to start at M-16, so every read
+         // stays in bounds and the shared rows recompute to identical values.
+         //
+         // Requiring m % 16 == 0 here is what fixed the original hang, and it
+         // MEASURED as the entire prefill bottleneck: prompt length gives
+         // m = tokens + 1, so 513 % 16 == 1 sent every 27B prefill GEMM to the
+         // untiled scalar kernel -- 99.9% of GPU time at ~96 GFLOP/s, about 1% of
+         // this device. N stays whole because a ragged N would need the same
+         // treatment on the B operand and no shape in play needs it.
+         m >= 16 && n % 16 == 0;
 }
 
 // GEMV TACTIC SELECTION (VK-F). Same shape of contract as the coopmat predicate
