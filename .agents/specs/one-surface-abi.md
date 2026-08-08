@@ -186,3 +186,19 @@ defaulted to the host-f32 GGUF arm — it now shares the ratified recipe
 HTTP-vs-CLI drift this row exists to prevent; (3) multi-image ref2va on the
 ABI. Laguna/DeepSeek/Kimi fast decode, embeddings and multimodal input remain
 open rows of this program.
+
+### ROW 2 device-selection follow-up (`row/ARCH-ONE-SURFACE`, PR #135; replaces #134)
+
+The ABI-v12 fold introduced two literal `GetBackend(kCUDA)` calls in the shared
+H3 seam. That violated the already-landed accelerator seam and raised the DSR
+`kcuda` bucket from its hard floor 0 to 2. The repair keeps the public contract
+exactly 0=CPU / 1=CUDA, maps it once through `MiniMaxH3VideoDeviceType`, and
+creates one queue through `GetBackend(device_type)`; the queue's device is then
+the engine device. The DSR gate is RED-first (34 vs baseline 32), then GREEN at
+32 with no baseline or allowlist change; all 25 checker mutations pass. Review
+also mutation-gates the operational contract through the real load path: a
+counting CUDA backend returns a distinctive CPU:7 queue, and the loaded engine
+must report that exact device after exactly one `CreateQueue` call. The original
+second-queue mutation was false-GREEN at 5/135, then RED at `2 == 1`; deleting
+the queue-device reuse is independently RED. The final CPU fold target is GREEN
+at 6 cases / 137 assertions in the isolated `/dev/shm` build.
