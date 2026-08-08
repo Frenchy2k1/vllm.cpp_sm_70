@@ -1,0 +1,81 @@
+#version 450
+// vt::GdnStateGather — pull the per-request GDN conv/SSM state rows named by
+// state_idx out of the paged cache into a compact f32 working buffer, zeroing
+// the rows whose request has no initial state.
+// Ported 1:1 from src/vt/cpu/cpu_ops.cpp:1666-1707 GdnStateGatherKernel.
+//
+// ONE INDEXING PATH, NOT TWO. The CPU kernel splits into a "contiguous fast
+// path" (cache_inner == work_inner) and a widened-cache path that walks the
+// `mid` channels with the cache row's PHYSICAL stride. The widened form is a
+// strict generalization — at cache_inner == work_inner it computes the same
+// addresses, because mid * work_inner == work_row — so this shader implements
+// only that one and the split disappears. The fast path exists on the CPU to
+// avoid a division in the inner loop; here the division is already paid by the
+// flat gid decomposition.
+//
+// THE CPU'S RANGE CHECK CANNOT BE REPRODUCED AS A THROW. cpu_ops.cpp:1671-1675
+// VT_CHECKs every index against cache.shape[0] before copying, which needs a
+// HOST read of state_idx — and on this backend a host read of device memory is
+// only correct after draining the dispatch batch (vulkan_context.h § FlushBatch),
+// so validating that way would serialize every call. The device analogue is the
+// bounds guard below: an out-of-range or negative index makes the invocation
+// write NOTHING, which is the safe direction (a stale working row) rather than a
+// wild write into another request's cache page. n_cache_rows travels in the push
+// constants precisely so the guard is a real bound and not a formality.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Wb32 { uint v[]; } WK32;          // working (f32 out)
+layout(binding = 1) buffer Wb16 { uint16_t v[]; } WK16;
+layout(binding = 2) readonly buffer Cb32 { uint v[]; } C32;  // cache
+layout(binding = 3) readonly buffer Cb16 { uint16_t v[]; } C16;
+layout(binding = 4) readonly buffer Ib { uint v[]; } IDX;    // state_idx, i32
+// has_initial_state, i8 OR i32, read through the 32-bit view. Aliases IDX when
+// the caller passed none (p.his_mode == 0) — a descriptor a shader statically
+// uses must be valid even on the path that never reads it, the same arrangement
+// vt_rms_norm uses for its optional residual.
+layout(binding = 5) readonly buffer Hb { uint v[]; } HIS;
+
+layout(push_constant) uniform Params {
+  uint rows;         // state_idx.shape[0]
+  uint work_row;     // working.Numel() / rows
+  uint work_inner;   // working.shape[rank-1]
+  uint cache_inner;  // cache.shape[rank-1]   (>= work_inner)
+  uint cache_row;    // mid * cache_inner — the PHYSICAL cache row width
+  uint n_cache_rows; // cache.shape[0], for the bounds guard
+  uint work_dt, cache_dt;
+  uint his_mode;     // 0 = absent, 1 = i8, 2 = i32
+  uint work_off, cache_off, idx_off, his_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.rows * p.work_row) { return; }
+  uint r = gid / p.work_row;
+  uint e = gid % p.work_row;
+
+  int ci = int(IDX.v[(p.idx_off >> 2) + r]);
+  if (ci < 0 || uint(ci) >= p.n_cache_rows) { return; }  // see the header note
+
+  bool keep = true;
+  if (p.his_mode == 1u) {
+    // i8: byte r of the buffer. Indexing the 32-bit view by BYTE ADDRESS is
+    // exact here because every buffer is bound WHOLE at offset 0
+    // (vt_common.glsl § STORAGE MODEL), so no 4-byte alignment of his_off is
+    // assumed — an i8 [N] tensor may legitimately start at any byte.
+    uint byte_addr = p.his_off + r;
+    keep = ((HIS.v[byte_addr >> 2] >> (8u * (byte_addr & 3u))) & 0xFFu) != 0u;
+  } else if (p.his_mode == 2u) {
+    keep = HIS.v[(p.his_off >> 2) + r] != 0u;
+  }
+
+  uint m = e / p.work_inner;   // channel / head within the row
+  uint ee = e % p.work_inner;  // element within the channel's sub-window
+  uint src = uint(ci) * p.cache_row + m * p.cache_inner + ee;
+  uint dst = r * p.work_row + e;
+
+  VT_STORE(WK32, WK16, p.work_dt, p.work_off, dst,
+           keep ? VT_LOAD(C32, C16, p.cache_dt, p.cache_off, src) : 0.0);
+}
