@@ -1,0 +1,2 @@
+waiver_id,rule_id,scope,owner,reason,evidence,expires
+WAIVER-PR-SIZE-001,POL-PR-SIZE,pr:128,maintainer,One-time policy consolidation and evidence-preserving archive migration exceeds the procedure and governance-test class budgets,PR-128 policy migration,2026-08-15

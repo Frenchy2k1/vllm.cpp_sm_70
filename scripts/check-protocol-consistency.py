@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
-"""Keep the protocol prose and the checkers that enforce it in agreement.
+"""Keep structured policy consumers and their protocol artifacts consistent.
 
-The failure this exists to prevent is real and already happened: the
-same-change public-document obligation was migrated from README.md to
-docs/STATUS.md in scripts/check-doc-checkpoint.py, AGENTS.md was updated, and
-`.agents/workflow.md` -- the operating manual an agent is told to follow every
-session -- was not. For a while the manual instructed agents to update README.md
-at every checkpoint, which is exactly the drift the migration removed. Prose and
-checker disagreed, and the prose is what agents actually read.
-
-So the obligated surfaces are declared ONCE, as a machine-readable contract
-block that both documents carry verbatim, and this gate asserts the block equals
-the constants in scripts/check-doc-checkpoint.py. Changing the checker without
-changing the prose (or the reverse) is a red build, not a silent divergence.
-
-The contract block looks like this, and is a normal Markdown table to a reader:
-
-    <!-- doc-obligation-contract:begin -->
-    | Public surface | Owed by |
-    |---|---|
-    | `docs/STATUS.md` | every feature/iteration checkpoint |
-    <!-- doc-obligation-contract:end -->
+Public-document obligations are controlled policy rows. The document checker
+fully parses their stable ID, exact scope, semantic trigger, positive action,
+and enforcement list; explanatory details remain in procedures.
 
 The same gate now also asserts that `.agents/workflow.md` carries the ROLE
 INTERVIEW, between `<!-- role-interview:begin -->` and its `:end`. That is the
@@ -38,18 +21,9 @@ that the controller runs the row's gate itself instead of taking the
 implementer's word, or that findings are never fixed in the controller's own
 session.
 
-The same gate finally asserts that the sub-agent prompts under `.agents/prompts`
-exist and still carry their binding instructions. Every Important finding across
-two branches of this project came from an INDEPENDENT reviewer sub-agent, none
-from an implementer's self-review, and the reviewers found them by MUTATING code
-rather than reading diffs: eleven tests passed with the thing they named
-deleted, and not one was visible by reading. That instruction is the deliverable,
-so it is tracked and pinned phrase by phrase, not merely present as a file.
-
-Before any claim or implementation, the same two normative documents also
-carry one verbatim PRE-CLAIM INTAKE block. It prevents a roadmap description or
-issue from being treated as proof that a gap still exists without checking the
-live claims, code, tests, and evidence first.
+The same gate finally runs the closed runtime-prompt grammar. Phrase presence
+cannot establish a method contract: contradictory prose may retain every
+required phrase. The semantic validator therefore parses every nonempty line.
 """
 
 from __future__ import annotations
@@ -61,46 +35,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-# Both documents must carry the contract, because both are read as normative:
-# AGENTS.md is the canonical index, workflow.md is the session operating manual.
-CONTRACT_DOCUMENTS = ("AGENTS.md", ".agents/workflow.md")
-
-INTAKE_DOCUMENTS = CONTRACT_DOCUMENTS
-INTAKE_BEGIN = "<!-- pre-claim-intake:begin -->"
-INTAKE_END = "<!-- pre-claim-intake:end -->"
-INTAKE_REQUIRED = (
-    "Before claiming a row or starting implementation",
-    "Search open issues and pull requests",
-    ".agents/NOW.md",
-    "scripts/ready-for-helper.py",
-    "roadmap row",
-    "owning matrix row",
-    ".agents/coordination.md",
-    "current code, tests, and relevant evidence anchors",
-    "confirm that the recorded gap still exists",
-    "Record the issue/PR search and exact current code/test anchors",
-    "reconcile the task instead of starting duplicate work",
-)
-INTAKE_BODY = """
-### Verify the gap before claiming or implementing
-
-An issue, roadmap row, or helper-queue result is a lead, not proof that work is
-still open. Before claiming a row or starting implementation:
-
-1. **Search open issues and pull requests** for duplicates and active ownership.
-2. Read `.agents/NOW.md`, run `scripts/ready-for-helper.py` when applicable, and
-   read the roadmap row, its owning matrix row, and `.agents/coordination.md`.
-3. Inspect the **current code, tests, and relevant evidence anchors** and
-   **confirm that the recorded gap still exists** at the current branch head.
-4. **Record the issue/PR search and exact current code/test anchors** in the
-   committed spike or PR.
-5. If the gap has landed, is claimed, or no longer matches the record, **stop and
-   reconcile the task instead of starting duplicate work**.
-"""
-
-BEGIN = "<!-- doc-obligation-contract:begin -->"
-END = "<!-- doc-obligation-contract:end -->"
+from scripts.policy_contract import PolicyRule, load_policy
 
 # The session manual must carry the role interview, because agent-preflight.sh
 # now FAILS a session that has not declared a role. A gate whose precondition is
@@ -111,8 +49,8 @@ INTERVIEW_DOCUMENT = ".agents/workflow.md"
 INTERVIEW_MARKER = "<!-- role-interview:begin -->"
 INTERVIEW_REQUIRED = ("claim operator", "claim helper --row", "claim read-only", "--headless")
 
-# The same manual must carry the operator's LOOP. The prompts in PROMPT_REQUIRED
-# below are handed to sub-agents; nothing told the operator how to run one, and
+# The same manual must carry the operator's LOOP. The prompts handed to
+# sub-agents cannot by themselves tell the operator how to run one, and
 # the three rules that carry the whole return are exactly the ones an operator
 # improvises away: dispatch a FRESH reviewer whose instruction is to MUTATE,
 # run the row's gate YOURSELF rather than believing the author's report, and
@@ -134,52 +72,38 @@ LOOP_REQUIRED = (
     "never fix findings yourself",
 )
 
-# The reviewer prompt's value is the MUTATION instruction; a reviewer told only
-# to "review" reads the diff, and reading found none of the eleven tests that
-# passed with their subject deleted. Pin the instruction, not the file.
-#
-# The reviewer needle is the full "mutate, don't read", not a bare "mutate":
-# the prompt also says "never mutate the reviewed worktree" further down, so the
-# short form would stay satisfied by an unrelated sentence after the binding
-# instruction was deleted. That is the same "an unrelated line satisfied the
-# assertion" failure the prompt itself is written to catch.
-#
-# Two needles pin REPAIRS to earlier drafts of these prompts, because a prompt
-# that once contradicted itself can drift back: the reviewer prompt used to
-# forbid re-running the full suite (which reads as a budget on the mutations it
-# demands two sections earlier), and the implementer prompt used to demand a
-# green gate with no answer for reds that were already there before the work
-# started, whose only exits were stalling or an allowlist.
-PROMPT_REQUIRED = {
-    ".agents/prompts/reviewer.md": (
-        "mutate, don't read",
-        "delete or invert",
-        "stays green",
-        "every mutation you make re-runs the suite",
-        "plan-mandated",
+CUTOVER_WIRING = {
+    "scripts/agent-preflight.sh": (
+        "check-policy",
+        "check-prompt-contract",
+        "test_agent_gates",
+        "check-commit-trailers.py",
     ),
-    ".agents/prompts/implementer.md": (
-        "failing test first",
-        "mutate every test",
-        "capture that failing set as a baseline",
-        "escalate rather than guess",
+    ".agents/workflow.md": (
+        "scripts/agent-ready.py",
+        "scripts/agent-integration.py --base origin/main",
+        "network-independent",
     ),
-}
-
-# A path in a table cell, e.g. `docs/STATUS.md`.
-CELL_PATH = re.compile(r"`([^`]+\.md)`")
-
-# README.md is a landing page, not a checkpoint surface. Naming it inside the
-# contract is the specific regression this gate was built after, so it earns a
-# targeted message instead of a bare set-difference.
-FORBIDDEN_IN_CONTRACT = {
-    "README.md": (
-        "README.md is a user-facing landing page, not a per-checkpoint status "
-        "surface; it changes only when a user-visible headline shifts. The "
-        "per-capability obligation belongs to docs/STATUS.md"
+    ".github/workflows/ci.yml": (
+        "scripts/check-policy.py",
+        "tests/scripts/test_agent_gates.py",
+        ".agents/policy-cutover",
+    ),
+    ".githooks/pre-push": ("check-policy.py", "check-prompt-contract.py"),
+    "scripts/agent-ready.py": (
+        "REMOTE_UNVERIFIED",
+        "if not run_local_preflight():",
+        "query_remote(expected)",
+    ),
+    "scripts/agent-integration.py": (
+        "reviewDecision",
+        "if not run_ready(args.pr_json):",
+        'f"{args.base}..HEAD"',
+        "errors = ready.ready_errors(payload, expected)",
+        "check-commit-trailers.py",
+        ".agents/policy-cutover",
     ),
 }
-
 
 def _load(name: str, relative: str):
     path = ROOT / relative
@@ -191,85 +115,43 @@ def _load(name: str, relative: str):
     return module
 
 
-def obligated_surfaces() -> tuple[str, ...]:
-    """Return the surfaces check-doc-checkpoint.py actually enforces."""
-    checkpoint = _load("doc_checkpoint", "scripts/check-doc-checkpoint.py")
-    return tuple(checkpoint.PUBLIC_CHECKPOINTS) + (checkpoint.FEATURE_CHECKPOINT,)
+def public_document_rule_errors(
+    rules: dict[str, PolicyRule] | None = None,
+) -> list[str]:
+    """Validate every public rule through the document checker's closed parser."""
 
+    checkpoint = _load(
+        "doc_checkpoint_for_consistency", "scripts/check-doc-checkpoint.py"
+    )
+    policy = load_policy(ROOT) if rules is None else rules
+    errors: list[str] = checkpoint.public_namespace_errors(policy)
+    seen_surfaces: dict[str, str] = {}
 
-def contract_paths(text: str) -> list[str] | None:
-    """Return the paths declared in the contract block, or None if absent."""
-    start = text.find(BEGIN)
-    end = text.find(END)
-    if start == -1 or end == -1 or end < start:
-        return None
-    block = text[start + len(BEGIN) : end]
-    paths: list[str] = []
-    for line in block.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("|"):
+    for rule_id in checkpoint.PUBLIC_RULE_IDS:
+        rule = policy.get(rule_id)
+        if rule is None:
+            errors.append(f"public-document checker requires missing policy rule {rule_id}")
             continue
-        found = CELL_PATH.findall(stripped)
-        if found:
-            paths.append(found[0])
-    return paths
+        try:
+            binding = checkpoint.parse_public_rule(rule)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        previous = seen_surfaces.setdefault(binding.surface, rule_id)
+        if previous != rule_id:
+            errors.append(
+                f"public surface {binding.surface!r} is duplicate in "
+                f"{previous} and {rule_id}"
+            )
 
-
-def document_errors(name: str, text: str, expected: tuple[str, ...]) -> list[str]:
-    """Return contract problems for one normative document."""
-    paths = contract_paths(text)
-    if paths is None:
-        return [
-            f"{name} is missing the doc-obligation contract block "
-            f"({BEGIN} ... {END}); it must declare the surfaces that "
-            "scripts/check-doc-checkpoint.py enforces so prose cannot drift "
-            "from the gate"
-        ]
-
-    errors: list[str] = []
-    for path in paths:
-        if path in FORBIDDEN_IN_CONTRACT:
-            errors.append(f"{name} contract names {path}: {FORBIDDEN_IN_CONTRACT[path]}")
-
-    if tuple(paths) != expected:
-        errors.append(
-            f"{name} contract declares {paths!r} but "
-            f"scripts/check-doc-checkpoint.py enforces {list(expected)!r}; "
-            "update the prose and the checker in the same change"
-        )
-    return errors
-
-
-def intake_block(text: str) -> str | None:
-    """Return the exact intake body, or None for missing/malformed markers."""
-    if text.count(INTAKE_BEGIN) != 1 or text.count(INTAKE_END) != 1:
-        return None
-    start = text.find(INTAKE_BEGIN)
-    end = text.find(INTAKE_END, start + len(INTAKE_BEGIN))
-    if end == -1:
-        return None
-    return text[start + len(INTAKE_BEGIN) : end]
-
-
-def intake_document_errors(name: str, text: str) -> list[str]:
-    """Return pre-claim intake problems for one normative document."""
-    block = intake_block(text)
-    if block is None:
-        return [
-            f"{name} is missing the pre-claim intake block "
-            f"({INTAKE_BEGIN} ... {INTAKE_END})"
-        ]
-    lowered = block.lower()
-    errors = [
-        f"{name} intake omits {needle!r}"
-        for needle in INTAKE_REQUIRED
-        if needle.lower() not in lowered
-    ]
-    if block != INTAKE_BODY:
-        errors.append(
-            f"{name} pre-claim intake block changed; copy the canonical "
-            "INTAKE_BODY verbatim"
-        )
+    if rules is None and not errors:
+        try:
+            bindings = checkpoint.public_rule_bindings(ROOT)
+        except ValueError as exc:
+            errors.extend(str(exc).splitlines())
+        else:
+            if set(bindings) != set(checkpoint.PUBLIC_RULE_IDS):
+                errors.append("document-checker bindings omit a required public rule")
     return errors
 
 
@@ -318,33 +200,48 @@ def loop_errors(text: str) -> list[str]:
     ]
 
 
-def prompt_errors(required: dict[str, tuple[str, ...]] | None = None) -> list[str]:
-    """Each tracked prompt exists and carries its binding instruction."""
-    # `required or PROMPT_REQUIRED` would silently promote an explicitly EMPTY
-    # spec into the full live check, which is this repo's recurring defect
-    # class: an absence and a value that look the same. Only a missing argument
-    # means "use the default".
+def prompt_contract_errors() -> list[str]:
+    """Validate every runtime prompt through the closed semantic grammar."""
+
+    checker = _load(
+        "prompt_contract_for_consistency", "scripts/check-prompt-contract.py"
+    )
+    return checker.repository_errors(ROOT, set(load_policy(ROOT)))
+
+
+def cutover_wiring_errors(root: Path | None = None) -> list[str]:
+    """Bind the local/ready/integration separation and its backstops."""
+
+    repository = root or ROOT
     errors: list[str] = []
-    spec = PROMPT_REQUIRED if required is None else required
-    for relative, needles in spec.items():
-        path = ROOT / relative
+    texts: dict[str, str] = {}
+    for relative, needles in CUTOVER_WIRING.items():
+        path = repository / relative
         if not path.is_file():
-            errors.append(f"{relative} is missing; the prompt is the protocol")
+            errors.append(f"cutover wiring is missing {relative}")
             continue
-        text = path.read_text(encoding="utf-8").lower()
-        errors.extend(
-            f"{relative} omits {needle!r}"
-            for needle in needles
-            if needle.lower() not in text
-        )
+        content = path.read_text(encoding="utf-8")
+        texts[relative] = content
+        for needle in needles:
+            if needle not in content:
+                errors.append(f"cutover wiring {relative} omits {needle!r}")
+    preflight = texts.get("scripts/agent-preflight.sh", "")
+    for remote_entrypoint in ("agent-ready.py", "agent-integration.py", "gh pr"):
+        if remote_entrypoint in preflight:
+            errors.append(
+                f"network-independent preflight invokes remote surface {remote_entrypoint!r}"
+            )
+    cutover = repository / ".agents/policy-cutover"
+    if not cutover.is_file():
+        errors.append("cutover wiring is missing .agents/policy-cutover")
+    elif re.fullmatch(r"[0-9a-f]{40}\n", cutover.read_text(encoding="utf-8")) is None:
+        errors.append(".agents/policy-cutover must contain one lowercase 40-hex commit")
     return errors
 
 
 def main() -> int:
-    expected = obligated_surfaces()
     failures: list[str] = []
-    blocks: dict[str, list[str] | None] = {}
-    intake_blocks: dict[str, str] = {}
+    failures.extend(public_document_rule_errors())
 
     interview = ROOT / INTERVIEW_DOCUMENT
     if not interview.exists():
@@ -363,76 +260,30 @@ def main() -> int:
     else:
         failures.extend(loop_errors(loop_doc.read_text(encoding="utf-8")))
 
-    failures.extend(prompt_errors())
-
-    for name in INTAKE_DOCUMENTS:
-        path = ROOT / name
-        if not path.exists():
-            failures.append(f"{name} does not exist")
-            continue
-        text = path.read_text(encoding="utf-8")
-        failures.extend(intake_document_errors(name, text))
-        block = intake_block(text)
-        if block is not None:
-            intake_blocks[name] = block
-
-    if len(intake_blocks) == len(INTAKE_DOCUMENTS):
-        distinct_intake = set(intake_blocks.values())
-        if len(distinct_intake) > 1:
-            failures.append(
-                "the pre-claim intake block differs between "
-                f"{' and '.join(INTAKE_DOCUMENTS)}; both must carry the same "
-                "block verbatim"
-            )
-
-    for name in CONTRACT_DOCUMENTS:
-        path = ROOT / name
-        if not path.exists():
-            failures.append(f"{name} does not exist")
-            continue
-        text = path.read_text(encoding="utf-8")
-        blocks[name] = contract_paths(text)
-        failures.extend(document_errors(name, text, expected))
-
-    present = {name: paths for name, paths in blocks.items() if paths is not None}
-    if len(present) == len(CONTRACT_DOCUMENTS):
-        distinct = {tuple(paths) for paths in present.values()}
-        if len(distinct) > 1:
-            failures.append(
-                "the doc-obligation contract differs between "
-                f"{' and '.join(CONTRACT_DOCUMENTS)}; both must carry the same "
-                "block verbatim"
-            )
+    failures.extend(prompt_contract_errors())
+    failures.extend(cutover_wiring_errors())
 
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         print(
-            "The obligated public surfaces are defined by PUBLIC_CHECKPOINTS and "
-            "FEATURE_CHECKPOINT in scripts/check-doc-checkpoint.py. Mirror them "
-            "in the contract block of every document listed in "
-            "CONTRACT_DOCUMENTS. The role interview is the block between "
+            "Public-document policy rows must fully parse through "
+            "scripts/check-doc-checkpoint.py. The role interview is the block between "
             f"{INTERVIEW_MARKER} and its :end in {INTERVIEW_DOCUMENT}; it must "
             "name every answer agent-role.py accepts. The operator's loop is "
             f"the block between {LOOP_MARKER} and its :end in {LOOP_DOCUMENT}; "
             f"it must carry {', '.join(repr(n) for n in LOOP_REQUIRED)} inside "
-            "the block. The sub-agent prompts in "
-            f"{', '.join(PROMPT_REQUIRED)} must carry their binding "
-            "instructions verbatim; a prompt that lives only in an operator's "
-            "head is not a protocol. The pre-claim intake block must appear "
-            f"verbatim in {' and '.join(INTAKE_DOCUMENTS)}.",
+            "the block. Every runtime prompt must satisfy the closed grammar "
+            "in scripts/check-prompt-contract.py; unknown prose is a failure.",
             file=sys.stderr,
         )
         return 1
 
     print(
-        "OK: the doc-obligation contract in "
-        f"{' and '.join(CONTRACT_DOCUMENTS)} matches "
-        f"scripts/check-doc-checkpoint.py, {INTERVIEW_DOCUMENT} carries the "
-        f"role interview and the orchestration loop, and "
-        f"{len(PROMPT_REQUIRED)} sub-agent prompts carry their binding "
-        "instructions, and both normative documents carry the same pre-claim "
-        "intake."
+        "OK: public-document policy matches scripts/check-doc-checkpoint.py, "
+        f"{INTERVIEW_DOCUMENT} carries the "
+        f"role interview and the orchestration loop, all runtime prompts satisfy "
+        "the closed semantic contract, and cutover wiring is complete."
     )
     return 0
 

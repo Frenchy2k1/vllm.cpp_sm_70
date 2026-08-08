@@ -869,7 +869,7 @@ addition, and it is behaviour-preserving by construction.
 
 ## 7. Tests to port
 
-Per [test-porting.md](../test-porting.md), each W-step carries its upstream
+Per [porting.md](../porting.md), each W-step carries its upstream
 module. Inventory from the pin (`/home/mudler/_git/vllm/tests`):
 
 | Upstream | Asserts | Our tier / target | W |

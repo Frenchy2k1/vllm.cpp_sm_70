@@ -11,7 +11,7 @@
 
 1. **Throughput parity vs vLLM and every equivalent faster floor** on
    the release-gate environment (`${GATE_HOST}`; currently the DGX Spark GB10
-   profile in [environment.md](environment.md)): serve
+   profile in [environment.md](../environment.md)): serve
    **Qwen3.6-35B-A3B (NVFP4)** and **Qwen3.6-27B (NVFP4)** with prefill AND
    decode throughput matching vLLM at large concurrency (request-rate sweeps,
    measured with our `bench serve` equivalent, same box, same models).
@@ -50,7 +50,7 @@
 
 vLLM is the parity oracle for BOTH correctness and performance. Every change
 that could affect either MUST be compared against vLLM, apples-to-apples, and
-BOTH numbers recorded in the [parity ledger](parity-ledger.md):
+BOTH numbers recorded in the [parity ledger](../parity-ledger.md):
 
 - **Correctness:** op dumps + model logits/greedy vs the pinned pip-vLLM oracle
   (`${VLLM_ORACLE}`, forward-math-identical to the pin). A new

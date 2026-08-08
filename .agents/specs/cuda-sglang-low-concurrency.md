@@ -13,7 +13,7 @@ exact SGLang v0.5.15 equivalence, `KV-MAMBA-ALIGN`, and async serving.
 
 This is the leaf spike required by the
 [competitive benchmark matrix](competitive-benchmarks.md) and the
-[benchmark protocol](../benchmark-protocol.md). It fixes the competitor,
+[benchmark protocol](../verification.md). It fixes the competitor,
 checkpoint-equivalence rule, workload, artifacts, and independent work
 packages before anyone installs SGLang or consumes the shared GPU.
 

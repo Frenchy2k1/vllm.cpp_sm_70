@@ -8,11 +8,9 @@ on `main` through a merged `row/<ROW-ID>` PR, whoever produced it. A sub-agent, 
 helper session, or the developer all satisfy it the same way, and a direct push
 of feature code does not.
 
-Integration work stays direct on purpose. `scripts/`, `.agents/`, `docs/` and
-`.github/` are NOT feature paths, because the operator must be able to fix a
-gate, resolve a conflict or repair the record without a round trip -- an operator
-who cannot touch anything cannot review, which is the rubber-stamp failure the
-protocol is designed to avoid.
+Non-product paths are classified by closed lexical forms rather than exempting
+whole mutable trees.  This checker still owns the feature-arrival rule; the PR
+and size gates independently review the other classes.
 
 ACTIVATION. ENFORCING since the cutover commit 44e8225cf (user-directed
 2026-08-05). Every commit from that one ONWARD must land feature code through a
@@ -33,6 +31,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,14 +49,17 @@ FEATURE_PREFIXES = (
     "cmake/",
 )
 FEATURE_FILES = {"CMakeLists.txt"}
-# Protocol/record tooling the operator legitimately maintains in place.
-INTEGRATION_PREFIXES = (
-    "tests/scripts/",
-    "scripts/",
-    ".agents/",
-    "docs/",
-    ".github/",
-)
+INTEGRATION_FILES = {
+    ".agents/state.md",
+    "docs/STATUS.md",
+    "docs/BENCHMARKS.md",
+    "docs/FEATURES.md",
+    "docs/USAGE.md",
+    "README.md",
+}
+CHECKER_PATH = re.compile(r"scripts/check-[A-Za-z0-9_.-]+\.(?:py|sh)\Z")
+CHECKER_TEST_PATH = re.compile(r"tests/scripts/test_[A-Za-z0-9_.-]+\.py\Z")
+CI_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml\Z")
 
 ROW_BRANCH = re.compile(r"row/[A-Za-z0-9_.-]+")
 PR_REFERENCE = re.compile(r"\(#\d+\)|#\d+")
@@ -70,7 +72,22 @@ def git(*args: str) -> str:
 
 
 def is_feature_path(path: str) -> bool:
-    if path.startswith(INTEGRATION_PREFIXES):
+    candidate = PurePosixPath(path)
+    if (
+        not path
+        or candidate.is_absolute()
+        or "\\" in path
+        or "//" in path
+        or candidate.as_posix() != path
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        return True
+    if (
+        path in INTEGRATION_FILES
+        or CHECKER_PATH.fullmatch(path)
+        or CHECKER_TEST_PATH.fullmatch(path)
+        or CI_PATH.fullmatch(path)
+    ):
         return False
     return path in FEATURE_FILES or path.startswith(FEATURE_PREFIXES)
 
@@ -120,8 +137,29 @@ def commit_violations(
     return [
         f"{commit}: feature code ({preview}) reached main without a reviewed "
         "row/* PR. Feature work goes through a helper session or a sub-agent on "
-        "a `row/<ROW-ID>` branch; the operator merges it. Integration paths "
-        "(scripts/, .agents/, docs/, .github/) are exempt by design"
+        "a `row/<ROW-ID>` branch; the operator merges it"
+    ]
+
+
+def policy_commit_violations(
+    commit: str,
+    parents: list[str],
+    subject: str,
+    body: str,
+    paths: list[str],
+    merged_messages: tuple[str, ...] = (),
+) -> list[str]:
+    """Enforce POL-PR-REQUIRED for every tracked repository change."""
+
+    governed = sorted(path for path in paths if path)
+    if not governed or arrives_via_row_pr(parents, subject, body, merged_messages):
+        return []
+    preview = ", ".join(governed[:4])
+    if len(governed) > 4:
+        preview += f", ... (+{len(governed) - 4})"
+    return [
+        f"{commit}: repository change ({preview}) reached main without a reviewed "
+        "row/* PR"
     ]
 
 
@@ -142,7 +180,9 @@ def inspect(commit: str) -> list[str]:
     # The messages of the branches this commit MERGES IN (parents[1:]), for the
     # synthetic-PR-merge case in arrives_via_row_pr.
     merged = tuple(git("log", "-1", "--format=%s%n%b", parent) for parent in parents[1:])
-    return commit_violations(short, parents, subject, body, commit_paths(commit), merged)
+    return policy_commit_violations(
+        short, parents, subject, body, commit_paths(commit), merged
+    )
 
 
 def enforced(commit: str) -> bool:
@@ -156,6 +196,25 @@ def enforced(commit: str) -> bool:
         return False
 
 
+def has_reached_main(commit: str) -> bool:
+    """Whether the commit is already contained by the local main ref."""
+
+    try:
+        git("merge-base", "--is-ancestor", commit, "refs/heads/main")
+        return True
+    except subprocess.CalledProcessError:
+        pass
+    try:
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+    except subprocess.CalledProcessError:
+        # CI checks out main and synthetic PR merges detached. A synthetic merge
+        # already passes arrives_via_row_pr; a violating detached commit must
+        # fail closed as landed/integration history.
+        return True
+    # An unmerged row head is pending PR disposition, not main history yet.
+    return not branch.startswith("row/")
+
+
 def commits_in_range(base: str, head: str) -> list[str]:
     try:
         git("cat-file", "-e", f"{base}^{{commit}}")
@@ -164,14 +223,34 @@ def commits_in_range(base: str, head: str) -> list[str]:
     return [c for c in git("rev-list", "--reverse", f"{base}..{head}").splitlines() if c]
 
 
+def pending_pr_commits(base: str, head: str, pending_pr_head: str) -> frozenset[str]:
+    """Return the exact unmerged PR range named by a trusted PR event."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", pending_pr_head) is None:
+        raise ValueError("--pending-pr-head must be one lowercase 40-byte commit SHA")
+    try:
+        resolved_head = git("rev-parse", "--verify", f"{head}^{{commit}}")
+    except subprocess.CalledProcessError as exc:
+        raise ValueError("--head must resolve to one commit") from exc
+    if resolved_head != pending_pr_head:
+        raise ValueError("--pending-pr-head must exactly match --head")
+    return frozenset(commits_in_range(base, resolved_head))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commit", help="check one commit")
     parser.add_argument("--base", help="check every commit after this revision")
     parser.add_argument("--head", help="range endpoint (requires --base)")
+    parser.add_argument(
+        "--pending-pr-head",
+        help="exact PR-event head SHA; marks only base..head as not yet landed",
+    )
     args = parser.parse_args()
     if (args.base is None) != (args.head is None):
         parser.error("--base and --head must be supplied together")
+    if args.pending_pr_head is not None and args.base is None:
+        parser.error("--pending-pr-head requires --base and --head")
 
     if args.base is not None:
         commits = commits_in_range(args.base, args.head)
@@ -180,10 +259,25 @@ def main() -> int:
     else:
         commits = ["HEAD"]
 
+    try:
+        pending = (
+            pending_pr_commits(args.base, args.head, args.pending_pr_head)
+            if args.pending_pr_head is not None
+            else frozenset()
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     failures, reported = [], []
     for commit in commits:
         for problem in inspect(commit):
-            (failures if enforced(commit) else reported).append(problem)
+            # A row head has not reached main yet, so it is reportable pending
+            # integration rather than a false claim that unmerged work already
+            # violated the arrival rule. Main history and recognized synthetic
+            # PR merges remain strict.
+            landed = commit not in pending and enforced(commit) and has_reached_main(commit)
+            (failures if landed else reported).append(problem)
 
     for problem in reported:
         print(f"REPORT: {problem}", file=sys.stderr)

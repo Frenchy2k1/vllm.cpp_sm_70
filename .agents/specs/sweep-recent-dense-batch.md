@@ -527,7 +527,7 @@ implementation time; anchors are against pin `e24d1b24` / base `5c00fc4`.
 
 ### Tests to port
 
-Per [`.agents/test-porting.md`](../test-porting.md). Nothing is ported by THIS spike
+Per [`.agents/porting.md`](../porting.md). Nothing is ported by THIS spike
 (design only); this is the inventory that binds the implementing Ws.
 
 | Upstream test | Tier | Ours (at impl time) |
@@ -543,7 +543,7 @@ Per [`.agents/test-porting.md`](../test-porting.md). Nothing is ported by THIS s
 
 1. **Correctness (SACRED), per family** — token-exact vs the pinned vLLM 0.25.0
    oracle, greedy, identical prompts, gate form selected BY MEASUREMENT per
-   [`near-tie-distributional-gate`](../gates.md) (run vLLM's own K=5 greedy first;
+   [`near-tie-distributional-gate`](../verification.md) (run vLLM's own K=5 greedy first;
    distributional/near-tie-band fallback ONLY if measured, else STRICT; add a bigger
    STRICT model where the small one is a near-tie, e.g. phi-4-14B for Phi-3).
 2. **New-op unit gate** — only Phi-1/2 has one: `kGelu`/NewGELU UNARY bit-exact vs the

@@ -89,7 +89,7 @@ Each row block must be split into backend-specific claims when kernels differ.
 | MLX `python/tests/test_quantized.py` | affine/MX/NV modes, shapes, gradients where relevant, invalid QQ global-scale case |
 
 A ported case that cannot pass is checked in skipped with a row ID and concrete
-reason, per [test-porting.md](../test-porting.md).
+reason, per [porting.md](../porting.md).
 
 ## Gates
 
@@ -101,7 +101,7 @@ reason, per [test-porting.md](../test-porting.md).
 | Apple MLX | MLX primitive/MLX-LM token parity | oMLX and MLX-LM on the same Mac/model/quant/concurrency |
 
 All runs use the exact recipe and repetition rules in
-[benchmark-protocol.md](../benchmark-protocol.md). GPU series hold one
+[verification.md](../verification.md). GPU series hold one
 `flock /tmp/gpu` for every arm.
 
 ## Risks and decisions

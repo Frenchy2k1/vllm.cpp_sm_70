@@ -10,6 +10,8 @@ disagrees with scripts/check-doc-checkpoint.py.
 from __future__ import annotations
 
 import contextlib
+import csv
+import dataclasses
 import importlib.util
 import io
 import re
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,24 +39,18 @@ def _load(name: str, relative: str):
 
 consistency = _load("protocol_consistency", "scripts/check-protocol-consistency.py")
 
-EXPECTED = ("docs/STATUS.md", "docs/BENCHMARKS.md", "docs/FEATURES.md")
-
-# Deliberately independent of consistency.INTAKE_REQUIRED. If the production
-# tuple is narrowed, a mutation loop derived from that tuple cannot notice the
-# omitted requirement; this literal contract makes the narrowing itself red.
-EXPECTED_INTAKE_REQUIRED = (
-    "Before claiming a row or starting implementation",
-    "Search open issues and pull requests",
-    ".agents/NOW.md",
-    "scripts/ready-for-helper.py",
-    "roadmap row",
-    "owning matrix row",
-    ".agents/coordination.md",
-    "current code, tests, and relevant evidence anchors",
-    "confirm that the recorded gap still exists",
-    "Record the issue/PR search and exact current code/test anchors",
-    "reconcile the task instead of starting duplicate work",
-)
+EXPECTED_PUBLIC_RULES = {
+    "POL-DOC-STATUS": ("docs/STATUS.md", "feature_checkpoint", "Update"),
+    "POL-DOC-BENCHMARKS": (
+        "docs/BENCHMARKS.md",
+        "feature_checkpoint",
+        "Update",
+    ),
+    "POL-DOC-FEATURES": ("docs/FEATURES.md", "feature_surface", "Update"),
+    "POL-DOC-USAGE": ("docs/USAGE.md", "user_usage", "Update"),
+    "POL-DOC-README": ("README.md", "landing_page", "Update"),
+    "POL-NOW-COUPLING": (".agents/NOW.md", "live_state", "Refresh"),
+}
 
 
 def _tracked_paths(prefix: str) -> set[str] | None:
@@ -96,7 +93,11 @@ def _prompt_tree(files: dict[str, str]):
 
 @contextlib.contextmanager
 def _repo_copy(
-    workflow_text: str, *, agents_text: str | None = None, prompts: bool = True
+    workflow_text: str,
+    *,
+    prompts: bool = True,
+    prompt_damage: tuple[str, str, str] | None = None,
+    extra_prompt: tuple[str, str] | None = None,
 ):
     """Run consistency.main() against a copy of the repo's own documents.
 
@@ -112,12 +113,45 @@ def _repo_copy(
             ROOT / "scripts/check-doc-checkpoint.py",
             root / "scripts/check-doc-checkpoint.py",
         )
-        if agents_text is None:
-            shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
-        else:
-            (root / "AGENTS.md").write_text(agents_text, encoding="utf-8")
+        shutil.copy(
+            ROOT / "scripts/check-prompt-contract.py",
+            root / "scripts/check-prompt-contract.py",
+        )
+        shutil.copy(ROOT / ".agents/policy.csv", root / ".agents/policy.csv")
+        shutil.copy(ROOT / ".agents/waivers.csv", root / ".agents/waivers.csv")
+        for relative in consistency.CUTOVER_WIRING:
+            source = ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(source, target)
+        shutil.copy(ROOT / ".agents/policy-cutover", root / ".agents/policy-cutover")
+        # The policy parser validates every named checker and procedure. Create
+        # the exact declared paths so this fixture isolates workflow behavior.
+        with (ROOT / ".agents/policy.csv").open(
+            newline="", encoding="utf-8"
+        ) as stream:
+            for row in csv.DictReader(stream):
+                named = [*row["enforcement"].split(";"), row["procedure"]]
+                for relative in named:
+                    target = root / relative.strip()
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        target.write_text("# fixture\n", encoding="utf-8")
         if prompts:
             shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
+            if prompt_damage is not None:
+                role, old, new = prompt_damage
+                path = root / ".agents/prompts" / f"{role}.md"
+                text = path.read_text(encoding="utf-8")
+                damaged = text.replace(old, new, 1)
+                if damaged == text:
+                    raise AssertionError(f"prompt mutation did not match: {old!r}")
+                path.write_text(damaged, encoding="utf-8")
+            if extra_prompt is not None:
+                name, content = extra_prompt
+                (root / ".agents/prompts" / name).write_text(
+                    content, encoding="utf-8"
+                )
         (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
         saved, consistency.ROOT = consistency.ROOT, root
         out, err = io.StringIO(), io.StringIO()
@@ -128,203 +162,262 @@ def _repo_copy(
             consistency.ROOT = saved
 
 
-def document(*paths: str) -> str:
-    rows = "\n".join(f"| `{path}` | every checkpoint |" for path in paths)
-    return "\n".join(
-        [
-            "# Some normative document",
-            "",
-            consistency.BEGIN,
-            "| Public surface | Owed by |",
-            "|---|---|",
-            rows,
-            consistency.END,
-            "",
-            "Trailing prose.",
-        ]
-    )
+class PublicDocumentPolicyTests(unittest.TestCase):
+    def _mutated_errors(self, rule_id: str, **changes: str) -> list[str]:
+        rules = consistency.load_policy(ROOT)
+        rules[rule_id] = dataclasses.replace(rules[rule_id], **changes)
+        return consistency.public_document_rule_errors(rules)
 
+    def _extra_rule_errors(self, rule_id: str, **changes: str) -> list[str]:
+        rules = consistency.load_policy(ROOT)
+        source = rules["POL-PR-REQUIRED"]
+        fields = {
+            "rule_id": rule_id,
+            "scope": "internal review",
+            "trigger": "policy review",
+            "requirement": "Review the policy change.",
+        }
+        fields.update(changes)
+        rules[rule_id] = dataclasses.replace(source, **fields)
+        return consistency.public_document_rule_errors(rules)
 
-class ContractParsing(unittest.TestCase):
-    def test_extracts_paths_in_order(self) -> None:
-        self.assertEqual(
-            consistency.contract_paths(document(*EXPECTED)), list(EXPECTED)
-        )
+    def test_repository_policy_matches_the_checker_semantically(self) -> None:
+        self.assertEqual(consistency.public_document_rule_errors(), [])
 
-    def test_absent_block_is_none(self) -> None:
-        self.assertIsNone(consistency.contract_paths("# No contract here"))
-
-    def test_end_before_begin_is_none(self) -> None:
-        text = f"{consistency.END}\n| `docs/STATUS.md` |\n{consistency.BEGIN}"
-        self.assertIsNone(consistency.contract_paths(text))
-
-
-class Mutations(unittest.TestCase):
-    def test_baseline_passes(self) -> None:
-        self.assertEqual(
-            consistency.document_errors("doc", document(*EXPECTED), EXPECTED), []
-        )
-
-    def test_missing_block_is_rejected(self) -> None:
-        errors = consistency.document_errors("doc", "# nothing", EXPECTED)
-        self.assertTrue(any("missing the doc-obligation contract" in e for e in errors))
-
-    def test_readme_in_contract_is_rejected_by_name(self) -> None:
-        """The exact historical regression: README named as a checkpoint."""
-        text = document("README.md", "docs/BENCHMARKS.md", "docs/FEATURES.md")
-        errors = consistency.document_errors("doc", text, EXPECTED)
-        self.assertTrue(any("README.md" in e and "landing page" in e for e in errors))
-
-    def test_dropped_surface_is_rejected(self) -> None:
-        text = document("docs/STATUS.md", "docs/BENCHMARKS.md")
-        errors = consistency.document_errors("doc", text, EXPECTED)
-        self.assertTrue(any("enforces" in e for e in errors))
-
-    def test_reordered_surfaces_are_rejected(self) -> None:
-        text = document("docs/BENCHMARKS.md", "docs/STATUS.md", "docs/FEATURES.md")
-        self.assertNotEqual(
-            consistency.document_errors("doc", text, EXPECTED), []
-        )
-
-    def test_extra_surface_is_rejected(self) -> None:
-        text = document(*EXPECTED, "docs/USAGE.md")
-        self.assertNotEqual(consistency.document_errors("doc", text, EXPECTED), [])
-
-
-class LiveTree(unittest.TestCase):
-    def test_expected_surfaces_come_from_the_checker(self) -> None:
-        self.assertEqual(consistency.obligated_surfaces(), EXPECTED)
-
-    def test_repository_contract_is_consistent(self) -> None:
+    def test_main_enforces_the_public_document_mapping(self) -> None:
         self.assertEqual(consistency.main(), 0)
 
-    def test_every_contract_document_exists(self) -> None:
-        for name in consistency.CONTRACT_DOCUMENTS:
-            self.assertTrue((ROOT / name).exists(), name)
+    def test_missing_public_rule_is_rejected(self) -> None:
+        rules = consistency.load_policy(ROOT)
+        rules.pop("POL-DOC-USAGE")
+        errors = consistency.public_document_rule_errors(rules)
+        self.assertTrue(any("POL-DOC-USAGE" in error for error in errors), errors)
 
+    def test_unknown_trigger_identifier_is_rejected(self) -> None:
+        errors = self._mutated_errors("POL-DOC-STATUS", trigger="mutable_tree")
+        self.assertTrue(any("mutable_tree" in error for error in errors), errors)
 
-class PreClaimIntakeTests(unittest.TestCase):
-    """Starting work from stale record prose must be a red protocol gate."""
+    def test_public_rule_must_name_the_document_checker(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-USAGE", enforcement="scripts/check-policy.py"
+        )
+        self.assertTrue(any("POL-DOC-USAGE" in e and "enforcement" in e for e in errors), errors)
 
-    STRIP = re.compile(
-        r"<!-- pre-claim-intake:begin -->.*?"
-        r"<!-- pre-claim-intake:end -->\n?",
-        re.S,
-    )
+    def test_partial_enforcement_content_is_rejected(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-USAGE",
+            enforcement="scripts/check-doc-checkpoint.py; scripts/check-policy.py; later",
+        )
+        self.assertTrue(any("POL-DOC-USAGE" in e and "enforcement" in e for e in errors), errors)
 
-    def _documents(self) -> dict[str, str]:
-        return {
-            name: (ROOT / name).read_text(encoding="utf-8")
-            for name in consistency.INTAKE_DOCUMENTS
+    def test_duplicate_public_surface_is_rejected(self) -> None:
+        rules = consistency.load_policy(ROOT)
+        rules["POL-DOC-USAGE"] = dataclasses.replace(
+            rules["POL-DOC-USAGE"], scope=rules["POL-DOC-STATUS"].scope
+        )
+        errors = consistency.public_document_rule_errors(rules)
+        self.assertTrue(
+            any("POL-DOC-USAGE" in e and "scope" in e for e in errors), errors
+        )
+
+    def test_each_public_rule_accepts_only_exact_positive_requirement(self) -> None:
+        for rule_id, (scope, _trigger, verb) in EXPECTED_PUBLIC_RULES.items():
+            original = consistency.load_policy(ROOT)[rule_id]
+            mutations = {
+                "wrong action": f"Observe {scope}.",
+                "wrong target": f"{verb} another-page.md.",
+                "except suffix": original.requirement.rstrip(".")
+                + " except when state is appended.",
+                "unless suffix": original.requirement.rstrip(".")
+                + " unless the change is small.",
+                "other than suffix": original.requirement.rstrip(".")
+                + " other than for releases.",
+                "without suffix": original.requirement.rstrip(".")
+                + " without benchmark changes.",
+                "generic trailing text": original.requirement + " Extra words",
+                "missing period": f"{verb} {scope}",
+            }
+            for label, requirement in mutations.items():
+                with self.subTest(rule_id=rule_id, mutation=label):
+                    errors = self._mutated_errors(rule_id, requirement=requirement)
+                    self.assertTrue(
+                        any(rule_id in error and "requirement" in error for error in errors),
+                        errors,
+                    )
+
+    def test_public_rule_rejects_unparsed_scope_content(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-STATUS", scope="docs/STATUS.md except docs/legacy.md"
+        )
+        self.assertTrue(any("POL-DOC-STATUS" in e and "scope" in e for e in errors), errors)
+
+    def test_public_rule_rejects_unparsed_trigger_content(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-STATUS", trigger="feature_checkpoint except docs-only"
+        )
+        self.assertTrue(any("POL-DOC-STATUS" in e and "trigger" in e for e in errors), errors)
+
+    def test_extra_rule_cannot_reuse_a_public_trigger(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-TRIGGER", trigger="feature_checkpoint"
+        )
+        self.assertTrue(
+            any("POL-EXTRA-TRIGGER" in e and "trigger" in e for e in errors), errors
+        )
+
+    def test_extra_rule_cannot_reuse_a_public_scope(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-SCOPE", scope="docs/STATUS.md"
+        )
+        self.assertTrue(
+            any("POL-EXTRA-SCOPE" in e and "scope" in e for e in errors), errors
+        )
+
+    def test_extra_rule_cannot_target_a_public_surface_in_its_requirement(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-REQUIREMENT", requirement="Update docs/STATUS.md."
+        )
+        self.assertTrue(
+            any(
+                "POL-EXTRA-REQUIREMENT" in e and "requirement" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    def test_malformed_positive_requirements_cannot_bypass_public_target_ownership(
+        self,
+    ) -> None:
+        mutations = {
+            "double terminal period": "Update docs/STATUS.md..",
+            "triple terminal period": "Update docs/STATUS.md...",
+            "segment ending period": "Update docs./STATUS.md.",
+            "empty segment": "Update docs//STATUS.md.",
+            "dot segment": "Update docs/./STATUS.md.",
+            "dot-dot segment": "Update docs/../STATUS.md.",
+            "parent traversal": "Update ../docs/STATUS.md.",
+            "absolute path": "Update /docs/STATUS.md.",
+            "backslash separator": r"Update docs\STATUS.md.",
+            "space inside token": "Update docs/STATUS file.md.",
+            "tab inside token": "Update docs/STATUS\tfile.md.",
+            "leading space": " Update docs/STATUS.md.",
+            "trailing space": "Update docs/STATUS.md. ",
+            "double space": "Update  docs/STATUS.md.",
+            "tab delimiter": "Update\tdocs/STATUS.md.",
+            "nbsp delimiter": "Update\u00a0docs/STATUS.md.",
+            "inserted token": "Update only docs/STATUS.md.",
+            "carriage return delimiter": "Update\rdocs/STATUS.md.",
+            "line feed delimiter": "Update\ndocs/STATUS.md.",
+            "second sentence": (
+                "Update docs/STATUS.md. Refresh docs/BENCHMARKS.md."
+            ),
+            "second delimiter": "Update docs/STATUS.md.;docs/BENCHMARKS.md.",
         }
-
-    def test_checker_exposes_independent_intake_requirements(self):
-        self.assertEqual(
-            getattr(consistency, "INTAKE_REQUIRED", ()),
-            EXPECTED_INTAKE_REQUIRED,
-            "INTAKE_REQUIRED must exactly match the test-owned intake contract",
-        )
-
-    def test_both_normative_documents_carry_one_identical_intake_block(self):
-        documents = self._documents()
-        blocks = []
-        for name, document_text in documents.items():
-            with self.subTest(document=name):
-                self.assertEqual(document_text.count(consistency.INTAKE_BEGIN), 1)
-                self.assertEqual(document_text.count(consistency.INTAKE_END), 1)
-                block = consistency.intake_block(document_text)
-                self.assertIsNotNone(block)
-                blocks.append(block)
-        self.assertEqual(blocks[0], blocks[1])
-
-    def test_each_required_intake_instruction_is_pinned_individually(self):
-        self.assertEqual(consistency.INTAKE_REQUIRED, EXPECTED_INTAKE_REQUIRED)
-        for name, document_text in self._documents().items():
-            block = consistency.intake_block(document_text)
-            self.assertIsNotNone(block)
-            for needle in EXPECTED_INTAKE_REQUIRED:
-                with self.subTest(document=name, needle=needle):
-                    damaged_block = block.replace(needle, "")
-                    self.assertNotEqual(damaged_block, block)
-                    damaged = document_text.replace(block, damaged_block, 1)
-                    self.assertNotEqual(damaged, document_text)
-                    errors = consistency.intake_document_errors(name, damaged)
-                    self.assertTrue(any("intake omits" in error for error in errors))
-
-    def test_main_fails_when_either_intake_block_is_removed(self):
-        documents = self._documents()
-        for name in consistency.INTAKE_DOCUMENTS:
-            with self.subTest(document=name):
-                damaged = self.STRIP.sub("", documents[name])
-                self.assertNotEqual(damaged, documents[name])
-                agents = damaged if name == "AGENTS.md" else documents["AGENTS.md"]
-                workflow = (
-                    damaged
-                    if name == ".agents/workflow.md"
-                    else documents[".agents/workflow.md"]
+        for label, requirement in mutations.items():
+            with self.subTest(mutation=label):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-MALFORMED", requirement=requirement
                 )
-                with _repo_copy(workflow, agents_text=agents) as run:
-                    code, _, err = run()
-                self.assertEqual(code, 1)
-                self.assertIn("pre-claim intake", err)
+                self.assertTrue(
+                    any(
+                        "POL-EXTRA-MALFORMED" in error
+                        and "requirement" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
 
-    def test_main_fails_when_normative_intake_copies_differ(self):
-        documents = self._documents()
-        workflow = documents[".agents/workflow.md"].replace(
-            EXPECTED_INTAKE_REQUIRED[1],
-            EXPECTED_INTAKE_REQUIRED[1] + " with a different instruction",
-            1,
+    def test_reserved_target_scan_is_independent_of_positive_grammar(self) -> None:
+        requirements = (
+            "Review docs/STATUS.md before release.",
+            " Review docs/STATUS.md.",
+            "Update  docs/STATUS.md.",
+            "Update\tdocs/STATUS.md.",
+            "Update\u00a0docs/STATUS.md.",
+            "Update only docs/STATUS.md.",
+            "Review (docs/STATUS.md).",
+            "Update\r\ndocs/STATUS.md.",
         )
-        with _repo_copy(workflow, agents_text=documents["AGENTS.md"]) as run:
-            code, _, err = run()
-        self.assertEqual(code, 1)
-        self.assertIn("intake block differs", err)
+        for requirement in requirements:
+            with self.subTest(requirement=repr(requirement)):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-LEXICAL", requirement=requirement
+                )
+                self.assertTrue(
+                    any(
+                        "POL-EXTRA-LEXICAL" in error
+                        and "requirement target" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
 
-    def test_main_fails_when_both_copies_lose_a_required_instruction(self):
-        # This is independent of the copy-drift check: if both documents are
-        # identically damaged, only the canonical requirements can make main()
-        # red. Name the reviewed regression literally so narrowing the
-        # production tuple cannot narrow this mutation along with it.
-        needle = "scripts/ready-for-helper.py"
-        documents = self._documents()
-        damaged = {}
-        for name, document_text in documents.items():
-            block = consistency.intake_block(document_text)
-            self.assertIsNotNone(block)
-            damaged_block = block.replace(needle, "")
-            self.assertNotEqual(damaged_block, block)
-            damaged[name] = document_text.replace(block, damaged_block, 1)
-        with _repo_copy(
-            damaged[".agents/workflow.md"], agents_text=damaged["AGENTS.md"]
-        ) as run:
-            code, _, err = run()
-        self.assertEqual(code, 1)
-        self.assertIn("intake omits 'scripts/ready-for-helper.py'", err)
-
-    def test_main_rejects_identically_drifted_intake_copies(self):
-        # This mutation keeps every required substring and changes both copies
-        # in the same way. Only comparison with the canonical INTAKE_BODY can
-        # reject it; copy equality and the required-needle checks both pass.
-        documents = self._documents()
-        damaged = {}
-        for name, document_text in documents.items():
-            block = consistency.intake_block(document_text)
-            self.assertIsNotNone(block)
-            damaged_block = block + "\nThe same checks still apply."
-            for needle in EXPECTED_INTAKE_REQUIRED:
-                self.assertIn(needle, damaged_block)
-            damaged[name] = document_text.replace(block, damaged_block, 1)
-        self.assertEqual(
-            consistency.intake_block(damaged["AGENTS.md"]),
-            consistency.intake_block(damaged[".agents/workflow.md"]),
-            "the fixture must drift both normative copies identically",
+    def test_reserved_target_scan_avoids_path_prefix_collisions(self) -> None:
+        # These controls independently pin both lexical boundaries. Removing
+        # the left-boundary check makes the nested/prefixed paths collide;
+        # removing the right-boundary check makes the suffixed paths collide.
+        requirements = (
+            "Review sub/docs/STATUS.md before release.",
+            "Review prefix/docs/STATUS.md before release.",
+            "Review docs/STATUS.md.extra before release.",
+            "Review .agents/NOW.md.extra before release.",
         )
-        with _repo_copy(
-            damaged[".agents/workflow.md"], agents_text=damaged["AGENTS.md"]
-        ) as run:
-            code, _, err = run()
-        self.assertEqual(code, 1)
-        self.assertIn("canonical INTAKE_BODY", err)
+        for requirement in requirements:
+            with self.subTest(requirement=requirement):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-PREFIX", requirement=requirement
+                )
+                self.assertFalse(
+                    any("requirement target" in error for error in errors), errors
+                )
+
+        self._assert_reserved_target_scan_accepts_non_path_delimiters()
+
+    def _assert_reserved_target_scan_accepts_non_path_delimiters(self) -> None:
+        # Exact references remain reserved when ordinary prose punctuation is
+        # adjacent. Inverting either boundary predicate makes at least one of
+        # these positive controls disappear from the ownership scan.
+        requirements = (
+            'Review "docs/STATUS.md" before release.',
+            "Review `docs/STATUS.md` before release.",
+            "Review (docs/STATUS.md) before release.",
+            "Review docs/STATUS.md: before release.",
+            "Review docs/STATUS.md, before release.",
+            "Review docs/STATUS.md; before release.",
+            "Review docs/STATUS.md! before release.",
+            "Review docs/STATUS.md? before release.",
+        )
+        for requirement in requirements:
+            with self.subTest(requirement=requirement):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-DELIMITED", requirement=requirement
+                )
+                self.assertTrue(
+                    any(
+                        "POL-EXTRA-DELIMITED" in error
+                        and "requirement target" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_extra_rule_cannot_duplicate_a_public_semantic_binding(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-BINDING",
+            scope="docs/STATUS.md",
+            trigger="feature_checkpoint",
+            requirement="Update docs/STATUS.md.",
+        )
+        self.assertTrue(
+            any("POL-EXTRA-BINDING" in e and "duplicate" in e for e in errors),
+            errors,
+        )
+
+    def test_extra_rule_cannot_claim_the_reserved_public_rule_namespace(self) -> None:
+        errors = self._extra_rule_errors("POL-DOC-EXTRA")
+        self.assertTrue(
+            any("POL-DOC-EXTRA" in e and "reserved" in e for e in errors), errors
+        )
 
 
 class InterviewBlockTests(unittest.TestCase):
@@ -378,8 +471,16 @@ class InterviewWiring(unittest.TestCase):
     )
 
     @contextlib.contextmanager
-    def _tree(self, workflow_text: str, *, prompts: bool = True):
-        with _repo_copy(workflow_text, prompts=prompts) as run:
+    def _tree(
+        self,
+        workflow_text: str,
+        *,
+        prompts: bool = True,
+        prompt_damage: tuple[str, str, str] | None = None,
+    ):
+        with _repo_copy(
+            workflow_text, prompts=prompts, prompt_damage=prompt_damage
+        ) as run:
             yield run
 
     def test_faithful_copy_passes(self):
@@ -401,23 +502,41 @@ class InterviewWiring(unittest.TestCase):
         self.assertIn("role-interview", err)
 
     def test_main_fails_when_the_prompts_are_missing(self):
-        """main() must CALL prompt_errors, not merely define it.
-
-        Every prompt assertion above calls the function directly, so a main()
-        that never wires it in leaves them all green while the gate enforces
-        nothing -- the same drift, one function later.
-        """
+        """The protocol gate must call the semantic prompt validator."""
         text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
         with self._tree(text, prompts=False) as run:
             code, _, err = run()
         self.assertEqual(code, 1, err)
         self.assertIn(".agents/prompts/reviewer.md", err)
 
+    def test_main_rejects_semantic_damage_that_keeps_legacy_phrases(self):
+        """A complete legacy phrase registry must not mask a contradiction."""
+        text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
+        damage = (
+            "reviewer",
+            "## Method",
+            "Scratch mutation replaces static review.\n\n## Method",
+        )
+        with self._tree(text, prompt_damage=damage) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1, err)
+        self.assertIn("unparsed", err)
+
 
 class PromptArtifactTests(unittest.TestCase):
-    def test_both_prompts_exist_and_are_tracked(self):
+    def test_unknown_runtime_prompt_artifact_is_rejected(self):
+        text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
+        with _repo_copy(
+            text,
+            extra_prompt=("critic.md", "# malformed runtime prompt\n"),
+        ) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1, err)
+        self.assertIn("critic.md", err)
+
+    def test_all_runtime_prompts_exist_and_are_tracked(self):
         tracked = _tracked_paths(".agents/prompts")
-        for name in ("reviewer.md", "implementer.md"):
+        for name in ("implementer.md", "reviewer.md", "operator.md"):
             path = ROOT / ".agents/prompts" / name
             self.assertTrue(path.is_file(), f"{name} must exist")
             # A silent downgrade to existence-only is the failure/absence
@@ -433,125 +552,68 @@ class PromptArtifactTests(unittest.TestCase):
                     "is not a protocol",
                 )
 
-    def test_the_reviewer_prompt_carries_the_mutation_instruction(self):
-        # The instruction IS the deliverable. A reviewer told only to "review"
-        # reads the diff, and reading found none of the eleven tests that
-        # passed with their subject deleted.
-        text = (ROOT / ".agents/prompts/reviewer.md").read_text(encoding="utf-8")
-        for needle in ("mutate", "delete or invert", "stays green"):
-            self.assertIn(needle, text.lower(), needle)
+    def test_protocol_checker_uses_the_semantic_prompt_contract(self):
+        self.assertEqual(consistency.prompt_contract_errors(), [])
 
-    def test_the_reviewer_prompt_refuses_to_defer_to_the_plan(self):
-        text = (ROOT / ".agents/prompts/reviewer.md").read_text(encoding="utf-8")
-        self.assertIn("plan-mandated", text.lower())
 
-    def test_checker_rejects_a_prompt_missing_its_instruction(self):
-        # A missing FILE and a present file missing its INSTRUCTION are two
-        # different failures. Asserting only the first would leave the needle
-        # loop -- the part that carries the value -- entirely unpinned.
-        errors = consistency.prompt_errors({"nonexistent-prompt.md": ("mutate",)})
-        self.assertTrue(errors)
-        self.assertTrue(any("missing" in e for e in errors), errors)
-
-        present = ".agents/prompts/reviewer.md"
-        self.assertEqual(consistency.prompt_errors({present: ("mutate",)}), [])
-        omitted = consistency.prompt_errors(
-            {present: ("no reviewer prompt would ever contain this phrase",)}
+class SemanticPromptBridgeBoundaryTests(unittest.TestCase):
+    def _source(self) -> str:
+        return (ROOT / "scripts/check-protocol-consistency.py").read_text(
+            encoding="utf-8"
         )
-        self.assertTrue(any("omits" in e for e in omitted), omitted)
 
-    def test_an_explicitly_empty_spec_checks_nothing(self):
-        # An empty spec must mean "nothing required", not silently fall back to
-        # the live PROMPT_REQUIRED: an absence and a value that look the same is
-        # the defect class the implementer prompt names.
-        with _prompt_tree({}):
-            self.assertEqual(consistency.prompt_errors({}), [])
-            self.assertTrue(consistency.prompt_errors())
+    def assert_source_boundary(self, source: str) -> None:
+        # These are direct assertions over the complete production source. They
+        # deliberately do not consult a production token set: emptying or
+        # renaming an in-checker registry cannot weaken this boundary.
+        self.assertNotIn(".agents/prompts/", source)
+        self.assertNotIn("PROMPT_REQUIRED", source)
+        self.assertNotIn("PHRASE_PINS", source)
 
-    def test_the_checker_enforces_the_phrases_these_tests_demand(self):
-        # Every assertion above reads the prompt FILES, so emptying, narrowing
-        # or widening a PROMPT_REQUIRED tuple would leave them all green while
-        # the gate quietly stopped enforcing what this suite believes it does.
-        #
-        # The comparison is EQUALITY, deliberately, not "demanded is a substring
-        # of enforced". That substring idiom is borrowed from
-        # test_every_declarable_role_is_named_in_the_interview, where it is safe
-        # because the demanded side is DERIVED from role.DECLARABLE. Here both
-        # sides are hand-written literals, and a substring test cannot see the
-        # one narrowing that matters: reverting the reviewer needle from
-        # "mutate, don't read" to a bare "mutate" satisfies it while re-opening
-        # the incidental-match hole check-protocol-consistency.py spends five
-        # lines arguing is dangerous. Equality means changing what the gate
-        # enforces is a deliberate two-file act.
-        demanded = {
-            ".agents/prompts/reviewer.md": (
-                "mutate, don't read",
-                "delete or invert",
-                "stays green",
-                "every mutation you make re-runs the suite",
-                "plan-mandated",
+    def test_protocol_checker_source_is_only_a_prompt_contract_bridge(self):
+        self.assert_source_boundary(self._source())
+
+    def test_source_boundary_rejects_direct_and_indirect_registries_anywhere(self):
+        mutations = (
+            "\nPROMPT_REQUIRED = {}\n",
+            '\nruntime_prompt = ".agents/prompts/reviewer.md"\nlegacy_rows = {runtime_prompt: ()}\n',
+            '\nlegacy_rows = ((".agents/prompts/reviewer.md", ("mutate",)),)\n',
+            '\nlegacy_rows = [[".agents/prompts/reviewer.md", ["mutate"]]]\n',
+            '\ndef retired_validator():\n    return {".agents/prompts/reviewer.md": ("mutate",)}\n',
+            "\nPHRASE_PINS = ()\n",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(AssertionError):
+                    self.assert_source_boundary(self._source() + mutation)
+
+    def test_unrelated_module_constants_remain_allowed(self):
+        extended = self._source() + """
+
+PROMPT_BUDGET = 4096
+REQUIRED_PUBLIC_SURFACES = {"docs/STATUS.md": "feature checkpoint"}
+"""
+        self.assert_source_boundary(extended)
+
+    def test_bridge_imports_and_calls_the_authoritative_repository_validator(self):
+        checker = mock.Mock()
+        checker.repository_errors.return_value = ["semantic sentinel"]
+        with (
+            mock.patch.object(consistency, "_load", return_value=checker) as load,
+            mock.patch.object(
+                consistency,
+                "load_policy",
+                return_value={"POL-PROMPT-BOUNDARIES": object()},
             ),
-            ".agents/prompts/implementer.md": (
-                "failing test first",
-                "mutate every test",
-                "capture that failing set as a baseline",
-                "escalate rather than guess",
-            ),
-        }
-        self.assertEqual(
-            set(demanded),
-            set(consistency.PROMPT_REQUIRED),
-            "PROMPT_REQUIRED covers a different set of prompts than this suite",
+        ):
+            errors = consistency.prompt_contract_errors()
+        load.assert_called_once_with(
+            "prompt_contract_for_consistency", "scripts/check-prompt-contract.py"
         )
-        for relative, needles in demanded.items():
-            with self.subTest(prompt=relative):
-                self.assertEqual(
-                    set(consistency.PROMPT_REQUIRED[relative]),
-                    set(needles),
-                    f"PROMPT_REQUIRED[{relative!r}] no longer enforces exactly "
-                    "the phrases this suite demands; narrowing one is how the "
-                    "gate stops catching what it was built for",
-                )
-
-    def test_a_bare_mutate_needle_would_not_pin_the_binding_instruction(self):
-        # The executable justification for the full "mutate, don't read" needle.
-        # Deleting the ENTIRE binding-instruction section still leaves the word
-        # "mutate" in the file ("Never mutate the reviewed worktree" under What
-        # you may not do), so a bare needle stays green through the exact
-        # deletion it exists to catch. If this test ever goes red because the
-        # incidental match is gone, the needle may safely be simplified.
-        relative = ".agents/prompts/reviewer.md"
-        text = (ROOT / relative).read_text(encoding="utf-8")
-        without_section = re.sub(
-            r"## The binding instruction.*?(?=\n## )", "", text, flags=re.S
+        checker.repository_errors.assert_called_once_with(
+            consistency.ROOT, {"POL-PROMPT-BOUNDARIES"}
         )
-        self.assertNotEqual(without_section, text, "the strip pattern matched nothing")
-        with _prompt_tree({relative: without_section}):
-            self.assertEqual(
-                consistency.prompt_errors({relative: ("mutate",)}),
-                [],
-                "a bare 'mutate' no longer matches incidentally",
-            )
-            self.assertTrue(
-                consistency.prompt_errors({relative: ("mutate, don't read",)}),
-                "the shipped needle failed to catch the section deletion",
-            )
-
-    def test_each_required_phrase_is_pinned_individually(self):
-        # PROMPT_REQUIRED is a hand-written tuple, so a prompt that survives
-        # losing one of its phrases means that phrase was never enforced. Strip
-        # each one in turn from a copy of the real file and demand a red.
-        for relative, needles in consistency.PROMPT_REQUIRED.items():
-            text = (ROOT / relative).read_text(encoding="utf-8")
-            for needle in needles:
-                with self.subTest(prompt=relative, needle=needle):
-                    damaged = re.sub(re.escape(needle), "", text, flags=re.I)
-                    self.assertNotEqual(
-                        damaged, text, f"{needle!r} does not appear in {relative}"
-                    )
-                    with _prompt_tree({relative: damaged}):
-                        errors = consistency.prompt_errors({relative: needles})
-                    self.assertTrue(any("omits" in e for e in errors), errors)
+        self.assertEqual(errors, ["semantic sentinel"])
 
 
 class OrchestrationLoopTests(unittest.TestCase):
@@ -714,6 +776,84 @@ class OrchestrationLoopWiring(unittest.TestCase):
             code, _, err = run()
         self.assertEqual(code, 1)
         self.assertIn("loop omits", err)
+
+
+class CutoverGateWiring(unittest.TestCase):
+    def test_repository_wiring_is_complete(self) -> None:
+        self.assertEqual(consistency.cutover_wiring_errors(ROOT), [])
+
+    def test_each_required_wire_is_mutation_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / ".agents/policy-cutover", target)
+            for relative, needles in consistency.CUTOVER_WIRING.items():
+                for needle in needles:
+                    with self.subTest(path=relative, needle=needle):
+                        path = root / relative
+                        original = path.read_text(encoding="utf-8")
+                        damaged = original.replace(needle, "", 1)
+                        self.assertNotEqual(damaged, original)
+                        path.write_text(damaged, encoding="utf-8")
+                        self.assertTrue(consistency.cutover_wiring_errors(root))
+                        path.write_text(original, encoding="utf-8")
+
+    def test_second_integration_snapshot_validation_is_mutation_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / ".agents/policy-cutover", target)
+            integration = root / "scripts/agent-integration.py"
+            needle = "errors = ready.ready_errors(payload, expected)"
+            original = integration.read_text(encoding="utf-8")
+            damaged = original.replace(needle, "errors = []", 1)
+            self.assertNotEqual(damaged, original)
+            integration.write_text(damaged, encoding="utf-8")
+            self.assertTrue(consistency.cutover_wiring_errors(root))
+
+    def test_local_preflight_rejects_remote_entrypoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / ".agents/policy-cutover", target)
+            preflight = root / "scripts/agent-preflight.sh"
+            preflight.write_text(
+                preflight.read_text(encoding="utf-8") + "\npython3 scripts/agent-ready.py\n",
+                encoding="utf-8",
+            )
+            errors = consistency.cutover_wiring_errors(root)
+            self.assertTrue(any("network-independent" in error for error in errors), errors)
+
+    def test_cutover_file_shape_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("00927ed6\nsecond\n", encoding="utf-8")
+            self.assertTrue(consistency.cutover_wiring_errors(root))
 
 
 if __name__ == "__main__":

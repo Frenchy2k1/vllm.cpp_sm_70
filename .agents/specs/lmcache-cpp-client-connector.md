@@ -304,7 +304,7 @@ compile-time connector registration (not `importlib`, per the W5 deviation).
 
 ### Tests to port
 
-Per [test-porting.md](../test-porting.md), the executable spec travels with the
+Per [porting.md](../porting.md), the executable spec travels with the
 port. The decisive property is **cross-implementation wire conformance against a
 REAL LMCache server**, which no unit test of ours can fake.
 
@@ -348,7 +348,7 @@ checked in SKIPPED with the tracked reason, never dropped.
 6. **Every-axis performance (DGX GB10):** match or beat vLLM (launched with the
    equivalent `--kv-transfer-config` LMCache connector) on total/output
    throughput, req/s, TTFT, TPOT/ITL and peak memory at the large-concurrency
-   operating point, per [benchmark-protocol.md](../benchmark-protocol.md); a
+   operating point, per [verification.md](../verification.md); a
    hit-rate gain that regresses any axis is a failed change.
    **PARTIAL 2026-07-24 (W5):** the correctness/inertness half is met (prefill
    shortcut by 48 tokens with bit-exact continuation; OPT SACRED unchanged

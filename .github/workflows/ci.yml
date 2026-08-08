@@ -89,9 +89,34 @@ jobs:
           python3 scripts/check-gemv-invocation-consistency.py
           python3 tests/scripts/test_check_gemv_invocation_consistency.py
       - name: Protocol prose matches the checkers that enforce it
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
         run: |
+          set -eu
+          python3 scripts/check-policy.py
+          python3 scripts/check-prompt-contract.py
           python3 scripts/check-protocol-consistency.py
+          python3 -m unittest \
+            tests.scripts.test_policy_contract \
+            tests.scripts.test_policy_waivers \
+            tests.scripts.test_check_commit_trailers
+          python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_check_protocol_consistency.py
+          python3 tests/scripts/test_agent_gates.py
+          cutover="$(tr -d '\n' < .agents/policy-cutover)"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
+          python3 scripts/check-commit-trailers.py \
+            --range "$base..$head" --cutover "$cutover"
       - name: The state-log tail is anchored and chronological
         run: |
           python3 scripts/check-state-order.py
@@ -113,8 +138,25 @@ jobs:
           python3 scripts/check-gate-commands.py --check
           python3 tests/scripts/test_check_gate_commands.py
       - name: Agent role machinery and role discipline
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
         run: |
-          python3 scripts/check-role-discipline.py
+          set -eu
+          pending_args=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+            pending_args=(--pending-pr-head "$PR_HEAD")
+          else
+            base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
+          python3 scripts/check-role-discipline.py \
+            --base "$base" --head "$head" "${pending_args[@]}"
           python3 tests/scripts/test_agent_role.py
           python3 tests/scripts/test_agent_onboard.py
       - name: Claim view, helper queue and PR reviewability
@@ -176,7 +218,12 @@ jobs:
           fi
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
-          python3 scripts/check-role-discipline.py --base "$base" --head "$head"
+          pending_args=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            pending_args=(--pending-pr-head "$PR_HEAD")
+          fi
+          python3 scripts/check-role-discipline.py \
+            --base "$base" --head "$head" "${pending_args[@]}"
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
@@ -238,7 +285,8 @@ jobs:
           python3 scripts/check-pr-size.py \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
-            --branch "${{ github.event.pull_request.head.ref }}"
+            --branch "${{ github.event.pull_request.head.ref }}" \
+            --pr-number "${{ github.event.pull_request.number }}"
   cuda-arch-features:
     # Configure-tier assertions on the CUDA per-arch FEATURE TABLE. Needs neither
     # a CUDA toolkit nor a GPU: it drives cmake/CudaArchFeatures.cmake directly,

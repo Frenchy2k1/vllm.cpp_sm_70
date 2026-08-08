@@ -420,7 +420,7 @@ ranges. The `olmo2.py`/`glm4.cpp` anchors above are against pin `e24d1b24` / bas
 
 ### Tests to port
 
-Per [`.agents/test-porting.md`](../test-porting.md). Nothing below is ported by this
+Per [`.agents/porting.md`](../porting.md). Nothing below is ported by this
 spike (spec only); this is the inventory that binds the implementing Ws.
 
 | Upstream test | Tier | Ours |
@@ -433,13 +433,13 @@ spike (spec only); this is the inventory that binds the implementing Ws.
 
 **Upstream coverage note:** OLMo-2 has a standard text-generation correctness entry
 (the same family Llama/Gemma use), directly portable. Our SACRED oracle remains our
-own pinned-vLLM comparison per [`.agents/gates.md`](../gates.md).
+own pinned-vLLM comparison per [`.agents/verification.md`](../verification.md).
 
 ### Gates
 
 1. **Correctness (SACRED), `Olmo2ForCausalLM` on `allenai/OLMo-2-0425-1B` bf16.**
    Token-exact vs the pinned vLLM 0.25.0 oracle, greedy, identical prompt set. Gate
-   form selected BY MEASUREMENT per [`near-tie-distributional-gate`](../gates.md): run
+   form selected BY MEASUREMENT per [`near-tie-distributional-gate`](../verification.md): run
    vLLM's own greedy K=5 first. A 1.485B dense model may be in the small-dense near-tie
    regime — a distributional / near-tie-band fallback (our token in vLLM's K-run set,
    or within a measured nats band with 0 forward-divergent) is permitted ONLY if

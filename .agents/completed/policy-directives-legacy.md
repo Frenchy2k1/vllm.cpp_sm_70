@@ -28,7 +28,7 @@ library / C ABI, as the CLI, and as the OpenAI server, with a runnable example
 each). Every argument, flag, and endpoint documented MUST be grounded in actual
 source, never invented.
 
-**Keep [`docs/STATUS.md`](../docs/STATUS.md) CURRENT at EVERY feature/iteration
+**Keep [`docs/STATUS.md`](../../docs/STATUS.md) CURRENT at EVERY feature/iteration
 checkpoint. THAT is the per-capability status surface, NOT `README.md`.** In the
 SAME change that shifts a feature's lifecycle state, update its ONE binding
 current-state line in the matching `docs/STATUS.md` section or table (typically
@@ -60,7 +60,7 @@ user-facing sections exist, that `docs/STATUS.md` exists and carries the
 capability ledger, and that the README stays inside its length, paragraph, and
 table-cell budgets; do not weaken the checker to bypass the obligation.
 
-**Keep [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) CURRENT at the SAME
+**Keep [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md) CURRENT at the SAME
 checkpoint.** Every feature/iteration records its benchmark disposition there
 in the same change: accepted numbers with exact workload/reference/evidence,
 or an explicit `PENDING`, `NOT APPLICABLE`, `FAILED`, or `VOID` reason and the
@@ -77,7 +77,7 @@ not a style preference: that is exactly how the page reached 11,405 lines and
 171 claim-titled sections and stopped being readable by users (converted
 2026-08-04). Per-attempt narrative, refuted hypotheses, profiler tables and
 superseded numbers go to the append-only
-[`.agents/benchmark-record.md`](benchmark-record.md) **in the same
+[`.agents/benchmark-record.md`](../benchmark-record.md) **in the same
 change** (move it, never delete evidence). If sections have accumulated anyway,
 `scripts/roll-benchmark-record.py --apply` moves every non-canonical section
 into the record verbatim. `scripts/check-public-doc-tables.py` (CI-gated, with
@@ -87,7 +87,7 @@ the house no-em-dash rule, and that the page still points at the record; do not
 weaken the checker to bypass the obligation. When a DENOMINATOR turns out to be
 wrong, correct every ratio built on it, never keep the flattering one.
 
-**Keep [`docs/FEATURES.md`](../docs/FEATURES.md) CURRENT — same-change
+**Keep [`docs/FEATURES.md`](../../docs/FEATURES.md) CURRENT — same-change
 obligation.** It is the PUBLIC feature surface: what we support, next to vLLM,
 SGLang and llama.cpp. It is a KEYED TABLE under the same rules as
 `docs/BENCHMARKS.md` above (one row per feature, updated in place, no appended
@@ -130,7 +130,7 @@ target — a new `VLLM_CPP_CUDA_ARCHITECTURES` value or a new
 configure-time pipeline (`-DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_REGEN=ON
 -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_XX`; cross-compiled, no target board needed;
 57 artifacts + MANIFEST matching the `sm_121a` fileset — see
-[.agents/specs/triton-aot-per-arch.md](specs/triton-aot-per-arch.md) and
+[.agents/specs/triton-aot-per-arch.md](../specs/triton-aot-per-arch.md) and
 `cmake/TritonAOT.cmake`), with `scripts/check-triton-aot-drift.sh` rc=0; or
 (b) if regen is not yet possible on that arch, record the GDN-decode gap
 HONESTLY in `backend-matrix.md`/`kernel-matrix.md` (that arch runs the hand
@@ -252,7 +252,7 @@ norm+quant, MoE, sm_121 "blackwell_sm12x" kernels), **cutlass**, **cuBLASLt**
 (nvjet), **DeepGEMM**, and **torch/Inductor** (the fused Triton it codegens). Read
 the actual pinned vLLM code (`${VLLM_SOURCE}` @ pin `555967922`, vLLM
 0.26.0.dev0 — advanced 2026-07-26 from the prior `e24d1b24`/0.25.0 pin; see
-[.agents/specs/pin-advance.md](specs/pin-advance.md)) AND, as
+[.agents/specs/pin-advance.md](../specs/pin-advance.md)) AND, as
 needed, the installed dependency source (`${DEPENDENCY_SOURCE}`, for example
 `flashinfer/cute_dsl/*.py` and `flashinfer/gemm/`), cite `file:line` on every
 side, and mirror what you find. **NEVER declare a lever "build-specific",
@@ -386,7 +386,7 @@ child kernels. Verify the export has graph-node kernel rows whenever graph launc
 occur; a whole-graph-only report is attribution-incomplete and cannot select a lever.**
 This applies to every subagent and every parity
 check. Full method:
-[.agents/parity-lever-protocol.md](parity-lever-protocol.md) § Verify the
+[.agents/parity-lever-protocol.md](../parity-lever-protocol.md) § Verify the
 whole chain.
 
 ## STANDING DIRECTIVE — port the TESTS with the code (upstream tests = the spec)
@@ -399,7 +399,7 @@ cases, with the upstream test file cited in the header. Specs
 test that can't pass yet is checked in SKIPPED with a tracked reason, never
 dropped. This ground-rules our work against what vLLM actually guarantees and
 turns the suite into the regression net. Full protocol:
-[.agents/test-porting.md](test-porting.md).
+[.agents/test-porting.md](test-porting-legacy.md).
 
 ## STANDING DIRECTIVE — always compare vs vLLM (the oracle), same workload
 
@@ -408,7 +408,7 @@ apples-to-apples against vLLM and both numbers + the ratio recorded in the
 ledger: **correctness** vs the pinned pip-vLLM oracle (`${VLLM_ORACLE}`),
 **performance** vs `vllm bench throughput` on the *identical* workload. Never
 re-base the bench config without re-running vLLM on it. This is non-negotiable
-and applies to subagents. Full rule: [.agents/gates.md](gates.md)
+and applies to subagents. Full rule: [.agents/gates.md](mvp-gates-legacy.md)
 § PROTOCOL DIRECTIVE.
 
 **Acceptance rule — match or beat vLLM on EVERY axis, never below.** Benchmark
@@ -421,7 +421,7 @@ any axis = an open gap, not a done change; "near parity" is NOT met.
 seed, build, vLLM oracle cmd), re-run ≥2–3× to confirm within run-noise, use a
 same-binary A/B, and run only on an idle box (contended runs are void). A number
 that doesn't reproduce does not count. Full protocol:
-[.agents/benchmark-protocol.md](benchmark-protocol.md).
+[.agents/benchmark-protocol.md](benchmark-protocol-legacy.md).
 
 **Additional competitor floor — equivalent SGLang binds wherever it is
 faster.** vLLM remains mandatory on every workload, but an exact SGLang arm is
@@ -460,7 +460,7 @@ unchanged. Each participating agent reads BOTH the pinned vLLM
 `file:line` on both sides, and reports what vLLM does DIFFERENTLY that makes it
 faster. Then verify each diff adversarially (real? on the gate hot path?), rank
 by gain÷effort, drive the top lever, re-measure vs vLLM, repeat. Full protocol:
-[.agents/parity-lever-protocol.md](parity-lever-protocol.md). Caveat: a
+[.agents/parity-lever-protocol.md](../parity-lever-protocol.md). Caveat: a
 real per-op comparison needs a CLEAN slice of OURS (not inferred proportions).
 A vLLM edge that is an Inductor/DeepGEMM/flashinfer FUSION is NOT a ceiling: only
 *eager* op-by-op dispatch can't fuse, and our engine is not limited to eager — we
@@ -504,7 +504,7 @@ So: same-kernel-different-throughput is a real RED FLAG worth the structural sca
 declaring a "ceiling" prematurely — but confirm the anomaly PER-SHAPE (never on an aggregate
 derived metric), and verify the reference's rationale actually applies to YOUR measured
 situation before you build the fix. Full method:
-[.agents/parity-lever-protocol.md](parity-lever-protocol.md) § The STRUCTURAL lens.
+[.agents/parity-lever-protocol.md](../parity-lever-protocol.md) § The STRUCTURAL lens.
 
 ## Standing directive — ONE SURFACE: every capability ships through the C ABI
 

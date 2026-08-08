@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -466,14 +467,30 @@ class RoleDiscipline(unittest.TestCase):
         self.assertTrue(problems)
         self.assertTrue(discipline.enforced("HEAD"))
 
-    def test_live_repository_is_reportable(self) -> None:
-        # main() parses sys.argv, which under `unittest -v` still carries the
-        # runner's own flags and made argparse SystemExit(2) here. The argv is
-        # isolated; the assertion is unchanged.
+    def test_exact_pending_pr_range_is_reportable_in_any_checkout(self) -> None:
+        head = discipline.git("rev-parse", "HEAD")
+        base = discipline.git("rev-parse", "HEAD^")
         saved = sys.argv
-        sys.argv = [saved[0]]
+        sys.argv = [
+            saved[0],
+            "--base",
+            base,
+            "--head",
+            head,
+            "--pending-pr-head",
+            head,
+        ]
         try:
             self.assertEqual(discipline.main(), 0)
+        finally:
+            sys.argv = saved
+
+    def test_landed_detached_commit_remains_strict_without_pending_evidence(self) -> None:
+        saved = sys.argv
+        sys.argv = [saved[0], "--commit", "HEAD"]
+        try:
+            with mock.patch.object(discipline, "has_reached_main", return_value=True):
+                self.assertEqual(discipline.main(), 1)
         finally:
             sys.argv = saved
 

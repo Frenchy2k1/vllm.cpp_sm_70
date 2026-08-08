@@ -1622,18 +1622,31 @@ items a-runner/b stay with the async/GDN `runner.cpp` owners.
 | `CLAIM-EMBEDDINGS-ONE-SURFACE` | `ENG-POOLING-RUNNER` (live engine-step invocation), `SERVE-POOLING-ENDPOINTS` (SPIKE→ACTIVE, `/v1/embeddings`), `MODEL-EMBED-llama-llama-for-causal-lm` (INVENTORIED→ACTIVE; PARTIAL on merge — only the `LlamaModel` membership registered); cross-refs `ENG-POOLER-SEQ` (stays `CLAIM-POOLING`, ops untouched) | Claude Code (fable-5) helper, task #285 | isolated worktree `/home/mudler/_git/vllm.cpp-embeddings-one-surface` (CPU-only; lean per-target builds under disk pressure) | branch `row/EMBEDDINGS-ONE-SURFACE`, base `main` `b44ad337`, DRAFT PR #137 (the reservation) | ARCH-ONE-SURFACE fold ROW 6: embeddings/pooling through the ONE surface. Owns: NEW `src/vllm/model_executor/models/llama_embedding_registry.cpp` + `LoadLlamaModelEmbeddingWeights` (llama_weights.cpp) + `Qwen3DenseModel::ForwardHidden` (qwen3.{h,cpp} additive tail); the ADDITIVE task-gated pooling plumb (`LoadedModel::pooler()`, runner `pooling_runner_`+`pool_tokens`, `Request/EngineCoreRequest::pooling_params`, `ModelRunnerOutput::pooler_output`, scheduler pooling stop, `EngineCoreOutput/RequestOutput::pooling_output`, `LLMEngine::add_pooling_request/embed`, `ResolveAsyncEnabled(is_pooling_model)`); `vllm_embed`/`vllm_embedding_result_free` ABI v15 (vllm.h + vllm_c.cpp incl. the refuse-both-directions guards + the v13 `vllm_complete_tokens` missing-guard fix); `handle_embeddings` + `set_embedder` + task-conditional route (api_server.{h,cpp}) + server main pooling dispatch; NEW fixture `tests/vllm/models/fixtures/llama_embed_e2e` + `scripts/mm/llama_embed_fixture_gen.py` + `tests/vllm/models/test_llama_embedding_fold.cpp`; test/guard updates (test_capi v15 section + floor pin >= 15, test_dlopen symbols, c_header_compile.c, test_api_server embeddings section, test_model_registry/gguf arch pins, check-supported-models ARCH_TOKEN_RE); allowlist row removal + FEATURES/STATUS/BENCHMARKS rows + matrices + specs. **NON-COLLISION:** every engine hook is task-gated on `is_pooling_model`/`pooling_params` (nullopt/false = byte-identical text path); no SACRED path rewritten; no example added. | `ACTIVE` | 2026-08-08 — CPU-LANDED on the branch: fold gate `test_llama_embedding_fold` 4/4-231 (engine path == direct registry path + f64 LAST+normalize ref + chunked is_valid arm), `test_capi` 48/48-462, `test_dlopen` 30/30, server suite 50/50, registry 24/24-820, engine suites green (scheduler 423, llm_engine 204, engine_core 44, output_processor 77, qwen3_forward 1557, async_llm 342, llama_forward 509); 9 mutation kills (floor pin, refuse both directions, route gating both ways, engine-step invocation, scheduler stop, registry info pin, async-off wire). RESIDUAL: real embedding checkpoint + `LLM(task="embed")` oracle cosine. |
 
 
-<!-- claim-view:begin -->
-<!-- claim-view:generated 2026-08-04 -->
+## Live claim authority
 
-GENERATED from open pull requests by `scripts/claim-view.py --apply`.
-Do not hand-edit: an open `row/<ROW-ID>` PR IS the reservation, and it
-is released by merging or closing it.
+Claims are not snapshotted in this record. `scripts/claim-view.py --check-live`
+validates current pull requests; `--check-local` proves that no stale snapshot
+was recommitted. Remote failure is `REMOTE_UNVERIFIED`, never an empty claim
+set. The retired timestamp/TTL procedure is preserved in
+[completed/pre-cutover-claim-protocol.md](completed/pre-cutover-claim-protocol.md).
 
-| Row | PR | State | Agent | Updated |
-|---|---|---|---|---|
-| _none_ | | | | |
+A `READY` row is advertised to helpers only after its base-committed spec
+contains exactly one closed execution contract:
 
-<!-- claim-view:end -->
+```text
+<!-- helper-readiness:v1
+{"gate":["python3","tests/example_gate.py"],"mutation":["python3","tests/example_mutation.py"]}
+-->
+```
+
+Both values are argv arrays, never shell strings. `ready-for-helper.py` reads
+the spec and referenced executables from the configured base commit, expands
+that exact commit into a disposable checkout, and runs both commands with no
+shell, a sanitized environment, bounded diagnostics, and a timeout. The gate
+must exit zero and the mutation command must exit nonzero. A mutable worktree
+file, prose assertion, missing/nonregular program, or unsafe argv cannot prove
+readiness. CPU or exact gate hardware, satisfied dependencies, `READY`
+lifecycle, and the absence of a repository-matching live claim remain required.
 
 **16-bit CPU GEMM: wide x86 ISA tiers + tiled sgemm (`KERNEL-GEMM-CPU-ELEM-X86WIDE`
 + `KERNEL-GEMM-CPU-TILED`, 2026-08-06, `CLAIM-KERNEL-CPU-ELEM-WIDE-1`).** Claude

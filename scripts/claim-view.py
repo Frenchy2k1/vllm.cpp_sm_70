@@ -1,188 +1,368 @@
 #!/usr/bin/env python3
-"""Derive the claim view from open PRs instead of maintaining it by hand. (W2)
+"""Validate helper claims from live pull-request state.
 
-`coordination.md`'s hand-written claim table rotted for a structural reason:
-claiming was free and never expired, while releasing cost anchor work. On
-2026-08-04 it carried 106 rows asserting "implementation in flight" with nobody
-flying them.
-
-A PR is already a self-evidently live-or-dead claim: open = reserved, merged or
-closed = released, no upkeep. So the claim view is GENERATED from PR state into a
-delimited block, and the block is a REPORT that is never hand-edited.
-
-Two modes, deliberately split so CI never needs the network:
-
-    scripts/claim-view.py --apply    # query GitHub, rewrite the block
-    scripts/claim-view.py --check    # offline: the block is well-formed,
-                                     # its row IDs exist, and it is not stale
-
-The legacy hand-maintained table above the block stays until the protocol cuts
-over, because `check-agent-record.py` still requires every SPIKE/ACTIVE row's
-owner to appear there. Removing it before those rows have PRs would strand them.
+The remote is the authority.  Local preflight checks only that no obsolete
+snapshot has been committed; ready/integration checks consume live PR JSON.
+An unavailable remote is neither an empty claim set nor success.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / ".agents/coordination.md"
-
-BEGIN = "<!-- claim-view:begin -->"
-END = "<!-- claim-view:end -->"
-GENERATED = re.compile(r"<!--\s*claim-view:generated\s+(\S+)\s*-->")
-
-# A claim with no PR behind it expires: this is the TTL that stops the rot.
-STALE_AFTER_DAYS = 14
-
-ROW_BRANCH = re.compile(r"^row/([A-Za-z0-9_.-]+)$")
-
-
-def git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+ROW_BRANCH = re.compile(r"^row/([A-Za-z0-9][A-Za-z0-9_.-]*)$")
+REMOTE_UNVERIFIED_EXIT = 4
+OPEN_STATE = "OPEN"
+LIVE_FIELDS = (
+    "number,state,headRefName,isDraft,title,author,headRepository"
+)
+FIXTURE_KEYS = frozenset({"expected", "prs"})
+EXPECTED_KEYS = frozenset({"repository", "base", "task_id", "head", "number"})
+REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-def known_row_ids() -> set[str]:
-    """Every stable row ID the matrices define."""
-    import importlib.util
+class RemoteUnverified(RuntimeError):
+    """The authoritative PR state could not be obtained or decoded."""
 
-    spec = importlib.util.spec_from_file_location(
-        "agent_record", ROOT / "scripts/check-agent-record.py"
-    )
+
+def _load_record(root: Path):
+    path = root / "scripts/check-agent-record.py"
+    spec = importlib.util.spec_from_file_location("claim_view_agent_record", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot load canonical record parser from {path}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_record"] = module
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    rows: set[str] = set()
-    for path in module.MATRIX_PATHS:
-        rows |= {r.item_id for r in module.parse_claim_rows(path, [])}
+    return module
+
+
+def _location(row: object, root: Path) -> str:
+    path = Path(row.path)
+    try:
+        rendered = path.relative_to(root).as_posix()
+    except ValueError:
+        rendered = path.as_posix()
+    return f"{rendered}:{row.line_no}"
+
+
+def canonical_task_rows(root: Path = ROOT) -> list:
+    """Parse the task record once, rejecting duplicate identity before indexing."""
+
+    record = _load_record(root)
+    errors: list[str] = []
+    rows = []
+    locations: dict[str, list[str]] = {}
+    for path in record.MATRIX_PATHS:
+        for row in record.parse_claim_rows(path, errors):
+            rows.append(row)
+            locations.setdefault(row.item_id, []).append(_location(row, root))
+    errors.extend(
+        f"duplicate task ID {item_id} at " + ", ".join(found)
+        for item_id, found in sorted(locations.items())
+        if len(found) > 1
+    )
+    if errors:
+        raise ValueError("canonical task record is invalid: " + "; ".join(errors))
     return rows
 
 
-def fetch_open_prs() -> list[dict]:
-    out = subprocess.check_output(
-        ["gh", "pr", "list", "--state", "open", "--limit", "200",
-         "--json", "number,headRefName,isDraft,title,author,updatedAt"],
-        cwd=ROOT, text=True,
-    )
-    return json.loads(out)
+def known_task_ids(root: Path = ROOT) -> set[str]:
+    """Return task IDs from the existing canonical matrix record.
+
+    The task-aware helper transaction (and its governance-task registry) was
+    deliberately deferred from this PR.  This adapter therefore has one source:
+    the matrices already parsed by check-agent-record.py.  Live validation and
+    readiness both call this function, so they cannot disagree about identity.
+    """
+
+    return {row.item_id for row in canonical_task_rows(root)}
 
 
-def render(prs: list[dict], stamp: str) -> str:
-    rows = []
-    for pr in sorted(prs, key=lambda p: p["number"]):
-        match = ROW_BRANCH.match(pr.get("headRefName", ""))
-        if not match:
-            continue
-        state = "draft" if pr.get("isDraft") else "ready"
-        author = (pr.get("author") or {}).get("login", "?")
-        rows.append(
-            f"| `{match.group(1)}` | #{pr['number']} | {state} | {author} | "
-            f"{pr.get('updatedAt', '')[:10]} |"
+def fetch_prs() -> list[dict]:
+    """Fetch the open PR set; raise a typed unknown-state result on failure."""
+
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "list", "--state", "open", "--limit", "500",
+                "--json", LIVE_FIELDS,
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
         )
-    body = "\n".join(rows) if rows else "| _none_ | | | | |"
-    return "\n".join([
-        BEGIN,
-        f"<!-- claim-view:generated {stamp} -->",
-        "",
-        "GENERATED from open pull requests by `scripts/claim-view.py --apply`.",
-        "Do not hand-edit: an open `row/<ROW-ID>` PR IS the reservation, and it",
-        "is released by merging or closing it.",
-        "",
-        "| Row | PR | State | Agent | Updated |",
-        "|---|---|---|---|---|",
-        body,
-        "",
-        END,
-    ])
+    except OSError as exc:
+        raise RemoteUnverified(str(exc)) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"gh exited {result.returncode}"
+        raise RemoteUnverified(detail)
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RemoteUnverified(f"invalid PR JSON: {exc}") from exc
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise RemoteUnverified("PR response must be a JSON array of objects")
+    return value
 
 
-def block_bounds(text: str) -> tuple[int, int] | None:
-    start, end = text.find(BEGIN), text.find(END)
-    if start == -1 or end == -1 or end < start:
-        return None
-    return start, end + len(END)
+def _closed_object(pairs: list[tuple[str, object]]) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
 
 
-def check_errors(text: str, rows: set[str]) -> list[str]:
-    """Offline validation of the generated block."""
-    bounds = block_bounds(text)
-    if bounds is None:
-        return [
-            f".agents/coordination.md is missing the claim view block "
-            f"({BEGIN} ... {END}); regenerate with scripts/claim-view.py --apply"
-        ]
-    block = text[bounds[0]:bounds[1]]
+def _validate_expected(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise RemoteUnverified("fixture expected must be an object")
+    unknown = sorted(set(value) - EXPECTED_KEYS)
+    if unknown:
+        raise RemoteUnverified("fixture expected has unknown keys: " + ", ".join(unknown))
+    repository = value.get("repository")
+    if not isinstance(repository, str) or REPOSITORY.fullmatch(repository) is None:
+        raise RemoteUnverified("fixture expected.repository is required and must be owner/name")
+    base = value.get("base")
+    if base is not None and (not isinstance(base, str) or not base.strip()):
+        raise RemoteUnverified("fixture expected.base must be a nonempty string")
+    task_id = value.get("task_id")
+    if task_id is not None and (
+        not isinstance(task_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", task_id) is None
+    ):
+        raise RemoteUnverified("fixture expected.task_id must be a canonical task ID")
+    head = value.get("head")
+    if head is not None and (
+        not isinstance(head, str)
+        or ROW_BRANCH.fullmatch(head) is None
+        or task_id is None
+    ):
+        raise RemoteUnverified("fixture expected.head requires task_id and canonical row head")
+    number = value.get("number")
+    if number is not None and _pr_number(number) is None:
+        raise RemoteUnverified("fixture expected.number must be a positive integer")
+    return value
+
+
+def load_pr_fixture(path: Path) -> tuple[list[dict], dict]:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_closed_object
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RemoteUnverified(f"cannot read PR fixture {path}: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != FIXTURE_KEYS:
+        raise RemoteUnverified("PR fixture must be a closed {expected, prs} object")
+    prs = value["prs"]
+    if not isinstance(prs, list) or any(not isinstance(item, dict) for item in prs):
+        raise RemoteUnverified("fixture prs must be an array of objects")
+    return prs, _validate_expected(value["expected"])
+
+
+def repository_identity(root: Path = ROOT) -> str:
+    """Derive exact owner/name authority from this checkout's origin URL."""
+
+    result = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RemoteUnverified("cannot derive expected repository from git origin")
+    remote = result.stdout.strip()
+    if "://" in remote:
+        path = urlsplit(remote).path
+    else:
+        match = re.fullmatch(r"[^@:/]+@[^:/]+:(.+)", remote)
+        path = match.group(1) if match else remote
+    candidate = path.strip("/")
+    if candidate.endswith(".git"):
+        candidate = candidate[:-4]
+    parts = candidate.split("/")
+    identity = "/".join(parts[-2:]) if len(parts) >= 2 else ""
+    if REPOSITORY.fullmatch(identity) is None:
+        raise RemoteUnverified(f"cannot derive owner/name from origin {remote!r}")
+    return identity
+
+
+def _pr_number(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def validate_live_claims(
+    prs: list[dict],
+    known_tasks: set[str],
+    expected: dict | None = None,
+) -> list[str]:
+    """Validate a complete live claim set with deterministic diagnostics."""
+
     errors: list[str] = []
+    numbers: dict[int, int] = {}
+    task_claims: dict[str, list[int]] = {}
+    valid_claims: list[tuple[int, str, str, dict]] = []
+    expected_repository = expected.get("repository") if expected is not None else None
+    if prs and (
+        not isinstance(expected_repository, str)
+        or REPOSITORY.fullmatch(expected_repository) is None
+    ):
+        errors.append("nonempty PR input lacks expected repository identity")
 
-    stamp = GENERATED.search(block)
-    if not stamp:
-        errors.append("the claim view has no <!-- claim-view:generated ... --> stamp")
+    for index, item in enumerate(prs):
+        label = f"PR entry {index + 1}"
+        number = _pr_number(item.get("number"))
+        if number is None:
+            errors.append(f"{label} has malformed PR number")
+        else:
+            numbers[number] = numbers.get(number, 0) + 1
+            label = f"PR #{number}"
+
+        state = item.get("state")
+        if state not in {"OPEN", "CLOSED", "MERGED"}:
+            errors.append(f"{label} has malformed state {state!r}")
+
+        repository = item.get("headRepository")
+        repository_name = (
+            repository.get("nameWithOwner") if isinstance(repository, dict) else None
+        )
+        if not isinstance(repository_name, str) or REPOSITORY.fullmatch(repository_name) is None:
+            errors.append(f"{label} has malformed head repository identity")
+        elif expected_repository is not None and repository_name != expected_repository:
+            errors.append(
+                f"{label} repository {repository_name!r} does not match expected "
+                f"{expected_repository!r}"
+            )
+
+        head = item.get("headRefName")
+        if not isinstance(head, str):
+            errors.append(f"{label} has malformed head identity")
+            continue
+        match = ROW_BRANCH.fullmatch(head)
+        if match is None:
+            # Unrelated PRs are not claims.  A row-like malformed branch is an
+            # attempted claim and must not disappear from validation.
+            if head.startswith("row/"):
+                errors.append(f"{label} has malformed row head {head!r}")
+            continue
+
+        task = match.group(1)
+        if state != OPEN_STATE:
+            errors.append(f"{label} for task {task} is {state}, not a live claim")
+        if task not in known_tasks:
+            errors.append(f"{label} claims unknown task {task}")
+        if number is not None:
+            task_claims.setdefault(task, []).append(number)
+            valid_claims.append((number, task, head, item))
+
+    for number, count in sorted(numbers.items()):
+        if count > 1:
+            errors.append(f"PR number #{number} is ambiguous ({count} entries)")
+    for task, claims in sorted(task_claims.items()):
+        distinct = sorted(set(claims))
+        if len(distinct) > 1:
+            rendered = ", ".join(f"PR #{number}" for number in distinct)
+            errors.append(f"task {task} has duplicate open claims: {rendered}")
+
+    if expected is not None and "task_id" in expected:
+        task = expected.get("task_id")
+        if not isinstance(task, str) or task not in known_tasks:
+            errors.append(f"expected claim has unknown or malformed task_id {task!r}")
+        else:
+            matches = [claim for claim in valid_claims if claim[1] == task]
+            if not matches:
+                if len(valid_claims) == 1:
+                    number, _, head, _ = valid_claims[0]
+                    expected_head = expected.get("head", f"row/{task}")
+                    errors.append(
+                        f"PR #{number} has wrong head {head!r}; expected {expected_head!r}"
+                    )
+                errors.append(f"expected live claim for task {task} is missing")
+            else:
+                expected_head = expected.get("head", f"row/{task}")
+                for number, _, head, item in matches:
+                    if head != expected_head:
+                        errors.append(
+                            f"PR #{number} has wrong head {head!r}; expected {expected_head!r}"
+                        )
+                expected_number = expected.get("number")
+                if expected_number is not None and not any(
+                    number == expected_number for number, *_ in matches
+                ):
+                    got = ", ".join(f"#{number}" for number, *_ in matches)
+                    errors.append(
+                        f"expected PR #{expected_number} for task {task}; found {got}"
+                    )
+    return sorted(set(errors))
+
+
+def claimed_tasks(prs: list[dict]) -> set[str]:
+    """Return only canonical OPEN row claims after callers validate the set."""
+
+    result = set()
+    for item in prs:
+        match = ROW_BRANCH.fullmatch(item.get("headRefName", ""))
+        if match is not None and item.get("state") == OPEN_STATE:
+            result.add(match.group(1))
+    return result
+
+
+def local_errors(text: str) -> list[str]:
+    if "<!-- claim-view:begin -->" in text or "<!-- claim-view:end -->" in text:
+        return [
+            "committed claim-view snapshots are forbidden; live PR state is authoritative"
+        ]
+    return []
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check-local", action="store_true")
+    mode.add_argument("--check-live", action="store_true")
+    mode.add_argument("--check", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pr-json", type=Path, help="offline live-state fixture")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.check_local or args.check:
+        if args.pr_json is not None:
+            _parser().error("--pr-json requires --check-live")
+        failures = local_errors(COORD.read_text(encoding="utf-8"))
     else:
         try:
-            age = time.time() - time.mktime(time.strptime(stamp.group(1), "%Y-%m-%d"))
-            if age > STALE_AFTER_DAYS * 86400:
-                errors.append(
-                    f"the claim view was generated {int(age // 86400)} days ago, over "
-                    f"the {STALE_AFTER_DAYS}-day TTL; a claim with no live PR behind "
-                    "it must expire rather than rot. Re-run --apply"
-                )
-        except ValueError:
-            errors.append(f"unparseable claim-view stamp {stamp.group(1)!r}")
+            if args.pr_json:
+                prs, expected = load_pr_fixture(args.pr_json)
+            else:
+                prs = fetch_prs()
+                expected = {"repository": repository_identity(ROOT)}
+            failures = validate_live_claims(prs, known_task_ids(ROOT), expected)
+        except (RemoteUnverified, ValueError) as exc:
+            print(f"REMOTE_UNVERIFIED: {exc}", file=sys.stderr)
+            return REMOTE_UNVERIFIED_EXIT
 
-    for line in block.splitlines():
-        if not line.startswith("| `"):
-            continue
-        row = line.split("`")[1]
-        if row not in rows:
-            errors.append(f"the claim view references unknown row {row}")
-    return errors
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--apply", action="store_true", help="query GitHub and rewrite")
-    mode.add_argument("--check", action="store_true", help="offline validation (default)")
-    args = parser.parse_args()
-
-    text = COORD.read_text(encoding="utf-8")
-
-    if args.apply:
-        try:
-            prs = fetch_open_prs()
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            print(f"ERROR: could not query GitHub ({exc}); --apply needs `gh`",
-                  file=sys.stderr)
-            return 1
-        stamp = time.strftime("%Y-%m-%d")
-        rendered = render(prs, stamp)
-        bounds = block_bounds(text)
-        if bounds:
-            text = text[:bounds[0]] + rendered + text[bounds[1]:]
-        else:
-            anchor = "## Handoff queue"
-            if anchor not in text:
-                print("ERROR: no place to insert the claim view", file=sys.stderr)
-                return 1
-            text = text.replace(anchor, rendered + "\n\n" + anchor, 1)
-        COORD.write_text(text, encoding="utf-8")
-        claimed = sum(1 for line in rendered.splitlines() if line.startswith("| `"))
-        print(f"claim view regenerated: {claimed} row(s) reserved by open PRs")
-        return 0
-
-    failures = check_errors(text, known_row_ids())
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         return 1
-    print("OK: the claim view is present, well-formed and inside its TTL.")
+    mode = "local record" if (args.check_local or args.check) else "live PR claims"
+    print(f"OK: {mode} validated.")
     return 0
 
 

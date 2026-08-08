@@ -1227,10 +1227,10 @@ ENFORCES** since `44e8225c`: feature code reaches `main` only via a merged
 `cancel-in-progress` group contradicting their own comments, so two pushes had
 them cancelled. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
-[.agents/directives.md](../.agents/directives.md), and THIS page gained a
+[the archived directives](../.agents/completed/policy-directives-legacy.md), and THIS page gained a
 shrink-only ratchet. Detail is in `.agents/state.md`. An operator/helper
 protocol is ACCEPTED; W0-W5 LANDED, enforcement opt-in
-([spec](../.agents/specs/operator-helper-protocol.md)). No engine code, no
+([archived spec](../.agents/completed/operator-helper-protocol-legacy.md)). No engine code, no
 kernel, no numbers changed.
 
 Qwen3.5-4B direct-load remains speed-pending against the oracle built at the
@@ -1932,8 +1932,7 @@ same workload, and every change that could affect correctness or performance is
 compared apples-to-apples against vLLM with both numbers and the ratio recorded.
 Behavioral CPU tests run under CTest; CUDA correctness, sanitizer, trace, and
 performance evidence is recorded per feature rather than inferred from source.
-The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
-[`.agents/benchmark-protocol.md`](../.agents/benchmark-protocol.md). A CI check
+The active protocol is in the [verification procedure](../.agents/verification.md). A CI check
 (`scripts/check-fusion-consistency.py`) additionally keeps model forwards routing
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
 hand-fusing it. A sibling CI check

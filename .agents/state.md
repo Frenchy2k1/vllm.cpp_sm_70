@@ -995,7 +995,7 @@
   chunked scan is now the #1 prefill lever at 63.8%, NOT the already-done MoE GEMM; gap 7.5×,
   config stated); (2) fixed the roadmap M0 header (M0.10 GGUF CPU load is DONE `6ef3f12`, real-
   GGUF parity dgx-pending — header had said "remains open"). OPEN DECISIONS surfaced to the
-  user: (a) **27B W4A4 gate scope** — gates.md makes 27B a co-equal throughput gate model but
+  user: (a) **27B W4A4 gate scope** — verification.md makes 27B a co-equal throughput gate model but
   every roadmap/inventory marker defers it (~M2.2); need an explicit "MVP = 35B-only vs 35B+27B"
   call; (b) **`/metrics` Prometheus endpoint** — gate #4 names it explicitly, currently deferred.
   RECORD CORRECTION: the `test_qwen36_weights` red reported at `2999431` (Phase 2, "79/80,
@@ -1007,12 +1007,12 @@
   regression — CONFIRM on a free-box GB10 run between kernel jobs (non-blocking).
 - **2026-07-04 (MVP definition SHARPENED by user + scope decisions)** — user calls:
   (1) **27B is co-equal in-MVP** (35B + 27B BOTH at vLLM throughput = the MVP; not deferred).
-  (2) **`/metrics` Prometheus DROPPED** from MVP → post-MVP (gates.md gate #4 updated).
+  (2) **`/metrics` Prometheus DROPPED** from MVP → post-MVP (verification.md gate #4 updated).
   (3) **MVP = both gate models at vLLM speed, full stop.** Explicitly POST-MVP, ordered:
   (a) more architectures, (b) more/faster CUDA kernels, (c) **design-lift to import vLLM
   kernels directly (csrc drop-in → cut maintenance)**, (d) a systematic sweep of vLLM
   features/archs/accelerators we lack → decide follow-up. Do NOT start post-MVP until both
-  models hit parity. gates.md banner records this. IMPLICATION: the 35B throughput campaign
+  models hit parity. verification.md banner records this. IMPLICATION: the 35B throughput campaign
   (GDN scan in progress → decode GEMV/argmax) continues, AND a 27B/W4A4 bring-up starts as a
   parallel CPU-first workstream (correctness scaffolding: the dense `Qwen3_5ForConditional
   Generation` arch + compressed-tensors W4A4 load/dequant + greedy parity vs the oracle) —
@@ -1239,7 +1239,7 @@ f32. LocalAI worker kept DOWN (dgx perf work ongoing).
 "CUDA fast-path" was sanctioned and PROVEN end-to-end on dgx (token-exact rmsnorm
 via `triton.tools.compile`+`link`, runtime Triton-free; branch `perf/triton-fastpath`).
 On re-reading the canon it was **re-rejected as a compile-target**: it violates
-mission.md ("no Python at BUILD or run time") + discipline.md 33-47 ("Kernel-DSL is
+mission.md ("no Python at BUILD or run time") + completed/porting-discipline-legacy.md 33-47 ("Kernel-DSL is
 a PORTING REFERENCE, NEVER a compile-target; do NOT AOT-compile Triton/CuTe-DSL to
 cubin"). The AOT branch is **shelved, kept OFF as a measurement oracle only** (compile
 FLA's exact kernel to get the ground-truth "what Triton codegen achieves" target).
@@ -1657,7 +1657,7 @@ codegen-bound GDN chunk kernels.** The MVP (27B ≥1.0×) is blocked by this cod
 portable vt::tile playbook closed the STRUCTURE (register-tiling, blocked-inverse, bf16, delta_h
 −22%) but cannot close Triton's WMMA-compute codegen. The ONLY known path to 27B parity is the
 Triton CUDA fast-path (branch perf/triton-fastpath, PROVEN toolchain, behind the vt:: seam with
-CPU-ref preserved) — which CONFLICTS with the canon (discipline.md "no compile-target" +
+CPU-ref preserved) — which CONFLICTS with the canon (porting.md "no compile-target" +
 mission.md "no build-Python"). This is a genuine MVP-vs-canon conflict, now PROVEN by exhausting
 the portable path: the "no compile-target" rule was premised on portable working (disproven for
 these kernels); mirror-vLLM (PRIME POLICY) + the ≥1.0× MVP both point to Triton. A HUMAN decision.
@@ -1918,7 +1918,7 @@ main (CPU Tier-1 interpreter vs golden RmsNorm at h={7,127,128,512}) — pre-exi
 proven not from the FA-2 branch; the Tier-1 interpreter is not on the model hot path
 (Tier-0 composite is default). Fix the CPU interpreter or its golden.
 **REMAINING MVP SCOPE (non-throughput):** TTFT/TPOT vs vLLM SERVE (only offline-bench
-compared so far), GGUF real-file parity on dgx, e2e suites — per gates.md.
+compared so far), GGUF real-file parity on dgx, e2e suites — per verification.md.
 
 ## 2026-07-10 — GGUF REAL-FILE GREEDY PARITY ON GB10: PASSED (the last M0.10 dgx-pending item)
 
@@ -2381,7 +2381,7 @@ Ported vLLM priority scheduling 1:1 (pin e24d1b24), fully separable from W1–W3
 - **Policy config surface**: `SchedulerPolicyFromString`/`SchedulerPolicyToString`
   (`config/scheduler.cpp:21`, reject-unknown mirrors upstream `SchedulingPolicy(value)`
   ValueError) + `EngineParams.policy` → `MakeSchedulerConfig`.
-- **Tests ported** (test-porting.md, same change): 12 `test_priority_scheduling_*`
+- **Tests ported** (porting.md, same change): 12 `test_priority_scheduling_*`
   cases → `tests/vllm/v1/test_scheduler.cpp:674` (from `test_scheduler.py:2382-2856,2978`,
   incl. the preemption-then-resumption-out-of-KV V2/no-connector case); 14
   priority-queue cases + the seeded random ordering/heap-property property test →
@@ -2459,7 +2459,7 @@ family leaf.
 User reaffirmed that every feature or milestone capable of affecting speed
 must be benchmarked immediately so regressions are caught at their source, not
 only at a later release gate. The existing fresh-denominator and every-axis
-rules already required this; `workflow.md` and `benchmark-protocol.md` now make
+rules already required this; `workflow.md` and `verification.md` now make
 the operational checkpoint explicit: correctness first, same-binary pre/post
 A/B, fresh same-box vLLM or backend-native floor, throughput/latency/memory,
 2–3 uncontended reproductions, and exact ledger recipe. A second
@@ -11533,7 +11533,7 @@ flag tests, and the CUDA selection test all inverted accordingly. The
 +2.06 ms/step recurrence lever REMAINS OPEN with two recorded paths:
 (a) an occupancy-aware hand-CUDA design (multiple tiles per block /
 cp.async pipeline via the vt::tile rungs), or (b) the SANCTIONED Triton-AOT
-exception (discipline.md, 2026-07-09): vLLM's `fused_recurrent` decode kernel
+exception (porting.md, 2026-07-09): vLLM's `fused_recurrent` decode kernel
 is now a measured codegen-bound gap candidate — vendor its AOT cubin via the
 proven `triton_aot_vendored/` toolchain, gated, with the hand-CUDA fallback
 preserved. Decision next session on measured grounds. Binding stays
@@ -17751,7 +17751,7 @@ and the reason is measured, not assumed:** neither box has `glslc`,
 (no `/usr/include/vulkan`, no `libvulkan.so` link name); and neither grants sudo
 (`sudo -n true` -> "a password is required" on both, 2026-07-22). Runtime GLSL
 compilation would need libshaderc linked in — a COMPILED third-party dependency
-that [discipline.md](discipline.md) forbids and `third_party/` has never carried.
+that [porting.md](porting.md) forbids and `third_party/` has never carried.
 
 So: **GLSL is compiled AHEAD OF TIME and the SPIR-V is COMMITTED**, regenerated
 by `scripts/gen-vulkan-spirv.py`. Consequences worth stating because they are
@@ -18071,7 +18071,7 @@ never owns our memory; and `set_input_array` binds at
 our `StorageModeShared` buffers **unmodified**.
 
 Honest costs: `libmlx.dylib` + a **104,894,650-byte `mlx.metallib`** (measured on
-the M4) — a real deviation from `discipline.md:86-92`, so it must be GATED and
+the M4) — a real deviation from `completed/porting-discipline-legacy.md:86-92`, so it must be GATED and
 optional, precedent `VLLM_CPP_TRITON`; building MLX from source needs `xcrun
 metal` i.e. full Xcode, which the M4 lacks; a commit+wait sync tax per delegated
 op that must be MEASURED not assumed; and **MLX has NO paged-KV attention** —
@@ -36330,7 +36330,7 @@ No source, kernel, model, gate, benchmark or capability mark changed.
 <!-- state: 2026-08-04T23:45 -->
 
 User-directed. Two roles for concurrent sessions, written up as
-`.agents/specs/operator-helper-protocol.md`. `AGENTS.md` deliberately untouched
+`.agents/workflow.md`. `AGENTS.md` deliberately untouched
 until reviewed.
 
 **Motivated by two measured failures the same day, both structural:**
@@ -42983,7 +42983,6 @@ removing only `; #129: SPIKE∅`; the compact clause consumes the existing
 is no archive, runtime, correctness or performance evidence.
 
 
-<<<<<<< ours
 
 ## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
 <!-- state: 2026-08-08T21:00 -->
@@ -43024,37 +43023,6 @@ scoping stays a future spike.
 Rows moved: none in lifecycle (`BACKEND-DISTRIBUTED-TP`/`PAR-TP` stay
 `READY`, now pointing at the new spec; `SPEC-DSPARK` stays `INVENTORIED`).
 Next: dispatch TP-W1 (GroupCoordinator-analog) — CPU-completable, no HW wait.
-=======
-
-## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
-<!-- state: 2026-08-08T21:00 -->
-
-The external RPi5/Cortex-A76 stack lands as two prepared branches off
-`b38f78a7`: `prep/land-65` (PR #65, PMU kernel-bench harness + lane records)
-and `prep/land-79` (PR #79, the Q8_0 SDOT/AAPCS64 tier), keyed records merged
-by the resolution law (main wholesale + in-lane rows; state pure-append in
-anchor order). The mutation review's fix map applied: F65-1 (ONE-SURFACE
-allowlist entry for `examples/cpu_kernel_bench`, ratchet 8->9 with a dated
-operator exception), F79-5 (KERNEL count 50->51 on top of main, their dated
-comment transplanted), F79-6 (the two RPi5 BENCHMARKS.md paragraphs are keyed
-table rows pointing at `docs/bench-evidence/rpi5-*.md`; the STATUS.md CPU cell
-condensed inside the char/cell ratchets), and F79-1: the new
-`test_ops_quant_dot` A76 byte-equality case referenced
-`QuantTraits(kQ8_0).vec_dot` — the SELECTED kernel, i.e. the assembly tier on
-a real A76 — so its CHECKs were a self-comparison. A true-portable seam
-`vt::cpu::QuantQ8PortableVecDot()` (quants.c:400 order) is exported next to
-the existing sdot/asm getters, the reference arm retargeted, and a new
-seam-pinning case compares the portable kernel byte-equal against an
-independent in-test transcription of the exact order on EVERY platform
-(contraction-robust: mul and fma candidates). Mutation kill verified on x86:
-reversing the portable block accumulation order REDs exactly that case
-(2 assertions, blocks=3/64), green on revert; 23/23 cases, 150231 assertions.
-
-RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
-F79-4 remain open on the landed tree; the review's merge-and-fix map is the
-binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
-as the lane's own next steps.
->>>>>>> theirs
 
 ## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
 <!-- state: 2026-08-08T21:00 -->

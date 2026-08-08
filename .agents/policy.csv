@@ -1,0 +1,60 @@
+rule_id,scope,trigger,requirement,enforcement,waiver_class,procedure
+POL-AUTH-REGISTRY,repository,any policy decision,Use policy.csv as the sole repository-policy authority.,scripts/check-policy.py,never,.agents/workflow.md
+POL-AUTH-PRECEDENCE,repository,repository instructions conflict,Apply AGENTS then the selected policy rule then its procedure then task evidence.,scripts/check-policy.py,never,.agents/workflow.md
+POL-BOOT-ROLE,session,before task work,Resolve or declare the worktree role before reading task state or editing.,scripts/check-role-discipline.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-BOOT-NOW,session,after role resolution,Read NOW.md before deeper task records.,scripts/check-now-current.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-BOOT-TASK,session,after NOW,Read only the claimed task and its linked procedures and evidence.,scripts/check-policy.py,expiring,.agents/workflow.md
+POL-CONFIG-SHARED,worktree,configuration is needed,Resolve developer preferences and env values from the shared checkout configuration.,scripts/check-policy.py,expiring,.agents/workflow.md
+POL-CONFIG-JIT,session,an environment value is required,Request only the missing value needed by the current gate and never infer another developer's setup.,scripts/check-policy.py,never,.agents/workflow.md
+POL-CONFIG-NO-WEAKEN,developer preferences,preferences alter operations,Preferences must not weaken correctness evidence attribution lifecycle testing or documentation rules.,scripts/check-policy.py,never,.agents/workflow.md
+POL-ROLE-DECLARED,write session,before edits,Declare operator helper or read-only and keep the role state consistent with the worktree.,scripts/check-role-discipline.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-HELPER-TASK,helper,start helper,Use a known matrix or governance task ID.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-HELPER-WORKTREE,helper,start helper,Work only in a linked worktree on the exact row task branch.,scripts/check-role-discipline.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-HELPER-PR,helper,before implementation,Create a draft PR as the remote claim when remote operations are authorized.,scripts/check-policy.py,expiring,.agents/workflow.md
+POL-REMOTE-UNKNOWN,remote gate,remote state cannot be queried,Report REMOTE_UNVERIFIED and never treat unknown remote state as absence or success.,scripts/check-policy.py,never,.agents/workflow.md
+POL-OPERATOR-BOUNDARY,operator,feature work,Delegate implementation and keep main integration and GPU ownership in the operator role.,scripts/check-role-discipline.py; scripts/check-policy.py,expiring,.agents/workflow.md
+POL-OPERATOR-VERIFY,operator,implementation returns,Run the claimed gate instead of trusting an implementer report.,scripts/check-protocol-consistency.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-REVIEW-FRESH,review,implementation is ready for review,Use a fresh reviewer that performs static review and targeted scratch mutation.,scripts/check-protocol-consistency.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-REVIEW-NO-REPAIR,review,a finding is found,Return findings to a fresh implementer and do not repair them in the coordinating session.,scripts/check-protocol-consistency.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-PR-DISPOSITION,operator,a PR is verified or obsolete,Merge a verified PR in-session or close an obsolete PR with the reason recorded.,scripts/check-policy.py,expiring,.agents/workflow.md
+POL-MIRROR-VLLM,feature port,vLLM defines behavior,Mirror every applicable vLLM mode instead of inventing product behavior.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/porting.md
+POL-GROUND-CHAIN,parity investigation,comparing implementation,Ground conclusions in vLLM and the complete runtime dependency and generated-kernel chain.,scripts/check-policy.py,never,.agents/verification.md
+POL-TRACE-SAME-TOOL,performance comparison,before comparing throughput,Trace vLLM and this project on the same workload with the same tracing tool.,scripts/check-policy.py,never,.agents/verification.md
+POL-GEMV-CONTRACT,GEMM or GEMV parity claim,claiming invocation parity,Match output dtype compute and scale type entry point algorithm policy and resolved template dtypes.,scripts/check-gemv-invocation-consistency.py; scripts/check-policy.py,never,.agents/verification.md
+POL-SEAM-FUSION,model implementation,model has fusible chains,Route through vt::FusedChain or declare an exact tracked exception.,scripts/check-fusion-consistency.py; scripts/check-policy.py,expiring,.agents/porting.md
+POL-SEAM-MERGED-GEMM,model implementation,model has mergeable MLP projections,Route through the shared merged-GEMM family or declare an exact tracked exception.,scripts/check-fusion-consistency.py; scripts/check-policy.py,expiring,.agents/porting.md
+POL-SEAM-RUNNER,model implementation,model supports decode,Route through the shared decode runner and on-device sampling or declare an exact tracked exception.,scripts/check-runner-routing-consistency.py; scripts/check-policy.py,expiring,.agents/porting.md
+POL-ORACLE,correctness or performance gate,running a comparison,Use the pinned oracle and an identical workload on both sides.,scripts/check-policy.py,never,.agents/verification.md
+POL-PERF-EVERY-AXIS,performance gate,accepting a checkpoint,Match or beat the oracle on every required throughput latency and memory axis.,scripts/check-policy.py,never,.agents/verification.md
+POL-CORRECTNESS-GATE,correctness gate,accepting a checkpoint,Pass the declared token-exact or ratified distributional correctness gate before performance acceptance.,scripts/check-policy.py,never,.agents/verification.md
+POL-REPRODUCE,performance gate,accepting a measured result,Record the recipe and reproduce the result on an idle box with same-binary comparisons.,scripts/check-policy.py,never,.agents/verification.md
+POL-NO-CEILING,performance investigation,a gap remains,Keep the gap open and identify the next concrete implementation difference.,scripts/check-policy.py,never,.agents/verification.md
+POL-PORT-TESTS,upstream port,porting code,Port the applicable upstream tests in the same change.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/porting.md
+POL-SPIKE-FIRST,task lifecycle,before READY or ACTIVE,Commit a complete spike spec before a row enters READY or ACTIVE.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-EVIDENCE-PRESERVE,records,compacting or retiring records,Move evidence without deleting it.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-ROW-SYNC,checkpoint,feature lifecycle changes,Update the roadmap row and owning matrix row in the same change.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-STATE-ORDER,state log,appending state,Append below the enforced marker in chronological anchor order.,scripts/check-state-order.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-NOW-COUPLING,.agents/NOW.md,live_state,Refresh .agents/NOW.md.,scripts/check-doc-checkpoint.py; scripts/check-now-current.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-DOC-STATUS,docs/STATUS.md,feature_checkpoint,Update docs/STATUS.md.,scripts/check-doc-checkpoint.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-DOC-BENCHMARKS,docs/BENCHMARKS.md,feature_checkpoint,Update docs/BENCHMARKS.md.,scripts/check-doc-checkpoint.py; scripts/check-public-doc-tables.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-DOC-FEATURES,docs/FEATURES.md,feature_surface,Update docs/FEATURES.md.,scripts/check-doc-checkpoint.py; scripts/check-public-doc-tables.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-DOC-USAGE,docs/USAGE.md,user_usage,Update docs/USAGE.md.,scripts/check-doc-checkpoint.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-DOC-README,README.md,landing_page,Update README.md.,scripts/check-doc-checkpoint.py; scripts/check-readme-structure.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-KEYED-MERGE,keyed records,resolving concurrent changes,Take main's keyed record and reapply the edit instead of using a three-way merge.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-TABLE-INVENTORY,project inventory,adding or changing an inventory item,Use a stable ID and record source anchor evidence spike lifecycle and owner.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/porting.md
+POL-PR-REQUIRED,repository change,changing feature policy checker docs or records,Deliver the change through a PR except under an exact expiring emergency waiver.,scripts/check-role-discipline.py; scripts/check-policy.py,expiring,.agents/workflow.md
+POL-COMMIT-TRAILERS,commit,creating a post-cutover commit,Use real protocol and AI-assistance Git trailers.,scripts/check-policy.py,migration-only,.agents/workflow.md
+POL-AI-ATTRIBUTION,AI-assisted commit,AI assistance was used,Add a syntactically valid Assisted-by trailer and do not add an AI Signed-off-by or Co-authored-by trailer.,scripts/check-policy.py,never,.agents/workflow.md
+POL-PREFLIGHT,write transition,before edits commits or pushes,Run the applicable preflight and prevent a failed gate from being followed by a push.,scripts/check-policy.py,never,.agents/workflow.md
+POL-CHECKER-CHANGE,checker semantics,changing enforcement behavior,Use a governance task with affected rule IDs and red-before after-mutation evidence plus synchronized policy procedure edits.,scripts/check-policy.py,never,.agents/workflow.md
+POL-WAIVER-EXACT,waiver,creating or using an exception,Use one narrow owned evidenced unexpired waiver whose rule permits it.,scripts/check-policy.py,never,.agents/workflow.md
+POL-NO-REPORT-ONLY,enforcement,a rule applies,Return satisfied waived pending-external or failing and never permanent report-only success.,scripts/check-policy.py,never,.agents/workflow.md
+POL-PATH-CLASSIFICATION,change scope,classifying mutable files,Classify policy checker docs scripts tests and CI explicitly without blanket directory exemptions.,scripts/check-pr-size.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-PR-SIZE,pull request,before ready,Keep each explicit path class within its reviewed change budget.,scripts/check-pr-size.py; scripts/check-policy.py,expiring,.agents/workflow.md
+POL-READY-SPEC,helper queue,advertising a task as ready,Prove the spec is committed and reachable and the declared gate has a failing mutation.,scripts/check-gate-commands.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-READY-HARDWARE,helper queue,advertising a task as ready,Declare CPU gateability or the exact required hardware.,scripts/check-gate-commands.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-READY-DEPS,helper queue,advertising a task as ready,Prove parsed dependencies are satisfied and no live claim exists.,scripts/check-policy.py,never,.agents/workflow.md
+POL-PROMPT-ENVELOPE,delegated task,dispatching an agent,Supply goal context constraints done-when required-evidence and authority or return NEEDS_CONTEXT.,scripts/check-prompt-contract.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-PROMPT-BOUNDARIES,runtime prompt,changing an agent prompt,Keep prompts versioned bounded tool-neutral and fully parsed with explicit method output and stop rows.,scripts/check-prompt-contract.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-INTAKE-REVALIDATE,task intake,before claim or implementation,Verify the gap against current code tests issues pull requests and live claims and reconcile stale work.,scripts/check-policy.py,never,.agents/workflow.md
+POL-ONE-SURFACE,capability completion,before DONE,Expose every shipped capability through include/vllm.h and keep examples as thin clients of the same library surface.,scripts/check-surface-coverage.py; scripts/check-policy.py,never,.agents/workflow.md

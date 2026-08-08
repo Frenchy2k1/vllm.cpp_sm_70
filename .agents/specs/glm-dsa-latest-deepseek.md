@@ -567,7 +567,7 @@ since its base `b4f14ee`. Verified current values in this tree:
 
 ### Tests to port
 
-Per [`.agents/test-porting.md`](../test-porting.md), the upstream test modules that
+Per [`.agents/porting.md`](../porting.md), the upstream test modules that
 are the executable spec for these rows. Nothing below is ported by this spike (it is
 spec-only); this is the inventory that binds the implementing Ws.
 
@@ -596,7 +596,7 @@ almost nonexistent upstream — only `chatglm3-6b` appears in
 `tests/models/language/generation/test_common.py`. No GLM-4, 4.5, 4.7 or 5 text
 model has an upstream output-correctness test. **Our correctness oracle for
 GLM-4.7-Flash must therefore be built by us**, against the pinned pip-vLLM oracle
-per [`.agents/gates.md`](../gates.md), exactly as the sweep models did — it cannot
+per [`.agents/verification.md`](../verification.md), exactly as the sweep models did — it cannot
 be inherited from an upstream test list.
 
 ### Gates
@@ -604,7 +604,7 @@ be inherited from an upstream test list.
 1. **Correctness (SACRED), `Glm4MoeLiteForCausalLM` on `zai-org/GLM-4.7-Flash`
    bf16.** Token-exact against the pinned vLLM oracle on the identical prompt set,
    greedy. Gate form selected BY MEASUREMENT per
-   [`near-tie-distributional-gate`](../gates.md): run vLLM's own greedy K=5 times
+   [`near-tie-distributional-gate`](../verification.md): run vLLM's own greedy K=5 times
    first; if vLLM is self-deterministic, the bar is STRICT token-exact — a 31.2B MoE
    is well above the small-dense near-tie regime, so STRICT is the expectation and a
    distributional fallback must be justified by measurement, not assumed.

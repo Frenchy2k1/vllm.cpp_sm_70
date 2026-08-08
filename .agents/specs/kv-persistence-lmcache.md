@@ -440,7 +440,7 @@ Upstream suite at the pin. Counts are `^def test_` plus indented/async forms.
 | `tests/v1/core/test_deferred_block_free.py` | 11 | T-unit | already SKIP-marked to `KV-CONNECTORS` by the caching spike; W5 makes it live |
 | `tests/v1/core/test_prefix_caching.py::test_cache_hit_local_and_external*` (`:3524,3645,3656,3682`) | 4 | T-unit | already SKIP-marked to `KV-EXTERNAL-CACHE`; W5 makes them live |
 
-Per [test-porting.md](../test-porting.md):6 every case that cannot pass yet is
+Per [porting.md](../porting.md):6 every case that cannot pass yet is
 checked in SKIPPED with a tracked row reason, never dropped.
 
 ### Gates
@@ -477,7 +477,7 @@ checked in SKIPPED with a tracked row reason, never dropped.
 7. **Every-axis performance (W4, W7 — DGX GB10):** match or beat vLLM on total
    and output throughput, req/s, TTFT, TPOT/ITL and peak memory at the
    large-concurrency operating point, per
-   [benchmark-protocol.md](../benchmark-protocol.md), against vLLM launched with
+   [verification.md](../verification.md), against vLLM launched with
    the equivalent `--kv-transfer-config`. An offload configuration that raises
    hit rate but regresses ANY axis is a failed change.
 8. **No-regression when unused (every row):** offloading is opt-in and must be

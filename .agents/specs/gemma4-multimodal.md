@@ -90,7 +90,7 @@ decisive than [`sweep-gemma.md`](sweep-gemma.md) §W6 found for the bare text ro
 (which only worried oracle *registry* listing): even though vLLM 0.25.0 ships
 `gemma4_mm.py`/`gemma4_unified.py`, the towers are Transformers modules the pinned
 Transformers does not carry. **A model the oracle cannot run has no gate**
-([gates.md](../gates.md)). This is the load-bearing reason Gemma-4 mm is
+([verification.md](../verification.md)). This is the load-bearing reason Gemma-4 mm is
 HONESTY-PASS-BLOCKED, independent of checkpoints and HW.
 
 ### 0.1 The Gemma-4 mm architecture — two variants, a SigLIP vision tower, and a USM Conformer audio tower
