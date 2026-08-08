@@ -230,15 +230,25 @@ platform identity, forced-CPU selector input and prefix name matching) is RED.
 The standalone selector target is non-vacuous under
 `scripts/check-test-registration.py`: a disposable CPU-only CMake configure and
 File-API codemodel query prove that the target exists with its exact source,
-then materializes its disposable File-API artifact and requires CTest JSON to
-resolve that test to the exact one-argument executable command. The workflow
-guard binds the dedicated YAML literal block to an unconditional job and step,
-then parses exact direct argv; commands behind a workflow `if`, shell control
-flow, or inert quoted text do not count. Preflight names count only inside the
-actual `CHECKERS`/`SUITES` arrays consumed by their execution loops. Its 34/34
-suite kills deletion/source substitution/duplication, wrong/no-op/extra-argv
-CTest commands, CMake bracket comments and false conditionals, inactive helper
-bodies, conditional/inert CI commands, inert preflight arrays, loss of wiring,
-vacuous assertion helpers, and a self-shrunk mutation inventory. The inventory
-is an external fixed manifest rather than an editable numeric range.
+then the checker selects the Release configuration, materializes that
+configuration's disposable artifact, and requires `ctest -C Release` JSON to
+resolve the enabled test to the exact one-argument executable command. This
+works for single- and multi-config generators. The workflow guard structurally
+normalizes quoted/spaced YAML mapping keys and accepts only the dedicated direct
+argv block owned by a job/step with no `if`, `continue-on-error`, or custom
+`shell`. Preflight is not inferred from loop text: the checker executes a
+disposable copy with instrumented `python3`/`git` shims and requires the checker
+and suite argv to occur exactly once, so empty bodies, `continue`, an outer false
+branch, and an unset array are all red.
+
+The 50/50 suite covers the earlier registration deaths plus disabled CTest,
+non-gating Actions variants, and the preflight execution variants. Its mutation
+inventory is protected by a third, independent layer in the production checker:
+the canonical path and content SHA-256 are pinned there, as are the named
+integrity method and wrapper-body contracts. Deleting or renaming M18 in both the
+suite and manifest, redirecting the suite to a byte-identical manifest, or
+deleting the integrity test is therefore red. This is precisely a claim of
+resistance to tandem two-layer suite/manifest shrinkage; it does not claim to
+resist an arbitrary simultaneous rewrite of the suite, manifest, and production
+checker.
 No CUDA runtime was used; the existing GPU A/B residual remains.

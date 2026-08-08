@@ -10,7 +10,10 @@ creates an executable *and* registers that executable with CTest.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -23,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS_CMAKE = ROOT / "tests/CMakeLists.txt"
 PREFLIGHT = ROOT / "scripts/agent-preflight.sh"
 CI = ROOT / ".github/workflows/ci.yml"
+MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
+MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
+MUTATION_MANIFEST_SHA256 = (
+    "de1ca9c1d42620896a5dfa2c46eb5f18f2f8273ed6e9c0546ca56a2852ea8608"
+)
 
 REQUIRED_TESTS = {
     "test_device_selection": "vllm/entrypoints/test_device_selection.cpp",
@@ -70,26 +78,42 @@ def _configure(
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
-def _codemodel_targets(build_dir: Path) -> dict[str, dict[str, object]]:
-    """Return configured targets keyed by name from the CMake File API."""
+def _codemodel_targets(
+    build_dir: Path,
+) -> tuple[str | None, dict[str, dict[str, object]]]:
+    """Return one configuration and its targets from the CMake File API.
+
+    Multi-config generators describe several artifact paths.  Release is the
+    CI contract and must be selected consistently for both the codemodel and
+    the subsequent CTest query.
+    """
 
     reply = build_dir / ".cmake/api/v1/reply"
     indexes = sorted(reply.glob("index-*.json"))
     if not indexes:
-        return {}
+        return None, {}
     index = json.loads(indexes[-1].read_text(encoding="utf-8"))
     codemodel_file = index["reply"]["codemodel-v2"]["jsonFile"]
     codemodel = json.loads((reply / codemodel_file).read_text(encoding="utf-8"))
+    configurations = codemodel.get("configurations", [])
+    if not configurations:
+        return None, {}
+    configuration = next(
+        (entry for entry in configurations if entry.get("name") == "Release"),
+        configurations[0],
+    )
     targets: dict[str, dict[str, object]] = {}
-    for configuration in codemodel.get("configurations", []):
-        for summary in configuration.get("targets", []):
-            detail = json.loads((reply / summary["jsonFile"]).read_text(encoding="utf-8"))
-            targets[summary["name"]] = detail
-    return targets
+    for summary in configuration.get("targets", []):
+        detail = json.loads((reply / summary["jsonFile"]).read_text(encoding="utf-8"))
+        targets[summary["name"]] = detail
+    name = configuration.get("name")
+    return (name if isinstance(name, str) and name else None), targets
 
 
-def _ctest_tests(build_dir: Path) -> dict[str, list[str]]:
-    """Return configured CTest commands keyed by test name.
+def _ctest_tests(
+    build_dir: Path, configuration: str | None
+) -> dict[str, dict[str, object]]:
+    """Return configured CTest command/properties keyed by test name.
 
     CTest omits ``command`` from JSON when a target executable does not exist
     yet.  The caller materializes disposable placeholders at the File-API
@@ -97,8 +121,12 @@ def _ctest_tests(build_dir: Path) -> dict[str, list[str]]:
     resolved executable path rather than an uninterpreted CMake token.
     """
 
+    command = ["ctest", "--test-dir", str(build_dir)]
+    if configuration is not None:
+        command.extend(["-C", configuration])
+    command.append("--show-only=json-v1")
     result = subprocess.run(
-        ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
+        command,
         text=True,
         capture_output=True,
         check=False,
@@ -110,10 +138,33 @@ def _ctest_tests(build_dir: Path) -> dict[str, list[str]]:
     except json.JSONDecodeError:
         return {}
     return {
-        test["name"]: test.get("command", [])
+        test["name"]: {
+            "command": test.get("command", []),
+            "properties": test.get("properties", []),
+        }
         for test in document.get("tests", [])
         if isinstance(test.get("name"), str)
     }
+
+
+def _cmake_truthy(value: object) -> bool:
+    """Interpret CMake's documented false constants; unknown values fail closed."""
+
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    normalized = str(value).strip().upper()
+    return normalized not in {
+        "",
+        "0",
+        "FALSE",
+        "OFF",
+        "NO",
+        "N",
+        "IGNORE",
+        "NOTFOUND",
+    } and not normalized.endswith("-NOTFOUND")
 
 
 def _target_artifact(build_dir: Path, detail: dict[str, object]) -> Path | None:
@@ -177,9 +228,9 @@ def _configured_contract_errors(
         )
         return errors
 
-    targets = _codemodel_targets(build_dir)
+    configuration, targets = _codemodel_targets(build_dir)
     artifacts = _materialize_ctest_targets(build_dir, targets, required)
-    tests = _ctest_tests(build_dir)
+    tests = _ctest_tests(build_dir, configuration)
     errors: list[str] = []
     for target, expected_source in sorted(required.items()):
         detail = targets.get(target)
@@ -208,7 +259,10 @@ def _configured_contract_errors(
                 "vllm_cpp_add_test does not register that executable with CTest"
             )
         elif artifact is not None:
-            command = tests[target]
+            test = tests[target]
+            command = test.get("command", [])
+            if not isinstance(command, list):
+                command = []
             actual_command: Path | None = None
             if len(command) == 1:
                 candidate = Path(command[0])
@@ -223,6 +277,16 @@ def _configured_contract_errors(
                     f"CTest test {target} must execute configured target {target} exactly; "
                     f"got {rendered}"
                 )
+            properties = test.get("properties", [])
+            if not isinstance(properties, list):
+                properties = []
+            disabled = [
+                prop.get("value")
+                for prop in properties
+                if isinstance(prop, dict) and prop.get("name") == "DISABLED"
+            ]
+            if any(_cmake_truthy(value) for value in disabled):
+                errors.append(f"CTest test {target} must not be DISABLED")
     return errors
 
 
@@ -267,6 +331,27 @@ def _literal_block(lines: list[str], header_index: int) -> list[str]:
     return [line[content_indent:] if line.strip() else "" for line in raw]
 
 
+def _yaml_mapping(line: str, indent: int, sequence: bool = False) -> tuple[str, str] | None:
+    """Parse one direct YAML mapping key in the workflow's structural subset."""
+
+    if _indent(line) != indent:
+        return None
+    content = line[indent:]
+    if sequence:
+        if not content.startswith("-"):
+            return None
+        content = content[1:].lstrip()
+        if not content:
+            return None
+    match = re.match(r"^(?P<key>'[^']*'|\"[^\"]*\"|[^:#]+?)\s*:\s*(?P<value>.*)$", content)
+    if match is None:
+        return None
+    key = match.group("key").strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {"'", '"'}:
+        key = key[1:-1]
+    return key.strip(), match.group("value").strip()
+
+
 def _unconditional_ci_run_blocks(text: str) -> list[list[str]]:
     """Return literal run blocks owned by unconditional Actions jobs/steps.
 
@@ -287,15 +372,26 @@ def _unconditional_ci_run_blocks(text: str) -> list[list[str]]:
     job_starts = [
         i
         for i in range(jobs_index + 1, len(lines))
-        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[i])
+        if (mapping := _yaml_mapping(lines[i], 2)) is not None
+        and mapping[1] == ""
     ]
     for job_pos, job_start in enumerate(job_starts):
         job_end = job_starts[job_pos + 1] if job_pos + 1 < len(job_starts) else len(lines)
         job_lines = lines[job_start + 1 : job_end]
-        if any(re.match(r"^    if:\s*", line) for line in job_lines):
+        job_fields = {
+            mapping[0]
+            for line in job_lines
+            if (mapping := _yaml_mapping(line, 4)) is not None
+        }
+        if "if" in job_fields:
             continue
         steps_offset = next(
-            (i for i, line in enumerate(job_lines) if line == "    steps:"), None
+            (
+                i
+                for i, line in enumerate(job_lines)
+                if _yaml_mapping(line, 4) == ("steps", "")
+            ),
+            None,
         )
         if steps_offset is None:
             continue
@@ -303,7 +399,7 @@ def _unconditional_ci_run_blocks(text: str) -> list[list[str]]:
         step_starts = [
             i
             for i in range(steps_start, job_end)
-            if re.match(r"^      -(?:\s|$)", lines[i])
+            if _indent(lines[i]) == 6 and lines[i][6:].startswith("-")
         ]
         for step_pos, step_start in enumerate(step_starts):
             step_end = (
@@ -311,19 +407,19 @@ def _unconditional_ci_run_blocks(text: str) -> list[list[str]]:
                 if step_pos + 1 < len(step_starts)
                 else job_end
             )
-            step_lines = lines[step_start:step_end]
-            if any(re.match(r"^        if:\s*", line) for line in step_lines):
+            step_fields: dict[str, tuple[str, int]] = {}
+            first = _yaml_mapping(lines[step_start], 6, sequence=True)
+            if first is not None:
+                step_fields[first[0]] = (first[1], step_start)
+            for index in range(step_start + 1, step_end):
+                mapping = _yaml_mapping(lines[index], 8)
+                if mapping is not None:
+                    step_fields[mapping[0]] = (mapping[1], index)
+            if {"if", "continue-on-error", "shell"} & step_fields.keys():
                 continue
-            run_index = next(
-                (
-                    i
-                    for i in range(step_start, step_end)
-                    if re.match(r"^        run:\s*\|[-+]?\s*$", lines[i])
-                    or re.match(r"^      -\s+run:\s*\|[-+]?\s*$", lines[i])
-                ),
-                None,
-            )
-            if run_index is not None:
+            run = step_fields.get("run")
+            if run is not None and re.fullmatch(r"\|[-+]?", run[0]):
+                run_index = run[1]
                 blocks.append(_literal_block(lines, run_index))
     return blocks
 
@@ -387,18 +483,72 @@ def _bash_array_values(text: str, name: str) -> list[str] | None:
     return None
 
 
-def _bash_loop_uses_array(text: str, variable: str, array: str) -> bool:
-    pattern = (
-        rf'^\s*for\s+{re.escape(variable)}\s+in\s+"\$\{{{re.escape(array)}'
-        rf'\[@\]\}}";\s*do\s*$'
-    )
-    return re.search(pattern, text, re.MULTILINE) is not None
+def _trace_preflight_commands(text: str) -> tuple[int, list[tuple[str, ...]]]:
+    """Execute preflight with Python/Git shims and return Python argv traces."""
+
+    with tempfile.TemporaryDirectory(prefix="vllm-preflight-trace-") as temporary:
+        root = Path(temporary)
+        script = root / "scripts/agent-preflight.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text(text, encoding="utf-8")
+        script.chmod(0o700)
+        (root / ".agents").mkdir()
+        (root / ".agents/NOW.md").write_text("trace-only\n", encoding="utf-8")
+        shim_dir = root / "shim"
+        shim_dir.mkdir()
+        trace = root / "python.trace"
+        python = shim_dir / "python3"
+        python.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\0' \"$@\" >> \"$VLLM_REGISTRATION_TRACE\"\n"
+            "printf '\\0' >> \"$VLLM_REGISTRATION_TRACE\"\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o700)
+        git = shim_dir / "git"
+        git.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        git.chmod(0o700)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
+        environment["VLLM_REGISTRATION_TRACE"] = str(trace)
+        result = subprocess.run(
+            ["bash", str(script), "--quiet", "--no-require-role"],
+            cwd=root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        raw = trace.read_bytes() if trace.exists() else b""
+    invocations = []
+    for record in raw.split(b"\0\0"):
+        if not record:
+            continue
+        invocations.append(
+            tuple(token.decode("utf-8") for token in record.split(b"\0") if token)
+        )
+    return result.returncode, invocations
+
+
+def _preflight_execution_errors(text: str) -> list[str]:
+    returncode, invocations = _trace_preflight_commands(text)
+    errors: list[str] = []
+    checker = ("scripts/check-test-registration.py",)
+    suite = ("tests/scripts/test_check_test_registration.py",)
+    if invocations.count(checker) != 1:
+        errors.append("preflight does not execute CHECKERS through its checker loop")
+    if invocations.count(suite) != 1:
+        errors.append("preflight does not execute SUITES through its suite loop")
+    if returncode != 0:
+        errors.append(f"instrumented preflight execution failed with rc={returncode}")
+    return errors
 
 
 def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
     """Return missing preflight/CI wiring for this checker and its mutations."""
 
-    preflight_text = _without_line_comments(preflight_text)
+    preflight_source = preflight_text
+    preflight_text = _without_line_comments(preflight_source)
     errors: list[str] = []
     checkers = _bash_array_values(preflight_text, "CHECKERS")
     suites = _bash_array_values(preflight_text, "SUITES")
@@ -406,10 +556,7 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
         errors.append("check-test-registration is missing from preflight CHECKERS")
     if suites is None or "test_check_test_registration" not in suites:
         errors.append("test_check_test_registration is missing from preflight SUITES")
-    if not _bash_loop_uses_array(preflight_text, "checker", "CHECKERS"):
-        errors.append("preflight does not execute CHECKERS through its checker loop")
-    if not _bash_loop_uses_array(preflight_text, "suite", "SUITES"):
-        errors.append("preflight does not execute SUITES through its suite loop")
+    errors.extend(_preflight_execution_errors(preflight_source))
     active_ci_commands = _active_ci_commands(ci_text)
     if ("python3", "scripts/check-test-registration.py") not in active_ci_commands:
         errors.append("check-test-registration is missing from the explicit CI checker step")
@@ -425,11 +572,137 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
     return errors
 
 
+def _method_calls(method: ast.AST) -> list[ast.Call]:
+    return [call for call in ast.walk(method) if isinstance(call, ast.Call)]
+
+
+def mutation_suite_integrity_errors(
+    source: str,
+    manifest_text: str | None = None,
+    *,
+    manifest_path: Path = MUTATION_MANIFEST,
+) -> list[str]:
+    """Pin the suite/manifest pair from this independent production layer."""
+
+    errors: list[str] = []
+    if manifest_path.resolve() != MUTATION_MANIFEST.resolve():
+        errors.append("mutation suite must use the canonical manifest path")
+    if manifest_text is None:
+        try:
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return errors + [f"mutation manifest is unreadable: {exc}"]
+    digest = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+    if digest != MUTATION_MANIFEST_SHA256:
+        errors.append("mutation manifest differs from the production-pinned digest")
+    manifest = {
+        line
+        for line in manifest_text.splitlines()
+        if line and not line.startswith("#")
+    }
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        return errors + [f"mutation suite is not valid Python: {exc}"]
+    methods = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    actual = {name for name in methods if name.startswith("test_M")}
+    if actual != manifest:
+        errors.append("mutation inventory differs from fixed manifest")
+
+    for name in sorted(actual & manifest):
+        calls = {
+            call.func.attr
+            for call in _method_calls(methods[name])
+            if isinstance(call.func, ast.Attribute)
+        }
+        if not {"assert_error", "assert_wiring_error", "assertTrue"} & calls:
+            errors.append(f"{name} has no semantic outcome assertion")
+
+    for name, production_call in {
+        "assert_error": "registration_errors",
+        "assert_wiring_error": "wiring_errors",
+    }.items():
+        method = methods.get(name)
+        if method is None:
+            errors.append(f"{name} helper is missing")
+            continue
+        calls = _method_calls(method)
+        if not any(
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+            and call.func.attr == "assertTrue"
+            for call in calls
+        ):
+            errors.append(f"{name} has no direct semantic assertion")
+        if not any(
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "mod"
+            and call.func.attr == production_call
+            for call in calls
+        ):
+            errors.append(f"{name} does not call {production_call}")
+
+    wrapper = methods.get("_suite_integrity_errors")
+    wrapper_ok = False
+    if wrapper is not None:
+        for call in _method_calls(wrapper):
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "mod"
+                and call.func.attr == "mutation_suite_integrity_errors"
+            ):
+                continue
+            path_keywords = [kw for kw in call.keywords if kw.arg == "manifest_path"]
+            wrapper_ok = (
+                len(call.args) == 1
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == "source"
+                and len(path_keywords) == 1
+                and isinstance(path_keywords[0].value, ast.Attribute)
+                and isinstance(path_keywords[0].value.value, ast.Name)
+                and path_keywords[0].value.value.id == "mod"
+                and path_keywords[0].value.attr == "MUTATION_MANIFEST"
+            )
+    if not wrapper_ok:
+        errors.append("suite integrity wrapper does not use the canonical manifest")
+
+    integrity = methods.get("test_suite_integrity_contract_is_pinned")
+    if integrity is None:
+        errors.append("required mutation-suite integrity method is missing")
+    else:
+        calls = _method_calls(integrity)
+        called_wrapper = any(
+            isinstance(call.func, ast.Name) and call.func.id == "_suite_integrity_errors"
+            for call in calls
+        )
+        asserted = any(
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+            and call.func.attr == "assertEqual"
+            for call in calls
+        )
+        if not (called_wrapper and asserted):
+            errors.append("mutation-suite integrity method has no pinned assertion")
+    return errors
+
+
 def check_tree(root: Path = ROOT) -> list[str]:
     paths = {
         "tests/CMakeLists.txt": root / "tests/CMakeLists.txt",
         "scripts/agent-preflight.sh": root / "scripts/agent-preflight.sh",
         ".github/workflows/ci.yml": root / ".github/workflows/ci.yml",
+        "tests/scripts/test_check_test_registration.py": root
+        / "tests/scripts/test_check_test_registration.py",
+        "tests/scripts/check_test_registration_mutations.txt": root
+        / "tests/scripts/check_test_registration_mutations.txt",
     }
     missing = [relative for relative, path in paths.items() if not path.is_file()]
     if missing:
@@ -456,10 +729,15 @@ def check_tree(root: Path = ROOT) -> list[str]:
                 "-DCMAKE_BUILD_TYPE=Release",
             ],
         )
+    integrity = mutation_suite_integrity_errors(
+        paths["tests/scripts/test_check_test_registration.py"].read_text(encoding="utf-8"),
+        paths["tests/scripts/check_test_registration_mutations.txt"].read_text(encoding="utf-8"),
+        manifest_path=paths["tests/scripts/check_test_registration_mutations.txt"],
+    )
     return registration + wiring_errors(
         paths["scripts/agent-preflight.sh"].read_text(encoding="utf-8"),
         paths[".github/workflows/ci.yml"].read_text(encoding="utf-8"),
-    )
+    ) + integrity
 
 
 def main() -> int:
