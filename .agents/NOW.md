@@ -46,6 +46,7 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 
 ## Next actions
 
+0. **`ROAD-V1-MEM`** KV auto-sizing spike LANDED (`specs/kv-sizing.md`, `READY`).
 1. **Spike the Parakeet encoder row** (vLLM carries it inside
    `nano_nemotron_vl.py`; the transducer half is NOT in vLLM: separate call).
 2. **Qwen3.5-4B serving follow-up:** bind the default-ON async-serving path

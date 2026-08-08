@@ -455,13 +455,10 @@ the named residual (`.agents/specs/mm-serving.md`).
 [#83](https://github.com/mudler/vllm.cpp/issues/83), scoped 2026-08-06): there is
 no memory profiling, and none of upstream's three `config/cache.py` knobs is
 exposed. The KV pool is a raw block count typed by hand
-(`EngineParams::num_blocks = 256`, `--num-blocks`, `vllm_model_params.num_blocks`),
-so sizing a run means converting free bytes, context and concurrency into blocks
-yourself. Target shape, rowed in
-[.agents/roadmap_v1.md](../.agents/roadmap_v1.md) (`kv-sizing` spike owed):
-auto-size to the declared workload by default, cap the TOTAL engine footprint
-when asked, refuse before allocating with a computed remedy breakdown rather
-than an OOM.
+(`EngineParams::num_blocks = 256`, `--num-blocks`, `vllm_model_params.num_blocks`). Target shape, rowed in
+[.agents/roadmap_v1.md](../.agents/roadmap_v1.md): auto-size to the declared
+workload by default, cap the TOTAL engine footprint when asked, refuse before
+allocating with a computed remedy breakdown rather than an OOM. **M0 spike LANDED** (`specs/kv-sizing.md`, `READY`): mirrors vLLM's cache knobs + profile-run; M1-M4 unblocked.
 
 **Open, not root-caused (observed 2026-07-28):** the C-ABI custom logits
 processor case (`tests/capi/test_capi.cpp:410`, ABI v8) SIGSEGVs in a CUDA build
