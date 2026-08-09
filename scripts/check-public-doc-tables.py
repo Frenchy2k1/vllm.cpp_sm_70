@@ -462,7 +462,18 @@ STATUS_RATCHET = {
     # gated" preamble, a "superseding the gap recorded here" aside, and three
     # restatements). Every measured number and binding claim kept verbatim, and
     # re-pinned byte-tight after rebasing onto the newer page.
-    "chars": 243588,
+    #
+    # 243584 since 2026-08-09 (measured 243584): #219 makes VLLM_CPP_TRITON a
+    # computed default, which the page owes one binding paragraph. It is paid
+    # for in the same change by collapsing the two paragraphs the flip
+    # supersedes -- the 2026-07-28 per-arch vendoring note, whose operative
+    # claim ("the cross-family arch builds ship -DVLLM_CPP_TRITON=OFF") the new
+    # default makes false, and the 27B SACRED-gate note, which spelled out a
+    # flag the build now sets for you. Both keep their binding result, their
+    # measured numbers and their links; only the superseded framing goes. Net
+    # -4 against the Tenstorrent page, re-pinned byte-tight so the reduction
+    # cannot become untracked growth headroom.
+    "chars": 243584,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
