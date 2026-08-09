@@ -1,8 +1,9 @@
 # Downloadable server binary release matrix
 
 Status: accepted contract with W5 manifest tooling and W6 installed server
-packaging implemented for `ENG-RELEASE-BINARIES`. The release row is `ACTIVE`;
-no W7-validated archive, release workflow, or model runtime result is claimed.
+packaging implemented for `ENG-RELEASE-BINARIES`. PR #196 is the single
+delivery PR for the complete W1-W13 matrix. The release row is `ACTIVE`; no
+W7-validated archive, release workflow, or model runtime result is claimed.
 
 Pins: vLLM parity source `555967922`; vllm.cpp spike baseline `f13c49ee`;
 request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
@@ -12,6 +13,15 @@ request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
 [#141](https://github.com/mudler/vllm.cpp/pull/141); W6 implementation claim
 `CLAIM-ENG-RELEASE-BINARIES-W6` in draft PR
 [#196](https://github.com/mudler/vllm.cpp/pull/196).
+
+## Delivery topology
+
+Developer direction on 2026-08-09 binds all remaining W1-W13 work to PR #196.
+Each work unit remains an independently committed, red-first, executable
+checkpoint, but no work unit is split into another implementation PR. PR #196
+stays draft until every required work unit, the full release dry run, fresh
+review, and operator verification are green. W12 remains optional and cannot
+block W13; its optional status does not permit moving it to another PR.
 
 <!-- release-binary-contract:begin -->
 identity=ENG-RELEASE-BINARIES
@@ -433,9 +443,11 @@ wildcards, and a failed lane cannot be replaced by an older workflow artifact.
 
 ## Work breakdown: helper-sized implementation plan
 
-Each work unit is a separate claim with its own red-first checker change and
-fresh review. W5 is implemented in draft PR #141 and advances the row to
-`ACTIVE`; no later work unit or release evidence is implied.
+Each work unit is a separate verified checkpoint inside the single active
+claim and PR #196, with its own red-first checker change and fresh review. W5
+was implemented in PR #141 and advanced the row to `ACTIVE`; W6 is the first
+implemented checkpoint in PR #196, and no later work unit or release evidence
+is implied until its own gate passes.
 
 | Work | Deps | Deliverable | Exit gate |
 |---|---|---|---|

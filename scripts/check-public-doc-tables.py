@@ -439,10 +439,10 @@ STATUS_RATCHET = {
     # replaces the longer container-only paragraph with the current binary and
     # container dependency state. Re-pinned byte-tight after the structured
     # state migration so the reduction cannot become untracked growth headroom.
-    # 243655 since 2026-08-09 (measured 243655): W6's implementation result
+    # 243654 since 2026-08-09 (measured 243654): W1-W13 single-PR topology
     # replaces the claim prose with the binding package result. Re-pinned
     # byte-tight after the structured-state migration.
-    "chars": 243655,
+    "chars": 243654,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

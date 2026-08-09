@@ -36,9 +36,9 @@ Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to firs
 6 legs contended, uncontended repeat died with a host reboot.
 [Detail](../.agents/specs/startup-latency-axis.md).
 
-Binary releases (2026-08-09): W5/W6 are implemented (#141/#196). The clean CPU archive is byte-reproducible;
-extracted static-core `vllm-server --help` runs and library install holds. W1-W4/W7-W13 and publication remain
-pending; the test release has zero assets. Containers stay `INVENTORIED`; Metal/MLX are not containerizable.
+Binary releases (2026-08-09): W5/W6 implemented (#141/#196). CPU archive reproduces and its extracted
+static-core server help runs. W1-W4/W7-W13 stay pending in draft #196; the test release has zero assets. Single-PR
+delivery changes sequencing, not evidence. Containers remain `INVENTORIED`; Metal/MLX are not containerizable.
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
 append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.
