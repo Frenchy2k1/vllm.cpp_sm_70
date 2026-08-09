@@ -207,6 +207,7 @@ CHECKER_EVIDENCE_OVERRIDES = {
     # exist and NO change to this checker could ever satisfy its own evidence
     # rule. Mapped to the file CI actually runs.
     "scripts/check-device-leakage.py": "tests/scripts/test_device_leakage.py",
+    "scripts/check-release-workflow.py": "tests/scripts/test_release_pipeline.py",
 }
 
 DISABLED_CREATION_CHECKER = (
@@ -223,8 +224,14 @@ CREATION_MUTATIONS = {
         b"def exact_waiver(*args, **kwargs): return None\n"
         b"def validate_waiver_targets(*args, **kwargs): return None\n"
     ),
+    "scripts/check-arm-isa-build.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-cpu-isa-build.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-cuda-fat-gencode.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-release-workflow.py": DISABLED_CREATION_CHECKER,
+    "scripts/validate-release-archive.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-triton-aot-multiarch.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
@@ -323,6 +330,7 @@ def classify_path(path: str) -> str:
         return "vendored_dependency"
     if path in {
         "release/manifest-v1.schema.json",
+        "release/release-matrix.json",
         "scripts/env-doc-allowlist.txt",
     }:
         return "configuration"

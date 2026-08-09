@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""W13 generated release index contract."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+TOOL = ROOT / "scripts/release_index.py"
+FIXTURE = ROOT / "tests/scripts/fixtures/release_manifest/v1/cpu-manifest.json"
+
+
+def load():
+    spec = importlib.util.spec_from_file_location("release_index", TOOL)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {TOOL}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ReleaseIndexContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tool = load()
+
+    def assets(self, scratch: Path) -> tuple[Path, dict]:
+        assets = scratch / "assets"
+        assets.mkdir()
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        artifact_id = manifest["artifact"]["id"]
+        archive = assets / f"{artifact_id}.tar.gz"
+        manifest_path = scratch / "release-manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with tarfile.open(archive, "w:gz") as bundle:
+            bundle.add(manifest_path, arcname="release-manifest.json")
+        digest = self.tool.sha256(archive)
+        (assets / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n")
+        (assets / f"{archive.name}.provenance.json").write_text("{}\n")
+        handoff = {
+            "files": [
+                {
+                    "artifact_id": artifact_id,
+                    "name": path.name,
+                    "sha256": self.tool.sha256(path),
+                    "size": path.stat().st_size,
+                }
+                for path in sorted(assets.iterdir())
+            ],
+            "release_tag": "v0.0.1",
+            "retention": {
+                "ci_artifacts_days": 7,
+                "github_release": "maintainer-deletion-only",
+            },
+            "source_sha": manifest["build"]["source_commit"],
+            "verified": True,
+        }
+        return assets, handoff
+
+    def test_index_is_derived_from_archive_manifests_and_byte_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets, handoff = self.assets(root)
+            json_out = root / "release-index.json"
+            markdown_out = root / "RELEASE_INDEX.md"
+            self.tool.generate_index(assets, handoff, json_out, markdown_out)
+            index = json.loads(json_out.read_text())
+            self.assertEqual(index["schema"], "vllm.cpp.release-index.v1")
+            self.assertEqual(index["artifacts"][0]["id"], "linux-x86_64-glibc-cpu")
+            self.assertEqual(index["artifacts"][0]["cpu_tiers"], [
+                "portable-sse2", "sse2-f16c", "avx2-f16c", "avx512f"
+            ])
+            self.assertIn("linux-x86_64-glibc-cpu", markdown_out.read_text())
+
+    def test_manifest_identity_or_handoff_digest_drift_is_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets, handoff = self.assets(root)
+            handoff["files"][0]["sha256"] = "0" * 64
+            with self.assertRaises(ValueError):
+                self.tool.generate_index(assets, handoff, root / "i.json", root / "i.md")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -56,6 +56,7 @@
 
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
+#include "vt/cuda/cuda_nvfp4_sm12x.h"
 #include "vt/cuda/fp4_quant_fast.h"
 #include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
@@ -119,20 +120,6 @@ bool Fp4VecEnabled() {
 // -Werror rejects the TU (#177-D "declared but never referenced"). On sm_12x
 // (VT_FP4_MMA_SM120A defined) they are compiled exactly as before — byte
 // identical. See .agents/specs/cuda-arch-additivity.md §W9 (BACKEND-CUDA-SM090).
-#if defined(VT_FP4_MMA_SM120A)
-bool FusedFp4VectorEnabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_FP4_FUSED_VEC");
-    return e != nullptr && e[0] == '1';
-  }();
-  return on;
-}
-
-bool PointerAligned(const void* pointer, uintptr_t alignment) {
-  return (reinterpret_cast<uintptr_t>(pointer) & (alignment - 1)) == 0;
-}
-#endif  // VT_FP4_MMA_SM120A
-
 // Decode-specialized MoE grouped GEMM path toggle (M2.9; A/B, default ON). Set
 // VT_MOE_DECODE=0 to force the prefill-tuned BM=64 WMMA tile for small-M decode
 // (the pre-M2.9 behavior) for same-binary A/B. See LaunchGrouped for the gate.
@@ -2233,182 +2220,9 @@ void SigmoidGateFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_sca
   Check(cudaGetLastError(), "sigmoid_gate_fp4_quant kernel launch");
 }
 
-// W3-I1 specialization of vLLM@e24d1b24
-//   csrc/libtorch_stable/quantization/fp4/
-//     activation_nvfp4_quant_fusion_kernels.cu:30-116,120-163
-//   csrc/libtorch_stable/quantization/fp4/nvfp4_utils.cuh:118-329
-//   csrc/libtorch_stable/cuda_vec_utils.cuh:123-175,264-288
-//
-// The upstream compiled body consumes 16 BF16 values per thread with two
-// 256-bit gate/up loads, computes/rounds packed BF16 pairs, emits one E4M3 scale
-// byte and one 64-bit E2M1 payload, and launches over actual rows/groups. vLLM's
-// generated graph pre-zeroes padded scale storage outside the custom body. Our
-// pooled DBuf storage is dirty, so the launcher below records an explicit
-// cudaMemsetAsync before this kernel. That lifecycle is intentionally visible
-// to graph tracing and remains a separately measurable W3-I2 opportunity.
-#if defined(VT_FP4_MMA_SM120A)
-struct alignas(32) PackedBf16x16 {
-  uint32_t words[8];
-};
-
-struct PackedFp4x16 {
-  uint32_t lo;
-  uint32_t hi;
-};
-
-__device__ __forceinline__ uint32_t CanonicalizeFp4NegativeZero(
-    uint32_t packed) {
-  // Blackwell's packed E2M1 conversion preserves the sign of values that
-  // round to zero. The established vt exact-mode reference deliberately
-  // canonicalizes both signed zeros to nibble 0x0. Detect a non-zero
-  // magnitude independently in every nibble, then retain its sign bit only
-  // when at least one of the three magnitude bits is set.
-  constexpr uint32_t kMagnitude = 0x77777777u;
-  constexpr uint32_t kSign = 0x88888888u;
-  const uint32_t magnitude = packed & kMagnitude;
-  const uint32_t nonzero_sign =
-      ((magnitude << 1) | (magnitude << 2) | (magnitude << 3)) & kSign;
-  return packed & (kMagnitude | nonzero_sign);
-}
-
-__device__ __forceinline__ void LoadBf16x16Cg(PackedBf16x16& value,
-                                               const __nv_bfloat16* pointer) {
-  asm volatile(
-      "ld.global.cg.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
-      : "=r"(value.words[0]), "=r"(value.words[1]), "=r"(value.words[2]),
-        "=r"(value.words[3]), "=r"(value.words[4]), "=r"(value.words[5]),
-        "=r"(value.words[6]), "=r"(value.words[7])
-      : "l"(pointer));
-}
-
-__device__ __forceinline__ __nv_bfloat162& Bf16Pair(PackedBf16x16& value,
-                                                     int index) {
-  return reinterpret_cast<__nv_bfloat162*>(value.words)[index];
-}
-
-__device__ __forceinline__ PackedFp4x16 PackFp4x16(float2 (&values)[8]) {
-  PackedFp4x16 packed;
-  asm volatile(
-      "{\n"
-      ".reg .b8 b0;\n"
-      ".reg .b8 b1;\n"
-      ".reg .b8 b2;\n"
-      ".reg .b8 b3;\n"
-      ".reg .b8 b4;\n"
-      ".reg .b8 b5;\n"
-      ".reg .b8 b6;\n"
-      ".reg .b8 b7;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b0,  %3,  %2;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b1,  %5,  %4;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b2,  %7,  %6;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b3,  %9,  %8;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b4, %11, %10;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b5, %13, %12;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b6, %15, %14;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 b7, %17, %16;\n"
-      "mov.b32 %0, {b0, b1, b2, b3};\n"
-      "mov.b32 %1, {b4, b5, b6, b7};\n"
-      "}\n"
-      : "=r"(packed.lo), "=r"(packed.hi)
-      : "f"(values[0].x), "f"(values[0].y), "f"(values[1].x),
-        "f"(values[1].y), "f"(values[2].x), "f"(values[2].y),
-        "f"(values[3].x), "f"(values[3].y), "f"(values[4].x),
-        "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
-        "f"(values[6].x), "f"(values[6].y), "f"(values[7].x),
-        "f"(values[7].y));
-  packed.lo = CanonicalizeFp4NegativeZero(packed.lo);
-  packed.hi = CanonicalizeFp4NegativeZero(packed.hi);
-  return packed;
-}
-
-__global__ __launch_bounds__(512) void SiluAndMulFp4QuantPackedBf16Kernel(
-    uint8_t* __restrict__ packed, uint8_t* __restrict__ scale,
-    const __nv_bfloat16* __restrict__ gate_up, float input_global_scale,
-    int32_t m_rows, int32_t i_dim, int32_t scale_cols, bool approx_recip) {
-  const int32_t groups = i_dim / 16;
-  const int32_t group =
-      static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
-  if (group >= groups) return;
-
-  for (int32_t row = static_cast<int32_t>(blockIdx.x); row < m_rows;
-       row += static_cast<int32_t>(gridDim.x)) {
-    const int64_t input_row_base = static_cast<int64_t>(row) * 2 * i_dim;
-    const int64_t group_base = static_cast<int64_t>(group) * 16;
-    PackedBf16x16 gate;
-    PackedBf16x16 up;
-    LoadBf16x16Cg(gate, gate_up + input_row_base + group_base);
-    LoadBf16x16Cg(up, gate_up + input_row_base + i_dim + group_base);
-
-    PackedBf16x16 activation;
-#pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-      const float2 gate_pair = __bfloat1622float2(Bf16Pair(gate, pair));
-      const float2 up_pair = __bfloat1622float2(Bf16Pair(up, pair));
-      const float lo =
-          (gate_pair.x / (1.0f + expf(-gate_pair.x))) * up_pair.x;
-      const float hi =
-          (gate_pair.y / (1.0f + expf(-gate_pair.y))) * up_pair.y;
-      Bf16Pair(activation, pair) = __floats2bfloat162_rn(lo, hi);
-    }
-
-    __nv_bfloat162 local_max = __habs2(Bf16Pair(activation, 0));
-#pragma unroll
-    for (int pair = 1; pair < 8; ++pair) {
-      local_max = __hmax2(local_max, __habs2(Bf16Pair(activation, pair)));
-    }
-    const float2 max_pair = __bfloat1622float2(local_max);
-    const float vmax = fmaxf(max_pair.x, max_pair.y);
-    const float inverse_six =
-        approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
-    float sf = input_global_scale * (vmax * inverse_six);
-    sf = fminf(fmaxf(sf, -448.0f), 448.0f);
-    const uint8_t sf8 = F32ToFp8Dev(sf);
-    scale[CutlassScaleOffset(row, group, scale_cols)] = sf8;
-
-    const float sf_value = F8E4M3ToF32Dev(sf8);
-    float output_scale = 0.0f;
-    if (sf_value != 0.0f) {
-      output_scale =
-          approx_recip
-              ? ReciprocalApproximateFtz(
-                    sf_value * ReciprocalApproximateFtz(input_global_scale))
-              : input_global_scale / sf_value;
-    }
-    float2 values[8];
-#pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-      values[pair] = __bfloat1622float2(Bf16Pair(activation, pair));
-      values[pair].x *= output_scale;
-      values[pair].y *= output_scale;
-    }
-    const PackedFp4x16 fp4 = PackFp4x16(values);
-    const uint64_t packed64 =
-        (static_cast<uint64_t>(fp4.hi) << 32) | fp4.lo;
-    const int64_t output_byte =
-        (static_cast<int64_t>(row) * i_dim + group_base) / 2;
-    *reinterpret_cast<uint64_t*>(packed + output_byte) = packed64;
-  }
-}
-
-int PackedFusedFp4ResidentBlocks() {
-  static const int blocks = [] {
-    int device = 0;
-    int multiprocessors = 0;
-    int blocks_per_multiprocessor = 0;
-    Check(cudaGetDevice(&device), "packed fused quant get device");
-    Check(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
-                                 device),
-          "packed fused quant multiprocessor count");
-    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-              &blocks_per_multiprocessor,
-              SiluAndMulFp4QuantPackedBf16Kernel, 512, 0),
-          "packed fused quant occupancy");
-    return std::max(1, multiprocessors * blocks_per_multiprocessor);
-  }();
-  return blocks;
-}
-#endif
-
+// The sm12x-only packed BF16 producer is compiled in
+// cuda_nvfp4_sm12x.cu. This common TU retains the portable producer below for
+// every release SM and calls the native producer through an exact-arch seam.
 // Exact one-input custom-op form used by vLLM's ActivationQuantFusionPass.
 // Upstream: vllm@e24d1b24
 //   csrc/libtorch_stable/quantization/fp4/
@@ -2544,26 +2358,10 @@ void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
   auto* sc = out_scale.Ptr<uint8_t>();
   const bool approx = NativeFp4MmaEnabled();
 #if defined(VT_FP4_MMA_SM120A)
-  const bool packed_eligible =
-      FusedFp4VectorEnabled() && swizzled && gate_up.dtype == DType::kBF16 &&
-      m <= std::numeric_limits<int32_t>::max() &&
-      i <= std::numeric_limits<int32_t>::max() &&
-      scale_cols <= std::numeric_limits<int32_t>::max() &&
-      PointerAligned(gate_up.data, 32) && PointerAligned(pk, 8);
-  if (packed_eligible) {
-    Check(cudaMemsetAsync(sc, 0, static_cast<size_t>(out_scale.Numel()), s),
-          "packed fused quant zero scale");
-    const int groups = static_cast<int>(i / 16);
-    const int block = std::min(groups, 512);
-    const int grid_y = (groups + block - 1) / block;
-    const int grid_x = std::min(
-        static_cast<int>(m),
-        std::max(1, PackedFusedFp4ResidentBlocks() / grid_y));
-    SiluAndMulFp4QuantPackedBf16Kernel<<<dim3(grid_x, grid_y), block, 0, s>>>(
-        pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv,
-        static_cast<int32_t>(m), static_cast<int32_t>(i),
-        static_cast<int32_t>(scale_cols), approx);
-    Check(cudaGetLastError(), "packed silu_and_mul_fp4_quant kernel launch");
+  if (swizzled && gate_up.dtype == DType::kBF16 &&
+      TryLaunchSiluAndMulFp4QuantPackedSm12x(
+          s, pk, sc, gate_up.data, input_global_scale_inv, m, i, scale_cols,
+          out_scale.Numel(), approx)) {
     return;
   }
 #endif
@@ -2815,170 +2613,6 @@ __global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uin
 #endif
 }
 
-// --- NATIVE block-scaled fp4xfp4 MMA (Blackwell sm120a mxf4nvf4 tensor cores) --
-// Mirrors vllm's cutlass_scaled_fp4_mm_sm120a: the fp4 operands and their fp8
-// (e4m3) group-16 block scales are fed DIRECTLY to the block-scaled tensor-core
-// MMA (no bf16 dequant), fp32 accumulate, then x alpha. This is the true W4A4
-// GEMM the 27B oracle golden was captured with (native != bf16-dequant on
-// near-ties). Only compiled when the TU is built for the architecture-specific
-// sm_120a/sm_121a target (__CUDA_ARCH_SPECIFIC__); the host gates the launch on
-// the VT_FP4_MMA_SM120A build define so non-a builds keep the bf16 path.
-//
-// The per-thread operand/scale layout was validated device-vs-CPU bit-exact on
-// GB10 sm_121a (m16n8k64 e2m1, scale_vec::4X ue4m3):
-//   lane: g=lane/4 (0..7), t=lane%4 (0..3)
-//   A frags a0(row g, k=t*8+j) a1(row g+8,..) a2(row g,32+t*8+j) a3(row g+8,..)
-//   B frags b0(n g, k=t*8+j)   b1(n g,32+t*8+j);  nibble j -> k-elem j
-//   D       d0(g,t*2) d1(g,t*2+1) d2(g+8,t*2) d3(g+8,t*2+1)
-//   A scale: row r held in lane (r%8)*4 + (r>=8?1:0), byte b = k-block b
-//   B scale: col n held in lane n*4,                  byte b = k-block b
-// Consumed only by the MatmulNvfp4Fp4Native template below, which is instantiated
-// exclusively from the native fp4 tactic (under VT_FP4_MMA_SM120A). Gate on BOTH
-// so a cross-family single-arch build where __CUDA_ARCH_SPECIFIC__ is defined
-// (e.g. sm_90a) but the native path is OFF does not leave this device helper
-// referenced nowhere (-Werror #177-D). On sm_12x both are defined -> byte
-// identical. See .agents/specs/cuda-arch-additivity.md §W9 (BACKEND-CUDA-SM090).
-#if defined(__CUDA_ARCH_SPECIFIC__) && defined(VT_FP4_MMA_SM120A)
-__device__ __forceinline__ uint8_t GetNib(const uint8_t* p, int64_t row,
-                                          int64_t col, int64_t k) {
-  const uint8_t byte = p[row * (k / 2) + col / 2];
-  return (col & 1) ? static_cast<uint8_t>(byte >> 4) : static_cast<uint8_t>(byte & 0xFu);
-}
-#endif
-
-template <typename Tout>
-__global__ void MatmulNvfp4Fp4Native(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,
-                                     const uint8_t* b_packed, const uint8_t* b_scale, float alpha,
-                                     int64_t M, int64_t N, int64_t K) {
-  const int lane = static_cast<int>(threadIdx.x);
-  const int g = lane / 4, t = lane % 4;
-  const int64_t m0 = static_cast<int64_t>(blockIdx.y) * 16;
-  const int64_t n0 = static_cast<int64_t>(blockIdx.x) * 8;
-  const int64_t groups = K / 16;
-  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-#if defined(__CUDA_ARCH_SPECIFIC__)
-  for (int64_t k0 = 0; k0 < K; k0 += 64) {
-    const int64_t rA = m0 + g, rA8 = m0 + g + 8, rB = n0 + g;
-    uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, b0 = 0, b1 = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const int64_t ka = k0 + t * 8 + j, kb = k0 + 32 + t * 8 + j;
-      if (rA < M) {
-        if (ka < K) a0 |= static_cast<uint32_t>(GetNib(a_packed, rA, ka, K)) << (4 * j);
-        if (kb < K) a2 |= static_cast<uint32_t>(GetNib(a_packed, rA, kb, K)) << (4 * j);
-      }
-      if (rA8 < M) {
-        if (ka < K) a1 |= static_cast<uint32_t>(GetNib(a_packed, rA8, ka, K)) << (4 * j);
-        if (kb < K) a3 |= static_cast<uint32_t>(GetNib(a_packed, rA8, kb, K)) << (4 * j);
-      }
-      if (rB < N) {
-        if (ka < K) b0 |= static_cast<uint32_t>(GetNib(b_packed, rB, ka, K)) << (4 * j);
-        if (kb < K) b1 |= static_cast<uint32_t>(GetNib(b_packed, rB, kb, K)) << (4 * j);
-      }
-    }
-    // 1.0 in fp8-e4m3 = 0x38: harmless default for unused/tail scale bytes.
-    uint32_t sfa = 0x38383838u, sfb = 0x38383838u;
-    const int64_t scaleRowA = (t == 0) ? (m0 + g) : (t == 1 ? (m0 + g + 8) : -1);
-    if (scaleRowA >= 0 && scaleRowA < M) {
-      uint32_t v = 0;
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const int64_t gc = k0 / 16 + b;
-        const uint8_t sv = (gc < groups) ? a_scale[scaleRowA * groups + gc] : 0x38u;
-        v |= static_cast<uint32_t>(sv) << (8 * b);
-      }
-      sfa = v;
-    }
-    if (t == 0) {
-      const int64_t cB = n0 + g;
-      if (cB < N) {
-        uint32_t v = 0;
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
-          const int64_t gc = k0 / 16 + b;
-          const uint8_t sv = (gc < groups) ? b_scale[cB * groups + gc] : 0x38u;
-          v |= static_cast<uint32_t>(sv) << (8 * b);
-        }
-        sfb = v;
-      }
-    }
-    asm volatile(
-        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X."
-        "f32.e2m1.e2m1.f32.ue4m3 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, "
-        "%14, {%15, %16}, %17, {%18, %19};\n"
-        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-          "f"(d0), "f"(d1), "f"(d2), "f"(d3),
-          "r"(sfa), "n"(0), "n"(0), "r"(sfb), "n"(0), "n"(0));
-  }
-#else
-  (void)a_packed; (void)a_scale; (void)b_packed; (void)b_scale; (void)groups; (void)t; (void)g;
-#endif
-  const int64_t r = m0 + g, r8 = m0 + g + 8, c0 = n0 + t * 2, c1 = n0 + t * 2 + 1;
-  if (r < M && c0 < N) Store(out, r * N + c0, alpha * d0);
-  if (r < M && c1 < N) Store(out, r * N + c1, alpha * d1);
-  if (r8 < M && c0 < N) Store(out, r8 * N + c0, alpha * d2);
-  if (r8 < M && c1 < N) Store(out, r8 * N + c1, alpha * d3);
-}
-
-// ── RUNTIME SM-DISPATCH TACTIC — the ONE tactic registered today ─────────────
-// BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #2 (.agents/specs/cuda-arch-additivity.md).
-// The native block-scaled fp4xfp4 path used to be reachable only through a bare
-// `#if defined(VT_FP4_MMA_SM120A)` inside LaunchFp4Fp4 — a COMPILE-time arch
-// assumption with no runtime check, so a fat binary that also targeted another
-// architecture would have entered this path on a device whose tensor cores do
-// not implement `mma.sync ... kind::mxf4nvf4`. It is now a registered tactic
-// with an explicit capability predicate, selected at launch time.
-//
-// ADDING AN ARCHITECTURE: write its kernel body in its OWN TU, give it a
-// `supports`/`launch` pair over the same Nvfp4Fp4MmaArgs, and call
-// RegisterArchTactic() from a static registrar there. Nothing in THIS file, and
-// nothing in LaunchFp4Fp4, changes. (Hopper wgmma / sm_100 tcgen05 bodies are a
-// separate, hardware-blocked kernel campaign — see the spec's Risks section.)
-#if defined(VT_FP4_MMA_SM120A)
-bool Sm12xFp4MmaSupports(const DeviceCaps& caps) {
-  // `mma.sync ... kind::mxf4nvf4` is consumer-Blackwell (sm_120/sm_121) only and
-  // is emitted only for the architecture-SPECIFIC 'a' target that the CMake
-  // `fp4-mma` FEATURE-TABLE row gates VT_FP4_MMA_SM120A on. The env A/B toggle
-  // stays INSIDE the predicate so VT_NVFP4_FP4_NATIVE keeps exactly its previous
-  // same-binary meaning (default OFF -> tactic not selected -> portable path).
-  return caps.valid && caps.sm_major == 12 && NativeFp4MmaEnabled();
-}
-
-bool Sm12xFp4MmaLaunch(const DeviceCaps&, void* args_v) {
-  const auto& a = *static_cast<const Nvfp4Fp4MmaArgs*>(args_v);
-  auto* s = static_cast<cudaStream_t>(a.stream);
-  const dim3 grid(static_cast<unsigned>((a.n + 7) / 8), static_cast<unsigned>((a.m + 15) / 16));
-  switch (a.out_dtype) {
-    case DType::kF32:
-      MatmulNvfp4Fp4Native<float><<<grid, 32, 0, s>>>(static_cast<float*>(a.out), a.a_packed,
-                                                      a.a_scale, a.b_packed, a.b_scale, a.alpha,
-                                                      a.m, a.n, a.k);
-      break;
-    case DType::kBF16:
-      MatmulNvfp4Fp4Native<__nv_bfloat16><<<grid, 32, 0, s>>>(
-          static_cast<__nv_bfloat16*>(a.out), a.a_packed, a.a_scale, a.b_packed, a.b_scale, a.alpha,
-          a.m, a.n, a.k);
-      break;
-    default:
-      return false;  // declined -> launcher keeps its portable path
-  }
-  Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (native sm120a)");
-  return true;
-}
-#endif  // VT_FP4_MMA_SM120A
-
-// Table fill only — no CUDA API calls before main() (cuda_ops.cu discipline).
-struct Fp4MmaTacticRegistrar {
-  Fp4MmaTacticRegistrar() {
-#if defined(VT_FP4_MMA_SM120A)
-    RegisterArchTactic(
-        TacticFamily::kNvfp4Fp4Mma,
-        ArchTactic{"nvfp4-fp4-mma/sm12x", &Sm12xFp4MmaSupports, &Sm12xFp4MmaLaunch});
-#endif
-  }
-} fp4_mma_tactic_registrar;
 
 template <typename Tout>
 void LaunchFp4Fp4(cudaStream_t s, const DeviceCaps& caps, Tensor& out, const Tensor& a_packed,

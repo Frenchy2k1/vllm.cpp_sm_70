@@ -87,6 +87,7 @@ class PathClassification(unittest.TestCase):
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
+            "release/release-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
         }
@@ -273,9 +274,15 @@ class BudgetEnforcement(unittest.TestCase):
 
     def test_every_created_checker_has_closed_bootstrap_evidence(self) -> None:
         expected = {
+            "scripts/check-arm-isa-build.py",
             "scripts/check-commit-trailers.py",
+            "scripts/check-cpu-isa-build.py",
+            "scripts/check-cuda-fat-gencode.py",
+            "scripts/check-release-workflow.py",
+            "scripts/validate-release-archive.py",
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
+            "scripts/check-triton-aot-multiarch.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

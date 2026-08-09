@@ -435,7 +435,13 @@ STATUS_RATCHET = {
     # compaction onto current main reduced the live page below the inherited
     # cap. The cap remains byte-tight and within the <=25 convention, so that
     # reduction cannot become untracked growth headroom.
-    "chars": 243761,
+    # 243694 since 2026-08-09 (measured 243694): the W6 claim checkpoint
+    # replaces the longer container-only paragraph with the current binary and
+    # container dependency state. Re-pinned byte-tight after the structured
+    # state migration so the reduction cannot become untracked growth headroom.
+    # 243632 since 2026-08-09 (measured 243632): the W1 candidate records local
+    # gencode gates while keeping the real ten-SM archive audit pending.
+    "chars": 243632,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

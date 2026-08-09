@@ -69,6 +69,7 @@ def flags(backend: str, sms: list[str] | None = None) -> dict[str, object]:
         "VLLM_CPP_CUDA_ARCHITECTURES": list(sms or []),
         "VLLM_CPP_HIP": False,
         "VLLM_CPP_HIP_ARCHITECTURES": [],
+        "VLLM_CPP_LITERAL_STATIC": False,
         "VLLM_CPP_METAL": backend in {"metal", "mlx"},
         "VLLM_CPP_MLX": backend == "mlx",
         "VLLM_CPP_SERVER": True,
@@ -117,14 +118,23 @@ def cpu_facts() -> dict[str, object]:
         {
             "name": "avx2-f16c",
             "kernel_families": ["matmul-elem-f32-bf16-f16"],
-            "required_cpu_bits": ["avx", "avx2", "f16c", "osxsave"],
+            "required_cpu_bits": ["avx", "avx2", "f16c", "osxsave", "sse2"],
             "required_os_state": ["xcr0:xmm", "xcr0:ymm"],
             "execution_evidence": evidence("absent"),
         },
         {
             "name": "avx512f",
             "kernel_families": ["matmul-elem-f32-bf16"],
-            "required_cpu_bits": ["avx", "avx512f", "osxsave"],
+            "required_cpu_bits": [
+                "avx",
+                "avx2",
+                "avx512bw",
+                "avx512f",
+                "avx512vl",
+                "f16c",
+                "osxsave",
+                "sse2",
+            ],
             "required_os_state": [
                 "xcr0:xmm",
                 "xcr0:ymm",
@@ -139,6 +149,7 @@ def cpu_facts() -> dict[str, object]:
         "artifact": {
             "id": "linux-x86_64-glibc-cpu",
             "version": "0.1.0-test",
+            "c_abi_version": 17,
             "channel": "preview",
             "kind": "primary",
             "static_boundary": "static-core",
@@ -200,6 +211,7 @@ def cuda_facts() -> dict[str, object]:
         "artifact": {
             "id": "linux-x86_64-glibc-cuda-fat",
             "version": "0.1.0-test",
+            "c_abi_version": 17,
             "channel": "preview",
             "kind": "primary",
             "static_boundary": "static-core",
@@ -399,6 +411,18 @@ class ReleaseManifestTests(unittest.TestCase):
         manifest["schema_version"] = True
         self.assert_invalid(manifest, "schema_version")
 
+    def test_artifact_c_abi_version_is_mandatory_and_numeric(self) -> None:
+        manifest = self.generated(cpu_facts())
+        self.assertEqual(manifest["artifact"]["c_abi_version"], 17)
+        for value in (None, True, 0, -1, "17"):
+            with self.subTest(value=value):
+                mutant = copy.deepcopy(manifest)
+                if value is None:
+                    del mutant["artifact"]["c_abi_version"]
+                else:
+                    mutant["artifact"]["c_abi_version"] = value
+                self.assert_invalid(mutant, "c_abi_version")
+
     def test_boolean_is_neither_an_integer_type_nor_integer_json_constant(self) -> None:
         self.assertFalse(
             self.tool._type_matches(True, "integer"),
@@ -521,6 +545,35 @@ class ReleaseManifestTests(unittest.TestCase):
         mutant["cpu"]["compiled_tiers"][1]["required_os_state"] = []
         self.assert_invalid(mutant, "OS-state")
 
+    def test_literal_static_flag_is_exactly_scoped_to_the_musl_cpu_tuple(self) -> None:
+        glibc = self.generated(cpu_facts())
+        glibc["backend"]["flags"]["VLLM_CPP_LITERAL_STATIC"] = True
+        glibc["build"]["resolved_cmake_options"]["VLLM_CPP_LITERAL_STATIC"] = True
+        self.assert_invalid(glibc, "must agree with the artifact static boundary")
+
+        facts = cpu_facts()
+        facts["artifact"].update(
+            {
+                "id": "linux-x86_64-musl-cpu-static",
+                "channel": "experimental-preview",
+                "static_boundary": "literal-static",
+            }
+        )
+        facts["host"].update({"abi": "musl", "abi_version": "1.2.5"})
+        facts["backend"]["flags"]["VLLM_CPP_LITERAL_STATIC"] = True
+        facts["build"]["resolved_cmake_options"]["VLLM_CPP_LITERAL_STATIC"] = True
+        facts["dependencies"] = [
+            {
+                "name": "musl-libc",
+                "version": "1.2.5",
+                "kind": "library",
+                "linkage": "static",
+                "bundled": True,
+                "role": "build-time",
+            }
+        ]
+        self.generated(facts)
+
     def test_cpu_tier_inventory_is_exact_on_x86_and_aarch64(self) -> None:
         manifest = self.generated(cpu_facts())
         for index, tier in enumerate(manifest["cpu"]["compiled_tiers"]):
@@ -559,19 +612,22 @@ class ReleaseManifestTests(unittest.TestCase):
 
         arm_kernel_families = {
             "portable-neon": ["matmul-elem-f32-bf16-f16"],
+            "dotprod": ["quant-dot-q8_0-q8_0"],
             "i8mm": ["quant-dot-q4_0-q8_0-q4_K-q6_K", "quant-repack-q8_0"],
         }
-        for os_name, abi, artifact_id, probe in (
+        for os_name, abi, artifact_id, dotprod_probe, i8mm_probe in (
             (
                 "linux",
                 "glibc",
                 "linux-aarch64-glibc-cpu",
+                "getauxval:AT_HWCAP:HWCAP_ASIMDDP",
                 "getauxval:AT_HWCAP2:HWCAP2_I8MM",
             ),
             (
                 "macos",
                 "macos",
                 "macos-arm64-cpu-policy-probe",
+                "sysctl:hw.optional.arm.FEAT_DotProd",
                 "sysctl:hw.optional.arm.FEAT_I8MM",
             ),
         ):
@@ -590,10 +646,16 @@ class ReleaseManifestTests(unittest.TestCase):
                             "required_os_state": [],
                         },
                         {
+                            "name": "dotprod",
+                            "kernel_families": arm_kernel_families["dotprod"],
+                            "required_cpu_bits": ["dotprod", "neon"],
+                            "required_os_state": [dotprod_probe],
+                        },
+                        {
                             "name": "i8mm",
                             "kernel_families": arm_kernel_families["i8mm"],
-                            "required_cpu_bits": ["i8mm"],
-                            "required_os_state": [probe],
+                            "required_cpu_bits": ["dotprod", "i8mm", "neon"],
+                            "required_os_state": [dotprod_probe, i8mm_probe],
                         },
                     ],
                 },
@@ -601,7 +663,7 @@ class ReleaseManifestTests(unittest.TestCase):
             with self.subTest(aarch64_os=os_name):
                 self.assertEqual(self.tool._cpu_policy(arm), [])
                 wrong_probe = copy.deepcopy(arm)
-                wrong_probe["cpu"]["compiled_tiers"][1]["required_os_state"] = [
+                wrong_probe["cpu"]["compiled_tiers"][2]["required_os_state"] = [
                     "fabricated:os-probe"
                 ]
                 self.assertTrue(
@@ -766,6 +828,8 @@ class ReleaseManifestTests(unittest.TestCase):
             "static_boundary": "literal-static",
         })
         musl["host"].update({"abi": "musl", "abi_version": "1.2.5"})
+        musl["backend"]["flags"]["VLLM_CPP_LITERAL_STATIC"] = True
+        musl["build"]["resolved_cmake_options"]["VLLM_CPP_LITERAL_STATIC"] = True
         musl["dependencies"] = [{
             "name": "musl", "version": "1.2.5", "kind": "library",
             "linkage": "static", "bundled": True, "role": "runtime",

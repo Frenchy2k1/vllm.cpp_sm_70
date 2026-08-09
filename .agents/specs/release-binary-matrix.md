@@ -1,20 +1,35 @@
 # Downloadable server binary release matrix
 
-Status: accepted contract with W5 manifest tooling implemented for
-`ENG-RELEASE-BINARIES`. The release row is `ACTIVE`; no archive, release
-workflow, or runtime result is claimed.
+Status: accepted contract with required W1-W11/W13 implementation complete for
+`ENG-RELEASE-BINARIES` in the single delivery PR #196. The release row remains
+`ACTIVE`: local gates are green, while the hosted eight-tuple dry run,
+matching-hardware evidence, and tagged publication are still pending. W12 is
+optional/non-primary.
 
 Pins: vLLM parity source `555967922`; vllm.cpp spike baseline `f13c49ee`;
 request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
 `CLAIM-ENG-RELEASE-BINARIES-SPIKE` in draft PR
 [#129](https://github.com/mudler/vllm.cpp/pull/129); W5 implementation claim
 `CLAIM-ENG-RELEASE-BINARIES-W5` in draft PR
-[#141](https://github.com/mudler/vllm.cpp/pull/141).
+[#141](https://github.com/mudler/vllm.cpp/pull/141); W6 implementation claim
+`CLAIM-ENG-RELEASE-BINARIES-W6` in draft PR
+[#196](https://github.com/mudler/vllm.cpp/pull/196).
+
+## Delivery topology
+
+Developer direction on 2026-08-09 binds all remaining W1-W13 work to PR #196.
+Each work unit remains an independently committed, red-first, executable
+checkpoint, but no work unit is split into another implementation PR. PR #196
+stays draft until every required work unit, the full release dry run, fresh
+review, and operator verification are green. W12 remains optional and cannot
+block W13; its optional status does not permit moving it to another PR.
 
 <!-- release-binary-contract:begin -->
 identity=ENG-RELEASE-BINARIES
 lifecycle=ACTIVE
 manifest_schema=vllm.cpp.release-manifest.v1
+delivery_pull_request=196
+delivery_mode=single-pr-W1-W13
 primary_cuda_artifact=one-fat-binary-per-os-host-abi
 primary_cuda_sms=80,86,87,89,90a,100a,103a,110,120a,121a
 per_sm_cuda=optional-non-primary
@@ -30,7 +45,7 @@ musl_channel=experimental-preview
 musl_scope=cpu-only-no-gpu
 rocm_channel=blocked
 gpu_driver_boundary=external-host-never-bundled
-required_anchor_paths=.agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,.agents/coordination.md,.agents/completed/state-events/2026-08/STATE-20260808T220000-002.md,docs/STATUS.md,docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,scripts/release_manifest.py,tests/scripts/test_release_manifest.py
+required_anchor_paths=.agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,.agents/coordination.md,.agents/completed/state-events/2026-08/STATE-20260809T160000-001.md,docs/STATUS.md,docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,scripts/release_manifest.py,tests/scripts/test_release_manifest.py,examples/CMakeLists.txt,scripts/package-server.py,tests/scripts/test_server_package.py
 work_W1=
 work_W2=W1
 work_W3=
@@ -38,6 +53,7 @@ work_W4=
 work_W5=
 work_W5_status=implemented
 work_W6=
+work_W6_status=implemented
 work_W7=W1,W2,W3,W4,W5,W6
 work_W8=W5,W7
 work_W9=W3,W4,W5,W6,W7
@@ -430,9 +446,10 @@ wildcards, and a failed lane cannot be replaced by an older workflow artifact.
 
 ## Work breakdown: helper-sized implementation plan
 
-Each work unit is a separate claim with its own red-first checker change and
-fresh review. W5 is implemented in draft PR #141 and advances the row to
-`ACTIVE`; no later work unit or release evidence is implied.
+Each work unit is a separate verified checkpoint inside the single active
+claim and PR #196, with its own red-first checker change and review. W5 was
+implemented in PR #141; required W1-W11/W13 are implemented in #196. Hosted
+completion remains necessary before any publication or channel claim.
 
 | Work | Deps | Deliverable | Exit gate |
 |---|---|---|---|
@@ -441,7 +458,7 @@ fresh review. W5 is implemented in draft PR #141 and advances the row to
 | W3 | — | x86_64 CPU ISA-dispatch inventory and completion | SSE2/portable baseline runs without AVX2; current F16C/AVX2/AVX-512 tiers forced and executed; exact OS-state probes; VNNI/AMX listed only for real gated kernels; no `-march=native` |
 | W4 | — | aarch64 CPU ISA-dispatch inventory and completion | NEON/portable baseline plus independently forced DotProd/i8mm where kernels exist; exact Linux HWCAP/Darwin sysctl gates; poor/rich host or emulation execution |
 | W5 | — | **IMPLEMENTED (#141):** versioned release-manifest generator and schema with independent per-SM and per-CPU-tier evidence | 19/19 tests: fixtures distinguish absent, false, failed and true; schema type/enum/const are independently live; booleans cannot satisfy integer types/constants; CPU tier kernel-family/bit/OS-probe inventories are exact; compiled tiers/SMs, fallback/AOT state, the named NVIDIA driver dependency, publication channels, static boundaries and host ABI are mandatory |
-| W6 | — | canonical `vllm-server` output name, install component, and staging/package target for the existing static-core server | install into empty prefix; extracted help smoke; existing library install unchanged |
+| W6 | — | **IMPLEMENTED (#196):** canonical `vllm-server` output name, install component, and deterministic staging/package target for the existing static-core server | clean CPU build installs into an empty prefix; archive bytes reproduce; extracted `--help` runs without dynamic `libvllm`; existing library/header install remains present |
 | W7 | W1, W2, W3, W4, W5, W6 | staged archive validator: allowlist, dependency/RPATH, fat-SM/AOT and adaptive-CPU audits, SHA256, VERSION, licenses and SPDX SBOM | Linux fixture/archive tests red-first; no build paths, missing SM, unsafe ISA tier or undeclared dependency accepted |
 | W8 | W5, W7 | least-privilege dry-run/tag workflow, immutable artifact handoff, provenance and protected publish stages | permissions checker plus dry run proves no release is created and publish cannot consume unverified bytes |
 | W9 | W3, W4, W5, W6, W7 | primary adaptive CPU bundles: Linux glibc x86_64+aarch64 and experimental x86_64 musl literal-static | glibc binaries execute baseline and supported rich tiers on matching hosts/emulation before stable; musl remains preview |
@@ -482,7 +499,8 @@ The release program is feasible as backend-specific static-core bundles with a
 hybrid stable/preview channel. Literal-static scope is limited to the
 experimental musl CPU lane. ROCm is blocked. Primary downloads are adaptive CPU
 or fat CUDA per OS+host ABI; per-SM CUDA archives are optional diagnostics. The
-W5 manifest schema/tooling is implemented and the row is `ACTIVE`, not `DONE`.
-W1-W4 and W6-W13 remain pending; in particular no archive, install/package or
-publish workflow, staged-archive evidence, runtime/correctness proof, or
-performance result exists.
+Required W1-W11/W13 are implemented and the row is `ACTIVE`, not `DONE`. Local
+archive, CPU, Vulkan, workflow, and mutation gates are green. The hosted
+eight-tuple dry run, matching-hardware evidence, and tagged publication remain
+pending, so no published archive or release-channel advancement is claimed.
+W12 remains the optional non-primary diagnostic lane.

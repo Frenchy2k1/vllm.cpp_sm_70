@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Executable W7 contract for extracted release archives and sidecars."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+TOOL = ROOT / "scripts" / "validate-release-archive.py"
+FIXTURE = ROOT / "tests/scripts/fixtures/release_manifest/v1/cpu-manifest.json"
+CUDA_FIXTURE = ROOT / "tests/scripts/fixtures/release_manifest/v1/cuda-manifest.json"
+
+
+def load_tool():
+    spec = importlib.util.spec_from_file_location("validate_release_archive", TOOL)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {TOOL}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "x86_64", "Linux x86_64 W7 fixture")
+class ReleaseArchiveContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tool = load_tool()
+
+    def manifest(self, executable: Path) -> dict[str, object]:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        dynamic = subprocess.run(
+            ["readelf", "-dW", str(executable)],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+        needed = self.tool.parse_elf_needed(dynamic)
+        manifest["dependencies"] = [
+            {
+                "name": name,
+                "version": "system",
+                "kind": "library",
+                "linkage": "dynamic",
+                "bundled": False,
+                "role": "runtime",
+            }
+            for name in needed
+        ]
+        return manifest
+
+    def make_release(self, scratch: Path, mutate=None) -> tuple[Path, Path, Path]:
+        stage = scratch / "stage"
+        (stage / "bin").mkdir(parents=True)
+        executable = stage / "bin/vllm-server"
+        shutil.copy2("/bin/true", executable)
+        executable.chmod(0o755)
+        manifest = self.manifest(executable)
+        version = {
+            "version": manifest["artifact"]["version"],
+            "commit": manifest["build"]["source_commit"],
+            "artifact_id": manifest["artifact"]["id"],
+            "backend": manifest["backend"]["name"],
+            "host_os": manifest["host"]["os"],
+            "host_arch": manifest["host"]["arch"],
+            "host_abi": manifest["host"]["abi"],
+            "source_clean": "true",
+            "c_abi_version": "17",
+        }
+        binary_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+        sbom = {
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": manifest["artifact"]["id"],
+            "documentNamespace": "https://github.com/mudler/vllm.cpp/spdx/fixture",
+            "creationInfo": {
+                "created": "1970-01-01T00:00:00Z",
+                "creators": ["Organization: vllm.cpp"],
+            },
+            "files": [
+                {
+                    "fileName": "./bin/vllm-server",
+                    "SPDXID": "SPDXRef-File-vllm-server",
+                    "checksums": [{"algorithm": "SHA256", "checksumValue": binary_digest}],
+                    "licenseConcluded": "NOASSERTION",
+                    "copyrightText": "NOASSERTION",
+                }
+            ],
+        }
+        (stage / "release-manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (stage / "VERSION").write_text(
+            "".join(f"{key}={value}\n" for key, value in version.items()), encoding="utf-8"
+        )
+        (stage / "sbom.spdx.json").write_text(
+            json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (stage / "THIRD_PARTY_NOTICES").write_text(
+            "vllm.cpp release dependency notices\n", encoding="utf-8"
+        )
+        licenses = stage / "share/licenses/vllm.cpp"
+        licenses.mkdir(parents=True)
+        shutil.copy2(ROOT / "LICENSE", licenses / "LICENSE")
+        if mutate is not None:
+            mutate(stage, manifest, sbom)
+        archive = scratch / "vllm.cpp-fixture.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            for path in sorted(stage.rglob("*")):
+                bundle.add(path, arcname=path.relative_to(stage))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        checksum = Path(f"{archive}.sha256")
+        checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+        provenance = Path(f"{archive}.provenance.json")
+        provenance.write_text(
+            json.dumps(
+                {
+                    "_type": "https://in-toto.io/Statement/v1",
+                    "predicateType": "https://slsa.dev/provenance/v1",
+                    "subject": [{"name": archive.name, "digest": {"sha256": digest}}],
+                    "predicate": {
+                        "buildDefinition": {
+                            "externalParameters": {
+                                "artifact_id": manifest["artifact"]["id"],
+                                "source_commit": manifest["build"]["source_commit"],
+                            }
+                        }
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return archive, checksum, provenance
+
+    def run_validator(self, archive: Path, checksum: Path, provenance: Path):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(TOOL),
+                "--archive",
+                str(archive),
+                "--checksum",
+                str(checksum),
+                "--provenance",
+                str(provenance),
+                "--repo-root",
+                str(ROOT),
+                "--skip-version-smoke",
+                "--forbid-path",
+                str(archive.parent / "build-secret"),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_valid_extracted_cpu_archive_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.make_release(Path(temporary))
+            result = self.run_validator(*paths)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_extra_source_object_and_missing_metadata_fail(self) -> None:
+        mutations = (
+            lambda stage, manifest, sbom: (stage / "source.cpp").write_text("int x;"),
+            lambda stage, manifest, sbom: (stage / "object.o").write_bytes(b"ELF"),
+            lambda stage, manifest, sbom: (stage / "VERSION").unlink(),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                paths = self.make_release(Path(temporary), mutation)
+                result = self.run_validator(*paths)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_wrong_checksum_and_provenance_subject_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive, checksum, provenance = self.make_release(Path(temporary))
+            checksum.write_text(f"{'0' * 64}  {archive.name}\n", encoding="utf-8")
+            self.assertNotEqual(self.run_validator(archive, checksum, provenance).returncode, 0)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+            statement = json.loads(provenance.read_text())
+            statement["subject"][0]["digest"]["sha256"] = "f" * 64
+            provenance.write_text(json.dumps(statement), encoding="utf-8")
+            self.assertNotEqual(self.run_validator(archive, checksum, provenance).returncode, 0)
+
+    def test_sbom_binary_digest_and_version_manifest_agreement_are_live(self) -> None:
+        def bad_sbom(stage, manifest, sbom):
+            sbom["files"][0]["checksums"][0]["checksumValue"] = "0" * 64
+            (stage / "sbom.spdx.json").write_text(json.dumps(sbom), encoding="utf-8")
+
+        def bad_version(stage, manifest, sbom):
+            path = stage / "VERSION"
+            path.write_text(path.read_text().replace("version=0.1.0-test", "version=9.9.9"))
+
+        for mutation in (bad_sbom, bad_version):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                paths = self.make_release(Path(temporary), mutation)
+                result = self.run_validator(*paths)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_build_path_and_undeclared_dynamic_dependency_fail(self) -> None:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        errors = self.tool.validate_linux_dynamic(
+            manifest,
+            ["libc.so.6", "libundeclared.so.1"],
+            ["/tmp/build-secret/lib"],
+            "/lib64/ld-linux-x86-64.so.2",
+            ["/tmp/build-secret"],
+        )
+        self.assertTrue(any("undeclared" in error for error in errors), errors)
+        self.assertTrue(any("RPATH" in error for error in errors), errors)
+        self.assertEqual(
+            self.tool.validate_macho_install_id("@rpath/libmlx.dylib", ["/tmp/build"]),
+            [],
+        )
+        self.assertTrue(
+            self.tool.validate_macho_install_id("/tmp/build/libmlx.dylib", ["/tmp/build"])
+        )
+
+    def test_literal_static_policy_rejects_any_dynamic_boundary(self) -> None:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        manifest["artifact"]["static_boundary"] = "literal-static"
+        manifest["host"]["abi"] = "musl"
+        manifest["dependencies"] = []
+        self.assertEqual(self.tool.validate_linux_dynamic(manifest, [], [], "", []), [])
+        errors = self.tool.validate_linux_dynamic(
+            manifest, ["libc.so"], ["$ORIGIN/lib"], "/lib/ld-musl-x86_64.so.1", []
+        )
+        self.assertTrue(any("literal-static" in error for error in errors), errors)
+
+    def test_large_file_scanner_catches_a_credential_across_chunk_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "large-binary"
+            path.write_bytes(b"x" * (1024 * 1024 - 8) + b"AKIA0123456789ABCDEF")
+            found, aws_key = self.tool.scan_file(path, [b"not-present"])
+            self.assertEqual(found, set())
+            self.assertTrue(aws_key)
+
+    def test_cuda_inventory_requires_all_sms_and_exact_aot_symbols(self) -> None:
+        manifest = json.loads(CUDA_FIXTURE.read_text(encoding="utf-8"))
+        images = [f"sm_{sm}" for sm in self.tool.PRIMARY_CUDA_SMS]
+        symbols = [f"vt_aot_sm_{sm}_gdn_default" for sm in self.tool.AOT_SMS]
+        self.assertEqual(self.tool.validate_cuda_inventory(manifest, images, symbols), [])
+        for removed in self.tool.PRIMARY_CUDA_SMS:
+            with self.subTest(missing_sm=removed):
+                errors = self.tool.validate_cuda_inventory(
+                    manifest, [image for image in images if image != f"sm_{removed}"], symbols
+                )
+                self.assertTrue(any(removed in error for error in errors), errors)
+        errors = self.tool.validate_cuda_inventory(
+            manifest,
+            images,
+            [symbol.replace("sm_80", "sm_87") for symbol in symbols],
+        )
+        self.assertTrue(any("AOT" in error for error in errors), errors)
+
+    def test_macho_dependencies_install_names_and_rpaths_fail_closed(self) -> None:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        manifest["host"].update({"os": "macos", "arch": "aarch64", "abi": "macos"})
+        manifest["backend"]["name"] = "mlx"
+        manifest["dependencies"] = [
+            {"name": "libmlx.dylib", "linkage": "dynamic"},
+            {"name": "libc++.1.dylib", "linkage": "dynamic"},
+            {"name": "libSystem.B.dylib", "linkage": "dynamic"},
+            {"name": "Metal.framework", "linkage": "external"},
+            {"name": "Foundation.framework", "linkage": "external"},
+        ]
+        dependencies = [
+            "@rpath/libmlx.dylib",
+            "/usr/lib/libc++.1.dylib",
+            "/usr/lib/libSystem.B.dylib",
+            "/System/Library/Frameworks/Metal.framework/Versions/A/Metal",
+            "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+        ]
+        self.assertEqual(
+            self.tool.validate_macho_dynamic(
+                manifest, dependencies, ["@loader_path/../lib"], ["/tmp/build-secret"]
+            ),
+            [],
+        )
+        errors = self.tool.validate_macho_dynamic(
+            manifest,
+            [*dependencies, "/tmp/build-secret/libbad.dylib"],
+            ["/tmp/build-secret"],
+            ["/tmp/build-secret"],
+        )
+        self.assertTrue(any("install name" in error for error in errors), errors)
+        self.assertTrue(any("RPATH" in error for error in errors), errors)
+
+    def test_tar_traversal_is_rejected_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            archive = scratch / "bad.tar.gz"
+            source = scratch / "payload"
+            source.write_text("escape", encoding="utf-8")
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(source, arcname="../escape")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            checksum = Path(f"{archive}.sha256")
+            checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+            provenance = Path(f"{archive}.provenance.json")
+            provenance.write_text(
+                json.dumps(
+                    {
+                        "_type": "https://in-toto.io/Statement/v1",
+                        "predicateType": "https://slsa.dev/provenance/v1",
+                        "subject": [
+                            {"name": archive.name, "digest": {"sha256": digest}}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_validator(archive, checksum, provenance)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsafe archive path", result.stdout + result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

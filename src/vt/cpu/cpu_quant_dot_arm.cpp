@@ -35,53 +35,25 @@
 // `vmmlaq_s32`; the whole body is additionally `#if defined(__aarch64__) &&
 // defined(__ARM_FEATURE_MATMUL_INT8)` so a build without the feature (or any
 // non-Arm build) links the empty stubs and the portable tier runs everywhere.
-// At RUNTIME the mmla kernels are handed out ONLY when `getauxval(AT_HWCAP2) &
-// HWCAP2_I8MM` — selecting an mmla kernel on a CPU that lacks i8mm would be an
-// illegal-instruction crash. `VT_CPU_QUANT_MMLA=0|off|false` forces the tier
-// off for a same-binary A/B (the portable nrc==1 path then serves every shape).
+// At RUNTIME the mmla kernels are handed out only after the shared Linux
+// HWCAP/HWCAP2 or Darwin sysctl detector proves the i8mm tier. The
+// VT_CPU_QUANT_MMLA switch can force either portable or i8mm; a forced i8mm on
+// unsupported hardware fails before an illegal instruction can execute.
 #include "vt/quant.h"
 
 #if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
 
 #include <arm_neon.h>
 
-#if defined(__linux__)
-#include <asm/hwcap.h>
-#include <sys/auxv.h>
-#elif defined(__APPLE__)
-#include <sys/sysctl.h>
-#endif
-
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "cpu_quant_blocks.h"
-
-#if defined(__linux__) && !defined(HWCAP2_I8MM)
-#define HWCAP2_I8MM (1 << 13)
-#endif
+#include "vt/cpu/cpu_isa_arm.h"
 
 namespace vt::cpu {
 namespace {
-
-// Runtime i8mm detection is OS-specific: Linux exposes it through the aux
-// vector, Darwin through sysctl. The compile-time __ARM_FEATURE_MATMUL_INT8
-// gate above only says the compiler MAY emit i8mm - the running core still
-// has to confirm it.
-bool CpuHasI8mm() {
-#if defined(__linux__)
-  return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
-#elif defined(__APPLE__)
-  int v = 0;
-  size_t sz = sizeof(v);
-  if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &v, &sz, nullptr, 0) != 0) {
-    return false;
-  }
-  return v != 0;
-#else
-  return false;
-#endif
-}
 
 // GGML_CPU_FP16_TO_FP32 on this target is an IEEE-exact fp16->fp32 widen; so is
 // vt::F16ToF32. Using the latter keeps the scale bit-identical to the portable
@@ -526,11 +498,12 @@ void VecDotMmlaQ6_K(int n, float* s, size_t bs, const void* vx, size_t bx,
 bool QuantMmlaActive() {
   static const bool v = [] {
     const char* e = std::getenv("VT_CPU_QUANT_MMLA");
-    if (e != nullptr &&
-        (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0 || std::strcmp(e, "false") == 0)) {
-      return false;
-    }
-    return CpuHasI8mm();
+    bool enabled = false;
+    std::string error;
+    VT_CHECK(ResolveArmIsaToggle(DetectArmIsaCaps(), ArmIsaTier::kI8mm,
+                                e == nullptr ? "auto" : e, &enabled, &error),
+             error);
+    return enabled;
   }();
   return v;
 }

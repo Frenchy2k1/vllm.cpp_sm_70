@@ -1,5 +1,6 @@
 {
   "artifact": {
+    "c_abi_version": 17,
     "channel": "preview",
     "id": "linux-x86_64-glibc-cuda-fat",
     "kind": "primary",
@@ -26,6 +27,7 @@
       ],
       "VLLM_CPP_HIP": false,
       "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_LITERAL_STATIC": false,
       "VLLM_CPP_METAL": false,
       "VLLM_CPP_MLX": false,
       "VLLM_CPP_SERVER": true,
@@ -115,6 +117,7 @@
       ],
       "VLLM_CPP_HIP": false,
       "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_LITERAL_STATIC": false,
       "VLLM_CPP_METAL": false,
       "VLLM_CPP_MLX": false,
       "VLLM_CPP_SERVER": true,

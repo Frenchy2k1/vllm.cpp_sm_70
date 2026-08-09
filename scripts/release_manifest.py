@@ -57,8 +57,11 @@ CPU_TIER_POLICY = {
         "bits": {
             "portable-sse2": {"sse2"},
             "sse2-f16c": {"sse2", "avx", "f16c", "osxsave"},
-            "avx2-f16c": {"avx", "avx2", "f16c", "osxsave"},
-            "avx512f": {"avx", "avx512f", "osxsave"},
+            "avx2-f16c": {"sse2", "avx", "avx2", "f16c", "osxsave"},
+            "avx512f": {
+                "sse2", "avx", "f16c", "avx2", "avx512f", "avx512bw",
+                "avx512vl", "osxsave",
+            },
         },
         "os_state": {
             "portable-sse2": set(),
@@ -72,20 +75,35 @@ CPU_TIER_POLICY = {
     },
     "aarch64": {
         "baseline": "portable-neon",
-        "tiers": ("portable-neon", "i8mm"),
+        "tiers": ("portable-neon", "dotprod", "i8mm"),
         "kernel_families": {
             "portable-neon": {"matmul-elem-f32-bf16-f16"},
+            "dotprod": {"quant-dot-q8_0-q8_0"},
             "i8mm": {
                 "quant-dot-q4_0-q8_0-q4_K-q6_K",
                 "quant-repack-q8_0",
             },
         },
-        "bits": {"portable-neon": {"neon"}, "i8mm": {"i8mm"}},
+        "bits": {
+            "portable-neon": {"neon"},
+            "dotprod": {"neon", "dotprod"},
+            "i8mm": {"neon", "dotprod", "i8mm"},
+        },
         "os_state": {
             "portable-neon": {"linux": set(), "macos": set()},
+            "dotprod": {
+                "linux": {"getauxval:AT_HWCAP:HWCAP_ASIMDDP"},
+                "macos": {"sysctl:hw.optional.arm.FEAT_DotProd"},
+            },
             "i8mm": {
-                "linux": {"getauxval:AT_HWCAP2:HWCAP2_I8MM"},
-                "macos": {"sysctl:hw.optional.arm.FEAT_I8MM"},
+                "linux": {
+                    "getauxval:AT_HWCAP:HWCAP_ASIMDDP",
+                    "getauxval:AT_HWCAP2:HWCAP2_I8MM",
+                },
+                "macos": {
+                    "sysctl:hw.optional.arm.FEAT_DotProd",
+                    "sysctl:hw.optional.arm.FEAT_I8MM",
+                },
             },
         },
     },
@@ -312,6 +330,10 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         return []
     artifact_id = artifact.get("id")
     name = backend.get("name")
+    if not isinstance(artifact.get("c_abi_version"), int) or isinstance(
+        artifact.get("c_abi_version"), bool
+    ) or artifact.get("c_abi_version", 0) <= 0:
+        return ["$.artifact.c_abi_version: must be a positive integer"]
     policies = {
         "linux-x86_64-glibc-cpu": ("linux", "x86_64", "glibc", "cpu", "static-core", {"preview", "stable"}),
         "linux-aarch64-glibc-cpu": ("linux", "aarch64", "glibc", "cpu", "static-core", {"preview", "stable"}),
@@ -347,8 +369,11 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
 
 def _backend_policy(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     backend = manifest.get("backend", {})
+    artifact = manifest.get("artifact", {})
     if not isinstance(backend, dict):
         return []
+    if not isinstance(artifact, dict):
+        artifact = {}
     name = backend.get("name")
     flags = backend.get("flags", {})
     if not isinstance(flags, dict):
@@ -364,6 +389,11 @@ def _backend_policy(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     for flag, expected in expected_switches.items():
         if flags.get(flag) is not expected:
             errors.append(f"$.backend.flags.{flag}: inconsistent backend flags for {name}")
+    expects_literal_static = artifact.get("static_boundary") == "literal-static"
+    if flags.get("VLLM_CPP_LITERAL_STATIC") is not expects_literal_static:
+        errors.append(
+            "$.backend.flags.VLLM_CPP_LITERAL_STATIC: must agree with the artifact static boundary"
+        )
     if flags.get("VLLM_CPP_SERVER") is not True or flags.get("VLLM_CPP_BUILD_EXAMPLES") is not True:
         errors.append("$.backend.flags: release backend flags must build server and examples")
     if flags.get("VLLM_CPP_HIP_ARCHITECTURES") != []:
