@@ -220,10 +220,10 @@ function(vt_cuda_gencode_options OUT_VAR ARCHS)
         "vt_cuda_gencode_options: invalid CUDA architecture '${_arch}'")
     endif()
     list(APPEND _options
-      "SHELL:-gencode arch=compute_${_arch},code=sm_${_arch}")
+      "-gencode=arch=compute_${_arch},code=sm_${_arch}")
     if(_emit_ptx)
       list(APPEND _options
-        "SHELL:-gencode arch=compute_${_arch},code=compute_${_arch}")
+        "-gencode=arch=compute_${_arch},code=compute_${_arch}")
     endif()
   endforeach()
   set(${OUT_VAR} "${_options}" PARENT_SCOPE)

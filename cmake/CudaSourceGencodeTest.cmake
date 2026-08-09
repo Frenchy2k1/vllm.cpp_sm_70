@@ -15,9 +15,9 @@ function(expect_gencode ARCHS EXPECTED)
 endfunction()
 
 expect_gencode("90a;120a"
-  "SHELL:-gencode arch=compute_90a,code=sm_90a;SHELL:-gencode arch=compute_120a,code=sm_120a")
+  "-gencode=arch=compute_90a,code=sm_90a;-gencode=arch=compute_120a,code=sm_120a")
 expect_gencode("${_ten_sms}"
-  "SHELL:-gencode arch=compute_80,code=sm_80;SHELL:-gencode arch=compute_86,code=sm_86;SHELL:-gencode arch=compute_87,code=sm_87;SHELL:-gencode arch=compute_89,code=sm_89;SHELL:-gencode arch=compute_90a,code=sm_90a;SHELL:-gencode arch=compute_100a,code=sm_100a;SHELL:-gencode arch=compute_103a,code=sm_103a;SHELL:-gencode arch=compute_110,code=sm_110;SHELL:-gencode arch=compute_120a,code=sm_120a;SHELL:-gencode arch=compute_121a,code=sm_121a")
+  "-gencode=arch=compute_80,code=sm_80;-gencode=arch=compute_86,code=sm_86;-gencode=arch=compute_87,code=sm_87;-gencode=arch=compute_89,code=sm_89;-gencode=arch=compute_90a,code=sm_90a;-gencode=arch=compute_100a,code=sm_100a;-gencode=arch=compute_103a,code=sm_103a;-gencode=arch=compute_110,code=sm_110;-gencode=arch=compute_120a,code=sm_120a;-gencode=arch=compute_121a,code=sm_121a")
 
 set(VLLM_CPP_CUDA_ARCHITECTURES "${_ten_sms}")
 vt_cuda_feature_archs(_fp4 "fp4-mma")
@@ -25,11 +25,11 @@ vt_cuda_feature_archs(_sm90 "scaledmm-c3x-sm90")
 vt_cuda_feature_archs(_sm100 "scaledmm-c3x-sm100")
 vt_cuda_feature_archs(_fa2 "fa2")
 expect_gencode("${_fp4}"
-  "SHELL:-gencode arch=compute_120a,code=sm_120a;SHELL:-gencode arch=compute_121a,code=sm_121a")
-expect_gencode("${_sm90}" "SHELL:-gencode arch=compute_90a,code=sm_90a")
-expect_gencode("${_sm100}" "SHELL:-gencode arch=compute_100a,code=sm_100a")
+  "-gencode=arch=compute_120a,code=sm_120a;-gencode=arch=compute_121a,code=sm_121a")
+expect_gencode("${_sm90}" "-gencode=arch=compute_90a,code=sm_90a")
+expect_gencode("${_sm100}" "-gencode=arch=compute_100a,code=sm_100a")
 expect_gencode("${_fa2}"
-  "SHELL:-gencode arch=compute_80,code=sm_80;SHELL:-gencode arch=compute_86,code=sm_86;SHELL:-gencode arch=compute_87,code=sm_87;SHELL:-gencode arch=compute_89,code=sm_89;SHELL:-gencode arch=compute_120a,code=sm_120a;SHELL:-gencode arch=compute_121a,code=sm_121a")
+  "-gencode=arch=compute_80,code=sm_80;-gencode=arch=compute_86,code=sm_86;-gencode=arch=compute_87,code=sm_87;-gencode=arch=compute_89,code=sm_89;-gencode=arch=compute_120a,code=sm_120a;-gencode=arch=compute_121a,code=sm_121a")
 
 get_filename_component(_root "${_here}/.." ABSOLUTE)
 file(READ "${_root}/CMakeLists.txt" _root_cmake)
