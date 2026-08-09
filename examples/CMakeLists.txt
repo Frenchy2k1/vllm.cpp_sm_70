@@ -115,6 +115,16 @@ if(VLLM_CPP_VULKAN)
   target_link_libraries(vulkan-dispatch-floor PRIVATE vllm::vllm)
   target_include_directories(vulkan-dispatch-floor PRIVATE ${CMAKE_SOURCE_DIR}/src)
   vllm_cpp_set_warnings(vulkan-dispatch-floor)
+
+  # vulkan-gemv-ab: the BACKEND-VULKAN-GEMVROWS variant sweep. Runs the decode
+  # GEMV over the (k, n) shapes Qwen3.6-27B actually dispatches, so a variant can
+  # be accepted or discarded without spending a 50 GB e2e run on it. Same
+  # Vulkan-only condition and the same reason as the two above: it prints the
+  # pipeline cache key, so an arm proves which specialization it ran.
+  add_executable(vulkan-gemv-ab ${CMAKE_SOURCE_DIR}/benchmarks/vulkan_gemv_ab.cpp)
+  target_link_libraries(vulkan-gemv-ab PRIVATE vllm::vllm)
+  target_include_directories(vulkan-gemv-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  vllm_cpp_set_warnings(vulkan-gemv-ab)
 endif()
 
 # parakeet-transcribe: the ASR example — a THIN client of the public C ABI

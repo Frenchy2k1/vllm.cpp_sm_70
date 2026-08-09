@@ -864,6 +864,19 @@ bool VulkanContext::PipelineExistsFor(const std::string& name) const {
   return false;
 }
 
+std::vector<std::string> VulkanContext::PipelineKeysFor(const std::string& name) const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& cache = *static_cast<std::map<std::string, Pipeline>*>(pipelines_);
+  std::vector<std::string> keys;
+  for (const auto& kv : cache) {
+    // Same prefix rule as PipelineExistsFor: "<module>" or "<module>|<spec…>".
+    if (kv.first == name || kv.first.compare(0, name.size() + 1, name + "|") == 0) {
+      keys.push_back(kv.first);
+    }
+  }
+  return keys;
+}
+
 uint64_t VulkanContext::dispatch_count() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   return dispatch_total_;

@@ -88,6 +88,15 @@ class VulkanContext {
   // call -- the same trap the op-provider decline counters exist for.
   bool PipelineExistsFor(const std::string& name) const;
 
+  // The FULL cache keys built for one module -- "<name>|<spec values, ascending
+  // constantID>". PipelineExistsFor answers "did any variant run"; this answers
+  // "WHICH variant ran", which is what a test has to assert when the variants
+  // differ only in speed. vt_matmul_vec's rows-per-workgroup axis is exactly that
+  // case: every value of it computes the same numbers, so a numeric tolerance
+  // test cannot notice when the optimisation silently stops being selected, and
+  // only the spec values in the key can.
+  std::vector<std::string> PipelineKeysFor(const std::string& name) const;
+
   // DISPATCH ACCOUNTING (VK-E deep dive). Total submits, and a per-shader
   // histogram. This exists because a wall-clock number could not distinguish two
   // very different stories: a reasonable dispatch count each paying a large
