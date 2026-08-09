@@ -17,6 +17,7 @@
 // DOES have one cannot masquerade as a pass.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -55,9 +56,9 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   vllm::platforms::Platform& p = vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT);
   CHECK(p.device_type() == DeviceType::kTENSTORRENT);
   CHECK(&p.backend() == vt::TryGetBackend(DeviceType::kTENSTORRENT));
-  // Registers the OPT-125m linear/residual/activation + vocab slice
-  // (kMatmul, kMatmulBT, kAdd, kRelu, kEmbedding) in F32 only — see
-  // tenstorrent_ops.cpp.
+  // Registers the OPT-125m linear/residual/activation + vocab + norm slice
+  // (kMatmul, kMatmulBT, kAdd, kRelu, kEmbedding, kLayerNorm) in F32 only —
+  // see tenstorrent_ops.cpp.
   CHECK(p.supported_dtypes() == std::vector<vt::DType>{vt::DType::kF32});
   // No attention kernel exists yet; an empty priority list is the honest answer
   // (platforms/tenstorrent.cpp's comment on get_attn_backend_priority).
@@ -328,4 +329,90 @@ TEST_CASE("kTENSTORRENT kEmbedding matches a host F32 reference (row gather)") {
     }
   }
   CHECK(max_abs_diff < 0.1f);
+}
+
+TEST_CASE("kTENSTORRENT kLayerNorm matches a host F32 reference (affine + plain)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kLayerNorm, DeviceType::kTENSTORRENT));
+
+  // Tile-aligned so the TILE upload path is exercised cleanly (same as the
+  // linear ops). Host oracle is the ATen/cpu_layernorm biased-variance form.
+  constexpr int64_t Rows = 32, D = 32;
+  constexpr float Eps = 1e-5f;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto layer_norm = reinterpret_cast<vt::LayerNormFn>(
+      vt::GetOp(vt::OpId::kLayerNorm, DeviceType::kTENSTORRENT));
+
+  auto run_case = [&](bool with_affine) {
+    std::vector<float> host_x(Rows * D), host_w(D), host_b(D), host_out(Rows * D, 0.0f);
+    for (size_t i = 0; i < host_x.size(); ++i)
+      host_x[i] = (static_cast<float>(i % 17) - 8.0f) * 0.15f;
+    for (int64_t j = 0; j < D; ++j) {
+      host_w[static_cast<size_t>(j)] = 0.5f + static_cast<float>(j % 5) * 0.1f;
+      host_b[static_cast<size_t>(j)] = static_cast<float>(j % 7) * 0.05f - 0.15f;
+    }
+
+    void* mem_x = backend.Alloc(host_x.size() * sizeof(float));
+    void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+    void* mem_w = with_affine ? backend.Alloc(host_w.size() * sizeof(float)) : nullptr;
+    void* mem_b = with_affine ? backend.Alloc(host_b.size() * sizeof(float)) : nullptr;
+    Queue q = backend.CreateQueue();
+    backend.Copy(q, mem_x, host_x.data(), host_x.size() * sizeof(float));
+    if (with_affine) {
+      backend.Copy(q, mem_w, host_w.data(), host_w.size() * sizeof(float));
+      backend.Copy(q, mem_b, host_b.data(), host_b.size() * sizeof(float));
+    }
+
+    Tensor x =
+        Tensor::Contiguous(mem_x, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {Rows, D});
+    Tensor out =
+        Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {Rows, D});
+    Tensor w_t, b_t;
+    const Tensor* w_ptr = nullptr;
+    const Tensor* b_ptr = nullptr;
+    if (with_affine) {
+      w_t = Tensor::Contiguous(mem_w, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {D});
+      b_t = Tensor::Contiguous(mem_b, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {D});
+      w_ptr = &w_t;
+      b_ptr = &b_t;
+    }
+
+    vt::LayerNormArgs args;
+    args.eps = Eps;
+    layer_norm(q, out, x, w_ptr, b_ptr, args);
+
+    backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+    backend.Free(mem_x);
+    backend.Free(mem_out);
+    if (with_affine) {
+      backend.Free(mem_w);
+      backend.Free(mem_b);
+    }
+
+    float max_abs_diff = 0.0f;
+    for (int64_t r = 0; r < Rows; ++r) {
+      float sum = 0.0f;
+      for (int64_t j = 0; j < D; ++j) sum += host_x[r * D + j];
+      const float mean = sum / static_cast<float>(D);
+      float sq = 0.0f;
+      for (int64_t j = 0; j < D; ++j) {
+        const float dv = host_x[r * D + j] - mean;
+        sq += dv * dv;
+      }
+      const float rstd = 1.0f / std::sqrt(sq / static_cast<float>(D) + Eps);
+      for (int64_t j = 0; j < D; ++j) {
+        float ref = (host_x[r * D + j] - mean) * rstd;
+        if (with_affine) ref = ref * host_w[static_cast<size_t>(j)] + host_b[static_cast<size_t>(j)];
+        max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[r * D + j] - ref));
+      }
+    }
+    // bf16 storage + device reduction; not bit-exact vs f32 host mean/var.
+    CHECK(max_abs_diff < 0.5f);
+  };
+
+  SUBCASE("elementwise_affine=True (weight + bias)") { run_case(true); }
+  SUBCASE("elementwise_affine=False (no weight/bias)") { run_case(false); }
 }

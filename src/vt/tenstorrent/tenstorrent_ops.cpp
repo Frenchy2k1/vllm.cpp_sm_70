@@ -1,15 +1,15 @@
 // Tenstorrent op providers — the ttnn adapter layer (BACKEND-TENSTORRENT,
 // .agents/specs/tenstorrent-backend.md). vllm.cpp original; no upstream
 // mirror (vLLM has no Tenstorrent platform). Op table: kMatmul, kMatmulBT,
-// kAdd, kRelu, kEmbedding — the OPT-125m linear/residual/activation slice plus
-// the vocab gather, mirroring how Metal landed ops one seam at a time
-// (docs/STATUS.md Backend detail).
+// kAdd, kRelu, kEmbedding, kLayerNorm — the OPT-125m linear/residual/
+// activation/vocab/norm slice, mirroring how Metal landed ops one seam at
+// a time (docs/STATUS.md Backend detail).
 //
-// SCOPE: 2D row-major F32 tensors for the linear/eltwise ops (kAdd also
-// allows rank-1 `b` for the nn.Linear bias broadcast, matching
-// cpu_layernorm.cpp's AddKernel). kEmbedding adds rank-1 i32/i64 ids + a
-// rank-2 F32 table — the first layout/dtype departure from TILE/BFLOAT16
-// (ROW_MAJOR UINT32 ids + ROW_MAJOR BFLOAT16 weights, forced by ttnn).
+// SCOPE: 2D row-major F32 tensors for the linear/eltwise/norm ops (kAdd
+// also allows rank-1 `b` for the nn.Linear bias broadcast, matching
+// cpu_layernorm.cpp's AddKernel; kLayerNorm accepts optional rank-1
+// weight/bias). kEmbedding adds rank-1 i32/i64 ids + a rank-2 F32 table —
+// ROW_MAJOR UINT32 ids + ROW_MAJOR BFLOAT16 weights, forced by ttnn.
 // Every other shape/dtype is a VT_CHECK failure, not a silent wrong answer
 // or a slow-path guess — this op table has no CPU reference-tier fallback
 // (UnifiedMemory()==false, tenstorrent_backend.cpp), so failing loudly is
@@ -19,6 +19,7 @@
 #include "vt/tenstorrent/tenstorrent_device.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -29,6 +30,7 @@
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/embedding/embedding.hpp>
+#include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -229,6 +231,54 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   Download(dev_out, out);
 }
 
+// Upload a rank-1 F32 affine vector as TILE BFLOAT16 with logical shape
+// [1, d]. ttnn::layer_norm's TILE-gamma path requires padded height ==
+// tile_height (32); from_vector with TILE layout pads a [1,d] tensor to
+// that. ROW_MAJOR gamma only works cleanly when d == tile_width in the
+// ttnn unit tests, so TILE is the general path.
+ttnn::Tensor UploadAffine1D(const float* data, uint32_t d, MeshDevice& device) {
+  std::vector<float> host(data, data + d);
+  return ttnn::Tensor::from_vector<float>(
+      host, SpecOf(tt::tt_metal::Shape({1, d}), ttnn::DataType::BFLOAT16, ttnn::Layout::TILE),
+      &device);
+}
+
+// kLayerNorm: per-row mean/var over the last dim (cpu_layernorm.cpp
+// LayerNormKernel / ATen native_layer_norm). Biased (1/N) variance; optional
+// rank-1 weight/bias (elementwise_affine). Uses ttnn::layer_norm with the
+// same TILE/BFLOAT16 upload path as the linear ops; eps comes from
+// LayerNormArgs (OPT default 1e-5, not ttnn's 1e-12 default).
+void LayerNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor* weight,
+                     const Tensor* bias, const LayerNormArgs& args) {
+  VT_CHECK(x.rank == 2 && out.rank == 2,
+           "tenstorrent kLayerNorm: only rank-2 tensors are supported in this step");
+  VT_CHECK(x.dtype == DType::kF32 && out.dtype == DType::kF32,
+           "tenstorrent kLayerNorm: only F32 is supported in this step");
+  VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
+           "tenstorrent kLayerNorm: out shape mismatch");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kLayerNorm: strided (non-contiguous) tensors are not supported");
+  VT_CHECK(args.eps >= 0.0f, "tenstorrent kLayerNorm: eps must be non-negative");
+  const uint32_t rows = static_cast<uint32_t>(x.shape[0]);
+  const uint32_t d = static_cast<uint32_t>(x.shape[1]);
+  for (const Tensor* p : {weight, bias}) {
+    if (p == nullptr) continue;
+    VT_CHECK(p->rank == 1 && p->shape[0] == d,
+             "tenstorrent kLayerNorm: weight/bias must be rank-1 [D]");
+    VT_CHECK(p->dtype == DType::kF32, "tenstorrent kLayerNorm: weight/bias must be F32");
+    VT_CHECK(p->IsContiguous(), "tenstorrent kLayerNorm: weight/bias must be contiguous");
+  }
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_x = UploadRows(x.Ptr<float>(), rows, d, device);
+  std::optional<ttnn::Tensor> dev_w;
+  std::optional<ttnn::Tensor> dev_b;
+  if (weight != nullptr) dev_w = UploadAffine1D(weight->Ptr<float>(), d, device);
+  if (bias != nullptr) dev_b = UploadAffine1D(bias->Ptr<float>(), d, device);
+  ttnn::Tensor dev_y = ttnn::layer_norm(dev_x, args.eps, dev_w, dev_b);
+  Download(dev_y, out);
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -242,6 +292,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ReluFn>(&ReluKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
   }
 } registrar;
 
