@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""W8 dry-run/tag planning, immutable handoff, and permission mutations."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+PIPELINE = ROOT / "scripts/release_pipeline.py"
+CHECKER = ROOT / "scripts/check-release-workflow.py"
+WORKFLOW = ROOT / ".github/workflows/release.yml"
+MATRIX = ROOT / "release/release-matrix.json"
+SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def load(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ReleasePipelineContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.pipeline = load(PIPELINE, "release_pipeline")
+        cls.checker = load(CHECKER, "check_release_workflow")
+
+    def plan(self, event: str, ref: str, release_ready: bool = False):
+        matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        matrix["release_ready"] = release_ready
+        return self.pipeline.make_plan(event, ref, SHA, "0.0.1", matrix)
+
+    def test_manual_dispatch_is_always_a_non_publishing_dry_run(self) -> None:
+        plan = self.plan("workflow_dispatch", "refs/heads/main", release_ready=True)
+        self.assertFalse(plan["publish"])
+        self.assertEqual(plan["release_tag"], f"dry-run-{SHA[:12]}")
+        self.assertEqual(plan["source_sha"], SHA)
+
+    def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
+        self.assertFalse(self.plan("push", "refs/tags/v0.0.1")["publish"])
+        self.assertTrue(self.plan("push", "refs/tags/v0.0.1", release_ready=True)["publish"])
+        for ref in ("refs/tags/v0.0.2", "refs/heads/v0.0.1", "refs/tags/0.0.1"):
+            with self.subTest(ref=ref):
+                with self.assertRaises(ValueError):
+                    self.plan("push", ref, release_ready=True)
+
+    def test_only_explicit_matrix_artifacts_enter_the_plan(self) -> None:
+        plan = self.plan("workflow_dispatch", "refs/heads/topic")
+        ids = [item["id"] for item in plan["artifacts"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn("linux-x86_64-glibc-cpu", ids)
+        self.assertIn("linux-aarch64-glibc-cuda-fat", ids)
+        self.assertNotIn("rocm", " ".join(ids))
+
+    def test_handoff_digest_and_source_sha_are_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "release-plan.json"
+            handoff_path = root / "release-handoff.json"
+            verified_path = root / "verified-handoff.json"
+            self.pipeline.write_json(plan_path, self.plan("workflow_dispatch", "refs/heads/main"))
+            self.pipeline.make_handoff(plan_path, handoff_path)
+            self.pipeline.verify_handoff(plan_path, handoff_path, verified_path, SHA)
+            verified = json.loads(verified_path.read_text())
+            self.assertTrue(verified["verified"])
+            mutant = json.loads(handoff_path.read_text())
+            mutant["source_sha"] = "f" * 40
+            self.pipeline.write_json(handoff_path, mutant)
+            with self.assertRaises(ValueError):
+                self.pipeline.verify_handoff(plan_path, handoff_path, verified_path, SHA)
+
+    def test_cli_dry_run_never_calls_github_or_creates_a_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "plan.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PIPELINE),
+                    "plan",
+                    "--event",
+                    "workflow_dispatch",
+                    "--ref",
+                    "refs/heads/main",
+                    "--sha",
+                    SHA,
+                    "--version",
+                    "0.0.1",
+                    "--matrix",
+                    str(MATRIX),
+                    "--output",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={"PATH": "/nonexistent"},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(json.loads(output.read_text())["publish"])
+
+    def test_workflow_has_exact_least_privilege_stage_boundaries(self) -> None:
+        errors = self.checker.validate(WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(errors, [])
+
+    def test_security_critical_workflow_mutations_fail(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "pull request trigger": ("  workflow_dispatch: {}", "  pull_request: {}\n  workflow_dispatch: {}"),
+            "global write": ("permissions:\n  contents: read", "permissions:\n  contents: write"),
+            "mutable upload": ("overwrite: false", "overwrite: true"),
+            "name not SHA-bound": ("release-unverified-${{ github.sha }}", "release-unverified"),
+            "name download": ("artifact-ids: ${{ needs.build.outputs.artifact_id }}", "name: release-unverified"),
+            "attest no OIDC": ("      id-token: write", "      id-token: none"),
+            "attest no repository grant": ("      attestations: write", "      attestations: none"),
+            "attest no metadata grant": ("      artifact-metadata: write", "      artifact-metadata: none"),
+            "publish no environment": ("    environment: release", "    # environment removed"),
+            "publish broad dependency": ("    needs: [plan, verify, attest]", "    needs: [plan, build, verify, attest]"),
+            "publish not tag gated": (
+                "startsWith(github.ref, 'refs/tags/v')",
+                "startsWith(github.ref, 'refs/heads/')",
+            ),
+            "continue on error": ("    runs-on: ubuntu-latest", "    continue-on-error: true\n    runs-on: ubuntu-latest"),
+        }
+        for label, (before, after) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(before, original)
+                mutant = original.replace(before, after, 1)
+                self.assertTrue(self.checker.validate(mutant), label)
+
+
+if __name__ == "__main__":
+    unittest.main()

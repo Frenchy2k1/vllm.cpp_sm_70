@@ -277,6 +277,7 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-commit-trailers.py",
             "scripts/check-cpu-isa-build.py",
             "scripts/check-cuda-fat-gencode.py",
+            "scripts/check-release-workflow.py",
             "scripts/validate-release-archive.py",
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",

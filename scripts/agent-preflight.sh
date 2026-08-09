@@ -58,6 +58,7 @@ CHECKERS=(
   check-prompt-contract
   check-agent-record
   check-release-binary-contract
+  check-release-workflow
   check-role-discipline
   claim-view
   check-readme-structure
@@ -80,6 +81,7 @@ SUITES=(
   test_check_release_binary_contract
   test_release_manifest
   test_release_archive
+  test_release_pipeline
   test_agent_role
   test_agent_onboard
   test_agent_start

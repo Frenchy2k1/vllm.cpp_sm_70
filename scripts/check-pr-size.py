@@ -207,6 +207,7 @@ CHECKER_EVIDENCE_OVERRIDES = {
     # exist and NO change to this checker could ever satisfy its own evidence
     # rule. Mapped to the file CI actually runs.
     "scripts/check-device-leakage.py": "tests/scripts/test_device_leakage.py",
+    "scripts/check-release-workflow.py": "tests/scripts/test_release_pipeline.py",
 }
 
 DISABLED_CREATION_CHECKER = (
@@ -226,6 +227,7 @@ CREATION_MUTATIONS = {
     "scripts/check-arm-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cpu-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cuda-fat-gencode.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-release-workflow.py": DISABLED_CREATION_CHECKER,
     "scripts/validate-release-archive.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,

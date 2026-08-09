@@ -1,0 +1,151 @@
+name: release
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      publish: ${{ steps.plan.outputs.publish }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute an explicit dry-run or exact-tag plan
+        id: plan
+        run: |
+          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          python3 scripts/release_pipeline.py plan \
+            --event '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --sha '${{ github.sha }}' \
+            --version "$version" \
+            --matrix release/release-matrix.json \
+            --output release-plan.json \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Upload immutable plan
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-plan-${{ github.sha }}
+          path: release-plan.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  build:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the exact immutable plan by ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: plan
+      - name: Produce the W8 contract handoff
+        run: |
+          python3 scripts/release_pipeline.py handoff \
+            --plan plan/release-plan.json \
+            --output release-handoff.json
+      - name: Upload immutable unverified handoff
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-unverified-${{ github.sha }}
+          path: release-handoff.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  verify:
+    needs: [plan, build]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact plan by ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: plan
+      - name: Download exact unverified handoff by ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: unverified
+      - name: Verify handoff against plan and workflow SHA
+        run: |
+          python3 scripts/release_pipeline.py verify \
+            --plan plan/release-plan.json \
+            --handoff unverified/release-handoff.json \
+            --output verified-handoff.json \
+            --sha '${{ github.sha }}'
+      - name: Upload immutable verified handoff
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-verified-${{ github.sha }}
+          path: verified-handoff.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  attest:
+    needs: [plan, verify]
+    if: needs.plan.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download only the verified handoff by ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          path: verified
+      - name: Attest verified bytes
+        uses: actions/attest@v4
+        with:
+          subject-path: verified/verified-handoff.json
+  publish:
+    needs: [plan, verify, attest]
+    if: needs.plan.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download only the verified handoff by ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          path: verified
+      - name: Publish the exact verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ needs.plan.outputs.release_tag }}'
+          test "$tag" = "${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" verified/verified-handoff.json \
+            --verify-tag --title "$tag" --generate-notes
