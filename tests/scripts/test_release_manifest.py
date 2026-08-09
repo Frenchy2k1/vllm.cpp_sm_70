@@ -117,14 +117,23 @@ def cpu_facts() -> dict[str, object]:
         {
             "name": "avx2-f16c",
             "kernel_families": ["matmul-elem-f32-bf16-f16"],
-            "required_cpu_bits": ["avx", "avx2", "f16c", "osxsave"],
+            "required_cpu_bits": ["avx", "avx2", "f16c", "osxsave", "sse2"],
             "required_os_state": ["xcr0:xmm", "xcr0:ymm"],
             "execution_evidence": evidence("absent"),
         },
         {
             "name": "avx512f",
             "kernel_families": ["matmul-elem-f32-bf16"],
-            "required_cpu_bits": ["avx", "avx512f", "osxsave"],
+            "required_cpu_bits": [
+                "avx",
+                "avx2",
+                "avx512bw",
+                "avx512f",
+                "avx512vl",
+                "f16c",
+                "osxsave",
+                "sse2",
+            ],
             "required_os_state": [
                 "xcr0:xmm",
                 "xcr0:ymm",
