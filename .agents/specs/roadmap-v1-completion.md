@@ -14,7 +14,7 @@ Every classification below is grounded in the six area matrices
 [kernel](../kernel-matrix.md), [backend](../backend-matrix.md),
 [quantization](../quantization-matrix.md), [feature](../feature-matrix.md)),
 the [roadmap portfolio table](../roadmap_v1.md), and the append-only
-[state](../state.md)/[ledger](../parity-ledger.md). "DONE" requires merged code +
+[git history](../../AGENTS.md)/[ledger](../parity-ledger.md). "DONE" requires merged code +
 a passing gate; where a row ships a capability but the every-axis **speed** gate
 or a **breadth** tail is open, the row is REACHABLE-INCOMPLETE, not DONE.
 

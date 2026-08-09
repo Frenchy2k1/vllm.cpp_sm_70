@@ -1,7 +1,6 @@
 ---
 prompt-contract-version: 1
 role: reviewer
-policy-rules: POL-PROMPT-ENVELOPE POL-PROMPT-BOUNDARIES POL-REVIEW-FRESH POL-REVIEW-NO-REPAIR
 ---
 ## Task envelope
 - Goal: REQUIRED

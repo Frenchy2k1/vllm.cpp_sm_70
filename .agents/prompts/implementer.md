@@ -1,7 +1,6 @@
 ---
 prompt-contract-version: 1
 role: implementer
-policy-rules: POL-PROMPT-ENVELOPE POL-PROMPT-BOUNDARIES
 ---
 ## Task envelope
 - Goal: REQUIRED

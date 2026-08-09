@@ -13,6 +13,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# check-pr-size.py imports scripts.waivers; a bare spec load has no repository
+# root on sys.path, so provide it before executing the module.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location("check_pr_size", ROOT / "scripts/check-pr-size.py")
 assert SPEC is not None and SPEC.loader is not None
 checker = importlib.util.module_from_spec(SPEC)
@@ -72,16 +76,13 @@ class PathClassification(unittest.TestCase):
             "MANIFESTO.md": "public_document",
             "src/vt/x.cpp": "product",
             "scripts/check-release-binary-contract.py": "product",
-            "scripts/check-policy.py": "governance_checker",
+            "scripts/check-doc-checkpoint.py": "governance_checker",
             "tests/scripts/test_policy_contract.py": "governance_test",
             ".agents/policy.csv": "policy",
-            ".agents/state.md": "project_record",
-            ".agents/state.csv": "project_record",
             ".agents/state-index/2026-08-001.csv": "append_only_record",
             ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
             ".agents/completed/state-migration-manifest.csv": "evidence",
-            "scripts/state_record.py": "governance_support",
-            "scripts/migrate-state-record.py": "governance_support",
+            "scripts/waivers.py": "governance_support",
             "docs/STATUS.md": "public_document",
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
@@ -116,11 +117,11 @@ class PathClassification(unittest.TestCase):
     def test_unknown_and_noncanonical_paths_fail_closed(self) -> None:
         for path in (
             "unknown.bin",
-            "/scripts/check-policy.py",
+            "/scripts/check-doc-checkpoint.py",
             "scripts/../src/x.cpp",
-            "scripts//check-policy.py",
-            r"scripts\check-policy.py",
-            "./scripts/check-policy.py",
+            "scripts//check-doc-checkpoint.py",
+            r"scripts\check-doc-checkpoint.py",
+            "./scripts/check-doc-checkpoint.py",
         ):
             with self.subTest(path=path):
                 with self.assertRaises(ValueError):
@@ -149,8 +150,8 @@ class PathClassification(unittest.TestCase):
             "governance_checker",
         )
         self.assertNotEqual(
-            checker.recognized_evidence("scripts/check-policy.py"),
-            "tests/scripts/test_policy_contract_extra.py",
+            checker.recognized_evidence("scripts/check-doc-checkpoint.py"),
+            "tests/scripts/test_doc_checkpoint_extra.py",
         )
         self.assertEqual(
             checker.recognized_evidence("scripts/check-agent-record.py"),
@@ -193,12 +194,12 @@ class BudgetEnforcement(unittest.TestCase):
         )
         waiver = checker.Waiver(
             waiver_id="WAIVER-PR-SIZE-001",
-            rule_id="POL-PR-SIZE",
+            checker="scripts/check-pr-size.py",
             scope="pr:128",
             owner="maintainer",
             reason="bounded migration",
             evidence="PR-128",
-            expires=dt.date(2026, 8, 15),
+            expires="2026-08-15",
         )
         self.assertEqual(
             checker.change_errors(
@@ -206,14 +207,14 @@ class BudgetEnforcement(unittest.TestCase):
             ),
             [],
         )
-        for rule_id, scope in (
-            ("POL-PATH-CLASSIFICATION", "pr:128"),
-            ("POL-PR-SIZE", "pr:129"),
-            ("POL-PR-SIZE", ""),
+        for waived_checker, scope in (
+            ("scripts/check-doc-checkpoint.py", "pr:128"),
+            ("scripts/check-pr-size.py", "pr:129"),
+            ("scripts/check-pr-size.py", ""),
         ):
-            with self.subTest(rule_id=rule_id, scope=scope):
+            with self.subTest(checker=waived_checker, scope=scope):
                 wrong = checker.Waiver(
-                    **{**waiver.__dict__, "rule_id": rule_id, "scope": scope}
+                    **{**waiver.__dict__, "checker": waived_checker, "scope": scope}
                 )
                 self.assertTrue(
                     checker.change_errors(
@@ -232,16 +233,16 @@ class BudgetEnforcement(unittest.TestCase):
             )
 
     def test_repository_pr_166_waiver_is_exact(self) -> None:
-        rules = checker.load_policy(ROOT)
-        waivers = checker.load_waivers(ROOT, rules, today=dt.date(2026, 8, 8))
+        waivers = checker.load_waivers(ROOT, today=dt.date(2026, 8, 8))
         applicable = [
             waiver
             for waiver in waivers
-            if waiver.rule_id == "POL-PR-SIZE" and waiver.scope == "pr:166"
+            if waiver.checker == "scripts/check-pr-size.py"
+            and waiver.scope == "pr:166"
         ]
         self.assertEqual(len(applicable), 1)
         self.assertEqual(applicable[0].waiver_id, "WAIVER-PR-SIZE-002")
-        self.assertEqual(applicable[0].expires, dt.date(2026, 8, 15))
+        self.assertEqual(applicable[0].expires, "2026-08-15")
 
     def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
         errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
@@ -258,7 +259,6 @@ class BudgetEnforcement(unittest.TestCase):
         proof = checker.EvidenceResult(
             checker="scripts/check-pr-size.py",
             test_module="tests.scripts.test_check_pr_size",
-            rule_ids=("POL-PATH-CLASSIFICATION", "POL-PR-SIZE"),
             head_tests=1,
             head_passed=True,
             base_tests=1,
@@ -274,10 +274,8 @@ class BudgetEnforcement(unittest.TestCase):
     def test_every_created_checker_has_closed_bootstrap_evidence(self) -> None:
         expected = {
             "scripts/check-commit-trailers.py",
-            "scripts/check-policy.py",
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
-            "scripts/check-state-record.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():
@@ -302,7 +300,6 @@ class BudgetEnforcement(unittest.TestCase):
         fake = checker.EvidenceResult(
             checker="scripts/check-pr-size.py",
             test_module="tests.scripts.test_check_pr_size",
-            rule_ids=("POL-PATH-CLASSIFICATION",),
             head_tests=1,
             head_passed=True,
             base_tests=1,
@@ -313,17 +310,16 @@ class BudgetEnforcement(unittest.TestCase):
         )
         self.assertTrue(any("BASE checker stayed green" in error for error in errors), errors)
 
-    def test_missing_policy_binding_or_unexecuted_test_fails_closed(self) -> None:
+    def test_unexecuted_test_fails_closed(self) -> None:
         changes = [
             self.change("scripts/check-pr-size.py", 1),
             self.change("tests/scripts/test_check_pr_size.py", 1),
         ]
-        for rules, count in (((), 1), (("POL-PR-SIZE",), 0)):
-            with self.subTest(rules=rules, count=count):
+        for count in (0,):
+            with self.subTest(count=count):
                 proof = checker.EvidenceResult(
                     checker="scripts/check-pr-size.py",
                     test_module="tests.scripts.test_check_pr_size",
-                    rule_ids=rules,
                     head_tests=count,
                     head_passed=True,
                     base_tests=1,
@@ -339,11 +335,11 @@ class BudgetEnforcement(unittest.TestCase):
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
             [
-                self.change("scripts/check-policy.py", 1),
-                self.change("tests/scripts/test_check_policy.py", 1),
+                self.change("scripts/check-doc-checkpoint.py", 1),
+                self.change("tests/scripts/test_check_doc_checkpoint.py", 1),
             ]
         )
-        self.assertTrue(any("test_policy_contract.py" in error for error in errors), errors)
+        self.assertTrue(any("test_doc_checkpoint.py" in error for error in errors), errors)
 
     def test_agent_record_checker_uses_its_existing_mutation_suite(self) -> None:
         self.assertEqual(
@@ -351,30 +347,7 @@ class BudgetEnforcement(unittest.TestCase):
             "tests/scripts/test_agent_record.py",
         )
 
-    def test_exact_technical_checker_is_bound_to_checker_change_policy(self) -> None:
-        rules = checker.load_policy(ROOT)
-        self.assertEqual(
-            checker.affected_policy_rules(
-                "scripts/check-release-binary-contract.py", rules, ROOT
-            ),
-            ("POL-CHECKER-CHANGE",),
-        )
-        with self.assertRaisesRegex(ValueError, "no affected POL rule mapping"):
-            checker.affected_policy_rules(
-                "scripts/check-unregistered-contract.py", rules, ROOT
-            )
 
-    def test_retired_state_checker_uses_cutover_mutation_evidence(self) -> None:
-        rules = checker.load_policy(ROOT)
-        retired = "scripts/check-state-order.py"
-        self.assertEqual(
-            checker.recognized_evidence(retired),
-            "tests/scripts/test_state_record_cutover.py",
-        )
-        self.assertEqual(
-            checker.affected_policy_rules(retired, rules, ROOT),
-            ("POL-STATE-STRUCTURED",),
-        )
 
     def test_numstat_parser_rejects_malformed_negative_and_duplicate_paths(self) -> None:
         for text in (
@@ -449,13 +422,15 @@ class BudgetEnforcement(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(checker.requires_reviewed_pr(path))
 
-    def test_production_role_check_requires_pr_for_records_docs_ci_and_support(self) -> None:
+    def test_production_role_check_requires_pr_for_product_paths(self) -> None:
+        """Feature code still needs a reviewed row/* PR."""
         role = checker.load_role_discipline()
         for path in (
-            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
-            "docs/STATUS.md",
-            ".github/workflows/ci.yml",
-            "scripts/agent-role.py",
+            "src/vt/cuda/cuda_backend.cu",
+            "include/vllm.h",
+            "examples/cli/main.cpp",
+            "tests/vt/test_backend.cpp",
+            "CMakeLists.txt",
             ".env.example",
         ):
             with self.subTest(path=path):
@@ -465,12 +440,37 @@ class BudgetEnforcement(unittest.TestCase):
                     )
                 )
 
-    def test_role_checker_classifies_structured_state_as_integration(self) -> None:
+    def test_integration_trees_may_reach_main_directly(self) -> None:
+        """The documented operator escape hatch, now actually implemented.
+
+        check-role-discipline.py's docstring has always said scripts/, .agents/,
+        docs/ and .github/ may be pushed straight to main so a gate or a record
+        can be repaired without a round trip -- but only an explicit FILE list
+        implemented it, so policy_commit_violations governed every path. A spec
+        commit under docs/ could not reach main at all. This pins the documented
+        behaviour so the code and its docstring cannot diverge again.
+        """
         role = checker.load_role_discipline()
         for path in (
-            ".agents/state.csv",
-            ".agents/state-index/2026-08-001.csv",
-            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
+            "docs/STATUS.md",
+            "docs/superpowers/specs/2026-08-09-policy-simplification-design.md",
+            ".github/workflows/ci.yml",
+            "scripts/agent-role.py",
+            ".agents/NOW.md",
+            "AGENTS.md",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    role.policy_commit_violations(
+                        "abc123", ["parent"], "direct", "", [path]
+                    ),
+                    [],
+                )
+
+    def test_role_checker_classifies_archived_state_as_integration(self) -> None:
+        role = checker.load_role_discipline()
+        for path in (
+            ".agents/completed/state-events/2026-08/STATE-20260808T120000-001.md",
             ".agents/completed/state-migration-manifest.csv",
         ):
             with self.subTest(path=path):

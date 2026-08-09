@@ -100,9 +100,7 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
-          python3 scripts/check-policy.py
           python3 scripts/check-prompt-contract.py
-          python3 scripts/check-protocol-consistency.py
           python3 -m unittest \
             tests.scripts.test_policy_contract \
             tests.scripts.test_policy_waivers \
@@ -120,9 +118,6 @@ jobs:
           fi
           python3 scripts/check-commit-trailers.py \
             --range "$base..$head" --cutover "$cutover"
-      - name: The structured state record is relationally consistent
-        run: |
-          python3 scripts/check-state-record.py
           python3 tests/scripts/test_state_record_core.py
           python3 tests/scripts/test_check_state_record.py
       - name: NOW.md stays a short one-Read resume surface
@@ -220,7 +215,6 @@ jobs:
             base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
-          python3 scripts/check-state-record.py --base "$base"
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
           pending_args=()

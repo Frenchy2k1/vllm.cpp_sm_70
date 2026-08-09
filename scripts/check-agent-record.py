@@ -399,7 +399,6 @@ TEST_ANCHOR_PREFIXES = (
 CODE_ANCHOR_FILES = {"CMakeLists.txt"}
 EVIDENCE_ANCHOR_FILES = {
     ".agents/parity-ledger.md",
-    ".agents/state.md",
 }
 
 SPEC_REQUIREMENTS = {
@@ -537,7 +536,7 @@ def parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]:
 def link_base(source: Path, text: str) -> Path:
     """Resolve migrated legacy links from their original .agents/ location."""
     if (
-        source.is_relative_to(AGENTS / "state-events")
+        source.is_relative_to(AGENTS / "completed/state-events")
         and "<!-- legacy-payload:begin -->" in text
     ):
         return AGENTS

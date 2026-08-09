@@ -143,7 +143,7 @@ Analysis deliverable → records only:
 [coordination.md](../coordination.md) `CLAIM-FEATURE-GAP-SPIKE` note +
 [docs/STATUS.md](../../docs/STATUS.md) + [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md)
 (NOT-APPLICABLE — spike) + [parity-ledger.md](../parity-ledger.md) +
-[state.md](../state.md). No `src/` port in this spike.
+[state.md](../completed/state-events/). No `src/` port in this spike.
 
 ## Tests to port
 

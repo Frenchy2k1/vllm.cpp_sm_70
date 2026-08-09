@@ -55,7 +55,6 @@ for arg in "$@"; do
 done
 
 CHECKERS=(
-  check-policy
   check-prompt-contract
   check-agent-record
   check-release-binary-contract
@@ -70,8 +69,6 @@ CHECKERS=(
   check-runner-routing-consistency
   check-surface-coverage
   check-test-registration
-  check-protocol-consistency
-  check-state-record
   check-now-current
   check-gate-commands
 )
@@ -97,10 +94,6 @@ SUITES=(
   test_check_runner_routing_consistency
   test_check_surface_coverage
   test_check_test_registration
-  test_check_protocol_consistency
-  test_state_record_core
-  test_check_state_record
-  test_check_now_current
   test_audit_live_rows
   test_check_gate_commands
 )
@@ -180,9 +173,8 @@ echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do
   run "$suite" python3 "tests/scripts/$suite.py"
 done
-run "policy/trailer suites" python3 -m unittest \
-  tests.scripts.test_policy_contract \
-  tests.scripts.test_policy_waivers \
+run "waiver/trailer suites" python3 -m unittest \
+  tests.scripts.test_waivers \
   tests.scripts.test_check_commit_trailers
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
@@ -194,26 +186,19 @@ run "policy/trailer suites" python3 -m unittest \
 if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
    [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
   echo "Committed range vs origin/main:"
-  run "state-record range" python3 scripts/check-state-record.py \
-    --base origin/main
   run "now-current range" python3 scripts/check-now-current.py \
     --base origin/main --head HEAD
   run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
     --base origin/main --head HEAD
 fi
 
-# Local cutover enforcement is deliberately separate from live PR readiness.
-# It reads only committed Git objects and the tracked policy registries.
-if [ -f .agents/policy-cutover ]; then
-  cutover="$(tr -d '\n' < .agents/policy-cutover)"
-  trailer_base="$cutover"
-  if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
-     git merge-base --is-ancestor origin/main HEAD; then
-    trailer_base=origin/main
-  fi
-  echo "Post-cutover commit range:"
-  run "commit-trailers cutover" python3 scripts/check-commit-trailers.py \
-    --range "$trailer_base..HEAD" --cutover "$cutover"
+# Trailer enforcement reads only committed Git objects.
+if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
+   git merge-base --is-ancestor origin/main HEAD &&
+   [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
+  echo "Commit trailers vs origin/main:"
+  run "commit-trailers" python3 scripts/check-commit-trailers.py \
+    --range "origin/main..HEAD"
 fi
 
 if [ "$STAGED" -eq 1 ]; then

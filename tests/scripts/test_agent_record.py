@@ -181,7 +181,7 @@ class AgentRecordMutationTests(unittest.TestCase):
     def test_done_requires_exact_ledger_link(self) -> None:
         done = self.by_id["QUANT-NVFP4-MO-W4A16"]
         evidence = done.field("tests").replace(
-            "parity-ledger.md#L284", "state.md#L1"
+            "parity-ledger.md#L284", "NOW.md#L1"
         )
         done = with_field(done, "tests", evidence)
         require(
@@ -252,12 +252,12 @@ class AgentRecordMutationTests(unittest.TestCase):
 
 class MigratedLegacyLinks(unittest.TestCase):
     def test_legacy_payload_keeps_original_agents_relative_link_base(self) -> None:
-        source = ROOT / ".agents/state-events/0000-00/STATE-LEGACY-000001.md"
+        source = ROOT / ".agents/completed/state-events/0000-00/STATE-LEGACY-000001.md"
         text = "<!-- legacy-payload:begin -->\n[spec](specs/example.md)"
         self.assertEqual(agent_record.link_base(source, text), ROOT / ".agents")
 
     def test_post_cutover_event_links_remain_event_relative(self) -> None:
-        source = ROOT / ".agents/state-events/2026-08/STATE-20260808T120000-001.md"
+        source = ROOT / ".agents/completed/state-events/2026-08/STATE-20260808T120000-001.md"
         self.assertEqual(agent_record.link_base(source, "[local](note.md)"), source.parent)
 
 

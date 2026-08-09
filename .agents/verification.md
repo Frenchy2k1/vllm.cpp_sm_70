@@ -1,52 +1,62 @@
-# Verification — gates, evidence, review, and performance
+# Task guide — gates, evidence, and review
 
-[Policy](policy.csv) supplies the rules. This procedure describes how to prove
-them without promoting a report into evidence.
+How to prove something, and how to review someone else's proof. The rules are in
+[`AGENTS.md`](../AGENTS.md); this is the method.
 
-## Gate sequence
+## Running a gate
 
 Start with the smallest deterministic test that can falsify the spec. Preserve
-the intended red result, make it green, run the declared focused gate, then run
-the full repository preflight. A gate report records the immutable SHA,
-command, environment, exit status, and relevant output/evidence path.
+the red result — a test that was never seen failing has proven nothing. Make it
+green, run the declared focused gate, then run the full preflight.
 
-Review occurs only after implementation gates pass. Static review checks the
-spec, diff, tests, error paths, ownership boundaries, and policy mapping;
-scratch mutation review temporarily removes or corrupts each critical guard
-and proves the focused test fails. Restore the reviewed tree byte-for-byte
-after every mutation.
+A gate report records the immutable SHA, the exact command, the environment,
+the exit status, and the evidence path. Not a summary of them.
 
-<!-- policy-procedure:begin -->
-[POL-GROUND-CHAIN] For parity conclusions, inspect and cite the applicable vLLM path plus every executing dependency layer—such as FlashInfer, CUTLASS, cuBLASLt, DeepGEMM, torch/Inductor, generated code, and the local dispatch path. Dump the generated kernel before calling a lever unreachable.
+Two traps that have produced false greens here:
 
-[POL-TRACE-SAME-TOOL] Before throughput comparison, trace both implementations on the identical workload with the same profiler and relevant graph-node tracing; source inspection establishes candidates, while matching traces establish what ran.
+- **Incremental builds mask `-Werror`.** Clean-rebuild after any header change;
+  an incremental green is not a clean green.
+- **A copied build directory rebuilds the original sources.** CMake caches
+  absolute source paths, so `cp -a` of a build tree can produce a
+  byte-identical binary from unmodified code. Build in place and verify source
+  and binary checksums.
 
-[POL-GEMV-CONTRACT] A GEMM/GEMV invocation-parity claim proves in the same tool: output/C dtype, compute and scale type, entry point and algorithm policy, and resolved kernel-template dtypes. Cross-tool traces cannot satisfy this claim.
+Release builds define `NDEBUG`, so `assert` is compiled out. A green Release
+gate over an assert-firing bug is a latent failure, not a pass — check the build
+type before believing a surprising green.
 
-[POL-ORACLE] Correctness and performance gates use the pinned oracle, identical model artifacts, prompts, token counts, batching/concurrency, sampling settings, and measured workload on both sides.
+Tests that starve under `ctest -j` are re-run serially before being called a
+regression.
 
-[POL-CORRECTNESS-GATE] Establish the declared token-exact gate—or an explicitly ratified distributional gate—before accepting performance. Never trade correctness for throughput.
+## Reviewing
 
-[POL-PERF-EVERY-AXIS] Record both values and the ratio for every required throughput, latency, memory, model, and workload axis; any below-floor axis remains an open gap.
+Review happens only after the implementation's own gates pass, and only on an
+immutable head, and never by the agent that wrote the code.
 
-[POL-REPRODUCE] Record the exact build and run recipe, revisions, model hashes, environment, clocks/contention state, raw output, and same-binary A/B; rerun the claimed result on an idle device before acceptance.
+**Static pass:** the spec, the diff, the tests, the error paths, ownership
+boundaries, and whether the claims are actually supported.
 
-[POL-NO-CEILING] Treat an apparent same-architecture performance ceiling as an unresolved implementation difference. Keep the gap open and name the next traceable hypothesis rather than declaring completion.
-<!-- policy-procedure:end -->
+**Mutation pass:** for each critical guard, temporarily remove or corrupt it in
+a *scratch copy* and prove the focused test fails. Mutate, don't just read — a
+test that passes with the guard deleted was testing nothing. Restore the tree
+byte-for-byte after every mutation, and never mutate the reviewed worktree.
 
-## Evidence and independent review
+Report `PASS` only after both passes on the same head. Every finding carries
+severity, the violated requirement, a reproduction, and the expected behavior.
 
-Evidence distinguishes observed facts from inference and names source roots,
-versions, file-and-line anchors, commands, artifacts, and limitations. Failed
-attempts and refuted hypotheses remain in append-only records; public documents
-contain only the keyed current projection.
+Do not take another agent's report at face value; the operator reruns the gate
+regardless of how confident the report sounded.
 
-A reviewer reports `PASS` only after both static and mutation review on the
-same immutable head. Findings include severity, violated spec or policy ID,
-reproduction, and expected behavior. The operator then runs the declared gate
-independently before disposition; a reviewer's green report is not a substitute.
+## Evidence
 
-Specialized methods remain in
-[`.agents/parity-lever-protocol.md`](parity-lever-protocol.md), the benchmark
-record, gate-specific specs, and environment registry. They are technical
-evidence and recipes, not additional policy registries.
+Separate what you observed from what you inferred. Name source roots, versions,
+`file:line` anchors, commands, artifacts, and limitations.
+
+A negative result is a result: record refuted hypotheses and failed attempts,
+including the regime they were measured in. "Not established" usually means
+"not resolvable against the current noise floor" — the same code can read
+differently once the bottleneck moves, so a discarded lever is worth re-testing
+after the surrounding performance picture changes.
+
+Public documents carry only the keyed current projection. Forensic detail stays
+in the row's spec and the append-only records.
