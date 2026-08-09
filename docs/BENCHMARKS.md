@@ -383,12 +383,3 @@ built on it rather than keeping the flattering one.
 
 Build flags, environment variables, and the full gate list are in
 [BUILD.md](BUILD.md) and [ENVIRONMENT.md](ENVIRONMENT.md).
-
-## 2026-08-08 — Gemma4 FP8 stream lab (gfx1201 R9700)
-
-| Path | Warm tok/s | Notes |
-|------|------------|--------|
-| vllm-cli Paris HIP=0 stream experts | ~38 | `--repeat` after cold expert fill |
-| server `/v1/completions` | ~38 | exclusive |
-| server `/v1/chat` thinking off | ~32 | after expert cache |
-| llama.cpp Vulkan Q8 tg128 (bar) | ~98 | separate stack |
