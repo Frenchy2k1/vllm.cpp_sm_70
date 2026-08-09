@@ -994,6 +994,27 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     byte-identical to W0 (`Integrated=0` kills the branch). Spec:
     `specs/rocm-unified-memory-b.md`; blind-written, community compile+ctest
     evidence PENDING.
+15. **Extension platform: Tenstorrent Blackhole (`BACKEND-TENSTORRENT`,
+    `DeviceType::kTENSTORRENT` — deliberately not `kBLACKHOLE`, which collides
+    with this codebase's pervasive NVIDIA Blackwell/GB10 references).** No
+    upstream analog: vLLM has no Tenstorrent platform anywhere, so this is an
+    extension platform in the same sense as item 8's Metal/Vulkan — added
+    through the mirrored Platform/vt-op seams so it behaves as a vLLM platform
+    would. Strategy: mirror decision E1 ([backends.md](backends.md)) rather
+    than E2 — Tenstorrent's Tensix cores are a dataflow multicore chip, not a
+    SIMT device, so `vt::tt` is proposed as a thin adapter over **ttnn**
+    (Tenstorrent's own C++ tensor-op library, confirmed externally
+    consumable via its exported `TT-NN` CMake package), the same move Apple's
+    MLX was for Metal, rather than hand-written Tensix kernels. `Backend::
+    UnifiedMemory()` is `false` (discrete PCIe device) — this DISABLES the
+    portable CPU reference tier (`op_provider.h`), so unlike a unified-memory
+    backend there is no partial-coverage safety net; every op the target
+    model touches must be registered or the run throws. Full design, the ttnn
+    op-coverage evidence, and the one identified open risk (`vt::Tensor` is a
+    bare device-pointer view; `ttnn::Tensor`'s device-side constructors take
+    no equivalent raw-pointer-attach path) are in
+    [tenstorrent-backend.md](specs/tenstorrent-backend.md). **STATUS:
+    `INVENTORIED` — proposal only, no code, not yet reviewed or accepted.**
 
 ## 10. E2E test suites (T0 deliverable)
 

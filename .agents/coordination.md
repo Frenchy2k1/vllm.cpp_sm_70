@@ -136,6 +136,27 @@ ships DEFAULT-OFF pending an operator re-measurement. dgx build/gate roots
 
 **Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,
 `CLAIM-ENG-RELEASE-BINARIES-W1-W13`).** Codex (GPT-5), isolated worktree
+**Tenstorrent Blackhole backend spike (`BACKEND-TENSTORRENT`, 2026-08-09,
+`CLAIM-BACKEND-TENSTORRENT-SPIKE`).** Claude Code (claude-sonnet-5), isolated
+worktree `/home/lu_zero/Sources/vllmcpp-tenstorrent`, branch
+`row/BACKEND-TENSTORRENT`, base `origin/main` `7534da65`. Records/spec-only
+claim proposing a new extension platform (no upstream vLLM equivalent, same
+class as Metal/Vulkan): `DeviceType::kTENSTORRENT` as a thin `vt::Backend`
+adapter over Tenstorrent's own ttnn C++ tensor-op library rather than
+hand-written Tensix kernels, mirroring the Metal/MLX decision (E1). Owns only
+NEW `.agents/specs/tenstorrent-backend.md`, the new `BACKEND-TENSTORRENT`
+backend-matrix row, its `porting-inventory.md` §9 item 15, and this claim. No
+code, kernel, build, GPU, model, or service change is in scope. No hardware
+available in this session to validate anything beyond reading the ttnn C++
+API and confirming its CMake package exports (`TT-NN`/`TT-Metalium`) resolve
+externally. Draft PR [#197](https://github.com/mudler/vllm.cpp/pull/197) is
+the claim, pushed with explicit developer authorization (no
+`.agents/developer-preferences.md` exists for this session; the example's
+safe default is ask-first for push/PR, and it was asked). The row stays `INVENTORIED`
+until reviewed and, if accepted, moved to `SPIKE`.
+
+**Server binary release manifest W5 (`ENG-RELEASE-BINARIES`, 2026-08-08,
+`CLAIM-ENG-RELEASE-BINARIES-W5`).** Codex (GPT-5), isolated worktree
 `/home/mudler/_git/vllm.cpp-release-binaries`, branch
 `row/ENG-RELEASE-BINARIES`, base `origin/main` `81291a89`. W5 merged in PR #141
 at `bd20da30`; developer direction binds every remaining W1-W13 checkpoint to

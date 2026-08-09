@@ -1316,6 +1316,8 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in positive MiB (unset/0 unlimited); `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` guard requests at 200000/4096 (0 disables); nine inherited tuning toggles are internal. No runtime/perf change.
 
+`BACKEND-TENSTORRENT`: `INVENTORIED` proposal, ttnn adapter, no code. [Spec](../.agents/specs/tenstorrent-backend.md).
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`
