@@ -68,11 +68,68 @@ endif()
 if(VLLM_CPP_SERVER)
   add_executable(server server/main.cpp)
   # ARCH-ONE-SURFACE: server/main.cpp is a THIN CLIENT of the public C ABI
-  # (vllm_server_main, v17) -- it includes vllm.h and nothing else, so it links the
-  # PACKAGED shared library exactly as an out-of-tree consumer would, not the
-  # internal C++ target.
-  target_link_libraries(server PRIVATE vllm::shared)
+  # (vllm_server_main, v17) -- it includes vllm.h and nothing else.  The release
+  # executable links the static core below, but reaches it only through that same
+  # public surface.
+  # Release bundles carry one static-core server.  The executable remains a
+  # thin C-ABI client; only the link form changes so an extracted archive does
+  # not depend on a separately installed libvllm.
+  target_link_libraries(server PRIVATE vllm::vllm)
+  set_target_properties(server PROPERTIES OUTPUT_NAME vllm-server)
   vllm_cpp_set_warnings(server)
+  install(TARGETS server
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    COMPONENT vllm-server)
+
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  set(_vllm_server_backends)
+  if(VLLM_CPP_CUDA)
+    list(APPEND _vllm_server_backends cuda)
+  endif()
+  if(VLLM_CPP_METAL)
+    if(VLLM_CPP_MLX)
+      list(APPEND _vllm_server_backends metal-mlx)
+    else()
+      list(APPEND _vllm_server_backends metal)
+    endif()
+  endif()
+  if(VLLM_CPP_VULKAN)
+    list(APPEND _vllm_server_backends vulkan)
+  endif()
+  if(VLLM_CPP_HIP)
+    list(APPEND _vllm_server_backends rocm)
+  endif()
+  if(NOT _vllm_server_backends)
+    list(APPEND _vllm_server_backends cpu)
+  endif()
+  string(JOIN "-" _vllm_server_backend ${_vllm_server_backends})
+  string(TOLOWER "${CMAKE_SYSTEM_NAME}" _vllm_server_os)
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _vllm_server_arch)
+  set(_vllm_server_release_dir "${CMAKE_BINARY_DIR}/release")
+  set(_vllm_server_stage_dir "${_vllm_server_release_dir}/stage")
+  set(_vllm_server_archive
+    "${_vllm_server_release_dir}/vllm.cpp-${PROJECT_VERSION}-${_vllm_server_backend}-${_vllm_server_os}-${_vllm_server_arch}.tar.gz")
+
+  add_custom_target(vllm-server-stage
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/package-server.py
+      --build-dir ${CMAKE_BINARY_DIR}
+      --stage-dir ${_vllm_server_stage_dir}
+      --config $<CONFIG>
+    DEPENDS server ${CMAKE_SOURCE_DIR}/scripts/package-server.py
+    COMMENT "Installing the vllm-server component into an empty staging prefix"
+    VERBATIM)
+
+  add_custom_target(vllm-server-archive
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/package-server.py
+      --build-dir ${CMAKE_BINARY_DIR}
+      --stage-dir ${_vllm_server_stage_dir}
+      --archive ${_vllm_server_archive}
+      --config $<CONFIG>
+    DEPENDS server ${CMAKE_SOURCE_DIR}/scripts/package-server.py
+    BYPRODUCTS ${_vllm_server_archive}
+    COMMENT "Creating deterministic installed vllm-server archive"
+    VERBATIM)
+
   if(VLLM_CPP_BUILD_TESTS)
     add_test(NAME test_server_help COMMAND $<TARGET_FILE:server> --help)
     set_tests_properties(test_server_help PROPERTIES

@@ -451,6 +451,10 @@ class StatusRatchet(unittest.TestCase):
         self.assertGreaterEqual(slack, 0)
         self.assertLessEqual(slack, 25)
 
+    def test_the_rebased_character_ratchet_is_byte_tight(self) -> None:
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.STATUS_RATCHET["chars"], len(text))
+
     def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
         # A ratchet parked well above the page it guards is not a ratchet: it
         # silently licenses regrowth up to the old number. The rule is "lower it

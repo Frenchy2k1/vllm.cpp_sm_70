@@ -29,7 +29,7 @@ CONTRACT_PATHS = (
     ".agents/roadmap_v1.md",
     ".agents/NOW.md",
     ".agents/coordination.md",
-    ".agents/completed/state-events/2026-08/STATE-20260808T220000-002.md",
+    ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md",
     "docs/STATUS.md",
     "docs/BENCHMARKS.md",
     ".github/workflows/ci.yml",
@@ -127,19 +127,16 @@ GUARD_MAP_KEYS = {
 RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": (
-        "| Release | **ACTIVE; W5 19/19+10/10; contract 30/30** |"
-    ),
+    ".agents/NOW.md": "| Release | **ACTIVE; W5 contract + W6 package GREEN** |",
     ".agents/coordination.md": (
-        "| `CLAIM-ENG-RELEASE-BINARIES-W5` | "
-        "`ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |"
+        "**Server binary release W6 (`ENG-RELEASE-BINARIES`, 2026-08-09,"
     ),
-    ".agents/completed/state-events/2026-08/STATE-20260808T220000-002.md": (
-        "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE"
+    ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": (
+        "# W6 installed server package green"
     ),
-    "docs/STATUS.md": "#141 W5 19/19 ACTIVE ART∅",
+    "docs/STATUS.md": "#196 W6 package/help GREEN; no published assets",
     "docs/BENCHMARKS.md": (
-        "| **Binary release matrix (ACTIVE; W5 implemented)** | "
+        "| **Binary release matrix (ACTIVE; W5+W6 implemented)** | "
         "`ENG-RELEASE-BINARIES`:"
     ),
 }
@@ -147,28 +144,28 @@ RECORD_ANCHORS = {
 LIFECYCLE_RECORD_MUTATIONS = (
     (
         ".agents/engine-matrix.md",
-        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W5` |",
-        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W5` |",
+        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W6` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W6` |",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/engine-matrix.md",
-        "install/archive/publish implementation and all real release evidence "
-        "remain pending",
-        "install/archive/publish implementation and all real release evidence "
-        "are complete",
+        "W7 archive validation/supply-chain metadata, publish workflow and real "
+        "model/runtime evidence remain pending",
+        "W7 archive validation/supply-chain metadata, publish workflow and real "
+        "model/runtime evidence are complete",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "`ACTIVE` | W5 versioned manifest schema/generator",
-        "`DONE` | W5 versioned manifest schema/generator",
+        "`ACTIVE` | W5 manifest/schema fixtures and W6 canonical static-core server",
+        "`DONE` | W5 manifest/schema fixtures and W6 canonical static-core server",
         "roadmap release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "no archive exists",
-        "archive exists",
+        "no release-grade or published archive exists",
+        "release-grade and published archives exist",
         "roadmap release lifecycle",
     ),
     (
@@ -196,9 +193,9 @@ LIFECYCLE_RECORD_MUTATIONS = (
         "coordination release lifecycle",
     ),
     (
-        ".agents/completed/state-events/2026-08/STATE-20260808T220000-002.md",
-        "`ACTIVE`, never `DONE` or `GATING`.",
-        "`DONE`, with every release gate complete.",
+        ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md",
+        "The row remains `ACTIVE`. W1-W4 and W7-W13 remain pending",
+        "The row is `DONE`. Every release gate is complete",
         "state release lifecycle",
     ),
 )
@@ -238,16 +235,15 @@ HUMAN_WORK_IDS = (
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/"
-        "correctness/performance gates",
+        "**PENDING:** W1-W4/W7-W13, W7 validation, model/runtime gates, publication",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
         "docs/STATUS.md",
-        "Subset; #141 W5 19/19 ACTIVE ART∅",
-        "Supported; #141: RELEASE DONE/ARTIFACTS✓",
+        "Subset; #196 W6 package/help GREEN; no published assets",
+        "Supported; #196: RELEASE DONE/ARTIFACTS✓",
         "docs/STATUS.md release row",
     ),
 )
@@ -288,6 +284,7 @@ EXACT_MACHINE_FIELDS = {
     "lifecycle": "ACTIVE",
     "manifest_schema": "vllm.cpp.release-manifest.v1",
     "work_W5_status": "implemented",
+    "work_W6_status": "implemented",
     "work_W12_policy": "optional-non-blocking",
     "archive_claims": "pending",
     "runtime_claims": "pending",
@@ -301,9 +298,11 @@ EXACT_MACHINE_FIELDS = {
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/completed/state-events/2026-08/"
-        "STATE-20260808T220000-002.md,docs/STATUS.md,"
+        "STATE-20260809T160000-001.md,docs/STATUS.md,"
         "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
-        "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
+        "scripts/release_manifest.py,tests/scripts/test_release_manifest.py,"
+        "examples/CMakeLists.txt,scripts/package-server.py,"
+        "tests/scripts/test_server_package.py"
     ),
 }
 

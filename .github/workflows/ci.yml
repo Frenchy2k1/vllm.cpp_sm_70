@@ -412,6 +412,10 @@ jobs:
         # Bounded parallelism: a bare `-j` lets Make link ALL test executables at
         # once, which OOM-kills the runner (ld signal 9) during the parallel link.
         run: cmake --build build -j 2
+      - name: Installed server archive is reproducible and runnable
+        env:
+          VLLM_CPP_PACKAGE_TEST_BUILD_DIR: ${{ github.workspace }}/build
+        run: python3 tests/scripts/test_server_package.py
       - name: Test
         run: ctest --test-dir build --output-on-failure
   sanitize-cpu:
