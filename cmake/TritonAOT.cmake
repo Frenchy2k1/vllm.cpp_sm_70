@@ -270,10 +270,8 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
         message(FATAL_ERROR
           "${_adir}/${OUT_BASE}.h must declare one ${OUT_BASE}_default")
       endif()
-      vt_triton_aot_namespace_token(
-        _namespaced_default "${_arch}" "${OUT_BASE}_default")
-      string(REPLACE "${OUT_BASE}_default" "${_namespaced_default}"
-        _default_decl "${_default_decl}")
+      vt_triton_aot_namespace_declaration(
+        _default_decl "${_arch}" "${OUT_BASE}_default" "${_default_decl}")
       set_property(GLOBAL APPEND PROPERTY VLLM_TRITON_AOT_DISPATCH_DECLS
         "${_default_decl}")
       file(STRINGS "${_adir}/${OUT_BASE}.h" _load_decl
@@ -283,12 +281,12 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
         message(FATAL_ERROR
           "${_adir}/${OUT_BASE}.h must declare one load_${OUT_BASE}")
       endif()
-      vt_triton_aot_namespace_token(
-        _namespaced_load "${_arch}" "load_${OUT_BASE}")
-      string(REPLACE "load_${OUT_BASE}" "${_namespaced_load}"
-        _load_decl "${_load_decl}")
+      vt_triton_aot_namespace_declaration(
+        _load_decl "${_arch}" "load_${OUT_BASE}" "${_load_decl}")
       set_property(GLOBAL APPEND PROPERTY VLLM_TRITON_AOT_DISPATCH_DECLS
         "${_load_decl}")
+      vt_triton_aot_namespace_token(
+        _namespaced_default "${_arch}" "${OUT_BASE}_default")
       message(STATUS
         "Triton AOT: ${OUT_BASE} <- ${_arch} as ${_namespaced_default}")
     endforeach()
@@ -535,7 +533,7 @@ else:
       "/* Generated W2 declarations for six collision-free AOT trees. */\n"
       "#pragma once\n#include <cuda.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n")
     foreach(_decl IN LISTS _dispatch_decls)
-      file(APPEND "${_dispatch_header}" "${_decl}\n")
+      file(APPEND "${_dispatch_header}" "${_decl};\n")
     endforeach()
     file(APPEND "${_dispatch_header}"
       "#ifdef __cplusplus\n}\n#endif\n")

@@ -28,6 +28,19 @@ function(vt_triton_aot_namespace_token OUT_VAR ARCH TOKEN)
   set(${OUT_VAR} "vt_aot_${ARCH}_${TOKEN}" PARENT_SCOPE)
 endfunction()
 
+# Return one namespaced declaration without its trailing semicolon. CMake uses
+# semicolons as list separators, so storing raw C declarations in a GLOBAL
+# property can drop the terminator and concatenate two declarations into a
+# function definition. The final header writer adds exactly one semicolon.
+function(vt_triton_aot_namespace_declaration OUT_VAR ARCH TOKEN DECLARATION)
+  vt_triton_aot_namespace_token(_namespaced "${ARCH}" "${TOKEN}")
+  string(REPLACE "${TOKEN}" "${_namespaced}" _declaration "${DECLARATION}")
+  # file(STRINGS) escapes a source semicolon as `\;` in a CMake list. Remove
+  # both characters before this value enters another list/property.
+  string(REGEX REPLACE "[\\\\;]+$" "" _declaration "${_declaration}")
+  set(${OUT_VAR} "${_declaration}" PARENT_SCOPE)
+endfunction()
+
 # Prefix every generated external identifier containing BASE before compiling a
 # vendored C launcher. This includes stable dispatchers, hash dispatchers,
 # module/function globals, cubin arrays, and load/unload functions. The embedded
