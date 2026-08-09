@@ -97,14 +97,25 @@ struct Qwen3_5DenseLayerWeights {
   DenseMlpWeights mlp;                   // every layer has a dense MLP
 };
 
-// Whole dense-model text weights. `lm_head` is always materialized bf16 here, but
-// the CHECKPOINT may store it BF16, FP8 (per-channel scale) or ModelOpt NVFP4 —
-// the 27B NVFP4 publishers disagree, and revisions of one repo disagree with each
-// other (issue #164). LoadLmHeadAnyDtype dequantizes all three to this operand.
+// Whole dense-model text weights. The CHECKPOINT may store the head BF16, FP8
+// (per-channel scale) or ModelOpt NVFP4 — the 27B NVFP4 publishers disagree, and
+// revisions of one repo disagree with each other (issue #164). A BF16 or FP8 head
+// is materialized into `lm_head`; a ModelOpt/CT NVFP4 head stays PACKED in
+// `lm_head_fp4` (PERF-27B-LMHEAD-FP4, issue #213). Exactly one is populated.
 struct Qwen3_5DenseWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
   OwnedTensor lm_head;       // bf16 [H, vocab]  (dequantized -> Matmul-B layout)
+  // NVFP4-resident output head [N=vocab, K=H], kept in the on-disk orientation
+  // the fp4 GEMMs read. Mirrors the MoE arm's Qwen3_5MoeWeights::lm_head_fp4 and
+  // vLLM's own decision to leave the head quantized:
+  // ModelOptMixedPrecisionConfig.get_quant_method accepts ParallelLMHead
+  // (modelopt.py:2508-2536) and _quantized_layer_prefix_candidates appends the
+  // bare `lm_head` key (modelopt.py:2491-2496), so ModelOptNvFp4W4A16LinearMethod
+  // — which pins MarlinNvFp4LinearKernel (modelopt.py:1249,1283-1284) — resolves
+  // it and logits_processor._apply_head calls quant_method.apply every step
+  // (logits_processor.py:98-133). Empty on every BF16/FP8/GGUF/tied checkpoint.
+  Nvfp4Weight lm_head_fp4;
   // Mirrors tie_word_embeddings: logits reuse embed_tokens as raw [V,H]
   // torch-Linear storage, so no second host/device owner is created.
   bool tied_lm_head = false;
@@ -134,6 +145,21 @@ bool IsQwen27QuantizedLinear(const std::string& name);
 OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get,
                                const std::function<bool(const std::string&)>& has,
                                const std::string& name);
+
+// PERF-27B-LMHEAD-FP4 (issue #213). Load the dense output head into EXACTLY ONE
+// of the two owners: a ModelOpt/compressed-tensors NVFP4 head stays PACKED in
+// `fp4_out` (leaving `bf16_out` empty), every other storage form is materialized
+// bf16 [in, out] into `bf16_out` by LoadLmHeadAnyDtype (leaving `fp4_out` empty).
+// `proj` is the module path WITHOUT the trailing ".weight" (i.e. "lm_head").
+// Exported for the loader gate.
+void LoadDenseLmHead(const TensorResolver& get,
+                     const std::function<bool(const std::string&)>& has,
+                     const std::string& proj, OwnedTensor& bf16_out,
+                     Nvfp4Weight& fp4_out);
+
+// VT_LMHEAD_FP4 (default ON): the in-binary rollback for the packed head. `0`
+// restores the dequantize-at-load owner, so the A/B is same-binary.
+bool DenseLmHeadFp4Enabled();
 
 Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj);
 
@@ -187,6 +213,13 @@ class Qwen3_5DenseModel {
   // staging bytes; normal forwards remain lazy.
   static void PrepareBf16Resident(const Qwen3_5DenseWeights& weights,
                                   vt::Queue& queue);
+
+  // PERF-27B-LMHEAD-FP4 (issue #213). Build the packed NVFP4 `lm_head_fp4`
+  // Marlin W4A16 resident, PRE-CAPTURE. Inert when the head is not packed or
+  // Marlin is not the selected path. Called from the registry `prepare` hook,
+  // mirroring Qwen3_5Model::PrepareMarlinResident.
+  static void PrepareMarlinResident(const Qwen3_5DenseWeights& weights,
+                                    vt::Queue& queue);
 
   // Batched PAGED dense forward — the 27B analogue of Qwen3_5Model::Forward.
   // Same signature/structure (paged KV cache for the full-attn layers, batched

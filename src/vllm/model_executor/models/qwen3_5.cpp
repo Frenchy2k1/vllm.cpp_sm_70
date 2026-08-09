@@ -2568,6 +2568,28 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   return dout;
 }
 
+// The ONE dense-gate logits GEMM: y[M,vocab] f32 = x[M,H] @ lm_head.
+//
+// PERF-27B-LMHEAD-FP4 (issue #213). A ModelOpt NVFP4 head stays PACKED, so the
+// GEMM reads K*N/2 + K*N/16 bytes per step instead of the 2*K*N of a
+// dequantized bf16 operand (~0.715 GB vs ~2.543 GB at the real 248320x5120), and
+// the operand keeps its on-disk [N,K] orientation instead of forcing the
+// row-major NN GEMM that has no nvjet_sm121 kernel. Mirrors vLLM's
+// logits_processor._apply_head -> lm_head.quant_method.apply
+// (logits_processor.py:98-133) and the MoE arm above; every dense consumer
+// (eager ForwardDense, the gathered and non-gathered paged arms) routes here so
+// exactly one head layout is ever selected.
+//
+// The bf16 arm keeps BOTH of its existing shapes: the tied embed_tokens raw
+// [V,H] owner (nk -> MatmulBf16LogitsF32D) and the transposed [H,V] owner.
+DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights) {
+  if (!weights.lm_head_fp4.Empty())
+    return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
+  const OwnedTensor& lm_head = DenseLmHead(weights);
+  return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
+                    : MatmulF32D(d, x, lm_head);
+}
+
 // Same as MatmulNvfp4F32D but bf16 output (the down/o/out_proj sinks that feed
 // the residual add). CUDA: fp4-resident vt::MatmulNvfp4 (bf16 out). CPU: the
 // DequantNvfp4ToBLayout fallback (no CPU MatmulNvfp4 kernel).
@@ -6452,6 +6474,33 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 #endif
 }
 
+// PERF-27B-LMHEAD-FP4 (issue #213). Build the PACKED dense head's Marlin W4A16
+// resident once, at prepare time — which is strictly BEFORE any decode-graph
+// capture. This is not an optimization: BuildMarlinDenseResident Allocs,
+// launches the repack, and Copies a HOST STACK float (the processed global
+// scale) to the device. Run lazily from inside a captured region that bakes a
+// dangling stack address into the graph and every replay reads freed memory.
+// Same arm as Qwen3_5Model::PrepareMarlinResident's lm_head build above.
+void Qwen3_5DenseModel::PrepareMarlinResident(const Qwen3_5DenseWeights& weights,
+                                              vt::Queue& queue) {
+#ifdef VT_MARLIN_NVFP4
+  // Build under EXACTLY the guard MatmulNvfp4F32D uses to select the Marlin
+  // GEMM, so a configuration that will not take that path never builds for it.
+  if (weights.lm_head_fp4.Empty() || weights.lm_head_fp4.IsTrueW4A4() ||
+      !MarlinMoeEnabled() ||
+      !vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, queue.device.type)) {
+    return;
+  }
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  BuildMarlinDenseResident(d, weights.lm_head_fp4,
+                           MarlinDenseResidentFor(&weights.lm_head_fp4));
+  d.b.Synchronize(d.q);
+#else
+  (void)weights;
+  (void)queue;
+#endif
+}
+
 void Qwen3_5DenseModel::PrepareBf16Resident(
     const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
   VT_CHECK(platforms::GetPlatform(queue.device.type).needs_weight_staging(),
@@ -6470,7 +6519,10 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
 
   raw(weights.embed_tokens);
   raw(weights.final_norm);
-  raw(DenseLmHead(weights));
+  // PERF-27B-LMHEAD-FP4: a PACKED head has no bf16 owner to stage, and staging
+  // one would hand back the ~2.3 GiB keeping it packed just saved. The packed
+  // resident is built by PrepareMarlinResident instead.
+  if (weights.lm_head_fp4.Empty()) raw(DenseLmHead(weights));
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     raw(layer.input_layernorm);
     raw(layer.post_attention_layernorm);
@@ -6685,10 +6737,9 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
-  // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
-  const OwnedTensor& lm_head = DenseLmHead(weights);
-  DBuf dlogits = lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
-                            : MatmulF32D(d, dnorm.t(), lm_head);
+  // lm_head (the one host Download): PACKED NVFP4 (PERF-27B-LMHEAD-FP4) when the
+  // checkpoint ships a ModelOpt/CT NVFP4 head, else the bf16/tied owner.
+  DBuf dlogits = DenseLogitsF32D(d, dnorm.t(), weights);
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;
@@ -6700,7 +6751,13 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
     : weights_(&weights),
       config_(&config),
       embed_tokens_(&target.embed_tokens),
-      lm_head_(&DenseLmHead(target)) {
+      lm_head_(&DenseLmHead(target)),
+      // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must
+      // see the packed one too — otherwise ForwardLogits would fall through to
+      // an empty bf16 owner on a ModelOpt NVFP4 checkpoint. Empty on every
+      // BF16/FP8/tied dense target, where the bf16 arm is selected exactly as
+      // before. Mirrors the MoE ctor below.
+      lm_head_fp4_(&target.lm_head_fp4) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -7030,21 +7087,19 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
-  // lm_head is unquantized bf16 in the 27B (notes §3.6). Pure-decode / graph
-  // replay pass empty indices (identity) → the full [T,vocab] path.
+  // Both arms route through DenseLogitsF32D, so a PACKED NVFP4 head
+  // (PERF-27B-LMHEAD-FP4) and the bf16/tied owner select the same way here as in
+  // the eager forward. Pure-decode / graph replay pass empty indices (identity)
+  // → the full [T,vocab] path.
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   if (do_gather) {
     const int64_t n_out = static_cast<int64_t>(logits_indices.size());
     DBuf dgather(d, DType::kBF16, {n_out, H});
     GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    const OwnedTensor& lm_head = DenseLmHead(weights);
-    return lm_head.nk ? MatmulBf16LogitsF32D(d, dgather.t(), lm_head)
-                      : MatmulF32D(d, dgather.t(), lm_head);
+    return DenseLogitsF32D(d, dgather.t(), weights);
   }
-  const OwnedTensor& lm_head = DenseLmHead(weights);
-  return lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
-                    : MatmulF32D(d, dnorm.t(), lm_head);
+  return DenseLogitsF32D(d, dnorm.t(), weights);
 }
 
 // Full eager dense paged forward body: embed (host token_ids) then the capturable
