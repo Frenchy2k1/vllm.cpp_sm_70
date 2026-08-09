@@ -2,6 +2,8 @@
 // value tile; the CUDA recurrence remains in cuda_gdn.cu.
 #include <doctest/doctest.h>
 
+#include <array>
+#include <cstring>
 #include <initializer_list>
 
 #include "vt/cuda/gdn_decode_fused.h"
@@ -12,6 +14,11 @@ using vt::cuda::GdnDecodeLaunchContractFor;
 using vt::cuda::GdnDecodeRegisterLogicalColumn;
 using vt::cuda::GdnDecodeRegisterSharedColumn;
 using vt::cuda::GdnDecodeRegstateFlagIsOn;
+using vt::cuda::DispatchGdnDecodeBf16Vecstore;
+using vt::cuda::GdnDecodeBf16PackByteOffset;
+using vt::cuda::GdnDecodeBf16PackLogicalColumn;
+using vt::cuda::GdnDecodeBf16VecstoreEligible;
+using vt::cuda::GdnDecodeBf16VecstoreFlagIsOn;
 using vt::cuda::GdnDecodeSharedColumn;
 using vt::cuda::GdnDecodeStateStride;
 using vt::cuda::GdnDecodeValueTile;
@@ -277,5 +284,120 @@ TEST_CASE("fused GDN decode register slots map bijectively to logical and shared
   for (int c = 0; c < 128; ++c) {
     CHECK(logical_seen[c]);
     CHECK(shared_seen[c]);
+  }
+}
+
+namespace {
+
+uint16_t ReferenceBf16Rn(float value) {
+  uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t exponent = bits & 0x7f800000u;
+  const uint32_t mantissa = bits & 0x007fffffu;
+  if (exponent == 0x7f800000u && mantissa != 0) {
+    return static_cast<uint16_t>((bits >> 16) | 0x0040u);
+  }
+  const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
+  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+}  // namespace
+
+TEST_CASE("VT_GDN_DECODE_BF16_VECSTORE selects only exact one") {
+  CHECK(GdnDecodeBf16VecstoreFlagIsOn("1"));
+  constexpr const char* invalid[] = {
+      nullptr, "", "0", "01", "10", "1 ", " 1", "+1", "1x", "true", "yes"};
+  for (const char* value : invalid) {
+    CAPTURE(value == nullptr ? "<unset>" : value);
+    CHECK_FALSE(GdnDecodeBf16VecstoreFlagIsOn(value));
+  }
+}
+
+TEST_CASE("GDN BF16 vector writeback requires every production predicate") {
+  const auto production =
+      GdnDecodeLaunchContractFor("16", "1", "1", 128, 128, 8);
+  auto eligible = [&](const char* vecstore, const auto& contract, int64_t dv,
+                      int64_t dk, int nw, bool state_is_bf16,
+                      bool regular_fused_decode) {
+    return GdnDecodeBf16VecstoreEligible(
+        vecstore, contract, dv, dk, nw, state_is_bf16,
+        regular_fused_decode);
+  };
+  CHECK(eligible("1", production, 128, 128, 8, true, true));
+  CHECK_FALSE(eligible(nullptr, production, 128, 128, 8, true, true));
+  CHECK_FALSE(eligible("1x", production, 128, 128, 8, true, true));
+  CHECK_FALSE(eligible("1", GdnDecodeLaunchContractFor("32", "1", "1", 128, 128, 8),
+                       128, 128, 8, true, true));
+  CHECK_FALSE(eligible("1", GdnDecodeLaunchContractFor("16", "0", "1", 128, 128, 8),
+                       128, 128, 8, true, true));
+  CHECK_FALSE(eligible("1", GdnDecodeLaunchContractFor("16", "1", "0", 128, 128, 8),
+                       128, 128, 8, true, true));
+  CHECK_FALSE(eligible("1", production, 127, 128, 8, true, true));
+  CHECK_FALSE(eligible("1", production, 128, 127, 8, true, true));
+  CHECK_FALSE(eligible("1", production, 128, 128, 4, true, true));
+  CHECK_FALSE(eligible("1", production, 128, 128, 8, false, true));
+  CHECK_FALSE(eligible("1", production, 128, 128, 8, true, false));
+}
+
+TEST_CASE("GDN BF16 vector writeback dispatches exactly one callback") {
+  auto select = [](bool vector_eligible) {
+    int incumbent_calls = 0;
+    int vector_calls = 0;
+    const int selected = DispatchGdnDecodeBf16Vecstore(
+        vector_eligible,
+        [&] {
+          ++incumbent_calls;
+          return 0;
+        },
+        [&] {
+          ++vector_calls;
+          return 1;
+        });
+    CHECK(incumbent_calls + vector_calls == 1);
+    return selected;
+  };
+  CHECK(select(false) == 0);
+  CHECK(select(true) == 1);
+}
+
+TEST_CASE("GDN BF16 vector packs cover the aligned 128-column state row") {
+  bool seen[128] = {};
+  for (int lane = 0; lane < 8; ++lane) {
+    const int64_t first = GdnDecodeBf16PackLogicalColumn(lane, 0, 0);
+    const int64_t second = GdnDecodeBf16PackLogicalColumn(lane, 1, 0);
+    CHECK(GdnDecodeBf16PackByteOffset(lane, 0) % 16 == 0);
+    CHECK(GdnDecodeBf16PackByteOffset(lane, 1) % 16 == 0);
+    CHECK(second == first + 8);
+    for (int pack = 0; pack < 2; ++pack) {
+      for (int element = 0; element < 8; ++element) {
+        const int64_t column =
+            GdnDecodeBf16PackLogicalColumn(lane, pack, element);
+        REQUIRE(column >= 0);
+        REQUIRE(column < 128);
+        CHECK_FALSE(seen[column]);
+        seen[column] = true;
+      }
+    }
+  }
+  for (bool visited : seen) CHECK(visited);
+
+  const std::array<float, 16> values = {
+      0.0f, -0.0f, 1.0f, -2.0f, 0.333251953125f, 65504.0f,
+      1.00390625f, 1.01171875f, -1.00390625f, -1.01171875f,
+      1.0e-20f, -1.0e-20f, 3.14159265f, -2.71828183f, 42.5f, -99.75f};
+  std::array<uint8_t, 32> packed{};
+  for (int pack = 0; pack < 2; ++pack) {
+    for (int element = 0; element < 8; ++element) {
+      const uint16_t bits = ReferenceBf16Rn(values[pack * 8 + element]);
+      std::memcpy(packed.data() + pack * 16 + element * 2, &bits,
+                  sizeof(bits));
+    }
+  }
+  for (int element = 0; element < 16; ++element) {
+    uint16_t packed_bits = 0;
+    std::memcpy(&packed_bits, packed.data() + element * 2,
+                sizeof(packed_bits));
+    CHECK(packed_bits == ReferenceBf16Rn(values[element]));
   }
 }

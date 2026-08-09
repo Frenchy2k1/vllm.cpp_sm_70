@@ -35,6 +35,13 @@ inline constexpr bool GdnDecodeRegstateFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] == '1' && env_value[1] == '\0';
 }
 
+// Direct BF16 vector writeback is a strict, independently selectable
+// discriminator. It is never implied by REGSTATE and every non-exact spelling
+// leaves the incumbent shared-memory writeback intact.
+inline constexpr bool GdnDecodeBf16VecstoreFlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1' && env_value[1] == '\0';
+}
+
 inline constexpr int64_t GdnDecodeStateStride(bool swizzled, int64_t dk,
                                               int lanes_per_row) {
   return dk + (swizzled ? lanes_per_row : 1);
@@ -57,6 +64,25 @@ inline constexpr int64_t GdnDecodeRegisterLogicalColumn(int lane, int slot) {
 #if defined(__CUDACC__)
 __host__ __device__
 #endif
+inline constexpr int64_t GdnDecodeBf16PackLogicalColumn(int lane, int pack,
+                                                        int element) {
+  return static_cast<int64_t>(lane) * 16 + pack * 8 + element;
+}
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline constexpr int64_t GdnDecodeBf16PackByteOffset(int lane, int pack) {
+  return GdnDecodeBf16PackLogicalColumn(lane, pack, 0) * 2;
+}
+
+static_assert(GdnDecodeBf16PackByteOffset(0, 0) == 0);
+static_assert(GdnDecodeBf16PackByteOffset(0, 1) == 16);
+static_assert(GdnDecodeBf16PackByteOffset(7, 1) == 240);
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
 inline constexpr int64_t GdnDecodeRegisterSharedColumn(int lane, int slot) {
   return static_cast<int64_t>(slot) * 8 + lane;
 }
@@ -72,6 +98,21 @@ struct GdnDecodeLaunchContract {
   bool swizzled;
   bool regstate;
 };
+
+// The vector specialization is intentionally narrower than REGSTATE. Keeping
+// the dtype and regular-decode predicates explicit here makes host dispatch and
+// portable mutation tests agree on every gate.
+inline constexpr bool GdnDecodeBf16VecstoreEligible(
+    const char* env_value, const GdnDecodeLaunchContract& contract, int64_t dv,
+    int64_t dk, int requested_nw, bool state_is_bf16,
+    bool regular_fused_decode) {
+  return GdnDecodeBf16VecstoreFlagIsOn(env_value) && contract.regstate &&
+         contract.swizzled &&
+         contract.selected_tile == GdnDecodeValueTile::kBv16 &&
+         contract.value_tile == 16 && contract.lanes_per_row == 8 &&
+         contract.block_threads == 128 && dv == 128 && dk == 128 &&
+         requested_nw == 8 && state_is_bf16 && regular_fused_decode;
+}
 
 inline constexpr GdnDecodeLaunchContract GdnDecodeLaunchContractFor(
     const char* bv_env_value, const char* swizzle_env_value,
@@ -122,6 +163,14 @@ inline decltype(auto) DispatchGdnDecodeStateStorage(
     RegisterLaunch&& register_launch) {
   if (contract.regstate) return register_launch(contract);
   return shared_launch(contract);
+}
+
+template <typename IncumbentLaunch, typename VectorLaunch>
+inline decltype(auto) DispatchGdnDecodeBf16Vecstore(
+    bool vector_eligible, IncumbentLaunch&& incumbent_launch,
+    VectorLaunch&& vector_launch) {
+  if (vector_eligible) return vector_launch();
+  return incumbent_launch();
 }
 
 // Shared callback dispatcher used by production and portable tests. The

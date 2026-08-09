@@ -270,6 +270,27 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);  // round-to-nearest-even, same as host F32ToBF16
 }
 
+// Pack exactly eight scalar BF16 RN conversions into one aligned 16-byte
+// transaction. The aggregate is alignment-safe; no potentially unaligned
+// scalar object is type-punned.
+__device__ inline void StoreBf16Vec8(__nv_bfloat16* p, float v0, float v1,
+                                     float v2, float v3, float v4, float v5,
+                                     float v6, float v7) {
+  static_assert(sizeof(__nv_bfloat16) * 8 == sizeof(int4));
+  static_assert(alignof(int4) == 16);
+  int4 packed;
+  auto* elements = reinterpret_cast<__nv_bfloat16*>(&packed);
+  elements[0] = __float2bfloat16(v0);
+  elements[1] = __float2bfloat16(v1);
+  elements[2] = __float2bfloat16(v2);
+  elements[3] = __float2bfloat16(v3);
+  elements[4] = __float2bfloat16(v4);
+  elements[5] = __float2bfloat16(v5);
+  elements[6] = __float2bfloat16(v6);
+  elements[7] = __float2bfloat16(v7);
+  *reinterpret_cast<int4*>(p) = packed;
+}
+
 template <typename T>
 __device__ inline float RoundToStorage(float v);
 template <>
@@ -2778,13 +2799,17 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
 // a power of two dividing 32 and the launcher only uses NW>1 when BV==32, so a
 // block is always a whole number of warps) — the xor butterfly stays in-warp.
 template <typename Tin, typename Tout, typename TState, int NW, bool SWIZZLED,
-          bool REGSTATE>
+          bool REGSTATE, bool BF16_VECSTORE = false>
 __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
                                      const float* g, const float* beta, TState* state,
                                      const int32_t* state_idx, int64_t hk_n, int64_t dk,
                                      int64_t hv_n, int64_t dv, int64_t bv, float scale) {
   static_assert(!REGSTATE || (SWIZZLED && NW == 8),
                 "register state requires the production swizzled NW8 layout");
+  static_assert(!BF16_VECSTORE ||
+                    (REGSTATE && SWIZZLED && NW == 8 &&
+                     std::is_same<TState, __nv_bfloat16>::value),
+                "BF16 vector writeback requires BF16 REGSTATE BV16+SWIZZLE+NW8");
   const int64_t i_v = blockIdx.x;         // value-dim tile
   const int64_t i_nh = blockIdx.y;        // fused (sequence, v-head)
   const int64_t i_n = i_nh / hv_n;        // sequence == decode token index
@@ -2900,19 +2925,35 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
 #pragma unroll
   for (int off = 1; off < NW; off <<= 1) o += __shfl_xor_sync(0xffffffffu, o, off);
   if (vrow < dv && wk == 0) Store(out, (i_n * hv_n + hv) * dv + vrow, o);
-  if constexpr (REGSTATE) {
+  if constexpr (REGSTATE && !BF16_VECSTORE) {
     for (int64_t j = 0; j < 16; ++j) {
       r[GdnDecodeRegisterSharedColumn(wk, j)] = rr[j];
     }
   }
-  __syncthreads();
+  if constexpr (BF16_VECSTORE) {
+    // Eligibility proves Dv=Dk=128 and BV16: every lane owns one complete,
+    // valid 16-element logical slice. Each destination begins at a 32-byte
+    // boundary, so both 16-byte stores are naturally aligned.
+    static_assert(sizeof(TState) == 2);
+#pragma unroll
+    for (int pack = 0; pack < 2; ++pack) {
+      const int64_t column =
+          GdnDecodeBf16PackLogicalColumn(wk, pack, 0);
+      const int base = pack * 8;
+      StoreBf16Vec8(s_head + static_cast<int64_t>(vi) * 128 + column,
+                    rr[base], rr[base + 1], rr[base + 2], rr[base + 3],
+                    rr[base + 4], rr[base + 5], rr[base + 6], rr[base + 7]);
+    }
+  } else {
+    __syncthreads();
 
-  // Coalesced write-back of the updated slice from f32 registers to the
-  // configured fp16/bf16/fp32 temporal cache.
-  for (int64_t e = tid; e < tile; e += blockDim.x) {
-    const int64_t c = e % dk;
-    const int64_t sc = SWIZZLED ? (c % 16) * 8 + c / 16 : c;
-    Store(s_head, e, sbh[(e / dk) * sdk + sc]);
+    // Coalesced write-back of the updated slice from f32 registers to the
+    // configured fp16/bf16/fp32 temporal cache.
+    for (int64_t e = tid; e < tile; e += blockDim.x) {
+      const int64_t c = e % dk;
+      const int64_t sc = SWIZZLED ? (c % 16) * 8 + c / 16 : c;
+      Store(s_head, e, sbh[(e / dk) * sdk + sc]);
+    }
   }
 }
 
@@ -2920,7 +2961,8 @@ template <typename Tin, typename Tout, typename TState, int NW>
 void LaunchGdnDecodeFusedNW(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                             const int32_t* state_idx, int64_t n, const GdnArgs& args,
-                            const GdnDecodeLaunchContract& contract) {
+                            const GdnDecodeLaunchContract& contract,
+                            bool bf16_vecstore) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t bv = contract.value_tile;
@@ -2940,13 +2982,38 @@ void LaunchGdnDecodeFusedNW(cudaStream_t s, Tensor& out, const Tensor& q_in, con
                     args.scale);
           },
           [&](const GdnDecodeLaunchContract&) {
-            GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true>
-                <<<grid, static_cast<unsigned>(contract.block_threads),
-                   contract.shared_bytes, s>>>(
-                    out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
-                    v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
-                    state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
-                    args.scale);
+            if constexpr (std::is_same<TState, __nv_bfloat16>::value) {
+              DispatchGdnDecodeBf16Vecstore(
+                  bf16_vecstore,
+                  [&] {
+                    GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true,
+                                         false>
+                        <<<grid, static_cast<unsigned>(contract.block_threads),
+                           contract.shared_bytes, s>>>(
+                            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                            v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                            state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv,
+                            bv, args.scale);
+                  },
+                  [&] {
+                    GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true,
+                                         true>
+                        <<<grid, static_cast<unsigned>(contract.block_threads),
+                           contract.shared_bytes, s>>>(
+                            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                            v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                            state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv,
+                            bv, args.scale);
+                  });
+            } else {
+              GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true>
+                  <<<grid, static_cast<unsigned>(contract.block_threads),
+                     contract.shared_bytes, s>>>(
+                      out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                      v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                      state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+                      args.scale);
+            }
           });
     } else {
       GdnDecodeFusedKernel<Tin, Tout, TState, NW, false, false>
@@ -2971,23 +3038,28 @@ template <typename Tin, typename Tout, typename TState>
 void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                           const int32_t* state_idx, int64_t n, const GdnArgs& args,
-                          const GdnDecodeLaunchContract& contract) {
+                          const GdnDecodeLaunchContract& contract,
+                          bool bf16_vecstore) {
   switch (contract.lanes_per_row) {
     case 2:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 2>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, contract);
+                                                   n, args, contract,
+                                                   bf16_vecstore);
       break;
     case 4:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 4>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, contract);
+                                                   n, args, contract,
+                                                   bf16_vecstore);
       break;
     case 8:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 8>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, contract);
+                                                   n, args, contract,
+                                                   bf16_vecstore);
       break;
     default:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 1>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, contract);
+                                                   n, args, contract,
+                                                   bf16_vecstore);
       break;
   }
 }
@@ -2998,16 +3070,19 @@ template <typename Tin, typename Tout>
 void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                            const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                            const int32_t* state_idx, int64_t n, const GdnArgs& args,
-                           const GdnDecodeLaunchContract& contract) {
+                           const GdnDecodeLaunchContract& contract,
+                           bool bf16_vecstore) {
   if (state.dtype == DType::kBF16)
     LaunchGdnDecodeFused<Tin, Tout, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, contract);
+                                                   n, args, contract,
+                                                   bf16_vecstore);
   else if (state.dtype == DType::kF16)
     LaunchGdnDecodeFused<Tin, Tout, __half>(s, out, q_in, k, v, g, beta,
-                                           state, state_idx, n, args, contract);
+                                           state, state_idx, n, args, contract,
+                                           bf16_vecstore);
   else
     LaunchGdnDecodeFused<Tin, Tout, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args,
-                                           contract);
+                                           contract, bf16_vecstore);
 }
 
 // Decode dispatch. state_idx == nullptr: compact [n,Hv,Dv,Dk] state (row==i_n).
@@ -3042,20 +3117,26 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
                   args, "gdn_decode");
       return;
     }
+    const bool bf16_vecstore = GdnDecodeBf16VecstoreEligible(
+        std::getenv("VT_GDN_DECODE_BF16_VECSTORE"), contract, dv, dk, nw,
+        state.dtype == DType::kBF16, true);
     if (q_in.dtype == DType::kF32) {
       if (out.dtype == DType::kF32)
         LaunchGdnDecodeFusedS<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,
-                                            args, contract);
+                                            args, contract, bf16_vecstore);
       else
         LaunchGdnDecodeFusedS<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                    n, args, contract);
+                                                    n, args, contract,
+                                                    bf16_vecstore);
     } else {
       if (out.dtype == DType::kF32)
         LaunchGdnDecodeFusedS<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                    n, args, contract);
+                                                    n, args, contract,
+                                                    bf16_vecstore);
       else
         LaunchGdnDecodeFusedS<__nv_bfloat16, __nv_bfloat16>(
-            s, out, q_in, k, v, g, beta, state, state_idx, n, args, contract);
+            s, out, q_in, k, v, g, beta, state, state_idx, n, args, contract,
+            bf16_vecstore);
     }
   };
   DispatchGdnDecodeValueTile(std::getenv("VT_GDN_DECODE_BV"),
