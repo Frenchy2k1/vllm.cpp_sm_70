@@ -264,12 +264,18 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_hosted_packagers_resolve_their_runtime_dependencies(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
-            "apk add --no-cache bash binutils build-base cmake file ninja python3 qemu-x86_64",
+            "apk add --no-cache bash binutils build-base cmake file gcompat ninja python3 qemu-x86_64",
             workflow,
         )
         self.assertNotIn("mlx.__file__", workflow)
         self.assertIn('d.locate_file("mlx")', workflow)
         musl = self.checker.job_block(workflow, "cpu_musl")
+        x86 = self.checker.job_block(workflow, "cpu_x86")
+        self.assertIn('scripts/install-intel-sde.sh "$RUNNER_TEMP/intel-sde"', x86)
+        self.assertIn('"$RUNNER_TEMP/intel-sde/sde64"', x86)
+        self.assertIn('scripts/install-intel-sde.sh "$RUNNER_TEMP/intel-sde"', musl)
+        self.assertIn('-v "$RUNNER_TEMP/intel-sde:/intel-sde:ro"', musl)
+        self.assertIn("/intel-sde/sde64", musl)
         self.assertIn(
             "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)\n"
             "          export SOURCE_DATE_EPOCH",

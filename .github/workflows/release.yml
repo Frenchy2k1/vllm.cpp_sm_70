@@ -58,6 +58,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-user
+          scripts/install-intel-sde.sh "$RUNNER_TEMP/intel-sde"
       - name: Build, execute, package, and validate adaptive x86 CPU bundle
         env:
           EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -72,7 +73,8 @@ jobs:
           scripts/build-cpu-release.sh \
             linux-x86_64-glibc-cpu x86_64 stable build-release-cpu-x86 \
             "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" \
-            "$(command -v qemu-x86_64)"
+            "$(command -v qemu-x86_64)" \
+            "$RUNNER_TEMP/intel-sde/sde64"
       - name: Upload exact validated x86 CPU asset triplet
         id: upload
         uses: actions/upload-artifact@v4
@@ -111,6 +113,7 @@ jobs:
           scripts/build-cpu-release.sh \
             linux-aarch64-glibc-cpu aarch64 stable build-release-cpu-arm64 \
             "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" \
+            "$(command -v qemu-aarch64)" \
             "$(command -v qemu-aarch64)"
       - name: Upload exact validated Arm CPU asset triplet
         id: upload
@@ -143,13 +146,15 @@ jobs:
           export SOURCE_DATE_EPOCH
           version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
           test "$version" = "$VERSION"
+          scripts/install-intel-sde.sh "$RUNNER_TEMP/intel-sde"
           docker run --rm \
             -e EVIDENCE_URL -e SOURCE_DATE_EPOCH -e SOURCE_SHA -e VERSION \
+            -v "$RUNNER_TEMP/intel-sde:/intel-sde:ro" \
             -v "$GITHUB_WORKSPACE:/src" -w /src alpine:3.22 sh -euxc '
-              apk add --no-cache bash binutils build-base cmake file ninja python3 qemu-x86_64
+              apk add --no-cache bash binutils build-base cmake file gcompat ninja python3 qemu-x86_64
               scripts/build-cpu-release.sh \
                 linux-x86_64-musl-cpu-static x86_64 experimental-preview \
-                build-release-cpu-musl 1.2.5 /usr/bin/qemu-x86_64
+                build-release-cpu-musl 1.2.5 /usr/bin/qemu-x86_64 /intel-sde/sde64
             '
           sudo chown -R "$(id -u):$(id -g)" build-release-cpu-musl
       - name: Upload exact validated musl CPU asset triplet
