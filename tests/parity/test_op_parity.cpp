@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "npy.h"
+#include "hf_snapshot.h"
 #include "vllm/model_executor/layers/rotary_embedding/base.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
@@ -1217,17 +1218,8 @@ bool RunQwen36Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
 
 // Snapshot dir of the 27B dense checkpoint (contains config.json), or "".
 std::string Find27BSnapshot() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path snaps =
-      fs::path(home) /
-      ".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec)) {
-    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
-  }
-  return "";
+  // Pinned to the goldens' revision; see tests/parity/hf_snapshot.h.
+  return parity::Qwen27NvfP4Snapshot();
 }
 
 // --- 27B DENSE full-model logits acceptance gate.

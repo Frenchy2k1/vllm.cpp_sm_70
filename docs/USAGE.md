@@ -78,10 +78,14 @@ a silent fallback cannot post a plausible number:
   reports GPU-timestamp time rather than wall clock; see
   [ENVIRONMENT.md](ENVIRONMENT.md) for what each knob does and what it measured.
 
-### Quantized checkpoints: which `lm_head` forms load
+### Quantized checkpoints: which weight forms load
 
-Publishers do not agree on how the output head is stored, and a single repo can
-change it between revisions. For the Qwen3.6 dense family we accept all three
+Publishers do not agree on how weights are stored, and a single repo can change
+it between revisions (one 27B "NVFP4" repo silently became FP8 throughout).
+The table below is about `lm_head`; the same three forms are accepted for the
+attention, MLP and `linear_attn` projections, in both compressed-tensors
+(`weight_packed` + `weight_global_scale`) and ModelOpt (`weight` +
+`weight_scale_2`) naming. For the Qwen3.6 dense family we accept all three
 forms in use, so pick a checkpoint by its quality, not by its head:
 
 | `lm_head.weight` | Companion tensors | Seen in |
@@ -271,7 +275,7 @@ to one built without video support. See
 | `--block-size N` | `32` | KV block size |
 | `--num-blocks N` | `256` | KV blocks |
 | `--max-model-len N` | `0` (config default) | Max sequence length |
-| `--max-num-seqs N` | `8` | Max concurrent sequences (also sizes the HTTP worker pool) |
+| `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
 | `--scheduling-policy fcfs\|priority\|lpm` | `fcfs` | Scheduler policy (`lpm` is the SGLang cache-aware policy, see [docs/SGLANG-COMPAT.md](SGLANG-COMPAT.md)) |

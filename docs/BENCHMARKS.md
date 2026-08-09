@@ -14,13 +14,15 @@
 | **DSR fix: async readback capability (2026-08-08)** | **No number owed**: behavior-neutral (CPU/CUDA async-ON, discrete non-CUDA async-OFF, unchanged); moves a `kCUDA` check onto `Backend`, unblocking red CI on #127/#154/#155 |
 | **`ROAD-V1-MEM` M1+M2 (2026-08-08)** | KV auto-sizing CPU brick: `--kv-cache-memory` sizes the pool from a byte budget via the group-aware `KVBytesPerBlock` divisor (ABI v16, CPU-gated). M3 profile run dgx-gated |
 | **Record/checker repair 2026-08-07–08** | Gates fixed. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited), `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables); nine Gemma4/ROCm tuners internal. No runtime/perf change. |
-| **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
-| **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
+| **vLLM** | Qwen3.6-27B NVFP4 `unsloth` @`890bdef7`, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
+| **vLLM** | Qwen3.6-27B NVFP4 `nvidia` @`0893e160` (ModelOpt `modelopt_mixed`), GB10 | **0.85x, BEHIND** at every concurrency (0.843x to 0.861x), up from 0.72x | identical |
+| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | decode 0.98x at c1 and c4, 0.87x at c2, 0.92x at c8 (warp-shuffle router landed) | near-tie |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-S-2.1 NVFP4 (118B/8B MoE), GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
+| **vLLM** | Kimi-Linear-48B-A3B, GB10 | no binding number: the published checkpoint is tiktoken-only, so it cannot drive the warm-server harness | golden 122/128, near-tie profile |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page. Which architecture each number
@@ -34,7 +36,8 @@ The binding comparison. vLLM runs its **production graphed config**, never
 
 | Model | Quant | vLLM pin | Axes passing | Disposition |
 |---|---|---|---:|---|
-| Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality. Measured on `unsloth/Qwen3.6-27B-NVFP4` @`890bdef7` (BF16 head); @`ccdaab7e` re-quantized the head to FP8 |
+| Qwen3.6-27B | NVFP4 (`unsloth` @`890bdef7`) | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality. Revision-PINNED (the gate no longer lets `readdir` choose): @`ccdaab7e` is the same repo name re-quantized to FP8 W8A8 throughout, not NVFP4 |
+| Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/4 | **BEHIND, uniformly 0.85x** on decode throughput (was 0.72x before the FP8 tower fix); greedy continuation IDENTICAL to vLLM. A different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 GDN/attn tower) |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | throughput + host PSS | Exact chunks ON: total **1.021x PASS**; TTFT **1.086x**, TPOT **1.025x**, VRAM **1.018x OPEN**; local A/B **+2.152%** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
@@ -51,7 +54,11 @@ The binding comparison. vLLM runs its **production graphed config**, never
 ### Qwen3.6-27B by concurrency
 
 Medians of three interleaved repetitions, 1,024 in / 128 out, cache off, closed
-loop. Output is token-for-token identical to vLLM at every point.
+loop. Output is token-for-token identical to vLLM at every point. The `nvidia`
+ModelOpt table that follows is a DIFFERENT checkpoint on a DIFFERENT axis and
+must not be compared against this one: a 7-token prompt scored on OUTPUT tokens
+per second, with method, attribution and the owed 1,024 in / 128 out axis in
+[the benchmark record](../.agents/benchmark-record.md).
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -67,6 +74,21 @@ tradeoff, not nine problems: our synchronous deterministic forward loses on
 low-concurrency *median* decode and TTFT, and wins the corresponding *tail* and
 the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 1.078x at c32).
+
+### Qwen3.6-27B NVFP4 `nvidia` @`0893e160` by concurrency (ModelOpt)
+
+| Concurrency | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| **vllm.cpp** tok/s | 10.41 | 20.22 | 38.76 | 72.49 |
+| vLLM 0.25.0 tok/s | 12.29 | 23.49 | 45.42 | 86.01 |
+| **Ratio** | **0.847x** | **0.861x** | **0.853x** | **0.843x** |
+| Before the FP8 tower fix | 8.76 | 17.07 | 33.01 | 62.13 |
+| Spread, ours / vLLM | 1.000 / 1.006 | 1.009 / 1.069 | 1.001 / 1.001 | 1.005 / 1.003 |
+| Method | medians of 3, warm servers, one `flock`, greedy, `ignore_eos` so both emit exactly 128 tokens, `--gpu-memory-utilization 0.55 --max-model-len 4096`, vLLM in its production graphed config | | | |
+| Tokens | greedy continuation IDENTICAL between engines, captured from the same warm processes as these numbers | | | |
+| Reading | still a real loss, not a tie, and still FLAT across the sweep, so batching and the scheduler are not the cause | | | |
+| Roof | 20.42 GiB over about 273 GB/s: vLLM's 79 ms/token is about 95% of the bandwidth limit, ours 96 ms/token about 78% | | | |
+| Peak host RSS | 21.0 GiB, down from 24.2 GiB, because the FP8 tower is no longer expanded to BF16 | | | |
 
 ### Qwen3.6-35B-A3B by concurrency
 

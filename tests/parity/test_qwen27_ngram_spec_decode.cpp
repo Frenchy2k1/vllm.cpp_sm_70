@@ -35,6 +35,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "hf_snapshot.h"
+
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/sampling_params.h"
@@ -48,20 +50,8 @@ namespace {
 // matching the ngram golden + the 27B SACRED gate), preferring the single
 // model.safetensors snapshot over a sharded FP8-lm_head re-quant.
 std::string Snap27B() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path base =
-      fs::path(home) /
-      ".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(base, ec)) return "";
-  std::string any;
-  for (const auto& e : fs::directory_iterator(base, ec)) {
-    if (!fs::exists(e.path() / "config.json", ec)) continue;
-    any = e.path().string();
-    if (fs::exists(e.path() / "model.safetensors", ec)) return e.path().string();
-  }
-  return any;
+  // Pinned to the goldens' revision; see tests/parity/hf_snapshot.h.
+  return parity::Qwen27NvfP4Snapshot();
 }
 
 vllm::SamplingParams Greedy(int max_tokens) {

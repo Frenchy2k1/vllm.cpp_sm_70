@@ -135,6 +135,8 @@ OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get,
                                const std::function<bool(const std::string&)>& has,
                                const std::string& name);
 
+Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj);
+
 OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
                                              const std::string& proj);
 
