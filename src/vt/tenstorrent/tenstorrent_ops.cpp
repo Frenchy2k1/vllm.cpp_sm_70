@@ -31,6 +31,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1031,18 +1032,18 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
 
 // kPagedAttention: causal/non-causal GQA softmax over the paged NHD cache
 // (cpu_paged_attn.cpp PagedAttentionKernel). Host-staged f32 oracle matching
-// the CPU reference while Alloc is host memory. Device ttnn::sdpa_decode is
-// deferred to the device-resident redesign — its layout contract does not map
-// 1:1 onto vLLM's block_table without that work.
+// the CPU reference while Alloc is host memory.
 //
-// Perf (still host, but no longer a single-thread LoadElem switch farm):
-//   * Parallel over (token, head) via the shared CPU threadpool — decode has
-//     total_q==1 so token-only parallelism is a no-op; head parallelism is the
-//     real win. Prefill gets both axes.
-//   * Hoist each query head into a local f32 buffer once (was re-loaded from
-//     the tensor for every key position).
-//   * Specialize contiguous f32/bf16 loads so the inner d-loop is a raw
-//     pointer walk, not a per-element dtype switch.
+// Device ttnn::paged_scaled_dot_product_attention_decode is deferred: ttnn
+// stores paged K/V as [nb, nkv, block, d] while vLLM NHD is [nb, block, nkv, d],
+// and the op requires DRAM TILE + cur_pos + program_config. A layout-preserving
+// bridge is the next device PA step.
+//
+// Host perf levers:
+//   * NEON FMA dots/axpy + Q hoist + specialized f32/bf16 loads
+//   * Short single-req sequences: gather pages → dense [seq,nkv,d] (capped) for
+//     sequential inner loops / GQA reuse
+//   * Prefill (T*H ≥ 64): small dedicated 4–16 thread pool (not 128-core global)
 //
 // Correctness: each (t,h) writes a disjoint out row with the same j-order and
 // max-subtracted softmax as the serial path → bit-identical to n_threads==1.
@@ -1162,24 +1163,68 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     return dt == DType::kBF16 ? BF16ToF32(base[i]) : F16ToF32(base[i]);
   };
 
-  // Work unit = (token, head). Decode has total_q==1 so token-only
-  // parallelism is a no-op; (t,h) is the useful axis. Prefill gets both.
-  //
-  // Do NOT kick the full hardware-concurrency pool for tiny nwork: on a
-  // 128-core box ParallelForRows barriers dominate short decode. Threshold
-  // keeps serial (still NEON-optimized) for smoke/decode and parallel for
-  // long prefill.
+  // Work unit = (token, head). Decode has total_q==1 so the head axis is the
+// useful one. Small dedicated pool (not the 128-thread global) for prefill
+// fan-out; decode (nwork=hq≈16) stays serial — ParallelForRows barriers still
+// lose to the NEON body at that size (measured).
   const int64_t nwork = total_q * hq;
+  auto& pa_pool = []() -> vt::cpu::Threadpool& {
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    const int n = std::clamp(hw > 0 ? hw / 8 : 8, 4, 16);
+    static vt::cpu::Threadpool pool(n);
+    return pool;
+  }();
+  // Prefill (T*H large) parallelizes; pure decode (T=1,H=16) stays serial.
   constexpr int64_t kPaParallelMinWork = 64;
+
+  // Single-request causal, full-window, no softcap: gather paged K/V into
+  // dense [seq, nkv, d] once so the inner j-loop is sequential (better for
+  // NEON + GQA reuse). Cap size — long-seq gather doubles traffic and loses
+  // (measured: seq=512 gather ~20ms vs paged walk ~7ms). Short decode/prefill
+  // stays under the cap and benefits.
+  constexpr int64_t kGatherMaxElems = 32 * 1024;  // floats per of K/V (~128 KiB)
+  std::vector<float> k_dense, v_dense;
+  int64_t gather_seq = 0;
+  if (num_reqs == 1 && args.causal && softcap <= 0.0f && window_left < 0 &&
+      window_right < 0 && total_q > 0) {
+    gather_seq = tok_slen[0];
+    const int64_t gather_elems = gather_seq * num_kv_heads * d;
+    if (gather_seq > 0 && gather_elems <= kGatherMaxElems) {
+      k_dense.resize(static_cast<size_t>(gather_elems));
+      v_dense.resize(static_cast<size_t>(gather_elems));
+      auto load_k_i = [&](int64_t i) -> float {
+        return k_f != nullptr ? k_f[i] : load_half(k_dt, k_h, i);
+      };
+      auto load_v_i = [&](int64_t i) -> float {
+        return v_f != nullptr ? v_f[i] : load_half(v_dt, v_h, i);
+      };
+      for (int64_t j = 0; j < gather_seq; ++j) {
+        const int64_t blk = btab[(j / block_size) * bt_col];
+        const int64_t off = j % block_size;
+        for (int64_t g = 0; g < num_kv_heads; ++g) {
+          const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
+          const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
+          const int64_t dst = (j * num_kv_heads + g) * d;
+          for (int64_t e = 0; e < d; ++e) {
+            k_dense[static_cast<size_t>(dst + e)] = load_k_i(kbase + e);
+            v_dense[static_cast<size_t>(dst + e)] = load_v_i(vbase + e);
+          }
+        }
+      }
+    }
+  }
+  const float* k_dense_p = k_dense.empty() ? nullptr : k_dense.data();
+  const float* v_dense_p = v_dense.empty() ? nullptr : v_dense.data();
 
   auto process_range = [&](int64_t w0, int64_t w1) {
     std::vector<float> probs;
     std::vector<float> acc(static_cast<size_t>(d));
     std::vector<float> qloc(static_cast<size_t>(d));
-    std::vector<float> kvloc;  // bf16/f16 K/V page staging
+    std::vector<float> kvloc;  // bf16/f16 K/V page staging (paged path)
     const bool k_is_f32 = k_f != nullptr;
     const bool v_is_f32 = v_f != nullptr;
-    if (!k_is_f32 || !v_is_f32) kvloc.resize(static_cast<size_t>(d));
+    if (k_dense_p == nullptr && (!k_is_f32 || !v_is_f32))
+      kvloc.resize(static_cast<size_t>(d));
 
     for (int64_t w = w0; w < w1; ++w) {
       const int64_t t = w / hq;
@@ -1205,16 +1250,21 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
       probs.assign(static_cast<size_t>(jmax - jmin + 1), 0.0f);
       float m = -std::numeric_limits<float>::infinity();
       for (int64_t j = jmin; j <= jmax; ++j) {
-        const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
-        const int64_t off = j % block_size;
-        const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
         float dot;
-        if (k_is_f32) {
-          dot = dot_f32(qloc.data(), k_f + kbase, d);
+        if (k_dense_p != nullptr) {
+          const int64_t kbase = (j * num_kv_heads + g) * d;
+          dot = dot_f32(qloc.data(), k_dense_p + kbase, d);
         } else {
-          for (int64_t e = 0; e < d; ++e)
-            kvloc[static_cast<size_t>(e)] = load_half(k_dt, k_h, kbase + e);
-          dot = dot_f32(qloc.data(), kvloc.data(), d);
+          const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
+          const int64_t off = j % block_size;
+          const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
+          if (k_is_f32) {
+            dot = dot_f32(qloc.data(), k_f + kbase, d);
+          } else {
+            for (int64_t e = 0; e < d; ++e)
+              kvloc[static_cast<size_t>(e)] = load_half(k_dt, k_h, kbase + e);
+            dot = dot_f32(qloc.data(), kvloc.data(), d);
+          }
         }
         dot *= scale;
         if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
@@ -1231,15 +1281,20 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
       std::fill(acc.begin(), acc.end(), 0.0f);
       for (int64_t j = jmin; j <= jmax; ++j) {
         const float pw = probs[static_cast<size_t>(j - jmin)] * inv;
-        const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
-        const int64_t off = j % block_size;
-        const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
-        if (v_is_f32) {
-          axpy_f32(acc.data(), v_f + vbase, pw, d);
+        if (v_dense_p != nullptr) {
+          const int64_t vbase = (j * num_kv_heads + g) * d;
+          axpy_f32(acc.data(), v_dense_p + vbase, pw, d);
         } else {
-          for (int64_t e = 0; e < d; ++e)
-            kvloc[static_cast<size_t>(e)] = load_half(v_dt, v_h, vbase + e);
-          axpy_f32(acc.data(), kvloc.data(), pw, d);
+          const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
+          const int64_t off = j % block_size;
+          const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
+          if (v_is_f32) {
+            axpy_f32(acc.data(), v_f + vbase, pw, d);
+          } else {
+            for (int64_t e = 0; e < d; ++e)
+              kvloc[static_cast<size_t>(e)] = load_half(v_dt, v_h, vbase + e);
+            axpy_f32(acc.data(), kvloc.data(), pw, d);
+          }
         }
       }
       if (o_f != nullptr) {
@@ -1250,8 +1305,8 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     }
   };
 
-  if (nwork >= kPaParallelMinWork && vt::cpu::CurrentThreadpool().NThreads() > 1) {
-    vt::cpu::ParallelForRows(vt::cpu::CurrentThreadpool(), nwork, process_range);
+  if (nwork >= kPaParallelMinWork && pa_pool.NThreads() > 1) {
+    vt::cpu::ParallelForRows(pa_pool, nwork, process_range);
   } else {
     process_range(0, nwork);
   }
