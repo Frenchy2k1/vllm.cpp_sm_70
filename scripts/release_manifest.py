@@ -75,20 +75,35 @@ CPU_TIER_POLICY = {
     },
     "aarch64": {
         "baseline": "portable-neon",
-        "tiers": ("portable-neon", "i8mm"),
+        "tiers": ("portable-neon", "dotprod", "i8mm"),
         "kernel_families": {
             "portable-neon": {"matmul-elem-f32-bf16-f16"},
+            "dotprod": {"quant-dot-q8_0-q8_0"},
             "i8mm": {
                 "quant-dot-q4_0-q8_0-q4_K-q6_K",
                 "quant-repack-q8_0",
             },
         },
-        "bits": {"portable-neon": {"neon"}, "i8mm": {"i8mm"}},
+        "bits": {
+            "portable-neon": {"neon"},
+            "dotprod": {"neon", "dotprod"},
+            "i8mm": {"neon", "dotprod", "i8mm"},
+        },
         "os_state": {
             "portable-neon": {"linux": set(), "macos": set()},
+            "dotprod": {
+                "linux": {"getauxval:AT_HWCAP:HWCAP_ASIMDDP"},
+                "macos": {"sysctl:hw.optional.arm.FEAT_DotProd"},
+            },
             "i8mm": {
-                "linux": {"getauxval:AT_HWCAP2:HWCAP2_I8MM"},
-                "macos": {"sysctl:hw.optional.arm.FEAT_I8MM"},
+                "linux": {
+                    "getauxval:AT_HWCAP:HWCAP_ASIMDDP",
+                    "getauxval:AT_HWCAP2:HWCAP2_I8MM",
+                },
+                "macos": {
+                    "sysctl:hw.optional.arm.FEAT_DotProd",
+                    "sysctl:hw.optional.arm.FEAT_I8MM",
+                },
             },
         },
     },

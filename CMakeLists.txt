@@ -920,6 +920,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
+  src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
@@ -975,16 +976,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  # The portable Q8 DotProd C++ tier is valid on Linux and Darwin. Compile only
+  # its TU with DotProd enabled; runtime entry is gated by Linux HWCAP or Darwin
+  # sysctl. The separately scheduled A76 assembly remains Linux-only below.
+  set_source_files_properties(
+    src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
+    COMPILE_DEFINITIONS VT_CPU_ARM_Q8_DOT=1
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
   # KERNEL-CPU-A76-Q8-DOT is Linux-only because its dispatch uses HWCAP/MIDR
   # and the hand-written file carries ELF assembler directives. Other arm64
   # platforms compile the generic stub and retain their existing portable tier.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(ASM)
     target_sources(vllm PRIVATE src/vt/cpu/cpu_quant_dot_a76.S)
-    set_source_files_properties(
-      src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
-      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1
-      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
+    set_property(SOURCE src/vt/cpu/cpu_quant_dot_sdot.cpp APPEND PROPERTY
+      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1)
   endif()
   # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this

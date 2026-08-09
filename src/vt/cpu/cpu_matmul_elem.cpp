@@ -2,6 +2,7 @@
 // anchors and the recorded "vectorize across OUTPUT columns, not along K"
 // deviation that keeps every result bit-identical to the scalar reference.
 #include "cpu_matmul_elem.h"
+#include "vt/cpu/cpu_isa_arm.h"
 #include "vt/cpu/cpu_isa_x86.h"
 #include "vt/quant.h"
 #include <vector>
@@ -564,6 +565,18 @@ ElemGemmTierTable BuildTier() {
     return t;
   }
 #if defined(__aarch64__)
+  const ArmIsaCaps caps = DetectArmIsaCaps();
+  const std::string arm_forced =
+      forced.empty()
+          ? (ArmIsaTierSupported(caps, ArmIsaTier::kNeon) ? "neon" : "portable")
+          : forced;
+  ArmIsaTier selected{};
+  std::string selection_error;
+  VT_CHECK(SelectArmIsaTier(caps, arm_forced, &selected, &selection_error),
+           selection_error);
+  VT_CHECK(selected == ArmIsaTier::kPortable || selected == ArmIsaTier::kNeon,
+           "VT_CPU_MATMUL_TIER on Arm must be portable or neon");
+  if (selected == ArmIsaTier::kPortable) return t;
   t.bt[kF32] = &Bt16Neon<ElemKind::kF32>;
   t.bt[kF16] = &Bt16Neon<ElemKind::kF16>;
   t.bt[kBF16] = &Bt16Neon<ElemKind::kBF16>;

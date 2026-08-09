@@ -492,6 +492,72 @@ jobs:
             echo "Running test_ops_matmul_elem with VT_CPU_MATMUL_TIER=${tier}"
             VT_CPU_MATMUL_TIER="${tier}" build/tests/test_ops_matmul_elem
           done
+  build-test-cpu-arm64:
+    # Independent Arm execution evidence: the x86 lane cannot prove HWCAP
+    # dispatch, Arm instructions, or the host ABI. The native runner exercises
+    # every available rich tier; qemu's Cortex-A53 model supplies the required
+    # feature-poor execution and illegal-tier refusal gate.
+    concurrency:
+      group: ci-build-test-cpu-arm64-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure focused Arm CPU gate
+        run: |
+          cmake -S . -B build-arm \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF \
+            -DVLLM_CPP_CUDA=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Build Arm ISA and kernel gates
+        run: |
+          cmake --build build-arm \
+            --target test_cpu_isa_arm test_ops_matmul_elem \
+                     test_ops_quant_dot test_ops_quant_repack \
+            -j 2
+      - name: Arm ISA objects use only their declared feature flags
+        run: |
+          python3 scripts/check-arm-isa-build.py \
+            --compile-commands build-arm/compile_commands.json
+      - name: Force baseline and every rich tier available on the native runner
+        run: |
+          build-arm/tests/test_cpu_isa_arm
+          VT_CPU_MATMUL_TIER=portable build-arm/tests/test_ops_matmul_elem
+          VT_CPU_MATMUL_TIER=neon build-arm/tests/test_ops_matmul_elem
+          VT_CPU_Q8_DOT=portable \
+            VT_CPU_QUANT_MMLA=portable \
+            build-arm/tests/test_ops_quant_dot
+          VT_CPU_QUANT_REPACK=portable build-arm/tests/test_ops_quant_repack
+          if grep -qiw asimddp /proc/cpuinfo; then
+            VT_CPU_Q8_DOT=sdot build-arm/tests/test_ops_quant_dot
+          fi
+          if grep -qiw asimddp /proc/cpuinfo && grep -qiw i8mm /proc/cpuinfo; then
+            VT_CPU_QUANT_MMLA=i8mm build-arm/tests/test_ops_quant_dot
+            VT_CPU_QUANT_REPACK=i8mm build-arm/tests/test_ops_quant_repack
+          fi
+      - name: Feature-poor Cortex-A53 executes baseline and refuses rich tiers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-user
+          qemu-aarch64 -cpu cortex-a53 build-arm/tests/test_cpu_isa_arm
+          VT_CPU_MATMUL_TIER=portable \
+            qemu-aarch64 -cpu cortex-a53 build-arm/tests/test_ops_matmul_elem
+          VT_CPU_MATMUL_TIER=neon \
+            qemu-aarch64 -cpu cortex-a53 build-arm/tests/test_ops_matmul_elem
+          VT_CPU_Q8_DOT=portable VT_CPU_QUANT_MMLA=portable \
+            qemu-aarch64 -cpu cortex-a53 build-arm/tests/test_ops_quant_dot
+          if VT_CPU_Q8_DOT=sdot \
+               qemu-aarch64 -cpu cortex-a53 build-arm/tests/test_ops_quant_dot; then
+            echo "Cortex-A53 unexpectedly accepted the DotProd tier" >&2
+            exit 1
+          fi
+          if VT_CPU_QUANT_MMLA=i8mm \
+               qemu-aarch64 -cpu cortex-a53 build-arm/tests/test_ops_quant_dot; then
+            echo "Cortex-A53 unexpectedly accepted the i8mm tier" >&2
+            exit 1
+          fi
   sanitize-cpu:
     # The DYNAMIC detector lanes (VLLM_CPP_SANITIZE, see CMakeLists.txt). The
     # plain build-test-cpu job above proves the suite PASSES; it cannot see a
