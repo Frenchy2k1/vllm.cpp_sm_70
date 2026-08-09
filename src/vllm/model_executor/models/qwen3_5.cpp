@@ -35,6 +35,7 @@
 #include <optional>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // dense_nvfp4::MarlinDenseEnabled
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
 #ifdef VT_BENCH_PROFILE_CONTROL
@@ -2362,10 +2363,36 @@ DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   MarlinDenseResident& mr = MarlinDenseResidentFor(&w);
   if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);
   d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+
+  // VT_MARLIN_DENSE (default ON): the framework-wide dense NVFP4 route this TU
+  // was forked off. E=1 dense projections go through vLLM's OWN dense marlin
+  // GEMM instead of the single-expert MoE-marlin route. Same resident
+  // (mr.w/mr.s/mr.g) and workspace; rank-2 operand views (the dense launcher
+  // wants [K/16, N*2] / [K/gs, N], not the MoE rank-3 [1, ...]) and direct-A,
+  // so no moe_align cache. Mirrors dense_nvfp4_gemm.h's MatmulNvfp4MarlinD,
+  // which qwen3 / olmo2 / deepseek_v2 / minimax_h3 already take.
+  if (dense_nvfp4::MarlinDenseEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    DBuf outd(d, DType::kBF16, {M, N});
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / 16, N});
+    Tensor ggd = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+    Tensor wstd = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(N),
+                              static_cast<int>(K)};
+    dargs.group_size = 16;
+    dargs.mxfp4 = false;
+    vt::MarlinDenseGemm(d.q, outd.t(), x, wqd, scd, ggd, wstd, dargs);
+    if (out_dtype == DType::kBF16) return outd;
+    DBuf outf(d, DType::kF32, {M, N});
+    vt::CastF32(d.q, outf.t(), outd.t());
+    return outf;
+  }
+
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
 
   // Marlin's output is bf16 (c_type=kBFloat16); an f32 result is the bf16 output
   // upcast (same value it rounds to — mirror of the cutlass f32-scratch cast).
@@ -3727,6 +3754,11 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
           MergedGdnBaEnabled(d),
           indt == DType::kBF16 && outdt == DType::kBF16 &&
               MergedGdnBaOutputDType(true) == DType::kBF16 &&
+              // An FP8 GDN tower feeds fp8 projections that vt::GdnPackedDecode
+              // rejects ("mixed_qkv/a/b/out must share FP16/BF16/F32 dtype").
+              // The unpacked decode -- what the 35B fp8 path already runs --
+              // handles them, so an fp8 tower is NOT packed-decode eligible.
+              w.in_proj_qkv_fp8.Empty() && w.in_proj_z_fp8.Empty() &&
               (state.ssm_state.dtype == DType::kF32 ||
                state.ssm_state.dtype == DType::kF16 ||
                state.ssm_state.dtype == DType::kBF16),

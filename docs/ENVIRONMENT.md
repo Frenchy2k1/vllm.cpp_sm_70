@@ -89,6 +89,7 @@ portable/reference path. In normal operation leave them unset.
 | `VT_GDN_PACKED_DECODE` | on (CUDA GDN) | Unpacked GDN decode path |
 | `VT_CONV_REG` | on (CUDA GDN) | The non-register-tiled short causal convolution |
 | `VT_CONV_EXACT_CHUNKS` | on (CUDA GDN prefill) | Use `=0` for the legacy sequence-serial causal-conv mapping; default mirrors vLLM's exact `(sequence, 8-token chunk)` descriptor and is byte-identical |
+| `VT_MODELOPT_W4A4` | `0` (Qwen3.6 dense ModelOpt NVFP4) | ModelOpt NVFP4 checkpoints ship a per-tensor `input_scale` next to every projection. Consuming it sets `Nvfp4Weight::alpha`, which flips `IsTrueW4A4()` and routes the weight to the fp4-ACTIVATION GEMM; on `nvidia/Qwen3.6-27B-NVFP4` that produced incoherent text, so the default leaves `alpha` at 0 and takes the W4A16 weight-only dispatcher (verified coherent). Set `1` to consume `input_scale` and take the W4A4 path |
 | `VT_FA2_PREFILL` | on (CUDA) | The portable prefill attention instead of the vendored FA2 |
 | `VT_FA2_DECODE` | on (CUDA) | The portable decode attention instead of the vendored FA2 |
 | `VT_FA2_DECODE_4B` | on (CUDA, Qwen3.5-4B) | The portable paged decode attention instead of the ratio-4 vendored FA2 path; the 27B and 35B selectors are unchanged |
