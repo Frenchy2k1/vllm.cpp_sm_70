@@ -443,6 +443,24 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
   // the decoded audio, and because the muxer passes `-shortest` that silently
   // truncated the VIDEO to half its frames too: a 124-frame render muxed 61.
   const int64_t audio_steps = request.audio_t;
+  // DIAGNOSTIC (env-gated): the audio rows as the DiT EMITS them, before
+  // denormalize. §8.17 measured the POST-denormalize latent at per-channel std
+  // 1.0774 where the config's `latents_std` implies 1.8983 -- ~57% -- with the
+  // MEAN landing correctly. Since denormalize is `value * std + mean`, that is
+  // either a DiT whose normalized audio output is already under-dispersed, or a
+  // denormalize that is not applying `std`. Those two have the SAME post-hoc
+  // signature and only this dump separates them: if these rows are already
+  // std ~0.57 the DiT (or the audio sigma schedule) owns it; if they are unit
+  // and the shortfall appears after, the denormalize path does.
+  if (const char* dump_dir = std::getenv("VT_H3_DUMP_DIR")) {
+    const std::string ppath = std::string(dump_dir) + "/dit_audio_rows_prenorm.f32";
+    if (std::FILE* pf = std::fopen(ppath.c_str(), "wb")) {
+      std::fwrite(audio_latent.data(), sizeof(float), audio_latent.size(), pf);
+      std::fclose(pf);
+      std::fprintf(stderr, "[h3-dump] wrote %s (%zu floats, PRE-denormalize)\n", ppath.c_str(),
+                   audio_latent.size());
+    }
+  }
   denormalize(audio_latent, dit_params.audio_latents_dim, audio_steps * request.audio_channel,
               request.audio_latents_mean, request.audio_latents_std);
 

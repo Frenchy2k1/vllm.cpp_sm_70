@@ -1248,3 +1248,51 @@ grid) and an audio-side scale in the DiT head. A dump of the DiT's NORMALIZED au
 before denormalize would separate them in one render. (2) The 512x512 canvas is the right
 bed for this: the artifact is resolution-INDEPENDENT and the loop is 15.4 s/step against
 176 s at the REF canvas.
+
+## 8.18 The audio defect LOCALIZED — denormalize CLEARED, the DiT audio arm REGRESSES TO THE CORPUS MEAN (2026-08-08, `row/H3-AUDIO-PREDENORM-DUMP`)
+
+§8.17 left two candidates for the audio latent being out of distribution: a DiT whose
+normalized audio output is wrong, or a `denormalize` not applying `latents_std`. Both have
+the same post-hoc signature. `VT_H3_DUMP_DIR` now also writes
+`dit_audio_rows_prenorm.f32` — the audio rows as the DiT EMITS them — which separates them
+in one render.
+
+**`denormalize` is CLEARED.** Pre-denormalize std_avg **0.5684**, post **1.0774**; the
+per-channel post/pre ratio is **1.8983** (min 1.492, max 3.299) — bit for bit the config's
+per-channel `latents_std`. The transform does exactly what it says.
+
+**The defect is the per-channel MEAN, not the variance.** Calibrated against three real
+speech encodes rather than one (jfk is a 1961 narrowband recording and a poor variance
+anchor):
+
+| Latent (RAW VAE space) | per-channel std | per-channel \|mean\| |
+|---|---|---|
+| jfk (real) | 0.7736 | **0.4388** |
+| speech (real) | 0.8801 | **0.4787** |
+| test_speech (real) | 0.9337 | **0.5008** |
+| ENCODE(our generated audio) | 0.9694 | 0.3028 |
+| **OURS (DiT)** | 1.0774 | **0.2406** |
+| config `latents_mean` (corpus) | — | 0.1940 |
+
+Variance is only modestly high (1.08 against 0.77-0.93). What separates ours from every
+real clip is the per-channel MEAN: real clips sit at **0.44-0.50**, ours at **0.24** —
+essentially the CORPUS mean (0.194). Real clips deviate strongly from the corpus average
+because those per-channel offsets carry speaker and content identity; ours does not
+deviate. The audio arm REGRESSES TO THE MEAN, which is what a generic, synthetic-sounding
+voice is, and it accounts directly for the §8.17 random-pair gap (real 0.4285 vs ours
+0.0855) since that shared component IS the per-channel mean.
+
+**Cleared along the way, by measurement:** the audio VAE decoder (a real-speech latent
+round-trips to WORD-IDENTICAL ASR, §8.17), `denormalize` (ratio == `latents_std` exactly),
+the sigma schedule (`MiniMaxH3TimeShiftSigmas` is `linspace(1,0,n)` then
+`s*b/(1+(s-1)*b)`, terminating exactly at 0 — algebraically the same curve ComfyUI reaches
+by inverting the video shift and re-applying the audio shift, `model.py:36-39`), the
+latent-rate seam, and the BigVGAN anti-aliasing.
+
+**Residual — the actual root cause is STILL OPEN.** What remains is why the DiT's audio
+stream produces mean-regressed output while the VIDEO stream on the same sampler, the same
+joint sequence and the same 50 steps is coherent at 0.8924 (§8.16). The next probe is the
+audio arm's per-step trajectory: dump the audio rows at several steps and see whether the
+per-channel mean structure is never built (a conditioning/guidance defect) or is built and
+then washed out (a sampler defect). Nothing about the audio path should be "fixed" before
+that reads, and no fix is attempted in this row.
