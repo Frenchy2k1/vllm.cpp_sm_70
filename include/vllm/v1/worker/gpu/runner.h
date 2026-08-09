@@ -54,6 +54,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -69,6 +70,7 @@
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d hidden tap + draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft + aux taps
+#include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft + Markov head
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -297,6 +299,20 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Idempotent; null weights leaves the runner on the MTP/non-spec path.
   void set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
                         const vllm::HfConfig* config, int k);
+
+  // SPEC-DSPARK W5: wire the separately-loaded DSpark draft into the SAME
+  // verify/propose loop. DSpark inherits DFlash's context accumulation and block
+  // forward unchanged (Qwen3DSparkModel(DFlashQwen3Model)); it differs only in
+  // the query-block layout (N rows with the anchor itself predicting, or the
+  // DFlash 1+N fill-in when `sample_from_anchor` is false) and in sampling
+  // (sequential Markov instead of one parallel argmax). Wiring it therefore
+  // routes through the same aux-tap capture and the same device KV store —
+  // set_dflash_draft is called internally with `&weights->backbone`, so
+  // use_dflash() stays the predicate for the shared machinery and use_dspark()
+  // only switches the propose tail. Idempotent; null leaves the runner alone.
+  void set_dspark_draft(const vllm::Qwen3DSparkWeights* weights,
+                        const vllm::HfConfig* config, int k,
+                        bool sample_from_anchor);
 
  private:
   // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed
@@ -565,6 +581,24 @@ class GPUModelRunner final : public ModelRunnerBase {
   // and stashes the k drafts/request. Only reachable when use_dflash().
   void propose_drafts_dflash(const std::vector<int32_t>& num_sampled,
                              const std::vector<int32_t>& num_rejected);
+  // The shared block-propose body of the DFlash and DSpark branches. Everything
+  // through the context accumulation and the block forward is IDENTICAL for the
+  // two (DSpark inherits it upstream); the two differ only in `num_query_per_req`
+  // / `first_sample_offset` (the anchor-as-first-prediction layout) and in how the
+  // resulting block logits become draft ids, which `sample` supplies. `anchors`
+  // receives each proposing row's anchor token in the target vocab (DFlash
+  // ignores it; DSpark seeds its sequential chain with it).
+  void propose_drafts_block(
+      const std::vector<int32_t>& num_rejected, const vllm::Qwen3DFlashWeights& backbone,
+      const vllm::HfConfig& config, int num_query_per_req,
+      const std::function<std::vector<std::vector<int32_t>>(
+          const std::vector<float>& block_logits, int num_propose_rows,
+          const std::vector<int32_t>& anchors)>& sample);
+  // SPEC-DSPARK W5: the DSpark branch of propose_drafts — the shared body above
+  // with the anchor-aware layout and the sequential Markov sampler
+  // (SampleDsparkBlockDrafts). Only reachable when use_dspark().
+  void propose_drafts_dspark(const std::vector<int32_t>& num_sampled,
+                             const std::vector<int32_t>& num_rejected);
   // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE branch of propose_drafts. Runs the
   // host-side n-gram matcher (v1/spec_decode/ngram_proposer) over each generating
   // request's own committed context (input_batch_.token_ids_cpu[i,
@@ -597,6 +631,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   int dflash_k_ = 0;
   std::vector<int32_t> dflash_tap_layer_ids_;
   bool use_dflash() const { return dflash_weights_ != nullptr; }
+  // ── SPEC-DSPARK W5 ──────────────────────────────────────────────────────────
+  // The separately-loaded DSpark draft (borrow owned by LoadedEngine; null unless
+  // method=="dspark"). When set, dflash_weights_ points at `&dspark_weights_->
+  // backbone`, so every piece of shared machinery — the aux multi-tap capture,
+  // the per-request device KV store, the context-aware block forward — runs
+  // UNCHANGED, and use_dspark() only redirects the propose tail to the sequential
+  // Markov sampler and the anchor-aware block layout.
+  const vllm::Qwen3DSparkWeights* dspark_weights_ = nullptr;
+  bool dspark_sample_from_anchor_ = true;
+  bool use_dspark() const { return dspark_weights_ != nullptr; }
   // Per-request PERSISTENT context KV store (D9 persistent paged draft-KV — the
   // perf form of vLLM's incrementally-written draft KV cache). dflash_kv_store_[i]
   // holds request i's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
