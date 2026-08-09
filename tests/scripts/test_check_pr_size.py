@@ -160,6 +160,98 @@ class PathClassification(unittest.TestCase):
         )
 
 
+class RetiredSurfaces(unittest.TestCase):
+    """Deleted paths keep a class on purpose; the table says so in one place.
+
+    `classify_path` fails closed, and a deleted file still appears in the diff of
+    the commit that removes it, so a retired surface with no class reds the very
+    change that retires it. The retention was previously spread across three
+    live groups and two module-level regexes with the reason written in only one
+    of them, and was read as abandoned scaffolding.
+    """
+
+    LIVE_GROUPS = (
+        "POLICY_FILES",
+        "APPEND_ONLY_FILES",
+        "PROJECT_RECORD_FILES",
+        "PROCEDURE_FILES",
+        "GOVERNANCE_SUPPORT_FILES",
+        "PRODUCT_CHECKER_FILES",
+        "PUBLIC_DOCUMENT_FILES",
+        "GENERATED_FILES",
+    )
+
+    def test_retired_paths_keep_the_class_they_had_while_live(self) -> None:
+        """The budget a historical diff spends must not move under this table."""
+        patterns = {
+            ".agents/state-index/2026-08-001.csv": "append_only_record",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
+        }
+        exact = {
+            ".agents/policy.csv": "policy",
+            ".agents/policy-cutover": "policy",
+            ".agents/state.md": "project_record",
+            ".agents/state.csv": "project_record",
+            ".agents/ai-coding-assistants.md": "procedure",
+            ".agents/benchmark-protocol.md": "procedure",
+            ".agents/directives.md": "procedure",
+            ".agents/discipline.md": "procedure",
+            ".agents/gates.md": "procedure",
+            ".agents/test-porting.md": "procedure",
+        }
+        for path, path_class in {**exact, **patterns}.items():
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), path_class)
+        self.assertEqual(dict(checker.RETIRED_PATHS), exact)
+
+    def test_every_retired_path_is_really_gone_from_the_tree(self) -> None:
+        """A live path parked here would take the retired budget and no review.
+
+        If one is ever re-added it must move back to a live group, so this fails
+        rather than letting the table quietly govern a live surface.
+        """
+        tracked = set(
+            subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).splitlines()
+        )
+        self.assertEqual(sorted(set(checker.RETIRED_PATHS) & tracked), [])
+        still_here = [
+            path
+            for path in tracked
+            for pattern, _ in checker.RETIRED_PATTERNS
+            if pattern.fullmatch(path)
+        ]
+        self.assertEqual(still_here, [])
+
+    def test_the_live_archive_does_not_classify_as_retired(self) -> None:
+        """`.agents/completed/state-events/` was MOVED, not deleted: 160 files."""
+        archived = ".agents/completed/state-events/2026-08/STATE-20260808T120000-001.md"
+        self.assertIsNone(checker.retired_class(archived))
+        self.assertEqual(checker.classify_path(archived), "procedure")
+        self.assertEqual(
+            checker.classify_path(".agents/completed/state-migration-manifest.csv"),
+            "evidence",
+        )
+
+    def test_retired_and_live_groups_are_disjoint(self) -> None:
+        """One home per path: the split that made this look like dead scaffolding."""
+        retired = set(checker.RETIRED_PATHS)
+        for name in self.LIVE_GROUPS:
+            with self.subTest(group=name):
+                self.assertEqual(sorted(retired & set(getattr(checker, name))), [])
+
+    def test_a_surface_that_never_EXISTED_fails_closed(self) -> None:
+        """`.agents/governance-tasks.csv` was never added and never deleted.
+
+        It sat in POLICY_FILES as a speculative entry, so a file by that name
+        could have arrived and spent the policy budget without anyone choosing
+        its class. Retirement is for paths git actually removed; this one is
+        simply unknown, and unknown fails closed.
+        """
+        with self.assertRaises(ValueError):
+            checker.classify_path(".agents/governance-tasks.csv")
+        self.assertNotIn(".agents/governance-tasks.csv", checker.RETIRED_PATHS)
+
+
 class BudgetEnforcement(unittest.TestCase):
     def change(self, path: str, lines: int) -> checker.ChangedPath:
         return checker.ChangedPath(path, lines, 0)
