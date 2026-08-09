@@ -183,7 +183,7 @@ the registered engine forward.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| DSpark (semi-autoregressive block drafter) | ☐ **in progress, not yet runnable** ([spec](../.agents/specs/dspark-spec-decode.md)): config, Markov logit-bias head, and both checkpoint layouts landed; the sequential sampler and the runner are next | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ☐ **wired end to end, UNGATED** ([spec](../.agents/specs/dspark-spec-decode.md)): config, Markov head, both checkpoint layouts, sequential sampler and runner landed; no oracle correctness or speed number claimed yet | ✅ | ◐ |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling

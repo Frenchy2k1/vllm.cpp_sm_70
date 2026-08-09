@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include <unordered_map>
+
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_dspark.h"
 #include "vt/dtype.h"
@@ -108,6 +110,27 @@ Qwen3DSparkWeights LoadQwen3DSpark(const TensorResolver& get, const HfConfig& co
              "qwen3_dspark: a reduced draft vocab needs the d2t remap table");
   }
   return w;
+}
+
+Qwen3DSparkWeights LoadQwen3DSpark(const std::vector<SafetensorsFile>& shards,
+                                   const HfConfig& config, int64_t num_taps,
+                                   int32_t mask_token_id) {
+  // The same bare-then-"model."-prefixed resolver the DFlash shards overload
+  // builds (qwen3_dflash_weights.cpp:191-210).
+  std::unordered_map<std::string, const SafetensorsFile*> where;
+  for (const SafetensorsFile& shard : shards)
+    for (const std::string& name : shard.Names()) where[name] = &shard;
+  const TensorResolver get = [&where](const std::string& name) -> const StTensor& {
+    auto it = where.find(name);
+    std::string key = name;
+    if (it == where.end()) {
+      key = "model." + name;
+      it = where.find(key);
+    }
+    VT_CHECK(it != where.end(), "qwen3_dspark: tensor not found: " + name);
+    return it->second->Get(key);
+  };
+  return LoadQwen3DSpark(get, config, num_taps, mask_token_id);
 }
 
 }  // namespace vllm

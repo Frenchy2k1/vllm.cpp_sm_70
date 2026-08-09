@@ -22,7 +22,8 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
-#include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft bundle
+#include "vllm/model_executor/models/qwen3_dflash.h"
+#include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft bundle
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -48,7 +49,15 @@ namespace vllm::entrypoints {
 // draft config + k) and the LoadedEngine hands a borrow to the runner. Owned by
 // LoadedEngine, declared before runner_ so the borrow outlives it.
 struct DflashDraft {
+  // The plain DFlash draft. EMPTY when `dspark` is set: a DSpark draft owns its
+  // backbone inside Qwen3DSparkWeights, so there is exactly one copy either way.
   vllm::Qwen3DFlashWeights weights;
+  // SPEC-DSPARK W5: set only for method=="dspark". DSpark IS a DFlash draft plus
+  // a Markov head (Qwen3DSparkModel(DFlashQwen3Model)), so it rides the same
+  // struct, the same loader seam and the same runner wiring; the two extra fields
+  // are the head itself and the query-block layout the checkpoint selects.
+  std::unique_ptr<vllm::Qwen3DSparkWeights> dspark;
+  bool sample_from_anchor = false;
   vllm::HfConfig config;
   int k = 0;
 };

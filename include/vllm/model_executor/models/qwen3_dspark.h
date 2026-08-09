@@ -101,6 +101,9 @@ struct Qwen3DSparkWeights {
 // (load_dspark_model :56-73), and the caller supplies them.
 Qwen3DSparkWeights LoadQwen3DSpark(const TensorResolver& get, const HfConfig& config,
                                    int64_t num_taps, int32_t mask_token_id);
+Qwen3DSparkWeights LoadQwen3DSpark(const std::vector<SafetensorsFile>& shards,
+                                   const HfConfig& config, int64_t num_taps,
+                                   int32_t mask_token_id);
 
 class Qwen3DSparkModel {
  public:

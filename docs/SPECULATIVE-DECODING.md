@@ -22,6 +22,30 @@ same JSON object vLLM takes, so a config written for vLLM works here.
 - **Speed:** measured about 1.04x faster than vLLM's own speculative-on decode at
   concurrency 1 (see [Measured result](#measured-result)).
 
+## DSpark (semi-autoregressive block drafting) — in progress
+
+DSpark drafts a whole block in one parallel pass and then adds intra-block
+dependency with a small sequential head, so a block draft stops being k
+conditionally independent guesses. It is the DFlash drafter plus a low-rank
+Markov transition bias.
+
+Current state (`SPEC-DSPARK`): the config, the Markov head and draft model, both
+published checkpoint layouts (native `deepseek-ai/dspark_qwen3_*` and
+Speculators `RedHatAI/*.dspark`), the sequential sampler and the runner wiring
+have landed. **No correctness or speed number is claimed yet** — the engine has
+not been gated against the pinned vLLM oracle running the same draft, and until
+it is, treat DSpark as unproven. A GGUF target is refused by name.
+
+```bash
+main --model /models/Qwen3-4B \
+  --speculative-config '{"method":"dspark","model":"deepseek-ai/dspark_qwen3_4b_block7","num_speculative_tokens":7}'
+```
+
+`num_speculative_tokens` is required for a DSpark draft (a native DSpark config
+carries no `n_predict`), and it must be at least the checkpoint's block size —
+a smaller value produces incorrect output rather than merely lower acceptance,
+so it is rejected.
+
 ## The flag
 
 On the OpenAI server:
