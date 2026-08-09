@@ -1,7 +1,7 @@
 # Tenstorrent (Blackhole) backend — spike spec (DRAFT, external proposal)
 
-Status: **DRAFT, W1.2 LANDED 2026-08-09 (W0 skeleton + linear/eltwise +
-kEmbedding + kLayerNorm).** Filed through the claim protocol
+Status: **DRAFT, W1.3 LANDED 2026-08-09 (W0 + linear/eltwise + embed +
+layernorm + kQkvSplit).** Filed through the claim protocol
 (`CLAIM-BACKEND-TENSTORRENT-SPIKE`, draft PR mudler/vllm.cpp#197) but not
 through the full `scripts/agent-start.py`/role-interview boot sequence —
 role was claimed directly per the developer's explicit direction. Treat it as
@@ -20,8 +20,9 @@ platforms" class, same as Metal/Vulkan): `DeviceType::kTENSTORRENT` as a thin
 `vt::Backend` adapter over **ttnn** — Tenstorrent's own C++ tensor-op library
 — rather than hand-written Tensix kernels, mirroring the Metal/MLX decision
 (E1 in `backends.md`) over the hand-written-kernel alternative (E2). Landed
-so far: the `DeviceType` + `Platform` + `Backend` seams, and SIX ops
-(`kMatmul`, `kMatmulBT`, `kAdd`, `kRelu`, `kEmbedding`, `kLayerNorm`). Target:
+so far: the `DeviceType` + `Platform` + `Backend` seams, and SEVEN ops
+(`kMatmul`, `kMatmulBT`, `kAdd`, `kRelu`, `kEmbedding`, `kLayerNorm`,
+`kQkvSplit`). Target:
 OPT-125m end to end — vllm.cpp's own established minimal-model bring-up
 target (both the CPU and Metal W0 milestones used it), confirmed by grepping
 `src/vllm/model_executor/models/opt.cpp` for its exact `vt::` call set:
@@ -30,8 +31,8 @@ QkvSplit, Relu, ReshapeAndCache` — 9 distinct ops (`GetBackend` is not an
 op). OPT uses learned position embeddings (no RoPE), standard multi-head
 attention, LayerNorm (not RmsNorm), and ReLU (not SiLU), which is why this
 row's op list differs from an earlier draft of this spec that assumed a
-Llama-style decoder. 3 of the 9 remain: `kQkvSplit`, `kReshapeAndCache`,
-`kPagedAttention` — the attention/KV-cache slice.
+Llama-style decoder. 2 of the 9 remain: `kReshapeAndCache`, `kPagedAttention` — the KV-cache /
+attention slice.
 
 **Out.** MoE, quantized kernels (the CUDA/Vulkan-side marlin/nvfp4
 equivalents), graph capture, and any model actually running — all
@@ -137,7 +138,7 @@ is a distinct, larger risk here than on CUDA.
 | `kRelu` (landed) | `ttnn::relu(x)` — `DECLARE_UNARY_OP(relu)` in `ttnn/cpp/ttnn/operations/eltwise/unary/unary.hpp` |
 | `kEmbedding` (landed) | `ttnn::embedding(ids, table, /*pad=*/nullopt, /*layout=*/ROW_MAJOR)` — parameter order is `(ids, table)`, reversed from `vt::EmbeddingFn`'s `(table, ids)`; ids uploaded ROW_MAJOR UINT32 (host i32/i64 converted); table uploaded ROW_MAJOR BFLOAT16 (ttnn requires RM weights, not TILE) |
 | `kLayerNorm` (landed) | `ttnn::layer_norm(x, eps, weight, bias)` — weight/bias optional rank-1; uploaded TILE BFLOAT16 as logical `[1,D]` (ttnn TILE-gamma path); eps from `LayerNormArgs` (OPT 1e-5) |
-| `kQkvSplit` (proposed) | No ttnn op found at a glance; likely three `ttnn::slice` calls on the projected QKV tensor's last dim, matching `vt::QkvSplitFn`'s contract. Needs a hands-on pass |
+| `kQkvSplit` (landed) | Host-staged pure column split (bit-exact memcpy). Device round-trip not useful while Alloc is host memory; `ttnn::slice` deferred to device-resident redesign |
 | `kReshapeAndCache` (proposed) | `experimental/paged_cache/` — writing K/V into the block-table KV cache |
 | `kPagedAttention` (proposed) | `transformer/sdpa_decode/` + `experimental/paged_cache/` — the one that de-risks the whole follow-on plan: vLLM's block-table attention has a direct, already-implemented home in ttnn, not a from-scratch design problem |
 | MoE routing (out of scope, later row) | `reduction/moe`, `data_movement/moe_expert_token_remap`, `data_movement/moe_routing_remap` |
@@ -155,14 +156,12 @@ present, so a Tenstorrent-enabled CI build with no card stays green.
 
 ## Gates
 
-**Passing today:** `tests/vt/test_tenstorrent_backend.cpp` (8/8 cases,
-23/23 assertions) on real Blackhole hardware — `kMatmul`, `kMatmulBT`,
-`kAdd` (elementwise and bias-broadcast), `kRelu`, `kEmbedding`, `kLayerNorm`
-(affine and plain) each vs a host F32 reference.
+**Passing today:** `tests/vt/test_tenstorrent_backend.cpp` (9/9 cases)
+on real Blackhole hardware — previous ops plus `kQkvSplit` bit-exact.
 
 **Not yet gated, and explicitly not claimed:**
-- No e2e model run — 3 of OPT-125m's 9 ops are still unregistered
-  (`kQkvSplit`, `kReshapeAndCache`, `kPagedAttention`).
+- No e2e model run — 2 of OPT-125m's 9 ops are still unregistered
+  (`kReshapeAndCache`, `kPagedAttention`).
 - No performance claim of any kind — the host-round-trip-per-call design
   (§ Risks/decisions) was never intended to be fast; `docs/BENCHMARKS.md`'s
   row for this backend says so explicitly ("NOT APPLICABLE: no number
@@ -198,11 +197,11 @@ landed next (2026-08-09). Remaining, toward running OPT-125m end to end:
    table; `(ids, table)` ttnn order vs `vt`'s `(table, ids)`.
 2. `kLayerNorm` — **landed.** `ttnn::layer_norm` with optional affine;
    TILE BFLOAT16 weight/bias as `[1,D]`.
-3. `kQkvSplit` — no confirmed ttnn op yet; likely `ttnn::slice` x3.
+3. `kQkvSplit` — **landed** host-staged bit-exact column split.
 4. `kReshapeAndCache` + `kPagedAttention` — the two together, since
    decode-time attention needs both; the hardest step, real KV-cache paging
    semantics.
-5. Only once 3-4 land: revisit the host-round-trip design (§
+5. Only once 4 lands: revisit the host-round-trip design (§
    Risks/decisions) for a device-resident-tensor performance pass.
 
 Each step is independently claimable and gateable — none blocks another

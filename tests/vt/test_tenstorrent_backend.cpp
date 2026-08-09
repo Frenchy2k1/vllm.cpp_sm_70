@@ -416,3 +416,60 @@ TEST_CASE("kTENSTORRENT kLayerNorm matches a host F32 reference (affine + plain)
   SUBCASE("elementwise_affine=True (weight + bias)") { run_case(true); }
   SUBCASE("elementwise_affine=False (no weight/bias)") { run_case(false); }
 }
+
+TEST_CASE("kTENSTORRENT kQkvSplit is BIT-EXACT vs a host reference (unequal widths)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kQkvSplit, DeviceType::kTENSTORRENT));
+
+  // Independent q/k/v widths (kernel contract); not equal-width MHA only.
+  constexpr int64_t T = 11, Qd = 24, Kd = 12, Vd = 12;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_qkv(static_cast<size_t>(T * (Qd + Kd + Vd)));
+  for (size_t i = 0; i < host_qkv.size(); ++i)
+    host_qkv[i] = static_cast<float>(i % 19) * 0.1f - 0.7f;
+  std::vector<float> host_q(static_cast<size_t>(T * Qd), 0.0f);
+  std::vector<float> host_k(static_cast<size_t>(T * Kd), 0.0f);
+  std::vector<float> host_v(static_cast<size_t>(T * Vd), 0.0f);
+
+  void* mem_qkv = backend.Alloc(host_qkv.size() * sizeof(float));
+  void* mem_q = backend.Alloc(host_q.size() * sizeof(float));
+  void* mem_k = backend.Alloc(host_k.size() * sizeof(float));
+  void* mem_v = backend.Alloc(host_v.size() * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_qkv, host_qkv.data(), host_qkv.size() * sizeof(float));
+
+  Tensor qkv = Tensor::Contiguous(mem_qkv, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T, Qd + Kd + Vd});
+  Tensor tq =
+      Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Qd});
+  Tensor tk =
+      Tensor::Contiguous(mem_k, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Kd});
+  Tensor tv =
+      Tensor::Contiguous(mem_v, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Vd});
+
+  auto split =
+      reinterpret_cast<vt::QkvSplitFn>(vt::GetOp(vt::OpId::kQkvSplit, DeviceType::kTENSTORRENT));
+  split(q, tq, tk, tv, qkv);
+
+  backend.Copy(q, host_q.data(), mem_q, host_q.size() * sizeof(float));
+  backend.Copy(q, host_k.data(), mem_k, host_k.size() * sizeof(float));
+  backend.Copy(q, host_v.data(), mem_v, host_v.size() * sizeof(float));
+  backend.Free(mem_qkv);
+  backend.Free(mem_q);
+  backend.Free(mem_k);
+  backend.Free(mem_v);
+
+  // Pure column split — bit-exact.
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t j = 0; j < Qd; ++j)
+      CHECK(host_q[i * Qd + j] == host_qkv[i * (Qd + Kd + Vd) + j]);
+    for (int64_t j = 0; j < Kd; ++j)
+      CHECK(host_k[i * Kd + j] == host_qkv[i * (Qd + Kd + Vd) + Qd + j]);
+    for (int64_t j = 0; j < Vd; ++j)
+      CHECK(host_v[i * Vd + j] == host_qkv[i * (Qd + Kd + Vd) + Qd + Kd + j]);
+  }
+}

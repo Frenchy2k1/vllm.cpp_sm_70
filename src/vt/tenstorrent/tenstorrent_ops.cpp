@@ -1,19 +1,22 @@
 // Tenstorrent op providers — the ttnn adapter layer (BACKEND-TENSTORRENT,
 // .agents/specs/tenstorrent-backend.md). vllm.cpp original; no upstream
-// mirror (vLLM has no Tenstorrent platform). Op table: kMatmul, kMatmulBT,
-// kAdd, kRelu, kEmbedding, kLayerNorm — the OPT-125m linear/residual/
-// activation/vocab/norm slice, mirroring how Metal landed ops one seam at
-// a time (docs/STATUS.md Backend detail).
+// mirror (vLLM has no Tenstorrent platform). Op table covers OPT-125m's 9
+// ops: ttnn for compute (matmul/add/relu/embedding/layernorm), host-staged
+// pure data-movement / attention for the remainder (see HOST-STAGED OPS
+// note below). Mirrors how Metal landed ops one seam at a time.
 //
-// SCOPE: 2D row-major F32 tensors for the linear/eltwise/norm ops (kAdd
-// also allows rank-1 `b` for the nn.Linear bias broadcast, matching
-// cpu_layernorm.cpp's AddKernel; kLayerNorm accepts optional rank-1
-// weight/bias). kEmbedding adds rank-1 i32/i64 ids + a rank-2 F32 table —
-// ROW_MAJOR UINT32 ids + ROW_MAJOR BFLOAT16 weights, forced by ttnn.
-// Every other shape/dtype is a VT_CHECK failure, not a silent wrong answer
-// or a slow-path guess — this op table has no CPU reference-tier fallback
-// (UnifiedMemory()==false, tenstorrent_backend.cpp), so failing loudly is
-// the only honest option. Widening dtype/rank coverage is deferred.
+// SCOPE: F32 for the W0 path unless noted. kAdd allows rank-1 bias
+// broadcast; kLayerNorm optional rank-1 weight/bias; kEmbedding i32/i64
+// ids. Every other shape/dtype is a VT_CHECK failure — no CPU reference
+// tier (UnifiedMemory()==false).
+//
+// HOST-STAGED OPS (kQkvSplit, kReshapeAndCache, kPagedAttention): this
+// backend's Alloc is host memory (tenstorrent_backend.cpp). QkvSplit and
+// ReshapeAndCache are pure contiguous / stride-aware copies — a device
+// round-trip would only burn PCIe for bit-identical results. PagedAttention
+// uses the CPU-oracle f32 softmax over the host-resident paged cache; mapping
+// vLLM's block-table contract onto ttnn::sdpa_decode is deferred to the
+// device-resident-tensor redesign the spec already names.
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/tenstorrent/tenstorrent_device.h"
@@ -21,6 +24,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -279,6 +284,34 @@ void LayerNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor* weight,
   Download(dev_y, out);
 }
 
+// kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
+// (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy, no device.
+void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  VT_CHECK(qkv.rank == 2 && qkv.dtype == DType::kF32,
+           "tenstorrent kQkvSplit: rank-2 F32 qkv required");
+  VT_CHECK(q_out.dtype == DType::kF32 && k_out.dtype == DType::kF32 && v_out.dtype == DType::kF32,
+           "tenstorrent kQkvSplit: only F32 out is supported in this step");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
+               qkv.IsContiguous(),
+           "tenstorrent kQkvSplit: contiguous required");
+  const int64_t t = qkv.shape[0];
+  const int64_t q_dim = q_out.Numel() / t;
+  const int64_t k_dim = k_out.Numel() / t;
+  const int64_t v_dim = v_out.Numel() / t;
+  const int64_t total = q_dim + k_dim + v_dim;
+  VT_CHECK(qkv.shape[1] == total, "tenstorrent kQkvSplit: inner dim mismatch");
+  const float* src = qkv.Ptr<float>();
+  float* qdst = q_out.Ptr<float>();
+  float* kdst = k_out.Ptr<float>();
+  float* vdst = v_out.Ptr<float>();
+  for (int64_t i = 0; i < t; ++i) {
+    const float* row = src + i * total;
+    std::memcpy(qdst + i * q_dim, row, static_cast<size_t>(q_dim) * sizeof(float));
+    std::memcpy(kdst + i * k_dim, row + q_dim, static_cast<size_t>(k_dim) * sizeof(float));
+    std::memcpy(vdst + i * v_dim, row + q_dim + k_dim, static_cast<size_t>(v_dim) * sizeof(float));
+  }
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -294,6 +327,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
+    RegisterOp(OpId::kQkvSplit, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
   }
 } registrar;
 
