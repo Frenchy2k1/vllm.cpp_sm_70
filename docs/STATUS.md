@@ -36,9 +36,9 @@ Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to firs
 6 legs contended, uncontended repeat died with a host reboot.
 [Detail](../.agents/specs/startup-latency-axis.md).
 
-Binary releases: W5/W6 implemented (#141/#196). CPU archive reproduces; extracted static-core server help runs.
-W1-W4/W7-W13 remain pending in draft #196; the test release has zero assets. Machine-bound single-PR delivery
-changes sequencing, not evidence. Containers are `INVENTORIED`; Metal/MLX are not containerizable.
+Binary releases: W5/W6 green; W1 is a #196 draft candidate. CPU archive reproduces; extracted server help runs.
+W1 local gencode/mutation gates pass; real ten-SM build/cubin audit plus W2-W4/W7-W13 remain pending.
+Test release has zero assets. Containers are `INVENTORIED`; Metal/MLX are not containerizable.
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
 append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.

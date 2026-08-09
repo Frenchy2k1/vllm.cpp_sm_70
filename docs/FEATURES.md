@@ -26,7 +26,7 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 30 registered, 25+ gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ◐ W5 manifest + W6 reproducible installed server archive implemented; no validated/published bundles | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Downloadable server binaries | ◐ W5/W6 green; W1 exact ten-SM CUDA gencode candidate, hosted build/audit pending; no published bundles | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 

@@ -294,8 +294,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: CUDA feature table resolves per architecture
-        run: cmake -P cmake/CudaArchFeaturesTest.cmake
+      - name: CUDA feature table and per-source gencode resolve exactly
+        run: |
+          cmake -P cmake/CudaArchFeaturesTest.cmake
+          cmake -P cmake/CudaSourceGencodeTest.cmake
+  cuda-fat-build:
+    # W1 release prerequisite: compile the primary heterogeneous CUDA archive,
+    # then inspect both compile_commands.json and the linked archive. No GPU is
+    # used; runtime/correctness evidence remains independent.
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-cuda-fat-build-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    container: nvidia/cuda:13.3.0-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates cmake g++ git ninja-build python3
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v4
+      - name: Configure ten-SM static library
+        run: |
+          cmake -S . -B build-cuda-fat -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DVLLM_CPP_CUDA=ON \
+            -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
+            -DVLLM_CPP_CUTLASS_FETCH=ON \
+            -DVLLM_CPP_TRITON=OFF \
+            -DVLLM_CPP_BUILD_TESTS=OFF \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF
+      - name: Build and audit exact per-source gencode
+        run: |
+          cmake --build build-cuda-fat --target vllm --parallel 2
+          python3 scripts/check-cuda-fat-gencode.py \
+            --compile-commands build-cuda-fat/compile_commands.json \
+            --library build-cuda-fat/libvllm.a
   vulkan-spirv-freshness:
     # The Vulkan backend commits its SPIR-V (src/vt/vulkan/vulkan_spirv.h) instead
     # of compiling shaders at build time, so the build needs no shader toolchain on
