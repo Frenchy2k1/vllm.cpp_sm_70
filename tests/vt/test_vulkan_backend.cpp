@@ -1537,6 +1537,106 @@ TEST_CASE("the decode causal conv1d update runs NATIVELY on Vulkan, state roll i
   cpu.DestroyQueue(cq);
 }
 
+// BACKEND-VULKAN-DEVICE-RESIDENT. The capability the model's indexed state-I/O
+// path needs: a COMPRESSED (bf16) conv_state addressed IN PLACE, which is what
+// Backend::SupportsCompressedConvState() advertises. The oracle is the arm this
+// replaces — gather the bf16 rows into an f32 working copy, run the CPU kernel
+// on the copy, round back — so a drift shows up HERE rather than as a slow
+// numeric divergence in a 64-layer model run.
+TEST_CASE("a COMPRESSED conv_state is updated IN PLACE on Vulkan, bit-exact vs the upcast arm") {
+  if (!VulkanPresent()) return;
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  CHECK(vk.SupportsCompressedConvState());
+  CHECK_FALSE(cpu.SupportsCompressedConvState());
+
+  constexpr int64_t kBatch = 3, kC = 5, kK = 4, kWidth = kK - 1;
+  constexpr int64_t kStateRows = 5, kStateLen = kWidth;
+  const std::vector<float> x = Spread(kBatch * kC, 2.0f, 71u);
+  const std::vector<float> w = Spread(kC * kK, 1.0f, 73u);
+  const std::vector<float> state_f = Spread(kStateRows * kC * kStateLen, 3.0f, 79u);
+  const std::vector<int32_t> cidx = {4, 0, 2};
+
+  // The bf16 cache, and the f32 UPCAST of exactly those bytes. Starting from the
+  // rounded values is what makes the two arms comparable at all: the upcast arm
+  // reads the same numbers the in-place arm reads.
+  std::vector<uint16_t> state_bf(state_f.size());
+  std::vector<float> state_up(state_f.size());
+  for (size_t i = 0; i < state_f.size(); ++i) {
+    state_bf[i] = vt::F32ToBF16(state_f[i]);
+    state_up[i] = vt::BF16ToF32(state_bf[i]);
+  }
+
+  Buf vx(vk, kBatch * kC, 4), vw(vk, kC * kK, 4), vo(vk, kBatch * kC, 4),
+      vs(vk, state_bf.size(), 2), vi(vk, kBatch, 4);
+  Buf cx(cpu, kBatch * kC, 4), cw(cpu, kC * kK, 4), co(cpu, kBatch * kC, 4),
+      cs(cpu, state_up.size(), 4), cci(cpu, kBatch, 4);
+  vk.Copy(vq, vx.p(), x.data(), x.size() * 4);
+  vk.Copy(vq, vw.p(), w.data(), w.size() * 4);
+  vk.Copy(vq, vs.p(), state_bf.data(), state_bf.size() * 2);
+  vk.Copy(vq, vi.p(), cidx.data(), cidx.size() * 4);
+  std::memcpy(cx.p(), x.data(), x.size() * 4);
+  std::memcpy(cw.p(), w.data(), w.size() * 4);
+  std::memcpy(cs.p(), state_up.data(), state_up.size() * 4);
+  std::memcpy(cci.p(), cidx.data(), cidx.size() * 4);
+  vk.Synchronize(vq);
+
+  Tensor vxt = Tensor::Contiguous(vx.p(), vt::DType::kF32, vd, {kBatch, kC});
+  Tensor vwt = Tensor::Contiguous(vw.p(), vt::DType::kF32, vd, {kC, kK});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kF32, vd, {kBatch, kC});
+  Tensor vst = Tensor::Contiguous(vs.p(), vt::DType::kBF16, vd, {kStateRows, kC, kStateLen});
+  Tensor vit = Tensor::Contiguous(vi.p(), vt::DType::kI32, vd, {kBatch});
+  Tensor cxt = Tensor::Contiguous(cx.p(), vt::DType::kF32, cd, {kBatch, kC});
+  Tensor cwt = Tensor::Contiguous(cw.p(), vt::DType::kF32, cd, {kC, kK});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kF32, cd, {kBatch, kC});
+  Tensor cst = Tensor::Contiguous(cs.p(), vt::DType::kF32, cd, {kStateRows, kC, kStateLen});
+  Tensor citt = Tensor::Contiguous(cci.p(), vt::DType::kI32, cd, {kBatch});
+
+  vt::CausalConv1dArgs args;
+  vt::CausalConv1dUpdate(cq, cot, cxt, cwt, nullptr, cst, args, &citt);
+  vt::CausalConv1dUpdate(vq, vot, vxt, vwt, nullptr, vst, args, &vit);
+  vk.Synchronize(vq);
+
+  CHECK(RanNative(vt::OpId::kCausalConv1dUpdate));
+
+  std::vector<float> got(kBatch * kC), ref(kBatch * kC);
+  vk.Copy(vq, got.data(), vo.p(), got.size() * 4);
+  vk.Synchronize(vq);
+  std::memcpy(ref.data(), co.p(), ref.size() * 4);
+  const double nmse = NmseOf(ref, got);
+  MESSAGE("compressed-state causal_conv1d_update NMSE vs the upcast arm: " << nmse);
+  CHECK(nmse <= kGdnNmseTol);
+
+  // THE STATE IS THE POINT. The roll is a value move plus ONE rounded store, so
+  // rounding the upcast arm's result is BIT-EXACT against the in-place bf16 row.
+  std::vector<uint16_t> state_got(state_bf.size());
+  vk.Copy(vq, state_got.data(), vs.p(), state_got.size() * 2);
+  vk.Synchronize(vq);
+  const float* state_ref = cs.as<float>();
+  for (size_t i = 0; i < state_got.size(); ++i) {
+    CAPTURE(i);
+    CHECK(state_got[i] == vt::F32ToBF16(state_ref[i]));
+  }
+  // Independently of the oracle: the last tap is the RAW x sample, rounded once.
+  for (int64_t bt = 0; bt < kBatch; ++bt) {
+    for (int64_t c = 0; c < kC; ++c) {
+      CAPTURE(bt);
+      CAPTURE(c);
+      const int64_t last = (cidx[static_cast<size_t>(bt)] * kC + c) * kStateLen + kWidth - 1;
+      CHECK(state_got[static_cast<size_t>(last)] ==
+            vt::F32ToBF16(x[static_cast<size_t>(bt * kC + c)]));
+    }
+  }
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
 TEST_CASE("the fused GDN post-conv preamble runs NATIVELY on Vulkan, all five outputs") {
   if (!VulkanPresent()) return;
   auto& ctx = vt::vulkan::VulkanContext::Get();
