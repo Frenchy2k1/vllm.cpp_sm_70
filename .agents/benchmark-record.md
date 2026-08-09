@@ -17065,3 +17065,484 @@ Peak is now the LOAD phase — the host `OwnedTensor` build reaches ~51 GiB befo
 the first upload, and the adoption only acts afterwards. Copying from the mmap
 straight into the device buffer at load would cut that too. The unreleased page
 cache is a second, independent lever.
+## 2026-08-09 — Qwen3.6-27B NVFP4 re-verified on the `nvidia` ModelOpt checkpoint
+
+The recorded 27B-NVFP4 grid was measured on `unsloth/Qwen3.6-27B-NVFP4`, and
+that repo re-quantized in place: @`890bdef7` is genuine NVFP4, @`ccdaab7e` is the
+same repo name turned into FP8 W8A8 throughout. `nvidia/Qwen3.6-27B-NVFP4`
+@`0893e1606ff3d5f97a441f405d5fc541a6bdf404` is the publisher's own single-revision
+NVFP4 build and is the reference from here on. It is not the same model as the
+`unsloth` one: `hf_quant_config.json` declares `MIXED_PRECISION`, so the MLP is
+`W4A16_NVFP4` group-16 while the whole `linear_attn` + attention tower is FP8,
+and it declares `kv_cache_quant_algo: FP8`.
+
+### Two method defects found before any number was taken
+
+**The benchmark build was not the production stack.** `~/build_gdnfp8.sh` on dgx
+configured with `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_BUILD_TESTS=OFF
+-DVLLM_CPP_CUTLASS_DIR=...` and never passed `-DVLLM_CPP_TRITON=ON`, so
+`CMakeCache.txt` read `VLLM_CPP_TRITON:BOOL=OFF` and `src/vt/cuda/cuda_gdn.cu:45`
+compiled out the entire Triton-AOT family: `gdn_deltah_h48/h32`, `gdn_chunko_*`,
+the WU pipeline, the packed decode `gdn_decode_h48/h32` and the whole KDA family.
+Qwen3.6-27B is a GDN hybrid, so every layer fell back to the hand kernels.
+`.agents/environment.md:51-66` already calls both flags MANDATORY on this box and
+the 27B gate refuses to run without them; a hand-written benchmark script has no
+such guard, which is how it slipped. Re-measured on a correct build (configure
+log verified for `CUTLASS found`, `FlashAttention-2 prefill/decode: ENABLED` and
+`Triton AOT: ... <- vendored ... sm_121a`, plus `gdn_decode_h48` symbols present
+in the `cuda_gdn` object), the throughput difference is a WASH, so the Triton-AOT
+GDN family is not a decode-throughput lever on this model. The numbers taken off
+that build were still not quotable.
+
+**The 27B gate let the filesystem choose the checkpoint.** Five checkpoint-gated
+tests, including SACRED `test_qwen27_paged_engine`, resolved the snapshot by
+taking whatever `fs::directory_iterator` yielded first under a repo with TWO
+cached revisions. Order is unspecified, so a token-exact pass against the FP8
+revision would have been recorded as an NVFP4 pass. It has been green by luck:
+readdir yields @`890bdef7` first on this box today. Now pinned through
+`tests/parity/hf_snapshot.h` to the revision named in the goldens' own
+`oracle.model` field, with `VT_QWEN27_SNAPSHOT` as the explicit escape hatch.
+
+### Correctness
+
+Production build, GB10 sm_121a: `test_qwen27_paged_engine` 235/235,
+`test_qwen36_paged_engine` 315/315. On the `nvidia` checkpoint, which has no
+committed golden, the greedy continuation was captured from the SAME warm server
+processes that produced the throughput numbers, so a mismatch could not be blamed
+on the two engines having loaded different weights in different sessions. Both
+engines returned, for `"The capital of France is"` at 32 tokens,
+`" Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\n..."`
+identically.
+
+### Throughput
+
+Warm servers, one engine resident at a time under one `flock`, greedy,
+`ignore_eos` so both emit exactly 128 output tokens, 7-token prompt,
+`--gpu-memory-utilization 0.55 --max-model-len 4096`, medians of three
+repetitions after a discarded warm-up, vLLM 0.25.0 in its production graphed
+config. Ours at `row/NVFP4-REPUBLISH-LAND` (current main plus the republish
+loader fix, the fp8-native GDN tower and `max_num_seqs` 32).
+
+| c | ours | vLLM 0.25.0 | ours/vLLM | spread ours | spread vLLM |
+|---|---:|---:|---:|---:|---:|
+| 1 | 8.76 | 12.29 | 0.713x | 1.0002 | 1.0060 |
+| 2 | 17.07 | 23.49 | 0.727x | 1.0087 | 1.0690 |
+| 4 | 33.01 | 45.42 | 0.727x | 1.0067 | 1.0005 |
+| 8 | 62.13 | 86.01 | 0.722x | 1.0023 | 1.0030 |
+
+The deficit is uniform and far outside the noise band. Scaling is NOT the
+problem: c1 to c8 we gain 7.09x against vLLM's 7.00x. From the roof, 20.42 GiB
+of weights over about 273 GB/s puts a floor near 75 ms/token; vLLM's 79 ms is
+about 95% of it and our 114 ms about 65%, so roughly a third of our per-token
+time is not weight streaming.
+
+### Configuration facts recorded with the numbers
+
+vLLM honors the checkpoint's `kv_cache_quant_algo: FP8` and runs
+`kv_cache_dtype=fp8_e4m3`; we have no `kv_cache_dtype` concept at all, so vLLM
+moves half the KV bytes we do. At 128 output tokens that is a small share of the
+difference, at long context it is not, and it is a POL-MIRROR-VLLM gap either
+way. Separately, vLLM 0.25.0 transiently touches 118 of 119 GiB during
+`determine_available_memory` at this utilization and pushes the box into swap; it
+recovers, but that is inside the OOM-reboot band for GB10.
+
+Owed: the 1,024 in / 128 out total-throughput axis on this checkpoint, so it can
+be compared against the `unsloth` grid, and the same treatment for the 35B.
+
+### Lever A/B: the dense NVFP4 Marlin route on qwen3_5 (2026-08-09)
+
+`qwen3_5.cpp` carries its OWN `MatmulNvfp4MarlinD` (:2357) which sends E=1 DENSE
+projections through `MoeGroupedGemmNvfp4Marlin` plus a `moe_align` cache, while
+`dense_nvfp4_gemm.h` has a dense route (`vt::MarlinDenseGemm`, rank-2 operands,
+direct-A, no moe_align) that qwen3, olmo2, deepseek_v2 and minimax_h3 all take,
+and which this repo measured at 48-CTA ~86 us/call against the MoE route's
+128-CTA ~118 us/call. That made it the prime suspect for the uniform 0.72x.
+
+**The earlier attempt at this hung; the root cause is now named.** The reverted
+patch mirrored `dense_nvfp4_gemm.h:366-385` including its call sequence, and that
+sequence has NO per-call workspace memset because the shared
+`DenseMarlinWorkspace` zeroes at allocation. `qwen3_5`'s own `DenseMarlinWorkspace`
+does NOT zero at allocation; it relies on a memset at the call site. Marlin's
+fp32 reduce SPINS on those lock words, so uninitialized locks spin forever, which
+is a hang rather than a fault and is why turning the decode graph off appeared to
+"fix" it. Keeping the per-call memset, the route runs first try with no hang.
+
+**Same-binary A/B**, one build, one flock, `VT_MARLIN_DENSE` the only difference,
+27B `nvidia` @`0893e160`, ns=32, 3 reps:
+
+| c | dense ON | MoE route | delta |
+|---|---:|---:|---:|
+| 1 | 8.78 | 8.78 | +0.0% |
+| 2 | 16.83 | 16.74 | +0.5% |
+| 4 | 32.98 | 32.81 | +0.5% |
+| 8 | 62.29 | 61.81 | +0.8% |
+
+The 32-token greedy continuations of the two arms are IDENTICAL, and both match
+vLLM. So the lever is REAL but SMALL: it removes a framework fork and buys under
+one percent above c1, and it does not explain a 38% deficit. The prime suspect is
+retired; attribution moves to a decode-window profile rather than another
+structural guess.
+
+### Decode attribution: where the 114 ms/token goes (2026-08-09)
+
+Two-length `nsys` difference (8 vs 136 tokens, same prompt, `cuda_gpu_kern_sum`
+diffed per kernel), 27B `nvidia` @`0893e160`, single stream, production build.
+
+**The first run of this was WRONG and the way it was wrong matters.** `nsys`
+defaults to `--cuda-graph-trace=graph`, which reports a captured decode graph as
+ONE range, so every kernel inside it contributes nothing to the per-kernel table.
+The diff came back at 0.030 ms/step against a 114 ms/token wall clock, with
+`dInstances == 0` for `marlin_moe_wna16::Marlin`, `nvjet_sm121_*`, `gemvx` and
+every other forward kernel, and +128 only for the sampler and embedding kernels
+that live OUTSIDE the graph. That profile makes the sampler look like the whole
+cost of decode and the GEMMs look free. Re-run with `--cuda-graph-trace=node`.
+Sanity check for any future profile on a graphed path: the hot kernels'
+instance counts MUST scale with the number of decode steps.
+
+**Corrected decode-only total: 14,630 ms over 128 steps = 114.298 ms/step**,
+against a measured 114 ms/token wall clock. **We are ~100% GPU-busy at c1**, so
+there is no host, scheduler or launch-overhead lever to recover here; the entire
+deficit is kernel efficiency.
+
+| Share | Calls/step | ms/step | Kernel |
+|---:|---:|---:|---|
+| 40.0% | 192 | 45.77 | `marlin_moe_wna16::Marlin` (the NVFP4 MLP, 3 GEMMs x 64 layers) |
+| 22.7% | 80 | 25.98 | cuBLAS `gemvx` bf16 |
+| 16.2% | 48 | 18.51 | `nvjet_sm121_qqsss_mma_64x128x128` (cuBLASLt, FP8 tower) |
+| 10.0% | 1 | 11.38 | `cutlass_80_tensorop_s16816gemm_bf16_128x64_32x6_nn_align2` |
+| 6.2% | 48 | 7.05 | `nvjet_sm121_qqtst_mma_64x64x128` |
+| 1.9% | 32 | 2.19 | cuBLAS `gemvx` bf16 (second shape) |
+| 1.2% | 48 | 1.32 | `GdnDecodeFusedKernel` |
+
+Checkpoint census, which is what those kernels are reading: 8.561 GiB U8 (NVFP4,
+of which 7.969 is `mlp` and 0.592 is `lm_head`), 7.789 GiB F8_E4M3 (5.156
+`linear_attn`, 1.562 `self_attn`, 0.996 `mlp`), 4.066 GiB BF16 (2.376 of it the
+embedding TABLE, which decode reads one row of, plus 0.997 `mlp`, 0.450 other,
+0.195 `self_attn`), 20.416 GiB total.
+
+Two readings follow. The NVFP4 MLP moves 8.56 GB in 45.77 ms, about 187 GB/s or
+roughly 68% of this box's ~273 GB/s, so about 14 ms is theoretically on the
+table there. The bf16 `gemvx` line is the sharper anomaly: after the FP8 and
+NVFP4 towers are accounted for, at most about 1.7 GB of bf16 weight remains for
+those 112 calls, and 28.2 ms to move 1.7 GB is far off the bandwidth roof, which
+means those GEMVs are latency or occupancy bound rather than bandwidth bound.
+That is the largest single mis-shaped cost in the step and it is where the next
+lever belongs, ahead of any further structural refactor.
+
+### The FP8 tower was being dequantized to bf16, and it was the gap (2026-08-09)
+
+The decode profile said 24.6% of the step was cuBLAS bf16 `gemvx` moving at most
+~1.7 GB, which is nowhere near bandwidth bound. Reading the loader explains it.
+
+`LoadAttnDense` (`qwen3_5_dense_weights.cpp`) had exactly TWO branches, NVFP4 or
+`LoadBf16RawNK`, and the same was true of `LoadGdnDense`'s `out_proj`. A
+`modelopt_mixed` checkpoint quantizes the attention tower to FP8 W8A8 while
+leaving the MLP NVFP4, so every one of those projections matched neither branch's
+intent and fell through to the bf16 path, which DEQUANTIZES: 1.562 GiB of
+`self_attn` FP8 plus 1.41 GiB of `linear_attn.out_proj` FP8 became ~5.9 GiB of
+BF16, re-read every decode step and executed as cuBLAS `gemvx`.
+
+This was never a missing capability. `FullAttnLayerWeights` already carries
+`q/k/v/o_proj_fp8`, `GdnLayerWeights` already carries `out_proj_fp8`,
+`MatmulFp8CutlassD` / `MatmulFp8CutlassPreQuantD` already consume them, and
+`LoadAttn` on the MoE path (`qwen3_5_weights.cpp:319`) has done exactly this
+since the 35B work, with its own comment calling it the DEFAULT. The dense path
+was the one that never got it. vLLM does the same thing (`modelopt.py:519`
+`process_weights_after_loading` keeps `layer.weight` fp8 and transposes it, then
+applies through `fp8_linear`), so this is POL-MIRROR-VLLM, not an invention.
+
+**MEASURED**, same harness, same checkpoint, same box, 3 reps:
+
+| c | before | after | gain | vs vLLM before | vs vLLM after |
+|---|---:|---:|---:|---:|---:|
+| 1 | 8.78 | 10.41 | +18.6% | 0.713x | **0.847x** |
+| 2 | 16.83 | 20.22 | +20.1% | 0.727x | **0.861x** |
+| 4 | 32.98 | 38.76 | +17.5% | 0.727x | **0.853x** |
+| 8 | 62.29 | 72.49 | +16.4% | 0.722x | **0.843x** |
+
+Peak host RSS falls 24.2 -> 21.0 GiB, the ~3.2 GiB the expansion was costing.
+The 32-token greedy continuation is byte-identical to vLLM's, captured from the
+same warm process as the numbers. SACRED gates on this build:
+`test_qwen27_paged_engine` 235/235, `test_qwen36_paged_engine` 315/315.
+
+Per-token time goes 114 ms to about 96 ms, which is ~78% of the bandwidth roof
+against vLLM's ~95%. The residual is the NVFP4 MLP marlin at ~68% of roof, and
+that is the next lever.
+
+### 35B-A3B NVFP4 re-verified, and a FIRST-REQUEST-ONLY correctness defect found
+
+Same harness and checkpoint discipline as the 27B, on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` @`491c2f1e`, ours at the FP8-tower build:
+
+| c | ours | vLLM 0.25.0 | ratio | spread ours / vLLM |
+|---|---:|---:|---:|---:|
+| 1 | 70.58 | 74.71 | 0.945x | 1.001 / 1.001 |
+| 2 | 107.64 | 130.35 | 0.826x | 1.022 / 1.111 |
+| 4 | 194.87 | 204.67 | 0.952x | 1.005 / 1.029 |
+| 8 | 318.56 | 354.04 | 0.900x | 1.073 / 1.081 |
+
+c2 and c8 carry real noise on both sides (vLLM's c2 spread is 1.111 on one slow
+leg), so treat c1 and c4 as the trustworthy cells.
+
+**THESE NUMBERS SIT ON TOP OF A CORRECTNESS DEFECT AND ARE NOT A PARITY CLAIM.**
+The greedy continuation captured from the warm 35B server did NOT match vLLM's,
+and the probe that followed is the important part. Five identical greedy requests
+to ONE warm server, `"The capital of France is"`, 32 tokens, `ignore_eos`:
+
+- request 1: `" Paris, a city renowned for its rich history, culture, and iconic
+  landmarks. Paris is situated in the north-central part of France..."` -- this
+  is BYTE-IDENTICAL to vLLM.
+- requests 2 through 5: `" Paris, a city renowned for its iconic landmarks such
+  as the Eiffel Tower, the Louvre Museum, and the Notre-Dame Cathedral..."` --
+  all four identical to each other, none matching vLLM.
+
+So it is not noise and not a near-tie coin flip: the FIRST request on a fresh
+server is vLLM-exact and every subsequent request deterministically produces a
+different, still-fluent continuation. Something survives across requests and
+changes the result. Prefix caching is OFF on both engines.
+
+The same probe on the 27B is CLEAN: all five captures identical and capture 1
+byte-identical to vLLM (the fifth differed by one trailing newline from the
+harness's block splitting, verified equal after `strip()`). So this is specific
+to the 35B MoE/GDN path, not the shared serving loop.
+
+`test_qwen36_paged_engine` is 315/315 token-exact at ITS engine params, which
+means the model and the weights are right and the defect lives in the serving
+configuration or in state reuse between requests. This is plausibly the same
+"prod async batch-1 greedy degeneration" a probe found earlier. It is NOT fixed
+here and it OWNS the 35B speed row: no 35B parity claim may be made from the
+table above until a second request returns what the first one does.
+
+### CORRECTION to the 35B entry above: it is not a first-request defect
+
+The entry above claimed the 35B divergence was state-dependent, request 1
+byte-identical to vLLM and requests 2-5 different. **That claim is REFUTED and is
+withdrawn.** It rested on a single probe run and did not survive repetition.
+
+Four further probe runs on the same build and checkpoint, five captures each:
+async runner off (`VT_ASYNC_RUNNER=0`), decode graph off
+(`VLLM_CPP_CUDAGRAPH=0`), `--max-num-seqs 8`, and the default config twice. All
+twenty captures are IDENTICAL to each other and NONE matches vLLM. Adding the
+original run's four later captures, that is 24 of 25 captures on one answer. The
+single vLLM-matching capture has never reproduced and remains unexplained; it is
+recorded as an anomaly, not as a mechanism.
+
+Two things are cleared by those arms. The `max_num_seqs` 8 -> 32 default change
+in this branch did NOT cause it: `--max-num-seqs 8` diverges identically. And
+neither the async runner nor the captured decode graph causes it: both rollbacks
+diverge identically.
+
+**What it actually is, and it is worse.** vLLM was put through the same probe on
+the same checkpoint and params: five captures, all identical, all matching its
+own earlier golden. So vLLM is DETERMINISTIC here and we are DETERMINISTIC on a
+different continuation. Under the ratified near-tie gate -- token-exact where
+vLLM is deterministic, distributional only where vLLM's own greedy is not -- the
+distributional escape does not apply and we owe token-exactness. We fail it.
+
+Both continuations are fluent (`"...its rich history, culture, and iconic
+landmarks. Paris is situated in the north-central part of France..."` from vLLM
+against `"...its iconic landmarks such as the Eiffel Tower, the Louvre Museum,
+and the Notre-Dame Cathedral..."` from us), diverging at token seven.
+
+The scope is now precise. `test_qwen36_paged_engine` is 315/315
+token-exact against the same oracle, so at the GATE's engine params we match and
+at the SERVER's params we do not. The defect lives in whatever differs between
+those two configurations, and that difference is the next thing to bisect. The
+35B throughput table stands as measured and remains NOT a parity claim.
+
+### 35B divergence, bisected: it is PROMPT-dependent and lives in the engine
+
+Continuing the correction above, five more arms, each five captures unless noted:
+
+| Arm | Result |
+|---|---|
+| `VT_ASYNC_RUNNER=0` | stable, diverges |
+| `VLLM_CPP_CUDAGRAPH=0` | stable, diverges |
+| `--max-num-seqs 8` | stable, diverges |
+| `--max-model-len 0` (config default) | stable, diverges |
+| default config, twice | stable, diverges |
+| vLLM, same probe | stable, matches its own golden |
+| `examples/vllm-cli` (SYNC engine, all defaults, 1 run) | diverges, same text |
+
+Tokenization is identical on both sides and both models: `prompt_tokens=5`,
+`completion_tokens=32` for ours and for vLLM, on the 27B and the 35B.
+
+So the serving layer is EXONERATED. `vllm-cli` drives `LoadedEngine` +
+`engine().generate()` with `EngineParams{}` -- the same entry point
+`test_qwen36_paged_engine` uses, which is 315/315 token-exact -- and it produces
+the divergent continuation. The difference between the gate and this run is
+therefore not the engine configuration at all. It is the PROMPT.
+
+That relocates the whole thing. Our 35B forward disagrees with vLLM on
+`"The capital of France is"` from token seven, while agreeing token-for-token on
+the gate's pinned prompt. Both engines are internally deterministic, so this is
+not a scheduling or state-reuse effect and the distributional escape does not
+apply. It is either a logit near-tie this prompt happens to land on, or a real
+numerical difference in the MoE path that the gate's single prompt never
+exercises. Either way the gate has a COVERAGE hole: one prompt cannot certify a
+forward.
+
+Next: teacher-force both engines on this prompt and read the top-2 logit margin
+at the divergence position. A margin at the bf16 noise floor makes it a ratified
+near-tie and the gate needs more prompts; a wide margin makes it a real defect in
+the MoE forward. Until that is answered the 35B throughput table is not a parity
+claim.
+
+### RESOLVED: the 35B divergence is a BIT-EXACT tie in the oracle, not a defect
+
+vLLM was asked for `logprobs` on the same prompt and its own top-2 at the
+divergence position, token 7, are the SAME float32 value:
+
+| pos | top1 | logprob | top2 | logprob | diff |
+|---|---|---:|---|---:|---:|
+| 6 | `' its'` | -0.011696805246174335 | `' iconic'` | -5.511696815490723 | 5.500000 |
+| 7 | `' rich'` | -1.2221027612686157 | `' iconic'` | -1.2221027612686157 | **0.0** |
+| 8 | `' history'` | -0.13290393352508545 | `' cultural'` | -2.507904052734375 | 2.375000 |
+
+`' rich'` is token 8807 and `' iconic'` is token 25438. Their logits are EQUAL in
+the oracle's own arithmetic, so vLLM's `torch.argmax` returns the lower index and
+picks `' rich'`. Our sampler implements the same rule -- `ArgReduce` in
+`cuda_sample.cu` is documented and written as lowest-index-wins and compares the
+true global index, so the tie-break is order-independent -- but our logits are
+not bit-identical to vLLM's (no two different GEMM/accumulation orders are), so
+the equality does not reproduce on our side and 25438 wins.
+
+**So this is not a forward defect and the 35B is not broken.** It is the exact
+case the ratified near-tie gate exists for: at a zero-margin position the outcome
+is decided below the precision of either implementation, and demanding
+token-exactness there is demanding that two different kernel stacks produce
+bit-identical floats. The earlier framing on this page -- first a state-dependent
+bug, then a flat token-exactness failure -- is superseded by this measurement.
+
+Two things remain true and are the actual residue. The 35B gate certifies the
+forward with ONE pinned prompt, and the second prompt tried lands on a zero-margin
+tie, so the gate's coverage is thin and a prompt set with margins above the noise
+floor would be worth more than the single prompt. And the 35B throughput table
+stands: ours 70.58 / 107.64 / 194.87 / 318.56 against vLLM's 74.71 / 130.35 /
+204.67 / 354.04, so 0.945 / 0.826 / 0.952 / 0.900 -- we are BEHIND on the 35B
+too, by 5 to 10 percent on the trustworthy cells, and that is now unblocked
+ordinary speed work rather than a correctness question.
+
+### 35B-A3B decode attribution (2026-08-09)
+
+Two-length `nsys` difference at `--cuda-graph-trace=node`, same discipline as the
+27B. Decode-only GPU kernel time is 16.686 ms/step.
+
+| Share | Calls/step | us/step | Kernel |
+|---:|---:|---:|---|
+| 19.8% | 40 | 3308 | `nvjet_sm121_qqsss_mma_128x64x128` (cuBLASLt FP8) |
+| 18.6% | 80 | 3097 | `marlin_moe_wna16::Marlin` (routed experts) |
+| 10.0% | 40 | 1661 | `nvjet_sm121_qqtst_mma_128x64x128_splitK` |
+| 9.7% | 41 | 1611 | `marlin::Marlin` (the DENSE route) |
+| 7.2% | 30 | 1198 | `nvjet_sm121_qqsss_mma_192x16x128` |
+| 5.6% | 40 | 941 | cuBLAS `gemvx` bf16 |
+| 4.7% | 40 | 780 | `MoeRouterTopKKernel` |
+| 3.6% | 30 | 603 | `GdnDecodeFusedKernel` |
+| 3.1% | 41 | 515 | `CastF32Kernel` |
+| 1.6% | 40 | 274 | `RmsNormQuantFp8RowKernel` |
+| 1.5% | 80 | 249 | `SiluAndMulKernel` |
+
+Unlike the 27B, no single line dominates: the two GEMM families are 37% and 28%
+and the rest is a long tail. Two entries stand out as pure overhead rather than
+work. `CastF32Kernel` is 3.1% for 41 calls, one per NVFP4 marlin GEMM, and exists
+only because the caller asks for an f32 output from a kernel whose `c_type` is
+bf16 -- the same f32-stream pattern the Laguna campaign identified, and here it
+is on a GATE model rather than only on laguna and ds4 as the current
+`NOW.md` row claims. `MoeRouterTopKKernel` is 4.7% for routing alone.
+
+Those two together are 7.8% of the step against a 5 to 10 percent deficit, so
+they are the first place to look for 35B parity, ahead of touching either GEMM
+family. Both need their own gate: dropping the f32 cast changes the residual
+stream dtype and therefore the numerics, so it is a spike with a strict 27B/35B
+gate, not a one-liner.
+
+### LANDED: warp-shuffle MoE router top-k (2026-08-09)
+
+The 35B attribution put `MoeRouterTopKKernel` at 4.7% of the decode step, 780
+us/step over 40 calls, which is 19.5 us for a few hundred comparisons. The cause
+is structural rather than algorithmic: the grid is one block per token, so at
+decode ONE block on ONE SM ran the k selection rounds, and each round did a
+block-wide tree reduction costing log2(256) `__syncthreads`. For k=8 over 256
+experts that is roughly 64 barriers, and barrier latency was the kernel.
+
+The k rounds now reduce with `__shfl_down_sync` inside each warp and then one
+cross-warp pass, taking barriers per round from log2(kBlock)+1 to 2.
+
+**This is byte-identical, and the reason it is safe is worth stating.** The top-k
+rounds are an ARGMAX reduction, not an arithmetic one: the comparison is
+unchanged (higher value wins, exact tie goes to the lower expert index) and
+argmax under a total order is associative and commutative, so any reduction order
+yields the same (value, index). The softmax max and sum reductions in the same
+kernel ARE arithmetic and were deliberately left on their existing tree, because
+reassociating those would move the denominator by an ulp and could change which
+experts win.
+
+MEASURED, same harness/checkpoint/box, 3 reps, `nvidia/Qwen3.6-35B-A3B-NVFP4`
+@`491c2f1e`:
+
+| c | before | after | gain | vs vLLM before | after |
+|---|---:|---:|---:|---:|---:|
+| 1 | 70.58 | 73.24 | +3.8% | 0.945x | **0.980x** |
+| 2 | 107.64 | 113.02 | +5.0% | 0.826x | **0.867x** |
+| 4 | 194.87 | 199.90 | +2.6% | 0.952x | **0.977x** |
+| 8 | 318.56 | 325.36 | +2.1% | 0.900x | **0.919x** |
+
+The 32-token greedy continuation is unchanged from the pre-spike baseline, as the
+byte-identity argument requires. Gates on this build: `test_ops_moe` 33451/33451,
+`test_ops_moe_grouped` 440/440, `test_ops_moe_grouped_bf16` 19/19,
+`test_qwen36_paged_engine` 315/315, `test_qwen27_paged_engine` 235/235.
+
+c1 and c4 are now within 2 to 3 percent of vLLM. c2 and c8 remain the weak cells
+and both carry the wider run-to-run spread, so the next 35B work should start by
+tightening those measurements before chasing them. `CastF32Kernel` at 3.1%
+remains unclaimed and is the next lever.
+
+### Grouped-router top-k parallelised; Kimi-Linear effect NOT ESTABLISHED (2026-08-09)
+
+`MoeRouterGroupedTopKKernel` is the router Kimi-Linear-48B and the DeepSeek-style
+MoEs take (`use_grouped_topk`, so `num_expert_group > 0` routes here rather than
+to the ungrouped kernel fixed earlier today). It did `if (threadIdx.x != 0)
+return;` before the group scoring, so the group scores, the group mask, the top-k
+and the renorm ALL ran on one lane of one block. Its own comment said so and
+deferred the fix: "a few thousand serial ops per token ... Speed work belongs to
+W9, after the numerics are gated". At Kimi-Linear's shape (e=256, k=8) step (4)
+alone is ~2048 serial compares per token.
+
+Step (4) is now block-parallel with the same warp-shuffle argmax used for the
+ungrouped router, on the same byte-identity argument: the comparison is unchanged
+(higher score wins, exact tie to the lower expert index, which the serial
+ascending scan with strict `>` also produced) and argmax over a total order
+reassociates freely. Everything ARITHMETIC still runs on thread 0 in the original
+order -- the `denom` accumulation in k order, the renormalize, and the
+`routed_scaling_factor` -- and steps (2) and (3) stay serial because they are
+O(n_group * group_size) once and n_group is 1 or 8 for the shapes we serve.
+
+Gates on this build: `test_ops_moe` 33451/33451, `test_ops_moe_grouped` 440/440,
+`test_ops_moe_grouped_bf16` 19/19, `test_deepseek_v4_moe` 716/716,
+`test_qwen36_paged_engine` 315/315, `test_qwen27_paged_engine` 235/235.
+
+**The speed effect on Kimi-Linear is NOT ESTABLISHED, and the first run said
+otherwise.** Same box, same golden, `kimi-linear-gen` two-length diff, 128 steps:
+
+| rep | baseline tok/s | spike tok/s | paired |
+|---|---:|---:|---:|
+| 1 | 17.93 | 18.36 | +2.4% |
+| 2 | 18.14 | 17.73 | -2.3% |
+| 3 | 16.43 | 18.13 | +10.3% |
+
+Baseline median 17.93 with a 1.104 spread, spike median 18.13 with 1.036. Two of
+three pairs favour the spike and one does not, and the baseline's own range
+(16.43 to 18.14) is wider than the effect being measured. Reporting the rep-1
++2.4% would have been reporting noise. Token ids are IDENTICAL in all six runs
+(122/128 against the golden, the same `got:` sequence), which is what the
+byte-identity argument requires and is the part that IS established.
+
+The instrument is the limitation, not the change: `kimi-linear-gen`'s two-length
+diff carries a ~10% band here, while the 35B's warm-server harness ran spreads
+under 1.05 and resolved a 2-5% effect cleanly. Kimi-Linear cannot use that
+harness today because the published checkpoint ships tiktoken
+(`tiktoken.model` + `tokenization_kimi.py`) and no `tokenizer.json`, so the
+server refuses to load it; the measurement above only works against a
+hand-prepared `~/kimi-linear-engine-dir` with a converted tokenizer. Giving
+Kimi-Linear a warm-server path is a prerequisite for any binding Kimi speed
+number, and is worth more than re-running this A/B.

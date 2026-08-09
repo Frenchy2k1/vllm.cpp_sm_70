@@ -147,7 +147,7 @@ struct Args {
   double gpu_memory_utilization = 0.92;
   long long kv_cache_memory_bytes = 0;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
-  int max_num_seqs = 8;
+  int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
   // --device: explicit device selection for the TEXT engine (ARCH-ONE-SURFACE
   // ROW 8), the vLLM DeviceConfig.device names this build serves: "auto"

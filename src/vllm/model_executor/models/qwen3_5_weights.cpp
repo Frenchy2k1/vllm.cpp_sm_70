@@ -445,6 +445,11 @@ Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
 
 }  // namespace
 
+// External-linkage seam so the DENSE loader can keep an FP8 GDN tower native.
+Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj) {
+  return LoadFp8Raw(get, proj);
+}
+
 Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
                                            const std::string& layer_type,
                                            int64_t layer_idx,

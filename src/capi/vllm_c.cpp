@@ -488,7 +488,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.block_size = 32;
   p.num_blocks = 0;  // 0 => auto: sized by the v16 knobs, else 256.
   p.max_model_len = 0;
-  p.max_num_seqs = 8;
+  p.max_num_seqs = 32;  // see EngineParams::max_num_seqs.
   p.tool_parser = nullptr;  // AUTO-detect from the chat template (ABI v4).
   p.reasoning_parser = nullptr;  // AUTO-detect / disabled (ABI v5).
   p.speculative_config = nullptr;  // speculation disabled (ABI v6).

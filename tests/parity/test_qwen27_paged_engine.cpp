@@ -34,6 +34,7 @@
 #endif
 
 #include "npy.h"
+#include "hf_snapshot.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/sampling_params.h"
@@ -74,21 +75,12 @@ void CheckDeviceCacheResidency(
 #endif
 }
 
-// Snapshot dir of the 27B checkpoint (contains config.json), or "". Same HF
-// cache layout as Find35BSnapshot, for models--unsloth--Qwen3.6-27B-NVFP4.
-std::string Find27BSnapshot() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path snaps =
-      fs::path(home) /
-      ".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec)) {
-    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
-  }
-  return "";
-}
+// Snapshot dir of the 27B gate checkpoint, or "" to SKIP. Pinned to the
+// revision the committed goldens were captured against -- this repo has TWO
+// cached snapshots under one name and only one of them is NVFP4. See
+// tests/parity/hf_snapshot.h for why an unpinned lookup could gate the wrong
+// weights.
+std::string Find27BSnapshot() { return parity::Qwen27NvfP4Snapshot(); }
 
 // Load an i32 (.npy "<i4") vector from the committed golden.
 std::vector<int32_t> LoadI32Npy(const fs::path& p) {
