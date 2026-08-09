@@ -27,6 +27,8 @@ block W13; its optional status does not permit moving it to another PR.
 identity=ENG-RELEASE-BINARIES
 lifecycle=ACTIVE
 manifest_schema=vllm.cpp.release-manifest.v1
+delivery_pull_request=196
+delivery_mode=single-pr-W1-W13
 primary_cuda_artifact=one-fat-binary-per-os-host-abi
 primary_cuda_sms=80,86,87,89,90a,100a,103a,110,120a,121a
 per_sm_cuda=optional-non-primary
