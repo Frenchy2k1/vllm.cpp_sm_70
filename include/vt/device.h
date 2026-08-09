@@ -19,9 +19,15 @@ enum class DeviceType : uint8_t {
   kMETAL = 2,
   kVULKAN = 3,
   kXPU = 4,
-  kROCM = 5
+  kROCM = 5,
+  // Tenstorrent Blackhole (P100/P150 PCIe cards). Named after the vendor/stack
+  // (kROCM precedent), not the chip family: this codebase's CUDA layer already
+  // uses "Blackwell" (sm_120/121, GB10) pervasively, and kBLACKHOLE next to
+  // those would be a near-miss for both humans and grep.
+  // (.agents/specs/tenstorrent-backend.md, BACKEND-TENSTORRENT)
+  kTENSTORRENT = 6
 };
-constexpr size_t kNumDeviceTypes = 6;
+constexpr size_t kNumDeviceTypes = 7;
 
 // The canonical lowercase spelling of a device, for user-facing messages (and
 // the docs that quote them). Lives here, beside the enum, rather than in the
@@ -46,6 +52,8 @@ constexpr const char* DeviceTypeName(DeviceType device) {
       // reuses the CUDA dispatch key. We have no torch, so only the honest name
       // survives here; the HIP-reuses-CUDA-spelling question does not arise.
       return "rocm";
+    case DeviceType::kTENSTORRENT:
+      return "tenstorrent";
   }
   return "unknown";
 }
