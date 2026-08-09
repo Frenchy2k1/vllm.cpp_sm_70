@@ -622,6 +622,16 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
                                                  cli.prompt_lookup_min,
                                                  cli.prompt_lookup_max);
   }
+  // SPEC-DSPARK W1: the config layer now resolves method "dspark"
+  // (SpeculativeConfig::ResolveDspark), but the drafter itself — the Markov
+  // logit-bias head, the sequential block sampling and the anchor-as-first-
+  // prediction layout — lands in W2-W5. Refuse BY NAME here so a user who passes
+  // it gets the real state instead of a confusing downstream failure.
+  if (cli.method == "dspark") {
+    throw std::invalid_argument(
+        "speculative-config: method \"dspark\" is not implemented yet "
+        "(SPEC-DSPARK: the config slice has landed, the drafter has not)");
+  }
   if (cli.method != "mtp") {
     throw std::invalid_argument(
         "speculative-config: only methods \"mtp\", \"dflash\" and \"ngram\" are "

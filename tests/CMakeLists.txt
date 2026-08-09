@@ -459,6 +459,9 @@ vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 # vllm#49343 eagle-draft max_position_embeddings clamp (config/speculative.h).
 vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
   vllm/config/test_speculative_draft_max_position_embeddings.cpp)
+# SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
+# lookahead slots, draft identity).
+vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)
