@@ -16542,3 +16542,65 @@ column blocking suppresses it. It is NOT "a lever bigger than every other Vulkan
 optimization" on the evidence available -- at 1 leg in 16 it costs roughly 6% of
 mean decode time, against the 8.5% that column blocking takes off this kernel
 deterministically.
+
+## BACKEND-VULKAN combined: the three levers measured TOGETHER on merged main (2026-08-09, GB10, `81ea01f0`)
+
+Each of the three Vulkan levers was measured against `93852c28` in isolation, so
+none of their numbers described a tree carrying all three. `docs/STATUS.md` was
+deliberately left at the CONSERVATIVE 4.24 (the largest single lever) rather than
+a sum. This entry is the binding combined measurement that replaces it.
+
+**METHOD.** `git archive` of the merged tree to dgx, `vt_matmul.comp` md5 verified
+identical on both sides. Fresh Release configure. 8 wall-clock legs with the page
+cache dropped before each and `flock ~/gpu.lock` held; then a two-length
+GPU-timestamp diff (output-len 36 minus 4, over 32 decode tokens) so prefill and
+one-time costs cancel. Qwen3.6-27B bf16, 1 prompt, 32-in, c1.
+
+**A FIRST ATTEMPT WAS INVALID AND IS RECORDED BECAUSE THE FAILURE IS REUSABLE.**
+It read 0.75-1.27 tok/s. `VLLM_CPP_VULKAN` defaults to `AUTO`, which resolves to
+`OFF` (Vulkan is opt-in so it cannot register into gate builds), and the fresh
+configure omitted `-DVLLM_CPP_VULKAN=ON`. The options had been copied from the
+reference build's `CMakeCache.txt` through `grep | head -15`, and the
+alphabetically-sorted list ended at `TRITON_TARGET`, exactly one line before
+`VULKAN`. Three independent tells were present in the output and are the cheap
+check: NO `[vt vulkan]` lines despite `VT_VULKAN_DISPATCH_STATS=1`, no
+`[vt reference-tier]` lines, and "Asynchronous scheduling is ENABLED" where every
+valid Vulkan run reports it disabled. Same family as this campaign's stale-binary
+false greens, in the opposite direction: a false catastrophe rather than a false
+pass. Re-run after confirming `VLLM_CPP_VULKAN:STRING=ON` in the cache AND that
+the run emits Vulkan lines BEFORE trusting it.
+
+**MEASURED, 8 legs, ALL CLEAN.** TPOT 232.18, 232.42, 232.50, 233.34, 233.42,
+233.47, 233.80, 234.07 ms; decode 4.27-4.31 tok/s. **Median 4.285 tok/s**, spread
+0.8%. Zero bimodal collapses in 8 legs (the ~1.8x pathology hit 1 leg in 16 in the
+lm_head row's block, so its absence here is consistent, not evidence against it).
+
+**MEASURED, per decode token, two-length diff:**
+
+| shader | before (`93852c28`) | merged | delta |
+|---|---:|---:|---:|
+| `vt_matmul_vec` | 214.1 | **210.1** | -4.0 |
+| `vt_matmul` (lm_head) | 12.43 | **11.57** | -0.86 |
+| `vt_rms_norm` -> `vt_rms_norm_wide` | 7.97 | **1.57** | -6.40 |
+| `vt_paged_attn` | 2.02 | 2.00 | - |
+| `vt_gdn_decode` | 1.40 | 1.40 | - |
+| **total GPU** | **240.3** | **227.7** | **-12.6** |
+
+Wall 233.0 ms, so host is **5.3 ms/token**. Each lever reproduced its own claim on
+the merged tree: `vt_rms_norm_wide` at 0.0123 ms/call is exactly the 0.0123 its row
+reported, and the GEMV and lm_head deltas match theirs to within the leg spread.
+
+**WHERE THE REMAINING 3.1 ms IS.** llama.cpp Vulkan is 4.35 tok/s = 229.9 ms/token
+on the same 50.89 GiB weights on this box. `vt_matmul_vec` is now 92% of our GPU
+time at 248.0 GB/s over 52.1 GB/token. The two named residuals are both small:
+lm_head at 219.8 GB/s is 95.4% of the 230.3 GB/s ceiling MEASURED for its own shape
+(worth ~1.3 ms if it could reach the layer GEMVs' 248), and host at 5.3 ms.
+
+**A CORRECTION TO THIS CAMPAIGN'S ROOF ARITHMETIC.** The lm_head row established
+that GB10 does not reach its theoretical 273 GB/s, by running a known-good
+streaming kernel on the identical byte count: 230.3 GB/s. That correctly retires
+the 9.3 ms lm_head floor. It does NOT invalidate the layer-GEMV percentages, which
+MEASURE 243-248 GB/s -- above 230.3 -- so 230.3 is a ceiling for THAT SHAPE
+(k=5120, n=248320, one 2.54 GB buffer), not a device ceiling. Why one shape's
+ceiling sits ~7% below the same kernel's on layer weights is UNEXPLAINED, and is
+the same lone buffer the 20x bimodal collapse attaches to.
