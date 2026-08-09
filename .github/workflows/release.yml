@@ -145,7 +145,7 @@ jobs:
           docker run --rm \
             -e EVIDENCE_URL -e SOURCE_DATE_EPOCH -e SOURCE_SHA -e VERSION \
             -v "$GITHUB_WORKSPACE:/src" -w /src alpine:3.22 sh -euxc '
-              apk add --no-cache binutils build-base cmake file ninja python3 qemu-x86_64
+              apk add --no-cache bash binutils build-base cmake file ninja python3 qemu-x86_64
               scripts/build-cpu-release.sh \
                 linux-x86_64-musl-cpu-static x86_64 experimental-preview \
                 build-release-cpu-musl 1.2.5 /usr/bin/qemu-x86_64
@@ -329,7 +329,7 @@ jobs:
         run: |
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
-          mlx_root=$(python3 -c 'import mlx, pathlib; print(pathlib.Path(mlx.__file__).parent)')
+          mlx_root=$(python3 -c 'import importlib.metadata as m; d=m.distribution("mlx"); print(d.locate_file("mlx"))')
           mlx_license=$(python3 -c 'import importlib.metadata as m; d=m.distribution("mlx"); print(next(str(d.locate_file(f)) for f in d.files if f.name.lower() in {"license", "license.txt"}))')
           test -f "$mlx_root/lib/libmlx.dylib"
           test -f "$mlx_root/lib/mlx.metallib" -o -f "$mlx_root/mlx.metallib"
