@@ -9,11 +9,12 @@
 //     space), unlike Vulkan's W0 here (unified on its GB10 target, so its
 //     Alloc returns a directly host-dereferenceable mapped pointer).
 //     vt::Tensor.data for this backend is still a HOST pointer (aligned_alloc)
-//     so host-staged ops (PA/RoPE/Silu) and weight load via Backend::Copy keep
+//     so host-staged ops (PA/RoPE) and weight load via Backend::Copy keep
 //     working. Device-resident ttnn::Tensor shadows are keyed by that host
 //     pointer in tenstorrent_ops.cpp (RegisterHostBuffer / EnsureDevice /
-//     CommitDevice) so the matmul/norm chain can skip host download+reupload
-//     between ops. UnifiedMemory() remains false — the real hardware property.
+//     CommitDevice) so the matmul/norm/silu chain can skip host
+//     download+reupload between ops. UnifiedMemory() remains false — the real
+//     hardware property.
 //   * `SupportsGraphCapture()` stays FALSE. tt_metal trace capture
 //     (begin_trace_capture/end_trace_capture/replay_trace) is the eventual
 //     mapping the spec already names; not implemented here.

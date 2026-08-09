@@ -483,8 +483,8 @@ TEST_CASE("kTENSTORRENT kRmsNorm matches a host F32 reference (weight, no residu
   CHECK(max_abs_diff < 0.5f);
 }
 
-// Qwen3-dense MLP SwiGLU half. Host-staged: bit-exact vs cpu SiluAndMulKernel.
-TEST_CASE("kTENSTORRENT kSiluAndMul is BIT-EXACT vs a host F32 reference") {
+// Qwen3-dense MLP SwiGLU half. Device path (slice + silu + mul) via BF16 tiles.
+TEST_CASE("kTENSTORRENT kSiluAndMul matches host F32 within BF16 envelope") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
@@ -514,15 +514,18 @@ TEST_CASE("kTENSTORRENT kSiluAndMul is BIT-EXACT vs a host F32 reference") {
   backend.Free(mem_x);
   backend.Free(mem_out);
 
+  float max_abs_diff = 0.0f;
   for (int64_t i = 0; i < T; ++i) {
     for (int64_t j = 0; j < D; ++j) {
-      const float gate = host_x[i * 2 * D + j];
-      const float up = host_x[i * 2 * D + D + j];
+      const float gate = host_x[static_cast<size_t>(i * 2 * D + j)];
+      const float up = host_x[static_cast<size_t>(i * 2 * D + D + j)];
       const float ref = (gate / (1.0f + std::exp(-gate))) * up;
-      // Host-staged f32 path: bit-identical to the CPU formula.
-      REQUIRE(host_out[i * D + j] == ref);
+      max_abs_diff =
+          std::max(max_abs_diff, std::fabs(host_out[static_cast<size_t>(i * D + j)] - ref));
     }
   }
+  // BF16 tile storage + silu; same envelope as kRelu / kRmsNorm.
+  CHECK(max_abs_diff < 0.05f);
 }
 
 // Cast pair used by Qwen3 K/V cache dtype and logits paths.
