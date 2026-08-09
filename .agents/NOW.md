@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-08 -->
+<!-- now-updated: 2026-08-09 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -26,7 +26,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
-| Vulkan 27B lm_head | **column-blocked -1.07 ms/tok, 6/6**; roof is 230 not 273 | 20x bimodality REAL on an IDLE box; reclaim REFUTED |
+| Vulkan 27B decode | **4.285 vs llama.cpp 4.35 (98.5%)** BINDING, 8/8 clean legs @`81ea01f0`; GPU 240.3->227.7 ms/tok; GEMV lever CLOSED | 3.1 ms short. Open: 20x lm_head bimodality REAL on an IDLE box (reclaim REFUTED, mechanism unknown) |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | SPIKE; 30/30 | #129 |
