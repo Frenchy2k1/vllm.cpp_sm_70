@@ -1,0 +1,186 @@
+#version 450
+// vt::AttnQkNormRopeGate — the FUSED FULL-ATTENTION PREAMBLE: split q|gate +
+// per-head gemma-RMSNorm(q) and gemma-RMSNorm(k) + partial NeoX RoPE from a
+// precomputed cos/sin cache + gate passthrough, in ONE dispatch.
+//
+// UPSTREAM: vLLM's QKNormRoPEFusionPass
+// (vllm/compilation/passes/fusion/qk_norm_rope_fusion.py:188 -> _C.fused_qk_norm_rope,
+// itself fla `fused_qk_norm_rope.py:95-102`), the same citation the recipe carries
+// (include/vt/recipes.h:231-247).
+//
+// NUMERIC ORACLE: our own CPU reference AttnQkNormRopeGateKernel
+// (src/vt/cpu/cpu_ops.cpp:956-1010), transcribed element for element — the
+// GemmaNormElem grouping `v * inv * wj` with `wj = w [+1 if gemma]`
+// (cpu_ops.cpp:944-948), the rotation spelled `ni*c - nih*sn` / `ni*sn + nih*c`
+// (:980, :986), and the tail dims [rot, Dh) normed but UNROTATED (:988).
+//
+// DISPATCH SHAPE ported from the CUDA kernel (src/vt/cuda/cuda_ops.cu:1316-1383):
+// ONE WORKGROUP PER (token, head) over Hq + Hkv slots — CUDA's dim3(t, hq+hkv)
+// grid (:1394), flattened here because Vulkan's workgroup count is consumed as a
+// single x extent by VulkanContext::Dispatch. The q heads occupy [0, Hq) and the
+// kv heads [Hq, Hq+Hkv), exactly as CUDA's `is_q = head < hq` split. The workgroup
+// tree-reduces the head row's mean square (vt_common.glsl vt_tg_sum, the idiom
+// vt_rms_norm_gated.comp already uses) and then RECOMPUTES the two paired normed
+// elements per output rather than round-tripping them through shared memory —
+// CUDA's choice at :1359-1361, kept so the two devices compute the same
+// expression.
+//
+// THIS IS A FUSION OF TWO KERNELS THAT ALREADY WORK. The reduction half is
+// vt_rms_norm_gated.comp:51-62; the cos/sin indexing is vt_rope_from_cache.comp,
+// with ONE difference that matters: there the cache is indexed by
+// `position * rotary_dim` because the table is the model-wide [P, rot] cache,
+// while HERE the cache is the per-step [T, rot] fill that kRopeCosSinCache
+// produced for exactly these tokens (ops.cpp:1533-1535 validates
+// cos_sin.shape[0] == T), so the row is `tok * rot` — no positions operand at
+// all. cpu_ops.cpp:995 does the same.
+//
+// WHY THE CACHE IS STILL BUILT ON THE HOST: kRopeCosSinCache constructs its
+// angles in DOUBLE (cpu_ops.cpp:932-936) and this is vLLM's own split — see the
+// argument in vt_rope_from_cache.comp. This kernel is the apply side of it.
+//
+// TIER: NMSE, not bit-exact. The recipe calls the standalone op a byte-exact
+// golden against the composed RmsNorm+RmsNorm+RopeFromCache+gate chain
+// (recipes.h:237), and that is still true device-locally, but the workgroup tree
+// reduction changes the ACCUMULATION ORDER of the mean square relative to the CPU
+// tier's sequential loop — the same trade vt_rms_norm and vt_rms_norm_gated
+// already make. The scale is `1.0 / sqrt(...)`, NOT `inversesqrt`
+// (vt_common.glsl § DELIBERATE DIVERGENCES).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// qgate / kf: the two SOURCE rows, dtype-erased pairs (§ STORAGE MODEL).
+layout(binding = 0) readonly buffer QGb32 { uint v[]; } QG32;
+layout(binding = 1) readonly buffer QGb16 { uint16_t v[]; } QG16;
+layout(binding = 2) readonly buffer KFb32 { uint v[]; } KF32;
+layout(binding = 3) readonly buffer KFb16 { uint16_t v[]; } KF16;
+// q_out / k_out / gate_out.
+layout(binding = 4) buffer QOb32 { uint v[]; } QO32;
+layout(binding = 5) buffer QOb16 { uint16_t v[]; } QO16;
+layout(binding = 6) buffer KOb32 { uint v[]; } KO32;
+layout(binding = 7) buffer KOb16 { uint16_t v[]; } KO16;
+layout(binding = 8) buffer GOb32 { uint v[]; } GO32;
+layout(binding = 9) buffer GOb16 { uint16_t v[]; } GO16;
+// q_norm / k_norm / cos_sin are f32 BY CONTRACT (src/vt/ops.cpp:1539-1541), so
+// they take ONE binding each rather than a dtype-erased pair whose 16-bit half
+// could never be taken — the arrangement vt_gdn_post_conv already uses for its
+// f32-by-contract operands.
+layout(binding = 10) readonly buffer QNb { uint v[]; } QN;
+layout(binding = 11) readonly buffer KNb { uint v[]; } KN;
+layout(binding = 12) readonly buffer CSb { uint v[]; } CS;
+
+// The three dtype axes the op contract actually admits (ops.cpp:1524-1538):
+// qgate and kf share ONE dtype; q_out and k_out share ONE dtype; gate_out is
+// either that same dtype or f32 while q/k are bf16 (the FA-2 prefill combo), so
+// it is its own axis. q_norm/k_norm/cos_sin are f32 and are NOT axes.
+layout(constant_id = 0) const uint VT_QKN_SRC_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_QKN_QK_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_QKN_GATE_DT = VT_DT_F32;
+
+layout(push_constant) uniform Params {
+  uint hq;         // q heads
+  uint hkv;        // kv heads
+  uint dh;         // head dim
+  uint rot;        // rotary_dim (<= dh)
+  uint half_dim;   // rot / 2
+  uint qgate_rs;   // qgate.stride[0], in ELEMENTS (>= hq*2*dh: a packed view)
+  uint kf_rs;      // kf.stride[0], in ELEMENTS
+  uint gemma;      // RmsNormArgs::gemma — weight is (1+w) when set
+  uint qg_off, kf_off, qo_off, ko_off, go_off, qn_off, kn_off, cs_off;
+  float eps;
+} p;
+
+// cpu_ops.cpp:944-948 GemmaNormElem. The +1 rides a UNIFORM branch, not
+// `w + float(gemma)`: `-0.0 + 0.0` is `+0.0`, so the additive spelling would
+// flip the sign of a zero weight's output bits on the gemma=false path.
+float qkn_elem(float v, float inv, float w) {
+  float wj = p.gemma != 0u ? w + 1.0 : w;
+  return v * inv * wj;
+}
+
+float qkn_src(bool is_q, uint idx) {
+  return is_q ? VT_LOAD(QG32, QG16, VT_QKN_SRC_DT, p.qg_off, idx)
+              : VT_LOAD(KF32, KF16, VT_QKN_SRC_DT, p.kf_off, idx);
+}
+
+float qkn_w(bool is_q, uint j) {
+  return is_q ? uintBitsToFloat(QN.v[(p.qn_off >> 2) + j])
+              : uintBitsToFloat(KN.v[(p.kn_off >> 2) + j]);
+}
+
+void qkn_store(bool is_q, uint idx, float v) {
+  if (is_q) {
+    VT_STORE(QO32, QO16, VT_QKN_QK_DT, p.qo_off, idx, v);
+  } else {
+    VT_STORE(KO32, KO16, VT_QKN_QK_DT, p.ko_off, idx, v);
+  }
+}
+
+void main() {
+  uint heads = p.hq + p.hkv;
+  uint wg = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  // Token-major so consecutive workgroups walk consecutive heads of ONE source
+  // row: the q heads of a token are adjacent in qgate.
+  uint tok = wg / heads;
+  uint head = wg % heads;
+  bool is_q = head < p.hq;
+
+  // cuda_ops.cu:1331-1342. Every one of these is workgroup-uniform.
+  uint src_base;
+  uint out_base;
+  uint gate_base = 0u;
+  if (is_q) {
+    uint qrow = tok * p.qgate_rs + head * 2u * p.dh;
+    src_base = qrow;             // q half [0, dh)
+    gate_base = qrow + p.dh;     // gate half [dh, 2dh)
+    out_base = (tok * p.hq + head) * p.dh;
+  } else {
+    uint hk = head - p.hq;
+    src_base = tok * p.kf_rs + hk * p.dh;
+    out_base = (tok * p.hkv + hk) * p.dh;
+  }
+
+  // ---- gemma-RMSNorm reduction over Dh, f32 variance (cpu_ops.cpp:969-974) ----
+  float partial = 0.0;
+  for (uint j = tid; j < p.dh; j += VT_TG) {
+    float v = qkn_src(is_q, src_base + j);
+    partial += v * v;
+  }
+  float inv = 1.0 / sqrt(vt_tg_sum(tid, partial) / float(p.dh) + p.eps);
+
+  // ---- partial NeoX RoPE + write (cpu_ops.cpp:975-991) ----
+  uint cs = (p.cs_off >> 2) + tok * p.rot;
+  for (uint j = tid; j < p.dh; j += VT_TG) {
+    if (j < p.half_dim) {
+      float ni = qkn_elem(qkn_src(is_q, src_base + j), inv, qkn_w(is_q, j));
+      float nih = qkn_elem(qkn_src(is_q, src_base + j + p.half_dim), inv,
+                           qkn_w(is_q, j + p.half_dim));
+      float c = uintBitsToFloat(CS.v[cs + j]);
+      float sn = uintBitsToFloat(CS.v[cs + p.half_dim + j]);
+      qkn_store(is_q, out_base + j, ni * c - nih * sn);
+    } else if (j < p.rot) {
+      uint i = j - p.half_dim;
+      float ni = qkn_elem(qkn_src(is_q, src_base + i), inv, qkn_w(is_q, i));
+      float nih = qkn_elem(qkn_src(is_q, src_base + i + p.half_dim), inv,
+                           qkn_w(is_q, i + p.half_dim));
+      float c = uintBitsToFloat(CS.v[cs + i]);
+      float sn = uintBitsToFloat(CS.v[cs + p.half_dim + i]);
+      qkn_store(is_q, out_base + j, ni * sn + nih * c);
+    } else {
+      // Tail dims are normed but NOT rotated (cpu_ops.cpp:988-989).
+      qkn_store(is_q, out_base + j,
+                qkn_elem(qkn_src(is_q, src_base + j), inv, qkn_w(is_q, j)));
+    }
+  }
+
+  // ---- gate passthrough, q heads only: the raw second Dh of the q|gate pair,
+  // no norm and no rope (cpu_ops.cpp:999-1002, cuda_ops.cu:1378-1382) ----
+  if (is_q) {
+    for (uint j = tid; j < p.dh; j += VT_TG) {
+      VT_STORE(GO32, GO16, VT_QKN_GATE_DT, p.go_off, out_base + j,
+               VT_LOAD(QG32, QG16, VT_QKN_SRC_DT, p.qg_off, gate_base + j));
+    }
+  }
+}
