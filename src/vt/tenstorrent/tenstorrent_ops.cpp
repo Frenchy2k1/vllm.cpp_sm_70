@@ -11,13 +11,12 @@
 // optional residual stream; kEmbedding i32/i64 ids. Every other shape/dtype
 // is a VT_CHECK failure — no CPU reference tier (UnifiedMemory()==false).
 //
-// HOST-STAGED OPS (kQkvSplit, kReshapeAndCache, kPagedAttention): this
-// backend's Alloc is host memory (tenstorrent_backend.cpp). QkvSplit and
-// ReshapeAndCache are pure contiguous / stride-aware copies — a device
-// round-trip would only burn PCIe for bit-identical results. PagedAttention
-// uses the CPU-oracle f32 softmax over the host-resident paged cache; mapping
-// vLLM's block-table contract onto ttnn::sdpa_decode is deferred to the
-// device-resident-tensor redesign the spec already names.
+// HOST-STAGED OPS (kReshapeAndCache, kPagedAttention): this backend's Alloc is
+// host memory (tenstorrent_backend.cpp). ReshapeAndCache is a pure contiguous /
+// stride-aware page write. PagedAttention uses the CPU-oracle f32 softmax over
+// the host-resident paged cache; mapping vLLM's block-table contract onto
+// ttnn::sdpa_decode is deferred. kQkvSplit is hybrid: device-slice when the
+// merged qkv already has a resident shadow (post MatmulBT), else host memcpy.
 #include "vt/backend.h"
 #include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
@@ -49,6 +48,7 @@
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
+#include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -171,7 +171,9 @@ ttnn::Tensor UploadRows(const float* data, uint32_t rows, uint32_t cols, MeshDev
 }
 
 // Return a TILE BFLOAT16 device tensor for rank-2 `t`, uploading only when the
-// device shadow is missing or stale.
+// device shadow is missing or stale. Same-numel reshape reuses a resident
+// shadow without host round-trip — needed so qk-RmsNorm on a [T*H, Dh] view
+// can consume QkvSplit's [T, H*Dh] device result.
 ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   VT_CHECK(t.rank == 2 && t.IsContiguous(),
            "tenstorrent: EnsureDevice2D expects contiguous rank-2");
@@ -180,9 +182,21 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
-    if (s != nullptr && s->device_current && s->device.has_value() &&
-        s->dev_rows == rows && s->dev_cols == cols) {
-      return *s->device;
+    if (s != nullptr && s->device_current && s->device.has_value()) {
+      if (s->dev_rows == rows && s->dev_cols == cols) {
+        return *s->device;
+      }
+      const uint64_t have =
+          static_cast<uint64_t>(s->dev_rows) * static_cast<uint64_t>(s->dev_cols);
+      const uint64_t want = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+      if (have == want) {
+        ttnn::Tensor reshaped =
+            ttnn::reshape(*s->device, ttnn::Shape({rows, cols}));
+        s->device = reshaped;
+        s->dev_rows = rows;
+        s->dev_cols = cols;
+        return *s->device;
+      }
     }
   }
   // Need host truth to upload (may download first if only device was current
@@ -200,6 +214,15 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
     s->host_current = true;
   }
   return dev;
+}
+
+// True when `t` already has a device-resident shadow matching [rows, cols]
+// (exact shape). Used to pick device vs host kernels without forcing upload.
+bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(t.data);
+  return s != nullptr && s->device_current && s->device.has_value() &&
+         s->dev_rows == rows && s->dev_cols == cols;
 }
 
 // Publish a device result as the current value of `out` WITHOUT downloading
@@ -872,8 +895,12 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions
                 args.is_neox_style);
 }
 
-// kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
-// (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy when dtypes match.
+// kQkvSplit: column split of merged [T, q+k+v] into q/k/v (cpu_ops QkvSplitKernel).
+//
+// Device path when qkv already has a resident shadow (post MatmulBT): slice the
+// last dim on-device and CommitDevice2D each shard so qk-RmsNorm can reshape-
+// reuse without download+reupload. Host path (bit-exact memcpy) when qkv is
+// host-only — unit tests and weight-load style callers.
 void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
   VT_CHECK(qkv.rank == 2 && IsFloatDType(qkv.dtype),
            "tenstorrent kQkvSplit: rank-2 float qkv required");
@@ -882,13 +909,42 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                qkv.IsContiguous(),
            "tenstorrent kQkvSplit: contiguous required");
-  EnsureHost(qkv);
   const int64_t t = qkv.shape[0];
   const int64_t q_dim = q_out.Numel() / t;
   const int64_t k_dim = k_out.Numel() / t;
   const int64_t v_dim = v_out.Numel() / t;
   const int64_t total = q_dim + k_dim + v_dim;
   VT_CHECK(qkv.shape[1] == total, "tenstorrent kQkvSplit: inner dim mismatch");
+  VT_CHECK(q_out.rank == 2 && k_out.rank == 2 && v_out.rank == 2 &&
+               q_out.shape[0] == t && k_out.shape[0] == t && v_out.shape[0] == t &&
+               q_out.shape[1] == q_dim && k_out.shape[1] == k_dim && v_out.shape[1] == v_dim,
+           "tenstorrent kQkvSplit: out shapes must be [T, *]");
+
+  const uint32_t tu = static_cast<uint32_t>(t);
+  const uint32_t total_u = static_cast<uint32_t>(total);
+  const uint32_t qd = static_cast<uint32_t>(q_dim);
+  const uint32_t kd = static_cast<uint32_t>(k_dim);
+  const uint32_t vd = static_cast<uint32_t>(v_dim);
+
+  if (DeviceShadowExact(qkv, tu, total_u)) {
+    MeshDevice& device = SharedMeshDevice();
+    ttnn::Tensor dev = EnsureDevice2D(qkv, device);
+    ttnn::Tensor dq = ttnn::slice(dev, ttsl::SmallVector<uint32_t>{0, 0},
+                                  ttsl::SmallVector<uint32_t>{tu, qd},
+                                  ttsl::SmallVector<uint32_t>{1, 1});
+    ttnn::Tensor dk = ttnn::slice(dev, ttsl::SmallVector<uint32_t>{0, qd},
+                                  ttsl::SmallVector<uint32_t>{tu, qd + kd},
+                                  ttsl::SmallVector<uint32_t>{1, 1});
+    ttnn::Tensor dv = ttnn::slice(dev, ttsl::SmallVector<uint32_t>{0, qd + kd},
+                                  ttsl::SmallVector<uint32_t>{tu, qd + kd + vd},
+                                  ttsl::SmallVector<uint32_t>{1, 1});
+    CommitDevice2D(q_out, std::move(dq));
+    CommitDevice2D(k_out, std::move(dk));
+    CommitDevice2D(v_out, std::move(dv));
+    return;
+  }
+
+  EnsureHost(qkv);
   const size_t esz = SizeOf(qkv.dtype);
   const auto* src = static_cast<const uint8_t*>(qkv.data);
   auto* qdst = static_cast<uint8_t*>(q_out.data);
