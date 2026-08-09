@@ -19,6 +19,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -40,6 +41,7 @@
 #include "vt/cuda/rmsnorm_gated_fast.h"
 #include "vt/cuda/tile/cp_async.cuh"
 #include "vt/cuda/tile/tma_pipeline.cuh"
+#include "vt/cuda/triton_aot_arch_dispatch.h"
 #include "vt/ops.h"
 
 #ifdef VLLM_CPP_TRITON
@@ -51,46 +53,96 @@
 // runtime. One spec per gate-model GDN shape: h48 (Qwen3.6-27B), h32 (35B).
 // gdn_deltah_hNN_default(stream, k, v, w, v_new, g, gk, h, h0, ht, cu_seqlens,
 //   chunk_offsets, T, NH) launches the FLA chunk_gated_delta_rule_fwd_kernel.
-extern "C" {
-#include "gdn_deltah_h48.h"
-#include "gdn_deltah_h32.h"
-// GDN chunk_o (the output kernel): gdn_chunko_hNN_default, and optionally
-// gdn_chunko_bf16_hNN_default when the vendored artifacts are present.
-// See triton_kernels/chunk_o.py. o(=out) is f32 for the default GDN out dtype;
-// bf16 mirrors the vLLM-faithful recurrence-output dtype once regenerated.
-#include "gdn_chunko_h48.h"
-#include "gdn_chunko_h32.h"
-#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
-#include "gdn_chunko_bf16_h48.h"
-#include "gdn_chunko_bf16_h32.h"
-#endif
-// GDN WU pipeline (kkt -> solve_tril -> recompute_w_u), 3 stable dispatchers each.
-// See triton_kernels/{chunk_scaled_dot_kkt,solve_tril,wy_fast}.py.
-#include "gdn_kkt_h48.h"
-#include "gdn_kkt_h32.h"
-#include "gdn_tril_h48.h"
-#include "gdn_tril_h32.h"
-#include "gdn_wu_h48.h"
-#include "gdn_wu_h32.h"
-// GDN packed pure-decode recurrence (fused_recurrent_gated_delta_rule packed
-// decode): gdn_decode_h48_default / gdn_decode_h32_default. See
-// triton_kernels/fused_recurrent_packed_decode.py. The MEASURED codegen-bound
-// lever (dgx phase1 2026-07-16): REG:205/0-spill under Triton vs REG:255+STACK:48
-// (spills) as hand-CUDA at BK=128.
-#include "gdn_decode_h48.h"
-#include "gdn_decode_h32.h"
-// KDA chunk-prefill family (Kimi-Linear; H=32). The FLA chunk_kda_with_fused_gate
-// forward: kda_gate_cumsum -> kkt(inter+intra) -> solve_tril (REUSES gdn_tril_h32)
-// -> recompute_w_u (kda_wu) -> chunk_delta_h (kda_deltah_h32) -> chunk_gla_o
-// (kda_gla_o). See triton_kernels/{kda_gate_cumsum,chunk_kda_kkt,recompute_w_u_kda,
-// chunk_gla_o}.py + chunk_delta_h.py (kda_deltah pin) + .agents/specs/kimi-linear.md §17.
-#include "kda_gate_cumsum.h"
-#include "kda_kkt_inter.h"
-#include "kda_kkt_intra.h"
-#include "kda_wu.h"
-#include "kda_deltah_h32.h"
-#include "kda_gla_o.h"
-}
+#include "triton_aot_multiarch.h"
+
+#define VT_AOT_SYMBOL_IMPL(ARCH, NAME) vt_aot_##ARCH##_##NAME##_default
+#define VT_AOT_SYMBOL(ARCH, NAME) VT_AOT_SYMBOL_IMPL(ARCH, NAME)
+#define VT_AOT_LOAD_SYMBOL_IMPL(ARCH, NAME) vt_aot_##ARCH##_load_##NAME
+#define VT_AOT_LOAD_SYMBOL(ARCH, NAME) VT_AOT_LOAD_SYMBOL_IMPL(ARCH, NAME)
+#define VT_TRITON_AOT_CALL(NAME, ...)                                      \
+  vt::cuda::DispatchTritonAot(                                             \
+      vt::cuda::GetDeviceCaps().sm_major,                                  \
+      vt::cuda::GetDeviceCaps().sm_minor, CUDA_ERROR_NOT_SUPPORTED,        \
+      std::array{&VT_AOT_SYMBOL(sm_80, NAME),                               \
+                 &VT_AOT_SYMBOL(sm_86, NAME),                              \
+                 &VT_AOT_SYMBOL(sm_89, NAME),                              \
+                 &VT_AOT_SYMBOL(sm_90a, NAME),                             \
+                 &VT_AOT_SYMBOL(sm_100a, NAME),                            \
+                 &VT_AOT_SYMBOL(sm_121a, NAME)},                           \
+      __VA_ARGS__)
+#define VT_TRITON_AOT_LOAD(NAME)                                          \
+  vt::cuda::DispatchTritonAotVoid(                                        \
+      vt::cuda::GetDeviceCaps().sm_major,                                 \
+      vt::cuda::GetDeviceCaps().sm_minor,                                 \
+      std::array{&VT_AOT_LOAD_SYMBOL(sm_80, NAME),                         \
+                 &VT_AOT_LOAD_SYMBOL(sm_86, NAME),                        \
+                 &VT_AOT_LOAD_SYMBOL(sm_89, NAME),                        \
+                 &VT_AOT_LOAD_SYMBOL(sm_90a, NAME),                       \
+                 &VT_AOT_LOAD_SYMBOL(sm_100a, NAME),                      \
+                 &VT_AOT_LOAD_SYMBOL(sm_121a, NAME)})
+
+#define gdn_deltah_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_deltah_h48, __VA_ARGS__)
+#define gdn_deltah_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_deltah_h32, __VA_ARGS__)
+#define gdn_chunko_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_h48, __VA_ARGS__)
+#define gdn_chunko_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_h32, __VA_ARGS__)
+#define gdn_chunko_bf16_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_bf16_h48, __VA_ARGS__)
+#define gdn_chunko_bf16_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_chunko_bf16_h32, __VA_ARGS__)
+#define gdn_kkt_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_kkt_h48, __VA_ARGS__)
+#define gdn_kkt_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_kkt_h32, __VA_ARGS__)
+#define gdn_tril_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_tril_h48, __VA_ARGS__)
+#define gdn_tril_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_tril_h32, __VA_ARGS__)
+#define gdn_wu_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_wu_h48, __VA_ARGS__)
+#define gdn_wu_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_wu_h32, __VA_ARGS__)
+#define gdn_decode_h48_default(...) \
+  VT_TRITON_AOT_CALL(gdn_decode_h48, __VA_ARGS__)
+#define gdn_decode_h32_default(...) \
+  VT_TRITON_AOT_CALL(gdn_decode_h32, __VA_ARGS__)
+#define kda_gate_cumsum_default(...) \
+  VT_TRITON_AOT_CALL(kda_gate_cumsum, __VA_ARGS__)
+#define kda_kkt_inter_default(...) \
+  VT_TRITON_AOT_CALL(kda_kkt_inter, __VA_ARGS__)
+#define kda_kkt_intra_default(...) \
+  VT_TRITON_AOT_CALL(kda_kkt_intra, __VA_ARGS__)
+#define kda_wu_default(...) VT_TRITON_AOT_CALL(kda_wu, __VA_ARGS__)
+#define kda_deltah_h32_default(...) \
+  VT_TRITON_AOT_CALL(kda_deltah_h32, __VA_ARGS__)
+#define kda_gla_o_default(...) VT_TRITON_AOT_CALL(kda_gla_o, __VA_ARGS__)
+
+#define VT_DEFINE_TRITON_AOT_LOADER(NAME) \
+  static void load_##NAME() { (void)VT_TRITON_AOT_LOAD(NAME); }
+VT_DEFINE_TRITON_AOT_LOADER(gdn_deltah_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_deltah_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_bf16_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_chunko_bf16_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_kkt_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_kkt_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_tril_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_tril_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_wu_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_wu_h32)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_decode_h48)
+VT_DEFINE_TRITON_AOT_LOADER(gdn_decode_h32)
+VT_DEFINE_TRITON_AOT_LOADER(kda_gate_cumsum)
+VT_DEFINE_TRITON_AOT_LOADER(kda_kkt_inter)
+VT_DEFINE_TRITON_AOT_LOADER(kda_kkt_intra)
+VT_DEFINE_TRITON_AOT_LOADER(kda_wu)
+VT_DEFINE_TRITON_AOT_LOADER(kda_deltah_h32)
+VT_DEFINE_TRITON_AOT_LOADER(kda_gla_o)
+#undef VT_DEFINE_TRITON_AOT_LOADER
 #endif
 
 namespace vt::cuda {
@@ -4476,6 +4528,16 @@ static bool GdnTritonEnvOn(const char* n) {
   return e == nullptr || e[0] != '0';
 }
 
+int CurrentTritonAotTreeIndex() {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid) return -1;
+  return TritonAotTreeIndex(caps.sm_major, caps.sm_minor);
+}
+
+bool TritonAotAvailableOnCurrentDevice() {
+  return CurrentTritonAotTreeIndex() >= 0;
+}
+
 // Persistent per-stream scratch for the Triton-AOT GDN build. This mirrors the
 // caching allocator vLLM gets through PyTorch: buffers grow to the largest shape
 // seen on a stream and are reused by subsequent GDN layers/steps. Reuse is safe
@@ -4620,29 +4682,29 @@ T* EnsureGdnScratch(GdnScratchBuf& buf, size_t count, cudaStream_t s, const char
 // so concurrent first use from separate queues cannot double-load or race those
 // globals. CUDA primary-context modules are process-wide for the active device.
 struct GdnAotModuleOnce {
-  std::once_flag deltah_h48;
-  std::once_flag deltah_h32;
-  std::once_flag chunko_h48;
-  std::once_flag chunko_h32;
+  std::array<std::once_flag, 6> deltah_h48;
+  std::array<std::once_flag, 6> deltah_h32;
+  std::array<std::once_flag, 6> chunko_h48;
+  std::array<std::once_flag, 6> chunko_h32;
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
-  std::once_flag chunko_bf16_h48;
-  std::once_flag chunko_bf16_h32;
+  std::array<std::once_flag, 6> chunko_bf16_h48;
+  std::array<std::once_flag, 6> chunko_bf16_h32;
 #endif
-  std::once_flag kkt_h48;
-  std::once_flag tril_h48;
-  std::once_flag wu_h48;
-  std::once_flag kkt_h32;
-  std::once_flag tril_h32;
-  std::once_flag wu_h32;
-  std::once_flag decode_h48;
-  std::once_flag decode_h32;
+  std::array<std::once_flag, 6> kkt_h48;
+  std::array<std::once_flag, 6> tril_h48;
+  std::array<std::once_flag, 6> wu_h48;
+  std::array<std::once_flag, 6> kkt_h32;
+  std::array<std::once_flag, 6> tril_h32;
+  std::array<std::once_flag, 6> wu_h32;
+  std::array<std::once_flag, 6> decode_h48;
+  std::array<std::once_flag, 6> decode_h32;
   // KDA chunk-prefill family (Kimi-Linear; H=32).
-  std::once_flag kda_gate_cumsum;
-  std::once_flag kda_kkt_inter;
-  std::once_flag kda_kkt_intra;
-  std::once_flag kda_wu;
-  std::once_flag kda_deltah_h32;
-  std::once_flag kda_gla_o;
+  std::array<std::once_flag, 6> kda_gate_cumsum;
+  std::array<std::once_flag, 6> kda_kkt_inter;
+  std::array<std::once_flag, 6> kda_kkt_intra;
+  std::array<std::once_flag, 6> kda_wu;
+  std::array<std::once_flag, 6> kda_deltah_h32;
+  std::array<std::once_flag, 6> kda_gla_o;
 };
 
 GdnAotModuleOnce& GdnAotModules() {
@@ -4652,43 +4714,47 @@ GdnAotModuleOnce& GdnAotModules() {
 
 void EnsureGdnDeltaHLoaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.deltah_h48, load_gdn_deltah_h48);
+    std::call_once(modules.deltah_h48[tree], load_gdn_deltah_h48);
   } else {
-    std::call_once(modules.deltah_h32, load_gdn_deltah_h32);
+    std::call_once(modules.deltah_h32[tree], load_gdn_deltah_h32);
   }
 }
 
 void EnsureGdnChunkOF32Loaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.chunko_h48, load_gdn_chunko_h48);
+    std::call_once(modules.chunko_h48[tree], load_gdn_chunko_h48);
   } else {
-    std::call_once(modules.chunko_h32, load_gdn_chunko_h32);
+    std::call_once(modules.chunko_h32[tree], load_gdn_chunko_h32);
   }
 }
 
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
 void EnsureGdnChunkOBF16Loaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.chunko_bf16_h48, load_gdn_chunko_bf16_h48);
+    std::call_once(modules.chunko_bf16_h48[tree], load_gdn_chunko_bf16_h48);
   } else {
-    std::call_once(modules.chunko_bf16_h32, load_gdn_chunko_bf16_h32);
+    std::call_once(modules.chunko_bf16_h32[tree], load_gdn_chunko_bf16_h32);
   }
 }
 #endif
 
 void EnsureGdnWULoaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.kkt_h48, load_gdn_kkt_h48);
-    std::call_once(modules.tril_h48, load_gdn_tril_h48);
-    std::call_once(modules.wu_h48, load_gdn_wu_h48);
+    std::call_once(modules.kkt_h48[tree], load_gdn_kkt_h48);
+    std::call_once(modules.tril_h48[tree], load_gdn_tril_h48);
+    std::call_once(modules.wu_h48[tree], load_gdn_wu_h48);
   } else {
-    std::call_once(modules.kkt_h32, load_gdn_kkt_h32);
-    std::call_once(modules.tril_h32, load_gdn_tril_h32);
-    std::call_once(modules.wu_h32, load_gdn_wu_h32);
+    std::call_once(modules.kkt_h32[tree], load_gdn_kkt_h32);
+    std::call_once(modules.tril_h32[tree], load_gdn_tril_h32);
+    std::call_once(modules.wu_h32[tree], load_gdn_wu_h32);
   }
 }
 
@@ -4696,14 +4762,16 @@ void EnsureGdnWULoaded(int64_t hv_n) {
 // select packed decode; Hv=32 serves the dense 4B model.
 void EnsureGdnPackedDecodeLoaded(int64_t hv_n) {
   auto& modules = GdnAotModules();
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
   if (hv_n == 48) {
-    std::call_once(modules.decode_h48, load_gdn_decode_h48);
+    std::call_once(modules.decode_h48[tree], load_gdn_decode_h48);
   } else {
-    std::call_once(modules.decode_h32, load_gdn_decode_h32);
+    std::call_once(modules.decode_h32[tree], load_gdn_decode_h32);
   }
 }
 
 void EnsureAllGdnAotModulesLoaded() {
+  if (!TritonAotAvailableOnCurrentDevice()) return;
   for (const int64_t hv_n : {48, 32}) {
     EnsureGdnDeltaHLoaded(hv_n);
     EnsureGdnChunkOF32Loaded(hv_n);
@@ -4738,6 +4806,7 @@ bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
                            const Tensor& dt_bias, Tensor& state,
                            const Tensor& state_idx, const GdnArgs& args) {
   // Default ON: fire unless VT_GDN_PACKED_DECODE_TRITON leads with '0' (rollback).
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnPackedDecodeTritonFlagIsOn(
           std::getenv("VT_GDN_PACKED_DECODE_TRITON")))
     return false;
@@ -4803,6 +4872,7 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
                      const __nv_bfloat16* k, const __nv_bfloat16* u, const __nv_bfloat16* w,
                      const float* gcum, const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t n_seq, int64_t t_tot) {
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnTritonEnvOn("VT_GDN_DELTAH_TRITON")) return false;  // default ON (see GdnTritonEnvOn); =0 restores hand path
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -4836,6 +4906,7 @@ bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t nt_tot, int64_t t_tot) {
   static_assert(std::is_same<Tout, float>::value || std::is_same<Tout, __nv_bfloat16>::value,
                 "Triton chunk_o supports f32 or bf16 output");
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnTritonEnvOn("VT_GDN_CHUNKO_TRITON")) return false;
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -4898,6 +4969,7 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
                  const __nv_bfloat16* v, const float* beta, const float* gcum, const int32_t* qsl,
                  const int32_t* cidx, int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv,
                  int64_t nt_tot, int64_t t_tot, GdnWuScratch* scratch) {
+  if (!TritonAotAvailableOnCurrentDevice()) return false;
   if (!GdnTritonEnvOn("VT_GDN_WU_TRITON")) return false;
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -4976,13 +5048,14 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
 #ifdef VLLM_CPP_TRITON
 void EnsureKdaChunkLoaded() {
   auto& m = GdnAotModules();
-  std::call_once(m.kda_gate_cumsum, load_kda_gate_cumsum);
-  std::call_once(m.kda_kkt_inter, load_kda_kkt_inter);
-  std::call_once(m.kda_kkt_intra, load_kda_kkt_intra);
-  std::call_once(m.tril_h32, load_gdn_tril_h32);  // REUSE gdn_tril_h32 (byte-identical sig)
-  std::call_once(m.kda_wu, load_kda_wu);
-  std::call_once(m.kda_deltah_h32, load_kda_deltah_h32);
-  std::call_once(m.kda_gla_o, load_kda_gla_o);
+  const std::size_t tree = static_cast<std::size_t>(CurrentTritonAotTreeIndex());
+  std::call_once(m.kda_gate_cumsum[tree], load_kda_gate_cumsum);
+  std::call_once(m.kda_kkt_inter[tree], load_kda_kkt_inter);
+  std::call_once(m.kda_kkt_intra[tree], load_kda_kkt_intra);
+  std::call_once(m.tril_h32[tree], load_gdn_tril_h32);  // REUSE gdn_tril_h32 (byte-identical sig)
+  std::call_once(m.kda_wu[tree], load_kda_wu);
+  std::call_once(m.kda_deltah_h32[tree], load_kda_deltah_h32);
+  std::call_once(m.kda_gla_o[tree], load_kda_gla_o);
 }
 
 template <typename Tin>
@@ -5162,7 +5235,8 @@ void KdaChunkPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const 
   const float baked_scale = 1.0f / std::sqrt(static_cast<float>(dk));
   const bool geom_ok = (hk_n == 32 && hv_n == 32 && dk == 128 && dv == 128 && has_bias &&
                         std::fabs(args.scale - baked_scale) <= 1e-6f * baked_scale && T > 1);
-  if (geom_ok && GdnTritonEnvOn("VT_KDA_CHUNK_TRITON")) {
+  if (geom_ok && TritonAotAvailableOnCurrentDevice() &&
+      GdnTritonEnvOn("VT_KDA_CHUNK_TRITON")) {
     LaunchKdaChunkPrefill(s, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, qsl, args);
     return;
   }

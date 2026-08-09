@@ -298,6 +298,9 @@ jobs:
         run: |
           cmake -P cmake/CudaArchFeaturesTest.cmake
           cmake -P cmake/CudaSourceGencodeTest.cmake
+          cmake -P cmake/TritonAOTMultiArchTest.cmake
+          python3 -m unittest tests.scripts.test_check_cuda_fat_gencode
+          python3 -m unittest tests.scripts.test_check_triton_aot_multiarch
   cuda-fat-build:
     # W1 release prerequisite: compile the primary heterogeneous CUDA archive,
     # then inspect both compile_commands.json and the linked archive. No GPU is
@@ -315,7 +318,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates cmake g++ git ninja-build python3
+            binutils ca-certificates cmake g++ git ninja-build python3
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v4
       - name: Configure ten-SM static library
@@ -326,7 +329,7 @@ jobs:
             -DVLLM_CPP_CUDA=ON \
             -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
             -DVLLM_CPP_CUTLASS_FETCH=ON \
-            -DVLLM_CPP_TRITON=OFF \
+            -DVLLM_CPP_TRITON=ON \
             -DVLLM_CPP_BUILD_TESTS=OFF \
             -DVLLM_CPP_BUILD_EXAMPLES=OFF \
             -DVLLM_CPP_SERVER=OFF
@@ -335,6 +338,9 @@ jobs:
           cmake --build build-cuda-fat --target vllm --parallel 2
           python3 scripts/check-cuda-fat-gencode.py \
             --compile-commands build-cuda-fat/compile_commands.json \
+            --library build-cuda-fat/libvllm.a
+          python3 scripts/check-triton-aot-multiarch.py \
+            --vendored-root src/vt/cuda/triton_aot_vendored \
             --library build-cuda-fat/libvllm.a
   vulkan-spirv-freshness:
     # The Vulkan backend commits its SPIR-V (src/vt/vulkan/vulkan_spirv.h) instead
