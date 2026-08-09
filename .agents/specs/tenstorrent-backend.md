@@ -1,7 +1,7 @@
 # Tenstorrent (Blackhole) backend — spike spec (DRAFT, external proposal)
 
-Status: **DRAFT, W1.4 LANDED 2026-08-09 (W0 + ... + kQkvSplit +
-kReshapeAndCache).** Filed through the claim protocol
+Status: **DRAFT, W1.5 LANDED 2026-08-09 (all 9 OPT-125m ops registered;
+attention host-staged oracle).** Filed through the claim protocol
 (`CLAIM-BACKEND-TENSTORRENT-SPIKE`, draft PR mudler/vllm.cpp#197) but not
 through the full `scripts/agent-start.py`/role-interview boot sequence —
 role was claimed directly per the developer's explicit direction. Treat it as
@@ -20,9 +20,9 @@ platforms" class, same as Metal/Vulkan): `DeviceType::kTENSTORRENT` as a thin
 `vt::Backend` adapter over **ttnn** — Tenstorrent's own C++ tensor-op library
 — rather than hand-written Tensix kernels, mirroring the Metal/MLX decision
 (E1 in `backends.md`) over the hand-written-kernel alternative (E2). Landed
-so far: the `DeviceType` + `Platform` + `Backend` seams, and EIGHT ops
+so far: the `DeviceType` + `Platform` + `Backend` seams, and ALL NINE ops
 (`kMatmul`, `kMatmulBT`, `kAdd`, `kRelu`, `kEmbedding`, `kLayerNorm`,
-`kQkvSplit`, `kReshapeAndCache`). Target:
+`kQkvSplit`, `kReshapeAndCache`, `kPagedAttention`). Target:
 OPT-125m end to end — vllm.cpp's own established minimal-model bring-up
 target (both the CPU and Metal W0 milestones used it), confirmed by grepping
 `src/vllm/model_executor/models/opt.cpp` for its exact `vt::` call set:
@@ -31,7 +31,8 @@ QkvSplit, Relu, ReshapeAndCache` — 9 distinct ops (`GetBackend` is not an
 op). OPT uses learned position embeddings (no RoPE), standard multi-head
 attention, LayerNorm (not RmsNorm), and ReLU (not SiLU), which is why this
 row's op list differs from an earlier draft of this spec that assumed a
-Llama-style decoder. 1 of the 9 remains: `kPagedAttention` — the decode attention kernel.
+Llama-style decoder. 0 of the 9 remain unregistered. Honest residual: kPagedAttention is a host
+f32 oracle (not ttnn::sdpa_decode); no e2e model run yet.
 
 **Out.** MoE, quantized kernels (the CUDA/Vulkan-side marlin/nvfp4
 equivalents), graph capture, and any model actually running — all
@@ -139,7 +140,7 @@ is a distinct, larger risk here than on CUDA.
 | `kLayerNorm` (landed) | `ttnn::layer_norm(x, eps, weight, bias)` — weight/bias optional rank-1; uploaded TILE BFLOAT16 as logical `[1,D]` (ttnn TILE-gamma path); eps from `LayerNormArgs` (OPT 1e-5) |
 | `kQkvSplit` (landed) | Host-staged pure column split (bit-exact memcpy). Device round-trip not useful while Alloc is host memory; `ttnn::slice` deferred to device-resident redesign |
 | `kReshapeAndCache` (landed) | Host-staged stride-aware page write (cpu_cache.cpp contract, slot<0 skip). Device paged_fill_cache deferred |
-| `kPagedAttention` (proposed) | `transformer/sdpa_decode/` + `experimental/paged_cache/` — the one that de-risks the whole follow-on plan: vLLM's block-table attention has a direct, already-implemented home in ttnn, not a from-scratch design problem |
+| `kPagedAttention` (landed, host oracle) | Host f32 causal/GQA softmax matching cpu_paged_attn.cpp. Device `ttnn::sdpa_decode` deferred to device-resident redesign |
 | MoE routing (out of scope, later row) | `reduction/moe`, `data_movement/moe_expert_token_remap`, `data_movement/moe_routing_remap` |
 
 ## Tests to port
@@ -155,12 +156,12 @@ present, so a Tenstorrent-enabled CI build with no card stays green.
 
 ## Gates
 
-**Passing today:** `tests/vt/test_tenstorrent_backend.cpp` (10/10 cases)
-on real Blackhole hardware — previous ops plus `kReshapeAndCache` bit-exact.
+**Passing today:** `tests/vt/test_tenstorrent_backend.cpp` (11/11 cases)
+on real Blackhole hardware — all 9 OPT-125m ops registered.
 
 **Not yet gated, and explicitly not claimed:**
-- No e2e model run — 1 of OPT-125m's 9 ops still unregistered
-  (`kPagedAttention`).
+- No e2e model run yet (wiring OPTForCausalLM onto kTENSTORRENT is next).
+- kPagedAttention is host-staged f32 oracle, not device sdpa_decode.
 - No performance claim of any kind — the host-round-trip-per-call design
   (§ Risks/decisions) was never intended to be fast; `docs/BENCHMARKS.md`'s
   row for this backend says so explicitly ("NOT APPLICABLE: no number
@@ -198,9 +199,8 @@ landed next (2026-08-09). Remaining, toward running OPT-125m end to end:
    TILE BFLOAT16 weight/bias as `[1,D]`.
 3. `kQkvSplit` — **landed** host-staged bit-exact column split.
 4. `kReshapeAndCache` — **landed** host-staged bit-exact page write.
-5. `kPagedAttention` — host f32 oracle next; ttnn::sdpa_decode later.
-6. Only once 5 lands: revisit the host-round-trip design (§
-   Risks/decisions) for a device-resident-tensor performance pass.
+5. `kPagedAttention` — **landed** host f32 oracle; ttnn::sdpa_decode later.
+6. E2e OPT-125m on kTENSTORRENT + device-resident tensors / sdpa_decode.
 
 Each step is independently claimable and gateable — none blocks another
 except that 4 wants 1-3 landed first for a meaningful decode-step test.
