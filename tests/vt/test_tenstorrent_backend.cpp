@@ -18,9 +18,11 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -971,4 +973,85 @@ TEST_CASE("kTENSTORRENT kPagedAttention matches a host causal GQA reference") {
     max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[i] - ref[i]));
   // Host f32 path — should be essentially bit-exact; allow tiny float noise.
   CHECK(max_abs_diff < 1e-5f);
+}
+
+// Optional microbench (TT_PA_BENCH=1): Qwen3-0.6B-ish decode shape at long
+// context to measure host PA throughput independent of e2e matmul/PCIe.
+TEST_CASE("kTENSTORRENT kPagedAttention host microbench (opt-in)") {
+  if (std::getenv("TT_PA_BENCH") == nullptr) {
+    MESSAGE("SKIPPED: set TT_PA_BENCH=1 to run host PA microbench");
+    return;
+  }
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  // Decode-shaped: T=1, Hq=16, Hkv=8, D=128, seqlen=512, block=16.
+  constexpr int64_t T = 1, Hq = 16, Hkv = 8, D = 128, Bsz = 16, Seq = 512;
+  constexpr int64_t NBlocks = Seq / Bsz;
+  constexpr int64_t Page = Hkv * D;
+  const size_t cache_elems = static_cast<size_t>(NBlocks * Bsz * Page);
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_q(static_cast<size_t>(T * Hq * D), 0.1f);
+  std::vector<float> host_kc(cache_elems, 0.05f), host_vc(cache_elems, 0.02f);
+  std::vector<int32_t> block_table(static_cast<size_t>(NBlocks));
+  for (int64_t i = 0; i < NBlocks; ++i) block_table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  std::vector<int32_t> seq_lens{static_cast<int32_t>(Seq)};
+  std::vector<int32_t> qsl{0, static_cast<int32_t>(T)};
+  std::vector<float> host_out(static_cast<size_t>(T * Hq * D), 0.0f);
+
+  void* mem_q = backend.Alloc(host_q.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  void* mem_kc = backend.Alloc(host_kc.size() * sizeof(float));
+  void* mem_vc = backend.Alloc(host_vc.size() * sizeof(float));
+  void* mem_bt = backend.Alloc(block_table.size() * sizeof(int32_t));
+  void* mem_sl = backend.Alloc(seq_lens.size() * sizeof(int32_t));
+  void* mem_qsl = backend.Alloc(qsl.size() * sizeof(int32_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_q, host_q.data(), host_q.size() * sizeof(float));
+  backend.Copy(q, mem_kc, host_kc.data(), host_kc.size() * sizeof(float));
+  backend.Copy(q, mem_vc, host_vc.data(), host_vc.size() * sizeof(float));
+  backend.Copy(q, mem_bt, block_table.data(), block_table.size() * sizeof(int32_t));
+  backend.Copy(q, mem_sl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, mem_qsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  Tensor tq =
+      Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Hq, D});
+  Tensor tout = Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {T, Hq, D});
+  Tensor tkc = Tensor::Contiguous(mem_kc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tvc = Tensor::Contiguous(mem_vc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tbt = Tensor::Contiguous(mem_bt, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {1, NBlocks});
+  Tensor tsl =
+      Tensor::Contiguous(mem_sl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {1});
+  Tensor tqsl =
+      Tensor::Contiguous(mem_qsl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {2});
+
+  vt::PagedAttentionArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(D));
+  args.causal = true;
+  auto pa = reinterpret_cast<vt::PagedAttentionFn>(
+      vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+
+  constexpr int kWarm = 3, kIters = 20;
+  for (int i = 0; i < kWarm; ++i) pa(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) pa(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+  const auto t1 = std::chrono::steady_clock::now();
+  const double ms =
+      std::chrono::duration<double, std::milli>(t1 - t0).count() / static_cast<double>(kIters);
+  MESSAGE("PA host microbench T=1 Hq=16 Hkv=8 D=128 seq=512: ", ms, " ms/call");
+
+  backend.Free(mem_q);
+  backend.Free(mem_out);
+  backend.Free(mem_kc);
+  backend.Free(mem_vc);
+  backend.Free(mem_bt);
+  backend.Free(mem_sl);
+  backend.Free(mem_qsl);
+  CHECK(ms > 0.0);
 }
