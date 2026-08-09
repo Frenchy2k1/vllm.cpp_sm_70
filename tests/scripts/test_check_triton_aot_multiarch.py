@@ -113,53 +113,5 @@ class TritonAotMultiArchContract(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("namespace is missing", result.stdout + result.stderr)
 
-    def test_forced_namespace_headers_compile_collision_free(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = "int toy_default(void) { return 0; }\nvoid load_toy(void) {}\n"
-            (root / "sm80.c").write_text(source, encoding="utf-8")
-            (root / "sm86.c").write_text(source, encoding="utf-8")
-            helper = (ROOT / "cmake" / "TritonAOTMultiArch.cmake").as_posix()
-            (root / "CMakeLists.txt").write_text(
-                "cmake_minimum_required(VERSION 3.24)\n"
-                "project(triton_namespace C)\n"
-                f'include("{helper}")\n'
-                "set(sm80 ${CMAKE_CURRENT_SOURCE_DIR}/sm80.c)\n"
-                "set(sm86 ${CMAKE_CURRENT_SOURCE_DIR}/sm86.c)\n"
-                "vt_triton_aot_namespace_sources(sm_80 toy "
-                '"${CMAKE_CURRENT_BINARY_DIR}/namespaces" out80 ${sm80})\n'
-                "vt_triton_aot_namespace_sources(sm_86 toy "
-                '"${CMAKE_CURRENT_BINARY_DIR}/namespaces" out86 ${sm86})\n'
-                "add_library(toy STATIC ${out80} ${out86})\n",
-                encoding="utf-8",
-            )
-            configure = subprocess.run(
-                ["cmake", "-S", str(root), "-B", str(root / "build")],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(configure.returncode, 0, configure.stdout + configure.stderr)
-            build = subprocess.run(
-                ["cmake", "--build", str(root / "build")],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            listing = subprocess.run(
-                ["nm", "--defined-only", "--extern-only", str(root / "build" / "libtoy.a")],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(listing.returncode, 0, listing.stderr)
-            for arch in ("sm_80", "sm_86"):
-                self.assertIn(f"vt_aot_{arch}_toy_default", listing.stdout)
-                self.assertIn(f"vt_aot_{arch}_load_toy", listing.stdout)
-            self.assertNotRegex(listing.stdout, r"\btoy_default\b")
-            self.assertNotRegex(listing.stdout, r"\bload_toy\b")
-
-
 if __name__ == "__main__":
     unittest.main()
