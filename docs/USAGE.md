@@ -197,6 +197,47 @@ Higher-precision arms that exist but are not the default: NVFP4
 note the pruned variants restructure AdaLN into a timestep lookup table and are
 NOT drop-in), and the original bf16 weights under `FL2VA/transformer/`.
 
+**What is actually verified, and what merely exists.** The distinction matters
+because a render takes hours before it tells you anything:
+
+| arm | status |
+|---|---|
+| **Q4_K_M** | **VERIFIED end to end** — every render in this doc. Use this. |
+| Q3_K_M | verified BAD (the A/B above): murky silhouette under a lattice |
+| bf16 (66.3 GB, 13 shards) | loader + device streamer implemented and gated, but **CPU-only** verification — no end-to-end GPU render has been done |
+| NVFP4 | exists; pruned variants are NOT drop-in (see above) |
+| Q8 | no published GGUF is known and none has been tested |
+
+### The trap: this checkpoint does not serve every task
+
+**`MiniMax-H3-FL2VA-Q4_K_M.gguf` is the FL2VA partition. It serves `t2va` and
+`fl2va` — NOT `ref2va`.** H3 ships two independently-served DiT partitions and
+the task must match the one you loaded; upstream's `_resolve_task` raises on the
+mismatch.
+
+Pass a reference image against this file and you get a task/partition mismatch.
+It does not fail loudly — it renders, and the render is *wrong*: a coloured
+diagonal lattice over the whole frame, worse the larger the canvas. Measured on
+one prompt and canvas (1344x768 / 124f), as a period-16 seam ratio where 1.15 is
+clean:
+
+| configuration | seam ratio |
+|---|---|
+| ref2va against FL2VA (the mismatch) | 2.28 |
+| t2va against FL2VA (correct) | **1.19** |
+
+The small-canvas case is what makes this expensive to spot: at 864x480 the same
+mismatch measures 1.15 and looks acceptable, so the bug only becomes obvious at
+the resolution you actually want.
+
+Pass `--partition fl2va` explicitly. The driver mirrors upstream's raise, so a
+mismatch is rejected at the CLI rather than silently rendered.
+
+For a reference-image render you need the **Ref2VA** partition instead
+(`minimax_h3_ref2va_nvfp4_full`, or a REF2VA GGUF). Note that the encoder vision
+tower is not yet ported, so image-conditioned renders are not clean even on the
+matching partition.
+
 ### Writing the prompt (read this first)
 
 Two things decide whether you get what you asked for, and neither is obvious.
@@ -453,20 +494,34 @@ encoder, and both VAEs.
 
 ```sh
 build/examples/minimax-h3-gen \
-  --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \
+  --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 --partition fl2va \
   --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
   --prompt "A golden retriever runs across a sunlit beach, waves crashing behind it" \
   --video-vae video_vae.safetensors --video-vae-config video_vae_config.json \
   --audio-vae audio_vae.safetensors --audio-vae-config audio_vae_config.json \
-  --frames 124 --height 480 --width 864 --steps 50 \
+  --frames 124 --height 768 --width 1344 --steps 50 \
   --device cuda --out out.mp4 --workdir /tmp/h3
 ```
+
+`--partition` is REQUIRED and names the partition the checkpoint you passed
+actually serves — see the trap above. This is the command every render in this
+document was produced with: Q4_K_M DiT and encoder, `--dequant-bf16`, task
+**t2va** (no reference image), the 1344x768 default canvas, 124 frames, 50 steps.
+
+Cost, so you can plan: **~176 s per step** at 1344x768 / 124f on a 20-SM sm_110
+device, so a 50-step render is about **2.5 hours** plus roughly 30 minutes of
+weight loading. Dropping to 512x512 costs ~15 s/step (~13 minutes end to end),
+which is the right canvas for iterating on a prompt before committing to a full
+render. `--dequant-bf16` holds the DiT as bf16 (~66 GB resident); `--keep-quant`
+is the low-memory arm.
 
 Conditioning modes, all optional and mutually exclusive where noted:
 
 ```sh
 --first-frame start.ppm --last-frame end.ppm   # pin the first and/or last frame (fl2va)
 --ref-image subject.ppm                        # reference image, repeatable (ref2va)
+                                               # NOT served by the FL2VA checkpoint above --
+                                               # needs a Ref2VA partition (see the trap)
 --ref-video prev_workdir/                      # reference clip, reads frame_%06d.ppm
 --ref-audio voice.wav                          # reference audio
 --noise-aug 0.9                                # how hard a keyframe is pinned (1.0 = exact)
