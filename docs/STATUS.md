@@ -1484,7 +1484,7 @@ remain fatal. Darwin CI is the binding AppleClang gate.
 **CUDA architectures.** The production target is GB10/`sm_121a` (runtime-gated,
 both gate models token-exact + at/above vLLM speed). The arch-additivity
 framework makes adding a CUDA architecture a data edit; `sm_120a`, `sm_90a`,
-Ampere/Ada `sm_80/86/87/89`, datacenter Blackwell `sm_100a/103a` and `sm_110` are
+Ampere/Ada `sm_80/86/87/89` and datacenter Blackwell `sm_100a/103a` are
 **BUILD-supported, portable-kernels-only** (they compile `-Werror`-clean and emit
 real per-arch SASS on dgx, but no such board runs here, so none is runtime
 support). The **Ampere major-8 fast-path bring-up is now SPIKED** as a

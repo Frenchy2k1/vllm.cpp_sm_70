@@ -363,7 +363,18 @@ endif()
 if(VLLM_CPP_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
-  set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES})
+  # CACHE ... FORCE, not a plain set(): `enable_language(CUDA)` has just written
+  # its own detected default into the CACHE, and a normal variable only SHADOWS
+  # that for the rest of the configure. The build was always correct — the
+  # gencode lines in build.ninja are the truth and they follow this value — but
+  # `CMakeCache.txt` kept reporting the detected default (`75`) even for an
+  # explicit `-DVLLM_CPP_CUDA_ARCHITECTURES=110` build, so the obvious way to
+  # confirm which architecture a build targets silently told you the wrong thing
+  # (issue #168, Jetson AGX Thor). Forcing the cache to agree costs nothing:
+  # every reader already resolved to this value.
+  set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES} CACHE STRING
+      "CUDA architectures actually compiled; mirrors VLLM_CPP_CUDA_ARCHITECTURES"
+      FORCE)
   # Per-arch capability resolution (BACKEND-CUDA-ARCH-ADDITIVITY). Every
   # arch-gated feature below asks the FEATURE TABLE instead of regex-matching the
   # whole arch list, so adding an architecture cannot silently disable fp4 /

@@ -447,7 +447,14 @@ STATUS_RATCHET = {
     # their re-measured ratios, and drops the superseded narrative those rows
     # carried. Net -32 against the rebased page, re-pinned byte-tight so the
     # reduction cannot become untracked growth headroom.
-    "chars": 243600,
+    #
+    # 243590 since 2026-08-09 (measured 243590): `sm_110` is removed from the
+    # BUILD-supported, portable-kernels-only list it never belonged in — the
+    # page already states two paragraphs earlier that it is RUNTIME-VERIFIED on
+    # a Jetson Thor board, and the contradiction cost a contributor time
+    # (issue #168). Net -10, re-pinned byte-tight so the reduction cannot become
+    # untracked growth headroom.
+    "chars": 243590,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
