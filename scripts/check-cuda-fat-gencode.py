@@ -29,14 +29,19 @@ REQUIRED_SOURCES = (
 
 ARCH_RE = re.compile(r"arch=compute_([0-9]+[af]?),code=sm_([0-9]+[af]?)")
 ARCHIVE_RE = re.compile(r"\bsm_([0-9]+[af]?)\b")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def relative_source(value: str) -> str | None:
-    normalized = value.replace("\\", "/")
-    marker = "/src/"
-    if marker not in normalized:
+def relative_source(value: str, directory: str = "") -> str | None:
+    source = Path(value)
+    if not source.is_absolute():
+        source = Path(directory) / source
+    try:
+        relative = source.resolve().relative_to(PROJECT_ROOT)
+    except ValueError:
         return None
-    return "src/" + normalized.split(marker, 1)[1]
+    normalized = relative.as_posix()
+    return normalized if normalized.startswith("src/") else None
 
 
 def expected_sms(source: str) -> tuple[str, ...]:
@@ -79,7 +84,9 @@ def validate_compile_commands(path: Path) -> list[str]:
     entries = json.loads(path.read_text(encoding="utf-8"))
     commands: dict[str, str] = {}
     for entry in entries:
-        source = relative_source(str(entry.get("file", "")))
+        source = relative_source(
+            str(entry.get("file", "")), str(entry.get("directory", ""))
+        )
         if source is None or not source.endswith(".cu"):
             continue
         command = entry.get("command")
