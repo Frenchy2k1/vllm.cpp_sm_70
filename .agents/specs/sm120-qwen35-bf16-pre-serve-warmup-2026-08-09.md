@@ -1,6 +1,6 @@
 # sm_120 Qwen3.5 BF16 pre-serve prefill warmup
 
-**Lifecycle:** `SPIKED`; implementation and GPU A/B pending
+**Lifecycle:** `REJECTED/REMOVED`; directionally positive but below hard gates
 
 **Owner rows:** `ROAD-V1-C2-LOCAL-BF16`, `KERNEL-SSM-MAMBA`
 
@@ -93,4 +93,23 @@ the first-wave chunk scheduling/shape sequence, not another decode microkernel.
 
 ## Outcome
 
-Pending fresh RED-first implementation, mutation review and operator GPU A/B.
+**REJECTED and removed, 2026-08-10.** Implementation `ef1f404f1` plus review
+repair `120b36a0e` passed fresh mutation re-review and the operator's rebuilt
+5-case / 42-assertion portable gate. The first exact GPU pair produced identical
+token SHA-256
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`:
+
+| Arm | total / output tok/s | TTFT | TPOT | E2E | first-wave queue+prefill |
+|---|---:|---:|---:|---:|---:|
+| COLD | 6864.21 / 759.03 | 1008.58 ms | 34.34 ms | 5369.49 ms | 2084.065 ms |
+| WARM | 6902.89 / 763.30 | 973.79 ms | 34.37 ms | 5339.26 ms | 1941.388 ms |
+
+Warmup is directionally positive (+0.564% total throughput, -3.45% TTFT,
+-0.563% E2E), but the first-wave gain is only **142.676 ms** versus the required
+250 ms and aggregate TTFT improves only **3.45%** versus the required 5%.
+TPOT also rises 0.03 ms. One leg is sufficient to reject on both hard magnitude
+gates; repetitions cannot turn this measured arm into an accepted result without
+changing the prespecified thresholds. Raw roots are
+`/tmp/qwen35-bf16-warmup-{cold,warm}-120b36a0e.*`. Product, selector and tests
+are removed. The remaining TTFT target is the first-wave chunk scheduling/shape
+sequence after first-touch warmup, as this spec prescribed.
