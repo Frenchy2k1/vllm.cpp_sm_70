@@ -4,7 +4,10 @@
 
 #include <array>
 #include <cstring>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
+#include <string>
 
 #include "vt/cuda/gdn_decode_fused.h"
 
@@ -19,6 +22,8 @@ using vt::cuda::GdnDecodeBf16PackByteOffset;
 using vt::cuda::GdnDecodeBf16PackLogicalColumn;
 using vt::cuda::GdnDecodeBf16VecstoreEligible;
 using vt::cuda::GdnDecodeBf16VecstoreFlagIsOn;
+using vt::cuda::GdnDecodeBf16VecstoreCapability;
+using vt::cuda::GdnDecodePackBf16Vec8;
 using vt::cuda::GdnDecodeSharedColumn;
 using vt::cuda::GdnDecodeStateStride;
 using vt::cuda::GdnDecodeValueTile;
@@ -338,6 +343,37 @@ TEST_CASE("GDN BF16 vector writeback requires every production predicate") {
   CHECK_FALSE(eligible("1", production, 128, 128, 4, true, true));
   CHECK_FALSE(eligible("1", production, 128, 128, 8, false, true));
   CHECK_FALSE(eligible("1", production, 128, 128, 8, true, false));
+
+  // Corrupt exactly one field at a time. Tests made from another factory
+  // contract can leave several correlated fields false and therefore survive
+  // deletion of the predicate they claim to cover.
+  auto corrupted = production;
+  corrupted.regstate = false;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.swizzled = false;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.selected_tile = GdnDecodeValueTile::kBv32;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.value_tile = 32;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.value_tiles = 4;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.lanes_per_row = 4;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.block_threads = 64;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.shared_bytes = 9727;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
+  corrupted = production;
+  corrupted.should_launch = false;
+  CHECK_FALSE(eligible("1", corrupted, 128, 128, 8, true, true));
 }
 
 TEST_CASE("GDN BF16 vector writeback dispatches exactly one callback") {
@@ -386,18 +422,64 @@ TEST_CASE("GDN BF16 vector packs cover the aligned 128-column state row") {
       0.0f, -0.0f, 1.0f, -2.0f, 0.333251953125f, 65504.0f,
       1.00390625f, 1.01171875f, -1.00390625f, -1.01171875f,
       1.0e-20f, -1.0e-20f, 3.14159265f, -2.71828183f, 42.5f, -99.75f};
-  std::array<uint8_t, 32> packed{};
   for (int pack = 0; pack < 2; ++pack) {
-    for (int element = 0; element < 8; ++element) {
-      const uint16_t bits = ReferenceBf16Rn(values[pack * 8 + element]);
-      std::memcpy(packed.data() + pack * 16 + element * 2, &bits,
-                  sizeof(bits));
+    const auto packed = GdnDecodePackBf16Vec8(values.data() + pack * 8);
+    for (int pair = 0; pair < 4; ++pair) {
+      const uint16_t lo = static_cast<uint16_t>(packed.words[pair]);
+      const uint16_t hi = static_cast<uint16_t>(packed.words[pair] >> 16);
+      CHECK(lo == ReferenceBf16Rn(values[pack * 8 + pair * 2]));
+      CHECK(hi == ReferenceBf16Rn(values[pack * 8 + pair * 2 + 1]));
     }
   }
-  for (int element = 0; element < 16; ++element) {
-    uint16_t packed_bits = 0;
-    std::memcpy(&packed_bits, packed.data() + element * 2,
-                sizeof(packed_bits));
-    CHECK(packed_bits == ReferenceBf16Rn(values[element]));
-  }
+}
+
+TEST_CASE("GDN BF16 vector capability binds eligibility and launch") {
+  const auto production =
+      GdnDecodeLaunchContractFor("16", "1", "1", 128, 128, 8);
+  auto select = [&](const char* env, bool state_is_bf16) {
+    int incumbent = 0;
+    int vector = 0;
+    const GdnDecodeBf16VecstoreCapability capability{
+        env, production, 128, 128, 8, state_is_bf16, true};
+    const int result = capability.Dispatch(
+        [&] { return ++incumbent, 0; }, [&] { return ++vector, 1; });
+    CHECK(incumbent + vector == 1);
+    return result;
+  };
+  CHECK(select("1", true) == 1);
+  CHECK(select("0", true) == 0);
+  CHECK(select("1", false) == 0);
+}
+
+TEST_CASE("CUDA GDN call site uses the tested vector capability and pack seam") {
+  std::ifstream input(std::string(VLLM_CPP_SOURCE_DIR) +
+                      "/src/vt/cuda/cuda_gdn.cu");
+  REQUIRE(input.good());
+  const std::string source((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+
+  const auto store_begin = source.find("__device__ inline void StoreBf16Vec8(");
+  const auto store_end = source.find("\n}", store_begin);
+  REQUIRE(store_begin != std::string::npos);
+  REQUIRE(store_end != std::string::npos);
+  const std::string store = source.substr(store_begin, store_end - store_begin);
+  CHECK(store.find("GdnDecodePackBf16Vec8(values)") != std::string::npos);
+  CHECK(store.find("*reinterpret_cast<int4*>(p) = transaction") !=
+        std::string::npos);
+
+  const auto kernel = source.find("if constexpr (BF16_VECSTORE) {");
+  REQUIRE(kernel != std::string::npos);
+  const std::string writeback = source.substr(kernel, 900);
+  CHECK(writeback.find("for (int pack = 0; pack < 2; ++pack)") !=
+        std::string::npos);
+  CHECK(writeback.find("StoreBf16Vec8(") != std::string::npos);
+
+  const auto route = source.find(
+      "const GdnDecodeBf16VecstoreCapability bf16_vecstore{");
+  REQUIRE(route != std::string::npos);
+  const std::string invocation = source.substr(route, 260);
+  CHECK(invocation.find("VT_GDN_DECODE_BF16_VECSTORE") != std::string::npos);
+  CHECK(invocation.find("state.dtype == DType::kBF16, true") !=
+        std::string::npos);
+  CHECK(source.find("bf16_vecstore.Dispatch(") != std::string::npos);
 }

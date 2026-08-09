@@ -894,6 +894,7 @@ target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_
 # in cuda_gdn.cu and is covered by same-process byte-exact CUDA comparisons.
 vllm_cpp_add_test(test_gdn_decode_fused vt/test_gdn_decode_fused.cpp)
 target_include_directories(test_gdn_decode_fused PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_gdn_decode_fused PRIVATE VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load
 # fast-path flags (VT_FP4_QUANT_FAST + VT_SILU_FP4_FAST, both default OFF /
 # '1'-opt-in). Reaches the internal header under src/ (not public API); the
