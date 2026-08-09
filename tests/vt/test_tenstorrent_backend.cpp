@@ -55,8 +55,9 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   vllm::platforms::Platform& p = vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT);
   CHECK(p.device_type() == DeviceType::kTENSTORRENT);
   CHECK(&p.backend() == vt::TryGetBackend(DeviceType::kTENSTORRENT));
-  // W0 registers the OPT-125m linear/residual/activation slice (kMatmul,
-  // kMatmulBT, kAdd, kRelu) in F32 only — see tenstorrent_ops.cpp.
+  // Registers the OPT-125m linear/residual/activation + vocab slice
+  // (kMatmul, kMatmulBT, kAdd, kRelu, kEmbedding) in F32 only — see
+  // tenstorrent_ops.cpp.
   CHECK(p.supported_dtypes() == std::vector<vt::DType>{vt::DType::kF32});
   // No attention kernel exists yet; an empty priority list is the honest answer
   // (platforms/tenstorrent.cpp's comment on get_attn_backend_priority).
@@ -270,5 +271,61 @@ TEST_CASE("kTENSTORRENT kRelu matches a host F32 reference") {
   float max_abs_diff = 0.0f;
   for (size_t i = 0; i < host_x.size(); ++i)
     max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[i] - std::max(0.0f, host_x[i])));
+  CHECK(max_abs_diff < 0.1f);
+}
+
+TEST_CASE("kTENSTORRENT kEmbedding matches a host F32 reference (row gather)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kEmbedding, DeviceType::kTENSTORRENT));
+
+  // Non-tile-aligned (t, h) on purpose: forces the ROW_MAJOR path and
+  // proves download is dense without TILE padding. Vocab is modest so the
+  // host oracle stays trivial.
+  constexpr int64_t Vocab = 17, H = 24, T = 7;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_table(Vocab * H);
+  for (size_t i = 0; i < host_table.size(); ++i)
+    host_table[i] = static_cast<float>(i % 13) * 0.1f - 0.5f;
+  // i32 ids covering edges: first, last, and middle rows; repeats allowed.
+  std::vector<int32_t> host_ids = {0, 3, 16, 1, 3, 8, 16};
+  REQUIRE(static_cast<int64_t>(host_ids.size()) == T);
+
+  std::vector<float> host_out(T * H, 0.0f);
+  void* mem_table = backend.Alloc(host_table.size() * sizeof(float));
+  void* mem_ids = backend.Alloc(host_ids.size() * sizeof(int32_t));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_table, host_table.data(), host_table.size() * sizeof(float));
+  backend.Copy(q, mem_ids, host_ids.data(), host_ids.size() * sizeof(int32_t));
+
+  Tensor table = Tensor::Contiguous(mem_table, vt::DType::kF32,
+                                    Device{DeviceType::kTENSTORRENT, 0}, {Vocab, H});
+  Tensor ids = Tensor::Contiguous(mem_ids, vt::DType::kI32,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {T});
+  Tensor out = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {T, H});
+
+  auto embedding =
+      reinterpret_cast<vt::EmbeddingFn>(vt::GetOp(vt::OpId::kEmbedding, DeviceType::kTENSTORRENT));
+  embedding(q, out, table, ids);
+
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_table);
+  backend.Free(mem_ids);
+  backend.Free(mem_out);
+
+  // Host oracle: pure row gather. bf16 table storage means a modest abs tol.
+  float max_abs_diff = 0.0f;
+  for (int64_t i = 0; i < T; ++i) {
+    const int32_t id = host_ids[static_cast<size_t>(i)];
+    for (int64_t j = 0; j < H; ++j) {
+      const float ref = host_table[static_cast<size_t>(id) * H + j];
+      max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[i * H + j] - ref));
+    }
+  }
   CHECK(max_abs_diff < 0.1f);
 }

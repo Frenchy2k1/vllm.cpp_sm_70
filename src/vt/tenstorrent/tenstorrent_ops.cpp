@@ -1,21 +1,26 @@
-// Tenstorrent op providers — the ttnn adapter layer (BACKEND-TENSTORRENT W0,
+// Tenstorrent op providers — the ttnn adapter layer (BACKEND-TENSTORRENT,
 // .agents/specs/tenstorrent-backend.md). vllm.cpp original; no upstream
 // mirror (vLLM has no Tenstorrent platform). Op table: kMatmul, kMatmulBT,
-// kAdd, kRelu — the OPT-125m linear/residual/activation slice, mirroring how
-// Metal's W0 skeleton landed one op before the rest (docs/STATUS.md Backend
-// detail).
+// kAdd, kRelu, kEmbedding — the OPT-125m linear/residual/activation slice plus
+// the vocab gather, mirroring how Metal landed ops one seam at a time
+// (docs/STATUS.md Backend detail).
 //
-// SCOPE: 2D row-major F32 tensors only (kAdd also allows rank-1 `b` for the
-// nn.Linear bias broadcast, matching cpu_layernorm.cpp's AddKernel). Every
-// other shape/dtype is a VT_CHECK failure, not a silent wrong answer or a
-// slow-path guess — this op table has no CPU reference-tier fallback to fall
-// into anyway (UnifiedMemory()==false, tenstorrent_backend.cpp), so failing
-// loudly here is the only honest option. Widening dtype/rank coverage is
-// explicitly deferred, not attempted here.
+// SCOPE: 2D row-major F32 tensors for the linear/eltwise ops (kAdd also
+// allows rank-1 `b` for the nn.Linear bias broadcast, matching
+// cpu_layernorm.cpp's AddKernel). kEmbedding adds rank-1 i32/i64 ids + a
+// rank-2 F32 table — the first layout/dtype departure from TILE/BFLOAT16
+// (ROW_MAJOR UINT32 ids + ROW_MAJOR BFLOAT16 weights, forced by ttnn).
+// Every other shape/dtype is a VT_CHECK failure, not a silent wrong answer
+// or a slow-path guess — this op table has no CPU reference-tier fallback
+// (UnifiedMemory()==false, tenstorrent_backend.cpp), so failing loudly is
+// the only honest option. Widening dtype/rank coverage is deferred.
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/tenstorrent/tenstorrent_device.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <ttnn/tensor/tensor.hpp>
@@ -23,6 +28,7 @@
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 #include <ttnn/operations/eltwise/unary/unary.hpp>
+#include <ttnn/operations/embedding/embedding.hpp>
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -35,12 +41,17 @@ namespace {
 // Shared host round-trip helpers — see the kMatmul comment below for why the
 // upload/compute/readback shape is correct (hardware evidence in
 // .agents/specs/tenstorrent-backend.md's "Resolved: hands-on spike result").
-tt::tt_metal::TensorSpec TileSpecOf(uint32_t rows, uint32_t cols) {
+tt::tt_metal::TensorSpec SpecOf(tt::tt_metal::Shape shape, ttnn::DataType dtype,
+                                ttnn::Layout layout) {
   return tt::tt_metal::TensorSpec(
-      tt::tt_metal::Shape({rows, cols}),
-      tt::tt_metal::TensorLayout(
-          ttnn::DataType::BFLOAT16, tt::tt_metal::PageConfig(ttnn::Layout::TILE),
-          tt::tt_metal::MemoryConfig{}));
+      std::move(shape),
+      tt::tt_metal::TensorLayout(dtype, tt::tt_metal::PageConfig(layout),
+                                 tt::tt_metal::MemoryConfig{}));
+}
+
+tt::tt_metal::TensorSpec TileSpecOf(uint32_t rows, uint32_t cols) {
+  return SpecOf(tt::tt_metal::Shape({rows, cols}), ttnn::DataType::BFLOAT16,
+                ttnn::Layout::TILE);
 }
 
 ttnn::Tensor UploadRows(const float* data, uint32_t rows, uint32_t cols, MeshDevice& device) {
@@ -159,6 +170,65 @@ void ReluKernel(Queue&, Tensor& out, const Tensor& x) {
   Download(dev_y, out);
 }
 
+// kEmbedding: row gather `out[i,:] = table[ids[i],:]` (cpu_ops.cpp
+// EmbeddingKernel contract). Two layout departures from the TILE/BFLOAT16
+// linear ops, forced by ttnn::embedding's validate path:
+//   1. ids upload as ROW_MAJOR UINT32 (ttnn rejects i32/i64; vt still accepts
+//      kI32/kI64 at the seam and converts host-side, matching Metal/Vulkan).
+//   2. table upload as ROW_MAJOR BFLOAT16 (ttnn requires ROW_MAJOR weights;
+//      TILE is converted inside ttnn::embedding, but starting RM is cheaper
+//      and matches the unit tests in tt-metal).
+// Parameter order at the ttnn call is (ids, table) — reversed from
+// vt::EmbeddingFn's (table, ids). Output is requested ROW_MAJOR so
+// to_vector is dense without tile padding for arbitrary (t, h).
+void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
+  VT_CHECK(table.rank == 2 && ids.rank == 1 && out.rank == 2,
+           "tenstorrent kEmbedding: table rank-2, ids rank-1, out rank-2");
+  VT_CHECK(table.dtype == DType::kF32 && out.dtype == DType::kF32,
+           "tenstorrent kEmbedding: only F32 table/out are supported in this step");
+  VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64,
+           "tenstorrent kEmbedding: ids must be i32 or i64");
+  VT_CHECK(table.IsContiguous() && ids.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kEmbedding: strided (non-contiguous) tensors are not supported");
+  const uint32_t vocab = static_cast<uint32_t>(table.shape[0]);
+  const uint32_t h = static_cast<uint32_t>(table.shape[1]);
+  const uint32_t t = static_cast<uint32_t>(ids.shape[0]);
+  VT_CHECK(out.shape[0] == t && out.shape[1] == h, "tenstorrent kEmbedding: out shape mismatch");
+
+  std::vector<uint32_t> host_ids(t);
+  if (ids.dtype == DType::kI32) {
+    const int32_t* p = ids.Ptr<int32_t>();
+    for (uint32_t i = 0; i < t; ++i) {
+      VT_CHECK(p[i] >= 0 && static_cast<uint32_t>(p[i]) < vocab,
+               "tenstorrent kEmbedding: id out of range");
+      host_ids[i] = static_cast<uint32_t>(p[i]);
+    }
+  } else {
+    const int64_t* p = ids.Ptr<int64_t>();
+    for (uint32_t i = 0; i < t; ++i) {
+      VT_CHECK(p[i] >= 0 && static_cast<uint64_t>(p[i]) < vocab,
+               "tenstorrent kEmbedding: id out of range");
+      host_ids[i] = static_cast<uint32_t>(p[i]);
+    }
+  }
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_ids = ttnn::Tensor::from_vector<uint32_t>(
+      host_ids, SpecOf(tt::tt_metal::Shape({t}), ttnn::DataType::UINT32, ttnn::Layout::ROW_MAJOR),
+      &device);
+  std::vector<float> host_table(table.Ptr<float>(),
+                                table.Ptr<float>() + static_cast<size_t>(vocab) * h);
+  ttnn::Tensor dev_table = ttnn::Tensor::from_vector<float>(
+      host_table,
+      SpecOf(tt::tt_metal::Shape({vocab, h}), ttnn::DataType::BFLOAT16, ttnn::Layout::ROW_MAJOR),
+      &device);
+  // (ids, table) — reversed from vt::EmbeddingFn. Explicit ROW_MAJOR output
+  // keeps download dense for non-tile-aligned (t, h).
+  ttnn::Tensor dev_out = ttnn::embedding(dev_ids, dev_table, /*pad_token=*/std::nullopt,
+                                         /*layout=*/ttnn::Layout::ROW_MAJOR);
+  Download(dev_out, out);
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -170,6 +240,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<AddFn>(&AddKernel)));
     RegisterOp(OpId::kRelu, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<ReluFn>(&ReluKernel)));
+    RegisterOp(OpId::kEmbedding, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
   }
 } registrar;
 
