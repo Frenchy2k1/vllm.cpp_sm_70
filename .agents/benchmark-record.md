@@ -16957,3 +16957,111 @@ draining. The hazard sets hold raw handle VALUES and are never dereferenced, so 
 destroyed handle in them is harmless (handle reuse can only manufacture an extra
 barrier). (3) `docs/ENVIRONMENT.md` documents `VT_VULKAN_RING` as defaulting to
 128; `kDescriptorRing` is 256.
+
+## BACKEND-VULKAN-LOADMEM — the 27B Vulkan load held the model TWICE; 100.759 -> 53.413 GiB VmRSS, device bytes unchanged (2026-08-09, GB10, `row/BACKEND-VULKAN-LOADMEM`)
+
+**Base:** `2b08dd24`. Build `-DVLLM_CPP_VULKAN=ON`, `CMAKE_CUDA_COMPILER:NOTFOUND`,
+Release, at `~/vkloadmem/build-vk` on dgx.casa; source md5-verified against the
+worktree after `git archive`. All GPU work under `flock $HOME/gpu.lock`, every
+model load behind a MemAvailable guard plus a kill-the-process watchdog.
+
+### 0. `VLLM_CPP_DEVICE` IS NOT READ ANYWHERE, and the Vulkan gate has been selected by accident
+
+`grep -rn VLLM_CPP_DEVICE src/ include/ tests/ docs/` returns NOTHING. The engine
+picks its device in `src/vllm/entrypoints/model_loader.cpp:81` via
+`CurrentPlatform()`, which walks `{kCUDA, kXPU, kVULKAN, kMETAL, kCPU}` and takes
+the first backend that probed a device. So `VLLM_CPP_DEVICE=vulkan
+test_opt_paged_engine` — the command recorded for this gate throughout the Vulkan
+campaign — selects Vulkan only because those builds had no CUDA compiler.
+MEASURED both ways on the same source: with `/usr/local/cuda/bin` on `PATH` at
+configure time the identical command reports `the engine selected device type 1`
+(kCUDA) and passes 6/6; without it, `device type 3` (kVULKAN), 6/6, 0 declines.
+`~/vkbar/build-vk/CMakeCache.txt` carries `CMAKE_CUDA_COMPILER:FILEPATH=NOTFOUND`,
+which is why the earlier rows were genuinely on Vulkan. The env var is a placebo
+and the gate needs a real selector.
+
+### 1. The attribution: a flat second copy of the model, not allocator excess
+
+`VT_VULKAN_ALLOC_STATS=1` (added by this row) prints, on every 1 GiB high-water
+crossing, the caller-REQUESTED bytes, the driver-COMMITTED bytes
+(`VkMemoryRequirements::size`), live buffer count, and the `/proc` context.
+
+Qwen3.6-27B bf16 (50.89 GiB on disk), `VT_ADOPT_DEVICE_BYTES` A/B on ONE binary:
+
+| arm | Vulkan live | buffers | VmRSS / VmHWM | MemAvailable floor | outcome |
+|---|---|---|---|---|---|
+| OFF (old behaviour) | 50.755 GiB | 863 of 894 | **100.759 GiB** | 13.85 GiB (MemFree 1.13) | watchdog KILLED it, still allocating |
+| ON (default) | 50.756 GiB | 894 | **53.413 GiB** | 47.33 GiB | completed, TTFT 18.44 s |
+
+Qwen3-4B bf16 (7.6 GiB): 8.622 GiB Vulkan / 375 buffers in BOTH arms; VmHWM
+16.392 -> 9.607 GiB; machine-wide cost 17.1 -> 9.45 GiB.
+
+Three things this rules out, with numbers rather than reasoning:
+
+* **No allocator excess.** `requested == committed` EXACTLY in every run
+  (50.756 GiB over 894 buffers at 27B, 8.622 over 375 at 4B). GB10's driver adds
+  no per-allocation rounding at these sizes, so there is nothing to win by
+  suballocating, and `maxMemoryAllocationCount` is nowhere near 894.
+* **No transient held too long.** The excess is a FLAT offset, not a spike: on the
+  27B OFF arm the RSS-minus-Vulkan gap reads 50.003 / 50.003 / 50.003 / 50.004 GiB
+  across the last four high-water lines. A staging buffer, a dequant scratch or a
+  duplicated upload would show as a bump, not a constant equal to the model.
+* **The windowed source-page release DOES fire.** During load, RSS holds ONE copy
+  of the copied bytes, not the mmap as well.
+
+The offset is the host `OwnedTensor.bytes` mirror. `ResidentWeight`
+(`dense_attn_block.h`, and its twin in `qwen3_5.cpp`) uploaded each weight and
+kept the host buffer. On a discrete GPU that mirror is free; the Vulkan backend
+allocates every buffer `HOST_VISIBLE|HOST_COHERENT` and persistently mapped, so
+on GB10 both copies are the same 119.6 GiB of system RAM.
+`src/vllm/platforms/vulkan.cpp` had reasoned that "there is exactly one copy of
+the bytes"; `dense_attn_block.h` made a second one.
+
+### 2. Page cache is NOT the OOM cause, and MemFree is the wrong instrument
+
+Sampled at 2 Hz through the 27B load, `Cached` tracks the copied bytes 1:1 and is
+never dropped: `MADV_DONTNEED` on a private file mapping drops the mapping's pages
+but leaves the page-cache pages, which needs `POSIX_FADV_DONTNEED` on the fd. It
+is reclaimable, so it does not consume MemAvailable — a first watchdog keyed on
+MemFree killed a perfectly healthy fixed-arm load at MemFree 11.46 GiB while
+MemAvailable was still 60.65 GiB. Recorded as a NEGATIVE for anyone tempted to
+guard on MemFree: on a 51 GiB checkpoint, MemFree measures the read, not the risk.
+
+### 3. Why it took the machine down rather than failing
+
+At the kill point the OFF arm had 1.13 GiB of MemFree and 13.85 GiB of
+MemAvailable with 31 buffers still to allocate, on a box whose Vulkan heap
+(89.72 GiB) was never the binding constraint — the MACHINE was. The recorded
+reboots ran repeated cold 27B loads with `drop_caches`, and the box also normally
+runs `local-ai-worker`, whose vLLM reserves HOST RAM on this unified machine. Two
+copies of a 50.89 GiB model plus any other tenant does not fit, and the NVIDIA
+driver reports that as `NV_ERR_NO_MEMORY` from `_memdescAllocInternal`.
+
+### 4. The fix, and what it is not
+
+`AdoptDeviceBytesAsHost` re-points `bytes` AT the device allocation through the
+existing `OwnedBytes` borrow, keyed alive by `d_dev`'s own control block. It is an
+ADOPTION, not a release: the bytes survive at the device address, so every
+`.bytes` reader (the f32 upcast, the portable CPU reference tier, `View`/`Numel`)
+reads the same bytes from the surviving copy, and unlike `ReleaseHost` it needs no
+"is the device path committed" proof. Gated on the new
+`Backend::DeviceMemoryIsHostAddressable()`, default FALSE, which is deliberately
+narrower than `UnifiedMemory()`: CUDA on GB10 is unified yet a `cudaMalloc`
+pointer is not host-dereferenceable.
+
+### 5. Gates, and the mutations that prove the test
+
+GB10, Vulkan build: `test_opt_paged_engine` **6/6 prompts token-exact (96/96
+tokens), 0 declines, device type 3**; `test_backend_cross_device` **11/11 (132)**;
+`test_vulkan_backend` **35/35 (2650/2650)**; `gen-vulkan-spirv.py --check` clean.
+The three mechanism cases in `test_qwen36_weights` are 3/3 (20) and go RED under
+each mutation: a no-op body (3 assertions), a dropped host-addressable guard
+(3), and a dropped keep-alive (2, including a genuine use-after-free that read
+`128` where `167` was written).
+
+### 6. Left open
+
+Peak is now the LOAD phase — the host `OwnedTensor` build reaches ~51 GiB before
+the first upload, and the adoption only acts afterwards. Copying from the mmap
+straight into the device buffer at load would cut that too. The unreleased page
+cache is a second, independent lever.

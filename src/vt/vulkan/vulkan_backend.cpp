@@ -127,6 +127,13 @@ class VulkanBackend final : public Backend {
 
   bool UnifiedMemory() const override { return VulkanContext::Get().unified_memory(); }
 
+  // Every allocation is HOST_VISIBLE|HOST_COHERENT and persistently mapped by
+  // AllocBuffer, and Copy/Memset above are already a plain host memcpy/memset
+  // over exactly that pointer. So this is not a new claim -- it NAMES the
+  // property this backend has always relied on, so the weight loader can rely
+  // on it too instead of keeping a redundant host mirror.
+  bool DeviceMemoryIsHostAddressable() const override { return true; }
+
   // vt_causal_conv1d_update binds the state through the dtype-erased 32/16-bit
   // view pair and rounds once on store, so a bf16 conv_state is read and written
   // in place. Without this the caller must gather the cache into an f32 working
