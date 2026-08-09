@@ -18,6 +18,58 @@
 // ONE MODULE SERVES 54 VARIANTS: three dtypes each for a, b and out, times the
 // two orientations, as SPECIALIZATION CONSTANTS. llama.cpp spells the same axis
 // as GLSL #defines and therefore emits a separate SPIR-V module per combination.
+//
+// THE lm_head, AND WHAT MEASURING IT ACTUALLY FOUND (VK-G). On 27B decode
+// EXACTLY ONE GEMM per token stays on this kernel -- the lm_head, whose weight is
+// [K,N] (bt=0), so the GEMV tactic correctly declines: that layout is already
+// coalesced across lanes and vt_matmul_vec's shape would make it strided. It
+// moves k*n = 5120*248320 bf16 = 2.54 GB per call.
+//
+// FIRST HYPOTHESIS, MEASURED AND REJECTED: memory-level parallelism. The rolled
+// loop issues one b load per iteration, so the theory was that each lane had a
+// single outstanding read and stalled on latency, exactly the defect a four-way
+// unroll fixed for vt_matmul_vec. A four-way K unroll with the accumulation order
+// preserved was built, gated and measured on GB10 over five interleaved pairs:
+// 12.43 ms/call rolled versus 12.53 ms/call unrolled -- ZERO, and if anything half
+// a percent the wrong way. The driver already pipelines the rolled loop. That
+// arm is not in this file; the negative result is recorded in
+// .agents/benchmark-record.md so it is not re-tried.
+//
+// WHAT THE NUMBER ACTUALLY IS. 2.54 GB in 12.43 ms is 204.6 GB/s. The 273 GB/s
+// figure is this box's THEORETICAL roof and nothing reaches it: vt_matmul_vec,
+// measured on the IDENTICAL 2.54 GB (M=1 K=5120 N=248320, benchmarks/
+// vulkan_gemm_ab.cpp), runs 11.04 ms = 230.3 GB/s. So 230 GB/s is the practical
+// streaming ceiling here and the honest headroom for this kernel is 1.4 ms, not
+// the 3.1 ms the theoretical roof suggests.
+//
+// SECOND HYPOTHESIS: CONTIGUITY PER WORKGROUP, which is the one structural
+// difference left between the two kernels at identical byte counts. In
+// vt_matmul_vec one workgroup owns one output element and its 128 lanes stride K,
+// so the workgroup sweeps a CONTIGUOUS 10 KB run of b and never returns to it. In
+// the flat body below one INVOCATION owns one output element, so a 128-lane
+// workgroup reads 256 contiguous bytes at row q and then jumps p.n*2 bytes --
+// 486 KB for this shape -- to row q+1. Contiguity then exists only across
+// workgroups that happen to still be at the same q, and they drift apart.
+//
+// COLUMN BLOCKING (VT_MM_NCOLS) is the fix for that and nothing else: a workgroup
+// takes VT_TG*NCOLS CONSECUTIVE output columns of one row, so at each q it reads
+// VT_TG*NCOLS contiguous elements instead of VT_TG. Lane t owns the columns
+// t + c*VT_TG, NOT t*NCOLS + c -- the strided assignment is what keeps every one
+// of the NCOLS loads a fully coalesced 128-lane contiguous read, where adjacent
+// per-lane columns would make each individual load 8-byte-strided.
+//
+// IT IS BYTE-EXACT, and that is the reason it is shaped this way. Each of a
+// lane's NCOLS accumulators belongs to a DIFFERENT output element and runs the
+// whole K reduction sequentially, which is precisely cpu_ops.cpp MatmulChunked's
+// order -- the byte-exact tier that the coopmat and GEMV tactics both had to give
+// up. No partial sums are merged anywhere, so there is no reassociation to argue
+// about. tests/vt/test_vulkan_backend.cpp gates that with a bitwise memcmp
+// against the unblocked body rather than with a tolerance.
+//
+// The factor rides a SPECIALIZATION CONSTANT (not a literal, not a #define) so
+// every arm is the SAME committed module and they A/B inside ONE binary via
+// VT_VULKAN_MATMUL_NCOLS -- a cross-build comparison is what produced a false
+// 1.2x reading for the subgroup tactic earlier in this campaign.
 #extension GL_GOOGLE_include_directive : require
 #include "vt_common.glsl"
 
@@ -41,6 +93,17 @@ layout(constant_id = 0) const uint VT_MM_A_DT = VT_DT_F32;
 layout(constant_id = 1) const uint VT_MM_B_DT = VT_DT_F32;
 layout(constant_id = 2) const uint VT_MM_OUT_DT = VT_DT_F32;
 layout(constant_id = 3) const uint VT_MM_BT = 0u;
+// Output columns per INVOCATION, 1, 4 or 8. 1 is the flat body -- one invocation
+// per output element, the original kernel instruction for instruction -- and is
+// what makes the A/B honest. Above 1 the kernel switches to the column-blocked
+// dispatch described above, which the host selects only for VT_MM_BT == 0.
+layout(constant_id = 4) const uint VT_MM_NCOLS = 1u;
+// Largest VT_MM_NCOLS this module is compiled for. The accumulator array must
+// have a COMPILE-TIME bound: a specialization constant may size an array in GLSL,
+// but the value is not known when the loop below is unrolled, and an array that
+// spills to scratch memory would defeat the whole point of holding NCOLS
+// accumulators in registers.
+#define VT_MM_NCOLS_MAX 8u
 
 layout(push_constant) uniform Params {
   uint m;
@@ -52,6 +115,53 @@ layout(push_constant) uniform Params {
 } p;
 
 void main() {
+  // COLUMN-BLOCKED BODY (bt = 0 only; the host never selects NCOLS > 1 otherwise,
+  // because in the [N,K] orientation contiguity runs along K, not along the output
+  // columns, and blocking columns there would stride every load).
+  //
+  // `VT_MM_NCOLS != 1u` is a specialization constant, so at NCOLS = 1 this whole
+  // block is statically dead and the module below it is the original kernel.
+  if (VT_MM_NCOLS != 1u) {
+    const uint per_group = VT_TG * VT_MM_NCOLS;
+    // Ragged N is expected and bounds-checked per column: 248320 is not a multiple
+    // of 1024, and rounding the span down would silently drop output columns.
+    const uint blocks = (p.n + per_group - 1u) / per_group;
+    const uint gid = gl_WorkGroupID.x;
+    if (gid >= p.m * blocks) { return; }
+    const uint i = gid / blocks;               // output row
+    const uint base = (gid % blocks) * per_group;
+    const uint t = gl_LocalInvocationID.x;
+    const uint a_row = i * p.k;
+
+    // One accumulator per output column this lane owns. Each runs the WHOLE K
+    // reduction sequentially, so each is the CPU kernel's order for its element.
+    float acc[VT_MM_NCOLS_MAX];
+    for (uint c = 0u; c < VT_MM_NCOLS; ++c) { acc[c] = 0.0; }
+
+    for (uint q = 0u; q < p.k; ++q) {
+      // Every lane in the workgroup reads the SAME a element -- a broadcast, and
+      // the reason a is not the cost here even though it is re-read k times per
+      // workgroup.
+      const float av = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q);
+      const uint b_row = q * p.n;
+      // The NCOLS loads are mutually independent and each is a coalesced 128-lane
+      // contiguous read; together they cover per_group CONSECUTIVE elements.
+      for (uint c = 0u; c < VT_MM_NCOLS; ++c) {
+        const uint j = base + t + c * VT_TG;
+        if (j < p.n) {
+          acc[c] += av * VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + j);
+        }
+      }
+    }
+
+    for (uint c = 0u; c < VT_MM_NCOLS; ++c) {
+      const uint j = base + t + c * VT_TG;
+      if (j < p.n) { VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, i * p.n + j, acc[c]); }
+    }
+    return;
+  }
+
+  // FLAT BODY: one invocation per output element, the whole K reduction on it.
   uint gid = gl_GlobalInvocationID.x;
   if (gid >= p.m * p.n) { return; }
   uint i = gid / p.n;  // output row

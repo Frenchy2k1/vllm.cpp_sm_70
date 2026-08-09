@@ -100,7 +100,7 @@ class CommittedArtifact(unittest.TestCase):
     # at its dispatch fails loudly rather than binding the wrong constant.
     SPECIALIZED = {
         "vt_cast": "src and dst dtype",
-        "vt_matmul": "a/b/out dtype plus the b orientation",
+        "vt_matmul": "a/b/out dtype, the b orientation, and the column-block factor",
         "vt_matmul_coopmat": "the b orientation and the output dtype",
         "vt_embedding": "table/out dtype plus the id width",
         "vt_paged_attn": "query/k-cache/v-cache/out dtype",

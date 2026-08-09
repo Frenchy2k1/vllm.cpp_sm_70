@@ -864,6 +864,15 @@ bool VulkanContext::PipelineExistsFor(const std::string& name) const {
   return false;
 }
 
+std::vector<std::string> VulkanContext::PipelineKeys() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& cache = *static_cast<std::map<std::string, Pipeline>*>(pipelines_);
+  std::vector<std::string> out;
+  out.reserve(cache.size());
+  for (const auto& kv : cache) out.push_back(kv.first);
+  return out;
+}
+
 uint64_t VulkanContext::dispatch_count() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   return dispatch_total_;

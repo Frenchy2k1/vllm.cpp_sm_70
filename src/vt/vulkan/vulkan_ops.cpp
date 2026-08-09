@@ -29,6 +29,7 @@
 // bindings onto the SAME VkBuffer — a uint32_t view and a uint16_t view — and
 // its BYTE OFFSET travels in the push constants. See
 // src/vt/vulkan/shaders/vt_common.glsl § STORAGE MODEL for why.
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -663,12 +664,58 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 
   // Scalar tactic: the portable reference, and the only one whose accumulation
   // ORDER matches the CPU kernel's.
-  // Ascending constantID order: a dtype, b dtype, out dtype, orientation.
-  const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype), DtypeCode(out.dtype),
-                            kBT ? 1u : 0u};
+  //
+  // COLUMN BLOCKING IS GATED TO bt == 0, and that gate is structural, not a
+  // heuristic. It exists to give a workgroup a CONTIGUOUS run of b, and b is only
+  // contiguous along the output columns in the [K,N] orientation. In [N,K]
+  // contiguity runs along K instead -- which is exactly why MatmulBT at M=1 has
+  // its own kernel -- so blocking columns there would stride every load and make
+  // this strictly worse.
+  //
+  // It is NOT gated on m. Each of a lane's accumulators owns one output element
+  // and runs the whole K reduction sequentially, so the result is bit-identical to
+  // the flat body for every shape; there is no numeric tier to protect by
+  // restricting it to the decode shape. Correctness of that claim is gated by a
+  // bitwise memcmp of the two arms, not by a tolerance.
+  const uint32_t ncols = kBT ? 1u : MatmulColumnsPerLane();
+
+  // WHICH ARM RAN, once per distinct orientation, under VT_VULKAN_DISPATCH_STATS.
+  // Column blocking is a PERFORMANCE axis: every arm is bit-identical, so a run's
+  // OUTPUT can never say which one served it, and the per-shader histogram only
+  // reports the module name -- every arm is `vt_matmul`. A measurement block on
+  // this box produced one 215 ms/call leg against three at 12.4 across two runs of
+  // each arm; with no marker in the log there was no way to distinguish an arm
+  // that had not taken the flag from a run that hit the GB10 residency lottery
+  // (replication showed it was the lottery). An A/B whose arms are not
+  // self-identifying is not an A/B.
+  if (kCoopMatWhy) {
+    static std::mutex sseen_mu;
+    static std::set<std::string> sseen;
+    const std::string key = std::to_string(kBT ? 1 : 0) + "|" + std::to_string(ncols);
+    std::lock_guard<std::mutex> g(sseen_mu);
+    if (sseen.insert(key).second) {
+      std::fprintf(stderr,
+                   "[vt vulkan] scalar matmul ARM: bt=%d ncols=%u (first shape m=%lld k=%lld "
+                   "n=%lld)\n",
+                   kBT ? 1 : 0, ncols, (long long)m, (long long)k, (long long)n);
+      std::fflush(stderr);
+    }
+  }
+
+  // Ascending constantID order: a dtype, b dtype, out dtype, orientation, ncols.
+  const uint32_t spec[5] = {DtypeCode(a.dtype), DtypeCode(b.dtype), DtypeCode(out.dtype),
+                            kBT ? 1u : 0u, ncols};
   MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n), static_cast<uint32_t>(k),
                  a_off, b_off, out_off};
-  Go("vt_matmul", bind, p, FlatGroupCount(m * n), spec, 4);
+  // ONE WORKGROUP PER COLUMN BLOCK when blocked -- not FlatGroupCount, which
+  // divides an ELEMENT count by the workgroup size. Here a workgroup owns
+  // kWorkgroupSize*ncols consecutive columns of ONE output row, and the block
+  // count is rounded UP because N is not required to be a multiple of that span
+  // (248320 is not a multiple of 1024); the shader bounds-checks each column.
+  const int64_t span = static_cast<int64_t>(kWorkgroupSize) * ncols;
+  const uint32_t groups = ncols == 1u ? FlatGroupCount(m * n)
+                                      : static_cast<uint32_t>(m * ((n + span - 1) / span));
+  Go("vt_matmul", bind, p, groups, spec, 5);
 }
 
 // cpu_ops.cpp:661-672 EmbeddingKernel. One output ELEMENT per invocation.
@@ -1452,4 +1499,51 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// OUTPUT COLUMNS PER LANE for the scalar matmul tactic (VK-G). 4 by default;
+// VT_VULKAN_MATMUL_NCOLS=1|2|4|8 selects an arm.
+//
+// WHY 4 AND NOT 8, MEASURED on GB10 over three interleaved triples at 27B decode
+// (ms/call for the lm_head, k=5120 n=248320): ncols 1 = 12.55, ncols 4 = 11.63,
+// ncols 8 = 12.81. Blocking is a TRADE, not a monotone win -- it buys a longer
+// contiguous run per workgroup and pays for it in workgroups. At 8 the dispatch
+// is only ceil(248320/1024) = 243 workgroups of 128 lanes, about 31k threads,
+// and the device runs out of work to hide memory latency with faster than the
+// longer run buys back.
+//
+// The lever exists for ONE reason, the same one the coopmat and GEMV levers cite:
+// a SAME-BINARY A/B. The factor is a specialization constant, so every arm is the
+// same committed SPIR-V and two runs differ in exactly one thing; comparing two
+// BUILDS is what produced a false 1.2x reading for the subgroup tactic earlier in
+// this campaign. It is NOT a correctness switch -- every arm is bit-identical,
+// which tests/vt/test_vulkan_backend.cpp asserts with memcmp.
+//
+// Atomic because ops dispatch from whichever thread the engine runs on; relaxed
+// because nothing else is ordered against it -- a stale read would pick the other
+// arm of a performance A/B, never a wrong result.
+std::atomic<uint32_t>& MatmulColumnsSlot() {
+  static std::atomic<uint32_t> slot{[] {
+    const char* v = std::getenv("VT_VULKAN_MATMUL_NCOLS");
+    if (v == nullptr) return 4u;
+    if (std::strcmp(v, "1") == 0) return 1u;
+    if (std::strcmp(v, "2") == 0) return 2u;
+    if (std::strcmp(v, "8") == 0) return 8u;
+    return 4u;
+  }()};
+  return slot;
+}
+
+uint32_t MatmulColumnsPerLane() { return MatmulColumnsSlot().load(std::memory_order_relaxed); }
+
+void SetMatmulColumnsPerLane(uint32_t ncols) {
+  // 1, 2, 4 or 8 only. The shader sizes its accumulator array with a COMPILE-TIME
+  // bound of 8 -- a specialization constant cannot size it without the array
+  // spilling to scratch memory, which would defeat the point -- so a larger value
+  // would read past the array rather than fail.
+  VT_CHECK(ncols == 1u || ncols == 2u || ncols == 4u || ncols == 8u,
+           "vulkan: matmul columns-per-lane must be 1, 2, 4 or 8 (the shader's "
+           "accumulator array is bounded at 8)");
+  MatmulColumnsSlot().store(ncols, std::memory_order_relaxed);
+}
+
 }  // namespace vt::vulkan
