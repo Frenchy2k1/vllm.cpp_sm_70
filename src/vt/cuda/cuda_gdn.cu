@@ -278,17 +278,13 @@ __device__ inline void StoreBf16Vec8(__nv_bfloat16* p, float v0, float v1,
                                      float v6, float v7) {
   static_assert(sizeof(__nv_bfloat16) * 8 == sizeof(int4));
   static_assert(alignof(int4) == 16);
-  int4 packed;
-  auto* elements = reinterpret_cast<__nv_bfloat16*>(&packed);
-  elements[0] = __float2bfloat16(v0);
-  elements[1] = __float2bfloat16(v1);
-  elements[2] = __float2bfloat16(v2);
-  elements[3] = __float2bfloat16(v3);
-  elements[4] = __float2bfloat16(v4);
-  elements[5] = __float2bfloat16(v5);
-  elements[6] = __float2bfloat16(v6);
-  elements[7] = __float2bfloat16(v7);
-  *reinterpret_cast<int4*>(p) = packed;
+  const float values[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+  const GdnDecodeBf16Pack8 packed = GdnDecodePackBf16Vec8(values);
+  const int4 transaction{static_cast<int>(packed.words[0]),
+                         static_cast<int>(packed.words[1]),
+                         static_cast<int>(packed.words[2]),
+                         static_cast<int>(packed.words[3])};
+  *reinterpret_cast<int4*>(p) = transaction;
 }
 
 template <typename T>
@@ -2962,7 +2958,7 @@ void LaunchGdnDecodeFusedNW(cudaStream_t s, Tensor& out, const Tensor& q_in, con
                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                             const int32_t* state_idx, int64_t n, const GdnArgs& args,
                             const GdnDecodeLaunchContract& contract,
-                            bool bf16_vecstore) {
+                            const GdnDecodeBf16VecstoreCapability& bf16_vecstore) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t bv = contract.value_tile;
@@ -2983,8 +2979,7 @@ void LaunchGdnDecodeFusedNW(cudaStream_t s, Tensor& out, const Tensor& q_in, con
           },
           [&](const GdnDecodeLaunchContract&) {
             if constexpr (std::is_same<TState, __nv_bfloat16>::value) {
-              DispatchGdnDecodeBf16Vecstore(
-                  bf16_vecstore,
+              bf16_vecstore.Dispatch(
                   [&] {
                     GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true,
                                          false>
@@ -3039,7 +3034,7 @@ void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                           const int32_t* state_idx, int64_t n, const GdnArgs& args,
                           const GdnDecodeLaunchContract& contract,
-                          bool bf16_vecstore) {
+                          const GdnDecodeBf16VecstoreCapability& bf16_vecstore) {
   switch (contract.lanes_per_row) {
     case 2:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 2>(s, out, q_in, k, v, g, beta, state, state_idx,
@@ -3071,7 +3066,7 @@ void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, cons
                            const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                            const int32_t* state_idx, int64_t n, const GdnArgs& args,
                            const GdnDecodeLaunchContract& contract,
-                           bool bf16_vecstore) {
+                           const GdnDecodeBf16VecstoreCapability& bf16_vecstore) {
   if (state.dtype == DType::kBF16)
     LaunchGdnDecodeFused<Tin, Tout, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
                                                    n, args, contract,
@@ -3117,9 +3112,9 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
                   args, "gdn_decode");
       return;
     }
-    const bool bf16_vecstore = GdnDecodeBf16VecstoreEligible(
+    const GdnDecodeBf16VecstoreCapability bf16_vecstore{
         std::getenv("VT_GDN_DECODE_BF16_VECSTORE"), contract, dv, dk, nw,
-        state.dtype == DType::kBF16, true);
+        state.dtype == DType::kBF16, true};
     if (q_in.dtype == DType::kF32) {
       if (out.dtype == DType::kF32)
         LaunchGdnDecodeFusedS<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,

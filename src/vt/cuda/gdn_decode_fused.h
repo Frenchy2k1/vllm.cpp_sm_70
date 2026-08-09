@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace vt::cuda {
 
@@ -80,6 +81,48 @@ static_assert(GdnDecodeBf16PackByteOffset(0, 0) == 0);
 static_assert(GdnDecodeBf16PackByteOffset(0, 1) == 16);
 static_assert(GdnDecodeBf16PackByteOffset(7, 1) == 240);
 
+// Portable representation of the exact 16-byte transaction emitted by the
+// CUDA writeback.  Keeping conversion and packing here lets the host tests
+// validate the bytes that StoreBf16Vec8 actually consumes.
+struct alignas(16) GdnDecodeBf16Pack8 {
+  uint32_t words[4];
+};
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline uint16_t GdnDecodeBf16RnBits(float value) {
+  uint32_t bits = 0;
+#if defined(__CUDA_ARCH__)
+  bits = __float_as_uint(value);
+#else
+  std::memcpy(&bits, &value, sizeof(bits));
+#endif
+  const uint32_t exponent = bits & 0x7f800000u;
+  const uint32_t mantissa = bits & 0x007fffffu;
+  if (exponent == 0x7f800000u && mantissa != 0) {
+    return static_cast<uint16_t>((bits >> 16) | 0x0040u);
+  }
+  const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
+  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline GdnDecodeBf16Pack8 GdnDecodePackBf16Vec8(const float* values) {
+  GdnDecodeBf16Pack8 packed{};
+  for (int pair = 0; pair < 4; ++pair) {
+    const uint32_t lo = GdnDecodeBf16RnBits(values[pair * 2]);
+    const uint32_t hi = GdnDecodeBf16RnBits(values[pair * 2 + 1]);
+    packed.words[pair] = lo | (hi << 16);
+  }
+  return packed;
+}
+
+static_assert(sizeof(GdnDecodeBf16Pack8) == 16);
+static_assert(alignof(GdnDecodeBf16Pack8) == 16);
+
 #if defined(__CUDACC__)
 __host__ __device__
 #endif
@@ -109,10 +152,35 @@ inline constexpr bool GdnDecodeBf16VecstoreEligible(
   return GdnDecodeBf16VecstoreFlagIsOn(env_value) && contract.regstate &&
          contract.swizzled &&
          contract.selected_tile == GdnDecodeValueTile::kBv16 &&
-         contract.value_tile == 16 && contract.lanes_per_row == 8 &&
-         contract.block_threads == 128 && dv == 128 && dk == 128 &&
-         requested_nw == 8 && state_is_bf16 && regular_fused_decode;
+         contract.value_tile == 16 && contract.value_tiles == 8 &&
+         contract.lanes_per_row == 8 && contract.block_threads == 128 &&
+         contract.shared_bytes == 9728 && contract.should_launch && dv == 128 &&
+         dk == 128 && requested_nw == 8 && state_is_bf16 &&
+         regular_fused_decode;
 }
+
+struct GdnDecodeBf16VecstoreCapability {
+  const char* env_value;
+  GdnDecodeLaunchContract contract;
+  int64_t dv;
+  int64_t dk;
+  int requested_nw;
+  bool state_is_bf16;
+  bool regular_fused_decode;
+
+  constexpr bool Eligible() const {
+    return GdnDecodeBf16VecstoreEligible(
+        env_value, contract, dv, dk, requested_nw, state_is_bf16,
+        regular_fused_decode);
+  }
+
+  template <typename IncumbentLaunch, typename VectorLaunch>
+  inline decltype(auto) Dispatch(IncumbentLaunch&& incumbent_launch,
+                                 VectorLaunch&& vector_launch) const {
+    if (Eligible()) return vector_launch();
+    return incumbent_launch();
+  }
+};
 
 inline constexpr GdnDecodeLaunchContract GdnDecodeLaunchContractFor(
     const char* bv_env_value, const char* swizzle_env_value,
