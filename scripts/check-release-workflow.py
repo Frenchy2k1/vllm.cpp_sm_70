@@ -34,11 +34,24 @@ def validate(text: str) -> list[str]:
     if "continue-on-error" in text:
         errors.append("release workflow may not continue after an error")
 
-    blocks = {name: job_block(text, name) for name in ("plan", "build", "verify", "attest", "publish")}
+    read_only_jobs = (
+        "plan",
+        "cpu_x86",
+        "cpu_arm64",
+        "cpu_musl",
+        "cuda_x86",
+        "cuda_arm64",
+        "build",
+        "verify",
+    )
+    blocks = {
+        name: job_block(text, name)
+        for name in (*read_only_jobs, "attest", "publish")
+    }
     for name, block in blocks.items():
         if not block:
             errors.append(f"release workflow is missing {name} job")
-    for name in ("plan", "build", "verify"):
+    for name in read_only_jobs:
         block = blocks[name]
         if "    permissions:\n      contents: read" not in block:
             errors.append(f"{name} job must have contents: read only")
@@ -86,14 +99,16 @@ def validate(text: str) -> list[str]:
     for fragment in required_handoff:
         if fragment not in text:
             errors.append(f"immutable artifact handoff is missing {fragment!r}")
-    if text.count("overwrite: false") != 3:
-        errors.append("every one of the three artifact uploads must refuse overwrite")
-    if text.count("if-no-files-found: error") != 3:
+    uploads = text.count("uses: actions/upload-artifact@v4")
+    downloads = text.count("uses: actions/download-artifact@v4")
+    if uploads < 3:
+        errors.append("release workflow requires immutable plan, asset, and verified uploads")
+    if text.count("overwrite: false") != uploads:
+        errors.append("every artifact upload must refuse overwrite")
+    if text.count("if-no-files-found: error") != uploads:
         errors.append("every artifact upload must fail when its explicit file is missing")
-    if text.count("uses: actions/upload-artifact@v4") != 3:
-        errors.append("release workflow requires exactly three immutable uploads")
-    if text.count("uses: actions/download-artifact@v4") != 5:
-        errors.append("every cross-job handoff must use the exact v4 downloader")
+    if downloads < 5 or text.count("artifact-ids:") != downloads:
+        errors.append("every cross-job handoff must use an exact immutable artifact ID")
     if re.search(r"(?m)^\s+path:\s*[^\n]*[*?]", text):
         errors.append("release workflow artifact paths must not use wildcards")
     if re.search(r"gh release (?:create|upload)[^\n]*[*?]", text):

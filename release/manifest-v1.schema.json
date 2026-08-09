@@ -93,6 +93,7 @@
         "VLLM_CPP_CUDA_ARCHITECTURES",
         "VLLM_CPP_HIP",
         "VLLM_CPP_HIP_ARCHITECTURES",
+        "VLLM_CPP_LITERAL_STATIC",
         "VLLM_CPP_METAL",
         "VLLM_CPP_MLX",
         "VLLM_CPP_SERVER",
@@ -115,6 +116,7 @@
           "items": {"type": "string", "minLength": 1},
           "uniqueItems": true
         },
+        "VLLM_CPP_LITERAL_STATIC": {"type": "boolean"},
         "VLLM_CPP_METAL": {"type": "boolean"},
         "VLLM_CPP_MLX": {"type": "boolean"},
         "VLLM_CPP_SERVER": {"type": "boolean"},

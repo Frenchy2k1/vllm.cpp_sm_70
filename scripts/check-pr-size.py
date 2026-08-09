@@ -330,6 +330,7 @@ def classify_path(path: str) -> str:
         return "vendored_dependency"
     if path in {
         "release/manifest-v1.schema.json",
+        "release/release-matrix.json",
         "scripts/env-doc-allowlist.txt",
     }:
         return "configuration"

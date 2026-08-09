@@ -69,16 +69,44 @@ class ReleasePipelineContract(unittest.TestCase):
             plan_path = root / "release-plan.json"
             handoff_path = root / "release-handoff.json"
             verified_path = root / "verified-handoff.json"
+            assets = root / "assets"
+            assets.mkdir()
+            archive = assets / "linux-x86_64-glibc-cpu.tar.gz"
+            archive.write_bytes(b"release bytes")
+            digest = self.pipeline.file_sha256(archive)
+            (assets / f"{archive.name}.sha256").write_text(
+                f"{digest}  {archive.name}\n", encoding="utf-8"
+            )
+            (assets / f"{archive.name}.provenance.json").write_text(
+                json.dumps({"subject": [{"name": archive.name, "digest": {"sha256": digest}}]}),
+                encoding="utf-8",
+            )
             self.pipeline.write_json(plan_path, self.plan("workflow_dispatch", "refs/heads/main"))
-            self.pipeline.make_handoff(plan_path, handoff_path)
-            self.pipeline.verify_handoff(plan_path, handoff_path, verified_path, SHA)
+            self.pipeline.make_handoff(plan_path, assets, handoff_path)
+            self.pipeline.verify_handoff(plan_path, handoff_path, assets, verified_path, SHA)
             verified = json.loads(verified_path.read_text())
             self.assertTrue(verified["verified"])
+            self.assertEqual([item["name"] for item in verified["files"]], sorted(path.name for path in assets.iterdir()))
             mutant = json.loads(handoff_path.read_text())
             mutant["source_sha"] = "f" * 40
             self.pipeline.write_json(handoff_path, mutant)
             with self.assertRaises(ValueError):
-                self.pipeline.verify_handoff(plan_path, handoff_path, verified_path, SHA)
+                self.pipeline.verify_handoff(plan_path, handoff_path, assets, verified_path, SHA)
+            self.pipeline.make_handoff(plan_path, assets, handoff_path)
+            archive.write_bytes(b"mutated")
+            with self.assertRaises(ValueError):
+                self.pipeline.verify_handoff(plan_path, handoff_path, assets, verified_path, SHA)
+
+    def test_publish_ready_plan_requires_every_required_asset_triplet(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = self.plan("push", "refs/tags/v0.0.1", release_ready=True)
+            plan_path = root / "plan.json"
+            self.pipeline.write_json(plan_path, plan)
+            assets = root / "assets"
+            assets.mkdir()
+            with self.assertRaises(ValueError):
+                self.pipeline.make_handoff(plan_path, assets, root / "handoff.json")
 
     def test_cli_dry_run_never_calls_github_or_creates_a_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -28,6 +28,9 @@ option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
 # deviation, NOT a compute/ML dependency (consistent with the no-pytorch/no-ggml
 # rule).
 option(VLLM_CPP_SERVER "Build the OpenAI HTTP server (needs third_party/httplib/httplib.h)" ON)
+option(VLLM_CPP_LITERAL_STATIC
+  "Link the CPU-only server as a literal static executable (experimental musl release lane only)"
+  OFF)
 if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib/httplib.h")
   message(WARNING "VLLM_CPP_SERVER=ON but third_party/httplib/httplib.h is missing; "
     "disabling the server target. Vendor cpp-httplib to enable it.")

@@ -69,6 +69,7 @@ def flags(backend: str, sms: list[str] | None = None) -> dict[str, object]:
         "VLLM_CPP_CUDA_ARCHITECTURES": list(sms or []),
         "VLLM_CPP_HIP": False,
         "VLLM_CPP_HIP_ARCHITECTURES": [],
+        "VLLM_CPP_LITERAL_STATIC": False,
         "VLLM_CPP_METAL": backend in {"metal", "mlx"},
         "VLLM_CPP_MLX": backend == "mlx",
         "VLLM_CPP_SERVER": True,
@@ -544,6 +545,35 @@ class ReleaseManifestTests(unittest.TestCase):
         mutant["cpu"]["compiled_tiers"][1]["required_os_state"] = []
         self.assert_invalid(mutant, "OS-state")
 
+    def test_literal_static_flag_is_exactly_scoped_to_the_musl_cpu_tuple(self) -> None:
+        glibc = self.generated(cpu_facts())
+        glibc["backend"]["flags"]["VLLM_CPP_LITERAL_STATIC"] = True
+        glibc["build"]["resolved_cmake_options"]["VLLM_CPP_LITERAL_STATIC"] = True
+        self.assert_invalid(glibc, "must agree with the artifact static boundary")
+
+        facts = cpu_facts()
+        facts["artifact"].update(
+            {
+                "id": "linux-x86_64-musl-cpu-static",
+                "channel": "experimental-preview",
+                "static_boundary": "literal-static",
+            }
+        )
+        facts["host"].update({"abi": "musl", "abi_version": "1.2.5"})
+        facts["backend"]["flags"]["VLLM_CPP_LITERAL_STATIC"] = True
+        facts["build"]["resolved_cmake_options"]["VLLM_CPP_LITERAL_STATIC"] = True
+        facts["dependencies"] = [
+            {
+                "name": "musl-libc",
+                "version": "1.2.5",
+                "kind": "library",
+                "linkage": "static",
+                "bundled": True,
+                "role": "build-time",
+            }
+        ]
+        self.generated(facts)
+
     def test_cpu_tier_inventory_is_exact_on_x86_and_aarch64(self) -> None:
         manifest = self.generated(cpu_facts())
         for index, tier in enumerate(manifest["cpu"]["compiled_tiers"]):
@@ -798,6 +828,8 @@ class ReleaseManifestTests(unittest.TestCase):
             "static_boundary": "literal-static",
         })
         musl["host"].update({"abi": "musl", "abi_version": "1.2.5"})
+        musl["backend"]["flags"]["VLLM_CPP_LITERAL_STATIC"] = True
+        musl["build"]["resolved_cmake_options"]["VLLM_CPP_LITERAL_STATIC"] = True
         musl["dependencies"] = [{
             "name": "musl", "version": "1.2.5", "kind": "library",
             "linkage": "static", "bundled": True, "role": "runtime",

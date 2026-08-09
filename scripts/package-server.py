@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -18,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--stage-dir", type=Path, required=True)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--metadata-dir", type=Path)
     parser.add_argument("--config", default="")
     return parser.parse_args()
 
@@ -95,6 +98,62 @@ def write_archive(stage_dir: Path, archive: Path, epoch: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def install_metadata(metadata_dir: Path, stage_dir: Path) -> None:
+    required = {
+        "THIRD_PARTY_NOTICES",
+        "VERSION",
+        "release-manifest.json",
+        "sbom.spdx.json",
+    }
+    files = {
+        path.relative_to(metadata_dir).as_posix(): path
+        for path in metadata_dir.rglob("*")
+        if path.is_file()
+    }
+    missing = sorted(required - files.keys())
+    if missing:
+        raise SystemExit(f"release metadata is missing required files: {missing}")
+    licenses = [name for name in files if name.startswith("share/licenses/")]
+    if not licenses:
+        raise SystemExit("release metadata must include share/licenses entries")
+    allowed = required | set(licenses)
+    extra = sorted(set(files) - allowed)
+    if extra:
+        raise SystemExit(f"release metadata contains undeclared files: {extra}")
+    for relative, source in files.items():
+        destination = stage_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def write_archive_sidecars(archive: Path, stage_dir: Path) -> None:
+    hasher = hashlib.sha256()
+    with archive.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    digest = hasher.hexdigest()
+    Path(f"{archive}.sha256").write_text(
+        f"{digest}  {archive.name}\n", encoding="utf-8"
+    )
+    manifest = json.loads((stage_dir / "release-manifest.json").read_text(encoding="utf-8"))
+    provenance = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "subject": [{"name": archive.name, "digest": {"sha256": digest}}],
+        "predicate": {
+            "buildDefinition": {
+                "externalParameters": {
+                    "artifact_id": manifest["artifact"]["id"],
+                    "source_commit": manifest["build"]["source_commit"],
+                }
+            }
+        },
+    }
+    Path(f"{archive}.provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def main() -> int:
     args = parse_args()
     build_dir = args.build_dir.resolve()
@@ -104,6 +163,9 @@ def main() -> int:
     require_build_output(stage_dir, build_dir, "--stage-dir")
     if args.archive is not None:
         require_build_output(args.archive.resolve(), build_dir, "--archive")
+    metadata_dir = args.metadata_dir.resolve() if args.metadata_dir is not None else None
+    if metadata_dir is not None and not metadata_dir.is_dir():
+        raise SystemExit("--metadata-dir must name a prepared metadata directory")
     stage_dir.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix=".vllm-server-stage-", dir=stage_dir.parent) as raw:
@@ -113,8 +175,12 @@ def main() -> int:
         server = fresh_stage / "bin" / server_name
         if not server.is_file():
             raise SystemExit(f"installed server component is missing {server.relative_to(fresh_stage)}")
+        if metadata_dir is not None:
+            install_metadata(metadata_dir, fresh_stage)
         if args.archive is not None:
             write_archive(fresh_stage, args.archive.resolve(), source_date_epoch())
+            if metadata_dir is not None:
+                write_archive_sidecars(args.archive.resolve(), fresh_stage)
 
         if stage_dir.exists():
             shutil.rmtree(stage_dir)

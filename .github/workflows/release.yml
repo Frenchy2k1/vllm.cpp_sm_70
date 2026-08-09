@@ -21,6 +21,7 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       publish: ${{ steps.plan.outputs.publish }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Compute an explicit dry-run or exact-tag plan
@@ -44,8 +45,204 @@ jobs:
           if-no-files-found: error
           overwrite: false
           retention-days: 7
-  build:
+  cpu_x86:
     needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install feature-poor userspace emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-user
+      - name: Build, execute, package, and validate adaptive x86 CPU bundle
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          test "$version" = "$VERSION"
+          scripts/build-cpu-release.sh \
+            linux-x86_64-glibc-cpu x86_64 stable build-release-cpu-x86 \
+            "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" \
+            "$(command -v qemu-x86_64)"
+      - name: Upload exact validated x86 CPU asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64-glibc-cpu-${{ github.sha }}
+          path: |
+            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz
+            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz.sha256
+            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  cpu_arm64:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install feature-poor userspace emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-user
+      - name: Build, execute, package, and validate adaptive Arm CPU bundle
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          test "$version" = "$VERSION"
+          scripts/build-cpu-release.sh \
+            linux-aarch64-glibc-cpu aarch64 stable build-release-cpu-arm64 \
+            "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" \
+            "$(command -v qemu-aarch64)"
+      - name: Upload exact validated Arm CPU asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-aarch64-glibc-cpu-${{ github.sha }}
+          path: |
+            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz
+            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz.sha256
+            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  cpu_musl:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and validate the literal-static musl experiment
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          test "$version" = "$VERSION"
+          docker run --rm \
+            -e EVIDENCE_URL -e SOURCE_DATE_EPOCH -e SOURCE_SHA -e VERSION \
+            -v "$GITHUB_WORKSPACE:/src" -w /src alpine:3.22 sh -euxc '
+              apk add --no-cache binutils build-base cmake file ninja python3 qemu-x86_64
+              scripts/build-cpu-release.sh \
+                linux-x86_64-musl-cpu-static x86_64 experimental-preview \
+                build-release-cpu-musl 1.2.5 /usr/bin/qemu-x86_64
+            '
+          sudo chown -R "$(id -u):$(id -g)" build-release-cpu-musl
+      - name: Upload exact validated musl CPU asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64-musl-cpu-static-${{ github.sha }}
+          path: |
+            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz
+            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz.sha256
+            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  cuda_x86:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container: nvidia/cuda:13.3.0-devel-ubuntu24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Install build and archive inspection tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils ca-certificates cmake file g++ git ninja-build python3
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v4
+      - name: Build and validate the x86 ten-SM CUDA bundle
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          scripts/build-linux-accelerator-release.sh \
+            linux-x86_64-glibc-cuda-fat cuda build-release-cuda-x86
+      - name: Upload exact validated x86 CUDA asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64-glibc-cuda-fat-${{ github.sha }}
+          path: |
+            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz
+            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz.sha256
+            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  cuda_arm64:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    container: nvidia/cuda:13.3.0-devel-ubuntu24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Install build and archive inspection tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils ca-certificates cmake file g++ git ninja-build python3
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v4
+      - name: Build and validate the Arm ten-SM CUDA bundle
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          scripts/build-linux-accelerator-release.sh \
+            linux-aarch64-glibc-cuda-fat cuda build-release-cuda-arm64
+      - name: Upload exact validated Arm CUDA asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-aarch64-glibc-cuda-fat-${{ github.sha }}
+          path: |
+            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz
+            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz.sha256
+            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  build:
+    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64]
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -59,17 +256,26 @@ jobs:
         with:
           artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
-      - name: Produce the W8 contract handoff
+      - name: Download exact validated CPU artifacts by immutable IDs
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }}
+          path: assets
+          merge-multiple: true
+      - name: Produce the byte-bound release handoff
         run: |
           python3 scripts/release_pipeline.py handoff \
             --plan plan/release-plan.json \
+            --assets-dir assets \
             --output release-handoff.json
       - name: Upload immutable unverified handoff
         id: upload
         uses: actions/upload-artifact@v4
         with:
           name: release-unverified-${{ github.sha }}
-          path: release-handoff.json
+          path: |
+            release-handoff.json
+            assets
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -95,17 +301,20 @@ jobs:
           path: unverified
       - name: Verify handoff against plan and workflow SHA
         run: |
+          mkdir -p verified
+          cp -a unverified/assets verified/assets
           python3 scripts/release_pipeline.py verify \
             --plan plan/release-plan.json \
             --handoff unverified/release-handoff.json \
-            --output verified-handoff.json \
+            --assets-dir verified/assets \
+            --output verified/verified-handoff.json \
             --sha '${{ github.sha }}'
       - name: Upload immutable verified handoff
         id: upload
         uses: actions/upload-artifact@v4
         with:
           name: release-verified-${{ github.sha }}
-          path: verified-handoff.json
+          path: verified
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -127,7 +336,7 @@ jobs:
       - name: Attest verified bytes
         uses: actions/attest@v4
         with:
-          subject-path: verified/verified-handoff.json
+          subject-path: verified/assets/**
   publish:
     needs: [plan, verify, attest]
     if: needs.plan.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
