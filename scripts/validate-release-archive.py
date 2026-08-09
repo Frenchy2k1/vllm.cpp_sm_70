@@ -442,6 +442,18 @@ def run(command: list[str]) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
+def ldd_reports_static(output: str) -> bool:
+    normalized = output.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "not a dynamic executable",
+            "not a valid dynamic program",
+            "statically linked",
+        )
+    )
+
+
 def inspect_linux(
     server: Path,
     manifest: dict[str, Any],
@@ -476,7 +488,7 @@ def inspect_linux(
         )
     ldd_rc, ldd_output = run(["ldd", str(server)])
     literal_static = manifest.get("artifact", {}).get("static_boundary") == "literal-static"
-    static_ldd = "not a dynamic executable" in ldd_output or "statically linked" in ldd_output
+    static_ldd = ldd_reports_static(ldd_output)
     if literal_static:
         if not static_ldd:
             errors.append(f"literal-static server has a dynamic ldd result: {ldd_output.strip()}")
