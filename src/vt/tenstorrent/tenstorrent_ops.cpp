@@ -19,6 +19,7 @@
 // vLLM's block-table contract onto ttnn::sdpa_decode is deferred to the
 // device-resident-tensor redesign the spec already names.
 #include "vt/backend.h"
+#include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tenstorrent/tenstorrent_device.h"
@@ -33,6 +34,10 @@
 #include <optional>
 #include <utility>
 #include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/shape/shape.hpp>
@@ -868,9 +873,21 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
 // deferred to the device-resident redesign — its layout contract does not map
 // 1:1 onto vLLM's block_table without that work.
 //
-// This step supports: F32 query/out/cache, kAuto KV (no fp8), optional softcap
-// and window_size (same math as CPU). OPT-125m uses causal + full window + no
-// softcap.
+// Perf (still host, but no longer a single-thread LoadElem switch farm):
+//   * Parallel over (token, head) via the shared CPU threadpool — decode has
+//     total_q==1 so token-only parallelism is a no-op; head parallelism is the
+//     real win. Prefill gets both axes.
+//   * Hoist each query head into a local f32 buffer once (was re-loaded from
+//     the tensor for every key position).
+//   * Specialize contiguous f32/bf16 loads so the inner d-loop is a raw
+//     pointer walk, not a per-element dtype switch.
+//
+// Correctness: each (t,h) writes a disjoint out row with the same j-order and
+// max-subtracted softmax as the serial path → bit-identical to n_threads==1.
+//
+// This step supports: F32/BF16/F16 query/cache, f32/bf16 out, kAuto KV (no
+// fp8), optional softcap and window_size (same math as CPU). OPT-125m uses
+// causal + full window + no softcap.
 void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& k_cache,
                           const Tensor& v_cache, const Tensor& block_table,
                           const Tensor& seq_lens, const Tensor& query_start_loc,
@@ -930,29 +947,113 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     }
   }
 
-  std::vector<float> probs;
-  std::vector<float> acc(static_cast<size_t>(d));
-  for (int64_t t = 0; t < total_q; ++t) {
-    const int64_t r = tok_req[static_cast<size_t>(t)];
-    const int64_t p = tok_pos[static_cast<size_t>(t)];
-    const int64_t seqlen = tok_slen[static_cast<size_t>(t)];
-    const int64_t jmin = window_left >= 0 ? std::max<int64_t>(0, p - window_left) : 0;
-    int64_t jmax = args.causal ? p : seqlen - 1;
-    if (window_right >= 0) jmax = std::min(jmax, p + window_right);
-    jmax = std::min(jmax, seqlen - 1);
-    if (jmax < jmin) continue;
-    probs.assign(static_cast<size_t>(jmax - jmin + 1), 0.0f);
-    for (int64_t h = 0; h < hq; ++h) {
+  // F32 contiguous inner kernels (NEON on aarch64). Bit-identical to scalar
+  // for normal finite scores (same j order / max-subtracted softmax).
+  auto dot_f32 = [](const float* a, const float* b, int64_t n) -> float {
+#if defined(__aarch64__)
+    float32x4_t vacc = vdupq_n_f32(0.0f);
+    int64_t e = 0;
+    for (; e + 4 <= n; e += 4) {
+      vacc = vfmaq_f32(vacc, vld1q_f32(a + e), vld1q_f32(b + e));
+    }
+    float sum = vaddvq_f32(vacc);
+    for (; e < n; ++e) sum += a[e] * b[e];
+    return sum;
+#else
+    float sum = 0.0f;
+    for (int64_t e = 0; e < n; ++e) sum += a[e] * b[e];
+    return sum;
+#endif
+  };
+  auto axpy_f32 = [](float* acc, const float* v, float pw, int64_t n) {
+#if defined(__aarch64__)
+    const float32x4_t vp = vdupq_n_f32(pw);
+    int64_t e = 0;
+    for (; e + 4 <= n; e += 4) {
+      float32x4_t a = vld1q_f32(acc + e);
+      a = vfmaq_f32(a, vp, vld1q_f32(v + e));
+      vst1q_f32(acc + e, a);
+    }
+    for (; e < n; ++e) acc[e] += pw * v[e];
+#else
+    for (int64_t e = 0; e < n; ++e) acc[e] += pw * v[e];
+#endif
+  };
+
+  // Contiguous float loaders — dtype is fixed for the whole kernel call.
+  // Captured bases avoid per-element Tensor::Ptr + switch in the hot loop.
+  const DType q_dt = query.dtype, k_dt = k_cache.dtype, v_dt = v_cache.dtype,
+              o_dt = out.dtype;
+  const float* q_f = (q_dt == DType::kF32) ? query.Ptr<float>() : nullptr;
+  const uint16_t* q_h =
+      (q_dt == DType::kBF16 || q_dt == DType::kF16) ? query.Ptr<uint16_t>() : nullptr;
+  const float* k_f = (k_dt == DType::kF32) ? k_cache.Ptr<float>() : nullptr;
+  const uint16_t* k_h =
+      (k_dt == DType::kBF16 || k_dt == DType::kF16) ? k_cache.Ptr<uint16_t>() : nullptr;
+  const float* v_f = (v_dt == DType::kF32) ? v_cache.Ptr<float>() : nullptr;
+  const uint16_t* v_h =
+      (v_dt == DType::kBF16 || v_dt == DType::kF16) ? v_cache.Ptr<uint16_t>() : nullptr;
+  float* o_f = (o_dt == DType::kF32) ? out.Ptr<float>() : nullptr;
+  uint16_t* o_h = (o_dt == DType::kBF16) ? out.Ptr<uint16_t>() : nullptr;
+
+  auto load_half = [](DType dt, const uint16_t* base, int64_t i) -> float {
+    return dt == DType::kBF16 ? BF16ToF32(base[i]) : F16ToF32(base[i]);
+  };
+
+  // Work unit = (token, head). Decode has total_q==1 so token-only
+  // parallelism is a no-op; (t,h) is the useful axis. Prefill gets both.
+  //
+  // Do NOT kick the full hardware-concurrency pool for tiny nwork: on a
+  // 128-core box ParallelForRows barriers dominate short decode. Threshold
+  // keeps serial (still NEON-optimized) for smoke/decode and parallel for
+  // long prefill.
+  const int64_t nwork = total_q * hq;
+  constexpr int64_t kPaParallelMinWork = 64;
+
+  auto process_range = [&](int64_t w0, int64_t w1) {
+    std::vector<float> probs;
+    std::vector<float> acc(static_cast<size_t>(d));
+    std::vector<float> qloc(static_cast<size_t>(d));
+    std::vector<float> kvloc;  // bf16/f16 K/V page staging
+    const bool k_is_f32 = k_f != nullptr;
+    const bool v_is_f32 = v_f != nullptr;
+    if (!k_is_f32 || !v_is_f32) kvloc.resize(static_cast<size_t>(d));
+
+    for (int64_t w = w0; w < w1; ++w) {
+      const int64_t t = w / hq;
+      const int64_t h = w % hq;
+      const int64_t r = tok_req[static_cast<size_t>(t)];
+      const int64_t p = tok_pos[static_cast<size_t>(t)];
+      const int64_t seqlen = tok_slen[static_cast<size_t>(t)];
+      const int64_t jmin = window_left >= 0 ? std::max<int64_t>(0, p - window_left) : 0;
+      int64_t jmax = args.causal ? p : seqlen - 1;
+      if (window_right >= 0) jmax = std::min(jmax, p + window_right);
+      jmax = std::min(jmax, seqlen - 1);
+      if (jmax < jmin) continue;
+
       const int64_t g = h / qpk;
       const int64_t qoff = (t * hq + h) * d;
+      // Hoist Q head once (was re-loaded for every key position).
+      if (q_f != nullptr) {
+        std::memcpy(qloc.data(), q_f + qoff, static_cast<size_t>(d) * sizeof(float));
+      } else {
+        for (int64_t e = 0; e < d; ++e) qloc[static_cast<size_t>(e)] = load_half(q_dt, q_h, qoff + e);
+      }
+
+      probs.assign(static_cast<size_t>(jmax - jmin + 1), 0.0f);
       float m = -std::numeric_limits<float>::infinity();
       for (int64_t j = jmin; j <= jmax; ++j) {
         const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
         const int64_t off = j % block_size;
         const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
-        float dot = 0.0f;
-        for (int64_t e = 0; e < d; ++e)
-          dot += LoadElemF32(query, qoff + e) * LoadElemF32(k_cache, kbase + e);
+        float dot;
+        if (k_is_f32) {
+          dot = dot_f32(qloc.data(), k_f + kbase, d);
+        } else {
+          for (int64_t e = 0; e < d; ++e)
+            kvloc[static_cast<size_t>(e)] = load_half(k_dt, k_h, kbase + e);
+          dot = dot_f32(qloc.data(), kvloc.data(), d);
+        }
         dot *= scale;
         if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
         probs[static_cast<size_t>(j - jmin)] = dot;
@@ -965,17 +1066,32 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
         denom += e;
       }
       const float inv = 1.0f / denom;
-      for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+      std::fill(acc.begin(), acc.end(), 0.0f);
       for (int64_t j = jmin; j <= jmax; ++j) {
         const float pw = probs[static_cast<size_t>(j - jmin)] * inv;
         const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
         const int64_t off = j % block_size;
         const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
-        for (int64_t e = 0; e < d; ++e)
-          acc[static_cast<size_t>(e)] += pw * LoadElemF32(v_cache, vbase + e);
+        if (v_is_f32) {
+          axpy_f32(acc.data(), v_f + vbase, pw, d);
+        } else {
+          for (int64_t e = 0; e < d; ++e)
+            kvloc[static_cast<size_t>(e)] = load_half(v_dt, v_h, vbase + e);
+          axpy_f32(acc.data(), kvloc.data(), pw, d);
+        }
       }
-      for (int64_t e = 0; e < d; ++e) StoreElemF32(out, qoff + e, acc[static_cast<size_t>(e)]);
+      if (o_f != nullptr) {
+        std::memcpy(o_f + qoff, acc.data(), static_cast<size_t>(d) * sizeof(float));
+      } else {
+        for (int64_t e = 0; e < d; ++e) o_h[qoff + e] = F32ToBF16(acc[static_cast<size_t>(e)]);
+      }
     }
+  };
+
+  if (nwork >= kPaParallelMinWork && vt::cpu::CurrentThreadpool().NThreads() > 1) {
+    vt::cpu::ParallelForRows(vt::cpu::CurrentThreadpool(), nwork, process_range);
+  } else {
+    process_range(0, nwork);
   }
   CommitHost(out);
 }
