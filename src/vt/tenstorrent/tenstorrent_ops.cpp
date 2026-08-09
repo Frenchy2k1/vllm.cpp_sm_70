@@ -367,6 +367,119 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   }
 }
 
+// kPagedAttention: causal/non-causal GQA softmax over the paged NHD cache
+// (cpu_paged_attn.cpp PagedAttentionKernel). Host-staged f32 oracle matching
+// the CPU reference while Alloc is host memory. Device ttnn::sdpa_decode is
+// deferred to the device-resident redesign — its layout contract does not map
+// 1:1 onto vLLM's block_table without that work.
+//
+// This step supports: F32 query/out/cache, kAuto KV (no fp8), optional softcap
+// and window_size (same math as CPU). OPT-125m uses causal + full window + no
+// softcap.
+void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                          const Tensor& v_cache, const Tensor& block_table,
+                          const Tensor& seq_lens, const Tensor& query_start_loc,
+                          const PagedAttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && out.rank == 3 && k_cache.rank == 4 && v_cache.rank == 4,
+           "tenstorrent kPagedAttention: query/out rank-3, caches rank-4");
+  VT_CHECK(query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
+               k_cache.dtype == DType::kF32 && v_cache.dtype == DType::kF32,
+           "tenstorrent kPagedAttention: only F32 is supported in this step");
+  VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kAuto,
+           "tenstorrent kPagedAttention: fp8 KV not supported in this step");
+  VT_CHECK(args.scale > 0.0f, "tenstorrent kPagedAttention: scale must be > 0");
+  VT_CHECK(query.IsContiguous() && out.IsContiguous() && seq_lens.IsContiguous() &&
+               query_start_loc.IsContiguous(),
+           "tenstorrent kPagedAttention: query/out/seq_lens/query_start_loc contiguous");
+
+  const int64_t total_q = query.shape[0];
+  const int64_t hq = query.shape[1];
+  const int64_t d = query.shape[2];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t num_kv_heads = k_cache.shape[2];
+  VT_CHECK(d == k_cache.shape[3], "tenstorrent kPagedAttention: head_size mismatch");
+  VT_CHECK(hq % num_kv_heads == 0, "tenstorrent kPagedAttention: GQA ratio");
+  const int64_t qpk = hq / num_kv_heads;
+  const float scale = args.scale;
+  const float softcap = args.logits_soft_cap;
+  const int64_t window_left = args.window_size.has_value() ? args.window_size->left : -1;
+  const int64_t window_right = args.window_size.has_value() ? args.window_size->right : -1;
+
+  const int64_t num_reqs = seq_lens.shape[0];
+  const int32_t* qsl = query_start_loc.Ptr<int32_t>();
+  const int32_t* slens = seq_lens.Ptr<int32_t>();
+  const int32_t* btab = block_table.Ptr<int32_t>();
+  const int64_t bt_row = block_table.stride[0], bt_col = block_table.stride[1];
+  const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
+  const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];
+  const float* qptr = query.Ptr<float>();
+  const float* kptr = k_cache.Ptr<float>();
+  const float* vptr = v_cache.Ptr<float>();
+  float* optr = out.Ptr<float>();
+
+  std::vector<int32_t> tok_pos(static_cast<size_t>(total_q));
+  std::vector<int32_t> tok_slen(static_cast<size_t>(total_q));
+  std::vector<int32_t> tok_req(static_cast<size_t>(total_q));
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    const int64_t q0 = qsl[r], q1 = qsl[r + 1];
+    const int64_t query_len = q1 - q0;
+    if (query_len <= 0) continue;
+    const int64_t seqlen = slens[r];
+    const int64_t context = seqlen - query_len;
+    for (int64_t local = 0; local < query_len; ++local) {
+      tok_pos[static_cast<size_t>(q0 + local)] = static_cast<int32_t>(context + local);
+      tok_slen[static_cast<size_t>(q0 + local)] = static_cast<int32_t>(seqlen);
+      tok_req[static_cast<size_t>(q0 + local)] = static_cast<int32_t>(r);
+    }
+  }
+
+  std::vector<float> probs;
+  std::vector<float> acc(static_cast<size_t>(d));
+  for (int64_t t = 0; t < total_q; ++t) {
+    const int64_t r = tok_req[static_cast<size_t>(t)];
+    const int64_t p = tok_pos[static_cast<size_t>(t)];
+    const int64_t seqlen = tok_slen[static_cast<size_t>(t)];
+    const int64_t jmin = window_left >= 0 ? std::max<int64_t>(0, p - window_left) : 0;
+    int64_t jmax = args.causal ? p : seqlen - 1;
+    if (window_right >= 0) jmax = std::min(jmax, p + window_right);
+    jmax = std::min(jmax, seqlen - 1);
+    if (jmax < jmin) continue;
+    probs.assign(static_cast<size_t>(jmax - jmin + 1), 0.0f);
+    for (int64_t h = 0; h < hq; ++h) {
+      const int64_t g = h / qpk;
+      const int64_t qoff = (t * hq + h) * d;
+      float m = -std::numeric_limits<float>::infinity();
+      for (int64_t j = jmin; j <= jmax; ++j) {
+        const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
+        const int64_t off = j % block_size;
+        const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
+        float dot = 0.0f;
+        for (int64_t e = 0; e < d; ++e) dot += qptr[qoff + e] * kptr[kbase + e];
+        dot *= scale;
+        if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
+        probs[static_cast<size_t>(j - jmin)] = dot;
+        if (dot > m) m = dot;
+      }
+      float denom = 0.0f;
+      for (int64_t j = jmin; j <= jmax; ++j) {
+        const float e = std::exp(probs[static_cast<size_t>(j - jmin)] - m);
+        probs[static_cast<size_t>(j - jmin)] = e;
+        denom += e;
+      }
+      const float inv = 1.0f / denom;
+      for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+      for (int64_t j = jmin; j <= jmax; ++j) {
+        const float pw = probs[static_cast<size_t>(j - jmin)] * inv;
+        const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
+        const int64_t off = j % block_size;
+        const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
+        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += pw * vptr[vbase + e];
+      }
+      for (int64_t e = 0; e < d; ++e) optr[qoff + e] = acc[static_cast<size_t>(e)];
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -386,6 +499,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
+    RegisterOp(OpId::kPagedAttention, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
   }
 } registrar;
 

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -548,4 +549,124 @@ TEST_CASE("kTENSTORRENT kReshapeAndCache is BIT-EXACT incl. slot<0 skip") {
   }
   CHECK(host_kc == ref_kc);
   CHECK(host_vc == ref_vc);
+}
+
+TEST_CASE("kTENSTORRENT kPagedAttention matches a host causal GQA reference") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+
+  // Single-request prefill: T=4 tokens, Hq=4, Hkv=2 (GQA 2:1), D=8, block=4.
+  constexpr int64_t T = 4, Hq = 4, Hkv = 2, D = 8, Bsz = 4, NBlocks = 2;
+  constexpr int64_t Page = Hkv * D;
+  const size_t cache_elems = static_cast<size_t>(NBlocks * Bsz * Page);
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_q(static_cast<size_t>(T * Hq * D));
+  std::vector<float> host_k(static_cast<size_t>(T * Page)), host_v(static_cast<size_t>(T * Page));
+  for (size_t i = 0; i < host_q.size(); ++i) host_q[i] = static_cast<float>(i % 7) * 0.1f - 0.3f;
+  for (size_t i = 0; i < host_k.size(); ++i) {
+    host_k[i] = static_cast<float>(i % 5) * 0.15f;
+    host_v[i] = static_cast<float>(i % 9) * 0.05f - 0.1f;
+  }
+  // Write K/V into contiguous slots 0..T-1 of the cache first.
+  std::vector<float> host_kc(cache_elems, 0.0f), host_vc(cache_elems, 0.0f);
+  for (int64_t t = 0; t < T; ++t) {
+    std::memcpy(host_kc.data() + t * Page, host_k.data() + t * Page,
+                static_cast<size_t>(Page) * sizeof(float));
+    std::memcpy(host_vc.data() + t * Page, host_v.data() + t * Page,
+                static_cast<size_t>(Page) * sizeof(float));
+  }
+  std::vector<int32_t> block_table{0, 1};  // [num_reqs=1, max_blocks=2]
+  std::vector<int32_t> seq_lens{static_cast<int32_t>(T)};
+  std::vector<int32_t> qsl{0, static_cast<int32_t>(T)};
+  std::vector<float> host_out(static_cast<size_t>(T * Hq * D), 0.0f);
+
+  void* mem_q = backend.Alloc(host_q.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  void* mem_kc = backend.Alloc(host_kc.size() * sizeof(float));
+  void* mem_vc = backend.Alloc(host_vc.size() * sizeof(float));
+  void* mem_bt = backend.Alloc(block_table.size() * sizeof(int32_t));
+  void* mem_sl = backend.Alloc(seq_lens.size() * sizeof(int32_t));
+  void* mem_qsl = backend.Alloc(qsl.size() * sizeof(int32_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_q, host_q.data(), host_q.size() * sizeof(float));
+  backend.Copy(q, mem_kc, host_kc.data(), host_kc.size() * sizeof(float));
+  backend.Copy(q, mem_vc, host_vc.data(), host_vc.size() * sizeof(float));
+  backend.Copy(q, mem_bt, block_table.data(), block_table.size() * sizeof(int32_t));
+  backend.Copy(q, mem_sl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, mem_qsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  Tensor tq =
+      Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Hq, D});
+  Tensor tout = Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {T, Hq, D});
+  Tensor tkc = Tensor::Contiguous(mem_kc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tvc = Tensor::Contiguous(mem_vc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tbt = Tensor::Contiguous(mem_bt, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {1, 2});
+  Tensor tsl =
+      Tensor::Contiguous(mem_sl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {1});
+  Tensor tqsl =
+      Tensor::Contiguous(mem_qsl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {2});
+
+  vt::PagedAttentionArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(D));
+  args.causal = true;
+  auto pa = reinterpret_cast<vt::PagedAttentionFn>(
+      vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+  pa(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_q);
+  backend.Free(mem_out);
+  backend.Free(mem_kc);
+  backend.Free(mem_vc);
+  backend.Free(mem_bt);
+  backend.Free(mem_sl);
+  backend.Free(mem_qsl);
+
+  // Host oracle: same two-pass max-subtracted softmax as cpu_paged_attn.cpp.
+  std::vector<float> ref(static_cast<size_t>(T * Hq * D), 0.0f);
+  const int64_t qpk = Hq / Hkv;
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t p = t;  // prefill, context=0
+    for (int64_t h = 0; h < Hq; ++h) {
+      const int64_t g = h / qpk;
+      const int64_t qoff = (t * Hq + h) * D;
+      float m = -std::numeric_limits<float>::infinity();
+      std::vector<float> scores(static_cast<size_t>(p + 1));
+      for (int64_t j = 0; j <= p; ++j) {
+        float dot = 0.0f;
+        for (int64_t e = 0; e < D; ++e)
+          dot += host_q[static_cast<size_t>(qoff + e)] *
+                 host_kc[static_cast<size_t>(j * Page + g * D + e)];
+        scores[static_cast<size_t>(j)] = dot * args.scale;
+        m = std::max(m, scores[static_cast<size_t>(j)]);
+      }
+      float denom = 0.0f;
+      for (int64_t j = 0; j <= p; ++j) {
+        scores[static_cast<size_t>(j)] = std::exp(scores[static_cast<size_t>(j)] - m);
+        denom += scores[static_cast<size_t>(j)];
+      }
+      const float inv = 1.0f / denom;
+      for (int64_t e = 0; e < D; ++e) {
+        float acc = 0.0f;
+        for (int64_t j = 0; j <= p; ++j)
+          acc += scores[static_cast<size_t>(j)] * inv *
+                 host_vc[static_cast<size_t>(j * Page + g * D + e)];
+        ref[static_cast<size_t>(qoff + e)] = acc;
+      }
+    }
+  }
+
+  float max_abs_diff = 0.0f;
+  for (size_t i = 0; i < ref.size(); ++i)
+    max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[i] - ref[i]));
+  // Host f32 path — should be essentially bit-exact; allow tiny float noise.
+  CHECK(max_abs_diff < 1e-5f);
 }
