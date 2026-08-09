@@ -261,6 +261,15 @@ class ReleasePipelineContract(unittest.TestCase):
         errors = self.checker.validate(WORKFLOW.read_text(encoding="utf-8"))
         self.assertEqual(errors, [])
 
+    def test_hosted_packagers_resolve_their_runtime_dependencies(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "apk add --no-cache bash binutils build-base cmake file ninja python3 qemu-x86_64",
+            workflow,
+        )
+        self.assertNotIn("mlx.__file__", workflow)
+        self.assertIn('d.locate_file("mlx")', workflow)
+
     def test_security_critical_workflow_mutations_fail(self) -> None:
         original = WORKFLOW.read_text(encoding="utf-8")
         mutations = {
