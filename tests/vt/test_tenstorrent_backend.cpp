@@ -64,7 +64,9 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   // FLASH_ATTN is registered against the NHD layout our kPagedAttention uses.
   CHECK(p.get_attn_backend_priority({}) == std::vector<std::string>{"FLASH_ATTN"});
   CHECK(p.supports_model_architecture("OPTForCausalLM"));
-  CHECK_FALSE(p.supports_model_architecture("Qwen3ForCausalLM"));
+  // Qwen3-dense after RmsNorm / SiluAndMul / Cast / RoPE landed (Metal M3b twin).
+  CHECK(p.supports_model_architecture("Qwen3ForCausalLM"));
+  CHECK_FALSE(p.supports_model_architecture("LlamaForCausalLM"));
 }
 
 TEST_CASE("kTENSTORRENT kMatmul matches a host F32 reference") {
