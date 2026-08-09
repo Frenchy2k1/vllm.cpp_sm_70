@@ -424,6 +424,182 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   }
 }
 
+// kCastBf16 / kCastF32: elementwise dtype convert via Load/Store (cpu_ops
+// CastBf16Kernel / CastF32Kernel). Qwen3 uses these for K/V cache dtype and
+// the logits / rope-cache paths. Host-staged; bit-exact for supported pairs.
+void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
+  VT_CHECK(out.dtype == DType::kBF16, "tenstorrent kCastBf16: out must be bf16");
+  VT_CHECK(IsFloatDType(in.dtype), "tenstorrent kCastBf16: in must be float");
+  VT_CHECK(out.Numel() == in.Numel(), "tenstorrent kCastBf16: numel mismatch");
+  VT_CHECK(out.IsContiguous() && in.IsContiguous(),
+           "tenstorrent kCastBf16: contiguous required");
+  const int64_t n = out.Numel();
+  for (int64_t i = 0; i < n; ++i) StoreElemF32(out, i, LoadElemF32(in, i));
+}
+
+void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
+  VT_CHECK(out.dtype == DType::kF32, "tenstorrent kCastF32: out must be f32");
+  VT_CHECK(IsFloatDType(in.dtype), "tenstorrent kCastF32: in must be float");
+  VT_CHECK(out.Numel() == in.Numel(), "tenstorrent kCastF32: numel mismatch");
+  VT_CHECK(out.IsContiguous() && in.IsContiguous(),
+           "tenstorrent kCastF32: contiguous required");
+  const int64_t n = out.Numel();
+  for (int64_t i = 0; i < n; ++i) StoreElemF32(out, i, LoadElemF32(in, i));
+}
+
+// Llama-3 frequency rescale (cpu_ops Llama3ScaleFreq); no-op when scaling_factor
+// is unset. Kept so Qwen3 / Llama rope paths share one host implementation.
+inline double Llama3ScaleFreq(double freq, const RopeArgs& a) {
+  const double sf = static_cast<double>(a.llama3_scaling_factor);
+  if (!(sf > 0.0)) return freq;
+  constexpr double kTwoPi = 6.283185307179586476925286766559;
+  const double lo = static_cast<double>(a.llama3_low_freq_factor);
+  const double hi = static_cast<double>(a.llama3_high_freq_factor);
+  const double omax = static_cast<double>(a.llama3_orig_max_position);
+  const double low_freq_wavelen = omax / lo;
+  const double high_freq_wavelen = omax / hi;
+  const double wave_len = kTwoPi / freq;
+  double smooth = 0.0;
+  if (lo != hi) smooth = (omax / wave_len - lo) / (hi - lo);
+  if (wave_len < high_freq_wavelen) return freq;
+  if (wave_len > low_freq_wavelen) return freq / sf;
+  return (1.0 - smooth) * freq / sf + smooth * freq;
+}
+
+// In-place NeoX rotation of one head (cpu_ops RopeRotateHead).
+void RopeRotateHead(Tensor& t, int64_t head_off, int rot, double base, int64_t pos,
+                    const RopeArgs& args) {
+  const int half = rot / 2;
+  for (int i = 0; i < half; ++i) {
+    double freq = std::pow(base, -2.0 * static_cast<double>(i) / static_cast<double>(rot));
+    freq = Llama3ScaleFreq(freq, args);
+    const double angle = static_cast<double>(pos) * freq;
+    const float c = static_cast<float>(std::cos(angle));
+    const float s = static_cast<float>(std::sin(angle));
+    const float x = LoadElemF32(t, head_off + i);
+    const float y = LoadElemF32(t, head_off + i + half);
+    StoreElemF32(t, head_off + i, x * c - y * s);
+    StoreElemF32(t, head_off + i + half, x * s + y * c);
+  }
+}
+
+// kRopeNeox: default Qwen3-dense RoPE (cpu_ops RopeNeoxKernel). Host-staged
+// f32 math with dtype storeback — same contract as Metal M3b / CPU.
+void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const RopeArgs& args) {
+  VT_CHECK(qs.rank == 3 && ks.rank == 3, "tenstorrent kRopeNeox: qs/ks rank-3");
+  VT_CHECK(IsFloatDType(qs.dtype) && qs.dtype == ks.dtype,
+           "tenstorrent kRopeNeox: qs/ks float same dtype");
+  VT_CHECK(pos.rank == 1 && (pos.dtype == DType::kI32 || pos.dtype == DType::kI64),
+           "tenstorrent kRopeNeox: positions rank-1 i32/i64");
+  VT_CHECK(qs.IsContiguous() && ks.IsContiguous() && pos.IsContiguous(),
+           "tenstorrent kRopeNeox: contiguous required");
+  VT_CHECK(args.rotary_dim > 0 && (args.rotary_dim % 2) == 0 &&
+               args.rotary_dim <= qs.shape[2],
+           "tenstorrent kRopeNeox: rotary_dim must be even and <= head_dim");
+  const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
+  VT_CHECK(ks.shape[0] == t && ks.shape[2] == d, "tenstorrent kRopeNeox: ks shape");
+  VT_CHECK(pos.shape[0] == t, "tenstorrent kRopeNeox: positions length");
+  const int rot = args.rotary_dim;
+  const double base = static_cast<double>(args.base);
+  for (int64_t i = 0; i < t; ++i) {
+    const int64_t p =
+        pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[i] : pos.Ptr<int64_t>()[i];
+    for (int64_t hh = 0; hh < hq; ++hh)
+      RopeRotateHead(qs, (i * hq + hh) * d, rot, base, p, args);
+    for (int64_t hh = 0; hh < hk; ++hh)
+      RopeRotateHead(ks, (i * hk + hh) * d, rot, base, p, args);
+  }
+}
+
+// kRopeCosSinCache: per-step cos|sin table [T, rot] (cpu_ops RopeCosSinCacheKernel).
+void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
+                           const RopeArgs& args) {
+  VT_CHECK(cos_sin.rank == 2 && cos_sin.dtype == DType::kF32 && cos_sin.IsContiguous(),
+           "tenstorrent kRopeCosSinCache: cos_sin contiguous f32 [T,rot]");
+  VT_CHECK(positions.rank == 1 &&
+               (positions.dtype == DType::kI32 || positions.dtype == DType::kI64) &&
+               positions.IsContiguous(),
+           "tenstorrent kRopeCosSinCache: positions rank-1 i32/i64");
+  VT_CHECK(args.rotary_dim > 0 && (args.rotary_dim % 2) == 0,
+           "tenstorrent kRopeCosSinCache: rotary_dim even > 0");
+  const int64_t t = cos_sin.shape[0];
+  const int rot = args.rotary_dim;
+  VT_CHECK(cos_sin.shape[1] == rot && positions.shape[0] == t,
+           "tenstorrent kRopeCosSinCache: shape mismatch");
+  const int64_t half = rot / 2;
+  const double base = static_cast<double>(args.base);
+  for (int64_t i = 0; i < t; ++i) {
+    const int64_t p = positions.dtype == DType::kI32 ? positions.Ptr<int32_t>()[i]
+                                                     : positions.Ptr<int64_t>()[i];
+    for (int64_t pair = 0; pair < half; ++pair) {
+      double freq =
+          std::pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+      freq = Llama3ScaleFreq(freq, args);
+      const double angle = static_cast<double>(p) * freq;
+      StoreElemF32(cos_sin, i * rot + pair, static_cast<float>(std::cos(angle)));
+      StoreElemF32(cos_sin, i * rot + half + pair, static_cast<float>(std::sin(angle)));
+    }
+  }
+}
+
+// kRopeFromCache: apply precomputed cos|sin (cpu_ops RopeFromCacheKernel).
+// Rank-1 positions only (Qwen3-dense); mrope deferred.
+void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions,
+                         const Tensor& cache, const RopeArgs& args) {
+  VT_CHECK(qs.rank == 3 && IsFloatDType(qs.dtype) && qs.IsContiguous(),
+           "tenstorrent kRopeFromCache: qs rank-3 contiguous float");
+  VT_CHECK(positions.rank == 1 &&
+               (positions.dtype == DType::kI32 || positions.dtype == DType::kI64) &&
+               positions.IsContiguous(),
+           "tenstorrent kRopeFromCache: rank-1 positions only (no mrope yet)");
+  VT_CHECK(cache.rank == 2 && IsFloatDType(cache.dtype) && cache.IsContiguous(),
+           "tenstorrent kRopeFromCache: cache rank-2 contiguous float");
+  VT_CHECK(args.rotary_dim > 0 && (args.rotary_dim % 2) == 0 &&
+               args.rotary_dim <= qs.shape[2],
+           "tenstorrent kRopeFromCache: rotary_dim");
+  const int64_t tokens = qs.shape[0];
+  const int64_t hq = qs.shape[1];
+  const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
+  if (ks != nullptr) {
+    VT_CHECK(ks->rank == 3 && ks->dtype == qs.dtype && ks->IsContiguous(),
+             "tenstorrent kRopeFromCache: ks must match qs");
+    VT_CHECK(ks->shape[0] == tokens && ks->shape[2] == qs.shape[2],
+             "tenstorrent kRopeFromCache: ks shape");
+  }
+  VT_CHECK(positions.shape[0] == tokens, "tenstorrent kRopeFromCache: positions length");
+  const int64_t half = args.rotary_dim / 2;
+  for (int64_t token = 0; token < tokens; ++token) {
+    for (int64_t pair = 0; pair < half; ++pair) {
+      const int64_t position = positions.dtype == DType::kI32
+                                   ? static_cast<int64_t>(positions.Ptr<int32_t>()[token])
+                                   : positions.Ptr<int64_t>()[token];
+      VT_CHECK(position >= 0 && position < cache.shape[0],
+               "tenstorrent kRopeFromCache: position outside cache");
+      const int64_t cache_off = position * args.rotary_dim;
+      const float c = LoadElemF32(cache, cache_off + pair);
+      const float s = LoadElemF32(cache, cache_off + half + pair);
+      const int64_t first = args.is_neox_style ? pair : pair * 2;
+      const int64_t second = args.is_neox_style ? pair + half : pair * 2 + 1;
+      for (int64_t head = 0; head < hq; ++head) {
+        const int64_t off = token * qs.stride[0] + head * qs.stride[1];
+        const float x = LoadElemF32(qs, off + first);
+        const float y = LoadElemF32(qs, off + second);
+        StoreElemF32(qs, off + first, x * c - y * s);
+        StoreElemF32(qs, off + second, x * s + y * c);
+      }
+      if (ks != nullptr) {
+        for (int64_t head = 0; head < hk; ++head) {
+          const int64_t off = token * ks->stride[0] + head * ks->stride[1];
+          const float x = LoadElemF32(*ks, off + first);
+          const float y = LoadElemF32(*ks, off + second);
+          StoreElemF32(*ks, off + first, x * c - y * s);
+          StoreElemF32(*ks, off + second, x * s + y * c);
+        }
+      }
+    }
+  }
+}
+
 // kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
 // (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy when dtypes match.
 void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
@@ -669,6 +845,16 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
+    RegisterOp(OpId::kCastBf16, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
+    RegisterOp(OpId::kCastF32, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32Kernel)));
+    RegisterOp(OpId::kRopeNeox, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
+    RegisterOp(OpId::kRopeCosSinCache, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
+    RegisterOp(OpId::kRopeFromCache, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kTENSTORRENT,

@@ -523,6 +523,199 @@ TEST_CASE("kTENSTORRENT kSiluAndMul is BIT-EXACT vs a host F32 reference") {
   }
 }
 
+// Cast pair used by Qwen3 K/V cache dtype and logits paths.
+TEST_CASE("kTENSTORRENT kCastBf16 / kCastF32 round-trip F32 values") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kCastBf16, DeviceType::kTENSTORRENT));
+  REQUIRE(vt::OpRegistered(vt::OpId::kCastF32, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t N = 64;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto cast_bf16 = reinterpret_cast<vt::CastBf16Fn>(
+      vt::GetOp(vt::OpId::kCastBf16, DeviceType::kTENSTORRENT));
+  auto cast_f32 = reinterpret_cast<vt::CastF32Fn>(
+      vt::GetOp(vt::OpId::kCastF32, DeviceType::kTENSTORRENT));
+
+  std::vector<float> host_f(N), host_back(N, 0.0f);
+  for (int64_t i = 0; i < N; ++i) host_f[static_cast<size_t>(i)] = static_cast<float>(i) * 0.125f;
+
+  void* mem_f = backend.Alloc(N * sizeof(float));
+  void* mem_bf = backend.Alloc(N * sizeof(uint16_t));
+  void* mem_back = backend.Alloc(N * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_f, host_f.data(), N * sizeof(float));
+
+  Tensor tf =
+      Tensor::Contiguous(mem_f, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {N});
+  Tensor tbf =
+      Tensor::Contiguous(mem_bf, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N});
+  Tensor tback =
+      Tensor::Contiguous(mem_back, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {N});
+  cast_bf16(q, tbf, tf);
+  cast_f32(q, tback, tbf);
+  backend.Copy(q, host_back.data(), mem_back, N * sizeof(float));
+  backend.Free(mem_f);
+  backend.Free(mem_bf);
+  backend.Free(mem_back);
+
+  for (int64_t i = 0; i < N; ++i) {
+    // Exact for values representable in bf16 (i * 0.125).
+    REQUIRE(host_back[static_cast<size_t>(i)] == host_f[static_cast<size_t>(i)]);
+  }
+}
+
+// Default Qwen3-dense RoPE (Metal M3b). Host-staged bit-exact vs CPU formula.
+TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kRopeNeox, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 4, Hq = 2, Hk = 1, Dh = 8, Rot = 8;
+  constexpr float Base = 10000.0f;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto rope = reinterpret_cast<vt::RopeFn>(
+      vt::GetOp(vt::OpId::kRopeNeox, DeviceType::kTENSTORRENT));
+
+  std::vector<float> hq(T * Hq * Dh), hk(T * Hk * Dh), hq_ref, hk_ref;
+  std::vector<int32_t> pos(T);
+  for (int64_t i = 0; i < T * Hq * Dh; ++i)
+    hq[static_cast<size_t>(i)] = (static_cast<float>(i % 11) - 5.0f) * 0.1f;
+  for (int64_t i = 0; i < T * Hk * Dh; ++i)
+    hk[static_cast<size_t>(i)] = (static_cast<float>(i % 7) - 3.0f) * 0.1f;
+  for (int64_t i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(i + 1);
+  hq_ref = hq;
+  hk_ref = hk;
+
+  auto rotate_head = [&](std::vector<float>& t, int64_t head_off, int64_t p) {
+    const int half = Rot / 2;
+    for (int i = 0; i < half; ++i) {
+      const double freq =
+          std::pow(static_cast<double>(Base), -2.0 * i / static_cast<double>(Rot));
+      const double angle = static_cast<double>(p) * freq;
+      const float c = static_cast<float>(std::cos(angle));
+      const float s = static_cast<float>(std::sin(angle));
+      const float x = t[static_cast<size_t>(head_off + i)];
+      const float y = t[static_cast<size_t>(head_off + i + half)];
+      t[static_cast<size_t>(head_off + i)] = x * c - y * s;
+      t[static_cast<size_t>(head_off + i + half)] = x * s + y * c;
+    }
+  };
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t h = 0; h < Hq; ++h) rotate_head(hq_ref, (i * Hq + h) * Dh, pos[static_cast<size_t>(i)]);
+    for (int64_t h = 0; h < Hk; ++h) rotate_head(hk_ref, (i * Hk + h) * Dh, pos[static_cast<size_t>(i)]);
+  }
+
+  void* mem_q = backend.Alloc(hq.size() * sizeof(float));
+  void* mem_k = backend.Alloc(hk.size() * sizeof(float));
+  void* mem_p = backend.Alloc(pos.size() * sizeof(int32_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_q, hq.data(), hq.size() * sizeof(float));
+  backend.Copy(q, mem_k, hk.data(), hk.size() * sizeof(float));
+  backend.Copy(q, mem_p, pos.data(), pos.size() * sizeof(int32_t));
+
+  Tensor tq = Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hq, Dh});
+  Tensor tk = Tensor::Contiguous(mem_k, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hk, Dh});
+  Tensor tp = Tensor::Contiguous(mem_p, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {T});
+  vt::RopeArgs args;
+  args.base = Base;
+  args.rotary_dim = Rot;
+  rope(q, tq, tk, tp, args);
+
+  backend.Copy(q, hq.data(), mem_q, hq.size() * sizeof(float));
+  backend.Copy(q, hk.data(), mem_k, hk.size() * sizeof(float));
+  backend.Free(mem_q);
+  backend.Free(mem_k);
+  backend.Free(mem_p);
+
+  for (size_t i = 0; i < hq.size(); ++i) REQUIRE(hq[i] == hq_ref[i]);
+  for (size_t i = 0; i < hk.size(); ++i) REQUIRE(hk[i] == hk_ref[i]);
+}
+
+TEST_CASE("kTENSTORRENT kRopeCosSinCache + kRopeFromCache match kRopeNeox") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kRopeCosSinCache, DeviceType::kTENSTORRENT));
+  REQUIRE(vt::OpRegistered(vt::OpId::kRopeFromCache, DeviceType::kTENSTORRENT));
+  REQUIRE(vt::OpRegistered(vt::OpId::kRopeNeox, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 3, Hq = 2, Hk = 1, Dh = 8, Rot = 8;
+  constexpr float Base = 10000.0f;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto rope_neox = reinterpret_cast<vt::RopeFn>(
+      vt::GetOp(vt::OpId::kRopeNeox, DeviceType::kTENSTORRENT));
+  auto rope_cache = reinterpret_cast<vt::RopeCosSinCacheFn>(
+      vt::GetOp(vt::OpId::kRopeCosSinCache, DeviceType::kTENSTORRENT));
+  auto rope_from = reinterpret_cast<vt::RopeFromCacheFn>(
+      vt::GetOp(vt::OpId::kRopeFromCache, DeviceType::kTENSTORRENT));
+
+  std::vector<float> q0(T * Hq * Dh), k0(T * Hk * Dh);
+  std::vector<int32_t> pos(T);
+  for (size_t i = 0; i < q0.size(); ++i) q0[i] = (static_cast<float>(i % 9) - 4.0f) * 0.05f;
+  for (size_t i = 0; i < k0.size(); ++i) k0[i] = (static_cast<float>(i % 5) - 2.0f) * 0.05f;
+  for (int64_t i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+
+  auto alloc_copy = [&](const void* src, size_t bytes) {
+    void* p = backend.Alloc(bytes);
+    Queue q = backend.CreateQueue();
+    backend.Copy(q, p, src, bytes);
+    return p;
+  };
+
+  void* mq1 = alloc_copy(q0.data(), q0.size() * sizeof(float));
+  void* mk1 = alloc_copy(k0.data(), k0.size() * sizeof(float));
+  void* mq2 = alloc_copy(q0.data(), q0.size() * sizeof(float));
+  void* mk2 = alloc_copy(k0.data(), k0.size() * sizeof(float));
+  void* mp = alloc_copy(pos.data(), pos.size() * sizeof(int32_t));
+  void* mcs = backend.Alloc(static_cast<size_t>(T * Rot) * sizeof(float));
+  // Identity row index into a T-row cache built from positions 0..T-1.
+  std::vector<int32_t> rows(T);
+  for (int64_t i = 0; i < T; ++i) rows[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  void* mrow = alloc_copy(rows.data(), rows.size() * sizeof(int32_t));
+
+  Queue q = backend.CreateQueue();
+  Tensor tq1 = Tensor::Contiguous(mq1, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T, Hq, Dh});
+  Tensor tk1 = Tensor::Contiguous(mk1, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T, Hk, Dh});
+  Tensor tq2 = Tensor::Contiguous(mq2, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T, Hq, Dh});
+  Tensor tk2 = Tensor::Contiguous(mk2, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T, Hk, Dh});
+  Tensor tp = Tensor::Contiguous(mp, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {T});
+  Tensor tcs =
+      Tensor::Contiguous(mcs, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Rot});
+  Tensor trow =
+      Tensor::Contiguous(mrow, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {T});
+
+  vt::RopeArgs args;
+  args.base = Base;
+  args.rotary_dim = Rot;
+  args.is_neox_style = true;
+
+  rope_neox(q, tq1, tk1, tp, args);
+  rope_cache(q, tcs, tp, args);
+  rope_from(q, tq2, &tk2, trow, tcs, args);
+
+  std::vector<float> qn(q0.size()), kn(k0.size()), qc(q0.size()), kc(k0.size());
+  backend.Copy(q, qn.data(), mq1, qn.size() * sizeof(float));
+  backend.Copy(q, kn.data(), mk1, kn.size() * sizeof(float));
+  backend.Copy(q, qc.data(), mq2, qc.size() * sizeof(float));
+  backend.Copy(q, kc.data(), mk2, kc.size() * sizeof(float));
+  for (void* p : {mq1, mk1, mq2, mk2, mp, mcs, mrow}) backend.Free(p);
+
+  for (size_t i = 0; i < qn.size(); ++i) REQUIRE(qn[i] == qc[i]);
+  for (size_t i = 0; i < kn.size(); ++i) REQUIRE(kn[i] == kc[i]);
+}
+
 TEST_CASE("kTENSTORRENT kQkvSplit is BIT-EXACT vs a host reference (unequal widths)") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
