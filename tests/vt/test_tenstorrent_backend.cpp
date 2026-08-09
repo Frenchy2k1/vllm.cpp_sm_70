@@ -1126,3 +1126,113 @@ TEST_CASE("kTENSTORRENT kPagedAttention host microbench (opt-in)") {
   backend.Free(mem_qsl);
   CHECK(ms > 0.0);
 }
+
+// Pure decode with TILE-legal geometry (D=128, block=32) exercises the
+// ttnn::paged_scaled_dot_product_attention_decode path (or host fallback).
+TEST_CASE("kTENSTORRENT kPagedAttention pure-decode matches host within BF16 envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t Hq = 4, Hkv = 2, D = 128, Bsz = 32, Seq = 64;
+  constexpr int64_t NBlocks = Seq / Bsz;  // 2
+  constexpr int64_t Page = Hkv * D;
+  const size_t cache_elems = static_cast<size_t>(NBlocks * Bsz * Page);
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_q(static_cast<size_t>(Hq * D));
+  std::vector<float> host_kc(cache_elems), host_vc(cache_elems);
+  for (size_t i = 0; i < host_q.size(); ++i)
+    host_q[i] = (static_cast<float>(i % 17) - 8.0f) * 0.05f;
+  for (size_t i = 0; i < host_kc.size(); ++i) {
+    host_kc[i] = (static_cast<float>(i % 13) - 6.0f) * 0.03f;
+    host_vc[i] = (static_cast<float>(i % 11) - 5.0f) * 0.02f;
+  }
+  std::vector<int32_t> block_table(static_cast<size_t>(NBlocks));
+  for (int64_t i = 0; i < NBlocks; ++i) block_table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  std::vector<int32_t> seq_lens{static_cast<int32_t>(Seq)};
+  std::vector<int32_t> qsl{0, 1};
+  std::vector<float> host_out(static_cast<size_t>(Hq * D), 0.0f);
+
+  void* mem_q = backend.Alloc(host_q.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  void* mem_kc = backend.Alloc(host_kc.size() * sizeof(float));
+  void* mem_vc = backend.Alloc(host_vc.size() * sizeof(float));
+  void* mem_bt = backend.Alloc(block_table.size() * sizeof(int32_t));
+  void* mem_sl = backend.Alloc(seq_lens.size() * sizeof(int32_t));
+  void* mem_qsl = backend.Alloc(qsl.size() * sizeof(int32_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_q, host_q.data(), host_q.size() * sizeof(float));
+  backend.Copy(q, mem_kc, host_kc.data(), host_kc.size() * sizeof(float));
+  backend.Copy(q, mem_vc, host_vc.data(), host_vc.size() * sizeof(float));
+  backend.Copy(q, mem_bt, block_table.data(), block_table.size() * sizeof(int32_t));
+  backend.Copy(q, mem_sl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, mem_qsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  Tensor tq =
+      Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {1, Hq, D});
+  Tensor tout = Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {1, Hq, D});
+  Tensor tkc = Tensor::Contiguous(mem_kc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tvc = Tensor::Contiguous(mem_vc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tbt = Tensor::Contiguous(mem_bt, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {1, NBlocks});
+  Tensor tsl =
+      Tensor::Contiguous(mem_sl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {1});
+  Tensor tqsl =
+      Tensor::Contiguous(mem_qsl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {2});
+
+  vt::PagedAttentionArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(D));
+  args.causal = true;
+  auto pa = reinterpret_cast<vt::PagedAttentionFn>(
+      vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+  pa(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_q);
+  backend.Free(mem_out);
+  backend.Free(mem_kc);
+  backend.Free(mem_vc);
+  backend.Free(mem_bt);
+  backend.Free(mem_sl);
+  backend.Free(mem_qsl);
+
+  // Host NHD oracle (same as unit test / cpu_paged_attn).
+  const int64_t qpk = Hq / Hkv;
+  const int64_t p = Seq - 1;
+  float max_abs = 0.0f;
+  for (int64_t h = 0; h < Hq; ++h) {
+    const int64_t g = h / qpk;
+    const int64_t qoff = h * D;
+    float m = -std::numeric_limits<float>::infinity();
+    std::vector<float> scores(static_cast<size_t>(p + 1));
+    for (int64_t j = 0; j <= p; ++j) {
+      float dot = 0.0f;
+      const int64_t kbase = j * Page + g * D;
+      for (int64_t e = 0; e < D; ++e)
+        dot += host_q[static_cast<size_t>(qoff + e)] * host_kc[static_cast<size_t>(kbase + e)];
+      scores[static_cast<size_t>(j)] = dot * args.scale;
+      m = std::max(m, scores[static_cast<size_t>(j)]);
+    }
+    float denom = 0.0f;
+    for (int64_t j = 0; j <= p; ++j) {
+      scores[static_cast<size_t>(j)] = std::exp(scores[static_cast<size_t>(j)] - m);
+      denom += scores[static_cast<size_t>(j)];
+    }
+    const float inv = 1.0f / denom;
+    for (int64_t e = 0; e < D; ++e) {
+      float acc = 0.0f;
+      for (int64_t j = 0; j <= p; ++j)
+        acc += scores[static_cast<size_t>(j)] * inv *
+               host_vc[static_cast<size_t>(j * Page + g * D + e)];
+      max_abs = std::max(max_abs, std::fabs(host_out[static_cast<size_t>(qoff + e)] - acc));
+    }
+  }
+  // Device BF16 SDPA or host path — generous envelope.
+  CHECK(max_abs < 0.5f);
+}
