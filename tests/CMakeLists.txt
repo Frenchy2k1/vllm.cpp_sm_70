@@ -739,6 +739,10 @@ vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+vllm_cpp_add_test(test_triton_aot_arch_dispatch
+  vt/test_triton_aot_arch_dispatch.cpp)
+target_include_directories(test_triton_aot_arch_dispatch PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
   # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
   # case no-ops when the build has HIP but the box has no AMD GPU.

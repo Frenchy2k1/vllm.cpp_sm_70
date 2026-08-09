@@ -60,6 +60,8 @@ option(VLLM_CPP_TRITON
 option(VLLM_CPP_TRITON_REGEN
   "MAINTAINER: regenerate target-pinned vendored Triton AOT artifacts with Python+Triton+ptxas; see scripts/regen-triton-aot.sh" OFF)
 
+include("${CMAKE_CURRENT_LIST_DIR}/TritonAOTMultiArch.cmake")
+
 # Where the vendored artifacts live, one subdir per arch (sm_121a today;
 # sm_90/sm_80/gfx* slots in later). Each arch dir holds the generated .c/.h for
 # every kernel base plus a MANIFEST (generator versions + source hashes +
@@ -90,6 +92,7 @@ set(VLLM_CPP_TRITON_TARGET "" CACHE STRING
 # add_triton_kernel call appends its exact manifest line in both builder and
 # regen modes; finalize compares it with the canonical contract and MANIFEST.
 set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES "")
+set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_DISPATCH_DECLS "")
 
 # _triton_aot_arch_name(OUTVAR) -> active vendored arch directory name.
 #
@@ -134,10 +137,31 @@ function(_triton_aot_arch_dir OUTVAR)
   set(${OUTVAR} "${VLLM_CPP_TRITON_VENDORED_DIR}/${_a}" PARENT_SCOPE)
 endfunction()
 
+# _triton_aot_arch_names(OUTVAR) -> artifact trees embedded by a normal build.
+# W2 deliberately embeds every complete vendored tree. Runtime selection is
+# exact-SM, so sm_87/sm_103/sm_110/sm_120 use the portable CUDA fallback and
+# can never attempt a neighboring cubin. Maintainer regeneration remains a
+# one-tree operation selected by VLLM_CPP_TRITON_VENDORED_ARCH.
+function(_triton_aot_arch_names OUTVAR)
+  if(VLLM_CPP_TRITON_REGEN)
+    _triton_aot_arch_name(_single)
+    set(_arches "${_single}")
+  else()
+    vt_triton_aot_available_arches(_arches)
+  endif()
+  foreach(_arch IN LISTS _arches)
+    if(NOT EXISTS "${VLLM_CPP_TRITON_VENDORED_DIR}/${_arch}/MANIFEST")
+      message(FATAL_ERROR
+        "Triton AOT W2 matrix names missing tree ${_arch}; regenerate or repair "
+        "${VLLM_CPP_TRITON_VENDORED_DIR}")
+    endif()
+  endforeach()
+  set(${OUTVAR} "${_arches}" PARENT_SCOPE)
+endfunction()
+
 # Resolve and validate the code-generation target from the vendored destination.
 # The current AOT toolchain is CUDA-only and accepts one target per artifact tree.
-function(_triton_aot_resolved_target OUTVAR)
-  _triton_aot_arch_name(_arch)
+function(_triton_aot_resolved_target_for_arch OUTVAR _arch)
   if(NOT _arch MATCHES "^sm_([0-9]+)a?$")
     message(FATAL_ERROR
       "Cannot derive a single CUDA Triton target from vendored arch '${_arch}'. "
@@ -151,6 +175,11 @@ function(_triton_aot_resolved_target OUTVAR)
       "cubinary into the wrong architecture directory.")
   endif()
   set(${OUTVAR} "${_derived}" PARENT_SCOPE)
+endfunction()
+
+function(_triton_aot_resolved_target OUTVAR)
+  _triton_aot_arch_name(_arch)
+  _triton_aot_resolved_target_for_arch(${OUTVAR} "${_arch}")
 endfunction()
 
 # add_triton_kernel(RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE GRID
@@ -185,7 +214,6 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
     message(FATAL_ERROR "add_triton_kernel: kernel file not found: ${KERNEL_PY}")
   endif()
   get_filename_component(_py_name "${KERNEL_PY}" NAME)
-  _triton_aot_arch_dir(_adir)
 
   # The MANIFEST line that describes THIS generation request. Written on regen;
   # compared against the vendored MANIFEST when consuming (a mismatch means the
@@ -196,54 +224,75 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
     "${_manifest_line}")
 
   if(NOT VLLM_CPP_TRITON_REGEN)
-    # ── BUILDER path: consume the vendored artifacts. No Python. ─────────────
-    if(NOT EXISTS "${_adir}/MANIFEST")
-      message(FATAL_ERROR
-        "VLLM_CPP_TRITON=ON but there are no vendored Triton AOT artifacts for "
-        "this arch:\n  ${_adir}\n"
-        "Options:\n"
-        "  * build without -DVLLM_CPP_TRITON=ON (the portable C++ CUDA kernels are\n"
-        "    the always-available fallback), or\n"
-        "  * set -DVLLM_CPP_TRITON_VENDORED_ARCH=<dir> if the artifacts exist under\n"
-        "    another name, or\n"
-        "  * regenerate for this arch (MAINTAINER task; needs Python+Triton+ptxas):\n"
-        "    scripts/regen-triton-aot.sh  (configure with -DVLLM_CPP_TRITON_REGEN=ON)")
-    endif()
-    if(NOT EXISTS "${_adir}/${OUT_BASE}.c" OR NOT EXISTS "${_adir}/${OUT_BASE}.h")
-      message(FATAL_ERROR
-        "Vendored Triton AOT tree ${_adir} is missing the '${OUT_BASE}' kernel "
-        "(expected ${OUT_BASE}.c/.h). The vendored tree predates this kernel — "
-        "regenerate it: scripts/regen-triton-aot.sh")
-    endif()
-    file(GLOB _spec_sources "${_adir}/${OUT_BASE}.*.c")
-    if(NOT _spec_sources)
-      message(FATAL_ERROR
-        "Vendored Triton AOT tree ${_adir} has ${OUT_BASE}.c but no per-spec "
-        "${OUT_BASE}.<hash>.c launchers — the tree is corrupt; regenerate it: "
-        "scripts/regen-triton-aot.sh")
-    endif()
-    set(_all_sources ${_spec_sources} "${_adir}/${OUT_BASE}.c")
-
-    # Parameter staleness: find this base's line in the MANIFEST and compare.
-    set(_found_line "")
-    file(STRINGS "${_adir}/MANIFEST" _mlines)
-    foreach(_line IN LISTS _mlines)
-      string(FIND "${_line}" "base ${OUT_BASE} " _pos)
-      if(_pos EQUAL 0)
-        set(_found_line "${_line}")
+    # ── BUILDER path: consume and namespace all six vendored trees. ──────────
+    _triton_aot_arch_names(_arch_names)
+    set(_all_sources)
+    set(_dispatch_dir "${CMAKE_BINARY_DIR}/triton_aot_multiarch")
+    foreach(_arch IN LISTS _arch_names)
+      set(_adir "${VLLM_CPP_TRITON_VENDORED_DIR}/${_arch}")
+      if(NOT EXISTS "${_adir}/${OUT_BASE}.c" OR
+         NOT EXISTS "${_adir}/${OUT_BASE}.h")
+        message(FATAL_ERROR
+          "Vendored Triton AOT tree ${_adir} is missing '${OUT_BASE}'. "
+          "Regenerate: scripts/regen-triton-aot.sh")
       endif()
+      file(GLOB _spec_sources "${_adir}/${OUT_BASE}.*.c")
+      if(NOT _spec_sources)
+        message(FATAL_ERROR
+          "Vendored Triton AOT tree ${_adir} has no ${OUT_BASE}.<hash>.c")
+      endif()
+      set(_tree_sources ${_spec_sources} "${_adir}/${OUT_BASE}.c")
+
+      set(_found_line "")
+      file(STRINGS "${_adir}/MANIFEST" _mlines)
+      foreach(_line IN LISTS _mlines)
+        string(FIND "${_line}" "base ${OUT_BASE} " _pos)
+        if(_pos EQUAL 0)
+          set(_found_line "${_line}")
+        endif()
+      endforeach()
+      if(NOT _found_line STREQUAL _manifest_line)
+        message(FATAL_ERROR
+          "STALE VENDORED TRITON AOT ARTIFACTS: '${OUT_BASE}' differs in "
+          "${_adir}/MANIFEST.\n  expected: ${_manifest_line}\n"
+          "  vendored: ${_found_line}")
+      endif()
+
+      vt_triton_aot_namespace_sources(
+        "${_arch}" "${OUT_BASE}" "${_dispatch_dir}/namespaces"
+        _tree_sources_namespaced ${_tree_sources})
+      list(APPEND _all_sources ${_tree_sources_namespaced})
+
+      file(STRINGS "${_adir}/${OUT_BASE}.h" _default_decl
+        REGEX "^CUresult ${OUT_BASE}_default\\(")
+      list(LENGTH _default_decl _decl_count)
+      if(NOT _decl_count EQUAL 1)
+        message(FATAL_ERROR
+          "${_adir}/${OUT_BASE}.h must declare one ${OUT_BASE}_default")
+      endif()
+      vt_triton_aot_namespace_token(
+        _namespaced_default "${_arch}" "${OUT_BASE}_default")
+      string(REPLACE "${OUT_BASE}_default" "${_namespaced_default}"
+        _default_decl "${_default_decl}")
+      set_property(GLOBAL APPEND PROPERTY VLLM_TRITON_AOT_DISPATCH_DECLS
+        "${_default_decl}")
+      file(STRINGS "${_adir}/${OUT_BASE}.h" _load_decl
+        REGEX "^void load_${OUT_BASE}\\(")
+      list(LENGTH _load_decl _load_decl_count)
+      if(NOT _load_decl_count EQUAL 1)
+        message(FATAL_ERROR
+          "${_adir}/${OUT_BASE}.h must declare one load_${OUT_BASE}")
+      endif()
+      vt_triton_aot_namespace_token(
+        _namespaced_load "${_arch}" "load_${OUT_BASE}")
+      string(REPLACE "load_${OUT_BASE}" "${_namespaced_load}"
+        _load_decl "${_load_decl}")
+      set_property(GLOBAL APPEND PROPERTY VLLM_TRITON_AOT_DISPATCH_DECLS
+        "${_load_decl}")
+      message(STATUS
+        "Triton AOT: ${OUT_BASE} <- ${_arch} as ${_namespaced_default}")
     endforeach()
-    if(NOT _found_line STREQUAL _manifest_line)
-      message(FATAL_ERROR
-        "STALE VENDORED TRITON AOT ARTIFACTS: the generation parameters for "
-        "'${OUT_BASE}' differ from ${_adir}/MANIFEST.\n"
-        "  expected: ${_manifest_line}\n"
-        "  vendored: ${_found_line}\n"
-        "Refusing to build cubins that do not reflect the declared launch ABI. "
-        "Regenerate: "
-        "scripts/regen-triton-aot.sh")
-    endif()
-    message(STATUS "Triton AOT: ${OUT_BASE} <- vendored ${_adir} (no Python)")
+    set(_result_include_dir "${_dispatch_dir}")
   else()
     # ── MAINTAINER path: regenerate with the Python toolchain, then refresh ──
     # the vendored tree and compile THOSE files (what a builder will compile).
@@ -254,6 +303,7 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
         "Point -DVLLM_CPP_TRITON_PYTHON=<path> at a Python that has Triton.")
     endif()
 
+    _triton_aot_arch_dir(_adir)
     set(_outdir "${CMAKE_BINARY_DIR}/triton_aot")
     file(MAKE_DIRECTORY "${_outdir}")
 
@@ -361,16 +411,17 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
       endif()
     endforeach()
     message(STATUS "Triton AOT: ${OUT_BASE} regenerated -> ${_adir}")
+    set(_result_include_dir "${_adir}")
   endif()
 
   # This is GENERATED codegen, not our code: compile with warnings suppressed
   # (-w). The launch stub deliberately has a missing-return on its empty-grid
   # branch; without -w that would trip a warning. The files end in .c, so CMake
   # compiles them as C automatically (enable_language(C) at the call site).
-  set_source_files_properties(${_all_sources} PROPERTIES COMPILE_OPTIONS "-w")
+  set_property(SOURCE ${_all_sources} APPEND PROPERTY COMPILE_OPTIONS "-w")
 
   set(${RESULT_VAR} "${_all_sources}" PARENT_SCOPE)
-  set(${RESULT_VAR}_INCLUDE_DIR "${_adir}" PARENT_SCOPE)
+  set(${RESULT_VAR}_INCLUDE_DIR "${_result_include_dir}" PARENT_SCOPE)
   set(${RESULT_VAR}_HEADER "${OUT_BASE}.h" PARENT_SCOPE)
   message(STATUS
     "Triton AOT: ${OUT_BASE} -> stable symbol ${OUT_BASE}_default()")
@@ -386,9 +437,13 @@ endfunction()
 #  * builder: verifies target, line-info policy, source hashes, generation
 #    declarations, artifact inventory, and artifact hashes; any drift is fatal.
 function(triton_aot_finalize)
-  _triton_aot_arch_dir(_adir)
-  _triton_aot_arch_name(_arch_name)
-  _triton_aot_resolved_target(_resolved_target)
+  if(VLLM_CPP_TRITON_REGEN)
+    _triton_aot_arch_dir(_adir)
+    _triton_aot_arch_name(_arch_name)
+    _triton_aot_resolved_target(_resolved_target)
+  else()
+    _triton_aot_arch_names(_arch_names)
+  endif()
 
   get_property(_expected_bases GLOBAL PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES)
   list(SORT _expected_bases)
@@ -469,6 +524,25 @@ else:
                    "(triton ${_triton_ver}, ptxas '${_ptxas_ver}'). "
                    "Review + commit the vendored tree: git diff ${_adir}")
   else()
+    get_property(_dispatch_decls GLOBAL PROPERTY
+      VLLM_TRITON_AOT_DISPATCH_DECLS)
+    list(REMOVE_DUPLICATES _dispatch_decls)
+    list(SORT _dispatch_decls)
+    set(_dispatch_dir "${CMAKE_BINARY_DIR}/triton_aot_multiarch")
+    file(MAKE_DIRECTORY "${_dispatch_dir}")
+    set(_dispatch_header "${_dispatch_dir}/triton_aot_multiarch.h")
+    file(WRITE "${_dispatch_header}"
+      "/* Generated W2 declarations for six collision-free AOT trees. */\n"
+      "#pragma once\n#include <cuda.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n")
+    foreach(_decl IN LISTS _dispatch_decls)
+      file(APPEND "${_dispatch_header}" "${_decl}\n")
+    endforeach()
+    file(APPEND "${_dispatch_header}"
+      "#ifdef __cplusplus\n}\n#endif\n")
+
+    foreach(_arch_name IN LISTS _arch_names)
+    set(_adir "${VLLM_CPP_TRITON_VENDORED_DIR}/${_arch_name}")
+    _triton_aot_resolved_target_for_arch(_resolved_target "${_arch_name}")
     # Exact dispatcher/signature set for the vendored tree we just consumed.
     file(STRINGS "${_adir}/MANIFEST" _mlines)
     if(NOT "arch ${_arch_name}" IN_LIST _mlines)
@@ -570,6 +644,10 @@ else:
       message(STATUS "Triton AOT: vendored tree ${_adir} matches triton_kernels/ "
                      "(MANIFEST hashes OK)")
     endif()
+    endforeach()
+    message(STATUS
+      "Triton AOT W2: embedded trees [${_arch_names}]; exact runtime dispatch "
+      "header ${_dispatch_header}")
   endif()
 endfunction()
 
