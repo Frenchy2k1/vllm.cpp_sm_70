@@ -147,13 +147,15 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_vec") == 0) {
-      // a dtype, b dtype, out dtype and the UNROLL factor -- but NOT the
-      // orientation. This module is MatmulBT by construction: the whole reason it
-      // exists is that b's [N,K] layout makes lane-strided K reads contiguous, and
-      // the other orientation is already coalesced in vt_matmul and would be made
-      // worse here. The unroll rides a spec constant so both arms are ONE module.
-      REQUIRE(m.spec_id_count == 4);
-      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
+      // a dtype, b dtype, out dtype, the UNROLL factor, the rows-per-workgroup
+      // count and the packed-load flag -- but NOT the orientation. This module is
+      // MatmulBT by construction: the whole reason it exists is that b's [N,K]
+      // layout makes lane-strided K reads contiguous, and the other orientation is
+      // already coalesced in vt_matmul and would be made worse here. Every tuning
+      // axis rides a spec constant so all the arms are ONE committed module and an
+      // A/B never needs a second build.
+      REQUIRE(m.spec_id_count == 6);
+      for (uint32_t want = 0; want < 6; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
       // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
       // ONE committed module, which is the argument for specialization constants
@@ -802,6 +804,210 @@ TEST_CASE("a DECODE GEMV takes the vec tactic; prefill and the other orientation
 
   vk.DestroyQueue(q);
 }
+
+// The load-width and rows-per-workgroup axes of vt_matmul_vec, asserted by the
+// SPECIALIZATION VALUES the dispatch actually built rather than by the numbers.
+//
+// THIS TEST EXISTS BECAUSE A TOLERANCE TEST CANNOT SEE THE OPTIMISATION AT ALL.
+// Every value of both axes computes the same dot product to within the tier this
+// kernel already lives in, so if a host predicate silently stopped selecting the
+// wide load -- a refactor, a reordered clause, an env parse that stopped parsing,
+// an allocator whose offsets stopped being 8-byte aligned -- every numeric check
+// in this file would still pass and 27B decode would quietly lose 8% of its
+// hottest kernel. The pipeline cache KEY is the only observable that changes.
+//
+// The expected default below is a LITERAL, not a read of kGemvPackDefault: a test
+// that imports the value it is checking asserts nothing. A change of default has
+// to come here and be argued.
+TEST_CASE("vt_matmul_vec selects its load width and row count from the shape") {
+  if (!VulkanPresent()) return;
+  // Mirrored from src/vt/vulkan/vulkan_ops.cpp kGemvPackDefault / kGemvRowsDefault.
+  // pack 2 = four 16-bit elements per load, MEASURED 1.086x over pack 0 on GB10;
+  // rows 1 = one output element per workgroup, because rows > 1 MEASURED 0.966x
+  // there (the axis is kept for the AMD/Intel boards llama.cpp raises it for).
+  constexpr uint32_t kExpectPack = 2;
+  constexpr uint32_t kExpectRows = 1;
+  // The A/B levers are process-wide and read once, so under one of them the KEY
+  // assertions would be asserting the override rather than the default. The
+  // NUMERIC checks still run in that case, and that is deliberate: forcing an arm
+  // and running this test is how a non-default variant -- every pack width above
+  // 0 changes the answer's low bits -- gets verified on a device CI can reach.
+  const bool overridden = std::getenv("VT_VULKAN_GEMV_ROWS") != nullptr ||
+                          std::getenv("VT_VULKAN_GEMV_PACK") != nullptr ||
+                          std::getenv("VT_VULKAN_GEMV_UNROLL") != nullptr ||
+                          std::getenv("VT_VULKAN_GEMV") != nullptr;
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // Runs one M=1 MatmulBT and returns (the key this shape newly built, all keys).
+  // `a_f32` makes the ACTIVATION f32 while the weight stays bf16, which is the
+  // real reason a decode GEMV would ever decline the packed path.
+  auto key_for = [&](int64_t n, int64_t k, bool a_f32) {
+    std::vector<uint16_t> a16(static_cast<size_t>(k));
+    std::vector<float> a32(static_cast<size_t>(k));
+    std::vector<uint16_t> b(static_cast<size_t>(n * k));
+    for (int64_t i = 0; i < k; ++i) {
+      const float v = 0.5f * static_cast<float>((i % 7) - 3);
+      a16[static_cast<size_t>(i)] = vt::F32ToBF16(v);
+      a32[static_cast<size_t>(i)] = v;
+    }
+    for (int64_t i = 0; i < n * k; ++i)
+      b[static_cast<size_t>(i)] = vt::F32ToBF16(0.25f * static_cast<float>((i % 5) - 2));
+    const size_t a_bytes = a_f32 ? a32.size() * sizeof(float) : a16.size() * sizeof(uint16_t);
+    void* da = vk.Alloc(a_bytes);
+    void* db = vk.Alloc(b.size() * sizeof(uint16_t));
+    auto* dout = static_cast<float*>(vk.Alloc(static_cast<size_t>(n) * sizeof(float)));
+    vk.Copy(q, da,
+            a_f32 ? static_cast<const void*>(a32.data()) : static_cast<const void*>(a16.data()),
+            a_bytes);
+    vk.Copy(q, db, b.data(), b.size() * sizeof(uint16_t));
+    vk.Synchronize(q);
+    Tensor ta = Tensor::Contiguous(da, a_f32 ? vt::DType::kF32 : vt::DType::kBF16, d, {1, k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {n, k});
+    Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {1, n});
+    const std::vector<std::string> before = ctx.PipelineKeysFor("vt_matmul_vec");
+    vt::MatmulBT(q, to, ta, tb);
+    vk.Synchronize(q);
+    // Correctness travels with the selection check: a variant that is selected and
+    // WRONG is worse than one that is not selected. The LAST row is included
+    // because a rows-per-workgroup or wide-load mistake at the end of a dispatch
+    // leaves every earlier row right.
+    std::vector<float> got(static_cast<size_t>(n), 0.0f);
+    vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+    vk.Synchronize(q);
+    for (int64_t j : {int64_t{0}, n / 2, n - 1}) {
+      double acc = 0.0;
+      for (int64_t c = 0; c < k; ++c) {
+        const double av = a_f32
+                              ? static_cast<double>(a32[static_cast<size_t>(c)])
+                              : static_cast<double>(vt::BF16ToF32(a16[static_cast<size_t>(c)]));
+        acc += av * static_cast<double>(vt::BF16ToF32(b[static_cast<size_t>(j * k + c)]));
+      }
+      CAPTURE(n);
+      CAPTURE(k);
+      CAPTURE(j);
+      CHECK(got[static_cast<size_t>(j)] ==
+            doctest::Approx(static_cast<float>(acc)).epsilon(1e-3));
+    }
+    const std::vector<std::string> after = ctx.PipelineKeysFor("vt_matmul_vec");
+    std::string key;
+    for (const std::string& s : after) {
+      bool fresh = true;
+      for (const std::string& pk : before) {
+        if (pk == s) fresh = false;
+      }
+      if (fresh) key = s;
+    }
+    vk.Free(da);
+    vk.Free(db);
+    vk.Free(dout);
+    return std::make_pair(key, after);
+  };
+
+  // "<module>|<a dt>,<b dt>,<out dt>,<unroll>,<rows>,<pack>" -- bf16 = 2, f32 = 0,
+  // unroll 4 by default.
+  auto expect = [](uint32_t a_dt, uint32_t rows, uint32_t pack) {
+    return "vt_matmul_vec|" + std::to_string(a_dt) + ",2,0,4," + std::to_string(rows) + "," +
+           std::to_string(pack);
+  };
+  auto has = [](const std::vector<std::string>& v, const std::string& want) {
+    for (const std::string& s : v) {
+      if (s == want) return true;
+    }
+    return false;
+  };
+  // A fresh key that is NOT the expected one means the predicate picked a
+  // different variant; no fresh key means an earlier shape already built this
+  // exact specialization, which is equally fine.
+  auto only = [](const std::string& fresh, const std::string& want) {
+    return fresh.empty() || fresh == want;
+  };
+
+  SUBCASE("the shipped default is the widest load, one output element per group") {
+    // K = 256 is two full workgroup widths and a multiple of 4; both operands
+    // bf16; a fresh allocation is 64-byte aligned. Nothing degrades.
+    auto r = key_for(64, 256, false);
+    const std::string want = expect(2, kExpectRows, kExpectPack);
+    CAPTURE(r.first);
+    CAPTURE(want);
+    if (!overridden) {
+      CHECK(has(r.second, want));
+      CHECK(only(r.first, want));
+      // The load-bearing half: the optimisation is actually ON. If
+      // kGemvPackDefault ever silently reverts to 0, this fails.
+      CHECK(kExpectPack == 2);
+    }
+  }
+
+  SUBCASE("K = 2 (mod 4) degrades to the 4-byte load rather than declining") {
+    // 258 = 2 x 129. Four elements per load would need a row start j*K that is a
+    // multiple of 4 for every j, which an even-but-not-multiple-of-4 K does not
+    // give, so the width halves instead of falling all the way back.
+    auto r = key_for(64, 258, false);
+    const std::string want = expect(2, kExpectRows, kExpectPack >= 1 ? 1u : 0u);
+    CAPTURE(r.first);
+    CAPTURE(want);
+    if (!overridden) {
+      CHECK(has(r.second, want));
+      CHECK(only(r.first, want));
+    }
+  }
+
+  SUBCASE("odd K falls all the way back to one element per load") {
+    auto r = key_for(64, 257, false);
+    const std::string want = expect(2, kExpectRows, 0);
+    CAPTURE(r.first);
+    CAPTURE(want);
+    if (!overridden) {
+      CHECK(has(r.second, want));
+      CHECK(only(r.first, want));
+    }
+  }
+
+  SUBCASE("an f32 activation declines the packed path entirely") {
+    // An f32 operand is already one element per 32-bit word: there is nothing to
+    // pack, and the shader's 16-bit half-extraction would be nonsense on it. The
+    // numeric checks inside key_for are what prove the fallback still computes the
+    // right answer for the mixed f32-activation / bf16-weight combination.
+    auto r = key_for(64, 256, true);
+    const std::string want = expect(0, kExpectRows, 0);
+    CAPTURE(r.first);
+    CAPTURE(want);
+    if (!overridden) {
+      CHECK(has(r.second, want));
+      CHECK(only(r.first, want));
+    }
+  }
+
+  SUBCASE("the rows axis degrades on N rather than declining") {
+    // Driven by whatever row count is REQUESTED, so this ladder is exercised for
+    // real by a VT_VULKAN_GEMV_ROWS=4 run; with the shipped default of 1 it
+    // asserts the complementary thing, that nothing accidentally selects rows > 1.
+    const char* rows_env = std::getenv("VT_VULKAN_GEMV_ROWS");
+    const char* pack_env = std::getenv("VT_VULKAN_GEMV_PACK");
+    const uint32_t want_rows =
+        rows_env != nullptr ? static_cast<uint32_t>(std::atoi(rows_env)) : kExpectRows;
+    const uint32_t want_pack =
+        pack_env != nullptr ? static_cast<uint32_t>(std::atoi(pack_env)) : kExpectPack;
+    // Those two would change the unroll value or disable the tactic outright, so
+    // the key stops being predictable from the row count alone.
+    if (std::getenv("VT_VULKAN_GEMV_UNROLL") == nullptr &&
+        std::getenv("VT_VULKAN_GEMV") == nullptr) {
+      // N = 64 keeps every row count; 66 is 2 (mod 4); 33 is odd.
+      auto r4 = key_for(64, 256, false);
+      CHECK(has(r4.second, expect(2, want_rows, want_pack)));
+      auto r2 = key_for(66, 256, false);
+      CHECK(has(r2.second, expect(2, want_rows >= 2 ? 2u : 1u, want_pack)));
+      auto r1 = key_for(33, 256, false);
+      CHECK(has(r1.second, expect(2, 1, want_pack)));
+    }
+  }
+
+  vk.DestroyQueue(q);
+}
+
 
 TEST_CASE("greedy argmax tree-reduces the vocabulary and keeps the first-wins tie-break") {
   if (!VulkanPresent()) return;

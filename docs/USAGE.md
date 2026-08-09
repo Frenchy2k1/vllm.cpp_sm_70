@@ -50,6 +50,22 @@ Two more example binaries ship alongside it:
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
 
+A Vulkan build (`-DVLLM_CPP_VULKAN=ON`) adds three kernel-measurement binaries.
+They exist so a Vulkan tuning knob can be A/B'd in ONE binary, which is this
+project's benchmark protocol, and each one prints WHICH kernel variant it ran so
+a silent fallback cannot post a plausible number:
+
+- `vulkan-gemm-ab`, cooperative-matrix versus the portable scalar GEMM
+  (`VT_VULKAN_COOPMAT=0` picks the arm). Takes `M K N [reps]`.
+- `vulkan-dispatch-floor`, one op swept across a 65,536x range of element counts,
+  to separate per-dispatch overhead from real kernel cost.
+- `vulkan-gemv-ab`, the decode GEMV swept over the (k, n) shapes a 27B model
+  actually dispatches, with `VT_VULKAN_GEMV_ROWS` / `VT_VULKAN_GEMV_PACK` /
+  `VT_VULKAN_GEMV_UNROLL` selecting the arm. Takes `[reps] [warmup] [GB/s roof]`
+  and reports GB/s against that roof. Set `VT_VULKAN_DISPATCH_STATS=1` so it
+  reports GPU-timestamp time rather than wall clock; see
+  [ENVIRONMENT.md](ENVIRONMENT.md) for what each knob does and what it measured.
+
 ### Quantized checkpoints: which `lm_head` forms load
 
 Publishers do not agree on how the output head is stored, and a single repo can
