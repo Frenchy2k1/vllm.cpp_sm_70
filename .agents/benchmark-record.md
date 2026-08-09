@@ -16296,3 +16296,249 @@ that, so even a PERFECT GEMV leaves ~20 ms and the remaining gap is the ~32 ms/t
 Rows-per-workgroup is kept as an off-by-default axis only because llama.cpp raises `rm_stdq` exactly on the
 AMD GCN and Intel parts `VK-I` is about.
 
+## BACKEND-VULKAN-LMHEAD — the one decode GEMM off the GEMV tactic: column blocking wins 6/6, the K-unroll is ZERO, and the 273 GB/s roof is not reachable (2026-08-09, GB10, `row/BACKEND-VULKAN-LMHEAD`)
+
+**Base:** `93852c28` (PR #183, the Vulkan head). Model Qwen3.6-27B bf16,
+`vllm-bench --num-prompts 1 --input-len 32 --concurrency 1`, `VLLM_CPP_DEVICE=vulkan`.
+All GPU work serialized through `flock ~/gpu.lock`.
+
+**The shape.** `VT_VULKAN_DISPATCH_STATS=1` names it exactly: `bt=0 m=1 k=5120
+n=248320`, the lm_head, whose weight is stored `[K,N]`. It is the ONLY GEMM per
+decode token that does not reach `vt_matmul_vec`, and the decline is correct --
+in `[K,N]` adjacent lanes already read adjacent addresses, so the GEMV shape
+would make a coalesced access strided. It moves `k*n` bf16 = **2.543 GB per
+token**.
+
+### 1. The 9.3 ms floor is WRONG, and the error is the roof, not the arithmetic
+
+2.543 GB at GB10's **theoretical** 273 GB/s is 9.3 ms, which made the measured
+12.43 ms look like 75% of roof and ~3.1 ms of headroom. Nothing on this box
+reaches 273 GB/s. `vt_matmul_vec` -- a genuinely coalesced streaming kernel --
+was run on the IDENTICAL byte count (`vulkan-gemm-ab 1 5120 248320 30`, M=1
+K=5120 N=248320, so `k*n` is the same 2.543 GB) and took **11.04 ms/call =
+230.3 GB/s**. That is the practical streaming ceiling here, 84% of theoretical.
+So the honest headroom for this kernel was **1.4 ms**, not 3.1.
+
+### 2. MEASURED NEGATIVE — the four-way K unroll is ZERO
+
+The first hypothesis was memory-level parallelism: the rolled loop issues one `b`
+load per iteration, so each lane should have a single outstanding read and stall,
+exactly the defect a four-way unroll fixed for `vt_matmul_vec`. A four-way K
+unroll was built with the accumulation order PRESERVED (four products folded into
+the same accumulator in ascending K, bit-identical, memcmp-gated) and A/B'd on one
+binary through a specialization constant.
+
+| arm | `vt_matmul` ms/call, len 36 | replicates |
+|---|---|---|
+| K-unroll 1 (rolled) | 12.4297, 12.4353, 12.3920 | median **12.430** |
+| K-unroll 4 | 12.5482, 12.4412, 12.5318 | median **12.532** |
+
+**ZERO, and half a percent the wrong way.** The driver already pipelines the
+rolled loop. The arm was removed rather than shipped; this row exists so it is
+not re-tried.
+
+**One leg of the FIRST block read 215.4 ms/call on the rolled arm** -- 17x -- and
+three replicates of the same arm then read 12.39-12.43. It was the GB10 residency
+lottery on a 2.54 GB buffer, not the arm. It is also why the kernel now prints
+`scalar matmul ARM: bt=... ncols=...` under `VT_VULKAN_DISPATCH_STATS`: both arms
+of a performance A/B produce bit-identical output and both report the same shader
+name in the histogram, so without a marker an arm that failed to take its flag is
+indistinguishable from a bad leg.
+
+### 3. WHAT WORKED — column blocking, 6 of 6 interleaved pairs
+
+The remaining structural difference between the two kernels at identical byte
+counts is CONTIGUITY PER WORKGROUP. `vt_matmul_vec` gives one workgroup one
+output element and strides its 128 lanes along K, so the workgroup sweeps a
+contiguous 10 KB run of `b`. The flat scalar body gives one INVOCATION one output
+element, so a 128-lane workgroup reads 256 contiguous bytes at row q and then
+jumps `n*2` = 486 KB to row q+1; contiguity survives only across workgroups still
+at the same q, and they drift apart.
+
+`VT_VULKAN_MATMUL_NCOLS` gives a workgroup `128*NCOLS` CONSECUTIVE output columns
+of one row. Lane t owns columns `t + c*128`, NOT `t*NCOLS + c` -- the strided
+assignment is what keeps each of the NCOLS loads a fully coalesced 128-lane
+contiguous read.
+
+`vt_matmul` ms/call at output-len 36, arms interleaved within each replicate:
+
+| NCOLS | replicates | median | GB/s | vs flat |
+|---|---|---|---|---|
+| 1 (flat, the pre-change kernel) | 12.4943, 12.5952, 12.5483, 12.3954, 12.4447, 12.4754 | **12.485** | 203.7 | — |
+| 2 | 13.9622, 12.4016, 12.4585 | 12.459 | 204.1 | ~0 |
+| **4 (shipped default)** | 11.6669, 11.6257, 11.5323, 11.5499, 11.3327, 11.4519 | **11.541** | **220.4** | **-0.944 ms, 1.082x** |
+| 8 | 12.8119, 12.8573, 11.9745 | 12.812 | 198.5 | SLOWER |
+
+**NCOLS 4 beat NCOLS 1 in 6 of 6 interleaved pairs.** Two-length diff (len 36
+minus len 4, over 32 tokens): flat `(449.1-49.9)/32` = **12.475 ms/token**,
+blocked `(412.3-47.2)/32` = **11.409 ms/token**, **-1.066 ms/token**.
+
+**Blocking is a TRADE, not a monotone win.** At NCOLS 8 the dispatch is only
+`ceil(248320/1024)` = 243 workgroups, ~31k threads, and the device runs out of
+work to hide memory latency with faster than the longer contiguous run buys back
+-- it is slower than not blocking at all. NCOLS 2 is indistinguishable from 1.
+The optimum is interior, which is why the gate pins the constant 4 rather than
+"not 1".
+
+At 220.4 GB/s the kernel is now at **95.7% of the 230.3 GB/s practical ceiling**
+measured on identical bytes. The residual is ~0.5 ms/token and there is no
+remaining structural difference identified to spend on it.
+
+**Nothing else moved.** Same 32,544 dispatches; `vt_matmul_vec` 0.4914-0.4981,
+`vt_matmul_coopmat` 1.6616-1.7308, `vt_rms_norm` 0.0614-0.0618 across both arms.
+`vt_matmul` is called exactly once per output token on this model and prefill
+never touches it (it takes the coopmat tactic), so the m>1 path is untouched by
+construction, and column blocking is host-gated to `bt == 0` besides.
+
+### 4. Correctness
+
+Every arm is BIT-IDENTICAL: each of a lane's accumulators owns one output element
+and sums the whole K sequentially, which is `cpu_ops.cpp` MatmulChunked's order --
+so `vt_matmul` keeps the byte-exact tier that the coopmat and GEMV tactics both
+gave up. `tests/vt/test_vulkan_backend.cpp` gates that with a **memcmp** of the
+blocked and flat arms in ONE process, not a tolerance. Two scratch mutations
+confirm the gate bites: defaulting NCOLS to 1 fails the mechanism assertion, and
+splitting the K reduction into two partial accumulators fails the memcmp. An
+earlier version of the case used the small exact operand ladder the neighbouring
+cases use and the reassociation mutation SURVIVED -- every partial sum was exact
+in f32 -- so the fixture now spans decades.
+
+GB10: `test_vulkan_backend` 30/30 (2369 assertions), `test_backend_cross_device`
+11/11, `VLLM_CPP_DEVICE=vulkan test_opt_paged_engine` 6/6 prompts token-exact
+(96/96 tokens), 0 declines.
+
+### 5. E2E wall clock — consistent, and at the edge of this box's noise
+
+8 order-alternated AB/BA pairs, output-len 32, arm A = NCOLS 4, arm B = NCOLS 1,
+same binary, `VT_VULKAN_DISPATCH_STATS` OFF. Median TPOT, ms:
+
+| pair | order | A (NCOLS 4) | B (NCOLS 1) | note |
+|---|---|---|---|---|
+| 1 | AB | 241.74 | 256.60 | B leg TTFT 84.05 s, contaminated |
+| 2 | BA | 242.56 | 244.76 | clean |
+| 3 | AB | 241.24 | 242.08 | clean |
+| 4 | BA | 243.14 | 242.72 | clean, B wins by 0.42 |
+| 5 | AB | 241.60 | 442.58 | B leg DISCARDED, 1.8x outlier |
+| 6 | BA | 241.19 | 242.62 | clean |
+| 7 | AB | 240.18 | 246.29 | B leg TTFT 18.57 s, contaminated |
+| 8 | BA | 246.47 | 493.09 | B leg DISCARDED, 2.0x outlier; A leg TTFT 53.70 s |
+
+**A wins 7 of 8 pairs overall and 3 of the 4 clean pairs.** Clean-leg medians:
+A 241.90 ms, B 242.67 ms, **-0.77 ms**, i.e. decode **4.121 -> 4.134 tok/s**
+(`1000/TPOT`). That is the same sign and the same order of magnitude as the
+paging-immune GPU-timestamp result (-1.066 ms/token) but it is 0.3% of wall, so
+the GPU-timestamp measurement is the BINDING one and this block is confirmation
+only. Two B legs and one A leg landed on gross outliers (up to 2x TPOT, TTFT up
+to 84 s) with no arm asymmetry in the mechanism -- this box's e2e wall clock is
+simply not resolving 1 ms in 242.
+
+**PROTOCOL DEPARTURE, stated.** The page cache was NOT dropped between legs, and
+a discarded warm-up leg ran first instead. Earlier Vulkan blocks dropped it
+because the box sat at the RAM ceiling; it did not here (MemAvailable ~116 of
+119 GB, no other job resident), and a cold leg costs ~30 minutes against ~4 warm
+-- 6 hours for 6 pairs. The first attempt was run that way, produced one pair in
+60 minutes, and was stopped.
+
+**Prefill is unaffected by construction and by measurement.** `vt_matmul` is
+called exactly once per output token and prefill takes the coopmat tactic, so no
+prefill GEMM reaches this kernel; the blocked arm is host-gated to `bt == 0`
+besides. Clean-leg median TTFT: A 6307 ms, B 6260 ms, a 0.7% spread with no
+ordering, well inside the leg-to-leg variation.
+
+## BACKEND-VULKAN-LMHEAD — the 19.5x `vt_matmul` BIMODALITY: memory pressure and co-residency are REFUTED, near-ceiling occupancy is the only surviving correlate (2026-08-09, GB10)
+
+Follow-up to the row above, prompted by two parallel agents reporting the same
+bimodality with opposite explanations ("a lever bigger than every other" vs
+"contamination from concurrent 27B benchmarks"). **Neither is supported by the
+measurement below.** MEASURED and INFERRED are separated explicitly.
+
+### The claim under test
+
+`vt_matmul` (the lm_head, 2.543 GB streamed per token) sometimes runs at
+~215-260 ms/call instead of ~12.4 -- a ~20x collapse to ~10 GB/s -- while
+`vt_matmul_vec` in the SAME leg moves under 1%.
+
+### Lock discipline, stated plainly
+
+**Every 27B run in this row went through `flock $HOME/gpu.lock`**, either
+`flock /home/mudler/gpu.lock <cmd>` for single runs or `exec 9>...; flock 9` held
+across a whole block. Evidence that it was real: the `P4` block sat QUEUED on the
+lock for 20+ minutes behind another agent's `--output-len 32` bench before
+running. The one thing NOT taken under the lock was the dgx BUILD (`nice -n 19`,
+`-j6`), which is CPU and RAM but not a second 27B.
+
+### MEASURED 1: the collapse happens with the box exclusively ours
+
+16 decode legs (output-len 4), arms alternated, whole block under the lock, with
+`/usr/bin/time -v` and `/proc/vmstat` deltas captured per leg.
+
+**`MemAvailable` immediately before EVERY leg was 119,024-119,276 MB of 119 GB**
+-- i.e. no other process of any size was resident. One leg collapsed:
+
+| leg | arm | `vt_matmul` ms/call | `vt_matmul_vec` | major faults | peak RSS | MemAvail before | TTFT |
+|---|---|---|---|---|---|---|---|
+| cB10 | ncols 1 | 12.457 | 0.4947 | 1090 | 105,995,280 KB | 119,215 MB | 6273 ms |
+| **cB12** | ncols 1 | **259.619** | 0.4959 | **1098** | **105,994,272 KB** | **119,276 MB** | **6346 ms** |
+| cB14 | ncols 1 | 12.422 | 0.4936 | 1102 | 105,995,248 KB | 119,067 MB | 6228 ms |
+
+The collapsed leg is **indistinguishable from its healthy neighbours on every
+memory metric**: same peak RSS to within 0.001%, same major-fault count, MORE
+free memory before it started, and a NORMAL TTFT. Its `vt_matmul_vec` moved
++0.3%.
+
+**REFUTED, therefore:** co-residency with another 27B (the box was empty),
+host page reclaim / swap (fault counts identical), and model-load or prefill
+effects (TTFT normal). The "contamination" explanation does not survive this leg.
+
+**Also refuted: heavy paging does not produce the collapse.** Four legs in the
+same block ran with 46k-304k major faults -- 40-270x the normal count, from a
+cold page cache -- and read 12.46, 13.24, 13.29 and 13.92 ms/call. Real paging
+costs about 10%, not 20x.
+
+### MEASURED 2: it does NOT reproduce standalone at low occupancy
+
+`benchmarks/vulkan_gemm_ab.cpp` gained an `nn` orientation and a `cycles`
+argument (free and REALLOCATE the weight between measurements), so the same
+kernel on the same 2.543 GB is reachable in seconds instead of a 3-minute,
+106 GB 27B leg. `vulkan-gemm-ab 1 5120 248320 12 nn 12` on an otherwise idle box
+(3 GB used, 116 GB available):
+
+**12 reallocations x 12 reps = 144 measurements, ALL between 12.39 and 13.96 ms.
+Zero collapses, no bimodality at all.**
+
+### What is left, and it is INFERRED, not established
+
+The single variable that differs between "collapses at ~6-14% of legs" and
+"never collapses in 144 measurements" is that the 27B process holds **106 GB RSS
+of a 119 GB unified box** while the standalone reproducer holds ~2.5 GB. So the
+surviving hypothesis is that near-ceiling occupancy, not contention from another
+process, puts the driver's management of this 2.54 GB buffer near a cliff.
+
+Why this kernel and not its neighbour is consistent with that: at `[K,N]` a
+workgroup reads 256 contiguous bytes and then jumps `n*2` = 486 KB, touching
+~620k distinct 4 KB pages per call, whereas `vt_matmul_vec` walks one weight row
+contiguously. `vt_matmul` is by far the most address-translation-hostile kernel
+in the model, so it is the one exposed to a placement or page-size regression.
+**This is a hypothesis. It was not tested**; the obvious next experiment
+(allocating ~100 GB of ballast to reproduce the occupancy) was NOT run because an
+unguarded large allocation has OOM-rebooted this box before.
+
+### SUGGESTIVE, explicitly NOT established: an arm asymmetry
+
+Across the blocks where both arms existed, every collapse landed on the FLAT
+arm: `NCOLS 1` 3 of 23 legs, `NCOLS 4/8` **0 of 31**. Including the two earlier
+blocks that predate column blocking it is 5 of 37 versus 0 of 31. Fisher exact
+one-sided p is about 0.06-0.07 -- **not significant**, and column blocking would
+plausibly reduce address-translation pressure, which is exactly the kind of
+just-so story this project has been burned by before. Settling it needs roughly
+60 more legs (about 3 hours) and it is the named next experiment, not a claim.
+
+### Bottom line
+
+**MEASURED:** the bimodality is real, is specific to `vt_matmul`, survives an
+exclusive box, and is not page reclaim. **REFUTED:** concurrent-benchmark
+contamination as its cause. **NOT ESTABLISHED:** the mechanism, and whether
+column blocking suppresses it. It is NOT "a lever bigger than every other Vulkan
+optimization" on the evidence available -- at 1 leg in 16 it costs roughly 6% of
+mean decode time, against the 8.5% that column blocking takes off this kernel
+deterministically.

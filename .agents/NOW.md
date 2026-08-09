@@ -26,13 +26,13 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
+| Vulkan 27B lm_head | **column-blocked -1.07 ms/tok, 6/6**; roof is 230 not 273 | 20x bimodality REAL on an IDLE box; reclaim REFUTED |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | SPIKE; 30/30 | #129 |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139 IN; **ROW 6 LANDED (#137): embeddings LIVE — `LlamaModel` arch, PoolingRunner in the step, `vllm_embed` v15, `/v1/embeddings`, fold gate 4/4-231, 9 kills** | Real-checkpoint oracle cosine residual |
 
-In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
-bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
+In-flight, default-OFF, not pushed: see state.md.
 
 ## Current gate
 
@@ -54,8 +54,7 @@ both gate models, reproduced 2–3x on an idle box. See the
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
    f32-out caller) once the Laguna fix proves the mechanism.
-4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
-   (`docker update --restart=always` + `docker start`).
+4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
 5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
    `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to
