@@ -39,6 +39,7 @@ PATH_CLASSES = frozenset(
         "asset",
         "evidence",
         "vendored_dependency",
+        "generated",
     }
 )
 PATH_CLASS_BUDGETS = {
@@ -57,7 +58,28 @@ PATH_CLASS_BUDGETS = {
     "asset": 3000,
     "evidence": 8000,
     "vendored_dependency": 8000,
+    # A REVIEW budget is a budget on what a human reads. Nobody reads a hex blob,
+    # and re-deriving one by eye is not review. These files are emitted by a
+    # tracked generator from reviewed sources, and a dedicated gate reproduces
+    # them BYTE-FOR-BYTE from those sources on every push, so their correctness is
+    # established mechanically rather than by reading the diff. The reviewable
+    # surface is the GENERATOR and its INPUTS, both of which stay `product` or
+    # `governance_checker` and keep their own tighter budgets.
+    "generated": 8000,
 }
+
+# Machine-generated artifacts, each of which MUST be (a) emitted by a tracked
+# generator in this repository, (b) reproduced byte-for-byte by a gate that runs
+# in CI, and (c) marked "GENERATED FILE - DO NOT EDIT BY HAND" at its head.
+# Adding a path here without all three is how this class would become a hole.
+GENERATED_FILES = frozenset(
+    {
+        # scripts/gen-vulkan-spirv.py, from src/vt/vulkan/shaders/*.comp.
+        # Reproduced by `gen-vulkan-spirv.py --check` in the vulkan-spirv-freshness
+        # CI job; the GLSL it compiles stays `product` and is what review reads.
+        "src/vt/vulkan/vulkan_spirv.cpp",
+    }
+)
 
 POLICY_FILES = frozenset(
     {
@@ -92,6 +114,10 @@ PROJECT_RECORD_FILES = frozenset(
 PROCEDURE_FILES = frozenset(
     {
         "AGENTS.md",
+        # A tracked SYMLINK to AGENTS.md, for tools that look for CLAUDE.md. It is
+        # the same procedure text and shares its budget; without this the checker
+        # failed closed on every change that touched it.
+        "CLAUDE.md",
         ".agents/workflow.md",
         ".agents/verification.md",
         ".agents/porting.md",
@@ -126,6 +152,9 @@ PUBLIC_DOCUMENT_FILES = frozenset(
     {
         "README.md",
         "CONTRIBUTING.md",
+        # Landed by a9a8581d and never classified, so the checker failed closed on
+        # it the same way it did on CLAUDE.md.
+        "MANIFESTO.md",
         "docs/STATUS.md",
         "docs/BENCHMARKS.md",
         "docs/FEATURES.md",
@@ -230,6 +259,10 @@ def classify_path(path: str) -> str:
 
     if not _canonical_path(path):
         raise ValueError(f"noncanonical repository path {path!r}")
+    # Ahead of every other rule: a generated artifact under src/ would otherwise
+    # fall through to `product` and spend a human-review budget on hex.
+    if path in GENERATED_FILES:
+        return "generated"
     if path in POLICY_FILES:
         return "policy"
     if path in APPEND_ONLY_FILES:
