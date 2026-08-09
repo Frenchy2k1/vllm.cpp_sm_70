@@ -2,10 +2,9 @@
 
 <!-- now-updated: 2026-08-09 -->
 
-Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
-the gate being chased, what to do next. Never a log — evidence lives in the
-append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md) and the
-benchmark record. Budget: 100 lines.
+Snapshot, not log. Evidence: [state manifest](state.csv),
+[parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
+characters.
 
 ## Live claims
 
@@ -13,6 +12,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
+| State record (#166) | **157 imports = 3,231,342 exact bytes** at `776c56f1`; 95/95; prior 156 wrappers/rows preserved; raw-row guard | Force-update #166; rerun readiness |
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
@@ -36,11 +36,9 @@ In-flight, default-OFF, not pushed: see state.md.
 
 ## Current gate
 
-Unchanged: token-exact (or the ratified distributional gate) against the pinned
-vLLM oracle, AND ≥ vLLM on every throughput axis / ≤ on latency and memory, on
-both gate models, reproduced 2–3x on an idle box. See the
-[verification procedure](verification.md). Parity pin: vLLM `555967922`
-(0.26.0.dev0).
+Token-exact (or ratified distributional) vs pinned vLLM; ≥ throughput and ≤
+latency/memory on every axis, both gate models, reproduced 2–3x idle. See
+[verification](verification.md). Pin: vLLM `555967922` (0.26.0.dev0).
 
 
 ## Next actions

@@ -4,6 +4,17 @@
 # docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
 # treats a name here as a known kernel-internal knob. A NEW production env
 # var must be documented in docs/ENVIRONMENT.md OR added here.
+# Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,
+# fallback, or experimental kernel behavior, not supported deployment knobs.
+VT_GEMMA4_BATCH_EXPERTS
+VT_GEMMA4_CUSTOM_EXPERT
+VT_GEMMA4_FP8_NATIVE
+VT_GEMMA4_FUSED_EXPERTS
+VT_GEMMA4_HOST_AXPY
+VT_GEMMA4_PROFILE
+VT_ROCM_GEMM_COMPUTE
+VT_ROCM_GEMV
+VT_ROCM_HIPBLASLT
 VLLM_MM_TOWER_PROFILE
 VT_ARCH_TACTIC_STATS
 VT_ATTN_DECODE_GQA
@@ -99,7 +110,6 @@ VT_GEMMA2_SLIDING
 VT_GEMMA3_SLIDING
 VT_GEMMA4_BATCH_EXPERTS
 VT_GEMMA4_CUSTOM_EXPERT
-VT_GEMMA4_EXPERT_VRAM_MB
 VT_GEMMA4_FP8_NATIVE
 VT_GEMMA4_FUSED_EXPERTS
 VT_GEMMA4_HOST_AXPY
@@ -208,12 +218,11 @@ VT_ASYNC_EXECUTOR_POISON
 VT_ASYNC_EXECUTOR_TRACE
 
 # Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
-# selects a kernel or a batching/residency strategy for the expert GEMMs and each
+# selects a kernel or a batching strategy for the expert GEMMs and each
 # defaults to the measured-best path; none changes an API contract or an output.
 # Kernel-internal, so allowlisted rather than documented as user knobs.
 VT_GEMMA4_BATCH_EXPERTS
 VT_GEMMA4_CUSTOM_EXPERT
-VT_GEMMA4_EXPERT_VRAM_MB
 VT_GEMMA4_FP8_NATIVE
 VT_GEMMA4_FUSED_EXPERTS
 VT_GEMMA4_HOST_AXPY

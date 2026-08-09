@@ -1,0 +1,3 @@
+schema_version,shard_id,index_path,event_prefix
+1,0000-00-001,.agents/state-index/0000-00-001.csv,.agents/state-events/0000-00/
+1,2026-08-001,.agents/state-index/2026-08-001.csv,.agents/state-events/2026-08/

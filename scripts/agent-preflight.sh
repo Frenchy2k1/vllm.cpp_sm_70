@@ -71,7 +71,7 @@ CHECKERS=(
   check-surface-coverage
   check-test-registration
   check-protocol-consistency
-  check-state-order
+  check-state-record
   check-now-current
   check-gate-commands
 )
@@ -98,7 +98,8 @@ SUITES=(
   test_check_surface_coverage
   test_check_test_registration
   test_check_protocol_consistency
-  test_check_state_order
+  test_state_record_core
+  test_check_state_record
   test_check_now_current
   test_audit_live_rows
   test_check_gate_commands
@@ -193,6 +194,10 @@ run "policy/trailer suites" python3 -m unittest \
 if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
    [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
   echo "Committed range vs origin/main:"
+  run "state-record range" python3 scripts/check-state-record.py \
+    --base origin/main
+  run "now-current range" python3 scripts/check-now-current.py \
+    --base origin/main --head HEAD
   run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
     --base origin/main --head HEAD
 fi

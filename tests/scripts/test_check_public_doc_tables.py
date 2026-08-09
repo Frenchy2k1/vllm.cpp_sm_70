@@ -401,7 +401,11 @@ class StatusRatchet(unittest.TestCase):
 
     def test_growth_past_the_char_ratchet_is_rejected(self) -> None:
         text = STATUS_VALID + "\n" + "x" * doc_tables.STATUS_RATCHET["chars"]
-        self.assertTrue(any("chars is" in e for e in doc_tables.status_errors(text)))
+        errors = doc_tables.status_errors(text)
+        self.assertTrue(any("chars is" in error for error in errors), errors)
+        self.assertTrue(
+            any("structured state evidence" in error for error in errors), errors
+        )
 
     def test_growth_past_the_section_ratchet_is_rejected(self) -> None:
         extra = "\n".join(

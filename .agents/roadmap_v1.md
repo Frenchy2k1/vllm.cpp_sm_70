@@ -17,7 +17,7 @@ golden drift, and the 0.26 re-benchmark of the binding grids is PENDING.
 
 **Where the detail lives.** This page is the single ordered portfolio table and
 nothing else. Per-attempt narrative, refuted hypotheses and superseded numbers
-belong in the append-only [state.md](state.md),
+belong in the [structured state index](state.csv) and immutable event evidence,
 [parity-ledger.md](parity-ledger.md) and
 [benchmark-record.md](benchmark-record.md); capability state belongs in the area
 matrices and [docs/STATUS.md](../docs/STATUS.md). The chronology that had

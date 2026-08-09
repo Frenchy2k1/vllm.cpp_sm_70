@@ -460,7 +460,7 @@ class ConsolidationMutations(unittest.TestCase):
             ("feature, model, backend, or quantization surface", "feature surface"),
             ("commands, C API, configuration, installation, or user workflows", "usage"),
             ("only for a user-visible landing-page headline", "for any change"),
-            ("same change as every `.agents/state.md` append", "later change"),
+            ("same change as every qualifying appended structured event", "later change"),
         )
         for old, new in replacements:
             with self.subTest(old=old):

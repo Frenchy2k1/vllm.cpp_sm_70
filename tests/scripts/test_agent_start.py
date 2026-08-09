@@ -158,7 +158,7 @@ class RendererTests(unittest.TestCase):
                 self.assertIn("printed .agents/NOW.md", out)
                 self.assertIn(".agents/developer-preferences.md", out)
                 self.assertIn(".agents/coordination.md", out)
-                self.assertIn(".agents/state.md", out)
+                self.assertIn("structured state event anchors", out)
 
     def test_declared_marker_owns_mode_even_when_no_conflict(self):
         out = self.render(

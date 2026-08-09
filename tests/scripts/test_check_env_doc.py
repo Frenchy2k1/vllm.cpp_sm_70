@@ -68,6 +68,37 @@ class UndocumentedEnvVarTests(unittest.TestCase):
         self.assertEqual(undocumented(scanned, documented, allowlisted), [])
         self.assertGreater(len(scanned), 100)  # the sweep actually found names
 
+    def test_inherited_variables_have_exact_public_internal_split(self) -> None:
+        public = {
+            "VT_GEMMA4_EXPERT_VRAM_MB",
+            "VT_SERVER_MAX_NEW_TOKENS",
+            "VT_SERVER_MAX_PROMPT_CHARS",
+        }
+        internal = {
+            "VT_GEMMA4_BATCH_EXPERTS",
+            "VT_GEMMA4_CUSTOM_EXPERT",
+            "VT_GEMMA4_FP8_NATIVE",
+            "VT_GEMMA4_FUSED_EXPERTS",
+            "VT_GEMMA4_HOST_AXPY",
+            "VT_GEMMA4_PROFILE",
+            "VT_ROCM_GEMM_COMPUTE",
+            "VT_ROCM_GEMV",
+            "VT_ROCM_HIPBLASLT",
+        }
+        inherited = public | internal
+        scanned = check_env_doc.scan_env_names(ROOT)
+        documented = check_env_doc.documented_names(
+            (ROOT / "docs/ENVIRONMENT.md").read_text(encoding="utf-8")
+        )
+        allowlisted = check_env_doc.allowlisted_names(
+            (ROOT / "scripts/env-doc-allowlist.txt").read_text(encoding="utf-8")
+        )
+
+        self.assertLessEqual(inherited, scanned)
+        self.assertEqual(inherited & documented, public)
+        self.assertEqual(inherited & allowlisted, internal)
+        self.assertTrue((inherited & documented).isdisjoint(inherited & allowlisted))
+
     def test_a_fabricated_new_var_would_fail(self) -> None:
         # Mutation: pretend the code grew a new undocumented var; it must trip.
         scanned = check_env_doc.scan_env_names(ROOT)

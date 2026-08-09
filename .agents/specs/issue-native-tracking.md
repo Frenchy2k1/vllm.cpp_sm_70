@@ -13,7 +13,8 @@ is deterministic and concurrent sessions cannot corrupt it.
 
 Out of scope, and explicitly staying in files: the **doctrine** (`AGENTS.md`,
 `.agents/directives.md`, `.agents/discipline.md`, `.agents/gates.md`, the
-benchmark and parity-lever protocols) and the **evidence** (`.agents/state.md`,
+benchmark and parity-lever protocols) and the **evidence** (`.agents/state.csv`
+plus immutable state events,
 `.agents/benchmark-record.md`, `.agents/parity-ledger.md`, every
 `.agents/specs/` card, `docs/STATUS.md`, `docs/BENCHMARKS.md`,
 `docs/FEATURES.md`, goldens). Also out of scope: what work to do (the roadmap's
@@ -37,9 +38,9 @@ superseded). Two properties of it are in tension:
 
   - 2026-08-04: a three-way merge silently produced a **variant** of another
     session's binding numbers. No conflict, no marker.
-  - union-merging appends from parallel worktrees interleaved the `state.md`
-    tail, so "newest last" was false and cold resume returned a jumble
-    (`check-state-order.py` and `sort-state-tail.py` exist to repair this).
+  - union-merging parallel appends interleaved the former monolithic state
+    tail, so "newest last" was false and cold resume returned a jumble. The
+    structured state cutover removed that writable format and its repair tools.
   - union-resolving the keyed tables **duplicates rows** rather than merging
     them.
   - `coordination.md` is a mutex implemented as a text file merged across
@@ -183,7 +184,7 @@ The split follows what is provable from the tree.
 
 **Offline, local, in `agent-preflight.sh`** — unchanged in spirit. Everything
 provable from the tree stays provable from the tree: `check-doc-checkpoint.py`,
-`check-state-order.py`, `check-protocol-consistency.py`, and every anchor
+`check-state-record.py`, `check-protocol-consistency.py`, and every anchor
 path-class and line-range check in `check-agent-record.py`.
 
 **CI-only, new `scripts/check-issue-record.py`** (Actions already provides a

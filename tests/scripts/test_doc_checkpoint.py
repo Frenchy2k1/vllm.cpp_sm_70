@@ -384,9 +384,36 @@ class SemanticClassificationTests(unittest.TestCase):
         self.assertIn("feature_checkpoint", classes)
         self.assertNotIn("user_usage", classes)
 
-    def test_state_append_is_live_state_and_checkpoint(self) -> None:
-        classes = doc_checkpoint.classify_changed_paths([".agents/state.md"])
-        self.assertEqual(classes, {"feature_checkpoint", "live_state"})
+    def test_structured_state_paths_are_governance_not_path_only_live_state(self) -> None:
+        for path in (
+            ".agents/state.csv",
+            ".agents/state-index/2026-08-001.csv",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
+            ".agents/completed/state-migration-manifest.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(doc_checkpoint.classify_changed_paths([path]), {"governance"})
+
+    def test_structured_now_checker_and_mutations_are_governance(self) -> None:
+        for path in (
+            "scripts/check-now-current.py",
+            "tests/scripts/test_check_now_current.py",
+            "tests/scripts/test_state_record_cutover.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    doc_checkpoint.classify_changed_paths([path]), {"governance"}
+                )
+
+    def test_public_document_checker_and_mutations_are_governance(self) -> None:
+        for path in (
+            "scripts/check-public-doc-tables.py",
+            "tests/scripts/test_check_public_doc_tables.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    doc_checkpoint.classify_changed_paths([path]), {"governance"}
+                )
 
 
 class RequiredSurfaceTests(unittest.TestCase):
@@ -427,14 +454,12 @@ class RequiredSurfaceTests(unittest.TestCase):
             "docs/USAGE.md",
         )
 
-    def test_state_append_requires_fresh_now(self) -> None:
-        self.assertMissing(
-            {
-                ".agents/state.md",
-                "docs/STATUS.md",
-                "docs/BENCHMARKS.md",
-            },
-            ".agents/NOW.md",
+    def test_index_path_without_a_qualifying_event_does_not_require_now(self) -> None:
+        self.assertEqual(
+            doc_checkpoint.checkpoint_errors(
+                {".agents/state-index/2026-08-001.csv"}
+            ),
+            [],
         )
 
     def test_readme_churn_without_landing_trigger_is_rejected(self) -> None:

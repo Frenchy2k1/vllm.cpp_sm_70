@@ -24,6 +24,8 @@ These change how the engine runs and have no CLI flag (or complement one).
 | `VT_LMCACHE_HOST` | `127.0.0.1` | Default LMCache server host for the `lm://` connector. The `kv_connector_extra_config.host` key overrides it. See [KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `VT_LMCACHE_PORT` | `65432` | Default LMCache server port. The `kv_connector_extra_config.port` key overrides it |
 | `VT_LMCACHE_HASH_ALGO` | `blake3` | Default LMCache key-derivation algorithm. Set `vllm` (alias `sha256_cbor`) for byte-for-byte interop with a real vLLM + LMCache peer. The `kv_connector_extra_config.hash_algo` key overrides it |
+| `VT_SERVER_MAX_PROMPT_CHARS` | `200000` characters | Rejects chat-completion prompts larger than this many characters. Set `0` to disable the prompt-size guard |
+| `VT_SERVER_MAX_NEW_TOKENS` | `4096` | Clamps the requested generation length to this many new tokens. Set `0` to disable the cap |
 | `VT_VULKAN_DEVICE` | first suitable device | Forces the Vulkan physical device index. Required on a multi-GPU host to pin the intended device |
 | `VT_KV_CACHE_F32` | off (native KV dtype) | Forces the KV cache to fp32. A precision/diagnostic lever, at the cost of double the KV memory |
 | `VT_ENABLE_JUMP_FORWARD` | off | Opt-in to jump-forward constrained decoding (SGLang parity SW3): when a grammar/structured-output request reaches a state with exactly one valid next token, that token is emitted without a model step. Currently drives only the standalone driver (`DrainForcedTokens`); output-identical by construction (it fires only where the constrained sampler already has a single valid token), so it changes speed, never tokens. Off by default until the production scheduler splice (jumped-token KV recompute) lands. Set `1`/`true`/`on` to enable |
@@ -153,6 +155,7 @@ on CUDA/CPU builds beyond the documented behavior.
 
 | Variable | Default | What it does |
 |---|---|---|
+| `VT_GEMMA4_EXPERT_VRAM_MB` | unlimited (unset or `0`) | A positive MiB value caps the device expert-cache LRU; unset or `0` leaves the cache unlimited |
 | `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads the Gemma-4 MoE experts resident on the GPU(s) after the first use instead of streaming them per step (discrete-ROCm optimization). No-op (with a stderr note) on a binary built without `-DVLLM_CPP_HIP` |
 | `VT_GEMMA4_RESIDENT_GPUS` | `2` | Number of GPUs across which resident Gemma-4 experts are spread; clamped to the ROCm device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
 | `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded, to fit a smaller VRAM budget. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |

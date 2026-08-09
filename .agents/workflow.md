@@ -19,7 +19,7 @@ Each controlled paragraph names exactly the rule it implements.
 [POL-BOOT-ROLE] Use the entrypoint's reported worktree role. If none exists, ask what work the developer intends and run `scripts/agent-role.py claim operator` for a multi-step integration campaign, `scripts/agent-role.py claim helper --row <ID>` for one scoped task, or `scripts/agent-role.py claim read-only` for inspection. Add `--headless` only when the developer explicitly declares an unattended run; never infer it.
 <!-- role-interview:end -->
 
-[POL-BOOT-NOW] After role resolution, read `.agents/NOW.md` as the one-read live snapshot; consult the append-only state tail only when the task needs deeper history.
+[POL-BOOT-NOW] After role resolution, read `.agents/NOW.md` as the one-read live snapshot; consult the structured state indexes and event evidence only for deeper history.
 
 [POL-BOOT-TASK] After NOW, read only the claimed spec, owning matrix/roadmap row, coordination entry, linked evidence, and the procedures selected by applicable policy rows.
 
@@ -123,9 +123,9 @@ gates.
 
 [POL-DOC-README] Change `README.md` only for a user-visible landing-page headline, positioning, primary quick start, or top-level capability shift; routine checkpoints belong in purpose-specific docs.
 
-[POL-NOW-COUPLING] Treat `.agents/NOW.md` as a bounded live snapshot, not a log. Rewrite it in the same change as every `.agents/state.md` append.
+[POL-NOW-COUPLING] Refresh bounded `.agents/NOW.md` in the same change as every qualifying appended structured event; imports and forensic-only corrections are exempt.
 
-[POL-STATE-ORDER] Append state entries below `<!-- state-order:enforced-below -->` with a sortable date anchor in oldest-to-newest order; repair interleaving with `scripts/sort-state-tail.py --apply`.
+[POL-STATE-STRUCTURED] Append via ordered indexes and immutable event evidence; correct only by supersession. Run `scripts/check-state-record.py`.
 <!-- policy-procedure:end -->
 
 An unfinished-work handoff records the immutable head, live claim, exact source
