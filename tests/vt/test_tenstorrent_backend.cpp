@@ -419,6 +419,68 @@ TEST_CASE("kTENSTORRENT kLayerNorm matches a host F32 reference (affine + plain)
   SUBCASE("elementwise_affine=False (no weight/bias)") { run_case(false); }
 }
 
+// First Qwen3-dense (`Qwen3ForCausalLM`) op beyond OPT's set. Host oracle is
+// cpu_ops RmsNormKernel (no residual, gemma=false) — the Qwen3 default.
+TEST_CASE("kTENSTORRENT kRmsNorm matches a host F32 reference (weight, no residual)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kRmsNorm, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t Rows = 32, D = 32;
+  constexpr float Eps = 1e-6f;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto rms_norm = reinterpret_cast<vt::RmsNormFn>(
+      vt::GetOp(vt::OpId::kRmsNorm, DeviceType::kTENSTORRENT));
+
+  std::vector<float> host_x(Rows * D), host_w(D), host_out(Rows * D, 0.0f);
+  for (size_t i = 0; i < host_x.size(); ++i)
+    host_x[i] = (static_cast<float>(i % 17) - 8.0f) * 0.15f;
+  for (int64_t j = 0; j < D; ++j)
+    host_w[static_cast<size_t>(j)] = 0.5f + static_cast<float>(j % 5) * 0.1f;
+
+  void* mem_x = backend.Alloc(host_x.size() * sizeof(float));
+  void* mem_w = backend.Alloc(host_w.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_x, host_x.data(), host_x.size() * sizeof(float));
+  backend.Copy(q, mem_w, host_w.data(), host_w.size() * sizeof(float));
+
+  Tensor x =
+      Tensor::Contiguous(mem_x, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {Rows, D});
+  Tensor w =
+      Tensor::Contiguous(mem_w, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {D});
+  Tensor out =
+      Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {Rows, D});
+
+  vt::RmsNormArgs args;
+  args.eps = Eps;
+  args.gemma = false;
+  rms_norm(q, out, x, w, args, /*residual=*/nullptr);
+
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_x);
+  backend.Free(mem_w);
+  backend.Free(mem_out);
+
+  float max_abs_diff = 0.0f;
+  for (int64_t r = 0; r < Rows; ++r) {
+    float sumsq = 0.0f;
+    for (int64_t j = 0; j < D; ++j) {
+      const float v = host_x[r * D + j];
+      sumsq += v * v;
+    }
+    const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(D) + Eps);
+    for (int64_t j = 0; j < D; ++j) {
+      const float ref = host_x[r * D + j] * inv * host_w[static_cast<size_t>(j)];
+      max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[r * D + j] - ref));
+    }
+  }
+  // bf16 storage + device reduction; same envelope as kLayerNorm.
+  CHECK(max_abs_diff < 0.5f);
+}
+
 TEST_CASE("kTENSTORRENT kQkvSplit is BIT-EXACT vs a host reference (unequal widths)") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
