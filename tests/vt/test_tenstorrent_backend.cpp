@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -472,4 +473,79 @@ TEST_CASE("kTENSTORRENT kQkvSplit is BIT-EXACT vs a host reference (unequal widt
     for (int64_t j = 0; j < Vd; ++j)
       CHECK(host_v[i * Vd + j] == host_qkv[i * (Qd + Kd + Vd) + Qd + Kd + j]);
   }
+}
+
+TEST_CASE("kTENSTORRENT kReshapeAndCache is BIT-EXACT incl. slot<0 skip") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kReshapeAndCache, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t NBlocks = 6, Bsz = 8, Hkv = 3, Dh = 16, T = 10;
+  constexpr int64_t Page = Hkv * Dh;
+  const size_t cache_elems = static_cast<size_t>(NBlocks * Bsz * Hkv * Dh);
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_k(static_cast<size_t>(T * Page)), host_v(static_cast<size_t>(T * Page));
+  for (size_t i = 0; i < host_k.size(); ++i) {
+    host_k[i] = static_cast<float>(i % 11) * 0.1f;
+    host_v[i] = static_cast<float>(i % 13) * 0.05f - 0.2f;
+  }
+  // Scattered slots + one padded (-1) token that must leave its page untouched.
+  std::vector<int64_t> slots{0, 9, 17, 3, -1, 40, 25, 8, 33, 11};
+  REQUIRE(static_cast<int64_t>(slots.size()) == T);
+
+  std::vector<float> seed(cache_elems);
+  for (size_t i = 0; i < seed.size(); ++i) seed[i] = static_cast<float>(i % 977) * 0.001f;
+  std::vector<float> host_kc = seed, host_vc = seed;
+
+  void* mem_k = backend.Alloc(host_k.size() * sizeof(float));
+  void* mem_v = backend.Alloc(host_v.size() * sizeof(float));
+  void* mem_kc = backend.Alloc(cache_elems * sizeof(float));
+  void* mem_vc = backend.Alloc(cache_elems * sizeof(float));
+  void* mem_slots = backend.Alloc(slots.size() * sizeof(int64_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_k, host_k.data(), host_k.size() * sizeof(float));
+  backend.Copy(q, mem_v, host_v.data(), host_v.size() * sizeof(float));
+  backend.Copy(q, mem_kc, host_kc.data(), host_kc.size() * sizeof(float));
+  backend.Copy(q, mem_vc, host_vc.data(), host_vc.size() * sizeof(float));
+  backend.Copy(q, mem_slots, slots.data(), slots.size() * sizeof(int64_t));
+
+  Tensor tk = Tensor::Contiguous(mem_k, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hkv, Dh});
+  Tensor tv = Tensor::Contiguous(mem_v, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hkv, Dh});
+  Tensor tkc = Tensor::Contiguous(mem_kc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, Dh});
+  Tensor tvc = Tensor::Contiguous(mem_vc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, Dh});
+  Tensor tsl = Tensor::Contiguous(mem_slots, vt::DType::kI64, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T});
+
+  auto rac = reinterpret_cast<vt::ReshapeAndCacheFn>(
+      vt::GetOp(vt::OpId::kReshapeAndCache, DeviceType::kTENSTORRENT));
+  rac(q, tk, tv, tkc, tvc, tsl);
+
+  backend.Copy(q, host_kc.data(), mem_kc, host_kc.size() * sizeof(float));
+  backend.Copy(q, host_vc.data(), mem_vc, host_vc.size() * sizeof(float));
+  backend.Free(mem_k);
+  backend.Free(mem_v);
+  backend.Free(mem_kc);
+  backend.Free(mem_vc);
+  backend.Free(mem_slots);
+
+  // Host oracle: same stride math as cpu_cache.cpp.
+  std::vector<float> ref_kc = seed, ref_vc = seed;
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t slot = slots[static_cast<size_t>(t)];
+    if (slot < 0) continue;
+    const int64_t block = slot / Bsz;
+    const int64_t offset = slot % Bsz;
+    const int64_t dst = (block * Bsz + offset) * Page;
+    std::memcpy(ref_kc.data() + dst, host_k.data() + t * Page, static_cast<size_t>(Page) * sizeof(float));
+    std::memcpy(ref_vc.data() + dst, host_v.data() + t * Page, static_cast<size_t>(Page) * sizeof(float));
+  }
+  CHECK(host_kc == ref_kc);
+  CHECK(host_vc == ref_vc);
 }
