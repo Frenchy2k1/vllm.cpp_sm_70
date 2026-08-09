@@ -226,7 +226,7 @@ RETIRED_PATTERNS = (
 
 CHECKER_EVIDENCE_OVERRIDES = {
     "scripts/check-agent-record.py": "tests/scripts/test_agent_record.py",
-    "scripts/check-role-discipline.py": "tests/scripts/test_check_pr_size.py",
+    "scripts/check-role-discipline.py": "tests/scripts/test_check_role_discipline.py",
     "scripts/check-doc-checkpoint.py": "tests/scripts/test_doc_checkpoint.py",
     # Its suite predates the test_check_<name> convention and CI runs it under
     # the older name, so the derived path pointed at a file that does not
