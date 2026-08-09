@@ -1,9 +1,10 @@
 # Downloadable server binary release matrix
 
-Status: accepted contract with W5 manifest tooling and W6 installed server
-packaging implemented for `ENG-RELEASE-BINARIES`. PR #196 is the single
-delivery PR for the complete W1-W13 matrix. The release row is `ACTIVE`; no
-W7-validated archive, release workflow, or model runtime result is claimed.
+Status: accepted contract with required W1-W11/W13 implementation complete for
+`ENG-RELEASE-BINARIES` in the single delivery PR #196. The release row remains
+`ACTIVE`: local gates are green, while the hosted eight-tuple dry run,
+matching-hardware evidence, and tagged publication are still pending. W12 is
+optional/non-primary.
 
 Pins: vLLM parity source `555967922`; vllm.cpp spike baseline `f13c49ee`;
 request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
@@ -446,10 +447,9 @@ wildcards, and a failed lane cannot be replaced by an older workflow artifact.
 ## Work breakdown: helper-sized implementation plan
 
 Each work unit is a separate verified checkpoint inside the single active
-claim and PR #196, with its own red-first checker change and fresh review. W5
-was implemented in PR #141 and advanced the row to `ACTIVE`; W6 is the first
-implemented checkpoint in PR #196, and no later work unit or release evidence
-is implied until its own gate passes.
+claim and PR #196, with its own red-first checker change and review. W5 was
+implemented in PR #141; required W1-W11/W13 are implemented in #196. Hosted
+completion remains necessary before any publication or channel claim.
 
 | Work | Deps | Deliverable | Exit gate |
 |---|---|---|---|
@@ -499,7 +499,8 @@ The release program is feasible as backend-specific static-core bundles with a
 hybrid stable/preview channel. Literal-static scope is limited to the
 experimental musl CPU lane. ROCm is blocked. Primary downloads are adaptive CPU
 or fat CUDA per OS+host ABI; per-SM CUDA archives are optional diagnostics. The
-W5 manifest tooling and W6 installed server packaging are implemented and the
-row is `ACTIVE`, not `DONE`. W1-W4 and W7-W13 remain pending; in particular no
-W7-validated or published archive, model-runtime correctness proof, or
-performance result exists.
+Required W1-W11/W13 are implemented and the row is `ACTIVE`, not `DONE`. Local
+archive, CPU, Vulkan, workflow, and mutation gates are green. The hosted
+eight-tuple dry run, matching-hardware evidence, and tagged publication remain
+pending, so no published archive or release-channel advancement is claimed.
+W12 remains the optional non-primary diagnostic lane.

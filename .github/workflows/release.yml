@@ -241,8 +241,116 @@ jobs:
           if-no-files-found: error
           overwrite: false
           retention-days: 7
+  vulkan_x86:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan software runtime and archive inspectors
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mesa-vulkan-drivers
+      - name: Build, execute, package, and validate Vulkan preview
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          scripts/build-linux-accelerator-release.sh \
+            linux-x86_64-glibc-vulkan vulkan build-release-vulkan-x86
+      - name: Upload exact validated Vulkan asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64-glibc-vulkan-${{ github.sha }}
+          path: |
+            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz
+            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz.sha256
+            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  metal_arm64:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: macos-15
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, execute, package, and validate native Metal bundle
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          scripts/build-macos-release.sh \
+            macos-arm64-metal stable build-release-metal-arm64
+      - name: Upload exact validated Metal asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64-metal-${{ github.sha }}
+          path: |
+            build-release-metal-arm64/release/macos-arm64-metal.tar.gz
+            build-release-metal-arm64/release/macos-arm64-metal.tar.gz.sha256
+            build-release-metal-arm64/release/macos-arm64-metal.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  mlx_arm64:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: macos-15
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install the exact redistributable MLX runtime
+        run: python3 -m pip install --disable-pip-version-check 'mlx==0.32.0'
+      - name: Build, execute, package, and validate MLX preview
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          mlx_root=$(python3 -c 'import mlx, pathlib; print(pathlib.Path(mlx.__file__).parent)')
+          mlx_license=$(python3 -c 'import importlib.metadata as m; d=m.distribution("mlx"); print(next(str(d.locate_file(f)) for f in d.files if f.name.lower() in {"license", "license.txt"}))')
+          test -f "$mlx_root/lib/libmlx.dylib"
+          test -f "$mlx_root/lib/mlx.metallib" -o -f "$mlx_root/mlx.metallib"
+          test -f "$mlx_license"
+          scripts/build-macos-release.sh \
+            macos-arm64-metal-mlx preview build-release-mlx-arm64 \
+            "$mlx_root" 0.32.0 "$mlx_license"
+      - name: Upload exact validated MLX asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64-metal-mlx-${{ github.sha }}
+          path: |
+            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz
+            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz.sha256
+            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
   build:
-    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64]
+    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64]
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -259,7 +367,7 @@ jobs:
       - name: Download exact validated CPU artifacts by immutable IDs
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }}
+          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
           path: assets
           merge-multiple: true
       - name: Produce the byte-bound release handoff
@@ -309,6 +417,14 @@ jobs:
             --assets-dir verified/assets \
             --output verified/verified-handoff.json \
             --sha '${{ github.sha }}'
+      - name: Generate byte-derived release indexes
+        run: |
+          python3 scripts/release_index.py \
+            --assets-dir verified/assets \
+            --handoff verified/verified-handoff.json \
+            --json-output verified/release-index.json \
+            --markdown-output verified/RELEASE_INDEX.md \
+            --retention-days 7
       - name: Upload immutable verified handoff
         id: upload
         uses: actions/upload-artifact@v4
@@ -345,6 +461,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Download only the verified handoff by ID
         uses: actions/download-artifact@v4
         with:
@@ -356,5 +473,9 @@ jobs:
         run: |
           tag='${{ needs.plan.outputs.release_tag }}'
           test "$tag" = "${GITHUB_REF#refs/tags/}"
-          gh release create "$tag" verified/verified-handoff.json \
-            --verify-tag --title "$tag" --generate-notes
+          python3 scripts/release_pipeline.py publish \
+            --handoff verified/verified-handoff.json \
+            --assets-dir verified/assets \
+            --index-json verified/release-index.json \
+            --index-markdown verified/RELEASE_INDEX.md \
+            --tag "$tag"

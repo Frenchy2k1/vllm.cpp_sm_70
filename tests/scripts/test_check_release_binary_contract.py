@@ -127,17 +127,16 @@ GUARD_MAP_KEYS = {
 RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | **ACTIVE; W5 contract + W6 package GREEN** |",
+    ".agents/NOW.md": "| Release | **ACTIVE; required W1-W11/W13 implemented in #196** |",
     ".agents/coordination.md": (
         "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,"
     ),
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": (
         "# W6 installed server package green"
     ),
-    "docs/STATUS.md": "#196 W6 package/help GREEN; no published assets",
+    "docs/STATUS.md": "#196 binary pipeline implemented; no published binaries",
     "docs/BENCHMARKS.md": (
-        "| **Binary release matrix (ACTIVE; W5+W6 implemented)** | "
-        "`ENG-RELEASE-BINARIES`:"
+        "| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** |"
     ),
 }
 
@@ -150,46 +149,42 @@ LIFECYCLE_RECORD_MUTATIONS = (
     ),
     (
         ".agents/engine-matrix.md",
-        "W7 archive validation/supply-chain metadata, publish workflow and real "
-        "model/runtime evidence remain pending",
-        "W7 archive validation/supply-chain metadata, publish workflow and real "
-        "model/runtime evidence are complete",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware "
+        "gates, and tagged publication remain pending",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware "
+        "gates, and tagged publication are complete",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "`ACTIVE` | W5 manifest/schema fixtures and W6 canonical static-core server",
-        "`DONE` | W5 manifest/schema fixtures and W6 canonical static-core server",
+        "`ACTIVE` | Required W1-W11/W13 implementation is complete",
+        "`DONE` | Required W1-W11/W13 implementation is complete",
         "roadmap release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "no release-grade or published archive exists",
-        "release-grade and published archives exist",
+        "no published binary exists",
+        "published binaries exist",
         "roadmap release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "| `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals "
-        "10/10 killed; accepted release suite 30/30; no archive or real "
-        "runtime/correctness/performance evidence |",
-        "| `DONE` | 2026-08-08 — W5 19/19; fresh-review production removals "
-        "10/10 killed; accepted release suite 30/30; "
-        "archive and runtime/correctness/performance evidence complete |",
+        "| `ACTIVE` | 2026-08-09 — required W1-W11/W13 implementation complete;",
+        "| `DONE` | 2026-08-09 — required W1-W11/W13 implementation complete;",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "Excludes W1-W4, W6-W13, archives, install/package/publish workflows and "
-        "runtime artifacts",
-        "Includes W1-W13, archives, install/package/publish workflows and "
-        "runtime artifacts",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware "
+        "gates, rebase/merge, and tagged publication pending",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware "
+        "gates, rebase/merge, and tagged publication complete",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "no archive or real runtime/correctness/performance evidence",
-        "release archive and runtime/correctness/performance evidence shipped",
+        "W12 optional/non-primary |",
+        "W12 required/primary |",
         "coordination release lifecycle",
     ),
     (
@@ -235,14 +230,14 @@ HUMAN_WORK_IDS = (
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** W1-W4/W7-W13, W7 validation, model/runtime gates, publication",
+        "**PENDING:** hosted full matrix, matching hardware, tagged publish",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
         "docs/STATUS.md",
-        "Subset; #196 W6 package/help GREEN; no published assets",
+        "Subset; #196 binary pipeline implemented; no published binaries",
         "Supported; #196: RELEASE DONE/ARTIFACTS✓",
         "docs/STATUS.md release row",
     ),

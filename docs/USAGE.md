@@ -141,6 +141,13 @@ images and the six available exact-SM Triton AOT namespaces; the manifest keeps
 runtime evidence separate per SM. These build-only preview candidates are not
 a downloadable release claim until the tagged workflow publishes them.
 
+The complete primary download matrix and its runtime boundaries are documented
+in [RELEASES.md](RELEASES.md). A manual workflow dispatch runs all eight tuples
+without publication. An exact version tag runs the same build, produces
+`release-index.json` and `RELEASE_INDEX.md` from the verified archive manifests,
+attests the archive bytes, and publishes every archive/checksum/provenance
+triplet through the protected release environment.
+
 ### Selecting an x86 CPU ISA tier
 
 The x86_64 CPU library is one adaptive binary: portable, SSE2,
