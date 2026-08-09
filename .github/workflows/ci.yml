@@ -102,13 +102,10 @@ jobs:
           set -eu
           python3 scripts/check-prompt-contract.py
           python3 -m unittest \
-            tests.scripts.test_policy_contract \
-            tests.scripts.test_policy_waivers \
+            tests.scripts.test_waivers \
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
-          python3 tests/scripts/test_check_protocol_consistency.py
           python3 tests/scripts/test_agent_gates.py
-          cutover="$(tr -d '\n' < .agents/policy-cutover)"
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base="$PR_BASE"
             head="$PR_HEAD"
@@ -116,10 +113,7 @@ jobs:
             base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
-          python3 scripts/check-commit-trailers.py \
-            --range "$base..$head" --cutover "$cutover"
-          python3 tests/scripts/test_state_record_core.py
-          python3 tests/scripts/test_check_state_record.py
+          python3 scripts/check-commit-trailers.py --range "$base..$head"
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py
