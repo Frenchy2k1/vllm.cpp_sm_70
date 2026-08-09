@@ -7,16 +7,13 @@
 // SCOPE / STUBS — stated plainly so nothing here reads as more than it is:
 //   * Blackhole is a DISCRETE PCIe device (no shared host/device address
 //     space), unlike Vulkan's W0 here (unified on its GB10 target, so its
-//     Alloc returns a directly host-dereferenceable mapped pointer). That
-//     trick does not apply here: vt::Tensor.data for this backend is plain
-//     HOST memory (identical to the CPU backend's aligned_alloc), and every
-//     registered op stages host<->device itself via ttnn::Tensor::from_vector
-//     / to_vector (hands-on validated on real Blackhole hardware — see the
-//     spec's "Resolved: hands-on spike result"). That is CORRECT — every op
-//     result is bit-for-bit what the device actually computed — but it pays a
-//     host round-trip per call; avoiding that (keeping vt::Tensor storage
-//     device-resident between ops) is exactly the deferred work the spec
-//     flags as the shipping-performance follow-up, not attempted in W0.
+//     Alloc returns a directly host-dereferenceable mapped pointer).
+//     vt::Tensor.data for this backend is still a HOST pointer (aligned_alloc)
+//     so host-staged ops (PA/RoPE/Silu) and weight load via Backend::Copy keep
+//     working. Device-resident ttnn::Tensor shadows are keyed by that host
+//     pointer in tenstorrent_ops.cpp (RegisterHostBuffer / EnsureDevice /
+//     CommitDevice) so the matmul/norm chain can skip host download+reupload
+//     between ops. UnifiedMemory() remains false — the real hardware property.
 //   * `SupportsGraphCapture()` stays FALSE. tt_metal trace capture
 //     (begin_trace_capture/end_trace_capture/replay_trace) is the eventual
 //     mapping the spec already names; not implemented here.
@@ -38,20 +35,32 @@ class TenstorrentBackend final : public Backend {
  public:
   void* Alloc(size_t bytes) override {
     VT_CHECK(bytes <= SIZE_MAX - 63, "tenstorrent alloc size overflow");
-    void* p = std::aligned_alloc(64, ((bytes + 63) / 64) * 64);
+    const size_t n = ((bytes + 63) / 64) * 64;
+    void* p = std::aligned_alloc(64, n);
     VT_CHECK(p != nullptr, "tenstorrent alloc failed");
+    RegisterHostBuffer(p, n);
     return p;
   }
-  void Free(void* p) override { std::free(p); }
-  void Memset(Queue&, void* p, int value, size_t bytes) override { std::memset(p, value, bytes); }
+  void Free(void* p) override {
+    if (p == nullptr) return;
+    UnregisterHostBuffer(p);
+    std::free(p);
+  }
+  void Memset(Queue&, void* p, int value, size_t bytes) override {
+    std::memset(p, value, bytes);
+    MarkHostWritten(p);
+  }
   void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
+    // Device-resident results leave host stale until read; materialize first.
+    EnsureHostBytes(const_cast<void*>(src));
     std::memcpy(dst, src, bytes);
+    MarkHostWritten(dst);
   }
   Queue CreateQueue() override { return Queue{Device{DeviceType::kTENSTORRENT, 0}, nullptr}; }
 
-  // See the file-level SCOPE note: vt::Tensor storage is host memory for this
-  // backend, the real device is discrete, and unified-memory-gated code paths
-  // (the op_provider.h reference tier in particular) must stay off.
+  // Discrete PCIe card — never host-dereference device pages. Host pointer +
+  // optional device shadow (ops TU) is the residency model; the CPU reference
+  // tier stays gated off.
   bool UnifiedMemory() const override { return false; }
 };
 
