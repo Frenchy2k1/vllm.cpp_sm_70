@@ -87,8 +87,13 @@ portable/reference path. In normal operation leave them unset.
 | `VT_DEVICE_KV_CACHE` | on (CUDA) | Host-side KV cache instead of the on-device one |
 | `VT_GPU_SAMPLE` | on (CUDA) | Host-side sampling instead of on-GPU sampling |
 | `VT_GDN_PACKED_DECODE` | on (CUDA GDN) | Unpacked GDN decode path |
+| `VT_GDN_DECODE_BV` | `32` (CUDA GDN decode experiment) | Exact `16` selects the byte-identical 16-value fused-recurrence tile; unset and every other spelling keep the 32-value schedule. Experimental opt-in; no release or cross-hardware default change |
+| `VT_GDN_DECODE_SWIZZLE` | `0` (CUDA GDN decode experiment) | Exact `1` enables the shared-memory bank swizzle only for the `BV=16`, `Dv=Dk=128`, eight-lane production geometry; all other values and shapes keep the incumbent layout |
+| `VT_GDN_DECODE_REGSTATE` | `0` (CUDA GDN decode experiment) | Exact `1` retains each lane's recurrence row in registers, only when the `BV=16` shared swizzle is eligible. Other geometries and spellings use the shared-state implementation |
 | `VT_CONV_REG` | on (CUDA GDN) | The non-register-tiled short causal convolution |
 | `VT_CONV_EXACT_CHUNKS` | on (CUDA GDN prefill) | Use `=0` for the legacy sequence-serial causal-conv mapping; default mirrors vLLM's exact `(sequence, 8-token chunk)` descriptor and is byte-identical |
+| `VT_CONV_CHANNEL_TILE` | `0` (CUDA GDN prefill experiment) | Exact `1` specializes the production `K=4` causal convolution with one channel per thread; exact `2` is the retained slower two-channel control. Unset, invalid, and non-`K=4` shapes use the runtime-width schedule |
+| `VT_GDN_POSTCONV_TOKEN_TILE` | `0` (CUDA GDN prefill experiment) | A non-`0` value selects the byte-identical 16-token, per-head fused post-conv schedule. It remains opt-in pending the combined K4+post-conv Pareto measurement in issue #206 |
 | `VT_MODELOPT_W4A4` | `0` (Qwen3.6 dense ModelOpt NVFP4) | ModelOpt NVFP4 checkpoints ship a per-tensor `input_scale` next to every projection. Consuming it sets `Nvfp4Weight::alpha`, which flips `IsTrueW4A4()` and routes the weight to the fp4-ACTIVATION GEMM; on `nvidia/Qwen3.6-27B-NVFP4` that produced incoherent text, so the default leaves `alpha` at 0 and takes the W4A16 weight-only dispatcher (verified coherent). Set `1` to consume `input_scale` and take the W4A4 path |
 | `VT_FA2_PREFILL` | on (CUDA) | The portable prefill attention instead of the vendored FA2 |
 | `VT_FA2_DECODE` | on (CUDA) | The portable decode attention instead of the vendored FA2 |
