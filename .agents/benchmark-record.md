@@ -18031,3 +18031,89 @@ loads 53 -> 48, shared stores 31 -> 15, barriers 2 -> 1—but global stores rose
 7 -> 18 and the timing proves lost coalescing dominates. No memory pair is
 needed after the hard timing rejection. No acceptance, default, release,
 pinned-vLLM, 27B or 35B claim changes.
+
+## 2026-08-09 — sm_120 Qwen3.5-4B combined prefill arms accepted locally; cross-engine frontend ratios void
+
+**Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206).
+The immutable measured binary was commit `84be99763bfcd8de94c7e6e2dd871e7a793348ea`
+(SHA-256 `581ea963303b37a92f838c96e5f8f828f79b0c29081c0d4d1c240606ed3fd041`).
+The fresh mutation review found that the post-conv token-tile fallback for the
+independent Q/K and V head widths was not owned by a focused test. Commit
+`23bc978f0e2c43265d858fc154d484be6e995f42` extracted the production
+eligibility predicate and added split/env/Dk/Dv fallback coverage; the fresh
+scoped mutation re-review then passed. This was a test-contract finding, not a
+token or measured-product change.
+
+The reviewed same-binary series used the standard cached Qwen3.5-4B BF16
+workload: ShareGPT SHA-256
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`,
+128 requests, 128 output tokens, c32, greedy, 2,048 batched-token cap and 1,280
+KV blocks. BASE set `VT_CONV_CHANNEL_TILE=0` and
+`VT_GDN_POSTCONV_TOKEN_TILE=0`; COMBINED set both to `1`. The order was
+`BASE-r1 -> COMBINED-r1 -> COMBINED-r2 -> BASE-r2 -> BASE-r3 -> COMBINED-r3`.
+The GPU was idle before the series (RTX 5070 Ti, driver 595.71.05, P8, 0%
+utilization, no compute application); the whole series held `/tmp/gpu`.
+
+| Arm / leg | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| BASE-r1 | 6762.97 | 747.83 | 1031.42 ms | 34.77 ms | 5447.71 ms |
+| BASE-r2 | 6775.87 | 749.26 | 1019.15 ms | 34.79 ms | 5437.30 ms |
+| BASE-r3 | 6780.66 | 749.79 | 1018.40 ms | 34.76 ms | 5433.45 ms |
+| **BASE mean** | **6773.1667** | **748.9600** | **1022.9900 ms** | **34.7733 ms** | **5439.4867 ms** |
+| COMBINED-r1 | 6820.31 | 754.17 | 1010.46 ms | 34.58 ms | 5401.67 ms |
+| COMBINED-r2 | 6823.24 | 754.49 | 1009.11 ms | 34.57 ms | 5399.32 ms |
+| COMBINED-r3 | 6821.75 | 754.33 | 1008.28 ms | 34.59 ms | 5400.59 ms |
+| **COMBINED mean** | **6821.7667** | **754.3300** | **1009.2833 ms** | **34.5800 ms** | **5400.5267 ms** |
+| **COMBINED change** | **+0.7175%** | **+0.7170%** | **-1.340%** | **-0.556%** | **-0.716%** |
+
+Every one of the six token files has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Both candidate legs beat every base leg on every enclosing timing axis, so the
+combined K=4 causal-conv plus 16-token post-conv arm is **ACCEPTED as a local,
+default-OFF opt-in**. Raw evidence is
+`/tmp/qwen35-ab-combined-84be99763/`; the six raw log hashes in arm order are
+`a776a34e...dd02`, `15858c44...5c6`, `09b42ddd...e7f`,
+`413713fb...c201`, `c1a664df...3f19`, and `6b0b1780...f214`.
+
+### TTFT attribution and the frontend mismatch
+
+A local COMBINED diagnostic produced **6816.79 tok/s**, **1010.16 ms TTFT**
+and **34.60 ms TPOT**. Across all 128 request rows, mean
+intake/queue/prefill was **196.252 / 344.389 / 469.181 ms**, summing to
+**1009.822 ms**. The pinned vLLM `555967922` diagnostic produced
+**6633.514 tok/s**, client/core TTFT **942.785 / 942.261 ms**, and TPOT
+**33.91494 ms**; its mean queue/prefill components were
+**338.960 / 449.291 ms**. vLLM's request arrival is a wall-clock timestamp
+while its event timestamps are monotonic, so the raw recorded intake delta is
+invalid. The only comparable intake inference is
+`core_ttft - queue - prefill` = **154.011 ms**. The resulting TTFT-gap
+decomposition is **42.241 ms intake + 5.429 ms queue + 19.890 ms prefill =
+67.560 ms**.
+
+Request-id waves further localize the mismatch:
+
+| IDs | local mean TTFT | pinned vLLM mean TTFT |
+|---|---:|---:|
+| 0-31 | 2104.505 ms | 1752.132 ms |
+| 32-63 | 656.106 ms | 657.784 ms |
+| 64-95 | 643.766 ms | 670.053 ms |
+| 96-127 | 634.913 ms | 689.077 ms |
+
+The source proves the frontends are not timing the same work. Local starts
+`t0` before admission and submits prompt **strings** through `AsyncLLM`, so
+tokenization is inside its measured interval
+(`examples/bench/bench_core.h:508-529`). The oracle tokenizes every prompt
+before `run_closed_loop` starts its timer and submits `TokensPrompt` IDs
+(`tools/bench/vllm_closed_loop_metrics.py:59-82,137-167`). Therefore every
+prior cross-engine **total-throughput and TTFT ratio on this harness is VOID**;
+both axes are `PENDING` a pretokenized local rerun. The local same-binary
+COMBINED A/B above remains accepted because both arms timed the same frontend.
+TPOT remains comparable and open because it begins after the first token.
+
+Diagnostic evidence hashes: local log/token
+`f7359b58...f41b` / `83fcdc45...3545`; vLLM log/metrics/splits/tokens
+`9980b7b4...7148` / `61739a24...12a` / `a46753d9...3c4` /
+`eebbb644...a38`. Roots are `/tmp/qwen35-combined-ttft-split-84be99763.*`
+and `/tmp/qwen35-vllm-ttft-split-pin.*`. The next gate pre-tokenizes every
+local prompt before `t0`, submits the existing token-ID overload, then repeats
+counterbalanced same-binary rollback and fresh local/vLLM comparisons.
