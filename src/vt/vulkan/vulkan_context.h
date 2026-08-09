@@ -205,6 +205,54 @@ class VulkanContext {
   // dropping it is likewise invisible in llvmpipe's numbers.
   uint64_t barrier_count() const;
 
+  // --- SMART BARRIERS (BACKEND-VULKAN-BARRIERS). Dispatches whose buffers do not
+  // collide with anything recorded since the last barrier get NO barrier.
+  //
+  // Barriers NOT recorded because the incoming dispatch was proven independent of
+  // everything since the previous barrier. barrier_count() + barrier_skip_count()
+  // is the dispatch count in a batched run, which is what the always-barrier arm
+  // would have recorded. This is the ONLY direct evidence that the analysis is
+  // doing anything: the two arms compute identical numbers by construction, so a
+  // value check cannot tell them apart, and neither can the wall clock when the
+  // skip rate is small.
+  uint64_t barrier_skip_count() const;
+  // Whether the hazard analysis is active (VT_VULKAN_SMART_BARRIERS, or the
+  // override below). Asked rather than re-derived from the environment, for the
+  // reason batching_enabled() exists.
+  bool smart_barriers() const;
+  // A/B LEVER over that decision, inside ONE binary. -1 forces the unconditional
+  // barrier before every dispatch (main's behaviour, byte for byte), +1 forces the
+  // hazard analysis, 0 lets VT_VULKAN_SMART_BARRIERS decide.
+  //
+  // A cross-BUILD comparison of two barrier policies is exactly the shape that
+  // produced a false 1.2x reading earlier in this campaign, and -- far worse here
+  // -- a barrier policy that drops a REAL dependency computes wrong numbers, so
+  // the correctness gate has to be able to run both arms against the same inputs
+  // in one process and compare them directly.
+  //
+  // Drains first: the analysis state describes work already recorded, so changing
+  // the policy underneath an open or in-flight batch would reason about the wrong
+  // history.
+  void set_smart_barriers_override(int v);
+  int smart_barriers_override() const { return smart_barriers_override_; }
+
+  // GPU-TIMELINE SPAN, milliseconds: summed over command buffers, the interval
+  // from the FIRST dispatch's top-of-pipe timestamp to the LAST one's
+  // bottom-of-pipe. Only collected when VT_VULKAN_DISPATCH_STATS is set, like the
+  // per-dispatch timestamps it is derived from.
+  //
+  // WHY IT IS SEPARATE FROM DispatchTimeMs. Those sum each dispatch's OWN
+  // interval; this measures the wall the GPU spent on the whole command buffer.
+  // The difference between them is the time the GPU spent BETWEEN dispatches --
+  // barrier drains and launch setup -- which is the quantity this row exists to
+  // move and which no per-shader number can show. It is also the honest metric
+  // once barriers are skipped: without a barrier between them two dispatches may
+  // OVERLAP, so their individual intervals double-count and only the span stays
+  // meaningful.
+  double gpu_span_ms() const;
+  // Command buffers the span above was accumulated over.
+  uint64_t gpu_span_batches() const;
+
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
   // silently reusing an existing one — which would look identical in the results.
@@ -349,6 +397,41 @@ class VulkanContext {
   bool batch_open_ = false;          // a command buffer is recording
   uint32_t batch_count_ = 0;         // dispatches recorded into it
   void* batch_buffers_ = nullptr;    // BufferSet*, buffers any UNRETIRED batch bound
+
+  // --- SMART BARRIERS (BACKEND-VULKAN-BARRIERS). The two halves of the access
+  // history the hazard test consults, both BufferSet*.
+  //
+  // THE INVARIANT, which is the whole correctness argument. At every point,
+  // hazard_written_ contains every buffer WRITTEN, and hazard_read_ every buffer
+  // READ, by any command recorded AFTER the most recent vkCmdPipelineBarrier this
+  // context emitted -- across command-buffer and submission boundaries, because
+  // they are cleared ONLY when a barrier is recorded and by nothing else.
+  //
+  // A dispatch is independent of that history iff none of its reads is in
+  // hazard_written_ (read-after-write), none of its writes is in hazard_written_
+  // (write-after-write) and none of its writes is in hazard_read_
+  // (write-after-read). If any of the three holds, a barrier is recorded, which
+  // by Vulkan's submission-order scope orders the dispatch after EVERY command
+  // submitted earlier on this queue -- so the sets may then be emptied and the
+  // invariant restarts. That scope is also what makes the analysis sound across
+  // the command-buffer boundary a pipelined submission creates.
+  //
+  // Both are keyed on the whole VkBuffer, never on the tensor's byte range: two
+  // tensors that share an allocation are reported as colliding even when their
+  // ranges do not, which costs a barrier and never misses one. An operand that is
+  // both read and written by the same shader lands in the WRITE set only, which is
+  // strictly stronger -- a write collides with everything a read collides with.
+  void* hazard_written_ = nullptr;
+  void* hazard_read_ = nullptr;
+  uint64_t barrier_skipped_ = 0;     // barriers the analysis proved unnecessary
+  int smart_barriers_override_ = 0;  // -1 always barrier, +1 analyse, 0 = env
+  // "The access history is not trustworthy, barrier unconditionally once." Set at
+  // construction and whenever the barrier policy changes, because the
+  // always-barrier arm deliberately does not maintain the history and an empty
+  // history must never be mistaken for an absence of hazards.
+  bool force_barrier_next_ = true;
+  uint64_t gpu_span_ns_ = 0;         // summed per-command-buffer GPU spans
+  uint64_t gpu_span_batches_ = 0;
 
   // PIPELINED SUBMISSION (BACKEND-VULKAN-HOSTDISPATCH). Ported from llama.cpp
   // `ggml_backend_vk_graph_compute` (ggml-vulkan.cpp:16192-16195 and

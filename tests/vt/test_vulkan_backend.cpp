@@ -93,6 +93,72 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   }
 }
 
+TEST_CASE("the committed SPIR-V table records each module's WRITABLE bindings") {
+  // Device-independent: a property of the checked-in artifact.
+  //
+  // WHY THIS IS THE MOST LOAD-BEARING ASSERTION IN THE FILE
+  // (BACKEND-VULKAN-BARRIERS). writable_mask is what lets the dispatch path skip
+  // a pipeline barrier, and its DANGEROUS failure mode is silent: a mask that
+  // came back all-zero would describe every binding as read-only, no dispatch
+  // would ever appear to write anything, no hazard would ever be detected, and
+  // every barrier in the batch would be dropped. That produces no error and no
+  // crash -- only wrong numbers, on real hardware, in a way a software
+  // rasterizer's effectively serial execution hides. So the mask is asserted as a
+  // STRUCTURE here rather than trusted because the numbers came out right.
+  for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
+    const auto& m = vt::vulkan::kSpirvModules[mi];
+    CAPTURE(m.name);
+    // Every compute shader in this backend produces an output. A module with NO
+    // writable binding is a reflection failure, not a legitimate shader.
+    CHECK(m.writable_mask != 0u);
+    REQUIRE(m.binding_count >= 1u);
+    // One bit per binding, and the dispatch path's stack arrays are 32 wide.
+    CHECK(m.binding_count <= 32u);
+    // No bit may be set above the declared binding count, or the mask and the
+    // dispatch's buffer array have drifted out of alignment.
+    const uint32_t above =
+        m.binding_count >= 32u ? 0u : (m.writable_mask >> m.binding_count);
+    CHECK(above == 0u);
+    // Not EVERY binding writable either: each of these shaders reads at least one
+    // operand, so an all-ones mask is the other reflection failure (it would cost
+    // barriers rather than correctness, but it would mean nothing was parsed).
+    const uint32_t all = m.binding_count >= 32u
+                             ? 0xffffffffu
+                             : ((1u << m.binding_count) - 1u);
+    CHECK(m.writable_mask != all);
+  }
+  // Spot checks against the GLSL, read directly from src/vt/vulkan/shaders. These
+  // pin the reflection to specific known-correct answers, so a generator change
+  // that starts reporting plausible-but-wrong masks fails here.
+  struct Expect { const char* name; uint32_t bindings; uint32_t mask; };
+  // vt_add.comp: A at 0/1 readonly, B at 2/3 readonly, D (out) at 4/5 writable.
+  // vt_silu_and_mul.comp: x at 0/1 readonly, out at 2/3 writable.
+  // vt_greedy_argmax.comp: logits at 0 readonly, out at 1 writable.
+  // vt_rms_norm.comp: x/weight readonly at 0..3, out at 4/5 and the in-place
+  //   residual stream at 6/7 both writable.
+  // vt_matmul_vec.comp: a/b at 0..3, out at 4/5, and the two 64-bit ALIASES of a
+  //   and b at 6/7 -- aliases of READ operands, so still read-only.
+  const Expect kExpect[] = {
+      {"vt_add", 6u, 0x30u},
+      {"vt_silu_and_mul", 4u, 0x0cu},
+      {"vt_greedy_argmax", 2u, 0x02u},
+      {"vt_rms_norm", 8u, 0xf0u},
+      {"vt_matmul_vec", 8u, 0x30u},
+  };
+  for (const auto& e : kExpect) {
+    CAPTURE(e.name);
+    bool found = false;
+    for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
+      const auto& m = vt::vulkan::kSpirvModules[mi];
+      if (std::strcmp(m.name, e.name) != 0) continue;
+      found = true;
+      CHECK(m.binding_count == e.bindings);
+      CHECK(m.writable_mask == e.mask);
+    }
+    CHECK(found);
+  }
+}
+
 TEST_CASE("the committed SPIR-V table records each module's specialization constants") {
   // Device-independent: a property of the checked-in artifact, so this also gates
   // the generator on a box with no Vulkan.
@@ -1369,6 +1435,10 @@ TEST_CASE("submission is PIPELINED: a flush does not block, and a drain retires 
   // still-executing batch; dropping it computes correct numbers on a software
   // rasterizer and races on real hardware, so it is asserted by count and not by
   // value.
+  //
+  // The hazard analysis reaches the SAME count on this loop rather than being
+  // excused from it: every iteration rewrites `to`, which is a write-after-write
+  // against the previous iteration, so each one is a genuine dependency.
   CHECK(ctx.barrier_count() - barriers0 == static_cast<uint64_t>(slice) + 1u);
 
   // THE SLICES PARTITION THE RING. Without this a mutation collapsing every slot
@@ -1442,6 +1512,197 @@ TEST_CASE("submission is PIPELINED: a flush does not block, and a drain retires 
   vk.Free(da);
   vk.Free(db);
   vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
+// A scoped restore for the barrier-policy lever, so a failing assertion inside a
+// case below cannot leave the whole rest of the file running under a policy it
+// did not ask for.
+namespace {
+class SmartBarrierArm {
+ public:
+  explicit SmartBarrierArm(int v) : prev_(vt::vulkan::VulkanContext::Get().smart_barriers_override()) {
+    vt::vulkan::VulkanContext::Get().set_smart_barriers_override(v);
+  }
+  ~SmartBarrierArm() { vt::vulkan::VulkanContext::Get().set_smart_barriers_override(prev_); }
+  SmartBarrierArm(const SmartBarrierArm&) = delete;
+  SmartBarrierArm& operator=(const SmartBarrierArm&) = delete;
+
+ private:
+  int prev_;
+};
+}  // namespace
+
+TEST_CASE("SMART BARRIERS: a real hazard barriers, a proven-independent pair does not") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  if (!ctx.batching_enabled()) return;  // no barriers are recorded at all without it
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // WHY THIS GATE EXISTS (BACKEND-VULKAN-BARRIERS), AND WHY IT ASSERTS COUNTERS.
+  // Skipping a barrier changes NO number when it is correct and changes numbers
+  // only on real hardware when it is wrong -- a software rasterizer runs the
+  // dispatches serially enough to hide a dropped dependency, which is how this
+  // backend's fence-spin arm passed 33/33 on llvmpipe while producing "the the
+  // capital capital of of" on GB10. So the mechanism is asserted directly: the
+  // pairs below are constructed so that the CORRECT number of barriers is known
+  // in advance from the dependency structure alone, and any predicate that stops
+  // detecting hazards moves that number.
+  constexpr int64_t kN = 1024;
+  const size_t bytes = static_cast<size_t>(kN) * sizeof(float);
+  std::vector<float> a(static_cast<size_t>(kN), 1.5f), b(static_cast<size_t>(kN), 2.25f);
+  // FIVE SEPARATE ALLOCATIONS, which is what makes the independence real: this
+  // backend gives every allocation its own VkBuffer and its own VkDeviceMemory,
+  // so distinct pointers here cannot alias and "different buffer" is a fact
+  // rather than an assumption about offsets.
+  void* da = vk.Alloc(bytes);
+  void* db = vk.Alloc(bytes);
+  void* d1 = vk.Alloc(bytes);
+  void* d2 = vk.Alloc(bytes);
+  void* d3 = vk.Alloc(bytes);
+  vk.Copy(q, da, a.data(), bytes);
+  vk.Copy(q, db, b.data(), bytes);
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {kN});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {kN});
+  Tensor t1 = Tensor::Contiguous(d1, vt::DType::kF32, d, {kN});
+  Tensor t2 = Tensor::Contiguous(d2, vt::DType::kF32, d, {kN});
+  Tensor t3 = Tensor::Contiguous(d3, vt::DType::kF32, d, {kN});
+
+  // vt_add reads both inputs and writes the output -- the writable mask asserted
+  // by the SPIR-V table case above -- so the five dispatches below have exactly
+  // one dependency structure and it is visible by inspection.
+  //
+  //   d0  t1 <- a + b      (the policy switch forces this one to barrier)
+  //   d1  t2 <- a + b      INDEPENDENT of d0: shares only the READ operands
+  //   d2  t3 <- t1 + b     READ-AFTER-WRITE on t1
+  //   d3  t1 <- a + b      WRITE-AFTER-READ on t1 (d2 read it)
+  //   d4  t1 <- a + b      WRITE-AFTER-WRITE on t1 (d3 wrote it)
+  //
+  // So: 4 barriers and exactly 1 skip. Each of the three hazard KINDS appears
+  // once, because a predicate that only implements read-after-write is a real
+  // and plausible mistake that produces correct numbers most of the time.
+  SUBCASE("the analysis skips exactly the independent pair") {
+    SmartBarrierArm arm(+1);
+    REQUIRE(ctx.smart_barriers());
+    const uint64_t barriers0 = ctx.barrier_count();
+    const uint64_t skips0 = ctx.barrier_skip_count();
+
+    vt::Add(q, t1, ta, tb);
+    vt::Add(q, t2, ta, tb);
+    vt::Add(q, t3, t1, tb);
+    vt::Add(q, t1, ta, tb);
+    vt::Add(q, t1, ta, tb);
+
+    const uint64_t barriers = ctx.barrier_count() - barriers0;
+    const uint64_t skips = ctx.barrier_skip_count() - skips0;
+    CAPTURE(barriers);
+    CAPTURE(skips);
+    // THE MUTATION TARGET. Forcing the hazard predicate to report "independent"
+    // takes this to 1 and 4 (only the policy-switch barrier survives); dropping
+    // the write-after-read half alone takes it to 3 and 2. Neither changes any
+    // value this file checks.
+    CHECK(barriers == 4u);
+    CHECK(skips == 1u);
+    // Every dispatch is accounted for exactly once.
+    CHECK(barriers + skips == 5u);
+    vk.Synchronize(q);
+  }
+
+  // THE CONTROL ARM, in the SAME BINARY. The two arms run the same kernels in the
+  // same order on the same inputs, so a cross-BUILD comparison could not tell
+  // them apart at all -- and this campaign has already been given a false 1.2x by
+  // exactly that shape. Here the lever is proven to MOVE.
+  SUBCASE("the always-barrier arm records one per dispatch and skips none") {
+    SmartBarrierArm arm(-1);
+    REQUIRE(!ctx.smart_barriers());
+    const uint64_t barriers0 = ctx.barrier_count();
+    const uint64_t skips0 = ctx.barrier_skip_count();
+
+    vt::Add(q, t1, ta, tb);
+    vt::Add(q, t2, ta, tb);
+    vt::Add(q, t3, t1, tb);
+    vt::Add(q, t1, ta, tb);
+    vt::Add(q, t1, ta, tb);
+
+    CHECK(ctx.barrier_count() - barriers0 == 5u);
+    CHECK(ctx.barrier_skip_count() - skips0 == 0u);
+    vk.Synchronize(q);
+  }
+
+  // A DEPENDENT CHAIN LONG ENOUGH TO CROSS SEVERAL COMMAND BUFFERS, with the
+  // analysis on. This is the value half, and it is the half only real hardware
+  // can fail: each step must observe exactly its predecessor's output, and the
+  // chain wraps the slot rotation repeatedly so the dependency has to survive the
+  // command-buffer boundary that a pipelined submission creates.
+  SUBCASE("a long dependent chain is still exact with the analysis on") {
+    SmartBarrierArm arm(+1);
+    const uint32_t steps = ctx.ring_slice() * (ctx.in_flight_limit() + 1) * 2 + 3;
+    CAPTURE(steps);
+    std::vector<float> zero(static_cast<size_t>(kN), 0.0f), one(static_cast<size_t>(kN), 1.0f);
+    vk.Copy(q, d1, zero.data(), bytes);
+    vk.Copy(q, db, one.data(), bytes);
+    vk.Synchronize(q);
+    const uint64_t barriers0 = ctx.barrier_count();
+    for (uint32_t i = 0; i < steps; ++i) vt::Add(q, t1, t1, tb);
+    // Every step is a read-after-write AND a write-after-write on t1, so the
+    // analysis must find a hazard at every single one. A chain like this is
+    // exactly where a dropped barrier turns into a wrong number.
+    CHECK(ctx.barrier_count() - barriers0 == static_cast<uint64_t>(steps));
+    std::vector<float> got(static_cast<size_t>(kN), -1.0f);
+    vk.Copy(q, got.data(), d1, bytes);
+    vk.Synchronize(q);
+    for (int64_t i = 0; i < kN; i += 128) {
+      CAPTURE(i);
+      CHECK(got[static_cast<size_t>(i)] == doctest::Approx(static_cast<float>(steps)));
+    }
+  }
+
+  // INDEPENDENT WRITES FOLLOWED BY A READER. The writes may all skip; the reader
+  // must not, and its value proves the skipped ones really did complete. This is
+  // the pattern the decode step would actually exploit -- several projections off
+  // one normalized activation, then a consumer -- so it is checked for VALUE and
+  // not only for counts.
+  SUBCASE("independent writers then a consumer: the consumer barriers, values hold") {
+    SmartBarrierArm arm(+1);
+    std::vector<float> three(static_cast<size_t>(kN), 3.0f);
+    vk.Copy(q, da, a.data(), bytes);
+    vk.Copy(q, db, three.data(), bytes);
+    vk.Synchronize(q);
+    // Re-assert the policy to force the history to a KNOWN state: the setter
+    // drains and marks the next dispatch as unconditionally barriered, so the
+    // dispatch below clears the access sets and the counts that follow start from
+    // a history containing exactly it. Without this the sets would still carry
+    // whatever an earlier subcase left, and t2/t3 could look written.
+    ctx.set_smart_barriers_override(+1);
+    vt::Add(q, t1, ta, tb);
+    const uint64_t barriers0 = ctx.barrier_count();
+    const uint64_t skips0 = ctx.barrier_skip_count();
+    vt::Add(q, t2, ta, tb);   // independent of t1: skip
+    vt::Add(q, t3, ta, tb);   // independent of both: skip
+    vt::Add(q, t1, t2, t3);   // reads t2 AND t3: read-after-write, barrier
+    CHECK(ctx.barrier_count() - barriers0 == 1u);
+    CHECK(ctx.barrier_skip_count() - skips0 == 2u);
+    std::vector<float> got(static_cast<size_t>(kN), -1.0f);
+    vk.Copy(q, got.data(), d1, bytes);
+    vk.Synchronize(q);
+    // t2 = t3 = 1.5 + 3.0 = 4.5, so t1 = 9.0. A dropped barrier before the
+    // consumer reads whatever t2/t3 held before -- which on this box is the 4.5
+    // of an earlier subcase or uninitialised memory, either way not 9.0.
+    for (int64_t i = 0; i < kN; i += 128) {
+      CAPTURE(i);
+      CHECK(got[static_cast<size_t>(i)] == doctest::Approx(9.0f));
+    }
+  }
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(d1);
+  vk.Free(d2);
+  vk.Free(d3);
   vk.DestroyQueue(q);
 }
 
