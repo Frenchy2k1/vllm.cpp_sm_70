@@ -243,6 +243,16 @@ class ReleaseArchiveContract(unittest.TestCase):
         )
         self.assertTrue(any("literal-static" in error for error in errors), errors)
 
+    def test_static_ldd_wording_covers_gnu_and_musl(self) -> None:
+        for output in (
+            "not a dynamic executable\n",
+            "statically linked\n",
+            "/lib/ld-musl-x86_64.so.1: ./vllm-server: Not a valid dynamic program\n",
+        ):
+            with self.subTest(output=output):
+                self.assertTrue(self.tool.ldd_reports_static(output))
+        self.assertFalse(self.tool.ldd_reports_static("libc.so.6 => /lib/libc.so.6\n"))
+
     def test_large_file_scanner_catches_a_credential_across_chunk_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "large-binary"
