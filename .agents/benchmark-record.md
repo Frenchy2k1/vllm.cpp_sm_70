@@ -16177,3 +16177,16 @@ the ~30 flushes/token. The declines name exactly three ops: `kCausalConv1dFwd`
 (op 5, prefill only), `kRopeCosSinCache` (op 66) and `kAttnQkNormRopeGate`
 (op 67). The last two run per full-attention layer, 16 per token, and are the
 next lever; they are kernel work, not plumbing.
+
+## Rolled out of the scoreboard on 2026-08-09
+
+Moved verbatim from `docs/BENCHMARKS.md` by `scripts/roll-benchmark-record.py`. Nothing edited or deleted.
+
+## 2026-08-08 — Gemma4 FP8 stream lab (gfx1201 R9700)
+
+| Path | Warm tok/s | Notes |
+|------|------------|--------|
+| vllm-cli Paris HIP=0 stream experts | ~38 | `--repeat` after cold expert fill |
+| server `/v1/completions` | ~38 | exclusive |
+| server `/v1/chat` thinking off | ~32 | after expert cache |
+| llama.cpp Vulkan Q8 tg128 (bar) | ~98 | separate stack |

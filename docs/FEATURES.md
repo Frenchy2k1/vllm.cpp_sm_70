@@ -215,11 +215,11 @@ kernels for it.
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact, 6/6
 prompts / 96/96 tokens vs the vLLM 0.25.0 oracle, all nine of that model's ops
 dispatched natively with **zero provider declines**. Qwen3.6-27B runs too, both
-GDN recurrences native and the GDN state cache read and written IN PLACE rather
-than gathered to a host copy per layer per token: **decode 3.93 tok/s against
-llama.cpp Vulkan's 4.35, prefill 21.5x** (GB10). Still partial at 24 native
-kernels plus 8 GDN, the rest on the portable CPU tier (decode still pays for
-`kRopeCosSinCache` and `kAttnQkNormRopeGate`); quant/MoE/MLA have none at all.
+GDN recurrences and the fused attention preamble native, its GDN state cache read
+and written IN PLACE: **decode 4.13 tok/s against llama.cpp Vulkan's 4.35,
+prefill 21.5x** (GB10). Still partial at 25 native kernels plus 8 GDN, the rest
+on the portable CPU tier (decode's one remaining host op, `kRopeCosSinCache`,
+mirrors vLLM's own split and stays there); quant/MoE/MLA have none at all.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations

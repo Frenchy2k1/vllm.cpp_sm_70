@@ -215,6 +215,12 @@ struct GdnPostConvParams {
   uint32_t g_off, beta_off, alog_off, dtb_off;
   float eps;
 };
+// The fused full-attention preamble (BACKEND-VULKAN-QKNORM).
+struct AttnQkNormRopeGateParams {
+  uint32_t hq, hkv, dh, rot, half_dim, qgate_rs, kf_rs, gemma;
+  uint32_t qg_off, kf_off, qo_off, ko_off, go_off, qn_off, kn_off, cs_off;
+  float eps;
+};
 // ONE block for BOTH recurrences: vt_gdn_prefill and vt_gdn_decode share their
 // step body through an include, so they must also share their push layout. The
 // prefill shader ignores has_idx / n_state_rows (they are the decode state-row
@@ -244,6 +250,8 @@ static_assert(sizeof(RmsNormGatedParams) <= 128,
 static_assert(sizeof(GdnStateGatherParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(GdnRecurrenceParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(AttnQkNormRopeGateParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
@@ -1308,6 +1316,71 @@ void GdnDecodeKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
   Go("vt_gdn_decode", bind, p, static_cast<uint32_t>(batch * hv * p.nv), spec, 2);
 }
 
+// ---------------------------------------------------------------------------
+// The FUSED FULL-ATTENTION PREAMBLE (BACKEND-VULKAN-QKNORM).
+//
+// WHY THIS OP AND NOT ANOTHER. With the GDN family native, a 27B decode step was
+// MEASURED at ~30 command-buffer flushes per token of which ~28 were
+// reference-tier: op_provider.cpp drains the whole recorded batch (submit +
+// blocking fence) before it can hand a host kernel device memory, so every
+// reference-tier op costs a full round trip regardless of how little arithmetic
+// it does. The declines named exactly three ops, and only this one runs in
+// DECODE on every step: kCausalConv1dFwd is prefill-only and kRopeCosSinCache is
+// deliberately host-side (the double-precision table; see vt_rope_from_cache.comp).
+// Qwen3.6-27B has 64 layers of which 48 are linear-attention, so this fires 16
+// times per token.
+//
+// NO DECLINE PATH. Every dtype the op contract admits (ops.cpp:1524-1541) is a
+// specialization axis here, the packed row strides are read from stride[0], and
+// rotary_dim < Dh is the ordinary case rather than a special one — so there is no
+// shape this kernel has to hand back. cpu_ops.cpp:956-1010 is the oracle.
+void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                              const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                              const Tensor& k_norm, const Tensor& cos_sin,
+                              const RmsNormArgs& na, const RopeArgs& ra) {
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  const int64_t hkv = k_out.shape[1];
+  if (t == 0 || hq + hkv == 0 || dh == 0) return;
+  Binder bind;
+  // Binding order IS the descriptor order: the shader declares qgate, kf, then
+  // the three outputs as dtype-erased PAIRS, then the three f32-by-contract
+  // operands as single bindings.
+  const uint32_t qg_off = bind.Add(qgate, "attn_qk_norm_rope_gate: qgate");
+  const uint32_t kf_off = bind.Add(kf, "attn_qk_norm_rope_gate: kf");
+  const uint32_t qo_off = bind.Add(q_out, "attn_qk_norm_rope_gate: q_out");
+  const uint32_t ko_off = bind.Add(k_out, "attn_qk_norm_rope_gate: k_out");
+  const uint32_t go_off = bind.Add(gate_out, "attn_qk_norm_rope_gate: gate_out");
+  const uint32_t qn_off = bind.AddU32Only(q_norm, "attn_qk_norm_rope_gate: q_norm");
+  const uint32_t kn_off = bind.AddU32Only(k_norm, "attn_qk_norm_rope_gate: k_norm");
+  const uint32_t cs_off = bind.AddU32Only(cos_sin, "attn_qk_norm_rope_gate: cos_sin");
+  // Ascending constantID order: the shared qgate/kf dtype, the shared q/k out
+  // dtype, the gate out dtype (its own axis — the FA-2 prefill combo keeps the
+  // gate f32 while q/k are bf16).
+  const uint32_t spec[3] = {DtypeCode(qgate.dtype), DtypeCode(q_out.dtype),
+                            DtypeCode(gate_out.dtype)};
+  AttnQkNormRopeGateParams p{static_cast<uint32_t>(hq),
+                             static_cast<uint32_t>(hkv),
+                             static_cast<uint32_t>(dh),
+                             static_cast<uint32_t>(ra.rotary_dim),
+                             static_cast<uint32_t>(ra.rotary_dim / 2),
+                             static_cast<uint32_t>(qgate.stride[0]),
+                             static_cast<uint32_t>(kf.stride[0]),
+                             na.gemma ? 1u : 0u,
+                             qg_off,
+                             kf_off,
+                             qo_off,
+                             ko_off,
+                             go_off,
+                             qn_off,
+                             kn_off,
+                             cs_off,
+                             na.eps};
+  // ONE WORKGROUP PER (token, head) over Hq + Hkv slots — CUDA's dim3(t, hq+hkv)
+  // grid (cuda_ops.cu:1394) flattened. NOT FlatGroupCount: the workgroup
+  // tree-reduces one head row's mean square.
+  Go("vt_attn_qk_norm_rope_gate", bind, p, static_cast<uint32_t>(t * (hq + hkv)), spec, 3);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -1370,6 +1443,11 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
+    // BACKEND-VULKAN-QKNORM: the fused full-attention preamble, the last
+    // per-decode-step reference-tier op on the 27B.
+    RegisterOp(
+        OpId::kAttnQkNormRopeGate, DeviceType::kVULKAN,
+        reinterpret_cast<void*>(static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernel)));
   }
 } registrar;
 
