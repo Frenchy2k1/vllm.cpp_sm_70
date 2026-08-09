@@ -245,6 +245,21 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_eng_docs_site_is_credited_for_real_commands(self):
+        # ENG-DOCS-SITE joined the runnable population on arrival rather than
+        # being parked as gates-no-command, so the credit has to be earned by
+        # the spec actually naming commands that can fail. Pin that: the row is
+        # runnable AND its Gates section carries the two that do the work. A
+        # spec rewritten into prose gates goes red here rather than silently
+        # keeping a credit it no longer deserves.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-DOCS-SITE"), "runnable")
+
+        spec = ROOT / ".agents" / "specs" / "gh-pages-docs-site.md"
+        body = spec.read_text(encoding="utf-8")
+        self.assertIn("python3 scripts/check-site.py", body)
+        self.assertIn("hugo --minify -s website", body)
+
     def test_a_row_that_loses_its_command_is_refused(self):
         # Still present, still gated, no longer runnable -- a real regression.
         victim = sorted(gates.RUNNABLE_BASELINE)[0]
