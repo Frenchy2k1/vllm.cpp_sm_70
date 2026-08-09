@@ -1318,6 +1318,8 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 ## Backend detail
 
+Gemma4 ROCm fused helpers route through the portable `include/vt/fused_ops.h` seam rather than calling `vt::rocm::*` from model files; ROCm fast path under `VLLM_CPP_HIP`, non-HIP stubs for peer/pin/resident upload, `check-device-leakage` at baseline (#154).
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`
@@ -2215,11 +2217,3 @@ and outside this repo.
 **Agent onboarding:** [session](../.agents/specs/session-onboarding.md) +
 [entry](../.agents/specs/developer-agent-protocol-entrypoint.md) implemented;
 documentation-only.
-
-## 2026-08-08 — Gemma4 ROCm fused helpers via portable vt:: seam (#154)
-
-Model files (`gemma4.cpp`, `gemma4_moe.cpp`) no longer call `vt::rocm::*` directly.
-Fused paths go through `include/vt/fused_ops.h` (`vt::RmsNormPlusAdd`,
-`DualRmsNormPlusRes`, `GeluMulSeparate`, `MatmulBTAlphaBeta`, `MatmulBTFp8Channel`,
-`ExpertGeGLUBf16TopKM1`). ROCm fast path under `VLLM_CPP_HIP`; non-HIP stubs for
-peer/pin/resident upload. `check-device-leakage` holds baseline.
