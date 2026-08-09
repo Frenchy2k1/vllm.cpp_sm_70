@@ -18,6 +18,9 @@ TIER_ENV = (
     "VT_CPU_QUANT_MMLA",
     "VT_CPU_QUANT_REPACK",
 )
+MATMUL_GATE_ARG = (
+    "--test-case=elementwise CPU GEMM: row-strided activation stays bit-exact"
+)
 
 
 class GateError(RuntimeError):
@@ -29,7 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", choices=("x86_64", "aarch64"), required=True)
     parser.add_argument("--tests-dir", type=Path, required=True)
     parser.add_argument("--poor-emulator", type=Path, required=True)
-    parser.add_argument("--rich-emulator", type=Path)
+    parser.add_argument("--rich-runner", type=Path)
+    parser.add_argument("--rich-runner-kind", choices=("qemu", "intel-sde"))
     parser.add_argument("--rich-cpu", default="max")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--evidence-url", required=True)
@@ -43,22 +47,32 @@ def executable(tests_dir: Path, name: str) -> Path:
     return path
 
 
-def display_command(prefix: list[str], env_values: dict[str, str], binary: Path) -> str:
+def test_args(binary: Path, targeted: bool) -> list[str]:
+    return [MATMUL_GATE_ARG] if targeted and binary.name == "test_ops_matmul_elem" else []
+
+
+def display_command(
+    prefix: list[str], env_values: dict[str, str], binary: Path, targeted: bool
+) -> str:
     assignments = " ".join(f"{name}={shlex.quote(value)}" for name, value in env_values.items())
-    command = shlex.join([*prefix, str(binary)])
+    command = shlex.join([*prefix, str(binary), *test_args(binary, targeted)])
     return f"{assignments} {command}".strip()
 
 
 def run_command(
-    prefix: list[str], env_values: dict[str, str], binary: Path, expect_failure: bool = False
+    prefix: list[str],
+    env_values: dict[str, str],
+    binary: Path,
+    expect_failure: bool = False,
+    targeted: bool = False,
 ) -> tuple[str, str]:
-    command = display_command(prefix, env_values, binary)
+    command = display_command(prefix, env_values, binary, targeted)
     environment = os.environ.copy()
     for name in TIER_ENV:
         environment.pop(name, None)
     environment.update(env_values)
     result = subprocess.run(
-        [*prefix, str(binary)],
+        [*prefix, str(binary), *test_args(binary, targeted)],
         env=environment,
         text=True,
         stdout=subprocess.PIPE,
@@ -100,11 +114,16 @@ def run_group(
 def gate(args: argparse.Namespace) -> dict[str, object]:
     tests_dir = args.tests_dir.resolve()
     matmul = executable(tests_dir, "test_ops_matmul_elem")
-    rich_prefix = (
-        [str(args.rich_emulator.resolve()), "-cpu", args.rich_cpu]
-        if args.rich_emulator is not None
-        else []
-    )
+    if (args.rich_runner is None) != (args.rich_runner_kind is None):
+        raise GateError("rich runner and kind must be provided together")
+    rich_prefix: list[str] = []
+    if args.rich_runner is not None:
+        rich_runner = str(args.rich_runner.resolve())
+        rich_prefix = (
+            [rich_runner, "-cpu", args.rich_cpu]
+            if args.rich_runner_kind == "qemu"
+            else [rich_runner, "-skx", "--"]
+        )
     poor_model = "Nehalem" if args.arch == "x86_64" else "cortex-a53"
     poor_prefix = [str(args.poor_emulator.resolve()), "-cpu", poor_model]
     tiers: dict[str, dict[str, str]] = {}
@@ -124,13 +143,15 @@ def gate(args: argparse.Namespace) -> dict[str, object]:
             {"VT_CPU_MATMUL_TIER": "portable"},
             {"VT_CPU_MATMUL_TIER": "sse2"},
         ):
-            command, _ = run_command(poor_prefix, env_values, matmul)
+            command, _ = run_command(poor_prefix, env_values, matmul, targeted=True)
             commands.append(command)
         for env_values in (
             {"VT_CPU_MATMUL_TIER": "sse2+f16c"},
             {"VT_CPU_MATMUL_TIER": "avx2"},
         ):
-            command, _ = run_command(poor_prefix, env_values, matmul, expect_failure=True)
+            command, _ = run_command(
+                poor_prefix, env_values, matmul, expect_failure=True, targeted=True
+            )
             commands.append(command)
         selected_tier = "avx512f"
     else:
@@ -168,7 +189,7 @@ def gate(args: argparse.Namespace) -> dict[str, object]:
             ({"VT_CPU_QUANT_REPACK": "portable"}, quant_repack),
         )
         for env_values, binary in poor_pass:
-            command, _ = run_command(poor_prefix, env_values, binary)
+            command, _ = run_command(poor_prefix, env_values, binary, targeted=True)
             commands.append(command)
         poor_refuse = (
             ({"VT_CPU_Q8_DOT": "sdot"}, quant_dot),
@@ -176,7 +197,9 @@ def gate(args: argparse.Namespace) -> dict[str, object]:
             ({"VT_CPU_QUANT_REPACK": "i8mm"}, quant_repack),
         )
         for env_values, binary in poor_refuse:
-            command, _ = run_command(poor_prefix, env_values, binary, expect_failure=True)
+            command, _ = run_command(
+                poor_prefix, env_values, binary, expect_failure=True, targeted=True
+            )
             commands.append(command)
         selected_tier = "i8mm"
 
