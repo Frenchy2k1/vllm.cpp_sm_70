@@ -392,6 +392,8 @@ VulkanContext::VulkanContext() {
   denorm_preserve_f32_ = fc.shaderDenormPreserveFloat32 == VK_TRUE;
   sz_inf_nan_preserve_f32_ = fc.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
   max_workgroup_count_x_ = props2.properties.limits.maxComputeWorkGroupCount[0];
+  max_workgroup_invocations_ = props2.properties.limits.maxComputeWorkGroupInvocations;
+  max_workgroup_size_x_ = props2.properties.limits.maxComputeWorkGroupSize[0];
   // GPU TIMESTAMP SUPPORT, probed rather than assumed. `timestampPeriod` is
   // nanoseconds per tick; a device reporting 0 cannot timestamp at all, and
   // `timestampComputeAndGraphics == VK_FALSE` means the compute queue family may
@@ -440,6 +442,35 @@ VulkanContext::VulkanContext() {
   sprops.pNext = &sub;
   Api().vkGetPhysicalDeviceProperties2(probe.physical_device, &sprops);
   subgroup_size_ = sub.subgroupSize;
+
+  // --- SUBGROUP REDUCTION / WIDE REDUCING WORKGROUPS (VK-RMSNORM).
+  //
+  // Both feature bits are asked for IN THE COMPUTE STAGE. `supportedOperations`
+  // alone is not enough: a device may expose arithmetic subgroup operations for
+  // fragment shaders and not for compute, and a module built on subgroupAdd is
+  // then invalid in exactly the stage we use. There is no VkResult that reports
+  // this -- an unsupported capability is undefined behaviour at pipeline
+  // creation, not an error code -- so the probe is the only guard there is.
+  //
+  // No extension has to be REQUESTED for either: subgroup basic and arithmetic
+  // are core Vulkan 1.1 features, and 1.1 is already this backend's floor.
+  subgroup_arithmetic_compute_ =
+      (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+      (sub.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0 &&
+      (sub.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+  wide_reduce_ = subgroup_arithmetic_compute_ && subgroup_size_ > 0 &&
+                 max_workgroup_invocations_ >= kWideWorkgroupSize &&
+                 max_workgroup_size_x_ >= kWideWorkgroupSize;
+  if (const char* v = std::getenv("VT_VULKAN_RMSNORM"); v != nullptr) {
+    if (std::strcmp(v, "base") == 0) {
+      rms_norm_override_ = -1;
+    } else if (std::strcmp(v, "wide") == 0) {
+      VT_CHECK(wide_reduce_,
+               "vulkan: VT_VULKAN_RMSNORM=wide but this device does not support "
+               "1024-invocation workgroups with compute subgroup arithmetic");
+      rms_norm_override_ = 1;
+    }
+  }
 
   if (has_coopmat_ext && has_bf16_ext &&
       HasBf16F32CoopMatConfig(probe.physical_device) && subgroup_size_ > 0) {

@@ -327,6 +327,155 @@ the umbrella, not a substitute for them.
 | **VK-H** | **Attention variants + samplers** (16 ops) | B (samplers), G (attn variants) | **83/83 — closes the op surface** |
 | **VK-I** | **AMD/RDNA (or Arc) bring-up** | hardware acquisition | The staging path for non-host-visible memory, and the gate re-run where Vulkan actually matters |
 
+### 6.0b `VK-G` partial: RMSNorm was OCCUPANCY-BOUND, not reduction-bound — 2026-08-09
+
+`row/BACKEND-VULKAN-RMSNORM`. `vt_rms_norm` gets a second SPIR-V module,
+`vt_rms_norm_wide`, at 1024 invocations with a subgroup reduction, chosen by
+device capability. Module count 25 -> 26. No op changes tier, no dispatch count
+changes, no flush tally changes: **the only thing that moves is which SPIR-V the
+same 129 dispatches per token bind.**
+
+**THE MECHANISM, AND HOW IT WAS ESTABLISHED.** The starting observation was that
+`vt_rms_norm` cost `0.0611` ms/call — roughly TEN TIMES `vt_silu_and_mul`
+(`0.0047`), `vt_gdn_post_conv` (`0.0063`) and, most pointedly,
+`vt_rms_norm_gated` (`0.0055`), which performs the SAME workgroup tree reduction.
+It reads about 20 KB, which at the GB10 roof of 273 GB/s is well under a
+microsecond, so essentially all of it was overhead. The natural suspect was the
+reduction — `vt_tg_sum` halves over 128 lanes through shared memory with a
+`barrier()` at every step. **That suspect is wrong, and the gated kernel is the
+clue that says so.**
+
+What was actually measured, by printing each distinct (shader, workgroup count,
+push constants) triple once from `VulkanContext::Dispatch`:
+
+| dispatch, decode step (t = 1) | workgroups | elements | ms/call |
+|---|---:|---:|---:|
+| `vt_rms_norm` | **1** | 5,120 (h) | 0.0611 |
+| `vt_rms_norm_gated` | **48** | 6,144 (48 x 128) | 0.0055 |
+
+`vt::RmsNorm` dispatches ONE WORKGROUP PER ROW (`vulkan_ops.cpp`,
+`Go("vt_rms_norm", …, groups = t)`), and a batch-1 decode step has exactly one
+row. So the kernel ran 128 invocations — four warps of ONE streaming
+multiprocessor — over a 5,120-wide row, 40 strided iterations per lane, while the
+rest of the GPU idled. The gated kernel reduces identically and is 11x cheaper
+purely because its rows are heads, so it gets 48 workgroups for the same amount
+of data. **The reduction was never the difference; the OCCUPANCY was.**
+
+The decisive confirmation needs no code change at all. In the SAME run the SAME
+shader also serves PREFILL, where `t = 32` gives it 32 workgroups and 32x the
+data:
+
+| `vt_rms_norm`, one run | workgroups | elements/call | ms/call |
+|---|---:|---:|---:|
+| decode | 1 | 5,120 | 0.0611 |
+| prefill | 32 | 163,840 | **0.066** |
+
+32x the work for 8% more time is not a kernel doing work, it is a kernel waiting.
+(Derived twice, from the output-len 4 and output-len 36 runs independently:
+0.0663 and 0.0659 ms/call.)
+
+**WHAT WAS PORTED.** llama.cpp reaches the same conclusion by two routes at pin
+`237ad9b96`: `vulkan-shaders/rms_norm.comp:33` runs `BLOCK_SIZE 512` rather than
+the guaranteed-portable 128, and `vulkan-shaders/rms_norm_partials.comp` exists
+solely to spread a SINGLE row across many workgroups when the row count cannot —
+including the `subgroupAdd` reduction at `rms_norm_partials.comp:41-47` that
+`vt_common.glsl`'s new `VT_SUBGROUP_REDUCE` path transcribes. Widening the
+workgroup is the half of that which needs no second dispatch and no
+cross-workgroup hand-off, so it is what this row does; the partials split stays
+available as a later lever.
+
+**MEASURED, GB10, Qwen3.6-27B bf16, Vulkan, 1 prompt, 32-in, c1.** Two-length
+GPU-timestamp diff (output-len 36 minus output-len 4, over 32 tokens, so prefill
+and one-time costs cancel), both arms from ONE binary via `VT_VULKAN_RMSNORM`:
+
+| per decoded token | 128-wide | 1024-wide + subgroup |
+|---|---:|---:|
+| RmsNorm dispatches | 129 | 129 |
+| RmsNorm ms/call | 0.0607 | **0.0123** |
+| RmsNorm ms/token | 7.85 | **1.59** |
+| GPU dispatches, all shaders | 32,544 | 32,544 |
+| command-buffer flushes | 191 | 191 |
+| reference-tier declines | 2 | 2 |
+
+**4.9x on the kernel, 6.3 ms/token off a ~240 ms budget (~2.6%).**
+
+**WIDTH AND SUBGROUP, ATTRIBUTED SEPARATELY**, because "1024 lanes plus a
+subgroup reduction is 4.9x" is two changes and one number. A third module at 1024
+lanes with the PLAIN halving tree was built and A/B'd against the other two in
+one binary (scratch only, never committed), controls matched to within 0.4% on
+`vt_matmul_vec`:
+
+| RmsNorm arm | ms/call | ms/token |
+|---|---:|---:|
+| 128 lanes, tree | 0.0607 | 7.85 |
+| 1024 lanes, tree | 0.0142 | 1.83 |
+| 1024 lanes, subgroup | **0.0123** | **1.58** |
+
+**The WIDTH is 4.3x of it and the SUBGROUP is the remaining 1.15x** (0.25
+ms/token, ~13% of what is left of the kernel). Both are real and both are kept,
+but the record must not let the subgroup reduction take credit for the width: the
+earlier campaign result that a subgroup reduction was a 4/8 wash in the GEMV is
+NOT overturned here, it is simply a different regime, and even in a kernel that is
+almost nothing but a reduction it is worth 1.15x rather than 5x.
+
+**WHAT DID NOT WORK, recorded because it was the leading hypothesis.** The
+residual path stored the summed value and RE-READ it from memory to pick up the
+bf16 rounding (`cpu_ops.cpp:235-237`'s idiom), which puts a store->load dependency
+on the same address in every one of the 40 iterations. Replacing it with
+`vt_round_through` — the same rounding as a pure register function, bit-identical
+by construction — moved `vt_rms_norm` from `0.0611` to `0.0607` ms/call at 128
+lanes. **Within noise: the memory round trip was not the cost.** It is kept
+anyway because it is free, it deletes a `memoryBarrierBuffer()`, and it is what
+leaves the wide module's inner loop dependency-free — but it is not the lever and
+must not be recorded as one.
+
+**Correctness.** NMSE vs the CPU oracle in the same binary on the GB10 NVIDIA
+driver, at the decode shape (t=1, h=5120): `7.02e-15` without a residual,
+`1.95e-12` with one, against the `5e-4` bar this backend's reducing kernels are
+gated at — and IDENTICAL to what the 128-wide module scores on the same inputs.
+The residual STREAM is held to the bit-exact tier by `memcmp`, which is what
+proves `vt_round_through` is the memory round trip rather than an approximation
+of it. `test_vulkan_backend` 30/30 (2371 assertions) on GB10 and 30/30 (1828) on
+llvmpipe; `test_opt_paged_engine` with `VLLM_CPP_DEVICE=vulkan` still 6/6
+token-exact (96/96) with 0 declines on BOTH arms; `test_backend_cross_device`
+11/11.
+
+**AN HONEST LIMIT ON THAT e2e GATE.** `opt-125m` is a LayerNorm model — two
+`vt::LayerNorm` calls per layer and ZERO `vt::RmsNorm` — so the standing
+token-exact gate is a regression guard for the backend and NOT a proof of this
+kernel. What covers the kernel end to end is the model that actually calls it:
+Qwen3.6-27B run on both arms with `--output-token-ids`, 4 prompts x 32 tokens,
+greedy, twice each. **All four dumps are byte-identical** — arm to arm and run to
+run — so on the model that dispatches this kernel 129 times per token the wide
+module changes no token at all. Disclosed limit: `vllm-bench` feeds SYNTHETIC
+prompts, so the sequences are low-entropy and this is weaker than a golden-text
+comparison; it is offered as the strongest e2e evidence available on a model with
+no pinned oracle, not as a token-exact gate.
+
+**The fallback is a TESTED path, not a hope.** llvmpipe reports 1024 invocations
+and compute subgroup arithmetic too, so CI would otherwise only ever exercise the
+wide module. `VulkanContext::set_rms_norm_override` forces either arm, and the new
+case asserts through the dispatch histogram that the intended module — and only
+it — was bound, in all three configurations.
+
+**WHAT THIS LEAVES, named rather than implied.** The same one-workgroup-per-row
+launch shape is still in `vt_layer_norm` (OPT's norm, so llvmpipe-gated rather
+than 27B-gated), in `vt_fused_chain`'s `kRmsNorm` step, and in
+`vt_greedy_argmax`, all of which keep the portable 128 and the tree. None of them
+is on the 27B decode path — the 129 calls per token measured here are all
+standalone `vt::RmsNorm` — so widening them is a separate row with its own
+measurement, not a follow-through this one is entitled to claim. Beyond that,
+`vt_matmul_vec` is still 91% of the decode budget (216 of 236 ms/token) and no
+norm-shaped lever can touch it.
+
+**FUSION was considered and NOT taken.** llama.cpp folds RMS_NORM+MUL into one
+node (`rms_norm.comp`'s `do_multiply` specialization constant), which is what
+makes 129 norms per token look like a call-count problem. It is not one here: our
+129 calls are 2 per layer plus the final norm, the multiply by the norm weight is
+ALREADY inside our kernel, and the residual add is already inside it too. There is
+no adjacent elementwise op left to fold, so the `include/vt/fused_ops.h` seam has
+nothing to bind. Recorded so the next reader does not re-derive it.
+
 ### 6.0a `VK-G` partial: the FUSED ATTN PREAMBLE landed — 2026-08-09
 
 `row/BACKEND-VULKAN-QKNORM`. `kAttnQkNormRopeGate` — gemma-RMSNorm(q) +

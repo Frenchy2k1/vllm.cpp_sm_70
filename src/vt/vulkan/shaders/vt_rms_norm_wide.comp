@@ -1,0 +1,47 @@
+#version 450
+// vt::RmsNorm — the WIDE variant. Same body, same math, same numerics tier as
+// vt_rms_norm.comp (both include vt_rms_norm_body.glsl); the ONLY differences are
+// the workgroup width and the reduction shape:
+//
+//   * VT_TG 1024 instead of 128, and a matching `local_size_x` literal;
+//   * VT_SUBGROUP_REDUCE, so vt_tg_sum collapses each subgroup with subgroupAdd
+//     and takes ONE barrier instead of log2(VT_TG) of them.
+//
+// WHY IT EXISTS — MEASURED, not assumed (VK-RMSNORM, GB10, 2026-08-09).
+// vt::RmsNorm dispatches ONE WORKGROUP PER ROW, and a batch-1 decode step has
+// exactly one row: the host launches `groups = t = 1`. On Qwen3.6-27B that is a
+// single 128-invocation workgroup walking h = 5120 elements, i.e. 40 loop
+// iterations on 4 warps of ONE streaming multiprocessor while the rest of the GPU
+// idles. The instrument that showed it is the two-length GPU-timestamp diff
+// (output-len 36 minus output-len 4, so prefill and one-time costs cancel):
+// vt_rms_norm cost 0.0611 ms/call and 7.88 ms/token across 129 calls/token, about
+// TEN TIMES the other small kernels, while reading only ~20 KB — far under a
+// microsecond at the 273 GB/s roof. The decisive attribution is that the SAME
+// shader in the SAME run costs 0.0667 ms/call during PREFILL, where it is handed
+// 32 rows and therefore 32 workgroups and 32x the data: 32x the work for 9% more
+// time is not a kernel doing work, it is a kernel waiting, and the idle machine
+// is the lever. `vt_rms_norm_gated`, which reduces identically but is launched
+// with 48 workgroups, costs 0.0055 ms/call — the reduction was never the
+// difference, the OCCUPANCY was.
+//
+// llama.cpp reaches the same conclusion by two other routes at the same pin
+// (237ad9b96): its `rms_norm.comp:33` runs BLOCK_SIZE 512 rather than the
+// guaranteed-portable 128, and `rms_norm_partials.comp` exists solely to spread a
+// SINGLE row across many workgroups when the row count cannot. Widening the
+// workgroup is the half of that which needs no second dispatch and no
+// cross-workgroup hand-off, so it is what this module does.
+//
+// NOT PORTABLE, WHICH IS WHY IT IS A SEPARATE MODULE. 1024 invocations exceed the
+// Vulkan-guaranteed minimum of 128, and the subgroup instructions need
+// capabilities a conformant device may lack. The host probes
+// maxComputeWorkGroupInvocations, maxComputeWorkGroupSize.x and
+// VkPhysicalDeviceSubgroupProperties and falls back to vt_rms_norm.comp when any
+// of them is missing (src/vt/vulkan/vulkan_ops.cpp § RmsNormKernel).
+#extension GL_GOOGLE_include_directive : require
+
+#define VT_TG 1024u
+#define VT_SUBGROUP_REDUCE
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+#include "vt_rms_norm_body.glsl"

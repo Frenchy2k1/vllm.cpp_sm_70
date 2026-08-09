@@ -58,7 +58,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 25);
+  CHECK(n == 26);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -73,6 +73,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
                            "vt_matmul_coopmat", "vt_matmul_vec", "vt_paged_attn",
                            "vt_qkv_split",
                            "vt_relu", "vt_reshape_and_cache", "vt_rms_norm",
+                           "vt_rms_norm_wide",
                            "vt_rope_from_cache", "vt_silu_and_mul",
                            // BACKEND-VULKAN-GDN: the GDN / conv1d glue family.
                            "vt_causal_conv1d_update", "vt_gdn_post_conv",
@@ -2456,6 +2457,166 @@ TEST_CASE("the fused attn preamble serves the bf16 q/k + f32 gate combo natively
     }
   }
   CHECK(gate_exact);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+// ===========================================================================
+// VK-RMSNORM — the WIDE RmsNorm module, asserted as a MECHANISM.
+//
+// vt::RmsNorm dispatches ONE WORKGROUP PER ROW, so a batch-1 decode step gives it
+// exactly one workgroup: on Qwen3.6-27B, 128 invocations walking h = 5120 while
+// the rest of the GPU idles. Measured on GB10 with the two-length GPU-timestamp
+// diff, that cost 0.0611 ms/call — about ten times the other small kernels, and
+// within 9% of what the SAME shader costs during PREFILL where it is handed 32x
+// the data across 32 workgroups. `vt_rms_norm_wide` is the same body at 1024
+// invocations with a subgroup reduction, selected by capability.
+//
+// WHY THIS CASE ASSERTS THE DISPATCH AND NOT ONLY THE NUMBERS. The wide module is
+// bit-for-bit the same arithmetic as the portable one except for the reduction
+// ORDER, so if the selection silently stopped applying — a capability probe that
+// regressed to false, a rename, a module that failed to load — every numeric
+// check here would still pass and the kernel would just be slow again. So the
+// case pins the module BY NAME through the dispatch histogram, in both
+// directions: the capability-selected one on this device, and the portable
+// fallback when the override forces it.
+// ===========================================================================
+namespace {
+
+// Dispatch count for one shader module, by name. The histogram is keyed by the
+// module name the dispatch actually bound, so a delta across a call is direct
+// evidence of WHICH SPIR-V ran — stronger than PipelineExistsFor, which only says
+// a pipeline was built at some point in the process.
+uint64_t DispatchesOf(const vt::vulkan::VulkanContext& ctx, const std::string& name) {
+  for (const auto& kv : ctx.DispatchHistogram()) {
+    if (kv.first == name) return kv.second;
+  }
+  return 0;
+}
+
+}  // namespace
+
+TEST_CASE("RmsNorm picks the wide module by CAPABILITY, and the numbers agree either way") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // The probe is a REPORT, not an assumption — but it must be CONSISTENT with the
+  // limits it is derived from, so a future edit cannot leave the predicate true
+  // on a device that cannot run the module.
+  const std::string caps =
+      "wide RmsNorm: " + std::string(ctx.wide_reduce() ? "YES" : "no") +
+      "  (maxComputeWorkGroupInvocations=" + std::to_string(ctx.max_workgroup_invocations()) +
+      ", maxComputeWorkGroupSize.x=" + std::to_string(ctx.max_workgroup_size_x()) +
+      ", subgroupSize=" + std::to_string(ctx.subgroup_size()) +
+      ", compute subgroup arithmetic=" + (ctx.subgroup_arithmetic_compute() ? "YES" : "no") + ")";
+  MESSAGE(caps);
+  if (ctx.wide_reduce()) {
+    CHECK(ctx.max_workgroup_invocations() >= vt::vulkan::VulkanContext::kWideWorkgroupSize);
+    CHECK(ctx.max_workgroup_size_x() >= vt::vulkan::VulkanContext::kWideWorkgroupSize);
+    CHECK(ctx.subgroup_arithmetic_compute());
+    CHECK(ctx.subgroup_size() > 0);
+  } else {
+    // The predicate is only allowed to be false because something is genuinely
+    // missing. Without this the fast path could quietly disappear behind a
+    // mis-edited probe and every other assertion here would still be green.
+    CHECK((ctx.max_workgroup_invocations() < vt::vulkan::VulkanContext::kWideWorkgroupSize ||
+           ctx.max_workgroup_size_x() < vt::vulkan::VulkanContext::kWideWorkgroupSize ||
+           !ctx.subgroup_arithmetic_compute() || ctx.subgroup_size() == 0));
+  }
+
+  // T = 1 is THE decode shape and the whole reason this module exists: it is the
+  // launch that gives the kernel a single workgroup. H = 5120 is Qwen3.6-27B's
+  // hidden size, so each of the 128 fallback lanes walks 40 elements and each of
+  // the 1024 wide lanes walks 5 — both strided loops, both over partial sums.
+  constexpr int64_t kT = 1, kH = 5120;
+  const std::vector<float> x = Spread(kT * kH, 2.0f, 41u);
+  const std::vector<float> w = Spread(kH, 1.5f, 43u);
+  const std::vector<float> r0 = Spread(kT * kH, 1.0f, 47u);
+
+  Buf vx(vk, kT * kH, 4), vw(vk, kH, 4), vo(vk, kT * kH, 4), vr(vk, kT * kH, 4);
+  Buf cx(cpu, kT * kH, 4), cw(cpu, kH, 4), co(cpu, kT * kH, 4), cr(cpu, kT * kH, 4);
+  Tensor vxt = Tensor::Contiguous(vx.p(), vt::DType::kF32, vd, {kT, kH});
+  Tensor vwt = Tensor::Contiguous(vw.p(), vt::DType::kF32, vd, {kH});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kF32, vd, {kT, kH});
+  Tensor vrt = Tensor::Contiguous(vr.p(), vt::DType::kF32, vd, {kT, kH});
+  Tensor cxt = Tensor::Contiguous(cx.p(), vt::DType::kF32, cd, {kT, kH});
+  Tensor cwt = Tensor::Contiguous(cw.p(), vt::DType::kF32, cd, {kH});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kF32, cd, {kT, kH});
+  Tensor crt = Tensor::Contiguous(cr.p(), vt::DType::kF32, cd, {kT, kH});
+
+  // Both arms of the override, so the FALLBACK is exercised on hardware that
+  // would otherwise never take it. `expect` is what each arm must dispatch;
+  // arm 0 is the shipped default and names whichever module the capability chose.
+  struct Arm { int override_value; const char* label; };
+  const Arm arms[] = {{0, "default (capability-driven)"}, {-1, "forced fallback"}, {1, "forced wide"}};
+  for (const Arm& arm : arms) {
+    if (arm.override_value > 0 && !ctx.wide_reduce()) continue;  // module unusable here
+    const char* expect = arm.override_value < 0
+                             ? "vt_rms_norm"
+                             : (ctx.wide_reduce() ? "vt_rms_norm_wide" : "vt_rms_norm");
+    const char* other = std::string(expect) == "vt_rms_norm" ? "vt_rms_norm_wide" : "vt_rms_norm";
+
+    for (bool with_residual : {false, true}) {
+      vk.Copy(vq, vx.p(), x.data(), x.size() * 4);
+      vk.Copy(vq, vw.p(), w.data(), w.size() * 4);
+      vk.Copy(vq, vr.p(), r0.data(), r0.size() * 4);
+      std::memcpy(cx.p(), x.data(), x.size() * 4);
+      std::memcpy(cw.p(), w.data(), w.size() * 4);
+      std::memcpy(cr.p(), r0.data(), r0.size() * 4);
+      vk.Synchronize(vq);
+
+      const vt::RmsNormArgs na{1e-6f, false};
+      vt::RmsNorm(cq, cot, cxt, cwt, na, with_residual ? &crt : nullptr);
+
+      ctx.set_rms_norm_override(arm.override_value);
+      const uint64_t before_want = DispatchesOf(ctx, expect);
+      const uint64_t before_other = DispatchesOf(ctx, other);
+      vt::RmsNorm(vq, vot, vxt, vwt, na, with_residual ? &vrt : nullptr);
+      vk.Synchronize(vq);
+      const uint64_t after_want = DispatchesOf(ctx, expect);
+      const uint64_t after_other = DispatchesOf(ctx, other);
+      ctx.set_rms_norm_override(0);
+
+      // THE MECHANISM. Exactly one dispatch of the intended module, and none of
+      // the other one — so a silent fall-back (or a silent promotion) fails here
+      // even though every number below would still match.
+      const std::string mech = std::string("RmsNorm ") + arm.label + ", residual=" +
+                               (with_residual ? "1" : "0") + " -> dispatched " + expect;
+      MESSAGE(mech);
+      CHECK(after_want == before_want + 1);
+      CHECK(after_other == before_other);
+      CHECK(RanNative(vt::OpId::kRmsNorm));
+
+      std::vector<float> got(kT * kH), gotr(kT * kH);
+      vk.Copy(vq, got.data(), vo.p(), got.size() * 4);
+      vk.Copy(vq, gotr.data(), vr.p(), gotr.size() * 4);
+      vk.Synchronize(vq);
+      const std::vector<float> ref(co.as<float>(), co.as<float>() + kT * kH);
+      const std::vector<float> refr(cr.as<float>(), cr.as<float>() + kT * kH);
+      const double nmse = NmseOf(ref, got);
+      const std::string line = std::string("RmsNorm ") + arm.label + ", residual=" +
+                               (with_residual ? "1" : "0") + " NMSE vs the CPU oracle: " +
+                               Sci(nmse);
+      MESSAGE(line);
+      CHECK(nmse <= kGdnNmseTol);
+
+      // THE RESIDUAL STREAM IS HELD TO THE BIT-EXACT TIER, not NMSE. It is a pure
+      // elementwise add rounded into the residual's own dtype, with no reduction
+      // anywhere in it, so the workgroup width cannot legitimately change it —
+      // and this is the assertion that vt_round_through really is the memory
+      // round trip it replaced rather than merely a close approximation of it.
+      if (with_residual) {
+        CHECK(std::memcmp(refr.data(), gotr.data(), refr.size() * 4) == 0);
+      }
+    }
+  }
 
   vk.DestroyQueue(vq);
   cpu.DestroyQueue(cq);
