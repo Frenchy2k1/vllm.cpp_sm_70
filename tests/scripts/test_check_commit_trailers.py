@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,10 @@ CHECKER = ROOT / "scripts/check-commit-trailers.py"
 
 
 def load_checker():
+    # check-commit-trailers.py imports scripts.waivers; a bare spec load has no
+    # repository root on sys.path, so provide it here.
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
     spec = importlib.util.spec_from_file_location("check_commit_trailers", CHECKER)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -228,7 +233,7 @@ class RangeContract(unittest.TestCase):
         cutover = self.commit(STRICT_MESSAGE)
         after = self.commit(STRICT_MESSAGE.replace("policy:", "policy after:"))
         errors = self.checker.validate_range(
-            self.repo, base, after, cutover=cutover, rules=None, waivers=[]
+            self.repo, base, after, cutover=cutover, waivers=[]
         )
         self.assertEqual(errors, [])
         self.assertNotEqual(before, cutover)
@@ -238,7 +243,7 @@ class RangeContract(unittest.TestCase):
         cutover = self.commit(STRICT_MESSAGE)
         self.commit("after\n\nFOLLOWING_AGENTS_PROTOCOL\n")
         errors = self.checker.validate_range(
-            self.repo, base, "HEAD", cutover=cutover, rules=None, waivers=[]
+            self.repo, base, "HEAD", cutover=cutover, waivers=[]
         )
         self.assertTrue(any("Following-Agents-Protocol" in error for error in errors))
 
@@ -247,13 +252,13 @@ class RangeContract(unittest.TestCase):
         head = self.commit(STRICT_MESSAGE)
         with self.assertRaises(ValueError):
             self.checker.validate_range(
-                self.repo, "missing", head, cutover=head, rules=None, waivers=[]
+                self.repo, "missing", head, cutover=head, waivers=[]
             )
         subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "--detach", base], check=True)
         side = self.commit(STRICT_MESSAGE.replace("policy:", "side:"))
         with self.assertRaises(ValueError):
             self.checker.validate_range(
-                self.repo, side, head, cutover=head, rules=None, waivers=[]
+                self.repo, side, head, cutover=head, waivers=[]
             )
 
     def test_ambiguous_revision_name_fails_closed(self) -> None:
@@ -267,7 +272,7 @@ class RangeContract(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self.checker.validate_range(
-                self.repo, base, "collision", cutover=head, rules=None, waivers=[]
+                self.repo, base, "collision", cutover=head, waivers=[]
             )
 
 

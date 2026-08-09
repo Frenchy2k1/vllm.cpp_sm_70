@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 try:
-    from scripts.policy_contract import PolicyRule, Waiver, load_policy, load_waivers
+    from scripts.waivers import Waiver, load_waivers
 except ModuleNotFoundError:
-    from policy_contract import PolicyRule, Waiver, load_policy, load_waivers
+    from waivers import Waiver, load_waivers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +97,9 @@ APPEND_ONLY_FILES = frozenset(
 )
 PROJECT_RECORD_FILES = frozenset(
     {
+        # Retired when history became git. They are DELETED, but a deleted path
+        # still appears in a diff and still has to classify, or the very commit
+        # that removes them fails the classification gate.
         ".agents/state.md",
         ".agents/state.csv",
         ".agents/NOW.md",
@@ -122,6 +125,8 @@ PROCEDURE_FILES = frozenset(
         ".agents/workflow.md",
         ".agents/verification.md",
         ".agents/porting.md",
+        ".agents/benchmarking.md",
+        ".agents/bugfixing.md",
         ".agents/directives.md",
         ".agents/ai-coding-assistants.md",
         ".agents/benchmark-protocol.md",
@@ -142,13 +147,11 @@ PROCEDURE_FILES = frozenset(
 )
 GOVERNANCE_SUPPORT_FILES = frozenset(
     {
-        "scripts/policy_contract.py",
+        "scripts/waivers.py",
         "scripts/agent-role.py",
         "scripts/claim-view.py",
         "scripts/ready-for-helper.py",
         "scripts/agent-preflight.sh",
-        "scripts/state_record.py",
-        "scripts/migrate-state-record.py",
     }
 )
 PRODUCT_CHECKER_FILES = frozenset({"scripts/check-release-binary-contract.py"})
@@ -173,6 +176,11 @@ DOC = re.compile(r"docs/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|png|svg|json
 SPEC = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.md\Z")
 SPEC_EVIDENCE = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.(?:patch|json|log)\Z")
 COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
+# Retired state evidence, moved wholesale under completed/ when history became
+# git. It is archived evidence, classified like every other completed record.
+COMPLETED_STATE_EVENT = re.compile(
+    r"\.agents/completed/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"
+)
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
@@ -192,45 +200,15 @@ RELEASE_MANIFEST_FIXTURE = re.compile(
 
 CHECKER_EVIDENCE_OVERRIDES = {
     "scripts/check-agent-record.py": "tests/scripts/test_agent_record.py",
-    "scripts/check-policy.py": "tests/scripts/test_policy_contract.py",
     "scripts/check-role-discipline.py": "tests/scripts/test_check_pr_size.py",
     "scripts/check-doc-checkpoint.py": "tests/scripts/test_doc_checkpoint.py",
-    "scripts/check-protocol-consistency.py": "tests/scripts/test_check_protocol_consistency.py",
     # Its suite predates the test_check_<name> convention and CI runs it under
     # the older name, so the derived path pointed at a file that does not
     # exist and NO change to this checker could ever satisfy its own evidence
     # rule. Mapped to the file CI actually runs.
     "scripts/check-device-leakage.py": "tests/scripts/test_device_leakage.py",
-    "scripts/check-state-order.py": "tests/scripts/test_state_record_cutover.py",
 }
 
-# New entrypoints cannot appear in their own historical policy enforcement
-# cells before they exist. This closed creation map binds their affected rules
-# until the policy cutover can name the entrypoint directly.
-CREATED_CHECKER_RULES = {
-    "scripts/check-commit-trailers.py": (
-        "POL-COMMIT-TRAILERS",
-        "POL-AI-ATTRIBUTION",
-        "POL-WAIVER-EXACT",
-    ),
-    "scripts/check-pr-size.py": (
-        "POL-PATH-CLASSIFICATION",
-        "POL-PR-SIZE",
-    ),
-}
-# Task-specific technical contract checkers do not become repository-policy
-# authorities. Their changes are nevertheless mutation-bound by the policy that
-# governs checker changes. Keep this declaration exact so an unknown checker
-# still fails closed instead of inheriting a directory-wide exemption.
-TECHNICAL_CHECKER_CHANGE_RULES = {
-    "scripts/check-release-binary-contract.py": ("POL-CHECKER-CHANGE",),
-}
-# A retired checker is mutation-tested by restoring its BASE bytes into the
-# HEAD worktree. The cutover suite must then turn red because the obsolete tool
-# exists again.
-RETIRED_CHECKER_RULES = {
-    "scripts/check-state-order.py": ("POL-STATE-STRUCTURED",),
-}
 DISABLED_CREATION_CHECKER = (
     b"#!/usr/bin/env python3\n"
     b'\"\"\"Deliberately disabled creation-contract mutation.\"\"\"\n'
@@ -245,11 +223,10 @@ CREATION_MUTATIONS = {
         b"def exact_waiver(*args, **kwargs): return None\n"
         b"def validate_waiver_targets(*args, **kwargs): return None\n"
     ),
-    "scripts/check-policy.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
-    "scripts/check-state-record.py": DISABLED_CREATION_CHECKER,
 }
+SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
 TEST_COUNT = re.compile(r"Ran ([0-9]+) tests? in ")
 
@@ -271,7 +248,6 @@ class ChangedPath:
 class EvidenceResult:
     checker: str
     test_module: str
-    rule_ids: tuple[str, ...]
     head_tests: int
     head_passed: bool
     base_tests: int
@@ -310,7 +286,12 @@ def classify_path(path: str) -> str:
         return "project_record"
     if path == ".agents/upstream-inventory.json":
         return "project_record"
-    if path in PROCEDURE_FILES or SPEC.fullmatch(path) or COMPLETED.fullmatch(path):
+    if (
+        path in PROCEDURE_FILES
+        or SPEC.fullmatch(path)
+        or COMPLETED.fullmatch(path)
+        or COMPLETED_STATE_EVENT.fullmatch(path)
+    ):
         return "procedure"
     if (
         path == STATE_MIGRATION_MANIFEST
@@ -428,8 +409,6 @@ def change_errors(
                     errors.append(f"checker evidence identity mismatch for {change.path!r}")
                 elif proof.test_module != evidence.removesuffix(".py").replace("/", "."):
                     errors.append(f"checker evidence test mismatch for {change.path!r}")
-                elif not proof.rule_ids:
-                    errors.append(f"checker change {change.path!r} has no affected POL rule IDs")
                 elif proof.head_tests <= 0:
                     errors.append(f"checker change {change.path!r} executed no HEAD tests")
                 elif not proof.head_passed:
@@ -446,11 +425,11 @@ def change_errors(
             applicable = [
                 waiver
                 for waiver in waivers
-                if waiver.rule_id == "POL-PR-SIZE" and waiver.scope == waiver_scope
+                if waiver.checker == SELF_CHECKER and waiver.scope == waiver_scope
             ]
             if len(applicable) > 1:
                 raise ValueError(
-                    f"duplicate applicable waivers for POL-PR-SIZE {waiver_scope}"
+                    f"duplicate applicable waivers for {SELF_CHECKER} {waiver_scope}"
                 )
             if applicable:
                 continue
@@ -518,33 +497,6 @@ def load_role_discipline():
     return module
 
 
-def affected_policy_rules(
-    checker_path: str, rules: dict[str, PolicyRule], root: Path
-) -> tuple[str, ...]:
-    direct = tuple(
-        sorted(
-            rule_id
-            for rule_id, rule in rules.items()
-            if checker_path in {part.strip() for part in rule.enforcement.split(";")}
-        )
-    )
-    declared = (
-        CREATED_CHECKER_RULES.get(checker_path, ())
-        + TECHNICAL_CHECKER_CHANGE_RULES.get(checker_path, ())
-        + RETIRED_CHECKER_RULES.get(checker_path, ())
-    )
-    rule_ids = tuple(sorted(set(direct) | set(declared)))
-    if not rule_ids:
-        raise ValueError(f"{checker_path} has no affected POL rule mapping")
-    for rule_id in rule_ids:
-        rule = rules.get(rule_id)
-        if rule is None:
-            raise ValueError(f"{checker_path} maps unknown policy rule {rule_id}")
-        if not (root / rule.procedure).is_file():
-            raise ValueError(
-                f"{checker_path} rule {rule_id} has no existing procedure {rule.procedure}"
-            )
-    return rule_ids
 
 
 def _sanitized_env(home: Path) -> dict[str, str]:
@@ -600,7 +552,6 @@ def executable_evidence(
     base: str,
     head: str,
     changes: list[ChangedPath],
-    rules: dict[str, PolicyRule],
 ) -> dict[str, EvidenceResult]:
     """Prove each checker change red-before/green-after in an isolated worktree."""
 
@@ -619,7 +570,6 @@ def executable_evidence(
         if evidence_path not in changed:
             continue
         module = evidence_path.removesuffix(".py").replace("/", ".")
-        rule_ids = affected_policy_rules(checker_path, rules, repo)
         container = Path(
             tempfile.mkdtemp(prefix="vllm-policy-evidence-", dir="/dev/shm")
         )
@@ -652,7 +602,6 @@ def executable_evidence(
             results[checker_path] = EvidenceResult(
                 checker=checker_path,
                 test_module=module,
-                rule_ids=rule_ids,
                 head_tests=head_count,
                 head_passed=head_passed,
                 base_tests=base_count,
@@ -690,9 +639,8 @@ def main() -> int:
         base_oid = resolve_commit(ROOT, args.base)
         head_oid = resolve_commit(ROOT, args.head)
         changes = changed_paths(base_oid, head_oid)
-        rules = load_policy(ROOT)
-        waivers = tuple(load_waivers(ROOT, rules))
-        evidence = executable_evidence(ROOT, base_oid, head_oid, changes, rules)
+        waivers = load_waivers(ROOT)
+        evidence = executable_evidence(ROOT, base_oid, head_oid, changes)
         errors = change_errors(
             changes,
             evidence_results=evidence,

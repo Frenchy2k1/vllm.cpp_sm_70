@@ -609,7 +609,7 @@ how to build it, the CLI, the OpenAI server, and how to consume it), see the
 [Performance](../README.md#performance) section, and the per-capability
 lifecycle ledger is [docs/STATUS.md](../docs/STATUS.md). Attempt chronology and failure
 forensics live in the [parity ledger](parity-ledger.md),
-[state log](state.md), linked specs, and Git. Those raw records are
+[state log](completed/state-events/), linked specs, and Git. Those raw records are
 append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
@@ -6576,7 +6576,7 @@ the windowed-load release - are in the `246a23c` binding binary, so the
 pin `--mamba-ssm-cache-dtype float32` is wired into the vLLM arm and recorded in
 this run's evidence. Detailed per-seal chronology and evidence SHAs live in the
 append-only [ledger](parity-ledger.md) and
-[state log](state.md). 35B stays blocked until 27B reaches 124/124.
+[state log](completed/state-events/). 35B stays blocked until 27B reaches 124/124.
 
 **Decode recurrence perf lever - MEASURED codegen-bound → vendored Triton cubin,
 now DEFAULT ON (2026-07-16).** The named +2.06 ms/step recurrence-tiling gap (correct-state c16
@@ -9792,7 +9792,7 @@ flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 G2 and W1D3 structural evidence are closed. The repaired source has been pushed
 and launched exactly once at `d82d282`; that incomplete root must never be
 reused or appended. The failure inspection and next diagnostic entry point are
-in the newest [state record](state.md) entry and the
+in the newest [state record](completed/state-events/) entry and the
 [spike](specs/gdn-packed-decode.md). The failed launch provenance is:
 
 ```sh
@@ -10449,7 +10449,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   synccheck 0. One W9 input recorded here: the oracle must run
   `moe_backend='triton'`, because vLLM's auto-selected FlashInfer CUTLASS
   unquantized MoE backend REBOOTS dgx. Per-W chronology and evidence anchors live
-  in the append-only [state log](state.md) and
+  in the append-only [state log](completed/state-events/) and
   [parity ledger](parity-ledger.md), not here.
 
 - **MLA campaign W10 - the blocked-row honesty pass (2026-07-22,

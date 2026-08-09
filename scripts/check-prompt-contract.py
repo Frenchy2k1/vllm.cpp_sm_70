@@ -12,14 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.policy_contract import load_policy  # noqa: E402
 
 
 PROMPT_BUDGET = 4096
 ROLES = ("implementer", "reviewer", "operator")
 RUNTIME_PROMPT_FILES = frozenset(f"{role}.md" for role in ROLES)
 SECTION_NAMES = ("Task envelope", "Method", "Required output", "Stop conditions")
-METADATA_KEYS = ("prompt-contract-version", "role", "policy-rules")
+METADATA_KEYS = ("prompt-contract-version", "role")
 ENVELOPE_ROWS = (
     "- Goal: REQUIRED",
     "- Context: REQUIRED",
@@ -29,28 +28,6 @@ ENVELOPE_ROWS = (
     "- Authority: REQUIRED",
     "- Missing input: NEEDS_CONTEXT",
 )
-ROLE_RULES = {
-    "implementer": (
-        "POL-PROMPT-ENVELOPE",
-        "POL-PROMPT-BOUNDARIES",
-    ),
-    "reviewer": (
-        "POL-PROMPT-ENVELOPE",
-        "POL-PROMPT-BOUNDARIES",
-        "POL-REVIEW-FRESH",
-        "POL-REVIEW-NO-REPAIR",
-    ),
-    "operator": (
-        "POL-PROMPT-ENVELOPE",
-        "POL-PROMPT-BOUNDARIES",
-        "POL-OPERATOR-BOUNDARY",
-        "POL-OPERATOR-VERIFY",
-        "POL-PR-DISPOSITION",
-        "POL-REVIEW-FRESH",
-        "POL-REVIEW-NO-REPAIR",
-        "POL-REMOTE-UNKNOWN",
-    ),
-}
 METHOD_ROWS = {
     "implementer": (
         "- `IMP-TEST-FIRST` | required | Write the failing test first, run it before implementation, and confirm the stated failure.",
@@ -188,7 +165,7 @@ def _row_errors(
     return errors
 
 
-def validate_prompt(path: Path, role: str, known_rule_ids: set[str]) -> list[str]:
+def validate_prompt(path: Path, role: str) -> list[str]:
     """Return every closed-grammar defect in one runtime prompt."""
 
     label = path.as_posix()
@@ -208,18 +185,10 @@ def validate_prompt(path: Path, role: str, known_rule_ids: set[str]) -> list[str
     expected_metadata = {
         "prompt-contract-version": "1",
         "role": role,
-        "policy-rules": " ".join(ROLE_RULES[role]),
     }
     for key, expected in expected_metadata.items():
         if metadata.get(key) != expected:
             errors.append(f"{label}: metadata {key!r} must be exactly {expected!r}")
-    missing_registry_rules = set(ROLE_RULES[role]) - known_rule_ids
-    if missing_registry_rules:
-        errors.append(
-            f"{label}: required policy rules are absent from policy.csv: "
-            + ", ".join(sorted(missing_registry_rules))
-        )
-
     sections, section_errors = _parse_sections(lines, body_start, label)
     errors.extend(section_errors)
     names = tuple(name for name, _ in sections)
@@ -244,7 +213,7 @@ def validate_prompt(path: Path, role: str, known_rule_ids: set[str]) -> list[str
     return errors
 
 
-def repository_errors(root: Path, known_rule_ids: set[str]) -> list[str]:
+def repository_errors(root: Path) -> list[str]:
     """Validate every runtime prompt owned by this contract checker."""
 
     errors: list[str] = []
@@ -261,20 +230,14 @@ def repository_errors(root: Path, known_rule_ids: set[str]) -> list[str]:
     for role in ROLES:
         errors.extend(
             validate_prompt(
-                prompt_root / f"{role}.md", role, known_rule_ids
+                prompt_root / f"{role}.md", role
             )
         )
     return errors
 
 
 def main() -> int:
-    try:
-        known_rule_ids = set(load_policy(ROOT))
-    except ValueError as exc:
-        print(f"prompt contract BLOCKED: policy registry is invalid\n{exc}")
-        return 1
-
-    errors = repository_errors(ROOT, known_rule_ids)
+    errors = repository_errors(ROOT)
     if errors:
         print("prompt contract FAILED:")
         for error in errors:

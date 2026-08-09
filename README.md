@@ -444,7 +444,7 @@ the number stays in the README and the label says *speed-pending*.
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Runtime environment variables |
 
 The canonical project record is indexed by [AGENTS.md](AGENTS.md) and lives
-under [`.agents/`](.agents/). See [current state](.agents/state.md),
+under [`.agents/`](.agents/). See [current state](.agents/NOW.md),
 [parity evidence](.agents/parity-ledger.md), the
 [model inventory](.agents/model-matrix.md), and the
 [portfolio roadmap](.agents/specs/roadmap-v1-completion.md).

@@ -11,15 +11,16 @@ from pathlib import Path
 from typing import Iterable
 
 try:
-    from scripts.policy_contract import PolicyRule, Waiver, load_policy, load_waivers
+    from scripts.waivers import Waiver, exact_waiver, load_waivers
 except ModuleNotFoundError:  # direct execution from outside the repository root
-    from policy_contract import PolicyRule, Waiver, load_policy, load_waivers
+    from waivers import Waiver, exact_waiver, load_waivers
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_PROTOCOL_MARKER = "FOLLOWING_AGENTS_PROTOCOL"
-PROTOCOL_RULE = "POL-COMMIT-TRAILERS"
-ATTRIBUTION_RULE = "POL-AI-ATTRIBUTION"
+CHECKER = "scripts/check-commit-trailers.py"
+PROTOCOL_RULE = "trailers"
+ATTRIBUTION_RULE = "attribution"
 ASSISTED_BY = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.+-]*"
     r"(?: \[[A-Za-z0-9][A-Za-z0-9_. +:/-]*\])+\Z"
@@ -241,9 +242,6 @@ def _is_ancestor(repo: Path, older: str, newer: str) -> bool:
     return result.returncode == 0
 
 
-def _error_rule(error: str) -> str:
-    match = re.match(r"\[([^]]+)\]", error)
-    return match.group(1) if match else PROTOCOL_RULE
 
 
 def validate_range(
@@ -252,7 +250,6 @@ def validate_range(
     head: str,
     *,
     cutover: str | None,
-    rules: dict[str, PolicyRule] | None,
     waivers: Iterable[Waiver],
 ) -> list[str]:
     """Validate an exact first-parent-independent ``BASE..HEAD`` commit set."""
@@ -279,10 +276,7 @@ def validate_range(
 
         message = _git(repo, "show", "-s", "--format=%B", commit) + "\n"
         for error in validate_commit_message(message, strict=strict):
-            rule_id = _error_rule(error)
-            if rules is not None and rule_id not in rules:
-                raise ValueError(f"policy registry is missing {rule_id}")
-            if exact_waiver(waivers, rule_id, f"commit:{commit}") is not None:
+            if exact_waiver(waivers, CHECKER, f"commit:{commit}") is not None:
                 continue
             failures.append(f"{commit[:12]}: {error}")
     return failures
@@ -303,14 +297,11 @@ def main() -> int:
     parser.add_argument("--cutover")
     args = parser.parse_args()
     try:
-        rules = load_policy(ROOT)
-        waivers = load_waivers(ROOT, rules)
-        validate_waiver_targets(ROOT, waivers)
+        waivers = load_waivers(ROOT)
         failures = validate_range(
             ROOT,
             *args.revision_range,
             cutover=args.cutover,
-            rules=rules,
             waivers=waivers,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:

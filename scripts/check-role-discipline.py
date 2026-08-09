@@ -50,8 +50,6 @@ FEATURE_PREFIXES = (
 )
 FEATURE_FILES = {"CMakeLists.txt"}
 INTEGRATION_FILES = {
-    ".agents/state.md",
-    ".agents/state.csv",
     ".agents/completed/state-migration-manifest.csv",
     "docs/STATUS.md",
     "docs/BENCHMARKS.md",
@@ -62,9 +60,10 @@ INTEGRATION_FILES = {
 CHECKER_PATH = re.compile(r"scripts/check-[A-Za-z0-9_.-]+\.(?:py|sh)\Z")
 CHECKER_TEST_PATH = re.compile(r"tests/scripts/test_[A-Za-z0-9_.-]+\.py\Z")
 CI_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml\Z")
+# Retired state evidence, preserved under completed/. Still an integration
+# path so the archive can be moved or indexed without a feature PR.
 STRUCTURED_STATE_PATH = re.compile(
-    r"\.agents/(?:state-index/\d{4}-\d{2}-\d{3}\.csv|"
-    r"state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md)\Z"
+    r"\.agents/completed/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"
 )
 
 ROW_BRANCH = re.compile(r"row/[A-Za-z0-9_.-]+")
@@ -77,11 +76,29 @@ def git(*args: str) -> str:
     ).strip()
 
 
+# The integration TREES. The module docstring has always said these may be
+# pushed straight to main so the operator can repair a gate or a record without
+# a round trip -- but only an explicit FILE list implemented it, so
+# policy_commit_violations governed every path and the code was stricter than
+# its own documentation. A spec commit under docs/ could not reach main at all.
+# These prefixes make the behaviour match the documented rule.
+INTEGRATION_PREFIXES = (
+    "scripts/",
+    ".agents/",
+    "docs/",
+    ".github/",
+    "tests/scripts/",
+)
+INTEGRATION_TOP_FILES = frozenset({"AGENTS.md", "CLAUDE.md"})
+
+
 def is_integration_path(path: str) -> bool:
-    """Return whether path is an explicit record, checker, or CI surface."""
+    """Return whether path is an explicit record, checker, doc, or CI surface."""
 
     return bool(
         path in INTEGRATION_FILES
+        or path in INTEGRATION_TOP_FILES
+        or path.startswith(INTEGRATION_PREFIXES)
         or STRUCTURED_STATE_PATH.fullmatch(path)
         or CHECKER_PATH.fullmatch(path)
         or CHECKER_TEST_PATH.fullmatch(path)
@@ -164,7 +181,9 @@ def policy_commit_violations(
 ) -> list[str]:
     """Enforce POL-PR-REQUIRED for every tracked repository change."""
 
-    governed = sorted(path for path in paths if path)
+    governed = sorted(
+        path for path in paths if path and not is_integration_path(path)
+    )
     if not governed or arrives_via_row_pr(parents, subject, body, merged_messages):
         return []
     preview = ", ".join(governed[:4])

@@ -28,16 +28,6 @@ def _load_checker():
 
 
 prompt_contract = _load_checker()
-KNOWN_RULE_IDS = {
-    "POL-PROMPT-ENVELOPE",
-    "POL-PROMPT-BOUNDARIES",
-    "POL-REVIEW-FRESH",
-    "POL-REVIEW-NO-REPAIR",
-    "POL-OPERATOR-BOUNDARY",
-    "POL-OPERATOR-VERIFY",
-    "POL-PR-DISPOSITION",
-    "POL-REMOTE-UNKNOWN",
-}
 
 
 class PromptContractTests(unittest.TestCase):
@@ -48,7 +38,7 @@ class PromptContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / f"{role}.md"
             path.write_text(text, encoding="utf-8")
-            return prompt_contract.validate_prompt(path, role, KNOWN_RULE_IDS)
+            return prompt_contract.validate_prompt(path, role)
 
     def assert_rejected(self, role: str, old: str, new: str) -> None:
         text = self.shipped(role)
@@ -63,7 +53,7 @@ class PromptContractTests(unittest.TestCase):
                 path = ROOT / ".agents/prompts" / f"{role}.md"
                 self.assertLessEqual(path.stat().st_size, 4096)
                 self.assertEqual(
-                    prompt_contract.validate_prompt(path, role, KNOWN_RULE_IDS), []
+                    prompt_contract.validate_prompt(path, role), []
                 )
 
     def test_metadata_is_closed_exact_and_unique(self) -> None:
@@ -73,11 +63,6 @@ class PromptContractTests(unittest.TestCase):
             ("role: implementer", "role: reviewer"),
             ("role: implementer", "role: implementer\nunknown-key: value"),
             ("role: implementer", "role: implementer\nrole: implementer"),
-            (
-                "POL-PROMPT-ENVELOPE POL-PROMPT-BOUNDARIES",
-                "POL-PROMPT-BOUNDARIES POL-PROMPT-ENVELOPE",
-            ),
-            ("POL-PROMPT-BOUNDARIES", "POL-NOT-A-RULE"),
         )
         for old, new in mutations:
             with self.subTest(new=new):
@@ -280,7 +265,7 @@ class PromptContractTests(unittest.TestCase):
             any(
                 "missing" in error
                 for error in prompt_contract.validate_prompt(
-                    missing, "implementer", KNOWN_RULE_IDS
+                    missing, "implementer"
                 )
             )
         )
@@ -288,7 +273,7 @@ class PromptContractTests(unittest.TestCase):
             any(
                 "unknown runtime role" in error
                 for error in prompt_contract.validate_prompt(
-                    missing, "inventor", KNOWN_RULE_IDS
+                    missing, "inventor"
                 )
             )
         )
@@ -311,11 +296,6 @@ class PromptContractTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(prompt_contract, "ROOT", root),
-                mock.patch.object(
-                    prompt_contract,
-                    "load_policy",
-                    return_value=dict.fromkeys(KNOWN_RULE_IDS),
-                ),
                 redirect_stdout(io.StringIO()) as output,
             ):
                 self.assertEqual(prompt_contract.main(), 1)
@@ -329,10 +309,10 @@ class PromptContractTests(unittest.TestCase):
             for role in ("implementer", "reviewer", "operator"):
                 shutil.copy(ROOT / ".agents/prompts" / f"{role}.md", prompt_root)
             self.assertEqual(
-                prompt_contract.repository_errors(root, KNOWN_RULE_IDS), []
+                prompt_contract.repository_errors(root), []
             )
             (prompt_root / "operator.md").unlink()
-            errors = prompt_contract.repository_errors(root, KNOWN_RULE_IDS)
+            errors = prompt_contract.repository_errors(root)
             self.assertTrue(any("operator.md" in error and "missing" in error for error in errors))
 
     def test_runtime_prompt_namespace_rejects_every_noncanonical_artifact(self) -> None:
@@ -349,7 +329,7 @@ class PromptContractTests(unittest.TestCase):
                 for role in ("implementer", "reviewer", "operator"):
                     shutil.copy(ROOT / ".agents/prompts" / f"{role}.md", prompt_root)
                 (prompt_root / name).write_text(content, encoding="utf-8")
-                errors = prompt_contract.repository_errors(root, KNOWN_RULE_IDS)
+                errors = prompt_contract.repository_errors(root)
                 self.assertTrue(
                     any(name in error and "unexpected" in error for error in errors),
                     errors,
@@ -362,7 +342,7 @@ class PromptContractTests(unittest.TestCase):
             for role in ("implementer", "reviewer", "operator"):
                 shutil.copy(ROOT / ".agents/prompts" / f"{role}.md", prompt_root)
             (prompt_root / "adapters").mkdir()
-            errors = prompt_contract.repository_errors(root, KNOWN_RULE_IDS)
+            errors = prompt_contract.repository_errors(root)
             self.assertTrue(
                 any("adapters" in error and "unexpected" in error for error in errors),
                 errors,

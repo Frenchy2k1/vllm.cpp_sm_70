@@ -2,7 +2,7 @@
 
 <!-- now-updated: 2026-08-09 -->
 
-Snapshot, not log. Evidence: [state manifest](state.csv),
+Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
 characters.
 
@@ -32,7 +32,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Release | **ACTIVE; W5 19/19+10/10; contract 30/30** | #141; artifacts pending |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): model, runner, ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
 
-In-flight, default-OFF, not pushed: see state.md.
+In-flight, default-OFF, not pushed: see the row's spec.
 
 ## Current gate
 

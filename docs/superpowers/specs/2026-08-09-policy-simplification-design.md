@@ -64,28 +64,42 @@ REJECTED" essay. Every new escape needs a checker edit, which itself trips
 
 ## Design
 
-### 1. `AGENTS.md` is an index
+### 1. `AGENTS.md` holds all the policy
 
-It holds boot order, essential commands, and a "for X, read Y" table. It does
-not restate rules. The generated `Compact T0` block is removed, so nothing
-needs rendering or `--check`ing.
+`AGENTS.md` is the only file every agent harness loads automatically. A rule
+kept anywhere else is a rule an agent may never read — linked files are not part
+of the instruction chain, as PR #128 itself observed (its lines 64-71). So the
+rules go where they are guaranteed to be seen.
 
-### 2. Rules live in topic files under `.agents/`
+`AGENTS.md` becomes complete and self-contained: every obligation, in plain
+prose, ordered by the phase of work it governs — session and claim, spec,
+implement, verify, review, land, record. No rule IDs, no generated block, no
+`Compact T0` to render or `--check`.
 
-Four files, each owning one domain, in plain prose with no rule IDs and no
-generated blocks:
+Budget: 16 KiB, raised from PR #128's 12 KiB because the file's job changed —
+it was an index pointing at the rules, and it now *is* the rules. It lands at
+about 13 KiB. No checker enforced the old budget (the prose in PR #128 asserted
+it; `check-protocol-consistency.py`, which is deleted here, is where it would
+have lived), so this is a documented target rather than a relaxed gate.
 
-- `workflow.md` — session, role, claim, PR, commit, handoff.
-- `verification.md` — gating, correctness, review, benchmarking.
-- `porting.md` — mirroring vLLM, the parity pin, upstream sync, test porting,
+### 2. `.agents/*` files are activity guidance, not rules
+
+They stop being rule registries and become the how-to an agent reads when it is
+doing that specific activity. `AGENTS.md` indexes them, one line each:
+
+- `porting.md` — porting from vLLM: the pin, upstream sync, test porting,
   shared seams.
+- `verification.md` — gating and benchmarking: what a gate proves, how to
+  measure honestly, the oracle protocol.
+- `bugfixing.md` — reproduce, red test first, minimum fix, mutation-verify.
 - `environment.md` — hosts, hardware, contention protocol, prohibitions.
 
-The 24 unenforced rules become guidance in these files. They carry no rule ID,
-so they cannot create a machine obligation and cannot contradict one. The 36
-enforced rules keep their checkers; the file states the rule and names the
-command. **Nothing verifies that the prose and the checker agree** — that check
-is precisely the cost being removed. Prose is guidance; the checker is the gate.
+None of them can create an obligation; if a sentence there is binding, it
+belongs in `AGENTS.md` instead. That is what makes the two layers unable to
+contradict each other: only one layer is normative.
+
+**Nothing verifies that the prose and the checker agree** — that check is
+precisely the cost being removed. Prose states the rule; the checker is the gate.
 
 ### 3. History is git
 
