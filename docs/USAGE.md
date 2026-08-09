@@ -152,6 +152,26 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+### Validating a staged release archive
+
+Release verification reads only a freshly extracted archive, never files from
+the build tree. Pass the archive together with its final-byte SHA256 and SLSA
+provenance sidecars:
+
+```sh
+python3 scripts/validate-release-archive.py \
+  --archive vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz \
+  --checksum vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.sha256 \
+  --provenance vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.provenance.json \
+  --forbid-path "$PWD/build"
+```
+
+The validator checks the content allowlist, executable and host ABI, manifest,
+`VERSION`, SPDX SBOM, licenses, ELF dependencies and RPATH/RUNPATH, extracted
+`--help`/`--version` smokes, and backend-specific CUDA or adaptive-CPU claims.
+The digest and provenance are sidecars because both describe the final archive
+bytes; placing either inside those bytes would create a self-reference.
+
 Any OpenAI client works by pointing its `base_url` at it:
 
 ```python

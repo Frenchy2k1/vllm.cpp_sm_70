@@ -117,6 +117,8 @@ class ServerPackageTest(unittest.TestCase):
             help_result = run(str(executable), "--help", env=clean_env)
             self.assertIn("--max-num-seqs N", help_result.stdout)
             self.assertIn("--max-num-batched-tokens N", help_result.stdout)
+            version_result = run(str(executable), "--version", env=clean_env)
+            self.assertRegex(version_result.stdout, r"^vllm\.cpp \d+\.\d+\.\d+(?:\+cuda)? c-abi=\d+\n$")
 
             if platform.system() == "Linux" and shutil.which("ldd"):
                 dependencies = run("ldd", str(executable), env=clean_env).stdout

@@ -330,6 +330,10 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         return []
     artifact_id = artifact.get("id")
     name = backend.get("name")
+    if not isinstance(artifact.get("c_abi_version"), int) or isinstance(
+        artifact.get("c_abi_version"), bool
+    ) or artifact.get("c_abi_version", 0) <= 0:
+        return ["$.artifact.c_abi_version: must be a positive integer"]
     policies = {
         "linux-x86_64-glibc-cpu": ("linux", "x86_64", "glibc", "cpu", "static-core", {"preview", "stable"}),
         "linux-aarch64-glibc-cpu": ("linux", "aarch64", "glibc", "cpu", "static-core", {"preview", "stable"}),

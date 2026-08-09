@@ -1,5 +1,6 @@
 {
   "artifact": {
+    "c_abi_version": 17,
     "channel": "preview",
     "id": "linux-x86_64-glibc-cuda-fat",
     "kind": "primary",

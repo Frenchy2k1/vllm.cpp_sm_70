@@ -79,6 +79,7 @@ SUITES=(
   test_agent_record
   test_check_release_binary_contract
   test_release_manifest
+  test_release_archive
   test_agent_role
   test_agent_onboard
   test_agent_start

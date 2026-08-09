@@ -55,6 +55,7 @@
 #include <thread>
 #endif
 
+#include "vllm.h"
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
@@ -251,7 +252,8 @@ struct Args {
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
-         "               [--speculative-config '<json>']\n";
+         "               [--speculative-config '<json>']\n"
+         "               [--version]\n";
   std::exit(code);
 }
 
@@ -399,6 +401,10 @@ Args ParseArgs(int argc, char** argv) {
       a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--version") {
+      std::cout << "vllm.cpp " << vllm::Version()
+                << " c-abi=" << VLLM_ABI_VERSION << "\n";
+      std::exit(0);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], 0);
     } else {
