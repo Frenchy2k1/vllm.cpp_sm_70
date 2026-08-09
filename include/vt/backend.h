@@ -51,6 +51,30 @@ class Backend {
   // True when host and device share one memory space (CPU, GB10, Apple).
   virtual bool UnifiedMemory() const = 0;
 
+  // True when a pointer returned by Alloc() may be DEREFERENCED BY THE HOST
+  // directly -- loaded, stored, memcpy'd -- with no map/unmap call and no
+  // staging bounce.
+  //
+  // This is STRICTLY NARROWER than UnifiedMemory(), and the difference is the
+  // whole reason it exists. CUDA on GB10 reports unified memory because host and
+  // device address the same physical RAM, yet a plain `cudaMalloc` pointer is
+  // still not host-dereferenceable. Vulkan here allocates every buffer
+  // HOST_VISIBLE|HOST_COHERENT and keeps it persistently mapped, so its pointers
+  // are ordinary host memory that the GPU also reads -- which is already what
+  // this backend's Copy/Memset (plain memcpy/memset) and the portable CPU
+  // reference tier depend on.
+  //
+  // MEASURED consequence (BACKEND-VULKAN-LOADMEM): where this is true, a weight
+  // that has been uploaded needs NO host mirror, because the device allocation
+  // IS a host buffer. Keeping one costs a second full copy of the model --
+  // 16.392 GiB of process RSS for a 7.6 GiB Qwen3-4B, against 8.622 GiB of
+  // Vulkan allocation -- and on a unified box that second copy comes out of the
+  // same RAM the first one does.
+  //
+  // Default false: a backend must OPT IN, because being wrong here hands a
+  // device pointer to a host memcpy and segfaults.
+  virtual bool DeviceMemoryIsHostAddressable() const { return false; }
+
   // --- Device compute capability (BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4) ---
   // The architecture the backend is actually running on, as the familiar
   // `(major, minor)` pair (GB10/sm_121 -> {12, 1}). Before this, the capability

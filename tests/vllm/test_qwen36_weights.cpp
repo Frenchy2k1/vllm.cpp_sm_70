@@ -406,6 +406,164 @@ TEST_CASE("OwnedTensor::ReleaseHost frees host bytes but preserves logical prese
                        std::runtime_error);
 }
 
+// --- Host-addressable device adoption: ONE copy of the bytes, not two --------
+// BACKEND-VULKAN-LOADMEM. On a backend whose allocations the host can
+// dereference (Vulkan: every buffer HOST_VISIBLE|HOST_COHERENT and persistently
+// mapped), a weight that has been uploaded must not ALSO keep a host mirror --
+// on GB10 both copies come out of the same unified RAM, so the model became
+// resident twice (MEASURED: 16.392 GiB VmHWM against 8.622 GiB of Vulkan
+// allocation for a 7.6 GiB Qwen3-4B).
+//
+// This pins the MECHANISM on the CPU tier, with no GPU and no checkpoint: what
+// the buffer POINTS AT afterwards, that the bytes survive, that the device
+// allocation is kept alive by the view, and -- the guard that keeps CUDA
+// byte-identical -- that a backend which does NOT advertise host-addressable
+// memory is left completely alone.
+namespace {
+
+// Minimal Backend whose "device" memory is plain host memory, so adoption is
+// observable without a real accelerator. `host_addressable` is the one axis
+// under test; `frees` counts Free() so the keep-alive can be proven.
+class FakeHostAddressableBackend final : public vt::Backend {
+ public:
+  explicit FakeHostAddressableBackend(bool host_addressable)
+      : host_addressable_(host_addressable) {}
+
+  void* Alloc(size_t bytes) override {
+    ++allocs;
+    return std::malloc(bytes == 0 ? 1 : bytes);
+  }
+  void Free(void* p) override {
+    ++frees;
+    std::free(p);
+  }
+  void Memset(vt::Queue&, void* p, int value, size_t bytes) override {
+    std::memset(p, value, bytes);
+  }
+  void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    std::memcpy(dst, src, bytes);
+  }
+  vt::Queue CreateQueue() override {
+    return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  }
+  bool UnifiedMemory() const override { return true; }
+  bool DeviceMemoryIsHostAddressable() const override { return host_addressable_; }
+
+  int allocs = 0;
+  int frees = 0;
+
+ private:
+  bool host_addressable_;
+};
+
+// Build a weight with owned host bytes and upload it exactly the way
+// ResidentWeight does, so the test exercises the real post-upload state.
+vllm::OwnedTensor UploadedWeight(vt::Backend& b, vt::Queue& q, uint8_t pattern,
+                                 size_t nbytes) {
+  vllm::OwnedTensor w;
+  w.dtype = vt::DType::kI8;
+  w.rank = 1;
+  w.shape[0] = static_cast<int64_t>(nbytes);
+  w.bytes.resize(nbytes, pattern);
+  void* p = b.Alloc(nbytes);
+  b.Copy(q, p, w.bytes.data(), nbytes);
+  vt::Backend* bk = &b;
+  w.d_dev = std::shared_ptr<void>(p, [bk](void* x) { bk->Free(x); });
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("AdoptDeviceBytesAsHost leaves ONE copy on a host-addressable device") {
+  ScopedEnv adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeHostAddressableBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+  constexpr size_t kBytes = 4096;
+
+  vllm::OwnedTensor w = UploadedWeight(b, q, 0xA7, kBytes);
+  // Precondition: two distinct copies exist, which is the defect.
+  REQUIRE(w.d_dev != nullptr);
+  REQUIRE_FALSE(w.bytes.borrowed());
+  REQUIRE(static_cast<const void*>(w.bytes.data()) != w.d_dev.get());
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  // THE MECHANISM: the host buffer now IS the device allocation. Not "freed",
+  // not "smaller" -- the same address, which is the only assertion that
+  // distinguishes one copy from two.
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == w.d_dev.get());
+  CHECK(w.bytes.size() == kBytes);
+  // The surviving copy holds the right bytes: every reader that used to read
+  // the mirror reads these instead.
+  bool all_match = true;
+  for (size_t i = 0; i < kBytes; ++i) {
+    if (w.bytes.data()[i] != 0xA7) { all_match = false; break; }
+  }
+  CHECK(all_match);
+  // Logical presence is untouched -- nothing was released, so nothing may look
+  // absent to dispatch.
+  CHECK_FALSE(w.Empty());
+  CHECK(w.HasHostBytes());
+  CHECK_FALSE(w.host_released);
+
+  // THE LIFETIME: the view keeps the allocation alive. Dropping d_dev alone
+  // must NOT free the buffer the bytes still point at.
+  CHECK(b.frees == 0);
+  w.d_dev.reset();
+  CHECK(b.frees == 0);
+  CHECK(w.bytes.data()[0] == 0xA7);
+  // Only when the view goes too.
+  w.bytes.Reset();
+  CHECK(b.frees == 1);
+}
+
+TEST_CASE("AdoptDeviceBytesAsHost is a NO-OP where device memory is not host-addressable") {
+  ScopedEnv adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  // The guard that keeps every discrete-GPU path byte-identical: a CUDA
+  // pointer is not host-dereferenceable, so adopting it would hand a device
+  // address to a host memcpy.
+  FakeHostAddressableBackend b(/*host_addressable=*/false);
+  vt::Queue q = b.CreateQueue();
+  constexpr size_t kBytes = 2048;
+
+  vllm::OwnedTensor w = UploadedWeight(b, q, 0x31, kBytes);
+  const void* host_before = w.bytes.data();
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  CHECK_FALSE(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == host_before);
+  CHECK(static_cast<const void*>(w.bytes.data()) != w.d_dev.get());
+  CHECK(w.bytes.size() == kBytes);
+}
+
+TEST_CASE("AdoptDeviceBytesAsHost leaves a BORROWED buffer alone") {
+  ScopedEnv adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  // A borrowed buffer owns no anonymous pages (a GGUF mmap, or the single
+  // expansion a tied token_embd/lm_head pair shares). Adopting would reclaim
+  // nothing and would break the tie, so it must be skipped.
+  FakeHostAddressableBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+  constexpr size_t kBytes = 1024;
+
+  auto shared = std::make_shared<std::vector<uint8_t>>(kBytes, 0x5C);
+  vllm::OwnedTensor w;
+  w.dtype = vt::DType::kI8;
+  w.rank = 1;
+  w.shape[0] = static_cast<int64_t>(kBytes);
+  w.bytes = vllm::OwnedBytes::Borrow(shared->data(), kBytes, shared);
+  void* p = b.Alloc(kBytes);
+  b.Copy(q, p, w.bytes.data(), kBytes);
+  vt::Backend* bk = &b;
+  w.d_dev = std::shared_ptr<void>(p, [bk](void* x) { bk->Free(x); });
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  CHECK(static_cast<const void*>(w.bytes.data()) == shared->data());
+  CHECK(static_cast<const void*>(w.bytes.data()) != w.d_dev.get());
+}
+
 namespace {
 // The Marlin runtime gate (MarlinMoeEnabled()) caches VT_NVFP4_MARLIN on first
 // use, so it cannot be flipped mid-process; the effective gate equals the LAUNCH

@@ -35,6 +35,31 @@
 
 namespace vt::vulkan {
 
+// DEVICE-MEMORY ACCOUNTING (BACKEND-VULKAN-LOADMEM). Maintained unconditionally
+// -- one relaxed atomic add per vkAllocateMemory -- because on a unified-memory
+// device the Vulkan heap IS system RAM, so "how many bytes does this backend
+// hold" is a question a test and a diagnostic both need to be able to ask at any
+// instant, not only under an env flag. `VT_VULKAN_ALLOC_STATS=1` additionally
+// prints a line on every 1 GiB high-water crossing and a summary at exit.
+//
+// `requested` is what the caller asked for (after the 4-byte rounding
+// AllocBuffer applies for the 32-bit storage view); `allocated` is what the
+// driver committed, `VkMemoryRequirements::size`. They are reported separately
+// so a driver-side over-allocation is distinguishable from a caller that simply
+// allocates too much -- the two have completely different fixes.
+struct DeviceAllocStats {
+  uint64_t live_count = 0;
+  uint64_t total_count = 0;
+  uint64_t live_requested = 0;
+  uint64_t live_allocated = 0;
+  uint64_t total_requested = 0;
+  uint64_t total_allocated = 0;
+  uint64_t peak_allocated = 0;
+  uint64_t peak_count = 0;
+};
+
+DeviceAllocStats DeviceAllocStatsSnapshot();
+
 // Process-wide Vulkan context. Created on first use, never destroyed (the
 // process outlives it; matching llama.cpp's `vk_instance` singleton lifetime and
 // the Metal skeleton's MetalContext).

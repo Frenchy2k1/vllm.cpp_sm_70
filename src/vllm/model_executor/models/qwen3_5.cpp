@@ -851,6 +851,10 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    // Same adoption as the dense block's ResidentWeight: on a host-addressable
+    // device the uploaded buffer IS the host buffer, so keeping the mirror
+    // costs a second full copy of the model out of the same unified RAM.
+    AdoptDeviceBytesAsHost(d.b, w);
   }
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
