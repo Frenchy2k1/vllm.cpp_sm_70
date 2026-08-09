@@ -42,6 +42,7 @@
 #include <ttnn/operations/embedding/embedding.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
+#include <ttnn/operations/data_movement/slice/slice.hpp>
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -534,10 +535,10 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
 
 // kSiluAndMul: SwiGLU gate half — out[i,j] = silu(x[i,j]) * x[i,j+d]
 // with d = x.shape[1]/2 (cpu_ops.cpp SiluAndMulKernel). Second Qwen3-dense
-// op beyond OPT (MLP: gate_up GEMM -> SiluAndMul -> down GEMM). Host-staged
-// while Alloc is host memory: pure elementwise, bit-exact for f32; bf16/f16
-// go through Load/Store for dtype round-trip. Device ttnn::silu + mul is
-// deferred with the other residual-stream fusions.
+// op beyond OPT (MLP: gate_up GEMM -> SiluAndMul -> down GEMM). Device path
+// keeps the gate_up → SiluAndMul → down GEMM chain on-device: slice the
+// last-dim halves, ttnn::silu(gate), ttnn::multiply by up. BF16 tile path
+// (same envelope as matmul/norm); not bit-exact vs host f32.
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   VT_CHECK(x.rank == 2 && out.rank == 2,
            "tenstorrent kSiluAndMul: only rank-2 tensors are supported");
@@ -550,16 +551,21 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t d = x.shape[1] / 2;
   VT_CHECK(out.shape[0] == t && out.shape[1] == d,
            "tenstorrent kSiluAndMul: out shape must be [T, D] with D = x.shape[1]/2");
-  EnsureHost(x);
-  for (int64_t i = 0; i < t; ++i) {
-    for (int64_t j = 0; j < d; ++j) {
-      const float gate = LoadElemF32(x, i * 2 * d + j);
-      const float up = LoadElemF32(x, i * 2 * d + d + j);
-      const float silu = gate / (1.0f + std::exp(-gate));
-      StoreElemF32(out, i * d + j, silu * up);
-    }
-  }
-  CommitHost(out);
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_x = EnsureDevice2D(x, device);
+  const uint32_t tu = static_cast<uint32_t>(t);
+  const uint32_t du = static_cast<uint32_t>(d);
+  // x = [gate | up] along last dim.
+  ttnn::Tensor gate = ttnn::slice(dev_x, ttsl::SmallVector<uint32_t>{0, 0},
+                                  ttsl::SmallVector<uint32_t>{tu, du},
+                                  ttsl::SmallVector<uint32_t>{1, 1});
+  ttnn::Tensor up = ttnn::slice(dev_x, ttsl::SmallVector<uint32_t>{0, du},
+                                ttsl::SmallVector<uint32_t>{tu, 2 * du},
+                                ttsl::SmallVector<uint32_t>{1, 1});
+  ttnn::Tensor silu_gate = ttnn::silu(gate);
+  ttnn::Tensor dev_y = ttnn::multiply(silu_gate, up);
+  CommitDevice2D(out, std::move(dev_y));
 }
 
 // kCastBf16 / kCastF32: elementwise dtype convert via Load/Store (cpu_ops
