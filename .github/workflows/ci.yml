@@ -453,7 +453,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+        run: |
+          cmake -S . -B build \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build
         # Bounded parallelism: a bare `-j` lets Make link ALL test executables at
         # once, which OOM-kills the runner (ld signal 9) during the parallel link.
@@ -462,8 +465,33 @@ jobs:
         env:
           VLLM_CPP_PACKAGE_TEST_BUILD_DIR: ${{ github.workspace }}/build
         run: python3 tests/scripts/test_server_package.py
+      - name: CPU ISA objects use only their declared feature flags
+        run: |
+          python3 scripts/check-cpu-isa-build.py \
+            --compile-commands build/compile_commands.json
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Force every x86 ISA tier available on this runner
+        run: |
+          tiers=(portable)
+          if [[ "$(uname -m)" == "x86_64" ]]; then
+            tiers+=(sse2)
+            if grep -qiw f16c /proc/cpuinfo && grep -qiw avx /proc/cpuinfo; then
+              tiers+=(sse2+f16c)
+            fi
+            if grep -qiw avx2 /proc/cpuinfo; then
+              tiers+=(avx2)
+            fi
+            if grep -qiw avx512f /proc/cpuinfo && \
+               grep -qiw avx512bw /proc/cpuinfo && \
+               grep -qiw avx512vl /proc/cpuinfo; then
+              tiers+=(avx512)
+            fi
+          fi
+          for tier in "${tiers[@]}"; do
+            echo "Running test_ops_matmul_elem with VT_CPU_MATMUL_TIER=${tier}"
+            VT_CPU_MATMUL_TIER="${tier}" build/tests/test_ops_matmul_elem
+          done
   sanitize-cpu:
     # The DYNAMIC detector lanes (VLLM_CPP_SANITIZE, see CMakeLists.txt). The
     # plain build-test-cpu job above proves the suite PASSES; it cannot see a

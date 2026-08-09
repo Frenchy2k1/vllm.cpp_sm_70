@@ -95,6 +95,8 @@ const ElemGemmTierTable& ElemGemmTier();
 // VT_CPU_MATMUL_TIER selects the tier for a SAME-BINARY A/B:
 //   "ref"      — the historical one-accumulator scalar chunk kernel
 //   "portable" — tier 0 only (no arch SIMD)
+//   "sse2", "sse2+f16c", "avx2", "avx512" — exact x86 tier; an unavailable
+//                  tier fails closed after CPUID + XCR0 validation
 //   unset      — the best tier this CPU probes into (production default)
 const char* ElemGemmTierName();
 
