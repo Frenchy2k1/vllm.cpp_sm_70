@@ -84,6 +84,17 @@ class Binder {
   // A raw buffer bound ONCE (no 16-bit view): the fused-chain step list.
   void AddRaw(void* buffer) { buffers_.push_back(buffer); }
 
+  // ONE MORE VIEW of an operand already added, for a shader that reads the same
+  // memory at a THIRD width (vt_matmul_vec's 64-bit packed loads). Deliberately
+  // separate from Add: this appends a SINGLE binding, and it must land after
+  // every operand's u32/u16 pair, so the caller is choosing the descriptor index
+  // rather than getting one implicitly.
+  uint32_t AddAlias(const Tensor& t, const char* what) {
+    Resolved r = Resolve(t.data, what);
+    buffers_.push_back(r.buffer);
+    return r.offset;
+  }
+
   // A tensor bound through the uint32_t view ONLY, for shaders that declare a
   // single binding per operand because the operand is integer (embedding ids,
   // sampler token ids) or f32-by-contract (logits). Binding the unused 16-bit
@@ -620,6 +631,118 @@ bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
   return k >= static_cast<int64_t>(kWorkgroupSize);
 }
 
+// GEMV VARIANT AXES (row BACKEND-VULKAN-GEMVROWS). Both are specialization
+// constants on the SAME committed module, so every arm of an A/B lives in one
+// binary; see shaders/vt_matmul_vec.comp for what each one can and cannot buy.
+//
+// Defaults are named here rather than spelled inline so a measured flip is one
+// edit and the env lever keeps meaning "override the measured default".
+//
+// MEASURED, GB10, benchmarks/vulkan_gemv_ab.cpp over the 27B's own decode shapes,
+// 9 arms x 4 rotated passes, each arm paired against the rows=1/pack=0 baseline
+// measured IN THE SAME PASS (the box drifted 15.5% peak-to-peak between passes,
+// so an unpaired ranking would have been noise):
+//
+//   rows=1 pack=0  1.000x     rows=2 pack=0  0.966x     rows=4 pack=0  0.968x
+//   rows=1 pack=1  1.025x     rows=2 pack=1  1.017x     rows=4 pack=1  1.014x
+//   rows=1 pack=2  1.086x     rows=2 pack=2  1.047x     rows=4 pack=2  1.039x
+//
+// ROWS > 1 IS A MEASURED LOSS ON THIS DEVICE, in all four passes and at every
+// pack width, so it ships OFF. It is kept as an axis rather than deleted because
+// llama.cpp makes exactly this knob device-dependent -- ggml-vulkan.cpp:4705-4719
+// sets `rm_stdq` to 2 on AMD GCN and on Intel and leaves it 1 elsewhere -- and the
+// board this campaign is waiting on (VK-I) is one of the two it raises it for.
+// Deleting the axis would mean rediscovering it there.
+// The likely reason it loses here: halving the workgroup count halves the number
+// of independent sequential read streams the memory controller sees, and each
+// surviving workgroup interleaves reads from rows k*2 bytes apart. The activation
+// re-reads it saves were L2 hits, which were never the constraint.
+constexpr uint32_t kGemvRowsDefault = 1;
+constexpr uint32_t kGemvPackDefault = 2;
+
+uint32_t EnvVariant(const char* name, uint32_t fallback, uint32_t lo, uint32_t hi) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || *v == '\0') return fallback;
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(v, &end, 10);
+  if (end == v || *end != '\0') return fallback;
+  const uint32_t val = static_cast<uint32_t>(parsed);
+  return (val >= lo && val <= hi) ? val : fallback;
+}
+
+// Once per distinct reason, exactly like the two DECLINED reporters above: a
+// variant that silently stops applying is the failure mode this whole row has to
+// be able to rule out, and reading the source cannot tell you which clause fired.
+void VariantWhy(const char* kind, const char* why) {
+  if (!kCoopMatWhy) return;
+  static std::mutex mu;
+  static std::set<std::string> seen;
+  std::lock_guard<std::mutex> g(mu);
+  if (seen.insert(std::string(kind) + "|" + why).second) {
+    std::fprintf(stderr, "[vt vulkan] gemv %s DECLINED: %s\n", kind, why);
+    std::fflush(stderr);
+  }
+}
+
+// OUTPUT ELEMENTS PER WORKGROUP. Requires m == 1 (so the block cannot straddle
+// two output rows) and n % rows == 0 (so the shader has no ragged tail to branch
+// on in its inner loop). Both hold for every decode projection in the models this
+// backend runs; when they do not, the request degrades to the next lower power of
+// two rather than failing, and says so under VT_VULKAN_DISPATCH_STATS.
+uint32_t GemvRows(int64_t m, int64_t n) {
+  // ONLY 1, 2 AND 4 EXIST, and that is a correctness constraint rather than a
+  // taste one: the shader materialises exactly four accumulator sets and guards
+  // them with `VT_MM_ROWS >= 2` / `>= 4`, so a value of 3 would compute two
+  // output elements while the host dispatched ceil(n/3) workgroups and silently
+  // drop a third of the row. Anything else falls back to 1.
+  static const uint32_t kWant = [] {
+    const uint32_t v = EnvVariant("VT_VULKAN_GEMV_ROWS", kGemvRowsDefault, 1, 4);
+    return (v == 1u || v == 2u || v == 4u) ? v : 1u;
+  }();
+  uint32_t rows = kWant;
+  while (rows > 1u && (m != 1 || (n % static_cast<int64_t>(rows)) != 0)) rows >>= 1;
+  if (rows < kWant) {
+    VariantWhy("rows", m != 1 ? "M is not 1" : "N is not a multiple of the requested row count");
+  }
+  return rows;
+}
+
+// LOAD WIDTH for 16-bit operands: 0 = one element per load, 1 = two through the
+// 32-bit view, 2 = four through the 64-bit view. Every requirement is a hard one
+// and a failure DEGRADES to the next narrower width rather than declining, so a
+// shape that cannot take the widest load still takes the one it can.
+//   * both operands 16-bit -- an f32 operand is already one element per 32-bit
+//     word, so there is nothing to pack.
+//   * byte offsets aligned to the load width -- the wide views index at
+//     (off >> 2) and (off >> 3), so a misaligned offset would read a word
+//     straddling two elements.
+//   * k divisible by the element count -- the shader's pair/quad count is exact
+//     with no ragged element left over, and a row start j*k must itself be
+//     aligned for every j, which k carries.
+uint32_t GemvPack(const Tensor& a, const Tensor& b, int64_t k, uint32_t a_off,
+                  uint32_t b_off) {
+  static const uint32_t kWant = EnvVariant("VT_VULKAN_GEMV_PACK", kGemvPackDefault, 0, 2);
+  if (kWant == 0) return 0;
+  const bool a16 = a.dtype == DType::kF16 || a.dtype == DType::kBF16;
+  const bool b16 = b.dtype == DType::kF16 || b.dtype == DType::kBF16;
+  if (!a16 || !b16) {
+    VariantWhy("pack", "an operand is not 16-bit (nothing to pack)");
+    return 0;
+  }
+  uint32_t level = kWant;
+  if (level >= 2 &&
+      ((a_off % 8u) != 0u || (b_off % 8u) != 0u || (k % 4) != 0)) {
+    VariantWhy("pack", "K or an operand byte offset is not 4-element aligned (8 B)");
+    level = 1;
+  }
+  if (level >= 1 &&
+      ((a_off % 4u) != 0u || (b_off % 4u) != 0u || (k % 2) != 0)) {
+    VariantWhy("pack", "K or an operand byte offset is not 2-element aligned (4 B)");
+    level = 0;
+  }
+  return level;
+}
+
 template <bool kBT>
 void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1];
@@ -644,20 +767,31 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   }
 
   if (GemvMatmulUsable(kBT, k, m)) {
-    // ONE WORKGROUP PER OUTPUT ELEMENT -- not FlatGroupCount, which would divide
-    // the element count by the workgroup size and put the whole K reduction back
-    // on a single lane. The workgroup cooperates on one element.
-    const uint32_t groups = static_cast<uint32_t>(m * n);
+    // ONE WORKGROUP PER `rows` OUTPUT ELEMENTS -- not FlatGroupCount, which would
+    // divide the element count by the workgroup size and put the whole K
+    // reduction back on a single lane. The workgroup cooperates on its elements.
+    const uint32_t rows = GemvRows(m, n);
+    const uint32_t groups = static_cast<uint32_t>((m * n + rows - 1) / rows);
     // VT_VULKAN_GEMV_UNROLL=1 forces the un-unrolled body, for the same-binary A/B.
     static const uint32_t kUnroll = [] {
       const char* v = std::getenv("VT_VULKAN_GEMV_UNROLL");
       return (v != nullptr && std::strcmp(v, "1") == 0) ? 1u : 4u;
     }();
-    const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
-                              DtypeCode(out.dtype), kUnroll};
+    const uint32_t spec[6] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
+                              DtypeCode(out.dtype), kUnroll, rows,
+                              GemvPack(a, b, k, a_off, b_off)};
     MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
                    static_cast<uint32_t>(k), a_off, b_off, out_off};
-    Go("vt_matmul_vec", bind, p, groups, spec, 4);
+    // TWO EXTRA BINDINGS, and they are the same two buffers again. This shader
+    // declares a 64-bit view of each input operand for the widest packed load;
+    // a shader must declare every descriptor the host writes, so both views are
+    // bound for every variant and the narrower ones simply never read them. The
+    // Binder pushed a and b at bindings 0-3 already, so the aliases have to be
+    // appended AFTER the output pair to land on 6 and 7.
+    Binder wide = bind;
+    wide.AddAlias(a, "matmul: a (64-bit view)");
+    wide.AddAlias(b, "matmul: b (64-bit view)");
+    Go("vt_matmul_vec", wide, p, groups, spec, 6);
     return;
   }
 
