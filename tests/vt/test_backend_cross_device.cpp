@@ -58,6 +58,7 @@ const char* DeviceName(DeviceType t) {
     case DeviceType::kVULKAN: return "VULKAN";
     case DeviceType::kXPU: return "XPU";
     case DeviceType::kROCM: return "ROCM";
+    case DeviceType::kTENSTORRENT: return "TENSTORRENT";
   }
   return "?";
 }
