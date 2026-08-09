@@ -129,7 +129,7 @@ RECORD_ANCHORS = {
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
     ".agents/NOW.md": "| Release | **ACTIVE; W5 contract + W6 package GREEN** |",
     ".agents/coordination.md": (
-        "**Server binary release W6 (`ENG-RELEASE-BINARIES`, 2026-08-09,"
+        "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,"
     ),
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": (
         "# W6 installed server package green"
@@ -144,8 +144,8 @@ RECORD_ANCHORS = {
 LIFECYCLE_RECORD_MUTATIONS = (
     (
         ".agents/engine-matrix.md",
-        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W6` |",
-        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W6` |",
+        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W1-W13` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W1-W13` |",
         "engine-matrix release lifecycle",
     ),
     (
@@ -283,6 +283,8 @@ PRIMARY_ARTIFACT_PROSE_MUTATIONS = (
 EXACT_MACHINE_FIELDS = {
     "lifecycle": "ACTIVE",
     "manifest_schema": "vllm.cpp.release-manifest.v1",
+    "delivery_pull_request": "196",
+    "delivery_mode": "single-pr-W1-W13",
     "work_W5_status": "implemented",
     "work_W6_status": "implemented",
     "work_W12_policy": "optional-non-blocking",

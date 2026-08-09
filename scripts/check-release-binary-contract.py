@@ -56,7 +56,7 @@ ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
     ".agents/NOW.md": "| Release | **ACTIVE; W5 contract + W6 package GREEN** |",
-    ".agents/coordination.md": "**Server binary release W6 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
+    ".agents/coordination.md": "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": "# W6 installed server package green",
     "docs/STATUS.md": "#196 W6 package/help GREEN; no published assets",
     "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; W5+W6 implemented)** | `ENG-RELEASE-BINARIES`:",
@@ -65,8 +65,8 @@ ANCHORS = {
 LIFECYCLE_RECORD_MUTATIONS = (
     (
         ".agents/engine-matrix.md",
-        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W6` |",
-        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W6` |",
+        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W1-W13` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W1-W13` |",
         "engine-matrix release lifecycle",
     ),
     (
@@ -400,6 +400,8 @@ TEST_LITERAL_INVENTORIES = {
     "EXACT_MACHINE_FIELDS": {
         "lifecycle": "ACTIVE",
         "manifest_schema": "vllm.cpp.release-manifest.v1",
+        "delivery_pull_request": "196",
+        "delivery_mode": "single-pr-W1-W13",
         "work_W5_status": "implemented",
         "work_W6_status": "implemented",
         "work_W12_policy": "optional-non-blocking",
@@ -572,6 +574,8 @@ TEST_INVENTORY_BODY_DIGESTS = {
 EXACT_MACHINE_FIELDS = {
     "lifecycle": "ACTIVE",
     "manifest_schema": "vllm.cpp.release-manifest.v1",
+    "delivery_pull_request": "196",
+    "delivery_mode": "single-pr-W1-W13",
     "work_W5_status": "implemented",
     "work_W6_status": "implemented",
     "work_W12_policy": "optional-non-blocking",
