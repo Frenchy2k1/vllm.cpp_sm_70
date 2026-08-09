@@ -43403,3 +43403,83 @@ The closed operator grammar adds `OP-CONTINUE` and removes the generic
 remote-state stops. Policy, T0, workflow, prompt, prompt checker, protocol
 checker, and mutation suites move together; no product or benchmark code
 changes, so the public benchmark result remains NOT APPLICABLE.
+
+## 2026-08-09 — Vulkan lm_head: column blocking wins 6/6, the K-unroll is ZERO, and the 273 GB/s roof is not reachable
+<!-- state: 2026-08-09T08:30 -->
+
+`row/BACKEND-VULKAN-LMHEAD` on base `93852c28`. The one decode GEMM per token
+that stays on the portable scalar kernel is the lm_head (`bt=0 m=1 k=5120
+n=248320`, 2.543 GB moved); the GEMV tactic's refusal of that orientation is
+correct and was not touched.
+
+THE STATED 9.3 ms FLOOR WAS WRONG, and the error was the roof. `vt_matmul_vec`
+on the IDENTICAL byte count (`vulkan-gemm-ab 1 5120 248320 30`) runs 11.04 ms =
+230.3 GB/s, so 230 is this box's practical streaming ceiling and the headroom was
+1.4 ms, not the 3.1 ms implied by 273 GB/s.
+
+MEASURED NEGATIVE, kept out of the tree: a four-way K unroll with the
+accumulation order preserved is ZERO (12.430 rolled vs 12.532 unrolled ms/call,
+three replicates each). The driver already pipelines the rolled loop.
+
+SHIPPED: `VT_VULKAN_MATMUL_NCOLS` (default 4) gives a workgroup 128*NCOLS
+CONSECUTIVE output columns of one row, so contiguity per workgroup rises from 256
+bytes to 1 KB per step of K. 12.485 -> 11.541 ms/call, 203.7 -> 220.4 GB/s,
+-1.066 ms/token by two-length diff, 6 of 6 interleaved pairs, 95.7% of the
+measured ceiling. NCOLS 8 is SLOWER than not blocking (243 workgroups is too
+little parallelism); NCOLS 2 is a tie. The optimum is interior.
+
+Numerically free and gated as such: each accumulator owns one output element and
+sums the whole K sequentially, so `vt_matmul` keeps the byte-exact tier the
+coopmat and GEMV tactics gave up; the gate is a memcmp of both arms in ONE
+process plus the specialization VALUES from a new `PipelineKeys()`, because both
+arms are the same module and produce identical bytes.
+
+Gates (GB10): `test_vulkan_backend` 30/30 (2369), `test_backend_cross_device`
+11/11 (132), `VLLM_CPP_DEVICE=vulkan test_opt_paged_engine` 6/6 prompts
+token-exact (96/96), 0 declines; `gen-vulkan-spirv.py --check` up to date. E2E
+27B decode moved 4.12 -> 4.13 tok/s, at the edge of this box's wall-clock noise;
+the paging-immune GPU-timestamp result is the binding one.
+
+PRE-EXISTING AND NOT CAUSED HERE, verified identical on `93852c28`:
+`check-public-doc-tables` fails on a non-canonical BENCHMARKS H2 section, one
+em-dash, and a STATUS ratchet overrun; `check-env-doc` lists 12 undocumented
+`VT_GEMMA4_*` / `VT_ROCM_*` / `VT_SERVER_*` vars. This change adds none of them
+and leaves STATUS.md strictly smaller than at base.
+
+## 2026-08-09 — Vulkan `vt_matmul` 20x bimodality: reclaim and co-residency REFUTED, mechanism OPEN
+<!-- state: 2026-08-09T11:00 -->
+
+`row/BACKEND-VULKAN-LMHEAD`, follow-up requested by the coordinator after two
+parallel agents reported the same bimodal legs with opposite explanations.
+
+EVERY 27B run in this row went through `flock $HOME/gpu.lock`; the `P4` block sat
+queued on it for 20+ minutes behind another agent. Only the dgx BUILD ran outside
+the lock.
+
+MEASURED, 16 alternated decode legs under the lock with `MemAvailable` at
+119,024-119,276 MB of 119 GB before EVERY leg (no other process resident): one
+leg collapsed to 259.62 ms/call while `vt_matmul_vec` beside it moved +0.3%. That
+leg's peak RSS (105,994,272 KB), major-fault count (1098) and TTFT (6346 ms) are
+indistinguishable from its healthy neighbours, and it had MORE free memory than
+they did. Co-residency, page reclaim and load/prefill effects are REFUTED. Four
+legs with 46k-304k major faults (40-270x normal, cold cache) read 12.46-13.92
+ms/call, so heavy paging costs ~10%, not 20x.
+
+MEASURED, standalone: `benchmarks/vulkan_gemm_ab.cpp` gained an `nn` orientation
+and realloc `cycles`, reaching the same kernel on the same 2.543 GB in seconds
+instead of a 3-minute 106 GB leg. 12 reallocations x 12 reps = 144 measurements
+on an idle box, all 12.39-13.96 ms, ZERO collapses.
+
+INFERRED, not established: the only variable separating the two regimes is that
+the 27B holds 106 GB RSS of a 119 GB unified box while the reproducer holds
+2.5 GB, so near-ceiling OCCUPANCY rather than contention is the surviving
+hypothesis. The ballast experiment that would test it was NOT run: an unguarded
+large allocation has OOM-rebooted this box before.
+
+SUGGESTIVE, explicitly NOT established: every collapse landed on the FLAT arm
+(`NCOLS 1` 3 of 23 legs; `NCOLS 4/8` 0 of 31), Fisher one-sided p about 0.07.
+Settling it needs ~60 more legs. It is the named next experiment, not a claim.
+
+The coordinator's "bigger than every other Vulkan lever" framing is NOT supported:
+at 1 leg in 16 the collapse costs roughly 6% of mean decode time, against the
+8.5% column blocking takes off this kernel deterministically.

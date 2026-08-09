@@ -88,6 +88,17 @@ class VulkanContext {
   // call -- the same trap the op-provider decline counters exist for.
   bool PipelineExistsFor(const std::string& name) const;
 
+  // Every cached pipeline key, as "<module>" or "<module>|<v0>,<v1>,...".
+  //
+  // PipelineExistsFor above answers "did any variant of this module run", which
+  // stops being enough the moment a module carries a PERFORMANCE axis rather than
+  // only correctness axes: at that point every arm of the A/B is the same module,
+  // the numbers are bit-identical by construction, and a test asserting only the
+  // module name passes just as happily when the optimization silently stopped
+  // being selected. The VALUES are the mechanism, so a gate has to be able to see
+  // them (VK-G, the vt_matmul K-unroll).
+  std::vector<std::string> PipelineKeys() const;
+
   // The FULL cache keys built for one module -- "<name>|<spec values, ascending
   // constantID>". PipelineExistsFor answers "did any variant run"; this answers
   // "WHICH variant ran", which is what a test has to assert when the variants
@@ -326,6 +337,22 @@ inline constexpr uint32_t kWorkgroupSize = 128;
 // Number of workgroups needed to cover `n` elements at kWorkgroupSize threads
 // each.
 uint32_t FlatGroupCount(int64_t n);
+
+// OUTPUT COLUMNS PER LANE for the scalar matmul tactic (VK-G), 1, 4 or 8. Defined
+// in vulkan_ops.cpp; declared here because it is the one axis of that kernel a
+// test has to be able to move.
+//
+// WHY A RUNTIME SETTER AND NOT JUST THE ENVIRONMENT VARIABLE. The claim this
+// optimization rests on is that the column-blocked body is BIT-IDENTICAL to the
+// flat one -- each accumulator owns one output element and runs the whole K
+// reduction sequentially, so nothing is reassociated and the byte-exact tier of
+// the general matmul path is untouched. Bit-identity between two SEPARATE
+// processes is not something a test can assert; both arms have to run in ONE
+// binary against the same inputs so the comparison can be a memcmp. The
+// environment variable stays the production lever; this is how the gate proves the
+// lever is numerically free.
+uint32_t MatmulColumnsPerLane();
+void SetMatmulColumnsPerLane(uint32_t ncols);
 
 }  // namespace vt::vulkan
 

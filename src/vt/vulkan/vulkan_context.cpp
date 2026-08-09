@@ -895,14 +895,24 @@ bool VulkanContext::PipelineExistsFor(const std::string& name) const {
   return false;
 }
 
-std::vector<std::string> VulkanContext::PipelineKeysFor(const std::string& name) const {
+std::vector<std::string> VulkanContext::PipelineKeys() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   const auto& cache = *static_cast<std::map<std::string, Pipeline>*>(pipelines_);
+  std::vector<std::string> out;
+  out.reserve(cache.size());
+  for (const auto& kv : cache) out.push_back(kv.first);
+  return out;
+}
+
+// A filter over PipelineKeys() rather than a second walk of the cache. It must
+// NOT take the mutex: PipelineKeys() already does, and that mutex is not
+// recursive, so locking here would deadlock.
+std::vector<std::string> VulkanContext::PipelineKeysFor(const std::string& name) const {
   std::vector<std::string> keys;
-  for (const auto& kv : cache) {
-    // Same prefix rule as PipelineExistsFor: "<module>" or "<module>|<spec…>".
-    if (kv.first == name || kv.first.compare(0, name.size() + 1, name + "|") == 0) {
-      keys.push_back(kv.first);
+  for (auto& key : PipelineKeys()) {
+    // Same prefix rule as PipelineExistsFor: "<module>" or "<module>|<spec...>".
+    if (key == name || key.compare(0, name.size() + 1, name + "|") == 0) {
+      keys.push_back(std::move(key));
     }
   }
   return keys;
