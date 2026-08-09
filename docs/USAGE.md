@@ -6,6 +6,23 @@ the reference behind it. Per-capability lifecycle state is
 [docs/STATUS.md](STATUS.md); measured numbers are
 [docs/BENCHMARKS.md](BENCHMARKS.md).
 
+## Confirming which CUDA architecture a build targets
+
+`CMakeCache.txt` is now a reliable answer. Configuring with
+`-DVLLM_CPP_CUDA_ARCHITECTURES=<arch>` writes that value into
+`CMAKE_CUDA_ARCHITECTURES` in the cache, so the two agree:
+
+```sh
+grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
+```
+
+It previously reported the toolkit's detected default (typically `75`) no matter
+what was requested, because the project set the variable without writing it back
+to the cache. Only the report was wrong — the emitted gencode always followed the
+requested value — but it sent a contributor looking in the wrong place
+([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
+gencode line remains the ground truth if you want to double-check.
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,

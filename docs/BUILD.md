@@ -206,7 +206,8 @@ defaults.
 | CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
 | CUDA | Hopper, sm_90a | Build-supported; the fast GDN (Triton-AOT) path is build-verified, not runtime-proven here |
-| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported; the fast GDN path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
+| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a) | Build-supported; the fast GDN path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
+| CUDA | Jetson Thor, sm_110 | Runtime-verified: the portable bf16 path ran the Llama-3.2-1B greedy gate token-exact on real silicon. Community reports add a 32B NVFP4A16 serving through the portable dequant-GEMM, and CUDA 13.2 passing the CUDA gates. fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY for `110` |
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
