@@ -1238,6 +1238,11 @@ vllm_cpp_add_test(test_qwen36_gguf_nvfp4_compute
 # the paged dense engine reproduces the pip-vLLM oracle greedy continuation
 # token-for-token via the fp4-resident W4A4 GEMM. See qwen27b-w4a4-notes.md §5.
 vllm_cpp_add_test(test_qwen27_paged_engine parity/test_qwen27_paged_engine.cpp)
+# `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.
+# Synthetic (no checkpoint, no GPU) BECAUSE test_qwen27_paged_engine runs the
+# unsloth @890bdef7 snapshot, whose head is BF16 — that gate cannot see this path.
+vllm_cpp_add_test(test_qwen27_dense_lmhead_fp4
+  parity/test_qwen27_dense_lmhead_fp4.cpp)
 target_compile_definitions(test_qwen27_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen27_paged_engine PRIVATE

@@ -219,11 +219,12 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 // head to FP8 with a PER-OUTPUT-CHANNEL scale, and nvidia/Qwen3.6-27B-NVFP4 ships
 // a ModelOpt NVFP4 head; both hit the old unconditional BF16 assert.
 //
-// All three land on the SAME bf16 [in, out] Matmul-B operand the logits GEMM
-// already consumes, so the forward is untouched and a BF16 head stays byte-exact
-// (identical call, no dequant). Keeping the head quantized end-to-end would save
-// ~2.3 GiB but needs an `lm_head_fp4`-style field on the dense weights plus a
-// forward branch; that is a follow-up, not this fix.
+// BF16 and FP8 heads land on the SAME bf16 [in, out] Matmul-B operand the logits
+// GEMM already consumes, so a BF16 head stays byte-exact (identical call, no
+// dequant). The NVFP4 form no longer reaches this function at all: since
+// PERF-27B-LMHEAD-FP4 (issue #213) LoadDenseLmHead routes it to the PACKED
+// `Qwen3_5DenseWeights::lm_head_fp4` instead, which is what vLLM does. The U8
+// branch below survives ONLY as the VT_LMHEAD_FP4=0 in-binary rollback.
 //
 // ModelOpt vs compressed-tensors global-scale convention: CT stores the value as
 // a DIVISOR and `DequantCtNvfp4WeightToF32` reciprocates it internally, whereas
@@ -499,6 +500,31 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
 
 }  // namespace
 
+bool DenseLmHeadFp4Enabled() {
+  const char* v = std::getenv("VT_LMHEAD_FP4");
+  return v == nullptr || v[0] != '0';
+}
+
+void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
+                     const std::string& proj, OwnedTensor& bf16_out,
+                     Nvfp4Weight& fp4_out) {
+  fp4_out = Nvfp4Weight{};
+  bf16_out = OwnedTensor{};
+  // PERF-27B-LMHEAD-FP4 (issue #213). An NVFP4 head stays PACKED, through the
+  // SAME LoadNvfp4AnyNaming every other NVFP4 projection takes — so the ModelOpt
+  // `weight_scale_2`-is-the-scale vs compressed-tensors
+  // `weight_global_scale`-is-the-divisor split is handled in exactly one place,
+  // and `input_scale` is left unconsumed (IsTrueW4A4() stays false) unless
+  // VT_MODELOPT_W4A4=1. vLLM makes the same two decisions: the mixed scheme is
+  // designed to resolve a quantized head (modelopt.py:2491-2496,2508-2536), and
+  // ModelOptNvFp4W4A16LinearMethod DELETES input_scale (modelopt.py:1359-1362).
+  if (DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj)) {
+    fp4_out = LoadNvfp4AnyNaming(get, has, proj);
+    return;
+  }
+  bf16_out = LoadLmHeadAnyDtype(get, has, proj + ".weight");
+}
+
 OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
                                 const std::vector<std::string>& names) {
   // Extracted to the shared dense_weight_loaders.h (SEAM GAP #3); this retains
@@ -633,7 +659,7 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
   // the embedding table and omit lm_head.weight.
   if (has("lm_head.weight")) {
-    w.lm_head = LoadLmHeadAnyDtype(get, has, "lm_head.weight");
+    LoadDenseLmHead(get, has, "lm_head", w.lm_head, w.lm_head_fp4);
   } else {
     w.tied_lm_head = true;
     w.embed_tokens.nk = true;
@@ -652,6 +678,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 }
 
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
+  // A PACKED head (PERF-27B-LMHEAD-FP4) is not plain bf16: the direct-device
+  // staging path this gates only knows how to stage OwnedTensors.
+  if (!weights.lm_head_fp4.Empty()) return false;
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
         !layer.mlp.down_proj_fp4.Empty()) {

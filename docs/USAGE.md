@@ -271,6 +271,17 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+### The NVFP4 output head
+
+On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
+`weight`/`weight_scale`/`weight_scale_2`, or compressed-tensors
+`weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
+GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
+head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
+2.543 GB on `nvidia/Qwen3.6-27B-NVFP4`. Set `VT_LMHEAD_FP4=0` for a same-binary
+A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF and
+`tie_word_embeddings` heads are unaffected by either setting.
+
 ### Validating a staged release archive
 
 Release verification reads only a freshly extracted archive, never files from
