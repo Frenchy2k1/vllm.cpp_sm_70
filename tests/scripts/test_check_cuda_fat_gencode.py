@@ -68,7 +68,14 @@ class FatGencodeContract(unittest.TestCase):
             )
 
     def test_exact_source_and_archive_matrix_passes(self) -> None:
-        result = self.run_checker(valid_commands())
+        entries = valid_commands()
+        entries.append(
+            {
+                "file": "/tmp/cutlass/tools/profiler/src/cublas_helpers.cu",
+                "command": "nvcc -c cublas_helpers.cu",
+            }
+        )
+        result = self.run_checker(entries)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_portable_source_missing_one_sm_fails(self) -> None:
