@@ -273,6 +273,7 @@ class BudgetEnforcement(unittest.TestCase):
 
     def test_every_created_checker_has_closed_bootstrap_evidence(self) -> None:
         expected = {
+            "scripts/check-arm-isa-build.py",
             "scripts/check-commit-trailers.py",
             "scripts/check-cpu-isa-build.py",
             "scripts/check-cuda-fat-gencode.py",

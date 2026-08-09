@@ -7,14 +7,9 @@
 // measurable AAPCS64 schedule over the exact same arithmetic.
 #include "vt/quant.h"
 
-#if defined(VT_CPU_A76_Q8_DOT) && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(VT_CPU_ARM_Q8_DOT) && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
 
 #include <arm_neon.h>
-
-#if defined(__linux__)
-#include <asm/hwcap.h>
-#include <sys/auxv.h>
-#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -22,23 +17,18 @@
 #include <string>
 
 #include "cpu_quant_blocks.h"
+#include "vt/cpu/cpu_isa_arm.h"
 
-#if defined(__linux__) && !defined(HWCAP_ASIMDDP)
-#define HWCAP_ASIMDDP (1 << 20)
-#endif
-
+#if defined(VT_CPU_A76_Q8_DOT)
 extern "C" void vt_cpu_q8_dot_a76_asm(int n, float* s, size_t bs, const void* x, size_t bx,
                                       const void* y, size_t by, int nrc);
+#endif
 
 namespace vt::cpu {
 namespace {
 
 bool CpuHasDotProd() {
-#if defined(__linux__)
-  return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
-#else
-  return true;
-#endif
+  return ArmIsaTierSupported(DetectArmIsaCaps(), ArmIsaTier::kDotProd);
 }
 
 bool CpuIsCortexA76() {
@@ -103,22 +93,34 @@ VecDotFn QuantQ8SdotVecDot() {
 }
 
 VecDotFn QuantQ8A76AsmVecDot() {
+#if defined(VT_CPU_A76_Q8_DOT)
   return CpuHasDotProd() ? &vt_cpu_q8_dot_a76_asm : nullptr;
+#else
+  return nullptr;
+#endif
 }
 
 VecDotFn SelectQuantQ8VecDot(VecDotFn portable) {
   const char* value = std::getenv("VT_CPU_Q8_DOT");
   if (value == nullptr || std::strcmp(value, "auto") == 0) {
-    return QuantQ8A76AsmActive() ? QuantQ8A76AsmVecDot() : portable;
+    if (QuantQ8A76AsmActive()) return QuantQ8A76AsmVecDot();
+    const VecDotFn sdot = QuantQ8SdotVecDot();
+    return sdot != nullptr ? sdot : portable;
   }
   if (std::strcmp(value, "portable") == 0) {
     return portable;
   }
   if (std::strcmp(value, "sdot") == 0) {
-    return QuantQ8SdotVecDot() != nullptr ? QuantQ8SdotVecDot() : portable;
+    const VecDotFn selected = QuantQ8SdotVecDot();
+    VT_CHECK(selected != nullptr,
+             "VT_CPU_Q8_DOT=sdot requires NEON DotProd OS capability");
+    return selected;
   }
   if (std::strcmp(value, "a76-asm") == 0) {
-    return QuantQ8A76AsmVecDot() != nullptr ? QuantQ8A76AsmVecDot() : portable;
+    const VecDotFn selected = QuantQ8A76AsmVecDot();
+    VT_CHECK(selected != nullptr,
+             "VT_CPU_Q8_DOT=a76-asm requires the Linux A76 assembly tier");
+    return selected;
   }
   VT_CHECK(false, "VT_CPU_Q8_DOT must be auto, portable, sdot, or a76-asm");
   return portable;

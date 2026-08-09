@@ -94,15 +94,15 @@ bool QuantQ8A76AsmActive();
 // process runs on i8mm-capable aarch64 (compile-time `__ARM_FEATURE_MATMUL_INT8`
 // AND runtime `HWCAP2_I8MM`) AND the dtype is one of the four encodings upstream
 // gives an mmla path (Q8_0, Q4_0, Q4_K, Q6_K). Returns nullptr everywhere else —
-// on any other CPU, when `VT_CPU_QUANT_MMLA=0`, and for q3_K/q5_K (no upstream
+// on any other CPU, when `VT_CPU_QUANT_MMLA=portable`, and for q3_K/q5_K (no upstream
 // mmla) — so the caller falls back to the portable nrc==1 tier. A returned
 // kernel produces a 2x2 output tile: it MUST be called with nrc==2, two
 // consecutive weight rows (stride bx) and two consecutive activation rows
 // (stride by), writing s[0]=(w0,a0), s[1]=(w1,a0), s[bs]=(w0,a1), s[bs+1]=(w1,a1).
 VecDotFn QuantMmlaVecDot(DType dtype);
 
-// True when the Arm i8mm mmla tier is live in this process (i8mm probed present
-// and not defeated by VT_CPU_QUANT_MMLA). Always false off i8mm-capable aarch64.
+// True when the Arm i8mm mmla tier is live in this process. A forced unsupported
+// tier fails closed; auto uses the shared Linux HWCAP/Darwin sysctl probe.
 bool QuantMmlaActive();
 
 // Bytes one quantized ACTIVATION row occupies for a given weight dtype, i.e.
@@ -144,8 +144,8 @@ bool HasQuantDotKernel(DType dtype);
 // kMatmulBTQuant is q8_0); the k-quants keep the mmla tier.
 
 // True when the i8mm repack tier is LIVE in this process: compiled for aarch64
-// with i8mm, `HWCAP2_I8MM` probed present, and not disabled by
-// `VT_CPU_QUANT_REPACK=0|off|false`. Always false off i8mm-capable aarch64, so
+// with i8mm, the exact HWCAP/sysctl bits probed present, and not forced to
+// `VT_CPU_QUANT_REPACK=portable`. Always false off i8mm-capable aarch64, so
 // the loader never repacks and every consumer keeps the portable/mmla path.
 bool QuantRepackActive();
 

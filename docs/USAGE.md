@@ -145,6 +145,13 @@ correctness/performance check. A forced tier that the current CPU or OS cannot
 execute fails closed instead of silently narrowing or risking an illegal
 instruction. Release builds never use `-march=native`.
 
+On arm64, leave the same variable unset to select between portable and NEON
+elementwise matmul, or force `portable`/`neon`. DotProd and i8mm kernels are
+independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
+`VT_CPU_QUANT_REPACK`; `auto` uses Linux HWCAP/HWCAP2 or Darwin feature sysctls,
+while an unavailable forced tier fails closed. The exact accepted values are
+listed in [ENVIRONMENT.md](ENVIRONMENT.md).
+
 Any OpenAI client works by pointing its `base_url` at it:
 
 ```python

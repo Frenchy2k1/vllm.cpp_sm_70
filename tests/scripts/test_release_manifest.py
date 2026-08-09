@@ -568,19 +568,22 @@ class ReleaseManifestTests(unittest.TestCase):
 
         arm_kernel_families = {
             "portable-neon": ["matmul-elem-f32-bf16-f16"],
+            "dotprod": ["quant-dot-q8_0-q8_0"],
             "i8mm": ["quant-dot-q4_0-q8_0-q4_K-q6_K", "quant-repack-q8_0"],
         }
-        for os_name, abi, artifact_id, probe in (
+        for os_name, abi, artifact_id, dotprod_probe, i8mm_probe in (
             (
                 "linux",
                 "glibc",
                 "linux-aarch64-glibc-cpu",
+                "getauxval:AT_HWCAP:HWCAP_ASIMDDP",
                 "getauxval:AT_HWCAP2:HWCAP2_I8MM",
             ),
             (
                 "macos",
                 "macos",
                 "macos-arm64-cpu-policy-probe",
+                "sysctl:hw.optional.arm.FEAT_DotProd",
                 "sysctl:hw.optional.arm.FEAT_I8MM",
             ),
         ):
@@ -599,10 +602,16 @@ class ReleaseManifestTests(unittest.TestCase):
                             "required_os_state": [],
                         },
                         {
+                            "name": "dotprod",
+                            "kernel_families": arm_kernel_families["dotprod"],
+                            "required_cpu_bits": ["dotprod", "neon"],
+                            "required_os_state": [dotprod_probe],
+                        },
+                        {
                             "name": "i8mm",
                             "kernel_families": arm_kernel_families["i8mm"],
-                            "required_cpu_bits": ["i8mm"],
-                            "required_os_state": [probe],
+                            "required_cpu_bits": ["dotprod", "i8mm", "neon"],
+                            "required_os_state": [dotprod_probe, i8mm_probe],
                         },
                     ],
                 },
@@ -610,7 +619,7 @@ class ReleaseManifestTests(unittest.TestCase):
             with self.subTest(aarch64_os=os_name):
                 self.assertEqual(self.tool._cpu_policy(arm), [])
                 wrong_probe = copy.deepcopy(arm)
-                wrong_probe["cpu"]["compiled_tiers"][1]["required_os_state"] = [
+                wrong_probe["cpu"]["compiled_tiers"][2]["required_os_state"] = [
                     "fabricated:os-probe"
                 ]
                 self.assertTrue(
