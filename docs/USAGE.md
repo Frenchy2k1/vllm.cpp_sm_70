@@ -192,9 +192,11 @@ bytes; placing either inside those bytes would create a self-reference.
 
 The CPU release helper is the reproducible entry point used by CI. It requires
 an explicit artifact tuple, architecture, channel, build directory, libc ABI,
-and a QEMU userspace emulator. The gate executes every compiled tier under a
-feature-rich CPU model, then executes the baseline and proves rich-tier refusal
-under a feature-poor model before metadata can be generated:
+a feature-poor QEMU userspace emulator, and a feature-rich runner. x86_64 uses
+the SHA256-pinned Intel SDE installed by `scripts/install-intel-sde.sh` so the
+AVX-512 tier is really executed even when the host lacks AVX-512. The gate then
+executes the baseline and proves rich-tier refusal under the feature-poor QEMU
+model before metadata can be generated:
 
 ```sh
 SOURCE_SHA=$(git rev-parse HEAD) \
@@ -203,7 +205,7 @@ SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) \
 EVIDENCE_URL=https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE \
 scripts/build-cpu-release.sh \
   linux-x86_64-glibc-cpu x86_64 stable build-release-cpu-x86 \
-  2.39 /usr/bin/qemu-x86_64
+  2.39 /usr/bin/qemu-x86_64 /tmp/intel-sde/sde64
 ```
 
 The corresponding arm64 tuple is `linux-aarch64-glibc-cpu`. The only literal

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 ]]; then
-  echo "usage: $0 ARTIFACT_ID ARCH CHANNEL BUILD_DIR ABI_VERSION POOR_EMULATOR" >&2
+if [[ $# -ne 7 ]]; then
+  echo "usage: $0 ARTIFACT_ID ARCH CHANNEL BUILD_DIR ABI_VERSION POOR_EMULATOR RICH_RUNNER" >&2
   exit 2
 fi
 
@@ -12,6 +12,7 @@ channel=$3
 build_dir=$4
 abi_version=$5
 poor_emulator=$6
+rich_runner=$7
 : "${SOURCE_SHA:?SOURCE_SHA is required}"
 : "${VERSION:?VERSION is required}"
 : "${EVIDENCE_URL:?EVIDENCE_URL is required}"
@@ -51,11 +52,16 @@ metadata_dir="$release_dir/metadata"
 archive="$release_dir/$artifact_id.tar.gz"
 mkdir -p "$release_dir"
 
+rich_runner_kind=qemu
+if [[ "$arch" == x86_64 ]]; then
+  rich_runner_kind=intel-sde
+fi
 python3 scripts/run-cpu-release-gates.py \
   --arch "$arch" \
   --tests-dir "$build_dir/tests" \
   --poor-emulator "$poor_emulator" \
-  --rich-emulator "$poor_emulator" \
+  --rich-runner "$rich_runner" \
+  --rich-runner-kind "$rich_runner_kind" \
   --rich-cpu max \
   --output "$tier_report" \
   --evidence-url "$EVIDENCE_URL"

@@ -18,14 +18,12 @@ mlx_license=${6:-}
 : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}"
 
 mlx=OFF
-mlx_metadata_args=()
 if [[ "$artifact_id" == macos-arm64-metal-mlx ]]; then
   mlx=ON
   if [[ -z "$mlx_root" || -z "$mlx_version" || -z "$mlx_license" ]]; then
     echo "MLX artifact requires an exact root, version, and license" >&2
     exit 2
   fi
-  mlx_metadata_args=(--mlx-license "$mlx_license")
 fi
 
 cmake -S . -B "$build_dir" -G Ninja \
@@ -68,7 +66,7 @@ python3 scripts/release_macos_metadata.py \
   --source-clean \
   --abi-version "$(sw_vers -productVersion)" \
   --mlx-version "$mlx_version" \
-  "${mlx_metadata_args[@]}" \
+  --mlx-license "$mlx_license" \
   --compiler "$compiler" \
   --toolchain "$toolchain" \
   --evidence-url "$EVIDENCE_URL"
