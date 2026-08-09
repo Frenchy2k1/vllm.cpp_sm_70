@@ -177,8 +177,11 @@ release gates are unchanged. [Spec and evidence](specs/sm120-qwen35-conv-chunkin
 Qwen3.5-4B Pareto campaign. The current sealed result passes throughput
 (**6784.743 vs 6643.593 tok/s**) while TTFT (**1018.040 vs 937.584 ms**),
 TPOT/ITL (**34.740 vs 33.906 ms**) and VRAM (**13053.3 vs 12820 MiB**) remain
-open. The first ordered gate transplants the historical opt-ins and measures
-combined K=4 causal-conv plus 16-token post-conv in a counterbalanced A/B;
+open. The historical default-off K=4 causal-conv, 16-token post-conv and
+BV16/swizzle/register-state decode arms and their focused contracts are now
+restored on the current branch; fresh performance measurement remains pending.
+The first ordered gate measures combined K=4 causal-conv plus 16-token
+post-conv in a counterbalanced A/B;
 same-tool local/vLLM tracing then selects the largest residual. Lifecycle
 stays `INVENTORIED`; generic Mamba and 27B/35B coverage are unchanged.
 [Campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
