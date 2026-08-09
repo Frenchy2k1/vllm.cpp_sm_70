@@ -226,6 +226,7 @@ CREATION_MUTATIONS = {
     "scripts/check-arm-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cpu-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cuda-fat-gencode.py": DISABLED_CREATION_CHECKER,
+    "scripts/validate-release-archive.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
     "scripts/check-triton-aot-multiarch.py": DISABLED_CREATION_CHECKER,

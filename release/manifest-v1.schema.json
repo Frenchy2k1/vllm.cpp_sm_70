@@ -59,10 +59,11 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "version", "channel", "kind", "static_boundary"],
+      "required": ["id", "version", "c_abi_version", "channel", "kind", "static_boundary"],
       "properties": {
         "id": {"type": "string", "minLength": 1},
         "version": {"type": "string", "minLength": 1},
+        "c_abi_version": {"type": "integer"},
         "channel": {
           "enum": ["stable", "preview", "experimental-preview"]
         },

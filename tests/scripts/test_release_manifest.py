@@ -148,6 +148,7 @@ def cpu_facts() -> dict[str, object]:
         "artifact": {
             "id": "linux-x86_64-glibc-cpu",
             "version": "0.1.0-test",
+            "c_abi_version": 17,
             "channel": "preview",
             "kind": "primary",
             "static_boundary": "static-core",
@@ -209,6 +210,7 @@ def cuda_facts() -> dict[str, object]:
         "artifact": {
             "id": "linux-x86_64-glibc-cuda-fat",
             "version": "0.1.0-test",
+            "c_abi_version": 17,
             "channel": "preview",
             "kind": "primary",
             "static_boundary": "static-core",
@@ -407,6 +409,18 @@ class ReleaseManifestTests(unittest.TestCase):
         manifest = self.generated(cpu_facts())
         manifest["schema_version"] = True
         self.assert_invalid(manifest, "schema_version")
+
+    def test_artifact_c_abi_version_is_mandatory_and_numeric(self) -> None:
+        manifest = self.generated(cpu_facts())
+        self.assertEqual(manifest["artifact"]["c_abi_version"], 17)
+        for value in (None, True, 0, -1, "17"):
+            with self.subTest(value=value):
+                mutant = copy.deepcopy(manifest)
+                if value is None:
+                    del mutant["artifact"]["c_abi_version"]
+                else:
+                    mutant["artifact"]["c_abi_version"] = value
+                self.assert_invalid(mutant, "c_abi_version")
 
     def test_boolean_is_neither_an_integer_type_nor_integer_json_constant(self) -> None:
         self.assertFalse(
