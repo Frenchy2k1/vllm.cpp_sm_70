@@ -87,6 +87,7 @@ class PathClassification(unittest.TestCase):
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
+            "release/release-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
         }

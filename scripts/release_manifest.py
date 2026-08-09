@@ -369,8 +369,11 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
 
 def _backend_policy(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     backend = manifest.get("backend", {})
+    artifact = manifest.get("artifact", {})
     if not isinstance(backend, dict):
         return []
+    if not isinstance(artifact, dict):
+        artifact = {}
     name = backend.get("name")
     flags = backend.get("flags", {})
     if not isinstance(flags, dict):
@@ -386,6 +389,11 @@ def _backend_policy(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     for flag, expected in expected_switches.items():
         if flags.get(flag) is not expected:
             errors.append(f"$.backend.flags.{flag}: inconsistent backend flags for {name}")
+    expects_literal_static = artifact.get("static_boundary") == "literal-static"
+    if flags.get("VLLM_CPP_LITERAL_STATIC") is not expects_literal_static:
+        errors.append(
+            "$.backend.flags.VLLM_CPP_LITERAL_STATIC: must agree with the artifact static boundary"
+        )
     if flags.get("VLLM_CPP_SERVER") is not True or flags.get("VLLM_CPP_BUILD_EXAMPLES") is not True:
         errors.append("$.backend.flags: release backend flags must build server and examples")
     if flags.get("VLLM_CPP_HIP_ARCHITECTURES") != []:

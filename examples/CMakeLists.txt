@@ -75,6 +75,14 @@ if(VLLM_CPP_SERVER)
   # thin C-ABI client; only the link form changes so an extracted archive does
   # not depend on a separately installed libvllm.
   target_link_libraries(server PRIVATE vllm::vllm)
+  if(VLLM_CPP_LITERAL_STATIC)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR VLLM_CPP_CUDA OR
+       VLLM_CPP_METAL OR VLLM_CPP_MLX OR VLLM_CPP_VULKAN OR VLLM_CPP_HIP)
+      message(FATAL_ERROR
+        "VLLM_CPP_LITERAL_STATIC is restricted to the experimental Linux CPU-only lane")
+    endif()
+    target_link_options(server PRIVATE -static -static-libgcc -static-libstdc++)
+  endif()
   set_target_properties(server PROPERTIES OUTPUT_NAME vllm-server)
   vllm_cpp_set_warnings(server)
   install(TARGETS server

@@ -58,6 +58,11 @@ jobs:
         run: |
           python3 scripts/check-release-workflow.py
           python3 tests/scripts/test_release_pipeline.py
+      - name: CPU release metadata and tier execution gates fail closed
+        run: |
+          python3 tests/scripts/test_release_metadata.py
+          python3 tests/scripts/test_release_accelerator_metadata.py
+          python3 tests/scripts/test_cpu_release_gates.py
       - name: README stays a human-readable user-facing document
         run: |
           python3 scripts/check-readme-structure.py

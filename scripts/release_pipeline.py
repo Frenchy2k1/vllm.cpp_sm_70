@@ -36,7 +36,11 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
@@ -94,36 +98,79 @@ def make_plan(
     }
 
 
-def make_handoff(plan_path: Path, output: Path) -> None:
+def inventory_assets(plan: dict[str, Any], assets_dir: Path) -> list[dict[str, Any]]:
+    if not assets_dir.is_dir():
+        raise ValueError(f"asset directory does not exist: {assets_dir}")
+    artifacts = plan.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("plan artifacts are invalid")
+    expected: dict[str, str] = {}
+    required_sets: dict[str, set[str]] = {}
+    for item in artifacts:
+        artifact_id = item["id"]
+        archive = f"{artifact_id}.tar.gz"
+        names = {
+            archive,
+            f"{archive}.sha256",
+            f"{archive}.provenance.json",
+        }
+        required_sets[artifact_id] = names
+        expected.update({name: artifact_id for name in names})
+    actual_paths = sorted(assets_dir.iterdir(), key=lambda path: path.name)
+    for path in actual_paths:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"release asset must be a regular file: {path.name}")
+        if path.name not in expected:
+            raise ValueError(f"release asset is not declared by the matrix: {path.name}")
+    actual = {path.name for path in actual_paths}
+    for item in artifacts:
+        names = required_sets[item["id"]]
+        present = names & actual
+        if present and present != names:
+            raise ValueError(f"release asset triplet is incomplete for {item['id']}")
+        if plan.get("publish") is True and item["required"] and present != names:
+            raise ValueError(f"publish-ready handoff is missing required artifact {item['id']}")
+    return [
+        {
+            "artifact_id": expected[path.name],
+            "name": path.name,
+            "sha256": file_sha256(path),
+            "size": path.stat().st_size,
+        }
+        for path in actual_paths
+    ]
+
+
+def handoff_value(plan_path: Path, assets_dir: Path) -> dict[str, Any]:
     plan = read_json(plan_path)
     if plan.get("schema") != PLAN_SCHEMA:
         raise ValueError("handoff input is not a release plan")
-    write_json(
-        output,
-        {
-            "artifacts": plan.get("artifacts"),
-            "plan_sha256": file_sha256(plan_path),
-            "publish": plan.get("publish"),
-            "release_tag": plan.get("release_tag"),
-            "schema": HANDOFF_SCHEMA,
-            "source_sha": plan.get("source_sha"),
-        },
-    )
-
-
-def verify_handoff(
-    plan_path: Path, handoff_path: Path, output: Path, expected_sha: str
-) -> None:
-    plan = read_json(plan_path)
-    handoff = read_json(handoff_path)
-    expected = {
+    return {
         "artifacts": plan.get("artifacts"),
+        "files": inventory_assets(plan, assets_dir),
         "plan_sha256": file_sha256(plan_path),
         "publish": plan.get("publish"),
         "release_tag": plan.get("release_tag"),
         "schema": HANDOFF_SCHEMA,
-        "source_sha": expected_sha,
+        "source_sha": plan.get("source_sha"),
     }
+
+
+def make_handoff(plan_path: Path, assets_dir: Path, output: Path) -> None:
+    write_json(output, handoff_value(plan_path, assets_dir))
+
+
+def verify_handoff(
+    plan_path: Path,
+    handoff_path: Path,
+    assets_dir: Path,
+    output: Path,
+    expected_sha: str,
+) -> None:
+    plan = read_json(plan_path)
+    handoff = read_json(handoff_path)
+    expected = handoff_value(plan_path, assets_dir)
+    expected["source_sha"] = expected_sha
     if handoff != expected or plan.get("source_sha") != expected_sha:
         raise ValueError("release handoff does not match the immutable plan and workflow SHA")
     write_json(output, {**handoff, "verified": True})
@@ -151,10 +198,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     plan.add_argument("--github-output", type=Path)
     handoff = commands.add_parser("handoff")
     handoff.add_argument("--plan", type=Path, required=True)
+    handoff.add_argument("--assets-dir", type=Path, required=True)
     handoff.add_argument("--output", type=Path, required=True)
     verify = commands.add_parser("verify")
     verify.add_argument("--plan", type=Path, required=True)
     verify.add_argument("--handoff", type=Path, required=True)
+    verify.add_argument("--assets-dir", type=Path, required=True)
     verify.add_argument("--output", type=Path, required=True)
     verify.add_argument("--sha", required=True)
     return parser.parse_args(argv)
@@ -173,12 +222,13 @@ def main(argv: list[str] | None = None) -> int:
                         "artifact_name": f"release-plan-{args.sha}",
                         "publish": plan["publish"],
                         "release_tag": plan["release_tag"],
+                        "version": plan["version"],
                     },
                 )
         elif args.command == "handoff":
-            make_handoff(args.plan, args.output)
+            make_handoff(args.plan, args.assets_dir, args.output)
         else:
-            verify_handoff(args.plan, args.handoff, args.output, args.sha)
+            verify_handoff(args.plan, args.handoff, args.assets_dir, args.output, args.sha)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"release pipeline error: {exc}", file=sys.stderr)
         return 1

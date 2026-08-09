@@ -112,10 +112,12 @@ cmake --build build --target vllm-server-archive
 build/release/stage/bin/vllm-server --help
 ```
 
-The archive under `build/release/` includes the version, configured backend, OS
-and host architecture in its name. These W6 archives remain development
-artifacts until W7 validation and supply-chain metadata land; no release
-download is claimed yet.
+The basic CMake archive under `build/release/` includes the version, configured
+backend, OS, and host architecture in its name. It is a developer package. The
+release workflow separately produces host-ABI-specific archives with a
+manifest, `VERSION`, SPDX SBOM, notices, licenses, and detached checksum and
+provenance sidecars; no release download is claimed until that workflow has
+completed on a release tag.
 
 To reproduce the W1 heterogeneous CUDA archive candidate, configure the exact
 release architecture set. Portable translation units compile for all ten SMs;
@@ -132,7 +134,12 @@ python3 scripts/check-cuda-fat-gencode.py \
   --library build-cuda-fat/libvllm.a
 ```
 
-This is a build/audit gate, not yet a downloadable release claim.
+The release workflow applies this audit to independently linked x86_64 and
+arm64 host executables, packages each as a preview `cuda-fat` archive, and then
+runs the extracted-archive validator. Each archive must contain all ten SM
+images and the six available exact-SM Triton AOT namespaces; the manifest keeps
+runtime evidence separate per SM. These build-only preview candidates are not
+a downloadable release claim until the tagged workflow publishes them.
 
 ### Selecting an x86 CPU ISA tier
 
@@ -171,6 +178,27 @@ The validator checks the content allowlist, executable and host ABI, manifest,
 `--help`/`--version` smokes, and backend-specific CUDA or adaptive-CPU claims.
 The digest and provenance are sidecars because both describe the final archive
 bytes; placing either inside those bytes would create a self-reference.
+
+The CPU release helper is the reproducible entry point used by CI. It requires
+an explicit artifact tuple, architecture, channel, build directory, libc ABI,
+and a QEMU userspace emulator. The gate executes every compiled tier under a
+feature-rich CPU model, then executes the baseline and proves rich-tier refusal
+under a feature-poor model before metadata can be generated:
+
+```sh
+SOURCE_SHA=$(git rev-parse HEAD) \
+VERSION=0.0.1 \
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) \
+EVIDENCE_URL=https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE \
+scripts/build-cpu-release.sh \
+  linux-x86_64-glibc-cpu x86_64 stable build-release-cpu-x86 \
+  2.39 /usr/bin/qemu-x86_64
+```
+
+The corresponding arm64 tuple is `linux-aarch64-glibc-cpu`. The only literal
+static tuple is the CPU-only `linux-x86_64-musl-cpu-static` experiment; normal
+CPU and accelerator archives are static-core bundles with audited host runtime
+dependencies.
 
 To exercise the release pipeline without publishing anything, trigger its
 manual entry point:

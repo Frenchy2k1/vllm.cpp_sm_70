@@ -82,6 +82,9 @@ SUITES=(
   test_release_manifest
   test_release_archive
   test_release_pipeline
+  test_release_metadata
+  test_release_accelerator_metadata
+  test_cpu_release_gates
   test_agent_role
   test_agent_onboard
   test_agent_start
