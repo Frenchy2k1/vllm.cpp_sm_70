@@ -1296,3 +1296,47 @@ audio arm's per-step trajectory: dump the audio rows at several steps and see wh
 per-channel mean structure is never built (a conditioning/guidance defect) or is built and
 then washed out (a sampler defect). Nothing about the audio path should be "fixed" before
 that reads, and no fix is attempted in this row.
+
+## 8.19 The metallic voice FIXED — the audio latent was denormalized ACROSS THE WRONG AXIS (2026-08-09, `row/H3-AUDIO-FIX`)
+
+§8.17 cleared the audio VAE (a real-speech latent round-trips to word-identical ASR) and
+§8.18 cleared `denormalize`'s arithmetic and localized the defect to a latent that
+regresses to the corpus mean. The cause is a LAYOUT disagreement between two functions
+that each held a self-consistent view of the same buffer.
+
+`MiniMaxH3UnpackAudioTokens` writes `[(c * latent_dim + d) * steps + t]` — the STEREO
+CHANNEL is outermost, `[audio_channel][latent_dim][steps]` — and the per-channel decode
+below reads it back at exactly that stride. But the buffer was handed to the VIDEO-shaped
+`denormalize`, which walks `latent[c * per_channel + i]` with `c` over `latents_dim`. Under
+the real layout its block `c` covers latent dims **{2c, 2c+1} of ONE stereo channel**, so
+every dim took another dim's mean/std. Dim `d` must take `mean[d]`/`std[d]` in BOTH stereo
+channels. The VIDEO arm was never affected: its latent really is `[C][T][H][W]` with C
+outermost, which is why video was coherent (§8.16) while audio was not.
+
+| Measure (stereo ch0, correct `[ac][d][t]` axis) | BEFORE | AFTER | real-speech reference |
+|---|---|---|---|
+| round-trip `encode(decode(z))` vs `z` | +0.4767 | **+0.9890** | ~1.0 for a sound VAE |
+| per-frame round-trip cosine | +0.4847 | **+0.9888** | — |
+| per-latent-dim \|mean\| | 0.2960 | **0.3458** | 0.4388 / 0.4787 / 0.5008 |
+| per-latent-dim std | 1.1785 | **1.0946** | 0.77-0.93 |
+
+The round-trip is the load-bearing number: the decoder now returns a latent the encoder
+reproduces almost exactly, i.e. the DiT's audio latent is back IN DISTRIBUTION. ASR on the
+512x512 verification render is word-perfect ("michael scheduled another all hands it is
+about the printer again").
+
+**Correction to §8.17.** That row reported the round-trip at **+0.016**. That figure was
+computed with the WRONG reshape — `(32, 2, 207)` instead of the true `(2, 32, 207)` — i.e.
+the same axis confusion that caused the bug also corrupted its measurement. Read on the
+correct axis the pre-fix round-trip is **+0.4767**. The defect and the fix are real; the
+severity in §8.17 was overstated.
+
+**Why every structural check passed.** Audio position grid (`w_grid.front()/back()`,
+cursor `text_len`, h=0), per-token timesteps (`t_a` to audio rows, `t_v` to video and
+non-media), the sigma schedule (`linspace(1,0,n)` then `s*b/(1+(s-1)*b)`, ending at 0),
+the Euler update (`advance(audio_rows, ..., t_a, s_a, s_a_next)`), the VAE decoder, the
+BigVGAN anti-aliasing and the frame-span constants (`{1,4,4,4,4}`, `5/3`) are all correct
+and were verified one by one. The defect lived in the INTERPRETATION of a buffer's axes
+between two correct functions — invisible to any check that does not compare the two
+readers against each other. The fix pins the expected size with a `VT_CHECK` so the
+assumption cannot drift again silently.

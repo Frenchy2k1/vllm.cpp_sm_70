@@ -461,8 +461,39 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                    audio_latent.size());
     }
   }
-  denormalize(audio_latent, dit_params.audio_latents_dim, audio_steps * request.audio_channel,
-              request.audio_latents_mean, request.audio_latents_std);
+  // The audio latent is NOT [latent_dim][...] like the video one. MiniMaxH3Unpack-
+  // AudioTokens writes `[(c * latent_dim + d) * steps + t]`, i.e. the STEREO
+  // CHANNEL is outermost -- [audio_channel][latent_dim][steps] -- and the decode
+  // below reads it back at exactly that stride. Handing that buffer to the
+  // video-shaped `denormalize` (which walks `latent[c * per_channel + i]` with c
+  // over latents_dim) made block c cover latent dims {2c, 2c+1} of ONE stereo
+  // channel, so every dim got another dim's mean/std: dim d must take mean[d] /
+  // std[d] in BOTH stereo channels. The video arm is unaffected -- its latent
+  // really is [C][T][H][W] with C outermost.
+  //
+  // Measured cost of the mismatch (§8.17/§8.18): the latent came out with roughly
+  // HALF the per-channel |mean| of real speech (0.2406 against 0.4388-0.5008,
+  // i.e. sitting on the CORPUS mean 0.194 instead of carrying clip identity) and
+  // raised variance -- the averaging signature of statistics applied across the
+  // wrong axis -- and it did not round-trip (encode(decode(z)) cosine +0.016).
+  // That is the metallic voice.
+  if (!request.audio_latents_mean.empty() || !request.audio_latents_std.empty()) {
+    const int64_t adim = dit_params.audio_latents_dim;
+    VT_CHECK(static_cast<int64_t>(request.audio_latents_mean.size()) == adim &&
+                 static_cast<int64_t>(request.audio_latents_std.size()) == adim,
+             "minimax_h3 t2va: audio latents_mean/std must have one value per latent dim");
+    VT_CHECK(static_cast<int64_t>(audio_latent.size()) ==
+                 request.audio_channel * adim * audio_steps,
+             "minimax_h3 t2va: audio latent is not [audio_channel, latents_dim, audio_t]");
+    for (int64_t ac = 0; ac < request.audio_channel; ++ac) {
+      for (int64_t d = 0; d < adim; ++d) {
+        const float mu = request.audio_latents_mean[static_cast<size_t>(d)];
+        const float sd = request.audio_latents_std[static_cast<size_t>(d)];
+        float* row = audio_latent.data() + static_cast<size_t>((ac * adim + d) * audio_steps);
+        for (int64_t t = 0; t < audio_steps; ++t) row[t] = row[t] * sd + mu;
+      }
+    }
+  }
 
   // --- 6. decode ---
   MiniMaxH3T2vaResult result;
