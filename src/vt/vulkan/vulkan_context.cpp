@@ -29,6 +29,7 @@
 #include "vulkan_context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,98 @@
 
 namespace vt::vulkan {
 namespace {
+
+// DEVICE-MEMORY ACCOUNTING, enabled by VT_VULKAN_ALLOC_STATS (BACKEND-VULKAN-
+// LOADMEM).
+//
+// GB10 is a UNIFIED-memory box: the one Vulkan heap and the machine's RAM are
+// the SAME 119 GiB, so a Vulkan allocation and a host allocation compete
+// directly and an over-allocating load takes the whole machine down rather than
+// failing cleanly (`NV_ERR_NO_MEMORY` out of `_memdescAllocInternal`, twice in
+// one day). Attributing that needs three numbers that only this layer can
+// supply: how many bytes the CALLER asked for, how many the DRIVER actually
+// committed (`VkMemoryRequirements::size`, which is rounded up), and how many
+// are LIVE at the moment the process peaks. Everything else -- RSS, page cache,
+// MemAvailable -- is observable from outside with /proc.
+//
+// Cost when off: one relaxed atomic add per allocation, which is noise against
+// a vkAllocateMemory. Cost when on: additionally a /proc read, but ONLY on a
+// new high-water mark, which is O(heap/step) times over a whole run.
+const bool kAllocStats = [] {
+  const char* v = std::getenv("VT_VULKAN_ALLOC_STATS");
+  return v != nullptr && std::strcmp(v, "0") != 0;
+}();
+
+struct AllocAccounting {
+  std::atomic<uint64_t> live_count{0};
+  std::atomic<uint64_t> total_count{0};
+  std::atomic<uint64_t> live_requested{0};  // caller bytes, before rounding
+  std::atomic<uint64_t> live_allocated{0};  // VkMemoryRequirements::size
+  std::atomic<uint64_t> total_requested{0};
+  std::atomic<uint64_t> total_allocated{0};
+  std::atomic<uint64_t> peak_allocated{0};
+  std::atomic<uint64_t> peak_count{0};
+  std::atomic<uint64_t> next_report{0};  // next high-water print threshold
+};
+
+AllocAccounting& Accounting() {
+  static AllocAccounting a;
+  return a;
+}
+
+// Per-allocation sizes, so FreeBuffer can subtract exactly what AllocBuffer
+// added. Keyed by the packed VkDeviceMemory, which is unique while it is live.
+// A map plus a mutex is free at this frequency: every entry costs one
+// vkAllocateMemory or vkFreeMemory, which is orders of magnitude dearer.
+std::mutex& AllocSizeMutex() {
+  static std::mutex m;
+  return m;
+}
+std::map<void*, std::pair<uint64_t, uint64_t>>& AllocSizes() {  // {requested, allocated}
+  static std::map<void*, std::pair<uint64_t, uint64_t>> m;
+  return m;
+}
+
+// One /proc key, in KiB as the kernel reports it, or 0 when absent. Read on the
+// slow path only.
+uint64_t ProcKiB(const char* path, const char* key) {
+  std::FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return 0;
+  char line[256];
+  const size_t klen = std::strlen(key);
+  uint64_t out = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::strncmp(line, key, klen) == 0 && line[klen] == ':') {
+      out = std::strtoull(line + klen + 1, nullptr, 10);
+      break;
+    }
+  }
+  std::fclose(f);
+  return out;
+}
+
+constexpr double kToGiB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+
+// Prints the full picture at one instant: what Vulkan holds, what the process
+// holds, and what the machine has left. The three together are the attribution
+// -- a Vulkan-only number cannot tell a driver over-allocation apart from a host
+// mirror of the same weights, and that distinction is the whole question.
+void ReportAllocState(const char* why) {
+  const AllocAccounting& a = Accounting();
+  std::fprintf(
+      stderr,
+      "[vt vulkan] alloc %-9s live=%llu bufs req=%.3f GiB alloc=%.3f GiB "
+      "peak=%.3f GiB | VmRSS=%.3f GiB VmHWM=%.3f GiB | MemAvail=%.3f GiB "
+      "Cached=%.3f GiB\n",
+      why, static_cast<unsigned long long>(a.live_count.load(std::memory_order_relaxed)),
+      static_cast<double>(a.live_requested.load(std::memory_order_relaxed)) * kToGiB,
+      static_cast<double>(a.live_allocated.load(std::memory_order_relaxed)) * kToGiB,
+      static_cast<double>(a.peak_allocated.load(std::memory_order_relaxed)) * kToGiB,
+      static_cast<double>(ProcKiB("/proc/self/status", "VmRSS")) * 1024.0 * kToGiB,
+      static_cast<double>(ProcKiB("/proc/self/status", "VmHWM")) * 1024.0 * kToGiB,
+      static_cast<double>(ProcKiB("/proc/meminfo", "MemAvailable")) * 1024.0 * kToGiB,
+      static_cast<double>(ProcKiB("/proc/meminfo", "Cached")) * 1024.0 * kToGiB);
+}
 
 // Dispatch accounting, enabled by VT_VULKAN_DISPATCH_STATS (VK-E deep dive).
 const bool kDispatchStats = [] {
@@ -864,6 +957,23 @@ VulkanContext::VulkanContext() {
     }
   }
 
+  // VT_VULKAN_ALLOC_STATS=1 dumps the device-memory summary at exit, for the
+  // same reason the dispatch histogram does: this context is never destroyed.
+  if (kAllocStats) {
+    std::atexit([] {
+      const AllocAccounting& a = Accounting();
+      ReportAllocState("exit");
+      std::fprintf(stderr,
+                   "[vt vulkan] alloc lifetime allocations=%llu requested=%.3f GiB "
+                   "committed=%.3f GiB peak_live=%.3f GiB peak_bufs=%llu\n",
+                   static_cast<unsigned long long>(a.total_count.load()),
+                   static_cast<double>(a.total_requested.load()) * kToGiB,
+                   static_cast<double>(a.total_allocated.load()) * kToGiB,
+                   static_cast<double>(a.peak_allocated.load()) * kToGiB,
+                   static_cast<unsigned long long>(a.peak_count.load()));
+    });
+  }
+
   // VT_VULKAN_DISPATCH_STATS=1 dumps the per-shader histogram at exit. Registered
   // with atexit rather than printed from a destructor because this context is a
   // never-destroyed process singleton, and because a run that is KILLED by a
@@ -1008,6 +1118,48 @@ void* VulkanContext::AllocBuffer(size_t bytes, void** out_buffer, void** out_mem
   Check(vk.vkAllocateMemory(device, &mai, nullptr, &memory), "vkAllocateMemory");
   Check(vk.vkBindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
 
+  // Account AFTER the allocation succeeded, so a failed allocation never
+  // inflates the live total. `req.size` is what the driver committed; `len` is
+  // what we asked for. On GB10 they are equal for every size the model loader
+  // uses, and the gap -- if a driver ever introduces one -- is exactly the
+  // "allocated is bigger than the tensor bytes" term this accounting exists to
+  // separate from a host mirror.
+  {
+    {
+      std::lock_guard<std::mutex> g(AllocSizeMutex());
+      AllocSizes()[Pack(memory)] = {static_cast<uint64_t>(len), static_cast<uint64_t>(req.size)};
+    }
+    AllocAccounting& a = Accounting();
+    a.live_count.fetch_add(1, std::memory_order_relaxed);
+    a.total_count.fetch_add(1, std::memory_order_relaxed);
+    a.live_requested.fetch_add(len, std::memory_order_relaxed);
+    a.total_requested.fetch_add(len, std::memory_order_relaxed);
+    a.total_allocated.fetch_add(req.size, std::memory_order_relaxed);
+    const uint64_t live =
+        a.live_allocated.fetch_add(req.size, std::memory_order_relaxed) + req.size;
+    uint64_t peak = a.peak_allocated.load(std::memory_order_relaxed);
+    while (live > peak &&
+           !a.peak_allocated.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+    }
+    uint64_t pc = a.peak_count.load(std::memory_order_relaxed);
+    const uint64_t lc = a.live_count.load(std::memory_order_relaxed);
+    while (lc > pc &&
+           !a.peak_count.compare_exchange_weak(pc, lc, std::memory_order_relaxed)) {
+    }
+    if (kAllocStats) {
+      // Report on each new 1 GiB high-water mark. A per-allocation line would be
+      // hundreds of thousands of lines on a 27B and would itself perturb the
+      // load; the high-water crossings are what a memory attribution needs.
+      constexpr uint64_t kStep = uint64_t{1} << 30;
+      uint64_t mark = a.next_report.load(std::memory_order_relaxed);
+      if (live >= mark &&
+          a.next_report.compare_exchange_strong(mark, ((live / kStep) + 1) * kStep,
+                                                std::memory_order_relaxed)) {
+        ReportAllocState("high-water");
+      }
+    }
+  }
+
   void* mapped = nullptr;
   Check(vk.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory");
   // vt::StepArena depends on >= 64-byte alignment (include/vt/backend.h:26).
@@ -1025,9 +1177,39 @@ void* VulkanContext::AllocBuffer(size_t bytes, void** out_buffer, void** out_mem
 void VulkanContext::FreeBuffer(void* buffer, void* memory) {
   const VulkanApi& vk = Api();
   auto device = Unpack<VkDevice>(device_);
+  {
+    std::pair<uint64_t, uint64_t> sizes{0, 0};
+    {
+      std::lock_guard<std::mutex> g(AllocSizeMutex());
+      auto& m = AllocSizes();
+      auto it = m.find(memory);
+      if (it != m.end()) {
+        sizes = it->second;
+        m.erase(it);
+      }
+    }
+    AllocAccounting& a = Accounting();
+    a.live_count.fetch_sub(1, std::memory_order_relaxed);
+    a.live_requested.fetch_sub(sizes.first, std::memory_order_relaxed);
+    a.live_allocated.fetch_sub(sizes.second, std::memory_order_relaxed);
+  }
   vk.vkUnmapMemory(device, Unpack<VkDeviceMemory>(memory));
   vk.vkDestroyBuffer(device, Unpack<VkBuffer>(buffer), nullptr);
   vk.vkFreeMemory(device, Unpack<VkDeviceMemory>(memory), nullptr);
+}
+
+DeviceAllocStats DeviceAllocStatsSnapshot() {
+  const AllocAccounting& a = Accounting();
+  DeviceAllocStats s;
+  s.live_count = a.live_count.load(std::memory_order_relaxed);
+  s.total_count = a.total_count.load(std::memory_order_relaxed);
+  s.live_requested = a.live_requested.load(std::memory_order_relaxed);
+  s.live_allocated = a.live_allocated.load(std::memory_order_relaxed);
+  s.total_requested = a.total_requested.load(std::memory_order_relaxed);
+  s.total_allocated = a.total_allocated.load(std::memory_order_relaxed);
+  s.peak_allocated = a.peak_allocated.load(std::memory_order_relaxed);
+  s.peak_count = a.peak_count.load(std::memory_order_relaxed);
+  return s;
 }
 
 namespace {

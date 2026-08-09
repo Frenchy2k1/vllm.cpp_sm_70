@@ -32,6 +32,10 @@
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 
+namespace vt {
+class Backend;
+}  // namespace vt
+
 namespace vllm {
 
 // One owned, contiguous, host tensor: heap bytes + shape/dtype. View() builds a
@@ -104,6 +108,35 @@ struct OwnedTensor {
   mutable std::shared_ptr<void> d_dev;
   mutable std::shared_ptr<void> d_dev_f32;
 };
+
+// ADOPT the device-resident copy AS the host buffer, where the backend says its
+// allocations are host-addressable (vt::Backend::DeviceMemoryIsHostAddressable).
+//
+// THE DEFECT THIS CLOSES (BACKEND-VULKAN-LOADMEM). `ResidentWeight` uploads a
+// weight and keeps `bytes` as well, so on Vulkan the model became resident
+// TWICE. That is invisible on a discrete GPU -- the two copies are in different
+// memories -- but GB10 is unified, so both come out of the same 119 GiB of
+// system RAM. MEASURED on Qwen3-4B (7.6 GiB on disk): 8.622 GiB of Vulkan
+// allocation and 16.392 GiB of process VmHWM, i.e. a whole second copy, and
+// 17.1 GiB off MemAvailable. Extrapolated to the 27B (50.89 GiB) that is over
+// 100 GiB, which is why loading it could take the machine down rather than fail.
+// `src/vllm/platforms/vulkan.cpp` even REASONED that there is "exactly one copy
+// of the bytes"; this is what makes that true.
+//
+// It is an ADOPTION, not a free: `bytes` is re-pointed at the device allocation
+// (persistently mapped, host-coherent) and keeps it alive through `d_dev`, so
+// every existing `.bytes` reader -- `ResidentWeightF32`'s upcast, the portable
+// CPU reference tier, `Numel`/`View` -- reads the SAME bytes it read before,
+// from the surviving copy. Nothing is dropped that anyone could still want, so
+// unlike `ReleaseHost()` this needs no "is the device path committed" proof.
+//
+// A no-op unless the backend opts in, and a no-op on an already-BORROWED buffer
+// (a GGUF mmap or a tied-weight expansion): those own no anonymous pages, and a
+// tied pair must keep sharing one keep-alive.
+//
+// `VT_ADOPT_DEVICE_BYTES=0` is the same-binary A/B back to the two-copy
+// behavior (house convention for a default-on residency change).
+void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
 // Device-resident NVFP4 W4A16 weight (M2.2b). The modelopt packed fp4 codes +
 // fp8-e4m3 group scales + per-tensor scale, kept RAW in the ORIGINAL torch
