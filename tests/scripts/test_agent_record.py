@@ -220,6 +220,27 @@ class AgentRecordMutationTests(unittest.TestCase):
             r"MODEL-FACTORY-registry table lacks semantic owner column",
         )
 
+    def test_engine_row_ratchet_is_load_bearing(self) -> None:
+        """The ENGINE_ROWS pin must catch a row appearing or vanishing.
+
+        The constant is re-pinned by hand whenever a real row lands, so it is
+        worth proving it is not decorative: a matrix carrying one row fewer than
+        the pin has to be an error, in both directions. Without this, bumping
+        the number to silence a failure would look exactly like bumping it for a
+        new row.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([error for error in clean if "engine rows" in error], [])
+
+        errors: list[str] = []
+        with mock.patch.object(
+            agent_record, "ENGINE_ROWS", agent_record.ENGINE_ROWS - 1
+        ):
+            agent_record.check_matrices(errors)
+
+        require(errors, r"\d+ engine rows; expected \d+")
+
     def test_engine_summary_rejects_stale_area_rollup(self) -> None:
         source = agent_record.ENGINE_MATRIX.read_text(encoding="utf-8")
         current = next(
