@@ -508,6 +508,33 @@ class RoleDiscipline(unittest.TestCase):
         finally:
             sys.argv = saved
 
+    def test_the_real_push_that_reddened_main_now_passes(self) -> None:
+        """`3bbee96e..0cf3dbbb` is the exact CI range that failed for PR #178.
+
+        The unit checks above own the rule; this one owns the fact that the rule
+        answers THE push CI ran. Skipped rather than failed where the history is
+        absent (a shallow clone), because the checkers themselves need depth.
+
+        `has_reached_main` and `enforced` are pinned TRUE on purpose: run from a
+        `row/*` worktree they report every commit as pending PR disposition, so
+        main() would return 0 without judging arrival at all and this test would
+        pass against the very defect it exists to catch.
+        """
+        base, head = "3bbee96ea8649cefd748bf3b979f91ae4f31d08b", "0cf3dbbb"
+        try:
+            discipline.git("cat-file", "-e", f"{base}^{{commit}}")
+            discipline.git("cat-file", "-e", f"{head}^{{commit}}")
+        except subprocess.CalledProcessError:
+            self.skipTest("history for the #178 push range is not present")
+        saved = sys.argv
+        sys.argv = [saved[0], "--base", base, "--head", head]
+        try:
+            with mock.patch.object(discipline, "has_reached_main", return_value=True), \
+                 mock.patch.object(discipline, "enforced", return_value=True):
+                self.assertEqual(discipline.main(), 0)
+        finally:
+            sys.argv = saved
+
     def test_a_pr_number_in_the_body_does_not_decide_this_gate(self) -> None:
         """Regression: the case that made the test above fail in CI.
 
@@ -524,6 +551,79 @@ class RoleDiscipline(unittest.TestCase):
                 self.assertEqual(discipline.main(), 1)
         finally:
             sys.argv = saved
+
+
+class MergeLandedPrContent(unittest.TestCase):
+    """A PR landed with a REAL merge commit pushes the branch commits too.
+
+    Those commits were never required to name the PR -- the merge above them
+    does -- so judging each one on its own message called every merge-landed PR
+    a direct push. Every main push that merged a PR was red for it (#178's
+    `6603356a`, #204's `e73cbbae`, #196's `1a02ab4f`). These build real git
+    history rather than hand-fed parents, because the defect was in WHICH
+    commits get judged, not in how one commit's message reads.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.com")
+        self.git("config", "user.name", "T")
+        self.commit("docs: seed", "docs/STATUS.md")
+
+    def git(self, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", *args], cwd=self.repo, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+
+    def commit(self, message: str, path: str) -> str:
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{message}\n{path}\n")
+        self.git("add", path)
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def land_via_merge(self, merge_message: str, branch_message: str) -> tuple[str, str]:
+        """Build `main -- merge(row branch)` and return (branch head, merge)."""
+        self.git("checkout", "-q", "-b", "row/ENG-FOO")
+        head = self.commit(branch_message, "src/vllm/a.cpp")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", merge_message, "row/ENG-FOO")
+        return head, self.git("rev-parse", "HEAD")
+
+    def content(self, *commits: str) -> frozenset[str]:
+        with mock.patch.object(discipline, "ROOT", self.repo):
+            return discipline.merged_pr_content(list(commits))
+
+    def test_a_row_pr_merge_exempts_the_branch_commits_it_brings_in(self) -> None:
+        head, merge = self.land_via_merge(
+            "Merge pull request #12 from mudler/row/ENG-FOO", "perf: faster kernel"
+        )
+        self.assertIn(head, self.content(merge))
+
+    def test_the_exemption_does_not_reach_mains_own_history(self) -> None:
+        """`--not parents[0]`: the first-parent side is main, not PR content."""
+        seed = self.git("rev-parse", "HEAD")
+        _, merge = self.land_via_merge(
+            "Merge pull request #12 from mudler/row/ENG-FOO", "perf: faster kernel"
+        )
+        self.assertNotIn(seed, self.content(merge))
+
+    def test_a_direct_push_is_not_laundered_by_a_later_row_pr_merge(self) -> None:
+        """The hole this must not open: merging a PR on top of a direct push."""
+        pushed = self.commit("perf: hand-edit a kernel", "src/vt/cuda/x.cu")
+        _, merge = self.land_via_merge(
+            "Merge pull request #12 from mudler/row/ENG-FOO", "perf: faster kernel"
+        )
+        self.assertNotIn(pushed, self.content(pushed, merge))
+
+    def test_a_merge_naming_no_row_anywhere_exempts_NOTHING(self) -> None:
+        head, merge = self.land_via_merge("Merge branch 'wip'", "perf: hand-edit")
+        self.assertEqual(self.content(merge), frozenset())
+        self.assertNotIn(head, self.content(merge))
 
 
 class ReadOnlyAndModeTests(unittest.TestCase):
