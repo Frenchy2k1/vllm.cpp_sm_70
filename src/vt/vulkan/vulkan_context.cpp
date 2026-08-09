@@ -51,6 +51,83 @@ const bool kDispatchStats = [] {
   const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
   return v != nullptr && std::strcmp(v, "0") != 0;
 }();
+
+// HOST-SIDE PHASE PROFILE, enabled by VT_VULKAN_HOST_PROFILE (BACKEND-VULKAN-
+// HOSTDISPATCH).
+//
+// The campaign's "host = wall - GPU" subtraction is an INFERENCE across two
+// different runs: a wall-clock run with no query pool, minus the sum of the
+// per-shader GPU timestamps from a separate stats run. It cannot distinguish
+// host recording cost from a GPU bubble between dispatches, and it cannot say
+// WHICH host line costs the microseconds. This measures our own side of the
+// boundary directly, attributing every nanosecond spent inside Dispatch to one
+// of five phases, and separates the submit and the fence wait inside the flush.
+//
+// Cost when on: 6 clock_gettime calls per dispatch (vDSO, ~20 ns each) against a
+// ~5.9 us dispatch, so ~2%. Cost when off: one predictable branch on a cached
+// const bool.
+const bool kHostProfile = [] {
+  const char* v = std::getenv("VT_VULKAN_HOST_PROFILE");
+  return v != nullptr && std::strcmp(v, "0") != 0;
+}();
+
+// Accumulators for the above. Every one of these is touched only under the
+// dispatch mutex, which Dispatch and FlushBatchLocked's caller already hold.
+struct HostProfile {
+  uint64_t dispatches = 0;
+  uint64_t flushes = 0;
+  // Dispatch phases, nanoseconds.
+  uint64_t ns_pipeline = 0;   // GetPipeline: key build + std::map lookup
+  uint64_t ns_descriptor = 0; // the write array + vkUpdateDescriptorSets
+  uint64_t ns_record = 0;     // begin / barrier / bind / push / vkCmdDispatch
+  uint64_t ns_bookkeep = 0;   // histogram, batch_buffers_ set, counters
+  uint64_t ns_total = 0;      // whole Dispatch body, flush time EXCLUDED
+  // Flush phases, nanoseconds.
+  uint64_t ns_flush_submit = 0;  // End + ResetFences + QueueSubmit
+  uint64_t ns_flush_wait = 0;    // vkWaitForFences
+  uint64_t ns_flush_other = 0;   // query readback + ring reset + set clear
+};
+HostProfile g_host_profile;
+
+inline uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+// Registered on first use rather than unconditionally, so a run with profiling
+// off installs no handler at all.
+void DumpHostProfileAtExit() {
+  static bool registered = false;
+  if (registered) return;
+  registered = true;
+  std::atexit([] {
+    const HostProfile& p = g_host_profile;
+    const double d = p.dispatches ? double(p.dispatches) : 1.0;
+    std::fprintf(stderr,
+                 "[vt vulkan] HOST PROFILE  dispatches=%llu flushes=%llu\n"
+                 "[vt vulkan]   phase              total_ms     ns/dispatch\n"
+                 "[vt vulkan]   pipeline-lookup  %10.2f  %12.1f\n"
+                 "[vt vulkan]   descriptor       %10.2f  %12.1f\n"
+                 "[vt vulkan]   record           %10.2f  %12.1f\n"
+                 "[vt vulkan]   bookkeeping      %10.2f  %12.1f\n"
+                 "[vt vulkan]   DISPATCH TOTAL   %10.2f  %12.1f\n"
+                 "[vt vulkan]   flush-submit     %10.2f  %12.1f\n"
+                 "[vt vulkan]   flush-wait       %10.2f  %12.1f\n"
+                 "[vt vulkan]   flush-other      %10.2f  %12.1f\n",
+                 static_cast<unsigned long long>(p.dispatches),
+                 static_cast<unsigned long long>(p.flushes),
+                 p.ns_pipeline / 1.0e6, p.ns_pipeline / d,
+                 p.ns_descriptor / 1.0e6, p.ns_descriptor / d,
+                 p.ns_record / 1.0e6, p.ns_record / d,
+                 p.ns_bookkeep / 1.0e6, p.ns_bookkeep / d,
+                 p.ns_total / 1.0e6, p.ns_total / d,
+                 p.ns_flush_submit / 1.0e6, p.ns_flush_submit / d,
+                 p.ns_flush_wait / 1.0e6, p.ns_flush_wait / d,
+                 p.ns_flush_other / 1.0e6, p.ns_flush_other / d);
+  });
+}
 // COMMAND-BUFFER BATCHING (VK-A2), VT_VULKAN_BATCH.
 //
 // DEFAULT ON. `=0` forces the per-dispatch submit-and-wait path, as a bisect
@@ -307,7 +384,14 @@ Probe ProbeDevice(VkInstance instance) {
 // CPU-threadpool spin suppressed puts 62% of on-CPU time in the kernel and the
 // NVIDIA driver against only 14% in our own code. So the submits ARE the host
 // cost, and the ring depth is what sets how many there are.
-constexpr uint32_t kDescriptorRing = 128;
+// RAISED FROM 128 TO 256 BY BACKEND-VULKAN-HOSTDISPATCH. The ring is now
+// PARTITIONED across in-flight slots, so the depth one batch can use is
+// kDescriptorRing / kInFlight. Leaving it at 128 would have halved the effective
+// depth to 64 the moment pipelining was enabled and doubled the flush count per
+// token, trading the win back. 256 keeps a 2-deep pipeline at the same 128 sets
+// per batch that the un-pipelined ring had. VT_VULKAN_RING A/Bs the two in ONE
+// binary.
+constexpr uint32_t kDescriptorRing = 256;
 
 // EFFECTIVE ring depth, clamped to the allocated one. Exists so the ring can be
 // A/B'd in ONE binary: it was 16, which capped batches at 40-46 dispatches, and a
@@ -321,6 +405,70 @@ const uint32_t kRingDepth = [] {
   return n > static_cast<int>(kDescriptorRing) ? kDescriptorRing : static_cast<uint32_t>(n);
 }();
 
+// HOW MANY BATCHES MAY BE IN FLIGHT AT ONCE (BACKEND-VULKAN-HOSTDISPATCH).
+//
+// 1 restores the pre-row submit-and-wait behaviour EXACTLY, which is what makes
+// this a same-binary A/B rather than the cross-build comparison that has already
+// produced one false reading in this campaign.
+//
+// The default is 2: the host only needs ONE batch of look-ahead to overlap its
+// recording with the GPU, because a batch is ~57 ms of GPU work against ~0.4 ms
+// of host recording. Deeper queues buy nothing and cost descriptor-ring width.
+const uint32_t kInFlight = [] {
+  const char* v = std::getenv("VT_VULKAN_INFLIGHT");
+  uint32_t n = 2;
+  if (v != nullptr) {
+    const int parsed = std::atoi(v);
+    n = parsed < 1 ? 1u : static_cast<uint32_t>(parsed);
+  }
+  return n > VulkanContext::kMaxInFlight ? VulkanContext::kMaxInFlight : n;
+}();
+
+// Upper bound on the descriptor writes ONE dispatch can issue, and therefore the
+// size of the stack arrays the dispatch path builds them in. It replaces a pair
+// of heap `std::vector`s that were constructed and destroyed on every dispatch.
+//
+// This is a real bound, not llama.cpp's MAX_PARAMETER_COUNT of 12
+// (ggml-vulkan.cpp:6424-6437): the Binder in vulkan_ops.cpp binds a u32 AND a u16
+// VIEW of most operands, so the widest kernel here (the fused GDN post-conv
+// preamble, 8 operands) already declares 16 bindings. 32 is headroom over that,
+// checked at dispatch so an overrun names itself instead of smashing the stack.
+constexpr uint32_t kMaxDispatchBindings = 32;
+
+// Descriptor-ring sets available to ONE slot. The ring is partitioned rather
+// than shared, so slot s owns [s*kRingSlice, (s+1)*kRingSlice) and no set can be
+// rewritten by a batch while an earlier, still-executing batch reads it.
+const uint32_t kRingSlice = [] {
+  const uint32_t slice = kRingDepth / kInFlight;
+  return slice < 1 ? 1u : slice;
+}();
+
+// A FENCE SPIN WAS TRIED AND IS REJECTED. RECORDED HERE BECAUSE THE NEGATIVE IS
+// THE EXPENSIVE PART.
+//
+// llama.cpp spins on `vkGetFenceStatus` instead of blocking, so the host resumes
+// the instant the GPU signals rather than when the scheduler gets round to it
+// (`ggml_vk_wait_for_fence`, ggml-vulkan.cpp:2306-2326 @ 237ad9b96). Ported here
+// it was worth a MEASURED 2.6 ms/token on 27B decode -- and it COMPUTED THE WRONG
+// NUMBERS on GB10.
+//
+// Same binary, same tree, one variable, on the GB10 device:
+//
+//   VT_VULKAN_FENCE_SPIN=0   test_vulkan_backend 33/33, opt-125m 6/6 token-exact
+//   VT_VULKAN_FENCE_SPIN=1   test_vulkan_backend 16/33, opt-125m DIVERGES
+//
+// It failed identically with pipelining ON and OFF, which is what identifies the
+// spin rather than the pipelining as the cause; the failures are host reads of
+// device memory returning PRE-DISPATCH contents, so observing the fence signalled
+// through `vkGetFenceStatus` did not make the device writes visible to the host on
+// this driver the way returning from `vkWaitForFences` does. It passed on
+// llvmpipe, which is why only running it on the real device found it.
+//
+// The retire path below therefore always blocks in `vkWaitForFences`. The
+// `vkGetFenceStatus` call it makes first is a pure diagnostic -- it distinguishes
+// a retirement that had to block from one that did not -- and is never the
+// synchronisation.
+
 struct VulkanContext::Pipeline {
   VkShaderModule module = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
@@ -330,6 +478,80 @@ struct VulkanContext::Pipeline {
   uint32_t used_this_batch = 0;  // reset by FlushBatchLocked
   uint32_t buffer_count = 0;
   uint32_t push_size = 0;
+  // Dispatch accounting moved OFF the hot path. It used to be
+  // `++map<string,uint64_t>[name]` on every dispatch: a red-black descent with
+  // string comparisons, 900 times per decode token, for a counter that is only
+  // ever read by a diagnostic. The pipeline is already in hand at that point, so
+  // the counter lives here and DispatchHistogram aggregates on demand.
+  uint64_t dispatches = 0;
+  const char* module_name = nullptr;  // points into the committed SPIR-V table
+};
+
+// The set of buffers bound by any batch that has not yet been drained.
+//
+// Was `std::set<void*>`, i.e. a red-black node allocation per newly seen buffer
+// and a pointer-comparison descent per bound buffer on every dispatch -- about
+// 3,600 lookups per decode token. This is an open-addressed table with linear
+// probing over a power-of-two array, which is a load and a compare in the common
+// case and stops allocating once it has grown to the working set.
+//
+// It GROWS rather than carrying a fixed capacity. A batch may legitimately bind
+// any number of distinct buffers -- a 27B decode token names several hundred
+// weight allocations -- so a fixed table would be a model-size-dependent hard
+// failure, which is a worse trade than a handful of reallocations during warmup.
+class BufferSet {
+ public:
+  BufferSet() : slots_(1024, nullptr) {}
+
+  void Insert(void* p) {
+    // Load factor kept under 1/2, which is what bounds the probe chains and
+    // guarantees the scan loops below terminate.
+    if ((count_ + 1) * 2 > slots_.size()) Grow();
+    const size_t at = Probe(p);
+    if (slots_[at] != nullptr) return;  // already present
+    slots_[at] = p;
+    ++count_;
+  }
+
+  bool Contains(void* p) const { return slots_[Probe(p)] != nullptr; }
+
+  void Clear() {
+    if (count_ == 0) return;
+    std::fill(slots_.begin(), slots_.end(), nullptr);
+    count_ = 0;
+  }
+
+ private:
+  static size_t Hash(void* p) {
+    // Fibonacci hashing on the pointer, shifted past the allocator's alignment
+    // bits so distinct buffers do not all collide into one probe chain.
+    uint64_t x = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) >> 4;
+    x *= 0x9E3779B97F4A7C15ull;
+    return static_cast<size_t>(x >> 32);
+  }
+
+  // Index of `p` if present, else the index of the free slot it belongs in.
+  size_t Probe(void* p) const {
+    const size_t mask = slots_.size() - 1;
+    size_t i = Hash(p) & mask;
+    while (slots_[i] != nullptr && slots_[i] != p) i = (i + 1) & mask;
+    return i;
+  }
+
+  void Grow() {
+    std::vector<void*> old;
+    old.swap(slots_);
+    slots_.assign(old.size() * 2, nullptr);
+    count_ = 0;
+    for (void* q : old) {
+      if (q == nullptr) continue;
+      slots_[Probe(q)] = q;
+      ++count_;
+    }
+  }
+
+  std::vector<void*> slots_;
+  size_t count_ = 0;
 };
 
 bool VulkanContext::Available() {
@@ -518,28 +740,48 @@ VulkanContext::VulkanContext() {
   VT_CHECK(type >= 0, "vulkan: no HOST_VISIBLE|HOST_COHERENT memory type");
   memory_type_index_ = static_cast<uint32_t>(type);
 
-  VkCommandPoolCreateInfo cpci{};
-  cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-  cpci.queueFamilyIndex = queue_family_;
-  VkCommandPool command_pool = VK_NULL_HANDLE;
-  Check(Api().vkCreateCommandPool(device, &cpci, nullptr, &command_pool), "vkCreateCommandPool");
-  command_pool_ = Pack(command_pool);
+  // ONE COMMAND POOL PER IN-FLIGHT SLOT. vkResetCommandPool resets every buffer
+  // allocated from the pool, so a single shared pool cannot be reset while any
+  // other slot's buffer is still executing. llama.cpp reaches the same conclusion
+  // by a different route -- it keeps a vector of pools and cleans them up only
+  // after the graph's fence (`ggml_vk_queue_command_pools_cleanup`,
+  // ggml-vulkan.cpp:2740).
+  for (uint32_t s = 0; s < kMaxInFlight; ++s) {
+    VkCommandPoolCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cpci.queueFamilyIndex = queue_family_;
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    Check(Api().vkCreateCommandPool(device, &cpci, nullptr, &command_pool),
+          "vkCreateCommandPool");
+    slot_pool_[s] = Pack(command_pool);
 
-  VkCommandBufferAllocateInfo cbai{};
-  cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  cbai.commandPool = command_pool;
-  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cbai.commandBufferCount = 1;
-  VkCommandBuffer cmd = VK_NULL_HANDLE;
-  Check(Api().vkAllocateCommandBuffers(device, &cbai, &cmd), "vkAllocateCommandBuffers");
-  command_buffer_ = Pack(cmd);
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = command_pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    Check(Api().vkAllocateCommandBuffers(device, &cbai, &cmd), "vkAllocateCommandBuffers");
+    slot_cmd_[s] = Pack(cmd);
 
-  // One descriptor set per kernel, each holding at most kMaxBindings storage
-  // buffers. Sized for the whole committed shader table so the pool is never
-  // reallocated. (llama.cpp grows a vector of pools instead; a fixed pool is
-  // enough here because dispatch is synchronous and sets are re-updated.)
-  constexpr uint32_t kMaxBindings = 12;  // llama.cpp's MAX_PARAMETER_COUNT
+    VkFenceCreateInfo sfci{};
+    sfci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence sfence = VK_NULL_HANDLE;
+    Check(Api().vkCreateFence(device, &sfci, nullptr, &sfence), "vkCreateFence");
+    slot_fence_[s] = Pack(sfence);
+    slot_names_[s] = new std::vector<std::string>();
+  }
+  // Slot 0's handles double as the single-slot handles the unbatched path uses.
+  command_pool_ = slot_pool_[0];
+  command_buffer_ = slot_cmd_[0];
+
+  // Descriptor-pool BUDGET, not a per-set bound: this is the total number of
+  // storage-buffer descriptors the pool may hand out, and the headroom factor
+  // below over-provisions it by more than an order of magnitude against the
+  // pipelines a run actually creates. (llama.cpp grows a vector of pools instead;
+  // a fixed pool is enough here.)
+  constexpr uint32_t kBudgetBindingsPerSet = 12;
   // ONE DESCRIPTOR SET PER PIPELINE, AND PIPELINES NOW OUTNUMBER MODULES.
   // Since VK-A1 a module can be specialized into several pipelines — vt_cast
   // alone reaches one per (src, dst) dtype pair — and each allocates its own set
@@ -552,7 +794,7 @@ VulkanContext::VulkanContext() {
       static_cast<uint32_t>(kSpirvModuleCount) * kSpecializationHeadroom;
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = kernels * kDescriptorRing * kMaxBindings;
+  pool_size.descriptorCount = kernels * kDescriptorRing * kBudgetBindingsPerSet;
   VkDescriptorPoolCreateInfo dpci{};
   dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   // kDescriptorRing sets per pipeline now, not one -- see the ring's comment for
@@ -574,18 +816,18 @@ VulkanContext::VulkanContext() {
   scratch_mapped_ = AllocBuffer(kScratchBytes, &scratch_buffer_, &scratch_memory_);
 
   pipelines_ = new std::map<std::string, Pipeline>();
-  dispatch_hist_ = new std::map<std::string, uint64_t>();
   dispatch_ms_ = new std::map<std::string, double>();
-  batch_names_ = new std::vector<std::string>();
-  batch_buffers_ = new std::set<void*>();
-  // TWO timestamps per dispatch (before and after), for a whole batch. Created
-  // only under the stats flag: a query pool is cheap, but writing timestamps adds
-  // commands to every dispatch and production must not pay for a diagnostic.
+  batch_buffers_ = new BufferSet();
+  // TWO timestamps per dispatch (before and after), for a whole batch, and ONE
+  // RANGE PER SLOT: a slot's queries are read back only when that slot retires,
+  // so two in-flight batches must not share query indices. Created only under the
+  // stats flag: a query pool is cheap, but writing timestamps adds commands to
+  // every dispatch and production must not pay for a diagnostic.
   if (kDispatchStats && timestamp_period_ns_ > 0.0) {
     VkQueryPoolCreateInfo qpci{};
     qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpci.queryCount = kMaxBatch * 2;
+    qpci.queryCount = kMaxBatch * 2 * kMaxInFlight;
     VkQueryPool qp = VK_NULL_HANDLE;
     if (Api().vkCreateQueryPool(Unpack<VkDevice>(device_), &qpci, nullptr, &qp) == VK_SUCCESS) {
       query_pool_ = Pack(qp);
@@ -798,6 +1040,9 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   Pipeline p;
   p.buffer_count = buffer_count;
   p.push_size = push_size;
+  // The committed SPIR-V table has static storage duration, so this pointer
+  // outlives the pipeline and the histogram can key on it without copying.
+  p.module_name = module->name;
 
   VkShaderModuleCreateInfo smci{};
   smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -932,9 +1177,18 @@ std::vector<std::pair<std::string, double>> VulkanContext::DispatchTimeMs() cons
   return out;
 }
 
+// Aggregated on demand from the per-pipeline counters rather than maintained by
+// the dispatch path. Several PIPELINES can share one MODULE name (one per
+// specialization), so the counts are summed by module name, which is exactly what
+// the map keyed on `name` used to hold.
 std::vector<std::pair<std::string, uint64_t>> VulkanContext::DispatchHistogram() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
-  const auto& hist = *static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_);
+  std::map<std::string, uint64_t> hist;
+  for (const auto& kv : *static_cast<std::map<std::string, Pipeline>*>(pipelines_)) {
+    if (kv.second.dispatches == 0) continue;
+    hist[kv.second.module_name != nullptr ? kv.second.module_name : kv.first] +=
+        kv.second.dispatches;
+  }
   std::vector<std::pair<std::string, uint64_t>> out(hist.begin(), hist.end());
   std::sort(out.begin(), out.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -953,20 +1207,112 @@ uint32_t VulkanContext::pending_batch() const {
   return batch_count_;
 }
 
+uint32_t VulkanContext::in_flight_batches() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < kMaxInFlight; ++i) n += slot_in_flight_[i] ? 1u : 0u;
+  return n;
+}
+
+uint32_t VulkanContext::in_flight_limit() const { return kInFlight; }
+
+uint32_t VulkanContext::ring_slice() const { return kRingSlice; }
+
+uint32_t VulkanContext::ring_depth() const { return kRingDepth; }
+
+uint64_t VulkanContext::submit_count() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return submit_count_;
+}
+
+uint64_t VulkanContext::fence_wait_count() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return fence_wait_count_;
+}
+
+uint32_t VulkanContext::ring_base() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return slot_ring_base_;
+}
+
+uint64_t VulkanContext::barrier_count() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return barrier_count_;
+}
+
 void VulkanContext::FlushIfBatchTouches(void* buffer, const char* why) {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
-  if (!batch_open_) return;
   // A host pointer (nullptr) cannot alias a bound VkBuffer, so it never forces a
-  // drain. Otherwise drain only on a genuine intersection with the open batch.
+  // drain. Otherwise drain only on a genuine intersection.
   if (buffer == nullptr) return;
-  const auto& bound = *static_cast<std::set<void*>*>(batch_buffers_);
-  if (bound.find(buffer) == bound.end()) return;
-  FlushBatchLocked(why);
+  // The bound-buffer table now spans every batch that has not been DRAINED, not
+  // just the open one. With submission pipelined, "no batch is open" no longer
+  // implies "the GPU is finished": a submitted batch can still be writing the
+  // buffer the host is about to read, and returning early here would be exactly
+  // the silent stale-read this backend's flush contract exists to prevent.
+  if (!static_cast<BufferSet*>(batch_buffers_)->Contains(buffer)) return;
+  DrainLocked(why);
 }
 
 void VulkanContext::FlushBatch(const char* why) {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  DrainLocked(why);
+}
+
+// Submits whatever is open and then waits for EVERY submitted batch. This is the
+// operation the three host-read paths need, and it is what FlushBatch meant
+// before submission was pipelined.
+void VulkanContext::DrainLocked(const char* why) {
   FlushBatchLocked(why);
+  for (uint32_t i = 0; i < kInFlight; ++i) RetireSlotLocked(i);
+  // Safe only now: every batch that could still have been reading these buffers
+  // has completed.
+  static_cast<BufferSet*>(batch_buffers_)->Clear();
+}
+
+// Waits for slot `s`, reads back its timestamps and frees its command buffer and
+// its slice of every descriptor ring. A no-op if the slot is idle.
+void VulkanContext::RetireSlotLocked(uint32_t s) {
+  if (!slot_in_flight_[s]) return;
+  const VulkanApi& vk = Api();
+  auto device = Unpack<VkDevice>(device_);
+  auto fence = Unpack<VkFence>(slot_fence_[s]);
+  const uint64_t hp_t0 = kHostProfile ? NowNs() : 0;
+  // Counted BEFORE the wait and only when the fence is genuinely unsignalled, so
+  // the counter measures blocked retirements rather than retirements.
+  if (vk.vkGetFenceStatus(device, fence) == VK_NOT_READY) ++fence_wait_count_;
+  Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  const uint64_t hp_t1 = kHostProfile ? NowNs() : 0;
+
+  // Read the timestamps back, now that this slot has certainly completed.
+  auto* names = static_cast<std::vector<std::string>*>(slot_names_[s]);
+  if (query_pool_ != nullptr && !names->empty()) {
+    const uint32_t n = static_cast<uint32_t>(names->size());
+    const uint32_t base = s * kMaxBatch * 2;
+    std::vector<uint64_t> ticks(n * 2, 0);
+    if (vk.vkGetQueryPoolResults(device, Unpack<VkQueryPool>(query_pool_), base, n * 2,
+                                 ticks.size() * sizeof(uint64_t), ticks.data(),
+                                 sizeof(uint64_t),
+                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+        VK_SUCCESS) {
+      auto& acc = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t t0 = ticks[i * 2], t1 = ticks[i * 2 + 1];
+        if (t1 > t0) acc[(*names)[i]] += double(t1 - t0) * timestamp_period_ns_ / 1.0e6;
+      }
+    }
+    names->clear();
+  }
+
+  Check(vk.vkResetFences(device, 1, &fence), "vkResetFences");
+  Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(slot_pool_[s]), 0),
+        "vkResetCommandPool");
+  slot_in_flight_[s] = false;
+  if (kHostProfile) {
+    const uint64_t hp_t2 = NowNs();
+    g_host_profile.ns_flush_wait += hp_t1 - hp_t0;
+    g_host_profile.ns_flush_other += hp_t2 - hp_t1;
+  }
 }
 
 // Ends the open command buffer, submits it, and WAITS. The wait is what makes
@@ -1002,51 +1348,48 @@ void VulkanContext::FlushBatchLocked(const char* why) {
     }
   }
   const VulkanApi& vk = Api();
-  auto device = Unpack<VkDevice>(device_);
-  auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
+  auto cmd = Unpack<VkCommandBuffer>(slot_cmd_[slot_]);
+  const uint64_t hp_t0 = kHostProfile ? NowNs() : 0;
   Check(vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
   VkSubmitInfo si{};
   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   si.commandBufferCount = 1;
   si.pCommandBuffers = &cmd;
-  auto fence = Unpack<VkFence>(fence_);
-  Check(vk.vkResetFences(device, 1, &fence), "vkResetFences");
+  auto fence = Unpack<VkFence>(slot_fence_[slot_]);
   Check(vk.vkQueueSubmit(Unpack<VkQueue>(queue_), 1, &si, fence), "vkQueueSubmit");
+  slot_in_flight_[slot_] = true;
+  ++submit_count_;
   if (kDispatchStats) {
     std::fprintf(stderr, "[vt vulkan] FLUSH %u dispatches in one submit\n", batch_count_);
     std::fflush(stderr);
   }
-  Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-
-  // Read the timestamps back, now that the batch has certainly completed. This is
-  // what restores the per-shader TIME profile that batching removed -- and it
-  // measures GPU execution directly instead of a host-side fence wait.
-  auto* names = static_cast<std::vector<std::string>*>(batch_names_);
-  if (query_pool_ != nullptr && !names->empty()) {
-    const uint32_t n = static_cast<uint32_t>(names->size());
-    std::vector<uint64_t> ticks(n * 2, 0);
-    if (vk.vkGetQueryPoolResults(device, Unpack<VkQueryPool>(query_pool_), 0, n * 2,
-                                 ticks.size() * sizeof(uint64_t), ticks.data(),
-                                 sizeof(uint64_t),
-                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
-        VK_SUCCESS) {
-      auto& acc = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
-      for (uint32_t i = 0; i < n; ++i) {
-        const uint64_t t0 = ticks[i * 2], t1 = ticks[i * 2 + 1];
-        if (t1 > t0) acc[(*names)[i]] += double(t1 - t0) * timestamp_period_ns_ / 1.0e6;
-      }
-    }
-    names->clear();
+  if (kHostProfile) {
+    g_host_profile.flushes += 1;
+    g_host_profile.ns_flush_submit += NowNs() - hp_t0;
   }
 
-  // Every pipeline's ring is free again only AFTER the wait above.
+  // Every pipeline's ring counter restarts at the NEXT slot's base. It is the
+  // slot rotation, not this reset, that keeps the sets safe: the counter only
+  // ever indexes within the slot's own slice.
   for (auto& kv : *static_cast<std::map<std::string, Pipeline>*>(pipelines_)) {
     kv.second.used_this_batch = 0;
   }
-  static_cast<std::set<void*>*>(batch_buffers_)->clear();
   batch_open_ = false;
   batch_count_ = 0;
+
+  // Move to the next slot and make sure it is free. With kInFlight == 1 this
+  // retires the slot just submitted, which is byte-for-byte the old
+  // submit-and-wait behaviour. With kInFlight == 2 the host returns immediately
+  // and records the next batch while the GPU runs this one; the wait only
+  // happens when the rotation catches up with still-executing work.
+  //
+  // NOTE the bound-buffer table is deliberately NOT cleared here. It has to keep
+  // naming every buffer any UNRETIRED batch touched, because that is what
+  // FlushIfBatchTouches consults to decide whether a host read must drain.
+  slot_ = (slot_ + 1) % kInFlight;
+  slot_ring_base_ = slot_ * kRingSlice;
+  RetireSlotLocked(slot_);
 }
 
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
@@ -1067,10 +1410,18 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // one command buffer per op (src/vt/metal/metal_ops.mm § DISPATCH MODEL).
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
 
+  const uint64_t hp_t0 = kHostProfile ? NowNs() : 0;
+  // Flush nanoseconds accumulated by a flush this Dispatch triggers are billed to
+  // the flush phases, so they are subtracted from this dispatch's own total.
+  const uint64_t hp_flush_before =
+      kHostProfile ? g_host_profile.ns_flush_submit + g_host_profile.ns_flush_wait +
+                         g_host_profile.ns_flush_other
+                   : 0;
+  if (kHostProfile) DumpHostProfileAtExit();
+
   // Counted under the mutex the dispatch already holds -- see the header for why
   // this is measured on OUR side rather than inferred from context switches.
   ++dispatch_total_;
-  ++(*static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_))[name];
   // PERIODIC dump, not just atexit: `timeout` sends SIGTERM, whose default action
   // terminates WITHOUT running atexit handlers, and every VK-E run so far ended
   // exactly that way. A diagnostic that only reports on a clean exit would have
@@ -1084,23 +1435,35 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
                  secs > 0 ? dispatch_total_ / secs : 0.0);
   }
 
+  const uint64_t hp_t_book = kHostProfile ? NowNs() : 0;
   Pipeline& p = GetPipeline(name, buffer_count, push_size, spec_values, spec_count);
+  const uint64_t hp_t_pipe = kHostProfile ? NowNs() : 0;
 
-  // A pipeline that has consumed its whole descriptor ring must flush before it
-  // can reuse set 0, because the GPU has not necessarily read the earlier ones
-  // yet. Flushing also resets every pipeline's counter.
-  if (kBatchDispatch && (p.used_this_batch >= kRingDepth || batch_count_ >= kMaxBatch)) {
-    FlushBatchLocked(p.used_this_batch >= kRingDepth ? "ring-full" : "batch-cap");
+  // A pipeline that has consumed this slot's whole ring SLICE must flush before it
+  // can reuse the slice's first set, because the GPU has not necessarily read the
+  // earlier ones yet. Flushing rotates to the next slot, which owns a DIFFERENT
+  // slice, and waits only if that slot is still executing.
+  const uint32_t ring_limit = kBatchDispatch ? kRingSlice : kRingDepth;
+  if (kBatchDispatch && (p.used_this_batch >= ring_limit || batch_count_ >= kMaxBatch)) {
+    FlushBatchLocked(p.used_this_batch >= ring_limit ? "ring-full" : "batch-cap");
   }
 
-  VkDescriptorSet set = kBatchDispatch ? p.sets[p.used_this_batch] : p.sets[0];
+  VkDescriptorSet set =
+      kBatchDispatch ? p.sets[slot_ring_base_ + p.used_this_batch] : p.sets[0];
 
-  std::vector<VkDescriptorBufferInfo> infos(buffer_count);
-  std::vector<VkWriteDescriptorSet> writes(buffer_count);
+  // Stack arrays, not two heap vectors per dispatch. kMaxBindings is the same
+  // bound GetPipeline already enforces against the committed SPIR-V.
+  VT_CHECK(buffer_count <= kMaxDispatchBindings,
+           "vulkan: dispatch binds " + std::to_string(buffer_count) +
+               " buffers, above the backend limit of " +
+               std::to_string(kMaxDispatchBindings));
+  VkDescriptorBufferInfo infos[kMaxDispatchBindings];
+  VkWriteDescriptorSet writes[kMaxDispatchBindings];
   for (uint32_t i = 0; i < buffer_count; ++i) {
     infos[i].buffer = Unpack<VkBuffer>(const_cast<void*>(buffers[i]));
     infos[i].offset = 0;  // always WHOLE; the element offset rides push constants
     infos[i].range = VK_WHOLE_SIZE;
+    writes[i] = VkWriteDescriptorSet{};
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = set;
     writes[i].dstBinding = i;
@@ -1108,34 +1471,44 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[i].pBufferInfo = &infos[i];
   }
-  vk.vkUpdateDescriptorSets(device, buffer_count, writes.data(), 0, nullptr);
+  vk.vkUpdateDescriptorSets(device, buffer_count, writes, 0, nullptr);
+  const uint64_t hp_t_desc = kHostProfile ? NowNs() : 0;
 
-  auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
+  auto cmd = Unpack<VkCommandBuffer>(slot_cmd_[slot_]);
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
   if (!kBatchDispatch) {
-    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
+    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(slot_pool_[slot_]), 0),
           "vkResetCommandPool");
     Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
-  } else if (!batch_open_) {
-    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
-          "vkResetCommandPool");
-    Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
-    // The pool must be reset on the DEVICE timeline, inside the command buffer,
-    // before any query in it is written.
-    if (query_pool_ != nullptr) {
-      vk.vkCmdResetQueryPool(cmd, Unpack<VkQueryPool>(query_pool_), 0, kMaxBatch * 2);
-      static_cast<std::vector<std::string>*>(batch_names_)->clear();
-    }
-    batch_open_ = true;
   } else {
-    // BETWEEN recorded dispatches: the ops in a decode step are sequentially
-    // dependent (norm feeds projection feeds attention), so every dispatch must
-    // see the previous one's writes. Without this the batch would run them
-    // concurrently and compute garbage. This is the cost batching pays back --
-    // a barrier is far cheaper than a fence round-trip to the host.
+    if (!batch_open_) {
+      // The pool was already reset by RetireSlotLocked, which is the only point at
+      // which this slot's previous command buffer is provably no longer executing.
+      Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+      // The query pool must be reset on the DEVICE timeline, inside the command
+      // buffer, before any query in it is written -- and only over THIS slot's
+      // range, or it would clobber an in-flight slot's unread results.
+      if (query_pool_ != nullptr) {
+        vk.vkCmdResetQueryPool(cmd, Unpack<VkQueryPool>(query_pool_),
+                               slot_ * kMaxBatch * 2, kMaxBatch * 2);
+        static_cast<std::vector<std::string>*>(slot_names_[slot_])->clear();
+      }
+      batch_open_ = true;
+    }
+    // BEFORE every recorded dispatch, INCLUDING the first in a command buffer: the
+    // ops in a decode step are sequentially dependent (norm feeds projection feeds
+    // attention), so every dispatch must see the previous one's writes. Without
+    // this the batch would run them concurrently and compute garbage.
+    //
+    // The first-in-buffer case matters only once submission is pipelined. Before
+    // this row the previous batch's fence had already been waited on, which is a
+    // stronger dependency than any barrier; now the previous batch may still be
+    // executing, and this barrier -- which orders against everything earlier in
+    // SUBMISSION ORDER on the same queue, not merely earlier in this buffer -- is
+    // what carries the dependency across the command-buffer boundary.
     VkMemoryBarrier mb{};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1143,6 +1516,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0,
                             nullptr);
+    ++barrier_count_;
   }
 
   vk.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -1151,29 +1525,46 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   vk.vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size,
                         push_constants);
   const bool timed = kBatchDispatch && query_pool_ != nullptr && batch_count_ < kMaxBatch;
+  const uint32_t query_base = (slot_ * kMaxBatch + batch_count_) * 2;
   if (timed) {
     // TOP_OF_PIPE before / BOTTOM_OF_PIPE after brackets this dispatch's execution
     // on the GPU. Because a barrier separates consecutive dispatches, the interval
     // is this kernel's own time rather than an overlap with its neighbours.
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                           Unpack<VkQueryPool>(query_pool_), batch_count_ * 2);
+                           Unpack<VkQueryPool>(query_pool_), query_base);
   }
   vk.vkCmdDispatch(cmd, group_count_x, 1, 1);
   if (timed) {
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                           Unpack<VkQueryPool>(query_pool_), batch_count_ * 2 + 1);
-    static_cast<std::vector<std::string>*>(batch_names_)->push_back(name);
+                           Unpack<VkQueryPool>(query_pool_), query_base + 1);
+    static_cast<std::vector<std::string>*>(slot_names_[slot_])->push_back(name);
   }
 
+  const uint64_t hp_t_rec = kHostProfile ? NowNs() : 0;
+
   if (kBatchDispatch) {
-    auto& bound = *static_cast<std::set<void*>*>(batch_buffers_);
+    auto& bound = *static_cast<BufferSet*>(batch_buffers_);
     for (uint32_t i = 0; i < buffer_count; ++i) {
-      bound.insert(const_cast<void*>(buffers[i]));
+      bound.Insert(const_cast<void*>(buffers[i]));
     }
+    ++p.dispatches;
     ++p.used_this_batch;
     ++batch_count_;
+    if (kHostProfile) {
+      const uint64_t hp_t_end = NowNs();
+      const uint64_t flush_ns = g_host_profile.ns_flush_submit +
+                                g_host_profile.ns_flush_wait +
+                                g_host_profile.ns_flush_other - hp_flush_before;
+      g_host_profile.dispatches += 1;
+      g_host_profile.ns_bookkeep += (hp_t_book - hp_t0) + (hp_t_end - hp_t_rec);
+      g_host_profile.ns_pipeline += hp_t_pipe - hp_t_book;
+      g_host_profile.ns_descriptor += (hp_t_desc - hp_t_pipe) - flush_ns;
+      g_host_profile.ns_record += hp_t_rec - hp_t_desc;
+      g_host_profile.ns_total += (hp_t_end - hp_t0) - flush_ns;
+    }
     return;  // submitted by FlushBatch, at the next host read or Synchronize
   }
+  ++p.dispatches;
   Check(vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
   VkSubmitInfo si{};
