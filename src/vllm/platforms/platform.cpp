@@ -54,9 +54,14 @@ size_t Index(DeviceType type) {
 // case: a platform left out of this walk registers fine, answers every query
 // correctly, and is simply never SELECTED. tests/vllm/platforms/test_platform.cpp
 // gates the membership so the next backend does not rediscover this.
+// kTENSTORRENT sits after kMETAL: an extension platform with no upstream probe
+// order to mirror (same as kVULKAN/kMETAL), placed last among accelerators
+// since it is the newest and least proven (BACKEND-TENSTORRENT W0: one op,
+// no model runs yet) — Metal and Vulkan already run models.
 constexpr DeviceType kCurrentPriority[] = {
-    DeviceType::kCUDA, DeviceType::kROCM, DeviceType::kXPU,
-    DeviceType::kVULKAN, DeviceType::kMETAL, DeviceType::kCPU};
+    DeviceType::kCUDA,   DeviceType::kROCM,        DeviceType::kXPU,
+    DeviceType::kVULKAN, DeviceType::kMETAL, DeviceType::kTENSTORRENT,
+    DeviceType::kCPU};
 }  // namespace
 
 void RegisterPlatform(DeviceType type, Platform* platform) {
