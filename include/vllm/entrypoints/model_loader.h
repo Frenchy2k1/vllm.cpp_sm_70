@@ -81,7 +81,15 @@ struct EngineParams {
   // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
   int64_t kv_cache_memory_bytes = 0;
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
-  int max_num_seqs = 8;    // max concurrent sequences.
+  // max concurrent sequences. vLLM's default is 1024 (EngineArgs.max_num_seqs);
+  // ours was 8, which put c8 EXACTLY on the batch ceiling so the 8th stream
+  // could not co-batch -- measured as a throughput ratio that stayed flat to c4
+  // then collapsed at c8. Raising to 32 recovers it (c8 51.66 -> 64.41 tok/s,
+  // +24.7%, ratio vs vLLM flat ~0.74x instead of degrading to 0.59x).
+  // NOT vLLM's 1024: max_num_seqs scales KV demand, and GB10's unified memory
+  // has a narrow usable band (see gb10 OOM/thrash notes). 32 is the value
+  // MEASURED clean at --gpu-memory-utilization 0.55; higher is unverified.
+  int max_num_seqs = 32;
   // Per-step token budget (the chunked-prefill knob). 0 => the bounded PER-ARCH
   // default (see LoadedEngine::ResolveMaxNumBatchedTokens): dense arch 2048 flat
   // (vLLM's DEFAULT_MAX_NUM_BATCHED_TOKENS, vllm/config/scheduler.py:42 @

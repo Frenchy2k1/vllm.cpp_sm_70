@@ -30,6 +30,8 @@
 #include <utility>
 #include <vector>
 
+#include "hf_snapshot.h"
+
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -40,17 +42,8 @@ namespace fs = std::filesystem;
 namespace {
 
 std::string Find27BSnapshot() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path snaps =
-      fs::path(home) /
-      ".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec)) {
-    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
-  }
-  return "";
+  // Pinned to the goldens' revision; see tests/parity/hf_snapshot.h.
+  return parity::Qwen27NvfP4Snapshot();
 }
 
 vllm::SamplingParams Greedy(int max_tokens) {

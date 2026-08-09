@@ -441,7 +441,13 @@ STATUS_RATCHET = {
     # state migration so the reduction cannot become untracked growth headroom.
     # 243632 since 2026-08-09 (measured 243632): the W1 candidate records local
     # gencode gates while keeping the real ten-SM archive audit pending.
-    "chars": 243632,
+    #
+    # 243600 since 2026-08-09 (measured 243600): the NVFP4 re-verification
+    # rewrites the 27B, 35B and Kimi-Linear rows onto their pinned revisions and
+    # their re-measured ratios, and drops the superseded narrative those rows
+    # carried. Net -32 against the rebased page, re-pinned byte-tight so the
+    # reduction cannot become untracked growth headroom.
+    "chars": 243600,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
