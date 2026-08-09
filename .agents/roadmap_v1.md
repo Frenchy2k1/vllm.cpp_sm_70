@@ -47,7 +47,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#192](https://github.com/mudler/vllm.cpp/issues/192) | — | `OrEmpty` C-linkage returns `std::string` (fixed by #195) | bug |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
-| [#150](https://github.com/mudler/vllm.cpp/issues/150) | — | Model load / cold start time: measure properly, then cut | perf |
+| [#150](https://github.com/mudler/vllm.cpp/issues/150) | `ENG-LOAD-DIRECT-UPLOAD` | Model load / cold start time: measure properly, then cut | perf |
 | [#149](https://github.com/mudler/vllm.cpp/issues/149) | — | CPU/RAM offload and CPU-MoE hybrid execution | feature |
 | [#148](https://github.com/mudler/vllm.cpp/issues/148) | — | Volta (sm_70) and Turing (sm_75) support | feature |
 | [#147](https://github.com/mudler/vllm.cpp/issues/147) | — | Multi-GPU tensor parallel on real hardware | feature |

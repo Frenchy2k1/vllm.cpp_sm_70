@@ -849,6 +849,10 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
+    // Issue #150 accounting: the host->device weight upload for this family.
+    // When `w.bytes` borrows the safetensors mapping (ENG-LOAD-DIRECT-UPLOAD)
+    // the source of this copy IS the file mapping, so the byte moved once.
+    vllm::load_stats::AddDeviceUpload(nb);
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });

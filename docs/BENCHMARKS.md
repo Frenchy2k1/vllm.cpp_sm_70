@@ -4,6 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
+| **Weight load (`ENG-LOAD-DIRECT-UPLOAD`, #150)** | Qwen3.6-27B bf16 (50.098 GiB), GB10 Vulkan, same binary both arms, interleaved under one GPU lock | **Load phase 1.54x warm** (19.27 -> 12.48 s), **1.61x cold** (52.62 -> 32.75 s); bytes moved **100.196 -> 81.260 GiB**. Every ON leg beat every OFF leg | byte-identical; 6/6 token-exact |
 | **Structured state record (active)** | v1 scalar + relational + Git-history contracts | No benchmark. At `776c56f1`: 157 imports = 3,231,342 exact bytes; append preserved all 156 wrappers/rows. 95 tests: validator/core 44 (checker 20 + core 24), NOW 18, migration 22, cutover 11. New raw-row mutation guard. | n/a |
 | **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |
 | **Binary release delivery topology** | #196: read-only build/verify, OIDC attest, protected publish; generated indexes and explicit handoff-authenticated assets | Fixes the zero-binary release path by attaching all eight archive/checksum/provenance triplets plus indexes. Hosted proof pending; W12 diagnostics optional | n/a |

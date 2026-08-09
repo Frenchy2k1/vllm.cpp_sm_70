@@ -72,6 +72,7 @@ are our reading of their documented behavior, not measurements.
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
+| Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of a 27B bf16); merged/transposed ones still copy | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
 

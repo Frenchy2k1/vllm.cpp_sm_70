@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,14 @@ struct StTensor {
   std::vector<int64_t> shape;
   const uint8_t* data = nullptr;
   size_t nbytes = 0;
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): keep-alive on the file's mmap, shared
+  // by every tensor of the same shard. A loader that BORROWS `data` instead of
+  // copying it out (OwnedBytes::Borrow) hands this to the borrow, so the
+  // mapping outlives `SafetensorsFile` itself and the borrowed weight can be
+  // read at device-upload time — which is what lets the upload copy straight
+  // from the file mapping and skip the intermediate owned host buffer. Null
+  // only for a default-constructed StTensor (tests).
+  std::shared_ptr<const void> mapping;
 };
 
 // One .safetensors file, mmap'd read-only. All header metadata is treated as
@@ -45,14 +54,29 @@ class SafetensorsFile {
     return metadata_;
   }
 
+  // Refcounted keep-alive on this file's read-only mmap (see StTensor::mapping).
+  // Holding it keeps the mapping (and its fd) valid past ~SafetensorsFile.
+  std::shared_ptr<const void> MappingKeepAlive() const { return map_; }
+
  private:
+  // The mmap + fd as one refcounted resource, so a borrowed weight can outlive
+  // the SafetensorsFile that opened it. munmap/close run when the LAST reference
+  // goes — the file object's own, plus any OwnedBytes::Borrow keep-alive.
+  struct Mapping {
+    void* addr = nullptr;
+    size_t size = 0;
+    int fd = -1;
+    Mapping() = default;
+    Mapping(const Mapping&) = delete;
+    Mapping& operator=(const Mapping&) = delete;
+    ~Mapping();
+  };
+
   SafetensorsFile() = default;
   void Release() noexcept;
 
   std::string path_;
-  int fd_ = -1;
-  void* map_ = nullptr;
-  size_t map_size_ = 0;
+  std::shared_ptr<Mapping> map_;
   std::vector<std::string> names_;
   std::map<std::string, StTensor> tensors_;
   std::map<std::string, std::string> metadata_;
@@ -103,5 +127,37 @@ namespace detail {
 // env-driven default.
 void SetLoadWindowedReleaseOverrideForTesting(std::optional<bool> value);
 }  // namespace detail
+
+// --- Load byte accounting (issue #150: measure it properly, then cut it) ------
+//
+// Process-global counters over the bytes a model load actually MOVES, so the
+// cost of the load path is a measured number rather than an inferred one:
+//
+//   host_copy_bytes    source bytes materialized into an owned host buffer.
+//     Counted at the single `MaybeReleaseSourcePages` call every copy helper
+//     already makes right after it has consumed a source range — verbatim
+//     copies, transposes, dtype conversions and dequants alike.
+//   borrowed_bytes     source bytes a weight VIEWS in place (OwnedBytes::Borrow
+//     over the safetensors mmap) instead of copying — the direct-upload path.
+//   device_upload_bytes bytes copied host->device by ResidentWeight.
+//
+// Free-running and monotonic; `Reset()` exists for tests. Relaxed atomics: the
+// loaders are single-threaded per tensor and these are diagnostics, so no
+// ordering is required beyond not tearing.
+namespace load_stats {
+
+struct Counters {
+  uint64_t host_copy_bytes = 0;
+  uint64_t borrowed_bytes = 0;
+  uint64_t device_upload_bytes = 0;
+};
+
+void AddHostCopy(uint64_t bytes);
+void AddBorrowed(uint64_t bytes);
+void AddDeviceUpload(uint64_t bytes);
+Counters Snapshot();
+void Reset();
+
+}  // namespace load_stats
 
 }  // namespace vllm
