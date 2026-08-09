@@ -24,6 +24,37 @@ matrices and [docs/STATUS.md](../docs/STATUS.md). The chronology that had
 accumulated here through 2026-08-03 is archived verbatim at
 [completed/roadmap-v1-preamble-2026-07-18..2026-08-03.md](completed/roadmap-v1-preamble-2026-07-18..2026-08-03.md).
 
+## Open issues
+
+**No work without an open issue.** Before claiming a row or writing code,
+confirm an issue tracks the work; open one if it does not. The number is linked
+from here, from the row's spec, and from the PR.
+
+This table is the intake surface; the portfolio table below is the ordering
+surface. `Row` is the owning roadmap block or area-matrix row, or `—` when the
+issue is not yet placed. Keyed record: update in place, never append.
+
+| Issue | Row | Title | Kind |
+|---:|---|---|---|
+| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | `hipblasGemmEx` overload mismatch in `rocm_matmul_hipblaslt.hip` | bug |
+| [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |
+| [#193](https://github.com/mudler/vllm.cpp/issues/193) | — | A100 (sm_80): crashes and wrong GDN output in fast paths | bug |
+| [#192](https://github.com/mudler/vllm.cpp/issues/192) | — | `OrEmpty` C-linkage returns `std::string` (fixed by #195) | bug |
+| [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
+| [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
+| [#150](https://github.com/mudler/vllm.cpp/issues/150) | — | Model load / cold start time: measure properly, then cut | perf |
+| [#149](https://github.com/mudler/vllm.cpp/issues/149) | — | CPU/RAM offload and CPU-MoE hybrid execution | feature |
+| [#148](https://github.com/mudler/vllm.cpp/issues/148) | — | Volta (sm_70) and Turing (sm_75) support | feature |
+| [#147](https://github.com/mudler/vllm.cpp/issues/147) | — | Multi-GPU tensor parallel on real hardware | feature |
+| [#146](https://github.com/mudler/vllm.cpp/issues/146) | — | Pascal support | feature |
+| [#132](https://github.com/mudler/vllm.cpp/issues/132) | `BACKEND-ROCM` | ROCm `-O0` RmsNorm CLR HostcallListener teardown deadlock | bug |
+| [#125](https://github.com/mudler/vllm.cpp/issues/125) | `BACKEND-VULKAN` | Vulkan on AMD Strix Halo (gfx1151) does not load | bug |
+| [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-BINARIES` | Binary release | feature |
+| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | Error when linking | bug |
+| [#83](https://github.com/mudler/vllm.cpp/issues/83) | — | Auto-size memory to the workload; pre-flight error instead of OOM | feature |
+| [#81](https://github.com/mudler/vllm.cpp/issues/81) | `SPEC-MTP` | Speculative decoding: MTP k>1, dynamic and adaptive depth | feature |
+| [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
+
 ## Top-level portfolio
 
 This is the single ordered roadmap table. Detailed capability/status rows live

@@ -93,7 +93,9 @@ class LifecycleTrigger(unittest.TestCase):
                 self.assertEqual("lifecycle" in classes, expected)
 
     def test_a_measurement_is_a_claim(self):
-        classes, reasons = self.classify([".agents/benchmark-record.md"], "", "")
+        classes, reasons = self.classify(
+            [".agents/benchmark-record.md"], "27B: 4.28 tok/s", "27B: 4.36 tok/s"
+        )
         self.assertIn("lifecycle", classes)
         self.assertTrue(any("measurement" in r for r in reasons), reasons)
 
@@ -144,7 +146,9 @@ class ObligationsDoNotOverfire(unittest.TestCase):
 
     def errors(self, paths):
         original = checker.blob
-        checker.blob = lambda rev, path: ""
+        checker.blob = lambda rev, path: (
+            "old claim" if rev == "BEFORE" else "new claim"
+        )
         try:
             return checker.errors_for(set(paths), "BEFORE", "AFTER")
         finally:
@@ -192,7 +196,9 @@ class ObligationsDoNotOverfire(unittest.TestCase):
 class SupportSurfaces(unittest.TestCase):
     def errors(self, paths):
         original = checker.blob
-        checker.blob = lambda rev, path: ""
+        checker.blob = lambda rev, path: (
+            "old claim" if rev == "BEFORE" else "new claim"
+        )
         try:
             return checker.errors_for(set(paths), "BEFORE", "AFTER")
         finally:
@@ -221,6 +227,35 @@ class SupportSurfaces(unittest.TestCase):
         errors = self.errors(["README.md", "docs/STATUS.md"])
         self.assertTrue(errors)
         self.assertIn("landing source", errors[0])
+
+    def test_a_link_repair_is_not_a_claim(self):
+        """Moving a file forces every document linking it to be edited.
+
+        Those edits assert nothing, so they must not demand a benchmark update
+        -- that demand is how the old gate grew six hardcoded escape hatches.
+        Link TARGETS are normalised away; link TEXT is not.
+        """
+        before = "See [current state](.agents/state.md) for details.\n"
+        after = "See [current state](.agents/NOW.md) for details.\n"
+        self.assertFalse(checker.claims_changed(before, after))
+
+        reworded = "See [the live snapshot](.agents/NOW.md) for details.\n"
+        self.assertTrue(checker.claims_changed(before, reworded))
+
+        original = checker.blob
+        checker.blob = lambda rev, path: before if rev == "BEFORE" else after
+        try:
+            self.assertEqual(
+                checker.errors_for({"README.md"}, "BEFORE", "AFTER"), []
+            )
+            self.assertEqual(
+                checker.errors_for(
+                    {".agents/benchmark-record.md"}, "BEFORE", "AFTER"
+                ),
+                [],
+            )
+        finally:
+            checker.blob = original
 
     def test_a_landing_source_permits_but_does_not_demand_readme(self):
         self.assertEqual(self.errors([".agents/mission.md"]), [])
