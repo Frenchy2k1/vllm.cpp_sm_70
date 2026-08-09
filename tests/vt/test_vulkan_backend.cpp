@@ -1305,6 +1305,146 @@ TEST_CASE("VK-A2 batching records many dispatches per submit and stays byte-exac
   vk.DestroyQueue(q);
 }
 
+TEST_CASE("submission is PIPELINED: a flush does not block, and a drain retires everything") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  if (!ctx.batching_enabled()) return;  // nothing is ever submitted without a flush
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // WHY THIS GATE EXISTS (BACKEND-VULKAN-HOSTDISPATCH). Pipelined submission
+  // records the SAME kernels in the SAME order as submit-and-wait, so it is
+  // invisible in every number this file checks: if the pipelining silently
+  // stopped applying -- a slot count that fell back to 1, a rotation that never
+  // happened, a wait that crept back into the flush -- every value assertion in
+  // this file would still pass and only the wall clock would move. The MECHANISM
+  // is the only thing that can be asserted.
+  const uint32_t limit = ctx.in_flight_limit();
+  const uint32_t slice = ctx.ring_slice();
+  CAPTURE(limit);
+  CAPTURE(slice);
+  // Asked, never re-derived from the environment: the same duplication trap
+  // batching_enabled() was introduced for.
+  REQUIRE(limit >= 1u);
+  REQUIRE(limit <= vt::vulkan::VulkanContext::kMaxInFlight);
+  // The slices must PARTITION the ring, because that is the whole correctness
+  // argument for letting a submitted batch keep executing while the next batch
+  // rewrites descriptor sets: slot s only ever touches [s*slice, (s+1)*slice).
+  const uint32_t depth = ctx.ring_depth();
+  CAPTURE(depth);
+  CHECK(slice * limit <= depth);
+  CHECK(slice >= 1u);
+
+  constexpr int64_t kN = 2048;
+  std::vector<float> a(static_cast<size_t>(kN), 1.5f), b(static_cast<size_t>(kN), 2.25f);
+  void* da = vk.Alloc(kN * sizeof(float));
+  void* db = vk.Alloc(kN * sizeof(float));
+  auto* dout = static_cast<float*>(vk.Alloc(kN * sizeof(float)));
+  vk.Copy(q, da, a.data(), a.size() * sizeof(float));
+  vk.Copy(q, db, b.data(), b.size() * sizeof(float));
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {kN});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {kN});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {kN});
+
+  // Synchronize left nothing in flight, so the counters below start from a known
+  // point rather than from whatever earlier test cases left behind.
+  REQUIRE(ctx.in_flight_batches() == 0u);
+  const uint64_t submits0 = ctx.submit_count();
+  const uint64_t waits0 = ctx.fence_wait_count();
+  const uint64_t barriers0 = ctx.barrier_count();
+  const uint32_t base0 = ctx.ring_base();
+
+  // Exactly enough dispatches of ONE pipeline to exhaust its slice and force a
+  // ring-full flush, plus one more so a batch is open again afterwards.
+  for (uint32_t i = 0; i < slice + 1; ++i) vt::Add(q, to, ta, tb);
+  const uint32_t base1 = ctx.ring_base();
+  CAPTURE(base0);
+  CAPTURE(base1);
+
+  // ONE BARRIER PER DISPATCH, first-in-command-buffer included. That first one is
+  // the ONLY thing ordering a new command buffer's work against the previous,
+  // still-executing batch; dropping it computes correct numbers on a software
+  // rasterizer and races on real hardware, so it is asserted by count and not by
+  // value.
+  CHECK(ctx.barrier_count() - barriers0 == static_cast<uint64_t>(slice) + 1u);
+
+  // THE SLICES PARTITION THE RING. Without this a mutation collapsing every slot
+  // onto slice 0 passes this entire file on llvmpipe -- MEASURED, it did.
+  if (limit > 1u) {
+    CHECK(base1 != base0);
+    CHECK(base1 % slice == 0u);
+  } else {
+    CHECK(base1 == 0u);
+  }
+  CHECK(base1 + slice <= depth);
+
+  const uint64_t submits1 = ctx.submit_count();
+  const uint64_t waits1 = ctx.fence_wait_count();
+  const uint32_t in_flight = ctx.in_flight_batches();
+  CAPTURE(submits1 - submits0);
+  CAPTURE(waits1 - waits0);
+  CAPTURE(in_flight);
+
+  // The ring-full flush happened.
+  REQUIRE(submits1 > submits0);
+
+  if (limit > 1u) {
+    // THE MECHANISM. The flush submitted and RETURNED: a batch is still in
+    // flight, and the rotation landed on a slot that was already idle so nothing
+    // blocked. Under the old submit-and-wait shape both of these read zero.
+    CHECK(in_flight >= 1u);
+    CHECK(waits1 == waits0);
+    // And the host really did carry on recording into the next slot.
+    CHECK(ctx.pending_batch() > 0u);
+  } else {
+    // VT_VULKAN_INFLIGHT=1 is the A/B's control arm and must be EXACTLY the
+    // pre-row behaviour: every flush waits, nothing is ever left in flight.
+    CHECK(in_flight == 0u);
+  }
+
+  // A host read must still see every byte, which is the contract pipelining is
+  // most able to break: the drain has to wait for EVERY submitted batch, not
+  // merely the open one.
+  std::vector<float> got(static_cast<size_t>(kN), 0.0f);
+  vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+  vk.Synchronize(q);
+  CHECK(ctx.pending_batch() == 0u);
+  CHECK(ctx.in_flight_batches() == 0u);
+  for (int64_t i = 0; i < kN; i += 256) {
+    CAPTURE(i);
+    CHECK(got[static_cast<size_t>(i)] == doctest::Approx(3.75f));
+  }
+
+  // DESCRIPTOR-SET REUSE UNDER ROTATION. A long DEPENDENT chain that wraps the
+  // slot rotation several times is what would expose a set being rewritten while
+  // an earlier, still-executing dispatch reads it: each step must observe exactly
+  // its predecessor's output, so a stale or clobbered descriptor shows up as a
+  // wrong final value rather than as a crash.
+  const uint32_t steps = slice * (limit + 1) * 2 + 3;
+  CAPTURE(steps);
+  std::vector<float> zero(static_cast<size_t>(kN), 0.0f), one(static_cast<size_t>(kN), 1.0f);
+  vk.Copy(q, da, zero.data(), zero.size() * sizeof(float));
+  vk.Copy(q, db, one.data(), one.size() * sizeof(float));
+  vk.Synchronize(q);
+  // acc <- acc + 1, `steps` times, with NO host read in between.
+  Tensor tacc = Tensor::Contiguous(da, vt::DType::kF32, d, {kN});
+  for (uint32_t i = 0; i < steps; ++i) vt::Add(q, tacc, tacc, tb);
+  vk.Copy(q, got.data(), da, got.size() * sizeof(float));
+  vk.Synchronize(q);
+  for (int64_t i = 0; i < kN; i += 256) {
+    CAPTURE(i);
+    CHECK(got[static_cast<size_t>(i)] == doctest::Approx(static_cast<float>(steps)));
+  }
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
 TEST_CASE("a REFERENCE-TIER op drains the batch before it touches device memory") {
   if (!VulkanPresent()) return;
   auto& ctx = vt::vulkan::VulkanContext::Get();

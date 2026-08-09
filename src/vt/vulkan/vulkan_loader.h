@@ -102,6 +102,7 @@ namespace vt::vulkan {
   X(vkCreateFence)                     \
   X(vkDestroyFence)                    \
   X(vkWaitForFences)                   \
+  X(vkGetFenceStatus)                  \
   X(vkResetFences)
 
 // The resolved pointers. A single process-wide instance; every member is null
