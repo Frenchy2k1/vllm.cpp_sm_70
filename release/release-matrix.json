@@ -9,6 +9,10 @@
     {"channel": "preview", "id": "macos-arm64-metal-mlx", "required": true},
     {"channel": "preview", "id": "linux-x86_64-glibc-vulkan", "required": true}
   ],
-  "release_ready": false,
+  "release_ready": true,
+  "retention": {
+    "ci_artifacts_days": 7,
+    "github_release": "maintainer-deletion-only"
+  },
   "schema": "vllm.cpp.release-matrix.v1"
 }

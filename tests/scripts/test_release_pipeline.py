@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +63,32 @@ class ReleasePipelineContract(unittest.TestCase):
         self.assertIn("linux-x86_64-glibc-cpu", ids)
         self.assertIn("linux-aarch64-glibc-cuda-fat", ids)
         self.assertNotIn("rocm", " ".join(ids))
+        self.assertEqual(plan["retention"]["ci_artifacts_days"], 7)
+
+    def test_matrix_retention_policy_is_exact(self) -> None:
+        matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        matrix["retention"]["ci_artifacts_days"] = 90
+        with self.assertRaises(ValueError):
+            self.pipeline.validate_matrix(matrix)
+
+    def test_publish_matrix_contains_all_eight_primary_bundles(self) -> None:
+        matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        artifacts = self.pipeline.validate_matrix(matrix)
+        self.assertTrue(matrix["release_ready"])
+        self.assertEqual(
+            {item["id"]: item["channel"] for item in artifacts},
+            {
+                "linux-x86_64-glibc-cpu": "stable",
+                "linux-aarch64-glibc-cpu": "stable",
+                "linux-x86_64-musl-cpu-static": "experimental-preview",
+                "linux-x86_64-glibc-cuda-fat": "preview",
+                "linux-aarch64-glibc-cuda-fat": "preview",
+                "linux-x86_64-glibc-vulkan": "preview",
+                "macos-arm64-metal": "stable",
+                "macos-arm64-metal-mlx": "preview",
+            },
+        )
+        self.assertTrue(all(item["required"] is True for item in artifacts))
 
     def test_handoff_digest_and_source_sha_are_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,6 +135,99 @@ class ReleasePipelineContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.pipeline.make_handoff(plan_path, assets, root / "handoff.json")
 
+    def test_publish_enumerates_only_verified_assets_without_shell_globs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            archive = assets / "linux-x86_64-glibc-cpu.tar.gz"
+            archive.write_bytes(b"release bytes")
+            digest = self.pipeline.file_sha256(archive)
+            for suffix, content in (
+                (".sha256", f"{digest}  {archive.name}\n"),
+                (".provenance.json", "{}\n"),
+            ):
+                (assets / f"{archive.name}{suffix}").write_text(content)
+            handoff = {
+                "files": [
+                    {"name": path.name, "sha256": self.pipeline.file_sha256(path), "size": path.stat().st_size}
+                    for path in sorted(assets.iterdir())
+                ],
+                "publish": True,
+                "release_tag": "v0.0.1",
+                "source_sha": SHA,
+                "verified": True,
+            }
+            handoff_path = root / "verified-handoff.json"
+            index_json = root / "release-index.json"
+            index_md = root / "RELEASE_INDEX.md"
+            self.pipeline.write_json(handoff_path, handoff)
+            self.pipeline.write_json(index_json, {
+                "artifacts": [{
+                    "archive": archive.name,
+                    "id": archive.name.removesuffix(".tar.gz"),
+                    "sha256": digest,
+                }],
+                "release_tag": "v0.0.1",
+                "schema": "vllm.cpp.release-index.v1",
+                "source_sha": SHA,
+            })
+            index_md.write_text(
+                f"# release v0.0.1\n\nSource: `{SHA}`\n\n{archive.name}\n"
+            )
+            with mock.patch.object(self.pipeline.subprocess, "run") as run:
+                self.pipeline.publish_release(
+                    handoff_path, assets, index_json, index_md, "v0.0.1"
+                )
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:4], ["gh", "release", "create", "v0.0.1"])
+            self.assertFalse(any("*" in value or "?" in value for value in argv))
+            self.assertIn(str(archive), argv)
+            run.assert_called_once()
+
+            index = json.loads(index_json.read_text())
+            index["source_sha"] = "f" * 40
+            self.pipeline.write_json(index_json, index)
+            with self.assertRaises(ValueError):
+                self.pipeline.publish_release(
+                    handoff_path, assets, index_json, index_md, "v0.0.1"
+                )
+
+    def test_publish_rejects_unverified_drift_and_extra_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            archive = assets / "asset.tar.gz"
+            archive.write_bytes(b"bytes")
+            handoff = {
+                "files": [{
+                    "name": archive.name,
+                    "sha256": self.pipeline.file_sha256(archive),
+                    "size": archive.stat().st_size,
+                }],
+                "publish": True,
+                "release_tag": "v0.0.1",
+                "verified": True,
+            }
+            handoff_path = root / "verified-handoff.json"
+            index_json = root / "release-index.json"
+            index_md = root / "RELEASE_INDEX.md"
+            self.pipeline.write_json(handoff_path, handoff)
+            index_json.write_text("{}\n")
+            index_md.write_text("# release\n")
+            (assets / "unexpected").write_text("no")
+            with self.assertRaises(ValueError):
+                self.pipeline.publish_release(
+                    handoff_path, assets, index_json, index_md, "v0.0.1"
+                )
+            (assets / "unexpected").unlink()
+            archive.write_bytes(b"drift")
+            with self.assertRaises(ValueError):
+                self.pipeline.publish_release(
+                    handoff_path, assets, index_json, index_md, "v0.0.1"
+                )
+
     def test_cli_dry_run_never_calls_github_or_creates_a_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "plan.json"
@@ -147,6 +267,10 @@ class ReleasePipelineContract(unittest.TestCase):
             "pull request trigger": ("  workflow_dispatch: {}", "  pull_request: {}\n  workflow_dispatch: {}"),
             "global write": ("permissions:\n  contents: read", "permissions:\n  contents: write"),
             "mutable upload": ("overwrite: false", "overwrite: true"),
+            "primary tuple omitted from handoff": (
+                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64]",
+                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64]",
+            ),
             "name not SHA-bound": ("release-unverified-${{ github.sha }}", "release-unverified"),
             "name download": ("artifact-ids: ${{ needs.build.outputs.artifact_id }}", "name: release-unverified"),
             "attest no OIDC": ("      id-token: write", "      id-token: none"),
@@ -154,6 +278,14 @@ class ReleasePipelineContract(unittest.TestCase):
             "attest no metadata grant": ("      artifact-metadata: write", "      artifact-metadata: none"),
             "publish no environment": ("    environment: release", "    # environment removed"),
             "publish broad dependency": ("    needs: [plan, verify, attest]", "    needs: [plan, build, verify, attest]"),
+            "publish no checkout": (
+                "    steps:\n      - uses: actions/checkout@v4\n      - name: Download only the verified handoff by ID",
+                "    steps:\n      - name: Download only the verified handoff by ID",
+            ),
+            "publish bypasses byte binding": (
+                "python3 scripts/release_pipeline.py publish",
+                "python3 -c 'pass'",
+            ),
             "publish not tag gated": (
                 "startsWith(github.ref, 'refs/tags/v')",
                 "startsWith(github.ref, 'refs/heads/')",

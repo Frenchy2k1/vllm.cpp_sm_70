@@ -224,6 +224,13 @@ class ReleaseArchiveContract(unittest.TestCase):
         )
         self.assertTrue(any("undeclared" in error for error in errors), errors)
         self.assertTrue(any("RPATH" in error for error in errors), errors)
+        self.assertEqual(
+            self.tool.validate_macho_install_id("@rpath/libmlx.dylib", ["/tmp/build"]),
+            [],
+        )
+        self.assertTrue(
+            self.tool.validate_macho_install_id("/tmp/build/libmlx.dylib", ["/tmp/build"])
+        )
 
     def test_literal_static_policy_rejects_any_dynamic_boundary(self) -> None:
         manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -261,6 +268,39 @@ class ReleaseArchiveContract(unittest.TestCase):
             [symbol.replace("sm_80", "sm_87") for symbol in symbols],
         )
         self.assertTrue(any("AOT" in error for error in errors), errors)
+
+    def test_macho_dependencies_install_names_and_rpaths_fail_closed(self) -> None:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        manifest["host"].update({"os": "macos", "arch": "aarch64", "abi": "macos"})
+        manifest["backend"]["name"] = "mlx"
+        manifest["dependencies"] = [
+            {"name": "libmlx.dylib", "linkage": "dynamic"},
+            {"name": "libc++.1.dylib", "linkage": "dynamic"},
+            {"name": "libSystem.B.dylib", "linkage": "dynamic"},
+            {"name": "Metal.framework", "linkage": "external"},
+            {"name": "Foundation.framework", "linkage": "external"},
+        ]
+        dependencies = [
+            "@rpath/libmlx.dylib",
+            "/usr/lib/libc++.1.dylib",
+            "/usr/lib/libSystem.B.dylib",
+            "/System/Library/Frameworks/Metal.framework/Versions/A/Metal",
+            "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+        ]
+        self.assertEqual(
+            self.tool.validate_macho_dynamic(
+                manifest, dependencies, ["@loader_path/../lib"], ["/tmp/build-secret"]
+            ),
+            [],
+        )
+        errors = self.tool.validate_macho_dynamic(
+            manifest,
+            [*dependencies, "/tmp/build-secret/libbad.dylib"],
+            ["/tmp/build-secret"],
+            ["/tmp/build-secret"],
+        )
+        self.assertTrue(any("install name" in error for error in errors), errors)
+        self.assertTrue(any("RPATH" in error for error in errors), errors)
 
     def test_tar_traversal_is_rejected_before_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

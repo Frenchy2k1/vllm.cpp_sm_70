@@ -34,13 +34,19 @@ def validate(text: str) -> list[str]:
     if "continue-on-error" in text:
         errors.append("release workflow may not continue after an error")
 
-    read_only_jobs = (
-        "plan",
+    primary_build_jobs = (
         "cpu_x86",
         "cpu_arm64",
         "cpu_musl",
         "cuda_x86",
         "cuda_arm64",
+        "vulkan_x86",
+        "metal_arm64",
+        "mlx_arm64",
+    )
+    read_only_jobs = (
+        "plan",
+        *primary_build_jobs,
         "build",
         "verify",
     )
@@ -58,6 +64,15 @@ def validate(text: str) -> list[str]:
         permission_block = re.search(r"(?m)^    permissions:\n((?:      [^\n]*\n)+)", block)
         if permission_block and "write" in permission_block.group(1):
             errors.append(f"{name} job unexpectedly has write permission")
+
+    build = blocks["build"]
+    expected_needs = "    needs: [plan, " + ", ".join(primary_build_jobs) + "]"
+    if expected_needs not in build:
+        errors.append("handoff build job must depend on every primary release tuple")
+    for name in primary_build_jobs:
+        reference = f"${{{{ needs.{name}.outputs.artifact_id }}}}"
+        if reference not in build:
+            errors.append(f"handoff build job does not consume immutable {name} output")
 
     attest = blocks["attest"]
     for permission in (
@@ -83,8 +98,16 @@ def validate(text: str) -> list[str]:
         errors.append("publish job must use the protected release environment")
     if "    needs: [plan, verify, attest]" not in publish:
         errors.append("publish job must consume only plan plus verified and attested handoffs")
+    if "uses: actions/checkout@v4" not in publish:
+        errors.append("publish job must check out the exact tagged publisher implementation")
     if tag_gate not in publish or "needs.plan.outputs.publish == 'true'" not in publish:
         errors.append("publish job must require an exact tag and approved publish plan")
+    if "scripts/release_pipeline.py publish" not in publish:
+        errors.append("publish job must use the byte-bound release publisher")
+    if "verified/assets" not in publish or "verified/release-index.json" not in publish:
+        errors.append("publish job must release verified assets and generated indexes")
+    if "gh release create" in publish:
+        errors.append("release workflow must not bypass the byte-bound publisher")
 
     required_handoff = (
         "name: release-plan-${{ github.sha }}",
@@ -95,6 +118,7 @@ def validate(text: str) -> list[str]:
         "artifact-ids: ${{ needs.verify.outputs.artifact_id }}",
         "overwrite: false",
         "if-no-files-found: error",
+        "python3 scripts/release_index.py",
     )
     for fragment in required_handoff:
         if fragment not in text:

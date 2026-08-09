@@ -258,18 +258,23 @@ def validate_sbom(path: Path, root: Path, manifest: dict[str, Any]) -> list[str]
     if not isinstance(files, list):
         return errors + ["SBOM files must be an array"]
     by_name = {item.get("fileName"): item for item in files if isinstance(item, dict)}
-    binary = by_name.get("./bin/vllm-server")
-    if not isinstance(binary, dict):
-        return errors + ["SBOM must inventory ./bin/vllm-server"]
-    checksums = binary.get("checksums", [])
-    recorded = {
-        item.get("checksumValue")
-        for item in checksums
-        if isinstance(item, dict) and item.get("algorithm") == "SHA256"
-    }
-    actual = sha256(root / "bin/vllm-server")
-    if recorded != {actual}:
-        errors.append("SBOM server SHA256 does not match extracted bytes")
+    shipped = [root / "bin/vllm-server"]
+    lib_dir = root / "lib"
+    if lib_dir.is_dir():
+        shipped.extend(path for path in lib_dir.rglob("*") if path.is_file() and not path.is_symlink())
+    for shipped_path in shipped:
+        relative = "./" + shipped_path.relative_to(root).as_posix()
+        item = by_name.get(relative)
+        if not isinstance(item, dict):
+            errors.append(f"SBOM must inventory {relative}")
+            continue
+        recorded = {
+            checksum.get("checksumValue")
+            for checksum in item.get("checksums", [])
+            if isinstance(checksum, dict) and checksum.get("algorithm") == "SHA256"
+        }
+        if recorded != {sha256(shipped_path)}:
+            errors.append(f"SBOM SHA256 does not match extracted bytes for {relative}")
     return errors
 
 
@@ -298,7 +303,11 @@ def validate_linux_dynamic(
     declared = {
         item.get("name")
         for item in manifest.get("dependencies", [])
-        if isinstance(item, dict) and item.get("linkage") == "dynamic"
+        if (
+            isinstance(item, dict)
+            and item.get("linkage") == "dynamic"
+            and not str(item.get("name", "")).endswith(".metallib")
+        )
     }
     literal_static = manifest.get("artifact", {}).get("static_boundary") == "literal-static"
     if literal_static and (needed or rpaths or interpreter):
@@ -321,6 +330,89 @@ def validate_linux_dynamic(
     if not literal_static and host.get("abi") == "musl" and "ld-musl" not in interpreter:
         errors.append(f"musl artifact has unexpected ELF interpreter: {interpreter!r}")
     return errors
+
+
+def macho_dependency_name(install_name: str) -> str:
+    for component in install_name.split("/"):
+        if component.endswith(".framework"):
+            return component
+    return Path(install_name).name
+
+
+def validate_macho_dynamic(
+    manifest: dict[str, Any],
+    dependencies: list[str],
+    rpaths: list[str],
+    forbidden_paths: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    declared_dynamic = {
+        item.get("name")
+        for item in manifest.get("dependencies", [])
+        if (
+            isinstance(item, dict)
+            and item.get("linkage") == "dynamic"
+            and not str(item.get("name", "")).endswith(".metallib")
+        )
+    }
+    declared_external = {
+        item.get("name")
+        for item in manifest.get("dependencies", [])
+        if isinstance(item, dict) and item.get("linkage") == "external"
+    }
+    actual_dynamic: set[str] = set()
+    actual_external: set[str] = set()
+    for install_name in dependencies:
+        name = macho_dependency_name(install_name)
+        if name.endswith(".framework"):
+            actual_external.add(name)
+        else:
+            actual_dynamic.add(name)
+        allowed = install_name.startswith(("/usr/lib/", "/System/Library/", "@rpath/", "@loader_path/"))
+        if not allowed:
+            errors.append(f"forbidden Mach-O install name: {install_name}")
+        if any(path and path in install_name for path in forbidden_paths):
+            errors.append(f"Mach-O install name contains forbidden build path: {install_name}")
+    for name in sorted(actual_dynamic - declared_dynamic):
+        errors.append(f"undeclared Mach-O dependency: {name}")
+    for name in sorted(declared_dynamic - actual_dynamic):
+        errors.append(f"declared dynamic dependency is not linked: {name}")
+    for name in sorted(actual_external - declared_external):
+        errors.append(f"undeclared Mach-O framework dependency: {name}")
+    for name in sorted(declared_external - actual_external):
+        errors.append(f"declared external framework is not linked: {name}")
+    for entry in rpaths:
+        if not entry.startswith("@loader_path/"):
+            errors.append(f"Mach-O RPATH must be relative to the extracted bundle: {entry}")
+        if any(path and path in entry for path in forbidden_paths):
+            errors.append(f"Mach-O RPATH contains a forbidden build path: {entry}")
+    return errors
+
+
+def parse_otool_dependencies(output: str) -> list[str]:
+    lines = output.splitlines()[1:]
+    return [line.strip().split(" (", 1)[0] for line in lines if line.strip()]
+
+
+def parse_otool_rpaths(output: str) -> list[str]:
+    lines = output.splitlines()
+    rpaths: list[str] = []
+    for index, line in enumerate(lines):
+        if line.strip() == "cmd LC_RPATH":
+            for candidate in lines[index + 1:index + 5]:
+                match = re.match(r"\s*path\s+(\S+)\s+\(offset", candidate)
+                if match:
+                    rpaths.append(match.group(1))
+                    break
+    return rpaths
+
+
+def validate_macho_install_id(install_id: str, forbidden_paths: list[str]) -> list[str]:
+    if not install_id.startswith(("@rpath/", "@loader_path/")):
+        return [f"bundled Mach-O install ID must be relative: {install_id}"]
+    if any(path and path in install_id for path in forbidden_paths):
+        return [f"bundled Mach-O install ID contains a forbidden build path: {install_id}"]
+    return []
 
 
 def validate_cuda_inventory(
@@ -420,6 +512,74 @@ def inspect_linux(
     return errors
 
 
+def inspect_macos(
+    root: Path,
+    server: Path,
+    manifest: dict[str, Any],
+    forbidden_paths: list[str],
+    skip_version_smoke: bool,
+) -> list[str]:
+    errors: list[str] = []
+    for tool in ("file", "otool"):
+        if shutil.which(tool) is None:
+            errors.append(f"required macOS archive inspector is unavailable: {tool}")
+    if errors:
+        return errors
+    file_rc, file_output = run(["file", "-b", str(server)])
+    if file_rc != 0 or "Mach-O" not in file_output or "arm64" not in file_output:
+        errors.append(f"server is not a Mach-O arm64 executable: {file_output.strip()}")
+    binaries = [server]
+    if manifest.get("backend", {}).get("name") == "mlx":
+        binaries.append(root / "lib/libmlx.dylib")
+    dependencies: set[str] = set()
+    rpaths: set[str] = set()
+    for binary in binaries:
+        binary_rc, binary_output = run(["file", "-b", str(binary)])
+        deps_rc, deps_output = run(["otool", "-L", str(binary)])
+        load_rc, load_output = run(["otool", "-l", str(binary)])
+        if binary_rc != 0 or "Mach-O" not in binary_output or "arm64" not in binary_output:
+            errors.append(f"bundled executable/library is not Mach-O arm64: {binary}")
+        if deps_rc != 0 or load_rc != 0:
+            errors.append(f"otool could not inspect extracted Mach-O file: {binary}")
+            continue
+        dependencies.update(parse_otool_dependencies(deps_output))
+        rpaths.update(parse_otool_rpaths(load_output))
+        if binary.suffix == ".dylib":
+            id_rc, id_output = run(["otool", "-D", str(binary)])
+            install_ids = [line.strip() for line in id_output.splitlines()[1:] if line.strip()]
+            if id_rc != 0 or len(install_ids) != 1:
+                errors.append(f"bundled dylib has no unique install ID: {binary}")
+            else:
+                errors.extend(validate_macho_install_id(install_ids[0], forbidden_paths))
+    errors.extend(
+        validate_macho_dynamic(
+            manifest,
+            sorted(dependencies),
+            sorted(rpaths),
+            forbidden_paths,
+        )
+    )
+    if manifest.get("backend", {}).get("name") == "mlx":
+        for relative in ("lib/libmlx.dylib", "lib/mlx.metallib"):
+            if not (root / relative).is_file():
+                errors.append(f"MLX archive is missing bundled {relative}")
+    help_rc, help_output = run([str(server), "--help"])
+    if help_rc != 0 or "usage" not in help_output.lower():
+        errors.append("extracted vllm-server --help smoke failed")
+    if not skip_version_smoke:
+        version_rc, version_output = run([str(server), "--version"])
+        expected_version = manifest.get("artifact", {}).get("version", "")
+        version_record = parse_version(root / "VERSION")[0]
+        expected_abi = version_record.get("c_abi_version", "")
+        if (
+            version_rc != 0
+            or f"vllm.cpp {expected_version}" not in version_output
+            or f"c-abi={expected_abi}" not in version_output
+        ):
+            errors.append("extracted vllm-server --version disagrees with VERSION/manifest")
+    return errors
+
+
 def validate_release(args: argparse.Namespace) -> list[str]:
     archive = args.archive.resolve()
     digest, errors = validate_checksum(archive, args.checksum.resolve())
@@ -457,8 +617,18 @@ def validate_release(args: argparse.Namespace) -> list[str]:
                     args.skip_version_smoke,
                 )
             )
+        elif manifest.get("host", {}).get("os") == "macos":
+            errors.extend(
+                inspect_macos(
+                    extracted,
+                    extracted / "bin/vllm-server",
+                    manifest,
+                    forbidden,
+                    args.skip_version_smoke,
+                )
+            )
         else:
-            errors.append("W7 validator currently accepts Linux archives only")
+            errors.append("release archive has an unsupported host OS")
     return errors
 
 

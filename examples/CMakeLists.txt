@@ -84,6 +84,20 @@ if(VLLM_CPP_SERVER)
     target_link_options(server PRIVATE -static -static-libgcc -static-libstdc++)
   endif()
   set_target_properties(server PROPERTIES OUTPUT_NAME vllm-server)
+  if(VLLM_CPP_MLX)
+    set_target_properties(server PROPERTIES
+      BUILD_RPATH "${MLX_ROOT}/lib"
+      INSTALL_RPATH "@loader_path/../lib")
+    find_file(_vllm_mlx_metallib mlx.metallib
+      PATHS "${MLX_ROOT}/lib" "${MLX_ROOT}" NO_DEFAULT_PATH)
+    if(NOT _vllm_mlx_metallib)
+      message(FATAL_ERROR
+        "MLX release packaging requires mlx.metallib under MLX_ROOT")
+    endif()
+    install(FILES "${MLX_LIBRARY}" "${_vllm_mlx_metallib}"
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      COMPONENT vllm-server)
+  endif()
   vllm_cpp_set_warnings(server)
   install(TARGETS server
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

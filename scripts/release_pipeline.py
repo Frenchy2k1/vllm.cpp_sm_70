@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,9 @@ from typing import Any
 PLAN_SCHEMA = "vllm.cpp.release-plan.v1"
 HANDOFF_SCHEMA = "vllm.cpp.release-handoff.v1"
 MATRIX_SCHEMA = "vllm.cpp.release-matrix.v1"
+RELEASE_INDEX_SCHEMA = "vllm.cpp.release-index.v1"
 CHANNELS = {"stable", "preview", "experimental-preview"}
+RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 
 
 def canonical_json(value: Any) -> str:
@@ -44,10 +47,17 @@ def file_sha256(path: Path) -> str:
 
 
 def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
+    if set(matrix) != {"artifacts", "release_ready", "retention", "schema"}:
+        raise ValueError("release matrix has unknown or missing fields")
     if matrix.get("schema") != MATRIX_SCHEMA:
         raise ValueError(f"release matrix schema must be {MATRIX_SCHEMA}")
     if type(matrix.get("release_ready")) is not bool:
         raise ValueError("release matrix release_ready must be boolean")
+    if matrix.get("retention") != {
+        "ci_artifacts_days": 7,
+        "github_release": "maintainer-deletion-only",
+    }:
+        raise ValueError("release matrix retention policy is invalid")
     artifacts = matrix.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("release matrix artifacts must be a non-empty array")
@@ -92,6 +102,7 @@ def make_plan(
         "event": event,
         "publish": publish,
         "release_tag": release_tag,
+        "retention": matrix["retention"],
         "schema": PLAN_SCHEMA,
         "source_sha": source_sha,
         "version": version,
@@ -151,6 +162,7 @@ def handoff_value(plan_path: Path, assets_dir: Path) -> dict[str, Any]:
         "plan_sha256": file_sha256(plan_path),
         "publish": plan.get("publish"),
         "release_tag": plan.get("release_tag"),
+        "retention": plan.get("retention"),
         "schema": HANDOFF_SCHEMA,
         "source_sha": plan.get("source_sha"),
     }
@@ -174,6 +186,107 @@ def verify_handoff(
     if handoff != expected or plan.get("source_sha") != expected_sha:
         raise ValueError("release handoff does not match the immutable plan and workflow SHA")
     write_json(output, {**handoff, "verified": True})
+
+
+def publish_release(
+    handoff_path: Path,
+    assets_dir: Path,
+    index_json: Path,
+    index_markdown: Path,
+    tag: str,
+) -> None:
+    """Publish only the regular files authenticated by a verified handoff."""
+    handoff = read_json(handoff_path)
+    if handoff.get("verified") is not True or handoff.get("publish") is not True:
+        raise ValueError("release publication requires a verified publish handoff")
+    if RELEASE_TAG.fullmatch(tag) is None or handoff.get("release_tag") != tag:
+        raise ValueError("release tag does not match the verified handoff")
+    if not assets_dir.is_dir():
+        raise ValueError(f"asset directory does not exist: {assets_dir}")
+    files = handoff.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("verified handoff has no release files")
+
+    expected: dict[str, dict[str, Any]] = {}
+    for item in files:
+        if not isinstance(item, dict) or set(item) < {"name", "sha256", "size"}:
+            raise ValueError("verified handoff file inventory is malformed")
+        name = item["name"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or name in expected
+        ):
+            raise ValueError("verified handoff contains an unsafe or duplicate file name")
+        expected[name] = item
+
+    actual_paths = sorted(assets_dir.iterdir(), key=lambda path: path.name)
+    actual_names = {path.name for path in actual_paths}
+    if actual_names != set(expected):
+        raise ValueError("release assets do not exactly match the verified handoff")
+    for path in actual_paths:
+        item = expected[path.name]
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"release asset must be a regular file: {path.name}")
+        if file_sha256(path) != item.get("sha256") or path.stat().st_size != item.get("size"):
+            raise ValueError(f"release asset drifted after verification: {path.name}")
+    for path in (index_json, index_markdown):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"release index must be a regular file: {path}")
+    index = read_json(index_json)
+    if (
+        index.get("schema") != RELEASE_INDEX_SCHEMA
+        or index.get("release_tag") != tag
+        or index.get("source_sha") != handoff.get("source_sha")
+    ):
+        raise ValueError("release index identity does not match the verified handoff")
+    index_rows = index.get("artifacts")
+    if not isinstance(index_rows, list):
+        raise ValueError("release index artifacts must be an array")
+    expected_archives = {
+        name: item for name, item in expected.items() if name.endswith(".tar.gz")
+    }
+    indexed_archives: set[str] = set()
+    for row in index_rows:
+        if not isinstance(row, dict):
+            raise ValueError("release index artifact row is malformed")
+        archive = row.get("archive")
+        artifact_id = row.get("id")
+        if (
+            not isinstance(archive, str)
+            or not isinstance(artifact_id, str)
+            or archive != f"{artifact_id}.tar.gz"
+            or archive not in expected_archives
+            or archive in indexed_archives
+            or row.get("sha256") != expected_archives[archive].get("sha256")
+        ):
+            raise ValueError("release index does not match the verified archive inventory")
+        indexed_archives.add(archive)
+    if indexed_archives != set(expected_archives):
+        raise ValueError("release index does not enumerate every verified archive")
+    markdown = index_markdown.read_text(encoding="utf-8")
+    required_markdown = [tag, str(handoff.get("source_sha", "")), *indexed_archives]
+    if any(not value or value not in markdown for value in required_markdown):
+        raise ValueError("release Markdown index does not match the verified handoff")
+
+    subprocess.run(
+        [
+            "gh",
+            "release",
+            "create",
+            tag,
+            *(str(path) for path in actual_paths),
+            str(index_json),
+            str(index_markdown),
+            "--verify-tag",
+            "--title",
+            tag,
+            "--notes-file",
+            str(index_markdown),
+        ],
+        check=True,
+    )
 
 
 def write_outputs(path: Path, values: dict[str, str | bool]) -> None:
@@ -206,6 +319,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     verify.add_argument("--assets-dir", type=Path, required=True)
     verify.add_argument("--output", type=Path, required=True)
     verify.add_argument("--sha", required=True)
+    publish = commands.add_parser("publish")
+    publish.add_argument("--handoff", type=Path, required=True)
+    publish.add_argument("--assets-dir", type=Path, required=True)
+    publish.add_argument("--index-json", type=Path, required=True)
+    publish.add_argument("--index-markdown", type=Path, required=True)
+    publish.add_argument("--tag", required=True)
     return parser.parse_args(argv)
 
 
@@ -227,9 +346,17 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.command == "handoff":
             make_handoff(args.plan, args.assets_dir, args.output)
-        else:
+        elif args.command == "verify":
             verify_handoff(args.plan, args.handoff, args.assets_dir, args.output, args.sha)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        else:
+            publish_release(
+                args.handoff,
+                args.assets_dir,
+                args.index_json,
+                args.index_markdown,
+                args.tag,
+            )
+    except (OSError, json.JSONDecodeError, subprocess.CalledProcessError, ValueError) as exc:
         print(f"release pipeline error: {exc}", file=sys.stderr)
         return 1
     return 0

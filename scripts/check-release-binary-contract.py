@@ -55,11 +55,11 @@ WORK_DEPS = {
 ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | **ACTIVE; W5 contract + W6 package GREEN** |",
+    ".agents/NOW.md": "| Release | **ACTIVE; required W1-W11/W13 implemented in #196** |",
     ".agents/coordination.md": "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": "# W6 installed server package green",
-    "docs/STATUS.md": "#196 W6 package/help GREEN; no published assets",
-    "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; W5+W6 implemented)** | `ENG-RELEASE-BINARIES`:",
+    "docs/STATUS.md": "#196 binary pipeline implemented; no published binaries",
+    "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** |",
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
@@ -71,38 +71,38 @@ LIFECYCLE_RECORD_MUTATIONS = (
     ),
     (
         ".agents/engine-matrix.md",
-        "W7 archive validation/supply-chain metadata, publish workflow and real model/runtime evidence remain pending",
-        "W7 archive validation/supply-chain metadata, publish workflow and real model/runtime evidence are complete",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, and tagged publication remain pending",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, and tagged publication are complete",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "`ACTIVE` | W5 manifest/schema fixtures and W6 canonical static-core server",
-        "`DONE` | W5 manifest/schema fixtures and W6 canonical static-core server",
+        "`ACTIVE` | Required W1-W11/W13 implementation is complete",
+        "`DONE` | Required W1-W11/W13 implementation is complete",
         "roadmap release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "no release-grade or published archive exists",
-        "release-grade and published archives exist",
+        "no published binary exists",
+        "published binaries exist",
         "roadmap release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "| `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals 10/10 killed; accepted release suite 30/30; no archive or real runtime/correctness/performance evidence |",
-        "| `DONE` | 2026-08-08 — W5 19/19; fresh-review production removals 10/10 killed; accepted release suite 30/30; archive and runtime/correctness/performance evidence complete |",
+        "| `ACTIVE` | 2026-08-09 — required W1-W11/W13 implementation complete;",
+        "| `DONE` | 2026-08-09 — required W1-W11/W13 implementation complete;",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "Excludes W1-W4, W6-W13, archives, install/package/publish workflows and runtime artifacts",
-        "Includes W1-W13, archives, install/package/publish workflows and runtime artifacts",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, rebase/merge, and tagged publication pending",
+        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, rebase/merge, and tagged publication complete",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "no archive or real runtime/correctness/performance evidence",
-        "release archive and runtime/correctness/performance evidence shipped",
+        "W12 optional/non-primary |",
+        "W12 required/primary |",
         "coordination release lifecycle",
     ),
     (
@@ -114,12 +114,12 @@ LIFECYCLE_RECORD_MUTATIONS = (
 )
 
 BENCHMARKS_RELEASE_ROW = (
-    "| **Binary release matrix (ACTIVE; W5+W6 implemented)** | `ENG-RELEASE-BINARIES`: deterministic manifest plus installed static-core server archive; fat-CUDA/adaptive-CPU bundles remain the target | "
-    "**W6 GREEN 1/1:** clean CPU build; reproducible archive; extracted help; no dynamic `libvllm`; library install preserved. **PENDING:** W1-W4/W7-W13, W7 validation, model/runtime gates, publication | n/a |"
+    "| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | "
+    "Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
-    "Subset; #196 W6 package/help GREEN; no published assets",
+    "Subset; #196 binary pipeline implemented; no published binaries",
 )
 
 BACKEND_POLICY_PROSE = {
@@ -273,13 +273,13 @@ WORK_CONTENT = {
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** W1-W4/W7-W13, W7 validation, model/runtime gates, publication",
+        "**PENDING:** hosted full matrix, matching hardware, tagged publish",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
         "docs/STATUS.md",
-        "Subset; #196 W6 package/help GREEN; no published assets",
+        "Subset; #196 binary pipeline implemented; no published binaries",
         "Supported; #196: RELEASE DONE/ARTIFACTS✓",
         "docs/STATUS.md release row",
     ),
@@ -1014,9 +1014,14 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         "engine-matrix release lifecycle",
         errors,
     )
-    if engine is not None and (engine[7] != "`ACTIVE`" or "W6 canonical static-core" not in engine[4] or "W7 archive validation/supply-chain metadata, publish workflow and real model/runtime evidence remain pending" not in engine[4]):
+    if engine is not None and (
+        engine[7] != "`ACTIVE`"
+        or "Required W1-W11/W13 implementation is complete" not in engine[4]
+        or "hosted ten-SM completion, full eight-tuple dry run" not in engine[5]
+        or "tagged publication remain pending" not in engine[5]
+    ):
         errors.append(
-            "engine-matrix release lifecycle must be ACTIVE with W5/W6 implemented and W7 validation plus real evidence pending"
+            "engine-matrix release lifecycle must be ACTIVE with required implementation complete and hosted publication pending"
         )
 
     roadmap = _table_record(
@@ -1027,22 +1032,33 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         "roadmap release lifecycle",
         errors,
     )
-    if roadmap is not None and (roadmap[5] != "`ACTIVE`" or "W6 canonical static-core server" not in roadmap[6] or "W1-W4 and W7-W13 remain pending" not in roadmap[6] or "no release-grade or published archive exists" not in roadmap[6]):
+    if roadmap is not None and (
+        roadmap[5] != "`ACTIVE`"
+        or "Required W1-W11/W13 implementation is complete" not in roadmap[6]
+        or "full eight-tuple dry run" not in roadmap[6]
+        or "no published binary exists" not in roadmap[6]
+    ):
         errors.append(
-            "roadmap release lifecycle must be ACTIVE with W5/W6 implemented while W1-W4/W7-W13 and release publication remain pending"
+            "roadmap release lifecycle must be ACTIVE with required implementation complete and hosted publication pending"
         )
 
     coordination = _table_record(
         root,
         ".agents/coordination.md",
-        "| `CLAIM-ENG-RELEASE-BINARIES-W5` |",
+        "| `CLAIM-ENG-RELEASE-BINARIES-W1-W13` |",
         8,
         "coordination release lifecycle",
         errors,
     )
-    if coordination is not None and (coordination[6] != "`ACTIVE`" or "W5 implemented" not in coordination[5] or "Excludes W1-W4, W6-W13" not in coordination[5] or "no archive or real runtime/correctness/performance evidence" not in coordination[7]):
+    if coordination is not None and (
+        coordination[6] != "`ACTIVE`"
+        or "Complete W1-W13 contract in one PR" not in coordination[5]
+        or "required W1-W11/W13 implementation complete" not in coordination[7]
+        or "tagged publication pending" not in coordination[7]
+        or "W12 optional/non-primary" not in coordination[7]
+    ):
         errors.append(
-            "coordination release lifecycle must keep W5 ACTIVE and implemented while later work and real artifact evidence remain pending"
+            "coordination release lifecycle must keep required implementation ACTIVE while hosted publication remains pending"
         )
 
     state_path = root / ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md"
@@ -1270,9 +1286,9 @@ def contract_errors(root: Path) -> list[str]:
         if fields.get(key) != expected:
             errors.append(_field_error(key, fields.get(key), expected))
 
-    if "Status: accepted contract with W5 manifest tooling and W6 installed server\npackaging implemented for `ENG-RELEASE-BINARIES`." not in text:
+    if "Status: accepted contract with required W1-W11/W13 implementation complete for\n`ENG-RELEASE-BINARIES`" not in text:
         errors.append(
-            "release spec identity/status line must name the accepted W5/W6 ENG-RELEASE-BINARIES contract"
+            "release spec identity/status line must name the accepted required implementation state"
         )
 
     header = "| Work | Deps | Deliverable | Exit gate |"
@@ -1338,8 +1354,8 @@ def contract_errors(root: Path) -> list[str]:
         encoding="utf-8"
     ):
         errors.append(
-            "docs/BENCHMARKS.md release row must keep W6 green while W7 validation, "
-            "runtime gates, and publication remain pending"
+            "docs/BENCHMARKS.md release row must keep hosted validation and "
+            "publication pending"
         )
     status = root / "docs/STATUS.md"
     status_text = status.read_text(encoding="utf-8") if status.is_file() else ""
@@ -1349,8 +1365,7 @@ def contract_errors(root: Path) -> list[str]:
     )
     if not all(fragment in status_row for fragment in STATUS_RELEASE_FRAGMENTS):
         errors.append(
-            "docs/STATUS.md release row must stay ACTIVE/W6 with no published "
-            "artifact or runtime claim"
+            "docs/STATUS.md release row must keep the binary pipeline unpublished"
         )
     preflight = root / PREFLIGHT_PATH
     ci = root / CI_PATH

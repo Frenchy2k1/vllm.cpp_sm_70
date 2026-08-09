@@ -189,6 +189,7 @@ def spdx_document(
     source_commit: str,
     server: Path,
     dependency_rows: list[dict[str, Any]],
+    bundled_files: list[tuple[str, Path, str]] | None = None,
 ) -> dict[str, Any]:
     binary_digest = sha256(server)
     packages = [
@@ -214,6 +215,25 @@ def spdx_document(
                 "versionInfo": dependency["version"],
             }
         )
+    files = [
+        {
+            "SPDXID": "SPDXRef-File-vllm-server",
+            "checksums": [{"algorithm": "SHA256", "checksumValue": binary_digest}],
+            "copyrightText": "NOASSERTION",
+            "fileName": "./bin/vllm-server",
+            "licenseConcluded": "Apache-2.0",
+        }
+    ]
+    for index, (relative, path, license_id) in enumerate(bundled_files or (), 1):
+        files.append(
+            {
+                "SPDXID": f"SPDXRef-Bundled-File-{index}",
+                "checksums": [{"algorithm": "SHA256", "checksumValue": sha256(path)}],
+                "copyrightText": "NOASSERTION",
+                "fileName": f"./{relative}",
+                "licenseConcluded": license_id,
+            }
+        )
     return {
         "SPDXID": "SPDXRef-DOCUMENT",
         "creationInfo": {
@@ -222,15 +242,7 @@ def spdx_document(
         },
         "dataLicense": "CC0-1.0",
         "documentNamespace": f"https://github.com/mudler/vllm.cpp/spdx/{source_commit}/{artifact_id}",
-        "files": [
-            {
-                "SPDXID": "SPDXRef-File-vllm-server",
-                "checksums": [{"algorithm": "SHA256", "checksumValue": binary_digest}],
-                "copyrightText": "NOASSERTION",
-                "fileName": "./bin/vllm-server",
-                "licenseConcluded": "Apache-2.0",
-            }
-        ],
+        "files": files,
         "name": artifact_id,
         "packages": packages,
         "spdxVersion": "SPDX-2.3",
