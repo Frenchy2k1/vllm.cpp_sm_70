@@ -208,7 +208,7 @@ the registered engine forward.
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
-| Tenstorrent Blackhole | ◐ W1.5, 9/9 OPT-125m ops ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`, `ACTIVE`) | ☐ | ☐ | ☐ |
+| Tenstorrent Blackhole | ◐ W2, OPT-125m STRICT 6/6 e2e ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`, `ACTIVE`) | ✅ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core

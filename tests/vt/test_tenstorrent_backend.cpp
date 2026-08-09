@@ -58,13 +58,13 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   vllm::platforms::Platform& p = vllm::platforms::GetPlatform(DeviceType::kTENSTORRENT);
   CHECK(p.device_type() == DeviceType::kTENSTORRENT);
   CHECK(&p.backend() == vt::TryGetBackend(DeviceType::kTENSTORRENT));
-  // Registers the OPT-125m linear/residual/activation + vocab + norm slice
-  // (kMatmul, kMatmulBT, kAdd, kRelu, kEmbedding, kLayerNorm) in F32 only —
-  // see tenstorrent_ops.cpp.
-  CHECK(p.supported_dtypes() == std::vector<vt::DType>{vt::DType::kF32});
-  // No attention kernel exists yet; an empty priority list is the honest answer
-  // (platforms/tenstorrent.cpp's comment on get_attn_backend_priority).
-  CHECK(p.get_attn_backend_priority({}).empty());
+  // OPT-125m path: BF16 weights/activations + F32 logits — see tenstorrent_ops.cpp.
+  CHECK(p.supported_dtypes() ==
+        std::vector<vt::DType>{vt::DType::kBF16, vt::DType::kF32});
+  // FLASH_ATTN is registered against the NHD layout our kPagedAttention uses.
+  CHECK(p.get_attn_backend_priority({}) == std::vector<std::string>{"FLASH_ATTN"});
+  CHECK(p.supports_model_architecture("OPTForCausalLM"));
+  CHECK_FALSE(p.supports_model_architecture("Qwen3ForCausalLM"));
 }
 
 TEST_CASE("kTENSTORRENT kMatmul matches a host F32 reference") {
