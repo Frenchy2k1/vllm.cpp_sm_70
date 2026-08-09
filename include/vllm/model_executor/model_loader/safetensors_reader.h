@@ -54,10 +54,6 @@ class SafetensorsFile {
     return metadata_;
   }
 
-  // Refcounted keep-alive on this file's read-only mmap (see StTensor::mapping).
-  // Holding it keeps the mapping (and its fd) valid past ~SafetensorsFile.
-  std::shared_ptr<const void> MappingKeepAlive() const { return map_; }
-
  private:
   // The mmap + fd as one refcounted resource, so a borrowed weight can outlive
   // the SafetensorsFile that opened it. munmap/close run when the LAST reference

@@ -161,16 +161,30 @@ inline Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   if (!w.d_packed) {
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
+    // ENG-LOAD-DIRECT-UPLOAD (issue #150). `LoadCtNvfp4W4A16`/`LoadCtMxfp4W4A16`
+    // /`LoadCtNvfp4Raw` BORROW `packed` and `scale` from the safetensors mmap,
+    // so this is the one host->device move of those bytes and it must be
+    // accounted and followed by the same post-upload residency step every other
+    // qualifying weight gets. Publishing the allocation on the OwnedTensor is
+    // what lets `AdoptDeviceBytesAsHost` run at all (it keys on `d_dev`); the
+    // two handles share one control block, so the buffer is still freed exactly
+    // once, through the vt Backend.
+    vllm::load_stats::AddDeviceUpload(pb);
     d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
     Backend* bk = &d.b;
     w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    w.packed.d_dev = w.d_packed;
+    AdoptDeviceBytesAsHost(d.b, w.packed);
   }
   if (!w.d_scale) {
     const size_t sb = w.scale.bytes.size();
     void* p = d.b.Alloc(sb);
+    vllm::load_stats::AddDeviceUpload(sb);
     d.b.Copy(d.q, p, w.scale.bytes.data(), sb);
     Backend* bk = &d.b;
     w.d_scale = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    w.scale.d_dev = w.d_scale;
+    AdoptDeviceBytesAsHost(d.b, w.scale);
   }
   Nvfp4Dev r;
   r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
