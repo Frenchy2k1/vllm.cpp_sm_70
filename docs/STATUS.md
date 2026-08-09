@@ -420,11 +420,12 @@ Parakeet ASR (2026-08-07): *CPU-correct, ON THE ONE SURFACE (ROW 1)*. Ids exact 
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
-Vulkan (opt-125m exact, GEMV 1.8x; 24 native, +8 GDN incl. BOTH
-recurrences; 27B prefill 21.5x, decode 2.99 vs llama.cpp 4.35; #125 VERIFIED; CUDA build fixed
+Vulkan (opt-125m exact; 24 native +8 GDN, BOTH
+recurrences; 27B prefill 21.5x, decode 3.93/4.35 llama.cpp (GDN state
+in place, 98->2 copy flushes/tok); #125 VERIFIED
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
-on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in —
-**blind-written, unverified** — M2 unblocks on verification; gfx1201 hipBLAS +
+on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
+(**blind-written, unverified**); M2 needs verification; gfx1201 hipBLAS +
 Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
 [guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction

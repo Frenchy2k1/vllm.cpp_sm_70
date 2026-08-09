@@ -12,9 +12,21 @@
 // races with nothing. Batch rows map to DISTINCT cache slots by contract
 // (src/vt/ops.cpp:1687-1696), so two invocations never share a row.
 //
-// THE STATE ROW IS f32 AND BOUND THROUGH THE 32-BIT VIEW ONLY. On this backend
-// conv_state is f32 by contract (src/vt/ops.cpp: bf16 conv_state is CUDA-only),
-// so a dtype-erased load would be a branch that can never take its other side.
+// THE STATE ROW IS DTYPE-ERASED, like every other operand. It used to be bound
+// through the 32-bit view only, because bf16 conv_state was a CUDA-only
+// extension of the vt contract and on this backend the state was f32 by
+// construction. That construction was the caller UPCASTING: the model's GDN
+// block gathered the bf16 cache rows into an f32 working buffer, ran this kernel
+// on the copy, and scattered the result back. On a batching backend that cost
+// two host memcpys over device memory per GDN layer per token, each one
+// intersecting the open command batch and forcing a submit-plus-fence drain.
+// Reading and writing the compressed row IN PLACE — exactly what the CUDA kernel
+// already does — is what lets the indexed state-I/O path run here at all.
+//
+// The rounding is UNCHANGED by that move: VT_LOAD widens the stored element to
+// f32, the accumulation is the same f32 sequence, and VT_STORE rounds once on
+// the way back, which is the same single bf16->f32->bf16 round trip the
+// gather/compute/scatter arm performed.
 //
 // THE ROW MAY BE PHYSICALLY WIDER THAN THE WINDOW. For spec-decode rollback the
 // row is widened to (K-1) + num_spec taps; the non-spec update operates on the
@@ -44,9 +56,11 @@ layout(binding = 5) readonly buffer Wb16 { uint16_t v[]; } W16;
 // bias; aliases the weight when the caller passed none (p.has_bias == 0).
 layout(binding = 6) readonly buffer Bb32 { uint v[]; } B32;
 layout(binding = 7) readonly buffer Bb16 { uint16_t v[]; } B16;
-layout(binding = 8) buffer Sb { uint v[]; } ST;    // conv_state, f32
+// conv_state, read AND written in place; f32 or bf16 (p.st_dt).
+layout(binding = 8) buffer Sb32 { uint v[]; } ST32;
+layout(binding = 9) buffer Sb16 { uint16_t v[]; } ST16;
 // conv_state_indices, i32; aliases conv_state when absent (p.has_idx == 0).
-layout(binding = 9) readonly buffer Ib { uint v[]; } IDX;
+layout(binding = 10) readonly buffer Ib { uint v[]; } IDX;
 
 layout(push_constant) uniform Params {
   uint batch;        // x.shape[0]
@@ -57,7 +71,7 @@ layout(push_constant) uniform Params {
   uint x_rs;         // x.stride[0], in elements (x may be a padded-row view)
   uint n_state_rows; // conv_state.shape[0], for the bounds guard
   uint has_bias, has_idx, silu;
-  uint out_dt, x_dt, w_dt, bias_dt;
+  uint out_dt, x_dt, w_dt, bias_dt, st_dt;
   uint out_off, x_off, w_off, bias_off, st_off, idx_off;
 } p;
 
@@ -74,14 +88,16 @@ void main() {
     if (uint(ci) >= p.n_state_rows) { return; }      // device analogue of the
     srow_row = uint(ci);                             // host-side range VT_CHECK
   }
-  // cpu_ops.cpp:1109-1111 — raw pointer arithmetic over the f32 state, so the
-  // row base is srow_row * c_dim * state_len + c * state_len.
-  uint srow = (p.st_off >> 2) + (srow_row * p.c_dim + c) * p.state_len;
+  // cpu_ops.cpp:1109-1111 — raw pointer arithmetic over the state, so the row
+  // base is srow_row * c_dim * state_len + c * state_len. This is an ELEMENT
+  // index; VT_LOAD/VT_STORE fold in the buffer's byte offset themselves.
+  uint srow = (srow_row * p.c_dim + c) * p.state_len;
 
   float xt = VT_LOAD(X32, X16, p.x_dt, p.x_off, bt * p.x_rs + c);
   float acc = p.has_bias != 0u ? VT_LOAD(B32, B16, p.bias_dt, p.bias_off, c) : 0.0;
   for (uint j = 0u; j < p.width; ++j) {
-    acc += VT_LOAD(W32, W16, p.w_dt, p.w_off, c * p.k + j) * uintBitsToFloat(ST.v[srow + j]);
+    acc += VT_LOAD(W32, W16, p.w_dt, p.w_off, c * p.k + j) *
+           VT_LOAD(ST32, ST16, p.st_dt, p.st_off, srow + j);
   }
   acc += VT_LOAD(W32, W16, p.w_dt, p.w_off, c * p.k + p.width) * xt;
   // Silu spelled `acc / (1 + exp(-acc))`, the CPU reference's spelling
@@ -89,6 +105,14 @@ void main() {
   VT_STORE(O32, O16, p.out_dt, p.out_off, bt * p.c_dim + c,
            p.silu != 0u ? (acc / (1.0 + exp(-acc))) : acc);
 
-  for (uint j = 0u; j + 1u < p.width; ++j) { ST.v[srow + j] = ST.v[srow + j + 1u]; }
-  if (p.width > 0u) { ST.v[srow + p.width - 1u] = floatBitsToUint(xt); }
+  // The roll is a value move, not a bit move: a compressed row is widened and
+  // re-rounded, which is a no-op on a value that was already stored in that
+  // dtype, and matches the CPU reference's element-typed shift.
+  for (uint j = 0u; j + 1u < p.width; ++j) {
+    VT_STORE(ST32, ST16, p.st_dt, p.st_off, srow + j,
+             VT_LOAD(ST32, ST16, p.st_dt, p.st_off, srow + j + 1u));
+  }
+  if (p.width > 0u) {
+    VT_STORE(ST32, ST16, p.st_dt, p.st_off, srow + p.width - 1u, xt);
+  }
 }

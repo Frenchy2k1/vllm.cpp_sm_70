@@ -2692,16 +2692,53 @@ void ScatterStateF32(Dev d, const Tensor& cache, DBuf& f32buf,
   }
 }
 
+// Are the four operators the indexed state-I/O path needs realized NATIVELY for
+// this device? `OpRegistered` deliberately excludes the portable reference tier
+// (op_provider.cpp), so this answers "can the device do the indexing on its own
+// hardware", not "will the call succeed" — a device that would fall back to the
+// host tier for these gains nothing from the switch and must keep the row-copy
+// reference. Decode needs the two *Update/Decode index arguments; a mixed step
+// with prefills additionally needs the fused gather/scatter.
+bool IndexedGdnOpsNative(Device device) {
+  return vt::OpRegistered(vt::OpId::kCausalConv1dUpdate, device.type) &&
+         vt::OpRegistered(vt::OpId::kGdnDecode, device.type) &&
+         vt::OpRegistered(vt::OpId::kGdnStateGather, device.type) &&
+         vt::OpRegistered(vt::OpId::kGdnStateScatter, device.type);
+}
+
 // W1 indexed state-I/O dispatch. CUDA + device-resident W0 storage defaults to
 // the fused indexed gather/scatter operators. Either diagnostic opt-out restores
 // the exact row-copy + cast baseline on the same binary. CPU keeps that baseline
 // as its reference implementation.
+//
+// BACKEND-VULKAN-DEVICE-RESIDENT. The old non-staging arm keyed the default on
+// `needs_weight_staging()`, which is a statement about WEIGHT residency on a
+// discrete device, not about whether the device can index its own state cache.
+// The consequence on Vulkan was measured, not guessed: the row-copy arm issues
+// four `Backend::Copy` calls per GDN layer (gather+scatter for conv and for ssm),
+// and the 27B has 48 linear-attention layers, so a single decode token drove ~192
+// host memcpys over device memory. Each one that intersects the open command
+// batch forces a submit-plus-blocking-fence drain, which is where the measured 98
+// copy-dst/copy-src flushes per token came from. The indexed arm passes the state
+// slot indices to the kernels instead and issues NONE of those copies.
+//
+// The switch is therefore keyed on the real question — does this device have the
+// indexed kernels natively — with CPU still pinned to the row-copy reference so
+// its golden path is untouched, and with `needs_weight_staging()` devices (CUDA)
+// evaluated by exactly the branch they took before.
 bool IndexedGdnStateIoEnabled(Device device) {
   const char* indexed = std::getenv("VT_GDN_INDEXED_STATE_IO");
-  // CPU keeps the row-copy reference by default. An explicit =1 is a test hook
-  // that drives the whole model integration through the CPU reference kernels.
-  if (!vllm::platforms::GetPlatform(device.type).needs_weight_staging())
-    return indexed != nullptr && indexed[0] == '1';
+  const vllm::platforms::Platform& plat =
+      vllm::platforms::GetPlatform(device.type);
+  if (!plat.needs_weight_staging()) {
+    // An explicit setting wins on every non-staging device: =1 is the CPU test
+    // hook that drives the model integration through the reference kernels, =0
+    // is the same-binary A/B that restores the row-copy baseline on Vulkan.
+    if (indexed != nullptr) return indexed[0] == '1';
+    // CPU keeps the row-copy reference by default.
+    if (plat.is_cpu()) return false;
+    return IndexedGdnOpsNative(device);
+  }
   const char* cache = std::getenv("VT_DEVICE_KV_CACHE");
   if (cache != nullptr && cache[0] == '0') return false;
   return indexed == nullptr || indexed[0] != '0';
