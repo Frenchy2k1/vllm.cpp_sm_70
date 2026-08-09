@@ -574,8 +574,9 @@ TEST_CASE("kTENSTORRENT kCastBf16 / kCastF32 round-trip F32 values") {
   }
 }
 
-// Default Qwen3-dense RoPE (Metal M3b). Host-staged bit-exact vs CPU formula.
-TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference") {
+// Default Qwen3-dense RoPE (Metal M3b). Small T*H uses host apply (bit-exact);
+// large prefill uses device NeoX (BF16) — covered by PreferDeviceRope threshold.
+TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference (small)") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
@@ -719,6 +720,7 @@ TEST_CASE("kTENSTORRENT kRopeCosSinCache + kRopeFromCache match kRopeNeox") {
   backend.Copy(q, kc.data(), mk2, kc.size() * sizeof(float));
   for (void* p : {mq1, mk1, mq2, mk2, mp, mcs, mrow}) backend.Free(p);
 
+  // Small T*H → host apply on both paths → bit-identical.
   for (size_t i = 0; i < qn.size(); ++i) REQUIRE(qn[i] == qc[i]);
   for (size_t i = 0; i < kn.size(); ++i) REQUIRE(kn[i] == kc[i]);
 }
