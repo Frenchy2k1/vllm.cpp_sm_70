@@ -167,6 +167,44 @@ class VulkanContext {
   // has to assert the MECHANISM rather than the numbers.
   uint32_t pending_batch() const;
 
+  // --- PIPELINED SUBMISSION (BACKEND-VULKAN-HOSTDISPATCH). Same argument as
+  // pending_batch, one level up: a pipelined flush and a blocking flush run the
+  // same kernels in the same order and produce identical numbers, so if the
+  // pipelining silently stopped applying every value check would still pass and
+  // only the wall clock would move. These are what a gate can assert on.
+  //
+  // Batches submitted but not yet known-complete. > 0 after a flush is the
+  // mechanism: the host returned from the flush without waiting.
+  uint32_t in_flight_batches() const;
+  // The configured depth (VT_VULKAN_INFLIGHT, clamped to kMaxInFlight). 1 is the
+  // pre-row submit-and-wait behaviour. Asked rather than re-derived from the
+  // environment, for the reason batching_enabled() exists.
+  uint32_t in_flight_limit() const;
+  // Descriptor sets one slot may consume before it must flush. kMaxInFlight
+  // slices of the ring, never overlapping, is the correctness argument for
+  // letting a submitted batch keep executing while the next one is recorded.
+  uint32_t ring_slice() const;
+  // Sets allocated per pipeline, i.e. the width the slices partition.
+  uint32_t ring_depth() const;
+  // vkQueueSubmit calls, and the subset of slot retirements that actually had to
+  // wait on an unsignalled fence. A pipelined run submits more often than it
+  // waits; a run that degraded back to submit-and-wait has them equal.
+  uint64_t submit_count() const;
+  uint64_t fence_wait_count() const;
+  // First descriptor-set index the OPEN batch may use. The slices are what make
+  // pipelining sound, and a timing-dependent value check cannot see them: on a
+  // software rasterizer a submitted batch is effectively finished by the time the
+  // next one records, so collapsing every slot onto slice 0 computes the right
+  // numbers there and corrupts them on real hardware. This is the STRUCTURAL
+  // assertion that closes that gap -- MEASURED: a scratch mutation forcing this
+  // to 0 for every slot passed the whole file on llvmpipe until this existed.
+  uint32_t ring_base() const;
+  // Pipeline barriers recorded. One per dispatch, INCLUDING the first in each
+  // command buffer -- that first one is what carries a dependency across a
+  // command-buffer boundary now that the previous batch may still be running, and
+  // dropping it is likewise invisible in llvmpipe's numbers.
+  uint64_t barrier_count() const;
+
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
   // silently reusing an existing one — which would look identical in the results.
@@ -263,6 +301,12 @@ class VulkanContext {
   // compares against it, so the two must not drift.
   static constexpr uint32_t kWideWorkgroupSize = 1024;
 
+  // Upper bound on batches in flight at once (BACKEND-VULKAN-HOSTDISPATCH). The
+  // per-slot resources below are sized by it, and VT_VULKAN_INFLIGHT is clamped
+  // to it. Public because the A/B lever is read at namespace scope in the
+  // implementation, and because the unit gate asserts against it.
+  static constexpr uint32_t kMaxInFlight = 4;
+
  private:
   VulkanContext();
   struct Pipeline;
@@ -280,7 +324,17 @@ class VulkanContext {
   void* scratch_buffer_ = nullptr;   // VkBuffer
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
+  // Submits the open batch. Does NOT wait unless in-flight slots are exhausted.
   void FlushBatchLocked(const char* why = "explicit");  // caller holds mutex_
+  // Submits the open batch AND waits for every submitted batch to complete, so
+  // that device memory is safe for the host to read. This is what the three host
+  // read paths (Copy, Memset, Synchronize/FlushPending) need; FlushBatchLocked
+  // alone is NOT sufficient once submission is pipelined.
+  void DrainLocked(const char* why);                    // caller holds mutex_
+  // Waits for slot `s` if it is in flight, reads back its timestamps, and resets
+  // its command pool. After this returns, slot `s`'s command buffer, its slice of
+  // every pipeline's descriptor ring, and its query range are all free to reuse.
+  void RetireSlotLocked(uint32_t s);                    // caller holds mutex_
   // GPU TIMESTAMP PROFILING. Batching submits many dispatches under ONE fence,
   // so the per-dispatch fence wait that used to attribute time to a shader no
   // longer exists. Timestamps written into the command buffer are the only way to
@@ -292,11 +346,40 @@ class VulkanContext {
   // production dispatch pays nothing.
   void* query_pool_ = nullptr;       // VkQueryPool
   double timestamp_period_ns_ = 0.0; // 0 => device cannot timestamp; profiling off
-  void* batch_names_ = nullptr;      // std::vector<std::string>*, one per recorded dispatch
   bool batch_open_ = false;          // a command buffer is recording
   uint32_t batch_count_ = 0;         // dispatches recorded into it
-  void* batch_buffers_ = nullptr;    // std::set<void*>*, buffers the open batch bound
-  void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
+  void* batch_buffers_ = nullptr;    // BufferSet*, buffers any UNRETIRED batch bound
+
+  // PIPELINED SUBMISSION (BACKEND-VULKAN-HOSTDISPATCH). Ported from llama.cpp
+  // `ggml_backend_vk_graph_compute` (ggml-vulkan.cpp:16192-16195 and
+  // :16417-16423 @ pin 237ad9b96), whose own comment states the mechanism:
+  // "Submit after enough work has accumulated, to overlap CPU cmdbuffer
+  // generation with GPU execution." It submits several times per graph and waits
+  // exactly ONCE, in `ggml_vk_wait_for_fence` (:2298).
+  //
+  // Before this row, every flush was submit-AND-wait, so the GPU was idle for the
+  // whole of the host's recording of the next batch. MEASURED on 27B decode: 900
+  // dispatches and 4 flushes per token, 3.04 ms/token of host time, every
+  // nanosecond of it serialized against a 227 ms GPU step.
+  //
+  // Each slot owns a command buffer, its own command POOL (a pool can only be
+  // reset as a whole, so one shared pool cannot serve an in-flight buffer), its
+  // own fence, its own query range, and a DISJOINT SLICE of every pipeline's
+  // descriptor ring. That last one is the correctness argument: a descriptor set
+  // is read at execution time, so rewriting one while a submitted command buffer
+  // still references it is silent corruption. A set can only be rewritten when
+  // its slot is re-entered, and a slot is re-entered only through
+  // RetireSlotLocked, which waits on that slot's fence first.
+  void* slot_cmd_[kMaxInFlight] = {};    // VkCommandBuffer
+  void* slot_pool_[kMaxInFlight] = {};   // VkCommandPool
+  void* slot_fence_[kMaxInFlight] = {};  // VkFence
+  void* slot_names_[kMaxInFlight] = {};  // std::vector<std::string>*
+  bool slot_in_flight_[kMaxInFlight] = {};
+  uint32_t slot_ = 0;                // slot the open batch records into
+  uint64_t submit_count_ = 0;        // vkQueueSubmit calls
+  uint64_t fence_wait_count_ = 0;    // retirements that had to wait
+  uint64_t barrier_count_ = 0;       // vkCmdPipelineBarrier calls
+  uint32_t slot_ring_base_ = 0;      // slot_ * ring slice width, cached
   void* dispatch_ms_ = nullptr;      // std::map<std::string, double>*
   uint64_t dispatch_total_ = 0;
   void* pipelines_ = nullptr;        // std::map<std::string, Pipeline>*

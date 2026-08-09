@@ -16543,6 +16543,159 @@ optimization" on the evidence available -- at 1 leg in 16 it costs roughly 6% of
 mean decode time, against the 8.5% that column blocking takes off this kernel
 deterministically.
 
+## BACKEND-VULKAN-HOSTDISPATCH — host is ~3 ms not 5.3, pipelining is worth 1.4 ms (5/5 paired), and llama.cpp's fence spin COMPUTES WRONG NUMBERS on GB10 (2026-08-09, GB10, base `6450604b`)
+
+The combined row left 27B Vulkan decode 3.1 ms/token short of llama.cpp Vulkan's
+4.35 tok/s (229.9 ms), with the GEMV lever closed and the whole residual attributed
+to host time by `wall - GPU = 5.3 ms`. **That subtraction is an INFERENCE ACROSS TWO
+RUNS** -- a wall-clock run with no query pool, minus the sum of per-shader GPU
+timestamps from a separate stats run -- and it cannot separate host recording cost
+from GPU-timeline time that the per-dispatch TOP-to-BOTTOM intervals never covered.
+
+**HOST TIME WAS MEASURED DIRECTLY.** `VT_VULKAN_HOST_PROFILE=1` times five phases
+inside `Dispatch` and separates submit from fence-wait inside the flush, under the
+mutex the dispatch already holds; cost is 6 vDSO clock reads per dispatch. Two-length
+diff (output-len 36 minus 4, over 32 decode tokens), Qwen3.6-27B bf16, 1 prompt,
+32-in, c1, so prefill and one-time costs cancel. Pre-row tree:
+
+| per decoded token | ms | share of host |
+|---|---:|---:|
+| flush-submit (`vkEndCommandBuffer` + `vkQueueSubmit`) | **1.50** | 49% |
+| record (barrier + bind + push + `vkCmdDispatch`) | 0.75 | 25% |
+| descriptor (`vkUpdateDescriptorSets`) | 0.29 | 10% |
+| bookkeeping (histogram map + bound-buffer set) | 0.28 | 9% |
+| pipeline-lookup (key build + `std::map`) | 0.10 | 3% |
+| **HOST TOTAL** | **3.04** | |
+| flush-wait (blocked on the GPU) | 234.67 | |
+
+900 dispatches and 4 flushes per token, matching the combined row's counts. Host
+plus fence-wait is 237.7 against that run's 237.2 ms TPOT, so the two account for
+the whole step and the instrument is self-consistent.
+
+**SO 5.3 ms IS SUPERSEDED: host is ~3 ms.** The rest of the old subtraction is
+GPU-timeline time outside any timestamped dispatch -- ~900 inter-dispatch barrier
+drains plus the command-buffer boundaries -- and no amount of host work removes it.
+The lever was smaller than it was sized.
+
+**AND ALL OF IT WAS SERIALISED AGAINST THE GPU**: every flush submitted and then
+immediately waited, so the device sat idle for the whole of the host's recording of
+the next batch. The fix is llama.cpp's, whose own comment states the mechanism --
+"Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with
+GPU execution" (`ggml_backend_vk_graph_compute`, ggml-vulkan.cpp:16192-16195 and
+:16417-16423 @ pin `237ad9b96`), waiting exactly once per graph
+(`ggml_vk_wait_for_fence`, :2298).
+
+### A FENCE SPIN WAS THE LARGER HALF OF THE APPARENT WIN AND IS REJECTED AS INCORRECT
+
+llama.cpp also spins on `vkGetFenceStatus` rather than blocking (:2306-2326). Ported,
+it read 229.43 ms against 232.07 for pipelining alone -- **and it computes the wrong
+numbers on GB10.** Same binary, one variable, on the device:
+
+| | `test_vulkan_backend` | opt-125m STRICT |
+|---|---|---|
+| `FENCE_SPIN=0`, `INFLIGHT=1` | 33/33 | 6/6 token-exact |
+| `FENCE_SPIN=0`, `INFLIGHT=2` | 33/33 | 6/6 token-exact |
+| `FENCE_SPIN=1`, `INFLIGHT=1` | **16/33** | **DIVERGES** |
+| `FENCE_SPIN=1`, `INFLIGHT=2` | **17/33** | **DIVERGES** |
+| `VT_VULKAN_BATCH=0` (pre-batching path) | 33/33 | - |
+
+It fails identically with pipelining ON and OFF, which is what identifies the spin
+rather than the pipelining. The failures are host reads of device memory returning
+PRE-DISPATCH contents (`CHECK(0 == Approx(-0.125))`, `CHECK(-9 == 0)`, 940 assertions),
+and opt-125m degenerates to "the the capital capital of of the the world world".
+Observing a fence signalled through `vkGetFenceStatus` did not make the device writes
+visible to the host on this driver the way returning from `vkWaitForFences` does.
+
+**It passed 33/33 on llvmpipe.** A full order-alternated 8-leg 27B A/B had already
+been run against the spin arm; **every number in it is VOID**, because the model was
+emitting garbage while being timed. That is the reusable lesson: a Vulkan
+synchronisation change measured only where a software rasterizer serialises
+everything reads as a clean win. The spin is deleted; the negative is recorded in
+`vulkan_context.cpp` next to the retire path so it is not re-attempted.
+
+### The surviving lever, measured
+
+Pipelined submission only, same binary, `VT_VULKAN_INFLIGHT` 1 vs 2, page cache
+dropped before every leg, `flock $HOME/gpu.lock`, order alternated:
+
+| pair | A = INFLIGHT 1 | B = INFLIGHT 2 | B - A |
+|---|---:|---:|---:|
+| scan (ring 128) | 233.22 | 232.07 | **-1.15** |
+| long decode, 128 tok x 2 prompts | 235.94 | 234.33 | **-1.61** |
+| r1 | 235.47 | 233.71 | **-1.76** |
+| s1 | 229.12 | 227.71 | **-1.41** |
+| s2 | 230.18 | 228.79 | **-1.39** |
+
+**5 of 5 paired comparisons favour pipelining; median -1.41 ms/token.** Best B leg
+227.71 ms = 4.39 tok/s, but the box drifted 229.12-235.94 ms across legs of the
+IDENTICAL control configuration during this session, so only the paired delta is
+quotable and **no absolute tok/s claim against llama.cpp's 4.35 is made from it**.
+
+**THE GOAL IS NOT MET.** 1.4 ms against the 3.1 ms owed.
+
+Post-change host profile, same session, same two-length method:
+
+| per decoded token | INFLIGHT 1 | INFLIGHT 2 |
+|---|---:|---:|
+| DISPATCH TOTAL | 0.79 | 1.49 |
+| flush-submit | 0.30 | 0.46 |
+| flush-other | 0.01 | 0.07 |
+| **host total** | **1.09** | **2.02** |
+| flush-wait (blocked) | 227.9 | 221.5 |
+| TPOT | 230.11 | 224.03 |
+
+The pipelined arm does MORE host work (4 flushes/token against 3, and it is never
+idle) and still finishes sooner, which is the mechanism working: the host cost is
+overlapped rather than removed. Note the blocked time also falls 6.4 ms, more than
+the host CPU it hides -- consistent with the submit-to-GPU-start latency of each
+flush being paid inside the wait in the un-pipelined arm and pre-paid in the
+pipelined one. Single runs each, so that 6.4 ms is DIRECTIONAL, not a claim.
+
+**NOT ESTABLISHED, and flagged rather than quoted:** the pre-row profile read host
+3.04 ms and the post-row `INFLIGHT=1` arm reads 1.09 ms, which would credit the
+per-dispatch cleanups (histogram off the hot path, open-addressed bound-buffer
+table, stack descriptor arrays) with ~1.9 ms. Those two profiles were taken about
+an hour apart in different box states (TPOT 237.22 vs 230.11) and the wall-clock
+A/B does not show a matching move, so the cleanups' wall-clock value is UNMEASURED
+and is not claimed. What both profiles agree on is the shape: host is single-digit
+milliseconds and `host + flush-wait` reconstructs TPOT.
+
+### Correctness
+
+GB10, `VLLM_CPP_VULKAN:STRING=ON` verified in the cache and `[vt vulkan]` /
+`[vt reference-tier]` lines present in every run: `test_vulkan_backend` **33/33
+(2479 assertions)** pipelined and **33/33 (2476)** at `INFLIGHT=1`;
+`test_backend_cross_device` **11/11 (132)**; `test_opt_paged_engine` **6/6 prompts
+token-exact (96/96 tokens), 0 declines** in BOTH arms. A 128-token x 2-prompt decode
+run in each arm produced **BYTE-IDENTICAL token ids** (md5
+`9a9fd41a97ca56a3beeebe420d874ae1`). llvmpipe: the same, plus `VT_VULKAN_BATCH=0`.
+Committed SPIR-V unchanged and up to date.
+
+### The mechanism gate, and what only the real device could catch
+
+Pipelining records the same kernels in the same order, so it is invisible in results.
+Three scratch mutations were run against the new gate: degrading the flush back to
+submit-and-wait is caught by the in-flight/blocked-wait counters; dropping the
+head-of-command-buffer barrier is caught by the barrier count; and **collapsing every
+slot onto descriptor slice 0 -- the exact silent-corruption hazard this change
+introduces -- passed the ENTIRE file on llvmpipe** until a structural assertion on
+the ring base was added. That is the same blind spot the fence spin exploited, and
+it is why the ring-base and barrier-count assertions are structural rather than
+numeric.
+
+### Open
+
+- The ~2.3 ms of GPU-timeline time between dispatches (900 barriers per token) is
+  now the largest identified residual and is UNTOUCHED. llama.cpp emits a barrier
+  only on a real dependency (`ggml_vk_sync_buffers`, ggml-vulkan.cpp:3193); this
+  backend emits one before every dispatch unconditionally. That is the next lever
+  and it is a correctness-risky one.
+- One 27B leg in this session stalled for 23 s inside a single token (median ITL
+  233.44 ms, P99 ITL 23,415 ms, TPOT 1313). It landed on a pipelined leg but its
+  signature -- one stall, normal median -- does not match the recorded ~20x
+  `vt_matmul` bimodality, and no mechanism was established. Discarded, and NOT
+  attributed either way.
+
 ## BACKEND-VULKAN combined: the three levers measured TOGETHER on merged main (2026-08-09, GB10, `81ea01f0`)
 
 Each of the three Vulkan levers was measured against `93852c28` in isolation, so
