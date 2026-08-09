@@ -481,6 +481,48 @@ TEST_CASE("kTENSTORRENT kRmsNorm matches a host F32 reference (weight, no residu
   CHECK(max_abs_diff < 0.5f);
 }
 
+// Qwen3-dense MLP SwiGLU half. Host-staged: bit-exact vs cpu SiluAndMulKernel.
+TEST_CASE("kTENSTORRENT kSiluAndMul is BIT-EXACT vs a host F32 reference") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kSiluAndMul, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 7, D = 16;  // x is [T, 2D]
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto silu_mul = reinterpret_cast<vt::SiluAndMulFn>(
+      vt::GetOp(vt::OpId::kSiluAndMul, DeviceType::kTENSTORRENT));
+
+  std::vector<float> host_x(T * 2 * D), host_out(T * D, 0.0f);
+  for (size_t i = 0; i < host_x.size(); ++i)
+    host_x[i] = (static_cast<float>(i % 13) - 6.0f) * 0.2f;
+
+  void* mem_x = backend.Alloc(host_x.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_x, host_x.data(), host_x.size() * sizeof(float));
+
+  Tensor x = Tensor::Contiguous(mem_x, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                {T, 2 * D});
+  Tensor out =
+      Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, D});
+  silu_mul(q, out, x);
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_x);
+  backend.Free(mem_out);
+
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t j = 0; j < D; ++j) {
+      const float gate = host_x[i * 2 * D + j];
+      const float up = host_x[i * 2 * D + D + j];
+      const float ref = (gate / (1.0f + std::exp(-gate))) * up;
+      // Host-staged f32 path: bit-identical to the CPU formula.
+      REQUIRE(host_out[i * D + j] == ref);
+    }
+  }
+}
+
 TEST_CASE("kTENSTORRENT kQkvSplit is BIT-EXACT vs a host reference (unequal widths)") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");

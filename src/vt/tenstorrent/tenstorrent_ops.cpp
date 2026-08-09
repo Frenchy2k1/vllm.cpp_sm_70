@@ -396,6 +396,34 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
   Download(dev_y, out);
 }
 
+// kSiluAndMul: SwiGLU gate half — out[i,j] = silu(x[i,j]) * x[i,j+d]
+// with d = x.shape[1]/2 (cpu_ops.cpp SiluAndMulKernel). Second Qwen3-dense
+// op beyond OPT (MLP: gate_up GEMM -> SiluAndMul -> down GEMM). Host-staged
+// while Alloc is host memory: pure elementwise, bit-exact for f32; bf16/f16
+// go through Load/Store for dtype round-trip. Device ttnn::silu + mul is
+// deferred with the other residual-stream fusions.
+void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
+  VT_CHECK(x.rank == 2 && out.rank == 2,
+           "tenstorrent kSiluAndMul: only rank-2 tensors are supported");
+  VT_CHECK(IsFloatDType(x.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kSiluAndMul: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kSiluAndMul: strided (non-contiguous) tensors are not supported");
+  VT_CHECK(x.shape[1] % 2 == 0, "tenstorrent kSiluAndMul: last dim must be even");
+  const int64_t t = x.shape[0];
+  const int64_t d = x.shape[1] / 2;
+  VT_CHECK(out.shape[0] == t && out.shape[1] == d,
+           "tenstorrent kSiluAndMul: out shape must be [T, D] with D = x.shape[1]/2");
+  for (int64_t i = 0; i < t; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      const float gate = LoadElemF32(x, i * 2 * d + j);
+      const float up = LoadElemF32(x, i * 2 * d + d + j);
+      const float silu = gate / (1.0f + std::exp(-gate));
+      StoreElemF32(out, i * d + j, silu * up);
+    }
+  }
+}
+
 // kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
 // (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy when dtypes match.
 void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
@@ -639,6 +667,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
+    RegisterOp(OpId::kSiluAndMul, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kTENSTORRENT,
