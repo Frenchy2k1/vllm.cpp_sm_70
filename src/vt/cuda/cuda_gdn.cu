@@ -1759,9 +1759,8 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
   // VT_GDN_POSTCONV_TOKEN_TILE (opt-in): the full upstream 16-token,
   // per-head/four-warp schedule. The explicit split control keeps priority when
   // both experimental flags are set. Only the production 128-wide heads route.
-  const bool token_tile =
-      !split && GdnPostConvTokenTileFlagIsOn(std::getenv("VT_GDN_POSTCONV_TOKEN_TILE")) &&
-      dk == 128 && dv == 128;
+  const bool token_tile = GdnPostConvTokenTileEligible(
+      split, std::getenv("VT_GDN_POSTCONV_TOKEN_TILE"), dk, dv);
   // VT_GDN_POSTCONV_FAST: byte-identical megablock at 128 threads + 128-bit V copy.
   // Only for the Dk==Dv==128 gate dims (16B alignment + value_dim%8==0); mutually
   // exclusive with the split (both target the same megablock). See predicate.
