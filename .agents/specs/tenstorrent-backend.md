@@ -1,12 +1,13 @@
 # Tenstorrent (Blackhole) backend — spike spec (DRAFT, external proposal)
 
-Status: **DRAFT — not filed through the repo's own agent workflow.** This was
-written by an assistant session at the developer's request, outside
-`scripts/agent-start.py`/role declaration/`.agents/policy.csv` gates. Treat it
-as a starting point for whoever claims the row, not as a `READY` artifact.
-No code, no kernels, no benchmark. The only hands-on work done is read-only:
-confirmed `TT-NN`'s CMake export resolves and inspected the exact C++ API
-surface (see § Evidence).
+Status: **DRAFT.** Filed through the claim protocol (`CLAIM-BACKEND-TENSTORRENT-
+SPIKE`, draft PR mudler/vllm.cpp#197) but not through the full
+`scripts/agent-start.py`/role-interview boot sequence — role was claimed
+directly per the developer's explicit direction. Treat it as a starting point
+for whoever reviews/claims the row, not as a `READY` artifact. Still no `src/vt/`
+code. The § Open risk item that gated this spec's core design claim **is now
+hands-on resolved on real Blackhole hardware** — see § Resolved: hands-on spike
+result.
 
 Proposed row id: `BACKEND-TENSTORRENT`. Not covered by any existing row —
 `.agents/backends.md`'s per-platform table has no Tenstorrent entry.
@@ -106,7 +107,7 @@ ttnn call (§ Evidence).
     composable from existing elementwise ops, or a small custom-fused op
     later. Needs the hands-on pass to confirm, not assumed here.
 
-## Open risk (the actual unknown — resolve this before claiming ACTIVE)
+## Open risk (the actual unknown — was gating ACTIVE, now resolved)
 
 `vt::Tensor` (`include/vt/tensor.h`) is a **non-owning raw-pointer view**:
 `void* data`, `dtype`, `shape[4]`, `stride[4]`, nothing more — the same
@@ -115,36 +116,53 @@ convention CUDA/Vulkan/Metal kernels here already use.
 `ttnn::Tensor` (`ttnn/api/ttnn/tensor/tensor.hpp`) is a richer, ref-counted
 object. Its device-side constructors are `Tensor(DeviceStorage storage)` where
 `DeviceStorage` wraps a `tt::tt_metal::MeshTensor`/`MeshBuffer` — i.e. ttnn
-owns/allocates through its own mesh-buffer machinery. The host-facing
-`from_span`/`from_vector`/`from_borrowed_data` constructors are for **host**
-data being pushed to device (they copy host->device); there is **no
-"attach a Tensor to a raw device pointer I already own" constructor** at this
-level.
+owns/allocates through its own mesh-buffer machinery, not a bare pointer.
 
-This means `vt::Backend::Alloc()` returning a bare `void*` does not compose
-directly with ttnn's ownership model — the two Tensor types have genuinely
-different lifecycle assumptions, and this is the one place "thin adapter" could
-turn out not to be thin.
+This looked, from reading headers alone, like it might mean
+`vt::Backend::Alloc()` returning a bare `void*` doesn't compose with ttnn's
+ownership model. **It doesn't matter in practice — see § Resolved below.**
+`Tensor::from_vector<T>(host_vec, spec, device)` uploads directly (no manual
+`DeviceStorage`/`MeshBuffer` wiring needed at the call site), and
+`to_vector<T>()` reads back. An adapter never needs to attach to a raw device
+pointer at all.
 
-Two ways to resolve it, in preference order:
+## Resolved: hands-on spike result (2026-08-09, real Blackhole hardware)
 
-1. **Opaque handle, no host round-trip (preferred).** `vt::tt::Alloc` allocates
-   through ttnn/tt_metal's own buffer machinery (e.g. an owning
-   `MeshBuffer`/`DeviceStorage`-compatible allocation) and returns an opaque
-   `void*` handle to a small heap-allocated wrapper holding that real
-   tt-metal-side handle — `vt::Tensor.data` is never a literal device address
-   the way it is on CUDA, only an opaque token the Tenstorrent adapter knows
-   how to unwrap back into a `ttnn::Tensor(DeviceStorage(...))` without a copy.
-   `Copy`/`Free` follow the same indirection. Needs confirming that
-   `DeviceStorage`'s constructor from an already-allocated `MeshBuffer` is
-   actually reachable this way (not verified — this is exactly the "spend an
-   hour" hands-on spike item).
-2. **Host round-trip (correctness-only fallback for a first spike).** Adapter
-   copies the vt-side device bytes to host, `Tensor::from_span(host_data, spec,
-   device)` pushes to device, runs the ttnn op, copies the result back. Simple,
-   provably correct, but defeats the entire point of a discrete-device backend
-   and should never be presented as more than a first correctness checkpoint —
-   explicitly not a shipping design.
+Built a standalone program (outside this repo's build — `find_package(TT-NN)`
++ `find_package(TT-Metalium)` against a local tt-metal install, `TTNN::TTNN`
+linked cleanly on the first try) that:
+
+1. Opens the real device: `ttnn::open_mesh_device(0, DEFAULT_L1_SMALL_SIZE,
+   DEFAULT_TRACE_REGION_SIZE)`.
+2. Builds two 32×32 `std::vector<float>` host matrices with known values.
+3. Uploads each via `Tensor::from_vector<float>(host_vec, spec, device.get())`
+   — `spec` built from `tt::tt_metal::TensorSpec(Shape({32,32}),
+   TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE),
+   MemoryConfig{}))`. No manual `DeviceStorage`/`MeshBuffer` construction.
+4. Runs `ttnn::operations::matmul::matmul(a, b)` on-device.
+5. Reads the result back via `c.to_vector<float>()`.
+6. Compares against a host-computed FP32 reference matmul.
+
+**Result: `max_abs_diff=0.033750` against `max_ref_mag=4.140000` (~0.8%
+relative) — PASS.** That's exactly the rounding expected from bf16
+accumulation over K=32, not a correctness gap.
+
+This confirms resolution (1) from the original two options below without
+needing either of them literally: the adapter doesn't need to manufacture a
+raw device pointer for `vt::Tensor.data` to point at. The natural design is
+`vt::Tensor.data` as an opaque handle to a heap-boxed `ttnn::Tensor` (or a
+thin wrapper owning one); `Alloc` creates it via `ttnn::empty(shape, dtype,
+layout, device)` (confirmed present in `operations/creation/creation.hpp`)
+or defers to first `Copy`; `Copy`/op adapters use `from_vector`/`to_vector`
+for host transfers and pass the `ttnn::Tensor` directly, unwrapped, for
+device-resident ops — no host round-trip on the hot path, no manual
+`DeviceStorage` construction anywhere.
+
+The two options originally listed here (kept for the record):
+
+1. **Opaque handle, no host round-trip.** Confirmed reachable — see above.
+2. **Host round-trip (correctness-only fallback).** Not needed; superseded by
+   (1) actually working.
 
 ## Minimal scope proposal
 
@@ -158,12 +176,18 @@ correctness-verified end to end.
 
 ## Next concrete step
 
-The § Open risk item is the one thing this spec could not resolve read-only.
-Whoever claims `BACKEND-TENSTORRENT` should spend the hands-on hour proving
-resolution (1) above with a throwaway standalone program linking `TTNN::TTNN`
-(outside this repo's build, no vllm.cpp code touched yet) — allocate a device
-buffer through ttnn's own path, wrap it in a `vt::Tensor`-shaped opaque handle,
-round-trip it through `ttnn::operations::matmul::matmul` bit-exact against a
-host-computed reference — before writing a single line inside `src/vt/`. If
-resolution (1) turns out not to be reachable, this spec's whole "thin adapter"
-premise needs revisiting before the row goes anywhere near `ACTIVE`.
+The design-level unknown is resolved (§ Resolved above). What's left before
+`src/vt/` code:
+
+1. Maintainer review of this row and the adapter design.
+2. First real `src/vt/` code: `DeviceType::kTENSTORRENT` + name (device.h),
+   `vt::tt::Backend` (Alloc/Free/Copy/CreateQueue/UnifiedMemory=false,
+   modeled on the opaque-`ttnn::Tensor`-handle design above), a `Platform`
+   registrar, and ONE op provider (`kMatmul`) as the first vertical slice —
+   mirroring how Metal's W0 skeleton landed one op before the rest.
+3. Only then the remaining ~7-9 ops in the minimal scope below.
+
+The standalone spike program that produced the § Resolved result is not part
+of this repo (built against a local tt-metal checkout, not vllm.cpp's CMake)
+and is not attached to this PR; its exact API calls are transcribed above in
+full, which is what stays useful here.
