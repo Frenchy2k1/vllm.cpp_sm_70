@@ -782,6 +782,75 @@ TEST_CASE("kTENSTORRENT kQkvSplit is BIT-EXACT vs a host reference (unequal widt
   }
 }
 
+// Device path: make qkv device-resident (kRelu), then split without host memcpy.
+// Matches e2e MatmulBT → QkvSplit residency chain.
+TEST_CASE("kTENSTORRENT kQkvSplit device path matches host within BF16 envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kQkvSplit, DeviceType::kTENSTORRENT));
+  REQUIRE(vt::OpRegistered(vt::OpId::kRelu, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 4, Qd = 32, Kd = 16, Vd = 16;  // total=64, tile-friendly
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto relu = reinterpret_cast<vt::ReluFn>(vt::GetOp(vt::OpId::kRelu, DeviceType::kTENSTORRENT));
+  auto split =
+      reinterpret_cast<vt::QkvSplitFn>(vt::GetOp(vt::OpId::kQkvSplit, DeviceType::kTENSTORRENT));
+
+  std::vector<float> host_qkv(static_cast<size_t>(T * (Qd + Kd + Vd)));
+  for (size_t i = 0; i < host_qkv.size(); ++i)
+    host_qkv[i] = std::fabs(static_cast<float>(i % 19) * 0.1f - 0.3f) + 0.05f;  // all > 0
+
+  void* mem_qkv = backend.Alloc(host_qkv.size() * sizeof(float));
+  void* mem_q = backend.Alloc(static_cast<size_t>(T * Qd) * sizeof(float));
+  void* mem_k = backend.Alloc(static_cast<size_t>(T * Kd) * sizeof(float));
+  void* mem_v = backend.Alloc(static_cast<size_t>(T * Vd) * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_qkv, host_qkv.data(), host_qkv.size() * sizeof(float));
+
+  Tensor qkv = Tensor::Contiguous(mem_qkv, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {T, Qd + Kd + Vd});
+  Tensor tq =
+      Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Qd});
+  Tensor tk =
+      Tensor::Contiguous(mem_k, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Kd});
+  Tensor tv =
+      Tensor::Contiguous(mem_v, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Vd});
+
+  // Relu in place → CommitDevice2D leaves qkv device-resident (positive inputs).
+  relu(q, qkv, qkv);
+  split(q, tq, tk, tv, qkv);
+
+  std::vector<float> host_q(static_cast<size_t>(T * Qd)), host_k(static_cast<size_t>(T * Kd)),
+      host_v(static_cast<size_t>(T * Vd));
+  backend.Copy(q, host_q.data(), mem_q, host_q.size() * sizeof(float));
+  backend.Copy(q, host_k.data(), mem_k, host_k.size() * sizeof(float));
+  backend.Copy(q, host_v.data(), mem_v, host_v.size() * sizeof(float));
+  backend.Free(mem_qkv);
+  backend.Free(mem_q);
+  backend.Free(mem_k);
+  backend.Free(mem_v);
+
+  float max_abs = 0.0f;
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t j = 0; j < Qd; ++j)
+      max_abs = std::max(
+          max_abs, std::fabs(host_q[static_cast<size_t>(i * Qd + j)] -
+                             host_qkv[static_cast<size_t>(i * (Qd + Kd + Vd) + j)]));
+    for (int64_t j = 0; j < Kd; ++j)
+      max_abs = std::max(
+          max_abs, std::fabs(host_k[static_cast<size_t>(i * Kd + j)] -
+                             host_qkv[static_cast<size_t>(i * (Qd + Kd + Vd) + Qd + j)]));
+    for (int64_t j = 0; j < Vd; ++j)
+      max_abs = std::max(
+          max_abs,
+          std::fabs(host_v[static_cast<size_t>(i * Vd + j)] -
+                    host_qkv[static_cast<size_t>(i * (Qd + Kd + Vd) + Qd + Kd + j)]));
+  }
+  CHECK(max_abs < 0.05f);
+}
+
 TEST_CASE("kTENSTORRENT kReshapeAndCache is BIT-EXACT incl. slot<0 skip") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
