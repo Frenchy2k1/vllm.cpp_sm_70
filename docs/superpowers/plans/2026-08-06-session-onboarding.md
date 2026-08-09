@@ -854,8 +854,11 @@ should not have to learn first.
 one command.
 
 Add `--headless` when the developer has said the run is unattended: decide,
-record each decision in `.agents/state.md`, never block, never merge, park what
-will not go green. Headless is **declared, never inferred** — not from the hour,
+record each decision as immutable `.agents/state-events/` evidence with its
+ordered row in the writable `.agents/state-index/` shard, refresh `.agents/NOW.md`,
+and run `python3 scripts/check-state-record.py`; never block, never merge, park
+what will not go green. `.agents/state.csv` is the structured-record manifest.
+Headless is **declared, never inferred** — not from the hour,
 not from silence, not from a long task.
 
 `.env` is asked **just in time**: when a gate needs a value, ask for that value

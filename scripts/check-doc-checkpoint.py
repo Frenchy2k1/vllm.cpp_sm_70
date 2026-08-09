@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import string
 import subprocess
 import sys
@@ -349,18 +350,26 @@ GOVERNANCE_FILES = frozenset(
         ".agents/governance-tasks.csv",
         ".agents/policy.csv",
         ".agents/waivers.csv",
+        ".agents/state.md",
+        ".agents/state.csv",
+        ".agents/completed/state-migration-manifest.csv",
         "scripts/agent-role.py",
         "scripts/check-doc-checkpoint.py",
         "scripts/check-commit-trailers.py",
         "scripts/check-gate-commands.py",
+        "scripts/check-now-current.py",
         "scripts/policy_contract.py",
         "scripts/check-policy.py",
         "scripts/check-prompt-contract.py",
         "scripts/check-pr-size.py",
         "scripts/check-protocol-consistency.py",
+        "scripts/check-public-doc-tables.py",
+        "scripts/check-state-record.py",
         "scripts/check-role-discipline.py",
         "scripts/claim-view.py",
         "scripts/ready-for-helper.py",
+        "scripts/state_record.py",
+        "scripts/migrate-state-record.py",
         "tests/scripts/test_agent_role.py",
         "tests/scripts/test_claim_view.py",
         "tests/scripts/test_ready_for_helper.py",
@@ -368,12 +377,22 @@ GOVERNANCE_FILES = frozenset(
         "tests/scripts/test_check_prompt_contract.py",
         "tests/scripts/test_doc_checkpoint.py",
         "tests/scripts/test_check_commit_trailers.py",
+        "tests/scripts/test_check_now_current.py",
         "tests/scripts/test_policy_waivers.py",
         "tests/scripts/test_check_pr_size.py",
         "tests/scripts/test_check_protocol_consistency.py",
+        "tests/scripts/test_check_public_doc_tables.py",
+        "tests/scripts/test_check_state_record.py",
+        "tests/scripts/test_state_record_core.py",
+        "tests/scripts/test_migrate_state_record.py",
+        "tests/scripts/test_state_record_cutover.py",
         "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md",
         ".agents/completed/pre-cutover-claim-protocol.md",
     }
+)
+STRUCTURED_STATE_PATH = re.compile(
+    r"\.agents/(?:state-index/\d{4}-\d{2}-\d{3}\.csv|"
+    r"state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md)\Z"
 )
 
 # coordination.md normally moves live feature state and therefore owes NOW plus
@@ -521,7 +540,6 @@ FEATURE_CHECKPOINT_FILES = frozenset(
         ".agents/porting-inventory.md",
         ".agents/quantization-matrix.md",
         ".agents/roadmap_v1.md",
-        ".agents/state.md",
     }
 )
 FEATURE_CHECKPOINT_PREFIXES = (
@@ -565,7 +583,7 @@ USER_USAGE_PREFIXES = (
     "examples/cli/",
     "examples/server/",
 )
-LIVE_STATE_FILES = frozenset({".agents/state.md", ".agents/coordination.md"})
+LIVE_STATE_FILES = frozenset({".agents/coordination.md"})
 
 # README permission and obligation come only from underlying landing sources.
 # Co-edited public projections can never justify README churn.
@@ -642,7 +660,7 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
         if exact_claim_cutover and path == ".agents/coordination.md":
             classes.add("governance")
             continue
-        if path in GOVERNANCE_FILES:
+        if path in GOVERNANCE_FILES or STRUCTURED_STATE_PATH.fullmatch(path):
             classes.add("governance")
             continue
         if path in LIVE_STATE_FILES:

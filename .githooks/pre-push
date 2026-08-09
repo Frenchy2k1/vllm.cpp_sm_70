@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the public-doc page gates against the COMMITS BEING PUSHED.
+# Run record and public-document gates against the COMMITS BEING PUSHED.
 #
 # Why this exists: docs/STATUS.md carries a shrink-only size ratchet and
 # docs/BENCHMARKS.md a per-cell budget, and both are enforced only in CI. A
@@ -8,7 +8,7 @@
 # these two checkers, but it is opt-in and a forgotten run is exactly how
 # 8f752ae5 reached main over both limits.
 #
-# It checks the PUSHED COMMIT's tree, not the working tree, for two reasons:
+# It checks the PUSHED COMMIT's worktree, not the caller's working tree:
 # a dirty checkout must not fail a clean push, and an uncommitted fix must not
 # let a broken commit through. This is the same content CI will see.
 #
@@ -24,58 +24,74 @@ ZERO='0000000000000000000000000000000000000000'
 
 # The checkers and the paths they read. Keep both lists in sync with
 # scripts/agent-preflight.sh's CHECKERS entries for the same two gates.
-CHECKERS=(check-policy.py check-prompt-contract.py check-readme-structure.py check-public-doc-tables.py)
-# AGENTS.md + .env.example are exported too. The policy checker asserts AGENTS.md is
-# a non-symlink regular file (policy_contract.py:428) and resolves its Markdown
-# links against this sandbox, so omitting either made EVERY push fail here while
-# passing in the real tree ("AGENTS.md must be a non-symlink regular file", then
-# "broken Markdown link: .env.example"). Keep this list a SUPERSET of what the
-# CHECKERS read, or the hook fails closed on content that is actually fine.
-EXPORT_PATHS=(README.md AGENTS.md .env.example docs scripts .agents)
+CHECKERS=(check-policy.py check-prompt-contract.py check-state-record.py check-now-current.py check-readme-structure.py check-public-doc-tables.py)
 
 shas=()
-while read -r _local_ref local_sha _remote_ref _remote_sha; do
+bases=()
+while read -r _local_ref local_sha _remote_ref remote_sha; do
   # A branch deletion pushes the null sha and has no tree to check.
   [ "$local_sha" = "$ZERO" ] && continue
   [ -z "$local_sha" ] && continue
   shas+=("$local_sha")
+  bases+=("$remote_sha")
 done
 
 # Nothing on stdin (a hand-run, or a git that passed no refs): check HEAD.
 if [ ${#shas[@]} -eq 0 ]; then
   shas=("$(git rev-parse HEAD)")
+  bases=("$(git rev-parse HEAD^)")
 fi
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+worktrees=()
+cleanup() {
+  for worktree in "${worktrees[@]}"; do
+    git -C "$ROOT" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  done
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 failed=0
-for sha in "${shas[@]}"; do
+for index in "${!shas[@]}"; do
+  sha="${shas[$index]}"
+  base="${bases[$index]}"
+  if [ "$base" = "$ZERO" ] || ! git -C "$ROOT" cat-file -e "${base}^{commit}" 2>/dev/null; then
+    base="$(git -C "$ROOT" merge-base origin/main "$sha" 2>/dev/null || git -C "$ROOT" rev-parse "$sha^" 2>/dev/null || true)"
+  fi
   work="$tmp/${sha}"
-  mkdir -p "$work"
-  # Fail CLOSED: an export we cannot read is content we cannot gate, and a
-  # silent skip is how an ungated page reaches main in the first place.
-  if ! git -C "$ROOT" archive "$sha" -- "${EXPORT_PATHS[@]}" 2>"$work/.archive-err" \
-      | tar -x -C "$work" 2>/dev/null; then
-    printf 'pre-push: could not export %s for checking\n' "${sha:0:12}" >&2
-    sed 's/^/  /' "$work/.archive-err" >&2
+  if ! git -C "$ROOT" worktree add --quiet --detach "$work" "$sha" 2>"$tmp/.worktree-err"; then
+    printf 'pre-push: could not materialize %s for checking\n' "${sha:0:12}" >&2
+    sed 's/^/  /' "$tmp/.worktree-err" >&2
+    failed=1
+    continue
+  fi
+  worktrees+=("$work")
+  if [ -z "$base" ]; then
+    printf 'pre-push: could not resolve comparison base for %s\n' "${sha:0:12}" >&2
     failed=1
     continue
   fi
   for checker in "${CHECKERS[@]}"; do
     [ -f "$work/scripts/$checker" ] || continue
-    if ! output="$(cd "$work" && python3 "scripts/$checker" 2>&1)"; then
+    args=()
+    case "$checker" in
+      check-state-record.py) args=(--base "$base") ;;
+      check-now-current.py) args=(--base "$base" --head "$sha") ;;
+    esac
+    if ! output="$(cd "$work" && python3 "scripts/$checker" "${args[@]}" 2>&1)"; then
       printf 'pre-push: %s FAILED on %s\n' "$checker" "${sha:0:12}" >&2
       printf '%s\n' "$output" | sed 's/^/  /' >&2
       failed=1
     fi
   done
+  git -C "$ROOT" worktree remove --force "$work" >/dev/null 2>&1 || true
 done
 
 if [ "$failed" -ne 0 ]; then
   cat >&2 <<'MSG'
 
-pre-push: refusing to push. Fix the pages and amend, or re-run with
+pre-push: refusing to push. Fix the record or pages and amend, or re-run with
 --no-verify if you are deliberately pushing over the budget.
 MSG
   exit 1

@@ -41,7 +41,7 @@
 | `tests/vt/test_vulkan_backend.cpp` | The Vulkan unit gate | Modify: new cases for specialization + metadata |
 | `.github/workflows/ci.yml` | CI | Modify: add the `vulkan-spirv-freshness` job |
 | `.agents/feature-matrix.md` | Record | Modify: repair the `BACKEND-VULKAN` drift |
-| `.agents/backend-matrix.md`, `.agents/state.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md` | Record | Modify: land the row + the doc checkpoint |
+| `.agents/backend-matrix.md`, `.agents/state-index/<writable-shard>.csv`, `.agents/state-events/<YYYY-MM>/<event-id>.md`, `.agents/NOW.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md` | Record | Modify/create: land the row + ordered checkpoint and immutable evidence (`.agents/state.csv` is the manifest) |
 
 ---
 
@@ -1077,7 +1077,7 @@ MSG
 - Modify: `.agents/feature-matrix.md:280`
 - Modify: `.agents/backend-matrix.md:233`
 - Modify: `.agents/specs/vulkan-full-support.md` (mark `VK-A1` landed)
-- Modify: `.agents/state.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`
+- Modify: `.agents/state-index/<writable-shard>.csv`, `.agents/NOW.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`; create matching `.agents/state-events/<YYYY-MM>/<event-id>.md` (`.agents/state.csv` is the manifest)
 - Modify: `docs/FEATURES.md` (required: `feature-matrix.md` is a feature-surface trigger)
 
 **Interfaces:**
@@ -1120,8 +1120,10 @@ owes none.
 `docs/STATUS.md` is under a **size ratchet that only shrinks** (currently 284,073;
 `scripts/check-public-doc-tables.py`). Adding text requires compacting elsewhere
 in the same change. Keep the STATUS entry to one or two sentences pointing at the
-spec, put the narrative in `.agents/state.md` (append-only, no ratchet), and
-update the existing `BENCH-VK-LLAMA` row in `docs/BENCHMARKS.md` rather than
+spec, put the narrative in the matching immutable `.agents/state-events/`
+evidence file, append its ordered `.agents/state-index/` row, refresh
+`.agents/NOW.md`, run `python3 scripts/check-state-record.py`, and update the
+existing `BENCH-VK-LLAMA` row in `docs/BENCHMARKS.md` rather than
 adding a new one — it must still read NOT APPLICABLE, because VK-A1 measures
 nothing.
 

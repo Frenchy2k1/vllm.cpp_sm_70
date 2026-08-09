@@ -925,8 +925,11 @@ never piped — `cmd | tail` reports `tail`'s status.
 `scripts/check-gate-commands.py` ratchets this.
 
 Interactive is the default. In a **declared** headless run, decide rather than
-ask, record every decision in `.agents/state.md`, park what will not go green,
-and never merge.
+ask, record every decision as immutable `.agents/state-events/` evidence with
+its ordered row in the writable `.agents/state-index/` shard, refresh
+`.agents/NOW.md`, and run `python3 scripts/check-state-record.py`; park what will
+not go green, and never merge. `.agents/state.csv` is the structured-record
+manifest.
 <!-- orchestration-loop:end -->
 ```
 

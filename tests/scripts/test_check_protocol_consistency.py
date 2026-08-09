@@ -835,6 +835,53 @@ class OrchestrationLoopWiring(unittest.TestCase):
 
 
 class CutoverGateWiring(unittest.TestCase):
+    def test_structured_state_cutover_wires_are_closed(self) -> None:
+        self.assertIn(
+            '--base origin/main\n  run "now-current range"',
+            consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
+        )
+        self.assertIn(
+            "test_check_state_record",
+            consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
+        )
+        self.assertIn(
+            'check-state-record.py --base "$base"',
+            consistency.CUTOVER_WIRING[".github/workflows/ci.yml"],
+        )
+        self.assertIn(
+            'check-state-record.py) args=(--base "$base")',
+            consistency.CUTOVER_WIRING[".githooks/pre-push"],
+        )
+        for needle in (
+            'run "state-record range" python3 scripts/check-state-record.py',
+            '--base origin/main\n  run "now-current range"',
+            'run "now-current range" python3 scripts/check-now-current.py',
+            '--base origin/main --head HEAD\n  run "doc-checkpoint range"',
+        ):
+            self.assertIn(
+                needle,
+                consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
+            )
+        for needle in (
+            'check-state-record.py --base "$base"',
+            'check-now-current.py --base "$base" --head "$head"',
+        ):
+            self.assertIn(needle, consistency.CUTOVER_WIRING[".github/workflows/ci.yml"])
+        self.assertIn(
+            'check-now-current.py) args=(--base "$base" --head "$sha")',
+            consistency.CUTOVER_WIRING[".githooks/pre-push"],
+        )
+        expected_retired = {
+            "scripts/agent-preflight.sh": ("check-state-order", "test_check_state_order"),
+            ".github/workflows/ci.yml": (
+                "scripts/check-state-order.py",
+                "tests/scripts/test_check_state_order.py",
+            ),
+        }
+        self.assertEqual(
+            getattr(consistency, "RETIRED_STATE_WIRING", {}), expected_retired
+        )
+
     def test_repository_wiring_is_complete(self) -> None:
         self.assertEqual(consistency.cutover_wiring_errors(ROOT), [])
 

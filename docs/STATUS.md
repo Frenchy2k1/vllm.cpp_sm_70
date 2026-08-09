@@ -11,11 +11,11 @@ oracle), *speed-pending* (correct, throughput work in progress), *build-only*
 (compiles for a target with no runtime proof here), and *hardware-blocked*
 (cannot run on the hardware available).
 
-The forensic chronology and the raw evidence live in the append-only
-[`.agents/state.md`](../.agents/state.md), the
-[parity ledger](../.agents/parity-ledger.md), the area matrices, and
-[docs/BENCHMARKS.md](BENCHMARKS.md). This file keeps ONE binding current-state
-line per capability, not a run-by-run log.
+Chronology and raw evidence live in the structured
+[state manifest](../.agents/state.csv), immutable events,
+[parity ledger](../.agents/parity-ledger.md), area matrices, and
+[docs/BENCHMARKS.md](BENCHMARKS.md). This file keeps one binding current-state
+line per capability, not a run log.
 
 ## Parity pin
 
@@ -41,9 +41,10 @@ published by GitHub Actions - lanes `-cuda`/`-vulkan`/`-cpu` plus moving `latest
 each an amd64+arm64 manifest. The image is the `ENG-RELEASE-BINARIES` staged bundle, which does not exist yet, so
 no Dockerfile, workflow or registry package is claimed. Metal/MLX are NOT-CONTAINERIZABLE. Issue #170.
 
-Protocol (2026-08-08): `agent-start.py` → claim → preflight; review FAIL →
-fresh implementer → both gates → fresh review until PASS. Budgets cannot stop
-it; registry/prompt mutation gates bind it. Verified PRs merge; obsolete close.
+Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
+append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.
+Tests: 95: validator/core 44 (checker 20 + core 24), NOW 18, migration 22,
+cutover 11.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;
@@ -1196,10 +1197,8 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
-Record hygiene (2026-08-06): `check-state-order` now rejects future-dated
-state anchors (one-day timezone grace) after a chained stamp bug recurred
-three times; the third recurrence was re-anchored to its git-evidenced date; #77 slip
-tree-reverted.
+Record hygiene (2026-08-08): a manifest/stub byte-preserves the monolithic log;
+`check-state-record` range-gates bounded indexes and immutable events.
 
 Public documentation restructure (2026-08-04): `docs/BENCHMARKS.md` had grown
 into an append log of 11,405 lines and 171 claim-titled sections and was no
@@ -1219,17 +1218,15 @@ them verbatim, reading its allowlist from the checker so the two cannot drift.
 No engine code, no kernel, no measured number changed; the scoreboard carries
 the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
-Agent-record repair, triage and compaction (2026-08-04). An audit found
-the rules sound but the substrate decayed. **Cold resume** was unsound (union-merged
-appends had interleaved `.agents/state.md`); entries below a marker now carry a
-sortable anchor. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md).
-**The operating manual** had drifted from the checker; both now carry one
-machine-readable contract. **Claim state** was triaged: only DeepSeek and
-Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
+Agent-record repair, triage and compaction (2026-08-04): structured state
+replaces the unsound union log with ordered indexes and immutable events;
+[.agents/NOW.md](../.agents/NOW.md) restores cold resume. The manual and checker
+share one machine-readable contract. Only DeepSeek and Laguna remain in flight;
+54 rows left `ACTIVE`, and 29 claims moved to
 [completed/claims-era1.md](../.agents/completed/claims-era1-2026-08-04.md).
-Backfill: 12 engine rows cite a `TEST_CASE`, 19 model rows a
-`REGISTER_VLLM_MODEL` line. 79 rows remain, 30 anchored; `upstream-inventory.py` gates
-it. All 362 vLLM registry archs carry a row (31 added).
+Backfill: 12 engine rows cite `TEST_CASE`, 19 model rows cite
+`REGISTER_VLLM_MODEL`; 79 rows remain, 30 anchored. `upstream-inventory.py`
+gates all 362 vLLM registry architectures (31 added).
 Devices: 6/6 vLLM platforms covered; llama.cpp's 11 extra ggml backends are
 spike-gated `BACKEND-GGML-*` rows (`ROAD-V1-D6`). Arch parity is checked both ways. **Role discipline
 ENFORCES** since `44e8225c`: feature code reaches `main` only via a merged
@@ -1238,7 +1235,7 @@ ENFORCES** since `44e8225c`: feature code reaches `main` only via a merged
 them cancelled. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
 [the archived directives](../.agents/completed/policy-directives-legacy.md), and THIS page gained a
-shrink-only ratchet. Detail is in `.agents/state.md`. An operator/helper
+shrink-only ratchet. The structured state record holds the detail. An operator/helper
 protocol is ACCEPTED; W0-W5 LANDED, enforcement opt-in
 ([archived spec](../.agents/completed/operator-helper-protocol-legacy.md)). No engine code, no
 kernel, no numbers changed.
@@ -1317,7 +1314,7 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 ## Backend detail
 
-Gemma4 ROCm fused helpers use portable `include/vt/fused_ops.h`: ROCm fast paths under `VLLM_CPP_HIP`; non-HIP stubs cover peer/pin/resident upload; kernel-only `VT_GEMMA4_*` switches are classified and device leakage stays at baseline (#154).
+Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in positive MiB (unset/0 unlimited); `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` guard requests at 200000/4096 (0 disables); nine inherited tuning toggles are internal. No runtime/perf change.
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

@@ -371,7 +371,10 @@ class RoleDiscipline(unittest.TestCase):
                      "CMakeLists.txt", "cmake/x.cmake"):
             self.assertTrue(discipline.is_feature_path(path), path)
         for path in ("scripts/check-x.py", "tests/scripts/test_x.py",
-                     ".agents/state.md", "docs/STATUS.md",
+                     ".agents/state.md", ".agents/state.csv",
+                     ".agents/state-index/2026-08-001.csv",
+                     ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
+                     ".agents/completed/state-migration-manifest.csv", "docs/STATUS.md",
                      ".github/workflows/ci.yml"):
             self.assertFalse(discipline.is_feature_path(path), path)
 

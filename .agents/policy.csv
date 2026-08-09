@@ -34,7 +34,7 @@ POL-PORT-TESTS,upstream port,porting code,Port the applicable upstream tests in 
 POL-SPIKE-FIRST,task lifecycle,before READY or ACTIVE,Commit a complete spike spec before a row enters READY or ACTIVE.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-EVIDENCE-PRESERVE,records,compacting or retiring records,Move evidence without deleting it.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-ROW-SYNC,checkpoint,feature lifecycle changes,Update the roadmap row and owning matrix row in the same change.,scripts/check-agent-record.py; scripts/check-policy.py,never,.agents/workflow.md
-POL-STATE-ORDER,state log,appending state,Append below the enforced marker in chronological anchor order.,scripts/check-state-order.py; scripts/check-policy.py,never,.agents/workflow.md
+POL-STATE-STRUCTURED,state record,appending or correcting state,Append through ordered indexes and immutable event evidence.,scripts/check-state-record.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-NOW-COUPLING,.agents/NOW.md,live_state,Refresh .agents/NOW.md.,scripts/check-doc-checkpoint.py; scripts/check-now-current.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-DOC-STATUS,docs/STATUS.md,feature_checkpoint,Update docs/STATUS.md.,scripts/check-doc-checkpoint.py; scripts/check-policy.py,never,.agents/workflow.md
 POL-DOC-BENCHMARKS,docs/BENCHMARKS.md,feature_checkpoint,Update docs/BENCHMARKS.md.,scripts/check-doc-checkpoint.py; scripts/check-public-doc-tables.py; scripts/check-policy.py,never,.agents/workflow.md

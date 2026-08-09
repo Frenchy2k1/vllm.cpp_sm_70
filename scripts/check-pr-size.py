@@ -91,13 +91,14 @@ POLICY_FILES = frozenset(
 )
 APPEND_ONLY_FILES = frozenset(
     {
-        ".agents/state.md",
         ".agents/benchmark-record.md",
         ".agents/parity-ledger.md",
     }
 )
 PROJECT_RECORD_FILES = frozenset(
     {
+        ".agents/state.md",
+        ".agents/state.csv",
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
@@ -146,6 +147,8 @@ GOVERNANCE_SUPPORT_FILES = frozenset(
         "scripts/claim-view.py",
         "scripts/ready-for-helper.py",
         "scripts/agent-preflight.sh",
+        "scripts/state_record.py",
+        "scripts/migrate-state-record.py",
     }
 )
 PRODUCT_CHECKER_FILES = frozenset({"scripts/check-release-binary-contract.py"})
@@ -173,6 +176,15 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
+STATE_INDEX = re.compile(r"\.agents/state-index/\d{4}-\d{2}-\d{3}\.csv\Z")
+STATE_EVENT = re.compile(
+    r"\.agents/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"
+)
+STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
+STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
+    r"\.agents/completed/state-migration-manifest-"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?\.csv\Z"
+)
 ASSET = re.compile(r"assets/[A-Za-z0-9_.-]+\.(?:png|svg)\Z")
 RELEASE_MANIFEST_FIXTURE = re.compile(
     r"tests/scripts/fixtures/release_manifest/v[0-9]+/[a-z0-9-]+\.json\Z"
@@ -189,6 +201,7 @@ CHECKER_EVIDENCE_OVERRIDES = {
     # exist and NO change to this checker could ever satisfy its own evidence
     # rule. Mapped to the file CI actually runs.
     "scripts/check-device-leakage.py": "tests/scripts/test_device_leakage.py",
+    "scripts/check-state-order.py": "tests/scripts/test_state_record_cutover.py",
 }
 
 # New entrypoints cannot appear in their own historical policy enforcement
@@ -204,6 +217,19 @@ CREATED_CHECKER_RULES = {
         "POL-PATH-CLASSIFICATION",
         "POL-PR-SIZE",
     ),
+}
+# Task-specific technical contract checkers do not become repository-policy
+# authorities. Their changes are nevertheless mutation-bound by the policy that
+# governs checker changes. Keep this declaration exact so an unknown checker
+# still fails closed instead of inheriting a directory-wide exemption.
+TECHNICAL_CHECKER_CHANGE_RULES = {
+    "scripts/check-release-binary-contract.py": ("POL-CHECKER-CHANGE",),
+}
+# A retired checker is mutation-tested by restoring its BASE bytes into the
+# HEAD worktree. The cutover suite must then turn red because the obsolete tool
+# exists again.
+RETIRED_CHECKER_RULES = {
+    "scripts/check-state-order.py": ("POL-STATE-STRUCTURED",),
 }
 DISABLED_CREATION_CHECKER = (
     b"#!/usr/bin/env python3\n"
@@ -222,6 +248,7 @@ CREATION_MUTATIONS = {
     "scripts/check-policy.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-state-record.py": DISABLED_CREATION_CHECKER,
 }
 EVIDENCE_TIMEOUT_SECONDS = 120
 TEST_COUNT = re.compile(r"Ran ([0-9]+) tests? in ")
@@ -277,13 +304,21 @@ def classify_path(path: str) -> str:
         return "policy"
     if path in APPEND_ONLY_FILES:
         return "append_only_record"
+    if STATE_INDEX.fullmatch(path) or STATE_EVENT.fullmatch(path):
+        return "append_only_record"
     if path in PROJECT_RECORD_FILES:
         return "project_record"
     if path == ".agents/upstream-inventory.json":
         return "project_record"
     if path in PROCEDURE_FILES or SPEC.fullmatch(path) or COMPLETED.fullmatch(path):
         return "procedure"
-    if SPEC_EVIDENCE.fullmatch(path) or SYNC_RECORD.fullmatch(path) or BENCH_EVIDENCE.fullmatch(path):
+    if (
+        path == STATE_MIGRATION_MANIFEST
+        or STATE_MIGRATION_MANIFEST_ARCHIVE.fullmatch(path)
+        or SPEC_EVIDENCE.fullmatch(path)
+        or SYNC_RECORD.fullmatch(path)
+        or BENCH_EVIDENCE.fullmatch(path)
+    ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:
         return "governance_support"
@@ -493,7 +528,11 @@ def affected_policy_rules(
             if checker_path in {part.strip() for part in rule.enforcement.split(";")}
         )
     )
-    declared = CREATED_CHECKER_RULES.get(checker_path, ())
+    declared = (
+        CREATED_CHECKER_RULES.get(checker_path, ())
+        + TECHNICAL_CHECKER_CHANGE_RULES.get(checker_path, ())
+        + RETIRED_CHECKER_RULES.get(checker_path, ())
+    )
     rule_ids = tuple(sorted(set(direct) | set(declared)))
     if not rule_ids:
         raise ValueError(f"{checker_path} has no affected POL rule mapping")

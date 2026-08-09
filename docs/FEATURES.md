@@ -310,4 +310,4 @@ mark on this page moved**. An inventoried backend is not a supported one, and th
 holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
 are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
 
-| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | partial | Portable seam; ROCm fast path; CPU/Vulkan link |
+| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | partial | Portable ROCm seam. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited) + `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables). Nine tuning vars internal; defaults unchanged. |

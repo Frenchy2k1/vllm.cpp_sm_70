@@ -51,6 +51,8 @@ FEATURE_PREFIXES = (
 FEATURE_FILES = {"CMakeLists.txt"}
 INTEGRATION_FILES = {
     ".agents/state.md",
+    ".agents/state.csv",
+    ".agents/completed/state-migration-manifest.csv",
     "docs/STATUS.md",
     "docs/BENCHMARKS.md",
     "docs/FEATURES.md",
@@ -60,6 +62,10 @@ INTEGRATION_FILES = {
 CHECKER_PATH = re.compile(r"scripts/check-[A-Za-z0-9_.-]+\.(?:py|sh)\Z")
 CHECKER_TEST_PATH = re.compile(r"tests/scripts/test_[A-Za-z0-9_.-]+\.py\Z")
 CI_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml\Z")
+STRUCTURED_STATE_PATH = re.compile(
+    r"\.agents/(?:state-index/\d{4}-\d{2}-\d{3}\.csv|"
+    r"state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md)\Z"
+)
 
 ROW_BRANCH = re.compile(r"row/[A-Za-z0-9_.-]+")
 PR_REFERENCE = re.compile(r"\(#\d+\)|#\d+")
@@ -69,6 +75,18 @@ def git(*args: str) -> str:
     return subprocess.check_output(
         ["git", *args], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
     ).strip()
+
+
+def is_integration_path(path: str) -> bool:
+    """Return whether path is an explicit record, checker, or CI surface."""
+
+    return bool(
+        path in INTEGRATION_FILES
+        or STRUCTURED_STATE_PATH.fullmatch(path)
+        or CHECKER_PATH.fullmatch(path)
+        or CHECKER_TEST_PATH.fullmatch(path)
+        or CI_PATH.fullmatch(path)
+    )
 
 
 def is_feature_path(path: str) -> bool:
@@ -82,12 +100,7 @@ def is_feature_path(path: str) -> bool:
         or any(part in {"", ".", ".."} for part in candidate.parts)
     ):
         return True
-    if (
-        path in INTEGRATION_FILES
-        or CHECKER_PATH.fullmatch(path)
-        or CHECKER_TEST_PATH.fullmatch(path)
-        or CI_PATH.fullmatch(path)
-    ):
+    if is_integration_path(path):
         return False
     return path in FEATURE_FILES or path.startswith(FEATURE_PREFIXES)
 

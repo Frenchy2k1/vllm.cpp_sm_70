@@ -57,7 +57,7 @@ ANCHORS = {
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
     ".agents/NOW.md": "| Release | **ACTIVE; W5 19/19+10/10; contract 30/30** |",
     ".agents/coordination.md": "| `CLAIM-ENG-RELEASE-BINARIES-W5` | `ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |",
-    ".agents/state.md": "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE",
+    ".agents/state-events/2026-08/STATE-20260808T220000-002.md": "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE",
     "docs/STATUS.md": "#141 W5 19/19 ACTIVE ART∅",
     "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; W5 implemented)** | `ENG-RELEASE-BINARIES`:",
 }
@@ -106,7 +106,7 @@ LIFECYCLE_RECORD_MUTATIONS = (
         "coordination release lifecycle",
     ),
     (
-        ".agents/state.md",
+        ".agents/state-events/2026-08/STATE-20260808T220000-002.md",
         "`ACTIVE`, never `DONE` or `GATING`.",
         "`DONE`, with every release gate complete.",
         "state release lifecycle",
@@ -413,7 +413,8 @@ TEST_LITERAL_INVENTORIES = {
         "gpu_driver_boundary": "external-host-never-bundled",
         "required_anchor_paths": (
             ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
-            ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
+            ".agents/coordination.md,.agents/state-events/2026-08/"
+            "STATE-20260808T220000-002.md,docs/STATUS.md,"
             "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
             "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
         ),
@@ -581,7 +582,8 @@ EXACT_MACHINE_FIELDS = {
     "gpu_driver_boundary": "external-host-never-bundled",
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
-        ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
+        ".agents/coordination.md,.agents/state-events/2026-08/"
+        "STATE-20260808T220000-002.md,docs/STATUS.md,"
         "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
         "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
     ),
@@ -1033,9 +1035,12 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
             "coordination release lifecycle must keep W5 ACTIVE and implemented while later work and real artifact evidence remain pending"
         )
 
-    state_path = root / ".agents/state.md"
+    state_path = root / ".agents/state-events/2026-08/STATE-20260808T220000-002.md"
     if not state_path.is_file():
-        errors.append("state release lifecycle record .agents/state.md is missing")
+        errors.append(
+            "state release lifecycle record "
+            ".agents/state-events/2026-08/STATE-20260808T220000-002.md is missing"
+        )
     else:
         state_text = state_path.read_text(encoding="utf-8")
         if state_text.count(STATE_RELEASE_HEADING) != 1:

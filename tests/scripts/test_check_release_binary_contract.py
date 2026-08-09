@@ -29,7 +29,7 @@ CONTRACT_PATHS = (
     ".agents/roadmap_v1.md",
     ".agents/NOW.md",
     ".agents/coordination.md",
-    ".agents/state.md",
+    ".agents/state-events/2026-08/STATE-20260808T220000-002.md",
     "docs/STATUS.md",
     "docs/BENCHMARKS.md",
     ".github/workflows/ci.yml",
@@ -134,7 +134,7 @@ RECORD_ANCHORS = {
         "| `CLAIM-ENG-RELEASE-BINARIES-W5` | "
         "`ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |"
     ),
-    ".agents/state.md": (
+    ".agents/state-events/2026-08/STATE-20260808T220000-002.md": (
         "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE"
     ),
     "docs/STATUS.md": "#141 W5 19/19 ACTIVE ART∅",
@@ -196,7 +196,7 @@ LIFECYCLE_RECORD_MUTATIONS = (
         "coordination release lifecycle",
     ),
     (
-        ".agents/state.md",
+        ".agents/state-events/2026-08/STATE-20260808T220000-002.md",
         "`ACTIVE`, never `DONE` or `GATING`.",
         "`DONE`, with every release gate complete.",
         "state release lifecycle",
@@ -300,7 +300,8 @@ EXACT_MACHINE_FIELDS = {
     "gpu_driver_boundary": "external-host-never-bundled",
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
-        ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
+        ".agents/coordination.md,.agents/state-events/2026-08/"
+        "STATE-20260808T220000-002.md,docs/STATUS.md,"
         "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
         "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
     ),

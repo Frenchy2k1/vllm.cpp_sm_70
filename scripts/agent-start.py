@@ -95,7 +95,7 @@ def _declared_actions(
             "3. Use the printed .agents/NOW.md as the live snapshot.",
             "4. Read .agents/developer-preferences.md when it exists.",
             "5. Resume the row from .agents/coordination.md and",
-            "   .agents/state.md anchors that apply to this claim.",
+            "   structured state event anchors that apply to this claim.",
         ]
     )
     if headless:

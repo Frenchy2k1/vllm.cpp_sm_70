@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Keep .agents/NOW.md a short, current, one-Read resume surface.
 
-The canonical record is large by design (state.md and parity-ledger.md are
-megabytes of append-only evidence, and that is correct -- evidence must not be
-deleted). But that made the cold-start path expensive: an agent was told to
-orient from the roadmap, the owning matrix, coordination.md and the newest state
-entries, none of which is cheap to locate inside files of that size.
+The canonical state record is a bounded manifest, sharded CSV indexes, and
+immutable event evidence. NOW.md is the live projection of that record.
 
 NOW.md is the fix: the single small file a cold session reads first to become
 productive. It is a SNAPSHOT, never a log -- it is rewritten in place, and the
@@ -13,14 +10,16 @@ detail it summarises stays in the append-only record.
 
 Two obligations are enforced:
   * structure and budget, so it cannot decay into another status log;
-  * freshness, so it cannot silently go stale. Any change that appends to
-    .agents/state.md must refresh NOW.md in that same change, because a state
-    append is exactly the event that moves what is live.
+  * freshness, so it cannot silently go stale. A newly indexed event refreshes
+    NOW.md when its outcome changes the live project position. Migration-only,
+    forensic corrections, and already-terminal forensic events are exempt.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import re
 import subprocess
 import sys
@@ -28,11 +27,20 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.state_record import EVENT_HEADER, Event
+
+
 NOW = ROOT / ".agents/NOW.md"
 NOW_PATH = ".agents/NOW.md"
-
-# A state append is the event that changes what is live, so it is the trigger.
-FRESHNESS_TRIGGERS = {".agents/state.md"}
+STATE_INDEX_PREFIX = ".agents/state-index/"
+TERMINAL_OUTCOMES = frozenset({"landed", "closed"})
+TERMINAL_NEXT_ACTIONS = frozenset(
+    {"", "-", "—", "none", "no further action", "terminal"}
+)
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 # Budgets. NOW.md exists to be read in full, every session, by every agent. The
 # moment it stops fitting in one screenful of attention it has become the thing
@@ -73,7 +81,7 @@ def structure_errors(text: str) -> list[str]:
     if len(lines) > MAX_LINES:
         errors.append(
             f"is {len(lines)} lines, over the {MAX_LINES}-line budget; move "
-            "detail to .agents/state.md and keep only the live position here"
+            "detail to structured state evidence and keep only the live position here"
         )
     if len(text) > MAX_CHARS:
         errors.append(
@@ -93,39 +101,83 @@ def structure_errors(text: str) -> list[str]:
     return errors
 
 
-def state_entries_changed(commit: str) -> bool:
-    """Whether this commit ADDED or REMOVED a state entry, vs merely reordering.
+def _state_index_paths(paths: set[str]) -> list[str]:
+    return sorted(
+        path
+        for path in paths
+        if path.startswith(STATE_INDEX_PREFIX) and path.endswith(".csv")
+    )
 
-    `sort-state-tail.py` rewrites the log to repair an interleave caused by
-    concurrent sessions. That moves no entry in or out and changes nothing about
-    what is live, so demanding a NOW.md refresh for it is an over-trigger: the
-    rule is "a state APPEND moves what is live", not "any byte changed".
-    """
-    import re
-    parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
-    if not parents:
+
+def _normalize_next_action(value: str) -> str:
+    return value.strip().rstrip(".").strip().lower()
+
+
+def event_requires_refresh(event: Event, now_text: str) -> bool:
+    """Whether a newly indexed event changes the live NOW projection."""
+    if event.kind == "legacy_import":
+        return False
+    subjects = [subject.lower() for subject in event.subject_ids.split(";") if subject]
+    subject_is_live = any(subject in now_text.lower() for subject in subjects)
+    has_follow_up = _normalize_next_action(event.next_action) not in TERMINAL_NEXT_ACTIONS
+    if event.kind == "correction" and event.outcome == "superseded":
+        return subject_is_live or has_follow_up
+    if event.outcome not in TERMINAL_OUTCOMES:
         return True
-    def headings(rev: str) -> set[str]:
-        try:
-            blob = git("show", f"{rev}:.agents/state.md")
-        except subprocess.CalledProcessError:
-            return set()
-        return set(re.findall(r"^## (.+)$", blob, re.M))
-    return headings(parents[0]) != headings(commit)
+    return subject_is_live or has_follow_up
 
 
-def freshness_errors(paths: set[str], entries_changed: bool = True) -> list[str]:
-    """Return staleness problems for one atomic change."""
-    triggers = sorted(FRESHNESS_TRIGGERS & paths)
-    if triggers and not entries_changed:
-        return []  # a pure reorder: no entry added, nothing live moved
-    if triggers and NOW_PATH not in paths:
+def freshness_errors(
+    paths: set[str],
+    appended_events: list[Event] | tuple[Event, ...] = (),
+    *,
+    now_text: str | None = None,
+) -> list[str]:
+    """Return staleness problems for one atomic structured-record change."""
+    triggers = _state_index_paths(paths)
+    if not triggers or not appended_events:
+        return []
+    digest = NOW.read_text(encoding="utf-8") if now_text is None else now_text
+    live_events = [event for event in appended_events if event_requires_refresh(event, digest)]
+    if live_events and NOW_PATH not in paths:
+        event_ids = ", ".join(event.event_id for event in live_events)
         return [
-            f"{', '.join(triggers)} changed but {NOW_PATH} did not; a state "
-            "append moves what is live, so refresh the digest in the same "
-            "change (live claims, current gate, next actions, stamp)"
+            f"{', '.join(triggers)} appended live event(s) {event_ids} but "
+            f"{NOW_PATH} did not change; refresh the digest in the same change "
+            "(live claims, current gate, next actions, stamp)"
         ]
     return []
+
+
+def _events_from_csv(text: str) -> list[Event]:
+    if not text:
+        return []
+    reader = csv.reader(io.StringIO(text), strict=True)
+    header = tuple(next(reader, ()))
+    if header != EVENT_HEADER:
+        raise ValueError(f"expected state-index header {EVENT_HEADER!r}, found {header!r}")
+    return [Event(*row) for row in reader if row]
+
+
+def _git_blob(revision: str, path: str) -> str:
+    try:
+        return git("show", f"{revision}:{path}")
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def appended_events(paths: set[str], before: str, after: str) -> list[Event]:
+    """Return rows introduced between two trees (``:`` means the staged index)."""
+    appended: list[Event] = []
+    for path in _state_index_paths(paths):
+        old_events = _events_from_csv(_git_blob(before, path))
+        old_ids = {event.event_id for event in old_events}
+        appended.extend(
+            event
+            for event in _events_from_csv(_git_blob(after, path))
+            if event.event_id not in old_ids
+        )
+    return appended
 
 
 def git(*args: str) -> str:
@@ -143,6 +195,16 @@ def commit_paths(commit: str) -> set[str]:
             "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit
         )
     return {line for line in output.splitlines() if line}
+
+
+def commit_events(commit: str, paths: set[str]) -> list[Event]:
+    parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
+    before = parents[0] if parents else EMPTY_TREE
+    return appended_events(paths, before, commit)
+
+
+def now_at(revision: str) -> str:
+    return _git_blob(revision, NOW_PATH) or NOW.read_text(encoding="utf-8")
 
 
 def commits_in_range(base: str, head: str) -> list[str]:
@@ -186,21 +248,33 @@ def main() -> int:
 
     if args.staged:
         paths = set(git("diff", "--cached", "--name-only").splitlines())
-        failures.extend(f"staged change: {error}" for error in freshness_errors(paths))
+        staged_events = appended_events(paths, "HEAD", "")
+        failures.extend(
+            f"staged change: {error}"
+            for error in freshness_errors(
+                paths, staged_events, now_text=now_at("")
+            )
+        )
     elif args.base is not None:
         for commit in commits_in_range(args.base, args.head):
             short = git("rev-parse", "--short", commit)
             failures.extend(
                 f"commit {short}: {error}"
                 for error in freshness_errors(
-                    commit_paths(commit), state_entries_changed(commit))
+                    commit_paths(commit),
+                    commit_events(commit, commit_paths(commit)),
+                    now_text=now_at(commit),
+                )
             )
     elif args.commit is not None:
         short = git("rev-parse", "--short", args.commit)
         failures.extend(
             f"commit {short}: {error}"
             for error in freshness_errors(
-                commit_paths(args.commit), state_entries_changed(args.commit))
+                commit_paths(args.commit),
+                commit_events(args.commit, commit_paths(args.commit)),
+                now_text=now_at(args.commit),
+            )
         )
 
     if failures:
@@ -209,7 +283,7 @@ def main() -> int:
         print(
             "NOW.md is the one-Read resume surface: the live claims, the gate "
             "being chased, and the next actions, rewritten in place. Detail "
-            "belongs in .agents/state.md and the area matrices.",
+            "belongs in structured state evidence and the area matrices.",
             file=sys.stderr,
         )
         return 1

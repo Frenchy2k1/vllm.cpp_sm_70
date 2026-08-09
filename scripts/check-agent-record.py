@@ -534,15 +534,26 @@ def parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]:
     return rows
 
 
+def link_base(source: Path, text: str) -> Path:
+    """Resolve migrated legacy links from their original .agents/ location."""
+    if (
+        source.is_relative_to(AGENTS / "state-events")
+        and "<!-- legacy-payload:begin -->" in text
+    ):
+        return AGENTS
+    return source.parent
+
+
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
         text = source.read_text(encoding="utf-8")
+        base = link_base(source, text)
         for raw_target in LINK_RE.findall(text):
             target = raw_target.strip().strip("<>")
             if not target or target.startswith(("http://", "https://", "mailto:")):
                 continue
             target_path, _, fragment = target.partition("#")
-            resolved = (source.parent / target_path).resolve()
+            resolved = (base / target_path).resolve()
             if not resolved.exists():
                 errors.append(f"{source.relative_to(ROOT)}: dangling link {raw_target}")
                 continue

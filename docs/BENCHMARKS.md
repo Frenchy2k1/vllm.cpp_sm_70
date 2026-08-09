@@ -4,6 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
+| **Structured state record (active)** | v1 scalar + relational + Git-history contracts | No benchmark. At `776c56f1`: 157 imports = 3,231,342 exact bytes; append preserved all 156 wrappers/rows. 95 tests: validator/core 44 (checker 20 + core 24), NOW 18, migration 22, cutover 11. New raw-row mutation guard. | n/a |
 | **Binary release matrix (ACTIVE; W5 implemented)** | `ENG-RELEASE-BINARIES`: versioned deterministic manifest for primary host-ABI fat-CUDA + adaptive-CPU static-core bundles, optional per-SM diagnostics and experimental literal-static musl CPU | **W5 GREEN:** 19/19 + ten review mutations killed; contract 30/30; PR-size classes/budget GREEN. Synthetic fixtures only. **PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/correctness/performance gates | n/a |
 | **Container images (inventoried)** | `ENG-RELEASE-CONTAINERS`: GHCR images from GitHub Actions; lanes `-cuda`/`-vulkan`/`-cpu`, amd64+arm64 manifests | **No number owed:** record-only. No Dockerfile, workflow, registry package or image exists; the image is the unimplemented `ENG-RELEASE-BINARIES` bundle | n/a |
 | **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |
@@ -11,7 +12,7 @@
 | **DSR fix: server TU profiler guards (2026-08-09)** | **No number owed:** comments only. #189 moved the server body into the shared layer with its 5 `VT_BENCH_PROFILE_CONTROL` guards, taking DSR 32 -> 37; they are `DSR-ALLOW`'d per site, baseline unchanged at 32 |
 | **DSR fix: async readback capability (2026-08-08)** | **No number owed**: behavior-neutral (CPU/CUDA async-ON, discrete non-CUDA async-OFF, unchanged); moves a `kCUDA` check onto `Backend`, unblocking red CI on #127/#154/#155 |
 | **`ROAD-V1-MEM` M1+M2 (2026-08-08)** | KV auto-sizing CPU brick: `--kv-cache-memory` sizes the pool from a byte budget via the group-aware `KVBytesPerBlock` divisor (ABI v16, CPU-gated). M3 profile run dgx-gated |
-| **Record/checker repair 2026-08-07–08** | Restored red record/env gates; made release AST semantic pins Python 3.12/3.13-stable; recorded merged Gemma-4 MoE as known merged-GEMM drift and closed the stale embeddings claim. No runtime/performance change |
+| **Record/checker repair 2026-08-07–08** | Gates fixed. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited), `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables); nine Gemma4/ROCm tuners internal. No runtime/perf change. |
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
@@ -278,8 +279,9 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 ## How we measure
 
 
-Record dates are CI-guarded: state anchors dated in the future are rejected
-(`check-state-order`), so scoreboard stamps trace to real landing dates. The
+Record dates are CI-guarded: structured state event timestamps and ordered
+indexes are validated by `check-state-record`, so scoreboard stamps remain
+traceable. The
 review protocol behind these numbers is guarded the same way: the reviewer and
 implementer sub-agent prompts are tracked artifacts checked by
 `check-protocol-consistency` (orchestration harness step 5/5), and
@@ -315,7 +317,7 @@ The PR #28 sanitizer repair is also NOT APPLICABLE to performance: both full
 333-test CPU detector lanes pass after merging upstream `main`, while the
 ASan+UBSan build footprint falls from 93 GiB to 5.7 GiB and TSan occupies
 1.9 GiB. Reproduce with the sanitizer
-CTest commands recorded in `.agents/state.md`. The 2026-08-06 live-state audit, its standing preflight+CI gate (`scripts/audit-live-rows.py --check`) and that gate's review follow-up (evidence-rule limit recorded, `ACTIVE` precondition written into `.agents/workflow.md`, count/scope fixes) are likewise NOT APPLICABLE: bookkeeping, a record checker over matrices and Git refs, prose. No engine code, no kernel, no number on this page.
+CTest commands preserved in the structured state evidence. The 2026-08-06 live-state audit and the 2026-08-08 state-record migration plus range-gate and stale-reference repair are likewise NOT APPLICABLE: bookkeeping, record checkers, and prose. No engine code, kernel, or number on this page changed.
 
 **Vocabulary.** *Token-exact* means our output ids equal the reference's, byte
 for byte. *Near-tie* means the reference's own greedy decode is not deterministic

@@ -1,0 +1,3 @@
+event_id,occurred_at,kind,subject_ids,phase,outcome,commit,pr,spec,evidence_path,supersedes,summary,next_action
+STATE-LEGACY-000001,,legacy_import,,,,,,,.agents/state-events/0000-00/STATE-LEGACY-000001.md,,,
+STATE-LEGACY-000002,2026-08-06,legacy_import,,,,,,,.agents/state-events/0000-00/STATE-LEGACY-000002.md,,,

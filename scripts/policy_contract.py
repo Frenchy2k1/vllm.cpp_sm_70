@@ -525,7 +525,7 @@ def _validate_consolidation(root: Path, rules: dict[str, PolicyRule]) -> list[st
         "POL-DOC-FEATURES": "feature, model, backend, or quantization surface",
         "POL-DOC-USAGE": "commands, C API, configuration, installation, or user workflows",
         "POL-DOC-README": "only for a user-visible landing-page headline",
-        "POL-NOW-COUPLING": "same change as every `.agents/state.md` append",
+        "POL-NOW-COUPLING": "same change as every qualifying appended structured event",
     }
     for rule_id, fragment in purpose_fragments.items():
         if not any(fragment in paragraph for paragraph in rule_paragraphs.get(rule_id, [])):

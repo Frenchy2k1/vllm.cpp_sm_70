@@ -207,7 +207,7 @@ void DequantGemma4Fp8ExpertToBf16Ephemeral(const Gemma4Fp8ExpertMats& ex, int64_
 // Host BF16 cache + device upload once (subsequent tokens use device GEMM path).
 // H2D is async on d.q — later GEMMs on the same stream see the data without a
 // device-wide Synchronize (was serializing every expert upload).
-// VRAM budget: VT_GEMMA4_EXPERT_VRAM_MB (default 12288). LRU evicts oldest.
+// A positive VT_GEMMA4_EXPERT_VRAM_MB caps the expert LRU in MiB; unset/0 is unlimited.
 namespace {
 struct DevExpertLru {
   struct Slot {

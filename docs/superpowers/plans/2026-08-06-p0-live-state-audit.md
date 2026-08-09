@@ -48,7 +48,7 @@ Copied from `AGENTS.md`, `.agents/coordination.md` and `.agents/specs/issue-nati
 | `tests/scripts/test_audit_live_rows.py` (create) | Unit + mutation suite for the classifier and the shipped-matrix integration |
 | `.agents/specs/live-state-audit-2026-08-06.md` (create) | The audit findings artifact — the evidence justifying every correction |
 | `.agents/*-matrix.md` (modify, Task 6) | The corrections themselves, one commit per matrix |
-| `.agents/state.md` (modify, Task 6) | Append-only checkpoint entry |
+| `.agents/state-index/<writable-shard>.csv`, `.agents/state-events/<YYYY-MM>/<event-id>.md` (create/modify, Task 6) | Ordered index row plus immutable checkpoint evidence |
 | `scripts/agent-preflight.sh:50-63` (modify, Task 7) | Register the new mutation suite and the gate |
 | `.github/workflows/ci.yml:42-46` (modify, Task 7) | Run the gate and its mutation suite in CI |
 
@@ -1045,7 +1045,8 @@ EOF
 **Files:**
 - Modify: `.agents/engine-matrix.md`, `.agents/model-matrix.md`, `.agents/kernel-matrix.md`, `.agents/quantization-matrix.md`, `.agents/backend-matrix.md`, `.agents/feature-matrix.md`, `.agents/sglang-matrix.md` (only those with corrections)
 - Modify: `.agents/roadmap_v1.md` (only if a corrected row has a portfolio row)
-- Modify: `.agents/state.md`, `.agents/NOW.md`, `docs/STATUS.md`
+- Modify: `.agents/state-index/<writable-shard>.csv`, `.agents/NOW.md`, `docs/STATUS.md`
+- Create: `.agents/state-events/<YYYY-MM>/<event-id>.md`
 
 **Interfaces:**
 - Consumes: the **Proposed corrections** section of `.agents/specs/live-state-audit-2026-08-06.md`.
@@ -1133,23 +1134,30 @@ retirement is missing or partial — repair the record, never the checker.
 
 - [ ] **Step 5: Repeat Steps 1–4b for each remaining matrix with corrections**
 
-- [ ] **Step 6: Update the roadmap, state log and public status**
+- [ ] **Step 6: Update the roadmap, structured state record and public status**
 
 The record obligation is that the roadmap portfolio row and its owning area matrix row move in the **same change** as the state they describe. If any corrected row has a portfolio row in `.agents/roadmap_v1.md`, update it now.
 
-Append one entry to `.agents/state.md` **below** the `<!-- state-order:enforced-below -->` marker, carrying a `<!-- state: 2026-08-06 -->` anchor on the line after its heading. Refresh `.agents/NOW.md` in the same commit (the freshness coupling is CI-gated) and update `docs/STATUS.md`.
+Append one checkpoint row to the writable `.agents/state-index/` shard and add
+its matching immutable Markdown evidence under `.agents/state-events/`, using
+the schema and event contract in the structured-state design. Refresh
+`.agents/NOW.md` in the same commit (the freshness coupling is CI-gated) and
+update `docs/STATUS.md`. Leave the `.agents/state.md` compatibility stub
+unchanged.
 
 - [ ] **Step 7: Verify chronology and doc obligations, then commit**
 
 ```bash
-python3 scripts/check-state-order.py; echo "state-order EXIT=$?"
+python3 scripts/check-state-record.py; echo "state-record EXIT=$?"
 bash scripts/agent-preflight.sh > /tmp/preflight.log 2>&1; echo "EXIT=$?"
-git add .agents/roadmap_v1.md .agents/state.md .agents/NOW.md docs/STATUS.md
+git add .agents/roadmap_v1.md .agents/state-index/<writable-shard>.csv \
+  .agents/state-events/<YYYY-MM>/<event-id>.md .agents/NOW.md docs/STATUS.md
 git commit -F - <<'EOF'
 record(state): live-state audit checkpoint — the ACTIVE claim set is now true
 
 49 rows claimed ACTIVE simultaneously; the audit reconciled them against
-branches and commits. Portfolio, state log, NOW and STATUS move together.
+branches and commits. Portfolio, structured state indexes, immutable event
+evidence, NOW and STATUS move together.
 
 FOLLOWING_AGENTS_PROTOCOL
 Assisted-by: Claude Code:claude-opus-5 [ClaudeCode]

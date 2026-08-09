@@ -250,5 +250,16 @@ class AgentRecordMutationTests(unittest.TestCase):
         require(errors, r"Serving, API, CLI, library summary ready=\d+; actual \d+")
 
 
+class MigratedLegacyLinks(unittest.TestCase):
+    def test_legacy_payload_keeps_original_agents_relative_link_base(self) -> None:
+        source = ROOT / ".agents/state-events/0000-00/STATE-LEGACY-000001.md"
+        text = "<!-- legacy-payload:begin -->\n[spec](specs/example.md)"
+        self.assertEqual(agent_record.link_base(source, text), ROOT / ".agents")
+
+    def test_post_cutover_event_links_remain_event_relative(self) -> None:
+        source = ROOT / ".agents/state-events/2026-08/STATE-20260808T120000-001.md"
+        self.assertEqual(agent_record.link_base(source, "[local](note.md)"), source.parent)
+
+
 if __name__ == "__main__":
     unittest.main()

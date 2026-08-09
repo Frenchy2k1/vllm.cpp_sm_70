@@ -82,7 +82,7 @@ The human-facing documents have distinct purposes:
 | `docs/FEATURES.md` | feature, model, backend, and quantization surface changes |
 | `docs/USAGE.md` | commands, API, configuration, installation, and user workflows |
 | `README.md` | landing-page and user-visible headline changes only |
-| `.agents/NOW.md` | live snapshot; refresh in the same change as a state-log append |
+| `.agents/NOW.md` | live snapshot; refresh with every qualifying appended structured event |
 
 Keyed records are updated in place. Append-only evidence remains append-only.
 During concurrent reconciliation, take the current target branch version of a
@@ -115,8 +115,8 @@ when assisted, `AI-Assisted: true` plus `Assisted-by:`. AI tools never add
 `Signed-off-by` or `Co-Authored-By`. The human submitter owns and reviews the
 change.
 
-For unfinished work, append an exact dated checkpoint below the enforced marker
-in [`.agents/state.md`](.agents/state.md), refresh [`.agents/NOW.md`](.agents/NOW.md)
+For unfinished work, append an indexed immutable event through
+[`.agents/state.csv`](.agents/state.csv), refresh [`.agents/NOW.md`](.agents/NOW.md)
 in the same change, and update the live claim in
 [`.agents/coordination.md`](.agents/coordination.md). Record the immutable head,
 exact gates run, evidence roots, prohibitions, blocker, and first resume

@@ -78,7 +78,7 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
    with an exact handoff. If benchmarks are baselined, the vLLM baseline must
    be re-measured at TARGET before comparing.
 7. **Advance the pin.** Fast-forward the reference checkout to TARGET, update
-   the PARITY PIN line above, append a [state.md](state.md) entry linking the
+   the PARITY PIN line above, append an indexed immutable state event linking the
    sync report. A cycle that stalls mid-way keeps the old pin and records
    what's left in the report ("carry-over" section) — the next cycle picks it
    up.

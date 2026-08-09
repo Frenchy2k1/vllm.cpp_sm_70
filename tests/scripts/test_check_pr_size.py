@@ -46,14 +46,42 @@ class CheckerEvidenceMapping(unittest.TestCase):
 
 
 class PathClassification(unittest.TestCase):
+    def test_state_migration_manifest_archives_are_evidence(self) -> None:
+        for path in (
+            ".agents/completed/state-migration-manifest.csv",
+            ".agents/completed/state-migration-manifest-f921.csv",
+            ".agents/completed/state-migration-manifest-release-v1.2.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+    def test_completed_csv_near_misses_fail_closed(self) -> None:
+        for path in (
+            ".agents/completed/unrelated.csv",
+            ".agents/completed/state-migration-manifests-f921.csv",
+            ".agents/completed/state-migration-manifest-.csv",
+            ".agents/completed/state-migration-manifest-f921-.csv",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_each_mutable_surface_has_an_explicit_class(self) -> None:
         expected = {
+            "CLAUDE.md": "procedure",
+            "MANIFESTO.md": "public_document",
             "src/vt/x.cpp": "product",
             "scripts/check-release-binary-contract.py": "product",
             "scripts/check-policy.py": "governance_checker",
             "tests/scripts/test_policy_contract.py": "governance_test",
             ".agents/policy.csv": "policy",
-            ".agents/state.md": "append_only_record",
+            ".agents/state.md": "project_record",
+            ".agents/state.csv": "project_record",
+            ".agents/state-index/2026-08-001.csv": "append_only_record",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
+            ".agents/completed/state-migration-manifest.csv": "evidence",
+            "scripts/state_record.py": "governance_support",
+            "scripts/migrate-state-record.py": "governance_support",
             "docs/STATUS.md": "public_document",
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
@@ -203,6 +231,18 @@ class BudgetEnforcement(unittest.TestCase):
                 waiver_scope="pr:128",
             )
 
+    def test_repository_pr_166_waiver_is_exact(self) -> None:
+        rules = checker.load_policy(ROOT)
+        waivers = checker.load_waivers(ROOT, rules, today=dt.date(2026, 8, 8))
+        applicable = [
+            waiver
+            for waiver in waivers
+            if waiver.rule_id == "POL-PR-SIZE" and waiver.scope == "pr:166"
+        ]
+        self.assertEqual(len(applicable), 1)
+        self.assertEqual(applicable[0].waiver_id, "WAIVER-PR-SIZE-002")
+        self.assertEqual(applicable[0].expires, dt.date(2026, 8, 15))
+
     def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
         errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
         self.assertTrue(any("binary" in error for error in errors), errors)
@@ -237,6 +277,7 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-policy.py",
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
+            "scripts/check-state-record.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():
@@ -304,6 +345,37 @@ class BudgetEnforcement(unittest.TestCase):
         )
         self.assertTrue(any("test_policy_contract.py" in error for error in errors), errors)
 
+    def test_agent_record_checker_uses_its_existing_mutation_suite(self) -> None:
+        self.assertEqual(
+            checker.recognized_evidence("scripts/check-agent-record.py"),
+            "tests/scripts/test_agent_record.py",
+        )
+
+    def test_exact_technical_checker_is_bound_to_checker_change_policy(self) -> None:
+        rules = checker.load_policy(ROOT)
+        self.assertEqual(
+            checker.affected_policy_rules(
+                "scripts/check-release-binary-contract.py", rules, ROOT
+            ),
+            ("POL-CHECKER-CHANGE",),
+        )
+        with self.assertRaisesRegex(ValueError, "no affected POL rule mapping"):
+            checker.affected_policy_rules(
+                "scripts/check-unregistered-contract.py", rules, ROOT
+            )
+
+    def test_retired_state_checker_uses_cutover_mutation_evidence(self) -> None:
+        rules = checker.load_policy(ROOT)
+        retired = "scripts/check-state-order.py"
+        self.assertEqual(
+            checker.recognized_evidence(retired),
+            "tests/scripts/test_state_record_cutover.py",
+        )
+        self.assertEqual(
+            checker.affected_policy_rules(retired, rules, ROOT),
+            ("POL-STATE-STRUCTURED",),
+        )
+
     def test_numstat_parser_rejects_malformed_negative_and_duplicate_paths(self) -> None:
         for text in (
             "1\t2\n",
@@ -365,7 +437,7 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-policy.py",
             "tests/scripts/test_policy_contract.py",
             ".agents/workflow.md",
-            ".agents/state.md",
+            ".agents/state-index/2026-08-001.csv",
             ".agents/NOW.md",
             "docs/STATUS.md",
             ".github/workflows/ci.yml",
@@ -380,7 +452,7 @@ class BudgetEnforcement(unittest.TestCase):
     def test_production_role_check_requires_pr_for_records_docs_ci_and_support(self) -> None:
         role = checker.load_role_discipline()
         for path in (
-            ".agents/state.md",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
             "docs/STATUS.md",
             ".github/workflows/ci.yml",
             "scripts/agent-role.py",
@@ -392,6 +464,17 @@ class BudgetEnforcement(unittest.TestCase):
                         "abc123", ["parent"], "direct", "", [path]
                     )
                 )
+
+    def test_role_checker_classifies_structured_state_as_integration(self) -> None:
+        role = checker.load_role_discipline()
+        for path in (
+            ".agents/state.csv",
+            ".agents/state-index/2026-08-001.csv",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
+            ".agents/completed/state-migration-manifest.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(role.is_integration_path(path))
 
     def test_pending_pr_range_requires_the_exact_event_head(self) -> None:
         role = checker.load_role_discipline()

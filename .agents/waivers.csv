@@ -1,2 +1,3 @@
 waiver_id,rule_id,scope,owner,reason,evidence,expires
 WAIVER-PR-SIZE-001,POL-PR-SIZE,pr:128,maintainer,One-time policy consolidation and evidence-preserving archive migration exceeds the procedure and governance-test class budgets,PR-128 policy migration,2026-08-15
+WAIVER-PR-SIZE-002,POL-PR-SIZE,pr:166,maintainer,One-time lossless structured-state migration exceeds review budgets through mechanical evidence fan-out,PR-166 structured state design,2026-08-15
