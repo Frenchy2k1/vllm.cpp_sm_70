@@ -54,6 +54,10 @@ jobs:
       - name: Extracted release archives fail closed on content and metadata drift
         run: |
           python3 tests/scripts/test_release_archive.py
+      - name: Release workflow is dry-run safe and least privilege
+        run: |
+          python3 scripts/check-release-workflow.py
+          python3 tests/scripts/test_release_pipeline.py
       - name: README stays a human-readable user-facing document
         run: |
           python3 scripts/check-readme-structure.py

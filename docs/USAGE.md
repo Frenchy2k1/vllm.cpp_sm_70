@@ -172,6 +172,20 @@ The validator checks the content allowlist, executable and host ABI, manifest,
 The digest and provenance are sidecars because both describe the final archive
 bytes; placing either inside those bytes would create a self-reference.
 
+To exercise the release pipeline without publishing anything, trigger its
+manual entry point:
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+Manual runs are always dry runs. Publication additionally requires an exact
+`v<project-version>` tag, a release matrix whose required lanes are all marked
+ready, successful verification and attestation jobs, and approval of the
+protected `release` environment. Build and verification jobs have read-only
+repository permissions; only attestation receives OIDC authority, and only the
+final protected job receives `contents: write`.
+
 Any OpenAI client works by pointing its `base_url` at it:
 
 ```python
