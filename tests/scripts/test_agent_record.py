@@ -282,8 +282,6 @@ class MigratedLegacyLinks(unittest.TestCase):
         self.assertEqual(agent_record.link_base(source, "[local](note.md)"), source.parent)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class IssueIntakeTable(unittest.TestCase):
@@ -312,7 +310,7 @@ class IssueIntakeTable(unittest.TestCase):
         try:
             path.write_text(section, encoding="utf-8")
             errors = []
-            checker.check_issue_table(errors)
+            agent_record.check_issue_table(errors)
             return errors
         finally:
             path.write_text(original, encoding="utf-8")
@@ -356,5 +354,8 @@ class IssueIntakeTable(unittest.TestCase):
 
     def test_the_tracked_roadmap_table_is_valid(self):
         errors = []
-        checker.check_issue_table(errors)
+        agent_record.check_issue_table(errors)
         self.assertEqual(errors, [])
+
+if __name__ == "__main__":
+    unittest.main()
