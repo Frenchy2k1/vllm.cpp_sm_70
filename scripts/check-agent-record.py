@@ -193,7 +193,10 @@ MATRICES = {
     # 79 since 2026-08-05: +11 BACKEND-GGML-* rows, the llama.cpp ggml
     # backends folded into scope (user-directed). All INVENTORIED and
     # spike-gated; inventorying is not committing.
-    "BACKEND": (AGENTS / "backend-matrix.md", 79),
+    # 80 since 2026-08-09: +`BACKEND-TENSTORRENT`, an extension platform
+    # proposal (Tenstorrent Blackhole, ttnn C++ adapter) in the same class as
+    # Metal/Vulkan. INVENTORIED; spec-only, not yet reviewed or accepted.
+    "BACKEND": (AGENTS / "backend-matrix.md", 80),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

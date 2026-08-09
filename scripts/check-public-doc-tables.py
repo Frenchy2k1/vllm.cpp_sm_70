@@ -454,7 +454,15 @@ STATUS_RATCHET = {
     # a Jetson Thor board, and the contradiction cost a contributor time
     # (issue #168). Net -10, re-pinned byte-tight so the reduction cannot become
     # untracked growth headroom.
-    "chars": 243590,
+    #
+    # 243588 since 2026-08-09 (measured 243588): BACKEND-TENSTORRENT reaches W2
+    # and needs a status line; its per-op detail stays in backend-matrix.md and
+    # the spec, so the page carries the binding result plus a pointer. Paid for
+    # by collapsing superseded narrative in the GGUF row (a "REPORTED, not
+    # gated" preamble, a "superseding the gap recorded here" aside, and three
+    # restatements). Every measured number and binding claim kept verbatim, and
+    # re-pinned byte-tight after rebasing onto the newer page.
+    "chars": 243588,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
