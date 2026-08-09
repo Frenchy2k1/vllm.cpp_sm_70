@@ -401,10 +401,24 @@ STATUS_RATCHET = {
     # ON the page deliberately: only OLMo-2 has a committed golden, Granite and
     # StableLM skip rather than gate, dflash and deepseek_v2 are build-verified
     # only. Nothing was lost, only de-duplicated. Net -2185.
-    "chars": 276960,
+    # 244486 since 2026-08-09 (measured 244486): the Laguna-S-2.1 MoE row was a
+    # SINGLE 33,211-char table row - an 18,215-char accumulated benchmark history
+    # and a 14,941-char implementation narrative - on a page whose contract is ONE
+    # binding current-state line per capability, and against a 220-char cell bound
+    # it was 150x over. It had also become the reason this page could not satisfy
+    # its own shrink-only ratchet: main sat 253 chars over with no other block
+    # large enough to pay for anything. Both cells were MOVED VERBATIM, the
+    # benchmark half to .agents/benchmark-record.md and the implementation half to
+    # .agents/state.md, leaving the binding result (87% of vLLM, root cause, the
+    # device-resident fix, default-ON) and the architecture summary ON the page
+    # with pointers. Nothing was rewritten, condensed or dropped. Net -32728, and
+    # the ratchet is tightened to the measured value in the same change so the
+    # headroom cannot be silently re-spent. oversized_cells 47 -> 44 and
+    # long_paragraphs 89 -> 82 fall out of the same move.
+    "chars": 244486,
     "h2_sections": 11,
-    "long_paragraphs": 89,
-    "oversized_cells": 47,
+    "long_paragraphs": 82,
+    "oversized_cells": 44,
 }
 STATUS_REQUIRED = (
     ("Parity pin", ("parity pin",)),

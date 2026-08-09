@@ -298,6 +298,25 @@ class SemanticClassificationTests(unittest.TestCase):
                     doc_checkpoint.classify_changed_paths(sorted(paths | {added})),
                 )
 
+    def test_a_headline_benchmark_source_unblocks_its_own_readme_claim(self) -> None:
+        # README carried two FALSE Vulkan claims that no permitted change could
+        # correct, because that backend had no headline-benchmark source in
+        # LANDING_SOURCE_FILES while the CUDA comparison had two. The fix is a
+        # real source file, NOT relaxing the co-edited-projection rule.
+        errors = doc_checkpoint.checkpoint_errors(
+            {"README.md", "benchmarks/demo/vulkan_27b_llamacpp.json"}
+        )
+        self.assertEqual([e for e in errors if "landing-page trigger" in e], [])
+
+    def test_readme_alone_still_needs_a_trigger(self) -> None:
+        # The original rule stands: a README edit with no underlying source is
+        # still churn and is still rejected.
+        errors = doc_checkpoint.checkpoint_errors({"README.md"})
+        self.assertTrue(
+            any("landing-page trigger" in e for e in errors),
+            "a bare README change must not become free",
+        )
+
     def test_synthetic_merge_trailer_correction_is_exact(self) -> None:
         paths = set(doc_checkpoint.SYNTHETIC_MERGE_RANGE_FILES)
         self.assertEqual(doc_checkpoint.classify_changed_paths(sorted(paths)), {"governance"})

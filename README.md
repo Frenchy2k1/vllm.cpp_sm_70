@@ -39,8 +39,9 @@
 
 - **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
   matches the vLLM oracle token for token, and decodes **45.45 vs 41.94 tok/s**.
-- **2026-08** **Vulkan runs a model end to end.** `opt-125m` greedy is STRICT token-exact on
-  24 native ops. Decode **8.59 to 91.7 tok/s (10.7x)**; llama.cpp Vulkan stays **2.62x** ahead.
+- **2026-08** **Vulkan reaches 98.5% of llama.cpp on a 27B.** `opt-125m` greedy is STRICT
+  token-exact; Qwen3.6-27B decodes **4.285 vs llama.cpp Vulkan 4.35 tok/s** on GB10, with our
+  GPU-side work already ahead of its wall clock. Prefill **21.5x**.
 
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
@@ -307,7 +308,7 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
-| **Vulkan** | Portable GPU | 24 native ops; `opt-125m` STRICT token-exact, Qwen3.6-27B runs e2e |
+| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact, Qwen3.6-27B runs e2e at 98.5% of llama.cpp Vulkan decode. Op coverage: [docs/STATUS.md](docs/STATUS.md) |
 | **ROCm** | AMD GPUs | W0 skeleton; a contributor ran gfx1201 on 2x R9700 ([#140](https://github.com/mudler/vllm.cpp/pull/140)). No AMD board here: [docs/ROCM.md](docs/ROCM.md) |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
