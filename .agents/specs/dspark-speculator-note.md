@@ -3,6 +3,11 @@
 USER-requested 2026-08-08; INVENTORIED only — full scoping is its own future
 spike (`planned: specs/dspark-spec-decode.md`). Grounded at pin `555967922`:
 
+> **SUPERSEDED 2026-08-09** by the committed spike
+> [dspark-spec-decode.md](dspark-spec-decode.md) (`CLAIM-SPEC-DSPARK`). This
+> note is kept as the provenance of the five grounding facts below; the spike
+> carries the scope, checkpoint inventory, slice plan, gates and risks.
+
 1. **Drafter:** `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:37` —
    `DSparkSpeculator(DFlashSpeculator)` drafts a BLOCK of
    `num_speculative_tokens` in ONE parallel pass (anchor + N−1 noise queries,

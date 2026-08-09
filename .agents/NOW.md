@@ -12,6 +12,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
+| `SPEC-DSPARK` | **SPIKE** ([spec](specs/dspark-spec-decode.md)): small delta over DFlash | W1 config (CPU); can the oracle run it? |
 | State record (#166) | **157 imports = 3,231,342 exact bytes** at `776c56f1`; 95/95; prior 156 wrappers/rows preserved; raw-row guard | Force-update #166; rerun readiness |
 | Laguna NVFP4 / DeepSeek-V4 decode | **CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **0.72x -> 0.85x**: FP8 tower native, tokens MATCH, RSS -3.2 GiB | NVFP4 MLP marlin, 68% of roof |

@@ -183,7 +183,8 @@ the registered engine forward.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| Other methods (ngram-gpu, suffix, dspark, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried; dspark re-grounded at the pin 2026-08-08 (V2-only DFlash-derived block drafter; Qwen3 + Gemma4 targets are ours) | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ☐ **spiked 2026-08-09, not implemented** ([spec](../.agents/specs/dspark-spec-decode.md)): DFlash-derived; adds a Markov logit-bias head and sequential block sampling | ✅ | ◐ |
+| Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
 

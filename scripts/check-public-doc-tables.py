@@ -447,7 +447,13 @@ STATUS_RATCHET = {
     # their re-measured ratios, and drops the superseded narrative those rows
     # carried. Net -32 against the rebased page, re-pinned byte-tight so the
     # reduction cannot become untracked growth headroom.
-    "chars": 243600,
+    #
+    # 243594 since 2026-08-09 (measured 243594): the DSpark speculator paragraph
+    # is rewritten from "grounded and inventoried, full scope is a future spike"
+    # to the committed-spike state (SPIKED, not implemented, no measurement) and
+    # re-pointed at the spec. Net -6 against the previous pin, re-pinned
+    # byte-tight so the reduction cannot become untracked growth headroom.
+    "chars": 243594,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
