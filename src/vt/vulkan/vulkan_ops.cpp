@@ -321,6 +321,31 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   Go("vt_silu_and_mul", bind, p, FlatGroupCount(t * d));
 }
 
+// WHICH RmsNorm MODULE THIS DISPATCH USES.
+//
+// `vt_rms_norm` is the portable 128-invocation module; `vt_rms_norm_wide` is the
+// same body at 1024 invocations with a subgroup reduction. The choice is a
+// DEVICE CAPABILITY question (VulkanContext::wide_reduce), not a shape question:
+// the wide module is never wrong, only unavailable.
+//
+// VulkanContext::rms_norm_override() is the A/B lever over that decision
+// (VT_VULKAN_RMSNORM=base|wide, or the setter the unit gate uses); it exists so
+// the two arms are switchable inside ONE binary, because a cross-BUILD comparison
+// is the shape that produced a false 1.2x reading for the subgroup tactic earlier
+// in this campaign (see vulkan_context.cpp § kRingDepth).
+const char* RmsNormShader() {
+  const VulkanContext& ctx = VulkanContext::Get();
+  const int forced = ctx.rms_norm_override();
+  if (forced < 0) return "vt_rms_norm";
+  if (forced > 0 || ctx.wide_reduce()) {
+    VT_CHECK(ctx.wide_reduce(),
+             "vulkan: the wide RmsNorm module was forced but this device does not "
+             "support 1024-invocation workgroups with compute subgroup arithmetic");
+    return "vt_rms_norm_wide";
+  }
+  return "vt_rms_norm";
+}
+
 // cpu_ops.cpp:225-250 RmsNormKernel. One workgroup per token row.
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
@@ -347,7 +372,7 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
               out_off,
               res_off,
               args.eps};
-  Go("vt_rms_norm", bind, p, static_cast<uint32_t>(t));
+  Go(RmsNormShader(), bind, p, static_cast<uint32_t>(t));
 }
 
 // cpu_layernorm.cpp:49-73 LayerNormKernel.
