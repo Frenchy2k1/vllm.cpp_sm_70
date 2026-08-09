@@ -34,6 +34,14 @@ exec "$@"
 """
 
 
+FAKE_SDE = """#!/bin/sh
+test "$1" = -skx
+test "$2" = --
+shift 2
+exec "$@"
+"""
+
+
 class CpuReleaseGatesContract(unittest.TestCase):
     def fixture(self, scratch: Path) -> tuple[Path, Path]:
         tests = scratch / "tests"
@@ -52,9 +60,15 @@ class CpuReleaseGatesContract(unittest.TestCase):
         emulator.chmod(0o755)
         return tests, emulator
 
-    def invoke(self, tests: Path, emulator: Path, arch: str, output: Path):
-        return subprocess.run(
-            [
+    def invoke(
+        self,
+        tests: Path,
+        emulator: Path,
+        arch: str,
+        output: Path,
+        rich_runner: Path | None = None,
+    ):
+        argv = [
                 sys.executable,
                 str(TOOL),
                 "--arch",
@@ -67,12 +81,30 @@ class CpuReleaseGatesContract(unittest.TestCase):
                 str(output),
                 "--evidence-url",
                 "https://github.com/mudler/vllm.cpp/actions/runs/1",
-            ],
+            ]
+        if rich_runner is not None:
+            argv.extend(["--rich-runner", str(rich_runner), "--rich-runner-kind", "intel-sde"])
+        return subprocess.run(
+            argv,
             text=True,
             capture_output=True,
             env={**os.environ, "VLLM_CPP_RELEASE_GATE_TEST": "1"},
             check=False,
         )
+
+    def test_x86_rich_tiers_use_the_explicit_intel_sde_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tests, emulator = self.fixture(Path(temporary))
+            rich_runner = Path(temporary) / "sde64"
+            rich_runner.write_text(FAKE_SDE, encoding="utf-8")
+            rich_runner.chmod(0o755)
+            output = Path(temporary) / "report.json"
+            result = self.invoke(tests, emulator, "x86_64", output, rich_runner)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = json.loads(output.read_text())
+            self.assertTrue(
+                all("sde64 -skx --" in tier["command"] for tier in report["tiers"].values())
+            )
 
     def test_x86_executes_all_tiers_and_poor_host_refusal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -88,6 +120,16 @@ class CpuReleaseGatesContract(unittest.TestCase):
             self.assertEqual({row["state"] for row in report["tiers"].values()}, {"passed"})
             self.assertTrue(any("Nehalem" in command for command in report["commands"]))
             self.assertTrue(any("expect-refusal" in command for command in report["commands"]))
+            poor_commands = [command for command in report["commands"] if "Nehalem" in command]
+            self.assertTrue(
+                all("--test-case=elementwise CPU GEMM:" in command for command in poor_commands)
+            )
+            self.assertTrue(
+                all(
+                    "--test-case=elementwise CPU GEMM:" not in tier["command"]
+                    for tier in report["tiers"].values()
+                )
+            )
 
     def test_arm_executes_dotprod_i8mm_and_poor_host_refusal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

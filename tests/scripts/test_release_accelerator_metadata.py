@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "scripts/release_accelerator_metadata.py"
+BUILD_SCRIPT = ROOT / "scripts/build-linux-accelerator-release.sh"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 SMS = ["80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a"]
 
@@ -109,6 +110,12 @@ class AcceleratorMetadataContract(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.tool.prepare_accelerator_metadata(args)
                 (args.build_dir / "CMakeCache.txt").write_text(cache, encoding="utf-8")
+
+    def test_cuda_archive_smoke_resolves_only_the_external_driver_stub(self) -> None:
+        script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("*/stubs/libcuda.so", script)
+        self.assertIn("CUDA driver stub is required for archive smoke validation", script)
+        self.assertIn('export LD_LIBRARY_PATH="$cuda_stub_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"', script)
 
 
 if __name__ == "__main__":

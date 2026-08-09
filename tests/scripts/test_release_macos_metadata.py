@@ -15,6 +15,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "scripts/release_macos_metadata.py"
+BUILD_SCRIPT = ROOT / "scripts/build-macos-release.sh"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -120,6 +121,11 @@ class MacosMetadataContract(unittest.TestCase):
             with mock.patch.object(self.tool, "otool_dependencies", return_value=self.otool(True)):
                 with self.assertRaises(ValueError):
                     self.tool.prepare_macos_metadata(args)
+
+    def test_native_metal_packaging_is_compatible_with_system_bash(self) -> None:
+        script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("mlx_metadata_args", script)
+        self.assertIn('--mlx-license "$mlx_license"', script)
 
 
 if __name__ == "__main__":
