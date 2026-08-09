@@ -1,11 +1,11 @@
 {
   "_source": "docs/BENCHMARKS.md BENCH-VK-LLAMA row; .agents/benchmark-record.md 'BACKEND-VULKAN combined'. Every number here is a MEASURED binding value, not a projection.",
-  "title": "Vulkan decode, within 1.5% of llama.cpp on a 27B",
+  "title": "Vulkan decode meets llama.cpp on a 27B",
   "model": "Qwen3.6-27B BF16 (50.89 GiB), greedy, 32-in / 32-out, concurrency 1",
   "hardware": "NVIDIA GB10 / DGX Spark",
-  "workload": "8 legs with the host page cache dropped before each, GPU serialized under one lock; llama.cpp built -DGGML_VULKAN=ON at 237ad9b96 with a from-source shaderc so all five of its Vulkan fast paths report supported (banner: matrix cores NV_coopmat2), llama-bench tg1024, same weights",
-  "headline": "4.285 vs 4.35 tok/s, 98.5%",
-  "subline": "our GPU-side work is already ahead of llama.cpp's wall clock; the whole remaining gap is host time",
+  "workload": "7 clean legs with the host page cache dropped before each and the GPU serialized under one lock, one leg discarded for a NAMED cause (an overlapping compile job, not the unexplained 1-in-16 collapse); llama.cpp built -DGGML_VULKAN=ON at 237ad9b96 with a from-source shaderc so all five of its Vulkan fast paths report supported (banner: matrix cores NV_coopmat2), llama-bench tg1024, same weights",
+  "headline": "4.36 vs 4.35 tok/s, MET",
+  "subline": "our GPU-side work was already ahead of llama.cpp's wall clock; pipelined submission closed the host-side remainder",
   "ours": {
     "label": "vllm.cpp (Vulkan)",
     "accent": "teal"
@@ -17,14 +17,15 @@
   "points": [
     {
       "c": 1,
-      "ours": 4.285,
+      "ours": 4.36,
       "theirs": 4.35
     }
   ],
   "footnotes": [
-    "Decode tokens/s per stream. Ours is the median of 8 clean legs (4.27 to 4.31, spread 0.8%); llama.cpp is llama-bench tg1024 at 4.35 +- 0.00.",
-    "Decomposed by GPU timestamps over a two-length diff (output-len 36 minus 4, over 32 decode tokens, so prefill and one-time costs cancel): GPU 227.7 ms/token, host 5.3 ms, wall 233.0. Over the 54.6 GB streamed once per token that is 239.8 GB/s of GPU-side aggregate against llama.cpp's 237.5 GB/s of WALL aggregate.",
-    "The decode GEMV is at 248.0 GB/s and its lever is closed: the binding constraint is DRAM bandwidth on a working set streamed once per token, not instruction issue or latency. llama.cpp's own rows-per-workgroup trick measured 0.966x here and ships off.",
+    "Decode tokens/s per stream. Ours is the median of 7 clean legs, TPOT 228.66 to 230.25 ms, spread 0.69% -- that spread IS the noise floor, so this is a narrow pass, not a comfortable one. llama.cpp is llama-bench tg1024 at 4.35 +- 0.00.",
+    "OPERATOR CORROBORATION, stated at its real strength: an independent run on a different main SHA, with its own fresh configure, read 4.58 tok/s -- but n=1, on a freshly rebooted box with clean memory, so it is treated as OPTIMISTIC and the 7-leg median is the binding figure. It confirms the direction, not the value. Further legs were abandoned rather than reboot the box a third time.",
+    "The campaign arc on this model: decode 2.40 -> 4.36 tok/s. The levers, in order of size: RMSNorm was dispatching ONE workgroup per row at batch 1 (7.85 -> 1.59 ms/token), GDN state I/O moved in place, the fused attention preamble went native (16 host round trips per token removed), the command batch stopped draining on every host memcpy, lm_head got column blocking, and submission was pipelined.",
+    "The GEMV lever is CLOSED with its binding constraint identified: DRAM bandwidth on a ~50 GB working set streamed once per token, at 248.0 GB/s. llama.cpp's own rows-per-workgroup trick measured 0.966x here and ships off.",
     "Prefill is 21.5x its pre-campaign value on the same model. opt-125m greedy stays STRICT token-exact against the vLLM 0.25.0 oracle with 0 declines.",
     "llama.cpp's own CUDA arm on this box is 4.67 tok/s, so its Vulkan backend runs at 93% of its CUDA."
   ]
