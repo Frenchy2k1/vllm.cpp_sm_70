@@ -18165,3 +18165,76 @@ arrivals for a whole refill wave and publish it once, so string rollback still
 times tokenization while both arms execute identical batches. The full
 RED-first, rollback and mutation gates are binding in the
 [campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
+
+## 2026-08-09 — Qwen3.5 corrected frontend comparison and retained local decode stack
+
+Atomic all-at-once request-wave admission repaired the pretokenized benchmark's
+batching confound at reviewed head `da449a88f0a06710839a0a6568f18426cb44fc19`.
+All repeated local and pinned-vLLM legs generated the same 128 x 128-token
+workload; the local token SHA-256 is
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`.
+The corrected, non-profiled three-repetition comparison is:
+
+| Engine | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E | peak VRAM |
+|---|---:|---:|---:|---:|---:|---:|
+| vllm.cpp direct-load | 6831.7100 | 755.4300 | 1016.5133 ms | 34.4767 ms | 5395.1333 ms | 12,950.7 MiB |
+| pinned vLLM `555967922` | 6643.4025 | 734.6087 | 936.5893 ms | 33.9171 ms | 5244.0659 ms | 12,832.0 MiB |
+| ratio / gap | **1.028345x** | **1.028345x** | **1.085335x slower** | **1.016497x slower** | **1.028807x slower** | **+118.7 MiB** |
+
+Host peak/stable PSS is 2.338/0.770 GiB locally versus 7.868/4.496 GiB for
+vLLM, so host memory remains a large win. Raw comparison root is
+`/tmp/qwen35-compare-da449a88f/`; same-tool traces are
+`/tmp/qwen35-profile-da449a88f-{ours,vllm}.{nsys-rep,sqlite}`. Throughput is
+now a valid win; TTFT, TPOT/ITL, E2E and VRAM remain open.
+
+Two later exact, counterbalanced local stacks were retained as default-OFF
+opt-ins. `VT_GDN_DECODE_BV=16`, `VT_GDN_DECODE_SWIZZLE=1` and
+`VT_GDN_DECODE_REGSTATE=1` moved the direct-load local mean from
+6838.4400/756.1767 tok/s, 1014.0233 ms TTFT, 34.4533 ms TPOT and 5389.7900 ms
+E2E to **6852.1200/757.6900**, **1011.8500**, **34.3867** and **5378.9500**
+(+0.200% throughput, -0.214% TTFT, -0.193% TPOT, -0.201% E2E). Adding
+`VT_GDN_SLACK_MEMSET=1` produced **6856.8633/758.2133**, **1010.4800 ms**,
+**34.3700 ms** and **5375.1900 ms** against its adjacent decode-stack mean
+6852.5700/757.7367, 1011.5233, 34.3900 and 5378.6167. These local gains have
+not been consolidated into a new pinned-vLLM ratio; do not project them as a
+cross-engine pass. Roots are `/tmp/qwen35-ab-decode-stack-da449a88f/` and
+`/tmp/qwen35-ab-slack-memset-da449a88f/`.
+
+## 2026-08-09 — geometric argmax scratch rejected and removed
+
+Reviewed head `06db3bbb3454f85e20f75b96eeb299afba7036ae` passed 9 portable
+cases / 105 assertions plus CUDA sampling. All six legs were token-exact.
+
+| Arm mean, 3 reps | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|
+| Incumbent | 6862.2667 / 758.8100 | 1009.7167 ms | 34.3400 ms | 5371.0000 ms |
+| Geometric scratch | 6863.8867 / 758.9867 | 965.0133 ms | 34.6833 ms | 5369.7067 ms |
+
+The apparent -4.427% TTFT coincides with a **+0.9998% TPOT regression**, so
+the candidate fails the Pareto gate. Same-tool traces identify wait migration,
+not saved compute: `cudaFree` falls 506 calls / 2960.361 ms to 476 / 27.705 ms
+(exactly 30 argmax frees), while the same 567 `cudaStreamSynchronize` calls rise
+18,027.497 -> 20,878.260 ms. Raw A/B is
+`/tmp/qwen35-ab-argmax-geometric-06db3bbb/`; candidate profiler hashes are
+`1021b045...239e7` and `808a7516...b7be4`. Product and tests are removed; the
+falsified allocation hypothesis remains documented.
+
+## 2026-08-09 — BF16 GDN vector writeback rejected and removed
+
+Implementation `29de225c8` plus repair `3ca49e926` passed fresh mutation
+review (16 cases / 2,568 assertions), operator CUDA rebuild and focused
+`test_gdn_decode_fused` + `test_ops_gdn`. All four profiled legs were exact.
+
+| Arm | all fused decode | y800 decode | total / output tok/s | TTFT | TPOT | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| REG-a | 251.210058 ms | 139.127859 ms | 6760.82 / 747.59 | 1027.95 | 34.81 | 5449.30 |
+| VEC-a | 250.472657 ms | 138.702659 ms | 6802.32 / 752.18 | 1015.76 | 34.66 | 5417.91 |
+| VEC-b | 251.214368 ms | 139.138796 ms | 6804.21 / 752.39 | 1015.60 | 34.65 | 5416.35 |
+| REG-b | 251.404693 ms | 139.111428 ms | 6807.51 / 752.76 | 1013.82 | 34.65 | 5413.73 |
+
+Counterbalanced means improve y800 only **0.1430%** and all fused decode only
+**0.1846%**; VEC-b loses to both controls on y800. It therefore misses the
+required 1% and raw-leg gates. `nsys` records unchanged gx8/gy800/bx128,
+56 registers/thread, 9,728 dynamic shared bytes and zero local bytes. Evidence
+is `/tmp/qwen35-gdn-vecstore-{rega,veca,vecb,regb}-3ca49e926.*`. Product and
+tests are removed; REGSTATE remains the local opt-in.

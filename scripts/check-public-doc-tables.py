@@ -485,7 +485,12 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    "chars": 243570,
+    #
+    # 243519 since 2026-08-10 (measured 243519): issue #206 replaces the stale
+    # pretoken-failure row with the corrected, exact throughput result and its
+    # still-open latency/VRAM axes. Re-pinned byte-tight after current-main
+    # reconciliation so the shorter row cannot become untracked headroom.
+    "chars": 243519,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

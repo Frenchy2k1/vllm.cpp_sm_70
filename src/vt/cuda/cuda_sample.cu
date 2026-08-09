@@ -18,13 +18,10 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
 #include "vt/backend.h"
-#include "vt/cuda/argmax_scratch.h"
-#include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -158,7 +155,6 @@ __global__ void ArgmaxFinalKernel(int64_t* out, const float* part_val, const int
 float* g_argmax_val = nullptr;
 int64_t* g_argmax_idx = nullptr;
 size_t g_argmax_cap = 0;  // capacity in elements
-ArgmaxScratchOwners g_argmax_geometric_owners;
 
 void EnsureArgmaxScratch(size_t elems) {
   if (elems <= g_argmax_cap) return;
@@ -194,34 +190,6 @@ bool FastArgmaxEnabled() {
   return on;
 }
 
-const char* ArgmaxGeometricScratchSelector() {
-  static const char* selector = [] {
-    const char* value = std::getenv("VT_ARGMAX_GEOMETRIC_SCRATCH");
-    return ArgmaxGeometricScratchEnabled(value) ? "1" : nullptr;
-  }();
-  return selector;
-}
-
-struct CudaArgmaxScratchRuntime {
-  bool IsCapturing(cudaStream_t stream) const {
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    Check(cudaStreamIsCapturing(stream, &status), "argmax scratch capture query");
-    return status != cudaStreamCaptureStatusNone;
-  }
-
-  void* Allocate(size_t bytes, cudaStream_t stream) const {
-    void* p = nullptr;
-    Check(cudaMallocAsync(&p, bytes, stream), "argmax geometric scratch allocation");
-    return p;
-  }
-
-  void CleanupPartial(void* p, cudaStream_t stream) const {
-    Check(cudaFreeAsync(p, stream), "argmax geometric scratch partial cleanup");
-  }
-
-  void Retire(void* p) const { RetireGraphScratch(p); }
-};
-
 void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
@@ -239,36 +207,13 @@ void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
   if (bpr > kBlock) bpr = kBlock;  // pass 2 reduces bpr partials with kBlock threads
   if (bpr < 1) bpr = 1;
 
-  DispatchArgmaxScratch(
-      ArgmaxGeometricScratchSelector(),
-      [&] {
-        // Exact rollback: retain the original process-global exact-size
-        // cudaFree/cudaMalloc allocator and launch sequence byte-for-byte.
-        EnsureArgmaxScratch(static_cast<size_t>(n) * bpr);
-        dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
-        ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(g_argmax_val, g_argmax_idx,
-                                                     logits.Ptr<float>(), v, bpr);
-        ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
-            token_ids.Ptr<int64_t>(), g_argmax_val, g_argmax_idx, bpr);
-        Check(cudaGetLastError(), "greedy_argmax launch");
-      },
-      [&] {
-        if (static_cast<size_t>(n) >
-            std::numeric_limits<size_t>::max() / static_cast<size_t>(bpr)) {
-          throw std::overflow_error("argmax scratch element-count overflow");
-        }
-        const size_t need = static_cast<size_t>(n) * static_cast<size_t>(bpr);
-        CudaArgmaxScratchRuntime runtime;
-        SubmitCudaArgmaxScratch(
-            g_argmax_geometric_owners, q, s, need, runtime, [&](ArgmaxScratchView scratch) {
-              dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
-              ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(scratch.values, scratch.indices,
-                                                           logits.Ptr<float>(), v, bpr);
-              ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
-                  token_ids.Ptr<int64_t>(), scratch.values, scratch.indices, bpr);
-              Check(cudaGetLastError(), "greedy_argmax launch");
-            });
-      });
+  EnsureArgmaxScratch(static_cast<size_t>(n) * bpr);
+  dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
+  ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(g_argmax_val, g_argmax_idx, logits.Ptr<float>(), v,
+                                               bpr);
+  ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(token_ids.Ptr<int64_t>(),
+                                                                g_argmax_val, g_argmax_idx, bpr);
+  Check(cudaGetLastError(), "greedy_argmax launch");
 }
 
 // --- compute_probs / compute_logprobs (block-per-row softmax) ---------------

@@ -1869,7 +1869,6 @@ struct GdnDecodeTestEnv {
   const char* swizzle;
   const char* regstate;
   const char* nw;
-  const char* bf16_vecstore = nullptr;
 };
 
 void SetOrUnsetEnv(const char* name, const char* value) {
@@ -1915,7 +1914,6 @@ void RunGdnDecodeExactCase(int64_t dv, DType io_dtype, DType state_dtype,
     SetOrUnsetEnv("VT_GDN_DECODE_BV", env.bv);
     SetOrUnsetEnv("VT_GDN_DECODE_SWIZZLE", env.swizzle);
     SetOrUnsetEnv("VT_GDN_DECODE_REGSTATE", env.regstate);
-    SetOrUnsetEnv("VT_GDN_DECODE_BF16_VECSTORE", env.bf16_vecstore);
     DeviceTensor dq(gpu, gq.q, io_dtype, {n, hk, dk}, q.data());
     DeviceTensor dkt(gpu, gq.q, io_dtype, {n, hk, dk}, k.data());
     DeviceTensor dvt(gpu, gq.q, io_dtype, {n, hv, dv}, v.data());
@@ -1946,7 +1944,6 @@ void RunGdnDecodeExactCase(int64_t dv, DType io_dtype, DType state_dtype,
   run(incumbent, out_incumbent, state_incumbent);
   run(candidate, out_candidate, state_candidate);
   unsetenv("VT_GDN_DECODE_REGSTATE");
-  unsetenv("VT_GDN_DECODE_BF16_VECSTORE");
   unsetenv("VT_GDN_DECODE_SWIZZLE");
   unsetenv("VT_GDN_DECODE_BV");
   unsetenv("VT_GDN_DECODE_NW");
@@ -3541,28 +3538,6 @@ TEST_CASE("CUDA fused GDN decode register-state schedule is byte-exact") {
                         nw4_shared, nw4_reg, 6440);
 }
 
-TEST_CASE("CUDA fused GDN decode BF16 vector writeback is byte-exact") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
-    return;
-  }
-  constexpr GdnDecodeTestEnv incumbent{"16", "1", "1", "8", "0"};
-  constexpr GdnDecodeTestEnv vectorized{"16", "1", "1", "8", "1"};
-  RunGdnDecodeExactCase(128, DType::kBF16, DType::kBF16, false,
-                        incumbent, vectorized, 6450);
-  RunGdnDecodeExactCase(128, DType::kBF16, DType::kBF16, true,
-                        incumbent, vectorized, 6460);
-
-  // The selector is ineligible for independent fp16/fp32 cache dtypes and a
-  // partial value dimension; those configurations must remain incumbent.
-  RunGdnDecodeExactCase(128, DType::kBF16, DType::kF16, true,
-                        incumbent, vectorized, 6470);
-  RunGdnDecodeExactCase(128, DType::kF32, DType::kF32, true,
-                        incumbent, vectorized, 6480);
-  RunGdnDecodeExactCase(37, DType::kBF16, DType::kBF16, true,
-                        incumbent, vectorized, 6490);
-}
-
 TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometry") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
@@ -3582,10 +3557,8 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
                       DType::kBF16);
   const auto g = RandomF32(static_cast<size_t>(n * hv), 6433, -0.5f, -0.01f);
   const auto beta = RandomF32(static_cast<size_t>(n * hv), 6434, 0.1f, 0.9f);
-  const auto state =
-      Pack(RandomF32(static_cast<size_t>(n * hv * dv * dk), 6435, -0.25f,
-                     0.25f),
-           DType::kBF16);
+  const auto state = RandomF32(static_cast<size_t>(n * hv * dv * dk), 6435,
+                               -0.25f, 0.25f);
 
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
@@ -3596,7 +3569,7 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
   DeviceTensor dvt(gpu, gq.q, DType::kBF16, {n, hv, dv}, v.data());
   DeviceTensor dg(gpu, gq.q, DType::kF32, {n, hv}, g.data());
   DeviceTensor dbeta(gpu, gq.q, DType::kF32, {n, hv}, beta.data());
-  DeviceTensor dst(gpu, gq.q, DType::kBF16, {n, hv, dv, dk}, state.data());
+  DeviceTensor dst(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, state.data());
   DeviceTensor dout(gpu, gq.q, DType::kBF16, {n, hv, dv});
   gpu.Synchronize(gq.q);
 
@@ -3604,40 +3577,33 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
     const char* bv_env;
     const char* swizzle_env;
     const char* regstate_env;
-    const char* vecstore_env;
     bool register_state;
-    bool vector_writeback;
     unsigned grid_x;
     unsigned block_x;
     unsigned shared_bytes;
   };
   constexpr ExpectedGeometry cases[] = {
-      {nullptr, "1", "1", "1", false, false, 4, 256, 17536},
-      {"16", "0", "1", "1", false, false, 8, 128, 9280},
-      {"16", "1", "0", "1", false, false, 8, 128, 9728},
-      {"16", "1", "1", "0", true, false, 8, 128, 9728},
-      {"16", "1", "1", "1", true, true, 8, 128, 9728},
-      {"16", "1", "1", "1x", true, false, 8, 128, 9728},
-      {"16", "1", "1x", "1", false, false, 8, 128, 9728},
-      {"16", "1x", "1", "1", false, false, 8, 128, 9280},
-      {"32", "1", "1", "1", false, false, 4, 256, 17536},
+      {nullptr, "1", "1", false, 4, 256, 17536},
+      {"16", "0", "1", false, 8, 128, 9280},
+      {"16", "1", "0", false, 8, 128, 9728},
+      {"16", "1", "1", true, 8, 128, 9728},
+      {"16", "1", "1x", false, 8, 128, 9728},
+      {"16", "1x", "1", false, 8, 128, 9280},
+      {"32", "1", "1", false, 4, 256, 17536},
   };
   const cudaStream_t stream = static_cast<cudaStream_t>(gq.q.handle);
   setenv("VT_GDN_DECODE_NW", "8", 1);
   void* shared_production_function = nullptr;
-  void* register_production_function = nullptr;
   for (const auto& expected : cases) {
     CAPTURE(expected.bv_env == nullptr ? "<unset>" : expected.bv_env);
     CAPTURE(expected.swizzle_env);
     CAPTURE(expected.regstate_env);
-    CAPTURE(expected.vecstore_env);
     if (expected.bv_env == nullptr)
       unsetenv("VT_GDN_DECODE_BV");
     else
       setenv("VT_GDN_DECODE_BV", expected.bv_env, 1);
     setenv("VT_GDN_DECODE_SWIZZLE", expected.swizzle_env, 1);
     setenv("VT_GDN_DECODE_REGSTATE", expected.regstate_env, 1);
-    setenv("VT_GDN_DECODE_BF16_VECSTORE", expected.vecstore_env, 1);
     CudaGraphGuard captured;
     REQUIRE(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) ==
             cudaSuccess);
@@ -3667,15 +3633,6 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
       REQUIRE(shared_production_function != nullptr);
       CHECK(params.func != shared_production_function);
     }
-    if (expected.register_state && !expected.vector_writeback &&
-        std::string(expected.regstate_env) == "1" &&
-        std::string(expected.vecstore_env) == "0") {
-      register_production_function = params.func;
-    }
-    if (expected.vector_writeback) {
-      REQUIRE(register_production_function != nullptr);
-      CHECK(params.func != register_production_function);
-    }
     CHECK(params.gridDim.x == expected.grid_x);
     CHECK(params.gridDim.y == static_cast<unsigned>(n * hv));
     CHECK(params.gridDim.z == 1);
@@ -3685,7 +3642,6 @@ TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometr
     CHECK(params.sharedMemBytes == expected.shared_bytes);
   }
   unsetenv("VT_GDN_DECODE_REGSTATE");
-  unsetenv("VT_GDN_DECODE_BF16_VECSTORE");
   unsetenv("VT_GDN_DECODE_SWIZZLE");
   unsetenv("VT_GDN_DECODE_BV");
   unsetenv("VT_GDN_DECODE_NW");
