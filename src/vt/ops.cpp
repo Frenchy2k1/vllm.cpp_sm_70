@@ -4,6 +4,10 @@
 #include <array>
 #include <vector>
 
+// CheckConvCommon asks the BACKEND whether it can address a compressed
+// conv_state in place, rather than naming a device type.
+#include "vt/backend.h"
+
 namespace vt {
 
 namespace {
@@ -1574,10 +1578,19 @@ void CheckConvCommon(const Queue& q, const Tensor& out, const Tensor& x, const T
            std::string(name) + ": conv_state must be [N,C,(K-1)+num_spec>=K-1]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
+  // bf16 conv_state is admitted wherever the BACKEND says its conv kernels can
+  // address a compressed row in place (Backend::SupportsCompressedConvState) —
+  // CUDA and Vulkan today. Asking the backend rather than naming a device is
+  // what keeps this shared op layer device-agnostic; the alternative for a
+  // backend that answers false is the caller's f32 gather/compute/scatter, which
+  // is still exactly what CPU does.
+  const Backend* conv_backend = TryGetBackend(q.device.type);
   VT_CHECK(conv_state.dtype == DType::kF32 ||
-               (conv_state.dtype == DType::kBF16 && q.device.type == DeviceType::kCUDA),
+               (conv_state.dtype == DType::kBF16 && conv_backend != nullptr &&
+                conv_backend->SupportsCompressedConvState()),
            std::string(name) +
-               ": conv_state must be f32, or bf16 on CUDA (in/out, in place; bf16 = "
+               ": conv_state must be f32, or bf16 on a backend whose conv kernels "
+               "support a compressed state in place (in/out, in place; bf16 = "
                "vLLM default mamba_cache_dtype, read/written in f32 registers)");
   // out/weight/conv_state stay fully contiguous. x may be a padded-row
   // (inner-contiguous, outer stride >= C) view: the merged qkvz projection feeds
