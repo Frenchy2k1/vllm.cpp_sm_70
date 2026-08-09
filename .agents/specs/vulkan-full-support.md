@@ -327,6 +327,88 @@ the umbrella, not a substitute for them.
 | **VK-H** | **Attention variants + samplers** (16 ops) | B (samplers), G (attn variants) | **83/83 — closes the op surface** |
 | **VK-I** | **AMD/RDNA (or Arc) bring-up** | hardware acquisition | The staging path for non-host-visible memory, and the gate re-run where Vulkan actually matters |
 
+### 6.0b The DECODE GEMV lever, measured to its floor — 2026-08-09
+
+`row/BACKEND-VULKAN-GEMVROWS`. `vt_matmul_vec` is 89-90% of 27B decode GPU time
+and moves ~52 GB of bf16 weights per token, so it was the largest single line
+item left. This section records what was found in it, including the two negative
+results, because the useful output of this row is mostly the CLOSING of a lever.
+
+**The two candidates**, both structural differences against llama.cpp's
+`mul_mat_vec` at pin `237ad9b96`:
+
+1. **Rows per workgroup** (`NUM_ROWS`, `mul_mat_vec_base.glsl:90`, set per vendor
+   by `rm_stdq` in `ggml-vulkan.cpp:4705-4719`): compute 2 or 4 output elements
+   per workgroup so one loaded activation element feeds several weight rows.
+2. **Wide loads** (`data_b_v4` / `dequantize4_2aligned`,
+   `dequant_funcs.glsl:54-61`): read four 16-bit elements per load instead of one.
+
+Neither can reduce DRAM traffic and neither was claimed to. The weights are read
+exactly once per token at any row count, and a 32-lane subgroup covers the same
+contiguous bytes at any load width. Row count buys activation-re-read locality and
+memory-level parallelism; load width buys fewer LOAD INSTRUCTIONS.
+
+**Isolated sweep** (`benchmarks/vulkan_gemv_ab.cpp`, the seven (k, n) shapes the
+27B actually dispatches, 9 arms x 4 rotated passes, each arm paired against the
+baseline measured IN THE SAME PASS because the box drifted 15.5% peak-to-peak
+between passes):
+
+| | pack 0 | pack 1 (4 B) | pack 2 (8 B) |
+|---|---|---|---|
+| rows 1 | 1.000x | 1.025x | **1.086x** |
+| rows 2 | 0.966x | 1.017x | 1.047x |
+| rows 4 | 0.968x | 1.014x | 1.039x |
+
+**Real 27B decode**, two-length GPU-timestamp diff (output-len 36 minus 4, over 32
+decode tokens, so prefill and one-time cost cancel), run TWICE with the arm order
+reversed the second time:
+
+| | block 1 pack 0 | block 1 pack 2 | block 2 pack 0 | block 2 pack 2 |
+|---|---|---|---|---|
+| `vt_matmul_vec` ms/token | 211.99 | 209.52 | 214.59 | 210.38 |
+| GB/s of the 273 roof | 90.0% | 91.1% | 88.9% | 90.7% |
+| speedup | | **1.012x** | | **1.020x** |
+
+**THE ISOLATED SWEEP OVERSTATED THE WIN BY ABOUT SEVEN TIMES, and the reason is
+the regime.** The sweep re-reads one 356 MB weight buffer 320 times, so its DRAM
+rows and TLB entries stay hot and instruction issue becomes visible as a secondary
+constraint. Decode streams 50 GB of distinct weights once per token, where DRAM is
+the whole story and a quarter as many load instructions buys ~1%. This is the
+campaign's regime lesson running in the opposite direction from the recorded case:
+a WIN can be an artefact of the measuring regime exactly as a discard can be.
+
+**Rows per workgroup is a MEASURED LOSS on GB10** (0.966x at 2, 0.968x at 4, in
+every pass and at every load width) and ships off. The axis is kept because
+llama.cpp raises `rm_stdq` precisely on the AMD GCN and Intel parts `VK-I` is
+about, so deleting it would mean rediscovering it there.
+
+**End-to-end**, order-alternated AB/BA pairs, page cache dropped before every
+leg, two blocks (6 + 8 pairs). Eight of the 28 legs landed in the `lm_head` slow
+mode described below (5 baseline, 3 pack=2, so arm-symmetric) and are reported
+separately rather than dropped; of the six pairs where BOTH legs were clean,
+pack=2 wins **5**, median paired ratio **1.0064x**. Clean-leg medians
+**242.38 -> 240.54 ms**, decode **4.126 -> 4.157 tok/s**. The measured noise floor
+on the clean legs is **0.88%** peak-to-peak on the baseline arm and 1.92% on the
+other, so a 0.7% effect sits AT the edge of what an e2e wall clock can resolve
+here; the GPU-timestamp two-length diff is the instrument that resolves it, and
+the two agree.
+
+**VERDICT: the GEMV lever is CLOSED.** The kernel was already at 90% of the
+bandwidth roof before this row and is at 91% after. The gap to llama.cpp Vulkan's
+229.9 ms/token is not in this kernel: the GEMV alone is 210 ms of our ~246, and
+even a perfect kernel would leave at most ~20 ms. The remaining work is the
+~35 ms/token of non-GEMV cost.
+
+**SIDE FINDING, and it is worth more than this row's 1%.** The ~1.8x bimodal
+decode legs this box produces, which the previous row discarded as environmental,
+are **`vt_matmul` (the `lm_head`, NN orientation) collapsing by 19.5x**: measured
+12.35 ms/token in the fast mode and **242.12 ms/token** in the slow one, in the
+same two-length diff, while `vt_matmul_vec` moved only 1.2% between the two legs.
+TTFT is unchanged across the modes, so it is neither load nor prefill. At 2.54 GB
+of `lm_head` weights that is 205 GB/s versus 10.5 GB/s. Whatever selects that
+state is worth more than every remaining kernel lever combined, and it belongs to
+whoever owns `lm_head`.
+
 ### 6.0a `VK-G` partial: the FUSED ATTN PREAMBLE landed — 2026-08-09
 
 `row/BACKEND-VULKAN-QKNORM`. `kAttnQkNormRopeGate` — gemma-RMSNorm(q) +
