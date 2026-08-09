@@ -17,56 +17,29 @@
 //
 // COMPILE/RUNTIME GATING mirrors the mmla tier: compiled with +i8mm for one TU
 // (CMakeLists), body guarded by `__aarch64__ && __ARM_FEATURE_MATMUL_INT8`, and
-// handed out at runtime only when HWCAP2_I8MM is set and VT_CPU_QUANT_REPACK is
-// not disabled. Off i8mm aarch64 the stubs make QuantRepackActive() false, so
-// the loader never repacks and this code is never reached.
+// handed out at runtime only after the shared Linux HWCAP/HWCAP2 or Darwin
+// sysctl detector proves i8mm+DotProd. VT_CPU_QUANT_REPACK can force portable
+// or i8mm; forcing i8mm on unsupported hardware fails before these instructions
+// can execute. Off i8mm aarch64 the loader never repacks.
 #include "vt/quant.h"
 
 #if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
 
 #include <arm_neon.h>
 
-#if defined(__linux__)
-#include <asm/hwcap.h>
-#include <sys/auxv.h>
-#elif defined(__APPLE__)
-#include <sys/sysctl.h>
-#endif
-
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "cpu_quant_blocks.h"
 #include "cpu_quant_repack.h"
 #include "cpu_threadpool.h"
+#include "vt/cpu/cpu_isa_arm.h"
 #include "vt/tensor.h"
-
-#ifndef HWCAP2_I8MM
-#define HWCAP2_I8MM (1 << 13)
-#endif
 
 namespace vt::cpu {
 namespace {
-
-// Runtime i8mm detection is OS-specific: Linux exposes it through the aux
-// vector, Darwin through sysctl. The compile-time __ARM_FEATURE_MATMUL_INT8
-// gate above only says the compiler MAY emit i8mm - the running core still
-// has to confirm it.
-bool CpuHasI8mm() {
-#if defined(__linux__)
-  return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
-#elif defined(__APPLE__)
-  int v = 0;
-  size_t sz = sizeof(v);
-  if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &v, &sz, nullptr, 0) != 0) {
-    return false;
-  }
-  return v != 0;
-#else
-  return false;
-#endif
-}
 
 }  // namespace
 
@@ -199,11 +172,12 @@ void GemvRowQ8_0(float* s_row, const BlockQ8_0x4* wgroups,
 bool QuantRepackActive() {
   static const bool v = [] {
     const char* e = std::getenv("VT_CPU_QUANT_REPACK");
-    if (e != nullptr && (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0 ||
-                         std::strcmp(e, "false") == 0)) {
-      return false;
-    }
-    return CpuHasI8mm();
+    bool enabled = false;
+    std::string error;
+    VT_CHECK(ResolveArmIsaToggle(DetectArmIsaCaps(), ArmIsaTier::kI8mm,
+                                e == nullptr ? "auto" : e, &enabled, &error),
+             error);
+    return enabled;
   }();
   return v;
 }

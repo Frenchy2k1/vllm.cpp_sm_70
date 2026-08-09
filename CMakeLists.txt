@@ -28,6 +28,9 @@ option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
 # deviation, NOT a compute/ML dependency (consistent with the no-pytorch/no-ggml
 # rule).
 option(VLLM_CPP_SERVER "Build the OpenAI HTTP server (needs third_party/httplib/httplib.h)" ON)
+option(VLLM_CPP_LITERAL_STATIC
+  "Link the CPU-only server as a literal static executable (experimental musl release lane only)"
+  OFF)
 if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib/httplib.h")
   message(WARNING "VLLM_CPP_SERVER=ON but third_party/httplib/httplib.h is missing; "
     "disabling the server target. Vendor cpp-httplib to enable it.")
@@ -113,10 +116,10 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 build-supported — they need a real fp16/non-tensor-core kernel
 #                 body, a scoped follow-up. See backend-matrix.md
 #                 BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and §W10.
-# A cross-FAMILY FAT list (e.g. "90a;121a") resolves its features honestly but
-# does NOT compile — the sources are gencode'd for the whole list, so the sm12x
-# fp4 PTX is rejected on compute_90a; per-source gencode narrowing (spec W7) is
-# what a fat cross-family binary needs. See .agents/specs/cuda-arch-additivity.md.
+# Cross-family fat lists use release-W1 per-source gencode: portable TUs receive
+# every requested target while feature TUs receive their exact feature-table
+# intersection. The ten-SM archive gate below proves both the commands and the
+# linked cubins. See .agents/specs/release-binary-matrix.md W1.
 set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"
@@ -920,6 +923,8 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
+  src/vt/cpu/cpu_isa_arm.cpp
+  src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
@@ -974,16 +979,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  # The portable Q8 DotProd C++ tier is valid on Linux and Darwin. Compile only
+  # its TU with DotProd enabled; runtime entry is gated by Linux HWCAP or Darwin
+  # sysctl. The separately scheduled A76 assembly remains Linux-only below.
+  set_source_files_properties(
+    src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
+    COMPILE_DEFINITIONS VT_CPU_ARM_Q8_DOT=1
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
   # KERNEL-CPU-A76-Q8-DOT is Linux-only because its dispatch uses HWCAP/MIDR
   # and the hand-written file carries ELF assembler directives. Other arm64
   # platforms compile the generic stub and retain their existing portable tier.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(ASM)
     target_sources(vllm PRIVATE src/vt/cpu/cpu_quant_dot_a76.S)
-    set_source_files_properties(
-      src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
-      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1
-      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
+    set_property(SOURCE src/vt/cpu/cpu_quant_dot_sdot.cpp APPEND PROPERTY
+      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1)
   endif()
   # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this
@@ -1803,6 +1813,74 @@ if(VLLM_CPP_CUDA)
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-DFLASH_NAMESPACE=flash;-include;${_FA2_ROOT}/fa2_compat_prelude.h;-isystem;${_FA2_ROOT}/src;-isystem;${_FA2_ROOT}/stubs;-isystem;${VLLM_CPP_CUTLASS_DIR}/include>")
     message(STATUS "FlashAttention-2 prefill/decode: ENABLED for arch(es) [${VT_FA2_ARCHS}] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)")
   endif()
+
+  # RELEASE W1: CMake's target-wide CUDA_ARCHITECTURES property would compile
+  # every CUDA TU for every requested SM, including architecture-specific
+  # CUTLASS/Marlin/FA2 bodies that ptxas rejects outside their feature-table
+  # cells. Disable target-wide emission for libvllm and give every CUDA source
+  # exactly one explicit gencode set: portable sources receive the complete
+  # requested list, feature sources receive only their resolved intersection.
+  # This mirrors vLLM's set_gencode_flags_for_srcs rather than inventing a
+  # release-only compilation path.
+  set_property(TARGET vllm PROPERTY CUDA_ARCHITECTURES OFF)
+  set(_VT_CUDA_FEATURE_SOURCES)
+
+  if(VT_FP4_MMA_ARCHS)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_nvfp4_sm12x.cu)
+    vt_cuda_set_source_gencode("${VT_FP4_MMA_ARCHS}"
+      src/vt/cuda/cuda_nvfp4_sm12x.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_nvfp4_sm12x.cu)
+  endif()
+
+  if(_NVFP4_CUTLASS_SOURCES)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_ARCHS}"
+      ${_NVFP4_CUTLASS_SOURCES})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_NVFP4_CUTLASS_SOURCES})
+  endif()
+  if(_FP8_CUTLASS_SOURCES)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_FP8_ARCHS}"
+      ${_FP8_CUTLASS_SOURCES})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_FP8_CUTLASS_SOURCES})
+  endif()
+  if(VLLM_CPP_CUTLASS_NVFP4_SM100)
+    vt_cuda_set_source_gencode("${VT_CUTLASS_NVFP4_SM100_ARCHS}"
+      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_matmul_nvfp4_sm100.cu)
+  endif()
+  if(VLLM_CPP_SCALEDMM_C3X_SM90)
+    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM90_ARCHS}"
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+  endif()
+  if(VLLM_CPP_SCALEDMM_C3X_SM100)
+    vt_cuda_set_source_gencode("${VT_SCALEDMM_C3X_SM100_ARCHS}"
+      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+  endif()
+  if(_MARLIN_SRCS)
+    vt_cuda_set_source_gencode("${VT_MARLIN_NVFP4_ARCHS}" ${_MARLIN_SRCS})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_MARLIN_SRCS})
+  endif()
+  if(_FA2_KERNEL_SRCS)
+    set(_VT_FA2_SOURCES
+      src/vt/cuda/cuda_flash_attn_fa2.cu
+      ${_FA2_KERNEL_SRCS})
+    vt_cuda_set_source_gencode("${VT_FA2_ARCHS}" ${_VT_FA2_SOURCES})
+    list(APPEND _VT_CUDA_FEATURE_SOURCES ${_VT_FA2_SOURCES})
+  endif()
+
+  get_target_property(_VT_VLLM_TARGET_SOURCES vllm SOURCES)
+  set(_VT_CUDA_PORTABLE_SOURCES ${_VT_VLLM_TARGET_SOURCES})
+  list(FILTER _VT_CUDA_PORTABLE_SOURCES INCLUDE REGEX "\\.cu$")
+  list(REMOVE_ITEM _VT_CUDA_PORTABLE_SOURCES ${_VT_CUDA_FEATURE_SOURCES})
+  vt_cuda_set_source_gencode("${VLLM_CPP_CUDA_ARCHITECTURES}"
+    ${_VT_CUDA_PORTABLE_SOURCES})
+  message(STATUS
+    "CUDA per-source gencode: ${VLLM_CPP_CUDA_ARCHITECTURES} portable; "
+    "feature TUs narrowed by VT_CUDA_FEATURE_TABLE")
 endif()
 
 # OpenAI HTTP server (M3.1 Task 4): the api_server.cpp translation unit pulls in

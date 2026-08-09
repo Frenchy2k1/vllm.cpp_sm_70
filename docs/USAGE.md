@@ -95,13 +95,131 @@ running. Any other dtype fails at load with a message naming what it saw.
 
 ## OpenAI-compatible server
 
-`server` is a small HTTP server speaking the OpenAI API. Source:
+`vllm-server` is a small HTTP server speaking the OpenAI API. Source:
 [`examples/server/main.cpp`](../examples/server/main.cpp) and
 [`src/vllm/entrypoints/openai/`](../src/vllm/entrypoints/openai/).
 
 ```sh
-build/examples/server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
+build/examples/vllm-server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
 ```
+
+The install component and deterministic archive target both stage from install
+rules rather than copying the build tree:
+
+```sh
+cmake --build build --target vllm-server-stage
+cmake --build build --target vllm-server-archive
+build/release/stage/bin/vllm-server --help
+```
+
+The basic CMake archive under `build/release/` includes the version, configured
+backend, OS, and host architecture in its name. It is a developer package. The
+release workflow separately produces host-ABI-specific archives with a
+manifest, `VERSION`, SPDX SBOM, notices, licenses, and detached checksum and
+provenance sidecars; no release download is claimed until that workflow has
+completed on a release tag.
+
+To reproduce the W1 heterogeneous CUDA archive candidate, configure the exact
+release architecture set. Portable translation units compile for all ten SMs;
+architecture-specific kernels compile only for their supported intersection:
+
+```sh
+cmake -S . -B build-cuda-fat -G Ninja \
+  -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
+  -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_TRITON=OFF
+cmake --build build-cuda-fat --target vllm
+python3 scripts/check-cuda-fat-gencode.py \
+  --compile-commands build-cuda-fat/compile_commands.json \
+  --library build-cuda-fat/libvllm.a
+```
+
+The release workflow applies this audit to independently linked x86_64 and
+arm64 host executables, packages each as a preview `cuda-fat` archive, and then
+runs the extracted-archive validator. Each archive must contain all ten SM
+images and the six available exact-SM Triton AOT namespaces; the manifest keeps
+runtime evidence separate per SM. These build-only preview candidates are not
+a downloadable release claim until the tagged workflow publishes them.
+
+The complete primary download matrix and its runtime boundaries are documented
+in [RELEASES.md](RELEASES.md). A manual workflow dispatch runs all eight tuples
+without publication. An exact version tag runs the same build, produces
+`release-index.json` and `RELEASE_INDEX.md` from the verified archive manifests,
+attests the archive bytes, and publishes every archive/checksum/provenance
+triplet through the protected release environment.
+
+### Selecting an x86 CPU ISA tier
+
+The x86_64 CPU library is one adaptive binary: portable, SSE2,
+SSE2+F16C, AVX2, and AVX-512 elementwise matmul kernels are isolated in their
+own translation units and selected only after CPUID plus the required XCR0 OS
+state are checked. Leave `VT_CPU_MATMUL_TIER` unset for automatic selection, or
+set it to `portable`, `sse2`, `sse2+f16c`, `avx2`, or `avx512` for a same-binary
+correctness/performance check. A forced tier that the current CPU or OS cannot
+execute fails closed instead of silently narrowing or risking an illegal
+instruction. Release builds never use `-march=native`.
+
+On arm64, leave the same variable unset to select between portable and NEON
+elementwise matmul, or force `portable`/`neon`. DotProd and i8mm kernels are
+independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
+`VT_CPU_QUANT_REPACK`; `auto` uses Linux HWCAP/HWCAP2 or Darwin feature sysctls,
+while an unavailable forced tier fails closed. The exact accepted values are
+listed in [ENVIRONMENT.md](ENVIRONMENT.md).
+
+### Validating a staged release archive
+
+Release verification reads only a freshly extracted archive, never files from
+the build tree. Pass the archive together with its final-byte SHA256 and SLSA
+provenance sidecars:
+
+```sh
+python3 scripts/validate-release-archive.py \
+  --archive vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz \
+  --checksum vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.sha256 \
+  --provenance vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.provenance.json \
+  --forbid-path "$PWD/build"
+```
+
+The validator checks the content allowlist, executable and host ABI, manifest,
+`VERSION`, SPDX SBOM, licenses, ELF dependencies and RPATH/RUNPATH, extracted
+`--help`/`--version` smokes, and backend-specific CUDA or adaptive-CPU claims.
+The digest and provenance are sidecars because both describe the final archive
+bytes; placing either inside those bytes would create a self-reference.
+
+The CPU release helper is the reproducible entry point used by CI. It requires
+an explicit artifact tuple, architecture, channel, build directory, libc ABI,
+and a QEMU userspace emulator. The gate executes every compiled tier under a
+feature-rich CPU model, then executes the baseline and proves rich-tier refusal
+under a feature-poor model before metadata can be generated:
+
+```sh
+SOURCE_SHA=$(git rev-parse HEAD) \
+VERSION=0.0.1 \
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) \
+EVIDENCE_URL=https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE \
+scripts/build-cpu-release.sh \
+  linux-x86_64-glibc-cpu x86_64 stable build-release-cpu-x86 \
+  2.39 /usr/bin/qemu-x86_64
+```
+
+The corresponding arm64 tuple is `linux-aarch64-glibc-cpu`. The only literal
+static tuple is the CPU-only `linux-x86_64-musl-cpu-static` experiment; normal
+CPU and accelerator archives are static-core bundles with audited host runtime
+dependencies.
+
+To exercise the release pipeline without publishing anything, trigger its
+manual entry point:
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+Manual runs are always dry runs. Publication additionally requires an exact
+`v<project-version>` tag, a release matrix whose required lanes are all marked
+ready, successful verification and attestation jobs, and approval of the
+protected `release` environment. Build and verification jobs have read-only
+repository permissions; only attestation receives OIDC authority, and only the
+final protected job receives `contents: write`.
 
 Any OpenAI client works by pointing its `base_url` at it:
 

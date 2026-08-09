@@ -1,0 +1,18 @@
+{
+  "artifacts": [
+    {"channel": "stable", "id": "linux-x86_64-glibc-cpu", "required": true},
+    {"channel": "stable", "id": "linux-aarch64-glibc-cpu", "required": true},
+    {"channel": "experimental-preview", "id": "linux-x86_64-musl-cpu-static", "required": true},
+    {"channel": "preview", "id": "linux-x86_64-glibc-cuda-fat", "required": true},
+    {"channel": "preview", "id": "linux-aarch64-glibc-cuda-fat", "required": true},
+    {"channel": "stable", "id": "macos-arm64-metal", "required": true},
+    {"channel": "preview", "id": "macos-arm64-metal-mlx", "required": true},
+    {"channel": "preview", "id": "linux-x86_64-glibc-vulkan", "required": true}
+  ],
+  "release_ready": true,
+  "retention": {
+    "ci_artifacts_days": 7,
+    "github_release": "maintainer-deletion-only"
+  },
+  "schema": "vllm.cpp.release-matrix.v1"
+}

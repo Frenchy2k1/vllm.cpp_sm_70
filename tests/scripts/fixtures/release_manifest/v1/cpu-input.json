@@ -1,5 +1,6 @@
 {
   "artifact": {
+    "c_abi_version": 17,
     "channel": "preview",
     "id": "linux-x86_64-glibc-cpu",
     "kind": "primary",
@@ -15,6 +16,7 @@
       "VLLM_CPP_CUDA_ARCHITECTURES": [],
       "VLLM_CPP_HIP": false,
       "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_LITERAL_STATIC": false,
       "VLLM_CPP_METAL": false,
       "VLLM_CPP_MLX": false,
       "VLLM_CPP_SERVER": true,
@@ -34,6 +36,7 @@
       "VLLM_CPP_CUDA_ARCHITECTURES": [],
       "VLLM_CPP_HIP": false,
       "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_LITERAL_STATIC": false,
       "VLLM_CPP_METAL": false,
       "VLLM_CPP_MLX": false,
       "VLLM_CPP_SERVER": true,
@@ -107,7 +110,8 @@
           "avx",
           "avx2",
           "f16c",
-          "osxsave"
+          "osxsave",
+          "sse2"
         ],
         "required_os_state": [
           "xcr0:xmm",
@@ -128,8 +132,13 @@
         "name": "avx512f",
         "required_cpu_bits": [
           "avx",
+          "avx2",
+          "avx512bw",
           "avx512f",
-          "osxsave"
+          "avx512vl",
+          "f16c",
+          "osxsave",
+          "sse2"
         ],
         "required_os_state": [
           "xcr0:xmm",
