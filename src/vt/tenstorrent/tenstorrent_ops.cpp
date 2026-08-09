@@ -48,6 +48,7 @@
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
+#include <ttnn/operations/data_movement/concat/concat.hpp>
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -619,25 +620,151 @@ inline double Llama3ScaleFreq(double freq, const RopeArgs& a) {
   return (1.0 - smooth) * freq / sf + smooth * freq;
 }
 
-// In-place NeoX rotation of one head (cpu_ops RopeRotateHead).
-void RopeRotateHead(Tensor& t, int64_t head_off, int rot, double base, int64_t pos,
-                    const RopeArgs& args) {
-  const int half = rot / 2;
-  for (int i = 0; i < half; ++i) {
-    double freq = std::pow(base, -2.0 * static_cast<double>(i) / static_cast<double>(rot));
-    freq = Llama3ScaleFreq(freq, args);
-    const double angle = static_cast<double>(pos) * freq;
-    const float c = static_cast<float>(std::cos(angle));
-    const float s = static_cast<float>(std::sin(angle));
-    const float x = LoadElemF32(t, head_off + i);
-    const float y = LoadElemF32(t, head_off + i + half);
-    StoreElemF32(t, head_off + i, x * c - y * s);
-    StoreElemF32(t, head_off + i + half, x * s + y * c);
+// Expand per-token cos|sin [T, half] to per-(token,head) [T*H, half] for a
+// device NeoX apply over the flat [T*H, D] view of qs/ks.
+void ExpandCosSinPerHead(const float* cos_t, const float* sin_t, int64_t tokens,
+                         int64_t heads, int64_t half, std::vector<float>& cos_exp,
+                         std::vector<float>& sin_exp) {
+  cos_exp.resize(static_cast<size_t>(tokens * heads * half));
+  sin_exp.resize(static_cast<size_t>(tokens * heads * half));
+  for (int64_t t = 0; t < tokens; ++t) {
+    for (int64_t h = 0; h < heads; ++h) {
+      const size_t dst = static_cast<size_t>((t * heads + h) * half);
+      const size_t src = static_cast<size_t>(t * half);
+      std::memcpy(cos_exp.data() + dst, cos_t + src, static_cast<size_t>(half) * sizeof(float));
+      std::memcpy(sin_exp.data() + dst, sin_t + src, static_cast<size_t>(half) * sizeof(float));
+    }
   }
 }
 
-// kRopeNeox: default Qwen3-dense RoPE (cpu_ops RopeNeoxKernel). Host-staged
-// f32 math with dtype storeback — same contract as Metal M3b / CPU.
+// Device NeoX apply: view [T,H,D] as [T*H,D], rotate leading `rot` cols via
+// slice + mul/sub/add + concat. Reuses EnsureDevice2D so a prior RmsNorm on the
+// [T*H,D] view leaves the shadow resident (no re-upload). BF16 tile path.
+void RopeApplyDeviceNeox(Tensor& x3, const float* cos_t, const float* sin_t,
+                         int64_t tokens, int64_t heads, int64_t d, int64_t rot,
+                         MeshDevice& device) {
+  VT_CHECK(x3.rank == 3 && x3.IsContiguous() && x3.shape[0] == tokens &&
+               x3.shape[1] == heads && x3.shape[2] == d,
+           "tenstorrent device rope: rank-3 contiguous [T,H,D]");
+  VT_CHECK(rot > 0 && (rot % 2) == 0 && rot <= d, "tenstorrent device rope: rotary_dim");
+  const int64_t half = rot / 2;
+  const int64_t th = tokens * heads;
+  Tensor x_mat = x3.View({th, d});
+  ttnn::Tensor dev_x = EnsureDevice2D(x_mat, device);
+
+  std::vector<float> cos_exp, sin_exp;
+  ExpandCosSinPerHead(cos_t, sin_t, tokens, heads, half, cos_exp, sin_exp);
+  const uint32_t thu = static_cast<uint32_t>(th);
+  const uint32_t halfu = static_cast<uint32_t>(half);
+  const uint32_t rotu = static_cast<uint32_t>(rot);
+  const uint32_t du = static_cast<uint32_t>(d);
+  ttnn::Tensor dev_cos = UploadRows(cos_exp.data(), thu, halfu, device);
+  ttnn::Tensor dev_sin = UploadRows(sin_exp.data(), thu, halfu, device);
+
+  // x1 = x[..., :half], x2h = x[..., half:rot]  (NeoX half-split)
+  ttnn::Tensor x1 = ttnn::slice(dev_x, ttsl::SmallVector<uint32_t>{0, 0},
+                                ttsl::SmallVector<uint32_t>{thu, halfu},
+                                ttsl::SmallVector<uint32_t>{1, 1});
+  ttnn::Tensor x2h = ttnn::slice(dev_x, ttsl::SmallVector<uint32_t>{0, halfu},
+                                 ttsl::SmallVector<uint32_t>{thu, rotu},
+                                 ttsl::SmallVector<uint32_t>{1, 1});
+  ttnn::Tensor o1 = ttnn::subtract(ttnn::multiply(x1, dev_cos), ttnn::multiply(x2h, dev_sin));
+  ttnn::Tensor o2 = ttnn::add(ttnn::multiply(x1, dev_sin), ttnn::multiply(x2h, dev_cos));
+  ttnn::Tensor rotated = ttnn::concat(std::vector<ttnn::Tensor>{o1, o2}, /*dim=*/1);
+  ttnn::Tensor out_dev;
+  if (rot == d) {
+    out_dev = std::move(rotated);
+  } else {
+    ttnn::Tensor tail = ttnn::slice(dev_x, ttsl::SmallVector<uint32_t>{0, rotu},
+                                    ttsl::SmallVector<uint32_t>{thu, du},
+                                    ttsl::SmallVector<uint32_t>{1, 1});
+    out_dev = ttnn::concat(std::vector<ttnn::Tensor>{rotated, tail}, /*dim=*/1);
+  }
+  CommitDevice2D(x_mat, std::move(out_dev));
+}
+
+// Gather per-token cos|sin from a [P, rot] cache via rank-1 positions.
+void GatherCosSinRows(const Tensor& cache, const Tensor& positions, int64_t tokens,
+                      int rot, std::vector<float>& cos_t, std::vector<float>& sin_t) {
+  EnsureHost(cache);
+  EnsureHost(positions);
+  const int64_t half = rot / 2;
+  cos_t.resize(static_cast<size_t>(tokens * half));
+  sin_t.resize(static_cast<size_t>(tokens * half));
+  for (int64_t t = 0; t < tokens; ++t) {
+    const int64_t position = positions.dtype == DType::kI32
+                                 ? static_cast<int64_t>(positions.Ptr<int32_t>()[t])
+                                 : positions.Ptr<int64_t>()[t];
+    VT_CHECK(position >= 0 && position < cache.shape[0],
+             "tenstorrent rope: position outside cache");
+    const int64_t cache_off = position * rot;
+    for (int64_t i = 0; i < half; ++i) {
+      cos_t[static_cast<size_t>(t * half + i)] = LoadElemF32(cache, cache_off + i);
+      sin_t[static_cast<size_t>(t * half + i)] =
+          LoadElemF32(cache, cache_off + half + i);
+    }
+  }
+}
+
+// Build per-token cos|sin from RopeNeox frequencies (double angles, f32 store).
+void BuildCosSinFromPositions(const Tensor& pos, int64_t tokens, int rot, double base,
+                              const RopeArgs& args, std::vector<float>& cos_t,
+                              std::vector<float>& sin_t) {
+  EnsureHost(pos);
+  const int64_t half = rot / 2;
+  cos_t.resize(static_cast<size_t>(tokens * half));
+  sin_t.resize(static_cast<size_t>(tokens * half));
+  for (int64_t t = 0; t < tokens; ++t) {
+    const int64_t p =
+        pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[t] : pos.Ptr<int64_t>()[t];
+    for (int64_t i = 0; i < half; ++i) {
+      double freq = std::pow(base, -2.0 * static_cast<double>(i) / static_cast<double>(rot));
+      freq = Llama3ScaleFreq(freq, args);
+      const double angle = static_cast<double>(p) * freq;
+      cos_t[static_cast<size_t>(t * half + i)] = static_cast<float>(std::cos(angle));
+      sin_t[static_cast<size_t>(t * half + i)] = static_cast<float>(std::sin(angle));
+    }
+  }
+}
+
+// Host NeoX/GPT-J apply from a precomputed cos|sin table. Fast path for short
+// decode: many tiny device launches (slice/mul/concat × q/k) lose to this.
+void RopeApplyHost(Tensor& qs, Tensor* ks, const float* cos_t, const float* sin_t,
+                   int64_t tokens, int64_t hq, int64_t hk, int64_t d, int rot,
+                   bool is_neox) {
+  EnsureHost(qs);
+  if (ks != nullptr) EnsureHost(*ks);
+  const int64_t half = rot / 2;
+  auto apply_one = [&](Tensor& x, int64_t heads) {
+    for (int64_t token = 0; token < tokens; ++token) {
+      for (int64_t pair = 0; pair < half; ++pair) {
+        const float c = cos_t[static_cast<size_t>(token * half + pair)];
+        const float s = sin_t[static_cast<size_t>(token * half + pair)];
+        const int64_t first = is_neox ? pair : pair * 2;
+        const int64_t second = is_neox ? pair + half : pair * 2 + 1;
+        for (int64_t head = 0; head < heads; ++head) {
+          const int64_t off = (token * heads + head) * d;
+          const float xv = LoadElemF32(x, off + first);
+          const float yv = LoadElemF32(x, off + second);
+          StoreElemF32(x, off + first, xv * c - yv * s);
+          StoreElemF32(x, off + second, xv * s + yv * c);
+        }
+      }
+    }
+  };
+  apply_one(qs, hq);
+  if (ks != nullptr) apply_one(*ks, hk);
+  CommitHost(qs);
+  if (ks != nullptr) CommitHost(*ks);
+}
+
+// Prefer device apply only when T*H is large enough that kernel launches amortize.
+// Short Qwen3 decode (T=1,H=16) is host-faster; long prefill benefits from device.
+inline bool PreferDeviceRope(int64_t tokens, int64_t heads) {
+  return tokens * heads >= 64;
+}
+
+// kRopeNeox: Qwen3-dense RoPE. Device NeoX for large [T*H]; host for short decode.
 void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const RopeArgs& args) {
   VT_CHECK(qs.rank == 3 && ks.rank == 3, "tenstorrent kRopeNeox: qs/ks rank-3");
   VT_CHECK(IsFloatDType(qs.dtype) && qs.dtype == ks.dtype,
@@ -652,24 +779,22 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
   const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
   VT_CHECK(ks.shape[0] == t && ks.shape[2] == d, "tenstorrent kRopeNeox: ks shape");
   VT_CHECK(pos.shape[0] == t, "tenstorrent kRopeNeox: positions length");
-  EnsureHost(qs);
-  EnsureHost(ks);
-  EnsureHost(pos);
-  const int rot = args.rotary_dim;
-  const double base = static_cast<double>(args.base);
-  for (int64_t i = 0; i < t; ++i) {
-    const int64_t p =
-        pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[i] : pos.Ptr<int64_t>()[i];
-    for (int64_t hh = 0; hh < hq; ++hh)
-      RopeRotateHead(qs, (i * hq + hh) * d, rot, base, p, args);
-    for (int64_t hh = 0; hh < hk; ++hh)
-      RopeRotateHead(ks, (i * hk + hh) * d, rot, base, p, args);
+
+  std::vector<float> cos_t, sin_t;
+  BuildCosSinFromPositions(pos, t, args.rotary_dim, static_cast<double>(args.base), args, cos_t,
+                           sin_t);
+  if (PreferDeviceRope(t, hq)) {
+    MeshDevice& device = SharedMeshDevice();
+    RopeApplyDeviceNeox(qs, cos_t.data(), sin_t.data(), t, hq, d, args.rotary_dim, device);
+    RopeApplyDeviceNeox(ks, cos_t.data(), sin_t.data(), t, hk, d, args.rotary_dim, device);
+  } else {
+    RopeApplyHost(qs, &ks, cos_t.data(), sin_t.data(), t, hq, hk, d, args.rotary_dim,
+                  /*is_neox=*/true);
   }
-  CommitHost(qs);
-  CommitHost(ks);
 }
 
 // kRopeCosSinCache: per-step cos|sin table [T, rot] (cpu_ops RopeCosSinCacheKernel).
+// Stays host — table is small and built once per step; apply is device.
 void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
                            const RopeArgs& args) {
   VT_CHECK(cos_sin.rank == 2 && cos_sin.dtype == DType::kF32 && cos_sin.IsContiguous(),
@@ -703,7 +828,9 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
 }
 
 // kRopeFromCache: apply precomputed cos|sin (cpu_ops RopeFromCacheKernel).
-// Rank-1 positions only (Qwen3-dense); mrope deferred.
+// Rank-1 positions only (Qwen3-dense); mrope deferred. DEFAULT Qwen3 path
+// (VT_QWEN3_ROPE_CACHE). Device NeoX when T*H is large; host for short decode
+// and GPT-J interleave.
 void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions,
                          const Tensor& cache, const RopeArgs& args) {
   VT_CHECK(qs.rank == 3 && IsFloatDType(qs.dtype) && qs.IsContiguous(),
@@ -719,51 +846,30 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions
            "tenstorrent kRopeFromCache: rotary_dim");
   const int64_t tokens = qs.shape[0];
   const int64_t hq = qs.shape[1];
+  const int64_t d = qs.shape[2];
   const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
   if (ks != nullptr) {
     VT_CHECK(ks->rank == 3 && ks->dtype == qs.dtype && ks->IsContiguous(),
              "tenstorrent kRopeFromCache: ks must match qs");
-    VT_CHECK(ks->shape[0] == tokens && ks->shape[2] == qs.shape[2],
+    VT_CHECK(ks->shape[0] == tokens && ks->shape[2] == d,
              "tenstorrent kRopeFromCache: ks shape");
   }
   VT_CHECK(positions.shape[0] == tokens, "tenstorrent kRopeFromCache: positions length");
-  EnsureHost(qs);
-  if (ks != nullptr) EnsureHost(*ks);
-  EnsureHost(positions);
-  EnsureHost(cache);
-  const int64_t half = args.rotary_dim / 2;
-  for (int64_t token = 0; token < tokens; ++token) {
-    for (int64_t pair = 0; pair < half; ++pair) {
-      const int64_t position = positions.dtype == DType::kI32
-                                   ? static_cast<int64_t>(positions.Ptr<int32_t>()[token])
-                                   : positions.Ptr<int64_t>()[token];
-      VT_CHECK(position >= 0 && position < cache.shape[0],
-               "tenstorrent kRopeFromCache: position outside cache");
-      const int64_t cache_off = position * args.rotary_dim;
-      const float c = LoadElemF32(cache, cache_off + pair);
-      const float s = LoadElemF32(cache, cache_off + half + pair);
-      const int64_t first = args.is_neox_style ? pair : pair * 2;
-      const int64_t second = args.is_neox_style ? pair + half : pair * 2 + 1;
-      for (int64_t head = 0; head < hq; ++head) {
-        const int64_t off = token * qs.stride[0] + head * qs.stride[1];
-        const float x = LoadElemF32(qs, off + first);
-        const float y = LoadElemF32(qs, off + second);
-        StoreElemF32(qs, off + first, x * c - y * s);
-        StoreElemF32(qs, off + second, x * s + y * c);
-      }
-      if (ks != nullptr) {
-        for (int64_t head = 0; head < hk; ++head) {
-          const int64_t off = token * ks->stride[0] + head * ks->stride[1];
-          const float x = LoadElemF32(*ks, off + first);
-          const float y = LoadElemF32(*ks, off + second);
-          StoreElemF32(*ks, off + first, x * c - y * s);
-          StoreElemF32(*ks, off + second, x * s + y * c);
-        }
-      }
+
+  std::vector<float> cos_t, sin_t;
+  GatherCosSinRows(cache, positions, tokens, args.rotary_dim, cos_t, sin_t);
+
+  if (args.is_neox_style && PreferDeviceRope(tokens, hq)) {
+    MeshDevice& device = SharedMeshDevice();
+    RopeApplyDeviceNeox(qs, cos_t.data(), sin_t.data(), tokens, hq, d, args.rotary_dim, device);
+    if (ks != nullptr) {
+      RopeApplyDeviceNeox(*ks, cos_t.data(), sin_t.data(), tokens, hk, d, args.rotary_dim,
+                          device);
     }
+    return;
   }
-  CommitHost(qs);
-  if (ks != nullptr) CommitHost(*ks);
+  RopeApplyHost(qs, ks, cos_t.data(), sin_t.data(), tokens, hq, hk, d, args.rotary_dim,
+                args.is_neox_style);
 }
 
 // kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
