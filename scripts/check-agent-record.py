@@ -1004,6 +1004,53 @@ def check_spec_location(errors: list[str]) -> None:
             errors.append(f"{path.relative_to(ROOT)}: feature spec/scoping file belongs in .agents/specs/")
 
 
+ISSUE_ROW = re.compile(
+    r"^\|\s*\[#(\d+)\]\((https://github\.com/[^)]+/issues/(\d+))\)\s*\|"
+    r"\s*(?:`([A-Z0-9][A-Za-z0-9_.-]*)`|—)\s*\|"
+)
+
+
+def check_issue_table(errors: list[str]) -> None:
+    """Every tracked issue is well-formed and its row link is consistent.
+
+    Deliberately NETWORK-FREE. Querying GitHub would make this gate fail on
+    connectivity, which is exactly the class of flake this protocol exists to
+    remove. It checks the FORM and the internal consistency; whether the issue
+    is still open is the agent's job at intake, not a CI blocker.
+    """
+
+    path = AGENTS / "roadmap_v1.md"
+    text = path.read_text(encoding="utf-8")
+    if "## Open issues" not in text:
+        errors.append(f"{path.relative_to(ROOT)}: missing the '## Open issues' intake table")
+        return
+
+    section = text.split("## Open issues", 1)[1].split("\n## ", 1)[0]
+    seen: set[str] = set()
+    rows = 0
+    for line in section.splitlines():
+        if not line.startswith("|") or line.startswith("| Issue") or set(line) <= set("|-: "):
+            continue
+        match = ISSUE_ROW.match(line)
+        if not match:
+            errors.append(
+                f"{path.relative_to(ROOT)}: malformed issue row {line[:60]!r}; "
+                "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
+            )
+            continue
+        rows += 1
+        number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
+        if number != url_number:
+            errors.append(
+                f"{path.relative_to(ROOT)}: issue #{number} links to {url}, a different issue"
+            )
+        if number in seen:
+            errors.append(f"{path.relative_to(ROOT)}: issue #{number} listed twice")
+        seen.add(number)
+    if rows == 0:
+        errors.append(f"{path.relative_to(ROOT)}: the open-issue table has no rows")
+
+
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
     path = AGENTS / "roadmap_v1.md"
     expected_blocks = [
@@ -1060,6 +1107,7 @@ def main() -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
+        check_issue_table(errors)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)

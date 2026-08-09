@@ -263,3 +263,77 @@ class MigratedLegacyLinks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IssueIntakeTable(unittest.TestCase):
+    """The roadmap issue table is the intake surface: no work without an issue.
+
+    The validator is deliberately NETWORK-FREE, so these mutations are all about
+    FORM and internal consistency. Whether an issue is still open is the agent's
+    job at intake; making CI ask GitHub would reintroduce exactly the kind of
+    connectivity flake this protocol was slimmed down to remove.
+    """
+
+    GOOD = (
+        "## Open issues\n\n"
+        "| Issue | Row | Title | Kind |\n"
+        "|---:|---|---|---|\n"
+        "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | x | bug |\n"
+        "| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | y | bug |\n"
+        "\n## Top-level portfolio\n"
+    )
+
+    def run_check(self, section):
+        import importlib.util
+
+        path = ROOT / ".agents/roadmap_v1.md"
+        original = path.read_text(encoding="utf-8")
+        try:
+            path.write_text(section, encoding="utf-8")
+            errors = []
+            checker.check_issue_table(errors)
+            return errors
+        finally:
+            path.write_text(original, encoding="utf-8")
+
+    def test_a_well_formed_table_passes(self):
+        self.assertEqual(self.run_check(self.GOOD), [])
+
+    def test_a_missing_table_is_rejected(self):
+        errors = self.run_check("# Roadmap\n\n## Top-level portfolio\n")
+        self.assertTrue(any("Open issues" in e for e in errors), errors)
+
+    def test_an_empty_table_is_rejected(self):
+        section = "## Open issues\n\n| Issue | Row | Title | Kind |\n|---:|---|---|---|\n\n## Top-level portfolio\n"
+        errors = self.run_check(section)
+        self.assertTrue(any("no rows" in e for e in errors), errors)
+
+    def test_a_bare_issue_number_without_a_link_is_rejected(self):
+        section = self.GOOD.replace(
+            "| [#85](https://github.com/mudler/vllm.cpp/issues/85) |", "| #85 |"
+        )
+        errors = self.run_check(section)
+        self.assertTrue(any("malformed issue row" in e for e in errors), errors)
+
+    def test_a_link_pointing_at_a_different_issue_is_rejected(self):
+        """The number and its URL must agree, or the table lies."""
+        section = self.GOOD.replace(
+            "[#201](https://github.com/mudler/vllm.cpp/issues/201)",
+            "[#201](https://github.com/mudler/vllm.cpp/issues/999)",
+        )
+        errors = self.run_check(section)
+        self.assertTrue(any("a different issue" in e for e in errors), errors)
+
+    def test_a_duplicated_issue_is_rejected(self):
+        section = self.GOOD.replace(
+            "\n## Top-level portfolio",
+            "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | — | dup | bug |\n"
+            "\n## Top-level portfolio",
+        )
+        errors = self.run_check(section)
+        self.assertTrue(any("listed twice" in e for e in errors), errors)
+
+    def test_the_tracked_roadmap_table_is_valid(self):
+        errors = []
+        checker.check_issue_table(errors)
+        self.assertEqual(errors, [])

@@ -161,8 +161,31 @@ def lifecycle_moves(paths: set[str], before: str, after: str) -> list[str]:
     return moves
 
 
-def measurement_changes(paths: set[str]) -> list[str]:
-    return sorted(paths & set(MEASUREMENT_RECORDS))
+MARKDOWN_LINK_TARGET = re.compile(r"\]\([^)]*\)")
+
+
+def claims_changed(before_text: str, after_text: str) -> bool:
+    """Whether a file's CLAIMS changed, ignoring pure link-target repairs.
+
+    Moving a file forces every document that links it to be edited. Those edits
+    assert nothing new, so treating them as claims makes structural work
+    impossible without a fake benchmark update -- which is precisely how the old
+    gate grew six hardcoded escape hatches. Normalising link TARGETS away (link
+    TEXT is preserved, so a reworded link still counts) keeps this general
+    instead of exempting named paths.
+    """
+
+    return MARKDOWN_LINK_TARGET.sub("]()", before_text) != MARKDOWN_LINK_TARGET.sub(
+        "]()", after_text
+    )
+
+
+def measurement_changes(paths: set[str], before: str, after: str) -> list[str]:
+    return sorted(
+        path
+        for path in paths & set(MEASUREMENT_RECORDS)
+        if claims_changed(blob(before, path), blob(after, path))
+    )
 
 
 def classify(paths: set[str], before: str, after: str) -> tuple[set[str], list[str]]:
@@ -175,7 +198,7 @@ def classify(paths: set[str], before: str, after: str) -> tuple[set[str], list[s
         classes.add("lifecycle")
         reasons.extend(moves)
 
-    measured = measurement_changes(paths)
+    measured = measurement_changes(paths, before, after)
     if measured:
         classes.add("lifecycle")
         reasons.extend(f"{path}: measurement recorded" for path in measured)
@@ -226,7 +249,11 @@ def errors_for(paths: set[str], before: str, after: str) -> list[str]:
             f"changed {detail} but did not update {', '.join(missing)}. {why}"
         )
 
-    if README in paths and "landing_page" not in classes:
+    if (
+        README in paths
+        and "landing_page" not in classes
+        and claims_changed(blob(before, README), blob(after, README))
+    ):
         errors.append(
             f"changed {README} without touching a landing source "
             f"({', '.join(sorted(LANDING_SOURCE_FILES))}). The README is the "
