@@ -269,6 +269,19 @@ class ReleasePipelineContract(unittest.TestCase):
         )
         self.assertNotIn("mlx.__file__", workflow)
         self.assertIn('d.locate_file("mlx")', workflow)
+        musl = self.checker.job_block(workflow, "cpu_musl")
+        self.assertIn(
+            "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)\n"
+            "          export SOURCE_DATE_EPOCH",
+            musl,
+        )
+        for job in ("cuda_x86", "cuda_arm64"):
+            with self.subTest(job=job):
+                block = self.checker.job_block(workflow, job)
+                self.assertIn(
+                    'git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+                    block,
+                )
 
     def test_security_critical_workflow_mutations_fail(self) -> None:
         original = WORKFLOW.read_text(encoding="utf-8")

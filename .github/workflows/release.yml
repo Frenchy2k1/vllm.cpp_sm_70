@@ -140,6 +140,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
           version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
           test "$version" = "$VERSION"
           docker run --rm \
@@ -186,6 +187,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
           scripts/build-linux-accelerator-release.sh \
@@ -225,6 +227,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
           scripts/build-linux-accelerator-release.sh \
