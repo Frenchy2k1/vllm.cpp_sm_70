@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
+
+# FIRST, before project() enables a compiler and before anything else can spend
+# minutes getting to a failure that names the wrong thing: an in-source `cmake .`
+# collides every examples/ executable with the source directory it was built
+# from and dies in the linker (issue #85). cmake/InSourceGuard.cmake explains
+# the collision; cmake/InSourceGuardTest.cmake pins when it fires.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+include(InSourceGuard)
+vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+
 project(vllm_cpp VERSION 0.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

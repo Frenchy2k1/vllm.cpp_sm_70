@@ -6,6 +6,22 @@ the reference behind it. Per-capability lifecycle state is
 [docs/STATUS.md](STATUS.md); measured numbers are
 [docs/BENCHMARKS.md](BENCHMARKS.md).
 
+## Building
+
+Full recipes are in [docs/BUILD.md](BUILD.md); the one rule worth stating here
+is that the build must be **out-of-source**. Every command on this page assumes
+a separate build directory:
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+```
+
+`cmake .` in the checkout is refused at configure time. It cannot work: the
+example targets are named after the directories they are built from, so an
+in-source build makes the linker write each executable over its own source
+directory (issue #85).
+
 ## Confirming which CUDA architecture a build targets
 
 `CMakeCache.txt` is now a reliable answer. Configuring with

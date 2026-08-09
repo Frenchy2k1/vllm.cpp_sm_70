@@ -6,6 +6,19 @@ dependencies; the OpenAI server uses a vendored header-only HTTP transport
 (cpp-httplib). The [README](../README.md) carries the two-line quickstart; this
 page is the full build reference.
 
+## Build out-of-source
+
+Every recipe on this page configures into a separate build directory, and that
+is a requirement, not a style preference: the example targets are named after
+the directories they are built from (`examples/tokenize` builds `tokenize`,
+`examples/dump_container` builds `dump_container`, ...), so `cmake .` asks the
+linker to write each executable on top of its own source directory and fails
+with `cannot open output file <target>: Is a directory` (issue #85).
+
+Configure refuses an in-source build up front and says so. If an earlier attempt
+already wrote into the checkout, clear it with
+`rm -rf CMakeCache.txt CMakeFiles`.
+
 ## CPU build (the correctness / CI reference)
 
 ```sh
