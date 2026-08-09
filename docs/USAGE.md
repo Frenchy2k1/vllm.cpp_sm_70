@@ -95,13 +95,27 @@ running. Any other dtype fails at load with a message naming what it saw.
 
 ## OpenAI-compatible server
 
-`server` is a small HTTP server speaking the OpenAI API. Source:
+`vllm-server` is a small HTTP server speaking the OpenAI API. Source:
 [`examples/server/main.cpp`](../examples/server/main.cpp) and
 [`src/vllm/entrypoints/openai/`](../src/vllm/entrypoints/openai/).
 
 ```sh
-build/examples/server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
+build/examples/vllm-server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
 ```
+
+The install component and deterministic archive target both stage from install
+rules rather than copying the build tree:
+
+```sh
+cmake --build build --target vllm-server-stage
+cmake --build build --target vllm-server-archive
+build/release/stage/bin/vllm-server --help
+```
+
+The archive under `build/release/` includes the version, configured backend, OS
+and host architecture in its name. These W6 archives remain development
+artifacts until W7 validation and supply-chain metadata land; no release
+download is claimed yet.
 
 Any OpenAI client works by pointing its `base_url` at it:
 
