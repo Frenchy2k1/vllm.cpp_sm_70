@@ -204,6 +204,28 @@ inline decltype(auto) DispatchBenchPromptAdmission(
   return std::forward<TimedStringCallback>(timed_string_callback)();
 }
 
+// One benchmark refill is one observable engine wave. Record every selected
+// request's arrival before invoking exactly one engine batch publish; in rollback
+// mode, string tokenization therefore remains timed but begins only after the
+// complete wave has the same arrival boundary as the pretokenized path.
+template <typename Engine, typename ArrivalCallback,
+          typename PretokenizedWaveFactory, typename TimedStringWaveFactory>
+inline decltype(auto) DispatchBenchPromptWaveAdmission(
+    Engine& engine, const char* env_value, std::size_t wave_size,
+    ArrivalCallback&& arrival_callback,
+    PretokenizedWaveFactory&& pretokenized_wave_factory,
+    TimedStringWaveFactory&& timed_string_wave_factory) {
+  for (std::size_t offset = 0; offset < wave_size; ++offset) {
+    std::forward<ArrivalCallback>(arrival_callback)(offset);
+  }
+  if (ResolveBenchPretokenizedAdmission(env_value)) {
+    return engine.add_request_wave(
+        std::forward<PretokenizedWaveFactory>(pretokenized_wave_factory)());
+  }
+  return engine.add_request_wave(
+      std::forward<TimedStringWaveFactory>(timed_string_wave_factory)());
+}
+
 // Own the ordering boundary between workload preparation and measurement.
 // The clock callback is invoked exactly once and only after every default-path
 // prompt has been encoded with the same special-token policy as InputProcessor.
@@ -596,27 +618,56 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   int done = 0;
 
   auto admit = [&]() {
-    while (next < cfg.num_prompts && in_flight < cfg.concurrency) {
-      const std::string rid = std::to_string(next);
-      RequestRecord rec;
-      rec.arrival_s = now_s();
-      records[rid] = rec;
-      const size_t prompt_index = static_cast<size_t>(next);
-      active.emplace(
-          rid, DispatchBenchPromptAdmission(
-                   pretokenize_env,
-                   [&]() {
-                     return engine.add_request(
-                         rid, std::move(pretokenized_prompts[prompt_index]),
-                         MakeSampling(cfg, next));
-                   },
-                   [&]() {
-                     return engine.add_request(rid, prompts[prompt_index],
-                                               MakeSampling(cfg, next));
-                   }));
-      ++next;
-      ++in_flight;
+    const int available = cfg.concurrency - in_flight;
+    const int wave_size = std::min(cfg.num_prompts - next, available);
+    if (wave_size <= 0) return;
+    const int wave_begin = next;
+
+    std::vector<vllm::v1::AsyncRequest> admitted =
+        DispatchBenchPromptWaveAdmission(
+            engine, pretokenize_env, static_cast<std::size_t>(wave_size),
+            [&](std::size_t offset) {
+              const int request_index =
+                  wave_begin + static_cast<int>(offset);
+              RequestRecord record;
+              record.arrival_s = now_s();
+              records[std::to_string(request_index)] = std::move(record);
+            },
+            [&]() {
+              std::vector<vllm::v1::AsyncTokensRequestInput> wave;
+              wave.reserve(static_cast<std::size_t>(wave_size));
+              for (int offset = 0; offset < wave_size; ++offset) {
+                const int request_index = wave_begin + offset;
+                const std::size_t prompt_index =
+                    static_cast<std::size_t>(request_index);
+                wave.push_back(vllm::v1::AsyncTokensRequestInput{
+                    std::to_string(request_index),
+                    std::move(pretokenized_prompts[prompt_index]),
+                    MakeSampling(cfg, request_index), 0});
+              }
+              return wave;
+            },
+            [&]() {
+              std::vector<vllm::v1::AsyncStringRequestInput> wave;
+              wave.reserve(static_cast<std::size_t>(wave_size));
+              for (int offset = 0; offset < wave_size; ++offset) {
+                const int request_index = wave_begin + offset;
+                const std::size_t prompt_index =
+                    static_cast<std::size_t>(request_index);
+                wave.push_back(vllm::v1::AsyncStringRequestInput{
+                    std::to_string(request_index), prompts[prompt_index],
+                    MakeSampling(cfg, request_index), 0});
+              }
+              return wave;
+            });
+    if (admitted.size() != static_cast<std::size_t>(wave_size)) {
+      throw std::runtime_error("AsyncLLM admitted an incomplete bench wave");
     }
+    for (vllm::v1::AsyncRequest& request : admitted) {
+      active.emplace(request.request_id, std::move(request));
+    }
+    next += wave_size;
+    in_flight += wave_size;
   };
 
   admit();
