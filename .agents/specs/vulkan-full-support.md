@@ -327,11 +327,84 @@ the umbrella, not a substitute for them.
 | **VK-H** | **Attention variants + samplers** (16 ops) | B (samplers), G (attn variants) | **83/83 — closes the op surface** |
 | **VK-I** | **AMD/RDNA (or Arc) bring-up** | hardware acquisition | The staging path for non-host-visible memory, and the gate re-run where Vulkan actually matters |
 
+### 6.0a `VK-G` partial: the FUSED ATTN PREAMBLE landed — 2026-08-09
+
+`row/BACKEND-VULKAN-QKNORM`. `kAttnQkNormRopeGate` — gemma-RMSNorm(q) +
+gemma-RMSNorm(k) + partial NeoX RoPE from the precomputed cos/sin cache + the
+gate passthrough — is native. Module count 24 -> 25.
+
+**Why this op, and only this op.** After the GDN rows there was no kernel-speed
+lever left in decode: `vt_matmul_vec` runs at 90% of the GB10 bandwidth roof and
+`lm_head` at 74%. What remained was the reference tier's ARCHITECTURAL cost —
+`src/vt/op_provider.cpp` drains the recorded command batch (submit + blocking
+fence) before it can hand a host kernel device memory, so a reference-tier op
+costs a full GPU round trip no matter how little arithmetic it does. Three ops
+declined; `kCausalConv1dFwd` is prefill-only and `kRopeCosSinCache` is
+deliberately host-side (the double-precision table, vLLM's own split), which left
+this one. The 27B has 64 layers of which 48 are linear-attention, so it fires 16
+times per decoded token.
+
+**Ported from.** Per-element math 1:1 from our own CPU reference
+`src/vt/cpu/cpu_ops.cpp:956-1010 AttnQkNormRopeGateKernel` (itself the transcription of
+vLLM's `QKNormRoPEFusionPass` -> `_C.fused_qk_norm_rope`); dispatch shape from our
+CUDA kernel `src/vt/cuda/cuda_ops.cu:1316-1394` — one workgroup per (token, head)
+over Hq + Hkv slots, CUDA's `dim3(t, hq+hkv)` grid flattened, with the two paired
+normed elements RECOMPUTED per output rather than staged in shared memory. The
+reduction idiom is `vt_rms_norm_gated.comp`'s and the cos/sin indexing is
+`vt_rope_from_cache.comp`'s, minus the positions indirection: this cache is the
+per-step `[T,rot]` fill, so the row is `tok * rot`.
+
+**MEASURED on GB10 (Qwen3.6-27B bf16, Vulkan, 1 prompt, 32-in, c1, page cache
+dropped before every run).** By the two-length flush diff (output-len 4 vs 12,
+both arms measured, neither inferred):
+
+| per decoded token | main | this row |
+|---|---:|---:|
+| reference-tier drains | 16 | **0** |
+| command-buffer flushes, all reasons | 18 | **4** |
+| GPU dispatches | 884 | 900 |
+| GPU-active | 236.3 ms | 234.6 ms |
+| wall (median TPOT) | 253.5 ms | 246.2 ms |
+| host time, wall minus GPU-active | 17.2 ms | **11.6 ms** |
+
+That is the whole mechanism in one table. The GPU does the SAME work to within
+noise and takes four more dispatches per token; what changes is that 16 submit +
+blocking-fence round trips per token stop happening. The four remaining flushes
+are the batcher's own copy-src and descriptor-ring-full drains, not provider
+declines, and the reference-tier decline list is now exactly `kRopeCosSinCache`
+and `kCausalConv1dFwd`, both by design.
+
+**PAIRED DECODE**, 6 order-alternated AB/BA pairs at 32-in/32-out, page cache
+dropped before each of the 12 runs: **this row wins 5 of 6**. Median TPOT over
+the non-outlier legs 249.74 ms -> 242.34 ms, i.e. decode **4.00 -> 4.13 tok/s**
+against llama.cpp Vulkan's 4.35. Two legs (one per arm, pairs 2 and 3) came in at
+~446-448 ms, 1.8x the block median; discarding the pairs that contain them leaves
+**4 of 4**, and it is the same ~3% either way.
+
+**HONESTY ON THE SPEED NUMBER.** The effect is ~3% and this box swings ~2x run to
+run, which is why the readout is a per-pair win rate and not a mean. It is also
+why the first paired block of this row was thrown away: the host had rebooted and
+brought `local-ai-worker` back up under `--restart=always`, and a contended block
+reads ~450-505 ms against a quiet box's ~250 ms, roughly 14x the effect being
+measured. The mechanism table above is the load-bearing evidence — the host-time
+column measures the thing this row removes directly and does not depend on the
+wall clock being reproducible.
+
+**Correctness.** NMSE vs the CPU oracle in the same binary on the GB10 NVIDIA
+driver: q `5.69e-15`, k `1.59e-14` (gemma=1); `6.5e-15` / `1.43e-14` (gemma=0);
+the bf16-q/k + f32-gate arm is BIT-EXACT. The f32 arm is NOT bit-exact and is not
+claimed to be — the workgroup tree reduction changes the mean square's
+accumulation order, the same tier `vt_rms_norm` and `vt_rms_norm_gated` sit in.
+The gate passthrough IS held bit-exact, against the SOURCE rather than against the
+oracle's output. `test_vulkan_backend` 29/29 (2329 assertions) on GB10;
+`test_opt_paged_engine` still 6/6 token-exact (96/96), 0 declines.
+
 ### 6.0 `VK-G` partial: the two GATED-DELTA RECURRENCES landed — 2026-08-08
 
 `row/BACKEND-VULKAN-GDN-CORE`. `kGdnPrefill` and `kGdnDecode` are native; the
 Vulkan module count goes 22 -> 24 and the GDN family 6 -> 8. `kCausalConv1dFwd`,
-`kRopeCosSinCache` and `kAttnQkNormRopeGate` stay on the reference tier.
+`kRopeCosSinCache` and `kAttnQkNormRopeGate` stay on the reference tier (the last
+of the three is closed by §6.0a).
 
 **What was ported, and from where.** Per-step arithmetic 1:1 from
 `src/vt/cpu/cpu_ops.cpp:1280-1311` `GdnHeadTokenStep`; dispatch shape and state

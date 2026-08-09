@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -57,7 +58,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 24);
+  CHECK(n == 25);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -78,7 +79,9 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
                            "vt_gdn_state_gather", "vt_gdn_state_scatter",
                            "vt_rms_norm_gated", "vt_sigmoid_gate_bf16",
                            // BACKEND-VULKAN-GDN-CORE: the two recurrences.
-                           "vt_gdn_prefill", "vt_gdn_decode"}) {
+                           "vt_gdn_prefill", "vt_gdn_decode",
+                           // BACKEND-VULKAN-QKNORM: the fused attn preamble.
+                           "vt_attn_qk_norm_rope_gate"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -179,6 +182,14 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // share one step body (vt_gdn_recurrence.glsl) and must stay in lockstep.
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_attn_qk_norm_rope_gate") == 0) {
+      // The shared qgate/kf dtype, the shared q_out/k_out dtype, and the gate
+      // dtype. THREE, and the third one is the assertion: the gate is a separate
+      // axis only because the op contract admits an f32 gate alongside bf16 q/k
+      // (the FA-2 prefill combo, src/vt/ops.cpp:1530-1536). q_norm, k_norm and
+      // the cos/sin cache are f32 by contract and are therefore NOT axes.
+      REQUIRE(m.spec_id_count == 3);
+      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
     } else {
       CHECK(m.spec_id_count == 0);
     }
@@ -2141,6 +2152,310 @@ TEST_CASE("a GDN recurrence wider than the shared tile DECLINES to the reference
   vk.Copy(vq, got.data(), vob.p(), kVo * 4);
   vk.Synchronize(vq);
   CHECK(std::memcmp(got.data(), cob.p(), static_cast<size_t>(kVo) * 4) == 0);
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+// ===========================================================================
+// BACKEND-VULKAN-QKNORM — the fused full-attention preamble.
+//
+// SHAPES ARE CHOSEN, NOT DEFAULTED. Hq=5 / Hkv=2 is RAGGED (Hq is not a multiple
+// of Hkv, and 5+2=7 workgroups per token exercise the flattened (token, head)
+// decomposition rather than a power-of-two one). Dh=160 exceeds the 128-wide
+// workgroup, so every lane walks its head row in a strided loop and the mean
+// square is a genuine tree reduction over partial sums. rot=96 < Dh is the whole
+// point of the op — PARTIAL RoPE, so dims [96,160) must come out normed but
+// UNROTATED, and a kernel that rotated the whole head would still pass a
+// rot==Dh test. Both source rows are PADDED VIEWS (stride[0] > shape[1]), the
+// QKVParallelLinear packed layout the model actually hands the op.
+// ===========================================================================
+namespace {
+
+// The op's contract: qgate is [T, Hq*2*Dh] with q at [h*2*Dh, h*2*Dh+Dh) and the
+// gate at the second Dh (src/vt/ops.cpp:1516-1523).
+constexpr int64_t kQkT = 3, kQkHq = 5, kQkHkv = 2, kQkDh = 160, kQkRot = 96;
+constexpr int64_t kQkQRow = kQkHq * 2 * kQkDh, kQkKRow = kQkHkv * kQkDh;
+constexpr int64_t kQkQPad = 24, kQkKPad = 8;  // packed-view row padding
+constexpr int64_t kQkQStride = kQkQRow + kQkQPad, kQkKStride = kQkKRow + kQkKPad;
+
+// std::to_string gives six DECIMALS, which renders every NMSE this kernel
+// produces as "0.000000" — the one number the message exists to carry.
+std::string Sci(double v) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.3g", v);
+  return buf;
+}
+
+Tensor QkSrc(void* p, Device dev, vt::DType dt, int64_t cols, int64_t stride) {
+  Tensor t = Tensor::Contiguous(p, dt, dev, {kQkT, cols});
+  t.stride[0] = stride;  // inner-contiguous, padded row: the packed projection view
+  return t;
+}
+
+}  // namespace
+
+TEST_CASE("the fused attn preamble runs NATIVELY on Vulkan: partial RoPE, ragged heads") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  const std::vector<float> qgate = Spread(kQkT * kQkQStride, 2.0f, 401u);
+  const std::vector<float> kf = Spread(kQkT * kQkKStride, 2.0f, 409u);
+  // Norm weights around zero: with gemma the applied weight is (1+w), so this is
+  // a spread around 1 and a kernel that dropped the +1 changes every output.
+  const std::vector<float> qn = Spread(kQkDh, 0.4f, 419u);
+  const std::vector<float> kn = Spread(kQkDh, 0.4f, 421u);
+
+  const int64_t qelems = kQkT * kQkQStride, kelems = kQkT * kQkKStride;
+  const int64_t qout = kQkT * kQkHq * kQkDh, kout = kQkT * kQkHkv * kQkDh;
+
+  Buf vqg(vk, qelems, 4), vkf(vk, kelems, 4), vqn(vk, kQkDh, 4), vkn(vk, kQkDh, 4);
+  Buf vcs(vk, kQkT * kQkRot, 4);
+  Buf vqo(vk, qout, 4), vko(vk, kout, 4), vgo(vk, qout, 4);
+  Buf cqg(cpu, qelems, 4), ckf(cpu, kelems, 4), cqn(cpu, kQkDh, 4), ckn(cpu, kQkDh, 4);
+  Buf ccs(cpu, kQkT * kQkRot, 4), cpo(cpu, kQkT, 4);
+  Buf cqo(cpu, qout, 4), cko(cpu, kout, 4), cgo(cpu, qout, 4);
+
+  // The cos/sin table is built ONCE on the host — that is the op's own split
+  // (kRopeCosSinCache stays on the portable tier by design) — and the SAME BYTES
+  // are handed to both devices, so the comparison isolates this kernel.
+  const std::vector<int32_t> pos = {0, 7, 4096};  // a long position: real angles
+  std::memcpy(cpo.p(), pos.data(), pos.size() * 4);
+  Tensor cpot = Tensor::Contiguous(cpo.p(), vt::DType::kI32, cd, {kQkT});
+  Tensor ccst = Tensor::Contiguous(ccs.p(), vt::DType::kF32, cd, {kQkT, kQkRot});
+  vt::RopeCosSinCache(cq, ccst, cpot, vt::RopeArgs{10000.0f, static_cast<int>(kQkRot)});
+
+  vk.Copy(vq, vqg.p(), qgate.data(), qelems * 4);
+  vk.Copy(vq, vkf.p(), kf.data(), kelems * 4);
+  vk.Copy(vq, vqn.p(), qn.data(), kQkDh * 4);
+  vk.Copy(vq, vkn.p(), kn.data(), kQkDh * 4);
+  vk.Copy(vq, vcs.p(), ccs.p(), kQkT * kQkRot * 4);
+  std::memcpy(cqg.p(), qgate.data(), qelems * 4);
+  std::memcpy(ckf.p(), kf.data(), kelems * 4);
+  std::memcpy(cqn.p(), qn.data(), kQkDh * 4);
+  std::memcpy(ckn.p(), kn.data(), kQkDh * 4);
+  vk.Synchronize(vq);
+
+  auto out3 = [](void* p, Device dev, int64_t h) {
+    return Tensor::Contiguous(p, vt::DType::kF32, dev, {kQkT, h, kQkDh});
+  };
+  Tensor vqgt = QkSrc(vqg.p(), vd, vt::DType::kF32, kQkQRow, kQkQStride);
+  Tensor vkft = QkSrc(vkf.p(), vd, vt::DType::kF32, kQkKRow, kQkKStride);
+  Tensor vqnt = Tensor::Contiguous(vqn.p(), vt::DType::kF32, vd, {kQkDh});
+  Tensor vknt = Tensor::Contiguous(vkn.p(), vt::DType::kF32, vd, {kQkDh});
+  Tensor vcst = Tensor::Contiguous(vcs.p(), vt::DType::kF32, vd, {kQkT, kQkRot});
+  Tensor vqot = out3(vqo.p(), vd, kQkHq), vkot = out3(vko.p(), vd, kQkHkv);
+  Tensor vgot = out3(vgo.p(), vd, kQkHq);
+  Tensor cqgt = QkSrc(cqg.p(), cd, vt::DType::kF32, kQkQRow, kQkQStride);
+  Tensor ckft = QkSrc(ckf.p(), cd, vt::DType::kF32, kQkKRow, kQkKStride);
+  Tensor cqnt = Tensor::Contiguous(cqn.p(), vt::DType::kF32, cd, {kQkDh});
+  Tensor cknt = Tensor::Contiguous(ckn.p(), vt::DType::kF32, cd, {kQkDh});
+  Tensor cqot = out3(cqo.p(), cd, kQkHq), ckot = out3(cko.p(), cd, kQkHkv);
+  Tensor cgot = out3(cgo.p(), cd, kQkHq);
+
+  const vt::RopeArgs ra{10000.0f, static_cast<int>(kQkRot)};
+  // BOTH gemma arms. The model only ever calls gemma=true, but the weight is
+  // applied as (1+w) vs w through a UNIFORM branch in the shader, and a branch
+  // written the other way round would be invisible with only one arm gated.
+  for (bool gemma : {true, false}) {
+    const vt::RmsNormArgs na{1e-6f, gemma};
+    vt::AttnQkNormRopeGate(cq, cqot, ckot, cgot, cqgt, ckft, cqnt, cknt, ccst, na, ra);
+    vt::AttnQkNormRopeGate(vq, vqot, vkot, vgot, vqgt, vkft, vqnt, vknt, vcst, na, ra);
+    vk.Synchronize(vq);
+
+    std::vector<float> gq(qout), gk(kout), gg(qout);
+    vk.Copy(vq, gq.data(), vqo.p(), qout * 4);
+    vk.Copy(vq, gk.data(), vko.p(), kout * 4);
+    vk.Copy(vq, gg.data(), vgo.p(), qout * 4);
+    vk.Synchronize(vq);
+    const std::vector<float> rq(cqo.as<float>(), cqo.as<float>() + qout);
+    const std::vector<float> rk(cko.as<float>(), cko.as<float>() + kout);
+    const double nq = NmseOf(rq, gq), nk = NmseOf(rk, gk);
+    // Reported, NOT asserted: on THIS device the tree reduction happens to land
+    // on the CPU tier's own bits, but that is a property of the shapes and the
+    // driver, not a promise the op makes across devices — the tier this kernel is
+    // gated at is NMSE, like every other reducing shader in the backend.
+    const bool bitwise = std::memcmp(rq.data(), gq.data(), static_cast<size_t>(qout) * 4) == 0 &&
+                         std::memcmp(rk.data(), gk.data(), static_cast<size_t>(kout) * 4) == 0;
+    // Assembled OUTSIDE the macro: MESSAGE(x << y) hands the expression to the
+    // doctest MessageBuilder, so a flag written inside renders as "1".
+    const std::string line = std::string("attn_qk_norm_rope_gate (gemma=") +
+                             (gemma ? "1" : "0") + ") q NMSE " + Sci(nq) + ", k NMSE " + Sci(nk) +
+                             ", bitwise-equal to the CPU: " + (bitwise ? "YES" : "no");
+    MESSAGE(line);
+    CHECK(nq <= kGdnNmseTol);
+    CHECK(nk <= kGdnNmseTol);
+
+    // THE GATE IS A PASSTHROUGH, so it is held to the BIT-EXACT tier, not NMSE:
+    // it is a copy of the raw second Dh of each q|gate pair with no norm and no
+    // rotation, and it is compared against the SOURCE rather than against the CPU
+    // oracle's output — a kernel that copied the q half into both would agree
+    // with a kernel that did the same on the other device.
+    bool gate_exact = true;
+    for (int64_t tok = 0; tok < kQkT; ++tok) {
+      for (int64_t h = 0; h < kQkHq; ++h) {
+        for (int64_t j = 0; j < kQkDh; ++j) {
+          const float want =
+              qgate[static_cast<size_t>(tok * kQkQStride + h * 2 * kQkDh + kQkDh + j)];
+          if (gg[static_cast<size_t>((tok * kQkHq + h) * kQkDh + j)] != want) gate_exact = false;
+        }
+      }
+    }
+    CHECK(gate_exact);
+    // The gate must also be DIFFERENT from q, or "carrying data" is unproven.
+    CHECK(std::memcmp(gg.data(), gq.data(), static_cast<size_t>(qout) * 4) != 0);
+
+    // PARTIAL RoPE: dims [rot, Dh) are normed but NOT rotated, so they equal the
+    // plain gemma-RMSNorm of the source. Checked against a hand-computed f64 row
+    // rather than against the CPU kernel, which would agree with a Vulkan kernel
+    // that rotated everything only if the CPU one did too.
+    for (int64_t h = 0; h < kQkHq; ++h) {
+      const size_t base = static_cast<size_t>(h * 2 * kQkDh);  // token 0
+      double ss = 0.0;
+      for (int64_t j = 0; j < kQkDh; ++j) {
+        const double v = qgate[base + static_cast<size_t>(j)];
+        ss += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(ss / static_cast<double>(kQkDh) + 1e-6);
+      for (int64_t j = kQkRot; j < kQkDh; ++j) {
+        const double w = gemma ? qn[static_cast<size_t>(j)] + 1.0 : qn[static_cast<size_t>(j)];
+        const double want = qgate[base + static_cast<size_t>(j)] * inv * w;
+        const double got = gq[static_cast<size_t>(h * kQkDh + j)];
+        CAPTURE(h);
+        CAPTURE(j);
+        CHECK(std::fabs(got - want) <= 1e-4 * (std::fabs(want) + 1e-3));
+      }
+    }
+  }
+
+  CHECK(ctx.PipelineExistsFor("vt_attn_qk_norm_rope_gate"));
+  CHECK(RanNative(vt::OpId::kAttnQkNormRopeGate));
+
+  vk.DestroyQueue(vq);
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("the fused attn preamble serves the bf16 q/k + f32 gate combo natively") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // The FA-2 prefill combo the op contract singles out (src/vt/ops.cpp:1530-1536):
+  // bf16 sources, bf16 q/k (they feed attention and the bf16 KV-cache write) and
+  // an f32 gate (sigmoid(gate) must see the un-rounded value). It is the ONLY
+  // shape in which the gate dtype differs from q/k, which is the reason the gate
+  // is its own specialization axis — a shader that reused the q/k dtype constant
+  // for the gate would write bf16 into an f32 buffer and pass every same-dtype
+  // test.
+  const std::vector<float> qgate_f = Spread(kQkT * kQkQStride, 2.0f, 431u);
+  const std::vector<float> kf_f = Spread(kQkT * kQkKStride, 2.0f, 433u);
+  const std::vector<float> qn = Spread(kQkDh, 0.4f, 439u);
+  const std::vector<float> kn = Spread(kQkDh, 0.4f, 443u);
+  std::vector<uint16_t> qgate_b(qgate_f.size()), kf_b(kf_f.size());
+  for (size_t i = 0; i < qgate_f.size(); ++i) qgate_b[i] = vt::F32ToBF16(qgate_f[i]);
+  for (size_t i = 0; i < kf_f.size(); ++i) kf_b[i] = vt::F32ToBF16(kf_f[i]);
+
+  const int64_t qelems = kQkT * kQkQStride, kelems = kQkT * kQkKStride;
+  const int64_t qout = kQkT * kQkHq * kQkDh, kout = kQkT * kQkHkv * kQkDh;
+
+  Buf vqg(vk, qelems, 2), vkf(vk, kelems, 2), vqn(vk, kQkDh, 4), vkn(vk, kQkDh, 4);
+  Buf vcs(vk, kQkT * kQkRot, 4);
+  Buf vqo(vk, qout, 2), vko(vk, kout, 2), vgo(vk, qout, 4);
+  Buf cqg(cpu, qelems, 2), ckf(cpu, kelems, 2), cqn(cpu, kQkDh, 4), ckn(cpu, kQkDh, 4);
+  Buf ccs(cpu, kQkT * kQkRot, 4), cpo(cpu, kQkT, 4);
+  Buf cqo(cpu, qout, 2), cko(cpu, kout, 2), cgo(cpu, qout, 4);
+
+  const std::vector<int32_t> pos = {1, 33, 900};
+  std::memcpy(cpo.p(), pos.data(), pos.size() * 4);
+  Tensor cpot = Tensor::Contiguous(cpo.p(), vt::DType::kI32, cd, {kQkT});
+  Tensor ccst = Tensor::Contiguous(ccs.p(), vt::DType::kF32, cd, {kQkT, kQkRot});
+  vt::RopeCosSinCache(cq, ccst, cpot, vt::RopeArgs{10000.0f, static_cast<int>(kQkRot)});
+
+  vk.Copy(vq, vqg.p(), qgate_b.data(), qelems * 2);
+  vk.Copy(vq, vkf.p(), kf_b.data(), kelems * 2);
+  vk.Copy(vq, vqn.p(), qn.data(), kQkDh * 4);
+  vk.Copy(vq, vkn.p(), kn.data(), kQkDh * 4);
+  vk.Copy(vq, vcs.p(), ccs.p(), kQkT * kQkRot * 4);
+  std::memcpy(cqg.p(), qgate_b.data(), qelems * 2);
+  std::memcpy(ckf.p(), kf_b.data(), kelems * 2);
+  std::memcpy(cqn.p(), qn.data(), kQkDh * 4);
+  std::memcpy(ckn.p(), kn.data(), kQkDh * 4);
+  vk.Synchronize(vq);
+
+  auto qk3 = [](void* p, Device dev, int64_t h) {
+    return Tensor::Contiguous(p, vt::DType::kBF16, dev, {kQkT, h, kQkDh});
+  };
+  Tensor vqgt = QkSrc(vqg.p(), vd, vt::DType::kBF16, kQkQRow, kQkQStride);
+  Tensor vkft = QkSrc(vkf.p(), vd, vt::DType::kBF16, kQkKRow, kQkKStride);
+  Tensor vqnt = Tensor::Contiguous(vqn.p(), vt::DType::kF32, vd, {kQkDh});
+  Tensor vknt = Tensor::Contiguous(vkn.p(), vt::DType::kF32, vd, {kQkDh});
+  Tensor vcst = Tensor::Contiguous(vcs.p(), vt::DType::kF32, vd, {kQkT, kQkRot});
+  Tensor vqot = qk3(vqo.p(), vd, kQkHq), vkot = qk3(vko.p(), vd, kQkHkv);
+  Tensor vgot = Tensor::Contiguous(vgo.p(), vt::DType::kF32, vd, {kQkT, kQkHq, kQkDh});
+  Tensor cqgt = QkSrc(cqg.p(), cd, vt::DType::kBF16, kQkQRow, kQkQStride);
+  Tensor ckft = QkSrc(ckf.p(), cd, vt::DType::kBF16, kQkKRow, kQkKStride);
+  Tensor cqnt = Tensor::Contiguous(cqn.p(), vt::DType::kF32, cd, {kQkDh});
+  Tensor cknt = Tensor::Contiguous(ckn.p(), vt::DType::kF32, cd, {kQkDh});
+  Tensor cqot = qk3(cqo.p(), cd, kQkHq), ckot = qk3(cko.p(), cd, kQkHkv);
+  Tensor cgot = Tensor::Contiguous(cgo.p(), vt::DType::kF32, cd, {kQkT, kQkHq, kQkDh});
+
+  const vt::RmsNormArgs na{1e-6f, true};
+  const vt::RopeArgs ra{10000.0f, static_cast<int>(kQkRot)};
+  vt::AttnQkNormRopeGate(cq, cqot, ckot, cgot, cqgt, ckft, cqnt, cknt, ccst, na, ra);
+  vt::AttnQkNormRopeGate(vq, vqot, vkot, vgot, vqgt, vkft, vqnt, vknt, vcst, na, ra);
+  vk.Synchronize(vq);
+
+  CHECK(ctx.PipelineExistsFor("vt_attn_qk_norm_rope_gate"));
+  CHECK(RanNative(vt::OpId::kAttnQkNormRopeGate));
+
+  std::vector<uint16_t> gq(qout), gk(kout);
+  std::vector<float> gg(qout);
+  vk.Copy(vq, gq.data(), vqo.p(), qout * 2);
+  vk.Copy(vq, gk.data(), vko.p(), kout * 2);
+  vk.Copy(vq, gg.data(), vgo.p(), qout * 4);
+  vk.Synchronize(vq);
+  std::vector<float> rqf(qout), gqf(qout), rkf(kout), gkf(kout);
+  for (int64_t i = 0; i < qout; ++i) {
+    rqf[static_cast<size_t>(i)] = vt::BF16ToF32(cqo.as<uint16_t>()[i]);
+    gqf[static_cast<size_t>(i)] = vt::BF16ToF32(gq[static_cast<size_t>(i)]);
+  }
+  for (int64_t i = 0; i < kout; ++i) {
+    rkf[static_cast<size_t>(i)] = vt::BF16ToF32(cko.as<uint16_t>()[i]);
+    gkf[static_cast<size_t>(i)] = vt::BF16ToF32(gk[static_cast<size_t>(i)]);
+  }
+  const double nq = NmseOf(rqf, gqf), nk = NmseOf(rkf, gkf);
+  const bool bitwise = std::memcmp(cqo.p(), gq.data(), static_cast<size_t>(qout) * 2) == 0 &&
+                       std::memcmp(cko.p(), gk.data(), static_cast<size_t>(kout) * 2) == 0;
+  const std::string line = std::string("attn_qk_norm_rope_gate (bf16 q/k, f32 gate) q NMSE ") +
+                           Sci(nq) + ", k NMSE " + Sci(nk) +
+                           ", bitwise-equal to the CPU: " + (bitwise ? "YES" : "no");
+  MESSAGE(line);
+  CHECK(nq <= kGdnNmseTol);
+  CHECK(nk <= kGdnNmseTol);
+
+  // The f32 gate is a widening passthrough of the bf16 source, so it is EXACT.
+  bool gate_exact = true;
+  for (int64_t tok = 0; tok < kQkT; ++tok) {
+    for (int64_t h = 0; h < kQkHq; ++h) {
+      for (int64_t j = 0; j < kQkDh; ++j) {
+        const float want = vt::BF16ToF32(
+            qgate_b[static_cast<size_t>(tok * kQkQStride + h * 2 * kQkDh + kQkDh + j)]);
+        if (gg[static_cast<size_t>((tok * kQkHq + h) * kQkDh + j)] != want) gate_exact = false;
+      }
+    }
+  }
+  CHECK(gate_exact);
 
   vk.DestroyQueue(vq);
   cpu.DestroyQueue(cq);
