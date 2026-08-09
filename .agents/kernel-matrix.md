@@ -172,6 +172,17 @@ and the profiled enclosing workload improves **2.272%**; pinned vLLM remains
 Lifecycle stays `INVENTORIED` because generic Mamba coverage and the 27B/35B
 release gates are unchanged. [Spec and evidence](specs/sm120-qwen35-conv-chunking-2026-08-07.md).
 
+**2026-08-09 `KERNEL-SSM-MAMBA` sm_120 campaign anchor.**
+[#206](https://github.com/mudler/vllm.cpp/issues/206) tracks the RTX 5070 Ti
+Qwen3.5-4B Pareto campaign. The current sealed result passes throughput
+(**6784.743 vs 6643.593 tok/s**) while TTFT (**1018.040 vs 937.584 ms**),
+TPOT/ITL (**34.740 vs 33.906 ms**) and VRAM (**13053.3 vs 12820 MiB**) remain
+open. The first ordered gate transplants the historical opt-ins and measures
+combined K=4 causal-conv plus 16-token post-conv in a counterbalanced A/B;
+same-tool local/vLLM tracing then selects the largest residual. Lifecycle
+stays `INVENTORIED`; generic Mamba and 27B/35B coverage are unchanged.
+[Campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
+
 ## Count invariants
 
 - This table has exactly 35 practical kernel-family rows.
