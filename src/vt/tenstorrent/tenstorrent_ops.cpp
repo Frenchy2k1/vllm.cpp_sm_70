@@ -1,14 +1,15 @@
 // Tenstorrent op providers — the ttnn adapter layer (BACKEND-TENSTORRENT,
 // .agents/specs/tenstorrent-backend.md). vllm.cpp original; no upstream
-// mirror (vLLM has no Tenstorrent platform). Op table covers OPT-125m's 9
-// ops: ttnn for compute (matmul/add/relu/embedding/layernorm), host-staged
-// pure data-movement / attention for the remainder (see HOST-STAGED OPS
-// note below). Mirrors how Metal landed ops one seam at a time.
+// mirror (vLLM has no Tenstorrent platform). Op table: OPT-125m's 9 ops plus
+// the Qwen3-dense deltas (kRmsNorm first; kSiluAndMul / RoPE / Cast next),
+// matching Metal's OPT→Qwen3 sequencing. ttnn for compute where available;
+// host-staged pure data-movement / attention for the remainder (see
+// HOST-STAGED OPS note below).
 //
 // SCOPE: F32 for the W0 path unless noted. kAdd allows rank-1 bias
-// broadcast; kLayerNorm optional rank-1 weight/bias; kEmbedding i32/i64
-// ids. Every other shape/dtype is a VT_CHECK failure — no CPU reference
-// tier (UnifiedMemory()==false).
+// broadcast; kLayerNorm optional rank-1 weight/bias; kRmsNorm weight +
+// optional residual stream; kEmbedding i32/i64 ids. Every other shape/dtype
+// is a VT_CHECK failure — no CPU reference tier (UnifiedMemory()==false).
 //
 // HOST-STAGED OPS (kQkvSplit, kReshapeAndCache, kPagedAttention): this
 // backend's Alloc is host memory (tenstorrent_backend.cpp). QkvSplit and
@@ -37,6 +38,7 @@
 #include <ttnn/operations/eltwise/unary/unary.hpp>
 #include <ttnn/operations/embedding/embedding.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
+#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -324,6 +326,76 @@ void LayerNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor* weight,
   Download(dev_y, out);
 }
 
+// kRmsNorm: per-row RMS over the last dim (cpu_ops.cpp RmsNormKernel). First
+// Qwen3-dense (`Qwen3ForCausalLM`) op beyond OPT's LayerNorm set — Qwen3 uses
+// RMSNorm for input/post-attn/final norms and per-head q/k norms. Weight is
+// always present at the seam; optional residual is the residual stream
+// (pre-norm sum written back, then normed), matching CPU residual round-trip
+// for bf16 faithfulness. Gemma style (w+1) is host-only for now — Qwen3 does
+// not set gemma=true.
+//
+// Device path: ttnn::rms_norm after residual merge (when any) and weight
+// upload via the same TILE [1,D] affine helper as kLayerNorm.
+void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
+                   const RmsNormArgs& args, Tensor* residual) {
+  VT_CHECK(x.rank == 2 && out.rank == 2,
+           "tenstorrent kRmsNorm: only rank-2 tensors are supported in this step");
+  VT_CHECK(IsFloatDType(x.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kRmsNorm: float in, f32/bf16 out");
+  VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
+           "tenstorrent kRmsNorm: out shape mismatch");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous(),
+           "tenstorrent kRmsNorm: strided (non-contiguous) tensors are not supported");
+  VT_CHECK(args.eps >= 0.0f, "tenstorrent kRmsNorm: eps must be non-negative");
+  const uint32_t rows = static_cast<uint32_t>(x.shape[0]);
+  const uint32_t d = static_cast<uint32_t>(x.shape[1]);
+  VT_CHECK(weight.rank == 1 && weight.shape[0] == d && IsFloatDType(weight.dtype),
+           "tenstorrent kRmsNorm: weight must be rank-1 float [D]");
+  if (residual != nullptr) {
+    VT_CHECK(residual->rank == 2 && residual->shape[0] == rows && residual->shape[1] == d,
+             "tenstorrent kRmsNorm: residual shape must match x");
+    VT_CHECK(IsFloatDType(residual->dtype) && residual->IsContiguous(),
+             "tenstorrent kRmsNorm: residual must be contiguous float");
+  }
+
+  // Residual stream: x + residual -> residual (with dtype re-read), then norm
+  // that value. Host-staged so bf16 round-trip matches cpu_ops RmsNormKernel
+  // even when Alloc is host memory. Gemma (w+1) also stays on the host path
+  // with the same math as CPU.
+  if (residual != nullptr || args.gemma) {
+    for (int64_t r = 0; r < static_cast<int64_t>(rows); ++r) {
+      float sumsq = 0.0f;
+      for (int64_t j = 0; j < static_cast<int64_t>(d); ++j) {
+        const int64_t idx = r * static_cast<int64_t>(d) + j;
+        float v = LoadElemF32(x, idx);
+        if (residual != nullptr) {
+          v += LoadElemF32(*residual, idx);
+          StoreElemF32(*residual, idx, v);
+          v = LoadElemF32(*residual, idx);
+        }
+        sumsq += v * v;
+      }
+      const float inv =
+          1.0f / std::sqrt(sumsq / static_cast<float>(d) + args.eps);
+      for (int64_t j = 0; j < static_cast<int64_t>(d); ++j) {
+        const int64_t idx = r * static_cast<int64_t>(d) + j;
+        float v =
+            residual != nullptr ? LoadElemF32(*residual, idx) : LoadElemF32(x, idx);
+        float wj = LoadElemF32(weight, j);
+        if (args.gemma) wj += 1.0f;
+        StoreElemF32(out, idx, v * inv * wj);
+      }
+    }
+    return;
+  }
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_x = UploadTensor2D(x, device);
+  ttnn::Tensor dev_w = UploadAffine1D(weight, d, device);
+  ttnn::Tensor dev_y = ttnn::rms_norm(dev_x, args.eps, dev_w);
+  Download(dev_y, out);
+}
+
 // kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
 // (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy when dtypes match.
 void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
@@ -565,6 +637,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
+    RegisterOp(OpId::kRmsNorm, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kTENSTORRENT,
