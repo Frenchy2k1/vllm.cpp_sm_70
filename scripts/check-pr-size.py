@@ -83,10 +83,7 @@ GENERATED_FILES = frozenset(
 
 POLICY_FILES = frozenset(
     {
-        ".agents/policy.csv",
         ".agents/waivers.csv",
-        ".agents/governance-tasks.csv",
-        ".agents/policy-cutover",
     }
 )
 APPEND_ONLY_FILES = frozenset(
@@ -97,11 +94,6 @@ APPEND_ONLY_FILES = frozenset(
 )
 PROJECT_RECORD_FILES = frozenset(
     {
-        # Retired when history became git. They are DELETED, but a deleted path
-        # still appears in a diff and still has to classify, or the very commit
-        # that removes them fails the classification gate.
-        ".agents/state.md",
-        ".agents/state.csv",
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
@@ -127,11 +119,6 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
-        ".agents/directives.md",
-        ".agents/ai-coding-assistants.md",
-        ".agents/benchmark-protocol.md",
-        ".agents/discipline.md",
-        ".agents/gates.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",
@@ -140,7 +127,6 @@ PROCEDURE_FILES = frozenset(
         ".agents/environment.md",
         ".agents/mission.md",
         ".agents/parity-lever-protocol.md",
-        ".agents/test-porting.md",
         ".agents/upstream-sync.md",
         ".agents/vllm-v1-v2.md",
     }
@@ -184,10 +170,6 @@ COMPLETED_STATE_EVENT = re.compile(
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
-STATE_INDEX = re.compile(r"\.agents/state-index/\d{4}-\d{2}-\d{3}\.csv\Z")
-STATE_EVENT = re.compile(
-    r"\.agents/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"
-)
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
     r"\.agents/completed/state-migration-manifest-"
@@ -196,6 +178,50 @@ STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
 ASSET = re.compile(r"assets/[A-Za-z0-9_.-]+\.(?:png|svg)\Z")
 RELEASE_MANIFEST_FIXTURE = re.compile(
     r"tests/scripts/fixtures/release_manifest/v[0-9]+/[a-z0-9-]+\.json\Z"
+)
+
+# RETIRED SURFACES -- deleted from the tree, still classified ON PURPOSE.
+#
+# `classify_path` fails closed on an unknown path, and a deleted file still
+# appears in the diff of the commit that removes it, so a surface with no class
+# reds the very change that retires it and every later range spanning that
+# commit. That is why these stay.
+#
+# They live HERE, in one table with the reason written once, because the same
+# retention used to be spread through POLICY_FILES, PROJECT_RECORD_FILES,
+# PROCEDURE_FILES and two module-level regexes with the reason written in only
+# ONE of them -- which reads as abandoned scaffolding rather than a deliberate
+# fail-closed guard, and was mistaken for exactly that. A path may appear here or
+# in a live group, never both.
+#
+# Each entry keeps the class its path resolved to while it was live, so the
+# review budget a historical diff spends does not move.
+RETIRED_PATHS = {
+    # `policy: the code is the state, git is the history` (0f3e44ee): AGENTS.md
+    # became the single normative surface and git became the history.
+    ".agents/policy.csv": "policy",
+    ".agents/policy-cutover": "policy",
+    ".agents/state.md": "project_record",
+    ".agents/state.csv": "project_record",
+    # `policy: optimize the agent protocol for strict, executable compliance`
+    # (1a021b1b, #128): folded into workflow/verification/porting.md.
+    ".agents/ai-coding-assistants.md": "procedure",
+    ".agents/benchmark-protocol.md": "procedure",
+    ".agents/directives.md": "procedure",
+    ".agents/discipline.md": "procedure",
+    ".agents/gates.md": "procedure",
+    ".agents/test-porting.md": "procedure",
+}
+RETIRED_PATTERNS = (
+    # The CSV index and the per-event files of the retired state record, both
+    # removed by 0f3e44ee. Their ARCHIVE under `.agents/completed/state-events/`
+    # is LIVE evidence -- 160 files, moved verbatim rather than deleted -- and
+    # classifies through COMPLETED_STATE_EVENT, not here.
+    (re.compile(r"\.agents/state-index/\d{4}-\d{2}-\d{3}\.csv\Z"), "append_only_record"),
+    (
+        re.compile(r"\.agents/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"),
+        "append_only_record",
+    ),
 )
 
 CHECKER_EVIDENCE_OVERRIDES = {
@@ -274,6 +300,18 @@ def _canonical_path(path: str) -> bool:
     )
 
 
+def retired_class(path: str) -> str | None:
+    """The class a RETIRED surface keeps, or None when the path is not retired."""
+
+    known = RETIRED_PATHS.get(path)
+    if known is not None:
+        return known
+    for pattern, path_class in RETIRED_PATTERNS:
+        if pattern.fullmatch(path):
+            return path_class
+    return None
+
+
 def classify_path(path: str) -> str:
     """Return one closed path class or reject an unknown/noncanonical path."""
 
@@ -283,11 +321,12 @@ def classify_path(path: str) -> str:
     # fall through to `product` and spend a human-review budget on hex.
     if path in GENERATED_FILES:
         return "generated"
+    retired = retired_class(path)
+    if retired is not None:
+        return retired
     if path in POLICY_FILES:
         return "policy"
     if path in APPEND_ONLY_FILES:
-        return "append_only_record"
-    if STATE_INDEX.fullmatch(path) or STATE_EVENT.fullmatch(path):
         return "append_only_record"
     if path in PROJECT_RECORD_FILES:
         return "project_record"
