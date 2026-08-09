@@ -152,7 +152,13 @@ API and confirming its CMake package exports (`TT-NN`/`TT-Metalium`) resolve
 externally. Draft PR [#197](https://github.com/mudler/vllm.cpp/pull/197) is
 the claim, pushed with explicit developer authorization (no
 `.agents/developer-preferences.md` exists for this session; the example's
-safe default is ask-first for push/PR, and it was asked). The row stays `INVENTORIED`
+safe default is ask-first for push/PR, and it was asked). **Update
+2026-08-09:** the spec's one open risk (vt::Tensor/ttnn::Tensor storage
+mismatch) is now hands-on resolved on real Blackhole hardware — a standalone
+program outside this repo's build uploaded two tensors via
+`Tensor::from_vector`, ran `ttnn::operations::matmul::matmul`, and matched a
+host FP32 reference within bf16 tolerance (max_abs_diff 0.03375 vs max_ref_mag
+4.14). Detail in the spec. The row stays `INVENTORIED`
 until reviewed and, if accepted, moved to `SPIKE`.
 
 **Server binary release manifest W5 (`ENG-RELEASE-BINARIES`, 2026-08-08,
