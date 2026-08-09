@@ -71,21 +71,8 @@ class ArgmaxScratchOwners {
   void Submit(ArgmaxScratchKey key, std::size_t need, CaptureQuery&& is_capturing,
               Allocate&& allocate, CleanupPartial&& cleanup_partial, Retire&& retire,
               Launch&& submit) {
-    Owner* owner = nullptr;
-    bool capture_already_checked = false;
-    {
-      std::lock_guard lock(owners_mu_);
-      auto it = owners_.find(key);
-      if (it == owners_.end()) {
-        if (std::forward<CaptureQuery>(is_capturing)()) ThrowCaptureMiss();
-        capture_already_checked = true;
-        it = owners_.emplace(key, std::make_unique<Owner>()).first;
-      }
-      owner = it->second.get();
-    }
-
-    std::lock_guard submit_lock(owner->submit_mu);
-    if (need > owner->capacity) {
+    auto grow = [&](Owner* owner, bool capture_already_checked) {
+      if (need <= owner->capacity) return;
       if (!capture_already_checked && std::forward<CaptureQuery>(is_capturing)()) {
         ThrowCaptureMiss();
       }
@@ -125,8 +112,31 @@ class ArgmaxScratchOwners {
         owner->retired_bytes += old_capacity * sizeof(std::int64_t);
         std::forward<Retire>(retire)(old_indices);
       }
+    };
+
+    std::unique_lock owners_lock(owners_mu_);
+    auto it = owners_.find(key);
+    if (it == owners_.end()) {
+      if (std::forward<CaptureQuery>(is_capturing)()) ThrowCaptureMiss();
+      auto new_owner = std::make_unique<Owner>();
+      Owner* owner = new_owner.get();
+      std::unique_lock submit_lock(owner->submit_mu);
+      // Keep the map lock until the first pair is complete. A failed first
+      // allocation therefore cannot publish an empty owner or race a second
+      // creator for the same key.
+      grow(owner, true);
+      owners_.emplace(key, std::move(new_owner));
+      owners_lock.unlock();
+      std::forward<Launch>(submit)(ArgmaxScratchView{static_cast<float*>(owner->values),
+                                                     static_cast<std::int64_t*>(owner->indices),
+                                                     owner->capacity});
+      return;
     }
 
+    Owner* owner = it->second.get();
+    owners_lock.unlock();
+    std::lock_guard submit_lock(owner->submit_mu);
+    grow(owner, false);
     std::forward<Launch>(submit)(ArgmaxScratchView{static_cast<float*>(owner->values),
                                                    static_cast<std::int64_t*>(owner->indices),
                                                    owner->capacity});
@@ -180,6 +190,21 @@ class ArgmaxScratchOwners {
   mutable std::mutex owners_mu_;
   std::unordered_map<ArgmaxScratchKey, std::unique_ptr<Owner>, KeyHash> owners_;
 };
+
+// This is the single production routing seam between cuda_sample and the pure
+// ownership state machine. Runtime is intentionally capability-limited: the
+// old published blocks can only be retired, while only a never-published
+// partial allocation can use stream-ordered cleanup.
+template <class QueueLike, class Stream, class Runtime, class Launch>
+void SubmitCudaArgmaxScratch(ArgmaxScratchOwners& owners, const QueueLike& queue, Stream stream,
+                             std::size_t need, Runtime& runtime, Launch&& launch) {
+  const ArgmaxScratchKey key{queue.device.index, reinterpret_cast<std::uintptr_t>(stream)};
+  owners.Submit(
+      key, need, [&] { return runtime.IsCapturing(stream); },
+      [&](std::size_t bytes) { return runtime.Allocate(bytes, stream); },
+      [&](void* p) { runtime.CleanupPartial(p, stream); }, [&](void* p) { runtime.Retire(p); },
+      std::forward<Launch>(launch));
+}
 
 }  // namespace vt::cuda
 
