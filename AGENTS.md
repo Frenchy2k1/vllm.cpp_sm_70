@@ -204,11 +204,27 @@ each fact lives in exactly one of them.
 Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
 lifecycle change owes `STATUS`, `BENCHMARKS`, and `NOW`.
 
+## Work happens in a worktree
+
+**Every unit of work — feature, fix, policy, docs, records, a one-line gate
+repair — happens in its own linked worktree on its own task branch.** A claimed
+row uses `row/<ID>`. Pin the base SHA when you create the worktree.
+
+The shared checkout stays on `main`, clean, and is **never a work surface**. It
+is what everything else branches from, so it has to be current and safe at all
+times. Never edit, commit, or stash in it.
+
+Remove the worktree and delete its branch once the work merges, closes, or is
+abandoned. A worktree is a full checkout; leaving them behind fills the disk
+until gates start failing for want of a temp file.
+
 ## Landing work
 
-Feature code reaches `main` through a reviewed `row/<ID>` PR. Integration paths
-— `scripts/`, `.agents/`, `docs/`, `.github/`, `AGENTS.md` — may be pushed
-directly so a gate or record can be repaired without a round trip.
+Work reaches `main` from its task branch, never from the shared checkout: a
+helper opens a reviewed `row/<ID>` PR, and an operator holding recorded merge
+authority may instead merge that branch locally with a commit naming it. That
+keeps the repair-without-a-round-trip case one step, while still leaving every
+change on a branch that git can show, revert, and attribute.
 
 Run the applicable gate before every push and chain that success directly to the
 exact-SHA push. Hooks are bypassable convenience, never proof. If the remote

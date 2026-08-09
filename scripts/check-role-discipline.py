@@ -19,15 +19,25 @@ the previous direct-push policy and rewriting that judgement retroactively would
 redden honest history. The cutover itself is a records-only commit, so it passes.
 
 What this changes in practice: feature paths (src/, include/, tests/, examples/,
-cmake/, CMakeLists.txt) can no longer be pushed straight to main. Integration
-paths (scripts/, .agents/, docs/, .github/) still can, deliberately, so the
-operator can fix a gate or repair the record without a round trip.
+cmake/, CMakeLists.txt) can no longer be pushed straight to main.
 
 ARRIVAL IS JUDGED ONCE, ON THE COMMIT THAT LANDS THE CHANGE. A squash-merge
 lands one commit carrying "(#N)". A real merge commit lands the merge plus the
 branch commits it brings in; the merge is the arrival, and `merged_pr_content`
 exempts the content underneath it rather than re-judging each branch commit on a
 message that was never required to name the PR.
+
+SECOND CUTOVER: WORKTREE_DISCIPLINE_SINCE (user-directed 2026-08-09). Integration
+paths (scripts/, .agents/, docs/, .github/, AGENTS.md) USED to be pushable
+straight to main, so the operator could fix a gate or repair a record without a
+round trip. That exemption was also the one way work could legitimately happen
+on the shared checkout, and it did: the checkout drifted 40 commits behind main
+on a stale branch while ~150 orphaned worktrees filled the disk. AGENTS.md now
+requires every unit of work to happen in its own worktree on its own task
+branch, so from this second cutover onward EVERY tracked path must arrive via a
+task branch -- a reviewed row/* PR, or an authorized local merge naming the
+branch, which keeps the repair case one step. is_integration_path is retained
+for pre-cutover history, which is honest under the rule it was made under.
 """
 
 from __future__ import annotations
@@ -44,6 +54,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Set to the cutover commit SHA to switch enforcement on. None = report only.
 ROLE_DISCIPLINE_SINCE: str | None = "44e8225cf95fff12de6c5d4f3c3b4ecc9f0b1f94"
+
+# Set to the cutover commit SHA to govern INTEGRATION paths too, so that every
+# tracked path must arrive on a task branch. None = report only. A commit cannot
+# name its own SHA, so this names the commit that introduced the behaviour.
+WORKTREE_DISCIPLINE_SINCE: str | None = "f236ca96088cce64eadc7c794a73033e2c4ec177"
 
 # Product code. A change here must arrive through a reviewed row/* PR.
 FEATURE_PREFIXES = (
@@ -184,11 +199,19 @@ def policy_commit_violations(
     body: str,
     paths: list[str],
     merged_messages: tuple[str, ...] = (),
+    govern_integration: bool = False,
 ) -> list[str]:
-    """Enforce POL-PR-REQUIRED for every tracked repository change."""
+    """Require every tracked repository change to arrive on a task branch.
+
+    ``govern_integration`` drops the integration-path exemption, which is what
+    the worktree cutover turns on. Before that cutover the exemption stands, so
+    history made under the direct-push rule stays green.
+    """
 
     governed = sorted(
-        path for path in paths if path and not is_integration_path(path)
+        path
+        for path in paths
+        if path and (govern_integration or not is_integration_path(path))
     )
     if not governed or arrives_via_row_pr(parents, subject, body, merged_messages):
         return []
@@ -196,8 +219,10 @@ def policy_commit_violations(
     if len(governed) > 4:
         preview += f", ... (+{len(governed) - 4})"
     return [
-        f"{commit}: repository change ({preview}) reached main without a reviewed "
-        "row/* PR"
+        f"{commit}: repository change ({preview}) reached main without arriving "
+        "on a task branch. Work happens in its own worktree on a `row/<ID>` "
+        "branch and lands through a reviewed PR or an authorized local merge "
+        "naming that branch; never directly on the shared checkout"
     ]
 
 
@@ -241,7 +266,7 @@ def commit_paths(commit: str) -> list[str]:
     return [line for line in out.splitlines() if line]
 
 
-def inspect(commit: str) -> list[str]:
+def inspect(commit: str, govern_integration: bool = False) -> list[str]:
     parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
     subject = git("log", "-1", "--format=%s", commit)
     body = git("log", "-1", "--format=%b", commit)
@@ -250,19 +275,35 @@ def inspect(commit: str) -> list[str]:
     # synthetic-PR-merge case in arrives_via_row_pr.
     merged = tuple(git("log", "-1", "--format=%s%n%b", parent) for parent in parents[1:])
     return policy_commit_violations(
-        short, parents, subject, body, commit_paths(commit), merged
+        short,
+        parents,
+        subject,
+        body,
+        commit_paths(commit),
+        merged,
+        govern_integration=govern_integration,
     )
+
+
+def _since(cutover: str | None, commit: str) -> bool:
+    """True when *commit* is at or after *cutover*; False when unset."""
+    if cutover is None:
+        return False
+    try:
+        git("merge-base", "--is-ancestor", cutover, commit)
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def enforced(commit: str) -> bool:
     """True when this commit is after the cutover."""
-    if ROLE_DISCIPLINE_SINCE is None:
-        return False
-    try:
-        git("merge-base", "--is-ancestor", ROLE_DISCIPLINE_SINCE, commit)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+    return _since(ROLE_DISCIPLINE_SINCE, commit)
+
+
+def worktree_enforced(commit: str) -> bool:
+    """True when this commit must have arrived on a task branch, whatever it touches."""
+    return _since(WORKTREE_DISCIPLINE_SINCE, commit)
 
 
 def has_reached_main(commit: str) -> bool:
@@ -344,7 +385,7 @@ def main() -> int:
         # Already judged, once, on the merge commit that carries it.
         if commit in reviewed:
             continue
-        for problem in inspect(commit):
+        for problem in inspect(commit, worktree_enforced(commit)):
             # A row head has not reached main yet, so it is reportable pending
             # integration rather than a false claim that unmerged work already
             # violated the arrival rule. Main history and recognized synthetic
@@ -365,8 +406,15 @@ def main() -> int:
             f"({len(reported)} commit(s) would fail once ROLE_DISCIPLINE_SINCE "
             "names the cutover commit)."
         )
+    elif WORKTREE_DISCIPLINE_SINCE is None:
+        print(
+            "OK: feature code on main arrived through reviewed row/* PRs. "
+            "Worktree discipline is REPORT-ONLY for integration paths "
+            f"({len(reported)} commit(s) reported) until "
+            "WORKTREE_DISCIPLINE_SINCE names the cutover commit."
+        )
     else:
-        print("OK: feature code on main arrived through reviewed row/* PRs.")
+        print("OK: every change on main arrived on a task branch.")
     return 0
 
 
