@@ -312,6 +312,61 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
   }
 }
 
+// kReshapeAndCache: write per-token K/V into paged NHD cache slots
+// (cpu_cache.cpp ReshapeAndCacheKernel). Stride-driven so unbind-style
+// [num_blocks,2,bs,H,D] views work; slot < 0 is a padded-token skip.
+// Host-staged pure element copy for F32.
+void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                           Tensor& v_cache, const Tensor& slot_mapping) {
+  VT_CHECK(k.rank == 3 && v.rank == 3 && k_cache.rank == 4 && v_cache.rank == 4,
+           "tenstorrent kReshapeAndCache: k/v rank-3, caches rank-4");
+  VT_CHECK(k.dtype == DType::kF32 && v.dtype == DType::kF32 && k_cache.dtype == DType::kF32 &&
+               v_cache.dtype == DType::kF32,
+           "tenstorrent kReshapeAndCache: only F32 is supported in this step");
+  VT_CHECK(slot_mapping.rank == 1 && slot_mapping.dtype == DType::kI64,
+           "tenstorrent kReshapeAndCache: slot_mapping rank-1 i64");
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t num_kv_heads = k_cache.shape[2];
+  const int64_t head_size = k_cache.shape[3];
+  const int64_t n_elems = num_kv_heads * head_size;
+  VT_CHECK(k.shape[1] == num_kv_heads && k.shape[2] == head_size && v.shape[1] == num_kv_heads &&
+               v.shape[2] == head_size,
+           "tenstorrent kReshapeAndCache: k/v head shape must match cache");
+  VT_CHECK(k.shape[0] >= num_slots && v.shape[0] >= num_slots,
+           "tenstorrent kReshapeAndCache: token count must cover slots");
+  // Contiguous NHD page: head stride == head_size (ops.cpp contract).
+  VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size &&
+               k_cache.stride[3] == 1 && v_cache.stride[3] == 1,
+           "tenstorrent kReshapeAndCache: cache pages must be dense NHD");
+  VT_CHECK(k.stride[2] == 1 && v.stride[2] == 1,
+           "tenstorrent kReshapeAndCache: k/v innermost stride must be 1");
+
+  const int64_t k_block_stride = k_cache.stride[0];
+  const int64_t k_page_stride = k_cache.stride[1];
+  const int64_t v_block_stride = v_cache.stride[0];
+  const int64_t v_page_stride = v_cache.stride[1];
+  const int64_t k_tok_stride = k.stride[0];
+  const int64_t v_tok_stride = v.stride[0];
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  const float* ksrc = k.Ptr<float>();
+  const float* vsrc = v.Ptr<float>();
+  float* kdst = k_cache.Ptr<float>();
+  float* vdst = v_cache.Ptr<float>();
+  const size_t bytes = static_cast<size_t>(n_elems) * sizeof(float);
+
+  for (int64_t t = 0; t < num_slots; ++t) {
+    const int64_t slot = slots[t];
+    if (slot < 0) continue;
+    const int64_t block = slot / block_size;
+    const int64_t offset = slot % block_size;
+    const int64_t kdst_off = block * k_block_stride + offset * k_page_stride;
+    const int64_t vdst_off = block * v_block_stride + offset * v_page_stride;
+    std::memcpy(kdst + kdst_off, ksrc + t * k_tok_stride, bytes);
+    std::memcpy(vdst + vdst_off, vsrc + t * v_tok_stride, bytes);
+  }
+}
+
 struct Registrar {
   Registrar() {
     if (!DeviceAvailable()) return;
@@ -329,6 +384,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
+    RegisterOp(OpId::kReshapeAndCache, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
   }
 } registrar;
 
