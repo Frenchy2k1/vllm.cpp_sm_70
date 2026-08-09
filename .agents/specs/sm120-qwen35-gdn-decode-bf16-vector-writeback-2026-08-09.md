@@ -1,6 +1,6 @@
 # sm_120 Qwen3.5 GDN decode BF16 vector-writeback discriminator
 
-**Lifecycle:** `SPIKED`; implementation and measurement pending
+**Lifecycle:** `REJECTED/REMOVED`; exact but below the timing gate
 
 **Owner rows:** `KERNEL-SSM-MAMBA`, `ROAD-V1-C2-LOCAL-BF16`
 
@@ -130,3 +130,38 @@ unavailable 27B/35B acceptance.
 
 Add only portable parser/eligibility/mapping/pack-reference tests and capture
 their red failure. Do not edit CUDA recurrence code until that evidence exists.
+
+## Outcome — rejected and removed
+
+Reviewed implementation `29de225c8` plus repair `3ca49e926` passed the fresh
+mutation re-review. The repaired portable suite ran 16 cases / 2,568 assertions;
+independent mutations killed every eligibility predicate, BF16 RN conversion,
+either pack, a hardwired-false dispatch, the CUDA route and the vector store.
+The operator rebuilt the CUDA translation unit and passed
+`test_gdn_decode_fused` plus `test_ops_gdn`. The immutable four-leg run was
+token-exact throughout (SHA-256
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`).
+
+| Arm | all fused decode, 1,656 calls | grid-y 800, 864 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| REG-a | 251.210058 ms | 139.127859 ms | 6760.82 / 747.59 | 1027.95 ms | 34.81 ms | 5449.30 ms |
+| VEC-a | 250.472657 ms | 138.702659 ms | 6802.32 / 752.18 | 1015.76 ms | 34.66 ms | 5417.91 ms |
+| VEC-b | 251.214368 ms | 139.138796 ms | 6804.21 / 752.39 | 1015.60 ms | 34.65 ms | 5416.35 ms |
+| REG-b | 251.404693 ms | 139.111428 ms | 6807.51 / 752.76 | 1013.82 ms | 34.65 ms | 5413.73 ms |
+
+The counterbalanced means improve y800 only **0.1430%** and all fused decode
+only **0.1846%**. VEC-b is slower than both controls on y800 and slower than
+REG-a on all fused decode, so the candidate fails both the required 1.00% gain
+and the every-vector-leg stability gate. The enclosing differences are run
+order drift: the final REG-b also beats both vector legs on every reported
+wall axis. `nsys` confirms unchanged gx8/gy800/bx128, 56 registers/thread,
+9,728 dynamic shared bytes and zero local bytes in every arm; static inspection
+shows two 16-byte stores, but the old PTX artifact predates the repaired pack
+seam and receives no current-head codegen credit.
+
+Raw roots are
+`/tmp/qwen35-gdn-vecstore-{rega,veca,vecb,regb}-3ca49e926.*`; the GPU was idle
+before the locked, cgroup-contained series (RTX 5070 Ti, driver 595.71.05,
+P8, 40 C, 0% utilization). The experiment is therefore rejected and its
+selector/product/tests are removed. REGSTATE remains the accepted opt-in; no
+default, release, pinned-vLLM, 27B or 35B claim changes.

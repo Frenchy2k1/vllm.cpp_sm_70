@@ -248,5 +248,29 @@ largest same-tool interval; never declare a ceiling.
 
 ## Outcome
 
-Pending fresh RED-first implementation, mutation review, operator verification,
-and same-binary GPU evidence. No default or performance claim is made.
+**REJECTED and removed, 2026-08-09.** Fresh RED-first implementation and
+mutation review passed at `06db3bbb3454f85e20f75b96eeb299afba7036ae` (9
+portable cases / 105 assertions plus the CUDA sampling gate). The immutable
+same-binary series
+`INC-a -> GEO-a -> GEO-b -> INC-b -> INC-c -> GEO-c` was token-exact in all
+six legs (SHA-256 `be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`).
+Raw evidence is `/tmp/qwen35-ab-argmax-geometric-06db3bbb/`.
+
+| Arm mean (3 reps) | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| Incumbent | 6862.2667 | 758.8100 | 1009.7167 ms | 34.3400 ms | 5371.0000 ms |
+| Geometric | 6863.8867 | 758.9867 | 965.0133 ms | 34.6833 ms | 5369.7067 ms |
+| Change | +0.0236% | +0.0233% | -4.427% | **+0.9998%** | -0.0241% |
+
+The candidate therefore fails the no-TPOT-regression Pareto gate. Same-tool
+`nsys --trace=cuda,nvtx --cuda-graph-trace=node` explains why the apparent
+TTFT win is not an end-to-end compute saving: incumbent `cudaFree` was
+506 calls / 2960.361 ms (max 200.004 ms), candidate was 476 calls / 27.705 ms
+(max 0.688 ms), exactly removing the 30 expected argmax frees; meanwhile
+`cudaStreamSynchronize` rose from 18,027.497 to 20,878.260 ms over the same
+567 calls. The wait moved to the later synchronization boundary. Candidate
+trace hashes are `1021b045...239e7` (`.nsys-rep`) and
+`808a7516...b7be4` (SQLite); the incumbent SQLite hash is
+`bab04901...be178`. No default or performance credit is taken, and the
+selector/product/tests are removed while this falsified hypothesis remains as
+evidence.
