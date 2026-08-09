@@ -204,6 +204,27 @@ inline decltype(auto) DispatchBenchPromptAdmission(
   return std::forward<TimedStringCallback>(timed_string_callback)();
 }
 
+// Own the ordering boundary between workload preparation and measurement.
+// The clock callback is invoked exactly once and only after every default-path
+// prompt has been encoded with the same special-token policy as InputProcessor.
+// Supplying the clock keeps this pure host contract deterministic in tests.
+template <typename TokenizerLike, typename StartClockCallback>
+inline auto PretokenizeBenchPromptsThenStartClock(
+    bool pretokenized_admission, const TokenizerLike& tokenizer,
+    const std::vector<std::string>& prompts,
+    StartClockCallback&& start_clock_callback) {
+  std::vector<std::vector<int32_t>> pretokenized_prompts;
+  if (pretokenized_admission) {
+    pretokenized_prompts.reserve(prompts.size());
+    for (const std::string& prompt : prompts) {
+      pretokenized_prompts.push_back(
+          tokenizer.EncodeWithSpecialTokens(prompt));
+    }
+  }
+  auto start = std::forward<StartClockCallback>(start_clock_callback)();
+  return std::make_pair(std::move(pretokenized_prompts), std::move(start));
+}
+
 // ────────────────────────────── Synthetic model ───────────────────────────────
 // A tiny hybrid-MoE Qwen3.6 (mirrors tests/vllm/v1/test_llm_engine.cpp) so the
 // harness runs end-to-end on the CPU box with no checkpoint. The NUMBERS from
@@ -367,6 +388,20 @@ inline tok::Tokenizer BuildSyntheticTokenizer() {
              {"add_prefix_space", false},
              {"trim_offsets", false},
              {"use_regex", false}}})}};
+  // Keep a real TemplateProcessing distinction in the benchmark fixture. The
+  // production string path applies this post-processor through InputProcessor;
+  // the pretokenized path must therefore use EncodeWithSpecialTokens too.
+  doc["post_processor"] = nlohmann::json::parse(R"json({
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<tool>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}}
+    ],
+    "pair": [],
+    "special_tokens": {
+      "<tool>": {"id": "<tool>", "ids": [20], "tokens": ["<tool>"]}
+    }
+  })json");
   nlohmann::json vocab = {
       {"h", 0},   {"e", 1},   {"l", 2},    {"o", 3},     {"w", 4},
       {"r", 5},   {"d", 6},   {"Ġ", 7}, {"1", 8},   {"2", 9},
@@ -546,18 +581,12 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   const char* const pretokenize_env = std::getenv("VT_BENCH_PRETOKENIZE");
   const bool pretokenized_admission =
       ResolveBenchPretokenizedAdmission(pretokenize_env);
-  std::vector<std::vector<int32_t>> pretokenized_prompts;
-  if (pretokenized_admission) {
-    pretokenized_prompts.reserve(prompts.size());
-    for (const std::string& prompt : prompts) {
-      pretokenized_prompts.push_back(
-          loaded->tokenizer().EncodeWithSpecialTokens(prompt));
-    }
-  }
+  auto [pretokenized_prompts, t0] = PretokenizeBenchPromptsThenStartClock(
+      pretokenized_admission, loaded->tokenizer(), prompts,
+      []() { return Clock::now(); });
 
   std::map<std::string, RequestRecord> records;
   std::map<std::string, vllm::v1::AsyncRequest> active;
-  const Clock::time_point t0 = Clock::now();
   auto now_s = [&]() {
     return std::chrono::duration<double>(Clock::now() - t0).count();
   };

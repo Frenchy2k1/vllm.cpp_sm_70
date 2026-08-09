@@ -21,7 +21,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; grouped router parallelised, e2e NOT ESTABLISHED | ckpt is tiktoken-only: no warm server |
 | 35B binding grid | @`a0fa12c7`: **flat 0.935-0.979x, NO c2/c8 weak cell** (CoV <0.81%); mem PSS 3.81x | Attribute the flat ~5% mid-band; TTFT c2 0.872x |
-| Qwen3.5-4B sm_120 | #206 pretoken CPU green; IDs exact vs rollback. Cross-engine tput/TTFT VOID; TPOT/VRAM OPEN | Review; GPU A/B |
+| Qwen3.5-4B sm_120 | #206 pretoken 10/10; special IDs/pre-clock/report gated. Cross-engine tput/TTFT VOID; TPOT/VRAM OPEN | Re-review; GPU A/B |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
 | SERVE-ASYNC-DENSE-MIRROR | **LANDED+VERIFIED** (`f9c969ae`): async mirror, dense Qwen3; SACRED 184/184 | Sibling scope one-liner |

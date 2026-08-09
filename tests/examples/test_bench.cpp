@@ -13,10 +13,15 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
+
+#include "vllm/v1/engine/input_processor.h"
 
 using vllm::bench::BenchConfig;
 using vllm::bench::BenchResult;
 using vllm::bench::DispatchBenchPromptAdmission;
+using vllm::bench::PretokenizeBenchPromptsThenStartClock;
 using vllm::bench::RunBench;
 
 namespace {
@@ -69,6 +74,50 @@ AdmissionObservation ObserveAdmission(const char* env_value) {
   return observed;
 }
 
+std::string RenderReport(const BenchResult& result) {
+  std::FILE* const file = std::tmpfile();
+  if (file == nullptr) throw std::runtime_error("tmpfile failed");
+  vllm::bench::PrintReport(BenchConfig{}, result, file);
+  std::fflush(file);
+  std::rewind(file);
+  std::string report;
+  char buffer[1024];
+  while (const size_t count = std::fread(buffer, 1, sizeof(buffer), file)) {
+    report.append(buffer, count);
+  }
+  std::fclose(file);
+  return report;
+}
+
+int ReportedPretokenizedAdmission(const BenchResult& result) {
+  const std::string report = RenderReport(result);
+  const std::string label = "Pretokenized prompt admission:";
+  const size_t begin = report.find(label);
+  if (begin == std::string::npos) return -1;
+  const size_t end = report.find('\n', begin);
+  const std::string line = report.substr(begin, end - begin);
+  int value = -1;
+  if (std::sscanf(line.c_str(), "Pretokenized prompt admission: %d", &value) !=
+      1) {
+    return -1;
+  }
+  return value;
+}
+
+struct RecordingTokenizer {
+  std::vector<std::string>* events = nullptr;
+
+  std::vector<int32_t> EncodeWithSpecialTokens(std::string_view prompt) const {
+    events->push_back("special:" + std::string(prompt));
+    return {20, static_cast<int32_t>(prompt.size())};
+  }
+
+  std::vector<int32_t> Encode(std::string_view prompt) const {
+    events->push_back("raw:" + std::string(prompt));
+    return {static_cast<int32_t>(prompt.size())};
+  }
+};
+
 }  // namespace
 
 TEST_CASE("bench: pretokenized admission dispatch is default-on with exact rollback") {
@@ -93,6 +142,74 @@ TEST_CASE("bench: pretokenized admission dispatch is default-on with exact rollb
   CHECK(invalid.result == 17);
   CHECK(invalid.pretokenized_calls == 1);
   CHECK(invalid.string_calls == 0);
+}
+
+TEST_CASE("bench: report exposes the resolved pretokenized admission mode") {
+  BenchResult result;
+  result.pretokenized_admission = true;
+  CHECK(ReportedPretokenizedAdmission(result) == 1);
+
+  result.pretokenized_admission = false;
+  CHECK(ReportedPretokenizedAdmission(result) == 0);
+}
+
+TEST_CASE("bench: synthetic tokenizer distinguishes prompt special tokens") {
+  const vllm::tok::Tokenizer tokenizer =
+      vllm::bench::detail::BuildSyntheticTokenizer();
+  const std::string prompt = "hello world";
+
+  CHECK(tokenizer.EncodeWithSpecialTokens(prompt) != tokenizer.Encode(prompt));
+}
+
+TEST_CASE("bench: default pretokenization completes before the clock") {
+  const std::vector<std::string> prompts = {"hello", "world"};
+  std::vector<std::string> events;
+  const RecordingTokenizer tokenizer{&events};
+
+  auto [prepared, clock_value] = PretokenizeBenchPromptsThenStartClock(
+      vllm::bench::ResolveBenchPretokenizedAdmission(nullptr), tokenizer,
+      prompts, [&]() {
+        events.push_back("clock");
+        return 73;
+      });
+
+  CHECK(events == std::vector<std::string>{"special:hello", "special:world",
+                                           "clock"});
+  CHECK(prepared ==
+        std::vector<std::vector<int32_t>>{{20, 5}, {20, 5}});
+  CHECK(clock_value == 73);
+
+  events.clear();
+  auto [rollback, rollback_clock] = PretokenizeBenchPromptsThenStartClock(
+      /*pretokenized_admission=*/false, tokenizer, prompts, [&]() {
+        events.push_back("clock");
+        return 91;
+      });
+  CHECK(rollback.empty());
+  CHECK(events == std::vector<std::string>{"clock"});
+  CHECK(rollback_clock == 91);
+}
+
+TEST_CASE("bench: pretokenized vectors match timed-string InputProcessor") {
+  const vllm::tok::Tokenizer tokenizer =
+      vllm::bench::detail::BuildSyntheticTokenizer();
+  const std::vector<std::string> prompts = {"hello", "hello world"};
+  auto [prepared, clock_value] = PretokenizeBenchPromptsThenStartClock(
+      vllm::bench::ResolveBenchPretokenizedAdmission(nullptr), tokenizer,
+      prompts, []() { return 17; });
+
+  const vllm::HfConfig config =
+      vllm::bench::detail::MakeSyntheticConfig(/*max_model_len=*/128);
+  const vllm::v1::InputProcessor input_processor(tokenizer, config);
+  REQUIRE(prepared.size() == prompts.size());
+  for (size_t i = 0; i < prompts.size(); ++i) {
+    const vllm::v1::EngineCoreRequest timed_string =
+        input_processor.process_inputs(std::to_string(i), prompts[i],
+                                       vllm::SamplingParams{},
+                                       /*arrival_time=*/0.0);
+    CHECK(prepared[i] == timed_string.prompt_token_ids);
+  }
+  CHECK(clock_value == 17);
 }
 
 TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {
