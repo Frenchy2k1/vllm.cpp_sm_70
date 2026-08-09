@@ -1,6 +1,6 @@
 # Benchmarks
 
-## At a glance: W5 manifest guarded; release artifacts pending
+## At a glance: W5 guarded; W6 claimed; release artifacts pending
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|

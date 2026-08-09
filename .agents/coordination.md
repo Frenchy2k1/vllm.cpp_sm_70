@@ -134,19 +134,19 @@ ships DEFAULT-OFF pending an operator re-measurement. dgx build/gate roots
 `dgx.casa:~/vkbase` (main control) and `~/vkbar` (this branch), both
 `-DVLLM_CPP_VULKAN=ON`, every GPU stage under `flock $HOME/gpu.lock`.
 
-**Server binary release manifest W5 (`ENG-RELEASE-BINARIES`, 2026-08-08,
-`CLAIM-ENG-RELEASE-BINARIES-W5`).** Codex (GPT-5), isolated worktree
+**Server binary release W6 (`ENG-RELEASE-BINARIES`, 2026-08-09,
+`CLAIM-ENG-RELEASE-BINARIES-W6`).** Codex (GPT-5), isolated worktree
 `/home/mudler/_git/vllm.cpp-release-binaries`, branch
-`row/ENG-RELEASE-BINARIES`, base `origin/main` `b38f78a7`. PR #129 merged the
-accepted release matrix; the current claim is W5 only: a versioned manifest
-schema, deterministic generator/validator, canonical fixtures, mutation tests,
-and the narrow release-contract/record surfaces those tests require. No W1-W4
-CUDA/CPU implementation, W6 archive/install target, release workflow,
-published artifact, download, GPU, model, kernel, or service change is in
-scope. Draft PR #141 is the claim. W5 is implemented and green at 19/19 after
-the fresh review's ten production-removal mutations were killed; the row is
-`ACTIVE`, while every archive, staged smoke, runtime, correctness, performance,
-install/package and publication claim remains pending.
+`row/ENG-RELEASE-BINARIES`, base `origin/main` `26a128c2`. W5 merged in PR #141
+at `bd20da30`; the current checkpoint is W6: canonical `vllm-server` output, a
+server-only install component, deterministic staging/archive targets, and a
+gate that installs into an empty prefix, extracts the archive, and runs
+`--help` while proving the existing library install remains unchanged. Owns
+`examples/CMakeLists.txt`, focused release-package CMake/script fixtures and
+tests, and the release contract/status surfaces. PR #196 is the live claim.
+The row remains `ACTIVE`; W1-W4 and W7-W13, publication, GPU execution,
+runtime-model correctness/performance, downloads, services, and channel
+advancement remain pending at this checkpoint.
 
 **CPU grouped keep-quant GEMM activation-dtype P0 (`QUANT-GGUF-CIQ-GEMM`,
 2026-08-06, `CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`).** Claude Code
