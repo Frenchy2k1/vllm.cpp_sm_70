@@ -577,6 +577,20 @@ LANDING_SOURCE_FILES = frozenset(
         "benchmarks/demo/qwen36_27b_c1_c32.json",
         "examples/cli/main.cpp",
         "examples/server/main.cpp",
+        # The Vulkan-vs-llama.cpp headline, added 2026-08-09. README carried two
+        # FALSE Vulkan claims ("24 native ops", "llama.cpp Vulkan stays 2.62x
+        # ahead") that no permitted change could correct, because the backend it
+        # describes had no headline-benchmark source in this list while the CUDA
+        # comparison had two.
+        #
+        # Adding docs/STATUS.md instead was considered and REJECTED: the rule
+        # above -- co-edited public projections never justify README churn -- is
+        # deliberate and directly tested
+        # (test_readme_is_not_justified_by_coedited_public_projections names
+        # docs/STATUS.md), and overturning it to unblock a README edit would be
+        # weakening a checker to make a change pass. The gap was not that the rule
+        # was wrong; it was that a real headline benchmark had no source file.
+        "benchmarks/demo/vulkan_27b_llamacpp.json",
     }
 )
 

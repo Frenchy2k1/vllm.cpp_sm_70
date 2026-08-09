@@ -30,10 +30,31 @@ class PathClassification(unittest.TestCase):
             ".agents/state.md": "append_only_record",
             "docs/STATUS.md": "public_document",
             ".github/workflows/ci.yml": "ci",
+            "src/vt/vulkan/vulkan_spirv.cpp": "generated",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), path_class)
+
+    def test_generated_class_does_not_swallow_its_own_sources(self) -> None:
+        # The generator and the GLSL it compiles are the REVIEWABLE surface and
+        # must keep their own tighter budgets. If either ever classified as
+        # `generated`, a shader change could arrive unreviewed behind the blob.
+        self.assertEqual(
+            checker.classify_path("src/vt/vulkan/shaders/vt_matmul_vec.comp"), "product"
+        )
+        self.assertEqual(checker.classify_path("scripts/gen-vulkan-spirv.py"), "product")
+
+    def test_generated_files_are_actually_generated_and_gate_verified(self) -> None:
+        # The class is only sound while every member is machine-emitted and
+        # reproduced by a gate. Assert the self-declaration at the head of each
+        # file so a hand-written file cannot be parked here to dodge review.
+        root = Path(checker.ROOT)
+        self.assertTrue(checker.GENERATED_FILES, "the class must not be empty")
+        for rel in checker.GENERATED_FILES:
+            with self.subTest(path=rel):
+                head = (root / rel).read_text(errors="replace")[:400]
+                self.assertIn("GENERATED FILE - DO NOT EDIT BY HAND", head)
 
     def test_unknown_and_noncanonical_paths_fail_closed(self) -> None:
         for path in (
