@@ -151,6 +151,15 @@ transposed (`lm_head`) or dequantized at load are not verbatim and still copy.
 `VT_LOAD_DIRECT_UPLOAD=0` turns the direct path off in the same binary; the
 loaded bytes, and therefore the tokens, are identical either way.
 
+`device_upload` counts every single-source weight upload: the bf16/fp8 weights
+through `ResidentWeight` and the compressed-tensors NVFP4/MXFP4 `packed`/`scale`
+residents through `ResidentNvfp4`. It does NOT yet count the merged fp4 operands
+(`qkv`, `gate_up`) or the Marlin repack residents, which build one device buffer
+out of several host tensors; on a bf16 checkpoint like the one above there are
+none, so the line is the whole model. Once a weight has been uploaded its source
+pages are released, and that release is independent of `VT_ADOPT_DEVICE_BYTES` --
+switching the adoption off leaves the release on.
+
 ### Quantized checkpoints: which `lm_head` forms load
 
 Publishers do not agree on how weights are stored, and a single repo can change

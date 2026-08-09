@@ -107,10 +107,31 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
   // allocation is NOT host-addressable the borrow stays as it is (a valid,
   // re-faultable view) and only the resident pages are dropped.
   if (w.mmap_src != nullptr && w.bytes.borrowed()) {
-    if (!backend.DeviceMemoryIsHostAddressable()) {
-      ReleaseDirectUploadSource(w);
-      return;
-    }
+    // ORDERING IS LOAD-BEARING, AND IT IS THE FIRST STATEMENT FOR A REASON.
+    //
+    // (1) Release BEFORE re-pointing `bytes`. The assignment below overwrites
+    // the OwnedBytes that carries this tensor's keep-alive on
+    // `StTensor::mapping`. By adoption time the shard's `SafetensorsFile` is
+    // long gone (`LoadedEngine::FromModelDir` drops `shards` at the end of the
+    // load; adoption runs lazily at first forward use), so for the LAST
+    // adopted weight of a shard that keep-alive is the last reference and
+    // `~Mapping` munmaps SYNCHRONOUSLY inside the assignment. Releasing after
+    // it would madvise a range that is no longer mapped -- observed under
+    // strace as `munmap(...) = 0` followed by `madvise(..., MADV_DONTNEED) =
+    // -1 ENOMEM`. That is a silent no-op only for as long as nothing else
+    // mmaps into the hole first; on a private anonymous mapping landing there,
+    // MADV_DONTNEED DISCARDS live data. `ReleaseHost()`'s borrowed branch
+    // already orders it this way.
+    //
+    // (2) Release BEFORE the two early returns. The page release and the
+    // adoption are two independent levers: a backend without host-addressable
+    // device memory, and the `VT_ADOPT_DEVICE_BYTES=0` A/B, must both still
+    // drop the consumed source pages. Otherwise the documented adoption knob
+    // silently turns off the direct-upload release as well.
+    ReleaseDirectUploadSource(w);
+    // Not host-addressable: the borrow STAYS as it is -- a valid, re-faultable
+    // PROT_READ MAP_PRIVATE view -- so `mmap_src` is deliberately left set.
+    if (!backend.DeviceMemoryIsHostAddressable()) return;
     if (const char* v = std::getenv("VT_ADOPT_DEVICE_BYTES");
         v != nullptr && v[0] == '0') {
       return;
@@ -121,7 +142,6 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
                                      static_cast<const void*>(w.d_dev.get()));
     self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(w.d_dev.get()),
                                     nb, std::move(keep));
-    ReleaseDirectUploadSource(w);
     self.mmap_src = nullptr;
     self.mmap_src_bytes = 0;
     return;

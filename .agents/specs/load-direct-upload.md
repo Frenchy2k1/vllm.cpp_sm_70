@@ -88,10 +88,11 @@ in the porting inventory); what is mirrored here is the number of moves.
 
 | Concern | Change |
 |---|---|
-| mapping lifetime | `SafetensorsFile` holds its `mmap`+`fd` in a `shared_ptr<Mapping>` whose destructor `munmap`s/`close`s; `StTensor::mapping` is an alias of it; `MappingKeepAlive()` exposes it. `Release()` drops this object's reference and its tensor map, so with no borrower the unmap happens at exactly the same instant as before. |
+| mapping lifetime | `SafetensorsFile` holds its `mmap`+`fd` in a `shared_ptr<Mapping>` whose destructor `munmap`s/`close`s; `StTensor::mapping` is an alias of it. `Release()` drops this object's reference and its tensor map, so with no borrower the unmap happens at exactly the same instant as before. |
 | the borrow | `BorrowStTensorBytes(o, t, dtype, shape)` — ONE entry point, fails closed. Requires a live keep-alive, a non-null source, and `numel(shape) * sizeof(dtype) == t.nbytes`. |
 | qualifying call sites | `dense_loaders::LoadBf16Direct` (hence `LoadBf16RawNK` and every arch that routes through the shared helpers), `LoadCtNvfp4W4A16`, `LoadCtMxfp4W4A16`; 27B `LoadModelBf16Direct` (BF16 arm only) and `LoadCtNvfp4Raw`; 35B `LoadBf16Direct`. |
-| post-upload residency | `AdoptDeviceBytesAsHost` gains one branch keyed on `OwnedTensor::mmap_src`: host-addressable device memory adopts the device allocation as the host view and releases the source pages; otherwise the borrow stays (a valid, re-faultable `PROT_READ MAP_PRIVATE` view) and only the pages are released. |
+| post-upload residency | `AdoptDeviceBytesAsHost` gains one branch keyed on `OwnedTensor::mmap_src`: host-addressable device memory adopts the device allocation as the host view and releases the source pages; otherwise the borrow stays (a valid, re-faultable `PROT_READ MAP_PRIVATE` view) and only the pages are released. The release is the branch's FIRST statement, ahead of both early returns and ahead of the assignment to `bytes` — that assignment drops this tensor's keep-alive on the mapping and, for the last adopted weight of a shard, munmaps synchronously, so releasing after it would madvise an unmapped range; and putting it ahead of the early returns keeps `VT_ADOPT_DEVICE_BYTES` from silently moving the release lever too. |
+| fp4 residents | `ResidentNvfp4` (shared `dense_nvfp4_gemm.h`, and the private one in `qwen3_5.cpp`) is the upload for every borrowed compressed-tensors NVFP4/MXFP4 `packed`/`scale`, so it counts `load_stats::AddDeviceUpload` and runs the same `AdoptDeviceBytesAsHost` step by publishing the allocation on the `OwnedTensor`'s `d_dev` (one control block, still freed once). |
 | merged loaders | `ReleaseBorrowedShardSource` releases a per-shard borrow once its bytes have been concatenated into the merged owned buffer. |
 | measurement | `load_stats::{AddHostCopy,AddBorrowed,AddDeviceUpload,Snapshot,Reset}`; `VT_LOAD_STATS=1` prints phase timing + the three byte counts from `model_loader.cpp`. |
 
@@ -129,7 +130,7 @@ the printed BACKEND PROOF line, not from an env var),
 
 ## Work breakdown
 
-- **W1** refcounted mapping + `StTensor::mapping` + `MappingKeepAlive`.
+- **W1** refcounted mapping + `StTensor::mapping`.
 - **W2** `BorrowStTensorBytes` (fail-closed) + `OwnedTensor::mmap_src`.
 - **W3** qualifying call sites; every other helper untouched.
 - **W4** post-upload adoption/page release; merged-shard release.
@@ -154,7 +155,15 @@ the printed BACKEND PROOF line, not from an env var),
   `qwen3_5_gguf_weights.cpp`, never on the safetensors path.
 - **Residency.** A borrow that survived the upload would keep the model resident
   in page cache; the post-upload release is what prevents that, and it is why
-  the adoption branch is part of this row rather than a follow-up.
+  the adoption branch is part of this row rather than a follow-up. It reaches
+  every single-source upload: `ResidentWeight` for the bf16 weights and
+  `ResidentNvfp4` (both copies) for the compressed-tensors NVFP4/MXFP4
+  `packed`/`scale`. **Named residual, NOT claimed:** the MERGED device operands
+  in `qwen3_5.cpp` (fp4 `qkv`/`gate_up` concatenation, the Marlin repack
+  residents) build ONE device buffer out of SEVERAL borrowed host tensors, so an
+  adoption is not representable there and those uploads are still neither
+  counted nor followed by a release. They are the 27B's own residency path and
+  predate this row; closing them is the next step, not part of this claim.
 - **Blast radius.** This is the weight-loading path for every model and backend.
   Mitigated by the fail-closed helper, the same-binary A/B
   (`VT_LOAD_DIRECT_UPLOAD=0`), and running the token-exact engine gate.
