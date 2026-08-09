@@ -313,6 +313,12 @@ jobs:
           cmake -P cmake/CudaArchFeaturesTest.cmake
           cmake -P cmake/CudaSourceGencodeTest.cmake
           cmake -P cmake/TritonAOTMultiArchTest.cmake
+      # Same tier, no CUDA involved: the in-source build guard (issue #85) is a
+      # configure-time predicate, so it is asserted the same way — by driving the
+      # module directly, with no compiler and no writes to the tree.
+      - name: In-source build guard fires on `cmake .` and only on `cmake .`
+        run: |
+          cmake -P cmake/InSourceGuardTest.cmake
           python3 -m unittest tests.scripts.test_check_cuda_fat_gencode
           python3 -m unittest tests.scripts.test_check_triton_aot_multiarch
   cuda-fat-build:
