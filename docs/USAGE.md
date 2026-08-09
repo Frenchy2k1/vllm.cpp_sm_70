@@ -51,6 +51,17 @@ Two more example binaries ship alongside it:
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
 
+### How much memory a Vulkan load needs
+
+On a unified-memory device (a DGX Spark) the Vulkan heap and system RAM are the
+same bytes, so budget roughly **the checkpoint size plus about 5%**, plus your KV
+pool. Measured on GB10: Qwen3.6-27B bf16 (50.89 GiB on disk) peaks at 53.4 GiB of
+process RSS. Reading the checkpoint also fills the page cache with about the file
+size; that is reclaimable and does not need to be budgeted, but it does make
+`MemFree` look alarming during a load. Use `MemAvailable`, not `MemFree`, to
+decide whether a model fits. `VT_VULKAN_ALLOC_STATS=1` prints the running device
+total and the `/proc` context if you need to see where it goes.
+
 A Vulkan build (`-DVLLM_CPP_VULKAN=ON`) adds three kernel-measurement binaries.
 They exist so a Vulkan tuning knob can be A/B'd in ONE binary, which is this
 project's benchmark protocol, and each one prints WHICH kernel variant it ran so

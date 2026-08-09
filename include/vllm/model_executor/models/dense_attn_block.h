@@ -193,6 +193,10 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    // The host mirror is now redundant wherever device memory is host-
+    // addressable (Vulkan). See AdoptDeviceBytesAsHost — this is what keeps a
+    // unified-memory box from holding the whole model twice.
+    AdoptDeviceBytesAsHost(d.b, w);
   }
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }

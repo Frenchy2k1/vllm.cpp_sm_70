@@ -17,6 +17,7 @@
 #endif
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -71,6 +72,47 @@ void OwnedTensor::ReleaseHost() const {
   // Reset() forces the underlying vector to deallocate its capacity.
   self.bytes.Reset();
   self.host_released = true;
+}
+
+void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
+  if (!backend.DeviceMemoryIsHostAddressable()) return;
+  // A BORROWED buffer owns no anonymous pages (a GGUF mmap is clean and
+  // file-backed; a shared expansion is a tied pair's single copy), so adopting
+  // would reclaim nothing and would break the tie. Same reasoning as
+  // ReleaseHost's borrowed branch.
+  if (w.d_dev == nullptr || w.bytes.empty() || w.bytes.borrowed()) return;
+  if (const char* v = std::getenv("VT_ADOPT_DEVICE_BYTES"); v != nullptr && v[0] == '0') {
+    return;
+  }
+  auto& self = *const_cast<OwnedTensor*>(&w);
+  const size_t nb = self.bytes.size();
+#if defined(__unix__) || defined(__APPLE__)
+  // Drop the resident anonymous pages BEFORE the vector is destroyed, for
+  // exactly the reason ReleaseHost above does it: glibc raises its dynamic mmap
+  // threshold as large blocks are freed, so free() alone leaves many weight
+  // buffers on the sbrk arena free-list with their pages still resident, and
+  // the whole point here is the RSS. Interior whole pages only, so free()'s
+  // boundary metadata is untouched.
+  {
+    const long ps_l = ::sysconf(_SC_PAGESIZE);
+    const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+    const auto begin = reinterpret_cast<uintptr_t>(self.bytes.data());
+    const uintptr_t end = begin + nb;
+    const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
+    const uintptr_t page_end = end & ~(ps - 1);
+    if (page_end > page_begin) {
+      ::madvise(reinterpret_cast<void*>(page_begin),
+                static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+    }
+  }
+#endif
+  // The keep-alive is the device allocation's own shared_ptr, so the borrowed
+  // view cannot outlive the bytes it points at: the aliasing constructor shares
+  // d_dev's control block, and the buffer is freed through the vt Backend only
+  // when BOTH the weight's d_dev and this view are gone.
+  std::shared_ptr<const void> keep(w.d_dev, static_cast<const void*>(w.d_dev.get()));
+  self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(w.d_dev.get()), nb,
+                                  std::move(keep));
 }
 
 vt::Tensor OwnedTensor::View() const {

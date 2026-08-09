@@ -217,11 +217,10 @@ Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact, 6/6
 prompts / 96/96 tokens vs the vLLM 0.25.0 oracle, all nine of that model's ops
 dispatched natively with **zero provider declines**. Qwen3.6-27B runs too, both
 GDN recurrences and the fused attention preamble native, its GDN state cache in
-place, and its RMSNorm 1024-wide (a batch-1 row is ONE workgroup, so it was
-occupancy-bound): **decode 4.24 tok/s vs llama.cpp's 4.35, prefill
-21.5x** (GB10). Still partial at 25 native kernels plus 8 GDN, the rest on the
-portable CPU tier (`kRopeCosSinCache` stays host-side, mirroring vLLM);
-quant/MoE/MLA have none at all.
+place, and its RMSNorm 1024-wide: **decode 4.24 tok/s vs llama.cpp's 4.35,
+prefill 21.5x** (GB10). A load keeps **one** copy of the weights, not two: 27B
+peak RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 native kernels
+plus 8 GDN, the rest on the portable CPU tier; quant/MoE/MLA have none at all.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations
