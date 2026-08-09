@@ -196,3 +196,21 @@ VT_ASYNC_EXECUTOR_NO_DBUF
 # (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
 VT_ASYNC_EXECUTOR_POISON
 VT_ASYNC_EXECUTOR_TRACE
+
+# Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
+# selects a kernel or a batching/residency strategy for the expert GEMMs and each
+# defaults to the measured-best path; none changes an API contract or an output.
+# Kernel-internal, so allowlisted rather than documented as user knobs.
+VT_GEMMA4_BATCH_EXPERTS
+VT_GEMMA4_CUSTOM_EXPERT
+VT_GEMMA4_EXPERT_VRAM_MB
+VT_GEMMA4_FP8_NATIVE
+VT_GEMMA4_FUSED_EXPERTS
+VT_GEMMA4_HOST_AXPY
+VT_GEMMA4_PROFILE
+# ROCm GEMM/GEMV tactic selection (rocm_matmul_hipblaslt.hip). Same class: they
+# pick between hipBLASLt and our own kernels, all defaulting to the faster arm
+# measured on gfx1201.
+VT_ROCM_GEMM_COMPUTE
+VT_ROCM_GEMV
+VT_ROCM_HIPBLASLT

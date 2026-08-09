@@ -431,3 +431,39 @@ class StatusRatchet(unittest.TestCase):
         self.assertEqual(
             doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
         )
+
+    def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
+        # A ratchet parked well above the page it guards is not a ratchet: it
+        # silently licenses regrowth up to the old number. The rule is "lower it
+        # in the same change", so the cap must track the page rather than trail
+        # it. This caught the real case -- collapsing one 33,211-char row left
+        # 32,728 chars of slack that would otherwise have been free to re-spend.
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        headers = [line for line in text.split("\n") if line.startswith("## ")]
+        measured = {
+            "chars": len(text),
+            "h2_sections": len(headers),
+            "long_paragraphs": sum(
+                1
+                for _, para in doc_tables._prose_paragraphs(text)
+                if len(para) > doc_tables.MAX_PARAGRAPH_CHARS
+            ),
+            "oversized_cells": sum(
+                1
+                for _, cells in doc_tables._table_rows(text)
+                for cell in cells
+                if len(cell) > doc_tables.MAX_CELL_CHARS
+            ),
+        }
+        for key, cap in doc_tables.STATUS_RATCHET.items():
+            with self.subTest(metric=key):
+                self.assertLessEqual(measured[key], cap)
+                # 1% of slack absorbs an in-flight edit; more than that is a cap
+                # that stopped describing the page.
+                self.assertLessEqual(
+                    cap - measured[key],
+                    max(1, cap // 100),
+                    f"{key} ratchet {cap} sits {cap - measured[key]} above the "
+                    f"measured {measured[key]}; lower it in the change that shrank "
+                    "the page",
+                )
