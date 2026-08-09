@@ -1015,9 +1015,9 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     no equivalent raw-pointer-attach path) are in
     [tenstorrent-backend.md](specs/tenstorrent-backend.md). **STATUS:
     `ACTIVE` — W0 skeleton landed 2026-08-09 (`vt::tenstorrent::Backend`, a
-    `Platform` registrar), growing toward OPT-125m: SIX of its 9 ops now
+    `Platform` registrar), growing toward OPT-125m: SEVEN of its 9 ops now
     registered (`kMatmul`, `kMatmulBT`, `kAdd` incl. rank-1 bias broadcast,
-    `kRelu`, `kEmbedding`, `kLayerNorm`), 8/8 test cases / 23/23 assertions
+    `kRelu`, `kEmbedding`, `kLayerNorm`, `kQkvSplit`), 9/9 test cases
     passing on real Blackhole hardware
     (`tests/vt/test_tenstorrent_backend.cpp`). Not yet reviewed or accepted
     by a maintainer. `ACTIVE` means a gated skeleton here, not a supported

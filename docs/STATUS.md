@@ -1316,7 +1316,7 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in positive MiB (unset/0 unlimited); `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` guard requests at 200000/4096 (0 disables); nine inherited tuning toggles are internal. No runtime/perf change.
 
-`BACKEND-TENSTORRENT`: `ACTIVE` W1.2 (ttnn adapter, 6/9 OPT-125m ops — `kMatmul`/`kMatmulBT`/`kAdd`/`kRelu`/`kEmbedding`/`kLayerNorm`), 8/8 tests PASS real Blackhole HW. Not reviewed. [Spec](../.agents/specs/tenstorrent-backend.md).
+`BACKEND-TENSTORRENT`: `ACTIVE` W1.3 (ttnn adapter, 7/9 OPT-125m ops — +`kQkvSplit` host-staged), 9/9 tests PASS real Blackhole HW. Not reviewed. [Spec](../.agents/specs/tenstorrent-backend.md).
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
