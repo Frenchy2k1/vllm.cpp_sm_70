@@ -229,14 +229,19 @@ bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols) {
 }
 
 // ---- Paged KV device shadows (ttnn layout) ---------------------------------
-// Host keeps vLLM NHD [nb, block, nkv, d] for LMCache/plane compatibility.
-// Device PA needs ttnn order [nb, nkv, block, d] TILE DRAM. We keep a separate
-// shadow per host cache base, rebuilt from host when stale (after RAC writes).
+// Host keeps vLLM NHD [nb, block, nkv, d] (LMCache/plane). Device PA needs
+// ttnn order [nb, nkv, block, d] TILE DRAM.
+//
+// Incremental path: keep a host-side ttnn-order *mirror* patched on each
+// ReshapeAndCache write. Ensure only re-uploads when the mirror is dirty or
+// too small — avoids re-walking the full NHD pool every layer.
 
 struct PagedKvShadow {
   std::optional<ttnn::Tensor> device;  // [nb, nkv, bs, d] TILE BF16 DRAM
+  std::vector<float> mirror;           // ttnn-order f32, size nb*nkv*bs*d
   uint32_t nb = 0, nkv = 0, bs = 0, d = 0;
-  bool current = false;
+  bool mirror_valid = false;   // mirror matches host NHD for [0, nb)
+  bool device_current = false; // device matches mirror
 };
 
 std::mutex& PagedKvMutex() {
@@ -248,21 +253,14 @@ std::map<uintptr_t, PagedKvShadow>& PagedKvShadows() {
   return m;
 }
 
-void InvalidatePagedKvShadow(void* host) {
+// Drop device + mirror (geometry change or Free).
+void DropPagedKvShadow(void* host) {
   if (host == nullptr) return;
   std::lock_guard<std::mutex> g(PagedKvMutex());
-  auto& m = PagedKvShadows();
-  const uintptr_t key = reinterpret_cast<uintptr_t>(host);
-  auto it = m.upper_bound(key);
-  if (it == m.begin()) return;
-  --it;
-  // Exact base only (cache tensors are whole allocations).
-  if (it->first == key) it->second.current = false;
+  PagedKvShadows().erase(reinterpret_cast<uintptr_t>(host));
 }
 
 // Convert host NHD blocks [0, used_nb) → ttnn [used_nb, nkv, bs, d] f32.
-// Only the prefix is uploaded so short sequences stay cheap (full pool can be
-// thousands of empty blocks).
 std::vector<float> NhdToTtnnLayoutPrefix(const Tensor& cache, uint32_t used_nb) {
   EnsureHost(cache);
   VT_CHECK(cache.rank == 4 && cache.IsContiguous(), "NhdToTtnn: rank-4 contiguous");
@@ -284,6 +282,70 @@ std::vector<float> NhdToTtnnLayoutPrefix(const Tensor& cache, uint32_t used_nb) 
   return out;
 }
 
+// Grow mirror to cover at least `need_nb` blocks (zero-fill new blocks).
+void EnsureMirrorCapacity(PagedKvShadow& s, uint32_t need_nb, uint32_t nkv, uint32_t bs,
+                          uint32_t d) {
+  if (s.mirror_valid && s.nkv == nkv && s.bs == bs && s.d == d && s.nb >= need_nb) return;
+  if (s.mirror_valid && s.nkv == nkv && s.bs == bs && s.d == d && s.nb < need_nb) {
+    // Grow: keep existing prefix, zero the new blocks.
+    const size_t old_n = s.mirror.size();
+    s.mirror.resize(static_cast<size_t>(need_nb) * nkv * bs * d, 0.0f);
+    (void)old_n;
+    s.nb = need_nb;
+    s.device_current = false;
+    return;
+  }
+  // Geometry mismatch or cold: allocate zeros; caller may fill from NHD.
+  s.mirror.assign(static_cast<size_t>(need_nb) * nkv * bs * d, 0.0f);
+  s.nb = need_nb;
+  s.nkv = nkv;
+  s.bs = bs;
+  s.d = d;
+  s.mirror_valid = true;
+  s.device_current = false;
+  s.device = std::nullopt;
+}
+
+// Patch one token into the ttnn-order mirror (and mark device stale).
+// `tok` is contiguous [nkv, d] for that cache plane (K or V).
+void PatchMirrorToken(PagedKvShadow& s, uint32_t block, uint32_t offset, const float* tok,
+                      uint32_t nkv, uint32_t d) {
+  VT_CHECK(s.mirror_valid && s.nkv == nkv && s.d == d && block < s.nb && offset < s.bs,
+           "PatchMirrorToken: mirror geometry");
+  for (uint32_t g = 0; g < nkv; ++g) {
+    const size_t dst =
+        (static_cast<size_t>(block) * nkv + g) * s.bs * d + static_cast<size_t>(offset) * d;
+    std::memcpy(s.mirror.data() + dst, tok + static_cast<size_t>(g) * d,
+                static_cast<size_t>(d) * sizeof(float));
+  }
+  s.device_current = false;
+}
+
+// After host NHD RAC write for one slot: patch both K and V mirrors if present.
+// Falls back to invalidating when geometry is not TILE-friendly or mirror cold.
+void NotePagedKvRacWrite(Tensor& k_cache, Tensor& v_cache, int64_t block, int64_t offset,
+                         const float* k_tok, const float* v_tok) {
+  if (k_cache.rank != 4 || v_cache.rank != 4) return;
+  const uint32_t bs = static_cast<uint32_t>(k_cache.shape[1]);
+  const uint32_t nkv = static_cast<uint32_t>(k_cache.shape[2]);
+  const uint32_t d = static_cast<uint32_t>(k_cache.shape[3]);
+  if ((d % 32u) != 0 || (bs % 32u) != 0) return;  // device PA won't run
+  if (block < 0 || offset < 0 || static_cast<uint32_t>(offset) >= bs) return;
+  const uint32_t need = static_cast<uint32_t>(block) + 1u;
+  if (need > static_cast<uint32_t>(k_cache.shape[0])) return;
+
+  std::lock_guard<std::mutex> g(PagedKvMutex());
+  auto patch_one = [&](void* host, const float* tok) {
+    PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
+    // Cold or grow: zero-fill new blocks, then patch this token (no full NHD walk).
+    EnsureMirrorCapacity(s, need, nkv, bs, d);
+    PatchMirrorToken(s, static_cast<uint32_t>(block), static_cast<uint32_t>(offset), tok, nkv,
+                     d);
+  };
+  patch_one(k_cache.data, k_tok);
+  patch_one(v_cache.data, v_tok);
+}
+
 // Return a current ttnn-layout device tensor covering physical blocks [0, used_nb).
 ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint32_t used_nb) {
   VT_CHECK(cache_nhd.rank == 4 && cache_nhd.IsContiguous(),
@@ -293,28 +355,49 @@ ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint
   const uint32_t nkv = static_cast<uint32_t>(cache_nhd.shape[2]);
   const uint32_t d = static_cast<uint32_t>(cache_nhd.shape[3]);
   VT_CHECK(used_nb > 0 && used_nb <= pool_nb, "EnsurePagedKvTtnn: used_nb out of range");
+
+  std::vector<float> upload;
   {
     std::lock_guard<std::mutex> g(PagedKvMutex());
     PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(cache_nhd.data)];
-    // Reuse when still current and covers enough blocks.
-    if (s.current && s.device.has_value() && s.nb >= used_nb && s.nkv == nkv && s.bs == bs &&
-        s.d == d) {
+
+    if (s.device_current && s.device.has_value() && s.nb >= used_nb && s.nkv == nkv &&
+        s.bs == bs && s.d == d) {
       return *s.device;
     }
+
+    // Prefer incremental mirror; rebuild from NHD if cold/short/wrong geometry.
+    if (!s.mirror_valid || s.nkv != nkv || s.bs != bs || s.d != d || s.nb < used_nb) {
+      // Release path: convert without holding the mutex for the whole NHD walk.
+    } else {
+      const size_t n_elems = static_cast<size_t>(used_nb) * nkv * bs * d;
+      upload.assign(s.mirror.begin(),
+                    s.mirror.begin() + static_cast<std::ptrdiff_t>(n_elems));
+    }
   }
-  std::vector<float> host = NhdToTtnnLayoutPrefix(cache_nhd, used_nb);
-  // Default MemoryConfig is DRAM INTERLEAVED — required by sdpa_decode K/V.
+
+  if (upload.empty()) {
+    // Cold / short mirror: full NHD→ttnn for the used prefix (outside the lock).
+    upload = NhdToTtnnLayoutPrefix(cache_nhd, used_nb);
+  }
+
   const auto spec = SpecOf(tt::tt_metal::Shape({used_nb, nkv, bs, d}), ttnn::DataType::BFLOAT16,
                            ttnn::Layout::TILE);
-  ttnn::Tensor dev = ttnn::Tensor::from_vector<float>(host, spec, &device);
+  ttnn::Tensor dev = ttnn::Tensor::from_vector<float>(upload, spec, &device);
+
   std::lock_guard<std::mutex> g(PagedKvMutex());
   PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(cache_nhd.data)];
+  // If RAC raced and built a larger mirror, keep the larger one; still publish dev.
+  if (!s.mirror_valid || s.nkv != nkv || s.bs != bs || s.d != d || s.nb < used_nb) {
+    s.mirror = std::move(upload);
+    s.nb = used_nb;
+    s.nkv = nkv;
+    s.bs = bs;
+    s.d = d;
+    s.mirror_valid = true;
+  }
   s.device = dev;
-  s.nb = used_nb;
-  s.nkv = nkv;
-  s.bs = bs;
-  s.d = d;
-  s.current = true;
+  s.device_current = true;
   return dev;
 }
 
@@ -1106,6 +1189,14 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   auto* vdst = static_cast<uint8_t*>(v_cache.data);
   const size_t bytes = static_cast<size_t>(n_elems) * esz;
 
+  // Optional float staging for ttnn-mirror incremental patches (TILE-legal only).
+  const bool patch_mirror = (head_size % 32) == 0 && (block_size % 32) == 0;
+  std::vector<float> k_tok, v_tok;
+  if (patch_mirror) {
+    k_tok.resize(static_cast<size_t>(n_elems));
+    v_tok.resize(static_cast<size_t>(n_elems));
+  }
+
   for (int64_t t = 0; t < num_slots; ++t) {
     const int64_t slot = slots[t];
     if (slot < 0) continue;
@@ -1117,12 +1208,23 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
                 ksrc + static_cast<size_t>(t * k_tok_stride) * esz, bytes);
     std::memcpy(vdst + static_cast<size_t>(vdst_off) * esz,
                 vsrc + static_cast<size_t>(t * v_tok_stride) * esz, bytes);
+    // Patch ttnn-order host mirrors so the next Ensure only re-uploads.
+    if (patch_mirror) {
+      for (int64_t i = 0; i < n_elems; ++i) {
+        k_tok[static_cast<size_t>(i)] =
+            LoadElemF32(k, t * k_tok_stride + i);  // k is [T,H,D] contiguous head major
+        v_tok[static_cast<size_t>(i)] = LoadElemF32(v, t * v_tok_stride + i);
+      }
+      // k/v token layout is [Hkv, Dh] contiguous — same as n_elems = Hkv*Dh.
+      NotePagedKvRacWrite(k_cache, v_cache, block, offset, k_tok.data(), v_tok.data());
+    }
   }
   CommitHost(k_cache);
   CommitHost(v_cache);
-  // Host NHD is source of truth; drop any ttnn-layout device shadow.
-  InvalidatePagedKvShadow(k_cache.data);
-  InvalidatePagedKvShadow(v_cache.data);
+  if (!patch_mirror) {
+    DropPagedKvShadow(k_cache.data);
+    DropPagedKvShadow(v_cache.data);
+  }
 }
 
 // Try pure-decode device PA via ttnn::paged_scaled_dot_product_attention_decode.
@@ -1641,10 +1743,7 @@ void UnregisterHostBuffer(void* host) {
     std::lock_guard<std::mutex> g(SlotMutex());
     Slots().erase(reinterpret_cast<uintptr_t>(host));
   }
-  {
-    std::lock_guard<std::mutex> g(PagedKvMutex());
-    PagedKvShadows().erase(reinterpret_cast<uintptr_t>(host));
-  }
+  DropPagedKvShadow(host);
 }
 
 void MarkHostWritten(void* host) {
