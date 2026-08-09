@@ -435,6 +435,30 @@ const uint32_t kInFlight = [] {
 // checked at dispatch so an overrun names itself instead of smashing the stack.
 constexpr uint32_t kMaxDispatchBindings = 32;
 
+// SMART BARRIERS (BACKEND-VULKAN-BARRIERS), VT_VULKAN_SMART_BARRIERS.
+//
+// The batched dispatch path records a full COMPUTE->COMPUTE memory barrier before
+// EVERY dispatch -- about 900 per 27B decode token -- because the ops in a decode
+// step are sequentially dependent and a dispatch that misses its producer's writes
+// computes garbage. llama.cpp does not: it calls `ggml_vk_sync_buffers`
+// (ggml-vulkan.cpp:3193 @ pin 237ad9b96) at 42 explicit call sites and tracks
+// per-scratch-buffer `prealloc_{x,y,split_k}_need_sync` flags (:2108, :8174,
+// :8687-8748) so a sync happens only where a real dependency exists.
+//
+// This is the same idea made GENERAL rather than per-scratch-buffer: the buffers
+// each dispatch reads and writes are known exactly (the committed SPIR-V records
+// which bindings are NonWritable, see vulkan_spirv.h), so the barrier can be
+// driven by an actual hazard test instead of by a call site the author remembered.
+//
+// DEFAULT OFF. The failure mode of a wrong answer here is not a crash, it is
+// silently wrong numbers, and this backend has already shipped one measured-faster
+// arm that computed garbage on the real driver while passing on llvmpipe (see the
+// FENCE SPIN note above). The default moves only on GB10 evidence.
+const bool kSmartBarriersEnv = [] {
+  const char* v = std::getenv("VT_VULKAN_SMART_BARRIERS");
+  return v != nullptr && std::strcmp(v, "0") != 0;
+}();
+
 // Descriptor-ring sets available to ONE slot. The ring is partitioned rather
 // than shared, so slot s owns [s*kRingSlice, (s+1)*kRingSlice) and no set can be
 // rewritten by a batch while an earlier, still-executing batch reads it.
@@ -485,6 +509,10 @@ struct VulkanContext::Pipeline {
   // the counter lives here and DispatchHistogram aggregates on demand.
   uint64_t dispatches = 0;
   const char* module_name = nullptr;  // points into the committed SPIR-V table
+  // Bit i set iff binding i is one the SHADER MAY WRITE, copied from the
+  // committed SPIR-V table (vulkan_spirv.h § writable_mask). The dispatch path
+  // splits its buffer array into a read set and a write set with it.
+  uint32_t writable_mask = 0;
 };
 
 // The set of buffers bound by any batch that has not yet been drained.
@@ -818,6 +846,8 @@ VulkanContext::VulkanContext() {
   pipelines_ = new std::map<std::string, Pipeline>();
   dispatch_ms_ = new std::map<std::string, double>();
   batch_buffers_ = new BufferSet();
+  hazard_written_ = new BufferSet();
+  hazard_read_ = new BufferSet();
   // TWO timestamps per dispatch (before and after), for a whole batch, and ONE
   // RANGE PER SLOT: a slot's queries are read back only when that slot retires,
   // so two in-flight batches must not share query indices. Created only under the
@@ -895,6 +925,24 @@ VulkanContext::VulkanContext() {
       }
       std::fprintf(stderr, "[vt vulkan] %-24s %8llu %10.1f\n", "TOTAL",
                    static_cast<unsigned long long>(ctx.dispatch_count()), total_ms);
+      // THE BARRIER LINE. The span is the GPU's own wall over each command
+      // buffer; total_ms above is the sum of the individual dispatch intervals.
+      // Their difference is the GPU time spent BETWEEN dispatches -- the barrier
+      // drains and the launch setup -- which is the only direct measurement of
+      // what BACKEND-VULKAN-BARRIERS is trying to remove, and it is invisible in
+      // every per-shader row above. Read the gap, not the arms' per-shader sums:
+      // once barriers are skipped, adjacent dispatches may OVERLAP and their
+      // intervals double-count.
+      const double span = ctx.gpu_span_ms();
+      std::fprintf(stderr,
+                   "[vt vulkan] BARRIERS recorded=%llu skipped=%llu smart=%d\n"
+                   "[vt vulkan] GPU span=%.1f ms over %llu cmdbufs, "
+                   "sum-of-dispatch=%.1f ms, GAP=%.1f ms (%.1f%%)\n",
+                   static_cast<unsigned long long>(ctx.barrier_count()),
+                   static_cast<unsigned long long>(ctx.barrier_skip_count()),
+                   ctx.smart_barriers() ? 1 : 0, span,
+                   static_cast<unsigned long long>(ctx.gpu_span_batches()), total_ms,
+                   span - total_ms, span > 0 ? 100.0 * (span - total_ms) / span : 0.0);
     });
   }
   mutex_ = new std::mutex();
@@ -1037,9 +1085,24 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
                " value(s) were supplied — host and committed SPIR-V have drifted;"
                " regenerate with scripts/gen-vulkan-spirv.py");
 
+  // The binding COUNT must agree too, and for a second reason beyond the layout:
+  // the writable mask below is indexed by binding, so a host that bound more
+  // buffers than the module declares would get mask bit 0 -- "read-only" -- for
+  // the extra ones, and the hazard analysis would then be free to skip a barrier
+  // for a buffer the shader can write. Bound LOUDLY rather than conservatively,
+  // because a mismatch is a host/shader drift that also breaks the descriptor set
+  // layout and should never be tolerated silently.
+  VT_CHECK(module->binding_count == buffer_count,
+           "vulkan: kernel '" + name + "' declares " +
+               std::to_string(module->binding_count) + " descriptor binding(s) but " +
+               std::to_string(buffer_count) +
+               " buffer(s) were bound — host and committed SPIR-V have drifted;"
+               " regenerate with scripts/gen-vulkan-spirv.py");
+
   Pipeline p;
   p.buffer_count = buffer_count;
   p.push_size = push_size;
+  p.writable_mask = module->writable_mask;
   // The committed SPIR-V table has static storage duration, so this pointer
   // outlives the pipeline and the histogram can key on it without copying.
   p.module_name = module->name;
@@ -1240,6 +1303,41 @@ uint64_t VulkanContext::barrier_count() const {
   return barrier_count_;
 }
 
+uint64_t VulkanContext::barrier_skip_count() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return barrier_skipped_;
+}
+
+bool VulkanContext::smart_barriers() const {
+  if (smart_barriers_override_ != 0) return smart_barriers_override_ > 0;
+  return kSmartBarriersEnv;
+}
+
+void VulkanContext::set_smart_barriers_override(int v) {
+  // Drain FIRST. hazard_written_/hazard_read_ describe commands already recorded
+  // under the OLD policy; switching while a batch is open or in flight would let
+  // the new policy reason about a history it did not build. After a drain the GPU
+  // is idle and the next dispatch starts from a clean slate either way.
+  //
+  // The sets are deliberately NOT cleared here even so -- see the header for why
+  // they are cleared only by an emitted barrier. Keeping them merely costs the
+  // next dispatch a barrier it may not have needed.
+  FlushBatch("smart-barrier-policy-change");
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  smart_barriers_override_ = v;
+  force_barrier_next_ = true;
+}
+
+double VulkanContext::gpu_span_ms() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return static_cast<double>(gpu_span_ns_) / 1.0e6;
+}
+
+uint64_t VulkanContext::gpu_span_batches() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return gpu_span_batches_;
+}
+
 void VulkanContext::FlushIfBatchTouches(void* buffer, const char* why) {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   // A host pointer (nullptr) cannot alias a bound VkBuffer, so it never forces a
@@ -1296,9 +1394,23 @@ void VulkanContext::RetireSlotLocked(uint32_t s) {
                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
         VK_SUCCESS) {
       auto& acc = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
+      // Earliest top-of-pipe and latest bottom-of-pipe over the whole command
+      // buffer. Taken as a MIN and a MAX rather than "first and last", because
+      // once barriers are skipped the dispatches may overlap and need not retire
+      // in the order they were recorded. Zero ticks mean the query was never
+      // written and are excluded, or they would drag the span back to the epoch.
+      uint64_t span_lo = 0, span_hi = 0;
       for (uint32_t i = 0; i < n; ++i) {
         const uint64_t t0 = ticks[i * 2], t1 = ticks[i * 2 + 1];
         if (t1 > t0) acc[(*names)[i]] += double(t1 - t0) * timestamp_period_ns_ / 1.0e6;
+        if (t0 == 0 || t1 == 0) continue;
+        if (span_lo == 0 || t0 < span_lo) span_lo = t0;
+        if (t1 > span_hi) span_hi = t1;
+      }
+      if (span_hi > span_lo && span_lo != 0) {
+        gpu_span_ns_ += static_cast<uint64_t>(double(span_hi - span_lo) *
+                                              timestamp_period_ns_);
+        ++gpu_span_batches_;
       }
     }
     names->clear();
@@ -1509,14 +1621,76 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     // executing, and this barrier -- which orders against everything earlier in
     // SUBMISSION ORDER on the same queue, not merely earlier in this buffer -- is
     // what carries the dependency across the command-buffer boundary.
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0,
-                            nullptr);
-    ++barrier_count_;
+    //
+    // SMART BARRIERS (BACKEND-VULKAN-BARRIERS) narrow "every dispatch" to "every
+    // dispatch that could actually observe or clobber an earlier one". The
+    // decision DEFAULTS TO EMITTING: a barrier is skipped only when this
+    // dispatch's operands are proven disjoint, in the hazardous direction, from
+    // every operand recorded since the previous barrier. The three sets and the
+    // invariant they maintain are documented on hazard_written_ in the header,
+    // and the cross-command-buffer guarantee above is unchanged -- when the test
+    // says hazard, the barrier recorded is exactly the one that was always
+    // recorded, with exactly the same submission-order scope.
+    auto& written = *static_cast<BufferSet*>(hazard_written_);
+    auto& read = *static_cast<BufferSet*>(hazard_read_);
+    const bool analyse = smart_barriers_override_ != 0 ? smart_barriers_override_ > 0
+                                                       : kSmartBarriersEnv;
+    // The always-barrier arm does not maintain the access history -- it does not
+    // need it, and paying for it there would make the control arm slower than the
+    // tree it is the control FOR. That leaves the history empty on the first
+    // dispatch after the policy is switched ON, which would read as "no hazard"
+    // when the truth is "no history". force_barrier_next_ makes that transition
+    // emit one barrier, after which the invariant is established honestly.
+    bool hazard = true;
+    if (analyse && !force_barrier_next_) {
+      hazard = false;
+      for (uint32_t i = 0; i < buffer_count && !hazard; ++i) {
+        void* b = const_cast<void*>(buffers[i]);
+        if ((p.writable_mask >> i) & 1u) {
+          // A WRITE collides with an earlier write (WAW) and with an earlier read
+          // (WAR); the latter is why the read set has to exist at all.
+          hazard = written.Contains(b) || read.Contains(b);
+        } else {
+          // A READ collides only with an earlier WRITE (RAW). Two dispatches that
+          // merely read the same buffer -- the gate and up projections sharing one
+          // normalized activation, say -- need no ordering between them.
+          hazard = written.Contains(b);
+        }
+      }
+    }
+    if (hazard) {
+      VkMemoryBarrier mb{};
+      mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
+                              0, nullptr);
+      ++barrier_count_;
+      // The barrier orders this dispatch after every command submitted earlier on
+      // this queue, so nothing before it can still be a hazard and the history
+      // restarts empty. Cleared HERE and nowhere else -- not at a flush, not at a
+      // drain -- which is what makes the invariant hold across command buffers.
+      written.Clear();
+      read.Clear();
+      force_barrier_next_ = false;
+    } else {
+      ++barrier_skipped_;
+    }
+    // Record this dispatch's accesses AFTER the decision, so a dispatch is never
+    // tested against itself. A buffer bound at both a readable and a writable
+    // binding is entered in BOTH sets, which is a superset of the truth and can
+    // only ever produce an extra barrier.
+    if (analyse) {
+      for (uint32_t i = 0; i < buffer_count; ++i) {
+        void* b = const_cast<void*>(buffers[i]);
+        if ((p.writable_mask >> i) & 1u) {
+          written.Insert(b);
+        } else {
+          read.Insert(b);
+        }
+      }
+    }
   }
 
   vk.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);

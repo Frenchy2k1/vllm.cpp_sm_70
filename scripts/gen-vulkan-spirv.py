@@ -114,6 +114,95 @@ SPIRV_OP_DECORATE = 71
 SPIRV_DECORATION_SPEC_ID = 1
 SPIRV_HEADER_WORDS = 5
 
+# The rest of the annotation/type opcodes the BINDING ACCESS reflection below
+# needs (SPIR-V core spec §3.52 Instructions, §3.20 Decoration).
+SPIRV_OP_TYPE_POINTER = 32
+SPIRV_OP_VARIABLE = 59
+SPIRV_OP_MEMBER_DECORATE = 72
+SPIRV_DECORATION_NON_WRITABLE = 24
+SPIRV_DECORATION_BINDING = 33
+
+# Mirrors kMaxDispatchBindings in src/vt/vulkan/vulkan_context.cpp. The mask
+# below is one bit per binding, so a shader with more bindings than this could
+# not be described and must fail LOUDLY rather than silently reporting the
+# overflow bindings as read-only.
+MAX_BINDINGS = 32
+
+
+def _instructions(blob: bytes):
+    """Yield (opcode, [operand words]) for one SPIR-V module."""
+    words = [int.from_bytes(blob[i:i + 4], "little") for i in range(0, len(blob), 4)]
+    i = SPIRV_HEADER_WORDS
+    while i < len(words):
+        word_count = words[i] >> 16
+        opcode = words[i] & 0xFFFF
+        if word_count == 0:
+            sys.exit("malformed SPIR-V: zero-length instruction")
+        yield opcode, words[i + 1:i + word_count]
+        i += word_count
+
+
+def binding_access(blob: bytes, name: str) -> tuple[int, int]:
+    """Return (binding_count, writable_mask) for one SPIR-V module.
+
+    WHY THIS IS PARSED OUT OF THE COMPILED MODULE AND NOT WRITTEN DOWN BY HAND.
+    The Vulkan backend can only skip a pipeline barrier between two dispatches if
+    it can prove they do not share a buffer in a hazardous way, and that proof
+    needs each dispatch's READ set and WRITE set. Nothing on the host side knows
+    them: `VulkanContext::Dispatch` receives one flat array of VkBuffers with no
+    roles attached, and guessing a role from the binding index would be exactly
+    the unverified assumption that turns a missing barrier into silently wrong
+    numbers.
+
+    The GLSL already states it, and glslang ENFORCES it: a `readonly buffer`
+    block is a compile error to write to, and the compiler records the promise as
+    a `NonWritable` decoration in the emitted module. So the committed SPIR-V is
+    an authoritative, machine-checked statement of which bindings the shader can
+    write, and the freshness check on this generator keeps it from drifting from
+    the .comp source.
+
+    A binding is reported WRITABLE unless a NonWritable decoration is positively
+    found for it, so an unrecognised encoding degrades to "assume it is written",
+    which costs a barrier rather than correctness.
+    """
+    binding_of: dict[int, int] = {}       # variable id -> binding number
+    var_non_writable: set[int] = set()    # variable ids decorated NonWritable
+    member_non_writable: set[tuple[int, int]] = set()
+    pointee_of: dict[int, int] = {}       # pointer type id -> pointee type id
+    ptr_type_of: dict[int, int] = {}      # variable id -> pointer type id
+    for opcode, ops in _instructions(blob):
+        if opcode == SPIRV_OP_DECORATE and len(ops) >= 3:
+            if ops[1] == SPIRV_DECORATION_BINDING:
+                binding_of[ops[0]] = ops[2]
+        elif opcode == SPIRV_OP_DECORATE and len(ops) == 2:
+            if ops[1] == SPIRV_DECORATION_NON_WRITABLE:
+                var_non_writable.add(ops[0])
+        elif opcode == SPIRV_OP_MEMBER_DECORATE and len(ops) >= 3:
+            if ops[2] == SPIRV_DECORATION_NON_WRITABLE:
+                member_non_writable.add((ops[0], ops[1]))
+        elif opcode == SPIRV_OP_TYPE_POINTER and len(ops) == 3:
+            pointee_of[ops[0]] = ops[2]
+        elif opcode == SPIRV_OP_VARIABLE and len(ops) >= 3:
+            ptr_type_of[ops[1]] = ops[0]
+
+    if not binding_of:
+        sys.exit(f"{name}: no descriptor bindings found in the SPIR-V")
+    mask = 0
+    for var, binding in binding_of.items():
+        if binding >= MAX_BINDINGS:
+            sys.exit(f"{name}: binding {binding} is at or above the backend's "
+                     f"{MAX_BINDINGS}-binding limit")
+        block = pointee_of.get(ptr_type_of.get(var, -1), -1)
+        read_only = var in var_non_writable or (block, 0) in member_non_writable
+        if not read_only:
+            mask |= 1 << binding
+    count = max(binding_of.values()) + 1
+    # The host binds descriptors 0..count-1 densely, so a hole would mean the
+    # mask's bit positions no longer line up with the dispatch's buffer array.
+    if len(set(binding_of.values())) != count:
+        sys.exit(f"{name}: descriptor bindings are not a dense 0..{count - 1} range")
+    return count, mask
+
 
 def spec_ids(blob: bytes) -> list[int]:
     """Return the SpecId values decorated in one SPIR-V module, sorted ascending."""
@@ -178,12 +267,31 @@ def render_header(blobs: dict[str, bytes], version: str) -> str:
     add("// passes specialization values BY ID, and Vulkan SILENTLY IGNORES a map entry")
     add("// whose ID the module does not declare - so without this table a host/shader")
     add("// drift produces WRONG NUMBERS instead of a clean failure.")
+    add("//")
+    add("// binding_count is the number of descriptor bindings the module declares, and")
+    add("// writable_mask has bit i set iff binding i is NOT decorated NonWritable, i.e.")
+    add("// iff the shader is permitted to WRITE that buffer. Both are parsed out of the")
+    add("// compiled module rather than written down beside it.")
+    add("//")
+    add("// This is the READ/WRITE SET the dispatch path needs to decide whether two")
+    add("// dispatches are genuinely independent. Dispatch() is handed one flat array of")
+    add("// VkBuffers with no roles attached, and inferring a role from the binding index")
+    add("// would be an unverified assumption whose failure mode is a MISSING BARRIER and")
+    add("// therefore silently wrong numbers. `readonly` in the GLSL is enforced by")
+    add("// glslang (writing such a block is a compile error) and recorded as NonWritable")
+    add("// in the SPIR-V, so this mask is a machine-checked fact about the shader.")
+    add("//")
+    add("// A bit is SET unless read-only is positively proven, so anything the")
+    add("// reflection does not understand degrades to an extra barrier, never a")
+    add("// missing one.")
     add("struct SpirvModule {")
     add("  const char* name;")
     add("  const uint32_t* words;")
     add("  size_t word_count;")
     add("  const uint32_t* spec_ids;")
     add("  size_t spec_id_count;")
+    add("  uint32_t binding_count;")
+    add("  uint32_t writable_mask;")
     add("};")
     add("")
     add("// DEFINED IN vulkan_spirv.cpp. The array is `extern` and therefore of unknown")
@@ -231,8 +339,9 @@ def render_source(blobs: dict[str, bytes], version: str) -> str:
     for name in sorted(blobs):
         ids = spec_ids(blobs[name])
         idp = f"kSpecIds_{name}" if ids else "nullptr"
+        count, mask = binding_access(blobs[name], name)
         add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t), '
-            f'{idp}, {len(ids)}}},')
+            f'{idp}, {len(ids)}, {count}u, 0x{mask:08x}u}},')
     add("};")
     add("const size_t kSpirvModuleCount = sizeof(kSpirvModules) / sizeof(kSpirvModules[0]);")
     add("")

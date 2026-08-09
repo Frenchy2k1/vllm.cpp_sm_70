@@ -118,6 +118,22 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Vulkan dependency-driven barriers (`BACKEND-VULKAN`, 2026-08-09, `CLAIM-VULKAN-FULL-1`).** Claude Code (opus-5), isolated worktree
+`/home/mudler/_git/vllm.cpp/.claude/worktrees/agent-aab93052e5a3c7025`, branch
+`row/BACKEND-VULKAN-BARRIERS`, base `origin/main` `c1716fd0` (rebased forward;
+the commits main gained carry NO `src/`, `examples/` or gate-test change, so the
+GB10 evidence stands). NOT PUSHED, no PR, by instruction. Scope: the batched
+dispatch path's barrier policy in `src/vt/vulkan/vulkan_context.{h,cpp}`, the
+SPIR-V binding-access reflection in `scripts/gen-vulkan-spirv.py` and its two
+generated artifacts, two new cases in `tests/vt/test_vulkan_backend.cpp`, and one
+`docs/ENVIRONMENT.md` row. NO kernel, shader, model, scheduler or op-table change.
+The row's headline result is that the llama.cpp Vulkan decode gate is ALREADY MET
+on current main (4.36 vs 4.35, 7 clean legs) independently of the lever;
+`VT_VULKAN_SMART_BARRIERS` is implemented, GB10-gated in 12 combinations, and
+ships DEFAULT-OFF pending an operator re-measurement. dgx build/gate roots
+`dgx.casa:~/vkbase` (main control) and `~/vkbar` (this branch), both
+`-DVLLM_CPP_VULKAN=ON`, every GPU stage under `flock $HOME/gpu.lock`.
+
 **Server binary release manifest W5 (`ENG-RELEASE-BINARIES`, 2026-08-08,
 `CLAIM-ENG-RELEASE-BINARIES-W5`).** Codex (GPT-5), isolated worktree
 `/home/mudler/_git/vllm.cpp-release-binaries`, branch
