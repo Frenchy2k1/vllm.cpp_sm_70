@@ -202,6 +202,26 @@ const char* ArgmaxGeometricScratchSelector() {
   return selector;
 }
 
+struct CudaArgmaxScratchRuntime {
+  bool IsCapturing(cudaStream_t stream) const {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    Check(cudaStreamIsCapturing(stream, &status), "argmax scratch capture query");
+    return status != cudaStreamCaptureStatusNone;
+  }
+
+  void* Allocate(size_t bytes, cudaStream_t stream) const {
+    void* p = nullptr;
+    Check(cudaMallocAsync(&p, bytes, stream), "argmax geometric scratch allocation");
+    return p;
+  }
+
+  void CleanupPartial(void* p, cudaStream_t stream) const {
+    Check(cudaFreeAsync(p, stream), "argmax geometric scratch partial cleanup");
+  }
+
+  void Retire(void* p) const { RetireGraphScratch(p); }
+};
+
 void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
@@ -238,24 +258,9 @@ void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
           throw std::overflow_error("argmax scratch element-count overflow");
         }
         const size_t need = static_cast<size_t>(n) * static_cast<size_t>(bpr);
-        const ArgmaxScratchKey key{q.device.index, reinterpret_cast<std::uintptr_t>(s)};
-        g_argmax_geometric_owners.Submit(
-            key, need,
-            [&] {
-              cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-              Check(cudaStreamIsCapturing(s, &status), "argmax scratch capture query");
-              return status != cudaStreamCaptureStatusNone;
-            },
-            [&](size_t bytes) -> void* {
-              void* p = nullptr;
-              Check(cudaMallocAsync(&p, bytes, s), "argmax geometric scratch allocation");
-              return p;
-            },
-            [&](void* p) {
-              Check(cudaFreeAsync(p, s), "argmax geometric scratch partial cleanup");
-            },
-            [](void* p) { RetireGraphScratch(p); },
-            [&](ArgmaxScratchView scratch) {
+        CudaArgmaxScratchRuntime runtime;
+        SubmitCudaArgmaxScratch(
+            g_argmax_geometric_owners, q, s, need, runtime, [&](ArgmaxScratchView scratch) {
               dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
               ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(scratch.values, scratch.indices,
                                                            logits.Ptr<float>(), v, bpr);
