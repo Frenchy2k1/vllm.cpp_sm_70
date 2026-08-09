@@ -108,7 +108,8 @@
           "avx",
           "avx2",
           "f16c",
-          "osxsave"
+          "osxsave",
+          "sse2"
         ],
         "required_os_state": [
           "xcr0:xmm",
@@ -129,8 +130,13 @@
         "name": "avx512f",
         "required_cpu_bits": [
           "avx",
+          "avx2",
+          "avx512bw",
           "avx512f",
-          "osxsave"
+          "avx512vl",
+          "f16c",
+          "osxsave",
+          "sse2"
         ],
         "required_os_state": [
           "xcr0:xmm",

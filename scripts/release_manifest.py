@@ -57,8 +57,11 @@ CPU_TIER_POLICY = {
         "bits": {
             "portable-sse2": {"sse2"},
             "sse2-f16c": {"sse2", "avx", "f16c", "osxsave"},
-            "avx2-f16c": {"avx", "avx2", "f16c", "osxsave"},
-            "avx512f": {"avx", "avx512f", "osxsave"},
+            "avx2-f16c": {"sse2", "avx", "avx2", "f16c", "osxsave"},
+            "avx512f": {
+                "sse2", "avx", "f16c", "avx2", "avx512f", "avx512bw",
+                "avx512vl", "osxsave",
+            },
         },
         "os_state": {
             "portable-sse2": set(),

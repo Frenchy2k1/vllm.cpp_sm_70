@@ -61,9 +61,9 @@ TEST_CASE("x86 forced tiers fail closed instead of silently narrowing") {
   CHECK_FALSE(SelectX86IsaTier(baseline, "avx2", &selected, &error));
   CHECK_FALSE(SelectX86IsaTier(baseline, "avx512", &selected, &error));
   CHECK_FALSE(SelectX86IsaTier(baseline, "amx", &selected, &error));
-        const bool has_reason = error.find("unsupported") != std::string::npos ||
-                                error.find("unknown") != std::string::npos;
-        CHECK(has_reason);
+  const bool has_reason = error.find("unsupported") != std::string::npos ||
+                          error.find("unknown") != std::string::npos;
+  CHECK(has_reason);
 }
 
 TEST_CASE("x86 release inventory lists only compiled elementwise GEMM tiers") {
