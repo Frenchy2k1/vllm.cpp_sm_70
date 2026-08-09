@@ -1015,11 +1015,13 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     no equivalent raw-pointer-attach path) are in
     [tenstorrent-backend.md](specs/tenstorrent-backend.md). **STATUS:
     `ACTIVE` — W0 skeleton landed 2026-08-09 (`vt::tenstorrent::Backend`, a
-    `Platform` registrar, ONE op (`kMatmul`, F32/rank-2 only)), 3/3 test
-    cases passing on real Blackhole hardware
-    (`tests/vt/test_tenstorrent_backend.cpp`). Not yet reviewed or accepted
-    by a maintainer. `ACTIVE` means a gated skeleton here, not a supported
-    backend — same caveat Metal/Vulkan's own `ACTIVE` status carries.**
+    `Platform` registrar), growing toward OPT-125m: FOUR of its 9 ops now
+    registered (`kMatmul`, `kMatmulBT`, `kAdd` incl. rank-1 bias broadcast,
+    `kRelu`, F32/rank-2 only), 6/6 test cases / 16/16 assertions passing on
+    real Blackhole hardware (`tests/vt/test_tenstorrent_backend.cpp`). Not
+    yet reviewed or accepted by a maintainer. `ACTIVE` means a gated
+    skeleton here, not a supported backend — same caveat Metal/Vulkan's own
+    `ACTIVE` status carries.**
 
 ## 10. E2E test suites (T0 deliverable)
 
