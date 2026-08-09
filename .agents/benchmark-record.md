@@ -18117,3 +18117,51 @@ Diagnostic evidence hashes: local log/token
 and `/tmp/qwen35-vllm-ttft-split-pin.*`. The next gate pre-tokenizes every
 local prompt before `t0`, submits the existing token-ID overload, then repeats
 counterbalanced same-binary rollback and fresh local/vLLM comparisons.
+
+## 2026-08-09 — pretokenized frontend real A/B failed token identity; timings void
+
+**Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206).
+The first real-GPU pair used clean implementation/review head
+`a33993a7cd8fdcf33b2b91112ef7a172b8f63fe1`, binary SHA-256
+`50f509cbde5865a6b0fe3b2bce0a05b68bf716337d41a90cb88d66480f1f8d02`
+and the accepted K4 causal-conv plus post-conv-token-tile flags in both arms.
+STRING-r1 set `VT_BENCH_PRETOKENIZE=0`; TOKENS-r1 set
+`VT_BENCH_PRETOKENIZE=1`. The ShareGPT corpus SHA-256 remained
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
+
+The hard correctness gate failed and stopped the series after that pair. Both
+arms reported 131,784 input tokens and produced 128 requests x 128 output
+tokens, but only **98/128 requests** and **15,507/16,384 positions** matched.
+The differing request IDs were
+`[1,7,10,23,30,41,46,50,51,60,61,68,70,74,77,80,82,83,85,86,88,92,95,110,113,116,122,124,126,127]`.
+STRING-r1 output SHA-256 was
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`;
+TOKENS-r1 was
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`.
+Raw evidence is `/tmp/qwen35-ab-pretoken-a33993a7/`; the two log SHA-256
+values are `02c4381844c0a62aa2cf20023750ada2042d54f11f65189d7cf581060a6fe197`
+and `3b0efb96c8b5ede5565bb12081d0d9010ccf10957a6fcb33ad7203ad766bc8d0`.
+
+| Invalid one-pair observation | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| STRING-r1 | 6803.47 | 752.31 | 1012.01 ms | 34.65 ms | 5412.13 ms |
+| TOKENS-r1 | 6839.78 | 756.32 | 1012.97 ms | 34.45 ms | 5388.73 ms |
+
+These values are **VOID**: changed output means changed work, so none receives
+performance credit and the missing second/third repetitions are not a reason to
+continue an invalid series.
+
+The mechanism is the admission boundary. Local `AsyncLLM` publishes and
+notifies one request at a time, and its background `EngineCoreProc` blocks on
+the first item then drains only items immediately available. String admission
+tokenizes between publishes; pretokenized admission publishes fast enough to
+change which requests are present for the first scheduling step. The pinned
+wrapper synchronously adds every request in the initial concurrency before its
+first `engine.step`, then publishes each refill group between steps. The next
+discriminator is therefore an additive **atomic wave admission** API: prepare
+all inputs and collectors first, register them under the shutdown lock, append
+every core ADD under one queue lock, and notify once. The benchmark will record
+arrivals for a whole refill wave and publish it once, so string rollback still
+times tokenization while both arms execute identical batches. The full
+RED-first, rollback and mutation gates are binding in the
+[campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
