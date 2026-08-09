@@ -21,6 +21,7 @@
 using vllm::bench::BenchConfig;
 using vllm::bench::BenchResult;
 using vllm::bench::DispatchBenchPromptAdmission;
+using vllm::bench::DispatchBenchPromptWaveAdmission;
 using vllm::bench::PretokenizeBenchPromptsThenStartClock;
 using vllm::bench::RunBench;
 
@@ -118,6 +119,35 @@ struct RecordingTokenizer {
   }
 };
 
+struct WaveOnlyEngine {
+  std::vector<std::string>* events = nullptr;
+  int token_publishes = 0;
+  int string_publishes = 0;
+  std::vector<std::string> published_ids;
+
+  std::vector<std::string> add_request_wave(
+      std::vector<vllm::v1::AsyncTokensRequestInput> wave) {
+    ++token_publishes;
+    events->push_back("token-publish");
+    published_ids.clear();
+    for (const auto& request : wave) {
+      published_ids.push_back(request.request_id);
+    }
+    return published_ids;
+  }
+
+  std::vector<std::string> add_request_wave(
+      std::vector<vllm::v1::AsyncStringRequestInput> wave) {
+    ++string_publishes;
+    events->push_back("string-publish");
+    published_ids.clear();
+    for (const auto& request : wave) {
+      published_ids.push_back(request.request_id);
+    }
+    return published_ids;
+  }
+};
+
 }  // namespace
 
 TEST_CASE("bench: pretokenized admission dispatch is default-on with exact rollback") {
@@ -142,6 +172,60 @@ TEST_CASE("bench: pretokenized admission dispatch is default-on with exact rollb
   CHECK(invalid.result == 17);
   CHECK(invalid.pretokenized_calls == 1);
   CHECK(invalid.string_calls == 0);
+}
+
+TEST_CASE("bench: wave admission owns one ordered engine publish") {
+  std::vector<std::string> events;
+  WaveOnlyEngine engine;
+  engine.events = &events;
+  const std::vector<std::string> result = DispatchBenchPromptWaveAdmission(
+      engine, /*env_value=*/nullptr, /*wave_size=*/3,
+      [&](size_t offset) {
+        events.push_back("arrival-" + std::to_string(offset));
+      },
+      [&]() {
+        events.push_back("token-build");
+        std::vector<vllm::v1::AsyncTokensRequestInput> wave;
+        for (int id = 4; id < 7; ++id) {
+          wave.push_back({std::to_string(id), {id}, {}, 0});
+        }
+        return wave;
+      },
+      [&]() {
+        events.push_back("string-build");
+        return std::vector<vllm::v1::AsyncStringRequestInput>{
+            {"wrong-arm", "prompt", {}, 0}};
+      });
+  CHECK(result == std::vector<std::string>{"4", "5", "6"});
+  CHECK(engine.token_publishes == 1);
+  CHECK(engine.string_publishes == 0);
+  CHECK(engine.published_ids == std::vector<std::string>{"4", "5", "6"});
+  CHECK(events == std::vector<std::string>{"arrival-0", "arrival-1",
+                                           "arrival-2", "token-build",
+                                           "token-publish"});
+
+  events.clear();
+  const std::vector<std::string> rollback = DispatchBenchPromptWaveAdmission(
+      engine, /*env_value=*/"0", /*wave_size=*/2,
+      [&](size_t offset) {
+        events.push_back("arrival-" + std::to_string(offset));
+      },
+      [&]() {
+        events.push_back("token-build");
+        return std::vector<vllm::v1::AsyncTokensRequestInput>{
+            {"wrong-arm", {99}, {}, 0}};
+      },
+      [&]() {
+        events.push_back("string-build");
+        return std::vector<vllm::v1::AsyncStringRequestInput>{
+            {"9", "first", {}, 0}, {"10", "second", {}, 0}};
+      });
+  CHECK(rollback == std::vector<std::string>{"9", "10"});
+  CHECK(engine.token_publishes == 1);
+  CHECK(engine.string_publishes == 1);
+  CHECK(engine.published_ids == std::vector<std::string>{"9", "10"});
+  CHECK(events == std::vector<std::string>{"arrival-0", "arrival-1",
+                                           "string-build", "string-publish"});
 }
 
 TEST_CASE("bench: report exposes the resolved pretokenized admission mode") {
