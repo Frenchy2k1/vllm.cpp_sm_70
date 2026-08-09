@@ -28,7 +28,10 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <ttnn/tensor/tensor.hpp>
@@ -48,9 +51,44 @@
 namespace vt::tenstorrent {
 namespace {
 
-// Shared host round-trip helpers — see the kMatmul comment below for why the
-// upload/compute/readback shape is correct (hardware evidence in
-// .agents/specs/tenstorrent-backend.md's "Resolved: hands-on spike result").
+// ---- Host/device residency -------------------------------------------------
+// vt::Tensor.data is always a host pointer from Backend::Alloc. A shadow map
+// (Metal AllocMap shape) holds an optional device-resident ttnn::Tensor for
+// that host base so multi-op chains need not download after every matmul.
+
+struct BufferSlot {
+  void* host = nullptr;
+  size_t bytes = 0;
+  std::optional<ttnn::Tensor> device;
+  uint32_t dev_rows = 0;
+  uint32_t dev_cols = 0;
+  bool host_current = true;    // host bytes match the latest value
+  bool device_current = false; // device tensor matches the latest value
+};
+
+std::mutex& SlotMutex() {
+  static std::mutex m;
+  return m;
+}
+std::map<uintptr_t, BufferSlot>& Slots() {
+  static std::map<uintptr_t, BufferSlot> m;
+  return m;
+}
+
+// Base slot for `p` or any interior pointer into a registered allocation.
+BufferSlot* FindSlot(void* p) {
+  if (p == nullptr) return nullptr;
+  auto& m = Slots();
+  const uintptr_t key = reinterpret_cast<uintptr_t>(p);
+  auto it = m.upper_bound(key);
+  if (it == m.begin()) return nullptr;
+  --it;
+  BufferSlot& s = it->second;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(s.host);
+  if (key < base || key >= base + s.bytes) return nullptr;
+  return &s;
+}
+
 tt::tt_metal::TensorSpec SpecOf(tt::tt_metal::Shape shape, ttnn::DataType dtype,
                                 ttnn::Layout layout) {
   return tt::tt_metal::TensorSpec(
@@ -88,7 +126,32 @@ bool IsFloatDType(DType d) {
   return d == DType::kF32 || d == DType::kBF16 || d == DType::kF16;
 }
 
+void DownloadToHost(ttnn::Tensor& dev, Tensor& out) {
+  std::vector<float> result = dev.to_vector<float>();
+  VT_CHECK(static_cast<int64_t>(result.size()) == out.Numel(),
+           "tenstorrent: unexpected result size");
+  for (int64_t i = 0; i < out.Numel(); ++i)
+    StoreElemF32(out, i, result[static_cast<size_t>(i)]);
+}
+
+// Pull device → host if the host view is stale (required before host kernels).
+void EnsureHost(Tensor& t) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(t.data);
+  if (s == nullptr || s->host_current) return;
+  VT_CHECK(s->device_current && s->device.has_value(),
+           "tenstorrent: EnsureHost with no current device or host copy");
+  DownloadToHost(*s->device, t);
+  s->host_current = true;
+}
+
+void EnsureHost(const Tensor& t) {
+  // const_cast: host bytes are filled in place; logical tensor is unchanged.
+  EnsureHost(const_cast<Tensor&>(t));
+}
+
 std::vector<float> ToHostF32(const Tensor& t) {
+  EnsureHost(t);
   const int64_t n = t.Numel();
   std::vector<float> host(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) host[static_cast<size_t>(i)] = LoadElemF32(t, i);
@@ -100,25 +163,86 @@ ttnn::Tensor UploadRows(const float* data, uint32_t rows, uint32_t cols, MeshDev
   return ttnn::Tensor::from_vector<float>(host, TileSpecOf(rows, cols), &device);
 }
 
-ttnn::Tensor UploadTensor2D(const Tensor& t, MeshDevice& device) {
-  VT_CHECK(t.rank == 2, "tenstorrent: UploadTensor2D expects rank-2");
+// Return a TILE BFLOAT16 device tensor for rank-2 `t`, uploading only when the
+// device shadow is missing or stale.
+ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
+  VT_CHECK(t.rank == 2 && t.IsContiguous(),
+           "tenstorrent: EnsureDevice2D expects contiguous rank-2");
+  const uint32_t rows = static_cast<uint32_t>(t.shape[0]);
+  const uint32_t cols = static_cast<uint32_t>(t.shape[1]);
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && s->device_current && s->device.has_value() &&
+        s->dev_rows == rows && s->dev_cols == cols) {
+      return *s->device;
+    }
+  }
+  // Need host truth to upload (may download first if only device was current
+  // under a different shape — rare).
+  EnsureHost(t);
   const auto host = ToHostF32(t);
-  return UploadRows(host.data(), static_cast<uint32_t>(t.shape[0]),
-                    static_cast<uint32_t>(t.shape[1]), device);
+  ttnn::Tensor dev = UploadRows(host.data(), rows, cols, device);
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(t.data);
+  if (s != nullptr) {
+    s->device = dev;
+    s->dev_rows = rows;
+    s->dev_cols = cols;
+    s->device_current = true;
+    s->host_current = true;
+  }
+  return dev;
 }
 
+// Publish a device result as the current value of `out` WITHOUT downloading
+// to host (the residency win). Host is marked stale until EnsureHost.
+void CommitDevice2D(Tensor& out, ttnn::Tensor dev) {
+  VT_CHECK(out.rank == 2 && out.IsContiguous(),
+           "tenstorrent: CommitDevice2D expects contiguous rank-2 out");
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(out.data);
+  if (s == nullptr) {
+    // Untracked buffer (e.g. stack/test scratch): fall back to host write.
+    DownloadToHost(dev, out);
+    return;
+  }
+  s->device = std::move(dev);
+  s->dev_rows = static_cast<uint32_t>(out.shape[0]);
+  s->dev_cols = static_cast<uint32_t>(out.shape[1]);
+  s->device_current = true;
+  s->host_current = false;
+}
+
+// Host wrote `out` in place — drop any device shadow.
+void CommitHost(Tensor& out) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(out.data);
+  if (s == nullptr) return;
+  s->host_current = true;
+  s->device_current = false;
+  s->device = std::nullopt;
+}
+
+// Legacy name used by a few call sites that still force a host materialization.
 void Download(ttnn::Tensor& dev, Tensor& out) {
-  std::vector<float> result = dev.to_vector<float>();
-  VT_CHECK(static_cast<int64_t>(result.size()) == out.Numel(),
-           "tenstorrent: unexpected result size");
-  for (int64_t i = 0; i < out.Numel(); ++i) StoreElemF32(out, i, result[static_cast<size_t>(i)]);
+  DownloadToHost(dev, out);
+  CommitHost(out);
+  // Also keep device copy so a subsequent EnsureDevice can reuse it without
+  // re-upload if host was not modified.
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(out.data);
+  if (s != nullptr) {
+    s->device = dev;
+    s->dev_rows = out.rank >= 1 ? static_cast<uint32_t>(out.shape[0]) : 0;
+    s->dev_cols = out.rank >= 2 ? static_cast<uint32_t>(out.shape[1]) : 0;
+    s->device_current = (out.rank == 2);
+    s->host_current = true;
+  }
 }
 
-// Host round-trip per call — see this file's SCOPE note for why, and
-// .agents/specs/tenstorrent-backend.md's "Resolved: hands-on spike result"
-// for the hardware evidence this exact from_vector / matmul / to_vector
-// sequence produces a correct answer (max_abs_diff 0.03375 vs max_ref_mag
-// 4.14 on a real Blackhole, bf16 tolerance).
+// Device compute: keep result on device (CommitDevice2D). Host round-trip only
+// when the consumer is a host-staged op (EnsureHost) or an untracked buffer.
 void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
            "tenstorrent kMatmul: only rank-2 tensors are supported in W0");
@@ -134,10 +258,10 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
            "tenstorrent kMatmul: strided (non-contiguous) tensors are not supported in W0");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_a = UploadTensor2D(a, device);
-  ttnn::Tensor dev_b = UploadTensor2D(b, device);
+  ttnn::Tensor dev_a = EnsureDevice2D(a, device);
+  ttnn::Tensor dev_b = EnsureDevice2D(b, device);
   ttnn::Tensor dev_c = ttnn::operations::matmul::matmul(dev_a, dev_b);
-  Download(dev_c, out);
+  CommitDevice2D(out, std::move(dev_c));
 }
 
 // kMatmulBT: `b` is a [N,K] row-major torch nn.Linear weight; computes
@@ -160,11 +284,11 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
            "tenstorrent kMatmulBT: strided (non-contiguous) tensors are not supported in W0");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_a = UploadTensor2D(a, device);
-  ttnn::Tensor dev_b = UploadTensor2D(b, device);
+  ttnn::Tensor dev_a = EnsureDevice2D(a, device);
+  ttnn::Tensor dev_b = EnsureDevice2D(b, device);
   ttnn::Tensor dev_c =
       ttnn::operations::matmul::matmul(dev_a, dev_b, /*transpose_a=*/false, /*transpose_b=*/true);
-  Download(dev_c, out);
+  CommitDevice2D(out, std::move(dev_c));
 }
 
 // kAdd: elementwise add, plus the rank-1 `b` row-broadcast form used for
@@ -189,19 +313,20 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
            "tenstorrent kAdd: `b` shape mismatch");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_a = UploadTensor2D(a, device);
+  ttnn::Tensor dev_a = EnsureDevice2D(a, device);
   ttnn::Tensor dev_b;
   if (bcast) {
+    EnsureHost(b);
     std::vector<float> replicated(static_cast<size_t>(rows) * d);
     for (uint32_t r = 0; r < rows; ++r)
       for (uint32_t c = 0; c < d; ++c)
         replicated[static_cast<size_t>(r) * d + c] = LoadElemF32(b, c);
     dev_b = ttnn::Tensor::from_vector<float>(replicated, TileSpecOf(rows, d), &device);
   } else {
-    dev_b = UploadTensor2D(b, device);
+    dev_b = EnsureDevice2D(b, device);
   }
   ttnn::Tensor dev_c = ttnn::add(dev_a, dev_b);
-  Download(dev_c, out);
+  CommitDevice2D(out, std::move(dev_c));
 }
 
 // kRelu: elementwise max(0, x) (cpu_layernorm.cpp's ReluKernel contract).
@@ -215,9 +340,9 @@ void ReluKernel(Queue&, Tensor& out, const Tensor& x) {
            "tenstorrent kRelu: strided (non-contiguous) tensors are not supported in W0");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_x = UploadTensor2D(x, device);
+  ttnn::Tensor dev_x = EnsureDevice2D(x, device);
   ttnn::Tensor dev_y = ttnn::relu(dev_x);
-  Download(dev_y, out);
+  CommitDevice2D(out, std::move(dev_y));
 }
 
 // kEmbedding: row gather `out[i,:] = table[ids[i],:]` (cpu_ops.cpp
@@ -245,6 +370,8 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   const uint32_t t = static_cast<uint32_t>(ids.shape[0]);
   VT_CHECK(out.shape[0] == t && out.shape[1] == h, "tenstorrent kEmbedding: out shape mismatch");
 
+  EnsureHost(ids);
+  EnsureHost(table);
   std::vector<uint32_t> host_ids(t);
   if (ids.dtype == DType::kI32) {
     const int32_t* p = ids.Ptr<int32_t>();
@@ -261,7 +388,6 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
       host_ids[i] = static_cast<uint32_t>(p[i]);
     }
   }
-
   MeshDevice& device = SharedMeshDevice();
   ttnn::Tensor dev_ids = ttnn::Tensor::from_vector<uint32_t>(
       host_ids, SpecOf(tt::tt_metal::Shape({t}), ttnn::DataType::UINT32, ttnn::Layout::ROW_MAJOR),
@@ -275,6 +401,9 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   // keeps download dense for non-tile-aligned (t, h).
   ttnn::Tensor dev_out = ttnn::embedding(dev_ids, dev_table, /*pad_token=*/std::nullopt,
                                          /*layout=*/ttnn::Layout::ROW_MAJOR);
+  // Embedding is ROW_MAJOR; materialize host then re-upload as TILE so the next
+  // matmul hits the device cache. Once-per-forward cost; activations after
+  // this stay device-resident via CommitDevice2D on matmul/norm.
   Download(dev_out, out);
 }
 
@@ -317,13 +446,15 @@ void LayerNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor* weight,
   }
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_x = UploadTensor2D(x, device);
+  if (weight != nullptr) EnsureHost(*weight);
+  if (bias != nullptr) EnsureHost(*bias);
+  ttnn::Tensor dev_x = EnsureDevice2D(x, device);
   std::optional<ttnn::Tensor> dev_w;
   std::optional<ttnn::Tensor> dev_b;
   if (weight != nullptr) dev_w = UploadAffine1D(*weight, d, device);
   if (bias != nullptr) dev_b = UploadAffine1D(*bias, d, device);
   ttnn::Tensor dev_y = ttnn::layer_norm(dev_x, args.eps, dev_w, dev_b);
-  Download(dev_y, out);
+  CommitDevice2D(out, std::move(dev_y));
 }
 
 // kRmsNorm: per-row RMS over the last dim (cpu_ops.cpp RmsNormKernel). First
@@ -359,10 +490,12 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
   }
 
   // Residual stream: x + residual -> residual (with dtype re-read), then norm
-  // that value. Host-staged so bf16 round-trip matches cpu_ops RmsNormKernel
-  // even when Alloc is host memory. Gemma (w+1) also stays on the host path
-  // with the same math as CPU.
+  // that value. Host-staged so bf16 round-trip matches cpu_ops RmsNormKernel.
+  // Gemma (w+1) also stays on the host path with the same math as CPU.
   if (residual != nullptr || args.gemma) {
+    EnsureHost(x);
+    EnsureHost(weight);
+    if (residual != nullptr) EnsureHost(*residual);
     for (int64_t r = 0; r < static_cast<int64_t>(rows); ++r) {
       float sumsq = 0.0f;
       for (int64_t j = 0; j < static_cast<int64_t>(d); ++j) {
@@ -386,14 +519,17 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
         StoreElemF32(out, idx, v * inv * wj);
       }
     }
+    CommitHost(out);
+    if (residual != nullptr) CommitHost(*residual);
     return;
   }
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_x = UploadTensor2D(x, device);
+  EnsureHost(weight);
+  ttnn::Tensor dev_x = EnsureDevice2D(x, device);
   ttnn::Tensor dev_w = UploadAffine1D(weight, d, device);
   ttnn::Tensor dev_y = ttnn::rms_norm(dev_x, args.eps, dev_w);
-  Download(dev_y, out);
+  CommitDevice2D(out, std::move(dev_y));
 }
 
 // kSiluAndMul: SwiGLU gate half — out[i,j] = silu(x[i,j]) * x[i,j+d]
@@ -414,6 +550,7 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t d = x.shape[1] / 2;
   VT_CHECK(out.shape[0] == t && out.shape[1] == d,
            "tenstorrent kSiluAndMul: out shape must be [T, D] with D = x.shape[1]/2");
+  EnsureHost(x);
   for (int64_t i = 0; i < t; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       const float gate = LoadElemF32(x, i * 2 * d + j);
@@ -422,6 +559,7 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
       StoreElemF32(out, i * d + j, silu * up);
     }
   }
+  CommitHost(out);
 }
 
 // kCastBf16 / kCastF32: elementwise dtype convert via Load/Store (cpu_ops
@@ -433,8 +571,10 @@ void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
   VT_CHECK(out.Numel() == in.Numel(), "tenstorrent kCastBf16: numel mismatch");
   VT_CHECK(out.IsContiguous() && in.IsContiguous(),
            "tenstorrent kCastBf16: contiguous required");
+  EnsureHost(in);
   const int64_t n = out.Numel();
   for (int64_t i = 0; i < n; ++i) StoreElemF32(out, i, LoadElemF32(in, i));
+  CommitHost(out);
 }
 
 void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
@@ -443,8 +583,10 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   VT_CHECK(out.Numel() == in.Numel(), "tenstorrent kCastF32: numel mismatch");
   VT_CHECK(out.IsContiguous() && in.IsContiguous(),
            "tenstorrent kCastF32: contiguous required");
+  EnsureHost(in);
   const int64_t n = out.Numel();
   for (int64_t i = 0; i < n; ++i) StoreElemF32(out, i, LoadElemF32(in, i));
+  CommitHost(out);
 }
 
 // Llama-3 frequency rescale (cpu_ops Llama3ScaleFreq); no-op when scaling_factor
@@ -499,6 +641,9 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
   const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
   VT_CHECK(ks.shape[0] == t && ks.shape[2] == d, "tenstorrent kRopeNeox: ks shape");
   VT_CHECK(pos.shape[0] == t, "tenstorrent kRopeNeox: positions length");
+  EnsureHost(qs);
+  EnsureHost(ks);
+  EnsureHost(pos);
   const int rot = args.rotary_dim;
   const double base = static_cast<double>(args.base);
   for (int64_t i = 0; i < t; ++i) {
@@ -509,6 +654,8 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
     for (int64_t hh = 0; hh < hk; ++hh)
       RopeRotateHead(ks, (i * hk + hh) * d, rot, base, p, args);
   }
+  CommitHost(qs);
+  CommitHost(ks);
 }
 
 // kRopeCosSinCache: per-step cos|sin table [T, rot] (cpu_ops RopeCosSinCacheKernel).
@@ -526,6 +673,7 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
   const int rot = args.rotary_dim;
   VT_CHECK(cos_sin.shape[1] == rot && positions.shape[0] == t,
            "tenstorrent kRopeCosSinCache: shape mismatch");
+  EnsureHost(positions);
   const int64_t half = rot / 2;
   const double base = static_cast<double>(args.base);
   for (int64_t i = 0; i < t; ++i) {
@@ -540,6 +688,7 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
       StoreElemF32(cos_sin, i * rot + half + pair, static_cast<float>(std::sin(angle)));
     }
   }
+  CommitHost(cos_sin);
 }
 
 // kRopeFromCache: apply precomputed cos|sin (cpu_ops RopeFromCacheKernel).
@@ -567,6 +716,10 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions
              "tenstorrent kRopeFromCache: ks shape");
   }
   VT_CHECK(positions.shape[0] == tokens, "tenstorrent kRopeFromCache: positions length");
+  EnsureHost(qs);
+  if (ks != nullptr) EnsureHost(*ks);
+  EnsureHost(positions);
+  EnsureHost(cache);
   const int64_t half = args.rotary_dim / 2;
   for (int64_t token = 0; token < tokens; ++token) {
     for (int64_t pair = 0; pair < half; ++pair) {
@@ -598,6 +751,8 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions
       }
     }
   }
+  CommitHost(qs);
+  if (ks != nullptr) CommitHost(*ks);
 }
 
 // kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
@@ -610,6 +765,7 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                qkv.IsContiguous(),
            "tenstorrent kQkvSplit: contiguous required");
+  EnsureHost(qkv);
   const int64_t t = qkv.shape[0];
   const int64_t q_dim = q_out.Numel() / t;
   const int64_t k_dim = k_out.Numel() / t;
@@ -630,6 +786,9 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
     std::memcpy(vdst + static_cast<size_t>(i * v_dim) * esz,
                 row + static_cast<size_t>(q_dim + k_dim) * esz, static_cast<size_t>(v_dim) * esz);
   }
+  CommitHost(q_out);
+  CommitHost(k_out);
+  CommitHost(v_out);
 }
 
 // kReshapeAndCache: write per-token K/V into paged NHD cache slots
@@ -643,6 +802,11 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   VT_CHECK(IsFloatDType(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
                v_cache.dtype == k.dtype,
            "tenstorrent kReshapeAndCache: k/v/caches must share one float dtype");
+  EnsureHost(k);
+  EnsureHost(v);
+  EnsureHost(k_cache);
+  EnsureHost(v_cache);
+  EnsureHost(slot_mapping);
   VT_CHECK(slot_mapping.rank == 1 && slot_mapping.dtype == DType::kI64,
            "tenstorrent kReshapeAndCache: slot_mapping rank-1 i64");
   const int64_t num_slots = slot_mapping.shape[0];
@@ -688,6 +852,8 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
     std::memcpy(vdst + static_cast<size_t>(vdst_off) * esz,
                 vsrc + static_cast<size_t>(t * v_tok_stride) * esz, bytes);
   }
+  CommitHost(k_cache);
+  CommitHost(v_cache);
 }
 
 // kPagedAttention: causal/non-causal GQA softmax over the paged NHD cache
@@ -703,6 +869,12 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
                           const Tensor& v_cache, const Tensor& block_table,
                           const Tensor& seq_lens, const Tensor& query_start_loc,
                           const PagedAttentionArgs& args) {
+  EnsureHost(query);
+  EnsureHost(k_cache);
+  EnsureHost(v_cache);
+  EnsureHost(block_table);
+  EnsureHost(seq_lens);
+  EnsureHost(query_start_loc);
   VT_CHECK(query.rank == 3 && out.rank == 3 && k_cache.rank == 4 && v_cache.rank == 4,
            "tenstorrent kPagedAttention: query/out rank-3, caches rank-4");
   VT_CHECK(IsFloatDType(query.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16) &&
@@ -799,6 +971,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
       for (int64_t e = 0; e < d; ++e) StoreElemF32(out, qoff + e, acc[static_cast<size_t>(e)]);
     }
   }
+  CommitHost(out);
 }
 
 // kGreedyArgmax: per-row lowest-index max of f32 logits (cpu_sample.cpp).
@@ -809,6 +982,7 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   VT_CHECK(token_ids.rank == 1 && token_ids.dtype == DType::kI64 && token_ids.IsContiguous() &&
                token_ids.shape[0] == logits.shape[0],
            "tenstorrent kGreedyArgmax: token_ids must be i64 [N]");
+  EnsureHost(logits);
   const int64_t n = logits.shape[0], v = logits.shape[1];
   const float* lp = logits.Ptr<float>();
   int64_t* out = token_ids.Ptr<int64_t>();
@@ -824,6 +998,7 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
     }
     out[i] = best;
   }
+  CommitHost(token_ids);
 }
 
 struct Registrar {
@@ -867,4 +1042,68 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// ---- Called from TenstorrentBackend::Alloc/Free/Copy (no ttnn in that TU). ----
+void RegisterHostBuffer(void* host, size_t bytes) {
+  if (host == nullptr) return;
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot s;
+  s.host = host;
+  s.bytes = bytes;
+  s.host_current = true;
+  s.device_current = false;
+  Slots()[reinterpret_cast<uintptr_t>(host)] = std::move(s);
+}
+
+void UnregisterHostBuffer(void* host) {
+  if (host == nullptr) return;
+  std::lock_guard<std::mutex> g(SlotMutex());
+  Slots().erase(reinterpret_cast<uintptr_t>(host));
+}
+
+void MarkHostWritten(void* host) {
+  if (host == nullptr) return;
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(host);
+  if (s == nullptr) return;
+  s->host_current = true;
+  s->device_current = false;
+  s->device = std::nullopt;
+}
+
+void EnsureHostBytes(void* host) {
+  if (host == nullptr) return;
+  ttnn::Tensor dev;
+  size_t bytes = 0;
+  void* base = nullptr;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(host);
+    if (s == nullptr || s->host_current) return;
+    VT_CHECK(s->device_current && s->device.has_value(),
+             "tenstorrent: EnsureHostBytes with no current device data");
+    dev = *s->device;
+    bytes = s->bytes;
+    base = s->host;
+  }
+  std::vector<float> result = dev.to_vector<float>();
+  const size_t n = result.size();
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(host);
+    if (s == nullptr || s->host_current) return;
+    // Device results are f32 via to_vector. Host Alloc is typically
+    // numel*sizeof(float) (tests/f32 path) or numel*2 (bf16 activations).
+    if (bytes >= n * sizeof(float)) {
+      std::memcpy(base, result.data(), n * sizeof(float));
+    } else if (bytes >= n * sizeof(uint16_t)) {
+      auto* dst = static_cast<uint16_t*>(base);
+      for (size_t i = 0; i < n; ++i) dst[i] = F32ToBF16(result[i]);
+    } else {
+      VT_CHECK(false, "tenstorrent: EnsureHostBytes host buffer too small");
+    }
+    s->host_current = true;
+  }
+}
+
 }  // namespace vt::tenstorrent
