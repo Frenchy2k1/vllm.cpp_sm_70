@@ -439,10 +439,9 @@ STATUS_RATCHET = {
     # replaces the longer container-only paragraph with the current binary and
     # container dependency state. Re-pinned byte-tight after the structured
     # state migration so the reduction cannot become untracked growth headroom.
-    # 243647 since 2026-08-09 (measured 243647): machine-bound PR topology
-    # replaces the claim prose with the binding package result. Re-pinned
-    # byte-tight after the structured-state migration.
-    "chars": 243647,
+    # 243635 since 2026-08-09 (measured 243635): the W1 candidate records local
+    # gencode gates while keeping the real ten-SM archive audit pending.
+    "chars": 243635,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

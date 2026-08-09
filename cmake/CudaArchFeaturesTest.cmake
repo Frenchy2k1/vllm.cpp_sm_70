@@ -75,10 +75,9 @@ foreach(_f IN LISTS _ALL_FEATURES)
 endforeach()
 
 # --- A cross-family target has NO tactic body here and must resolve EMPTY for
-# itself while leaving the sm_12x arch fully enabled. (Such a heterogeneous list
-# still cannot COMPILE — the sources are gencode'd for the whole list — but the
-# resolution must be honest about which arch provides what; see
-# .agents/specs/cuda-arch-additivity.md Risks #1.)
+# itself while leaving the sm_12x arch fully enabled. W1's source-scoped
+# gencode now makes this heterogeneous list compilable without widening the
+# feature body; the resolution remains the authority for which arch provides it.
 foreach(_f IN LISTS _ALL_FEATURES)
   expect_feature("90a;121a" "${_f}" "121a")
 endforeach()

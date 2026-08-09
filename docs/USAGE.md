@@ -117,6 +117,23 @@ and host architecture in its name. These W6 archives remain development
 artifacts until W7 validation and supply-chain metadata land; no release
 download is claimed yet.
 
+To reproduce the W1 heterogeneous CUDA archive candidate, configure the exact
+release architecture set. Portable translation units compile for all ten SMs;
+architecture-specific kernels compile only for their supported intersection:
+
+```sh
+cmake -S . -B build-cuda-fat -G Ninja \
+  -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
+  -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_TRITON=OFF
+cmake --build build-cuda-fat --target vllm
+python3 scripts/check-cuda-fat-gencode.py \
+  --compile-commands build-cuda-fat/compile_commands.json \
+  --library build-cuda-fat/libvllm.a
+```
+
+This is a build/audit gate, not yet a downloadable release claim.
+
 Any OpenAI client works by pointing its `base_url` at it:
 
 ```python
