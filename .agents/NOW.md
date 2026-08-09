@@ -32,6 +32,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): model, runner, ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
+| `BACKEND-TENSTORRENT` | `INVENTORIED` | Review |
 
 In-flight, default-OFF, not pushed: see the row's spec.
 
