@@ -2,6 +2,7 @@
 // anchors and the recorded "vectorize across OUTPUT columns, not along K"
 // deviation that keeps every result bit-identical to the scalar reference.
 #include "cpu_matmul_elem.h"
+#include "vt/cpu/cpu_isa_x86.h"
 #include "vt/quant.h"
 #include <vector>
 
@@ -578,6 +579,12 @@ ElemGemmTierTable BuildTier() {
   t.mr = kMrNeon;
   t.name = "neon";
 #elif defined(__x86_64__) || defined(_M_X64)
+  X86IsaTier selected{};
+  std::string selection_error;
+  VT_CHECK(SelectX86IsaTier(DetectX86IsaCaps(), forced, &selected,
+                           &selection_error),
+           selection_error);
+  if (selected == X86IsaTier::kPortable) return t;
   t.bt[kF32] = &Bt16Sse2<ElemKind::kF32>;
   t.bt[kBF16] = &Bt16Sse2<ElemKind::kBF16>;
   t.nk[kF32] = &Nk16Sse2<ElemKind::kF32>;
@@ -588,27 +595,21 @@ ElemGemmTierTable BuildTier() {
   t.nkm[kBF16] = &NkM2Sse2<ElemKind::kBF16>;
   t.mr = kMrSse2;
   t.name = "sse2";
-  if (__builtin_cpu_supports("f16c")) {
+  if (selected == X86IsaTier::kSse2) return t;
+  if (selected == X86IsaTier::kSse2F16c ||
+      selected == X86IsaTier::kAvx2 ||
+      selected == X86IsaTier::kAvx512) {
     t.bt[kF16] = &Bt16F16c;
     t.nk[kF16] = &Nk16F16c;
     t.btm[kF16] = &BtM2F16c;
     t.nkm[kF16] = &NkM2F16c;
     t.name = "sse2+f16c";
-  } else {
-    // No f16 M-blocked kernel without F16C: fall back to the 1-row path for
-    // f16 only, which the caller selects on a null btm entry.
-    t.btm[kF16] = nullptr;
   }
-  // Wider tiers replace the SSE2 table wholesale when the CPU has them. AVX2
-  // needs F16C for its f16 widening (_mm256_cvtph_ps); every x86-64 CPU with
-  // AVX2 also has F16C, but the probe is explicit rather than assumed.
-  if ((forced.empty() || forced == "avx2") && __builtin_cpu_supports("avx2") &&
-      __builtin_cpu_supports("f16c")) {
+  if (selected == X86IsaTier::kSse2F16c) return t;
+  if (selected == X86IsaTier::kAvx2 || selected == X86IsaTier::kAvx512) {
     FillAvx2Tier(&t);
   }
-  // AVX-512F last so it wins when present, unless a narrower tier was forced
-  // for a same-binary A/B.
-  if ((forced.empty() || forced == "avx512") && __builtin_cpu_supports("avx512f")) {
+  if (selected == X86IsaTier::kAvx512) {
     FillAvx512Tier(&t);
   }
 #endif

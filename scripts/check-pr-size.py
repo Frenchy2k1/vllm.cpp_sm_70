@@ -223,6 +223,7 @@ CREATION_MUTATIONS = {
         b"def exact_waiver(*args, **kwargs): return None\n"
         b"def validate_waiver_targets(*args, **kwargs): return None\n"
     ),
+    "scripts/check-cpu-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cuda-fat-gencode.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,

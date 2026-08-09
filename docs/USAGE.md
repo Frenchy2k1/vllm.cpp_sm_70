@@ -134,6 +134,17 @@ python3 scripts/check-cuda-fat-gencode.py \
 
 This is a build/audit gate, not yet a downloadable release claim.
 
+### Selecting an x86 CPU ISA tier
+
+The x86_64 CPU library is one adaptive binary: portable, SSE2,
+SSE2+F16C, AVX2, and AVX-512 elementwise matmul kernels are isolated in their
+own translation units and selected only after CPUID plus the required XCR0 OS
+state are checked. Leave `VT_CPU_MATMUL_TIER` unset for automatic selection, or
+set it to `portable`, `sse2`, `sse2+f16c`, `avx2`, or `avx512` for a same-binary
+correctness/performance check. A forced tier that the current CPU or OS cannot
+execute fails closed instead of silently narrowing or risking an illegal
+instruction. Release builds never use `-march=native`.
+
 Any OpenAI client works by pointing its `base_url` at it:
 
 ```python

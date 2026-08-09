@@ -743,6 +743,8 @@ vllm_cpp_add_test(test_triton_aot_arch_dispatch
   vt/test_triton_aot_arch_dispatch.cpp)
 target_include_directories(test_triton_aot_arch_dispatch PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_cpu_isa_x86 vt/test_cpu_isa_x86.cpp)
+target_include_directories(test_cpu_isa_x86 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
   # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
   # case no-ops when the build has HIP but the box has no AMD GPU.
