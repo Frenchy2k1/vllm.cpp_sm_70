@@ -16,6 +16,7 @@
 // cross-backend oracle in the project.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -155,11 +156,14 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       REQUIRE(m.spec_id_count == 4);
       for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
-      // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
-      // ONE committed module, which is the argument for specialization constants
-      // over llama.cpp's module-per-#define in miniature.
-      REQUIRE(m.spec_id_count == 4);
-      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
+      // a dtype, b dtype, out dtype, orientation and the COLUMN-BLOCK factor:
+      // 3*3*3*2*3 = 162 variants served by ONE committed module, which is the
+      // argument for specialization constants over llama.cpp's module-per-#define
+      // in miniature. The block factor is the only PERFORMANCE axis here; the other
+      // four are correctness axes, which is why the gate below has to look at the
+      // specialization VALUES and not just at the module name.
+      REQUIRE(m.spec_id_count == 5);
+      for (uint32_t want = 0; want < 5; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_sigmoid_gate_bf16") == 0) {
       // ONE axis, and the count is the assertion: the gate is f32 and the output
       // bf16 by the op contract (src/vt/ops.cpp:3327-3334), so only the attention
@@ -800,6 +804,149 @@ TEST_CASE("a DECODE GEMV takes the vec tactic; prefill and the other orientation
     vk.Free(dout);
   }
 
+  vk.DestroyQueue(q);
+}
+
+TEST_CASE("the scalar matmul takes the COLUMN-BLOCKED variant and it is bit-identical") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // THE SHAPE IS THE lm_head's, IN MINIATURE. MEASURED on 27B Vulkan decode:
+  // exactly one GEMM per token stays on vt_matmul rather than reaching the GEMV
+  // tactic -- the lm_head, at bt=0 (b is [K,N]), m=1, k=5120, n=248320, moving
+  // 2.54 GB per call at 12.43 ms. Every other decode GEMM is MatmulBT and goes to
+  // vt_matmul_vec. So this orientation at m == 1 is the shape the K-unroll exists
+  // for, and it is the shape asserted here.
+  //
+  // N = 33 is deliberately FAR SMALLER than one blocked span (128*8 = 1024), so
+  // every lane but the first few is out of range and the shader's per-column
+  // bounds check is the only thing between this and writes past the output. N is
+  // also not a multiple of 16, so the coopmat tactic declines and cannot be what is
+  // measured. bt = 0 at m = 1 makes the GEMV tactic decline for the documented
+  // reason (that layout is already coalesced), which is exactly why this GEMM is
+  // on vt_matmul at all.
+  constexpr int64_t kK = 258, kN = 33;
+
+  // THE OPERANDS MUST SPAN DECADES, and that is a MEASURED requirement, not
+  // decoration. The first version of this case used the small exact ladder the
+  // neighbouring cases use (multiples of 0.25 and 0.5). Every partial sum there is
+  // representable in f32 with no rounding at all, so a deliberately reassociated
+  // shader body -- `acc += (a0*b0 + a1*b1) + (a2*b2 + a3*b3)`, exactly the
+  // "improvement" this gate exists to forbid -- produced BITWISE IDENTICAL output
+  // and the memcmp below PASSED the mutation. A gate on floating-point
+  // associativity has to feed it operands whose partial sums actually round.
+  //
+  // These do: a 32-bit LCG picks a sign, a mantissa and an exponent in [2^-7,
+  // 2^8), so terms differ by up to ~2^15 and a large partial absorbs a small one
+  // differently depending on when it is added. Both operands are bf16, whose
+  // 8-bit mantissas make every PRODUCT exact in f32 -- so the only source of
+  // difference between the two arms is the accumulation ORDER, which is precisely
+  // the property under test.
+  std::vector<uint16_t> a(static_cast<size_t>(kK)), b(static_cast<size_t>(kK * kN));
+  uint32_t rng = 0x9E3779B9u;
+  auto next = [&rng] {
+    rng = rng * 1664525u + 1013904223u;
+    const float mag = std::ldexp(1.0f + static_cast<float>((rng >> 8) & 0xFFu) / 256.0f,
+                                 static_cast<int>((rng >> 20) & 0xFu) - 7);
+    return vt::F32ToBF16((rng & 1u) != 0u ? -mag : mag);
+  };
+  for (int64_t i = 0; i < kK; ++i) a[static_cast<size_t>(i)] = next();
+  for (int64_t i = 0; i < kK * kN; ++i) b[static_cast<size_t>(i)] = next();
+
+  void* da = vk.Alloc(a.size() * sizeof(uint16_t));
+  void* db = vk.Alloc(b.size() * sizeof(uint16_t));
+  auto* dout = static_cast<float*>(vk.Alloc(kN * sizeof(float)));
+  vk.Copy(q, da, a.data(), a.size() * sizeof(uint16_t));
+  vk.Copy(q, db, b.data(), b.size() * sizeof(uint16_t));
+  vk.Synchronize(q);
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {1, kK});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {kK, kN});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {1, kN});
+
+  auto run = [&](uint32_t ncols) {
+    vt::vulkan::SetMatmulColumnsPerLane(ncols);
+    vk.Memset(q, dout, 0, kN * sizeof(float));
+    vt::Matmul(q, to, ta, tb);
+    vk.Synchronize(q);
+    std::vector<float> got(static_cast<size_t>(kN));
+    vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+    vk.Synchronize(q);
+    return got;
+  };
+
+  const uint32_t restore = vt::vulkan::MatmulColumnsPerLane();
+  const std::vector<float> blocked = run(4u);
+  const std::vector<float> flat = run(1u);
+  vt::vulkan::SetMatmulColumnsPerLane(restore);
+
+  // MECHANISM, ASSERTION 1: the two arms are DISTINCT PIPELINES of the same
+  // module. PipelineExistsFor("vt_matmul") passes identically whether column
+  // blocking was selected or not -- it is a PERFORMANCE axis, so the numbers are
+  // bit-identical by construction and no value check can ever see it. The
+  // specialization VALUES are the only place the mechanism is visible, which is
+  // why PipelineKeys() exists.
+  //
+  // Key layout is "<module>|<a dtype>,<b dtype>,<out dtype>,<bt>,<ncols>";
+  // bf16 = 2, f32 = 0 (DtypeCode, src/vt/vulkan/vulkan_ops.cpp), bt = 0 here.
+  const std::vector<std::string> keys = ctx.PipelineKeys();
+  const bool has_blocked =
+      std::find(keys.begin(), keys.end(), std::string("vt_matmul|2,2,0,0,4")) != keys.end();
+  const bool has_flat =
+      std::find(keys.begin(), keys.end(), std::string("vt_matmul|2,2,0,0,1")) != keys.end();
+  std::string joined;
+  for (const std::string& k : keys) { joined += k; joined += " "; }
+  CAPTURE(joined);
+  CHECK(has_blocked);
+  CHECK(has_flat);
+
+  // MECHANISM, ASSERTION 2: the DEFAULT is the blocked arm, AND it is the arm
+  // that measured fastest. Without this the optimization could be present,
+  // specializable and never selected, and every assertion above would still pass.
+  // The constant is 4 rather than "not 1" on purpose: 8 blocks harder and measured
+  // SLOWER than not blocking at all (243 workgroups is too little parallelism to
+  // hide memory latency), so "some blocking" is not the property worth pinning.
+  CHECK(vt::vulkan::MatmulColumnsPerLane() == 4u);
+
+  // NUMERIC TIER, ASSERTION 3: BITWISE, not a tolerance. The whole argument for
+  // blocking COLUMNS rather than splitting the K reduction is that vt_matmul is
+  // the ONE matmul tactic that shares cpu_ops.cpp MatmulChunked's accumulation
+  // order -- the byte-exact tier the coopmat and GEMV tactics both gave up. Each
+  // of a lane's accumulators owns a different output element and sums the whole K
+  // sequentially, which is that order exactly, so the correct gate is memcmp. An
+  // epsilon check here would pass just as well if someone "improved" the shader
+  // into partial K accumulators and silently moved the general matmul path -- and
+  // the sampler that reads the lm_head's output -- into the NMSE tier.
+  REQUIRE(blocked.size() == flat.size());
+  CHECK(std::memcmp(blocked.data(), flat.data(), blocked.size() * sizeof(float)) == 0);
+
+  // And both are right: a f64 host oracle, so neither arm's order is privileged.
+  //
+  // The tolerance is scaled by the sum of |terms|, NOT by the result. These
+  // operands span decades and cancel, so a dot product can land near zero while
+  // its terms are large, and a relative-to-result epsilon would then demand more
+  // precision than f32 accumulation can deliver for reasons that have nothing to
+  // do with this change. Absolute error against the CONDITIONING of the sum is the
+  // honest bound.
+  for (int64_t j = 0; j < kN; ++j) {
+    double acc = 0.0, scale = 0.0;
+    for (int64_t c = 0; c < kK; ++c) {
+      const double term = static_cast<double>(vt::BF16ToF32(a[static_cast<size_t>(c)])) *
+                          static_cast<double>(vt::BF16ToF32(b[static_cast<size_t>(c * kN + j)]));
+      acc += term;
+      scale += std::abs(term);
+    }
+    CAPTURE(j);
+    CAPTURE(acc);
+    CAPTURE(scale);
+    CHECK(std::abs(static_cast<double>(blocked[static_cast<size_t>(j)]) - acc) <= 1e-4 * scale);
+  }
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
   vk.DestroyQueue(q);
 }
 

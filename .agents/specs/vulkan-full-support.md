@@ -327,6 +327,63 @@ the umbrella, not a substitute for them.
 | **VK-H** | **Attention variants + samplers** (16 ops) | B (samplers), G (attn variants) | **83/83 — closes the op surface** |
 | **VK-I** | **AMD/RDNA (or Arc) bring-up** | hardware acquisition | The staging path for non-host-visible memory, and the gate re-run where Vulkan actually matters |
 
+### 6.0b `VK-G` partial: the lm_head, COLUMN-BLOCKED — 2026-08-09
+
+`row/BACKEND-VULKAN-LMHEAD`, base `93852c28`. No new op and no new module: one
+specialization constant on `vt_matmul`.
+
+**The shape, named by the gated decline diagnostic.** `VT_VULKAN_DISPATCH_STATS=1`
+reports `gemv DECLINED: not MatmulBT (b is [K,N]; that layout is already
+coalesced) (bt=0 m=1 k=5120 n=248320)`. That is the lm_head, the ONLY GEMM per
+decode token that stays on the portable scalar kernel, and the decline is
+correct: in `[K,N]` adjacent lanes already read adjacent addresses, so
+`vt_matmul_vec`'s shape would make a coalesced access strided. It moves `k*n`
+bf16 = 2.543 GB per token.
+
+**The 273 GB/s roof is not a floor you can plan against.** 2.543 GB at the
+theoretical roof is 9.3 ms, which made the measured 12.43 ms look like 75% of
+roof. Nothing here reaches 273: `vt_matmul_vec`, run on the IDENTICAL byte count
+(`vulkan-gemm-ab 1 5120 248320 30`), takes 11.04 ms = 230.3 GB/s. **230 GB/s is
+the practical ceiling on this box** and the honest headroom was 1.4 ms, not 3.1.
+
+**MEASURED NEGATIVE, recorded so it is not re-tried: the four-way K unroll is
+ZERO.** The memory-level-parallelism hypothesis (one outstanding load per lane,
+the defect the four-way unroll fixed for `vt_matmul_vec`) was built with the
+accumulation order preserved and A/B'd on one binary: 12.430 ms/call rolled
+versus 12.532 unrolled over three replicates each. The driver already pipelines
+the rolled loop. One leg of the first block read 215 ms/call on the rolled arm
+and three replicates of the same arm then read 12.39-12.43 -- the GB10 residency
+lottery on a 2.54 GB buffer, not the arm, which is why the kernel now prints
+`scalar matmul ARM: bt=... ncols=...` and both arms of a performance A/B are
+self-identifying.
+
+**What worked: CONTIGUITY PER WORKGROUP.** `vt_matmul_vec` gives one workgroup
+one output element and strides its lanes along K, sweeping a contiguous 10 KB run
+of `b`. The flat scalar body gives one INVOCATION one output element, so a
+128-lane workgroup reads 256 contiguous bytes at row q and then jumps `n*2` =
+486 KB to row q+1. `VT_VULKAN_MATMUL_NCOLS` gives a workgroup `128*NCOLS`
+CONSECUTIVE output columns of one row, with lane t owning columns `t + c*128`
+(not `t*NCOLS + c`, which would stride every load).
+
+| NCOLS | `vt_matmul` ms/call, len 36 | GB/s |
+|---|---|---|
+| 1 (flat) | **12.485** | 203.7 |
+| 2 | 12.459 | 204.1 |
+| **4 (default)** | **11.541** | **220.4** |
+| 8 | 12.812 | 198.5 |
+
+**6 of 6 interleaved pairs at NCOLS 4**, two-length diff -1.066 ms/token, and
+95.7% of the practical ceiling. Blocking is a TRADE: at 8 the dispatch is only
+243 workgroups (~31k threads) and the device runs out of latency-hiding work
+faster than the longer run buys back, so it is slower than not blocking at all.
+
+**Numerically free.** Each of a lane's accumulators owns one output element and
+sums the whole K sequentially -- `cpu_ops.cpp` MatmulChunked's order -- so
+`vt_matmul` keeps the byte-exact tier the coopmat and GEMV tactics gave up. The
+gate is a memcmp of the two arms in ONE process, plus the specialization VALUES
+from `PipelineKeys()`, because both arms are the same module and produce
+identical bytes; a numeric check alone could never see the mechanism.
+
 ### 6.0a `VK-G` partial: the FUSED ATTN PREAMBLE landed — 2026-08-09
 
 `row/BACKEND-VULKAN-QKNORM`. `kAttnQkNormRopeGate` — gemma-RMSNorm(q) +
