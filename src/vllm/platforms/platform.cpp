@@ -55,9 +55,9 @@ size_t Index(DeviceType type) {
 // correctly, and is simply never SELECTED. tests/vllm/platforms/test_platform.cpp
 // gates the membership so the next backend does not rediscover this.
 // kTENSTORRENT sits after kMETAL: an extension platform with no upstream probe
-// order to mirror (same as kVULKAN/kMETAL), placed last among accelerators
-// since it is the newest and least proven (BACKEND-TENSTORRENT W0: one op,
-// no model runs yet) — Metal and Vulkan already run models.
+// order to mirror (same as kVULKAN/kMETAL), placed last among accelerators.
+// W2: OPT-125m e2e STRICT token-exact on real Blackhole; still least proven
+// among model-running backends.
 constexpr DeviceType kCurrentPriority[] = {
     DeviceType::kCUDA,   DeviceType::kROCM,        DeviceType::kXPU,
     DeviceType::kVULKAN, DeviceType::kMETAL, DeviceType::kTENSTORRENT,

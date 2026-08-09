@@ -18,6 +18,7 @@
 // vLLM's block-table contract onto ttnn::sdpa_decode is deferred to the
 // device-resident-tensor redesign the spec already names.
 #include "vt/backend.h"
+#include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tenstorrent/tenstorrent_device.h"
 
@@ -61,16 +62,54 @@ tt::tt_metal::TensorSpec TileSpecOf(uint32_t rows, uint32_t cols) {
                 ttnn::Layout::TILE);
 }
 
+// OPT-125m (and the rest of the dense path) runs BF16 weights/activations with
+// F32 logits. Host-stage every float dtype to f32 for from_vector, then round
+// back on download — ttnn already computes in BFLOAT16 tiles.
+float LoadElemF32(const Tensor& t, int64_t i) {
+  switch (t.dtype) {
+    case DType::kF32: return t.Ptr<float>()[i];
+    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[i]);
+    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[i]);
+    default: VT_CHECK(false, "tenstorrent: unsupported float dtype"); return 0.0f;
+  }
+}
+
+void StoreElemF32(Tensor& t, int64_t i, float v) {
+  switch (t.dtype) {
+    case DType::kF32: t.Ptr<float>()[i] = v; break;
+    case DType::kBF16: t.Ptr<uint16_t>()[i] = F32ToBF16(v); break;
+    default: VT_CHECK(false, "tenstorrent: unsupported out dtype (f32/bf16)");
+  }
+}
+
+bool IsFloatDType(DType d) {
+  return d == DType::kF32 || d == DType::kBF16 || d == DType::kF16;
+}
+
+std::vector<float> ToHostF32(const Tensor& t) {
+  const int64_t n = t.Numel();
+  std::vector<float> host(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) host[static_cast<size_t>(i)] = LoadElemF32(t, i);
+  return host;
+}
+
 ttnn::Tensor UploadRows(const float* data, uint32_t rows, uint32_t cols, MeshDevice& device) {
   std::vector<float> host(data, data + static_cast<size_t>(rows) * cols);
   return ttnn::Tensor::from_vector<float>(host, TileSpecOf(rows, cols), &device);
+}
+
+ttnn::Tensor UploadTensor2D(const Tensor& t, MeshDevice& device) {
+  VT_CHECK(t.rank == 2, "tenstorrent: UploadTensor2D expects rank-2");
+  const auto host = ToHostF32(t);
+  return UploadRows(host.data(), static_cast<uint32_t>(t.shape[0]),
+                    static_cast<uint32_t>(t.shape[1]), device);
 }
 
 void Download(ttnn::Tensor& dev, Tensor& out) {
   std::vector<float> result = dev.to_vector<float>();
   VT_CHECK(static_cast<int64_t>(result.size()) == out.Numel(),
            "tenstorrent: unexpected result size");
-  std::copy(result.begin(), result.end(), out.Ptr<float>());
+  for (int64_t i = 0; i < out.Numel(); ++i) StoreElemF32(out, i, result[static_cast<size_t>(i)]);
 }
 
 // Host round-trip per call — see this file's SCOPE note for why, and
@@ -81,8 +120,9 @@ void Download(ttnn::Tensor& dev, Tensor& out) {
 void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
            "tenstorrent kMatmul: only rank-2 tensors are supported in W0");
-  VT_CHECK(a.dtype == DType::kF32 && b.dtype == DType::kF32 && out.dtype == DType::kF32,
-           "tenstorrent kMatmul: only F32 is supported in W0");
+  VT_CHECK(IsFloatDType(a.dtype) && IsFloatDType(b.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMatmul: float in, f32/bf16 out");
   const uint32_t M = static_cast<uint32_t>(a.shape[0]);
   const uint32_t K = static_cast<uint32_t>(a.shape[1]);
   const uint32_t N = static_cast<uint32_t>(b.shape[1]);
@@ -92,8 +132,8 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
            "tenstorrent kMatmul: strided (non-contiguous) tensors are not supported in W0");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_a = UploadRows(a.Ptr<float>(), M, K, device);
-  ttnn::Tensor dev_b = UploadRows(b.Ptr<float>(), K, N, device);
+  ttnn::Tensor dev_a = UploadTensor2D(a, device);
+  ttnn::Tensor dev_b = UploadTensor2D(b, device);
   ttnn::Tensor dev_c = ttnn::operations::matmul::matmul(dev_a, dev_b);
   Download(dev_c, out);
 }
@@ -106,8 +146,9 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
            "tenstorrent kMatmulBT: only rank-2 tensors are supported in W0");
-  VT_CHECK(a.dtype == DType::kF32 && b.dtype == DType::kF32 && out.dtype == DType::kF32,
-           "tenstorrent kMatmulBT: only F32 is supported in W0");
+  VT_CHECK(IsFloatDType(a.dtype) && IsFloatDType(b.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMatmulBT: float in, f32/bf16 out");
   const uint32_t M = static_cast<uint32_t>(a.shape[0]);
   const uint32_t K = static_cast<uint32_t>(a.shape[1]);
   const uint32_t N = static_cast<uint32_t>(b.shape[0]);
@@ -117,8 +158,8 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
            "tenstorrent kMatmulBT: strided (non-contiguous) tensors are not supported in W0");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_a = UploadRows(a.Ptr<float>(), M, K, device);
-  ttnn::Tensor dev_b = UploadRows(b.Ptr<float>(), N, K, device);
+  ttnn::Tensor dev_a = UploadTensor2D(a, device);
+  ttnn::Tensor dev_b = UploadTensor2D(b, device);
   ttnn::Tensor dev_c =
       ttnn::operations::matmul::matmul(dev_a, dev_b, /*transpose_a=*/false, /*transpose_b=*/true);
   Download(dev_c, out);
@@ -133,8 +174,9 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.rank == 2 && out.rank == 2, "tenstorrent kAdd: `a`/`out` must be rank-2 in W0");
   VT_CHECK(b.rank == 2 || b.rank == 1, "tenstorrent kAdd: `b` must be rank-1 or rank-2 in W0");
-  VT_CHECK(a.dtype == DType::kF32 && b.dtype == DType::kF32 && out.dtype == DType::kF32,
-           "tenstorrent kAdd: only F32 is supported in W0");
+  VT_CHECK(IsFloatDType(a.dtype) && IsFloatDType(b.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kAdd: float in, f32/bf16 out");
   VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
            "tenstorrent kAdd: strided (non-contiguous) tensors are not supported in W0");
   const uint32_t rows = static_cast<uint32_t>(a.shape[0]);
@@ -145,15 +187,16 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
            "tenstorrent kAdd: `b` shape mismatch");
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_a = UploadRows(a.Ptr<float>(), rows, d, device);
+  ttnn::Tensor dev_a = UploadTensor2D(a, device);
   ttnn::Tensor dev_b;
   if (bcast) {
     std::vector<float> replicated(static_cast<size_t>(rows) * d);
-    const float* row = b.Ptr<float>();
-    for (uint32_t r = 0; r < rows; ++r) std::copy(row, row + d, replicated.begin() + r * d);
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t c = 0; c < d; ++c)
+        replicated[static_cast<size_t>(r) * d + c] = LoadElemF32(b, c);
     dev_b = ttnn::Tensor::from_vector<float>(replicated, TileSpecOf(rows, d), &device);
   } else {
-    dev_b = UploadRows(b.Ptr<float>(), rows, d, device);
+    dev_b = UploadTensor2D(b, device);
   }
   ttnn::Tensor dev_c = ttnn::add(dev_a, dev_b);
   Download(dev_c, out);
@@ -162,17 +205,15 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 // kRelu: elementwise max(0, x) (cpu_layernorm.cpp's ReluKernel contract).
 void ReluKernel(Queue&, Tensor& out, const Tensor& x) {
   VT_CHECK(x.rank == 2 && out.rank == 2, "tenstorrent kRelu: only rank-2 tensors are supported in W0");
-  VT_CHECK(x.dtype == DType::kF32 && out.dtype == DType::kF32,
-           "tenstorrent kRelu: only F32 is supported in W0");
+  VT_CHECK(IsFloatDType(x.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kRelu: float in, f32/bf16 out");
   VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
            "tenstorrent kRelu: out shape mismatch");
   VT_CHECK(x.IsContiguous() && out.IsContiguous(),
            "tenstorrent kRelu: strided (non-contiguous) tensors are not supported in W0");
-  const uint32_t rows = static_cast<uint32_t>(x.shape[0]);
-  const uint32_t d = static_cast<uint32_t>(x.shape[1]);
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_x = UploadRows(x.Ptr<float>(), rows, d, device);
+  ttnn::Tensor dev_x = UploadTensor2D(x, device);
   ttnn::Tensor dev_y = ttnn::relu(dev_x);
   Download(dev_y, out);
 }
@@ -191,8 +232,8 @@ void ReluKernel(Queue&, Tensor& out, const Tensor& x) {
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   VT_CHECK(table.rank == 2 && ids.rank == 1 && out.rank == 2,
            "tenstorrent kEmbedding: table rank-2, ids rank-1, out rank-2");
-  VT_CHECK(table.dtype == DType::kF32 && out.dtype == DType::kF32,
-           "tenstorrent kEmbedding: only F32 table/out are supported in this step");
+  VT_CHECK(IsFloatDType(table.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kEmbedding: float table, f32/bf16 out");
   VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64,
            "tenstorrent kEmbedding: ids must be i32 or i64");
   VT_CHECK(table.IsContiguous() && ids.IsContiguous() && out.IsContiguous(),
@@ -223,8 +264,7 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   ttnn::Tensor dev_ids = ttnn::Tensor::from_vector<uint32_t>(
       host_ids, SpecOf(tt::tt_metal::Shape({t}), ttnn::DataType::UINT32, ttnn::Layout::ROW_MAJOR),
       &device);
-  std::vector<float> host_table(table.Ptr<float>(),
-                                table.Ptr<float>() + static_cast<size_t>(vocab) * h);
+  std::vector<float> host_table = ToHostF32(table);
   ttnn::Tensor dev_table = ttnn::Tensor::from_vector<float>(
       host_table,
       SpecOf(tt::tt_metal::Shape({vocab, h}), ttnn::DataType::BFLOAT16, ttnn::Layout::ROW_MAJOR),
@@ -241,8 +281,9 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
 // tile_height (32); from_vector with TILE layout pads a [1,d] tensor to
 // that. ROW_MAJOR gamma only works cleanly when d == tile_width in the
 // ttnn unit tests, so TILE is the general path.
-ttnn::Tensor UploadAffine1D(const float* data, uint32_t d, MeshDevice& device) {
-  std::vector<float> host(data, data + d);
+ttnn::Tensor UploadAffine1D(const Tensor& t, uint32_t d, MeshDevice& device) {
+  std::vector<float> host(d);
+  for (uint32_t i = 0; i < d; ++i) host[i] = LoadElemF32(t, i);
   return ttnn::Tensor::from_vector<float>(
       host, SpecOf(tt::tt_metal::Shape({1, d}), ttnn::DataType::BFLOAT16, ttnn::Layout::TILE),
       &device);
@@ -257,40 +298,39 @@ void LayerNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor* weight,
                      const Tensor* bias, const LayerNormArgs& args) {
   VT_CHECK(x.rank == 2 && out.rank == 2,
            "tenstorrent kLayerNorm: only rank-2 tensors are supported in this step");
-  VT_CHECK(x.dtype == DType::kF32 && out.dtype == DType::kF32,
-           "tenstorrent kLayerNorm: only F32 is supported in this step");
+  VT_CHECK(IsFloatDType(x.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kLayerNorm: float in, f32/bf16 out");
   VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
            "tenstorrent kLayerNorm: out shape mismatch");
   VT_CHECK(x.IsContiguous() && out.IsContiguous(),
            "tenstorrent kLayerNorm: strided (non-contiguous) tensors are not supported");
   VT_CHECK(args.eps >= 0.0f, "tenstorrent kLayerNorm: eps must be non-negative");
-  const uint32_t rows = static_cast<uint32_t>(x.shape[0]);
   const uint32_t d = static_cast<uint32_t>(x.shape[1]);
   for (const Tensor* p : {weight, bias}) {
     if (p == nullptr) continue;
     VT_CHECK(p->rank == 1 && p->shape[0] == d,
              "tenstorrent kLayerNorm: weight/bias must be rank-1 [D]");
-    VT_CHECK(p->dtype == DType::kF32, "tenstorrent kLayerNorm: weight/bias must be F32");
+    VT_CHECK(IsFloatDType(p->dtype), "tenstorrent kLayerNorm: float weight/bias");
     VT_CHECK(p->IsContiguous(), "tenstorrent kLayerNorm: weight/bias must be contiguous");
   }
 
   MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor dev_x = UploadRows(x.Ptr<float>(), rows, d, device);
+  ttnn::Tensor dev_x = UploadTensor2D(x, device);
   std::optional<ttnn::Tensor> dev_w;
   std::optional<ttnn::Tensor> dev_b;
-  if (weight != nullptr) dev_w = UploadAffine1D(weight->Ptr<float>(), d, device);
-  if (bias != nullptr) dev_b = UploadAffine1D(bias->Ptr<float>(), d, device);
+  if (weight != nullptr) dev_w = UploadAffine1D(*weight, d, device);
+  if (bias != nullptr) dev_b = UploadAffine1D(*bias, d, device);
   ttnn::Tensor dev_y = ttnn::layer_norm(dev_x, args.eps, dev_w, dev_b);
   Download(dev_y, out);
 }
 
 // kQkvSplit: pure contiguous column split of merged [T, q+k+v] into q/k/v
-// (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy, no device.
+// (cpu_ops.cpp QkvSplitKernel). Host-staged: bit-exact memcpy when dtypes match.
 void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
-  VT_CHECK(qkv.rank == 2 && qkv.dtype == DType::kF32,
-           "tenstorrent kQkvSplit: rank-2 F32 qkv required");
-  VT_CHECK(q_out.dtype == DType::kF32 && k_out.dtype == DType::kF32 && v_out.dtype == DType::kF32,
-           "tenstorrent kQkvSplit: only F32 out is supported in this step");
+  VT_CHECK(qkv.rank == 2 && IsFloatDType(qkv.dtype),
+           "tenstorrent kQkvSplit: rank-2 float qkv required");
+  VT_CHECK(q_out.dtype == qkv.dtype && k_out.dtype == qkv.dtype && v_out.dtype == qkv.dtype,
+           "tenstorrent kQkvSplit: q/k/v out must match qkv dtype");
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                qkv.IsContiguous(),
            "tenstorrent kQkvSplit: contiguous required");
@@ -300,15 +340,19 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
   const int64_t v_dim = v_out.Numel() / t;
   const int64_t total = q_dim + k_dim + v_dim;
   VT_CHECK(qkv.shape[1] == total, "tenstorrent kQkvSplit: inner dim mismatch");
-  const float* src = qkv.Ptr<float>();
-  float* qdst = q_out.Ptr<float>();
-  float* kdst = k_out.Ptr<float>();
-  float* vdst = v_out.Ptr<float>();
+  const size_t esz = SizeOf(qkv.dtype);
+  const auto* src = static_cast<const uint8_t*>(qkv.data);
+  auto* qdst = static_cast<uint8_t*>(q_out.data);
+  auto* kdst = static_cast<uint8_t*>(k_out.data);
+  auto* vdst = static_cast<uint8_t*>(v_out.data);
   for (int64_t i = 0; i < t; ++i) {
-    const float* row = src + i * total;
-    std::memcpy(qdst + i * q_dim, row, static_cast<size_t>(q_dim) * sizeof(float));
-    std::memcpy(kdst + i * k_dim, row + q_dim, static_cast<size_t>(k_dim) * sizeof(float));
-    std::memcpy(vdst + i * v_dim, row + q_dim + k_dim, static_cast<size_t>(v_dim) * sizeof(float));
+    const uint8_t* row = src + static_cast<size_t>(i * total) * esz;
+    std::memcpy(qdst + static_cast<size_t>(i * q_dim) * esz, row,
+                static_cast<size_t>(q_dim) * esz);
+    std::memcpy(kdst + static_cast<size_t>(i * k_dim) * esz, row + static_cast<size_t>(q_dim) * esz,
+                static_cast<size_t>(k_dim) * esz);
+    std::memcpy(vdst + static_cast<size_t>(i * v_dim) * esz,
+                row + static_cast<size_t>(q_dim + k_dim) * esz, static_cast<size_t>(v_dim) * esz);
   }
 }
 
@@ -320,9 +364,9 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
                            Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3 && k_cache.rank == 4 && v_cache.rank == 4,
            "tenstorrent kReshapeAndCache: k/v rank-3, caches rank-4");
-  VT_CHECK(k.dtype == DType::kF32 && v.dtype == DType::kF32 && k_cache.dtype == DType::kF32 &&
-               v_cache.dtype == DType::kF32,
-           "tenstorrent kReshapeAndCache: only F32 is supported in this step");
+  VT_CHECK(IsFloatDType(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
+               v_cache.dtype == k.dtype,
+           "tenstorrent kReshapeAndCache: k/v/caches must share one float dtype");
   VT_CHECK(slot_mapping.rank == 1 && slot_mapping.dtype == DType::kI64,
            "tenstorrent kReshapeAndCache: slot_mapping rank-1 i64");
   const int64_t num_slots = slot_mapping.shape[0];
@@ -349,11 +393,12 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   const int64_t k_tok_stride = k.stride[0];
   const int64_t v_tok_stride = v.stride[0];
   const int64_t* slots = slot_mapping.Ptr<int64_t>();
-  const float* ksrc = k.Ptr<float>();
-  const float* vsrc = v.Ptr<float>();
-  float* kdst = k_cache.Ptr<float>();
-  float* vdst = v_cache.Ptr<float>();
-  const size_t bytes = static_cast<size_t>(n_elems) * sizeof(float);
+  const size_t esz = SizeOf(k.dtype);
+  const auto* ksrc = static_cast<const uint8_t*>(k.data);
+  const auto* vsrc = static_cast<const uint8_t*>(v.data);
+  auto* kdst = static_cast<uint8_t*>(k_cache.data);
+  auto* vdst = static_cast<uint8_t*>(v_cache.data);
+  const size_t bytes = static_cast<size_t>(n_elems) * esz;
 
   for (int64_t t = 0; t < num_slots; ++t) {
     const int64_t slot = slots[t];
@@ -362,8 +407,10 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
     const int64_t offset = slot % block_size;
     const int64_t kdst_off = block * k_block_stride + offset * k_page_stride;
     const int64_t vdst_off = block * v_block_stride + offset * v_page_stride;
-    std::memcpy(kdst + kdst_off, ksrc + t * k_tok_stride, bytes);
-    std::memcpy(vdst + vdst_off, vsrc + t * v_tok_stride, bytes);
+    std::memcpy(kdst + static_cast<size_t>(kdst_off) * esz,
+                ksrc + static_cast<size_t>(t * k_tok_stride) * esz, bytes);
+    std::memcpy(vdst + static_cast<size_t>(vdst_off) * esz,
+                vsrc + static_cast<size_t>(t * v_tok_stride) * esz, bytes);
   }
 }
 
@@ -382,9 +429,9 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
                           const PagedAttentionArgs& args) {
   VT_CHECK(query.rank == 3 && out.rank == 3 && k_cache.rank == 4 && v_cache.rank == 4,
            "tenstorrent kPagedAttention: query/out rank-3, caches rank-4");
-  VT_CHECK(query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
-               k_cache.dtype == DType::kF32 && v_cache.dtype == DType::kF32,
-           "tenstorrent kPagedAttention: only F32 is supported in this step");
+  VT_CHECK(IsFloatDType(query.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16) &&
+               IsFloatDType(k_cache.dtype) && k_cache.dtype == v_cache.dtype,
+           "tenstorrent kPagedAttention: float query/cache, f32/bf16 out");
   VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kAuto,
            "tenstorrent kPagedAttention: fp8 KV not supported in this step");
   VT_CHECK(args.scale > 0.0f, "tenstorrent kPagedAttention: scale must be > 0");
@@ -412,10 +459,6 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const int64_t bt_row = block_table.stride[0], bt_col = block_table.stride[1];
   const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
   const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];
-  const float* qptr = query.Ptr<float>();
-  const float* kptr = k_cache.Ptr<float>();
-  const float* vptr = v_cache.Ptr<float>();
-  float* optr = out.Ptr<float>();
 
   std::vector<int32_t> tok_pos(static_cast<size_t>(total_q));
   std::vector<int32_t> tok_slen(static_cast<size_t>(total_q));
@@ -454,7 +497,8 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
         const int64_t off = j % block_size;
         const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
         float dot = 0.0f;
-        for (int64_t e = 0; e < d; ++e) dot += qptr[qoff + e] * kptr[kbase + e];
+        for (int64_t e = 0; e < d; ++e)
+          dot += LoadElemF32(query, qoff + e) * LoadElemF32(k_cache, kbase + e);
         dot *= scale;
         if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
         probs[static_cast<size_t>(j - jmin)] = dot;
@@ -473,10 +517,36 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
         const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
         const int64_t off = j % block_size;
         const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
-        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += pw * vptr[vbase + e];
+        for (int64_t e = 0; e < d; ++e)
+          acc[static_cast<size_t>(e)] += pw * LoadElemF32(v_cache, vbase + e);
       }
-      for (int64_t e = 0; e < d; ++e) optr[qoff + e] = acc[static_cast<size_t>(e)];
+      for (int64_t e = 0; e < d; ++e) StoreElemF32(out, qoff + e, acc[static_cast<size_t>(e)]);
     }
+  }
+}
+
+// kGreedyArgmax: per-row lowest-index max of f32 logits (cpu_sample.cpp).
+// OPT's lm_head produces F32 logits; host-staged, bit-exact with CPU.
+void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
+  VT_CHECK(logits.rank == 2 && logits.dtype == DType::kF32 && logits.IsContiguous(),
+           "tenstorrent kGreedyArgmax: logits must be contiguous f32 [N,V]");
+  VT_CHECK(token_ids.rank == 1 && token_ids.dtype == DType::kI64 && token_ids.IsContiguous() &&
+               token_ids.shape[0] == logits.shape[0],
+           "tenstorrent kGreedyArgmax: token_ids must be i64 [N]");
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  const float* lp = logits.Ptr<float>();
+  int64_t* out = token_ids.Ptr<int64_t>();
+  for (int64_t i = 0; i < n; ++i) {
+    const float* row = lp + i * v;
+    int64_t best = 0;
+    float best_v = row[0];
+    for (int64_t j = 1; j < v; ++j) {
+      if (row[j] > best_v) {
+        best_v = row[j];
+        best = j;
+      }
+    }
+    out[i] = best;
   }
 }
 
@@ -501,6 +571,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
     RegisterOp(OpId::kPagedAttention, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
+    RegisterOp(OpId::kGreedyArgmax, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernel)));
   }
 } registrar;
 

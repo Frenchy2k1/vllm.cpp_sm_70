@@ -1,7 +1,7 @@
 # Tenstorrent (Blackhole) backend — spike spec (DRAFT, external proposal)
 
-Status: **DRAFT, W1.5 LANDED 2026-08-09 (all 9 OPT-125m ops registered;
-attention host-staged oracle).** Filed through the claim protocol
+Status: **DRAFT, W2 LANDED 2026-08-09 — OPT-125m e2e STRICT token-exact
+6/6 prompts / 96/96 tokens on real Blackhole (device type 6).** Filed through the claim protocol
 (`CLAIM-BACKEND-TENSTORRENT-SPIKE`, draft PR mudler/vllm.cpp#197) but not
 through the full `scripts/agent-start.py`/role-interview boot sequence —
 role was claimed directly per the developer's explicit direction. Treat it as
@@ -31,8 +31,9 @@ QkvSplit, Relu, ReshapeAndCache` — 9 distinct ops (`GetBackend` is not an
 op). OPT uses learned position embeddings (no RoPE), standard multi-head
 attention, LayerNorm (not RmsNorm), and ReLU (not SiLU), which is why this
 row's op list differs from an earlier draft of this spec that assumed a
-Llama-style decoder. 0 of the 9 remain unregistered. Honest residual: kPagedAttention is a host
-f32 oracle (not ttnn::sdpa_decode); no e2e model run yet.
+Llama-style decoder. 0 of the 9 remain unregistered. E2e OPT-125m greedy is STRICT token-exact
+on real Blackhole. Honest residual: kPagedAttention is host-staged f32
+oracle (not ttnn::sdpa_decode); no perf claim.
 
 **Out.** MoE, quantized kernels (the CUDA/Vulkan-side marlin/nvfp4
 equivalents), graph capture, and any model actually running — all
