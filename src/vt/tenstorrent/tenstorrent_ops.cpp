@@ -52,6 +52,21 @@
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/operations/transformer/sdpa_config.hpp>
+// experimental/paged_cache pulls op_profiler which expects a 6-arg
+// ___tracy_alloc_srcloc (with color); the TracyC.h on this tree only has 5-arg.
+// Temporarily disable Tracy for this include chain so the op headers compile.
+#ifdef TRACY_ENABLE
+#undef TRACY_ENABLE
+#define VT_RESTORE_TRACY_ENABLE 1
+#endif
+#include <ttnn/operations/experimental/paged_cache/paged_cache.hpp>
+#include <ttnn/operations/core/to_memory_config/to_memory_config_op.hpp>
+#include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
+#ifdef VT_RESTORE_TRACY_ENABLE
+#define TRACY_ENABLE 1
+#undef VT_RESTORE_TRACY_ENABLE
+#endif
 
 #include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
@@ -232,9 +247,12 @@ bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols) {
 // Host keeps vLLM NHD [nb, block, nkv, d] (LMCache/plane). Device PA needs
 // ttnn order [nb, nkv, block, d] TILE DRAM.
 //
-// Incremental path: keep a host-side ttnn-order *mirror* patched on each
-// ReshapeAndCache write. Ensure only re-uploads when the mirror is dirty or
-// too small — avoids re-walking the full NHD pool every layer.
+// Incremental path:
+//  1) Host-side ttnn-order *mirror* patched on each ReshapeAndCache write.
+//  2) When a device shadow already covers the block, try
+//     ttnn::experimental::paged_update_cache (height-sharded B=1 input) so the
+//     next PA can skip re-upload. On failure, leave device dirty → Ensure
+//     re-uploads from the mirror only (no full NHD walk).
 
 struct PagedKvShadow {
   std::optional<ttnn::Tensor> device;  // [nb, nkv, bs, d] TILE BF16 DRAM
@@ -321,8 +339,54 @@ void PatchMirrorToken(PagedKvShadow& s, uint32_t block, uint32_t offset, const f
   s.device_current = false;
 }
 
-// After host NHD RAC write for one slot: patch both K and V mirrors if present.
-// Falls back to invalidating when geometry is not TILE-friendly or mirror cold.
+// In-place device write of one decode token via paged_update_cache.
+// Requires an existing TILE DRAM cache covering `phys_block`. Returns true if
+// the device tensor was updated (so device_current can stay true).
+bool TryDevicePagedUpdateToken(ttnn::Tensor& cache_dev, MeshDevice& device, uint32_t phys_block,
+                               uint32_t offset, const float* tok, uint32_t nkv, uint32_t d,
+                               uint32_t /*bs*/) {
+  try {
+    // paged_update_cache expects [1, B, nkv_pad, d] height-sharded; pad nkv to 32.
+    const uint32_t nkv_pad = std::max(32u, ((nkv + 31u) / 32u) * 32u);
+    std::vector<float> x(static_cast<size_t>(nkv_pad) * d, 0.0f);
+    for (uint32_t g = 0; g < nkv; ++g) {
+      std::memcpy(x.data() + static_cast<size_t>(g) * d, tok + static_cast<size_t>(g) * d,
+                  static_cast<size_t>(d) * sizeof(float));
+    }
+    // DRAM TILE first, then height-shard onto 1 core (B=1).
+    ttnn::Tensor xt = ttnn::Tensor::from_vector<float>(
+        x, SpecOf(tt::tt_metal::Shape({1u, 1u, nkv_pad, d}), ttnn::DataType::BFLOAT16,
+                  ttnn::Layout::TILE),
+        &device);
+    const tt::tt_metal::CoreRangeSet core_set(
+        tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord{0, 0}, tt::tt_metal::CoreCoord{0, 0}));
+    // Shard height = one user's padded heads (nkv_pad), width = head_dim.
+    tt::tt_metal::ShardSpec shard_spec(core_set, {nkv_pad, d},
+                                       tt::tt_metal::ShardOrientation::ROW_MAJOR);
+    tt::tt_metal::MemoryConfig sharded_mem(tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED,
+                                           tt::tt_metal::BufferType::L1, shard_spec);
+    xt = ttnn::to_memory_config(xt, sharded_mem);
+
+    // Synthetic page table: update_idx=offset maps pos//bs→0 → phys_block.
+    std::vector<int32_t> pt{static_cast<int32_t>(phys_block)};
+    ttnn::Tensor page_table = ttnn::Tensor::from_vector<int32_t>(
+        pt, SpecOf(tt::tt_metal::Shape({1u, 1u}), ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
+        &device);
+    std::vector<uint32_t> update_idxs{offset};
+
+    cache_dev = ttnn::experimental::paged_update_cache(
+        cache_dev, xt, update_idxs, /*update_idxs_tensor=*/std::nullopt,
+        /*share_cache=*/false, page_table, /*batch_offset=*/0,
+        /*compute_kernel_config=*/std::nullopt, /*mesh_coords=*/std::nullopt);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// After host NHD RAC write for one slot: patch ttnn mirrors, and if a device
+// shadow already covers this block, try paged_update_cache so the next PA can
+// skip re-upload (true incremental device path).
 void NotePagedKvRacWrite(Tensor& k_cache, Tensor& v_cache, int64_t block, int64_t offset,
                          const float* k_tok, const float* v_tok) {
   if (k_cache.rank != 4 || v_cache.rank != 4) return;
@@ -334,16 +398,47 @@ void NotePagedKvRacWrite(Tensor& k_cache, Tensor& v_cache, int64_t block, int64_
   const uint32_t need = static_cast<uint32_t>(block) + 1u;
   if (need > static_cast<uint32_t>(k_cache.shape[0])) return;
 
-  std::lock_guard<std::mutex> g(PagedKvMutex());
-  auto patch_one = [&](void* host, const float* tok) {
+  // Phase 1: patch host mirrors under lock; snapshot device tensors if present.
+  std::optional<ttnn::Tensor> k_dev, v_dev;
+  bool k_can_update = false, v_can_update = false;
+  {
+    std::lock_guard<std::mutex> g(PagedKvMutex());
+    auto prepare = [&](void* host, const float* tok, std::optional<ttnn::Tensor>& dev_out,
+                       bool& can_update) {
+      PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
+      EnsureMirrorCapacity(s, need, nkv, bs, d);
+      PatchMirrorToken(s, static_cast<uint32_t>(block), static_cast<uint32_t>(offset), tok, nkv,
+                       d);
+      if (s.device.has_value() && s.nb > static_cast<uint32_t>(block) && s.nkv == nkv &&
+          s.bs == bs && s.d == d) {
+        dev_out = s.device;
+        can_update = true;
+      }
+    };
+    prepare(k_cache.data, k_tok, k_dev, k_can_update);
+    prepare(v_cache.data, v_tok, v_dev, v_can_update);
+  }
+
+  // Phase 2: optional on-device paged_update (outside lock).
+  MeshDevice* device = nullptr;
+  try {
+    device = &SharedMeshDevice();
+  } catch (...) {
+    return;
+  }
+  auto try_one = [&](void* host, std::optional<ttnn::Tensor>& dev, bool can, const float* tok) {
+    if (!can || !dev.has_value()) return;
+    if (!TryDevicePagedUpdateToken(*dev, *device, static_cast<uint32_t>(block),
+                                   static_cast<uint32_t>(offset), tok, nkv, d, bs)) {
+      return;
+    }
+    std::lock_guard<std::mutex> g(PagedKvMutex());
     PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
-    // Cold or grow: zero-fill new blocks, then patch this token (no full NHD walk).
-    EnsureMirrorCapacity(s, need, nkv, bs, d);
-    PatchMirrorToken(s, static_cast<uint32_t>(block), static_cast<uint32_t>(offset), tok, nkv,
-                     d);
+    s.device = std::move(*dev);
+    s.device_current = true;
   };
-  patch_one(k_cache.data, k_tok);
-  patch_one(v_cache.data, v_tok);
+  try_one(k_cache.data, k_dev, k_can_update, k_tok);
+  try_one(v_cache.data, v_dev, v_can_update, v_tok);
 }
 
 // Return a current ttnn-layout device tensor covering physical blocks [0, used_nb).
