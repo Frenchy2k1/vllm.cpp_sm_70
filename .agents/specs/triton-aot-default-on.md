@@ -168,4 +168,166 @@ notes.
 
 ## Outcome
 
-Pending.
+Implemented on `row/BUILD-TRITON-DEFAULT-ON`, base `origin/main` @`bd6b3936`.
+Gate host `dgx.casa` (GB10, sm_121a, nvcc 13.0.88, CUTLASS 4.5.0).
+
+### The rule that shipped
+
+`vt_triton_aot_computed_default` (`cmake/TritonAOTMultiArch.cmake`): `ON` iff
+CUDA is enabled **and** every vendored tree is present **and**
+`VLLM_CPP_TRITON_REGEN` is `OFF`. The **architecture count is not a condition** —
+see the CORRECTION under Design. Third condition added because regeneration
+genuinely writes into one tree, so the default must not select it for you.
+
+### Configure matrix (configure-only, one script against both trees)
+
+| cell | base | new | exit |
+|---|---|---|---|
+| `cpu-default` | OFF | OFF | 0 |
+| `vulkan-default` | OFF | OFF | 0 |
+| `cuda-121a-default` | OFF | **ON** | 0 |
+| `cuda-120a-default` | OFF | **ON** | 0 |
+| `cuda-110-default` | OFF | **ON** | 0 |
+| `cuda-fat-default` (`120a;121a`) | OFF | **ON** | 0 |
+| `cuda-121a-explicit-on` | ON | ON | 0 |
+| `cuda-121a-explicit-off` | OFF | OFF | 0 |
+| `cuda-fat-explicit-on` | ON | ON | 0 |
+| `cuda-release-fat-explicit-on` (ten SM) | ON | ON | 0 |
+| `cuda-121a-regen-default` | OFF | OFF | 0 |
+| `cuda-fat-regen-explicit-on` | ON | ON | **1** |
+
+The last row is the preserved `FATAL_ERROR`: byte-identical text on both trees
+(only its line number moved, 116 → 136, from added comment lines).
+
+A full CUDA gate build configured with **no** `-DVLLM_CPP_TRITON` prints
+`Triton AOT W2: embedded trees [sm_80;sm_86;sm_89;sm_90a;sm_100a;sm_121a]`
+beside the CUTLASS and FlashAttention-2 lines, and 1017 translation units carry
+both `VLLM_CPP_TRITON=1` and `VLLM_CPP_TRITON_CHUNKO_BF16=1` (Tests §3).
+
+### Dispatch evidence — the Triton chunk_o path RUNS, on both gate models
+
+`GdnDebugCounters`, captured per phase in the real paged engine:
+
+| model | `hv_n` | phase | `chunk_o_f32` | `chunk_o_bf16` | `chunk_o_hand` |
+|---|---|---|---|---|---|
+| 27B @`0893e160` | 48 | prefill (step 1) | 0 | **48** | **0** |
+| 27B @`0893e160` | 48 | decode (step 2) | 0 | 0 | 0 |
+| 35B-A3B @`491c2f1e` | 32 | prefill (step 1) | **30** | 0 | **0** |
+| 35B-A3B @`491c2f1e` | 32 | decode (step 2) | 0 | 0 | 0 |
+
+`hv_n` is `linear_num_value_heads` read from each checkpoint's `config.json`:
+**48** (27B) and **32** (35B). Both are inside `{48,32}`, so the fourth bail-out
+never fires — the spec's "if `hv_n` is outside `{48,32}` that is a finding" case
+does not arise.
+
+**Not one of the six bail-outs declined anything at prefill.** `chunk_o_hand`
+is 0 in both models, so every GDN layer took the Triton realization: 48 of 48
+GDN layers on the 27B, 30 of 30 on the 35B.
+
+The zeros are not declines:
+
+- `chunk_o_f32 = 0` on the 27B and `chunk_o_bf16 = 0` on the 35B are the *other*
+  `Tout` template instantiation of the same call site. The 27B dense path runs
+  the vLLM-faithful **bf16** GDN output; the 35B MoE path runs the **f32**
+  recurrence output. Each model calls exactly one instantiation.
+- **Every decode counter is 0, including `chunk_o_hand`.** The hand counter is
+  incremented on the `!triton_chunko` branch of the same call site, so both being
+  zero means `TryTritonChunkO` was never *called*: the chunked-scan path does not
+  execute at batch-1 decode at all. That is the code path, not a bail-out —
+  matching the spec's own note that decode goes through `GdnDecodeFusedKernel`.
+  **No decode-throughput effect is claimed.**
+
+Scratch pools behaved: 27B prefill 432 chunk reuses / 96 WU reuses with 0
+growths; 35B 261 / 58 with 0 growths.
+
+### Gates
+
+- Focused: `cmake -P cmake/TritonAOTDefaultTest.cmake` — ALL PASS (RED before:
+  `Unknown CMake command "vt_triton_aot_computed_default"`). Wired into the
+  `cuda-arch-features` CI job beside `TritonAOTMultiArchTest.cmake`.
+- `scripts/agent-preflight.sh --staged` — exit 0.
+- CUDA `ctest` on sm_121a, **serial**, from the default-ON build:
+  GDN/Triton subset **9/9 PASS**.
+- 27B SACRED gate (`test_qwen27_paged_engine`, pinned unsloth @`890bdef7`):
+  **235/235 assertions, SUCCESS** — the documented full-production-stack result,
+  now reached with no build flag to remember.
+- 35B gate (`test_qwen36_paged_engine`, pinned nvidia @`491c2f1e`):
+  **2/2 cases, 315/315 assertions, SUCCESS**.
+- Release metadata: all eleven tests pass **unedited**; every expectation
+  re-derived from the new rule and unchanged (see the commit body).
+
+### Pre-existing failures, attributed not assumed
+
+The serial suite reached **379/395** with **nine** failures. Five are
+**A/B-attributed to `origin/main`**: built there with its own default
+(`VLLM_CPP_TRITON:BOOL=OFF`), same box, toolchain and CUTLASS, each fails with
+the same assertion, the same line and the same pass/fail counts, so none is
+caused by this change. A sixth shares an already-attributed root cause. The
+remaining three are covered by a comprehensive same-set A/B against `origin/main`
+that is queued to run when the suite finishes (`triton-abfull`, logs
+`out-gate/abfull-*.log`).
+
+**Attributed to main by direct A/B:**
+
+- `test_linear_method` — `CHECK(after == before + 1)` at `:246`. Cause pinned
+  exactly: `VT_MARLIN_DENSE` defaults **ON**
+  (`dense_nvfp4_gemm.h:121-127` returns true unless the value is `0`), so
+  `GateUpFusedMarlinD` takes the dense-GEMM branch and increments `dense_gemms`
+  instead of `fused_gate_up`. Re-running the SAME binary with
+  `VT_MARLIN_DENSE=0` passes 1/1. The comment at `dense_nvfp4_gemm.h:527` still
+  says "VT_MARLIN_DENSE (default OFF)", which is now false. **Owed its own
+  issue.**
+- `test_minimax_h3` — `vt cuda: cudaFree: invalid argument` at `:3535` then
+  SIGSEGV at `:3945`, byte-identical on main. **Owed its own issue.**
+- `test_serve_low_tools` — `test_script_stays_shellcheck_clean`, a lint test
+  with no CUDA involvement, failing on main too. **Owed its own issue.**
+- `test_glm4_moe_lite_paged_engine` — the GLM/DSA G1 gate, token divergence
+  `REQUIRE(got[j] == od[i*T+j])` at `:283`, 70 assertions / 69 passed. Attributed
+  **twice**: (a) the SAME binary with `VT_GDN_CHUNKO_TRITON=0
+  VT_GDN_DELTAH_TRITON=0 VT_GDN_WU_TRITON=0 VT_GDN_PACKED_DECODE_TRITON=0` fails
+  identically, and (b) the `origin/main` build fails identically. Consistent with
+  the model: GLM-4.7-Flash's `config.json` carries **no `linear_*` keys at all**
+  (`qk_nope_head_dim` 192 / `qk_rope_head_dim` 64 / `v_head_dim` 256 — MLA +
+  DeepSeek-MoE), so it has no GDN layers and the GDN-only Triton kernels cannot
+  reach it. **Owed its own issue** — this is a live SACRED gate that is red on
+  main.
+- `test_gemma4_registry_e2e` — `vt::GeluMulSeparate: ROCm-only fast path in this
+  build` thrown at `:163` (`fused_ops.cpp:70`); no CUDA realization of that op is
+  registered. Identical on main. **Owed its own issue.**
+
+**Same root cause as an attributed one:**
+
+- `test_gemma4_paged_engine` — the identical
+  `vt::GeluMulSeparate: ROCm-only fast path in this build` throw, at `:67`.
+  Folded into the `GeluMulSeparate` issue above.
+
+**Pending the queued comprehensive A/B** (none is plausibly reachable from a
+GDN-only cubin set, but none is asserted attributed until measured):
+
+- `test_capi` — SIGSEGV at `tests/capi/test_capi.cpp:480`, the ABI v8
+  custom-logits-processor case on a *synthetic* engine; 47/47 assertions passed
+  before the crash, 3 of 4 cases green. `.agents/environment.md:189` already
+  calls this a known flake here, but this run was `-j 1`, so that explanation
+  does not apply and it needs the A/B.
+- `test_qwen3_apc_e2e` — `REQUIRE(anchor_ok)` at `:375`, 59 assertions / 58
+  passed. Automatic prefix caching, no GDN layers involved.
+- `test_minicpm3_paged_engine` — `REQUIRE(first_div < 0)` at `:224`, 26
+  assertions / 25 passed.
+
+### Operational note (cost a box)
+
+`ctest -j 4` on this build **OOM-rebooted dgx.casa** at 00:55 (kernel
+`NVRM ... Out of memory [NV_ERR_NO_MEMORY]`): unified memory means concurrent
+model gates stack into host RAM. Run the CUDA suite with `-j 1` here.
+
+The full serial suite is the remaining open item. It was started, stopped at
+171/395 to free `$HOME/gpu.lock` for the attribution arms (which queue behind
+it), and restarted from the beginning; the restarted run reached **379/395**
+with the nine failures above. Logs, all under
+`dgx:~/work/triton-default-on/out-gate/`: `ctest-serial-full-partial.log` (the
+first run), `ctest-serial-full.log` (the restarted run, ends with
+`full-serial-exit=`), and `abfull-armA.log` / `abfull-armB-main.log` (the
+comprehensive attribution pass).
+
+Serialising the whole suite behind one `flock` also means every probe queues
+behind it; run attribution arms before, not during, a full suite.
