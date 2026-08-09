@@ -9,6 +9,66 @@ function(vt_triton_aot_available_arches OUT_VAR)
   set(${OUT_VAR} "${VT_TRITON_AOT_AVAILABLE_ARCHES}" PARENT_SCOPE)
 endfunction()
 
+# vt_triton_aot_computed_default(OUT_DEFAULT OUT_REASON CUDA_ENABLED
+#                                VENDORED_DIR REGEN)
+#
+# The default value of VLLM_CPP_TRITON (BUILD-TRITON-DEFAULT-ON, #219). ON
+# wherever the build can actually consume the vendored artifacts; otherwise OFF
+# with a one-line reason naming the condition that declined it.
+#
+# The artifacts are pre-generated cubins embedded in plain C, so consuming them
+# needs a C compiler and nothing else — the opt-in default guarded no
+# dependency, it only made the shipped kernels easy to omit by accident. The
+# gate profile has required `-DVLLM_CPP_TRITON=ON` by hand for that reason
+# (.agents/environment.md, MANDATORY gate-build flags).
+#
+# NOT a condition: the number of CUDA architectures. The builder path embeds
+# EVERY vendored tree (`_triton_aot_arch_names` in TritonAOT.cmake) and the
+# runtime picks a cubin by exact SM, which is precisely what the shipped ten-SM
+# release archive (scripts/build-linux-accelerator-release.sh) and the
+# cuda-fat-gencode CI job (.github/workflows/ci.yml) already build with
+# -DVLLM_CPP_TRITON=ON. The single-arch FATAL_ERROR in `_triton_aot_arch_name`
+# guards the MAINTAINER regen flow, which is why REGEN below declines instead.
+#
+# Declining is always quiet: the default must never turn a configure that used
+# to succeed into an error. An explicit -DVLLM_CPP_TRITON=ON keeps every
+# existing diagnostic, unchanged.
+function(vt_triton_aot_computed_default OUT_DEFAULT OUT_REASON CUDA_ENABLED
+         VENDORED_DIR REGEN)
+  if(NOT CUDA_ENABLED)
+    set(${OUT_DEFAULT} OFF PARENT_SCOPE)
+    set(${OUT_REASON}
+      "the vendored artifacts are CUDA cubins and VLLM_CPP_CUDA is OFF"
+      PARENT_SCOPE)
+    return()
+  endif()
+  if(REGEN)
+    set(${OUT_DEFAULT} OFF PARENT_SCOPE)
+    set(${OUT_REASON}
+      "VLLM_CPP_TRITON_REGEN is ON — maintainer regeneration pins ONE arch tree \
+and runs the Python toolchain, so it is never selected for you"
+      PARENT_SCOPE)
+    return()
+  endif()
+  vt_triton_aot_available_arches(_arches)
+  set(_missing "")
+  foreach(_arch IN LISTS _arches)
+    if(NOT EXISTS "${VENDORED_DIR}/${_arch}/MANIFEST")
+      list(APPEND _missing "${_arch}")
+    endif()
+  endforeach()
+  if(_missing)
+    list(JOIN _missing " " _missing_text)
+    set(${OUT_DEFAULT} OFF PARENT_SCOPE)
+    set(${OUT_REASON}
+      "vendored artifact tree(s) [${_missing_text}] are absent from ${VENDORED_DIR}"
+      PARENT_SCOPE)
+    return()
+  endif()
+  set(${OUT_DEFAULT} ON PARENT_SCOPE)
+  set(${OUT_REASON} "" PARENT_SCOPE)
+endfunction()
+
 function(vt_triton_aot_arch_tree OUT_VAR ARCH)
   set(_tree "sm_${ARCH}")
   if(_tree IN_LIST VT_TRITON_AOT_AVAILABLE_ARCHES)

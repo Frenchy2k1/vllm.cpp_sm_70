@@ -51,6 +51,49 @@ FATAL_ERRORs would break the fat build and every non-CUDA backend.
 
 Must keep resolving `OFF`: CPU, Metal/MSL, Vulkan, ROCm, and `120a;121a`.
 
+### CORRECTION (implementation, 2026-08-09): conditions 2 and the "explicit path
+### keeps failing loudly" clause are REFUTED
+
+Conditions 1 and 3 stand. Condition 2 and the multi-arch `FATAL_ERROR`
+requirement above were written from a stale reading of `TritonAOT.cmake` and are
+false on `origin/main` @`785e2978`.
+
+`_triton_aot_arch_name` — the function holding the multi-arch `FATAL_ERROR` — is
+**unreachable from the builder path**. `add_triton_kernel` (`:226-228`) and
+`triton_aot_finalize` (`:437-444`) both branch on `VLLM_CPP_TRITON_REGEN`, and
+the non-regen branch calls `_triton_aot_arch_names`, which returns
+`vt_triton_aot_available_arches` — *every* vendored tree — and never consults
+`VLLM_CPP_CUDA_ARCHITECTURES`. W2 embeds all six trees and selects one by exact
+SM at runtime. Only maintainer regeneration, which writes a cubin into one
+directory, reaches the single-arch guard.
+
+Measured, configure-only, on the gate host (`dgx.casa`, sm_121a, nvcc 13.0,
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`), against an unmodified
+`origin/main` @`785e2978`:
+
+| cell | exit | resolved |
+|---|---|---|
+| `-DVLLM_CPP_CUDA_ARCHITECTURES="120a;121a" -DVLLM_CPP_TRITON=ON` | **0** | `ON` |
+| `-DVLLM_CPP_CUDA_ARCHITECTURES="80;…;121a" -DVLLM_CPP_TRITON=ON` | **0** | `ON` |
+
+The fat cell printed `Triton AOT W2: embedded trees
+[sm_80;sm_86;sm_89;sm_90a;sm_100a;sm_121a]` and configured clean. Two shipped
+callers already depend on this: `scripts/build-linux-accelerator-release.sh:23,47`
+builds the release archive as ten SMs *with* `-DVLLM_CPP_TRITON=ON`, and
+`.github/workflows/ci.yml:344-346` does the same in `cuda-fat-build`. Making the
+explicit multi-arch path fatal would break both, and
+`test_release_accelerator_metadata.py:107` requires `VLLM_CPP_TRITON=ON` in a
+CUDA release cache, so it would be self-contradictory as well.
+
+**What was implemented instead.** The default is `ON` iff CUDA is enabled, every
+vendored tree is present, and `VLLM_CPP_TRITON_REGEN` is `OFF` — the third
+condition added because regeneration genuinely is single-arch, so the default
+must not select it for you. The architecture **count is not a condition**;
+`120a;121a` and the ten-SM set both resolve `ON` and configure clean. The
+`FATAL_ERROR` at `TritonAOT.cmake:116-127` is **byte-unchanged** and still
+guards the regen flow it actually protects. No new error was added, so the
+default can never turn a configure that used to succeed into a failure.
+
 ## Risks
 
 - **Breaking the fat build.** `_triton_aot_arch_name` raises `FATAL_ERROR` on

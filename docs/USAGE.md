@@ -163,13 +163,16 @@ completed on a release tag.
 
 To reproduce the W1 heterogeneous CUDA archive candidate, configure the exact
 release architecture set. Portable translation units compile for all ten SMs;
-architecture-specific kernels compile only for their supported intersection:
+architecture-specific kernels compile only for their supported intersection.
+`VLLM_CPP_TRITON` is left to its default, which is `ON` here — a fat CUDA build
+embeds every vendored per-arch cubin tree and selects one by exact SM at
+runtime, which is what the released archive contains:
 
 ```sh
 cmake -S . -B build-cuda-fat -G Ninja \
   -DVLLM_CPP_CUDA=ON \
   -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
-  -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_TRITON=OFF
+  -DVLLM_CPP_CUTLASS_FETCH=ON
 cmake --build build-cuda-fat --target vllm
 python3 scripts/check-cuda-fat-gencode.py \
   --compile-commands build-cuda-fat/compile_commands.json \

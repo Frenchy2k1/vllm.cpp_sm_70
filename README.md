@@ -327,14 +327,14 @@ ctest --test-dir build
 ```
 
 ```sh
-cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON   # NVIDIA GB10
+cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON   # NVIDIA GB10
 cmake --build build-cuda -j
 ```
 
 Triton-AOT cubins for the fast GDN path are vendored, so Python and Triton are needed only to
-regenerate them, never to build or run them. Metal is auto-detected on Apple hosts; Vulkan is opt-in
-with `-DVLLM_CPP_VULKAN=ON`. Every CMake option, per-backend recipe, and the quantization format
-table: [docs/BUILD.md](docs/BUILD.md).
+regenerate them, never to build or run them; a CUDA build ships them. Metal is auto-detected on
+Apple hosts; Vulkan is opt-in with `-DVLLM_CPP_VULKAN=ON`. Every CMake option, per-backend recipe,
+and the quantization format table: [docs/BUILD.md](docs/BUILD.md).
 
 ## Running inference (CLI)
 
