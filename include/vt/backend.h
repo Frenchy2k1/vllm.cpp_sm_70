@@ -140,6 +140,20 @@ class Backend {
   // lands.
   virtual bool SupportsAsyncSampledTokenReadback() const { return false; }
 
+  // Can this backend's causal-conv1d kernels read and write a COMPRESSED (bf16)
+  // conv_state IN PLACE? vLLM's default mamba_cache_dtype="auto" makes the GDN
+  // conv cache the model dtype (bf16 for the gate checkpoints), and a backend
+  // that cannot address it must be handed an f32 working copy instead — which
+  // costs the caller a gather before and a scatter after, per GDN layer, per
+  // token. Overridden true by CUDA and by Vulkan, whose kernels widen the stored
+  // element to f32, accumulate in f32 registers and round once on store; that is
+  // the SAME single bf16->f32->bf16 round trip the gather/scatter arm performs,
+  // so the two arms agree bit-for-bit.
+  // This is the capability the `device == kCUDA` clause in CheckConvCommon
+  // actually asked. It lives on Backend so the shared vt op layer stops naming a
+  // device, exactly as SupportsAsyncSampledTokenReadback did for the runner.
+  virtual bool SupportsCompressedConvState() const { return false; }
+
   // Optional graph/command capture (CUDA Graphs / Metal ICB / Vulkan CB).
   virtual bool SupportsGraphCapture() const { return false; }
   virtual void BeginCapture(Queue& q);

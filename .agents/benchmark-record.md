@@ -16104,3 +16104,76 @@ recording with GPU execution — and their descriptor sets are fungible across
 pipelines (one global layout, bump-allocated, `:6996-7009`, `:8137`), so ring
 exhaustion cannot force a flush at all. Our submit-then-block idiom is, in their
 code, a debug-only path behind `GGML_VK_SERIALIZE_SUBMISSIONS` (`:17016-17035`).
+
+---
+
+## BACKEND-VULKAN-DEVICE-RESIDENT — the 98 copy flushes were the GDN STATE cache, not activations (2026-08-09, GB10)
+
+The entry above named the remaining 1.45x as "the 27B forward moves activations
+through HOST vectors between ops". **That premise was wrong, and grounding it
+first is what made the fix small.** The 27B decode already runs a device-resident
+forward: `RunDenseLayerPaged` -> `GdnBlockPaged` / `FullAttnBlockPaged` /
+`DenseMlpBlock` all take and return `DBuf`, so no activation crosses the host.
+The host-vector helpers at `qwen3_5.cpp:886-917` (`MatmulF32`/`MatmulBf16`) are
+reached only from the non-paged reference path and the MoE router, not from this
+model's decode.
+
+**Where the copies actually came from.** `IndexedGdnStateIoEnabled` keyed its
+default on `needs_weight_staging()`, which is true ONLY on CUDA — the same
+"not-CUDA is not CPU" defect as issue #125, one level up. So every non-CUDA
+device took the ROW-COPY arm: per GDN layer, `GatherStateF32` + `ScatterStateF32`
+for the conv state and for the ssm state, each issuing a `Backend::Copy`. The 27B
+has 48 linear-attention layers of 64, so a decode token drove ~192 host memcpys
+over device memory, and the ones that touched a buffer the open batch had bound
+drained it. MEASURED, `VT_VULKAN_DISPATCH_STATS=1`, 1 prefill + 4 decode tokens:
+`copy-dst` 192 + `copy-src` 201 = **393 copy-triggered flushes, 457 submits
+total** — 98 and 114 per token, reproducing the campaign's figures exactly.
+
+**Why the indexed arm was reachable on Vulkan at all.** The 27B's
+`mamba_ssm_dtype` is `float32`, so `vt::GdnDecode(cache, &state_idx)` already
+satisfied the vt contract and the Vulkan shader already had `has_idx`. Only the
+CONV state was blocked: it is bf16, and `CheckConvCommon` spelled the
+compressed-state permission as `device == kCUDA`. That clause is now
+`Backend::SupportsCompressedConvState()` (CUDA + Vulkan true, CPU false), and
+`vt_causal_conv1d_update.comp` binds the state through the dtype-erased 32/16-bit
+view pair. The rounding is unchanged: `VT_LOAD` widens, the accumulation is the
+same f32 sequence, `VT_STORE` rounds once — the same single bf16->f32->bf16 round
+trip the gather/scatter arm performed.
+
+**Result (all same binary, `VT_GDN_INDEXED_STATE_IO=0` restores the baseline):**
+
+| | row-copy (A) | indexed in place (B) |
+|---|---|---|
+| submits, 1 prefill + 4 decode | 457 | **121** |
+| copy-triggered flushes | 393 (`copy-dst` 192, `copy-src` 201) | **9** (`copy-src` only) |
+| per decode token | 114 flushes, 98 copy | **~30 flushes, ~2 copy** |
+| median TPOT, 8 pairs | 314.3 ms (3.18 tok/s) | **254.4 ms (3.93 tok/s)** |
+
+8 order-alternated pairs, page cache dropped before every run, `--num-prompts 1
+--input-len 32 --output-len 32 --concurrency 1`: **B wins 8/8**, 1.235x. B is
+tight (249.4-255.7 ms); A is 300.8-319.4 plus one 519.9 cold outlier.
+
+**Regime matters, and two earlier blocks prove it.** Blocks 1-2 (6 + 8 pairs)
+ran WITHOUT dropping the page cache and B won only 15/18 overall, with two B runs
+at ~455 ms. The 27B on Vulkan holds its safetensors in host page cache AND a
+second full copy in Vulkan device buffers (both host RAM on GB10), so an
+uncontrolled run sits at the RAM ceiling; block 2 had 6 of 16 runs killed by a
+MemAvailable watchdog at 6 GB, in BOTH arms. An unguarded earlier attempt
+OOM-rebooted the box. **Releasing the host weight bytes after upload on the
+Vulkan load path is a real, unclaimed lever** (the GB10 NVFP4 recipe already does
+this on CUDA: 114 -> 67 GiB RSS).
+
+**Correctness:** greedy 32-token completion on the 27B is byte-identical between
+the two arms; `opt-125m` STRICT 6/6 token-exact (96/96, 0 declines);
+`test_vulkan_backend` 27/27 on GB10 (the 27th is a NEW case: a compressed conv
+state updated in place, bit-exact against the upcast arm it replaces); the CUDA
+library builds clean with the same
+change and takes exactly the branch it took before (`SupportsCompressedConvState`
+returns true on CUDA, and the `needs_weight_staging()` arm is untouched).
+
+**What remains, now located.** `reference-tier` grew from 64 to 112 flushes
+because the batch accumulates further between host-tier ops — it is now ~28 of
+the ~30 flushes/token. The declines name exactly three ops: `kCausalConv1dFwd`
+(op 5, prefill only), `kRopeCosSinCache` (op 66) and `kAttnQkNormRopeGate`
+(op 67). The last two run per full-attention layer, 16 per token, and are the
+next lever; they are kernel work, not plumbing.

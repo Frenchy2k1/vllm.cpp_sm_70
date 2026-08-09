@@ -206,7 +206,7 @@ struct GdnStateScatterParams {
 struct ConvUpdateParams {
   uint32_t batch, c_dim, k, width, state_len, x_rs, n_state_rows;
   uint32_t has_bias, has_idx, silu;
-  uint32_t out_dt, x_dt, w_dt, bias_dt;
+  uint32_t out_dt, x_dt, w_dt, bias_dt, st_dt;
   uint32_t out_off, x_off, w_off, bias_off, st_off, idx_off;
 };
 struct GdnPostConvParams {
@@ -1083,11 +1083,14 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
                               const CausalConv1dArgs& args) {
   const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1];
   if (batch == 0 || c_dim == 0) return;
-  // bf16 conv_state is a CUDA-only extension of the contract
-  // (src/vt/ops.cpp CheckConvCommon), so on this backend the state is f32 and the
-  // shader reads it through the 32-bit view directly.
-  VT_CHECK(conv_state.dtype == DType::kF32,
-           "vulkan causal_conv1d_update: conv_state must be f32");
+  // The state is read AND written in place through the dtype-erased pair of
+  // views, so a COMPRESSED (bf16) cache needs no caller-side gather/upcast. That
+  // is what SupportsCompressedConvState() advertises for this backend
+  // (src/vt/ops.cpp CheckConvCommon), and what lets the model's indexed
+  // state-I/O path — which hands the kernel the cache itself plus the slot
+  // indices — replace two host memcpys per GDN layer per token.
+  VT_CHECK(conv_state.dtype == DType::kF32 || conv_state.dtype == DType::kBF16,
+           "vulkan causal_conv1d_update: conv_state must be f32 or bf16");
   Binder bind;
   const uint32_t out_off = bind.Add(out, "causal_conv1d_update: out");
   const uint32_t x_off = bind.Add(x, "causal_conv1d_update: x");
@@ -1095,11 +1098,15 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
   // Bindings 6/7 alias the weight when there is no bias; see the note above.
   const uint32_t bias_off = bias != nullptr ? bind.Add(*bias, "causal_conv1d_update: bias")
                                             : bind.Add(w, "causal_conv1d_update: weight");
-  const uint32_t st_off = bind.AddU32Only(conv_state, "causal_conv1d_update: conv_state");
+  const uint32_t st_off = bind.Add(conv_state, "causal_conv1d_update: conv_state");
   const uint32_t idx_off =
       conv_state_indices != nullptr
           ? bind.AddU32Only(*conv_state_indices, "causal_conv1d_update: conv_state_indices")
-          : bind.AddU32Only(conv_state, "causal_conv1d_update: conv_state");
+          // Alias the state when there are no indices. AddByteView, not
+          // AddU32Only: a bf16 state is only 2-byte aligned, and AddU32Only's
+          // 4-byte assertion would reject a perfectly valid tensor on the path
+          // where the shader never reads this binding at all (p.has_idx == 0).
+          : bind.AddByteView(conv_state, "causal_conv1d_update: conv_state");
   ConvUpdateParams p{static_cast<uint32_t>(batch),
                      static_cast<uint32_t>(c_dim),
                      static_cast<uint32_t>(k),
@@ -1114,6 +1121,7 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
                      DtypeCode(x.dtype),
                      DtypeCode(w.dtype),
                      bias != nullptr ? DtypeCode(bias->dtype) : DtypeCode(w.dtype),
+                     DtypeCode(conv_state.dtype),
                      out_off,
                      x_off,
                      w_off,

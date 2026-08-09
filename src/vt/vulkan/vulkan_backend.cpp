@@ -127,6 +127,13 @@ class VulkanBackend final : public Backend {
 
   bool UnifiedMemory() const override { return VulkanContext::Get().unified_memory(); }
 
+  // vt_causal_conv1d_update binds the state through the dtype-erased 32/16-bit
+  // view pair and rounds once on store, so a bf16 conv_state is read and written
+  // in place. Without this the caller must gather the cache into an f32 working
+  // copy and scatter it back — two host memcpys per GDN layer per token, each
+  // one intersecting the open command batch and forcing a drain.
+  bool SupportsCompressedConvState() const override { return true; }
+
   int DeviceCapabilityMajor() const override { return VulkanContext::Get().api_major(); }
   int DeviceCapabilityMinor() const override { return VulkanContext::Get().api_minor(); }
 };
