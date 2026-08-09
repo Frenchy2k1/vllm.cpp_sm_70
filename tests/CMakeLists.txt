@@ -763,6 +763,13 @@ if(VLLM_CPP_VULKAN)
   # test_model_registry already uses above.
   target_include_directories(test_vulkan_backend PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
+if(VLLM_CPP_TENSTORRENT)
+  # Plain C++ (no ttnn/tt-metal header): every assertion goes through the
+  # public vt:: seam, same rationale as test_vulkan_backend.cpp's own comment.
+  # Each case SKIPS (not fails) when the build has the backend compiled in but
+  # the box has no Blackhole card.
+  vllm_cpp_add_test(test_tenstorrent_backend vt/test_tenstorrent_backend.cpp)
+endif()
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 # BACKEND-ACCEL-PROVIDER: the acceleration-provider seam (include/vt/op_provider.h)
 # — deterministic selection, capability predicates, decline-and-fall-back and the

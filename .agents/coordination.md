@@ -151,15 +151,47 @@ available in this session to validate anything beyond reading the ttnn C++
 API and confirming its CMake package exports (`TT-NN`/`TT-Metalium`) resolve
 externally. Draft PR [#197](https://github.com/mudler/vllm.cpp/pull/197) is
 the claim, pushed with explicit developer authorization (no
+**Tenstorrent Blackhole backend, W0 skeleton (`BACKEND-TENSTORRENT`,
+2026-08-09, `CLAIM-BACKEND-TENSTORRENT-SPIKE`).** Claude Code
+(claude-sonnet-5), isolated worktree
+`/home/lu_zero/Sources/vllmcpp-tenstorrent`, branch
+`row/BACKEND-TENSTORRENT`, base `origin/main` `7534da65`. Real Blackhole
+hardware is available to this session throughout (a P150 board, used all
+session for unrelated tt-metal/Gentoo work) — updating the claim's earlier
+"no hardware available" framing, which was never accurate.
+
+Proposes and lands a new extension platform (no upstream vLLM equivalent,
+same class as Metal/Vulkan): `DeviceType::kTENSTORRENT` as a thin
+`vt::Backend` adapter over Tenstorrent's own ttnn C++ tensor-op library
+rather than hand-written Tensix kernels, mirroring the Metal/MLX decision
+(E1). The design's one open risk (`vt::Tensor`/`ttnn::Tensor` storage
+mismatch) was hands-on resolved first via a standalone program outside this
+repo's build (`Tensor::from_vector` uploads, `ttnn::operations::matmul::matmul`,
+`to_vector` reads back — max_abs_diff 0.03375 vs max_ref_mag 4.14 against a
+host FP32 reference, bf16 tolerance), then landed for real behind the actual
+`vt::Backend`/`RegisterOp` seam: `vt::tenstorrent::Backend`, a `Platform`
+registrar, and ONE op (`kMatmul`, F32/rank-2 only) —
+`tests/vt/test_tenstorrent_backend.cpp` is 3/3 cases, 8/8 assertions, PASS on
+the real card. Two real bugs surfaced and fixed in the same pass: an
+nlohmann-json ABI-version collision between vllm.cpp's own vendored copy and
+tt-metal's (isolated `tenstorrent_ops.cpp` as its own OBJECT library, same
+pattern `vllm_rocm_platform_syntax_check` already uses), and a process-exit
+segfault from a plain `static shared_ptr<MeshDevice>`'s destructor running
+during static teardown (fixed by deliberately leaking the device — see the
+spec and `tenstorrent_device.cpp` for both). Owns `.agents/specs/
+tenstorrent-backend.md`, the `BACKEND-TENSTORRENT` backend-matrix row (now
+`ACTIVE`), `porting-inventory.md` §9 item 15, `include/vt/device.h`,
+`src/vllm/platforms/{platform,tenstorrent}.cpp`, `src/vt/tenstorrent/`,
+`tests/vt/test_tenstorrent_backend.cpp`, the `VLLM_CPP_TENSTORRENT` CMake
+wiring, and this claim. Draft PR [#197](https://github.com/mudler/vllm.cpp/pull/197)
+is the claim, pushed with explicit developer authorization each time (no
 `.agents/developer-preferences.md` exists for this session; the example's
-safe default is ask-first for push/PR, and it was asked). **Update
-2026-08-09:** the spec's one open risk (vt::Tensor/ttnn::Tensor storage
-mismatch) is now hands-on resolved on real Blackhole hardware — a standalone
-program outside this repo's build uploaded two tensors via
-`Tensor::from_vector`, ran `ttnn::operations::matmul::matmul`, and matched a
-host FP32 reference within bf16 tolerance (max_abs_diff 0.03375 vs max_ref_mag
-4.14). Detail in the spec. The row stays `INVENTORIED`
-until reviewed and, if accepted, moved to `SPIKE`.
+safe default is ask-first for push/PR, and it was asked every time).
+
+**`ACTIVE` means a gated skeleton, not a supported backend** — same caveat
+Metal/Vulkan's own `ACTIVE` status carries. Not yet reviewed by a maintainer.
+Quant/MoE/graph-capture/most ops are unregistered; every op call pays a host
+round-trip (`tenstorrent_backend.cpp`'s SCOPE note); no model runs.
 
 **Server binary release manifest W5 (`ENG-RELEASE-BINARIES`, 2026-08-08,
 `CLAIM-ENG-RELEASE-BINARIES-W5`).** Codex (GPT-5), isolated worktree
@@ -1728,6 +1760,7 @@ this claim will meet. The tiled row is speed-gatable on dgx.
 | `CLAIM-SERVE-VIDEOS-REFS` | `SERVE-VIDEOS-REFS` (NEW engine-matrix row, stacked on `SERVE-VIDEOS-OAI`) | Claude Opus 5 (1M context) sub-agent | isolated worktree `/home/mudler/_git/vllm.cpp/.claude/worktrees/agent-a152dd219c723cb12` (CPU-only; no GPU, no download; foreground) | branch `row/SERVE-VIDEOS-REFS`, base `row/SERVE-VIDEOS-OAI` | Reference conditioning over `/v1/videos`: `input_reference` -> fl2va first-frame conditioning, the `metadata` video/audio references -> ref2va blocks, the exclusivity rule at the request boundary, and the `examples/server` runner wiring with lazily-loaded VAE encoder halves. Owns the reference members of `{include,src}/vllm/entrypoints/openai/video_api.*`, the video runner in `examples/server/main.cpp`, both video test files, `specs/minimax-h3.md` §10 and the record surfaces. ADDITIVE: no generation kernel and no model forward touched. | `ACTIVE` | 2026-08-06 CPU-LANDED + gated (`test_video_api` 14/14-167, `test_openai_api_server` 41/41-525, `server` -Werror clean). Real-weights leg rides the H3 GB10/disk window. |
 | `CLAIM-PARAKEET-KERNELS-P1P3` | `KERNEL-CPU-CONV2D-SUBSAMPLE`, `KERNEL-DEPTHWISE-CONV1D`, `KERNEL-ATTN-RELPOS` | Claude Opus 5 (1M context) | isolated worktree `/home/mudler/_git/vllm.cpp-parakeet` (CPU-only) | branch `row/MODEL-AUDIO-PARAKEET-ENCODER`, base `main` | The three ops the FastConformer encoder needs and `vt::` did not have: Conv2d subsampling, non-causal depthwise Conv1d, and relative-position attention with the `_rel_shift` closed form. Owns `src/vt/cpu/cpu_conv2d.cpp`, the depthwise-conv1d and attn-relpos CPU providers, `tests/vt/test_ops_conv2d.cpp`, `tests/vt/test_ops_conv1d_depthwise.cpp`, `tests/vt/test_ops_attn_relpos.cpp` and the three kernel-matrix rows. | `ACTIVE` | 2026-08-06 CPU-LANDED + gated. CPU-ONLY by developer instruction: no GPU regression suite, no CUDA test or benchmark was run. |
 | `CLAIM-PARAKEET-MODEL-P4` | `MODEL-AUDIO-PARAKEET-ENCODER`, `MODEL-AUDIO-PARAKEET-TRANSDUCER` | Claude Opus 5 (1M context) | isolated worktree `/home/mudler/_git/vllm.cpp-parakeet` (CPU-only) | branch `row/MODEL-AUDIO-PARAKEET-ENCODER`, base `main` | The encoder, the CTC head with greedy collapse, the log-mel front end, an HF-safetensors loader and the RNN-T/TDT transducer. Owns `src/vllm/model_executor/models/parakeet_*`, `src/vllm/multimodal/parakeet_audio_processor.*`, `examples/parakeet_transcribe/`, the Parakeet tests and the two model-matrix rows. | `ACTIVE` | 2026-08-07 CPU-LANDED + gated against a HF `ParakeetForCTC` oracle with EXACT token ids; transcribes ctc-0.6b/1.1b, rnnt-0.6b, tdt-0.6b-v3. No CUDA, no aarch64, no speed number claimed. |
+| `CLAIM-BACKEND-TENSTORRENT-SPIKE` | `BACKEND-TENSTORRENT` (`INVENTORIED`→`ACTIVE`; W0 skeleton, one op) | Claude Code (claude-sonnet-5) | isolated worktree `/home/lu_zero/Sources/vllmcpp-tenstorrent`; real Blackhole (P150) hardware available all session | branch `row/BACKEND-TENSTORRENT`, base `origin/main` `7534da65`, draft PR [#197](https://github.com/mudler/vllm.cpp/pull/197) | New extension platform (no upstream vLLM equivalent, same class as Metal/Vulkan): `DeviceType::kTENSTORRENT`, `vt::tenstorrent::Backend` (host-staged, discrete PCIe), `TenstorrentPlatform`, ONE op (`kMatmul`, F32/rank-2) via `ttnn::operations::matmul::matmul`. Owns `include/vt/device.h`, `src/vllm/platforms/{platform,tenstorrent}.cpp`, `src/vt/tenstorrent/`, `tests/vt/test_tenstorrent_backend.cpp`, the `VLLM_CPP_TENSTORRENT` CMake wiring, the backend-matrix/porting-inventory/spec, and this claim. | `ACTIVE` | 2026-08-09 W0 LANDED: 3/3 test cases, 8/8 assertions PASS on real hardware (registration, Platform/Backend mirror, kMatmul vs host F32 reference within bf16 tolerance, max_abs_diff 0.03375). Two bugs found+fixed in the same pass (nlohmann-json ABI collision between vllm.cpp's vendored copy and tt-metal's, isolated via a separate OBJECT library; a process-exit segfault from static MeshDevice teardown ordering, fixed by a deliberate leak) — both documented in the spec's Risks/decisions. Not reviewed. No model runs; one op only; host round-trip per call, no perf claim. |
 **CLOSED same-session claim — `CLAIM-TP-SPIKE-287` (task #287, 2026-08-08,
 records-only, helper `row/SPIKE-TENSOR-PARALLELISM` draft PR #143, base
 `b38f78a7`).** Not an active-claims row because every referenced row keeps its

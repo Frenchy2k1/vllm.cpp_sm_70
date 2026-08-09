@@ -1,193 +1,250 @@
 # Tenstorrent (Blackhole) backend — spike spec (DRAFT, external proposal)
 
-Status: **DRAFT.** Filed through the claim protocol (`CLAIM-BACKEND-TENSTORRENT-
-SPIKE`, draft PR mudler/vllm.cpp#197) but not through the full
-`scripts/agent-start.py`/role-interview boot sequence — role was claimed
-directly per the developer's explicit direction. Treat it as a starting point
-for whoever reviews/claims the row, not as a `READY` artifact. Still no `src/vt/`
-code. The § Open risk item that gated this spec's core design claim **is now
-hands-on resolved on real Blackhole hardware** — see § Resolved: hands-on spike
-result.
+Status: **DRAFT, W0 skeleton LANDED 2026-08-09.** Filed through the claim
+protocol (`CLAIM-BACKEND-TENSTORRENT-SPIKE`, draft PR mudler/vllm.cpp#197) but
+not through the full `scripts/agent-start.py`/role-interview boot sequence —
+role was claimed directly per the developer's explicit direction. Treat it as
+a starting point for whoever reviews this row, not as a maintainer-accepted
+artifact — no human review has happened yet. **`ACTIVE` MEANS A GATED
+SKELETON, NOT A SUPPORTED BACKEND** — same caveat Metal/Vulkan's own W0 status
+carries. See § Our baseline for exactly what that means here.
 
 Proposed row id: `BACKEND-TENSTORRENT`. Not covered by any existing row —
 `.agents/backends.md`'s per-platform table has no Tenstorrent entry.
 
-## Naming — read before writing any code
+## Scope
 
-**Do not spell the `DeviceType` enumerator `kBLACKHOLE`.** This codebase's CUDA
-layer is saturated with NVIDIA "Blackwell"-generation references (`sm_120`,
-`sm_121`, `GB10` = NVIDIA's Grace-*Blackwell* Superchip, the T0 gate hardware) —
-`kBLACKHOLE` next to those is a near-miss for both humans and grep. Use
-`DeviceType::kTENSTORRENT` (mirrors `kROCM` naming after the vendor/stack, not
-a specific chip); "Blackhole" (Tenstorrent's chip family: P100/P150 PCIe cards)
-stays in comments and doc prose only, e.g. `vt::tt` as the namespace.
+**In.** A new extension platform (`.agents/backends.md`'s "Extension
+platforms" class, same as Metal/Vulkan): `DeviceType::kTENSTORRENT` as a thin
+`vt::Backend` adapter over **ttnn** — Tenstorrent's own C++ tensor-op library
+— rather than hand-written Tensix kernels, mirroring the Metal/MLX decision
+(E1 in `backends.md`) over the hand-written-kernel alternative (E2). Landed
+in this pass: the `DeviceType` + `Platform` + `Backend` seams, and ONE op
+(`kMatmul`, F32, rank-2 only). Proposed follow-on (not yet built): a small
+dense (non-MoE) decoder, decode-only path first — matmul, rmsnorm, RoPE,
+embedding, `sdpa_decode` + paged KV cache, plus whatever `silu_and_mul` turns
+out to need. That's roughly 8-10 `RegisterOp` calls total, not `vt::ops.h`'s
+full ~130.
 
-## Why this is not "write Tensix kernels"
+**Out.** MoE, quantized kernels (the CUDA/Vulkan-side marlin/nvfp4
+equivalents), graph capture, and any model actually running — all
+explicitly deferred past this row's minimal scope.
 
-Every backend in this tree targets a SIMT-shaped device (threads/warps, an
-implicit memory hierarchy, a compiler taking portable kernel source). Tenstorrent
-Tensix cores are a dataflow multicore chip: a `tt_metal::Program` is an explicit
-set of reader/compute/writer kernels bound to specific cores, wired by circular
+**Naming — read before writing any code.** Do not spell the `DeviceType`
+enumerator `kBLACKHOLE`. This codebase's CUDA layer is saturated with NVIDIA
+"Blackwell"-generation references (`sm_120`, `sm_121`, `GB10` = NVIDIA's
+Grace-*Blackwell* Superchip, the T0 gate hardware) — `kBLACKHOLE` next to
+those is a near-miss for both humans and grep. Landed as
+`DeviceType::kTENSTORRENT` (mirrors `kROCM` naming after the vendor/stack,
+not a specific chip) and namespace `vt::tenstorrent` (not the `vt::tt`
+originally floated here — tt-metal's own top-level namespace is `tt::`, and
+`vt::tt::Backend` calling into `::tt::tt_metal::...` read as an avoidable
+collision once actually writing the code). "Blackhole" (the chip family:
+P100/P150 PCIe cards) stays in comments and doc prose only.
+
+**Why this is not "write Tensix kernels."** Every backend in this tree
+targets a SIMT-shaped device (threads/warps, an implicit memory hierarchy, a
+compiler taking portable kernel source). Tenstorrent Tensix cores are a
+dataflow multicore chip: a `tt_metal::Program` is an explicit set of
+reader/compute/writer kernels bound to specific cores, wired by circular
 buffers over a NOC, dispatched through a `CommandQueue`. Reimplementing that
 surface here would mean re-deriving a meaningful slice of `tt_metal`/`ttnn`
-itself.
+itself — hence the ttnn-adapter strategy instead.
 
-**Proposed strategy: mirror decision E1 (`.agents/backends.md`), not E2.** Apple
-chose MLX (a mature vendor tensor library) over hand-written Metal kernels for
-exactly this reason. The Tenstorrent equivalent is **ttnn** — Tenstorrent's own
-C++ tensor-op library, which already ships the ops a minimal decode-only backend
-needs (see § Evidence). `vt::tt` should be a thin adapter over ttnn calls, not a
-from-scratch kernel backend.
+## Upstream chain
 
-## The three seams (`.agents/backends.md`)
+**No upstream vLLM equivalent exists.** vLLM has no Tenstorrent platform
+anywhere in its tree or dependency chain (same as Metal/Vulkan — see
+`.agents/porting-inventory.md` §9 item 8 for those, item 15 for this one).
+The loyal-port anchor is therefore the `Platform` interface itself, not a
+Tenstorrent-specific upstream file: `vllm/platforms/interface.py:134-229`
+(`class Platform`), the same seam Metal/Vulkan/ROCm implement against. This
+backend adds a NEW leg of that already-faithfully-ported interface; it does
+not deviate from anything vLLM defines.
 
-**1. `DeviceType` (`vt/device.h`) + `Platform` (`vllm/platforms/interface.h`).**
-Mechanical, but note `src/vllm/platforms/platform.cpp`'s `kCurrentPriority`
-array is explicitly the ONE non-additive spot — a platform left out registers
-fine and is simply never selected, silently. `tests/vllm/platforms/
-test_platform.cpp` gates membership; do not skip updating both.
-
-**2. `Backend` (`vt/backend.h`).**
-
-| Method | Tenstorrent mapping |
-|---|---|
-| `Alloc`/`Free` | see § Open risk below — not a bare `tt_metal::Buffer` allocation |
-| `Copy` | `EnqueueWriteBuffer`/`EnqueueReadBuffer` (host<->device; same-device copy is a device-side op) |
-| `CreateQueue` | `tt_metal::CommandQueue` — the device already runs 2 CQs in existing perf paths |
-| `UnifiedMemory()` | **`false`.** Blackhole is a discrete PCIe card (DRAM over PCIe, no shared address space). |
-| `SupportsGraphCapture`/`BeginCapture`/`EndCaptureGraph`/`ReplayGraph` | `tt_metal` trace capture (`begin_trace_capture`/`end_trace_capture`/`replay_trace`) — an existing, exercised feature (`test_perf_trace_2cqs`-style paths already use it), the cleanest mapping in this whole spec |
-
-`UnifiedMemory() == false` is load-bearing, not incidental: `op_provider.h`'s
-portable CPU reference tier (§ "Portable reference tier") is gated on
-`ReferenceTierEligible`, which requires unified memory. **A Tenstorrent backend
-gets ZERO free correctness net for an unregistered op — it throws, it does not
-silently slow-path.** Minimal scope must cover every op the chosen model
-actually exercises; there is no partial-backend safety rail the way there would
-be on an integrated/unified device.
-
-Also flag for whoever picks this up: kernel JIT compile is expensive on first
-run. Measured this week on a real Blackhole box: ResNet-50 e2e perf compile
-time went from ~120–140s (cold) to ~3.7s (warm cache) between two runs of the
-same binary. Needs the same warmup discipline CUDA graph capture already gets
-in this codebase, but the cliff is bigger — treat first-token latency as a
-distinct, larger risk than on CUDA.
-
-**3. `vt::op_provider` registrations.** One `RegisterOp(OpId::kX,
-DeviceType::kTENSTORRENT, ...)` per op, each a thin adapter into the matching
-ttnn call (§ Evidence).
-
-## Evidence (read-only checks against a local tt-metal checkout, this week)
-
-- `find_package(TT-NN)` / `find_package(TT-Metalium)` are real, external-
-  consumable CMake package configs — confirmed present at
-  `build_Release/lib64/cmake/tt-nn/TT-NN.cmake` and `.../tt-metalium/
-  Metalium.cmake`, exporting `TTNN::TTNN` as an `IMPORTED SHARED` target with
-  `find_dependency(TT-Metalium)` / `find_dependency(xtensor)` wired in. A new
-  CMake target can `find_package(TT-NN REQUIRED)` +
-  `target_link_libraries(... TTNN::TTNN)` without vendoring tt-metal's build.
+Dependency chain anchors (not vLLM, but load-bearing for this row):
 - `ttnn::operations::matmul::matmul(const Tensor&, const Tensor&, ...)`
-  (`ttnn/cpp/ttnn/operations/matmul/matmul.hpp`) is a plain function, all
-  parameters past the two input tensors defaulted — the minimal call is a
-  one-liner.
-- ttnn C++ op coverage relevant to a minimal decode-only model, confirmed
-  present (not assumed) in `ttnn/cpp/ttnn/operations/`:
-  - `matmul/` — matmul
-  - `normalization/rmsnorm/`, `normalization/softmax/` — norm, softmax
-  - `experimental/transformer/rotary_embedding_llama` (+ `_hf`, `_fused_qk`
-    variants) — RoPE
-  - `embedding/` — token embedding
-  - `transformer/sdpa/`, `transformer/sdpa_decode/` — prefill/decode attention
-  - **`experimental/paged_cache/`** — paged KV cache. This is the one that
-    de-risks the whole plan: vLLM's block-table attention has a direct,
-    already-implemented home, not a from-scratch design problem.
-  - `reduction/moe`, `data_movement/moe_expert_token_remap`,
-    `data_movement/moe_routing_remap` — MoE routing (post-minimal scope, listed
-    for later rows)
-  - No standalone `silu_and_mul`-shaped fusion found at a glance; likely
-    composable from existing elementwise ops, or a small custom-fused op
-    later. Needs the hands-on pass to confirm, not assumed here.
+  (tt-metal `ttnn/cpp/ttnn/operations/matmul/matmul.hpp`) — the one op
+  landed.
+- `TT-NN`/`TT-Metalium` CMake package configs (tt-metal
+  `build_Release/lib64/cmake/{tt-nn,tt-metalium}/`), confirmed real and
+  externally consumable — a standalone `find_package(TT-NN REQUIRED)` +
+  `target_link_libraries(... TTNN::TTNN)` links clean with no vendoring of
+  tt-metal's own build.
 
-## Open risk (the actual unknown — was gating ACTIVE, now resolved)
+## Our baseline
 
-`vt::Tensor` (`include/vt/tensor.h`) is a **non-owning raw-pointer view**:
-`void* data`, `dtype`, `shape[4]`, `stride[4]`, nothing more — the same
-convention CUDA/Vulkan/Metal kernels here already use.
+**Landed 2026-08-09, real Blackhole hardware:**
 
-`ttnn::Tensor` (`ttnn/api/ttnn/tensor/tensor.hpp`) is a richer, ref-counted
-object. Its device-side constructors are `Tensor(DeviceStorage storage)` where
-`DeviceStorage` wraps a `tt::tt_metal::MeshTensor`/`MeshBuffer` — i.e. ttnn
-owns/allocates through its own mesh-buffer machinery, not a bare pointer.
+- `DeviceType::kTENSTORRENT` (`include/vt/device.h`) + `kCurrentPriority`
+  membership (`src/vllm/platforms/platform.cpp`, after `kMETAL` — newest and
+  least proven among the accelerators, ahead of `kCPU`).
+- `vt::tenstorrent::Backend` (`src/vt/tenstorrent/tenstorrent_backend.cpp`):
+  `Alloc`/`Free`/`Copy`/`Memset` are HOST memory, identical to the CPU
+  backend's `aligned_alloc` — Blackhole is genuinely discrete, unlike
+  Vulkan's W0 here (unified on its GB10 target, so it can return a directly
+  host-dereferenceable mapped pointer; that trick does not apply here).
+  `UnifiedMemory()` is `false` regardless — the real hardware property,
+  independent of this W0's host-staging implementation detail.
+- `vt::tenstorrent::TenstorrentPlatform`
+  (`src/vllm/platforms/tenstorrent.cpp`), mirroring `vulkan.cpp`'s registrar
+  idiom.
+- ONE op provider, `kMatmul`, F32, rank-2 only
+  (`src/vt/tenstorrent/tenstorrent_ops.cpp`): `Tensor::from_vector` uploads
+  both operands, `ttnn::operations::matmul::matmul` runs on-device,
+  `to_vector` reads the result back.
+- `tests/vt/test_tenstorrent_backend.cpp`: **3/3 test cases, 8/8 assertions,
+  PASS on real Blackhole hardware** — registration, `Platform` mirrors
+  `Backend`, and `kMatmul` matches a host F32 reference
+  (`max_abs_diff=0.03375` vs `max_ref_mag=4.14`, ~0.8% relative — the
+  rounding bf16 accumulation over K=32 predicts, not a correctness gap).
 
-This looked, from reading headers alone, like it might mean
-`vt::Backend::Alloc()` returning a bare `void*` doesn't compose with ttnn's
-ownership model. **It doesn't matter in practice — see § Resolved below.**
-`Tensor::from_vector<T>(host_vec, spec, device)` uploads directly (no manual
-`DeviceStorage`/`MeshBuffer` wiring needed at the call site), and
-`to_vector<T>()` reads back. An adapter never needs to attach to a raw device
-pointer at all.
+**Honest gaps.** One op, one dtype, one rank. No model runs. Every call pays
+a host round-trip (§ Risks/decisions). `UnifiedMemory()==false` means
+`op_provider.h`'s portable CPU reference tier stays gated off for this
+device — an unregistered op throws, it does not silently slow-path, so
+nothing here is "probably fine" by default the way it might be on a unified
+backend.
 
-## Resolved: hands-on spike result (2026-08-09, real Blackhole hardware)
+Also worth flagging for whoever widens this: kernel JIT compile is expensive
+on first run. Measured on this same box this week: ResNet-50 e2e perf
+compile time went from ~120-140s (cold) to ~3.7s (warm cache) between two
+runs of the same binary. Needs the same warmup discipline CUDA graph capture
+already gets in this codebase, but the cliff is bigger — first-token latency
+is a distinct, larger risk here than on CUDA.
 
-Built a standalone program (outside this repo's build — `find_package(TT-NN)`
-+ `find_package(TT-Metalium)` against a local tt-metal install, `TTNN::TTNN`
-linked cleanly on the first try) that:
+## Port map
 
-1. Opens the real device: `ttnn::open_mesh_device(0, DEFAULT_L1_SMALL_SIZE,
-   DEFAULT_TRACE_REGION_SIZE)`.
-2. Builds two 32×32 `std::vector<float>` host matrices with known values.
-3. Uploads each via `Tensor::from_vector<float>(host_vec, spec, device.get())`
-   — `spec` built from `tt::tt_metal::TensorSpec(Shape({32,32}),
-   TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE),
-   MemoryConfig{}))`. No manual `DeviceStorage`/`MeshBuffer` construction.
-4. Runs `ttnn::operations::matmul::matmul(a, b)` on-device.
-5. Reads the result back via `c.to_vector<float>()`.
-6. Compares against a host-computed FP32 reference matmul.
+| `vt::Backend` method | Tenstorrent mapping |
+|---|---|
+| `Alloc`/`Free`/`Copy`/`Memset` | Host memory (`aligned_alloc`/`memcpy`), same as the CPU backend — see § Our baseline for why |
+| `CreateQueue` | `Queue{Device{kTENSTORRENT,0}, nullptr}` — no native queue handle needed while every op stages through `from_vector`/`to_vector` |
+| `UnifiedMemory()` | `false` — the real hardware property |
+| `SupportsGraphCapture`/`BeginCapture`/`EndCaptureGraph`/`ReplayGraph` | Not implemented in W0. `tt_metal` trace capture (`begin_trace_capture`/`end_trace_capture`/`replay_trace`) is the eventual mapping — an existing, exercised tt-metal feature (`test_perf_trace_2cqs`-style paths already use it), the cleanest-looking piece of future work in this whole spec |
 
-**Result: `max_abs_diff=0.033750` against `max_ref_mag=4.140000` (~0.8%
-relative) — PASS.** That's exactly the rounding expected from bf16
-accumulation over K=32, not a correctness gap.
+| `vt::op_provider` entry | ttnn call |
+|---|---|
+| `kMatmul` (landed) | `ttnn::operations::matmul::matmul(a, b)`, operands built via `Tensor::from_vector`, result read via `to_vector` |
+| `kRmsNorm` (proposed) | `normalization/rmsnorm/` |
+| RoPE (proposed) | `experimental/transformer/rotary_embedding_llama` (+ `_hf`, `_fused_qk` variants) |
+| `kEmbedding` (proposed) | `embedding/` |
+| Attention (proposed) | `transformer/sdpa/`, `transformer/sdpa_decode/` |
+| Paged KV cache (proposed) | `experimental/paged_cache/` — the one that de-risks the whole follow-on plan: vLLM's block-table attention has a direct, already-implemented home in ttnn, not a from-scratch design problem |
+| MoE routing (out of scope, later row) | `reduction/moe`, `data_movement/moe_expert_token_remap`, `data_movement/moe_routing_remap` |
+| `kSiluAndMul` (unconfirmed) | No standalone fusion found at a glance in `ttnn/cpp/ttnn/operations/`; likely composable from existing elementwise ops, or a small custom-fused op later. Needs a hands-on pass to confirm, not assumed here |
 
-This confirms resolution (1) from the original two options below without
-needing either of them literally: the adapter doesn't need to manufacture a
-raw device pointer for `vt::Tensor.data` to point at. The natural design is
-`vt::Tensor.data` as an opaque handle to a heap-boxed `ttnn::Tensor` (or a
-thin wrapper owning one); `Alloc` creates it via `ttnn::empty(shape, dtype,
-layout, device)` (confirmed present in `operations/creation/creation.hpp`)
-or defers to first `Copy`; `Copy`/op adapters use `from_vector`/`to_vector`
-for host transfers and pass the `ttnn::Tensor` directly, unwrapped, for
-device-resident ops — no host round-trip on the hot path, no manual
-`DeviceStorage` construction anywhere.
+## Tests to port
 
-The two options originally listed here (kept for the record):
+No upstream vLLM tests exist for this row — there is no upstream Tenstorrent
+platform to port tests FROM (same as Metal/Vulkan). `tests/vt/
+test_tenstorrent_backend.cpp` is newly authored, mirroring `test_vulkan_backend
+.cpp`'s own rationale: every assertion goes through the public `vt::`/
+`vllm::platforms::` seam, with no ttnn/tt-metal headers in the test file
+itself — if the skeleton needed those headers in a test to be checkable, the
+seam would be leaking. Every case SKIPS (not fails) when no Blackhole card is
+present, so a Tenstorrent-enabled CI build with no card stays green.
 
-1. **Opaque handle, no host round-trip.** Confirmed reachable — see above.
-2. **Host round-trip (correctness-only fallback).** Not needed; superseded by
-   (1) actually working.
+## Gates
 
-## Minimal scope proposal
+**Passing today:** `tests/vt/test_tenstorrent_backend.cpp` (3/3 cases, 8/8
+assertions) on real Blackhole hardware — the correctness bar `kMatmul` alone
+needs to clear.
 
-One small dense (non-MoE) decoder, **decode-only path first** (prefill can
-follow once decode is proven): matmul, rmsnorm, RoPE, embedding, `sdpa_decode`
-+ paged KV cache, plus whatever silu_and_mul turns out to need. That's roughly
-8-10 `RegisterOp` calls, not vt::ops.h's full ~130. MoE, quantized kernels
-(the CUDA/Vulkan-side marlin/nvfp4-equivalents), and graph capture are
-explicitly out of this row's minimal scope and follow once decode-only is
-correctness-verified end to end.
+**Not yet gated, and explicitly not claimed:**
+- No e2e model run (no model has enough registered ops yet).
+- No performance claim of any kind — the host-round-trip-per-call design
+  (§ Risks/decisions) was never intended to be fast; `docs/BENCHMARKS.md`'s
+  row for this backend says so explicitly ("NOT APPLICABLE: no number
+  measured, claimed or owed").
+- No cross-device oracle comparison (`test_backend_cross_device.cpp` was not
+  extended to include `kTENSTORRENT` in this pass).
+- No maintainer review.
 
-## Next concrete step
+## Dependencies
 
-The design-level unknown is resolved (§ Resolved above). What's left before
-`src/vt/` code:
+- `BACKEND-PLATFORM` (the `Platform` seam) — already `REALIZED`
+  (`.agents/porting-inventory.md` §9 item 8's note), composed via, not
+  reimplemented by, this row.
+- Toolchain: a local tt-metal build with `TT-NN`/`TT-Metalium` installed and
+  discoverable via `CMAKE_PREFIX_PATH` (both `lib64/cmake` and `share/cmake`
+  — the latter carries `nlohmann_json`/`xtensor`, which `TT-NN`'s package
+  config `find_dependency`s). `VLLM_CPP_TENSTORRENT=ON` fails loudly, not
+  silently, if these aren't found (`CMakeLists.txt`).
+- Hardware: a real Blackhole card for anything beyond the registrars
+  compiling — `DeviceAvailable()` gates both the `Backend` and `Platform`
+  registrars off cleanly (silent, not a throw) when none is present, mirroring
+  Vulkan's `VulkanDeviceAvailable()` idiom.
+- No model, dataset, or additional license dependency beyond ttnn/tt-metal's
+  own (Apache-2.0).
 
-1. Maintainer review of this row and the adapter design.
-2. First real `src/vt/` code: `DeviceType::kTENSTORRENT` + name (device.h),
-   `vt::tt::Backend` (Alloc/Free/Copy/CreateQueue/UnifiedMemory=false,
-   modeled on the opaque-`ttnn::Tensor`-handle design above), a `Platform`
-   registrar, and ONE op provider (`kMatmul`) as the first vertical slice —
-   mirroring how Metal's W0 skeleton landed one op before the rest.
-3. Only then the remaining ~7-9 ops in the minimal scope below.
+## Work breakdown
 
-The standalone spike program that produced the § Resolved result is not part
-of this repo (built against a local tt-metal checkout, not vllm.cpp's CMake)
-and is not attached to this PR; its exact API calls are transcribed above in
-full, which is what stays useful here.
+Small, non-overlapping steps, each sized like `kMatmul` was:
+
+1. `kRmsNorm` — next, since normalization is the next thing a decode step
+   needs after a projection.
+2. RoPE (`rotary_embedding_llama` family).
+3. `kEmbedding`.
+4. `sdpa_decode` + paged KV cache — the two together, since decode-time
+   attention needs both.
+5. Whatever `silu_and_mul` turns out to need (composable or a small custom
+   op — § Port map).
+6. Only once 1-5 land: revisit the host-round-trip design (§
+   Risks/decisions) for a device-resident-tensor performance pass.
+
+Each step is independently claimable and gateable — none blocks another
+except that 4 wants 1-3 landed first for a meaningful decode-step test.
+
+## Risks/decisions
+
+Two real problems surfaced landing the W0 skeleton, both fixed and
+documented in place rather than papered over — these are the load-bearing
+facts for anyone extending this row, not just implementation trivia:
+
+1. **A build-system integration hazard, not a Tenstorrent or vllm.cpp bug.**
+   `tenstorrent_ops.cpp` includes `ttnn/operations/matmul/matmul.hpp`, which
+   transitively pulls in tt-metal's `tt_stl/reflection.hpp`. That header
+   properly includes the full `<nlohmann/json.hpp>` (verified — nothing
+   missing on tt-metal's side). The break is that `vllm.cpp` ALSO vendors its
+   own private copy of nlohmann-json (`third_party/nlohmann/json.hpp`, a
+   different version) on the same include path for the whole `vllm` target.
+   nlohmann-json tags each version's types in an ABI-versioned `inline
+   namespace` specifically so mixing two versions in one translation unit is
+   a loud compile error (ambiguous `basic_json`) rather than a silent ODR
+   violation — which is exactly what happened the first time this file
+   compiled. Fixed by isolating `tenstorrent_ops.cpp` as its own `OBJECT`
+   library with its own include set (TT-NN's dirs, no `third_party`) — the
+   same isolation pattern this codebase already uses for
+   `vllm_rocm_platform_syntax_check`, not a new idiom. The real fix, if ever
+   wanted, is on vllm.cpp's side (`find_package(nlohmann_json)` instead of a
+   private vendored copy) — a cross-cutting build decision out of scope for
+   this row, noted for the maintainer.
+2. **A process-exit segfault, actually ours.** The first working version held
+   the mesh device in a plain `static std::shared_ptr<MeshDevice>`. All test
+   assertions passed, but the process then segfaulted during static
+   destruction, inside `MeshDevice`'s own teardown chain
+   (`GraphTracker::track_deallocate_cb`) — a cross-`libtt_metal.so`-boundary
+   static destruction ordering hazard a standalone spike program (see below)
+   never hit, because it held the device in a `main()`-local variable
+   destroyed deterministically mid-program, not during static teardown.
+   Fixed by deliberately leaking the device (heap-allocate, never `delete`)
+   so its destructor never runs at process exit at all — documented in
+   `tenstorrent_device.cpp`/`.h`, not a silent workaround.
+3. **Product decision: host round-trip per call, not device-resident
+   tensors.** `vt::Tensor` is a bare device-pointer view; before landing any
+   code, it looked like this might force `vt::Backend::Alloc()`'s bare
+   `void*` to somehow manufacture a raw device pointer `ttnn::Tensor` could
+   attach to without copying. A standalone spike program (outside this
+   repo's build — `find_package(TT-NN)`/`find_package(TT-Metalium)` against
+   a local tt-metal install) proved that's not actually necessary:
+   `Tensor::from_vector<T>(host_vec, spec, device)` uploads directly, no
+   manual `DeviceStorage`/`MeshBuffer` wiring needed, and `to_vector<T>()`
+   reads back — `max_abs_diff=0.033750` vs `max_ref_mag=4.140000` (~0.8%,
+   the bf16-over-K=32 rounding expected) confirmed this on real hardware
+   before any `vt::` code existed. The landed `kMatmul` provider uses exactly
+   that sequence, which means every call pays a host round-trip rather than
+   keeping tensors device-resident between ops — correct (proven by the
+   spike and by the 3/3 test pass) but not fast, a deliberate W0 scope
+   decision, not an oversight (`tenstorrent_backend.cpp`'s SCOPE note).
+   Avoiding the round trip is real future work (§ Work breakdown step 6), not
+   attempted here.
