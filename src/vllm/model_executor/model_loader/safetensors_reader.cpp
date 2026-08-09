@@ -7,10 +7,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -47,18 +49,35 @@ SafetensorsFile SafetensorsFile::Open(const std::string& path) {
   SafetensorsFile f;  // fully constructed: dtor cleans up on any throw below
   f.path_ = path;
 
-  f.fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (f.fd_ < 0) Fail(path, "cannot open file");
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) Fail(path, "cannot open file");
   struct stat st{};
-  if (::fstat(f.fd_, &st) != 0) Fail(path, "fstat failed");
-  if (st.st_size <= 0) Fail(path, "empty file");
-  const size_t file_size = static_cast<size_t>(st.st_size);
-  if (file_size < 8) Fail(path, "file shorter than the 8-byte header prefix");
+  size_t file_size = 0;
+  {
+    struct FdGuard {
+      int fd;
+      ~FdGuard() { if (fd >= 0) ::close(fd); }
+    } guard{fd};
+    if (::fstat(fd, &st) != 0) Fail(path, "fstat failed");
+    if (st.st_size <= 0) Fail(path, "empty file");
+    file_size = static_cast<size_t>(st.st_size);
+    if (file_size < 8) Fail(path, "file shorter than the 8-byte header prefix");
+    guard.fd = -1;  // ownership passes to the Mapping below (or the mmap fail path)
+  }
 
-  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, f.fd_, 0);
-  if (map == MAP_FAILED) Fail(path, "mmap failed");
-  f.map_ = map;
-  f.map_size_ = file_size;
+  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED) {
+    ::close(fd);
+    Fail(path, "mmap failed");
+  }
+  // From here the mmap and the fd are owned by the refcounted Mapping, whose
+  // destructor munmaps and closes. A borrowed weight (StTensor::mapping) shares
+  // it, so the mapping outlives this object exactly as long as someone reads it.
+  f.map_ = std::make_shared<Mapping>();
+  f.map_->addr = map;
+  f.map_->size = file_size;
+  f.map_->fd = fd;
+  const std::shared_ptr<const void> keep_alive = f.map_;
   const uint8_t* bytes = static_cast<const uint8_t*>(map);
 
   // u64 little-endian header length, assembled byte-wise for portability.
@@ -145,6 +164,7 @@ SafetensorsFile SafetensorsFile::Open(const std::string& path) {
 
       t.nbytes = static_cast<size_t>(end - begin);
       t.data = data_base + begin;
+      t.mapping = keep_alive;
 
       // numel * dtype_size, division-checked before each multiply so a huge
       // declared shape throws instead of wrapping (untrusted metadata).
@@ -201,48 +221,43 @@ const StTensor& SafetensorsFile::Get(const std::string& name) const {
   return it->second;
 }
 
+SafetensorsFile::Mapping::~Mapping() {
+  if (addr != nullptr) ::munmap(addr, size);
+  if (fd >= 0) ::close(fd);
+}
+
+// Drop THIS object's reference to the mapping. Any weight that borrowed a span
+// of it (StTensor::mapping) holds its own reference and keeps it mapped; when
+// nobody does, this is the last one and ~Mapping munmaps immediately — the
+// pre-existing behavior, byte for byte.
 void SafetensorsFile::Release() noexcept {
-  if (map_ != nullptr) {
-    ::munmap(map_, map_size_);
-    map_ = nullptr;
-    map_size_ = 0;
-  }
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
-  }
+  map_.reset();
+  names_.clear();
+  tensors_.clear();
 }
 
 SafetensorsFile::~SafetensorsFile() { Release(); }
 
 SafetensorsFile::SafetensorsFile(SafetensorsFile&& other) noexcept
     : path_(std::move(other.path_)),
-      fd_(other.fd_),
-      map_(other.map_),
-      map_size_(other.map_size_),
+      map_(std::move(other.map_)),
       names_(std::move(other.names_)),
       tensors_(std::move(other.tensors_)),
       metadata_(std::move(other.metadata_)) {
   // Leave the moved-from object inert so its dtor is a no-op (no double
-  // munmap/close).
-  other.fd_ = -1;
-  other.map_ = nullptr;
-  other.map_size_ = 0;
+  // munmap/close). Moving the shared_ptr already did that.
+  other.map_.reset();
 }
 
 SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
   if (this != &other) {
     Release();
     path_ = std::move(other.path_);
-    fd_ = other.fd_;
-    map_ = other.map_;
-    map_size_ = other.map_size_;
+    map_ = std::move(other.map_);
     names_ = std::move(other.names_);
     tensors_ = std::move(other.tensors_);
     metadata_ = std::move(other.metadata_);
-    other.fd_ = -1;
-    other.map_ = nullptr;
-    other.map_size_ = 0;
+    other.map_.reset();
   }
   return *this;
 }
@@ -335,7 +350,56 @@ void ReleaseSourcePages(const void* data, size_t nbytes) {
 }
 
 void MaybeReleaseSourcePages(const void* data, size_t nbytes) {
+  // Issue #150 accounting: every copy helper calls this exactly once, right
+  // after it has consumed a source range into an OWNED host buffer, so this is
+  // the one place that sees every host materialization. The direct-upload path
+  // borrows instead of copying and deliberately does NOT call it.
+  load_stats::AddHostCopy(nbytes);
   if (LoadWindowedReleaseEnabled()) ReleaseSourcePages(data, nbytes);
 }
+
+namespace load_stats {
+namespace {
+
+std::atomic<uint64_t>& HostCopyBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& BorrowedBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& DeviceUploadBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+
+}  // namespace
+
+void AddHostCopy(uint64_t bytes) {
+  HostCopyBytes().fetch_add(bytes, std::memory_order_relaxed);
+}
+void AddBorrowed(uint64_t bytes) {
+  BorrowedBytes().fetch_add(bytes, std::memory_order_relaxed);
+}
+void AddDeviceUpload(uint64_t bytes) {
+  DeviceUploadBytes().fetch_add(bytes, std::memory_order_relaxed);
+}
+
+Counters Snapshot() {
+  Counters c;
+  c.host_copy_bytes = HostCopyBytes().load(std::memory_order_relaxed);
+  c.borrowed_bytes = BorrowedBytes().load(std::memory_order_relaxed);
+  c.device_upload_bytes = DeviceUploadBytes().load(std::memory_order_relaxed);
+  return c;
+}
+
+void Reset() {
+  HostCopyBytes().store(0, std::memory_order_relaxed);
+  BorrowedBytes().store(0, std::memory_order_relaxed);
+  DeviceUploadBytes().store(0, std::memory_order_relaxed);
+}
+
+}  // namespace load_stats
 
 }  // namespace vllm

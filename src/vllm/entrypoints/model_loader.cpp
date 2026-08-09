@@ -6,6 +6,8 @@
 #include "vllm/model_executor/models/qwen3_dflash_gguf.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -100,6 +102,55 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
 }
 
 namespace {
+
+// --- Issue #150 load-time instrumentation -----------------------------------
+// "Measure it properly, then cut it": `VT_LOAD_STATS=1` prints the wall time of
+// each load phase and the bytes the load actually MOVED, so the cost of the
+// weight path is a measured number instead of an inferred one. Off by default
+// and read once; when off this costs two clock reads per load.
+bool LoadStatsEnabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_LOAD_STATS");
+    return e != nullptr && e[0] != '0';
+  }();
+  return enabled;
+}
+
+double SecondsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+void ReportLoadPhase(const char* phase, double seconds) {
+  if (!LoadStatsEnabled()) return;
+  std::fprintf(stderr, "[vt load] %-14s %8.3f s\n", phase, seconds);
+}
+
+void PrintLoadBytes(const char* when) {
+  const vllm::load_stats::Counters c = vllm::load_stats::Snapshot();
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+  std::fprintf(stderr,
+               "[vt load] bytes@%-9s host_copy=%.3f GiB borrowed=%.3f GiB "
+               "device_upload=%.3f GiB\n",
+               when, static_cast<double>(c.host_copy_bytes) / gib,
+               static_cast<double>(c.borrowed_bytes) / gib,
+               static_cast<double>(c.device_upload_bytes) / gib);
+}
+
+void ReportLoadBytes() {
+  if (!LoadStatsEnabled()) return;
+  PrintLoadBytes("load-end");
+  // The device uploads are LAZY -- ResidentWeight runs at first forward use,
+  // after this function returns -- so the load-end snapshot always reads
+  // device_upload=0. Print the final totals at exit as well, which is where the
+  // "bytes moved by this process" question is actually answered. Registered
+  // once; std::atexit handlers cannot take an argument, hence the wrapper.
+  static const bool once = [] {
+    std::atexit([] { PrintLoadBytes("exit"); });
+    return true;
+  }();
+  (void)once;
+}
 
 bool DirectDeviceLoadRequested() {
   const char* release = std::getenv("VT_RELEASE_HOST_WEIGHTS");
@@ -1236,8 +1287,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // deferred-expert closure holds the last reference and releases the shards once
   // the device Marlin resident is built; loaders that don't retain it drop the
   // shards when this local `shards` and the model's ModelSource go out of scope.
+  const auto t_open = std::chrono::steady_clock::now();
   auto shards = std::make_shared<const std::vector<vllm::SafetensorsFile>>(
       LoadShards(model_dir));
+  ReportLoadPhase("mmap+header", SecondsSince(t_open));
 
   // SPEC-MTP I5d-pre: when a speculative (MTP) config is set, load the `mtp.*`
   // draft weights from the SAME shards and retain them on the loaded target
@@ -1297,8 +1350,11 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       (registration.factory->is_dense_model && DirectDeviceLoadRequested()) ||
       registration.factory->stage_on_load;
   if (!queue_load) {
+    const auto t_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards));
+    ReportLoadPhase("weights", SecondsSince(t_weights));
+    ReportLoadBytes();
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
@@ -1312,8 +1368,11 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   vt::Queue load_queue =
       SelectQueueForModel(registration.architecture, params.device);
   try {
+    const auto t_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
+    ReportLoadPhase("weights", SecondsSince(t_weights));
+    ReportLoadBytes();
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(

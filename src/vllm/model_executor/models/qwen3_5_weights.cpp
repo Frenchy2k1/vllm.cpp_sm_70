@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +43,8 @@ void OwnedTensor::ReleaseHost() const {
   // wrong on both counts, so releasing one means only dropping the keep-alive.
   if (self.bytes.borrowed()) {
     self.bytes.Reset();
+    self.mmap_src = nullptr;  // nothing borrows the mapping through this tensor now
+    self.mmap_src_bytes = 0;
     self.host_released = true;
     return;
   }
@@ -74,13 +77,61 @@ void OwnedTensor::ReleaseHost() const {
   self.host_released = true;
 }
 
+// ENG-LOAD-DIRECT-UPLOAD (issue #150). A weight whose bytes BORROW the
+// safetensors mmap has just been uploaded to the device, so its source range is
+// consumed-and-dead exactly as a copied one is: drop its resident (clean,
+// file-backed) pages, mirroring the loaders' windowed release. Correctness-safe
+// on any backend -- the mapping is PROT_READ MAP_PRIVATE, so a later read of the
+// still-valid borrowed view simply re-faults it from the file.
+namespace {
+
+void ReleaseDirectUploadSource(const OwnedTensor& w) {
+  if (w.mmap_src == nullptr) return;
+  // Deliberately NOT MaybeReleaseSourcePages: that call site is the host-copy
+  // BYTE COUNTER (every copy helper reaches it after materializing a range),
+  // and these bytes were never materialized on the host -- they went straight to
+  // the device. Counting them there would report the very copy this row removes.
+  if (LoadWindowedReleaseEnabled())
+    ReleaseSourcePages(w.mmap_src, w.mmap_src_bytes);
+}
+
+}  // namespace
+
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
+  if (w.d_dev == nullptr) return;
+  // ENG-LOAD-DIRECT-UPLOAD: a direct-upload borrow is the ONE borrow that may be
+  // adopted. Its bytes are the file mapping, not an anonymous copy and not a
+  // tied pair's shared expansion, so re-pointing it at the (host-addressable)
+  // device allocation loses nothing and stops the page cache from holding a
+  // second copy of the model for the rest of the process. Where the device
+  // allocation is NOT host-addressable the borrow stays as it is (a valid,
+  // re-faultable view) and only the resident pages are dropped.
+  if (w.mmap_src != nullptr && w.bytes.borrowed()) {
+    if (!backend.DeviceMemoryIsHostAddressable()) {
+      ReleaseDirectUploadSource(w);
+      return;
+    }
+    if (const char* v = std::getenv("VT_ADOPT_DEVICE_BYTES");
+        v != nullptr && v[0] == '0') {
+      return;
+    }
+    auto& self = *const_cast<OwnedTensor*>(&w);
+    const size_t nb = self.bytes.size();
+    std::shared_ptr<const void> keep(w.d_dev,
+                                     static_cast<const void*>(w.d_dev.get()));
+    self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(w.d_dev.get()),
+                                    nb, std::move(keep));
+    ReleaseDirectUploadSource(w);
+    self.mmap_src = nullptr;
+    self.mmap_src_bytes = 0;
+    return;
+  }
   if (!backend.DeviceMemoryIsHostAddressable()) return;
   // A BORROWED buffer owns no anonymous pages (a GGUF mmap is clean and
   // file-backed; a shared expansion is a tied pair's single copy), so adopting
   // would reclaim nothing and would break the tie. Same reasoning as
   // ReleaseHost's borrowed branch.
-  if (w.d_dev == nullptr || w.bytes.empty() || w.bytes.borrowed()) return;
+  if (w.bytes.empty() || w.bytes.borrowed()) return;
   if (const char* v = std::getenv("VT_ADOPT_DEVICE_BYTES"); v != nullptr && v[0] == '0') {
     return;
   }
@@ -113,6 +164,64 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
   std::shared_ptr<const void> keep(w.d_dev, static_cast<const void*>(w.d_dev.get()));
   self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(w.d_dev.get()), nb,
                                   std::move(keep));
+}
+
+namespace {
+
+// nullopt => env-driven; set => forced (test seam).
+std::optional<bool>& DirectUploadOverride() {
+  static std::optional<bool> value;
+  return value;
+}
+
+}  // namespace
+
+void detail::SetLoadDirectUploadOverrideForTesting(std::optional<bool> value) {
+  DirectUploadOverride() = value;
+}
+
+bool LoadDirectUploadEnabled() {
+  const std::optional<bool> forced = DirectUploadOverride();
+  if (forced.has_value()) return *forced;
+  // Process-cached: read the env once. DEFAULT ON; "=0" rolls back to the
+  // copy-then-upload behavior (same-binary A/B, house convention).
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_LOAD_DIRECT_UPLOAD");
+    return e == nullptr || e[0] != '0';
+  }();
+  return enabled;
+}
+
+bool BorrowStTensorBytes(OwnedTensor& o, const StTensor& t, vt::DType dtype,
+                         const std::vector<int64_t>& shape) {
+  if (!LoadDirectUploadEnabled()) return false;
+  // FAIL CLOSED on anything that is not a whole-range verbatim view of a live
+  // mapping: no keep-alive (a synthetic StTensor), no data, or a destination
+  // whose element count times dtype width is not EXACTLY the source span. The
+  // caller then runs its ordinary copy, so a mismatch can only cost the lever,
+  // never correctness.
+  if (t.mapping == nullptr || t.data == nullptr || t.nbytes == 0) return false;
+  const auto rank = static_cast<int>(shape.size());
+  if (rank <= 0 || rank > vt::kMaxRank) return false;
+  size_t numel = 1;
+  for (const int64_t dim : shape) {
+    if (dim <= 0) return false;
+    const auto d = static_cast<size_t>(dim);
+    if (numel > SIZE_MAX / d) return false;
+    numel *= d;
+  }
+  const size_t elem = vt::SizeOf(dtype);
+  if (elem == 0 || numel > SIZE_MAX / elem) return false;
+  if (numel * elem != t.nbytes) return false;
+
+  o.dtype = dtype;
+  o.rank = rank;
+  for (int i = 0; i < rank; ++i) o.shape[i] = shape[static_cast<size_t>(i)];
+  o.bytes = OwnedBytes::Borrow(t.data, t.nbytes, t.mapping);
+  o.mmap_src = t.data;
+  o.mmap_src_bytes = t.nbytes;
+  load_stats::AddBorrowed(t.nbytes);
+  return true;
 }
 
 vt::Tensor OwnedTensor::View() const {
@@ -177,6 +286,9 @@ OwnedTensor LoadBf16Direct(const TensorResolver& get, const std::string& name,
   VT_CHECK(t.dtype == "BF16", "qwen3_5 weights: expected BF16 for " + name);
   std::vector<int64_t> shape =
       shape_override.empty() ? t.shape : shape_override;
+  OwnedTensor borrowed;
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): whole-range verbatim copy; qualifies.
+  if (BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, shape)) return borrowed;
   OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
   VT_CHECK(t.nbytes == o.bytes.size(),
            "qwen3_5 weights: byte-size mismatch for " + name);
