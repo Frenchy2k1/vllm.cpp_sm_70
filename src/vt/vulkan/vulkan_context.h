@@ -212,6 +212,46 @@ class VulkanContext {
   bool coopmat_bf16_f32() const { return coopmat_bf16_f32_; }
   uint32_t subgroup_size() const { return subgroup_size_; }
 
+  // --- WIDE REDUCTION SHADERS (VK-RMSNORM). Every shader in this backend is
+  // compiled for the Vulkan-GUARANTEED 128 invocations, which is the right floor
+  // for a flat kernel but leaves a per-ROW reducing kernel on four warps of one
+  // SM at batch 1. `vt_rms_norm_wide` is a second module at 1024 invocations with
+  // a subgroup reduction; this predicate is what decides whether it may be used.
+  //
+  // All four conditions, because any one missing makes the module unusable:
+  // enough invocations per workgroup, enough of them on the X axis, and the
+  // subgroup BASIC (gl_NumSubgroups / gl_SubgroupID / subgroupElect) and
+  // ARITHMETIC (subgroupAdd) feature bits present IN THE COMPUTE STAGE. A module
+  // whose capabilities the device lacks is UNDEFINED BEHAVIOUR at pipeline
+  // creation rather than a VkResult, so this is probed rather than hoped for.
+  bool wide_reduce() const { return wide_reduce_; }
+
+  // A/B LEVER over that decision, and the ONLY way the fallback is reachable on a
+  // device that has the capability. -1 forces the portable 128-wide module, +1
+  // forces the wide one, 0 (the default, and what VT_VULKAN_RMSNORM=base|wide
+  // overrides) lets wide_reduce() decide.
+  //
+  // Two jobs, both load-bearing. (1) A cross-BUILD comparison of two shader
+  // widths is exactly the shape that produced a false 1.2x reading for the
+  // subgroup tactic earlier in this campaign; switching arms inside ONE binary is
+  // the fix. (2) `test_vulkan_backend` uses it to prove the FALLBACK path still
+  // computes the same numbers on hardware that would otherwise never take it --
+  // without a setter that path is dead code on every box we own.
+  //
+  // Set it before dispatching. It is read on the (mutex-serialized) dispatch
+  // path and is not meant to change while work is in flight.
+  int rms_norm_override() const { return rms_norm_override_; }
+  void set_rms_norm_override(int v) { rms_norm_override_ = v; }
+  uint32_t max_workgroup_invocations() const { return max_workgroup_invocations_; }
+  uint32_t max_workgroup_size_x() const { return max_workgroup_size_x_; }
+  bool subgroup_arithmetic_compute() const { return subgroup_arithmetic_compute_; }
+
+  // Invocations the wide reducing modules are compiled for. Mirrors VT_TG in
+  // src/vt/vulkan/shaders/vt_rms_norm_wide.comp; the host never launches with it
+  // (a reducing kernel dispatches one workgroup per row) but the probe above
+  // compares against it, so the two must not drift.
+  static constexpr uint32_t kWideWorkgroupSize = 1024;
+
  private:
   VulkanContext();
   struct Pipeline;
@@ -260,6 +300,11 @@ class VulkanContext {
   bool coopmat_bf16_f32_ = false;
   uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
+  uint32_t max_workgroup_invocations_ = 0;
+  uint32_t max_workgroup_size_x_ = 0;
+  bool subgroup_arithmetic_compute_ = false;
+  bool wide_reduce_ = false;
+  int rms_norm_override_ = 0;
   std::string device_name_;
 
   friend class VulkanAllocator;
