@@ -52,6 +52,20 @@
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/operations/transformer/sdpa_config.hpp>
+// chunked_scaled_dot_product_attention lives in sdpa.hpp, but the installed
+// TT-NN tree ships that header with a missing device/ include. Forward-declare
+// the overload we call; the symbol is linked via TTNN::TTNN.
+namespace ttnn::transformer {
+ttnn::Tensor chunked_scaled_dot_product_attention(
+    const ttnn::Tensor& input_tensor_q, const ttnn::Tensor& input_tensor_k,
+    const ttnn::Tensor& input_tensor_v, const ttnn::Tensor& page_table_tensor,
+    int64_t chunk_start_idx, std::optional<float> scale = std::nullopt,
+    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
+    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
+    std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride>
+        paged_cache_geometry = std::nullopt);
+}  // namespace ttnn::transformer
 // experimental/paged_cache pulls op_profiler which expects a 6-arg
 // ___tracy_alloc_srcloc (with color); the TracyC.h on this tree only has 5-arg.
 // Temporarily disable Tracy for this include chain so the op headers compile.
@@ -401,6 +415,32 @@ bool TryDevicePagedFill(ttnn::Tensor& cache_dev, MeshDevice& device,
   }
 }
 
+// Pack token-major [C, nkv, d] → height-sharded [1, C, nkv_pad, d] L1 TILE.
+ttnn::Tensor MakeHeightShardedUpdateInput(MeshDevice& device, const float* toks, uint32_t base,
+                                          uint32_t C, uint32_t nkv, uint32_t nkv_pad, uint32_t d,
+                                          const tt::tt_metal::CoreCoord& grid) {
+  std::vector<float> x(static_cast<size_t>(C) * nkv_pad * d, 0.0f);
+  for (uint32_t b = 0; b < C; ++b) {
+    const float* src = toks + (static_cast<size_t>(base + b) * nkv * d);
+    float* dst = x.data() + static_cast<size_t>(b) * nkv_pad * d;
+    for (uint32_t g = 0; g < nkv; ++g) {
+      std::memcpy(dst + static_cast<size_t>(g) * d, src + static_cast<size_t>(g) * d,
+                  static_cast<size_t>(d) * sizeof(float));
+    }
+  }
+  ttnn::Tensor xt = ttnn::Tensor::from_vector<float>(
+      x, SpecOf(tt::tt_metal::Shape({1u, C, nkv_pad, d}), ttnn::DataType::BFLOAT16,
+                ttnn::Layout::TILE),
+      &device);
+  const tt::tt_metal::CoreRangeSet core_set =
+      tt::tt_metal::num_cores_to_corerangeset(C, grid, /*row_wise=*/true);
+  tt::tt_metal::ShardSpec shard_spec(core_set, {nkv_pad, d},
+                                     tt::tt_metal::ShardOrientation::ROW_MAJOR);
+  tt::tt_metal::MemoryConfig sharded_mem(tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED,
+                                         tt::tt_metal::BufferType::L1, shard_spec);
+  return ttnn::to_memory_config(xt, sharded_mem);
+}
+
 // Batched in-place device write via paged_update_cache. Treats each token as a
 // "batch user" with a 1-entry synthetic page table (phys_block) and
 // update_idx=offset. Height-shards onto B cores; chunks to the device grid when
@@ -419,29 +459,9 @@ bool TryDevicePagedUpdateBatch(ttnn::Tensor& cache_dev, MeshDevice& device,
 
     for (uint32_t base = 0; base < B; base += max_cores) {
       const uint32_t C = std::min(max_cores, B - base);
-      // Pack [1, C, nkv_pad, d] (zero-pad heads beyond nkv).
-      std::vector<float> x(static_cast<size_t>(C) * nkv_pad * d, 0.0f);
-      for (uint32_t b = 0; b < C; ++b) {
-        const float* src = toks + (static_cast<size_t>(base + b) * nkv * d);
-        float* dst = x.data() + static_cast<size_t>(b) * nkv_pad * d;
-        for (uint32_t g = 0; g < nkv; ++g) {
-          std::memcpy(dst + static_cast<size_t>(g) * d, src + static_cast<size_t>(g) * d,
-                      static_cast<size_t>(d) * sizeof(float));
-        }
-      }
-      ttnn::Tensor xt = ttnn::Tensor::from_vector<float>(
-          x, SpecOf(tt::tt_metal::Shape({1u, C, nkv_pad, d}), ttnn::DataType::BFLOAT16,
-                    ttnn::Layout::TILE),
-          &device);
-      const tt::tt_metal::CoreRangeSet core_set =
-          tt::tt_metal::num_cores_to_corerangeset(C, grid, /*row_wise=*/true);
-      tt::tt_metal::ShardSpec shard_spec(core_set, {nkv_pad, d},
-                                         tt::tt_metal::ShardOrientation::ROW_MAJOR);
-      tt::tt_metal::MemoryConfig sharded_mem(tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED,
-                                             tt::tt_metal::BufferType::L1, shard_spec);
-      xt = ttnn::to_memory_config(xt, sharded_mem);
+      ttnn::Tensor xt =
+          MakeHeightShardedUpdateInput(device, toks, base, C, nkv, nkv_pad, d, grid);
 
-      // Synthetic page table [C, 1]: update_idx=offset → page 0 → phys_block.
       std::vector<int32_t> pt(static_cast<size_t>(C));
       std::vector<uint32_t> update_idxs(static_cast<size_t>(C));
       for (uint32_t b = 0; b < C; ++b) {
@@ -463,6 +483,50 @@ bool TryDevicePagedUpdateBatch(ttnn::Tensor& cache_dev, MeshDevice& device,
   }
 }
 
+// Fused K+V paged_update — one device op for both caches (half the launches).
+bool TryDevicePagedFusedUpdateBatch(ttnn::Tensor& k_dev, ttnn::Tensor& v_dev, MeshDevice& device,
+                                    const std::vector<uint32_t>& phys_blocks,
+                                    const std::vector<uint32_t>& offsets, const float* k_toks,
+                                    const float* v_toks, uint32_t nkv, uint32_t d,
+                                    uint32_t /*bs*/) {
+  const uint32_t B = static_cast<uint32_t>(phys_blocks.size());
+  if (B == 0 || offsets.size() != phys_blocks.size()) return false;
+  try {
+    const uint32_t nkv_pad = std::max(32u, ((nkv + 31u) / 32u) * 32u);
+    const auto grid = device.compute_with_storage_grid_size();
+    const uint32_t max_cores =
+        std::max(1u, static_cast<uint32_t>(grid.x) * static_cast<uint32_t>(grid.y));
+
+    for (uint32_t base = 0; base < B; base += max_cores) {
+      const uint32_t C = std::min(max_cores, B - base);
+      ttnn::Tensor xt_k =
+          MakeHeightShardedUpdateInput(device, k_toks, base, C, nkv, nkv_pad, d, grid);
+      ttnn::Tensor xt_v =
+          MakeHeightShardedUpdateInput(device, v_toks, base, C, nkv, nkv_pad, d, grid);
+
+      std::vector<int32_t> pt(static_cast<size_t>(C));
+      std::vector<uint32_t> update_idxs(static_cast<size_t>(C));
+      for (uint32_t b = 0; b < C; ++b) {
+        pt[static_cast<size_t>(b)] = static_cast<int32_t>(phys_blocks[static_cast<size_t>(base + b)]);
+        update_idxs[static_cast<size_t>(b)] = offsets[static_cast<size_t>(base + b)];
+      }
+      ttnn::Tensor page_table = ttnn::Tensor::from_vector<int32_t>(
+          pt, SpecOf(tt::tt_metal::Shape({C, 1u}), ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
+          &device);
+
+      auto updated = ttnn::experimental::paged_fused_update_cache(
+          k_dev, xt_k, v_dev, xt_v, update_idxs, /*update_idxs_tensor=*/std::nullopt,
+          /*share_cache=*/false, page_table, /*batch_offset=*/0,
+          /*compute_kernel_config=*/std::nullopt, /*mesh_coords=*/std::nullopt);
+      k_dev = std::move(std::get<0>(updated));
+      v_dev = std::move(std::get<1>(updated));
+    }
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 // Prefer fill for longer sequential prefills; otherwise batched update.
 // Threshold keeps short decode/smoke on the height-sharded update path.
 constexpr uint32_t kPagedFillMinTokens = 16;
@@ -476,6 +540,29 @@ bool TryDevicePagedPush(ttnn::Tensor& cache_dev, MeshDevice& device,
     // Fall through to batched update on fill failure.
   }
   return TryDevicePagedUpdateBatch(cache_dev, device, blocks, offsets, toks, nkv, d, bs);
+}
+
+// Push K and V together: fill (2 calls) or fused update (1 call). Falls back to
+// independent pushes if the paired path fails.
+bool TryDevicePagedPushPair(ttnn::Tensor& k_dev, ttnn::Tensor& v_dev, MeshDevice& device,
+                            const std::vector<uint32_t>& blocks,
+                            const std::vector<uint32_t>& offsets, const float* k_toks,
+                            const float* v_toks, uint32_t nkv, uint32_t d, uint32_t bs) {
+  const uint32_t T = static_cast<uint32_t>(blocks.size());
+  if (T >= kPagedFillMinTokens && IsSequentialFillEligible(blocks, offsets, bs)) {
+    if (TryDevicePagedFill(k_dev, device, blocks, k_toks, T, nkv, d, bs) &&
+        TryDevicePagedFill(v_dev, device, blocks, v_toks, T, nkv, d, bs)) {
+      return true;
+    }
+    // Fall through.
+  }
+  if (TryDevicePagedFusedUpdateBatch(k_dev, v_dev, device, blocks, offsets, k_toks, v_toks, nkv, d,
+                                     bs)) {
+    return true;
+  }
+  // Last resort: independent updates.
+  return TryDevicePagedUpdateBatch(k_dev, device, blocks, offsets, k_toks, nkv, d, bs) &&
+         TryDevicePagedUpdateBatch(v_dev, device, blocks, offsets, v_toks, nkv, d, bs);
 }
 
 // After host NHD RAC writes: patch ttnn mirrors for all valid slots, then push
@@ -529,26 +616,43 @@ void NotePagedKvRacWrites(Tensor& k_cache, Tensor& v_cache, const std::vector<ui
     prepare(v_cache.data, v_toks, v_dev, v_can_update);
   }
 
-  // Phase 2: optional on-device push (outside lock).
+  // Phase 2: optional on-device push (outside lock). Prefer fused K+V.
   MeshDevice* device = nullptr;
   try {
     device = &SharedMeshDevice();
   } catch (...) {
     return;
   }
+  auto mark_dirty = [&](void* host) {
+    std::lock_guard<std::mutex> g(PagedKvMutex());
+    PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
+    if (s.device.has_value()) s.device_current = false;
+  };
+  auto publish = [&](void* host, ttnn::Tensor dev) {
+    std::lock_guard<std::mutex> g(PagedKvMutex());
+    PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
+    s.device = std::move(dev);
+    s.device_current = true;
+  };
+
+  if (k_can_update && v_can_update && k_dev.has_value() && v_dev.has_value()) {
+    if (TryDevicePagedPushPair(*k_dev, *v_dev, *device, blocks, offsets, k_toks.data(),
+                               v_toks.data(), nkv, d, bs)) {
+      publish(k_cache.data, std::move(*k_dev));
+      publish(v_cache.data, std::move(*v_dev));
+    } else {
+      mark_dirty(k_cache.data);
+      mark_dirty(v_cache.data);
+    }
+    return;
+  }
   auto try_one = [&](void* host, std::optional<ttnn::Tensor>& dev, bool can, const float* toks) {
     if (!can || !dev.has_value()) return;
     if (!TryDevicePagedPush(*dev, *device, blocks, offsets, toks, nkv, d, bs)) {
-      // Partial device writes leave the shadow dirty; Ensure will re-upload.
-      std::lock_guard<std::mutex> g(PagedKvMutex());
-      PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
-      if (s.device.has_value()) s.device_current = false;
+      mark_dirty(host);
       return;
     }
-    std::lock_guard<std::mutex> g(PagedKvMutex());
-    PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(host)];
-    s.device = std::move(*dev);
-    s.device_current = true;
+    publish(host, std::move(*dev));
   };
   try_one(k_cache.data, k_dev, k_can_update, k_toks.data());
   try_one(v_cache.data, v_dev, v_can_update, v_toks.data());
@@ -1584,13 +1688,166 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
   }
 }
 
+// Multi-token (prefill) device PA via ttnn::chunked_scaled_dot_product_attention.
+// Each request is processed independently (B=1) so seq lengths need not match.
+// Query tokens for request r cover absolute positions [seq_len-q_len, seq_len);
+// chunk_start must be a multiple of the program q/k chunk size (32).
+// Pads the last Q chunk with zeros (causal → pad queries do not affect earlier
+// real positions). Returns true if every request was written.
+bool TryPagedAttentionDevicePrefill(Tensor& out, const Tensor& query, const Tensor& k_cache,
+                                    const Tensor& v_cache, const Tensor& block_table,
+                                    const Tensor& seq_lens, const Tensor& query_start_loc,
+                                    const PagedAttentionArgs& args) {
+  if (!args.causal || args.logits_soft_cap > 0.0f) return false;
+  if (args.window_size.has_value()) return false;
+  if (args.kv_cache_dtype != Fp8KVCacheDataType::kAuto) return false;
+  if (query.rank != 3 || out.rank != 3 || k_cache.rank != 4 || v_cache.rank != 4) return false;
+  if (!query.IsContiguous() || !out.IsContiguous()) return false;
+
+  const int64_t total_q = query.shape[0];
+  const int64_t hq = query.shape[1];
+  const int64_t d = query.shape[2];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t nkv = k_cache.shape[2];
+  if (d != k_cache.shape[3] || d != v_cache.shape[3]) return false;
+  if (hq % nkv != 0) return false;
+  if ((d % 32) != 0 || (block_size % 32) != 0) return false;
+  if (block_table.rank != 2 || seq_lens.rank != 1 || query_start_loc.rank != 1) return false;
+
+  EnsureHost(query);
+  EnsureHost(k_cache);
+  EnsureHost(v_cache);
+  EnsureHost(block_table);
+  EnsureHost(seq_lens);
+  EnsureHost(query_start_loc);
+
+  const int64_t num_reqs = seq_lens.shape[0];
+  const int32_t* qsl = query_start_loc.Ptr<int32_t>();
+  const int32_t* slens = seq_lens.Ptr<int32_t>();
+  if (qsl[num_reqs] != total_q) return false;
+
+  // Chunk size must divide TILE and match program_config (decode uses 32 too).
+  constexpr int64_t kChunk = 32;
+  bool any_multi = false;
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    const int64_t q_len = static_cast<int64_t>(qsl[r + 1] - qsl[r]);
+    const int64_t seq = static_cast<int64_t>(slens[r]);
+    if (q_len <= 0 || seq < q_len) return false;
+    const int64_t chunk_start = seq - q_len;
+    if ((chunk_start % kChunk) != 0) return false;
+    if (q_len > 1) any_multi = true;
+  }
+  // Pure-decode batches stay on the decode SDPA path.
+  if (!any_multi) return false;
+
+  const int64_t max_blocks = block_table.shape[1];
+  const int32_t* btab = block_table.Ptr<int32_t>();
+  const int64_t bt_row = block_table.stride[0], bt_col = block_table.stride[1];
+
+  int32_t max_phys = -1;
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    for (int64_t c = 0; c < max_blocks; ++c) {
+      const int32_t id = btab[r * bt_row + c * bt_col];
+      if (id > max_phys) max_phys = id;
+    }
+  }
+  if (max_phys < 0) return false;
+  const uint32_t used_nb = static_cast<uint32_t>(max_phys) + 1u;
+  if (static_cast<int64_t>(used_nb) > k_cache.shape[0]) return false;
+
+  try {
+    MeshDevice& device = SharedMeshDevice();
+    ttnn::Tensor dev_k = EnsurePagedKvTtnn(k_cache, device, used_nb);
+    ttnn::Tensor dev_v = EnsurePagedKvTtnn(v_cache, device, used_nb);
+
+    const auto grid = device.compute_with_storage_grid_size();
+    ttnn::operations::transformer::SDPAProgramConfig prog{
+        grid,
+        std::nullopt,
+        /*q_chunk_size=*/static_cast<uint32_t>(kChunk),
+        /*k_chunk_size=*/static_cast<uint32_t>(kChunk),
+        /*exp_approx_mode=*/false,
+        /*max_cores_per_head_batch=*/16};
+
+    const uint32_t hu = static_cast<uint32_t>(hq);
+    const uint32_t du = static_cast<uint32_t>(d);
+
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      const int64_t q_begin = static_cast<int64_t>(qsl[r]);
+      const int64_t q_len = static_cast<int64_t>(qsl[r + 1] - qsl[r]);
+      const int64_t seq = static_cast<int64_t>(slens[r]);
+      const int64_t chunk_start0 = seq - q_len;
+
+      // Page table for this request: [1, max_blocks].
+      std::vector<int32_t> pt(static_cast<size_t>(max_blocks));
+      for (int64_t c = 0; c < max_blocks; ++c) {
+        pt[static_cast<size_t>(c)] = btab[r * bt_row + c * bt_col];
+      }
+      // KV address space must cover seq (and any Q pad to kChunk).
+      const int64_t q_pad = ((q_len + kChunk - 1) / kChunk) * kChunk;
+      const int64_t need_kv = chunk_start0 + q_pad;
+      if (max_blocks * block_size < need_kv) return false;
+
+      ttnn::Tensor dev_pt = ttnn::Tensor::from_vector<int32_t>(
+          pt, SpecOf(tt::tt_metal::Shape({1u, static_cast<uint32_t>(max_blocks)}),
+                     ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
+          &device);
+
+      for (int64_t local = 0; local < q_len; local += kChunk) {
+        const int64_t n_real = std::min(kChunk, q_len - local);
+        const int64_t chunk_start = chunk_start0 + local;
+        // Pack Q chunk [1, H, kChunk, D] (pad tail with zeros).
+        std::vector<float> q_host(static_cast<size_t>(hq) * static_cast<size_t>(kChunk) * d, 0.0f);
+        for (int64_t i = 0; i < n_real; ++i) {
+          const int64_t t = q_begin + local + i;
+          for (int64_t h = 0; h < hq; ++h) {
+            for (int64_t e = 0; e < d; ++e) {
+              q_host[static_cast<size_t>((h * kChunk + i) * d + e)] =
+                  LoadElemF32(query, (t * hq + h) * d + e);
+            }
+          }
+        }
+        ttnn::Tensor dev_q = ttnn::Tensor::from_vector<float>(
+            q_host,
+            SpecOf(tt::tt_metal::Shape({1u, hu, static_cast<uint32_t>(kChunk), du}),
+                   ttnn::DataType::BFLOAT16, ttnn::Layout::TILE),
+            &device);
+
+        ttnn::Tensor dev_out = ttnn::transformer::chunked_scaled_dot_product_attention(
+            dev_q, dev_k, dev_v, dev_pt, chunk_start, /*scale=*/args.scale,
+            /*memory_config=*/std::nullopt, /*program_config=*/prog,
+            /*compute_kernel_config=*/std::nullopt, /*paged_cache_geometry=*/std::nullopt);
+
+        std::vector<float> result = dev_out.to_vector<float>();
+        // Expected dense logical [1, H, kChunk, D].
+        VT_CHECK(static_cast<int64_t>(result.size()) >= hq * kChunk * d,
+                 "tenstorrent device prefill PA: unexpected output size");
+        for (int64_t i = 0; i < n_real; ++i) {
+          const int64_t t = q_begin + local + i;
+          for (int64_t h = 0; h < hq; ++h) {
+            for (int64_t e = 0; e < d; ++e) {
+              const float v = result[static_cast<size_t>((h * kChunk + i) * d + e)];
+              StoreElemF32(out, (t * hq + h) * d + e, v);
+            }
+          }
+        }
+      }
+    }
+    CommitHost(out);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 // kPagedAttention: causal/non-causal GQA softmax over the paged NHD cache
 // (cpu_paged_attn.cpp PagedAttentionKernel). Host-staged f32 oracle matching
 // the CPU reference while Alloc is host memory.
 //
-// Device path (pure decode): rebuild/upload ttnn-layout K/V shadows
-// [nb,nkv,bs,d] and call paged_scaled_dot_product_attention_decode. Host NHD
-// stays the source of truth for ReshapeAndCache / LMCache plane layout.
+// Device paths (ttnn-layout K/V shadows [nb,nkv,bs,d]):
+//   * pure decode → paged_scaled_dot_product_attention_decode
+//   * multi-token prefill → chunked_scaled_dot_product_attention (per request)
+// Host NHD stays the source of truth for ReshapeAndCache / LMCache plane layout.
 //
 // Host perf levers:
 //   * NEON FMA dots/axpy + Q hoist + specialized f32/bf16 loads
@@ -1608,10 +1865,14 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
                           const Tensor& v_cache, const Tensor& block_table,
                           const Tensor& seq_lens, const Tensor& query_start_loc,
                           const PagedAttentionArgs& args) {
-  // Pure-decode batch: ttnn paged SDPA (ttnn-layout device shadows). Prefill /
-  // softcap / window / odd TILE dims fall through to the host oracle.
+  // Device SDPA (ttnn-layout shadows). Softcap / window / odd TILE dims /
+  // misaligned chunk starts fall through to the host oracle.
   if (TryPagedAttentionDeviceDecode(out, query, k_cache, v_cache, block_table, seq_lens,
                                     query_start_loc, args)) {
+    return;
+  }
+  if (TryPagedAttentionDevicePrefill(out, query, k_cache, v_cache, block_table, seq_lens,
+                                     query_start_loc, args)) {
     return;
   }
 
