@@ -779,7 +779,16 @@ which carries no ggml or PyTorch dependency.
 
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
-per position. (Over HTTP the OpenAI `logprobs` field keeps its own 0..5 range.)
+per position.
+
+Over HTTP the same `-1` reaches the chat surface: `{"logprobs": true,
+"top_logprobs": -1}` is accepted, as in vLLM, and returns every vocab entry for
+each generated token. No numeric range is enforced on either surface — vLLM's
+`check_logprobs` request validation and its `max_logprobs` model cap are not
+ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
+returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
+count is not rejected. Both are tracked by
+[issue #249](https://github.com/mudler/vllm.cpp/issues/249).
 
 ## Multimodal input (image, video, audio to text)
 

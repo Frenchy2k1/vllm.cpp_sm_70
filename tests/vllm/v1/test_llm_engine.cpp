@@ -1053,13 +1053,18 @@ TEST_CASE("llm_engine: async depth-2 serving generates past ignore_eos (no corru
 
 // ─── 8. logprobs=-1 reaches the client intact (issue #231) ───────────────────
 // "All logprobs". The sampler has a `num_logprobs == -1` branch that returns a
-// raw-vocab LogprobsTensors with EMPTY ids and ranks (1:1 sampler.py:122-125),
-// and LogprobsProcessor::UpdateSampleLogprobs indexes all three arrays — so a
-// live request that reached that branch segfaulted. Upstream never reaches it,
+// raw-vocab LogprobsTensors with EMPTY ids and ranks (1:1 sampler.py:122-125)
+// while `num_tokens_per_position` is the full vocab — so a live request that
+// reached that branch died in the FIRST thing to touch the tensor:
+// LogprobsTensors::slice_request (src/vllm/v1/outputs.cpp:31-37), called from
+// scheduler.cpp:920-924, which assigns a num_positions*vocab range out of the
+// two empty vectors' null begin(). LogprobsProcessor::UpdateSampleLogprobs
+// (src/vllm/v1/engine/logprobs.cpp:51-77) indexes the same two arrays and would
+// fault identically, but the process never gets there. Upstream reaches neither,
 // because gpu_input_batch.py:434-440 widens the sentinel to vocab_size at
 // admission; we propagated it instead.
 //
-// RED before the widening: SIGSEGV inside UpdateSampleLogprobs.
+// RED before the widening: SIGSEGV inside LogprobsTensors::slice_request.
 TEST_CASE("llm_engine: logprobs=-1 returns a full-vocab logprobs dict") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -1093,9 +1098,20 @@ TEST_CASE("llm_engine: logprobs=-1 returns a full-vocab logprobs dict") {
   }
 }
 
-// A finite count is unchanged by the widening: k+1 entries, deduped when the
-// sampled token is itself in the top-k. Guards the ordinary path against a
-// regression in the same edit.
+// A finite count is unchanged by the widening. The gathered row is
+// [sampled | top-2], k+1 == 3 wide; greedy makes the sampled token the rank-1
+// entry, so the dict-dedup collapses it to EXACTLY 2 distinct ids at rank 1 and
+// rank 2. Asserted exactly, not as a `>= 1 && <= 3` range, which any narrower or
+// empty-ish row would also satisfy.
+//
+// What this case deliberately does NOT claim to cover: the SAMPLER-side gather
+// width. AppendLogprobsForNextPosition (logprobs.h:82) truncates to the
+// REQUEST's own num_logprobs, so widening every request to vocab_size leaves the
+// client-visible payload byte-identical — no engine-level assertion can see it.
+// That width is pinned where it is observable, at the input-batch seam:
+// tests/vllm/v1/worker/test_input_batch.cpp:641 (`max_num_logprobs == 4` for a
+// finite request) and :687 (`num_logprobs.at("a") == 3`); mutating add_request to
+// widen unconditionally turns both RED.
 TEST_CASE("llm_engine: a finite logprobs count is unaffected by the -1 widening") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -1108,8 +1124,11 @@ TEST_CASE("llm_engine: a finite logprobs count is unaffected by the -1 widening"
 
   REQUIRE(r.outputs.size() == 1);
   REQUIRE(r.outputs[0].logprobs.has_value());
-  for (const vllm::LogprobsOnePosition& pos : *r.outputs[0].logprobs) {
-    CHECK(pos.entries.size() >= 1);
-    CHECK(pos.entries.size() <= 3);  // sampled + 2, deduped
+  for (std::size_t i = 0; i < r.outputs[0].logprobs->size(); ++i) {
+    const vllm::LogprobsOnePosition& pos = (*r.outputs[0].logprobs)[i];
+    CHECK(pos.entries.size() == 2u);  // sampled(==top-1) + top-2
+    const vllm::Logprob* self = pos.find(r.outputs[0].token_ids[i]);
+    REQUIRE(self != nullptr);
+    CHECK(self->rank == 1);  // greedy -> the sampled token IS the argmax
   }
 }
