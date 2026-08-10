@@ -4983,7 +4983,14 @@ SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfC
       h.dtype == DType::kBF16 &&
       SharedGateUpFusedEligible(w.shared_gate_proj_fp4, w.shared_up_proj_fp4)) {
     DBuf sact = SharedGateUpFusedMarlinD(d, h, w.shared_gate_proj_fp4, w.shared_up_proj_fp4);
-    DBuf sd = MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);  // [T,H] f32
+    // bf16 down-proj out (VT_SHARED_DOWN_BF16, default ON): the Marlin GEMM
+    // already produces bf16 and BOTH consumers re-round through bf16, so the
+    // f32 form wrote and re-read a whole [T,H] buffer for a value it had.
+    // Bit-identical; drops one CastF32 launch per layer per step (CastF32 was
+    // measured at 3.1% of the 35B decode step).
+    DBuf sd = dense_nvfp4::SharedDownBf16Enabled()
+                  ? MatmulNvfp4Bf16D(d, sact.t(), w.shared_down_proj_fp4)   // [T,H] bf16
+                  : MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);   // [T,H] f32
     DBuf gl = MatmulF32D(d, h, w.shared_gate);                       // [T,1] f32
     return {std::move(sd), std::move(gl)};
   }

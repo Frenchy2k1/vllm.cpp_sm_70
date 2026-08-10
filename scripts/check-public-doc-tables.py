@@ -491,7 +491,7 @@ STATUS_RATCHET = {
     # ~100% GPU-busy reading) into the binding result, both of which are now
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
-    "chars": 243542,
+    "chars": 243526,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

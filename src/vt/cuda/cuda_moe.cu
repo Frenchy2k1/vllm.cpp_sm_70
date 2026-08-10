@@ -547,9 +547,13 @@ void MoeCombineKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out, const
 // topk_weight_and_reduce.py moe_sum) extended to fold the shared contribution.
 __device__ inline float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-template <typename Teo, typename Tout>
+// `sd` is read through Tsd: the f32 the shared down-proj used to be cast to, or
+// the bf16 the Marlin GEMM actually produced. Widening bf16 to float in-kernel
+// is EXACT, and the value is immediately re-rounded through bf16 below, so both
+// forms are bit-identical -- the bf16 one just skips a whole [T,H] f32 cast.
+template <typename Teo, typename Tsd, typename Tout>
 __global__ void MoeCombineGateKernel(Tout* out, const Teo* expert_out, const float* weights,
-                                     const float* sd, const float* gl, int64_t t, int64_t h,
+                                     const Tsd* sd, const float* gl, int64_t t, int64_t h,
                                      int k) {
   const int64_t n = t * h;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -562,7 +566,7 @@ __global__ void MoeCombineGateKernel(Tout* out, const Teo* expert_out, const flo
       acc += weights[row * k + j] * Load(expert_out, (row * k + j) * h + col);
     // Shared-expert gate, rounded through bf16 exactly as SharedExpertGate's
     // store, then re-added in f32 (matches MoeCombine's Load(shared) bf16->f32).
-    const float sv = SigmoidF(gl[row]) * sd[idx];
+    const float sv = SigmoidF(gl[row]) * Load(sd, idx);
     acc += __bfloat162float(__float2bfloat16(sv));
     Store(out, idx, acc);
   }
@@ -572,9 +576,15 @@ template <typename Teo, typename Tout>
 void LaunchCombineGate(cudaStream_t s, Tensor& out, const Tensor& expert_out,
                        const Tensor& weights, const Tensor& sd, const Tensor& gl, int64_t t,
                        int64_t h, int k) {
-  MoeCombineGateKernel<Teo, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
-      out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(), sd.Ptr<float>(),
-      gl.Ptr<float>(), t, h, k);
+  if (sd.dtype == DType::kBF16) {
+    MoeCombineGateKernel<Teo, __nv_bfloat16, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
+        out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(),
+        sd.Ptr<__nv_bfloat16>(), gl.Ptr<float>(), t, h, k);
+  } else {
+    MoeCombineGateKernel<Teo, float, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
+        out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(), sd.Ptr<float>(),
+        gl.Ptr<float>(), t, h, k);
+  }
   Check(cudaGetLastError(), "moe_combine_gate launch");
 }
 
@@ -594,6 +604,8 @@ void MoeCombineGateKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out,
            "cuda moe_combine_gate: unsupported expert_out dtype (f32/bf16 only)");
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
            "cuda moe_combine_gate: unsupported out dtype (f32/bf16 only)");
+  VT_CHECK(sd.dtype == DType::kF32 || sd.dtype == DType::kBF16,
+           "cuda moe_combine_gate: unsupported sd dtype (f32/bf16 only)");
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
   if (t == 0 || h == 0) return;
   cudaStream_t s = AsStream(q);
