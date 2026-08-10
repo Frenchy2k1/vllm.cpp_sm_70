@@ -17,7 +17,7 @@
 | Dependencies | Landed: `SPEC-DFLASH` (`DONE`), `SPEC-REJECTION` verify half, `SPEC-GDN-SEGMENTS`. External, PENDING developer authority: checkpoint downloads (2.79-8.80 GB), dgx GPU time, push/draft-PR. Blocking unknown: R1, whether the pinned oracle runs DSpark at all. |
 | Work breakdown | §4 — W1 config, W2 Markov head + draft model, W3 loader (native + Speculators), W4 speculator (anchor layout + sequential sampling), W5 runner + one-surface, W6 gates. W1-W4 are CPU-gateable. |
 | Risks/decisions | §6 — R1 oracle runnability (V2 runner), R2 Speculators format is a new subsystem, R3 the community 27B checkpoint's `attn_output_gate`, R4 the `k >= dspark_block_size` garbling trap, R5 sequential sampling vs CUDA-graph capture, R6 greedy before probabilistic, R7 GB10 host-RAM pressure. |
-| Status | W1-W5 LANDED and DSpark now genuinely speculates on the 35B gate model (real acceptance, 6.78 -> 41.89 tok/s) after fixing an engine-wide `check_for_draft_tokens` wiring bug that silently disabled EVERY speculator on the CLI/server path. W6 still OPEN: spec-ON output is not yet token-identical to spec-OFF nor run-stable (see §6b). R1 answered (§6a). |
+| Status | W1-W5 LANDED and DSpark now genuinely speculates on the 35B gate model (real acceptance, 6.78 -> 41.89 tok/s) after fixing an engine-wide `check_for_draft_tokens` wiring bug that silently disabled EVERY speculator on the CLI/server path. W6 PARTIAL: spec-ON output is token-identical to spec-OFF and reproducible on the 35B gate model (§6b), but speed is ~2% BEHIND spec-off and the cross-engine + acceptance-band gates are still owed. R1 answered (§6a). |
 | Goal (developer, 2026-08-09) | a FULL DSpark implementation in vllm.cpp, mirrored from vLLM |
 
 ## 0. Verdict
@@ -360,17 +360,39 @@ loop's `process_engine_step` where a stale comment had deferred it.
 and throughput goes from **6.78 tok/s (drafts discarded) to 41.89 tok/s**,
 against 42.11 spec-OFF — i.e. from 5.5x slower to parity.
 
-**REMAINING DEFECT (W6 still open).** Speculative-ON output is NOT yet
-token-identical to spec-OFF, and it is not stable run to run: at 24 tokens the
-ON arm reproduced the spec-OFF prefix exactly, while a 48-token run of the same
-binary and prompt produced a different continuation from the first token. For
-greedy decoding a correct rejection sampler must make ON == OFF exactly, so this
-is a real bug, not a tie-break. Next probes, in order: (a) whether the
-divergence survives with async scheduling forced OFF on both arms (the OFF arm
-ran async-enabled, the ON arm async-disabled, so the two arms differ in more
-than speculation); (b) the anchor-layout `sample_pos` alignment against the
-verify side; (c) whether the aux multi-tap path is numerically neutral on the
-35B MoE NVFP4.
+**SELF-CONSISTENCY GATE MET (2026-08-10).** The earlier "ON diverges from OFF
+and is not run-stable" reading was a CONFOUND, and naming it is the point: the
+spec-OFF arm had run with async scheduling ENABLED while the spec-ON arm forces
+it off, so the two arms differed in two variables, not one. Re-run with BOTH
+arms on the synchronous path (`VT_ASYNC_SCHED=0 VT_ASYNC_RUNNER=0` on the
+spec-off arm), 48 greedy tokens, `nvidia/Qwen3.6-35B-A3B-NVFP4` +
+`RedHatAI/Qwen3.6-35B-A3B-speculator.dspark` at k=8:
+
+| arm | tok/s | output |
+|---|---:|---|
+| A spec-OFF, sync | 40.836 | " Paris, a city renowned for its iconic landmarks such as the Eiffel Tower, ... a popular destination for tourists" |
+| B spec-OFF, sync (repeat) | 40.916 | **identical to A** |
+| C DSpark k=8 | 40.174 | **identical to A** |
+| D DSpark k=8 (repeat) | 39.751 | **identical to A** |
+
+So on a gate model, with real acceptance behind it, **speculative-on greedy
+output is token-identical to speculative-off and reproducible**. That is the
+correctness invariant speculative decoding must satisfy, and it now holds.
+
+**SPEED IS NOT YET A WIN, and is not claimed.** 40.17/39.75 spec-on against
+40.84/40.92 spec-off is ~2% SLOWER at c1 on this prompt. The sequential Markov
+stage is a host-side loop with a device round-trip per step (spec R5 predicted
+exactly this), and acceptance on a bf16-trained draft over an NVFP4 target is
+modest. The house gate is at-or-above vLLM's own DSpark-on, so this row stays
+`ACTIVE`.
+
+**Still owed for a binding W6:** (1) the cross-engine comparison against the
+pinned oracle running the same target+draft+k through the project's SACRED
+harness rather than an ad-hoc prompt (our base decode and the oracle's already
+differ on this prompt, so a like-for-like corpus is required); (2) the
+acceptance rate/length band against the upstream reference; (3) the speed A/B
+versus vLLM DSpark-on; (4) the same on the 27B lane and the Gemma4 `1 + N`
+layout.
 
 ## 7. Evidence, authority, stop conditions
 

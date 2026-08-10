@@ -297,7 +297,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | Qwen3.6-35B-A3B NVFP4 + RedHatAI dspark draft, k=8 | **Not a gate yet**: real acceptance, 41.89 vs 42.11 spec-off tok/s (was 6.78 while drafts were discarded). Output not yet token-identical to spec-off | `ACTIVE` |
+| DSpark | Qwen3.6-35B-A3B NVFP4 + RedHatAI dspark draft, k=8 | Output token-identical to spec-off (48/48, both arms synchronous, 2 runs each). Speed **40.17 vs 40.84 tok/s = ~2% BEHIND**, so no speed claim; cross-engine gate owed | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
