@@ -176,6 +176,7 @@ assume** (the maintainer decision, verbatim). Decision record:
 | Strix Halo / GTR9 Pro 128GB | gfx1151 | unified | M0/M1 **MET** (#41). Now: **verify the §3.1 fix, then M2** (§5.2) — the reference tier means a model runs with no further kernel written. Closest analogue to GB10, so the residency-policy question in §6 is yours |
 | Radeon 780M iGPU | gfx1103 | shared | M0/M1 **MET** (#41). Same §5.2 path, smaller models. Best position to find every place a "CUDA" assumption is really an "NVIDIA" assumption. A vLLM-ROCm oracle is unlikely on this board, so M4 stays PENDING there — fine, and to be said rather than papered over |
 | 4x 7900 XTX | gfx1100 | discrete | M0/M1 **MET** (#41, with the #132 caveat). Now **the kernel path**, since the reference tier cannot install on a dGPU and a model needs real kernels. The only board class that can host a vLLM-ROCm oracle for M4 and, later, multi-GPU TP — the backend already registers all four at `Device{kROCM, i}`. gfx1201 (2x R9700) is on the same discrete lane via PR #140 |
+| RX 9060 XT | gfx1200 | discrete | M0/M1 **MET** independently ([#41](https://github.com/mudler/vllm.cpp/issues/41)). **M2 MET via the kernel path** ([#269](https://github.com/mudler/vllm.cpp/issues/269), [.agents/specs/rocm-gfx1200-m2-correctness.md](../.agents/specs/rocm-gfx1200-m2-correctness.md)): Qwen3-0.6B and Gemma-3-1B-it both ran greedy with every op `VT_OP_PROVIDER_STATS=1`-reported `selected=vt-native` — no reference tier exists on a dGPU, so this is full native coverage, not the zero-kernel path §5.2 describes. Qwen3 hit one CPU-vs-ROCm near-tie flip (closed as ordinary bf16/reduction-order drift, not a kernel defect); Gemma-3-1B was a clean 48/48 unanimous match, the first exercise of the gemma `(1+w)` RmsNorm + GeGLU + dual-rope-theta code path on this board |
 
 These do not collide. Two people can be on M0/M1/M2 on unified parts while a
 third does the hipify pass, and the discrete board is what turns the result into
@@ -208,6 +209,15 @@ real silicon — with two runtime caveats, both teardown-related, in §5.1 below
 Acceptance: greedy token parity against the **CPU backend** on the same build,
 plus the `VT_OP_PROVIDER_STATS=1` output showing which ops fell back, which is
 your kernel to-do list, sorted by real usage rather than by guesswork.
+
+**On a discrete board there is no reference tier (§3), so M2's acceptance bar
+is unchanged but its mechanism is not** — every op the model needs must
+already be a real kernel; `VT_OP_PROVIDER_STATS=1` reporting `selected=vt-native`
+on all of them, with zero fallbacks, *is* the evidence, since a fallback
+literally cannot exist to hide behind. **MET on gfx1200** this way ([#269](https://github.com/mudler/vllm.cpp/issues/269)): Qwen3-0.6B and Gemma-3-1B-it
+both ran greedy, all-native, token parity vs `--device cpu` (Gemma-3-1B clean
+48/48; Qwen3-0.6B one near-tie flip, closed as bf16/reduction-order drift, not
+a kernel defect — [.agents/specs/rocm-gfx1200-m2-correctness.md](../.agents/specs/rocm-gfx1200-m2-correctness.md)).
 
 ### 5.1 Known runtime issues on the #41 boards
 
