@@ -468,6 +468,60 @@ speculative-decode shape as a first-class uniform-query case. Confirm with an
 `nsys` instance-count check on both arms (the house rule: same tool both sides,
 and a captured graph reports as one range), then capture the 1+k shape.
 
+## 6e. nsys: the verify step loses the CUDA graph, AND the MoE is not free (2026-08-10)
+
+Same tool, same binary, both arms, `--cuda-graph-trace=node` (without it a
+captured graph collapses to one range and instance counts are meaningless), two
+token lengths per arm so decode differences out from the one-time prefill.
+Evidence `dgx:~/work/dspark-w6/nsys/`.
+
+**1. The speculative verify runs FULLY EAGER. Proven, not inferred.**
+
+| arm | `cudaGraphLaunch` | `cudaLaunchKernel` |
+|---|---:|---:|
+| spec-off, 32 tok | **30** | 64,457 |
+| spec-off, 64 tok | **62** | 64,617 |
+| DSpark, 32 tok | **0** | 70,828 |
+| DSpark, 64 tok | **0** | 82,893 |
+
+Graph launches on the spec-off arm scale exactly one per decode step (30 for 32
+tokens, 62 for 64). On BOTH DSpark arms there are none at all, and the eager
+path adds ~18k extra kernel launches over 64 tokens plus `cuLaunchKernelEx` /
+`cuLaunchKernel` families that do not appear spec-off at all. The T=1+k verify
+shape is simply not a captured shape.
+
+**2. But the larger factor is MoE expert activation, and this CORRECTS §6d.**
+§6d argued the verify "should be nearly free, because it streams the same
+weights". That is true of a DENSE decode and FALSE for a top-k MoE. The
+dominant decode kernel, per arm (64-minus-32 differencing):
+
+| arm | Marlin MoE instances | avg per instance | per generated token |
+|---|---:|---:|---:|
+| spec-off | 80 / token | **42.6 us** | 3,408 us |
+| DSpark | 37.5 / token | **154.2 us** | 5,783 us |
+
+One token activates top-8 of 256 experts; nine query tokens activate up to nine
+different expert sets, so the expert GEMM grows with the query count instead of
+riding the same weight stream. Per instance the kernel is **3.6x** more
+expensive at T=9, and even after the ~2.1x fewer launches DSpark spends **1.7x
+MORE GPU time per generated token** in that one kernel.
+
+**What this means for the row.** The block drafter has to overcome super-linear
+expert cost on a sparse MoE, which is a harder bar than on a dense target and
+is NOT something better drafting fixes. Two levers, in order:
+
+1. **Capture the 1+k verify shape** (a real, bounded win: the eager path's
+   launch overhead is measured above, and upstream treats the speculative-decode
+   shape as a first-class captured uniform-query case).
+2. **Look at expert batching for the verify shape** — whether the 9 tokens'
+   expert sets are being gathered into one grouped GEMM or run as near-separate
+   passes. The 3.6x per-instance jump for 9x the tokens suggests the former is
+   partly working, but the absolute cost says it is worth measuring against
+   vLLM's own MoE path on the SAME shape before assuming.
+
+A dense gate model (Qwen3.6-27B + a dense DSpark draft) would separate the two
+factors cleanly, and is the cheapest next experiment.
+
 **Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
 PRODUCTION GRAPHED config through the project's harness, not the eager arm run
 here; (2) token-exactness against that oracle on the SACRED corpus rather than
