@@ -184,8 +184,7 @@ echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do
   run "$suite" python3 "tests/scripts/$suite.py"
 done
-run "waiver/trailer suites" python3 -m unittest \
-  tests.scripts.test_waivers \
+run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the

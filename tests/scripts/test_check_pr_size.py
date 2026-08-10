@@ -17,7 +17,6 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
-# check-pr-size.py imports scripts.waivers; a bare spec load has no repository
 # root on sys.path, so provide it before executing the module.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -86,7 +85,6 @@ class PathClassification(unittest.TestCase):
             ".agents/state-index/2026-08-001.csv": "append_only_record",
             ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
             ".agents/completed/state-migration-manifest.csv": "evidence",
-            "scripts/waivers.py": "governance_support",
             "docs/STATUS.md": "public_document",
             "website/hugo.toml": "public_document",
             "website/layouts/_default/baseof.html": "public_document",
@@ -197,6 +195,11 @@ class RetiredSurfaces(unittest.TestCase):
             ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
         }
         exact = {
+            # Retired by #281: the waiver registry became a commit-message
+            # argument recorded in git, so these three left the tree together.
+            ".agents/waivers.csv": "policy",
+            "scripts/waivers.py": "governance_support",
+            "tests/scripts/test_waivers.py": "checker_test",
             ".agents/policy.csv": "policy",
             ".agents/policy-cutover": "policy",
             ".agents/state.md": "project_record",
