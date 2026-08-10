@@ -139,7 +139,11 @@ engines) and is entirely MARGINAL per-token work, since our FIXED per-step cost
 already beats vLLM (9.02 ms against 9.43 ms). The marlin block-size lever is
 REFUTED by same-binary A/B (block 8 at c8 is 1.16% SLOWER; c4 control +0.29%),
 but routing the fused shared-expert gate_up sink off the MoE-marlin route WINS
-**+1.31% at c8 and +1.38% at c4** (`VT_MARLIN_DENSE_PAIR`, default ON).
+**+1.31% at c8 and +1.38% at c4** (`VT_MARLIN_DENSE_PAIR`, default ON). A
+follow-on per-launch gap on the shared `marlin_moe_wna16` is WITHDRAWN: the two
+engines run identical geometry, identical launch counts and identical registers,
+and the same FlashAttention kernel matches to 0.02% at large grid, so the
+residual is cross-tool uncertainty rather than a kernel difference.
 Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**. Detail in
 `.agents/benchmark-record.md`.
 
