@@ -37,6 +37,8 @@
 
 ## News
 
+- **2026-08** **MiniMax-H3 generates video with audio.** All tasks run through `POST /v1/videos`;
+  use Q4_K_M.
 - **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
   matches the vLLM oracle token for token, and decodes **45.45 vs 41.94 tok/s**.
 - **2026-08** **Vulkan matches llama.cpp on a 27B.** `opt-125m` greedy is STRICT token-exact;
@@ -55,9 +57,8 @@ scheduling ideas (RadixAttention, LPM cache-aware admission, jump-forward decodi
 ABI, GGUF straight off the shelf, and compute directly on the quantized blocks). MLX's GEMM where it
 wins on Apple Silicon. Safetensors and GGUF, CUDA and CPU and Metal and Vulkan, from one source tree.
 
-What keeps that honest is the oracle. Every architecture is gated **token-for-token against vLLM
-itself** on the same workload, so "grounded in vLLM" is a test result rather than a design claim, and
-speed is only ever quoted against a reference measured in its own production config.
+Every architecture is gated **token-for-token against vLLM** on the same workload. Speed claims use
+the reference engine's production configuration.
 
 ![vllm.cpp vs vLLM on Qwen3.6-27B: identical output at every concurrency](benchmarks/media/concurrency_race.gif)
 
@@ -195,9 +196,8 @@ you get on top, most of it borrowed from whichever engine does it best:
   scheduling, jump-forward decoding, and custom logits processors, opt-in from the library, the C
   ABI, or server flags. Each defaults to today's behavior, so an engine that sets none of them is
   byte-identical to one built without them ([docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md)).
-- **Runs on hardware people actually have.** CUDA, CPU, Metal, and Vulkan from one source tree, with
-  an MLX GEMM provider on Apple Silicon and an Arm i8mm quant-GEMM tier. No datacenter assumption
-  baked in.
+- **Runs on hardware people actually have.** CUDA, CPU, Metal, and Vulkan ship from one tree. ROCm
+  and Tenstorrent are growing; Apple MLX and Arm i8mm providers cover their useful shapes.
 - **Speculative decoding beyond ngram.** MTP, block-diffusion DFlash, and draft-free ngram, through
   the same `--speculative-config` JSON vLLM takes
   ([docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md)).
@@ -310,7 +310,7 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35). Op coverage: [docs/STATUS.md](docs/STATUS.md) |
 | **ROCm** | AMD GPUs | W0 skeleton, gfx1201/2xR9700 contrib-run ([#140](https://github.com/mudler/vllm.cpp/pull/140)); no board: [detail](docs/ROCM.md) |
-| **Tenstorrent** | Blackhole | W0, 1 op |
+| **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
 Per-arch build flags, per-op coverage, and the quantization format table:

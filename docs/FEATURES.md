@@ -215,7 +215,7 @@ HTTP are not started.
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; builds on ROCm 6.x with the CLR hostcall fix, #201/#132; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
-| Tenstorrent Blackhole | ◐ W2, OPT-125m STRICT 6/6 e2e ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`, `ACTIVE`) | ✅ | ☐ | ☐ |
+| Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens, full 16x16 rerun pending ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`) | ✅ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core

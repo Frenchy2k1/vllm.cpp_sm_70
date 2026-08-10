@@ -118,11 +118,13 @@ size; that is reclaimable and does not need to be budgeted, but it does make
 `MemFree` look alarming during a load. Use `MemAvailable`, not `MemFree`, to
 decide whether a model fits. `VT_VULKAN_ALLOC_STATS=1` prints the running device
 total and the `/proc` context if you need to see where it goes.
-A Tenstorrent build (`-DVLLM_CPP_TENSTORRENT=ON`, needs a local tt-metal
-install on `CMAKE_PREFIX_PATH`) adds nothing runtime-visible yet — W0 is one
-op with no model support, so there is nothing here to document until that
-changes. See [docs/STATUS.md](STATUS.md) and
-[.agents/specs/tenstorrent-backend.md](../.agents/specs/tenstorrent-backend.md).
+A Tenstorrent build (`-DVLLM_CPP_TENSTORRENT=ON`) needs TT-Metalium and TT-NN
+on `CMAKE_PREFIX_PATH`. Blackhole currently runs OPT-125m through the shared
+engine and has the Qwen3-0.6B correctness gate wired with device-specific
+goldens. The full Qwen3 16x16 gate remains pending because paged attention is
+still host-bound. This is an active correctness backend, not a performance
+backend. See [STATUS.md](STATUS.md) and the
+[Tenstorrent backend spec](../.agents/specs/tenstorrent-backend.md).
 
 A Vulkan build (`-DVLLM_CPP_VULKAN=ON`) adds three kernel-measurement binaries.
 They exist so a Vulkan tuning knob can be A/B'd in ONE binary, which is this
