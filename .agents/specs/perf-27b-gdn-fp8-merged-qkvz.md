@@ -103,6 +103,38 @@ need not agree — each shard's folded alpha is applied per output column (folde
 into the GEMM scalar when equal, else through a resident alpha vector, mirroring
 `MergedFp8QkvD`); only the per-tensor *activation* scale must match bitwise.
 
+## The bitwise claim is shape-conditional — MEASURED on `sm_121a`
+
+The first CUDA run of this row's own equivalence test was RED, and the cause is
+not in this leaf's arithmetic. The production fp8 GEMM is cuBLASLt
+(`VT_DENSE_CUBLASLT_FP8`, default ON) and `cublasLtMatmulAlgoGetHeuristic`
+selects the kernel — *including the split-K factor* — per `(M,N,K)`. Merging
+changes `N`, so it can change how many partial K-reductions get summed, and f32
+addition is not associative. `VT_GEMM_ALGO_LOG=1`:
+
+| shape | merged | `in_proj_qkv` | `in_proj_z` |
+|---|---|---|---|
+| 27B gate, M=1, K=5120 | n=16384 **splitK=1** | n=10240 **splitK=1** | n=6144 **splitK=1** |
+| toy, M=3, K=256 | n=320 **splitK=1** | n=192 **splitK=4** | n=128 **splitK=8** |
+
+At the gate shapes every arm reduces K in one pass and the merge is **bitwise
+exact**: 0 differing of 16384 (27B, M=1) and of 49152 (M=3), across both
+weight-scale regimes and both `z` dtypes. At the toy shape the two split GEMMs
+use *different* split-K factors (4 and 8), so no single merged launch can
+reproduce both halves — bitwise equality is unattainable there by construction,
+and the arms differ by at most 128 ULP / 8.4e-06 relative, the size of f32
+reassociation. Rerunning the same toy shape on the shape-invariant CUTLASS fp8
+GEMM (`VT_DENSE_CUBLASLT_FP8=0`) is bitwise green in all four regimes, which
+isolates the difference to the library heuristic and clears the concatenation,
+the alpha folding (both regimes), the f32 view, and the `bf16` cast of `z`.
+
+So Tests §2's "on the gate shapes" is load-bearing, not incidental. The test now
+runs both gate checkpoints' real GDN dims (27B hidden 5120 / Hv48; 35B hidden
+2048 / Hv32) at T=1 and T=3, and its standing precondition is that N and K there
+are large enough that cuBLASLt needs no split-K to fill the device. If a future
+cuBLASLt or driver splits K at these shapes the case goes red, which is the
+correct signal: the two arms would then genuinely no longer be one arithmetic.
+
 ## Risks
 
 - **Scale folding changes numerics.** The gate is token-exactness against the
