@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "scripts/release_accelerator_metadata.py"
 BUILD_SCRIPT = ROOT / "scripts/build-linux-accelerator-release.sh"
+CUDA_STUB_PREP = ROOT / "scripts/prepare-cuda-driver-stub.sh"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 SMS = ["80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a"]
 
@@ -113,9 +115,57 @@ class AcceleratorMetadataContract(unittest.TestCase):
 
     def test_cuda_archive_smoke_resolves_only_the_external_driver_stub(self) -> None:
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("find -L /usr/local/cuda -type f -path '*/stubs/libcuda.so'", script)
-        self.assertIn("CUDA driver stub is required for archive smoke validation", script)
-        self.assertIn('export LD_LIBRARY_PATH="$cuda_stub_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"', script)
+        self.assertIn(
+            'scripts/prepare-cuda-driver-stub.sh /usr/local/cuda "$release_dir/cuda-driver-stub"',
+            script,
+        )
+        self.assertIn(
+            'export LD_LIBRARY_PATH="$cuda_stub_runtime_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+            script,
+        )
+
+    def test_cuda_driver_stub_preparation_adds_runtime_soname_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            versioned_root = scratch / "cuda-13.3"
+            stub = versioned_root / "targets/sbsa-linux/lib/stubs/libcuda.so"
+            stub.parent.mkdir(parents=True)
+            stub.write_bytes(b"external CUDA driver stub")
+            cuda_root = scratch / "cuda"
+            cuda_root.symlink_to(versioned_root, target_is_directory=True)
+            runtime_dir = scratch / "runtime"
+
+            result = subprocess.run(
+                ["bash", str(CUDA_STUB_PREP), str(cuda_root), str(runtime_dir)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(runtime_dir))
+            soname_alias = runtime_dir / "libcuda.so.1"
+            self.assertTrue(soname_alias.is_symlink())
+            self.assertEqual(soname_alias.resolve(strict=True), stub.resolve(strict=True))
+            self.assertFalse((stub.parent / "libcuda.so.1").exists())
+
+    def test_cuda_driver_stub_preparation_fails_without_external_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            cuda_root = scratch / "cuda"
+            cuda_root.mkdir()
+            result = subprocess.run(
+                ["bash", str(CUDA_STUB_PREP), str(cuda_root), str(scratch / "runtime")],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "CUDA driver stub is required for archive smoke validation",
+                result.stderr,
+            )
 
 
 if __name__ == "__main__":
