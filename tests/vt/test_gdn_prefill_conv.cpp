@@ -23,6 +23,7 @@ using vt::cuda::DispatchConvChannelTileLaunch;
 using vt::cuda::ConvChannelTileLaunchContractFor;
 using vt::cuda::GdnPostConvFastFlagIsOn;
 using vt::cuda::GdnPostConvSplitFlagIsOn;
+using vt::cuda::GdnPostConvTokenTileEligible;
 using vt::cuda::GdnPostConvTokenTileFlagIsOn;
 using vt::cuda::GdnPostConvTokenTileGridX;
 
@@ -176,6 +177,17 @@ TEST_CASE("VT_GDN_POSTCONV_TOKEN_TILE defaults OFF; a non-'0' value enables it")
   CHECK(GdnPostConvTokenTileFlagIsOn("1"));
   CHECK(GdnPostConvTokenTileFlagIsOn("on"));
   CHECK(GdnPostConvTokenTileFlagIsOn(" 0"));
+}
+
+TEST_CASE("GDN post-conv token tile requires both 128-wide heads") {
+  CHECK(GdnPostConvTokenTileEligible(false, "1", 128, 128));
+  CHECK_FALSE(GdnPostConvTokenTileEligible(false, "1", 128, 64));
+  CHECK_FALSE(GdnPostConvTokenTileEligible(false, "1", 64, 128));
+  CHECK_FALSE(GdnPostConvTokenTileEligible(false, "1", 64, 64));
+
+  CHECK_FALSE(GdnPostConvTokenTileEligible(true, "1", 128, 128));
+  CHECK_FALSE(GdnPostConvTokenTileEligible(false, nullptr, 128, 128));
+  CHECK_FALSE(GdnPostConvTokenTileEligible(false, "0", 128, 128));
 }
 
 TEST_CASE("GDN post-conv token tile covers each ceil(T/16) work item") {

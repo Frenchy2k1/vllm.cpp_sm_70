@@ -203,6 +203,17 @@ inline bool GdnPostConvTokenTileFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] != '0';
 }
 
+// Shared production eligibility contract for the token-tile kernel. The
+// explicit split experiment retains priority, and the token-tile indexing owns
+// exactly four 32-element feature groups per lane, so both Q/K and V head
+// widths must independently be 128. Unsupported shapes keep the existing
+// megablock/split dispatch.
+inline bool GdnPostConvTokenTileEligible(bool split, const char* env_value,
+                                         int64_t dk, int64_t dv) {
+  return !split && GdnPostConvTokenTileFlagIsOn(env_value) && dk == 128 &&
+         dv == 128;
+}
+
 inline constexpr int64_t kGdnPostConvTokenTileTokens = 16;
 
 inline constexpr int64_t GdnPostConvTokenTileGridX(int64_t tokens) {

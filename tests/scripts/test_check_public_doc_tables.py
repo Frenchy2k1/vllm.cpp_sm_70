@@ -475,7 +475,7 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            "chars": 243578,
+            "chars": 243455,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,

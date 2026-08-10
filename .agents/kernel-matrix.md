@@ -194,6 +194,20 @@ one-channel arm; that hypothesis is falsified. Portable 9/9·88, CUDA GDN
 67/67·4631 and paged-forward 4/4·8 pass. Arm 1 remains opt-in; generic Mamba
 lifecycle stays `INVENTORIED`.
 [Spike and result](specs/sm120-qwen35-conv-channel-tile-2026-08-08.md).
+**2026-08-09 `KERNEL-SSM-MAMBA` sm_120 campaign anchor.**
+[#206](https://github.com/mudler/vllm.cpp/issues/206) tracks the RTX 5070 Ti
+Qwen3.5-4B Pareto campaign. Reviewed atomic pretoken admission removed the
+frontend/batching confound; the corrected exact three-repetition comparison is
+**6831.71 vs 6643.40 tok/s (1.0283x)**, while TTFT, TPOT/ITL and E2E remain
+**1.0853x / 1.0165x / 1.0288x slower** and VRAM is **+118.7 MiB**. The exact
+default-OFF GDN decode BV16+swizzle+REGSTATE stack improves local throughput,
+TTFT, TPOT and E2E, and slack-only memset adds a smaller further local win.
+Two deeper candidates are closed: geometric argmax scratch merely moved wait
+from `cudaFree` to stream synchronization and regressed TPOT ~1%; BF16 vector
+writeback improved y800 only 0.143% with one losing raw leg. Both products/tests
+were removed while their specs and same-tool traces remain. Lifecycle stays
+`INVENTORIED`; generic Mamba and 27B/35B coverage are unchanged.
+[Campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
 
 ## Count invariants
 

@@ -27,6 +27,8 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #ifdef VLLM_CPP_CUDA
+#include <cuda_runtime_api.h>
+
 // Packed-decode debug counters (reg-tile vs legacy launch sub-counts) plus the
 // Triton AOT stats used by the chunked cases. Defined in cuda_gdn.cu, available
 // whenever the CUDA backend is built (the packed counters do not require Triton).
@@ -1862,6 +1864,120 @@ void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch,
   CheckClose(st_gpu, st_cpu, state_tol, state_tol);
 }
 
+struct GdnDecodeTestEnv {
+  const char* bv;
+  const char* swizzle;
+  const char* regstate;
+  const char* nw;
+};
+
+void SetOrUnsetEnv(const char* name, const char* value) {
+  if (value == nullptr)
+    unsetenv(name);
+  else
+    setenv(name, value, 1);
+}
+
+// Same-process schedule discriminator for the regular fused GDN decode path.
+// Output and the complete persistent state must remain byte-identical.
+void RunGdnDecodeExactCase(int64_t dv, DType io_dtype, DType state_dtype,
+                           bool indexed, const GdnDecodeTestEnv& incumbent,
+                           const GdnDecodeTestEnv& candidate, uint32_t seed) {
+  const int64_t n = indexed ? 3 : 2;
+  const int64_t slots = indexed ? 4 : n;
+  const int64_t hk = 1, hv = 2, dk = 128;
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+  const auto q = Pack(RandomF32(static_cast<size_t>(n * hk * dk), seed,
+                                -0.5f, 0.5f),
+                      io_dtype);
+  const auto k = Pack(RandomF32(static_cast<size_t>(n * hk * dk), seed + 1,
+                                -0.5f, 0.5f),
+                      io_dtype);
+  const auto v = Pack(RandomF32(static_cast<size_t>(n * hv * dv), seed + 2,
+                                -0.75f, 0.75f),
+                      io_dtype);
+  const auto g = RandomF32(static_cast<size_t>(n * hv), seed + 3, -0.5f,
+                           -0.01f);
+  const auto beta = RandomF32(static_cast<size_t>(n * hv), seed + 4, 0.1f,
+                              0.9f);
+  const auto state_initial =
+      Pack(RandomF32(static_cast<size_t>(slots * hv * dv * dk), seed + 5,
+                     -0.25f, 0.25f),
+           state_dtype);
+  const std::vector<int32_t> state_idx = {2, -1, 0};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  auto run = [&](const GdnDecodeTestEnv& env, std::vector<uint8_t>& out_bytes,
+                 std::vector<uint8_t>& state_bytes) {
+    SetOrUnsetEnv("VT_GDN_DECODE_NW", env.nw);
+    SetOrUnsetEnv("VT_GDN_DECODE_BV", env.bv);
+    SetOrUnsetEnv("VT_GDN_DECODE_SWIZZLE", env.swizzle);
+    SetOrUnsetEnv("VT_GDN_DECODE_REGSTATE", env.regstate);
+    DeviceTensor dq(gpu, gq.q, io_dtype, {n, hk, dk}, q.data());
+    DeviceTensor dkt(gpu, gq.q, io_dtype, {n, hk, dk}, k.data());
+    DeviceTensor dvt(gpu, gq.q, io_dtype, {n, hv, dv}, v.data());
+    DeviceTensor dg(gpu, gq.q, DType::kF32, {n, hv}, g.data());
+    DeviceTensor dbeta(gpu, gq.q, DType::kF32, {n, hv}, beta.data());
+    DeviceTensor dst(gpu, gq.q, state_dtype, {slots, hv, dv, dk},
+                     state_initial.data());
+    DeviceTensor dout(gpu, gq.q, io_dtype, {n, hv, dv});
+    if (indexed) {
+      DeviceTensor didx(gpu, gq.q, DType::kI32, {n}, state_idx.data());
+      vt::GdnDecode(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(),
+                    dvt.tensor(), dg.tensor(), dbeta.tensor(), dst.tensor(),
+                    args, &didx.tensor());
+    } else {
+      vt::GdnDecode(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(),
+                    dvt.tensor(), dg.tensor(), dbeta.tensor(), dst.tensor(),
+                    args);
+    }
+    out_bytes.resize(static_cast<size_t>(n * hv * dv) *
+                     vt::SizeOf(io_dtype));
+    state_bytes.resize(state_initial.size());
+    dout.Download(gq.q, out_bytes.data());
+    dst.Download(gq.q, state_bytes.data());
+  };
+
+  std::vector<uint8_t> out_incumbent, state_incumbent;
+  std::vector<uint8_t> out_candidate, state_candidate;
+  run(incumbent, out_incumbent, state_incumbent);
+  run(candidate, out_candidate, state_candidate);
+  unsetenv("VT_GDN_DECODE_REGSTATE");
+  unsetenv("VT_GDN_DECODE_SWIZZLE");
+  unsetenv("VT_GDN_DECODE_BV");
+  unsetenv("VT_GDN_DECODE_NW");
+  CheckBytesEqual(out_candidate, out_incumbent);
+  CheckBytesEqual(state_candidate, state_incumbent);
+
+  if (indexed) {
+    // The null request must write exact zero outputs and the unreferenced cache
+    // slot must remain byte-for-byte untouched in both schedules.
+    const size_t out_row_bytes =
+        static_cast<size_t>(hv * dv) * vt::SizeOf(io_dtype);
+    CHECK(std::all_of(out_candidate.begin() + static_cast<std::ptrdiff_t>(out_row_bytes),
+                      out_candidate.begin() + static_cast<std::ptrdiff_t>(2 * out_row_bytes),
+                      [](uint8_t byte) { return byte == 0; }));
+    const size_t state_row_bytes =
+        static_cast<size_t>(hv * dv * dk) * vt::SizeOf(state_dtype);
+    const auto untouched_begin =
+        state_candidate.begin() + static_cast<std::ptrdiff_t>(state_row_bytes);
+    CHECK(std::equal(untouched_begin,
+                     untouched_begin + static_cast<std::ptrdiff_t>(state_row_bytes),
+                     state_initial.begin() +
+                         static_cast<std::ptrdiff_t>(state_row_bytes)));
+  }
+}
+
+#ifdef VLLM_CPP_CUDA
+struct CudaGraphGuard {
+  cudaGraph_t graph = nullptr;
+  ~CudaGraphGuard() {
+    if (graph != nullptr) cudaGraphDestroy(graph);
+  }
+};
+#endif
+
 // Chunk-parallel prefill (VT_GDN_CHUNKED, default) vs the sequential scan
 // (VT_GDN_CHUNKED=0), same inputs, same binary. The chunked path is the M2
 // prefill perf kernel (cuda_gdn.cu GdnChunk*); it must reproduce the sequential
@@ -2639,15 +2755,14 @@ TEST_CASE("CUDA gdn_post_conv split kernel (VT_GDN_POSTCONV_SPLIT) matches megab
 //
 // `qkv` MUST be swept over {f32, bf16}, and a BF16-only sweep is NOT a gate on
 // the reduction order. bf16 keeps 8 mantissa bits, so `__float2bfloat16`
-// absorbs the ~1-ulp f32 movement that a reassociated q/k norm produces: the
-// FIRST reduction ordering tried for this kernel (summing the four lane-owned
-// squares sequentially) is recorded in
+// absorbs the ~1-ulp f32 movement a reassociated q/k norm produces: the FIRST
+// ordering tried for this kernel is recorded in
 // .agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md as having
-// CHANGED production tokens, and yet it differs on 0 of 11160 rows once stored
-// as bf16 while differing on 3580 of 20000 rows in f32. A bf16 `CHECK(q1 == q0)`
-// is therefore satisfied by an arithmetic the author already rejected. The f32
-// arm is what makes this a real byte-exactness gate rather than a tolerance one.
-void RunGdnPostConvTokenTileCase(int64_t t, int64_t hk, int64_t hv, DType qkv, uint32_t seed) {
+// CHANGED production tokens, yet it differs on 0 of 11160 rows once stored as
+// bf16 while differing on 3580 of 20000 rows in f32. A bf16 `CHECK(q1 == q0)`
+// is therefore satisfied by an arithmetic the author already rejected.
+void RunGdnPostConvTokenTileCase(int64_t t, int64_t hk, int64_t hv, DType qkv,
+                                 uint32_t seed) {
   constexpr int64_t dk = 128;
   constexpr int64_t dv = 128;
   const int64_t key_dim = hk * dk;
@@ -3387,6 +3502,165 @@ TEST_CASE("CUDA gdn decode matches CPU (real dims, batched multi-seq)") {
   RunGdnCudaCase({}, 8, 16, 32, 128, 128, kCudaCombos[0], 6300);  // f32 (the real GDN dtype)
   RunGdnCudaCase({}, 8, 16, 32, 128, 128, kCudaCombos[2], 6310);  // bf16 in/out
   RunGdnCudaCase({}, 5, 2, 2, 128, 128, kCudaCombos[0], 6320);    // GQA ratio 1, odd batch
+}
+
+TEST_CASE("CUDA fused GDN decode swizzle is byte-exact") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  constexpr GdnDecodeTestEnv linear{"16", "0", "0", "8"};
+  constexpr GdnDecodeTestEnv swizzled{"16", "1", "0", "8"};
+  RunGdnDecodeExactCase(128, DType::kBF16, DType::kBF16, false,
+                        linear, swizzled, 6350);
+  RunGdnDecodeExactCase(128, DType::kF32, DType::kF32, true,
+                        linear, swizzled, 6360);
+  RunGdnDecodeExactCase(37, DType::kBF16, DType::kF32, true,
+                        linear, swizzled, 6370);
+}
+
+TEST_CASE("CUDA fused GDN decode register-state schedule is byte-exact") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  constexpr GdnDecodeTestEnv shared{"16", "1", "0", "8"};
+  constexpr GdnDecodeTestEnv regstate{"16", "1", "1", "8"};
+  RunGdnDecodeExactCase(128, DType::kBF16, DType::kBF16, false,
+                        shared, regstate, 6380);
+  RunGdnDecodeExactCase(128, DType::kBF16, DType::kF16, true,
+                        shared, regstate, 6390);
+  RunGdnDecodeExactCase(128, DType::kF32, DType::kF32, true,
+                        shared, regstate, 6400);
+
+  // REGSTATE must preserve incumbent kernels whenever one production predicate
+  // fails. These cover partial Dv, unswizzled BV16, BV32, and NW4.
+  constexpr GdnDecodeTestEnv partial_shared{"16", "1", "0", "8"};
+  constexpr GdnDecodeTestEnv partial_reg{"16", "1", "1", "8"};
+  RunGdnDecodeExactCase(37, DType::kBF16, DType::kF32, true,
+                        partial_shared, partial_reg, 6410);
+  constexpr GdnDecodeTestEnv linear_shared{"16", "0", "0", "8"};
+  constexpr GdnDecodeTestEnv linear_reg{"16", "0", "1", "8"};
+  RunGdnDecodeExactCase(128, DType::kBF16, DType::kBF16, false,
+                        linear_shared, linear_reg, 6420);
+  constexpr GdnDecodeTestEnv bv32_shared{"32", "1", "0", "8"};
+  constexpr GdnDecodeTestEnv bv32_reg{"32", "1", "1", "8"};
+  RunGdnDecodeExactCase(128, DType::kF32, DType::kF32, false,
+                        bv32_shared, bv32_reg, 6430);
+  constexpr GdnDecodeTestEnv nw4_shared{"16", "1", "0", "4"};
+  constexpr GdnDecodeTestEnv nw4_reg{"16", "1", "1", "4"};
+  RunGdnDecodeExactCase(128, DType::kBF16, DType::kF32, false,
+                        nw4_shared, nw4_reg, 6440);
+}
+
+TEST_CASE("CUDA public GdnDecode binds decode layout to exact production geometry") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+#ifdef VLLM_CPP_CUDA
+  constexpr int64_t n = 2, hk = 1, hv = 2, dk = 128, dv = 128;
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+  const auto q = Pack(RandomF32(static_cast<size_t>(n * hk * dk), 6430,
+                                -0.5f, 0.5f),
+                      DType::kBF16);
+  const auto k = Pack(RandomF32(static_cast<size_t>(n * hk * dk), 6431,
+                                -0.5f, 0.5f),
+                      DType::kBF16);
+  const auto v = Pack(RandomF32(static_cast<size_t>(n * hv * dv), 6432,
+                                -0.75f, 0.75f),
+                      DType::kBF16);
+  const auto g = RandomF32(static_cast<size_t>(n * hv), 6433, -0.5f, -0.01f);
+  const auto beta = RandomF32(static_cast<size_t>(n * hv), 6434, 0.1f, 0.9f);
+  const auto state = RandomF32(static_cast<size_t>(n * hv * dv * dk), 6435,
+                               -0.25f, 0.25f);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  // All device and host allocations precede capture. The captured work is the
+  // actual public op call on the queue's production stream.
+  DeviceTensor dq(gpu, gq.q, DType::kBF16, {n, hk, dk}, q.data());
+  DeviceTensor dkt(gpu, gq.q, DType::kBF16, {n, hk, dk}, k.data());
+  DeviceTensor dvt(gpu, gq.q, DType::kBF16, {n, hv, dv}, v.data());
+  DeviceTensor dg(gpu, gq.q, DType::kF32, {n, hv}, g.data());
+  DeviceTensor dbeta(gpu, gq.q, DType::kF32, {n, hv}, beta.data());
+  DeviceTensor dst(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, state.data());
+  DeviceTensor dout(gpu, gq.q, DType::kBF16, {n, hv, dv});
+  gpu.Synchronize(gq.q);
+
+  struct ExpectedGeometry {
+    const char* bv_env;
+    const char* swizzle_env;
+    const char* regstate_env;
+    bool register_state;
+    unsigned grid_x;
+    unsigned block_x;
+    unsigned shared_bytes;
+  };
+  constexpr ExpectedGeometry cases[] = {
+      {nullptr, "1", "1", false, 4, 256, 17536},
+      {"16", "0", "1", false, 8, 128, 9280},
+      {"16", "1", "0", false, 8, 128, 9728},
+      {"16", "1", "1", true, 8, 128, 9728},
+      {"16", "1", "1x", false, 8, 128, 9728},
+      {"16", "1x", "1", false, 8, 128, 9280},
+      {"32", "1", "1", false, 4, 256, 17536},
+  };
+  const cudaStream_t stream = static_cast<cudaStream_t>(gq.q.handle);
+  setenv("VT_GDN_DECODE_NW", "8", 1);
+  void* shared_production_function = nullptr;
+  for (const auto& expected : cases) {
+    CAPTURE(expected.bv_env == nullptr ? "<unset>" : expected.bv_env);
+    CAPTURE(expected.swizzle_env);
+    CAPTURE(expected.regstate_env);
+    if (expected.bv_env == nullptr)
+      unsetenv("VT_GDN_DECODE_BV");
+    else
+      setenv("VT_GDN_DECODE_BV", expected.bv_env, 1);
+    setenv("VT_GDN_DECODE_SWIZZLE", expected.swizzle_env, 1);
+    setenv("VT_GDN_DECODE_REGSTATE", expected.regstate_env, 1);
+    CudaGraphGuard captured;
+    REQUIRE(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) ==
+            cudaSuccess);
+    vt::GdnDecode(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(),
+                  dg.tensor(), dbeta.tensor(), dst.tensor(), args);
+    REQUIRE(cudaStreamEndCapture(stream, &captured.graph) == cudaSuccess);
+    REQUIRE(captured.graph != nullptr);
+
+    size_t node_count = 0;
+    REQUIRE(cudaGraphGetNodes(captured.graph, nullptr, &node_count) == cudaSuccess);
+    REQUIRE(node_count == 1);
+    cudaGraphNode_t node = nullptr;
+    REQUIRE(cudaGraphGetNodes(captured.graph, &node, &node_count) == cudaSuccess);
+    REQUIRE(node_count == 1);
+    cudaGraphNodeType node_type = cudaGraphNodeTypeEmpty;
+    REQUIRE(cudaGraphNodeGetType(node, &node_type) == cudaSuccess);
+    REQUIRE(node_type == cudaGraphNodeTypeKernel);
+    cudaKernelNodeParams params{};
+    REQUIRE(cudaGraphKernelNodeGetParams(node, &params) == cudaSuccess);
+    if (expected.bv_env != nullptr &&
+        std::string(expected.bv_env) == "16" &&
+        std::string(expected.swizzle_env) == "1" &&
+        std::string(expected.regstate_env) == "0") {
+      shared_production_function = params.func;
+    }
+    if (expected.register_state) {
+      REQUIRE(shared_production_function != nullptr);
+      CHECK(params.func != shared_production_function);
+    }
+    CHECK(params.gridDim.x == expected.grid_x);
+    CHECK(params.gridDim.y == static_cast<unsigned>(n * hv));
+    CHECK(params.gridDim.z == 1);
+    CHECK(params.blockDim.x == expected.block_x);
+    CHECK(params.blockDim.y == 1);
+    CHECK(params.blockDim.z == 1);
+    CHECK(params.sharedMemBytes == expected.shared_bytes);
+  }
+  unsetenv("VT_GDN_DECODE_REGSTATE");
+  unsetenv("VT_GDN_DECODE_SWIZZLE");
+  unsetenv("VT_GDN_DECODE_BV");
+  unsetenv("VT_GDN_DECODE_NW");
+#endif
 }
 
 // vLLM's public mamba_ssm_cache_dtype accepts float16 independently of the

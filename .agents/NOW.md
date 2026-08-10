@@ -21,7 +21,7 @@ Work: exact chunks; opt-in sm_120 post-conv and K4 conv measured.
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **LANDED +1.31% c8**; 2.7% per-launch gap WITHDRAWN (kernels identical) | Glue 13.00% vs 11.37%: 2x SiLU + `CastF32` |
-| Qwen3.5-4B sm_120 | Exact 3.072x; post-conv 1.859x; K4 arm 1 exact/+6.44%; 256-channel falsified | Repeat A/B; gate models unavailable |
+| Qwen3.5-4B sm_120 | Exact; tput **1.0283x**. Slower: TTFT/TPOT/E2E **1.0853/1.0165/1.0288x**; VRAM +118.7 MiB | Profile first wave |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
 | SERVE-ASYNC-DENSE-MIRROR | **LANDED+VERIFIED** (`f9c969ae`): async mirror, dense Qwen3; SACRED 184/184 | Sibling scope one-liner |
@@ -54,7 +54,8 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
    transducer half is NOT in vLLM: separate call).
-3. **Qwen3.5-4B:** post-conv/K4 exact and opt-in; repeat A/B or divide gap.
+3. **Qwen3.5-4B #206:** exact, tput +2.83%; latency/VRAM open. Profile first
+   wave; argmax/writeback closed.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
