@@ -176,7 +176,7 @@ assume** (the maintainer decision, verbatim). Decision record:
 | Strix Halo / GTR9 Pro 128GB | gfx1151 | unified | M0/M1 **MET** (#41). Now: **verify the §3.1 fix, then M2** (§5.2) — the reference tier means a model runs with no further kernel written. Closest analogue to GB10, so the residency-policy question in §6 is yours |
 | Radeon 780M iGPU | gfx1103 | shared | M0/M1 **MET** (#41). Same §5.2 path, smaller models. Best position to find every place a "CUDA" assumption is really an "NVIDIA" assumption. A vLLM-ROCm oracle is unlikely on this board, so M4 stays PENDING there — fine, and to be said rather than papered over |
 | 4x 7900 XTX | gfx1100 | discrete | M0/M1 **MET** (#41, with the #132 caveat). Now **the kernel path**, since the reference tier cannot install on a dGPU and a model needs real kernels. The only board class that can host a vLLM-ROCm oracle for M4 and, later, multi-GPU TP — the backend already registers all four at `Device{kROCM, i}`. gfx1201 (2x R9700) is on the same discrete lane via PR #140 |
-| RX 9060 XT | gfx1200 | discrete | M0/M1 **MET** independently ([#41](https://github.com/mudler/vllm.cpp/issues/41)). **M4 MET for both models against a real vLLM-ROCm oracle** ([#269](https://github.com/mudler/vllm.cpp/issues/269), [.agents/specs/rocm-gfx1200-m2-correctness.md](../.agents/specs/rocm-gfx1200-m2-correctness.md)): both ran greedy with every op `VT_OP_PROVIDER_STATS=1`-reported `selected=vt-native` (no reference tier exists on a dGPU — full native coverage, not the zero-kernel path §5.2 describes), then checked against AMD's prebuilt `rocm/vllm:...gfx120X...` image. Gemma-3-1B-it: 48/48 tokens identical to the oracle. Qwen3-0.6B hit a genuine CPU-vs-ROCm near-tie flip — and the oracle sides with **ROCm**, deterministically (5/5); it is our own CPU backend that diverges from ground truth on that one prompt, not ROCm |
+| RX 9060 XT | gfx1200 | discrete | M0/M1 **MET** independently ([#41](https://github.com/mudler/vllm.cpp/issues/41)). **Gemma-3-1B-it: M4 MET, no caveat** — 48/48 tokens identical against TWO independent real vLLM-ROCm oracles on this board (a prebuilt AMD image and a from-source build at this project's own pinned commit `555967922`). **Qwen3-0.6B: one genuine near-tie prompt, not a defect** — our CPU and ROCm backends split, and so do the two real oracles (2-and-2), each internally deterministic; the reference itself doesn't hold still on this input, which is the strongest possible evidence it's a near-tie-robust-gate case, not a bug on either side ([#269](https://github.com/mudler/vllm.cpp/issues/269), [.agents/specs/rocm-gfx1200-m2-correctness.md](../.agents/specs/rocm-gfx1200-m2-correctness.md)) |
 
 These do not collide. Two people can be on M0/M1/M2 on unified parts while a
 third does the hipify pass, and the discrete board is what turns the result into
@@ -217,15 +217,23 @@ on all of them, with zero fallbacks, *is* the evidence, since a fallback
 literally cannot exist to hide behind. **MET on gfx1200** this way ([#269](https://github.com/mudler/vllm.cpp/issues/269)): both models ran greedy,
 all-native, token parity vs `--device cpu`.
 
-**Went further than M2 on gfx1200 the same day: a real vLLM-ROCm oracle**
-(AMD's prebuilt `rocm/vllm:...gfx120X...` Docker image — the practical answer
-to pip-vs-NixOS friction, since it needs no PyTorch/vLLM build at all).
-Gemma-3-1B-it: 48/48 tokens identical to the oracle, not just to our own CPU
-backend — genuine M4. Qwen3-0.6B surfaced a real near-tie between our CPU and
-ROCm backends, and checking it against the oracle **reversed the initial
-read**: the oracle deterministically (5/5) agrees with **ROCm**, not CPU — the
-CPU backend is the one that diverges from ground truth on that prompt, not
-ROCm. Full story: [.agents/specs/rocm-gfx1200-m2-correctness.md](../.agents/specs/rocm-gfx1200-m2-correctness.md).
+**Went further than M2 on gfx1200 the same day: two independent real
+vLLM-ROCm oracles**, Docker-based — the practical answer to pip-vs-NixOS
+friction, since neither needs a PyTorch/vLLM build on the host. Tier 1 is
+AMD's prebuilt `rocm/vllm:...gfx120X...` image (fast, vLLM 0.19.1, not this
+project's pin). Tier 2 builds this project's exact pinned commit
+(`555967922`) from source, inside `rocm/vllm-dev:base` (the same base image
+vLLM's own official Dockerfile.rocm uses) — ROCm 7.2.3 in that base matches
+this board's native build exactly, compiled clean in ~6.5 minutes.
+
+**Gemma-3-1B-it: 48/48 tokens identical against BOTH oracles** — genuine M4,
+no caveat. **Qwen3-0.6B: the two oracles disagree with each other** (0.19.1
+matches our ROCm; the exact pin matches our CPU), each internally
+deterministic (K=5, 5/5). That is direct proof this specific prompt is a
+genuine, version-sensitive near-tie in the reference implementation itself —
+not a defect in either of our backends, and not closeable by a strict
+token-exact bar on this input. Full story:
+[.agents/specs/rocm-gfx1200-m2-correctness.md](../.agents/specs/rocm-gfx1200-m2-correctness.md).
 
 ### 5.1 Known runtime issues on the #41 boards
 

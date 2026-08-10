@@ -1,9 +1,9 @@
-# ROCm gfx1200 (RX 9060 XT) — M2/M4: real-oracle-verified correct on Qwen3-0.6B and Gemma-3-1B-it
+# ROCm gfx1200 (RX 9060 XT) — M2/M4: Gemma-3-1B-it clean; Qwen3-0.6B is a genuine cross-version near-tie
 
 **Row:** `BACKEND-ROCM` (backend-matrix, `ACTIVE`).
 **Claim:** unclaimed — this spec documents a closed investigation, not a landed
-fix (there is nothing to fix — ROCm's output was correct all along; see
-Outcome, corrected 2026-08-10 once a real vLLM-ROCm oracle became available).
+fix. Gemma-3-1B-it is real-oracle-verified clean (M4). Qwen3-0.6B's one
+near-tie prompt is not a defect on either of our backends — see Outcome.
 **Issue:** [#269](https://github.com/mudler/vllm.cpp/issues/269).
 **Origin:** [issue #41](https://github.com/mudler/vllm.cpp/issues/41), the
 gfx1200 M0/M1 report, first M2 attempt on this board. Distinct defect from
@@ -16,30 +16,51 @@ M0/M1 independently MET on this board (separate report to #41).
 
 ---
 
-## Outcome (2026-08-10, corrected same day — see below)
+## Outcome (2026-08-10)
 
-**CORRECTION (2026-08-10, later same day): the conclusion below was wrong
-about which side is right.** It was written without a real oracle available
-(the "not attempted, hardware/environment-blocked" note further down was
-literal). A real vLLM-ROCm oracle was subsequently stood up on this exact
-board (§ Real-oracle verification) and it produces **`' 1000000'`
-deterministically, 5/5 runs** — the same output our own ROCm backend
-produces, and *not* the `Paris` output our own CPU backend produces. **ROCm
-was correct. CPU is the outlier on this input.** The near-tie mechanism
-described below (two backends landing on opposite sides of an extremely tight
-logit cluster) is still the right *mechanism*; what was wrong was the
-unstated assumption that CPU's answer was the ground truth to measure ROCm
-against. It wasn't — vLLM-the-reference is, per this project's own standing
-rule, and on this input vLLM agrees with ROCm. The paragraph below is kept
-verbatim as the mechanism analysis; read it with CPU and ROCm's roles
-reversed from how it frames them.
+### Gemma-3-1B-it: clean, unambiguous, real-oracle-verified — M4 met
 
-**A genuine, extremely tight near-tie that two backends resolve to opposite
-sides, amplified into visible garbage because the losing token happens to be
-content-free — original (partially superseded) framing follows:**
+Greedy (`--temperature 0`, `--max-tokens 8`), the same 6-prompt battery the
+SACRED Gemma-3 gate uses (`scripts/gemma3-oracle-capture.py`), full text and
+token ids, not just the last printed line:
+
+| Prompt | Our CPU | Our ROCm | vLLM 0.19.1 (prebuilt gfx120X image) | vLLM `555967922` (exact pin, built from source) |
+|---|---|---|---|---|
+| "The capital of France is" | ` Paris.\n\nThe largest city in France` | identical | identical | identical |
+| "The largest planet in our solar system is" | ` Jupiter, and it's a truly` | identical | identical | identical |
+| "Water boils at a temperature of" | ` 100 degrees Celsius.\n\n` | identical | identical | identical |
+| "The chemical symbol for gold is" | ` Au.\n\nThe chemical formula for gold` | identical | identical | identical |
+| "The first president of the United States was" | ` George Washington.\n\nThe second president of` | identical | identical | identical |
+| "Roses are red, violets are" | ` blue,\nI like to eat a` | identical | identical | identical |
+
+**48/48 tokens identical across all four sources**, including two independent
+real vLLM-ROCm installs on this exact board (a prebuilt AMD image and a
+from-source build at this project's own pinned commit). This is the first
+real exercise of the gemma `(1+w)` RmsNorm code path
+(`vt::RmsNorm{gemma=true}` — sandwich norms + QK-norm,
+`rocm_rmsnorm.hip:69-110`) plus GeGLU (`kGeluAndMul`/`rocm_ops.hip`) and the
+dual per-layer RoPE-theta routing on this board, and it never comes near a
+tie anywhere in the battery. No kernel changes needed or made. **M4, not just
+M2, genuinely met for this model on this board — no caveat.**
+
+### Qwen3-0.6B: not a kernel bug on either backend — a genuine, version-sensitive near-tie
 
 `Qwen3ForCausalLM` (Qwen3-0.6B bf16), prompt `'The capital of france is'`,
-greedy, `--temperature 0`. Final-position top-5 logits:
+greedy, `--temperature 0`, K=5 (all four sources below are internally
+deterministic — 5/5 identical each):
+
+| Source | Result |
+|---|---|
+| Our CPU backend | `' Paris. The capital of the United States'` |
+| Our ROCm backend | `' 1000000'` |
+| vLLM 0.19.1 (prebuilt gfx120X image) | `' 1000000'` — agrees with our ROCm |
+| vLLM `555967922` (exact pin, built from source, ROCm 7.2.3) | `' Paris. The capital of the United States'` — agrees with our CPU |
+
+**The real reference implementation does not agree with itself across its own
+versions on this input.** That is the decisive fact: this cannot be framed as
+"one of our backends is wrong," because the two things being compared *against*
+also disagree with each other. Final-position top-5 logits (our own two
+backends) explain the mechanism:
 
 | | #1 | #2 | #3 | #4 | #5 |
 |---|---|---|---|---|---|
@@ -51,9 +72,8 @@ each other on both backends (max logit ≈15). CPU resolves the cluster toward
 `Paris` by 0.0675 over its runner-up; ROCm resolves it toward `Ġ` (a bare
 leading-space token — content-free) by just 0.0102 over `Paris`. Picking a
 content-free token derails the rest of greedy decoding into out-of-distribution
-territory, which is why the completion reads as total garbage (` 1000000`)
-rather than a merely-different-but-plausible word — the mechanism is an
-ordinary near-tie flip, not a broken computation.
+territory, which is why the completion reads as total garbage (`' 1000000'`)
+rather than a merely-different-but-plausible word.
 
 **Per-layer activation drift** (L2 norm of the last token's hidden row after
 every decoder layer, CPU vs ROCm, same prompt):
@@ -96,7 +116,8 @@ higher. This is the textbook signature of ordinary bf16 rounding +
 reduction-order noise (hipBLASLt's GEMM accumulation order vs. CPU's fixed
 sequential order accumulating independently at every op), not a localized
 defect anywhere in the stack. It happens to be enough, by the final layer, to
-tip an unusually thin 0.07%-of-max-logit tie the other way.
+tip an unusually thin 0.07%-of-max-logit tie — and which way it tips depends
+on the exact kernel/version path, ours or vLLM's own.
 
 **What was ruled out along the way**, in order:
 1. The `is_cuda()`-vs-`is_cpu()` host-pointer-aliasing defect at
@@ -108,16 +129,9 @@ tip an unusually thin 0.07%-of-max-logit tie the other way.
    against the CPU oracle (see `scratch_diag_embed.cpp`, not for landing).
 3. A discrete localized op bug — the per-layer drift table above shows none;
    drift is present from layer 0 and grows uniformly.
-
-**No longer pending — a real oracle was stood up same-day.** The
-teacher-forcing decisive-measurement method
-(`scripts/qwen3-neartie-gap-transformers.py`) still hasn't been run (it wants
-the exact pinned vLLM commit `555967922`/0.26.0.dev0, and what's available
-here is a newer prebuilt AMD image, 0.19.1 — see below), but a direct greedy
-comparison against a genuinely independent, real vLLM-ROCm install on this
-same board is strictly stronger evidence than eyeballing logit margins, and
-it settles the question the logit-margin analysis above could only gesture
-at: which side of the tie is *actually* right.
+4. **"One implementation is simply correct"** — ruled out directly: the exact
+   same reference implementation, at two different points in its own history,
+   lands on both sides.
 
 **Debug instrumentation used, then reverted** (not landed, not left in the
 tree): two `VT_DEBUG_LOGITS=1` hooks in `sampler.cpp` (`greedy_argmax_host`
@@ -125,11 +139,14 @@ and the async `Sampler::forward` path — CPU and ROCm take different code
 paths by default, both needed instrumenting for a fair comparison) and one
 `VT_DEBUG_LAYERS=1` hook in `qwen3.cpp`'s `ForwardLayers` loop.
 
-## Real-oracle verification (2026-08-10)
+## Real-oracle setup (2026-08-10, reproducible)
 
-Docker was the practical path here — pip/PyTorch-vs-NixOS's non-FHS layout is
-what made earlier oracle attempts finicky, and Docker sidesteps it entirely.
-AMD ships a prebuilt image **explicitly targeting this arch family**:
+Docker was the practical path — pip/PyTorch-vs-NixOS's non-FHS layout is what
+made earlier oracle attempts finicky here, and Docker sidesteps it entirely.
+Two tiers, cheapest first:
+
+**Tier 1 — prebuilt, fast, close-but-not-pinned.** AMD ships an image
+explicitly targeting this arch family:
 
 ```sh
 docker pull rocm/vllm:rocm7.13.0_gfx120X-all_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1   # 10.8 GB
@@ -139,90 +156,73 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
   python3 -c '<vllm.LLM(...) offline-inference script>'
 ```
 
-`torch.cuda.get_device_properties(0).gcnArchName` inside the container reports
-`gfx1200` and `current_platform` resolves to `RocmPlatform` — a real,
-independent PyTorch/vLLM stack on the same silicon, not our own code twice.
-**Caveat, stated plainly:** this is vLLM **0.19.1**, not this project's
-pinned CUDA-oracle commit (0.26.0.dev0/`555967922`) — no gfx120X-targeted
-image exists yet at that pin (RDNA4 is too new). Treated as a first-pass
-"does a real oracle even agree with us at all" check, not a final SACRED gate;
-building the exact pinned commit from source for gfx1200 (no prebuilt path
-exists) is separate, unstarted follow-on work.
+**Tier 2 — exact pinned commit, built from source.** No gfx120X-targeted
+prebuilt exists at this project's pin (`555967922`, RDNA4 is too new for AMD
+to have shipped one), but `rocm/vllm-dev:base` — the same base image vLLM's
+own official `docker/Dockerfile.rocm` builds from — already carries ROCm
+7.2.3 (**matches this board's native build exactly**), PyTorch
+2.12.0+git6bbd260, and Triton 3.7.1 with `gfx1200` in `PYTORCH_ROCM_ARCH`.
+`requirements/rocm.txt` at the pin carries no torch/torchvision/torchaudio
+pin, so installing it does not clobber the base image's ROCm-built torch.
+Full recipe:
 
-**Qwen3-0.6B, prompt `'The capital of france is'`, greedy, K=5:** oracle
-outputs `' 1000000'` (`[220, 16, 15, 15, 15, 15, 15, 15]`) **every run,
-identical** — deterministic, not itself near a tie at the sampling level.
-Matches our ROCm backend exactly. Diverges from our CPU backend (`' Paris.
-The capital of the United States'`).
+```sh
+docker pull rocm/vllm-dev:base   # 10.4 GB
 
-**Gemma-3-1B-it, the same 6-prompt battery used above:** oracle output is
-**byte-identical to both of our backends on every prompt** (` Paris.\n\nThe
-largest city in France`, ` Jupiter, and it's a truly`, ` 100 degrees
-Celsius.\n\n`, ` Au.\n\nThe chemical formula for gold`, ` George
-Washington.\n\nThe second president of`, ` blue,\nI like to eat a`) — full
-text and token ids, not just the last printed line.
+cat > Dockerfile.rocm-oracle <<'EOF'
+FROM rocm/vllm-dev:base
+ENV PYTORCH_ROCM_ARCH=gfx1200
+ENV VLLM_TARGET_DEVICE=rocm
+ENV MAX_JOBS=6
+# setup.py imports setuptools_rust unconditionally; give it a real toolchain.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN git clone https://github.com/vllm-project/vllm.git /vllm-src
+WORKDIR /vllm-src
+RUN git checkout 555967922
+RUN python3 -m pip install --upgrade pip setuptools wheel setuptools-rust
+RUN python3 -m pip install -r requirements/rocm.txt
+RUN python3 -m pip install --no-build-isolation -v -e .
+EOF
+
+docker build -f Dockerfile.rocm-oracle -t vllm-rocm-oracle:555967922-gfx1200 .
+```
+
+Compiled clean in ~6.5 minutes (hipify reported **zero unsupported CUDA
+function calls**), producing `vllm-0.23.1rc1.dev1511+g555967922.rocm723` —
+the project's exact pinned vLLM commit, natively built for `gfx1200` on this
+board's own ROCm version. `torch.cuda.get_device_properties(0).gcnArchName`
+reports `gfx1200`, `current_platform` resolves to `RocmPlatform`, in both
+tiers.
 
 ## What this means for the row
 
-**M4, not just M2, is now real for a narrow but genuine slice.** Gemma-3-1B-it
-is real-oracle greedy-token-exact on gfx1200, 6/6 prompts. Qwen3-0.6B's ROCm
-output matches the real oracle too, deterministically — it is **our CPU
-backend**, not ROCm, that diverges from ground truth on this specific
-near-tie prompt. That CPU-side divergence is a new, separate, small open
-question (likely still ordinary bf16/reduction-order drift, just landing on
-the wrong side of an extremely tight cluster on this box's CPU kernel path —
-not established as a "bug" so much as an unresolved direction of a very
-narrow tie) — worth a note on the CPU backend somewhere, but it is not a
-ROCm-row defect and does not block this row.
+**Gemma-3-1B-it: M4 genuinely met, no caveat.** Real-oracle-verified,
+token-exact, two independent oracles including this project's own exact pin.
 
-## Broadening M2: `Gemma3ForCausalLM` (gemma-3-1b-it), 2026-08-10 — clean pass, no near-tie
-
-Same board (gfx1200, RX 9060 XT), same `build-hip` (no rebuild needed — already
-current), same `--device cpu` vs `--device auto` (`auto` resolves to
-`device=5`=`kROCM`, confirmed, not a silent CPU-reference-tier fallback: every
-op in the forward reports `selected=vt-native` under
-`VT_OP_PROVIDER_STATS=1`). Model: `unsloth/gemma-3-1b-it` (ungated mirror of
-the gated `google/gemma-3-1b-it` the SACRED gate uses; `model.safetensors`
-SHA-256 `3d4ef8d7…8516b6` matches the upstream blob hash exactly — same
-weights, different host). Config confirmed matching the sweep-gemma spec's
-expected shape: `head_dim=256`, `final_logit_softcapping=null`,
-`sliding_window=512`/pattern 6, dual rope theta (`rope_theta=1e6`,
-`rope_local_base_freq=1e4`).
-
-Greedy (`--temperature 0`, `--max-tokens 8`), the same 6-prompt battery the
-SACRED Gemma-3 gate uses (`scripts/gemma3-oracle-capture.py`):
-
-| Prompt | CPU vs ROCm |
-|---|---|
-| "The capital of France is" | identical (` Paris.\n\nThe largest city in France`) |
-| "The largest planet in our solar system is" | identical |
-| "Water boils at a temperature of" | identical |
-| "The chemical symbol for gold is" | identical |
-| "The first president of the United States was" | identical |
-| "Roses are red, violets are" | identical |
-
-**48/48 tokens identical, CPU vs ROCm.** This is the first real exercise of
-the gemma `(1+w)` RmsNorm code path (`vt::RmsNorm{gemma=true}` — sandwich
-norms + QK-norm, `rocm_rmsnorm.hip:69-110`) plus GeGLU
-(`kGeluAndMul`/`rocm_ops.hip`) and the dual per-layer RoPE-theta routing on
-this board, and unlike the Qwen3-0.6B M2 attempt above it hits **no near-tie
-anywhere in the battery** — a clean unanimous match rather than a coin-flip on
-an unusually tight cluster.
-
-**Upgraded to a real-oracle result same day** (§ Real-oracle verification):
-the independent vLLM-ROCm oracle matches all 6/6 prompts byte-identically too,
-not just our own two backends agreeing with each other. This is the stronger
-claim — M4, not just M2 — for this model on this board.
-
-No kernel changes were needed or made; this is a validation run only, done
-from a separate worktree against the already-built `build-hip` in the primary
-checkout.
+**Qwen3-0.6B: not a row defect, and not closeable by a strict token-exact
+gate on this specific prompt.** Four independent measurements — our CPU, our
+ROCm, and two different real vLLM versions — split 2-and-2, and the two real
+vLLM results are individually deterministic. That is direct, measured proof
+this input is a genuine near-arbitrary tie, not a bug in either of our
+backends or in either oracle. This is exactly the case
+[`near-tie-distributional-gate`](../verification.md) exists for: the right
+bar here is "our token is a member of the reference's own K-run/cross-version
+output set," not strict equality on one arbitrarily-chosen reference build.
+No kernel fix is owed on this row. This board joins the already-documented
+France/Italy Qwen3 near-tie (elsewhere in the project) as the same phenomenon
+class, now with the strongest possible confirmation: the reference itself
+doesn't hold still on it.
 
 ## Environment note (reproducibility)
 
 This board is accessed through `nix develop .#rocm-shell` (local, uncommitted
-`flake.nix` addition — see the M0/M1 report). `ROCM_PATH` is nixpkgs' `clr`
-output (has `lib/cmake/hip-lang`); hipBLAS/hipBLASLt/hipblas-common are merged
-into a small writable overlay at `~/.cache/vllm-cpp-rocm-overlay` because
-nixpkgs ships them as separate store paths. None of this affects the finding —
-it reproduces identically build-to-build, deterministic at `--temperature 0`.
+`flake.nix` addition — see the M0/M1 report) for the ROCm/HIP `build-hip`
+build itself; the oracle containers are unrelated to that and need no ROCm
+toolchain on the host beyond the kernel driver + `/dev/kfd`/`/dev/dri`.
+`ROCM_PATH` for `build-hip` is nixpkgs' `clr` output (has
+`lib/cmake/hip-lang`); hipBLAS/hipBLASLt/hipblas-common are merged into a
+small writable overlay at `~/.cache/vllm-cpp-rocm-overlay` because nixpkgs
+ships them as separate store paths. None of this affects either finding —
+both reproduce identically build-to-build, deterministic at
+`--temperature 0`.
