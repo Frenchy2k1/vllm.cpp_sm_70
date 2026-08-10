@@ -475,7 +475,13 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            "chars": 243578,
+            # 243578 -> 243479 (2026-08-10, `SAMPLE-LOGPROB-TOKEN-IDS`): the
+            # Sampling row bought its `logprob_token_ids` line by collapsing the
+            # beam-search wiring narrative in the same cell, so the ratchet fell
+            # by 92. The ceiling is lowered WITH it, in the same change, because
+            # a ceiling left above the ratchet is exactly the regrowth headroom
+            # the docstring above says this guard exists to deny.
+            "chars": 243479,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,
@@ -496,6 +502,25 @@ class StatusRatchet(unittest.TestCase):
                     "narrative instead, and lower this ceiling in the same "
                     "change that lowers the ratchet -- never the reverse",
                 )
+
+    def test_one_char_of_growth_on_the_LIVE_page_is_rejected(self) -> None:
+        """The other growth test grows a SYNTHETIC page by a whole ratchet.
+
+        That proves the comparison exists; it does not prove the cap is on the
+        boundary of the real page. Since the ratchet is re-pinned byte-tight on
+        every STATUS edit, the live page always sits exactly ONE character below
+        rejection, and that off-by-one is the only thing standing between "the
+        cap tracks the page" and "the cap trails it by a byte". So assert it on
+        the live text, and assert the message names both numbers -- an error
+        that says only "too big" cannot tell an author what to collapse.
+        """
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        cap = doc_tables.STATUS_RATCHET["chars"]
+        errors = doc_tables.status_errors(text + "x")
+        self.assertTrue(
+            any(f"chars is {len(text) + 1}" in error for error in errors), errors
+        )
+        self.assertTrue(any(f"{cap} ratchet" in error for error in errors), errors)
 
     def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
         # A ratchet parked well above the page it guards is not a ratchet: it

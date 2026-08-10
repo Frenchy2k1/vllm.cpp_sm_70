@@ -298,6 +298,16 @@ int InputBatch::add_request(const CachedRequestState& request) {
     num_logprobs[req_id] = *sp.logprobs == -1 ? vocab_size : *sp.logprobs;
   }
 
+  // logprob_token_ids (gpu_input_batch.py:443-444): the EXPLICIT vocab ids to
+  // score. Tracked separately from num_logprobs and, exactly as upstream, it
+  // does NOT populate num_logprobs — the sampler's `or` at sampler.py:86 is
+  // what makes the raw-logprobs snapshot fire for a request that sets only
+  // this. Absent for every request that leaves the field unset.
+  logprob_token_ids.erase(req_id);
+  if (sp.logprob_token_ids.has_value()) {
+    logprob_token_ids[req_id] = *sp.logprob_token_ids;
+  }
+
   // allowed_token_ids (gpu_input_batch.py:446-467). Lazily allocate the
   // [max_num_reqs][vocab] exclude mask; set the row all-TRUE (exclude) then clear
   // the allowed ids to FALSE (keep).
@@ -456,6 +466,21 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
   // computes no logprobs (byte-identical to before).
   md.max_num_logprobs = max_num_logprobs();
 
+  // logprob_token_ids (gpu_input_batch.py:934-951): re-key req_id -> req_INDEX
+  // over the LIVE batch, skipping any id no longer in req_id_to_index. Upstream
+  // leaves the field None when its own map is empty (`if self.logprob_token_ids:`
+  // at :936), and `if sampling_metadata.logprob_token_ids:` at sampler.py:114
+  // is false for BOTH None and {} — so an empty result stays unset here, which
+  // keeps the default request byte-identical.
+  if (!logprob_token_ids.empty()) {
+    std::map<int, std::vector<int32_t>> by_index;
+    for (const auto& [req_id, token_ids] : logprob_token_ids) {
+      const auto it = req_id_to_index.find(req_id);
+      if (it != req_id_to_index.end()) by_index[it->second] = token_ids;
+    }
+    if (!by_index.empty()) md.logprob_token_ids = std::move(by_index);
+  }
+
   // allowed_token_ids_mask (gpu_input_batch.py:924-932): None unless some request
   // restricts ids; else the dense [:num_reqs] EXCLUDE-mask rows.
   if (!no_allowed_token_ids() && !allowed_token_ids_mask.empty()) {
@@ -525,6 +550,7 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   min_p_reqs.erase(req_id);
   has_allowed_token_ids.erase(req_id);
   num_logprobs.erase(req_id);
+  logprob_token_ids.erase(req_id);  // gpu_input_batch.py:574
   min_tokens.erase(req_index);
   logit_bias.erase(req_index);
   logits_processors.erase(req_index);
@@ -688,8 +714,8 @@ void InputBatch::condense() {
     // ROAD-V1-C7 per-slot controls move with the row (gpu_input_batch.py
     // :819-830). min_p is an array; the index-keyed maps pop-and-reinsert; the
     // allowed-ids mask row is copied then the vacated row cleared. The req_id-
-    // keyed predicate sets (min_p_reqs / has_allowed_token_ids / num_logprobs)
-    // need no move — they survive reindexing.
+    // keyed predicate sets (min_p_reqs / has_allowed_token_ids / num_logprobs /
+    // logprob_token_ids) need no move — they survive reindexing.
     min_p_cpu[static_cast<size_t>(empty_index)] =
         min_p_cpu[static_cast<size_t>(last_req_index)];
     MoveDictValue(min_tokens, last_req_index, empty_index);

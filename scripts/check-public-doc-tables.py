@@ -485,7 +485,16 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    "chars": 243571,
+    #
+    # 2026-08-10 (`SAMPLE-LOGPROB-TOKEN-IDS`): the Sampling row owes the page a
+    # line for `logprob_token_ids` generative scoring, and it was paid for
+    # INSIDE the same cell. The beam-search paragraph was three clauses of
+    # how-it-is-wired narrative -- which driver, over which two engine seams,
+    # returning what relative to which other driver -- collapsed to its binding
+    # result plus its named residuals, with the wiring story kept in
+    # .agents/engine-matrix.md where it already lives. Net -92, re-pinned
+    # byte-tight.
+    "chars": 243479,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

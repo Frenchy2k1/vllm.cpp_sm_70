@@ -781,6 +781,23 @@ which carries no ggml or PyTorch dependency.
 it returns the same gathered shape a finite count returns, one entry per vocab id
 per position. (Over HTTP the OpenAI `logprobs` field keeps its own 0..5 range.)
 
+`SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead —
+vLLM's generative-scoring path, and what to reach for when you only need a few
+labels compared, since it avoids the full-vocab sort `logprobs=-1` costs:
+
+```cpp
+vllm::SamplingParams sp;
+sp.max_tokens = 1;
+sp.logprob_token_ids = std::vector<int32_t>{yes_id, no_id};  // `logprobs` unset
+```
+
+Each returned position then carries exactly those ids plus the sampled token,
+whose `rank` is still its rank over the WHOLE vocabulary, so it stays comparable
+across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
+`logprobs` as well is allowed only when it equals the id count, and the explicit
+ids win. This is a library-API field today — the OpenAI request field is not
+wired yet.
+
 ## Multimodal input (image, video, audio to text)
 
 Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:

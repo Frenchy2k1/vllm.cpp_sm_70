@@ -27,9 +27,17 @@
 // Task 2/3 host-array-then-op pattern. CPU is the correctness gate at T0; a
 // CUDA-Queue run is dgx-pending.
 //
-// DEFERRED (marked 1:1 stubs, see sampler.cpp): logprob_token_ids gather
-// (generative-scoring), spec-decode bonus-token (predict_bonus_token),
-// thinking-budget, and the logprobs_mode variants beyond raw_logprobs.
+// Step 8 has a SECOND form (`SAMPLE-LOGPROB-TOKEN-IDS`): when a request carries
+// `logprob_token_ids` (generative scoring), gather_specific_token_logprobs
+// returns the sampled token plus EXACTLY the requested vocab ids — padded to the
+// batch-wide width with -inf — with the sampled token's rank still over the FULL
+// vocab. It also drives whether the step-1 snapshot is taken at all
+// (sampler.py:86), and it WINS over a logprobs count when a request supplies
+// both (sampler.py:133-136).
+//
+// DEFERRED (marked 1:1 stubs, see sampler.cpp): spec-decode bonus-token
+// (predict_bonus_token), thinking-budget, and the logprobs_mode variants beyond
+// raw_logprobs.
 #ifndef VLLM_V1_SAMPLE_SAMPLER_H_
 #define VLLM_V1_SAMPLE_SAMPLER_H_
 
