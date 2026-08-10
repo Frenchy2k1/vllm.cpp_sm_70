@@ -87,6 +87,22 @@ weight, exactly as the BF16 leaf already mirrors it.
    same-binary and there is an in-binary rollback.
 5. `mixed_qkv`/`z` remain last-dim views of the merged output, as in the BF16 leaf.
 
+**As implemented, two design points the plan left open.** (a) The merged GEMM
+emits **f32** — the dtype the split `in_proj_qkv` GEMM already emits — so
+`mixed_qkv` is a byte-identical last-dim view. The split `in_proj_z` GEMM emits
+`GdnOutDType`, which is BF16 on the dense 27B, so on that arm `z` is a cast of
+the f32 view rather than a view: one extra elementwise launch per layer, and it
+rounds the SAME f32 product the split GEMM's epilogue would have rounded. Making
+the merged output BF16 instead would remove that launch but would silently move
+`mixed_qkv` from f32 to bf16 — a separate numeric lever (`VT_GDN_IN_BF16` applied
+to the fp8 branch) that owes its own token gate, and is deliberately NOT bundled
+here. (b) The BF16 leaf's `ShouldUseMergedGdnQkvz` is **not touched**: the FP8
+arm gets its own `ShouldUseMergedGdnFp8Qkvz` predicate, so the `GdnInDType() ==
+GdnOutDType()` requirement stays exactly where it was. Per-shard *weight* scales
+need not agree — each shard's folded alpha is applied per output column (folded
+into the GEMM scalar when equal, else through a resident alpha vector, mirroring
+`MergedFp8QkvD`); only the per-tensor *activation* scale must match bitwise.
+
 ## Risks
 
 - **Scale folding changes numerics.** The gate is token-exactness against the
