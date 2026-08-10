@@ -190,6 +190,17 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
                                                const std::string& layer_type,
                                                int64_t layer_idx);
 
+// The same load with an EXPLICIT presence probe — what `LoadQwen3_5Dense` calls
+// per layer. The resolver-only overload above answers `has` with a constant
+// `true`, which forces every routed projection down the compressed-tensors
+// spelling; a checkpoint that mixes namings (the ModelOpt `weight_scale_2` form,
+// or an FP8/BF16 projection next to an NVFP4 one) needs the real probe. Exposed
+// so the loader gate can drive a whole synthetic layer through the SAME routing
+// production takes.
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::function<bool(const std::string&)>& has,
+    const std::string& layer_type, int64_t layer_idx);
+
 // Full dense-model load across the given shards. Uses config.num_hidden_layers
 // and config.layer_types. Text path only — the vision tower (model.visual.*)
 // and image/video merger are DEFERRED (notes §0.1). The checkpoint's MTP
