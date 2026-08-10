@@ -118,6 +118,17 @@ inline bool FusedGateUpEnabled() {
 // marlin runs the 48-CTA grid at ~86us/call vs the MoE route's 128-CTA ~118us/call.
 // The MoE route's greedy anchor (our_ids) shifts at two exact bf16 ties, so the 32B
 // goldens were regenerated under dense-ON per the ratified-tie regen rule.
+// Fused shared-expert gate_up dense route (VT_MARLIN_DENSE_PAIR, default ON,
+// opt out with =0) — the sibling of MarlinDenseEnabled() for the ONE fused
+// gate_up sink, which was still taking the single-expert MoE-marlin route.
+inline bool MarlinDensePairEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MARLIN_DENSE_PAIR");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
 inline bool MarlinDenseEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_MARLIN_DENSE");
