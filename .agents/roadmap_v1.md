@@ -36,6 +36,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
+| [#314](https://github.com/mudler/vllm.cpp/issues/314) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE` glue half: `glm4`/`phi3` still hand-call add+RMSNorm instead of `vt::FusedChain` (split out of #299, which closed the merged-GEMM half only) | bug |
 | [#299](https://github.com/mudler/vllm.cpp/issues/299) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: 5 dense SwiGLU models bypass the MUST-route merged-GEMM seam with no stated blocker (spec [`fusion-dense-migrate.md`](specs/fusion-dense-migrate.md)) | bug |
 | [#298](https://github.com/mudler/vllm.cpp/issues/298) | `PERF-27B-LMHEAD-DSR` | `main` is RED on the `device-leakage` DSR ratchet: `PrepareLmHeadResident` added a 33rd `vt_ifdef` to the shared layer | bug |
 | [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |

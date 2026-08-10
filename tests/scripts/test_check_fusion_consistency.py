@@ -174,6 +174,52 @@ class GemmMergeDriftTests(unittest.TestCase):
             "brand_new_mlp_arch", gemm_merge_drift_models(scanned, allowlisted)
         )
 
+    def test_folded_dense_models_stay_folded(self) -> None:
+        # FUSION-DENSE-MIGRATE (issue #299) folded five plain dense SwiGLU MLPs onto
+        # layers::UnquantizedMlpGateUpMethod and DELETED their allowlist entries.
+        # Two distinct regressions must go RED here, not silently re-open the drift:
+        #   1. re-adding any of the five to the merged-GEMM allowlist, and
+        #   2. reverting a fold (the hand-rolled {MatmulBT[2I,H]; SiluAndMul} comes
+        #      back, so the TU is scanned again with no seam reference and drifts).
+        # A fully-folded TU has NO hand-call left, so it drops OUT of the scan
+        # entirely — that is the shape every earlier fold produced too, and it is
+        # exactly what makes (2) detectable.
+        folded = ("commandr", "glm4", "minicpm", "minicpm3", "phi3")
+        models = ROOT / "src/vllm/model_executor/models"
+        allowlisted = mod.allowlisted_names(
+            (ROOT / "scripts/merged-gemm-consistency-allowlist.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        scanned = mod.scan_models_gemm(models)
+        for stem in folded:
+            source = (models / f"{stem}.cpp").read_text(encoding="utf-8")
+            self.assertTrue(
+                mod.uses_merged_gemm_seam(source),
+                f"{stem}.cpp no longer references a shared merged-GEMM seam; the "
+                "FUSION-DENSE-MIGRATE fold was reverted",
+            )
+            self.assertNotIn(
+                stem,
+                allowlisted,
+                f"{stem} was folded onto the seam; putting it back on the "
+                "merged-GEMM allowlist re-opens tracked drift",
+            )
+            # Folded => no hand-rolled gated epilogue left in the TU.
+            self.assertNotIn(stem, scanned, f"{stem}.cpp hand-rolls a gated MLP again")
+
+    def test_refolded_model_reappearing_unfolded_would_fail(self) -> None:
+        # Mutation of (2) above: put a folded stem back into the scan with no seam
+        # and an allowlist that no longer names it — the checker must flag it.
+        allowlisted = mod.allowlisted_names(
+            (ROOT / "scripts/merged-gemm-consistency-allowlist.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        scanned = dict(mod.scan_models_gemm(ROOT / "src/vllm/model_executor/models"))
+        scanned["phi3"] = (1, False)  # the pre-fold shape
+        self.assertIn("phi3", gemm_merge_drift_models(scanned, allowlisted))
+
     def test_allowlist_is_load_bearing(self) -> None:
         # Emptying the allowlist must expose every in-tree unfolded model, and the
         # allowlist must suppress at least one the detector really sees.
