@@ -1340,18 +1340,25 @@ bf16 path that ran; `sm_110` fp8/fp4/CUTLASS remain DERIVED/NOT-YET. Other
 fan-out boards are build-supported only (no board here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
-**GDN Triton-AOT cubins are now vendored per-arch (2026-07-28).** The vendored
-Triton-AOT GDN fast-path cubins (the measured codegen-win packed decode plus the
-delta_h/chunk_o FLA kernels for Qwen3.6 GDN-hybrids) previously existed for GB10
-`sm_121a` ONLY. Because a cubin loads only on the SM it was built for
-and the cross-family arch builds ship `-DVLLM_CPP_TRITON=OFF`, GDN decode on
-other arches ran the slower spilling hand kernel. The full GDN AOT set is now
-regenerated and vendored for `sm_80/86/89/90a/100a` (`cuobjdump` shows real
-per-target SASS), so a `-DVLLM_CPP_TRITON=ON` single-arch build there selects
-the non-spilling path too — **DERIVED+BUILD-VERIFIED (testing-welcome):
-no non-`sm_121` board runs a GDN model here, so this is not a runtime
-GDN-decode-parity claim on any arch.** `sm_121a` is byte-unchanged (SACRED gate
-intact). Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
+**GDN Triton-AOT cubins are vendored per-arch (2026-07-28).** The GDN AOT set
+(packed decode + the delta_h/chunk_o FLA kernels) is vendored for
+`sm_80/86/89/90a/100a` as well as `sm_121a`; `cuobjdump` shows per-target SASS,
+and `sm_121a` is byte-unchanged (SACRED gate intact).
+
+**`VLLM_CPP_TRITON` defaults ON for every CUDA arch (#219).** `ON` when
+`VLLM_CPP_CUDA` is `ON`, `VLLM_CPP_TRITON_REGEN` is `OFF`, and every vendored
+tree passes the builder's drift/staleness checks; `OFF` otherwise, naming the
+condition. Arch COUNT is not a condition.
+
+**RISK of that default, DISCLOSED NOT MITIGATED.** It selects all five
+non-`sm_121a` trees unasked, yet only `sm_121a` is RUNTIME-VERIFIED; the rest
+stay **DERIVED+BUILD-VERIFIED (testing-welcome)** — no such board here runs a
+GDN model — and `sm_80` has open
+[#193](https://github.com/mudler/vllm.cpp/issues/193) (crashes, wrong GDN
+output) reported at Triton OFF, so not caused by this. `-DVLLM_CPP_TRITON=OFF`
+restores the hand kernels. Specs:
+[per-arch](../.agents/specs/triton-aot-per-arch.md),
+[default-on](../.agents/specs/triton-aot-default-on.md).
 
 **As of 2026-07-28, `sm_87` is also RUNTIME-VERIFIED (portable bf16 SYNC path) on
 real silicon — the SECOND non-GB10 runtime proof.** vllm.cpp was built
@@ -1982,18 +1989,16 @@ all four text Gemma MLPs fold onto a new shared GeGLU gate-up method
 serves BOTH activation families. Gemma is the strongest reuse proof because it has
 REAL committed goldens: see docs/BENCHMARKS.md for the DGX SACRED-gate results.
 
-**The 27B SACRED gate needs the production kernel build, and now says so.** The
-27B W4A4 acceptance gate (`tests/parity/test_qwen27_paged_engine.cpp`) reproduces
-the oracle's production continuation only when the binary carries BOTH the CUTLASS
-sm120a NVFP4 fp4xfp4 GEMM (`-DVLLM_CPP_CUTLASS_DIR=<cutlass 4.5.0+>`) and the
-vendored Triton-AOT GDN kernels (`-DVLLM_CPP_TRITON=ON`). Drop either and the
-engine falls back to the emulation-grade fp4 GEMM / hand GDN recurrence, which
-deterministically takes the other side of the documented tok6 whitespace near-tie
-and emits the `greedy_ids_emulation.npy` stream. Measured 2026-07-29 on GB10
-sm_121a from ONE source tree at main `d4492c03`: CUTLASS off + Triton off 234/235,
-CUTLASS on + Triton off 233/235, both on **235/235**. The gate now refuses to run
-in a build missing either flag and names the configuration, instead of reporting a
-token regression that is not there. The gate's own status is UNCHANGED and GREEN.
+**The 27B SACRED gate needs the production kernel build, and says so.** The 27B
+W4A4 gate (`tests/parity/test_qwen27_paged_engine.cpp`) reproduces the oracle's
+production continuation only with BOTH the CUTLASS sm120a NVFP4 fp4xfp4 GEMM
+(`-DVLLM_CPP_CUTLASS_DIR=<cutlass 4.5.0+>`) and the vendored Triton-AOT GDN
+kernels; without either, the engine falls to the emulation-grade fp4 GEMM / hand
+GDN recurrence, takes the other side of the tok6 whitespace near-tie and emits
+`greedy_ids_emulation.npy`. Measured 2026-07-29 on GB10 sm_121a from ONE tree at
+`d4492c03`: CUTLASS off + Triton off 234/235, CUTLASS on + Triton off 233/235,
+both on **235/235**. The gate refuses to run in a build missing either and names
+the configuration; Triton is now default-ON (#219). Status UNCHANGED and GREEN.
 
 ### Feature-gap map vs pinned vLLM 0.26 (2026-07-28)
 

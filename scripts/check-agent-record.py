@@ -318,7 +318,14 @@ ENGINE_PREFIXES = (
 # staged bundle. User-directed, issue #170; inventoried while its spike is
 # written, and no image, workflow or registry package is claimed by the bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 144
+# 145 since 2026-08-09: +`ENG-DOCS-SITE` (publish `docs/` as a GitHub Pages site
+# that mounts the existing markdown read-only rather than copying it — a real
+# distribution surface for the documentation, distinct from the binary and
+# container channels above and from the docs themselves, which it does not
+# modify). User-directed, issue #224; `READY` on its committed spec, and no
+# site, workflow or published page is claimed by the bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 145
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

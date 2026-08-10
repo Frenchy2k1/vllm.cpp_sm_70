@@ -463,12 +463,29 @@ STATUS_RATCHET = {
     # restatements). Every measured number and binding claim kept verbatim, and
     # re-pinned byte-tight after rebasing onto the newer page.
     #
-    # 2026-08-10 (SPEC-DSPARK): the DSpark paragraph moves from "grounded and
-    # inventoried" to the measured state (works on the 35B gate model, spec-on
-    # output token-identical to spec-off, speed not yet a win). Re-pinned
-    # byte-tight below after the merge, so the reduction cannot become untracked
-    # growth headroom.
-    "chars": 243582,
+    # 243584 since 2026-08-09 (measured 243584): #219 makes VLLM_CPP_TRITON a
+    # computed default, which the page owes one binding paragraph. It is paid
+    # for in the same change by collapsing the two paragraphs the flip
+    # supersedes -- the 2026-07-28 per-arch vendoring note, whose operative
+    # claim ("the cross-family arch builds ship -DVLLM_CPP_TRITON=OFF") the new
+    # default makes false, and the 27B SACRED-gate note, which spelled out a
+    # flag the build now sets for you. Both keep their binding result, their
+    # measured numbers and their links; only the superseded framing goes. Net
+    # -4 against the Tenstorrent page, re-pinned byte-tight so the reduction
+    # cannot become untracked growth headroom.
+    # 243578 since 2026-08-10 (measured 243578): the developer ruled Triton
+    # default-ON for EVERY CUDA arch, which the page owes a disclosure -- the
+    # default now enables five never-runtime-verified cubin trees, one of which
+    # (sm_80) has open #193. Paid for inside the same block it belongs to: the
+    # per-arch vendoring note and the default note were collapsed to their
+    # binding results and the RISK split out beside them, so the new claim costs
+    # the page nothing. Net -6, re-pinned byte-tight.
+    #
+    # 2026-08-10 (SPEC-DSPARK): the DSpark paragraph moves to the measured state
+    # (works on the 35B gate model, spec-on output token-identical to spec-off,
+    # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
+    # merge, so the reduction cannot become untracked growth headroom.
+    "chars": 243572,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
