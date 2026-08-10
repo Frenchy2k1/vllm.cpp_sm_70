@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Enforce finite review budgets for explicit repository path classes."""
+"""Enforce explicit path classification and the checker-evidence contract.
+
+The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10;
+see the note where they stood. What remains: every changed path must classify
+explicitly, binaries fail closed, a governance-checker change must carry
+executable mutation evidence, and product paths must arrive on a PR."""
 
 from __future__ import annotations
 
@@ -42,31 +47,19 @@ PATH_CLASSES = frozenset(
         "generated",
     }
 )
-PATH_CLASS_BUDGETS = {
-    "product": 900,
-    "governance_checker": 6000,
-    "governance_test": 3000,
-    "governance_support": 1800,
-    "policy": 1200,
-    "procedure": 3000,
-    "append_only_record": 5000,
-    "project_record": 4000,
-    "public_document": 2500,
-    "design": 1500,
-    "ci": 800,
-    "configuration": 800,
-    "asset": 3000,
-    "evidence": 8000,
-    "vendored_dependency": 8000,
-    # A REVIEW budget is a budget on what a human reads. Nobody reads a hex blob,
-    # and re-deriving one by eye is not review. These files are emitted by a
-    # tracked generator from reviewed sources, and a dedicated gate reproduces
-    # them BYTE-FOR-BYTE from those sources on every push, so their correctness is
-    # established mechanically rather than by reading the diff. The reviewable
-    # surface is the GENERATOR and its INPUTS, both of which stay `product` or
-    # `governance_checker` and keep their own tighter budgets.
-    "generated": 8000,
-}
+# NO LINE BUDGET. The per-class budgets that used to live here were retired on
+# 2026-08-10 by developer decision, on measured grounds: over the last 22 merged
+# PRs the `product` budget of 900 lines was exceeded by 9 of them (41%), and
+# tests were 33-57% of the diff in every large one. A gate that fires on four
+# changes in ten is not a budget, it is noise that teaches people to waive it,
+# and charging RED-first mutation tests against the same allowance as kernel
+# code penalised exactly the discipline the rest of this document demands.
+# Reviewability is now a review judgement, not an arithmetic one.
+#
+# Everything else this checker enforces is unchanged and is NOT a size rule:
+# explicit path classification (no blanket directory exemptions), the
+# fail-closed binary guard, the checker-change mutation-evidence contract, and
+# the role checks that keep product paths on a PR.
 
 # Machine-generated artifacts, each of which MUST be (a) emitted by a tracked
 # generator in this repository, (b) reproduced byte-for-byte by a gate that runs
@@ -447,7 +440,6 @@ def change_errors(
     waiver_scope: str = "",
 ) -> list[str]:
     errors: list[str] = []
-    totals = {path_class: 0 for path_class in PATH_CLASSES}
     changed_paths = {change.path: change for change in changes}
     for change in changes:
         try:
@@ -456,9 +448,8 @@ def change_errors(
             errors.append(str(exc))
             continue
         if change.lines is None:
-            errors.append(f"binary change {change.path!r} has no reviewable line budget")
+            errors.append(f"binary change {change.path!r} is not reviewable as text")
             continue
-        totals[path_class] += change.lines
         if path_class == "governance_checker":
             evidence = recognized_evidence(change.path)
             evidence_change = changed_paths.get(evidence)
@@ -486,23 +477,6 @@ def change_errors(
                     errors.append(
                         f"BASE checker stayed green for {change.path!r}; changed test is not semantic evidence"
                     )
-    for path_class in sorted(PATH_CLASSES):
-        budget = PATH_CLASS_BUDGETS[path_class]
-        if totals[path_class] > budget:
-            applicable = [
-                waiver
-                for waiver in waivers
-                if waiver.checker == SELF_CHECKER and waiver.scope == waiver_scope
-            ]
-            if len(applicable) > 1:
-                raise ValueError(
-                    f"duplicate applicable waivers for {SELF_CHECKER} {waiver_scope}"
-                )
-            if applicable:
-                continue
-            errors.append(
-                f"{path_class} changes total {totals[path_class]} lines, over the {budget}-line budget"
-            )
     return errors
 
 
