@@ -236,9 +236,10 @@ above and a larger change. Not a ceiling, an unclaimed lever.
 
 ### Correctness
 
-- Mechanism gate `tests/test_load_direct_upload` **14/14, 178 assertions**: the
-  6 borrow-mechanism cases, 4 post-upload residency cases, 3 fp4-resident cases,
-  and 1 general-branch RSS-reclaim case. RED under eleven mutations of the tree
+- Mechanism gate `tests/test_load_direct_upload` **14/14, 183 assertions** (178
+  through round 4; round 5 added five to the RSS-reclaim case's runtime allocator
+  guard, no case-count change): the 6 borrow-mechanism cases, 4 post-upload
+  residency cases, 3 fp4-resident cases, and 1 general-branch RSS-reclaim case. RED under eleven mutations of the tree
   it guards, with the tree md5-verified restored and re-GREEN after each. EVERY
   count below was measured on THIS tree (rebased on `5023adec`), one mutation at
   a time, rebuilding the binary each time and aborting if the build failed — a
@@ -285,6 +286,27 @@ above and a larger change. Not a ceiling, an unclaimed lever.
   the sbrk arena (`M_MMAP_MAX=0`, trim off, a guard allocation above the mirror)
   so `free()` cannot return the pages by itself and pass the mutant. Linux +
   glibc only, `#if`-guarded: the mechanism is a glibc allocator behavior.
+- That `#if` proves the HEADERS are glibc's, not that glibc's ALLOCATOR is the
+  one running — under an LD_PRELOADed jemalloc/tcmalloc the `mallopt` calls are
+  inert and `free()` may purge or munmap the block itself, which would let the
+  deleted-madvise mutant pass. The case therefore carries a RUNTIME guard: before
+  it measures anything it allocates a block the same way, frees it, and requires
+  the interior pages to stay MAPPED (`mincore` would fail `ENOMEM` after a
+  munmap) and RESIDENT. Simulating a purging allocator turns that guard RED —
+  1 case / 1 assertion, the same case — so it is not vacuous.
+- A PROCESS-LIFETIME SIDE EFFECT REMAINS, recorded rather than removed. Every
+  `mallopt` that touches a threshold sets glibc's `no_dyn_threshold`, which no
+  destructor can clear: the thresholds stop adapting for the rest of the process,
+  pinned at the documented defaults `~ScopedArenaOnlyMalloc` restores. It is NOT
+  specific to `M_TRIM_THRESHOLD`, so dropping that call would not have removed
+  the coupling — MEASURED on glibc 2.39 by probing whether freeing a 1 MiB
+  mmap'd block still raises `mmap_threshold`, read off `mallinfo2().hblks` for
+  the next 1 MiB allocation: no mallopt -> LIVE (`hblks` 1 then 0);
+  `M_TRIM_THRESHOLD` set-then-restored -> DISABLED (1 then 1); `M_MMAP_MAX`
+  set-then-restored -> DISABLED (1 then 1). `M_MMAP_MAX=0` is load-bearing here,
+  so the flag is unavoidable for this observation. No cross-case effect was
+  observed across 30 randomized-order runs, and this is the only case in the
+  suite that reads residency at all.
 - Linux-only assumption, recorded rather than hidden: every `== 0` assertion in
   the residency section rests on `MADV_DONTNEED` DISCARDING a private anonymous
   mapping's contents. That is Linux semantics; on the BSDs and macOS the advice
@@ -294,7 +316,7 @@ above and a larger change. Not a ceiling, an unclaimed lever.
 - The `qwen3_5.cpp` duplicate of `ResidentNvfp4` sits in an anonymous namespace
   inside an 8.5k-line translation unit, so no test can call it. It is held to
   the same invariant structurally by `scripts/check-fp4-resident-consistency.py`
-  (mutation suite `tests/scripts/test_check_fp4_resident_consistency.py`, **27
+  (mutation suite `tests/scripts/test_check_fp4_resident_consistency.py`, **42
   cases**). The invariant is checked PER BUFFER, inside each buffer's own
   `if (!w.d_<buf>)` upload block. It was NOT: the first version matched
   `AddDeviceUpload` body-wide, so one surviving call satisfied both buffers and
@@ -306,15 +328,43 @@ above and a larger change. Not a ceiling, an unclaimed lever.
   upload to `pb`, `w.packed.d_dev = nullptr`, `AdoptDeviceBytesAsHost(d.b,
   other.packed)`, copying `w.packed.bytes.data()` into the scale buffer,
   dropping only the packed adoption, dropping only the scale publication.
+- A DELETION DOES NOT HAVE TO LOOK LIKE ONE, and matching RAW source meant it
+  passed. The clause matchers now run on `checker_text.normalize_source`, which
+  blanks `//` and `/* */` comments, `#if 0` / `#if false` regions and
+  `if (false)` / `if (0)` branches IN PLACE — offsets and line numbers survive,
+  which the ordering clauses and the `file:line` report need. `strip_comments`
+  already existed as two byte-identical private copies (in
+  `check-runner-routing-consistency.py` and `check-surface-coverage.py`); both
+  now import the shared helper rather than a third copy being written. MEASURED
+  against the LIVE `qwen3_5.cpp` on disk, one mutation at a time, tree
+  md5-verified restored after each (`35b5ea250f490105d579f4ffb573aa36` before and
+  after all eleven) — old checker exit / new checker exit: delete the packed
+  adoption 1/1; `//` it out 0/1; `/* */` it out 0/1; `#if 0` around it 0/1;
+  `if (false)` around it 0/1; `//` the packed upload counter 0/1; `//` the packed
+  `d_dev` publication 0/1; `#if 0` around that publication 0/1; `if (false)`
+  around it 0/1; move the packed adoption ABOVE its `Copy` 0/1.
+- Clause (f) READ-FIRST closes the ordering half: (c) PUBLISH had to precede
+  (d) ADOPT, but (b) COPY did not, so hoisting `AdoptDeviceBytesAsHost` above
+  `d.b.Copy(...)` passed. The adoption re-points `w.<buf>.bytes` at the device
+  allocation and releases the consumed source pages, so the upload then reads
+  pages already handed back — the reviewer's equivalent mutation of the SHARED
+  copy goes red at run time in 2 cases / 3 assertions.
 - WHAT THAT CHECKER DOES NOT DO, stated so the record does not imply more: it is
-  a STRUCTURAL check over text. It proves the six statements are present, bound
-  to the right buffer of this function's own weight parameter, and in the right
-  order. It cannot prove they are correct at run time — that the published
-  pointer is the uploaded one, that the byte count matches the allocation, that
-  the copy moved the right bytes. **The `qwen3_5.cpp` duplicate is guarded
-  against DELETION and gross substitution, not against corruption.** Run-time
-  proof exists only for the shared copy; extending it to the duplicate means
-  making it reachable, which is the unification refactor this row does not
+  a STRUCTURAL check over text. It proves the six statements are present in code
+  the compiler KEEPS, bound to the right buffer of this function's own weight
+  parameter, and that the adoption follows both the copy and the publication. It
+  cannot prove they are correct at run time — that the published pointer is the
+  uploaded one, that the byte count matches the allocation, that the copy moved
+  the right bytes. **The `qwen3_5.cpp` duplicate is guarded against DELETION —
+  including deletion disguised as a comment, an `#if 0`, or a never-taken branch
+  — against gross substitution, and against mis-ordering; not against
+  corruption.** It does NOT model the preprocessor: extending the normalization
+  to arbitrary `#ifdef` conditions is DECLINED, because a region under
+  `#ifdef VT_CUTLASS_NVFP4` is a real build configuration rather than a disguised
+  deletion and deciding it needs the build's macro state — pinned in that
+  direction, `#ifdef` around the live adoption stays exit 0 in both checkers.
+  Run-time proof exists only for the shared copy; extending it to the duplicate
+  means making it reachable, which is the unification refactor this row does not
   attempt.
 - GB10 Vulkan build, device asserted from the printed BACKEND PROOF line (not
   from an env var — `VLLM_CPP_DEVICE` is read nowhere in the tree):
@@ -441,9 +491,11 @@ refs are what got copied forward twice.
 moved, md5-verified after every mutation). CLEAN Release build, `mudler-ubuntu-box`
 dev box, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=ON` (`CMakeCache` verified),
 **Vulkan = llvmpipe**, which is a correctness device and proves nothing about
-speed. Round 4 re-ran all of these on the branch rebased onto `5023adec`:
+speed. Round 4 re-ran all of these on the branch rebased onto `5023adec`; the
+numbers below are ROUND 5's own re-run, on the branch rebased onto `a0fa12c7`:
 
-- `test_load_direct_upload` **14/14, 178 assertions**;
+- `test_load_direct_upload` **14/14, 183 assertions** (178 at `d1fe55ef`; the
+  five added are the RSS-reclaim case's runtime allocator guard);
 - `test_safetensors` **34/34 (79)**; `test_qwen36_weights` **7/7 (45)** (the
   35B-shard cases skip on this box, so 7/7 here is a skip and not a pass;
   `in_proj_qkv_fp8` did not go red on this build);
@@ -451,9 +503,16 @@ speed. Round 4 re-ran all of these on the branch rebased onto `5023adec`:
   **11/11 (132)**; `test_opt_paged_engine` **6/6 prompts token-exact (96/96),
   0 declines, device type 3** from the printed BACKEND PROOF line (`all 9 OPT
   ops dispatched on device type 3 with 0 declines`);
-- `scripts/gen-vulkan-spirv.py --check`: `committed SPIR-V is up to date`;
+- `scripts/gen-vulkan-spirv.py --check`: `committed SPIR-V is up to date`, run
+  with the pinned `~/tools/glslang-16.5.0/bin/glslang` on `PATH`. Without it the
+  script exits **1** (`no GLSL->SPIR-V compiler found`) on this tree, so the
+  green above is a real compile-and-compare, not a skip;
 - `scripts/agent-preflight.sh --quiet`: **all gates green**, including
-  `check-fp4-resident-consistency` and its now-**27**-case mutation suite.
+  `check-fp4-resident-consistency` and its now-**42**-case mutation suite, plus
+  the new **33**-case `test_checker_text` for the shared normalization (wired
+  into both `agent-preflight.sh` and `.github/workflows/ci.yml`).
+  `test_check_runner_routing_consistency` **31/31** and
+  `test_check_surface_coverage` **46/46** green on the shared helper.
 
 **NOT run for this follow-up, stated plainly:** GB10, CUDA, and both SACRED
 paged-engine gates. The change compiles into exactly one test binary, so a CUDA
