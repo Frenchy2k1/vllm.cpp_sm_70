@@ -522,7 +522,16 @@ SamplingParams CompletionRequest::to_sampling_params(
   sp.prompt_logprobs =
       prompt_logprobs.has_value() ? prompt_logprobs : (echo ? logprobs : std::nullopt);
   sp.ignore_eos = ignore_eos;
-  sp.max_tokens = max_tokens.has_value() ? max_tokens : default_max_tokens;
+  // A non-positive max_tokens means "no client-side limit": Hermes and some
+  // OpenAI clients send -1 for that. It is UNSET, not a number -- the engine
+  // then generates to max_model_len - seq_len (v1/engine/input_processor.cpp,
+  // mirroring vllm input_processor.py:317-321). Substituting any constant here
+  // would silently truncate exactly the long-context request that asked to be
+  // left unlimited, and PostInit rejects <1, which is what made a clamp look
+  // necessary.
+  sp.max_tokens = (max_tokens.has_value() && *max_tokens > 0)
+                      ? max_tokens
+                      : default_max_tokens;
   sp.min_tokens = min_tokens;
   sp.skip_special_tokens = skip_special_tokens;
   sp.spaces_between_special_tokens = spaces_between_special_tokens;
@@ -567,7 +576,9 @@ SamplingParams ChatCompletionRequest::to_sampling_params(
   // (chat_completion/serving.py:299).
   std::optional<int> req_max =
       max_completion_tokens.has_value() ? max_completion_tokens : max_tokens;
-  sp.max_tokens = req_max.has_value() ? req_max : default_max_tokens;
+  // Same rule as the completions path above: non-positive means UNSET.
+  sp.max_tokens =
+      (req_max.has_value() && *req_max > 0) ? req_max : default_max_tokens;
   sp.min_tokens = min_tokens;
   sp.skip_special_tokens = skip_special_tokens;
   sp.spaces_between_special_tokens = spaces_between_special_tokens;
