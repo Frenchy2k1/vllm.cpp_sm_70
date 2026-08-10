@@ -342,8 +342,17 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   if (want_logprobs) {
     if (*num_logprobs == -1) {
       // Full unsorted/unranked raw logprobs (upstream LogprobsTensors(empty,
-      // raw_logprobs, empty)). Minimal 1:1 form: the [n, vocab] raw logprobs
-      // with empty ids/ranks. The OutputProcessor slicing is M1.8.
+      // raw_logprobs, empty), sampler.py:122-125). Minimal 1:1 form: the
+      // [n, vocab] raw logprobs with empty ids/ranks.
+      //
+      // UNREACHABLE, exactly as upstream's is: max_num_logprobs comes from
+      // InputBatch::num_logprobs, whose values add_request already widened from
+      // `-1` to vocab_size (gpu_input_batch.py:434-440), so a live request for
+      // "all logprobs" arrives here as a concrete count and takes the gather
+      // below. Kept because upstream keeps it; a caller that hand-builds
+      // SamplingMetadata can still reach it. Note the shape differs from the
+      // gathered one — ids and ranks are empty — so any NEW consumer must
+      // branch on it rather than index blindly (issue #231).
       LogprobsTensors lt;
       lt.num_positions = static_cast<int>(n);
       lt.num_tokens_per_position = static_cast<int>(vocab);

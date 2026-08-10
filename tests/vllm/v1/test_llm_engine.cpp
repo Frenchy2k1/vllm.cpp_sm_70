@@ -27,6 +27,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -1047,5 +1048,68 @@ TEST_CASE("llm_engine: async depth-2 serving generates past ignore_eos (no corru
     REQUIRE(r.finished);
     REQUIRE(r.outputs.size() == 1);
     CHECK(static_cast<int>(r.outputs[0].token_ids.size()) == 16);  // ran to cap
+  }
+}
+
+// ─── 8. logprobs=-1 reaches the client intact (issue #231) ───────────────────
+// "All logprobs". The sampler has a `num_logprobs == -1` branch that returns a
+// raw-vocab LogprobsTensors with EMPTY ids and ranks (1:1 sampler.py:122-125),
+// and LogprobsProcessor::UpdateSampleLogprobs indexes all three arrays — so a
+// live request that reached that branch segfaulted. Upstream never reaches it,
+// because gpu_input_batch.py:434-440 widens the sentinel to vocab_size at
+// admission; we propagated it instead.
+//
+// RED before the widening: SIGSEGV inside UpdateSampleLogprobs.
+TEST_CASE("llm_engine: logprobs=-1 returns a full-vocab logprobs dict") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 3;
+
+  Harness h(c, w, tok);
+  SamplingParams sp = Greedy(kN);
+  sp.logprobs = -1;  // all
+  const RequestOutput r = h.engine.generate(std::string("hello"), sp, "req");
+
+  REQUIRE(r.finished);
+  REQUIRE(r.outputs.size() == 1);
+  REQUIRE(r.outputs[0].logprobs.has_value());
+  REQUIRE(r.outputs[0].logprobs->size() == static_cast<std::size_t>(kN));
+
+  for (std::size_t i = 0; i < r.outputs[0].logprobs->size(); ++i) {
+    const vllm::LogprobsOnePosition& pos = (*r.outputs[0].logprobs)[i];
+    // "All" means every vocab entry is present, exactly once.
+    CHECK(pos.entries.size() == static_cast<std::size_t>(kVocab));
+    // The sampled token carries its own rank, and the row is a distribution.
+    const vllm::Logprob* self = pos.find(r.outputs[0].token_ids[i]);
+    REQUIRE(self != nullptr);
+    CHECK(self->rank == 1);  // greedy -> the sampled token IS the argmax
+    double mass = 0.0;
+    for (const auto& [tid, lp] : pos.entries) {
+      (void)tid;
+      mass += std::exp(static_cast<double>(lp.logprob));
+    }
+    CHECK(mass == doctest::Approx(1.0).epsilon(1e-4));
+  }
+}
+
+// A finite count is unchanged by the widening: k+1 entries, deduped when the
+// sampled token is itself in the top-k. Guards the ordinary path against a
+// regression in the same edit.
+TEST_CASE("llm_engine: a finite logprobs count is unaffected by the -1 widening") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  SamplingParams sp = Greedy(3);
+  sp.logprobs = 2;
+  const RequestOutput r = h.engine.generate(std::string("hello"), sp, "req");
+
+  REQUIRE(r.outputs.size() == 1);
+  REQUIRE(r.outputs[0].logprobs.has_value());
+  for (const vllm::LogprobsOnePosition& pos : *r.outputs[0].logprobs) {
+    CHECK(pos.entries.size() >= 1);
+    CHECK(pos.entries.size() <= 3);  // sampled + 2, deduped
   }
 }
