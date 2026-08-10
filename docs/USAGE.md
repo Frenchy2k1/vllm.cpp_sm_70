@@ -63,6 +63,20 @@ requested value — but it sent a contributor looking in the wrong place
 ([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
 gencode line remains the ground truth if you want to double-check.
 
+## Using more than one engine in a process
+
+Constructing a `LoadedEngine`, destroying it, and constructing another in the
+same process is supported, including on CUDA. Each engine's device-resident MoE
+and Marlin constants are owned by the weights they describe and are released
+with them.
+
+Before, that state lived in process-lifetime caches keyed on the *address* of a
+weights block, so a second engine could land on a freed block's address and
+reuse device pointers that had already been freed. Nothing crashed — the CUDA
+context is never torn down, so the pointers stayed mapped — it simply produced
+corrupted or zeroed output tokens, intermittently
+([#237](https://github.com/mudler/vllm.cpp/issues/237)).
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
