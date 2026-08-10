@@ -86,6 +86,13 @@ welcome that the agent should relay. An explicit request can use
 claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
 The entrypoint is non-interactive and does not mutate the checkout.
 
+The operator role is a coordinator, and **several may run at once**:
+`scripts/agent-role.py claim operator` records this worktree and is never
+refused, `scripts/agent-role.py show` lists the other live coordinators, and
+`scripts/agent-role.py release` removes only this worktree's record. What keeps
+concurrent coordinators safe is that `main` is never force-pushed, so a plain
+`git push` refuses any non-fast-forward.
+
 ## Running inference (CLI)
 
 `vllm-cli` runs a one-shot completion through the C ABI. Source:

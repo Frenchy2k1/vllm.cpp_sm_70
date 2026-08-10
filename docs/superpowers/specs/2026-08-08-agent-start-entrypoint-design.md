@@ -123,6 +123,11 @@ is re-derived from materialized state, followed by preflight.
 An operator lock held by another worktree is reported as a blocker rather than
 converted into a different role. The agent reports it and obtains direction.
 
+**SUPERSEDED 2026-08-10 by issue #285** (`.agents/specs/operator-record.md`):
+there is no lock and no blocker. A live coordinator in another worktree is
+reported as status — `other coordinators: N recorded (claim is allowed)` — and
+`claim operator` is offered as normal, because it is never refused.
+
 ### Undeclared worktree without explicit intent
 
 The entrypoint emits the selected compact-frame welcome. The source constant,
@@ -182,7 +187,8 @@ duplicating the interview and points to the canonical entrypoint.
 - A missing helper row produces a specific next action rather than a malformed
   claim command.
 - A held operator lock reports the holder conflict and does not recommend an
-  unauthorized fallback.
+  unauthorized fallback. (SUPERSEDED by #285: recorded coordinators are
+  reported as status and refuse nothing.)
 - A declared-role/explicit-intent mismatch is visible and never mutates state.
 - Headless mode is propagated into the exact claim command only when explicitly
   supplied.
@@ -217,7 +223,7 @@ cover:
 - the compact banner's ASCII-only and maximum-width guarantees;
 - stable welcome/action delimiters and exact role-claim commands;
 - inherited-role/explicit-intent conflicts;
-- a live operator lock owned by another worktree;
+- a live coordinator recorded by another worktree (a blocking lock until #285);
 - unavailable helper queue and unreadable/incomplete environment states;
 - absence of environment values and secrets in rendered output;
 - nonzero exits only for invalid input or an inability to route truthfully;
