@@ -523,7 +523,7 @@ def build_dry_run_manifest(
                 "flock", "/tmp/gpu", "<one-whole-P2-or-P3-campaign-command>"
             ],
             "ours_server": [
-                "<VLLM_CPP_BUILD>/examples/server",
+                "<VLLM_CPP_BUILD>/examples/vllm-server",
                 "--model", "<MODEL_SNAPSHOT>",
                 "--served-model-name", "gate",
                 "--host", "127.0.0.1", "--port", "30000",
