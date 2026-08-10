@@ -15,8 +15,10 @@ the reference for behavior and the bar for speed.
    what work is intended. Follow its printed action, then rerun it.
 2. Declare a role: `scripts/agent-role.py claim operator` for a multi-step
    integration campaign, `claim helper --row <ID>` for one scoped task, or
-   `claim read-only` for inspection. Add `--headless` only when the developer
-   explicitly says the run is unattended. Never infer it.
+   `claim read-only` for inspection. The operator claim records this worktree
+   as a coordinator; it is never refused because someone else is coordinating.
+   Add `--headless` only when the developer explicitly says the run is
+   unattended. Never infer it.
 3. Read `.agents/NOW.md`. It is the live snapshot and fits on one screen.
 4. Read only the claimed row, its spec, its evidence, and the task guide for
    what you are about to do.
@@ -97,8 +99,17 @@ conditions. Missing binding context returns `NEEDS_CONTEXT` rather than a guess;
 a material disagreement returns `NEEDS_DECISION` rather than silent scope
 change. Use the versioned contracts in [`.agents/prompts/`](.agents/prompts/).
 
-The operator coordinates, owns main integration and the GPU, and does not write
-implementations that should be independently reviewed.
+The operator is a **coordinator**. It holds the plan and the GPU, merges
+reviewed PRs, dispatches sub-agents into separate worktrees, and does not write
+implementations that should be independently reviewed. **Several operators may
+run at once** — `scripts/agent-role.py claim operator` records who is
+coordinating where and never refuses; `show` lists the others.
+
+**`main` is never force-pushed.** No `--force`, no `--force-with-lease`, by
+anyone, ever. That is what makes concurrent coordinators safe: a plain
+`git push` refuses any non-fast-forward, so git itself is the interlock. A
+rejected push means fetch, re-merge, re-run the gate, and push again — never
+force.
 
 ## vLLM is the reference
 
@@ -227,9 +238,11 @@ keeps the repair-without-a-round-trip case one step, while still leaving every
 change on a branch that git can show, revert, and attribute.
 
 Run the applicable gate before every push and chain that success directly to the
-exact-SHA push. Hooks are bypassable convenience, never proof. If the remote
-cannot be queried, report `REMOTE_UNVERIFIED` — unknown is neither absence nor
-success, and it authorizes no cleanup.
+exact-SHA push. Never force-push, and never add a force variant to a script; a
+rejected push is git protecting someone else's merge, so fetch, re-merge,
+re-gate and push again. Hooks are bypassable convenience, never proof. If the
+remote cannot be queried, report `REMOTE_UNVERIFIED` — unknown is neither
+absence nor success, and it authorizes no cleanup.
 
 Verified PRs are merged in-session; obsolete ones are closed with the reason
 recorded. Never end a session with a verified, unmerged PR.

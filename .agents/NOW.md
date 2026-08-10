@@ -64,9 +64,9 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to
    `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
 
-**Operator/helper protocol** ([spec](workflow.md)): roles are a lock or
-worktree+PR; helpers claim `row/<ROW-ID>` with a DRAFT PR. Role/entrypoint gates
-ENFORCE `agent-start.py` → claim → preflight. Review FAIL loops through a fresh
+**Operator/helper protocol** ([spec](workflow.md)): roles are a coordinator
+record or worktree+PR; helpers claim `row/<ROW-ID>` with a DRAFT PR. Role gates
+ENFORCE `agent-start.py` → claim → preflight. Review FAIL loops to a fresh
 implementer until PASS. Queue: 10 rows; backfill 79, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
 SM060/061/070 below vLLM's floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL
