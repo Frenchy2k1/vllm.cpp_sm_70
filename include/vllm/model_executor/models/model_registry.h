@@ -142,6 +142,16 @@ class LoadedModel {
   // Whether this concrete model can hold MTP draft weights and build the draft.
   virtual bool supports_mtp_draft() const { return false; }
 
+  // Whether this concrete model can capture the DFlash/DSpark AUX MULTI-TAP —
+  // the residual stream at the draft's `target_layer_ids`, written into
+  // `ForwardInput::aux_tap` as [T, H x taps]. Both block drafters CONDITION on
+  // that tap, so a target without it produces a speculative engine that dies
+  // mid-run ("missing target aux multi-tap") rather than at load. Found exactly
+  // that way: the first DSpark e2e ran against classic-dense `Qwen3ForCausalLM`,
+  // which has no tap, and the engine threw on the first propose. Default false;
+  // the Qwen3.5/3.6 dense + MoE forwards override it.
+  virtual bool supports_aux_multi_tap() const { return false; }
+
   // Retain the checkpoint's loaded `mtp.*` draft weights (the 15/19 BF16 tensors
   // LoadQwen3_5MTP produced) inside the concrete model so the draft can be built
   // on demand with a stable lifetime. Default: unsupported (throws), because a
