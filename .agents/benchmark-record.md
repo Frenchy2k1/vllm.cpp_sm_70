@@ -17772,3 +17772,65 @@ plus whatever the routed-expert path itself carries. Gap stays OPEN.
 Evidence: `dgx:~/abpair` (12 result JSONs + token probes), `dgx:~/mbprof`
 (the nsys kernel table that named the sink), `dgx:~/gate2.log`.
 
+## The 35B "2.7% per-launch marlin gap" is NOT ESTABLISHED — ncu would have measured two identical kernels (2026-08-10, `row/BENCH-35B-NCU-PREREQ`, GB10)
+
+The mid-band entries above listed a ~2.7% per-launch gap on the shared
+`marlin_moe_wna16` as the next lever, to be settled by an ncu shape-matched
+comparison. Running ncu's PREREQUISITE checks first retires the lever instead:
+there is no implementation difference for ncu to find.
+
+**Everything structural is identical**, ours (nsys sqlite) vs the pinned vLLM
+(torch trace), c8, same corpus:
+
+| property | ours | vLLM |
+|---|---|---|
+| launch geometry | grid 144x1x1, block 128 | grid 144x1x1, block 128 |
+| template instantiation | `<128,1,8,4,true,4,1,false>` | same |
+| registers / stack / shared | REG:94 STACK:32 SHARED:1024 CONST:1043 | **identical** |
+| launches per 24-request leg | 30480 | 30480 |
+
+The register/shared footprint is byte-identical via `cuobjdump -res-usage` on
+our `vllm-server` and the oracle's `_moe_C_stable_libtorch.abi3.so`, so the
+occupancy / wave-quantisation hypothesis (different toolchains -> different
+register allocation -> different waves at small grids) is REFUTED too.
+
+**A COUNTING ERROR of mine, corrected here.** Raw launch counts looked 1.148x
+higher on our side, and per-kernel they were EXACTLY 1.333x (ours 40640 vs vLLM
+30480). That factor is not a finding: our nsys window covered the whole client
+invocation including its `--num-warmups 8`, i.e. 32 requests against the 24 the
+ratio should normalise to (32/24 = 1.3333). After normalising, the big-GEMM
+counts match exactly. Any count-based inference from the raw numbers is void.
+
+**The control that kills the marlin framing.** The SAME FlashAttention kernel,
+same source, same geometry, differs by grid size:
+
+| kernel | grid (CTAs) | ours | vLLM | delta |
+|---|---|---:|---:|---|
+| `flash_fwd_splitkv` (prefill) | (16,8,16) = 2048 | 1027.96 us | 1027.72 us | **+0.02%** |
+| `flash_fwd_splitkv` (decode) | (1,6,16) = 96 | 82.41 us | 78.25 us | **+5.31%** |
+| `marlin_moe_wna16` | 144 | 172.56 us | 167.92 us | +2.76% |
+
+At large grids we are identical to 0.02%; the delta appears only on small-grid
+decode-phase kernels and is LARGER on FlashAttention than on marlin. So it is
+not a marlin property. It is also not GPU idle: merged-interval busy is 97.99%
+ours against 96.14% vLLM -- **we are MORE GPU-busy than the oracle**, so host
+gaps cannot explain it either.
+
+**What remains is cross-tool uncertainty, which cannot carry a 2-5% claim.**
+Ours was measured by `nsys` (CUPTI, `--cuda-graph-trace=node`), vLLM by the
+torch profiler, on separate sessions minutes apart. The protocol says plainly
+that cross-tool comparisons never establish invocation parity; a delta that
+vanishes on long kernels and appears on short ones is exactly the shape of
+per-kernel instrumentation or thermal/phase drift. **The 2.7% is withdrawn as a
+lever.** Re-opening it would need BOTH engines under the SAME tool.
+
+**What IS visible and survives:** glue share is 13.00% of GPU kernel time ours
+against 11.37% vLLM. That is the next thing to characterise, and it is countable
+rather than timing-sensitive: after normalisation we launch ~2x the SiLU kernels
+of vLLM's fused `triton_poi_fused_mul_silu_slice_0`, and we run a
+`CastF32Kernel` (~15.9k/leg) with no obvious oracle counterpart -- the same
+`CastF32` already flagged at 3.1% of the 35B step in the f32-out GEMV audit.
+
+Evidence: `dgx:~/mbprof/ours-c8.sqlite`, `dgx:~/vlprof2/vllm-profile/`,
+`cuobjdump -res-usage` on both binaries.
+

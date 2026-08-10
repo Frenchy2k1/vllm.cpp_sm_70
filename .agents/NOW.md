@@ -20,7 +20,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Invocation-parity | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
-| 35B mid-band | **LEVER LANDED +1.31% c8 / +1.38% c4**: shared gate_up off MoE-marlin | ncu the 2.7% per-launch `marlin_moe` gap |
+| 35B mid-band | **LANDED +1.31% c8**; 2.7% per-launch gap WITHDRAWN (kernels identical) | Glue 13.00% vs 11.37%: 2x SiLU + `CastF32` |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; sealed-vLLM tput 1.021x PASS; latency/VRAM OPEN | Spike residual 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
@@ -48,7 +48,8 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
 0. **35B mid-band: first lever LANDED** (+1.31% c8, +1.38% c4). The fused
    shared gate_up sink still took the MoE-marlin route (20320 launches = 5.4%
    GPU, a config vLLM never launches); `VT_MARLIN_DENSE_PAIR` ON. Block lever
-   REFUTED. NEXT: ncu the 2.7% per-launch `marlin_moe` gap; NOT closed.
+   REFUTED; the 2.7% per-launch gap WITHDRAWN (same geometry, counts AND
+   registers; a cross-tool artifact). NEXT: glue, 13.00% vs 11.37%.
 1. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
