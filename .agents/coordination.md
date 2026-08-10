@@ -118,6 +118,27 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**PROTOCOL MISS on `CLAIM-SPEC-DSPARK`, recorded not waived (2026-08-10).** PR
+#211 was merged at developer instruction while its CI was still pending; the run
+finished 11 green (including `cuda-fat-build`, both sanitizers and all three
+build-test lanes) and 3 red. Reproduced locally against the merged range:
+
+  * `pr-size` — **product changes total 2261 lines against a 900-line budget**,
+    and `scripts/check-public-doc-tables.py` was changed (the STATUS ratchet
+    re-pin) without accompanying mutation evidence in
+    `tests/scripts/test_check_public_doc_tables.py`. POL-PR-SIZE wanted this
+    split into its slices (spike / W1 / W2+W3 / W4+W5 / the engine fix / the
+    benchmarks) or one exact waiver. It got neither. The slices existed as
+    separate commits, so splitting was available and was not taken.
+  * `agent-record` and `commit-protocol-tag` — both PASS when re-run against
+    current `main` (`agent record OK: ENGINE=146 MODEL=361 ...`, `OK: commit
+    trailer contract`), so those two were stale-head or PR-base artifacts, not
+    content faults. Verified rather than assumed.
+
+No retroactive waiver is being written: the budget breach is real and the honest
+record of it is this note. The lesson for the next row is that a 6-slice claim
+should land as 6 PRs.
+
 **DSpark speculative decoding (`SPEC-DSPARK`, 2026-08-09, `CLAIM-SPEC-DSPARK`).**
 Claude Code (opus-5), helper role, isolated worktree
 `/home/mudler/_git/vllm.cpp-spec-dspark`, branch `row/SPEC-DSPARK`, base
