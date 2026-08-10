@@ -193,6 +193,23 @@ Nvfp4Weight MakeNvfp4Weight(int64_t n, int64_t k, uint64_t seed) {
   return w;
 }
 
+// One TOWER projection [N=out, K=in] under either spelling. `LoadNvfp4AnyNaming`
+// has an arm for each — `LoadCtNvfp4Raw` for compressed-tensors, its own body for
+// ModelOpt — so a residency opt-in added to one is invisible to a fixture that
+// only ever exercises the other.
+void PutNvfp4Proj(Bag& bag, const std::string& proj, int64_t n, int64_t k,
+                  uint64_t seed, bool ct_naming) {
+  const Nvfp4Fixture f = MakeNvfp4Fixture(n, k, seed);
+  if (ct_naming) {
+    PutCtNvfp4Head(bag, proj, n, k, f);
+  } else {
+    // ModelOpt ships an `input_scale` next to EVERY projection; a tower
+    // projection is where the loader may legally ignore it at the default
+    // `VT_MODELOPT_W4A4=0`.
+    PutModelOptHead(bag, proj, n, k, f, /*with_input_scale=*/true);
+  }
+}
+
 uint16_t F32ToBf16(float v) {
   uint32_t bits = 0;
   std::memcpy(&bits, &v, sizeof(bits));
@@ -217,6 +234,71 @@ Fake MakeBf16(const std::vector<int64_t>& shape, uint64_t seed) {
     std::memcpy(f.bytes.data() + static_cast<size_t>(i) * 2, &h, 2);
   }
   return f;
+}
+
+// One whole synthetic dense decoder layer with EVERY routed projection stored
+// NVFP4 (ModelOpt spelling) and everything else BF16, under the exact tensor
+// names `LoadQwen3_5DenseLayer` resolves. `linear_attention` quantizes the GDN
+// `out_proj`, `full_attention` quantizes q/k/v/o_proj, and both quantize the MLP
+// — which is every `LoadNvfp4AnyNaming` call site in the dense loader.
+void PutNvfp4DenseLayer(Bag& bag, const HfConfig& c, const std::string& type,
+                        int64_t idx, bool ct_naming) {
+  const std::string base =
+      "model.language_model.layers." + std::to_string(idx) + ".";
+  const uint64_t s = 3000 + static_cast<uint64_t>(idx) * 700;
+  const int64_t H = c.hidden_size, I = c.intermediate_size;
+  const int64_t Hq = c.num_attention_heads, Hkv = c.num_key_value_heads,
+                Dh = c.head_dim;
+  const int64_t Hk = c.linear_num_key_heads, Hv = c.linear_num_value_heads,
+                Dk = c.linear_key_head_dim, Dv = c.linear_value_head_dim,
+                Kw = c.linear_conv_kernel_dim;
+  const int64_t key_dim = Hk * Dk, value_dim = Hv * Dv,
+                conv_dim = 2 * key_dim + value_dim;
+  bag.Put(base + "input_layernorm.weight", MakeBf16({H}, s + 1));
+  bag.Put(base + "post_attention_layernorm.weight", MakeBf16({H}, s + 2));
+  if (type == "linear_attention") {
+    const std::string la = base + "linear_attn.";
+    // The in-projections are on vLLM's `ignore` list and stay BF16 in the on-disk
+    // torch-Linear [out, in] orientation; only `out_proj` is quantized.
+    bag.Put(la + "in_proj_qkv.weight", MakeBf16({conv_dim, H}, s + 10));
+    bag.Put(la + "in_proj_z.weight", MakeBf16({value_dim, H}, s + 20));
+    bag.Put(la + "in_proj_b.weight", MakeBf16({Hv, H}, s + 30));
+    bag.Put(la + "in_proj_a.weight", MakeBf16({Hv, H}, s + 40));
+    bag.Put(la + "conv1d.weight", MakeBf16({conv_dim, 1, Kw}, s + 50));
+    bag.Put(la + "A_log", MakeBf16({Hv}, s + 60));
+    bag.Put(la + "dt_bias", MakeBf16({Hv}, s + 70));
+    bag.Put(la + "norm.weight", MakeBf16({Dv}, s + 80));
+    PutNvfp4Proj(bag, la + "out_proj", H, value_dim, s + 90, ct_naming);
+  } else {
+    const std::string sa = base + "self_attn.";
+    PutNvfp4Proj(bag, sa + "q_proj", Hq * Dh, H, s + 110, ct_naming);
+    PutNvfp4Proj(bag, sa + "k_proj", Hkv * Dh, H, s + 120, ct_naming);
+    PutNvfp4Proj(bag, sa + "v_proj", Hkv * Dh, H, s + 130, ct_naming);
+    PutNvfp4Proj(bag, sa + "o_proj", H, Hq * Dh, s + 140, ct_naming);
+    bag.Put(sa + "q_norm.weight", MakeBf16({Dh}, s + 150));
+    bag.Put(sa + "k_norm.weight", MakeBf16({Dh}, s + 160));
+  }
+  const std::string mlp = base + "mlp.";
+  PutNvfp4Proj(bag, mlp + "gate_proj", I, H, s + 210, ct_naming);
+  PutNvfp4Proj(bag, mlp + "up_proj", I, H, s + 220, ct_naming);
+  PutNvfp4Proj(bag, mlp + "down_proj", H, I, s + 230, ct_naming);
+}
+
+// EVERY `Nvfp4Weight` a loaded dense layer can own, by struct field rather than
+// by loader call site — which is what makes the sweep below survive a loader
+// path that does not exist yet.
+std::vector<std::pair<std::string, const Nvfp4Weight*>> LayerNvfp4Weights(
+    const Qwen3_5DenseLayerWeights& lw) {
+  return {
+      {"linear_attn.out_proj", &lw.gdn.out_proj_fp4},
+      {"self_attn.q_proj", &lw.attn.q_proj_fp4},
+      {"self_attn.k_proj", &lw.attn.k_proj_fp4},
+      {"self_attn.v_proj", &lw.attn.v_proj_fp4},
+      {"self_attn.o_proj", &lw.attn.o_proj_fp4},
+      {"mlp.gate_proj", &lw.mlp.gate_proj_fp4},
+      {"mlp.up_proj", &lw.mlp.up_proj_fp4},
+      {"mlp.down_proj", &lw.mlp.down_proj_fp4},
+  };
 }
 
 // --- the small synthetic dense model (shape scaffold from
@@ -559,4 +641,66 @@ TEST_CASE("qwen27 dense lm_head: the packed head's resident is built once, at pr
       vllm::BorrowQwen3_5DenseLoadedModel(bf16_w);
   ModelRegistry::Prepare(*bf16_model, c, q);
   CHECK(bf16_w.lm_head_fp4.d_dequant_b == nullptr);
+}
+
+// ── 8. The opt-in belongs to ONE LOADER, and the LOADER is what proves it ────
+// The case above builds its tower with `MakeNvfp4Weight` — direct struct
+// construction — so it pins what the FORWARD does with a weight that did not opt
+// in, and says nothing about which loader may set the flag. Adding
+// `r.keep_dequant_b = true;` to `LoadNvfp4AnyNaming`, the one function every
+// dense NVFP4 TOWER projection flows through (MLP gate/up/down via
+// `LoadDenseMlp`, attention q/k/v/o via `LoadAttnDense`, GDN `out_proj` via
+// `LoadGdnDense`), reopens the whole-tower bf16 expansion of #203 verbatim while
+// every case above stays green — and the CUDA gate is blind by construction,
+// because `kMatmulNvfp4` is registered there so `ResidentNvfp4DequantB` is never
+// reached.
+//
+// So load a fully-NVFP4 layer of BOTH types, under BOTH namings, through the REAL
+// loader, and sweep every `Nvfp4Weight` the layer struct owns. The sweep
+// enumerates FIELDS, not call sites, so a fourth opt-in site anywhere in the
+// dense loader fails it.
+TEST_CASE("qwen27 dense lm_head: LoadDenseLmHead is the ONLY loader that opts a weight in") {
+  const HfConfig c = MakeConfig();
+  const int64_t N = c.vocab_size, K = c.hidden_size;
+  const Nvfp4Fixture f = MakeNvfp4Fixture(N, K, 53);
+
+  for (const bool ct_naming : {false, true}) {
+    CAPTURE(ct_naming);
+    Bag bag;  // outlives every weight below: the bf16 arms BORROW its bytes
+    if (ct_naming) {
+      PutCtNvfp4Head(bag, "lm_head", N, K, f);
+    } else {
+      PutModelOptHead(bag, "lm_head", N, K, f, /*with_input_scale=*/true);
+    }
+    for (int64_t l = 0; l < c.num_hidden_layers; ++l)
+      PutNvfp4DenseLayer(bag, c, c.layer_types[static_cast<size_t>(l)], l,
+                         ct_naming);
+
+    // The head, through the loader that IS allowed to opt in.
+    OwnedTensor unused_bf16;
+    Nvfp4Weight head;
+    LoadDenseLmHead(bag.Resolver(), bag.Has(), "lm_head", unused_bf16, head);
+    REQUIRE_FALSE(head.Empty());
+    CHECK(head.keep_dequant_b);
+
+    // The tower, through the loaders that are NOT.
+    int populated = 0;
+    for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+      const std::string type = c.layer_types[static_cast<size_t>(l)];
+      const Qwen3_5DenseLayerWeights lw =
+          vllm::LoadQwen3_5DenseLayer(bag.Resolver(), bag.Has(), type, l);
+      for (const auto& [name, w] : LayerNvfp4Weights(lw)) {
+        // An empty slot would pass the opt-in check for free, so count what the
+        // loader actually routed and require the census below: a fixture that
+        // stopped producing NVFP4 tower weights must not read as a pass.
+        if (w->Empty()) continue;
+        ++populated;
+        INFO(type << " layer " << l << " " << name);
+        CHECK_FALSE(w->keep_dequant_b);
+      }
+    }
+    // linear_attention: gdn.out_proj + mlp gate/up/down = 4.
+    // full_attention:   attn q/k/v/o  + mlp gate/up/down = 7.
+    CHECK(populated == 11);
+  }
 }

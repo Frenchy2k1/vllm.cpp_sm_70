@@ -151,6 +151,35 @@ Added in the ROUND-2 findings round:
    that removes the `keep_dequant_b` guard (6 failing assertions, 3 projections x
    2 layers), which is exactly the round-1 behavior.
 
+Added in the ROUND-3 findings round:
+
+8. Case 7 builds its tower with `MakeNvfp4Weight` — direct struct construction —
+   so it pins what the FORWARD does with a weight that did not opt in and says
+   nothing about which LOADER may set the flag. No test in the repo called
+   `LoadDenseMlp`, `LoadDenseAttn` or `LoadQwen3_5DenseWeights` at all. Case 8
+   loads a fully-NVFP4 dense layer of BOTH layer types, under BOTH namings
+   (ModelOpt `weight_scale_2` and compressed-tensors `weight_packed`), through
+   `LoadQwen3_5DenseLayer` on a synthetic bag, and sweeps every `Nvfp4Weight` the
+   layer STRUCT owns — fields, not call sites — asserting `keep_dequant_b` is
+   false on all of them and true on the head. A census assertion
+   (`populated == 11` per naming: GDN `out_proj` + 3 MLP on the linear-attention
+   layer, 4 attention + 3 MLP on the full-attention layer) keeps a fixture that
+   stopped routing NVFP4 from reading as a pass.
+
+   Three mutations, each RED: `keep_dequant_b = true` in `LoadNvfp4AnyNaming`'s
+   ModelOpt arm (11 failures, the ModelOpt leg), the same in `LoadCtNvfp4Raw`
+   (11 failures, the compressed-tensors leg), and a genuinely FOURTH setter
+   outside `LoadNvfp4AnyNaming` — one line after `LoadDenseMlp`'s `down_proj`
+   load (4 failures, both legs). The first is the reviewer's exact mutation,
+   under which cases 1-7, `test_qwen27_paged_forward` and `test_mtp_speculator`
+   all stayed green.
+
+   `LoadQwen3_5DenseLayer` gains a `has`-taking overload in the header. The
+   resolver-only overload answers `has` with a constant `true`, which forces every
+   routed projection down the compressed-tensors spelling and so cannot reach the
+   ModelOpt arm at all. The definition already existed; only the declaration is
+   new.
+
 Port anchor: `marlin_utils_fp4.py` tolerances and shapes as used by the existing
 NVFP4A16 op tests.
 
@@ -174,6 +203,22 @@ NVFP4A16 op tests.
   21.06 -> 19.36 GiB reading was taken BEFORE #150 rewrote `LoadCtNvfp4Raw` to
   borrow mmap'd bytes; that changes what host RSS counts, so the figure is
   recorded as OWED a re-measurement rather than carried forward as accepted.
+
+  **That -1.70 GiB is CUDA's, and the sign is not the same everywhere.** CUDA
+  never dequantizes, so it holds the packed head alone. A backend with no fp4
+  GEMM holds the packed head *plus* the one bf16 operand it multiplies against,
+  0.666 + 2.368 = 3.034 GiB. Arithmetic from the same K*N, not measured:
+
+  | Backend | before this row | after | delta |
+  |---|---|---|---|
+  | CUDA | 2.368 bf16 | 0.666 packed | **-1.70 GiB** |
+  | Vulkan (unified, #203) | 2.368 host bf16 + 2.368 device copy = 4.736 | 0.666 host packed + 2.368 device bf16 = 3.034 | **-1.70 GiB** |
+  | plain CPU | 2.368 bf16 | 0.666 + 2.368 = 3.034 | **+0.67 GiB** |
+
+  So #203's backend genuinely improves and plain CPU genuinely regresses by the
+  packed head's own bytes. The trade is deliberate: CPU pays 0.67 GiB once
+  instead of rebuilding 2.368 GiB on every decode step, which is what it did
+  before this row and what round 1 tried to fix for the whole tower at once.
 
 ## Evidence
 
@@ -211,11 +256,41 @@ records that the true-W4A4 (fp4-activation) path stays private to `qwen3_5.cpp`,
 so the two also carry independent `Dev`, `MakeTensor`, `ResidentNvfp4` and
 `DequantNvfp4ToBLayout` copies. Unifying them is a refactor this row does not do.
 What this row does instead is put the opt-in on the SHARED data type
-(`Nvfp4Weight`, `qwen3_5_weights.h`), which both dispatchers read, and default it
-OFF — so the shared seam's fallback and the private one cannot disagree about a
-weight, and no weight reachable from `MatmulNvfp4W4A16D` opts in today. The PR
+(`Nvfp4Weight`, `qwen3_5_weights.h`), which both dispatchers can read, and
+default it OFF.
+
+**They CAN still disagree, and the claim is only that they do not.** The shared
+fallback at `dense_nvfp4_gemm.h:626-631` ignores `keep_dequant_b` outright: it
+rebuilds the `K*N` bf16 operand per call for every weight, opted in or not. So a
+weight that opted in and then reached `MatmulNvfp4W4A16D` would get the per-call
+temporary rather than the resident. That does not happen today because no weight
+reachable from `MatmulNvfp4W4A16D` opts in, and if it ever did the divergence is
+in the benign direction: the shared seam UNDER-caches, never over-caches, so it
+cannot reintroduce the whole-tower expansion this finding was about. Honoring the
+flag in the shared seam belongs to the unification refactor, not here. The PR
 body and commit message claim only the dense `lm_head`, never "every fp4
 projection".
+
+**The opt-in has exactly ONE setter, and a test says so.** `LoadDenseLmHead` is
+it. `LoadNvfp4AnyNaming` is the single function every dense NVFP4 TOWER
+projection flows through (MLP gate/up/down via `LoadDenseMlp`, attention q/k/v/o
+via `LoadAttnDense`, GDN `out_proj` via `LoadGdnDense`), so one added line there
+reopens the round-2 blocker verbatim — and the CUDA gate cannot see it, because
+`kMatmulNvfp4` is registered on CUDA and `ResidentNvfp4DequantB` is never
+reached. Round 3 found that every gate stayed green under exactly that mutation.
+Test 8 below closes it.
+
+**A backend-asymmetric hard abort, deliberate.** `ResidentNvfp4DequantB` opens
+with `VT_CHECK(w.keep_dequant_b, ...)`, so `PrepareLmHeadResident`
+(`qwen3_5.cpp:6534`) ABORTS for any `Qwen3_5DenseWeights` whose `lm_head_fp4` is
+non-empty but did not come from `LoadDenseLmHead` — and only on a backend with no
+fp4 GEMM, because CUDA returns at `:6533` first. It is unreachable in production
+(the loader is the only producer of a packed head), and it is preferred to a
+silent fall-through because a head that quietly lost its opt-in would rebuild
+2.54 GB per step with no symptom but throughput. A test that hand-builds an
+`lm_head_fp4` is the one caller that can trip it:
+`tests/vllm/models/test_qwen27_paged_forward.cpp:1377` does exactly that and
+passes only because it never calls `Prepare`.
 
 ## Stop conditions
 
