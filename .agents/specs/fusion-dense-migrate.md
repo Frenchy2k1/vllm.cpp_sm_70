@@ -23,8 +23,18 @@ sits on `scripts/merged-gemm-consistency-allowlist.txt` with the sole reason
 | `phi3` | `Phi3MlpBlock` | `Qwen3DenseMlpWeights` |
 
 Each routes its gate/up through `layers::UnquantizedMlpGateUpMethod` and loses its
-allowlist entry. `scripts/check-fusion-consistency.py` goes from
-`6 route … 11 allowlisted` to `11 route … 6 allowlisted`.
+allowlist entry.
+
+**Mechanical correction to #299's stated end state.** The issue predicted the checker
+would go from `6/15 routed` to `11/15 routed`. It cannot, and no earlier fold ever did:
+`scan_models_gemm` only enters a TU that still HAND-CALLS `vt::SiluAndMul`/`GeluAndMul`,
+and a fully-folded TU has no hand-call left, so it leaves the DENOMINATOR rather than
+entering the numerator. (That is why `qwen3`, `olmo2`, `stablelm`, `granite` and
+`deepseek_v2` — all folded by A1 — do not appear in the checker's count at all today.)
+The real end state is `15 scanned / 6 routed / 11 allowlisted` →
+`10 scanned / 6 routed / 6 allowlisted`. What matters, and what the gate asserts, is
+identical either way: drift is 0 and the allowlist holds only entries that state a
+blocker. The checker's semantics are NOT changed to make the issue's number come true.
 
 **OUT — every other allowlist entry**, each of which names a real blocker that can
 only be cleared by EXTENDING the shared layer (its own row, not this one):
@@ -38,7 +48,13 @@ weights against the explicitly UNQUANTIZED arm; gate/up not always merged).
 Also OUT: the GLUE allowlist `scripts/fusion-consistency-allowlist.txt`. `glm4` and
 `phi3` appear there too, for a DIFFERENT drift (add+RMSNorm → `kFusedAddRmsNormStd`);
 that is the same historical follow-on name but a distinct check, and #299 scopes this
-row to the merged-GEMM half only.
+row to the merged-GEMM half only. Both of those entries read `pending
+FUSION-DENSE-MIGRATE`, so closing this row would have left them pointing at closed work
+— the exact stale-`pending` shape that let the merged-GEMM allowlist grow to hold most
+of its population. They are therefore REPOINTED at a new issue,
+[#314](https://github.com/mudler/vllm.cpp/issues/314), which owns the glue half. That
+repoint is a comment correction this row creates the need for; the glue FOLD itself is
+not done here.
 
 **OUT:** any change to `include/vllm/model_executor/layers/linear.h`,
 `.../schemes/nvfp4.h`, or any `vt::` op. The seam TU is untouched, so the 27B/35B/
@@ -123,7 +139,12 @@ activation identity is already covered by the ported byte-exact case at
 `tests/compile/passes/test_fusion.py` oracle discipline: raw byte compare, not
 `assert_close`).
 
-Added locally: one regression case in
+Added locally, both RED-first proven: a byte-exact case in
+`tests/vllm/model_executor/layers/test_linear_method.cpp` for the DIRECTLY-constructed
+`UnquantizedMlpGateUpMethod` (the spelling all five folds use, as distinct from the
+factory the existing case covers) at BOTH the decode shape `M == 1` and a prefill shape
+`M == 4`, byte-compared against the standalone `{ResidentWeight; MatmulBT[2I,H];
+SiluAndMul}` sequence; and two regression cases in
 `tests/scripts/test_check_fusion_consistency.py` asserting that each of the five
 folded stems (a) is scanned by the merged-GEMM detector, (b) routes a shared seam,
 and (c) is NOT on `scripts/merged-gemm-consistency-allowlist.txt` — so re-allowlisting
@@ -138,7 +159,7 @@ CPU-only (no GPU available to this claim), foreground:
 cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_METAL=OFF
 cmake --build build-cpu -j 18
-python3 scripts/check-fusion-consistency.py      # must read 11 routed / 6 allowlisted
+python3 scripts/check-fusion-consistency.py       # 0 drift; allowlist 11 -> 6 entries
 python3 -m unittest tests.scripts.test_check_fusion_consistency -v
 ./build-cpu/tests/test_linear_method               # the seam byte-exactness gate
 ctest --test-dir build-cpu -j 6 --output-on-failure
@@ -204,5 +225,101 @@ Recorded in [`parity-ledger.md`](../parity-ledger.md) and in the
 
 ## Outcome
 
-PENDING — W2 has not run. This section is filled in the implementation commit,
-from gates that actually executed, and never written ahead of them.
+**All five folded. No target turned out to have a real blocker.** Each of
+`commandr`, `glm4`, `minicpm`, `minicpm3` and `phi3` now spells its gate-up as one
+`layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, I).Apply(d, x)`, and all five
+entries are gone from `scripts/merged-gemm-consistency-allowlist.txt` (11 -> 6
+entries, every survivor naming a shared-layer blocker).
+
+**Measured, on the CPU build (`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=OFF
+-DVLLM_CPP_METAL=OFF`, Release, `-j 18`, clean configure, foreground):**
+
+| Gate | Before | After |
+|---|---|---|
+| `check-fusion-consistency.py` merged-GEMM | 15 scanned / 6 routed / 11 allowlisted, 0 drift | 10 scanned / 6 routed / 6 allowlisted, 0 drift |
+| `check-fusion-consistency.py` glue | 13 scanned / 11 routed / 2 allowlisted | unchanged |
+| `test_linear_method` | 5 cases / 65 assertions | 6 cases / 76 assertions |
+| `test_check_fusion_consistency` | 18 tests | 20 tests |
+
+Full CPU `ctest -j 6`, re-run on the rebased base `60e71a0e` (the final base `c70f42b9` adds only
+record commits plus one unrelated parity test, re-gated focused: fusion checker 0
+drift, `test_check_fusion_consistency` 20/20, `test_linear_method` 76/76):
+**369 / 369 passed, 0 failed**, 1288.75 s.
+
+An earlier `-j 6` run on the intermediate base `688eea12` read **367 / 369** with
+`test_async_llm` and `test_openai_conformance` red, and BOTH numbers are reported
+because that run is the honest one to explain rather than delete. It executed while
+a SECOND worktree (`/home/mudler/_git/vllm.cpp-land-ext`) ran its own suite and the
+box sat at load average 89-122. Re-run alone on a quiet box (load 12.8) they passed
+in **0.04 s** and **20.76 s**, against 605 s of `statuses == -1` — the client's 30 s
+read timeout — under load. Neither could have been this row's:
+`test_openai_conformance` builds a synthetic `Qwen3_5MoeForConditionalGeneration`
+in-process (`test_conformance.cpp:154`) and loads none of the five folded TUs. The
+clean 369/369 on the final base settles it. The five ASan/UBSan failures of #274 did
+not appear in either run — this gate is a Release build with no sanitizer.
+
+**Why the issue's predicted number is unreachable, and was not chased.** #299 said
+the checker would read `11 routed / 15`. It cannot: `scan_models_gemm` enters a TU
+only while that TU still HAND-CALLS `vt::SiluAndMul`/`GeluAndMul`, so a fully-folded
+TU leaves the denominator instead of entering the numerator — which is why the five
+A1 folds (`qwen3`, `olmo2`, `stablelm`, `granite`, `deepseek_v2`) appear nowhere in
+today's count either. Reaching `11/15` would have meant widening the detector to
+count folded models, i.e. changing a checker's semantics to make a prediction come
+true. Rejected. Drift is 0 and the allowlist holds only stated blockers, which is
+what the gate actually asserts.
+
+**RED-first, executed, not asserted.** Three mutations were run and each was
+restored byte-for-byte (`md5sum` verified against the pre-mutation digest):
+
+1. Seam activation `SiluAndMul` -> `GeluAndMul` in `linear.h`, rebuilt: the new
+   byte-exact case FAILS — `test_linear_method` 6 cases / 76 assertions -> 4 passed /
+   2 failed, 11 assertions failed. Restored: 76/76 green.
+2. `phi3` re-added to the merged-GEMM allowlist: `test_check_fusion_consistency`
+   20/20 -> 2 failures (`test_folded_dense_models_stay_folded`,
+   `test_refolded_model_reappearing_unfolded_would_fail`).
+3. The `phi3` fold reverted to its pre-fold five statements: the CHECKER ITSELF goes
+   RC=1 naming `phi3.cpp (1 gated-MLP epilogue hand-call site(s))`, and the unit
+   suite drops 2. So a revert is caught by the shipped gate, not only by the test.
+
+**Two honest limits on the token-exactness claim.**
+
+- *No end-to-end token evidence exists on this box.* Each folded arch's SACRED gate
+  is `tests/parity/test_<arch>_paged_engine.cpp`, checkpoint-gated and dgx-only; all
+  five run here as a loud SKIP (1 case, **0 assertions**). Running them is OWED to
+  the next GPU holder and is recorded as PENDING, never as passed. The proof that
+  stands in the meantime is op-sequence identity: each replaced body WAS the seam's
+  own `{ResidentWeight; MatmulBT[2I,H]; SiluAndMul}` with `M` spelled `T`, and all
+  five call sites pass a `DBuf{T,H}` (`commandr.cpp:158`, `glm4.cpp:185`,
+  `minicpm.cpp:180`, `minicpm3.cpp:208`, `phi3.cpp:147`) so `x.shape[0] == T`
+  identically — plus the new byte-exact runtime case at both M=1 and M=4.
+- *The op sequence is identical; the ALLOCATION sequence is not, and saying
+  otherwise would overreach.* `DBuf` is pooled and returns its block on destruction
+  (`dense_device_glue.h:99`). Pre-fold, the `[T,2I]` gate_up buffer stayed alive to
+  the end of the MLP block; post-fold it is released when `Apply` returns, so the
+  `[T,H]` output may reuse that block. This cannot move a value — `vt::MatmulBT`
+  writes every output element from a fresh f32 accumulator rather than accumulating
+  into `out` — and peak pool usage is unchanged or lower. It is the same shape every
+  earlier fold produced, and it is stated here rather than hidden inside
+  "byte-for-byte the same".
+
+**Rejected as evidence: an object-code A/B.** Compiling each of the five TUs from
+main's source and from the folded source with the identical production command and
+diffing the disassembly gives 3689-6888 differing instruction lines per TU. That is
+GCC re-allocating registers around a header-inlined method plus its emitted
+out-of-line copy — it is not a numerical signal in either direction, and machine-code
+identity is the wrong bar for a routing fold. Recorded so nobody re-runs it expecting
+a proof.
+
+**Decisions held, none reopened.** Direct `UnquantizedMlpGateUpMethod` rather than the
+`MakeMlpGateUpMethod` factory (no loader for the three `Qwen3DenseMlpWeights` models
+populates `*_fp4`, so the factory arm would be untestable); no adoption env flag (the
+fold is unconditional and bit-exact, so a rollback branch would be dead code); no
+Group-B allowlist entry touched and no shared-layer TU edited (`git status` on
+`include/` is empty), so no already-routed model can move.
+
+**One correction this row forced.** `glm4` and `phi3` also sit on the OTHER (glue)
+allowlist with the reason `pending FUSION-DENSE-MIGRATE`. Closing this row would have
+left both pointing at closed work — the stale-`pending` shape that let this allowlist
+grow to hold most of its population. Both reasons are repointed at
+[#314](https://github.com/mudler/vllm.cpp/issues/314), which owns the glue half. The
+glue fold itself is NOT done here.

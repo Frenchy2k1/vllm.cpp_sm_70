@@ -24,11 +24,17 @@
 # concat needed) — the gap is launch/epilogue granularity + seam routing only.
 
 # --- KNOWN-DRIFT: seam exists, model has NOT adopted it (fix = fold, Tier A1/C1) ---
-commandr        # SwiGLU {gate;up;SiluAndMul}, merged gate_up present -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
-glm4            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
-minicpm         # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
-minicpm3        # SwiGLU dense MLP (MLA arch) -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
-phi3            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
+# commandr / glm4 / minicpm / minicpm3 / phi3 were HERE with the sole reason
+# "pending FOLD-MIGRATE". All five FOLDED 2026-08-10 (FUSION-DENSE-MIGRATE, issue
+# #299, specs/fusion-dense-migrate.md) onto layers::UnquantizedMlpGateUpMethod, so
+# their entries are GONE and re-adding one is a REGRESSION the checker now catches
+# (tests/scripts/test_check_fusion_consistency.py::test_folded_dense_models_stay_folded).
+# What is left below all names a blocker that needs the SHARED LAYER extended --
+# an f32 arm, a bias arm, a keep-quant arm, or a residency arm -- which is its own
+# row, not a model fold.
+# glm4 and phi3 remain on the OTHER allowlist (scripts/fusion-consistency-allowlist.txt)
+# for the unrelated GLUE floor (add+RMSNorm -> vt::FusedChain), tracked by #314; #299
+# closed the merged-GEMM half only.
 gemma4_vision   # GeGLU vision-tower MLP -> UnquantizedMlpGateUpGeluMethod + a clamp-epilogue hook (Tier C2); pending FOLD-MIGRATE
 gemma4_moe      # known-drift pending fold: PLE shared expert and routed experts hand-call GeGLU; fold onto the shared merged-GEMM/MoE gate-up family before claiming seam closure
 

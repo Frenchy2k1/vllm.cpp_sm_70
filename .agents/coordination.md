@@ -1612,19 +1612,27 @@ and this row owes that line.
 **`FUSION-DENSE-MIGRATE` merged-GEMM fold (`ROAD-V1-C1` punch-list item 15,
 2026-08-10, issue #299).** Claude Code (claude-opus-5), helper role, isolated
 worktree `/home/mudler/_git/vllm.cpp-fusion-fold`, branch
-`row/FUSION-DENSE-MIGRATE`, base `origin/main` `e17e8f8a` pinned at worktree
-creation. Spec [fusion-dense-migrate.md](specs/fusion-dense-migrate.md). NOT in the
+`row/FUSION-DENSE-MIGRATE`, base `origin/main` `c70f42b9` — the branch was rebased
+onto it (from `e17e8f8a` pinned at worktree creation, via `688eea12`) because main
+moved 38 commits during the run and a stale base fails `pr-size`/`agent-record` with
+"base must be an ancestor of head". Spec [fusion-dense-migrate.md](specs/fusion-dense-migrate.md). NOT in the
 claims table below: that table keys `SPIKE`/`ACTIVE` rows, and `FUSION-DENSE-MIGRATE`
 is a named tail item of the already-`DONE` `ROAD-V1-C1` cornerstone, not a matrix row
 with a lifecycle state of its own. Scope: the five gate-up folds in
 `src/vllm/model_executor/models/{commandr,glm4,minicpm,minicpm3,phi3}.cpp`, the five
-removed entries in `scripts/merged-gemm-consistency-allowlist.txt`, one regression
-case in `tests/scripts/test_check_fusion_consistency.py`, the roadmap issue-table row
-for #299, the `KERNEL-FUSION-FRAMEWORK` evidence prose, `docs/FEATURES.md`, the
-parity-ledger line, and this note. **NON-COLLISION:** touches NO shared layer
-(`linear.h`/`nvfp4.h` untouched), NO `vt::` op, NO CMake, NO checker script, and no
-Group-B allowlist entry. CPU-only; the five dgx paged-engine SACRED gates SKIP here
-and are recorded as OWED.
+removed entries in `scripts/merged-gemm-consistency-allowlist.txt`, one byte-exact
+case in `tests/vllm/model_executor/layers/test_linear_method.cpp`, two regression
+cases in `tests/scripts/test_check_fusion_consistency.py`, the roadmap issue-table row
+for #299, the `KERNEL-FUSION-FRAMEWORK` evidence prose, the `ROAD-V1-C1` tail lines in
+`specs/roadmap-v1-completion.md`, `docs/FEATURES.md`, the parity-ledger line, and this
+note. Plus one correction this row creates the need for: the `glm4`/`phi3` reasons on
+the OTHER (glue) allowlist `scripts/fusion-consistency-allowlist.txt` read `pending
+FUSION-DENSE-MIGRATE`, which closing this row would leave pointing at closed work, so
+they are repointed at the new issue #314 and its roadmap intake row. The glue FOLD
+itself is NOT done here. **NON-COLLISION:** touches NO shared layer (`linear.h`/
+`nvfp4.h` untouched), NO `vt::` op, NO CMake, NO checker SCRIPT (only two allowlist
+DATA files), and no Group-B allowlist entry. CPU-only; the five dgx paged-engine
+SACRED gates SKIP here and are recorded as OWED.
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
