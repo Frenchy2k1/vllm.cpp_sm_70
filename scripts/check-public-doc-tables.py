@@ -448,12 +448,27 @@ STATUS_RATCHET = {
     # carried. Net -32 against the rebased page, re-pinned byte-tight so the
     # reduction cannot become untracked growth headroom.
     #
-    # 243594 since 2026-08-09 (measured 243594): the DSpark speculator paragraph
-    # is rewritten from "grounded and inventoried, full scope is a future spike"
-    # to the committed-spike state (SPIKED, not implemented, no measurement) and
-    # re-pointed at the spec. Net -6 against the previous pin, re-pinned
-    # byte-tight so the reduction cannot become untracked growth headroom.
-    "chars": 243594,
+    # 243590 since 2026-08-09 (measured 243590): `sm_110` is removed from the
+    # BUILD-supported, portable-kernels-only list it never belonged in — the
+    # page already states two paragraphs earlier that it is RUNTIME-VERIFIED on
+    # a Jetson Thor board, and the contradiction cost a contributor time
+    # (issue #168). Net -10, re-pinned byte-tight so the reduction cannot become
+    # untracked growth headroom.
+    #
+    # 243588 since 2026-08-09 (measured 243588): BACKEND-TENSTORRENT reaches W2
+    # and needs a status line; its per-op detail stays in backend-matrix.md and
+    # the spec, so the page carries the binding result plus a pointer. Paid for
+    # by collapsing superseded narrative in the GGUF row (a "REPORTED, not
+    # gated" preamble, a "superseding the gap recorded here" aside, and three
+    # restatements). Every measured number and binding claim kept verbatim, and
+    # re-pinned byte-tight after rebasing onto the newer page.
+    #
+    # 2026-08-10 (SPEC-DSPARK): the DSpark paragraph moves from "grounded and
+    # inventoried" to the measured state (works on the 35B gate model, spec-on
+    # output token-identical to spec-off, speed not yet a win). Re-pinned
+    # byte-tight below after the merge, so the reduction cannot become untracked
+    # growth headroom.
+    "chars": 243582,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

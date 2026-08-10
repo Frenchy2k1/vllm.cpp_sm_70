@@ -186,21 +186,6 @@ def validate_commit_message(message: str, *, strict: bool) -> list[str]:
     return _strict_errors(message)
 
 
-def exact_waiver(
-    waivers: Iterable[Waiver], rule_id: str, scope: str
-) -> Waiver | None:
-    """Select one exact, already-validated waiver or fail on ambiguity."""
-
-    matches = [
-        waiver
-        for waiver in waivers
-        if waiver.rule_id == rule_id and waiver.scope == scope
-    ]
-    if len(matches) > 1:
-        raise ValueError(f"duplicate applicable waivers for {rule_id} {scope}")
-    return matches[0] if matches else None
-
-
 def _resolve_commit(repo: Path, revision: str) -> str:
     if not revision or "\x00" in revision or "\n" in revision:
         raise ValueError(f"invalid revision {revision!r}")

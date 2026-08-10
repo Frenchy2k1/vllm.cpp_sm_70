@@ -51,7 +51,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#132](https://github.com/mudler/vllm.cpp/issues/132) | `BACKEND-ROCM` | ROCm `-O0` RmsNorm CLR HostcallListener teardown deadlock | bug |
 | [#125](https://github.com/mudler/vllm.cpp/issues/125) | `BACKEND-VULKAN` | Vulkan on AMD Strix Halo (gfx1151) does not load | bug |
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-BINARIES` | Binary release | feature |
-| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | Error when linking | bug |
+| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | In-source `cmake .` collides every examples/ target with its own source directory and dies in the linker | bug |
 | [#83](https://github.com/mudler/vllm.cpp/issues/83) | — | Auto-size memory to the workload; pre-flight error instead of OOM | feature |
 | [#81](https://github.com/mudler/vllm.cpp/issues/81) | `SPEC-MTP` | Speculative decoding: MTP k>1, dynamic and adaptive depth | feature |
 | [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |

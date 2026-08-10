@@ -52,9 +52,32 @@
 
 // MLX public headers. Deliberately NOT mlx/backend/metal/*: those pull in
 // metal-cpp and, as noted above, their entry points are not exported anyway.
+//
+// The suppressions below are NOT belt-and-braces: they are load-bearing, and the
+// -isystem that ought to make them unnecessary cannot be relied on. CMake marks
+// the MLX include directory SYSTEM (cmake/MLXDependency.cmake), but it DROPS any
+// include directory that is already one of the compiler's implicit ones — and
+// `/usr/local/include` is exactly that, and is exactly where the common MLX
+// installs put their headers. For `-DMLX_ROOT=/usr/local` no `-isystem` reaches
+// the command line at all, the headers are found through the compiler's own
+// search instead, and every warning in them lands under this TU's -Werror
+// (issue #199: reproduced on macOS 26.6.0/26.6.1 against MLX 0.30.6, 0.31.2 and
+// 0.32.0, so it is not a regression in any one MLX release).
+//
+// Scoped to the include region on purpose. Demoting these file-wide would also
+// demote them for OUR code below, and -Wunused-parameter in particular is worth
+// keeping there. Each entry names the MLX header that raises it, so an entry
+// that MLX later fixes can be retired instead of accumulating.
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wgnu-folding-constant"
+// mlx/allocator.h: `virtual Buffer make_buffer(void* ptr, size_t size)` and
+// `virtual void release(Buffer buffer)` name parameters their default bodies do
+// not use.
+#pragma clang diagnostic ignored "-Wunused-parameter"
+// mlx/types/bf16.h: `_MLX_BFloat16` user-declares a copy constructor, which
+// deprecates its implicit copy assignment; the header then uses that operator.
+#pragma clang diagnostic ignored "-Wdeprecated-copy"
 #endif
 #include "mlx/allocator.h"
 #include "mlx/array.h"

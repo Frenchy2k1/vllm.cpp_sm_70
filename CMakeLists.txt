@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
+
+# FIRST, before project() enables a compiler and before anything else can spend
+# minutes getting to a failure that names the wrong thing: an in-source `cmake .`
+# collides every examples/ executable with the source directory it was built
+# from and dies in the linker (issue #85). cmake/InSourceGuard.cmake explains
+# the collision; cmake/InSourceGuardTest.cmake pins when it fires.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+include(InSourceGuard)
+vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+
 project(vllm_cpp VERSION 0.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -52,6 +62,13 @@ set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUT
 # and into tests/vt/test_backend_cross_device.cpp during the CUDA regressions it
 # must not touch. So Vulkan is opt-in: -DVLLM_CPP_VULKAN=ON.
 set(VLLM_CPP_VULKAN "AUTO" CACHE STRING "Build the Vulkan backend: ON, OFF, or AUTO (=OFF)")
+# Tri-state like Vulkan/ROCm below (BACKEND-TENSTORRENT W0). AUTO resolves OFF:
+# unlike Vulkan (headers vendored, dlopen at runtime), this backend needs a real
+# external tt-metal install (find_package(TT-NN)/find_package(TT-Metalium), via
+# -DCMAKE_PREFIX_PATH pointing at a built tt-metal's install tree) that nothing
+# on a stock box provides, so probing by default would be a silent no-op
+# everywhere except a developer's own tt-metal checkout.
+set(VLLM_CPP_TENSTORRENT "AUTO" CACHE STRING "Build the Tenstorrent backend: ON, OFF, or AUTO (=OFF)")
 # Tri-state like the three above (BACKEND-ROCM W0). AUTO resolves OFF for the
 # same reason Vulkan's does, plus one specific to this skeleton: it has NEVER
 # BEEN COMPILED by anyone (no AMD GPU on the authoring machine), so AUTO-enabling
@@ -245,6 +262,28 @@ else()
   set(VLLM_CPP_VULKAN OFF)
 endif()
 
+# Resolve the tri-state VLLM_CPP_TENSTORRENT (BACKEND-TENSTORRENT W0). AUTO
+# resolves OFF (see the option's comment above). ON is where detection happens
+# and FAILS LOUDLY rather than silently downgrading to a CPU-only build — the
+# same contract VLLM_CPP_HIP below uses, for the same reason: a contributor who
+# typed -DVLLM_CPP_TENSTORRENT=ON and got a green CPU-only build would have no
+# way to notice the backend was not built.
+if(VLLM_CPP_TENSTORRENT STREQUAL "AUTO")
+  set(VLLM_CPP_TENSTORRENT OFF)
+elseif(VLLM_CPP_TENSTORRENT)
+  find_package(TT-Metalium QUIET)
+  find_package(TT-NN QUIET)
+  if(NOT TT-Metalium_FOUND OR NOT TT-NN_FOUND)
+    message(FATAL_ERROR "VLLM_CPP_TENSTORRENT=ON but TT-Metalium/TT-NN were not "
+      "found. Point -DCMAKE_PREFIX_PATH at a built tt-metal install tree's "
+      "lib64/cmake and share/cmake dirs (both are needed - the latter carries "
+      "nlohmann_json/xtensor), or configure with -DVLLM_CPP_TENSTORRENT=OFF.")
+  endif()
+  set(VLLM_CPP_TENSTORRENT ON)
+else()
+  set(VLLM_CPP_TENSTORRENT OFF)
+endif()
+
 # Resolve the tri-state VLLM_CPP_HIP (BACKEND-ROCM W0). Unlike Vulkan there IS
 # something to detect — a HIP toolchain — but AUTO still resolves OFF (see the
 # option's comment). ON is where detection happens, and it FAILS LOUDLY rather
@@ -363,7 +402,18 @@ endif()
 if(VLLM_CPP_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
-  set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES})
+  # CACHE ... FORCE, not a plain set(): `enable_language(CUDA)` has just written
+  # its own detected default into the CACHE, and a normal variable only SHADOWS
+  # that for the rest of the configure. The build was always correct — the
+  # gencode lines in build.ninja are the truth and they follow this value — but
+  # `CMakeCache.txt` kept reporting the detected default (`75`) even for an
+  # explicit `-DVLLM_CPP_CUDA_ARCHITECTURES=110` build, so the obvious way to
+  # confirm which architecture a build targets silently told you the wrong thing
+  # (issue #168, Jetson AGX Thor). Forcing the cache to agree costs nothing:
+  # every reader already resolved to this value.
+  set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES} CACHE STRING
+      "CUDA architectures actually compiled; mirrors VLLM_CPP_CUDA_ARCHITECTURES"
+      FORCE)
   # Per-arch capability resolution (BACKEND-CUDA-ARCH-ADDITIVITY). Every
   # arch-gated feature below asks the FEATURE TABLE instead of regex-matching the
   # whole arch list, so adding an architecture cannot silently disable fp4 /
@@ -1139,6 +1189,46 @@ if(VLLM_CPP_VULKAN)
     # ONE TU's compile time instead of every TU that includes the table.
     src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
+endif()
+# --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
+# Mostly ADDITIVE like the Metal/Vulkan/ROCm blocks above: a source list, a
+# PUBLIC compile definition, and one link library. TTNN::TTNN is TT-NN's own
+# exported IMPORTED target and pulls in TT::Metalium/xtensor/nlohmann_json
+# transitively per its own package config — no separate find_dependency needed
+# here.
+#
+# tenstorrent_ops.cpp is the ONE exception, isolated as its own OBJECT library
+# rather than a plain `vllm` source (same pattern as
+# vllm_rocm_platform_syntax_check below). It includes
+# ttnn/operations/matmul/matmul.hpp, which transitively pulls in tt-metal's
+# tt_stl/reflection.hpp — that header uses nlohmann::json as a COMPLETE type
+# without itself including the full <nlohmann/json.hpp> (it relies on some
+# other TU in tt-metal's own build having already done so). `vllm`'s own
+# vendored nlohmann 3.12.0 (ABI-tagged json_abi_v3_12_0, third_party/, SYSTEM
+# PUBLIC on `vllm` a few hundred lines up) is on the include path for every
+# `vllm` source, so an angle-bracket `<nlohmann/json.hpp>` reached from
+# tt-metal's headers in a `vllm`-target TU resolves to vllm's copy instead of
+# tt-metal's own (ABI-tagged json_abi_v3_11_3) — two incompatible ABI-tagged
+# versions of the same library visible in one TU, "implicit instantiation of
+# undefined template" and "reference to basic_json is ambiguous". Nothing else
+# in this backend (or in `vllm` generally) needs matmul.hpp, so giving this one
+# file its own include set — TTNN's dirs, no `third_party` — resolves it
+# without touching include order for the other ~370 files in the vllm target,
+# which must keep resolving vllm's OWN vendored version.
+if(VLLM_CPP_TENSTORRENT)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_TENSTORRENT)
+  target_sources(vllm PRIVATE
+    src/vllm/platforms/tenstorrent.cpp
+    src/vt/tenstorrent/tenstorrent_device.cpp
+    src/vt/tenstorrent/tenstorrent_backend.cpp)
+  add_library(vllm_tenstorrent_ops OBJECT src/vt/tenstorrent/tenstorrent_ops.cpp)
+  target_include_directories(vllm_tenstorrent_ops PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(vllm_tenstorrent_ops PRIVATE TTNN::TTNN)
+  target_compile_features(vllm_tenstorrent_ops PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_tenstorrent_ops)
+  target_sources(vllm PRIVATE $<TARGET_OBJECTS:vllm_tenstorrent_ops>)
+  target_link_libraries(vllm PUBLIC TTNN::TTNN)
 endif()
 # --- ROCm/HIP backend (BACKEND-ROCM W0 skeleton) ------------------------------
 # Purely ADDITIVE like the Metal and Vulkan blocks above: a source list, a PUBLIC

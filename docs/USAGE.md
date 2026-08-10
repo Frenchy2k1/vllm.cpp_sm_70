@@ -6,6 +6,39 @@ the reference behind it. Per-capability lifecycle state is
 [docs/STATUS.md](STATUS.md); measured numbers are
 [docs/BENCHMARKS.md](BENCHMARKS.md).
 
+## Building
+
+Full recipes are in [docs/BUILD.md](BUILD.md); the one rule worth stating here
+is that the build must be **out-of-source**. Every command on this page assumes
+a separate build directory:
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+```
+
+`cmake .` in the checkout is refused at configure time. It cannot work: the
+example targets are named after the directories they are built from, so an
+in-source build makes the linker write each executable over its own source
+directory (issue #85).
+
+## Confirming which CUDA architecture a build targets
+
+`CMakeCache.txt` is now a reliable answer. Configuring with
+`-DVLLM_CPP_CUDA_ARCHITECTURES=<arch>` writes that value into
+`CMAKE_CUDA_ARCHITECTURES` in the cache, so the two agree:
+
+```sh
+grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
+```
+
+It previously reported the toolkit's detected default (typically `75`) no matter
+what was requested, because the project set the variable without writing it back
+to the cache. Only the report was wrong — the emitted gencode always followed the
+requested value — but it sent a contributor looking in the wrong place
+([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
+gencode line remains the ground truth if you want to double-check.
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
@@ -61,6 +94,11 @@ size; that is reclaimable and does not need to be budgeted, but it does make
 `MemFree` look alarming during a load. Use `MemAvailable`, not `MemFree`, to
 decide whether a model fits. `VT_VULKAN_ALLOC_STATS=1` prints the running device
 total and the `/proc` context if you need to see where it goes.
+A Tenstorrent build (`-DVLLM_CPP_TENSTORRENT=ON`, needs a local tt-metal
+install on `CMAKE_PREFIX_PATH`) adds nothing runtime-visible yet — W0 is one
+op with no model support, so there is nothing here to document until that
+changes. See [docs/STATUS.md](STATUS.md) and
+[.agents/specs/tenstorrent-backend.md](../.agents/specs/tenstorrent-backend.md).
 
 A Vulkan build (`-DVLLM_CPP_VULKAN=ON`) adds three kernel-measurement binaries.
 They exist so a Vulkan tuning knob can be A/B'd in ONE binary, which is this
