@@ -234,6 +234,15 @@ class Qwen3_5DenseModel {
   // the head is not packed. Called from the registry `prepare` hook.
   static void PrepareLmHeadResident(const Qwen3_5DenseWeights& weights,
                                     vt::Queue& queue);
+  // PERF-27B-GDN-FP8-QKVZ. Build the merged N-concatenated [qkv;z] FP8 operand
+  // for every eligible GDN layer NOW — at model prepare, before any forward and
+  // therefore before any CUDA-graph capture. A resident built inside stream
+  // capture allocates and copies mid-capture, which aborts the capture; this is
+  // the same reason PERF-27B-LMHEAD-FP4 builds its Marlin operand up front.
+  // No-op on a non-staging (CPU) queue, on a non-FP8 owner, and whenever the
+  // merge is not selected — the split path then never pays for the operand.
+  static void PrepareGdnFp8Resident(const Qwen3_5DenseWeights& weights,
+                                    const HfConfig& config, vt::Queue& queue);
 
   // Batched PAGED dense forward — the 27B analogue of Qwen3_5Model::Forward.
   // Same signature/structure (paged KV cache for the full-attn layers, batched

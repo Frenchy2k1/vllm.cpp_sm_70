@@ -209,9 +209,36 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
   // GDN layers, so default selection is exactly 48 calls; the process-cached
   // rollback arm must issue none.
   vt::cuda::testing::ResetGdnPackedDecodeDebugStats();
+  vllm::detail::ResetGdnFp8InProjDebugStats();
 #endif
   consume(loaded->engine().step());
 #ifdef VLLM_CPP_CUDA
+  // PERF-27B-GDN-FP8-QKVZ structural gate. The 27B NVFP4 checkpoint is
+  // `modelopt_mixed`: its 48 GDN layers carry FP8 W8A8 input projections. vLLM
+  // runs ONE merged qkvz GEMM per layer (48/step); we ran TWO (96/step), and
+  // that shape — not traffic, not kernel quality — is the measured 7.9 ms/step
+  // of the 27B decode deficit. So on the merged arm the total FP8 GDN
+  // input-projection dispatch count must be exactly 48 (48 merged + 0 split),
+  // and on the VT_GDN_MERGED_QKVZ_FP8=0 rollback exactly 96 (0 merged + 96
+  // split). A BF16-owner checkpoint issues neither and totals 0.
+  const vllm::detail::GdnFp8InProjDebugStats fp8_inproj =
+      vllm::detail::GetGdnFp8InProjDebugStats();
+  vllm::detail::DisableGdnFp8InProjDebugStats();
+  if (fp8_inproj.Total() != 0) {
+    const bool fp8_merged = vllm::detail::MergedGdnFp8QkvzEnvSelected(
+        vllm::detail::GdnMergedFp8QkvzEnvConfig{
+            std::getenv("VT_GDN_MERGED_PROJ"),
+            std::getenv("VT_GDN_MERGED_QKVZ"),
+            std::getenv("VT_GDN_MERGED_QKVZ_FP8")});
+    const uint64_t expected_merged = fp8_merged ? 48U : 0U;
+    const uint64_t expected_split = fp8_merged ? 0U : 96U;
+    if (fp8_inproj.merged_launches != expected_merged ||
+        fp8_inproj.split_launches != expected_split) {
+      vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
+      throw std::runtime_error(
+          "qwen27 GDN fp8 input-projection dispatch count mismatch");
+    }
+  }
   const uint64_t packed_launches =
       vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
   // Packed pure-decode selection is process-coupled to the merged BF16 BA

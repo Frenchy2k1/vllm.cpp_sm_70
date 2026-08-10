@@ -29,6 +29,23 @@ struct GDNAttentionMetadata;
 // (f32). Drives the real per-step upload (BuildStepDevInputs) + layer assembly
 // (GdnBlockPaged), so the synthetic spec-branch test exercises the exact
 // production routing. Defined in qwen3_5.cpp.
+// Test-only entry point (PERF-27B-GDN-FP8-QKVZ): run ONE GDN layer's FP8 input
+// projection over `h_host` ([T*H] f32, rounded to bf16 on upload exactly like
+// the real forward's embed target) through EITHER the merged single-GEMM arm
+// (`merged=true`) or the exact two legacy fp8 GEMMs, and return the
+// concatenation [mixed_qkv | z] as [T*(conv_dim+value_dim)] f32. `z` is
+// produced at BF16 when `z_bf16` (the 27B dense default `GdnOutDType`) and
+// upcast on the way out, so the two arms are directly byte-comparable. The
+// merged arm is byte-identical to the split arm by construction; this proves it
+// on the real fp8 GEMM. CUDA-only (the fp8 W8A8 path is). Defined in
+// qwen3_5.cpp.
+std::vector<float> ProjectGdnFp8QkvzForTest(vt::Queue queue,
+                                            const GdnLayerWeights& w,
+                                            const std::vector<float>& h_host,
+                                            int64_t T, int64_t conv_dim,
+                                            int64_t value_dim, bool merged,
+                                            bool z_bf16);
+
 std::vector<float> GdnBlockPagedForTest(vt::Queue queue, const GdnLayerWeights& w,
                                         const HfConfig& cfg,
                                         const std::vector<float>& h_host,
@@ -100,6 +117,75 @@ struct GdnMergedQkvzEligibility {
 };
 
 bool ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& eligibility);
+
+// PERF-27B-GDN-FP8-QKVZ — the FP8 (W8A8) leaf of the same merge. The BF16 leaf
+// above owns a merged `in_proj_qkvz` BF16 parameter; a ModelOpt FP8 tower
+// (`nvidia/Qwen3.6-27B-NVFP4` is `modelopt_mixed`, and the 35B shares the
+// tower) keeps the two shards NATIVE and so cannot use that owner. vLLM still
+// runs ONE merged qkvz GEMM per GDN layer (qwen_gdn_linear_attn.py:923-936 @
+// 702f4814; MergedColumnParallelLinear packs qkv+z along N), which is what this
+// leaf mirrors: the two RAW fp8 [N,K] shards are N-concatenated ONCE into one
+// resident operand and one fp8 GEMM replaces the two.
+//
+// The merge only reproduces the split arithmetic when the two shards agree on
+// the ACTIVATION scale, because the merged GEMM quantizes the activation once:
+// ModelOpt fp8 here is per-tensor, so `in_proj_qkv.input_scale` must equal
+// `in_proj_z.input_scale` BITWISE. That is exactly the predicate
+// `GdnFp8SharedInputScale` (the same one `Fp8SharedInputScale` already applies
+// to this pair for the fused RmsNorm+quant), evaluated ONCE when the resident is
+// built, never per step. The per-shard WEIGHT scales need no agreement: each
+// shard's folded alpha is applied per output column (folded into the GEMM when
+// both are equal, else through the resident alpha vector), exactly as the
+// merged FP8 QKV path does.
+struct GdnMergedFp8QkvzEligibility {
+  bool runtime_enabled = false;  // VT_GDN_MERGED_QKVZ_FP8 (+ the BF16 leaf's
+                                 // master VT_GDN_MERGED_PROJ / leaf
+                                 // VT_GDN_MERGED_QKVZ rollbacks)
+  bool fp8_platform = false;     // supports_fp8() + the fp8 GEMM registered
+  bool has_fp8_shards = false;   // both in_proj_qkv_fp8 and in_proj_z_fp8 live
+  bool shared_k = false;         // both shards read the same [M,K] activation
+  bool shared_input_scale = false;  // bitwise-equal per-tensor input_scale
+  bool shard_widths_match = false;  // shard N == conv_dim / value_dim
+};
+
+bool ShouldUseMergedGdnFp8Qkvz(const GdnMergedFp8QkvzEligibility& eligibility);
+
+// Process-level ENV resolution of the FP8 leaf, mirroring
+// PackedGdnDecodeEnvSelected: fields carry the raw getenv values (nullptr =
+// unset) so the CPU tier can pin the truth table that `MergedGdnFp8QkvzEnabled`
+// caches. VT_GDN_MERGED_QKVZ_FP8 is the leaf switch and defaults ON; the BF16
+// leaf's master (VT_GDN_MERGED_PROJ) and leaf (VT_GDN_MERGED_QKVZ) rollbacks
+// also disable it, so one switch retires the whole merged-input-projection
+// topology.
+struct GdnMergedFp8QkvzEnvConfig {
+  const char* merged_proj = nullptr;      // VT_GDN_MERGED_PROJ (master)
+  const char* merged_qkvz = nullptr;      // VT_GDN_MERGED_QKVZ (BF16 leaf)
+  const char* merged_qkvz_fp8 = nullptr;  // VT_GDN_MERGED_QKVZ_FP8 (FP8 leaf)
+};
+
+bool MergedGdnFp8QkvzEnvSelected(const GdnMergedFp8QkvzEnvConfig& env);
+
+// The load-time scale-compatibility predicate itself, exposed so the CPU tier
+// can pin it: true (and *scale filled) only when BOTH fp8 GDN input shards are
+// populated and carry the SAME per-tensor activation scale, compared with exact
+// float equality. `Fp8SharedInputScale`'s linear-attention branch delegates
+// here, so the fused-quant guard and the merge guard can never drift apart.
+bool GdnFp8SharedInputScale(const GdnLayerWeights& gdn, float* scale);
+
+// Model-selection instrumentation for the FP8 GDN input projections, mirroring
+// vt::cuda::testing::GdnPackedDecodeDebugStats: counts the host GEMM dispatches
+// (`merged` = one per GDN layer, `split` = two per GDN layer) so a real-model
+// step can assert the structural 96 -> 48 collapse without a profiler. Graph
+// replay has no host dispatch, so this is read on an eager step.
+struct GdnFp8InProjDebugStats {
+  uint64_t merged_launches = 0;
+  uint64_t split_launches = 0;
+  uint64_t Total() const { return merged_launches + split_launches; }
+};
+
+void ResetGdnFp8InProjDebugStats();
+GdnFp8InProjDebugStats GetGdnFp8InProjDebugStats();
+void DisableGdnFp8InProjDebugStats();
 
 // Validate the exact prefix that will be uploaded. Negative rows are inert
 // padding; every live slot must be unique and in range. This runs on host
