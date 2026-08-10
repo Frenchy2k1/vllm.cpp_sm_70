@@ -501,7 +501,11 @@ STATUS_RATCHET = {
     # and "the async production-serving path wiring" leaves the remaining-work
     # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
     # each rebase); re-pinned byte-tight to the merged measurement.
-    "chars": 243496,
+    #
+    # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
+    # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
+    # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    "chars": 243455,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
