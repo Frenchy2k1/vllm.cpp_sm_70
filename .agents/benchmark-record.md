@@ -17834,3 +17834,55 @@ of vLLM's fused `triton_poi_fused_mul_silu_slice_0`, and we run a
 Evidence: `dgx:~/mbprof/ours-c8.sqlite`, `dgx:~/vlprof2/vllm-profile/`,
 `cuobjdump -res-usage` on both binaries.
 
+## 35B glue lever #2 LANDS: shared-expert down-proj emits bf16, one CastF32 per layer-step removed (+2.05% c8, 2026-08-10, `row/PERF-35B-SHARED-DOWN-BF16`, GB10, #213)
+
+Follows the glue lead from the withdrawn per-launch entry: glue was 13.00% of
+GPU kernel time ours against 11.37% vLLM, with a `CastF32Kernel` (~1 per layer
+per step) that has no oracle counterpart.
+
+Root cause: the shared expert's `down_proj` called `MatmulNvfp4F32D`, i.e. the
+Marlin GEMM produced bf16 and was then upcast to f32 across a whole `[T,H]`
+buffer -- while BOTH consumers (`SharedExpertGate` and `MoeCombineGate`) widen
+to float in-kernel and re-round through bf16 on store. The f32 buffer was
+written and re-read for a value that was already bf16.
+
+Fix: `sd` is now templated in both consumers (bf16 or f32) and the sink uses the
+existing `MatmulNvfp4Bf16D`. `VT_SHARED_DOWN_BF16`, default ON per the
+parity-enabler policy.
+
+**BIT-IDENTICAL, and the gates say so on BOTH arms with UNCHANGED assertion
+counts** -- `test_qwen36_paged_engine` 315/315 and `test_qwen27_paged_engine`
+235/235 with `Status: SUCCESS` for ON and for `=0`. The warm-server greedy probe
+is byte-identical across all four runs (`d4dfa279e5a5`), which the previous
+lever could not show because its baseline was unstable run-to-run.
+
+**MEASURED same binary, 3 reps/arm, order-alternated, single load per arm:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | f32 (opt-out) | 193.2, 193.6, 188.8 | 193.22 | - |
+| c8 | bf16 (default) | 197.2, 197.4, 196.5 | **197.18** | **+2.05%** (ITL -1.72%) |
+| c4 | f32 | 140.3, 141.6, 141.8 | 141.59 | - |
+| c4 | bf16 | 142.2, 142.7, 142.9 | **142.71** | **+0.79%** |
+
+Bands NON-OVERLAPPING at both points (c8 max f32 193.6 < min bf16 196.5; c4
+141.8 < 142.2).
+
+**A METHODOLOGY BUG this exposed, worth more than the lever.** The first attempt
+at this change wired only `SharedExpertGate` and missed `MoeCombineGate`, which
+threw `sd must be f32 [T,H]`. The gate command in use greps `assertions:`, and
+that line read `285 | 285 passed | 0 failed` -- GREEN -- while the run's real
+status was `test cases: 0 passed | 2 failed` / `Status: FAILURE!`. When a case
+throws, assertions already executed still count as passed and the case aborts.
+What caught it was the assertion COUNT (285 against the 315 this gate always
+reports), not the pass/fail. **Gate commands must grep `Status:`/`test cases:`
+as well, and any change in assertion count is RED even when everything
+"passed".**
+
+Cumulative on the mid-band: this plus the shared gate_up dense route. The band
+is still OPEN -- glue was 1.63 points of the ~6.5% deficit and the ~2x SiLU
+launch count against vLLM's fused `triton_poi_fused_mul_silu_slice_0` is the
+next countable item.
+
+Evidence: `dgx:~/abdown` (12 result JSONs + 4 identical token probes),
+`dgx:~/g5.log` (both arms, both gates, with Status lines).
