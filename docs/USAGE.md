@@ -63,6 +63,20 @@ requested value — but it sent a contributor looking in the wrong place
 ([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
 gencode line remains the ground truth if you want to double-check.
 
+## Using more than one engine in a process
+
+Constructing a `LoadedEngine`, destroying it, and constructing another in the
+same process is supported, including on CUDA. Each engine's device-resident MoE
+and Marlin constants are owned by the weights they describe and are released
+with them.
+
+Before, that state lived in process-lifetime caches keyed on the *address* of a
+weights block, so a second engine could land on a freed block's address and
+reuse device pointers that had already been freed. Nothing crashed — the CUDA
+context is never torn down, so the pointers stayed mapped — it simply produced
+corrupted or zeroed output tokens, intermittently
+([#237](https://github.com/mudler/vllm.cpp/issues/237)).
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
@@ -853,10 +867,40 @@ Reference frames are binary PPM, which is what this tool also **writes**, so one
 feeds straight back in as `--ref-video` and clips chain. Convert anything else with
 `ffmpeg -i in.png -pix_fmt rgb24 out.ppm`.
 
-Useful for measurement: `--denoise-only` times the DiT loop without loading the VAEs,
-`--dump-params` prints the geometry a checkpoint implies (manifest only, no weights),
-`--save-embeds` writes the text conditioning so a second run can replay it with
-`--prompt-embeds` and compare checkpoints on identical conditioning.
+Worked reference renders, all on the **Ref2VA** checkpoint (`--partition ref2va`); the flags
+below replace `--ref-image` in the command above:
+
+```sh
+# a SUBJECT carried into a new scene, from one still
+--ref-image subject.ppm
+
+# a reference CLIP: a directory of frame_%06d.ppm. A previous run's --workdir already
+# has that layout, so clips chain without converting anything:
+--ref-video /tmp/h3/            # reads /tmp/h3/frame_000000.ppm, frame_000001.ppm, ...
+
+# reference AUDIO: 16-bit PCM WAV. Resample first -- the audio VAE is 32 kHz:
+#   ffmpeg -i voice.mp3 -ac 1 -ar 32000 -c:a pcm_s16le voice.wav
+--ref-audio voice.wav
+```
+
+To build a `--ref-video` directory from an arbitrary clip:
+
+```sh
+mkdir -p /tmp/refclip && ffmpeg -i source.mp4 -pix_fmt rgb24 /tmp/refclip/frame_%06d.ppm
+```
+
+Reference conditioning is **ref2va only**. On the FL2VA checkpoint these flags are refused
+rather than silently ignored, which is the guard from the task/partition mirror.
+
+Useful for measurement: `--prompt-embeds` replays text conditioning saved earlier, so two
+checkpoints can be compared on byte-identical conditioning. `VT_H3_DUMP_DIR=<dir>` writes the
+latents that enter each VAE (`vae_input_video_latent.f32`, `vae_input_audio_latent.f32`) plus
+the pre-denormalize audio rows — that is how a render is checked numerically rather than by
+eye, and it is byte-inert when unset.
+
+(`--denoise-only`, `--dump-params` and `--save-embeds` belonged to the pre-fold driver and
+were removed when the example became a thin ABI client; see the header comment in
+`examples/minimax_h3_gen/main.cpp`.)
 
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
