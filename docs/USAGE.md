@@ -285,6 +285,34 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+### The NVFP4 output head
+
+On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
+`weight`/`weight_scale`/`weight_scale_2`, or compressed-tensors
+`weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
+GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
+head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
+2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
+GiB, a 1.70 GiB saving on CUDA; the figure is owed a re-measurement after
+`ENG-LOAD-DIRECT-UPLOAD` changed the RSS accounting).
+
+That accounting is CUDA's. A backend with no fp4 GEMM (CPU, Vulkan, Metal, HIP,
+Tenstorrent) has to multiply against a dequantized bf16 copy, so on those the
+head costs the packed bytes **plus** one `2*K*N` operand, built once when the
+model is prepared rather than per call — 0.666 + 2.368 = 3.034 GiB on the same
+checkpoint. The sign of the change therefore depends on the backend: on Vulkan,
+which used to stage a host bf16 head *and* a device copy of it, the head goes
+4.736 to 3.034 GiB, the same **-1.70 GiB**; on plain CPU it goes 2.368 to 3.034,
+a **+0.67 GiB** regression, paid once instead of rebuilding 2.368 GiB on every
+decode step as that backend did before. Only the head is kept that way; every
+other NVFP4 projection dequantizes per call, so a quantized tower is never
+expanded in memory. The head runs W4A16 under both namings: the on-disk
+activation divisor next to it (`input_scale`, or `input_global_scale` in the
+compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
+matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a
+same-binary A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF
+and `tie_word_embeddings` heads are unaffected by either setting.
+
 ### Validating a staged release archive
 
 Release verification reads only a freshly extracted archive, never files from
