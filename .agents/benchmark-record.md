@@ -17834,3 +17834,117 @@ of vLLM's fused `triton_poi_fused_mul_silu_slice_0`, and we run a
 Evidence: `dgx:~/mbprof/ours-c8.sqlite`, `dgx:~/vlprof2/vllm-profile/`,
 `cuobjdump -res-usage` on both binaries.
 
+## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
+
+**Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
+Locally positive and token-safe; default and release-model gates remain open.
+
+**Selection and falsification.** On exact-chunks `c3bb0f39a`, the accepted
+Qwen3.5-4B/c32/1,280-block graph-node trace measured fast megablock
+228.150171 ms and the existing per-V-head split 448.364941 ms across 1,728
+calls. Both token files were identical. The split is 1.965x slower and the
+enclosing run 0.97% slower, so V-only launch decomposition is rejected.
+Pinned vLLM's same-tool `_fused_post_conv_kernel` is 108.034870 ms across 1,923
+calls. Source comparison instead selected vLLM/FLA's 16-token, per-head,
+four-warp schedule and Q/K register reuse.
+
+**Implementation and numerical mutant.** `GdnPostConvTokenTileKernel` maps one
+block to `(16 tokens, one Q/K or V head)` and one warp to four tokens. Each Q/K
+lane retains features `lane+{0,32,64,96}` across normalization. The first
+implementation summed those four squares sequentially before a warp reduction:
+kernel time improved 227.731960→122.472980 ms and enclosing throughput
+6731.69→6773.85 tok/s, but the tile token SHA
+`1d496ff0f989978155d8e900c7a5500a43db26816dead8e035310d0bf9cb9756`
+did not match fast `83fcdc45...453545`; REJECTED. Reproducing the current
+128-lane tree exactly—`(i+i+64)`, then `(i+i+32)`, then shuffle offsets
+16/8/4/2/1—restored byte identity without restoring the reload/barrier costs.
+
+**Final same-binary profile.** One `/tmp/gpu` lock, 22/25 GiB user-systemd
+scope, `--cuda-graph-trace=node`, identical production workload and binary:
+
+| Axis | fast megablock | token tile | change |
+|---|---:|---:|---:|
+| post-conv GPU total, 1,728 calls | 227.887066 ms | **122.587027 ms** | **1.858982x faster** |
+| mean post-conv call | 131.879 us | **70.942 us** | **46.21% lower** |
+| total throughput | 6734.82 tok/s | **6770.62 tok/s** | **+0.532%** |
+| output throughput | 744.72 tok/s | **748.68 tok/s** | **+0.532%** |
+| TTFT | 1024.14 ms | **1015.43 ms** | **-0.850%** |
+| TPOT / ITL | 35.01 ms | **34.85 ms** | **-0.457%** |
+| E2E | 5469.87 ms | **5440.81 ms** | **-0.531%** |
+
+The vLLM kernel residual is now **1.134699x**, down from 2.112x. Final token
+files are identical, full SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Portable flag/grid tests pass 6/6·50; CUDA GDN passes 67/67·4384 including
+partial/exact tiles, packed BA non-zero views/wider row strides, byte-exact five
+outputs, finiteness and norms; cached Qwen3.5-4B passes 3/3·1672.
+
+**Evidence.** Final fast/tile traces
+`/tmp/qwen35-postconv-tile-exact-{fast,tile}.nsys-rep`, SHA-256
+`c75e2cb...bcadc` / `a0eb1808...f418`; token files beside them. Rejected
+arithmetic traces `/tmp/qwen35-postconv-tile-wip-{fast,tile}.nsys-rep`, SHA-256
+`c2d8872e...b774` / `1c42d489...d66b`. Selection traces and exact recipes are
+in [the spike/result](specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+One local profile is not extrapolated to the unavailable Qwen3.6-27B/35B gates;
+the flag therefore remains opt-in.
+
+## 2026-08-08 — sm_120 causal-conv residual: K=4 specialization wins; 256-channel tile falsified
+
+**Disposition:** arm 1 is IMPLEMENTED, byte-exact and locally positive behind
+`VT_CONV_CHANNEL_TILE=1`; arm 2 (`=2`) is retained as an explicit falsified
+experiment. Unset/`0` remains the default pending repeated and release-model
+gates.
+
+**Divide-and-conquer selection.** Fresh current-main/post-conv tracing measured
+causal conv 234.255 ms versus pinned-vLLM 145.532 ms, while post-conv's
+remaining excess was only 14.476 ms. Grouping causal-conv launches by grid
+showed the 279/280-program waves consumed 136.189 ms (58.1%). Local used 64
+feature blocks and runtime width at 43 registers/thread; vLLM used `BLOCK_N=256`,
+32 feature blocks and compile-time width at 32 registers/thread. The spike split
+those differences into arm 1 (compile-time K=4, unchanged 64 blocks) and arm 2
+(K=4 plus two channels/thread, 32 blocks).
+
+**Correctness/review finding.** A serial-stripe arm 2 corrupted the second
+stripe when an exact final-chunk block wrote state before stripe 2 loaded initial
+history; the CUDA matrix caught it and the accepted kernel preloads both stripes.
+Fresh mutation review then found byte comparisons could stay green when a whole
+specialized dispatch branch was deleted. A fresh fix routes production through
+the same portable callback dispatcher the tests mutate. Scoped re-review killed
+arm-1 deletion, arm-2 deletion, relaxed arm-2 parsing and removed non-K4 fallback.
+Final gates: portable 9/9·88, CUDA GDN 67/67·4631, paged-forward 4/4·8.
+
+**VOID series.** `/tmp/qwen35-conv-arm{0,1,2}-565a26fcc.*` is invalid for
+selection: the test executables had rebuilt but `vllm-bench` had not relinked.
+All three traces proved the old runtime kernel/grid/registers ran. This was
+caught structurally before timing interpretation.
+
+**Accepted rebuilt same-binary profile.** One GPU lock, 22/25 GiB user-systemd
+scope, exact c32 workload and `--cuda-graph-trace=node`:
+
+| Axis | arm 0 runtime | arm 1 K4x1 | arm 2 K4x2 |
+|---|---:|---:|---:|
+| kernel / grid / registers | runtime / 64 / 43 | K4<1> / 64 / 52 | K4<2> / 32 / 58 |
+| causal-conv total, 1,728 calls | 234.604587 ms | **219.506425 ms** | 228.400830 ms |
+| 279-program mean | 149.546 us | **140.133 us** | 145.586 us |
+| 280-program mean | 149.480 us | **139.982 us** | 145.468 us |
+| total throughput | 6759.39 tok/s | **6767.62 tok/s** | 6757.19 tok/s |
+| output throughput | 747.43 tok/s | **748.34 tok/s** | 747.19 tok/s |
+| TTFT | 1016.69 ms | **1013.82 ms** | 1017.61 ms |
+| TPOT / ITL | 34.91 ms | **34.88 ms** | 34.91 ms |
+| E2E | 5449.87 ms | **5443.16 ms** | 5451.66 ms |
+
+Arm 1 improves conv **6.4356%**, with every enclosing axis positive but small.
+It leaves a **1.5083x** same-tool vLLM conv residual. Register count rises rather
+than falls, falsifying the occupancy rationale; compile-time removal of runtime
+width work is the supported cause. Arm 2 improves only 2.6443% versus baseline,
+is **4.0520% slower than arm 1**, and is neutral/slightly negative end to end:
+halving blocks does not repay duplicated channel-local register state on sm_120.
+
+All accepted token files SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Report SHA-256 arm0/arm1/arm2:
+`39d383dd878fc340a3cfaaee79a4addcb4eccb181439e9b4725f724f4569a6eb`,
+`c8799ac0b4cdf997d383fe8a690b223be882dce3b1ee1a6fff35a62d75f7cf85`,
+`3d38793571539864b23688fd9a85966debbf1e7c48fe8a1a2509438a45ee0452`.
+Full recipe and decision:
+[structured spike/result](specs/sm120-qwen35-conv-channel-tile-2026-08-08.md).

@@ -43,11 +43,12 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | throughput + host PSS | Exact chunks ON: total **1.021x PASS**; TTFT **1.086x**, TPOT **1.025x**, VRAM **1.018x OPEN**; local A/B **+2.152%** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 
-### GDN prefill causal-convolution by GPU
+### GDN prefill kernels by GPU
 
 | GPU | Workload and basis | vllm.cpp | vLLM | Ratio | Status |
 |---|---|---:|---:|---:|---|
-| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 233.955 ms | 145.421 ms | **1.609x slower** | Rebased-main exact chunks ON; rollback 718.704 ms, so local is **3.072x faster** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 234.605 ms arm 0; **219.506 ms** K4 arm 1 | 145.421 ms | 1.613x arm 0; **1.509x** arm 1 | K4 arm 1 is byte-exact and **6.436% faster** (same-run arm-0 basis, not the earlier 233.955 default); arm 2 falsified; arm 1 opt-in ([result](../.agents/specs/sm120-qwen35-conv-channel-tile-2026-08-08.md)) |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, fused post-conv total | 122.587 ms | 108.035 ms | **1.135x slower** | Opt-in tile is exact and **1.859x faster** than 227.887 ms fast megablock; all axes improved; default/release gates open ([spec](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-27B NVFP4, historical normalized prefill | 0.43 us/token/layer | 0.18 us/token/layer | **2.39x slower** | Directional only: unequal token clusters, older pin ([ledger](../.agents/parity-ledger.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-35B NVFP4, later local kernel A/B | 321.148 us c1; 960.313 us c6 | - | `PENDING` | Register vs tiled improved 4.7%/7.3%; no paired vLLM denominator ([record](../.agents/specs/gdn-prefill-conv-reg-2026-07-18.md)) |
 | Jetson Thor (`sm_110`), AGX Orin (`sm_87`) | No matched GDN workload | - | - | `PENDING` | Runtime correctness only; no causal-conv speed trace |

@@ -491,7 +491,15 @@ STATUS_RATCHET = {
     # ~100% GPU-busy reading) into the binding result, both of which are now
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
-    "chars": 243542,
+    #
+    # 243405 since 2026-08-10 (measured 243405): row KERNEL-SSM-MAMBA (#155)
+    # rewrites the Qwen3.5-4B sm_120 cell for the post-conv token tile and the
+    # K=4 causal-conv specialization. The superseded exact-chunk A/B narrative
+    # (the three-pair local percentages and the rebased-main nsys retelling)
+    # collapses to its binding result; both are carried durably by
+    # docs/BENCHMARKS.md's GDN rows and .agents/benchmark-record.md. Strictly
+    # DOWN from 243542, the only direction this number may move.
+    "chars": 243405,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
