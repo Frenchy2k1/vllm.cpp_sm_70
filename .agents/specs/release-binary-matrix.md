@@ -531,6 +531,55 @@ or replacing the runtime resolution smoke with `readelf` alone. The former
 weakens the no-build-path release invariant, while the latter stops proving
 that the extracted executable's declared dependencies resolve.
 
+## Hosted artifact-handoff completion
+
+The 2026-08-10 manual dry run at Actions run `31408404388` proved that all
+eight required platform jobs build, validate, package, and upload their exact
+bundle triplets. The aggregate `build` job `93565669335` then failed before
+handoff verification with
+`[Errno 2] No such file or directory: 'plan/release-plan.json'`.
+`actions/download-artifact@v4` had extracted the exact plan artifact below an
+additional artifact-name directory because that download did not set
+`merge-multiple: true`; the consumer intentionally reads the stable flat path
+`plan/release-plan.json`.
+
+The same latent layout mismatch applies to every later exact single-artifact
+handoff. `verify` reads both `plan/release-plan.json` and
+`unverified/release-handoff.json`; `attest` and `publish` read the verified
+handoff and assets from fixed paths. The asset-set download already opts into
+flat extraction and succeeded. Fixing only the first observed failure would
+therefore defer the same failure to verify or to the first real tag run.
+
+The approved completion is one invariant across the whole workflow:
+
+1. Every `actions/download-artifact@v4` step uses `merge-multiple: true`,
+   including exact single-artifact downloads. Artifact names stay immutable and
+   SHA-bound, and consumer paths stay stable and explicit.
+2. `scripts/check-release-workflow.py` fails unless the flattening invariant is
+   present on every download step. It continues requiring exact artifact names,
+   explicit paths, immutable handoffs, least-privilege permissions, and
+   wildcard-free publication.
+3. `tests/scripts/test_release_pipeline.py` first demonstrates a red mutation
+   by removing or falsifying one download's flattening flag, then proves the
+   repaired workflow green. Existing workflow and release-pipeline mutations
+   remain green.
+4. The focused workflow checker and mutation suite, full preflight, fresh
+   static plus scratch-mutation review, and operator rerun must pass before the
+   branch is pushed. A new manual dry run must then reach the `verify` job with
+   all eight tuples and an immutable verified handoff.
+5. Manual `workflow_dispatch` remains non-publishing by design: successful
+   build and verify may advance archive evidence, but cannot prove OIDC
+   attestation or GitHub Release publication. Those stages require a real
+   signed/authorized `v*` tag whose version matches `CMakeLists.txt`, followed
+   by an audit that every matrix archive, checksum, SBOM/provenance sidecar, and
+   generated release index was attached from the verified handoff.
+
+Rejected alternatives are duplicating artifact-name subdirectories throughout
+consumer paths or adding discovery/move scripts. Both repeat generated names
+outside their producing expressions and weaken the fixed-path handoff contract.
+Universal flat extraction is the action's native mechanism and keeps the
+workflow's exact-file publication boundary unchanged.
+
 ## Spike verdict
 
 The release program is feasible as backend-specific static-core bundles with a
