@@ -17,7 +17,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Laguna NVFP4 / DS-V4 decode | **CLOSED, byte-exact**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **0.85x**: FP8 native, tokens MATCH; #213 head packed | #213 grid + RSS remeasure post-#150 |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
-| Invocation-parity | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` |
+| Invocation-parity | **CLOSED** (row was STALE; STATUS had it since 08-04): re-verified @`812de8ca` | — |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **2 LANDED**: gate_up +1.31%, down bf16 +2.05%; SILU NEGATIVE | Decode-only window, ONE tool |
