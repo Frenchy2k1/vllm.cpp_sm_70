@@ -127,10 +127,31 @@ if(VLLM_CPP_SERVER)
   string(JOIN "-" _vllm_server_backend ${_vllm_server_backends})
   string(TOLOWER "${CMAKE_SYSTEM_NAME}" _vllm_server_os)
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _vllm_server_arch)
+  set(_vllm_server_artifact_backend "${_vllm_server_backend}")
+  if(VLLM_CPP_CUDA)
+    set(_vllm_server_artifact_backend cuda-fat)
+  elseif(VLLM_CPP_LITERAL_STATIC)
+    set(_vllm_server_artifact_backend cpu-static)
+  endif()
+  if(_vllm_server_os STREQUAL "linux")
+    if(VLLM_CPP_LITERAL_STATIC)
+      set(_vllm_server_abi musl)
+    else()
+      set(_vllm_server_abi glibc)
+    endif()
+    set(_vllm_server_artifact_id
+      "linux-${_vllm_server_arch}-${_vllm_server_abi}-${_vllm_server_artifact_backend}")
+  elseif(_vllm_server_os STREQUAL "darwin")
+    set(_vllm_server_artifact_id
+      "macos-${_vllm_server_arch}-${_vllm_server_artifact_backend}")
+  else()
+    set(_vllm_server_artifact_id
+      "${_vllm_server_os}-${_vllm_server_arch}-${_vllm_server_artifact_backend}")
+  endif()
   set(_vllm_server_release_dir "${CMAKE_BINARY_DIR}/release")
   set(_vllm_server_stage_dir "${_vllm_server_release_dir}/stage")
   set(_vllm_server_archive
-    "${_vllm_server_release_dir}/vllm.cpp-${PROJECT_VERSION}-${_vllm_server_backend}-${_vllm_server_os}-${_vllm_server_arch}.tar.gz")
+    "${_vllm_server_release_dir}/vllm.cpp-${PROJECT_VERSION}-${_vllm_server_artifact_id}.tar.gz")
 
   add_custom_target(vllm-server-stage
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/package-server.py

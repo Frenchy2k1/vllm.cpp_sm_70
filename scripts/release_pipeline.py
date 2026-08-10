@@ -46,6 +46,14 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_archive_name(version: str, artifact_id: str) -> str:
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version) is None:
+        raise ValueError("archive version must be a semantic version")
+    if re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", artifact_id) is None:
+        raise ValueError("archive artifact ID is unsafe")
+    return f"vllm.cpp-{version}-{artifact_id}.tar.gz"
+
+
 def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
     if set(matrix) != {"artifacts", "release_ready", "retention", "schema"}:
         raise ValueError("release matrix has unknown or missing fields")
@@ -117,9 +125,12 @@ def inventory_assets(plan: dict[str, Any], assets_dir: Path) -> list[dict[str, A
         raise ValueError("plan artifacts are invalid")
     expected: dict[str, str] = {}
     required_sets: dict[str, set[str]] = {}
+    version = plan.get("version")
+    if not isinstance(version, str):
+        raise ValueError("plan version is invalid")
     for item in artifacts:
         artifact_id = item["id"]
-        archive = f"{artifact_id}.tar.gz"
+        archive = canonical_archive_name(version, artifact_id)
         names = {
             archive,
             f"{archive}.sha256",
@@ -165,6 +176,7 @@ def handoff_value(plan_path: Path, assets_dir: Path) -> dict[str, Any]:
         "retention": plan.get("retention"),
         "schema": HANDOFF_SCHEMA,
         "source_sha": plan.get("source_sha"),
+        "version": plan.get("version"),
     }
 
 
@@ -247,6 +259,7 @@ def publish_release(
     expected_archives = {
         name: item for name, item in expected.items() if name.endswith(".tar.gz")
     }
+    version = handoff.get("version")
     indexed_archives: set[str] = set()
     for row in index_rows:
         if not isinstance(row, dict):
@@ -256,7 +269,8 @@ def publish_release(
         if (
             not isinstance(archive, str)
             or not isinstance(artifact_id, str)
-            or archive != f"{artifact_id}.tar.gz"
+            or not isinstance(version, str)
+            or archive != canonical_archive_name(version, artifact_id)
             or archive not in expected_archives
             or archive in indexed_archives
             or row.get("sha256") != expected_archives[archive].get("sha256")
