@@ -1340,22 +1340,25 @@ bf16 path that ran; `sm_110` fp8/fp4/CUTLASS remain DERIVED/NOT-YET. Other
 fan-out boards are build-supported only (no board here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
-**GDN Triton-AOT cubins are vendored per-arch (2026-07-28).** The full GDN AOT
-set (packed decode plus the delta_h/chunk_o FLA kernels for Qwen3.6
-GDN-hybrids) is vendored for `sm_80/86/89/90a/100a` as well as `sm_121a`
-(`cuobjdump` shows per-target SASS), so those arches select the non-spilling
-path. **DERIVED+BUILD-VERIFIED (testing-welcome): no non-`sm_121`
-board runs a GDN model here, so this is not a runtime GDN-decode-parity claim on
-any arch.** `sm_121a` is byte-unchanged (SACRED gate intact). Evidence:
-[.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
+**GDN Triton-AOT cubins are vendored per-arch (2026-07-28).** The GDN AOT set
+(packed decode + the delta_h/chunk_o FLA kernels) is vendored for
+`sm_80/86/89/90a/100a` as well as `sm_121a`; `cuobjdump` shows per-target SASS,
+and `sm_121a` is byte-unchanged (SACRED gate intact).
 
-**`VLLM_CPP_TRITON` defaults ON for a CUDA build (#219).** Computed: `ON` when
-`VLLM_CPP_CUDA` is `ON` and every vendored tree is present;
-`OFF`, naming the condition, for a non-CUDA backend, `VLLM_CPP_TRITON_REGEN=ON`,
-or a missing tree. Arch COUNT is not a condition; the single-arch `FATAL_ERROR`
-in `cmake/TritonAOT.cmake` is unchanged. Matrix:
-[`cmake/TritonAOTDefaultTest.cmake`](../cmake/TritonAOTDefaultTest.cmake);
-spec: [.agents/specs/triton-aot-default-on.md](../.agents/specs/triton-aot-default-on.md).
+**`VLLM_CPP_TRITON` defaults ON for every CUDA arch (#219).** `ON` when
+`VLLM_CPP_CUDA` is `ON`, `VLLM_CPP_TRITON_REGEN` is `OFF`, and every vendored
+tree passes the builder's drift/staleness checks; `OFF` otherwise, naming the
+condition. Arch COUNT is not a condition.
+
+**RISK of that default, DISCLOSED NOT MITIGATED.** It selects all five
+non-`sm_121a` trees unasked, yet only `sm_121a` is RUNTIME-VERIFIED; the rest
+stay **DERIVED+BUILD-VERIFIED (testing-welcome)** — no such board here runs a
+GDN model — and `sm_80` has open
+[#193](https://github.com/mudler/vllm.cpp/issues/193) (crashes, wrong GDN
+output) reported at Triton OFF, so not caused by this. `-DVLLM_CPP_TRITON=OFF`
+restores the hand kernels. Specs:
+[per-arch](../.agents/specs/triton-aot-per-arch.md),
+[default-on](../.agents/specs/triton-aot-default-on.md).
 
 **As of 2026-07-28, `sm_87` is also RUNTIME-VERIFIED (portable bf16 SYNC path) on
 real silicon — the SECOND non-GB10 runtime proof.** vllm.cpp was built

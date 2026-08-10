@@ -473,7 +473,14 @@ STATUS_RATCHET = {
     # measured numbers and their links; only the superseded framing goes. Net
     # -4 against the Tenstorrent page, re-pinned byte-tight so the reduction
     # cannot become untracked growth headroom.
-    "chars": 243584,
+    # 243578 since 2026-08-10 (measured 243578): the developer ruled Triton
+    # default-ON for EVERY CUDA arch, which the page owes a disclosure -- the
+    # default now enables five never-runtime-verified cubin trees, one of which
+    # (sm_80) has open #193. Paid for inside the same block it belongs to: the
+    # per-arch vendoring note and the default note were collapsed to their
+    # binding results and the RISK split out beside them, so the new claim costs
+    # the page nothing. Net -6, re-pinned byte-tight.
+    "chars": 243578,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
