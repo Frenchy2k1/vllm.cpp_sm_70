@@ -236,11 +236,35 @@ above and a larger change. Not a ceiling, an unclaimed lever.
 
 ### Correctness
 
-- Mechanism gate `tests/test_load_direct_upload` **6/6, 77 assertions**, and RED
-  under two independent mutations of the tree it guards: removing the size
-  identity check in `BorrowStTensorBytes` fails 5 assertions; removing the
-  borrow from `LoadBf16Direct` fails 7. Tree restored and md5-verified after
-  each.
+- Mechanism gate `tests/test_load_direct_upload` **13/13, 167 assertions**: the
+  6 borrow-mechanism cases, 4 post-upload residency cases, and 3 fp4-resident
+  cases. RED under nine independent mutations of the tree it guards, with the
+  tree md5-verified restored and re-GREEN after each:
+
+  | mutation | red |
+  |---|---|
+  | drop the size-identity check in `BorrowStTensorBytes` | 5 assertions |
+  | skip the borrow in `LoadBf16Direct` | 7 assertions |
+  | delete the whole adopt branch | 3 cases / 7 assertions |
+  | move the release after the `bytes` reassignment | 3 cases / 3 assertions (incl. the ordering assertion read from inside the munmap) |
+  | move the release after the host-addressable early return, BEFORE the env one | 1 case / 1 assertion |
+  | move the release after the `VT_ADOPT_DEVICE_BYTES` early return (i.e. after BOTH early returns) | 2 cases / 2 assertions |
+  | `ResidentNvfp4`: drop both `AddDeviceUpload` calls | 3 cases / 3 assertions |
+  | `ResidentNvfp4`: drop both `d_dev` publications | 3 cases / 20 assertions |
+  | `ResidentNvfp4`: drop both `AdoptDeviceBytesAsHost` calls | 3 cases / 16 assertions |
+  | `ResidentNvfp4`: drop all six statements (the reviewer's exact revert) | 3 cases / 23 assertions |
+
+  The two release-ordering rows were previously recorded as ONE mutation with
+  the wrong count; they are two distinct, differently-strong mutations and both
+  were re-measured. All six of the `ResidentNvfp4` statements had shipped with
+  NO test that bites — a fresh reviewer reverted them and 20/20 fp4-and-loader
+  suites stayed green — which is what the three fp4-resident cases close, over
+  the shared `dense_nvfp4::ResidentNvfp4` and a fake host-addressable backend.
+- The `qwen3_5.cpp` duplicate of `ResidentNvfp4` sits in an anonymous namespace
+  inside an 8.5k-line translation unit, so no test can call it. It is held to
+  the same invariant structurally by `scripts/check-fp4-resident-consistency.py`
+  (mutation suite `tests/scripts/test_check_fp4_resident_consistency.py`, 16
+  cases), which goes RED on each of the same three reverts applied to that copy.
 - GB10 Vulkan build, device asserted from the printed BACKEND PROOF line (not
   from an env var — `VLLM_CPP_DEVICE` is read nowhere in the tree):
   `test_vulkan_backend` **35/35 (2650)**, `test_backend_cross_device`
@@ -290,3 +314,74 @@ same tokens (the STRICT engine gate is green), strictly less work, and a
 one-variable rollback for a same-binary A/B. There is no regime in which the
 copy is faster: it is the same read plus an extra write into memory that is then
 discarded.
+
+### Round-3 follow-up on main (the two review findings)
+
+The row merged to main as `8768c64e` on top of the round-2 repair `72548610`. A
+fresh scoped review of that head then returned FAIL/narrow — no correctness
+defect, no redesign — with two findings, both closed here as ordinary follow-up
+defects. Base `9ec78b84`.
+
+**Finding 1 (LOW-MEDIUM), the round-2 repair was pinned by no test.** The
+reviewer reverted all six `ResidentNvfp4` statements (an `AddDeviceUpload`, a
+`d_dev` publication and an `AdoptDeviceBytesAsHost` per buffer, in BOTH copies),
+rebuilt clean, and ran every suite touching fp4 residency or the load counters —
+`test_load_direct_upload`, `test_qwen36_weights`, `test_safetensors`,
+`test_ops_nvfp4_*`, `test_ops_moe_grouped*`, `test_qwen3_32b_nvfp4a16_*`,
+`test_laguna_nvfp4_loader`, `test_minimax_h3`, `test_linear_method`: **20/20
+passed**. `test_load_direct_upload` is the only suite asserting on `load_stats`
+and it never reached `ResidentNvfp4`; the sole `ResidentNvfp4` case
+(`test_qwen36_weights.cpp:587`) is CUDA + 35B-shard gated and asserts nothing
+about upload accounting or post-upload residency.
+
+Closed with three cases driving the SHARED `dense_nvfp4::ResidentNvfp4` over the
+`FakeBackend` + `ObservableMapping` harness the adopt cases already had, plus a
+structural gate for the copy no test can reach. The mutation rows are in
+§Correctness above; the estimate that ~30 lines would do it was low — the
+harness needed a reusable `BorrowedWeight` split out of `BorrowedUploadedWeight`
+and the three cases run ~230 lines with their reasoning.
+
+The reviewer's remaining concern — a host-addressable backend reaching
+`ResidentNvfp4` with **non-borrowed** `packed`/`scale`, where the new
+`AdoptDeviceBytesAsHost` takes the GENERAL branch and madvises + frees the host
+fp4 mirror — is the third case ("a host-addressable device adopts an OWNED fp4
+mirror too"). It asserts the full byte content through `bytes` after the
+adoption, which is the executable form of "the CPU dequant fallback still reads
+valid bytes".
+
+**Finding 2 (LOW), the recorded mutation evidence was wrong.** `engine-matrix`
+recorded *"move the release after the `VT_ADOPT_DEVICE_BYTES` early return: 1
+case / 1 assertion"*. Both halves of that pairing were re-measured on this tree:
+
+| mutation | MEASURED |
+|---|---|
+| release moved after BOTH early returns (i.e. after the `VT_ADOPT_DEVICE_BYTES` one) | **2 cases / 2 assertions** — `:479` non-host-addressable, `:499` `VT_ADOPT_DEVICE_BYTES=0` |
+| release moved after the host-addressable return, BEFORE the env one | **1 case / 1 assertion** — `:479` only |
+
+So the recorded count belonged to the weaker mutation. Both are now recorded as
+the two separate rows they are. The spec's own §Correctness was additionally a
+round BEHIND — it still carried round 1's `6/6, 77 assertions` and two mutations
+and had never picked up the four round-2 residency cases; that is repaired in the
+same edit.
+
+**Gates for this follow-up** (test-and-record only: the sole compiled change is
+`tests/vllm/test_load_direct_upload.cpp`; no `src/`, `include/` or `.cu` file
+moved, md5-verified after every mutation). CLEAN Release build, `mudler-ubuntu-box`
+dev box, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=ON` (`CMakeCache` verified),
+**Vulkan = llvmpipe**, which is a correctness device and proves nothing about
+speed:
+
+- `test_load_direct_upload` **13/13, 167 assertions**;
+- `test_safetensors` **34/34 (79)**; `test_qwen36_weights` **7/7 (45)** (the
+  35B-shard cases skip on this box; `in_proj_qkv_fp8` did not go red here);
+- `test_vulkan_backend` **35/35 (2107)**; `test_backend_cross_device`
+  **11/11 (132)**; `test_opt_paged_engine` **6/6 prompts token-exact (96/96),
+  0 declines, device type 3** from the printed BACKEND PROOF line;
+- `scripts/gen-vulkan-spirv.py --check`: `committed SPIR-V is up to date`;
+- `scripts/agent-preflight.sh --quiet`: all gates green, including the new
+  `check-fp4-resident-consistency` and its 16-case mutation suite.
+
+**NOT run for this follow-up, stated plainly:** GB10, CUDA, and both SACRED
+paged-engine gates. The change compiles into exactly one test binary, so a CUDA
+re-run is owed to the operator rather than claimed here. Metal, ROCm and XPU
+remain unrun as before.

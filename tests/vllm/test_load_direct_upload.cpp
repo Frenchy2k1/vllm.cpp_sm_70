@@ -31,6 +31,8 @@
 #include <unistd.h>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // dense_nvfp4::ResidentNvfp4
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/owned_bytes.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -401,13 +403,13 @@ size_t PageSize() {
   return static_cast<size_t>(ps > 0 ? ps : 4096);
 }
 
-// Build a borrowed, uploaded weight standing exactly where ResidentWeight leaves
-// one: bytes VIEW the mapping, `mmap_src` records the source range, `d_dev`
-// holds the device copy, and the tensor's borrow is the LAST reference to the
-// mapping (the SafetensorsFile is gone by adoption time).
-vllm::OwnedTensor BorrowedUploadedWeight(vt::Backend& b, vt::Queue& q,
-                                         ObservableMapping& m) {
-  m.size = 2 * PageSize();
+// A weight that BORROWS `bytes` from an observable stand-in shard mapping and
+// records the source range in `mmap_src`, with the tensor's borrow as the LAST
+// reference to the mapping (the SafetensorsFile is gone by adoption time). This
+// is the state the loader leaves a qualifying weight in, BEFORE any upload.
+// `size` must be a whole number of pages so the interior-page release covers it.
+vllm::OwnedTensor BorrowedWeight(ObservableMapping& m, size_t size) {
+  m.size = size;
   void* raw = ::mmap(nullptr, m.size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   REQUIRE(raw != MAP_FAILED);
@@ -429,8 +431,14 @@ vllm::OwnedTensor BorrowedUploadedWeight(vt::Backend& b, vt::Queue& q,
   w.bytes = vllm::OwnedBytes::Borrow(m.addr, m.size, keep);
   w.mmap_src = m.addr;
   w.mmap_src_bytes = m.size;
-  keep.reset();  // the weight's borrow is now the only reference, as in production
+  return w;  // `keep` dies here: the weight's borrow is the only reference left
+}
 
+// Build a borrowed, uploaded weight standing exactly where ResidentWeight leaves
+// one: the borrow above, plus the device copy published on `d_dev`.
+vllm::OwnedTensor BorrowedUploadedWeight(vt::Backend& b, vt::Queue& q,
+                                         ObservableMapping& m) {
+  vllm::OwnedTensor w = BorrowedWeight(m, 2 * PageSize());
   void* p = b.Alloc(m.size);
   b.Copy(q, p, w.bytes.data(), m.size);
   vt::Backend* bk = &b;
@@ -534,4 +542,253 @@ TEST_CASE("adopt: the windowed-release flag still governs the direct-upload rele
 
   CHECK(m.addr[0] == kSrcPattern);
   CHECK_FALSE(m.dropped);
+}
+
+// --- The fp4 resident upload: ResidentNvfp4's accounting AND its residency ---
+//
+// `LoadCtNvfp4W4A16` / `LoadCtMxfp4W4A16` / `LoadCtNvfp4Raw` BORROW an fp4
+// weight's `packed` and `scale` from the shard mmap, so `ResidentNvfp4` is the
+// ONE host->device move of those bytes. Round 2 of this row therefore gave it
+// three statements per buffer, in both copies of the function
+// (`dense_nvfp4_gemm.h` and the private one in `qwen3_5.cpp`):
+//
+//   1. `load_stats::AddDeviceUpload(nb)`   — account the move;
+//   2. `w.packed.d_dev = w.d_packed`       — PUBLISH the allocation on the
+//      OwnedTensor, which is the only reason `AdoptDeviceBytesAsHost` can act
+//      on it at all (that function keys on `d_dev` and returns immediately when
+//      it is null);
+//   3. `AdoptDeviceBytesAsHost(d.b, w.packed)` — the post-upload residency step
+//      every other qualifying weight already got.
+//
+// NOTHING PINNED THEM. `test_load_direct_upload` is the only suite asserting on
+// `load_stats`, and it never reached `ResidentNvfp4`; the sole `ResidentNvfp4`
+// case (`test_qwen36_weights.cpp`) is CUDA + 35B-shard gated and asserts nothing
+// about upload accounting or post-upload residency. All six statements could be
+// reverted with every fp4-touching suite still green. These cases close that:
+// they drive the SHARED `dense_nvfp4::ResidentNvfp4` over the same FakeBackend +
+// ObservableMapping harness the adopt cases above use, so each of the three
+// statements has an assertion that fails when it is removed. (The `qwen3_5.cpp`
+// duplicate lives in an anonymous namespace inside a 8.5k-line translation unit
+// and is unreachable from a test; `scripts/check-fp4-resident-consistency.py`
+// is what keeps it from diverging from the copy pinned here.)
+namespace {
+
+// Whole-page `packed` and `scale` sizes, consistent with an [n, k] NVFP4 weight
+// (`packed` = n*k/2 bytes, `scale` = n*k/group_size bytes at group_size 16), so
+// the interior-whole-page source release covers both buffers completely.
+// Derived from the page size rather than hardcoded: a 64 KiB-page arm64 host
+// would otherwise release nothing out of a 4 KiB `scale`.
+struct Fp4Dims {
+  int64_t n = 0;
+  int64_t k = 256;
+  size_t packed_bytes = 0;  // 8 pages
+  size_t scale_bytes = 0;   // 1 page
+};
+
+Fp4Dims MakeFp4Dims() {
+  Fp4Dims d;
+  d.n = static_cast<int64_t>(PageSize() / 16);  // n*k == 16 * page_size
+  d.packed_bytes = static_cast<size_t>(d.n * d.k) / 2;
+  d.scale_bytes = static_cast<size_t>(d.n * d.k) / 16;
+  return d;
+}
+
+// An fp4 weight whose packed+scale BORROW two observable stand-in mappings —
+// exactly what the compressed-tensors loaders hand `ResidentNvfp4` under
+// ENG-LOAD-DIRECT-UPLOAD. No device handles yet: the upload under test is what
+// creates them.
+vllm::Nvfp4Weight BorrowedFp4Weight(const Fp4Dims& d, ObservableMapping& mp,
+                                    ObservableMapping& ms) {
+  vllm::Nvfp4Weight w;
+  w.n = d.n;
+  w.k = d.k;
+  w.group_size = 16;
+  w.scale2 = 1.0F;
+  w.packed = BorrowedWeight(mp, d.packed_bytes);
+  w.scale = BorrowedWeight(ms, d.scale_bytes);
+  return w;
+}
+
+// The OTHER residency an fp4 weight can arrive in: an OWNED anonymous buffer
+// (`mmap_src == nullptr`), which is what every non-borrowing arm still produces.
+// A recognizable, position-dependent fill, so reading the wrong buffer after the
+// adoption is visible in the VALUES and not only in the pointer.
+vllm::OwnedTensor OwnedPatternWeight(size_t size) {
+  std::vector<uint8_t> v(size);
+  for (size_t i = 0; i < size; ++i) v[i] = static_cast<uint8_t>(i % 251);
+  vllm::OwnedTensor w;
+  w.dtype = vt::DType::kI8;
+  w.rank = 1;
+  w.shape[0] = static_cast<int64_t>(size);
+  w.bytes = vllm::OwnedBytes(std::move(v));
+  return w;
+}
+
+bool AllBytesMatchPattern(const uint8_t* p, size_t size) {
+  for (size_t i = 0; i < size; ++i) {
+    if (p[i] != static_cast<uint8_t>(i % 251)) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST_CASE("fp4 resident: ResidentNvfp4 COUNTS its upload, publishes d_dev, and adopts") {
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+  const Fp4Dims dims = MakeFp4Dims();
+
+  {
+    ObservableMapping mp;
+    ObservableMapping ms;
+    vllm::Nvfp4Weight w = BorrowedFp4Weight(dims, mp, ms);
+    REQUIRE(w.packed.bytes.size() == dims.packed_bytes);
+    REQUIRE(w.scale.bytes.size() == dims.scale_bytes);
+    REQUIRE(w.d_packed == nullptr);
+    REQUIRE(w.d_scale == nullptr);
+
+    const vllm::load_stats::Counters before = vllm::load_stats::Snapshot();
+    vllm::dense_attn::Dev d{b, q};
+    const vllm::dense_nvfp4::Nvfp4Dev dev = vllm::dense_nvfp4::ResidentNvfp4(d, w);
+    const vllm::load_stats::Counters after = vllm::load_stats::Snapshot();
+
+    // (1) ACCOUNTING. Both buffers reached the device, and both were counted —
+    // this is the ONLY place those bytes are ever counted, since they were
+    // borrowed rather than copied on the way in.
+    CHECK(after.device_upload_bytes - before.device_upload_bytes ==
+          dims.packed_bytes + dims.scale_bytes);
+    // ... and the upload is not miscounted as a host materialization.
+    CHECK(after.host_copy_bytes == before.host_copy_bytes);
+    CHECK(after.borrowed_bytes == before.borrowed_bytes);
+
+    // (2) PUBLICATION. The allocation is on the OwnedTensor, not only on the
+    // Nvfp4Weight's own handle. Without this the adoption below cannot happen
+    // at all: AdoptDeviceBytesAsHost returns immediately on a null `d_dev`.
+    REQUIRE(w.d_packed != nullptr);
+    REQUIRE(w.d_scale != nullptr);
+    CHECK(w.packed.d_dev.get() == w.d_packed.get());
+    CHECK(w.scale.d_dev.get() == w.d_scale.get());
+
+    // (3) ADOPTION. The host view IS the device allocation, and the weight is no
+    // longer a direct-upload borrow.
+    CHECK(w.packed.bytes.borrowed());
+    CHECK(w.scale.bytes.borrowed());
+    CHECK(static_cast<const void*>(w.packed.bytes.data()) == w.d_packed.get());
+    CHECK(static_cast<const void*>(w.scale.bytes.data()) == w.d_scale.get());
+    CHECK(w.packed.mmap_src == nullptr);
+    CHECK(w.scale.mmap_src == nullptr);
+    CHECK(w.packed.mmap_src_bytes == 0u);
+    CHECK(w.scale.mmap_src_bytes == 0u);
+    // The surviving copy carries the bytes, so every `.bytes` reader (the CPU
+    // dequant fallback among them) still reads the weight.
+    CHECK(w.packed.bytes.size() == dims.packed_bytes);
+    CHECK(w.scale.bytes.size() == dims.scale_bytes);
+    CHECK(w.packed.bytes.data()[0] == kSrcPattern);
+    CHECK(w.scale.bytes.data()[0] == kSrcPattern);
+    CHECK_FALSE(w.packed.host_released);
+    CHECK_FALSE(w.Empty());
+
+    // (4) THE SOURCE WENT, IN THE RIGHT ORDER. Both mappings were dropped by the
+    // re-point, and both read 0 at the instant of the drop — i.e. the madvise ran
+    // while the range was still mapped. kSrcPattern here would mean the release
+    // had moved after the assignment, onto an unmapped range.
+    CHECK(mp.dropped);
+    CHECK(ms.dropped);
+    CHECK(mp.byte_at_drop == 0);
+    CHECK(ms.byte_at_drop == 0);
+
+    // (5) The returned device views are the uploaded buffers.
+    CHECK(dev.packed.data == w.d_packed.get());
+    CHECK(dev.scale.data == w.d_scale.get());
+  }
+
+  // ONE control block per buffer, despite the two handles (`d_packed` and
+  // `packed.d_dev`, plus the adopted `bytes` keep-alive aliasing it): the device
+  // memory is freed exactly once, through the vt Backend.
+  CHECK(b.frees == 2);
+}
+
+TEST_CASE("fp4 resident: a NON-host-addressable device still counts and still releases") {
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/false);
+  vt::Queue q = b.CreateQueue();
+  const Fp4Dims dims = MakeFp4Dims();
+
+  ObservableMapping mp;
+  ObservableMapping ms;
+  vllm::Nvfp4Weight w = BorrowedFp4Weight(dims, mp, ms);
+
+  const vllm::load_stats::Counters before = vllm::load_stats::Snapshot();
+  vllm::dense_attn::Dev d{b, q};
+  vllm::dense_nvfp4::ResidentNvfp4(d, w);
+  const vllm::load_stats::Counters after = vllm::load_stats::Snapshot();
+
+  CHECK(after.device_upload_bytes - before.device_upload_bytes ==
+        dims.packed_bytes + dims.scale_bytes);
+
+  // No adoption: the borrows stay valid, re-faultable views of their mappings...
+  CHECK(static_cast<const void*>(w.packed.bytes.data()) ==
+        static_cast<const void*>(mp.addr));
+  CHECK(static_cast<const void*>(w.scale.bytes.data()) ==
+        static_cast<const void*>(ms.addr));
+  CHECK(w.packed.mmap_src == static_cast<const void*>(mp.addr));
+  CHECK_FALSE(mp.dropped);
+  CHECK_FALSE(ms.dropped);
+  // ... but the consumed source pages were dropped all the same.
+  CHECK(mp.addr[0] == 0);
+  CHECK(ms.addr[0] == 0);
+}
+
+TEST_CASE("fp4 resident: a host-addressable device adopts an OWNED fp4 mirror too") {
+  // THE PREVIOUSLY UNEXERCISED REGIME. Every fp4 arm that does NOT borrow — a
+  // dequant/repack producer, a checkpoint the borrow helper failed closed on,
+  // any non-safetensors source — hands ResidentNvfp4 an OWNED `packed`/`scale`
+  // with a null `mmap_src`. The round-2 AdoptDeviceBytesAsHost call then takes
+  // the GENERAL branch, which madvises and frees the host fp4 mirror and
+  // re-points `bytes` at the device buffer. That is new behavior on Vulkan and
+  // no gate covered it; the assertion that matters is that every `.bytes` reader
+  // still sees the weight's VALUES afterwards, since the CPU dequant fallback is
+  // one of them.
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+  const Fp4Dims dims = MakeFp4Dims();
+
+  vllm::Nvfp4Weight w;
+  w.n = dims.n;
+  w.k = dims.k;
+  w.group_size = 16;
+  w.packed = OwnedPatternWeight(dims.packed_bytes);
+  w.scale = OwnedPatternWeight(dims.scale_bytes);
+  REQUIRE_FALSE(w.packed.bytes.borrowed());
+  REQUIRE(w.packed.mmap_src == nullptr);
+
+  const vllm::load_stats::Counters before = vllm::load_stats::Snapshot();
+  vllm::dense_attn::Dev d{b, q};
+  vllm::dense_nvfp4::ResidentNvfp4(d, w);
+  const vllm::load_stats::Counters after = vllm::load_stats::Snapshot();
+
+  CHECK(after.device_upload_bytes - before.device_upload_bytes ==
+        dims.packed_bytes + dims.scale_bytes);
+  REQUIRE(w.d_packed != nullptr);
+  CHECK(w.packed.d_dev.get() == w.d_packed.get());
+  CHECK(w.scale.d_dev.get() == w.d_scale.get());
+
+  // Adopted: ONE copy, and it is the device one.
+  CHECK(w.packed.bytes.borrowed());
+  CHECK(w.scale.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.packed.bytes.data()) == w.d_packed.get());
+  CHECK(static_cast<const void*>(w.scale.bytes.data()) == w.d_scale.get());
+  CHECK(w.packed.bytes.size() == dims.packed_bytes);
+  CHECK(w.scale.bytes.size() == dims.scale_bytes);
+  CHECK_FALSE(w.packed.host_released);
+  CHECK_FALSE(w.Empty());
+
+  // THE VALUES SURVIVED the host mirror being madvise'd away and freed.
+  CHECK(AllBytesMatchPattern(w.packed.bytes.data(), dims.packed_bytes));
+  CHECK(AllBytesMatchPattern(w.scale.bytes.data(), dims.scale_bytes));
 }
