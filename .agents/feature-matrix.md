@@ -29,9 +29,18 @@ instead of it.
 scan of pinned vLLM `555967922` vs these matrices ranked what we are MISSING —
 8 HIGH, ~19 MED, ~16 LOW. Full grounded list (each gap with vLLM `file:line`,
 our-status, effort, priority) in
-[specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md). Top
-HIGH misses: LoRA runtime, the pooling/embedding/rerank task class, AWQ+GPTQ
-compute, xgrammar, fp8-KV, reasoning parsers. Three MED gaps have no stable row
+[specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md).
+**Re-verified 2026-08-10 at `16d5c2ce` ([#243](https://github.com/mudler/vllm.cpp/issues/243)):
+9 of the 16 HIGH/MED rows were stale, every one understating what we have.**
+CLOSED since the sweep: xgrammar, reasoning parsers,
+`/v1/audio/transcriptions`, the offline batch API, KV offload, MLA and
+GDN/Mamba. Downgraded to `PARTIAL` rather than `MISSING`: LoRA runtime, the
+pooling task class, AWQ, GPTQ, fp8-KV, the plugin system. Post-reconcile top
+HIGH misses: **LoRA end to end (the CPU brick exists but nothing reaches it),
+AWQ/GPTQ native GPU compute, fp8-KV on CUDA, classify/score/rerank archs, and
+`/v1/responses` + Anthropic `/v1/messages`.** The pin did not move, so only our
+column changed; re-verify against the tree before scoping from this line.
+Three MED gaps have no stable row
 yet (flagged below): generic draft-model/Medusa spec decode. (The offline Batch
 API RECORDS-GAP was picked up 2026-07-29 as `SERVE-BATCH-API`; the plugin system
 RECORDS-GAP as `ENG-PLUGIN-SYSTEM`; the generic draft-model/Medusa spec-decode
