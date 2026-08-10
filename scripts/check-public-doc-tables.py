@@ -485,7 +485,16 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    "chars": 243571,
+    # 243559 since 2026-08-10 (measured 243559): the logprobs_mode row (#238) needs one
+    # binding line -- three of four modes were runtime-refused stubs and now work.
+    # Paid for by collapsing the best_of cell's upstream RATIONALE ("vLLM 0.26 itself
+    # has dropped best_of from its live path..."), which is a why, not a current state,
+    # and belongs in the row's spec. Deliberately a DIFFERENT collapse from the one PR
+    # #235 makes in the beam-search prose, so the two open PRs cannot conflict on the
+    # same text. Every measured number and binding claim kept verbatim; re-pinned
+    # byte-tight.
+    #
+    "chars": 243559,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

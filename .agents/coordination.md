@@ -1537,6 +1537,17 @@ public-doc change. Does NOT touch the roadmap issue table — PR #235 already
 registers #231 there and duplicating the row would guarantee a keyed-record
 conflict.
 
+**`logprobs_mode` modes (`SAMPLE-LOGPROB-TOKEN-IDS`, 2026-08-10, `CLAIM-SAMPLE-LOGPROBS-MODE`, issue #238).** Claude Code (claude-opus-5), isolated worktree
+`/home/mudler/_git/vllm.cpp-logprobs-mode`, branch `row/SAMPLE-LOGPROBS-MODE`, rebased onto
+`origin/main` `5e67fcc2`. Spec [logprobs-mode.md](specs/logprobs-mode.md). Scope: the three
+unimplemented `logprobs_mode` values and the deletion of the runtime refusal, in
+`src/vllm/v1/sample/sampler.{h,cpp}` plus four cases in
+`tests/vllm/v1/sample/test_sampler.cpp`. CPU-only; NO kernel, vt op, ABI, CMake, model file or
+GPU. Row moves `INVENTORIED` -> `PARTIAL`, NOT `ACTIVE`: `logprob_token_ids` generative scoring
+and the config/CLI plumbing to select a mode from outside the library are both still absent.
+Records a spec-after-code ordering deviation in the spec preamble rather than hiding it behind
+commit order.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-SPEC-DSPARK` | `SPEC-DSPARK` (`ACTIVE`) | Claude Code (opus-5), helper role | isolated worktree `/home/mudler/_git/vllm.cpp-spec-dspark`; CPU-only so far, NO build, NO GPU, NO download | `row/SPEC-DSPARK`, base `origin/main` `bc6e3d72`; NOT PUSHED, no PR yet (remote step PENDING developer authority) | The DSpark spike, records-only in this commit: NEW `.agents/specs/dspark-spec-decode.md`, the `SPEC-DSPARK` engine-matrix row + section/total counters, the feature-matrix §8 DSpark row, the superseded grounding-note header, this claim, `.agents/NOW.md`, and the `docs/STATUS.md`/`docs/FEATURES.md`/`docs/BENCHMARKS.md` one-liners. **NON-COLLISION:** touches NO `src/`, `include/`, `tests/`, `examples/` or CMake path. Implementation slices W1-W6 follow under this same claim. | `ACTIVE` | 2026-08-09 — spike committed. DSpark = the landed DFlash lane + Markov logit-bias head + sequential block sampling + anchor-as-first-prediction layout + `d2t` reduced vocab + method/config resolution + Speculators-format translation; upstream surface is 1613 lines over 5 files, 3 of them DFlash subclasses. Draft checkpoints exist for both gate models and for the 4B pair the upstream test uses; DeepSeek-V4 DSpark is out of scope (HW-blocked). NEXT: W1 config slice (CPU, RED = `speculative.cpp:44` rejects `"dspark"` today) and R1, prove the pinned oracle `555967922` actually RUNS DSpark (it forces the V2 runner). PENDING developer authority: checkpoint downloads, dgx GPU time, push/draft-PR. |
