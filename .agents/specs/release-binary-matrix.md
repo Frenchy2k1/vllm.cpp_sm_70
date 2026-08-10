@@ -493,6 +493,44 @@ tests before workflow expansion, never by a wildcard build.
   byte-for-byte rebuild reproducibility is a separate evidence field until
   demonstrated.
 
+## Hosted CUDA archive-validation repair
+
+The 2026-08-10 hosted dry run at Actions run `31363264184` built and packaged
+six of eight tuples successfully. Both CUDA tuples completed their ten-SM
+builds and archive creation, then failed the extracted-archive dependency gate:
+`ldd` resolved `libcuda.so.1` through `build-release-cuda-{x86,arm64}`. The
+publish chain correctly stopped before verify, attest, or publish.
+
+The failure is in the validation harness, not in the archive. CUDA's driver is
+an external host dependency and hosted build runners have no driver runtime, so
+the harness creates a controlled `libcuda.so.1` alias for the extracted
+`--help` smoke. The caller currently creates that alias below the same build
+directory passed to `--forbid-path`, making the harness violate its own
+invariant. The validator must continue rejecting every dependency resolved
+through a source or build tree.
+
+The approved repair is deliberately narrow:
+
+1. The Linux accelerator release driver creates the validation-only CUDA stub
+   directory with `mktemp` outside the build tree and removes it on exit.
+2. `prepare-cuda-driver-stub.sh` continues to resolve the CUDA toolkit's
+   external stub and create only the runtime SONAME alias; it does not copy or
+   bundle that stub into the release archive.
+3. `validate-release-archive.py` and its strict forbidden-path check remain
+   unchanged. No build path is allowlisted and no `ldd` result is suppressed.
+4. A red-first regression test proves the release driver no longer places the
+   validation stub below `$build_dir`, still exports the exact controlled
+   runtime directory, and installs cleanup before validation.
+5. The focused release archive/accelerator/workflow tests, repository
+   preflight, fresh static+mutation review, and a new hosted eight-tuple dry run
+   must pass. Only that hosted run may advance `archive_claims`; tagged
+   publication remains a separate developer-authorized action.
+
+Rejected alternatives are allowing the known stub path through the validator
+or replacing the runtime resolution smoke with `readelf` alone. The former
+weakens the no-build-path release invariant, while the latter stops proving
+that the extracted executable's declared dependencies resolve.
+
 ## Spike verdict
 
 The release program is feasible as backend-specific static-core bundles with a
