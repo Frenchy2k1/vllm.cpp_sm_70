@@ -138,7 +138,7 @@ through `include/vllm.h`; examples and the server stay thin ABI clients
 
 | W | Scope | Gate |
 |---|---|---|
-| **W0** | Config parse + registry + weight map. No forward. | Config fixtures incl. both `qk_scale_factor` schemas; `None`-means-`True` flags |
+| **W0** ✅ | Config parse + registry + weight map. No forward. | **LANDED 2026-08-10**, see §8 |
 | **W1** | Text tower forward: sandwich norms, iRoPE/NoPE, QK-norm, query pre-scale, output gate | Per-layer reference-dump match, RED-first per mechanism |
 | **W2** | Text e2e greedy vs HF reference | Token-exact on a fixed prompt set |
 | **W3** | Perception encoder: patchify, pos-emb interp, 2D RoPE, window attention, pixel shuffle | Tower dump match, per-stage fixtures |
@@ -208,5 +208,40 @@ to include it plus transformers 5.15. No ceiling is declared
 
 ## 7. Outcome
 
-Pending. Filled in when the row reaches `DONE`: what was measured, what was
+Pending overall.
+
+## 8. W0 — the CPU scaffold (2026-08-10, `CLAIM-MUSE-GLIMMER-W0`)
+
+Additive only: `include/vllm/model_executor/models/muse_glimmer.h`,
+`src/vllm/model_executor/models/muse_glimmer{,_weights,_registry}.cpp`,
+`tests/vllm/models/test_muse_glimmer_scaffold.cpp`. No forward, no checkpoint,
+no GPU, no download.
+
+Both architecture strings register onto one factory, mirroring upstream. The
+config parse handles the canonical nested layout *and* normalizes the older flat
+layout. The weight-name mapper ports `hf_to_vllm_mapper` for both checkpoint
+conventions. The structural enumeration deliberately omits the three weightless
+modules (`embed_norm`, the per-head `qk_norm`, `perception_emb_norm`) that ship
+no tensor — enumerating them would make the loader demand tensors that do not
+exist in any checkpoint. The forward refuses by name.
+
+**Gate:** `test_muse_glimmer_scaffold` 11/11 cases, 73/73 assertions, clean CPU
+`-Werror` build. Full CPU `ctest` green (regression: the change is additive TUs
+plus two registry entries).
+
+**RED-first mutation evidence.** Each of the four named traps was mutated in
+tree, rebuilt, and confirmed to turn the gate red; the tree was then restored
+byte-for-byte (verified by an empty `git diff`) and the gate re-run green:
+
+| Mutation | Result |
+|---|---|
+| Native raw `qk_scale_factor` treated as already-folded (the 11.3x query blow-up) | 3 assertions RED |
+| Absent `use_qk_norm` / `use_attn_output_gate` defaulted to `false` | 4 assertions RED |
+| iRoPE mask counted forward instead of backward from the last layer | 5 assertions RED |
+| Legacy sandwich-norm renames applied in the wrong order (swapping post-attention with pre-feedforward) | 1 assertion RED |
+
+**What W0 does NOT establish.** No forward runs, so nothing here says the model
+produces correct tokens. The KV-cache spec is a documented placeholder: the real
+sliding/full split rides the Gemma-4 per-layer spec seam and lands with W1. And
+per §0 no speed axis is measurable at all while the pin lacks `muse_glimmer`. Filled in when the row reaches `DONE`: what was measured, what was
 rejected and why, and why each default is set the way it is.

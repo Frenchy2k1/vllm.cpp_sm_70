@@ -209,6 +209,22 @@ forms in use, so pick a checkpoint by its quality, not by its head:
 The head is dequantized to BF16 at load, so all three cost the same memory once
 running. Any other dtype fails at load with a message naming what it saw.
 
+### Architectures that resolve but refuse to run
+
+A few architectures are registered so their config and weight layout are
+accounted for, while their forward is deliberately not implemented. Pointing the
+CLI or server at one of these loads far enough to resolve the architecture and
+then fails with a message naming the missing piece, rather than emitting wrong
+tokens quietly.
+
+| Architecture | Why it refuses |
+|---|---|
+| `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
+| `MuseGlimmerForCausalLM`, `MuseGlimmerForConditionalGeneration` | Scaffold only. The text tower and perception encoder are not implemented, and the pinned vLLM cannot load `muse_glimmer` at all, so there is nothing to gate against yet |
+
+This is a deliberate state, not a bug: registering the architecture is what lets
+the config parse and weight-name mapping be tested before the forward exists.
+
 ## OpenAI-compatible server
 
 `vllm-server` is a small HTTP server speaking the OpenAI API. Source:
