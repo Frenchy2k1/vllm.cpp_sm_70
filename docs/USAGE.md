@@ -279,7 +279,15 @@ On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
 GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
 head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
 2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
-GiB, a 1.70 GiB saving). The head runs W4A16 under both namings: the on-disk
+GiB, a 1.70 GiB saving on CUDA; the figure is owed a re-measurement after
+`ENG-LOAD-DIRECT-UPLOAD` changed the RSS accounting).
+
+That accounting is CUDA's. A backend with no fp4 GEMM (CPU, Vulkan, Metal, HIP,
+Tenstorrent) has to multiply against a dequantized bf16 copy, so on those the
+head costs the packed bytes **plus** one `2*K*N` operand, built once when the
+model is prepared rather than per call. Only the head is kept that way; every
+other NVFP4 projection dequantizes per call, so a quantized tower is never
+expanded in memory. The head runs W4A16 under both namings: the on-disk
 activation divisor next to it (`input_scale`, or `input_global_scale` in the
 compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
 matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a

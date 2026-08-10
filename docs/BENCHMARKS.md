@@ -98,7 +98,7 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 | Axis | Packed (`VT_LMHEAD_FP4=1`) | Dequant (`=0`) | Result |
 |---|---:|---:|---|
-| Peak host RSS | 19.36 GiB | 21.06 GiB | **-1.70 GiB**, SOLID |
+| Peak host RSS | 19.36 GiB | 21.06 GiB | **-1.70 GiB**, but measured BEFORE `ENG-LOAD-DIRECT-UPLOAD` (#150) made `LoadCtNvfp4Raw` borrow mmap'd bytes, which moves the RSS accounting; re-measurement OWED |
 | Greedy continuation | identical to the dequant leg, byte for byte | | SOLID |
 | `test_qwen27_paged_engine` | 235/235 | 235/235 | unchanged |
 | tok/s, leg A / leg B | 11.197 / 11.193 | 9.418 / 10.163 | **INDICATIVE ONLY** |

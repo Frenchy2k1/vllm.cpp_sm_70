@@ -1342,12 +1342,12 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
   }
 }
 
-// PERF-27B-LMHEAD-FP4 (issue #213). The PAGED forward has TWO lm_head call
-// sites — the gathered (prefill/mixed) and the non-gathered full [T,vocab] arm —
-// and a PACKED NVFP4 head leaves the bf16 owner EMPTY, so reverting either site
-// to it hands the logits GEMM an empty tensor. The packed head's gate
-// (test_qwen27_dense_lmhead_fp4) pins its NUMERICS but runs only the EAGER
-// ForwardDense; this pins that both PAGED arms SELECT it.
+// PERF-27B-LMHEAD-FP4 (issue #213). The PAGED forward has TWO lm_head call sites
+// — gathered (prefill/mixed) and the non-gathered full [T,vocab] arm — and a
+// PACKED head leaves the bf16 owner EMPTY, so reverting either hands the logits
+// GEMM an empty tensor. test_qwen27_dense_lmhead_fp4 pins the NUMERICS but runs
+// only the EAGER forward; this pins that both PAGED arms SELECT the packed head.
+namespace {
 Nvfp4Weight MakePackedHead(int64_t n, int64_t k, uint64_t seed) {
   Nvfp4Weight w;
   w.n = n;
@@ -1355,16 +1355,20 @@ Nvfp4Weight MakePackedHead(int64_t n, int64_t k, uint64_t seed) {
   w.scale2 = 0.125F;  // ModelOpt weight_scale_2 IS the scale
   w.packed = MakeOwned(DType::kI8, {n, k / 2}, seed);
   w.scale = MakeOwned(DType::kI8, {n, k / 16}, seed + 1);
-  // MakeOwned fills f32/bf16 patterns; fp4 operands are raw bytes.
-  auto* pb = reinterpret_cast<uint8_t*>(w.packed.bytes.data());
+  // fp4 operands are RAW bytes, and MakeOwned has no kI8 arm — its f32 branch
+  // over-allocates 4 B/element — so size and fill them exactly here.
+  w.packed.bytes.resize(static_cast<size_t>(n) * static_cast<size_t>(k / 2));
+  w.scale.bytes.resize(static_cast<size_t>(n) * static_cast<size_t>(k / 16));
+  auto* pb = w.packed.bytes.data();
   for (size_t i = 0; i < w.packed.bytes.size(); ++i)
     pb[i] = static_cast<uint8_t>((i * 37U + 11U) & 0x77U);
   const uint8_t kE4M3PowersOfTwo[4] = {0x34, 0x38, 0x3C, 0x40};  // .25 .5 1 2
-  auto* sb = reinterpret_cast<uint8_t*>(w.scale.bytes.data());
+  auto* sb = w.scale.bytes.data();
   for (size_t i = 0; i < w.scale.bytes.size(); ++i)
     sb[i] = kE4M3PowersOfTwo[i & 3U];
   return w;
 }
+}  // namespace
 
 TEST_CASE("qwen27 dense paged: both lm_head arms run a PACKED NVFP4 head") {
   const HfConfig c = MakeConfig();

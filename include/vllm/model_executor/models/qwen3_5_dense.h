@@ -99,22 +99,21 @@ struct Qwen3_5DenseLayerWeights {
 
 // Whole dense-model text weights. The CHECKPOINT may store the head BF16, FP8
 // (per-channel scale) or ModelOpt NVFP4 — the 27B NVFP4 publishers disagree, and
-// revisions of one repo disagree with each other (issue #164). A BF16 or FP8 head
-// is materialized into `lm_head`; a ModelOpt/CT NVFP4 head stays PACKED in
-// `lm_head_fp4` (PERF-27B-LMHEAD-FP4, issue #213). Exactly one is populated.
+// revisions of one repo disagree with each other (issue #164). BF16/FP8 are
+// materialized into `lm_head`, NVFP4 stays PACKED in `lm_head_fp4`
+// (PERF-27B-LMHEAD-FP4, issue #213); exactly one is populated.
 struct Qwen3_5DenseWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
   OwnedTensor lm_head;       // bf16 [H, vocab]  (dequantized -> Matmul-B layout)
-  // NVFP4-resident output head [N=vocab, K=H], kept in the on-disk orientation
-  // the fp4 GEMMs read. Mirrors the MoE arm's Qwen3_5MoeWeights::lm_head_fp4 and
-  // vLLM's own decision to leave the head quantized:
-  // ModelOptMixedPrecisionConfig.get_quant_method accepts ParallelLMHead
-  // (modelopt.py:2508-2536) and _quantized_layer_prefix_candidates appends the
-  // bare `lm_head` key (modelopt.py:2491-2496), so ModelOptNvFp4W4A16LinearMethod
-  // — which pins MarlinNvFp4LinearKernel (modelopt.py:1249,1283-1284) — resolves
-  // it and logits_processor._apply_head calls quant_method.apply every step
-  // (logits_processor.py:98-133). Empty on every BF16/FP8/GGUF/tied checkpoint.
+  // NVFP4-resident output head [N=vocab, K=H], kept in the on-disk orientation the
+  // fp4 GEMMs read. Mirrors Qwen3_5MoeWeights::lm_head_fp4 and vLLM's own decision
+  // to leave the head quantized: get_quant_method accepts ParallelLMHead
+  // (modelopt.py:2508-2536) over the bare `lm_head` key (modelopt.py:2491-2496),
+  // so ModelOptNvFp4W4A16LinearMethod — pinning MarlinNvFp4LinearKernel
+  // (modelopt.py:1249,1283-1284) — resolves it and logits_processor._apply_head
+  // calls quant_method.apply every step (logits_processor.py:98-133). Empty on
+  // every BF16/FP8/GGUF/tied checkpoint.
   Nvfp4Weight lm_head_fp4;
   // Mirrors tie_word_embeddings: logits reuse embed_tokens as raw [V,H]
   // torch-Linear storage, so no second host/device owner is created.
@@ -148,10 +147,8 @@ OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get,
 
 // PERF-27B-LMHEAD-FP4 (issue #213). Load the dense output head into EXACTLY ONE
 // of the two owners: a ModelOpt/compressed-tensors NVFP4 head stays PACKED in
-// `fp4_out` (leaving `bf16_out` empty), every other storage form is materialized
-// bf16 [in, out] into `bf16_out` by LoadLmHeadAnyDtype (leaving `fp4_out` empty).
-// `proj` is the module path WITHOUT the trailing ".weight" (i.e. "lm_head").
-// Exported for the loader gate.
+// `fp4_out`, every other storage form is materialized bf16 [in, out] into
+// `bf16_out` by LoadLmHeadAnyDtype. `proj` omits the trailing ".weight".
 void LoadDenseLmHead(const TensorResolver& get,
                      const std::function<bool(const std::string&)>& has,
                      const std::string& proj, OwnedTensor& bf16_out,
@@ -159,8 +156,7 @@ void LoadDenseLmHead(const TensorResolver& get,
 
 // True when the checkpoint ships an EXPLICIT head under either naming
 // (`<proj>.weight`, or `<proj>.weight_packed` for compressed-tensors NVFP4);
-// false means `tie_word_embeddings`. Exported so the gate can pin a CT-named
-// head as such rather than as a tied one.
+// false means `tie_word_embeddings`.
 bool DenseCheckpointHasLmHead(const std::function<bool(const std::string&)>& has,
                               const std::string& proj);
 
@@ -223,9 +219,8 @@ class Qwen3_5DenseModel {
 
   // PERF-27B-LMHEAD-FP4 (issue #213). Build the resident form of the packed
   // `lm_head_fp4` THIS backend's logits GEMM consumes: the Marlin W4A16 repack
-  // on CUDA (PRE-CAPTURE), else the dequantized bf16 [K,N] operand (so the
-  // forward never dequantizes per call). Inert when the head is not packed.
-  // Called from the registry `prepare` hook, mirroring the MoE sibling.
+  // on CUDA (PRE-CAPTURE), else the dequantized bf16 [K,N] operand. Inert when
+  // the head is not packed. Called from the registry `prepare` hook.
   static void PrepareLmHeadResident(const Qwen3_5DenseWeights& weights,
                                     vt::Queue& queue);
 
