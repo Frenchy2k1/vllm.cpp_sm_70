@@ -108,9 +108,13 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 sm_120 board exists on this hardware. See backend-matrix.md
 #                 BACKEND-CUDA-SM120 for exactly what is and is not proven.
 #   120a;121a     same-family FAT binary; builds clean and carries both SASS
-#                 targets. NOTE: incompatible with -DVLLM_CPP_TRITON=ON, because a
-#                 vendored AOT cubin is single-arch (TritonAOT.cmake explains and
-#                 diagnoses this); the portable CUDA kernels cover the fat build.
+#                 targets. VLLM_CPP_TRITON=ON is FINE here (and is the default):
+#                 a vendored AOT cubin is single-arch, but the W2 builder embeds
+#                 EVERY vendored tree and picks one by exact SM at runtime, so
+#                 sm_120a — which has no tree — simply uses the portable CUDA
+#                 kernels. This is what the shipped ten-SM release archive and
+#                 the cuda-fat-gencode CI job build. The single-arch FATAL_ERROR
+#                 in TritonAOT.cmake guards the MAINTAINER regen flow only.
 #   90a           Hopper (H100/H200) — a DIFFERENT family. Single-arch only, and
 #                 PORTABLE-KERNELS-ONLY: all five accelerated features resolve
 #                 DISABLED (we have no Hopper wgmma/TMA kernel body, so no
@@ -637,7 +641,8 @@ endif()
 include(cmake/CompilerWarnings.cmake)
 # Triton AOT kernels (cubins embedded in C launchers, CUDA-only), VENDORED
 # per-arch under src/vt/cuda/triton_aot_vendored/. Defines the gated option
-# VLLM_CPP_TRITON (default OFF; consumes the vendored artifacts — NO Python) +
+# VLLM_CPP_TRITON (default COMPUTED: ON for a CUDA build whose vendored trees are
+# present, OFF otherwise; consumes the vendored artifacts — NO Python) +
 # the maintainer knob VLLM_CPP_TRITON_REGEN (regenerates them with Python+Triton;
 # scripts/regen-triton-aot.sh) + add_triton_kernel()/triton_aot_finalize(); with
 # the option OFF this include is inert (no sources added). Wired below under
@@ -1599,7 +1604,8 @@ if(VLLM_CPP_CUDA)
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
   endif()
 
-  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default OFF)
+  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default ON
+  # for a CUDA build) ─────────────────────────────────────────────────────────
   # The FLA chunk_delta_h state-recurrence kernel as an embedded cubin in libvllm
   # (VENDORED per-arch — the build needs no Python; VLLM_CPP_TRITON_REGEN=ON is
   # the maintainer regen); runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
