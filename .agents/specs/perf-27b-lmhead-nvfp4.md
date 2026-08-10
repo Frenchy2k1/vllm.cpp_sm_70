@@ -3,8 +3,9 @@
 Issue: [#213](https://github.com/mudler/vllm.cpp/issues/213)
 Row: `PERF-27B-LMHEAD-FP4`
 Gate model: `nvidia/Qwen3.6-27B-NVFP4` @`0893e1606ff3d5f97a441f405d5fc541a6bdf404`
-Base: `origin/main` @`04069bd7`; the review-findings round is rebased onto
-`origin/main` @`723d96a8`.
+Base: `origin/main` @`04069bd7`; the round-1 findings were rebased onto
+`origin/main` @`723d96a8`, the round-2 findings onto `origin/main` @`a0fa12c7`
+(after `ENG-LOAD-DIRECT-UPLOAD` #150).
 
 ## Scope
 
@@ -142,6 +143,14 @@ Added in the review-findings round, each pinned by a mutation that turns it RED:
 6. The fallback dequant is built ONCE (pointer identity across two forwards),
    not per call, and the registry `prepare` hook builds it before any forward.
 
+Added in the ROUND-2 findings round:
+
+7. The same case additionally populates an NVFP4 **tower** (every layer's
+   `mlp.{gate,up,down}_proj_fp4`) and asserts that after two forwards on the same
+   no-fp4-GEMM backend NONE of them holds a `d_dequant_b`. RED under the mutation
+   that removes the `keep_dequant_b` guard (6 failing assertions, 3 projections x
+   2 layers), which is exactly the round-1 behavior.
+
 Port anchor: `marlin_utils_fp4.py` tolerances and shapes as used by the existing
 NVFP4A16 op tests.
 
@@ -161,13 +170,52 @@ NVFP4A16 op tests.
   for the logits kernel on both legs as the invocation-parity evidence.
 - Memory: peak host RSS on both legs. Expected delta **1.70 GiB**: the bf16
   head is `2*K*N` = 2,543,206,400 B = 2.368 GiB and the packed head is
-  `K*N/2 + K*N/16` = 715,264,000 B = 0.666 GiB, at the real 248320x5120.
+  `K*N/2 + K*N/16` = 715,264,000 B = 0.666 GiB, at the real 248320x5120. The
+  21.06 -> 19.36 GiB reading was taken BEFORE #150 rewrote `LoadCtNvfp4Raw` to
+  borrow mmap'd bytes; that changes what host RSS counts, so the figure is
+  recorded as OWED a re-measurement rather than carried forward as accepted.
 
 ## Evidence
 
 `dgx:~/work/vllm.cpp-online-gate/evidence/<sha>/lmhead-fp4/` — raw A/B legs,
 both `nsys` reports, the continuation transcripts from both engines, RSS
 samples, and the build recipe.
+
+## Residency, and the shared-seam exception
+
+The dequantized bf16 `[K,N]` operand a backend with no fp4 GEMM multiplies
+against is kept for the model's lifetime **only for a weight that opts in**
+(`Nvfp4Weight::keep_dequant_b`, set by `LoadDenseLmHead` and by nothing else).
+
+Round 2 found the round-1 fix had cached it for EVERY NVFP4 weight, because the
+caching sat inside `MatmulNvfp4F32D` / `MatmulNvfp4Bf16D`, which also serve the
+dense MLP, `o_proj`, GDN `out_proj` and the MoE shared experts. `kMatmulNvfp4` is
+registered CUDA-only (`cuda_matmul_nvfp4.cu`), so CPU, Vulkan, Metal, HIP and
+Tenstorrent all take that fallback: their steady state went from packed-only to
+packed plus a bf16 expansion of the WHOLE tower, roughly 4x the packed bytes, on
+the backends where issue #203 already reports the 27B peaking at 100.8 GiB.
+
+Residency is therefore a property of the WEIGHT, not of the GEMM. It is worth its
+bytes exactly where one operand is re-read whole every step and there is one of
+it — the output head. Alternatives rejected: making it a per-BACKEND switch (the
+tower is the problem on every fallback backend, not on a particular one) and
+dequantizing the head into `Qwen3_5DenseWeights::lm_head` at prepare time (the
+prepare hook may hold BORROWED, const weights, so only `mutable` residency state
+is writable there).
+
+**Shared-seam exception, recorded.** `qwen3_5.cpp` carries a private device
+dispatcher (`MatmulNvfp4F32D` / `MatmulNvfp4Bf16D`) parallel to the shared
+`dense_nvfp4::MatmulNvfp4W4A16D`. That predates this row: `dense_nvfp4_gemm.h`
+was EXTRACTED from `qwen3_5.cpp`'s anonymous namespace and its own SCOPE comment
+records that the true-W4A4 (fp4-activation) path stays private to `qwen3_5.cpp`,
+so the two also carry independent `Dev`, `MakeTensor`, `ResidentNvfp4` and
+`DequantNvfp4ToBLayout` copies. Unifying them is a refactor this row does not do.
+What this row does instead is put the opt-in on the SHARED data type
+(`Nvfp4Weight`, `qwen3_5_weights.h`), which both dispatchers read, and default it
+OFF — so the shared seam's fallback and the private one cannot disagree about a
+weight, and no weight reachable from `MatmulNvfp4W4A16D` opts in today. The PR
+body and commit message claim only the dense `lm_head`, never "every fp4
+projection".
 
 ## Stop conditions
 

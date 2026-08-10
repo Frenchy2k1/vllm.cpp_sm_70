@@ -1180,12 +1180,11 @@ std::vector<uint16_t> DequantNvfp4ToBLayout(const Nvfp4Weight& w) {
 }
 
 // The SAME bf16 [K=in, N=out] operand, uploaded ONCE and kept resident on the
-// weight (mirror of ResidentNvfp4, same Backend deleter). This is the fallback
-// every backend without an fp4 GEMM takes — CPU registers only kMatmulNvfp4Fp4,
-// Vulkan/Metal neither kMatmulNvfp4 nor the Marlin grouped GEMM — so uncached it
-// rebuilds K*N bf16 per call. PERF-27B-LMHEAD-FP4 moved the 27B head here, where
-// the loader used to pay that dequant once and per call it is ~2.54 GB a step.
+// weight (mirror of ResidentNvfp4, same Backend deleter). OPT-IN per weight
+// (`keep_dequant_b`, qwen3_5_weights.h): only the output head is worth a lifetime
+// bf16 expansion of ~4x its packed bytes.
 Tensor ResidentNvfp4DequantB(Dev d, const Nvfp4Weight& w) {
+  VT_CHECK(w.keep_dequant_b, "nvfp4: dequant-B residency is opt-in per weight");
   if (!w.d_dequant_b) {
     const std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
     const size_t nb = wb.size() * sizeof(uint16_t);
@@ -1195,6 +1194,22 @@ Tensor ResidentNvfp4DequantB(Dev d, const Nvfp4Weight& w) {
     w.d_dequant_b = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
   }
   return MakeTensor(w.d_dequant_b.get(), DType::kBF16, d.q.device, {w.k, w.n});
+}
+
+// out[M,N] = x[M,K] @ dequant(w).T — the fallback both device dispatchers take on
+// a backend with NO fp4 GEMM (CPU registers only kMatmulNvfp4Fp4; Vulkan/Metal
+// neither kMatmulNvfp4 nor the Marlin grouped GEMM). A weight that did not opt in
+// keeps the PER-CALL temporary it has always had; caching the whole NVFP4 tower
+// would quadruple its steady-state bytes on exactly those backends.
+void MatmulNvfp4DequantB(Dev d, Tensor& out, const Tensor& x,
+                         const Nvfp4Weight& w) {
+  if (w.keep_dequant_b) {
+    vt::Matmul(d.q, out, x, ResidentNvfp4DequantB(d, w));
+    return;
+  }
+  const std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+  DBuf dwb(d, DType::kBF16, {w.k, w.n}, wb.data());
+  vt::Matmul(d.q, out, x, dwb.t());
 }
 
 // y[M,N] f32 = x[M,K] bf16 @ dequant(w).T, w fp4-resident [N=out, K=in]. Drops
@@ -2579,25 +2594,20 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
-    vt::Matmul(d.q, dout.t(), x, ResidentNvfp4DequantB(d, w));
+    MatmulNvfp4DequantB(d, dout.t(), x, w);
   }
   return dout;
 }
 
 // The ONE dense-gate logits GEMM: y[M,vocab] f32 = x[M,H] @ lm_head.
-//
 // PERF-27B-LMHEAD-FP4 (issue #213). A ModelOpt NVFP4 head stays PACKED, so the
-// GEMM reads K*N/2 + K*N/16 bytes per step instead of the 2*K*N of a
-// dequantized bf16 operand (~0.715 GB vs ~2.543 GB at the real 248320x5120), and
-// the operand keeps its on-disk [N,K] orientation instead of forcing the
-// row-major NN GEMM that has no nvjet_sm121 kernel. Mirrors vLLM's
-// logits_processor._apply_head -> lm_head.quant_method.apply
-// (logits_processor.py:98-133) and the MoE arm above; every dense consumer
-// (eager ForwardDense, the gathered and non-gathered paged arms) routes here so
-// exactly one head layout is ever selected.
-//
-// The bf16 arm keeps BOTH of its existing shapes: the tied embed_tokens raw
-// [V,H] owner (nk -> MatmulBf16LogitsF32D) and the transposed [H,V] owner.
+// GEMM reads K*N/2 + K*N/16 bytes per step instead of the 2*K*N of a dequantized
+// bf16 operand (~0.715 GB vs ~2.543 GB at the real 248320x5120), and keeps its
+// on-disk [N,K] orientation instead of forcing the row-major NN GEMM that has no
+// nvjet_sm121 kernel. Mirrors logits_processor._apply_head ->
+// lm_head.quant_method.apply (logits_processor.py:98-133). Every dense consumer
+// (eager ForwardDense, the gathered and non-gathered paged arms) routes here, so
+// exactly one head layout is selected; the bf16 arm keeps both of its shapes.
 DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights) {
   if (!weights.lm_head_fp4.Empty())
     return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
@@ -2623,7 +2633,7 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
-    vt::Matmul(d.q, dout.t(), x, ResidentNvfp4DequantB(d, w));
+    MatmulNvfp4DequantB(d, dout.t(), x, w);
   }
   return dout;
 }
@@ -6492,15 +6502,12 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 // dense head THIS backend's logits GEMM will actually consume, once, at prepare
 // time. Inert on every BF16/FP8/GGUF/tied head (`lm_head_fp4` empty).
 //
-// CUDA/Marlin: prepare time is strictly BEFORE any decode-graph capture, and
-// that matters — BuildMarlinDenseResident Allocs, launches the repack, and
-// Copies a host float (the processed global scale) whose source is a
-// function-local temporary. CUDA aborts such a capture with an error rather
-// than baking it silently, but a graph is not where a weight gets built. Same
-// arm as Qwen3_5Model::PrepareMarlinResident's lm_head build above.
-//
-// Backends with NO fp4 GEMM (CPU / Vulkan / Metal): build the dequantized bf16
-// [K,N] operand here instead, so it is paid once, never on the forward path.
+// CUDA/Marlin: prepare time is strictly BEFORE any decode-graph capture, and that
+// matters — BuildMarlinDenseResident Allocs, launches the repack, and Copies a
+// host float whose source is a function-local temporary. Same arm as
+// Qwen3_5Model::PrepareMarlinResident's lm_head build above. A backend with NO
+// fp4 GEMM builds the dequantized bf16 [K,N] operand here instead, so the head —
+// the one weight that opted into it — never pays it on the forward path.
 void Qwen3_5DenseModel::PrepareLmHeadResident(const Qwen3_5DenseWeights& weights,
                                               vt::Queue& queue) {
   if (weights.lm_head_fp4.Empty()) return;
@@ -6546,12 +6553,9 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
 
   raw(weights.embed_tokens);
   raw(weights.final_norm);
-  // PERF-27B-LMHEAD-FP4: `raw` is already a no-op for a PACKED head, whose bf16
-  // owner is empty by construction (LoadDenseLmHead fills exactly one of the
-  // two), and this function is only reached under IsPlainBf16Qwen3_5Dense, false
-  // whenever the head is packed. The 1.70 GiB saving is the LOADER never
-  // building the f32 + bf16 arrays, not anything skipped here; the packed head's
-  // resident is built by PrepareLmHeadResident.
+  // PERF-27B-LMHEAD-FP4: already a no-op for a PACKED head (empty bf16 owner, and
+  // IsPlainBf16Qwen3_5Dense is false whenever the head is packed); its resident is
+  // built by PrepareLmHeadResident.
   raw(DenseLmHead(weights));
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     raw(layer.input_layernorm);
@@ -6782,11 +6786,8 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       config_(&config),
       embed_tokens_(&target.embed_tokens),
       lm_head_(&DenseLmHead(target)),
-      // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must
-      // see the packed one too — otherwise ForwardLogits would fall through to
-      // an empty bf16 owner on a ModelOpt NVFP4 checkpoint. Empty on every
-      // BF16/FP8/tied dense target, where the bf16 arm is selected exactly as
-      // before. Mirrors the MoE ctor below.
+      // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
+      // the packed one too. Empty on every BF16/FP8/tied dense target.
       lm_head_fp4_(&target.lm_head_fp4) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
@@ -7117,10 +7118,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
-  // Both arms route through DenseLogitsF32D, so a PACKED NVFP4 head
-  // (PERF-27B-LMHEAD-FP4) and the bf16/tied owner select the same way here as in
-  // the eager forward. Pure-decode / graph replay pass empty indices (identity)
-  // → the full [T,vocab] path.
+  // Both arms route through DenseLogitsF32D (PERF-27B-LMHEAD-FP4). Pure-decode /
+  // graph replay pass empty indices (identity) → the full [T,vocab] path.
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   if (do_gather) {

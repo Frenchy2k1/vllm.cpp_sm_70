@@ -1,20 +1,13 @@
 // PERF-27B-LMHEAD-FP4 (issue #213) — keep the ModelOpt NVFP4 `lm_head` PACKED.
-//
 // `nvidia/Qwen3.6-27B-NVFP4` ships a ModelOpt NVFP4 output head (`lm_head.weight`
 // U8 + `lm_head.weight_scale` F8_E4M3 + `lm_head.weight_scale_2` f32). The dense
 // loader used to DEQUANTIZE it into a bf16 [in,out] Matmul-B owner, so the logits
 // GEMM re-read ~2.543 GB every decode step where the packed head is ~0.715 GB.
+// vLLM keeps it quantized instead (anchors on `Qwen3_5DenseWeights::lm_head_fp4`,
+// qwen3_5_dense.h).
 //
-// vLLM keeps that head quantized: `ModelOptMixedPrecisionConfig.get_quant_method`
-// accepts `ParallelLMHead` (modelopt.py:2508-2536) and
-// `_quantized_layer_prefix_candidates` appends the bare `lm_head` key
-// (modelopt.py:2491-2496), so `ModelOptNvFp4W4A16LinearMethod` — which pins
-// `MarlinNvFp4LinearKernel` (modelopt.py:1249,1283-1284) — resolves the head and
-// `logits_processor._apply_head` (logits_processor.py:98-133) calls
-// `lm_head.quant_method.apply` every step. Nothing materializes BF16.
-//
-// These cases pin the LOADER ROUTING and the NUMERICS of that decision. They are
-// synthetic (no checkpoint, no GPU) on purpose: the 235/235
+// These cases pin the LOADER ROUTING, the NUMERICS and the RESIDENCY of that
+// decision. They are synthetic (no checkpoint, no GPU) on purpose: the 235/235
 // `test_qwen27_paged_engine` gate runs `unsloth`@890bdef7, whose head is BF16, so
 // that gate is BLIND to this path.
 #include <doctest/doctest.h>
@@ -39,7 +32,6 @@
 #include "vt/dtype.h"
 
 using vllm::DenseCheckpointHasLmHead;
-using vllm::DenseMlpWeights;
 using vllm::HfConfig;
 using vllm::LoadDenseLmHead;
 using vllm::ModelRegistry;
@@ -100,14 +92,11 @@ float RandV(uint64_t seed) {
   return static_cast<float>(u * 0.16 - 0.08);
 }
 
-// One deterministic ModelOpt NVFP4 head fixture. The nibbles and the group scale
-// bytes are chosen DIRECTLY (exact E2M1 codes, exact powers-of-two fp8 block
-// scales) so the value a correct dequant must produce is exact and known here:
-//
+// One deterministic ModelOpt NVFP4 fixture. The nibbles and group scale bytes are
+// chosen DIRECTLY (exact E2M1 codes, exact powers-of-two fp8 block scales) so the
+// value a correct dequant must produce is exact and known here:
 //   w[r][c] = sign * kE2M1Lut[idx] * F8E4M3ToF32(block_scale) * weight_scale_2
-//
-// `weight_scale_2` is the ModelOpt convention: the SCALE itself, not the
-// compressed-tensors divisor.
+// `weight_scale_2` is the ModelOpt convention: the SCALE, not the CT divisor.
 constexpr float kFixtureScale2 = 0.125F;
 
 struct Nvfp4Fixture {
@@ -161,9 +150,8 @@ void PutModelOptHead(Bag& bag, const std::string& proj, int64_t n, int64_t k,
   std::memcpy(s2.bytes.data(), &v, 4);
   bag.Put(proj + ".weight_scale_2", std::move(s2));
   if (with_input_scale) {
-    // The gate checkpoint DOES ship `lm_head.input_scale`. Consuming it would
-    // flip IsTrueW4A4() and select the W4A4 GEMM vLLM explicitly refuses on this
-    // head (modelopt.py:1359-1362 DELETES input_scale on the W4A16 path).
+    // The gate checkpoint DOES ship `lm_head.input_scale`. Consuming it would flip
+    // IsTrueW4A4() and select the W4A4 GEMM vLLM refuses here (modelopt.py:1365).
     Fake is{"F32", {}, std::vector<uint8_t>(4)};
     const float iv = 0.0625F;
     std::memcpy(is.bytes.data(), &iv, 4);
@@ -171,10 +159,9 @@ void PutModelOptHead(Bag& bag, const std::string& proj, int64_t n, int64_t k,
   }
 }
 
-// The SAME fp4 bytes under compressed-tensors names. CT spells the global scale
-// `weight_global_scale` and stores it as a DIVISOR (so 1/scale), and it ships a
-// per-tensor `input_global_scale` next to every quantized Linear — which is
-// exactly the activation divisor that must NOT be consumed on an output head.
+// The SAME fp4 bytes under compressed-tensors names: `weight_global_scale` is a
+// DIVISOR (1/scale), and the per-Linear `input_global_scale` shipped next to it
+// is exactly the activation divisor that must NOT be consumed on an output head.
 void PutCtNvfp4Head(Bag& bag, const std::string& proj, int64_t n, int64_t k,
                     const Nvfp4Fixture& f) {
   bag.Put(proj + ".weight_packed", Fake{"U8", {n, k / 2}, f.packed});
@@ -187,6 +174,23 @@ void PutCtNvfp4Head(Bag& bag, const std::string& proj, int64_t n, int64_t k,
   const float iv = 16.0F;
   std::memcpy(igs.bytes.data(), &iv, 4);
   bag.Put(proj + ".input_global_scale", std::move(igs));
+}
+
+// The fixture bytes as an NVFP4 TOWER projection [N=out, K=in].
+Nvfp4Weight MakeNvfp4Weight(int64_t n, int64_t k, uint64_t seed) {
+  const Nvfp4Fixture f = MakeNvfp4Fixture(n, k, seed);
+  Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.scale2 = kFixtureScale2;
+  w.packed.dtype = w.scale.dtype = DType::kI8;
+  w.packed.rank = w.scale.rank = 2;
+  w.packed.shape[0] = w.scale.shape[0] = n;
+  w.packed.shape[1] = k / 2;
+  w.scale.shape[1] = k / 16;
+  w.packed.bytes.assign(f.packed.begin(), f.packed.end());
+  w.scale.bytes.assign(f.scale.begin(), f.scale.end());
+  return w;
 }
 
 uint16_t F32ToBf16(float v) {
@@ -216,8 +220,7 @@ Fake MakeBf16(const std::vector<int64_t>& shape, uint64_t seed) {
 }
 
 // --- the small synthetic dense model (shape scaffold from
-// tests/vllm/models/test_qwen27_dense_forward.cpp; hidden/vocab widened so the
-// head's K and N are Marlin-shaped on a CUDA queue) ---
+// test_qwen27_dense_forward.cpp; hidden/vocab widened to Marlin-shaped) ---
 
 OwnedTensor MakeOwned(DType dt, std::vector<int64_t> shape, uint64_t seed) {
   OwnedTensor t;
@@ -316,11 +319,10 @@ vt::Queue CpuQ() {
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 
-// The bf16 [K,N] Matmul-B owner the OLD loader produced for this exact head:
-// dequant to f32, round to bf16, transpose. Built here from the fixture's own
-// exact values, NOT by calling either production dequant — so the numerical case
-// below compares the packed forward against an independent reference rather than
-// against a shared helper.
+// The bf16 [K,N] Matmul-B owner the OLD loader produced for this head: dequant,
+// round to bf16, transpose. Built from the fixture's own exact values, NOT by
+// calling either production dequant, so the numerical case below compares against
+// an INDEPENDENT reference.
 OwnedTensor ReferenceBf16Head(const Nvfp4Fixture& f, int64_t n, int64_t k) {
   OwnedTensor o;
   o.dtype = DType::kBF16;
@@ -351,8 +353,8 @@ TEST_CASE("qwen27 dense lm_head: a ModelOpt NVFP4 head stays PACKED (no bf16 own
   LoadDenseLmHead(bag.Resolver(), bag.Has(), "lm_head", bf16, fp4);
 
   REQUIRE_FALSE(fp4.Empty());
-  // The whole point: NOTHING is materialized to bf16. The old U8 branch produced
-  // a [K,N] bf16 owner (~2.543 GB at the real 248320x5120).
+  // The point: NOTHING is materialized to bf16 (the old U8 branch built a [K,N]
+  // bf16 owner, ~2.543 GB at the real 248320x5120).
   CHECK(bf16.Empty());
   CHECK(fp4.n == N);
   CHECK(fp4.k == K);
@@ -361,33 +363,18 @@ TEST_CASE("qwen27 dense lm_head: a ModelOpt NVFP4 head stays PACKED (no bf16 own
   CHECK(fp4.scale.bytes.size() == static_cast<size_t>(K) * static_cast<size_t>(N) / 16);
   // ModelOpt's weight_scale_2 IS the scale (not the CT divisor).
   CHECK(fp4.scale2 == doctest::Approx(kFixtureScale2));
-}
-
-// ── 3. `lm_head.input_scale` must NOT flip the head to W4A4 ──────────────────
-TEST_CASE("qwen27 dense lm_head: input_scale does not select the W4A4 GEMM") {
-  constexpr int64_t N = 256, K = 128;
-  const Nvfp4Fixture f = MakeNvfp4Fixture(N, K, 11);
-  Bag bag;
-  PutModelOptHead(bag, "lm_head", N, K, f, /*with_input_scale=*/true);
-
-  OwnedTensor bf16;
-  Nvfp4Weight fp4;
-  LoadDenseLmHead(bag.Resolver(), bag.Has(), "lm_head", bf16, fp4);
-  REQUIRE_FALSE(fp4.Empty());
-  // vLLM DELETES input_scale on the W4A16 head path (modelopt.py:1359-1362);
-  // consuming it here would route the head to the fp4-activation GEMM.
+  // ── 3. and the `lm_head.input_scale` this fixture ships must NOT flip the head
+  // to W4A4: vLLM DELETES it on the W4A16 head path (modelopt.py:1365), and
+  // consuming it would route the head to the fp4-activation GEMM.
   CHECK_FALSE(fp4.IsTrueW4A4());
   CHECK(fp4.alpha == 0.0F);
 }
 
 // ── 3b. The SAME rule under compressed-tensors names ─────────────────────────
-// `LoadCtNvfp4Raw` consumes `input_global_scale` UNCONDITIONALLY, because on a
-// TOWER projection the 27B CT checkpoint really is W4A4. An output head is not a
-// tower projection: vLLM resolves it through `ModelOptNvFp4W4A16LinearMethod`,
-// which DELETES `input_scale` (modelopt.py:1365), and USAGE.md advertises the CT
-// spelling as kept packed on the same W4A16 path as the ModelOpt spelling. A
-// W4A4 head would take the fp4-activation GEMM AND silently skip the pre-capture
-// Marlin build (which early-returns on IsTrueW4A4()).
+// `LoadCtNvfp4Raw` consumes `input_global_scale` UNCONDITIONALLY, correct for a
+// TOWER projection of the 27B CT checkpoint, which really is W4A4. An output head
+// is not one (modelopt.py:1365): a W4A4 head would take the fp4-activation GEMM
+// AND skip the pre-capture Marlin build, which early-returns on IsTrueW4A4().
 TEST_CASE("qwen27 dense lm_head: a compressed-tensors NVFP4 head is W4A16, not W4A4") {
   constexpr int64_t N = 256, K = 128;
   const Nvfp4Fixture f = MakeNvfp4Fixture(N, K, 23);
@@ -396,10 +383,9 @@ TEST_CASE("qwen27 dense lm_head: a compressed-tensors NVFP4 head is W4A16, not W
 
   // A CT head's ONLY weight tensor is `lm_head.weight_packed`, so a bare
   // `lm_head.weight` probe reads it as `tie_word_embeddings` and computes the
-  // logits off the embedding table. USAGE.md advertises the CT spelling as kept
-  // packed; that is only true if the model loader looks for it.
+  // logits off the embedding table.
   CHECK(DenseCheckpointHasLmHead(bag.Has(), "lm_head"));
-  Bag tied;  // a genuinely tied checkpoint ships no head under either naming
+  Bag tied;  // a genuinely tied checkpoint ships no head under either name
   tied.Put("model.language_model.embed_tokens.weight", MakeBf16({8, 4}, 5));
   CHECK_FALSE(DenseCheckpointHasLmHead(tied.Has(), "lm_head"));
 
@@ -484,8 +470,7 @@ TEST_CASE("qwen27 dense lm_head: packed-head logits match the dequant-then-GEMM 
   const std::vector<int32_t> pos{0, 1, 2, 3};
   vt::Queue q = CpuQ();
 
-  // Reference arm: the bf16 [K,N] owner the OLD loader produced, built from the
-  // fixture's own exact values (see ReferenceBf16Head).
+  // Reference arm: the bf16 [K,N] owner the OLD loader produced.
   Qwen3_5DenseWeights ref = MakeWeights(c);
   ref.lm_head = ReferenceBf16Head(f, N, K);
   const std::vector<float> want =
@@ -507,19 +492,21 @@ TEST_CASE("qwen27 dense lm_head: packed-head logits match the dequant-then-GEMM 
     scale = std::max(scale, std::fabs(static_cast<double>(want[i])));
   }
   // Both arms consume the SAME fp4 codes; the only divergence allowed is the
-  // reference arm's bf16 rounding of each already-exact dequantized value plus
-  // GEMM accumulation order. (Marlin W4A16 tolerance band.)
+  // reference arm's bf16 rounding plus GEMM accumulation order (Marlin W4A16
+  // tolerance band).
   CHECK(max_abs / scale < 2e-2);
 }
 
-// ── 5. The packed head's resident is built ONCE, at PREPARE time ─────────────
+// ── 5. The packed head's resident is built ONCE, at PREPARE time, for the HEAD
+// ── ALONE ────────────────────────────────────────────────────────────────────
 // Backends with no fp4 GEMM (CPU here; Vulkan and Metal register neither
 // kMatmulNvfp4 nor the Marlin grouped GEMM) fall back to `vt::Matmul` on a
-// dequantized bf16 [K,N] operand the LOADER used to build exactly once. Two ways
-// to lose that, neither visible to a numerical assertion: rebuild it inside the
-// GEMM (2.54 GB per decode step at the real 248320x5120), or drop the
-// PrepareLmHeadResident call so the forward builds it — on CUDA that same call
-// is the PRE-CAPTURE Marlin build. Pinned here by pointer identity.
+// dequantized bf16 [K,N] operand. Three ways to lose that, none visible to a
+// numerical assertion: rebuild it inside the GEMM (2.54 GB per decode step at the
+// real 248320x5120); drop the PrepareLmHeadResident call so the forward builds it
+// (on CUDA that same call is the PRE-CAPTURE Marlin build); or keep one for EVERY
+// NVFP4 weight, quadrupling the tower's steady-state bytes on these same backends
+// — the double-residency of issue #203.
 TEST_CASE("qwen27 dense lm_head: the packed head's resident is built once, at prepare") {
   const HfConfig c = MakeConfig();
   const int64_t N = c.vocab_size, K = c.hidden_size;
@@ -534,6 +521,13 @@ TEST_CASE("qwen27 dense lm_head: the packed head's resident is built once, at pr
 
   Qwen3_5DenseWeights w = MakeWeights(c);
   w.lm_head_fp4 = fp4;
+  // An NVFP4 TOWER as well as an NVFP4 head, both on the same fallback.
+  const int64_t I = c.intermediate_size;
+  for (Qwen3_5DenseLayerWeights& lw : w.layers) {
+    lw.mlp.gate_proj_fp4 = MakeNvfp4Weight(I, K, 41);
+    lw.mlp.up_proj_fp4 = MakeNvfp4Weight(I, K, 43);
+    lw.mlp.down_proj_fp4 = MakeNvfp4Weight(K, I, 47);
+  }
   vt::Queue q = CpuQ();
 
   // The registry `prepare` hook builds it BEFORE any forward runs.
@@ -549,6 +543,14 @@ TEST_CASE("qwen27 dense lm_head: the packed head's resident is built once, at pr
   (void)Qwen3_5DenseModel::ForwardDense(ids, pos, w, c, q);
   (void)Qwen3_5DenseModel::ForwardDense(ids, pos, w, c, q);
   CHECK(w.lm_head_fp4.d_dequant_b.get() == first);
+
+  // ...and the tower ran the same fallback GEMM without acquiring any.
+  for (const Qwen3_5DenseLayerWeights& lw : w.layers) {
+    CHECK_FALSE(lw.mlp.gate_proj_fp4.keep_dequant_b);
+    CHECK(lw.mlp.gate_proj_fp4.d_dequant_b == nullptr);
+    CHECK(lw.mlp.up_proj_fp4.d_dequant_b == nullptr);
+    CHECK(lw.mlp.down_proj_fp4.d_dequant_b == nullptr);
+  }
 
   // A BF16 head acquires none — the hook is inert off the packed path.
   Qwen3_5DenseWeights bf16_w = MakeWeights(c);
