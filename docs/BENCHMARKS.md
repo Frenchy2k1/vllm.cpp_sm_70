@@ -133,15 +133,18 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 **There is no isolated c2/c8 weakness.** Binding grid at `a0fa12c7`
 (2026-08-10), 3 reps, binding-eligible 12/12; the prior c2 0.87x / c8 0.92x
-"weak cells" came from a different harness and were never comparable. The deficit
-is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on both
-engines) and is entirely MARGINAL per-token work, since our FIXED per-step cost
-already beats vLLM (9.02 ms against 9.43 ms).
+"weak cells" came from a different harness and were never comparable. The
+deficit is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on
+both engines) and is entirely MARGINAL per-token work, since our FIXED per-step
+cost already beats vLLM (9.02 ms against 9.43 ms). Two glue levers land against
+it, both default ON: the fused shared-expert gate_up sink off the MoE-marlin
+route (**+1.31% c8 / +1.38% c4**, `VT_MARLIN_DENSE_PAIR`) and the shared
+`down_proj` emitted as bf16 rather than f32 (**+2.05% c8 / +0.79% c4**,
+bit-identical, `VT_SHARED_DOWN_BF16`).
 
-Two glue levers land against it, both default ON: routing the fused
-shared-expert gate_up sink off the MoE-marlin route (**+1.31% c8 / +1.38% c4**,
-`VT_MARLIN_DENSE_PAIR`) and emitting the shared `down_proj` as bf16 rather than
-f32 (**+2.05% c8 / +0.79% c4**, bit-identical, `VT_SHARED_DOWN_BF16`). The
+Next is `SiluAndMul`: launch counts MATCH vLLM (2.00 against 1.98 per
+layer-step) but ours costs 22.6 us against ~2.45 us, a **9.2x** per-launch gap
+worth 3.6 points ([spec](../.agents/specs/moe-silu-vectorize.md)). The
 marlin block-size lever is REFUTED (block 8 at c8 is 1.16% SLOWER against a
 +0.29% control), and a per-launch marlin gap is WITHDRAWN as cross-tool
 uncertainty. Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**.

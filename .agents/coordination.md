@@ -157,6 +157,28 @@ No retroactive waiver is being written: the budget breach is real and the honest
 record of it is this note. The lesson for the next row is that a 6-slice claim
 should land as 6 PRs.
 
+**AsyncLLM serving-path metric wiring (`SERVE-METRICS`, 2026-08-10,
+`CLAIM-SERVE-METRICS-ASYNC`).** Claude Code (claude-opus-5), helper role,
+isolated worktree `/home/mudler/_git/vllm.cpp-metrics-async`, branch
+`row/SERVE-METRICS-ASYNC`, rebased forward as main landed (base `abdc3a26` at
+creation, `488fca89` at push). PUSHED `e8a7624f`, PR
+[#297](https://github.com/mudler/vllm.cpp/pull/297). Issue
+[#277](https://github.com/mudler/vllm.cpp/issues/277), spec
+[`.agents/specs/async-metrics.md`](specs/async-metrics.md). Closes the
+`ROAD-V1-C8` residual "AsyncLLM serving-path metric wiring": the production
+server serves `/metrics` off `AsyncLLM`, whose output handler folds nothing into
+the `PrometheusStatLogger`, so a real deployment scrapes a well-formed catalog
+whose series never move. Owns `src/vllm/v1/engine/async_llm.cpp`,
+`include/vllm/v1/engine/async_llm.h`, the `step_with_batch_queue` stat stamp in
+`src/vllm/v1/engine/core.cpp`, the recorder mutex in
+`{include,src}/vllm/v1/metrics/loggers.{h,cpp}`, the async attach in
+`src/vllm/entrypoints/openai/server_main.cpp`, the stale residual comments in
+`{include,src}/vllm/entrypoints/openai/api_server.{h,cpp}`, new cases in
+`tests/vllm/v1/test_async_llm.cpp`, and the `SERVE-METRICS` /
+`SERVE-RESPONSE-METRICS` records. EXCLUDED and untouched: the config-gated
+metric families (spec-decode / kv-connector / mm / LoRA), which are the sibling
+residual on the same row. CPU-only gate; no GPU, no model, no checkpoint.
+
 **DSpark speculative decoding (`SPEC-DSPARK`, 2026-08-09, `CLAIM-SPEC-DSPARK`).**
 Claude Code (opus-5), helper role, isolated worktree
 `/home/mudler/_git/vllm.cpp-spec-dspark`, branch `row/SPEC-DSPARK`, base
@@ -1554,6 +1576,38 @@ row's evidence cell. CPU-only; NO kernel, vt op, ABI, CMake, model file, GPU or
 public-doc change. Does NOT touch the roadmap issue table — PR #235 already
 registers #231 there and duplicating the row would guarantee a keyed-record
 conflict.
+
+**Record repair to the above (`SAMPLE-LOGPROBS`, 2026-08-10, issue #231).** Claude
+Code (claude-opus-5), isolated worktree
+`/home/mudler/_git/vllm.cpp-logprobs-record`, branch
+`row/SAMPLE-LOGPROBS-RECORD-REPAIR`, base `origin/main` `1c1749cb` pinned at
+worktree creation. **Follows the entry directly above**: the fix landed as
+`fd9af7d9` (merged `723d96a8`, PR #236, from `row/SAMPLE-LOGPROBS-ALL-SENTINEL`)
+and the CODE is correct, but an independent review found two shipped records
+false. (1) The crash site: the SIGSEGV is in `LogprobsTensors::slice_request`
+(`src/vllm/v1/outputs.cpp:31-37`) from `scheduler.cpp:920-924`, NOT in
+`LogprobsProcessor::UpdateSampleLogprobs` — the reviewer instrumented both
+consumers with the widening reverted and `UpdateSampleLogprobs` is never entered;
+reproduced here before the edit. (2) `docs/USAGE.md` claimed the HTTP `logprobs`
+field "keeps its own 0..5 range"; nothing in the tree enforces any range, and
+upstream deliberately admits `-1` on the CHAT surface, so
+`{"logprobs":true,"top_logprobs":-1}` is a real capability the widening unblocked
+and it was untested. Scope: the crash-site attribution in
+[logprobs-all-sentinel.md](specs/logprobs-all-sentinel.md), the `SAMPLE-LOGPROBS`
+evidence cell in [engine-matrix.md](engine-matrix.md), the section-8 comment in
+`tests/vllm/v1/test_llm_engine.cpp`, the stale guard comment in
+`src/vllm/v1/engine/logprobs.cpp`, a strengthened finite-count assertion, one
+added chat `top_logprobs=-1` case in
+`tests/vllm/entrypoints/openai/test_serving.cpp`, the `SamplingParams::logprobs`
+paragraph in `docs/USAGE.md`, and this entry. NO behaviour change: `add_request`,
+`max_num_logprobs()` and the sampler are untouched. CPU-only; NO kernel, vt op,
+ABI, CMake, model file or GPU change. Porting upstream's `check_logprobs` /
+`max_logprobs` validation stays out of scope — that is issue #249. Roadmap issue
+table still untouched: PR #235 registers #231 there and is open, so adding it
+again would duplicate a keyed record; `AGENTS.md` does prescribe how to resolve
+such a conflict, so this is duplication avoidance rather than an unresolvable
+clash — and if #235 closes without landing, #231 loses its roadmap registration
+and this row owes that line.
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
