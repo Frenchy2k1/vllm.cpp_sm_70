@@ -46,11 +46,20 @@ ACTIONS_END = "--- END ACTIONS ---"
 
 def _status_lines(state: dict) -> list[str]:
     """Render status labels only; never echo environment values or keys."""
-    return [
+    lines = [
         f"environment: {state.get('env') or 'unavailable'}",
         f"branch: {state.get('branch') or 'unavailable'}",
         f"worktree: {state.get('worktree') or 'unavailable'}",
     ]
+    # Who else is coordinating. Until issue #285 this router turned the same
+    # fact into "BLOCKED: the operator lock is held by another live worktree"
+    # and told the session not to run "a known-failing claim". That claim no
+    # longer fails: several coordinators may run at once, so a peer is status,
+    # never a blocker. Kept SHORT -- the welcome route is width-checked.
+    peers = state.get("operator_peers") or []
+    if peers:
+        lines.append(f"other coordinators: {len(peers)} recorded (claim is allowed)")
+    return lines
 
 
 def _claim_command(intent: str, row: str | None, headless: bool) -> str:
@@ -131,22 +140,6 @@ def _undeclared_actions(
     lines = _status_lines(state)
 
     if intent is None:
-        if state.get("blocked_by_other_operator"):
-            reason = state.get("reason") or "reason unavailable"
-            lines.extend(
-                [
-                    "BLOCKED OPTION: the operator lock is held by another live worktree.",
-                    f"Reason: {reason}",
-                    "1. Relay only the welcome block above verbatim.",
-                    "2. Then ask what the contributor is here to do.",
-                    "3. If the contributor chooses operator, report the conflict;",
-                    "   do not run a known-failing claim or select another role.",
-                    "4. For helper or read-only, use the matching claim command.",
-                    "5. After claiming, rerun scripts/agent-start.py.",
-                    "6. Then run scripts/agent-preflight.sh.",
-                ]
-            )
-            return lines
         lines.extend(
             [
                 "1. Relay only the welcome block above verbatim.",
@@ -154,18 +147,6 @@ def _undeclared_actions(
                 "3. Use the matching scripts/agent-role.py claim command.",
                 "4. After claiming, rerun scripts/agent-start.py.",
                 "5. Then run scripts/agent-preflight.sh.",
-            ]
-        )
-        return lines
-
-    if intent == "operator" and state.get("blocked_by_other_operator"):
-        reason = state.get("reason") or "reason unavailable"
-        lines.extend(
-            [
-                "BLOCKED: the operator lock is held by another live worktree.",
-                f"Reason: {reason}",
-                "Do not run a known-failing claim or select another role.",
-                "Report the conflict and obtain direction.",
             ]
         )
         return lines

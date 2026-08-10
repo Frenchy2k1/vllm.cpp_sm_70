@@ -183,6 +183,11 @@ Two properties are preserved unchanged:
 
 - **One operator per repo.** The operator lock stays in the git COMMON dir, so
   it is shared by every worktree and a second operator still fails.
+  **SUPERSEDED 2026-08-10 by issue #285** (`specs/operator-record.md`): the file
+  stays in the git COMMON dir and stays keyed on the worktree, but it is now a
+  RECORD of who is coordinating where and never a refusal. Several coordinators
+  may run at once; `main` is never force-pushed, so git's non-fast-forward
+  refusal is the interlock this lock was pretending to be.
 - **Helpers stay isolated.** A helper already materializes its own worktree.
 
 The cost is explicit: **two agent sessions sharing one checkout now share a

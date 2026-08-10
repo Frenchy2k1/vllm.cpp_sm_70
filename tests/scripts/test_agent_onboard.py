@@ -118,16 +118,22 @@ class ProbeRenderTests(unittest.TestCase):
             onboard.render_probe(undeclared_mode),
         )
 
-    def test_lockout_by_another_operator_is_not_rendered_as_never_declared(self):
-        # Beyond the brief. resolve() knows the difference; a session locked
-        # out by a live operator must not be told to claim operator, because
-        # that claim will fail. Both are role=None, so only the NOTE separates
-        # them.
-        blocked = dict(self.UNDECLARED, blocked_by_other_operator=True)
-        out = onboard.render_probe(blocked)
-        self.assertIn("NOTE", out)
-        self.assertIn("held by another live session", out)
-        self.assertNotIn("NOTE", onboard.render_probe(self.UNDECLARED))
+    def test_live_coordinators_are_rendered_and_never_as_a_blocker(self):
+        # Beyond the brief. Until issue #285 this asserted a NOTE saying the
+        # lock was "held by another live session" so the reader would not run a
+        # claim "that will fail". The claim no longer fails, so the peer is
+        # rendered as information -- who, where, how long since the heartbeat --
+        # and the interview hint still offers every role.
+        peer = {"worktree": "/repo/.git/worktrees/other", "session": "peer-1",
+                "host": "box", "pid": 42, "heartbeat": 0}
+        out = onboard.render_probe(dict(self.UNDECLARED, operator_peers=[peer]))
+        self.assertIn("other coordinators recorded: 1", out)
+        self.assertIn("/repo/.git/worktrees/other", out)
+        self.assertIn("peer-1", out)
+        self.assertNotIn("will fail", out)
+        self.assertIn("operator", out)  # the role is still on the table
+        # and with nobody else recorded, no coordinator line is invented
+        self.assertNotIn("other coordinators", onboard.render_probe(self.UNDECLARED))
 
     def test_probe_never_exits_nonzero(self):
         # The probe reports; it does not gate. Preflight gates.
@@ -146,11 +152,11 @@ class ProbeFieldsComeFromResolve(unittest.TestCase):
     Every other probe test in this file feeds render_probe an already-populated
     fixture, so nothing asserted that probe() actually reads its fields out of
     agent-role.py. Five hardcodes therefore left the whole suite green:
-    `blocked_by_other_operator: False`, `reason: None`, `mode: "headless"`,
+    `operator_peers: []`, `reason: None`, `mode: "headless"`,
     `role: "operator"` and `env: "present"`. `--probe` is the front door
     .agents/workflow.md sends every session to, and a probe that answers
     `role: operator` to a session that never declared one is worse than no
-    probe: it points at a `claim operator` that will exit 1.
+    probe: it reports a claim that was never made.
 
     So these claim in a THROWAWAY repo and read the values back out of probe().
     """
@@ -198,7 +204,7 @@ class ProbeFieldsComeFromResolve(unittest.TestCase):
         self.assertEqual(state["row"], "PROBE-WIRING")
         self.assertEqual(state["mode"], "interactive")
         self.assertEqual(state["reason"], "declared")
-        self.assertIs(state["blocked_by_other_operator"], False)
+        self.assertEqual(state["operator_peers"], [])
         self.assertEqual(state["branch"], "master")
         self.assertEqual(
             state["worktree"],
@@ -239,29 +245,46 @@ class ProbeFieldsComeFromResolve(unittest.TestCase):
         self.assertEqual(state["role"], "read-only")
         self.assertEqual(state["mode"], "headless")
 
-    def test_probe_reports_a_lockout_by_a_live_rival(self) -> None:
-        # Kills `blocked_by_other_operator: False` and `reason: None`, and pins
-        # the resolve() branch that reaches this state: an operator marker whose
-        # lock is now held by ANOTHER LIVE WORKTREE. Since ownership keys on the
-        # worktree, that is not a hypothetical -- it is what a rival claim
-        # leaves behind, and rendering it as "never declared" sends the session
-        # straight at a `claim operator` that exits 1.
+    def test_probe_carries_the_live_coordinators_out_of_resolve(self) -> None:
+        # Kills `operator_peers: []` and `reason: None`, against records written
+        # by the REAL CLI in two real worktrees. Until issue #285 this asserted
+        # `blocked_by_other_operator: True` and a "held by another live session"
+        # NOTE; a peer is now reported and blocks nothing.
+        self.assertEqual(self.claim(self.repo, "a", "operator").returncode, 0)
+        rival = self.worktree("rival")
+        self.assertEqual(self.claim(rival, "rival-session", "operator").returncode, 0)
+        rival_git_dir = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=rival, text=True).strip()
+
+        state = self.probe_in(self.repo)
+        self.assertEqual(state["role"], "operator")
+        self.assertEqual(state["reason"], "declared")
+        self.assertEqual(
+            [record.get("worktree") for record in state["operator_peers"]],
+            [rival_git_dir])
+        rendered = onboard.render_probe(state)
+        self.assertIn("other coordinators recorded: 1", rendered)
+        self.assertIn(rival_git_dir, rendered)
+        self.assertIn("rival-session", rendered)
+
+    def test_probe_reports_a_vanished_record_as_re_claimable(self) -> None:
+        # The one state that still fails to resolve, and it is REACHABLE: a
+        # host cleanup deleted this worktree's record on 2026-08-10. It must
+        # stay distinguishable from "never declared", because the remedy is
+        # `claim operator` and it now always succeeds.
         self.assertEqual(self.claim(self.repo, "a", "operator").returncode, 0)
         common = subprocess.check_output(
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
             cwd=self.repo, text=True).strip()
-        (Path(common) / "vllm-cpp-operator.lock").unlink()
-        rival = self.worktree("rival")
-        self.assertEqual(self.claim(rival, "b", "operator").returncode, 0)
+        for record in (Path(common) / "vllm-cpp-operators").glob("*.json"):
+            record.unlink()
 
         state = self.probe_in(self.repo)
         self.assertIsNone(state["role"])
-        self.assertIs(state["blocked_by_other_operator"], True)
         self.assertEqual(
-            state["reason"], "operator marker without a held lock; re-claim")
-        # and the human surface must say so, not print the generic hint alone
-        rendered = onboard.render_probe(state)
-        self.assertIn("held by another live session", rendered)
+            state["reason"],
+            "operator marker without a coordinator record; re-claim")
+        self.assertEqual(state["operator_peers"], [])
 
     def test_probe_reports_the_env_state_it_was_given(self) -> None:
         # Kills `env: "present"`. It cannot be pinned against the real tree --
