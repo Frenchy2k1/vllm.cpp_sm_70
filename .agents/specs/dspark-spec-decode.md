@@ -309,11 +309,19 @@ and the architecture (commit `56b7b607`).
    (Markov head), W3 (loader) and W4 (sequential sampler) are doing their job on
    real weights.
 2. **The drafts NEVER REACH THE VERIFY PATH.** Zero `[SPECTRACE]` lines (the
-   verify side, `kr > 0`) and — decisively — zero `[spec-install]` lines, so
-   `Scheduler::update_draft_token_ids` is never reached at all. The break is
-   between `pending_drafts_` / `take_draft_token_ids()` and the engine's
-   `post_step` install, NOT in the drafter. That is the W6 blocker and it is
-   now localized to a three-call span.
+   verify side, `kr > 0`) and zero `[spec-install]` lines. Precisely: the
+   `[spec-install]` probe sits AFTER the two `continue`s in
+   `Scheduler::update_draft_token_ids` (request-not-found / finished, and
+   `is_prefill_chunk`), so its silence means the ASSIGNMENT
+   `request->spec_token_ids = ...` never executes — it does NOT yet distinguish
+   "the function is never called" from "it is called and skips every request".
+   Ruled out on the way: `post_step` IS on this path (`max_concurrent_batches=1`
+   ⇒ `batch_queue_size_ == 1` ⇒ `step_fn_ = &EngineCore::step`, which calls
+   `post_step` at `core.cpp:96`), and `check_for_draft_tokens_` is
+   `resolved_spec_config_.has_value()`, which the dspark branch of
+   `ResolveSpecConfig` satisfies. **Next probe:** a trace at the TOP of
+   `update_draft_token_ids` reporting `n`, and per request whether it was
+   not-found / finished / `is_prefill_chunk`. That single line decides it.
 3. **CORRECTION to the earlier reading.** A first run showed our DSpark-ON text
    byte-identical to our spec-OFF text, and that was reported as the
    self-consistency half of the gate. A second run of the same binary, same
