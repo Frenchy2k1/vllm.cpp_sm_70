@@ -455,6 +455,60 @@ class StatusRatchet(unittest.TestCase):
         text = doc_tables.STATUS.read_text(encoding="utf-8")
         self.assertEqual(doc_tables.STATUS_RATCHET["chars"], len(text))
 
+    def test_a_retired_claim_cannot_come_back_for_free(self) -> None:
+        """A claim the page RETIRED must cost something to reinstate.
+
+        The ratchet is what makes a deletion permanent. #277 paid for its STATUS
+        edit by deleting two claims that had become false -- that `/metrics` has
+        no live async backing, once in the OpenAI-server row and once in the
+        metrics paragraph -- and lowered the char ratchet by the same 30 bytes.
+
+        Two things are asserted, and neither is the byte-tightness above.
+        First, the retired wording is genuinely GONE: a page that still says
+        `/metrics` is unbacked while the AsyncLLM output handler records into it
+        is lying to a reader, and no size ratchet notices a false sentence.
+        Second, putting it back is rejected -- so a future edit reinstating it
+        has to find the space, out loud, instead of spending headroom the
+        deletion left behind.
+        """
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(text), [])
+
+        retired = (
+            "metrics and cache reset lack live async backing",
+            "the async production-serving path wiring",
+        )
+        for claim in retired:
+            with self.subTest(claim=claim):
+                self.assertNotIn(
+                    claim,
+                    text,
+                    "docs/STATUS.md still carries a claim about /metrics that "
+                    "the AsyncLLM wiring made false",
+                )
+
+        restored = text.replace(
+            "cache reset lacks live async backing",
+            retired[0],
+            1,
+        ).replace(
+            "The remaining work is the chat/completion",
+            f"The remaining work is {retired[1]}, the chat/completion",
+            1,
+        )
+        self.assertGreater(
+            len(restored),
+            len(text),
+            "the mutation must actually re-add the retired claims; if the "
+            "anchors stopped matching, this test is asserting nothing",
+        )
+        errors = doc_tables.status_errors(restored)
+        self.assertTrue(
+            any("chars is" in error for error in errors),
+            "reinstating the retired claims must break the char ratchet, "
+            f"otherwise the deletion bought free headroom; got {errors}",
+        )
+
     def test_the_status_ratchet_only_ever_moves_down(self) -> None:
         """A ratchet that can be RAISED is a budget with extra steps.
 

@@ -485,13 +485,17 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    # 243554 since 2026-08-10 (measured 243554): row PERF-27B-LMHEAD-FP4 adds
-    # the packed NVFP4 lm_head to the 27B cell. Paid for by collapsing that
-    # cell's superseded narrative (the ModelOpt-FP8-tower aside and the
-    # ~100% GPU-busy reading) into the binding result, both of which are now
-    # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
-    # from 243556, the only direction this number may move.
-    "chars": 243542,
+    #
+    # 243512 since 2026-08-10 (measured 243512, #277): the metrics paragraph and
+    # the OpenAI-server row both carried a claim that had become FALSE -- that
+    # the async serving path has no live metric backing. Wiring it (the AsyncLLM
+    # output handler now folds each step's stats into the logger) RETIRES a
+    # residual rather than adding one, so the correction is a net deletion:
+    # "metrics and cache reset lack live async backing" loses its first subject,
+    # and "the async production-serving path wiring" leaves the remaining-work
+    # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
+    # each rebase); re-pinned byte-tight to the merged measurement.
+    "chars": 243512,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

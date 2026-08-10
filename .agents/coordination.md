@@ -160,7 +160,9 @@ should land as 6 PRs.
 **AsyncLLM serving-path metric wiring (`SERVE-METRICS`, 2026-08-10,
 `CLAIM-SERVE-METRICS-ASYNC`).** Claude Code (claude-opus-5), helper role,
 isolated worktree `/home/mudler/_git/vllm.cpp-metrics-async`, branch
-`row/SERVE-METRICS-ASYNC`, base `origin/main` `abdc3a26`. Issue
+`row/SERVE-METRICS-ASYNC`, rebased forward as main landed (base `abdc3a26` at
+creation, `488fca89` at push). PUSHED `e8a7624f`, PR
+[#297](https://github.com/mudler/vllm.cpp/pull/297). Issue
 [#277](https://github.com/mudler/vllm.cpp/issues/277), spec
 [`.agents/specs/async-metrics.md`](specs/async-metrics.md). Closes the
 `ROAD-V1-C8` residual "AsyncLLM serving-path metric wiring": the production
