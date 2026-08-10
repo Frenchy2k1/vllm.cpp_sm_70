@@ -47,9 +47,10 @@ class TenstorrentPlatform final : public Platform {
 
   // Explicit allow-list of architectures whose full op set is registered for
   // kTENSTORRENT (mirrors MetalPlatform::supports_model_architecture). OPT-125m
-  // is the bring-up target; anything else falls back to CPU via SelectQueue.
+  // was the first bring-up; Qwen3-dense is the second (same OPT→Qwen3 sequence
+  // Metal used for M3a/M3b). Anything else falls back to CPU via SelectQueue.
   bool supports_model_architecture(std::string_view architecture) const override {
-    return architecture == "OPTForCausalLM";
+    return architecture == "OPTForCausalLM" || architecture == "Qwen3ForCausalLM";
   }
 
   // kPagedAttention + kReshapeAndCache are registered against the NHD

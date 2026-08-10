@@ -33,4 +33,21 @@ bool DeviceAvailable();
 // either way.
 MeshDevice& SharedMeshDevice();
 
+// Host-allocation registry for device-resident shadows (BACKEND-TENSTORRENT
+// residency). Implemented in tenstorrent_ops.cpp (the only TU that links
+// ttnn); called from TenstorrentBackend::Alloc/Free/Copy so Free drops any
+// cached ttnn::Tensor that still owns device pages for that host pointer.
+// No-ops until the ops registrar has loaded (static init order: backend may
+// Free before ops if a test tears down early — Unregister is tolerant).
+void RegisterHostBuffer(void* host, size_t bytes);
+void UnregisterHostBuffer(void* host);
+// Host bytes at `host` (or any interior pointer into that allocation) were
+// written by a host-side path (Backend::Copy, Memset, host op). Invalidates
+// any device shadow so the next EnsureDevice re-uploads.
+void MarkHostWritten(void* host);
+// If `host` is inside a registered buffer whose device shadow is the source
+// of truth, download to host. Used by Backend::Copy so D2H-style reads see
+// device-resident results without every op writing host eagerly.
+void EnsureHostBytes(void* host);
+
 }  // namespace vt::tenstorrent

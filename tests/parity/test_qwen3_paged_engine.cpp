@@ -36,21 +36,20 @@
 //   neartie_gap_mnats.npy  [N,T]   i32  vLLM teacher-forced gap (milli-nats) for
 //                                       OUR CUDA token given OUR CUDA prefix.
 //
-// DEVICE-AWARE goldens (Metal, Qwen3-0.6B). SelectQueue runs Metal on the Apple M4;
-// the Metal forward is a DIFFERENT but equally correct bf16 decoder that resolves
-// the model's genuine near-ties the other way (e.g. p0 tok5 France 9625 vs Italy
-// 15344, top-2 margin 0.003-0.007 nats; vLLM's OWN teacher-forced argmax on the
-// identical prefix flips to Italy at gap 0.0000, contradicting its CUDA-capture
-// pick). So Metal is gated against ITS OWN oracle-backed golden, captured exactly
-// like the base pair but teacher-forcing vLLM on the METAL sequence:
-//   our_ids_metal.npy           [N,T] i32  the Metal forward's deterministic greedy.
-//   neartie_gap_mnats_metal.npy [N,T] i32  vLLM teacher-forced gap for the Metal
-//                                          token given the Metal prefix (max 0.125
-//                                          nats over all 60 Metal-vs-CUDA
-//                                          divergences => oracle-confirmed near-tie;
-//                                          strict token-exactness on 0.6B is
-//                                          ill-posed, it is a near-tie model). The
-//                                          gate logic is IDENTICAL on every device
+// DEVICE-AWARE goldens (Metal + Tenstorrent, Qwen3-0.6B). SelectQueue runs Metal
+// on the Apple M4 and Tenstorrent on Blackhole when those platforms support
+// Qwen3ForCausalLM. Each partial accelerator is a DIFFERENT but equally correct
+// bf16 decoder that can resolve the model's genuine near-ties differently from
+// CUDA (e.g. Metal p0 tok5 France 9625 vs Italy 15344, top-2 margin 0.003-0.007
+// nats; vLLM's OWN teacher-forced argmax on the identical prefix flips to Italy
+// at gap 0.0000, contradicting its CUDA-capture pick). So each non-CUDA device is
+// gated against ITS OWN oracle-backed golden, captured like the base pair but
+// teacher-forcing vLLM on THAT device's sequence:
+//   our_ids_metal.npy / our_ids_tenstorrent.npy
+//   neartie_gap_mnats_metal.npy / neartie_gap_mnats_tenstorrent.npy
+//                                          [N,T] i32  device greedy + vLLM
+//                                          teacher-forced gap for that prefix.
+//                                          Gate logic is IDENTICAL on every device
 //                                          (hard anchor + <=0.5-nat band); only the
 //                                          golden pair is device-appropriate.
 //
@@ -221,67 +220,79 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
 
   // Which device did SelectQueue actually pick? On dgx this is kCUDA and the gate
   // below is byte-for-byte the historical CUDA gate (the strict our_ids anchor +
-  // near-tie band). On the Apple M4 it is kMETAL, and two things change: (1) the
-  // Qwen3-dense ops must PROVE they ran on the Metal provider (selections > 0,
-  // declines == 0 — `last_selected` alone is insufficient, fan-out spike Risk 4);
-  // (2) the gate is held against Metal's OWN oracle-backed golden (see below), not
-  // against CUDA's — the identical anchor+band logic, device-appropriate goldens.
+  // near-tie band). On the Apple M4 it is kMETAL; on Blackhole kTENSTORRENT. Two
+  // things change on those partial accelerators: (1) the Qwen3-dense ops must
+  // PROVE they ran on that provider (selections > 0, declines == 0 — fan-out spike
+  // Risk 4); (2) the gate is held against THAT device's OWN oracle-backed golden,
+  // not against CUDA's — identical anchor+band logic, device-appropriate goldens.
   const vt::DeviceType run_dev = loaded->runner().device().type;
   const bool metal = run_dev == vt::DeviceType::kMETAL;
+  const bool tenstorrent = run_dev == vt::DeviceType::kTENSTORRENT;
+  const bool device_golden = metal || tenstorrent;
   // The forward + greedy ops Qwen3-dense dispatches on the DEFAULT
   // (VT_QWEN3_ROPE_CACHE) path. kRopeCosSinCache + kRopeFromCache are the M3b
   // additions (build the per-step cos|sin cache, then apply it); the rest are
   // shared with OPT. kMatmul is excluded deliberately: Qwen3-0.6B ties its
-  // lm_head, so every projection is a kMatmulBT.
+  // lm_head, so every projection is a kMatmulBT. Default path uses kRopeNeox
+  // (cache OFF); both RoPE families are registered on Metal/TT.
   const std::vector<vt::OpId> kQwen3Ops = {
       vt::OpId::kEmbedding,      vt::OpId::kMatmulBT,       vt::OpId::kRmsNorm,
-      vt::OpId::kRopeCosSinCache, vt::OpId::kRopeFromCache, vt::OpId::kReshapeAndCache,
-      vt::OpId::kPagedAttention, vt::OpId::kSiluAndMul,     vt::OpId::kGreedyArgmax};
-  if (metal) {
+      vt::OpId::kRopeNeox,       vt::OpId::kReshapeAndCache, vt::OpId::kPagedAttention,
+      vt::OpId::kSiluAndMul,     vt::OpId::kGreedyArgmax};
+  // Also registered / may fire when VT_QWEN3_ROPE_CACHE is on (Metal M3b cache path).
+  const std::vector<vt::OpId> kQwen3RopeCacheOps = {
+      vt::OpId::kRopeCosSinCache, vt::OpId::kRopeFromCache};
+  if (device_golden) {
     for (vt::OpId op : kQwen3Ops) {
       CHECK(vt::OpRegistered(op, run_dev));
       vt::ResetOpProviderStats(op, run_dev);
     }
+    for (vt::OpId op : kQwen3RopeCacheOps) {
+      if (vt::OpRegistered(op, run_dev)) vt::ResetOpProviderStats(op, run_dev);
+    }
     vt::EnableOpProviderCallStats(true);
     MESSAGE(label << ": running on device type " << static_cast<int>(run_dev)
-            << " (2=METAL) — gated against Metal's OWN oracle-backed golden "
-               "(our_ids_metal.npy + neartie_gap_mnats_metal.npy)");
+            << " (2=METAL, 6=TENSTORRENT) — gated against this device's OWN "
+               "oracle-backed golden");
   }
 
-  // Device-appropriate anchor + teacher-forced gap goldens. The base golden
-  // (our_ids.npy / neartie_gap_mnats.npy) is the CUDA-captured sequence: vLLM 0.25.0
-  // teacher-forced on OUR CUDA tokens. The Metal forward is a DIFFERENT but equally
-  // correct bf16 decoder: it resolves the model's genuine near-ties the other way
-  // (e.g. p0 tok5 France 9625 vs Italy 15344, a 0.003-0.007-nat top-2 margin —
-  // vLLM's OWN teacher-forced argmax on the identical prefix is Italy here at gap
-  // 0.0000, contradicting its CUDA-capture pick of France), so it emits its OWN
-  // deterministic sequence with its OWN teacher-forced gaps (our_ids_metal.npy /
-  // neartie_gap_mnats_metal.npy, produced by qwen3-neartie-gap.py teacher-forcing
-  // vLLM on the METAL prefix; every Metal token there is within 0.5 nats of vLLM's
-  // argmax, max 0.125). Gate the running device against ITS device's oracle golden.
+  // Device-appropriate anchor + teacher-forced gap goldens. Base = CUDA sequence.
+  // Metal/Tenstorrent each have their own pair (see file header).
   const int32_t* anchor_ids = od;   // hard anchor for THIS device
   const int32_t* gap_ids = gapd;    // vLLM teacher-forced gaps for THIS device
-  parity::NpyArray o_metal, gap_metal;  // keep the metal arrays alive for the loop
-  if (metal) {
-    const bool metal_goldens = fs::exists(gdir / "our_ids_metal.npy") &&
-                               fs::exists(gdir / "neartie_gap_mnats_metal.npy");
-    REQUIRE_MESSAGE(metal_goldens,
-                    label << ": Metal oracle golden absent — capture the Metal "
-                          "sequence on the M4 (VT_DUMP_IDS bootstrap), then on dgx "
-                          "teacher-force vLLM on it: qwen3-neartie-gap.py over the "
-                          "Metal our_ids -> *_metal.npy");
-    o_metal = parity::LoadNpy((gdir / "our_ids_metal.npy").string());
-    gap_metal = parity::LoadNpy((gdir / "neartie_gap_mnats_metal.npy").string());
-    REQUIRE(o_metal.dtype == "<i4");
-    REQUIRE(gap_metal.dtype == "<i4");
-    REQUIRE(o_metal.shape.size() == 2);
-    REQUIRE(o_metal.shape[0] == N);
-    REQUIRE(o_metal.shape[1] == T);
-    REQUIRE(gap_metal.shape.size() == 2);
-    REQUIRE(gap_metal.shape[0] == N);
-    REQUIRE(gap_metal.shape[1] == T);
-    anchor_ids = AsI32(o_metal);
-    gap_ids = AsI32(gap_metal);
+  parity::NpyArray o_dev, gap_dev;  // keep device arrays alive for the loop
+  const char* ids_name = metal ? "our_ids_metal.npy" : "our_ids_tenstorrent.npy";
+  const char* gap_name =
+      metal ? "neartie_gap_mnats_metal.npy" : "neartie_gap_mnats_tenstorrent.npy";
+  bool bootstrap_only = false;
+  if (device_golden) {
+    const bool have_dev = fs::exists(gdir / ids_name) && fs::exists(gdir / gap_name);
+    if (!have_dev && dump) {
+      // Bootstrap dump path: generate tokens, write raw i32, skip the gate.
+      // qwen3-neartie-gap.py then teacher-forces vLLM on that sequence.
+      bootstrap_only = true;
+      MESSAGE(label << ": BOOTSTRAP dump (device golden absent) for "
+              << (metal ? "Metal" : "Tenstorrent") << "...");
+    } else {
+      REQUIRE_MESSAGE(have_dev,
+                      label << ": device oracle golden absent (" << ids_name << " / "
+                            << gap_name
+                            << ") — capture sequence with VT_DUMP_IDS=1, then "
+                               "teacher-force vLLM: qwen3-neartie-gap.py -> device "
+                               "golden pair");
+      o_dev = parity::LoadNpy((gdir / ids_name).string());
+      gap_dev = parity::LoadNpy((gdir / gap_name).string());
+      REQUIRE(o_dev.dtype == "<i4");
+      REQUIRE(gap_dev.dtype == "<i4");
+      REQUIRE(o_dev.shape.size() == 2);
+      REQUIRE(o_dev.shape[0] == N);
+      REQUIRE(o_dev.shape[1] == T);
+      REQUIRE(gap_dev.shape.size() == 2);
+      REQUIRE(gap_dev.shape[0] == N);
+      REQUIRE(gap_dev.shape[1] == T);
+      anchor_ids = AsI32(o_dev);
+      gap_ids = AsI32(gap_dev);
+    }
   }
 
   int strict_exact = 0;   // prompts where our tokens == vLLM greedy exactly
@@ -302,47 +313,47 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
         our_dump[static_cast<size_t>(i * T + j)] = got[static_cast<size_t>(j)];
     }
 
+    if (bootstrap_only) continue;  // dump-only path; no anchor/gap yet
+
     // Anchor: the committed anchor is the exact deterministic sequence THIS device
-    // produces (CUDA base golden on CUDA/CPU; Metal golden on Metal), and the
-    // committed gaps are vLLM 0.25.0 teacher-forced on THAT device's own prefix. A
-    // drift from the anchor is a hard REQUIRE on EVERY device — this is what gives
-    // the gate teeth: a real Metal forward bug flips a token off the anchor and
-    // fails HERE, and the near-tie band below then independently proves each token
-    // is one vLLM's own logits cannot separate from its argmax. No cross-device
-    // latitude is taken: Metal is gated against Metal's OWN oracle-backed golden,
-    // never excused against CUDA's.
+    // produces (CUDA base / Metal / Tenstorrent golden), and the committed gaps are
+    // vLLM 0.25.0 teacher-forced on THAT device's own prefix. Drift is a hard
+    // REQUIRE — no cross-device latitude.
     int first_div = -1;
     for (int64_t j = 0; j < T; ++j) {
-      if (got[static_cast<size_t>(j)] != anchor_ids[i * T + j]) { first_div = static_cast<int>(j); break; }
+      if (got[static_cast<size_t>(j)] != anchor_ids[i * T + j]) {
+        first_div = static_cast<int>(j);
+        break;
+      }
     }
-    // RE-CAPTURE MODE. With VT_DUMP_IDS set you are, by definition, replacing the
-    // anchor, so asserting the OLD anchor makes the documented re-capture
-    // procedure impossible to run: the fatal REQUIRE below aborts the loop before
-    // the dump is ever written. Skipping it here does NOT weaken the gate — the
-    // dump path writes no golden and asserts nothing; the committed goldens are
-    // only ever replaced by qwen3-neartie-gap.py, whose gaps come from the vLLM
-    // oracle rather than from us. A normal (non-dump) run is unchanged.
-    // Precomputed: doctest cannot decompose a compound expression here.
+    // RE-CAPTURE MODE. VT_DUMP_IDS replaces the anchor, so skip the hard REQUIRE.
     const bool anchor_ok = dump || first_div < 0;
     REQUIRE_MESSAGE(anchor_ok,
                     label << " anchor drift prompt[" << i << "] tok=" << first_div
                     << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
-                    << " committed anchor=" << (first_div < 0 ? -1 : anchor_ids[i * T + first_div])
-                    << (metal ? " — re-capture the Metal golden (our_ids_metal.npy + "
-                                "neartie_gap_mnats_metal.npy) via qwen3-neartie-gap.py"
-                              : " — re-run qwen3-neartie-gap.py to refresh the gap golden"));
+                    << " committed anchor="
+                    << (first_div < 0 ? -1 : anchor_ids[i * T + first_div])
+                    << (device_golden
+                            ? " — re-capture the device golden pair via "
+                              "qwen3-neartie-gap.py"
+                            : " — re-run qwen3-neartie-gap.py to refresh the gap "
+                              "golden"));
 
-    // Anchor holds: the committed gaps describe our exact sequence, so the near-tie
-    // band check below is well-posed on every device. PASS iff every one of our
-    // tokens is within kNearTieMnats of vLLM's teacher-forced argmax on our prefix.
     bool exact = true;
     bool prompt_ok = true;
     int first_bad = -1;
     for (int64_t j = 0; j < T; ++j) {
       if (got[static_cast<size_t>(j)] != gd[i * T + j]) exact = false;
       const int32_t mn = gap_ids[i * T + j];
-      if (mn > worst_gap) { worst_gap = mn; worst_i = static_cast<int>(i); worst_j = static_cast<int>(j); }
-      if (mn > kNearTieMnats) { prompt_ok = false; if (first_bad < 0) first_bad = static_cast<int>(j); }
+      if (mn > worst_gap) {
+        worst_gap = mn;
+        worst_i = static_cast<int>(i);
+        worst_j = static_cast<int>(j);
+      }
+      if (mn > kNearTieMnats) {
+        prompt_ok = false;
+        if (first_bad < 0) first_bad = static_cast<int>(j);
+      }
     }
     if (!prompt_ok) {
       ++fail;
@@ -359,44 +370,40 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     CHECK(prompt_ok);
   }
 
-  // The backend proof, now that work has been dispatched. Metal computes the same
-  // tokens as any other backend, so the token comparison does NOT say the Metal
-  // GPU ran; the provider stats do. Every Qwen3-dense op must have been SELECTED
-  // on the running device and must NEVER have DECLINED (a decline is a silent
-  // forward down the provider stack — fan-out spike Risk 4).
-  if (metal) {
+  // Backend proof: token equality alone does not prove which device ran.
+  if (device_golden) {
     vt::EnableOpProviderCallStats(false);
-    // A FUSED realisation can subsume a standalone op: the Qwen3-dense preamble
-    // recipe (kAttnQkNormRope) absorbs the two qk RMSNorms and the RoPE into one
-    // kernel, so kRopeFromCache legitimately reports zero selections when the
-    // fused path is taken. The proof's intent — every piece of this forward ran on
-    // the Metal device and nothing silently declined to CPU — is preserved by
-    // requiring the SUBSUMING op to have run instead, and by still demanding zero
-    // declines from the subsumed one.
     const auto fused_pre = vt::GetOpProviderStats(vt::OpId::kAttnQkNormRope, run_dev);
+    const auto rope_cache = vt::GetOpProviderStats(vt::OpId::kRopeFromCache, run_dev);
+    const auto rope_neox = vt::GetOpProviderStats(vt::OpId::kRopeNeox, run_dev);
     for (vt::OpId op : kQwen3Ops) {
       const auto st = vt::GetOpProviderStats(op, run_dev);
-      const bool subsumed = (op == vt::OpId::kRopeFromCache) && fused_pre.selections > 0;
-      // Precomputed: doctest cannot decompose a compound expression here.
-      const bool ran_on_metal = st.selections > 0 || subsumed;
-      CHECK_MESSAGE(ran_on_metal,
+      // Default path is kRopeNeox; cache path may subsume via kRopeFromCache /
+      // kAttnQkNormRope when VT_QWEN3_ROPE_CACHE or fused adopt is on.
+      const bool rope_alt =
+          (op == vt::OpId::kRopeNeox) &&
+          (rope_cache.selections > 0 || fused_pre.selections > 0);
+      const bool ran = st.selections > 0 || rope_alt;
+      CHECK_MESSAGE(ran,
                     label << ": op " << static_cast<int>(op)
-                          << " was never dispatched on the Metal device — the token "
-                             "result cannot be attributed to this backend");
+                          << " was never dispatched on device type "
+                          << static_cast<int>(run_dev));
       CHECK_MESSAGE(st.declines == 0,
                     label << ": op " << static_cast<int>(op)
-                          << " DECLINED on Metal and fell back");
+                          << " DECLINED and fell back");
     }
-    MESSAGE(label << ": BACKEND PROOF — all " << kQwen3Ops.size()
-            << " Qwen3-dense ops dispatched on Metal with 0 declines (kAttnQkNormRope "
-               "selections=" << fused_pre.selections << ", kRopeFromCache "
-               "selections=" << vt::GetOpProviderStats(vt::OpId::kRopeFromCache, run_dev).selections
-            << ", kPagedAttention selections="
-            << vt::GetOpProviderStats(vt::OpId::kPagedAttention, run_dev).selections << ")");
+    MESSAGE(label << ": BACKEND PROOF — Qwen3-dense ops on device type "
+            << static_cast<int>(run_dev) << " with 0 declines (kRopeNeox selections="
+            << rope_neox.selections << ", kPagedAttention selections="
+            << vt::GetOpProviderStats(vt::OpId::kPagedAttention, run_dev).selections
+            << ")");
   }
 
   if (dump) {
-    const std::string path = (gdir / "our_ids.i32").string();
+    const std::string dump_name =
+        tenstorrent ? "our_ids_tenstorrent.i32"
+                    : (metal ? "our_ids_metal.i32" : "our_ids.i32");
+    const std::string path = (gdir / dump_name).string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f != nullptr) {
       std::fwrite(our_dump.data(), sizeof(int32_t), our_dump.size(), f);
@@ -404,13 +411,18 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       MESSAGE(label << " dumped our token ids -> " << path);
     }
   }
+  if (bootstrap_only) {
+    MESSAGE(label << " BOOTSTRAP complete — no correctness bar this run; convert "
+                     "dump to npy + run qwen3-neartie-gap.py for the device golden");
+    return;
+  }
   MESSAGE(label << " correctness gate: " << (strict_exact + neartie_only) << "/" << N
           << " prompts PASS  (STRICT token-exact vs vLLM per-prompt greedy: "
           << strict_exact << "/" << N << "; near-tie-band only: " << neartie_only
           << "/" << N << "; max gap " << (worst_gap / 1000.0) << " nats @ prompt["
           << worst_i << "] tok=" << worst_j << "; " << fail << " forward-divergent"
-          << (metal ? "; anchor+gaps = Metal oracle-backed golden (vLLM teacher-"
-                      "forced on the Metal prefix)" : "") << ")");
+          << (device_golden ? "; anchor+gaps = device oracle-backed golden" : "")
+          << ")");
   REQUIRE(fail == 0);
 }
 
