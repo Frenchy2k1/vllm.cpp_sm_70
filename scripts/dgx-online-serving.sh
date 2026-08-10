@@ -290,8 +290,14 @@ if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then
   cat "${build_log}" >&2
   exit 1
 fi
-[[ -x ${build_dir}/examples/server ]] || {
-  echo "provenance-recorded build did not produce examples/server" >&2
+# The `server` target's OUTPUT_NAME became `vllm-server` when the release
+# packaging landed (examples/CMakeLists.txt, W6), so a current build tree has no
+# `examples/server`. Resolve the new name first and keep the old one as a
+# fallback so an evidence tree built before that rename still replays.
+server_bin="${build_dir}/examples/vllm-server"
+[[ -x ${server_bin} ]] || server_bin="${build_dir}/examples/server"
+[[ -x ${server_bin} ]] || {
+  echo "provenance-recorded build did not produce examples/vllm-server (nor the pre-rename examples/server)" >&2
   exit 1
 }
 [[ ${model} != q3mxfp4 || -x ${build_dir}/examples/vllm-cli ]] || {
@@ -379,7 +385,7 @@ drop_caches() {
   python3 -m tools.bench.drop_file_cache \
     --root "${snapshot}" \
     --root "${source_corpus}" \
-    --root "${build_dir}/examples/server" \
+    --root "${server_bin}" \
     --root "${client}" \
     --output "${output}"
 }
@@ -421,7 +427,7 @@ start_server() {
   local -a server_cmd
   if [[ ${engine} == ours ]]; then
     server_cmd=(
-      "${build_dir}/examples/server"
+      "${server_bin}"
       --model "${snapshot}"
       --port "${port}"
       --num-blocks "${num_blocks}"
@@ -690,7 +696,7 @@ run_paired_traces() {
     done
     mkfifo --mode=600 "${shutdown_fifo}"
     local -a server_cmd=(
-      "${build_dir}/examples/server"
+      "${server_bin}"
       --model "${snapshot}"
       --port "${port}"
       --num-blocks "${num_blocks}"
