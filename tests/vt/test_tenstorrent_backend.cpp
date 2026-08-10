@@ -1236,3 +1236,128 @@ TEST_CASE("kTENSTORRENT kPagedAttention pure-decode matches host within BF16 env
   // Device BF16 SDPA or host path — generous envelope.
   CHECK(max_abs < 0.5f);
 }
+
+// Multi-token pure prefill with TILE-legal geometry exercises
+// ttnn::chunked_scaled_dot_product_attention (or host fallback).
+TEST_CASE("kTENSTORRENT kPagedAttention pure-prefill matches host within BF16 envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+
+  // T=32 query tokens, full prefill (seq=T), D=128, block=32 → one chunked SDPA call.
+  constexpr int64_t T = 32, Hq = 4, Hkv = 2, D = 128, Bsz = 32;
+  constexpr int64_t Seq = T;
+  constexpr int64_t NBlocks = (Seq + Bsz - 1) / Bsz;  // 1
+  constexpr int64_t Page = Hkv * D;
+  const size_t cache_elems = static_cast<size_t>(NBlocks * Bsz * Page);
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_q(static_cast<size_t>(T * Hq * D));
+  std::vector<float> host_kc(cache_elems), host_vc(cache_elems);
+  for (size_t i = 0; i < host_q.size(); ++i)
+    host_q[i] = (static_cast<float>(i % 17) - 8.0f) * 0.05f;
+  // Dense NHD cache: position j lives at block j/Bsz, offset j%Bsz.
+  for (int64_t j = 0; j < Seq; ++j) {
+    const int64_t blk = j / Bsz, off = j % Bsz;
+    for (int64_t g = 0; g < Hkv; ++g) {
+      for (int64_t e = 0; e < D; ++e) {
+        const size_t idx =
+            static_cast<size_t>(((blk * Bsz + off) * Hkv + g) * D + e);
+        host_kc[idx] = (static_cast<float>((j * 3 + g * 5 + e) % 13) - 6.0f) * 0.03f;
+        host_vc[idx] = (static_cast<float>((j * 7 + g * 2 + e) % 11) - 5.0f) * 0.02f;
+      }
+    }
+  }
+  std::vector<int32_t> block_table(static_cast<size_t>(NBlocks));
+  for (int64_t i = 0; i < NBlocks; ++i) block_table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  std::vector<int32_t> seq_lens{static_cast<int32_t>(Seq)};
+  std::vector<int32_t> qsl{0, static_cast<int32_t>(T)};
+  std::vector<float> host_out(static_cast<size_t>(T * Hq * D), 0.0f);
+
+  void* mem_q = backend.Alloc(host_q.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  void* mem_kc = backend.Alloc(host_kc.size() * sizeof(float));
+  void* mem_vc = backend.Alloc(host_vc.size() * sizeof(float));
+  void* mem_bt = backend.Alloc(block_table.size() * sizeof(int32_t));
+  void* mem_sl = backend.Alloc(seq_lens.size() * sizeof(int32_t));
+  void* mem_qsl = backend.Alloc(qsl.size() * sizeof(int32_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_q, host_q.data(), host_q.size() * sizeof(float));
+  backend.Copy(q, mem_kc, host_kc.data(), host_kc.size() * sizeof(float));
+  backend.Copy(q, mem_vc, host_vc.data(), host_vc.size() * sizeof(float));
+  backend.Copy(q, mem_bt, block_table.data(), block_table.size() * sizeof(int32_t));
+  backend.Copy(q, mem_sl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, mem_qsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  Tensor tq =
+      Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, Hq, D});
+  Tensor tout = Tensor::Contiguous(mem_out, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                   {T, Hq, D});
+  Tensor tkc = Tensor::Contiguous(mem_kc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tvc = Tensor::Contiguous(mem_vc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {NBlocks, Bsz, Hkv, D});
+  Tensor tbt = Tensor::Contiguous(mem_bt, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0},
+                                  {1, NBlocks});
+  Tensor tsl =
+      Tensor::Contiguous(mem_sl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {1});
+  Tensor tqsl =
+      Tensor::Contiguous(mem_qsl, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {2});
+
+  vt::PagedAttentionArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(D));
+  args.causal = true;
+  auto pa = reinterpret_cast<vt::PagedAttentionFn>(
+      vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kTENSTORRENT));
+  pa(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_q);
+  backend.Free(mem_out);
+  backend.Free(mem_kc);
+  backend.Free(mem_vc);
+  backend.Free(mem_bt);
+  backend.Free(mem_sl);
+  backend.Free(mem_qsl);
+
+  // Host causal GQA oracle over the dense NHD cache.
+  const int64_t qpk = Hq / Hkv;
+  float max_abs = 0.0f;
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t p = t;  // pure prefill: query pos == token index
+    for (int64_t h = 0; h < Hq; ++h) {
+      const int64_t g = h / qpk;
+      const int64_t qoff = (t * Hq + h) * D;
+      float m = -std::numeric_limits<float>::infinity();
+      std::vector<float> scores(static_cast<size_t>(p + 1));
+      for (int64_t j = 0; j <= p; ++j) {
+        float dot = 0.0f;
+        const int64_t blk = j / Bsz, off = j % Bsz;
+        const int64_t kbase = ((blk * Bsz + off) * Hkv + g) * D;
+        for (int64_t e = 0; e < D; ++e)
+          dot += host_q[static_cast<size_t>(qoff + e)] * host_kc[static_cast<size_t>(kbase + e)];
+        scores[static_cast<size_t>(j)] = dot * args.scale;
+        m = std::max(m, scores[static_cast<size_t>(j)]);
+      }
+      float denom = 0.0f;
+      for (int64_t j = 0; j <= p; ++j) {
+        scores[static_cast<size_t>(j)] = std::exp(scores[static_cast<size_t>(j)] - m);
+        denom += scores[static_cast<size_t>(j)];
+      }
+      const float inv = 1.0f / denom;
+      for (int64_t e = 0; e < D; ++e) {
+        float acc = 0.0f;
+        for (int64_t j = 0; j <= p; ++j) {
+          const int64_t blk = j / Bsz, off = j % Bsz;
+          const int64_t vbase = ((blk * Bsz + off) * Hkv + g) * D + e;
+          acc += scores[static_cast<size_t>(j)] * inv * host_vc[static_cast<size_t>(vbase)];
+        }
+        max_abs = std::max(max_abs, std::fabs(host_out[static_cast<size_t>(qoff + e)] - acc));
+      }
+    }
+  }
+  MESSAGE("pure-prefill max_abs vs host oracle: ", max_abs);
+  CHECK(max_abs < 0.5f);
+}
