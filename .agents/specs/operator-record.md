@@ -71,11 +71,22 @@ unchanged from the 2026-08-06 correction, and `record_is_ours` keeps the legacy
 session fallback for a record written before that correction.
 
 **Staleness.** `RECORD_TTL_SECONDS` keeps the 2-hour value and the heartbeat
-semantics. A stale record is filtered out of every display and unlinked on the
-next `claim`, which is a write path; `show` and `resolve` never unlink, because
-`agent-preflight.sh` documents itself as never writing anything. A stale record
-can no longer refuse anybody, so breaking one is no longer an event: the NOTE
-that announced it goes with the refusal it explained.
+semantics. Another worktree's stale record is filtered out of every display and
+unlinked on the next `claim`, which is a write path; `show` and `resolve` never
+unlink, because `agent-preflight.sh` documents itself as never writing anything.
+A stale record can no longer refuse anybody, so breaking one is no longer an
+event: the NOTE that announced it goes with the refusal it explained.
+
+The prune skips THIS worktree's own record (`keep_canonical`, third review
+round). Our own record is stale on any ordinary re-claim — the TTL is two hours
+and a session re-claims at the top of its next tool call — and pruning it before
+republishing it is the same unlink-then-create the second round removed from
+`drop_our_record`, only reached by the commoner path. It costs nothing to skip:
+`write_our_record` republishes that exact path immediately, and `resolve` matches
+our own record by ownership with no staleness filter, so an aged own record was
+never displayed as a live coordinator in the first place. The consequence of not
+skipping is measured, not theoretical: a session killed inside the window turned
+a worktree that resolved `role=operator` into `role=UNDECLARED` exit 3.
 
 **Migration.** A pre-#285 `vllm-cpp-operator.lock` is read as one more record,
 so a session that claimed operator before this change still resolves as operator
@@ -156,3 +167,20 @@ worktree, session, host and heartbeat age; `release` removes only the caller's
 record; a stale record is pruned from the display and blocks nothing. The
 refusal path and its `already held` message are gone from the tool, the two
 front doors, and the documents.
+
+Three review rounds. Round 2 scoped `drop_our_record` so a re-claim replaces its
+record instead of unlinking it, and pinned the atomic publish. Round 3 found the
+same window still open through `prune_stale_records`, which the round-2 comment
+had asserted was closed: the prune runs first and unlinks any stale record,
+including ours. It is now scoped the same way, and
+`test_a_reclaim_never_unlinks_its_own_record` runs both ages of record because
+only the fresh one had been covered. Round 3 also pinned what the publish tests
+missed — a publish that unlinks the name and recreates it leaves the hardlink
+witness and the residue check both green, so the NAME is now watched directly —
+and pinned the `legacy` field a pre-#285 peer adds to `--probe --json`.
+
+Still declined, unchanged: `prune_stale_records` targets a path rather than the
+inode it read, so a PEER that republishes inside the window loses that record.
+Its remedy is `claim operator`, which is never refused. With `keep_canonical`
+that declination is now confined to peers; this worktree's own record is no
+longer exposed to it.
