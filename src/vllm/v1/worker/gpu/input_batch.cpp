@@ -289,11 +289,13 @@ int InputBatch::add_request(const CachedRequestState& request) {
     logits_processors[req_index] = sp.logits_processor;
   }
 
-  // num_logprobs (gpu_input_batch.py:435-440). Keep the -1 sentinel; our Sampler
-  // reads it directly (upstream stores vocab_size).
+  // num_logprobs (gpu_input_batch.py:434-440). The `-1` ("all logprobs")
+  // sentinel is WIDENED to vocab_size here, exactly as upstream does, so that
+  // downstream sees one shape whatever the request asked for. See
+  // specs/logprobs-all-sentinel.md.
   num_logprobs.erase(req_id);
   if (sp.logprobs.has_value()) {
-    num_logprobs[req_id] = *sp.logprobs;
+    num_logprobs[req_id] = *sp.logprobs == -1 ? vocab_size : *sp.logprobs;
   }
 
   // allowed_token_ids (gpu_input_batch.py:446-467). Lazily allocate the
@@ -479,17 +481,17 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
 }
 
 std::optional<int> InputBatch::max_num_logprobs() const {
-  // gpu_input_batch.py:1150-1151: max(num_logprobs.values()) or None. Our -1
-  // ("all") sentinel dominates any finite request (it means the full vocab).
+  // gpu_input_batch.py:1150-1151: max(num_logprobs.values()) or None. Every
+  // value is already a concrete count — add_request widened `-1` to vocab_size
+  // — so a request asking for "all" simply carries the largest count and wins
+  // this max on its own, with no sentinel to propagate.
   if (num_logprobs.empty()) return std::nullopt;
   int best = 0;
-  bool any_all = false;
   for (const auto& [req_id, k] : num_logprobs) {
     (void)req_id;
-    if (k == -1) any_all = true;
-    else best = std::max(best, k);
+    best = std::max(best, k);
   }
-  return any_all ? std::optional<int>(-1) : std::optional<int>(best);
+  return best;
 }
 
 std::optional<int> InputBatch::remove_request(const std::string& req_id) {

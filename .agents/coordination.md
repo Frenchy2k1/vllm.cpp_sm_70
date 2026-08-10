@@ -1502,6 +1502,19 @@ with the seed_oss-before-step3p5 ordering, re-verified. Scope:
 `{include,src}/vllm/entrypoints/openai/tool_parsers/{qwen3_coder,kimi_k2,
 glm47,minimax_m2,gemma4,seed_oss}.*`, structural_tags.*, utils.*, detect
 table, tests, CMake. Details in the state-log entry of the same date.
+**`logprobs=-1` engine crash (`SAMPLE-LOGPROBS`, 2026-08-09, issue #231).** Claude
+Code (claude-opus-5), isolated worktree `/home/mudler/_git/vllm.cpp-logprobs-all`,
+branch `row/SAMPLE-LOGPROBS-ALL`, base `origin/main` `58f43f66` pinned at worktree
+creation. Spec [logprobs-all-sentinel.md](specs/logprobs-all-sentinel.md). NOT in
+the claims table below: that table keys `SPIKE`/`ACTIVE` rows, and this is a
+bugfix to a `DONE` row with no lifecycle move. Scope: the `num_logprobs` widening
++ `max_num_logprobs()` in `input_batch.{h,cpp}`, the unreachability comment on the
+sampler's raw-vocab arm, two cases in `tests/vllm/v1/test_llm_engine.cpp`, the
+replaced + added cases in `tests/vllm/v1/worker/test_input_batch.cpp`, and the
+row's evidence cell. CPU-only; NO kernel, vt op, ABI, CMake, model file, GPU or
+public-doc change. Does NOT touch the roadmap issue table — PR #235 already
+registers #231 there and duplicating the row would guarantee a keyed-record
+conflict.
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|

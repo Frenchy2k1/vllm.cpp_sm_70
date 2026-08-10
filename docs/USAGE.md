@@ -645,6 +645,10 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
 
+`SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
+it returns the same gathered shape a finite count returns, one entry per vocab id
+per position. (Over HTTP the OpenAI `logprobs` field keeps its own 0..5 range.)
+
 ## Multimodal input (image, video, audio to text)
 
 Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:
