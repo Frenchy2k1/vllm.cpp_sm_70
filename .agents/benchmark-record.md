@@ -17886,3 +17886,30 @@ next countable item.
 
 Evidence: `dgx:~/abdown` (12 result JSONs + 4 identical token probes),
 `dgx:~/g5.log` (both arms, both gates, with Status lines).
+
+## CORRECTIONS to the two 35B glue entries above (2026-08-10)
+
+Two numbers those entries carry do not survive re-measurement. Corrected here
+rather than left standing.
+
+**"~2x the SiLU launch count" is WRONG.** It matched only ONE of vLLM's two
+SiLU-family kernels. Normalised per layer-step, vLLM runs
+`triton_poi_fused_mul_silu_slice_0` at 1.00 AND
+`vllm::act_and_mul_kernel<..., __nv_bfloat162, ...>` at 0.98 = **1.98**, against
+our 2.00. **The counts MATCH.** What differs is per-launch cost: ours 22.6 us
+against ~2.45 us, a **9.2x** gap — 4.1% of our GPU kernel time against 0.50% of
+vLLM's, i.e. **3.6 percentage points**, over half the remaining mid-band. Now
+spec'd as `PERF-35B-SILU-VECTORIZE` ([spec](specs/moe-silu-vectorize.md)): our
+kernel does two integer divisions per element and no vectorisation; vLLM's does
+neither.
+
+**"CastF32 was 3.1% of the 35B decode step"** was quoted from the older f32-out
+GEMV audit row, not from the c8 profile that justified the change. In that
+profile `CastF32Kernel` is **0.6%** of GPU kernel time at 1.02 launches per
+layer-step. The landed +2.05% is unaffected and gate-verified — the win is the
+eliminated `[T,H]` f32 write plus the consumer's cheaper read, not the cast
+kernel's own share — but 3.1% is not this profile's number.
+
+Both corrections share one failure mode: matching a single kernel name and
+concluding a ratio. Enumerate the whole kernel family and normalise per
+layer-step before claiming any count difference.

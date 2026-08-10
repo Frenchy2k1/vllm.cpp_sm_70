@@ -36,6 +36,7 @@
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/v1/core/sched/async_scheduler.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/async_llm.h"
@@ -43,6 +44,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/metrics/loggers.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vt/dtype.h"
 
@@ -65,6 +67,7 @@ using vllm::v1::KVCacheConfig;
 using vllm::v1::ModelRunnerBase;
 using vllm::v1::ModelRunnerOutput;
 using vllm::v1::OutputProcessor;
+using vllm::v1::metrics::PrometheusStatLogger;
 using vllm::v1::Scheduler;
 using vllm::v1::SchedulerOutput;
 using vllm::v1::sha256_cbor;
@@ -229,6 +232,19 @@ int Drain(AsyncLLM& engine, const AsyncRequest& request,
     if (outputs != nullptr) outputs->push_back(output);
     if (output.finished) return tokens;
   }
+}
+
+// Parse the scalar a Prometheus text line carries: find "<series> " and read
+// the value to end of line. Same shape as test_llm_engine.cpp's helper, but
+// this one RETURNS a sentinel instead of failing when the series is absent, so
+// it is safe to call inside a poll loop.
+double MetricValue(const std::string& text, const std::string& series) {
+  const std::string needle = series + " ";
+  const size_t p = text.find(needle);
+  if (p == std::string::npos) return -1.0;
+  const size_t v = p + needle.size();
+  const size_t e = text.find('\n', v);
+  return std::stod(text.substr(v, e - v));
 }
 
 void InitHash() {
@@ -522,4 +538,133 @@ TEST_CASE(
   CHECK(second_add_what.find("EngineCore encountered an issue") !=
         std::string::npos);
   CHECK(second_add_what.find("DIAG_ROOT_CAUSE_SENTINEL") == std::string::npos);
+}
+
+// ─── Metrics on the ASYNC-SCHEDULING (depth-2 batch-queue) step path (#277) ───
+// `AsyncLLM` with max_concurrent_batches=2 runs EngineCore::step_with_batch_queue
+// instead of step(). Upstream stamps `scheduler_stats` and `timestamp` inside
+// `Scheduler.update_from_output` (scheduler.py:1938-1951) and
+// `EngineCoreOutputs.__post_init__` (engine/__init__.py:249-251) — a path BOTH
+// step functions share, so upstream's batch-queue path carries them too. Our
+// port stamped them at EngineCore::step() only, so the depth-2 serving path
+// (which is what `LoadedEngine` resolves to when the runner supports async
+// scheduling) published a default-constructed SchedulerStats and timestamp 0.
+//
+// The gauge assertion is a POLL rather than a single scrape: the running batch
+// is only observable while a request is in flight, and the delayed stub keeps
+// one in flight for as long as the poll needs. It also exercises the recorder
+// mutex, since Expose() here runs on the test thread concurrently with the
+// output handler's Record().
+//
+// RED before the stamp: the running gauge never leaves 0 and the poll times out.
+TEST_CASE("async_llm: depth-2 batch-queue step publishes live scheduler stats") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+  KVCacheConfig kv;
+  kv.num_blocks = 10000;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, 1, 1, DType::kF32));
+  vllm::v1::AsyncScheduler scheduler(cfg, kv, /*block_size=*/16,
+                                     /*enable_caching=*/true);
+
+  // 500 us per step keeps a long request in flight for the whole poll window.
+  RunnerStub runner(std::chrono::microseconds(500));
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor),
+                  /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/2);
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  AsyncRequest long_request = engine.add_request(
+      "in-flight", "hello", Params(100000, RequestOutputKind::kDelta));
+
+  // Poll until the running gauge reports the in-flight request. Generous
+  // budget: this box is shared and the assertion is about the value ever being
+  // published at all, not about how fast it appears.
+  bool saw_running = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (MetricValue(logger.Expose(),
+                    "vllm:num_requests_running{model_name=\"m\",engine=\"0\"}") ==
+        1.0) {
+      saw_running = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  CHECK(saw_running);
+
+  engine.abort(long_request.request_id);
+  engine.shutdown();
+}
+
+// The token counters and the engine-core-timestamp-derived histograms on the
+// same depth-2 path. Without the timestamp stamp the TTFT/e2e observations are
+// `0 - arrival_time`, i.e. strongly NEGATIVE, so a positive _sum is the exact
+// discriminator. Counters/observation counts additionally gate the fold itself.
+TEST_CASE("async_llm: depth-2 batch-queue step folds IterationStats") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+  KVCacheConfig kv;
+  kv.num_blocks = 10000;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, 1, 1, DType::kF32));
+  vllm::v1::AsyncScheduler scheduler(cfg, kv, /*block_size=*/16,
+                                     /*enable_caching=*/true);
+
+  RunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor),
+                  /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/2);
+  PrometheusStatLogger logger("m", /*max_model_len=*/8192);
+  engine.set_stat_logger(&logger);
+
+  constexpr int kTokens = 8;
+  AsyncRequest request = engine.add_request(
+      "r", "hello", Params(kTokens, RequestOutputKind::kDelta));
+  CHECK(Drain(engine, request) == kTokens);
+  // Join the output handler so every fold has retired before the scrape.
+  engine.shutdown();
+
+  const std::string t = logger.Expose();
+  const char* kLabels = "{model_name=\"m\",engine=\"0\"}";
+  CHECK(MetricValue(t, std::string("vllm:prompt_tokens_total") + kLabels) == 1.0);
+  CHECK(MetricValue(t, std::string("vllm:generation_tokens_total") + kLabels) ==
+        static_cast<double>(kTokens));
+  CHECK(MetricValue(t, std::string("vllm:time_to_first_token_seconds_count") +
+                           kLabels) == 1.0);
+  CHECK(MetricValue(t, std::string("vllm:e2e_request_latency_seconds_count") +
+                           kLabels) == 1.0);
+  // The discriminator for the timestamp stamp: an unstamped (0.0) engine-core
+  // timestamp makes both of these negative.
+  CHECK(MetricValue(t, std::string("vllm:time_to_first_token_seconds_sum") +
+                           kLabels) > 0.0);
+  CHECK(MetricValue(t, std::string("vllm:e2e_request_latency_seconds_sum") +
+                           kLabels) > 0.0);
 }
