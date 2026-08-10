@@ -184,3 +184,74 @@ inode it read, so a PEER that republishes inside the window loses that record.
 Its remedy is `claim operator`, which is never refused. With `keep_canonical`
 that declination is now confined to peers; this worktree's own record is no
 longer exposed to it.
+
+## Follow-up: issue [#296](https://github.com/mudler/vllm.cpp/issues/296)
+
+Round 3's final review passed with two LOW findings recorded rather than
+blocked. Both are closed on `row/ENG-OPERATOR-RECORD-COVERAGE`. No product
+behaviour changes: `scripts/agent-role.py`'s publish is unchanged apart from one
+comment.
+
+**1. The `RECORD_TTL_SECONDS` comment was falsified by its own fix.** It still
+said a stale record is *"unlinked by the next `claim`"*, which `keep_canonical`
+made untrue for THIS worktree's record — that one is replaced, never unlinked.
+The identical sentence at line 74 above was corrected when the fix landed and
+the source copy, one screen above the function it describes, was not. It now
+carries the same qualification, and a tree-wide search found no third copy.
+
+**2. The publish-NAME pin was escapable, and widening it again would not have
+been the fix.** `test_a_publish_never_leaves_the_record_NAME_absent` watched
+`Path.write_text`, `Path.unlink`, `os.unlink` and `os.remove`. A publish written
+`os.rename(target, aside)` then `open(target, "w")` escaped it: MEASURED, the
+pre-#296 suite is 59/59 green under that mutation. That is the third round in a
+row where one publish-coverage residual was fixed and the next one opened, and
+the reason is structural — **any monkeypatch-watcher pin is escapable by one more
+I/O primitive**, so widening the list chases a fixed point.
+
+The pin is now two tests that fail differently, and the evidence says neither
+subsumes the other:
+
+- `_watch_publish` (deterministic, in-process) adds `os.rename`/`os.replace` and
+  `Path.rename`/`Path.replace` as SOURCE, plus `builtins.open`/`io.open`/`os.open`
+  in write modes. It catches every primitive it names, on every run, in
+  milliseconds — and only those.
+- `test_a_concurrent_observer_never_sees_the_record_name_absent` (probabilistic,
+  out-of-process) republishes the record 200 times in a subprocess while the test
+  process does nothing but poll `exists()`. It enumerates nothing, so it is the
+  only half that can catch a primitive nobody listed. It is ONE-SIDED — a hit
+  proves absence, a miss proves nothing — and therefore cannot go red on correct
+  code however the two processes are scheduled.
+
+Measured 2026-08-10 on a 20-core box already at load average 263, ~1.5ms per
+publish against ~1us per poll, 150k-300k polls per run:
+
+| Publish under test | Watcher | Observer |
+|---|---|---|
+| `os.rename` + `open` (the documented escape) | RED | 10/10, and 10/10 at 60 publishes |
+| `unlink` + `write_text` (the previous escape) | RED | 10/10 |
+| byte-at-a-time in-place rewrite (the escape before that) | green — caught instead by the hardlink test | 0/6 |
+| shipped `write temp + os.replace` | green | 40/40 green, zero absent readings |
+| shipped, both processes pinned to ONE core | green | 20/20 green |
+| `os.rename` + `open`, pinned to ONE core | RED | 1/15 |
+
+The two pinned rows are why both halves ship. The observer's sensitivity needs
+real parallelism — on a single core the publisher is rarely preempted inside a
+window that lasts microseconds — and it is blind by construction to a publish
+that never makes the name absent. The watcher is unaffected by scheduling and
+covers exactly the named primitives. Sizing follows from that: 200 publishes is
+~0.39s, chosen for margin over the 60 that already detected 10/10, and the only
+non-assertion guard is a floor of 200 polls, ~0.1% of the measured count, whose
+sole job is to notice a poll loop that never ran. A loaded machine costs
+detection probability, never a red run.
+
+The test's stated claim was weakened to match what it proves: it no longer says
+*"at the instant **any** file content is written … **nothing** may unlink it"*,
+but bounds itself to the primitives `_watch_publish` names, and points at the
+observer for the rest.
+
+**Still declined here:** the observer is a backstop, not a gate — a single-core
+CI runner reduces it to ~1/15 per run on the mutation it is aimed at. The
+deterministic half is what holds the line there, and the residual is recorded
+rather than closed with a longer run, because buying meaningful single-core
+sensitivity costs seconds per suite invocation for a probability that still is
+not one.
