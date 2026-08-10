@@ -723,6 +723,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_weights.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
+  src/vllm/model_executor/models/muse_glimmer_mm.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
