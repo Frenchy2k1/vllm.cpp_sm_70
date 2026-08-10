@@ -251,6 +251,48 @@ oracle gate and is recorded as such. Not a full-depth comparison of our forward
 (the 52-layer arm needs ~55.7 GB resident and is a named residual). Not any kind
 of speed result; no denominator exists.
 
+## 6.6 A REAL HF REFERENCE EXISTS — and we match it (2026-08-10)
+
+§0 said no gateable reference existed. **That is now out of date**, and this
+section supersedes it for correctness (the speed statement in §0 still stands
+unchanged).
+
+HF's Muse Glimmer implementation lives on the `exportable-muse` branch of
+`huggingface/transformers` (`a9e337e8`, version 5.16.0.dev0) — *not* the
+`new-model-addition-onyx` name vllm#51655's comment gives, which exists neither
+as a branch nor as a repo. The branch carries the full
+`models/muse_glimmer/{configuration,modeling,processing,image_processing,video_processing}`
+set plus `muse_glimmer_assistant` (the DFlash drafter).
+
+Installed on dgx at `$HOME/venvs/muse-onyx`, deliberately isolated: the pinned
+oracle venv is untouched, and the new venv reuses the oracle's torch through a
+`.pth` fallback rather than pulling a second CUDA build. `muse_glimmer` registers
+in `CONFIG_MAPPING_NAMES` and `AutoConfig` resolves the released 52-layer config.
+Note it registers under the multimodal AutoModel classes, so
+`AutoModelForCausalLM` rejects it — use `MuseGlimmerForConditionalGeneration`.
+
+**Result at reduced depth (4/52), real weights, prompt "The capital of France is":**
+
+| Comparison | argmax | max abs diff | cosine |
+|---|---|---|---|
+| HF reference vs our torch transcription | **identical** | 0.117212 | 0.99997157 |
+| our C++ vs our torch transcription | **identical** | 0.0889745 | 0.999981 |
+
+Three independent implementations — HF's own, our transcription, and our C++ —
+agree on `[27389, 110709, 32485, 122967, 152652]`. That is materially stronger
+than §6.5's claim: the earlier evidence was agreement between two things we
+wrote from the same source, and this adds a genuine third-party oracle.
+
+**Still owed.** The full 52-layer HF comparison did not run: dgx had a live
+`vllm serve` holding most of the 119 GB unified pool, leaving ~37 GB against a
+60 GB load, and on GB10 an OOM can reboot the box. That job also did NOT hold
+`${GPU_LOCK}`, so the mutex protected nothing — the reduced-depth run was chosen
+to stay bounded. Re-run at full depth on an idle box.
+
+Also still true: the perception encoder has no reference check, nothing has run
+end to end through the server, multi-step decode and the sliding window are
+untested, and **no speed axis is claimable on any dimension.**
+
 ## 7. Outcome
 
 Pending overall.
