@@ -325,7 +325,7 @@ ENGINE_PREFIXES = (
 # modify). User-directed, issue #224; `READY` on its committed spec, and no
 # site, workflow or published page is claimed by the bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 145
+ENGINE_ROWS = 146
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

@@ -849,6 +849,10 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
+    // Issue #150 accounting: the host->device weight upload for this family.
+    // When `w.bytes` borrows the safetensors mapping (ENG-LOAD-DIRECT-UPLOAD)
+    // the source of this copy IS the file mapping, so the byte moved once.
+    vllm::load_stats::AddDeviceUpload(nb);
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
@@ -938,16 +942,29 @@ Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   if (!w.d_packed) {
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
+    // ENG-LOAD-DIRECT-UPLOAD (issue #150): the 27B `LoadCtNvfp4Raw` weights
+    // BORROW packed/scale from the safetensors mmap, so this is their one
+    // host->device move. Account it and run the same post-upload residency step
+    // every other qualifying weight gets, exactly as dense_nvfp4_gemm.h's
+    // shared ResidentNvfp4 does. Publishing the allocation on the OwnedTensor
+    // is what lets AdoptDeviceBytesAsHost run (it keys on `d_dev`); the two
+    // handles share one control block, so the buffer is freed exactly once.
+    vllm::load_stats::AddDeviceUpload(pb);
     d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
     Backend* bk = &d.b;
     w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    w.packed.d_dev = w.d_packed;
+    AdoptDeviceBytesAsHost(d.b, w.packed);
   }
   if (!w.d_scale) {
     const size_t sb = w.scale.bytes.size();
     void* p = d.b.Alloc(sb);
+    vllm::load_stats::AddDeviceUpload(sb);
     d.b.Copy(d.q, p, w.scale.bytes.data(), sb);
     Backend* bk = &d.b;
     w.d_scale = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    w.scale.d_dev = w.d_scale;
+    AdoptDeviceBytesAsHost(d.b, w.scale);
   }
   Nvfp4Dev r;
   r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});

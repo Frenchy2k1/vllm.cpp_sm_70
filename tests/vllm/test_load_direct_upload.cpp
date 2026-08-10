@@ -1,0 +1,537 @@
+// ENG-LOAD-DIRECT-UPLOAD (issue #150) — the MECHANISM, not a timing.
+//
+// The claim under test is not "loading got faster"; it is that a weight the
+// device consumes VERBATIM never materializes an owned host buffer at all. That
+// is an observable, deterministic property of the loaded container:
+//
+//   * `bytes.data()` IS the address inside the safetensors mmap (so nothing was
+//     copied), and `bytes.borrowed()` is true;
+//   * the borrow keeps the mapping alive past ~SafetensorsFile, which is what
+//     makes a LATER device upload legal (the whole design problem);
+//   * the byte accounting shows the range under `borrowed`, and NOT under
+//     `host_copy`;
+//   * every non-verbatim path — transpose, dtype conversion, concatenation —
+//     and every size/dtype mismatch still copies, i.e. the lever fails closed.
+//
+// A timing test would pass with the copy still in place. These do not.
+#include <doctest/doctest.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/model_executor/models/owned_bytes.h"
+#include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vt/backend.h"
+
+namespace {
+
+std::string U64Le(uint64_t v) {
+  std::string s(8, '\0');
+  for (int i = 0; i < 8; ++i) s[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+  return s;
+}
+
+class TempFile {
+ public:
+  explicit TempFile(const std::string& bytes) {
+    static int counter = 0;
+    path_ = (std::filesystem::temp_directory_path() /
+             ("vllm_direct_upload_test_" + std::to_string(counter++) +
+              ".safetensors"))
+                .string();
+    std::ofstream out(path_, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  ~TempFile() { std::remove(path_.c_str()); }
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+// Two BF16 [4,2] tensors ("w", "v") and one F32 [4] tensor ("f"), with distinct
+// contents so a wrong copy is visible in the values, not only in the pointer.
+constexpr int64_t kRows = 4;
+constexpr int64_t kCols = 2;
+constexpr size_t kBf16Bytes = static_cast<size_t>(kRows * kCols) * 2;
+constexpr size_t kF32Bytes = static_cast<size_t>(kRows) * 4;
+
+std::string Body() {
+  std::string data(kBf16Bytes * 2 + kF32Bytes, '\0');
+  std::vector<uint16_t> w(kRows * kCols);
+  std::vector<uint16_t> v(kRows * kCols);
+  for (size_t i = 0; i < w.size(); ++i) {
+    w[i] = static_cast<uint16_t>(0x3f00 + i);
+    v[i] = static_cast<uint16_t>(0x4100 + i);
+  }
+  std::memcpy(data.data(), w.data(), kBf16Bytes);
+  std::memcpy(data.data() + kBf16Bytes, v.data(), kBf16Bytes);
+  const float f[kRows] = {1.5F, 2.5F, 3.5F, 4.5F};
+  std::memcpy(data.data() + 2 * kBf16Bytes, f, kF32Bytes);
+  return data;
+}
+
+std::string Header() {
+  return
+      R"({"w":{"dtype":"BF16","shape":[4,2],"data_offsets":[0,16]},)"
+      R"("v":{"dtype":"BF16","shape":[4,2],"data_offsets":[16,32]},)"
+      R"("f":{"dtype":"F32","shape":[4],"data_offsets":[32,48]}})";
+}
+
+std::string File() {
+  const std::string h = Header();
+  return U64Le(h.size()) + h + Body();
+}
+
+vllm::TensorResolver ResolverFor(const vllm::SafetensorsFile& st) {
+  return [&st](const std::string& name) -> const vllm::StTensor& {
+    return st.Get(name);
+  };
+}
+
+// RAII around the process-wide test seams so one failing CHECK cannot leak a
+// forced decision into the next TEST_CASE.
+class ForcedArm {
+ public:
+  explicit ForcedArm(bool direct) {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(direct);
+    // The windowed source-page release madvises the source range away after a
+    // copy. Reading a copied tensor's SOURCE afterwards is legal (the pages
+    // re-fault) but the assertions below compare against it, so keep it off to
+    // isolate the one behavior under test.
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(false);
+  }
+  ~ForcedArm() {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(std::nullopt);
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(std::nullopt);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("direct upload: a verbatim BF16 weight VIEWS the mapping, no host copy") {
+  ForcedArm arm(true);
+  TempFile f(File());
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  const vllm::StTensor& src = st.Get("w");
+
+  const vllm::load_stats::Counters before = vllm::load_stats::Snapshot();
+  const vllm::OwnedTensor w = vllm::dense_loaders::LoadBf16Direct(ResolverFor(st), "w");
+  const vllm::load_stats::Counters after = vllm::load_stats::Snapshot();
+
+  // THE MECHANISM: the weight's bytes ARE the mapping's bytes. No owned buffer
+  // was allocated, so there is nothing for a device upload to read but the file.
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) ==
+        static_cast<const void*>(src.data));
+  CHECK(w.bytes.size() == kBf16Bytes);
+  CHECK(w.mmap_src == static_cast<const void*>(src.data));
+  CHECK(w.mmap_src_bytes == kBf16Bytes);
+
+  // ... and the accounting agrees: these bytes were BORROWED, never copied.
+  CHECK(after.borrowed_bytes - before.borrowed_bytes == kBf16Bytes);
+  CHECK(after.host_copy_bytes == before.host_copy_bytes);
+
+  // Metadata is the same as the copy arm would produce.
+  CHECK(w.dtype == vt::DType::kBF16);
+  CHECK(w.rank == 2);
+  CHECK(w.shape[0] == kRows);
+  CHECK(w.shape[1] == kCols);
+}
+
+TEST_CASE("direct upload: the borrow keeps the mapping alive past ~SafetensorsFile") {
+  ForcedArm arm(true);
+  TempFile f(File());
+  std::vector<uint16_t> expected;
+  vllm::OwnedTensor w;
+  {
+    vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+    w = vllm::dense_loaders::LoadBf16Direct(ResolverFor(st), "w");
+    expected.assign(reinterpret_cast<const uint16_t*>(w.bytes.data()),
+                    reinterpret_cast<const uint16_t*>(w.bytes.data()) +
+                        kRows * kCols);
+  }
+  // The SafetensorsFile is gone. This is the lifetime question the lazy upload
+  // poses: the mapping must still be readable here, because ResidentWeight runs
+  // long after the loader returned and the shards were released.
+  REQUIRE(w.bytes.size() == kBf16Bytes);
+  const auto* got = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  for (size_t i = 0; i < expected.size(); ++i) CHECK(got[i] == expected[i]);
+  for (size_t i = 0; i < expected.size(); ++i)
+    CHECK(got[i] == static_cast<uint16_t>(0x3f00 + i));
+}
+
+TEST_CASE("direct upload: OFF copies, and both arms load the SAME bytes") {
+  TempFile f(File());
+  std::vector<uint8_t> direct_bytes;
+  std::vector<uint8_t> copied_bytes;
+  {
+    ForcedArm arm(true);
+    vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+    const vllm::OwnedTensor w =
+        vllm::dense_loaders::LoadBf16Direct(ResolverFor(st), "w");
+    REQUIRE(w.bytes.borrowed());
+    direct_bytes.assign(w.bytes.begin(), w.bytes.end());
+  }
+  {
+    ForcedArm arm(false);
+    vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+    const vllm::StTensor& src = st.Get("w");
+    const vllm::load_stats::Counters before = vllm::load_stats::Snapshot();
+    const vllm::OwnedTensor w =
+        vllm::dense_loaders::LoadBf16Direct(ResolverFor(st), "w");
+    const vllm::load_stats::Counters after = vllm::load_stats::Snapshot();
+    CHECK_FALSE(w.bytes.borrowed());
+    CHECK(static_cast<const void*>(w.bytes.data()) !=
+          static_cast<const void*>(src.data));
+    CHECK(w.mmap_src == nullptr);
+    CHECK(after.host_copy_bytes - before.host_copy_bytes == kBf16Bytes);
+    CHECK(after.borrowed_bytes == before.borrowed_bytes);
+    copied_bytes.assign(w.bytes.begin(), w.bytes.end());
+  }
+  // A residency change may not change one byte of the model.
+  CHECK(direct_bytes == copied_bytes);
+}
+
+TEST_CASE("direct upload: a TRANSPOSE is not a verbatim copy and still owns its buffer") {
+  ForcedArm arm(true);
+  TempFile f(File());
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  const vllm::StTensor& src = st.Get("w");
+  const vllm::OwnedTensor t =
+      vllm::dense_loaders::LoadBf16Transposed(ResolverFor(st), "w");
+  CHECK_FALSE(t.bytes.borrowed());
+  CHECK(t.mmap_src == nullptr);
+  CHECK(static_cast<const void*>(t.bytes.data()) !=
+        static_cast<const void*>(src.data));
+  // [out=4, in=2] on disk -> [in=2, out=4] in memory, transposed values.
+  REQUIRE(t.rank == 2);
+  CHECK(t.shape[0] == kCols);
+  CHECK(t.shape[1] == kRows);
+  const auto* got = reinterpret_cast<const uint16_t*>(t.bytes.data());
+  for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t c = 0; c < kCols; ++c) {
+      CHECK(got[c * kRows + r] == static_cast<uint16_t>(0x3f00 + r * kCols + c));
+    }
+  }
+}
+
+TEST_CASE("direct upload: a CONCATENATION of two shards owns its merged buffer") {
+  ForcedArm arm(true);
+  TempFile f(File());
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  const vllm::OwnedTensor merged =
+      vllm::dense_loaders::LoadMergedBf16RawNK(ResolverFor(st), {"w", "v"});
+  CHECK_FALSE(merged.bytes.borrowed());
+  CHECK(merged.mmap_src == nullptr);
+  REQUIRE(merged.bytes.size() == 2 * kBf16Bytes);
+  const auto* got = reinterpret_cast<const uint16_t*>(merged.bytes.data());
+  for (size_t i = 0; i < kRows * kCols; ++i) {
+    CHECK(got[i] == static_cast<uint16_t>(0x3f00 + i));
+    CHECK(got[kRows * kCols + i] == static_cast<uint16_t>(0x4100 + i));
+  }
+}
+
+TEST_CASE("direct upload: BorrowStTensorBytes FAILS CLOSED on a size or dtype mismatch") {
+  ForcedArm arm(true);
+  TempFile f(File());
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  const vllm::StTensor& w = st.Get("w");
+  const vllm::StTensor& fl = st.Get("f");
+
+  // Right dtype, WRONG element count for the span.
+  vllm::OwnedTensor too_small;
+  CHECK_FALSE(vllm::BorrowStTensorBytes(too_small, w, vt::DType::kBF16, {2, 2}));
+  CHECK(too_small.bytes.empty());
+  CHECK(too_small.mmap_src == nullptr);
+
+  // Right element count, WRONG dtype width: an f32 source is twice a bf16
+  // destination, which is exactly the f32->bf16 conversion arm that must copy.
+  vllm::OwnedTensor wrong_dtype;
+  CHECK_FALSE(vllm::BorrowStTensorBytes(wrong_dtype, fl, vt::DType::kBF16, {4}));
+  CHECK(wrong_dtype.bytes.empty());
+
+  // A synthetic StTensor with no mapping keep-alive can never be borrowed: a
+  // borrow with nothing holding the memory alive is the bug this fails closed on.
+  vllm::StTensor detached;
+  detached.dtype = "BF16";
+  detached.shape = {4, 2};
+  detached.nbytes = kBf16Bytes;
+  detached.data = w.data;
+  detached.mapping = nullptr;
+  vllm::OwnedTensor no_owner;
+  CHECK_FALSE(
+      vllm::BorrowStTensorBytes(no_owner, detached, vt::DType::kBF16, {4, 2}));
+  CHECK(no_owner.bytes.empty());
+
+  // The matching case still borrows, so the checks above rejected for their
+  // stated reason rather than because the arm was off.
+  vllm::OwnedTensor ok;
+  CHECK(vllm::BorrowStTensorBytes(ok, w, vt::DType::kBF16, {4, 2}));
+  CHECK(ok.bytes.borrowed());
+}
+
+// --- Post-upload residency: the adopt branch, and the ORDER it does things ---
+//
+// The branch under test is `AdoptDeviceBytesAsHost`'s direct-upload arm
+// (`mmap_src != nullptr && bytes.borrowed()`), the one place ENG-LOAD-DIRECT-
+// UPLOAD and BACKEND-VULKAN-LOADMEM meet. Nothing pinned it: deleting the whole
+// arm left every existing suite green, because no test ever built the
+// (borrowed + `mmap_src` + host-addressable backend) state it keys on.
+//
+// It has two guarantees, and ONE of them is an ORDERING, which is why these
+// tests need a mapping that can be OBSERVED at the instant it is dropped:
+//
+//   1. The consumed source pages are released BEFORE `bytes` is re-pointed at
+//      the device allocation. That assignment destroys the OwnedBytes carrying
+//      this tensor's keep-alive on the mapping, and by adoption time the shard's
+//      SafetensorsFile is already gone -- so for the last adopted weight of a
+//      shard the assignment MUNMAPS, and a release after it would madvise an
+//      address range that is no longer mapped.
+//   2. The release also runs on the two early-return paths -- a backend without
+//      host-addressable device memory, and `VT_ADOPT_DEVICE_BYTES=0` -- so the
+//      adoption A/B does not silently move the release lever as well.
+//
+// THE OBSERVABLE. The stand-in mapping is a private ANONYMOUS mapping filled
+// with a pattern. `MADV_DONTNEED` on such a mapping DISCARDS its contents (a
+// later read returns zeroes), so "were the pages released yet?" is answerable by
+// reading one byte -- including from inside the keep-alive's deleter, which runs
+// at exactly the instant the mapping is dropped. Correct order => the deleter
+// sees 0. Reversed order => the deleter sees the pattern.
+namespace {
+
+// Forces the direct-upload arm AND the windowed release (the release is the
+// behavior under test here, unlike the loader cases above which switch it off).
+class ForcedResidencyArm {
+ public:
+  explicit ForcedResidencyArm(bool release = true) {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(true);
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(release);
+  }
+  ~ForcedResidencyArm() {
+    vllm::detail::SetLoadDirectUploadOverrideForTesting(std::nullopt);
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(std::nullopt);
+  }
+  ForcedResidencyArm(const ForcedResidencyArm&) = delete;
+  ForcedResidencyArm& operator=(const ForcedResidencyArm&) = delete;
+};
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnvVar() {
+    if (had_old_) {
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
+// Minimal Backend whose "device" memory is plain host memory, so the adoption
+// is observable with no accelerator. `host_addressable` is the axis under test.
+class FakeBackend final : public vt::Backend {
+ public:
+  explicit FakeBackend(bool host_addressable)
+      : host_addressable_(host_addressable) {}
+
+  void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
+  void Free(void* p) override {
+    ++frees;
+    std::free(p);
+  }
+  void Memset(vt::Queue&, void* p, int value, size_t bytes) override {
+    std::memset(p, value, bytes);
+  }
+  void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    std::memcpy(dst, src, bytes);
+  }
+  vt::Queue CreateQueue() override {
+    return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  }
+  bool UnifiedMemory() const override { return true; }
+  bool DeviceMemoryIsHostAddressable() const override { return host_addressable_; }
+
+  int frees = 0;
+
+ private:
+  bool host_addressable_;
+};
+
+constexpr uint8_t kSrcPattern = 0xC3;
+
+// A stand-in shard mapping whose drop is OBSERVABLE.
+struct ObservableMapping {
+  uint8_t* addr = nullptr;
+  size_t size = 0;
+  bool dropped = false;
+  // The source byte as it read AT THE MOMENT the mapping was dropped. 0 means
+  // the pages had already been released; kSrcPattern means they had not.
+  uint8_t byte_at_drop = 0xFF;
+};
+
+size_t PageSize() {
+  const long ps = ::sysconf(_SC_PAGESIZE);
+  return static_cast<size_t>(ps > 0 ? ps : 4096);
+}
+
+// Build a borrowed, uploaded weight standing exactly where ResidentWeight leaves
+// one: bytes VIEW the mapping, `mmap_src` records the source range, `d_dev`
+// holds the device copy, and the tensor's borrow is the LAST reference to the
+// mapping (the SafetensorsFile is gone by adoption time).
+vllm::OwnedTensor BorrowedUploadedWeight(vt::Backend& b, vt::Queue& q,
+                                         ObservableMapping& m) {
+  m.size = 2 * PageSize();
+  void* raw = ::mmap(nullptr, m.size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(raw != MAP_FAILED);
+  m.addr = static_cast<uint8_t*>(raw);
+  std::memset(m.addr, kSrcPattern, m.size);
+
+  ObservableMapping* mp = &m;
+  std::shared_ptr<const void> keep(static_cast<const void*>(m.addr),
+                                   [mp](const void*) {
+                                     mp->byte_at_drop = mp->addr[0];
+                                     mp->dropped = true;
+                                     ::munmap(mp->addr, mp->size);
+                                   });
+
+  vllm::OwnedTensor w;
+  w.dtype = vt::DType::kI8;
+  w.rank = 1;
+  w.shape[0] = static_cast<int64_t>(m.size);
+  w.bytes = vllm::OwnedBytes::Borrow(m.addr, m.size, keep);
+  w.mmap_src = m.addr;
+  w.mmap_src_bytes = m.size;
+  keep.reset();  // the weight's borrow is now the only reference, as in production
+
+  void* p = b.Alloc(m.size);
+  b.Copy(q, p, w.bytes.data(), m.size);
+  vt::Backend* bk = &b;
+  w.d_dev = std::shared_ptr<void>(p, [bk](void* x) { bk->Free(x); });
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("adopt: a direct-upload borrow RELEASES its source pages BEFORE it re-points bytes") {
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+
+  ObservableMapping m;
+  vllm::OwnedTensor w = BorrowedUploadedWeight(b, q, m);
+  REQUIRE(w.bytes.borrowed());
+  REQUIRE(static_cast<const void*>(w.bytes.data()) == static_cast<const void*>(m.addr));
+  REQUIRE_FALSE(m.dropped);
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  // THE ADOPTION. The host view IS the device allocation now -- the branch that
+  // no test reached before.
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == w.d_dev.get());
+  CHECK(w.bytes.size() == m.size);
+  CHECK(w.bytes.data()[0] == kSrcPattern);  // the surviving copy has the bytes
+  CHECK(w.mmap_src == nullptr);             // no longer a direct-upload borrow
+  CHECK(w.mmap_src_bytes == 0u);
+  CHECK_FALSE(w.Empty());
+  CHECK_FALSE(w.host_released);
+
+  // THE MAPPING WENT. Re-pointing `bytes` dropped this tensor's keep-alive, and
+  // it was the last one -- which is exactly why the ordering matters.
+  CHECK(m.dropped);
+
+  // THE ORDERING. Read at the instant of the drop: 0 means the source pages had
+  // ALREADY been released, i.e. the madvise ran while the range was still
+  // mapped. kSrcPattern here means the release was moved after the assignment
+  // and would have madvise'd an unmapped range.
+  CHECK(m.byte_at_drop == 0);
+}
+
+TEST_CASE("adopt: the source pages are released even where device memory is NOT host-addressable") {
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/false);
+  vt::Queue q = b.CreateQueue();
+
+  ObservableMapping m;
+  vllm::OwnedTensor w = BorrowedUploadedWeight(b, q, m);
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  // No adoption: the borrow stays a valid, re-faultable view of the mapping...
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == static_cast<const void*>(m.addr));
+  CHECK(w.mmap_src == static_cast<const void*>(m.addr));
+  CHECK_FALSE(m.dropped);
+  // ... but the consumed pages were released all the same.
+  CHECK(m.addr[0] == 0);
+}
+
+TEST_CASE("adopt: VT_ADOPT_DEVICE_BYTES=0 moves ONLY the adoption, not the page release") {
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_off("VT_ADOPT_DEVICE_BYTES", "0");
+  FakeBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+
+  ObservableMapping m;
+  vllm::OwnedTensor w = BorrowedUploadedWeight(b, q, m);
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  // The documented A/B is back to the two-copy behavior...
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == static_cast<const void*>(m.addr));
+  CHECK(static_cast<const void*>(w.bytes.data()) != w.d_dev.get());
+  CHECK(w.mmap_src == static_cast<const void*>(m.addr));
+  CHECK_FALSE(m.dropped);
+  // ... and it did NOT also switch off the direct-upload source release, which
+  // is a separate lever with its own flag (VT_LOAD_WINDOWED_RELEASE).
+  CHECK(m.addr[0] == 0);
+}
+
+TEST_CASE("adopt: the windowed-release flag still governs the direct-upload release") {
+  // The negative control for the three cases above: with the release gate OFF,
+  // the source pages survive, so those `== 0` assertions are reading the release
+  // and not some unrelated zeroing.
+  ForcedResidencyArm arm(/*release=*/false);
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/false);
+  vt::Queue q = b.CreateQueue();
+
+  ObservableMapping m;
+  vllm::OwnedTensor w = BorrowedUploadedWeight(b, q, m);
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  CHECK(m.addr[0] == kSrcPattern);
+  CHECK_FALSE(m.dropped);
+}

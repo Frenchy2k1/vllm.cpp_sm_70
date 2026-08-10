@@ -127,6 +127,40 @@ a silent fallback cannot post a plausible number:
   [ENVIRONMENT.md](ENVIRONMENT.md) for what each knob does and what it measured.
 
 ### Quantized checkpoints: which weight forms load
+### How long a load takes, and how to see where it goes
+
+`VT_LOAD_STATS=1` prints one line per load phase with its wall time, plus the
+bytes the load actually MOVED: `host_copy` (materialized into a host buffer),
+`borrowed` (read in place from the file mapping) and `device_upload`. The byte
+line is printed twice, once when the weights are loaded and once at exit, because
+the device uploads are lazy and happen at first use.
+
+```
+$ VT_LOAD_STATS=1 build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt hi --max-tokens 1
+[vt load] mmap+header       0.027 s
+[vt load] weights          12.268 s
+[vt load] bytes@load-end  host_copy=31.162 GiB borrowed=18.936 GiB device_upload=0.000 GiB
+[vt load] bytes@exit      host_copy=31.162 GiB borrowed=18.936 GiB device_upload=50.098 GiB
+```
+
+A weight the device consumes verbatim is READ FROM the checkpoint mapping rather
+than copied into a host buffer first, so it is moved once instead of twice; that
+is `borrowed` above, and on this 27B it is 37.8% of the model and worth 1.54x on
+the load phase warm, 1.61x cold. Tensors that are merged (`qkv`, `gate_up`),
+transposed (`lm_head`) or dequantized at load are not verbatim and still copy.
+`VT_LOAD_DIRECT_UPLOAD=0` turns the direct path off in the same binary; the
+loaded bytes, and therefore the tokens, are identical either way.
+
+`device_upload` counts every single-source weight upload: the bf16/fp8 weights
+through `ResidentWeight` and the compressed-tensors NVFP4/MXFP4 `packed`/`scale`
+residents through `ResidentNvfp4`. It does NOT yet count the merged fp4 operands
+(`qkv`, `gate_up`) or the Marlin repack residents, which build one device buffer
+out of several host tensors; on a bf16 checkpoint like the one above there are
+none, so the line is the whole model. Once a weight has been uploaded its source
+pages are released, and that release is independent of `VT_ADOPT_DEVICE_BYTES` --
+switching the adoption off leaves the release on.
+
+### Quantized checkpoints: which `lm_head` forms load
 
 Publishers do not agree on how weights are stored, and a single repo can change
 it between revisions (one 27B "NVFP4" repo silently became FP8 throughout).

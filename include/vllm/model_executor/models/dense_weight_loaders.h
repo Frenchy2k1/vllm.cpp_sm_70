@@ -114,6 +114,12 @@ inline const uint8_t* MaterializeBf16Source(const TensorResolver& get,
 }
 
 // BF16 tensor copied verbatim (optionally reshaped).
+//
+// ENG-LOAD-DIRECT-UPLOAD (issue #150): this is a whole-range verbatim copy into
+// a same-size destination -- a reshape changes no byte -- so it is one of the
+// call sites that QUALIFIES for the borrow-the-mapping path. When it takes it,
+// no owned buffer is allocated and the device upload reads the file mapping
+// directly; the copy below is the unchanged fallback for every other case.
 inline OwnedTensor LoadBf16Direct(const TensorResolver& get,
                                   const std::string& name,
                                   const std::vector<int64_t>& shape_override = {}) {
@@ -121,6 +127,8 @@ inline OwnedTensor LoadBf16Direct(const TensorResolver& get,
   std::vector<uint16_t> staging;
   const uint8_t* src = MaterializeBf16Source(get, name, t, &staging);
   std::vector<int64_t> shape = shape_override.empty() ? t.shape : shape_override;
+  OwnedTensor borrowed;
+  if (BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, shape)) return borrowed;
   OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
   const size_t src_bytes =
       staging.empty() ? t.nbytes : staging.size() * sizeof(uint16_t);
@@ -131,6 +139,17 @@ inline OwnedTensor LoadBf16Direct(const TensorResolver& get,
   // so the owned mirror never double-resides with the mmap (spec §page-lifetime).
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
+}
+
+// ENG-LOAD-DIRECT-UPLOAD: release the resident pages behind a weight that
+// BORROWED the mapping and whose bytes a merged loader has just copied into its
+// own buffer. Without this the per-shard borrow would keep the source pages
+// resident until the temporary shard dies, which is the residency the windowed
+// release exists to avoid. A no-op for a copied (non-borrowing) shard, whose
+// LoadBf16Direct/LoadCt* already released it.
+inline void ReleaseBorrowedShardSource(const OwnedTensor& shard) {
+  if (shard.mmap_src != nullptr)
+    MaybeReleaseSourcePages(shard.mmap_src, shard.mmap_src_bytes);
 }
 
 // BF16 [out, in] -> owned bf16 [in, out] (Matmul-B layout).
@@ -404,16 +423,25 @@ inline Nvfp4Weight LoadCtNvfp4W4A16(
   r.weight_global_scale_inv = wgs_disk;  // exact divisor, for merged linears
   r.scale2 = 1.0F / wgs_disk;            // CT stores a divisor -> reciprocate
   r.alpha = 0.0F;                        // W4A16: no activation quant
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "dense loader: packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "dense loader: scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): weight_packed and weight_scale are each
+  // taken VERBATIM into their own same-size destination, so both qualify for the
+  // borrow path; the memcpys are the unchanged fallback.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "dense loader: packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "dense loader: scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
@@ -481,6 +509,10 @@ inline Nvfp4Weight LoadMergedCtNvfp4W4A16(
     std::memcpy(merged.scale.bytes.data() + s_off, s.scale.bytes.data(),
                 s.scale.bytes.size());
     s_off += s.scale.bytes.size();
+    // A concatenation is NOT a verbatim view, so the merged buffer is owned and
+    // any per-shard borrow is now consumed-and-dead.
+    ReleaseBorrowedShardSource(s.packed);
+    ReleaseBorrowedShardSource(s.scale);
   }
   VT_CHECK(p_off == merged.packed.bytes.size() &&
                s_off == merged.scale.bytes.size(),
@@ -546,16 +578,24 @@ inline Nvfp4Weight LoadCtMxfp4W4A16(
   r.is_mxfp4 = true;
   r.scale2 = 0.0F;  // MXFP4 has no global scale (unused)
   r.alpha = 0.0F;   // W4A16: no activation quant
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "dense loader: packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 32});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "dense loader: scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): both payloads are verbatim; see
+  // LoadCtNvfp4W4A16 above.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "dense loader: packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 32})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 32});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "dense loader: scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
@@ -602,6 +642,8 @@ inline Nvfp4Weight LoadMergedCtMxfp4W4A16(
     std::memcpy(merged.scale.bytes.data() + s_off, s.scale.bytes.data(),
                 s.scale.bytes.size());
     s_off += s.scale.bytes.size();
+    ReleaseBorrowedShardSource(s.packed);
+    ReleaseBorrowedShardSource(s.scale);
   }
   VT_CHECK(p_off == merged.packed.bytes.size() &&
                s_off == merged.scale.bytes.size(),

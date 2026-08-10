@@ -60,6 +60,15 @@ OwnedTensor LoadModelBf16Direct(
            "qwen3_5 dense: expected BF16 or F32 for " + name);
   const std::vector<int64_t> shape =
       shape_override.empty() ? t.shape : shape_override;
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): ONLY the BF16 arm is verbatim. The F32
+  // arm below CONVERTS f32 -> bf16 and therefore can never borrow; the dtype
+  // test is what keeps the two apart, and BorrowStTensorBytes independently
+  // rejects the f32 source anyway (its span is twice the bf16 destination).
+  OwnedTensor borrowed;
+  if (t.dtype == "BF16" &&
+      BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, shape)) {
+    return borrowed;
+  }
   OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
   if (t.dtype == "BF16") {
     VT_CHECK(t.nbytes == o.bytes.size(),
@@ -175,16 +184,23 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
            "qwen3_5 dense: zero input_global_scale (divisor) for " + proj);
   r.input_global_scale_inv = igs_disk;   // on-disk divisor, used directly
   r.alpha = r.scale2 * (1.0F / igs_disk);
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "qwen3_5 dense: packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "qwen3_5 dense: scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150): both payloads are verbatim.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "qwen3_5 dense: packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "qwen3_5 dense: scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
