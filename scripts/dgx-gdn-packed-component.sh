@@ -261,12 +261,18 @@ mem_available_kib() {
   awk '/^MemAvailable:/{print $2}' /proc/meminfo
 }
 
+# The `server` target's OUTPUT_NAME became `vllm-server` with the release
+# packaging (examples/CMakeLists.txt, W6). Resolve the current name, falling
+# back to the pre-rename one so older build trees still replay.
+server_bin="${build_dir}/examples/vllm-server"
+[[ -x ${server_bin} ]] || server_bin="${build_dir}/examples/server"
+
 drop_caches() {
   local output=$1
   "${benchmark_clean_env[@]}" python3 -m tools.bench.drop_file_cache \
     --root "${snapshot}" \
     --root "${source_corpus}" \
-    --root "${build_dir}/examples/server" \
+    --root "${server_bin}" \
     --root "${client}" \
     --output "${output}"
 }
@@ -297,7 +303,7 @@ server_command() {
     "${benchmark_clean_env[@]}"
     "${plan_env[@]}"
     "VT_GDN_PACKED_DECODE=${packed_value}"
-    "${build_dir}/examples/server"
+    "${server_bin}"
     --model "${snapshot}"
     --port "${port}"
     --num-blocks "${num_blocks}"
@@ -452,7 +458,7 @@ diagnostic_server_command() {
   diag_out=()
   local spliced=0 token
   for token in "${base_command[@]}"; do
-    if [[ ${spliced} -eq 0 && ${token} == "${build_dir}/examples/server" ]]; then
+    if [[ ${spliced} -eq 0 && ${token} == "${server_bin}" ]]; then
       diag_out+=("VT_GDN_DIAG_STEP_LOG=1")
       spliced=1
     fi
