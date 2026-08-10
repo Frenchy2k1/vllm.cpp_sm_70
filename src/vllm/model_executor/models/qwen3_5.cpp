@@ -2649,6 +2649,32 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;
 }
+
+// PERF-27B-LMHEAD-FP4 (issue #213). Build the dense head's Marlin resident when
+// THIS configuration will actually take the Marlin logits GEMM, and report
+// whether it did. The predicate is EXACTLY the one MatmulNvfp4F32D selects with,
+// so a configuration that will not take that path never builds for it.
+//
+// It lives here, inside the region that already owns this kernel family, rather
+// than as a second `#ifdef VT_MARLIN_NVFP4` at the call site in
+// PrepareLmHeadResident: the DSR ratchet (scripts/check-device-leakage.py)
+// counts every build-time kernel-feature gate in the device-agnostic shared
+// layer and fails on any increase. A new guard at the call site was one, and the
+// honest repair is to keep the gate in the one place that already has it.
+bool BuildDenseHeadMarlinResident(Dev d, const Nvfp4Weight& w) {
+  if (w.IsTrueW4A4() || !MarlinMoeEnabled() ||
+      !vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type)) {
+    return false;
+  }
+  BuildMarlinDenseResident(d, w, MarlinDenseResidentFor(&w));
+  d.b.Synchronize(d.q);
+  return true;
+}
+#else
+// No Marlin NVFP4 in this build: there is no dense-head Marlin resident to
+// build, so PrepareLmHeadResident falls straight through to the arm this
+// backend's logits GEMM will actually take.
+bool BuildDenseHeadMarlinResident(Dev, const Nvfp4Weight&) { return false; }
 #endif  // VT_MARLIN_NVFP4
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
@@ -4957,7 +4983,14 @@ SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfC
       h.dtype == DType::kBF16 &&
       SharedGateUpFusedEligible(w.shared_gate_proj_fp4, w.shared_up_proj_fp4)) {
     DBuf sact = SharedGateUpFusedMarlinD(d, h, w.shared_gate_proj_fp4, w.shared_up_proj_fp4);
-    DBuf sd = MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);  // [T,H] f32
+    // bf16 down-proj out (VT_SHARED_DOWN_BF16, default ON): the Marlin GEMM
+    // already produces bf16 and BOTH consumers re-round through bf16, so the
+    // f32 form wrote and re-read a whole [T,H] buffer for a value it had.
+    // Bit-identical; drops one CastF32 launch per layer per step (CastF32 was
+    // measured at 3.1% of the 35B decode step).
+    DBuf sd = dense_nvfp4::SharedDownBf16Enabled()
+                  ? MatmulNvfp4Bf16D(d, sact.t(), w.shared_down_proj_fp4)   // [T,H] bf16
+                  : MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);   // [T,H] f32
     DBuf gl = MatmulF32D(d, h, w.shared_gate);                       // [T,1] f32
     return {std::move(sd), std::move(gl)};
   }
@@ -6849,17 +6882,11 @@ void Qwen3_5DenseModel::PrepareLmHeadResident(const Qwen3_5DenseWeights& weights
                                               vt::Queue& queue) {
   if (weights.lm_head_fp4.Empty()) return;
   Dev d{vt::GetBackend(queue.device.type), queue};
-#ifdef VT_MARLIN_NVFP4
   // Build under EXACTLY the guard MatmulNvfp4F32D uses to select the Marlin
   // GEMM, so a configuration that will not take that path never builds for it.
-  if (!weights.lm_head_fp4.IsTrueW4A4() && MarlinMoeEnabled() &&
-      vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, queue.device.type)) {
-    BuildMarlinDenseResident(d, weights.lm_head_fp4,
-                             MarlinDenseResidentFor(&weights.lm_head_fp4));
-    d.b.Synchronize(d.q);
-    return;
-  }
-#endif
+  // The build-time gate itself lives with the kernel family (see
+  // BuildDenseHeadMarlinResident), not here.
+  if (BuildDenseHeadMarlinResident(d, weights.lm_head_fp4)) return;
   // Same selection order as MatmulNvfp4F32D: the fp4-activation and packed-GEMM
   // arms stage the packed bytes lazily and NOT per call, so only the
   // dequantizing fallback needs eager work here.

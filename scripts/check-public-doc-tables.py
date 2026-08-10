@@ -491,12 +491,34 @@ STATUS_RATCHET = {
     # ~100% GPU-busy reading) into the binding result, both of which are now
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
-    # 2026-08-10 (LoRA W2, issue #278): the LoRA row now covers W1+W2 in fewer
-    # bytes than it used to spend on W1 alone -- the W1 component list collapsed
-    # to the two names that matter and the W2 additions replaced the "named
-    # W2-W7" enumeration. Re-pinned byte-tight against the merged page so the
+    #
+    # 243512 since 2026-08-10 (measured 243512, #277): the metrics paragraph and
+    # the OpenAI-server row both carried a claim that had become FALSE -- that
+    # the async serving path has no live metric backing. Wiring it (the AsyncLLM
+    # output handler now folds each step's stats into the logger) RETIRES a
+    # residual rather than adding one, so the correction is a net deletion:
+    # "metrics and cache reset lack live async backing" loses its first subject,
+    # and "the async production-serving path wiring" leaves the remaining-work
+    # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
+    # each rebase); re-pinned byte-tight to the merged measurement.
+    #
+    # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
+    # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
+    # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    # 243431 since 2026-08-11 (measured 243431): the #213 post-lever binding
+    # numbers replace the pre-lever narrative in the 27B cell. Strictly DOWN
+    # from 243451.
+    #
+    # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
+    # superseded allowlist clause into the binding result. Strictly DOWN.
+    #
+    # 243339 since 2026-08-10 (LoRA W2, issue #278): the LoRA row now covers
+    # W1+W2 in fewer bytes than it used to spend on W1 alone -- the W1 component
+    # list collapsed to the two names that matter and the W2 additions replaced
+    # the "named W2-W7" enumeration. RE-MEASURED against the MERGED page (not
+    # carried from either side of the merge) and re-pinned byte-tight, so the
     # reduction cannot become untracked growth headroom.
-    "chars": 243482,
+    "chars": 243339,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

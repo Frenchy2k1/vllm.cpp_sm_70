@@ -85,6 +85,15 @@ an Ampere tile on an `sm_121a` part.
    copy source does not outlive the capture. On a backend with NO fp4 GEMM the
    same hook builds the dequantized bf16 operand instead, so the fallback never
    dequantizes per forward call.
+
+   The Marlin arm's build-time gate lives in `BuildDenseHeadMarlinResident`,
+   inside the `#ifdef VT_MARLIN_NVFP4` region that already owns this kernel
+   family, with an `#else` stub returning `false` — NOT as a second `#ifdef` at
+   the hook. Round 3 found the hook's own guard had pushed the DSR ratchet
+   (`scripts/check-device-leakage.py`) from 32 to 33 in the `vt_ifdef` bucket,
+   failing the `device-leakage` CI job. The checker's instruction is to repair
+   the code rather than grow the DSR-ALLOW list, and the predicate is unchanged:
+   `!IsTrueW4A4() && MarlinMoeEnabled() && OpRegistered(kMoeGroupedGemmNvfp4Marlin)`.
 5. `PrepareBf16Resident` needs no head-specific branch: a packed head's bf16
    owner is empty by construction, and the function is only reached under
    `IsPlainBf16Qwen3_5Dense`, which is false whenever the head is packed. **The

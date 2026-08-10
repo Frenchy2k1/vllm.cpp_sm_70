@@ -121,6 +121,18 @@ inline bool FusedGateUpEnabled() {
 // Fused shared-expert gate_up dense route (VT_MARLIN_DENSE_PAIR, default ON,
 // opt out with =0) — the sibling of MarlinDenseEnabled() for the ONE fused
 // gate_up sink, which was still taking the single-expert MoE-marlin route.
+// Shared-expert down-proj emits bf16 instead of f32 (VT_SHARED_DOWN_BF16,
+// default ON, opt out with =0). BIT-IDENTICAL: both consumers (SharedExpertGate
+// and MoeCombineGate) widen bf16 in-kernel, which is exact, and both re-round
+// through bf16 on store. Drops one CastF32 launch per layer per step.
+inline bool SharedDownBf16Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_SHARED_DOWN_BF16");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
 inline bool MarlinDensePairEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_MARLIN_DENSE_PAIR");
