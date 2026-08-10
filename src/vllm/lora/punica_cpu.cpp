@@ -64,8 +64,19 @@ void BgmvExpandSlice(const float* buffer, int64_t T, int64_t rank,
                      float* y) {
   // lora_ops.py:110-128 — selected_loras = b[idx] ([out, rank]); y window
   // [off:off+slice] += / = einsum. slice_size == out_dim for a plain linear.
+  //
+  // lora_ops.py:42 clamps the write to
+  // `min(outputs.shape[1], output_tensor.shape[1])` — "LoRA adapter and model
+  // may add different amounts of padding to output". `y` here is the CALLER's
+  // buffer, so its width is the third bound: an lm_head whose logits are
+  // narrower than the adapter's vocab (LogitsProcessorWithLoRA passes
+  // vocab_size as out_dim and the gathered logits width as y_width) would
+  // otherwise run off the end of every row.
   const int64_t slot_stride = out_dim * rank;
-  const int64_t n = slice_size < out_dim ? slice_size : out_dim;
+  int64_t n = slice_size < out_dim ? slice_size : out_dim;
+  const int64_t room = y_width - slice_offset;
+  if (room < n) n = room;
+  if (n <= 0) return;
   for (int64_t t = 0; t < T; ++t) {
     const int32_t s = indices[t];
     if (s < 0 || s >= num_slots) continue;
@@ -96,6 +107,87 @@ void AddLoraLinear(float* y, const float* x, int64_t T, int64_t in_dim,
   BgmvExpandSlice(buffer.data(), T, rank, b_stacked, num_slots, out_dim, indices,
                   /*y_width=*/out_dim, /*slice_offset=*/0, /*slice_size=*/out_dim,
                   /*add_inputs=*/true, y);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-slice apply (punica_cpu.py:166-236, 265-312)
+
+void AddShrink(float* buffers, const float* x, int64_t T, int64_t in_dim,
+               const std::vector<const float*>& a_stacked, int64_t num_slots,
+               int64_t rank_a, int64_t buffer_rank, const int32_t* indices,
+               double scale) {
+  // punica_cpu.py:192-195 — "TODO fuse these kernels": one bgmv_shrink per
+  // slice, all reading the same x. bgmv_shrink writes only the leading rank_a
+  // columns (lora_ops.py:80, output_tensor[:, :outputs.shape[1]]), which is
+  // narrower than the buffer on the fully-sharded path.
+  const int64_t slot_stride = rank_a * in_dim;
+  for (size_t s = 0; s < a_stacked.size(); ++s) {
+    float* buf = buffers + static_cast<int64_t>(s) * T * buffer_rank;
+    for (int64_t t = 0; t < T; ++t) {
+      const int32_t slot = indices[t];
+      if (slot < 0 || slot >= num_slots) continue;
+      MatVecRow(a_stacked[s] + slot * slot_stride, x + t * in_dim,
+                /*o_dim=*/rank_a, /*i_dim=*/in_dim, scale, /*add=*/false,
+                buf + t * buffer_rank, /*out_stride=*/1);
+    }
+  }
+}
+
+void AddExpand(float* y, int64_t y_width, const float* buffers, int64_t T,
+               int64_t rank, const std::vector<const float*>& b_stacked,
+               const std::vector<int64_t>& output_slices, int64_t num_slots,
+               const int32_t* indices, int64_t offset_start, bool add_inputs) {
+  // punica_cpu.py:225-236 — walk the output windows left to right, each slice
+  // expanding its own buffer into its own [offset, offset+size) window.
+  int64_t offset_left = offset_start;
+  for (size_t s = 0; s < b_stacked.size(); ++s) {
+    const int64_t out_dim = output_slices[s];
+    BgmvExpandSlice(buffers + static_cast<int64_t>(s) * T * rank, T, rank,
+                    b_stacked[s], num_slots, out_dim, indices, y_width,
+                    offset_left, out_dim, add_inputs, y);
+    offset_left += out_dim;
+  }
+}
+
+void AddLoraLinear(float* y, const float* x, int64_t T, int64_t in_dim,
+                   const std::vector<const float*>& a_stacked,
+                   const std::vector<const float*>& b_stacked,
+                   const std::vector<int64_t>& output_slices, int64_t num_slots,
+                   int64_t rank_a, int64_t rank, const int32_t* indices,
+                   double scale) {
+  // punica_cpu.py:299-312 — one zeroed float32 buffer per slice, shrink, then
+  // expand with add_inputs=True.
+  const size_t n = b_stacked.size();
+  std::vector<float> buffers(static_cast<size_t>(T * rank) * n, 0.0f);
+  AddShrink(buffers.data(), x, T, in_dim, a_stacked, num_slots, rank_a, rank,
+            indices, scale);
+  int64_t y_width = 0;
+  for (int64_t o : output_slices) y_width += o;
+  AddExpand(y, y_width, buffers.data(), T, rank, b_stacked, output_slices,
+            num_slots, indices, /*offset_start=*/0, /*add_inputs=*/true);
+}
+
+void AddLoraEmbedding(float* y, const float* x, int64_t T, int64_t rank,
+                      const float* b_stacked, int64_t num_slots,
+                      int64_t embed_dim, const int32_t* indices,
+                      bool add_inputs) {
+  // punica_cpu.py:259-263 — "Embedding layer only need expand op".
+  BgmvExpand(x, T, rank, b_stacked, num_slots, embed_dim, indices, add_inputs,
+             y);
+}
+
+void AddLoraLogits(float* y, int64_t y_width, const float* x, int64_t T,
+                   int64_t hidden, int64_t vocab, const float* a_stacked,
+                   const float* b_stacked, int64_t num_slots, int64_t rank,
+                   const int32_t* sampler_indices, double scale) {
+  // punica_cpu.py:343-351 — zeroed float32 buffer, bgmv_shrink then bgmv_expand
+  // with add_inputs=True, both indexed by sampler_indices.
+  std::vector<float> buffer(static_cast<size_t>(T * rank), 0.0f);
+  BgmvShrink(x, T, hidden, a_stacked, num_slots, rank, sampler_indices, scale,
+             buffer.data());
+  BgmvExpandSlice(buffer.data(), T, rank, b_stacked, num_slots, vocab,
+                  sampler_indices, y_width, /*slice_offset=*/0,
+                  /*slice_size=*/vocab, /*add_inputs=*/true, y);
 }
 
 // ---------------------------------------------------------------------------
