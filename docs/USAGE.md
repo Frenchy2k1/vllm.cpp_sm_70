@@ -24,6 +24,11 @@ directory (issue #85).
 
 ### One ROCm-specific behaviour
 
+ROCm builds register the full V1 sampler surface (temperature, top-k/top-p, min-p,
+penalties, allowed-token masks, logprobs, random sample) so EngineCore does not
+fatal with `no kernel for op` after prefill on AMD. Non-positive chat
+`max_tokens` is treated as unset on all backends (Hermes `max_tokens=-1`).
+
 Worth knowing before you read a hang as a bug in the tests: a build that sets no
 `CMAKE_BUILD_TYPE` floors **HIP device code** at `-O1` and prints a configure
 line saying so. At `-O0` the ROCm runtime starts a hostcall listener the kernels
