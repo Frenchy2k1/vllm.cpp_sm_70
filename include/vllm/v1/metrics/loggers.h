@@ -19,6 +19,7 @@
 #define VLLM_V1_METRICS_LOGGERS_H_
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,12 @@ namespace vllm::v1::metrics {
 // of ten times the mantissa list, up to and including max_value.
 std::vector<double> Build1_2_5Buckets(int64_t max_value);
 
+// THREAD SAFETY (SERVE-METRICS, #277): `PromRegistry` is not thread-safe, and
+// upstream never needs it to be — `prometheus_client` mutates under the GIL.
+// Once AsyncLLM's output-handler THREAD records (async_llm.py:697-702) while an
+// HTTP worker thread scrapes, one recorder and N readers genuinely overlap, so
+// every public entry point below takes one mutex. It is a LEAF lock: Record is
+// called from outside AsyncLLM's output-processor mutex, so no cycle exists.
 class PrometheusStatLogger {
  public:
   // `served_model_name` == vLLM served_model_name (the `model_name` label);
@@ -49,17 +56,25 @@ class PrometheusStatLogger {
   void SetCacheConfigInfo(int64_t kv_cache_size_tokens,
                           double kv_cache_max_concurrency);
 
-  // The Prometheus text-0.0.4 exposition for GET /metrics.
-  std::string Expose() const { return registry_.Expose(); }
+  // The Prometheus text-0.0.4 exposition for GET /metrics. Safe to call from a
+  // scraping thread while the engine's output handler records.
+  std::string Expose() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return registry_.Expose();
+  }
 
+  // Direct registry access for tests/introspection. NOT synchronized — callers
+  // must not use it while an engine is recording.
   const PromRegistry& registry() const { return registry_; }
 
  private:
   // Convenience wrappers that bind the {model_name, engine} label values.
+  // Callers hold mu_.
   void Inc(const std::string& name, double v);
   void Set(const std::string& name, double v);
   void Obs(const std::string& name, double v);
 
+  mutable std::mutex mu_;
   PromRegistry registry_;
   std::string model_name_;
   std::string engine_str_;

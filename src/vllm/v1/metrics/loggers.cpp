@@ -207,6 +207,9 @@ void PrometheusStatLogger::Obs(const std::string& name, double v) {
 
 void PrometheusStatLogger::Record(const SchedulerStats& s,
                                   const IterationStats& it) {
+  // One recorder thread (the sync step site, or AsyncLLM's output handler)
+  // against N scraping readers — see the header's THREAD SAFETY note.
+  std::lock_guard<std::mutex> lock(mu_);
   // Scheduler-state gauges (loggers.py:1109-1123).
   Set("vllm:num_requests_running", static_cast<double>(s.num_running_reqs));
   Set("vllm:num_requests_waiting", static_cast<double>(s.num_waiting_reqs));
@@ -269,6 +272,7 @@ void PrometheusStatLogger::Record(const SchedulerStats& s,
 
 void PrometheusStatLogger::SetCacheConfigInfo(int64_t kv_cache_size_tokens,
                                               double kv_cache_max_concurrency) {
+  std::lock_guard<std::mutex> lock(mu_);
   // Info series value is fixed at 1.0; the config is carried in the labels.
   char conc[32];
   std::snprintf(conc, sizeof(conc), "%g", kv_cache_max_concurrency);
