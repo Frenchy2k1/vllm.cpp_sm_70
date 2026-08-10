@@ -85,6 +85,11 @@ class PathClassification(unittest.TestCase):
             ".agents/completed/state-migration-manifest.csv": "evidence",
             "scripts/waivers.py": "governance_support",
             "docs/STATUS.md": "public_document",
+            "website/hugo.toml": "public_document",
+            "website/layouts/_default/baseof.html": "public_document",
+            "website/assets/css/site.css": "public_document",
+            "website/static/fonts/sora-700.woff2": "asset",
+            "website/static/logo.svg": "asset",
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
@@ -376,6 +381,10 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
             "scripts/check-triton-aot-multiarch.py",
+            # 2026-08-10: the docs-site content guard (#224). A checker created
+            # in the same PR has no BASE version to mutate, so it registers the
+            # disabled form its own tests must reject.
+            "scripts/check-site.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():
