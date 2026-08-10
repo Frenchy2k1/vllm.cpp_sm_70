@@ -834,9 +834,29 @@ TEST_CASE("fp4 resident: a host-addressable device adopts an OWNED fp4 mirror to
 //     the same reason.
 //
 // The in-run negative control is `before`: the same pages, counted the same way,
-// must show FULLY resident immediately beforehand. Linux + glibc only; the
-// mechanism being pinned is a glibc allocator behavior, so there is nothing to
-// assert about it elsewhere.
+// must show FULLY resident immediately beforehand.
+//
+// `#if __GLIBC__` PROVES THE HEADERS, NOT THE ALLOCATOR. An LD_PRELOADed
+// jemalloc/tcmalloc interposes malloc/free, leaves the mallopt calls above inert,
+// and may purge or munmap freed pages BY ITSELF -- under which the deleted-madvise
+// mutant would pass. So the case also carries a RUNTIME guard (`the free() control`
+// below): it allocates a block the same way, frees it, and requires the pages to
+// stay mapped AND resident. That is exactly the allocator property the observation
+// rests on, and if it does not hold the case goes red and says which half failed
+// instead of silently vouching for a mutant.
+//
+// A PROCESS-LIFETIME SIDE EFFECT REMAINS, recorded rather than fixed. Every
+// `mallopt` that touches a threshold sets glibc's `no_dyn_threshold`, which no
+// destructor can clear: the thresholds stop adapting for the rest of the process,
+// pinned at the documented defaults the destructor restores. It is NOT specific to
+// `M_TRIM_THRESHOLD`, so dropping that call would not remove the coupling --
+// MEASURED on glibc 2.39, probing whether freeing a 1 MiB mmap'd block still raises
+// `mmap_threshold` (`mallinfo2().hblks` on the next 1 MiB allocation): no mallopt
+// -> threshold LIVE; `M_TRIM_THRESHOLD` set-then-restored -> DISABLED;
+// `M_MMAP_MAX` set-then-restored -> DISABLED. `M_MMAP_MAX=0` is load-bearing here
+// (without it `free()` munmaps the mirror and the mutant passes), so the flag is
+// unavoidable for this observation. No cross-case effect was observed across 30
+// randomized-order runs, and only this case reads residency at all.
 #if defined(__linux__) && defined(__GLIBC__)
 namespace {
 
@@ -846,6 +866,8 @@ class ScopedArenaOnlyMalloc {
     ::mallopt(M_MMAP_MAX, 0);
     ::mallopt(M_TRIM_THRESHOLD, -1);
   }
+  // Restores glibc's documented defaults. It cannot restore `no_dyn_threshold`,
+  // which either call above already set for the process; see the note above.
   ~ScopedArenaOnlyMalloc() {
     ::mallopt(M_MMAP_MAX, 65536);             // glibc DEFAULT_MMAP_MAX
     ::mallopt(M_TRIM_THRESHOLD, 128 * 1024);  // glibc DEFAULT_TRIM_THRESHOLD
@@ -893,6 +915,32 @@ TEST_CASE("adopt: the general branch DROPS the host mirror's resident pages") {
   vt::Queue q = b.CreateQueue();
 
   const size_t nb = 32 * PageSize();
+  std::vector<unsigned char> scratch(nb / PageSize() + 1);
+
+  // THE RUNTIME ALLOCATOR GUARD. `#if __GLIBC__` compiled this case in because the
+  // HEADERS are glibc's; it does not prove glibc's allocator is the one running. An
+  // interposed allocator makes the mallopt calls above inert and may drop freed
+  // pages by itself, which would let the deleted-madvise mutant pass. Prove in-run
+  // that `free()` ALONE keeps the pages mapped and resident -- the exact property
+  // the observation below rests on -- using a block allocated and freed the same way.
+  {
+    std::vector<uint8_t> control(nb, 0x3C);
+    const uint8_t* cp = control.data();
+    std::vector<uint8_t> control_guard(nb, 0x3C);  // keeps `control` off the heap top
+    const PageResidency live = InteriorResidency(cp, nb, scratch);
+    std::vector<uint8_t>().swap(control);          // free, nothing else
+    const PageResidency freed = InteriorResidency(cp, nb, scratch);
+    REQUIRE(live.total > 0);
+    REQUIRE(live.resident == live.total);
+    // Still MAPPED: mincore would fail with ENOMEM (total stays -1) if free() had
+    // munmapped the block, as it does for an mmap'd chunk or under jemalloc.
+    REQUIRE(freed.total == live.total);
+    // Still RESIDENT: an allocator that purges on free would make the madvise
+    // below unobservable, and this case's verdict meaningless.
+    REQUIRE(freed.resident == freed.total);
+    CHECK(control_guard[0] == 0x3C);
+  }
+
   // The host mirror: an OWNED buffer, every page touched by the pattern fill.
   vllm::OwnedTensor w = OwnedPatternWeight(nb);
   // Allocated AFTER it, so freeing the mirror cannot consolidate into the heap top.
@@ -907,7 +955,6 @@ TEST_CASE("adopt: the general branch DROPS the host mirror's resident pages") {
   w.d_dev = std::shared_ptr<void>(p, [bk](void* x) { bk->Free(x); });
 
   const uint8_t* mirror = w.bytes.data();
-  std::vector<unsigned char> scratch(nb / PageSize() + 1);
   const PageResidency before = InteriorResidency(mirror, nb, scratch);
 
   vllm::AdoptDeviceBytesAsHost(b, w);
