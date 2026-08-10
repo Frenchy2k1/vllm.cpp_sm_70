@@ -17619,3 +17619,97 @@ thermal / cache-drop / memory-return). Build contract: RelWithDebInfo, nvcc
 4.5.0, TRITON=ON, BENCH_PROFILE_CONTROL=OFF. SACRED `test_qwen36_paged_engine`
 passed as the harness's own precondition.
 
+## 35B mid-band ATTRIBUTED to per-token MoE work; the marlin block-size lever REFUTED (2026-08-10, `row/BENCH-35B-MIDBAND-ATTRIB`, GB10, build `a0fa12c7` + Release profile build)
+
+The flat 0.935x-0.979x mid-band from the `a0fa12c7` grid, attributed and then
+lever-tested. Paired kernel profile: OURS under `nsys` (`--cuda-graph-trace=node`,
+session start/stop around the measured c8 leg) and vLLM under the harness's own
+`tools/bench/profile_vllm_online_gate.py` torch profiler, same corpus
+(`c8-r1.jsonl`), same server params (`--max-num-seqs 32
+--max-num-batched-tokens 8192 --no-enable-prefix-caching`).
+
+**What the deficit IS (established).** It is a uniform shift of the whole ITL
+distribution, not a tail: median ITL == mean ITL == 0.94 across c2-c32, and
+p90/p99 ITL are BETTER than the median (at c16/c32 we WIN p99 at 1.059/1.088).
+Fitting step time against batch, our FIXED per-step cost is LOWER than vLLM's
+(intercept 9.02 ms vs 9.43 ms); the entire deficit is marginal, per-token work:
+
+| B->B | ours ms/req | vLLM ms/req | ours vs vLLM |
+|---|---:|---:|---|
+| 1->2 | 4.90 | 4.18 | +17% |
+| 2->4 | 2.46 | 2.30 | +7.2% |
+| 4->8 | 1.95 | 1.80 | +8.5% |
+| 8->16 | 2.07 | 1.89 | +9.4% |
+| 16->32 | 1.86 | 1.91 | **-3.0%, we win** |
+
+So there is nothing to win in launch/host overhead, and the c32 recovery is a
+genuine crossover rather than noise. Geometry: 256 experts, top-8,
+`moe_intermediate` 512, 40 layers, so per-expert M stays ~1.0-1.6 even at B=32
+(the experts never densify); what scales is the NUMBER of distinct active
+experts (~8 at B=1 to ~162 at B=32), i.e. NVFP4 expert-slab streaming.
+
+**Kernel profile, both engines.** Both are dominated by the SAME
+`marlin_moe_wna16::Marlin` (we ported it): 42.5% of GPU time ours, 40.3% vLLM.
+Our dominant instantiation is 2.7% slower per launch (172.6 us vs 167.9 us),
+which is within shape-mix noise. The one STRUCTURAL difference is a
+configuration we launch and vLLM never does:
+
+| `<threads, m_blocks, n_blocks, k_blocks, m_block_size_8, stages>` | vLLM | ours |
+|---|---|---|
+| `<128,1,8,4,true,4>` | 91440 @ 167.9 us | 40640 @ 172.6 us |
+| `<256,4,16,4,false,4>` (prefill) | 1200 @ 2462 us | 880 @ 1571 us |
+| `<128,3,8,4,false,4>` | 240 @ 901 us | 80 @ 898 us |
+| `<128,1,8,4,false,4>` | **never launched** | **20320 @ 59.7 us = 5.4% GPU** |
+
+Root cause of the extra variant: `DenseAlignFor` (`qwen3_5.cpp:2344`) routes the
+DENSE projections through the GROUPED-MoE Marlin with a degenerate `E=1,
+top_k=1`, and picks the tile with `MarlinMoeAlignBlockSizeSelect`, a port of
+vLLM's grouped `marlin_moe.py` heuristic whose ratio
+`num_tokens*top_k/num_experts/cand` collapses to `M/cand` in that case. At M=8,
+`8/8 = 1.0` fails the `< 0.9` test, so it selects a 16-row tile (32 at M=16, 48
+at M=32). vLLM instead runs those projections through DENSE `marlin::Marlin`
+(~93k launches to our ~21k, the mirror image).
+
+**The block-size lever is REFUTED (same-binary A/B, `VT_DENSE_ALIGN_BLOCK`, 3
+reps/arm, order-alternated).** Forcing block 8 at M=8 is SLOWER, not faster:
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | default (block 16) | 201.0, 203.6, 202.3 | 202.34 | - |
+| c8 | forced block 8 | 200.6, 200.0, 198.5 | 199.99 | **-1.16%** (ITL +2.12%) |
+| c4 | default (already 8) | 145.1, 144.2, 144.3 | 144.33 | - |
+| c4 | forced block 8 | 145.0, 144.8, 144.5 | 144.76 | +0.29% |
+
+The c4 arm is the internal CONTROL: the default already picks 8 there, so the
+override is a no-op and its +0.29% is the noise floor. Against that floor c8's
+-1.16% is real. **The 16-row tile is the better choice at M=8**; the "wasting
+half the tile" reading was wrong. The knob was NOT landed (a dead diagnostic
+default is debt, not evidence).
+
+Note the heuristic could NEVER have explained c2/c4 anyway: the 16-row tile only
+appears at M>=8, yet the deficit is already ~6% at c2 (0.937) and c4 (0.949)
+where the selector still picks 8. That was flagged before the A/B ran, and the
+A/B confirms the whole line is dead.
+
+**NEXT TRACEABLE HYPOTHESIS (gap stays OPEN, no ceiling declared):** that we
+route dense projections through the grouped-MoE kernel AT ALL. The cost would be
+the `moe_align_block_size` bookkeeping plus row padding (M=2 padded to a
+block) that vLLM's dense path never pays, which -- unlike tile choice -- is
+present at EVERY batch and so is consistent with the deficit appearing at c2.
+Testing it means routing the `E=1` dense path to the dense Marlin entrypoint, a
+real change rather than an env flag. Second candidate: the ~2.7% per-launch gap
+on the shared dominant kernel, which needs an ncu shape-matched comparison to
+separate from mix.
+
+Token identity across the A/B: 3 of 4 greedy probes byte-identical; the 4th
+(`b8` at c8) differs, but that probe is a SINGLE request at M=1 where BOTH arms
+select block 8, so the override is inert and cannot be the cause -- it is the
+run-to-run instability already recorded for this checkpoint.
+
+Evidence: `dgx:~/mbprof` (ours nsys-rep + `kern.csv`), `dgx:~/vlprof2`
+(vLLM torch trace + metadata; vLLM's own `output_digests_equal: false` on that
+run), `dgx:~/abblock` (12 A/B result JSONs + token probes). The harness's
+`--trace-only` and `summarize_torch_kernels.py` are both hard-gated to model 27
+("35B performance remains held"), so this profile was driven directly rather
+than through them.
+

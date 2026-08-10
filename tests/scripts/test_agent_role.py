@@ -2,14 +2,16 @@
 """Unit and mutation checks for scripts/agent-role.py (W0) and
 scripts/check-role-discipline.py (W1).
 
-The behaviours that matter are the ones the protocol rests on: a second
-self-declared operator must FAIL rather than race, a session sharing a checkout
-must NOT inherit another session's role, a stale lock must be breakable but
-never silently, and feature code must not reach main without a row/* PR.
+The behaviours that matter are the ones the protocol rests on: a coordinator
+must be RECORDED and never refused (issue #285), a session sharing a checkout
+must NOT inherit another session's role, a stale record must be pruned without
+blocking anyone, and feature code must not reach main without a row/* PR.
 """
 
 from __future__ import annotations
 
+import argparse
+import concurrent.futures
 import importlib.util
 import json
 import os
@@ -66,14 +68,53 @@ class _TempRepo:
     def worktree(self, name: str) -> Path:
         """A real second worktree of the throwaway repo.
 
-        A role keys on the worktree, so both surviving invariants -- one
-        operator per repo, and helper isolation -- can only be proven with a
-        genuine second worktree rather than a second session id.
+        A role keys on the worktree, so everything this suite proves --
+        coordinator records being per-worktree, and helper isolation -- can only
+        be proven with a genuine second worktree rather than a second session id.
         """
         path = self.repo / f".{name}"
         subprocess.run(["git", "worktree", "add", "-q", str(path), "-b", name],
                        cwd=self.repo, check=True, capture_output=True)
         return path
+
+    def common(self) -> Path:
+        return Path(subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=self.repo, text=True).strip())
+
+    def records_dir(self) -> Path:
+        """Where coordinator records live: shared by every worktree, never
+        inside a work tree, and one file per worktree so no two claimants ever
+        write the same path."""
+        return self.common() / "vllm-cpp-operators"
+
+    def record_files(self) -> list[Path]:
+        directory = self.records_dir()
+        return sorted(directory.glob("*.json")) if directory.is_dir() else []
+
+    def records(self) -> list[dict]:
+        return [json.loads(path.read_text(encoding="utf-8")) for path in self.record_files()]
+
+    def record_of(self, worktree: Path) -> dict:
+        """The record whose worktree is `worktree`'s git dir. Fails if absent."""
+        wanted = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=worktree, text=True).strip()
+        for record in self.records():
+            if record.get("worktree") == wanted:
+                return record
+        raise AssertionError(f"no coordinator record for {wanted}: {self.records()}")
+
+    def backdate(self, worktree: Path, seconds: float) -> Path:
+        """Age one worktree's record past the TTL, as a crashed session leaves it."""
+        wanted = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=worktree, text=True).strip()
+        for path in self.record_files():
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("worktree") == wanted:
+                record["heartbeat"] = time.time() - seconds
+                path.write_text(json.dumps(record), encoding="utf-8")
+                return path
+        raise AssertionError(f"no coordinator record for {wanted}")
 
 
 class RoleLifecycle(_TempRepo, unittest.TestCase):
@@ -88,18 +129,25 @@ class RoleLifecycle(_TempRepo, unittest.TestCase):
         self.assertEqual(out.returncode, 0)
         self.assertIn("role=operator", out.stdout)
 
-    def test_second_operator_is_refused(self) -> None:
-        """The core mutual-exclusion guarantee.
+    def test_a_second_coordinator_is_recorded_not_refused(self) -> None:
+        """Issue #285, user-directed: the record must never refuse.
 
-        Stated across WORKTREES since the 2026-08-06 correction: a role keys on
-        the worktree, so a second session in the SAME worktree is the same
-        operator (idempotent), while the lock in the git common dir still
-        refuses a genuinely different one.
+        This test asserted the OPPOSITE until 2026-08-10 -- a second worktree's
+        `claim operator` exited 1 with "already held". An operator is a
+        coordinator: it merges PRs and dispatches sub-agents into worktrees, and
+        it never force-pushes `main`, so git's non-fast-forward refusal is the
+        interlock and a JSON file in `.git/` never was one. The refusal cost two
+        hours of blocked coordination every time a session died mid-flight.
         """
-        run_role(self.repo, "a", "claim", "operator")
-        second = run_role(self.worktree("rival"), "b", "claim", "operator")
-        self.assertEqual(second.returncode, 1)
-        self.assertIn("already held", second.stderr)
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        rival = self.worktree("rival")
+        second = run_role(rival, "b", "claim", "operator")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("already held", second.stderr)
+        # Both are operators, and both are recorded -- neither displaced the other.
+        for where in (self.repo, rival):
+            self.assertIn("role=operator", run_role(where, "z", "show").stdout)
+        self.assertEqual(len(self.record_files()), 2, self.records())
 
     def test_another_session_in_the_same_worktree_shares_the_role(self) -> None:
         """The accepted cost of keying on the worktree, made explicit.
@@ -123,33 +171,17 @@ class RoleLifecycle(_TempRepo, unittest.TestCase):
         self.assertEqual(ok.returncode, 0)
         self.assertIn("row=ENG-FOO", run_role(self.repo, "a", "show").stdout)
 
-    def test_release_frees_the_lock_for_another_session(self) -> None:
+    def test_release_removes_this_worktrees_record(self) -> None:
         run_role(self.repo, "a", "claim", "operator")
+        self.assertEqual(len(self.record_files()), 1)
         run_role(self.repo, "a", "release")
+        self.assertEqual(self.record_files(), [])
         self.assertEqual(run_role(self.repo, "b", "claim", "operator").returncode, 0)
 
-    def test_stale_lock_is_broken_but_reported(self) -> None:
+    def test_operator_marker_without_a_record_does_not_resolve(self) -> None:
         run_role(self.repo, "a", "claim", "operator")
-        common = subprocess.check_output(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            cwd=self.repo, text=True).strip()
-        lock = Path(common) / "vllm-cpp-operator.lock"
-        record = json.loads(lock.read_text())
-        record["heartbeat"] = time.time() - (10 * 60 * 60)
-        lock.write_text(json.dumps(record))
-        # From ANOTHER worktree: re-claiming inside the worktree that already
-        # holds the lock is the same operator and is idempotent, so a crashed
-        # operator can only be displaced from somewhere else.
-        took = run_role(self.worktree("successor"), "b", "claim", "operator")
-        self.assertEqual(took.returncode, 0)
-        self.assertIn("STALE", took.stderr)  # broken, but never silently
-
-    def test_operator_marker_without_lock_does_not_resolve(self) -> None:
-        run_role(self.repo, "a", "claim", "operator")
-        common = subprocess.check_output(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            cwd=self.repo, text=True).strip()
-        (Path(common) / "vllm-cpp-operator.lock").unlink()
+        for path in self.record_files():
+            path.unlink()
         self.assertEqual(run_role(self.repo, "a", "show").returncode, 3)
 
 
@@ -209,14 +241,20 @@ class WorktreeKeyedRole(_TempRepo, unittest.TestCase):
         self.assertEqual(state["row"], "ENG-BAR")
         self.assertEqual(state["declared_by"], "some-other-session")
 
-    def test_one_operator_per_repo_holds_across_worktrees(self) -> None:
-        # Keying on the worktree must not WIDEN the lock: it lives in the git
-        # common dir, shared by every worktree, and that is the scope of "one
-        # operator per repo".
+    def test_the_records_are_shared_by_every_worktree(self) -> None:
+        # Keying on the worktree must not NARROW the records: they live in the
+        # git common dir, shared by every worktree, which is what makes "who is
+        # coordinating where" answerable from any of them.
         self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
-        second = run_role(self.worktree("rival"), "b", "claim", "operator")
-        self.assertEqual(second.returncode, 1)
-        self.assertIn("already held", second.stderr)
+        rival = self.worktree("rival")
+        self.assertEqual(run_role(rival, "b", "claim", "operator").returncode, 0)
+        # The same two records are visible from either side, and neither lives
+        # in a work tree where a commit could pick it up.
+        self.assertEqual(len(self.record_files()), 2)
+        for where in (self.repo, rival):
+            self.assertNotIn("vllm-cpp-operators", subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=where, text=True))
 
     def test_helper_marker_does_not_leak_into_another_worktree(self) -> None:
         # Isolation, asserted where it is now real. The SAME session id in
@@ -227,11 +265,10 @@ class WorktreeKeyedRole(_TempRepo, unittest.TestCase):
         self.assertEqual(out.returncode, 3)
         self.assertIn("UNDECLARED", out.stdout)
 
-    def _lock(self, repo: Path) -> Path:
-        common = subprocess.check_output(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            cwd=repo, text=True).strip()
-        return Path(common) / "vllm-cpp-operator.lock"
+    def _legacy(self) -> Path:
+        """The pre-#285 single-file lock. Still read, so a session that claimed
+        before the change does not silently become UNDECLARED mid-flight."""
+        return self.common() / "vllm-cpp-operator.lock"
 
     def _resolve_in(self, where: Path) -> dict:
         """resolve()'s OWN return value, read in `where`.
@@ -246,123 +283,449 @@ class WorktreeKeyedRole(_TempRepo, unittest.TestCase):
         finally:
             os.chdir(saved)
 
-    def test_reclaiming_your_own_lock_refreshes_the_heartbeat(self) -> None:
-        # The idempotent branch REWRITES the record instead of passing. With
-        # ownership keyed on the worktree a live operator is likelier to
-        # re-claim than to heartbeat, and a lock that ages out while its owner
-        # is alive gets broken by someone else.
+    def test_reclaiming_your_own_record_refreshes_the_heartbeat(self) -> None:
+        # A live coordinator is likelier to re-claim than to heartbeat, and a
+        # record that ages past the TTL while its owner is alive drops out of
+        # everyone else's display of who is working where.
         run_role(self.repo, "a", "claim", "operator")
-        lock = self._lock(self.repo)
-        record = json.loads(lock.read_text(encoding="utf-8"))
-        record["heartbeat"] = time.time() - (10 * 60 * 60)
-        lock.write_text(json.dumps(record), encoding="utf-8")
-
+        self.backdate(self.repo, 10 * 60 * 60)
         run_role(self.repo, "b", "claim", "operator")
         self.assertGreater(
-            json.loads(lock.read_text(encoding="utf-8"))["heartbeat"],
-            time.time() - 60,
-        )
+            self.record_of(self.repo)["heartbeat"], time.time() - 60)
 
-    def test_a_legacy_lock_cannot_produce_two_operators(self) -> None:
-        # A lock written BEFORE the 2026-08-06 correction carries no worktree,
-        # so ownership falls back to its recorded session -- and two worktrees
-        # under the same session id would both read it as theirs. Rewriting on
-        # the idempotent branch stamps the worktree on, so the fallback heals
-        # the first time it is used and only one worktree stays the operator.
-        run_role(self.repo, "s1", "claim", "operator")
-        lock = self._lock(self.repo)
-        legacy = json.loads(lock.read_text(encoding="utf-8"))
-        del legacy["worktree"]
-        lock.write_text(json.dumps(legacy), encoding="utf-8")
+    def test_a_legacy_lock_file_is_adopted_as_this_worktrees_record(self) -> None:
+        # A pre-#285 session holds the single-file lock. It must keep resolving
+        # as operator -- turning a live coordinator UNDECLARED mid-flight fails
+        # its next preflight -- and the next claim must heal the repo by moving
+        # it into the records directory, so the legacy file cannot linger and be
+        # counted twice.
+        legacy = self._legacy()
+        worktree = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=self.repo, text=True).strip()
+        legacy.write_text(json.dumps({
+            "session": "pre-285", "worktree": worktree,
+            "claimed_at": time.time(), "heartbeat": time.time(),
+            "host": "somewhere", "pid": 1}), encoding="utf-8")
+        (Path(worktree) / "vllm-cpp-agent-role").write_text(
+            json.dumps({"role": "operator", "session": "pre-285", "at": time.time()}),
+            encoding="utf-8")
 
-        twin = self.worktree("twin")
-        self.assertEqual(run_role(twin, "s1", "claim", "operator").returncode, 0)
-        resolved = [
-            run_role(self.repo, "s1", "show"),
-            run_role(twin, "s1", "show"),
-        ]
-        operators = [r for r in resolved if r.returncode == 0 and "role=operator" in r.stdout]
-        self.assertEqual(
-            len(operators), 1,
-            f"exactly one operator expected, got {[r.stdout for r in resolved]}")
+        self.assertIn("role=operator", run_role(self.repo, "pre-285", "show").stdout)
+        self.assertEqual(run_role(self.repo, "later", "claim", "operator").returncode, 0)
+        self.assertFalse(legacy.exists(), "the legacy lock file was not healed away")
+        self.assertEqual(len(self.record_files()), 1, self.records())
 
-    def test_an_operator_marker_beaten_to_the_lock_reports_the_lockout(self) -> None:
-        # Keying lock OWNERSHIP on the worktree made this branch reachable from
-        # a LIVE RIVAL, not only from a self-lost lock: another worktree can now
-        # hold the lock while this one still carries an operator marker. Without
-        # operator_held_by_other the state is indistinguishable from "never
-        # declared" -- same JSON, same cmd_show output, same probe NOTE (none) --
-        # and every one of those tells the session to `claim operator`, which
-        # exits 1. Deleting the key from this branch must go red.
+    def test_an_operator_whose_record_vanished_is_told_to_re_claim(self) -> None:
+        # The one path that still refuses to resolve: an operator marker with no
+        # record of its own. It is REACHABLE -- a host cleanup deleted exactly
+        # this file on 2026-08-10 -- and it must be distinguishable from "never
+        # declared", because the remedy is `claim operator`, which now always
+        # succeeds. A live coordinator elsewhere changes none of it.
         self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
-        self._lock(self.repo).unlink()
         rival = self.worktree("live-rival")
         self.assertEqual(run_role(rival, "b", "claim", "operator").returncode, 0)
+        self.record_of(self.repo)  # precondition: ours exists before we delete it
+        for path in self.record_files():
+            if json.loads(path.read_text(encoding="utf-8")).get("worktree") == \
+                    subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"],
+                                            cwd=self.repo, text=True).strip():
+                path.unlink()
 
         state = self._resolve_in(self.repo)
         self.assertIsNone(state["role"])
         self.assertEqual(
-            state["reason"], "operator marker without a held lock; re-claim")
-        # .get, so DROPPING the key fails on the value rather than erroring
-        # on the lookup: a missing signal is the same defect as a false one.
-        self.assertIs(state.get("operator_held_by_other"), True)
-        # the CLI surface, which is what an agent actually reads
+            state["reason"],
+            "operator marker without a coordinator record; re-claim")
         shown = run_role(self.repo, "a", "show")
         self.assertEqual(shown.returncode, 3)
-        self.assertIn("held by another live session", shown.stdout)
-
-    def test_a_self_lost_lock_is_not_reported_as_a_rival(self) -> None:
-        # The other side of the same key: with the lock simply GONE there is no
-        # rival, so a blanket True would be a different lie. Hardcoding the key
-        # either way now fails one of these two tests.
-        run_role(self.repo, "a", "claim", "operator")
-        self._lock(self.repo).unlink()
-        state = self._resolve_in(self.repo)
-        self.assertIsNone(state["role"])
-        self.assertIs(state.get("operator_held_by_other"), False)
-        self.assertNotIn("another live session", run_role(self.repo, "a", "show").stdout)
-
-    def test_downgrading_out_of_operator_releases_the_lock(self) -> None:
-        # `claim read-only` ("just looking") is the exact next command an
-        # operator types, and leaving the lock behind is worse than holding no
-        # role: heartbeat answers "not the operator; nothing to heartbeat", so
-        # nothing renews it, and a second worktree is refused for the full 2h
-        # TTL by a session that holds no role at all.
+        # No refusal language survives anywhere: the rival is reported as a
+        # peer, never as a blocker, and re-claiming works on the spot.
+        self.assertNotIn("cannot be the operator", shown.stdout + shown.stderr)
         self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
-        self.assertTrue(self._lock(self.repo).exists())
+        self.assertIn("role=operator", run_role(self.repo, "a", "show").stdout)
+
+    def test_downgrading_out_of_operator_releases_the_record(self) -> None:
+        # `claim read-only` ("just looking") is the exact next command an
+        # operator types, and leaving the record behind is worse than holding no
+        # role: heartbeat answers "not the operator; nothing to heartbeat", so
+        # nothing renews it, and the display then shows a coordinator that is
+        # not coordinating for the full 2h TTL.
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        self.assertEqual(len(self.record_files()), 1)
         downgrade = run_role(self.repo, "a", "claim", "read-only")
         self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
-        self.assertFalse(self._lock(self.repo).exists())
+        self.assertEqual(self.record_files(), [])
         self.assertIn("role=read-only", run_role(self.repo, "a", "show").stdout)
-        # the lock is genuinely free, not merely absent from this worktree
-        successor = run_role(self.worktree("successor"), "b", "claim", "operator")
-        self.assertEqual(successor.returncode, 0, successor.stderr)
 
-    def test_downgrading_to_helper_releases_the_lock_too(self) -> None:
+    def test_downgrading_to_helper_releases_the_record_too(self) -> None:
         # Same rule, the other non-operator answer: the release keys on "the
         # claimed role is not operator", not on read-only specifically.
         run_role(self.repo, "a", "claim", "operator")
         self.assertEqual(
             run_role(self.repo, "a", "claim", "helper", "--row", "ENG-FOO").returncode, 0)
-        self.assertFalse(self._lock(self.repo).exists())
+        self.assertEqual(self.record_files(), [])
 
-    def test_a_downgrade_never_frees_ANOTHER_worktrees_lock(self) -> None:
-        # The release must use the same ownership test `release` does. A
-        # read-only claim in one worktree stealing the operator lock from
-        # another would be the mutual-exclusion guarantee inverted.
+    def test_a_downgrade_never_removes_ANOTHER_worktrees_record(self) -> None:
+        # The removal must use the same ownership test `release` does. A
+        # read-only claim in one worktree erasing another worktree's record
+        # would make the record lie about who is working where.
         run_role(self.repo, "a", "claim", "operator")
         elsewhere = self.worktree("bystander")
         self.assertEqual(run_role(elsewhere, "b", "claim", "read-only").returncode, 0)
-        self.assertTrue(self._lock(self.repo).exists())
+        self.assertEqual(len(self.record_files()), 1)
         self.assertIn("role=operator", run_role(self.repo, "a", "show").stdout)
 
-    def test_release_from_a_new_session_frees_the_lock(self) -> None:
-        # Release has to cross the call boundary as well, or a lock taken in one
-        # call is unreleasable in the next and wedges the repo until the TTL.
+    def test_release_from_a_new_session_removes_the_record(self) -> None:
+        # Release has to cross the call boundary as well, or a record written in
+        # one call is unreleasable in the next and shows a phantom coordinator
+        # until the TTL.
         run_role(self.repo, "call-1", "claim", "operator")
         run_role(self.repo, "call-2-different-pid", "release")
-        taken = run_role(self.worktree("next"), "c", "claim", "operator")
-        self.assertEqual(taken.returncode, 0)
+        self.assertEqual(self.record_files(), [])
+
+
+class CoordinatorRecords(_TempRepo, unittest.TestCase):
+    """Issue #285: the file records who is coordinating where; it never refuses.
+
+    Everything here is stated across REAL worktrees, because a record keys on
+    the worktree and one file per worktree is what makes concurrent claimants
+    safe: two claims write two different paths, so neither can lose the other's
+    record, and each publish is a rename over its own path.
+    """
+
+    def peers_shown(self, where: Path) -> str:
+        shown = run_role(where, "watcher", "show")
+        return shown.stdout
+
+    def test_show_lists_the_other_live_coordinators(self) -> None:
+        # The point of keeping the file at all: who, which worktree, and how
+        # long since the heartbeat. Diagnosing a dead holder needed exactly this
+        # on 2026-08-10 and the tool would not say it.
+        run_role(self.repo, "primary", "claim", "operator")
+        rival = self.worktree("rival")
+        run_role(rival, "rival-session", "claim", "operator")
+        rival_git_dir = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=rival, text=True).strip()
+
+        shown = self.peers_shown(self.repo)
+        self.assertIn("other coordinators", shown)
+        self.assertIn(rival_git_dir, shown)          # which worktree
+        self.assertIn("rival-session", shown)        # who
+        self.assertIn("heartbeat", shown)            # how long since
+        self.assertRegex(shown, r"\d+s ago")
+
+    def test_show_never_lists_this_worktree_as_a_peer(self) -> None:
+        # A record that counted itself would report a coordinator conflict with
+        # nobody, which is how a record starts reading like a lock again.
+        run_role(self.repo, "solo", "claim", "operator")
+        own_git_dir = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=self.repo, text=True).strip()
+        shown = run_role(self.repo, "solo", "show").stdout
+        self.assertIn("role=operator", shown)
+        self.assertNotIn("other coordinators", shown)
+        self.assertNotIn(own_git_dir, shown)
+
+    def test_release_removes_only_the_callers_record(self) -> None:
+        run_role(self.repo, "a", "claim", "operator")
+        rival = self.worktree("rival")
+        run_role(rival, "b", "claim", "operator")
+
+        run_role(self.repo, "a", "release")
+        self.assertEqual(len(self.record_files()), 1, self.records())
+        self.record_of(rival)  # the survivor is the OTHER worktree's
+        self.assertIn("role=operator", run_role(rival, "b", "show").stdout)
+        self.assertEqual(run_role(self.repo, "a", "show").returncode, 3)
+
+    def test_a_stale_record_is_pruned_and_never_blocks(self) -> None:
+        # A session killed mid-flight leaves a dead pid and a frozen heartbeat.
+        # The TTL stays; what changes is the consequence -- the stale record
+        # drops out of the display instead of refusing everyone for two hours.
+        run_role(self.repo, "crashed", "claim", "operator")
+        self.backdate(self.repo, 10 * 60 * 60)
+        successor = self.worktree("successor")
+
+        took = run_role(successor, "b", "claim", "operator")
+        self.assertEqual(took.returncode, 0, took.stderr)
+        self.assertNotIn("crashed", took.stdout + took.stderr)
+        shown = run_role(successor, "b", "show").stdout
+        self.assertIn("role=operator", shown)
+        self.assertNotIn("other coordinators", shown)
+        self.assertNotIn("crashed", shown)
+        self.assertEqual(len(self.record_files()), 1, self.records())
+        self.record_of(successor)
+
+    def test_a_stale_record_is_hidden_before_anything_prunes_it(self) -> None:
+        # Pruning is a WRITE, so it happens on claim and never in `show`:
+        # agent-preflight.sh documents itself as never writing anything. The
+        # display must therefore filter on the TTL itself, not rely on a
+        # previous claim having cleaned up.
+        run_role(self.repo, "crashed", "claim", "operator")
+        rival = self.worktree("rival")
+        run_role(rival, "live", "claim", "operator")
+        self.backdate(self.repo, 10 * 60 * 60)
+
+        shown = run_role(rival, "live", "show").stdout
+        self.assertNotIn("crashed", shown)
+        self.assertNotIn("other coordinators", shown)
+        self.assertEqual(len(self.record_files()), 2, "show must not delete anything")
+
+    def test_concurrent_claims_lose_no_record(self) -> None:
+        # The representation exists for this case. Eight worktrees claim at
+        # once; every one of them must end up recorded, and every record must be
+        # readable JSON -- a shared file rewritten by eight writers loses some.
+        worktrees = [self.worktree(f"coord{index}") for index in range(8)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(
+                lambda pair: run_role(pair[1], f"s{pair[0]}", "claim", "operator"),
+                list(enumerate(worktrees))))
+        for index, result in enumerate(results):
+            self.assertEqual(result.returncode, 0, f"claim {index}: {result.stderr}")
+        self.assertEqual(len(self.record_files()), 8, self.records())
+        for worktree in worktrees:
+            self.record_of(worktree)  # every one survived, none was overwritten
+        # And every claimant sees the other seven.
+        shown = run_role(worktrees[0], "s0", "show").stdout
+        self.assertIn("other coordinators recorded: 7", shown)
+
+    def test_a_claim_never_rewrites_another_worktrees_record(self) -> None:
+        # The atomicity argument in one assertion: a writer only ever touches
+        # the path derived from its OWN worktree, so a peer's bytes are
+        # untouched. If claims ever shared a file this is the first thing to go.
+        run_role(self.repo, "a", "claim", "operator")
+        before = self.record_files()[0].read_bytes()
+        rival = self.worktree("rival")
+        run_role(rival, "b", "claim", "operator")
+        run_role(rival, "b", "heartbeat")
+        run_role(rival, "b", "release")
+        self.assertEqual(self.record_files()[0].read_bytes(), before)
+
+    def test_heartbeat_renews_only_this_worktrees_record(self) -> None:
+        run_role(self.repo, "a", "claim", "operator")
+        rival = self.worktree("rival")
+        run_role(rival, "b", "claim", "operator")
+        self.backdate(self.repo, 30 * 60)
+        self.backdate(rival, 30 * 60)
+
+        beat = run_role(rival, "b", "heartbeat")
+        self.assertEqual(beat.returncode, 0, beat.stderr)
+        self.assertGreater(self.record_of(rival)["heartbeat"], time.time() - 60)
+        self.assertLess(self.record_of(self.repo)["heartbeat"], time.time() - 60)
+
+    def test_a_record_is_never_written_inside_a_work_tree(self) -> None:
+        # It must stay uncommittable. `git status` in the worktree that claimed
+        # is the check that matters, because that is where a `git add` runs.
+        run_role(self.repo, "a", "claim", "operator")
+        self.assertTrue(self.records_dir().is_dir())
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=self.repo, text=True).strip(),
+            "")
+
+
+class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
+    """How a record reaches its own path, and what a bad file in the directory
+    does to `show`.
+
+    `test_a_claim_never_rewrites_another_worktrees_record` pins the DISJOINT
+    PATHS half of the concurrency argument: it fails on shared-path symptoms and
+    says nothing about the publish itself. A fresh review (2026-08-10) replaced
+    `write temp + os.replace` with an in-place, byte-at-a-time flushing write --
+    deliberately torn publishes -- and all three suites stayed green, so the
+    mechanism the module docstring calls atomic was pinned by nothing. The same
+    review found the re-claim path unlinking its own record before rewriting it,
+    and both defensive branches (`record_is_stale`'s unreadable heartbeat,
+    `read_records`'s suffix filter) reachable by no test at all.
+
+    A third round then showed both of those repairs still short. The re-claim
+    test only ever started from a FRESH record, so it never reached the prune
+    that runs first and unlinked our own record once it was stale -- the common
+    case, since the TTL is two hours. And both publish tests survive
+    `unlink(target); target.write_text(new)`: a new inode leaves the hardlink
+    witness intact and no temp is left, but the NAME is transiently absent,
+    which is neither the old record nor the new one.
+    """
+
+    def test_a_publish_replaces_the_record_and_never_rewrites_it_in_place(self) -> None:
+        # A hardlink is the inode a concurrent reader is holding. `os.replace`
+        # publishes a NEW inode over the name, so the reader keeps seeing whole
+        # old bytes; any in-place rewrite reaches through the link, which is
+        # exactly how a reader gets half a record.
+        run_role(self.repo, "a", "claim", "operator")
+        published = self.record_files()[0]
+        before = published.read_bytes()
+        witness = published.with_name("witness-hardlink")
+        os.link(published, witness)
+
+        beat = run_role(self.repo, "a", "heartbeat")
+        self.assertEqual(beat.returncode, 0, beat.stderr)
+        self.assertNotEqual(published.read_bytes(), before, "nothing was published")
+        self.assertEqual(
+            witness.read_bytes(), before,
+            "the record was rewritten IN PLACE: a reader holding the previous "
+            "inode sees the new bytes, so it can observe a partial record")
+
+    def test_a_publish_leaves_no_temporary_file_behind(self) -> None:
+        # The other half of rename-publish: the temp file is CONSUMED by the
+        # rename. A publish that copies instead leaves it, and a leftover temp
+        # is a record-shaped file nobody owns.
+        run_role(self.repo, "a", "claim", "operator")
+        run_role(self.repo, "a", "heartbeat")
+        run_role(self.repo, "a", "claim", "operator")
+        residue = sorted(entry.name for entry in self.records_dir().iterdir()
+                         if entry.suffix != ".json")
+        self.assertEqual(residue, [], f"publish residue left behind: {residue}")
+
+    def _killed_reclaim(self) -> None:
+        """`claim operator` whose publish dies mid-flight. What survives is the
+        point: whatever is on disk at that instant is what a killed session
+        leaves behind."""
+        saved = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            with mock.patch.object(role, "write_our_record",
+                                   side_effect=RuntimeError("killed mid-publish")):
+                with self.assertRaises(RuntimeError):
+                    role.cmd_claim(argparse.Namespace(
+                        role="operator", row=None, headless=False))
+        finally:
+            os.chdir(saved)
+
+    def test_a_publish_never_leaves_the_record_NAME_absent(self) -> None:
+        # The two tests above both survive `target.unlink(); target.write_text()`
+        # (review mutation MINE-B, 2026-08-10): a fresh inode leaves the hardlink
+        # witness reading the old bytes, and no temp file is left behind. What
+        # that publish does do is make the NAME transiently absent, which is
+        # neither "the old record" nor "the new one" -- a `show` landing in the
+        # window reports an operator marker with no record and exits 3.
+        #
+        # So the NAME is watched rather than the bytes. Polling for the window
+        # would be a race; instead the publish is observed from inside: at the
+        # instant any file content is written, the published path must already
+        # resolve, and nothing may unlink it. Both hold for temp + os.replace,
+        # and neither holds for unlink-then-create. The record has to exist
+        # first -- "old or new, never absent" says nothing about the first
+        # publish, which has no old.
+        run_role(self.repo, "a", "claim", "operator")
+
+        absent_when_writing: list[str] = []
+        unlinked: list[str] = []
+        real_write_text = Path.write_text
+        real_path_unlink = Path.unlink
+        real_os_unlink = os.unlink
+        real_os_remove = os.remove
+
+        saved = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            target = role.record_path()
+
+            def watched_write_text(path, *args, **kwargs):
+                if not target.exists():
+                    absent_when_writing.append(str(path))
+                return real_write_text(path, *args, **kwargs)
+
+            def watched_path_unlink(path, *args, **kwargs):
+                if Path(path) == target:
+                    unlinked.append(str(path))
+                return real_path_unlink(path, *args, **kwargs)
+
+            def watched_os_unlink(path, *args, **kwargs):
+                if Path(path) == target:
+                    unlinked.append(str(path))
+                return real_os_unlink(path, *args, **kwargs)
+
+            def watched_os_remove(path, *args, **kwargs):
+                if Path(path) == target:
+                    unlinked.append(str(path))
+                return real_os_remove(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", watched_write_text), \
+                    mock.patch.object(Path, "unlink", watched_path_unlink), \
+                    mock.patch.object(os, "unlink", watched_os_unlink), \
+                    mock.patch.object(os, "remove", watched_os_remove):
+                role.write_our_record()
+        finally:
+            os.chdir(saved)
+
+        self.assertEqual(
+            unlinked, [],
+            "the publish UNLINKED the record name; a reader in that window sees "
+            "an operator marker with no record, not the old record")
+        self.assertEqual(
+            absent_when_writing, [],
+            "the new bytes were written while the record name did not exist, so "
+            f"the name was transiently absent: {absent_when_writing}")
+
+    def test_a_reclaim_never_unlinks_its_own_record(self) -> None:
+        # Re-claim must REPLACE, never unlink-then-create. With the publish
+        # killed mid-flight, the record from the previous claim has to survive
+        # byte-for-byte -- an operator marker with no record is the one state
+        # that still refuses to resolve, and it is what this change exists to
+        # remove.
+        #
+        # Both ages, because they take DIFFERENT code paths and only the fresh
+        # one was covered: `cmd_claim` prunes before it publishes, and a prune
+        # that is not scoped to skip our own path unlinks our record whenever it
+        # is the stale one. Stale is the COMMON case -- the TTL is two hours and
+        # a session re-claims at the top of its next tool call -- and `resolve`
+        # matches our own record with no staleness filter, so the state RESOLVES
+        # FINE until the re-claim destroys it. One backdate is the whole
+        # difference between the two legs.
+        for age, backdate_by in (("fresh", None),
+                                 ("stale", role.RECORD_TTL_SECONDS + 60)):
+            with self.subTest(own_record=age):
+                run_role(self.repo, "a", "claim", "operator")
+                if backdate_by is not None:
+                    self.backdate(self.repo, backdate_by)
+                before = self.record_files()[0].read_bytes()
+                # Whatever its age, this worktree resolves BEFORE the re-claim.
+                # So any refusal afterwards was manufactured by the re-claim.
+                self.assertEqual(run_role(self.repo, "a", "show").returncode, 0)
+
+                self._killed_reclaim()
+
+                self.assertEqual(
+                    len(self.record_files()), 1,
+                    "the re-claim unlinked this worktree's own record before "
+                    f"republishing it: {self.records()}")
+                self.assertEqual(self.record_files()[0].read_bytes(), before)
+                # The state the whole change exists to remove: an operator
+                # marker with no record, created out of one that resolved.
+                self.assertEqual(run_role(self.repo, "a", "show").returncode, 0)
+
+    def test_show_survives_a_corrupt_record_a_bad_heartbeat_and_a_stray_temp(self) -> None:
+        # Nothing exercised either defensive branch. A record whose heartbeat is
+        # unreadable must read as STALE, not raise out of `show`; a `.tmp` file
+        # caught mid-publish must not parse as a coordinator. And `show` must
+        # still write nothing: agent-preflight.sh documents itself as never
+        # writing, and it calls exactly this path.
+        run_role(self.repo, "a", "claim", "operator")
+        directory = self.records_dir()
+        (directory / "corrupt.json").write_text("{ not json at all", encoding="utf-8")
+        (directory / "bad-heartbeat.json").write_text(json.dumps({
+            "session": "bad-beat-session", "worktree": "/nowhere/.git",
+            "claimed_at": "not-a-number", "heartbeat": "not-a-number",
+            "host": "somewhere", "pid": 4321}), encoding="utf-8")
+        (directory / ".half-published.999.tmp").write_text(json.dumps({
+            "session": "stray-temp-session", "worktree": "/torn/.git",
+            "claimed_at": time.time(), "heartbeat": time.time(),
+            "host": "somewhere", "pid": 999}), encoding="utf-8")
+        before = sorted((entry.name, entry.read_bytes()) for entry in directory.iterdir())
+
+        shown = run_role(self.repo, "a", "show")
+
+        self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+        self.assertIn("role=operator", shown.stdout)
+        self.assertNotIn("Traceback", shown.stderr)
+        # Neither bad file may become a coordinator: one is past no TTL it can
+        # state, the other is a temp file mid-publish.
+        self.assertNotIn("other coordinators", shown.stdout)
+        self.assertNotIn("bad-beat-session", shown.stdout)
+        self.assertNotIn("stray-temp-session", shown.stdout)
+        self.assertEqual(
+            sorted((entry.name, entry.read_bytes()) for entry in directory.iterdir()),
+            before, "`show` wrote to the records directory")
 
 
 class RoleDiscipline(unittest.TestCase):
@@ -698,18 +1061,16 @@ class ReadOnlyAndModeResolved(_TempRepo, unittest.TestCase):
         self.assertIsNone(undeclared["role"])
         self.assertEqual(undeclared["mode"], "interactive")
 
-    def test_read_only_takes_no_operator_lock(self) -> None:
-        # The whole reason read-only exists: a session that only reads must not
-        # hold the repo-wide operator lock, or it blocks a real operator.
+    def test_read_only_writes_no_coordinator_record(self) -> None:
+        # The whole reason read-only exists: a session that only reads is not
+        # coordinating, so it must not appear in the record of who is.
         self.assertEqual(run_role(self.repo, "a", "claim", "read-only").returncode, 0)
-        common = subprocess.check_output(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            cwd=self.repo, text=True).strip()
-        self.assertFalse((Path(common) / "vllm-cpp-operator.lock").exists())
+        self.assertEqual(self.record_files(), [])
         self.assertIn("role=read-only", run_role(self.repo, "a", "show").stdout)
-        # ... and a real operator elsewhere is still free to take the lock.
+        # ... and a real coordinator elsewhere records itself normally.
         self.assertEqual(
             run_role(self.worktree("real-operator"), "b", "claim", "operator").returncode, 0)
+        self.assertEqual(len(self.record_files()), 1)
 
 
 if __name__ == "__main__":

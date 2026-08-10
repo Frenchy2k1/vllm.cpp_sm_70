@@ -238,6 +238,16 @@ struct Nvfp4Weight {
   // path. Uploaded once from the persistent `alpha` member; the diagnostic host
   // scalar path leaves this null.
   mutable std::shared_ptr<void> d_alpha;
+  // OPT-IN lifetime residency for the DEQUANTIZED bf16 [K=in, N=out] Matmul-B
+  // operand the backends with NO fp4 GEMM multiply against (CPU / Vulkan / Metal /
+  // HIP / Tenstorrent; CUDA never dequantizes). Default OFF, and it must stay a
+  // per-WEIGHT opt-in: the operand is a bf16 expansion of ~4x the packed bytes, so
+  // holding one per tower projection is the double-residency that OOM-reboots a
+  // Spark on Vulkan (#203). The dense loader opts in the OUTPUT HEAD alone — one
+  // weight, re-read whole every step (~2.54 GB a step rebuilt per call at the
+  // 27B's 248320x5120); everything else keeps a per-call copy.
+  bool keep_dequant_b = false;
+  mutable std::shared_ptr<void> d_dequant_b;
 
   // Resident Marlin constants (issue #237; see ResidentSlot). `resident_marlin`
   // is this weight's own repack; `resident_marlin_pair` is the fused gate+up
