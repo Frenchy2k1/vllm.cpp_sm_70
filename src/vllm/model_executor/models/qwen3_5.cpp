@@ -2557,24 +2557,43 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   const int64_t M = x.shape[0], K = x.shape[1], N = gw.n;
   MarlinDensePairResident& mr = MarlinDensePairResidentFor(&gw);
   if (!mr.ready) BuildMarlinDensePairResident(d, gw, uw, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);
   d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
 
   DBuf gu(d, DType::kBF16, {M, 2 * N});
-  Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
-  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
   Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
   Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
-  Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
-  Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
-  Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
-  Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
-  vt::MoeGroupedGemmNvfp4Marlin(
-      d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
-      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
-                        static_cast<int>(K), false});
+  // VT_MARLIN_DENSE_PAIR (default ON): the single-projection sink already takes vLLM's OWN
+  // dense marlin GEMM (MatmulNvfp4MarlinD, VT_MARLIN_DENSE). This fused
+  // shared-expert gate_up sink did NOT, so it still ran the single-expert
+  // MoE-marlin route: measured at c8 that is 20320 launches (one per layer per
+  // step) of <128,1,8,4,m_block_size_8=false> = 5.4% of GPU time, a kernel
+  // configuration the pinned vLLM never launches. Same resident (mr.w/mr.s/
+  // mr.g) and workspace; rank-2 operand views and direct-A, so no moe_align
+  // cache and no row padding.
+  if (dense_nvfp4::MarlinDensePairEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, 2 * N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / 16, 2 * N});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(2 * N),
+                              static_cast<int>(K)};
+    dargs.group_size = 16;
+    dargs.mxfp4 = false;
+    vt::MarlinDenseGemm(d.q, gu.t(), x, wqd, scd, gg, wst, dargs);
+  } else {
+    DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
+    Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
+    Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
+    Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
+    Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
+    Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
+    Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
+    vt::MoeGroupedGemmNvfp4Marlin(
+        d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
+        vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
+                          static_cast<int>(K), false});
+  }
   DBuf act(d, DType::kBF16, {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;

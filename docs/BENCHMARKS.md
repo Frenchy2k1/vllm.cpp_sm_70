@@ -137,7 +137,9 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on both
 engines) and is entirely MARGINAL per-token work, since our FIXED per-step cost
 already beats vLLM (9.02 ms against 9.43 ms). The marlin block-size lever is
-REFUTED by same-binary A/B (block 8 at c8 is 1.16% SLOWER; c4 control +0.29%).
+REFUTED by same-binary A/B (block 8 at c8 is 1.16% SLOWER; c4 control +0.29%),
+but routing the fused shared-expert gate_up sink off the MoE-marlin route WINS
+**+1.31% at c8 and +1.38% at c4** (`VT_MARLIN_DENSE_PAIR`, default ON).
 Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**. Detail in
 `.agents/benchmark-record.md`.
 

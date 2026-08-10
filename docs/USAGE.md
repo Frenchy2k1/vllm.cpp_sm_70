@@ -292,6 +292,18 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+### NVFP4 dense sinks
+
+The `E=1` dense NVFP4 projections run on vLLM's own dense Marlin GEMM rather
+than the single-expert grouped-MoE route, which pays `moe_align` bookkeeping and
+row padding for a problem that has neither. `VT_MARLIN_DENSE` covers the single
+projections and `VT_MARLIN_DENSE_PAIR` the fused shared-expert gate_up sink;
+both default ON, opt out with `=0`. The pair sink was the last one still on the
+MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
+throughput changes; the routed experts still use the grouped MoE kernel, which
+is where they belong.
+
 ### The NVFP4 output head
 
 On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
