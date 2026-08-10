@@ -203,8 +203,9 @@ HTTP are not started.
 | GBNF grammars | ✅ | ☐ | ☐ | ✅ |
 | xgrammar backend | ✅ | ✅ | ✅ | ☐ |
 | Jump-forward decoding | ✅ opt-in | ☐ | ✅ | ☐ |
-| Tool-call parsers | ✅ 36 families | ✅ | ✅ | ◐ |
-| Reasoning-content parsers | ✅ | ✅ | ✅ | ☐ |
+| Tool-call parsers | ✅ 37 families | ✅ | ✅ | ◐ |
+| Reasoning-content parsers | ✅ 10 | ✅ | ✅ | ☐ |
+| Muse Glimmer ATEM parsers (`muse_glimmer`) | ◐ PARSERS ONLY (ATEM tool dialect + `to=self` reasoning split, ported with all five upstream parser test modules). The forward is NOT implemented, so nothing serves end to end ([spec](../.agents/specs/muse-glimmer.md)) | ✅ | ☐ | ☐ |
 | Custom logits processors | ◐ CPU-verified | ✅ | ✅ | ☐ |
 
 ## Backends and hardware
