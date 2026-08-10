@@ -61,11 +61,17 @@ class AsyncLLM {
   // through to the EngineCoreProc (grammar_init + the scheduler's bitmask).
   // Null keeps structured output a no-op (backward-compat with tests that
   // build a bare stack).
+  //
+  // `check_for_draft_tokens` is EngineCore's speculative-decode flag, threaded
+  // down to the EngineCoreProc this owns. False (the default) leaves post_step
+  // a no-op, which is byte-identical for a non-speculative engine; a
+  // speculative engine MUST pass true or its drafts are proposed and dropped.
   AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
            Executor& executor, OutputProcessor& output_processor,
            BlockHasher block_hasher = nullptr, int shutdown_timeout_s = 0,
            int max_concurrent_batches = 1,
-           StructuredOutputManager* structured_output_manager = nullptr);
+           StructuredOutputManager* structured_output_manager = nullptr,
+           bool check_for_draft_tokens = false);
   ~AsyncLLM();
 
   AsyncLLM(const AsyncLLM&) = delete;

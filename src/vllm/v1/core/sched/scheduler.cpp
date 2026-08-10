@@ -1074,9 +1074,22 @@ void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
   const std::size_t n =
       std::min(draft_token_ids.req_ids.size(),
                draft_token_ids.draft_token_ids.size());
+  static const bool spec_entry_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+  if (spec_entry_trace) {
+    std::fprintf(stderr, "[spec-update] called n=%zu\n", n);
+  }
   for (std::size_t i = 0; i < n; ++i) {
     const std::string& req_id = draft_token_ids.req_ids[i];
     auto it = requests.find(req_id);
+    if (spec_entry_trace) {
+      std::fprintf(stderr,
+                   "[spec-update] req=%s found=%d finished=%d prefill_chunk=%d "
+                   "drafts=%zu\n",
+                   req_id.c_str(), it != requests.end() ? 1 : 0,
+                   (it != requests.end() && it->second->IsFinished()) ? 1 : 0,
+                   (it != requests.end() && it->second->is_prefill_chunk) ? 1 : 0,
+                   draft_token_ids.draft_token_ids[i].size());
+    }
     if (it == requests.end() || it->second->IsFinished()) {
       // The request may have been finished. Skip.
       continue;
