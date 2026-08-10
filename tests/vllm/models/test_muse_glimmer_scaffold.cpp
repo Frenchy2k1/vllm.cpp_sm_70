@@ -327,7 +327,18 @@ TEST_CASE("MuseGlimmer: the structural name map is faithful") {
   // Vision tower + adapter + projector.
   CHECK(Has(names, "vision_encoder.conv1_linear.weight"));
   CHECK(Has(names, "vision_encoder.positional_embedding_vlm"));
-  CHECK(Has(names, "vision_encoder.transformer.0.attn.qkv_proj.weight"));
+  // W4 CORRECTION: the vision attention ships SEPARATE q/k/v shards, each WITH a
+  // bias, and `attn.proj` (-> `attn.o_proj`) also has one. W0 pinned upstream's
+  // merged `qkv_proj` MODULE name instead, which no checkpoint contains — the merge
+  // is a LOAD-time fold (packed_modules_mapping, muse_glimmer.py:1427-1430). Gated
+  // against the real 1436-tensor index in test_muse_glimmer_wiring.cpp.
+  CHECK_FALSE(Has(names, "vision_encoder.transformer.0.attn.qkv_proj.weight"));
+  for (const char* proj : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+    CHECK(Has(names, std::string("vision_encoder.transformer.0.attn.") + proj +
+                         ".weight"));
+    CHECK(Has(names, std::string("vision_encoder.transformer.0.attn.") + proj +
+                         ".bias"));
+  }
   CHECK(Has(names, "vision_encoder.ln_post.bias"));
   CHECK(Has(names, "vision_adapter.c_proj.weight"));
   CHECK(Has(names, "vision_projection.weight"));

@@ -204,6 +204,20 @@ target_include_directories(test_muse_glimmer_vision PRIVATE
 # exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
 vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
 
+# Muse Glimmer W4 WIRING gate: the REAL-CHECKPOINT structural contract (every name
+# EnumerateMuseGlimmerTensors produces exists in the released 1436-tensor
+# Muse-Glimmer-30B index at the right shape, and nothing in the checkpoint is
+# unaccounted) plus the perception-encoder wiring (vision load with the q|k|v merge
+# order and every bias, the soft-token projection, the masked scatter onto the
+# image/video rows, and the mm forward branch). The structural half runs off a
+# COMMITTED header-only fixture so CI never needs the NAS; a second case re-reads
+# the live checkpoint when VLLM_MUSE_CKPT points at it. CPU-only, no GPU, no tensor
+# bytes. NOT an image e2e correctness gate — the pinned oracle cannot load this
+# model at all, so no speed or token-exactness claim exists (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.cpp)
+target_compile_definitions(test_muse_glimmer_wiring PRIVATE
+  MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
+
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
 # checkpoint name-map faithfulness (block_sparse_moe, verified vs the HF index) +
