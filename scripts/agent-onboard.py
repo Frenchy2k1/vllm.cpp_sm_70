@@ -125,12 +125,14 @@ def probe() -> dict:
     return {
         "role": state.get("role"),
         "row": state.get("row"),
-        # resolve() distinguishes "never declared" from "the operator lock is
-        # held by another live session" and from "operator marker without a
-        # held lock; re-claim". Dropping those makes this front door LESS
-        # honest than the tool it wraps, and sends a session toward `claim
-        # operator` when that will fail.
-        "blocked_by_other_operator": bool(state.get("operator_held_by_other")),
+        # Who else is coordinating right now, straight from resolve(). This
+        # replaced `blocked_by_other_operator` when the operator lock became a
+        # RECORD (issue #285): a recorded peer never blocks a claim, so
+        # reporting it as a blocker sent sessions away from a command that
+        # succeeds. Dropping it instead would make this front door LESS honest
+        # than the tool it wraps -- "who is working where" is the whole reason
+        # the file is kept.
+        "operator_peers": state.get("operator_peers") or [],
         "reason": state.get("reason"),
         # The role tool owns both facts. Keep the branch from resolve() and
         # expose the same per-worktree identity used by role markers/locks so
@@ -167,12 +169,11 @@ def render_probe(state: dict) -> str:
         + (f" (unset: {', '.join(state['env_missing'])})" if state["env_missing"] else ""),
         queue_line,
     ]
+    # Rendered whatever this session's role is: any session may need to know
+    # who else is coordinating. It is information and never an obstacle --
+    # `claim operator` is never refused (issue #285).
+    lines.extend(role_mod.render_peers(state.get("operator_peers") or []))
     if state["role"] is None:
-        if state.get("blocked_by_other_operator"):
-            lines.append(
-                "NOTE: the operator lock is held by another live session, so "
-                "`claim operator` will fail. Take helper or read-only."
-            )
         lines.append(
             "This session has not declared a role. Ask what the work is, then claim: "
             "a long campaign -> operator; one scoped change -> helper --row <ROW-ID>; "
