@@ -240,7 +240,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `MuseGlimmerForCausalLM`, `MuseGlimmerForConditionalGeneration` | Scaffold only. The text tower is not implemented; the perception encoder exists as a standalone, per-stage-gated tower but is not reachable from the registry or the C API, and there is no loader for it yet. The pinned vLLM cannot load `muse_glimmer` at all, so no speed axis is measurable |
+| `MuseGlimmerForCausalLM`, `MuseGlimmerForConditionalGeneration` | Text tower forwards, but the perception encoder is not wired into it, so an image or video prompt refuses. No checkpoint has been run |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.

@@ -46,7 +46,8 @@
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
-#include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, ForwardLogits
+#include "vllm/model_executor/models/qwen3_5.h"          // PagedKvCache, ForwardLogits
+#include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/kv_cache_interface.h"
@@ -191,24 +192,88 @@ MuseGlimmerCheckpointConvention MuseGlimmerConventionOf(const std::string& name)
 // NO tensor, which is why the counts are smaller than a Gemma-shaped tower's.
 std::vector<std::string> EnumerateMuseGlimmerTensors(const MuseGlimmerParams& params);
 
-// Whole Muse Glimmer weights. STRUCTURAL SCAFFOLDING for W0: carries the resolved
-// params + the loader's accounting result. Tensor MATERIALIZATION is the named W1+
-// residual.
+// One Muse Glimmer self-attention block (muse_glimmer.py:1082-1215). Merged QKV
+// (`qkv_proj` <- [q,k,v]_proj, no bias), and — the delta vs every Gemma — a
+// SEPARATE per-head output-gate projection whose input is the NORMED LAYER INPUT,
+// not the attention output (:1203-1206). The QK-norm is WEIGHTLESS (:1121), so it
+// contributes no tensor here.
+struct MuseGlimmerAttnWeights {
+  OwnedTensor qkv_proj;         // bf16 raw-NK [Hq*Dh + 2*Hkv*Dh, H] (rows q|k|v)
+  OwnedTensor o_proj;           // bf16 raw-NK [H, Hq*Dh]
+  OwnedTensor output_gate_proj;  // bf16 raw-NK [Hq*Dh, H]; EMPTY when the gate is off
+};
+
+// Muse Glimmer SwiGLU MLP (muse_glimmer.py:1046-1079): merged gate_up ->
+// SiluAndMul -> down. `hidden_activation` is asserted `silu` at config parse —
+// this is the delta vs Gemma-2's GeGLU sibling.
+struct MuseGlimmerMlpWeights {
+  OwnedTensor gate_up_proj;  // bf16 raw-NK [2*I, H] (rows gate|up)
+  OwnedTensor down_proj;     // bf16 raw-NK [H, I]
+};
+
+// One decoder layer (muse_glimmer.py:1218-1277). FOUR sandwich RMSNorms, all with
+// the baked `+1` weight offset, but on TWO different epsilons: the two PRE norms
+// take `rms_norm_eps`, the two POST norms `post_norm_eps` (:1236-1247).
+struct MuseGlimmerLayerWeights {
+  OwnedTensor input_layernorm;             // bf16 [H]  pre  (eps = rms_norm_eps)
+  OwnedTensor post_attention_layernorm;    // bf16 [H]  post (eps = post_norm_eps)
+  OwnedTensor pre_feedforward_layernorm;   // bf16 [H]  pre  (eps = rms_norm_eps)
+  OwnedTensor post_feedforward_layernorm;  // bf16 [H]  post (eps = post_norm_eps)
+  MuseGlimmerAttnWeights attn;
+  MuseGlimmerMlpWeights mlp;
+};
+
+// Whole Muse Glimmer weights. W0 carried only the resolved params + the loader's
+// structural accounting; W1 adds the materialized TEXT tower. The perception
+// encoder's tensors are still NOT materialized (W3) — a Muse Glimmer forward on
+// this struct is text-only.
+//
+// `model.embed_norm` (:1286) and the per-head `qk_norm` (:1121) are WEIGHTLESS and
+// deliberately hold no tensor; the forward realizes them as `vt::RmsNorm` against a
+// ones weight (spec §9).
 struct MuseGlimmerWeights {
   MuseGlimmerParams params{};
   int64_t accounted_tensors = 0;
   int64_t enumerated_tensors = 0;
+
+  // W1 text tower. `text_loaded` is false for a params-only struct (the W0
+  // accounting form, and every scaffold-level unit test) — the forward refuses on
+  // it BY NAME rather than reading empty tensors.
+  bool text_loaded = false;
+  OwnedTensor embed_tokens;  // bf16 [V,H]   (:1280)
+  OwnedTensor final_norm;    // bf16 [H]     (:1296) — NOTE: NO `+1` offset here
+  OwnedTensor lm_head;       // bf16 [H,V] Matmul-B (:1480) — UNTIED
+  std::vector<MuseGlimmerLayerWeights> layers;
 };
 
-// Load `MuseGlimmerForConditionalGeneration` safetensors. W0 performs the
-// STRUCTURAL accounting pass only; it does not materialize tensors.
+// Load `MuseGlimmerForConditionalGeneration` safetensors. Performs the W0
+// structural accounting pass AND materializes the W1 text tower (both checkpoint
+// naming conventions, via `NormalizeMuseGlimmerWeightName`). The perception
+// encoder's tensors are accounted but NOT materialized — that is W3.
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
 
-// The Muse Glimmer forward. REFUSE-by-name (both entrypoints VT_CHECK(false)):
-// the sandwich-norm + iRoPE + gated-attention text tower (W1) and the perception
-// encoder (W3) are not wired here. A forward LOUDLY reports the pending brick.
-// See `.agents/specs/muse-glimmer.md` §3.
+// The Muse Glimmer forward. W1 implements the TEXT tower
+// (muse_glimmer.py:1218-1345, :1604-1613):
+//   embed -> WEIGHTLESS embed_norm (NOT Gemma's sqrt(hidden) scale, :1286)
+//   per layer: input_layernorm (fused add, +1, rms_norm_eps)
+//              -> attn: merged qkv, weightless per-head QK-norm in fp32 BEFORE
+//                 RoPE, query pre-scale `scale_query_by` on q only, iRoPE
+//                 (`no_rope_layers[l]==1` => RoPE AND sliding window; `==0` =>
+//                 NoPE AND full attention), softmax scale head_dim**-0.5,
+//                 attn * sigmoid(output_gate_proj(normed layer input)), o_proj
+//              -> post_attention_layernorm (STANDALONE, +1, post_norm_eps)
+//              -> pre_feedforward_layernorm (fused add, +1, rms_norm_eps)
+//              -> SwiGLU MLP
+//              -> post_feedforward_layernorm (STANDALONE, +1, post_norm_eps)
+//   final norm (fused add, NO offset, rms_norm_eps) -> UNTIED lm_head
+//   -> * output_multiplier -> final_logit_softcapping
+// The perception encoder is NOT wired (W3), so an image/video prompt is still a
+// pending brick. Returns [n_out, vocab] f32.
+//
+// NOT ESTABLISHED by W1: no token-exact e2e claim. The pinned oracle cannot load
+// `muse_glimmer` at all (spec §0), so there is neither a golden nor a speed
+// denominator; W1's evidence is structural + per-mechanism unit level.
 class MuseGlimmerModel {
  public:
   static std::vector<float> Forward(
@@ -224,12 +289,15 @@ class MuseGlimmerModel {
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
 };
 
-// KV-cache spec builder. W0 PLACEHOLDER: the TRUE topology is heterogeneous —
-// the RoPE layers are sliding-window and the NoPE layers are full attention
-// (muse_glimmer.py:1167-1168) — which the per-layer spec seam Gemma-4 landed can
-// represent. W0 emits ONE full-attention group sized to the uniform GQA geometry
-// so the arch RESOLVES; the heterogeneous split lands with the W1 forward. Never
-// exercised — the forward REFUSES.
+// KV-cache spec builder: ONE full-attention group over the uniform GQA geometry.
+// W1 RESOLVED the W0 placeholder note: the RoPE layers are sliding-window and the
+// NoPE layers are full attention (muse_glimmer.py:1167-1168), but BOTH classes have
+// the SAME num_key_value_heads and head_dim, so the only per-layer difference is
+// the WINDOW — which is applied at the attention-kernel level
+// (`vt::PagedAttentionArgs::window_size`), exactly as Gemma-2/Laguna do for their
+// interleaved sliding layers. No heterogeneous per-layer spec is needed; the
+// Gemma-4 per-layer seam exists for models whose KV GEOMETRY differs per layer,
+// which Muse Glimmer's does not.
 v1::KVCacheConfig MakeMuseGlimmerKVCache(const HfConfig& config, int block_size,
                                          int num_blocks);
 
