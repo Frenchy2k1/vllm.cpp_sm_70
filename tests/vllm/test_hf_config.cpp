@@ -35,6 +35,29 @@ class TempJson {
   std::string path_;
 };
 
+// Writes config.json (+ optional generation_config.json) into a unique temp
+// DIRECTORY and returns the config.json path, so sibling-file resolution is
+// exercised the way a real checkpoint lays out. Removed in the destructor.
+class TempModelDir {
+ public:
+  TempModelDir(const std::string& config_body, const std::string& gen_body) {
+    static int counter = 0;
+    dir_ = (std::filesystem::temp_directory_path() /
+            ("vllm_hf_model_test_" + std::to_string(counter++)))
+               .string();
+    std::filesystem::create_directories(dir_);
+    std::ofstream(dir_ + "/config.json", std::ios::binary) << config_body;
+    if (!gen_body.empty()) {
+      std::ofstream(dir_ + "/generation_config.json", std::ios::binary) << gen_body;
+    }
+  }
+  ~TempModelDir() { std::filesystem::remove_all(dir_); }
+  std::string config_path() const { return dir_ + "/config.json"; }
+
+ private:
+  std::string dir_;
+};
+
 // Qwen3-Next-like hybrid MoE config (key names per upstream
 // vllm/transformers_utils/configs/qwen3_next.py).
 constexpr const char* kHybridJson = R"({
@@ -785,5 +808,61 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
     const auto& rp = cfg.raw.at("rope_parameters");
     CHECK(rp.at("full_attention").at("rope_theta").get<double>() == 1000000.0);
     CHECK(rp.at("sliding_attention").at("rope_theta").get<double>() == 10000.0);
+  }
+}
+
+// ─── generation_config.json eos ids (vllm/config/model.py try_get_generation_
+// config -> sampling_params.py:645-655) ──────────────────────────────────────
+// Upstream loads generation_config.json alongside config.json whenever
+// --generation-config is "auto" (the default) or "vllm". Its eos_token_id is a
+// DIFFERENT, usually larger set than config.json's: Gemma-4-26B ships
+// config.json [1, 106] and generation_config.json [1, 106, 50].
+TEST_CASE("LoadHfConfig reads sibling generation_config.json eos ids") {
+  constexpr const char* kConfig = R"({
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 8,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "vocab_size": 32,
+    "max_position_embeddings": 128,
+    "eos_token_id": [1, 106]
+  })";
+
+  SUBCASE("array eos is unioned, config.json raw left untouched") {
+    TempModelDir model(kConfig, R"({"eos_token_id": [1, 106, 50]})");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    // Sorted, de-duplicated union.
+    std::vector<int32_t> expected = {1, 50, 106};
+    CHECK(cfg.generation_config_eos_ids == expected);
+    // raw["eos_token_id"] is the checkpoint's own field and must not be
+    // rewritten: the PRIMARY eos id is derived from it downstream.
+    CHECK(cfg.raw["eos_token_id"] == nlohmann::json::array({1, 106}));
+  }
+
+  SUBCASE("scalar eos in generation_config.json") {
+    TempModelDir model(kConfig, R"({"eos_token_id": 50})");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    std::vector<int32_t> expected = {50};
+    CHECK(cfg.generation_config_eos_ids == expected);
+  }
+
+  SUBCASE("absent generation_config.json leaves the list empty") {
+    TempModelDir model(kConfig, "");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    CHECK(cfg.generation_config_eos_ids.empty());
+  }
+
+  SUBCASE("malformed generation_config.json is a silent no-op, not a throw") {
+    TempModelDir model(kConfig, "{ this is not json");
+    vllm::HfConfig cfg;
+    REQUIRE_NOTHROW(cfg = vllm::LoadHfConfig(model.config_path()));
+    CHECK(cfg.generation_config_eos_ids.empty());
+  }
+
+  SUBCASE("generation_config.json without an eos field") {
+    TempModelDir model(kConfig, R"({"temperature": 0.7})");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(model.config_path());
+    CHECK(cfg.generation_config_eos_ids.empty());
   }
 }
