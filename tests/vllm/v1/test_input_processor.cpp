@@ -192,6 +192,39 @@ TEST_CASE("process_inputs wires eos/stop token ids") {
     CHECK(req.sampling_params.stop_token_ids == expected);
   }
 
+  // ─── generation_config.json eos ids (sampling_params.py:645-655) ───────────
+  // Upstream's update_from_generation_config draws its secondary eos ids from
+  // generation_config.json, NOT config.json. Gemma-4-26B ships
+  //   config.json            eos: [1, 106]
+  //   generation_config.json eos: [1, 106, 50]
+  // so a port that reads only config.json never stops on 50.
+  SUBCASE("generation_config eos ids merge into stop_token_ids") {
+    HfConfig cfg = MakeConfig(4096, json::array({1, 106}));
+    cfg.generation_config_eos_ids = {1, 106, 50};
+    InputProcessor proc(tok, cfg);
+    SamplingParams params;
+    EngineCoreRequest req = proc.process_inputs("r", "hi", params);
+    REQUIRE(req.sampling_params.eos_token_id.has_value());
+    // The PRIMARY eos still comes from config.json's first element: the
+    // generation_config union must not reorder or displace it.
+    CHECK(*req.sampling_params.eos_token_id == 1);
+    std::vector<int32_t> expected = {50, 106};
+    CHECK(req.sampling_params.stop_token_ids == expected);
+  }
+
+  SUBCASE("generation_config eos ids still respect ignore_eos") {
+    HfConfig cfg = MakeConfig(4096, json::array({1, 106}));
+    cfg.generation_config_eos_ids = {1, 106, 50};
+    InputProcessor proc(tok, cfg);
+    SamplingParams params;
+    params.ignore_eos = true;
+    EngineCoreRequest req = proc.process_inputs("r", "hi", params);
+    CHECK_FALSE(req.sampling_params.eos_token_id.has_value());
+    CHECK(req.sampling_params.stop_token_ids.empty());
+    // ... but they DO feed min_tokens masking regardless (sampling_params.py:653).
+    CHECK(req.sampling_params.all_stop_token_ids.count(50) == 1);
+  }
+
   SUBCASE("list eos with ignore_eos does not touch stop_token_ids") {
     HfConfig cfg = MakeConfig(4096, json::array({100, 200, 300}));
     InputProcessor proc(tok, cfg);

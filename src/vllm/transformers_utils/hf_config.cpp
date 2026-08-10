@@ -7,9 +7,13 @@
 #include "vllm/transformers_utils/hf_config.h"
 
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace vllm {
 
@@ -332,6 +336,45 @@ std::vector<std::string> PeekHfArchitectures(const std::string& path) {
   return archs;
 }
 
+namespace {
+
+// The sibling generation_config.json of a config.json path (HF checkpoint
+// layout). `path` is the config.json file itself.
+std::string SiblingGenerationConfigPath(const std::string& path) {
+  const auto slash = path.find_last_of("/\\");
+  const std::string dir = (slash == std::string::npos) ? std::string(".")
+                                                       : path.substr(0, slash);
+  return dir + "/generation_config.json";
+}
+
+// generation_config.json's eos_token_id (int OR list) as a sorted unique list.
+// Upstream ModelConfig.try_get_generation_config loads this file for the
+// default --generation-config=auto; a missing or malformed file is not an
+// error there either (try_get_generation_config returns {}), so every failure
+// path here yields an empty list rather than throwing.
+std::vector<int32_t> ReadGenerationConfigEosIds(const std::string& path) {
+  std::vector<int32_t> out;
+  std::ifstream in(SiblingGenerationConfigPath(path), std::ios::binary);
+  if (!in) return out;
+  nlohmann::json gen = nlohmann::json::parse(in, /*cb=*/nullptr,
+                                             /*allow_exceptions=*/false);
+  if (gen.is_discarded() || !gen.is_object()) return out;
+  const auto it = gen.find("eos_token_id");
+  if (it == gen.end() || it->is_null()) return out;
+  std::set<int32_t> ids;
+  if (it->is_number_integer()) {
+    ids.insert(it->get<int32_t>());
+  } else if (it->is_array()) {
+    for (const auto& e : *it) {
+      if (e.is_number_integer()) ids.insert(e.get<int32_t>());
+    }
+  }
+  out.assign(ids.begin(), ids.end());
+  return out;
+}
+
+}  // namespace
+
 HfConfig LoadHfConfig(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
@@ -484,6 +527,7 @@ HfConfig LoadHfConfig(const std::string& path) {
   }
 
   cfg.raw = std::move(doc);
+  cfg.generation_config_eos_ids = ReadGenerationConfigEosIds(path);
   return cfg;
 }
 

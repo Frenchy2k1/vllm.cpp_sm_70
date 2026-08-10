@@ -109,6 +109,16 @@ struct HfConfig {
   int64_t max_position_embeddings = 0;
   std::string torch_dtype;
   nlohmann::json raw;  // full doc for fields we don't type yet
+  // eos_token_id from the sibling generation_config.json, sorted and unique.
+  // Upstream ModelConfig.try_get_generation_config (config/model.py) loads that
+  // file whenever --generation-config is "auto" (the default) or "vllm", and
+  // SamplingParams.update_from_generation_config (sampling_params.py:645-655)
+  // merges its ids into stop_token_ids. It is a SEPARATE field rather than a
+  // rewrite of raw["eos_token_id"] because the two have different roles: the
+  // checkpoint's own eos_token_id supplies the PRIMARY eos id, while these are
+  // secondary stop ids gated on ignore_eos. Empty when the file is absent,
+  // unparseable, or carries no eos_token_id.
+  std::vector<int32_t> generation_config_eos_ids;
 };
 
 // Loads and parses `path`. Throws std::runtime_error (message includes the
