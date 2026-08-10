@@ -17913,3 +17913,30 @@ kernel's own share — but 3.1% is not this profile's number.
 Both corrections share one failure mode: matching a single kernel name and
 concluding a ratio. Enumerate the whole kernel family and normalise per
 layer-step before claiming any count difference.
+
+## `PERF-35B-SILU-VECTORIZE` is NEGATIVE — the 9.2x per-launch gap was an averaging artifact (2026-08-10, GB10, #213)
+
+Implemented the row-blocked SiluAndMul from [the spec](specs/moe-silu-vectorize.md)
+(block per token row, no integer divisions, flat kernel kept as fallback,
+`VT_SILU_ROW`). Bit-identical: 315/315 + 235/235, `Status: SUCCESS`, assertion
+counts unchanged on BOTH arms, all four warm greedy probes byte-identical.
+
+A/B, same binary, 3 reps/arm, order-alternated: **c8 -0.17%** (196.64 -> 196.29)
+and **c4 +0.52%** (141.72 -> 142.45), bands OVERLAPPING at both points. The
+spec's stop condition governs; the knob was NOT landed.
+
+**The premise was wrong.** The 22.6 us per launch that motivated the row is a
+MEAN over a bimodal distribution: `min 1.34 / med 18.88 / max 979.78 / stddev
+47.69 us`. Prefill launches drag the mean up; our DECODE SiluAndMul is ~1.3 us,
+FASTER per launch than the ~2.45 us vLLM mean it was compared against. There was
+no 9.2x gap, and the "3.6 percentage points of glue" scoped around it does not
+survive either.
+
+This is the documented prefill/decode mixing trap, not applied when the spec was
+written. **Read the DISTRIBUTION (min/med/max/stddev) before quoting any
+per-launch ratio** — a mean over a bimodal kernel is not a per-launch cost. The
+same discipline that withdrew the marlin 2.7% applies here: the next attempt
+needs a decode-only window on BOTH engines under ONE tool.
+
+The 35B mid-band therefore stands at two landed levers (`VT_MARLIN_DENSE_PAIR`
++1.31%, `VT_SHARED_DOWN_BF16` +2.05%) with the remaining ~5% UNATTRIBUTED.
