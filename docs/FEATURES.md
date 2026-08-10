@@ -25,7 +25,7 @@ are our reading of their documented behavior, not measurements.
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 30 registered, 25+ gated | 130+ | 100+ | 100+ |
+| Architectures | 35 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; full hosted dry run and first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
@@ -78,7 +78,7 @@ are our reading of their documented behavior, not measurements.
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers from its own translation unit via
 `REGISTER_VLLM_MODEL`, and `scripts/check-supported-models.py` gates this list
-against the source so it can never drift. Today that is **30 registered
+against the source so it can never drift. Today that is **35 registered
 architectures**. Each row names the concrete checkpoint it was gated against and
 the honest verdict; per-arch lifecycle caveats are in [STATUS.md](STATUS.md) and
 the agent-facing detail is in `.agents/model-matrix.md`.
@@ -152,8 +152,10 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
 
-25 of the 30 registered text-generation architectures carry a passing
+27 of the 31 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
+(The 35 registered total also covers 3 Parakeet ASR entry points and the
+`LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live
 (`LlamaModel`, task=embed, LAST pooling, the as_embedding_model mirror, gated
@@ -167,11 +169,14 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
 | Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT; ref2va ckpt-limited (§8.12); GGUF/NVFP4/bf16 loaders; ABI v12 `vllm_video_*` uses generic `DeviceType` dispatch (DSR 32) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
-| Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
+| Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 
-Image, video and audio are correct through the CLI and library. Serving them
-over the HTTP API is the named open gap: the vision tower is not yet folded into
-the registered engine forward.
+Image, video and audio are correct through the CLI and library. Over the HTTP
+API the image **request** path is wired end to end (`ROAD-V1-MM` W1-W3): the
+production server attaches the seam at `server_main.cpp:826`. Two residuals keep
+it from ✅: the model runner has no mm-forward consuming `Request.mm_features`,
+and no image codec is vendored (raw RGB only). Video, audio and multi-image over
+HTTP are not started.
 
 ## Speculative decoding
 
@@ -207,7 +212,7 @@ the registered engine forward.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
+| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; builds on ROCm 6.x with the CLR hostcall fix, #201/#132; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ W2, OPT-125m STRICT 6/6 e2e ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`, `ACTIVE`) | ✅ | ☐ | ☐ |
 
@@ -221,8 +226,9 @@ dispatched natively with **zero provider declines**. Qwen3.6-27B runs too, both
 GDN recurrences and the fused attention preamble native, its GDN state cache in
 place, and its RMSNorm 1024-wide: **decode 4.24 tok/s vs llama.cpp's 4.35,
 prefill 21.5x** (GB10). A load keeps **one** copy of the weights, not two: 27B
-peak RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 native kernels
-plus 8 GDN, the rest on the portable CPU tier; quant/MoE/MLA have none at all.
+peak RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 natively
+registered ops of 112 (8 are GDN), the rest on the portable CPU tier;
+quant/MoE/MLA have none at all.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations
@@ -256,6 +262,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
 | Video+audio generation (MiniMax-H3) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv` | reachable |
 | Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
+| Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v17) | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out
@@ -283,12 +290,13 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Runner fold LANDS (ROW 7 §21, #122): the ENGINE/SERVER surface serves Kimi at the 122/128 golden profile (engine==CLI 128/128); STRICT stays closed (intrinsic p7 near-tie)** | server 19.0 tok/s wall / CLI 18.9 vs vLLM ~21 (~0.90×), speed residual named (§21) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
-| Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
+| Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
 | ROCm | W0 verified by community, model e2e pending | Backend + platform + 1 op, ctest-green on gfx1151/1103/1100/1201 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix in (managed allocs, unverified); M2 unblocks with it. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
+| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | Partial | Portable ROCm seam. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited) + `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables). Nine tuning vars internal; defaults unchanged |
 
 ## How to read this page
 
@@ -310,5 +318,3 @@ backends in scope as inventoried rows. Neither changed a capability, so **no
 mark on this page moved**. An inventoried backend is not a supported one, and the same
 holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
 are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
-
-| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | partial | Portable ROCm seam. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited) + `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables). Nine tuning vars internal; defaults unchanged. |
