@@ -240,6 +240,42 @@ byte-for-byte (verified by an empty `git diff`) and the gate re-run green:
 | iRoPE mask counted forward instead of backward from the last layer | 5 assertions RED |
 | Legacy sandwich-norm renames applied in the wrong order (swapping post-attention with pre-feedforward) | 1 assertion RED |
 
+## 9. W1 readiness — the primitive map (surveyed 2026-08-10, no code yet)
+
+Every primitive the text tower needs already exists, so W1 is a mechanical port
+against `gemma2.cpp` (407 lines) rather than new kernel work. `gemma2.cpp` is the
+template: its sandwich-norm decoder layer is structurally identical to Muse's.
+
+| Muse mechanism | Existing primitive | Note |
+|---|---|---|
+| Sandwich norms with baked `+1` | `vt::RmsNormArgs{eps, gemma=true}` | `gemma=true` IS the `(1+w)` offset |
+| Split pre/post eps | two `RmsNormArgs` values | the ONE delta vs gemma2, which uses a single eps |
+| SwiGLU MLP | `layers::UnquantizedMlpGateUpMethod` | gemma2 uses the `...GeluMethod` sibling; Muse is silu |
+| Attention output gate | `vt::kSigmoidGateBf16` (FusedChain) | already used by Qwen3.5; `attn * sigmoid(gate)` |
+| Sliding vs full attention | `vt::PagedAttentionArgs::window_size` | gemma2 threads this per layer already |
+| RoPE | `vt::RopeNeox` | skip entirely on NoPE layers |
+| Weightless QK-norm / embed_norm | `vt::RmsNorm` with a ones weight | no weightless variant exists; a ones buffer is the cheap path |
+
+Deltas from the `gemma2.cpp` template, each a place to get it wrong:
+
+1. **Embedding scale.** Gemma multiplies by `sqrt(hidden)`; Muse instead applies a
+   weightless RMSNorm (`embed_norm`, `muse_glimmer.py:1286`). Different operation,
+   same slot.
+2. **Split eps.** Pre-norms take `rms_norm_eps`, post-norms `post_norm_eps`.
+   gemma2 threads one eps everywhere.
+3. **Attention scale.** Muse uses plain `head_dim**-0.5`, NOT gemma2's
+   `query_pre_attn_scalar**-0.5`; the query pre-scale is applied separately to q
+   after QK-norm.
+4. **iRoPE.** RoPE and sliding-window travel TOGETHER on `no_rope_layers[l]==1`;
+   NoPE layers are full attention. gemma2's sliding split is independent of RoPE.
+5. **The gate reads the normed layer input** (`dhn`), not the attention output.
+6. **`lm_head` is untied** and there is an `output_multiplier` before the final
+   soft-cap.
+
+The post-attention and post-feedforward norms must stay STANDALONE, exactly as
+gemma2 documents: they are sublayer-output norms with no residual add, so folding
+them onto `kFusedAddRmsNorm` would be an incorrect fold.
+
 **What W0 does NOT establish.** No forward runs, so nothing here says the model
 produces correct tokens. The KV-cache spec is a documented placeholder: the real
 sliding/full split rides the Gemma-4 per-layer spec seam and lands with W1. And
