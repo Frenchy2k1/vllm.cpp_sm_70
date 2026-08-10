@@ -278,9 +278,13 @@ On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
 `weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
 GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
 head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
-2.543 GB on `nvidia/Qwen3.6-27B-NVFP4`. Set `VT_LMHEAD_FP4=0` for a same-binary
-A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF and
-`tie_word_embeddings` heads are unaffected by either setting.
+2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
+GiB, a 1.70 GiB saving). The head runs W4A16 under both namings: the on-disk
+activation divisor next to it (`input_scale`, or `input_global_scale` in the
+compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
+matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a
+same-binary A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF
+and `tie_word_embeddings` heads are unaffected by either setting.
 
 ### Validating a staged release archive
 

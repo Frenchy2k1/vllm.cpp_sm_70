@@ -202,6 +202,12 @@ struct Nvfp4Weight {
   // path. Uploaded once from the persistent `alpha` member; the diagnostic host
   // scalar path leaves this null.
   mutable std::shared_ptr<void> d_alpha;
+  // Lazily-populated DEQUANTIZED bf16 [K=in, N=out] Matmul-B operand for the
+  // backends with NO fp4 GEMM (CPU / Vulkan / Metal fall through to `vt::Matmul`
+  // on a dequantized copy). Built ONCE and kept for the model lifetime like
+  // `d_packed`: per call it would rewrite K*N bf16 a step (~2.54 GB for the 27B
+  // head). Never populated on CUDA, where Marlin / vt::MatmulNvfp4 read packed.
+  mutable std::shared_ptr<void> d_dequant_b;
 };
 
 // Device-resident per-tensor FP8 (W8A8) weight — the 35B attn q/k/v/o + GDN

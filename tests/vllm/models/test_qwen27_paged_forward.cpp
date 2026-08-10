@@ -1341,3 +1341,63 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
     CHECK(d < 1e-4);
   }
 }
+
+// PERF-27B-LMHEAD-FP4 (issue #213). The PAGED forward has TWO lm_head call
+// sites — the gathered (prefill/mixed) and the non-gathered full [T,vocab] arm —
+// and a PACKED NVFP4 head leaves the bf16 owner EMPTY, so reverting either site
+// to it hands the logits GEMM an empty tensor. The packed head's gate
+// (test_qwen27_dense_lmhead_fp4) pins its NUMERICS but runs only the EAGER
+// ForwardDense; this pins that both PAGED arms SELECT it.
+Nvfp4Weight MakePackedHead(int64_t n, int64_t k, uint64_t seed) {
+  Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.scale2 = 0.125F;  // ModelOpt weight_scale_2 IS the scale
+  w.packed = MakeOwned(DType::kI8, {n, k / 2}, seed);
+  w.scale = MakeOwned(DType::kI8, {n, k / 16}, seed + 1);
+  // MakeOwned fills f32/bf16 patterns; fp4 operands are raw bytes.
+  auto* pb = reinterpret_cast<uint8_t*>(w.packed.bytes.data());
+  for (size_t i = 0; i < w.packed.bytes.size(); ++i)
+    pb[i] = static_cast<uint8_t>((i * 37U + 11U) & 0x77U);
+  const uint8_t kE4M3PowersOfTwo[4] = {0x34, 0x38, 0x3C, 0x40};  // .25 .5 1 2
+  auto* sb = reinterpret_cast<uint8_t*>(w.scale.bytes.data());
+  for (size_t i = 0; i < w.scale.bytes.size(); ++i)
+    sb[i] = kE4M3PowersOfTwo[i & 3U];
+  return w;
+}
+
+TEST_CASE("qwen27 dense paged: both lm_head arms run a PACKED NVFP4 head") {
+  const HfConfig c = MakeConfig();
+  const int64_t T = 5, V = c.vocab_size;
+  Qwen3_5DenseWeights w = MakeWeights(c);
+  w.lm_head_fp4 = MakePackedHead(V, c.hidden_size, 4242);
+
+  const std::vector<int32_t> ids{3, 11, 7, 20, 5}, pos{0, 1, 2, 3, 4};
+  vt::Queue q = Q();
+  const std::vector<float> eager =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, c, q);
+  REQUIRE(eager.size() == static_cast<size_t>(T * V));
+
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+
+  // Non-gathered arm: empty logits_indices -> the full [T, vocab].
+  {
+    CachePool pool(c, 4, 8);
+    const std::vector<float> full = Qwen3_5DenseModel::Forward(
+        ids, pos, am, gm, pool.attn_kv, pool.gdn_state, w, c, q, {});
+    REQUIRE(full.size() == eager.size());
+    CHECK(MaxAbsDiff(full, eager, full.size()) < 1e-3);
+  }
+  // Gathered arm: the prefill shape the engine actually runs -> [1, vocab].
+  {
+    CachePool pool(c, 4, 8);
+    const std::vector<float> got =
+        Qwen3_5DenseModel::Forward(ids, pos, am, gm, pool.attn_kv,
+                                   pool.gdn_state, w, c, q,
+                                   {static_cast<int32_t>(T - 1)});
+    REQUIRE(got.size() == static_cast<size_t>(V));
+    const std::vector<float> tail(eager.end() - V, eager.end());
+    CHECK(MaxAbsDiff(got, tail, got.size()) < 1e-3);
+  }
+}

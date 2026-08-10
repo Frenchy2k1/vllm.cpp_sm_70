@@ -103,11 +103,12 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
 void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
                          vt::Queue& queue) {
   (void)config;
-  // PERF-27B-LMHEAD-FP4 (issue #213): build the packed lm_head's Marlin resident
-  // HERE, before the runner ever captures a decode graph. Inert on every
+  // PERF-27B-LMHEAD-FP4 (issue #213): build the packed lm_head's resident HERE —
+  // on CUDA before the runner ever captures a decode graph, and on a backend
+  // with no fp4 GEMM before the first forward pays the dequant. Inert on every
   // BF16/FP8/GGUF/tied dense checkpoint. Mirrors PrepareQwen3_5Moe.
   auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
-  Qwen3_5DenseModel::PrepareMarlinResident(qwen.weights(), queue);
+  Qwen3_5DenseModel::PrepareLmHeadResident(qwen.weights(), queue);
 }
 
 ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
