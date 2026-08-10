@@ -9,11 +9,12 @@ cmake_minimum_required(VERSION 3.24)
 # configuring clean — are proven on the gate host and recorded in the row's
 # spec.
 #
-# Scratch fixtures live under a temporary root OUTSIDE the checkout, because
+# Scratch fixtures live under a unique temporary root OUTSIDE the checkout:
 # `cmake -P` sets CMAKE_CURRENT_BINARY_DIR to the invoker's cwd, which under CI
-# is the repository root. A FATAL_ERROR aborts the script immediately, so the
-# end-of-run cleanup below cannot run on failure; putting the fixtures in the
-# system temp directory keeps that residue out of the tree either way.
+# is the repository root. `_expect` also RECORDS failures instead of raising
+# them, so the run always reaches its own cleanup and always reports every
+# failing cell rather than only the first one; the single FATAL_ERROR comes
+# after the fixtures are gone.
 
 get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
 get_filename_component(_root "${_here}/.." ABSOLUTE)
@@ -29,30 +30,34 @@ string(RANDOM LENGTH 10 ALPHABET "abcdefghijklmnopqrstuvwxyz0123456789" _tag)
 set(_scratch "${_tmp_root}/vllm-triton-aot-default-test-${_tag}")
 file(REMOVE_RECURSE "${_scratch}")
 
+set_property(GLOBAL PROPERTY VT_TRITON_DEFAULT_TEST_FAILURES "")
+
+function(_fail MESSAGE)
+  set_property(GLOBAL APPEND PROPERTY VT_TRITON_DEFAULT_TEST_FAILURES "${MESSAGE}")
+endfunction()
+
 function(_expect CASE EXPECTED_DEFAULT EXPECTED_REASON_SUBSTRING
          CUDA_ENABLED VENDORED_DIR SOURCE_ROOT REGEN)
   vt_triton_aot_computed_default(_default _reason
     "${CUDA_ENABLED}" "${VENDORED_DIR}" "${SOURCE_ROOT}" "${REGEN}")
   if(NOT _default STREQUAL EXPECTED_DEFAULT)
-    message(FATAL_ERROR
-      "${CASE}: expected default ${EXPECTED_DEFAULT}, got '${_default}'")
+    _fail("${CASE}: expected default ${EXPECTED_DEFAULT}, got '${_default}'")
+    return()
   endif()
   if(EXPECTED_REASON_SUBSTRING STREQUAL "")
     if(NOT _reason STREQUAL "")
-      message(FATAL_ERROR
-        "${CASE}: an enabling cell must carry no decline reason, got '${_reason}'")
+      _fail("${CASE}: an enabling cell must carry no decline reason, got '${_reason}'")
     endif()
-  else()
-    if(_reason STREQUAL "")
-      message(FATAL_ERROR
-        "${CASE}: a declining cell must name the condition that declined it")
-    endif()
-    string(FIND "${_reason}" "${EXPECTED_REASON_SUBSTRING}" _pos)
-    if(_pos LESS 0)
-      message(FATAL_ERROR
-        "${CASE}: decline reason must mention '${EXPECTED_REASON_SUBSTRING}', "
-        "got '${_reason}'")
-    endif()
+    return()
+  endif()
+  if(_reason STREQUAL "")
+    _fail("${CASE}: a declining cell must name the condition that declined it")
+    return()
+  endif()
+  string(FIND "${_reason}" "${EXPECTED_REASON_SUBSTRING}" _pos)
+  if(_pos LESS 0)
+    _fail("${CASE}: decline reason must mention "
+      "'${EXPECTED_REASON_SUBSTRING}', got '${_reason}'")
   endif()
 endfunction()
 
@@ -88,7 +93,7 @@ _expect("no-vendored-tree" OFF "sm_121a" ON "${_scratch}/empty" "${_root}" OFF)
 vt_triton_aot_available_arches(_arches)
 list(LENGTH _arches _n_arches)
 if(NOT _n_arches EQUAL 6)
-  message(FATAL_ERROR "expected six vendored trees, got ${_n_arches}")
+  _fail("expected six vendored trees, got ${_n_arches}")
 endif()
 file(MAKE_DIRECTORY "${_scratch}/partial")
 foreach(_arch IN LISTS _arches)
@@ -208,5 +213,13 @@ _expect("synth-arch-mismatch" OFF "sm_121a" ON
   "${_fixture}/vendored" "${_fixture}" OFF)
 
 file(REMOVE_RECURSE "${_scratch}")
+
+get_property(_failures GLOBAL PROPERTY VT_TRITON_DEFAULT_TEST_FAILURES)
+if(_failures)
+  list(LENGTH _failures _n_failures)
+  list(JOIN _failures "\n  " _failures_text)
+  message(FATAL_ERROR
+    "Triton AOT default matrix: ${_n_failures} FAILED\n  ${_failures_text}")
+endif()
 
 message(STATUS "Triton AOT default matrix: ALL PASS")
