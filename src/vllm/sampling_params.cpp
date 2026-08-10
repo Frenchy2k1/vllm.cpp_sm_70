@@ -32,6 +32,17 @@ SamplingType SamplingParams::Type() const {
   return SamplingType::kRandom;
 }
 
+// num_logprobs (property, sampling_params.py:724-729). `logprobs` if set, else
+// len(logprob_token_ids) if set (Python truthiness: an EMPTY list is falsy and
+// yields None), else unset.
+std::optional<int> SamplingParams::num_logprobs() const {
+  if (logprobs.has_value()) return logprobs;
+  if (logprob_token_ids.has_value() && !logprob_token_ids->empty()) {
+    return static_cast<int>(logprob_token_ids->size());
+  }
+  return std::nullopt;
+}
+
 void SamplingParams::Verify() const {
   if (n < 1) {
     throw std::runtime_error("n must be at least 1, got " + std::to_string(n) +
@@ -116,6 +127,29 @@ void SamplingParams::Verify() const {
     throw std::runtime_error(
         "prompt_logprobs must be non-negative or -1, got " +
         std::to_string(*prompt_logprobs) + ".");
+  }
+  // logprob_token_ids (_validate_logprobs, sampling_params.py:773-801). Two of
+  // upstream's three checks need no model config and are enforced here; the
+  // third — every id within [0, vocab_size) (:783-793) — does, so it stays
+  // engine-time exactly like the allowed_token_ids vocab-range check above.
+  // The sampler bounds each id against the live vocab anyway (mirroring what
+  // torch.gather raises on), so an out-of-range id is a loud error there, never
+  // a read past the logprobs row.
+  if (logprob_token_ids.has_value()) {
+    const int n_ids = static_cast<int>(logprob_token_ids->size());
+    if (n_ids > kMaxLogprobTokenIds) {
+      throw std::runtime_error(
+          "Requested logprob_token_ids of length " + std::to_string(n_ids) +
+          ", which is greater than max allowed: " +
+          std::to_string(kMaxLogprobTokenIds));
+    }
+    if (logprobs.has_value() && *logprobs != n_ids) {
+      throw std::runtime_error(
+          "When both logprobs and logprob_token_ids are set, logprobs must "
+          "equal len(logprob_token_ids). Got logprobs=" +
+          std::to_string(*logprobs) +
+          ", len(logprob_token_ids)=" + std::to_string(n_ids) + ".");
+    }
   }
   // stop_token_ids element type is enforced by std::vector<int32_t>.
   for (const std::string& stop_str : stop) {

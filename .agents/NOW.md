@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-09 -->
+<!-- now-updated: 2026-08-10 -->
 
 Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
@@ -26,6 +26,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
+| `SAMPLE-LOGPROB-TOKEN-IDS` | explicit-id scoring LANDED (#264), `PARTIAL` | `logprobs_mode` #258; OpenAI field |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** verbatim weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head need the device |
@@ -52,8 +53,7 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    `nano_nemotron_vl.py`; the transducer half is NOT in vLLM: separate call).
 2. **Qwen3.5-4B sm_120:** rebased branch is GREEN and reprofiled. Spike the
    residual 1.609x conv gap; latency/VRAM and gate models stay open.
-2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
-   CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
+3. **Invocation-parity prevention:** merge it; the claim row has the rest.
 4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
 5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
    `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
