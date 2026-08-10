@@ -20,6 +20,7 @@ from tools.bench.online_gate import (
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
+    MODEL_GATE_CONTRACTS,
     MODEL_REVISIONS,
     OUTPUT_LEN,
     PANDAS_VERSION,
@@ -228,13 +229,25 @@ def _write_fixture(root: pathlib.Path) -> None:
     model_gate = root / "preflight" / "model-gate"
     model_gate.mkdir(parents=True)
     gate_log = model_gate / "27.log"
-    gate_log.write_text("100% tests passed\n", encoding="utf-8")
+    # A real ctest -V log: the proof line the gate prints only after it has
+    # compared tokens. A checkpoint-absent run exits 0 without it, which is how
+    # a skipped precondition used to be recorded as passed.
+    gate_log.write_text(
+        f"{MODEL_GATE_CONTRACTS['test_qwen27_paged_engine']['proof']}\n"
+        "100% tests passed\n",
+        encoding="utf-8",
+    )
     (model_gate / "27.json").write_text(
         json.dumps(
             {
+                "golden_covers_benched_checkpoint": True,
+                "golden_revision": MODEL_GATE_CONTRACTS["test_qwen27_paged_engine"][
+                    "golden_revision"
+                ],
                 "log": str(gate_log),
                 "log_sha256": sha256_file(gate_log),
                 "model_key": "27",
+                "model_revision": MODEL_REVISIONS["27"],
                 "passed": True,
                 "test_name": "test_qwen27_paged_engine",
                 "vllm_cpp_sha": sha,
@@ -494,6 +507,51 @@ class OnlineGateSummaryTests(unittest.TestCase):
             path.write_text(json.dumps(execution), encoding="utf-8")
             runs, _ = self._summarize_model(root)
             self.assertFalse(runs["gate_pass"])
+
+    def test_model_gate_scope_must_be_recorded_and_consistent(self) -> None:
+        """A gate that skipped, or whose scope is silent, cannot pass.
+
+        `test_qwen27_paged_engine` returns 0 when its checkpoint is absent, so
+        without the proof line the summary would accept zero tokens compared as
+        a correctness precondition -- the expected shape for key "27n", whose
+        goldens are a DIFFERENT checkpoint's on purpose.
+        """
+        gate_json = pathlib.Path("preflight") / "model-gate" / "27.json"
+        gate_log = pathlib.Path("preflight") / "model-gate" / "27.log"
+        mutations = {
+            "golden revision": lambda s: s.__setitem__("golden_revision", "0" * 40),
+            "benched revision": lambda s: s.__setitem__("model_revision", "0" * 40),
+            "scope flag": lambda s: s.__setitem__(
+                "golden_covers_benched_checkpoint", False
+            ),
+            "scope field absent": lambda s: s.pop("golden_covers_benched_checkpoint"),
+            "revision field absent": lambda s: s.pop("golden_revision"),
+            "unknown gate": lambda s: s.__setitem__("test_name", "invented_gate"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                _write_fixture(root)
+                path = root / gate_json
+                status = json.loads(path.read_text(encoding="utf-8"))
+                mutate(status)
+                path.write_text(json.dumps(status), encoding="utf-8")
+                runs, _ = self._summarize_model(root)
+                self.assertFalse(runs["gate_pass"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            log = root / gate_log
+            log.write_text("100% tests passed\n", encoding="utf-8")
+            status = json.loads((root / gate_json).read_text(encoding="utf-8"))
+            status["log_sha256"] = sha256_file(log)
+            (root / gate_json).write_text(json.dumps(status), encoding="utf-8")
+            runs, _ = self._summarize_model(root)
+            self.assertFalse(runs["gate_pass"])
+            self.assertIn(
+                "model-gate log carries no proof that a token was compared",
+                json.dumps(runs),
+            )
 
     def test_model_selection_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
