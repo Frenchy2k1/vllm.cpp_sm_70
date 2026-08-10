@@ -364,6 +364,20 @@ with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. See
 [MiniMax-H3: video + audio generation](#minimax-h3-video--audio-generation).
 
+### `max_tokens`: what a non-positive value means
+
+Some clients (Hermes among them) send `max_tokens: -1` to mean "no client-side
+limit". A non-positive `max_tokens` — or `max_completion_tokens` on
+`/v1/chat/completions`, which takes precedence — is treated as **unset**, not as
+an error and not as a clamp to some constant. Unset then generates up to
+`max_model_len` minus the prompt length, mirroring vLLM.
+
+That distinction is load-bearing for long-context requests: substituting a
+constant would cap exactly the request that asked to be left unlimited, and the
+client would see `finish_reason: length` with no way to tell it apart from a
+limit it set itself. Use `VT_SERVER_MAX_NEW_TOKENS` when you want a serving-side
+ceiling.
+
 ### Server flags
 
 | Flag | Default | Meaning |
