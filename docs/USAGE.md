@@ -233,10 +233,20 @@ the config parse and weight-name mapping be tested before the forward exists.
 
 `MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` no longer belong
 in that table: both towers forward and the perception encoder is wired, so an
-image or video prompt runs instead of refusing. That is reachability, not
-verification — no checkpoint has been run end to end, and the pinned oracle
-cannot load `muse_glimmer` at all, so no output of this model has been checked
-against a reference and no speed number exists for it.
+image or video prompt runs instead of refusing. The text tower has been checked
+on the released 30B checkpoint against a standalone torch transcription of the
+upstream source and matches it token for token, but that is not the model's own
+runtime: the pinned oracle cannot load `muse_glimmer` at all. The perception
+encoder has no such check, nothing has been run end to end through the server,
+and no speed number exists for this model.
+A `modelopt_mixed` checkpoint (`nvidia/Qwen3.6-27B-NVFP4`, and the 35B-A3B that
+shares the tower) keeps its `linear_attn` input projections in FP8 W8A8, and
+those two per-layer projections are packed into ONE merged `in_proj_qkvz` GEMM,
+mirroring vLLM's `MergedColumnParallelLinear`. The merge only fires when the two
+shards carry a bitwise-identical per-tensor `input_scale`, since one GEMM
+quantizes the activation once; a checkpoint whose scales differ keeps the two
+separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
+in the same binary.
 
 ## OpenAI-compatible server
 
@@ -313,6 +323,24 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 `VT_CPU_QUANT_REPACK`; `auto` uses Linux HWCAP/HWCAP2 or Darwin feature sysctls,
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
+
+### NVFP4 dense sinks
+
+The `E=1` dense NVFP4 projections run on vLLM's own dense Marlin GEMM rather
+than the single-expert grouped-MoE route, which pays `moe_align` bookkeeping and
+row padding for a problem that has neither. `VT_MARLIN_DENSE` covers the single
+projections and `VT_MARLIN_DENSE_PAIR` the fused shared-expert gate_up sink;
+both default ON, opt out with `=0`. The pair sink was the last one still on the
+MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
+throughput changes; the routed experts still use the grouped MoE kernel, which
+is where they belong.
+
+The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
+f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
+bf16 in-kernel — which is exact — and re-round through bf16 on store, so the
+f32 form was writing and re-reading a whole `[T,H]` buffer for a value it
+already had. The change is bit-identical and worth **+2.05% at c8**.
 
 ### The NVFP4 output head
 

@@ -11,8 +11,10 @@ blocking anyone, and feature code must not reach main without a row/* PR.
 from __future__ import annotations
 
 import argparse
+import builtins
 import concurrent.futures
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -48,6 +50,69 @@ def run_role(repo: Path, session: str, *args: str):
         [sys.executable, str(ROLE_SCRIPT), *args],
         cwd=repo, env=env, capture_output=True, text=True,
     )
+
+
+# The publisher half of the OUTSIDE OBSERVER (see
+# `test_a_concurrent_observer_never_sees_the_record_name_absent`). It runs in its
+# own process so the observing test process can watch the published name with no
+# knowledge of which I/O primitives the publish uses.
+#
+# 2000 publishes at ~0.16ms each (see the child loop below) put the window under
+# observation at ~0.33s, against ~1us per `exists()` poll. The count is SIZED
+# from measurement, not chosen for margin. MEASURED 2026-08-10 on a 20-core box
+# at load average ~200, against the publish that only this half can catch
+# (bytes first, unlink by basename, rename the temp in), 20 runs per cell:
+#
+#   publishes | multi-core | one core (taskset -c 3) | clean run, multi / one
+#         200 |  16/20 RED |                6/20 RED | 0.25s / 0.23s
+#         800 |  19/20 RED |               14/20 RED | 0.37s / 0.44s
+#        2000 |  20/20 RED |               20/20 RED | 0.71s / 0.80s
+#
+# Unmutated stayed 0/3 RED at every count in both regimes. 2000 is the first
+# count that is not probabilistic in EITHER regime, and it costs ~0.5s over 200
+# on a suite that runs in ~5s -- which is why the single-core residual #296
+# recorded is closed here rather than recorded again.
+_OBSERVED_PUBLISHES = 2000
+
+# A wedged child must FAIL this test, not hang the suite. The publish loop takes
+# ~0.33s plus interpreter start; 60s is over two orders of magnitude of
+# headroom, so reaching it means the child stopped making progress, and the test
+# says so instead of spinning until someone kills the run.
+_OBSERVER_DEADLINE_SECONDS = 60.0
+_OBSERVED_WINDOW_SECONDS = 0.33
+
+_OBSERVED_PUBLISH_LOOP = '''
+import importlib.util, sys
+from pathlib import Path
+
+script, count = Path(sys.argv[1]), int(sys.argv[2])
+spec = importlib.util.spec_from_file_location("agent_role", script)
+role = importlib.util.module_from_spec(spec)
+sys.modules["agent_role"] = role
+spec.loader.exec_module(role)
+
+# The publish's FILE sequence is the subject, so both `git rev-parse` calls on
+# the publish path are hoisted out of the loop: `worktree_id` (via
+# `record_path`) and `common_dir` (via `records_dir`). Caching only the first
+# leaves the second, and MEASURED on a 20-core box at load average 184
+# (2026-08-10) that is where nearly all the time was going:
+#   * worktree_id cached only          1.467 ms/publish
+#   * both cached                      0.163 ms/publish
+#   * one bare `git rev-parse`         1.041 ms
+# i.e. 89% of the window a half-cached child offers the observer is the
+# subprocess it is not supposed to be measuring. Both answers are constant for
+# one repo and `record_path`/`records_dir` are their only consumers here, so no
+# path this test looks at changes -- it just stops being diluted.
+worktree = role.worktree_id()
+role.worktree_id = lambda: worktree
+common = role.common_dir()
+role.common_dir = lambda: common
+
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+for _ in range(count):
+    role.write_our_record()
+'''
 
 
 class _TempRepo:
@@ -544,6 +609,18 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
     `unlink(target); target.write_text(new)`: a new inode leaves the hardlink
     witness intact and no temp is left, but the NAME is transiently absent,
     which is neither the old record nor the new one.
+
+    A fourth round (issue #296) found the same pattern once more, and stopped
+    repeating it. Round 3's NAME watcher named four primitives, so a publish
+    written `os.rename(target, aside)` then `open(target, "w")` escaped all 59
+    tests while a concurrent `show` against the slowed window really did return
+    `rc=3, role=UNDECLARED` -- MEASURED here: the pre-#296 suite is 59/59 GREEN
+    under that mutation. Any watcher is escapable by one more primitive, so
+    widening the list cannot be the whole answer. The pin is now two tests that
+    fail differently: `_watch_publish` names more primitives and catches every
+    one of them deterministically, and
+    `test_a_concurrent_observer_never_sees_the_record_name_absent` enumerates
+    nothing and can therefore catch the next primitive nobody thought of.
     """
 
     def test_a_publish_replaces_the_record_and_never_rewrites_it_in_place(self) -> None:
@@ -591,6 +668,111 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
         finally:
             os.chdir(saved)
 
+    def _watch_publish(self, publish) -> tuple[list[str], list[str]]:
+        """Run `publish` with the record's name watched from INSIDE the process.
+
+        Returns (written-while-absent, name-removals). Both must be empty.
+
+        Two families can make the published name stop resolving: removing it
+        (`unlink`/`remove`) and renaming it AWAY (`rename`/`replace` with the
+        record as SOURCE -- `os.replace(temp, target)`, the shipped publish, has
+        it as destination and never removes it). Content writes are watched too,
+        because a create that finds the name missing proves it was absent an
+        instant earlier whichever call removed it.
+
+        This half is DETERMINISTIC and only ever as complete as the list below.
+        Every round of review has fixed one residual here and created the next
+        escape: the hardlink and residue pins fell to `unlink` + `write_text`,
+        which fell to `os.rename` + `open`. That is why the list is not the whole
+        pin -- see `test_a_concurrent_observer_never_sees_the_record_name_absent`,
+        which enumerates nothing.
+        """
+        absent_when_writing: list[str] = []
+        removed: list[str] = []
+        real = {
+            "write_text": Path.write_text,
+            "path_unlink": Path.unlink,
+            "path_rename": Path.rename,
+            "path_replace": Path.replace,
+            "os_unlink": os.unlink,
+            "os_remove": os.remove,
+            "os_rename": os.rename,
+            "os_replace": os.replace,
+            "os_open": os.open,
+            "io_open": io.open,
+        }
+
+        saved = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            target = role.record_path()
+
+            def writing(path) -> None:
+                if not target.exists():
+                    absent_when_writing.append(str(path))
+
+            def removing(path) -> None:
+                if Path(path) == target:
+                    removed.append(str(path))
+
+            def watched_write_text(path, *args, **kwargs):
+                writing(path)
+                return real["write_text"](path, *args, **kwargs)
+
+            def watched_io_open(file, mode="r", *args, **kwargs):
+                if any(character in mode for character in "wax+"):
+                    writing(file)
+                return real["io_open"](file, mode, *args, **kwargs)
+
+            def watched_os_open(path, flags, *args, **kwargs):
+                if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+                    writing(path)
+                return real["os_open"](path, flags, *args, **kwargs)
+
+            def watched_path_unlink(path, *args, **kwargs):
+                removing(path)
+                return real["path_unlink"](path, *args, **kwargs)
+
+            def watched_os_unlink(path, *args, **kwargs):
+                removing(path)
+                return real["os_unlink"](path, *args, **kwargs)
+
+            def watched_os_remove(path, *args, **kwargs):
+                removing(path)
+                return real["os_remove"](path, *args, **kwargs)
+
+            def watched_path_rename(path, *args, **kwargs):
+                removing(path)
+                return real["path_rename"](path, *args, **kwargs)
+
+            def watched_path_replace(path, *args, **kwargs):
+                removing(path)
+                return real["path_replace"](path, *args, **kwargs)
+
+            def watched_os_rename(source, *args, **kwargs):
+                removing(source)
+                return real["os_rename"](source, *args, **kwargs)
+
+            def watched_os_replace(source, *args, **kwargs):
+                removing(source)
+                return real["os_replace"](source, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", watched_write_text), \
+                    mock.patch.object(Path, "unlink", watched_path_unlink), \
+                    mock.patch.object(Path, "rename", watched_path_rename), \
+                    mock.patch.object(Path, "replace", watched_path_replace), \
+                    mock.patch.object(os, "unlink", watched_os_unlink), \
+                    mock.patch.object(os, "remove", watched_os_remove), \
+                    mock.patch.object(os, "rename", watched_os_rename), \
+                    mock.patch.object(os, "replace", watched_os_replace), \
+                    mock.patch.object(os, "open", watched_os_open), \
+                    mock.patch.object(io, "open", watched_io_open), \
+                    mock.patch.object(builtins, "open", watched_io_open):
+                publish()
+        finally:
+            os.chdir(saved)
+        return absent_when_writing, removed
+
     def test_a_publish_never_leaves_the_record_NAME_absent(self) -> None:
         # The two tests above both survive `target.unlink(); target.write_text()`
         # (review mutation MINE-B, 2026-08-10): a fresh inode leaves the hardlink
@@ -599,63 +781,156 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
         # neither "the old record" nor "the new one" -- a `show` landing in the
         # window reports an operator marker with no record and exits 3.
         #
-        # So the NAME is watched rather than the bytes. Polling for the window
-        # would be a race; instead the publish is observed from inside: at the
-        # instant any file content is written, the published path must already
-        # resolve, and nothing may unlink it. Both hold for temp + os.replace,
-        # and neither holds for unlink-then-create. The record has to exist
-        # first -- "old or new, never absent" says nothing about the first
-        # publish, which has no old.
+        # So the NAME is watched rather than the bytes. The claim this test can
+        # actually support is bounded by `_watch_publish`'s list: of the
+        # primitives named there, none may remove the published name, and none
+        # may write content while that name does not resolve. It holds for
+        # temp + os.replace and fails for unlink-then-create and for
+        # rename-aside-then-create. The record has to exist first -- "old or new,
+        # never absent" says nothing about the first publish, which has no old.
         run_role(self.repo, "a", "claim", "operator")
 
-        absent_when_writing: list[str] = []
-        unlinked: list[str] = []
-        real_write_text = Path.write_text
-        real_path_unlink = Path.unlink
-        real_os_unlink = os.unlink
-        real_os_remove = os.remove
-
-        saved = os.getcwd()
-        os.chdir(self.repo)
-        try:
-            target = role.record_path()
-
-            def watched_write_text(path, *args, **kwargs):
-                if not target.exists():
-                    absent_when_writing.append(str(path))
-                return real_write_text(path, *args, **kwargs)
-
-            def watched_path_unlink(path, *args, **kwargs):
-                if Path(path) == target:
-                    unlinked.append(str(path))
-                return real_path_unlink(path, *args, **kwargs)
-
-            def watched_os_unlink(path, *args, **kwargs):
-                if Path(path) == target:
-                    unlinked.append(str(path))
-                return real_os_unlink(path, *args, **kwargs)
-
-            def watched_os_remove(path, *args, **kwargs):
-                if Path(path) == target:
-                    unlinked.append(str(path))
-                return real_os_remove(path, *args, **kwargs)
-
-            with mock.patch.object(Path, "write_text", watched_write_text), \
-                    mock.patch.object(Path, "unlink", watched_path_unlink), \
-                    mock.patch.object(os, "unlink", watched_os_unlink), \
-                    mock.patch.object(os, "remove", watched_os_remove):
-                role.write_our_record()
-        finally:
-            os.chdir(saved)
+        absent_when_writing, removed = self._watch_publish(role.write_our_record)
 
         self.assertEqual(
-            unlinked, [],
-            "the publish UNLINKED the record name; a reader in that window sees "
-            "an operator marker with no record, not the old record")
+            removed, [],
+            "the publish REMOVED the record name (unlink, or rename away); a "
+            "reader in that window sees an operator marker with no record, not "
+            f"the old record: {removed}")
         self.assertEqual(
             absent_when_writing, [],
             "the new bytes were written while the record name did not exist, so "
             f"the name was transiently absent: {absent_when_writing}")
+
+    def test_a_concurrent_observer_never_sees_the_record_name_absent(self) -> None:
+        # The other half, and the only half that needs no enumeration. A separate
+        # process republishes this worktree's record `_OBSERVED_PUBLISHES` times
+        # while THIS process does nothing but ask whether the published name
+        # resolves. Any publish that removes the name -- by any primitive, named
+        # or not, including whichever one escapes the watcher next -- is visible
+        # from out here.
+        #
+        # It is deliberately ONE-SIDED: a hit proves the name was absent, a miss
+        # proves nothing. That asymmetry is the point. The observer cannot go red
+        # on correct code, because `os.replace` never lets the name stop
+        # resolving no matter how the two processes are scheduled; scheduling can
+        # only cost SENSITIVITY, never produce a false failure. So it is safe
+        # under CI contention in the way a timing assertion never is.
+        #
+        # RE-MEASURED 2026-08-10 at this file's `_OBSERVED_PUBLISHES` on a
+        # 20-core box already at load average 185 (multi-core) and 262 (both
+        # processes pinned to one core with `taskset -c 3`), 10 runs per cell:
+        #                                              multi-core  single core
+        #   * `os.rename` + `open`                          10/10        9/10
+        #   * `unlink` + `write_text`                       10/10       10/10
+        #   * bytes first, unlink by BASENAME, rename the
+        #     temp in -- the one shape NO watcher arm sees  10/10       10/10
+        #   * byte-at-a-time IN-PLACE rewrite                0/10        0/10
+        #   * unmutated                                      0/10        0/10
+        #                                        (zero absent readings, both)
+        # The third row is why this half exists at all: it satisfies the
+        # hardlink and residue pins and trips no `_watch_publish` arm --
+        # `writing` sees the name still present, and both removals arrive as a
+        # relative basename that does not compare equal to the absolute target
+        # -- so the observer is the ONLY test that fails on it. The fourth row
+        # is the converse: this half is blind BY CONSTRUCTION to a publish that
+        # never makes the name absent, which is
+        # `test_a_publish_replaces_the_record_and_never_rewrites_it_in_place`'s
+        # subject. The watcher above holds the line deterministically on every
+        # primitive it names; this holds it on the ones nobody named. Neither
+        # subsumes the other, and only the pair covers both.
+        run_role(self.repo, "a", "claim", "operator")
+        saved = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            target = role.record_path()
+        finally:
+            os.chdir(saved)
+        self.assertTrue(target.exists(), "nothing was published to observe")
+        # Non-vacuity, checked at the end: `absent == 0` also holds for a future
+        # publish that stops touching this path at all, and the `exists()` guard
+        # above only proves the path existed BEFORE. The record carries the
+        # writer's pid and a fresh heartbeat, so requiring the bytes to change
+        # proves the name the observer watched is the name that was republished.
+        before = target.read_bytes()
+
+        # Child output goes to FILES, never to a pipe nobody reads. An unread
+        # `subprocess.PIPE` deadlocks as soon as the child fills the pipe buffer
+        # (65536 bytes here), and this child forks `git rev-parse` per publish,
+        # so a few hundred bytes of warning per publish from anyone's unrelated
+        # change is enough to cross it. MEASURED 2026-08-10 against the shipped,
+        # correct publish with the pipe in place: 391 bytes of child stderr per
+        # publish never completed at all -- killed at 90s, rc=124, spinning a
+        # core -- while 155 bytes/publish (~31KB, under the pipe) passed in
+        # 0.41s. A file has no capacity to fill, so no volume of child output
+        # can wedge the observer, and the text still survives for the failure
+        # message. Everything below is additionally bounded by a wall-clock
+        # deadline, so a child that stops making progress FAILS this test in
+        # bounded time instead of hanging a suite everyone has to pass.
+        logs = tempfile.TemporaryDirectory()
+        self.addCleanup(logs.cleanup)
+        out_path = Path(logs.name) / "publisher.out"
+        err_path = Path(logs.name) / "publisher.err"
+        deadline = time.monotonic() + _OBSERVER_DEADLINE_SECONDS
+
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            publisher = subprocess.Popen(
+                [sys.executable, "-c", _OBSERVED_PUBLISH_LOOP,
+                 str(ROLE_SCRIPT), str(_OBSERVED_PUBLISHES)],
+                cwd=self.repo, stdout=out, stderr=err)
+
+        def wedged(what: str) -> None:
+            publisher.kill()
+            publisher.wait()
+            self.fail(
+                f"the publisher {what} within {_OBSERVER_DEADLINE_SECONDS:.0f}s "
+                f"(~{_OBSERVER_DEADLINE_SECONDS / _OBSERVED_WINDOW_SECONDS:.0f}x "
+                f"the measured window for {_OBSERVED_PUBLISHES} publishes); "
+                f"killed. "
+                f"stderr: {err_path.read_text(encoding='utf-8', errors='replace')[-2000:]!r}")
+
+        try:
+            # Import and both `git rev-parse` calls happen before "ready", so
+            # the observed window is publishes and nothing else.
+            while not out_path.read_bytes().startswith(b"ready\n"):
+                if publisher.poll() is not None:
+                    break  # died before signalling; the returncode check reports it
+                if time.monotonic() > deadline:
+                    wedged("never signalled ready")
+            absent = 0
+            polls = 0
+            while publisher.poll() is None:
+                polls += 1
+                if not target.exists():
+                    absent += 1
+                # Every 4096 polls (~4ms of polling), so the deadline costs the
+                # hot loop nothing measurable and still resolves to milliseconds.
+                if polls % 4096 == 0 and time.monotonic() > deadline:
+                    wedged("never finished publishing")
+        finally:
+            if publisher.poll() is None:
+                publisher.kill()
+            publisher.wait()
+        errors = err_path.read_text(encoding="utf-8", errors="replace")
+
+        self.assertEqual(publisher.returncode, 0, errors)
+        # A floor for the observer having LOOKED at all, not a timing assertion:
+        # the measured count is 148k-257k polls per run (multi-core and pinned
+        # to one core alike, load average 312), so this is under 2% of it and
+        # can only fire if the poll loop did not run.
+        self.assertGreater(polls, _OBSERVED_PUBLISHES,
+                           "the observer never got to look; sensitivity unknown")
+        self.assertEqual(
+            absent, 0,
+            f"a concurrent observer saw the published record name NOT resolve "
+            f"{absent} times in {polls} polls across {_OBSERVED_PUBLISHES} "
+            "publishes: that window is an operator marker with no record")
+        self.assertTrue(target.exists(), "the publishes left no record behind")
+        self.assertNotEqual(
+            target.read_bytes(), before,
+            "the record is byte-identical to the one the claim wrote, so the "
+            "publishes did not touch the name this test observed and "
+            "`absent == 0` says nothing")
 
     def test_a_reclaim_never_unlinks_its_own_record(self) -> None:
         # Re-claim must REPLACE, never unlink-then-create. With the publish

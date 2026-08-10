@@ -96,7 +96,12 @@ python3 scripts/package-server.py \
   --metadata-dir "$metadata_dir" \
   --archive "$archive"
 if [[ "$backend" == cuda ]]; then
-  cuda_stub_runtime_dir=$(scripts/prepare-cuda-driver-stub.sh /usr/local/cuda "$release_dir/cuda-driver-stub")
+  cuda_stub_validation_dir=$(mktemp -d)
+  cleanup_cuda_stub_validation_dir() {
+    rm -rf -- "$cuda_stub_validation_dir"
+  }
+  trap cleanup_cuda_stub_validation_dir EXIT
+  cuda_stub_runtime_dir=$(scripts/prepare-cuda-driver-stub.sh /usr/local/cuda "$cuda_stub_validation_dir")
   export LD_LIBRARY_PATH="$cuda_stub_runtime_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 python3 scripts/validate-release-archive.py \

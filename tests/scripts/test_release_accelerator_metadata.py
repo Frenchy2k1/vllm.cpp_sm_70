@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -113,16 +114,112 @@ class AcceleratorMetadataContract(unittest.TestCase):
                     self.tool.prepare_accelerator_metadata(args)
                 (args.build_dir / "CMakeCache.txt").write_text(cache, encoding="utf-8")
 
-    def test_cuda_archive_smoke_resolves_only_the_external_driver_stub(self) -> None:
-        script = BUILD_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn(
-            'scripts/prepare-cuda-driver-stub.sh /usr/local/cuda "$release_dir/cuda-driver-stub"',
-            script,
-        )
-        self.assertIn(
-            'export LD_LIBRARY_PATH="$cuda_stub_runtime_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
-            script,
-        )
+    def test_cuda_archive_smoke_uses_external_cleaned_driver_stub_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            repo = scratch / "repo"
+            scripts = repo / "scripts"
+            fake_bin = scratch / "bin"
+            log = scratch / "log"
+            external_runtime = scratch / "external-runtime"
+            scripts.mkdir(parents=True)
+            fake_bin.mkdir()
+            log.mkdir()
+            shutil.copy2(BUILD_SCRIPT, scripts / BUILD_SCRIPT.name)
+            (repo / "include").mkdir()
+            (repo / "include/vllm.h").write_text(
+                "#define VLLM_ABI_VERSION 17\n",
+                encoding="utf-8",
+            )
+
+            shims = {
+                "cmake": """#!/bin/sh
+if [ "${1:-}" = --version ]; then
+  echo 'cmake version 3.30.0'
+fi
+""",
+                "ninja": """#!/bin/sh
+echo '1.12.0'
+""",
+                "c++": """#!/bin/sh
+echo 'c++ (GCC) 13.2.0'
+""",
+                "mktemp": """#!/bin/sh
+printf '%s\n' "$*" > "$TEST_LOG/mktemp.args"
+mkdir -p "$TEST_EXTERNAL_RUNTIME"
+printf '%s\n' "$TEST_EXTERNAL_RUNTIME"
+""",
+                "python3": """#!/bin/sh
+if [ "${1:-}" = scripts/validate-release-archive.py ]; then
+  printf '%s\n' "$@" > "$TEST_LOG/validate.args"
+  printf '%s\n' "${LD_LIBRARY_PATH:-}" > "$TEST_LOG/validate.ld-library-path"
+  exit 23
+fi
+""",
+            }
+            for name, content in shims.items():
+                path = fake_bin / name
+                path.write_text(content, encoding="utf-8")
+                path.chmod(0o755)
+
+            stub_prep = scripts / CUDA_STUB_PREP.name
+            stub_prep.write_text(
+                """#!/bin/sh
+printf '%s\n' "$2" > "$TEST_LOG/stub-runtime.arg"
+mkdir -p "$2/canonical-runtime"
+realpath "$2/canonical-runtime"
+""",
+                encoding="utf-8",
+            )
+            stub_prep.chmod(0o755)
+
+            build_dir = "build-release-cuda-x86"
+            env = dict(os.environ)
+            env.update(
+                {
+                    "EVIDENCE_URL": "https://github.com/mudler/vllm.cpp/actions/runs/1",
+                    "LD_LIBRARY_PATH": "/host/runtime",
+                    "PATH": f"{fake_bin}:{env['PATH']}",
+                    "SOURCE_DATE_EPOCH": "0",
+                    "SOURCE_SHA": SHA,
+                    "TEST_EXTERNAL_RUNTIME": str(external_runtime),
+                    "TEST_LOG": str(log),
+                    "VERSION": "0.0.1",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    f"scripts/{BUILD_SCRIPT.name}",
+                    "linux-x86_64-glibc-cuda-fat",
+                    "cuda",
+                    build_dir,
+                ],
+                cwd=repo,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            mktemp_log = log / "mktemp.args"
+            self.assertTrue(
+                mktemp_log.exists(),
+                "release driver did not allocate the CUDA validation runtime with mktemp",
+            )
+            self.assertEqual(mktemp_log.read_text(encoding="utf-8").strip(), "-d")
+            self.assertEqual(
+                (log / "stub-runtime.arg").read_text(encoding="utf-8").strip(),
+                str(external_runtime),
+            )
+            self.assertFalse(external_runtime.exists(), "validation runtime was not cleaned on failure")
+            self.assertEqual(
+                (log / "validate.ld-library-path").read_text(encoding="utf-8").strip(),
+                f"{external_runtime}/canonical-runtime:/host/runtime",
+            )
+            validate_args = (log / "validate.args").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(validate_args[-2:], ["--forbid-path", str(repo / build_dir)])
 
     def test_cuda_driver_stub_preparation_adds_runtime_soname_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

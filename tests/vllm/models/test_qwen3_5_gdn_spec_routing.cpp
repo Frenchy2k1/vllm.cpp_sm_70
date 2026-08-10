@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -391,5 +392,177 @@ TEST_CASE("GDN MIXED spec+prefill routing (CUDA): mixed batch matches pure spec 
   vt::GetBackend(vt::DeviceType::kCUDA);
   RunMixedRoutingCase(vt::DeviceType::kCUDA, kGate27B, /*bit_exact=*/false);
   RunMixedRoutingCase(vt::DeviceType::kCUDA, kGate35B, /*bit_exact=*/false);
+}
+
+// PERF-27B-GDN-FP8-QKVZ, the numerical contract: ONE merged fp8 GEMM over the
+// N-concatenated [qkv;z] operand must produce EXACTLY the concatenation of the
+// two legacy per-shard fp8 GEMM outputs. Both arms run in one process over one
+// uploaded activation and one set of resident bytes, so the comparison is
+// bitwise. The merged output is f32 (the dtype the split mixed_qkv GEMM already
+// emits) and z is cast to the split arm's own output dtype, so nothing about the
+// split arithmetic is traded for the shape change.
+//
+// Two weight-scale regimes, because they take different code paths inside the
+// merged GEMM: EQUAL folded alphas fold into the GEMM scalar, DIFFERENT ones go
+// through the resident per-output-column alpha vector.
+//
+// AT THE GATE SHAPES, and only there, per the spec's Tests §2. The shape is
+// load-bearing and not an incidental parameter. The production fp8 GEMM is
+// cuBLASLt (`VT_DENSE_CUBLASLT_FP8`, default ON), and its kernel is chosen per
+// (M,N,K) by cublasLtMatmulAlgoGetHeuristic — a choice that includes the SPLIT-K
+// factor, i.e. how many partial K-reductions get summed afterwards. Measured on
+// `sm_121a` with VT_GEMM_ALGO_LOG=1:
+//
+//   27B  M=1  merged n=16384 k=5120 splitK=1 | qkv n=10240 splitK=1 | z n=6144 splitK=1
+//   toy  M=3  merged n=320   k=256  splitK=1 | qkv n=192   splitK=4 | z n=128  splitK=8
+//
+// At the gate shapes all three GEMMs reduce K in ONE pass, so the merge is
+// bitwise exact (measured 0/16384 differing at 27B M=1, 0/49152 at M=3). At a
+// toy N the heuristic splits K four ways for one shard and eight ways for the
+// other while the wider merged N stays at one — three DIFFERENT summation
+// orders, and no single merged launch can reproduce two of them at once, so
+// bitwise equality is unattainable there for a reason that has nothing to do
+// with this code. That was confirmed by rerunning the toy shape on the
+// shape-invariant CUTLASS fp8 GEMM (VT_DENSE_CUBLASLT_FP8=0), where merged and
+// split agree bitwise in all four regimes; under cuBLASLt they differ by at
+// most 128 ULP / 8.4e-06 relative, the size of f32 reassociation and nothing
+// more. So the precondition this case rests on is: the gate shapes' N and K are
+// large enough that cuBLASLt needs no split-K to fill the device. If a future
+// cuBLASLt or driver starts splitting K here, this case goes red — which is the
+// correct signal, because the merged and split arms would then genuinely no
+// longer be the same arithmetic.
+TEST_CASE("GDN merged FP8 qkvz == the two split fp8 GEMMs, bitwise") {
+  vt::GetBackend(vt::DeviceType::kCUDA);  // skip cleanly if no device
+
+  // The real GDN input-projection shapes of both gate checkpoints:
+  // nvidia/Qwen3.6-27B-NVFP4@0893e160 (hidden 5120, Hk16/Dk128, Hv48/Dv128) and
+  // nvidia/Qwen3.6-35B-A3B-NVFP4@491c2f1e (hidden 2048, Hv32) — the same FP8
+  // tower, and the one the spec requires be run alongside the 27B.
+  struct GateShape {
+    GdnDims dims;
+    int64_t hidden;
+  };
+  const GateShape gates[] = {{kGate27B, 5120}, {kGate35B, 2048}};
+
+  const float shared_input_scale = 0.0078125F;
+  for (const GateShape& gate : gates) {
+    const int64_t H = gate.hidden;
+    const int64_t value_dim = gate.dims.hv * gate.dims.dv;
+    const int64_t conv_dim = 2 * gate.dims.hk * gate.dims.dk + value_dim;
+
+    const auto make_fp8 = [&](int64_t n, uint64_t seed, float weight_scale) {
+      vllm::Fp8Weight f;
+      f.n = n;
+      f.k = H;
+      f.input_scale = shared_input_scale;
+      f.weight_scale = weight_scale;
+      f.alpha = shared_input_scale * weight_scale;
+      f.packed.dtype = DType::kI8;
+      f.packed.rank = 2;
+      f.packed.shape[0] = n;
+      f.packed.shape[1] = H;
+      f.packed.bytes.resize(static_cast<size_t>(n * H));
+      auto* bytes = f.packed.bytes.data();
+      for (int64_t i = 0; i < n * H; ++i) {
+        // e4m3 byte patterns with the sign/exponent bits exercised; 0x7f/0xff
+        // are NaN in e4m3fn, so keep the mantissa/exponent below that.
+        bytes[static_cast<size_t>(i)] = static_cast<uint8_t>(
+            Mix(seed + static_cast<uint64_t>(i)) % 0x7EU);
+      }
+      return f;
+    };
+
+    for (const bool same_weight_scale : {true, false}) {
+      // One set of resident bytes per weight-scale regime, reused across the
+      // token counts below: the shards are tens of megabytes at these shapes.
+      GdnLayerWeights w;
+      w.in_proj_qkv_fp8 = make_fp8(conv_dim, 101, 0.00390625F);
+      w.in_proj_z_fp8 =
+          make_fp8(value_dim, 202, same_weight_scale ? 0.00390625F : 0.015625F);
+
+      // T=1 is the decode step this row is measured on; T=3 is a short prefill,
+      // which the heuristic sees as a different M and may answer differently.
+      for (const int64_t T : {int64_t{1}, int64_t{3}}) {
+        std::vector<float> h(static_cast<size_t>(T * H));
+        for (size_t i = 0; i < h.size(); ++i)
+          h[i] = RandV(9000 + static_cast<uint64_t>(i), -0.5F, 0.5F);
+        for (const bool z_bf16 : {true, false}) {
+          CAPTURE(H);
+          CAPTURE(conv_dim);
+          CAPTURE(value_dim);
+          CAPTURE(same_weight_scale);
+          CAPTURE(T);
+          CAPTURE(z_bf16);
+          const std::vector<float> merged = vllm::ProjectGdnFp8QkvzForTest(
+              Q(vt::DeviceType::kCUDA), w, h, T, conv_dim, value_dim,
+              /*merged=*/true, z_bf16);
+          const std::vector<float> split = vllm::ProjectGdnFp8QkvzForTest(
+              Q(vt::DeviceType::kCUDA), w, h, T, conv_dim, value_dim,
+              /*merged=*/false, z_bf16);
+          REQUIRE(merged.size() == split.size());
+          size_t bad = 0;
+          size_t first_bad = 0;
+          for (size_t i = 0; i < merged.size(); ++i) {
+            if (std::memcmp(&merged[i], &split[i], sizeof(float)) != 0) {
+              if (bad == 0) first_bad = i;
+              ++bad;
+            }
+          }
+          if (bad != 0) {
+            CAPTURE(first_bad);
+            CAPTURE(merged[first_bad]);
+            CAPTURE(split[first_bad]);
+          }
+          CHECK(bad == 0);
+        }
+      }
+    }
+  }
+}
+
+// The merged operand must exist BEFORE the first forward — a resident built
+// inside a CUDA-graph capture allocates and copies mid-capture, which aborts
+// the capture. PrepareGdnFp8Resident is registered on the dense prepare hook and
+// is what guarantees it; deleting that call leaves d_qkvz_fp8_packed null here.
+TEST_CASE("GDN merged FP8 qkvz resident is built pre-capture, at prepare") {
+  vt::GetBackend(vt::DeviceType::kCUDA);  // skip cleanly if no device
+  const int64_t H = 256;
+  const HfConfig c = MakeConfig(kGate27B, H);
+  const int64_t value_dim = kGate27B.hv * kGate27B.dv;
+  const int64_t conv_dim = 2 * kGate27B.hk * kGate27B.dk + value_dim;
+
+  const auto make_fp8 = [&](int64_t n, uint64_t seed) {
+    vllm::Fp8Weight f;
+    f.n = n;
+    f.k = H;
+    f.input_scale = 0.0078125F;
+    f.weight_scale = 0.00390625F;
+    f.alpha = f.input_scale * f.weight_scale;
+    f.packed.dtype = DType::kI8;
+    f.packed.rank = 2;
+    f.packed.shape[0] = n;
+    f.packed.shape[1] = H;
+    f.packed.bytes.resize(static_cast<size_t>(n * H));
+    auto* bytes = f.packed.bytes.data();
+    for (int64_t i = 0; i < n * H; ++i)
+      bytes[static_cast<size_t>(i)] = static_cast<uint8_t>(
+          Mix(seed + static_cast<uint64_t>(i)) % 0x7EU);
+    return f;
+  };
+
+  vllm::Qwen3_5DenseWeights weights;
+  vllm::Qwen3_5DenseLayerWeights layer;
+  layer.is_linear_attention = true;
+  layer.gdn.in_proj_qkv_fp8 = make_fp8(conv_dim, 11);
+  layer.gdn.in_proj_z_fp8 = make_fp8(value_dim, 22);
+  weights.layers.push_back(std::move(layer));
+
+  REQUIRE_FALSE(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_packed));
+  vt::Queue q = Q(vt::DeviceType::kCUDA);
+  vllm::Qwen3_5DenseModel::PrepareGdnFp8Resident(weights, c, q);
+  CHECK(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_packed));
+  // Equal folded alphas: the alpha vector is folded into the GEMM scalar and no
+  // second resident is allocated.
+  CHECK_FALSE(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_alpha));
 }
 #endif
