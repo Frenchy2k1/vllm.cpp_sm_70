@@ -206,6 +206,51 @@ to include it plus transformers 5.15. No ceiling is declared
   refuse; the axis is an open gap by construction.
 - Weight download or GPU time beyond what is already authorised → stop and ask.
 
+## 6.5 REAL-WEIGHTS RESULT — our text tower agrees with an independent
+transcription on the released checkpoint (2026-08-10)
+
+The first evidence for this model that comes from the actual released weights
+rather than a synthetic fixture.
+
+**Reference.** `scripts/mm/muse_glimmer_text_ref.py` transcribes the upstream
+forward (vllm#51655 head `075d645af`) into plain torch, with no `transformers`
+and no `vllm` import, and runs it on the checkpoint's own safetensors. It exists
+because nothing on either box can load this model: released transformers does
+not register `model_type: muse_glimmer`, the checkpoint ships no remote-code
+file, and the parity pin has no `muse_glimmer` at all.
+
+**Full-depth reference sanity (52 layers, real weights).** Prompt "The capital of
+France is" produces argmax `[" key", " of", " the", " is", " Paris"]`, last
+position top-2 17.086 vs 13.445, `|logit|` max 18.66 under the 20.0 soft cap. A
+coherent, correct continuation is good evidence the transcription is faithful.
+It also independently confirms two things W0/W1 had to infer: `scale_query_by`
+resolves to 3.87, and the derived iRoPE mask agrees with the checkpoint's own
+`layer_types` / `layer_rope_theta` encoding.
+
+**Our C++ vs that reference (reduced depth 4/52, real weights).**
+
+| Measure | Result |
+|---|---|
+| Tensor accounting | **51 / 51** enumerated names present |
+| argmax | `27389 110709 32485 122967 152652` — **identical both sides** |
+| max abs logit difference | 0.0889745 |
+| cosine | 0.999981 |
+| assertions | **1,010,282 passed**, 0 failed |
+
+**A verification trap worth recording.** With the env gates unset the same binary
+reports "3 test cases, 3 passed, 15 assertions" — it looks green while comparing
+nothing, because the heavy cases return early and doctest counts them as passed
+rather than skipped. The assertion count is the tell: a real comparison is over a
+million assertions, a no-op is fifteen. Never read this gate's pass/fail without
+reading its assertion count.
+
+**What this is NOT.** Not token-exact against the model's own runtime — no such
+runtime exists here to be exact against, so this is agreement with an independent
+transcription of the same upstream source, which is a weaker claim than a true
+oracle gate and is recorded as such. Not a full-depth comparison of our forward
+(the 52-layer arm needs ~55.7 GB resident and is a named residual). Not any kind
+of speed result; no denominator exists.
+
 ## 7. Outcome
 
 Pending overall.
