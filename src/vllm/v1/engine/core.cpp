@@ -3,6 +3,9 @@
 // deviations and deferrals.
 #include "vllm/v1/engine/core.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <cassert>
 #include <cstdlib>
 #include <memory>
@@ -107,6 +110,12 @@ void EngineCore::post_step(bool model_executed) {
     return;
   }
   std::optional<DraftTokenIds> draft_token_ids = executor_.take_draft_token_ids();
+  static const bool spec_post_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+  if (spec_post_trace) {
+    std::fprintf(stderr, "[spec-post_step] pulled=%d rows=%zu\n",
+                 draft_token_ids.has_value() ? 1 : 0,
+                 draft_token_ids.has_value() ? draft_token_ids->req_ids.size() : 0);
+  }
   if (draft_token_ids.has_value()) {
     scheduler_.update_draft_token_ids(*draft_token_ids);
   }

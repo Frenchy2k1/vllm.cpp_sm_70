@@ -480,7 +480,12 @@ STATUS_RATCHET = {
     # per-arch vendoring note and the default note were collapsed to their
     # binding results and the RISK split out beside them, so the new claim costs
     # the page nothing. Net -6, re-pinned byte-tight.
-    "chars": 243578,
+    #
+    # 2026-08-10 (SPEC-DSPARK): the DSpark paragraph moves to the measured state
+    # (works on the 35B gate model, spec-on output token-identical to spec-off,
+    # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
+    # merge, so the reduction cannot become untracked growth headroom.
+    "chars": 243572,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

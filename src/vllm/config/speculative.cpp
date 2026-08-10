@@ -41,11 +41,15 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   // checkpoint) and the block-derived k from the model config. "ngram" needs no
   // draft model; "draft_model" needs a separate `model` checkpoint (below).
   // Any other method is still rejected at this pin.
+  // SPEC-DSPARK W1: accept "dspark" — the semi-autoregressive BLOCK drafter that
+  // extends DFlash with a Markov logit-bias head (speculative.py:62,310;
+  // dspark/speculator.py:37). Like DFlash it names a SEPARATE draft checkpoint,
+  // so it requires the `model` key below.
   if (cfg.method != "mtp" && cfg.method != "dflash" && cfg.method != "ngram" &&
-      cfg.method != "draft_model") {
+      cfg.method != "draft_model" && cfg.method != "dspark") {
     throw std::invalid_argument(
-        "speculative-config: only methods \"mtp\", \"dflash\", \"ngram\" and "
-        "\"draft_model\" are supported at this pin (got \"" +
+        "speculative-config: only methods \"mtp\", \"dflash\", \"dspark\", "
+        "\"ngram\" and \"draft_model\" are supported at this pin (got \"" +
         cfg.method + "\")");
   }
 
@@ -92,6 +96,17 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
     throw std::invalid_argument(
         "speculative-config: method \"dflash\" requires a \"model\" key naming "
         "the DFlash draft checkpoint (path or HF repo id)");
+  }
+  // SPEC-DSPARK W1: the in-scope DSpark drafts (Qwen3 + Gemma4 families) are
+  // SEPARATE checkpoints exactly like DFlash — e.g.
+  // deepseek-ai/dspark_qwen3_4b_block7 (speculative.py:875). The DeepSeek-V4
+  // variant that ships its draft inside the target checkpoint
+  // (speculative.py:706-709) is out of scope for this row (hardware-blocked), so
+  // the key is required here.
+  if (cfg.method == "dspark" && !cfg.draft_model_path.has_value()) {
+    throw std::invalid_argument(
+        "speculative-config: method \"dspark\" requires a \"model\" key naming "
+        "the DSpark draft checkpoint (path or HF repo id)");
   }
   // SPEC-DRAFT-MODEL: the generic draft model is a SEPARATE standalone
   // checkpoint, so it likewise requires the `model` key (speculative.py:692-701;

@@ -19,8 +19,10 @@ namespace vllm::v1 {
 
 EngineCoreProc::EngineCoreProc(Scheduler& scheduler, Executor& executor,
                                StructuredOutputManager* structured_output_manager,
-                               int max_concurrent_batches, int shutdown_timeout_s)
-    : EngineCore(scheduler, executor, structured_output_manager),
+                               int max_concurrent_batches, int shutdown_timeout_s,
+                               bool check_for_draft_tokens)
+    : EngineCore(scheduler, executor, structured_output_manager,
+                 check_for_draft_tokens),
       shutdown_timeout_s_(shutdown_timeout_s) {
   // core.py:196-223: batch_queue_size = max_concurrent_batches; the batch queue
   // is enabled only when > 1, which flips step_fn to step_with_batch_queue.
@@ -190,8 +192,18 @@ bool EngineCoreProc::process_engine_step() {
     out.outputs = std::move(engine_core_outputs);
     output_queue.put_nowait(std::move(out));
   }
-  // core.py:1308 post_step(model_executed) — deferred (spec-decode draft
-  // tokens; the sync EngineCore has no post_step yet, core.py:510-517).
+  // core.py:1308 post_step(model_executed). NO LONGER DEFERRED. This is the
+  // step the proc loop owes the drafter: it pulls the out-of-band drafts the
+  // worker proposed this step and installs them on the scheduler so the NEXT
+  // step verifies them. Without it a speculator proposes every step and every
+  // proposal is dropped — the engine still produces correct output, just one
+  // token per step while paying the draft cost, which is exactly how it was
+  // found (SPEC-DSPARK W6: 24 proposals, 0 installs, 5.5x slower).
+  //
+  // Idempotent by construction: take_draft_token_ids moves pending_drafts_ out,
+  // so the `step()` path calling post_step internally and this call cannot
+  // double-install, and a step that proposed nothing pulls nullopt.
+  post_step(model_executed);
 
   // core.py:1314: `if not model_executed and self.scheduler.has_requests():`
   // yield briefly (upstream: lets KV-connector background threads take the GIL;

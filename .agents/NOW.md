@@ -12,7 +12,8 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| State record (#166) | **157 imports = 3,231,342 exact bytes** at `776c56f1`; 95/95; prior 156 wrappers/rows preserved; raw-row guard | Force-update #166; rerun readiness |
+| `SPEC-DSPARK` | **WORKS on 35B**: ON==OFF 48/48. ★fixed engine-wide draft-drop | Draft step ~6x a target step |
+| State record (#166) | **157 imports = 3,231,342 exact bytes** at `776c56f1`; 95/95; raw-row guard | Force-update #166; rerun readiness |
 | Laguna NVFP4 / DeepSeek-V4 decode | **CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **0.72x -> 0.85x**: FP8 tower native, tokens MATCH, RSS -3.2 GiB | NVFP4 MLP marlin, 68% of roof |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%), a GATE model | Fold into the 35B lever |
@@ -27,8 +28,8 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
-| Vulkan 27B | decode **MET 4.36 vs 4.35** (barriers OFF). **LOADMEM: load held the model TWICE, VmRSS 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
-| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
+| Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
+| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): model, runner, ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
