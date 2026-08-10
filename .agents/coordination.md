@@ -157,6 +157,28 @@ No retroactive waiver is being written: the budget breach is real and the honest
 record of it is this note. The lesson for the next row is that a 6-slice claim
 should land as 6 PRs.
 
+**AsyncLLM serving-path metric wiring (`SERVE-METRICS`, 2026-08-10,
+`CLAIM-SERVE-METRICS-ASYNC`).** Claude Code (claude-opus-5), helper role,
+isolated worktree `/home/mudler/_git/vllm.cpp-metrics-async`, branch
+`row/SERVE-METRICS-ASYNC`, rebased forward as main landed (base `abdc3a26` at
+creation, `488fca89` at push). PUSHED `e8a7624f`, PR
+[#297](https://github.com/mudler/vllm.cpp/pull/297). Issue
+[#277](https://github.com/mudler/vllm.cpp/issues/277), spec
+[`.agents/specs/async-metrics.md`](specs/async-metrics.md). Closes the
+`ROAD-V1-C8` residual "AsyncLLM serving-path metric wiring": the production
+server serves `/metrics` off `AsyncLLM`, whose output handler folds nothing into
+the `PrometheusStatLogger`, so a real deployment scrapes a well-formed catalog
+whose series never move. Owns `src/vllm/v1/engine/async_llm.cpp`,
+`include/vllm/v1/engine/async_llm.h`, the `step_with_batch_queue` stat stamp in
+`src/vllm/v1/engine/core.cpp`, the recorder mutex in
+`{include,src}/vllm/v1/metrics/loggers.{h,cpp}`, the async attach in
+`src/vllm/entrypoints/openai/server_main.cpp`, the stale residual comments in
+`{include,src}/vllm/entrypoints/openai/api_server.{h,cpp}`, new cases in
+`tests/vllm/v1/test_async_llm.cpp`, and the `SERVE-METRICS` /
+`SERVE-RESPONSE-METRICS` records. EXCLUDED and untouched: the config-gated
+metric families (spec-decode / kv-connector / mm / LoRA), which are the sibling
+residual on the same row. CPU-only gate; no GPU, no model, no checkpoint.
+
 **DSpark speculative decoding (`SPEC-DSPARK`, 2026-08-09, `CLAIM-SPEC-DSPARK`).**
 Claude Code (opus-5), helper role, isolated worktree
 `/home/mudler/_git/vllm.cpp-spec-dspark`, branch `row/SPEC-DSPARK`, base

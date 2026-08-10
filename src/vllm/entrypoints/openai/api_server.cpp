@@ -1194,10 +1194,15 @@ void ConfigureUtilityEndpoints(ApiServer& server,
         });
   }
 
-  // /metrics and /reset_prefix_cache are deliberately NOT wired here — the
-  // production AsyncLLM frontend exposes no live PrometheusStatLogger and no
-  // thread-safe prefix-cache reset RPC (see the header block comment +
-  // specs/{utility,admin}-endpoints.md). They stay 404, byte-identical to before.
+  // /metrics is not wired HERE because it is not a utility endpoint: the caller
+  // owns the PrometheusStatLogger's lifetime and attaches it to both frontends
+  // plus set_metrics_logger (server_main.cpp). Since #277 that logger IS live
+  // on the AsyncLLM serving path, so /metrics reports real counts.
+  //
+  // /reset_prefix_cache stays deliberately unwired: reset_prefix_cache() lives
+  // only on the scheduler's KVCacheManager, mutated exclusively on the
+  // EngineCore engine thread, with no thread-safe RPC to reach it (see the
+  // header block comment + specs/{utility,admin}-endpoints.md). It stays 404.
 }
 
 }  // namespace vllm::entrypoints::openai

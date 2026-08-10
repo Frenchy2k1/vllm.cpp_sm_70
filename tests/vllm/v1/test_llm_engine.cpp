@@ -1003,6 +1003,153 @@ TEST_CASE("llm_engine: per-request queue/prefill/inference timing populates") {
   CHECK(queue_sum > 0.0);
 }
 
+// ─── 7b. The SAME invariants on the ASYNC serving path (SERVE-METRICS, #277) ──
+// Cases 6 and 7 drive `LLMEngine`. The shipped server does not: it serves from
+// `AsyncLLM` (server_main.cpp -> loaded->async_engine()), whose output handler
+// folded nothing into any logger — so a real deployment scraped a well-formed
+// `vllm:*` catalog whose series never moved, which reads as "idle" rather than
+// as "missing". This drives the ASYNC stack over the identical model, prompts
+// and sampling params as case 6 and asserts the identical invariants, plus case
+// 7's per-request timing algebra.
+//
+// Mirrors async_llm.py:662-665 (build IterationStats), :676-678 (thread it into
+// process_outputs) and :697-702 (fold it + scheduler_stats into the logger).
+//
+// The scrape happens after `shutdown()` joins the output-handler thread. That is
+// the quiescence point: unlike upstream's asyncio handler — which runs to its
+// next `await` before a woken consumer resumes, so `record()` always precedes
+// the consumer — our handler is a real thread, and a drained collector says
+// nothing about whether the fold for that step has retired.
+//
+// RED before the wiring: every value below is 0 (the primed schema, not counts).
+TEST_CASE("async_llm: live per-step stats populate the Prometheus registry") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 4;  // max_tokens per request (length stop), as in case 6.
+
+  AsyncHarness h(c, w, tok);
+  PrometheusStatLogger logger("m", kMaxModelLen);
+  h.engine.set_stat_logger(&logger);
+
+  const std::string kRun = std::string("vllm:num_requests_running") + kL;
+  const std::string kWait = std::string("vllm:num_requests_waiting") + kL;
+  const std::string kPrompt = std::string("vllm:prompt_tokens_total") + kL;
+  const std::string kGen = std::string("vllm:generation_tokens_total") + kL;
+  const std::string kSuccessLen =
+      "vllm:request_success_total{model_name=\"m\",engine=\"0\",finished_reason="
+      "\"length\"}";
+  const char* kQueue = "vllm:request_queue_time_seconds";
+  const char* kPrefill = "vllm:request_prefill_time_seconds";
+  const char* kInference = "vllm:request_inference_time_seconds";
+  const char* kDecode = "vllm:request_decode_time_seconds";
+  const char* kE2E = "vllm:e2e_request_latency_seconds";
+
+  // Baseline: primed at zero — exactly the state a production scrape saw.
+  {
+    const std::string t = logger.Expose();
+    CHECK(MetricValue(t, kPrompt) == 0.0);
+    CHECK(MetricValue(t, kGen) == 0.0);
+    CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 0);
+    CHECK(HistogramCount(t, kE2E) == 0);
+    CHECK(HistogramSum(t, kQueue) == 0.0);
+  }
+
+  // Both requests are admitted before either is drained, so they share the
+  // prefill step exactly as case 6's pair does.
+  vllm::v1::AsyncRequest a =
+      h.engine.add_request("A", std::string("hello"), Greedy(kN));
+  vllm::v1::AsyncRequest b =
+      h.engine.add_request("B", std::string("hello"), Greedy(kN));
+
+  int64_t total_gen = 0;
+  for (const vllm::v1::AsyncRequest* r : {&a, &b}) {
+    for (;;) {
+      const RequestOutput o = h.engine.get_output(*r);
+      REQUIRE(o.outputs.size() == 1);
+      if (o.finished) {
+        total_gen += static_cast<int64_t>(o.outputs[0].token_ids.size());
+        break;
+      }
+    }
+  }
+  CHECK(total_gen == 2 * kN);  // deterministic greedy, length-stopped.
+
+  // Join the output handler: every fold for every step has now retired.
+  h.engine.shutdown();
+
+  const std::string t = logger.Expose();
+  // Token counters == the EXACT counts the run produced (case 6's invariant).
+  CHECK(MetricValue(t, kPrompt) == 2.0);  // 1 token per "hello" x2 prefilled.
+  CHECK(MetricValue(t, kGen) == static_cast<double>(total_gen));
+  // Both requests finished with the "length" reason.
+  CHECK(MetricValue(t, kSuccessLen) == 2.0);
+  // All requests drained: the gauges track the batch back down to zero.
+  CHECK(MetricValue(t, kRun) == 0.0);
+  CHECK(MetricValue(t, kWait) == 0.0);
+  // Histogram sample counts: TTFT once per request; ITL once per decode token;
+  // e2e + TPOT once per finished request.
+  CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:inter_token_latency_seconds") == 2 * (kN - 1));
+  CHECK(HistogramCount(t, kE2E) == 2);
+  CHECK(HistogramCount(t, "vllm:request_time_per_output_token_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:iteration_tokens_total") >= 1);
+  CHECK(HistogramCount(t, "vllm:request_generation_tokens") == 2);
+
+  // Case 7's invariant on the async path: the per-request timing intervals are
+  // real positive durations, and inference == prefill + decode.
+  CHECK(HistogramCount(t, kQueue) == 2);
+  CHECK(HistogramCount(t, kPrefill) == 2);
+  CHECK(HistogramCount(t, kInference) == 2);
+  const double queue_sum = HistogramSum(t, kQueue);
+  const double prefill_sum = HistogramSum(t, kPrefill);
+  const double inference_sum = HistogramSum(t, kInference);
+  const double decode_sum = HistogramSum(t, kDecode);
+  const double e2e_sum = HistogramSum(t, kE2E);
+  CHECK(queue_sum > 0.0);
+  CHECK(prefill_sum > 0.0);
+  CHECK(inference_sum > 0.0);
+  CHECK(decode_sum > 0.0);
+  CHECK(e2e_sum > 0.0);
+  CHECK(inference_sum == doctest::Approx(prefill_sum + decode_sum));
+  CHECK(inference_sum <= e2e_sum);
+  CHECK(prefill_sum <= inference_sum);
+  // TTFT is measured from the engine-core timestamp, so it must be positive —
+  // a zero/unstamped timestamp reports it as -arrival_time.
+  CHECK(HistogramSum(t, "vllm:time_to_first_token_seconds") > 0.0);
+}
+
+// The DEFAULT async path — no logger attached — must stay byte-identical. This
+// is the whole inertness claim: the fold is opt-in, so an engine with no logger
+// takes the same no-stats process_outputs call it took before this row.
+TEST_CASE("async_llm: with no logger attached the token stream is unchanged") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 6;
+
+  std::vector<int32_t> with_logger;
+  {
+    AsyncHarness h(c, w, tok);
+    PrometheusStatLogger logger("m", kMaxModelLen);
+    h.engine.set_stat_logger(&logger);
+    const RequestOutput r =
+        h.engine.generate(std::string("hello"), Greedy(kN), "req");
+    REQUIRE(r.outputs.size() == 1);
+    with_logger = r.outputs[0].token_ids;
+  }
+  std::vector<int32_t> without_logger;
+  {
+    AsyncHarness h(c, w, tok);
+    const RequestOutput r =
+        h.engine.generate(std::string("hello"), Greedy(kN), "req");
+    REQUIRE(r.outputs.size() == 1);
+    without_logger = r.outputs[0].token_ids;
+  }
+  CHECK(with_logger.size() == static_cast<std::size_t>(kN));
+  CHECK(with_logger == without_logger);
+}
+
 // ─── ENG-ASYNC-SCHED depth-2 serving-path e2e (heap-corruption regression) ────
 // Full production-server stack (LoadedEngine -> AsyncLLM -> InprocClient ->
 // EngineCoreProc::run_busy_loop -> step_with_batch_queue, mcb=2) over the MoE
