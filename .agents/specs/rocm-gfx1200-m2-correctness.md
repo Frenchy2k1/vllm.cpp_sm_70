@@ -119,6 +119,47 @@ is for the already-documented France/Italy near-tie on this same model under
 other build configurations — this is the same phenomenon class, now confirmed
 by measurement rather than assumed.
 
+## Broadening M2: `Gemma3ForCausalLM` (gemma-3-1b-it), 2026-08-10 — clean pass, no near-tie
+
+Same board (gfx1200, RX 9060 XT), same `build-hip` (no rebuild needed — already
+current), same `--device cpu` vs `--device auto` (`auto` resolves to
+`device=5`=`kROCM`, confirmed, not a silent CPU-reference-tier fallback: every
+op in the forward reports `selected=vt-native` under
+`VT_OP_PROVIDER_STATS=1`). Model: `unsloth/gemma-3-1b-it` (ungated mirror of
+the gated `google/gemma-3-1b-it` the SACRED gate uses; `model.safetensors`
+SHA-256 `3d4ef8d7…8516b6` matches the upstream blob hash exactly — same
+weights, different host). Config confirmed matching the sweep-gemma spec's
+expected shape: `head_dim=256`, `final_logit_softcapping=null`,
+`sliding_window=512`/pattern 6, dual rope theta (`rope_theta=1e6`,
+`rope_local_base_freq=1e4`).
+
+Greedy (`--temperature 0`, `--max-tokens 8`), the same 6-prompt battery the
+SACRED Gemma-3 gate uses (`scripts/gemma3-oracle-capture.py`):
+
+| Prompt | CPU vs ROCm |
+|---|---|
+| "The capital of France is" | identical (` Paris.\n\nThe largest city in France`) |
+| "The largest planet in our solar system is" | identical |
+| "Water boils at a temperature of" | identical |
+| "The chemical symbol for gold is" | identical |
+| "The first president of the United States was" | identical |
+| "Roses are red, violets are" | identical |
+
+**48/48 tokens identical, CPU vs ROCm.** This is the first real exercise of
+the gemma `(1+w)` RmsNorm code path (`vt::RmsNorm{gemma=true}` — sandwich
+norms + QK-norm, `rocm_rmsnorm.hip:69-110`) plus GeGLU
+(`kGeluAndMul`/`rocm_ops.hip`) and the dual per-layer RoPE-theta routing on
+this board, and unlike the Qwen3-0.6B M2 attempt above it hits **no near-tie
+anywhere in the battery** — a clean unanimous match rather than a coin-flip on
+an unusually tight cluster. Read together with the Qwen3 finding, this is
+consistent evidence that gfx1200 M2 is met in the sense that matters: the
+backend computes the right thing, and Qwen3's single flip was the exception
+(an extremely thin tie), not the rule.
+
+No kernel changes were needed or made; this is a validation run only, done
+from a separate worktree against the already-built `build-hip` in the primary
+checkout.
+
 ## Environment note (reproducibility)
 
 This board is accessed through `nix develop .#rocm-shell` (local, uncommitted
