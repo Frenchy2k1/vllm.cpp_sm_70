@@ -29,6 +29,9 @@
 
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>  // mallopt — pinned for the mincore residency observation below
+#endif
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev
@@ -313,6 +316,17 @@ TEST_CASE("direct upload: BorrowStTensorBytes FAILS CLOSED on a size or dtype mi
 // reading one byte -- including from inside the keep-alive's deleter, which runs
 // at exactly the instant the mapping is dropped. Correct order => the deleter
 // sees 0. Reversed order => the deleter sees the pattern.
+//
+// PLATFORM NOTE, recorded rather than abstracted away. That zero-fill is LINUX
+// semantics: `madvise(MADV_DONTNEED)` on a private anonymous mapping frees the
+// pages and the next read faults in a fresh zero page. On the BSDs and macOS
+// `MADV_DONTNEED` is advisory and leaves the CONTENTS intact, so every `== 0`
+// assertion in this section would read `kSrcPattern` there. The assumption is not
+// new with these cases -- the already-merged adopt cases rest on it identically,
+// and so does the production behavior they pin (the release exists to return RSS,
+// which is what MADV_DONTNEED does on Linux). vllm.cpp gates on Linux only; a
+// macOS port owes this section a residency observation with different semantics,
+// not a tolerance widening.
 namespace {
 
 // Forces the direct-upload arm AND the windowed release (the release is the
@@ -792,3 +806,128 @@ TEST_CASE("fp4 resident: a host-addressable device adopts an OWNED fp4 mirror to
   CHECK(AllBytesMatchPattern(w.packed.bytes.data(), dims.packed_bytes));
   CHECK(AllBytesMatchPattern(w.scale.bytes.data(), dims.scale_bytes));
 }
+
+// --- The general adopt branch's madvise: the RSS half, made observable --------
+//
+// The case above proves the general branch keeps the weight's VALUES. It does not
+// prove the branch reclaims anything, and reclaiming is the entire thesis of this
+// row. `AdoptDeviceBytesAsHost`'s general branch MADV_DONTNEEDs the host mirror's
+// interior whole pages and only THEN frees the vector, for a reason its own
+// comment states: glibc raises its dynamic mmap threshold as large blocks are
+// freed, so `free()` alone leaves weight buffers on the arena free-list with every
+// page still RESIDENT.
+//
+// NOTHING BIT WHEN THAT MADVISE WAS DELETED, and a fresh reviewer showed it: every
+// assertion in this file reads VALUES, and the values live in the surviving device
+// copy either way. A residency claim needs a residency observation, which is
+// `mincore()` -- it answers "is this page in core" for an address RANGE, and being
+// a syscall on the range rather than a dereference it stays legal after the block
+// has gone back to the allocator.
+//
+// TWO ALLOCATOR FACTS MUST BE PINNED or the observation is not about the madvise:
+//
+//   * `M_MMAP_MAX=0` keeps the mirror in the sbrk arena instead of a private mmap.
+//     `free()` on an mmap'd block MUNMAPS it, and then the pages are gone with or
+//     without the madvise -- the test would pass on the mutant.
+//   * `M_TRIM_THRESHOLD` off plus a guard allocation made AFTER the mirror keep the
+//     freed block off the heap top, so glibc cannot sbrk-trim it away for exactly
+//     the same reason.
+//
+// The in-run negative control is `before`: the same pages, counted the same way,
+// must show FULLY resident immediately beforehand. Linux + glibc only; the
+// mechanism being pinned is a glibc allocator behavior, so there is nothing to
+// assert about it elsewhere.
+#if defined(__linux__) && defined(__GLIBC__)
+namespace {
+
+class ScopedArenaOnlyMalloc {
+ public:
+  ScopedArenaOnlyMalloc() {
+    ::mallopt(M_MMAP_MAX, 0);
+    ::mallopt(M_TRIM_THRESHOLD, -1);
+  }
+  ~ScopedArenaOnlyMalloc() {
+    ::mallopt(M_MMAP_MAX, 65536);             // glibc DEFAULT_MMAP_MAX
+    ::mallopt(M_TRIM_THRESHOLD, 128 * 1024);  // glibc DEFAULT_TRIM_THRESHOLD
+  }
+  ScopedArenaOnlyMalloc(const ScopedArenaOnlyMalloc&) = delete;
+  ScopedArenaOnlyMalloc& operator=(const ScopedArenaOnlyMalloc&) = delete;
+};
+
+struct PageResidency {
+  int total = -1;     // interior whole pages in the range
+  int resident = -1;  // how many of them mincore() reports in core
+};
+
+// Residency of the interior whole pages of [begin, begin+nb) -- the exact range
+// the adopt branch madvises. `scratch` is the caller's, so counting allocates
+// NOTHING: an allocation between the free and the count could be served out of the
+// freed block and re-fault the very pages being measured.
+PageResidency InteriorResidency(const uint8_t* begin, size_t nb,
+                                std::vector<unsigned char>& scratch) {
+  const auto ps = static_cast<uintptr_t>(PageSize());
+  const auto b = reinterpret_cast<uintptr_t>(begin);
+  const uintptr_t page_begin = (b + ps - 1) & ~(ps - 1);
+  const uintptr_t page_end = (b + nb) & ~(ps - 1);
+  PageResidency r;
+  if (page_end <= page_begin) return r;
+  const size_t n = (page_end - page_begin) / ps;
+  if (scratch.size() < n) return r;
+  if (::mincore(reinterpret_cast<void*>(page_begin),
+                static_cast<size_t>(page_end - page_begin), scratch.data()) != 0) {
+    return r;
+  }
+  r.total = static_cast<int>(n);
+  r.resident = 0;
+  for (size_t i = 0; i < n; ++i) r.resident += (scratch[i] & 1);
+  return r;
+}
+
+}  // namespace
+
+TEST_CASE("adopt: the general branch DROPS the host mirror's resident pages") {
+  ScopedArenaOnlyMalloc arena;
+  ForcedResidencyArm arm;
+  ScopedEnvVar adopt_default("VT_ADOPT_DEVICE_BYTES", "1");
+  FakeBackend b(/*host_addressable=*/true);
+  vt::Queue q = b.CreateQueue();
+
+  const size_t nb = 32 * PageSize();
+  // The host mirror: an OWNED buffer, every page touched by the pattern fill.
+  vllm::OwnedTensor w = OwnedPatternWeight(nb);
+  // Allocated AFTER it, so freeing the mirror cannot consolidate into the heap top.
+  std::vector<uint8_t> guard(nb, 0x5A);
+  REQUIRE_FALSE(w.bytes.borrowed());
+  REQUIRE(w.mmap_src == nullptr);
+
+  // Upload it, exactly as ResidentWeight / ResidentNvfp4 leave a weight.
+  void* p = b.Alloc(nb);
+  b.Copy(q, p, w.bytes.data(), nb);
+  vt::Backend* bk = &b;
+  w.d_dev = std::shared_ptr<void>(p, [bk](void* x) { bk->Free(x); });
+
+  const uint8_t* mirror = w.bytes.data();
+  std::vector<unsigned char> scratch(nb / PageSize() + 1);
+  const PageResidency before = InteriorResidency(mirror, nb, scratch);
+
+  vllm::AdoptDeviceBytesAsHost(b, w);
+
+  const PageResidency after = InteriorResidency(mirror, nb, scratch);
+
+  // The control: every interior page of the mirror was in core going in.
+  REQUIRE(before.total > 0);
+  REQUIRE(before.resident == before.total);
+  // THE RECLAIM. Deleting the madvise leaves this at `before.total`: free() hands
+  // the block back to the arena with its pages still resident, and the RSS this
+  // row exists to return is never returned.
+  REQUIRE(after.total == before.total);
+  CHECK(after.resident == 0);
+
+  // ... and the weight is still readable, out of the surviving device copy.
+  CHECK(w.bytes.borrowed());
+  CHECK(static_cast<const void*>(w.bytes.data()) == w.d_dev.get());
+  CHECK(w.bytes.size() == nb);
+  CHECK(AllBytesMatchPattern(w.bytes.data(), nb));
+  CHECK(guard[0] == 0x5A);
+}
+#endif  // __linux__ && __GLIBC__
