@@ -36,12 +36,15 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 
 namespace vllm {
 namespace {
@@ -86,6 +89,14 @@ std::vector<int64_t> RawIntArray(const nlohmann::json& doc, const char* key) {
   if (f != nullptr && f->is_array())
     for (const auto& v : *f)
       if (v.is_number()) out.push_back(v.get<int64_t>());
+  return out;
+}
+std::vector<double> RawDoubleArray(const nlohmann::json& doc, const char* key) {
+  std::vector<double> out;
+  const nlohmann::json* f = Field(doc, key);
+  if (f != nullptr && f->is_array())
+    for (const auto& v : *f)
+      if (v.is_number()) out.push_back(v.get<double>());
   return out;
 }
 std::vector<std::string> RawStringArray(const nlohmann::json& doc, const char* key) {
@@ -279,8 +290,49 @@ MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
         "num_hidden_layers / num_attention_heads)");
   if (t.head_dim <= 0) t.head_dim = t.hidden_size / t.num_attention_heads;
 
-  // iRoPE mask.
+  // iRoPE mask, CHECKPOINT-FIRST. The released meta-models/Muse-Glimmer-30B
+  // config ships NO `no_rope_layers` at all; it encodes the same split TWICE:
+  //   text_config.layer_rope_theta[i] == 0        marks a NoPE layer
+  //   text_config.layer_types[i] == "full_attention" marks the same layer
+  // (verified against the released config.json, 2026-08-10: both put the NoPE
+  // layers at 3, 7, 11, ... 51 for L=52). Deriving from the checkpoint rather than
+  // from the counted default matters because the default only HAPPENS to agree for
+  // this depth; a checkpoint with a different schedule would be silently mis-split
+  // into wrong-RoPE, wrong-window layers that still emit fluent text.
+  //
+  // Precedence: an explicit `no_rope_layers` wins; else derive from the checkpoint's
+  // own fields; else fall back to upstream's backward-counted default
+  // (configs/muse_glimmer.py:20-26).
+  const std::vector<double> layer_rope_theta = RawDoubleArray(text, "layer_rope_theta");
+  const std::vector<std::string> text_layer_types = RawStringArray(text, "layer_types");
+  const size_t L = static_cast<size_t>(t.num_hidden_layers);
+
+  std::vector<int64_t> from_theta;
+  if (layer_rope_theta.size() == L) {
+    for (double th : layer_rope_theta) from_theta.push_back(th != 0.0 ? 1 : 0);
+    // Every RoPE layer must use the model's single theta: we thread ONE theta into
+    // the forward, so a per-layer value that disagrees would be applied wrongly.
+    for (double th : layer_rope_theta)
+      if (th != 0.0 && th != t.rope_theta)
+        throw std::runtime_error(
+            "MuseGlimmer layer_rope_theta carries a per-layer theta that disagrees "
+            "with rope_parameters.rope_theta; only a single theta is supported");
+  }
+  std::vector<int64_t> from_types;
+  if (text_layer_types.size() == L)
+    for (const std::string& ty : text_layer_types)
+      from_types.push_back(ty == "full_attention" ? 0 : 1);
+
+  // Both present => they must AGREE. A disagreement is a config we do not
+  // understand, and guessing which one wins is exactly the silent-wrong-model risk.
+  if (!from_theta.empty() && !from_types.empty() && from_theta != from_types)
+    throw std::runtime_error(
+        "MuseGlimmer layer_rope_theta and layer_types disagree about which layers "
+        "are NoPE/full-attention");
+
   t.no_rope_layers = RawIntArray(text, "no_rope_layers");
+  if (t.no_rope_layers.empty() && !from_theta.empty()) t.no_rope_layers = from_theta;
+  if (t.no_rope_layers.empty() && !from_types.empty()) t.no_rope_layers = from_types;
   if (t.no_rope_layers.empty())
     t.no_rope_layers = DefaultMuseGlimmerNoRopeLayers(t.num_hidden_layers);
   if (static_cast<int64_t>(t.no_rope_layers.size()) != t.num_hidden_layers)
@@ -312,20 +364,33 @@ MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
     v.num_hidden_layers = RawInt(*vision_obj, "num_hidden_layers", 50);
     v.hidden_size = RawInt(*vision_obj, "hidden_size", 1536);
     v.intermediate_size = RawInt(*vision_obj, "intermediate_size", 8960);
-    v.merge_kernel_size = RawInt(*vision_obj, "merge_kernel_size", 2);
-    v.output_dim = RawInt(*vision_obj, "output_dim", 6144);
+    // FIELD SPELLINGS, verified against the released config.json (2026-08-10):
+    // the vision block ships `merge_size` (not `merge_kernel_size`) and ships
+    // NEITHER `output_dim` NOR `adapter_dim` — those live at the TOP level as
+    // `out_hidden_size` and `projector_hidden_size`. Reading only the old spellings
+    // fell back to defaults that COINCIDENTALLY equal the real values, so the
+    // `output_dim == hidden * merge^2` check below passed by luck rather than by
+    // reading the checkpoint. Both spellings are accepted, checkpoint-first.
+    v.merge_kernel_size =
+        RawInt(*vision_obj, "merge_size", RawInt(*vision_obj, "merge_kernel_size", 2));
+    v.output_dim =
+        RawInt(*vision_obj, "output_dim", RawInt(raw, "out_hidden_size", 6144));
     v.patch_temporal = RawInt(*vision_obj, "patch_temporal", 2);
-    v.adapter_dim = RawInt(*vision_obj, "adapter_dim", 4096);
+    v.adapter_dim =
+        RawInt(*vision_obj, "adapter_dim", RawInt(raw, "projector_hidden_size", 4096));
     v.layer_norm_eps =
         static_cast<float>(RawDouble(*vision_obj, "layer_norm_eps", 1e-5));
     v.layer_types = RawStringArray(*vision_obj, "layer_types");
     if (v.layer_types.empty()) {
       // configs/muse_glimmer.py:168-176 — full every 4th layer AND on the last.
-      // NOTE this rule differs from the text tower's backward-counted mask.
+      // NOTE this rule differs from the text tower's backward-counted mask. The
+      // non-full spelling is "window_attention", which is what the released
+      // config.json ships (verified 2026-08-10); every consumer compares against
+      // "full_attention" as upstream does, so either spelling reads the same.
       for (int64_t i = 0; i < v.num_hidden_layers; ++i)
         v.layer_types.push_back(
             ((i + 1) % 4 == 0 || i == v.num_hidden_layers - 1) ? "full_attention"
-                                                               : "sliding_attention");
+                                                               : "window_attention");
     }
     // muse_glimmer.py:734-739 — the pixel-shuffle output width is structural.
     const int64_t expected = v.hidden_size * v.merge_kernel_size * v.merge_kernel_size;
@@ -466,6 +531,51 @@ std::vector<std::string> EnumerateMuseGlimmerTensors(const MuseGlimmerParams& pa
   return names;
 }
 
+namespace {
+
+// Where a CANONICAL (post-`NormalizeMuseGlimmerWeightName`) name lives.
+struct TensorSite {
+  const SafetensorsFile* shard = nullptr;
+  std::string raw_name;
+};
+
+// One decoder layer's tensors, in the canonical names EnumerateMuseGlimmerTensors
+// declares (muse_glimmer.py:1218-1277).
+MuseGlimmerLayerWeights LoadLayer(const TensorResolver& get, int64_t layer,
+                                  bool use_attn_output_gate) {
+  const std::string base = "model.layers." + std::to_string(layer) + ".";
+  const std::string sa = base + "self_attn.";
+  const std::string mlp = base + "mlp.";
+
+  MuseGlimmerLayerWeights w;
+  w.input_layernorm = dense_loaders::LoadBf16Direct(get, base + "input_layernorm.weight");
+  w.post_attention_layernorm =
+      dense_loaders::LoadBf16Direct(get, base + "post_attention_layernorm.weight");
+  w.pre_feedforward_layernorm =
+      dense_loaders::LoadBf16Direct(get, base + "pre_feedforward_layernorm.weight");
+  w.post_feedforward_layernorm =
+      dense_loaders::LoadBf16Direct(get, base + "post_feedforward_layernorm.weight");
+
+  // Merged QKVParallelLinear, rows q|k|v (muse_glimmer.py:1126-1135).
+  w.attn.qkv_proj = dense_loaders::LoadMergedBf16RawNK(
+      get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+  w.attn.o_proj = dense_loaders::LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
+  // The attention OUTPUT GATE (:1145-1152). Its checkpoint name collides with the
+  // MLP gate by suffix, which is why NormalizeMuseGlimmerWeightName renames
+  // `.self_attn.gate_proj` FIRST; here the canonical name is unambiguous.
+  if (use_attn_output_gate)
+    w.attn.output_gate_proj =
+        dense_loaders::LoadMergedBf16RawNK(get, {sa + "output_gate_proj.weight"});
+
+  // MergedColumnParallelLinear gate|up (:1052-1058) — SwiGLU, not GeGLU.
+  w.mlp.gate_up_proj = dense_loaders::LoadMergedBf16RawNK(
+      get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
+  w.mlp.down_proj = dense_loaders::LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+  return w;
+}
+
+}  // namespace
+
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
   MuseGlimmerWeights w;
@@ -473,19 +583,43 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
   const std::vector<std::string> expected = EnumerateMuseGlimmerTensors(w.params);
   w.enumerated_tensors = static_cast<int64_t>(expected.size());
 
-  // W0 is a STRUCTURAL accounting pass: normalize every checkpoint name through
-  // the same mapper the forward will use, and report how much of the enumerated
-  // structure is actually present. No tensor is materialized — that is W1.
-  std::unordered_set<std::string> present;
+  // STRUCTURAL accounting (W0): normalize every checkpoint name through the same
+  // mapper the forward uses, and report how much of the enumerated structure is
+  // present. The same index is what the W1 materialization reads through, so the
+  // accounting and the load can never disagree about a name.
+  std::unordered_map<std::string, TensorSite> where;
   for (const SafetensorsFile& shard : shards) {
     for (const std::string& raw_name : shard.Names()) {
       std::string canonical;
       if (!NormalizeMuseGlimmerWeightName(raw_name, &canonical)) continue;
-      present.insert(canonical);
+      where.emplace(canonical, TensorSite{&shard, raw_name});
     }
   }
   for (const std::string& name : expected)
-    if (present.count(name) != 0) ++w.accounted_tensors;
+    if (where.count(name) != 0) ++w.accounted_tensors;
+
+  // W1: materialize the TEXT tower. The perception encoder's tensors are accounted
+  // above but NOT materialized — that is W3, and a Muse Glimmer forward is text-only
+  // until it lands.
+  const TensorResolver get = [&where](const std::string& name) -> const StTensor& {
+    auto it = where.find(name);
+    VT_CHECK(it != where.end(), "muse_glimmer: tensor not found: " + name);
+    return it->second.shard->Get(it->second.raw_name);
+  };
+
+  const MuseGlimmerTextParams& t = w.params.text;
+  w.embed_tokens = dense_loaders::LoadBf16Direct(get, "model.embed_tokens.weight");
+  w.final_norm = dense_loaders::LoadBf16Direct(get, "model.norm.weight");
+  // UNTIED lm_head (:1480). Muse Glimmer is NOT a Gemma here: `tie_word_embeddings`
+  // is false in the released config, and only an explicitly tied checkpoint (which
+  // ships no `lm_head.weight`) falls back to the embedding table.
+  if (!t.tie_word_embeddings)
+    w.lm_head = dense_loaders::LoadBf16Transposed(get, "lm_head.weight");
+
+  w.layers.reserve(static_cast<size_t>(t.num_hidden_layers));
+  for (int64_t l = 0; l < t.num_hidden_layers; ++l)
+    w.layers.push_back(LoadLayer(get, l, t.use_attn_output_gate));
+  w.text_loaded = true;
   return w;
 }
 

@@ -9,10 +9,12 @@
 // that: one factory, two registered names, so a text-only and a multimodal
 // checkpoint both RESOLVE.
 //
-// The arch RESOLVES and parses config + accounts the structural name map. It does
-// NOT forward: MuseGlimmerModel REFUSES-by-name. The model-matrix row stays SPIKE.
-// Muse Glimmer is beyond the pinned oracle (555967922) and is anchored to the OPEN
-// vllm#51655 — see porting-inventory §9 deviation 16 and specs/muse-glimmer.md §0.
+// W1: the arch RESOLVES, parses config, accounts the structural name map, loads the
+// TEXT tower and FORWARDS it. The perception encoder is still W3, so an image or
+// video prompt is a pending brick. Muse Glimmer is beyond the pinned oracle
+// (555967922) and is anchored to the OPEN vllm#51655 — see porting-inventory §9
+// deviation 16 and specs/muse-glimmer.md §0. No speed axis is claimable for this
+// model at all while the pin lacks `muse_glimmer`.
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <memory>
@@ -103,13 +105,15 @@ const ModelFactory kMuseGlimmerFactory{
 
 v1::KVCacheConfig MakeMuseGlimmerKVCache(const HfConfig& config, int block_size,
                                          int num_blocks) {
-  // W0 PLACEHOLDER. The TRUE topology is heterogeneous: `no_rope_layers[i] == 1`
-  // layers are SLIDING-window and `== 0` layers are FULL attention
-  // (muse_glimmer.py:1167-1168). The KV GEOMETRY is uniform across both (same
-  // num_kv_heads and head_dim), so only the window differs; the per-layer spec
-  // seam Gemma-4 landed can express that split, and it lands with the W1 forward.
-  // Emitting one full-attention group here keeps the arch resolvable and is never
-  // exercised, because the forward REFUSES-by-name.
+  // W1 RESOLVED the W0 placeholder note. The topology IS heterogeneous in masking
+  // — `no_rope_layers[i] == 1` layers are SLIDING-window and `== 0` layers are FULL
+  // attention (muse_glimmer.py:1167-1168) — but the KV GEOMETRY is uniform across
+  // both classes (same num_key_value_heads, same head_dim), so ONLY the window
+  // differs. The window is applied at the attention-kernel level
+  // (`vt::PagedAttentionArgs::window_size`, muse_glimmer.cpp), exactly as Gemma-2
+  // and Laguna do for their interleaved sliding layers, so ONE full-attention group
+  // is the correct spec and not a stand-in. The Gemma-4 per-layer spec seam exists
+  // for models whose KV geometry differs per layer; Muse Glimmer's does not.
   const MuseGlimmerParams p = ParseMuseGlimmerParams(config);
   const int num_kv_heads = static_cast<int>(p.text.num_key_value_heads);
   const int head_dim = static_cast<int>(p.text.head_dim);
