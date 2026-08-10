@@ -485,7 +485,7 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    "chars": 243571,
+    "chars": 243570,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
