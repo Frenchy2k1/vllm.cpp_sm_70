@@ -20,7 +20,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Invocation-parity | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
-| 35B mid-band | ATTRIBUTED: per-token MoE; fixed cost WINS (9.02 vs 9.43ms); block lever REFUTED | Route `E=1` dense off grouped-MoE |
+| 35B mid-band | **2 LEVERS LANDED**: gate_up dense +1.31%, down bf16 +2.05% (bit-exact) | Glue: 2x SiLU vs vLLM fused triton |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; sealed-vLLM tput 1.021x PASS; latency/VRAM OPEN | Spike residual 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
@@ -45,11 +45,11 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
 
 ## Next actions
 
-0. **35B mid-band ATTRIBUTED** to per-token MoE work; our FIXED per-step cost
-   already beats vLLM (9.02 vs 9.43ms) and both run the same
-   `marlin_moe_wna16`. Block-size lever **REFUTED** (-1.16% at c8, c4 control
-   +0.29%). NEXT: `E=1` dense goes through the GROUPED-MoE kernel (moe_align +
-   padding at EVERY batch); vLLM uses dense marlin.
+0. **35B mid-band: first lever LANDED** (+1.31% c8, +1.38% c4). The fused
+   shared gate_up sink still took the MoE-marlin route (20320 launches = 5.4%
+   GPU); `VT_MARLIN_DENSE_PAIR` ON. Second lever LANDED: shared down-proj emits
+   bf16, one `CastF32`/layer-step gone, **+2.05% c8 BIT-IDENTICAL**
+   (`VT_SHARED_DOWN_BF16`). NEXT: 2x SiLU vs vLLM's fused triton kernel.
 1. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
