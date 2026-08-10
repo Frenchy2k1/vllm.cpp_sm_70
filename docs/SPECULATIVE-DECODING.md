@@ -39,10 +39,17 @@ engine-wide bug was fixed that had been silently discarding EVERY speculator's
 drafts on the CLI and server path (`check_for_draft_tokens` was never threaded
 into `EngineCoreProc`, so `post_step` returned before installing anything).
 
-**It is still not gated.** Speculative-on output is not yet token-identical to
-speculative-off, and it is not stable run to run, so no correctness number is
-claimed and neither is a speed win. A GGUF target, and a target architecture
-with no aux multi-tap, are both refused by name.
+On that model its greedy output is **token-identical to speculative-off across
+all 48 tokens and reproducible** (both arms run on the synchronous path; the
+speculative path forces async scheduling off, so a fair comparison has to force
+it off on the other side too).
+
+**It is still not gated.** Speculation is currently about 2% SLOWER than plain
+decode at concurrency 1 — the sequential stage is a host-side loop with a device
+round-trip per step — and the cross-engine comparison against vLLM's own DSpark,
+the acceptance-rate band, and the other target families are all still owed. No
+speed win is claimed. A GGUF target, and a target architecture with no aux
+multi-tap, are both refused by name.
 
 ```bash
 main --model /models/Qwen3-4B \
