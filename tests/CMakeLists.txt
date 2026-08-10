@@ -193,6 +193,13 @@ vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
 vllm_cpp_add_test(test_muse_glimmer_scaffold vllm/models/test_muse_glimmer_scaffold.cpp)
+# Muse Glimmer W1 TEXT TOWER gate: the whole text forward vs an INDEPENDENT fp32
+# reference transcribed from vllm#51655 head 075d645af, plus a property test per
+# mechanism (weightless embed_norm, QK-norm, query pre-scale, the iRoPE NoPE/sliding
+# split, split pre/post eps, the offset-free final norm, the attention output gate,
+# the output multiplier and the soft-cap). CPU-only, no checkpoint. No speed axis
+# exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
 
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
