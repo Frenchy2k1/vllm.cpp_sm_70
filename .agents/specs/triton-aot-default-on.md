@@ -118,6 +118,22 @@ residual, which is stated rather than claimed away.
   and `tests/scripts/fixtures/release_manifest/v1/cpu-input.json` encode the
   matrix. Re-derive them from the new rule; **never** edit an expectation merely
   to make a red gate green.
+- **ON-by-default enables five cubin trees that no board here has ever run.**
+  ACCEPTED, DISCLOSED, NOT MITIGATED. The default is `ON` for **every** CUDA
+  architecture (developer ruling, 2026-08-10), so `sm_80`, `sm_86`, `sm_89`,
+  `sm_90a` and `sm_100a` now select their vendored Triton realizations in a
+  build that previously had to ask for them. Only `sm_121a` is runtime-verified;
+  the other five are `DERIVED+BUILD-VERIFIED` (`cuobjdump` shows real per-target
+  SASS, no board here runs a GDN model on them — see
+  `.agents/specs/triton-aot-per-arch.md`). **`sm_80` additionally has open issue
+  [#193](https://github.com/mudler/vllm.cpp/issues/193): crashes and wrong GDN
+  output.** That was reported with Triton `OFF`, so this change does not cause
+  it, but this change does mean an `sm_80` builder reaches the Triton path
+  without opting in. The hand C++/CUDA kernels remain the always-available
+  fallback via `-DVLLM_CPP_TRITON=OFF`. **Do not narrow the default by
+  architecture to manage this** — the directive is one default for all CUDA
+  arches; the obligation is to state the exposure, which `docs/STATUS.md`
+  also carries.
 
 ## Tests
 
@@ -300,34 +316,70 @@ growths; 35B 261 / 58 with 0 growths.
 - Release metadata: all eleven tests pass **unedited**; every expectation
   re-derived from the new rule and unchanged (see the commit body).
 
+### `test_qwen36_spec_decode`: an in-suite-only failure, NOT attributed here
+
+**This was briefly and wrongly recorded as a regression caused by this change.
+The correction, and how the mistake was made, matter more than the result.**
+
+In the 395-test serial suite on the default-ON build,
+`test_qwen36_spec_decode` failed: `CHECK(got_prefix == want_prod)` at `:142`,
+9 assertions / 8 passed, with a genuinely divergent continuation (drafts 15/17
+accepted, continuation diverging from token 8). On the `origin/main` arm it
+**passed**. Comparing those two looked like a clean attribution — and it was
+not, because the `origin/main` run was a **5-test `ctest`, not the full suite**.
+In-suite versus out-of-suite is not a like-for-like comparison.
+
+The same-binary probe settles it. On the **default-ON build**, standalone, six
+arms — as shipped, all four GDN Triton realizations off together, and each of
+`VT_GDN_CHUNKO_TRITON` / `VT_GDN_DELTAH_TRITON` / `VT_GDN_WU_TRITON` /
+`VT_GDN_PACKED_DECODE_TRITON` disabled alone:
+
+| arm | result |
+|---|---|
+| as shipped (all Triton realizations ON) | **9/9 PASS** |
+| all four GDN Triton toggles OFF | **9/9 PASS** |
+| `chunko` / `deltah` / `wu` / `packeddecode` off, one at a time | **9/9 PASS** each |
+| five plain repeats, as shipped | **9/9 PASS** each |
+
+The binary that failed inside the suite passes standalone **eleven times out of
+eleven**, with the Triton kernels on. So the failure is **context-dependent
+inside the suite**, not caused by the default flip, and **no Triton GDN kernel is
+implicated** — the bisect found nothing to bisect. It is an unexplained
+suite-ordering/state failure — note test 379, immediately before it, is
+`test_qwen27_dflash_spec_decode`, another spec-decode gate — and it **owes its
+own issue**, not a block on this row.
+
+Method note worth keeping: an A/B is only an A/B when both arms run in the same
+context. Attributing an in-suite failure requires the comparison arm to run
+in-suite too.
+
 ### Pre-existing failures, attributed not assumed
 
-**The count below does not reconcile, and it is UNRESOLVED.** 395 − 379 = 16,
-but only nine failures are named. Either seven tests never ran or seven failures
-went unlisted, and which of those it is can only be read off
-`dgx:~/work/triton-default-on/out-gate/ctest-serial-full.log`. Review round 1
-could not reach the gate host — `ssh mudler@dgx.casa` is answered and refuses
-the key (`Permission denied (publickey,password)`; the host resolves to
-192.168.68.128, pings, and has a `known_hosts` entry from earlier sessions) — so
-the log was not read and the run was not repeated. **Treat 379/395 as a
-provisional figure and the nine-failure list as incomplete until the operator
-re-reads that log or re-runs the suite at `-j 1`.**
+**The earlier `379/395` figure was a progress reading of an incomplete suite,
+not a pass count** — which is why `395 − 379 = 16` never reconciled against the
+nine failures then listed. The suite **completed**: `97% tests passed, 11 tests
+failed out of 395`, `full-serial-exit=8`.
 
-**A same-set A/B must account for one extra registered test.**
+**A same-set A/B must still account for one extra registered test.**
 `tests/CMakeLists.txt:974-980` registers `test_ops_gdn_aot_concurrent_first_load`
 only `if(VLLM_CPP_TRITON)` — the sole `VLLM_CPP_TRITON` guard in that file — so a
 default-`ON` build has exactly **one more** registered test than a default-`OFF`
 `origin/main` build. Any "same set" claim between the two totals is off by one
 in that direction and must say so.
 
-The serial suite reached **379/395** with **nine** failures. Five are
-**A/B-attributed to `origin/main`**: built there with its own default
-(`VLLM_CPP_TRITON:BOOL=OFF`), same box, toolchain and CUTLASS, each fails with
-the same assertion, the same line and the same pass/fail counts, so none is
-caused by this change. A sixth shares an already-attributed root cause. The
-remaining three are covered by a comprehensive same-set A/B against `origin/main`
-that is queued to run when the suite finishes (`triton-abfull`, logs
-`out-gate/abfull-*.log`).
+Every one of the 11 was then run on unmodified `origin/main` built with its own
+default (`VLLM_CPP_TRITON:BOOL=OFF`), same box, toolchain and CUTLASS. **Ten
+reproduce there identically** — same assertion, same line, same pass/fail counts
+— and are therefore not caused by this change. The eleventh,
+`test_qwen36_spec_decode`, passed on that arm, but the arm was not run in-suite;
+the same-binary probe shows it passes standalone here too. See the section above.
+
+Arms: `build-mainab5` (`origin/main`, 1163/1163 clean), logs
+`out-gate/mainab-ctest.log`, `out-gate/abmain5-ctest.log` and
+`out-gate/abfull-armA.log`. `test_glm4_moe_lite_paged_engine` was excluded from
+the last arm because standalone it reached 59 GB RSS on a 119 GB box with 1 GB
+left after ~1 h (versus 52 s in-suite) and had to be killed to avoid a second
+OOM reboot; it was already attributed twice by then.
 
 **Attributed to main by direct A/B:**
 
@@ -363,28 +415,23 @@ that is queued to run when the suite finishes (`triton-abfull`, logs
   `vt::GeluMulSeparate: ROCm-only fast path in this build` throw, at `:67`.
   Folded into the `GeluMulSeparate` issue above.
 
-**UNATTRIBUTED — pending the queued comprehensive A/B.** These three are
-**open**, not explained. The earlier framing here — "none is plausibly reachable
-from a GDN-only cubin set" — is **withdrawn**: it was an argument, not a
-measurement, and the reviewer disproved its premise.
-`src/vt/cuda/cuda_backend.cu:102-104` calls `ReleaseGdnTritonScratch()` from the
-**generic** CUDA `DestroyQueue()`, which every CUDA test executes, so the change
-is not confined to GDN models. (The mechanism is small — it early-returns on an
-empty pool — but that too has to be measured rather than asserted.) Two of the
-three are token-drift assertions against committed goldens, which is exactly the
-failure class a kernel-selection change produces.
+**Also attributed to main by the same arm** (same assertion, line and counts on
+`origin/main`). These four were once listed as "pending", with the argument that
+"none is plausibly reachable from a GDN-only cubin set". That argument is
+**withdrawn and stays withdrawn** — it was reasoning, not measurement, and its
+premise was wrong: `src/vt/cuda/cuda_backend.cu:102-104` calls
+`ReleaseGdnTritonScratch()` from the **generic** CUDA `DestroyQueue()`, which
+every CUDA test executes, so the change was never confined to GDN models. They
+are attributed here because they were **measured on `origin/main`**, which is
+the only thing that ever could have closed them.
 
-The `triton-abfull` arms (`out-gate/abfull-armA.log`,
-`out-gate/abfull-armB-main.log`) were **not** checked in review round 1: the gate
-host refuses this session's key (see the note above the failure list), so whether
-they completed is unknown. Nothing here may be closed until those logs are read
-or the A/B is re-run.
-
+- `test_llama_paged_engine` — `REQUIRE(first_div < 0)` at `:205`, 15 assertions
+  / 14 passed. Same assertion shape as the MiniCPM3 gate below.
 - `test_capi` — SIGSEGV at `tests/capi/test_capi.cpp:480`, the ABI v8
   custom-logits-processor case on a *synthetic* engine; 47/47 assertions passed
-  before the crash, 3 of 4 cases green. `.agents/environment.md:189` already
-  calls this a known flake here, but this run was `-j 1`, so that explanation
-  does not apply and it needs the A/B.
+  before the crash, 3 of 4 cases green. Note this run was `-j 1`, so the
+  parallel-flake note in `.agents/environment.md` is not the explanation; the
+  `origin/main` arm is.
 - `test_qwen3_apc_e2e` — `REQUIRE(anchor_ok)` at `:375`, 59 assertions / 58
   passed. Automatic prefix caching, no GDN layers involved.
 - `test_minicpm3_paged_engine` — `REQUIRE(first_div < 0)` at `:224`, 26
@@ -396,14 +443,20 @@ or the A/B is re-run.
 `NVRM ... Out of memory [NV_ERR_NO_MEMORY]`): unified memory means concurrent
 model gates stack into host RAM. Run the CUDA suite with `-j 1` here.
 
-The full serial suite is the remaining open item. It was started, stopped at
-171/395 to free `$HOME/gpu.lock` for the attribution arms (which queue behind
-it), and restarted from the beginning; the restarted run reached **379/395**
-with the nine failures above. Logs, all under
+The full serial suite is DONE (`97% tests passed, 11 tests failed out of 395`).
+It was started, stopped at 171/395 to free `$HOME/gpu.lock` for the attribution
+arms (which queue behind it), and restarted from the beginning. Logs, all under
 `dgx:~/work/triton-default-on/out-gate/`: `ctest-serial-full-partial.log` (the
-first run), `ctest-serial-full.log` (the restarted run, ends with
-`full-serial-exit=`), and `abfull-armA.log` / `abfull-armB-main.log` (the
-comprehensive attribution pass).
+first run), `ctest-serial-full.log` (the complete run, ends with
+`full-serial-exit=8`), and `abmain-*.log` (the `origin/main` attribution arm).
 
-Serialising the whole suite behind one `flock` also means every probe queues
-behind it; run attribution arms before, not during, a full suite.
+**The remaining open item is `test_qwen36_spec_decode`'s in-suite-only failure**,
+which owes its own issue and does not block this row. Every other failure is
+attributed to `origin/main`.
+
+Two process lessons: serialising the whole suite behind one `flock` makes every
+probe queue behind it, so run attribution arms before — not during — a full
+suite; and a standalone re-run of a model gate can be ~50x slower than the same
+test inside the suite (GLM-4.7-Flash: 52 s in-suite, still running at 1 h alone)
+because the suite leaves the checkpoint warm in the page cache. Re-running "just
+the failures" is not the cheap option it looks like.
