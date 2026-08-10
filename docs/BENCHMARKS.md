@@ -142,9 +142,10 @@ route (**+1.31% c8 / +1.38% c4**, `VT_MARLIN_DENSE_PAIR`) and the shared
 `down_proj` emitted as bf16 rather than f32 (**+2.05% c8 / +0.79% c4**,
 bit-identical, `VT_SHARED_DOWN_BF16`).
 
-Next is `SiluAndMul`: launch counts MATCH vLLM (2.00 against 1.98 per
-layer-step) but ours costs 22.6 us against ~2.45 us, a **9.2x** per-launch gap
-worth 3.6 points ([spec](../.agents/specs/moe-silu-vectorize.md)). The
+The SiLU lever is NEGATIVE ([spec](../.agents/specs/moe-silu-vectorize.md)):
+the 9.2x per-launch gap that motivated it was a MEAN over a bimodal kernel
+(min 1.34 us, max 979 us) and our decode-phase SiLU is already faster than
+vLLM's, so the remaining band is unattributed. The
 marlin block-size lever is REFUTED (block 8 at c8 is 1.16% SLOWER against a
 +0.29% control), and a per-launch marlin gap is WITHDRAWN as cross-tool
 uncertainty. Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**.
