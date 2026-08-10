@@ -1555,6 +1555,38 @@ public-doc change. Does NOT touch the roadmap issue table — PR #235 already
 registers #231 there and duplicating the row would guarantee a keyed-record
 conflict.
 
+**Record repair to the above (`SAMPLE-LOGPROBS`, 2026-08-10, issue #231).** Claude
+Code (claude-opus-5), isolated worktree
+`/home/mudler/_git/vllm.cpp-logprobs-record`, branch
+`row/SAMPLE-LOGPROBS-RECORD-REPAIR`, base `origin/main` `1c1749cb` pinned at
+worktree creation. **Follows the entry directly above**: the fix landed as
+`fd9af7d9` (merged `723d96a8`, PR #236, from `row/SAMPLE-LOGPROBS-ALL-SENTINEL`)
+and the CODE is correct, but an independent review found two shipped records
+false. (1) The crash site: the SIGSEGV is in `LogprobsTensors::slice_request`
+(`src/vllm/v1/outputs.cpp:31-37`) from `scheduler.cpp:920-924`, NOT in
+`LogprobsProcessor::UpdateSampleLogprobs` — the reviewer instrumented both
+consumers with the widening reverted and `UpdateSampleLogprobs` is never entered;
+reproduced here before the edit. (2) `docs/USAGE.md` claimed the HTTP `logprobs`
+field "keeps its own 0..5 range"; nothing in the tree enforces any range, and
+upstream deliberately admits `-1` on the CHAT surface, so
+`{"logprobs":true,"top_logprobs":-1}` is a real capability the widening unblocked
+and it was untested. Scope: the crash-site attribution in
+[logprobs-all-sentinel.md](specs/logprobs-all-sentinel.md), the `SAMPLE-LOGPROBS`
+evidence cell in [engine-matrix.md](engine-matrix.md), the section-8 comment in
+`tests/vllm/v1/test_llm_engine.cpp`, the stale guard comment in
+`src/vllm/v1/engine/logprobs.cpp`, a strengthened finite-count assertion, one
+added chat `top_logprobs=-1` case in
+`tests/vllm/entrypoints/openai/test_serving.cpp`, the `SamplingParams::logprobs`
+paragraph in `docs/USAGE.md`, and this entry. NO behaviour change: `add_request`,
+`max_num_logprobs()` and the sampler are untouched. CPU-only; NO kernel, vt op,
+ABI, CMake, model file or GPU change. Porting upstream's `check_logprobs` /
+`max_logprobs` validation stays out of scope — that is issue #249. Roadmap issue
+table still untouched: PR #235 registers #231 there and is open, so adding it
+again would duplicate a keyed record; `AGENTS.md` does prescribe how to resolve
+such a conflict, so this is duplication avoidance rather than an unresolvable
+clash — and if #235 closes without landing, #231 loses its roadmap registration
+and this row owes that line.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MOONCAKE-STORE` | `KV-MOONCAKE-STORE` (new, `SPIKE`) | Claude Code (opus-5), helper role | isolated worktree `/home/mudler/_git/vllm.cpp-mooncake`; records-only — NO build, NO GPU, NO download, NO external dependency installed | `row/KV-MOONCAKE-STORE`, base `origin/main` `848d4a87` | The `MooncakeStoreConnector` spike, records-only in this commit: NEW [`.agents/specs/mooncake-store-connector.md`](specs/mooncake-store-connector.md), the NEW `KV-MOONCAKE-STORE` engine-matrix row + section/total counters, the `ENGINE_ROWS` 146→147 bump in `scripts/check-agent-record.py` with its justification comment, a PROSE-ONLY Mooncake-disposition correction inside the `KV-CONNECTORS` row (both NOT-SCHEDULED sentences; that row's `ANCHOR-BACKFILL` state, tier, anchors, evidence, spec link and owner are UNCHANGED, so it is not claimed here), the `ROAD-V1-D4` portfolio note + canonical-table link, the roadmap issue-table row for [#287](https://github.com/mudler/vllm.cpp/issues/287), and this claim. **NON-COLLISION:** touches NO `src/`, `include/`, `tests/`, `examples/` or CMake path; the only script touched is the record checker's own row-count constant. | `ACTIVE` | 2026-08-10 — spec committed. The `KV-CONNECTORS` spike's blanket "Mooncake NOT SCHEDULED" conflated TWO connectors: `MooncakeConnector` (P2P prefill/decode over the Transfer Engine — two nodes, fabric, proxy) KEEPS that verdict; `MooncakeStoreConnector` (shared KV object store, the LMCache analogue) is reopened because (a) Mooncake is NATIVE C++ — `mooncake::Client` in `client_service.h`, and the `MooncakeDistributedStore` vLLM imports is a pybind wrapper over it — so we LINK instead of reimplementing a wire (the inverse of the LMCache cost shape), and (b) its single-node `protocol: "tcp"` + `mooncake_master` config is gateable on one box with NO RDMA NIC. The landed W5 `KVConnector` seam needs NO change. NEXT: W0, the go/no-go link spike (build Mooncake from source, pin the revision, drive `mooncake::Client` from a standalone C++ TU against a local master over TCP) — a genuine stop point per spec §S1. Speed is recorded as an OPEN axis: the RDMA/GPUDirect path that motivates the connector is unmeasurable for want of a fabric on any box we own. PENDING developer authority: the Mooncake source build, push/PR. |
