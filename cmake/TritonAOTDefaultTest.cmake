@@ -33,7 +33,12 @@ file(REMOVE_RECURSE "${_scratch}")
 set_property(GLOBAL PROPERTY VT_TRITON_DEFAULT_TEST_FAILURES "")
 
 function(_fail MESSAGE)
-  set_property(GLOBAL APPEND PROPERTY VT_TRITON_DEFAULT_TEST_FAILURES "${MESSAGE}")
+  # A recorded message can quote a decline reason, and that reason JOINs several
+  # tree defects with "; ". CMake lists are semicolon-separated, so a literal
+  # semicolon would split one failure into several entries and inflate the
+  # count; flatten it before appending.
+  string(REPLACE ";" "," _message "${MESSAGE}")
+  set_property(GLOBAL APPEND PROPERTY VT_TRITON_DEFAULT_TEST_FAILURES "${_message}")
 endfunction()
 
 function(_expect CASE EXPECTED_DEFAULT EXPECTED_REASON_SUBSTRING
