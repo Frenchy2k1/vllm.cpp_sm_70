@@ -514,7 +514,25 @@ STATUS_RATCHET = {
     # campaign spec, and says why the older figure is not a competitor. The
     # explanation is paid for out of the page, not added to it. Strictly DOWN
     # from 243519, the only direction this number may move.
-    "chars": 243455,
+    # 243512 since 2026-08-10 (measured 243512, #277): the metrics paragraph and
+    # the OpenAI-server row both carried a claim that had become FALSE -- that
+    # the async serving path has no live metric backing. Wiring it (the AsyncLLM
+    # output handler now folds each step's stats into the logger) RETIRES a
+    # residual rather than adding one, so the correction is a net deletion:
+    # "metrics and cache reset lack live async backing" loses its first subject,
+    # and "the async production-serving path wiring" leaves the remaining-work
+    # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
+    # each rebase); re-pinned byte-tight to the merged measurement.
+    #
+    # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
+    # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
+    # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    #
+    # 243368 since 2026-08-10 (measured 243368): reconciled once more when the
+    # external-PR landing (#155 + #266) merged current main, which had itself
+    # re-pinned to 243512 for #277. Both histories are kept above; this is the
+    # single measured value for the merged page. Strictly DOWN from 243455.
+    "chars": 243368,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

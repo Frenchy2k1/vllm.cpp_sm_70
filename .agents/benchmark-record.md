@@ -17834,6 +17834,85 @@ of vLLM's fused `triton_poi_fused_mul_silu_slice_0`, and we run a
 Evidence: `dgx:~/mbprof/ours-c8.sqlite`, `dgx:~/vlprof2/vllm-profile/`,
 `cuobjdump -res-usage` on both binaries.
 
+## 35B glue lever #2 LANDS: shared-expert down-proj emits bf16, one CastF32 per layer-step removed (+2.05% c8, 2026-08-10, `row/PERF-35B-SHARED-DOWN-BF16`, GB10, #213)
+
+Follows the glue lead from the withdrawn per-launch entry: glue was 13.00% of
+GPU kernel time ours against 11.37% vLLM, with a `CastF32Kernel` (~1 per layer
+per step) that has no oracle counterpart.
+
+Root cause: the shared expert's `down_proj` called `MatmulNvfp4F32D`, i.e. the
+Marlin GEMM produced bf16 and was then upcast to f32 across a whole `[T,H]`
+buffer -- while BOTH consumers (`SharedExpertGate` and `MoeCombineGate`) widen
+to float in-kernel and re-round through bf16 on store. The f32 buffer was
+written and re-read for a value that was already bf16.
+
+Fix: `sd` is now templated in both consumers (bf16 or f32) and the sink uses the
+existing `MatmulNvfp4Bf16D`. `VT_SHARED_DOWN_BF16`, default ON per the
+parity-enabler policy.
+
+**BIT-IDENTICAL, and the gates say so on BOTH arms with UNCHANGED assertion
+counts** -- `test_qwen36_paged_engine` 315/315 and `test_qwen27_paged_engine`
+235/235 with `Status: SUCCESS` for ON and for `=0`. The warm-server greedy probe
+is byte-identical across all four runs (`d4dfa279e5a5`), which the previous
+lever could not show because its baseline was unstable run-to-run.
+
+**MEASURED same binary, 3 reps/arm, order-alternated, single load per arm:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | f32 (opt-out) | 193.2, 193.6, 188.8 | 193.22 | - |
+| c8 | bf16 (default) | 197.2, 197.4, 196.5 | **197.18** | **+2.05%** (ITL -1.72%) |
+| c4 | f32 | 140.3, 141.6, 141.8 | 141.59 | - |
+| c4 | bf16 | 142.2, 142.7, 142.9 | **142.71** | **+0.79%** |
+
+Bands NON-OVERLAPPING at both points (c8 max f32 193.6 < min bf16 196.5; c4
+141.8 < 142.2).
+
+**A METHODOLOGY BUG this exposed, worth more than the lever.** The first attempt
+at this change wired only `SharedExpertGate` and missed `MoeCombineGate`, which
+threw `sd must be f32 [T,H]`. The gate command in use greps `assertions:`, and
+that line read `285 | 285 passed | 0 failed` -- GREEN -- while the run's real
+status was `test cases: 0 passed | 2 failed` / `Status: FAILURE!`. When a case
+throws, assertions already executed still count as passed and the case aborts.
+What caught it was the assertion COUNT (285 against the 315 this gate always
+reports), not the pass/fail. **Gate commands must grep `Status:`/`test cases:`
+as well, and any change in assertion count is RED even when everything
+"passed".**
+
+Cumulative on the mid-band: this plus the shared gate_up dense route. The band
+is still OPEN -- glue was 1.63 points of the ~6.5% deficit and the ~2x SiLU
+launch count against vLLM's fused `triton_poi_fused_mul_silu_slice_0` is the
+next countable item.
+
+Evidence: `dgx:~/abdown` (12 result JSONs + 4 identical token probes),
+`dgx:~/g5.log` (both arms, both gates, with Status lines).
+
+## CORRECTIONS to the two 35B glue entries above (2026-08-10)
+
+Two numbers those entries carry do not survive re-measurement. Corrected here
+rather than left standing.
+
+**"~2x the SiLU launch count" is WRONG.** It matched only ONE of vLLM's two
+SiLU-family kernels. Normalised per layer-step, vLLM runs
+`triton_poi_fused_mul_silu_slice_0` at 1.00 AND
+`vllm::act_and_mul_kernel<..., __nv_bfloat162, ...>` at 0.98 = **1.98**, against
+our 2.00. **The counts MATCH.** What differs is per-launch cost: ours 22.6 us
+against ~2.45 us, a **9.2x** gap — 4.1% of our GPU kernel time against 0.50% of
+vLLM's, i.e. **3.6 percentage points**, over half the remaining mid-band. Now
+spec'd as `PERF-35B-SILU-VECTORIZE` ([spec](specs/moe-silu-vectorize.md)): our
+kernel does two integer divisions per element and no vectorisation; vLLM's does
+neither.
+
+**"CastF32 was 3.1% of the 35B decode step"** was quoted from the older f32-out
+GEMV audit row, not from the c8 profile that justified the change. In that
+profile `CastF32Kernel` is **0.6%** of GPU kernel time at 1.02 launches per
+layer-step. The landed +2.05% is unaffected and gate-verified — the win is the
+eliminated `[T,H]` f32 write plus the consumer's cheaper read, not the cast
+kernel's own share — but 3.1% is not this profile's number.
+
+Both corrections share one failure mode: matching a single kernel name and
+concluding a ratio. Enumerate the whole kernel family and normalise per
+layer-step before claiming any count difference.
 ## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
 
 **Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
