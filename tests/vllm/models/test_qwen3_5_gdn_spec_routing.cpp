@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -391,5 +392,133 @@ TEST_CASE("GDN MIXED spec+prefill routing (CUDA): mixed batch matches pure spec 
   vt::GetBackend(vt::DeviceType::kCUDA);
   RunMixedRoutingCase(vt::DeviceType::kCUDA, kGate27B, /*bit_exact=*/false);
   RunMixedRoutingCase(vt::DeviceType::kCUDA, kGate35B, /*bit_exact=*/false);
+}
+
+// PERF-27B-GDN-FP8-QKVZ, the numerical contract: ONE merged fp8 GEMM over the
+// N-concatenated [qkv;z] operand must produce EXACTLY the concatenation of the
+// two legacy per-shard fp8 GEMM outputs. Both arms run in one process over one
+// uploaded activation and one set of resident bytes, so the comparison is
+// bitwise. The merged output is f32 (the dtype the split mixed_qkv GEMM already
+// emits) and z is cast to the split arm's own output dtype, so nothing about the
+// split arithmetic is traded for the shape change.
+//
+// Two weight-scale regimes, because they take different code paths inside the
+// merged GEMM: EQUAL folded alphas fold into the GEMM scalar, DIFFERENT ones go
+// through the resident per-output-column alpha vector.
+TEST_CASE("GDN merged FP8 qkvz == the two split fp8 GEMMs, bitwise") {
+  vt::GetBackend(vt::DeviceType::kCUDA);  // skip cleanly if no device
+  const int64_t H = 256;
+  const int64_t conv_dim = 192;   // 2*key_dim + value_dim
+  const int64_t value_dim = 128;
+  const int64_t T = 3;
+
+  const auto make_fp8 = [&](int64_t n, uint64_t seed, float input_scale,
+                            float weight_scale) {
+    vllm::Fp8Weight f;
+    f.n = n;
+    f.k = H;
+    f.input_scale = input_scale;
+    f.weight_scale = weight_scale;
+    f.alpha = input_scale * weight_scale;
+    f.packed.dtype = DType::kI8;
+    f.packed.rank = 2;
+    f.packed.shape[0] = n;
+    f.packed.shape[1] = H;
+    f.packed.bytes.resize(static_cast<size_t>(n * H));
+    auto* bytes = f.packed.bytes.data();
+    for (int64_t i = 0; i < n * H; ++i) {
+      // e4m3 byte patterns with the sign/exponent bits exercised; 0x7f/0xff are
+      // NaN in e4m3fn, so keep the mantissa/exponent below that.
+      bytes[static_cast<size_t>(i)] = static_cast<uint8_t>(
+          Mix(seed + static_cast<uint64_t>(i)) % 0x7EU);
+    }
+    return f;
+  };
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i)
+    h[i] = RandV(9000 + static_cast<uint64_t>(i), -0.5F, 0.5F);
+
+  const float shared_input_scale = 0.0078125F;
+  for (const bool same_weight_scale : {true, false}) {
+    for (const bool z_bf16 : {true, false}) {
+      CAPTURE(same_weight_scale);
+      CAPTURE(z_bf16);
+      GdnLayerWeights w;
+      w.in_proj_qkv_fp8 =
+          make_fp8(conv_dim, 101, shared_input_scale, 0.00390625F);
+      w.in_proj_z_fp8 = make_fp8(
+          value_dim, 202, shared_input_scale,
+          same_weight_scale ? 0.00390625F : 0.015625F);
+
+      const std::vector<float> merged = vllm::ProjectGdnFp8QkvzForTest(
+          Q(vt::DeviceType::kCUDA), w, h, T, conv_dim, value_dim,
+          /*merged=*/true, z_bf16);
+      const std::vector<float> split = vllm::ProjectGdnFp8QkvzForTest(
+          Q(vt::DeviceType::kCUDA), w, h, T, conv_dim, value_dim,
+          /*merged=*/false, z_bf16);
+      REQUIRE(merged.size() == split.size());
+      size_t bad = 0;
+      size_t first_bad = 0;
+      for (size_t i = 0; i < merged.size(); ++i) {
+        if (std::memcmp(&merged[i], &split[i], sizeof(float)) != 0) {
+          if (bad == 0) first_bad = i;
+          ++bad;
+        }
+      }
+      if (bad != 0) {
+        CAPTURE(first_bad);
+        CAPTURE(merged[first_bad]);
+        CAPTURE(split[first_bad]);
+      }
+      CHECK(bad == 0);
+    }
+  }
+}
+
+// The merged operand must exist BEFORE the first forward — a resident built
+// inside a CUDA-graph capture allocates and copies mid-capture, which aborts
+// the capture. PrepareGdnFp8Resident is registered on the dense prepare hook and
+// is what guarantees it; deleting that call leaves d_qkvz_fp8_packed null here.
+TEST_CASE("GDN merged FP8 qkvz resident is built pre-capture, at prepare") {
+  vt::GetBackend(vt::DeviceType::kCUDA);  // skip cleanly if no device
+  const int64_t H = 256;
+  const HfConfig c = MakeConfig(kGate27B, H);
+  const int64_t value_dim = kGate27B.hv * kGate27B.dv;
+  const int64_t conv_dim = 2 * kGate27B.hk * kGate27B.dk + value_dim;
+
+  const auto make_fp8 = [&](int64_t n, uint64_t seed) {
+    vllm::Fp8Weight f;
+    f.n = n;
+    f.k = H;
+    f.input_scale = 0.0078125F;
+    f.weight_scale = 0.00390625F;
+    f.alpha = f.input_scale * f.weight_scale;
+    f.packed.dtype = DType::kI8;
+    f.packed.rank = 2;
+    f.packed.shape[0] = n;
+    f.packed.shape[1] = H;
+    f.packed.bytes.resize(static_cast<size_t>(n * H));
+    auto* bytes = f.packed.bytes.data();
+    for (int64_t i = 0; i < n * H; ++i)
+      bytes[static_cast<size_t>(i)] = static_cast<uint8_t>(
+          Mix(seed + static_cast<uint64_t>(i)) % 0x7EU);
+    return f;
+  };
+
+  vllm::Qwen3_5DenseWeights weights;
+  vllm::Qwen3_5DenseLayerWeights layer;
+  layer.is_linear_attention = true;
+  layer.gdn.in_proj_qkv_fp8 = make_fp8(conv_dim, 11);
+  layer.gdn.in_proj_z_fp8 = make_fp8(value_dim, 22);
+  weights.layers.push_back(std::move(layer));
+
+  REQUIRE_FALSE(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_packed));
+  vt::Queue q = Q(vt::DeviceType::kCUDA);
+  vllm::Qwen3_5DenseModel::PrepareGdnFp8Resident(weights, c, q);
+  CHECK(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_packed));
+  // Equal folded alphas: the alpha vector is folded into the GEMM scalar and no
+  // second resident is allocated.
+  CHECK_FALSE(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_alpha));
 }
 #endif

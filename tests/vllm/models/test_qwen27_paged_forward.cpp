@@ -495,6 +495,136 @@ TEST_CASE("qwen27 merged qkvz selection requires CUDA, owner, toggle, one dtype"
   }
 }
 
+// PERF-27B-GDN-FP8-QKVZ — the FP8 leaf's dispatch predicate. vLLM issues ONE
+// merged qkvz GEMM per GDN layer on this tower too (the 27B NVFP4 checkpoint is
+// `modelopt_mixed`, so its GDN input projections are FP8 W8A8 and the BF16
+// merged owner is empty). The merged fp8 GEMM quantizes the shared activation
+// ONCE, so a shard pair that does not agree bitwise on `input_scale` MUST stay
+// on the exact two legacy GEMMs. Every term is load-invariant and checked once.
+TEST_CASE("qwen27 merged FP8 qkvz selection requires every guard") {
+  vllm::detail::GdnMergedFp8QkvzEligibility e;
+  e.runtime_enabled = true;
+  e.fp8_platform = true;
+  e.has_fp8_shards = true;
+  e.shared_k = true;
+  e.shared_input_scale = true;
+  e.shard_widths_match = true;
+
+  CHECK(vllm::detail::ShouldUseMergedGdnFp8Qkvz(e));
+
+  {
+    auto x = e;
+    x.runtime_enabled = false;  // VT_GDN_MERGED_QKVZ_FP8=0 (or the BF16 leaf's
+                                // VT_GDN_MERGED_QKVZ=0 / VT_GDN_MERGED_PROJ=0).
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.fp8_platform = false;  // CPU / no fp8 GEMM registered.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.has_fp8_shards = false;  // 27B BF16 merged owner / GGUF / synthetic.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.shared_k = false;  // the two shards do not read one [M,K] activation.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.shared_input_scale = false;  // THE scale-compatibility stop condition.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.shard_widths_match = false;  // shard N != conv_dim / value_dim.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+}
+
+// The load-time scale-compatibility predicate itself. ModelOpt FP8 here is
+// PER-TENSOR: the merged GEMM can only reproduce both split GEMMs when the two
+// shards quantize the activation with the identical scalar, so the comparison is
+// exact float equality — one ulp apart must fall back. This is the same
+// predicate `Fp8SharedInputScale` applies to this pair for the fused
+// RmsNorm+quant, so the two guards cannot drift.
+TEST_CASE("qwen27 GDN fp8 shared input_scale is exact, not approximate") {
+  const auto shard = [](int64_t n, int64_t k, float input_scale,
+                        float weight_scale) {
+    vllm::Fp8Weight w;
+    w.n = n;
+    w.k = k;
+    w.input_scale = input_scale;
+    w.weight_scale = weight_scale;
+    w.alpha = input_scale * weight_scale;
+    w.packed.dtype = DType::kI8;
+    w.packed.rank = 2;
+    w.packed.shape[0] = n;
+    w.packed.shape[1] = k;
+    w.packed.bytes.resize(static_cast<size_t>(n * k));
+    return w;
+  };
+
+  const float base = 0.0078125F;
+  const float one_ulp = std::nextafter(base, 1.0F);
+  REQUIRE(base != one_ulp);
+
+  {
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    g.in_proj_z_fp8 = shard(6144, 5120, base, 0.0005340576F);
+    float scale = 0.0F;
+    CHECK(vllm::detail::GdnFp8SharedInputScale(g, &scale));
+    CHECK(scale == base);
+  }
+  {
+    // One ulp apart: NOT mergeable. The activation each split GEMM quantizes
+    // would differ, so one merged GEMM cannot reproduce both.
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    g.in_proj_z_fp8 = shard(6144, 5120, one_ulp, 0.0005340576F);
+    float scale = -1.0F;
+    CHECK_FALSE(vllm::detail::GdnFp8SharedInputScale(g, &scale));
+    CHECK(scale == -1.0F);  // untouched on rejection.
+  }
+  {
+    // Differing WEIGHT scales are fine — each shard's folded alpha is applied
+    // per output column, so only the activation scale has to agree.
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    g.in_proj_z_fp8 = shard(6144, 5120, base, 0.25F);
+    CHECK(vllm::detail::GdnFp8SharedInputScale(g, nullptr));
+  }
+  {
+    // A non-FP8 owner (27B BF16 merged / GGUF / synthetic) is never mergeable.
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    CHECK_FALSE(vllm::detail::GdnFp8SharedInputScale(g, nullptr));
+  }
+}
+
+// The merged-FP8 leaf's rollback env truth table, pinned on the CPU tier the
+// same way PackedGdnDecodeEnvSelected is: VT_GDN_MERGED_QKVZ_FP8 is the leaf
+// switch and the BF16 leaf's master/leaf rollbacks also turn it off, so one
+// switch can retire the whole merged-input-projection topology.
+TEST_CASE("qwen27 merged FP8 qkvz env rollback truth table") {
+  using vllm::detail::GdnMergedFp8QkvzEnvConfig;
+  using vllm::detail::MergedGdnFp8QkvzEnvSelected;
+
+  CHECK(MergedGdnFp8QkvzEnvSelected(GdnMergedFp8QkvzEnvConfig{}));  // all unset.
+  CHECK(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{"1", "1", "1"}));
+  CHECK_FALSE(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{"0", nullptr, nullptr}));  // master off.
+  CHECK_FALSE(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{nullptr, "0", nullptr}));  // BF16 leaf off.
+  CHECK_FALSE(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{nullptr, nullptr, "0"}));  // FP8 leaf off.
+}
+
 // The 27B gate's packed-dispatch-count contract must agree with the engine's
 // process-cached env couplings: ShouldUsePackedGdnDecode requires
 // merged_ba_enabled (master VT_GDN_MERGED_PROJ + leaf VT_GDN_MERGED_BA) and
