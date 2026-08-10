@@ -551,6 +551,30 @@ class StatusRatchet(unittest.TestCase):
                     "change that lowers the ratchet -- never the reverse",
                 )
 
+    def test_the_repin_was_paid_for_by_a_real_collapse(self) -> None:
+        # Lowering the cap is the honest half of "STATUS may only shrink"; the
+        # dishonest half is lowering it after growing the page and calling the
+        # difference rounding. The 2026-08-09 prompt-logprobs re-pin added a
+        # Sampling clause and paid for it by collapsing three restatements in the
+        # same row.
+        #
+        # So assert the payment, not the arithmetic: put the collapsed text back
+        # and the page must break the cap it is pinned to. If a later edit
+        # quietly restores that prose, this goes red rather than the slack being
+        # silently re-spent.
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        restored = text.replace(
+            "); the C-ABI beam",
+            "), so beam search runs on the real server (the C-ABI beam",
+            1,
+        ).replace(
+            "beams are stepped sequentially).",
+            "beams are stepped sequentially, byte-identical to the sync driver).",
+            1,
+        )
+        self.assertNotEqual(restored, text, "the collapsed prose is not where it was")
+        self.assertGreater(len(restored), doc_tables.STATUS_RATCHET["chars"])
+
     def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
         # A ratchet parked well above the page it guards is not a ratchet: it
         # silently licenses regrowth up to the old number. The rule is "lower it
