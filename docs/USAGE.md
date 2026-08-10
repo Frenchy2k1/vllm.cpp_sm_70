@@ -216,6 +216,15 @@ forms in use, so pick a checkpoint by its quality, not by its head:
 The head is dequantized to BF16 at load, so all three cost the same memory once
 running. Any other dtype fails at load with a message naming what it saw.
 
+A `modelopt_mixed` checkpoint (`nvidia/Qwen3.6-27B-NVFP4`, and the 35B-A3B that
+shares the tower) keeps its `linear_attn` input projections in FP8 W8A8, and
+those two per-layer projections are packed into ONE merged `in_proj_qkvz` GEMM,
+mirroring vLLM's `MergedColumnParallelLinear`. The merge only fires when the two
+shards carry a bitwise-identical per-tensor `input_scale`, since one GEMM
+quantizes the activation once; a checkpoint whose scales differ keeps the two
+separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
+in the same binary.
+
 ## OpenAI-compatible server
 
 `vllm-server` is a small HTTP server speaking the OpenAI API. Source:

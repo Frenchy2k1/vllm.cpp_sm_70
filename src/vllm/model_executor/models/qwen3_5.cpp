@@ -80,6 +80,57 @@ bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
 
+// PERF-27B-GDN-FP8-QKVZ. Every term is required: dropping any one of them must
+// leave the exact two legacy fp8 GEMMs. `shared_input_scale` is the load-time
+// scale-compatibility guard (the merged GEMM quantizes the activation ONCE, so
+// the two shards must agree bitwise on the per-tensor activation scale) and is
+// the term that keeps a checkpoint whose scales differ on the split path.
+bool detail::ShouldUseMergedGdnFp8Qkvz(const GdnMergedFp8QkvzEligibility& e) {
+  return e.runtime_enabled && e.fp8_platform && e.has_fp8_shards &&
+         e.shared_k && e.shared_input_scale && e.shard_widths_match;
+}
+
+// True (and *scale filled) only when both fp8 GDN input shards are populated and
+// carry the SAME per-tensor activation scale, by exact float equality. This is
+// the single definition; `Fp8SharedInputScale`'s linear-attention branch calls
+// it, so the fused RmsNorm+quant guard and the merge guard cannot drift.
+bool detail::GdnFp8SharedInputScale(const GdnLayerWeights& gdn, float* scale) {
+  if (gdn.in_proj_qkv_fp8.Empty() || gdn.in_proj_z_fp8.Empty()) return false;
+  if (gdn.in_proj_qkv_fp8.input_scale != gdn.in_proj_z_fp8.input_scale)
+    return false;
+  if (scale != nullptr) *scale = gdn.in_proj_qkv_fp8.input_scale;
+  return true;
+}
+
+bool detail::MergedGdnFp8QkvzEnvSelected(const GdnMergedFp8QkvzEnvConfig& env) {
+  if (env.merged_proj != nullptr && env.merged_proj[0] == '0') return false;
+  if (env.merged_qkvz != nullptr && env.merged_qkvz[0] == '0') return false;
+  return env.merged_qkvz_fp8 == nullptr || env.merged_qkvz_fp8[0] != '0';
+}
+
+namespace {
+std::atomic<bool> g_gdn_fp8_inproj_debug_enabled{false};
+std::atomic<uint64_t> g_gdn_fp8_inproj_merged{0};
+std::atomic<uint64_t> g_gdn_fp8_inproj_split{0};
+}  // namespace
+
+void detail::ResetGdnFp8InProjDebugStats() {
+  g_gdn_fp8_inproj_merged.store(0, std::memory_order_relaxed);
+  g_gdn_fp8_inproj_split.store(0, std::memory_order_relaxed);
+  g_gdn_fp8_inproj_debug_enabled.store(true, std::memory_order_release);
+}
+
+detail::GdnFp8InProjDebugStats detail::GetGdnFp8InProjDebugStats() {
+  GdnFp8InProjDebugStats out;
+  out.merged_launches = g_gdn_fp8_inproj_merged.load(std::memory_order_relaxed);
+  out.split_launches = g_gdn_fp8_inproj_split.load(std::memory_order_relaxed);
+  return out;
+}
+
+void detail::DisableGdnFp8InProjDebugStats() {
+  g_gdn_fp8_inproj_debug_enabled.store(false, std::memory_order_release);
+}
+
 bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
   const bool runtime_enabled =
@@ -3089,6 +3140,146 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   return out;
 }
 
+// --- PERF-27B-GDN-FP8-QKVZ: the FP8 leaf of the merged GDN input projection.
+// The BF16 leaf below owns a merged `in_proj_qkvz` parameter; a ModelOpt FP8
+// tower (`nvidia/Qwen3.6-27B-NVFP4` is `modelopt_mixed`; the 35B shares the
+// tower) keeps the two shards native, so the loader leaves that owner empty and
+// this arm merges the RAW fp8 bytes instead. Same upstream behavior being
+// mirrored: MergedColumnParallelLinear packs qkv+z along N and ONE GEMM runs
+// per GDN layer (qwen_gdn_linear_attn.py:923-936, linear.py:580-636 @ 702f4814).
+
+// VT_GDN_MERGED_QKVZ_FP8, DEFAULT ON. Also honors the BF16 leaf's rollbacks so a
+// single switch turns the whole merged-input-projection topology off: master
+// VT_GDN_MERGED_PROJ=0 or leaf VT_GDN_MERGED_QKVZ=0 disables this arm too.
+// Process-cached, resolved outside the hot loop.
+bool MergedGdnFp8QkvzEnabled() {
+  static const bool enabled = [] {
+    return detail::MergedGdnFp8QkvzEnvSelected(
+        detail::GdnMergedFp8QkvzEnvConfig{
+            std::getenv("VT_GDN_MERGED_PROJ"),
+            std::getenv("VT_GDN_MERGED_QKVZ"),
+            std::getenv("VT_GDN_MERGED_QKVZ_FP8")});
+  }();
+  return enabled;
+}
+
+detail::GdnMergedFp8QkvzEligibility GdnMergedFp8QkvzEligibilityFor(
+    Dev d, const GdnLayerWeights& w, int64_t conv_dim, int64_t value_dim) {
+  detail::GdnMergedFp8QkvzEligibility e;
+  e.runtime_enabled = MergedGdnFp8QkvzEnabled();
+  e.fp8_platform =
+      vllm::platforms::GetPlatform(d.q.device.type).supports_fp8() &&
+      vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type);
+  e.has_fp8_shards = !w.in_proj_qkv_fp8.Empty() && !w.in_proj_z_fp8.Empty();
+  e.shared_k = e.has_fp8_shards && w.in_proj_qkv_fp8.k == w.in_proj_z_fp8.k;
+  e.shared_input_scale = detail::GdnFp8SharedInputScale(w, nullptr);
+  e.shard_widths_match = e.has_fp8_shards &&
+                         w.in_proj_qkv_fp8.n == conv_dim &&
+                         w.in_proj_z_fp8.n == value_dim;
+  return e;
+}
+
+// The resident N-concatenated [qkv;z] fp8 operand + its column-alpha policy.
+// Mirrors ResidentFp8Qkv (the attention QKV sibling) byte for byte in structure.
+struct Fp8QkvzDev {
+  Tensor packed;     // i8 [conv_dim+value_dim, K] raw e4m3fn (K contiguous)
+  Tensor alpha_vec;  // f32 [conv_dim+value_dim]; valid only when !folded
+  float alpha = 1.0F;  // the GEMM scalar (the shared folded alpha, or 1)
+  bool folded = false;
+};
+
+// Build (lazily, ONCE — and eagerly pre-capture via PrepareGdnFp8Resident) the
+// merged operand. The two shards' packed rows are byte-concatenated: fp8 e4m3 is
+// a raw byte encoding read in [N,K] orientation, so concatenating along N is
+// lossless and needs no repack. The per-tensor input_scale must already be
+// shared (the caller's eligibility guarantees it, re-checked here). Each shard's
+// folded alpha (= shared input_scale * that shard's weight_scale) is applied per
+// OUTPUT COLUMN: folded into the GEMM scalar when both shards fold the same
+// alpha — the byte-exact case, no extra launch — else through the resident
+// per-column vector, exactly as MergedFp8QkvD does.
+Fp8QkvzDev ResidentFp8Qkvz(Dev d, const GdnLayerWeights& w) {
+  const Fp8Weight& qkv = w.in_proj_qkv_fp8;
+  const Fp8Weight& z = w.in_proj_z_fp8;
+  VT_CHECK(!qkv.Empty() && !z.Empty(),
+           "qwen3_5 merged FP8 GDN qkvz: empty logical shard");
+  VT_CHECK(qkv.k == z.k, "qwen3_5 merged FP8 GDN qkvz: logical shard K mismatch");
+  VT_CHECK(qkv.input_scale == z.input_scale,
+           "qwen3_5 merged FP8 GDN qkvz: shards do not share one input_scale");
+  const int64_t inner_k = qkv.k;
+  const int64_t total_n = qkv.n + z.n;
+  const size_t qpb = qkv.packed.bytes.size();
+  const size_t zpb = z.packed.bytes.size();
+  VT_CHECK(qpb == static_cast<size_t>(qkv.n * inner_k) &&
+               zpb == static_cast<size_t>(z.n * inner_k),
+           "qwen3_5 merged FP8 GDN qkvz: packed shard byte mismatch");
+  const bool folded = qkv.alpha == z.alpha;
+
+  if (!w.d_qkvz_fp8_packed) {
+    Backend* backend = &d.b;
+    void* packed_data = d.b.Alloc(qpb + zpb);
+    std::shared_ptr<void> packed_owner(
+        packed_data, [backend](void* pointer) { backend->Free(pointer); });
+    auto* dst = static_cast<uint8_t*>(packed_data);
+    d.b.Copy(d.q, dst, qkv.packed.bytes.data(), qpb);
+    d.b.Copy(d.q, dst + qpb, z.packed.bytes.data(), zpb);
+    if (!folded) {
+      std::vector<float> alpha_host(static_cast<size_t>(total_n));
+      std::fill(alpha_host.begin(), alpha_host.begin() + qkv.n, qkv.alpha);
+      std::fill(alpha_host.begin() + qkv.n, alpha_host.end(), z.alpha);
+      void* alpha_data = d.b.Alloc(static_cast<size_t>(total_n) * sizeof(float));
+      std::shared_ptr<void> alpha_owner(
+          alpha_data, [backend](void* pointer) { backend->Free(pointer); });
+      d.b.Copy(d.q, alpha_data, alpha_host.data(),
+               alpha_host.size() * sizeof(float));
+      w.d_qkvz_fp8_alpha = std::move(alpha_owner);
+    }
+    w.d_qkvz_fp8_packed = std::move(packed_owner);
+  }
+
+  Fp8QkvzDev out;
+  out.packed = MakeTensor(w.d_qkvz_fp8_packed.get(), DType::kI8, d.q.device,
+                          {total_n, inner_k});
+  out.folded = folded;
+  out.alpha = folded ? qkv.alpha : 1.0F;
+  if (!folded) {
+    VT_CHECK(static_cast<bool>(w.d_qkvz_fp8_alpha),
+             "qwen3_5 merged FP8 GDN qkvz: partial resident state");
+    out.alpha_vec = MakeTensor(w.d_qkvz_fp8_alpha.get(), DType::kF32,
+                               d.q.device, {total_n});
+  }
+  return out;
+}
+
+// ONE fp8 GEMM over the N-concatenated [qkv;z] operand -> f32 [M, conv_dim +
+// value_dim]. `h_fp8` is the shared pre-quantized activation (quantize-once)
+// when supplied, else the activation is quantized here with the shared
+// input_scale — the SAME activation bytes both split GEMMs would have read,
+// which is why one shared input_scale is a hard precondition. Output is f32 so
+// each column's alpha is applied by the same IEEE f32 multiply the folded-alpha
+// GEMM would apply, keeping the merged result identical to the concatenation of
+// the two split f32 GEMM outputs.
+DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
+                    const GdnLayerWeights& w) {
+  Fp8QkvzDev qkvz = ResidentFp8Qkvz(d, w);
+  const int64_t M = h_fp8 != nullptr ? h_fp8->shape[0] : x.shape[0];
+  const int64_t total_n = qkvz.packed.shape[0];
+  DBuf out(d, DType::kF32, {M, total_n});
+  const Tensor* a_fp8_p = h_fp8;
+  std::optional<DBuf> a_fp8_owner;
+  if (a_fp8_p == nullptr) {
+    const int64_t K = x.shape[1];
+    a_fp8_owner.emplace(d, DType::kI8, std::vector<int64_t>{M, K});
+    vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.in_proj_qkv_fp8.input_scale);
+    a_fp8_p = &a_fp8_owner->t();
+  }
+  if (DenseCublasLtFp8Enabled())
+    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  else
+    vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  if (!qkvz.folded) vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+  return out;
+}
+
 // vLLM's Qwen3.5/3.6 GDN owns one physical `in_proj_qkvz` and invokes it once,
 // then exposes logical [mixed_qkv, z] last-dim views
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814). W2 enables that topology only
@@ -3153,6 +3344,38 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.z = out.z_owner->t();
     return out;
   }
+  // PERF-27B-GDN-FP8-QKVZ — the native-FP8 owner's merged arm. ONE fp8 GEMM
+  // over the N-concatenated [qkv;z] operand replaces the two below; `mixed_qkv`
+  // and `z` become last-dim views of its output, exactly as in the BF16 leaf.
+  // The merged output is f32 — the dtype the split `mixed_qkv` GEMM already
+  // emits — so `mixed_qkv` is byte-identical. `z`'s split GEMM emits `outdt`;
+  // when that is not f32 the f32 view is cast, which rounds the SAME f32 product
+  // the split GEMM's epilogue would have rounded. Nothing about the split
+  // arithmetic changes, so this leaf is a pure launch/shape change.
+  if (!w.in_proj_qkv_fp8.Empty() &&
+      detail::ShouldUseMergedGdnFp8Qkvz(
+          GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim))) {
+    if (g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
+      g_gdn_fp8_inproj_merged.fetch_add(1, std::memory_order_relaxed);
+    out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w));
+    Tensor packed = out.packed_owner->t();
+    out.mixed = packed.Slice(1, 0, conv_dim);
+    Tensor z_f32 = packed.Slice(1, conv_dim, conv_dim + value_dim);
+    if (outdt == DType::kF32) {
+      out.z = z_f32;
+    } else {
+      VT_CHECK(outdt == DType::kBF16,
+               "qwen3_5 merged FP8 GDN qkvz: unsupported z output dtype");
+      out.z_owner.emplace(d, DType::kBF16,
+                          std::vector<int64_t>{packed.shape[0], value_dim});
+      vt::CastBf16(d.q, out.z_owner->t(), z_f32);
+      out.z = out.z_owner->t();
+    }
+    return out;
+  }
+  if (!w.in_proj_qkv_fp8.Empty() &&
+      g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
+    g_gdn_fp8_inproj_split.fetch_add(2, std::memory_order_relaxed);
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -5557,12 +5780,10 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 // fuse when the checkpoint scales are truly identical).
 bool Fp8SharedInputScale(bool is_linear_attention, const GdnLayerWeights& g,
                          const FullAttnLayerWeights& a, float* scale) {
-  if (is_linear_attention) {
-    if (g.in_proj_qkv_fp8.Empty() || g.in_proj_z_fp8.Empty()) return false;
-    if (g.in_proj_qkv_fp8.input_scale != g.in_proj_z_fp8.input_scale) return false;
-    *scale = g.in_proj_qkv_fp8.input_scale;
-    return true;
-  }
+  // ONE definition of the GDN pair's scale-compatibility rule, shared with the
+  // PERF-27B-GDN-FP8-QKVZ merge guard (detail::GdnFp8SharedInputScale) so the
+  // two can never drift.
+  if (is_linear_attention) return detail::GdnFp8SharedInputScale(g, scale);
   if (a.q_proj_fp8.Empty() || a.k_proj_fp8.Empty() || a.v_proj_fp8.Empty()) return false;
   if (a.q_proj_fp8.input_scale != a.k_proj_fp8.input_scale ||
       a.q_proj_fp8.input_scale != a.v_proj_fp8.input_scale)
@@ -6033,6 +6254,99 @@ Qwen3_5MTPHiddenStates MtpFinalize(Dev device, const Qwen3_5MTPWeights& weights,
 // diverges. h_host is the f32 hidden [T*H] (rounded to bf16 on upload, exactly
 // like the real forward's embed target). conv_len is (K-1) for the non-spec
 // decode reference and (K-1)+num_spec for the widened spec state.
+// PERF-27B-GDN-FP8-QKVZ numerical harness. Both arms are driven from ONE
+// process (the env toggle is process-cached, so an in-process A/B has to select
+// the arm explicitly), over the same uploaded activation and the same resident
+// bytes, so a bitwise comparison of the two results is exactly the spec's
+// "merged output byte-identical to the concatenation of the two legacy GEMM
+// outputs".
+std::vector<float> ProjectGdnFp8QkvzForTest(vt::Queue queue,
+                                            const GdnLayerWeights& w,
+                                            const std::vector<float>& h_host,
+                                            int64_t T, int64_t conv_dim,
+                                            int64_t value_dim, bool merged,
+                                            bool z_bf16) {
+  Backend& b = vt::GetBackend(queue.device.type);
+  Dev d{b, queue};
+  VT_CHECK(!w.in_proj_qkv_fp8.Empty() && !w.in_proj_z_fp8.Empty(),
+           "ProjectGdnFp8QkvzForTest: fp8 GDN shards required");
+  const int64_t H = w.in_proj_qkv_fp8.k;
+  VT_CHECK(static_cast<int64_t>(h_host.size()) == T * H,
+           "ProjectGdnFp8QkvzForTest: h_host must be [T*H]");
+  const DType outdt = z_bf16 ? DType::kBF16 : DType::kF32;
+  DBuf hf(d, DType::kF32, {T, H}, h_host.data());
+  DBuf h(d, DType::kBF16, {T, H});
+  vt::CastBf16(d.q, h.t(), hf.t());
+
+  GdnQkvzOutput out;
+  if (merged) {
+    out.packed_owner.emplace(MergedFp8QkvzD(d, h.t(), nullptr, w));
+    Tensor packed = out.packed_owner->t();
+    out.mixed = packed.Slice(1, 0, conv_dim);
+    Tensor z_f32 = packed.Slice(1, conv_dim, conv_dim + value_dim);
+    if (outdt == DType::kF32) {
+      out.z = z_f32;
+    } else {
+      out.z_owner.emplace(d, DType::kBF16, std::vector<int64_t>{T, value_dim});
+      vt::CastBf16(d.q, out.z_owner->t(), z_f32);
+      out.z = out.z_owner->t();
+    }
+  } else {
+    out.mixed_owner.emplace(
+        MatmulFp8CutlassD(d, h.t(), w.in_proj_qkv_fp8, DType::kF32));
+    out.z_owner.emplace(MatmulFp8CutlassD(d, h.t(), w.in_proj_z_fp8, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+  }
+
+  // Assemble [mixed_qkv | z] on the HOST, so no device op has to consume the
+  // merged arm's strided views (which is the point of them).
+  const int64_t total = conv_dim + value_dim;
+  std::vector<float> host(static_cast<size_t>(T * total), 0.0F);
+  if (merged) {
+    // packed_owner is contiguous f32 [T, conv+value]; mixed (and, when z stays
+    // f32, z) are exactly its column ranges.
+    std::vector<float> packed(static_cast<size_t>(T * total));
+    out.packed_owner->Download(d, packed.data());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < conv_dim; ++i)
+        host[static_cast<size_t>(t * total + i)] =
+            packed[static_cast<size_t>(t * total + i)];
+    if (!z_bf16) {
+      for (int64_t t = 0; t < T; ++t)
+        for (int64_t i = 0; i < value_dim; ++i)
+          host[static_cast<size_t>(t * total + conv_dim + i)] =
+              packed[static_cast<size_t>(t * total + conv_dim + i)];
+    }
+  } else {
+    std::vector<float> mixed(static_cast<size_t>(T * conv_dim));
+    out.mixed_owner->Download(d, mixed.data());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < conv_dim; ++i)
+        host[static_cast<size_t>(t * total + i)] =
+            mixed[static_cast<size_t>(t * conv_dim + i)];
+    if (!z_bf16) {
+      std::vector<float> zf(static_cast<size_t>(T * value_dim));
+      out.z_owner->Download(d, zf.data());
+      for (int64_t t = 0; t < T; ++t)
+        for (int64_t i = 0; i < value_dim; ++i)
+          host[static_cast<size_t>(t * total + conv_dim + i)] =
+              zf[static_cast<size_t>(t * value_dim + i)];
+    }
+  }
+  if (z_bf16) {
+    // Both arms own a contiguous bf16 z here; upcast losslessly so the caller
+    // compares the exact stored bf16 bit patterns as floats.
+    std::vector<uint16_t> zb(static_cast<size_t>(T * value_dim));
+    out.z_owner->Download(d, zb.data());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < value_dim; ++i)
+        host[static_cast<size_t>(t * total + conv_dim + i)] =
+            vt::BF16ToF32(zb[static_cast<size_t>(t * value_dim + i)]);
+  }
+  return host;
+}
+
 std::vector<float> GdnBlockPagedForTest(vt::Queue queue, const GdnLayerWeights& w,
                                         const HfConfig& cfg,
                                         const std::vector<float>& h_host,
@@ -6556,6 +6870,33 @@ void Qwen3_5DenseModel::PrepareLmHeadResident(const Qwen3_5DenseWeights& weights
   if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, queue.device.type)) return;
   (void)ResidentNvfp4DequantB(d, weights.lm_head_fp4);
   d.b.Synchronize(d.q);
+}
+
+// PERF-27B-GDN-FP8-QKVZ — build the merged FP8 [qkv;z] operand PRE-CAPTURE.
+// Registered on the dense prepare hook, so it runs at model load, strictly
+// before the first forward and therefore before any decode-graph capture: the
+// alloc + two H2D copies can never land inside a stream capture. Skipping this
+// leaves the forward's lazy build to run at first use, which is correct only
+// because an eager warm step precedes capture — this makes it unconditional.
+void Qwen3_5DenseModel::PrepareGdnFp8Resident(
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue) {
+  if (!platforms::GetPlatform(queue.device.type).needs_weight_staging()) return;
+  const int64_t key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+  const int64_t value_dim =
+      config.linear_num_value_heads * config.linear_value_head_dim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  bool built = false;
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    if (!layer.is_linear_attention) continue;
+    if (!detail::ShouldUseMergedGdnFp8Qkvz(
+            GdnMergedFp8QkvzEligibilityFor(d, layer.gdn, conv_dim, value_dim)))
+      continue;
+    (void)ResidentFp8Qkvz(d, layer.gdn);
+    built = true;
+  }
+  if (built) d.b.Synchronize(d.q);
 }
 
 void Qwen3_5DenseModel::PrepareBf16Resident(
