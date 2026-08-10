@@ -955,3 +955,212 @@ TEST_CASE("muse_glimmer text: the loader throws BY NAME on a missing tensor") {
   shards.push_back(vllm::SafetensorsFile::Open(file.path()));
   CHECK_THROWS(vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, cfg));
 }
+
+
+// ─────────── the RELEASED checkpoint's config, as a hardcoded fixture ───────────
+// Transcribed from meta-models/Muse-Glimmer-30B `config.json` (read from the local
+// download 2026-08-10). It is HARDCODED on purpose: the test must run in CI on a box
+// with no checkpoint, and the point is to pin the field SPELLINGS and SHAPES the real
+// artifact ships, which the upstream python alone does not tell you.
+//
+// Two things here were live defects until this fixture existed:
+//   * `no_rope_layers` is ABSENT. The split is carried by `layer_rope_theta` (a 0
+//     marks NoPE) and `layer_types` ("full_attention" marks the same layer). The
+//     backward-counted default only HAPPENS to agree at L=52.
+//   * the vision block ships `merge_size`, and NEITHER `output_dim` NOR
+//     `adapter_dim` — those are top-level `out_hidden_size` / `projector_hidden_size`.
+namespace {
+
+nlohmann::json ReleasedConfigJson() {
+  constexpr int64_t L = 52;
+  nlohmann::json layer_types = nlohmann::json::array();
+  nlohmann::json layer_rope_theta = nlohmann::json::array();
+  for (int64_t i = 0; i < L; ++i) {
+    const bool full = ((i + 1) % 4 == 0);  // 3, 7, 11, ... 51
+    layer_types.push_back(full ? "full_attention" : "sliding_attention");
+    layer_rope_theta.push_back(full ? 0.0 : 500000.0);
+  }
+  nlohmann::json vision_layer_types = nlohmann::json::array();
+  for (int64_t i = 0; i < 50; ++i)
+    vision_layer_types.push_back(((i + 1) % 4 == 0 || i == 49) ? "full_attention"
+                                                               : "window_attention");
+  return nlohmann::json{
+      {"architectures", nlohmann::json::array({"MuseGlimmerForConditionalGeneration"})},
+      {"dtype", "bfloat16"},
+      {"image_token_id", 200092},
+      {"video_token_id", 200091},
+      {"model_type", "muse_glimmer"},
+      {"out_hidden_size", 6144},
+      {"projector_hidden_act", "gelu"},
+      {"projector_hidden_size", 4096},
+      {"text_config",
+       {{"attention_bias", false},
+        {"attention_dropout", 0.0},
+        {"bos_token_id", 200000},
+        {"eos_token_id", 200001},
+        {"final_logit_softcapping", 20.0},
+        {"head_dim", 128},
+        {"hidden_activation", "silu"},
+        {"hidden_size", 6656},
+        {"initializer_range", 0.02},
+        {"intermediate_size", 19968},
+        {"layer_rope_theta", layer_rope_theta},
+        {"layer_types", layer_types},
+        {"max_position_embeddings", 131072},
+        {"model_type", "muse_glimmer_text"},
+        {"num_attention_heads", 32},
+        {"num_hidden_layers", L},
+        {"num_key_value_heads", 2},
+        {"output_multiplier", 0.19611613513818404},
+        {"post_norm_eps", 1e-08},
+        {"qk_scale_factor", 3.87},
+        {"rms_norm_eps", 1e-05},
+        {"rope_parameters", {{"rope_theta", 500000.0}, {"rope_type", "default"}}},
+        {"sliding_window", 2048},
+        {"tie_word_embeddings", false},
+        {"use_cache", true},
+        {"vocab_size", 202048}}},
+      {"vision_config",
+       {{"hidden_act", "gelu"},
+        {"hidden_size", 1536},
+        {"intermediate_size", 8960},
+        {"layer_norm_eps", 1e-05},
+        {"layer_types", vision_layer_types},
+        {"merge_size", 2},
+        {"num_attention_heads", 16},
+        {"num_hidden_layers", 50},
+        {"patch_size", 14},
+        {"patch_temporal", 2},
+        {"pos_emb_height", 32},
+        {"pos_emb_width", 32}}},
+      {"transformers_version", "5.15.0.dev0"},
+  };
+}
+
+HfConfig ReleasedConfig() {
+  HfConfig c;
+  c.architectures = {"MuseGlimmerForConditionalGeneration"};
+  c.hidden_size = 6656;
+  c.num_hidden_layers = 52;
+  c.vocab_size = 202048;
+  c.num_attention_heads = 32;
+  c.raw = ReleasedConfigJson();
+  return c;
+}
+
+}  // namespace
+
+TEST_CASE("muse_glimmer: the RELEASED 30B config parses to the real geometry") {
+  const MuseGlimmerParams p = vllm::ParseMuseGlimmerParams(ReleasedConfig());
+  const vllm::MuseGlimmerTextParams& t = p.text;
+
+  CHECK(t.vocab_size == 202048);
+  CHECK(t.hidden_size == 6656);
+  CHECK(t.intermediate_size == 19968);
+  CHECK(t.num_hidden_layers == 52);
+  CHECK(t.num_attention_heads == 32);
+  CHECK(t.num_key_value_heads == 2);
+  CHECK(t.head_dim == 128);
+  CHECK(t.max_position_embeddings == 131072);
+  CHECK(t.sliding_window == 2048);
+  CHECK(t.rope_theta == doctest::Approx(500000.0));
+  CHECK_FALSE(t.tie_word_embeddings);
+  CHECK(t.hidden_activation == "silu");
+  CHECK(t.output_multiplier == doctest::Approx(0.19611613513818404));
+  CHECK(t.final_logit_softcapping == doctest::Approx(20.0));
+
+  // The split eps is REAL: three orders of magnitude apart in the shipped config.
+  CHECK(t.rms_norm_eps == doctest::Approx(1e-5f));
+  CHECK(t.post_norm_eps == doctest::Approx(1e-8f));
+  CHECK(t.post_norm_eps < t.rms_norm_eps);
+
+  // The pre-folded schema at the REAL head_dim: 3.87 < sqrt(128) = 11.31, so it is
+  // used as-is. The trap is dividing it again (or treating a native 43.784 as folded).
+  CHECK(t.scale_query_by == doctest::Approx(3.87));
+
+  // Both flags are ABSENT in the released config and MUST read as ON.
+  CHECK(t.use_qk_norm);
+  CHECK(t.use_attn_output_gate);
+}
+
+TEST_CASE("muse_glimmer: the released config's iRoPE split comes from the CHECKPOINT") {
+  // `no_rope_layers` is absent; the split is derived from layer_rope_theta (0 => NoPE)
+  // and layer_types ("full_attention" => NoPE), which must agree.
+  const MuseGlimmerParams p = vllm::ParseMuseGlimmerParams(ReleasedConfig());
+  REQUIRE(p.text.no_rope_layers.size() == 52u);
+  for (int64_t i = 0; i < 52; ++i) {
+    const bool full = ((i + 1) % 4 == 0);
+    CHECK(p.text.no_rope_layers[static_cast<size_t>(i)] == (full ? 0 : 1));
+  }
+  // It agrees with upstream's backward-counted default AT THIS DEPTH — which is why
+  // the defect was invisible. The derivation is what makes that agreement a fact
+  // rather than a coincidence we depend on.
+  CHECK(p.text.no_rope_layers == vllm::DefaultMuseGlimmerNoRopeLayers(52));
+
+  // A checkpoint whose two encodings DISAGREE is a config we do not understand.
+  HfConfig bad = ReleasedConfig();
+  bad.raw["text_config"]["layer_types"][0] = "full_attention";  // theta still 500000
+  CHECK_THROWS(vllm::ParseMuseGlimmerParams(bad));
+
+  // And a per-layer theta that disagrees with rope_parameters is rejected rather
+  // than silently applied with the wrong base.
+  HfConfig mixed = ReleasedConfig();
+  mixed.raw["text_config"]["layer_rope_theta"][0] = 10000.0;
+  CHECK_THROWS(vllm::ParseMuseGlimmerParams(mixed));
+
+  // The derivation must SURVIVE a schedule that differs from the counted default:
+  // make layer 0 NoPE in both encodings and require the mask to follow the file.
+  HfConfig shifted = ReleasedConfig();
+  for (int64_t i = 0; i < 52; ++i) {
+    const bool full = (i % 4 == 0);  // 0, 4, 8, ... — NOT the backward default
+    shifted.raw["text_config"]["layer_types"][static_cast<size_t>(i)] =
+        full ? "full_attention" : "sliding_attention";
+    shifted.raw["text_config"]["layer_rope_theta"][static_cast<size_t>(i)] =
+        full ? 0.0 : 500000.0;
+  }
+  const MuseGlimmerParams sp = vllm::ParseMuseGlimmerParams(shifted);
+  CHECK(sp.text.no_rope_layers[0] == 0);
+  CHECK(sp.text.no_rope_layers[51] == 1);
+  CHECK(sp.text.no_rope_layers != vllm::DefaultMuseGlimmerNoRopeLayers(52));
+}
+
+TEST_CASE("muse_glimmer: the released vision block's REAL field spellings resolve") {
+  const MuseGlimmerParams p = vllm::ParseMuseGlimmerParams(ReleasedConfig());
+  const vllm::MuseGlimmerVisionParams& v = p.vision;
+  REQUIRE(v.present);
+  CHECK(v.hidden_size == 1536);
+  CHECK(v.intermediate_size == 8960);
+  CHECK(v.num_hidden_layers == 50);
+  CHECK(v.num_attention_heads == 16);
+  CHECK(v.patch_size == 14);
+  CHECK(v.patch_temporal == 2);
+  CHECK(v.pos_emb_height == 32);
+  CHECK(v.pos_emb_width == 32);
+  // `merge_size` (vision block), `out_hidden_size` and `projector_hidden_size`
+  // (TOP level) are the real spellings. Reading the old names alone fell back to
+  // defaults that happen to equal these, so this pins the read, not just the value.
+  CHECK(v.merge_kernel_size == 2);
+  CHECK(v.output_dim == 6144);
+  CHECK(v.adapter_dim == 4096);
+  REQUIRE(v.layer_types.size() == 50u);
+  CHECK(v.layer_types[0] == "window_attention");
+  CHECK(v.layer_types[3] == "full_attention");
+
+  // The spelling read must come from the file, not from a default: change ONLY the
+  // real field names and the parse must follow (and reject the mismatched shape).
+  HfConfig moved = ReleasedConfig();
+  moved.raw["out_hidden_size"] = 4096;  // != 1536 * 2 * 2
+  CHECK_THROWS(vllm::ParseMuseGlimmerParams(moved));
+  HfConfig merged = ReleasedConfig();
+  merged.raw["vision_config"]["merge_size"] = 4;  // 1536*16 != 6144
+  CHECK_THROWS(vllm::ParseMuseGlimmerParams(merged));
+  // `adapter_dim` has no structural equation to cross-check it, so assert it TRACKS
+  // the top-level field. Without this the 4096 above is equally consistent with the
+  // field never being read at all (measured: it was, until this control existed).
+  HfConfig proj = ReleasedConfig();
+  proj.raw["projector_hidden_size"] = 2048;
+  CHECK(vllm::ParseMuseGlimmerParams(proj).vision.adapter_dim == 2048);
+
+  CHECK(p.image_token_id == 200092);
+  CHECK(p.video_token_id == 200091);
+}
