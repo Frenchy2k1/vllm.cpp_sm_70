@@ -85,14 +85,25 @@ explicit multi-arch path fatal would break both, and
 `test_release_accelerator_metadata.py:107` requires `VLLM_CPP_TRITON=ON` in a
 CUDA release cache, so it would be self-contradictory as well.
 
-**What was implemented instead.** The default is `ON` iff CUDA is enabled, every
-vendored tree is present, and `VLLM_CPP_TRITON_REGEN` is `OFF` — the third
-condition added because regeneration genuinely is single-arch, so the default
-must not select it for you. The architecture **count is not a condition**;
-`120a;121a` and the ten-SM set both resolve `ON` and configure clean. The
-`FATAL_ERROR` at `TritonAOT.cmake:116-127` is **byte-unchanged** and still
-guards the regen flow it actually protects. No new error was added, so the
-default can never turn a configure that used to succeed into a failure.
+**What was implemented instead.** The default is `ON` iff CUDA is enabled,
+`VLLM_CPP_TRITON_REGEN` is `OFF`, and every vendored tree passes the builder's
+own tree-level preconditions — the third condition added because regeneration
+genuinely is single-arch, so the default must not select it for you. The
+architecture **count is not a condition**; `120a;121a` and the ten-SM set both
+resolve `ON` and configure clean. The `FATAL_ERROR` at `TritonAOT.cmake:116-127`
+is **byte-unchanged** and still guards the regen flow it actually protects.
+
+**CORRECTION (review round 1, 2026-08-10).** The first implementation tested
+tree **`MANIFEST` existence only**, and this paragraph claimed on that basis
+that "no new error was added, so the default can never turn a configure that
+used to succeed into a failure." That was **false**, and the reviewer proved it
+by mutation twice: appending one comment line to `triton_kernels/solve_tril.py`
+left the default `ON` and then `FATAL_ERROR`ed on the staleness comparison
+(`TritonAOT.cmake:627-664`), and deleting a generated file from one vendored
+tree left the default `ON` and then `FATAL_ERROR`ed at `:253-263`. In both cases
+every CUDA configure failed where it had previously succeeded with the option
+`OFF`. See `## Outcome` for the strengthened precondition and for the single
+residual, which is stated rather than claimed away.
 
 ## Risks
 
@@ -121,6 +132,10 @@ RED first:
 3. Extend `tests/tools/test_gdn_packed_component.py`-style coverage so the
    default-built CUDA target carries `VLLM_CPP_TRITON=1` and
    `VLLM_CPP_TRITON_CHUNKO_BF16=1`.
+   **Landed in review round 1** as `tests/scripts/test_triton_default_definitions.py`
+   plus the `cuda-fat-build` CI step that feeds it a real ten-SM CUDA configure
+   made with no `-DVLLM_CPP_TRITON`. It had previously been discharged by a hand
+   count of translation units on the gate host, which is not a gate.
 
 ## Dispatch evidence (the part that answers "are they used")
 
@@ -174,10 +189,33 @@ Gate host `dgx.casa` (GB10, sm_121a, nvcc 13.0.88, CUTLASS 4.5.0).
 ### The rule that shipped
 
 `vt_triton_aot_computed_default` (`cmake/TritonAOTMultiArch.cmake`): `ON` iff
-CUDA is enabled **and** every vendored tree is present **and**
-`VLLM_CPP_TRITON_REGEN` is `OFF`. The **architecture count is not a condition** —
-see the CORRECTION under Design. Third condition added because regeneration
-genuinely writes into one tree, so the default must not select it for you.
+CUDA is enabled **and** `VLLM_CPP_TRITON_REGEN` is `OFF` **and** every vendored
+tree passes `vt_triton_aot_tree_defect`. The **architecture count is not a
+condition** — see the CORRECTION under Design. The regen condition is there
+because regeneration genuinely writes into one tree, so the default must not
+select it for you.
+
+`vt_triton_aot_tree_defect` (added in review round 1) runs the builder's own
+**tree-level** preconditions before the option exists, each mirrored from the
+place that `FATAL_ERROR`s on it in `TritonAOT.cmake`: the tree and its
+`MANIFEST` exist; `arch` / `triton_target` / `line_info` agree with the
+directory; the `generator` sha256 matches `scripts/triton-aot-compile.py`; every
+`artifact` line names a file that exists and still hashes to its pin, and the
+tree holds no `*.c`/`*.h` the `MANIFEST` does not pin; every `source` line
+matches `triton_kernels/<name>.py` byte-for-byte and no kernel source is
+unpinned. Cost is negligible — 480 files, 23 MB, ~0.15 s of `file(SHA256)`, and
+only on a CUDA configure, which already hashes the same files in
+`triton_aot_finalize`.
+
+**The one residual, stated rather than claimed away.** The builder also compares
+each `MANIFEST` `base` line against the build contract accumulated from the
+`add_triton_kernel` calls in `CMakeLists.txt`. Those parameters do not exist yet
+when the option is defined, so editing a kernel's signature, grid, warps or
+stages **without regenerating** still fails a defaulted-`ON` configure. That is
+a repository-local edit to a tracked file, made by whoever is changing the
+kernel contract; nothing a checkout can present to `cmake` reaches it. Every
+other way in is closed, and `cmake/TritonAOTDefaultTest.cmake` pins each one
+with a single-mutation cell on an otherwise valid fixture.
 
 ### Configure matrix (configure-only, one script against both trees)
 
@@ -244,7 +282,13 @@ growths; 35B 261 / 58 with 0 growths.
 
 - Focused: `cmake -P cmake/TritonAOTDefaultTest.cmake` — ALL PASS (RED before:
   `Unknown CMake command "vt_triton_aot_computed_default"`). Wired into the
-  `cuda-arch-features` CI job beside `TritonAOTMultiArchTest.cmake`.
+  `cuda-arch-features` CI job beside `TritonAOTMultiArchTest.cmake`. Review round
+  1 added nine single-mutation cells on a synthetic fixture; RED before the
+  strengthened precondition was `synth-kernel-edited: expected default OFF, got
+  'ON'` and `synth-artifact-deleted: expected default OFF, got 'ON'`.
+- `python3 -m unittest tests.scripts.test_triton_default_definitions` — 7 tests,
+  1 skipped without a build dir (Tests §3; the live leg runs in `cuda-fat-build`).
+- `python3 -m unittest tests.scripts.test_check_public_doc_tables` — 53 tests OK.
 - `scripts/agent-preflight.sh --staged` — exit 0.
 - CUDA `ctest` on sm_121a, **serial**, from the default-ON build:
   GDN/Triton subset **9/9 PASS**.
@@ -257,6 +301,24 @@ growths; 35B 261 / 58 with 0 growths.
   re-derived from the new rule and unchanged (see the commit body).
 
 ### Pre-existing failures, attributed not assumed
+
+**The count below does not reconcile, and it is UNRESOLVED.** 395 − 379 = 16,
+but only nine failures are named. Either seven tests never ran or seven failures
+went unlisted, and which of those it is can only be read off
+`dgx:~/work/triton-default-on/out-gate/ctest-serial-full.log`. Review round 1
+could not reach the gate host — `ssh mudler@dgx.casa` is answered and refuses
+the key (`Permission denied (publickey,password)`; the host resolves to
+192.168.68.128, pings, and has a `known_hosts` entry from earlier sessions) — so
+the log was not read and the run was not repeated. **Treat 379/395 as a
+provisional figure and the nine-failure list as incomplete until the operator
+re-reads that log or re-runs the suite at `-j 1`.**
+
+**A same-set A/B must account for one extra registered test.**
+`tests/CMakeLists.txt:974-980` registers `test_ops_gdn_aot_concurrent_first_load`
+only `if(VLLM_CPP_TRITON)` — the sole `VLLM_CPP_TRITON` guard in that file — so a
+default-`ON` build has exactly **one more** registered test than a default-`OFF`
+`origin/main` build. Any "same set" claim between the two totals is off by one
+in that direction and must say so.
 
 The serial suite reached **379/395** with **nine** failures. Five are
 **A/B-attributed to `origin/main`**: built there with its own default
@@ -301,8 +363,22 @@ that is queued to run when the suite finishes (`triton-abfull`, logs
   `vt::GeluMulSeparate: ROCm-only fast path in this build` throw, at `:67`.
   Folded into the `GeluMulSeparate` issue above.
 
-**Pending the queued comprehensive A/B** (none is plausibly reachable from a
-GDN-only cubin set, but none is asserted attributed until measured):
+**UNATTRIBUTED — pending the queued comprehensive A/B.** These three are
+**open**, not explained. The earlier framing here — "none is plausibly reachable
+from a GDN-only cubin set" — is **withdrawn**: it was an argument, not a
+measurement, and the reviewer disproved its premise.
+`src/vt/cuda/cuda_backend.cu:102-104` calls `ReleaseGdnTritonScratch()` from the
+**generic** CUDA `DestroyQueue()`, which every CUDA test executes, so the change
+is not confined to GDN models. (The mechanism is small — it early-returns on an
+empty pool — but that too has to be measured rather than asserted.) Two of the
+three are token-drift assertions against committed goldens, which is exactly the
+failure class a kernel-selection change produces.
+
+The `triton-abfull` arms (`out-gate/abfull-armA.log`,
+`out-gate/abfull-armB-main.log`) were **not** checked in review round 1: the gate
+host refuses this session's key (see the note above the failure list), so whether
+they completed is unknown. Nothing here may be closed until those logs are read
+or the A/B is re-run.
 
 - `test_capi` — SIGSEGV at `tests/capi/test_capi.cpp:480`, the ABI v8
   custom-logits-processor case on a *synthetic* engine; 47/47 assertions passed
