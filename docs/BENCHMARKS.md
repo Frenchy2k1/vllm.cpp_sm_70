@@ -17,7 +17,7 @@
 | **Record/checker repair 2026-08-07–08** | Gates fixed. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited), `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables); nine Gemma4/ROCm tuners internal. No runtime/perf change. |
 | **vLLM** | Qwen3.6-27B NVFP4 `unsloth` @`890bdef7`, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-27B NVFP4 `nvidia` @`0893e160` (ModelOpt `modelopt_mixed`), GB10 | **0.85x, BEHIND** at every concurrency (0.843x to 0.861x), up from 0.72x | identical |
-| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | decode 0.98x at c1 and c4, 0.87x at c2, 0.92x at c8 (warp-shuffle router landed) | near-tie |
+| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | **0.935x to 0.979x, BEHIND at every concurrency** (binding grid @`a0fa12c7`); memory wins: PSS 3.81x, GPU 1.40x | near-tie |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-S-2.1 NVFP4 (118B/8B MoE), GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
@@ -98,26 +98,30 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| **vllm.cpp** tok/s | 593.7 | 882.9 | **1417.6** | 1845.2 | 2327.4 | 2937.8 |
-| vLLM tok/s | 607.4 | 911.9 | 1374.4 | 1922.1 | 2497.2 | 3012.9 |
-| **Ratio** | 0.977x | 0.964x | **1.025x** | 0.964x | 0.932x | 0.971x |
-| Mean TPOT | 0.975x | 0.966x | **1.036x** | 0.976x | 0.928x | 0.988x |
-| Mean TTFT | 0.980x | 0.947x | 0.976x | 0.939x | 0.933x | 0.929x |
+| **vllm.cpp** tok/s | 65.6 | 93.6 | 142.9 | 197.6 | 256.2 | 323.1 |
+| vLLM tok/s | 67.0 | 99.9 | 150.6 | 211.3 | 272.9 | 333.6 |
+| **Ratio** | **0.979x** | 0.937x | 0.949x | 0.935x | 0.939x | 0.969x |
+| Mean TPOT | 0.978x | 0.945x | 0.943x | 0.938x | 0.930x | 0.967x |
+| Mean TTFT | 0.972x | **0.872x** | 0.970x | 0.965x | 0.969x | 0.968x |
+| Our CoV | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
+| vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
 
-Fresh 3-rep grid 2026-08-05 at `1ea26427` (post async-UAF fix), medians, SACRED
-gate passed pre-bench. The prior low-batch gap closed hard (c1 0.817x→0.977x);
-the open mass is now TTFT 0.93-0.98x everywhere and a NEW c16 dip to 0.932x
-(prior binding won c16). **c16 drain-sync lever, MEASURED NEGATIVE 2026-08-05**
-(3+3 reps, single load/arm, ours only): the UAF fix's full-stream drain vs a
-blocking-event drain (mirrors vLLM's `prepare_inputs_event`, blocking=True) gave
-2308.0 vs 2263.2 total tok/s medians, non-overlapping bands, the event arm
-**-1.9%** (TPOT 47.6 to 49.0 ms). So the c16 cost is NOT driver-lock spin but the
-depth-2 **serialization** the drain guards: `update_states`' host `condense`
-read-after-writes the previous step's device scatter of `last_sampled_tokens`, a
-true data dependency on the integrated host-array combine path that cannot be
-overlapped without moving sampled tokens GPU-resident (vLLM's `prev_sampled_
-token_ids` device gather). The full drain is byte-exact and UAF-safe and is
-**kept**.
+**There is no isolated c2/c8 weakness.** Binding grid at `a0fa12c7`
+(2026-08-10), 3 reps, oracle vLLM 0.25.0, binding-eligible 12/12. The prior
+record carried c2 0.87x and c8 0.92x as two "weak cells with wider spread", but
+those came from a different harness (absolute tok/s ~8x apart from this table's)
+and were never comparable to these ratios. The real deficit is a flat mid-band:
+c1 and c32 strongest, c2 to c16 all within 0.935x to 0.949x, every point under
+0.81% CoV on BOTH engines, so the ~6% at c2 is ~8x the noise. Detail in
+`.agents/benchmark-record.md`.
+
+The c4 1.025x win recorded 2026-08-05 at `1ea26427` did not reproduce here, and
+mean TTFT at c2 (0.872x) is the sharpest single-axis outlier. Memory passes
+decisively on the same run: peak PSS 3.34 GiB against vLLM's 12.72 GiB
+(**3.81x**), peak GPU 50.1 GiB against 70.4 GiB (**1.40x**). The c16 drain-sync
+lever was measured NEGATIVE (-1.9%) on 2026-08-05: the cost is the depth-2
+serialization the drain guards, not driver-lock spin, so the byte-exact full
+drain is **kept**.
 
 **Device-resident sampled tokens on integrated (`VT_ASYNC_DEVICE_MIRROR`) A/B'd
 2026-08-06, speed-NEUTRAL** (same-binary): c16 OFF median 2305.8 vs ON 2303.3
