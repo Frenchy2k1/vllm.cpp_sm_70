@@ -32,9 +32,12 @@ Markov transition bias.
 Current state (`SPEC-DSPARK`): the config, the Markov head and draft model, both
 published checkpoint layouts (native `deepseek-ai/dspark_qwen3_*` and
 Speculators `RedHatAI/*.dspark`), the sequential sampler and the runner wiring
-have landed. **No correctness or speed number is claimed yet** — the engine has
-not been gated against the pinned vLLM oracle running the same draft, and until
-it is, treat DSpark as unproven. A GGUF target is refused by name.
+have landed, and the path runs end to end on the Qwen3.6-35B-A3B gate model.
+**It is not working yet:** an acceptance trace of that run shows zero verified
+draft tokens, so the drafter is inert in the engine loop, and speculation is
+5.5x slower than plain decode. No correctness or speed number is claimed. A GGUF
+target, and a target architecture with no aux multi-tap, are both refused by
+name.
 
 ```bash
 main --model /models/Qwen3-4B \

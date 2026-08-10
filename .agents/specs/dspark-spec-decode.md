@@ -17,7 +17,7 @@
 | Dependencies | Landed: `SPEC-DFLASH` (`DONE`), `SPEC-REJECTION` verify half, `SPEC-GDN-SEGMENTS`. External, PENDING developer authority: checkpoint downloads (2.79-8.80 GB), dgx GPU time, push/draft-PR. Blocking unknown: R1, whether the pinned oracle runs DSpark at all. |
 | Work breakdown | §4 — W1 config, W2 Markov head + draft model, W3 loader (native + Speculators), W4 speculator (anchor layout + sequential sampling), W5 runner + one-surface, W6 gates. W1-W4 are CPU-gateable. |
 | Risks/decisions | §6 — R1 oracle runnability (V2 runner), R2 Speculators format is a new subsystem, R3 the community 27B checkpoint's `attn_output_gate`, R4 the `k >= dspark_block_size` garbling trap, R5 sequential sampling vs CUDA-graph capture, R6 greedy before probabilistic, R7 GB10 host-RAM pressure. |
-| Status | W1-W5 LANDED (config, Markov head + draft model, both checkpoint layouts, sequential sampler, runner + surface). W6 (the oracle gates) is the remaining work; R1 is unanswered. |
+| Status | W1-W5 LANDED and running end to end on a gate model; W6 OPEN — the acceptance trace shows ZERO verified draft tokens, so the drafter is inert in the engine loop (see §6b). R1 answered (§6a). |
 | Goal (developer, 2026-08-09) | a FULL DSpark implementation in vllm.cpp, mirrored from vLLM |
 
 ## 0. Verdict
@@ -249,6 +249,72 @@ Binding acceptance for `DONE` (house gate, [verification.md](../verification.md)
 - **R7 — GB10 memory.** `gpu_memory_utilization` reserves HOST RAM on GB10 and a
   big oracle beside ctest has rebooted the box. The 4B lane is chosen partly for
   this; keep the oracle and our engine serialized under the `flock`.
+
+## 6a. R1 RESULT — the oracle RUNS DSpark (2026-08-09)
+
+R1 was the row's one blocking unknown: DSpark forces the V2 runner, which our
+oracle recipes had never exercised. **Answered, and the answer is clean.**
+
+Run on dgx, one `flock`, `local-ai-worker` parked, `enforce_eager=True`,
+`gpu_memory_utilization=0.30`, two prompts x 48 greedy tokens:
+
+| | value |
+|---|---|
+| target / draft / k | `Qwen/Qwen3-4B` / `deepseek-ai/dspark_qwen3_4b_block7` / 7 |
+| DSpark-ON arm | loads and decodes, exit 0 |
+| DSpark-ON vs spec-OFF | **TOKEN-IDENTICAL on both prompts** (48/48 ids each) |
+| evidence | `dgx:~/work/dspark-r1/{r1.log,r1_on.json,r1_off.json}` |
+
+**Recorded caveat:** this is the dgx **v0.25.0 stage** oracle
+(`~/venvs/vllm-oracle` -> `vllm-oracle-v0.25.0-stage`), NOT the `555967922`
+(0.26.0.dev0) pin; `vllm-oracle-next` has no vllm installed, and the pin rebuild
+is a standing residual. The 0.25.0 stage does carry the dspark speculator with
+`sample_from_anchor`, so the semantics this port mirrors are present, but a
+binding W6 gate should be re-run once the pinned oracle exists.
+
+**Environment trap, cost one queued GPU slot:** the first attempt failed at
+EngineCore init with `FileNotFoundError: 'ninja'` in BOTH arms — a non-login
+tmux shell has neither `~/venvs/vllm-oracle/bin` nor `~/.local/bin` on PATH.
+Both arms failing identically reads as "the oracle cannot run this feature",
+which is the exact question R1 asks; suspect the environment first.
+
+## 6b. W6 FIRST RUN — runs end to end, but the drafter is INERT (2026-08-10)
+
+Two lanes were run on dgx under one `flock`, worker parked.
+
+**4B lane** (`Qwen/Qwen3-4B` + `deepseek-ai/dspark_qwen3_4b_block7`, k=7).
+Our spec-OFF decode reproduces the oracle's golden text exactly. Our DSpark arm
+**failed at the first propose**: `missing target aux multi-tap`. Cause: only the
+Qwen3.5/3.6 dense + MoE forwards implement `ForwardDeviceMultiTap`, and classic
+`Qwen3ForCausalLM` has none — a hole that was LATENT FOR DFLASH TOO. Fixed by
+`ModelBase::supports_aux_multi_tap()` + a load-time refusal naming the method
+and the architecture (commit `56b7b607`).
+
+**35B gate-model lane** (`nvidia/Qwen3.6-35B-A3B-NVFP4` +
+`RedHatAI/Qwen3.6-35B-A3B-speculator.dspark`, k=8, the reduced-vocab `d2t` +
+`sample_from_anchor` path):
+
+| arm | result |
+|---|---|
+| ours spec-OFF | 48 tokens, 37.34 tok/s |
+| ours DSpark-ON | 48 tokens, **6.78 tok/s**, text byte-identical to spec-OFF |
+| oracle DSpark-ON | runs; its own ON and OFF texts DIVERGE mid-sequence |
+| oracle vs ours | our BASE decode already differs from the oracle's on this ad-hoc prompt, so no DSpark-attributable cross-engine claim is possible from it |
+
+**The load-bearing negative result:** re-run with `VT_SPEC_TRACE=1` printed **no
+acceptance lines at all**, i.e. `kr > 0` never held — **no draft token was ever
+verified**. So the identical ON/OFF output is NOT evidence that the speculator
+works; it is consistent with the drafter being INERT while still paying its
+cost, which is also exactly what the 5.5x slowdown looks like. Do not read
+"ON == OFF" as a correctness result until acceptance is demonstrably non-zero.
+
+**Open defect (the W6 blocker):** find where the proposed drafts are dropped
+between `propose_drafts_dspark` and the next step's verify. The DFlash control
+that would have proved the trace harness itself works could NOT be run: the
+landed `MakeDflashDraftConfig` does `c.at("rope_theta")`, and the z-lab 35B
+DFlash draft carries `rope_theta` only under `rope_parameters` — a pre-existing
+gap in the DFlash lane (the 27B draft it was gated on has the top-level key),
+found incidentally here and worth its own fix.
 
 ## 7. Evidence, authority, stop conditions
 

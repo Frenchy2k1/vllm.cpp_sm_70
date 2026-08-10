@@ -42,6 +42,8 @@ class Qwen3_5MoeLoadedModel final : public LoadedModel {
   // (the 35B MoE MTP layer) sharing this target's embed_tokens/lm_head. Inert
   // unless FromModelDir attached weights (i.e. unless a SpeculativeConfig is set).
   bool supports_mtp_draft() const override { return true; }
+  // SPEC-DFLASH / SPEC-DSPARK: this forward routes to ForwardDeviceMultiTap.
+  bool supports_aux_multi_tap() const override { return true; }
   void AttachMtpDraftWeights(Qwen3_5MTPWeights weights) override {
     mtp_draft_weights_ = std::move(weights);
   }

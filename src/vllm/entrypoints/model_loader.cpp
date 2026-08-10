@@ -966,6 +966,24 @@ LoadedEngine::LoadedEngine(HfConfig config,
   // WarmupKernels) so the runner holds a stable borrow of dflash_draft_ (which
   // outlives it). Null for mtp/non-spec, so this is inert on every other path.
   if (dflash_draft_ != nullptr) {
+    // Both block drafters CONDITION on the target's aux multi-tap. A target
+    // architecture whose forward cannot produce it yields an engine that dies on
+    // the first propose with "missing target aux multi-tap" -- which is exactly
+    // how the first DSpark e2e failed, against classic-dense Qwen3ForCausalLM.
+    // Refuse at LOAD, by name, with the reason.
+    if (!model_->supports_aux_multi_tap()) {
+      const std::string method =
+          dflash_draft_->dspark != nullptr ? "dspark" : "dflash";
+      const std::string arch = config_.architectures.empty()
+                                   ? std::string("this model")
+                                   : config_.architectures.front();
+      throw std::runtime_error(
+          "speculative-config: method \"" + method +
+          "\" needs a target architecture that captures the aux multi-tap (the "
+          "residual stream at the draft's target_layer_ids); " + arch +
+          " does not. Supported targets today are the Qwen3.5/3.6 dense and MoE "
+          "families.");
+    }
     if (dflash_draft_->dspark != nullptr) {
       // SPEC-DSPARK W5: wires the inherited backbone through set_dflash_draft
       // internally, so the shared machinery is byte-identical to the DFlash lane.
