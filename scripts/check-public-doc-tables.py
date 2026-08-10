@@ -505,7 +505,10 @@ STATUS_RATCHET = {
     # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
     # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
     # collapsed the mid-band narrative to its binding result. Strictly DOWN.
-    "chars": 243455,
+    # 243435 since 2026-08-11 (measured 243435): the #213 post-lever result
+    # replaces the pre-lever narrative in the 27B cell with the binding
+    # numbers. Strictly DOWN from 243455, the only direction allowed.
+    "chars": 243435,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

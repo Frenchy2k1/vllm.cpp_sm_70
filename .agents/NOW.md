@@ -15,7 +15,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | `SPEC-DSPARK` | **WORKS on 35B**: ON==OFF 48/48. ★fixed engine-wide draft-drop | Draft step ~6x a target step |
 | State record (#166) | **157 imports = 3,231,342 bytes** at `776c56f1` | Force-update #166; rerun readiness |
 | Laguna NVFP4 / DeepSeek-V4 decode | **CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
-| 27B NVFP4 @`0893e160` | **0.85x**: FP8 native, tokens MATCH; #213 head packed | #213 grid + RSS remeasure post-#150 |
+| 27B NVFP4 @`0893e160` | **c1 0.838, c2-c8 0.95-0.97** (#213 levers ACTIVE); c1 unmoved | c1 decode window; 35B canonical |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
 | Invocation-parity | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
@@ -52,7 +52,7 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    bf16, **+2.05% c8 BIT-IDENTICAL**. NEXT
    [spec](specs/moe-silu-vectorize.md): SiLU counts MATCH vLLM but ours costs
    **9.2x/launch** = 3.6 pts of the band.
-1. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
+1. **27B NVFP4 0.85x -> c2-c8 0.95-0.97, c1 STUCK 0.838** (#213 levers landed
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
    transducer half is NOT in vLLM: separate call).
