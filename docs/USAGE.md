@@ -388,11 +388,11 @@ because a render takes hours before it tells you anything:
 
 | arm | status |
 |---|---|
-| **Q4_K_M** | **VERIFIED end to end** — every render in this doc. Use this. |
+| **Q4_K_M** | **VERIFIED end to end** — every render in this doc, on BOTH partitions (t2va + fl2va on FL2VA, ref2va on REF2VA). Use this. |
 | Q3_K_M | verified BAD (the A/B above): murky silhouette under a lattice |
 | bf16 (66.3 GB, 13 shards) | loader + device streamer implemented and gated, but **CPU-only** verification — no end-to-end GPU render has been done |
 | NVFP4 | exists; pruned variants are NOT drop-in (see above) |
-| Q8 | no published GGUF is known and none has been tested |
+| Q8 / Q6_K / Q5_0 | published ([unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) but **PRUNED only** — the restructured AdaLN is not drop-in and this loader cannot read it |
 
 ### The trap: this checkpoint does not serve every task
 
@@ -419,10 +419,28 @@ the resolution you actually want.
 Pass `--partition fl2va` explicitly. The driver mirrors upstream's raise, so a
 mismatch is rejected at the CLI rather than silently rendered.
 
-For a reference-image render you need the **Ref2VA** partition instead
-(`minimax_h3_ref2va_nvfp4_full`, or a REF2VA GGUF). Note that the encoder vision
-tower is not yet ported, so image-conditioned renders are not clean even on the
-matching partition.
+For a reference-image render you need the **Ref2VA** partition instead, and the
+one to use is **`MiniMax-H3-REF2VA-Q4_K_M.gguf`** (19.9 GB,
+[realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs)) —
+the same quantisation as the FL2VA file above, and verified coherent:
+
+```sh
+build/examples/minimax-h3-gen \
+  --dit MiniMax-H3-REF2VA-Q4_K_M.gguf --dequant-bf16 --partition ref2va \
+  --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
+  --prompt "..." --ref-image subject.ppm \
+  --video-vae video_vae.safetensors --video-vae-config video_vae_config.json \
+  --audio-vae audio_vae.safetensors --audio-vae-config audio_vae_config.json \
+  --frames 124 --height 512 --width 512 --steps 50 \
+  --device cuda --out out.mp4 --workdir /tmp/h3
+```
+
+**Do NOT use the NVFP4 Ref2VA weights.** `minimax_h3_ref2va_nvfp4_full` renders the
+multicolour patch grid, and it took three investigations to establish that this is the
+QUANTISATION and not the ref2va path: the identical reference-row assembly, packed-block
+layout and denoise loop render coherently on Q4_K_M (period-16 seam **1.13**, VAE-input
+latent adjacent-cell cosine **0.8526**). Ref2VA on Q4_K_M is a working mode; Ref2VA on
+NVFP4 is not.
 
 ### Writing the prompt (read this first)
 

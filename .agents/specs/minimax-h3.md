@@ -1340,3 +1340,45 @@ and were verified one by one. The defect lived in the INTERPRETATION of a buffer
 between two correct functions — invisible to any check that does not compare the two
 readers against each other. The fix pins the expected size with a `VT_CHECK` so the
 assumption cannot drift again silently.
+
+## 8.20 ALL THREE MODALITIES WORK — the ref2va grid was the QUANTISATION, and §8.9's assembly hypothesis is REFUTED (2026-08-10, `row/H3-REF2VA-WORKS`, Thor sm_110)
+
+Three campaigns fought the ref2va patch grid (#86 text-only, §8.9 vision-enriched, §8.12
+load-path). §8.9 re-attributed it to the **ref2va-specific reference-row conditioning
+ASSEMBLY** (`MiniMaxH3EncodeReferenceImages` + the ref2va packed-block layout + how the
+loop conditions un-pinned target rows), having ruled out the DiT forward and the encoder.
+That attribution is **REFUTED**.
+
+**Every prior ref2va attempt ran on NVFP4** (`minimax_h3_ref2va_nvfp4_full`). The one cell
+nobody filled in was ref2va on the quantisation this project has verified coherent
+everywhere else. `MiniMax-H3-REF2VA-Q4_K_M.gguf` (19,864,208,064 bytes,
+`realrebelai/MiniMax-H3_GGUFs`) renders **COHERENTLY** with the identical assembly code:
+
+| arm | period-16 seam | VAE-input latent adj-cell cosine |
+|---|---|---|
+| ref2va on NVFP4 (§8.9) | grid, every frame | — |
+| **ref2va on Q4_K_M (this row)** | **1.13** | **0.8526** |
+| t2va on Q4_K_M (§8.16) | 1.19 | 0.8924 |
+| fl2va on Q4_K_M (this row) | 1.06-1.44 | — |
+
+512x512/124f/50 steps, `--partition ref2va --ref-image`, seam scale 1.15-1.19 clean /
+2.28 broken, cosine scale 0.06 white / 0.789 real encode / 0.89+ coherent. The decoded
+frame is a coherent office scene with no trace of the multicolour patch grid. §8.12's
+quieter attribution ("100% attributable to the per-weight NVFP4-vs-Q3_K quantization
+difference") was the correct one.
+
+**All three H3 modalities are now verified on Q4_K_M**, each with a rendered artifact:
+t2va (§8.16, 1344x768 + ASR-verified speech), fl2va (this row: first-frame conditioning
+load-bearing at keyframe→frame0 correlation **0.7881**, and the clip evolves away from the
+pin at 0.7653), ref2va (this row).
+
+**Why it survived three investigations.** The FL2VA/Q4_K_M cell was verified and the
+Ref2VA/NVFP4 cell was verified-broken, but the two variables — PARTITION and QUANTISATION —
+were never crossed. Each campaign held quantisation fixed at NVFP4 and searched the ref2va
+code path, which is where the bug was not. The lesson generalises: when a mode fails on
+exactly one checkpoint, vary the CHECKPOINT before searching the mode's code.
+
+**Residual.** The NVFP4 Ref2VA arm is still broken and unexplained at the weight level
+(§8.12 found no discrete load-path defect, so it is the per-weight quantisation error
+itself). `docs/USAGE.md` now steers users to the REF2VA GGUF and warns off NVFP4 rather
+than leaving that trap live.
