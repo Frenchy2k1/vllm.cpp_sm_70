@@ -372,6 +372,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
+          merge-multiple: true
       - name: Download exact validated CPU artifacts by immutable IDs
         uses: actions/download-artifact@v4
         with:
@@ -410,11 +411,13 @@ jobs:
         with:
           artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
+          merge-multiple: true
       - name: Download exact unverified handoff by ID
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           path: unverified
+          merge-multiple: true
       - name: Verify handoff against plan and workflow SHA
         run: |
           mkdir -p verified
@@ -457,6 +460,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           path: verified
+          merge-multiple: true
       - name: Attest verified bytes
         uses: actions/attest@v4
         with:
@@ -475,6 +479,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           path: verified
+          merge-multiple: true
       - name: Publish the exact verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
