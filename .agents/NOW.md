@@ -19,8 +19,8 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
 | Invocation-parity | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
-| Kimi-Linear-48B | 122/128 held; grouped router parallelised, e2e NOT ESTABLISHED | ckpt is tiktoken-only: no warm server |
-| 35B binding grid | @`a0fa12c7`: **flat 0.935-0.979x, NO c2/c8 weak cell** (CoV <0.81%); mem PSS 3.81x | Attribute the flat ~5% mid-band; TTFT c2 0.872x |
+| Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
+| 35B mid-band | ATTRIBUTED: per-token MoE; fixed cost WINS (9.02 vs 9.43ms); block lever REFUTED | Route `E=1` dense off grouped-MoE |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; sealed-vLLM tput 1.021x PASS; latency/VRAM OPEN | Spike residual 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
@@ -45,10 +45,11 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
 
 ## Next actions
 
-0. **35B c2/c8 CLOSED by measurement** (`a0fa12c7`): the 0.87x/0.92x "weak
-   cells" were a HARNESS MISMATCH. Flat 0.935-0.979x, CoV <0.81%. Next: the
-   mid-band ~5% (c2-c16) + the one outlier, TTFT c2 0.872x. The binding harness
-   was UNRUNNABLE 2026-08-09..`a0fa12c7` (`vllm-server` rename, 12 stale paths).
+0. **35B mid-band ATTRIBUTED** to per-token MoE work; our FIXED per-step cost
+   already beats vLLM (9.02 vs 9.43ms) and both run the same
+   `marlin_moe_wna16`. Block-size lever **REFUTED** (-1.16% at c8, c4 control
+   +0.29%). NEXT: `E=1` dense goes through the GROUPED-MoE kernel (moe_align +
+   padding at EVERY batch); vLLM uses dense marlin.
 1. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
