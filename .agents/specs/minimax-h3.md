@@ -1382,3 +1382,138 @@ exactly one checkpoint, vary the CHECKPOINT before searching the mode's code.
 (§8.12 found no discrete load-path defect, so it is the per-weight quantisation error
 itself). `docs/USAGE.md` now steers users to the REF2VA GGUF and warns off NVFP4 rather
 than leaving that trap live.
+
+## 8.21 The PRUNED checkpoints — AdaLN refactored into a timestep CURVE table (2026-08-10, `row/H3-PRUNED`, issue [#241](https://github.com/mudler/vllm.cpp/issues/241))
+
+**Scope.** Load and run the community `pruned` H3 DiT variants — `unsloth/MiniMax-H3-GGUF`
+(`minimax_h3_{fl2va,ref2va}_pruned-{Q2_K,Q3_K,Q4_K,Q5_0,Q6_K,Q8_0,UD-Q2_K_XL,UD-Q3_K_XL}.gguf`)
+and `lilcheaty/MiniMax-H3-NVFP4` (`minimax_h3_{fl2va,ref2va}_pruned_nvfp4.safetensors`).
+`docs/USAGE.md` recorded them as "NOT drop-in"; this row makes them drop-in.
+
+### What "pruned" IS — evidence, not inference
+
+It is **not** lossy pruning. It is a structural refactor of the AdaLN modulation path,
+and it is defined upstream in **ComfyUI** (`comfy/ldm/minimax/model.py`, native H3 support
+since ComfyUI 0.30.0). vLLM-Omni has NO curve form — `grep -rn prune vllm_omni/` returns
+only scheduler/cache hits — so ComfyUI is the upstream anchor for this row and is cited as
+such. The reference lines:
+
+| Anchor | What it says |
+|---|---|
+| `comfy/ldm/minimax/model.py:419` | `use_adaln_curves = adaln_curve_grid is not None` |
+| `:421-422` | `apply_silu = not use_adaln_curves`; `adaln_dtype = float32 if use_adaln_curves else dtype` |
+| `:428-432` | curve form registers buffer `adaln_t_table` **instead of** constructing `time_embedder` |
+| `:610-615` | `pos = t.clamp(0,1) * (grid-1)`; `i0 = floor(pos).clamp(max=grid-2)`; `t_emb = lerp(table[i0], table[i0+1], pos-i0)` |
+| `:193-198` | `AdalnProj.linear(silu(t_emb) if apply_silu else t_emb)` — the ONLY other difference |
+
+Why it exists (`lilcheaty/MiniMax-H3-NVFP4` README, "Why the pruned base is the right one
+to quantize"): modulation depends only on the timestep, so the 2688-wide conditioning
+projection is almost entirely redundant. `adaln_proj` falls from **13.04B (39.4% of 33.12B)
+to 0.04B (0.2%)**, a ~326x reduction, and the whole DiT from 33.12B to **20.11B**. That is
+why a pruned Q8_0 is the same order of size as our unpruned Q4_K_M — and it is the reason
+this row is worth doing.
+
+### Verified against the REAL checkpoints (headers only, no payload downloaded)
+
+GGUF header via HTTP range read + `ggufinfo.py`; safetensors header via range read of its
+JSON prologue.
+
+| | unpruned (`realrebelai` FL2VA-Q4_K_M) | pruned (`unsloth` fl2va-Q8_0) |
+|---|---|---|
+| tensor count | 535 | **532** |
+| `time_embedder.proj_{in,out}.{weight,bias}` | 4 tensors | **absent** |
+| `adaln_t_table` | absent | **F32, torch `[1025, 8]`** |
+| `blocks.N.adaln_proj.linear.weight` | `[96768, 2688]` | **`[96768, 8]`** (F16) |
+| `final_layer.adaln_proj.linear.weight` | `[10752, 2688]` | **`[10752, 8]`** (F16) |
+
+535 − 4 + 1 = 532 exactly. Every other name and shape is IDENTICAL, so the identity name
+map of §W9 still holds. `minimax_h3_fl2va_pruned_nvfp4.safetensors` carries the same
+structure (1132 keys = 532 + 200 quantized × 3 sidecars), with `adaln_t_table F32 [1025,8]`
+and `blocks.N.adaln_proj.linear.weight F16 [96768, 8]`.
+
+**Therefore: a WEIGHT-layout change with a small, contained FORWARD change.** It is not a
+new architecture. Three deltas and nothing else:
+
+1. `t_emb` comes from a clamped-lerp table lookup instead of sinusoidal+MLP;
+2. no SiLU before the AdaLN linear;
+3. the AdaLN linear's `in_features` is 8 instead of `time_embed_dim` 2688.
+
+The index variable is ours already: our per-row timestep is `t = 1 - sigma` in `[0,1]`
+(`minimax_h3.cpp:824`), which is exactly ComfyUI's `t_v = 1 - sigma_v` (`model.py:538`).
+
+### Design
+
+* `MiniMaxH3DitParams::adaln_curve_grid` (0 = unpruned) mirrors ComfyUI's
+  `adaln_curve_grid=None`; `use_adaln_curves()` is the predicate. When the manifest
+  carries `adaln_t_table`, the grid AND `time_embed_dim` are read from its shape, so the
+  geometry still comes only from the checkpoint.
+* `MiniMaxH3DitWeights::adaln_t_table` is a **host-resident** f32 view, bound by the same
+  rule as `rope.inv_freq`: the lerp runs on the host (M ≤ 4 rows), so no device buffer, no
+  new kernel, and every one of the four staging paths keeps its existing shape.
+* The two loaders that name `time_embedder.*` bind it only in the non-curve form; the
+  curve form binds `adaln_t_table` instead. A checkpoint carrying BOTH or NEITHER is a
+  hard error rather than a silent half-load.
+* `MiniMaxH3IsFp32IslandTensor` gains `adaln_t_table` (it is F32 upstream and read on the
+  host — the same category `rope.inv_freq` is in).
+* The NVFP4 loader skips `comfy_quant` (a rank-1 U8 JSON blob the pruned files carry per
+  quantized layer and the unpruned ones do not).
+
+**One exact tracked exception.** ComfyUI pins `adaln_dtype = float32` for curve
+checkpoints (`model.py:422`). Our AdaLN projection runs in the STREAM dtype on both the
+CPU-bf16 and device paths, exactly as our unpruned arm already does, because
+`modulate_scale_shift`/`modulate_gate` take ONE dtype for the stream and its modulation
+vectors — fp32 modulation over a bf16 stream would be a glue-signature change across
+CUDA/CPU. The f32 parity path (`compute_dtype=kF32`) is fp32 throughout and is what the
+goldens gate. Recorded here rather than hidden; revisit if a render shows modulation
+error.
+
+### Gates
+
+* **Contract gate** — a real pruned GGUF manifest (`minimax_h3_pruned_gguf_manifest.inc`,
+  header-only capture of `minimax_h3_fl2va_pruned-Q8_0.gguf`) resolves name-for-name and
+  shape-for-shape onto `EnumerateMiniMaxH3DitTensors` in curve form, and
+  `ParseMiniMaxH3DitParamsFromGgufManifest` recovers `adaln_curve_grid=1025`,
+  `time_embed_dim=8`, 50 blocks, 2 refiner layers, hidden 5376.
+* **Numeric gate** — `MiniMaxH3AdalnCurveEmbed` matches a checked-in golden of upstream's
+  own expression (`torch.lerp` over a clamped fractional grid index), including the
+  `t=1.0` end case that `clamp(max=grid-2)` exists to protect and the out-of-range clamp.
+* **Render gate** — the same prompt/seed on pruned Q8_0 and on our known-good unpruned
+  Q4_K_M, measured by the two numbers this lane uses: period-16 seam ratio on a decoded
+  frame (~1.15-1.19 clean, 2.28 the known-broken lattice) and VAE-input latent
+  adjacent-cell cosine (0.06 white, 0.789 a real encode, 0.89+ coherent).
+
+### Render — MEASURED (Thor sm_110, 2026-08-10)
+
+`minimax_h3_fl2va_pruned-Q8_0.gguf` (21.4 GB) rendered end to end through the
+production path (`--dequant-bf16`, CUDA, `--partition fl2va`) at 512x512 / 124
+frames / 50 steps, on the same prompt and first frame as the lane's known-good
+Q4_K_M reference and with the same default seed.
+
+A CONTROLLED A/B: both arms ran back to back from the SAME binary, prompt, first
+frame, canvas, step count and default seed, and were measured with the same
+script. Only `--dit` changed.
+
+| measure | pruned Q8_0 (21.4 GB) | unpruned Q4_K_M (19.9 GB) | reading |
+|---|---|---|---|
+| tensors streamed | **532/532** | **535/535** | ONE binary takes both forms, and tells them apart |
+| DiT s/step | 15.88-15.96 | 15.94-15.98 | no per-step cost; the curve lerp is a host-side [m, 8] gather |
+| VAE-input latent adjacent cosine | **0.8385** | **0.8391** | 0.06 == white/broken, 0.789 == a real encode |
+| period-16 seam ratio, frame 100 | **0.9941** | **0.9839** | 2.28 is the known-broken lattice |
+| frame 0 luma mean / sd | 119.74 / 66.02 | 119.75 / 66.35 | both anchor on the same first frame |
+| frame 100 luma mean / sd | 115.13 / 57.11 | 112.96 / 56.94 | |
+| frame 0 -> 100 mean abs diff | 46.66 | 45.78 | neither is a frozen video |
+
+The frame is a coherent scene, not a silhouette or a lattice: the cyan llama, the
+office behind it, the blinds and the readable LOCALAI poster all resolve. On every
+number the pruned Q8_0 sits inside the reference's own band.
+
+**What is NOT claimed.** Nothing here says Q8_0 looks BETTER than Q4_K_M. The two
+numbers this lane measures are coherence detectors, not quality metrics, and they
+cannot separate two coherent renders. A quality claim needs a perceptual
+comparison this row did not run.
+
+### Stop conditions
+
+A pruned checkpoint that carries `time_embedder.*` AND `adaln_t_table`, or an
+`adaln_t_table` whose second dim does not equal the AdaLN linear's `in_features`, stops the
+row: that is a third checkpoint form, not this one.
