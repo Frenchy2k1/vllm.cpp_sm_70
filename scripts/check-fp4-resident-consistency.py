@@ -52,7 +52,10 @@ below is scoped to one block, and each clause is bound to that block's buffer:
   (f) READ-FIRST — (b) precedes (d). The adoption RE-POINTS `w.<buf>.bytes` at the
                    device allocation and releases the source pages, so an upload
                    copy sequenced after it reads pages that have already been
-                   handed back. Moving the adopt above the `Copy` used to pass.
+                   handed back. SINKING the `Copy` to below the adopt is what used
+                   to pass; the opposite motion — HOISTING the adopt above the
+                   `Copy` — lifts it above (c) as well and was already caught by
+                   (e), so only the sink shape shows what (f) adds.
 
 TEXT THE COMPILER NEVER SEES IS NOT A PASS. Every clause runs against
 `checker_text.normalize_source`, which blanks `//` and `/* */` comments, `#if 0` /
