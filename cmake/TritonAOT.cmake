@@ -74,11 +74,17 @@ set(VLLM_CPP_TRITON_VENDORED_DIR "${CMAKE_SOURCE_DIR}/src/vt/cuda/triton_aot_ven
 # -DVLLM_CPP_TRITON=..., and an EXPLICIT request keeps every existing
 # diagnostic below unchanged: only the default is allowed to degrade quietly.
 vt_triton_aot_computed_default(_vt_triton_aot_default _vt_triton_aot_decline
-  "${VLLM_CPP_CUDA}" "${VLLM_CPP_TRITON_VENDORED_DIR}" "${VLLM_CPP_TRITON_REGEN}")
+  "${VLLM_CPP_CUDA}" "${VLLM_CPP_TRITON_VENDORED_DIR}" "${CMAKE_SOURCE_DIR}"
+  "${VLLM_CPP_TRITON_REGEN}")
 option(VLLM_CPP_TRITON
   "Link the vendored Triton AOT kernels (cubins embedded in C) into libvllm (CUDA-only; no Python needed)"
   ${_vt_triton_aot_default})
-if(_vt_triton_aot_decline)
+# Report the RESOLVED value, not the computed one. A cache entry or an explicit
+# -DVLLM_CPP_TRITON=ON overrides the default, and printing "default OFF" beside
+# a cache that reads ON is simply false — which is what every maintainer regen
+# saw, since scripts/regen-triton-aot.sh passes VLLM_CPP_TRITON=ON together
+# with VLLM_CPP_TRITON_REGEN=ON.
+if(_vt_triton_aot_decline AND NOT VLLM_CPP_TRITON)
   message(STATUS
     "Triton AOT: default OFF — ${_vt_triton_aot_decline}")
 endif()
