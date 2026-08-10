@@ -18,10 +18,10 @@ implementation is PR #51655, opened 2026-08-10T10:20Z, approved but **unmerged**
 with 3 of 20 CI checks red. This row therefore ports from a **branch head**, not
 from the pin. That is a deliberate exception, taken on explicit developer
 direction (2026-08-10), recorded as deviation 16 in
-[`.agents/porting-inventory.md`](../porting-inventory.md) §9. It is NOT a
-`waivers.csv` entry: no checker enforces the anchor rule, and a waiver naming a
-checker that does not exist would be a false record. It owes a re-anchor when
-#51655 merges.
+[`.agents/porting-inventory.md`](../porting-inventory.md) §9 and argued for in
+the commit that introduces it, which is where exceptions live now that the
+waiver registry is retired (`a4f72f86`). It owes a re-anchor when #51655
+merges.
 
 **There is no gateable oracle, so no speed number is claimable.** AGENTS.md
 requires both sides of any throughput comparison to run the pinned oracle on
