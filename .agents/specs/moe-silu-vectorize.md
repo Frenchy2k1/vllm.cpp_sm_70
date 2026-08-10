@@ -105,4 +105,40 @@ and that is a gate condition below, not an assumption.
 
 ## Outcome
 
-Pending.
+**NEGATIVE — the premise was an averaging artifact, and the lever is dropped.**
+
+Implemented the row-blocked kernel exactly as designed (block per token row, no
+integer divisions, flat kernel kept as fallback), behind `VT_SILU_ROW`. It is
+bit-identical: `test_qwen36_paged_engine` 315/315 and `test_qwen27_paged_engine`
+235/235, `Status: SUCCESS`, assertion counts unchanged on BOTH arms, and all
+four warm-server greedy probes byte-identical.
+
+Same-binary A/B, 3 reps/arm, order-alternated:
+
+| conc | flat | row | delta |
+|---|---|---|---|
+| c8 | 195.6, 197.3, 196.6 -> 196.64 | 195.9, 196.3, 196.3 -> 196.29 | **-0.17%** |
+| c4 | 141.7, 141.7, 141.8 -> 141.72 | 142.4, 141.8, 142.6 -> 142.45 | +0.52% |
+
+Bands OVERLAP at both points. The stop condition in this spec ("< 0.5% at both
+c4 and c8 -> record NEGATIVE and stop; do not iterate on tiling") governs, so
+the knob was NOT landed.
+
+**Why the premise was wrong.** The 22.6 us per launch that motivated this row is
+a MEAN over a bimodal distribution: `min 1.34 us, med 18.88 us, max 979.78 us,
+stddev 47.69 us`. A handful of enormous prefill launches drag the mean up. Our
+DECODE-phase SiluAndMul is ~1.3 us -- FASTER per launch than the ~2.45 us vLLM
+average it was compared against. There was never a 9.2x gap to close.
+
+This is the prefill/decode mixing trap the record already documents (whole-run
+kernel aggregates mix phases; use a decode-only window or a two-length diff, and
+watch for Max >> Med). It was not applied when this spec was written: the
+comparison used our whole-run mean against vLLM's whole-run mean, over different
+prefill/decode mixes. **Before quoting a per-launch ratio, read the DISTRIBUTION
+(min/med/max/stddev), not the mean.**
+
+Consequence for the mid-band: the "3.6 percentage points of glue" figure that
+this row was scoped around does not survive either -- it was computed from the
+same inflated mean. The mid-band's remaining ~5% is still unattributed, and the
+next attempt must start from a decode-only window on BOTH engines under ONE
+tool, which is the same condition that closed the per-launch marlin question.
