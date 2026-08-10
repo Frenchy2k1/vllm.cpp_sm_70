@@ -99,6 +99,7 @@ SUITES=(
   test_check_model_checklist
   test_check_supported_models
   test_check_env_doc
+  test_checker_text
   test_check_fusion_consistency
   test_check_fp4_resident_consistency
   test_check_runner_routing_consistency

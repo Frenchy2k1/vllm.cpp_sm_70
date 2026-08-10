@@ -14,6 +14,14 @@ dropped BOTH `AddDeviceUpload` calls at once, which is why it could not see that
 `_COUNT` was matched body-wide: one surviving call satisfied the clause for both
 buffers, so dropping exactly one of them passed. The drop-exactly-one cases below
 are the regression for that.
+
+A DELETION DOES NOT HAVE TO LOOK LIKE ONE. The second round of this file only ever
+DELETED text, so it could not see that the clause matchers ran on RAW source: a
+statement left behind as `// AdoptDeviceBytesAsHost(d.b, w.packed);`, inside `#if 0`,
+or inside `if (false)` is gone as far as the compiler is concerned and was a PASS.
+The `Disguised*` cases are the regression for that, and the `#ifdef` case pins the
+opposite direction — a real build configuration is not a deletion and must stay
+green, which is the limitation this gate declares rather than enforces.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ function_bodies = mod.function_bodies
 buffer_block = mod.buffer_block
 body_violations = mod.body_violations
 file_violations = mod.file_violations
+checked_bodies = mod.checked_bodies
 
 
 # A miniature of the real ResidentNvfp4 carrying the full step for both buffers,
@@ -71,7 +80,10 @@ Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
 
 
 def body_of(text: str) -> str:
-    bodies = function_bodies(text)
+    """The single ResidentNvfp4 body, through the SAME normalization `file_violations`
+    applies — so a mutation that only comments a statement out is seen here exactly
+    as the checker sees it in the real file."""
+    bodies = checked_bodies(text)
     assert len(bodies) == 1, f"expected one body, got {len(bodies)}"
     return bodies[0][2]
 
@@ -266,6 +278,30 @@ class InvariantTests(unittest.TestCase):
         problems = body_violations(body_of(text))
         self.assertTrue(any("publishes `d_dev` AFTER" in p for p in problems), problems)
 
+    # --- (f) READ-FIRST ---------------------------------------------------------
+    def test_adopting_before_the_upload_copy_fails(self) -> None:
+        # Mutation (5): the OTHER ordering. `AdoptDeviceBytesAsHost` re-points
+        # `w.packed.bytes` at the device allocation and releases the consumed source
+        # pages; running it before the `Copy` means the upload reads pages that were
+        # already handed back. Publication still precedes the adopt, so clause (e) is
+        # satisfied and only this one may fire.
+        text = mutate(
+            "    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);\n"
+            "    Backend* bk = &d.b;\n"
+            "    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });\n"
+            "    w.packed.d_dev = w.d_packed;\n"
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+            "    Backend* bk = &d.b;\n"
+            "    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });\n"
+            "    w.packed.d_dev = w.d_packed;\n"
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n"
+            "    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);\n",
+        )
+        problems = body_violations(body_of(text))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("BEFORE the upload copy", problems[0])
+        self.assertIn("`packed`", problems[0])
+
     # --- the whole revert -------------------------------------------------------
     def test_dropping_all_six_statements_fails(self) -> None:
         # The exact revert a fresh reviewer applied to BOTH copies, which left every
@@ -289,6 +325,120 @@ class InvariantTests(unittest.TestCase):
         self.assertIn("no `ResidentNvfp4", problems[0])
 
 
+class DisguisedDeletionTests(unittest.TestCase):
+    """A statement the COMPILER never sees is a deletion, however it reads.
+
+    Each case leaves the statement's TEXT in place and removes only its effect. The
+    round-2 checker matched raw source and returned GREEN on every one of them, which
+    is the finding these pin: a commented-out post-upload step is exactly the silent
+    runtime divergence the gate says it catches.
+    """
+
+    def test_a_line_commented_adoption_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+            "    // AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+        )
+        problems = body_violations(body_of(text))
+        self.assertTrue(any("`packed` skips" in p for p in problems), problems)
+        self.assertFalse(any("`scale` skips" in p for p in problems), problems)
+
+    def test_a_block_commented_adoption_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+            "    /* AdoptDeviceBytesAsHost(d.b, w.packed); */\n",
+        )
+        self.assertTrue(any("`packed` skips" in p for p in body_violations(body_of(text))))
+
+    def test_an_if_0_adoption_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+            "#if 0\n    AdoptDeviceBytesAsHost(d.b, w.packed);\n#endif\n",
+        )
+        self.assertTrue(any("`packed` skips" in p for p in body_violations(body_of(text))))
+
+    def test_an_if_false_adoption_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+            "    if (false) { AdoptDeviceBytesAsHost(d.b, w.packed); }\n",
+        )
+        self.assertTrue(any("`packed` skips" in p for p in body_violations(body_of(text))))
+
+    def test_a_commented_upload_counter_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    vllm::load_stats::AddDeviceUpload(sb);\n",
+            "    // vllm::load_stats::AddDeviceUpload(sb);\n",
+        )
+        problems = body_violations(body_of(text))
+        self.assertTrue(any("`scale`'s host->device upload is NOT counted" in p for p in problems), problems)
+        self.assertFalse(any("`packed`'s host->device upload is NOT counted" in p for p in problems), problems)
+
+    def test_a_commented_publication_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    w.packed.d_dev = w.d_packed;\n",
+            "    // w.packed.d_dev = w.d_packed;\n",
+        )
+        self.assertTrue(any("`packed` does not PUBLISH" in p for p in body_violations(body_of(text))))
+
+    def test_an_if_0_publication_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    w.scale.d_dev = w.d_scale;\n",
+            "#if 0\n    w.scale.d_dev = w.d_scale;\n#endif\n",
+        )
+        self.assertTrue(any("`scale` does not PUBLISH" in p for p in body_violations(body_of(text))))
+
+    def test_a_commented_upload_copy_is_not_a_pass(self) -> None:
+        text = mutate(
+            "    d.b.Copy(d.q, p, w.scale.bytes.data(), sb);\n",
+            "    // d.b.Copy(d.q, p, w.scale.bytes.data(), sb);\n",
+        )
+        self.assertTrue(any("does not upload `w.scale.bytes.data()`" in p for p in body_violations(body_of(text))))
+
+    # --- the other direction ----------------------------------------------------
+    def test_ordinary_comments_beside_live_statements_still_pass(self) -> None:
+        # The real function carries a nine-line ENG-LOAD-DIRECT-UPLOAD comment above
+        # its first statement, and it NAMES every statement below it. Blanking
+        # comments must not turn that into a false red.
+        text = mutate(
+            "    vllm::load_stats::AddDeviceUpload(pb);\n",
+            "    // ENG-LOAD-DIRECT-UPLOAD (issue #150): account the move, publish\n"
+            "    // the allocation on the OwnedTensor (w.packed.d_dev = w.d_packed),\n"
+            "    /* then AdoptDeviceBytesAsHost(d.b, w.packed) releases the pages. */\n"
+            "    vllm::load_stats::AddDeviceUpload(pb);\n",
+        )
+        self.assertEqual(body_violations(body_of(text)), [])
+
+    def test_an_ifdef_build_configuration_is_left_alone(self) -> None:
+        # THE DECLARED LIMITATION, pinned in the direction it was declared. `#if 0` is
+        # a disguised deletion; `#ifdef VT_CUTLASS_NVFP4` is a real build
+        # configuration, and deciding it needs the build's macro state. This gate does
+        # not model the preprocessor and must not pretend to: the case stays GREEN.
+        text = mutate(
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n",
+            "#ifdef VT_CUTLASS_NVFP4\n    AdoptDeviceBytesAsHost(d.b, w.packed);\n#endif\n",
+        )
+        self.assertEqual(body_violations(body_of(text)), [])
+
+    def test_normalization_does_not_move_the_reported_line(self) -> None:
+        # `file_violations` prefixes every problem with `label:line`, so the
+        # normalization has to be position-preserving. A four-line block comment above
+        # the definition must push the reported line by exactly four.
+        text = "/* one\n   two\n   three\n   four */\n" + GOOD
+        bodies = checked_bodies(text)
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0][0], 6)  # GOOD's definition is on its own line 2
+
+    def test_a_whole_definition_inside_if_0_is_not_COUNTED_as_checked(self) -> None:
+        # `main` reports "N ResidentNvfp4 definition(s) ... " from the same
+        # `checked_bodies`, so a copy commented out wholesale can never be counted as
+        # checked while being reported as absent — the OK banner would be a lie.
+        self.assertEqual(checked_bodies("#if 0\n" + GOOD + "#endif\n"), [])
+        self.assertEqual(len(checked_bodies(GOOD)), 1)
+        problems = file_violations("#if 0\n" + GOOD + "#endif\n", "some/file.cpp")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no `ResidentNvfp4", problems[0])
+
+
 class LiveTreeTests(unittest.TestCase):
     def test_the_checker_passes_on_the_current_tree(self) -> None:
         r = subprocess.run(
@@ -302,11 +452,51 @@ class LiveTreeTests(unittest.TestCase):
         # with both per-buffer upload blocks inside it.
         for rel in mod.SOURCES:
             text = (ROOT / rel).read_text(encoding="utf-8", errors="ignore")
-            bodies = function_bodies(text)
+            bodies = checked_bodies(text)
             self.assertEqual(len(bodies), 1, str(rel))
             _, recv, body = bodies[0]
             for buffer in mod.BUFFERS:
                 self.assertIsNotNone(buffer_block(body, recv, buffer), f"{rel}:{buffer}")
+
+    def test_disguised_deletions_of_the_LIVE_duplicate_go_red(self) -> None:
+        # The findings against the REAL qwen3_5.cpp text, not the miniature. The
+        # round-2 checker returned exit 0 for every replacement below while the
+        # compiler saw the statement gone.
+        rel = Path("src/vllm/model_executor/models/qwen3_5.cpp")
+        text = (ROOT / rel).read_text(encoding="utf-8", errors="ignore")
+        adopt = "    AdoptDeviceBytesAsHost(d.b, w.packed);\n"
+        publish = "    w.packed.d_dev = w.d_packed;\n"
+        for anchor, replacement in (
+            (adopt, "    // AdoptDeviceBytesAsHost(d.b, w.packed);\n"),
+            (adopt, "    /* AdoptDeviceBytesAsHost(d.b, w.packed); */\n"),
+            (adopt, "#if 0\n" + adopt + "#endif\n"),
+            (adopt, "    if (false) { AdoptDeviceBytesAsHost(d.b, w.packed); }\n"),
+            (publish, "    // w.packed.d_dev = w.d_packed;\n"),
+            (publish, "#if 0\n" + publish + "#endif\n"),
+            (
+                "    vllm::load_stats::AddDeviceUpload(pb);\n",
+                "    // vllm::load_stats::AddDeviceUpload(pb);\n",
+            ),
+        ):
+            self.assertEqual(text.count(anchor), 1, anchor)
+            mutant = text.replace(anchor, replacement, 1)
+            self.assertNotEqual(file_violations(mutant, str(rel)), [], replacement)
+
+    def test_moving_the_LIVE_adoption_above_its_upload_copy_goes_red(self) -> None:
+        rel = Path("src/vllm/model_executor/models/qwen3_5.cpp")
+        text = (ROOT / rel).read_text(encoding="utf-8", errors="ignore")
+        anchor = (
+            "    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);\n"
+            "    Backend* bk = &d.b;\n"
+            "    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });\n"
+            "    w.packed.d_dev = w.d_packed;\n"
+            "    AdoptDeviceBytesAsHost(d.b, w.packed);\n"
+        )
+        self.assertEqual(text.count(anchor), 1)
+        lines = anchor.splitlines(keepends=True)
+        moved = "".join(lines[1:] + lines[:1])  # the Copy after the adopt
+        problems = file_violations(text.replace(anchor, moved, 1), str(rel))
+        self.assertTrue(any("BEFORE the upload copy" in p for p in problems), problems)
 
     def test_dropping_ONE_live_upload_counter_goes_red(self) -> None:
         # The finding, against the REAL qwen3_5.cpp text rather than the miniature:
