@@ -17546,3 +17546,76 @@ server refuses to load it; the measurement above only works against a
 hand-prepared `~/kimi-linear-engine-dir` with a converted tokenizer. Giving
 Kimi-Linear a warm-server path is a prerequisite for any binding Kimi speed
 number, and is worth more than re-running this A/B.
+
+## 35B c2/c8 "weak cells" REFUTED — they were a HARNESS MISMATCH, not code (2026-08-10, `row/BENCH-35B-C2C8-REGRID`, GB10, build `a0fa12c7`)
+
+The record carried two conflicting 35B pictures. The 2026-08-05 binding grid read
+c1 0.977 / c2 0.964 / c4 1.025 / c8 0.964 / c16 0.932 / c32 0.971. The 2026-08-09
+router-landing entry read c1 0.980 / c2 0.867 / c4 0.977 / c8 0.919 and concluded
+"c2 and c8 remain the weak cells and both carry the wider run-to-run spread, so
+the next 35B work should start by tightening those measurements". `NOW.md` then
+spliced the two, publishing c1/c4 0.98x alongside c2 0.87x / c8 0.92x.
+
+**The two number sets were never comparable.** Their absolute throughputs differ
+by ~8x (grid c1 593.7 tok/s against the 2026-08-09 run's 70.58), so they are
+different quantities from different harnesses, and no code change connects them.
+A router optimisation that is byte-identical by construction cannot regress c2 by
+10 points; that impossibility was the tell.
+
+**Re-measured on the binding harness** (`dgx-online-serving.sh --execute`, model
+35, 3 repetitions, single whole-model flock, drop_caches per leg, oracle vLLM
+0.25.0, `nvidia/Qwen3.6-35B-A3B-NVFP4` @`491c2f1e`, corpus byte-copied from the
+2026-08-05 grid). Binding-eligible 12/12 groups; gate FAIL (114/124 axes below
+floor), which is the expected result of a uniform sub-1.0 profile.
+
+| Axis | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| output tok/s (ours) | 65.6 | 93.6 | 142.9 | 197.6 | 256.2 | 323.1 |
+| output tok/s (vLLM) | 67.0 | 99.9 | 150.6 | 211.3 | 272.9 | 333.6 |
+| **throughput ratio** | **0.979** | 0.937 | 0.949 | 0.935 | 0.939 | 0.969 |
+| mean TPOT | 0.978 | 0.945 | 0.943 | 0.938 | 0.930 | 0.967 |
+| mean TTFT | 0.972 | **0.872** | 0.970 | 0.965 | 0.969 | 0.968 |
+| p99 TPOT | 0.977 | 0.961 | 0.972 | 0.933 | 0.938 | 0.951 |
+| our CoV | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
+| vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
+
+**There is no isolated c2/c8 weakness.** The deficit is a broad, flat
+mid-concurrency band: c1 and c32 are strongest (0.979 / 0.969) and everything
+from c2 to c16 sits in 0.935-0.949. Chasing "c2" and "c8" as two special cells
+would have been chasing an artefact of harness mixing.
+
+**Spread was not the problem either.** Every point has CoV under 0.81% on BOTH
+engines, so the ~6% c2 deficit is roughly 8x the noise — resolvable now, without
+more repetitions. The prescribed "tighten the measurement first" step is
+therefore DONE, and its answer is that the measurements were never loose; the
+disagreement was which harness produced them.
+
+**Two residues.** (1) The c4 1.025x win recorded 2026-08-05 did NOT reproduce
+(0.949 here) — either a regression since, or a non-robust win; a same-binary A/B
+against that SHA would separate them. (2) mean TTFT at c2 = 0.872 is the sharpest
+single-axis outlier and the one cell that still looks like a distinct effect
+rather than the flat band.
+
+**Memory PASSES decisively** on the same run: peak PSS 3.34 GiB vs vLLM 12.72 GiB
+(**3.81x**), peak RSS 3.34 vs 13.09 GiB (**3.92x**), peak GPU 50.1 vs 70.4 GiB
+(**1.40x**).
+
+**Blocker cleared to get here: the binding harness had been unrunnable since
+2026-08-09.** `examples/CMakeLists.txt` renamed the `server` target's OUTPUT_NAME
+to `vllm-server` with the release packaging; the harness hardcoded
+`examples/server` in 12 places across BOTH halves — the shell drivers (literal
+string) and `online_gate.py`/`gdn_packed_component.py` (pathlib join, which a
+literal-string grep does not match). The last grid before that was 2026-08-05, so
+nothing exercised it in between. Fixed in `5023adec` (shell) and `a0fa12c7`
+(Python). The Python failure mode was actively misleading: `_file_contains`
+returns False for a MISSING file, so a stale path reports as
+"server binary omits target marker b'MatmulNvfp4Cutlass'" when the marker is in
+fact present 12 times in the binary.
+
+Evidence: `dgx:~/work/g35c/evidence/a0fa12c7219a86832412a6ece1490f452c1d1c40`
+(manifest.json + ratios.json + all-runs.json + report.md + 36 raws + memory /
+thermal / cache-drop / memory-return). Build contract: RelWithDebInfo, nvcc
+13.0.88 at the pinned `/usr/local/cuda-13.0/bin/nvcc`, oracle-bundled CUTLASS
+4.5.0, TRITON=ON, BENCH_PROFILE_CONTROL=OFF. SACRED `test_qwen36_paged_engine`
+passed as the harness's own precondition.
+
