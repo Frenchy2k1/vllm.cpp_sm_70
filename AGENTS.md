@@ -264,10 +264,12 @@ Changing a checker's semantics requires a spec, a red-before test or mutation,
 and green-after evidence. You may never turn a red gate green by deleting an
 assertion or widening a scope.
 
-A waiver names one checker and one exact task, PR, commit, path, gate, or
-hardware target, with an owner, reason, evidence, and a future expiry, in
-[`.agents/waivers.csv`](.agents/waivers.csv). A waiver is visible debt, not
-success.
+There is no waiver registry. A registry of exceptions is a state log, and this
+protocol has none — a change that needs an exception argues for it in its own
+commit message, where the reason is attached to the diff it excuses, carries an
+author and a date, and cannot drift from the tree because it *is* the tree.
+`git log --grep` is the record. An exception is visible debt, not success, and a
+reviewer who does not accept the argument does not merge it.
 
 ## Task guides
 

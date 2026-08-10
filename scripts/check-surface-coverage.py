@@ -74,6 +74,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# `scripts/` is sys.path[0] when this file is RUN, but not when a test loads it by
+# path, so pin it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from checker_text import strip_comments  # noqa: E402,F401  (re-exported by name)
+
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = ROOT / "examples"
 EXAMPLES_CMAKE = EXAMPLES_DIR / "CMakeLists.txt"
@@ -137,12 +142,11 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def strip_comments(text: str) -> str:
-    """Drop // line and /* */ block comments so an include named in a comment never
-    counts as a real internal reach."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    text = re.sub(r"//[^\n]*", " ", text)
-    return text
+# `strip_comments` — an include named in a comment must never count as a real
+# internal reach — is imported above from scripts/checker_text.py, the one copy this
+# family shares. It blanks comments in place instead of collapsing them, so offsets
+# and line numbers survive; for the `findall` uses below that is indistinguishable
+# from the private copy it replaces.
 
 
 def internal_includes(text: str) -> list[str]:
