@@ -217,6 +217,19 @@ vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
 vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.cpp)
 target_compile_definitions(test_muse_glimmer_wiring PRIVATE
   MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
+# Muse Glimmer REAL-WEIGHT gate. Loads the released 30B bf16 checkpoint (or a
+# reduced-depth model assembled from its REAL tensors) through the real loader,
+# forwards it on CPU, and compares against a standalone torch transcription of
+# vllm#51655 head 075d645af produced by scripts/mm/muse_glimmer_text_ref.py.
+# Every case SKIPs unless its env var names a fixture directory, so CI never
+# depends on the 59.55 GB NAS asset. This is NOT a token-exact gate against the
+# model's own runtime — no such runtime exists on this box (released
+# transformers does not register `muse_glimmer` and the pin has no Muse code) —
+# and it makes no speed claim whatsoever (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_real_weights
+  vllm/models/test_muse_glimmer_real_weights.cpp)
+target_compile_definitions(test_muse_glimmer_real_weights PRIVATE
+  VLLM_MUSE_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models")
 
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
