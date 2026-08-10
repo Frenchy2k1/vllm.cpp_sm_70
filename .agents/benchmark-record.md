@@ -17713,3 +17713,62 @@ run), `dgx:~/abblock` (12 A/B result JSONs + token probes). The harness's
 ("35B performance remains held"), so this profile was driven directly rather
 than through them.
 
+## 35B mid-band lever LANDS: the fused shared-expert gate_up sink was still on the MoE-marlin route (+1.31% c8 / +1.38% c4, 2026-08-10, `row/PERF-35B-SHARED-GATEUP-DENSE`, GB10)
+
+Direct follow-on to the mid-band attribution above, and it confirms that entry's
+NAMED next hypothesis: the cost is routing dense projections through the
+grouped-MoE kernel AT ALL, not the tile size (that lever was refuted).
+
+`efa6e40d` (#57) already established "dense route beats MoE on every axis" and
+flipped `VT_MARLIN_DENSE` default ON for `MatmulNvfp4MarlinD`. But
+`SharedGateUpFusedMarlinD` — the ONE fused shared-expert gate_up sink — was
+never given that route and still called `MoeGroupedGemmNvfp4Marlin` with a
+degenerate `E=1, top_k=1` plus a `DenseAlignFor` moe_align cache. The c8 profile
+counted it exactly: **20320 launches per leg = 40 layers x 508 steps, one per
+layer per step**, of `<128,1,8,4,m_block_size_8=false>` at 59.7 us = **5.4% of
+GPU time, a configuration the pinned vLLM never launches**.
+
+Fix mirrors the sibling exactly: rank-2 operand views over the SAME resident
+(`mr.w`/`mr.s`/`mr.g`) and workspace, direct-A, no moe_align cache and no row
+padding. `VT_MARLIN_DENSE_PAIR`, default ON (opt out `=0`) per the
+parity-enabler policy.
+
+**MEASURED, same binary, 3 reps/arm, order-alternated (def first at c8, pair
+first at c4), single load per arm, 35B-A3B NVFP4 @`491c2f1e`:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | MoE route (was default) | 198.3, 200.5, 198.1 | 198.27 | - |
+| c8 | dense route | 202.0, 200.9, 200.6 | **200.87** | **+1.31%** |
+| c4 | MoE route | 143.1, 143.9, 142.9 | 143.07 | - |
+| c4 | dense route | 144.4, 145.0, 145.2 | **145.04** | **+1.38%** (ITL -2.17%) |
+
+Bands are NON-OVERLAPPING at both points, and +1.3% is ~4.5x the +-0.29% noise
+floor established by the block-size A/B's c4 control. Unlike that refuted lever
+this one helps at c4 as well as c8, which is what the deficit's onset at c2
+requires.
+
+**SACRED gates unmoved on the new default:** `test_qwen36_paged_engine` 315/315
+and `test_qwen27_paged_engine` 235/235 with the route ON, and 315/315 again on
+the `=0` opt-out path.
+
+**Token identity NOT claimed.** The warm-server greedy probes are not stable
+run-to-run on this checkpoint (the BASELINE arm itself produced two different
+32-token continuations across its own two runs, `ccc8ca62` at c8 vs `e5d301c5`
+at c4, while both dense-route runs agreed at `d4dfa279`). That instability is
+already recorded for this configuration, so the deterministic SACRED fixtures
+are the correctness arbiter here, not the probe.
+
+**Stale doc corrected in the same change:** `docs/ENVIRONMENT.md` described
+`VT_MARLIN_DENSE` as "off (opt-in)" and "DEFAULT OFF until the strict token
+battery proves oracle byte-match", but `efa6e40d` flipped it ON months ago. The
+page disagreed with the code until 2026-08-10.
+
+Residual: the mid-band is not closed. At c8 this recovers ~1.3% of a ~6.5%
+deficit. The remaining term is the ~2.7% per-launch gap on the shared dominant
+`marlin_moe_wna16` (needs an ncu shape-matched comparison to separate from mix)
+plus whatever the routed-expert path itself carries. Gap stays OPEN.
+
+Evidence: `dgx:~/abpair` (12 result JSONs + token probes), `dgx:~/mbprof`
+(the nsys kernel table that named the sink), `dgx:~/gate2.log`.
+
