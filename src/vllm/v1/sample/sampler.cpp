@@ -374,4 +374,37 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   return out;
 }
 
+// compute_prompt_logprobs (gpu_model_runner.py:5688-5697). The prompt half of
+// step 1 + step 8 above, with nothing in between: no logits processor, no
+// temperature, no sampling. Upstream spells that out at :5691-5693 — "prompt
+// tokens skip sampling processors, so processed_* and raw_* yield the same
+// scores here" — which is why this reuses the exact ops rather than a
+// prompt-specific variant.
+LogprobsTensors Sampler::compute_prompt_logprobs(
+    vt::Queue& q, const vt::Tensor& logits, int num_logprobs,
+    const std::vector<int64_t>& target_token_ids) const {
+  const int64_t n = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+  VT_CHECK(static_cast<int64_t>(target_token_ids.size()) == n,
+           "compute_prompt_logprobs: one target token id per prompt row");
+  VT_CHECK(num_logprobs >= 0 && static_cast<int64_t>(num_logprobs) <= vocab,
+           "compute_prompt_logprobs: num_logprobs must be in [0, vocab]");
+  VT_CHECK(logits.dtype == vt::DType::kF32 && logits.rank == 2,
+           "compute_prompt_logprobs: logits must be f32 [n, vocab]");
+
+  LogprobsTensors lt;
+  if (n == 0) {
+    lt.num_positions = 0;
+    lt.num_tokens_per_position = num_logprobs + 1;
+    return lt;
+  }
+
+  DeviceBuffer rlp(logits.device, q, vt::DType::kF32, {n, vocab});
+  vt::ComputeLogprobs(q, rlp.tensor(), logits);
+  std::vector<float> raw_logprobs(static_cast<size_t>(n) *
+                                  static_cast<size_t>(vocab));
+  rlp.download(raw_logprobs.data());
+  return GatherLogprobs(raw_logprobs, n, vocab, num_logprobs, target_token_ids);
+}
+
 }  // namespace vllm::v1

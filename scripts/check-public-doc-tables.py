@@ -485,7 +485,19 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    "chars": 243571,
+    # 243561 since 2026-08-10 (measured 243561): SAMPLE-PROMPT-LOGPROBS lands the
+    # runner source, so the Sampling row's "Prompt logprobs and `echo` are not
+    # emitted yet" becomes false and needs one binding current-state clause. Paid
+    # for by collapsing three restatements in the same row: "so beam search runs
+    # on the real server" (the same sentence already says it is wired over the
+    # production AsyncLLM HTTP server), "byte-identical to the sync driver" on the
+    # sequential-stepping residual (the parenthetical two clauses earlier already
+    # claims the stronger token-identical output), and the chunked-prefill detail
+    # of the new clause itself, which belongs to specs/prompt-logprobs.md. Every
+    # measured number and binding claim kept verbatim. Net -10 against the
+    # DSpark page this branch was rebased onto, re-pinned byte-tight so the
+    # reduction cannot become untracked growth headroom.
+    "chars": 243561,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
