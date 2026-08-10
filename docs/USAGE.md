@@ -32,6 +32,20 @@ never use, and its teardown can deadlock at process exit — every test passes,
 ([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
+### CUTLASS is fetched as headers only
+
+`-DVLLM_CPP_CUTLASS_FETCH=ON` downloads CUTLASS v4.5.0 and stops there: the
+sources are populated, but CUTLASS's own CMake project is never configured. Every
+consumer in this tree `-isystem`s `${VLLM_CPP_CUTLASS_DIR}/include`, and nothing
+links a CUTLASS CMake target, so its `tools/`, `library/`, `examples/` and
+`tests/` targets are never built.
+
+This is why no `-DCUTLASS_ENABLE_TOOLS=OFF` is needed. Configuring those targets
+used to be required and could fail on its own — building for `sm_80` under CUDA
+13 dies inside CUTLASS `tools/library` with duplicate `sm_100f` flags
+([#193](https://github.com/mudler/vllm.cpp/issues/193)) — for a build product we
+never used.
+
 ## Confirming which CUDA architecture a build targets
 
 `CMakeCache.txt` is now a reliable answer. Configuring with
