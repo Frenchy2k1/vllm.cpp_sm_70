@@ -465,9 +465,36 @@ visible lattice and Q4_K_M gave a photoreal close-up. The full bf16 release is
 66.3 GB across 13 shards if you want to go further.
 
 Higher-precision arms that exist but are not the default: NVFP4
-([lilcheaty/MiniMax-H3-NVFP4](https://huggingface.co/lilcheaty/MiniMax-H3-NVFP4),
-note the pruned variants restructure AdaLN into a timestep lookup table and are
-NOT drop-in), and the original bf16 weights under `FL2VA/transformer/`.
+([lilcheaty/MiniMax-H3-NVFP4](https://huggingface.co/lilcheaty/MiniMax-H3-NVFP4))
+and the original bf16 weights under `FL2VA/transformer/`.
+
+### The PRUNED checkpoints — more precision for the same footprint
+
+The community `pruned` variants **are supported and are drop-in**: pass one to
+`--dit` exactly as you would an unpruned file. Nothing else about the command
+changes.
+
+They are not lossily pruned. AdaLN modulation dominates the unpruned parameter
+count — `adaln_proj` alone is 13.04B of 33.12B (39.4%) — because the model
+projects a 5376-wide conditioning vector into modulation parameters in every one
+of the 50 blocks. But modulation depends only on the timestep, so that projection
+is almost entirely redundant, and the pruned form replaces it with a `[1025, 8]`
+timestep table feeding an 8-wide `adaln_proj.linear`. 13.04B parameters become
+0.04B and the DiT drops from 33.12B to 20.11B, with the modulation path kept at
+full precision.
+
+The practical consequence: **a pruned Q8_0 costs about what our unpruned Q4_K_M
+costs.**
+
+| file | size | source |
+|---|---|---|
+| `minimax_h3_fl2va_pruned-Q8_0.gguf` | 21.4 GB | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF) |
+| `minimax_h3_ref2va_pruned-Q8_0.gguf` | 21.4 GB | same repo — the `ref2va` partition |
+| `minimax_h3_{fl2va,ref2va}_pruned-{Q2_K,Q3_K,Q4_K,Q5_0,Q6_K}.gguf` | 6.7-16.6 GB | same repo |
+| `minimax_h3_{fl2va,ref2va}_pruned_nvfp4.safetensors` | 12.5 GB | [lilcheaty/MiniMax-H3-NVFP4](https://huggingface.co/lilcheaty/MiniMax-H3-NVFP4) |
+
+The partition rule below still applies: a `fl2va` file serves `t2va` and `fl2va`,
+a `ref2va` file serves `ref2va`.
 
 **What is actually verified, and what merely exists.** The distinction matters
 because a render takes hours before it tells you anything:
@@ -477,8 +504,9 @@ because a render takes hours before it tells you anything:
 | **Q4_K_M** | **VERIFIED end to end** — every render in this doc, on BOTH partitions (t2va + fl2va on FL2VA, ref2va on REF2VA). Use this. |
 | Q3_K_M | verified BAD (the A/B above): murky silhouette under a lattice |
 | bf16 (66.3 GB, 13 shards) | loader + device streamer implemented and gated, but **CPU-only** verification — no end-to-end GPU render has been done |
-| NVFP4 | exists; pruned variants are NOT drop-in (see above) |
-| Q8 / Q6_K / Q5_0 | published ([unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) but **PRUNED only** — the restructured AdaLN is not drop-in and this loader cannot read it |
+| NVFP4 | exists; loads (unpruned and pruned) |
+| **pruned Q8_0** | **loads and renders** — the A/B is in `.agents/specs/minimax-h3.md` section 8.21 |
+| pruned Q6_K / Q5_0 / Q4_K / Q3_K / Q2_K ([unsloth](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | load through the same path; only Q8_0 has been rendered |
 
 ### The trap: this checkpoint does not serve every task
 

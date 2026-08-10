@@ -411,10 +411,16 @@ MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
   upload(host.video_patch_proj_b, staged.weights.video_patch_proj_b, false);
   upload(host.audio_patch_proj_w, staged.weights.audio_patch_proj_w, false);
   upload(host.audio_patch_proj_b, staged.weights.audio_patch_proj_b, false);
-  upload(host.time_proj_in_w, staged.weights.time_proj_in_w, false);
-  upload(host.time_proj_in_b, staged.weights.time_proj_in_b, false);
-  upload(host.time_proj_out_w, staged.weights.time_proj_out_w, false);
-  upload(host.time_proj_out_b, staged.weights.time_proj_out_b, false);
+  // A PRUNED (curve-form) checkpoint has no time embedder; its curve table is
+  // HOST-consumed, exactly like rope.inv_freq below.
+  if (!params.use_adaln_curves()) {
+    upload(host.time_proj_in_w, staged.weights.time_proj_in_w, false);
+    upload(host.time_proj_in_b, staged.weights.time_proj_in_b, false);
+    upload(host.time_proj_out_w, staged.weights.time_proj_out_w, false);
+    upload(host.time_proj_out_b, staged.weights.time_proj_out_b, false);
+  } else {
+    staged.weights.adaln_t_table = host.adaln_t_table;
+  }
   upload(host.video_out_w, staged.weights.video_out_w, false);
   upload(host.video_out_b, staged.weights.video_out_b, false);
   upload(host.audio_out_w, staged.weights.audio_out_w, false);
@@ -521,10 +527,14 @@ MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeightsDequantBf16(
   upload(host.audio_patch_proj_b, staged.weights.audio_patch_proj_b);
   upload(host.condition_proj_w, staged.weights.condition_proj_w);
   upload(host.condition_proj_b, staged.weights.condition_proj_b);
-  upload(host.time_proj_in_w, staged.weights.time_proj_in_w);
-  upload(host.time_proj_in_b, staged.weights.time_proj_in_b);
-  upload(host.time_proj_out_w, staged.weights.time_proj_out_w);
-  upload(host.time_proj_out_b, staged.weights.time_proj_out_b);
+  if (!params.use_adaln_curves()) {
+    upload(host.time_proj_in_w, staged.weights.time_proj_in_w);
+    upload(host.time_proj_in_b, staged.weights.time_proj_in_b);
+    upload(host.time_proj_out_w, staged.weights.time_proj_out_w);
+    upload(host.time_proj_out_b, staged.weights.time_proj_out_b);
+  } else {
+    staged.weights.adaln_t_table = host.adaln_t_table;  // consumed on the host
+  }
   staged.weights.rope_inv_freq = host.rope_inv_freq;  // consumed on the host
   for (size_t i = 0; i < host.refiner.size(); ++i) {
     upload_block(host.refiner[i], staged.weights.refiner[i]);
@@ -774,8 +784,21 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   dump_act("embed.stream_post_scatter", stream.t());
 
   // --- time embedding (minimax_h3_transformer.py:272-285) ---
+  //
+  // PRUNED/curve form (comfy/ldm/minimax/model.py:610-615): the checkpoint has
+  // no time embedder; t_emb is interpolated out of the host-resident
+  // `adaln_t_table` and uploaded. M is the unique-timestep count (<= 4), so this
+  // is a few dozen floats, not a kernel.
   DBuf t_emb(d, DType::kF32, {m, params.time_embed_dim});
-  {
+  if (params.use_adaln_curves()) {
+    VT_CHECK(weights.adaln_t_table.data != nullptr,
+             "minimax_h3 device: a curve-form checkpoint must bind adaln_t_table");
+    const std::vector<float> host_emb = MiniMaxH3AdalnCurveEmbed(
+        weights.adaln_t_table.Ptr<float>(), params.adaln_curve_grid, params.time_embed_dim,
+        inputs.unique_timesteps, m);
+    backend.Copy(d.q, t_emb.ptr(), host_emb.data(), t_emb.bytes());
+    backend.Synchronize(d.q);  // `host_emb` dies at the end of this scope
+  } else {
     const int64_t half = params.timestep_input_dim / 2;
     std::vector<float> t_freq(static_cast<size_t>(m * params.timestep_input_dim));
     for (int64_t r = 0; r < m; ++r) {
@@ -801,10 +824,14 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   dump_act("time.t_emb", t_emb.t());
 
   // silu(t_emb), hoisted: t_emb is loop-invariant, so the reference's per-block
-  // silu inside AdalnProject is redundant work here.
+  // silu inside AdalnProject is redundant work here. The PRUNED form applies NO
+  // silu at all — the curve table already carries the activated embedding
+  // (`apply_silu = not use_adaln_curves`, comfy/ldm/minimax/model.py:421).
   DBuf t_emb_act(d, DType::kF32, {m, params.time_embed_dim});
   backend.Copy(d.q, t_emb_act.ptr(), t_emb.ptr(), t_emb.bytes());
-  glue->silu(d.q, t_emb_act.t().Ptr<float>(), m * params.time_embed_dim);
+  if (!params.use_adaln_curves()) {
+    glue->silu(d.q, t_emb_act.t().Ptr<float>(), m * params.time_embed_dim);
+  }
   // silu(t_emb) is fp32; cast to the BF16 AdaLN linear's dtype before the GEMM.
   DBuf t_emb_s(d, dt.S(), {m, params.time_embed_dim});
   CastTo(d, t_emb_s.t(), t_emb_act.t());
@@ -970,10 +997,15 @@ void BindStreamedDitViews(const std::map<std::string, Tensor>& views,
   w.audio_patch_proj_b = view("audio_patch_proj.bias");
   w.condition_proj_w = view("condition_proj.weight");
   w.condition_proj_b = view("condition_proj.bias");
-  w.time_proj_in_w = view("time_embedder.proj_in.weight");
-  w.time_proj_in_b = view("time_embedder.proj_in.bias");
-  w.time_proj_out_w = view("time_embedder.proj_out.weight");
-  w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  // The PRUNED (curve) form carries `adaln_t_table` INSTEAD of the time
+  // embedder. Like `rope.inv_freq`, the table is NOT bound here: it is
+  // host-consumed and each loader binds it from its own container.
+  if (!params.use_adaln_curves()) {
+    w.time_proj_in_w = view("time_embedder.proj_in.weight");
+    w.time_proj_in_b = view("time_embedder.proj_in.bias");
+    w.time_proj_out_w = view("time_embedder.proj_out.weight");
+    w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  }
   auto block = [&](const std::string& prefix, bool adaln) {
     MiniMaxH3DitBlockWeights b;
     b.norm1 = view(prefix + ".norm1.weight");
@@ -1038,10 +1070,15 @@ void BindStreamedDitViewsFp4(const std::map<std::string, Tensor>& views,
   w.audio_patch_proj_b = view("audio_patch_proj.bias");
   proj("condition_proj.weight", w.condition_fp4, w.condition_proj_w);
   w.condition_proj_b = view("condition_proj.bias");
-  w.time_proj_in_w = view("time_embedder.proj_in.weight");
-  w.time_proj_in_b = view("time_embedder.proj_in.bias");
-  w.time_proj_out_w = view("time_embedder.proj_out.weight");
-  w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  // The PRUNED (curve) form carries `adaln_t_table` INSTEAD of the time
+  // embedder. Like `rope.inv_freq`, the table is NOT bound here: it is
+  // host-consumed and each loader binds it from its own container.
+  if (!params.use_adaln_curves()) {
+    w.time_proj_in_w = view("time_embedder.proj_in.weight");
+    w.time_proj_in_b = view("time_embedder.proj_in.bias");
+    w.time_proj_out_w = view("time_embedder.proj_out.weight");
+    w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  }
   auto block = [&](const std::string& prefix, bool adaln) {
     MiniMaxH3DitBlockWeights b;
     b.norm1 = view(prefix + ".norm1.weight");
@@ -1159,6 +1196,16 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
     w.rope_inv_freq = vt::Tensor::Contiguous(staged.rope_inv_freq_host.data(), DType::kF32,
                                              vt::Device{}, {n});
   }
+  // Same rule for a PRUNED checkpoint's curve table: the lerp runs on the host.
+  if (params.use_adaln_curves()) {
+    const GgufTensorInfo& info = file.Get("adaln_t_table");
+    staged.adaln_t_table_host = DequantGgufRowToF32(
+        info.ggml_type, static_cast<const uint8_t*>(info.data),
+        params.adaln_curve_grid * params.time_embed_dim);
+    w.adaln_t_table = vt::Tensor::Contiguous(
+        staged.adaln_t_table_host.data(), DType::kF32, vt::Device{},
+        {params.adaln_curve_grid, params.time_embed_dim});
+  }
   BindStreamedDitViews(views, params, &staged.weights);
   return staged;
 }
@@ -1179,8 +1226,11 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
   const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
 
   auto is_sidecar = [](const std::string& n) {
+    // `.comfy_quant` is a rank-1 U8 JSON blob the PRUNED checkpoints carry per
+    // quantized layer: metadata, not a weight.
     return (n.size() > 12 && n.compare(n.size() - 12, 12, "weight_scale") == 0) ||
-           (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0);
+           (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0) ||
+           (n.size() > 12 && n.compare(n.size() - 12, 12, ".comfy_quant") == 0);
   };
   // Same fp32 ISLANDS as the GGUF stream: vt::MatmulBT rejects a mixed
   // (f32 activation, bf16 weight) pair, so this split is load-bearing, not a
@@ -1219,6 +1269,14 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
       staged.weights.rope_inv_freq = vt::Tensor::Contiguous(
           staged.rope_inv_freq_host.data(), DType::kF32, vt::Device{},
           {static_cast<int64_t>(staged.rope_inv_freq_host.size())});
+      continue;
+    }
+    // A PRUNED checkpoint's curve table is host-consumed for the same reason.
+    if (spec.name == "adaln_t_table") {
+      staged.adaln_t_table_host = MiniMaxH3ReadSafetensorF32(t);
+      staged.weights.adaln_t_table = vt::Tensor::Contiguous(
+          staged.adaln_t_table_host.data(), DType::kF32, vt::Device{},
+          {params.adaln_curve_grid, params.time_embed_dim});
       continue;
     }
 
@@ -1318,8 +1376,11 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
   const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
 
   auto is_sidecar = [](const std::string& n) {
+    // `.comfy_quant` is a rank-1 U8 JSON blob the PRUNED checkpoints carry per
+    // quantized layer: metadata, not a weight.
     return (n.size() > 12 && n.compare(n.size() - 12, 12, "weight_scale") == 0) ||
-           (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0);
+           (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0) ||
+           (n.size() > 12 && n.compare(n.size() - 12, 12, ".comfy_quant") == 0);
   };
   auto is_fp32_island = [](const std::string& n) { return MiniMaxH3IsFp32IslandTensor(n); };
 
@@ -1352,6 +1413,14 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
       staged.weights.rope_inv_freq = vt::Tensor::Contiguous(
           staged.rope_inv_freq_host.data(), DType::kF32, vt::Device{},
           {static_cast<int64_t>(staged.rope_inv_freq_host.size())});
+      continue;
+    }
+    // A PRUNED checkpoint's curve table is host-consumed for the same reason.
+    if (spec.name == "adaln_t_table") {
+      staged.adaln_t_table_host = MiniMaxH3ReadSafetensorF32(t);
+      staged.weights.adaln_t_table = vt::Tensor::Contiguous(
+          staged.adaln_t_table_host.data(), DType::kF32, vt::Device{},
+          {params.adaln_curve_grid, params.time_embed_dim});
       continue;
     }
 
@@ -1486,6 +1555,16 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
       staged.weights.rope_inv_freq = vt::Tensor::Contiguous(
           staged.rope_inv_freq_host.data(), DType::kF32, vt::Device{},
           {static_cast<int64_t>(staged.rope_inv_freq_host.size())});
+      MaybeReleaseSourcePages(t.data, t.nbytes);
+      ++stats.host_resident;
+      continue;
+    }
+    // A PRUNED checkpoint's curve table is host-consumed for the same reason.
+    if (spec.name == "adaln_t_table") {
+      staged.adaln_t_table_host = MiniMaxH3ReadSafetensorF32(t);
+      staged.weights.adaln_t_table = vt::Tensor::Contiguous(
+          staged.adaln_t_table_host.data(), DType::kF32, vt::Device{},
+          {params.adaln_curve_grid, params.time_embed_dim});
       MaybeReleaseSourcePages(t.data, t.nbytes);
       ++stats.host_resident;
       continue;

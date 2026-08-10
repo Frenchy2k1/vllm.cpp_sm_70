@@ -71,6 +71,12 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
          (name.size() > 14 && name.compare(name.size() - 14, 14, "weight_scale_2") == 0))) {
       continue;
     }
+    // `comfy_quant` is a rank-1 U8 tensor holding the layer's quant config as
+    // JSON. Only the PRUNED checkpoints carry it (one per quantized layer); it
+    // is metadata, not a weight, and must not reach the packed-FP4 branch below.
+    if (name.size() > 12 && name.compare(name.size() - 12, 12, ".comfy_quant") == 0) {
+      continue;
+    }
     const StTensor& t = file.Get(name);
     if (t.dtype != "U8") {
       out.storage[name] = MiniMaxH3ReadSafetensorF32(t);

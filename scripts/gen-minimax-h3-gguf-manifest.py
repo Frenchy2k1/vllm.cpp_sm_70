@@ -77,9 +77,13 @@ class Reader:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {sys.argv[0]} <gguf-or-header-prefix>")
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit(f"usage: {sys.argv[0]} <gguf-or-header-prefix> [symbol-prefix]")
     path = sys.argv[1]
+    # The PRUNED checkpoints (unsloth/MiniMax-H3-GGUF) are a second, structurally
+    # different manifest that must be frozen alongside the unpruned one, so the
+    # emitted C++ identifiers are parameterized instead of hard-coded.
+    sym = sys.argv[2] if len(sys.argv) == 3 else "H3Gguf"
     with open(path, "rb") as fh:
         r = Reader(fh)
         if r.raw(4) != b"GGUF":
@@ -117,12 +121,12 @@ def main() -> int:
         "#include <cstdint>\n\n"
         "namespace vllm_test {\n\n"
     )
-    out.write(f"inline constexpr int64_t kH3GgufTensorCount = {len(tensors)};\n")
-    out.write(f"inline constexpr int64_t kH3GgufVersion = {version};\n")
+    out.write(f"inline constexpr int64_t k{sym}TensorCount = {len(tensors)};\n")
+    out.write(f"inline constexpr int64_t k{sym}Version = {version};\n")
     arch = kv.get("general.architecture", "")
-    out.write(f'inline constexpr const char* kH3GgufArchitecture = "{arch}";\n\n')
+    out.write(f'inline constexpr const char* k{sym}Architecture = "{arch}";\n\n')
 
-    out.write("struct H3GgufTensor {\n"
+    out.write(f"struct {sym}Tensor {{\n"
               "  const char* name;\n"
               "  int64_t dims[4];   // GGUF ne order (reversed vs torch), 0-padded\n"
               "  int32_t n_dims;\n"
@@ -130,7 +134,7 @@ def main() -> int:
               "  int64_t orig_shape[4];  // comfy.gguf.orig_shape.<name>, 0 if absent\n"
               "  int32_t orig_n_dims;    // 0 when the key is absent\n"
               "};\n\n")
-    out.write("inline constexpr H3GgufTensor kH3GgufTensors[] = {\n")
+    out.write(f"inline constexpr {sym}Tensor k{sym}Tensors[] = {{\n")
     for name, dims, type_id in tensors:
         padded = list(dims) + [0] * (4 - len(dims))
         orig = kv.get(f"comfy.gguf.orig_shape.{name}")
