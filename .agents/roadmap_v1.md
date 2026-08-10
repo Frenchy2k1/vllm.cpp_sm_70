@@ -37,6 +37,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
 | [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |
+| [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
 | [#250](https://github.com/mudler/vllm.cpp/issues/250) | — | `a5b52047` reached main without a task branch, and `check-role-discipline` cannot be waived | bug |
 | [#243](https://github.com/mudler/vllm.cpp/issues/243) | — | `vllm-feature-gap-analysis.md` is a stale 2026-07-28 snapshot: 9 of 16 HIGH/MED gaps have since landed | bug |
