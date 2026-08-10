@@ -12,6 +12,7 @@
 #include "vllm/entrypoints/openai/reasoning_parsers/think_auto.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/minimax_m2.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/mistral.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/olmo3.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/step3.h"
 
@@ -50,6 +51,10 @@ std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name) {
   if (name == "olmo3") {
     return std::make_unique<Olmo3ReasoningParser>();
   }
+  // muse_glimmer_reasoning_parser.py:106 (register_module("muse_glimmer")).
+  if (name == "muse_glimmer") {
+    return std::make_unique<MuseGlimmerReasoningParser>();
+  }
   return nullptr;
 }
 
@@ -59,6 +64,7 @@ const std::vector<std::string>& reasoning_parser_names() {
   static const std::vector<std::string> names = {
       "think_auto", "deepseek_r1", "deepseek_v3", "holo2",
       "mistral", "minimax_m2", "minimax_m2_append_think", "step3", "olmo3",
+      "muse_glimmer",
   };
   return names;
 }

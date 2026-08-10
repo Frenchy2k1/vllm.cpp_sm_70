@@ -658,6 +658,10 @@ vllm_cpp_add_test(test_tool_parser_gemma4
   vllm/entrypoints/openai/tool_parsers/test_gemma4.cpp)
 vllm_cpp_add_test(test_tool_parser_seed_oss
   vllm/entrypoints/openai/tool_parsers/test_seed_oss.cpp)
+vllm_cpp_add_test(test_tool_parser_muse_glimmer
+  vllm/entrypoints/openai/tool_parsers/test_muse_glimmer_tool_parser.cpp)
+vllm_cpp_add_test(test_reasoning_muse_glimmer
+  vllm/entrypoints/openai/reasoning_parsers/test_muse_glimmer_reasoning_parser.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
 # The real Qwen3.5 chat template (extracted from the GGUF) lives under
 # tests/fixtures/; hand its absolute path to the test so it resolves regardless
