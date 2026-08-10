@@ -1,5 +1,26 @@
 # vLLM feature-gap analysis (`CLAIM-FEATURE-GAP-SPIKE`)
 
+> **Re-verified 2026-08-10 against `main` `16d5c2ce` ([#243](https://github.com/mudler/vllm.cpp/issues/243)).**
+> The original sweep is dated 2026-07-28 at base `308c312a`. OUR side moved a
+> long way since, and nine of the sixteen HIGH/MED rows were stale, several
+> listed `MISSING` while the code was already in the tree AND reachable from the
+> server. Statuses below now carry a `verified 2026-08-10` note naming what was
+> checked; rows that closed outright moved to "Already HAVE".
+>
+> **The pin did NOT move.** Upstream is still `555967922` (0.26.0.dev0), the same
+> revision this spike swept, so no re-sweep of vLLM is owed and nobody should
+> re-run the four parallel area agents. Only our column changed. When the pin
+> advances (see [upstream-sync.md](../upstream-sync.md)) the upstream half of
+> every row needs re-reading and this note must be updated to say so.
+>
+> **Method.** Each row was checked against the TREE, not against
+> `docs/FEATURES.md` — FEATURES was itself drifting at the time
+> ([#242](https://github.com/mudler/vllm.cpp/issues/242)). Where the two
+> disagreed, the tree won. The lesson worth keeping: a gap list decays from the
+> bottom, because the HIGH rows are ranked HIGH precisely because they are common
+> and single-box, which is also why they get implemented first. Re-verify before
+> scoping off this file.
+
 An honest, prioritized map of what pinned vLLM `555967922` (0.26.0.dev0) has
 that vllm.cpp does NOT. Records-only, CPU/research; no build, no GPU. Base
 `main` `308c312a`. vLLM source read at `/home/mudler/_git/vllm` (HEAD
@@ -65,34 +86,35 @@ program.
 
 | Gap | vLLM file:line | Our status | Effort | Notes |
 |---|---|---|---|---|
-| LoRA / multi-LoRA runtime (punica batched apply) | `vllm/lora/lora_model.py:60`, `vllm/lora/punica_wrapper/punica_gpu.py:33`, `vllm/lora/ops/triton_ops/lora_shrink_op.py`, `vllm/v1/worker/lora_model_runner_mixin.py:30` | MISSING (`LORA-RUNTIME` INVENTORIED) | L | Whole adapter subsystem absent; shrink/expand GEMM + slot-mapped batched apply + LRU multi-adapter cache. Highest-demand missing user feature. |
-| LoRA dynamic load/unload endpoints + resolver | `vllm/entrypoints/serve/lora/api_router.py:43,59`, `vllm/lora/resolver.py:14` | MISSING (`LORA-ENDPOINTS` INVENTORIED) | M | `POST /v1/{load,unload}_lora_adapter`; builds on runtime. |
-| Pooling task class: embedding / classify / score / rerank (models) | `vllm/model_executor/layers/pooler/abstract.py:16`, `seqwise/methods.py:37-60`, `tokwise/methods.py:35-86`, `vllm/tasks.py:10`, `vllm/v1/worker/gpu/pool/pooling_runner.py` | MISSING — no pooling model rows in model-matrix; `MODEL-POOLING` is a feature-matrix rollup only | L | Entire non-generative runner (`RunnerType` pooling, `ConvertType` embed/classify). Embeddings + rerank are a huge use case we cannot serve at all. |
-| Pooling / embeddings / classify / score / rerank endpoints | `vllm/entrypoints/pooling/embed/api_router.py:28`, `pooling/scoring/api_router.py:37,71`, `pooling/classify/api_router.py:26` | MISSING (`SERVE-POOLING-ENDPOINTS` INVENTORIED) | M | `/v1/embeddings`, `/pooling`, `/classify`, `/score`, `/rerank` (+v1/v2). Needs the pooling runner first. |
-| AWQ quantization (native compute) | registry `vllm/model_executor/layers/quantization/__init__.py:142`, `auto_awq.py:171` (marlin :414, MoE :547) | MISSING (`QUANT-AWQ` INVENTORIED) | M | One of the two most common community weight formats; no dequant/compute path. |
-| GPTQ quantization (native compute) | registry `__init__.py:152`, `auto_gptq.py:97` (linear :306, MoE :467) | MISSING (`QUANT-GPTQ` INVENTORIED) | M | The other ubiquitous community format (+ marlin repack). |
-| xgrammar structured-output backend | `vllm/v1/structured_output/backend_xgrammar.py:36` (grammar :136, structural-tag :345) | PARTIAL — native JSON-schema subset only (`TOOLS-XGRAMMAR` INVENTORIED) | M | Closes whitespace / key-order / exotic-schema parity vs our bounded native backend. Auto-selection resolves to xgrammar by default (`sampling_params.py:1031`). |
-| fp8 KV cache (`cache_dtype=fp8*`) | `vllm/config/cache.py:76` (`CacheDType`:19), `vllm/model_executor/layers/quantization/kv_cache.py:42` | MISSING (`KV-FP8` INVENTORIED) | M | Standard memory/throughput lever; halves KV footprint. |
+| LoRA / multi-LoRA runtime (punica batched apply) | `vllm/lora/lora_model.py:60`, `vllm/lora/punica_wrapper/punica_gpu.py:33`, `vllm/lora/ops/triton_ops/lora_shrink_op.py`, `vllm/v1/worker/lora_model_runner_mixin.py:30` | **PARTIAL** (was MISSING) — `LORA-RUNTIME` | L | **verified 2026-08-10:** a CPU brick exists (`src/vllm/lora/punica_cpu.cpp`, `include/vllm/lora/{punica,lora_weights}.h`) but is UNWIRED — grep finds no reference from `src/vllm/v1/worker/`, `src/vllm/entrypoints/` or `src/capi/`. So the subsystem is no longer absent, but nothing reaches it. Still the highest-demand missing USER feature, because unreachable equals unusable. |
+| LoRA dynamic load/unload endpoints + resolver | `vllm/entrypoints/serve/lora/api_router.py:43,59`, `vllm/lora/resolver.py:14` | MISSING (`LORA-ENDPOINTS` INVENTORIED) | M | **verified 2026-08-10:** absent from the server route table (13 registered routes; see the endpoint row below). `POST /v1/{load,unload}_lora_adapter`; builds on the runtime being wired first. |
+| Pooling task class: embedding / classify / score / rerank (models) | `vllm/model_executor/layers/pooler/abstract.py:16`, `seqwise/methods.py:37-60`, `tokwise/methods.py:35-86`, `vllm/tasks.py:10`, `vllm/v1/worker/gpu/pool/pooling_runner.py` | **PARTIAL** (was MISSING, "cannot serve at all") — `MODEL-POOLING` | M | **verified 2026-08-10:** the non-generative runner IS landed — `src/vllm/v1/worker/gpu/pool/pooling_runner.cpp` + `src/vllm/model_executor/layers/pooler/dispatch_pooler.cpp`, and `LlamaModel` is registered as a task=embed arch. **embed only.** classify/score/rerank heads are landed ops with NO registered arch, which is the real remaining gap. |
+| Pooling / embeddings / classify / score / rerank endpoints | `vllm/entrypoints/pooling/embed/api_router.py:28`, `pooling/scoring/api_router.py:37,71`, `pooling/classify/api_router.py:26` | **PARTIAL** (was MISSING) — `SERVE-POOLING-ENDPOINTS` | M | **verified 2026-08-10:** `POST /v1/embeddings` is registered and live (`api_server.cpp:1029`). `/pooling`, `/classify`, `/score`, `/rerank` (+v1/v2) are still absent from the route table. |
+| AWQ quantization (native compute) | registry `vllm/model_executor/layers/quantization/__init__.py:142`, `auto_awq.py:171` (marlin :414, MoE :547) | **PARTIAL** (was MISSING, "no dequant/compute path") — `QUANT-AWQ` | M | **verified 2026-08-10:** `src/vllm/model_executor/model_loader/awq_gptq_dequant.cpp` exists — a CPU dequant path. The gap is now native GPU COMPUTE (marlin/MoE), not the absence of any path. |
+| GPTQ quantization (native compute) | registry `__init__.py:152`, `auto_gptq.py:97` (linear :306, MoE :467) | **PARTIAL** (was MISSING) — `QUANT-GPTQ` | M | **verified 2026-08-10:** same CPU dequant TU as AWQ, plus `src/vt/cuda/marlin/.../gptq_marlin_repack.cuh`. Native GPU compute still open. |
+| xgrammar structured-output backend | `vllm/v1/structured_output/backend_xgrammar.py:36` (grammar :136, structural-tag :345) | **CLOSED** — moved to "Already HAVE" | — | **verified 2026-08-10:** `src/vllm/v1/structured_output/backend_xgrammar.cpp` + `xgrammar_json_schema.cpp` + `include/vllm/v1/structured_output/backend_xgrammar.h`. No longer a gap. |
+| fp8 KV cache (`cache_dtype=fp8*`) | `vllm/config/cache.py:76` (`CacheDType`:19), `vllm/model_executor/layers/quantization/kv_cache.py:42` | **PARTIAL** (was MISSING) — `KV-FP8` / `QUANT-KV-FP8` | M | **verified 2026-08-10:** `include/vt/fp8_kv.h` is present and the CPU store/read path landed. CUDA + the memory-halving e2e are the live residual, so the memory lever itself is still unrealised. |
 
 ### MEDIUM priority
 
 | Gap | vLLM file:line | Our status | Effort | Notes |
 |---|---|---|---|---|
-| Reasoning parsers (+ reasoning-gated grammar) | `vllm/reasoning/__init__.py:22` (25+ parsers: deepseek_r1 `deepseek_r1_reasoning_parser.py:10`, qwen3, granite `granite_reasoning_parser.py:18`, gpt-oss, gemma4, glm, kimi_k2, minimax, olmo3 …) | MISSING (`SAMPLE-REASONING` INVENTORIED) | M | Reasoning models (`<think>` split) are now mainstream; also gates reasoning-conditioned structured output. |
+| Reasoning parsers (+ reasoning-gated grammar) | `vllm/reasoning/__init__.py:22` (25+ parsers: deepseek_r1 `deepseek_r1_reasoning_parser.py:10`, qwen3, granite `granite_reasoning_parser.py:18`, gpt-oss, gemma4, glm, kimi_k2, minimax, olmo3 …) | **CLOSED** — moved to "Already HAVE" | — | **verified 2026-08-10:** 11 TUs under `src/vllm/entrypoints/openai/reasoning_parsers/` (`abstract`, `deepseek_r1`, `step3`, …). Breadth vs upstream's 25+ is a separate question from existence; this row claimed non-existence. |
 | Separate draft-model spec decode (generic) | `vllm/v1/spec_decode/draft_model.py:19`, config method `"draft_model"` `speculative.py:684,1195`, runner `gpu_model_runner.py:604` | ROW CREATED 2026-07-29 → `SPEC-DRAFT-MODEL` ACTIVE (`CLAIM-SPEC-DRAFT-MEDUSA`) | M | W0 spike + W1 CPU brick: `DraftModelProposeGreedy` k-step autoregressive greedy propose over a `DraftLogitsFn` oracle, reusing the LANDED `SPEC-REJECTION` verify UNCHANGED; unit 6/6 RED-first (accepted==target greedy; full-acceptance depends on feed-back); `draft_model` config accept. Residuals: real GPU draft forward + DGX e2e greedy + speed gate (W3). See [draft-model-medusa-spec.md](draft-model-medusa-spec.md). |
 | Medusa spec decode | `vllm/v1/spec_decode/medusa.py:18`, method `"medusa"` `speculative.py:822`, runner `:642` | ROW CREATED 2026-07-29 → `SPEC-MEDUSA` SPIKE (`CLAIM-SPEC-DRAFT-MEDUSA`) | M | W0 spike only; the N-head single-pass proposer is deferred to W2 (needs the target's Medusa heads, a model change). Verify/accept reuses `SPEC-REJECTION`. See [draft-model-medusa-spec.md](draft-model-medusa-spec.md). |
 | EAGLE (base v1) + suffix + ngram_gpu + extract_hidden_states + custom_class | `eagle.py:10` (`"eagle"` runner `:636`), `suffix_decoding.py:9`, `ngram_proposer_gpu.py:217`, `extract_hidden_states.py:29`, `custom_class_proposer.py` | MISSING/RECORDS-GAP — `SPEC-EAGLE3` covers eagle3 only; base EAGLE + others unrowed | M | Breadth beyond eagle3; `mlp_speculator` is config-valid but has NO v1 runtime branch upstream (parity floor = nothing owed). |
-| Offline Batch API (JSONL file runner) | `vllm/entrypoints/openai/run_batch.py:793` (`run_batch`), input/output `:148,:213`; batched chat/embed/score/transcription/translation | ROW CREATED 2026-07-29 → `SERVE-BATCH-API` ACTIVE (`CLAIM-BATCH-API`) | M | W0 spike + W1 CPU brick: `RunBatch`/`RunBatchFile` orchestrator over the existing chat serving handler, chat dispatch + custom_id echo + per-line error isolation, unit-gated RED-first (7/80). Residuals: CLI, embeddings/audio dispatch, remote I/O. See [batch-api.md](batch-api.md). |
+| Offline Batch API (JSONL file runner) | `vllm/entrypoints/openai/run_batch.py:793` (`run_batch`), input/output `:148,:213`; batched chat/embed/score/transcription/translation | `SERVE-BATCH-API` — **landed, residuals named** | S | **verified 2026-08-10:** `src/vllm/entrypoints/openai/run_batch.cpp` + `include/.../run_batch.h`. `run_batch.cpp:188-199` shows the dispatch now recognises `/v1/embeddings`, `/score`, `/rerank`, `/v1/audio/transcriptions` and explicitly names `/v1/audio/translations` as a residual in its own error text. `docs/FEATURES.md` marks the offline batch API supported. See [batch-api.md](batch-api.md). |
 | `/v1/responses` (+retrieve/cancel), `/v1/messages` (Anthropic) + count_tokens | `vllm/entrypoints/openai/responses/api_router.py:48,80,110`, `vllm/entrypoints/anthropic/api_router.py:49,95` | MISSING (`SERVE-RESPONSES-MESSAGES` INVENTORIED) | M | Responses API + Anthropic-compat surface. |
-| Audio transcription / translation / realtime endpoints | `vllm/entrypoints/speech_to_text/transcription/api_router.py:31`, `translation/api_router.py:31`, `realtime/api_router.py:17` | MISSING — folded into `SERVE-RESPONSES-MESSAGES` upstream cell; audio INPUT pipeline exists (`ENG-MM-AUDIO-*`) but no `/v1/audio/transcriptions` endpoint | M | We have Whisper/Voxtral encode+decode; the OpenAI transcription endpoint is not wired. Split into its own row when picked up. |
-| Plugin system (general / io_processor / platform / endpoint plugins) | `vllm/plugins/__init__.py:18,77`, `vllm/plugins/io_processors/interface.py:19`, `vllm/plugins/endpoint_plugins/interface.py:43` | RECORDS-GAP — no row | M | Directly serves the extensibility-first priority (additive HW/models/endpoints). Recommend `ENG-PLUGIN-SYSTEM`. |
+| Audio transcription endpoint | `vllm/entrypoints/speech_to_text/transcription/api_router.py:31` | **CLOSED** — moved to "Already HAVE" | — | **verified 2026-08-10:** `POST /v1/audio/transcriptions` is registered in the route table, and `vllm_transcribe` is on the C ABI at v11. The row claimed "the endpoint is not wired"; it is. |
+| Audio **translation** + realtime endpoints | `translation/api_router.py:31`, `realtime/api_router.py:17` | MISSING (split out of the transcription row) | M | **verified 2026-08-10:** `/v1/audio/translations` appears in the tree ONLY as a named residual inside `run_batch.cpp:190,199`; no route registers it. `/v1/audio/realtime` absent entirely. |
+| Plugin system (general / io_processor / platform / endpoint plugins) | `vllm/plugins/__init__.py:18,77`, `vllm/plugins/io_processors/interface.py:19`, `vllm/plugins/endpoint_plugins/interface.py:43` | **PARTIAL** (was RECORDS-GAP, "no row") — `ENG-PLUGIN-SYSTEM` | M | **verified 2026-08-10:** `src/vllm/plugins/plugins.cpp` + `include/vllm/plugins/plugins.h` exist, and `docs/FEATURES.md` marks the in-tree factory done plus a plugin seam. Which of upstream's four plugin KINDS (general / io_processor / platform / endpoint) the seam covers was NOT established by this re-verification and is the next question for whoever picks it up. |
 | Sleep/wake (CuMemAllocator L1/L2) + RLHF weight-update + profiler endpoints | `vllm/device_allocator/cumem.py:82,229`, `vllm/v1/worker/gpu_worker.py:190,1263,1103`, `vllm/entrypoints/serve/dev/{sleep,rlhf,profile}/api_router.py` | PARTIAL (`SERVE-ADMIN` — only `/abort_requests` landed) | M | Sleep/wake + `update_weights`/`collective_rpc` are the RLHF-training integration surface; profiler is dev tooling. |
 | guidance / outlines / lm-format-enforcer backends | `backend_guidance.py:88`, `backend_outlines.py:53`, `backend_lm_format_enforcer.py:95` | MISSING (`TOOLS-GUIDANCE-OUTLINES` INVENTORIED) | M | Additional structured-output engines after xgrammar. |
 | Data parallel (DP) + Expert parallel (EP) + EPLB | `vllm/config/parallel.py:129,165,174`, `vllm/distributed/eplb/eplb_state.py:220`, `vllm/v1/engine/coordinator.py:23` | MISSING (`PAR-DP`, `PAR-EP-EPLB` INVENTORIED) | L | Scale-out; TP/PP already spiked. EPLB rebalances routed experts. |
-| KV offloading (CPU tiering, LRU/ARC) | `vllm/v1/kv_offload/cpu/manager.py:37`, `policies/lru.py:12`, `policies/arc.py:12`, `base.py:187` | MISSING (`KV-OFFLOAD` INVENTORIED) | M | CPU KV tier with pluggable eviction. |
-| External KV cache + connectors (LMCache, NIXL, Mooncake, PD disaggregation) | `vllm/distributed/kv_transfer/kv_connector/v1/base.py:171`, `lmcache_connector.py:72`, `nixl/connector.py:322,350`, `mooncake/mooncake_connector.py:469`, `config/kv_transfer.py:41` | MISSING (`KV-EXTERNAL-CACHE`, `KV-CONNECTORS` INVENTORIED) | L | Prefill/decode disaggregation + external cache providers; cluster-scale. |
+| KV offloading (CPU tiering, LRU/ARC) | `vllm/v1/kv_offload/cpu/manager.py:37`, `policies/lru.py:12`, `policies/arc.py:12`, `base.py:187` | **LANDED and REACHABLE** (was MISSING) — `KV-OFFLOAD` | — | **verified 2026-08-10, the single most wrong row in this file.** A full `kv_offload/` subsystem exists in both `include/vllm/v1/kv_offload/` and `src/vllm/v1/kv_offload/`: `base`, `cache_identity`, `cache_policy`, `cpu_manager`, `fs_io`, `fs_tier`, `kv_block_transfer`, `kv_connector`, `tiering_manager`. It is WIRED — `KVConnectorFactory` is consulted in `server_main.cpp:664-669` and built in `model_loader.cpp:478`. `docs/FEATURES.md` marks KV offload to host memory supported. Residual: confirm which eviction policies `cache_policy` actually implements against upstream's LRU/ARC. |
+| External KV cache + connectors (LMCache, NIXL, Mooncake, PD disaggregation) | `vllm/distributed/kv_transfer/kv_connector/v1/base.py:171`, `lmcache_connector.py:72`, `nixl/connector.py:322,350`, `mooncake/mooncake_connector.py:469`, `config/kv_transfer.py:41` | **PARTIAL** (was MISSING) — `KV-EXTERNAL-CACHE`, `KV-CONNECTORS` | L | **verified 2026-08-10:** an LMCache client subtree exists — `include/vllm/v1/kv_offload/lmcache/` carries `lmcache_connector.h`, `remote_client.h`, `remote_protocol.h`, `cache_engine_key.h`, `chunked_token_database.h`, `token_hasher.h`, `memory_format.h`, but `src/.../lmcache/` has only `cache_engine_key.cpp` + `chunked_token_database.cpp`, so the client is headers-ahead-of-implementation. `docs/FEATURES.md` still marks the external KV provider ABI unsupported, which is consistent. NIXL / Mooncake / PD disaggregation remain untouched. |
 | compressed-tensors generic + quark + bitsandbytes + torchao + moe_wna16 + mxfp4-MoE + modelopt-generic | `compressed_tensors/compressed_tensors.py:82`, `quark/quark.py:57`, `bitsandbytes.py:49`, `torchao.py:134`, `moe_wna16.py:47`, `mxfp4.py:40,102`, `modelopt.py:370,1017` | MISSING (`QUANT-BNB`, `QUANT-QUARK`, `QUANT-TORCHAO`, `QUANT-MOE-WNA16` INVENTORIED; CT schemes rowed `QUANT-CT-*`) | L | Broad quant registry; gate-specific NVFP4/FP8 done, generic dispatch open. mxfp4 backs gpt-oss MoE. |
-| MLA + Mamba/linear attention backends | `vllm/v1/attention/backends/mla/`, `.../mamba` | MISSING (`ATTN-MLA`, `ATTN-MAMBA` INVENTORIED) | L | DeepSeek latent-KV + Mamba/SSM families as first-class backends. |
+| MLA + Mamba/linear attention backends | `vllm/v1/attention/backends/mla/`, `.../mamba` | **LANDED** (was MISSING) — `ATTN-MLA`, `ATTN-MAMBA` | — | **verified 2026-08-10:** MLA is real — `src/vllm/model_executor/layers/attention/mla_attention.cpp`, `include/vllm/model_executor/models/mla_attention.h`, `include/.../mla_chunked_context.h`, plus CPU kernels `src/vt/cpu/cpu_mla_{attn,prefill}.cpp` — and four registered archs use it (DeepSeek-V2, MiniCPM3, GLM-4.7-Flash, Kimi-Linear NoPE-MLA). The linear/SSM side ships as GDN with vendored per-arch Triton-AOT kernels (`src/vt/cuda/triton_aot_vendored/*/gdn_*.h`) and exact-chunks Mamba (`KERNEL-SSM-MAMBA-EXACT-CHUNKS`, merged #127). Calling these MISSING was wrong at the time of writing, not merely stale. |
 | Encoder-decoder / cross-attention runtime | `vllm/model_executor/models/interfaces.py:1013` (`SupportsCrossEncoding`), `config/model.py:1649`, registry Whisper/Mllama/Bart `:595,744,772` | MISSING (`ATTN-ENCODER-CROSS`, `KV-CROSS-ENCODER-SPECS` INVENTORIED) | L | General enc-dec beyond our audio-encoder special-case. |
 | Weight CPU offload (UVA / Prefetch offloader, `cpu_offload_gb`) | `vllm/config/offload.py:23`, `vllm/model_executor/offloader/{uva.py:21,prefetch.py:127}` | MISSING (`ENG-WEIGHT-OFFLOAD` INVENTORIED) | M | Per-parameter UVA offload; mirror floor for expert streaming. |
 
@@ -119,6 +141,20 @@ program.
 ---
 
 ## Already HAVE — naive-scan false-positives (do NOT re-roadmap)
+
+**Closed since the 2026-07-28 sweep** (verified in the tree 2026-08-10, moved
+down from the HIGH/MED tables above rather than deleted, so the record of why
+they were once flagged survives):
+
+- **xgrammar structured-output backend** — `src/vllm/v1/structured_output/backend_xgrammar.cpp`, `xgrammar_json_schema.cpp`.
+- **Reasoning parsers** — 11 TUs under `src/vllm/entrypoints/openai/reasoning_parsers/`.
+- **`/v1/audio/transcriptions`** — registered route + `vllm_transcribe` on the C ABI (v11). Translation and realtime are still open and now carry their own row.
+- **Offline Batch API** — `src/vllm/entrypoints/openai/run_batch.cpp`, with embeddings/score/rerank/transcription dispatch.
+- **KV offload (CPU tiering)** — the whole `kv_offload/` subsystem, wired through `KVConnectorFactory` at `server_main.cpp:664`.
+- **MLA and GDN/Mamba attention** — `mla_attention.cpp` + CPU MLA kernels + vendored per-arch GDN Triton-AOT; four registered MLA archs.
+- **DSpark speculative decoding** — landed via #211 after this sweep; `docs/FEATURES.md` carries it with an honest "no speed claim" note.
+
+**Flagged as false positives in the original sweep and still true:**
 
 - **ngram, MTP, DFlash spec decode** — `SPEC-NGRAM`/`SPEC-MTP`/`SPEC-DFLASH` all DONE.
 - **Prometheus `/metrics`** — `SERVE-METRICS` ACTIVE (catalog + live per-step wiring).
@@ -189,3 +225,25 @@ respective C++ cores; KV connectors on the external-cache ABI; DP/EP on the
   xgrammar and fp8-KV rank HIGH because they are common on one GPU; KV
   connectors / DP-EP / PD-disaggregation are MED because they are cluster-scale
   and the collective abstraction is only at W1.
+- **Staleness is the standing risk in this file, not inaccuracy at authoring
+  time** (2026-08-10, #243). Nine of sixteen HIGH/MED rows had gone wrong in
+  ~2 weeks, all in the same direction: understating what we have. Two rows
+  (KV offload, MLA/Mamba) appear to have been wrong when written, not merely
+  overtaken — both had substantial code the sweep did not find, which suggests
+  the original agents searched by upstream concept name rather than by our own
+  file layout. Anyone re-running this sweep should grep OUR tree for the
+  capability before writing `MISSING`, and prefer `PARTIAL` with a named
+  residual over a binary verdict.
+
+## Post-reconcile priority (2026-08-10)
+
+What is genuinely HIGH after the corrections above, for scoping:
+
+1. **LoRA end to end** — the brick exists and nothing reaches it; wiring it is
+   the single biggest user-visible win.
+2. **AWQ / GPTQ native GPU compute** — CPU dequant is not the lever people want.
+3. **fp8 KV on CUDA** — the memory halving is still unrealised.
+4. **classify / score / rerank** — heads are landed ops with no registered arch;
+   the endpoints follow from that, not the other way round.
+5. **`/v1/responses` + Anthropic `/v1/messages`** — untouched, and the largest
+   remaining OpenAI-surface gap now that transcription and embeddings are live.
