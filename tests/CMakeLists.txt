@@ -78,6 +78,18 @@ vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_dflash_forward vllm/models/test_qwen3_dflash_forward.cpp)
 target_include_directories(test_qwen3_dflash_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W2: the DSpark Markov transition head + draft->target vocab map.
+vllm_cpp_add_test(test_qwen3_dspark_markov vllm/models/test_qwen3_dspark_markov.cpp)
+target_include_directories(test_qwen3_dspark_markov PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W3: speculators-format DSpark config translation.
+vllm_cpp_add_test(test_qwen3_dspark_config vllm/models/test_qwen3_dspark_config.cpp)
+target_include_directories(test_qwen3_dspark_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W3: the DSpark draft weight loader (Markov head + d2t).
+vllm_cpp_add_test(test_qwen3_dspark_weights vllm/models/test_qwen3_dspark_weights.cpp)
+target_include_directories(test_qwen3_dspark_weights PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DSPARK W4: sequential Markov sampling + the anchor block layout.
+vllm_cpp_add_test(test_dspark_sample vllm/v1/spec_decode/test_dspark_sample.cpp)
+target_include_directories(test_dspark_sample PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
 target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ARCH-ONE-SURFACE fold ROW 6: embeddings through the registry/runner path on
@@ -459,6 +471,9 @@ vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 # vllm#49343 eagle-draft max_position_embeddings clamp (config/speculative.h).
 vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
   vllm/config/test_speculative_draft_max_position_embeddings.cpp)
+# SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
+# lookahead slots, draft identity).
+vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)

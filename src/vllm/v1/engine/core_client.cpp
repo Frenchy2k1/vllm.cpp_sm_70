@@ -14,9 +14,10 @@ namespace vllm::v1 {
 
 InprocClient::InprocClient(Scheduler& scheduler, Executor& executor,
                            StructuredOutputManager* structured_output_manager,
-                           int max_concurrent_batches, int shutdown_timeout_s)
+                           int max_concurrent_batches, int shutdown_timeout_s,
+                           bool check_for_draft_tokens)
     : proc_(scheduler, executor, structured_output_manager,
-            max_concurrent_batches, shutdown_timeout_s) {
+            max_concurrent_batches, shutdown_timeout_s, check_for_draft_tokens) {
   // The in-proc analog of launching the background engine process
   // (core_client.py launch_core_engines -> core.py:1154 run_engine_core):
   // one dedicated thread runs the busy loop under the fatal-error guard —

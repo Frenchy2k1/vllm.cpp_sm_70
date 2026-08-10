@@ -22,6 +22,45 @@ same JSON object vLLM takes, so a config written for vLLM works here.
 - **Speed:** measured about 1.04x faster than vLLM's own speculative-on decode at
   concurrency 1 (see [Measured result](#measured-result)).
 
+## DSpark (semi-autoregressive block drafting) — in progress
+
+DSpark drafts a whole block in one parallel pass and then adds intra-block
+dependency with a small sequential head, so a block draft stops being k
+conditionally independent guesses. It is the DFlash drafter plus a low-rank
+Markov transition bias.
+
+Current state (`SPEC-DSPARK`): the config, the Markov head and draft model, both
+published checkpoint layouts (native `deepseek-ai/dspark_qwen3_*` and
+Speculators `RedHatAI/*.dspark`), the sequential sampler and the runner wiring
+have landed, and the path runs end to end on the Qwen3.6-35B-A3B gate model.
+DSpark now genuinely speculates on the Qwen3.6-35B-A3B gate model: draft tokens
+are proposed and accepted, and throughput went from 6.78 to 41.89 tok/s once an
+engine-wide bug was fixed that had been silently discarding EVERY speculator's
+drafts on the CLI and server path (`check_for_draft_tokens` was never threaded
+into `EngineCoreProc`, so `post_step` returned before installing anything).
+
+On that model its greedy output is **token-identical to speculative-off across
+all 48 tokens and reproducible** (both arms run on the synchronous path; the
+speculative path forces async scheduling off, so a fair comparison has to force
+it off on the other side too).
+
+**It is still not gated.** Speculation is currently about 2% SLOWER than plain
+decode at concurrency 1 — the sequential stage is a host-side loop with a device
+round-trip per step — and the cross-engine comparison against vLLM's own DSpark,
+the acceptance-rate band, and the other target families are all still owed. No
+speed win is claimed. A GGUF target, and a target architecture with no aux
+multi-tap, are both refused by name.
+
+```bash
+main --model /models/Qwen3-4B \
+  --speculative-config '{"method":"dspark","model":"deepseek-ai/dspark_qwen3_4b_block7","num_speculative_tokens":7}'
+```
+
+`num_speculative_tokens` is required for a DSpark draft (a native DSpark config
+carries no `n_predict`), and it must be at least the checkpoint's block size —
+a smaller value produces incorrect output rather than merely lower acceptance,
+so it is rejected.
+
 ## The flag
 
 On the OpenAI server:

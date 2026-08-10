@@ -275,6 +275,120 @@ class SharedHeadSource {
   const vllm::GgufFile* gguf_ = nullptr;
 };
 
+// Build the DSpark draft HfConfig from its config.json (SPEC-DSPARK W5).
+//
+// A DSpark config differs from the DFlash one in three ways that all bite:
+//   * `mask_token_id` / `target_layer_ids` sit at the TOP LEVEL, not inside a
+//     nested `dflash_config`. The inherited backbone helpers read
+//     `dflash_config`, exactly as upstream's _dflash_layer_causal does on a
+//     DSpark config (getattr -> {} -> fall back to layer_types), so we synthesize
+//     that sub-object here rather than fork the helpers.
+//   * `sliding_window` may be JSON null (the 4B/8B drafts are all full-attention).
+//   * `rope_theta` lives under `rope_parameters`, not at the top level.
+// Speculators-format configs are translated to this shape first
+// (Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig).
+vllm::HfConfig MakeDsparkDraftConfig(const nlohmann::json& c) {
+  vllm::HfConfig cfg;
+  cfg.hidden_size = c.at("hidden_size").get<int64_t>();
+  cfg.num_attention_heads = c.at("num_attention_heads").get<int64_t>();
+  cfg.num_key_value_heads = c.at("num_key_value_heads").get<int64_t>();
+  cfg.head_dim = c.at("head_dim").get<int64_t>();
+  cfg.rotary_dim = cfg.head_dim;
+  cfg.rope_theta = 10000.0;
+  if (c.contains("rope_theta") && c.at("rope_theta").is_number()) {
+    cfg.rope_theta = c.at("rope_theta").get<double>();
+  } else if (c.contains("rope_parameters") && c.at("rope_parameters").is_object() &&
+             c.at("rope_parameters").contains("rope_theta")) {
+    cfg.rope_theta = c.at("rope_parameters").at("rope_theta").get<double>();
+  }
+  cfg.intermediate_size = c.at("intermediate_size").get<int64_t>();
+  cfg.vocab_size = c.at("vocab_size").get<int64_t>();
+  cfg.num_hidden_layers = c.at("num_hidden_layers").get<int64_t>();
+  cfg.rms_norm_eps = c.at("rms_norm_eps").get<double>();
+  if (c.contains("sliding_window") && c.at("sliding_window").is_number_integer()) {
+    cfg.sliding_window = c.at("sliding_window").get<int64_t>();
+  }
+  if (c.contains("layer_types") && c.at("layer_types").is_array()) {
+    cfg.layer_types = c.at("layer_types").get<std::vector<std::string>>();
+  }
+  cfg.raw = c;
+  // Synthesize the nested dflash_config the inherited backbone reads.
+  nlohmann::json dflash_config = nlohmann::json::object();
+  if (c.contains("mask_token_id")) dflash_config["mask_token_id"] = c.at("mask_token_id");
+  if (c.contains("target_layer_ids")) {
+    dflash_config["target_layer_ids"] = c.at("target_layer_ids");
+  }
+  cfg.raw["dflash_config"] = dflash_config;
+  return cfg;
+}
+
+// Load a DSpark draft: the DFlash backbone plus the Markov head plus, for a
+// reduced draft vocab, the d2t map (SPEC-DSPARK W5). Both published config
+// layouts are accepted; the tensor layout is identical between them.
+std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec,
+                                             const SharedHeadSource& shared) {
+  if (spec.method != "dspark") return nullptr;
+  if (!spec.draft_model_path.has_value()) {
+    throw std::runtime_error("dspark: resolved config missing draft_model_path");
+  }
+  const std::string draft_dir = ResolveDflashDraftDir(*spec.draft_model_path);
+  std::error_code ec;
+  if (!fs::exists(fs::path(draft_dir) / "config.json", ec)) {
+    throw std::runtime_error("dspark: draft checkpoint not found at " + draft_dir +
+                             " (from \"" + *spec.draft_model_path + "\")");
+  }
+  std::ifstream cf((fs::path(draft_dir) / "config.json").string());
+  nlohmann::json cj;
+  cf >> cj;
+  // Speculators format -> the native shape the rest of the path expects.
+  if (vllm::Qwen3DSparkModel::IsSpeculatorsDsparkConfig(cj)) {
+    cj = vllm::Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig(cj);
+  }
+
+  auto draft = std::make_unique<DflashDraft>();
+  draft->k = spec.ResolvedNumSpeculativeTokens();
+  draft->config = MakeDsparkDraftConfig(cj);
+  // Native Qwen3 DSpark configs default to sampling from the anchor
+  // (dspark/speculator.py:50-52 getattr(..., True)); the Speculators translation
+  // has already written the key explicitly with its own FALSE default.
+  draft->sample_from_anchor =
+      !cj.contains("sample_from_anchor") || cj.at("sample_from_anchor").get<bool>();
+
+  const nlohmann::json& dcfg = draft->config.raw.at("dflash_config");
+  if (!dcfg.contains("target_layer_ids") || !dcfg.contains("mask_token_id")) {
+    throw std::runtime_error(
+        "dspark: the draft config must carry target_layer_ids and mask_token_id");
+  }
+  const int64_t num_taps = static_cast<int64_t>(dcfg.at("target_layer_ids").size());
+  const int32_t mask_id = dcfg.at("mask_token_id").get<int32_t>();
+
+  std::vector<vllm::SafetensorsFile> dshards = LoadShards(draft_dir);
+  draft->dspark = std::make_unique<vllm::Qwen3DSparkWeights>(
+      vllm::LoadQwen3DSpark(dshards, draft->config, num_taps, mask_id));
+
+  // A DSpark checkpoint usually SHIPS embed_tokens + lm_head (both published
+  // families do), unlike the z-lab DFlash draft. Share the target's ONLY when the
+  // draft omits them, which is what load_dspark_model's _should_share decides
+  // (dspark/utils.py:56-73) -- overwriting a shipped head would silently swap the
+  // draft's own (possibly reduced-vocab) output layer for the target's.
+  if (draft->dspark->backbone.embed_tokens.Empty() ||
+      draft->dspark->backbone.lm_head.Empty()) {
+    vllm::OwnedTensor shared_embed;
+    vllm::OwnedTensor shared_lm_head;
+    shared.LoadInto(&shared_embed, &shared_lm_head);
+    if (draft->dspark->backbone.embed_tokens.Empty()) {
+      draft->dspark->backbone.embed_tokens = std::move(shared_embed);
+    }
+    if (draft->dspark->backbone.lm_head.Empty()) {
+      draft->dspark->backbone.lm_head = std::move(shared_lm_head);
+      draft->dspark->backbone.draft_vocab_size =
+          draft->dspark->backbone.lm_head.shape[0];
+      draft->dspark->draft_vocab_size = draft->dspark->backbone.draft_vocab_size;
+    }
+  }
+  return draft;
+}
+
 // Load the whole DFlash draft (layer weights + fc + norms from the draft
 // checkpoint, safetensors dir or `dflash`-arch GGUF; embed_tokens + lm_head
 // SHARED bf16 from the TARGET via `shared`) plus the resolved draft config + k.
@@ -622,6 +736,21 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
                                                  cli.prompt_lookup_min,
                                                  cli.prompt_lookup_max);
   }
+  // SPEC-DSPARK W5: the semi-autoregressive block drafter. Like DFlash it names a
+  // SEPARATE draft checkpoint and takes k from the CLI (a native Qwen3 DSpark
+  // config carries no n_predict, speculative.py:973-994); the draft's own
+  // block_size floor is applied by ResolveDspark once the config is read.
+  if (cli.method == "dspark") {
+    if (!cli.num_speculative_tokens.has_value()) {
+      throw std::invalid_argument(
+          "speculative-config: method \"dspark\" requires num_speculative_tokens "
+          "(a DSpark draft config carries no n_predict)");
+    }
+    vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
+        std::nullopt, std::nullopt, cli.num_speculative_tokens);
+    resolved.draft_model_path = cli.draft_model_path;
+    return resolved;
+  }
   if (cli.method != "mtp") {
     throw std::invalid_argument(
         "speculative-config: only methods \"mtp\", \"dflash\" and \"ngram\" are "
@@ -837,8 +966,34 @@ LoadedEngine::LoadedEngine(HfConfig config,
   // WarmupKernels) so the runner holds a stable borrow of dflash_draft_ (which
   // outlives it). Null for mtp/non-spec, so this is inert on every other path.
   if (dflash_draft_ != nullptr) {
-    runner_.set_dflash_draft(&dflash_draft_->weights, &dflash_draft_->config,
-                             dflash_draft_->k);
+    // Both block drafters CONDITION on the target's aux multi-tap. A target
+    // architecture whose forward cannot produce it yields an engine that dies on
+    // the first propose with "missing target aux multi-tap" -- which is exactly
+    // how the first DSpark e2e failed, against classic-dense Qwen3ForCausalLM.
+    // Refuse at LOAD, by name, with the reason.
+    if (!model_->supports_aux_multi_tap()) {
+      const std::string method =
+          dflash_draft_->dspark != nullptr ? "dspark" : "dflash";
+      const std::string arch = config_.architectures.empty()
+                                   ? std::string("this model")
+                                   : config_.architectures.front();
+      throw std::runtime_error(
+          "speculative-config: method \"" + method +
+          "\" needs a target architecture that captures the aux multi-tap (the "
+          "residual stream at the draft's target_layer_ids); " + arch +
+          " does not. Supported targets today are the Qwen3.5/3.6 dense and MoE "
+          "families.");
+    }
+    if (dflash_draft_->dspark != nullptr) {
+      // SPEC-DSPARK W5: wires the inherited backbone through set_dflash_draft
+      // internally, so the shared machinery is byte-identical to the DFlash lane.
+      runner_.set_dspark_draft(dflash_draft_->dspark.get(), &dflash_draft_->config,
+                               dflash_draft_->k,
+                               dflash_draft_->sample_from_anchor);
+    } else {
+      runner_.set_dflash_draft(&dflash_draft_->weights, &dflash_draft_->config,
+                               dflash_draft_->k);
+    }
   }
   // KV-EXTERNAL-CACHE (LMCache): build + wire the external KV connector when the
   // caller selected one via EngineParams::kv_transfer_config. Default (unset)
@@ -923,7 +1078,11 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
     async_engine_ = std::make_unique<vllm::v1::AsyncLLM>(
         input_processor_, *scheduler_, executor_, output_processor_,
         block_hasher_, /*shutdown_timeout_s=*/0, max_concurrent_batches_,
-        &structured_output_manager_);
+        &structured_output_manager_,
+        // The speculative-decode flag EngineCoreProc needs to run post_step.
+        // Without it every speculator's drafts were proposed and dropped on
+        // this (the production CLI/server) path.
+        /*check_for_draft_tokens=*/resolved_spec_config_.has_value());
   }
   return *async_engine_;
 }
@@ -1006,6 +1165,17 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // the shared-head source. The draft is loaded while `gguf` is still mapped,
     // and it copies out (its resolver owns its dequantized bf16), so nothing
     // borrows past this scope.
+    // SPEC-DSPARK W5: a DSpark draft is a safetensors checkpoint at this pin.
+    // A GGUF TARGET would otherwise silently produce a spec-ON engine with NO
+    // draft (the propose path finds no weights and yields nothing), so refuse by
+    // name. The GGUF draft axis is the DSpark analogue of SPEC-DFLASH-GGUF and is
+    // tracked separately.
+    if (params.speculative_config.has_value() &&
+        params.speculative_config->method == "dspark") {
+      throw std::invalid_argument(
+          "speculative-config: method \"dspark\" needs a safetensors target at "
+          "this pin (a GGUF DSpark draft/target axis is not ported yet)");
+    }
     std::unique_ptr<DflashDraft> dflash;
     if (params.speculative_config.has_value() &&
         params.speculative_config->method == "dflash") {
@@ -1094,8 +1264,16 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // *shards, which are still alive here) into a DflashDraft bundle the engine
   // owns and wires into the runner. Null (never built) on every other path.
   const auto maybe_load_dflash = [&]() -> std::unique_ptr<DflashDraft> {
-    if (!params.speculative_config.has_value() ||
-        params.speculative_config->method != "dflash") {
+    if (!params.speculative_config.has_value()) return nullptr;
+    // SPEC-DSPARK W5: the DSpark draft rides the same seam and the same bundle.
+    if (params.speculative_config->method == "dspark") {
+      vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
+          std::nullopt, std::nullopt,
+          params.speculative_config->ResolvedNumSpeculativeTokens());
+      resolved.draft_model_path = params.speculative_config->draft_model_path;
+      return LoadDsparkDraft(resolved, SharedHeadSource(shards.get()));
+    }
+    if (params.speculative_config->method != "dflash") {
       return nullptr;
     }
     // ResolveSpecConfig re-runs on the target config in the LoadedEngine ctor, so

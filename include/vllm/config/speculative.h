@@ -19,9 +19,11 @@
 #ifndef VLLM_CONFIG_SPECULATIVE_H_
 #define VLLM_CONFIG_SPECULATIVE_H_
 
+#include <cctype>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace vllm {
 
@@ -57,6 +59,13 @@ struct SpeculativeConfig {
   // the user gives neither (speculative.py:737-742). std::nullopt for non-ngram.
   std::optional<int> prompt_lookup_min = std::nullopt;
   std::optional<int> prompt_lookup_max = std::nullopt;
+
+  // SPEC-DSPARK W1: parallel_drafting (speculative.py:963-964) — set for the
+  // BLOCK drafters ("dflash", "dspark"), which propose the whole draft block in
+  // one forward instead of k autoregressive steps. Upstream also uses it to
+  // reject P-EAGLE on the V2 runner (config/vllm.py:2168-2177); for us it is the
+  // declarative marker that the propose path is block-shaped.
+  bool parallel_drafting = false;
 
   // ResolveMtp: build the scheduler-facing SpeculativeConfig for a Qwen3.5 MTP
   // checkpoint. Mirrors speculative.py:480-489 (method "mtp",
@@ -98,6 +107,83 @@ struct SpeculativeConfig {
     cfg.method = "dflash";
     cfg.n_predict = 0;
     cfg.num_speculative_tokens = num_speculative_tokens_k;
+    cfg.parallel_drafting = true;  // speculative.py:963-964
+    return cfg;
+  }
+
+  // IsDsparkDraft: the DSpark half of upstream's method auto-detection
+  // (speculative.py:881-887) — a draft whose model id contains "dspark"
+  // (case-insensitively, e.g. deepseek-ai/dspark_qwen3_8b_block7 or
+  // RedHatAI/Qwen3.6-35B-A3B-speculator.dspark) OR whose architectures name
+  // "Qwen3DSparkModel" / "Gemma4DSparkModel". Kept separate from ResolveDspark so
+  // the loader can classify a checkpoint before building any config.
+  static bool IsDsparkDraft(const std::string& draft_model_id,
+                            const std::vector<std::string>& architectures) {
+    std::string lowered = draft_model_id;
+    for (char& c : lowered) {
+      c = static_cast<char>(
+          std::tolower(static_cast<unsigned char>(c)));  // .lower() upstream
+    }
+    if (lowered.find("dspark") != std::string::npos) {
+      return true;
+    }
+    for (const std::string& arch : architectures) {
+      if (arch == "Qwen3DSparkModel" || arch == "Gemma4DSparkModel") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // ResolveDspark: build the scheduler-facing SpeculativeConfig for a DSpark
+  // semi-autoregressive BLOCK draft (SPEC-DSPARK W1). Mirrors the DSpark path of
+  // speculative.py __post_init__ exactly:
+  //
+  //   * `parallel_drafting = True` for ("dflash", "dspark")            :963-964
+  //   * `n_predict` defaults k when the draft config carries one       :973-979
+  //     (the Gemma4 DSpark branch sets n_predict = block_size, :957-961; a native
+  //     Qwen3DSparkModel config carries `block_size` but NOT `n_predict`, so its
+  //     k is REQUIRED from the user — which is why the upstream e2e test passes
+  //     num_speculative_tokens=7 explicitly)
+  //   * k above n_predict must be a multiple of it                     :980-988
+  //   * k missing with no n_predict is an error                        :990-994
+  //   * k below a DSV4-style `dspark_block_size` is a HARD error       :1003-1027
+  //     ("Smaller values produce incorrect output" — garbled, not merely lower
+  //     acceptance, because the block/Markov machinery gets an unsupported layout)
+  //
+  // `n_predict` / `dspark_block_size` are std::nullopt when the draft's HF config
+  // carries no such key, mirroring upstream's getattr(..., None).
+  static SpeculativeConfig ResolveDspark(std::optional<int> n_predict,
+                                         std::optional<int> dspark_block_size,
+                                         std::optional<int> user_num_speculative_tokens) {
+    SpeculativeConfig cfg;
+    cfg.method = "dspark";
+    cfg.parallel_drafting = true;
+    cfg.n_predict = n_predict.value_or(0);
+
+    std::optional<int> k = user_num_speculative_tokens;
+    if (n_predict.has_value()) {
+      if (!k.has_value()) {
+        k = *n_predict;  // "Default to max value defined in draft model config."
+      } else if (*k > *n_predict && *n_predict > 0 && *k % *n_predict != 0) {
+        throw std::invalid_argument(
+            "num_speculative_tokens must be divisible by n_predict "
+            "(the DSpark draft block depth)");
+      }
+    }
+    if (!k.has_value()) {
+      throw std::invalid_argument(
+          "speculative-config: a DSpark draft model was provided, but "
+          "\"num_speculative_tokens\" was not provided");
+    }
+    if (dspark_block_size.has_value() && *k < *dspark_block_size) {
+      throw std::invalid_argument(
+          "speculative-config: DSpark requires num_speculative_tokens >= "
+          "dspark_block_size (" +
+          std::to_string(*dspark_block_size) + "); got " + std::to_string(*k) +
+          ". Smaller values produce incorrect output.");
+    }
+    cfg.num_speculative_tokens = k;
     return cfg;
   }
 
@@ -212,6 +298,13 @@ struct SpeculativeConfig {
   // use_dflash (speculative.py:1172): DFlash needs one EXTRA lookahead slot
   // (scheduler.py:289-292, num_lookahead = k + 1).
   bool use_dflash() const { return method == "dflash"; }
+
+  // use_dspark (speculative.py:1333-1334). DSpark is deliberately NOT part of
+  // use_dflash(): the scheduler branches on the two separately and reserves k
+  // lookahead slots for DSpark against DFlash's k + 1 (scheduler.py:256-265),
+  // because DSpark's anchor query is itself the first prediction rather than a
+  // separate bonus query.
+  bool use_dspark() const { return method == "dspark"; }
 
   // NumLookaheadTokens: the scheduler's num_lookahead_tokens for this config
   // (scheduler.py:275-292). This is the value threaded into allocate_slots so the

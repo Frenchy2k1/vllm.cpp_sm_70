@@ -681,6 +681,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
   src/vllm/model_executor/models/qwen3_dflash.cpp
+  src/vllm/model_executor/models/qwen3_dspark.cpp
+  src/vllm/model_executor/models/qwen3_dspark_weights.cpp
   src/vllm/model_executor/models/qwen3_dflash_gguf.cpp
   src/vllm/model_executor/models/qwen3_dflash_weights.cpp
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
@@ -843,6 +845,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
+  src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
   src/vllm/v1/core/kv_cache_utils.cpp

@@ -28,6 +28,7 @@
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
+#include "vllm/v1/worker/gpu/spec_decode/dspark/speculator.h"  // SPEC-DSPARK W5 SampleDsparkBlockDrafts
 #include "vllm/v1/spec_decode/ngram_proposer.h"  // SPEC-NGRAM D3 NgramPropose
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
@@ -1757,6 +1758,13 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
   }
   // SPEC-DFLASH D5: the block-diffusion drafter has no MTP draft_model_/
   // draft_attn_kv_ (it recomputes context K/V inline); route to its own propose.
+  // SPEC-DSPARK W5: a DSpark draft sets BOTH predicates (dflash_weights_ points
+  // at its inherited backbone, so the shared machinery runs unchanged), so it is
+  // checked first and only the propose tail differs.
+  if (use_dspark()) {
+    propose_drafts_dspark(num_sampled_in, num_rejected_in);
+    return;
+  }
   if (use_dflash()) {
     propose_drafts_dflash(num_sampled_in, num_rejected_in);
     return;
@@ -1814,6 +1822,58 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
     }
   }
   pending_drafts_ = std::move(out);
+}
+
+// SPEC-DFLASH D5: the DFlash branch — the shared block body with the 1 + k
+// fill-in layout and the parallel per-row argmax (dflash/speculator.py:242-273).
+void GPUModelRunner::propose_drafts_dflash(
+    const std::vector<int32_t>& num_sampled_in,
+    const std::vector<int32_t>& num_rejected_in) {
+  // num_sampled_in is derivable from (T_req - num_rejected) per request, so only
+  // num_rejected_in drives the append.
+  (void)num_sampled_in;
+  if (dflash_weights_ == nullptr) {
+    pending_drafts_.reset();
+    return;
+  }
+  const int k = dflash_k_;
+  const int64_t draft_vocab = dflash_weights_->draft_vocab_size;
+  propose_drafts_block(
+      num_rejected_in, *dflash_weights_, *dflash_config_,
+      /*num_query_per_req=*/1 + k,
+      [k, draft_vocab](const std::vector<float>& block_logits, int P,
+                       const std::vector<int32_t>& anchors) {
+        (void)anchors;  // DFlash's anchor is a bonus token, never a prediction.
+        return SampleDflashBlockDrafts(block_logits, P, k, draft_vocab);
+      });
+}
+
+// SPEC-DSPARK W5: the DSpark branch — the SAME shared block body (context
+// accumulation, device KV store, block forward are inherited unchanged) with the
+// anchor-aware query layout and the sequential Markov sampler
+// (dspark/speculator.py:100-169).
+void GPUModelRunner::propose_drafts_dspark(
+    const std::vector<int32_t>& num_sampled_in,
+    const std::vector<int32_t>& num_rejected_in) {
+  (void)num_sampled_in;
+  if (dspark_weights_ == nullptr) {
+    pending_drafts_.reset();
+    return;
+  }
+  vllm::v1::DsparkBlockLayout layout;
+  layout.num_speculative_steps = dflash_k_;
+  layout.sample_from_anchor = dspark_sample_from_anchor_;
+  const vllm::Qwen3DSparkWeights* weights = dspark_weights_;
+  propose_drafts_block(
+      num_rejected_in, weights->backbone, *dflash_config_,
+      layout.num_query_per_req(),
+      [this, layout, weights](const std::vector<float>& block_logits, int P,
+                              const std::vector<int32_t>& anchors) {
+        VT_CHECK(static_cast<int>(anchors.size()) == P,
+                 "propose_drafts_dspark: one anchor token per proposing row");
+        return vllm::v1::SampleDsparkBlockDrafts(block_logits, anchors, layout,
+                                                 *weights, queue_);
+      });
 }
 
 // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE propose. Ported from
@@ -1893,6 +1953,18 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
   dflash_ctx_reqid_.clear();
 }
 
+// SPEC-DSPARK W5: wire a DSpark draft. The inherited backbone goes through
+// set_dflash_draft, so the aux multi-tap capture, the per-request device KV
+// store and the context-aware block forward are the SAME code the landed DFlash
+// lane runs; only the propose tail (use_dspark()) differs.
+void GPUModelRunner::set_dspark_draft(const vllm::Qwen3DSparkWeights* weights,
+                                      const vllm::HfConfig* config, int k,
+                                      bool sample_from_anchor) {
+  dspark_weights_ = weights;
+  dspark_sample_from_anchor_ = sample_from_anchor;
+  set_dflash_draft(weights == nullptr ? nullptr : &weights->backbone, config, k);
+}
+
 // SPEC-DFLASH D5: the DFlash branch of propose_drafts. Ported from
 // dflash/speculator.py::propose (:300-413). Where vLLM writes each step's
 // combined target features into the draft's incremental KV cache
@@ -1903,25 +1975,27 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
 // (the rejected drafts' features are simply never appended). Then it runs the
 // non-autoregressive (1+k) block forward over that context (DflashProposeBlock)
 // and stashes the k drafts/request. Reachable only when use_dflash().
-void GPUModelRunner::propose_drafts_dflash(
-    const std::vector<int32_t>& num_sampled_in,
-    const std::vector<int32_t>& num_rejected_in) {
-  // num_sampled_in is derivable from (T_req - num_rejected) per request (and the
-  // two differ on a non-spec prefill step, where we accumulate ALL chunk features
-  // regardless of num_sampled==1), so only num_rejected_in drives the append.
-  (void)num_sampled_in;
+void GPUModelRunner::propose_drafts_block(
+    const std::vector<int32_t>& num_rejected_in,
+    const vllm::Qwen3DFlashWeights& backbone, const vllm::HfConfig& config,
+    int num_query_per_req,
+    const std::function<std::vector<std::vector<int32_t>>(
+        const std::vector<float>&, int, const std::vector<int32_t>&)>& sample) {
   const int num_reqs = exec_state_.num_reqs;
-  if (num_reqs == 0 || dflash_weights_ == nullptr) {
+  if (num_reqs == 0) {
     pending_drafts_.reset();
     return;
   }
   VT_CHECK(exec_state_.spec_aux.tensor.data != nullptr,
-           "propose_drafts_dflash: missing target aux multi-tap (aux_tap not "
+           "propose_drafts_block: missing target aux multi-tap (aux_tap not "
            "captured on the verify forward)");
-  const int64_t H = dflash_config_->hidden_size;
+  const int64_t H = config.hidden_size;
   const int taps = static_cast<int>(dflash_tap_layer_ids_.size());
-  const int k = dflash_k_;
-  const int32_t mask_id = dflash_weights_->mask_token_id;
+  const int32_t mask_id = backbone.mask_token_id;
+  // The number of NOISE/mask rows after the anchor row. DFlash always emits
+  // 1 + k rows (anchor + k masks). DSpark's anchor-as-first-prediction layout
+  // emits k rows total, so it carries k - 1 masks.
+  const int num_mask_rows = num_query_per_req - 1;
   const StepInputs& step = exec_state_.step;
 
   if (static_cast<int>(dflash_ctx_len_.size()) < num_reqs) {
@@ -1934,7 +2008,7 @@ void GPUModelRunner::propose_drafts_dflash(
   const int64_t T_total = exec_state_.num_actual_tokens;
   const vt::Tensor& aux = exec_state_.spec_aux.tensor;
   VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
-           "propose_drafts_dflash: aux tap shape mismatch");
+           "propose_drafts_block: aux tap shape mismatch");
   std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
                                  static_cast<size_t>(H) * static_cast<size_t>(taps));
   vt::Backend& b = vt::GetBackend(queue_.device.type);
@@ -1950,22 +2024,23 @@ void GPUModelRunner::propose_drafts_dflash(
 
   // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
   const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
-      aux_f32, T_total, *dflash_weights_, *dflash_config_, queue_);
+      aux_f32, T_total, backbone, config, queue_);
 
   // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
   //    rows to the persistent per-request KV store (D9 — no full recompute), and
   //    (for a generating row) build the next (1+k) mask block.
-  std::vector<int32_t> blk_ids;                // [P*(1+k)]
-  std::vector<int32_t> blk_pos;                // [P*(1+k)]
+  std::vector<int32_t> blk_ids;                // [P*num_query_per_req]
+  std::vector<int32_t> blk_pos;                // [P*num_query_per_req]
   std::vector<int32_t> blk_cu = {0};           // [P+1]
   std::vector<int> propose_rows;               // batch rows in the propose batch
+  std::vector<int32_t> anchors;                // [P] each proposing row's anchor token
 
   for (int i = 0; i < num_reqs; ++i) {
     // Reset a reused dense slot (a new request now occupies this row).
     if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
         exec_state_.req_ids[static_cast<size_t>(i)]) {
       dflash_kv_store_[static_cast<size_t>(i)] =
-          Qwen3DFlashModel::MakeDeviceKVStore(*dflash_config_, queue_);
+          Qwen3DFlashModel::MakeDeviceKVStore(config, queue_);
       dflash_ctx_len_[static_cast<size_t>(i)] = 0;
       dflash_ctx_reqid_[static_cast<size_t>(i)] =
           exec_state_.req_ids[static_cast<size_t>(i)];
@@ -1991,7 +2066,7 @@ void GPUModelRunner::propose_drafts_dflash(
     // (the I5e async-input-combine bug class) — assert rather than corrupt.
     const int64_t L = dflash_ctx_len_[static_cast<size_t>(i)];
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
-             "propose_drafts_dflash: context position discontinuity (accumulation "
+             "propose_drafts_block: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
     // Gather this step's `append` accepted-prefix combined features (in ascending
     // position order) + their absolute positions [L, L+append), then project+append
@@ -2007,7 +2082,7 @@ void GPUModelRunner::propose_drafts_dflash(
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
     Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                            new_pos, *dflash_weights_, *dflash_config_, queue_);
+                                            new_pos, backbone, config, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -2022,12 +2097,13 @@ void GPUModelRunner::propose_drafts_dflash(
     const int32_t anchor = input_batch_.last_sampled_tokens[static_cast<size_t>(i)];
     blk_ids.push_back(anchor);
     blk_pos.push_back(static_cast<int32_t>(Lp));
-    for (int j = 1; j <= k; ++j) {
+    for (int j = 1; j <= num_mask_rows; ++j) {
       blk_ids.push_back(mask_id);
       blk_pos.push_back(static_cast<int32_t>(Lp + j));
     }
     blk_cu.push_back(static_cast<int32_t>(blk_ids.size()));
     propose_rows.push_back(i);
+    anchors.push_back(anchor);
   }
 
   // 4. Non-autoregressive (1+k) block propose over the PERSISTENT context KV store.
@@ -2039,6 +2115,14 @@ void GPUModelRunner::propose_drafts_dflash(
   for (int i = 0; i < num_reqs; ++i)
     out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
 
+  // VT_SPEC_TRACE=1: how many rows actually proposed this step, and what the
+  // first row's drafts were. The aggregate acceptance trace on the VERIFY side
+  // cannot distinguish "proposed nothing" from "proposed and everything was
+  // rejected", which is exactly the question the first DSpark e2e raised.
+  static const bool propose_trace = [] {
+    const char* v = std::getenv("VT_SPEC_TRACE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
     // D11 A-wire: run the block forward straight off the per-request DEVICE stores
@@ -2059,13 +2143,25 @@ void GPUModelRunner::propose_drafts_dflash(
     }
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
-            stores, ctx_cu, blk_ids, blk_pos, blk_cu, *dflash_weights_, *dflash_config_, queue_);
-    const std::vector<std::vector<int32_t>> drafts = SampleDflashBlockDrafts(
-        block_logits, P, k, dflash_weights_->draft_vocab_size);
+            stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
+    const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];
       out.draft_token_ids[static_cast<size_t>(row)] = drafts[static_cast<size_t>(r)];
     }
+    if (propose_trace) {
+      std::string first;
+      for (int32_t id : drafts[0]) {
+        first += std::to_string(id);
+        first += ' ';
+      }
+      std::fprintf(stderr, "[spec-propose] rows=%d nqpr=%d drafts/row=%zu first=[%s]\n",
+                   P, num_query_per_req, drafts[0].size(), first.c_str());
+    }
+  }
+  if (propose_trace && propose_rows.empty()) {
+    std::fprintf(stderr, "[spec-propose] NO proposing rows this step (num_reqs=%d)\n",
+                 num_reqs);
   }
   pending_drafts_ = std::move(out);
 }

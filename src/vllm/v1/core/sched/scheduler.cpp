@@ -3,6 +3,8 @@
 #include "vllm/v1/core/sched/scheduler.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -473,6 +475,16 @@ SchedulerOutput Scheduler::schedule() {
       const int num_scheduled_spec_tokens =
           num_new_tokens + request->num_computed_tokens - request->NumTokens() -
           request->num_output_placeholders;
+      static const bool spec_sched_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+      if (spec_sched_trace) {
+        std::fprintf(stderr,
+                     "[spec-sched] req=%s have=%zu num_new=%d computed=%d "
+                     "NumTokens=%d placeholders=%d -> sched=%d\n",
+                     request_id.c_str(), request->spec_token_ids.size(),
+                     num_new_tokens, request->num_computed_tokens,
+                     request->NumTokens(), request->num_output_placeholders,
+                     num_scheduled_spec_tokens);
+      }
       if (num_scheduled_spec_tokens > 0) {
         std::vector<int32_t> spec_ids = request->spec_token_ids;
         // Chunked-prefill / budget clamping may fit only a prefix of the drafts.
@@ -1062,9 +1074,22 @@ void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
   const std::size_t n =
       std::min(draft_token_ids.req_ids.size(),
                draft_token_ids.draft_token_ids.size());
+  static const bool spec_entry_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+  if (spec_entry_trace) {
+    std::fprintf(stderr, "[spec-update] called n=%zu\n", n);
+  }
   for (std::size_t i = 0; i < n; ++i) {
     const std::string& req_id = draft_token_ids.req_ids[i];
     auto it = requests.find(req_id);
+    if (spec_entry_trace) {
+      std::fprintf(stderr,
+                   "[spec-update] req=%s found=%d finished=%d prefill_chunk=%d "
+                   "drafts=%zu\n",
+                   req_id.c_str(), it != requests.end() ? 1 : 0,
+                   (it != requests.end() && it->second->IsFinished()) ? 1 : 0,
+                   (it != requests.end() && it->second->is_prefill_chunk) ? 1 : 0,
+                   draft_token_ids.draft_token_ids[i].size());
+    }
     if (it == requests.end() || it->second->IsFinished()) {
       // The request may have been finished. Skip.
       continue;
@@ -1086,6 +1111,12 @@ void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
     // it so a non-structured request is unaffected. When wired, this drops draft
     // tokens that do not conform to the schema (upstream scheduler.py:1953-1956).
     request->spec_token_ids = draft_token_ids.draft_token_ids[i];
+    static const bool spec_trace = std::getenv("VT_SPEC_TRACE") != nullptr;
+    if (spec_trace) {
+      std::fprintf(stderr, "[spec-install] req=%s installed=%zu lookahead=%d\n",
+                   req_id.c_str(), request->spec_token_ids.size(),
+                   num_lookahead_tokens_);
+    }
   }
 }
 

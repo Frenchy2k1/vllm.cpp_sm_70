@@ -450,9 +450,9 @@ parallelism mode is enumerated and ranked in
 ~40% of the TP surface landed/reusable; **TP-W1 LANDED** (group table); W2..W4+W7
 (the engine-level TP2-on-CPU token-exact gate) are CPU-completable
 NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
-(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is grounded
-and inventoried ([note](../.agents/specs/dspark-speculator-note.md)); full
-scope is a future spike.
+(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is **SPIKED,
+not implemented** ([spec](../.agents/specs/dspark-spec-decode.md)): no code,
+no measurement.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the
