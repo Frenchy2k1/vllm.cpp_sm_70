@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate integration on readiness, review, trailers, waivers, and fresh base."""
+"""Gate integration on readiness, review, trailers, cutover, and fresh base."""
 
 from __future__ import annotations
 
@@ -109,12 +109,12 @@ def main() -> int:
         cwd=ROOT,
     )
     if trailers.returncode:
-        errors.append("post-cutover trailer or waiver validation failed")
+        errors.append("post-cutover trailer validation failed")
     if errors:
         for error in errors:
             print(f"INTEGRATION FAILED: {error}", file=sys.stderr)
         return 1
-    print("INTEGRATION: ready, review, trailers, waivers, cutover, and base are green")
+    print("INTEGRATION: ready, review, trailers, cutover, and base are green")
     return 0
 
 

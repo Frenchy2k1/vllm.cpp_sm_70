@@ -127,7 +127,6 @@ jobs:
           set -eu
           python3 scripts/check-prompt-contract.py
           python3 -m unittest \
-            tests.scripts.test_waivers \
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
