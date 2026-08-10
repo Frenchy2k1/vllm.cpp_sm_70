@@ -8,13 +8,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable
-
-try:
-    from scripts.waivers import Waiver, exact_waiver, load_waivers
-except ModuleNotFoundError:  # direct execution from outside the repository root
-    from waivers import Waiver, exact_waiver, load_waivers
-
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_PROTOCOL_MARKER = "FOLLOWING_AGENTS_PROTOCOL"
@@ -160,20 +153,6 @@ def _strict_errors(message: str) -> list[str]:
     return errors
 
 
-def validate_waiver_targets(repo: Path, waivers: Iterable[Waiver]) -> None:
-    """Reject path waivers whose supposedly exact target is a directory."""
-
-    for waiver in waivers:
-        if not waiver.scope.startswith("path:"):
-            continue
-        target = waiver.scope.removeprefix("path:")
-        candidate = repo / target
-        if candidate.is_dir():
-            raise ValueError(
-                f"waiver {waiver.waiver_id} path target {target!r} is a directory"
-            )
-
-
 def validate_commit_message(message: str, *, strict: bool) -> list[str]:
     """Return trailer-contract errors for one complete commit message."""
 
@@ -235,7 +214,6 @@ def validate_range(
     head: str,
     *,
     cutover: str | None,
-    waivers: Iterable[Waiver],
 ) -> list[str]:
     """Validate an exact first-parent-independent ``BASE..HEAD`` commit set."""
 
@@ -261,8 +239,6 @@ def validate_range(
 
         message = _git(repo, "show", "-s", "--format=%B", commit) + "\n"
         for error in validate_commit_message(message, strict=strict):
-            if exact_waiver(waivers, CHECKER, f"commit:{commit}") is not None:
-                continue
             failures.append(f"{commit[:12]}: {error}")
     return failures
 
@@ -282,12 +258,10 @@ def main() -> int:
     parser.add_argument("--cutover")
     args = parser.parse_args()
     try:
-        waivers = load_waivers(ROOT)
         failures = validate_range(
             ROOT,
             *args.revision_range,
             cutover=args.cutover,
-            waivers=waivers,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"commit trailer check FAILED: {exc}", file=sys.stderr)
