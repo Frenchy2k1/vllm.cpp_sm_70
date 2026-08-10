@@ -482,7 +482,13 @@ class LiveTreeTests(unittest.TestCase):
             mutant = text.replace(anchor, replacement, 1)
             self.assertNotEqual(file_violations(mutant, str(rel)), [], replacement)
 
-    def test_moving_the_LIVE_adoption_above_its_upload_copy_goes_red(self) -> None:
+    def test_sinking_the_LIVE_upload_copy_below_its_adoption_goes_red(self) -> None:
+        # NAME THE MOTION. This SINKS the `Copy` to below the adoption, leaving the
+        # `d_dev` publication where it is, so clause (e) is still satisfied and only
+        # (f) can fire — that is the shape the pre-(f) checker passed. HOISTING the
+        # adoption above the `Copy` instead would lift it above the publication too
+        # and trip (e), which the old checker already caught; it proves nothing
+        # about (f).
         rel = Path("src/vllm/model_executor/models/qwen3_5.cpp")
         text = (ROOT / rel).read_text(encoding="utf-8", errors="ignore")
         anchor = (

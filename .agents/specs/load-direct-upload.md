@@ -342,13 +342,46 @@ above and a larger change. Not a ceiling, an unclaimed lever.
   adoption 1/1; `//` it out 0/1; `/* */` it out 0/1; `#if 0` around it 0/1;
   `if (false)` around it 0/1; `//` the packed upload counter 0/1; `//` the packed
   `d_dev` publication 0/1; `#if 0` around that publication 0/1; `if (false)`
-  around it 0/1; move the packed adoption ABOVE its `Copy` 0/1.
+  around it 0/1; SINK the packed `Copy` to below its adoption 0/1.
 - Clause (f) READ-FIRST closes the ordering half: (c) PUBLISH had to precede
-  (d) ADOPT, but (b) COPY did not, so hoisting `AdoptDeviceBytesAsHost` above
-  `d.b.Copy(...)` passed. The adoption re-points `w.<buf>.bytes` at the device
-  allocation and releases the consumed source pages, so the upload then reads
-  pages already handed back — the reviewer's equivalent mutation of the SHARED
-  copy goes red at run time in 2 cases / 3 assertions.
+  (d) ADOPT, but (b) COPY did not, so a body where the adoption runs before the
+  copy passed. WHICH MOTION PRODUCES THAT ORDER MATTERS, and the record has to
+  name it, because the two are different mutations with different results.
+  SINKING `d.b.Copy(...)` to below `AdoptDeviceBytesAsHost` leaves the `d_dev`
+  publication where it was, so ONLY clause (f) bites: MEASURED on the live
+  `qwen3_5.cpp` duplicate, old checker exit 0 / new checker exit 1 — that is the
+  0/1 row above. HOISTING `AdoptDeviceBytesAsHost` above `d.b.Copy(...)` also
+  lifts it above the publication, so it trips the pre-existing clause (e) as
+  well and the OLD checker already caught it: MEASURED 1/1, which is no evidence
+  for what clause (f) adds.
+- The adoption re-points `w.<buf>.bytes` at the device allocation and releases
+  the consumed source pages, so the upload then reads pages already handed back.
+  The equivalent mutation of the SHARED `dense_nvfp4_gemm.h` copy is red at run
+  time, MEASURED one mutation at a time with the binary deleted before each
+  rebuild and the header md5-verified (`4665255f7af6f52254367f9118ad92ee`)
+  before and after every one:
+
+  | shape of "the adoption now precedes the `Copy`" | red |
+  |---|---|
+  | sink `packed`'s `Copy` below its adoption | 2 cases / 2 assertions |
+  | sink `scale`'s `Copy` below its adoption | 2 cases / 2 assertions |
+  | sink BOTH `Copy`s below their adoptions | 2 cases / 4 assertions |
+  | hoist `packed`'s adoption above its `Copy` (so also above the publication) | 3 cases / 8 assertions |
+  | hoist BOTH adoptions above their `Copy`s | 3 cases / 16 assertions |
+
+  The 2-case family is `fp4 resident: ResidentNvfp4 COUNTS its upload, publishes
+  d_dev, and adopts` and `fp4 resident: a host-addressable device adopts an
+  OWNED fp4 mirror too`; the failing assertions are exactly
+  `w.<buf>.bytes.data()[0] == kSrcPattern` and `AllBytesMatchPattern(...)`, TWO
+  per mutated buffer, so an ODD count is not obtainable from this mutation. The
+  hoist rows are wider because a null `d_dev` makes `AdoptDeviceBytesAsHost`
+  return immediately, which additionally takes `fp4 resident: a NON-host-
+  addressable device still counts and still releases`. This paragraph previously
+  recorded **2 cases / 3 assertions** for clause (f). That is the count of the
+  release-ordering row seven lines above it in the mutation table (*move the
+  release after the host-addressable early return, BEFORE the env one*), carried
+  onto a different mutation — the SAME failure mode as the four rows round 4
+  repaired, caught by a fifth reviewer and re-measured here rather than copied.
 - WHAT THAT CHECKER DOES NOT DO, stated so the record does not imply more: it is
   a STRUCTURAL check over text. It proves the six statements are present in code
   the compiler KEEPS, bound to the right buffer of this function's own weight
@@ -363,6 +396,17 @@ above and a larger change. Not a ceiling, an unclaimed lever.
   `#ifdef VT_CUTLASS_NVFP4` is a real build configuration rather than a disguised
   deletion and deciding it needs the build's macro state — pinned in that
   direction, `#ifdef` around the live adoption stays exit 0 in both checkers.
+  The round-5 reviewer's narrowing of that decline — fail an `#if(n)def` whose
+  macro appears NOWHERE ELSE in the tree, since `VT_REVIEWER_NEVER_DEFINED_ANYWHERE`
+  is a pure deletion while `VT_CUTLASS_NVFP4` is a configuration — is ALSO
+  DECLINED, and for a reason the narrowing does not remove: "defined somewhere in
+  the tree" is not the same predicate as "is a real build configuration".
+  Compiler- and libc-provided macros (`__CUDACC__`, `NDEBUG`, `__linux__`) are
+  never defined in this repository at all, so the rule would fail a legitimate
+  guard the moment one of them is the only occurrence, and it would need a
+  tree-wide scan the checker does not otherwise do. The gate's stated boundary
+  stands: it models `#if 0` / `#if false` and literally-constant false
+  conditions, and nothing else about the preprocessor.
   Run-time proof exists only for the shared copy; extending it to the duplicate
   means making it reachable, which is the unification refactor this row does not
   attempt.
@@ -513,6 +557,36 @@ numbers below are ROUND 5's own re-run, on the branch rebased onto `a0fa12c7`:
   into both `agent-preflight.sh` and `.github/workflows/ci.yml`).
   `test_check_runner_routing_consistency` **31/31** and
   `test_check_surface_coverage` **46/46** green on the shared helper.
+
+**ROUND 6** changed NO compiled file: the diff is this spec, the engine-matrix
+row, the `(f)` clause docstring in `scripts/check-fp4-resident-consistency.py`,
+and the name plus comment of one case in
+`tests/scripts/test_check_fp4_resident_consistency.py`. It repairs one wrong
+number — the clause-(f) parenthetical, re-measured above — and the wording that
+produced it. Branch rebased onto `e3cc4f64`; CLEAN Release build from an empty
+`build/` on the same dev box, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=ON`
+(`CMakeCache` verified: `VLLM_CPP_VULKAN:STRING=ON`, `VLLM_CPP_CUDA:STRING=OFF`,
+`CMAKE_BUILD_TYPE:STRING=Release`), full `cmake --build` with **0 warnings**
+under `-Werror`. Everything above reproduces byte-for-byte:
+`test_load_direct_upload` **14/14 (183)**, `test_safetensors` **34/34 (79)**,
+`test_qwen36_weights` **7/7 (45)** (still a skip on this box, not a pass),
+`test_vulkan_backend` **35/35 (2107)**, `test_backend_cross_device`
+**11/11 (132)**, `test_opt_paged_engine` **6/6 prompts token-exact (96/96), 0
+declines, device type 3** from the printed BACKEND PROOF line;
+`check-fp4-resident-consistency` rc **0**; `test_check_fp4_resident_consistency`
+**42**, `test_checker_text` **33**, `test_check_surface_coverage` **46**,
+`test_check_runner_routing_consistency` **31**;
+`scripts/gen-vulkan-spirv.py --check` `committed SPIR-V is up to date` with the
+pinned `~/tools/glslang-16.5.0/bin/glslang` on `PATH`;
+`scripts/agent-preflight.sh --quiet` **all gates green**. The five clause-(f)
+run-time mutations and the two checker mutations were measured on this same
+tree, one at a time, with `dense_nvfp4_gemm.h`
+(`4665255f7af6f52254367f9118ad92ee`) and `qwen3_5.cpp`
+(`35b5ea250f490105d579f4ffb573aa36`) md5-verified before and after each — and
+with the `qwen3_5.cpp` edits SCOPED to the `ResidentNvfp4` body, because
+`ResidentFp8` a few hundred lines below carries a byte-identical
+`d.b.Copy(d.q, p, w.packed.bytes.data(), pb);` line and a whole-file
+`count == 1` assertion fires on it.
 
 **NOT run for this follow-up, stated plainly:** GB10, CUDA, and both SACRED
 paged-engine gates. The change compiles into exactly one test binary, so a CUDA
