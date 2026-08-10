@@ -313,6 +313,12 @@ MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
 throughput changes; the routed experts still use the grouped MoE kernel, which
 is where they belong.
 
+The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
+f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
+bf16 in-kernel — which is exact — and re-round through bf16 on store, so the
+f32 form was writing and re-reading a whole `[T,H]` buffer for a value it
+already had. The change is bit-identical and worth **+2.05% at c8**.
+
 ### The NVFP4 output head
 
 On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt

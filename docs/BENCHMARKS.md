@@ -136,16 +136,16 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 "weak cells" came from a different harness and were never comparable. The deficit
 is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on both
 engines) and is entirely MARGINAL per-token work, since our FIXED per-step cost
-already beats vLLM (9.02 ms against 9.43 ms). The marlin block-size lever is
-REFUTED by same-binary A/B (block 8 at c8 is 1.16% SLOWER; c4 control +0.29%),
-but routing the fused shared-expert gate_up sink off the MoE-marlin route WINS
-**+1.31% at c8 and +1.38% at c4** (`VT_MARLIN_DENSE_PAIR`, default ON). A
-follow-on per-launch gap on the shared `marlin_moe_wna16` is WITHDRAWN: the two
-engines run identical geometry, identical launch counts and identical registers,
-and the same FlashAttention kernel matches to 0.02% at large grid, so the
-residual is cross-tool uncertainty rather than a kernel difference.
-Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**. Detail in
-`.agents/benchmark-record.md`.
+already beats vLLM (9.02 ms against 9.43 ms).
+
+Two glue levers land against it, both default ON: routing the fused
+shared-expert gate_up sink off the MoE-marlin route (**+1.31% c8 / +1.38% c4**,
+`VT_MARLIN_DENSE_PAIR`) and emitting the shared `down_proj` as bf16 rather than
+f32 (**+2.05% c8 / +0.79% c4**, bit-identical, `VT_SHARED_DOWN_BF16`). The
+marlin block-size lever is REFUTED (block 8 at c8 is 1.16% SLOWER against a
++0.29% control), and a per-launch marlin gap is WITHDRAWN as cross-tool
+uncertainty. Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**.
+Detail in `.agents/benchmark-record.md`.
 
 **Device-resident sampled tokens on integrated (`VT_ASYNC_DEVICE_MIRROR`) A/B'd
 2026-08-06, speed-NEUTRAL** (same-binary): c16 OFF median 2305.8 vs ON 2303.3
