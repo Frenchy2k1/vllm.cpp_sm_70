@@ -18005,3 +18005,32 @@ needs a decode-only window on BOTH engines under ONE tool.
 
 The 35B mid-band therefore stands at two landed levers (`VT_MARLIN_DENSE_PAIR`
 +1.31%, `VT_SHARED_DOWN_BF16` +2.05%) with the remaining ~5% UNATTRIBUTED.
+
+## `kGemvHeuristicAlgos` CUDA build-verify CLOSED (2026-08-10, GB10, main `812de8ca`)
+
+`NOW.md` carried "build-verify `kGemvHeuristicAlgos` on dgx" as an open residual
+on the invocation-parity row. **That row was STALE:** both halves were already on
+main (the named constant in `cuda_matmul.cu` and
+`scripts/check-gemv-invocation-consistency.py`), and `docs/STATUS.md` already
+recorded "CUDA build-verified on dgx (clean -Werror, 2026-08-04)". NOW and
+STATUS disagreed; STATUS was right.
+
+Re-verified at current main anyway, since `cuda_matmul.cu` has moved since
+2026-08-04 and a six-day-old verification is not a claim about today's tree.
+
+Guard, on main:
+
+```
+OK (out-dtype): 4 cuBLASLt C/D layout site(s) all take their dtype from the
+                dtype-faithful out_type variable.
+OK (algo-count): 4 requestedAlgoCount site(s) all route through kGemvHeuristicAlgos.
+```
+
+Build-verify, GB10 sm_121a, Release + CUTLASS 4.5.0 + Triton, nvcc 13.0.88:
+`cuda_matmul.cu` **recompiled** (forced — the first attempt was a stale-object
+pass because `812de8ca` was records-only, and a build that skips the TU verifies
+nothing) with **zero warnings** under `-Werror`, and the resulting binary gates
+clean: `test_qwen36_paged_engine` **315/315** and `test_qwen27_paged_engine`
+**235/235**, `Status: SUCCESS`, assertion counts unchanged.
+
+NOW row corrected to match STATUS. Evidence: `dgx:~/gemv2.log`, `dgx:~/g7.log`.

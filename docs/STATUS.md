@@ -68,7 +68,7 @@ locks the dtype-faithful cuBLASLt op-contract the Laguna `gemvx<bf16,FLOAT>`-vs-
 hardcoded `CUDA_R_32F` literal) and requestedAlgoCount is the named
 `kGemvHeuristicAlgos`. The byte-exact `kGemvHeuristicAlgos` refactor of
 `src/vt/cuda/cuda_matmul.cu` is type-safe and zero-behavior; CUDA build-verified on dgx
-(clean -Werror, 2026-08-04). `VT_V4_RESIDENT_W` allowlisted (2026-08-05).
+(clean -Werror; re-verified @`812de8ca`).
 
 vllm.cpp implements an intentionally focused subset of vLLM, held to
 token-for-token correctness against the pinned oracle.
