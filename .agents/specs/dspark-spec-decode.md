@@ -420,12 +420,60 @@ WHOLE draft step (backbone + the N-step loop) in one CUDA graph
 and wants checking against the upstream reference band before it is blamed on
 the draft checkpoint's bf16-trained-over-NVFP4 mismatch.
 
+## 6d. DEEP DIVE: the drafter is not the problem (2026-08-10)
+
+Two measurements, both of which contradict the guess in §6c.
+
+**1. Our acceptance is BETTER than upstream's — 2.7x better.** vLLM's own
+`spec_decode` metrics on the SAME target + draft + k=8, 64 greedy tokens:
+
+| | drafts | draft tokens | accepted | rate | per-position |
+|---|---:|---:|---:|---:|---|
+| oracle vLLM 0.25.0 | 39 | 312 | 24 | **7.7%** | `[18, 5, 1, 0, 0, 0, 0, 0]` |
+| ours | 18 | 144 | 30 | **20.8%** | 1.67/step |
+
+Upstream accepts past position 2 essentially never. So "20.8% is low, blame the
+bf16-trained draft over an NVFP4 target" was wrong: the draft is fine, and our
+sampling of it is at least as good.
+
+**2. The draft step is CHEAP, and the sequential Markov loop is 12% of it.**
+Phase probe inside the runner's real propose path (`VT_SPEC_TRACE`, 26 steps,
+first step discarded as warm-up):
+
+| phase | median | total |
+|---|---:|---:|
+| parallel backbone block forward | **4.17 ms** | 195.1 ms |
+| sequential Markov sampler (k=8) | **0.62 ms** | 26.8 ms |
+
+So the host-side loop with its per-step device round-trip — the thing §6c named
+as the prime suspect and the thing upstream's CUDA-graph capture would fix —
+costs 0.6 ms of a 4.8 ms draft step. Capturing it could win at most ~1% of the
+step. **That lever is dead.**
+
+**Where the speedup actually goes: the VERIFY step.** With the warm numbers
+(spec-off 71.3 tok/s = 14.0 ms/step; spec-on ~82 tok/s at 2.67 tokens/step =
+32.5 ms/step) and a 4.8 ms draft, the target forward on a speculative step costs
+**~27.7 ms against 14.0 ms for a plain one-token decode — about 2x**. A
+speculative verify carries 1+k=9 query tokens instead of 1; on a bandwidth-bound
+MoE decode that should be nearly free, because it streams the same weights.
+
+If the verify step cost what a plain decode costs, 2.67 tokens per
+(14.0 + 4.8) ms would be **142 tok/s, a 2.0x speedup** instead of 1.15x. That
+single ratio is the whole gap.
+
+**Next probe (named, not yet run):** whether the T=9 verify falls off the
+captured decode CUDA graph into an eager prefill-shaped forward. Our decode
+graph is captured for the T=1 decode shape; upstream captures the
+speculative-decode shape as a first-class uniform-query case. Confirm with an
+`nsys` instance-count check on both arms (the house rule: same tool both sides,
+and a captured graph reports as one range), then capture the 1+k shape.
+
 **Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
 PRODUCTION GRAPHED config through the project's harness, not the eager arm run
 here; (2) token-exactness against that oracle on the SACRED corpus rather than
 ad-hoc prompts; (3) the acceptance-rate band against the upstream reference;
-(4) the 27B lane and the Gemma4 `1 + N` layout; (5) the CUDA-graph capture of
-the draft step, which is where the missing half of the speedup most likely is.
+(4) the 27B lane and the Gemma4 `1 + N` layout; (5) capturing the SPECULATIVE VERIFY shape, which § 6d measures as the real
+gap (the draft-step capture that looked like the lever is worth ~1%).
 
 ## 7. Evidence, authority, stop conditions
 
