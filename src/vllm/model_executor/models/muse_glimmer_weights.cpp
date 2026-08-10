@@ -36,12 +36,15 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 
 namespace vllm {
 namespace {
@@ -466,6 +469,51 @@ std::vector<std::string> EnumerateMuseGlimmerTensors(const MuseGlimmerParams& pa
   return names;
 }
 
+namespace {
+
+// Where a CANONICAL (post-`NormalizeMuseGlimmerWeightName`) name lives.
+struct TensorSite {
+  const SafetensorsFile* shard = nullptr;
+  std::string raw_name;
+};
+
+// One decoder layer's tensors, in the canonical names EnumerateMuseGlimmerTensors
+// declares (muse_glimmer.py:1218-1277).
+MuseGlimmerLayerWeights LoadLayer(const TensorResolver& get, int64_t layer,
+                                  bool use_attn_output_gate) {
+  const std::string base = "model.layers." + std::to_string(layer) + ".";
+  const std::string sa = base + "self_attn.";
+  const std::string mlp = base + "mlp.";
+
+  MuseGlimmerLayerWeights w;
+  w.input_layernorm = dense_loaders::LoadBf16Direct(get, base + "input_layernorm.weight");
+  w.post_attention_layernorm =
+      dense_loaders::LoadBf16Direct(get, base + "post_attention_layernorm.weight");
+  w.pre_feedforward_layernorm =
+      dense_loaders::LoadBf16Direct(get, base + "pre_feedforward_layernorm.weight");
+  w.post_feedforward_layernorm =
+      dense_loaders::LoadBf16Direct(get, base + "post_feedforward_layernorm.weight");
+
+  // Merged QKVParallelLinear, rows q|k|v (muse_glimmer.py:1126-1135).
+  w.attn.qkv_proj = dense_loaders::LoadMergedBf16RawNK(
+      get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+  w.attn.o_proj = dense_loaders::LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
+  // The attention OUTPUT GATE (:1145-1152). Its checkpoint name collides with the
+  // MLP gate by suffix, which is why NormalizeMuseGlimmerWeightName renames
+  // `.self_attn.gate_proj` FIRST; here the canonical name is unambiguous.
+  if (use_attn_output_gate)
+    w.attn.output_gate_proj =
+        dense_loaders::LoadMergedBf16RawNK(get, {sa + "output_gate_proj.weight"});
+
+  // MergedColumnParallelLinear gate|up (:1052-1058) — SwiGLU, not GeGLU.
+  w.mlp.gate_up_proj = dense_loaders::LoadMergedBf16RawNK(
+      get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
+  w.mlp.down_proj = dense_loaders::LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+  return w;
+}
+
+}  // namespace
+
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
   MuseGlimmerWeights w;
@@ -473,19 +521,43 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
   const std::vector<std::string> expected = EnumerateMuseGlimmerTensors(w.params);
   w.enumerated_tensors = static_cast<int64_t>(expected.size());
 
-  // W0 is a STRUCTURAL accounting pass: normalize every checkpoint name through
-  // the same mapper the forward will use, and report how much of the enumerated
-  // structure is actually present. No tensor is materialized — that is W1.
-  std::unordered_set<std::string> present;
+  // STRUCTURAL accounting (W0): normalize every checkpoint name through the same
+  // mapper the forward uses, and report how much of the enumerated structure is
+  // present. The same index is what the W1 materialization reads through, so the
+  // accounting and the load can never disagree about a name.
+  std::unordered_map<std::string, TensorSite> where;
   for (const SafetensorsFile& shard : shards) {
     for (const std::string& raw_name : shard.Names()) {
       std::string canonical;
       if (!NormalizeMuseGlimmerWeightName(raw_name, &canonical)) continue;
-      present.insert(canonical);
+      where.emplace(canonical, TensorSite{&shard, raw_name});
     }
   }
   for (const std::string& name : expected)
-    if (present.count(name) != 0) ++w.accounted_tensors;
+    if (where.count(name) != 0) ++w.accounted_tensors;
+
+  // W1: materialize the TEXT tower. The perception encoder's tensors are accounted
+  // above but NOT materialized — that is W3, and a Muse Glimmer forward is text-only
+  // until it lands.
+  const TensorResolver get = [&where](const std::string& name) -> const StTensor& {
+    auto it = where.find(name);
+    VT_CHECK(it != where.end(), "muse_glimmer: tensor not found: " + name);
+    return it->second.shard->Get(it->second.raw_name);
+  };
+
+  const MuseGlimmerTextParams& t = w.params.text;
+  w.embed_tokens = dense_loaders::LoadBf16Direct(get, "model.embed_tokens.weight");
+  w.final_norm = dense_loaders::LoadBf16Direct(get, "model.norm.weight");
+  // UNTIED lm_head (:1480). Muse Glimmer is NOT a Gemma here: `tie_word_embeddings`
+  // is false in the released config, and only an explicitly tied checkpoint (which
+  // ships no `lm_head.weight`) falls back to the embedding table.
+  if (!t.tie_word_embeddings)
+    w.lm_head = dense_loaders::LoadBf16Transposed(get, "lm_head.weight");
+
+  w.layers.reserve(static_cast<size_t>(t.num_hidden_layers));
+  for (int64_t l = 0; l < t.num_hidden_layers; ++l)
+    w.layers.push_back(LoadLayer(get, l, t.use_attn_output_gate));
+  w.text_loaded = true;
   return w;
 }
 

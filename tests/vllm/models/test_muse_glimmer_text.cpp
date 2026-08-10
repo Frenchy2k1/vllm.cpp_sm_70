@@ -1,0 +1,957 @@
+// Muse Glimmer TEXT TOWER (W1) correctness gate. CPU-only, checkpoint-free.
+//
+// WHAT THIS ESTABLISHES. The whole text forward is checked against an INDEPENDENT
+// fp32 reference transcribed directly from vllm#51655 head `075d645af`
+// (`vllm/model_executor/models/muse_glimmer.py`, MuseGlimmerAttention.forward
+// :1177-1215, MuseGlimmerDecoderLayer.forward :1249-1277, MuseGlimmerModel
+// :1279-1345, compute_logits :1615-1621). The reference is written from the python,
+// not from our C++, so it is a second opinion and not a restatement — and every
+// mechanism additionally gets a PROPERTY test that a plausible-but-wrong port
+// breaks:
+//
+//   * embed_norm is a WEIGHTLESS RMSNorm (:1286), so the forward is INVARIANT to a
+//     power-of-two rescale of the whole embedding table — which Gemma's
+//     sqrt(hidden) multiplier in the same slot is not.
+//   * QK-norm (:1189-1196) makes the forward INVARIANT to a power-of-two rescale of
+//     the q and k projections; without it every attention score would scale.
+//   * the query pre-scale (:1192) is a CONFIG CONSTANT applied after QK-norm, so it
+//     changes the output while the projection rescale above does not.
+//   * iRoPE (:1114-1116, :1167-1168): an all-NoPE model is INVARIANT to a shift of
+//     `positions` and to the sliding window; an all-RoPE model is sensitive to both.
+//     RoPE and the window travel together.
+//   * split eps (:1236-1247): `post_norm_eps` alone changes the output, which it
+//     cannot do if the post-norms wrongly read `rms_norm_eps`.
+//   * the FINAL norm (:1296) has NO `+1` offset, unlike all four sandwich norms:
+//     a zeroed final-norm weight must zero the logits.
+//   * `output_multiplier` is applied BEFORE the soft-cap (:1618-1621).
+//
+// WHAT THIS DOES NOT ESTABLISH. Nothing about tokens from the real 30B checkpoint,
+// and nothing at all about speed. Muse Glimmer is BEYOND the parity pin
+// `555967922` — the pinned oracle cannot load `muse_glimmer`, so there is neither a
+// golden nor a throughput denominator (specs/muse-glimmer.md §0). Token-exact e2e
+// vs the HF reference is W2; the perception encoder is W3.
+#include "vllm/model_executor/models/muse_glimmer.h"
+
+#include <doctest/doctest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/transformers_utils/hf_config.h"
+#include "vt/backend.h"
+#include "vt/dtype.h"
+#include "vt/ops.h"
+
+using vllm::HfConfig;
+using vllm::MuseGlimmerLayerWeights;
+using vllm::MuseGlimmerModel;
+using vllm::MuseGlimmerParams;
+using vllm::MuseGlimmerWeights;
+using vllm::OwnedTensor;
+using vllm::PagedKvCache;
+using vllm::v1::CommonAttentionMetadata;
+using vt::DType;
+
+namespace {
+
+vt::Queue Qcpu() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
+
+// ─────────────────────────── tiny synthetic model ───────────────────────────
+// Real geometry scaled to the smallest shape that still exercises every branch:
+// GQA (2 query heads / 1 KV head), head_dim 4 (so RoPE has 2 rotary pairs), two
+// layers with ONE RoPE layer and ONE NoPE layer, a sliding window shorter than the
+// sequence (so the window actually masks), an untied lm_head, a non-unit
+// output_multiplier and a soft-cap.
+struct TinySpec {
+  int64_t vocab = 11, hidden = 8, inter = 6, layers = 2;
+  int64_t heads = 2, kv_heads = 1, head_dim = 4;
+  double rms_eps = 1e-2;   // deliberately FAR from post_eps so the split is visible
+  double post_eps = 1e-6;
+  // Modular schema: `qk_scale_factor` is already folded, and upstream keeps it as-is
+  // when it is below sqrt(head_dim) (muse_glimmer.py:472-517). The released 30B ships
+  // 3.87 against sqrt(128)=11.31; at THIS geometry sqrt(head_dim)=2, so the tiny model
+  // uses a value below 2 to stay on the same branch. The magnitude disambiguation
+  // itself is gated at the real head_dim 128 in test_muse_glimmer_scaffold.
+  double qk_scale_factor = 1.75;
+  int64_t sliding = 2;
+  std::vector<int64_t> no_rope = {1, 0};  // 1 => RoPE + sliding, 0 => NoPE + full
+  double out_mult = 0.75;
+  double softcap = 20.0;
+  double rope_theta = 500000.0;
+};
+
+HfConfig MakeConfig(const TinySpec& s) {
+  nlohmann::json text{
+      {"model_type", "muse_glimmer_text"},
+      {"vocab_size", s.vocab},
+      {"hidden_size", s.hidden},
+      {"intermediate_size", s.inter},
+      {"num_hidden_layers", s.layers},
+      {"num_attention_heads", s.heads},
+      {"num_key_value_heads", s.kv_heads},
+      {"head_dim", s.head_dim},
+      {"max_position_embeddings", 131072},
+      {"sliding_window", s.sliding},
+      {"rms_norm_eps", s.rms_eps},
+      {"post_norm_eps", s.post_eps},
+      {"hidden_activation", "silu"},
+      {"qk_scale_factor", s.qk_scale_factor},
+      {"no_rope_layers", s.no_rope},
+      {"output_multiplier", s.out_mult},
+      {"final_logit_softcapping", s.softcap},
+      {"tie_word_embeddings", false},
+      {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", s.rope_theta}}},
+  };
+  HfConfig c;
+  c.architectures = {"MuseGlimmerForConditionalGeneration"};
+  c.hidden_size = s.hidden;
+  c.num_hidden_layers = s.layers;
+  c.vocab_size = s.vocab;
+  c.num_attention_heads = s.heads;
+  c.raw = nlohmann::json{{"model_type", "muse_glimmer"}, {"text_config", text}};
+  return c;
+}
+
+OwnedTensor MakeBf16(const std::vector<int64_t>& shape, bool nk, uint32_t seed,
+                     float scale = 0.08f) {
+  OwnedTensor o;
+  o.dtype = DType::kBF16;
+  o.nk = nk;
+  o.rank = static_cast<int>(shape.size());
+  int64_t numel = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[static_cast<size_t>(i)];
+    numel *= shape[static_cast<size_t>(i)];
+  }
+  o.bytes.resize(static_cast<size_t>(numel) * sizeof(uint16_t));
+  auto* p = reinterpret_cast<uint16_t*>(o.bytes.data());
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-scale, scale);
+  for (int64_t i = 0; i < numel; ++i) p[i] = vt::F32ToBF16(dist(rng));
+  return o;
+}
+
+// Read an owned bf16 tensor back as f32 — the reference reads the SAME bytes the
+// forward does, so any difference is arithmetic, never a different model.
+std::vector<float> Host(const OwnedTensor& t) {
+  const size_t n = t.bytes.size() / sizeof(uint16_t);
+  const auto* p = reinterpret_cast<const uint16_t*>(t.bytes.data());
+  std::vector<float> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = vt::BF16ToF32(p[i]);
+  return out;
+}
+
+MuseGlimmerWeights TinyWeights(const HfConfig& cfg) {
+  MuseGlimmerWeights w;
+  w.params = vllm::ParseMuseGlimmerParams(cfg);
+  const vllm::MuseGlimmerTextParams& t = w.params.text;
+  const int64_t H = t.hidden_size, I = t.intermediate_size, V = t.vocab_size;
+  const int64_t qdim = t.num_attention_heads * t.head_dim;
+  const int64_t kdim = t.num_key_value_heads * t.head_dim;
+
+  w.embed_tokens = MakeBf16({V, H}, /*nk=*/false, 1);
+  w.final_norm = MakeBf16({H}, false, 2, 0.3f);
+  w.lm_head = MakeBf16({H, V}, /*nk=*/false, 3);  // Matmul-B [in,out]; UNTIED
+  uint32_t seed = 100;
+  for (int64_t l = 0; l < t.num_hidden_layers; ++l) {
+    MuseGlimmerLayerWeights lw;
+    lw.input_layernorm = MakeBf16({H}, false, seed++, 0.3f);
+    lw.post_attention_layernorm = MakeBf16({H}, false, seed++, 0.3f);
+    lw.pre_feedforward_layernorm = MakeBf16({H}, false, seed++, 0.3f);
+    lw.post_feedforward_layernorm = MakeBf16({H}, false, seed++, 0.3f);
+    lw.attn.qkv_proj = MakeBf16({qdim + 2 * kdim, H}, /*nk=*/true, seed++);
+    lw.attn.o_proj = MakeBf16({H, qdim}, /*nk=*/true, seed++);
+    lw.attn.output_gate_proj = MakeBf16({qdim, H}, /*nk=*/true, seed++);
+    lw.mlp.gate_up_proj = MakeBf16({2 * I, H}, /*nk=*/true, seed++);
+    lw.mlp.down_proj = MakeBf16({H, I}, /*nk=*/true, seed++);
+    w.layers.push_back(std::move(lw));
+  }
+  w.text_loaded = true;
+  return w;
+}
+
+struct CachePool {
+  std::vector<std::vector<float>> buf;
+  std::vector<PagedKvCache> attn_kv;
+  CachePool(const MuseGlimmerParams& p, int64_t num_blocks, int64_t block_size) {
+    const int64_t Hkv = p.text.num_key_value_heads, Dh = p.text.head_dim;
+    for (int64_t l = 0; l < p.text.num_hidden_layers; ++l)
+      buf.emplace_back(static_cast<size_t>(num_blocks * 2 * block_size * Hkv * Dh), 0.0f);
+    for (auto& b : buf) {
+      PagedKvCache kv;
+      kv.data = b.data();
+      kv.dtype = DType::kF32;
+      kv.num_blocks = num_blocks;
+      kv.block_size = block_size;
+      kv.num_kv_heads = Hkv;
+      kv.head_size = Dh;
+      attn_kv.push_back(kv);
+    }
+  }
+};
+
+CommonAttentionMetadata PrefillMeta(int64_t T, int64_t block_size) {
+  CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(T);
+  m.query_start_loc = {0, static_cast<int32_t>(T)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(T)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(T);
+  m.max_seq_len = static_cast<int>(T);
+  m.block_table_num_cols = 1;
+  m.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t) m.slot_mapping.push_back(t % block_size);
+  m.causal = true;
+  return m;
+}
+
+const std::vector<int32_t>& Tokens() {
+  static const std::vector<int32_t> t = {3, 7, 1, 9, 4};
+  return t;
+}
+std::vector<int32_t> Positions(int32_t stride = 1) {
+  std::vector<int32_t> p(Tokens().size());
+  for (size_t i = 0; i < p.size(); ++i) p[i] = stride * static_cast<int32_t>(i);
+  return p;
+}
+
+std::vector<float> RunForward(const MuseGlimmerWeights& w,
+                              const std::vector<int32_t>& positions) {
+  const int64_t T = static_cast<int64_t>(Tokens().size());
+  CachePool pool(w.params, /*num_blocks=*/2, /*block_size=*/8);
+  const CommonAttentionMetadata am = PrefillMeta(T, 8);
+  vt::Queue q = Qcpu();
+  return MuseGlimmerModel::Forward(Tokens(), positions, am, pool.attn_kv, w, q);
+}
+
+// ───────────────────── the independent fp32 reference ─────────────────────
+// Transcribed from muse_glimmer.py @ 075d645af. Written from the PYTHON, so it is a
+// second implementation and not a restatement of the C++ under test.
+
+// MuseGlimmerRMSNorm (:520-552): fp32 `_norm`, weight applied as (w + offset).
+// `weight == nullptr` is the WEIGHTLESS form (with_scale=False) used by embed_norm
+// and qk_norm.
+void RefRmsNorm(std::vector<float>& row, const float* weight, float offset,
+                float eps) {
+  double sq = 0.0;
+  for (float v : row) sq += static_cast<double>(v) * v;
+  const double inv = 1.0 / std::sqrt(sq / static_cast<double>(row.size()) + eps);
+  for (size_t j = 0; j < row.size(); ++j) {
+    const double scaled = static_cast<double>(row[j]) * inv;
+    row[j] = static_cast<float>(weight == nullptr ? scaled
+                                                  : scaled * (weight[j] + offset));
+  }
+}
+
+// torch F.linear against a raw-NK [N,K] weight: out[n] = sum_k in[k]*W[n,k].
+std::vector<float> RefLinear(const std::vector<float>& in, const std::vector<float>& w,
+                             int64_t N, int64_t K) {
+  std::vector<float> out(static_cast<size_t>(N), 0.0f);
+  for (int64_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    for (int64_t k = 0; k < K; ++k)
+      acc += static_cast<double>(in[static_cast<size_t>(k)]) *
+             w[static_cast<size_t>(n * K + k)];
+    out[static_cast<size_t>(n)] = static_cast<float>(acc);
+  }
+  return out;
+}
+
+// NeoX RoPE over one head vector (get_rope(..., is_neox_style=True), :1163-1174).
+void RefRope(float* head, int64_t Dh, double base, int64_t pos) {
+  const int64_t half = Dh / 2;
+  for (int64_t i = 0; i < half; ++i) {
+    const double freq = std::pow(base, -2.0 * static_cast<double>(i) /
+                                            static_cast<double>(Dh));
+    const double angle = static_cast<double>(pos) * freq;
+    const float c = static_cast<float>(std::cos(angle));
+    const float s = static_cast<float>(std::sin(angle));
+    const float x = head[i], y = head[i + half];
+    head[i] = x * c - y * s;
+    head[i + half] = x * s + y * c;
+  }
+}
+
+std::vector<float> RefForward(const MuseGlimmerWeights& w,
+                              const std::vector<int32_t>& positions) {
+  const vllm::MuseGlimmerTextParams& t = w.params.text;
+  const int64_t T = static_cast<int64_t>(Tokens().size());
+  const int64_t H = t.hidden_size, I = t.intermediate_size, V = t.vocab_size;
+  const int64_t Hq = t.num_attention_heads, Hkv = t.num_key_value_heads;
+  const int64_t Dh = t.head_dim, qdim = Hq * Dh, kdim = Hkv * Dh;
+  const float rms_eps = t.rms_norm_eps, post_eps = t.post_norm_eps;
+  const float attn_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(Dh)));
+
+  const std::vector<float> embed = Host(w.embed_tokens);
+  // embed_input_ids (:1298-1299): embed_tokens then the WEIGHTLESS embed_norm.
+  std::vector<std::vector<float>> h(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) {
+    h[static_cast<size_t>(i)].assign(
+        embed.begin() + static_cast<int64_t>(Tokens()[static_cast<size_t>(i)]) * H,
+        embed.begin() + (static_cast<int64_t>(Tokens()[static_cast<size_t>(i)]) + 1) * H);
+    RefRmsNorm(h[static_cast<size_t>(i)], nullptr, 0.0f, rms_eps);
+  }
+
+  for (int64_t l = 0; l < t.num_hidden_layers; ++l) {
+    const MuseGlimmerLayerWeights& lw = w.layers[static_cast<size_t>(l)];
+    const std::vector<float> w_in = Host(lw.input_layernorm);
+    const std::vector<float> w_pa = Host(lw.post_attention_layernorm);
+    const std::vector<float> w_pf = Host(lw.pre_feedforward_layernorm);
+    const std::vector<float> w_pff = Host(lw.post_feedforward_layernorm);
+    const std::vector<float> w_qkv = Host(lw.attn.qkv_proj);
+    const std::vector<float> w_o = Host(lw.attn.o_proj);
+    const std::vector<float> w_g = Host(lw.attn.output_gate_proj);
+    const std::vector<float> w_gu = Host(lw.mlp.gate_up_proj);
+    const std::vector<float> w_dn = Host(lw.mlp.down_proj);
+    const bool use_rope = t.no_rope_layers[static_cast<size_t>(l)] == 1;
+
+    // residual = hidden_states; hidden_states = input_layernorm(hidden_states)
+    std::vector<std::vector<float>> res = h;
+    std::vector<std::vector<float>> x = h;
+    for (auto& row : x) RefRmsNorm(row, w_in.data(), 1.0f, rms_eps);
+
+    // qkv_proj, then WEIGHTLESS per-head QK-norm BEFORE RoPE, then the query
+    // pre-scale on q only (:1183-1196).
+    std::vector<std::vector<float>> q(static_cast<size_t>(T)), k(static_cast<size_t>(T)),
+        v(static_cast<size_t>(T));
+    for (int64_t i = 0; i < T; ++i) {
+      const std::vector<float> qkv =
+          RefLinear(x[static_cast<size_t>(i)], w_qkv, qdim + 2 * kdim, H);
+      q[static_cast<size_t>(i)].assign(qkv.begin(), qkv.begin() + qdim);
+      k[static_cast<size_t>(i)].assign(qkv.begin() + qdim, qkv.begin() + qdim + kdim);
+      v[static_cast<size_t>(i)].assign(qkv.begin() + qdim + kdim, qkv.end());
+      if (t.use_qk_norm) {
+        for (int64_t hh = 0; hh < Hq; ++hh) {
+          std::vector<float> head(q[static_cast<size_t>(i)].begin() + hh * Dh,
+                                  q[static_cast<size_t>(i)].begin() + (hh + 1) * Dh);
+          RefRmsNorm(head, nullptr, 0.0f, rms_eps);
+          for (int64_t e = 0; e < Dh; ++e)
+            q[static_cast<size_t>(i)][static_cast<size_t>(hh * Dh + e)] =
+                static_cast<float>(head[static_cast<size_t>(e)] * t.scale_query_by);
+        }
+        for (int64_t hh = 0; hh < Hkv; ++hh) {
+          std::vector<float> head(k[static_cast<size_t>(i)].begin() + hh * Dh,
+                                  k[static_cast<size_t>(i)].begin() + (hh + 1) * Dh);
+          RefRmsNorm(head, nullptr, 0.0f, rms_eps);
+          for (int64_t e = 0; e < Dh; ++e)
+            k[static_cast<size_t>(i)][static_cast<size_t>(hh * Dh + e)] =
+                head[static_cast<size_t>(e)];
+        }
+      }
+      if (use_rope) {
+        for (int64_t hh = 0; hh < Hq; ++hh)
+          RefRope(q[static_cast<size_t>(i)].data() + hh * Dh, Dh, t.rope_theta,
+                  positions[static_cast<size_t>(i)]);
+        for (int64_t hh = 0; hh < Hkv; ++hh)
+          RefRope(k[static_cast<size_t>(i)].data() + hh * Dh, Dh, t.rope_theta,
+                  positions[static_cast<size_t>(i)]);
+      }
+    }
+
+    // Causal GQA attention, softmax scale head_dim**-0.5, sliding window ONLY on
+    // RoPE layers (:1167-1168). Full prefill => key index == query position.
+    std::vector<std::vector<float>> attn(static_cast<size_t>(T),
+                                         std::vector<float>(static_cast<size_t>(qdim), 0.0f));
+    const int64_t group = Hq / Hkv;
+    for (int64_t i = 0; i < T; ++i) {
+      const int64_t jmin =
+          (use_rope && t.sliding_window > 0) ? std::max<int64_t>(0, i - (t.sliding_window - 1)) : 0;
+      for (int64_t hh = 0; hh < Hq; ++hh) {
+        const int64_t kvh = hh / group;
+        std::vector<double> score;
+        double mx = -1e30;
+        for (int64_t j = jmin; j <= i; ++j) {
+          double dot = 0.0;
+          for (int64_t e = 0; e < Dh; ++e)
+            dot += static_cast<double>(q[static_cast<size_t>(i)][static_cast<size_t>(hh * Dh + e)]) *
+                   k[static_cast<size_t>(j)][static_cast<size_t>(kvh * Dh + e)];
+          dot *= attn_scale;
+          score.push_back(dot);
+          mx = std::max(mx, dot);
+        }
+        double denom = 0.0;
+        for (double& sdot : score) {
+          sdot = std::exp(sdot - mx);
+          denom += sdot;
+        }
+        for (size_t si = 0; si < score.size(); ++si) {
+          const double p = score[si] / denom;
+          const int64_t j = jmin + static_cast<int64_t>(si);
+          for (int64_t e = 0; e < Dh; ++e)
+            attn[static_cast<size_t>(i)][static_cast<size_t>(hh * Dh + e)] +=
+                static_cast<float>(p * v[static_cast<size_t>(j)][static_cast<size_t>(kvh * Dh + e)]);
+        }
+      }
+    }
+
+    // Output gate (:1202-1206): sigmoid(output_gate_proj(x)) * attn, where x is the
+    // NORMED LAYER INPUT — then o_proj.
+    std::vector<std::vector<float>> h_attn(static_cast<size_t>(T));
+    for (int64_t i = 0; i < T; ++i) {
+      std::vector<float> gated = attn[static_cast<size_t>(i)];
+      if (t.use_attn_output_gate) {
+        const std::vector<float> g = RefLinear(x[static_cast<size_t>(i)], w_g, qdim, H);
+        for (int64_t e = 0; e < qdim; ++e)
+          gated[static_cast<size_t>(e)] = static_cast<float>(
+              gated[static_cast<size_t>(e)] /
+              (1.0 + std::exp(-static_cast<double>(g[static_cast<size_t>(e)]))));
+      }
+      h_attn[static_cast<size_t>(i)] = RefLinear(gated, w_o, H, qdim);
+      // post_attention_layernorm (post_norm_eps), then residual += .
+      RefRmsNorm(h_attn[static_cast<size_t>(i)], w_pa.data(), 1.0f, post_eps);
+      for (int64_t e = 0; e < H; ++e)
+        h_attn[static_cast<size_t>(i)][static_cast<size_t>(e)] +=
+            res[static_cast<size_t>(i)][static_cast<size_t>(e)];
+    }
+    h = h_attn;
+
+    // residual = hidden; pre_feedforward_layernorm -> SwiGLU MLP ->
+    // post_feedforward_layernorm -> residual += .
+    res = h;
+    for (int64_t i = 0; i < T; ++i) {
+      std::vector<float> x2 = h[static_cast<size_t>(i)];
+      RefRmsNorm(x2, w_pf.data(), 1.0f, rms_eps);
+      const std::vector<float> gu = RefLinear(x2, w_gu, 2 * I, H);
+      std::vector<float> act(static_cast<size_t>(I));
+      for (int64_t e = 0; e < I; ++e) {
+        const double g = gu[static_cast<size_t>(e)];
+        act[static_cast<size_t>(e)] =
+            static_cast<float>((g / (1.0 + std::exp(-g))) * gu[static_cast<size_t>(I + e)]);
+      }
+      std::vector<float> down = RefLinear(act, w_dn, H, I);
+      RefRmsNorm(down, w_pff.data(), 1.0f, post_eps);
+      for (int64_t e = 0; e < H; ++e)
+        down[static_cast<size_t>(e)] += res[static_cast<size_t>(i)][static_cast<size_t>(e)];
+      h[static_cast<size_t>(i)] = down;
+    }
+  }
+
+  // Final norm (:1296) — weight as `w`, NO +1 offset — then the UNTIED lm_head,
+  // the output multiplier and the tanh soft-cap (:1615-1621).
+  const std::vector<float> w_fn = Host(w.final_norm);
+  const std::vector<float> lm = Host(w.lm_head);  // [H, V]
+  std::vector<float> logits(static_cast<size_t>(T * V));
+  for (int64_t i = 0; i < T; ++i) {
+    std::vector<float> row = h[static_cast<size_t>(i)];
+    RefRmsNorm(row, w_fn.data(), 0.0f, rms_eps);
+    for (int64_t vi = 0; vi < V; ++vi) {
+      double acc = 0.0;
+      for (int64_t e = 0; e < H; ++e)
+        acc += static_cast<double>(row[static_cast<size_t>(e)]) *
+               lm[static_cast<size_t>(e * V + vi)];
+      acc *= t.output_multiplier;
+      if (t.final_logit_softcapping > 0.0)
+        acc = t.final_logit_softcapping * std::tanh(acc / t.final_logit_softcapping);
+      logits[static_cast<size_t>(i * V + vi)] = static_cast<float>(acc);
+    }
+  }
+  return logits;
+}
+
+double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
+  REQUIRE(a.size() == b.size());
+  double m = 0.0;
+  for (size_t i = 0; i < a.size(); ++i)
+    m = std::max(m, std::abs(static_cast<double>(a[i]) - b[i]));
+  return m;
+}
+
+bool Differs(const std::vector<float>& a, const std::vector<float>& b) {
+  return a.size() != b.size() ||
+         std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0;
+}
+
+// Multiply a whole owned bf16 tensor by an exact power of two — bf16 stores the
+// mantissa unchanged, so this is an EXACT rescale and any output difference is a
+// real sensitivity, never rounding.
+void ScaleRowsPow2(OwnedTensor* t, int64_t first_row, int64_t rows, int64_t cols,
+                   float factor) {
+  auto* p = reinterpret_cast<uint16_t*>(t->bytes.data());
+  for (int64_t r = first_row; r < first_row + rows; ++r)
+    for (int64_t c = 0; c < cols; ++c) {
+      const size_t idx = static_cast<size_t>(r * cols + c);
+      p[idx] = vt::F32ToBF16(vt::BF16ToF32(p[idx]) * factor);
+    }
+}
+
+void ZeroTensor(OwnedTensor* t) {
+  auto* p = reinterpret_cast<uint16_t*>(t->bytes.data());
+  const size_t n = t->bytes.size() / sizeof(uint16_t);
+  for (size_t i = 0; i < n; ++i) p[i] = vt::F32ToBF16(0.0f);
+}
+
+}  // namespace
+
+TEST_CASE("muse_glimmer text: forward runs, finite, deterministic") {
+  const HfConfig cfg = MakeConfig(TinySpec{});
+  const MuseGlimmerWeights w = TinyWeights(cfg);
+  const std::vector<float> a = RunForward(w, Positions());
+  REQUIRE(a.size() == static_cast<size_t>(Tokens().size()) *
+                          static_cast<size_t>(w.params.text.vocab_size));
+  for (float x : a) REQUIRE(std::isfinite(x));
+  CHECK_FALSE(Differs(a, RunForward(w, Positions())));
+}
+
+TEST_CASE("muse_glimmer text: refuses a params-only (unloaded) weight set BY NAME") {
+  const HfConfig cfg = MakeConfig(TinySpec{});
+  MuseGlimmerWeights w = TinyWeights(cfg);
+  w.text_loaded = false;  // the W0 structural-accounting form
+  CHECK_THROWS(RunForward(w, Positions()));
+}
+
+// THE GATE: the whole text forward vs the independent fp32 reference. Our path is
+// bf16 per op (vLLM's own stores) against an f64-accumulating f32 reference, so the
+// band is a bf16-DEPTH envelope, not an equality — but it is far tighter than any
+// of the mechanism mutations below, each of which moves the output by O(1).
+TEST_CASE("muse_glimmer text: matches the fp32 reference transcribed from upstream") {
+  const HfConfig cfg = MakeConfig(TinySpec{});
+  const MuseGlimmerWeights w = TinyWeights(cfg);
+  const std::vector<float> got = RunForward(w, Positions());
+  const std::vector<float> want = RefForward(w, Positions());
+  double scale = 0.0;
+  for (float x : want) scale = std::max(scale, std::abs(static_cast<double>(x)));
+  const double diff = MaxAbsDiff(got, want);
+  MESSAGE("muse_glimmer text vs fp32 reference: max|diff|=" << diff
+          << " over logits of max|.|=" << scale);
+  CHECK(diff <= 5e-4);
+
+  // Same model with a BITING soft-cap, so the reference also pins the ORDER of the
+  // output multiplier and the cap (:1618-1621). At the default cap of 20 the tanh is
+  // linear over these logits and the order is unobservable; at 1e-3 it is not.
+  TinySpec biting;
+  biting.softcap = 1e-3;
+  const MuseGlimmerWeights wb = TinyWeights(MakeConfig(biting));
+  const double bdiff = MaxAbsDiff(RunForward(wb, Positions()), RefForward(wb, Positions()));
+  MESSAGE("muse_glimmer text vs fp32 reference (biting soft-cap): max|diff|=" << bdiff);
+  CHECK(bdiff <= 1e-5);
+}
+
+TEST_CASE("muse_glimmer text: embed_norm is WEIGHTLESS RMSNorm, not a sqrt(H) scale") {
+  // RMSNorm is scale-invariant, so rescaling the WHOLE embedding table by an exact
+  // power of two must leave the logits bit-identical. Gemma's sqrt(hidden)
+  // multiplier in the same slot would carry the factor straight through.
+  TinySpec s;
+  s.rms_eps = 0.0;  // eps would break exact scale invariance
+  s.post_eps = 0.0;
+  const HfConfig cfg = MakeConfig(s);
+  const MuseGlimmerWeights base = TinyWeights(cfg);
+  MuseGlimmerWeights scaled = base;
+  ScaleRowsPow2(&scaled.embed_tokens, 0, s.vocab, s.hidden, 4.0f);
+  CHECK_FALSE(Differs(RunForward(base, Positions()), RunForward(scaled, Positions())));
+}
+
+TEST_CASE("muse_glimmer text: QK-norm is applied (q/k projection rescale is inert)") {
+  // The weightless per-head QK-norm removes the magnitude of q and k, so scaling
+  // BOTH projections by an exact power of two cannot move a single logit. Drop the
+  // QK-norm and every attention score scales by 16.
+  TinySpec s;
+  s.rms_eps = 0.0;
+  s.post_eps = 0.0;
+  const HfConfig cfg = MakeConfig(s);
+  const MuseGlimmerWeights base = TinyWeights(cfg);
+  const int64_t qdim = s.heads * s.head_dim, kdim = s.kv_heads * s.head_dim;
+  MuseGlimmerWeights scaled = base;
+  for (auto& lw : scaled.layers)
+    ScaleRowsPow2(&lw.attn.qkv_proj, 0, qdim + kdim, s.hidden, 4.0f);  // q and k only
+  CHECK_FALSE(Differs(RunForward(base, Positions()), RunForward(scaled, Positions())));
+
+  // THE CONTROL, so the invariance above is not vacuous. Rescaling ONE q output row
+  // changes the DIRECTION of a query head vector, which the per-head RMSNorm cannot
+  // undo, so it MUST move the logits — proving this harness really does mutate the
+  // weights the forward reads.
+  //
+  // (Note what does NOT work as a control: a uniform rescale of the V rows scales the
+  // whole attention branch, and the sandwich post_attention_layernorm — being an
+  // RMSNorm — erases exactly that. Measured inert, which is correct behaviour of the
+  // sandwich, not an inert harness.)
+  MuseGlimmerWeights qrow = base;
+  for (auto& lw : qrow.layers) ScaleRowsPow2(&lw.attn.qkv_proj, 0, 1, s.hidden, 4.0f);
+  CHECK(Differs(RunForward(base, Positions()), RunForward(qrow, Positions())));
+}
+
+TEST_CASE("muse_glimmer text: the query pre-scale is applied and is a config constant") {
+  TinySpec a;
+  TinySpec b = a;
+  b.qk_scale_factor = 0.5;  // also below sqrt(head_dim) => used as-is
+  const MuseGlimmerWeights wa = TinyWeights(MakeConfig(a));
+  const MuseGlimmerWeights wb = TinyWeights(MakeConfig(b));
+  REQUIRE(wa.params.text.scale_query_by == doctest::Approx(1.75));
+  REQUIRE(wb.params.text.scale_query_by == doctest::Approx(0.5));
+  CHECK(Differs(RunForward(wa, Positions()), RunForward(wb, Positions())));
+}
+
+TEST_CASE("muse_glimmer text: iRoPE — NoPE layers are position-invariant") {
+  // An ALL-NoPE model has nothing position-dependent left, so REMAPPING `positions`
+  // must be bit-inert. An ALL-RoPE model must be sensitive to the same remap.
+  //
+  // The remap SPREADS the positions (stride 2) rather than shifting them: RoPE's
+  // q·k depends only on the position DIFFERENCE, so a uniform shift is inert for a
+  // RoPE model too (measured — that is RoPE's defining property, not a bug), and
+  // only a change in the relative spacing separates the two layer classes. Masking
+  // is unaffected either way: paged attention bottom-right-aligns by token index,
+  // not by this vector.
+  TinySpec nope;
+  nope.no_rope = {0, 0};
+  const MuseGlimmerWeights wn = TinyWeights(MakeConfig(nope));
+  CHECK_FALSE(Differs(RunForward(wn, Positions(1)), RunForward(wn, Positions(2))));
+
+  TinySpec rope;
+  rope.no_rope = {1, 1};
+  const MuseGlimmerWeights wr = TinyWeights(MakeConfig(rope));
+  CHECK(Differs(RunForward(wr, Positions(1)), RunForward(wr, Positions(2))));
+
+  // And the MIXED default (layer 0 RoPE, layer 1 NoPE) is sensitive too — the NoPE
+  // layer does not neutralise the RoPE one.
+  const MuseGlimmerWeights wm = TinyWeights(MakeConfig(TinySpec{}));
+  CHECK(Differs(RunForward(wm, Positions(1)), RunForward(wm, Positions(2))));
+}
+
+TEST_CASE("muse_glimmer text: the sliding window travels WITH RoPE") {
+  // muse_glimmer.py:1167 — `sliding_window = None if not self.use_rope`. So the
+  // window must bite on an all-RoPE model and be inert on an all-NoPE one.
+  TinySpec rope_narrow;
+  rope_narrow.no_rope = {1, 1};
+  rope_narrow.sliding = 2;
+  TinySpec rope_wide = rope_narrow;
+  rope_wide.sliding = 4096;  // longer than the sequence => full attention
+  CHECK(Differs(RunForward(TinyWeights(MakeConfig(rope_narrow)), Positions()),
+                RunForward(TinyWeights(MakeConfig(rope_wide)), Positions())));
+
+  TinySpec nope_narrow;
+  nope_narrow.no_rope = {0, 0};
+  nope_narrow.sliding = 2;
+  TinySpec nope_wide = nope_narrow;
+  nope_wide.sliding = 4096;
+  CHECK_FALSE(Differs(RunForward(TinyWeights(MakeConfig(nope_narrow)), Positions()),
+                      RunForward(TinyWeights(MakeConfig(nope_wide)), Positions())));
+}
+
+TEST_CASE("muse_glimmer text: the post-norms read post_norm_eps, not rms_norm_eps") {
+  // Changing ONLY post_norm_eps must change the output. If the post-norms wrongly
+  // took rms_norm_eps, post_norm_eps would be dead config and this would be inert.
+  TinySpec a;
+  TinySpec b = a;
+  b.post_eps = 0.5;
+  CHECK(Differs(RunForward(TinyWeights(MakeConfig(a)), Positions()),
+                RunForward(TinyWeights(MakeConfig(b)), Positions())));
+
+  // The mirror: changing ONLY rms_norm_eps must also change the output, so neither
+  // eps is the one that silently drives both.
+  TinySpec c = a;
+  c.rms_eps = 0.5;
+  CHECK(Differs(RunForward(TinyWeights(MakeConfig(a)), Positions()),
+                RunForward(TinyWeights(MakeConfig(c)), Positions())));
+}
+
+TEST_CASE("muse_glimmer text: the FINAL norm has NO +1 weight offset") {
+  // model.norm is MuseGlimmerRMSNorm(hidden, eps) — weight_offset 0 (:1296), unlike
+  // the four sandwich norms. Zeroing its weight must therefore zero the logits; a
+  // (1+w) final norm would leave the model fully alive.
+  TinySpec s;
+  s.softcap = 0.0;
+  const HfConfig cfg = MakeConfig(s);
+  MuseGlimmerWeights w = TinyWeights(cfg);
+  ZeroTensor(&w.final_norm);
+  for (float x : RunForward(w, Positions())) CHECK(x == 0.0f);
+}
+
+TEST_CASE("muse_glimmer text: the attention OUTPUT GATE is applied") {
+  // Zeroing output_gate_proj makes every gate sigmoid(0) = 0.5 exactly; a forward
+  // that ignored the gate would be unchanged by that.
+  const HfConfig cfg = MakeConfig(TinySpec{});
+  const MuseGlimmerWeights base = TinyWeights(cfg);
+  MuseGlimmerWeights zeroed = base;
+  for (auto& lw : zeroed.layers) ZeroTensor(&lw.attn.output_gate_proj);
+  CHECK(Differs(RunForward(base, Positions()), RunForward(zeroed, Positions())));
+}
+
+TEST_CASE("muse_glimmer text: output_multiplier scales the logits BEFORE the soft-cap") {
+  // With the cap off the multiplier is exactly linear, so doubling it doubles every
+  // logit. (With the cap on it would not — which is why the order matters.)
+  TinySpec a;
+  a.softcap = 0.0;
+  a.out_mult = 0.5;
+  TinySpec b = a;
+  b.out_mult = 1.0;
+  const std::vector<float> half = RunForward(TinyWeights(MakeConfig(a)), Positions());
+  const std::vector<float> full = RunForward(TinyWeights(MakeConfig(b)), Positions());
+  REQUIRE(half.size() == full.size());
+  for (size_t i = 0; i < half.size(); ++i) CHECK(full[i] == doctest::Approx(2.0f * half[i]));
+}
+
+TEST_CASE("muse_glimmer text: the final soft-cap bounds every logit") {
+  TinySpec s;
+  s.softcap = 1e-3;  // small enough that the tanh actually saturates
+  s.out_mult = 1.0;
+  TinySpec off = s;
+  off.softcap = 0.0;
+  const std::vector<float> capped = RunForward(TinyWeights(MakeConfig(s)), Positions());
+  const std::vector<float> raw = RunForward(TinyWeights(MakeConfig(off)), Positions());
+  // `cap*tanh(y/cap)` is strictly inside the cap in exact arithmetic but ROUNDS TO the
+  // cap in f32 once it saturates, so the bound is inclusive.
+  for (float x : capped) CHECK(std::abs(x) <= 1e-3f);
+  double raw_max = 0.0;
+  for (float x : raw) raw_max = std::max(raw_max, std::abs(static_cast<double>(x)));
+  CHECK(raw_max > 1e-3);  // the control: uncapped logits really do exceed the cap
+}
+
+
+// ─────────── synthetic checkpoint: the loader round-trip (W1 materialization) ───────────
+// Mirrors the builder in test_kimi_linear_scaffold.cpp. The point is to drive the REAL
+// loader — `LoadMuseGlimmerForConditionalGenerationWeights` — through
+// `NormalizeMuseGlimmerWeightName` end to end, in BOTH checkpoint conventions, and to
+// prove the two sandwich-norm rename hazards the header documents do not swap a tensor.
+namespace {
+
+struct Fx {
+  std::string name;
+  std::vector<int64_t> shape;
+  std::string bytes;
+};
+
+std::string U64Le(uint64_t v) {
+  std::string s(8, '\0');
+  for (int i = 0; i < 8; ++i) s[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+  return s;
+}
+
+// bf16 bytes from SMALL finite floats — a raw byte fill would manufacture NaNs and the
+// "loaded weights forward finite" check could not tell a load bug from a NaN input.
+std::string Bf16Fill(size_t numel, int seed) {
+  std::string s(numel * 2, '\0');
+  auto* p = reinterpret_cast<uint16_t*>(s.data());
+  std::mt19937 rng(static_cast<uint32_t>(seed));
+  std::uniform_real_distribution<float> dist(-0.08f, 0.08f);
+  for (size_t i = 0; i < numel; ++i) p[i] = vt::F32ToBF16(dist(rng));
+  return s;
+}
+
+Fx Bf16Fx(const std::string& n, const std::vector<int64_t>& shape, int seed) {
+  int64_t numel = 1;
+  for (int64_t d : shape) numel *= d;
+  return {n, shape, Bf16Fill(static_cast<size_t>(numel), seed)};
+}
+
+std::string BuildSt(const std::vector<Fx>& ts) {
+  nlohmann::json hdr = nlohmann::json::object();
+  std::string data;
+  for (const Fx& t : ts) {
+    const size_t start = data.size();
+    data += t.bytes;
+    hdr[t.name] = {{"dtype", "BF16"}, {"shape", t.shape}, {"data_offsets", {start, data.size()}}};
+  }
+  const std::string header = hdr.dump();
+  return U64Le(header.size()) + header + data;
+}
+
+class TempFile {
+ public:
+  explicit TempFile(const std::string& bytes) {
+    static int counter = 0;
+    path_ = (std::filesystem::temp_directory_path() /
+             ("muse_glimmer_text_" + std::to_string(counter++) + ".safetensors"))
+                .string();
+    std::ofstream out(path_, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  ~TempFile() { std::remove(path_.c_str()); }
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+// NOTE the configs below are TEXT-ONLY (MakeConfig emits no vision_config), so the
+// enumeration is exactly the text tower and `accounted == enumerated` is a meaningful
+// equality rather than a partial count.
+
+// The canonical `model.language_model.*` checkpoint. NOTE the attention gate ships as
+// `.self_attn.gate_proj` on disk — the name that collides with the MLP gate by suffix
+// and that the mapper must rename FIRST.
+std::vector<Fx> CanonicalShards(const TinySpec& s) {
+  const int64_t H = s.hidden, I = s.inter, V = s.vocab;
+  const int64_t qdim = s.heads * s.head_dim, kdim = s.kv_heads * s.head_dim;
+  const std::string L0 = "model.language_model.layers.0.";
+  return {
+      Bf16Fx("model.language_model.embed_tokens.weight", {V, H}, 1),
+      Bf16Fx("model.language_model.norm.weight", {H}, 2),
+      Bf16Fx("lm_head.weight", {V, H}, 3),
+      Bf16Fx(L0 + "input_layernorm.weight", {H}, 11),
+      Bf16Fx(L0 + "post_attention_layernorm.weight", {H}, 12),
+      Bf16Fx(L0 + "pre_feedforward_layernorm.weight", {H}, 13),
+      Bf16Fx(L0 + "post_feedforward_layernorm.weight", {H}, 14),
+      Bf16Fx(L0 + "self_attn.q_proj.weight", {qdim, H}, 21),
+      Bf16Fx(L0 + "self_attn.k_proj.weight", {kdim, H}, 22),
+      Bf16Fx(L0 + "self_attn.v_proj.weight", {kdim, H}, 23),
+      Bf16Fx(L0 + "self_attn.o_proj.weight", {H, qdim}, 24),
+      Bf16Fx(L0 + "self_attn.gate_proj.weight", {qdim, H}, 25),
+      Bf16Fx(L0 + "mlp.gate_proj.weight", {I, H}, 31),
+      Bf16Fx(L0 + "mlp.up_proj.weight", {I, H}, 32),
+      Bf16Fx(L0 + "mlp.down_proj.weight", {H, I}, 33),
+  };
+}
+
+// The legacy `guac` checkpoint carrying the SAME bytes under the SAME seeds, but with
+// the sandwich norms under their legacy names: legacy `post_attention_layernorm` is
+// really the PRE-feedforward norm, legacy `post_attn_norm` the true post-attention one.
+std::vector<Fx> LegacyShards(const TinySpec& s) {
+  std::vector<Fx> out = CanonicalShards(s);
+  for (Fx& f : out) {
+    const std::string from = "model.language_model.";
+    if (f.name.rfind(from, 0) == 0) f.name = "model." + f.name.substr(from.size());
+  }
+  for (Fx& f : out) {
+    if (f.name == "model.layers.0.post_attention_layernorm.weight")
+      f.name = "model.layers.0.post_attn_norm.weight";           // true post-attention
+    else if (f.name == "model.layers.0.pre_feedforward_layernorm.weight")
+      f.name = "model.layers.0.post_attention_layernorm.weight";  // legacy pre-FF name
+    else if (f.name == "model.layers.0.post_feedforward_layernorm.weight")
+      f.name = "model.layers.0.post_ffn_norm.weight";
+  }
+  return out;
+}
+
+const std::string& BytesOf(const std::vector<Fx>& fx, const std::string& name) {
+  for (const Fx& f : fx)
+    if (f.name == name) return f.bytes;
+  REQUIRE_MESSAGE(false, "fixture missing " << name);
+  return fx.front().bytes;
+}
+
+bool SameBytes(const OwnedTensor& t, const std::string& raw) {
+  return t.bytes.size() == raw.size() &&
+         std::memcmp(t.bytes.data(), raw.data(), raw.size()) == 0;
+}
+
+}  // namespace
+
+TEST_CASE("muse_glimmer text: the loader materializes the text tower (canonical names)") {
+  TinySpec s;
+  s.layers = 1;
+  s.no_rope = {1};
+  const HfConfig cfg = MakeConfig(s);
+  const std::vector<Fx> fx = CanonicalShards(s);
+  const TempFile file(BuildSt(fx));
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+
+  const MuseGlimmerWeights w =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, cfg);
+  REQUIRE(w.text_loaded);
+  // Every enumerated tensor is present, and the enumeration is the text tower alone.
+  CHECK(w.accounted_tensors == w.enumerated_tensors);
+  REQUIRE(w.layers.size() == 1u);
+
+  const int64_t H = s.hidden, I = s.inter, V = s.vocab;
+  const int64_t qdim = s.heads * s.head_dim, kdim = s.kv_heads * s.head_dim;
+  CHECK(w.embed_tokens.shape[0] == V);
+  CHECK(w.embed_tokens.shape[1] == H);
+  CHECK(w.final_norm.shape[0] == H);
+  CHECK(w.lm_head.shape[0] == H);  // TRANSPOSED to Matmul-B [in,out]
+  CHECK(w.lm_head.shape[1] == V);
+  CHECK(w.layers[0].attn.qkv_proj.shape[0] == qdim + 2 * kdim);
+  CHECK(w.layers[0].attn.o_proj.shape[0] == H);
+  CHECK(w.layers[0].attn.output_gate_proj.shape[0] == qdim);
+  CHECK(w.layers[0].mlp.gate_up_proj.shape[0] == 2 * I);
+  CHECK(w.layers[0].mlp.down_proj.shape[0] == H);
+
+  // The merged QKV owner carries the disk q|k|v shards IN THAT ROW ORDER. Without
+  // this, swapping two same-width shards (k and v are both kdim rows) is a silent,
+  // shape-valid defect: the model still runs and still produces fluent-looking text.
+  const std::string L0 = "model.language_model.layers.0.";
+  const std::string q_disk = BytesOf(fx, L0 + "self_attn.q_proj.weight");
+  const std::string k_disk = BytesOf(fx, L0 + "self_attn.k_proj.weight");
+  const std::string v_disk = BytesOf(fx, L0 + "self_attn.v_proj.weight");
+  const auto* qkv = reinterpret_cast<const char*>(w.layers[0].attn.qkv_proj.bytes.data());
+  CHECK(std::memcmp(qkv, q_disk.data(), q_disk.size()) == 0);
+  CHECK(std::memcmp(qkv + q_disk.size(), k_disk.data(), k_disk.size()) == 0);
+  CHECK(std::memcmp(qkv + q_disk.size() + k_disk.size(), v_disk.data(), v_disk.size()) == 0);
+
+  // Same for the merged gate|up MLP owner (gate FIRST — SiluAndMul reads the first
+  // half as the gate).
+  const std::string up_disk = BytesOf(fx, L0 + "mlp.up_proj.weight");
+  const std::string gate_disk = BytesOf(fx, L0 + "mlp.gate_proj.weight");
+  const auto* gu = reinterpret_cast<const char*>(w.layers[0].mlp.gate_up_proj.bytes.data());
+  CHECK(std::memcmp(gu, gate_disk.data(), gate_disk.size()) == 0);
+  CHECK(std::memcmp(gu + gate_disk.size(), up_disk.data(), up_disk.size()) == 0);
+
+  // The attention gate landed on output_gate_proj, NOT folded into the MLP gate_up:
+  // its bytes are the disk `.self_attn.gate_proj` tensor, and the MLP's first half is
+  // the disk `mlp.gate_proj` tensor.
+  CHECK(SameBytes(w.layers[0].attn.output_gate_proj,
+                  BytesOf(fx, "model.language_model.layers.0.self_attn.gate_proj.weight")));
+
+
+  // And the loaded tower actually forwards.
+  const std::vector<float> logits = RunForward(w, Positions());
+  REQUIRE(logits.size() == static_cast<size_t>(Tokens().size()) * static_cast<size_t>(V));
+  for (float x : logits) CHECK(std::isfinite(x));
+}
+
+TEST_CASE("muse_glimmer text: the legacy guac convention loads the SAME tower") {
+  // The two conventions carry byte-identical tensors under different norm names. If the
+  // legacy remap fired in the wrong order the post-attention and pre-feedforward norms
+  // would silently swap — plausible output, wrong model.
+  TinySpec s;
+  s.layers = 1;
+  s.no_rope = {1};
+  const HfConfig cfg = MakeConfig(s);
+  const std::vector<Fx> canon = CanonicalShards(s);
+  const std::vector<Fx> legacy = LegacyShards(s);
+  const TempFile cfile(BuildSt(canon));
+  const TempFile lfile(BuildSt(legacy));
+  std::vector<vllm::SafetensorsFile> cshards, lshards;
+  cshards.push_back(vllm::SafetensorsFile::Open(cfile.path()));
+  lshards.push_back(vllm::SafetensorsFile::Open(lfile.path()));
+
+  const MuseGlimmerWeights cw =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(cshards, cfg);
+  const MuseGlimmerWeights lw =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(lshards, cfg);
+  CHECK(lw.accounted_tensors == lw.enumerated_tensors);
+
+  // The legacy `post_attn_norm` (seed 12) must land on post_attention_layernorm, and the
+  // legacy `post_attention_layernorm` (seed 13) on pre_feedforward_layernorm.
+  CHECK(SameBytes(lw.layers[0].post_attention_layernorm,
+                  BytesOf(legacy, "model.layers.0.post_attn_norm.weight")));
+  CHECK(SameBytes(lw.layers[0].pre_feedforward_layernorm,
+                  BytesOf(legacy, "model.layers.0.post_attention_layernorm.weight")));
+  CHECK(SameBytes(lw.layers[0].post_attention_layernorm,
+                  BytesOf(canon,
+                          "model.language_model.layers.0.post_attention_layernorm.weight")));
+
+  // End to end: the two conventions produce the same logits.
+  CHECK_FALSE(Differs(RunForward(cw, Positions()), RunForward(lw, Positions())));
+}
+
+TEST_CASE("muse_glimmer text: the loader throws BY NAME on a missing tensor") {
+  TinySpec s;
+  s.layers = 1;
+  s.no_rope = {1};
+  const HfConfig cfg = MakeConfig(s);
+  std::vector<Fx> fx = CanonicalShards(s);
+  fx.erase(std::remove_if(fx.begin(), fx.end(),
+                          [](const Fx& f) {
+                            return f.name ==
+                                   "model.language_model.layers.0.self_attn.k_proj.weight";
+                          }),
+           fx.end());
+  const TempFile file(BuildSt(fx));
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+  CHECK_THROWS(vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, cfg));
+}

@@ -240,7 +240,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `MuseGlimmerForCausalLM`, `MuseGlimmerForConditionalGeneration` | Scaffold only. The text tower and perception encoder are not implemented, and the pinned vLLM cannot load `muse_glimmer` at all, so there is nothing to gate against yet |
+| `MuseGlimmerForCausalLM`, `MuseGlimmerForConditionalGeneration` | Text-only. The text tower forwards (W1), but the perception encoder is not implemented, so an image or video prompt still refuses by name; a forward on a params-only weight set also refuses. The pinned vLLM cannot load `muse_glimmer` at all, so no e2e token gate and no speed number exist for this model yet |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
