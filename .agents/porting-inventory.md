@@ -1035,9 +1035,10 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (a descendant of the pin). Every `file:line` this row cites therefore points
     at a **branch head, not the pin** — a deliberate exception to "port from the
     pinned oracle", taken on explicit developer direction (2026-08-10). It is
-    recorded here rather than in `.agents/waivers.csv` because no checker
-    enforces the anchor rule, and a waiver naming a checker that does not exist
-    would be a false record. Consequences, all binding while this stands:
+    recorded here, and argued for in the commit that introduced it, because no
+    checker enforces the anchor rule and the waiver registry has since been
+    retired (`a4f72f86`): an exception now lives in the commit message that
+    needs it, attached to the diff it excuses. Consequences, all binding while this stands:
     (a) the anchor is mutable — a force-push or review round on #51655 rewrites
     what we cite, so the fetched ref is kept and re-diffed before every
     re-anchor; (b) upstream's own gates have NOT fully passed, so where our
