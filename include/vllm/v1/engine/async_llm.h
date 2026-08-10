@@ -13,7 +13,14 @@
 // variables replace asyncio tasks/queues and ZMQ. Queue ordering, per-request
 // single-slot coalescing, abort-final-output behavior, and output-handler order
 // remain the pinned upstream semantics. Parallel sampling, streaming input,
-// pooling, DP, stats/tracing and W3 async scheduling are deferred.
+// pooling and DP are deferred.
+//
+// STATS (SERVE-METRICS, #277, specs/async-metrics.md): the output handler folds
+// each step's SchedulerStats + IterationStats into an ATTACHED
+// PrometheusStatLogger, mirroring async_llm.py:662-702. Opt-in: with no logger
+// attached (the default) the handler takes the same no-stats path it always
+// took. The config-gated metric families (spec-decode / kv-connector / mm /
+// LoRA) remain deferred, as does update_scheduler_stats (LoRA-only upstream).
 #ifndef VLLM_V1_ENGINE_ASYNC_LLM_H_
 #define VLLM_V1_ENGINE_ASYNC_LLM_H_
 
@@ -35,6 +42,10 @@
 #include "vllm/v1/engine/output_processor.h"
 
 namespace vllm::v1 {
+
+namespace metrics {
+class PrometheusStatLogger;
+}  // namespace metrics
 
 // The value returned by add_request/generate-start. The collector is shared
 // with OutputProcessor's RequestState until that request finishes or aborts.
@@ -146,6 +157,19 @@ class AsyncLLM {
     return get_num_unfinished_requests() != 0;
   }
 
+  // The stat-logger attach point (async_llm.py:648-652 `logger_ref`, the
+  // mutable one-element list holding self.logger_manager). Mirrors
+  // LLMEngine::set_stat_logger: NON-OWNING, must outlive the engine, and null
+  // (the default) keeps RunOutputHandler on its byte-identical no-stats path.
+  //
+  // DEVIATION: upstream's one-element list exists to avoid a circular ref from
+  // the handler coroutine back to the AsyncLLM; ours is an atomic pointer,
+  // which additionally makes an attach that happens after construction visible
+  // to the already-running output-handler thread without a lock.
+  void set_stat_logger(metrics::PrometheusStatLogger* logger) {
+    stat_logger_.store(logger, std::memory_order_release);
+  }
+
   // Idempotent teardown. Active requests receive abort-final outputs before
   // the output handler is woken with the engine-dead sentinel and joined.
   void shutdown();
@@ -159,6 +183,8 @@ class AsyncLLM {
   InprocClient engine_core_;
 
   mutable std::mutex output_processor_mutex_;
+  // async_llm.py:650-652 logger_ref. Non-owning; null == log_stats off.
+  std::atomic<metrics::PrometheusStatLogger*> stat_logger_{nullptr};
   std::thread output_handler_;
   std::atomic<bool> stopping_{false};
   std::atomic<bool> shutdown_started_{false};

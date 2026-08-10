@@ -10,7 +10,8 @@
 #include <stdexcept>
 #include <utility>
 
-#include "vllm/v1/metrics/stats.h"  // IterationStats (VT_TTFT_DUMP diagnostic)
+#include "vllm/v1/metrics/loggers.h"  // PrometheusStatLogger::Record
+#include "vllm/v1/metrics/stats.h"    // IterationStats
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
@@ -264,26 +265,39 @@ void AsyncLLM::RunOutputHandler() {
     for (;;) {
       // async_llm.py:651: one blocking EngineCoreOutputs pull.
       EngineCoreOutputs outputs = engine_core_.get_output();
+
+      // async_llm.py:648-652 logger_ref[0] — read ONCE per iteration so the
+      // build decision and the fold below cannot disagree if the logger is
+      // detached mid-step.
+      metrics::PrometheusStatLogger* logger =
+          stat_logger_.load(std::memory_order_acquire);
+
+      // async_llm.py:664-665
+      //   iteration_stats = IterationStats() if (log_stats and num_outputs)
+      // — `log_stats` is "a logger is attached" here, exactly as the sync site
+      // reads it (llm_engine.cpp:190-193).
+      //
+      // DIAGNOSTIC (VT_TTFT_DUMP): keeps its own independent trigger, so a
+      // no-logger run with the env unset is instruction-identical to before
+      // this row (process_outputs takes its byte-identical no-stats path).
+      static const bool kTrackAsyncStats =
+          std::getenv("VT_TTFT_DUMP") != nullptr;
+      const bool track_stats =
+          (logger != nullptr && !outputs.outputs.empty()) || kTrackAsyncStats;
+
+      IterationStats iteration_stats;
       OutputProcessorOutput processed;
       {
         std::lock_guard<std::mutex> lock(output_processor_mutex_);
         // RequestOutputs are pushed to their collectors by OutputProcessor;
         // the synchronous return list must therefore stay empty.
         //
-        // DIAGNOSTIC (VT_TTFT_DUMP): the production async frontend passes
-        // nullptr, so process_outputs skips the per-request timing block
-        // (queued/prefill/decode intervals + engine-core events) entirely — the
-        // SERVE-RESPONSE-METRICS residual. Under the diagnostic, pass a throwaway
-        // IterationStats so req_state timing is populated for the TTFT-split dump
-        // (paired with the async timestamp stamp in EngineCore::step_with_batch_
-        // queue). Observational only; generation is byte-identical, and the
-        // default (unset) path is instruction-identical to production.
-        static const bool kTrackAsyncStats =
-            std::getenv("VT_TTFT_DUMP") != nullptr;
-        if (kTrackAsyncStats) {
-          IterationStats async_iteration_stats;
-          processed =
-              output_processor_.process_outputs(outputs, &async_iteration_stats);
+        // async_llm.py:676-678 process_outputs(outputs_slice, outputs.timestamp,
+        // iteration_stats). Our process_outputs reads the engine-core timestamp
+        // off the EngineCoreOutputs itself (output_processor.cpp:367).
+        if (track_stats) {
+          processed = output_processor_.process_outputs(outputs,
+                                                        &iteration_stats);
         } else {
           processed = output_processor_.process_outputs(outputs);
         }
@@ -291,6 +305,19 @@ void AsyncLLM::RunOutputHandler() {
       // Stop-string finishes detected by the detokenizer must be reflected in
       // EngineCore after leaving the OutputProcessor critical section.
       engine_core_.abort_requests_async(processed.reqs_to_abort);
+
+      // async_llm.py:697-702 — fold this step's SchedulerStats + IterationStats
+      // into the registry. Upstream records whenever a logger exists; every
+      // EngineCoreOutputs our proc queues came from a map entry that exists
+      // only when `outputs` is non-empty (core.cpp:91-94), so this is also the
+      // sync site's `len(outputs.outputs) > 0` guard (llm_engine.py:321-323).
+      //
+      // Deliberately OUTSIDE output_processor_mutex_: the logger's own mutex is
+      // then a leaf lock that can never take part in a cycle with the
+      // output-processor lock or a collector's condition variable.
+      if (logger != nullptr && !outputs.outputs.empty()) {
+        logger->Record(outputs.scheduler_stats, iteration_stats);
+      }
     }
   } catch (...) {
     if (!stopping_.load()) {

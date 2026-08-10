@@ -104,9 +104,13 @@ def mode_from_marker(marker: dict) -> str:
 # A record older than this with no heartbeat is stale: it describes a session
 # that stopped coordinating, and showing it would make the record lie. The value
 # is unchanged from when this was a lock; only the consequence changed. A stale
-# record is filtered out of every display and unlinked by the next `claim`, and
-# it can no longer refuse anybody, so breaking one is not an event worth
-# announcing any more.
+# record is filtered out of every display, and ANOTHER worktree's is unlinked by
+# the next `claim`; OURS is replaced by it and never unlinked -- see
+# `prune_stale_records`' `keep_canonical`, which exists because our own record is
+# stale on any ordinary re-claim and unlinking it before republishing it is the
+# one window that leaves this worktree an operator marker with no record. A stale
+# record can no longer refuse anybody either, so breaking one is not an event
+# worth announcing any more.
 RECORD_TTL_SECONDS = 2 * 60 * 60
 
 # One directory of per-worktree records. See the module docstring for why this

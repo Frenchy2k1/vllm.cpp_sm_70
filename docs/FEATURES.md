@@ -66,7 +66,8 @@ are our reading of their documented behavior, not measurements.
 |---|---|---|---|---|
 | NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ☐ |
 | NVFP4 dense sinks take vLLM's dense Marlin, not the single-expert MoE route | ✅ `VT_MARLIN_DENSE` (single projection, `efa6e40d`) + `VT_MARLIN_DENSE_PAIR` (fused shared-expert gate_up), both default-ON; the pair sink measured +1.31% at c8 / +1.38% at c4 on 35B-A3B, SACRED 315/315 + 235/235 | ☐ | ☐ | ☐ |
-| NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA-gated on `nvidia/Qwen3.6-27B-NVFP4`@`0893e160` (continuations byte-identical packed vs dequant, `test_qwen27_paged_engine` 235/235; RSS -1.70 GiB owed a re-measure) | ✅ | ☐ | ☐ |
+| NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |
+| NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA-gated on `nvidia`@`0893e160` (continuations byte-identical packed vs dequant, 235/235; RSS -1.70 GiB on CUDA, owed a re-measure; a no-fp4-GEMM backend keeps one bf16 operand too) | ✅ | ☐ | ☐ |
 | GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE took a bf16-activation regression in `b4f5610a`; found by bisect and fixed 2026-08-06) | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
@@ -223,15 +224,15 @@ CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core
 kernels for it.
 
-Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact, 6/6
-prompts / 96/96 tokens vs the vLLM 0.25.0 oracle, all nine of that model's ops
-dispatched natively with **zero provider declines**. Qwen3.6-27B runs too, both
-GDN recurrences and the fused attention preamble native, its GDN state cache in
-place, and its RMSNorm 1024-wide: **decode 4.24 tok/s vs llama.cpp's 4.35,
-prefill 21.5x** (GB10). A load keeps **one** copy of the weights, not two: 27B
-peak RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 natively
-registered ops of 112 (8 are GDN), the rest on the portable CPU tier;
-quant/MoE/MLA have none at all.
+Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact,
+6/6 prompts vs the vLLM 0.25.0 oracle, every op of that model dispatched
+natively with **zero provider declines**. Qwen3.6-27B runs too, both GDN
+recurrences and the fused attention preamble native: **decode 4.36 tok/s vs
+llama.cpp's 4.35, parity met narrowly**, and **prefill 21.5x** (GB10). A load
+keeps **one** copy of the weights, not two, and is 1.54x faster warm: 27B peak
+RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 natively registered
+ops of 112 (8 are GDN), the rest on the portable CPU tier; quant/MoE/MLA have
+none at all.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations
@@ -241,7 +242,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | OpenAI-compatible `/v1/chat/completions` | ✅ | ✅ | ✅ | ✅ |
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Offline batch API | ✅ | ✅ | ◐ | ☐ |
-| Prometheus metrics | ✅ | ✅ | ✅ | ◐ |
+| Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog | ✅ | ✅ | ◐ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |

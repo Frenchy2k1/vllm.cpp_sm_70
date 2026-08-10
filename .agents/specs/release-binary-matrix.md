@@ -90,11 +90,23 @@ not a copy from a build directory. It contains at least:
 - no model weights, tokenizer assets, Python, PyTorch, Triton runtime, compiler,
   or source/build directory.
 
-The bundle name includes project version, backend, OS, host ABI, and archive
-format. One binary never crosses an OS or host ABI. The primary CPU download is
+The canonical primary archive name is
+`vllm.cpp-<version>-<artifact-id>.tar.gz`. `<version>` is exactly the semantic
+version in the release plan and embedded manifest; `<artifact-id>` is copied
+verbatim from `release/release-matrix.json`, whose stable tuple IDs encode the
+OS, host architecture/ABI, and backend. For example, v0.0.2's x86 glibc CPU
+archive is `vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz`. Its checksum and
+provenance names are derived by appending `.sha256` and `.provenance.json` to
+that complete archive name. Package targets, lane drivers, handoff inventory,
+release-index generation/verification, workflow paths, documentation, and
+publication all use this one spelling; reordered or unversioned aliases are not
+release assets. SHA-bound GitHub Actions artifact names are transport container
+identities and do not replace or alter filenames inside them.
+
+One binary never crosses an OS or host ABI. The primary CPU download is
 one conservative-baseline, runtime-adaptive binary per OS+host ABI; the primary
-CUDA download is one fat binary per OS+host ABI containing every supported SM.
-Its manifest makes compiled CPU tiers or CUDA SMs explicit. Optional per-SM CUDA
+CUDA download is one fat binary per OS+host ABI containing every supported SM. Its
+manifest makes compiled CPU tiers or CUDA SMs explicit. Optional per-SM CUDA
 archives are diagnostic/performance variants, not the primary downloads. A
 future server install component and package target must stage this exact tree.
 The current CMake installs
@@ -530,6 +542,55 @@ Rejected alternatives are allowing the known stub path through the validator
 or replacing the runtime resolution smoke with `readelf` alone. The former
 weakens the no-build-path release invariant, while the latter stops proving
 that the extracted executable's declared dependencies resolve.
+
+## Hosted artifact-handoff completion
+
+The 2026-08-10 manual dry run at Actions run `31408404388` proved that all
+eight required platform jobs build, validate, package, and upload their exact
+bundle triplets. The aggregate `build` job `93565669335` then failed before
+handoff verification with
+`[Errno 2] No such file or directory: 'plan/release-plan.json'`.
+`actions/download-artifact@v4` had extracted the exact plan artifact below an
+additional artifact-name directory because that download did not set
+`merge-multiple: true`; the consumer intentionally reads the stable flat path
+`plan/release-plan.json`.
+
+The same latent layout mismatch applies to every later exact single-artifact
+handoff. `verify` reads both `plan/release-plan.json` and
+`unverified/release-handoff.json`; `attest` and `publish` read the verified
+handoff and assets from fixed paths. The asset-set download already opts into
+flat extraction and succeeded. Fixing only the first observed failure would
+therefore defer the same failure to verify or to the first real tag run.
+
+The approved completion is one invariant across the whole workflow:
+
+1. Every `actions/download-artifact@v4` step uses `merge-multiple: true`,
+   including exact single-artifact downloads. Artifact names stay immutable and
+   SHA-bound, and consumer paths stay stable and explicit.
+2. `scripts/check-release-workflow.py` fails unless the flattening invariant is
+   present on every download step. It continues requiring exact artifact names,
+   explicit paths, immutable handoffs, least-privilege permissions, and
+   wildcard-free publication.
+3. `tests/scripts/test_release_pipeline.py` first demonstrates a red mutation
+   by removing or falsifying one download's flattening flag, then proves the
+   repaired workflow green. Existing workflow and release-pipeline mutations
+   remain green.
+4. The focused workflow checker and mutation suite, full preflight, fresh
+   static plus scratch-mutation review, and operator rerun must pass before the
+   branch is pushed. A new manual dry run must then reach the `verify` job with
+   all eight tuples and an immutable verified handoff.
+5. Manual `workflow_dispatch` remains non-publishing by design: successful
+   build and verify may advance archive evidence, but cannot prove OIDC
+   attestation or GitHub Release publication. Those stages require a real
+   signed/authorized `v*` tag whose version matches `CMakeLists.txt`, followed
+   by an audit that every matrix archive, checksum, SBOM/provenance sidecar, and
+   generated release index was attached from the verified handoff.
+
+Rejected alternatives are duplicating artifact-name subdirectories throughout
+consumer paths or adding discovery/move scripts. Both repeat generated names
+outside their producing expressions and weaken the fixed-path handoff contract.
+Universal flat extraction is the action's native mechanism and keeps the
+workflow's exact-file publication boundary unchanged.
 
 ## Spike verdict
 

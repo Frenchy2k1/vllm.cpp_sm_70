@@ -19,6 +19,29 @@ def job_block(text: str, name: str) -> str:
     return match.group(1) if match else ""
 
 
+def action_steps(text: str, action: str) -> list[str]:
+    starts = [match.start() for match in re.finditer(r"(?m)^      - ", text)]
+    starts.append(len(text))
+    return [
+        text[start:end]
+        for start, end in zip(starts, starts[1:])
+        if re.search(rf"(?m)^        uses: {re.escape(action)}$", text[start:end])
+    ]
+
+
+def step_mapping_blocks(step: str, name: str) -> list[str]:
+    lines = step.splitlines()
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if line != f"        {name}:":
+            continue
+        end = index + 1
+        while end < len(lines) and not re.match(r"^        \S", lines[end]):
+            end += 1
+        blocks.append("\n".join(lines[index + 1 : end]))
+    return blocks
+
+
 def validate(text: str) -> list[str]:
     errors: list[str] = []
     required_global = (
@@ -43,6 +66,16 @@ def validate(text: str) -> list[str]:
         "vulkan_x86",
         "metal_arm64",
         "mlx_arm64",
+    )
+    release_outputs = (
+        ("build-release-cpu-x86", "linux-x86_64-glibc-cpu"),
+        ("build-release-cpu-arm64", "linux-aarch64-glibc-cpu"),
+        ("build-release-cpu-musl", "linux-x86_64-musl-cpu-static"),
+        ("build-release-cuda-x86", "linux-x86_64-glibc-cuda-fat"),
+        ("build-release-cuda-arm64", "linux-aarch64-glibc-cuda-fat"),
+        ("build-release-vulkan-x86", "linux-x86_64-glibc-vulkan"),
+        ("build-release-metal-arm64", "macos-arm64-metal"),
+        ("build-release-mlx-arm64", "macos-arm64-metal-mlx"),
     )
     read_only_jobs = (
         "plan",
@@ -73,6 +106,18 @@ def validate(text: str) -> list[str]:
         reference = f"${{{{ needs.{name}.outputs.artifact_id }}}}"
         if reference not in build:
             errors.append(f"handoff build job does not consume immutable {name} output")
+    for build_dir, artifact_id in release_outputs:
+        archive = (
+            f"{build_dir}/release/vllm.cpp-${{{{ needs.plan.outputs.version }}}}-"
+            f"{artifact_id}.tar.gz"
+        )
+        if any(
+            f"            {archive}{suffix}\n" not in text
+            for suffix in ("", ".sha256", ".provenance.json")
+        ):
+            errors.append(
+                "every release upload path must use its canonical versioned archive name"
+            )
 
     attest = blocks["attest"]
     for permission in (
@@ -124,7 +169,8 @@ def validate(text: str) -> list[str]:
         if fragment not in text:
             errors.append(f"immutable artifact handoff is missing {fragment!r}")
     uploads = text.count("uses: actions/upload-artifact@v4")
-    downloads = text.count("uses: actions/download-artifact@v4")
+    download_steps = action_steps(text, "actions/download-artifact@v4")
+    downloads = len(download_steps)
     if uploads < 3:
         errors.append("release workflow requires immutable plan, asset, and verified uploads")
     if text.count("overwrite: false") != uploads:
@@ -133,6 +179,19 @@ def validate(text: str) -> list[str]:
         errors.append("every artifact upload must fail when its explicit file is missing")
     if downloads < 5 or text.count("artifact-ids:") != downloads:
         errors.append("every cross-job handoff must use an exact immutable artifact ID")
+    flatten_values = []
+    for step in download_steps:
+        with_blocks = step_mapping_blocks(step, "with")
+        flatten_values.append(
+            re.findall(
+                r"(?m)^          merge-multiple:\s*(true|'true'|\"true\")\s*$",
+                with_blocks[0],
+            )
+            if len(with_blocks) == 1
+            else []
+        )
+    if any(values not in (["true"], ["'true'"], ['"true"']) for values in flatten_values):
+        errors.append("every artifact download must flatten into its declared path")
     if re.search(r"(?m)^\s+path:\s*[^\n]*[*?]", text):
         errors.append("release workflow artifact paths must not use wildcards")
     if re.search(r"gh release (?:create|upload)[^\n]*[*?]", text):

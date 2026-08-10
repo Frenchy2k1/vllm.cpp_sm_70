@@ -184,3 +184,142 @@ inode it read, so a PEER that republishes inside the window loses that record.
 Its remedy is `claim operator`, which is never refused. With `keep_canonical`
 that declination is now confined to peers; this worktree's own record is no
 longer exposed to it.
+
+## Follow-up: issue [#296](https://github.com/mudler/vllm.cpp/issues/296)
+
+Round 3's final review passed with two LOW findings recorded rather than
+blocked. Both are closed on `row/ENG-OPERATOR-RECORD-COVERAGE`. No product
+behaviour changes: `scripts/agent-role.py`'s publish is unchanged apart from one
+comment.
+
+**1. The `RECORD_TTL_SECONDS` comment was falsified by its own fix.** It still
+said a stale record is *"unlinked by the next `claim`"*, which `keep_canonical`
+made untrue for THIS worktree's record — that one is replaced, never unlinked.
+The identical sentence at line 74 above was corrected when the fix landed and
+the source copy, one screen above the function it describes, was not. It now
+carries the same qualification, and a tree-wide search found no third copy.
+
+**2. The publish-NAME pin was escapable, and widening it again would not have
+been the fix.** `test_a_publish_never_leaves_the_record_NAME_absent` watched
+`Path.write_text`, `Path.unlink`, `os.unlink` and `os.remove`. A publish written
+`os.rename(target, aside)` then `open(target, "w")` escaped it: MEASURED, the
+pre-#296 suite is 59/59 green under that mutation. That is the third round in a
+row where one publish-coverage residual was fixed and the next one opened, and
+the reason is structural — **any monkeypatch-watcher pin is escapable by one more
+I/O primitive**, so widening the list chases a fixed point.
+
+The pin is now two tests that fail differently, and the evidence says neither
+subsumes the other:
+
+- `_watch_publish` (deterministic, in-process) adds `os.rename`/`os.replace` and
+  `Path.rename`/`Path.replace` as SOURCE, plus `builtins.open`/`io.open`/`os.open`
+  in write modes. It catches every primitive it names, on every run, in
+  milliseconds — and only those.
+- `test_a_concurrent_observer_never_sees_the_record_name_absent` (probabilistic,
+  out-of-process) republishes the record 2000 times in a subprocess while the test
+  process does nothing but poll `exists()`. It enumerates nothing, so it is the
+  only half that can catch a primitive nobody listed. It is ONE-SIDED — a hit
+  proves absence, a miss proves nothing — and therefore cannot go red on correct
+  code however the two processes are scheduled.
+
+Measured 2026-08-10 on a 20-core box at load average 185 (multi-core) and 262
+(both processes pinned to one core with `taskset -c 3`), 10 runs per cell, at
+the sizing this row settled on:
+
+| Publish under test | Watcher | Observer, multi-core | Observer, one core |
+|---|---|---|---|
+| `os.rename` + `open` (the documented escape) | RED | 10/10 | 9/10 |
+| `unlink` + `write_text` (the previous escape) | RED | 10/10 | 10/10 |
+| bytes first, unlink by BASENAME, rename the temp in | green — no arm sees it | 10/10 | 10/10 |
+| byte-at-a-time in-place rewrite (the escape before that) | green — caught instead by the hardlink test | 0/10 | 0/10 |
+| shipped `write temp + os.replace` | green | 0/10 RED | 0/10 RED |
+
+The third row is the one that settles the design argument, and the reviewer of
+`row/ENG-OPERATOR-RECORD-COVERAGE` found it rather than this row: write the
+bytes while the name still resolves, `os.chdir` into the records directory,
+`os.unlink` the BASENAME, then `os.rename` the temp in. `_watch_publish`'s
+`writing` hook sees the name present, and both of its removal hooks receive a
+relative path that does not compare equal to the absolute target, so no arm
+fires — and the temp is renamed in, so the residue and hardlink pins stay green
+too. The observer is the only test in the suite that fails on it. The fourth row
+is the exact converse: the observer is blind by construction to a publish that
+never makes the name absent. Neither half subsumes the other, and the two shapes
+that only one half catches are now both in the record.
+
+The test's stated claim was weakened to match what it proves: it no longer says
+*"at the instant **any** file content is written … **nothing** may unlink it"*,
+but bounds itself to the primitives `_watch_publish` names, and points at the
+observer for the rest.
+
+### The two residuals #296 left, and what measurement said about them
+
+**Closed: the single-core sensitivity residual, which cost 0.5s and not
+"seconds".** #296 declined to close it on the stated ground that *"buying
+meaningful single-core sensitivity costs seconds per suite invocation for a
+probability that still is not one"*. That was wrong on the cost, and the reason
+is a second measurement-falsified rationale in the same commit — the child
+loop's comment said caching `worktree_id` *"stops the observed window being
+diluted by a subprocess that touches no record"*, but `record_path` →
+`records_dir` → `common_dir` still forked `git rev-parse` on every publish.
+Measured on the same box:
+
+| Child publish loop | ms per publish |
+|---|---|
+| `worktree_id` cached only (as #296 shipped it) | 1.467 |
+| `worktree_id` **and** `common_dir` cached | 0.163 |
+| one bare `git rev-parse --git-common-dir` | 1.041 |
+
+So 89% of the window a half-cached child offered the observer was the very
+subprocess the comment claimed had been removed. Caching the second call is one
+line, and it moves the observer from probabilistic to deterministic on a single
+core. Interleaved A/B, 30 paired runs per arm, `taskset -c 3`, load 198–201:
+the `os.rename` + `open` publish went 0/30 → 7/30 RED and the basename shape
+1/30 → 9/30 at the old count of 200 publishes. Raising the count then closes it
+outright, because the loop is now cheap enough to run many more times in the
+same wall clock — sweep against the basename shape, 20 runs per cell:
+
+| Publishes | Multi-core | One core | Seconds per clean run |
+|---|---|---|---|
+| 200 | 16/20 | 6/20 | 0.25 / 0.23 |
+| 800 | 19/20 | 14/20 | 0.37 / 0.44 |
+| 2000 | 20/20 | 20/20 | 0.71 / 0.80 |
+
+2000 is the first count that is not probabilistic in either regime. It costs
+~0.5s on a suite that runs in ~5s, which is why the residual is closed here
+rather than recorded a second time. The only non-assertion guard remains a floor
+on the poll count; the measured count is 148k–257k polls per run in both
+regimes, so the floor sits under 2% of it and can only fire if the poll loop
+never ran.
+
+**Closed: the observer could hang the suite instead of failing it.** As #296
+shipped it, the child's `stderr=subprocess.PIPE` was never read while the parent
+spun on `while publisher.poll() is None`, and there was no timeout anywhere in
+the test. Measured against the shipped, *correct* publish: 391 bytes of child
+stderr per publish never completed at all — killed at 90s, rc=124, spinning a
+core throughout — while 155 bytes per publish (~31KB, under this box's 65536-byte
+pipe capacity) passed in 0.41s. Nothing exotic is needed to cross that cliff:
+the child forks `git rev-parse`, so a few hundred bytes of warning per publish
+from anyone's unrelated change is enough, and a test that cannot finish is worse
+in a suite everyone must pass than the gap it closes. Child output now goes to
+files, which have no capacity to fill — 782KB and 40MB of child stderr both pass
+in under a second — and both loops are bounded by a 60s wall-clock deadline that
+kills the child and fails the test. Verified both ways: a child wedged before
+its ready signal and a child wedged mid-publish each fail at 60.05s instead of
+hanging.
+
+**Recorded, not closed:** `TMPDIR` on an exotic filesystem (NFS, overlay) is
+untested. Both halves assume ordinary POSIX rename and stat semantics on the
+temp directory. A filesystem that does not provide them would surface as an
+ERROR rather than a silent pass, which is the safe direction, so this is
+recorded rather than guarded.
+
+**Kept deliberately:** `_watch_publish` watches `Path.rename`, `Path.replace`
+and `Path.write_text` as well as the `os.*` and `io.open` calls they delegate
+to, so one `Path.rename` records two removals. That redundancy is harmless — the
+assertions are "this list is empty" — and it keeps the pin honest if CPython
+ever stops delegating.
+
+**Unmutated flake rate at the shipped sizing:** 0/40 RED for the observer and
+0/40 for the watcher, multi-core and pinned to one core alike, on a box at load
+average 397–415. The slowest observer run under that load was 0.92s against the
+60s deadline.
