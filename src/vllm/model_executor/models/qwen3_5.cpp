@@ -1187,6 +1187,39 @@ std::vector<uint16_t> DequantNvfp4ToBLayout(const Nvfp4Weight& w) {
   return io;
 }
 
+// The SAME bf16 [K=in, N=out] operand, uploaded ONCE and kept resident on the
+// weight (mirror of ResidentNvfp4, same Backend deleter). OPT-IN per weight
+// (`keep_dequant_b`, qwen3_5_weights.h): only the output head is worth a lifetime
+// bf16 expansion of ~4x its packed bytes.
+Tensor ResidentNvfp4DequantB(Dev d, const Nvfp4Weight& w) {
+  VT_CHECK(w.keep_dequant_b, "nvfp4: dequant-B residency is opt-in per weight");
+  if (!w.d_dequant_b) {
+    const std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+    const size_t nb = wb.size() * sizeof(uint16_t);
+    void* p = d.b.Alloc(nb);
+    d.b.Copy(d.q, p, wb.data(), nb);
+    Backend* bk = &d.b;
+    w.d_dequant_b = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(w.d_dequant_b.get(), DType::kBF16, d.q.device, {w.k, w.n});
+}
+
+// out[M,N] = x[M,K] @ dequant(w).T — the fallback both device dispatchers take on
+// a backend with NO fp4 GEMM (CPU registers only kMatmulNvfp4Fp4; Vulkan/Metal
+// neither kMatmulNvfp4 nor the Marlin grouped GEMM). A weight that did not opt in
+// keeps the PER-CALL temporary it has always had; caching the whole NVFP4 tower
+// would quadruple its steady-state bytes on exactly those backends.
+void MatmulNvfp4DequantB(Dev d, Tensor& out, const Tensor& x,
+                         const Nvfp4Weight& w) {
+  if (w.keep_dequant_b) {
+    vt::Matmul(d.q, out, x, ResidentNvfp4DequantB(d, w));
+    return;
+  }
+  const std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+  DBuf dwb(d, DType::kBF16, {w.k, w.n}, wb.data());
+  vt::Matmul(d.q, out, x, dwb.t());
+}
+
 // y[M,N] f32 = x[M,K] bf16 @ dequant(w).T, w fp4-resident [N=out, K=in]. Drops
 // in for MatmulF32 where the weight is NVFP4 (experts/shared/lm_head).
 std::vector<float> MatmulNvfp4F32(Dev d, const std::vector<uint16_t>& x, int64_t M,
@@ -2549,7 +2582,7 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 #endif  // VT_MARLIN_NVFP4
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  const int64_t M = x.shape[0], N = w.n;
   if (vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kF32);
 #ifdef VT_MARLIN_NVFP4
@@ -2565,18 +2598,33 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
-    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
-    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
-    vt::Matmul(d.q, dout.t(), x, dwb.t());
+    MatmulNvfp4DequantB(d, dout.t(), x, w);
   }
   return dout;
+}
+
+// The ONE dense-gate logits GEMM: y[M,vocab] f32 = x[M,H] @ lm_head.
+// PERF-27B-LMHEAD-FP4 (issue #213). A ModelOpt NVFP4 head stays PACKED, so the
+// GEMM reads K*N/2 + K*N/16 bytes per step instead of the 2*K*N of a dequantized
+// bf16 operand (~0.715 GB vs ~2.543 GB at the real 248320x5120), and keeps its
+// on-disk [N,K] orientation instead of forcing the row-major NN GEMM that has no
+// nvjet_sm121 kernel. Mirrors logits_processor._apply_head ->
+// lm_head.quant_method.apply (logits_processor.py:98-133). Every dense consumer
+// (eager ForwardDense, the gathered and non-gathered paged arms) routes here, so
+// exactly one head layout is selected; the bf16 arm keeps both of its shapes.
+DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights) {
+  if (!weights.lm_head_fp4.Empty())
+    return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
+  const OwnedTensor& lm_head = DenseLmHead(weights);
+  return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
+                    : MatmulF32D(d, x, lm_head);
 }
 
 // Same as MatmulNvfp4F32D but bf16 output (the down/o/out_proj sinks that feed
 // the residual add). CUDA: fp4-resident vt::MatmulNvfp4 (bf16 out). CPU: the
 // DequantNvfp4ToBLayout fallback (no CPU MatmulNvfp4 kernel).
 DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  const int64_t M = x.shape[0], N = w.n;
   if (vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kBF16);
 #ifdef VT_MARLIN_NVFP4
@@ -2589,9 +2637,7 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
-    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
-    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
-    vt::Matmul(d.q, dout.t(), x, dwb.t());
+    MatmulNvfp4DequantB(d, dout.t(), x, w);
   }
   return dout;
 }
@@ -6456,6 +6502,43 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 #endif
 }
 
+// PERF-27B-LMHEAD-FP4 (issue #213). Build whatever resident form of the PACKED
+// dense head THIS backend's logits GEMM will actually consume, once, at prepare
+// time. Inert on every BF16/FP8/GGUF/tied head (`lm_head_fp4` empty).
+//
+// CUDA/Marlin: prepare time is strictly BEFORE any decode-graph capture, and that
+// matters — BuildMarlinDenseResident Allocs, launches the repack, and Copies a
+// host float whose source is a function-local temporary. Same arm as
+// Qwen3_5Model::PrepareMarlinResident's lm_head build above. A backend with NO
+// fp4 GEMM builds the dequantized bf16 [K,N] operand here instead, so the head —
+// the one weight that opted into it — never pays it on the forward path.
+void Qwen3_5DenseModel::PrepareLmHeadResident(const Qwen3_5DenseWeights& weights,
+                                              vt::Queue& queue) {
+  if (weights.lm_head_fp4.Empty()) return;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+#ifdef VT_MARLIN_NVFP4
+  // Build under EXACTLY the guard MatmulNvfp4F32D uses to select the Marlin
+  // GEMM, so a configuration that will not take that path never builds for it.
+  if (!weights.lm_head_fp4.IsTrueW4A4() && MarlinMoeEnabled() &&
+      vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, queue.device.type)) {
+    BuildMarlinDenseResident(d, weights.lm_head_fp4,
+                             MarlinDenseResidentFor(&weights.lm_head_fp4));
+    d.b.Synchronize(d.q);
+    return;
+  }
+#endif
+  // Same selection order as MatmulNvfp4F32D: the fp4-activation and packed-GEMM
+  // arms stage the packed bytes lazily and NOT per call, so only the
+  // dequantizing fallback needs eager work here.
+  if (vllm::platforms::GetPlatform(queue.device.type).cutlass_fp4_supported() &&
+      weights.lm_head_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
+    return;
+  }
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, queue.device.type)) return;
+  (void)ResidentNvfp4DequantB(d, weights.lm_head_fp4);
+  d.b.Synchronize(d.q);
+}
+
 void Qwen3_5DenseModel::PrepareBf16Resident(
     const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
   VT_CHECK(platforms::GetPlatform(queue.device.type).needs_weight_staging(),
@@ -6474,6 +6557,9 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
 
   raw(weights.embed_tokens);
   raw(weights.final_norm);
+  // PERF-27B-LMHEAD-FP4: already a no-op for a PACKED head (empty bf16 owner, and
+  // IsPlainBf16Qwen3_5Dense is false whenever the head is packed); its resident is
+  // built by PrepareLmHeadResident.
   raw(DenseLmHead(weights));
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     raw(layer.input_layernorm);
@@ -6689,10 +6775,9 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
-  // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
-  const OwnedTensor& lm_head = DenseLmHead(weights);
-  DBuf dlogits = lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
-                            : MatmulF32D(d, dnorm.t(), lm_head);
+  // lm_head (the one host Download): PACKED NVFP4 (PERF-27B-LMHEAD-FP4) when the
+  // checkpoint ships a ModelOpt/CT NVFP4 head, else the bf16/tied owner.
+  DBuf dlogits = DenseLogitsF32D(d, dnorm.t(), weights);
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;
@@ -6704,7 +6789,10 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
     : weights_(&weights),
       config_(&config),
       embed_tokens_(&target.embed_tokens),
-      lm_head_(&DenseLmHead(target)) {
+      lm_head_(&DenseLmHead(target)),
+      // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
+      // the packed one too. Empty on every BF16/FP8/tied dense target.
+      lm_head_fp4_(&target.lm_head_fp4) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -7034,21 +7122,17 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
-  // lm_head is unquantized bf16 in the 27B (notes §3.6). Pure-decode / graph
-  // replay pass empty indices (identity) → the full [T,vocab] path.
+  // Both arms route through DenseLogitsF32D (PERF-27B-LMHEAD-FP4). Pure-decode /
+  // graph replay pass empty indices (identity) → the full [T,vocab] path.
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   if (do_gather) {
     const int64_t n_out = static_cast<int64_t>(logits_indices.size());
     DBuf dgather(d, DType::kBF16, {n_out, H});
     GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    const OwnedTensor& lm_head = DenseLmHead(weights);
-    return lm_head.nk ? MatmulBf16LogitsF32D(d, dgather.t(), lm_head)
-                      : MatmulF32D(d, dgather.t(), lm_head);
+    return DenseLogitsF32D(d, dgather.t(), weights);
   }
-  const OwnedTensor& lm_head = DenseLmHead(weights);
-  return lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
-                    : MatmulF32D(d, dnorm.t(), lm_head);
+  return DenseLogitsF32D(d, dnorm.t(), weights);
 }
 
 // Full eager dense paged forward body: embed (host token_ids) then the capturable

@@ -105,6 +105,20 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 | Roof | 20.42 GiB over about 273 GB/s: vLLM's 79 ms/token is about 95% of the bandwidth limit, ours 96 ms/token about 78% | | | |
 | Peak host RSS | 21.0 GiB, down from 24.2 GiB, because the FP8 tower is no longer expanded to BF16 | | | |
 
+#### NVFP4 `lm_head` kept packed (`PERF-27B-LMHEAD-FP4`, #213)
+
+| Axis | Packed (`VT_LMHEAD_FP4=1`) | Dequant (`=0`) | Result |
+|---|---:|---:|---|
+| Peak host RSS | 19.36 GiB | 21.06 GiB | **-1.70 GiB**, but measured BEFORE `ENG-LOAD-DIRECT-UPLOAD` (#150) made `LoadCtNvfp4Raw` borrow mmap'd bytes, which moves the RSS accounting; re-measurement OWED |
+| Peak host RSS, non-CUDA | | | **Arithmetic, not measured.** A backend with no fp4 GEMM keeps packed + one bf16 operand: Vulkan **-1.70 GiB** (it used to stage a host bf16 head *and* a device copy), plain CPU **+0.67 GiB**. See `docs/USAGE.md` |
+| Greedy continuation | identical to the dequant leg, byte for byte | | SOLID |
+| `test_qwen27_paged_engine` | 235/235 | 235/235 | unchanged |
+| tok/s, leg A / leg B | 11.197 / 11.193 | 9.418 / 10.163 | **INDICATIVE ONLY** |
+| Reading, throughput | packed faster in all four legs; packed legs agree to 0.04%, dequant legs disagree by 7.9% | | DIRECTION established, MAGNITUDE not |
+| Owed | binding grid: 3 reps per leg, order-alternated, c1/c2/c4/c8, medians of per-rep medians, before any ratio is quoted | | PENDING |
+| Method | same model and revision as the table above, same-binary A/B on GB10 | | |
+| Provenance | the row's fresh reviewer, gate checkpoint `nvidia/Qwen3.6-27B-NVFP4`@`0893e1606ff3d5f97a441f405d5fc541a6bdf404` | | |
+
 ### Qwen3.6-35B-A3B by concurrency
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |

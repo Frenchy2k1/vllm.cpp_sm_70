@@ -1244,6 +1244,12 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.
+# Synthetic (no checkpoint, no GPU) BECAUSE test_qwen27_paged_engine runs the
+# unsloth @890bdef7 snapshot, whose head is BF16 — that gate cannot see this path.
+vllm_cpp_add_test(test_qwen27_dense_lmhead_fp4
+  parity/test_qwen27_dense_lmhead_fp4.cpp)
+
 # SPEC-DFLASH D2 — the DFlash draft-forward parity gate vs the dumped vLLM DFlash
 # draft reference (fc combine + context-free block forward per-stage hidden +
 # proposed ids). GPU + z-lab-draft + NVFP4-target + fixture gated (skips on CPU/CI).

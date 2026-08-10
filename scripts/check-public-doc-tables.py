@@ -485,7 +485,13 @@ STATUS_RATCHET = {
     # (works on the 35B gate model, spec-on output token-identical to spec-off,
     # 1.15x warm against upstream's 1.41x). Re-pinned byte-tight below after the
     # merge, so the reduction cannot become untracked growth headroom.
-    "chars": 243556,
+    # 243554 since 2026-08-10 (measured 243554): row PERF-27B-LMHEAD-FP4 adds
+    # the packed NVFP4 lm_head to the 27B cell. Paid for by collapsing that
+    # cell's superseded narrative (the ModelOpt-FP8-tower aside and the
+    # ~100% GPU-busy reading) into the binding result, both of which are now
+    # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
+    # from 243556, the only direction this number may move.
+    "chars": 243554,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
