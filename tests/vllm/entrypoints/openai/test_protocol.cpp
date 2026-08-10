@@ -612,3 +612,46 @@ TEST_CASE("empty allowed_token_ids is rejected via PostInit") {
   })").get<CompletionRequest>();
   CHECK_THROWS_AS(req.to_sampling_params(), std::runtime_error);
 }
+
+// A non-positive max_tokens means "no client-side limit" (Hermes and some
+// OpenAI clients send -1). It must arrive at the engine UNSET so the
+// max_model_len - seq_len path runs; substituting a constant would silently
+// truncate the request that explicitly asked to be left unlimited.
+TEST_CASE("max_tokens <= 0 means UNSET, not a clamped constant") {
+  SUBCASE("completions: -1 leaves max_tokens unset") {
+    auto req = json::parse(R"({"prompt":"x","max_tokens":-1})")
+                   .get<CompletionRequest>();
+    CHECK_FALSE(req.to_sampling_params().max_tokens.has_value());
+  }
+  SUBCASE("completions: 0 leaves max_tokens unset") {
+    auto req = json::parse(R"({"prompt":"x","max_tokens":0})")
+                   .get<CompletionRequest>();
+    CHECK_FALSE(req.to_sampling_params().max_tokens.has_value());
+  }
+  SUBCASE("completions: a positive value is honoured unchanged") {
+    auto req = json::parse(R"({"prompt":"x","max_tokens":7})")
+                   .get<CompletionRequest>();
+    const auto sp = req.to_sampling_params();
+    REQUIRE(sp.max_tokens.has_value());
+    CHECK(*sp.max_tokens == 7);
+  }
+  SUBCASE("completions: -1 yields to the serving default when one is given") {
+    auto req = json::parse(R"({"prompt":"x","max_tokens":-1})")
+                   .get<CompletionRequest>();
+    const auto sp = req.to_sampling_params(/*default_max_tokens=*/128);
+    REQUIRE(sp.max_tokens.has_value());
+    CHECK(*sp.max_tokens == 128);
+  }
+  SUBCASE("chat: -1 leaves max_tokens unset") {
+    auto req = json::parse(
+                   R"({"messages":[{"role":"user","content":"x"}],"max_tokens":-1})")
+                   .get<ChatCompletionRequest>();
+    CHECK_FALSE(req.to_sampling_params().max_tokens.has_value());
+  }
+  SUBCASE("chat: max_completion_tokens=-1 leaves max_tokens unset") {
+    auto req = json::parse(
+                   R"({"messages":[{"role":"user","content":"x"}],"max_completion_tokens":-1})")
+                   .get<ChatCompletionRequest>();
+    CHECK_FALSE(req.to_sampling_params().max_tokens.has_value());
+  }
+}
