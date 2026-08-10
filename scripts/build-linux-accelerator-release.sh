@@ -96,13 +96,8 @@ python3 scripts/package-server.py \
   --metadata-dir "$metadata_dir" \
   --archive "$archive"
 if [[ "$backend" == cuda ]]; then
-  cuda_stub=$(find -L /usr/local/cuda -type f -path '*/stubs/libcuda.so' -print -quit)
-  if [[ -z "$cuda_stub" ]]; then
-    echo "CUDA driver stub is required for archive smoke validation" >&2
-    exit 1
-  fi
-  cuda_stub_dir=${cuda_stub%/*}
-  export LD_LIBRARY_PATH="$cuda_stub_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  cuda_stub_runtime_dir=$(scripts/prepare-cuda-driver-stub.sh /usr/local/cuda "$release_dir/cuda-driver-stub")
+  export LD_LIBRARY_PATH="$cuda_stub_runtime_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 python3 scripts/validate-release-archive.py \
   --archive "$archive" \

@@ -35,14 +35,16 @@ The server is ON by default. Example binaries land under `build/examples/`:
 ```sh
 cmake -S . -B build-cuda \
   -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_TRITON=ON \
   -DVLLM_CPP_CUTLASS_FETCH=ON
 cmake --build build-cuda -j
 ```
 
 Triton-AOT cubins for the fast GDN path are **vendored**: Python and Triton are
 needed only to regenerate them (`VLLM_CPP_TRITON_REGEN`), never to build or run
-them.
+them. Because building them needs nothing a CUDA build does not already have,
+`VLLM_CPP_TRITON` defaults **ON** for a CUDA build and the line above no longer
+carries it; `-DVLLM_CPP_TRITON=OFF` drops back to the hand C++/CUDA kernels,
+which stay the always-available fallback.
 
 ### CUTLASS: the one external build dependency
 
@@ -147,9 +149,16 @@ real install, the configure now derives the compiler hints from it
 (`CMAKE_HIP_COMPILER_ROCM_ROOT`, `--rocm-path` in `CMAKE_HIP_FLAGS`, the
 `ROCM_PATH` environment variable — each only if you have not set it), which is
 what makes Arch and TheRock dist-tarball layouts configure without the manual
-flags issue #41's gfx1151 report needed. An explicit `-DCMAKE_BUILD_TYPE` (any
-optimizing one) matters on ROCm: a `-O0` device build trips a CLR teardown race
-([#132](https://github.com/mudler/vllm.cpp/issues/132)).
+flags issue #41's gfx1151 report needed.
+
+A build with no `CMAKE_BUILD_TYPE` now floors **HIP device code** at `-O1`
+automatically, and says so at configure time. At `-O0` hipcc marks the kernels
+as dynamic-stack users, which makes the ROCm runtime start a hostcall listener
+the kernels never use, and its teardown handshake can deadlock at process exit —
+the tests all pass and then the process never returns
+([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
+or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides this and is respected
+as-is.
 
 `-DVLLM_CPP_HIP=ON` **fails the configure** when no HIP compiler is found rather
 than quietly producing a CPU-only build, for the same reason the CUTLASS note
@@ -202,7 +211,7 @@ defaults.
 | `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
 | `MLX_ROOT` | (empty) | Root of an MLX install (`include/` + `lib/`) for `VLLM_CPP_MLX` |
 | `VLLM_CPP_SERVER` | `ON` | Build the OpenAI HTTP server (needs `third_party/httplib/httplib.h`; disables itself with a warning if absent) |
-| `VLLM_CPP_TRITON` | `OFF` | Consume the vendored per-arch Triton-AOT GDN cubins (CUDA only; no Python needed) |
+| `VLLM_CPP_TRITON` | computed: `ON` for a CUDA build with the vendored trees present, else `OFF` | Consume the vendored per-arch Triton-AOT GDN cubins (CUDA only; no Python needed). It ships ON because the artifacts are pre-generated cubins embedded in plain C — a C compiler is the whole requirement. It declines, with one `STATUS` line naming the condition, when `VLLM_CPP_CUDA` is `OFF`, when `VLLM_CPP_TRITON_REGEN` is `ON`, or when a vendored tree is absent, incomplete, or older than the `triton_kernels/*.py` it was generated from — the same conditions the build itself refuses to consume, checked before the default is set so it can decline instead of failing your configure. Turn it off with `-DVLLM_CPP_TRITON=OFF` |
 | `VLLM_CPP_TRITON_REGEN` | `OFF` | Maintainer knob: regenerate the AOT cubins with Python + Triton |
 | `VLLM_CPP_CUTLASS_DIR` | `third_party/cutlass` | CUTLASS source root (>= 4.5.0). Feeds the sm120a NVFP4 GEMM **and** FlashAttention-2 on `8.0/8.6/8.7/8.9/12.0a/12.1a`. Absent on an FA2-capable arch, configure warns and FA2 is not built |
 | `VLLM_CPP_CUTLASS_FETCH` | `OFF` | FetchContent CUTLASS 4.5.0 if not found locally (~200 MB, needs network) |

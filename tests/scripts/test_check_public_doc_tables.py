@@ -455,6 +455,48 @@ class StatusRatchet(unittest.TestCase):
         text = doc_tables.STATUS.read_text(encoding="utf-8")
         self.assertEqual(doc_tables.STATUS_RATCHET["chars"], len(text))
 
+    def test_the_status_ratchet_only_ever_moves_down(self) -> None:
+        """A ratchet that can be RAISED is a budget with extra steps.
+
+        The checker states the rule in prose -- "every limit is pinned to what
+        the page measured ... and may only go DOWN" -- and nothing enforced it.
+        Every other ratchet test here measures the LIVE page, so raising a cap
+        and growing the page by the same amount in one change is green in all of
+        them: measured 2026-08-10, `"chars": 243584 -> 243684` plus 100 chars
+        appended to docs/STATUS.md left this module at 52/52 OK. That is exactly
+        the cheap way out the ratchet exists to block, and every STATUS edit
+        touches this number, so it is the number most likely to drift upward
+        unnoticed.
+
+        STATUS_RATCHET_CEILING is the ratchet as it stands. Lowering a cap keeps
+        passing; raising one fails here and can only be unblocked by editing the
+        ceiling in the same change -- a deliberate, reviewable act instead of a
+        silent bump. The caps have in fact only ever fallen (chars 289727 ->
+        243584 over 48 commits), so the ceiling never needs to rise.
+        """
+        ceiling = {
+            "chars": 243578,
+            "h2_sections": 11,
+            "long_paragraphs": 82,
+            "oversized_cells": 44,
+        }
+        self.assertEqual(
+            set(doc_tables.STATUS_RATCHET),
+            set(ceiling),
+            "every ratcheted metric needs a ceiling here, and a ceiling with no "
+            "metric behind it is a metric that quietly stopped being enforced",
+        )
+        for key, cap in doc_tables.STATUS_RATCHET.items():
+            with self.subTest(metric=key):
+                self.assertLessEqual(
+                    cap,
+                    ceiling[key],
+                    f"the {key} ratchet moved UP to {cap} from {ceiling[key]}; "
+                    "docs/STATUS.md may only shrink. Collapse the superseded "
+                    "narrative instead, and lower this ceiling in the same "
+                    "change that lowers the ratchet -- never the reverse",
+                )
+
     def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
         # A ratchet parked well above the page it guards is not a ratchet: it
         # silently licenses regrowth up to the old number. The rule is "lower it
