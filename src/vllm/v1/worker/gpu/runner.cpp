@@ -7,6 +7,7 @@
 #include "vllm/v1/worker/gpu/runner.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2141,10 +2142,25 @@ void GPUModelRunner::propose_drafts_block(
       total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
+    const auto t_fwd0 = std::chrono::steady_clock::now();
     const std::vector<float> block_logits =
         Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
             stores, ctx_cu, blk_ids, blk_pos, blk_cu, backbone, config, queue_);
+    const auto t_fwd1 = std::chrono::steady_clock::now();
     const std::vector<std::vector<int32_t>> drafts = sample(block_logits, P, anchors);
+    const auto t_smp1 = std::chrono::steady_clock::now();
+    if (propose_trace) {
+      // Splits the draft step into the parallel backbone forward and the
+      // sampler. For DSpark the sampler is a k-iteration host loop, each
+      // iteration a Markov GEMV plus a device->host download plus a host argmax
+      // over the draft vocab; upstream captures the WHOLE draft step in one CUDA
+      // graph instead (dspark/speculator.py:22-24).
+      std::fprintf(stderr,
+                   "[spec-phase] backbone=%.2fms sample=%.2fms logits=%zu\n",
+                   std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count(),
+                   std::chrono::duration<double, std::milli>(t_smp1 - t_fwd1).count(),
+                   block_logits.size());
+    }
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];
       out.draft_token_ids[static_cast<size_t>(row)] = drafts[static_cast<size_t>(r)];

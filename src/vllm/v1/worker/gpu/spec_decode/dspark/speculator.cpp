@@ -3,7 +3,10 @@
 // See the header for scope and the exact upstream anchors. SPEC-DSPARK W4.
 #include "vllm/v1/worker/gpu/spec_decode/dspark/speculator.h"
 
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 
 #include "vt/backend.h"
 
@@ -102,14 +105,33 @@ DsparkProposeResult DsparkProposeBlock(
 
   // The parallel backbone forward is the INHERITED DFlash one, unchanged
   // (_generate_draft :158-165 calls DFlashSpeculator._run_model).
+  static const bool phase_trace = [] {
+    const char* v = std::getenv("VT_SPEC_TRACE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  const auto t0 = std::chrono::steady_clock::now();
   const std::vector<float> block_logits =
       Qwen3DFlashModel::ForwardBlockLogitsWithContext(
           context_states, context_positions, ctx_cu, block_input_ids,
           block_positions, block_cu, weights.backbone, config, queue);
+  const auto t1 = std::chrono::steady_clock::now();
 
   DsparkProposeResult out;
   out.draft_token_ids =
       SampleDsparkBlockDrafts(block_logits, anchor_ids, layout, weights, queue);
+  const auto t2 = std::chrono::steady_clock::now();
+  if (phase_trace) {
+    // Separates the parallel backbone forward from the sequential Markov loop.
+    // The loop runs k Markov GEMVs, each with a device->host download and a
+    // host argmax over the draft vocab; if it dominates, the lever is capturing
+    // the whole draft step the way upstream does (dspark/speculator.py:22-24),
+    // not making the backbone faster.
+    std::fprintf(stderr,
+                 "[spec-phase] backbone=%.2fms sequential=%.2fms k=%d logits=%zu\n",
+                 std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                 std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                 layout.num_speculative_steps, block_logits.size());
+  }
   return out;
 }
 
