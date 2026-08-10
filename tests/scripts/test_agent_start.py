@@ -34,7 +34,7 @@ def state(**changes):
         "mode": "interactive",
         "branch": "main",
         "worktree": "/repo/.git",
-        "blocked_by_other_operator": False,
+        "operator_peers": [],
         "reason": "undeclared",
         "env": "present",
         "env_missing": [],
@@ -180,35 +180,42 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("scripts/agent-role.py claim operator", out)
         self.assertIn("No worktree or PR was created by this command", out)
 
-    def test_external_operator_lock_blocks_known_failing_claim(self):
+    def test_a_recorded_peer_never_blocks_the_operator_claim(self):
+        """Issue #285. This test asserted the OPPOSITE until 2026-08-10.
+
+        It required "BLOCKED: the operator lock is held by another live
+        worktree" and forbade printing the claim command. `claim operator` is
+        now never refused, so that route sent a session away from a command
+        that works. The peer is reported as status and the claim is still
+        offered.
+        """
         out = self.render(
-            state(
-                blocked_by_other_operator=True,
-                reason="operator lock held elsewhere",
-            ),
+            state(operator_peers=[{"worktree": "/repo/.git/worktrees/other"}]),
             intent="operator",
         )
-        self.assertIn("operator lock is held by another live worktree", out)
-        self.assertIn("operator lock held elsewhere", out)
-        self.assertNotIn("scripts/agent-role.py claim operator", out)
-        self.assertNotIn("claim helper", out)
+        self.assertIn("other coordinators: 1 recorded", out)
+        self.assertIn("scripts/agent-role.py claim operator", out)
+        self.assertNotIn("BLOCKED", out)
+        self.assertNotIn("known-failing", out)
 
-    def test_first_time_route_surfaces_operator_lock_before_role_choice(self):
+    def test_first_time_route_reports_peers_without_withholding_a_role(self):
         out = self.render(
-            state(
-                blocked_by_other_operator=True,
-                reason="operator lock held elsewhere",
-            )
+            state(operator_peers=[
+                {"worktree": "/repo/.git/worktrees/a"},
+                {"worktree": "/repo/.git/worktrees/b"},
+            ])
         )
         self.assertIn("WELCOME: RELAY VERBATIM", out)
-        self.assertIn("operator lock is held by another live worktree", out)
-        self.assertIn("operator lock held elsewhere", out)
-        self.assertNotIn(
-            "Use the matching scripts/agent-role.py claim command.", out
-        )
-        self.assertIn(
-            "If the contributor chooses operator, report the conflict", out
-        )
+        self.assertIn("other coordinators: 2 recorded", out)
+        # every role stays on the table, and nothing tells the agent to refuse
+        self.assertIn("Use the matching scripts/agent-role.py claim command.", out)
+        self.assertNotIn("BLOCKED", out)
+        self.assertNotIn("report the conflict", out)
+
+    def test_no_peers_renders_no_coordinator_line(self):
+        # The other side of the same key: a hardcoded line would announce
+        # coordinators that do not exist, which is how a record reads as a lock.
+        self.assertNotIn("other coordinators", self.render(state()))
 
     def test_environment_reports_status_only_and_never_secret_values(self):
         secret = "TOP-SECRET-TOKEN"

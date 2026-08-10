@@ -142,6 +142,14 @@ void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
   (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
 }
 
+// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
+// divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
+// GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift.
+bool ModelOptW4A4OptIn() {
+  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
+  return w4a4 != nullptr && w4a4[0] == '1';
+}
+
 // One compressed-tensors NVFP4 W4A4 Linear -> RAW fp4-resident Nvfp4Weight kept
 // in the on-disk [N=out, K=in] orientation vt::MatmulNvfp4 reads directly (notes
 // §5 step-6a — the throughput path; NO bf16 materialization). Reads the CT
@@ -219,11 +227,11 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 // head to FP8 with a PER-OUTPUT-CHANNEL scale, and nvidia/Qwen3.6-27B-NVFP4 ships
 // a ModelOpt NVFP4 head; both hit the old unconditional BF16 assert.
 //
-// All three land on the SAME bf16 [in, out] Matmul-B operand the logits GEMM
-// already consumes, so the forward is untouched and a BF16 head stays byte-exact
-// (identical call, no dequant). Keeping the head quantized end-to-end would save
-// ~2.3 GiB but needs an `lm_head_fp4`-style field on the dense weights plus a
-// forward branch; that is a follow-up, not this fix.
+// BF16 and FP8 heads land on the SAME bf16 [in, out] Matmul-B operand the logits
+// GEMM already consumes, so a BF16 head stays byte-exact. The NVFP4 form no
+// longer reaches this function: LoadDenseLmHead routes it to the PACKED
+// `lm_head_fp4` (PERF-27B-LMHEAD-FP4, issue #213), and the U8 branch below
+// survives ONLY as the VT_LMHEAD_FP4=0 in-binary rollback.
 //
 // ModelOpt vs compressed-tensors global-scale convention: CT stores the value as
 // a DIVISOR and `DequantCtNvfp4WeightToF32` reciprocates it internally, whereas
@@ -377,8 +385,8 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   // A/B(VT_MODELOPT_W4A4=1): default W4A16. ModelOpt ships `input_scale` on every
   // projection, but consuming it flips IsTrueW4A4() and routes to the
   // fp4-activation GEMM; leaving alpha at 0 keeps the weight-only dispatcher.
-  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
-  if (w4a4 != nullptr && w4a4[0] == '1' && has(proj + ".input_scale")) {
+  const bool w4a4_opt_in = ModelOptW4A4OptIn();
+  if (w4a4_opt_in && has(proj + ".input_scale")) {
     const float is = ReadF32Scalar(get(proj + ".input_scale"));
     if (is != 0.0F) {
       r.input_global_scale_inv = is;
@@ -498,6 +506,51 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
 }
 
 }  // namespace
+
+bool DenseLmHeadFp4Enabled() {
+  const char* v = std::getenv("VT_LMHEAD_FP4");
+  return v == nullptr || v[0] != '0';
+}
+
+void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
+                     const std::string& proj, OwnedTensor& bf16_out,
+                     Nvfp4Weight& fp4_out) {
+  fp4_out = Nvfp4Weight{};
+  bf16_out = OwnedTensor{};
+  // PERF-27B-LMHEAD-FP4 (issue #213). An NVFP4 head stays PACKED, through the SAME
+  // LoadNvfp4AnyNaming every other NVFP4 projection takes, so the ModelOpt vs
+  // compressed-tensors global-scale convention is handled in exactly one place.
+  // vLLM's mixed scheme likewise resolves a quantized head (modelopt.py:2491-2496).
+  if (DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj)) {
+    fp4_out = LoadNvfp4AnyNaming(get, has, proj);
+    // The head is W4A16, whatever the naming. `LoadNvfp4AnyNaming` decides
+    // activation-quant per SPELLING — the ModelOpt arm ignores `input_scale`
+    // unless VT_MODELOPT_W4A4=1, but `LoadCtNvfp4Raw` consumes
+    // `input_global_scale` UNCONDITIONALLY, correct for a TOWER projection of the
+    // 27B compressed-tensors checkpoint, which really is W4A4. An output head is
+    // not one: vLLM resolves it through ModelOptNvFp4W4A16LinearMethod, which
+    // DELETES input_scale (modelopt.py:1365; registered at :1358) and pins
+    // MarlinNvFp4LinearKernel (modelopt.py:1249,1283-1284). A set alpha would (a)
+    // take the fp4-activation GEMM vLLM refuses here and (b) make
+    // PrepareLmHeadResident early-return, skipping the pre-capture Marlin build.
+    if (!ModelOptW4A4OptIn()) {
+      fp4_out.input_global_scale_inv = 0.0F;
+      fp4_out.alpha = 0.0F;
+    }
+    // The ONE weight that opts into a lifetime dequant-B resident where there is
+    // no fp4 GEMM (qwen3_5_weights.h): the head is re-read whole every step.
+    fp4_out.keep_dequant_b = true;
+    return;
+  }
+  bf16_out = LoadLmHeadAnyDtype(get, has, proj + ".weight");
+}
+
+bool DenseCheckpointHasLmHead(const TensorExists& has, const std::string& proj) {
+  // A bare `<proj>.weight` probe misses a compressed-tensors head, whose only
+  // weight tensor is `<proj>.weight_packed`; no head at all means
+  // `tie_word_embeddings`, so missing CT ties the logits to the embedding table.
+  return has(proj + ".weight") || IsNvfp4Projection(has, proj);
+}
 
 OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
                                 const std::vector<std::string>& names) {
@@ -632,8 +685,8 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
       LoadModelBf16Direct(get, "model.language_model.norm.weight");
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
   // the embedding table and omit lm_head.weight.
-  if (has("lm_head.weight")) {
-    w.lm_head = LoadLmHeadAnyDtype(get, has, "lm_head.weight");
+  if (DenseCheckpointHasLmHead(has, "lm_head")) {
+    LoadDenseLmHead(get, has, "lm_head", w.lm_head, w.lm_head_fp4);
   } else {
     w.tied_lm_head = true;
     w.embed_tokens.nk = true;
@@ -652,6 +705,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 }
 
 bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
+  // A PACKED head (PERF-27B-LMHEAD-FP4) is not plain bf16: this staging path
+  // only knows how to stage OwnedTensors.
+  if (!weights.lm_head_fp4.Empty()) return false;
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
         !layer.mlp.down_proj_fp4.Empty()) {

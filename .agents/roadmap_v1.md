@@ -38,6 +38,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 |---:|---|---|---|
 | [#268](https://github.com/mudler/vllm.cpp/issues/268) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer (Meta, 30B agentic multimodal): text tower, perception encoder, DFlash drafter | feature |
 | [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |
+| [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
 | [#250](https://github.com/mudler/vllm.cpp/issues/250) | — | `a5b52047` reached main without a task branch, and `check-role-discipline` cannot be waived | bug |
 | [#243](https://github.com/mudler/vllm.cpp/issues/243) | — | `vllm-feature-gap-analysis.md` is a stale 2026-07-28 snapshot: 9 of 16 HIGH/MED gaps have since landed | bug |
@@ -45,6 +46,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#230](https://github.com/mudler/vllm.cpp/issues/230) | — | `test_agent_record.py`: 7 issue-intake tests never run, and error when they do | bug |
 | [#222](https://github.com/mudler/vllm.cpp/issues/222) | `SERVE-GATE-ONLINE` | The online-serving gate aborts on current main: harness looks for `examples/server`, the build produces `examples/vllm-server` — paths repaired by `2b262622`/`8fce04d3`; residue is the drift guard, the `27n` key and a model gate that recorded a skip as passed | bug |
 | [#224](https://github.com/mudler/vllm.cpp/issues/224) | `ENG-DOCS-SITE` | Publish `docs/` as a GitHub Pages site without owning a second copy | feature |
+| [#213](https://github.com/mudler/vllm.cpp/issues/213) | `PERF-27B-LMHEAD-FP4` | Qwen3.6 NVFP4 baselines (27B and 35B-A3B) must reach vLLM speed parity | perf |
 | [#203](https://github.com/mudler/vllm.cpp/issues/203) | `BACKEND-VULKAN` | Vulkan on unified memory holds TWO copies of the weights: 27B peaks at 100.8 GiB RSS and OOM-reboots a Spark | bug |
 | [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | `hipblasGemmEx` overload mismatch in `rocm_matmul_hipblaslt.hip` | bug |
 | [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |

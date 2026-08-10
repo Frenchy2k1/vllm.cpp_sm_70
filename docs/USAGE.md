@@ -86,25 +86,12 @@ welcome that the agent should relay. An explicit request can use
 claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
 The entrypoint is non-interactive and does not mutate the checkout.
 
-### Where model weights live
-
-`--model` takes a directory, so weights can sit anywhere. On a shared or
-multi-host setup, put them on shared storage rather than each box's system disk:
-a 30B bf16 checkpoint is around 60 GB, and a build tree plus a couple of
-checkpoints fills a disk fast. A full disk surfaces as unrelated test failures,
-not as an obvious disk error.
-
-Set `CHECKPOINT_ROOT` in your `.env` (see `.env.example`) to that shared root and
-point `--model` beneath it:
-
-```sh
-build/examples/vllm-cli --model "$CHECKPOINT_ROOT/qwen3.6-27b" --prompt "..."
-```
-
-Leaving `CHECKPOINT_ROOT` empty is fine; it only means tools fall back to their
-own defaults, usually the Hugging Face cache under `$HOME`. When you fetch a
-checkpoint, pin an explicit revision: publishers do re-quantize in place under an
-unchanged repo name, so a bare branch name is not reproducible.
+The operator role is a coordinator, and **several may run at once**:
+`scripts/agent-role.py claim operator` records this worktree and is never
+refused, `scripts/agent-role.py show` lists the other live coordinators, and
+`scripts/agent-role.py release` removes only this worktree's record. What keeps
+concurrent coordinators safe is that `main` is never force-pushed, so a plain
+`git push` refuses any non-fast-forward.
 
 ## Running inference (CLI)
 
@@ -320,6 +307,34 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 `VT_CPU_QUANT_REPACK`; `auto` uses Linux HWCAP/HWCAP2 or Darwin feature sysctls,
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
+
+### The NVFP4 output head
+
+On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
+`weight`/`weight_scale`/`weight_scale_2`, or compressed-tensors
+`weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
+GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
+head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
+2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
+GiB, a 1.70 GiB saving on CUDA; the figure is owed a re-measurement after
+`ENG-LOAD-DIRECT-UPLOAD` changed the RSS accounting).
+
+That accounting is CUDA's. A backend with no fp4 GEMM (CPU, Vulkan, Metal, HIP,
+Tenstorrent) has to multiply against a dequantized bf16 copy, so on those the
+head costs the packed bytes **plus** one `2*K*N` operand, built once when the
+model is prepared rather than per call — 0.666 + 2.368 = 3.034 GiB on the same
+checkpoint. The sign of the change therefore depends on the backend: on Vulkan,
+which used to stage a host bf16 head *and* a device copy of it, the head goes
+4.736 to 3.034 GiB, the same **-1.70 GiB**; on plain CPU it goes 2.368 to 3.034,
+a **+0.67 GiB** regression, paid once instead of rebuilding 2.368 GiB on every
+decode step as that backend did before. Only the head is kept that way; every
+other NVFP4 projection dequantizes per call, so a quantized tower is never
+expanded in memory. The head runs W4A16 under both namings: the on-disk
+activation divisor next to it (`input_scale`, or `input_global_scale` in the
+compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
+matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a
+same-binary A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF
+and `tie_word_embeddings` heads are unaffected by either setting.
 
 ### Validating a staged release archive
 
