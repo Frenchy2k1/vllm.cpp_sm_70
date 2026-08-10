@@ -27,13 +27,18 @@
 //                 vision_encoder.positional_embedding_vlm          (:711)
 //                 vision_encoder.{ln_pre,ln_post}.{weight,bias}    (:714,:732)
 //                 vision_encoder.transformer.N.{ln_1,ln_2}.{weight,bias} (:661,:666)
-//                 vision_encoder.transformer.N.attn.{qkv,o}_proj.weight  (:574,:1397)
+//                 vision_encoder.transformer.N.attn.{q,k,v,o}_proj.{weight,bias}
+//                                                                  (:574-589,:1397)
+//                   — SEPARATE on disk, WITH bias; upstream's merged `qkv_proj`
+//                     module is a LOAD-time fusion (packed_modules_mapping,
+//                     :1427-1430), which is what our loader reproduces.
 //                 vision_encoder.transformer.N.mlp.{c_fc,c_proj}.{weight,bias} (:643-644)
 //                 vision_adapter.{c_fc,c_proj}.weight              (:1038-1039)
 //                 vision_projection.weight                         (:1464)
 #include "vllm/model_executor/models/muse_glimmer.h"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -514,8 +519,26 @@ std::vector<std::string> EnumerateMuseGlimmerTensors(const MuseGlimmerParams& pa
       names.push_back(p + "ln_1.bias");
       names.push_back(p + "ln_2.weight");
       names.push_back(p + "ln_2.bias");
-      names.push_back(p + "attn.qkv_proj.weight");
-      names.push_back(p + "attn.o_proj.weight");
+      // W4 CORRECTION, verified against the released `meta-models/Muse-Glimmer-30B`
+      // checkpoint (1436 tensors, revision f84ecc3a0e; the header-only projection is
+      // committed as tests/vllm/models/fixtures/muse_glimmer_30b/index.json). W0
+      // enumerated ONE merged `attn.qkv_proj.weight` per vision layer and NO vision
+      // attention bias at all, mirroring upstream's `QKVParallelLinear` MODULE name
+      // rather than the checkpoint's on-disk names. The checkpoint ships SEPARATE
+      // `attn.{q,k,v}_proj` and `attn.proj` (-> `attn.o_proj`), each WITH a bias —
+      // upstream reaches them through its `packed_modules_mapping`
+      // (muse_glimmer.py:1427-1430), which fuses the three shards at LOAD time.
+      //
+      // The enumeration is the checkpoint's contract, so it names what the file
+      // ships; the MERGE stays an internal representation and happens in the loader
+      // (LoadVisionTower), which is where upstream does it too. Getting this
+      // backwards is not cosmetic: the loader would demand a tensor no checkpoint
+      // contains, and the structural accounting pass would report the tower as
+      // partly missing instead of saying so.
+      for (const char* proj : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+        names.push_back(p + "attn." + proj + ".weight");
+        names.push_back(p + "attn." + proj + ".bias");
+      }
       names.push_back(p + "mlp.c_fc.weight");
       names.push_back(p + "mlp.c_fc.bias");
       names.push_back(p + "mlp.c_proj.weight");
@@ -574,6 +597,105 @@ MuseGlimmerLayerWeights LoadLayer(const TensorResolver& get, int64_t layer,
   return w;
 }
 
+// ── W4: the perception encoder ───────────────────────────────────────────────
+// The W3 tower (muse_glimmer_vision.{h,cpp}) owns HOST f32 weight structs in torch
+// storage order, so the loader's job here is a bf16 -> f32 widening plus ONE
+// structural fold: the checkpoint's separate `attn.{q,k,v}_proj` shards become the
+// tower's merged `[3*hidden, hidden]` operand. Row order is q|k|v and it is
+// load-bearing — upstream's `QKVParallelLinear` output is viewed as
+// `(tokens, 3, heads, head_dim)` and unbound on dim 1 (muse_glimmer.py:611-618),
+// so shard k landing where q is expected silently permutes the attention rather
+// than erroring.
+std::vector<float> Bf16TensorToF32(const TensorResolver& get, const std::string& name,
+                                   const std::vector<int64_t>& expect) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.dtype == "BF16",
+           "muse_glimmer vision: expected BF16 for " + name + ", got " + t.dtype);
+  VT_CHECK(t.shape.size() == expect.size(),
+           "muse_glimmer vision: rank mismatch for " + name);
+  int64_t n = 1;
+  for (size_t i = 0; i < expect.size(); ++i) {
+    VT_CHECK(t.shape[i] == expect[i],
+             "muse_glimmer vision: shape mismatch for " + name);
+    n *= expect[i];
+  }
+  VT_CHECK(t.nbytes >= static_cast<size_t>(n) * 2,
+           "muse_glimmer vision: truncated tensor " + name);
+  const auto* src = static_cast<const uint8_t*>(t.data);
+  std::vector<float> out(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    uint16_t bits = 0;
+    std::memcpy(&bits, src + static_cast<size_t>(i) * 2, sizeof(bits));
+    out[static_cast<size_t>(i)] = vt::BF16ToF32(bits);
+  }
+  MaybeReleaseSourcePages(t.data, t.nbytes);
+  return out;
+}
+
+// Concatenate the q|k|v shards along output rows into one [3*H, H] operand.
+std::vector<float> MergeQkvF32(const TensorResolver& get, const std::string& prefix,
+                               const std::string& suffix,
+                               const std::vector<int64_t>& shard_shape) {
+  std::vector<float> out;
+  for (const char* proj : {"q_proj", "k_proj", "v_proj"}) {
+    const std::vector<float> shard =
+        Bf16TensorToF32(get, prefix + proj + suffix, shard_shape);
+    out.insert(out.end(), shard.begin(), shard.end());
+  }
+  return out;
+}
+
+MuseGlimmerVisionTower LoadVisionTower(const TensorResolver& get,
+                                       const MuseGlimmerParams& params) {
+  const MuseGlimmerVisionParams& v = params.vision;
+  const int64_t VH = v.hidden_size;
+  const int64_t VI = v.intermediate_size;
+  const int64_t patch_dim = v.patch_temporal * 3 * v.patch_size * v.patch_size;
+
+  MuseGlimmerVisionTower tower;
+  tower.cfg = MuseGlimmerVisionConfigOf(params);
+  tower.encoder.conv1_w =
+      Bf16TensorToF32(get, "vision_encoder.conv1_linear.weight", {VH, patch_dim});
+  tower.encoder.pos_emb =
+      Bf16TensorToF32(get, "vision_encoder.positional_embedding_vlm",
+                      {v.pos_emb_height * v.pos_emb_width, VH});
+  tower.encoder.ln_pre_w = Bf16TensorToF32(get, "vision_encoder.ln_pre.weight", {VH});
+  tower.encoder.ln_pre_b = Bf16TensorToF32(get, "vision_encoder.ln_pre.bias", {VH});
+  tower.encoder.ln_post_w = Bf16TensorToF32(get, "vision_encoder.ln_post.weight", {VH});
+  tower.encoder.ln_post_b = Bf16TensorToF32(get, "vision_encoder.ln_post.bias", {VH});
+
+  tower.encoder.blocks.reserve(static_cast<size_t>(v.num_hidden_layers));
+  for (int64_t l = 0; l < v.num_hidden_layers; ++l) {
+    const std::string p = "vision_encoder.transformer." + std::to_string(l) + ".";
+    multimodal::MuseGlimmerVisionBlockWeights b;
+    b.ln_1_w = Bf16TensorToF32(get, p + "ln_1.weight", {VH});
+    b.ln_1_b = Bf16TensorToF32(get, p + "ln_1.bias", {VH});
+    b.ln_2_w = Bf16TensorToF32(get, p + "ln_2.weight", {VH});
+    b.ln_2_b = Bf16TensorToF32(get, p + "ln_2.bias", {VH});
+    b.qkv_w = MergeQkvF32(get, p + "attn.", ".weight", {VH, VH});
+    b.qkv_b = MergeQkvF32(get, p + "attn.", ".bias", {VH});
+    b.o_w = Bf16TensorToF32(get, p + "attn.o_proj.weight", {VH, VH});
+    b.o_b = Bf16TensorToF32(get, p + "attn.o_proj.bias", {VH});
+    b.c_fc_w = Bf16TensorToF32(get, p + "mlp.c_fc.weight", {VI, VH});
+    b.c_fc_b = Bf16TensorToF32(get, p + "mlp.c_fc.bias", {VI});
+    b.c_proj_w = Bf16TensorToF32(get, p + "mlp.c_proj.weight", {VH, VI});
+    b.c_proj_b = Bf16TensorToF32(get, p + "mlp.c_proj.bias", {VH});
+    tower.encoder.blocks.push_back(std::move(b));
+  }
+
+  // The adapter's two projections are BIAS-FREE (:1039-1040), and so is the
+  // vision_projection (:1464-1468) — enumerating a bias for either would demand a
+  // tensor the checkpoint does not ship.
+  tower.adapter.c_fc_w =
+      Bf16TensorToF32(get, "vision_adapter.c_fc.weight", {v.adapter_dim, v.output_dim});
+  tower.adapter.c_proj_w = Bf16TensorToF32(get, "vision_adapter.c_proj.weight",
+                                           {v.adapter_dim, v.adapter_dim});
+  tower.projection = Bf16TensorToF32(get, "vision_projection.weight",
+                                     {params.text.hidden_size, v.adapter_dim});
+  tower.loaded = true;
+  return tower;
+}
+
 }  // namespace
 
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
@@ -620,6 +742,12 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
   for (int64_t l = 0; l < t.num_hidden_layers; ++l)
     w.layers.push_back(LoadLayer(get, l, t.use_attn_output_gate));
   w.text_loaded = true;
+
+  // W4: the perception encoder, when the checkpoint carries one. Loaded by DEFAULT
+  // — a capability behind an opt-in flag is a capability nobody reaches. A
+  // text-only Muse Glimmer checkpoint (no `vision_config`) leaves `vision.loaded`
+  // false and the mm forward refuses BY NAME rather than reading empty vectors.
+  if (w.params.vision.present) w.vision = LoadVisionTower(get, w.params);
   return w;
 }
 

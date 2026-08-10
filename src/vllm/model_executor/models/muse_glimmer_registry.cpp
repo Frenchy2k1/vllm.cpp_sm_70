@@ -80,6 +80,25 @@ ForwardLogits ForwardMuseGlimmer(LoadedModel& model,
                                  const ModelForwardInput& input) {
   auto& mg = static_cast<MuseGlimmerLoadedModel&>(model);
   const MuseGlimmerWeights& weights = mg.weights();
+  // W4 WIRING: the MULTIMODAL branch. When ModelForwardInput.mm is set (the
+  // MuseGlimmerGenerateGreedyViaRegistry driver / the runner mm-path) the hidden
+  // stream starts from the ALREADY-MERGED inputs_embeds — text rows carrying
+  // `embed_norm`, placeholder rows carrying the projected vision soft tokens —
+  // mirroring `MuseGlimmerModel.forward`'s `inputs_embeds` branch
+  // (muse_glimmer.py:1311-1315). Positions are the 1-D ModelForwardInput::positions:
+  // Muse Glimmer has NO MRoPE and NO DeepStack, so no other mm field applies.
+  // nullopt on every text step ⇒ the text path below is byte-identical.
+  if (input.mm.has_value()) {
+    const MultiModalForwardInput& mm = *input.mm;
+    VT_CHECK(mm.inputs_embeds_bf16 != nullptr,
+             "MuseGlimmer mm forward: null merged-embeds handle on "
+             "ModelForwardInput.mm");
+    return HostLogits(
+        MuseGlimmerModel::ForwardMm(*mm.inputs_embeds_bf16, input.positions,
+                                    input.attn_meta, input.attn_kv, weights,
+                                    input.queue, input.logits_indices),
+        weights.params.text.vocab_size);
+  }
   if (input.gather_logits) {
     return MuseGlimmerModel::ForwardDevice(input.token_ids, input.positions,
                                            input.attn_meta, input.attn_kv, weights,
