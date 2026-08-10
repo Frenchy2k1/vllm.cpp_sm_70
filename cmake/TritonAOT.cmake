@@ -49,13 +49,10 @@
 # tree FAILS configuration. Shipping source and embedded cubins as an atomic
 # unit is the builder contract; regen remains a maintainer task.
 #
-# VLLM_CPP_TRITON=OFF (the default) => this file only DEFINES the options + cache
+# VLLM_CPP_TRITON=OFF => this file only DEFINES the options + cache
 # vars + the functions and does nothing else. No Python is invoked, no sources
 # are added, no compile definitions change: a build without it is byte-identical
 # to a tree that never included this file.
-
-option(VLLM_CPP_TRITON
-  "Link the vendored Triton AOT kernels (cubins embedded in C) into libvllm (CUDA-only; no Python needed)" OFF)
 
 option(VLLM_CPP_TRITON_REGEN
   "MAINTAINER: regenerate target-pinned vendored Triton AOT artifacts with Python+Triton+ptxas; see scripts/regen-triton-aot.sh" OFF)
@@ -68,6 +65,29 @@ include("${CMAKE_CURRENT_LIST_DIR}/TritonAOTMultiArch.cmake")
 # generation parameters).
 set(VLLM_CPP_TRITON_VENDORED_DIR "${CMAKE_SOURCE_DIR}/src/vt/cuda/triton_aot_vendored"
   CACHE PATH "Root of the vendored Triton AOT artifacts (per-arch subdirs)")
+
+# The default SHIPS the vendored kernels (BUILD-TRITON-DEFAULT-ON, #219): it is
+# computed, not hardcoded, so it can be ON exactly where the build can consume
+# the artifacts and OFF — quietly, naming the condition — everywhere else. The
+# rule and the matrix that pins it live in TritonAOTMultiArch.cmake /
+# TritonAOTDefaultTest.cmake. `option()` still yields to a command-line
+# -DVLLM_CPP_TRITON=..., and an EXPLICIT request keeps every existing
+# diagnostic below unchanged: only the default is allowed to degrade quietly.
+vt_triton_aot_computed_default(_vt_triton_aot_default _vt_triton_aot_decline
+  "${VLLM_CPP_CUDA}" "${VLLM_CPP_TRITON_VENDORED_DIR}" "${CMAKE_SOURCE_DIR}"
+  "${VLLM_CPP_TRITON_REGEN}")
+option(VLLM_CPP_TRITON
+  "Link the vendored Triton AOT kernels (cubins embedded in C) into libvllm (CUDA-only; no Python needed)"
+  ${_vt_triton_aot_default})
+# Report the RESOLVED value, not the computed one. A cache entry or an explicit
+# -DVLLM_CPP_TRITON=ON overrides the default, and printing "default OFF" beside
+# a cache that reads ON is simply false — which is what every maintainer regen
+# saw, since scripts/regen-triton-aot.sh passes VLLM_CPP_TRITON=ON together
+# with VLLM_CPP_TRITON_REGEN=ON.
+if(_vt_triton_aot_decline AND NOT VLLM_CPP_TRITON)
+  message(STATUS
+    "Triton AOT: default OFF — ${_vt_triton_aot_decline}")
+endif()
 
 # Arch subdir name. Empty => derived from VLLM_CPP_CUDA_ARCHITECTURES as
 # "sm_<arch>" (e.g. 121a -> sm_121a). Set explicitly for cross-arch layouts the
@@ -94,10 +114,16 @@ set(VLLM_CPP_TRITON_TARGET "" CACHE STRING
 set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES "")
 set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_DISPATCH_DECLS "")
 
-# _triton_aot_arch_name(OUTVAR) -> active vendored arch directory name.
+# _triton_aot_arch_name(OUTVAR) -> the ONE vendored arch directory this build
+# regenerates into. REACHED ONLY FROM THE MAINTAINER REGEN FLOW: the builder path
+# goes through `_triton_aot_arch_names` below, which embeds every available tree
+# and leaves the choice to exact-SM runtime dispatch. A fat builder configure is
+# therefore fine (the shipped ten-SM release archive is exactly that), and it is
+# only regeneration — writing a cubin into one directory — that needs a single
+# arch. The FATAL_ERROR below is that regen guard and its wording is unchanged.
 #
-# MULTI-ARCH (fat-binary) BUILDS ARE NOT SUPPORTED BY THE AOT TREE, and that is a
-# PROPERTY OF CUBINS, not a missing feature here. Every vendored artifact embeds
+# MULTI-ARCH (fat-binary) REGENERATION IS NOT SUPPORTED BY THE AOT TREE, and that
+# is a PROPERTY OF CUBINS, not a missing feature here. Every vendored artifact embeds
 # a cubin compiled for exactly one `sm_<cc>` target; `cuModuleLoadData` rejects it
 # on any other SM. A fat CUDA build (e.g. `-DVLLM_CPP_CUDA_ARCHITECTURES="120a;121a"`)
 # therefore has NO single correct AOT tree: pinning it to one arch would silently

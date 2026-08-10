@@ -104,6 +104,14 @@ environment:
     Online-gate manifests hash pandas package/distribution files plus Ninja and
     reject missing/drifted dependencies before the GPU lock; profiler launches
     prepend the venv `bin` to spawned EngineCore `PATH`.
+  - **Run the CUDA `ctest` suite with `-j 1`.** GB10 memory is UNIFIED, so a
+    `gpu_memory_utilization` reservation is HOST RAM: concurrent model gates
+    stack into the same ~119 GB and the kernel starts killing. Measured
+    2026-08-09 on a default-ON Triton build, `ctest -j 4` **OOM-rebooted this
+    box** (`NVRM ... Out of memory [NV_ERR_NO_MEMORY]`), which is why the
+    parallel-flake advice in the Apple/Metal profile below does not transfer
+    here. Serialising also means every other probe queues behind the suite, so
+    run attribution arms BEFORE a full suite, never during one.
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds the
     `${GPU_LOCK}` file mutex for the whole job or multi-arm series WHEN other
     agents may run GPU work concurrently (sole owner verified idle via
@@ -187,7 +195,10 @@ environment:
     does not provide, so it returns 0 and the RSS assertions cannot hold.
 
   `test_capi` and `test_openai_conformance` are ctest-PARALLELISM flakes on this
-  box (and on Linux); they pass on rerun. Prefer `ctest -j 3`.
+  box (and on Linux); they pass on rerun. Prefer `ctest -j 3` **here, on this
+  16 GB Mac mini only** — it is not general advice, and in particular the DGX
+  profile above requires `-j 1` because its unified memory OOM-reboots the box
+  under a parallel CUDA suite.
   `test_engine_core_proc` is likewise a timing flake under heavy parallel ctest:
   the case "EngineCoreProc: abort-mode shutdown aborts in-flight requests"
   (`test_engine_core_proc.cpp:315`) races the busy-loop teardown against the
