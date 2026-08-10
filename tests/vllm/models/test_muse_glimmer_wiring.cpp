@@ -781,3 +781,44 @@ TEST_CASE("MuseGlimmer: an image prompt runs through the REGISTERED mm forward")
   text_only.vision = vllm::MuseGlimmerVisionTower{};
   CHECK_THROWS(vllm::MuseGlimmerEncodePixelGroups(TinyImages(), text_only, q));
 }
+
+TEST_CASE("MuseGlimmer: ForwardMm consumes the given embeds WITHOUT re-normalizing") {
+  // The mm branch must take `inputs_embeds` straight through
+  // (muse_glimmer.py:1312-1313). Re-applying `embed_norm` there is invisible to the
+  // text-identity gate above — RMSNorm is very nearly idempotent on an already
+  // normalized row, so the text arm stays bit-identical — but it would flatten the
+  // vision soft tokens, whose magnitude is NOT unit-RMS and carries signal.
+  //
+  // The probe: scale the whole embedding block by an exact power of two. Both the
+  // embed_norm and the first `input_layernorm` are scale-invariant, so a forward
+  // that normalized its input would return IDENTICAL logits for both arms. The
+  // real forward carries the scale into the residual stream, so they must DIFFER.
+  const TempFile file(BuildSt(TinyTensors()));
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+  const HfConfig config = TinyConfig();
+  const MuseGlimmerWeights w =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, config);
+  vt::Queue q = Qcpu();
+
+  const std::vector<int32_t> ids = {5, 9, 2, 7};
+  const int64_t T = static_cast<int64_t>(ids.size());
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) positions[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+
+  const std::vector<uint16_t> base = vllm::MuseGlimmerMergeMultimodalEmbeds(ids, {}, w, q);
+  std::vector<uint16_t> scaled(base.size());
+  for (size_t i = 0; i < base.size(); ++i)
+    scaled[i] = vt::F32ToBF16(4.0f * vt::BF16ToF32(base[i]));  // exact in bf16
+
+  CachePool pa(w.params, 2, 8), pb(w.params, 2, 8);
+  const std::vector<float> la =
+      MuseGlimmerModel::ForwardMm(base, positions, PrefillMeta(T, 8), pa.attn_kv, w, q);
+  const std::vector<float> lb =
+      MuseGlimmerModel::ForwardMm(scaled, positions, PrefillMeta(T, 8), pb.attn_kv, w, q);
+  REQUIRE(la.size() == lb.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < la.size(); ++i)
+    if (std::memcmp(&la[i], &lb[i], sizeof(float)) != 0) ++differing;
+  CHECK(differing > 0);
+}
