@@ -35,7 +35,9 @@ class ReleaseIndexContract(unittest.TestCase):
         assets.mkdir()
         manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
         artifact_id = manifest["artifact"]["id"]
-        archive = assets / f"{artifact_id}.tar.gz"
+        archive = assets / (
+            f"vllm.cpp-{manifest['artifact']['version']}-{artifact_id}.tar.gz"
+        )
         manifest_path = scratch / "release-manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with tarfile.open(archive, "w:gz") as bundle:
@@ -60,6 +62,7 @@ class ReleaseIndexContract(unittest.TestCase):
             },
             "source_sha": manifest["build"]["source_commit"],
             "verified": True,
+            "version": manifest["artifact"]["version"],
         }
         return assets, handoff
 

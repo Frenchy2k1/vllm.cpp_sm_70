@@ -355,9 +355,9 @@ provenance sidecars:
 
 ```sh
 python3 scripts/validate-release-archive.py \
-  --archive vllm.cpp-0.0.2-cpu-linux-x86_64.tar.gz \
-  --checksum vllm.cpp-0.0.2-cpu-linux-x86_64.tar.gz.sha256 \
-  --provenance vllm.cpp-0.0.2-cpu-linux-x86_64.tar.gz.provenance.json \
+  --archive vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz \
+  --checksum vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256 \
+  --provenance vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.provenance.json \
   --forbid-path "$PWD/build"
 ```
 
