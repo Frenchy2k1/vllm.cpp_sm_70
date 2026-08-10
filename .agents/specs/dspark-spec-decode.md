@@ -17,7 +17,7 @@
 | Dependencies | Landed: `SPEC-DFLASH` (`DONE`), `SPEC-REJECTION` verify half, `SPEC-GDN-SEGMENTS`. External, PENDING developer authority: checkpoint downloads (2.79-8.80 GB), dgx GPU time, push/draft-PR. Blocking unknown: R1, whether the pinned oracle runs DSpark at all. |
 | Work breakdown | §4 — W1 config, W2 Markov head + draft model, W3 loader (native + Speculators), W4 speculator (anchor layout + sequential sampling), W5 runner + one-surface, W6 gates. W1-W4 are CPU-gateable. |
 | Risks/decisions | §6 — R1 oracle runnability (V2 runner), R2 Speculators format is a new subsystem, R3 the community 27B checkpoint's `attn_output_gate`, R4 the `k >= dspark_block_size` garbling trap, R5 sequential sampling vs CUDA-graph capture, R6 greedy before probabilistic, R7 GB10 host-RAM pressure. |
-| Status | W1-W5 LANDED and running end to end on a gate model; W6 OPEN — the acceptance trace shows ZERO verified draft tokens, so the drafter is inert in the engine loop (see §6b). R1 answered (§6a). |
+| Status | W1-W5 LANDED; the drafter PROPOSES correctly on real weights but the drafts are never installed by the scheduler, so nothing is verified. W6 OPEN with the break localized (see §6b). NO correctness claim. R1 answered (§6a). |
 | Goal (developer, 2026-08-09) | a FULL DSpark implementation in vllm.cpp, mirrored from vLLM |
 
 ## 0. Verdict
@@ -301,20 +301,42 @@ and the architecture (commit `56b7b607`).
 | oracle DSpark-ON | runs; its own ON and OFF texts DIVERGE mid-sequence |
 | oracle vs ours | our BASE decode already differs from the oracle's on this ad-hoc prompt, so no DSpark-attributable cross-engine claim is possible from it |
 
-**The load-bearing negative result:** re-run with `VT_SPEC_TRACE=1` printed **no
-acceptance lines at all**, i.e. `kr > 0` never held — **no draft token was ever
-verified**. So the identical ON/OFF output is NOT evidence that the speculator
-works; it is consistent with the drafter being INERT while still paying its
-cost, which is also exactly what the 5.5x slowdown looks like. Do not read
-"ON == OFF" as a correctness result until acceptance is demonstrably non-zero.
+**The load-bearing negative results, isolated with `VT_SPEC_TRACE=1`:**
 
-**Open defect (the W6 blocker):** find where the proposed drafts are dropped
-between `propose_drafts_dspark` and the next step's verify. The DFlash control
-that would have proved the trace harness itself works could NOT be run: the
-landed `MakeDflashDraftConfig` does `c.at("rope_theta")`, and the z-lab 35B
-DFlash draft carries `rope_theta` only under `rope_parameters` — a pre-existing
-gap in the DFlash lane (the 27B draft it was gated on has the top-level key),
-found incidentally here and worth its own fix.
+1. **The drafter PROPOSES correctly.** A propose-side trace prints one line per
+   step: `rows=1 nqpr=8 drafts/row=8 first=[13 198 12 2972 57590 11 11751 11]` —
+   8 plausible target-vocab ids every step, from the anchor-layout block. So W2
+   (Markov head), W3 (loader) and W4 (sequential sampler) are doing their job on
+   real weights.
+2. **The drafts NEVER REACH THE VERIFY PATH.** Zero `[SPECTRACE]` lines (the
+   verify side, `kr > 0`) and — decisively — zero `[spec-install]` lines, so
+   `Scheduler::update_draft_token_ids` is never reached at all. The break is
+   between `pending_drafts_` / `take_draft_token_ids()` and the engine's
+   `post_step` install, NOT in the drafter. That is the W6 blocker and it is
+   now localized to a three-call span.
+3. **CORRECTION to the earlier reading.** A first run showed our DSpark-ON text
+   byte-identical to our spec-OFF text, and that was reported as the
+   self-consistency half of the gate. A second run of the same binary, same
+   prompt, temperature 0, produced DIFFERENT text (" Paris.\nA. True\nB. False
+   \nAnswer:..." versus " Paris, a city renowned for..."). So the ON path is
+   NOT deterministic and the identity was a single-run coincidence, not a
+   property. No correctness claim of any kind survives; the earlier one is
+   withdrawn. A plausible mechanism to check first: enabling the aux multi-tap
+   routes the target through `ForwardDeviceMultiTap`, and that path may not be
+   numerically neutral on the 35B MoE NVFP4 the way it is on the gated 27B.
+4. **Speed** is 6.78 vs 37.34 tok/s (5.5x slower) — what paying for a drafter
+   whose output is discarded looks like.
+
+**Open defect (the W6 blocker):** find why `take_draft_token_ids()` ->
+`EngineCore::post_step` -> `update_draft_token_ids` never installs the proposed
+drafts. `check_for_draft_tokens_` is `resolved_spec_config_.has_value()` and the
+dspark branch of `ResolveSpecConfig` does return a config, so the next probes
+are (a) whether `post_step` runs at all on this path, and (b) whether
+`pending_drafts_` survives to the pull. The DFlash control that would have shown
+whether the same wiring works for the landed lane could NOT be run: the landed
+`MakeDflashDraftConfig` does `c.at("rope_theta")` and the z-lab 35B DFlash draft
+carries `rope_theta` only under `rope_parameters` — a pre-existing gap in the
+DFlash lane, found incidentally, worth its own fix.
 
 ## 7. Evidence, authority, stop conditions
 

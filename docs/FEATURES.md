@@ -183,7 +183,7 @@ the registered engine forward.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| DSpark (semi-autoregressive block drafter) | ☐ **runs on the 35B gate model, drafter still inert** ([spec](../.agents/specs/dspark-spec-decode.md)): zero verified draft tokens, spec-on 5.5x slower; no claim | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ☐ **proposes, but the drafts are never installed** ([spec](../.agents/specs/dspark-spec-decode.md)): zero verified tokens, output not deterministic, 5.5x slower; no claim | ✅ | ◐ |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
