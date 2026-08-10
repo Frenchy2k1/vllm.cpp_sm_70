@@ -1537,6 +1537,25 @@ public-doc change. Does NOT touch the roadmap issue table — PR #235 already
 registers #231 there and duplicating the row would guarantee a keyed-record
 conflict.
 
+**`CLAIM-SAMPLE-LOGPROB-TOKEN-IDS` (`SAMPLE-LOGPROB-TOKEN-IDS`, 2026-08-10, issue
+#264).** Claude Code (claude-opus-5), helper role, isolated worktree
+`/home/mudler/_git/vllm.cpp-token-ids`, branch `row/SAMPLE-LOGPROB-TOKEN-IDS`,
+base `origin/main` `e63d11d3` pinned at worktree creation. Spec
+[logprob-token-ids.md](specs/logprob-token-ids.md). NOT in the claims table
+below: that table keys `SPIKE`/`ACTIVE` rows and this row lands `PARTIAL`
+(`INVENTORIED` -> `PARTIAL`), because its `logprobs_mode` half stays unported.
+Scope: `SamplingParams::logprob_token_ids` + `num_logprobs()` + its two
+validations; the `InputBatch` req_id-keyed map and its `make_sampling_metadata`
+emission; `GatherSpecificTokenLogprobs` + the snapshot/precedence wiring in
+`sampler.cpp`; the two `num_logprobs`-property consumers (`scheduler.cpp:920`,
+`logprobs.cpp:35`); cases in `test_sampler.cpp` / `test_input_batch.cpp` /
+`test_sampling_params.cpp` / `test_llm_engine.cpp`; the row + its docs
+checkpoint; this claim; the #264 roadmap intake row. CPU-only; NO kernel, vt op,
+C ABI, CMake, model file, GPU or download. **Textual overlap warning:** open PR
+#258 (`logprobs_mode`) edits the same snapshot block in `sampler.cpp`; whichever
+lands second rebases. Does NOT touch `GatherLogprobs` — issue #249's unbounded
+`k` is a separate row.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-SPEC-DSPARK` | `SPEC-DSPARK` (`ACTIVE`) | Claude Code (opus-5), helper role | isolated worktree `/home/mudler/_git/vllm.cpp-spec-dspark`; CPU-only so far, NO build, NO GPU, NO download | `row/SPEC-DSPARK`, base `origin/main` `bc6e3d72`; NOT PUSHED, no PR yet (remote step PENDING developer authority) | The DSpark spike, records-only in this commit: NEW `.agents/specs/dspark-spec-decode.md`, the `SPEC-DSPARK` engine-matrix row + section/total counters, the feature-matrix §8 DSpark row, the superseded grounding-note header, this claim, `.agents/NOW.md`, and the `docs/STATUS.md`/`docs/FEATURES.md`/`docs/BENCHMARKS.md` one-liners. **NON-COLLISION:** touches NO `src/`, `include/`, `tests/`, `examples/` or CMake path. Implementation slices W1-W6 follow under this same claim. | `ACTIVE` | 2026-08-09 — spike committed. DSpark = the landed DFlash lane + Markov logit-bias head + sequential block sampling + anchor-as-first-prediction layout + `d2t` reduced vocab + method/config resolution + Speculators-format translation; upstream surface is 1613 lines over 5 files, 3 of them DFlash subclasses. Draft checkpoints exist for both gate models and for the 4B pair the upstream test uses; DeepSeek-V4 DSpark is out of scope (HW-blocked). NEXT: W1 config slice (CPU, RED = `speculative.cpp:44` rejects `"dspark"` today) and R1, prove the pinned oracle `555967922` actually RUNS DSpark (it forces the V2 runner). PENDING developer authority: checkpoint downloads, dgx GPU time, push/draft-PR. |
