@@ -8,6 +8,8 @@
   "upstream_anchor": "vllm#51655 head 075d645af",
   "torch_version": "2.11.0+cu130",
   "device": "cpu",
+  "_device_cross_check": "The same script, same checkpoint, same prompt, rerun with --device cuda on a GB10 (dgx.casa, torch 2.11.0+cu130) at full 52-layer depth produced the IDENTICAL argmax stream, and its per-layer |x| trace matched the CPU run to 4 decimal places. The reference is therefore not an artifact of one accumulation path: x86 CPU torch, GB10 CUDA torch, and our C++ CPU forward all agree on these five ids.",
+  "_reference_not_oracle": "All three of those paths are still transcriptions or ports of the SAME upstream source (vllm#51655). They rule out a large class of porting defects; they cannot rule out a shared misreading of #51655. Only Meta's own runtime, or the merged upstream, can do that.",
   "prompt": "The capital of France is",
   "token_ids": [954, 7963, 323, 11698, 373],
   "positions": [0, 1, 2, 3, 4],
