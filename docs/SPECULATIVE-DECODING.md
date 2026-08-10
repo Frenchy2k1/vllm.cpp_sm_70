@@ -33,11 +33,12 @@ Current state (`SPEC-DSPARK`): the config, the Markov head and draft model, both
 published checkpoint layouts (native `deepseek-ai/dspark_qwen3_*` and
 Speculators `RedHatAI/*.dspark`), the sequential sampler and the runner wiring
 have landed, and the path runs end to end on the Qwen3.6-35B-A3B gate model.
-**It is not working yet:** an acceptance trace of that run shows zero verified
-draft tokens, so the drafter is inert in the engine loop, and speculation is
-5.5x slower than plain decode. No correctness or speed number is claimed. A GGUF
-target, and a target architecture with no aux multi-tap, are both refused by
-name.
+**It is not working yet.** Tracing shows the drafter proposes eight plausible
+tokens every step, but none of them are ever installed on the scheduler or
+verified, speculation is 5.5x slower than plain decode, and the speculative-on
+output is not stable run to run. No correctness or speed number is claimed. A
+GGUF target, and a target architecture with no aux multi-tap, are both refused
+by name.
 
 ```bash
 main --model /models/Qwen3-4B \

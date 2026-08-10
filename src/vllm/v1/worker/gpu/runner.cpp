@@ -2115,6 +2115,14 @@ void GPUModelRunner::propose_drafts_block(
   for (int i = 0; i < num_reqs; ++i)
     out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
 
+  // VT_SPEC_TRACE=1: how many rows actually proposed this step, and what the
+  // first row's drafts were. The aggregate acceptance trace on the VERIFY side
+  // cannot distinguish "proposed nothing" from "proposed and everything was
+  // rejected", which is exactly the question the first DSpark e2e raised.
+  static const bool propose_trace = [] {
+    const char* v = std::getenv("VT_SPEC_TRACE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
     // D11 A-wire: run the block forward straight off the per-request DEVICE stores
@@ -2141,6 +2149,19 @@ void GPUModelRunner::propose_drafts_block(
       const int row = propose_rows[static_cast<size_t>(r)];
       out.draft_token_ids[static_cast<size_t>(row)] = drafts[static_cast<size_t>(r)];
     }
+    if (propose_trace) {
+      std::string first;
+      for (int32_t id : drafts[0]) {
+        first += std::to_string(id);
+        first += ' ';
+      }
+      std::fprintf(stderr, "[spec-propose] rows=%d nqpr=%d drafts/row=%zu first=[%s]\n",
+                   P, num_query_per_req, drafts[0].size(), first.c_str());
+    }
+  }
+  if (propose_trace && propose_rows.empty()) {
+    std::fprintf(stderr, "[spec-propose] NO proposing rows this step (num_reqs=%d)\n",
+                 num_reqs);
   }
   pending_drafts_ = std::move(out);
 }
