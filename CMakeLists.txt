@@ -515,8 +515,22 @@ if(VLLM_CPP_CUDA)
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
+    # SOURCE_SUBDIR names a directory that does not exist IN CUTLASS ON PURPOSE.
+    # That is the documented way to tell FetchContent "populate, but do not
+    # add_subdirectory": we consume CUTLASS as HEADERS ONLY — every consumer
+    # below `-isystem`s ${VLLM_CPP_CUTLASS_DIR}/include and nothing in this tree
+    # links a CUTLASS CMake target — so configuring CUTLASS's own build system
+    # buys nothing and can only fail.
+    #
+    # And it does fail. Building for sm_80 with CUDA 13 dies inside CUTLASS's
+    # tools/library with duplicate sm_100f flags, which forced the A100 reporter
+    # to add -DCUTLASS_ENABLE_TOOLS=OFF by hand before they could get to the
+    # actual bugs (issue #193). Not configuring those targets at all is both the
+    # narrower fix and the faster configure: the tools/library/examples/tests
+    # trees are the bulk of what add_subdirectory would walk.
     FetchContent_Declare(cutlass GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-      GIT_TAG v4.5.0 GIT_SHALLOW ON)
+      GIT_TAG v4.5.0 GIT_SHALLOW ON
+      SOURCE_SUBDIR vllm-cpp-consumes-cutlass-headers-only)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
