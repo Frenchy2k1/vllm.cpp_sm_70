@@ -235,6 +235,15 @@ def audit() -> list[dict]:
 # section carries `python3 scripts/check-site.py` and `hugo --minify`, both of
 # which genuinely fail on a broken site, so it is credited on arrival rather
 # than pinned as gates-no-command. Issue #224.
+# 2026-08-10: +LORA-RUNTIME enters the runnable population. It did not gain a
+# gate; it re-entered the AUDITED population when the row went back to `ACTIVE`
+# for W2 (issue #278) after the 2026-08-04 triage parked it at ANCHOR-BACKFILL.
+# Its only pre-existing credit was the UPSTREAM path
+# `tests/lora/test_qwen35_densemodel_lora.py` named in prose as the eventual
+# model gate -- one of the weak credits described above. The same change adds
+# the row's REAL invocation (the CPU configure/build plus
+# `ctest -R test_punica_cpu` and `ctest -R test_lora_layers`), so the pin rests
+# on a command that genuinely fails when the row regresses.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
     "ATTN-ROPE-FAMILY",
@@ -248,6 +257,7 @@ RUNNABLE_BASELINE = frozenset({
     "ENG-LOAD-DIRECT-UPLOAD",
     "ENG-PRIORITY-SCHED",
     "KERNEL-GEMM-CPU-ELEM",
+    "LORA-RUNTIME",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
     # ARCH-ONE-SURFACE ROW 6 (2026-08-08): SERVE remains gated, while the

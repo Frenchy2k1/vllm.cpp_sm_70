@@ -475,7 +475,11 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            "chars": 243578,
+            # Lowered 2026-08-10 with the ratchet it guards (LoRA W2, #278):
+            # the STATUS LoRA row now covers W1+W2 in fewer bytes than it spent
+            # on W1 alone. The ceiling moves down in the SAME change, never
+            # after it.
+            "chars": 243482,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,

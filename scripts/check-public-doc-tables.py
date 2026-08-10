@@ -491,7 +491,12 @@ STATUS_RATCHET = {
     # ~100% GPU-busy reading) into the binding result, both of which are now
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
-    "chars": 243542,
+    # 2026-08-10 (LoRA W2, issue #278): the LoRA row now covers W1+W2 in fewer
+    # bytes than it used to spend on W1 alone -- the W1 component list collapsed
+    # to the two names that matter and the W2 additions replaced the "named
+    # W2-W7" enumeration. Re-pinned byte-tight against the merged page so the
+    # reduction cannot become untracked growth headroom.
+    "chars": 243482,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
