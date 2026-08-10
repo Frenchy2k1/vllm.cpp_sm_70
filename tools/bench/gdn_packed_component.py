@@ -1556,7 +1556,7 @@ def _validate_execution(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, 
             raise HarnessError("component execution snapshot artifact path differs")
 
     server = resolved["server"]
-    if server.name != "server" or server.parent.name != "examples":
+    if server.name not in ("vllm-server", "server") or server.parent.name != "examples":
         raise HarnessError("component execution server path differs")
     build_dir = server.parents[1]
     expected_paths = {
