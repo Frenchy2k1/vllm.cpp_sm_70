@@ -107,21 +107,14 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 | vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
 
 **There is no isolated c2/c8 weakness.** Binding grid at `a0fa12c7`
-(2026-08-10), 3 reps, oracle vLLM 0.25.0, binding-eligible 12/12. The prior
-record carried c2 0.87x and c8 0.92x as two "weak cells with wider spread", but
-those came from a different harness (absolute tok/s ~8x apart from this table's)
-and were never comparable to these ratios. The real deficit is a flat mid-band:
-c1 and c32 strongest, c2 to c16 all within 0.935x to 0.949x, every point under
-0.81% CoV on BOTH engines, so the ~6% at c2 is ~8x the noise. Detail in
+(2026-08-10), 3 reps, binding-eligible 12/12; the prior c2 0.87x / c8 0.92x
+"weak cells" came from a different harness and were never comparable. The deficit
+is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on both
+engines) and is entirely MARGINAL per-token work, since our FIXED per-step cost
+already beats vLLM (9.02 ms against 9.43 ms). The marlin block-size lever is
+REFUTED by same-binary A/B (block 8 at c8 is 1.16% SLOWER; c4 control +0.29%).
+Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**. Detail in
 `.agents/benchmark-record.md`.
-
-The c4 1.025x win recorded 2026-08-05 at `1ea26427` did not reproduce here, and
-mean TTFT at c2 (0.872x) is the sharpest single-axis outlier. Memory passes
-decisively on the same run: peak PSS 3.34 GiB against vLLM's 12.72 GiB
-(**3.81x**), peak GPU 50.1 GiB against 70.4 GiB (**1.40x**). The c16 drain-sync
-lever was measured NEGATIVE (-1.9%) on 2026-08-05: the cost is the depth-2
-serialization the drain guards, not driver-lock spin, so the byte-exact full
-drain is **kept**.
 
 **Device-resident sampled tokens on integrated (`VT_ASYNC_DEVICE_MIRROR`) A/B'd
 2026-08-06, speed-NEUTRAL** (same-binary): c16 OFF median 2305.8 vs ON 2303.3
