@@ -17,6 +17,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -1230,6 +1231,62 @@ TEST_CASE("serving_chat: logprobs=true returns per-token ChatCompletionLogProbs"
   const json body = json(*res.response);
   CHECK(body["choices"][0]["logprobs"]["content"].size() ==
         static_cast<size_t>(kN));
+}
+
+// ─── (c3) chat top_logprobs=-1 ("all") runs end-to-end (issue #231) ──────────
+// Upstream deliberately admits `-1` on the CHAT surface
+// (chat_completion/protocol.py:785-796, "`top_logprobs` must be a positive value
+// or -1"), and our stack already carried both ends of it:
+// ChatCompletionRequest::to_sampling_params (protocol.cpp:562) maps
+// `top_logprobs` straight into `sp.logprobs`, and ChatTopLogprobs
+// (serving_utils.cpp:165) reads `-1` as "keep every entry". The middle was
+// broken — the sentinel reached the sampler's raw-vocab arm and the engine
+// SIGSEGVed in LogprobsTensors::slice_request — so this whole path was
+// unreachable in practice. The admission-time widening makes it real, and this
+// case pins it end-to-end over the HTTP request object.
+TEST_CASE("serving_chat: top_logprobs=-1 returns every vocab entry per token") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 3;
+
+  Harness h(c, w, tok);
+  OpenAIServingChat serving(h.engine, "test-model", InVocabChatPrompt);
+
+  ChatCompletionRequest req = MakeChatRequest(
+      {ChatMessage{"user", std::string("hello")}}, kN, /*stream=*/false);
+  req.logprobs = true;
+  req.top_logprobs = -1;  // "all"
+  ChatCompletionResult res = serving.create_chat_completion(req);
+
+  REQUIRE(res.response.has_value());
+  REQUIRE(res.response->choices.size() == 1);
+  const auto& choice = res.response->choices[0];
+  REQUIRE(choice.logprobs.has_value());
+  REQUIRE(choice.logprobs->content.has_value());
+  const auto& content = *choice.logprobs->content;
+  REQUIRE(content.size() == static_cast<size_t>(kN));
+  for (const auto& item : content) {
+    CHECK_FALSE(item.token.empty());
+    CHECK(item.logprob <= 0.0f);
+    // "All" is every vocab id, exactly once — not the 2 a finite request gets.
+    CHECK(item.top_logprobs.size() == static_cast<size_t>(kVocab));
+    double mass = 0.0;
+    std::set<std::string> distinct;
+    for (const auto& e : item.top_logprobs) {
+      mass += std::exp(static_cast<double>(e.logprob));
+      distinct.insert(e.token);
+    }
+    CHECK(distinct.size() == static_cast<size_t>(kVocab));
+    CHECK(mass == doctest::Approx(1.0).epsilon(1e-4));
+  }
+  // And it serializes: the content array is present and each entry carries the
+  // full set.
+  const json body = json(*res.response);
+  CHECK(body["choices"][0]["logprobs"]["content"].size() ==
+        static_cast<size_t>(kN));
+  CHECK(body["choices"][0]["logprobs"]["content"][0]["top_logprobs"].size() ==
+        static_cast<size_t>(kVocab));
 }
 
 // ─── (d) Streaming chat → role delta, content deltas, finish, [DONE] ─────────

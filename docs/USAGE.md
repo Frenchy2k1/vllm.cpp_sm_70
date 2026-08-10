@@ -346,6 +346,12 @@ MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
 throughput changes; the routed experts still use the grouped MoE kernel, which
 is where they belong.
 
+The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
+f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
+bf16 in-kernel — which is exact — and re-round through bf16 on store, so the
+f32 form was writing and re-reading a whole `[T,H]` buffer for a value it
+already had. The change is bit-identical and worth **+2.05% at c8**.
+
 ### The NVFP4 output head
 
 On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
@@ -454,7 +460,7 @@ Registered in
 | GET | `/health` | Process liveness (200) |
 | GET, POST | `/ping` | Liveness probe (200, mirrors `/health`) |
 | GET | `/version` | Engine version |
-| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4) |
+| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4), recorded per engine step by the engine that serves your requests |
 | POST | `/tokenize` | Tokenize a `prompt` to token ids (optional `token_strs`) |
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
@@ -882,7 +888,16 @@ which carries no ggml or PyTorch dependency.
 
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
-per position. (Over HTTP the OpenAI `logprobs` field keeps its own 0..5 range.)
+per position.
+
+Over HTTP the same `-1` reaches the chat surface: `{"logprobs": true,
+"top_logprobs": -1}` is accepted, as in vLLM, and returns every vocab entry for
+each generated token. No numeric range is enforced on either surface — vLLM's
+`check_logprobs` request validation and its `max_logprobs` model cap are not
+ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
+returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
+count is not rejected. Both are tracked by
+[issue #249](https://github.com/mudler/vllm.cpp/issues/249).
 
 ## Multimodal input (image, video, audio to text)
 

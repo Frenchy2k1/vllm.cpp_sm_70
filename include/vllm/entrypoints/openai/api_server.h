@@ -348,14 +348,16 @@ class ApiServer {
 //     the abort-ALL (empty request_ids) path is a NAMED RESIDUAL — AsyncLLM
 //     exposes no active-request-id enumeration, so empty ids abort nothing and
 //     report 0 (explicit-id abort is the supported production path).
-//   /metrics, /reset_prefix_cache — NOT wired (deliberate, honest residuals).
-//     The production frontend is AsyncLLM (main.cpp: loaded->async_engine()),
-//     whose output handler records no iteration/scheduler stats to any
-//     PrometheusStatLogger (async stats deferred, specs/async-serving.md) and
-//     neither LoadedEngine nor AsyncLLM constructs/exposes one; and
+//   /metrics — wired by the CALLER, not here, because the caller owns the
+//     PrometheusStatLogger's lifetime: server_main.cpp constructs one under
+//     --enable-metrics, attaches it to both frontends (including the production
+//     AsyncLLM, whose output handler folds each step's SchedulerStats +
+//     IterationStats into it since #277 — specs/async-metrics.md) and hands it
+//     to set_metrics_logger. Without --enable-metrics the route stays 404.
+//   /reset_prefix_cache — NOT wired (deliberate, honest residual).
 //     reset_prefix_cache() lives only on the scheduler's KVCacheManager, mutated
 //     exclusively on the EngineCore engine thread with no thread-safe RPC.
-//     Attaching either backing from main.cpp would be a fabricated wiring that
+//     Attaching a backing from main.cpp would be a fabricated wiring that
 //     never reaches the live engine, so it is left unwired and named in
 //     specs/{utility,admin}-endpoints.md.
 struct UtilityEndpointOptions {

@@ -340,14 +340,18 @@ void QkvSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, c
 // ---------------------------------------------------------------------------
 // shared_expert_gate: out[t,c] = bf16(sigmoid(gl[t]) * sd[t*H+c]). Thread per
 // output element (flat idx over T*H); the token index t = idx / H picks gl[t].
-__global__ void SharedExpertGateKernel(__nv_bfloat16* out, const float* sd, const float* gl,
+// sd is read through T: f32, or the bf16 the down-proj GEMM actually produced.
+// Widening bf16 in-kernel is EXACT and the store is bf16 either way, so the two
+// forms are bit-identical; the bf16 one skips a full [T,H] f32 cast + reread.
+template <typename T>
+__global__ void SharedExpertGateKernel(__nv_bfloat16* out, const T* sd, const float* gl,
                                        int64_t t, int64_t h) {
   const int64_t n = t * h;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
        idx += step) {
     const int64_t row = idx / h;
-    Store(out, idx, SigmoidF(gl[row]) * sd[idx]);
+    Store(out, idx, SigmoidF(gl[row]) * Load(sd, idx));
   }
 }
 
@@ -355,9 +359,13 @@ void SharedExpertGateKernelCuda(Queue& q, Tensor& out, const Tensor& sd, const T
   const int64_t t = out.shape[0], h = out.shape[1];
   const int64_t n = t * h;
   if (n == 0) return;
-  SharedExpertGateKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(out.Ptr<__nv_bfloat16>(),
-                                                                 sd.Ptr<float>(), gl.Ptr<float>(),
-                                                                 t, h);
+  if (sd.dtype == DType::kBF16) {
+    SharedExpertGateKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<__nv_bfloat16>(), sd.Ptr<__nv_bfloat16>(), gl.Ptr<float>(), t, h);
+  } else {
+    SharedExpertGateKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<__nv_bfloat16>(), sd.Ptr<float>(), gl.Ptr<float>(), t, h);
+  }
   Check(cudaGetLastError(), "shared_expert_gate launch");
 }
 

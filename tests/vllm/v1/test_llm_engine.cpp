@@ -1003,6 +1003,153 @@ TEST_CASE("llm_engine: per-request queue/prefill/inference timing populates") {
   CHECK(queue_sum > 0.0);
 }
 
+// ─── 7b. The SAME invariants on the ASYNC serving path (SERVE-METRICS, #277) ──
+// Cases 6 and 7 drive `LLMEngine`. The shipped server does not: it serves from
+// `AsyncLLM` (server_main.cpp -> loaded->async_engine()), whose output handler
+// folded nothing into any logger — so a real deployment scraped a well-formed
+// `vllm:*` catalog whose series never moved, which reads as "idle" rather than
+// as "missing". This drives the ASYNC stack over the identical model, prompts
+// and sampling params as case 6 and asserts the identical invariants, plus case
+// 7's per-request timing algebra.
+//
+// Mirrors async_llm.py:662-665 (build IterationStats), :676-678 (thread it into
+// process_outputs) and :697-702 (fold it + scheduler_stats into the logger).
+//
+// The scrape happens after `shutdown()` joins the output-handler thread. That is
+// the quiescence point: unlike upstream's asyncio handler — which runs to its
+// next `await` before a woken consumer resumes, so `record()` always precedes
+// the consumer — our handler is a real thread, and a drained collector says
+// nothing about whether the fold for that step has retired.
+//
+// RED before the wiring: every value below is 0 (the primed schema, not counts).
+TEST_CASE("async_llm: live per-step stats populate the Prometheus registry") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 4;  // max_tokens per request (length stop), as in case 6.
+
+  AsyncHarness h(c, w, tok);
+  PrometheusStatLogger logger("m", kMaxModelLen);
+  h.engine.set_stat_logger(&logger);
+
+  const std::string kRun = std::string("vllm:num_requests_running") + kL;
+  const std::string kWait = std::string("vllm:num_requests_waiting") + kL;
+  const std::string kPrompt = std::string("vllm:prompt_tokens_total") + kL;
+  const std::string kGen = std::string("vllm:generation_tokens_total") + kL;
+  const std::string kSuccessLen =
+      "vllm:request_success_total{model_name=\"m\",engine=\"0\",finished_reason="
+      "\"length\"}";
+  const char* kQueue = "vllm:request_queue_time_seconds";
+  const char* kPrefill = "vllm:request_prefill_time_seconds";
+  const char* kInference = "vllm:request_inference_time_seconds";
+  const char* kDecode = "vllm:request_decode_time_seconds";
+  const char* kE2E = "vllm:e2e_request_latency_seconds";
+
+  // Baseline: primed at zero — exactly the state a production scrape saw.
+  {
+    const std::string t = logger.Expose();
+    CHECK(MetricValue(t, kPrompt) == 0.0);
+    CHECK(MetricValue(t, kGen) == 0.0);
+    CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 0);
+    CHECK(HistogramCount(t, kE2E) == 0);
+    CHECK(HistogramSum(t, kQueue) == 0.0);
+  }
+
+  // Both requests are admitted before either is drained, so they share the
+  // prefill step exactly as case 6's pair does.
+  vllm::v1::AsyncRequest a =
+      h.engine.add_request("A", std::string("hello"), Greedy(kN));
+  vllm::v1::AsyncRequest b =
+      h.engine.add_request("B", std::string("hello"), Greedy(kN));
+
+  int64_t total_gen = 0;
+  for (const vllm::v1::AsyncRequest* r : {&a, &b}) {
+    for (;;) {
+      const RequestOutput o = h.engine.get_output(*r);
+      REQUIRE(o.outputs.size() == 1);
+      if (o.finished) {
+        total_gen += static_cast<int64_t>(o.outputs[0].token_ids.size());
+        break;
+      }
+    }
+  }
+  CHECK(total_gen == 2 * kN);  // deterministic greedy, length-stopped.
+
+  // Join the output handler: every fold for every step has now retired.
+  h.engine.shutdown();
+
+  const std::string t = logger.Expose();
+  // Token counters == the EXACT counts the run produced (case 6's invariant).
+  CHECK(MetricValue(t, kPrompt) == 2.0);  // 1 token per "hello" x2 prefilled.
+  CHECK(MetricValue(t, kGen) == static_cast<double>(total_gen));
+  // Both requests finished with the "length" reason.
+  CHECK(MetricValue(t, kSuccessLen) == 2.0);
+  // All requests drained: the gauges track the batch back down to zero.
+  CHECK(MetricValue(t, kRun) == 0.0);
+  CHECK(MetricValue(t, kWait) == 0.0);
+  // Histogram sample counts: TTFT once per request; ITL once per decode token;
+  // e2e + TPOT once per finished request.
+  CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:inter_token_latency_seconds") == 2 * (kN - 1));
+  CHECK(HistogramCount(t, kE2E) == 2);
+  CHECK(HistogramCount(t, "vllm:request_time_per_output_token_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:iteration_tokens_total") >= 1);
+  CHECK(HistogramCount(t, "vllm:request_generation_tokens") == 2);
+
+  // Case 7's invariant on the async path: the per-request timing intervals are
+  // real positive durations, and inference == prefill + decode.
+  CHECK(HistogramCount(t, kQueue) == 2);
+  CHECK(HistogramCount(t, kPrefill) == 2);
+  CHECK(HistogramCount(t, kInference) == 2);
+  const double queue_sum = HistogramSum(t, kQueue);
+  const double prefill_sum = HistogramSum(t, kPrefill);
+  const double inference_sum = HistogramSum(t, kInference);
+  const double decode_sum = HistogramSum(t, kDecode);
+  const double e2e_sum = HistogramSum(t, kE2E);
+  CHECK(queue_sum > 0.0);
+  CHECK(prefill_sum > 0.0);
+  CHECK(inference_sum > 0.0);
+  CHECK(decode_sum > 0.0);
+  CHECK(e2e_sum > 0.0);
+  CHECK(inference_sum == doctest::Approx(prefill_sum + decode_sum));
+  CHECK(inference_sum <= e2e_sum);
+  CHECK(prefill_sum <= inference_sum);
+  // TTFT is measured from the engine-core timestamp, so it must be positive —
+  // a zero/unstamped timestamp reports it as -arrival_time.
+  CHECK(HistogramSum(t, "vllm:time_to_first_token_seconds") > 0.0);
+}
+
+// The DEFAULT async path — no logger attached — must stay byte-identical. This
+// is the whole inertness claim: the fold is opt-in, so an engine with no logger
+// takes the same no-stats process_outputs call it took before this row.
+TEST_CASE("async_llm: with no logger attached the token stream is unchanged") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 6;
+
+  std::vector<int32_t> with_logger;
+  {
+    AsyncHarness h(c, w, tok);
+    PrometheusStatLogger logger("m", kMaxModelLen);
+    h.engine.set_stat_logger(&logger);
+    const RequestOutput r =
+        h.engine.generate(std::string("hello"), Greedy(kN), "req");
+    REQUIRE(r.outputs.size() == 1);
+    with_logger = r.outputs[0].token_ids;
+  }
+  std::vector<int32_t> without_logger;
+  {
+    AsyncHarness h(c, w, tok);
+    const RequestOutput r =
+        h.engine.generate(std::string("hello"), Greedy(kN), "req");
+    REQUIRE(r.outputs.size() == 1);
+    without_logger = r.outputs[0].token_ids;
+  }
+  CHECK(with_logger.size() == static_cast<std::size_t>(kN));
+  CHECK(with_logger == without_logger);
+}
+
 // ─── ENG-ASYNC-SCHED depth-2 serving-path e2e (heap-corruption regression) ────
 // Full production-server stack (LoadedEngine -> AsyncLLM -> InprocClient ->
 // EngineCoreProc::run_busy_loop -> step_with_batch_queue, mcb=2) over the MoE
@@ -1053,13 +1200,18 @@ TEST_CASE("llm_engine: async depth-2 serving generates past ignore_eos (no corru
 
 // ─── 8. logprobs=-1 reaches the client intact (issue #231) ───────────────────
 // "All logprobs". The sampler has a `num_logprobs == -1` branch that returns a
-// raw-vocab LogprobsTensors with EMPTY ids and ranks (1:1 sampler.py:122-125),
-// and LogprobsProcessor::UpdateSampleLogprobs indexes all three arrays — so a
-// live request that reached that branch segfaulted. Upstream never reaches it,
+// raw-vocab LogprobsTensors with EMPTY ids and ranks (1:1 sampler.py:122-125)
+// while `num_tokens_per_position` is the full vocab — so a live request that
+// reached that branch died in the FIRST thing to touch the tensor:
+// LogprobsTensors::slice_request (src/vllm/v1/outputs.cpp:31-37), called from
+// scheduler.cpp:920-924, which assigns a num_positions*vocab range out of the
+// two empty vectors' null begin(). LogprobsProcessor::UpdateSampleLogprobs
+// (src/vllm/v1/engine/logprobs.cpp:51-77) indexes the same two arrays and would
+// fault identically, but the process never gets there. Upstream reaches neither,
 // because gpu_input_batch.py:434-440 widens the sentinel to vocab_size at
 // admission; we propagated it instead.
 //
-// RED before the widening: SIGSEGV inside UpdateSampleLogprobs.
+// RED before the widening: SIGSEGV inside LogprobsTensors::slice_request.
 TEST_CASE("llm_engine: logprobs=-1 returns a full-vocab logprobs dict") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -1093,9 +1245,20 @@ TEST_CASE("llm_engine: logprobs=-1 returns a full-vocab logprobs dict") {
   }
 }
 
-// A finite count is unchanged by the widening: k+1 entries, deduped when the
-// sampled token is itself in the top-k. Guards the ordinary path against a
-// regression in the same edit.
+// A finite count is unchanged by the widening. The gathered row is
+// [sampled | top-2], k+1 == 3 wide; greedy makes the sampled token the rank-1
+// entry, so the dict-dedup collapses it to EXACTLY 2 distinct ids at rank 1 and
+// rank 2. Asserted exactly, not as a `>= 1 && <= 3` range, which any narrower or
+// empty-ish row would also satisfy.
+//
+// What this case deliberately does NOT claim to cover: the SAMPLER-side gather
+// width. AppendLogprobsForNextPosition (logprobs.h:82) truncates to the
+// REQUEST's own num_logprobs, so widening every request to vocab_size leaves the
+// client-visible payload byte-identical — no engine-level assertion can see it.
+// That width is pinned where it is observable, at the input-batch seam:
+// tests/vllm/v1/worker/test_input_batch.cpp:641 (`max_num_logprobs == 4` for a
+// finite request) and :687 (`num_logprobs.at("a") == 3`); mutating add_request to
+// widen unconditionally turns both RED.
 TEST_CASE("llm_engine: a finite logprobs count is unaffected by the -1 widening") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -1108,8 +1271,11 @@ TEST_CASE("llm_engine: a finite logprobs count is unaffected by the -1 widening"
 
   REQUIRE(r.outputs.size() == 1);
   REQUIRE(r.outputs[0].logprobs.has_value());
-  for (const vllm::LogprobsOnePosition& pos : *r.outputs[0].logprobs) {
-    CHECK(pos.entries.size() >= 1);
-    CHECK(pos.entries.size() <= 3);  // sampled + 2, deduped
+  for (std::size_t i = 0; i < r.outputs[0].logprobs->size(); ++i) {
+    const vllm::LogprobsOnePosition& pos = (*r.outputs[0].logprobs)[i];
+    CHECK(pos.entries.size() == 2u);  // sampled(==top-1) + top-2
+    const vllm::Logprob* self = pos.find(r.outputs[0].token_ids[i]);
+    REQUIRE(self != nullptr);
+    CHECK(self->rank == 1);  // greedy -> the sampled token IS the argmax
   }
 }
