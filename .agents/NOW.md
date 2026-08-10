@@ -18,7 +18,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | 27B NVFP4 @`0893e160` | **0.72x -> 0.85x**: FP8 tower native, tokens MATCH, RSS -3.2 GiB | NVFP4 MLP marlin, 68% of roof |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%), a GATE model | Fold into the 35B lever |
 | Invocation-parity prevention | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **bf16 shards STREAM both towers; Q4_K_M cos 0.9975, DIFFUSE** | render A/B on saved embeds |
+| MiniMax-H3 lane | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; grouped router parallelised, e2e NOT ESTABLISHED | ckpt is tiktoken-only: no warm server |
 | 35B fresh grid | @`491c2f1e`: warp-shuffle router LANDED, **c1/c4 now 0.98x**, c2 0.87x, c8 0.92x | `CastF32` 3.1%; tighten c2/c8 spreads |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; sealed-vLLM tput 1.021x PASS; latency/VRAM OPEN | Spike residual 1.609x conv gap |

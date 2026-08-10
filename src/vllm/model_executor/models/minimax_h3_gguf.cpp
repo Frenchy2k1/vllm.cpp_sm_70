@@ -79,6 +79,10 @@ MiniMaxH3DitParams ParseMiniMaxH3DitParamsFromGgufManifest(
   MiniMaxH3DitParams p;
   int64_t max_block = -1, max_refiner = -1;
   bool saw_hidden = false, saw_head_dim = false;
+  // PRUNED (curve) vs unpruned: the two forms are mutually exclusive, and BOTH
+  // want to set time_embed_dim, so which one the file carries is recorded and
+  // checked rather than left to iteration order.
+  bool saw_curve = false, saw_time_embedder = false;
 
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const std::string& name = spec.name;
@@ -101,8 +105,16 @@ MiniMaxH3DitParams ParseMiniMaxH3DitParamsFromGgufManifest(
     } else if (name == "time_embedder.proj_in.weight" && spec.shape.size() == 2) {
       p.time_embed_hidden_size = spec.shape[0];
       p.timestep_input_dim = spec.shape[1];
+      saw_time_embedder = true;
     } else if (name == "time_embedder.proj_out.weight" && spec.shape.size() == 2) {
       p.time_embed_dim = spec.shape[0];
+      saw_time_embedder = true;
+    } else if (name == "adaln_t_table" && spec.shape.size() == 2) {
+      // [grid, curve width]; the width IS the AdaLN linear's in_features
+      // (comfy/ldm/minimax/model.py:429), so it replaces time_embed_dim.
+      p.adaln_curve_grid = spec.shape[0];
+      p.time_embed_dim = spec.shape[1];
+      saw_curve = true;
     } else if (name == "blocks.0.mlp.fc2.weight" && spec.shape.size() == 2) {
       p.ffn_hidden_size = spec.shape[1];
     } else if (name == "blocks.0.adaln_proj.linear.weight" && spec.shape.size() == 2) {
@@ -131,6 +143,15 @@ MiniMaxH3DitParams ParseMiniMaxH3DitParamsFromGgufManifest(
   VT_CHECK(p.num_attention_heads > 0, "minimax_h3 gguf: could not derive the head count");
   VT_CHECK(p.adaln_out_features == 6 * p.hidden_size * kMiniMaxH3AdalnModalityNum,
            "minimax_h3 gguf: adaln width does not match 6 * hidden * 3");
+  // Spec 8.20 stop condition: a file carrying BOTH forms is a third checkpoint
+  // shape, not this one, and would load with half the modulation path unbound.
+  VT_CHECK(!(saw_curve && saw_time_embedder),
+           "minimax_h3 gguf: checkpoint carries BOTH adaln_t_table and time_embedder.* "
+           "-- the pruned and unpruned forms are mutually exclusive");
+  VT_CHECK(saw_curve || saw_time_embedder,
+           "minimax_h3 gguf: checkpoint carries NEITHER adaln_t_table nor time_embedder.*");
+  VT_CHECK(p.adaln_curve_grid == 0 || p.adaln_curve_grid >= 2,
+           "minimax_h3 gguf: adaln_t_table needs at least two rows to interpolate");
   VT_CHECK(p.rope_rot_dim() <= p.attention_head_dim,
            "minimax_h3 gguf: 6 * rope_inv_freq_len exceeds attention_head_dim");
   return p;
@@ -228,10 +249,17 @@ void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
   out->weights.audio_patch_proj_b = view("audio_patch_proj.bias");
   out->weights.condition_proj_w = view("condition_proj.weight");
   out->weights.condition_proj_b = view("condition_proj.bias");
-  out->weights.time_proj_in_w = view("time_embedder.proj_in.weight");
-  out->weights.time_proj_in_b = view("time_embedder.proj_in.bias");
-  out->weights.time_proj_out_w = view("time_embedder.proj_out.weight");
-  out->weights.time_proj_out_b = view("time_embedder.proj_out.bias");
+  // The PRUNED form has no time embedder at all; it binds the curve table
+  // instead (comfy/ldm/minimax/model.py:428-432). Binding the wrong one throws
+  // by NAME, which is what makes a mismatched --dit fail loudly.
+  if (p.use_adaln_curves()) {
+    out->weights.adaln_t_table = view("adaln_t_table");
+  } else {
+    out->weights.time_proj_in_w = view("time_embedder.proj_in.weight");
+    out->weights.time_proj_in_b = view("time_embedder.proj_in.bias");
+    out->weights.time_proj_out_w = view("time_embedder.proj_out.weight");
+    out->weights.time_proj_out_b = view("time_embedder.proj_out.bias");
+  }
   out->weights.rope_inv_freq = view("rope.inv_freq");
 
   auto bind_block = [&](const std::string& prefix, bool with_adaln) {
@@ -317,6 +345,17 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file) {
     int64_t numel = 1;
     for (int64_t d : spec.shape) numel *= d;
     VT_CHECK(numel > 0, "minimax_h3 gguf bf16: tensor has an empty logical shape");
+    // The two buffers the forward consumes on the HOST as f32 — rope.inv_freq
+    // (it builds the cos/sin cache) and, for a pruned checkpoint, adaln_t_table
+    // (it is interpolated at the per-row timestep) — must NOT be rounded into
+    // bf16 bits here: both are read through Ptr<float>(), which is an unchecked
+    // cast, so a bf16 buffer is silently reinterpreted as garbage floats. See
+    // https://github.com/mudler/vllm.cpp/issues/244.
+    if (spec.name == "rope.inv_freq" || spec.name == "adaln_t_table") {
+      out.storage[spec.name] = DequantGgufRowToF32(info.ggml_type, info.data, numel);
+      out.shapes[spec.name] = spec.shape;
+      continue;
+    }
     // Straight to bf16: going via f32 would double the peak for no benefit, and the
     // f32 intermediate is exactly what does not fit.
     out.bf16_storage[spec.name] = DequantGgufRowToBf16(info.ggml_type, info.data, numel);

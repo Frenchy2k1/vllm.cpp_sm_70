@@ -82,6 +82,12 @@ struct MiniMaxH3DitParams {
   int64_t adaln_out_features = 18 * 5376;      // 6 vectors x 3 modalities x H
   int64_t final_adaln_out_features = 2 * 5376;  // 2 vectors x 1 modality x H
   int64_t rope_inv_freq_len = 16;
+  // PRUNED ("curve-form") checkpoints: 0 = the shipped unpruned model, > 0 = the
+  // row count of an `adaln_t_table` buffer that REPLACES the time embedder
+  // (comfy/ldm/minimax/model.py:409, 419, 428-432). In that form `time_embed_dim`
+  // is the curve width (8 in every published pruned checkpoint), not 2688, and
+  // `timestep_input_dim` / `time_embed_hidden_size` are unused. See spec 8.20.
+  int64_t adaln_curve_grid = 0;
   double norm_eps = 1e-5;
   double qk_norm_eps = 1e-5;
   double final_norm_eps = 1e-5;
@@ -94,6 +100,8 @@ struct MiniMaxH3DitParams {
   // 3D RoPE rotates 6*rope_inv_freq_len of attention_head_dim dims
   // (minimax_h3_transformer.py:207-230; 96 of 128 at shipped scale).
   int64_t rope_rot_dim() const { return 6 * rope_inv_freq_len; }
+  // comfy/ldm/minimax/model.py:419 `use_adaln_curves`.
+  bool use_adaln_curves() const { return adaln_curve_grid > 0; }
 };
 
 // AdaLN modality count: token tags are -1 padding and 0/1/2 for video/text/audio
@@ -1286,6 +1294,19 @@ std::vector<float> MiniMaxH3ReorderGroupedQkv(const std::vector<float>& weight,
                                               int64_t num_query_groups, int64_t heads_per_group,
                                               int64_t head_dim, int64_t in_features);
 
+// PRUNED (curve-form) timestep embedding — comfy/ldm/minimax/model.py:612-615.
+//
+//   pos = t.clamp(0, 1) * (grid - 1)
+//   i0  = floor(pos).clamp(max = grid - 2)
+//   out = lerp(table[i0], table[i0 + 1], pos - i0)
+//
+// The max-clamp on i0 is load-bearing: it keeps t = 1.0 on the LAST interval
+// instead of reading table[grid], and the input clamp makes an out-of-range
+// timestep (H3 pins condition rows near 1) hold the curve's end value rather
+// than extrapolate. Returns [m, dim] row-major fp32.
+std::vector<float> MiniMaxH3AdalnCurveEmbed(const float* table, int64_t grid, int64_t dim,
+                                            const float* timesteps, int64_t m);
+
 // Non-owning views of every DiT parameter, in the shape the forward consumes.
 struct MiniMaxH3DitBlockWeights {
   vt::Tensor norm1;      // [H]
@@ -1314,8 +1335,15 @@ struct MiniMaxH3DitWeights {
   vt::Tensor video_patch_proj_w, video_patch_proj_b;
   vt::Tensor audio_patch_proj_w, audio_patch_proj_b;
   vt::Tensor condition_proj_w, condition_proj_b;
+  // Unpruned form only: the sinusoidal time embedder's two projections. Empty()
+  // when the checkpoint is the pruned/curve form, which carries `adaln_t_table`
+  // instead (they are mutually exclusive, and the loader enforces that).
   vt::Tensor time_proj_in_w, time_proj_in_b;
   vt::Tensor time_proj_out_w, time_proj_out_b;
+  // PRUNED form only: [adaln_curve_grid, time_embed_dim] fp32, and — like
+  // rope.inv_freq — HOST-resident on every path, because the interpolation runs
+  // on the host over M <= 4 rows before any kernel does.
+  vt::Tensor adaln_t_table;
   vt::Tensor rope_inv_freq;  // [rope_inv_freq_len], fp32
   std::vector<MiniMaxH3DitBlockWeights> refiner;  // no adaln, no rope
   vt::Tensor refiner_final_norm;
@@ -1445,6 +1473,15 @@ struct MiniMaxH3DitOutputs {
 // One DiT forward = one denoise step's velocity prediction. `compute_dtype` picks
 // the block-stream dtype: kBF16 is the production path (upstream's cast points are
 // preserved), kF32 is the parity path the golden suite gates.
+// UNPRUNED timestep embedding — the sinusoidal frequency bank (cosine before
+// sine) through the two-layer time embedder (minimax_h3_transformer.py:272-285).
+// Returns [m, time_embed_dim] row-major fp32. The forward calls this or
+// MiniMaxH3AdalnCurveEmbed depending on `params.use_adaln_curves()`; both hand
+// back the same shape, which is why nothing downstream branches.
+std::vector<float> MiniMaxH3SinusoidalTimeEmbed(vt::Device device, const MiniMaxH3DitParams& params,
+                                                const MiniMaxH3DitWeights& weights,
+                                                const float* timesteps, int64_t m);
+
 MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitParams& params,
                                         const MiniMaxH3DitWeights& weights,
                                         const MiniMaxH3DitInputs& inputs,
@@ -1460,6 +1497,9 @@ struct MiniMaxH3DitDeviceWeights {
   // kernel runs), so it must stay host-resident f32 no matter how the rest is
   // staged. Binding it to device memory segfaults the moment the forward reads it.
   std::vector<float> rope_inv_freq_host;
+  // Same rule for the pruned form's curve table: the lerp runs on the host, so
+  // the table must stay host-resident whatever the staging path did.
+  std::vector<float> adaln_t_table_host;
   MiniMaxH3DitWeights weights;                 // views into `storage`
 };
 
