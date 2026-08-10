@@ -153,9 +153,10 @@ of what the row is and why it matters, above the machine fields.
 4. open the draft PR.
 
 Assignment is atomic and unmergeable, so the claim race disappears. The
-operator/helper roles, the exclusive operator lock, and the "helper works in a
-worktree and opens a draft PR at the start" rule are unchanged — only the
-*medium* of the claim changes.
+operator/helper roles, the coordinator record (an exclusive lock when this was
+written; a record of who is coordinating where since issue #285), and the
+"helper works in a worktree and opens a draft PR at the start" rule are
+unchanged — only the *medium* of the claim changes.
 
 ### Read cache for offline work
 

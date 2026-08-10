@@ -1,14 +1,22 @@
 # Task guide — coordinating parallel work
 
-How the operator runs several rows at once without agents colliding. The rules
+How a coordinator runs several rows at once without agents colliding. The rules
 are in [`AGENTS.md`](../AGENTS.md); this is the method.
 
 ## The shape of a campaign
 
-The operator holds the plan, the GPU, and main. Everything else is delegated to
-fresh agents with bounded briefs. The operator does not implement work that
-should be independently reviewed — writing it and reviewing it in one context
-defeats the review.
+The operator is a coordinator: it holds the plan and the GPU, merges reviewed
+PRs, and delegates everything else to fresh agents with bounded briefs in their
+own worktrees. It does not implement work that should be independently reviewed
+— writing it and reviewing it in one context defeats the review.
+
+**Several coordinators may run at once.** `scripts/agent-role.py claim operator`
+records this worktree and never refuses; `scripts/agent-role.py show` lists the
+other live coordinators — worktree, session, host, and time since their last
+heartbeat — and prunes anything past the 2-hour TTL. What keeps concurrent
+coordinators from colliding is not that file: `main` is never force-pushed, so a
+plain `git push` refuses any non-fast-forward. When yours is rejected, fetch,
+re-merge, re-run the gate, and push again.
 
 For each row: confirm the issue, commit the spec, dispatch an implementer,
 dispatch a *different* reviewer, return findings to a new implementer, rerun the
