@@ -63,11 +63,14 @@ per second, with method, attribution and the owed 1,024 in / 128 out axis in
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| **vllm.cpp** tok/s | **86.05** | 159.68 | 292.34 | 508.77 | 801.76 | 1095.01 |
-| vLLM tok/s | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
+| **vllm.cpp** TOTAL tok/s | **86.05** | 159.68 | 292.34 | 508.77 | 801.76 | 1095.01 |
+| vLLM TOTAL tok/s | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | 1.011x | 1.007x | 1.007x | 1.016x | 1.017x |
 | Axes passing | 20/20 | 20/20 | 18/20 | 15/20 | 19/20 | 18/20 |
 
+TOTAL tokens per second (prompt plus output), not a decode rate: c1's 86.05 is
+about 10 tok/s of decode plus about 940 of prefill. The `nvidia` table below
+counts OUTPUT only, hence its c1 of 10.41.
 We are nominally ahead at all six, but only c1 means anything. Our run-to-run
 noise band is 0.5% and c2 through c32 land between 0.7% and 1.7%, so **treat
 those five as ties**, not as wins. The nine axes that fail in both grids are one
