@@ -35,6 +35,8 @@
 
 #include "minimax_h3_goldens.inc"
 #include "minimax_h3_gguf_manifest.inc"
+#include "minimax_h3_pruned_gguf_manifest.inc"
+#include "minimax_h3_adaln_curve_goldens.inc"
 #include "minimax_h3_audio_vae_goldens.inc"
 #include "minimax_h3_audio_vae_encoder_goldens.inc"
 #include "minimax_h3_audio_vae_manifest.inc"
@@ -7692,4 +7694,233 @@ TEST_CASE("minimax_h3: the bf16 encoder runs the SAME forward as an f32-staged t
 
   RemoveShardedDit(bf16_dir, kShards);
   RemoveShardedDit(f32_dir, kShards);
+}
+
+// ---------------------------------------------------------------------------
+// PRUNED (AdaLN timestep-CURVE) checkpoints — spec section 8.20, issue #241.
+//
+// The community `pruned` variants are NOT lossily pruned: ComfyUI's curve form
+// (comfy/ldm/minimax/model.py:419-432, 610-615) replaces the sinusoidal +
+// 2-layer-MLP time embedder with an `adaln_t_table` that is LERPED at the
+// per-row timestep, drops the SiLU before the AdaLN linear, and narrows that
+// linear's in_features from time_embed_dim (2688) to the curve width (8).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("minimax_h3: the AdaLN curve embedding matches upstream's clamped lerp") {
+  const int64_t grid = vllm_test::kH3AdalnCurveGrid;
+  const int64_t dim = vllm_test::kH3AdalnCurveDim;
+  // The generator's table is h3_rand("adaln_t_table") with scale 1, offset 0.
+  const std::vector<float> table = MakeParam("adaln_t_table", grid * dim, 1.0);
+
+  const std::vector<float> t(vllm_test::kH3AdalnCurveT,
+                             vllm_test::kH3AdalnCurveT + vllm_test::kH3AdalnCurveTCount);
+  const std::vector<float> got =
+      vllm::MiniMaxH3AdalnCurveEmbed(table.data(), grid, dim, t.data(),
+                                     static_cast<int64_t>(t.size()));
+  REQUIRE(static_cast<int64_t>(got.size()) == vllm_test::kH3AdalnCurveEmbCount);
+  double worst = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(got[i]) -
+                                     static_cast<double>(vllm_test::kH3AdalnCurveEmb[i])));
+  }
+  INFO("max |diff| vs the upstream expression = " << worst);
+  CHECK(worst < 1e-6);
+
+  // t = 1.0 must land on the LAST interval, not read past the table: that is the
+  // whole reason upstream clamps i0 to grid-2. Row 6 of the golden is t=1.0 and
+  // must equal the final table row exactly.
+  for (int64_t d = 0; d < dim; ++d) {
+    CHECK(got[static_cast<size_t>(6 * dim + d)] ==
+          doctest::Approx(table[static_cast<size_t>((grid - 1) * dim + d)]).epsilon(1e-6));
+  }
+  // Out-of-range timesteps clamp to the curve ends rather than extrapolating.
+  for (int64_t d = 0; d < dim; ++d) {
+    CHECK(got[static_cast<size_t>(7 * dim + d)] ==
+          doctest::Approx(table[static_cast<size_t>(d)]).epsilon(1e-6));
+    CHECK(got[static_cast<size_t>(8 * dim + d)] ==
+          doctest::Approx(table[static_cast<size_t>((grid - 1) * dim + d)]).epsilon(1e-6));
+  }
+}
+
+TEST_CASE("minimax_h3: a REAL PRUNED GGUF resolves onto our weight contract") {
+  // unsloth/MiniMax-H3-GGUF `minimax_h3_fl2va_pruned-Q8_0.gguf`, header only.
+  CHECK(vllm_test::kH3PrunedGgufVersion == 3);
+  REQUIRE(vllm_test::kH3PrunedGgufTensorCount ==
+          static_cast<int64_t>(std::size(vllm_test::kH3PrunedGgufTensors)));
+  // 535 unpruned - 4 time_embedder tensors + 1 adaln_t_table.
+  CHECK(vllm_test::kH3PrunedGgufTensorCount == 532);
+  CHECK(vllm_test::kH3PrunedGgufTensorCount == vllm_test::kH3GgufTensorCount - 3);
+
+  std::vector<vllm::MiniMaxH3TensorSpec> manifest;
+  manifest.reserve(static_cast<size_t>(vllm_test::kH3PrunedGgufTensorCount));
+  for (const vllm_test::H3PrunedGgufTensor& t : vllm_test::kH3PrunedGgufTensors) {
+    const std::vector<int64_t> dims(t.dims, t.dims + t.n_dims);
+    const std::vector<int64_t> orig(t.orig_shape, t.orig_shape + t.orig_n_dims);
+    vllm::MiniMaxH3TensorSpec spec;
+    spec.name = t.name;
+    spec.shape = vllm::MiniMaxH3GgufLogicalShape(dims, orig);
+    spec.fp32 = t.ggml_type == 0;
+    manifest.push_back(std::move(spec));
+  }
+
+  // Not one `time_embedder.*` tensor survives, and `adaln_t_table` is there.
+  bool saw_table = false;
+  for (const vllm::MiniMaxH3TensorSpec& spec : manifest) {
+    CHECK(spec.name.rfind("time_embedder.", 0) != 0);
+    if (spec.name == "adaln_t_table") {
+      saw_table = true;
+      REQUIRE(spec.shape.size() == 2);
+      CHECK(spec.shape[0] == 1025);  // the curve grid
+      CHECK(spec.shape[1] == 8);     // the curve width
+      CHECK(spec.fp32);              // F32 upstream, and read on the host
+    }
+  }
+  CHECK(saw_table);
+
+  // The geometry still comes from the SHAPES ALONE.
+  const MiniMaxH3DitParams p = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  CHECK(p.use_adaln_curves());
+  CHECK(p.adaln_curve_grid == 1025);
+  CHECK(p.time_embed_dim == 8);  // the AdaLN linear's in_features, per the table
+  CHECK(p.num_layers == 50);
+  CHECK(p.token_refiner_num_layers == 2);
+  CHECK(p.hidden_size == 5376);
+  CHECK(p.num_attention_heads == 56);
+  CHECK(p.attention_head_dim == 128);
+  CHECK(p.ffn_hidden_size == 14336);
+  CHECK(p.latents_dim == 24);
+  CHECK(p.audio_latents_dim == 32);
+  CHECK(p.text_dim == 5120);
+  CHECK(p.rope_inv_freq_len == 16);
+  CHECK(p.video_row_width() == 96);
+  CHECK(p.adaln_out_features == 96768);
+  CHECK(p.final_adaln_out_features == 10752);
+
+  // Identity name map, exactly as for the unpruned arm.
+  const std::vector<vllm::MiniMaxH3TensorSpec> expected = EnumerateMiniMaxH3DitTensors(p);
+  CHECK(manifest.size() == expected.size());
+  std::map<std::string, std::vector<int64_t>> got;
+  for (const vllm::MiniMaxH3TensorSpec& spec : manifest) got[spec.name] = spec.shape;
+  for (const vllm::MiniMaxH3TensorSpec& want : expected) {
+    INFO("contract tensor " << want.name);
+    const auto it = got.find(want.name);
+    REQUIRE(it != got.end());
+    CHECK(it->second == want.shape);
+  }
+
+  // in_features 8 means the AdaLN projections no longer need ComfyUI's
+  // quant-block reshape: 8 is not 2688, so there is no orig_shape key at all.
+  for (const vllm_test::H3PrunedGgufTensor& t : vllm_test::kH3PrunedGgufTensors) {
+    if (std::string(t.name) != "blocks.0.adaln_proj.linear.weight") continue;
+    CHECK(t.orig_n_dims == 0);
+    CHECK(t.dims[0] == 8);
+    CHECK(t.dims[1] == 96768);
+  }
+
+  // `adaln_t_table` is an fp32 ISLAND, in the same category as rope.inv_freq:
+  // it is F32 upstream and it is consumed on the host.
+  CHECK(vllm::MiniMaxH3IsFp32IslandTensor("adaln_t_table"));
+  CHECK(vllm::MiniMaxH3IsFp32IslandTensor("rope.inv_freq"));
+}
+
+TEST_CASE("minimax_h3: a checkpoint may carry the time embedder or the curve, never both") {
+  // The stop condition from spec 8.20: a half-and-half file is a THIRD form and
+  // must fail loudly rather than load with one path silently unbound.
+  MiniMaxH3DitParams base;
+  base.num_layers = 2;
+  base.token_refiner_num_layers = 1;
+  std::vector<vllm::MiniMaxH3TensorSpec> both = EnumerateMiniMaxH3DitTensors(base);
+  both.push_back({"adaln_t_table", {1025, 8}, true});
+  CHECK_THROWS(vllm::ParseMiniMaxH3DitParamsFromGgufManifest(both));
+
+  MiniMaxH3DitParams curve = base;
+  curve.adaln_curve_grid = 1025;
+  curve.time_embed_dim = 8;
+  const std::vector<vllm::MiniMaxH3TensorSpec> only_curve =
+      EnumerateMiniMaxH3DitTensors(curve);
+  const MiniMaxH3DitParams round = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(only_curve);
+  CHECK(round.adaln_curve_grid == 1025);
+  CHECK(round.time_embed_dim == 8);
+  CHECK(round.num_layers == 2);
+}
+
+TEST_CASE("minimax_h3: a CONSTRUCTED curve checkpoint reproduces the unpruned forward exactly") {
+  // The strongest available gate on the pruned forward, and the only one that
+  // pins the SiLU rule.
+  //
+  // The curve form feeds `adaln_proj.linear` with table[i] directly (no SiLU,
+  // comfy/ldm/minimax/model.py:197 + :421); the unpruned form feeds it with
+  // silu(time_embedder(t)). So a table whose rows ARE silu(time_embedder(t_k))
+  // at the grid points t_k, sampled at exactly those t_k, must drive the two
+  // forwards through identical AdaLN inputs — and therefore to identical
+  // outputs. Any one of {applying SiLU in the curve path, getting the lerp
+  // index wrong, reading in_features from the wrong place} breaks the equality.
+  const std::unique_ptr<GoldenWeights> unpruned = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = unpruned->params;
+  const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(p);
+  const int64_t m = c->in.num_unique_timesteps;
+  REQUIRE(m >= 1);
+
+  // A grid whose points include every unique timestep of the case: put t_k at
+  // grid index k and pad the rest, so `pos` lands exactly on an integer.
+  const int64_t grid = m + 3;
+  std::vector<float> t_on_grid(static_cast<size_t>(m));
+  for (int64_t k = 0; k < m; ++k) {
+    t_on_grid[static_cast<size_t>(k)] = static_cast<float>(k) / static_cast<float>(grid - 1);
+  }
+
+  // Row k of the table = silu(time_embedder(t_on_grid[k])), i.e. exactly what
+  // the unpruned AdaLN linear consumes at that timestep. Everything else in the
+  // rest of the table is arbitrary and must never be read.
+  MiniMaxH3DitInputs probe = c->in;
+  probe.unique_timesteps = t_on_grid.data();
+  probe.num_unique_timesteps = m;
+  const std::vector<float> t_emb =
+      vllm::MiniMaxH3SinusoidalTimeEmbed(Cpu(), p, unpruned->views, t_on_grid.data(), m);
+  REQUIRE(static_cast<int64_t>(t_emb.size()) == m * p.time_embed_dim);
+  std::vector<float> table = MakeParam("curve.filler", grid * p.time_embed_dim, 7.0);
+  for (int64_t k = 0; k < m; ++k) {
+    for (int64_t d = 0; d < p.time_embed_dim; ++d) {
+      const float v = t_emb[static_cast<size_t>(k * p.time_embed_dim + d)];
+      table[static_cast<size_t>(k * p.time_embed_dim + d)] =
+          v / (1.0f + std::exp(-v));  // silu, the activation the table absorbs
+    }
+  }
+
+  // The unpruned run, at the grid timesteps.
+  const MiniMaxH3DitOutputs want =
+      MiniMaxH3DitForward(Cpu(), p, unpruned->views, probe, vt::DType::kF32);
+
+  // The SAME weights, minus the time embedder, plus the table.
+  MiniMaxH3DitParams cp = p;
+  cp.adaln_curve_grid = grid;
+  MiniMaxH3DitWeights cw = unpruned->views;
+  cw.time_proj_in_w = vt::Tensor{};
+  cw.time_proj_in_b = vt::Tensor{};
+  cw.time_proj_out_w = vt::Tensor{};
+  cw.time_proj_out_b = vt::Tensor{};
+  cw.adaln_t_table = View2D(table, grid, cp.time_embed_dim);
+  const MiniMaxH3DitOutputs got = MiniMaxH3DitForward(Cpu(), cp, cw, probe, vt::DType::kF32);
+
+  REQUIRE(got.video_logits.size() == want.video_logits.size());
+  REQUIRE(got.audio_logits.size() == want.audio_logits.size());
+  const double video_err =
+      MaxAbsDiff(got.video_logits, want.video_logits.data(), got.video_logits.size());
+  const double audio_err =
+      MaxAbsDiff(got.audio_logits, want.audio_logits.data(), got.audio_logits.size());
+  INFO("curve-vs-unpruned video max|diff| = " << video_err << ", audio = " << audio_err);
+  // Identical arithmetic on both sides apart from how t_emb was produced, so the
+  // slack is only the f32 rounding of silu(t_emb) through the table.
+  CHECK(video_err <= 1e-5);
+  CHECK(audio_err <= 1e-5);
+  // And the equality must be non-trivial: the outputs are not all zero.
+  double mag = 0.0;
+  for (float v : want.video_logits) mag = std::max(mag, std::abs(static_cast<double>(v)));
+  CHECK(mag > 1e-3);
+
+  // A curve checkpoint whose table is not bound must fail LOUDLY rather than
+  // read a null pointer.
+  MiniMaxH3DitWeights unbound = cw;
+  unbound.adaln_t_table = vt::Tensor{};
+  CHECK_THROWS(MiniMaxH3DitForward(Cpu(), cp, unbound, probe, vt::DType::kF32));
 }

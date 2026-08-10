@@ -180,10 +180,16 @@ void ModulateGate(float* residual, int64_t rows, int64_t width, const float* gat
 // silu(t_emb) -> linear -> view(M*modality_num, expand*H) -> chunk(expand).
 // Returns the flat [M*modality_num, expand*H] buffer; chunk c of row m starts at
 // (m * expand + c) * H within the caller's indexing scheme below.
+// `apply_silu` is FALSE for the pruned/curve form: the curve table already
+// carries the activated embedding, so upstream skips the SiLU
+// (comfy/ldm/minimax/model.py:197, with apply_silu = not use_adaln_curves at :421).
 std::vector<float> AdalnProject(vt::Queue& q, const float* t_emb, int64_t m, int64_t time_embed_dim,
-                                const Tensor& weight, const Tensor& bias, const StreamDtype& dt) {
+                                const Tensor& weight, const Tensor& bias, const StreamDtype& dt,
+                                bool apply_silu) {
   std::vector<float> activated(static_cast<size_t>(m * time_embed_dim));
-  for (int64_t i = 0; i < m * time_embed_dim; ++i) activated[static_cast<size_t>(i)] = Silu(t_emb[i]);
+  for (int64_t i = 0; i < m * time_embed_dim; ++i) {
+    activated[static_cast<size_t>(i)] = apply_silu ? Silu(t_emb[i]) : t_emb[i];
+  }
   const int64_t out_features = weight.shape[0];
   // silu(t_emb) is fp32, then cast to the BF16 linear's dtype before the GEMM.
   dt.Apply(activated);
@@ -374,10 +380,17 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3DitTensors(const MiniMaxH3Dit
   out.push_back({"audio_patch_proj.bias", {p.hidden_size}, true});
   out.push_back({"condition_proj.weight", {p.hidden_size, p.text_dim}, false});
   out.push_back({"condition_proj.bias", {p.hidden_size}, false});
-  out.push_back({"time_embedder.proj_in.weight", {p.time_embed_hidden_size, p.timestep_input_dim}, true});
-  out.push_back({"time_embedder.proj_in.bias", {p.time_embed_hidden_size}, true});
-  out.push_back({"time_embedder.proj_out.weight", {p.time_embed_dim, p.time_embed_hidden_size}, true});
-  out.push_back({"time_embedder.proj_out.bias", {p.time_embed_dim}, true});
+  // PRUNED (curve) checkpoints carry `adaln_t_table` INSTEAD of the four time
+  // embedder tensors (comfy/ldm/minimax/model.py:428-432). The two forms are
+  // mutually exclusive, which is exactly what makes the contract checkable.
+  if (p.use_adaln_curves()) {
+    out.push_back({"adaln_t_table", {p.adaln_curve_grid, p.time_embed_dim}, true});
+  } else {
+    out.push_back({"time_embedder.proj_in.weight", {p.time_embed_hidden_size, p.timestep_input_dim}, true});
+    out.push_back({"time_embedder.proj_in.bias", {p.time_embed_hidden_size}, true});
+    out.push_back({"time_embedder.proj_out.weight", {p.time_embed_dim, p.time_embed_hidden_size}, true});
+    out.push_back({"time_embedder.proj_out.bias", {p.time_embed_dim}, true});
+  }
   out.push_back({"rope.inv_freq", {p.rope_inv_freq_len}, true});
 
   auto push_attn_and_mlp = [&](const std::string& prefix) {
@@ -417,6 +430,60 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3DitTensors(const MiniMaxH3Dit
   out.push_back({"final_layer.video_out.bias", {video_patch_dim}, true});
   out.push_back({"final_layer.audio_out.weight", {p.audio_latents_dim, p.hidden_size}, true});
   out.push_back({"final_layer.audio_out.bias", {p.audio_latents_dim}, true});
+  return out;
+}
+
+// MiniMaxH3TimeEmbedder.forward (minimax_h3_transformer.py:272-285).
+std::vector<float> MiniMaxH3SinusoidalTimeEmbed(vt::Device device, const MiniMaxH3DitParams& params,
+                                                const MiniMaxH3DitWeights& weights,
+                                                const float* timesteps, int64_t m) {
+  vt::Queue queue{device, nullptr};
+  const int64_t half = params.timestep_input_dim / 2;
+  std::vector<float> t_freq(static_cast<size_t>(m * params.timestep_input_dim));
+  for (int64_t r = 0; r < m; ++r) {
+    for (int64_t i = 0; i < half; ++i) {
+      const double freq =
+          std::exp(-std::log(10000.0) * static_cast<double>(i) / static_cast<double>(half));
+      const double arg = static_cast<double>(timesteps[r]) * freq;
+      // Cosine values are concatenated BEFORE sine values.
+      t_freq[static_cast<size_t>(r * params.timestep_input_dim + i)] =
+          static_cast<float>(std::cos(arg));
+      t_freq[static_cast<size_t>(r * params.timestep_input_dim + half + i)] =
+          static_cast<float>(std::sin(arg));
+    }
+  }
+  std::vector<float> mid(static_cast<size_t>(m * params.time_embed_hidden_size));
+  Linear(queue, t_freq.data(), m, params.timestep_input_dim, weights.time_proj_in_w,
+         &weights.time_proj_in_b, mid.data());
+  for (float& value : mid) value = Silu(value);
+  std::vector<float> out(static_cast<size_t>(m * params.time_embed_dim));
+  Linear(queue, mid.data(), m, params.time_embed_hidden_size, weights.time_proj_out_w,
+         &weights.time_proj_out_b, out.data());
+  return out;
+}
+
+// comfy/ldm/minimax/model.py:612-615, verbatim.
+std::vector<float> MiniMaxH3AdalnCurveEmbed(const float* table, int64_t grid, int64_t dim,
+                                            const float* timesteps, int64_t m) {
+  VT_CHECK(grid >= 2, "minimax_h3 curve: adaln_t_table needs at least two rows to interpolate");
+  std::vector<float> out(static_cast<size_t>(m * dim));
+  for (int64_t r = 0; r < m; ++r) {
+    // t in [0,1] -> fractional grid index; out-of-range t clamps to the ends.
+    const float t = std::min(1.0f, std::max(0.0f, timesteps[r]));
+    const float pos = t * static_cast<float>(grid - 1);
+    // The max-clamp keeps t = 1.0 on the LAST interval instead of reading past
+    // the table.
+    int64_t i0 = static_cast<int64_t>(std::floor(pos));
+    if (i0 > grid - 2) i0 = grid - 2;
+    if (i0 < 0) i0 = 0;
+    const float frac = pos - static_cast<float>(i0);
+    const float* lo = table + i0 * dim;
+    const float* hi = table + (i0 + 1) * dim;
+    for (int64_t d = 0; d < dim; ++d) {
+      // torch.lerp(a, b, w) == a + w * (b - a).
+      out[static_cast<size_t>(r * dim + d)] = lo[d] + frac * (hi[d] - lo[d]);
+    }
+  }
   return out;
 }
 
@@ -567,28 +634,19 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   dt.Apply(stream);
 
   // --- time embedding (minimax_h3_transformer.py:272-285) ---
+  //
+  // PRUNED/curve form: the sinusoidal + 2-layer-MLP embedder does not exist in
+  // the checkpoint; t_emb is interpolated out of `adaln_t_table`
+  // (comfy/ldm/minimax/model.py:610-615). Same t, same [m, time_embed_dim]
+  // result, so nothing downstream of this block changes.
   std::vector<float> t_emb(static_cast<size_t>(m * params.time_embed_dim));
-  {
-    const int64_t half = params.timestep_input_dim / 2;
-    std::vector<float> t_freq(static_cast<size_t>(m * params.timestep_input_dim));
-    for (int64_t r = 0; r < m; ++r) {
-      for (int64_t i = 0; i < half; ++i) {
-        const double freq =
-            std::exp(-std::log(10000.0) * static_cast<double>(i) / static_cast<double>(half));
-        const double arg = static_cast<double>(inputs.unique_timesteps[r]) * freq;
-        // Cosine values are concatenated BEFORE sine values.
-        t_freq[static_cast<size_t>(r * params.timestep_input_dim + i)] =
-            static_cast<float>(std::cos(arg));
-        t_freq[static_cast<size_t>(r * params.timestep_input_dim + half + i)] =
-            static_cast<float>(std::sin(arg));
-      }
-    }
-    std::vector<float> mid(static_cast<size_t>(m * params.time_embed_hidden_size));
-    Linear(q, t_freq.data(), m, params.timestep_input_dim, weights.time_proj_in_w,
-           &weights.time_proj_in_b, mid.data());
-    for (float& value : mid) value = Silu(value);
-    Linear(q, mid.data(), m, params.time_embed_hidden_size, weights.time_proj_out_w,
-           &weights.time_proj_out_b, t_emb.data());
+  if (params.use_adaln_curves()) {
+    VT_CHECK(weights.adaln_t_table.data != nullptr,
+             "minimax_h3: a curve-form checkpoint must bind adaln_t_table");
+    t_emb = MiniMaxH3AdalnCurveEmbed(weights.adaln_t_table.Ptr<float>(), params.adaln_curve_grid,
+                                     params.time_embed_dim, inputs.unique_timesteps, m);
+  } else {
+    t_emb = MiniMaxH3SinusoidalTimeEmbed(device, params, weights, inputs.unique_timesteps, m);
   }
 
   // combined_indices = inverse_indices * modality_num + token_tags.clamp(min=0)
@@ -604,7 +662,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   std::vector<float> normed(stream.size()), tmp(stream.size());
   for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
     const std::vector<float> projected =
-        AdalnProject(q, t_emb.data(), m, params.time_embed_dim, block.adaln_w, block.adaln_b, dt);
+        AdalnProject(q, t_emb.data(), m, params.time_embed_dim, block.adaln_w, block.adaln_b, dt,
+                     !params.use_adaln_curves());
     const std::vector<float> shift_msa =
         AdalnChunk(projected, m, kMiniMaxH3AdalnModalityNum, hidden, 6, 0);
     const std::vector<float> scale_msa =
@@ -643,7 +702,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   // --- final layer (minimax_h3_transformer.py:724-743) ---
   const std::vector<float> final_projected =
       AdalnProject(q, t_emb.data(), m, params.time_embed_dim, weights.final_adaln_w,
-                   weights.final_adaln_b, dt);
+                   weights.final_adaln_b, dt, !params.use_adaln_curves());
   const std::vector<float> final_shift = AdalnChunk(final_projected, m, 1, hidden, 2, 0);
   const std::vector<float> final_scale = AdalnChunk(final_projected, m, 1, hidden, 2, 1);
   RmsNormRows(stream.data(), weights.final_norm.Ptr<float>(), normed.data(), seq_len, hidden,

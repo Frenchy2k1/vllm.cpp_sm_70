@@ -81,7 +81,11 @@ std::string FindIndexPath(const std::string& dir) {
 bool MiniMaxH3IsFp32IslandTensor(const std::string& n) {
   return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
          n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
-         n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
+         n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq" ||
+         // The PRUNED form's curve table: F32 upstream
+         // (comfy/ldm/minimax/model.py:429) and, like rope.inv_freq, read on the
+         // HOST. Rounding it to bf16 would be reinterpreted as garbage floats.
+         n == "adaln_t_table";
 }
 
 struct MiniMaxH3ShardedCheckpoint::Impl {
