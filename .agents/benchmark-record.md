@@ -17913,3 +17913,69 @@ kernel's own share — but 3.1% is not this profile's number.
 Both corrections share one failure mode: matching a single kernel name and
 concluding a ratio. Enumerate the whole kernel family and normalise per
 layer-step before claiming any count difference.
+
+## 27B post-lever grid, the 35B lever A/B, and an unattributed 35B c1 anomaly (2026-08-11, main `348c265d`, GB10)
+
+Both #213 levers landed: the NVFP4 `lm_head` kept packed, and the GDN fp8
+`in_proj_qkv`+`in_proj_z` merged into one qkvz GEMM.
+
+**Both are CONFIRMED ACTIVE by kernel signature**, which is the check a contended
+box cannot fake: `cutlass_80_tensorop_s16816gemm_bf16` (lever 1's 11.183 ms/step
+BF16 logits GEMM) is ABSENT; the split `nvjet_sm121_qqsss_mma_64x128x128` (lever
+2's 48 `in_proj_qkv` launches) is ABSENT and a merged `192x48x128` shape appears
+in its place; `marlin::Marlin` now carries the head.
+
+### 27B, same recipe as the pre-lever binding grid
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| post-lever ratio | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| pre-lever ratio | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| ours tok/s, post | 9.366 | 19.529 | 32.870 | 51.753 |
+
+Our legs are tight (spread 1.0013-1.0068); the vLLM arm carried one cold leg per
+concurrency (spread to 1.27), absorbed by medians.
+
+**THE OPEN PROBLEM: c1 did not move.** c2-c8 gained ~10 points, c1 gained 0.010,
+and both levers demonstrably execute at c1. The pre-lever nsys attribution closed
+to four decimal places and sized these levers AT c1 (lm_head 8.6414 + fp8 tower
+7.6068 of 17.3292 ms/step), so it mis-assigned what the c1 step actually spends.
+Two profiling attempts were DISCARDED rather than reasoned from: a whole-lifetime
+two-length diff whose calls/step came out non-integral (114.703) with a total at
+half the wall clock, and a session-based warm capture that produced no report.
+The valid method is the pre-lever one: `nsys start`/`stop` windows inside one
+already-warm server, validity-checked by integral instance deltas.
+
+### 35B-A3B, same-binary lever A/B (`VT_GDN_MERGED_QKVZ_FP8` the only variable)
+
+| | c1 med | c1 spread | c8 med | c8 spread |
+|---|---:|---:|---:|---:|
+| lever OFF (rollback) | 32.261 | 1.076 | 190.150 | 1.006 |
+| lever ON (shipped) | 33.158 | 1.086 | 187.357 | 1.007 |
+
+- **c1: NOT ESTABLISHED.** +2.8% nominal, inside an ~8% band on both arms.
+- **c8: -1.5%, REAL** against a 0.6-0.7% band.
+
+So the lever that gains ~10 points on the 27B **dense** is mildly NEGATIVE on the
+35B **MoE** at c8. Whether the default should be scoped by model family is open.
+
+### The 35B c1 anomaly is NOT the lever, and is unattributed
+
+Our 35B c1 reads ~32 tok/s here against a recorded 70.58. The A/B rules the lever
+out: with it rolled back, c1 still reads ~32. An earlier cache-sizing hypothesis
+was also withdrawn -- `num_blocks=4736` is what the canonical harness uses for
+every model, and the 35B/27B scale ratio (32.9 vs 9.4 tok/s) is what an A3B MoE
+should give. So it is protocol drift from the earlier record, or a build
+property, and the ad-hoc-harness 35B grid is NOT comparable to the 08-05 binding
+grid. It is therefore NOT published as a ratio. Re-run through the canonical
+`--execute` harness (model key `35`), which enforces per-model sizing, cache-drop
+proof and the one-lock boundary.
+
+### Method notes worth keeping
+
+- A fast `Passed` is indistinguishable from a skipped test in ctest output. Check
+  assertion counts, not exit codes. Page-cache warmth varies timings ~50x here.
+- The gate host rebooted SIX times in 18 hours during this work, at least one with
+  no OOM evidence at all (journal ends mid-normal-operation). Long runs are at
+  ongoing risk of silent truncation; c16/c32 still have no numbers because both
+  canonical attempts died that way.

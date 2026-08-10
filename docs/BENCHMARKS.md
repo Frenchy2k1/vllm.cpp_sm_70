@@ -85,7 +85,11 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 |---|---:|---:|---:|---:|
 | **vllm.cpp** tok/s (canonical 2026-08-10) | 9.4201 | 17.2474 | 29.5132 | 46.7061 |
 | vLLM 0.25.0 tok/s (canonical) | 11.3646 | 20.3858 | 34.6041 | 54.0616 |
-| **Ratio (canonical, BINDING)** | **0.8289x** | **0.8461x** | **0.8529x** | **0.8639x** |
+| **Ratio POST-LEVER (BINDING, main @`348c265d`)** | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| ours tok/s post-lever | 9.366 | 19.529 | 32.870 | 51.753 |
+| Ratio pre-lever (same recipe, superseded) | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| Levers landed | packed NVFP4 `lm_head` + merged GDN fp8 qkvz. Both ACTIVE by kernel signature: `cutlass_80_tensorop` ABSENT, split `nvjet_64x128x128` replaced by merged `192x48x128` | | |
+| OPEN: c1 did not move | c2-c8 gained ~10 points, c1 only +0.010 though both levers execute there. The pre-lever attribution sized them AT c1, so it mis-assigned c1 | | |
 | TPOT / TTFT ratio (canonical) | 1.2245 / 1.0077 | 1.1902 / 1.1111 | 1.2313 / 0.9722 | 1.2250 / 0.9992 |
 | Prior ad-hoc ratio (superseded, consistent) | 0.847x | 0.861x | 0.853x | 0.843x |
 | Before the FP8 tower fix | 8.76 | 17.07 | 33.01 | 62.13 |
