@@ -17,9 +17,9 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Laguna NVFP4 / DeepSeek-V4 decode | **CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **0.72x -> 0.85x**: FP8 tower native, tokens MATCH, RSS -3.2 GiB | NVFP4 MLP marlin, 68% of roof |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%), a GATE model | Fold into the 35B lever |
-| Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **bf16 shards STREAM both towers; Q4_K_M enc cond cos 0.9975, DIFFUSE** | render A/B on saved embeds |
-| Kimi-Linear-48B | 122/128 held; grouped router parallelised, e2e NOT ESTABLISHED (~10% band) | Warm-server path: ckpt is tiktoken-only |
+| Invocation-parity prevention | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` on dgx |
+| MiniMax-H3 lane | **bf16 shards STREAM both towers; Q4_K_M cos 0.9975, DIFFUSE** | render A/B on saved embeds |
+| Kimi-Linear-48B | 122/128 held; grouped router parallelised, e2e NOT ESTABLISHED | ckpt is tiktoken-only: no warm server |
 | 35B fresh grid | @`491c2f1e`: warp-shuffle router LANDED, **c1/c4 now 0.98x**, c2 0.87x, c8 0.92x | `CastF32` 3.1%; tighten c2/c8 spreads |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; sealed-vLLM tput 1.021x PASS; latency/VRAM OPEN | Spike residual 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
@@ -28,6 +28,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
+| `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** verbatim weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head need the device |
 | Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
@@ -59,16 +60,14 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to
    `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
 
-**Operator/helper protocol**
-([spec](workflow.md)): roles are a lock or worktree+PR; operator delegates,
-helpers claim `row/<ROW-ID>` with a start-time DRAFT PR. **W0-W5 LANDED**;
-role/entrypoint gates ENFORCE `agent-start.py` → claim → preflight. Review FAIL
-loops through fresh implementer, both gates, and fresh review until PASS; budgets
-cannot stop it. Queue: 10 rows; backfill 79 rows, 30 anchored.
-**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
-drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
-OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs have
-rows**; llama.cpp's 11 extra devices IN SCOPE, spike-gated (`ROAD-V1-D6`).
+**Operator/helper protocol** ([spec](workflow.md)): roles are a lock or
+worktree+PR; helpers claim `row/<ROW-ID>` with a DRAFT PR. Role/entrypoint gates
+ENFORCE `agent-start.py` → claim → preflight. Review FAIL loops through a fresh
+implementer until PASS. Queue: 10 rows; backfill 79, 30 anchored.
+**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
+SM060/061/070 below vLLM's floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL
+unported work; **all 362 archs have rows**; llama.cpp's 11 extra devices IN
+SCOPE (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 

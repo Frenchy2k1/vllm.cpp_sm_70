@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,16 @@ struct OwnedTensor {
   // dispatch metadata, so host reclamation must not make a populated weight look
   // absent. Mutable because ReleaseHost is logically const, like lazy residency.
   mutable bool host_released = false;
+
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150). Non-null when `bytes` BORROWS a
+  // read-only safetensors mmap taken verbatim from the checkpoint instead of
+  // being copied into an owned buffer, and records the exact source range so
+  // the windowed page release can run once a device copy exists. It is the
+  // discriminator between the two borrow producers: this one may be adopted
+  // onto the device allocation after upload, whereas a GGUF-mmap or
+  // tied-expansion borrow must not be (see AdoptDeviceBytesAsHost).
+  mutable const void* mmap_src = nullptr;
+  mutable size_t mmap_src_bytes = 0;
 
   bool Empty() const { return bytes.empty() && !host_released; }
   bool HasHostBytes() const { return !bytes.empty(); }
@@ -403,6 +414,47 @@ struct Qwen3_5MoeWeights {
 
 // Resolves a tensor name to its StTensor (across shards). Throws if absent.
 using TensorResolver = std::function<const StTensor&(const std::string&)>;
+
+// --- ENG-LOAD-DIRECT-UPLOAD (issue #150) -------------------------------------
+//
+// THE DEFECT THIS CLOSES. Loading a checkpoint copies the weights TWICE: the
+// loader `memcpy`s each tensor out of the read-only safetensors mmap into an
+// owned anonymous buffer, and `ResidentWeight` later copies that buffer into a
+// device allocation and drops it. For a 27B that is two full passes over tens
+// of GiB where one would do, and the intermediate pass also costs the kernel a
+// fresh anonymous page (and its zero-fill) for every page of the model.
+//
+// THE MECHANISM. For a tensor the device consumes VERBATIM, the owned buffer is
+// never allocated at all: `bytes` borrows the mapping (OwnedBytes::Borrow, with
+// StTensor::mapping as the keep-alive, so the mapping cannot be unmapped out
+// from under it), and the device upload reads straight from the file mapping.
+//
+// WHAT QUALIFIES, BY CONSTRUCTION. Only a call site that would have performed a
+// plain `memcpy` of the WHOLE source range into a freshly allocated destination
+// of the SAME size may call this — no transpose, no dtype conversion, no
+// dequant, no concatenation of several sources into one buffer, and no
+// load-time repack (`repacked`/`q8_0_aligned`/`elem_kn_repacked`, which mutate
+// the buffer and are set only on the GGUF path). The size identity is re-checked
+// here (`numel(shape) * sizeof(dtype) == t.nbytes`) and the call FAILS CLOSED,
+// returning false so the caller runs its normal copy, whenever anything does
+// not line up. A reshape is fine: it changes no byte.
+//
+// Returns true when `o` was made to borrow (its dtype/rank/shape are then set
+// from `dtype`/`shape` and its bytes are the mapping's); false when the caller
+// must fall back to its existing copy. `VT_LOAD_DIRECT_UPLOAD=0` forces false
+// (same-binary A/B, house convention).
+bool BorrowStTensorBytes(OwnedTensor& o, const StTensor& t, vt::DType dtype,
+                         const std::vector<int64_t>& shape);
+
+// Process-cached gate behind `BorrowStTensorBytes`. Exposed so a test can assert
+// which arm it is measuring.
+bool LoadDirectUploadEnabled();
+
+namespace detail {
+// Test-only override of the direct-upload decision, bypassing the env cache so
+// one test binary can exercise both arms. std::nullopt restores the default.
+void SetLoadDirectUploadOverrideForTesting(std::optional<bool> value);
+}  // namespace detail
 
 // Load one decoder layer's weights from real tensors. `layer_type` is
 // "linear_attention" or "full_attention"; `num_experts` drives the expert loop.
