@@ -227,10 +227,16 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `MuseGlimmerForCausalLM`, `MuseGlimmerForConditionalGeneration` | Text tower forwards, but the perception encoder is not wired into it, so an image or video prompt refuses. No checkpoint has been run |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
+
+`MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` no longer belong
+in that table: both towers forward and the perception encoder is wired, so an
+image or video prompt runs instead of refusing. That is reachability, not
+verification — no checkpoint has been run end to end, and the pinned oracle
+cannot load `muse_glimmer` at all, so no output of this model has been checked
+against a reference and no speed number exists for it.
 
 ## OpenAI-compatible server
 
