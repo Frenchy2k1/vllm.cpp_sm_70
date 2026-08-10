@@ -48,18 +48,36 @@ below is scoped to one block, and each clause is bound to that block's buffer:
                    a foreign handle are not a pass);
   (d) ADOPTED    — `AdoptDeviceBytesAsHost(..., w.<buf>)` on THIS function's weight
                    parameter (so adopting another object's buffer is not a pass);
-  (e) ORDERED    — (c) precedes (d), which is what makes (d) more than a no-op.
+  (e) ORDERED    — (c) precedes (d), which is what makes (d) more than a no-op;
+  (f) READ-FIRST — (b) precedes (d). The adoption RE-POINTS `w.<buf>.bytes` at the
+                   device allocation and releases the source pages, so an upload
+                   copy sequenced after it reads pages that have already been
+                   handed back. Moving the adopt above the `Copy` used to pass.
+
+TEXT THE COMPILER NEVER SEES IS NOT A PASS. Every clause runs against
+`checker_text.normalize_source`, which blanks `//` and `/* */` comments, `#if 0` /
+`#if false` regions and `if (false)` / `if (0)` branches before matching, keeping
+byte offsets and line numbers intact so the ordering clauses and the `file:line`
+report still describe the real file. Without that, `// AdoptDeviceBytesAsHost(d.b,
+w.packed);` read as the statement being present — a commented-out step is precisely
+the silent divergence this gate exists to catch, and it passed. Conditions other
+than a literal false are NOT evaluated: a region under `#ifdef VT_CUTLASS_NVFP4` is
+a real build configuration, not a disguised deletion.
 
 WHAT THIS GATE DOES *NOT* DO, stated plainly so the record does not imply more. It is
-a STRUCTURAL check over text: it proves the six statements are present, bound to the
-right buffer of the right object, and in the right order. It cannot prove they are
-CORRECT at run time — that the pointer published is the one that was uploaded, that
-the byte count matches the allocation, or that the copy transferred the right bytes.
-The qwen3_5.cpp duplicate is therefore guarded against DELETION and against gross
-substitution, not against arbitrary corruption. Run-time proof exists only for the
-shared copy, via tests/vllm/test_load_direct_upload.cpp; extending it to this one
-means making the duplicate reachable, which is the unification refactor this row
-explicitly does not attempt.
+a STRUCTURAL check over text: it proves the six statements are present in code the
+compiler keeps, bound to the right buffer of the right object, and that the adoption
+follows both the copy and the publication. It cannot prove they are CORRECT at run
+time — that the pointer published is the one that was uploaded, that the byte count
+matches the allocation, or that the copy transferred the right bytes. Nor does it
+model the preprocessor: a statement moved under a build-configuration `#ifdef` is
+out of its reach. The qwen3_5.cpp duplicate is therefore guarded against DELETION —
+including deletion disguised as a comment, an `#if 0`, or a never-taken branch —
+and against gross substitution and mis-ordering, not against arbitrary corruption.
+Run-time proof exists only for the shared copy, via
+tests/vllm/test_load_direct_upload.cpp; extending it to this one means making the
+duplicate reachable, which is the unification refactor this row explicitly does not
+attempt.
 
 Pure functions over text, so they are unit- and mutation-testable
 (tests/scripts/test_check_fp4_resident_consistency.py), mirroring
@@ -71,6 +89,12 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+
+# The shared normalization the whole check-* family needs. `scripts/` is sys.path[0]
+# when this file is RUN, but not when a test loads it by path, so pin it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from checker_text import match_braces as _match_braces  # noqa: E402
+from checker_text import normalize_source  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -116,19 +140,6 @@ def _line_no(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
 
 
-def _match_braces(text: str, start: int) -> int:
-    """Index just past the `}` closing the block whose `{` ended at `start`."""
-    depth = 1
-    i = start
-    while i < len(text) and depth > 0:
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-        i += 1
-    return i
-
-
 def function_bodies(text: str) -> list[tuple[int, str, str]]:
     """Every `ResidentNvfp4(Dev, const Nvfp4Weight&)` as (line_no, recv, body),
     the body delimited by brace matching from the definition's opening brace."""
@@ -138,6 +149,14 @@ def function_bodies(text: str) -> list[tuple[int, str, str]]:
         end = _match_braces(text, start)
         bodies.append((_line_no(text, m.start()), m.group("recv"), text[start : end - 1]))
     return bodies
+
+
+def checked_bodies(text: str) -> list[tuple[int, str, str]]:
+    """`function_bodies` over the text the COMPILER keeps — the ONE place raw source
+    is normalized, so no caller can reach a clause matcher with a commented-out or
+    `#if 0`-ed statement still in it. `normalize_source` is position-preserving, so
+    the line numbers returned here are the raw file's."""
+    return function_bodies(normalize_source(text))
 
 
 def buffer_block(body: str, recv: str, buffer: str) -> str | None:
@@ -174,19 +193,18 @@ def _counted(block: str, recv: str, buffer: str) -> bool:
     return False
 
 
-def _copied(block: str, recv: str, buffer: str) -> bool:
-    """The upload reads THIS buffer's bytes, not the other one's."""
-    return (
-        re.search(
-            r"\.\s*Copy\s*\([^;]*?"
-            + re.escape(recv)
-            + r"\s*\.\s*"
-            + re.escape(buffer)
-            + r"\s*\.\s*bytes\s*\.\s*data\s*\(\s*\)",
-            block,
-        )
-        is not None
+def _copied(block: str, recv: str, buffer: str) -> int | None:
+    """Offset of the upload that reads THIS buffer's bytes (not the other one's),
+    or None. The OFFSET, not a bool, because clause (f) orders it against (d)."""
+    m = re.search(
+        r"\.\s*Copy\s*\([^;]*?"
+        + re.escape(recv)
+        + r"\s*\.\s*"
+        + re.escape(buffer)
+        + r"\s*\.\s*bytes\s*\.\s*data\s*\(\s*\)",
+        block,
     )
+    return None if m is None else m.start()
 
 
 def _published(block: str, recv: str, buffer: str) -> int | None:
@@ -244,7 +262,8 @@ def body_violations(body: str, recv: str = "w") -> list[str]:
                 f"`{recv}.{buffer}.bytes.size()`. These bytes were BORROWED from the "
                 f"shard mmap, so this is the only counter that can ever see them"
             )
-        if not _copied(block, recv, buffer):
+        copied = _copied(block, recv, buffer)
+        if copied is None:
             problems.append(
                 f"`{buffer}`'s block does not upload `{recv}.{buffer}.bytes.data()`: "
                 f"the device buffer published for `{buffer}` is filled from somewhere "
@@ -266,17 +285,27 @@ def body_violations(body: str, recv: str = "w") -> list[str]:
                 f"pages are never released and, on a host-addressable device, the "
                 f"model stays resident twice"
             )
-        elif pub is not None and pub > adopt:
-            problems.append(
-                f"`{buffer}` publishes `d_dev` AFTER its AdoptDeviceBytesAsHost call, "
-                f"so the adoption sees a null `d_dev` and silently does nothing"
-            )
+        else:
+            if pub is not None and pub > adopt:
+                problems.append(
+                    f"`{buffer}` publishes `d_dev` AFTER its AdoptDeviceBytesAsHost "
+                    f"call, so the adoption sees a null `d_dev` and silently does "
+                    f"nothing"
+                )
+            if copied is not None and copied > adopt:
+                problems.append(
+                    f"`{buffer}` runs AdoptDeviceBytesAsHost BEFORE the upload copy "
+                    f"reads `{recv}.{buffer}.bytes.data()`: the adoption re-points "
+                    f"`bytes` at the device allocation and releases the consumed "
+                    f"source pages, so the copy reads them after they were handed "
+                    f"back"
+                )
     return problems
 
 
 def file_violations(text: str, label: str) -> list[str]:
     """Every violation in one file, each already prefixed with `label:line`."""
-    bodies = function_bodies(text)
+    bodies = checked_bodies(text)
     if not bodies:
         return [
             f"{label}: no `{FUNCTION}(Dev, const Nvfp4Weight&)` definition found. "
@@ -299,7 +328,7 @@ def main() -> int:
             print(f"ERROR: {rel} not found", file=sys.stderr)
             return 1
         text = path.read_text(encoding="utf-8", errors="ignore")
-        checked += len(function_bodies(text))
+        checked += len(checked_bodies(text))
         violations.extend(file_violations(text, str(rel)))
 
     if violations:
