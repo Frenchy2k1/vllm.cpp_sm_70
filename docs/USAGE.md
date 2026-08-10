@@ -378,6 +378,28 @@ client would see `finish_reason: length` with no way to tell it apart from a
 limit it set itself. Use `VT_SERVER_MAX_NEW_TOKENS` when you want a serving-side
 ceiling.
 
+### Which token ids stop a generation
+
+Stop ids come from two files in the checkpoint, not one. `config.json`'s
+`eos_token_id` supplies the **primary** eos id, and the sibling
+`generation_config.json` supplies **secondary** stop ids that are usually a
+superset of it. Gemma-4-26B is the clearest case:
+
+```
+config.json             eos_token_id: [1, 106]
+generation_config.json  eos_token_id: [1, 106, 50]
+```
+
+Both are read, mirroring vLLM's default `--generation-config auto`. The
+secondary ids are merged into the request's `stop_token_ids`, so a chat model
+stops on its turn-level token rather than running to the length cap. A missing
+or malformed `generation_config.json` is a silent no-op.
+
+`ignore_eos: true` suppresses **all** of them, primary and secondary alike, and
+generation then runs to the token budget. The ids still count toward
+`min_tokens` masking either way, so `min_tokens` cannot be satisfied by emitting
+a stop token early.
+
 ### Server flags
 
 | Flag | Default | Meaning |

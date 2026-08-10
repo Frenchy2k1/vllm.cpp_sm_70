@@ -3,6 +3,7 @@
 // deferrals.
 #include "vllm/v1/engine/input_processor.h"
 
+#include <algorithm>
 #include <chrono>
 #include <set>
 #include <stdexcept>
@@ -58,6 +59,21 @@ InputProcessor::InputProcessor(const tok::Tokenizer& tokenizer,
   if (!found && tokenizer_.EosId() >= 0) {
     eos_token_id_ = tokenizer_.EosId();
     generation_config_eos_ids_.push_back(tokenizer_.EosId());
+  }
+
+  // Upstream draws update_from_generation_config's id set from
+  // generation_config.json (ModelConfig.try_get_generation_config), which is
+  // usually a SUPERSET of config.json's: Gemma-4-26B ships config.json
+  // [1, 106] against generation_config.json [1, 106, 50], and a port reading
+  // only config.json never stops on 50. Union them, appending only ids not
+  // already present so the PRIMARY eos id resolved above -- which is
+  // generation_config_eos_ids_.front() on the list path -- keeps its position.
+  for (const int32_t id : config.generation_config_eos_ids) {
+    if (std::find(generation_config_eos_ids_.begin(),
+                  generation_config_eos_ids_.end(),
+                  id) == generation_config_eos_ids_.end()) {
+      generation_config_eos_ids_.push_back(id);
+    }
   }
 }
 
