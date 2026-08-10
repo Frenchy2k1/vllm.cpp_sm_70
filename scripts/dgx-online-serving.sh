@@ -12,13 +12,13 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   dgx-online-serving.sh --dry-run [--claim-root DIR] [--client PATH] [--vllm-cpp-sha SHA]
-  dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
+  dgx-online-serving.sh --prepare-corpus --model 27|27n|35 --source-corpus DIR --evidence DIR
   dgx-online-serving.sh --trace-only --model 27 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N] \
     [--trace-concurrency 2|16] [--gdn-ba-mode both] [--gdn-packed-mode both]
-  dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
+  dgx-online-serving.sh --execute --model 27|27n|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
-  dgx-online-serving.sh --startup-only --model 27|35|q3mxfp4 --snapshot DIR \
+  dgx-online-serving.sh --startup-only --model 27|27n|35|q3mxfp4 --snapshot DIR \
     --source-corpus DIR --evidence DIR --build-dir DIR --configure-log FILE \
     [--client PATH] [--port N]
 EOF
@@ -107,10 +107,11 @@ if [[ ${mode} == dry-run ]]; then
   exit 0
 fi
 
-[[ ${model} == 27 || ${model} == 35 || ${model} == q3mxfp4 ]] || {
-  echo "--model must be 27, 35 or q3mxfp4" >&2; exit 2; }
-# 35B MoE prefills a wider chunk; the 27B NVFP4 dense and the q3mxfp4 MXFP4 dense
-# 8B both use the dense 2048 batched-token gate value.
+[[ ${model} == 27 || ${model} == 27n || ${model} == 35 || ${model} == q3mxfp4 ]] || {
+  echo "--model must be 27, 27n, 35 or q3mxfp4" >&2; exit 2; }
+# 35B MoE prefills a wider chunk; the 27B NVFP4 dense arms (27 = unsloth,
+# 27n = nvidia/ModelOpt) and the q3mxfp4 MXFP4 dense 8B all use the dense 2048
+# batched-token gate value.
 if [[ ${model} == 35 ]]; then
   max_num_batched_tokens=8192
 else
@@ -146,8 +147,12 @@ fi
 # on 2026-07-13, and the W1D3 closure (b80663a) authorized the fresh
 # binding/exact-grid rerun. Timed grids still require a production
 # (profile-control-OFF) build via the recorded configure contract.
+# The refusal below is about WHICH CHECKPOINT, not which architecture: 27n is a
+# Qwen3.6-27B dense graph too. TRACE_PRIMARY_GRAPH_CONTRACTS holds node and
+# kernel-family counts captured on the unsloth @890bdef7 27B alone, so no other
+# key has a contract to validate a trace against.
 if [[ ${mode} == trace-only && ${model} != 27 ]]; then
-  echo "H1d trace-only control is defined only for the Qwen3.6-27B dense graph; 35B performance remains held" >&2
+  echo "H1d trace-only control is defined only for the unsloth Qwen3.6-27B NVFP4 checkpoint (--model 27), the only key with captured graph contracts; 35B performance remains held" >&2
   exit 2
 fi
 if [[ ${mode} == trace-only && ${trace_concurrency} != 2 && ${trace_concurrency} != 16 ]]; then
@@ -239,7 +244,14 @@ if [[ ${mode} == trace-only ]]; then
 else
   execution_manifest="${execution_dir}/${model}.json"
 fi
-if [[ ${model} == 27 ]]; then
+if [[ ${model} == 27 || ${model} == 27n ]]; then
+  # Both dense 27B arms precondition on the same paged-engine suite, whose
+  # committed goldens are the unsloth @890bdef7 checkpoint's -- so for 27n this
+  # is BUILD SANITY, not a golden for @0893e160, and a 27n correctness claim
+  # additionally owes a greedy continuation against the pinned oracle there.
+  # This comment is NOT the record: record-model-gate writes golden_revision,
+  # model_revision and golden_covers_benched_checkpoint into
+  # preflight/model-gate/<key>.json and the summary revalidates them.
   test_name=test_qwen27_paged_engine
   gate_target=${test_name}
 elif [[ ${model} == 35 ]]; then
@@ -1077,8 +1089,11 @@ if [[ ${model} == q3mxfp4 ]]; then
     cat "${gate_log}" >&2
     exit 1
   fi
+# -V, not just --output-on-failure: a checkpoint-gated parity test emits a loud
+# SKIP MESSAGE and returns 0, so a PASSING run must also land its own output in
+# the log, or record-model-gate cannot tell a real gate from a skipped one.
 elif ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
-  ctest --test-dir "${build_dir}" -R "^${test_name}$" --output-on-failure \
+  ctest --test-dir "${build_dir}" -R "^${test_name}$" -V --output-on-failure \
   >"${gate_log}" 2>&1; then
   cat "${gate_log}" >&2
   exit 1

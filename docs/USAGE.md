@@ -600,7 +600,7 @@ It speaks **OpenAI's Sora video shape**, so an OpenAI client works against it
 unmodified, and it keeps the richer native knobs alongside.
 
 ```sh
-build/examples/server --model /path/to/Qwen3.6-27B \
+build/examples/vllm-server --model /path/to/Qwen3.6-27B \
   --video-dit /path/to/h3-dit.gguf --video-vae /path/to/video-vae.safetensors \
   --audio-vae /path/to/audio-vae.safetensors \
   --video-vae-config video_vae/config.json --audio-vae-config audio_vae/config.json \
