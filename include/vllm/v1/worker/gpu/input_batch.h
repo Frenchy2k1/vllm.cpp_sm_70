@@ -292,9 +292,12 @@ class InputBatch {
   // `custom_logit_processor`). Only present for a request that registered one;
   // make_sampling_metadata emits it as SamplingMetadata.logits_processors.
   std::map<int, LogitsProcessorCallback> logits_processors;
-  // req_id -> requested sample-logprob count (gpu_input_batch.py:435-440); the
-  // -1 "all" sentinel is preserved (our Sampler consumes it directly, whereas
-  // upstream stores vocab_size — recorded deviation).
+  // req_id -> requested sample-logprob count (gpu_input_batch.py:434-440). The
+  // `-1` ("all logprobs") sentinel is WIDENED to vocab_size at add_request, as
+  // upstream does, so every value here is a concrete count and one gathered
+  // shape reaches every consumer. Preserving the sentinel instead was a
+  // recorded deviation until it turned out to crash the engine
+  // (specs/logprobs-all-sentinel.md).
   std::map<std::string, int> num_logprobs;
   // Lazily-allocated [max_num_reqs][vocab_size] EXCLUDE mask (TRUE == mask this
   // token to -inf). Empty until the first request with allowed_token_ids; a row
