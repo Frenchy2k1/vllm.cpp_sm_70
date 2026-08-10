@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/muse_glimmer_vision.h"  // the W3 perception tower
 #include "vllm/model_executor/models/qwen3_5.h"          // PagedKvCache, ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vllm/transformers_utils/hf_config.h"
@@ -223,10 +224,31 @@ struct MuseGlimmerLayerWeights {
   MuseGlimmerMlpWeights mlp;
 };
 
+// The materialized perception encoder (W4 WIRING). The tower itself is the W3
+// `vllm::multimodal` code, which owns host-f32 weight structs, so the loader
+// converts the checkpoint's bf16 bytes to f32 here rather than inventing a second
+// tower representation. That costs 2x the tower's on-disk footprint in host RAM
+// (~3.7 GiB bf16 -> ~7.4 GiB f32 at the released 30B scale) — a named residual,
+// not a design claim: collapsing it means teaching the W3 tower a bf16 weight
+// struct, which is a change to the sibling-owned tower gate.
+//
+// `vision_projection` is torch storage order [text_hidden, adapter_dim]
+// (muse_glimmer.py:1464-1468, `nn.Linear(adapter_dim, hidden_size, bias=False)`).
+// `perception_emb_norm` (:1469-1473) is a WEIGHTLESS RMSNorm applied only when
+// `normalize_tok_embeddings` is set, and `nn.Identity()` otherwise — it holds no
+// tensor either way, which is why it is absent from the enumeration.
+struct MuseGlimmerVisionTower {
+  bool loaded = false;
+  multimodal::MuseGlimmerVisionConfig cfg{};
+  multimodal::MuseGlimmerVisionWeights encoder{};
+  multimodal::MuseGlimmerVisionAdapterWeights adapter{};
+  std::vector<float> projection;  // [text_hidden, adapter_dim]
+};
+
 // Whole Muse Glimmer weights. W0 carried only the resolved params + the loader's
-// structural accounting; W1 adds the materialized TEXT tower. The perception
-// encoder's tensors are still NOT materialized (W3) — a Muse Glimmer forward on
-// this struct is text-only.
+// structural accounting; W1 added the materialized TEXT tower; W4 adds the
+// materialized PERCEPTION ENCODER (`vision`), so a Muse Glimmer forward is no
+// longer text-only.
 //
 // `model.embed_norm` (:1286) and the per-head `qk_norm` (:1121) are WEIGHTLESS and
 // deliberately hold no tensor; the forward realizes them as `vt::RmsNorm` against a
@@ -244,12 +266,19 @@ struct MuseGlimmerWeights {
   OwnedTensor final_norm;    // bf16 [H]     (:1296) — NOTE: NO `+1` offset here
   OwnedTensor lm_head;       // bf16 [H,V] Matmul-B (:1480) — UNTIED
   std::vector<MuseGlimmerLayerWeights> layers;
+
+  // W4: the perception encoder. `vision.loaded` is false for a text-only
+  // checkpoint (no `vision_config`) and for the params-only accounting form.
+  MuseGlimmerVisionTower vision;
 };
 
 // Load `MuseGlimmerForConditionalGeneration` safetensors. Performs the W0
-// structural accounting pass AND materializes the W1 text tower (both checkpoint
-// naming conventions, via `NormalizeMuseGlimmerWeightName`). The perception
-// encoder's tensors are accounted but NOT materialized — that is W3.
+// structural accounting pass, materializes the W1 text tower (both checkpoint
+// naming conventions, via `NormalizeMuseGlimmerWeightName`), and — W4 — the
+// perception encoder when the config carries a `vision_config`. The vision
+// attention's separate on-disk `q/k/v` shards are FUSED here into the tower's
+// merged `[3*hidden, hidden]` operand, in q|k|v row order, mirroring upstream's
+// `packed_modules_mapping` (muse_glimmer.py:1427-1430).
 MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
 
@@ -268,12 +297,17 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
 //              -> post_feedforward_layernorm (STANDALONE, +1, post_norm_eps)
 //   final norm (fused add, NO offset, rms_norm_eps) -> UNTIED lm_head
 //   -> * output_multiplier -> final_logit_softcapping
-// The perception encoder is NOT wired (W3), so an image/video prompt is still a
-// pending brick. Returns [n_out, vocab] f32.
+// Returns [n_out, vocab] f32.
 //
-// NOT ESTABLISHED by W1: no token-exact e2e claim. The pinned oracle cannot load
-// `muse_glimmer` at all (spec §0), so there is neither a golden nor a speed
-// denominator; W1's evidence is structural + per-mechanism unit level.
+// W4 WIRING adds `ForwardMm`, the `inputs_embeds` branch upstream's model forward
+// already has (:1311-1315), so the perception encoder is REACHABLE: an image or
+// video prompt now runs instead of refusing.
+//
+// NOT ESTABLISHED: no token-exact e2e claim, for text OR for image/video. The
+// pinned oracle cannot load `muse_glimmer` at all (spec §0), so there is neither a
+// golden nor a speed denominator; the evidence here is structural + per-mechanism
+// unit level. "The tower is reachable and its output lands on the placeholder
+// rows" is NOT "an image produces the right tokens".
 class MuseGlimmerModel {
  public:
   static std::vector<float> Forward(
@@ -287,7 +321,72 @@ class MuseGlimmerModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+
+  // W4 WIRING: the MULTIMODAL entry. Takes the ALREADY-MERGED input embeddings
+  // (bf16 bits, [T, hidden] row-major) instead of token ids, exactly as upstream's
+  // `MuseGlimmerModel.forward` takes `inputs_embeds` (muse_glimmer.py:1311-1315).
+  //
+  // NOTE the asymmetry that upstream's two branches encode and that the caller
+  // therefore owns: `embed_input_ids` (:1301-1302) is `embed_norm(embed_tokens(ids))`,
+  // but the `inputs_embeds` branch applies NO embed_norm. The vision soft tokens
+  // must not be re-normalized (their own `perception_emb_norm` already ran, or is
+  // Identity), so the norm belongs to the TEXT rows only — which is precisely what
+  // `MuseGlimmerMergeMultimodalEmbeds` below builds. Everything downstream of the
+  // embedding is shared with the text path, so a text-only prompt routed through
+  // here is BIT-IDENTICAL to `Forward` (gated in test_muse_glimmer_wiring.cpp).
+  static std::vector<float> ForwardMm(
+      const std::vector<uint16_t>& inputs_embeds_bf16,
+      const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
 };
+
+// The perception-encoder geometry, bridged from the resolved model config to the
+// W3 tower's own config struct. `compute_dtype` stays the tower default (bf16 —
+// what the checkpoint ships and what production runs).
+multimodal::MuseGlimmerVisionConfig MuseGlimmerVisionConfigOf(
+    const MuseGlimmerParams& params);
+
+// Which prompt rows are multimodal placeholders. BOTH the image (200092) and the
+// video (200091) token are placeholders and share one soft-token stream, mirroring
+// `configure_mm_token_handling(vocab, [image_token_id, video_token_id])`
+// (muse_glimmer.py:1496-1498) and `embed_multimodal` appending both modalities into
+// ONE `MultiModalEmbeddings` list (:1592-1602).
+std::vector<bool> MuseGlimmerMultimodalMask(const std::vector<int32_t>& token_ids,
+                                            const MuseGlimmerParams& params);
+
+// `_encode_pixel_groups` (muse_glimmer.py:1548-1569): encoder -> adapter ->
+// vision_projection -> perception_emb_norm. Returns host f32 [total_tokens,
+// text_hidden] — the soft tokens, in image order, ready to scatter. Throws BY NAME
+// when the checkpoint carries no perception encoder (:1553-1559).
+std::vector<float> MuseGlimmerEncodePixelGroups(
+    const std::vector<multimodal::MuseGlimmerVisionImage>& images,
+    const MuseGlimmerWeights& weights, vt::Queue& queue);
+
+// `SupportsMultiModal.embed_input_ids`: `embed_norm(embed_tokens(ids))` with the
+// placeholder rows masked-scattered from `mm_embeds` [N, hidden] host f32. Returns
+// bf16 bits [T, hidden], the exact input `ForwardMm` wants. `mm_embeds` may be
+// empty, in which case this is plain `embed_input_ids` and the result reproduces
+// the text path bit-for-bit.
+std::vector<uint16_t> MuseGlimmerMergeMultimodalEmbeds(
+    const std::vector<int32_t>& token_ids, const std::vector<float>& mm_embeds,
+    const MuseGlimmerWeights& weights, vt::Queue& queue);
+
+// Single-sequence greedy image->text driver, mirroring the Gemma-4 fold
+// (`Gemma4GenerateGreedyViaRegistry`, gemma4_mm.cpp): EVERY step goes through
+// `ModelRegistry::Forward` with `ModelForwardInput.mm` set, so the ENGINE's
+// registered mm branch drives decode rather than a bespoke in-TU forward.
+//
+// HONESTY: this makes an image prompt RUN. It does NOT establish that the tokens
+// are correct — the pinned oracle cannot load `muse_glimmer` at all, so there is
+// no reference decode to compare against and no speed denominator either
+// (specs/muse-glimmer.md §0).
+std::vector<int32_t> MuseGlimmerGenerateGreedyViaRegistry(
+    LoadedModel& model, const std::vector<int32_t>& prompt_ids,
+    const std::vector<multimodal::MuseGlimmerVisionImage>& images,
+    int32_t eos_token_id, const MuseGlimmerWeights& weights, const HfConfig& config,
+    vt::Queue& queue, int max_new_tokens);
 
 // KV-cache spec builder: ONE full-attention group over the uniform GQA geometry.
 // W1 RESOLVED the W0 placeholder note: the RoPE layers are sliding-window and the
