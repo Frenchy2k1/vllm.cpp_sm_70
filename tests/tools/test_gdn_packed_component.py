@@ -562,7 +562,7 @@ def _write_complete_evidence(root: pathlib.Path, *, packed_better: bool = True) 
         json.dumps(build_component_plan(SOURCE_SHA)), encoding="utf-8"
     )
     build = root / "build"
-    artifact = build / "examples" / "server"
+    artifact = build / "examples" / "vllm-server"
     artifact.parent.mkdir(parents=True)
     artifact.write_text(
         "immutable MatmulNvfp4Cutlass [VT_FP4_CACHE] prepared\n",

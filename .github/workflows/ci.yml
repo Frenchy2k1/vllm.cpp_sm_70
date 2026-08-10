@@ -85,10 +85,21 @@ jobs:
         run: |
           python3 scripts/check-env-doc.py
           python3 tests/scripts/test_check_env_doc.py
+      - name: The docs site's content invariants hold
+        run: |
+          python3 scripts/check-site.py
+          python3 tests/scripts/test_check_site.py
       - name: Model add+RMSNorm glue routes through the fusion catalog
         run: |
           python3 scripts/check-fusion-consistency.py
           python3 tests/scripts/test_check_fusion_consistency.py
+      - name: Structural checkers ignore text the compiler never sees
+        run: |
+          python3 tests/scripts/test_checker_text.py
+      - name: Every fp4 resident upload keeps its post-upload residency step
+        run: |
+          python3 scripts/check-fp4-resident-consistency.py
+          python3 tests/scripts/test_check_fp4_resident_consistency.py
       - name: Model decode is born on the runner (device-resident logits)
         run: |
           python3 scripts/check-runner-routing-consistency.py
@@ -279,15 +290,18 @@ jobs:
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
   pr-size:
-    # PR-only: helper PRs stay cheap to review, which is what stops the serial
-    # operator from becoming the bottleneck. Non-row branches are reported only.
+    # PR-only. The per-class LINE BUDGETS this job used to enforce were retired
+    # 2026-08-10 (see scripts/check-pr-size.py); the job name is kept because it
+    # is a required check. What it enforces now: explicit path classification,
+    # the fail-closed binary guard, the checker-change mutation-evidence
+    # contract, and the role check that keeps product paths on a PR.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Helper PRs stay reviewable
+      - name: PR path classification and checker evidence
         run: |
           python3 scripts/check-pr-size.py \
             --base "${{ github.event.pull_request.base.sha }}" \

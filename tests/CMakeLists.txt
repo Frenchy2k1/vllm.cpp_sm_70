@@ -74,6 +74,7 @@ vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1317,6 +1318,8 @@ target_include_directories(test_qwen27_spec_decode_concurrent PRIVATE
 # battery through the paged engine and checks per-(prompt,pos) set membership vs
 # the vLLM 0.25.0 oracle's K-run greedy set (STRICT where vLLM is deterministic).
 # Checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot/goldens are absent.
+vllm_cpp_add_test(test_moe_two_engines vllm/models/test_moe_two_engines.cpp)
+target_include_directories(test_moe_two_engines PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3coder_paged_engine vllm/models/test_qwen3coder_paged_engine.cpp)
 target_compile_definitions(test_qwen3coder_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-surface-coverage.py"
+SHARED_TEXT = ROOT / "scripts/checker_text.py"
 SPEC = importlib.util.spec_from_file_location("check_surface_coverage", CHECKER)
 assert SPEC is not None and SPEC.loader is not None
 mod = importlib.util.module_from_spec(SPEC)
@@ -357,6 +358,10 @@ def _base_files(sym: str = "vllm_complete") -> dict[str, str]:
     """A minimal valid fixture tree the shipped checker passes (rc 0)."""
     return {
         "scripts/check-surface-coverage.py": CHECKER.read_text(encoding="utf-8"),
+        # The checker imports its comment stripper from the shared helper beside it
+        # (scripts/checker_text.py), so the fixture tree needs that file too — a
+        # subprocess run of a scripts/ dir that lacks it dies on the import.
+        "scripts/checker_text.py": SHARED_TEXT.read_text(encoding="utf-8"),
         "CMakeLists.txt": "install(FILES include/vllm.h DESTINATION include)\n",
         "include/vllm.h": "VLLM_API vllm_status vllm_complete(void);\n",
         "docs/FEATURES.md": (

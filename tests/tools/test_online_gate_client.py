@@ -29,6 +29,7 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
+    MODEL_GATE_CONTRACTS,
     MODEL_REPOSITORIES,
     MODEL_REVISIONS,
     FLASHINFER_VERSION,
@@ -1002,8 +1003,11 @@ class OnlineClientContractTests(unittest.TestCase):
             '[[ -n ${build_dir} && -f ${build_dir}/CMakeCache.txt ]]'
         )
         build = script.index('if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then')
+        # The driver resolves the server artifact by name (`vllm-server`, with
+        # the pre-rename `server` as a replay fallback) and only then asserts it
+        # is executable, so the resolution line is the postflight's first token.
         executable_postflight = script.index(
-            '[[ -x ${build_dir}/examples/server ]]'
+            'server_bin="${build_dir}/examples/vllm-server"'
         )
         self.assertLess(configured_preflight, build)
         self.assertLess(build, executable_postflight)
@@ -2247,7 +2251,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (build / "examples/server").write_bytes(
+            (build / "examples/vllm-server").write_bytes(
                 b"MatmulNvfp4Cutlass\0[VT_FP4_CACHE] prepared\0"
                 b"[VT_CUDA_PROFILE] started\0[VT_BENCH_SHUTDOWN] ready\0"
             )
@@ -2352,7 +2356,13 @@ class OnlineClientContractTests(unittest.TestCase):
             self.assertIn("build_command", execution["artifacts"])
 
             gate_log = root / "gate.log"
-            gate_log.write_text("passed\n", encoding="utf-8")
+            # ctest -V output: the gate's own proof line, which a
+            # checkpoint-absent (and therefore token-free) run never prints.
+            gate_log.write_text(
+                f"{MODEL_GATE_CONTRACTS['test_qwen27_paged_engine']['proof']}\n"
+                "passed\n",
+                encoding="utf-8",
+            )
             gate = record_model_gate(
                 root / "gate.json",
                 log=gate_log,
@@ -2420,7 +2430,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     "--force-overwrite=true",
                     "--output",
                     str(prefix),
-                    str(build / "examples/server"),
+                    str(build / "examples/vllm-server"),
                     "--model",
                     str(snapshot),
                     "--port",

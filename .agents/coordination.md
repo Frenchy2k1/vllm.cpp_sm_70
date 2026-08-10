@@ -118,6 +118,24 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**TRAILER-CONTRACT MISS, recorded by developer decision (2026-08-10).** Commits
+`450a1b69` (the PR-size retirement) and its merge `a178f1af` reached `main` in
+the same minutes that `check-commit-trailers.py` was tightened on `main` to
+require a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and an `Assisted-by` whose
+agent token carries no space (`Claude:claude-opus-5 [ClaudeCode]`). Both use the
+older shape, so `commit-protocol-tag` is RED for that pushed range and a
+follow-up commit cannot repair it, because CI checks the pushed range itself.
+
+A corrected single commit with the identical tree was prepared and preflighted
+green; the developer chose NOT to rewrite shared history for it, so the red
+stands and this note is the record. Every earlier commit of this session that is
+already on `main` carries the same older shape for the same reason: it was
+compliant when written.
+
+Separately, and not this claim's to fix: the tightened checker also fails
+commits that are not ours (`1078355d` carries a forbidden `Co-authored-by`), so
+the tightening left older history non-compliant across the repository.
+
 **PROTOCOL MISS on `CLAIM-SPEC-DSPARK`, recorded not waived (2026-08-10).** PR
 #211 was merged at developer instruction while its CI was still pending; the run
 finished 11 green (including `cuda-fat-build`, both sanitizers and all three
