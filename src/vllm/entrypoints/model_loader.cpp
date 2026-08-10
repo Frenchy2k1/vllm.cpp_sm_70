@@ -1078,7 +1078,11 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
     async_engine_ = std::make_unique<vllm::v1::AsyncLLM>(
         input_processor_, *scheduler_, executor_, output_processor_,
         block_hasher_, /*shutdown_timeout_s=*/0, max_concurrent_batches_,
-        &structured_output_manager_);
+        &structured_output_manager_,
+        // The speculative-decode flag EngineCoreProc needs to run post_step.
+        // Without it every speculator's drafts were proposed and dropped on
+        // this (the production CLI/server) path.
+        /*check_for_draft_tokens=*/resolved_spec_config_.has_value());
   }
   return *async_engine_;
 }

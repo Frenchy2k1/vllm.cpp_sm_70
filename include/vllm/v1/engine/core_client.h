@@ -76,7 +76,8 @@ class InprocClient {
   // blocked get_output() learns of the death, core.py:1229-1235).
   InprocClient(Scheduler& scheduler, Executor& executor,
                StructuredOutputManager* structured_output_manager = nullptr,
-               int max_concurrent_batches = 1, int shutdown_timeout_s = 0);
+               int max_concurrent_batches = 1, int shutdown_timeout_s = 0,
+               bool check_for_draft_tokens = false);
 
   // shutdown() then join (upstream MPClient.shutdown + atexit teardown).
   ~InprocClient();

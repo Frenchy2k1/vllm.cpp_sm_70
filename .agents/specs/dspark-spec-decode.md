@@ -17,7 +17,7 @@
 | Dependencies | Landed: `SPEC-DFLASH` (`DONE`), `SPEC-REJECTION` verify half, `SPEC-GDN-SEGMENTS`. External, PENDING developer authority: checkpoint downloads (2.79-8.80 GB), dgx GPU time, push/draft-PR. Blocking unknown: R1, whether the pinned oracle runs DSpark at all. |
 | Work breakdown | §4 — W1 config, W2 Markov head + draft model, W3 loader (native + Speculators), W4 speculator (anchor layout + sequential sampling), W5 runner + one-surface, W6 gates. W1-W4 are CPU-gateable. |
 | Risks/decisions | §6 — R1 oracle runnability (V2 runner), R2 Speculators format is a new subsystem, R3 the community 27B checkpoint's `attn_output_gate`, R4 the `k >= dspark_block_size` garbling trap, R5 sequential sampling vs CUDA-graph capture, R6 greedy before probabilistic, R7 GB10 host-RAM pressure. |
-| Status | W1-W5 LANDED; the drafter PROPOSES correctly on real weights but the drafts are never installed by the scheduler, so nothing is verified. W6 OPEN with the break localized (see §6b). NO correctness claim. R1 answered (§6a). |
+| Status | W1-W5 LANDED and DSpark now genuinely speculates on the 35B gate model (real acceptance, 6.78 -> 41.89 tok/s) after fixing an engine-wide `check_for_draft_tokens` wiring bug that silently disabled EVERY speculator on the CLI/server path. W6 still OPEN: spec-ON output is not yet token-identical to spec-OFF nor run-stable (see §6b). R1 answered (§6a). |
 | Goal (developer, 2026-08-09) | a FULL DSpark implementation in vllm.cpp, mirrored from vLLM |
 
 ## 0. Verdict
@@ -335,16 +335,42 @@ and the architecture (commit `56b7b607`).
 4. **Speed** is 6.78 vs 37.34 tok/s (5.5x slower) — what paying for a drafter
    whose output is discarded looks like.
 
-**Open defect (the W6 blocker):** find why `take_draft_token_ids()` ->
-`EngineCore::post_step` -> `update_draft_token_ids` never installs the proposed
-drafts. `check_for_draft_tokens_` is `resolved_spec_config_.has_value()` and the
-dspark branch of `ResolveSpecConfig` does return a config, so the next probes
-are (a) whether `post_step` runs at all on this path, and (b) whether
-`pending_drafts_` survives to the pull. The DFlash control that would have shown
-whether the same wiring works for the landed lane could NOT be run: the landed
-`MakeDflashDraftConfig` does `c.at("rope_theta")` and the z-lab 35B DFlash draft
-carries `rope_theta` only under `rope_parameters` — a pre-existing gap in the
-DFlash lane, found incidentally, worth its own fix.
+**ROOT CAUSE FOUND AND FIXED — and it was never DSpark's.**
+`EngineCoreProc`'s constructor called the base `EngineCore(scheduler, executor,
+structured_output_manager)` WITHOUT the `check_for_draft_tokens` argument, so it
+defaulted to `false` on the production path. `post_step` therefore returned at
+its first guard, `take_draft_token_ids()` was never pulled, and no speculator's
+drafts were ever installed. **This affected EVERY speculator — MTP, DFlash,
+ngram, DSpark — through the CLI and the OpenAI server.** The landed spec-decode
+gates did not catch it because they drive the engine directly rather than
+through `AsyncLLM` -> `InprocClient` -> `EngineCoreProc`.
+
+Fixed by threading the flag `AsyncLLM` -> `InprocClient` -> `EngineCoreProc` ->
+`EngineCore` and passing `resolved_spec_config_.has_value()` at the loader's
+`AsyncLLM` construction, plus calling `post_step(model_executed)` in the proc
+loop's `process_engine_step` where a stale comment had deferred it.
+
+**After the fix, on the 35B gate model, DSpark actually speculates:**
+
+```
+[SPECTRACE] req=0 pos=8  k=8 ns=2 acc=1 draft=[3177 421 682 ...] emit=[3177 34756]
+[SPECTRACE] req=0 pos=10 k=8 ns=3 acc=2 draft=[364 1141 12761 ...] emit=[364 1141 25438]
+```
+
+and throughput goes from **6.78 tok/s (drafts discarded) to 41.89 tok/s**,
+against 42.11 spec-OFF — i.e. from 5.5x slower to parity.
+
+**REMAINING DEFECT (W6 still open).** Speculative-ON output is NOT yet
+token-identical to spec-OFF, and it is not stable run to run: at 24 tokens the
+ON arm reproduced the spec-OFF prefix exactly, while a 48-token run of the same
+binary and prompt produced a different continuation from the first token. For
+greedy decoding a correct rejection sampler must make ON == OFF exactly, so this
+is a real bug, not a tie-break. Next probes, in order: (a) whether the
+divergence survives with async scheduling forced OFF on both arms (the OFF arm
+ran async-enabled, the ON arm async-disabled, so the two arms differ in more
+than speculation); (b) the anchor-layout `sample_pos` alignment against the
+verify side; (c) whether the aux multi-tap path is numerically neutral on the
+35B MoE NVFP4.
 
 ## 7. Evidence, authority, stop conditions
 

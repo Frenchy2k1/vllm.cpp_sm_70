@@ -173,9 +173,16 @@ class EngineCoreProc : public EngineCore {
   // shutdown_timeout_s mirrors VllmConfig.shutdown_timeout
   // (vllm/config/vllm.py:377, default 0): 0 => "abort" shutdown mode,
   // > 0 => "drain" (core.py:1330-1358).
+  //
+  // `check_for_draft_tokens` forwards EngineCore's speculative-decode flag. It
+  // MUST be threaded: without it the base defaulted to false on this path, so
+  // post_step returned immediately and EVERY speculator's proposed drafts were
+  // dropped on the production CLI/server path (found by SPEC-DSPARK W6:
+  // 24 proposals, 0 installs).
   EngineCoreProc(Scheduler& scheduler, Executor& executor,
                  StructuredOutputManager* structured_output_manager = nullptr,
-                 int max_concurrent_batches = 1, int shutdown_timeout_s = 0);
+                 int max_concurrent_batches = 1, int shutdown_timeout_s = 0,
+                 bool check_for_draft_tokens = false);
 
   // The IO queue split (core.py:915-916). Public exactly like the upstream
   // attributes: the in-proc client shares them directly (no socket relay).
