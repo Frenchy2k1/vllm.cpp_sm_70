@@ -661,7 +661,16 @@ TEST_CASE("C7 wiring: default request keeps every filter empty (inertness)") {
   CHECK(batch.no_allowed_token_ids());
 }
 
-TEST_CASE("C7 wiring: -1 logprobs sentinel dominates max_num_logprobs") {
+// `logprobs=-1` means "all logprobs". Upstream widens it to vocab_size at
+// admission (gpu_input_batch.py:434-440) so that every value in num_logprobs is
+// a concrete count and one gathered shape reaches every consumer; the sampler's
+// `num_logprobs == -1` branch is then unreachable on the V1 path.
+//
+// We used to propagate the sentinel instead (a recorded deviation), which routed
+// live requests into that branch and crashed the engine — issue #231. This case
+// asserts the mirrored behaviour, so the old assertion (`max_num_logprobs ==
+// -1`) is replaced rather than merely relaxed.
+TEST_CASE("C7 wiring: -1 logprobs widens to vocab_size, and wins the max") {
   InputBatch batch = make_batch();
   vllm::SamplingParams a;
   a.temperature = 0.0;
@@ -671,9 +680,30 @@ TEST_CASE("C7 wiring: -1 logprobs sentinel dominates max_num_logprobs") {
   b.logprobs = -1;  // all
   batch.add_request(make_req_sp("a", a));
   batch.add_request(make_req_sp("b", b));
+
+  // Widened at admission: the map holds a count, never the sentinel.
+  REQUIRE(batch.num_logprobs.count("b") == 1);
+  CHECK(batch.num_logprobs.at("b") == batch.vocab_size);
+  CHECK(batch.num_logprobs.at("a") == 3);
+
+  // "All" is simply the largest count, so it wins the max on its own.
   const auto& md = batch.make_sampling_metadata();
   REQUIRE(md.max_num_logprobs.has_value());
-  CHECK(*md.max_num_logprobs == -1);
+  CHECK(*md.max_num_logprobs == batch.vocab_size);
+}
+
+// A lone `-1` request must still widen — the max is not what does the widening.
+TEST_CASE("C7 wiring: a lone -1 logprobs request still carries vocab_size") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams sp;
+  sp.temperature = 0.0;
+  sp.logprobs = -1;
+  batch.add_request(make_req_sp("only", sp));
+  REQUIRE(batch.num_logprobs.count("only") == 1);
+  CHECK(batch.num_logprobs.at("only") == batch.vocab_size);
+  const auto& md = batch.make_sampling_metadata();
+  REQUIRE(md.max_num_logprobs.has_value());
+  CHECK(*md.max_num_logprobs == batch.vocab_size);
 }
 
 TEST_CASE("C7 wiring: index-keyed controls follow the row through swap/condense") {
