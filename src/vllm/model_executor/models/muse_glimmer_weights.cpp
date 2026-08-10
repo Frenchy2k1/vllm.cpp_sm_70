@@ -91,6 +91,14 @@ std::vector<int64_t> RawIntArray(const nlohmann::json& doc, const char* key) {
       if (v.is_number()) out.push_back(v.get<int64_t>());
   return out;
 }
+std::vector<double> RawDoubleArray(const nlohmann::json& doc, const char* key) {
+  std::vector<double> out;
+  const nlohmann::json* f = Field(doc, key);
+  if (f != nullptr && f->is_array())
+    for (const auto& v : *f)
+      if (v.is_number()) out.push_back(v.get<double>());
+  return out;
+}
 std::vector<std::string> RawStringArray(const nlohmann::json& doc, const char* key) {
   std::vector<std::string> out;
   const nlohmann::json* f = Field(doc, key);
@@ -282,8 +290,49 @@ MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
         "num_hidden_layers / num_attention_heads)");
   if (t.head_dim <= 0) t.head_dim = t.hidden_size / t.num_attention_heads;
 
-  // iRoPE mask.
+  // iRoPE mask, CHECKPOINT-FIRST. The released meta-models/Muse-Glimmer-30B
+  // config ships NO `no_rope_layers` at all; it encodes the same split TWICE:
+  //   text_config.layer_rope_theta[i] == 0        marks a NoPE layer
+  //   text_config.layer_types[i] == "full_attention" marks the same layer
+  // (verified against the released config.json, 2026-08-10: both put the NoPE
+  // layers at 3, 7, 11, ... 51 for L=52). Deriving from the checkpoint rather than
+  // from the counted default matters because the default only HAPPENS to agree for
+  // this depth; a checkpoint with a different schedule would be silently mis-split
+  // into wrong-RoPE, wrong-window layers that still emit fluent text.
+  //
+  // Precedence: an explicit `no_rope_layers` wins; else derive from the checkpoint's
+  // own fields; else fall back to upstream's backward-counted default
+  // (configs/muse_glimmer.py:20-26).
+  const std::vector<double> layer_rope_theta = RawDoubleArray(text, "layer_rope_theta");
+  const std::vector<std::string> text_layer_types = RawStringArray(text, "layer_types");
+  const size_t L = static_cast<size_t>(t.num_hidden_layers);
+
+  std::vector<int64_t> from_theta;
+  if (layer_rope_theta.size() == L) {
+    for (double th : layer_rope_theta) from_theta.push_back(th != 0.0 ? 1 : 0);
+    // Every RoPE layer must use the model's single theta: we thread ONE theta into
+    // the forward, so a per-layer value that disagrees would be applied wrongly.
+    for (double th : layer_rope_theta)
+      if (th != 0.0 && th != t.rope_theta)
+        throw std::runtime_error(
+            "MuseGlimmer layer_rope_theta carries a per-layer theta that disagrees "
+            "with rope_parameters.rope_theta; only a single theta is supported");
+  }
+  std::vector<int64_t> from_types;
+  if (text_layer_types.size() == L)
+    for (const std::string& ty : text_layer_types)
+      from_types.push_back(ty == "full_attention" ? 0 : 1);
+
+  // Both present => they must AGREE. A disagreement is a config we do not
+  // understand, and guessing which one wins is exactly the silent-wrong-model risk.
+  if (!from_theta.empty() && !from_types.empty() && from_theta != from_types)
+    throw std::runtime_error(
+        "MuseGlimmer layer_rope_theta and layer_types disagree about which layers "
+        "are NoPE/full-attention");
+
   t.no_rope_layers = RawIntArray(text, "no_rope_layers");
+  if (t.no_rope_layers.empty() && !from_theta.empty()) t.no_rope_layers = from_theta;
+  if (t.no_rope_layers.empty() && !from_types.empty()) t.no_rope_layers = from_types;
   if (t.no_rope_layers.empty())
     t.no_rope_layers = DefaultMuseGlimmerNoRopeLayers(t.num_hidden_layers);
   if (static_cast<int64_t>(t.no_rope_layers.size()) != t.num_hidden_layers)
@@ -315,20 +364,33 @@ MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
     v.num_hidden_layers = RawInt(*vision_obj, "num_hidden_layers", 50);
     v.hidden_size = RawInt(*vision_obj, "hidden_size", 1536);
     v.intermediate_size = RawInt(*vision_obj, "intermediate_size", 8960);
-    v.merge_kernel_size = RawInt(*vision_obj, "merge_kernel_size", 2);
-    v.output_dim = RawInt(*vision_obj, "output_dim", 6144);
+    // FIELD SPELLINGS, verified against the released config.json (2026-08-10):
+    // the vision block ships `merge_size` (not `merge_kernel_size`) and ships
+    // NEITHER `output_dim` NOR `adapter_dim` — those live at the TOP level as
+    // `out_hidden_size` and `projector_hidden_size`. Reading only the old spellings
+    // fell back to defaults that COINCIDENTALLY equal the real values, so the
+    // `output_dim == hidden * merge^2` check below passed by luck rather than by
+    // reading the checkpoint. Both spellings are accepted, checkpoint-first.
+    v.merge_kernel_size =
+        RawInt(*vision_obj, "merge_size", RawInt(*vision_obj, "merge_kernel_size", 2));
+    v.output_dim =
+        RawInt(*vision_obj, "output_dim", RawInt(raw, "out_hidden_size", 6144));
     v.patch_temporal = RawInt(*vision_obj, "patch_temporal", 2);
-    v.adapter_dim = RawInt(*vision_obj, "adapter_dim", 4096);
+    v.adapter_dim =
+        RawInt(*vision_obj, "adapter_dim", RawInt(raw, "projector_hidden_size", 4096));
     v.layer_norm_eps =
         static_cast<float>(RawDouble(*vision_obj, "layer_norm_eps", 1e-5));
     v.layer_types = RawStringArray(*vision_obj, "layer_types");
     if (v.layer_types.empty()) {
       // configs/muse_glimmer.py:168-176 — full every 4th layer AND on the last.
-      // NOTE this rule differs from the text tower's backward-counted mask.
+      // NOTE this rule differs from the text tower's backward-counted mask. The
+      // non-full spelling is "window_attention", which is what the released
+      // config.json ships (verified 2026-08-10); every consumer compares against
+      // "full_attention" as upstream does, so either spelling reads the same.
       for (int64_t i = 0; i < v.num_hidden_layers; ++i)
         v.layer_types.push_back(
             ((i + 1) % 4 == 0 || i == v.num_hidden_layers - 1) ? "full_attention"
-                                                               : "sliding_attention");
+                                                               : "window_attention");
     }
     // muse_glimmer.py:734-739 — the pixel-shuffle output width is structural.
     const int64_t expected = v.hidden_size * v.merge_kernel_size * v.merge_kernel_size;
