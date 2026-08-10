@@ -131,9 +131,25 @@ invariants* the ported sync gate asserts, on the async stack:
 
 | Case | Where | Asserts |
 |---|---|---|
-| `async_llm: live per-step stats populate the Prometheus registry` | `tests/vllm/v1/test_async_llm.cpp` (new) | Baseline zero; after driving N requests to completion through `AsyncLLM`: `vllm:num_requests_running`/`_waiting` gauges fall back to 0, `vllm:prompt_tokens_total` and `vllm:generation_tokens_total` equal the exact counts the run produced, `vllm:request_success_total{finished_reason="length"}` counts the finished requests, and the TTFT / ITL / e2e / TPOT / iteration-tokens / generation-tokens histograms carry the exact expected sample counts. Mirrors `test_llm_engine.cpp` case 6. |
+| `async_llm: live per-step stats populate the Prometheus registry` | `tests/vllm/v1/test_llm_engine.cpp:1025` | Baseline zero; after driving two requests to completion through `AsyncLLM`: `vllm:num_requests_running`/`_waiting` gauges fall back to 0, `vllm:prompt_tokens_total` and `vllm:generation_tokens_total` equal the exact counts the run produced, `vllm:request_success_total{finished_reason="length"}` counts the finished requests, and the TTFT / ITL / e2e / TPOT / iteration-tokens / generation-tokens histograms carry the exact expected sample counts. Mirrors `test_llm_engine.cpp` case 6. |
 | per-request timing on the async path | same case | `vllm:request_{queue,prefill,inference,decode}_time_seconds` `_sum` values are **positive**, and `inference == prefill + decode`. Mirrors `test_llm_engine.cpp` case 7, which is the `SERVE-RESPONSE-METRICS` invariant. |
-| async-scheduling (batch-queue) step path | same file | The same registry invariants hold with `max_concurrent_batches = 2`, which is what proves item (4) of Scope. RED without the `step_with_batch_queue` stamp: gauges stay 0 and TTFT is nonsensical. |
+| `async_llm: with no logger attached the token stream is unchanged` | `tests/vllm/v1/test_llm_engine.cpp:1148` | The inertness claim: identical token ids with and without an attached logger. |
+| async-scheduling (batch-queue) step path | `tests/vllm/v1/test_async_llm.cpp:560,618` | The same registry invariants with `max_concurrent_batches = 2` over an `AsyncScheduler`, which is what proves item (4) of Scope. Two cases: a POLL until `vllm:num_requests_running` reads 1 while a delayed stub keeps a request in flight (RED: times out, the gauge never leaves 0 — and it exercises the recorder mutex, since `Expose()` runs on the test thread concurrently with the handler's `Record()`), and exact token counters + positive TTFT/e2e `_sum` after a short run (RED: unstamped `timestamp` makes both observations `-arrival_time`). |
+
+**Harness note (refinement of the W0 plan).** The primary gate lives in
+`test_llm_engine.cpp` rather than `test_async_llm.cpp` because that file already
+has `AsyncHarness` — the identical model, KV config, tokenizer and sampling
+params as sync case 6, but fronted by `AsyncLLM` — plus the `MetricValue` /
+`HistogramCount` / `HistogramSum` helpers and the `kL` label suffix. Asserting
+"the same invariants" is then literal rather than approximate. Only the depth-2
+batch-queue pair, which needs an `AsyncScheduler` and a delay-injecting runner
+stub, lives in `test_async_llm.cpp`, where both patterns already exist.
+
+The async gate scrapes **after `shutdown()`** joins the output-handler thread.
+That is the quiescence point: upstream's asyncio handler runs to its next
+`await` before a woken consumer resumes, so `record()` always precedes the
+consumer, but our handler is a real thread and a drained collector says nothing
+about whether that step's fold has retired.
 
 Existing gates that must stay byte-identical: `test_prometheus_metrics` (4/4),
 `test_llm_engine` cases 6 and 7, `test_async_llm`'s existing cases,
@@ -214,14 +230,110 @@ data race or a zeroed path in the tree between commits.
 
 ## Evidence
 
-Filled in by the implementing commit: RED output verbatim, focused GREEN
-counts, the full `ctest` line, any serial re-run of a known-flaky binary with
-both numbers, and the landed SHA/PR.
+Build: `cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release
+-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_METAL=OFF`, `-j 18`,
+1131/1131 clean under `-Werror`.
 
-* RED (pre-wiring): recorded in the PR body and the implementation commit
-  message.
-* GREEN: `test_async_llm`, `test_llm_engine`, `test_prometheus_metrics`, full
-  `ctest`.
+**RED** (attach point present, nothing folded, nothing stamped):
+
+```text
+test_llm_engine -tc="async_llm*"
+  test_llm_engine.cpp:1083: CHECK( MetricValue(t, kPrompt) == 2.0 )        -> 0 == 2
+  test_llm_engine.cpp:1084: CHECK( MetricValue(t, kGen) == total_gen )     -> 0 == 8
+  test_llm_engine.cpp:404:  REQUIRE( p != npos ) series absent:
+                            vllm:request_success_total{...,finished_reason="length"}
+  test_llm_engine.cpp:1092: time_to_first_token_seconds _count             -> 0 == 2
+  test_llm_engine.cpp:1093: inter_token_latency_seconds _count             -> 0 == 6
+  test_llm_engine.cpp:1094: e2e_request_latency_seconds _count             -> 0 == 2
+  test_llm_engine.cpp:1095: request_time_per_output_token_seconds _count   -> 0 == 2
+  test_llm_engine.cpp:1096: iteration_tokens_total _count                  -> 0 >= 1
+  test_llm_engine.cpp:1097: request_generation_tokens _count               -> 0 == 2
+  test_llm_engine.cpp:1101-1103: request_{queue,prefill,inference}_time _count -> 0 == 2
+  test_llm_engine.cpp:1109-1113: {queue,prefill,inference,decode,e2e} _sum > 0 -> 0 > 0
+  test_llm_engine.cpp:1119: time_to_first_token_seconds _sum > 0           -> 0 > 0
+  [doctest] test cases:  2 |  1 passed |  1 failed | 13 skipped
+  [doctest] assertions: 63 | 44 passed | 19 failed |
+
+test_async_llm -tc="*depth-2*"
+  test_async_llm.cpp:608: CHECK( saw_running )                             -> false
+  test_async_llm.cpp:657: prompt_tokens_total                              -> 0 == 1
+  test_async_llm.cpp:658: generation_tokens_total                          -> 0 == 8
+  test_async_llm.cpp:660: time_to_first_token_seconds_count                -> 0 == 1
+  test_async_llm.cpp:662: e2e_request_latency_seconds_count                -> 0 == 1
+  test_async_llm.cpp:666: time_to_first_token_seconds_sum > 0              -> 0 > 0
+  test_async_llm.cpp:668: e2e_request_latency_seconds_sum > 0              -> 0 > 0
+  [doctest] test cases: 2 | 0 passed | 2 failed | 8 skipped
+  [doctest] assertions: 9 | 2 passed | 7 failed |
+```
+
+**GREEN** after the wiring:
+
+| Binary | Result |
+|---|---|
+| `test_llm_engine` | 15 cases / 291 assertions, 0 failed |
+| `test_async_llm` | 10 cases / 325 assertions, 0 failed |
+| `test_prometheus_metrics` | 4 cases / 81 assertions, 0 failed |
+| `ctest --test-dir build-cpu -j 6` (pre-rebase) | **366/366 passed, 0 failed**, 780.19 s |
+| `ctest --test-dir build-cpu -j 6` (post-rebase on `848d4a87`) | **368/368 passed, 0 failed**, 1249.55 s |
+
+No serial re-run was owed on that run: none of the four known-flaky binaries
+(`test_openai_api_server`, `test_openai_conformance`, `test_async_llm`,
+`test_engine_core_proc`) failed in it.
+
+**A gate log is not evidence until it is checked for contamination.** The
+post-rebase re-run appeared to report `test_openai_conformance` failing with 13
+of 23 cases. It did not. Three internal inconsistencies in the log file said so
+before any test was re-run:
+
+* the failing assertions cited
+  `/home/mudler/_git/vllm.cpp-lora-w2/tests/vllm/entrypoints/openai/test_conformance.cpp`
+  — a **different worktree**, while `strings` on the binary `ctest` actually
+  invoked contains 152 references to this worktree and **zero** to that one;
+* the file was **48,261 NUL bytes out of 60,238** — a sparse hole, the
+  signature of two processes writing one file at independent offsets;
+* its own progress lines counted `1/368` while the summary said `out of 369`.
+
+A concurrent session was running `ctest` in `/home/mudler/_git/vllm.cpp-lora-w2`
+(pid 218469, confirmed via `/proc/<pid>/cwd`), and its output landed in this
+session's log. Our own run was still executing at the moment that "summary"
+appeared. The two ctests together drove the box to a **load average of 360 on 20
+cores**, and `test_conformance` binds an *ephemeral* port (`:409
+bind_to_any_port`), so the `REQUIRE(res)` failures are `httplib::Result` falsy
+from connect/read timeouts under starvation — which is precisely why that binary
+is on the known-flaky list, and is not a port clash.
+
+Two things follow, and both are cheap. Gate logs are written **inside the
+worktree** (`.gatelogs/`, git-excluded) rather than to a shared temp path. And a
+failing gate log is validated before it is believed: check the source paths it
+cites against the binary, check for NUL runs, and check that its own test counts
+agree.
+
+**A re-run on an uncontaminated log then failed `test_async_llm` for real**, in
+the pre-existing case `async_llm test_abort and test_multi_abort leave other
+requests healthy` (`:325`, `Drain(engine, reused) == 3` observing 4) — not in
+any case this row adds. Because that binary is squarely in this row's blast
+radius, it was NOT called a flake on reputation. It was measured, paired, on the
+same box, by alternating the two builds in one worktree and running 40
+concurrent copies of the single case:
+
+| Tree | round 1 | round 2 | round 3 | total |
+|---|---:|---:|---:|---:|
+| `main` @ `848d4a87` | 11/40 | 9/40 | 11/40 | **31/120 (25.8%)** |
+| `main` + this row's wiring | 9/40 | 15/40 | 7/40 | **31/120 (25.8%)** |
+
+Identical rate: the defect is pre-existing on `main` and this wiring neither
+causes nor worsens it. It is a real engine-frontend race — `AsyncLLM::abort`
+queues the core abort asynchronously while the case's precondition
+(`has_unfinished_requests()`) reads only frontend state, so a token frame from
+the previous incarnation of a reused request id can reach the new collector —
+and it now has its own issue,
+[#294](https://github.com/mudler/vllm.cpp/issues/294), rather than a silent fix
+here. Serially on an idle box both that binary and `test_openai_conformance` are
+green (10/10 and 23/23), and the full gate re-run on the idle box is **368/368,
+0 failed** (log verified: 0 NUL bytes, this worktree only) — recorded above.
+The case reappeared once more on the final base under load 167, and the split
+was checked rather than assumed: this row's own depth-2 cases 8/8, the #294
+case 7/8 — its measured rate, unchanged.
 
 ## Stop conditions
 
@@ -237,7 +349,49 @@ both numbers, and the landed SHA/PR.
 
 ## Outcome
 
-Filled in when the row's residual reaches `DONE`. Reserved for: what the async
-gate measured, what was rejected (a snapshot-copy `Expose`, moving the stamp
-into `Scheduler::update_from_output`), and why the logger attach is opt-in
-rather than always-on.
+The `SERVE-METRICS` row keeps its residual (the config-gated families), so it
+does not reach `DONE` here; this section records what closing the AsyncLLM
+residual actually established.
+
+**What was measured.** The async serving stack produces the same metric values
+the synchronous one does for the identical workload: over two `hello` prompts
+at `max_tokens=4` on the CPU reference MoE, both stacks report
+`prompt_tokens_total == 2`, `generation_tokens_total == 8`,
+`request_success_total{finished_reason="length"} == 2`, running/waiting gauges
+back at 0, two TTFT observations, six ITL observations, and two each of e2e /
+TPOT / generation-tokens — with every per-request timing `_sum` positive and
+`inference == prefill + decode`. That is the whole claim of #277.
+
+**What the RED proved beyond "the numbers were zero".** Three separate defects
+were latent, and each has its own discriminator:
+
+1. *No fold.* 19 assertions read 0 on a stack that had just generated 8 tokens.
+2. *No `scheduler_stats` on the depth-2 path.* The running gauge never left 0
+   even with a request in flight for 20 s. A single end-of-run scrape could not
+   have caught this — every gauge is legitimately 0 once the batch drains — so
+   the gate had to be a poll against a deliberately slowed runner.
+3. *No `timestamp` on the depth-2 path.* TTFT and e2e were computed as
+   `0 - arrival_time`. Their `_count` was already correct, so only the sign of
+   the `_sum` distinguishes it; a count-only assertion would have passed.
+
+**What was rejected.**
+
+* *A snapshot-copy `Expose()`* (clone the registry under a short lock, render
+  outside it). Rejected: rendering a few hundred series is orders of magnitude
+  below one engine step, so the lock hold is not worth doubling the state and
+  the copy cost on every scrape. One leaf mutex.
+* *Moving the stamp into `Scheduler::update_from_output`*, which is literally
+  where upstream does it. Rejected for this row: `EngineCore::step()` already
+  stamps at its own site, so relocating would restructure the synchronous path
+  #277 does not touch, for no behavioural difference. Recorded as a deviation
+  in the Port map rather than done silently.
+* *Recording inside `output_processor_mutex_`.* Rejected: it would make the
+  logger mutex an inner lock under the output-processor lock, which is the only
+  way to build a cycle here. `Record` is called after the critical section.
+
+**Why the attach is opt-in.** It mirrors upstream — `logger_ref[0]` is `None`
+unless a logger manager exists, and `log_stats` gates the `IterationStats`
+build — and it keeps the default path instruction-identical, which is what lets
+the no-logger token-stream identity case assert byte-equality rather than
+approximate equality. The server turns it on with `--enable-metrics`, whose
+default is already on.

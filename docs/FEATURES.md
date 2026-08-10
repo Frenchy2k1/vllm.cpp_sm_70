@@ -241,7 +241,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | OpenAI-compatible `/v1/chat/completions` | ✅ | ✅ | ✅ | ✅ |
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Offline batch API | ✅ | ✅ | ◐ | ☐ |
-| Prometheus metrics | ✅ | ✅ | ✅ | ◐ |
+| Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog | ✅ | ✅ | ◐ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |

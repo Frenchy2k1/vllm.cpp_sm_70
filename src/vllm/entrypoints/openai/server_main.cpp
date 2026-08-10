@@ -932,8 +932,13 @@ int VllmServerMain(int argc, char** argv) {
     if (args.enable_metrics) {
       prom_logger = std::make_unique<vllm::v1::metrics::PrometheusStatLogger>(
           served_model_name, loaded->max_model_len(), /*engine_index=*/0);
-      // Sync engine path records on step(); async may under-report until fully wired.
+      // BOTH frontends record into the SAME logger, so a scrape reports this
+      // process whichever one served the request. The async engine is the one
+      // that matters here — every HTTP route is served from
+      // loaded->async_engine() — and until #277 it recorded nothing, so
+      // /metrics answered with a well-formed catalog that never moved.
       loaded->engine().set_stat_logger(prom_logger.get());
+      loaded->async_engine().set_stat_logger(prom_logger.get());
       server.set_metrics_logger(prom_logger.get());
       std::cerr << "server: GET /metrics enabled (PrometheusStatLogger)\n";
     }
