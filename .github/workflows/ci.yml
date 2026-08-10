@@ -363,6 +363,27 @@ jobs:
           python3 scripts/check-triton-aot-multiarch.py \
             --vendored-root src/vt/cuda/triton_aot_vendored \
             --library build-cuda-fat/libvllm.a
+      # BUILD-TRITON-DEFAULT-ON (#219), spec Tests item 3. The configure above
+      # passes -DVLLM_CPP_TRITON=ON explicitly, so it cannot witness the DEFAULT.
+      # This one passes no such flag: the option must resolve ON by itself AND
+      # reach every CUDA translation unit as VLLM_CPP_TRITON=1 /
+      # VLLM_CPP_TRITON_CHUNKO_BF16=1, which is the row's actual claim. Configure
+      # only, and it reuses the CUTLASS the job already fetched (FETCH stays ON
+      # as the fallback if that path ever moves).
+      - name: The computed Triton default reaches the CUDA translation units
+        run: |
+          cmake -S . -B build-cuda-default -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DVLLM_CPP_CUDA=ON \
+            -DVLLM_CPP_CUDA_ARCHITECTURES='80;86;87;89;90a;100a;103a;110;120a;121a' \
+            -DVLLM_CPP_CUTLASS_DIR="$PWD/build-cuda-fat/_deps/cutlass-src" \
+            -DVLLM_CPP_CUTLASS_FETCH=ON \
+            -DVLLM_CPP_BUILD_TESTS=OFF \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF
+          VLLM_CPP_DEFAULT_BUILD_DIR=build-cuda-default \
+            python3 -m unittest tests.scripts.test_triton_default_definitions
   vulkan-spirv-freshness:
     # The Vulkan backend commits its SPIR-V (src/vt/vulkan/vulkan_spirv.h) instead
     # of compiling shaders at build time, so the build needs no shader toolchain on
