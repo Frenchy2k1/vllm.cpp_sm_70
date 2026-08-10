@@ -1609,6 +1609,23 @@ such a conflict, so this is duplication avoidance rather than an unresolvable
 clash — and if #235 closes without landing, #231 loses its roadmap registration
 and this row owes that line.
 
+**`FUSION-DENSE-MIGRATE` merged-GEMM fold (`ROAD-V1-C1` punch-list item 15,
+2026-08-10, issue #299).** Claude Code (claude-opus-5), helper role, isolated
+worktree `/home/mudler/_git/vllm.cpp-fusion-fold`, branch
+`row/FUSION-DENSE-MIGRATE`, base `origin/main` `e17e8f8a` pinned at worktree
+creation. Spec [fusion-dense-migrate.md](specs/fusion-dense-migrate.md). NOT in the
+claims table below: that table keys `SPIKE`/`ACTIVE` rows, and `FUSION-DENSE-MIGRATE`
+is a named tail item of the already-`DONE` `ROAD-V1-C1` cornerstone, not a matrix row
+with a lifecycle state of its own. Scope: the five gate-up folds in
+`src/vllm/model_executor/models/{commandr,glm4,minicpm,minicpm3,phi3}.cpp`, the five
+removed entries in `scripts/merged-gemm-consistency-allowlist.txt`, one regression
+case in `tests/scripts/test_check_fusion_consistency.py`, the roadmap issue-table row
+for #299, the `KERNEL-FUSION-FRAMEWORK` evidence prose, `docs/FEATURES.md`, the
+parity-ledger line, and this note. **NON-COLLISION:** touches NO shared layer
+(`linear.h`/`nvfp4.h` untouched), NO `vt::` op, NO CMake, NO checker script, and no
+Group-B allowlist entry. CPU-only; the five dgx paged-engine SACRED gates SKIP here
+and are recorded as OWED.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MOONCAKE-STORE` | `KV-MOONCAKE-STORE` (new, `SPIKE`) | Claude Code (opus-5), helper role | isolated worktree `/home/mudler/_git/vllm.cpp-mooncake`; records-only — NO build, NO GPU, NO download, NO external dependency installed | `row/KV-MOONCAKE-STORE`, base `origin/main` `848d4a87` | The `MooncakeStoreConnector` spike, records-only in this commit: NEW [`.agents/specs/mooncake-store-connector.md`](specs/mooncake-store-connector.md), the NEW `KV-MOONCAKE-STORE` engine-matrix row + section/total counters, the `ENGINE_ROWS` 146→147 bump in `scripts/check-agent-record.py` with its justification comment, a PROSE-ONLY Mooncake-disposition correction inside the `KV-CONNECTORS` row (both NOT-SCHEDULED sentences; that row's `ANCHOR-BACKFILL` state, tier, anchors, evidence, spec link and owner are UNCHANGED, so it is not claimed here), the `ROAD-V1-D4` portfolio note + canonical-table link, the roadmap issue-table row for [#287](https://github.com/mudler/vllm.cpp/issues/287), and this claim. **NON-COLLISION:** touches NO `src/`, `include/`, `tests/`, `examples/` or CMake path; the only script touched is the record checker's own row-count constant. | `ACTIVE` | 2026-08-10 — spec committed. The `KV-CONNECTORS` spike's blanket "Mooncake NOT SCHEDULED" conflated TWO connectors: `MooncakeConnector` (P2P prefill/decode over the Transfer Engine — two nodes, fabric, proxy) KEEPS that verdict; `MooncakeStoreConnector` (shared KV object store, the LMCache analogue) is reopened because (a) Mooncake is NATIVE C++ — `mooncake::Client` in `client_service.h`, and the `MooncakeDistributedStore` vLLM imports is a pybind wrapper over it — so we LINK instead of reimplementing a wire (the inverse of the LMCache cost shape), and (b) its single-node `protocol: "tcp"` + `mooncake_master` config is gateable on one box with NO RDMA NIC. The landed W5 `KVConnector` seam needs NO change. NEXT: W0, the go/no-go link spike (build Mooncake from source, pin the revision, drive `mooncake::Client` from a standalone C++ TU against a local master over TCP) — a genuine stop point per spec §S1. Speed is recorded as an OPEN axis: the RDMA/GPUDirect path that motivates the connector is unmeasurable for want of a fabric on any box we own. PENDING developer authority: the Mooncake source build, push/PR. |
