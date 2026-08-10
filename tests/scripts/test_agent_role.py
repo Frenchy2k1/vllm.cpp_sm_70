@@ -536,6 +536,14 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
     review found the re-claim path unlinking its own record before rewriting it,
     and both defensive branches (`record_is_stale`'s unreadable heartbeat,
     `read_records`'s suffix filter) reachable by no test at all.
+
+    A third round then showed both of those repairs still short. The re-claim
+    test only ever started from a FRESH record, so it never reached the prune
+    that runs first and unlinked our own record once it was stale -- the common
+    case, since the TTL is two hours. And both publish tests survive
+    `unlink(target); target.write_text(new)`: a new inode leaves the hardlink
+    witness intact and no temp is left, but the NAME is transiently absent,
+    which is neither the old record nor the new one.
     """
 
     def test_a_publish_replaces_the_record_and_never_rewrites_it_in_place(self) -> None:
@@ -568,15 +576,10 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
                          if entry.suffix != ".json")
         self.assertEqual(residue, [], f"publish residue left behind: {residue}")
 
-    def test_a_reclaim_never_unlinks_its_own_record(self) -> None:
-        # Re-claim must REPLACE, never unlink-then-create. With the publish
-        # killed mid-flight, the record from the previous claim has to survive
-        # byte-for-byte -- an operator marker with no record is the one state
-        # that still refuses to resolve, and it is what this change exists to
-        # remove.
-        run_role(self.repo, "a", "claim", "operator")
-        before = self.record_files()[0].read_bytes()
-
+    def _killed_reclaim(self) -> None:
+        """`claim operator` whose publish dies mid-flight. What survives is the
+        point: whatever is on disk at that instant is what a killed session
+        leaves behind."""
         saved = os.getcwd()
         os.chdir(self.repo)
         try:
@@ -588,11 +591,108 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
         finally:
             os.chdir(saved)
 
+    def test_a_publish_never_leaves_the_record_NAME_absent(self) -> None:
+        # The two tests above both survive `target.unlink(); target.write_text()`
+        # (review mutation MINE-B, 2026-08-10): a fresh inode leaves the hardlink
+        # witness reading the old bytes, and no temp file is left behind. What
+        # that publish does do is make the NAME transiently absent, which is
+        # neither "the old record" nor "the new one" -- a `show` landing in the
+        # window reports an operator marker with no record and exits 3.
+        #
+        # So the NAME is watched rather than the bytes. Polling for the window
+        # would be a race; instead the publish is observed from inside: at the
+        # instant any file content is written, the published path must already
+        # resolve, and nothing may unlink it. Both hold for temp + os.replace,
+        # and neither holds for unlink-then-create. The record has to exist
+        # first -- "old or new, never absent" says nothing about the first
+        # publish, which has no old.
+        run_role(self.repo, "a", "claim", "operator")
+
+        absent_when_writing: list[str] = []
+        unlinked: list[str] = []
+        real_write_text = Path.write_text
+        real_path_unlink = Path.unlink
+        real_os_unlink = os.unlink
+        real_os_remove = os.remove
+
+        saved = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            target = role.record_path()
+
+            def watched_write_text(path, *args, **kwargs):
+                if not target.exists():
+                    absent_when_writing.append(str(path))
+                return real_write_text(path, *args, **kwargs)
+
+            def watched_path_unlink(path, *args, **kwargs):
+                if Path(path) == target:
+                    unlinked.append(str(path))
+                return real_path_unlink(path, *args, **kwargs)
+
+            def watched_os_unlink(path, *args, **kwargs):
+                if Path(path) == target:
+                    unlinked.append(str(path))
+                return real_os_unlink(path, *args, **kwargs)
+
+            def watched_os_remove(path, *args, **kwargs):
+                if Path(path) == target:
+                    unlinked.append(str(path))
+                return real_os_remove(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", watched_write_text), \
+                    mock.patch.object(Path, "unlink", watched_path_unlink), \
+                    mock.patch.object(os, "unlink", watched_os_unlink), \
+                    mock.patch.object(os, "remove", watched_os_remove):
+                role.write_our_record()
+        finally:
+            os.chdir(saved)
+
         self.assertEqual(
-            len(self.record_files()), 1,
-            "the re-claim unlinked this worktree's own record before "
-            f"republishing it: {self.records()}")
-        self.assertEqual(self.record_files()[0].read_bytes(), before)
+            unlinked, [],
+            "the publish UNLINKED the record name; a reader in that window sees "
+            "an operator marker with no record, not the old record")
+        self.assertEqual(
+            absent_when_writing, [],
+            "the new bytes were written while the record name did not exist, so "
+            f"the name was transiently absent: {absent_when_writing}")
+
+    def test_a_reclaim_never_unlinks_its_own_record(self) -> None:
+        # Re-claim must REPLACE, never unlink-then-create. With the publish
+        # killed mid-flight, the record from the previous claim has to survive
+        # byte-for-byte -- an operator marker with no record is the one state
+        # that still refuses to resolve, and it is what this change exists to
+        # remove.
+        #
+        # Both ages, because they take DIFFERENT code paths and only the fresh
+        # one was covered: `cmd_claim` prunes before it publishes, and a prune
+        # that is not scoped to skip our own path unlinks our record whenever it
+        # is the stale one. Stale is the COMMON case -- the TTL is two hours and
+        # a session re-claims at the top of its next tool call -- and `resolve`
+        # matches our own record with no staleness filter, so the state RESOLVES
+        # FINE until the re-claim destroys it. One backdate is the whole
+        # difference between the two legs.
+        for age, backdate_by in (("fresh", None),
+                                 ("stale", role.RECORD_TTL_SECONDS + 60)):
+            with self.subTest(own_record=age):
+                run_role(self.repo, "a", "claim", "operator")
+                if backdate_by is not None:
+                    self.backdate(self.repo, backdate_by)
+                before = self.record_files()[0].read_bytes()
+                # Whatever its age, this worktree resolves BEFORE the re-claim.
+                # So any refusal afterwards was manufactured by the re-claim.
+                self.assertEqual(run_role(self.repo, "a", "show").returncode, 0)
+
+                self._killed_reclaim()
+
+                self.assertEqual(
+                    len(self.record_files()), 1,
+                    "the re-claim unlinked this worktree's own record before "
+                    f"republishing it: {self.records()}")
+                self.assertEqual(self.record_files()[0].read_bytes(), before)
+                # The state the whole change exists to remove: an operator
+                # marker with no record, created out of one that resolved.
+                self.assertEqual(run_role(self.repo, "a", "show").returncode, 0)
 
     def test_show_survives_a_corrupt_record_a_bad_heartbeat_and_a_stray_temp(self) -> None:
         # Nothing exercised either defensive branch. A record whose heartbeat is

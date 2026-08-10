@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -310,6 +311,33 @@ class ProbeFieldsComeFromResolve(unittest.TestCase):
         self.assertEqual(
             sorted(state["operator_peers"][0]),
             ["claimed_at", "heartbeat", "host", "path", "pid", "session", "worktree"])
+
+        # A pre-#285 peer widens that set by one: `read_records` tags the legacy
+        # single-file lock with `legacy` on the way through, and it reaches this
+        # surface like any other peer. Pinned rather than left implicit, because
+        # the untagged case above passes either way. This leg goes away with
+        # LEGACY_RECORD_NAME, which agent-role.py already schedules for deletion.
+        common = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=self.repo, text=True).strip()
+        (Path(common) / onboard.role_mod.LEGACY_RECORD_NAME).write_text(json.dumps({
+            "session": "legacy-session", "worktree": "/elsewhere/.git",
+            "claimed_at": time.time(), "heartbeat": time.time(),
+            "host": "somewhere", "pid": 77}), encoding="utf-8")
+
+        emitted = subprocess.run(
+            [sys.executable, str(ONBOARD_SCRIPT), "--probe", "--json"],
+            cwd=self.repo, env=dict(os.environ, VLLM_CPP_AGENT_SESSION="a"),
+            capture_output=True, text=True)
+        self.assertEqual(emitted.returncode, 0, emitted.stderr)
+        peers = {record["session"]: sorted(record)
+                 for record in json.loads(emitted.stdout)["operator_peers"]}
+        self.assertEqual(
+            peers,
+            {"rival-session": ["claimed_at", "heartbeat", "host", "path", "pid",
+                               "session", "worktree"],
+             "legacy-session": ["claimed_at", "heartbeat", "host", "legacy",
+                                "path", "pid", "session", "worktree"]})
 
     def test_probe_reports_the_env_state_it_was_given(self) -> None:
         # Kills `env: "present"`. It cannot be pinned against the real tree --

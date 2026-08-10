@@ -290,19 +290,33 @@ def drop_our_record(keep_canonical: bool = False) -> bool:
     return removed
 
 
-def prune_stale_records() -> list[dict]:
+def prune_stale_records(keep_canonical: bool = False) -> list[dict]:
     """Drop records past the TTL. Called from `claim`, which already writes.
 
-    This targets a PATH, not the inode it read, so a peer that was silent for
-    more than the TTL and republishes inside this window loses the record it
-    just wrote. Left as is deliberately: the loser's remedy is `claim operator`,
-    which is never refused and which every session runs at the top of its next
-    tool call, so the cost is one display cycle. Re-reading before the unlink
-    would narrow the window without closing it and would add a branch no test
-    can reach.
+    `keep_canonical` skips THIS worktree's own `record_path()`. The claim path
+    needs it, and only the claim path calls this: our own record is stale on
+    every ordinary re-claim -- the TTL is two hours and a session re-claims at
+    the top of its next tool call -- and pruning it is an unlink-then-create
+    that this path has already been fixed once to avoid (see `drop_our_record`).
+    It is safe because `write_our_record` republishes that exact path
+    immediately afterwards, and it is not a leak: `resolve` matches our own
+    record by ownership with no staleness filter, so an aged own record was
+    never being displayed as a live coordinator anyway.
+
+    For every OTHER record this targets a PATH, not the inode it read, so a peer
+    that was silent for more than the TTL and republishes inside this window
+    loses the record it just wrote. Left as is deliberately: the loser's remedy
+    is `claim operator`, which is never refused and which every session runs at
+    the top of its next tool call, so the cost is one display cycle. Re-reading
+    before the unlink would narrow the window without closing it and would add a
+    branch no test can reach. That declination covers peers ONLY -- our own
+    record is not exposed to it, because `keep_canonical` never unlinks it.
     """
+    canonical = record_path() if keep_canonical else None
     pruned = []
     for record in read_records():
+        if canonical is not None and Path(record["path"]) == canonical:
+            continue
         if record_is_stale(record):
             try:
                 Path(record["path"]).unlink(missing_ok=True)
@@ -447,7 +461,13 @@ def cmd_claim(args: argparse.Namespace) -> int:
         # died mid-flight neither lingers in the display nor is reported as a
         # live coordinator. This is a write path, which is why pruning happens
         # here and never in `show`.
-        prune_stale_records()
+        #
+        # keep_canonical: the prune is about OTHER sessions. Our own record is
+        # stale on any ordinary re-claim, and unlinking it here would put back
+        # exactly the window `drop_our_record(keep_canonical=True)` closes
+        # below -- an operator marker with no record, manufactured out of a
+        # state that resolved fine a moment earlier.
+        prune_stale_records(keep_canonical=True)
         peers = peer_records()
         # Rewriting our own record is the renewal path too: a live coordinator
         # re-claims more often than it beats, and a record that ages out while
@@ -455,10 +475,12 @@ def cmd_claim(args: argparse.Namespace) -> int:
         # replaces a legacy single-file lock this worktree owned, so that file
         # cannot linger and be counted twice.
         #
-        # keep_canonical: only the legacy file is unlinked. Our own record is
-        # REPLACED by the publish below and never removed first, so a re-claim
-        # has no window in which this worktree has an operator marker and no
-        # record.
+        # keep_canonical: our own `record_path()` is left alone here, so only
+        # the other files this worktree owns (in practice the pre-#285 legacy
+        # lock) are unlinked. Together with the scoped prune above, nothing on
+        # this path removes our record: it is REPLACED by the publish below, so
+        # a re-claim has no window in which this worktree has an operator marker
+        # and no record -- at any age of the record it started from.
         drop_our_record(keep_canonical=True)
         write_our_record()
     else:
