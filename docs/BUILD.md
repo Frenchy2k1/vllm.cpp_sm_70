@@ -124,6 +124,25 @@ cmake -S . -B build-vulkan -DVLLM_CPP_VULKAN=ON
 cmake --build build-vulkan -j
 ```
 
+## Tenstorrent build (Blackhole)
+
+The Tenstorrent backend is opt-in and requires local TT-Metalium and TT-NN
+package installations. Point `CMAKE_PREFIX_PATH` at the built tt-metal install
+tree. Configure fails instead of silently producing a CPU-only build when
+either package is missing.
+
+```sh
+cmake -S . -B build-tenstorrent \
+  -DVLLM_CPP_TENSTORRENT=ON \
+  -DCMAKE_PREFIX_PATH=/path/to/tt-metal/install
+cmake --build build-tenstorrent -j
+```
+
+The Blackhole lane is correctness-focused. OPT-125m passes its strict 6/6
+end-to-end gate. Qwen3-0.6B is selected by the platform and has a device-aware
+near-tie gate plus committed goldens, but the full 16x16 rerun is still pending.
+There is no binding speed result.
+
 ## ROCm build (AMD GPUs) — community-verified W0, blind F6 fix
 
 > The W0 HIP sources compiled clean and passed `ctest -R 'rocm|cross_device'`
@@ -205,7 +224,8 @@ defaults.
 | `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed |
-| `VLLM_CPP_HIP` | `AUTO` (= `OFF`) | Build the ROCm/HIP backend. Opt-in with `-DVLLM_CPP_HIP=ON`, which fails loudly if no `hipcc` is found. **Never compiled by anyone — see the ROCm section above** |
+| `VLLM_CPP_TENSTORRENT` | `AUTO` (= `OFF`) | Build the Tenstorrent backend. Opt-in with `-DVLLM_CPP_TENSTORRENT=ON`; requires TT-Metalium and TT-NN and fails configure if either package is missing |
+| `VLLM_CPP_HIP` | `AUTO` (= `OFF`) | Build the ROCm/HIP backend. Opt-in with `-DVLLM_CPP_HIP=ON`, which fails loudly if no `hipcc` is found. Community W0 builds cover four `gfx` targets; model gates remain open |
 | `VLLM_CPP_HIP_ARCHITECTURES` | (empty) | Target `gfx` arch(es), e.g. `gfx1100` or `gfx1100;gfx1151`. Empty means hipcc targets the installed GPU |
 | `ROCM_PATH` | `/opt/rocm` | ROCm installation prefix, for a nightly/TheRock install elsewhere |
 | `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
@@ -231,9 +251,10 @@ defaults.
 | CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a) | Build-supported; the fast GDN path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
 | CUDA | Jetson Thor, sm_110 | Runtime-verified: the portable bf16 path ran the Llama-3.2-1B greedy gate token-exact on real silicon. Community reports add a 32B NVFP4A16 serving through the portable dequant-GEMM, and CUDA 13.2 passing the CUDA gates. fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY for `110` |
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
-| Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet |
+| Vulkan | Portable GPU | `opt-125m` is strict token-exact; Qwen3.6-27B decode matches llama.cpp Vulkan on GB10. See [BENCHMARKS.md](BENCHMARKS.md) for the measured scope |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
-| ROCm | AMD GPUs | W0 skeleton committed (backend, platform, one op); its HIP sources are **never compiled** — no AMD hardware here. Open for contribution: [ROCM.md](ROCM.md) |
+| ROCm | AMD GPUs | W0 tests passed on four community `gfx` targets; ROCm 6.x build fix landed. Model and oracle gates remain open: [ROCM.md](ROCM.md) |
+| Tenstorrent | Blackhole | `ACTIVE`: OPT-125m strict 6/6 on real hardware; Qwen3-0.6B gate wired, full 16x16 rerun and performance path pending |
 | ANE | Apple Neural Engine | Post-parity roadmap |
 
 Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell

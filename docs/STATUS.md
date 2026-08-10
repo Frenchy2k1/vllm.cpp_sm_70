@@ -1316,7 +1316,7 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in positive MiB (unset/0 unlimited); `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` guard requests at 200000/4096 (0 disables); nine inherited tuning toggles are internal. No runtime/perf change.
 
-`BACKEND-TENSTORRENT`: `ACTIVE` W2 — OPT-125m e2e STRICT token-exact on Blackhole; ttnn adapter, 9 ops. See `.agents/backend-matrix.md`.
+`BACKEND-TENSTORRENT`: `ACTIVE`: OPT-125m strict 6/6 on Blackhole; 17 ops. Qwen3 is wired; its full 16x16 gate and speed remain pending.
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
