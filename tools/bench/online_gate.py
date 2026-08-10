@@ -66,6 +66,18 @@ NSYS_CUDA_GRAPH_TRACE = "node:host-only"
 NSYS_CUDA_FLUSH_INTERVAL_MS = 0
 NSYS_PRODUCT_VERSION = "2025.3.2.474"
 DGX_CUDA_COMPILER = pathlib.Path("/usr/local/cuda-13.0/bin/nvcc")
+
+
+def server_binary(build_dir: pathlib.Path) -> pathlib.Path:
+    """The built OpenAI server.
+
+    `examples/CMakeLists.txt` renamed the `server` target's OUTPUT_NAME to
+    `vllm-server` with the release packaging, so a current build tree has no
+    `examples/server`. Prefer the current name and fall back to the pre-rename
+    one so an evidence tree built before that rename still replays.
+    """
+    current = build_dir / "examples" / "vllm-server"
+    return current if current.exists() else build_dir / "examples" / "server"
 DGX_CUDA_COMPILER_VERSION = "13.0.88"
 NVFP4_PLAN_FIXTURE_SHA256 = (
     "e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd"
@@ -3593,7 +3605,7 @@ def record_execution_manifest(
         "compile_commands": build_dir / "compile_commands.json",
         "model_config": snapshot / "config.json",
         "oracle_manifest": oracle_manifest,
-        "server": build_dir / "examples" / "server",
+        "server": server_binary(build_dir),
         "tokenizer": snapshot / "tokenizer.json",
     }
     oracle = _load_json_object(oracle_manifest)
@@ -3753,7 +3765,7 @@ def record_execution_manifest(
             "CUTLASS NVFP4 compile command profile-control definition differs"
         )
 
-    server_path = build_dir / "examples" / "server"
+    server_path = server_binary(build_dir)
     for marker in (b"MatmulNvfp4Cutlass", b"[VT_FP4_CACHE] prepared"):
         if not _file_contains(server_path, marker):
             raise HarnessError(f"server binary omits target marker {marker!r}")
@@ -3804,7 +3816,7 @@ def record_execution_manifest(
         "cache_drop_roots": [
             str(snapshot.absolute()),
             str((output.parent.parent / "corpus" / model_key).absolute()),
-            str((build_dir / "examples" / "server").absolute()),
+            str(server_binary(build_dir).absolute()),
             str(client.absolute()),
         ],
         "bench_dependencies": expected_bench_dependencies,
