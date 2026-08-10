@@ -534,11 +534,25 @@ struct MoeFusedResident {
   bool ready = false;
 };
 
-MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
+// Fetch (building on first use) the resident state a weight owns. Replaces the
+// process-lifetime `static std::unordered_map<const W*, R>` these accessors used
+// to be: keying on the weight's ADDRESS let a second engine inherit a freed
+// engine's device pointers (issue #237). See ResidentSlot in qwen3_5_weights.h.
+//
+// The lock is the one the map accessors already took on every call, kept rather
+// than narrowed: this fix is about lifetime, and quietly changing the
+// synchronisation of a hot path at the same time would make any regression
+// ambiguous between the two.
+template <typename R>
+R& ResidentIn(const ResidentSlot& slot) {
   static std::mutex mu;
-  static std::unordered_map<const MoeBlockWeights*, MoeFusedResident> cache;
   std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  if (!slot.state) slot.state = std::make_shared<R>();
+  return *static_cast<R*>(slot.state.get());
+}
+
+MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
+  return ResidentIn<MoeFusedResident>(w->resident_fused);
 }
 
 // --- BF16 fast-MoE per-layer resident constants (Qwen3-Coder Qwen3MoeForCausalLM,
@@ -558,10 +572,7 @@ struct MoeBf16Resident {
 };
 
 MoeBf16Resident& MoeBf16ResidentFor(const MoeBlockWeights* w) {
-  static std::mutex mu;
-  static std::unordered_map<const MoeBlockWeights*, MoeBf16Resident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  return ResidentIn<MoeBf16Resident>(w->resident_bf16);
 }
 
 // Fast BF16 grouped-MoE path (Qwen3-Coder). DEFAULT ON per the parity-enablers-
@@ -650,10 +661,7 @@ struct MoeMarlinResident {
 };
 
 MoeMarlinResident& MoeMarlinResidentFor(const MoeBlockWeights* w) {
-  static std::mutex mu;
-  static std::unordered_map<const MoeBlockWeights*, MoeMarlinResident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  return ResidentIn<MoeMarlinResident>(w->resident_marlin);
 }
 
 bool MarlinMoeEnabled() {
@@ -2284,10 +2292,7 @@ struct MarlinDenseResident {
 };
 
 MarlinDenseResident& MarlinDenseResidentFor(const Nvfp4Weight* w) {
-  static std::mutex mu;
-  static std::unordered_map<const Nvfp4Weight*, MarlinDenseResident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  return ResidentIn<MarlinDenseResident>(w->resident_marlin);
 }
 
 // Repack one dense NVFP4 weight into the resident Marlin layout, then free the
@@ -2452,10 +2457,9 @@ struct MarlinDensePairResident {
 };
 
 MarlinDensePairResident& MarlinDensePairResidentFor(const Nvfp4Weight* gate) {
-  static std::mutex mu;
-  static std::unordered_map<const Nvfp4Weight*, MarlinDensePairResident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[gate];
+  // Held on the GATE weight: it was the pair's map key, and it is the member of
+  // the pair whose lifetime the fused repack must not outlive.
+  return ResidentIn<MarlinDensePairResident>(gate->resident_marlin_pair);
 }
 
 void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw, const Nvfp4Weight& uw,

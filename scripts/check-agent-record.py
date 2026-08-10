@@ -324,8 +324,14 @@ ENGINE_PREFIXES = (
 # container channels above and from the docs themselves, which it does not
 # modify). User-directed, issue #224; `READY` on its committed spec, and no
 # site, workflow or published page is claimed by the bump.
+# 147 since 2026-08-10: +`KV-MOONCAKE-STORE` (`MooncakeStoreConnector`, Mooncake's
+# distributed KV object store as an external cache pool). Split out of
+# `KV-CONNECTORS`, whose blanket "Mooncake NOT SCHEDULED" verdict conflated the
+# P2P `MooncakeConnector` with the store connector; the P2P half keeps that
+# verdict. User-directed, issue #287; `SPIKE` on its committed spec. No client,
+# no connector, no build flag and no gate result is claimed by the bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 146
+ENGINE_ROWS = 147
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

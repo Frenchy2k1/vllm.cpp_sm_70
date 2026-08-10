@@ -19,10 +19,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-try:
-    from scripts.waivers import Waiver, load_waivers
-except ModuleNotFoundError:
-    from waivers import Waiver, load_waivers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,7 +72,6 @@ GENERATED_FILES = frozenset(
 
 POLICY_FILES = frozenset(
     {
-        ".agents/waivers.csv",
     }
 )
 APPEND_ONLY_FILES = frozenset(
@@ -126,7 +121,6 @@ PROCEDURE_FILES = frozenset(
 )
 GOVERNANCE_SUPPORT_FILES = frozenset(
     {
-        "scripts/waivers.py",
         "scripts/agent-role.py",
         "scripts/claim-view.py",
         "scripts/ready-for-helper.py",
@@ -203,6 +197,12 @@ RELEASE_MANIFEST_FIXTURE = re.compile(
 # Each entry keeps the class its path resolved to while it was live, so the
 # review budget a historical diff spends does not move.
 RETIRED_PATHS = {
+    # `policy: retire the waiver registry` (#281): a registry of exceptions is a
+    # state log, so an exception now argues for itself in the commit that needs
+    # it and `git log --grep` is the record. Same reasoning as policy.csv below.
+    ".agents/waivers.csv": "policy",
+    "scripts/waivers.py": "governance_support",
+    "tests/scripts/test_waivers.py": "checker_test",
     # `policy: the code is the state, git is the history` (0f3e44ee): AGENTS.md
     # became the single normative surface and git became the history.
     ".agents/policy.csv": "policy",
@@ -253,8 +253,6 @@ CREATION_MUTATIONS = {
         b"def parsed_trailers(message): return ''\n"
         b"def validate_commit_message(message, *, strict): return []\n"
         b"def validate_range(*args, **kwargs): return []\n"
-        b"def exact_waiver(*args, **kwargs): return None\n"
-        b"def validate_waiver_targets(*args, **kwargs): return None\n"
     ),
     "scripts/check-arm-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cpu-isa-build.py": DISABLED_CREATION_CHECKER,
@@ -436,8 +434,6 @@ def change_errors(
     changes: list[ChangedPath],
     *,
     evidence_results: dict[str, EvidenceResult] | None = None,
-    waivers: tuple[Waiver, ...] = (),
-    waiver_scope: str = "",
 ) -> list[str]:
     errors: list[str] = []
     changed_paths = {change.path: change for change in changes}
@@ -680,13 +676,10 @@ def main() -> int:
         base_oid = resolve_commit(ROOT, args.base)
         head_oid = resolve_commit(ROOT, args.head)
         changes = changed_paths(base_oid, head_oid)
-        waivers = load_waivers(ROOT)
         evidence = executable_evidence(ROOT, base_oid, head_oid, changes)
         errors = change_errors(
             changes,
             evidence_results=evidence,
-            waivers=waivers,
-            waiver_scope=f"pr:{args.pr_number}" if args.pr_number else "",
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"ERROR: PR size check could not classify the change: {exc}", file=sys.stderr)
