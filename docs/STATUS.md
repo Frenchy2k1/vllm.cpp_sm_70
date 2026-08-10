@@ -78,7 +78,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **0.83-0.86x BEHIND**, gap attributed; NVFP4 `lm_head` PACKED (#213) |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; binding grid @`a0fa12c7` FLAT 0.935x-0.979x c1-c32; per-token MoE; gate_up dense route LANDED +1.31% c8; per-launch marlin gap WITHDRAWN; PSS 3.81x | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration; `VT_ASYNC_EXECUTOR` Option A NEUTRAL → OFF |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending. Async-serving P0 FIXED (`ROW-SERVE-ASYNC-DENSE-MIRROR`): classic-dense `Qwen3ForCausalLM` now honors the async device token-ids mirror; CPU-only -Werror test-guard fixes x2 | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **Async device-mirror (`ROW-SERVE-ASYNC-DENSE-MIRROR`, `f9c969ae`): the #31 fix ported to the classic dense family, dgx-VERIFIED.** The shared dense `EmbedInto` (qwen3.cpp) raced the async combine's device input-ids write against a stale host upload → token-0 degeneration on the depth-2 AsyncLLM serving path (quant-independent). `EmbedInto` now consumes the device override published by `ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` (27B-dense template); gate `test_qwen3_dense_async_serving` RED on `VT_ASYNC_DEVICE_MIRROR=0`, GREEN default, byte-identical mirror-off. dgx GB10: async gate RED→GREEN 0.6B+4B, SACRED 0.6B+4B 184/184 unchanged (byte-neutral sync path), memcheck 0 errors; Yi30/Qwen3-8B-MXFP4 default-config e2e coherent + 3/4 token-exact (p2 = oracle-ratified near-tie, gap 0.0000), closing the QUANT-CT-MXFP4 async-default residual. RESIDUAL: sibling InternLM2/Mistral/Llama scope one-liner; W4 bench RAN; FA2 GQA-swap default-ON, c2-c8 <1.0x. `FLASH-PTXAS` #82: codegen at PARITY (no ptxas lever); gap=engine context. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete; throughput passes; latency/VRAM and kernel default gates open | Exact chunks ON: local +2.152% total. Opt-in post-conv tile is 1.859x faster. Opt-in causal-conv K4 arm 1 is byte-exact and 234.605→219.506 ms (6.44%); the 256-channel arm is falsified |
+| Qwen3.5-4B BF16 direct-load on discrete CUDA | Correct; throughput/host PSS ahead, acceptance `PENDING`; latency/VRAM open | Atomic pretoken exact. Ratios: tput 1.0283x; TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower; VRAM +118.7 MiB. GDN local stack retained ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -1290,21 +1290,24 @@ regression.
 
 ## Performance detail
 
-**Local Qwen3.5-4B plain BF16 direct loader, throughput passed; latency and
-VRAM pending:** production `AsyncLLM` uses default-ON exact `(sequence,
-8-token chunk)` causal-conv dispatch. Rebased-main graph-node `nsys` measures
-**718.704→233.955 ms (3.072x)** and +2.272% profiled throughput, leaving 1.609x
-to vLLM; the binding A/B improves total/output 2.152%, TTFT 2.945%, TPOT 1.920%
-and E2E 2.118%. Against sealed vLLM, throughput is **1.021246x PASS**; TTFT
-1.085812x, TPOT 1.024597x and peak VRAM 13053.3/12820 MiB remain OPEN.
+**Local Qwen3.5-4B plain BF16 direct loader; throughput ahead, acceptance
+`PENDING`, latency and VRAM open:** production `AsyncLLM` uses default-ON exact
+`(sequence, 8-token chunk)` causal-conv dispatch. Graph-node `nsys` measures
+**718.704→233.955 ms (3.072x)**, leaving 1.609x to vLLM.
 
-The next same-tool target, fused post-conv, now has an opt-in upstream-shaped
-16-token/four-warp CUDA tile. It is byte-exact and cuts **227.887→122.587 ms
-(1.859x)**, moving the vLLM gap from 2.112x to **1.135x**; the one enclosing
-profile improves total/output 0.532%, TTFT 0.850%, TPOT 0.457% and E2E 0.531%.
-It remains opt-in pending repeated A/B and unavailable 27B/35B gates. Evidence:
-[exact chunks](bench-evidence/qwen35-4b-sm120-main-20260807.md),
-[post-conv tile](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+ONE cross-engine result stands, the corrected three-repetition run: throughput
+**6831.71 vs 6643.40 tok/s (1.0283x)**, host PSS lower, TTFT **1.0853x**, TPOT
+**1.0165x**, E2E **1.0288x** slower, VRAM **+118.7 MiB** OPEN. The earlier
+**1.021246x** is SUPERSEDED, not a competing result: it predates the atomic
+wave admission that removed the frontend timing confound. Disposition is
+`PENDING` acceptance, matching
+[the campaign spec](../.agents/specs/sm120-qwen35-pareto-2026-08-09.md) — fresh
+mutation re-review, operator gate and real-GPU token identity are still owed,
+and the GDN selectors it measures stay default OFF. The 18-leg oracle attempts
+were VOID JIT-environment runs, not a replacement denominator.
+
+This local 4B diagnostic does not establish 27B/35B support:
+[exact-chunk outcome](bench-evidence/qwen35-4b-sm120-main-20260807.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).

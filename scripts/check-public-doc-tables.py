@@ -499,7 +499,22 @@ STATUS_RATCHET = {
     # collapses to its binding result; both are carried durably by
     # docs/BENCHMARKS.md's GDN rows and .agents/benchmark-record.md. Strictly
     # DOWN from 243542, the only direction this number may move.
-    "chars": 243405,
+    #
+    # 243519 since 2026-08-10 (measured 243519): issue #206 replaces the stale
+    # pretoken-failure row with the corrected, exact throughput result and its
+    # still-open latency/VRAM axes. Re-pinned byte-tight after current-main
+    # reconciliation so the shorter row cannot become untracked headroom.
+    #
+    # 243455 since 2026-08-10 (measured 243455): #155 and #266 landed together,
+    # so the two ratchets above are reconciled into one. The page had ended up
+    # publishing TWO cross-engine results for the same Qwen3.5-4B key -- 1.0283x
+    # in the row and 1.021246x twice in the prose. The superseded 1.021246x
+    # pair collapses into one paragraph that names the corrected run as the
+    # single standing result, marks its disposition PENDING to match the
+    # campaign spec, and says why the older figure is not a competitor. The
+    # explanation is paid for out of the page, not added to it. Strictly DOWN
+    # from 243519, the only direction this number may move.
+    "chars": 243455,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

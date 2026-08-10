@@ -130,7 +130,10 @@ Two more example binaries ship alongside it:
 - `vllm-bench` ([`examples/bench/main.cpp`](../examples/bench/main.cpp)), a
   throughput/latency harness taking `--model`, `--dataset-path`,
   `--num-prompts`, `--input-len`, `--output-len`, `--concurrency`,
-  `--max-num-batched-tokens`, and `--num-blocks`.
+  `--max-num-batched-tokens`, and `--num-blocks`. It pretokenizes before timing
+  and atomically publishes each concurrency wave. Set
+  `VT_BENCH_PRETOKENIZE=0` for the timed-string rollback; the report names the
+  resolved mode.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
 
