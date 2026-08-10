@@ -149,6 +149,42 @@ struct OwnedTensor {
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
+// Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
+// #237).
+//
+// The forward paths build per-weight constants once — arrays of per-expert
+// device pointers, Marlin repacks, token row maps — and reuse them on every
+// subsequent step. That state used to live in `static` maps keyed on the ADDRESS
+// of the weight, built on first touch and never erased, on the assumption that a
+// process holds one engine for its lifetime.
+//
+// The assumption is false and it corrupts output. Destroy a `LoadedEngine` and
+// build another in the same process, and the allocator can hand the new weights
+// the address the old ones had; the new weights then inherit an entry marked
+// ready whose device pointers were `cudaFree`d with the old engine. Nothing in
+// this tree destroys the CUDA context, so those pointers stay *mapped* — they
+// just now belong to whatever the new engine allocated there, which is how it
+// surfaced: not a crash, but zeroed and corrupted output token ids, only in a
+// test ordering that builds a second engine.
+//
+// Holding the state here ties it to the weights it describes, so it cannot
+// outlive them and an address cannot be inherited. Deliberately opaque: the
+// resident types are CUDA-path implementation details of the model .cpp files,
+// and `shared_ptr<void>` keeps them out of this header while still running the
+// correct destructor.
+//
+// This does NOT change the lifetime of the DEVICE allocations those types point
+// at. They were leaked for the process before and are leaked now; freeing them
+// is a separate question about backend teardown order, and widening this fix to
+// touch that would put a shutdown-ordering hazard on the critical path of a
+// correctness fix.
+struct ResidentSlot {
+  // Mutable because building the resident state is logically const: it is a
+  // cache of what the weight already contains, populated on first use from a
+  // const forward.
+  mutable std::shared_ptr<void> state;
+};
+
 // Device-resident NVFP4 W4A16 weight (M2.2b). The modelopt packed fp4 codes +
 // fp8-e4m3 group scales + per-tensor scale, kept RAW in the ORIGINAL torch
 // [N=out_features, K=in_features] orientation vt::MatmulNvfp4 expects (NOT
@@ -202,6 +238,12 @@ struct Nvfp4Weight {
   // path. Uploaded once from the persistent `alpha` member; the diagnostic host
   // scalar path leaves this null.
   mutable std::shared_ptr<void> d_alpha;
+
+  // Resident Marlin constants (issue #237; see ResidentSlot). `resident_marlin`
+  // is this weight's own repack; `resident_marlin_pair` is the fused gate+up
+  // repack, held on the GATE weight of the pair (it is the pair's cache key).
+  ResidentSlot resident_marlin;
+  ResidentSlot resident_marlin_pair;
 };
 
 // Device-resident per-tensor FP8 (W8A8) weight — the 35B attn q/k/v/o + GDN
@@ -376,6 +418,13 @@ struct MoeBlockWeights {
   Nvfp4Weight shared_gate_proj_fp4;  // [N=Is, K=H]
   Nvfp4Weight shared_up_proj_fp4;    // [N=Is, K=H]
   Nvfp4Weight shared_down_proj_fp4;  // [N=H, K=Is]
+
+  // Resident MoE constants, one slot per forward path (issue #237; see
+  // ResidentSlot). Exactly one is populated on a given engine — whichever path
+  // this block's experts route through — and all three die with the block.
+  ResidentSlot resident_fused;   // MoeFusedResident   (fp4 fused)
+  ResidentSlot resident_bf16;    // MoeBf16Resident    (bf16 fast)
+  ResidentSlot resident_marlin;  // MoeMarlinResident  (Marlin grouped)
 };
 
 // One decoder layer: input/post norms + one attention variant + the MoE block.

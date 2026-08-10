@@ -1,4 +1,0 @@
-waiver_id,checker,scope,owner,reason,evidence,expires
-WAIVER-PR-SIZE-001,scripts/check-pr-size.py,pr:128,maintainer,One-time policy consolidation and evidence-preserving archive migration exceeds the procedure and governance-test class budgets,PR-128 policy migration,2026-08-15
-WAIVER-PR-SIZE-002,scripts/check-pr-size.py,pr:166,maintainer,One-time lossless structured-state migration exceeds review budgets through mechanical evidence fan-out,PR-166 structured state design,2026-08-15
-WAIVER-PR-SIZE-003,scripts/check-pr-size.py,pr:196,maintainer,One-time atomic W1-W13 release matrix intentionally ships through one delivery PR,release-binary-matrix.md delivery topology and developer direction 2026-08-09,2026-09-30
