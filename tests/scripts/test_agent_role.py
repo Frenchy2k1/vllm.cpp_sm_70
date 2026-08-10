@@ -57,12 +57,30 @@ def run_role(repo: Path, session: str, *args: str):
 # own process so the observing test process can watch the published name with no
 # knowledge of which I/O primitives the publish uses.
 #
-# 200 publishes: measured at ~1.5ms each on a 20-core box at load average 263
-# (2026-08-10), so the window under observation is ~0.3s, against ~1us per
-# `exists()` poll. That budget is chosen for MARGIN, not sensitivity: 60
-# publishes already detected both name-absent mutations 10/10 on that same
-# loaded box, and 200 detected 10/10 with 150k-300k polls landing inside the run.
-_OBSERVED_PUBLISHES = 200
+# 2000 publishes at ~0.16ms each (see the child loop below) put the window under
+# observation at ~0.33s, against ~1us per `exists()` poll. The count is SIZED
+# from measurement, not chosen for margin. MEASURED 2026-08-10 on a 20-core box
+# at load average ~200, against the publish that only this half can catch
+# (bytes first, unlink by basename, rename the temp in), 20 runs per cell:
+#
+#   publishes | multi-core | one core (taskset -c 3) | clean run, multi / one
+#         200 |  16/20 RED |                6/20 RED | 0.25s / 0.23s
+#         800 |  19/20 RED |               14/20 RED | 0.37s / 0.44s
+#        2000 |  20/20 RED |               20/20 RED | 0.71s / 0.80s
+#
+# Unmutated stayed 0/3 RED at every count in both regimes. 2000 is the first
+# count that is not probabilistic in EITHER regime, and it costs ~0.5s over 200
+# on a suite that runs in ~5s -- which is why the single-core residual #296
+# recorded is closed here rather than recorded again.
+_OBSERVED_PUBLISHES = 2000
+
+# A wedged child must FAIL this test, not hang the suite. The publish loop takes
+# ~0.33s plus interpreter start; 60s is over two orders of magnitude of
+# headroom, so reaching it means the child stopped making progress, and the test
+# says so instead of spinning until someone kills the run.
+_OBSERVER_DEADLINE_SECONDS = 60.0
+_OBSERVED_WINDOW_SECONDS = 0.33
+
 _OBSERVED_PUBLISH_LOOP = '''
 import importlib.util, sys
 from pathlib import Path
@@ -73,13 +91,22 @@ role = importlib.util.module_from_spec(spec)
 sys.modules["agent_role"] = role
 spec.loader.exec_module(role)
 
-# The publish's FILE sequence is the subject. `worktree_id` shells out to
-# `git rev-parse` at ~2.7ms a call -- 40x the file work -- so caching it stops
-# the observed window being diluted by a subprocess that touches no record.
-# `record_path` is the only consumer and its answer is constant for one repo,
-# so no path this test looks at changes.
+# The publish's FILE sequence is the subject, so both `git rev-parse` calls on
+# the publish path are hoisted out of the loop: `worktree_id` (via
+# `record_path`) and `common_dir` (via `records_dir`). Caching only the first
+# leaves the second, and MEASURED on a 20-core box at load average 184
+# (2026-08-10) that is where nearly all the time was going:
+#   * worktree_id cached only          1.467 ms/publish
+#   * both cached                      0.163 ms/publish
+#   * one bare `git rev-parse`         1.041 ms
+# i.e. 89% of the window a half-cached child offers the observer is the
+# subprocess it is not supposed to be measuring. Both answers are constant for
+# one repo and `record_path`/`records_dir` are their only consumers here, so no
+# path this test looks at changes -- it just stops being diluted.
 worktree = role.worktree_id()
 role.worktree_id = lambda: worktree
+common = role.common_dir()
+role.common_dir = lambda: common
 
 sys.stdout.write("ready\\n")
 sys.stdout.flush()
@@ -790,23 +817,28 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
         # only cost SENSITIVITY, never produce a false failure. So it is safe
         # under CI contention in the way a timing assertion never is.
         #
-        # MEASURED 2026-08-10 on a 20-core box already at load average 263,
-        # publishes at ~1.5ms and polls at ~1us, 150k-300k polls per run:
-        #   * `os.rename` + `open` publish   caught 10/10 runs (and 10/10 at 60)
-        #   * `unlink` + `write_text` publish caught 10/10 runs
-        #   * unmutated                       40/40 green, zero absent readings
-        #   * unmutated, BOTH PROCESSES PINNED TO ONE CORE   20/20 green
-        #   * `os.rename` + `open`, pinned to one core        caught 1/15
-        #   * byte-at-a-time IN-PLACE rewrite                 caught 0/6
-        # The last two are why this is a backstop and not the whole pin. Its
-        # sensitivity needs real parallelism -- pinned to a single core the
-        # publisher is rarely preempted inside a window that lasts microseconds
-        # -- and it is blind BY CONSTRUCTION to a publish that never makes the
-        # name absent, which is
+        # RE-MEASURED 2026-08-10 at this file's `_OBSERVED_PUBLISHES` on a
+        # 20-core box already at load average 185 (multi-core) and 262 (both
+        # processes pinned to one core with `taskset -c 3`), 10 runs per cell:
+        #                                              multi-core  single core
+        #   * `os.rename` + `open`                          10/10        9/10
+        #   * `unlink` + `write_text`                       10/10       10/10
+        #   * bytes first, unlink by BASENAME, rename the
+        #     temp in -- the one shape NO watcher arm sees  10/10       10/10
+        #   * byte-at-a-time IN-PLACE rewrite                0/10        0/10
+        #   * unmutated                                      0/10        0/10
+        #                                        (zero absent readings, both)
+        # The third row is why this half exists at all: it satisfies the
+        # hardlink and residue pins and trips no `_watch_publish` arm --
+        # `writing` sees the name still present, and both removals arrive as a
+        # relative basename that does not compare equal to the absolute target
+        # -- so the observer is the ONLY test that fails on it. The fourth row
+        # is the converse: this half is blind BY CONSTRUCTION to a publish that
+        # never makes the name absent, which is
         # `test_a_publish_replaces_the_record_and_never_rewrites_it_in_place`'s
         # subject. The watcher above holds the line deterministically on every
-        # primitive it names; this holds it probabilistically on the ones nobody
-        # named. Neither subsumes the other, and only the pair covers both.
+        # primitive it names; this holds it on the ones nobody named. Neither
+        # subsumes the other, and only the pair covers both.
         run_role(self.repo, "a", "claim", "operator")
         saved = os.getcwd()
         os.chdir(self.repo)
@@ -815,31 +847,77 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
         finally:
             os.chdir(saved)
         self.assertTrue(target.exists(), "nothing was published to observe")
+        # Non-vacuity, checked at the end: `absent == 0` also holds for a future
+        # publish that stops touching this path at all, and the `exists()` guard
+        # above only proves the path existed BEFORE. The record carries the
+        # writer's pid and a fresh heartbeat, so requiring the bytes to change
+        # proves the name the observer watched is the name that was republished.
+        before = target.read_bytes()
 
-        publisher = subprocess.Popen(
-            [sys.executable, "-c", _OBSERVED_PUBLISH_LOOP,
-             str(ROLE_SCRIPT), str(_OBSERVED_PUBLISHES)],
-            cwd=self.repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Child output goes to FILES, never to a pipe nobody reads. An unread
+        # `subprocess.PIPE` deadlocks as soon as the child fills the pipe buffer
+        # (65536 bytes here), and this child forks `git rev-parse` per publish,
+        # so a few hundred bytes of warning per publish from anyone's unrelated
+        # change is enough to cross it. MEASURED 2026-08-10 against the shipped,
+        # correct publish with the pipe in place: 391 bytes of child stderr per
+        # publish never completed at all -- killed at 90s, rc=124, spinning a
+        # core -- while 155 bytes/publish (~31KB, under the pipe) passed in
+        # 0.41s. A file has no capacity to fill, so no volume of child output
+        # can wedge the observer, and the text still survives for the failure
+        # message. Everything below is additionally bounded by a wall-clock
+        # deadline, so a child that stops making progress FAILS this test in
+        # bounded time instead of hanging a suite everyone has to pass.
+        logs = tempfile.TemporaryDirectory()
+        self.addCleanup(logs.cleanup)
+        out_path = Path(logs.name) / "publisher.out"
+        err_path = Path(logs.name) / "publisher.err"
+        deadline = time.monotonic() + _OBSERVER_DEADLINE_SECONDS
+
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            publisher = subprocess.Popen(
+                [sys.executable, "-c", _OBSERVED_PUBLISH_LOOP,
+                 str(ROLE_SCRIPT), str(_OBSERVED_PUBLISHES)],
+                cwd=self.repo, stdout=out, stderr=err)
+
+        def wedged(what: str) -> None:
+            publisher.kill()
+            publisher.wait()
+            self.fail(
+                f"the publisher {what} within {_OBSERVER_DEADLINE_SECONDS:.0f}s "
+                f"(~{_OBSERVER_DEADLINE_SECONDS / _OBSERVED_WINDOW_SECONDS:.0f}x "
+                f"the measured window for {_OBSERVED_PUBLISHES} publishes); "
+                f"killed. "
+                f"stderr: {err_path.read_text(encoding='utf-8', errors='replace')[-2000:]!r}")
+
         try:
-            # Import and the one `git rev-parse` happen before this line, so the
-            # observed window is publishes and nothing else.
-            self.assertEqual(publisher.stdout.readline(), "ready\n")
+            # Import and both `git rev-parse` calls happen before "ready", so
+            # the observed window is publishes and nothing else.
+            while not out_path.read_bytes().startswith(b"ready\n"):
+                if publisher.poll() is not None:
+                    break  # died before signalling; the returncode check reports it
+                if time.monotonic() > deadline:
+                    wedged("never signalled ready")
             absent = 0
             polls = 0
             while publisher.poll() is None:
                 polls += 1
                 if not target.exists():
                     absent += 1
-            errors = publisher.stderr.read()
+                # Every 4096 polls (~4ms of polling), so the deadline costs the
+                # hot loop nothing measurable and still resolves to milliseconds.
+                if polls % 4096 == 0 and time.monotonic() > deadline:
+                    wedged("never finished publishing")
         finally:
-            publisher.stdout.close()
-            publisher.stderr.close()
+            if publisher.poll() is None:
+                publisher.kill()
             publisher.wait()
+        errors = err_path.read_text(encoding="utf-8", errors="replace")
 
         self.assertEqual(publisher.returncode, 0, errors)
         # A floor for the observer having LOOKED at all, not a timing assertion:
-        # the measured count is 150k-300k, so this is ~0.1% of it and can only
-        # fire if the poll loop did not run.
+        # the measured count is 148k-257k polls per run (multi-core and pinned
+        # to one core alike, load average 312), so this is under 2% of it and
+        # can only fire if the poll loop did not run.
         self.assertGreater(polls, _OBSERVED_PUBLISHES,
                            "the observer never got to look; sensitivity unknown")
         self.assertEqual(
@@ -848,6 +926,11 @@ class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
             f"{absent} times in {polls} polls across {_OBSERVED_PUBLISHES} "
             "publishes: that window is an operator marker with no record")
         self.assertTrue(target.exists(), "the publishes left no record behind")
+        self.assertNotEqual(
+            target.read_bytes(), before,
+            "the record is byte-identical to the one the claim wrote, so the "
+            "publishes did not touch the name this test observed and "
+            "`absent == 0` says nothing")
 
     def test_a_reclaim_never_unlinks_its_own_record(self) -> None:
         # Re-claim must REPLACE, never unlink-then-create. With the publish
