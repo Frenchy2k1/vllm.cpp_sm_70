@@ -30,6 +30,19 @@ single pair is an anecdote.
 Prefer an instrument that is immune to page-cache effects (GPU-active time per
 step) over wall clock when the host is doing heavy I/O.
 
+Budget the disk before the run. A production RelWithDebInfo CUDA build tree is
+about **169 GiB** — the build contract claimed ~3 GiB until 2026-08-10, a 56x
+underestimate on the one number that decides whether a grid fits. A full disk
+does not fail loudly: it voids the binding through memory-return tolerance while
+still emitting plausible ratios. Leave real headroom, and delete the tree once
+the evidence directory is captured (evidence is tens of MiB).
+
+Two ratio sets that disagree may be two different HARNESSES rather than a
+regression. Compare their absolute numbers before believing either; ratios are
+scale-invariant and hide an order-of-magnitude mismatch completely. If the
+change between the readings is provably inert (a byte-identical refactor),
+suspect the measurement, not the code.
+
 ## Reading a profile
 
 **A whole-run kernel ranking is a trap.** It sums prefill and decode, so the
