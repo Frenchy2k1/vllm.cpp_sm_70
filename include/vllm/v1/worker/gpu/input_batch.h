@@ -299,6 +299,14 @@ class InputBatch {
   // recorded deviation until it turned out to crash the engine
   // (specs/logprobs-all-sentinel.md).
   std::map<std::string, int> num_logprobs;
+  // req_id -> requested PROMPT-logprob count (gpu_model_runner.py:1305-1310,
+  // where upstream keeps it on the runner rather than the input batch; it is
+  // seeded and dropped at exactly the two sites num_logprobs above is, so it
+  // lives beside it). The `-1` sentinel IS widened to vocab_size here — the
+  // opposite of num_logprobs — because the prompt path feeds GatherLogprobs
+  // directly, which needs a concrete column count, and never reaches the
+  // Sampler that reads our sentinel. See specs/prompt-logprobs.md.
+  std::map<std::string, int> num_prompt_logprobs;
   // Lazily-allocated [max_num_reqs][vocab_size] EXCLUDE mask (TRUE == mask this
   // token to -inf). Empty until the first request with allowed_token_ids; a row
   // is all-TRUE then the allowed ids are cleared to FALSE (gpu_input_batch.py

@@ -501,7 +501,7 @@ STATUS_RATCHET = {
     # and "the async production-serving path wiring" leaves the remaining-work
     # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
     # each rebase); re-pinned byte-tight to the merged measurement.
-    "chars": 243496,
+    "chars": 243486,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

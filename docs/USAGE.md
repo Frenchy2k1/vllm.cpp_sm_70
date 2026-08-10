@@ -437,6 +437,25 @@ Registered in
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
 
+`prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
+and the engine computes it — every prompt position is scored against the token
+that followed it, accumulated across chunked prefill — but the **response body
+does not carry it yet**: emitting it needs the OpenAI `echo` wiring, which is
+not done. Until then it is reachable through the library
+(`RequestOutput.prompt_logprobs`), not over HTTP. `logprobs`/`top_logprobs` on
+GENERATED tokens are emitted normally.
+
+That computation is gated on the **CPU** backend only. A step that owes prompt
+logits takes the full-logits route, and on that route the sampler is handed a
+host-resident logits buffer carrying the accelerator's device label — sound on
+unified memory, and **not yet verified on CUDA at all, discrete or otherwise**.
+Treat `prompt_logprobs` on a GPU build as unverified until that gate runs; the
+mechanism and the exact owed invocation are in
+[`.agents/specs/prompt-logprobs.md`](../.agents/specs/prompt-logprobs.md)
+(risk 4 and the `PENDING` CUDA smoke gate). Requests that do NOT set it are
+unaffected on every backend — the route is only taken for a step where some
+request asked.
+
 The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. See
