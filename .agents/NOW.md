@@ -13,27 +13,26 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Claim / track | State | Next command or step |
 |---|---|---|
 | `SPEC-DSPARK` | **WORKS on 35B**: ON==OFF 48/48. ★fixed engine-wide draft-drop | Draft step ~6x a target step |
-| State record (#166) | **157 imports = 3,231,342 exact bytes** at `776c56f1`; 95/95; raw-row guard | Force-update #166; rerun readiness |
+| State record (#166) | **157 imports = 3,231,342 bytes** at `776c56f1`; 95/95 | Force-update #166; rerun readiness |
 | Laguna NVFP4 / DeepSeek-V4 decode | **CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
-| 27B NVFP4 @`0893e160` | **0.85x**: FP8 tower native, tokens MATCH; #213 head packed | #213 grid + RSS re-measure post-#150 |
-| f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%), a GATE model | Fold into the 35B lever |
-| Invocation-parity prevention | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
+| 27B NVFP4 @`0893e160` | **0.72x -> 0.85x**: FP8 tower native, tokens MATCH; #213 head packed | #213 grid + RSS re-measure post-#150 |
+| f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
+| Invocation-parity | CI guard + checklist landing | build-verify `kGemvHeuristicAlgos` |
+| MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; grouped router parallelised, e2e NOT ESTABLISHED | ckpt is tiktoken-only: no warm server |
-| 35B fresh grid | @`491c2f1e`: warp-shuffle router LANDED, **c1/c4 now 0.98x**, c2 0.87x, c8 0.92x | `CastF32` 3.1%; tighten c2/c8 spreads |
+| 35B binding grid | @`a0fa12c7`: **flat 0.935-0.979x, NO c2/c8 weak cell** (CoV <0.81%); mem PSS 3.81x | Attribute the flat ~5% mid-band; TTFT c2 0.872x |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; sealed-vLLM tput 1.021x PASS; latency/VRAM OPEN | Spike residual 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
-| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
+| SERVE-ASYNC-DENSE-MIRROR | **LANDED+VERIFIED** (`f9c969ae`): async mirror, dense Qwen3; SACRED 184/184 | Sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
-| Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
-| `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
-| `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** verbatim weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head need the device |
+| `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS`: reference conditioning |
+| `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head |
 | Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
-| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
+| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
-| Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): model, runner, ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
+| Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
 
 In-flight, default-OFF, not pushed: see the row's spec.
 
@@ -46,12 +45,16 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
 
 ## Next actions
 
-0. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
-   of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH; no `kv_cache_dtype`.
-1. **Spike the Parakeet encoder row** (vLLM carries it inside
-   `nano_nemotron_vl.py`; the transducer half is NOT in vLLM: separate call).
-2. **Qwen3.5-4B sm_120:** rebased branch is GREEN and reprofiled. Spike the
-   residual 1.609x conv gap; latency/VRAM and gate models stay open.
+0. **35B c2/c8 CLOSED by measurement** (`a0fa12c7`): the 0.87x/0.92x "weak
+   cells" were a HARNESS MISMATCH. Flat 0.935-0.979x, CoV <0.81%. Next: the
+   mid-band ~5% (c2-c16) + the one outlier, TTFT c2 0.872x. The binding harness
+   was UNRUNNABLE 2026-08-09..`a0fa12c7` (`vllm-server` rename, 12 stale paths).
+1. **27B NVFP4 0.72x -> 0.85x** (FP8 tower native). Next: NVFP4 MLP marlin, 68%
+   of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
+2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
+   transducer half is NOT in vLLM: separate call).
+3. **Qwen3.5-4B sm_120:** GREEN + reprofiled. Spike the residual 1.609x conv
+   gap; latency/VRAM and gate models stay open.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).

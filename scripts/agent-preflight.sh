@@ -67,6 +67,7 @@ CHECKERS=(
   check-supported-models
   check-env-doc
   check-fusion-consistency
+  check-fp4-resident-consistency
   check-runner-routing-consistency
   check-surface-coverage
   check-test-registration
@@ -98,7 +99,9 @@ SUITES=(
   test_check_model_checklist
   test_check_supported_models
   test_check_env_doc
+  test_checker_text
   test_check_fusion_consistency
+  test_check_fp4_resident_consistency
   test_check_runner_routing_consistency
   test_check_surface_coverage
   test_check_test_registration

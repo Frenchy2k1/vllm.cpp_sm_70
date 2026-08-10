@@ -222,19 +222,60 @@ POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
 POINTS_BY_MODEL = {
     "q3mxfp4": ((1, 6), (2, 6), (4, 12), (8, 24)),
 }
+# "27" and "27n" are DIFFERENT MODELS, not two spellings of one. The unsloth
+# repo @890bdef7 ships a BF16 lm_head and a different mixed-precision layout;
+# the nvidia ModelOpt repo @0893e160 is NVFP4 MLP + FP8 W8A8 tower + NVFP4 head.
+# They do not share goldens and their ratios are not comparable.
 MODEL_REVISIONS = {
     "27": "890bdef7a42feba6d83b6e17a03315c694112f2a",
+    "27n": "0893e1606ff3d5f97a441f405d5fc541a6bdf404",
     "35": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
     "q3mxfp4": "b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47",
 }
 MODEL_REPOSITORIES = {
     "27": "unsloth/Qwen3.6-27B-NVFP4",
+    "27n": "nvidia/Qwen3.6-27B-NVFP4",
     "35": "nvidia/Qwen3.6-35B-A3B-NVFP4",
     "q3mxfp4": "Yi30/Qwen3-8B-MXFP4",
 }
 MAX_NUM_SEQS = 32
-MAX_NUM_BATCHED_TOKENS = {"27": 2048, "35": 8192, "q3mxfp4": 2048}
-MAX_MODEL_LEN = {"27": 262144, "35": 262144, "q3mxfp4": 40960}
+MAX_NUM_BATCHED_TOKENS = {"27": 2048, "27n": 2048, "35": 8192, "q3mxfp4": 2048}
+MAX_MODEL_LEN = {"27": 262144, "27n": 262144, "35": 262144, "q3mxfp4": 40960}
+# Every correctness precondition the driver can dispatch, and the two facts that
+# make its recorded PASS falsifiable.
+#
+# `proof` is a line the gate prints ONLY after it has compared tokens. It is not
+# decoration: a checkpoint-gated parity test emits a loud MESSAGE and returns
+# with status 0 when its snapshot is absent, so `ctest` exit 0 says nothing about
+# whether anything was compared. Without the proof line a model gate can be
+# recorded as passed with zero tokens compared.
+#
+# `golden_revision` is the checkpoint the gate's committed goldens were captured
+# against, when the gate pins one, and `None` when it resolves its snapshot
+# without pinning a revision. Comparing it to `MODEL_REVISIONS[model_key]` is
+# what tells a reader whether the precondition is a golden FOR THE BENCHED MODEL
+# or build sanity on a neighbour -- the deliberate case for key "27n".
+MODEL_GATE_CONTRACTS = {
+    "test_qwen27_paged_engine": {
+        # tests/parity/hf_snapshot.h `kQwen27NvfP4Revision`: the 27B goldens are
+        # the unsloth @890bdef7 checkpoint's, for BOTH dense 27B keys.
+        "golden_revision": "890bdef7a42feba6d83b6e17a03315c694112f2a",
+        "proof": "qwen27_paged_engine: full production stream 16/16 token-exact vs vLLM",
+    },
+    "test_qwen36_paged_engine": {
+        # Find35BSnapshot() takes the first cached snapshot of the 35B repo and
+        # pins no revision, so this records an honest "unknown" rather than
+        # asserting a match nothing checks.
+        "golden_revision": None,
+        "proof": "qwen36_paged_engine M0-EXIT: produced ",
+    },
+    "mxfp4_smoke_battery": {
+        # docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json records no
+        # source revision.
+        "golden_revision": None,
+        "proof": "MXFP4 smoke battery: PASS",
+    },
+}
 ENGINES = ("ours", "vllm")
 PERCENTILE_METRICS = ("ttft", "tpot", "itl", "e2el")
 PERCENTILES = (50, 90, 99)
@@ -1280,13 +1321,37 @@ def record_model_gate(
         raise HarnessError(f"refusing to overwrite model-gate evidence: {output}")
     if model_key not in MODEL_REVISIONS:
         raise HarnessError(f"unknown model key: {model_key}")
+    contract = MODEL_GATE_CONTRACTS.get(test_name)
+    if contract is None:
+        raise HarnessError(
+            f"no model-gate contract for {test_name}: a gate with no proof marker "
+            "cannot be distinguished from one that never ran"
+        )
     _require_full_sha(vllm_cpp_sha, "vllm.cpp SHA")
     if not log.is_file() or log.stat().st_size == 0:
         raise HarnessError(f"model-gate log is absent or empty: {log}")
+    # A checkpoint-gated gate exits 0 whether it compared sixteen tokens or none,
+    # so the exit status is not the evidence -- this line is.
+    if contract["proof"] not in log.read_text(encoding="utf-8", errors="replace"):
+        raise HarnessError(
+            f"{test_name} compared no token: its log never printed "
+            f"{contract['proof']!r}, so the checkpoint was absent, the gate was "
+            "skipped, or its output was not captured"
+        )
+    golden_revision = contract["golden_revision"]
+    model_revision = MODEL_REVISIONS[model_key]
     result = {
+        # None when the gate pins no revision; otherwise whether its committed
+        # goldens belong to the checkpoint this campaign actually benches. False
+        # is legitimate and deliberate for key "27n" -- and now readable.
+        "golden_covers_benched_checkpoint": (
+            None if golden_revision is None else golden_revision == model_revision
+        ),
+        "golden_revision": golden_revision,
         "log": str(log),
         "log_sha256": sha256_file(log),
         "model_key": model_key,
+        "model_revision": model_revision,
         "passed": True,
         "test_name": test_name,
         "vllm_cpp_sha": vllm_cpp_sha,

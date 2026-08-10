@@ -245,9 +245,14 @@ Assisted-by: AGENT:MODEL [TOOL]
 AI tools never add `Signed-off-by` or `Co-Authored-By`. The human submitter owns
 and reviews the change.
 
-Keep each PR within its reviewed budget, classifying policy, checker, doc,
-script, test, CI, generated, and product paths explicitly. Never hide mutable
-files behind a blanket directory exemption.
+Classify policy, checker, doc, script, test, CI, generated, and product paths
+explicitly, and never hide mutable files behind a blanket directory exemption.
+There is no line budget: the per-class limits were retired 2026-08-10 because
+9 of the last 22 merged PRs exceeded the product one and tests were a third to
+a half of every large diff, so the gate fired on ordinary work and charged
+RED-first mutation tests against the same allowance as kernel code. Size is a
+review judgement. Split a change when a reviewer would be better served by
+parts, not when a counter says so.
 
 ## Changing the rules or a checker
 

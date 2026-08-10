@@ -464,11 +464,16 @@ inline bool LagunaMoeFusedW13Enabled() {
   return on;
 }
 
+// Same lifetime fix as the Qwen3.5 resident slots (issue #237); ResidentSlot and
+// the reasoning are in qwen3_5_weights.h, which this model's weights header
+// already includes.
 LagunaMoeMarlinResident& LagunaMoeMarlinResidentFor(const LagunaMoeWeights* w) {
   static std::mutex mu;
-  static std::unordered_map<const LagunaMoeWeights*, LagunaMoeMarlinResident> cache;
   std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  if (!w->resident_marlin.state) {
+    w->resident_marlin.state = std::make_shared<LagunaMoeMarlinResident>();
+  }
+  return *static_cast<LagunaMoeMarlinResident*>(w->resident_marlin.state.get());
 }
 
 // Repack every routed expert's fp4 gate/up/down into the resident Marlin layout —
