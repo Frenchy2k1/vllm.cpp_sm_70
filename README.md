@@ -309,7 +309,8 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35). Op coverage: [docs/STATUS.md](docs/STATUS.md) |
-| **ROCm** | AMD GPUs | W0 skeleton; a contributor ran gfx1201 on 2x R9700 ([#140](https://github.com/mudler/vllm.cpp/pull/140)). No AMD board here: [docs/ROCM.md](docs/ROCM.md) |
+| **ROCm** | AMD GPUs | W0 skeleton, gfx1201/2xR9700 contrib-run ([#140](https://github.com/mudler/vllm.cpp/pull/140)); no board: [detail](docs/ROCM.md) |
+| **Tenstorrent** | Blackhole | W0, 1 op |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
 Per-arch build flags, per-op coverage, and the quantization format table:

@@ -113,7 +113,7 @@ class AcceleratorMetadataContract(unittest.TestCase):
 
     def test_cuda_archive_smoke_resolves_only_the_external_driver_stub(self) -> None:
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("*/stubs/libcuda.so", script)
+        self.assertIn("find -L /usr/local/cuda -type f -path '*/stubs/libcuda.so'", script)
         self.assertIn("CUDA driver stub is required for archive smoke validation", script)
         self.assertIn('export LD_LIBRARY_PATH="$cuda_stub_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"', script)
 

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -158,6 +159,98 @@ class PathClassification(unittest.TestCase):
             checker.recognized_evidence("scripts/check-agent-record.py"),
             "tests/scripts/test_agent_record.py",
         )
+
+
+class RetiredSurfaces(unittest.TestCase):
+    """Deleted paths keep a class on purpose; the table says so in one place.
+
+    `classify_path` fails closed, and a deleted file still appears in the diff of
+    the commit that removes it, so a retired surface with no class reds the very
+    change that retires it. The retention was previously spread across three
+    live groups and two module-level regexes with the reason written in only one
+    of them, and was read as abandoned scaffolding.
+    """
+
+    LIVE_GROUPS = (
+        "POLICY_FILES",
+        "APPEND_ONLY_FILES",
+        "PROJECT_RECORD_FILES",
+        "PROCEDURE_FILES",
+        "GOVERNANCE_SUPPORT_FILES",
+        "PRODUCT_CHECKER_FILES",
+        "PUBLIC_DOCUMENT_FILES",
+        "GENERATED_FILES",
+    )
+
+    def test_retired_paths_keep_the_class_they_had_while_live(self) -> None:
+        """The budget a historical diff spends must not move under this table."""
+        patterns = {
+            ".agents/state-index/2026-08-001.csv": "append_only_record",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
+        }
+        exact = {
+            ".agents/policy.csv": "policy",
+            ".agents/policy-cutover": "policy",
+            ".agents/state.md": "project_record",
+            ".agents/state.csv": "project_record",
+            ".agents/ai-coding-assistants.md": "procedure",
+            ".agents/benchmark-protocol.md": "procedure",
+            ".agents/directives.md": "procedure",
+            ".agents/discipline.md": "procedure",
+            ".agents/gates.md": "procedure",
+            ".agents/test-porting.md": "procedure",
+        }
+        for path, path_class in {**exact, **patterns}.items():
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), path_class)
+        self.assertEqual(dict(checker.RETIRED_PATHS), exact)
+
+    def test_every_retired_path_is_really_gone_from_the_tree(self) -> None:
+        """A live path parked here would take the retired budget and no review.
+
+        If one is ever re-added it must move back to a live group, so this fails
+        rather than letting the table quietly govern a live surface.
+        """
+        tracked = set(
+            subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).splitlines()
+        )
+        self.assertEqual(sorted(set(checker.RETIRED_PATHS) & tracked), [])
+        still_here = [
+            path
+            for path in tracked
+            for pattern, _ in checker.RETIRED_PATTERNS
+            if pattern.fullmatch(path)
+        ]
+        self.assertEqual(still_here, [])
+
+    def test_the_live_archive_does_not_classify_as_retired(self) -> None:
+        """`.agents/completed/state-events/` was MOVED, not deleted: 160 files."""
+        archived = ".agents/completed/state-events/2026-08/STATE-20260808T120000-001.md"
+        self.assertIsNone(checker.retired_class(archived))
+        self.assertEqual(checker.classify_path(archived), "procedure")
+        self.assertEqual(
+            checker.classify_path(".agents/completed/state-migration-manifest.csv"),
+            "evidence",
+        )
+
+    def test_retired_and_live_groups_are_disjoint(self) -> None:
+        """One home per path: the split that made this look like dead scaffolding."""
+        retired = set(checker.RETIRED_PATHS)
+        for name in self.LIVE_GROUPS:
+            with self.subTest(group=name):
+                self.assertEqual(sorted(retired & set(getattr(checker, name))), [])
+
+    def test_a_surface_that_never_EXISTED_fails_closed(self) -> None:
+        """`.agents/governance-tasks.csv` was never added and never deleted.
+
+        It sat in POLICY_FILES as a speculative entry, so a file by that name
+        could have arrived and spent the policy budget without anyone choosing
+        its class. Retirement is for paths git actually removed; this one is
+        simply unknown, and unknown fails closed.
+        """
+        with self.assertRaises(ValueError):
+            checker.classify_path(".agents/governance-tasks.csv")
+        self.assertNotIn(".agents/governance-tasks.csv", checker.RETIRED_PATHS)
 
 
 class BudgetEnforcement(unittest.TestCase):
@@ -496,6 +589,64 @@ class BudgetEnforcement(unittest.TestCase):
             with self.subTest(pending=pending):
                 with self.assertRaises(ValueError):
                     role.pending_pr_commits(base, head, pending)
+
+    def test_a_merge_landed_pr_carries_the_commits_it_brings_in(self) -> None:
+        """Arrival is judged ONCE, on the commit that lands the change.
+
+        A PR landed with a real merge commit pushes the merge AND its branch
+        commits in one range. The merge names the PR; the branch commits under it
+        never had to, so judging each on its own message called every merge-
+        landed PR a direct push -- main went red for `6603356a` (#178),
+        `e73cbbae` (#204) and `1a02ab4f` (#196), in a gate about arriving through
+        exactly the PR that had just been merged.
+
+        The exhaustive cases live in tests/scripts/test_agent_role.py; this is the
+        evidence CHECKER_EVIDENCE_OVERRIDES names for the role-discipline checker,
+        so it pins the rule and the hole it must not open: only the SIDE parents
+        count, and a merge naming no row and no PR exempts nothing.
+        """
+        role = checker.load_role_discipline()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", *args], cwd=repo, text=True, stderr=subprocess.DEVNULL
+                ).strip()
+
+            def commit(message: str, path: str) -> str:
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(f"{message}\n")
+                git("add", path)
+                git("commit", "-q", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "t@example.com")
+            git("config", "user.name", "T")
+            commit("docs: seed", "docs/STATUS.md")
+            pushed = commit("perf: hand-edit a kernel", "src/vt/cuda/x.cu")
+            git("checkout", "-q", "-b", "row/ENG-FOO")
+            reviewed = commit("perf: faster kernel", "src/vllm/a.cpp")
+            git("checkout", "-q", "main")
+            git("merge", "-q", "--no-ff", "-m",
+                "Merge pull request #12 from mudler/row/ENG-FOO", "row/ENG-FOO")
+            merge = git("rev-parse", "HEAD")
+
+            with mock.patch.object(role, "ROOT", repo):
+                content = role.merged_pr_content([pushed, merge])
+                self.assertIn(reviewed, content)
+                # Merging a PR on top must not launder a direct push below it.
+                self.assertNotIn(pushed, content)
+
+                git("checkout", "-q", "-b", "wip", merge)
+                commit("perf: hand-edit again", "src/vllm/b.cpp")
+                git("checkout", "-q", "main")
+                git("merge", "-q", "--no-ff", "-m", "Merge branch 'wip'", "wip")
+                self.assertEqual(
+                    role.merged_pr_content([git("rev-parse", "HEAD")]), frozenset()
+                )
 
 
 if __name__ == "__main__":

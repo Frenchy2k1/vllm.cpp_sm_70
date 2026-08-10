@@ -221,6 +221,13 @@ const AttentionBackendRegistrar kFlashAttnMetal{vt::DeviceType::kMETAL,
 const AttentionBackendRegistrar kFlashAttnVulkan{vt::DeviceType::kVULKAN,
                                                  FlashAttentionBackend::kName,
                                                  MakeFlashAttentionBackend};
+// ...and kTENSTORRENT (BACKEND-TENSTORRENT). Host-staged kPagedAttention /
+// kReshapeAndCache use the same NHD layout get_kv_cache_shape allocates —
+// name registration only; TenstorrentPlatform::get_attn_backend_priority is
+// what decides whether the name is reached.
+const AttentionBackendRegistrar kFlashAttnTenstorrent{vt::DeviceType::kTENSTORRENT,
+                                                      FlashAttentionBackend::kName,
+                                                      MakeFlashAttentionBackend};
 }  // namespace
 
 }  // namespace vllm::v1

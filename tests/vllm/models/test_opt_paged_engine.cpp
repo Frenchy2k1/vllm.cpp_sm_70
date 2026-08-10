@@ -131,7 +131,7 @@ std::vector<int32_t> LoadI32File(const fs::path& p) {
 
 }  // namespace
 
-TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (CUDA + Metal, SACRED)") {
+TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (CUDA + Metal + Tenstorrent, SACRED)") {
   const std::string dir = FindOptModelDir();
   if (dir.empty()) {
     MESSAGE(
@@ -204,7 +204,7 @@ TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (CUDA + Metal, S
   // (a probe failing silently into the slow path).
   const vt::DeviceType run_dev = loaded->runner().device().type;
   MESSAGE("opt-125m: the engine selected device type " << static_cast<int>(run_dev)
-          << " (0=CPU, 1=CUDA, 2=METAL, 3=VULKAN, 4=XPU)");
+          << " (0=CPU, 1=CUDA, 2=METAL, 3=VULKAN, 4=XPU, 5=ROCM, 6=TENSTORRENT)");
   // The nine ops OPT's forward + greedy sampling dispatch. Every one must be
   // REGISTERED for the running device, must actually be SELECTED at least once,
   // and must never DECLINE.

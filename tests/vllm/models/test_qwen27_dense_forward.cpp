@@ -227,13 +227,54 @@ TEST_CASE("qwen27 loader packs GDN in_proj_ba in exact b,a row order") {
                        doctest::Contains("missing tensor"), std::runtime_error);
   tensors["a"].dtype = "F32";
   CHECK_THROWS_WITH_AS(LoadMergedBf16RawNK(get, {"b", "a"}),
-                       doctest::Contains("expected BF16"), std::runtime_error);
+                       doctest::Contains("unsupported dtype 'F32'"),
+                       std::runtime_error);
   tensors["a"].dtype = "BF16";
   tensors["a"].shape = {3, 5};
   CHECK_THROWS_WITH_AS(LoadMergedBf16RawNK(get, {"b", "a"}),
                        doctest::Contains("share input width"), std::runtime_error);
   CHECK_THROWS_WITH_AS(LoadMergedBf16RawNK(get, {}),
                        doctest::Contains("at least one shard"), std::runtime_error);
+
+  // nvidia/Qwen3.6-27B-NVFP4 publishes the GDN in-projections as per-tensor FP8
+  // beside BF16 siblings, so one merged parameter may MIX dtypes. The FP8 shard
+  // is materialized first (nvfp4_dequant.h:83 -- `bf16(f8(w) * scale)`), and the
+  // b,a row order plus the nk=true orientation stay exactly as the all-BF16 case
+  // above. E4M3: 0x38 = 1.0, 0x40 = 2.0, 0x3c = 1.5.
+  const std::vector<uint8_t> a_f8 = {
+      0x38, 0x40, 0x3c, 0x38,
+      0x40, 0x3c, 0x38, 0x40,
+      0x3c, 0x38, 0x40, 0x3c,
+  };  // [3,4]
+  const float a_scale = 2.0F;
+  tensors["a"].dtype = "F8_E4M3";
+  tensors["a"].shape = {3, 4};
+  tensors["a"].data = a_f8.data();
+  tensors["a"].nbytes = a_f8.size();
+  add("a_scale", "F32", {1}, &a_scale, sizeof(a_scale));
+
+  const OwnedTensor mixed = LoadMergedBf16RawNK(get, {"b", "a"});
+  REQUIRE(mixed.rank == 2);
+  CHECK(mixed.shape[0] == 5);
+  CHECK(mixed.shape[1] == 4);
+  CHECK(mixed.dtype == DType::kBF16);
+  REQUIRE(mixed.bytes.size() == (b.size() + a_f8.size()) * sizeof(uint16_t));
+  CHECK(std::memcmp(mixed.bytes.data(), b.data(), b.size() * sizeof(uint16_t)) == 0);
+  const uint16_t* merged_rows =
+      reinterpret_cast<const uint16_t*>(mixed.bytes.data());
+  // 1.0,2.0,1.5 * 2.0 -> 2.0,4.0,3.0 -> bf16 0x4000,0x4080,0x4040.
+  const uint16_t want[3] = {0x4000, 0x4080, 0x4040};
+  for (size_t i = 0; i < a_f8.size(); ++i) {
+    CHECK(merged_rows[b.size() + i] == want[i % 3]);
+  }
+
+  // A per-output-channel scale read as per-tensor would be silently wrong, so
+  // any other element count is REJECTED rather than reinterpreted.
+  const float bad_scale[2] = {2.0F, 2.0F};
+  add("a_scale", "F32", {2}, bad_scale, sizeof(bad_scale));
+  CHECK_THROWS_WITH_AS(LoadMergedBf16RawNK(get, {"b", "a"}),
+                       doctest::Contains("per-tensor or one value per output row"),
+                       std::runtime_error);
 }
 
 TEST_CASE("qwen27 GDN loader retains one merged BA owner and no split copies") {
