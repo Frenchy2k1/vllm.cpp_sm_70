@@ -386,13 +386,46 @@ exactly this), and acceptance on a bf16-trained draft over an NVFP4 target is
 modest. The house gate is at-or-above vLLM's own DSpark-on, so this row stays
 `ACTIVE`.
 
-**Still owed for a binding W6:** (1) the cross-engine comparison against the
-pinned oracle running the same target+draft+k through the project's SACRED
-harness rather than an ad-hoc prompt (our base decode and the oracle's already
-differ on this prompt, so a like-for-like corpus is required); (2) the
-acceptance rate/length band against the upstream reference; (3) the speed A/B
-versus vLLM DSpark-on; (4) the same on the 27B lane and the Gemma4 `1 + N`
-layout.
+## 6c. MEASURED: what enabling DSpark actually buys (2026-08-10)
+
+The "~2% behind" reading in §6b was a COLD single-shot measurement, where model
+load and first-request costs dominate. Warm (`--repeat 3`, c1, 128 tokens, same
+target + draft + k, one `flock`), enabling DSpark **does** change the number:
+
+| engine / arm | tok/s | speculative speedup |
+|---|---:|---:|
+| ours, spec-OFF (warm) | 71.3 | — |
+| **ours, DSpark k=8 (warm)** | **~82** (79.5, 84.8) | **1.15x** |
+| oracle vLLM 0.25.0, spec-OFF | 25.1 | — |
+| **oracle vLLM 0.25.0, DSpark k=8** | **35.4** | **1.41x** |
+
+**Acceptance accounting** (`VT_SPEC_TRACE`, 48 tokens): 18 speculative steps
+emitted 48 tokens = **2.67 tokens/step**, of which **1.67 accepted drafts/step**
+out of k=8 — a **20.8% acceptance rate**.
+
+**The honest comparison is the RATIO OF RATIOS, not the raw tok/s.** The oracle
+arm ran `enforce_eager=True` and one `generate()` per prompt, which is NOT
+vLLM's production graphed config (house rule: the denominator is graphed vLLM,
+never `--enforce-eager`). Our 82 versus its 35.4 therefore says nothing binding
+— our own spec-off 71.3 versus its 25.1 is a 2.8x that the project's own 35B
+grid (0.93-1.03x) proves is an artifact of the handicap. What IS like-for-like
+is each engine's speculative speedup measured against ITSELF under identical
+settings: **upstream gets 1.41x out of this draft, we get 1.15x.**
+
+So DSpark works and pays, but we leave roughly half the available speedup on the
+table. The two named suspects, in order: (1) the sequential Markov stage is a
+host-side loop with a device round-trip per step, where upstream captures the
+WHOLE draft step (backbone + the N-step loop) in one CUDA graph
+(`dspark/speculator.py:22-24`); (2) 20.8% acceptance is low for a block drafter
+and wants checking against the upstream reference band before it is blamed on
+the draft checkpoint's bf16-trained-over-NVFP4 mismatch.
+
+**Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
+PRODUCTION GRAPHED config through the project's harness, not the eager arm run
+here; (2) token-exactness against that oracle on the SACRED corpus rather than
+ad-hoc prompts; (3) the acceptance-rate band against the upstream reference;
+(4) the 27B lane and the Gemma4 `1 + N` layout; (5) the CUDA-graph capture of
+the draft step, which is where the missing half of the speedup most likely is.
 
 ## 7. Evidence, authority, stop conditions
 
