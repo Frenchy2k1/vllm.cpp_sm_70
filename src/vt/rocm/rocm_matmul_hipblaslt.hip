@@ -6,6 +6,26 @@
 // Matmul:   out[M,N] = a[M,K] @ b[K,N]
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+// hipBLAS ships TWO generations of the *Ex entry points and picks between them
+// in the header. The legacy generation takes `hipblasDatatype_t` (HIPBLAS_R_*);
+// the current one takes the HIP-wide `hipDataType` (HIP_R_*). This file is
+// written entirely against the current one — every data type below is HIP_R_*,
+// and the compute type is already the current `hipblasComputeType_t` — but it
+// never ASKED for it, so it only compiled on a ROCm new enough to make that
+// generation the default (7.x, where the row was developed on gfx1201).
+//
+// On ROCm 6.4 the legacy generation is the default, the two enums are distinct
+// types with no implicit conversion, and all six *Ex call sites fail with
+// "no matching function for call to 'hipblasGemmEx' ... no known conversion
+// from 'const hipDataType' to 'hipblasDatatype_t' for 9th argument" (issue #201,
+// gfx1100). Selecting the generation the file is written for fixes all six at
+// the include, rather than teaching six call sites to switch enums.
+//
+// Must precede <hipblas/hipblas.h>: it is what the header dispatches on. Newer
+// hipBLAS, where this generation is already the default, ignores it.
+#ifndef HIPBLAS_V2
+#define HIPBLAS_V2
+#endif
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 

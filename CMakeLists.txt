@@ -362,6 +362,45 @@ elseif(VLLM_CPP_HIP)
   # in the RmsNorm reduction is exactly the kind of drift that budget is meant to
   # catch rather than absorb.
   add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>)
+  # Floor HIP DEVICE code at -O1 when nothing else sets an optimisation level.
+  #
+  # This is not a performance preference, it is a correctness workaround for the
+  # ROCm runtime (issue #132, VikashLoomba, 4x gfx1100 / ROCm 7.14). The
+  # documented first build — `cmake -S . -B build-hip -DVLLM_CPP_HIP=ON`, no
+  # CMAKE_BUILD_TYPE — passes no -O at all, so hipcc compiles at -O0. At -O0 all
+  # eight RmsNorm specialisations come out with AMDHSA metadata
+  # `.uses_dynamic_stack: true` plus `hidden_hostcall_buffer` / `hidden_heap_v1`,
+  # even though the kernel performs no hostcall. That makes CLR create a hostcall
+  # buffer and start a listener thread on the first launch.
+  #
+  # CLR's listener startup/termination handshake is racy (the shared state is
+  # `volatile`, not atomic, and the upstream source still carries its own
+  # `FIXME_lmoriche: fix termination handshake`): under host CPU saturation a
+  # delayed listener can overwrite the `kExit` written by terminate(), and DSO
+  # finalisation then spins forever waiting for a thread that has already exited.
+  # The symptom is `test_backend_cross_device` hanging AFTER printing
+  # `Status: SUCCESS!` — 11/11 cases, 39/39 assertions, then no exit.
+  #
+  # The report's controlled A/B, relinking the same library with ONLY
+  # rocm_rmsnorm.hip.o changed, on a 48-thread host:
+  #   -O0 object (dynamic stack, hidden hostcall + heap): 14/20 teardown timeouts
+  #   -O1 object (no dynamic stack, no hostcall/heap):    20/20 clean exits
+  # The same finaliser loop also reproduces in a standalone raw-HIP program that
+  # links neither vllm.cpp nor doctest, so the defect is CLR's, not the harness'.
+  # The definitive fix belongs upstream in CLR; this keeps our documented build
+  # off the path that triggers it.
+  #
+  # Deliberately yields to any explicit choice: if the developer set a build type
+  # or put an -O in CMAKE_HIP_FLAGS, that wins and nothing is added here.
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" _vllm_hip_build_type)
+  if((_vllm_hip_build_type STREQUAL "" OR _vllm_hip_build_type STREQUAL "DEBUG")
+     AND NOT "${CMAKE_HIP_FLAGS}" MATCHES "(^| )-O")
+    add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-O1>)
+    message(STATUS
+      "HIP device code floored at -O1: -O0 marks kernels as dynamic-stack users "
+      "and trips the ROCm CLR hostcall-listener teardown deadlock (issue #132)")
+  endif()
+  unset(_vllm_hip_build_type)
   set(VLLM_CPP_HIP ON)
 else()
   set(VLLM_CPP_HIP OFF)

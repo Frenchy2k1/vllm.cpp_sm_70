@@ -22,6 +22,16 @@ example targets are named after the directories they are built from, so an
 in-source build makes the linker write each executable over its own source
 directory (issue #85).
 
+### One ROCm-specific behaviour
+
+Worth knowing before you read a hang as a bug in the tests: a build that sets no
+`CMAKE_BUILD_TYPE` floors **HIP device code** at `-O1` and prints a configure
+line saying so. At `-O0` the ROCm runtime starts a hostcall listener the kernels
+never use, and its teardown can deadlock at process exit — every test passes,
+`Status: SUCCESS!` prints, and the process never returns
+([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
+or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
+
 ## Confirming which CUDA architecture a build targets
 
 `CMakeCache.txt` is now a reliable answer. Configuring with
