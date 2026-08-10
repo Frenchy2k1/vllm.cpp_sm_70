@@ -157,6 +157,13 @@ void LoadDenseLmHead(const TensorResolver& get,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out);
 
+// True when the checkpoint ships an EXPLICIT head under either naming
+// (`<proj>.weight`, or `<proj>.weight_packed` for compressed-tensors NVFP4);
+// false means `tie_word_embeddings`. Exported so the gate can pin a CT-named
+// head as such rather than as a tied one.
+bool DenseCheckpointHasLmHead(const std::function<bool(const std::string&)>& has,
+                              const std::string& proj);
+
 // VT_LMHEAD_FP4 (default ON): the in-binary rollback for the packed head. `0`
 // restores the dequantize-at-load owner, so the A/B is same-binary.
 bool DenseLmHeadFp4Enabled();
@@ -214,11 +221,12 @@ class Qwen3_5DenseModel {
   static void PrepareBf16Resident(const Qwen3_5DenseWeights& weights,
                                   vt::Queue& queue);
 
-  // PERF-27B-LMHEAD-FP4 (issue #213). Build the packed NVFP4 `lm_head_fp4`
-  // Marlin W4A16 resident, PRE-CAPTURE. Inert when the head is not packed or
-  // Marlin is not the selected path. Called from the registry `prepare` hook,
-  // mirroring Qwen3_5Model::PrepareMarlinResident.
-  static void PrepareMarlinResident(const Qwen3_5DenseWeights& weights,
+  // PERF-27B-LMHEAD-FP4 (issue #213). Build the resident form of the packed
+  // `lm_head_fp4` THIS backend's logits GEMM consumes: the Marlin W4A16 repack
+  // on CUDA (PRE-CAPTURE), else the dequantized bf16 [K,N] operand (so the
+  // forward never dequantizes per call). Inert when the head is not packed.
+  // Called from the registry `prepare` hook, mirroring the MoE sibling.
+  static void PrepareLmHeadResident(const Qwen3_5DenseWeights& weights,
                                     vt::Queue& queue);
 
   // Batched PAGED dense forward — the 27B analogue of Qwen3_5Model::Forward.

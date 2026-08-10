@@ -65,7 +65,7 @@ are our reading of their documented behavior, not measurements.
 | Format | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ☐ |
-| NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA gate PENDING | ✅ | ☐ | ☐ |
+| NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA-gated on `nvidia/Qwen3.6-27B-NVFP4`@`0893e160` (greedy continuations byte-identical packed vs dequant, `test_qwen27_paged_engine` 235/235, RSS -1.70 GiB) | ✅ | ☐ | ☐ |
 | GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE took a bf16-activation regression in `b4f5610a`; found by bisect and fixed 2026-08-06) | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |

@@ -3,7 +3,8 @@
 Issue: [#213](https://github.com/mudler/vllm.cpp/issues/213)
 Row: `PERF-27B-LMHEAD-FP4`
 Gate model: `nvidia/Qwen3.6-27B-NVFP4` @`0893e1606ff3d5f97a441f405d5fc541a6bdf404`
-Base: `origin/main` @`04069bd7`
+Base: `origin/main` @`04069bd7`; the review-findings round is rebased onto
+`origin/main` @`723d96a8`.
 
 ## Scope
 
@@ -49,7 +50,9 @@ an Ampere tile on an `sm_121a` part.
 - `modelopt.py:1249,1283-1284` — `ModelOptNvFp4W4A16LinearMethod` pins
   `MarlinNvFp4LinearKernel`, explicitly because the generic priority list would
   otherwise first-pick a W4A4 cutlass kernel on this hardware.
-- `modelopt.py:1359-1362` — vLLM **deletes** `input_scale` on the W4A16 path.
+- `modelopt.py:1365` — vLLM **deletes** `input_scale` on the W4A16 path
+  (`process_weights_after_loading`); the placeholder is registered at
+  `modelopt.py:1358`. Verified against the pinned oracle `555967922`.
 - `vllm/model_executor/layers/logits_processor.py:98-133` — `_apply_head` calls
   `lm_head.quant_method.apply` every step; nothing materializes BF16.
 - `marlin_utils_fp4.py:157-218,221-306` — `prepare_fp4_layer_for_marlin` /
@@ -62,15 +65,30 @@ an Ampere tile on an `sm_121a` part.
 2. In the loader's `U8` branch, stop dequantizing: route through the existing
    `IsNvfp4Projection` / `LoadNvfp4AnyNaming` path into `lm_head_fp4`, keeping
    the ModelOpt `weight_scale_2`-as-scale convention already handled at
-   `:274-288`. Retire the stale "lm_head is never quantized" rule at `:506`.
-3. `DenseLmHead` (`qwen3_5.cpp:1248-1250`) gains the packed branch so the tied
-   and `nk` cases keep one code path. Both consumers must route through it:
-   `:7024-7026` (gather) and `:7028-7030` (non-gather), plus the eager
-   `ForwardLogits` arm at `:6671-6674`.
-4. Build the Marlin resident **pre-capture**, mirroring `:6424-6425`. A resident
-   built inside capture bakes a stack address and fails on replay.
-5. Stop staging the BF16 head owner in `PrepareBf16Resident` (`:6456`), or the
-   ~2.3 GiB RSS win does not materialize.
+   `:274-288`.
+
+   **Deviation, ratified in review:** the design said to retire the stale
+   "lm_head is never quantized" rule in `IsQwen27QuantizedLinear`
+   (`qwen3_5_dense_weights.cpp:527` today, not `:506`). It was deliberately NOT
+   retired: the function has ZERO production callers — only its own routing test
+   in `test_qwen27_dense_forward.cpp` — so changing it would move no behavior
+   while invalidating a checked-in expectation. The routing that matters lives in
+   `LoadDenseLmHead`.
+3. A `DenseLogitsF32D` helper gains the packed branch so the tied and `nk`
+   cases keep one code path. All three consumers route through it: the gathered
+   and non-gathered paged arms and the eager `ForwardDense` arm.
+4. Build the head's resident **pre-capture**, from the registry `prepare` hook
+   (`Qwen3_5DenseModel::PrepareLmHeadResident`), mirroring the MoE
+   `PrepareMarlinResident`. `BuildMarlinDenseResident` copies a function-local
+   host float into the device buffer; built lazily inside a captured region, the
+   copy source does not outlive the capture. On a backend with NO fp4 GEMM the
+   same hook builds the dequantized bf16 operand instead, so the fallback never
+   dequantizes per forward call.
+5. `PrepareBf16Resident` needs no head-specific branch: a packed head's bf16
+   owner is empty by construction, and the function is only reached under
+   `IsPlainBf16Qwen3_5Dense`, which is false whenever the head is packed. **The
+   RSS win comes from the LOADER no longer building the f32 + bf16 arrays**, not
+   from anything skipped at staging time.
 6. The dense MTP ctor (`:6684-6686`) has no `lm_head_fp4_` sibling; add it.
 
 Gate the whole thing behind `VT_LMHEAD_FP4` (default ON once green) so the A/B
@@ -85,8 +103,16 @@ so every recorded `unsloth` benchmark is unaffected.
   workspace that is not zero at allocation hangs forever. Zero at alloc.
 - **`IsTrueW4A4()` flip.** This checkpoint ships `lm_head.input_scale`.
   Consuming it would select the W4A4 GEMM that vLLM explicitly refuses
-  (`modelopt.py:1359-1362`). Keep `VT_MODELOPT_W4A4=0` and assert
-  `lm_head_fp4.IsTrueW4A4() == false`.
+  (`modelopt.py:1365`) AND make `PrepareLmHeadResident` early-return, silently
+  skipping the pre-capture build. The rule holds under BOTH spellings:
+  `LoadCtNvfp4Raw` consumes `input_global_scale` unconditionally (correct for a
+  27B TOWER projection, wrong for an output head), so `LoadDenseLmHead` drops the
+  activation globals unless `VT_MODELOPT_W4A4=1`. Assert
+  `lm_head_fp4.IsTrueW4A4() == false` for both namings.
+- **A compressed-tensors head read as tied.** The model loader's head probe must
+  accept `<proj>.weight_packed` as well as `<proj>.weight`
+  (`DenseCheckpointHasLmHead`); a bare `.weight` probe reads a CT head as
+  `tie_word_embeddings` and computes the logits off the embedding table.
 - **Gate blindness.** `test_qwen27_paged_engine` (235/235) runs `unsloth`
   @`890bdef7`, which ships a **BF16** head — that gate cannot see this path. A
   fresh greedy continuation on `nvidia`@`0893e160` against the pinned oracle is
@@ -103,6 +129,18 @@ RED first, `tests/parity/test_qwen27_dense_lmhead_fp4.cpp`:
 2. Numerical: logits from the packed head match a reference dequant-then-GEMM
    within the Marlin W4A16 tolerance already used by the 32B-NVFP4A16 op tests.
 3. Assert `IsTrueW4A4() == false` for the loaded head.
+
+Added in the review-findings round, each pinned by a mutation that turns it RED:
+
+4. The same `IsTrueW4A4() == false` assertion under compressed-tensors names
+   (`weight_packed` / `weight_global_scale` / `input_global_scale`), and
+   `DenseCheckpointHasLmHead` accepting the CT spelling.
+5. Both PAGED lm_head call sites — the gathered (prefill/mixed) and the
+   non-gathered arm — against the eager reference. The numerical case above runs
+   only `ForwardDense`, so reverting either paged arm to the bf16 owner was
+   invisible.
+6. The fallback dequant is built ONCE (pointer identity across two forwards),
+   not per call, and the registry `prepare` hook builds it before any forward.
 
 Port anchor: `marlin_utils_fp4.py` tolerances and shapes as used by the existing
 NVFP4A16 op tests.
@@ -121,7 +159,9 @@ NVFP4A16 op tests.
   c1/c2/c4/c8. Expected effect is far above the 0.5% noise band, so e2e
   throughput resolves it; report `nsys --cuda-graph-trace=node` instance counts
   for the logits kernel on both legs as the invocation-parity evidence.
-- Memory: peak host RSS on both legs; expect ~2.3 GiB lower with the head packed.
+- Memory: peak host RSS on both legs. Expected delta **1.70 GiB**: the bf16
+  head is `2*K*N` = 2,543,206,400 B = 2.368 GiB and the packed head is
+  `K*N/2 + K*N/16` = 715,264,000 B = 0.666 GiB, at the real 248320x5120.
 
 ## Evidence
 
