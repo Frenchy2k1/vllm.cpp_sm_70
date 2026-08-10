@@ -193,6 +193,9 @@ vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
 vllm_cpp_add_test(test_muse_glimmer_scaffold vllm/models/test_muse_glimmer_scaffold.cpp)
+vllm_cpp_add_test(test_muse_glimmer_vision vllm/models/test_muse_glimmer_vision.cpp)
+target_include_directories(test_muse_glimmer_vision PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
