@@ -83,6 +83,22 @@ class Sampler {
                         const SamplingMetadata& sampling_metadata,
                         vt::Tensor* sampled_ids_out = nullptr) const;
 
+  // compute_logprobs + gather_logprobs over PROMPT positions
+  // (gpu_model_runner.py:5688-5697, SAMPLE-PROMPT-LOGPROBS). `logits` is a
+  // read-only [n, vocab] f32 view of the rows the forward produced for prompt
+  // positions; `target_token_ids` [n] names the token each row is scored
+  // against — the token that FOLLOWS that position, since a prompt logprob asks
+  // how likely the token that actually came next was.
+  //
+  // Prompt positions bypass every logits processor, which is why upstream notes
+  // that the raw_* and processed_* logprobs_modes coincide here (:5691-5693);
+  // the logits are consequently never mutated. Deliberately the same
+  // log_softmax op and the same gather the sampled path runs, so a prompt
+  // logprob and a sampled logprob over the same distribution agree bit-for-bit.
+  LogprobsTensors compute_prompt_logprobs(
+      vt::Queue& q, const vt::Tensor& logits, int num_logprobs,
+      const std::vector<int64_t>& target_token_ids) const;
+
  private:
   // Sampler.sample. Runs steps 7a-7f; returns the [num_reqs] host token ids.
   std::vector<int64_t> sample(vt::Queue& q, vt::Tensor& logits,

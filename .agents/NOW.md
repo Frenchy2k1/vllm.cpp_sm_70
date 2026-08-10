@@ -26,13 +26,13 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
-| Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** verbatim weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head need the device |
 | Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
+| `SAMPLE-PROMPT-LOGPROBS` (#223) | **LANDED** 21/21, review-FAIL fixed | W2 `echo`; CUDA **PENDING** |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): model, runner, ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
 
 In-flight, default-OFF, not pushed: see the row's spec.
