@@ -30,23 +30,60 @@ Measured on gfx1200, 2026-08-10, 128in/128out, our engine vs a real vLLM-ROCm
 oracle at this project's own pin (`555967922`), oracle in production config
 (**not** `--enforce-eager`):
 
-| Model | Ours (batch 8) | Oracle (batch 8) | Ratio |
-|---|---|---|---|
-| Gemma-3-1B-it | 146.43 tok/s | 438.09 tok/s | 2.99x |
-| Qwen3-0.6B | 184.69 tok/s | 552.65 tok/s | 2.99x |
+| Model | Layers | hidden x inter | Ours (batch 8) | Oracle (batch 8) | Ratio |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 28 | 1024 x 3072 | 184.69 tok/s | 552.65 tok/s | 2.99x |
+| Qwen3-1.7B | 28 | 2048 x 6144 | 150.50 tok/s | 286.42 tok/s | **1.90x** |
+| Gemma-3-1B-it | 26 | 1152 x 6912 | 146.43 tok/s | 438.09 tok/s | 2.99x |
 
-Two structurally different models (GeGLU/dual-rope/sandwich-norm vs
-SiLU/standard-attention), different sizes, different absolute speeds on both
-sides — and the SAME ratio to three significant figures. That is the signature
-of a backend-wide, architecture-independent overhead, not a per-kernel quality
-gap: a slow GeGLU kernel would move Gemma's ratio and not Qwen's.
+Single-stream agrees: ours TPOT 13.55 -> 24.09 ms across the two Qwen3 sizes,
+oracle 5.21 -> 12.34 ms/token, ratio 2.60x -> 1.95x.
 
-The oracle's run captured 51 piecewise + 35 full hipGraphs before its timed
-section. Ours captured none, because `SupportsGraphCapture()` is `false` on
-ROCm — so every decode step pays full host-side launch cost. **The hypothesis
-this spec tests is that graph capture is the dominant term in that 2.99x.** It
-is a hypothesis, not a conclusion: no `rocprof` trace has been taken on either
-side, and §8/D4 keeps that gap open rather than assuming.
+**The premise was tested by a controlled experiment BEFORE committing to
+implementation, and it survived.** Qwen3-0.6B vs Qwen3-1.7B is a clean control:
+**identical layer count (28)**, so an identical number of kernel launches per
+decode step, with roughly **4x the compute per step** (2x hidden, 2x
+intermediate). Launch overhead is fixed per step; compute is not. The gap fell
+**2.99x -> 1.90x**. A gap dominated by kernel quality would not move under that
+change; a gap dominated by fixed per-step overhead must. That is the cheapest
+available test of this spec's premise, and it is why the spec proceeds.
+
+**It also BOUNDS the expected win, which matters more than the direction.**
+Fitting `ratio = alpha * (1 + L/C)` to the two Qwen3 points (alpha = the
+size-independent efficiency advantage, L = fixed per-step overhead, C = compute
+per step):
+
+- **alpha ~= 1.54x** — persistent, does NOT shrink with size. Kernel quality,
+  torch.compile/inductor fusion, the Triton attention path.
+- **launch-overhead term ~= 1.45x at 0.6B, ~= 0.36x at 1.7B.**
+
+So roughly half the 0.6B gap is launch overhead, and the realistic outcome of
+this work is **0.6B 2.99x -> ~1.54x and 1.7B 1.90x -> ~1.54x**. That is a real,
+worthwhile win, and it is **not parity**: a ~1.5x residual from non-launch
+causes would remain, and this spec must not be written up as closing the gap.
+Gate 5 is calibrated against that number, not against parity.
+
+Two data points fitted with a one-line model is indicative, not rigorous: "4x
+compute" is an approximation (attention and MLP scale differently, and KV heads
+are identical at 8 in both), alpha is *assumed* size-independent, and no trace
+has been taken on either side. D4 carries that.
+
+The oracle's runs captured 51 piecewise + 35 full hipGraphs before their timed
+sections. Ours captured none, because `SupportsGraphCapture()` is `false` on
+ROCm, so every decode step pays full host-side launch cost.
+
+*Measurement provenance.* Checkpoints are stock upstream, SHA-256-verified
+against their HF blob hashes on download: `Qwen/Qwen3-0.6B`,
+`Qwen/Qwen3-1.7B` (shards `169ad53e...30ed5` / `912becff...deff9`),
+`unsloth/gemma-3-1b-it` (`3d4ef8d7...8516b6`, ungated mirror of the gated
+`google/gemma-3-1b-it`). Ours = `examples/vllm-bench` on `build-hip`; oracle =
+`vllm bench throughput` / `vllm bench latency` in the
+`vllm-rocm-oracle:555967922-gfx1200` container (§8/D3, and the build recipe in
+[rocm-gfx1200-m2-correctness.md](rocm-gfx1200-m2-correctness.md)). Single run
+per cell on a board that also drives a display — indicative, and NOT the
+2-3x-reproduced-idle standard gate 5 requires of the real measurement.
+`Qwen/Qwen3-8B` was considered and does not fit: ~16.4 GB of bf16 weights
+against 15.92 GiB of VRAM, before any KV cache.
 
 **Second, structural reason.** `vt::Backend`'s capture virtuals
 (`include/vt/backend.h:181-195`) are documented as a multi-backend seam
@@ -223,13 +260,26 @@ copy and restored byte-for-byte:
    destructors) must show a non-zero replay count — proving capture engaged
    rather than silently falling through to eager, which would make gate 5's
    numbers meaningless.
-5. **Performance, as a MEASUREMENT not a claim.** Re-run the §1 comparison on
-   Qwen3-0.6B, same-binary A/B (capture ON vs `VLLM_CPP_CUDAGRAPH=0`), both
-   arms on an idle box, reproduced 2-3x per AGENTS.md. Record the ratio
-   whatever it is. If the gap does not close materially, **that is a finding to
-   record, not a failure to bury** — it would refute §1's hypothesis and
-   redirect to the profiling in D4. Gemma-3 numbers must NOT be quoted as
-   improved (§1).
+5. **Performance, as a MEASUREMENT against a PRE-REGISTERED prediction.** Re-run
+   the §1 comparison on **both** Qwen3-0.6B and Qwen3-1.7B, same-binary A/B
+   (capture ON vs `VLLM_CPP_CUDAGRAPH=0`), both arms on an idle box, reproduced
+   2-3x per AGENTS.md. The prediction from §1's fit, written down before the
+   work so it cannot be retrofitted:
+
+   | Model | Today | Predicted with capture |
+   |---|---|---|
+   | Qwen3-0.6B | 2.99x | ~1.54x |
+   | Qwen3-1.7B | 1.90x | ~1.54x |
+
+   The load-bearing shape is that **both sizes should converge on the same
+   ratio**, since the size-dependent term is what capture removes. Convergence
+   is stronger evidence than either number alone. Record what actually happens.
+   A result materially worse than predicted is a finding to record, not a
+   failure to bury; it would mean the fixed-overhead term is smaller than the
+   fit implies and redirect to D4's profiling. **Do NOT quote Gemma-3 as
+   improved** — it has no decode-graph sibling and cannot be (§1, D6). **Do NOT
+   describe any outcome as reaching parity**; ~1.54x is the predicted floor for
+   this change alone.
 6. **`GetReferenceTierHits()` == 0** in any perf measurement (discrete board;
    should be structurally impossible, assert anyway).
 7. **Records green:** `scripts/agent-preflight.sh --staged`,
@@ -270,21 +320,37 @@ region is the genuinely unproven combination. *Mitigation:* W2 captures a real
 Qwen3 decode step, not just the W1 micro-test; `hipStreamCaptureModeThreadLocal`
 turns any illegal op into a loud capture failure.
 
-**D4 — "graph capture is the 2.99x" is a hypothesis, and the spec must not
-launder it into a conclusion.** No `rocprof`/`nsys`-equivalent trace has been
-taken on either side; the evidence is (a) the ratio is identical across two
-unrelated architectures, (b) the oracle demonstrably captures graphs and we
-demonstrably do not. That is strong, and it is not a profile. Per AGENTS.md
-("never declare a ceiling"; trace both sides with the same tool before a
-throughput claim), if gate 5 closes the gap the win is real but the
-*attribution* still wants a same-tool trace before it is written up as the
-explanation. If gate 5 does NOT close it, D4 becomes the next work item and the
-hypothesis is recorded as refuted.
+**D4 — the launch-overhead attribution is now EVIDENCED but still not PROFILED,
+and the spec must not launder the one into the other.** The §1 scaling
+experiment is real evidence: a controlled 4x compute increase at constant layer
+count moved the gap 2.99x -> 1.90x, which a kernel-quality-dominated gap would
+not do. What is still missing is a same-tool trace (`rocprof` on both sides) that
+*isolates* launch overhead from the other things graph capture changes. Until
+that exists, "graph capture recovers ~1.45x" is a calibrated prediction, not a
+measured attribution. Per AGENTS.md (trace both sides with the same tool before
+a throughput claim; never declare a ceiling), the write-up in W4 says
+"consistent with" and not "because of" unless the trace has been run. The
+residual alpha ~= 1.54x is explicitly NOT claimed to be a floor — it is the next
+thing to attack, and naming it is what keeps the gap open.
 
 **D5 — one board, one arch.** gfx1200 only. hipGraph is not arch-specific and
 the four #41 boards are all likelier-supported RDNA3/CDNA parts, but none of
 them has run this. Every record says gfx1200, and the other boards stay
 `PENDING-community` exactly as the W1 approach-(b) delta does today.
+
+**D6 — Gemma-3-1B does not sit on the Qwen3 scaling curve, and that is an open
+question this spec does not answer.** An earlier reading of the matching 2.99x
+on Gemma-3-1B and Qwen3-0.6B claimed it proved architecture-independence. The
+1.7B point refutes that reasoning: Gemma-3-1B has ~2.5x the MLP compute of
+Qwen3-0.6B (1152x6912 vs 1024x3072), so on the fitted curve it should land near
+**2.1x**, and it measures **2.99x**. So there IS an architecture-dependent
+component, and Gemma is relatively slower on our side than its compute alone
+explains — plausibly its unusual attention shape (head_dim 256, 4 query heads,
+1 KV head) or the GeGLU/dual-rope path, neither investigated. The original
+matching ratio was substantially coincidence. This does not block the work
+(Gemma has no decode-graph sibling and is unaffected either way, §1), but it is
+a real, recorded, unexplained residual and it must not be quietly dropped
+because it is inconvenient. It wants its own investigation after W3.
 
 ## 9. Work breakdown
 
@@ -308,8 +374,10 @@ them has run this. Every record says gfx1200, and the other boards stay
 - **W2 — flip `support_static_graph_mode()` and run a real model.** Qwen3-0.6B
   end to end with capture engaged. *Gate: 3, 4 — the correctness gates. Nothing
   proceeds past a red here.*
-- **W3 — measure.** Gate 5 + 6, same-binary A/B, idle box, 2-3x reproduced.
-  Record the result whatever it is.
+- **W3 — measure against the pre-registered prediction.** Gate 5 + 6, on BOTH
+  Qwen3-0.6B and Qwen3-1.7B, same-binary A/B, idle box, 2-3x reproduced. The
+  convergence of the two ratios is the load-bearing result, not either number.
+  Record what happens, including a miss.
 - **W4 — records.** This spec's `## Outcome` (what was measured, what was
   rejected, why the default is what it is), `backend-matrix.md`,
   `docs/ROCM.md` §5 M3, `docs/BENCHMARKS.md` if gate 5 yields an accepted
@@ -324,7 +392,10 @@ Return `NEEDS_DECISION` rather than improvising if:
 - D1 turns out to need a real allocator change (a pre-warm hook, a workspace
   cap) — that widens scope from "port a seam" into shared-allocator surgery and
   wants its own decision.
-- Gate 5 shows no material improvement — W3 stops and D4 (profiling) becomes the
-  next spec rather than iterating blind on this one.
+- Gate 5 lands materially short of the §1 prediction — concretely, if
+  Qwen3-0.6B does not fall below ~2.2x (i.e. under half the predicted 1.45x
+  recovery) — W3 stops and D4's profiling becomes the next spec rather than
+  iterating blind on this one. The threshold is stated here, in advance, so it
+  is a stop condition and not a judgement call made after seeing the number.
 
 Return `NEEDS_CONTEXT` if the issue in W0 cannot be filed (no work without one).
