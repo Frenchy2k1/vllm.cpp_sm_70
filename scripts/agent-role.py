@@ -262,21 +262,45 @@ def write_our_record(claimed_at: float | None = None) -> dict:
     return record
 
 
-def drop_our_record() -> bool:
-    """Remove THIS worktree's record -- including a legacy file it owns."""
+def drop_our_record(keep_canonical: bool = False) -> bool:
+    """Remove THIS worktree's record -- including a legacy file it owns.
+
+    `keep_canonical` leaves our own `record_path()` alone and drops only the
+    other files this worktree owns (in practice the pre-#285 single-file lock).
+    The claim path needs it: unlinking our canonical record and re-creating it
+    is an unlink-then-create where the design promises replace, and a session
+    killed inside that window leaves an operator marker with NO record -- the
+    exact state issue #285 exists to remove, and the one state that still
+    refuses to resolve. `write_our_record`'s `os.replace` publishes over the
+    path without ever removing it, so nothing has to be unlinked first.
+    """
+    canonical = record_path() if keep_canonical else None
     removed = False
     for record in read_records():
-        if record_is_ours(record):
-            try:
-                Path(record["path"]).unlink(missing_ok=True)
-                removed = True
-            except OSError:
-                pass
+        if not record_is_ours(record):
+            continue
+        path = Path(record["path"])
+        if canonical is not None and path == canonical:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed = True
+        except OSError:
+            pass
     return removed
 
 
 def prune_stale_records() -> list[dict]:
-    """Drop records past the TTL. Called from `claim`, which already writes."""
+    """Drop records past the TTL. Called from `claim`, which already writes.
+
+    This targets a PATH, not the inode it read, so a peer that was silent for
+    more than the TTL and republishes inside this window loses the record it
+    just wrote. Left as is deliberately: the loser's remedy is `claim operator`,
+    which is never refused and which every session runs at the top of its next
+    tool call, so the cost is one display cycle. Re-reading before the unlink
+    would narrow the window without closing it and would add a branch no test
+    can reach.
+    """
     pruned = []
     for record in read_records():
         if record_is_stale(record):
@@ -430,7 +454,12 @@ def cmd_claim(args: argparse.Namespace) -> int:
         # its owner is alive disappears from everyone else's display. It also
         # replaces a legacy single-file lock this worktree owned, so that file
         # cannot linger and be counted twice.
-        drop_our_record()
+        #
+        # keep_canonical: only the legacy file is unlinked. Our own record is
+        # REPLACED by the publish below and never removed first, so a re-claim
+        # has no window in which this worktree has an operator marker and no
+        # record.
+        drop_our_record(keep_canonical=True)
         write_our_record()
     else:
         # Downgrading OUT of the operator role must not orphan the record.

@@ -10,6 +10,7 @@ blocking anyone, and feature code must not reach main without a row/* PR.
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import importlib.util
 import json
@@ -520,6 +521,111 @@ class CoordinatorRecords(_TempRepo, unittest.TestCase):
                 ["git", "status", "--porcelain", "--untracked-files=all"],
                 cwd=self.repo, text=True).strip(),
             "")
+
+
+class RecordPublishAndBadInput(_TempRepo, unittest.TestCase):
+    """How a record reaches its own path, and what a bad file in the directory
+    does to `show`.
+
+    `test_a_claim_never_rewrites_another_worktrees_record` pins the DISJOINT
+    PATHS half of the concurrency argument: it fails on shared-path symptoms and
+    says nothing about the publish itself. A fresh review (2026-08-10) replaced
+    `write temp + os.replace` with an in-place, byte-at-a-time flushing write --
+    deliberately torn publishes -- and all three suites stayed green, so the
+    mechanism the module docstring calls atomic was pinned by nothing. The same
+    review found the re-claim path unlinking its own record before rewriting it,
+    and both defensive branches (`record_is_stale`'s unreadable heartbeat,
+    `read_records`'s suffix filter) reachable by no test at all.
+    """
+
+    def test_a_publish_replaces_the_record_and_never_rewrites_it_in_place(self) -> None:
+        # A hardlink is the inode a concurrent reader is holding. `os.replace`
+        # publishes a NEW inode over the name, so the reader keeps seeing whole
+        # old bytes; any in-place rewrite reaches through the link, which is
+        # exactly how a reader gets half a record.
+        run_role(self.repo, "a", "claim", "operator")
+        published = self.record_files()[0]
+        before = published.read_bytes()
+        witness = published.with_name("witness-hardlink")
+        os.link(published, witness)
+
+        beat = run_role(self.repo, "a", "heartbeat")
+        self.assertEqual(beat.returncode, 0, beat.stderr)
+        self.assertNotEqual(published.read_bytes(), before, "nothing was published")
+        self.assertEqual(
+            witness.read_bytes(), before,
+            "the record was rewritten IN PLACE: a reader holding the previous "
+            "inode sees the new bytes, so it can observe a partial record")
+
+    def test_a_publish_leaves_no_temporary_file_behind(self) -> None:
+        # The other half of rename-publish: the temp file is CONSUMED by the
+        # rename. A publish that copies instead leaves it, and a leftover temp
+        # is a record-shaped file nobody owns.
+        run_role(self.repo, "a", "claim", "operator")
+        run_role(self.repo, "a", "heartbeat")
+        run_role(self.repo, "a", "claim", "operator")
+        residue = sorted(entry.name for entry in self.records_dir().iterdir()
+                         if entry.suffix != ".json")
+        self.assertEqual(residue, [], f"publish residue left behind: {residue}")
+
+    def test_a_reclaim_never_unlinks_its_own_record(self) -> None:
+        # Re-claim must REPLACE, never unlink-then-create. With the publish
+        # killed mid-flight, the record from the previous claim has to survive
+        # byte-for-byte -- an operator marker with no record is the one state
+        # that still refuses to resolve, and it is what this change exists to
+        # remove.
+        run_role(self.repo, "a", "claim", "operator")
+        before = self.record_files()[0].read_bytes()
+
+        saved = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            with mock.patch.object(role, "write_our_record",
+                                   side_effect=RuntimeError("killed mid-publish")):
+                with self.assertRaises(RuntimeError):
+                    role.cmd_claim(argparse.Namespace(
+                        role="operator", row=None, headless=False))
+        finally:
+            os.chdir(saved)
+
+        self.assertEqual(
+            len(self.record_files()), 1,
+            "the re-claim unlinked this worktree's own record before "
+            f"republishing it: {self.records()}")
+        self.assertEqual(self.record_files()[0].read_bytes(), before)
+
+    def test_show_survives_a_corrupt_record_a_bad_heartbeat_and_a_stray_temp(self) -> None:
+        # Nothing exercised either defensive branch. A record whose heartbeat is
+        # unreadable must read as STALE, not raise out of `show`; a `.tmp` file
+        # caught mid-publish must not parse as a coordinator. And `show` must
+        # still write nothing: agent-preflight.sh documents itself as never
+        # writing, and it calls exactly this path.
+        run_role(self.repo, "a", "claim", "operator")
+        directory = self.records_dir()
+        (directory / "corrupt.json").write_text("{ not json at all", encoding="utf-8")
+        (directory / "bad-heartbeat.json").write_text(json.dumps({
+            "session": "bad-beat-session", "worktree": "/nowhere/.git",
+            "claimed_at": "not-a-number", "heartbeat": "not-a-number",
+            "host": "somewhere", "pid": 4321}), encoding="utf-8")
+        (directory / ".half-published.999.tmp").write_text(json.dumps({
+            "session": "stray-temp-session", "worktree": "/torn/.git",
+            "claimed_at": time.time(), "heartbeat": time.time(),
+            "host": "somewhere", "pid": 999}), encoding="utf-8")
+        before = sorted((entry.name, entry.read_bytes()) for entry in directory.iterdir())
+
+        shown = run_role(self.repo, "a", "show")
+
+        self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+        self.assertIn("role=operator", shown.stdout)
+        self.assertNotIn("Traceback", shown.stderr)
+        # Neither bad file may become a coordinator: one is past no TTL it can
+        # state, the other is a temp file mid-publish.
+        self.assertNotIn("other coordinators", shown.stdout)
+        self.assertNotIn("bad-beat-session", shown.stdout)
+        self.assertNotIn("stray-temp-session", shown.stdout)
+        self.assertEqual(
+            sorted((entry.name, entry.read_bytes()) for entry in directory.iterdir()),
+            before, "`show` wrote to the records directory")
 
 
 class RoleDiscipline(unittest.TestCase):

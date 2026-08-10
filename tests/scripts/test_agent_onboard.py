@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -144,6 +145,7 @@ class ProbeRenderTests(unittest.TestCase):
 
 
 ROLE_SCRIPT = ROOT / "scripts/agent-role.py"
+ONBOARD_SCRIPT = ROOT / "scripts/agent-onboard.py"
 
 
 class ProbeFieldsComeFromResolve(unittest.TestCase):
@@ -285,6 +287,29 @@ class ProbeFieldsComeFromResolve(unittest.TestCase):
             state["reason"],
             "operator marker without a coordinator record; re-claim")
         self.assertEqual(state["operator_peers"], [])
+
+    def test_probe_json_peer_records_carry_exactly_these_fields(self) -> None:
+        # `--probe --json` used to emit one bool for this. It now emits whole
+        # peer records, and nothing pinned what may appear in them. This is the
+        # machine-readable front door .agents/workflow.md sends sessions to, so
+        # the surface is fixed here: a new field in a coordinator record has to
+        # be a deliberate edit of this list, not a silent widening. Run through
+        # the CLI, because the emitted JSON is the surface, not probe()'s dict.
+        self.assertEqual(self.claim(self.repo, "a", "operator").returncode, 0)
+        rival = self.worktree("shape-rival")
+        self.assertEqual(self.claim(rival, "rival-session", "operator").returncode, 0)
+
+        emitted = subprocess.run(
+            [sys.executable, str(ONBOARD_SCRIPT), "--probe", "--json"],
+            cwd=self.repo, env=dict(os.environ, VLLM_CPP_AGENT_SESSION="a"),
+            capture_output=True, text=True)
+        self.assertEqual(emitted.returncode, 0, emitted.stderr)
+        state = json.loads(emitted.stdout)
+
+        self.assertEqual(len(state["operator_peers"]), 1, state["operator_peers"])
+        self.assertEqual(
+            sorted(state["operator_peers"][0]),
+            ["claimed_at", "heartbeat", "host", "path", "pid", "session", "worktree"])
 
     def test_probe_reports_the_env_state_it_was_given(self) -> None:
         # Kills `env: "present"`. It cannot be pinned against the real tree --
