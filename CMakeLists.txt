@@ -719,6 +719,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/laguna_device.cpp
   src/vllm/model_executor/models/laguna_shared_fp4.cpp
   src/vllm/model_executor/models/laguna.cpp
+  src/vllm/model_executor/models/muse_glimmer_registry.cpp
+  src/vllm/model_executor/models/muse_glimmer_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
