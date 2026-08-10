@@ -220,6 +220,27 @@ class AgentRecordMutationTests(unittest.TestCase):
             r"MODEL-FACTORY-registry table lacks semantic owner column",
         )
 
+    def test_engine_row_ratchet_is_load_bearing(self) -> None:
+        """The ENGINE_ROWS pin must catch a row appearing or vanishing.
+
+        The constant is re-pinned by hand whenever a real row lands, so it is
+        worth proving it is not decorative: a matrix carrying one row fewer than
+        the pin has to be an error, in both directions. Without this, bumping
+        the number to silence a failure would look exactly like bumping it for a
+        new row.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([error for error in clean if "engine rows" in error], [])
+
+        errors: list[str] = []
+        with mock.patch.object(
+            agent_record, "ENGINE_ROWS", agent_record.ENGINE_ROWS - 1
+        ):
+            agent_record.check_matrices(errors)
+
+        require(errors, r"\d+ engine rows; expected \d+")
+
     def test_engine_summary_rejects_stale_area_rollup(self) -> None:
         source = agent_record.ENGINE_MATRIX.read_text(encoding="utf-8")
         current = next(
@@ -261,8 +282,6 @@ class MigratedLegacyLinks(unittest.TestCase):
         self.assertEqual(agent_record.link_base(source, "[local](note.md)"), source.parent)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class IssueIntakeTable(unittest.TestCase):
@@ -291,7 +310,7 @@ class IssueIntakeTable(unittest.TestCase):
         try:
             path.write_text(section, encoding="utf-8")
             errors = []
-            checker.check_issue_table(errors)
+            agent_record.check_issue_table(errors)
             return errors
         finally:
             path.write_text(original, encoding="utf-8")
@@ -335,5 +354,8 @@ class IssueIntakeTable(unittest.TestCase):
 
     def test_the_tracked_roadmap_table_is_valid(self):
         errors = []
-        checker.check_issue_table(errors)
+        agent_record.check_issue_table(errors)
         self.assertEqual(errors, [])
+
+if __name__ == "__main__":
+    unittest.main()

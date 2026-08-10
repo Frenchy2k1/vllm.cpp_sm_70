@@ -231,6 +231,10 @@ def audit() -> list[dict]:
 # FLAKE). They are pinned anyway -- see
 # .agents/specs/gate-command-audit-2026-08-06.md risk 3. A ratchet that waits for
 # a clean baseline never starts.
+# 2026-08-09: +ENG-DOCS-SITE enters the runnable population. Its spec's Gates
+# section carries `python3 scripts/check-site.py` and `hugo --minify`, both of
+# which genuinely fail on a broken site, so it is credited on arrival rather
+# than pinned as gates-no-command. Issue #224.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
     "ATTN-ROPE-FAMILY",
@@ -239,6 +243,7 @@ RUNNABLE_BASELINE = frozenset({
     "BACKEND-VULKAN",
     "ENG-ASYNC-SCHED",
     "ENG-CORE-BUSY-LOOP",
+    "ENG-DOCS-SITE",
     "ENG-EXPERT-STREAM",
     "ENG-PRIORITY-SCHED",
     "KERNEL-GEMM-CPU-ELEM",
