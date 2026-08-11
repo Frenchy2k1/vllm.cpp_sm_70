@@ -371,6 +371,9 @@ rejected and why, and why each default is set the way it is.
 
 ## 10. The GGUF k-quant arm (2026-08-11, `row/MODEL-MUSE-GLIMMER-GGUF`)
 
+**Issue:** [#329](https://github.com/mudler/vllm.cpp/issues/329). Implements the
+quantized-arm rule added to `AGENTS.md` in [#318](https://github.com/mudler/vllm.cpp/issues/318).
+
 `LoadMuseGlimmer` used to throw `"does not support GGUF weights"`. That was never
 a decision — the quantized arm simply was not on any list — and
 the `.agents/porting-a-model.md` checklist §2 now makes it a rule: a
