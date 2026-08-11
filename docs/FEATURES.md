@@ -146,7 +146,7 @@ they sit outside the gated list above.
 
 | Lane | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
-| Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
+| Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17.1x, or ~3.11x with opt-in `VT_WHISPER_ENC_FA2=1` (5.50x, costs 3 near-tie divergences vs 0). Pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |

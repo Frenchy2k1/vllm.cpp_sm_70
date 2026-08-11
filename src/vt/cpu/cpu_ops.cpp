@@ -2605,6 +2605,10 @@ struct Registrar {
     // to kAttention on CPU.
     RegisterOp(OpId::kAttentionDenseFlash, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    // The FA-2 dense variant is a CUDA tensor-core optimization; byte-identical to
+    // kAttention on CPU.
+    RegisterOp(OpId::kAttentionDenseFa2, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernel)));

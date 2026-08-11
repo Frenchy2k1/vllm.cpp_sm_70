@@ -1302,3 +1302,131 @@ of conv GEMMs and the `whisper_audio.cpp:205-216` device→host→device im2col 
 against vLLM's 42.8 ms, so this lever alone is NOT expected to reach parity. The next
 traceable hypothesis after it is the device im2col kernel for the full cross-channel
 Whisper conv, which §15.1 measured, attributed and deferred as a new-kernel task.
+
+### 17.5 RESULT — the kernel is a 5.50x win and it is NOT the default; here is why
+
+**Base:** `origin/main` `dc7a1392`, branch `row/MM-SPEED-ENC-FA2`. **Build:**
+`dgx.casa:~/work/mmenc-fa2/build-cuda`, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, all three mandatory
+banners CONFIRMED at configure (`CUTLASS found ... enabling sm120a NVFP4 cutlass GEMM`,
+`FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]`, `Triton AOT ... MANIFEST
+hashes OK` for sm_121a), `-Werror` **0 warnings**. `local-ai-worker` STOPPED for the
+duration. ALL GPU work under `flock $HOME/gpu.lock`; **the box was contended** — three
+other agents' jobs held or queued on the lock during this session, so every arm-group
+below was taken inside ONE lock window and can never have interleaved with another job.
+
+#### Speed — a very large win (same binary, one lock window, rep0 dropped)
+
+Throwaway `VT_ENC_REPS` `steady_clock` instrumentation around the encoder forward (NOT
+committed; the same shape §15 used), 6 reps per arm, cold rep0 discarded:
+
+| Arm | Encoder forward (reps 1-5) | vs default | vs vLLM 0.25.0 TTFT 42.8 ms |
+|---|---|---|---|
+| warp `AttentionDenseFast` (§13) | 844.8 ms (843.6-847.6) | 0.87x | ~19.7x |
+| flash-tiled `AttentionDenseFlash` (§14/§15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **~17.1x** |
+| **FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`)** | **133.0 ms** (131.6-137.9) | **5.50x faster** | **~3.11x** |
+
+Bands are non-overlapping by a wide margin. **Proof-of-run** — nsys
+`cuda_gpu_kern_sum --cuda-graph-trace=node`, SAME tool on both arms, same workload:
+
+| Arm | Encoder attention kernel | Instances | Avg | x32 layers |
+|---|---|---|---|---|
+| flash-tiled | `AttentionDenseFlashKernel<bf16,bf16>` | 32 | 19,278 us | 616.9 ms (24.0% of all GPU) |
+| FA-2 | `flash_fwd_kernel<Flash_fwd_kernel_traits<64,128,128,4,...>>` | **32** | **166.5 us** | **5.33 ms (0.3%)** |
+
+**115.8x on the kernel itself**, and the FA-2 arm shows ZERO `AttentionDenseFlashKernel`
+— the new hd-64 non-split instantiation is what ran, at exactly 32 instances = 32
+encoder layers. (The `flash_fwd_splitkv_kernel` rows at 1410 instances in both arms are
+the untouched §12 text-decode attention.)
+
+#### Correctness — PASSES the ratified band, but is a real precision step DOWN
+
+`test_voxtral_e2e` on the FA-2 arm **FAILS 14/16**: `strict_prefix` 12/48 (bar is >= 18)
+and the determinism anchor `repro` 13/48 (bar is 48). Token md5 `d6d6ae1b...` versus
+`89923566...` shared IDENTICALLY by the naive, warp and flash-tiled arms. Goldens md5
+UNCHANGED throughout (`voxtral_golden.json 8ab87b7e...`, `voxtral_neartie.json
+937b9ad3...`, before == after) — nothing was regenerated to make anything pass.
+
+Teacher-forced against the **fixture's own oracle** — `~/venvs/vllm-oracle-v0.25.0-stage`,
+asserted live as vLLM **0.25.0** / torch 2.11.0+cu130 / transformers 5.13.1 /
+mistral_common **1.11.5** / flashinfer 0.6.13, which is the stack
+`a3_voxtral_oracle_capture.py` captured this golden with:
+
+```
+divergent positions: 3, worst gap 0.1250 nats @ pos 12
+gate band: <= 0.5 nats; over-band failures: 0 -> []
+RESULT: PASS
+```
+
+So the FA-2 sequence IS inside the ratified near-tie band. **But the shipping scalar
+kernel's sequence has 0 divergent positions at gap 0.0** — every one of its tokens is
+vLLM's own argmax. FA-2 gives up three of those (gaps 0.125, 0.125, 0.0625). That is a
+correctness step down, not a tie flip, and it is the difference between this and §12:
+§12's adopted FA-2 *decode* kernel kept divergent=0 / gap 0.0 while getting faster.
+
+**ROOT CAUSE, grounded — this is inherent, not a launcher bug.** FA-2 converts the
+softmax probabilities out of its f32 accumulator into bf16 before the PV MMA
+(`src/vt/cuda/flash_attn/src/flash_fwd_kernel.h:347`
+`Tensor rP = convert_type<Element>(acc_s)`), because that operand feeds a tensor-core
+`mma.sync`. Our scalar kernel keeps them in f32 (`cuda_ops.cu`: `const float p =
+expf(s - m_new)` then `acc[k] += p * Load(sV, ...)`). FA-2 is therefore **lower
+precision here by construction**, and buys ~116x for it. Note the direction this rules
+out: a *faithful* port of the kernel vLLM itself runs should have moved us CLOSER to
+vLLM's tokens, not further — it moved further because our encoder's other stages
+(conv/LayerNorm/GEMM) differ from vLLM's too, and the scalar kernel's higher-precision
+softmax happened to compensate.
+
+#### DISPOSITION — lands OPT-IN, adoption is a DEVELOPER decision
+
+The kernel ships behind `VT_WHISPER_ENC_FA2=1`; **the default stays the byte-exact
+flash-tiled kernel**, so `test_voxtral_e2e` remains 16/16 and every other caller is
+untouched. AGENTS.md is unambiguous that correctness is not traded for throughput, and
+adopting a default that turns 0 divergences into 3 is exactly that trade — so it goes to
+the developer with both numbers, precisely the shape §11 used before §12's approval.
+**What approval would buy: audio TTFT 17.1x -> 3.11x, the last mm axis below floor.**
+
+#### NOT a ceiling — the ranked next hypotheses
+
+1. **Keep the tensor cores AND the precision.** The 0.125-nat gaps come from one
+   conversion. An f32-P variant is not reachable in FA-2's `mma.sync` operand layout,
+   but the FA-3-style two-stage rescale, or splitting the PV accumulation so the
+   correction term stays f32, is a real port target. This is the hypothesis that would
+   make the adoption question disappear rather than answering it.
+2. **The remaining 133 ms is no longer attention** — 5.33 ms of the 133 ms is the
+   attention kernel now, so the encoder is dominated by the conv GEMMs and the
+   `whisper_audio.cpp:205-216` device->host->device im2col bounce. That is the §15.1
+   deferred device-im2col kernel, and it is now the top encoder lever by a wide margin.
+3. **The vLLM denominator is carried forward, not re-measured** (42.8 ms, §2.3) — as
+   §14.4 and §15.4 also did, to avoid a big oracle alongside the tree on a contended
+   unified-memory box. The ratio moved so far that the exact denominator does not change
+   any verdict, but a fresh capture is owed before this axis is ever called closed.
+
+#### 17.6 Final verification ON THE SHIPPING TREE (default reversed, same box, one lock window)
+
+Rebuilt after making FA-2 opt-in (`-Werror`, **0 warnings**) and re-run, so these are the
+numbers for what actually merges — not for the exploratory build §17.5 measured:
+
+| Check | Result |
+|---|---|
+| `test_voxtral_e2e` DEFAULT arm | **16/16 SUCCESS** — strict prefix 18/48, determinism anchor `repro` **48/48** |
+| DEFAULT-arm token md5 | `89923566...` — **identical** to the naive/warp/flash arms and to the pre-change path |
+| `test_voxtral_e2e` FA-2 arm (`VT_WHISPER_ENC_FA2=1`) | 14/16 (strict prefix 12/48, repro 13/48), token md5 `d6d6ae1b...` |
+| `compute-sanitizer --tool memcheck` on the FA-2 path | **ERROR SUMMARY: 0 errors** |
+| Goldens | md5 **UNCHANGED** (`8ab87b7e...` / `937b9ad3...`) — nothing regenerated |
+
+So the merged default is byte-identical to what shipped before this change, and the new
+kernel is reachable, memory-clean, and fully characterized behind one env knob.
+
+#### 17.7 Two environment traps this pass hit, both silent-false-pass shaped
+
+Recorded because each cost a run and each returns exit 0 while proving nothing:
+- **`test_voxtral_e2e` SKIPS without `VLLM_VOXTRAL_SAFETENSORS`** and still reports
+  `Status: SUCCESS` with 0 assertions. The first gate script omitted it; the result would
+  have read as a clean pass of a test that never loaded a model. Every gate script here
+  now greps its own log for `SKIP`.
+- **The 0.25.0 oracle needs `CC` as well as `ninja` on PATH** in a non-login shell, or
+  Triton's JIT dies `RuntimeError: Failed to find C compiler` AFTER loading the model,
+  surfacing as `EngineCore failed to start`. `environment.md` currently records this venv
+  as "crashes in EngineCore KV-cache/model init" — that is very likely this, not a broken
+  oracle: with `CC=/usr/bin/gcc` set, the same venv ran the teacher-force to completion.
+
