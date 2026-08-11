@@ -36,6 +36,8 @@ issue is not yet placed. Keyed record: update in place, never append.
 
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
+| [#337](https://github.com/mudler/vllm.cpp/issues/337) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: the five dgx SACRED paged-engine gates are OWED after the merged-GEMM fold (`test_{commandr,glm4,minicpm,minicpm3,phi3}_paged_engine` SKIP on a CPU box) | bug |
+| [#338](https://github.com/mudler/vllm.cpp/issues/338) | `ROAD-V1-C1` | MiniCPM/MiniCPM3 hard-code SiLU: upstream `MiniCPMMLP` (`minicpm.py:219-226`) selects `FatreluAndMul` on `hidden_act == "fatrelu"` and raises otherwise; our `parse_config` never reads `hidden_act` | bug |
 | [#314](https://github.com/mudler/vllm.cpp/issues/314) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE` glue half: `glm4`/`phi3` still hand-call add+RMSNorm instead of `vt::FusedChain` (split out of #299, which closed the merged-GEMM half only) | bug |
 | [#299](https://github.com/mudler/vllm.cpp/issues/299) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: 5 dense SwiGLU models bypass the MUST-route merged-GEMM seam with no stated blocker (spec [`fusion-dense-migrate.md`](specs/fusion-dense-migrate.md)) | bug |
 | [#298](https://github.com/mudler/vllm.cpp/issues/298) | `PERF-27B-LMHEAD-DSR` | `main` is RED on the `device-leakage` DSR ratchet: `PrepareLmHeadResident` added a 33rd `vt_ifdef` to the shared layer | bug |
