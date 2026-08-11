@@ -51,18 +51,18 @@ WindowsHandlerRegistry& HandlerRegistry() {
 constexpr DWORD kHandlerDrainTimeoutMs = 5000;
 
 bool DrainEntrantsWithTimeout(std::atomic<unsigned>& entrants) {
-  const ULONGLONG deadline = GetTickCount64() + kHandlerDrainTimeoutMs;
+  const ULONGLONG start = GetTickCount64();
   while (entrants.load(std::memory_order_seq_cst) != 0) {
-    if (GetTickCount64() >= deadline) return false;
+    if (GetTickCount64() - start >= kHandlerDrainTimeoutMs) return false;
     SwitchToThread();
   }
   return true;
 }
 
 bool DrainInFlightWithTimeout(std::atomic<unsigned>& in_flight) {
-  const ULONGLONG deadline = GetTickCount64() + kHandlerDrainTimeoutMs;
+  const ULONGLONG start = GetTickCount64();
   while (in_flight.load(std::memory_order_seq_cst) != 0) {
-    if (GetTickCount64() >= deadline) return false;
+    if (GetTickCount64() - start >= kHandlerDrainTimeoutMs) return false;
     SwitchToThread();
   }
   return true;

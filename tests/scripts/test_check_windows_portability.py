@@ -58,17 +58,17 @@ SAFE_FILES = {
           return *registry;
         }
         bool DrainEntrantsWithTimeout(std::atomic<unsigned>& entrants) {
-          const ULONGLONG deadline = GetTickCount64() + 5000;
+          const ULONGLONG start = GetTickCount64();
           while (entrants.load(std::memory_order_seq_cst) != 0) {
-            if (GetTickCount64() >= deadline) return false;
+            if (GetTickCount64() - start >= 5000) return false;
             SwitchToThread();
           }
           return true;
         }
         bool DrainInFlightWithTimeout(std::atomic<unsigned>& in_flight) {
-          const ULONGLONG deadline = GetTickCount64() + 5000;
+          const ULONGLONG start = GetTickCount64();
           while (in_flight.load(std::memory_order_seq_cst) != 0) {
-            if (GetTickCount64() >= deadline) return false;
+            if (GetTickCount64() - start >= 5000) return false;
             SwitchToThread();
           }
           return true;
@@ -84,9 +84,10 @@ SAFE_FILES = {
           }
           registry.entrants.fetch_sub(1, std::memory_order_seq_cst);
           if (state == nullptr) return false;
+          const bool resumed = true;
           SetEvent(state->stop_event);
           state->in_flight.fetch_sub(1, std::memory_order_seq_cst);
-          return true;
+          return resumed;
         }
         BOOL WINAPI ConsoleControlHandler(DWORD event) {
           return DispatchControlEvent(event);
@@ -357,6 +358,107 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 "stable event/in-flight",
             )
 
+    def test_console_function_body_skips_prototypes_and_decoys(self) -> None:
+        source = (REPO / "src/vllm/platform/console_shutdown.cpp").read_text(
+            encoding="utf-8"
+        )
+        declarations = {
+            "bool DrainEntrantsWithTimeout(std::atomic<unsigned>& entrants) {":
+                "bool DrainEntrantsWithTimeout(std::atomic<unsigned>& entrants);\n"
+                "bool EntrantsDeclarationDecoy() { return false; }\n",
+            "bool DrainInFlightWithTimeout(std::atomic<unsigned>& in_flight) {":
+                "bool DrainInFlightWithTimeout(std::atomic<unsigned>& in_flight);\n"
+                "bool InFlightDeclarationDecoy() { return false; }\n",
+            "bool DispatchControlEvent(DWORD event, HANDLE acquired_event = nullptr,":
+                "bool DispatchControlEvent(DWORD event, HANDLE acquired_event,\n"
+                "                          HANDLE resume_event);\n"
+                "bool DispatchDeclarationDecoy() { return false; }\n",
+        }
+        for definition, prefix in declarations.items():
+            with self.subTest(definition=definition):
+                self.assertEqual(source.count(definition), 1)
+                mutated = source.replace(definition, prefix + definition, 1)
+                result = self.run_checker(self.make_tree({
+                    "src/vllm/platform/console_shutdown.cpp": mutated,
+                }))
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+
+    def test_console_final_tail_requires_bound_local_resumed(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            source.replace("return resumed;", "return true;", 1),
+            "final in-flight decrement",
+        )
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            source.replace(
+                "bool DispatchControlEvent(DWORD event) {",
+                "bool resumed = true;\n"
+                "bool DispatchControlEvent(DWORD event) {",
+                1,
+            ).replace("const bool resumed = true;\n", "", 1),
+            "final in-flight decrement",
+        )
+
+    def test_console_final_tail_rejects_object_and_function_macros(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        mutations = (
+            (
+                "#define POST_DECREMENT_RESULT "
+                "(SetEvent(state->stop_event), resumed)\n  " + decrement,
+                "return POST_DECREMENT_RESULT;",
+            ),
+            (
+                "#define resumed (SetEvent(state->stop_event), true)\n  " +
+                decrement,
+                "return resumed;",
+            ),
+            (
+                "#define POST_DECREMENT_RESULT() "
+                "(SetEvent(state->stop_event), resumed)\n  " + decrement,
+                "return POST_DECREMENT_RESULT();",
+            ),
+        )
+        for macro_and_decrement, returned in mutations:
+            with self.subTest(returned=returned):
+                mutated = source.replace(decrement, macro_and_decrement, 1)
+                mutated = mutated.replace("return resumed;", returned, 1)
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp",
+                    mutated,
+                    "final in-flight decrement",
+                )
+
+    def test_console_final_tail_ignores_comment_and_string_decoys(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        decoys = (
+            'const char* macro_decoy = "#define resumed false";\n'
+            "  (void)macro_decoy;\n"
+            "  // #define POST_DECREMENT_RESULT false\n  "
+        )
+        result = self.run_checker(self.make_tree({
+            "src/vllm/platform/console_shutdown.cpp":
+                source.replace(decrement, decoys + decrement, 1),
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unsigned_elapsed_subtraction_survives_tick_wrap(self) -> None:
+        mask = (1 << 64) - 1
+        start = mask - 2
+        self.assertEqual((1 - start) & mask, 4)
+        self.assertLess((1 - start) & mask, 5)
+        self.assertEqual((2 - start) & mask, 5)
+
     def test_console_partial_event_creation_cleanup_is_structural(self) -> None:
         source = textwrap.dedent(
             SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
@@ -547,16 +649,40 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             "final in-flight decrement",
         )
 
+    def test_real_console_rejects_macro_post_decrement_result(self) -> None:
+        console = (REPO / "src/vllm/platform/console_shutdown.cpp").read_text(
+            encoding="utf-8"
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        self.assertEqual(console.count(decrement), 1)
+        self.assertEqual(console.count("return resumed;"), 1)
+        mutated = console.replace(
+            decrement,
+            "#define POST_DECREMENT_RESULT "
+            "(SetEvent(state->stop_event), resumed)\n  " + decrement,
+            1,
+        ).replace(
+            "return resumed;", "return POST_DECREMENT_RESULT;", 1
+        )
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            mutated,
+            "final in-flight decrement",
+        )
+
     def test_real_console_drains_require_reachable_timeout_branches(self) -> None:
         console = (REPO / "src/vllm/platform/console_shutdown.cpp").read_text(
             encoding="utf-8"
         )
-        timeout = "if (GetTickCount64() >= deadline) return false;"
+        timeout = (
+            "if (GetTickCount64() - start >= kHandlerDrainTimeoutMs) return false;"
+        )
         self.assertEqual(console.count(timeout), 2)
         decoy = (
-            'const char* timeout_decoy = "if (GetTickCount64() >= deadline) '
-            'return false;";\n'
-            "    // if (GetTickCount64() >= deadline) return false;"
+            'const char* timeout_decoy = "if (GetTickCount64() - start >= '
+            'kHandlerDrainTimeoutMs) return false;";\n'
+            "    // if (GetTickCount64() - start >= kHandlerDrainTimeoutMs) "
+            "return false;"
         )
         for occurrence in (0, 1):
             position = -1
@@ -569,6 +695,41 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 mutated,
                 "finite timeout",
             )
+
+    def test_real_console_rejects_absolute_deadline_in_each_drain(self) -> None:
+        console = (REPO / "src/vllm/platform/console_shutdown.cpp").read_text(
+            encoding="utf-8"
+        )
+        start = "const ULONGLONG start = GetTickCount64();"
+        elapsed = (
+            "if (GetTickCount64() - start >= kHandlerDrainTimeoutMs) return false;"
+        )
+        self.assertEqual(console.count(start), 2)
+        self.assertEqual(console.count(elapsed), 2)
+        for function in ("DrainEntrantsWithTimeout", "DrainInFlightWithTimeout"):
+            with self.subTest(function=function):
+                function_at = console.index(f"bool {function}")
+                next_function = console.find("\nbool ", function_at + 1)
+                function_end = len(console) if next_function < 0 else next_function
+                body = console[function_at:function_end]
+                self.assertIn(start, body)
+                self.assertIn(elapsed, body)
+                body = body.replace(
+                    start,
+                    "const ULONGLONG deadline = "
+                    "GetTickCount64() + kHandlerDrainTimeoutMs;",
+                    1,
+                ).replace(
+                    elapsed,
+                    "if (GetTickCount64() >= deadline) return false;",
+                    1,
+                )
+                mutated = console[:function_at] + body + console[function_end:]
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp",
+                    mutated,
+                    "finite timeout",
+                )
 
     def test_rejects_disabled_smoke_and_missing_crt_audit(self) -> None:
         script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
