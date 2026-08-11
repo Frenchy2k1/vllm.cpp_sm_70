@@ -1314,6 +1314,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_gdn_state.hip
     src/vt/rocm/rocm_gdn_conv.hip
+    src/vt/rocm/rocm_gdn_postconv.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
@@ -1330,6 +1331,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_gdn_state.hip
       src/vt/rocm/rocm_gdn_conv.hip
+      src/vt/rocm/rocm_gdn_postconv.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()

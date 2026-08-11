@@ -1375,6 +1375,92 @@ TEST_CASE("causal conv1d fwd/update match the CPU oracle") {
 }
 
 
+TEST_CASE("GdnPostConv matches the CPU oracle within NMSE <= 5e-4") {
+  // The fused post-conv glue (the VT_GLUE_FUSE path the model calls by
+  // default): conv-split + q/k l2norm + g/beta in one launch, with padded a/b
+  // row strides. All arithmetic: NMSE.
+  const int64_t T = 4, HK = 2, DK = 16, HV = 4, DV = 24;
+  const int64_t key_dim = HK * DK, value_dim = HV * DV;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t a_outer = HV + 3, b_outer = HV + 5;
+  const std::vector<float> conv = RandomVec(static_cast<size_t>(T * conv_dim), 871, -0.5f, 0.5f);
+  const std::vector<float> araw = RandomVec(static_cast<size_t>(T * a_outer), 872, -0.4f, 0.4f);
+  const std::vector<float> braw = RandomVec(static_cast<size_t>(T * b_outer), 873, -0.4f, 0.4f);
+  const std::vector<float> a_log = RandomVec(static_cast<size_t>(HV), 874, -2.0f, -0.5f);
+  const std::vector<float> dt_bias = RandomVec(static_cast<size_t>(HV), 875, -0.1f, 0.1f);
+  vt::L2NormArgs l2a;
+  l2a.eps = 1e-6f;
+
+  std::vector<float> ref_q(static_cast<size_t>(T * key_dim)),
+      ref_k(static_cast<size_t>(T * key_dim)), ref_v(static_cast<size_t>(T * value_dim)),
+      ref_g(static_cast<size_t>(T * HV)), ref_b(static_cast<size_t>(T * HV));
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cc = conv, ca = araw, cb = braw, cal = a_log, cdt = dt_bias;
+    // araw/braw reach the op as padded [T, HV] rank-2 views (row stride honored).
+    auto Make = [](void* p, Device dd, std::initializer_list<int64_t> s) {
+      return Tensor::Contiguous(p, DType::kF32, dd, s);
+    };
+    Tensor tq = Make(ref_q.data(), cd, {T, HK, DK});
+    Tensor tk = Make(ref_k.data(), cd, {T, HK, DK});
+    Tensor tv = Make(ref_v.data(), cd, {T, HV, DV});
+    Tensor tg = Make(ref_g.data(), cd, {T, HV});
+    Tensor tb = Make(ref_b.data(), cd, {T, HV});
+    Tensor tc = Make(cc.data(), cd, {T, conv_dim});
+    Tensor ta = Make(ca.data(), cd, {T, a_outer});  // logical HV cols, padded row
+    ta.shape[1] = HV;  // view narrows the row; stride[0] stays a_outer
+    Tensor tb2 = Make(cb.data(), cd, {T, b_outer});
+    tb2.shape[1] = HV;
+    Tensor tal = Make(cal.data(), cd, {HV});
+    Tensor tdt = Make(cdt.data(), cd, {HV});
+    vt::GdnPostConv(cq, tq, tk, tv, tg, tb, tc, ta, tb2, tal, tdt, l2a);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kGdnPostConv, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, ref_q.size()), dk(dev, q, ref_k.size()), dv(dev, q, ref_v.size()),
+        dg(dev, q, ref_g.size()), db(dev, q, ref_b.size()), dc(dev, q, conv.size()),
+        da(dev, q, araw.size()), db2(dev, q, braw.size()), dal(dev, q, HV),
+        ddt(dev, q, HV);
+    dq.Upload(std::vector<float>(ref_q.size(), 0.0f));
+    dc.Upload(conv);
+    da.Upload(araw);
+    db2.Upload(braw);
+    dal.Upload(a_log);
+    ddt.Upload(dt_bias);
+    auto Make = [&](void* p, std::initializer_list<int64_t> s) {
+      return Tensor::Contiguous(p, DType::kF32, d, s);
+    };
+    Tensor tq = Make(dq.ptr(), {T, HK, DK});
+    Tensor tk = Make(dk.ptr(), {T, HK, DK});
+    Tensor tv = Make(dv.ptr(), {T, HV, DV});
+    Tensor tg = Make(dg.ptr(), {T, HV});
+    Tensor tb = Make(db.ptr(), {T, HV});
+    Tensor tc = Make(dc.ptr(), {T, conv_dim});
+    Tensor ta = Make(da.ptr(), {T, a_outer});
+    ta.shape[1] = HV;
+    ta.stride[0] = a_outer;
+    Tensor tb2 = Make(db2.ptr(), {T, b_outer});
+    tb2.shape[1] = HV;
+    tb2.stride[0] = b_outer;
+    Tensor tal = Make(dal.ptr(), {HV});
+    Tensor tdt = Make(ddt.ptr(), {HV});
+    vt::GdnPostConv(q, tq, tk, tv, tg, tb, tc, ta, tb2, tal, tdt, l2a);
+    CHECK(Nmse(ref_q, dq.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_k, dk.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_v, dv.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_g, dg.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_b, db.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;
