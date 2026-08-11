@@ -33,6 +33,7 @@ from tools.bench.online_gate import (
     FLASHINFER_VERSION,
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
+    MODEL_GATE_CONTRACTS,
     MODEL_REVISIONS,
     PANDAS_VERSION,
     POINTS,
@@ -532,11 +533,31 @@ def _model_precondition_reasons(
             reasons.append("model-gate model key differs")
         if status.get("vllm_cpp_sha") != vllm_cpp_sha:
             reasons.append("model-gate vllm.cpp SHA differs from the campaign")
+        # WHOSE goldens the precondition ran against has to survive into the
+        # summary. For key "27n" the answer is "a different checkpoint's", which
+        # is deliberate; a summary that cannot see the difference reports build
+        # sanity and a token-exact golden as the same fact.
+        contract = MODEL_GATE_CONTRACTS.get(status.get("test_name"))
+        if contract is None:
+            reasons.append("model-gate test name has no recorded contract")
+        else:
+            golden = contract["golden_revision"]
+            if status.get("golden_revision") != golden:
+                reasons.append("model-gate golden revision differs from the contract")
+            if status.get("model_revision") != MODEL_REVISIONS[model]:
+                reasons.append("model-gate benched revision differs from the gate")
+            expected_scope = None if golden is None else golden == MODEL_REVISIONS[model]
+            if status.get("golden_covers_benched_checkpoint") is not expected_scope:
+                reasons.append("model-gate golden scope differs from the recorded revisions")
         log = _artifact_path(status.get("log"), evidence_root, "model-gate log")
         if not log.is_file() or log.stat().st_size == 0:
             reasons.append(f"model-gate log is absent or empty: {log}")
         elif sha256_file(log) != status.get("log_sha256"):
             reasons.append("model-gate log hash differs")
+        elif contract is not None and contract["proof"] not in log.read_text(
+            encoding="utf-8", errors="replace"
+        ):
+            reasons.append("model-gate log carries no proof that a token was compared")
     except HarnessError as error:
         reasons.append(str(error))
 

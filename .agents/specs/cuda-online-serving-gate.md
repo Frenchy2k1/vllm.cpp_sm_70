@@ -77,6 +77,64 @@ The accepted c16 profiler keeps 16 of 48 requests resident. The active c2
 diagnostic keeps two of six resident. Both admit one replacement per completion,
 matching the online closed-loop client instead of preloading all prompts.
 
+### Model keys
+
+`tools/bench/online_gate.py` `MODEL_REVISIONS` is the only list of keys the
+driver admits, and `scripts/dgx-online-serving.sh`'s `--model` guard must name
+exactly the same set.
+
+| Key | Repository | Revision | Correctness precondition |
+|---|---|---|---|
+| `27` | `unsloth/Qwen3.6-27B-NVFP4` | `890bdef7` | `test_qwen27_paged_engine` — a golden FOR THIS checkpoint |
+| `27n` | `nvidia/Qwen3.6-27B-NVFP4` | `0893e160` | `test_qwen27_paged_engine` — **build sanity only**, see below |
+| `35` | `nvidia/Qwen3.6-35B-A3B-NVFP4` | `491c2f1e` | `test_qwen36_paged_engine` |
+| `q3mxfp4` | `Yi30/Qwen3-8B-MXFP4` | `b3e7ab32` | `mxfp4_smoke_battery` (#44) |
+
+`27` and `27n` are different models, not two spellings: the unsloth repo ships a
+BF16 `lm_head` and a different mixed-precision layout, the nvidia ModelOpt repo
+an NVFP4 MLP + FP8 W8A8 tower + NVFP4 head. They share no goldens and their
+ratios are not comparable.
+
+**`27n` scope, stated once and recorded in the evidence.** The committed 27B
+goldens belong to `@890bdef7` (`tests/parity/hf_snapshot.h`
+`kQwen27NvfP4Revision`), so `test_qwen27_paged_engine` is a BUILD-SANITY
+precondition for `27n`, never a golden for `@0893e160`. `record-model-gate`
+writes `golden_revision`, `model_revision` and
+`golden_covers_benched_checkpoint` into `preflight/model-gate/<key>.json` and
+the summary revalidates them, so the distinction is machine-readable rather than
+a comment a reader may miss. A `27n` **correctness** claim additionally owes a
+greedy continuation against the pinned oracle on `@0893e160` itself; until that
+exists, `27n` produces performance evidence with a build-sanity precondition and
+no token-exact correctness claim may be made from it.
+
+`27n` is refused by `--trace-only`: `TRACE_PRIMARY_GRAPH_CONTRACTS` holds node
+and kernel-family counts captured on `@890bdef7` alone, so a `27n` trace has no
+contract to validate against.
+
+**Stop condition.** A model gate that did not compare a token is not a passed
+gate. A checkpoint-gated parity test emits a loud MESSAGE and returns 0 when its
+snapshot is absent, so the driver captures the gate's own output (`ctest -V`)
+and `record-model-gate` fails closed unless the log carries that gate's proof
+line. If the `@890bdef7` snapshot is absent on the gate host, `27n` stops here
+rather than recording a vacuous pass.
+
+**Artifact name.** The `server` target's `OUTPUT_NAME` is `vllm-server`
+(`examples/CMakeLists.txt`, W6), so the built file is `examples/vllm-server`.
+Every consumer resolves that name and keeps the pre-rename `examples/server` as
+a REPLAY FALLBACK, so an evidence tree recorded before W6 still replays against
+the binary it was recorded with. `tests/tools/test_online_gate_server_binary.py`
+scans the repository for the stale spelling and admits only that fallback shape,
+and only in a file that resolves the declared name too — a fallback whose
+primary is deleted is an ordinary hardcode and is reported.
+
+Issues: [#222](https://github.com/mudler/vllm.cpp/issues/222) (the harness
+consumed `examples/server` while the build emits `examples/vllm-server`, so
+`--execute` aborted before starting a server; the path repair itself landed on
+`main` as `2b262622`/`8fce04d3`, leaving this spec to own the drift guard, the
+`27n` key and the fail-closed model gate) and
+[#213](https://github.com/mudler/vllm.cpp/issues/213), which this gate is the
+reproducible measurement path for.
+
 ## Upstream chain
 
 - CLI and benchmark orchestration:
@@ -323,6 +381,14 @@ owns the DGX campaign and its result directory.
 - Provisioning, compilation, downloads, and cache warmup stay outside the
   measurement lock window.
 - The exact same checkpoint is required; converted weights are non-binding.
+- A correctness precondition borrowed from a NEIGHBOURING checkpoint (key `27n`
+  on the `@890bdef7` goldens) is build sanity, and the evidence must say so in a
+  field, not in prose. The risk it carries is that a `27n` performance number
+  reads as correctness-preconditioned when only the build was proven; the
+  mitigation is the recorded `golden_covers_benched_checkpoint=false` plus the
+  proof-line requirement that makes a skipped gate fail closed.
+- The gate host must hold BOTH 27B snapshots to run `27n`. It stops rather than
+  degrading: a `27n` run on a box without `@890bdef7` is a blocked gate.
 - A profiler dependency that is importable but not executable through the
   spawned EngineCore `PATH` is a failed preflight, not a reason to omit the
   paired trace or reuse a lock-released series.

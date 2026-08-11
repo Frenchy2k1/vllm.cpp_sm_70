@@ -80,6 +80,57 @@ bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
 
+// PERF-27B-GDN-FP8-QKVZ. Every term is required: dropping any one of them must
+// leave the exact two legacy fp8 GEMMs. `shared_input_scale` is the load-time
+// scale-compatibility guard (the merged GEMM quantizes the activation ONCE, so
+// the two shards must agree bitwise on the per-tensor activation scale) and is
+// the term that keeps a checkpoint whose scales differ on the split path.
+bool detail::ShouldUseMergedGdnFp8Qkvz(const GdnMergedFp8QkvzEligibility& e) {
+  return e.runtime_enabled && e.fp8_platform && e.has_fp8_shards &&
+         e.shared_k && e.shared_input_scale && e.shard_widths_match;
+}
+
+// True (and *scale filled) only when both fp8 GDN input shards are populated and
+// carry the SAME per-tensor activation scale, by exact float equality. This is
+// the single definition; `Fp8SharedInputScale`'s linear-attention branch calls
+// it, so the fused RmsNorm+quant guard and the merge guard cannot drift.
+bool detail::GdnFp8SharedInputScale(const GdnLayerWeights& gdn, float* scale) {
+  if (gdn.in_proj_qkv_fp8.Empty() || gdn.in_proj_z_fp8.Empty()) return false;
+  if (gdn.in_proj_qkv_fp8.input_scale != gdn.in_proj_z_fp8.input_scale)
+    return false;
+  if (scale != nullptr) *scale = gdn.in_proj_qkv_fp8.input_scale;
+  return true;
+}
+
+bool detail::MergedGdnFp8QkvzEnvSelected(const GdnMergedFp8QkvzEnvConfig& env) {
+  if (env.merged_proj != nullptr && env.merged_proj[0] == '0') return false;
+  if (env.merged_qkvz != nullptr && env.merged_qkvz[0] == '0') return false;
+  return env.merged_qkvz_fp8 == nullptr || env.merged_qkvz_fp8[0] != '0';
+}
+
+namespace {
+std::atomic<bool> g_gdn_fp8_inproj_debug_enabled{false};
+std::atomic<uint64_t> g_gdn_fp8_inproj_merged{0};
+std::atomic<uint64_t> g_gdn_fp8_inproj_split{0};
+}  // namespace
+
+void detail::ResetGdnFp8InProjDebugStats() {
+  g_gdn_fp8_inproj_merged.store(0, std::memory_order_relaxed);
+  g_gdn_fp8_inproj_split.store(0, std::memory_order_relaxed);
+  g_gdn_fp8_inproj_debug_enabled.store(true, std::memory_order_release);
+}
+
+detail::GdnFp8InProjDebugStats detail::GetGdnFp8InProjDebugStats() {
+  GdnFp8InProjDebugStats out;
+  out.merged_launches = g_gdn_fp8_inproj_merged.load(std::memory_order_relaxed);
+  out.split_launches = g_gdn_fp8_inproj_split.load(std::memory_order_relaxed);
+  return out;
+}
+
+void detail::DisableGdnFp8InProjDebugStats() {
+  g_gdn_fp8_inproj_debug_enabled.store(false, std::memory_order_release);
+}
+
 bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
   const bool runtime_enabled =
@@ -534,11 +585,25 @@ struct MoeFusedResident {
   bool ready = false;
 };
 
-MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
+// Fetch (building on first use) the resident state a weight owns. Replaces the
+// process-lifetime `static std::unordered_map<const W*, R>` these accessors used
+// to be: keying on the weight's ADDRESS let a second engine inherit a freed
+// engine's device pointers (issue #237). See ResidentSlot in qwen3_5_weights.h.
+//
+// The lock is the one the map accessors already took on every call, kept rather
+// than narrowed: this fix is about lifetime, and quietly changing the
+// synchronisation of a hot path at the same time would make any regression
+// ambiguous between the two.
+template <typename R>
+R& ResidentIn(const ResidentSlot& slot) {
   static std::mutex mu;
-  static std::unordered_map<const MoeBlockWeights*, MoeFusedResident> cache;
   std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  if (!slot.state) slot.state = std::make_shared<R>();
+  return *static_cast<R*>(slot.state.get());
+}
+
+MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
+  return ResidentIn<MoeFusedResident>(w->resident_fused);
 }
 
 // --- BF16 fast-MoE per-layer resident constants (Qwen3-Coder Qwen3MoeForCausalLM,
@@ -558,10 +623,7 @@ struct MoeBf16Resident {
 };
 
 MoeBf16Resident& MoeBf16ResidentFor(const MoeBlockWeights* w) {
-  static std::mutex mu;
-  static std::unordered_map<const MoeBlockWeights*, MoeBf16Resident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  return ResidentIn<MoeBf16Resident>(w->resident_bf16);
 }
 
 // Fast BF16 grouped-MoE path (Qwen3-Coder). DEFAULT ON per the parity-enablers-
@@ -650,10 +712,7 @@ struct MoeMarlinResident {
 };
 
 MoeMarlinResident& MoeMarlinResidentFor(const MoeBlockWeights* w) {
-  static std::mutex mu;
-  static std::unordered_map<const MoeBlockWeights*, MoeMarlinResident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  return ResidentIn<MoeMarlinResident>(w->resident_marlin);
 }
 
 bool MarlinMoeEnabled() {
@@ -1177,6 +1236,39 @@ std::vector<uint16_t> DequantNvfp4ToBLayout(const Nvfp4Weight& w) {
       io[static_cast<size_t>(c) * out_dim + r] =
           oi[static_cast<size_t>(r) * in_dim + c];
   return io;
+}
+
+// The SAME bf16 [K=in, N=out] operand, uploaded ONCE and kept resident on the
+// weight (mirror of ResidentNvfp4, same Backend deleter). OPT-IN per weight
+// (`keep_dequant_b`, qwen3_5_weights.h): only the output head is worth a lifetime
+// bf16 expansion of ~4x its packed bytes.
+Tensor ResidentNvfp4DequantB(Dev d, const Nvfp4Weight& w) {
+  VT_CHECK(w.keep_dequant_b, "nvfp4: dequant-B residency is opt-in per weight");
+  if (!w.d_dequant_b) {
+    const std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+    const size_t nb = wb.size() * sizeof(uint16_t);
+    void* p = d.b.Alloc(nb);
+    d.b.Copy(d.q, p, wb.data(), nb);
+    Backend* bk = &d.b;
+    w.d_dequant_b = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(w.d_dequant_b.get(), DType::kBF16, d.q.device, {w.k, w.n});
+}
+
+// out[M,N] = x[M,K] @ dequant(w).T — the fallback both device dispatchers take on
+// a backend with NO fp4 GEMM (CPU registers only kMatmulNvfp4Fp4; Vulkan/Metal
+// neither kMatmulNvfp4 nor the Marlin grouped GEMM). A weight that did not opt in
+// keeps the PER-CALL temporary it has always had; caching the whole NVFP4 tower
+// would quadruple its steady-state bytes on exactly those backends.
+void MatmulNvfp4DequantB(Dev d, Tensor& out, const Tensor& x,
+                         const Nvfp4Weight& w) {
+  if (w.keep_dequant_b) {
+    vt::Matmul(d.q, out, x, ResidentNvfp4DequantB(d, w));
+    return;
+  }
+  const std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+  DBuf dwb(d, DType::kBF16, {w.k, w.n}, wb.data());
+  vt::Matmul(d.q, out, x, dwb.t());
 }
 
 // y[M,N] f32 = x[M,K] bf16 @ dequant(w).T, w fp4-resident [N=out, K=in]. Drops
@@ -2284,10 +2376,7 @@ struct MarlinDenseResident {
 };
 
 MarlinDenseResident& MarlinDenseResidentFor(const Nvfp4Weight* w) {
-  static std::mutex mu;
-  static std::unordered_map<const Nvfp4Weight*, MarlinDenseResident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[w];
+  return ResidentIn<MarlinDenseResident>(w->resident_marlin);
 }
 
 // Repack one dense NVFP4 weight into the resident Marlin layout, then free the
@@ -2452,10 +2541,9 @@ struct MarlinDensePairResident {
 };
 
 MarlinDensePairResident& MarlinDensePairResidentFor(const Nvfp4Weight* gate) {
-  static std::mutex mu;
-  static std::unordered_map<const Nvfp4Weight*, MarlinDensePairResident> cache;
-  std::lock_guard<std::mutex> lk(mu);
-  return cache[gate];
+  // Held on the GATE weight: it was the pair's map key, and it is the member of
+  // the pair whose lifetime the fused repack must not outlive.
+  return ResidentIn<MarlinDensePairResident>(gate->resident_marlin_pair);
 }
 
 void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw, const Nvfp4Weight& uw,
@@ -2520,32 +2608,77 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   const int64_t M = x.shape[0], K = x.shape[1], N = gw.n;
   MarlinDensePairResident& mr = MarlinDensePairResidentFor(&gw);
   if (!mr.ready) BuildMarlinDensePairResident(d, gw, uw, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);
   d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
 
   DBuf gu(d, DType::kBF16, {M, 2 * N});
-  Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
-  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
   Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
   Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
-  Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
-  Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
-  Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
-  Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
-  vt::MoeGroupedGemmNvfp4Marlin(
-      d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
-      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
-                        static_cast<int>(K), false});
+  // VT_MARLIN_DENSE_PAIR (default ON): the single-projection sink already takes vLLM's OWN
+  // dense marlin GEMM (MatmulNvfp4MarlinD, VT_MARLIN_DENSE). This fused
+  // shared-expert gate_up sink did NOT, so it still ran the single-expert
+  // MoE-marlin route: measured at c8 that is 20320 launches (one per layer per
+  // step) of <128,1,8,4,m_block_size_8=false> = 5.4% of GPU time, a kernel
+  // configuration the pinned vLLM never launches. Same resident (mr.w/mr.s/
+  // mr.g) and workspace; rank-2 operand views and direct-A, so no moe_align
+  // cache and no row padding.
+  if (dense_nvfp4::MarlinDensePairEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, 2 * N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / 16, 2 * N});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(2 * N),
+                              static_cast<int>(K)};
+    dargs.group_size = 16;
+    dargs.mxfp4 = false;
+    vt::MarlinDenseGemm(d.q, gu.t(), x, wqd, scd, gg, wst, dargs);
+  } else {
+    DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
+    Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
+    Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
+    Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
+    Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
+    Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
+    Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
+    vt::MoeGroupedGemmNvfp4Marlin(
+        d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
+        vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
+                          static_cast<int>(K), false});
+  }
   DBuf act(d, DType::kBF16, {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;
 }
+
+// PERF-27B-LMHEAD-FP4 (issue #213). Build the dense head's Marlin resident when
+// THIS configuration will actually take the Marlin logits GEMM, and report
+// whether it did. The predicate is EXACTLY the one MatmulNvfp4F32D selects with,
+// so a configuration that will not take that path never builds for it.
+//
+// It lives here, inside the region that already owns this kernel family, rather
+// than as a second `#ifdef VT_MARLIN_NVFP4` at the call site in
+// PrepareLmHeadResident: the DSR ratchet (scripts/check-device-leakage.py)
+// counts every build-time kernel-feature gate in the device-agnostic shared
+// layer and fails on any increase. A new guard at the call site was one, and the
+// honest repair is to keep the gate in the one place that already has it.
+bool BuildDenseHeadMarlinResident(Dev d, const Nvfp4Weight& w) {
+  if (w.IsTrueW4A4() || !MarlinMoeEnabled() ||
+      !vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type)) {
+    return false;
+  }
+  BuildMarlinDenseResident(d, w, MarlinDenseResidentFor(&w));
+  d.b.Synchronize(d.q);
+  return true;
+}
+#else
+// No Marlin NVFP4 in this build: there is no dense-head Marlin resident to
+// build, so PrepareLmHeadResident falls straight through to the arm this
+// backend's logits GEMM will actually take.
+bool BuildDenseHeadMarlinResident(Dev, const Nvfp4Weight&) { return false; }
 #endif  // VT_MARLIN_NVFP4
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  const int64_t M = x.shape[0], N = w.n;
   if (vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kF32);
 #ifdef VT_MARLIN_NVFP4
@@ -2561,18 +2694,33 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
-    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
-    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
-    vt::Matmul(d.q, dout.t(), x, dwb.t());
+    MatmulNvfp4DequantB(d, dout.t(), x, w);
   }
   return dout;
+}
+
+// The ONE dense-gate logits GEMM: y[M,vocab] f32 = x[M,H] @ lm_head.
+// PERF-27B-LMHEAD-FP4 (issue #213). A ModelOpt NVFP4 head stays PACKED, so the
+// GEMM reads K*N/2 + K*N/16 bytes per step instead of the 2*K*N of a dequantized
+// bf16 operand (~0.715 GB vs ~2.543 GB at the real 248320x5120), and keeps its
+// on-disk [N,K] orientation instead of forcing the row-major NN GEMM that has no
+// nvjet_sm121 kernel. Mirrors logits_processor._apply_head ->
+// lm_head.quant_method.apply (logits_processor.py:98-133). Every dense consumer
+// (eager ForwardDense, the gathered and non-gathered paged arms) routes here, so
+// exactly one head layout is selected; the bf16 arm keeps both of its shapes.
+DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights) {
+  if (!weights.lm_head_fp4.Empty())
+    return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
+  const OwnedTensor& lm_head = DenseLmHead(weights);
+  return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
+                    : MatmulF32D(d, x, lm_head);
 }
 
 // Same as MatmulNvfp4F32D but bf16 output (the down/o/out_proj sinks that feed
 // the residual add). CUDA: fp4-resident vt::MatmulNvfp4 (bf16 out). CPU: the
 // DequantNvfp4ToBLayout fallback (no CPU MatmulNvfp4 kernel).
 DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  const int64_t M = x.shape[0], N = w.n;
   if (vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kBF16);
 #ifdef VT_MARLIN_NVFP4
@@ -2585,9 +2733,7 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
-    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
-    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
-    vt::Matmul(d.q, dout.t(), x, dwb.t());
+    MatmulNvfp4DequantB(d, dout.t(), x, w);
   }
   return dout;
 }
@@ -3020,6 +3166,146 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   return out;
 }
 
+// --- PERF-27B-GDN-FP8-QKVZ: the FP8 leaf of the merged GDN input projection.
+// The BF16 leaf below owns a merged `in_proj_qkvz` parameter; a ModelOpt FP8
+// tower (`nvidia/Qwen3.6-27B-NVFP4` is `modelopt_mixed`; the 35B shares the
+// tower) keeps the two shards native, so the loader leaves that owner empty and
+// this arm merges the RAW fp8 bytes instead. Same upstream behavior being
+// mirrored: MergedColumnParallelLinear packs qkv+z along N and ONE GEMM runs
+// per GDN layer (qwen_gdn_linear_attn.py:923-936, linear.py:580-636 @ 702f4814).
+
+// VT_GDN_MERGED_QKVZ_FP8, DEFAULT ON. Also honors the BF16 leaf's rollbacks so a
+// single switch turns the whole merged-input-projection topology off: master
+// VT_GDN_MERGED_PROJ=0 or leaf VT_GDN_MERGED_QKVZ=0 disables this arm too.
+// Process-cached, resolved outside the hot loop.
+bool MergedGdnFp8QkvzEnabled() {
+  static const bool enabled = [] {
+    return detail::MergedGdnFp8QkvzEnvSelected(
+        detail::GdnMergedFp8QkvzEnvConfig{
+            std::getenv("VT_GDN_MERGED_PROJ"),
+            std::getenv("VT_GDN_MERGED_QKVZ"),
+            std::getenv("VT_GDN_MERGED_QKVZ_FP8")});
+  }();
+  return enabled;
+}
+
+detail::GdnMergedFp8QkvzEligibility GdnMergedFp8QkvzEligibilityFor(
+    Dev d, const GdnLayerWeights& w, int64_t conv_dim, int64_t value_dim) {
+  detail::GdnMergedFp8QkvzEligibility e;
+  e.runtime_enabled = MergedGdnFp8QkvzEnabled();
+  e.fp8_platform =
+      vllm::platforms::GetPlatform(d.q.device.type).supports_fp8() &&
+      vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type);
+  e.has_fp8_shards = !w.in_proj_qkv_fp8.Empty() && !w.in_proj_z_fp8.Empty();
+  e.shared_k = e.has_fp8_shards && w.in_proj_qkv_fp8.k == w.in_proj_z_fp8.k;
+  e.shared_input_scale = detail::GdnFp8SharedInputScale(w, nullptr);
+  e.shard_widths_match = e.has_fp8_shards &&
+                         w.in_proj_qkv_fp8.n == conv_dim &&
+                         w.in_proj_z_fp8.n == value_dim;
+  return e;
+}
+
+// The resident N-concatenated [qkv;z] fp8 operand + its column-alpha policy.
+// Mirrors ResidentFp8Qkv (the attention QKV sibling) byte for byte in structure.
+struct Fp8QkvzDev {
+  Tensor packed;     // i8 [conv_dim+value_dim, K] raw e4m3fn (K contiguous)
+  Tensor alpha_vec;  // f32 [conv_dim+value_dim]; valid only when !folded
+  float alpha = 1.0F;  // the GEMM scalar (the shared folded alpha, or 1)
+  bool folded = false;
+};
+
+// Build (lazily, ONCE — and eagerly pre-capture via PrepareGdnFp8Resident) the
+// merged operand. The two shards' packed rows are byte-concatenated: fp8 e4m3 is
+// a raw byte encoding read in [N,K] orientation, so concatenating along N is
+// lossless and needs no repack. The per-tensor input_scale must already be
+// shared (the caller's eligibility guarantees it, re-checked here). Each shard's
+// folded alpha (= shared input_scale * that shard's weight_scale) is applied per
+// OUTPUT COLUMN: folded into the GEMM scalar when both shards fold the same
+// alpha — the byte-exact case, no extra launch — else through the resident
+// per-column vector, exactly as MergedFp8QkvD does.
+Fp8QkvzDev ResidentFp8Qkvz(Dev d, const GdnLayerWeights& w) {
+  const Fp8Weight& qkv = w.in_proj_qkv_fp8;
+  const Fp8Weight& z = w.in_proj_z_fp8;
+  VT_CHECK(!qkv.Empty() && !z.Empty(),
+           "qwen3_5 merged FP8 GDN qkvz: empty logical shard");
+  VT_CHECK(qkv.k == z.k, "qwen3_5 merged FP8 GDN qkvz: logical shard K mismatch");
+  VT_CHECK(qkv.input_scale == z.input_scale,
+           "qwen3_5 merged FP8 GDN qkvz: shards do not share one input_scale");
+  const int64_t inner_k = qkv.k;
+  const int64_t total_n = qkv.n + z.n;
+  const size_t qpb = qkv.packed.bytes.size();
+  const size_t zpb = z.packed.bytes.size();
+  VT_CHECK(qpb == static_cast<size_t>(qkv.n * inner_k) &&
+               zpb == static_cast<size_t>(z.n * inner_k),
+           "qwen3_5 merged FP8 GDN qkvz: packed shard byte mismatch");
+  const bool folded = qkv.alpha == z.alpha;
+
+  if (!w.d_qkvz_fp8_packed) {
+    Backend* backend = &d.b;
+    void* packed_data = d.b.Alloc(qpb + zpb);
+    std::shared_ptr<void> packed_owner(
+        packed_data, [backend](void* pointer) { backend->Free(pointer); });
+    auto* dst = static_cast<uint8_t*>(packed_data);
+    d.b.Copy(d.q, dst, qkv.packed.bytes.data(), qpb);
+    d.b.Copy(d.q, dst + qpb, z.packed.bytes.data(), zpb);
+    if (!folded) {
+      std::vector<float> alpha_host(static_cast<size_t>(total_n));
+      std::fill(alpha_host.begin(), alpha_host.begin() + qkv.n, qkv.alpha);
+      std::fill(alpha_host.begin() + qkv.n, alpha_host.end(), z.alpha);
+      void* alpha_data = d.b.Alloc(static_cast<size_t>(total_n) * sizeof(float));
+      std::shared_ptr<void> alpha_owner(
+          alpha_data, [backend](void* pointer) { backend->Free(pointer); });
+      d.b.Copy(d.q, alpha_data, alpha_host.data(),
+               alpha_host.size() * sizeof(float));
+      w.d_qkvz_fp8_alpha = std::move(alpha_owner);
+    }
+    w.d_qkvz_fp8_packed = std::move(packed_owner);
+  }
+
+  Fp8QkvzDev out;
+  out.packed = MakeTensor(w.d_qkvz_fp8_packed.get(), DType::kI8, d.q.device,
+                          {total_n, inner_k});
+  out.folded = folded;
+  out.alpha = folded ? qkv.alpha : 1.0F;
+  if (!folded) {
+    VT_CHECK(static_cast<bool>(w.d_qkvz_fp8_alpha),
+             "qwen3_5 merged FP8 GDN qkvz: partial resident state");
+    out.alpha_vec = MakeTensor(w.d_qkvz_fp8_alpha.get(), DType::kF32,
+                               d.q.device, {total_n});
+  }
+  return out;
+}
+
+// ONE fp8 GEMM over the N-concatenated [qkv;z] operand -> f32 [M, conv_dim +
+// value_dim]. `h_fp8` is the shared pre-quantized activation (quantize-once)
+// when supplied, else the activation is quantized here with the shared
+// input_scale — the SAME activation bytes both split GEMMs would have read,
+// which is why one shared input_scale is a hard precondition. Output is f32 so
+// each column's alpha is applied by the same IEEE f32 multiply the folded-alpha
+// GEMM would apply, keeping the merged result identical to the concatenation of
+// the two split f32 GEMM outputs.
+DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
+                    const GdnLayerWeights& w) {
+  Fp8QkvzDev qkvz = ResidentFp8Qkvz(d, w);
+  const int64_t M = h_fp8 != nullptr ? h_fp8->shape[0] : x.shape[0];
+  const int64_t total_n = qkvz.packed.shape[0];
+  DBuf out(d, DType::kF32, {M, total_n});
+  const Tensor* a_fp8_p = h_fp8;
+  std::optional<DBuf> a_fp8_owner;
+  if (a_fp8_p == nullptr) {
+    const int64_t K = x.shape[1];
+    a_fp8_owner.emplace(d, DType::kI8, std::vector<int64_t>{M, K});
+    vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.in_proj_qkv_fp8.input_scale);
+    a_fp8_p = &a_fp8_owner->t();
+  }
+  if (DenseCublasLtFp8Enabled())
+    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  else
+    vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  if (!qkvz.folded) vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+  return out;
+}
+
 // vLLM's Qwen3.5/3.6 GDN owns one physical `in_proj_qkvz` and invokes it once,
 // then exposes logical [mixed_qkv, z] last-dim views
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814). W2 enables that topology only
@@ -3084,6 +3370,38 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.z = out.z_owner->t();
     return out;
   }
+  // PERF-27B-GDN-FP8-QKVZ — the native-FP8 owner's merged arm. ONE fp8 GEMM
+  // over the N-concatenated [qkv;z] operand replaces the two below; `mixed_qkv`
+  // and `z` become last-dim views of its output, exactly as in the BF16 leaf.
+  // The merged output is f32 — the dtype the split `mixed_qkv` GEMM already
+  // emits — so `mixed_qkv` is byte-identical. `z`'s split GEMM emits `outdt`;
+  // when that is not f32 the f32 view is cast, which rounds the SAME f32 product
+  // the split GEMM's epilogue would have rounded. Nothing about the split
+  // arithmetic changes, so this leaf is a pure launch/shape change.
+  if (!w.in_proj_qkv_fp8.Empty() &&
+      detail::ShouldUseMergedGdnFp8Qkvz(
+          GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim))) {
+    if (g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
+      g_gdn_fp8_inproj_merged.fetch_add(1, std::memory_order_relaxed);
+    out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w));
+    Tensor packed = out.packed_owner->t();
+    out.mixed = packed.Slice(1, 0, conv_dim);
+    Tensor z_f32 = packed.Slice(1, conv_dim, conv_dim + value_dim);
+    if (outdt == DType::kF32) {
+      out.z = z_f32;
+    } else {
+      VT_CHECK(outdt == DType::kBF16,
+               "qwen3_5 merged FP8 GDN qkvz: unsupported z output dtype");
+      out.z_owner.emplace(d, DType::kBF16,
+                          std::vector<int64_t>{packed.shape[0], value_dim});
+      vt::CastBf16(d.q, out.z_owner->t(), z_f32);
+      out.z = out.z_owner->t();
+    }
+    return out;
+  }
+  if (!w.in_proj_qkv_fp8.Empty() &&
+      g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
+    g_gdn_fp8_inproj_split.fetch_add(2, std::memory_order_relaxed);
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -4665,7 +4983,14 @@ SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfC
       h.dtype == DType::kBF16 &&
       SharedGateUpFusedEligible(w.shared_gate_proj_fp4, w.shared_up_proj_fp4)) {
     DBuf sact = SharedGateUpFusedMarlinD(d, h, w.shared_gate_proj_fp4, w.shared_up_proj_fp4);
-    DBuf sd = MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);  // [T,H] f32
+    // bf16 down-proj out (VT_SHARED_DOWN_BF16, default ON): the Marlin GEMM
+    // already produces bf16 and BOTH consumers re-round through bf16, so the
+    // f32 form wrote and re-read a whole [T,H] buffer for a value it had.
+    // Bit-identical; drops one CastF32 launch per layer per step (CastF32 was
+    // measured at 3.1% of the 35B decode step).
+    DBuf sd = dense_nvfp4::SharedDownBf16Enabled()
+                  ? MatmulNvfp4Bf16D(d, sact.t(), w.shared_down_proj_fp4)   // [T,H] bf16
+                  : MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);   // [T,H] f32
     DBuf gl = MatmulF32D(d, h, w.shared_gate);                       // [T,1] f32
     return {std::move(sd), std::move(gl)};
   }
@@ -5488,12 +5813,10 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 // fuse when the checkpoint scales are truly identical).
 bool Fp8SharedInputScale(bool is_linear_attention, const GdnLayerWeights& g,
                          const FullAttnLayerWeights& a, float* scale) {
-  if (is_linear_attention) {
-    if (g.in_proj_qkv_fp8.Empty() || g.in_proj_z_fp8.Empty()) return false;
-    if (g.in_proj_qkv_fp8.input_scale != g.in_proj_z_fp8.input_scale) return false;
-    *scale = g.in_proj_qkv_fp8.input_scale;
-    return true;
-  }
+  // ONE definition of the GDN pair's scale-compatibility rule, shared with the
+  // PERF-27B-GDN-FP8-QKVZ merge guard (detail::GdnFp8SharedInputScale) so the
+  // two can never drift.
+  if (is_linear_attention) return detail::GdnFp8SharedInputScale(g, scale);
   if (a.q_proj_fp8.Empty() || a.k_proj_fp8.Empty() || a.v_proj_fp8.Empty()) return false;
   if (a.q_proj_fp8.input_scale != a.k_proj_fp8.input_scale ||
       a.q_proj_fp8.input_scale != a.v_proj_fp8.input_scale)
@@ -5964,6 +6287,99 @@ Qwen3_5MTPHiddenStates MtpFinalize(Dev device, const Qwen3_5MTPWeights& weights,
 // diverges. h_host is the f32 hidden [T*H] (rounded to bf16 on upload, exactly
 // like the real forward's embed target). conv_len is (K-1) for the non-spec
 // decode reference and (K-1)+num_spec for the widened spec state.
+// PERF-27B-GDN-FP8-QKVZ numerical harness. Both arms are driven from ONE
+// process (the env toggle is process-cached, so an in-process A/B has to select
+// the arm explicitly), over the same uploaded activation and the same resident
+// bytes, so a bitwise comparison of the two results is exactly the spec's
+// "merged output byte-identical to the concatenation of the two legacy GEMM
+// outputs".
+std::vector<float> ProjectGdnFp8QkvzForTest(vt::Queue queue,
+                                            const GdnLayerWeights& w,
+                                            const std::vector<float>& h_host,
+                                            int64_t T, int64_t conv_dim,
+                                            int64_t value_dim, bool merged,
+                                            bool z_bf16) {
+  Backend& b = vt::GetBackend(queue.device.type);
+  Dev d{b, queue};
+  VT_CHECK(!w.in_proj_qkv_fp8.Empty() && !w.in_proj_z_fp8.Empty(),
+           "ProjectGdnFp8QkvzForTest: fp8 GDN shards required");
+  const int64_t H = w.in_proj_qkv_fp8.k;
+  VT_CHECK(static_cast<int64_t>(h_host.size()) == T * H,
+           "ProjectGdnFp8QkvzForTest: h_host must be [T*H]");
+  const DType outdt = z_bf16 ? DType::kBF16 : DType::kF32;
+  DBuf hf(d, DType::kF32, {T, H}, h_host.data());
+  DBuf h(d, DType::kBF16, {T, H});
+  vt::CastBf16(d.q, h.t(), hf.t());
+
+  GdnQkvzOutput out;
+  if (merged) {
+    out.packed_owner.emplace(MergedFp8QkvzD(d, h.t(), nullptr, w));
+    Tensor packed = out.packed_owner->t();
+    out.mixed = packed.Slice(1, 0, conv_dim);
+    Tensor z_f32 = packed.Slice(1, conv_dim, conv_dim + value_dim);
+    if (outdt == DType::kF32) {
+      out.z = z_f32;
+    } else {
+      out.z_owner.emplace(d, DType::kBF16, std::vector<int64_t>{T, value_dim});
+      vt::CastBf16(d.q, out.z_owner->t(), z_f32);
+      out.z = out.z_owner->t();
+    }
+  } else {
+    out.mixed_owner.emplace(
+        MatmulFp8CutlassD(d, h.t(), w.in_proj_qkv_fp8, DType::kF32));
+    out.z_owner.emplace(MatmulFp8CutlassD(d, h.t(), w.in_proj_z_fp8, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+  }
+
+  // Assemble [mixed_qkv | z] on the HOST, so no device op has to consume the
+  // merged arm's strided views (which is the point of them).
+  const int64_t total = conv_dim + value_dim;
+  std::vector<float> host(static_cast<size_t>(T * total), 0.0F);
+  if (merged) {
+    // packed_owner is contiguous f32 [T, conv+value]; mixed (and, when z stays
+    // f32, z) are exactly its column ranges.
+    std::vector<float> packed(static_cast<size_t>(T * total));
+    out.packed_owner->Download(d, packed.data());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < conv_dim; ++i)
+        host[static_cast<size_t>(t * total + i)] =
+            packed[static_cast<size_t>(t * total + i)];
+    if (!z_bf16) {
+      for (int64_t t = 0; t < T; ++t)
+        for (int64_t i = 0; i < value_dim; ++i)
+          host[static_cast<size_t>(t * total + conv_dim + i)] =
+              packed[static_cast<size_t>(t * total + conv_dim + i)];
+    }
+  } else {
+    std::vector<float> mixed(static_cast<size_t>(T * conv_dim));
+    out.mixed_owner->Download(d, mixed.data());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < conv_dim; ++i)
+        host[static_cast<size_t>(t * total + i)] =
+            mixed[static_cast<size_t>(t * conv_dim + i)];
+    if (!z_bf16) {
+      std::vector<float> zf(static_cast<size_t>(T * value_dim));
+      out.z_owner->Download(d, zf.data());
+      for (int64_t t = 0; t < T; ++t)
+        for (int64_t i = 0; i < value_dim; ++i)
+          host[static_cast<size_t>(t * total + conv_dim + i)] =
+              zf[static_cast<size_t>(t * value_dim + i)];
+    }
+  }
+  if (z_bf16) {
+    // Both arms own a contiguous bf16 z here; upcast losslessly so the caller
+    // compares the exact stored bf16 bit patterns as floats.
+    std::vector<uint16_t> zb(static_cast<size_t>(T * value_dim));
+    out.z_owner->Download(d, zb.data());
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < value_dim; ++i)
+        host[static_cast<size_t>(t * total + conv_dim + i)] =
+            vt::BF16ToF32(zb[static_cast<size_t>(t * value_dim + i)]);
+  }
+  return host;
+}
+
 std::vector<float> GdnBlockPagedForTest(vt::Queue queue, const GdnLayerWeights& w,
                                         const HfConfig& cfg,
                                         const std::vector<float>& h_host,
@@ -6452,6 +6868,64 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 #endif
 }
 
+// PERF-27B-LMHEAD-FP4 (issue #213). Build whatever resident form of the PACKED
+// dense head THIS backend's logits GEMM will actually consume, once, at prepare
+// time. Inert on every BF16/FP8/GGUF/tied head (`lm_head_fp4` empty).
+//
+// CUDA/Marlin: prepare time is strictly BEFORE any decode-graph capture, and that
+// matters — BuildMarlinDenseResident Allocs, launches the repack, and Copies a
+// host float whose source is a function-local temporary. Same arm as
+// Qwen3_5Model::PrepareMarlinResident's lm_head build above. A backend with NO
+// fp4 GEMM builds the dequantized bf16 [K,N] operand here instead, so the head —
+// the one weight that opted into it — never pays it on the forward path.
+void Qwen3_5DenseModel::PrepareLmHeadResident(const Qwen3_5DenseWeights& weights,
+                                              vt::Queue& queue) {
+  if (weights.lm_head_fp4.Empty()) return;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  // Build under EXACTLY the guard MatmulNvfp4F32D uses to select the Marlin
+  // GEMM, so a configuration that will not take that path never builds for it.
+  // The build-time gate itself lives with the kernel family (see
+  // BuildDenseHeadMarlinResident), not here.
+  if (BuildDenseHeadMarlinResident(d, weights.lm_head_fp4)) return;
+  // Same selection order as MatmulNvfp4F32D: the fp4-activation and packed-GEMM
+  // arms stage the packed bytes lazily and NOT per call, so only the
+  // dequantizing fallback needs eager work here.
+  if (vllm::platforms::GetPlatform(queue.device.type).cutlass_fp4_supported() &&
+      weights.lm_head_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
+    return;
+  }
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, queue.device.type)) return;
+  (void)ResidentNvfp4DequantB(d, weights.lm_head_fp4);
+  d.b.Synchronize(d.q);
+}
+
+// PERF-27B-GDN-FP8-QKVZ — build the merged FP8 [qkv;z] operand PRE-CAPTURE.
+// Registered on the dense prepare hook, so it runs at model load, strictly
+// before the first forward and therefore before any decode-graph capture: the
+// alloc + two H2D copies can never land inside a stream capture. Skipping this
+// leaves the forward's lazy build to run at first use, which is correct only
+// because an eager warm step precedes capture — this makes it unconditional.
+void Qwen3_5DenseModel::PrepareGdnFp8Resident(
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue) {
+  if (!platforms::GetPlatform(queue.device.type).needs_weight_staging()) return;
+  const int64_t key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+  const int64_t value_dim =
+      config.linear_num_value_heads * config.linear_value_head_dim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  bool built = false;
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    if (!layer.is_linear_attention) continue;
+    if (!detail::ShouldUseMergedGdnFp8Qkvz(
+            GdnMergedFp8QkvzEligibilityFor(d, layer.gdn, conv_dim, value_dim)))
+      continue;
+    (void)ResidentFp8Qkvz(d, layer.gdn);
+    built = true;
+  }
+  if (built) d.b.Synchronize(d.q);
+}
+
 void Qwen3_5DenseModel::PrepareBf16Resident(
     const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
   VT_CHECK(platforms::GetPlatform(queue.device.type).needs_weight_staging(),
@@ -6470,6 +6944,9 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
 
   raw(weights.embed_tokens);
   raw(weights.final_norm);
+  // PERF-27B-LMHEAD-FP4: already a no-op for a PACKED head (empty bf16 owner, and
+  // IsPlainBf16Qwen3_5Dense is false whenever the head is packed); its resident is
+  // built by PrepareLmHeadResident.
   raw(DenseLmHead(weights));
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     raw(layer.input_layernorm);
@@ -6685,10 +7162,9 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
-  // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
-  const OwnedTensor& lm_head = DenseLmHead(weights);
-  DBuf dlogits = lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
-                            : MatmulF32D(d, dnorm.t(), lm_head);
+  // lm_head (the one host Download): PACKED NVFP4 (PERF-27B-LMHEAD-FP4) when the
+  // checkpoint ships a ModelOpt/CT NVFP4 head, else the bf16/tied owner.
+  DBuf dlogits = DenseLogitsF32D(d, dnorm.t(), weights);
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;
@@ -6700,7 +7176,10 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
     : weights_(&weights),
       config_(&config),
       embed_tokens_(&target.embed_tokens),
-      lm_head_(&DenseLmHead(target)) {
+      lm_head_(&DenseLmHead(target)),
+      // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
+      // the packed one too. Empty on every BF16/FP8/tied dense target.
+      lm_head_fp4_(&target.lm_head_fp4) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -7030,21 +7509,17 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
-  // lm_head is unquantized bf16 in the 27B (notes §3.6). Pure-decode / graph
-  // replay pass empty indices (identity) → the full [T,vocab] path.
+  // Both arms route through DenseLogitsF32D (PERF-27B-LMHEAD-FP4). Pure-decode /
+  // graph replay pass empty indices (identity) → the full [T,vocab] path.
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   if (do_gather) {
     const int64_t n_out = static_cast<int64_t>(logits_indices.size());
     DBuf dgather(d, DType::kBF16, {n_out, H});
     GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    const OwnedTensor& lm_head = DenseLmHead(weights);
-    return lm_head.nk ? MatmulBf16LogitsF32D(d, dgather.t(), lm_head)
-                      : MatmulF32D(d, dgather.t(), lm_head);
+    return DenseLogitsF32D(d, dgather.t(), weights);
   }
-  const OwnedTensor& lm_head = DenseLmHead(weights);
-  return lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
-                    : MatmulF32D(d, dnorm.t(), lm_head);
+  return DenseLogitsF32D(d, dnorm.t(), weights);
 }
 
 // Full eager dense paged forward body: embed (host token_ids) then the capturable

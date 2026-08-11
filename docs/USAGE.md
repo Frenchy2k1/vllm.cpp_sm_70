@@ -63,6 +63,20 @@ requested value — but it sent a contributor looking in the wrong place
 ([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
 gencode line remains the ground truth if you want to double-check.
 
+## Using more than one engine in a process
+
+Constructing a `LoadedEngine`, destroying it, and constructing another in the
+same process is supported, including on CUDA. Each engine's device-resident MoE
+and Marlin constants are owned by the weights they describe and are released
+with them.
+
+Before, that state lived in process-lifetime caches keyed on the *address* of a
+weights block, so a second engine could land on a freed block's address and
+reuse device pointers that had already been freed. Nothing crashed — the CUDA
+context is never torn down, so the pointers stayed mapped — it simply produced
+corrupted or zeroed output tokens, intermittently
+([#237](https://github.com/mudler/vllm.cpp/issues/237)).
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
@@ -71,6 +85,13 @@ welcome that the agent should relay. An explicit request can use
 `--intent operator|helper|read-only` and a helper `--row ID`. Follow its printed
 claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
 The entrypoint is non-interactive and does not mutate the checkout.
+
+The operator role is a coordinator, and **several may run at once**:
+`scripts/agent-role.py claim operator` records this worktree and is never
+refused, `scripts/agent-role.py show` lists the other live coordinators, and
+`scripts/agent-role.py release` removes only this worktree's record. What keeps
+concurrent coordinators safe is that `main` is never force-pushed, so a plain
+`git push` refuses any non-fast-forward.
 
 ## Running inference (CLI)
 
@@ -195,6 +216,15 @@ forms in use, so pick a checkpoint by its quality, not by its head:
 The head is dequantized to BF16 at load, so all three cost the same memory once
 running. Any other dtype fails at load with a message naming what it saw.
 
+A `modelopt_mixed` checkpoint (`nvidia/Qwen3.6-27B-NVFP4`, and the 35B-A3B that
+shares the tower) keeps its `linear_attn` input projections in FP8 W8A8, and
+those two per-layer projections are packed into ONE merged `in_proj_qkvz` GEMM,
+mirroring vLLM's `MergedColumnParallelLinear`. The merge only fires when the two
+shards carry a bitwise-identical per-tensor `input_scale`, since one GEMM
+quantizes the activation once; a checkpoint whose scales differ keeps the two
+separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
+in the same binary.
+
 ## OpenAI-compatible server
 
 `vllm-server` is a small HTTP server speaking the OpenAI API. Source:
@@ -271,6 +301,52 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+### NVFP4 dense sinks
+
+The `E=1` dense NVFP4 projections run on vLLM's own dense Marlin GEMM rather
+than the single-expert grouped-MoE route, which pays `moe_align` bookkeeping and
+row padding for a problem that has neither. `VT_MARLIN_DENSE` covers the single
+projections and `VT_MARLIN_DENSE_PAIR` the fused shared-expert gate_up sink;
+both default ON, opt out with `=0`. The pair sink was the last one still on the
+MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
+throughput changes; the routed experts still use the grouped MoE kernel, which
+is where they belong.
+
+The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
+f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
+bf16 in-kernel — which is exact — and re-round through bf16 on store, so the
+f32 form was writing and re-reading a whole `[T,H]` buffer for a value it
+already had. The change is bit-identical and worth **+2.05% at c8**.
+
+### The NVFP4 output head
+
+On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
+`weight`/`weight_scale`/`weight_scale_2`, or compressed-tensors
+`weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
+GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
+head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
+2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
+GiB, a 1.70 GiB saving on CUDA; the figure is owed a re-measurement after
+`ENG-LOAD-DIRECT-UPLOAD` changed the RSS accounting).
+
+That accounting is CUDA's. A backend with no fp4 GEMM (CPU, Vulkan, Metal, HIP,
+Tenstorrent) has to multiply against a dequantized bf16 copy, so on those the
+head costs the packed bytes **plus** one `2*K*N` operand, built once when the
+model is prepared rather than per call — 0.666 + 2.368 = 3.034 GiB on the same
+checkpoint. The sign of the change therefore depends on the backend: on Vulkan,
+which used to stage a host bf16 head *and* a device copy of it, the head goes
+4.736 to 3.034 GiB, the same **-1.70 GiB**; on plain CPU it goes 2.368 to 3.034,
+a **+0.67 GiB** regression, paid once instead of rebuilding 2.368 GiB on every
+decode step as that backend did before. Only the head is kept that way; every
+other NVFP4 projection dequantizes per call, so a quantized tower is never
+expanded in memory. The head runs W4A16 under both namings: the on-disk
+activation divisor next to it (`input_scale`, or `input_global_scale` in the
+compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
+matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a
+same-binary A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF
+and `tie_word_embeddings` heads are unaffected by either setting.
+
 ### Validating a staged release archive
 
 Release verification reads only a freshly extracted archive, never files from
@@ -279,9 +355,9 @@ provenance sidecars:
 
 ```sh
 python3 scripts/validate-release-archive.py \
-  --archive vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz \
-  --checksum vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.sha256 \
-  --provenance vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.provenance.json \
+  --archive vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz \
+  --checksum vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256 \
+  --provenance vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.provenance.json \
   --forbid-path "$PWD/build"
 ```
 
@@ -301,7 +377,7 @@ model before metadata can be generated:
 
 ```sh
 SOURCE_SHA=$(git rev-parse HEAD) \
-VERSION=0.0.1 \
+VERSION=0.0.2 \
 SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) \
 EVIDENCE_URL=https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE \
 scripts/build-cpu-release.sh \
@@ -351,7 +427,7 @@ Registered in
 | GET | `/health` | Process liveness (200) |
 | GET, POST | `/ping` | Liveness probe (200, mirrors `/health`) |
 | GET | `/version` | Engine version |
-| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4) |
+| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4), recorded per engine step by the engine that serves your requests |
 | POST | `/tokenize` | Tokenize a `prompt` to token ids (optional `token_strs`) |
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
@@ -360,6 +436,25 @@ Registered in
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+
+`prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
+and the engine computes it — every prompt position is scored against the token
+that followed it, accumulated across chunked prefill — but the **response body
+does not carry it yet**: emitting it needs the OpenAI `echo` wiring, which is
+not done. Until then it is reachable through the library
+(`RequestOutput.prompt_logprobs`), not over HTTP. `logprobs`/`top_logprobs` on
+GENERATED tokens are emitted normally.
+
+That computation is gated on the **CPU** backend only. A step that owes prompt
+logits takes the full-logits route, and on that route the sampler is handed a
+host-resident logits buffer carrying the accelerator's device label — sound on
+unified memory, and **not yet verified on CUDA at all, discrete or otherwise**.
+Treat `prompt_logprobs` on a GPU build as unverified until that gate runs; the
+mechanism and the exact owed invocation are in
+[`.agents/specs/prompt-logprobs.md`](../.agents/specs/prompt-logprobs.md)
+(risk 4 and the `PENDING` CUDA smoke gate). Requests that do NOT set it are
+unaffected on every backend — the route is only taken for a step where some
+request asked.
 
 The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
@@ -600,7 +695,7 @@ It speaks **OpenAI's Sora video shape**, so an OpenAI client works against it
 unmodified, and it keeps the richer native knobs alongside.
 
 ```sh
-build/examples/server --model /path/to/Qwen3.6-27B \
+build/examples/vllm-server --model /path/to/Qwen3.6-27B \
   --video-dit /path/to/h3-dit.gguf --video-vae /path/to/video-vae.safetensors \
   --audio-vae /path/to/audio-vae.safetensors \
   --video-vae-config video_vae/config.json --audio-vae-config audio_vae/config.json \
@@ -777,9 +872,27 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
 
+`Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
+from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
+`raw_logits` are snapshotted before any logits processor runs, so they describe
+the MODEL's distribution; `processed_logprobs` and `processed_logits` are taken
+after temperature and top-k/top-p, so they describe the distribution actually
+SAMPLED from — a token top-k masked away reads `-inf` there and its true value
+under the raw pair. It is selectable by constructing a `Sampler` directly; there
+is no config, CLI or request field for it yet.
+
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
-per position. (Over HTTP the OpenAI `logprobs` field keeps its own 0..5 range.)
+per position.
+
+Over HTTP the same `-1` reaches the chat surface: `{"logprobs": true,
+"top_logprobs": -1}` is accepted, as in vLLM, and returns every vocab entry for
+each generated token. No numeric range is enforced on either surface — vLLM's
+`check_logprobs` request validation and its `max_logprobs` model cap are not
+ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
+returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
+count is not rejected. Both are tracked by
+[issue #249](https://github.com/mudler/vllm.cpp/issues/249).
 
 `SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead —
 vLLM's generative-scoring path, and what to reach for when you only need a few
@@ -870,10 +983,40 @@ Reference frames are binary PPM, which is what this tool also **writes**, so one
 feeds straight back in as `--ref-video` and clips chain. Convert anything else with
 `ffmpeg -i in.png -pix_fmt rgb24 out.ppm`.
 
-Useful for measurement: `--denoise-only` times the DiT loop without loading the VAEs,
-`--dump-params` prints the geometry a checkpoint implies (manifest only, no weights),
-`--save-embeds` writes the text conditioning so a second run can replay it with
-`--prompt-embeds` and compare checkpoints on identical conditioning.
+Worked reference renders, all on the **Ref2VA** checkpoint (`--partition ref2va`); the flags
+below replace `--ref-image` in the command above:
+
+```sh
+# a SUBJECT carried into a new scene, from one still
+--ref-image subject.ppm
+
+# a reference CLIP: a directory of frame_%06d.ppm. A previous run's --workdir already
+# has that layout, so clips chain without converting anything:
+--ref-video /tmp/h3/            # reads /tmp/h3/frame_000000.ppm, frame_000001.ppm, ...
+
+# reference AUDIO: 16-bit PCM WAV. Resample first -- the audio VAE is 32 kHz:
+#   ffmpeg -i voice.mp3 -ac 1 -ar 32000 -c:a pcm_s16le voice.wav
+--ref-audio voice.wav
+```
+
+To build a `--ref-video` directory from an arbitrary clip:
+
+```sh
+mkdir -p /tmp/refclip && ffmpeg -i source.mp4 -pix_fmt rgb24 /tmp/refclip/frame_%06d.ppm
+```
+
+Reference conditioning is **ref2va only**. On the FL2VA checkpoint these flags are refused
+rather than silently ignored, which is the guard from the task/partition mirror.
+
+Useful for measurement: `--prompt-embeds` replays text conditioning saved earlier, so two
+checkpoints can be compared on byte-identical conditioning. `VT_H3_DUMP_DIR=<dir>` writes the
+latents that enter each VAE (`vae_input_video_latent.f32`, `vae_input_audio_latent.f32`) plus
+the pre-denormalize audio rows — that is how a render is checked numerically rather than by
+eye, and it is byte-inert when unset.
+
+(`--denoise-only`, `--dump-params` and `--save-embeds` belonged to the pre-fold driver and
+were removed when the example became a thin ABI client; see the header comment in
+`examples/minimax_h3_gen/main.cpp`.)
 
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the

@@ -235,8 +235,15 @@ def audit() -> list[dict]:
 # section carries `python3 scripts/check-site.py` and `hugo --minify`, both of
 # which genuinely fail on a broken site, so it is credited on arrival rather
 # than pinned as gates-no-command. Issue #224.
+
+# 2026-08-09: +SAMPLE-PROMPT-LOGPROBS. The row reached ACTIVE with the runner
+# prompt-logits source (#223) and its spec's Gates section carries the exact
+# configure/build/focused-test/full-ctest invocation the gate was run with,
+# including the serial re-run for the known parallel-ctest flake. Growth, so the
+# set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
     "BACKEND-CUDA-ARCH-ADDITIVITY",
     "BACKEND-METAL-MLX",

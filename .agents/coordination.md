@@ -118,6 +118,37 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Prompt-logprob runner source (`SAMPLE-PROMPT-LOGPROBS`, 2026-08-09,
+`CLAIM-SAMPLE-PROMPT-LOGPROBS-W1`).** Claude Code (claude-opus-5), isolated
+worktree `/home/mudler/_git/vllm.cpp-prompt-logprobs`, branch
+`row/SAMPLE-PROMPT-LOGPROBS`, opened on `origin/main` `bd6b3936`, rebased onto
+`8a6704a2` for the 2026-08-10 review repair and onto `e63d11d3` to land. Issue [#223](https://github.com/mudler/vllm.cpp/issues/223), spec
+[prompt-logprobs.md](specs/prompt-logprobs.md). Scope W1: the runner-side prompt
+logits source — `prepare_inputs` row selection, `collect_prompt_logprobs`,
+`Sampler::compute_prompt_logprobs`, the `InputBatch::num_prompt_logprobs` map,
+and eight engine-level cases in `tests/vllm/v1/test_llm_engine.cpp` (§9). NO kernel, NO
+vt op, NO ABI, NO model file. CPU reference backend only — claims no GPU and
+takes no benchmark device. Excluded: the OpenAI `echo` serialization (W2) and
+[#231](https://github.com/mudler/vllm.cpp/issues/231), both split out.
+
+**TRAILER-CONTRACT MISS, recorded by developer decision (2026-08-10).** Commits
+`450a1b69` (the PR-size retirement) and its merge `a178f1af` reached `main` in
+the same minutes that `check-commit-trailers.py` was tightened on `main` to
+require a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and an `Assisted-by` whose
+agent token carries no space (`Claude:claude-opus-5 [ClaudeCode]`). Both use the
+older shape, so `commit-protocol-tag` is RED for that pushed range and a
+follow-up commit cannot repair it, because CI checks the pushed range itself.
+
+A corrected single commit with the identical tree was prepared and preflighted
+green; the developer chose NOT to rewrite shared history for it, so the red
+stands and this note is the record. Every earlier commit of this session that is
+already on `main` carries the same older shape for the same reason: it was
+compliant when written.
+
+Separately, and not this claim's to fix: the tightened checker also fails
+commits that are not ours (`1078355d` carries a forbidden `Co-authored-by`), so
+the tightening left older history non-compliant across the repository.
+
 **PROTOCOL MISS on `CLAIM-SPEC-DSPARK`, recorded not waived (2026-08-10).** PR
 #211 was merged at developer instruction while its CI was still pending; the run
 finished 11 green (including `cuda-fat-build`, both sanitizers and all three
@@ -138,6 +169,28 @@ build-test lanes) and 3 red. Reproduced locally against the merged range:
 No retroactive waiver is being written: the budget breach is real and the honest
 record of it is this note. The lesson for the next row is that a 6-slice claim
 should land as 6 PRs.
+
+**AsyncLLM serving-path metric wiring (`SERVE-METRICS`, 2026-08-10,
+`CLAIM-SERVE-METRICS-ASYNC`).** Claude Code (claude-opus-5), helper role,
+isolated worktree `/home/mudler/_git/vllm.cpp-metrics-async`, branch
+`row/SERVE-METRICS-ASYNC`, rebased forward as main landed (base `abdc3a26` at
+creation, `488fca89` at push). PUSHED `e8a7624f`, PR
+[#297](https://github.com/mudler/vllm.cpp/pull/297). Issue
+[#277](https://github.com/mudler/vllm.cpp/issues/277), spec
+[`.agents/specs/async-metrics.md`](specs/async-metrics.md). Closes the
+`ROAD-V1-C8` residual "AsyncLLM serving-path metric wiring": the production
+server serves `/metrics` off `AsyncLLM`, whose output handler folds nothing into
+the `PrometheusStatLogger`, so a real deployment scrapes a well-formed catalog
+whose series never move. Owns `src/vllm/v1/engine/async_llm.cpp`,
+`include/vllm/v1/engine/async_llm.h`, the `step_with_batch_queue` stat stamp in
+`src/vllm/v1/engine/core.cpp`, the recorder mutex in
+`{include,src}/vllm/v1/metrics/loggers.{h,cpp}`, the async attach in
+`src/vllm/entrypoints/openai/server_main.cpp`, the stale residual comments in
+`{include,src}/vllm/entrypoints/openai/api_server.{h,cpp}`, new cases in
+`tests/vllm/v1/test_async_llm.cpp`, and the `SERVE-METRICS` /
+`SERVE-RESPONSE-METRICS` records. EXCLUDED and untouched: the config-gated
+metric families (spec-decode / kv-connector / mm / LoRA), which are the sibling
+residual on the same row. CPU-only gate; no GPU, no model, no checkpoint.
 
 **DSpark speculative decoding (`SPEC-DSPARK`, 2026-08-09, `CLAIM-SPEC-DSPARK`).**
 Claude Code (opus-5), helper role, isolated worktree
@@ -1537,13 +1590,59 @@ public-doc change. Does NOT touch the roadmap issue table — PR #235 already
 registers #231 there and duplicating the row would guarantee a keyed-record
 conflict.
 
+**Record repair to the above (`SAMPLE-LOGPROBS`, 2026-08-10, issue #231).** Claude
+Code (claude-opus-5), isolated worktree
+`/home/mudler/_git/vllm.cpp-logprobs-record`, branch
+`row/SAMPLE-LOGPROBS-RECORD-REPAIR`, base `origin/main` `1c1749cb` pinned at
+worktree creation. **Follows the entry directly above**: the fix landed as
+`fd9af7d9` (merged `723d96a8`, PR #236, from `row/SAMPLE-LOGPROBS-ALL-SENTINEL`)
+and the CODE is correct, but an independent review found two shipped records
+false. (1) The crash site: the SIGSEGV is in `LogprobsTensors::slice_request`
+(`src/vllm/v1/outputs.cpp:31-37`) from `scheduler.cpp:920-924`, NOT in
+`LogprobsProcessor::UpdateSampleLogprobs` — the reviewer instrumented both
+consumers with the widening reverted and `UpdateSampleLogprobs` is never entered;
+reproduced here before the edit. (2) `docs/USAGE.md` claimed the HTTP `logprobs`
+field "keeps its own 0..5 range"; nothing in the tree enforces any range, and
+upstream deliberately admits `-1` on the CHAT surface, so
+`{"logprobs":true,"top_logprobs":-1}` is a real capability the widening unblocked
+and it was untested. Scope: the crash-site attribution in
+[logprobs-all-sentinel.md](specs/logprobs-all-sentinel.md), the `SAMPLE-LOGPROBS`
+evidence cell in [engine-matrix.md](engine-matrix.md), the section-8 comment in
+`tests/vllm/v1/test_llm_engine.cpp`, the stale guard comment in
+`src/vllm/v1/engine/logprobs.cpp`, a strengthened finite-count assertion, one
+added chat `top_logprobs=-1` case in
+`tests/vllm/entrypoints/openai/test_serving.cpp`, the `SamplingParams::logprobs`
+paragraph in `docs/USAGE.md`, and this entry. NO behaviour change: `add_request`,
+`max_num_logprobs()` and the sampler are untouched. CPU-only; NO kernel, vt op,
+ABI, CMake, model file or GPU change. Porting upstream's `check_logprobs` /
+`max_logprobs` validation stays out of scope — that is issue #249. Roadmap issue
+table still untouched: PR #235 registers #231 there and is open, so adding it
+again would duplicate a keyed record; `AGENTS.md` does prescribe how to resolve
+such a conflict, so this is duplication avoidance rather than an unresolvable
+clash — and if #235 closes without landing, #231 loses its roadmap registration
+and this row owes that line.
+
+**`logprobs_mode` modes (`SAMPLE-LOGPROB-TOKEN-IDS`, 2026-08-10, `CLAIM-SAMPLE-LOGPROBS-MODE`, issue #238).** Claude Code (claude-opus-5), isolated worktree
+`/home/mudler/_git/vllm.cpp-logprobs-mode`, branch `row/SAMPLE-LOGPROBS-MODE`, rebased onto
+`origin/main` `5e67fcc2`. Spec [logprobs-mode.md](specs/logprobs-mode.md). Scope: the three
+unimplemented `logprobs_mode` values and the deletion of the runtime refusal, in
+`src/vllm/v1/sample/sampler.{h,cpp}` plus four cases in
+`tests/vllm/v1/sample/test_sampler.cpp`. CPU-only; NO kernel, vt op, ABI, CMake, model file or
+GPU. Row moves `INVENTORIED` -> `PARTIAL`, NOT `ACTIVE`: `logprob_token_ids` generative scoring
+and the config/CLI plumbing to select a mode from outside the library are both still absent.
+Records a spec-after-code ordering deviation in the spec preamble rather than hiding it behind
+commit order.
+
 **`CLAIM-SAMPLE-LOGPROB-TOKEN-IDS` (`SAMPLE-LOGPROB-TOKEN-IDS`, 2026-08-10, issue
 #264).** Claude Code (claude-opus-5), helper role, isolated worktree
 `/home/mudler/_git/vllm.cpp-token-ids`, branch `row/SAMPLE-LOGPROB-TOKEN-IDS`,
-base `origin/main` `e63d11d3` pinned at worktree creation. Spec
+base `origin/main` `e63d11d3` pinned at worktree creation, PR #267, `origin/main`
+`5812b8b6` MERGED in 2026-08-11 (never rebased -- both heads are published and
+`main` is never force-pushed). Spec
 [logprob-token-ids.md](specs/logprob-token-ids.md). NOT in the claims table
 below: that table keys `SPIKE`/`ACTIVE` rows and this row lands `PARTIAL`
-(`INVENTORIED` -> `PARTIAL`), because its `logprobs_mode` half stays unported.
+(the row was already moved `INVENTORIED` -> `PARTIAL` on main by the sibling
+`logprobs_mode` claim, so this change moves no lifecycle counter).
 Scope: `SamplingParams::logprob_token_ids` + `num_logprobs()` + its two
 validations; the `InputBatch` req_id-keyed map and its `make_sampling_metadata`
 emission; `GatherSpecificTokenLogprobs` + the snapshot/precedence wiring in
@@ -1551,15 +1650,20 @@ emission; `GatherSpecificTokenLogprobs` + the snapshot/precedence wiring in
 `logprobs.cpp:35`); cases in `test_sampler.cpp` / `test_input_batch.cpp` /
 `test_sampling_params.cpp` / `test_llm_engine.cpp`; the row + its docs
 checkpoint; this claim; the #264 roadmap intake row. CPU-only; NO kernel, vt op,
-C ABI, CMake, model file, GPU or download. **Textual overlap warning:** open PR
-#258 (`logprobs_mode`) edits the same snapshot block in `sampler.cpp`; whichever
-lands second rebases. Does NOT touch `GatherLogprobs` — issue #249's unbounded
-`k` is a separate row.
+C ABI, CMake, model file, GPU or download. **Textual overlap RESOLVED:** #258
+(`logprobs_mode`) and #223 (`prompt_logprobs`) landed first and both touched the
+same `sampler.cpp` snapshot block and `input_batch.{h,cpp}`; the 2026-08-11
+merge keeps BOTH features -- `logprobs_mode` selects WHICH tensor the snapshot
+holds, `logprob_token_ids` selects WHICH ids are read out of it -- and adds one
+composition case that neither PR could have written against its own base. Does
+NOT touch `GatherLogprobs` -- issue #249's unbounded `k` is a separate row.
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
+| `CLAIM-SAMPLE-PROMPT-LOGPROBS-W1` | `SAMPLE-PROMPT-LOGPROBS` (`ACTIVE`; W1 runner source only) | Claude Code (claude-opus-5) | `/home/mudler/_git/vllm.cpp-prompt-logprobs`; CPU-only `build-gate` (`-DVLLM_CPP_CUDA=OFF` Release) — NO GPU, NO download, claims no benchmark device | `row/SAMPLE-PROMPT-LOGPROBS`, opened on `origin/main` `bd6b3936`, rebased onto `8a6704a2` for the 2026-08-10 review repair and onto `e63d11d3` to land, issue #223 | The runner-side prompt-logits source ported from `_get_prompt_logprobs_dict`. Owns ONLY: the `prompt_logprob_rows`/`prompt_logprob_indices` block in `prepare_inputs.{h,cpp}`, `collect_prompt_logprobs` + `in_progress_prompt_logprobs_` in `runner.{h,cpp}`, `Sampler::compute_prompt_logprobs` in `sampler.{h,cpp}`, `num_prompt_logprobs` in `input_batch.{h,cpp}`, section 9 of `tests/vllm/v1/test_llm_engine.cpp`, this claim, the row cells, `.agents/NOW.md`, `.agents/roadmap_v1.md` issue rows, one `docs/STATUS.md` sentence, and the `prompt_logprobs` paragraph in `docs/USAGE.md`. **NON-COLLISION:** NO kernel, NO vt op, NO ABI, NO CMake, NO model file — the full-logits route reuses the existing `VT_LOGITS_GATHER=0` path rather than widening any model's gather contract. EXCLUDED: the OpenAI `echo` serialization (W2) and issue #231, both split out. | `ACTIVE` | 2026-08-10 — W1 landed then REPAIRED after a fresh review returned `VERDICT: FAIL`. Review found a REAL bug: the inertness guard keyed on `prompt_logprob_indices` while the full-logits assertion keyed on `prompt_logprob_rows`, so a zero-row final chunk (the exact-prefill edge, `:5668-5673`) beside another multi-token request threw `VT_CHECK` out of `engine.step()` and killed the whole batch. Fixed by moving the check inside the `num_rows > 0` slice; regression §8(h), RED-first (the throw). Second finding: the on-vs-off inertness case could not see a change to the SHARED route (forcing full logits on every step left it 17/17·346 green), so §8(g) now asserts the route DECISION through a const runner seam and fails under that exact mutation. Third finding recorded, NOT fixed and NOT claimed: the full-logits route hands the sampler a host pointer wearing the device label — sound on unified memory, unverified on CUDA; spec risk 4 + a `PENDING` CUDA smoke gate, and `docs/USAGE.md` narrowed to say so. Three latent lifetime divergences recorded as risks 5-7. Gates on the rebased tree (`e63d11d3`): clean CPU Release build 0 warnings under `-Werror`, `test_llm_engine` **21/21 · 384**, full `ctest -j 6` **365/366** with `test_openai_conformance` (parallel starvation — connection `-1`s) passing serially 1/1 in 0.39 s. Row stays `ACTIVE`: W2 `echo` serialization is the named residual, and the CUDA smoke gate is `PENDING`. |
+| `CLAIM-MOONCAKE-STORE` | `KV-MOONCAKE-STORE` (new, `SPIKE`) | Claude Code (opus-5), helper role | isolated worktree `/home/mudler/_git/vllm.cpp-mooncake`; records-only — NO build, NO GPU, NO download, NO external dependency installed | `row/KV-MOONCAKE-STORE`, base `origin/main` `848d4a87` | The `MooncakeStoreConnector` spike, records-only in this commit: NEW [`.agents/specs/mooncake-store-connector.md`](specs/mooncake-store-connector.md), the NEW `KV-MOONCAKE-STORE` engine-matrix row + section/total counters, the `ENGINE_ROWS` 146→147 bump in `scripts/check-agent-record.py` with its justification comment, a PROSE-ONLY Mooncake-disposition correction inside the `KV-CONNECTORS` row (both NOT-SCHEDULED sentences; that row's `ANCHOR-BACKFILL` state, tier, anchors, evidence, spec link and owner are UNCHANGED, so it is not claimed here), the `ROAD-V1-D4` portfolio note + canonical-table link, the roadmap issue-table row for [#287](https://github.com/mudler/vllm.cpp/issues/287), and this claim. **NON-COLLISION:** touches NO `src/`, `include/`, `tests/`, `examples/` or CMake path; the only script touched is the record checker's own row-count constant. | `ACTIVE` | 2026-08-10 — spec committed. The `KV-CONNECTORS` spike's blanket "Mooncake NOT SCHEDULED" conflated TWO connectors: `MooncakeConnector` (P2P prefill/decode over the Transfer Engine — two nodes, fabric, proxy) KEEPS that verdict; `MooncakeStoreConnector` (shared KV object store, the LMCache analogue) is reopened because (a) Mooncake is NATIVE C++ — `mooncake::Client` in `client_service.h`, and the `MooncakeDistributedStore` vLLM imports is a pybind wrapper over it — so we LINK instead of reimplementing a wire (the inverse of the LMCache cost shape), and (b) its single-node `protocol: "tcp"` + `mooncake_master` config is gateable on one box with NO RDMA NIC. The landed W5 `KVConnector` seam needs NO change. NEXT: W0, the go/no-go link spike (build Mooncake from source, pin the revision, drive `mooncake::Client` from a standalone C++ TU against a local master over TCP) — a genuine stop point per spec §S1. Speed is recorded as an OPEN axis: the RDMA/GPUDirect path that motivates the connector is unmeasurable for want of a fabric on any box we own. PENDING developer authority: the Mooncake source build, push/PR. |
 | `CLAIM-SPEC-DSPARK` | `SPEC-DSPARK` (`ACTIVE`) | Claude Code (opus-5), helper role | isolated worktree `/home/mudler/_git/vllm.cpp-spec-dspark`; CPU-only so far, NO build, NO GPU, NO download | `row/SPEC-DSPARK`, base `origin/main` `bc6e3d72`; NOT PUSHED, no PR yet (remote step PENDING developer authority) | The DSpark spike, records-only in this commit: NEW `.agents/specs/dspark-spec-decode.md`, the `SPEC-DSPARK` engine-matrix row + section/total counters, the feature-matrix §8 DSpark row, the superseded grounding-note header, this claim, `.agents/NOW.md`, and the `docs/STATUS.md`/`docs/FEATURES.md`/`docs/BENCHMARKS.md` one-liners. **NON-COLLISION:** touches NO `src/`, `include/`, `tests/`, `examples/` or CMake path. Implementation slices W1-W6 follow under this same claim. | `ACTIVE` | 2026-08-09 — spike committed. DSpark = the landed DFlash lane + Markov logit-bias head + sequential block sampling + anchor-as-first-prediction layout + `d2t` reduced vocab + method/config resolution + Speculators-format translation; upstream surface is 1613 lines over 5 files, 3 of them DFlash subclasses. Draft checkpoints exist for both gate models and for the 4B pair the upstream test uses; DeepSeek-V4 DSpark is out of scope (HW-blocked). NEXT: W1 config slice (CPU, RED = `speculative.cpp:44` rejects `"dspark"` today) and R1, prove the pinned oracle `555967922` actually RUNS DSpark (it forces the V2 runner). PENDING developer authority: checkpoint downloads, dgx GPU time, push/draft-PR. |
-| `CLAIM-ENG-RELEASE-BINARIES-W1-W13` | `ENG-RELEASE-BINARIES` (`ACTIVE`; complete release matrix) | Codex (GPT-5) | `/home/mudler/_git/vllm.cpp-release-binaries`; inline execution in the existing isolated worktree | `row/ENG-RELEASE-BINARIES`, base `origin/main` `81291a89`, draft PR #196 | Complete W1-W13 contract in one PR: fat-CUDA gencode and AOT, adaptive CPU tiers, staged validation and supply chain, least-privilege release automation, all declared bundles, generated index, and tagged-release audit. W5 is inherited from main; ROCm remains blocked by contract | `ACTIVE` | 2026-08-09 — required W1-W11/W13 implementation complete; local CPU/Vulkan/mutation gates green; hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, rebase/merge, and tagged publication pending; W12 optional/non-primary |
+| `CLAIM-ENG-RELEASE-BINARIES-W1-W13` | `ENG-RELEASE-BINARIES` (`ACTIVE`; complete release matrix) | Codex (GPT-5) | `/home/mudler/_git/vllm.cpp-release-binaries`; inline execution in the existing isolated worktree | `row/ENG-RELEASE-HANDOFF-FLAT`, base `origin/main` `24306364`; follow-up PR pending | Complete W1-W13 contract in one PR; the current follow-up completes the W8/W13 hosted handoff after run `31408404388` built and uploaded all eight required tuples but aggregation failed on nested `download-artifact` extraction. Owns the workflow-wide flat-download invariant, checker and red-first mutation, hosted dry-run verification, and exact release-readiness audit; no backend/package/manifest behavior change. ROCm remains blocked | `ACTIVE` | 2026-08-09 — required W1-W11/W13 implementation complete; hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, rebase/merge, and tagged publication pending. Update 2026-08-10: all eight bundles now build and upload, while aggregation still fails before verify because `plan/release-plan.json` is nested under the artifact name; W12 optional/non-primary |
 | `CLAIM-ENG-RELEASE-BINARIES-W5` | `ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) | Codex (GPT-5) | `/home/mudler/_git/vllm.cpp-release-binaries`; CPU/build-time metadata tooling only, no GPU/download/service work | `row/ENG-RELEASE-BINARIES`, base `b38f78a7`, claim commit `29107d0b`, draft PR #141 | W5 implemented: versioned manifest schema + deterministic generator/validator, canonical synthetic CPU/CUDA fixtures, fail-closed mutation tests, release checker/registration and required record/doc checkpoints. Excludes W1-W4, W6-W13, archives, install/package/publish workflows and runtime artifacts | `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals 10/10 killed; accepted release suite 30/30; no archive or real runtime/correctness/performance evidence |
 | `CLAIM-KIMI-LINEAR-W0` | `MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` (stays SPIKE — dedicated W0 spike) | Claude Code (opus-4-8) | isolated worktree `.claude/worktrees/agent-a771cc029e6843be0`; CPU-only, records-only — NO build, NO GPU, NO download (two GPU jobs queued ahead; the W0 GPU golden capture is a SEPARATE later step) | branch `worktree-agent-a771cc029e6843be0`, base `origin/main` HEAD `10dd23ee` | The FULL dedicated W0 spike for `KimiLinearForCausalLM` (Kimi-Linear-48B-A3B) per the spike-first protocol, so W1 implementation can start immediately. Owns ONLY: NEW `.agents/specs/kimi-linear.md`, the `MODEL-TEXT-kimi-linear-*` matrix row (Spike link → the dedicated spec + note; STAYS `SPIKE` because it is actively claimed — protocol forbids a claimed row from being `READY`; checklist mark stays `📋`), this claim row + the narrative block below, the roadmap breadth note, `docs/STATUS.md`/`docs/BENCHMARKS.md`/`docs/FEATURES.md` one-liners, the `.agents/NOW.md` live-claim row + stamp, and one `.agents/state.md` entry. **NON-COLLISION:** records-only — touches NO model/kernel/registry/loader source, NO CMake, NO test. Co-owns the Kimi-Linear row with `CLAIM-MLA-DEEPSEEK` (MLA half) + `CLAIM-KDA-KERNEL` (KDA host refs), exactly as the K3 row is co-owned by `CLAIM-KIMI-K3-SCOPE`/`CLAIM-KIMI-K3-W2-W5`. | `DONE` | 2026-08-05 — **W0 DEDICATED SPIKE LANDED (records-only, NOT pushed).** Authoritative `config.json` fetched (27 layers = 20 KDA + 7 NoPE-MLA; 256e/top-8/1-shared sigmoid `noaux_tc` `routed_scaling=2.446` `first_k_dense_replace=1`; `num_nextn_predict_layers=0` ⇒ no MTP); reuse-vs-new map with our `file:line`; HW-fit (FITS one GB10, 91.5 GiB / 0.77× pool — real e2e SACRED gate reachable); W0-W7 breakdown + GPU golden-capture recipe. NET-NEW = KDA device kernel (host refs landed, `CLAIM-KDA-KERNEL`), NoPE-MLA branch, hybrid schedule/het-KV, loader name-map. Record checkers green (`check-model-checklist`, `check-agent-record`, `check-doc-checkpoint`, `check-now-current`). |
 | `CLAIM-KIMI-LINEAR-W1` | `MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` (stays SPIKE — W1 registry/config/loader scaffolding; forward REFUSES-by-name) | Claude Code (opus-4-8) | isolated worktree `.claude/worktrees/agent-a11ae231a71e8694b`; CPU-only `build-cpu` (`-DVLLM_CPP_CUDA=OFF` Release); NO GPU, NO download — additive TU + one REGISTER line, forward is a `VT_CHECK(false)` stub | branch `worktree-agent-a11ae231a71e8694b`, base `origin/main` HEAD `053116df` | Kimi-Linear-48B-A3B W1 — registry + config + loader + KV-spec scaffolding so the W3-W6 forward can start. Owns ONLY: NEW `include/vllm/model_executor/models/kimi_linear.h`, NEW `src/vllm/model_executor/models/{kimi_linear_registry,kimi_linear_weights,kimi_linear}.cpp`, NEW `tests/vllm/models/test_kimi_linear_scaffold.cpp`, its two CMake registration lines (`CMakeLists.txt` source list + `tests/CMakeLists.txt`), the `KimiLinearForCausalLM` sorted-set + error-message + model-property inserts in `tests/vllm/models/test_model_registry.cpp`, the `MODEL-TEXT-kimi-linear-*` row cells + checklist Status (STAYS `SPIKE`/`📋` — the forward refuses, rollup UNCHANGED), this claim, `.agents/NOW.md`, `docs/STATUS.md`/`docs/BENCHMARKS.md`/`docs/FEATURES.md` one-liners, and one `.agents/state.md` entry. **NON-COLLISION:** additive TU + one REGISTER line ⇒ ZERO edit to any shared array; the forward is a `VT_CHECK(false)` refuse stub so NO production/device path changes; co-owns the Kimi-Linear row with `CLAIM-MLA-DEEPSEEK` + `CLAIM-KDA-KERNEL` + `CLAIM-KIMI-LINEAR-W0`; MUST NOT touch README, Metal/SACRED/apex/darwin, or any other model/kernel source. | `DONE` | 2026-08-05 — **W1 CPU SCAFFOLDING LANDED (foreground, NOT pushed).** Additive registry (`kimi_linear`/`KimiLinearForCausalLM`, `is_hybrid`, `supports_multimodal=false`) + `ParseKimiLinearParams` (20 KDA + 7 NoPE-MLA schedule, MLA 512/128/64/128 q_lora-null, 256e/top-8/1-shared sigmoid `noaux_tc` 2.446, `first_k_dense_replace=1`; asserts `mla_use_nope`/`q_lora==null`) + `EnumerateKimiLinearTensors` name-map VERIFIED vs the real HF safetensors index (MoE = `block_sparse_moe.*`, the correction of the DERIVED K3 `mlp.*`) + loader THROWS BY NAME on missing/mis-shaped tensors + het KV spec (MLA latent-576 + KDA mamba `12288×3`/`32×128×128`) + REFUSE-by-name forward. `test_kimi_linear_scaffold` **9/9·83** + `test_model_registry` **24/24** + `test_kimi_k3_scaffold` 6/6 unchanged; clean CPU Release build; `check-fusion-consistency`/`check-runner-routing-consistency` green (refuse stub skipped); record checkers rc=0. RESIDUAL (W3-W6): KDA device kernel + NoPE-MLA route + sigmoid-noaux MoE + het-KV born-on-runner forward + the e2e SACRED gate (spec §8 recipe). |

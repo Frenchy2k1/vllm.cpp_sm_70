@@ -22,7 +22,8 @@
 # CMAKE_MAKE_PROGRAM=<oracle venv>/bin/ninja, CMAKE_EXPORT_COMPILE_COMMANDS=ON,
 # VLLM_CPP_BENCH_PROFILE_CONTROL=OFF, VLLM_CPP_BUILD_TESTS=ON, and VLLM_CPP_CUTLASS_DIR
 # pointing at the ORACLE's flashinfer-bundled cutlass tree (4.5.0), not $HOME/cutlass-4.5.0.
-# Full tree ~3 GiB. See .agents/benchmark-record.md for the exact configure line.
+# Full tree ~169 GiB (RelWithDebInfo CUDA debug info) -- budget the disk first.
+# See .agents/benchmark-record.md for the exact configure line.
 set -euo pipefail
 
 usage() {

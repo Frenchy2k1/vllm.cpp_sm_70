@@ -61,7 +61,7 @@ OUTPUT_ROWS = {
         "- changed_files: LIST",
         "- commands_and_exit_status: EVIDENCE",
         "- negative_mutation: EVIDENCE",
-        "- deviations_and_waivers: EVIDENCE | NONE",
+        "- deviations: EVIDENCE | NONE",
         "- risks: EVIDENCE | NONE",
         "- omitted_gates: EVIDENCE | NONE",
         "- commit_sha: SHA | NONE",

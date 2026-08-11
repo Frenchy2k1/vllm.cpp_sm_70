@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Mutation tests for explicit PR path classes and budgets."""
+"""Mutation tests for explicit PR path classes and the checker contracts.
+
+The per-class line budgets were retired 2026-08-10; the tests that pinned them
+are gone and `test_no_line_budget_is_enforced_for_any_class` pins their absence."""
 
 from __future__ import annotations
 
@@ -14,7 +17,6 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
-# check-pr-size.py imports scripts.waivers; a bare spec load has no repository
 # root on sys.path, so provide it before executing the module.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -83,8 +85,12 @@ class PathClassification(unittest.TestCase):
             ".agents/state-index/2026-08-001.csv": "append_only_record",
             ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
             ".agents/completed/state-migration-manifest.csv": "evidence",
-            "scripts/waivers.py": "governance_support",
             "docs/STATUS.md": "public_document",
+            "website/hugo.toml": "public_document",
+            "website/layouts/_default/baseof.html": "public_document",
+            "website/assets/css/site.css": "public_document",
+            "website/static/fonts/sora-700.woff2": "asset",
+            "website/static/logo.svg": "asset",
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
@@ -189,6 +195,11 @@ class RetiredSurfaces(unittest.TestCase):
             ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
         }
         exact = {
+            # Retired by #281: the waiver registry became a commit-message
+            # argument recorded in git, so these three left the tree together.
+            ".agents/waivers.csv": "policy",
+            "scripts/waivers.py": "governance_support",
+            "tests/scripts/test_waivers.py": "checker_test",
             ".agents/policy.csv": "policy",
             ".agents/policy-cutover": "policy",
             ".agents/state.md": "project_record",
@@ -257,86 +268,35 @@ class BudgetEnforcement(unittest.TestCase):
     def change(self, path: str, lines: int) -> checker.ChangedPath:
         return checker.ChangedPath(path, lines, 0)
 
-    def test_every_class_has_a_finite_positive_budget(self) -> None:
-        self.assertEqual(set(checker.PATH_CLASS_BUDGETS), set(checker.PATH_CLASSES))
-        self.assertTrue(all(0 < value < 10000 for value in checker.PATH_CLASS_BUDGETS.values()))
+    def test_no_line_budget_is_enforced_for_any_class(self) -> None:
+        """Budgets were retired 2026-08-10; size is a review judgement now.
 
-    def test_budget_boundary_passes_and_one_over_fails_on_every_branch(self) -> None:
-        path = "scripts/check-pr-size.py"
-        limit = checker.PATH_CLASS_BUDGETS["governance_checker"]
-        evidence = self.change("tests/scripts/test_check_pr_size.py", 1)
-        self.assertEqual(
-            checker.change_errors([self.change(path, limit), evidence]), []
-        )
-        errors = checker.change_errors([self.change(path, limit + 1), evidence])
-        self.assertTrue(any("governance_checker" in error for error in errors), errors)
+        RED against the previous checker on both halves: it exported a
+        PATH_CLASS_BUDGETS table, and a 100,000-line product change tripped its
+        900-line limit. Either surviving would mean the retirement did not land.
+        """
+        self.assertFalse(hasattr(checker, "PATH_CLASS_BUDGETS"))
+        huge = self.change("src/vllm/model_executor/models/qwen3_5.cpp", 100_000)
+        self.assertEqual(checker.change_errors([huge]), [])
 
-    def test_oversized_policy_and_governance_test_changes_fail(self) -> None:
-        for path, path_class in (
-            (".agents/policy.csv", "policy"),
-            ("tests/scripts/test_policy_contract.py", "governance_test"),
-        ):
-            with self.subTest(path=path):
-                errors = checker.change_errors(
-                    [self.change(path, checker.PATH_CLASS_BUDGETS[path_class] + 1)]
-                )
-                self.assertTrue(errors)
+    def test_retiring_the_budget_did_not_retire_the_other_contracts(self) -> None:
+        """The three rules that share this checker must still bite.
 
-    def test_only_one_exact_pr_waiver_covers_an_over_budget_class(self) -> None:
-        change = self.change(
-            "AGENTS.md", checker.PATH_CLASS_BUDGETS["procedure"] + 1
+        Dropping a size gate is not licence to drop classification, the binary
+        guard, or checker-evidence with it, which is exactly the kind of thing
+        that goes unnoticed when a constant is deleted.
+        """
+        unknown = checker.ChangedPath("no/such/surface.txt", 1, 0)
+        self.assertTrue(checker.change_errors([unknown]))
+        # Asserted on the ERROR, not its wording: this is a regression guard
+        # that must hold on both sides of the retirement, so it must not be
+        # coupled to a message string that the retirement itself reworded.
+        binary = checker.ChangedPath("assets/logo.png", None, None)
+        self.assertTrue(checker.change_errors([binary]))
+        lone_checker = self.change("scripts/check-pr-size.py", 10)
+        self.assertTrue(
+            any("mutation evidence" in e for e in checker.change_errors([lone_checker]))
         )
-        waiver = checker.Waiver(
-            waiver_id="WAIVER-PR-SIZE-001",
-            checker="scripts/check-pr-size.py",
-            scope="pr:128",
-            owner="maintainer",
-            reason="bounded migration",
-            evidence="PR-128",
-            expires="2026-08-15",
-        )
-        self.assertEqual(
-            checker.change_errors(
-                [change], waivers=(waiver,), waiver_scope="pr:128"
-            ),
-            [],
-        )
-        for waived_checker, scope in (
-            ("scripts/check-doc-checkpoint.py", "pr:128"),
-            ("scripts/check-pr-size.py", "pr:129"),
-            ("scripts/check-pr-size.py", ""),
-        ):
-            with self.subTest(checker=waived_checker, scope=scope):
-                wrong = checker.Waiver(
-                    **{**waiver.__dict__, "checker": waived_checker, "scope": scope}
-                )
-                self.assertTrue(
-                    checker.change_errors(
-                        [change], waivers=(wrong,), waiver_scope="pr:128"
-                    )
-                )
-
-        duplicate = checker.Waiver(
-            **{**waiver.__dict__, "waiver_id": "WAIVER-PR-SIZE-002"}
-        )
-        with self.assertRaisesRegex(ValueError, "duplicate applicable waivers"):
-            checker.change_errors(
-                [change],
-                waivers=(waiver, duplicate),
-                waiver_scope="pr:128",
-            )
-
-    def test_repository_pr_166_waiver_is_exact(self) -> None:
-        waivers = checker.load_waivers(ROOT, today=dt.date(2026, 8, 8))
-        applicable = [
-            waiver
-            for waiver in waivers
-            if waiver.checker == "scripts/check-pr-size.py"
-            and waiver.scope == "pr:166"
-        ]
-        self.assertEqual(len(applicable), 1)
-        self.assertEqual(applicable[0].waiver_id, "WAIVER-PR-SIZE-002")
-        self.assertEqual(applicable[0].expires, "2026-08-15")
 
     def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
         errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
@@ -376,6 +336,10 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
             "scripts/check-triton-aot-multiarch.py",
+            # 2026-08-10: the docs-site content guard (#224). A checker created
+            # in the same PR has no BASE version to mutate, so it registers the
+            # disabled form its own tests must reject.
+            "scripts/check-site.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

@@ -216,17 +216,22 @@ EngineCore::step_with_batch_queue() {
         BatchQueueItem{std::move(sampled), std::move(*deferred_scheduler_output)});
   }
 
-  // DIAGNOSTIC (VT_TTFT_DUMP): unlike the synchronous step() (which stamps
-  // scheduler_stats + timestamp at core.py parity above), the batch-queue path
-  // leaves engine_core_outputs.timestamp at 0, so the frontend's TTFT/prefill/
-  // decode intervals (engine_core_timestamp - arrival/last_token) are wrong on
-  // the async serving path. That is the SERVE-RESPONSE-METRICS residual (async
-  // per-request stats are never tracked). Stamp it only under the diagnostic so
-  // the production async path stays byte-AND-instruction-identical when unset.
-  static const bool kStampAsyncTs = std::getenv("VT_TTFT_DUMP") != nullptr;
-  if (kStampAsyncTs) {
-    engine_core_outputs.timestamp = MonotonicSeconds();
-  }
+  // Attach this step's scheduler snapshot + engine-core timestamp, identically
+  // to the synchronous step() above. Upstream stamps BOTH inside the path the
+  // two step functions share — scheduler_stats in Scheduler.update_from_output
+  // (scheduler.py:1938-1951) and timestamp in EngineCoreOutputs.__post_init__
+  // (engine/__init__.py:249-251) — so upstream's step_with_batch_queue
+  // (core.py:622-720) stamps nothing extra precisely because it already has
+  // them.
+  //
+  // Until #277 this path stamped NEITHER: the async-scheduling serving stack
+  // (LoadedEngine resolves max_concurrent_batches=2 whenever the runner
+  // supports it) published a default-constructed SchedulerStats — every gauge
+  // 0 — and a timestamp of 0.0, which turns every TTFT/e2e observation into
+  // `-arrival_time`. The former VT_TTFT_DUMP-only timestamp stamp is subsumed
+  // here; the diagnostic reads exactly the value it always did.
+  engine_core_outputs.scheduler_stats = scheduler_.make_stats();
+  engine_core_outputs.timestamp = MonotonicSeconds();
 
   std::map<int, EngineCoreOutputs> outputs_by_client;
   if (!engine_core_outputs.outputs.empty()) {

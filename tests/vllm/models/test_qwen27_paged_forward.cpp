@@ -495,6 +495,136 @@ TEST_CASE("qwen27 merged qkvz selection requires CUDA, owner, toggle, one dtype"
   }
 }
 
+// PERF-27B-GDN-FP8-QKVZ — the FP8 leaf's dispatch predicate. vLLM issues ONE
+// merged qkvz GEMM per GDN layer on this tower too (the 27B NVFP4 checkpoint is
+// `modelopt_mixed`, so its GDN input projections are FP8 W8A8 and the BF16
+// merged owner is empty). The merged fp8 GEMM quantizes the shared activation
+// ONCE, so a shard pair that does not agree bitwise on `input_scale` MUST stay
+// on the exact two legacy GEMMs. Every term is load-invariant and checked once.
+TEST_CASE("qwen27 merged FP8 qkvz selection requires every guard") {
+  vllm::detail::GdnMergedFp8QkvzEligibility e;
+  e.runtime_enabled = true;
+  e.fp8_platform = true;
+  e.has_fp8_shards = true;
+  e.shared_k = true;
+  e.shared_input_scale = true;
+  e.shard_widths_match = true;
+
+  CHECK(vllm::detail::ShouldUseMergedGdnFp8Qkvz(e));
+
+  {
+    auto x = e;
+    x.runtime_enabled = false;  // VT_GDN_MERGED_QKVZ_FP8=0 (or the BF16 leaf's
+                                // VT_GDN_MERGED_QKVZ=0 / VT_GDN_MERGED_PROJ=0).
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.fp8_platform = false;  // CPU / no fp8 GEMM registered.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.has_fp8_shards = false;  // 27B BF16 merged owner / GGUF / synthetic.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.shared_k = false;  // the two shards do not read one [M,K] activation.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.shared_input_scale = false;  // THE scale-compatibility stop condition.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+  {
+    auto x = e;
+    x.shard_widths_match = false;  // shard N != conv_dim / value_dim.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnFp8Qkvz(x));
+  }
+}
+
+// The load-time scale-compatibility predicate itself. ModelOpt FP8 here is
+// PER-TENSOR: the merged GEMM can only reproduce both split GEMMs when the two
+// shards quantize the activation with the identical scalar, so the comparison is
+// exact float equality — one ulp apart must fall back. This is the same
+// predicate `Fp8SharedInputScale` applies to this pair for the fused
+// RmsNorm+quant, so the two guards cannot drift.
+TEST_CASE("qwen27 GDN fp8 shared input_scale is exact, not approximate") {
+  const auto shard = [](int64_t n, int64_t k, float input_scale,
+                        float weight_scale) {
+    vllm::Fp8Weight w;
+    w.n = n;
+    w.k = k;
+    w.input_scale = input_scale;
+    w.weight_scale = weight_scale;
+    w.alpha = input_scale * weight_scale;
+    w.packed.dtype = DType::kI8;
+    w.packed.rank = 2;
+    w.packed.shape[0] = n;
+    w.packed.shape[1] = k;
+    w.packed.bytes.resize(static_cast<size_t>(n * k));
+    return w;
+  };
+
+  const float base = 0.0078125F;
+  const float one_ulp = std::nextafter(base, 1.0F);
+  REQUIRE(base != one_ulp);
+
+  {
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    g.in_proj_z_fp8 = shard(6144, 5120, base, 0.0005340576F);
+    float scale = 0.0F;
+    CHECK(vllm::detail::GdnFp8SharedInputScale(g, &scale));
+    CHECK(scale == base);
+  }
+  {
+    // One ulp apart: NOT mergeable. The activation each split GEMM quantizes
+    // would differ, so one merged GEMM cannot reproduce both.
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    g.in_proj_z_fp8 = shard(6144, 5120, one_ulp, 0.0005340576F);
+    float scale = -1.0F;
+    CHECK_FALSE(vllm::detail::GdnFp8SharedInputScale(g, &scale));
+    CHECK(scale == -1.0F);  // untouched on rejection.
+  }
+  {
+    // Differing WEIGHT scales are fine — each shard's folded alpha is applied
+    // per output column, so only the activation scale has to agree.
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    g.in_proj_z_fp8 = shard(6144, 5120, base, 0.25F);
+    CHECK(vllm::detail::GdnFp8SharedInputScale(g, nullptr));
+  }
+  {
+    // A non-FP8 owner (27B BF16 merged / GGUF / synthetic) is never mergeable.
+    vllm::GdnLayerWeights g;
+    g.in_proj_qkv_fp8 = shard(10240, 5120, base, 0.0007629395F);
+    CHECK_FALSE(vllm::detail::GdnFp8SharedInputScale(g, nullptr));
+  }
+}
+
+// The merged-FP8 leaf's rollback env truth table, pinned on the CPU tier the
+// same way PackedGdnDecodeEnvSelected is: VT_GDN_MERGED_QKVZ_FP8 is the leaf
+// switch and the BF16 leaf's master/leaf rollbacks also turn it off, so one
+// switch can retire the whole merged-input-projection topology.
+TEST_CASE("qwen27 merged FP8 qkvz env rollback truth table") {
+  using vllm::detail::GdnMergedFp8QkvzEnvConfig;
+  using vllm::detail::MergedGdnFp8QkvzEnvSelected;
+
+  CHECK(MergedGdnFp8QkvzEnvSelected(GdnMergedFp8QkvzEnvConfig{}));  // all unset.
+  CHECK(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{"1", "1", "1"}));
+  CHECK_FALSE(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{"0", nullptr, nullptr}));  // master off.
+  CHECK_FALSE(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{nullptr, "0", nullptr}));  // BF16 leaf off.
+  CHECK_FALSE(MergedGdnFp8QkvzEnvSelected(
+      GdnMergedFp8QkvzEnvConfig{nullptr, nullptr, "0"}));  // FP8 leaf off.
+}
+
 // The 27B gate's packed-dispatch-count contract must agree with the engine's
 // process-cached env couplings: ShouldUsePackedGdnDecode requires
 // merged_ba_enabled (master VT_GDN_MERGED_PROJ + leaf VT_GDN_MERGED_BA) and
@@ -1339,5 +1469,69 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
     MESSAGE("chunked (split tail=" << tail << ") vs one-shot max|diff| = " << d
             << " (must be ~0 — bit-identical state continuity)");
     CHECK(d < 1e-4);
+  }
+}
+
+// PERF-27B-LMHEAD-FP4 (issue #213). The PAGED forward has TWO lm_head call sites
+// — gathered (prefill/mixed) and the non-gathered full [T,vocab] arm — and a
+// PACKED head leaves the bf16 owner EMPTY, so reverting either hands the logits
+// GEMM an empty tensor. test_qwen27_dense_lmhead_fp4 pins the NUMERICS but runs
+// only the EAGER forward; this pins that both PAGED arms SELECT the packed head.
+namespace {
+Nvfp4Weight MakePackedHead(int64_t n, int64_t k, uint64_t seed) {
+  Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.scale2 = 0.125F;  // ModelOpt weight_scale_2 IS the scale
+  w.packed = MakeOwned(DType::kI8, {n, k / 2}, seed);
+  w.scale = MakeOwned(DType::kI8, {n, k / 16}, seed + 1);
+  // fp4 operands are RAW bytes, and MakeOwned has no kI8 arm — its f32 branch
+  // over-allocates 4 B/element — so size and fill them exactly here.
+  w.packed.bytes.resize(static_cast<size_t>(n) * static_cast<size_t>(k / 2));
+  w.scale.bytes.resize(static_cast<size_t>(n) * static_cast<size_t>(k / 16));
+  auto* pb = w.packed.bytes.data();
+  for (size_t i = 0; i < w.packed.bytes.size(); ++i)
+    pb[i] = static_cast<uint8_t>((i * 37U + 11U) & 0x77U);
+  const uint8_t kE4M3PowersOfTwo[4] = {0x34, 0x38, 0x3C, 0x40};  // .25 .5 1 2
+  auto* sb = w.scale.bytes.data();
+  for (size_t i = 0; i < w.scale.bytes.size(); ++i)
+    sb[i] = kE4M3PowersOfTwo[i & 3U];
+  return w;
+}
+}  // namespace
+
+TEST_CASE("qwen27 dense paged: both lm_head arms run a PACKED NVFP4 head") {
+  const HfConfig c = MakeConfig();
+  const int64_t T = 5, V = c.vocab_size;
+  Qwen3_5DenseWeights w = MakeWeights(c);
+  w.lm_head_fp4 = MakePackedHead(V, c.hidden_size, 4242);
+
+  const std::vector<int32_t> ids{3, 11, 7, 20, 5}, pos{0, 1, 2, 3, 4};
+  vt::Queue q = Q();
+  const std::vector<float> eager =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, c, q);
+  REQUIRE(eager.size() == static_cast<size_t>(T * V));
+
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+
+  // Non-gathered arm: empty logits_indices -> the full [T, vocab].
+  {
+    CachePool pool(c, 4, 8);
+    const std::vector<float> full = Qwen3_5DenseModel::Forward(
+        ids, pos, am, gm, pool.attn_kv, pool.gdn_state, w, c, q, {});
+    REQUIRE(full.size() == eager.size());
+    CHECK(MaxAbsDiff(full, eager, full.size()) < 1e-3);
+  }
+  // Gathered arm: the prefill shape the engine actually runs -> [1, vocab].
+  {
+    CachePool pool(c, 4, 8);
+    const std::vector<float> got =
+        Qwen3_5DenseModel::Forward(ids, pos, am, gm, pool.attn_kv,
+                                   pool.gdn_state, w, c, q,
+                                   {static_cast<int32_t>(T - 1)});
+    REQUIRE(got.size() == static_cast<size_t>(V));
+    const std::vector<float> tail(eager.end() - V, eager.end());
+    CHECK(MaxAbsDiff(got, tail, got.size()) < 1e-3);
   }
 }

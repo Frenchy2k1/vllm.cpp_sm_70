@@ -194,7 +194,7 @@ class PromptContractTests(unittest.TestCase):
             "changed_files",
             "commands_and_exit_status",
             "negative_mutation",
-            "deviations_and_waivers",
+            "deviations",
             "risks",
             "omitted_gates",
             "commit_sha",
