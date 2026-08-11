@@ -2,7 +2,7 @@
 // Generator:  tools/gen_unicode_data.py
 // Regenerate: python3 tools/gen_unicode_data.py
 // Unicode data version (Python unicodedata.unidata_version): 15.0.0
-// Category ranges: 1563; whitespace ranges: 10.
+// Category ranges: 1563; whitespace ranges: 10; letter-sub ranges: 1861.
 // Semantics mirror HF tokenizers byte-level BPE: categories are the major
 // Unicode general-category classes (unassigned -> kOther); IsWhitespace is
 // python str.isspace().
@@ -28,6 +28,21 @@ enum class UCat : uint8_t {
 };
 
 UCat Category(uint32_t cp);
+
+// MINOR letter class. Category(cp) == UCat::kLetter is exactly
+// LetterSub(cp) != ULetterSub::kNotLetter; this splits that set three ways.
+// Needed only by the GPT-4o / o200k split regex, whose two letter classes are
+//   A = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]   (kLuLt, kLmLo, plus UCat::kMark)
+//   B = [\p{Ll}\p{Lm}\p{Lo}\p{M}]          (kLl,   kLmLo, plus UCat::kMark)
+// Lu/Lt and Lm/Lo are never separated by that regex, hence three classes.
+enum class ULetterSub : uint8_t {
+  kNotLetter = 0,
+  kLl = 1,    // \p{Ll}
+  kLuLt = 2,  // \p{Lu} | \p{Lt}
+  kLmLo = 3,  // \p{Lm} | \p{Lo}
+};
+
+ULetterSub LetterSub(uint32_t cp);
 
 // python str.isspace() semantics (per HF byte-level pretokenization):
 // includes 0x1C-0x1F, NEL (0x85) and NBSP (0xA0); excludes ZWSP (0x200B),
