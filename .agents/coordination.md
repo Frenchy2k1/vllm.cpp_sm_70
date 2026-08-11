@@ -1622,17 +1622,25 @@ with a lifecycle state of its own. Scope: the five gate-up folds in
 `src/vllm/model_executor/models/{commandr,glm4,minicpm,minicpm3,phi3}.cpp`, the five
 removed entries in `scripts/merged-gemm-consistency-allowlist.txt`, one byte-exact
 case in `tests/vllm/model_executor/layers/test_linear_method.cpp`, two regression
-cases in `tests/scripts/test_check_fusion_consistency.py`, the roadmap issue-table row
-for #299, the `KERNEL-FUSION-FRAMEWORK` evidence prose, the `ROAD-V1-C1` tail lines in
-`specs/roadmap-v1-completion.md`, `docs/FEATURES.md`, the parity-ledger line, and this
-note. Plus one correction this row creates the need for: the `glm4`/`phi3` reasons on
+cases in `tests/scripts/test_check_fusion_consistency.py`, NEW
+`tests/vllm/models/test_dense_gate_up_seam_forward.cpp` + its two `tests/CMakeLists.txt`
+lines (the executed CPU coverage of the folded TUs, added on review finding F4), the
+roadmap issue-table rows for #299/#337/#338, the `KERNEL-FUSION-FRAMEWORK` evidence
+prose, the `ROAD-V1-C1` tail lines in `specs/roadmap-v1-completion.md`,
+`docs/FEATURES.md`, the parity-ledger line, and this note. Plus one correction this row creates the need for: the `glm4`/`phi3` reasons on
 the OTHER (glue) allowlist `scripts/fusion-consistency-allowlist.txt` read `pending
 FUSION-DENSE-MIGRATE`, which closing this row would leave pointing at closed work, so
 they are repointed at the new issue #314 and its roadmap intake row. The glue FOLD
 itself is NOT done here. **NON-COLLISION:** touches NO shared layer (`linear.h`/
-`nvfp4.h` untouched), NO `vt::` op, NO CMake, NO checker SCRIPT (only two allowlist
-DATA files), and no Group-B allowlist entry. CPU-only; the five dgx paged-engine
-SACRED gates SKIP here and are recorded as OWED.
+`nvfp4.h` untouched), NO `vt::` op, NO checker SCRIPT (only two allowlist DATA
+files), and no `src/`/`include/` file beyond the five folds. The only CMake edit is
+two additive `tests/CMakeLists.txt` lines registering the new test binary. CPU-only;
+the five dgx paged-engine SACRED gates SKIP here and are recorded as OWED, tracked by
+#337. Two Group-B allowlist REASONS (`gemma4_moe`, `laguna`) were rewritten in place
+on review finding F2 — they claimed a shared-layer blocker and stated none; their
+STEMS are untouched, so no model's allowlist status moves. Found while reviewing and
+NOT fixed here, its own issue: #338 (MiniCPM/MiniCPM3 hard-code SiLU where upstream
+`MiniCPMMLP` selects `FatreluAndMul` on `hidden_act == "fatrelu"`).
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|

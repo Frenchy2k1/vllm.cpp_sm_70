@@ -151,6 +151,19 @@ and (c) is NOT on `scripts/merged-gemm-consistency-allowlist.txt` — so re-allo
 a folded model, or reverting a fold, goes RED instead of silently re-opening the
 drift the allowlist was emptied of.
 
+Added after review (finding F4 — there was NO executed coverage of the change
+surface, proven by mutating `phi3`'s `I` to `I - 1` at the call site and watching it
+survive 176 CPU tests): `tests/vllm/models/test_dense_gate_up_seam_forward.cpp`
+drives the REAL forward of four of the five folded TUs (`commandr`, `glm4`,
+`minicpm`, `phi3`) over synthetic in-memory weights on CPU — no checkpoint, no GPU —
+and pins the gate/up split analytically rather than against a golden. The review
+also rejected this row's original "no e2e evidence is possible on a CPU box" framing
+as too strong: *oracle* evidence needs the GPU, *self-consistency* evidence does
+not. `minicpm3` is the folded TU this harness does not drive: its MLA attention plus
+the load-time `kv_b_proj` -> W_UK/W_UV absorption belong to the DeepSeek-V2 synthetic
+harness, not the dense one, and it shares the identical `Qwen3DenseMlpWeights` call
+shape with `minicpm` and `phi3`, both covered.
+
 ## Gates
 
 CPU-only (no GPU available to this claim), foreground:
@@ -162,6 +175,7 @@ cmake --build build-cpu -j 18
 python3 scripts/check-fusion-consistency.py       # 0 drift; allowlist 11 -> 6 entries
 python3 -m unittest tests.scripts.test_check_fusion_consistency -v
 ./build-cpu/tests/test_linear_method               # the seam byte-exactness gate
+./build-cpu/tests/test_dense_gate_up_seam_forward # the folded TUs, really executed
 ctest --test-dir build-cpu -j 6 --output-on-failure
 ```
 
@@ -179,7 +193,8 @@ the op sequence, not a tolerance):
 Dgx-only paged-engine gates (`test_{commandr,glm4,minicpm,minicpm3,phi3}_paged_engine`)
 are the SACRED token-exact bar for these archs; they emit a loud SKIP on a CPU box.
 Running them is OWED to whoever next holds the GPU and is recorded as PENDING, not as
-passed.
+passed — tracked by [#337](https://github.com/mudler/vllm.cpp/issues/337), so the
+handle outlives #299 rather than living only in this prose.
 
 ## Dependencies
 
@@ -277,17 +292,34 @@ restored byte-for-byte (`md5sum` verified against the pre-mutation digest):
 2. `phi3` re-added to the merged-GEMM allowlist: `test_check_fusion_consistency`
    20/20 -> 2 failures (`test_folded_dense_models_stay_folded`,
    `test_refolded_model_reappearing_unfolded_would_fail`).
-3. The `phi3` fold reverted to its pre-fold five statements: the CHECKER ITSELF goes
+3. The `phi3` fold reverted **as a whole hunk** — the five pre-fold statements
+   restored AND the explanatory comment (which names
+   `layers::UnquantizedMlpGateUpMethod`) removed with them: the CHECKER ITSELF goes
    RC=1 naming `phi3.cpp (1 gated-MLP epilogue hand-call site(s))`, and the unit
-   suite drops 2. So a revert is caught by the shipped gate, not only by the test.
+   suite drops 2. **The scope of that claim, corrected after review:** a CODE-ONLY
+   revert that leaves the comment in place leaves the shipped checker at **RC=0**
+   with 1 unit failure, because `_MERGED_GEMM_SEAM` matches the seam token anywhere
+   in the file, comments included, and the fold added that token to each TU's
+   comment (e.g. `phi3.cpp:49`). Verified by executing both reverts. That is the
+   detector working as documented — its docstring calls the seam token's presence
+   in the file the adoption signal, precisely so a rollback hand-call in an `else`
+   branch still reads as adopted — so the checker was NOT changed to make the
+   stronger claim true; the claim was narrowed to what was actually run. The
+   realistic regression (an entry coming back onto the allowlist) is caught by the
+   unit suite's `assertNotIn(stem, scanned)` guard either way.
 
 **Two honest limits on the token-exactness claim.**
 
-- *No end-to-end token evidence exists on this box.* Each folded arch's SACRED gate
-  is `tests/parity/test_<arch>_paged_engine.cpp`, checkpoint-gated and dgx-only; all
+- *No ORACLE token evidence exists on this box* (narrowed after review: the original
+  wording said no end-to-end evidence was possible on a CPU box at all, which is too
+  strong — oracle evidence needs the GPU, self-consistency evidence does not, and
+  `test_dense_gate_up_seam_forward` now supplies the latter for four of the five
+  folded TUs). Each folded arch's SACRED gate is
+  `tests/parity/test_<arch>_paged_engine.cpp`, checkpoint-gated and dgx-only; all
   five run here as a loud SKIP (1 case, **0 assertions**). Running them is OWED to
-  the next GPU holder and is recorded as PENDING, never as passed. The proof that
-  stands in the meantime is op-sequence identity: each replaced body WAS the seam's
+  the next GPU holder ([#337](https://github.com/mudler/vllm.cpp/issues/337)) and is
+  recorded as PENDING, never as passed. The proof that stands in the meantime is
+  op-sequence identity: each replaced body WAS the seam's
   own `{ResidentWeight; MatmulBT[2I,H]; SiluAndMul}` with `M` spelled `T`, and all
   five call sites pass a `DBuf{T,H}` (`commandr.cpp:158`, `glm4.cpp:185`,
   `minicpm.cpp:180`, `minicpm3.cpp:208`, `phi3.cpp:147`) so `x.shape[0] == T`
@@ -323,3 +355,56 @@ left both pointing at closed work — the stale-`pending` shape that let this al
 grow to hold most of its population. Both reasons are repointed at
 [#314](https://github.com/mudler/vllm.cpp/issues/314), which owns the glue half. The
 glue fold itself is NOT done here.
+
+## Review findings repaired (2026-08-11)
+
+An independent review returned **PASS with 5 MINOR findings**. The routing change
+itself was not touched — it is byte-identical by construction and was verified per
+model. What changed:
+
+| # | Finding | Repair |
+|---|---|---|
+| F1 | The RED-first claim overstated its scope: only a **comment-inclusive** revert turns the shipped checker RC=1. | Claim narrowed to what was executed, with the code-only result stated. Checker semantics deliberately NOT changed — that would need its own spec, and the detector's documented adoption signal is the token's presence in the FILE. |
+| F2 | The allowlist claimed every survivor "names a blocker that needs the SHARED LAYER extended"; `gemma4_moe` and `laguna` did not. | Both reasons REWRITTEN with the actual missing arm (a GeGLU arm on the SwiGLU-only grouped MoE op; an NVFP4-Marlin-resident arm for weights held as raw device pointers), and the allowlist header now says a bare `pending <ROW>` is not a reason. Echoes in `parity-ledger.md` and `kernel-matrix.md` follow. |
+| F3 | `docs/FEATURES.md` said `check-fusion-consistency.py` "lists the rest with their blocker". The script lists nothing. | Cites `scripts/merged-gemm-consistency-allowlist.txt`, which is where the blockers live. |
+| F4 | **No executed coverage of the change surface** — mutating `phi3`'s `I` to `I - 1` survived 176 CPU tests. | New `tests/vllm/models/test_dense_gate_up_seam_forward.cpp` (below). |
+| F5 | `Closes #299` left the five owed dgx SACRED runs with no tracking handle. | [#337](https://github.com/mudler/vllm.cpp/issues/337) opened and cited from the ledger line, this spec and the PR body. |
+
+Also opened, NOT fixed here (pre-existing on both sides of the fold, its own issue
+per AGENTS.md): [#338](https://github.com/mudler/vllm.cpp/issues/338) —
+`minicpm.cpp`/`minicpm3.cpp` hard-code SiLU while upstream `MiniCPMMLP`
+(`minicpm.py:219-226`) selects `FatreluAndMul` on `hidden_act == "fatrelu"` and
+RAISES otherwise; our `parse_config` hook never reads `hidden_act`, so such a
+checkpoint would decode fluent-wrong rather than fail to load.
+
+### F4: what the new test proves, and how that was verified
+
+`test_dense_gate_up_seam_forward` drives the real `{MiniCPM,Phi3,Glm4,Commandr}Model::Forward`
+over synthetic in-memory weights on CPU (no checkpoint, no GPU), four arms per model:
+
+- **The split.** Zeroing the UP half of the merged `[2I, H]` gate_up makes
+  `silu(gate)·up` exactly zero; zeroing `down_proj` makes the MLP contribute zero a
+  different way. Both must give BYTE-IDENTICAL logits — which holds only if the seam
+  splits the merged operand at exactly `I`.
+- **The half order.** Swapping the two halves must CHANGE the logits, since
+  `silu(gate)·up != silu(up)·gate`.
+- **Vacuity guard.** baseline != MLP-disabled, so the split assertion is not two
+  zeros compared to each other.
+- **Determinism.** The same weights twice are byte-identical.
+
+Green: **4 cases / 1940 assertions**. Both mutations executed, each restored
+byte-for-byte (`md5sum` verified):
+
+1. `I` -> `I - 1` at ALL FOUR call sites simultaneously: **all four cases fail**, each
+   with `vt: matmul_bt: output shape mismatch` — i.e. every one of the four folded TUs
+   is genuinely reached by this binary. Mutating `phi3` alone gives 3 passed / 1
+   failed, so the cases are independent. Stated plainly: this mutation is caught by a
+   SHAPE contract inside `vt::MatmulBT`, not by the numeric assertion — the point is
+   that before this file nothing executed those TUs on CPU at all, so that contract
+   never ran.
+2. A SHAPE-PRESERVING mutation of the shared epilogue (`vt::SiluAndMul`'s CPU kernel,
+   `silu * up` -> `silu + up`): **all four cases fail on `CHECK(Same(zero_up, zero_down))`**
+   — the split assertion itself — while `test_linear_method` stays fully GREEN at
+   **76/76**, because that test compares the seam against a standalone sequence which
+   calls the SAME op. So the new coverage catches a defect class the PR's existing new
+   test structurally cannot.

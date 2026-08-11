@@ -87,8 +87,9 @@ checkpoint it was gated against and the verdict; caveats are in
 [STATUS.md](STATUS.md), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
 once reaches every such arch; Command-R, GLM-4, MiniCPM, MiniCPM3 and Phi-3
-joined that set on 2026-08-10 (#299), and `scripts/check-fusion-consistency.py`
-lists the rest with their blocker.
+joined on 2026-08-10 (#299), and
+`scripts/merged-gemm-consistency-allowlist.txt` lists the rest with their
+blocker.
 
 Gate words: **strict** is token-for-token identical to the vLLM oracle;
 **near-tie** is the ratified distributional gate used where vLLM's own greedy is
