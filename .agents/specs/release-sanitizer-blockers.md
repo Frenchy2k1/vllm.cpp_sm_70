@@ -225,8 +225,12 @@ immutable review and the operator's post-review gate remain pending.
   IDs, flat extraction, exact inventory, attestation, and publication remain
   unchanged. Fresh mutation review proved that global fragment counts could be
   compensated by changing an unrelated download; the checker now binds each
-  exact artifact ID, job, step, and upload to its declared root. A checkout
-  `favicon.png` in the handoff root is still rejected.
+  exact artifact ID, job, step, and upload to its declared root. A second fresh
+  mutation review proved that raw named-step fragments could still be supplied
+  by comments or inert shell strings. Consumer validation now parses executable
+  commands and continuations in the exact named step, binds a unique command's
+  complete option map, and fails closed on malformed or duplicate commands and
+  options. A checkout `favicon.png` in the handoff root is still rejected.
 - Address+undefined sanitizer replay passed all six executables that failed in
   CI; the complete direct-upload target passed 14 cases / 183 assertions after
   the extra transpose repair. ThreadSanitizer passed the detach regression and
@@ -234,5 +238,6 @@ immutable review and the operator's post-review gate remain pending.
   `setarch x86_64 -R` to avoid this host's pre-main GCC TSan mapping failure.
   The non-sanitized focused suite passed all four targets. The post-review
   Laguna replay passed 4 cases / 63 assertions under combined address and
-  undefined sanitizers, and the release pipeline suite passed all 20 tests,
-  including the cross-download compensation mutation.
+  undefined sanitizers, and the release pipeline suite passed all 23 tests,
+  including cross-download, inert-shell-text, duplicate-binding, and direct
+  `gh release` bypass mutations.

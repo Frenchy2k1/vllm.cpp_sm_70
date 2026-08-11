@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -105,9 +106,111 @@ def upload_is_bound(block: str, artifact_name: str, paths: list[str]) -> bool:
     return len(matches) == 1 and mapping_paths(matches[0]) == paths
 
 
-def step_has_fragments(block: str, name: str, fragments: tuple[str, ...]) -> bool:
+def step_run_script(step: str) -> str | None:
+    lines = step.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "        run: |"]
+    if len(starts) != 1:
+        return None
+    script: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        if re.match(r"^        \S", line):
+            break
+        if line and not line.startswith("          "):
+            return None
+        script.append(line[10:] if line else "")
+    return "\n".join(script)
+
+
+def shell_commands(step: str) -> list[list[str]] | None:
+    script = step_run_script(step)
+    if script is None:
+        return None
+    logical: list[str] = []
+    current: list[str] = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if current:
+                logical.append(" ".join(current))
+                current = []
+            continue
+        continued = stripped.endswith("\\")
+        current.append(stripped[:-1].rstrip() if continued else stripped)
+        if not continued:
+            logical.append(" ".join(current))
+            current = []
+    if current:
+        return None
+
+    commands: list[list[str]] = []
+    try:
+        for command in logical:
+            lexer = shlex.shlex(
+                command, posix=True, punctuation_chars=";&|<>()"
+            )
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            commands.append(list(lexer))
+    except ValueError:
+        return None
+    return commands
+
+
+def step_command_is_bound(
+    block: str,
+    name: str,
+    prefix: tuple[str, ...],
+    expected_options: dict[str, str],
+) -> bool:
     step = named_step(block, name)
-    return step is not None and all(fragment in step for fragment in fragments)
+    commands = shell_commands(step) if step is not None else None
+    if commands is None:
+        return False
+    matches = [command for command in commands if command[: len(prefix)] == list(prefix)]
+    if len(matches) != 1:
+        return False
+    arguments = matches[0][len(prefix) :]
+    if len(arguments) % 2 != 0:
+        return False
+    options: dict[str, str] = {}
+    for index in range(0, len(arguments), 2):
+        option, value = arguments[index : index + 2]
+        if not option.startswith("--") or option in options:
+            return False
+        options[option] = value
+    return options == expected_options
+
+
+def step_has_exact_command(
+    block: str, name: str, expected: tuple[str, ...]
+) -> bool:
+    step = named_step(block, name)
+    commands = shell_commands(step) if step is not None else None
+    return commands is not None and commands.count(list(expected)) == 1
+
+
+def action_input_is_bound(
+    block: str, name: str, action: str, key: str, value: str
+) -> bool:
+    step = named_step(block, name)
+    return (
+        step is not None
+        and re.search(rf"(?m)^        uses: {re.escape(action)}$", step)
+        is not None
+        and mapping_value(step, "with", key) == value
+    )
+
+
+def job_has_shell_command(block: str, prefix: tuple[str, ...]) -> bool:
+    for step in workflow_steps(block):
+        if "        run: |" not in step:
+            continue
+        commands = shell_commands(step)
+        if commands is None:
+            return True
+        if any(command[: len(prefix)] == list(prefix) for command in commands):
+            return True
+    return False
 
 
 def validate(text: str) -> list[str]:
@@ -215,11 +318,9 @@ def validate(text: str) -> list[str]:
         errors.append("publish job must check out the exact tagged publisher implementation")
     if tag_gate not in publish or "needs.plan.outputs.publish == 'true'" not in publish:
         errors.append("publish job must require an exact tag and approved publish plan")
-    if "scripts/release_pipeline.py publish" not in publish:
-        errors.append("publish job must use the byte-bound release publisher")
-    if "verified/release-assets" not in publish or "verified/release-index.json" not in publish:
-        errors.append("publish job must release verified assets and generated indexes")
-    if "gh release create" in publish:
+    if job_has_shell_command(
+        publish, ("gh", "release", "create")
+    ) or job_has_shell_command(publish, ("gh", "release", "upload")):
         errors.append("release workflow must not bypass the byte-bound publisher")
 
     required_handoff = (
@@ -231,7 +332,6 @@ def validate(text: str) -> list[str]:
         "artifact-ids: ${{ needs.verify.outputs.artifact_id }}",
         "overwrite: false",
         "if-no-files-found: error",
-        "python3 scripts/release_index.py",
     )
     for fragment in required_handoff:
         if fragment not in text:
@@ -244,16 +344,31 @@ def validate(text: str) -> list[str]:
     verified_artifact = "${{ needs.verify.outputs.artifact_id }}"
     verify = blocks["verify"]
     root_contracts = (
+        step_command_is_bound(
+            blocks["plan"],
+            "Compute an explicit dry-run or exact-tag plan",
+            ("python3", "scripts/release_pipeline.py", "plan"),
+            {
+                "--event": "${{ github.event_name }}",
+                "--ref": "${{ github.ref }}",
+                "--sha": "${{ github.sha }}",
+                "--version": "$version",
+                "--matrix": "release/release-matrix.json",
+                "--output": "release-plan.json",
+                "--github-output": "$GITHUB_OUTPUT",
+            },
+        ),
         download_is_bound(build, plan_artifact, "plan"),
         download_is_bound(build, primary_artifacts, "release-assets"),
-        step_has_fragments(
+        step_command_is_bound(
             build,
             "Produce the byte-bound release handoff",
-            (
-                "--plan plan/release-plan.json",
-                "--assets-dir release-assets",
-                "--output release-handoff.json",
-            ),
+            ("python3", "scripts/release_pipeline.py", "handoff"),
+            {
+                "--plan": "plan/release-plan.json",
+                "--assets-dir": "release-assets",
+                "--output": "release-handoff.json",
+            },
         ),
         upload_is_bound(
             build,
@@ -264,46 +379,58 @@ def validate(text: str) -> list[str]:
         download_is_bound(
             verify, "${{ needs.build.outputs.artifact_id }}", "unverified"
         ),
-        step_has_fragments(
+        step_has_exact_command(
             verify,
             "Verify handoff against plan and workflow SHA",
-            (
-                "cp -a unverified/release-assets verified/release-assets",
-                "--plan plan/release-plan.json",
-                "--handoff unverified/release-handoff.json",
-                "--assets-dir verified/release-assets",
-                "--output verified/verified-handoff.json",
-            ),
+            ("cp", "-a", "unverified/release-assets", "verified/release-assets"),
         ),
-        step_has_fragments(
+        step_command_is_bound(
+            verify,
+            "Verify handoff against plan and workflow SHA",
+            ("python3", "scripts/release_pipeline.py", "verify"),
+            {
+                "--plan": "plan/release-plan.json",
+                "--handoff": "unverified/release-handoff.json",
+                "--assets-dir": "verified/release-assets",
+                "--output": "verified/verified-handoff.json",
+                "--sha": "${{ github.sha }}",
+            },
+        ),
+        step_command_is_bound(
             verify,
             "Generate byte-derived release indexes",
-            (
-                "--assets-dir verified/release-assets",
-                "--handoff verified/verified-handoff.json",
-                "--json-output verified/release-index.json",
-                "--markdown-output verified/RELEASE_INDEX.md",
-            ),
+            ("python3", "scripts/release_index.py"),
+            {
+                "--assets-dir": "verified/release-assets",
+                "--handoff": "verified/verified-handoff.json",
+                "--json-output": "verified/release-index.json",
+                "--markdown-output": "verified/RELEASE_INDEX.md",
+                "--retention-days": "7",
+            },
         ),
         upload_is_bound(
             verify, "release-verified-${{ github.sha }}", ["verified"]
         ),
         download_is_bound(attest, verified_artifact, "verified"),
-        step_has_fragments(
+        action_input_is_bound(
             attest,
             "Attest verified bytes",
-            ("subject-path: verified/release-assets/**",),
+            "actions/attest@v4",
+            "subject-path",
+            "verified/release-assets/**",
         ),
         download_is_bound(publish, verified_artifact, "verified"),
-        step_has_fragments(
+        step_command_is_bound(
             publish,
             "Publish the exact verified release assets",
-            (
-                "--handoff verified/verified-handoff.json",
-                "--assets-dir verified/release-assets",
-                "--index-json verified/release-index.json",
-                "--index-markdown verified/RELEASE_INDEX.md",
-            ),
+            ("python3", "scripts/release_pipeline.py", "publish"),
+            {
+                "--handoff": "verified/verified-handoff.json",
+                "--assets-dir": "verified/release-assets",
+                "--index-json": "verified/release-index.json",
+                "--index-markdown": "verified/RELEASE_INDEX.md",
+                "--tag": "$tag",
+            },
         ),
     )
     if not all(root_contracts):
@@ -336,8 +463,6 @@ def validate(text: str) -> list[str]:
         errors.append("every artifact download must flatten into its declared path")
     if re.search(r"(?m)^\s+path:\s*[^\n]*[*?]", text):
         errors.append("release workflow artifact paths must not use wildcards")
-    if re.search(r"gh release (?:create|upload)[^\n]*[*?]", text):
-        errors.append("publish command must enumerate release assets without wildcards")
     return errors
 
 

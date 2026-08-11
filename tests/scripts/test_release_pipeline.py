@@ -377,6 +377,124 @@ class ReleasePipelineContract(unittest.TestCase):
             self.checker.validate(mutant),
         )
 
+    def test_publish_asset_root_cannot_be_compensated_by_an_inert_comment(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        publish_command = (
+            "          python3 scripts/release_pipeline.py publish \\\n"
+            "            --handoff verified/verified-handoff.json \\\n"
+            "            --assets-dir verified/release-assets \\\n"
+            "            --index-json verified/release-index.json \\\n"
+            "            --index-markdown verified/RELEASE_INDEX.md \\\n"
+            '            --tag "$tag"'
+        )
+        self.assertIn(publish_command, original)
+        mutant = original.replace(
+            publish_command,
+            publish_command.replace(
+                "            --assets-dir verified/release-assets \\",
+                "            # Inert compensation: --assets-dir verified/release-assets\n"
+                "            --assets-dir verified/assets \\",
+            ),
+            1,
+        )
+        self.assertIn(
+            "release workflow must bind each handoff stage to its declared root",
+            self.checker.validate(mutant),
+        )
+
+    def test_publish_binding_ignores_inert_shell_text_and_duplicates(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        publish_command = (
+            "          python3 scripts/release_pipeline.py publish \\\n"
+            "            --handoff verified/verified-handoff.json \\\n"
+            "            --assets-dir verified/release-assets \\\n"
+            "            --index-json verified/release-index.json \\\n"
+            "            --index-markdown verified/RELEASE_INDEX.md \\\n"
+            '            --tag "$tag"'
+        )
+        good_option = "            --assets-dir verified/release-assets \\"
+        bad_option = "            --assets-dir verified/assets \\"
+        wrong_publish = publish_command.replace(good_option, bad_option)
+        plan_command = "          python3 scripts/release_pipeline.py plan \\"
+        self.assertIn(publish_command, original)
+        self.assertIn(plan_command, original)
+
+        mutants = {
+            "inline comment": original.replace(
+                publish_command,
+                publish_command.replace(
+                    good_option,
+                    "            --assets-dir verified/assets"
+                    " # --assets-dir verified/release-assets",
+                ),
+                1,
+            ),
+            "echo": original.replace(
+                publish_command,
+                wrong_publish
+                + '\n          echo "--assets-dir verified/release-assets"',
+                1,
+            ),
+            "quoted assignment": original.replace(
+                publish_command,
+                wrong_publish
+                + "\n          note='--assets-dir verified/release-assets'",
+                1,
+            ),
+            "unrelated command": original.replace(
+                publish_command,
+                wrong_publish
+                + "\n          python3 scripts/other.py"
+                " --assets-dir verified/release-assets",
+                1,
+            ),
+            "duplicate option": original.replace(
+                publish_command,
+                publish_command.replace(
+                    good_option, good_option + "\n" + bad_option
+                ),
+                1,
+            ),
+            "duplicate publisher": original.replace(
+                publish_command, publish_command + "\n" + publish_command, 1
+            ),
+            "plan step": original.replace(
+                publish_command, wrong_publish, 1
+            ).replace(
+                plan_command, publish_command + "\n" + plan_command, 1
+            ),
+        }
+        for attack, mutant in mutants.items():
+            with self.subTest(attack=attack):
+                self.assertIn(
+                    "release workflow must bind each handoff stage to its declared root",
+                    self.checker.validate(mutant),
+                )
+
+    def test_gh_release_bypass_check_only_matches_executable_commands(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        anchor = '            --tag "$tag"'
+        self.assertIn(anchor, original)
+        for inert in (
+            "          # gh release create --notes harmless",
+            '          echo "gh release upload --clobber harmless"',
+            "          note='gh release create harmless'",
+        ):
+            with self.subTest(inert=inert):
+                mutant = original.replace(anchor, anchor + "\n" + inert, 1)
+                self.assertEqual(self.checker.validate(mutant), [])
+
+        for command in (
+            '          gh release create "$tag" verified/release-index.json',
+            '          gh release upload "$tag" verified/release-index.json',
+        ):
+            with self.subTest(command=command):
+                mutant = original.replace(anchor, anchor + "\n" + command, 1)
+                self.assertIn(
+                    "release workflow must not bypass the byte-bound publisher",
+                    self.checker.validate(mutant),
+                )
+
     def test_flat_extraction_cannot_be_compensated_by_an_upload(self) -> None:
         original = WORKFLOW.read_text(encoding="utf-8")
         mutant = original.replace(
