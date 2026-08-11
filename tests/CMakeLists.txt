@@ -74,6 +74,24 @@ vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
+# PERF-27B-DENSE-MARLIN-GATEUP (#365): the pre-kernel DECISIONS that route the
+# 27B's dense W4A16 MLP through the fused Marlin gate_up pair. CPU-only by
+# construction — the fused GEMM itself is CUDA + VT_MARLIN_NVFP4.
+vllm_cpp_add_test(test_dense_gateup_fused_marlin
+  vllm/models/test_dense_gateup_fused_marlin.cpp)
+# Each of the three levers the composed guard ANDs is read ONCE per process into
+# a function-local static, so a single run can only ever observe one value of
+# each and a deleted / hardwired / misspelled term stays green (fresh-review
+# findings F1/F2). Re-run the SAME binary with each lever forced to 0: the
+# "EVERY lever term is load-bearing" case then asserts the guard reads OFF, which
+# is the assertion a dropped term fails.
+foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
+  string(TOLOWER "${_gateup_lever}" _gateup_lever_lc)
+  add_test(NAME test_dense_gateup_fused_marlin_off_${_gateup_lever_lc}
+    COMMAND test_dense_gateup_fused_marlin)
+  set_tests_properties(test_dense_gateup_fused_marlin_off_${_gateup_lever_lc}
+    PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
+endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
@@ -211,6 +229,13 @@ target_include_directories(test_muse_glimmer_vision PRIVATE
 # the output multiplier and the soft-cap). CPU-only, no checkpoint. No speed axis
 # exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
 vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
+# The DFlash drafter's RELEASED config.json, committed verbatim. It is the only
+# real artifact that OMITS qk_scale_factor / post_norm_eps / output_multiplier /
+# final_logit_softcapping, so it is what pins their defaults to the architecture's
+# constants rather than to neutral values (issue #412). Committed, not read off
+# the NAS, so the gate is asset-free.
+target_compile_definitions(test_muse_glimmer_text PRIVATE
+  MUSE_GLIMMER_DRAFT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b_assistant")
 # ...and the SAME gate on the HAND-CALL arm. `FusedChainAdoptEnabled()` defaults ON
 # and is read once per process into a function-local static, so the three
 # `else vt::RmsNorm(...)` fallbacks in muse_glimmer.cpp (input layernorm,

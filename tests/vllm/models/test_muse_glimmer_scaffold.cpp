@@ -229,9 +229,22 @@ TEST_CASE("MuseGlimmer: the query pre-scale agrees across BOTH config schemas") 
   // An explicit scale_query_by is already final and wins outright.
   CHECK(ResolveMuseGlimmerQueryPreScale(43.784, true, 2.5, true, head_dim) ==
         doctest::Approx(2.5));
-  // No scale info at all degrades to the identity, not to 0.
+
+  // ── ABSENT is NOT "no scaling" (issue #412) ────────────────────────────────
+  // `qk_scale_factor` is a class default in BOTH references, not a required key:
+  // configs/muse_glimmer.py:62 and SGLang srt/configs/muse_glimmer.py:98 both ship
+  // 43.7840518911, which folds to EXACTLY 3.87 at the released head_dim 128
+  // (11.31370849898476 * 3.87 = 43.7840518911). The DFlash drafter's released
+  // config.json omits the key, so the identity here would run its queries ~3.87x
+  // too small with `use_qk_norm` still on — coherent text, collapsed acceptance.
   CHECK(ResolveMuseGlimmerQueryPreScale(0.0, false, 0.0, false, head_dim) ==
+        doctest::Approx(3.87).epsilon(1e-9));
+  CHECK(ResolveMuseGlimmerQueryPreScale(0.0, false, 0.0, false, head_dim) !=
         doctest::Approx(1.0));
+  // It runs through the SAME magnitude disambiguation, so it is the native value
+  // that is defaulted, not the folded one: at head_dim 4 the fold is by 2.
+  CHECK(ResolveMuseGlimmerQueryPreScale(0.0, false, 0.0, false, 4) ==
+        doctest::Approx(43.7840518911 / 2.0));
 }
 
 TEST_CASE("MuseGlimmer: qk-norm and the output gate default ON when ABSENT") {

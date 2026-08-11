@@ -545,15 +545,23 @@ names.
 | `embed_tokens` | **dequantized** | a `[vocab, H]` gather table, not a GEMM operand |
 | all norms | **dequantized** | `[H]`/`[Dh]` F32 vectors carrying a `-1` value transform |
 
-### 10.3 Named residual — `post_norm_eps`
+### 10.3 Named residual — `post_norm_eps` (CLOSED 2026-08-11, see §15)
 
-The GGUF carries one epsilon (`attention.layer_norm_rms_epsilon` = 1e-5) and no
-post-norm key; the safetensors config ships `post_norm_eps` = 1e-8 separately, so
-the GGUF arm falls back to `rms_norm_eps` for the post-norms. Inside
-`1/sqrt(mean_square + eps)` with a mean square of order 1 that is a ~5e-6
-relative change — two orders of magnitude below bf16's ~4e-3 spacing, so it is
-not representable in the activation dtype. A real difference from the safetensors
-arm, just not an observable one. Fixing it needs a converter key upstream.
+**Superseded.** This section used to read:
+
+> The GGUF carries one epsilon (`attention.layer_norm_rms_epsilon` = 1e-5) and no
+> post-norm key; the safetensors config ships `post_norm_eps` = 1e-8 separately, so
+> the GGUF arm falls back to `rms_norm_eps` for the post-norms. Inside
+> `1/sqrt(mean_square + eps)` with a mean square of order 1 that is a ~5e-6
+> relative change — two orders of magnitude below bf16's ~4e-3 spacing, so it is
+> not representable in the activation dtype. A real difference from the safetensors
+> arm, just not an observable one. Fixing it needs a converter key upstream.
+
+Two things were wrong with that. It did **not** need a converter key: 1e-8 is the
+architecture's own constant in both references, so the right fallback was always
+available locally. And the "not observable" conclusion rested on an assumed
+post-norm input mean square of order 1 that nothing ever measured — these norms
+take a *sublayer output*, and the sensitivity goes as `1/ms`. §15 closes it.
 
 ### 10.4 REFUSED and OWED — the mmproj perception encoder
 
@@ -859,7 +867,9 @@ Adjacent gates unchanged and green on the same build: `test_muse_glimmer_text`
   agrees on the first token and then diverges into a repetition. Whether that
   residual is quantization/accumulation drift, the `post_norm_eps` fallback of
   §10.3, or a second defect is OPEN and owed. "Coherent" is the claim;
-  "token-identical" is not.
+  "token-identical" is not. **Updated 2026-08-11:** the `post_norm_eps` candidate
+  is ELIMINATED — §15 fixes the fallback and measures the generated tokens on both
+  arms; the divergence from llama.cpp is unchanged by it.
 - **No speed axis, still.** §0 is unchanged: the pinned oracle cannot load
   `muse_glimmer`, so there is no denominator and none is claimed here.
 - The bf16 safetensors arm at full depth has still never generated; it is
@@ -1013,3 +1023,157 @@ They establish **nothing about vLLM**, which is the only bar that counts and
 remains unavailable; nothing about GPU behaviour, which was not built; nothing
 about multimodal; and nothing about token-exactness. **No ceiling is claimed or
 implied anywhere in this section.**
+
+## 15. Config defaults are the ARCHITECTURE's, not neutral values (2026-08-11, `row/FIX-MUSE-CONFIG-DEFAULTS`, issue [#412](https://github.com/mudler/vllm.cpp/issues/412))
+
+Found by a differential review of SGLang's independent implementation
+(`muse-glimmer` @ `38a1bc5d2f`) against ours. Same shape as
+[#405](https://github.com/mudler/vllm.cpp/issues/405), generalized: that fix
+corrected one field, this is the class.
+
+When a key is absent we fell back to a **neutral** value (identity, zero, "off").
+Both references fall back to the **architecture's constant**. For a key the
+released 30B `config.json` always ships the two agree, which is exactly why the
+defaults went untested — the only checkpoint that can reach a default is one
+that OMITS the key, and two such checkpoints exist.
+
+### 15.1 The six fields, and both references' authority for each
+
+| key absent | ours (before) | vLLM #51655 @ `075d645af` | SGLang @ `38a1bc5d2f` | now |
+|---|---|---|---|---|
+| `qk_scale_factor` | `scale_query_by = 1.0` | `configs/muse_glimmer.py:62` 43.7840518911 | `srt/configs/muse_glimmer.py:98` same | 43.7840518911, folded by `sqrt(head_dim)` → exactly 3.87 at 128 |
+| `sliding_window` | **0 = no window at all** | `:56` 2048 | `:93` 2048 | 2048 |
+| `output_multiplier` | 1.0 | `:65` 0.19611613513818404 | `:101` same | 0.19611613513818404 |
+| `final_logit_softcapping` | 0 = none | `:58` 20.0 | `:102` `output_soft_cap_temp` 20.0 | 20.0 |
+| `rms_norm_eps` | 1e-6 | `:45` 1e-5 | `:90` 1e-5 | 1e-5 |
+| `post_norm_eps` | `rms_norm_eps` | `:67` 1e-8 | `:91` 1e-8 | 1e-8 |
+
+The two references AGREE on all six, so nothing was adjudicated and no
+`NEEDS_DECISION` arises. They are named constants in
+`include/vllm/model_executor/models/muse_glimmer.h` so the parser, the GGUF arm
+and the struct's own member defaults cannot drift apart — the struct was a
+SECOND copy of the same trap.
+
+`sliding_window` and `final_logit_softcapping` are `X | None` upstream, where
+`None` is a real state distinct from absent. Absent now takes the default; an
+explicit `"sliding_window": null` still means no window, in both the nested and
+the flat layout (the flat hoist used to drop a null and re-default it).
+
+### 15.2 It was LIVE on the GGUF path
+
+The released `muse-glimmer-30B-kquant-17gb.gguf` has 32 KV pairs; its header was
+dumped and it carries **no** `attention.post_norm_rms_epsilon` and **no**
+`attention.scale`. So both sandwich post-norms ran at
+`attention.layer_norm_rms_epsilon` = 1e-5 where the released safetensors
+`config.json` says 1e-8 — a factor of 1000, on the only arm of this model most
+people can run. §10.3's "not observable" argument assumed a post-norm input mean
+square of order 1; the sensitivity goes as `1/ms` and nothing measured it.
+
+The arm now also PREFERS what a file says over any default: a converter emitting
+`muse-glimmer.attention.post_norm_rms_epsilon` is honoured, and one emitting
+llama.cpp's `%s.attention.scale` (`LLM_KV_ATTENTION_SCALE`, `llama-arch.cpp:240`
+— the factor that replaces `head_dim ** -0.5` in the softmax, so
+`scale_query_by = scale * sqrt(head_dim)`) wins over the value folded into
+`attn_q_norm`. `attention.sliding_window`, `logit_scale` and
+`final_logit_softcapping` are likewise written only when the file carries them,
+so exactly ONE place decides a default.
+
+### 15.3 It was latent via the DFlash drafter
+
+`meta-models/Muse-Glimmer-30B-Assistant`'s `config.json` omits
+`qk_scale_factor`, `post_norm_eps`, `output_multiplier`,
+`final_logit_softcapping` and `vocab_size`. Routed through
+`ParseMuseGlimmerParams` it ran with `use_qk_norm = true` and **no query
+pre-scale at all** — coherent drafts, no error, acceptance quietly collapsing.
+That is the silent-degradation signature §1.3 already warns about for a
+draft/target RoPE mismatch. The file is now committed verbatim as
+`tests/vllm/models/fixtures/muse_glimmer_30b_assistant/config.json` and is what
+pins those four defaults.
+
+**No claim is made that the drafter now works.** Nothing here ran it. A trap was
+removed; the acceptance-rate A/B of §10.5 is still OWED.
+
+### 15.4 Evidence
+
+RED first. The critical shape of #405 was that its test set the flag
+EXPLICITLY, which is why the default stayed untested — so every new assertion
+here is made against a config that OMITS the field.
+
+| Gate | RED (before the fix) | GREEN |
+|---|---|---|
+| `test_muse_glimmer_scaffold` | 1 case / 3 assertions failing of 85 | 11/11, 85 assertions |
+| `test_muse_glimmer_text` | 3 cases / 16 assertions failing of 528 | 24/24, 528 assertions |
+| `test_muse_glimmer_gguf` | 3 cases / 10 assertions failing of 654 | 17/17, 654; 727 with `VLLM_MUSE_GGUF` on the released 16.76 GB file |
+
+A trap inside the RED capture is worth recording: `doctest::Approx` carries a
+`scale` term defaulting to 1.0, so a bare `CHECK(eps == Approx(1e-8))` accepts
+1e-5 — the exact wrong value — as equal. Three assertions passed against the
+defect until every epsilon comparison got `.scale(0)`. The pre-existing released-
+config assertion had the same hole.
+
+Eleven mutations, each reverting one default (or one precedence rule) to what it
+replaced, each proven RED, tree restored byte-for-byte from an in-memory
+snapshot and md5-verified:
+
+| Mutation | Caught by |
+|---|---|
+| `rms_norm_eps` default 1e-5 → 1e-6 | text 1, gguf 1 |
+| `post_norm_eps` default 1e-8 → 1e-5 | text 3, gguf 3 |
+| `sliding_window` default 2048 → 0 | text 3, gguf 1 |
+| `output_multiplier` default → 1.0 | text 2, gguf 1 |
+| `final_logit_softcapping` default → 0.0 | text 4, gguf 1 |
+| absent `qk_scale_factor` → identity | scaffold 3, text 3 |
+| an explicit `null` no longer disables the window / cap | text 2 |
+| the flat hoist drops an explicit `null` again | text 1 |
+| GGUF ignores `attention.post_norm_rms_epsilon` when present | gguf 2 |
+| GGUF ignores `attention.scale` when present | gguf 2 |
+| GGUF writes the three optional keys unconditionally | gguf 3 |
+
+Adjacent gates unchanged and green on the same build: `_wiring` 9/9 (10317),
+`_vision` 7/7 (98), `_real_weights` 3/3 (15), `test_model_registry` 24/24 (871),
+`test_tool_parser_muse_glimmer` 15/15, `test_reasoning_muse_glimmer` 19/19, and
+`test_muse_glimmer_text` again under `VT_FUSED_CHAIN_ADOPT=0` (24/24, 528).
+
+**The text tower did not move**, as predicted: the released `config.json` carries
+all six keys, so the fp32-reference comparisons of §6.5/§6.6 are untouched. Only
+a checkpoint that omits a key changes, and the safetensors 30B omits none.
+
+### 15.5 Did GGUF numerics move? MEASURED, and the answer is "not in the tokens"
+
+Same-binary A/B on the released 16.76 GB k-quant, this box, CPU-only Release,
+`--temperature 0`, `flock /tmp/cpu-bench.lock`. The ONLY difference between the
+two arms is `kMuseGlimmerDefaultPostNormEps`; both prompts are the two §13.3
+recorded.
+
+| prompt | 1e-8 (fixed) | 1e-5 (the old fallback) |
+|---|---|---|
+| `"The capital of France is"`, 12 tok | `" Paris. The capital of France is Paris. The capital of"` | **identical** |
+| `"The history of the Roman Empire began"`, 20 tok | `" with the founding of the city of Rome in 753 BC and ended in the west with the fall"` | **identical** |
+
+Both arms also reproduce §13.3's recorded text exactly, so this is a three-way
+agreement, not two runs of one build.
+
+**What that does and does not say.** The generated tokens do not move at these
+lengths — the change is not large enough to flip a greedy argmax here. It does
+NOT say the activations are unchanged: the norm's scale factor changes by
+`1 - sqrt((ms + 1e-8)/(ms + 1e-5))`, which is `5.0e-6` at a post-norm input mean
+square of 1 and grows as `1/ms`. It crosses half a bf16 ulp (`2^-9`) at
+`ms = 2.6e-3`, i.e. a post-norm input **RMS of 0.051**: below that the difference
+is representable in the activation dtype and rises fast (4.6e-2 at RMS 0.01).
+
+So §10.3's conclusion happens to hold for THESE two prompts, while its
+*reasoning* — the assumed `ms` of order 1 — is still unmeasured, and the
+threshold above is what would have to be measured to justify it. That is
+precisely why the fix does not depend on it: 1e-8 is the architecture's value in
+both references, so the correct fallback costs nothing and needs no argument
+about magnitudes. **Two greedy prompts are not a token-exactness claim.**
+
+### 15.6 What is still open
+
+- **Still not token-exact against llama.cpp.** §13.4 listed the `post_norm_eps`
+  fallback as one of three candidate explanations for the residual divergence.
+  That candidate is now eliminated; quantization/accumulation drift and a
+  possible second defect remain, and the comparison is still OWED.
+- **The drafter has still never run.** §10.5's acceptance A/B is unchanged.
+- **No speed axis.** §0 stands: the pinned oracle cannot load `muse_glimmer`, so
+  there is no denominator and none is claimed here on any axis.
