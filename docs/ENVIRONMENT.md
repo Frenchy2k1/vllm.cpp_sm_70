@@ -176,10 +176,23 @@ on CUDA/CPU builds beyond the documented behavior.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `VT_GEMMA4_EXPERT_VRAM_MB` | unlimited (unset or `0`) | A positive MiB value caps the device expert-cache LRU; unset or `0` leaves the cache unlimited |
+| `VT_GEMMA4_EXPERT_VRAM_MB` | off (unset/`0`) | `N>0` enables device expert LRU with N MiB fill budget; unset/`0` = device expert LRU **off** (resident path uses `VT_GEMMA4_RESIDENT_*`). Evict only with `VT_GEMMA4_EXPERT_EVICT=1` |
 | `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads the Gemma-4 MoE experts resident on the GPU(s) after the first use instead of streaming them per step (discrete-ROCm optimization). No-op (with a stderr note) on a binary built without `-DVLLM_CPP_HIP` |
 | `VT_GEMMA4_RESIDENT_GPUS` | `2` | Number of GPUs across which resident Gemma-4 experts are spread; clamped to the ROCm device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
 | `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded, to fit a smaller VRAM budget. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VT_GEMMA4_RESIDENT_BF16` | unset | Force BF16 resident expert packs when set |
+| `VT_GEMMA4_RESIDENT_NATIVE` | unset | Prefer native FP8 resident packs when set |
+| `VT_ATTN_PREFILL_FLASH_SHAREDK` | on | ROCm Gemma-4 prefill: scoreless SharedK flash path (prod default). `0` forces DecodeGqa baseline for A/B |
+| `VT_ATTN_PREFILL_FLASH_WMMA` | off | Lab-only ROCm flash WMMA QK path; leave off for prod |
+| `VT_ATTN_PREFILL_SHAREDK_WMMA` | on | ROCm SharedK fused with rocWMMA QK on sliding d=256 (and global-Q d=512). `0` forces scalar SharedK |
+| `VT_GEMMA4_PREFILL_PEER_ACT` | on | Prefill MoE: run ExpertGeGLU on the expert GPU and peer activations only (not full weight PeerCopy). `0` restores weight PeerCopy |
+| `VT_GEMMA4_GPU0_HEADROOM_GB` | `12` | GiB kept free on GPU0 when packing resident experts (decode vs long-prefill trade). Lab dual R9700 + 49k KV: `8` survives 16k+ prefill; `6` OOMs ~11k |
+| `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
+| `VT_GEMMA4_MLP_MOE_PARALLEL` | off | `=1` run Gemma4 MLP and MoE on two HIP streams (lab; wall ~flat on R9700). Not wired in this PR tip (decode-graph-free split) |
+| `VT_ATTN_PREFILL_FLASH` | off | `=1` SGLang-style BM×BN GQA flash prefill (lab A/B) |
+| `VT_GEMMA4_PREFILL_GEMM_M` | `256` | Tokens per expert in prefill-batch GEMM chunks (`16..2048`). Larger M → fewer launches; lab `512` ~+37% prefill vs `64` |
+| `VT_GEMMA4_HOST_EXPERT_MB` | `512` | Host-side expert staging budget (MiB) for non-resident paths |
+| `VT_GEMMA4_LAYER_TRACE` | off | `=1` layer GPU-synced phase timers; `=2` per-layer heartbeats |
 | `VLLM_CPP_HTTP_FIXED_POOL` | `1` (fixed) | `=0` reverts the HTTP worker pool to the legacy dynamic mode. Production uses the capacity-derived fixed pool; the opt-out exists for same-binary A/B attribution |
 | `VT_ROCM_ATTN_CPU_REF` | unset | `=1` routes ROCm paged attention through the CPU reference kernel instead of the HIP kernel — a correctness A/B for the ROCm attention bring-up |
 | `VT_DEBUG_SAMPLED` | unset | `=1` prints the per-step sampled token id(s) to stderr (sampling-loop debug). Read-only; does not change output. Read once per token, so it does not stall the hot loop |

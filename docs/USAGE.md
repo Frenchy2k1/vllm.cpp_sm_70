@@ -1438,3 +1438,10 @@ waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
 (default 15s; `0` disables). Comment frames are not `data:` events and do not
 carry tokens. Token streaming still uses a timed wait on the request collector
 so deltas are not collapsed by a poll loop.
+
+## Gemma4 FP8 on ROCm (RDNA4)
+
+Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
+ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
+This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).
