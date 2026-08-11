@@ -57,12 +57,54 @@ def _git(repo: Path, *args: str, input_text: str | None = None) -> str:
     return result.stdout.strip()
 
 
+TRAILER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t].+$")
+CONTINUATION_LINE = re.compile(r"^[ \t]+\S")
+
+
+def _is_trailer_paragraph(paragraph: str) -> bool:
+    """Whether every line of a paragraph is trailer-shaped."""
+    lines = [line for line in paragraph.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if not TRAILER_LINE.match(lines[0]):
+        return False
+    return all(
+        TRAILER_LINE.match(line) or CONTINUATION_LINE.match(line) for line in lines[1:]
+    )
+
+
+def join_trailing_trailer_paragraphs(message: str) -> str:
+    """Fuse consecutive trailer-shaped paragraphs at the END into one block.
+
+    `git interpret-trailers --parse` reads ONLY the final paragraph, so anything
+    appended after the trailer block hides it completely. GitHub does exactly
+    that on a squash merge: it adds `Co-authored-by:` as a new paragraph, and the
+    protocol trailers above it stop being visible. Measured on main: dbd0d51c,
+    87308dea and f64f2b71 all parse to nothing but that one line, and the gate
+    reported them as missing trailers they plainly carry (#406).
+
+    Only TRAILER-SHAPED paragraphs are fused. A prose paragraph still terminates
+    the block, so trailers buried mid-message remain invalid -- the looseness
+    this gate exists to prevent is untouched.
+    """
+    paragraphs = _paragraphs(message)
+    if not paragraphs:
+        return message
+    fused: list[str] = []
+    while paragraphs and _is_trailer_paragraph(paragraphs[-1]):
+        fused.insert(0, paragraphs.pop())
+    if len(fused) < 2:
+        return message
+    return "\n\n".join(paragraphs + ["\n".join(fused)])
+
+
 def parsed_trailers(message: str) -> str:
-    """Return exactly what ``git interpret-trailers --parse`` returns."""
+    """Return what ``git interpret-trailers --parse`` returns, after fusing any
+    trailer-shaped paragraphs appended below the block (see the helper above)."""
 
     result = subprocess.run(
         ["git", "interpret-trailers", "--parse"],
-        input=message,
+        input=join_trailing_trailer_paragraphs(message),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
