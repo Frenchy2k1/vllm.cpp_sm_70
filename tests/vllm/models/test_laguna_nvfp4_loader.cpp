@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,12 @@
 #include "doctest/doctest.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/laguna.h"
+
+namespace vllm {
+void StageLagunaGraphEmbedding(const OwnedTensor& embed, int32_t token,
+                               int64_t hidden_size, int64_t vocab_size,
+                               float* destination);
+}  // namespace vllm
 
 using vllm::HfConfig;
 using vllm::LagunaWeights;
@@ -341,6 +348,34 @@ TEST_CASE("laguna nvfp4 loader: missing tensor throws (RED-first)") {
   std::vector<SafetensorsFile> shards;
   shards.push_back(SafetensorsFile::Open(f.path()));
   CHECK_THROWS(LoadLagunaForCausalLMWeights(shards, TinyConfig()));
+}
+
+TEST_CASE("laguna graph staging reads a borrowed BF16 row at an odd byte offset") {
+  constexpr int64_t kRows = 2;
+  constexpr int64_t kCols = 4;
+  const uint16_t values[] = {
+      Bf16Bits(0.0F), Bf16Bits(1.0F), Bf16Bits(2.0F), Bf16Bits(3.0F),
+      Bf16Bits(10.0F), Bf16Bits(11.0F), Bf16Bits(12.0F), Bf16Bits(13.0F),
+  };
+  auto storage = std::make_shared<std::vector<uint8_t>>(
+      1 + sizeof(values));
+  std::memcpy(storage->data() + 1, values, sizeof(values));
+  REQUIRE(reinterpret_cast<uintptr_t>(storage->data() + 1) %
+              alignof(uint16_t) ==
+          1);
+
+  vllm::OwnedTensor embed;
+  embed.bytes = vllm::OwnedBytes::Borrow(storage->data() + 1, sizeof(values),
+                                          storage);
+  embed.dtype = vt::DType::kBF16;
+  embed.rank = 2;
+  embed.shape[0] = kRows;
+  embed.shape[1] = kCols;
+
+  float destination[kCols] = {};
+  vllm::StageLagunaGraphEmbedding(embed, 1, kCols, kRows, destination);
+  CHECK(std::vector<float>(destination, destination + kCols) ==
+        std::vector<float>{10.0F, 11.0F, 12.0F, 13.0F});
 }
 
 // N2 CPU RUN-GATE (task #230): the NVFP4 fp4 MoE branch in LagunaFfnBlock actually

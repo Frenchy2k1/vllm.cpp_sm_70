@@ -42,6 +42,74 @@ def step_mapping_blocks(step: str, name: str) -> list[str]:
     return blocks
 
 
+def mapping_value(step: str, mapping: str, key: str) -> str | None:
+    blocks = step_mapping_blocks(step, mapping)
+    if len(blocks) != 1:
+        return None
+    values = re.findall(
+        rf"(?m)^          {re.escape(key)}:\s*([^\n]+?)\s*$", blocks[0]
+    )
+    return values[0] if len(values) == 1 else None
+
+
+def mapping_paths(step: str) -> list[str]:
+    blocks = step_mapping_blocks(step, "with")
+    if len(blocks) != 1:
+        return []
+    lines = blocks[0].splitlines()
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"          path:\s*(.*)", line)
+        if match is None:
+            continue
+        if match.group(1) != "|":
+            return [match.group(1)]
+        paths: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate.startswith("            "):
+                break
+            paths.append(candidate.strip())
+        return paths
+    return []
+
+
+def workflow_steps(block: str) -> list[str]:
+    starts = [match.start() for match in re.finditer(r"(?m)^      - ", block)]
+    starts.append(len(block))
+    return [block[start:end] for start, end in zip(starts, starts[1:])]
+
+
+def named_step(block: str, name: str) -> str | None:
+    matches = [
+        step
+        for step in workflow_steps(block)
+        if re.search(rf"(?m)^      - name: {re.escape(name)}$", step)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def download_is_bound(block: str, artifact_ids: str, path: str) -> bool:
+    matches = [
+        step
+        for step in action_steps(block, "actions/download-artifact@v4")
+        if mapping_value(step, "with", "artifact-ids") == artifact_ids
+    ]
+    return len(matches) == 1 and mapping_value(matches[0], "with", "path") == path
+
+
+def upload_is_bound(block: str, artifact_name: str, paths: list[str]) -> bool:
+    matches = [
+        step
+        for step in action_steps(block, "actions/upload-artifact@v4")
+        if mapping_value(step, "with", "name") == artifact_name
+    ]
+    return len(matches) == 1 and mapping_paths(matches[0]) == paths
+
+
+def step_has_fragments(block: str, name: str, fragments: tuple[str, ...]) -> bool:
+    step = named_step(block, name)
+    return step is not None and all(fragment in step for fragment in fragments)
+
+
 def validate(text: str) -> list[str]:
     errors: list[str] = []
     required_global = (
@@ -168,18 +236,79 @@ def validate(text: str) -> list[str]:
     for fragment in required_handoff:
         if fragment not in text:
             errors.append(f"immutable artifact handoff is missing {fragment!r}")
-    isolated_asset_fragments = {
-        "          path: release-assets": 1,
-        "            --assets-dir release-assets \\": 1,
-        "            release-assets\n": 1,
-        "          cp -a unverified/release-assets verified/release-assets": 1,
-        "            --assets-dir verified/release-assets \\": 3,
-        "          subject-path: verified/release-assets/**": 1,
-    }
-    if any(text.count(fragment) != count
-           for fragment, count in isolated_asset_fragments.items()):
+    plan_artifact = "${{ needs.plan.outputs.artifact_id }}"
+    primary_artifacts = ",".join(
+        f"${{{{ needs.{name}.outputs.artifact_id }}}}"
+        for name in primary_build_jobs
+    )
+    verified_artifact = "${{ needs.verify.outputs.artifact_id }}"
+    verify = blocks["verify"]
+    root_contracts = (
+        download_is_bound(build, plan_artifact, "plan"),
+        download_is_bound(build, primary_artifacts, "release-assets"),
+        step_has_fragments(
+            build,
+            "Produce the byte-bound release handoff",
+            (
+                "--plan plan/release-plan.json",
+                "--assets-dir release-assets",
+                "--output release-handoff.json",
+            ),
+        ),
+        upload_is_bound(
+            build,
+            "release-unverified-${{ github.sha }}",
+            ["release-handoff.json", "release-assets"],
+        ),
+        download_is_bound(verify, plan_artifact, "plan"),
+        download_is_bound(
+            verify, "${{ needs.build.outputs.artifact_id }}", "unverified"
+        ),
+        step_has_fragments(
+            verify,
+            "Verify handoff against plan and workflow SHA",
+            (
+                "cp -a unverified/release-assets verified/release-assets",
+                "--plan plan/release-plan.json",
+                "--handoff unverified/release-handoff.json",
+                "--assets-dir verified/release-assets",
+                "--output verified/verified-handoff.json",
+            ),
+        ),
+        step_has_fragments(
+            verify,
+            "Generate byte-derived release indexes",
+            (
+                "--assets-dir verified/release-assets",
+                "--handoff verified/verified-handoff.json",
+                "--json-output verified/release-index.json",
+                "--markdown-output verified/RELEASE_INDEX.md",
+            ),
+        ),
+        upload_is_bound(
+            verify, "release-verified-${{ github.sha }}", ["verified"]
+        ),
+        download_is_bound(attest, verified_artifact, "verified"),
+        step_has_fragments(
+            attest,
+            "Attest verified bytes",
+            ("subject-path: verified/release-assets/**",),
+        ),
+        download_is_bound(publish, verified_artifact, "verified"),
+        step_has_fragments(
+            publish,
+            "Publish the exact verified release assets",
+            (
+                "--handoff verified/verified-handoff.json",
+                "--assets-dir verified/release-assets",
+                "--index-json verified/release-index.json",
+                "--index-markdown verified/RELEASE_INDEX.md",
+            ),
+        ),
+    )
+    if not all(root_contracts):
         errors.append(
-            "release workflow must isolate transient release assets from checkout assets"
+            "release workflow must bind each handoff stage to its declared root"
         )
     uploads = text.count("uses: actions/upload-artifact@v4")
     download_steps = action_steps(text, "actions/download-artifact@v4")
