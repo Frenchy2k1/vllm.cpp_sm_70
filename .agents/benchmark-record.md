@@ -18244,6 +18244,81 @@ located. They establish **nothing** about how fast vllm.cpp runs Muse Glimmer,
 nothing about how it compares to any engine, and nothing about vLLM — which
 remains the only bar that counts and remains unavailable. **No ceiling is
 claimed or implied anywhere in this entry.**
+
+## 27B NVFP4 canonical SIX-POINT regrid, and the two grids that disagree (2026-08-11, main `348c265d`, GB10)
+
+Issue: [#349](https://github.com/mudler/vllm.cpp/issues/349).
+
+Canonical driver, model key `27n`, SAME SHA and SAME build (`build-gate2`) as the
+recorded c1-c8 cells, so all six points form one coherent grid. Corpus
+regenerated with this checkpoint's own tokenizer. Model gate passed token-exact
+16/16 vs vLLM before any timing.
+
+| | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| ours tok/s (n=3) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
+| vLLM tok/s (n=3) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
+| ratio | 0.9561x | 0.9543x | 0.9441x | 0.9414x | 0.9443x | 0.9371x |
+| ours spread | 1.005 | 1.006 | 1.006 | 1.001 | 1.004 | 1.006 |
+| vLLM spread | 1.006 | 1.006 | 1.005 | 1.005 | 1.003 | 1.004 |
+
+Driver verdict `{"gate_pass": false}`. No cell at or above parity.
+
+Superseded rows moved here from the scoreboard to stay inside its budget:
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| TPOT / TTFT ratio (2026-08-10) | 1.2245 / 1.0077 | 1.1902 / 1.1111 | 1.2313 / 0.9722 | 1.2250 / 0.9992 |
+| prior ad-hoc ratio | 0.847x | 0.861x | 0.853x | 0.843x |
+| before the FP8 tower fix (tok/s) | 8.76 | 17.07 | 33.01 | 62.13 |
+| leg spread ours / vLLM (regrid) | 1.005 / 1.006 | 1.006 / 1.006 | 1.006 / 1.005 | 1.001 / 1.005 |
+
+### The published grid does not reproduce
+
+| arm, c1 | 2026-08-10 | 2026-08-11 | delta |
+|---|---:|---:|---:|
+| vLLM | 11.3646 | 11.250 | 1.0% |
+| ours | 9.366 | 10.756 | **+14.8%** |
+| ratio | 0.8384x | 0.9561x | +0.118 |
+
+Same SHA, same driver, same box. The denominator reproduces to 1%; our own arm
+moved ~15%. A third value exists for our c1 (8.1176, the no-lever floor of
+[#319](https://github.com/mudler/vllm.cpp/issues/319)), giving an 8.12-10.76
+span (32%) while vLLM stays inside 1%. The SHAPE also inverts: c1 was the WORST
+cell and is now the BEST. There is no c1 cliff.
+
+### Refuted: a per-load residency lottery
+
+Both grids are internally tight (08-10 spreads 1.0013-1.0068; regrid 1.001-1.006)
+yet disagree by 15%, which looks like a state fixed per server lifetime. Tested:
+ONE identical binary, 6 cold loads, page cache dropped before each.
+
+```
+11.7933  11.7642  11.7573  11.7541  11.7392  11.7484   (batch-1 tok/s)
+min 11.739  max 11.793  spread 1.0046x  -> SINGLE MODE
+```
+
+0.46% reload-to-reload, ~30x smaller than the cross-grid delta. Not a lottery,
+and not per-load nondeterminism at this magnitude. (Absolute values are not
+comparable to the grid: 5-token prompt, decode-dominated. It tests VARIANCE of
+one fixed method and must not be quoted as a ratio.)
+
+Leading remaining candidate is a BUILD difference. The regrid used
+RelWithDebInfo, `VLLM_CPP_TRITON=ON`, oracle ninja, flashinfer-bundled CUTLASS,
+`BENCH_PROFILE_CONTROL=OFF`, FA2 marker verified. The 08-10 grid records its
+recipe only as "same recipe as the pre-lever binding grid". This project has a
+recorded incident of a bench tree silently omitting `-DVLLM_CPP_TRITON=ON`, and
+another of a degraded CUTLASS build drifting near-tie gates. Settle it from that
+grid's configure log, not by re-measuring.
+
+### What this retracts
+
+"THE OPEN PROBLEM: c1 did not move" is withdrawn as a statement about the
+levers. Both demonstrably executed. Any per-lever attribution taken at c1 before
+2026-08-11 is noise-dominated, including the four-decimal pre-lever attribution
+(lm_head 8.6414 + fp8 tower 7.6068 of 17.3292), which
+[#339](https://github.com/mudler/vllm.cpp/issues/339) independently found
+mis-assigned its terms.
 ## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
 
 **Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
