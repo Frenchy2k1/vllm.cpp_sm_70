@@ -245,33 +245,16 @@ void RunRealWeightGate(const Reference& ref) {
                                     << missing << ", first: " << first_missing);
   }
 
-  // OPEN FINDING, reported not fixed (muse_glimmer_weights.cpp is owned by the
-  // vision-wiring work in flight). On the FULL multimodal checkpoint the
-  // aggregate accounting does NOT close: measured 1086 accounted vs 1136
-  // enumerated, a shortfall of exactly 50 — one per perception-encoder layer.
-  //
-  //   * EnumerateMuseGlimmerTensors declares a MERGED
-  //     `vision_encoder.transformer.N.attn.qkv_proj.weight` per vision layer,
-  //     but the released checkpoint ships SEPARATE
-  //     `model.vision_tower.layers.N.attn.{q,k,v}_proj.weight` and
-  //     NormalizeMuseGlimmerWeightName does not fuse them (upstream's
-  //     `orig_to_new_stacked` is a LOAD-time stacking, not a name rewrite), so
-  //     the merged name can never be accounted. 50 layers -> 50 missing.
-  //   * Separately, the enumeration declares NO vision attention biases, while
-  //     upstream builds both `qkv_proj` and `o_proj` with `bias=True`
-  //     (muse_glimmer.py:573-588) and the checkpoint ships 200 such tensors
-  //     (`attn.{q,k,v}_proj.bias` + `attn.proj.bias`, 4 per layer).
-  //
-  // Neither touches the text tower, which loads and forwards correctly, so this
-  // is recorded rather than asserted: pinning the shortfall at 50 would turn
-  // red the moment somebody fixes it.
-  if (params.vision.present && w.accounted_tensors != w.enumerated_tensors) {
-    MESSAGE("OPEN FINDING (vision enumeration, not fixed here): "
-            << (w.enumerated_tensors - w.accounted_tensors)
-            << " enumerated tensor(s) unaccounted on the multimodal checkpoint");
-  } else {
-    CHECK(w.accounted_tensors == w.enumerated_tensors);
-  }
+  // The accounting must close on EVERY checkpoint, multimodal included. This
+  // assertion was demoted to a MESSAGE while the vision enumeration was short by
+  // 50 (a merged `attn.qkv_proj` the checkpoint never ships, plus the missing
+  // vision attention biases); the W4 enumeration correction fixed both, and
+  // test_muse_glimmer_wiring now proves the released 30B's 1436 tensors are
+  // accounted 1436/1436. A conditional assertion is a disarmed one, so it is
+  // armed again — the same guarantee runs on the synthetic multimodal checkpoint
+  // in test_muse_glimmer_wiring ("the perception encoder loads, q|k|v merged in
+  // order"), which is what makes this reachable without the NAS.
+  CHECK(w.accounted_tensors == w.enumerated_tensors);
   CHECK(w.embed_tokens.shape[0] == params.text.vocab_size);
   CHECK(w.embed_tokens.shape[1] == params.text.hidden_size);
   CHECK(w.lm_head.shape[0] == params.text.hidden_size);  // Matmul-B [in,out]
