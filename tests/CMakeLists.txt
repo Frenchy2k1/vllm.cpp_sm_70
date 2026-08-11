@@ -192,6 +192,70 @@ vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
+vllm_cpp_add_test(test_muse_glimmer_scaffold vllm/models/test_muse_glimmer_scaffold.cpp)
+vllm_cpp_add_test(test_muse_glimmer_vision vllm/models/test_muse_glimmer_vision.cpp)
+target_include_directories(test_muse_glimmer_vision PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# Muse Glimmer W1 TEXT TOWER gate: the whole text forward vs an INDEPENDENT fp32
+# reference transcribed from vllm#51655 head 075d645af, plus a property test per
+# mechanism (weightless embed_norm, QK-norm, query pre-scale, the iRoPE NoPE/sliding
+# split, split pre/post eps, the offset-free final norm, the attention output gate,
+# the output multiplier and the soft-cap). CPU-only, no checkpoint. No speed axis
+# exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
+# ...and the SAME gate on the HAND-CALL arm. `FusedChainAdoptEnabled()` defaults ON
+# and is read once per process into a function-local static, so the three
+# `else vt::RmsNorm(...)` fallbacks in muse_glimmer.cpp (input layernorm,
+# pre-feedforward layernorm, final norm) are UNREACHABLE in a default-env run —
+# mutating one of them left every gate green — and a same-process env flip cannot
+# reach them either. A SECOND ctest registration of the same binary is the only way
+# to gate that arm, and it is the arm that runs wherever the fusion recipes are
+# unavailable, so both must be green. The `... the fusion arm the environment
+# selected` case inside the binary is what proves this registration really took the
+# other branch instead of silently repeating the first.
+add_test(NAME test_muse_glimmer_text_fallback COMMAND test_muse_glimmer_text)
+set_tests_properties(test_muse_glimmer_text_fallback PROPERTIES
+  ENVIRONMENT "VT_FUSED_CHAIN_ADOPT=0")
+
+# Muse Glimmer W4 WIRING gate: the REAL-CHECKPOINT structural contract (every name
+# EnumerateMuseGlimmerTensors produces exists in the released 1436-tensor
+# Muse-Glimmer-30B index at the right shape, and nothing in the checkpoint is
+# unaccounted) plus the perception-encoder wiring (vision load with the q|k|v merge
+# order and every bias, the soft-token projection, the masked scatter onto the
+# image/video rows, and the mm forward branch). The structural half runs off a
+# COMMITTED header-only fixture so CI never needs the NAS; a second case re-reads
+# the live checkpoint when VLLM_MUSE_CKPT points at it. CPU-only, no GPU, no tensor
+# bytes. NOT an image e2e correctness gate — the pinned oracle cannot load this
+# model at all, so no speed or token-exactness claim exists (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.cpp)
+target_compile_definitions(test_muse_glimmer_wiring PRIVATE
+  MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
+# Muse Glimmer REAL-WEIGHT gate. Loads the released 30B bf16 checkpoint (or a
+# reduced-depth model assembled from its REAL tensors) through the real loader,
+# forwards it on CPU, and compares against a standalone torch transcription of
+# vllm#51655 head 075d645af produced by scripts/mm/muse_glimmer_text_ref.py.
+# Every case SKIPs unless its env var names a fixture directory, so CI never
+# depends on the 59.55 GB NAS asset. This is NOT a token-exact gate against the
+# model's own runtime — no such runtime exists on this box (released
+# transformers does not register `muse_glimmer` and the pin has no Muse code) —
+# and it makes no speed claim whatsoever (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_real_weights
+  vllm/models/test_muse_glimmer_real_weights.cpp)
+target_compile_definitions(test_muse_glimmer_real_weights PRIVATE
+  VLLM_MUSE_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models")
+
+# Muse Glimmer GGUF K-QUANT gate (.agents/porting-a-model.md §2). The quantized
+# arm the port was missing: config-from-GGUF, the canonical<->GGUF name map, the
+# three convert-time transforms this loader inverts (the +1 sandwich-norm
+# pre-offset, the query pre-scale folded into attn_q_norm, the iRoPE mask on
+# sliding_window_pattern), and STRUCTURAL ACCOUNTING in both directions against
+# COMMITTED header-only manifests of the real 731/809/58-tensor files, so CI
+# needs no asset. A live case runs when VLLM_MUSE_GGUF names the 16.76 GB
+# k-quant. No forward, no e2e, and NO SPEED AXIS: the pinned oracle cannot load
+# `muse_glimmer` in any weight format (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_gguf vllm/models/test_muse_glimmer_gguf.cpp)
+target_include_directories(test_muse_glimmer_gguf PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
@@ -657,6 +721,10 @@ vllm_cpp_add_test(test_tool_parser_gemma4
   vllm/entrypoints/openai/tool_parsers/test_gemma4.cpp)
 vllm_cpp_add_test(test_tool_parser_seed_oss
   vllm/entrypoints/openai/tool_parsers/test_seed_oss.cpp)
+vllm_cpp_add_test(test_tool_parser_muse_glimmer
+  vllm/entrypoints/openai/tool_parsers/test_muse_glimmer_tool_parser.cpp)
+vllm_cpp_add_test(test_reasoning_muse_glimmer
+  vllm/entrypoints/openai/reasoning_parsers/test_muse_glimmer_reasoning_parser.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
 # The real Qwen3.5 chat template (extracted from the GGUF) lives under
 # tests/fixtures/; hand its absolute path to the test so it resolves regardless
