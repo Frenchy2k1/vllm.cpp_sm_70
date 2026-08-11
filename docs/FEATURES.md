@@ -216,7 +216,7 @@ HTTP are not started.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; builds on ROCm 6.x with the CLR hostcall fix, #201/#132; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
+| ROCm | W0-W1 verified on 5 gfx archs; classic-dense AND GDN-hybrid e2e run all-native (strict CPU parity not met: near-tie regime, #269; GDN divergence characterization open) | Backend + platform + #140 ops + full GDN op set; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix verified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens, full 16x16 rerun pending ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`) | ✅ | ☐ | ☐ |
 
