@@ -522,6 +522,41 @@ is NOT something better drafting fixes. Two levers, in order:
 A dense gate model (Qwen3.6-27B + a dense DSpark draft) would separate the two
 factors cleanly, and is the cheapest next experiment.
 
+## 6f. DENSE LANE RESULT: the MoE is the drag, not the graph (2026-08-11)
+
+Qwen3.6-27B NVFP4 (DENSE) + `satgeze/Qwen3.6-27B-DSpark`, k=15, dgx, one flock,
+`--max-num-seqs 2` (sized against the #371 state budget: 2.42 GB/slot at k=15,
+so the default 32 would have demanded 77 GB).
+
+| arm | warm x3 tok/s | speedup |
+|---|---|---:|
+| spec-off | 9.846 / 9.878 / 9.886 | - |
+| **DSpark k=15** | **17.370 / 17.512 / 17.462** | **1.77x** |
+
+Acceptance: 24 steps, 2.83 tokens/step, 1.83 accepted of k=15 = **12.2%**.
+Phase split: backbone 29.8-31.6 ms steady, sequential sampler 9.7-10.3 ms
+(~25% of the draft step, against 12% on the 35B).
+
+**THE GRAPH COUNTS OVERTURN 6e's LEADING HYPOTHESIS.**
+
+| arm | `cudaGraphLaunch` |
+|---|---:|
+| off_32 / off_64 | 30 / 62 |
+| **dsp_32 / dsp_64** | **11 / 24** |
+
+The DENSE speculative arm DOES capture CUDA graphs, and the count tracks its
+speculative step count (24 launches for 64 tokens at 2.83 tokens/step ~= 23
+steps). On the 35B MoE the same arms launched ZERO. So "the speculative verify
+falls off the captured decode graph" is NOT a property of the 1+k shape, as
+6e proposed - it is specific to the 35B MoE path, and is its own defect.
+
+**Corrected attribution.** With graphs working and no expert term, DSpark returns
+**1.77x on a dense target at only 12.2% acceptance**. The 35B's 1.15x was
+therefore dominated by MoE EXPERT ACTIVATION (1.7x more GPU time per generated
+token in the Marlin MoE kernel at T=9, 6e), not by the missing graph. The lever
+worth building is the MoE verify path - expert batching for the 1+k shape, and
+finding why that path loses its graph - not a generic 1+k capture.
+
 **Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
 PRODUCTION GRAPHED config through the project's harness, not the eager arm run
 here; (2) token-exactness against that oracle on the SACRED corpus rather than
