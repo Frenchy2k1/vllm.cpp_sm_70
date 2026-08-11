@@ -51,9 +51,10 @@ def _load(name: str, relative: str):
 
 record = _load("agent_record", "scripts/check-agent-record.py")
 
-# DONE is included: a row that lost its gate command is exactly the regression
-# this exists to catch, and DONE rows are the ones people stop looking at.
-GATED_STATES = frozenset({"READY", "ACTIVE", "GATING", "DONE", "BLOCKED"})
+# The runnable-command audit follows work that can still move. DONE rows have
+# immutable closing evidence and leave this population; keeping them here would
+# turn a closure into a permanent baseline entry instead of auditing live debt.
+GATED_STATES = frozenset({"READY", "ACTIVE", "GATING", "BLOCKED"})
 
 # check-agent-record.py's MATRIX_PATHS covers 5 of the 7 matrices. feature-matrix
 # is added here without widening that constant -- it governs a repo-wide CI gate
@@ -253,26 +254,35 @@ def audit() -> list[dict]:
 # configure/build/focused-test/full-ctest invocation the gate was run with,
 # including the serial re-run for the known parallel-ctest flake. Growth, so the
 # set is re-pinned in the same change.
+# 2026-08-10: +LORA-RUNTIME enters the runnable population. It did not gain a
+# gate; it re-entered the AUDITED population when the row went back to `ACTIVE`
+# for W2 (issue #278) after the 2026-08-04 triage parked it at ANCHOR-BACKFILL.
+# Its only pre-existing credit was the UPSTREAM path
+# `tests/lora/test_qwen35_densemodel_lora.py` named in prose as the eventual
+# model gate -- one of the weak credits described above. The same change adds
+# the row's REAL invocation (the CPU configure/build plus
+# `ctest -R test_punica_cpu` and `ctest -R test_lora_layers`), so the pin rests
+# on a command that genuinely fails when the row regresses.
+#
 # 2026-08-11: +ENG-RECORD-CONFLICT-SURFACES. The row reaches READY on its
 # committed spec (issue #364), whose Gates section names the exact preflight,
 # `tests/scripts/` and `agent-integration.py` invocations the record gate runs
 # with, and records that no CUDA/GPU/SACRED gate is implicated because no product
 # source is touched. Growth, so the set is re-pinned in the same change.
-# 2026-08-11: +ENG-NOW-DERIVED. The row reaches ACTIVE on its committed spec
-# (issue #374), whose Gates section names the exact preflight, tests/scripts
-# and agent-integration invocations it runs with, and records that no
-# CUDA/GPU/SACRED gate is implicated because no product source is touched.
-# Growth, so the set is re-pinned in the same change.
+# 2026-08-11: -ENG-ASYNC-SCHED, -SERVE-HTTP-TRANSPORT and
+# -ENG-NOW-DERIVED. DONE is closed evidence, not live gated work; #374 exposed
+# that retaining DONE made a completed protocol row a permanent runnable
+# baseline member. All three departures are the same lifecycle-policy closure,
+# not downgraded verdicts or hidden work. Re-adding DONE to GATED_STATES is the
+# load-bearing mutation pinned in the paired suite.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
-    "ENG-NOW-DERIVED",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
     "BACKEND-CUDA-ARCH-ADDITIVITY",
     "BACKEND-METAL-MLX",
     "BACKEND-VULKAN",
-    "ENG-ASYNC-SCHED",
     "ENG-CORE-BUSY-LOOP",
     "ENG-DOCS-SITE",
     "ENG-EXPERT-STREAM",
@@ -280,6 +290,7 @@ RUNNABLE_BASELINE = frozenset({
     "ENG-PRIORITY-SCHED",
     "ENG-RELEASE-CONTAINERS",
     "KERNEL-GEMM-CPU-ELEM",
+    "LORA-RUNTIME",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
     # ARCH-ONE-SURFACE ROW 6 (2026-08-08): SERVE remains gated, while the
@@ -298,7 +309,6 @@ RUNNABLE_BASELINE = frozenset({
     "QUANT-GGUF-COMPUTE",
     "QUANT-NVFP4-CT-W4A16",
     "SERVE-ASYNC-LLM",
-    "SERVE-HTTP-TRANSPORT",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
 })

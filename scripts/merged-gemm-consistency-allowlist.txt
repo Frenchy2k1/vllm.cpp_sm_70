@@ -24,15 +24,24 @@
 # concat needed) — the gap is launch/epilogue granularity + seam routing only.
 
 # --- KNOWN-DRIFT: seam exists, model has NOT adopted it (fix = fold, Tier A1/C1) ---
-commandr        # SwiGLU {gate;up;SiluAndMul}, merged gate_up present -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
-glm4            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
-minicpm         # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
-minicpm3        # SwiGLU dense MLP (MLA arch) -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
-phi3            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
+# commandr / glm4 / minicpm / minicpm3 / phi3 were HERE with the sole reason
+# "pending FOLD-MIGRATE". All five FOLDED 2026-08-10 (FUSION-DENSE-MIGRATE, issue
+# #299, specs/fusion-dense-migrate.md) onto layers::UnquantizedMlpGateUpMethod, so
+# their entries are GONE and re-adding one is a REGRESSION the checker now catches
+# (tests/scripts/test_check_fusion_consistency.py::test_folded_dense_models_stay_folded).
+# What is left below all names a blocker that needs the SHARED LAYER extended --
+# an f32 arm, a bias arm, a keep-quant arm, a GeGLU arm on the grouped MoE op, an
+# NVFP4-Marlin-resident arm, or a residency arm -- which is its own row, not a
+# model fold. A bare "pending <ROW>" is NOT a reason: that is exactly how this
+# allowlist grew to hold most of its population, so an entry states the arm the
+# shared layer is missing.
+# glm4 and phi3 remain on the OTHER allowlist (scripts/fusion-consistency-allowlist.txt)
+# for the unrelated GLUE floor (add+RMSNorm -> vt::FusedChain), tracked by #314; #299
+# closed the merged-GEMM half only.
 gemma4_vision   # GeGLU vision-tower MLP -> UnquantizedMlpGateUpGeluMethod + a clamp-epilogue hook (Tier C2); pending FOLD-MIGRATE
-gemma4_moe      # known-drift pending fold: PLE shared expert and routed experts hand-call GeGLU; fold onto the shared merged-GEMM/MoE gate-up family before claiming seam closure
+gemma4_moe      # known-drift pending fold. BLOCKER (a GeGLU arm on the grouped MoE op): every GeluAndMul here is a per-EXPERT routed-MoE epilogue over raw expert-slice pointers -- ExpertGeGLUHost (host upload), ExpertGeGLUDeviceAccum (device view + alpha/beta accumulate-into), ExpertGeGLUFp8Native (MatmulBTFp8Channel), and the top-k batched fused-Gelu -- and NEITHER shared arm reaches that shape. layers::UnquantizedMlpGateUpGeluMethod is the DENSE arm: one OwnedTensor in, a fresh DBuf out, with no expert slice, no accumulate-into and no fp8-channel GEMM. The shared grouped op vt::MoeGateUpSwiGLUGrouped is SwiGLU-only AND wants the stacked [E*N,K] towers in a CUDA keep-quant dtype. Folding means giving the grouped MoE op a GeGLU (and accumulating) arm, which is a shared-layer change, not a model fold.
 
-laguna  # known-drift pending fold: Laguna NVFP4 resident/graph decode hand-rolls the shared-expert SwiGLU epilogue; fold onto layers::MlpGateUp seam is part of the decode/runtime framework-routing port (AGENTS.md 3rd seam)
+laguna  # known-drift pending fold. BLOCKER (an NVFP4-Marlin-resident arm): the two detected vt::SiluAndMul calls are the LEVER-B epilogue of vt::MoeGroupedGemmNvfp4Marlin over the N-concatenated w13, held as RAW DEVICE POINTERS in LagunaMoeMarlinResident (Marlin-repacked i32 weights / u8 scales / f32 global scales owned by the resident decode graph) -- not an OwnedTensor gate_up. Neither shared arm reaches it: layers::MlpGateUpMethodBase takes an OwnedTensor, and vt::MoeGateUpSwiGLUGrouped wants the stacked expert towers in a CUDA keep-quant dtype (Q8_K-quantized activations), not NVFP4-Marlin planes. Folding means an NVFP4-Marlin-grouped arm on the shared MoE op plus a resident-pointer residency arm, and it lands with the decode/runtime framework-routing port (AGENTS.md 3rd seam), not as a model fold.
 
 minimax_h3_device  # known-drift pending fold. The DTYPE half of this blocker is now GONE: the H3 device forward uses TRUE bf16 activation storage, so it matches the seam's kBF16 DBufs. What remains is WEIGHT RESIDENCY: layers::UnquantizedMlpGateUpMethod takes an OwnedTensor (host bytes staged on demand via ResidentWeight), whereas H3 stages device tensors UP FRONT in StageMiniMaxH3DitWeights and binds plain views -- a different ownership model, not a dtype mismatch. H3's fc1 ALREADY ships merged [2*ffn, H] and is ALREADY one MatmulBT, so nothing is unmerged; adopting the seam means moving H3's loaders onto OwnedTensor residency, which is an architectural change to the quantized loaders rather than a fold.
 

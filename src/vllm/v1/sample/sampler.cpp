@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
+#include <vector>
 
 #include "vllm/v1/sample/device_scratch.h"
 #include "vllm/v1/sample/logits_processor/builtin.h"
@@ -137,6 +140,82 @@ LogprobsTensors GatherLogprobs(const std::vector<float>& raw_logprobs, int64_t n
       lt.logprob_token_ids[base + 1 + static_cast<size_t>(c)] = idx[static_cast<size_t>(c)];
       lt.logprobs[base + 1 + static_cast<size_t>(c)] = row[idx[static_cast<size_t>(c)]];
     }
+  }
+  return lt;
+}
+
+// gather_specific_token_logprobs (sampler.py:151-225). Generative scoring:
+// return the logprobs of an EXPLICIT set of vocab ids per request instead of a
+// top-k. Upstream builds a padded [batch, max_num_tokens + 1] int64 id matrix
+// with the sampled token in column 0 (always valid), each request's ids at
+// columns 1..n, `torch.gather`s the logprobs at those ids, masks the padded
+// positions to -inf, and computes the sampled token's rank with
+// batched_count_greater_than over the FULL vocab — not over the requested
+// subset, so a rank stays comparable across requests (:207-215).
+//
+// Rows absent from `token_ids` still get column 0 (their sampled token) and
+// -inf padding everywhere else, exactly as upstream's zero-initialized matrix +
+// `valid_mask[:, 0] = True` does.
+//
+// BOUNDS: torch.gather RAISES on an out-of-range index; the equivalent here
+// would read past the row, so every id is checked into [0, vocab) and every key
+// into [0, n) before it indexes anything. (This is the defect class of issue
+// #249, whose instance — GatherLogprobs' unbounded `k` — is a separate row and
+// is deliberately not touched here.)
+LogprobsTensors GatherSpecificTokenLogprobs(
+    const std::vector<float>& raw_logprobs, int64_t n, int64_t vocab,
+    const std::map<int, std::vector<int32_t>>& token_ids,
+    const std::vector<int64_t>& sampled) {
+  // max_num_tokens = max(len(tids) ...) (:180).
+  size_t max_num_tokens = 0;
+  for (const auto& [req_idx, ids] : token_ids) {
+    VT_CHECK(0 <= req_idx && static_cast<int64_t>(req_idx) < n,
+             "sampler: logprob_token_ids key is not a request index");
+    for (int32_t tid : ids) {
+      VT_CHECK(0 <= tid && static_cast<int64_t>(tid) < vocab,
+               "sampler: logprob_token_ids contains an out-of-vocab token id");
+    }
+    max_num_tokens = std::max(max_num_tokens, ids.size());
+  }
+  const size_t width = max_num_tokens + 1;  // + the sampled token in column 0
+
+  LogprobsTensors lt;
+  lt.num_positions = static_cast<int>(n);
+  lt.num_tokens_per_position = static_cast<int>(width);
+  lt.logprob_token_ids.assign(static_cast<size_t>(n) * width, 0);
+  lt.logprobs.assign(static_cast<size_t>(n) * width,
+                     -std::numeric_limits<float>::infinity());
+  lt.selected_token_ranks.resize(static_cast<size_t>(n));
+
+  for (int64_t i = 0; i < n; ++i) {
+    const float* row = &raw_logprobs[static_cast<size_t>(i * vocab)];
+    const size_t base = static_cast<size_t>(i) * width;
+
+    // Column 0: the sampled token, valid for EVERY row (:190).
+    const int32_t tok = static_cast<int32_t>(sampled[static_cast<size_t>(i)]);
+    VT_CHECK(0 <= tok && static_cast<int64_t>(tok) < vocab,
+             "sampler: sampled token id is out of vocab range");
+    const float tok_lp = row[tok];
+    lt.logprob_token_ids[base] = tok;
+    lt.logprobs[base] = tok_lp;
+
+    // Columns 1..n: this request's ids, in REQUEST order. The rest stay at the
+    // -inf / id 0 the assign() above wrote (upstream's masked padding).
+    const auto it = token_ids.find(static_cast<int>(i));
+    if (it != token_ids.end()) {
+      for (size_t c = 0; c < it->second.size(); ++c) {
+        const int32_t tid = it->second[c];
+        lt.logprob_token_ids[base + 1 + c] = tid;
+        lt.logprobs[base + 1 + c] = row[tid];
+      }
+    }
+
+    // Rank over the FULL vocab, 1-based (:213-215), the same
+    // batched_count_greater_than GatherLogprobs uses.
+    int32_t rank = 0;
+    for (int64_t j = 0; j < vocab; ++j)
+      if (row[j] >= tok_lp) ++rank;
+    lt.selected_token_ranks[static_cast<size_t>(i)] = rank;
   }
   return lt;
 }
@@ -308,10 +387,17 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   //    modes snapshot here; the processed_* pair is taken inside sample(),
   //    after the mutations they are named for, and overwrites this below
   //    (sampler.py:104-106).
-  //    NOTE: logprob_token_ids (generative-scoring) is a deferred stub, so the
-  //    snapshot is driven solely by max_num_logprobs.
+  //    sampler.py:86: `if num_logprobs is not None or
+  //    sampling_metadata.logprob_token_ids:` — generative scoring needs the
+  //    same snapshot, and a request may set ONLY logprob_token_ids. Python
+  //    truthiness makes `{}` falsy just like None, hence the !empty().
+  //    logprobs_mode and logprob_token_ids are ORTHOGONAL and COMPOSE: the mode
+  //    selects WHICH tensor the snapshot holds (raw vs processed), the ids
+  //    select WHICH entries step 8 reads out of it.
   const std::optional<int> num_logprobs = sm.max_num_logprobs;
-  const bool want_logprobs = num_logprobs.has_value();
+  const bool want_token_ids =
+      sm.logprob_token_ids.has_value() && !sm.logprob_token_ids->empty();
+  const bool want_logprobs = num_logprobs.has_value() || want_token_ids;
   const bool processed_mode = logprobs_mode_ == LogprobsMode::kProcessedLogprobs ||
                               logprobs_mode_ == LogprobsMode::kProcessedLogits;
   std::vector<float> raw_logprobs;  // host [n*vocab] when want_logprobs
@@ -391,8 +477,27 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   }
 
   // 8. Gather logprobs.
+  //
+  // 8a. logprob_token_ids first (sampler.py:111-118): the explicit-id gather,
+  //     which sampler.py:119-136 then lets WIN over any top-k gather.
+  std::optional<LogprobsTensors> token_ids_tensors;
+  if (want_token_ids) {
+    token_ids_tensors = GatherSpecificTokenLogprobs(
+        raw_logprobs, n, vocab, *sm.logprob_token_ids, sampled);
+  }
+
   std::optional<LogprobsTensors> logprobs_tensors;
-  if (want_logprobs) {
+  if (!num_logprobs.has_value()) {
+    // sampler.py:120-121: no count requested, so the explicit-id gather is the
+    // whole answer (or nothing, when neither was requested).
+    logprobs_tensors = std::move(token_ids_tensors);
+  } else if (token_ids_tensors.has_value()) {
+    // sampler.py:133-136: both were requested; the explicit ids are more
+    // specific and win. Computing the top-k gather first and discarding it, as
+    // upstream literally does, would be pure waste — the branch below is the
+    // only consumer of it, so it is simply not entered.
+    logprobs_tensors = std::move(token_ids_tensors);
+  } else {
     if (*num_logprobs == -1) {
       // Full unsorted/unranked raw logprobs (upstream LogprobsTensors(empty,
       // raw_logprobs, empty), sampler.py:122-125). Minimal 1:1 form: the

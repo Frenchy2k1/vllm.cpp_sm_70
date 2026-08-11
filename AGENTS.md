@@ -245,10 +245,12 @@ each fact lives in exactly one of them.
 | `docs/FEATURES.md` | a feature, model, backend, or quantization surface changes |
 | `docs/USAGE.md` | a command, C API, config key, install step, or workflow changes |
 | `README.md` | a user-visible headline, positioning, or quick start changes |
-| `.agents/NOW.md` | the live position moves |
+| the moved row spec's `## Now` | a row changes lifecycle state |
 
 Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
-lifecycle change owes `STATUS`, `BENCHMARKS`, and `NOW`.
+lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
+`.agents/NOW.md` is authored only at operator cadence and is never a per-row
+lifecycle write.
 
 ## Work happens in a worktree
 

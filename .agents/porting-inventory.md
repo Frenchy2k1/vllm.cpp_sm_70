@@ -215,9 +215,12 @@ RandomSample) + penalties/min-p/logit-bias/token-mask/allowed-ids, CPU+CUDA (CUD
 dgx-pending). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
 from T1 below — the OpenAI-serving MVP needs them). Greedy = bit-exact parity gate;
 random RNG = exponential-noise gumbel-max, distribution-correct, **torch-Philox
-bit-exact parity deferred to T1**. Deferred (marked stubs): logprob_token_ids
-(generative-scoring), spec-decode bonus-token, thinking-budget, logprobs_mode
-variants beyond raw/processed. **InputBatch-side tracking of seeds/min_p/min_tokens/
+bit-exact parity deferred to T1**. Deferred (marked stubs): spec-decode
+bonus-token, thinking-budget. **logprob_token_ids (generative scoring) LANDED
+2026-08-10** and is no longer a stub — `SAMPLE-LOGPROB-TOKEN-IDS` in
+engine-matrix.md, [specs/logprob-token-ids.md](specs/logprob-token-ids.md).
+(The `logprobs_mode` variants left the same stub list when #238 landed; the
+sentence is corrected here because this edit rewrites it.) **InputBatch-side tracking of seeds/min_p/min_tokens/
 logit_bias/allowed/bad_words + num_logprobs is an M1.8 wiring dependency**
 (make_sampling_metadata emits empty defaults today — the InputBatch doesn't store
 them yet; SamplingMetadata carries the fields ready to populate).
@@ -248,7 +251,7 @@ reasoning-gating, spec-decode multi-row, optional object properties, strict-comp
 separators, the `has_xgrammar_unsupported_json_features` guard +
 `validate_xgrammar_grammar` feeding the `auto` fallback, production wiring, GPU
 oracle parity.
-T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
+T1: `prompt_logprobs` (`logprob_token_ids` LANDED 2026-08-10), additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection
 sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/

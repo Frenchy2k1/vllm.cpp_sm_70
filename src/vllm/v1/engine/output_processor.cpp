@@ -178,8 +178,11 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
   // LogprobsProcessor (output_processor.py:225-228): engaged only when the
   // request asked for sample and/or prompt logprobs, so the default generate
   // path leaves it nullopt (inert — SACRED greedy path unchanged). Uses the
-  // same detokenize-gated tokenizer as the detokenizer (:222-223).
-  if (sp.logprobs.has_value() || sp.prompt_logprobs.has_value()) {
+  // same detokenize-gated tokenizer as the detokenizer (:222-223). The sample
+  // half reads upstream's `num_logprobs` PROPERTY, not the raw `logprobs`
+  // field, so a generative-scoring request (logprob_token_ids set, `logprobs`
+  // unset) engages the processor too.
+  if (sp.num_logprobs().has_value() || sp.prompt_logprobs.has_value()) {
     state.logprobs_processor =
         LogprobsProcessor::FromNewRequest(detok_tokenizer, sp);
   }
