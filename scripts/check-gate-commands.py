@@ -275,15 +275,12 @@ def audit() -> list[dict]:
 # baseline member. All three departures are the same lifecycle-policy closure,
 # not downgraded verdicts or hidden work. Re-adding DONE to GATED_STATES is the
 # load-bearing mutation pinned in the paired suite.
-# 2026-08-11: +ENG-TRAILER-MERGE-ARTIFACTS. The row reaches ACTIVE on its
-# committed spec (issue #406), whose Gates section names the preflight,
-# tests/scripts and agent-integration invocations plus the per-commit
-# re-verification of the five real main commits, and records that no
-# CUDA/GPU/SACRED gate is implicated because no product source is touched.
-# Growth, so the set is re-pinned in the same change.
+# 2026-08-11: +ENG-TRAILER-MERGE-ARTIFACTS on arrival at ACTIVE, then REMOVED
+# the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
+# the gated population, so its verdict is None rather than a downgraded one.
+# A shrink for a real record edit, named as the message demands.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
-    "ENG-TRAILER-MERGE-ARTIFACTS",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
