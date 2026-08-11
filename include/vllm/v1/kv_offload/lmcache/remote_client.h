@@ -133,9 +133,13 @@ class LmcacheRemoteClient {
                  std::vector<std::string>* v_planes);
 
  private:
+  enum class ResponsePayload { kForbidden, kRequired, kOptional };
+
   // Loop until all n bytes are written / read; throw on error or peer EOF.
   void SendAll(const char* data, std::size_t n);
   void RecvAll(char* data, std::size_t n);
+  ServerMetaMessage ReceiveMeta(const char* operation,
+                                ResponsePayload success_payload);
 
   LmcacheClientConfig config_;
   static constexpr std::uintptr_t kInvalidSocket =

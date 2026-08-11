@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -290,6 +291,75 @@ class MockLmcacheServer {
   bool close_immediately_ = false;
 };
 
+class OneReplyServer {
+ public:
+  OneReplyServer(std::string reply, std::string payload = {})
+      : reply_(std::move(reply)), payload_(std::move(payload)) {
+    EnsureTestSockets();
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listen_fd_ != kInvalidTestSocket);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                   static_cast<TestSocketLength>(sizeof(addr))) == 0);
+    TestSocketLength length = static_cast<TestSocketLength>(sizeof(addr));
+    REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                          &length) == 0);
+    port_ = ntohs(addr.sin_port);
+    REQUIRE(::listen(listen_fd_, 1) == 0);
+    thread_ = std::thread([this] {
+      TestSocket client = ::accept(listen_fd_, nullptr, nullptr);
+      if (client == kInvalidTestSocket) return;
+      std::string request(ClientMetaMessage::PackLength(), '\0');
+      if (RecvRequest(client, request.data(), request.size())) {
+        SendReply(client, reply_.data(), reply_.size());
+        SendReply(client, payload_.data(), payload_.size());
+      }
+      CloseTestSocket(client);
+    });
+  }
+
+  ~OneReplyServer() {
+    ShutdownTestSocket(listen_fd_);
+    CloseTestSocket(listen_fd_);
+    if (thread_.joinable()) thread_.join();
+  }
+  int port() const { return port_; }
+
+ private:
+  static bool RecvRequest(TestSocket fd, char* data, std::size_t size) {
+    std::size_t offset = 0;
+    while (offset < size) {
+      const auto count = TestRecv(fd, data + offset, size - offset);
+      if (count <= 0) return false;
+      offset += static_cast<std::size_t>(count);
+    }
+    return true;
+  }
+  static void SendReply(TestSocket fd, const char* data, std::size_t size) {
+    std::size_t offset = 0;
+    while (offset < size) {
+      const auto count = TestSend(fd, data + offset, size - offset);
+      if (count <= 0) return;
+      offset += static_cast<std::size_t>(count);
+    }
+  }
+  TestSocket listen_fd_ = kInvalidTestSocket;
+  int port_ = 0;
+  std::string reply_;
+  std::string payload_;
+  std::thread thread_;
+};
+
+LmcacheClientConfig OneReplyConfig(const OneReplyServer& server) {
+  LmcacheClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.port();
+  config.connect_retries = 1;
+  return config;
+}
+
 // Deterministic pseudo-random-ish bytes so payloads are non-trivial.
 std::string MakeBytes(std::size_t n, uint32_t seed) {
   std::string s(n, '\0');
@@ -418,6 +488,75 @@ TEST_CASE("lmcache peer close invalidates the owned socket") {
   CHECK_FALSE(client.connected());
   client.Close();
   CHECK_FALSE(client.connected());
+}
+
+TEST_CASE("lmcache malformed response headers close the connection") {
+  ServerMetaMessage meta;
+  meta.code = ServerReturnCode::kSuccess;
+  meta.length = -1;
+  meta.fmt = MemoryFormat::kKV2LTD;
+  meta.dtype = Dtype::kFloat16;
+  meta.shape = {2, 1, 1, 1};
+  OneReplyServer server(meta.Serialize());
+  LmcacheRemoteClient client(OneReplyConfig(server));
+  client.Connect();
+  CHECK_THROWS_WITH_AS(client.Get("m@1@0@1@half"),
+                       doctest::Contains("negative response length"),
+                       std::runtime_error);
+  CHECK_FALSE(client.connected());
+}
+
+TEST_CASE("lmcache invalid return code and decode failure close connection") {
+  ServerMetaMessage meta;
+  meta.code = static_cast<ServerReturnCode>(201);
+  meta.length = 0;
+  meta.fmt = MemoryFormat::kKV2LTD;
+  meta.dtype = Dtype::kFloat16;
+  meta.shape = {0, 0, 0, 0};
+  {
+    OneReplyServer server(meta.Serialize());
+    LmcacheRemoteClient client(OneReplyConfig(server));
+    client.Connect();
+    CHECK_THROWS_WITH_AS(client.Health(), doctest::Contains("return code"),
+                         std::runtime_error);
+    CHECK_FALSE(client.connected());
+  }
+  std::string invalid_dtype = meta.Serialize();
+  invalid_dtype[12] = static_cast<char>(99);
+  {
+    OneReplyServer server(invalid_dtype);
+    LmcacheRemoteClient client(OneReplyConfig(server));
+    client.Connect();
+    CHECK_THROWS(client.Health());
+    CHECK_FALSE(client.connected());
+  }
+}
+
+TEST_CASE("lmcache response lengths match the requested operation") {
+  ServerMetaMessage meta;
+  meta.code = ServerReturnCode::kFail;
+  meta.length = 1;
+  meta.fmt = MemoryFormat::kKV2LTD;
+  meta.dtype = Dtype::kFloat16;
+  meta.shape = {0, 0, 0, 0};
+  OneReplyServer server(meta.Serialize(), "x");
+  LmcacheRemoteClient client(OneReplyConfig(server));
+  client.Connect();
+  CHECK_THROWS_WITH_AS(client.Exist("m@1@0@1@half"),
+                       doctest::Contains("error response length"),
+                       std::runtime_error);
+  CHECK_FALSE(client.connected());
+}
+
+TEST_CASE("lmcache oversized PUT is rejected before the signed wire cast") {
+  LmcacheRemoteClient client;
+  static const char byte = 0;
+  const std::string_view oversized(
+      &byte, static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) + 1);
+  CHECK_THROWS_WITH_AS(
+      client.Put("m@1@0@1@half", oversized, MemoryFormat::kKV2LTD,
+                 Dtype::kFloat16, {2, 1, 1, 1}),
+      doctest::Contains("INT32_MAX"), std::invalid_argument);
 }
 
 TEST_CASE("lmcache LmcacheRemoteClient config from env") {

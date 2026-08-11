@@ -392,6 +392,12 @@ AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
 pwsh -File scripts/build-windows-release.ps1
 ```
 
+The adaptive binary keeps its F16C translation unit at `/arch:AVX`; AVX2 and
+AVX-512 remain separate runtime-selected translation units. The gate derives
+the complete server source set from CMake's generated codemodel, audits project
+COFF directives for static `LIBCMT`, and rejects dynamic/debug CRT imports from
+the staged executable before starting the HTTP smoke.
+
 The default smoke model is the committed tiny embedding fixture; pass
 `-SmokeModel C:\path\to\model` to use another complete model directory. This
 command produces a staged developer tree only. The Windows CPU and Vulkan ZIP

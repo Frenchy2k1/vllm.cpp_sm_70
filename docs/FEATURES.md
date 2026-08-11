@@ -26,7 +26,7 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 37 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ✅ v0.0.2 publishes eight indexed CPU/CUDA/Vulkan/Metal/MLX archives with checksums, provenance records, manifests, and SBOMs | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows CPU/Vulkan substrate is implemented; preview ZIPs await hosted/prerelease gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 

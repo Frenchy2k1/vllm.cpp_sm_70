@@ -4,7 +4,8 @@ param(
     [string]$BuildDir = (Join-Path $SourceDir "build-release-windows-cpu"),
     [string]$StageDir = (Join-Path $BuildDir "stage"),
     [string]$SmokeModel = (Join-Path $SourceDir "tests/vllm/models/fixtures/llama_embed_e2e"),
-    [int]$SmokePort = 18080
+    [int]$SmokePort = 18080,
+    [switch]$ContractTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,9 +20,79 @@ function Invoke-Checked {
     }
 }
 
+function Assert-CrtPolicy {
+    param([Parameter(Mandatory)][string[]]$DirectiveOutput,
+          [Parameter(Mandatory)][string[]]$ImportOutput)
+    $directives = $DirectiveOutput -join "`n"
+    $imports = $ImportOutput -join "`n"
+    if ($directives -notmatch '(?im)DEFAULTLIB\s*:\s*"?LIBCMT"?') {
+        throw "COFF CRT audit: no /DEFAULTLIB:LIBCMT static CRT directive found"
+    }
+    if ($directives -match '(?im)DEFAULTLIB\s*:\s*"?(?:MSVCRT|MSVCPRT|LIBCMTD)"?') {
+        throw "COFF CRT audit: dynamic or debug CRT directive found"
+    }
+    if ($imports -match '(?im)^\s*(?:VCRUNTIME[^\s]*|MSVCP[^\s]*|CONCRT[^\s]*|UCRTBASED?|api-ms-win-crt-[^\s]*|MSVCR[^\s]*)\.dll\s*$') {
+        throw "PE CRT audit: dynamic or debug CRT DLL import found"
+    }
+}
+
+function Invoke-CrtAudit {
+    param([Parameter(Mandatory)][string[]]$Artifacts,
+          [Parameter(Mandatory)][string]$Server,
+          [scriptblock]$DumpbinRunner = {
+              param([string]$Mode, [string]$Path)
+              $output = & dumpbin $Mode $Path 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                  throw "dumpbin $Mode failed for $Path with status $LASTEXITCODE"
+              }
+              return @($output)
+          })
+    $directiveOutput = @()
+    foreach ($artifact in $Artifacts) {
+        $directiveOutput += & $DumpbinRunner "/directives" $artifact
+    }
+    $importOutput = @(& $DumpbinRunner "/imports" $Server)
+    Assert-CrtPolicy -DirectiveOutput $directiveOutput -ImportOutput $importOutput
+    Write-Host ($directiveOutput -join "`n")
+    Write-Host ($importOutput -join "`n")
+}
+
+function Invoke-CrtContractTests {
+    $good = {
+        param([string]$Mode, [string]$Path)
+        if ($Mode -eq "/directives") { return '/DEFAULTLIB:"LIBCMT"' }
+        return @("$Path", "KERNEL32.dll", "WS2_32.dll")
+    }
+    Invoke-CrtAudit -Artifacts @("fake-vllm.lib", "fake-server.obj") `
+        -Server "fake-vllm-server.exe" -DumpbinRunner $good
+    foreach ($bad in @(
+        { param($Mode, $Path) if ($Mode -eq "/directives") { '/DEFAULTLIB:"MSVCRT"' } else { 'KERNEL32.dll' } },
+        { param($Mode, $Path) if ($Mode -eq "/directives") { '/DEFAULTLIB:"LIBCMT"' } else { 'UCRTBASE.dll' } }
+    )) {
+        $rejected = $false
+        try {
+            Invoke-CrtAudit -Artifacts @("fake.lib") -Server "fake.exe" `
+                -DumpbinRunner $bad
+        } catch {
+            $rejected = $true
+        }
+        if (-not $rejected) { throw "injected bad dumpbin output was accepted" }
+    }
+}
+
+if ($ContractTest) {
+    Invoke-CrtContractTests
+    Write-Host "Windows PowerShell/CRT contract tests OK"
+    exit 0
+}
+
 if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
     throw "Windows runtime smoke model is incomplete: $SmokeModel"
 }
+
+$queryDir = Join-Path $BuildDir ".cmake/api/v1/query"
+New-Item -ItemType Directory -Force -Path $queryDir | Out-Null
+New-Item -ItemType File -Force -Path (Join-Path $queryDir "codemodel-v2") | Out-Null
 
 Invoke-Checked cmake @(
     "-S", $SourceDir,
@@ -41,6 +112,11 @@ Invoke-Checked cmake @(
     "-DVLLM_CPP_TRITON=OFF",
     "-DVLLM_CPP_VULKAN=OFF",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+)
+Invoke-Checked python @(
+    (Join-Path $SourceDir "scripts/check-windows-portability.py"),
+    "--root", $SourceDir,
+    "--build-dir", $BuildDir
 )
 
 $targets = @(
@@ -93,6 +169,16 @@ if (-not (Test-Path $server)) {
     throw "native install did not stage bin/vllm-server.exe"
 }
 Invoke-Checked $server @("--help")
+
+$crtArtifacts = @(
+    Get-ChildItem -Path $BuildDir -Recurse -File -Include "*.obj", "vllm*.lib" |
+        Where-Object { $_.FullName -notmatch '[\\/](?:_deps|third_party)[\\/]' } |
+        ForEach-Object { $_.FullName }
+)
+if ($crtArtifacts.Count -eq 0) {
+    throw "COFF CRT audit found no project objects or static libraries"
+}
+Invoke-CrtAudit -Artifacts $crtArtifacts -Server $server
 
 # Python's Windows subprocess path calls CreateProcess with
 # CREATE_NEW_PROCESS_GROUP, letting the smoke target one CTRL_BREAK_EVENT at the

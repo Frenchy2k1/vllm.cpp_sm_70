@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
 #if defined(_WIN32)
+#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
@@ -16,9 +18,68 @@
 
 namespace vllm::platform {
 
+#if defined(_WIN32)
+namespace {
+struct WindowsHandlerState {
+  std::atomic<unsigned> in_flight{0};
+  std::atomic<bool> pending{false};
+  HANDLE stop_event = nullptr;
+  HANDLE quit_event = nullptr;
+  HANDLE drained_event = nullptr;
+  HANDLE before_drain_test_event = nullptr;
+};
+
+std::atomic<WindowsHandlerState*> g_handler_state{nullptr};
+std::atomic<unsigned> g_handler_acquisitions{0};
+
+bool DispatchControlEvent(DWORD event, HANDLE acquired_event = nullptr,
+                          HANDLE resume_event = nullptr) {
+  if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return false;
+  g_handler_acquisitions.fetch_add(1, std::memory_order_acq_rel);
+  WindowsHandlerState* state =
+      g_handler_state.load(std::memory_order_acquire);
+  if (state != nullptr) {
+    state->in_flight.fetch_add(1, std::memory_order_acq_rel);
+  }
+  g_handler_acquisitions.fetch_sub(1, std::memory_order_acq_rel);
+  if (state == nullptr) return false;
+
+  if (acquired_event != nullptr) SetEvent(acquired_event);
+  if (resume_event != nullptr) WaitForSingleObject(resume_event, INFINITE);
+  state->pending.store(true, std::memory_order_release);
+  SetEvent(state->stop_event);
+  if (state->in_flight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    SetEvent(state->drained_event);
+  }
+  return true;
+}
+}  // namespace
+#endif
+
 class ConsoleShutdown::Impl {
  public:
-  explicit Impl(std::function<void()> stop) : stop_(std::move(stop)) {}
+  explicit Impl(std::function<void()> stop) : stop_(std::move(stop)) {
+#if defined(_WIN32)
+    win_state_ = std::make_unique<WindowsHandlerState>();
+    win_state_->stop_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    win_state_->quit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    win_state_->drained_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (win_state_->stop_event == nullptr || win_state_->quit_event == nullptr ||
+        win_state_->drained_event == nullptr) {
+      throw std::runtime_error("server: could not create console shutdown events");
+    }
+    worker_ = std::thread([this] {
+      const HANDLE events[] = {win_state_->quit_event, win_state_->stop_event};
+      while (true) {
+        const DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        if (win_state_->pending.exchange(false, std::memory_order_acq_rel)) {
+          RequestStop();
+        }
+        if (result == WAIT_OBJECT_0) return;
+      }
+    });
+#endif
+  }
 
   void RequestStop() {
     bool expected = false;
@@ -34,20 +95,17 @@ class ConsoleShutdown::Impl {
   std::thread watcher_;
   int pipe_fds_[2] = {-1, -1};
 #endif
+#if defined(_WIN32)
+  std::unique_ptr<WindowsHandlerState> win_state_;
+  std::thread worker_;
+#endif
   bool armed_ = false;
 };
 
 namespace {
 #if defined(_WIN32)
-std::atomic<ConsoleShutdown*> g_console_shutdown{nullptr};
-
 BOOL WINAPI ConsoleControlHandler(DWORD event) {
-  if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return FALSE;
-  ConsoleShutdown* shutdown =
-      g_console_shutdown.load(std::memory_order_acquire);
-  if (shutdown == nullptr) return FALSE;
-  shutdown->RequestStop();
-  return TRUE;
+  return DispatchControlEvent(event) ? TRUE : FALSE;
 }
 #else
 std::atomic<int> g_signal_write_fd{-1};
@@ -68,12 +126,12 @@ ConsoleShutdown::ConsoleShutdown(std::function<void()> stop,
     : impl_(std::make_unique<Impl>(std::move(stop))) {
   if (!install_handlers) return;
 #if defined(_WIN32)
-  ConsoleShutdown* expected = nullptr;
-  if (!g_console_shutdown.compare_exchange_strong(expected, this,
-                                                   std::memory_order_acq_rel) ||
+  WindowsHandlerState* expected = nullptr;
+  if (!g_handler_state.compare_exchange_strong(expected, impl_->win_state_.get(),
+                                                std::memory_order_acq_rel) ||
       !SetConsoleCtrlHandler(ConsoleControlHandler, TRUE)) {
     if (expected == nullptr) {
-      g_console_shutdown.store(nullptr, std::memory_order_release);
+      g_handler_state.store(nullptr, std::memory_order_release);
     }
     std::cerr << "server: could not install console control handler; shutdown "
                  "will not be graceful\n";
@@ -119,10 +177,24 @@ ConsoleShutdown::~ConsoleShutdown() {
 #if defined(_WIN32)
   if (impl_->armed_) {
     SetConsoleCtrlHandler(ConsoleControlHandler, FALSE);
-    ConsoleShutdown* expected = this;
-    g_console_shutdown.compare_exchange_strong(expected, nullptr,
-                                                std::memory_order_acq_rel);
+    WindowsHandlerState* expected = impl_->win_state_.get();
+    g_handler_state.compare_exchange_strong(expected, nullptr,
+                                             std::memory_order_acq_rel);
+    while (g_handler_acquisitions.load(std::memory_order_acquire) != 0) {
+      SwitchToThread();
+    }
+    if (impl_->win_state_->before_drain_test_event != nullptr) {
+      SetEvent(impl_->win_state_->before_drain_test_event);
+    }
+    while (impl_->win_state_->in_flight.load(std::memory_order_acquire) != 0) {
+      WaitForSingleObject(impl_->win_state_->drained_event, INFINITE);
+    }
   }
+  SetEvent(impl_->win_state_->quit_event);
+  if (impl_->worker_.joinable()) impl_->worker_.join();
+  CloseHandle(impl_->win_state_->drained_event);
+  CloseHandle(impl_->win_state_->quit_event);
+  CloseHandle(impl_->win_state_->stop_event);
 #else
   if (impl_->armed_) {
     std::signal(SIGTERM, SIG_DFL);
@@ -140,5 +212,19 @@ ConsoleShutdown::~ConsoleShutdown() {
 }
 
 void ConsoleShutdown::RequestStop() { impl_->RequestStop(); }
+
+#if defined(_WIN32)
+void ConsoleShutdown::SetBeforeDrainEventForTest(void* event) {
+  impl_->win_state_->before_drain_test_event = static_cast<HANDLE>(event);
+}
+
+bool ConsoleShutdown::DispatchControlEventForTest(unsigned long event,
+                                                  void* acquired_event,
+                                                  void* resume_event) {
+  return DispatchControlEvent(static_cast<DWORD>(event),
+                              static_cast<HANDLE>(acquired_event),
+                              static_cast<HANDLE>(resume_event));
+}
+#endif
 
 }  // namespace vllm::platform

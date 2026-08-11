@@ -30,6 +30,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -2603,3 +2609,38 @@ TEST_CASE("platform shutdown: a stop request is thread-safe and idempotent") {
   shutdown.RequestStop();
   CHECK(stops.load() == 1);
 }
+
+#if defined(_WIN32)
+TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
+  HANDLE acquired = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE before_drain = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  REQUIRE(acquired != nullptr);
+  REQUIRE(resume != nullptr);
+  REQUIRE(before_drain != nullptr);
+  std::atomic<int> stops{0};
+  std::atomic<bool> destroyed{false};
+  auto shutdown = std::make_unique<vllm::platform::ConsoleShutdown>(
+      [&]() { ++stops; });
+  shutdown->SetBeforeDrainEventForTest(before_drain);
+  std::thread handler([&] {
+    CHECK(vllm::platform::ConsoleShutdown::DispatchControlEventForTest(
+        CTRL_BREAK_EVENT, acquired, resume));
+  });
+  REQUIRE(WaitForSingleObject(acquired, INFINITE) == WAIT_OBJECT_0);
+  std::thread destroyer([&] {
+    shutdown.reset();
+    destroyed.store(true, std::memory_order_release);
+  });
+  REQUIRE(WaitForSingleObject(before_drain, INFINITE) == WAIT_OBJECT_0);
+  CHECK_FALSE(destroyed.load(std::memory_order_acquire));
+  REQUIRE(SetEvent(resume) != 0);
+  handler.join();
+  destroyer.join();
+  CHECK(destroyed.load(std::memory_order_acquire));
+  CHECK(stops.load() == 1);
+  CloseHandle(before_drain);
+  CloseHandle(resume);
+  CloseHandle(acquired);
+}
+#endif
