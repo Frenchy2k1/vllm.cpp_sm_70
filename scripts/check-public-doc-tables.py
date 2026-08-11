@@ -550,7 +550,11 @@ STATUS_RATCHET = {
     # (throughput 1.021246x PASS, the other three axes OPEN) plus the pointer.
     # Nothing was lost, only de-duplicated -- every dropped figure was verified
     # present in both other surfaces first. Net -4. Strictly DOWN.
-    "chars": 243283,
+    #
+    # 243245 since 2026-08-11 (measured 243245): ENG-RELEASE-CONTAINERS
+    # owes the page a lifecycle line, paid for inside the release
+    # paragraph rather than out of the page. Strictly DOWN.
+    "chars": 243245,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

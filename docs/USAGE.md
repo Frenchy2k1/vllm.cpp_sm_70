@@ -444,6 +444,73 @@ static tuple is the CPU-only `linux-x86_64-musl-cpu-static` experiment; normal
 CPU and accelerator archives are static-core bundles with audited host runtime
 dependencies.
 
+## Container images
+
+Published to one GHCR package with the lane in the tag:
+`ghcr.io/mudler/vllm.cpp:<version>-cuda`, `-vulkan`, `-cpu`, plus the moving
+`:latest-<lane>`. The bare `:latest` is the **cpu** lane, so pulling it on a
+machine with no accelerator gets a working server rather than a library-load
+failure. Every lane is a `linux/amd64` + `linux/arm64` manifest.
+
+The entrypoint is `vllm-server`, so flags go straight after the image name and
+the server keeps its own default of `0.0.0.0:8000`:
+
+```sh
+docker run --rm -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/mudler/vllm.cpp:latest \
+  --model /models/Qwen3.6-35B-A3B
+```
+
+For the CUDA lane, the GPU driver comes from the host through the container
+runtime; the image carries only the CUDA *runtime* libraries it links:
+
+```sh
+docker run --rm --gpus all -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/mudler/vllm.cpp:latest-cuda \
+  --model /models/Qwen3.6-35B-A3B
+```
+
+`/models` is the weights mount and `/cache` is the tokenizer/HF cache; the
+container runs as uid 1000, so `/cache` must be writable by it if you bind-mount
+one. `ffmpeg` is installed in every lane, so `/v1/videos` works out of the box —
+a deliberate difference from the tarballs, which never vendor it because they
+are extracted onto a host that already has a `PATH`.
+
+macOS Metal and MLX have no image and never will: there is no macOS container
+runtime and no Metal passthrough. ROCm has no image until its backend compiles.
+
+### Building and validating an image locally
+
+One Dockerfile, one target per lane. The builder stage runs the same
+`scripts/build-*-release.sh` the release workflow runs, so there is no second
+build definition to drift:
+
+```sh
+docker build -f docker/Dockerfile --target cpu \
+  --build-arg VERSION=0.0.1 \
+  --build-arg SOURCE_SHA=$(git rev-parse HEAD) \
+  --build-arg JOBS=$(nproc) \
+  -t vllm-cpp:local-cpu .
+```
+
+Then gate it. Without `--model` the validator checks configuration and layout
+and says plainly that the image has no runtime evidence; with one it also boots
+the server, requires `/health` and `/version`, runs the image's own declared
+healthcheck, and requires a clean SIGTERM shutdown:
+
+```sh
+python3 scripts/validate-container-image.py \
+  --image vllm-cpp:local-cpu --lane cpu --version 0.0.1 \
+  --model /path/to/opt-125m
+```
+
+`scripts/check-container-matrix.py` keeps `release/container-matrix.json` and
+the Dockerfile agreeing about lanes, tags and digest-pinned bases;
+`scripts/check-container-workflow.py` holds the publish workflow to its
+least-privilege stages. Both run in preflight and CI.
+
 To exercise the release pipeline without publishing anything, trigger its
 manual entry point:
 

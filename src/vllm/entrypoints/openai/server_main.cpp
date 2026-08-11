@@ -44,6 +44,10 @@
 #include <utility>
 #include <vector>
 #include <atomic>
+#include <cerrno>
+#include <csignal>
+#include <functional>
+#include <thread>
 #include <sys/wait.h>
 #include <unistd.h>
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
@@ -454,6 +458,85 @@ Args ParseArgs(int argc, char** argv) {
   return a;
 }
 
+
+// Clean shutdown on SIGTERM/SIGINT -- issue #312.
+//
+// Without this the server ignores SIGTERM outright when it is PID 1, because
+// the kernel does not apply default signal dispositions to PID 1. Every
+// `docker stop`, Kubernetes rolling update and `compose down` therefore waited
+// out its grace period and then SIGKILLed, dropping in-flight requests.
+//
+// The handler itself only write()s one byte to a self-pipe, which IS
+// async-signal-safe; a watcher thread does the actual stop(). That is the same
+// shape the VT_BENCH_PROFILE_CONTROL FIFO shutdown already uses, so both paths
+// converge on one stop().
+class SignalShutdown {
+ public:
+  explicit SignalShutdown(std::function<void()> stop) : stop_(std::move(stop)) {
+    if (pipe(pipe_fds_) != 0) {
+      std::cerr << "server: could not install signal handlers (pipe failed); "
+                   "shutdown will not be graceful\n";
+      return;
+    }
+    write_fd.store(pipe_fds_[1], std::memory_order_release);
+    armed_ = Install(SIGTERM) && Install(SIGINT);
+    if (!armed_) return;
+    watcher_ = std::thread([this]() {
+      char byte = 0;
+      while (true) {
+        const ssize_t bytes = read(pipe_fds_[0], &byte, 1);
+        if (bytes == 1) {
+          if (byte == kCancel) return;
+          std::cerr << "server: shutting down on signal "
+                    << static_cast<int>(byte) << "\n";
+          stop_();
+          return;
+        }
+        if (bytes < 0 && errno == EINTR) continue;
+        return;
+      }
+    });
+  }
+
+  ~SignalShutdown() {
+    if (armed_) {
+      std::signal(SIGTERM, SIG_DFL);
+      std::signal(SIGINT, SIG_DFL);
+      const char cancel = kCancel;
+      const ssize_t ignored = write(pipe_fds_[1], &cancel, 1);
+      (void)ignored;
+    }
+    if (watcher_.joinable()) watcher_.join();
+    for (int fd : pipe_fds_) {
+      if (fd >= 0) close(fd);
+    }
+    write_fd.store(-1, std::memory_order_release);
+  }
+
+  SignalShutdown(const SignalShutdown&) = delete;
+  SignalShutdown& operator=(const SignalShutdown&) = delete;
+
+  static inline std::atomic<int> write_fd{-1};
+
+ private:
+  static constexpr char kCancel = 0;
+
+  static void Handle(int signum) {
+    const int fd = write_fd.load(std::memory_order_acquire);
+    if (fd < 0) return;
+    const char byte = static_cast<char>(signum);
+    const ssize_t ignored = write(fd, &byte, 1);
+    (void)ignored;
+  }
+
+  static bool Install(int signum) { return std::signal(signum, Handle) != SIG_ERR; }
+
+  std::function<void()> stop_;
+  std::thread watcher_;
+  int pipe_fds_[2] = {-1, -1};
+  bool armed_ = false;
+};
+
 }  // namespace
 
 namespace vllm {
@@ -582,6 +665,7 @@ int VllmServerMain(int argc, char** argv) {
             });
         std::cerr << "server: listening on http://" << args.host << ":"
                   << args.port << "\n";
+        SignalShutdown shutdown_on_signal([&]() { embed_server.stop(); });
         if (!embed_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
@@ -605,6 +689,7 @@ int VllmServerMain(int argc, char** argv) {
             });
         std::cerr << "server: listening on http://" << args.host << ":"
                   << args.port << "\n";
+        SignalShutdown shutdown_on_signal([&]() { asr_server.stop(); });
         if (!asr_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
@@ -1035,6 +1120,7 @@ int VllmServerMain(int argc, char** argv) {
     }
 #endif
 
+    SignalShutdown shutdown_on_signal([&]() { server.stop(); });
     const bool listen_ok = server.listen(args.host, args.port);
 
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
