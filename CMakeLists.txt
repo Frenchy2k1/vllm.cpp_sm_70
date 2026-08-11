@@ -1054,7 +1054,6 @@ add_library(vllm STATIC
   src/vt/ops.cpp
   src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
-  src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
@@ -1111,7 +1110,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   set_source_files_properties(
     src/vt/cpu/cpu_matmul_elem_f16c.cpp PROPERTIES
     COMPILE_OPTIONS
-      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX2>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mf16c>")
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mf16c>")
   set_source_files_properties(
     src/vt/cpu/cpu_matmul_elem_avx2.cpp PROPERTIES
     COMPILE_OPTIONS
@@ -1440,6 +1439,7 @@ if(VLLM_CPP_CUDA)
   endif()
   target_sources(vllm PRIVATE
     src/vllm/platforms/cuda.cpp
+    src/vt/cuda/nvfp4_persistent_cache.cpp
     src/vt/cuda/cuda_arch_tactics.cu
     src/vt/cuda/cuda_backend.cu
     src/vt/cuda/nccl_communicator.cu

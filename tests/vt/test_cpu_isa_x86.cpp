@@ -1,7 +1,9 @@
 #include <array>
+#include <bit>
 #include <string>
 
 #include "doctest/doctest.h"
+#include "vllm/model_executor/models/device_pool.h"
 #include "vt/cpu/cpu_isa_x86.h"
 
 namespace {
@@ -19,6 +21,22 @@ vt::cpu::X86IsaCaps FullAvx512() {
 }
 
 }  // namespace
+
+TEST_CASE("device pool size classes preserve power-of-two alignment") {
+  CHECK(vllm::DevicePool::SizeClassForTest(0) == 1);
+  for (std::size_t bytes = 1; bytes <= 4096; ++bytes) {
+    const std::size_t size_class =
+        vllm::DevicePool::SizeClassForTest(bytes);
+    CHECK(size_class >= bytes);
+    const int msb = static_cast<int>(std::bit_width(bytes)) - 1;
+    if (msb >= 4) {
+      const std::size_t alignment = std::size_t{1} << (msb - 4);
+      CHECK((size_class % alignment) == 0);
+    } else {
+      CHECK(size_class == bytes);
+    }
+  }
+}
 
 TEST_CASE("x86 ISA selection requires CPU bits and exact OS-enabled state") {
   using vt::cpu::SelectX86IsaTier;

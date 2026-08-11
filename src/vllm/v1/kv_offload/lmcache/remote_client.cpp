@@ -250,11 +250,53 @@ void LmcacheRemoteClient::RecvAll(char* data, std::size_t n) {
   }
 }
 
+ServerMetaMessage LmcacheRemoteClient::ReceiveMeta(
+    const char* operation, ResponsePayload success_payload) {
+  std::string reply(ServerMetaMessage::PackLength(), '\0');
+  RecvAll(reply.data(), reply.size());
+  try {
+    ServerMetaMessage meta = ServerMetaMessage::Deserialize(reply);
+    if (meta.code != ServerReturnCode::kSuccess &&
+        meta.code != ServerReturnCode::kFail) {
+      throw std::runtime_error(std::string(operation) +
+                               ": invalid server return code " +
+                               std::to_string(static_cast<int32_t>(meta.code)));
+    }
+    if (meta.length < 0) {
+      throw std::runtime_error(std::string(operation) +
+                               ": negative response length");
+    }
+    if (meta.code == ServerReturnCode::kFail && meta.length != 0) {
+      throw std::runtime_error(std::string(operation) +
+                               ": error response length must be zero");
+    }
+    if (meta.code == ServerReturnCode::kSuccess) {
+      if (success_payload == ResponsePayload::kForbidden && meta.length != 0) {
+        throw std::runtime_error(std::string(operation) +
+                                 ": success response length must be zero");
+      }
+      if (success_payload == ResponsePayload::kRequired && meta.length == 0) {
+        throw std::runtime_error(std::string(operation) +
+                                 ": success response payload is missing");
+      }
+    }
+    return meta;
+  } catch (...) {
+    Close();
+    throw;
+  }
+}
+
 void LmcacheRemoteClient::Put(const std::string& key, std::string_view kv_bytes,
                               MemoryFormat fmt, Dtype dtype,
                               const std::vector<int32_t>& shape) {
   // ClientMetaMessage(PUT, key, len(kv_bytes), fmt, dtype, shape) then the raw
   // payload (lm_connector.py:126-136).
+  if (kv_bytes.size() >
+      static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
+    throw std::invalid_argument(
+        "LmcacheRemoteClient::Put: payload exceeds INT32_MAX wire limit");
+  }
   ClientMetaMessage msg;
   msg.command = ClientCommand::kPut;
   msg.key = key;
@@ -282,9 +324,8 @@ std::optional<LmcacheRemoteClient::GetResult> LmcacheRemoteClient::Get(
   const std::string header = msg.Serialize();
   SendAll(header.data(), header.size());
 
-  std::string reply(ServerMetaMessage::PackLength(), '\0');
-  RecvAll(reply.data(), reply.size());
-  const ServerMetaMessage meta = ServerMetaMessage::Deserialize(reply);
+  const ServerMetaMessage meta =
+      ReceiveMeta("LmcacheRemoteClient::Get", ResponsePayload::kRequired);
   if (meta.code != ServerReturnCode::kSuccess) {
     return std::nullopt;  // absent
   }
@@ -310,9 +351,8 @@ bool LmcacheRemoteClient::Exist(const std::string& key) {
   const std::string header = msg.Serialize();
   SendAll(header.data(), header.size());
 
-  std::string reply(ServerMetaMessage::PackLength(), '\0');
-  RecvAll(reply.data(), reply.size());
-  return ServerMetaMessage::Deserialize(reply).code == ServerReturnCode::kSuccess;
+  return ReceiveMeta("LmcacheRemoteClient::Exist", ResponsePayload::kForbidden)
+             .code == ServerReturnCode::kSuccess;
 }
 
 // The lm:// server deserializes EVERY header via parse_cache_key BEFORE the
@@ -334,9 +374,8 @@ bool LmcacheRemoteClient::Health() {
   const std::string header = msg.Serialize();
   SendAll(header.data(), header.size());
 
-  std::string reply(ServerMetaMessage::PackLength(), '\0');
-  RecvAll(reply.data(), reply.size());
-  return ServerMetaMessage::Deserialize(reply).code == ServerReturnCode::kSuccess;
+  return ReceiveMeta("LmcacheRemoteClient::Health", ResponsePayload::kForbidden)
+             .code == ServerReturnCode::kSuccess;
 }
 
 std::vector<std::string> LmcacheRemoteClient::List() {
@@ -350,9 +389,8 @@ std::vector<std::string> LmcacheRemoteClient::List() {
   const std::string header = msg.Serialize();
   SendAll(header.data(), header.size());
 
-  std::string reply(ServerMetaMessage::PackLength(), '\0');
-  RecvAll(reply.data(), reply.size());
-  const ServerMetaMessage meta = ServerMetaMessage::Deserialize(reply);
+  const ServerMetaMessage meta =
+      ReceiveMeta("LmcacheRemoteClient::List", ResponsePayload::kOptional);
   std::vector<std::string> keys;
   if (meta.code != ServerReturnCode::kSuccess || meta.length == 0) {
     return keys;
@@ -369,8 +407,26 @@ std::vector<std::string> LmcacheRemoteClient::List() {
       }
       break;
     }
+    if (nl == start) {
+      Close();
+      throw std::runtime_error(
+          "LmcacheRemoteClient::List: empty key in response payload");
+    }
     keys.emplace_back(data.substr(start, nl - start));
     start = nl + 1;
+  }
+  if (!data.empty() && data.back() == '\n') {
+    Close();
+    throw std::runtime_error(
+        "LmcacheRemoteClient::List: trailing separator in response payload");
+  }
+  try {
+    for (const std::string& key : keys) {
+      (void)CacheEngineKey::FromString(key);
+    }
+  } catch (...) {
+    Close();
+    throw;
   }
   return keys;
 }

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,7 @@ SAFE_FILES = {
           PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:MSVC>:/arch:AVX2>")
         set_source_files_properties(src/vt/cpu/cpu_matmul_elem_f16c.cpp
           PROPERTIES COMPILE_OPTIONS
-            "$<$<CXX_COMPILER_ID:MSVC>:/arch:AVX2>;$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-mf16c>")
+            "$<$<CXX_COMPILER_ID:MSVC>:/arch:AVX>;$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-mf16c>")
     """,
     "src/vllm/entrypoints/openai/server_main.cpp": """
         int server_main_contract;
@@ -43,7 +44,18 @@ SAFE_FILES = {
     """,
     "src/vllm/platform/console_shutdown.cpp": """
         #ifdef _WIN32
+        std::atomic<unsigned> handler_acquisitions;
+        std::atomic<unsigned> in_flight;
+        bool DispatchControlEvent(DWORD event) {
+          handler_acquisitions.fetch_add(1); in_flight.fetch_add(1);
+          SetEvent(stop_event); return true;
+        }
+        BOOL WINAPI ConsoleControlHandler(DWORD event) {
+          return DispatchControlEvent(event);
+        }
         SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
+        SetEvent(stop_event);
+        WaitForSingleObject(impl_->win_state_->drained_event, INFINITE);
         #else
         #include <unistd.h>
         pipe(fds); read(fds[0], data, 1); write(fds[1], data, 1); close(fds[0]);
@@ -53,6 +65,7 @@ SAFE_FILES = {
         #ifdef _WIN32
         WSAStartup(MAKEWORD(2, 2), &data);
         WSAGetLastError(); closesocket(socket);
+        if (recv_result == 0) { Close(); throw peer_closed; }
         #else
         #include <sys/socket.h>
         close(socket);
@@ -60,8 +73,9 @@ SAFE_FILES = {
     """,
     "src/vllm/v1/kv_offload/fs_io.cpp": """
         #ifdef _WIN32
+        #define NOMINMAX
         CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL, nullptr);
+                    FILE_ATTRIBUTE_NORMAL, nullptr); CREATE_NEW;
         FlushFileBuffers(file);
         MoveFileExW(source.c_str(), destination.c_str(),
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
@@ -84,9 +98,21 @@ SAFE_FILES = {
         & "$StageDir/bin/vllm-server.exe" --help
         $env:VT_CPU_MATMUL_TIER = "amx"
         & "$StageDir/bin/vllm-server.exe" --help
+        dumpbin /directives library.lib
+        dumpbin /imports bin/vllm-server.exe
+        VCRUNTIME MSVCP CONCRT UCRTBASE api-ms-win-crt- MSVCR LIBCMT
     """,
     "src/vt/cpu/cpu_matmul_elem.cpp": """
         void PortableDispatcher();
+    """,
+    "src/vllm/model_executor/models/minimax_h3_sharded.cpp": """
+        #include <filesystem>
+        bool ok = std::filesystem::is_directory(path) ||
+                  std::filesystem::is_regular_file(path);
+    """,
+    "include/vllm/model_executor/models/device_pool.h": """
+        #include <bit>
+        auto width = std::bit_width(bytes);
     """,
 }
 
@@ -100,6 +126,9 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(textwrap.dedent(content), encoding="utf-8")
+        (root / ".windows-portability-sources.json").write_text(
+            json.dumps({"sources": sorted(files)}), encoding="utf-8"
+        )
         return root
 
     def setUp(self) -> None:
@@ -186,10 +215,114 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             textwrap.dedent(SAFE_FILES["CMakeLists.txt"]).replace(
                 'set_source_files_properties(src/vt/cpu/cpu_matmul_elem_f16c.cpp\n'
                 '  PROPERTIES COMPILE_OPTIONS\n'
-                '    "$<$<CXX_COMPILER_ID:MSVC>:/arch:AVX2>;$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-mf16c>")',
+                '    "$<$<CXX_COMPILER_ID:MSVC>:/arch:AVX>;$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-mf16c>")',
                 "",
             ),
             "dedicated F16C translation unit",
+        )
+
+    def test_f16c_tu_accepts_avx_but_rejects_avx2(self) -> None:
+        avx = textwrap.dedent(SAFE_FILES["CMakeLists.txt"])
+        result = self.run_checker(self.make_tree({"CMakeLists.txt": avx}))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_rejected(
+            "CMakeLists.txt",
+            avx.replace("/arch:AVX>", "/arch:AVX2>"),
+            "F16C translation unit must not require AVX2",
+        )
+
+    def test_rejects_dynamic_msvc_runtime(self) -> None:
+        self.assert_rejected(
+            "CMakeLists.txt",
+            textwrap.dedent(SAFE_FILES["CMakeLists.txt"]).replace(
+                '"MultiThreaded$<$<CONFIG:Debug>:Debug>"',
+                '"MultiThreadedDLL"',
+            ),
+            "exact static MSVC runtime",
+        )
+
+    def test_scans_all_shipped_server_sources(self) -> None:
+        self.assert_rejected(
+            "src/vllm/model_executor/models/minimax_h3_sharded.cpp",
+            "#include <sys/stat.h>\nstruct stat st; stat(path, &st);\n",
+            "unguarded POSIX",
+        )
+        self.assert_rejected(
+            "include/vllm/model_executor/models/device_pool.h",
+            "auto n = __builtin_clzll(bytes);\n",
+            "non-portable compiler builtin",
+        )
+
+    def test_pins_windows_file_publish_and_header_contracts(self) -> None:
+        fs = textwrap.dedent(SAFE_FILES["src/vllm/v1/kv_offload/fs_io.cpp"])
+        self.assert_rejected(
+            "src/vllm/v1/kv_offload/fs_io.cpp",
+            fs.replace("#define NOMINMAX\n", ""),
+            "NOMINMAX",
+        )
+        self.assert_rejected(
+            "src/vllm/v1/kv_offload/fs_io.cpp",
+            fs.replace("CREATE_NEW", "CREATE_ALWAYS"),
+            "CREATE_NEW",
+        )
+        self.assert_rejected(
+            "src/vllm/v1/kv_offload/fs_io.cpp",
+            fs.replace("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH",
+                       "MOVEFILE_REPLACE_EXISTING"),
+            "MOVEFILE_WRITE_THROUGH",
+        )
+
+    def test_pins_peer_close_invalidation(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/v1/kv_offload/lmcache/remote_client.cpp"]
+        )
+        result = self.run_checker(self.make_tree({
+            "src/vllm/v1/kv_offload/lmcache/remote_client.cpp": source,
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_rejected(
+            "src/vllm/v1/kv_offload/lmcache/remote_client.cpp",
+            source.replace("Close(); throw peer_closed", "throw peer_closed"),
+            "peer-close must invalidate",
+        )
+
+    def test_console_handler_uses_stable_event_and_drains_inflight(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        for mutation in (
+            "std::atomic<unsigned> handler_acquisitions;",
+            "std::atomic<unsigned> in_flight;",
+            "SetEvent(stop_event);",
+            "WaitForSingleObject(impl_->win_state_->drained_event, INFINITE);",
+        ):
+            self.assert_rejected(
+                "src/vllm/platform/console_shutdown.cpp",
+                source.replace(mutation, ""),
+                "stable event/in-flight",
+            )
+
+    def test_rejects_disabled_smoke_and_missing_crt_audit(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        result = self.run_checker(self.make_tree({
+            "scripts/build-windows-release.ps1": script,
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            script.replace('& "$StageDir/bin/vllm-server.exe" --help',
+                           '# & "$StageDir/bin/vllm-server.exe" --help'),
+            "live --help smoke",
+        )
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            script.replace("dumpbin /imports bin/vllm-server.exe", ""),
+            "PE CRT import audit",
+        )
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            script.replace("UCRTBASE", "UNRELATED_SYSTEM_DLL"),
+            "dynamic CRT rejection",
         )
 
 
