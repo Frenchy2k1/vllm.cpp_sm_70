@@ -1087,6 +1087,14 @@ SAMPLED from — a token top-k masked away reads `-inf` there and its true value
 under the raw pair. It is selectable by constructing a `Sampler` directly; there
 is no config, CLI or request field for it yet.
 
+The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
+[`lora/punica.h`](../include/vllm/lora/punica.h),
+[`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired
+to any engine path**: they are the in-progress runtime (`LORA-RUNTIME`), not a
+supported way to serve an adapter. There is no CLI flag, server flag, config key
+or C-ABI field for LoRA, and adding one is a later work item — see
+[`.agents/specs/lora-adapter.md`](../.agents/specs/lora-adapter.md).
+
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
 per position.

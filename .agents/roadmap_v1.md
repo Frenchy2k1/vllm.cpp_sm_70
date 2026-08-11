@@ -57,6 +57,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#294](https://github.com/mudler/vllm.cpp/issues/294) | `SERVE-ASYNC-LLM` | `test_async_llm`: reusing an aborted request id races the core abort — 26% failure rate under contention, on main | bug |
 | [#277](https://github.com/mudler/vllm.cpp/issues/277) | `SERVE-METRICS` | `/metrics` is dead on the production server: AsyncLLM never folds IterationStats into the logger | bug |
+| [#278](https://github.com/mudler/vllm.cpp/issues/278) | `LORA-RUNTIME` | LoRA W2: packed adapters, merged qkv/gate_up layers, TP slicing, embedding + logits LoRA | feature |
 | [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
 | [#250](https://github.com/mudler/vllm.cpp/issues/250) | — | `a5b52047` reached main without a task branch, and `check-role-discipline` cannot be waived | bug |
 | [#243](https://github.com/mudler/vllm.cpp/issues/243) | — | `vllm-feature-gap-analysis.md` is a stale 2026-07-28 snapshot: 9 of 16 HIGH/MED gaps have since landed | bug |
