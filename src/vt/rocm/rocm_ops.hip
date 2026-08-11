@@ -58,6 +58,15 @@ void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
                               const Tensor& state_idx, const Tensor* has_initial_state);
 void GdnStateScatterKernelRocm(Queue& q, Tensor& cache, const Tensor& working,
                                const Tensor& state_idx);
+// BACKEND-ROCM-GDN-KERNELS family 2 (rocm_gdn_conv.hip): causal conv1d prefill
+// fwd + decode update (gdn-semantics §2/§3).
+void CausalConv1dFwdKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
+                               const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
+                               const Tensor& his, const CausalConv1dArgs& args);
+void CausalConv1dUpdateKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
+                                  const Tensor* bias, Tensor& conv_state,
+                                  const Tensor* conv_state_indices,
+                                  const CausalConv1dArgs& args);
 
 namespace {
 
@@ -149,6 +158,12 @@ struct Registrar {
     RegisterOp(OpId::kGdnStateScatter, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateScatterFn>(&GdnStateScatterKernelRocm)));
+    RegisterOp(OpId::kCausalConv1dFwd, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<CausalConv1dFwdFn>(&CausalConv1dFwdKernelRocm)));
+    RegisterOp(OpId::kCausalConv1dUpdate, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernelRocm)));
   }
 } registrar;
 

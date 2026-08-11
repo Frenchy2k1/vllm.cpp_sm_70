@@ -40,8 +40,10 @@ or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 ### ROCm op coverage is incremental (and throws are by design)
 
 The ROCm backend registers native ops family by family
-([#41](https://github.com/mudler/vllm.cpp/issues/41)); the GDN indexed state I/O
-pair (`kGdnStateGather`/`kGdnStateScatter`) is the first GDN slice. On a
+([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
+the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`) and the causal
+conv1d pair (`kCausalConv1dFwd`/`kCausalConv1dUpdate`, incl. the exact-chunks
+descriptor form Qwen3.5 prefill passes). On a
 discrete card there is no CPU fallback tier, so a model whose layers call an op
 that is not registered yet fails loudly with `vt: no kernel for op N on device
 type 5` — that is the memory-safety design working, not a crash. Run with
