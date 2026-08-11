@@ -1,0 +1,442 @@
+<!doctype html>
+<!-- vllm.cpp original. The MiniMax-H3 studio console.
+
+     Served by examples/video_studio, a STANDALONE example that owns its own
+     endpoints. Deliberately NOT part of examples/server: that binary is the
+     OpenAI-compatible API surface and a browser console does not belong in it.
+     The studio drives the public C ABI (vllm_video_*) and nothing else.
+
+     Palette and type follow website/assets/css/site.css so the console and the
+     docs read as one project rather than two.
+
+     Structured as a WIZARD because the decisions are not independent: the task
+     decides which checkpoint can serve it, the checkpoint decides whether a swap
+     is needed, and the canvas decides whether the answer arrives in 13 minutes
+     or 3 hours. Asking all of that at once as a flat form is how the first
+     version of this page failed. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MiniMax-H3 studio</title>
+<style>
+  :root{
+    --ink:#131a20; --ink-soft:#46545e; --ink-faint:#6b7a84;
+    --paper:#fbfaf8; --rule:#ddddd6; --rule-soft:#e9e8e3;
+    --teal:#0f7f96; --teal-lift:#13a0bd; --cyan:#3abbd2; --mark:#b9e6ef;
+    --accent:var(--teal);
+    --good:#1c7c4a; --bad:#a5321f;
+    --font-display:'Iowan Old Style','Charter','Bitstream Charter',Georgia,serif;
+    --font-text:ui-serif,Charter,'Bitstream Charter','Iowan Old Style',Georgia,serif;
+    --font-mono:ui-monospace,'SF Mono',SFMono-Regular,'JetBrains Mono',Menlo,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --ink:#e8eef1; --ink-soft:#a9b8c0; --ink-faint:#7d8f99;
+           --paper:#0e1418; --rule:#26333a; --rule-soft:#1c262c;
+           --teal:#3abbd2; --teal-lift:#6fd6e6; --mark:#14414c;
+           --good:#4fc487; --bad:#e2705c; }
+  }
+  *{box-sizing:border-box}
+  body{ margin:0; background:var(--paper); color:var(--ink);
+        font-family:var(--font-text); font-size:17px; line-height:1.55; }
+  .page{ max-width:1180px; margin:0 auto; padding:clamp(1.1rem,.6rem + 2.2vw,3.5rem); }
+
+  header{ display:flex; align-items:baseline; gap:.9rem; flex-wrap:wrap;
+          padding-bottom:.9rem; border-bottom:1px solid var(--rule); margin-bottom:2rem; }
+  header h1{ font-family:var(--font-display); font-size:1.5rem; margin:0; font-weight:600; }
+  header .now{ font-family:var(--font-mono); font-size:.78rem; color:var(--ink-faint); }
+  header .now b{ color:var(--teal); font-weight:600 }
+
+  /* ---------- wizard ---------- */
+  .steps{ display:flex; gap:.5rem; list-style:none; margin:0 0 1.6rem; padding:0;
+          font-family:var(--font-mono); font-size:.72rem; letter-spacing:.06em;
+          text-transform:uppercase; color:var(--ink-faint); flex-wrap:wrap; }
+  .steps li{ padding:.25rem .55rem; border-bottom:2px solid transparent; }
+  .steps li[data-on]{ color:var(--teal); border-bottom-color:var(--teal); }
+  .steps li[data-done]{ color:var(--ink-soft); }
+
+  .card{ border:1px solid var(--rule); border-radius:3px; padding:1.4rem 1.5rem;
+         background:color-mix(in oklab,var(--paper) 92%,var(--rule-soft)); }
+  h2{ font-family:var(--font-display); font-size:1.18rem; margin:0 0 .3rem; font-weight:600; }
+  .sub{ color:var(--ink-soft); font-size:.92rem; margin:0 0 1.15rem; max-width:62ch; }
+
+  .picks{ display:grid; gap:.7rem; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+  .pick{ text-align:left; font:inherit; color:var(--ink); cursor:pointer; padding:1rem 1.05rem;
+         background:var(--paper); border:1px solid var(--rule); border-radius:3px;
+         transition:border-color .16s, transform .16s cubic-bezier(.22,1,.36,1); }
+  .pick:hover{ border-color:var(--teal); transform:translateY(-2px) }
+  .pick[aria-pressed="true"]{ border-color:var(--teal); box-shadow:inset 0 0 0 1px var(--teal) }
+  .pick b{ display:block; font-family:var(--font-display); font-size:1.02rem; margin-bottom:.2rem }
+  .pick span{ display:block; color:var(--ink-soft); font-size:.85rem; line-height:1.45 }
+  .pick .tag{ display:inline-block; margin-top:.5rem; font-family:var(--font-mono);
+              font-size:.68rem; letter-spacing:.05em; color:var(--ink-faint); }
+
+  label{ display:block; font-size:.83rem; color:var(--ink-soft); margin-bottom:.25rem; }
+  input,select,textarea{ width:100%; font:inherit; font-size:.95rem; color:var(--ink);
+    background:var(--paper); border:1px solid var(--rule); border-radius:3px; padding:.55rem .7rem; }
+  input:focus,select:focus,textarea:focus{ outline:2px solid var(--teal); outline-offset:-1px }
+  textarea{ min-height:150px; resize:vertical }
+  .row{ display:grid; gap:.7rem; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); margin-top:.8rem }
+
+  .nav{ display:flex; gap:.6rem; margin-top:1.4rem; align-items:center; flex-wrap:wrap }
+  button.go{ font:inherit; font-size:.95rem; font-weight:600; padding:.6rem 1.3rem;
+    background:var(--teal); color:#fff; border:0; border-radius:3px; cursor:pointer;
+    transition:background .16s; }
+  button.go:hover{ background:var(--teal-lift) }
+  button.go[disabled]{ opacity:.45; cursor:not-allowed }
+  button.ghost{ font:inherit; font-size:.95rem; padding:.6rem 1rem; background:transparent;
+    color:var(--ink-soft); border:1px solid var(--rule); border-radius:3px; cursor:pointer }
+  .note{ font-size:.83rem; color:var(--ink-faint); max-width:62ch }
+  .warn{ border-left:3px solid var(--teal); padding:.6rem .85rem; background:color-mix(in oklab,var(--mark) 30%,transparent);
+         font-size:.88rem; margin-top:.9rem; border-radius:0 3px 3px 0 }
+
+  /* ---------- ledger ---------- */
+  .ledger{ margin-top:2.6rem }
+  .ledger h2{ margin-bottom:1rem }
+  .job{ border-top:1px solid var(--rule); padding:.95rem 0;
+        display:grid; grid-template-columns:8px 1fr auto; gap:1rem; align-items:start }
+  .dot{ width:8px; height:8px; border-radius:50%; margin-top:.55rem; background:var(--ink-faint) }
+  .dot.running{ background:var(--teal); animation:p 1.6s ease-in-out infinite }
+  .dot.succeeded{ background:var(--good) } .dot.failed{ background:var(--bad) }
+  @keyframes p{ 0%,100%{opacity:1} 50%{opacity:.3} }
+  .job p{ margin:0 0 .3rem; font-size:.98rem; overflow-wrap:anywhere }
+  .meta{ font-family:var(--font-mono); font-size:.72rem; color:var(--ink-faint) }
+  .meta b{ color:var(--ink-soft); font-weight:600 }
+  .clock{ font-family:var(--font-mono); font-size:.85rem; color:var(--teal); text-align:right; white-space:nowrap }
+  .clock small{ display:block; color:var(--ink-faint); font-size:.68rem }
+  video{ width:100%; max-width:600px; margin-top:.7rem; border:1px solid var(--rule); background:#000; display:block }
+  .err{ margin-top:.5rem; font-family:var(--font-mono); font-size:.76rem; color:var(--bad);
+        background:color-mix(in oklab,var(--bad) 8%,transparent); padding:.5rem .7rem; border-radius:3px }
+  .job.clickable{ cursor:pointer; transition:background .14s }
+  .job.clickable:hover{ background:color-mix(in oklab,var(--mark) 22%,transparent) }
+  .meta a{ color:var(--teal); text-decoration:none; font-weight:600 }
+  .meta a:hover{ text-decoration:underline }
+  .none{ color:var(--ink-faint); font-size:.92rem; border:1px dashed var(--rule);
+         padding:1.6rem; border-radius:3px; max-width:60ch }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>MiniMax-H3 studio</h1>
+    <div class="now" id="now">…</div>
+  </header>
+
+  <ol class="steps" id="steps">
+    <li data-s="0">1 · what to make</li>
+    <li data-s="1">2 · checkpoint</li>
+    <li data-s="2">3 · describe it</li>
+    <li data-s="3">4 · size</li>
+  </ol>
+
+  <div class="card" id="card"></div>
+
+  <section class="ledger">
+    <h2>Renders</h2>
+    <div id="jobs"></div>
+  </section>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const TASKS = {
+  t2va:  {title:"From a description",
+          sub:"Everything is invented from your words. No image needed.",
+          tag:"needs the fl2va checkpoint"},
+  fl2va: {title:"Starting from my image",
+          sub:"Your picture becomes frame 0 and the clip moves on from there. The strongest control.",
+          tag:"needs the fl2va checkpoint"},
+  ref2va:{title:"Featuring my subject",
+          sub:"Carries a subject or style through a new scene without pinning any frame.",
+          tag:"needs the ref2va checkpoint"}
+};
+const SIZES = [
+  {w:512,h:512,   label:"Draft",  note:"square, ~13 min. Use this while you work on the prompt."},
+  {w:864,h:480,   label:"Wide",   note:"16:9, ~35 min."},
+  {w:1344,h:768,  label:"Full",   note:"the model's trained canvas, ~2.5 h. Worth it once the prompt is right."}
+];
+let step = 0, task = null, model = null, imageData = null, size = SIZES[0];
+let frames = 124, steps = 50, prompt = "";
+let models = [], engine = {loaded:false};
+let jobs = JSON.parse(localStorage.getItem("h3studio") || "[]");
+
+const secPerStep = (w,h) => 15.9 * (w*h) / (512*512);
+const fmt = s => { s=Math.max(0,Math.round(s));
+  const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
+  return h ? `${h}h ${String(m).padStart(2,"0")}m` : (m ? `${m}m ${String(s%60).padStart(2,"0")}s` : `${s}s`); };
+const esc = t => (t||"").replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+
+async function load(){
+  try{ engine = await (await fetch("/api/engine")).json(); }catch(_){ engine={loaded:false}; }
+  try{ models = await (await fetch("/api/models")).json(); }catch(_){ models=[]; }
+  $("#now").innerHTML = engine.loaded
+    ? `loaded · <b>${engine.partition||"?"}</b> · ${engine.dit.split("/").pop()}`
+    : "no checkpoint loaded";
+  draw();
+}
+
+function needPartition(){ return task === "ref2va" ? "ref2va" : "fl2va"; }
+function usable(){ return models.filter(m => !m.partition || m.partition === needPartition()); }
+
+let resultOpen = null;
+function draw(){
+  if (resultOpen) return;   // a result view owns the card until dismissed
+  document.querySelectorAll("#steps li").forEach(li => {
+    const n = +li.dataset.s;
+    li.toggleAttribute("data-on", n === step);
+    li.toggleAttribute("data-done", n < step);
+  });
+  const c = $("#card");
+
+  if (step === 0){
+    c.innerHTML = `<h2>What do you want to make?</h2>
+      <p class="sub">All three produce video <em>and</em> audio together — ask for speech in the
+        prompt and the model lip-syncs it.</p>
+      <div class="picks">${Object.entries(TASKS).map(([k,v]) => `
+        <button class="pick" data-k="${k}" aria-pressed="${task===k}">
+          <b>${v.title}</b><span>${v.sub}</span><span class="tag">${v.tag}</span></button>`).join("")}</div>`;
+    c.querySelectorAll(".pick").forEach(b => b.onclick = () => { task = b.dataset.k; step = 1; draw(); });
+    return;
+  }
+
+  if (step === 1){
+    const opts = usable();
+    const hot = engine.loaded && engine.partition === needPartition();
+    c.innerHTML = `<h2>Which checkpoint?</h2>
+      <p class="sub">${TASKS[task].title} needs a <b>${needPartition()}</b> checkpoint.
+        ${hot ? "One is already loaded, so this renders straight away."
+              : "Loading one takes about 25 minutes; nothing renders while it loads."}</p>
+      ${opts.length ? `<div class="picks">${opts.map(m => `
+        <button class="pick" data-p="${m.path}" aria-pressed="${(model||engine.dit)===m.path}">
+          <b>${m.name}</b>
+          <span>${m.partition
+              ? m.partition + (m.pruned?" · pruned":"")
+              : `<b style="color:var(--bad)">partition unknown</b> — the filename does not say, and
+                 the two are byte-identical inside. Picking it here loads it as
+                 <b>${needPartition()}</b>; if that is wrong the render is refused after the load.
+                 Rename the file to contain fl2va or ref2va to fix this permanently.`}
+            · ${m.gib ? m.gib.toFixed(1)+" GiB" : ""}</span>
+          ${engine.dit===m.path ? '<span class="tag">loaded now</span>' : ''}
+        </button>`).join("")}</div>`
+      : `<p class="none">No ${needPartition()} checkpoint found. Start the studio with
+          <code>--models-dir</code> pointing at the folder holding your .gguf files.</p>`}
+      ${!hot && opts.length ? `<div class="warn">Picking one below unloads the current
+        checkpoint first, then loads it. Renders are unavailable until that finishes.</div>` : ""}
+      <div class="nav"><button class="ghost" id="back">Back</button>
+        <button class="go" id="next" ${opts.length?"":"disabled"}>Continue</button></div>`;
+    c.querySelectorAll(".pick").forEach(b => b.onclick = () => {
+      model = b.dataset.p;
+      c.querySelectorAll(".pick").forEach(o => o.setAttribute("aria-pressed", String(o===b)));
+    });
+    $("#back").onclick = () => { step = 0; draw(); };
+    $("#next").onclick = async () => {
+      const want = model || engine.dit;
+      if (engine.loaded && want === engine.dit){ step = 2; draw(); return; }
+      const btn = $("#next"); btn.disabled = true; btn.textContent = "Loading… (~25 min)";
+      try{
+        const r = await fetch("/api/engine", {method:"POST", headers:{"content-type":"application/json"},
+          body: JSON.stringify({dit: want, partition: needPartition()})});
+        const j = await r.json();
+        if(!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        engine = j; step = 2; await load();
+      }catch(e){ alert(e.message); btn.disabled=false; btn.textContent="Continue"; }
+    };
+    return;
+  }
+
+  if (step === 2){
+    const needsImg = task !== "t2va";
+    c.innerHTML = `<h2>Describe the shot</h2>
+      <p class="sub">Say what happens, who is in it, and how it is filmed. For speech, say the
+        character talks <em>and</em> put the words in — a silent description gives you room tone,
+        which is correct but rarely what people expect.</p>
+      <textarea id="p" placeholder="A cyan llama in an office, sitting in a swivel chair, talking straight to camera in a dry deadpan.
+
+It says, clearly and audibly: &quot;Michael scheduled another all hands. It is about the printer again.&quot;
+
+Handheld documentary framing, warm fluorescent light.">${esc(prompt)}</textarea>
+      ${needsImg ? `<div style="margin-top:1rem">
+        <label for="img">${task==="fl2va" ? "The frame it starts from" : "Your subject or style reference"}</label>
+        <input type="file" id="img" accept="image/*">
+        <p class="note" style="margin-top:.4rem">Any format — it is resized to the output size and
+          converted here in the browser, because the engine reads only raw PPM.</p>
+        <div id="thumb"></div></div>` : ""}
+      <div class="nav"><button class="ghost" id="back">Back</button>
+        <button class="go" id="next">Continue</button></div>`;
+    $("#p").oninput = e => prompt = e.target.value;
+    if (needsImg) $("#img").onchange = async e => {
+      const f = e.target.files[0]; if(!f) return;
+      imageData = await toPPM(f, size.w, size.h);
+      $("#thumb").innerHTML = `<p class="note" style="margin-top:.5rem">✓ ${esc(f.name)} — converted to
+        ${size.w}×${size.h} PPM</p>`;
+    };
+    $("#back").onclick = () => { step = 1; draw(); };
+    $("#next").onclick = () => {
+      if(!prompt.trim()) return alert("The prompt is what the model conditions on — say something.");
+      if(task!=="t2va" && !imageData) return alert(`${TASKS[task].title} needs an image.`);
+      step = 3; draw();
+    };
+    return;
+  }
+
+  const est = fmt(secPerStep(size.w,size.h) * steps);
+  c.innerHTML = `<h2>How big, and how long are you willing to wait?</h2>
+    <p class="sub">Cost scales with pixels × frames × steps. Start small; the prompt is usually
+      what needs the work, not the resolution.</p>
+    <div class="picks">${SIZES.map((s,i) => `
+      <button class="pick" data-i="${i}" aria-pressed="${s.w===size.w&&s.h===size.h}">
+        <b>${s.label} · ${s.w}×${s.h}</b><span>${s.note}</span></button>`).join("")}</div>
+    <div class="row">
+      <div><label for="fr">frames (17n+5)</label><input id="fr" type="number" step="17" value="${frames}"></div>
+      <div><label for="st">steps</label><input id="st" type="number" value="${steps}"></div>
+    </div>
+    <div class="warn">Estimated <b>${est}</b> on this box, plus muxing. It keeps rendering if you
+      close the tab — the list below survives.</div>
+    <div class="nav"><button class="ghost" id="back">Back</button>
+      <button class="go" id="render">Render</button></div>`;
+  c.querySelectorAll(".pick").forEach(b => b.onclick = async () => {
+    size = SIZES[+b.dataset.i];
+    if (imageData && $("#img")) imageData = null;      // geometry changed: re-convert
+    draw();
+  });
+  $("#fr").oninput = e => frames = +e.target.value;
+  $("#st").oninput = e => { steps = +e.target.value; };
+  $("#back").onclick = () => { step = 2; draw(); };
+  $("#render").onclick = submit;
+}
+
+async function toPPM(file, w, h){
+  const bmp = await createImageBitmap(file);
+  const c = new OffscreenCanvas(w,h), g = c.getContext("2d");
+  const s = Math.max(w/bmp.width, h/bmp.height);       // cover-fit, centre-crop:
+  const dw = bmp.width*s, dh = bmp.height*s;            // never letterbox black into
+  g.drawImage(bmp,(w-dw)/2,(h-dh)/2,dw,dh);            // the conditioning
+  const d = g.getImageData(0,0,w,h).data;
+  const head = `P6\n${w} ${h}\n255\n`;
+  const out = new Uint8Array(head.length + w*h*3);
+  for(let i=0;i<head.length;i++) out[i]=head.charCodeAt(i);
+  let o=head.length;
+  for(let i=0;i<w*h;i++){ out[o++]=d[i*4]; out[o++]=d[i*4+1]; out[o++]=d[i*4+2]; }
+  let bin=""; const CH=0x8000;
+  for(let i=0;i<out.length;i+=CH) bin += String.fromCharCode.apply(null,out.subarray(i,i+CH));
+  return "data:image/x-portable-pixmap;base64," + btoa(bin);
+}
+
+async function submit(){
+  const b = $("#render"); b.disabled = true; b.textContent = "Submitting…";
+  try{
+    const body = {prompt, task, width:size.w, height:size.h, num_frames:frames, steps};
+    if (imageData) body.image = imageData;
+    const r = await fetch("/api/render", {method:"POST",
+      headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
+    const j = await r.json();
+    if(!r.ok || !j.id) throw new Error(j.error || `HTTP ${r.status}`);
+    jobs.unshift({id:j.id, prompt, task, w:size.w, h:size.h, frames, steps,
+      status:"queued", started:Date.now(), est:secPerStep(size.w,size.h)*steps});
+    save(); step = 0; imageData = null; draw(); renderJobs();
+  }catch(e){ alert(e.message); }
+  finally{ b.disabled=false; b.textContent="Render"; }
+}
+
+function save(){ localStorage.setItem("h3studio", JSON.stringify(jobs.slice(0,40))); }
+
+// The ledger updates IN PLACE. The first version rebuilt this list from innerHTML
+// on a 1s timer, which destroyed and recreated the <video> element underneath the
+// player every tick -- playback could never survive long enough to start. Rows
+// are created once and only their clock, status and dot are touched afterwards,
+// so nothing that holds media state is ever replaced.
+function renderJobs(){
+  const box = $("#jobs");
+  if (!jobs.length){
+    box.innerHTML = `<div class="none">Nothing yet. Renders stay here across reloads, so a clip you
+      started an hour ago is still findable.</div>`;
+    return;
+  }
+  if (box.querySelector(".none")) box.innerHTML = "";
+
+  for (const j of jobs){
+    let row = box.querySelector(`[data-id="${j.id}"]`);
+    if (!row){
+      row = document.createElement("div");
+      row.className = "job";
+      row.dataset.id = j.id;
+      row.innerHTML = `<div class="dot"></div>
+        <div><p></p><div class="meta"></div><div class="errslot"></div></div>
+        <div class="clock"></div>`;
+      row.querySelector("p").textContent = j.prompt.slice(0,160);
+      box.appendChild(row);
+    }
+    const el = (Date.now()-j.started)/1000;
+    const done = j.status==="succeeded" || j.status==="failed";
+    row.querySelector(".dot").className = "dot " + j.status;
+    row.querySelector(".meta").innerHTML =
+      `<b>${j.task}</b> · ${j.w}×${j.h} · ${j.frames}f · ${j.steps} steps · <b>${j.status}</b>` +
+      (j.status === "succeeded" ? ` · <a href="#" data-open="${j.id}">open ▸</a>` : "");
+    row.querySelector(".clock").innerHTML = fmt(done ? (j.took||el) : el) +
+      (done ? "" : `<small>~${fmt(Math.max(0,j.est-el))} left</small>`);
+    const errslot = row.querySelector(".errslot");
+    const want = j.error ? `<div class="err">${esc(j.error)}</div>` : "";
+    if (errslot.innerHTML !== want) errslot.innerHTML = want;
+    row.classList.toggle("clickable", j.status === "succeeded");
+  }
+  // rows for jobs we dropped from the local list
+  box.querySelectorAll("[data-id]").forEach(r => {
+    if (!jobs.some(j => j.id === r.dataset.id)) r.remove();
+  });
+}
+
+// A finished render gets its OWN view rather than an inline player: the clip is
+// the point once it exists, and a <video> living inside a list that updates every
+// second is a player that never gets to play.
+function openResult(id){
+  const j = jobs.find(x => x.id === id);
+  if (!j) return;
+  resultOpen = id;
+  const c = $("#card");
+  c.innerHTML = `<h2>${esc(j.task)} · ${j.w}×${j.h}</h2>
+    <p class="sub">${esc(j.prompt)}</p>
+    <video id="player" controls autoplay playsinline src="/api/video/${id}"
+           style="max-width:100%;width:100%;margin:0"></video>
+    <div class="meta" style="margin-top:.8rem">${j.frames} frames · ${j.steps} steps ·
+      rendered in ${fmt(j.took||0)} · ${esc(id)}</div>
+    <div class="nav">
+      <a class="go" style="text-decoration:none;display:inline-block"
+         href="/api/video/${id}" download="${id}.mp4">Download mp4</a>
+      <button class="ghost" id="again">Render another</button>
+      <button class="ghost" id="closeres">Back to the wizard</button>
+    </div>`;
+  $("#again").onclick = () => { resultOpen=null; step=0; draw(); };
+  $("#closeres").onclick = () => { resultOpen=null; draw(); };
+}
+
+async function poll(){
+  let live=false;
+  try{
+    const server = await (await fetch("/api/jobs")).json();
+    const by = Object.fromEntries(server.map(j=>[j.id,j]));
+    for(const j of jobs){
+      const s = by[j.id]; if(!s) continue;
+      if(s.status!==j.status){ j.status=s.status;
+        if(s.status==="succeeded"||s.status==="failed") j.took=(Date.now()-j.started)/1000;
+        save(); }
+      if(s.error) j.error=s.error;
+      if(j.status==="queued"||j.status==="running") live=true;
+    }
+  }catch(_){}
+  renderJobs();
+  setTimeout(poll, live?3000:10000);
+}
+
+// One delegated listener: rows come and go, and re-binding per row per tick was
+// part of what made the old list churn.
+document.addEventListener("click", ev => {
+  const a = ev.target.closest("[data-open]");
+  if (a){ ev.preventDefault(); openResult(a.dataset.open); return; }
+  const row = ev.target.closest(".job.clickable");
+  if (row && !ev.target.closest("a,button,video")) openResult(row.dataset.id);
+});
+
+load(); renderJobs(); poll(); setInterval(renderJobs,1000);
+</script>
+</body>
+</html>
