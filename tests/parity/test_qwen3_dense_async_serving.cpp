@@ -217,6 +217,23 @@ TEST_CASE("qwen3-4B dense async-serving greedy token-exact gate (dgx-only) — "
   RunAsyncGate("models--Qwen--Qwen3-4B", "qwen3-4B");
 }
 
+// ─── Sibling families — the #323 regression gates ────────────────────────────
+// Llama / Mistral / InternLM2 are all `using <X>Model = Qwen3DenseModel`, so they
+// share this exact forward. These three were RED until the decode-graph decline
+// (#323): the graph replayed against the stale HOST token_ids, so every
+// concurrent request past slot 0 degenerated. Mistral and InternLM2 reproduced
+// it; Llama did not, purely because it did not engage the graph in this battery.
+// Keep all three: the failure is a property of the shared path, not of a family.
+TEST_CASE("llama-3.2-1B dense async-serving greedy token-exact gate (dgx-only) — #323") {
+  RunAsyncGate("models--meta-llama--Llama-3.2-1B", "llama-3.2-1B");
+}
+TEST_CASE("mistral-7B-v0.3 dense async-serving greedy token-exact gate (dgx-only) — #323") {
+  RunAsyncGate("models--mistralai--Mistral-7B-v0.3", "mistral-7B-v0.3");
+}
+TEST_CASE("internlm2-chat-1.8B dense async-serving greedy token-exact gate (dgx-only) — #323") {
+  RunAsyncGate("models--internlm--internlm2-chat-1_8b", "internlm2-chat-1.8B");
+}
+
 // ─── Sibling families (ROW-SERVE-ASYNC-DENSE-MIRROR sibling scope) ───────────
 // Llama / Mistral / InternLM2 each have their OWN Forward*ForCausalLM entry but
 // route through the SAME shared EmbedInto, so the device token-ids mirror has to
