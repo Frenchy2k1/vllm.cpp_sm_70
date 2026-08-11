@@ -24,8 +24,15 @@ Both arms traced on the identical batch-1 decode workload (#365):
 | Marlin ms/step | 47.0590 | 45.8048 |
 | **Marlin calls/step** | **193** | **129** |
 
-48 layers: ~4 Marlin GEMMs/layer for us, ~2.7 for vLLM. vLLM's production
-topology is one `MergedColumnParallelLinear` `gate_up_proj`.
+**64 layers** (16 full-attn + 48 GDN -- see `.agents/parity-ledger.md:369`), and
+the counts decompose exactly: ours 64x3 + lm_head = **193**; fused 64x2 +
+lm_head = **129**; vLLM 64x2 + 1 = **129**. So we issue 3 Marlin GEMMs per
+layer where vLLM issues 2, and the saving is **64** launches, not 48. vLLM's
+production topology is one `MergedColumnParallelLinear` `gate_up_proj`.
+
+(An earlier draft of this spec said "48 layers / ~4 GEMMs per layer / saves ~48
+launches". That was wrong on all three counts and the sizing in §4 rested on
+it. Corrected here after review.)
 
 The fusion exists here and is not reachable on this path:
 
@@ -75,7 +82,7 @@ AGENTS.md §"Shared seams": "Route mergeable MLP projections through
   bit-identical to the split path. `SharedGateUpFusedEligible` requires
   `gw.scale2 == uw.scale2` precisely because a shared scale is what makes the
   concatenation legal. Assert that, do not assume it, and prove byte-identity.
-- **The gain may be launch-overhead only.** 193 -> ~145 calls/step saves ~48
+- **The gain may be launch-overhead only.** 193 -> 129 calls/step saves **64**
   launches. If the fused GEMM is not itself faster, the saving is bounded by
   launch overhead, which at 0.24 ms/call average is not the whole +1.26 ms.
   Measure; do not assume the full delta is recoverable.
@@ -86,9 +93,10 @@ AGENTS.md §"Shared seams": "Route mergeable MLP projections through
 
 ## 5. Tests and evidence
 
-- RED-first unit: fused vs split gate_up on the same weights, asserting
-  **byte-identical** output, and an f32 comparison arm (a bf16 store is known on
-  this project to absorb a real defect that only f32 catches).
+- RED-first unit: fused vs split gate_up on the same weights. **NOT
+  byte-identical** -- that bar is false here and was corrected during the row;
+  see `## Outcome` / Numerics. Pin the decisions (predicate truth table, path
+  selection, halves order) and use token agreement for the arithmetic.
 - Token-exact gate on the 27B with the toggle ON.
 - Same-binary A/B at c1 and c8, toggle the only variable, arms interleaved.
 - A decode-window trace showing Marlin calls/step actually fell from 193, per
@@ -149,8 +157,16 @@ instrument.
 
 ### Numerics
 
-**Tokens identical between arms**, verified by a greedy 64-token continuation
-captured on each arm and diffed.
+**Tokens identical BETWEEN ARMS** (fused vs split), verified by a greedy
+64-token continuation captured on each arm and diffed.
+
+**This is NOT the oracle bar and must not be read as it.** It shows the change
+is self-consistent; it does not show we still match vLLM. Spec §5 requires a
+token-exact gate against the PINNED ORACLE with the toggle ON, every sibling
+lever in `docs/ENVIRONMENT.md` cites a SACRED count, and this row cited none --
+while being the only one that changes the 27B decode path by default. Caught by
+the fresh review. The oracle gate is **owed** and no parity or correctness claim
+for this row is complete until it lands.
 
 Byte-identity was deliberately NOT asserted, and this spec's original §4/§5
 wording demanding it was **wrong**. Marlin's fp32 split-K groups K-slices
@@ -170,11 +186,33 @@ confusion earlier in this campaign, where two ratios 8x apart in absolute scale
 were compared as equivalent. The binding number requires re-running the
 canonical grid against vLLM with the default ON, and is **owed**.
 
-### Where it leaves the gap
+### Where it leaves the gap -- ARITHMETIC CORRECTED AFTER REVIEW
 
-The measured 27B gap was +4.40 ms/step (#365). This row closes ~1.42 ms of it,
-**32%**. Remaining **+2.68 ms**: the fp8 tower at +2.12 and an unattributed
-residue at +1.02, with Marlin now a -0.39 credit. GPU-busy ratio 0.948 -> 0.968.
+The first version of this section mixed two baselines and did not close:
+"+4.40 gap, closes 1.42, remaining 2.68" sums to 4.10, not 4.40. The 4.40 came
+from the ORIGINAL profile (84.85 ms/step) while the 2.68 came from the NEW
+trace's split arm (84.5544). That is the mixed-denominator hazard this project
+has recorded twice, committed inside a single paragraph.
+
+Stated against **one** denominator -- this row's own trace, both arms same
+binary:
+
+| | split | fused | vLLM |
+|---|---:|---:|---:|
+| GPU busy ms/step | 84.5544 | 83.1344 | 80.4492 |
+| gap vs vLLM | +4.105 | **+2.685** | -- |
+| ratio | 0.951 | **0.968** | 1.000 |
+
+So the closure is **1.420 ms of 4.105 = 34.6%**, and the ratio moves
+**0.951 -> 0.968** on this instrument. The separately-measured original profile
+put the gap at +4.40 against a slightly different split baseline (84.85 vs
+84.5544); that ~0.3 ms difference between two sessions is itself unexplained
+and is NOT to be quoted as if it were one number.
+
+The remaining +2.685 is the fp8 tower plus an unattributed residue, with Marlin
+now a small credit. The sub-terms (+2.12, +1.02, -0.39) were carried over from
+the original profile and sum to 2.75 rather than 2.685; they are indicative,
+not reconciled, and re-attributing them needs a fresh both-arms profile.
 
 The tower term was **reframed** during this row: vLLM does not reach cuDNN
 through any linear layer -- those kernels come from torch/Inductor, and
