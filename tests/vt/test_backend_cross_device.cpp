@@ -1726,6 +1726,71 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
   // strides; plain + gemma norm variants. All arithmetic: NMSE except the
   // gate passthrough (pure movement).
   const int64_t T = 4;
+  // Real Qwen3.5-0.8B attention dims first: Dh=256, rot=64 (partial_rotary
+  // 0.25), Hq=8, Hkv=2 — the config the model actually runs; the synthetic
+  // 32/16 arm below does not exercise the 192-dim pass-through tail.
+  {
+    const int64_t HQr = 8, HKVr = 2, DHr = 256, ROTr = 64;
+    const int64_t qgo = HQr * 2 * DHr + 7, kfo = HKVr * DHr + 5;
+    const std::vector<float> qg = RandomVec(static_cast<size_t>(T * qgo), 981, -0.5f, 0.5f);
+    const std::vector<float> kfv = RandomVec(static_cast<size_t>(T * kfo), 982, -0.5f, 0.5f);
+    const std::vector<float> qnr = RandomVec(static_cast<size_t>(DHr), 983, 0.2f, 1.0f);
+    const std::vector<float> knr = RandomVec(static_cast<size_t>(DHr), 984, 0.2f, 1.0f);
+    const std::vector<float> csr = RandomVec(static_cast<size_t>(T * ROTr), 985, -1.0f, 1.0f);
+    for (bool gemma : {false, true}) {
+      CAPTURE(gemma);
+      vt::RmsNormArgs na2; na2.eps = 1e-6f; na2.gemma = gemma;
+      vt::RopeArgs ra2; ra2.rotary_dim = static_cast<int>(ROTr);
+      std::vector<float> rq(static_cast<size_t>(T * HQr * DHr));
+      std::vector<float> rk(static_cast<size_t>(T * HKVr * DHr));
+      std::vector<float> rg(static_cast<size_t>(T * HQr * DHr));
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> a = qg, b = kfv, e = qnr, f = knr, g = csr;
+        Tensor tqg = Tensor::Contiguous(a.data(), DType::kF32, cd, {T, HQr * 2 * DHr});
+        tqg.stride[0] = qgo;
+        Tensor tkf = Tensor::Contiguous(b.data(), DType::kF32, cd, {T, HKVr * DHr});
+        tkf.stride[0] = kfo;
+        Tensor tqn = T1(e.data(), cd, DHr);
+        Tensor tkn = T1(f.data(), cd, DHr);
+        Tensor tcs = T2(g.data(), cd, T, ROTr);
+        Tensor tqo = Tensor::Contiguous(rq.data(), DType::kF32, cd, {T, HQr, DHr});
+        Tensor tko = Tensor::Contiguous(rk.data(), DType::kF32, cd, {T, HKVr, DHr});
+        Tensor tgo = Tensor::Contiguous(rg.data(), DType::kF32, cd, {T, HQr, DHr});
+        vt::AttnQkNormRopeGate(cq, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na2, ra2);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf dqg(dev, q, qg.size()), dkf(dev, q, kfv.size()), dqn(dev, q, DHr),
+            dkn(dev, q, DHr), dcs(dev, q, csr.size()), dqo(dev, q, rq.size()),
+            dko(dev, q, rk.size()), dgo(dev, q, rg.size());
+        dqg.Upload(qg); dkf.Upload(kfv); dqn.Upload(qnr); dkn.Upload(knr); dcs.Upload(csr);
+        Tensor tqg = Tensor::Contiguous(dqg.ptr(), DType::kF32, d, {T, HQr * 2 * DHr});
+        tqg.stride[0] = qgo;
+        Tensor tkf = Tensor::Contiguous(dkf.ptr(), DType::kF32, d, {T, HKVr * DHr});
+        tkf.stride[0] = kfo;
+        Tensor tqn = T1(dqn.ptr(), d, DHr);
+        Tensor tkn = T1(dkn.ptr(), d, DHr);
+        Tensor tcs = T2(dcs.ptr(), d, T, ROTr);
+        Tensor tqo = Tensor::Contiguous(dqo.ptr(), DType::kF32, d, {T, HQr, DHr});
+        Tensor tko = Tensor::Contiguous(dko.ptr(), DType::kF32, d, {T, HKVr, DHr});
+        Tensor tgo = Tensor::Contiguous(dgo.ptr(), DType::kF32, d, {T, HQr, DHr});
+        vt::AttnQkNormRopeGate(q, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na2, ra2);
+        CHECK(Nmse(rq, dqo.Download()) <= kNmseTol);
+        CHECK(Nmse(rk, dko.Download()) <= kNmseTol);
+        CHECK(Nmse(rg, dgo.Download()) <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+
   const int64_t HQ = 3, HKV = 2, DH = 32, ROT = 16;
   const int64_t qg_outer = HQ * 2 * DH + 7, kf_outer = HKV * DH + 5;
   const std::vector<float> qgate = RandomVec(static_cast<size_t>(T * qg_outer), 881, -0.5f, 0.5f);
