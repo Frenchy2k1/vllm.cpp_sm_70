@@ -244,7 +244,7 @@ SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
 
 std::map<std::string, std::string> LoadSafetensorsIndex(
     const std::string& index_json_path) {
-  std::ifstream in(index_json_path, std::ios::binary);
+  std::ifstream in(Utf8Path(index_json_path), std::ios::binary);
   if (!in) Fail(index_json_path, "cannot open index file");
   nlohmann::json doc;
   try {
