@@ -515,7 +515,18 @@ STATUS_RATCHET = {
     # 243389 since 2026-08-10 (measured, #223): the Sampling row gains prompt
     # logprobs computed on the runner; paid for by collapsing the beam-search
     # restatements that row carried. Strictly DOWN.
-    "chars": 243389,
+    #
+    # 243377 since 2026-08-11 (measured 243377, #238): the logprobs_mode row needs
+    # one binding line -- three of four modes were runtime-refused stubs and now
+    # work. Paid for by collapsing the best_of cell's upstream RATIONALE ("vLLM
+    # 0.26 itself has dropped best_of from its live path..."), which is a why, not
+    # a current state, and belongs in the row's spec. A DIFFERENT collapse from
+    # #223's beam-search one directly above: both collapses and both additions are
+    # in the merged page, which is why this pin is RE-MEASURED against it rather
+    # than carried from either PR (#223 measured 243389, #238 measured 243559 --
+    # both stale the moment the other landed). Every measured number and binding
+    # claim kept verbatim. Strictly DOWN.
+    "chars": 243377,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

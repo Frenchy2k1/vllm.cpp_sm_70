@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-09 -->
+<!-- now-updated: 2026-08-11 -->
 
 Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
@@ -33,6 +33,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
 | `SAMPLE-PROMPT-LOGPROBS` (#223) | **LANDED** 21/21 | W2 `echo`; CUDA PENDING |
+| `logprobs_mode` (#238) | **3 stubs -> all 4 work** | `logprob_token_ids` half |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
 
 In-flight, default-OFF, not pushed: see the row's spec.
