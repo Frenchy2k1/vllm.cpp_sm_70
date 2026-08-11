@@ -30,6 +30,18 @@ the package name.
 | `cpu` | `:<version>-cpu` | `:latest-cpu`, `:latest` | stable after the baseline-tier gate |
 | `rocm` | — | — | blocked; no image is published |
 
+Each lane also publishes a moving `:main-<lane>`. That is a change from the
+original design, which published on tags only: `main` produced no image at all,
+so anyone wanting to try the tree had to build it. Main images are a
+convenience and carry no support claim -- they move, they never touch `:latest*`
+or a version tag, and `promote` stays release-only so they cannot.
+
+They are built when container INFRASTRUCTURE changes (`docker/**`, the matrix,
+the validator, the build scripts, the workflow) and nightly otherwise. `main`
+takes dozens of pushes a day and three lanes on two architectures per push is
+prohibitive; a nightly floor bounds how stale a main image can be while
+container changes still rebuild immediately.
+
 Every lane is a `linux/amd64` + `linux/arm64` manifest list whose members are
 built on native runners. aarch64 is first-class rather than an afterthought
 because the project's own gate hardware — GB10 (`sm_121a`), Thor (`sm_110`),
@@ -544,7 +556,10 @@ paths. That is the distinction `/health` cannot make, and the GB10 result did
 not make either.
 
 **Scope.** Orin (`sm_87`) only. Thor (`sm_110`) has never been probed and
-inherits nothing from this.
+inherits nothing from this -- the node was unavailable, and it is owed a run
+when it returns. Orin makes the Tegra family plausible for Thor, not proven:
+Thor is a different SoC on a newer L4T, which is exactly the kind of
+assumption this row has already been wrong about once.
 
 ### Pull-request scope, and why it is not a hole
 
