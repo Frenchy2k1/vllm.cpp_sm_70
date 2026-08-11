@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -40,6 +41,297 @@ def step_mapping_blocks(step: str, name: str) -> list[str]:
             end += 1
         blocks.append("\n".join(lines[index + 1 : end]))
     return blocks
+
+
+def mapping_value(step: str, mapping: str, key: str) -> str | None:
+    blocks = step_mapping_blocks(step, mapping)
+    if len(blocks) != 1:
+        return None
+    values = re.findall(
+        rf"(?m)^          {re.escape(key)}:\s*([^\n]+?)\s*$", blocks[0]
+    )
+    return values[0] if len(values) == 1 else None
+
+
+def mapping_paths(step: str) -> list[str]:
+    blocks = step_mapping_blocks(step, "with")
+    if len(blocks) != 1:
+        return []
+    lines = blocks[0].splitlines()
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"          path:\s*(.*)", line)
+        if match is None:
+            continue
+        if match.group(1) != "|":
+            return [match.group(1)]
+        paths: list[str] = []
+        for candidate in lines[index + 1 :]:
+            if not candidate.startswith("            "):
+                break
+            paths.append(candidate.strip())
+        return paths
+    return []
+
+
+def workflow_steps(block: str) -> list[str]:
+    starts = [match.start() for match in re.finditer(r"(?m)^      - ", block)]
+    starts.append(len(block))
+    return [block[start:end] for start, end in zip(starts, starts[1:])]
+
+
+def named_step(block: str, name: str) -> str | None:
+    matches = [
+        step
+        for step in workflow_steps(block)
+        if re.search(rf"(?m)^      - name: {re.escape(name)}$", step)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def download_is_bound(block: str, artifact_ids: str, path: str) -> bool:
+    matches = [
+        step
+        for step in action_steps(block, "actions/download-artifact@v4")
+        if mapping_value(step, "with", "artifact-ids") == artifact_ids
+    ]
+    return len(matches) == 1 and mapping_value(matches[0], "with", "path") == path
+
+
+def upload_is_bound(block: str, artifact_name: str, paths: list[str]) -> bool:
+    matches = [
+        step
+        for step in action_steps(block, "actions/upload-artifact@v4")
+        if mapping_value(step, "with", "name") == artifact_name
+    ]
+    return len(matches) == 1 and mapping_paths(matches[0]) == paths
+
+
+def step_run_script(step: str) -> str | None:
+    lines = step.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == "        run: |"]
+    if len(starts) != 1:
+        return None
+    script: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        if re.match(r"^        \S", line):
+            break
+        if line and not line.startswith("          "):
+            return None
+        script.append(line[10:] if line else "")
+    return "\n".join(script)
+
+
+def logical_shell_commands(step: str) -> list[str] | None:
+    script = step_run_script(step)
+    if script is None:
+        return None
+    logical: list[str] = []
+    current: list[str] = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if current:
+                logical.append(" ".join(current))
+                current = []
+            continue
+        continued = stripped.endswith("\\")
+        current.append(stripped[:-1].rstrip() if continued else stripped)
+        if not continued:
+            logical.append(" ".join(current))
+            current = []
+    if current:
+        return None
+    return logical
+
+
+def shell_commands(step: str) -> list[list[str]] | None:
+    logical = logical_shell_commands(step)
+    if logical is None:
+        return None
+
+    commands: list[list[str]] = []
+    try:
+        for command in logical:
+            lexer = shlex.shlex(
+                command, posix=True, punctuation_chars=";&|<>()"
+            )
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            commands.append(list(lexer))
+    except ValueError:
+        return None
+    return commands
+
+
+def executable_shell_segments(command: str) -> tuple[list[list[str]], bool] | None:
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            current.append(char)
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == '"':
+            current.append(char)
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            index += 1
+            if index < len(command):
+                current.append(command[index])
+                index += 1
+            continue
+        if command.startswith(("$(", "<(", ">("), index) or char == "`":
+            return [], True
+        if quote == '"':
+            current.append(char)
+            index += 1
+            continue
+        if char == "'":
+            current.append(char)
+            quote = "'"
+            index += 1
+            continue
+        if char == "#" and (
+            not current or current[-1].isspace() or current[-1] in ";|&(){}"
+        ):
+            break
+        if char in ";|&(){}":
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 1
+            while index < len(command) and command[index] in ";|&":
+                index += 1
+            continue
+        current.append(char)
+        index += 1
+    if quote is not None:
+        return None
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+
+    words: list[list[str]] = []
+    try:
+        for segment in segments:
+            words.append(shlex.split(segment, comments=True, posix=True))
+    except ValueError:
+        return None
+    return words, False
+
+
+def shell_assignment(word: str) -> bool:
+    name, separator, _ = word.partition("=")
+    return (
+        bool(separator)
+        and bool(name)
+        and (name[0].isalpha() or name[0] == "_")
+        and all(char.isalnum() or char == "_" for char in name[1:])
+    )
+
+
+def executable_prefix(words: list[str]) -> list[str]:
+    prefixes = {
+        "!",
+        "builtin",
+        "command",
+        "do",
+        "elif",
+        "else",
+        "env",
+        "exec",
+        "if",
+        "nohup",
+        "sudo",
+        "then",
+        "time",
+        "until",
+        "while",
+    }
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if shell_assignment(word) or word in prefixes:
+            index += 1
+            continue
+        if word.startswith("-") and index > 0 and words[index - 1] in prefixes:
+            index += 1
+            continue
+        break
+    return words[index:]
+
+
+def step_command_is_bound(
+    block: str,
+    name: str,
+    prefix: tuple[str, ...],
+    expected_options: dict[str, str],
+) -> bool:
+    step = named_step(block, name)
+    commands = shell_commands(step) if step is not None else None
+    if commands is None:
+        return False
+    matches = [command for command in commands if command[: len(prefix)] == list(prefix)]
+    if len(matches) != 1:
+        return False
+    arguments = matches[0][len(prefix) :]
+    if len(arguments) % 2 != 0:
+        return False
+    options: dict[str, str] = {}
+    for index in range(0, len(arguments), 2):
+        option, value = arguments[index : index + 2]
+        if not option.startswith("--") or option in options:
+            return False
+        options[option] = value
+    return options == expected_options
+
+
+def step_has_exact_command(
+    block: str, name: str, expected: tuple[str, ...]
+) -> bool:
+    step = named_step(block, name)
+    commands = shell_commands(step) if step is not None else None
+    return commands is not None and commands.count(list(expected)) == 1
+
+
+def action_input_is_bound(
+    block: str, name: str, action: str, key: str, value: str
+) -> bool:
+    step = named_step(block, name)
+    return (
+        step is not None
+        and re.search(rf"(?m)^        uses: {re.escape(action)}$", step)
+        is not None
+        and mapping_value(step, "with", key) == value
+    )
+
+
+def job_has_shell_command(block: str, prefix: tuple[str, ...]) -> bool:
+    for step in workflow_steps(block):
+        if "        run: |" not in step:
+            continue
+        logical = logical_shell_commands(step)
+        if logical is None:
+            return True
+        for command in logical:
+            scanned = executable_shell_segments(command)
+            if scanned is None or scanned[1]:
+                return True
+            if any(
+                executable_prefix(segment)[: len(prefix)] == list(prefix)
+                for segment in scanned[0]
+            ):
+                return True
+    return False
 
 
 def validate(text: str) -> list[str]:
@@ -147,11 +439,9 @@ def validate(text: str) -> list[str]:
         errors.append("publish job must check out the exact tagged publisher implementation")
     if tag_gate not in publish or "needs.plan.outputs.publish == 'true'" not in publish:
         errors.append("publish job must require an exact tag and approved publish plan")
-    if "scripts/release_pipeline.py publish" not in publish:
-        errors.append("publish job must use the byte-bound release publisher")
-    if "verified/assets" not in publish or "verified/release-index.json" not in publish:
-        errors.append("publish job must release verified assets and generated indexes")
-    if "gh release create" in publish:
+    if job_has_shell_command(
+        publish, ("gh", "release", "create")
+    ) or job_has_shell_command(publish, ("gh", "release", "upload")):
         errors.append("release workflow must not bypass the byte-bound publisher")
 
     required_handoff = (
@@ -163,11 +453,111 @@ def validate(text: str) -> list[str]:
         "artifact-ids: ${{ needs.verify.outputs.artifact_id }}",
         "overwrite: false",
         "if-no-files-found: error",
-        "python3 scripts/release_index.py",
     )
     for fragment in required_handoff:
         if fragment not in text:
             errors.append(f"immutable artifact handoff is missing {fragment!r}")
+    plan_artifact = "${{ needs.plan.outputs.artifact_id }}"
+    primary_artifacts = ",".join(
+        f"${{{{ needs.{name}.outputs.artifact_id }}}}"
+        for name in primary_build_jobs
+    )
+    verified_artifact = "${{ needs.verify.outputs.artifact_id }}"
+    verify = blocks["verify"]
+    root_contracts = (
+        step_command_is_bound(
+            blocks["plan"],
+            "Compute an explicit dry-run or exact-tag plan",
+            ("python3", "scripts/release_pipeline.py", "plan"),
+            {
+                "--event": "${{ github.event_name }}",
+                "--ref": "${{ github.ref }}",
+                "--sha": "${{ github.sha }}",
+                "--version": "$version",
+                "--matrix": "release/release-matrix.json",
+                "--output": "release-plan.json",
+                "--github-output": "$GITHUB_OUTPUT",
+            },
+        ),
+        download_is_bound(build, plan_artifact, "plan"),
+        download_is_bound(build, primary_artifacts, "release-assets"),
+        step_command_is_bound(
+            build,
+            "Produce the byte-bound release handoff",
+            ("python3", "scripts/release_pipeline.py", "handoff"),
+            {
+                "--plan": "plan/release-plan.json",
+                "--assets-dir": "release-assets",
+                "--output": "release-handoff.json",
+            },
+        ),
+        upload_is_bound(
+            build,
+            "release-unverified-${{ github.sha }}",
+            ["release-handoff.json", "release-assets"],
+        ),
+        download_is_bound(verify, plan_artifact, "plan"),
+        download_is_bound(
+            verify, "${{ needs.build.outputs.artifact_id }}", "unverified"
+        ),
+        step_has_exact_command(
+            verify,
+            "Verify handoff against plan and workflow SHA",
+            ("cp", "-a", "unverified/release-assets", "verified/release-assets"),
+        ),
+        step_command_is_bound(
+            verify,
+            "Verify handoff against plan and workflow SHA",
+            ("python3", "scripts/release_pipeline.py", "verify"),
+            {
+                "--plan": "plan/release-plan.json",
+                "--handoff": "unverified/release-handoff.json",
+                "--assets-dir": "verified/release-assets",
+                "--output": "verified/verified-handoff.json",
+                "--sha": "${{ github.sha }}",
+            },
+        ),
+        step_command_is_bound(
+            verify,
+            "Generate byte-derived release indexes",
+            ("python3", "scripts/release_index.py"),
+            {
+                "--assets-dir": "verified/release-assets",
+                "--handoff": "verified/verified-handoff.json",
+                "--json-output": "verified/release-index.json",
+                "--markdown-output": "verified/RELEASE_INDEX.md",
+                "--retention-days": "7",
+            },
+        ),
+        upload_is_bound(
+            verify, "release-verified-${{ github.sha }}", ["verified"]
+        ),
+        download_is_bound(attest, verified_artifact, "verified"),
+        action_input_is_bound(
+            attest,
+            "Attest verified bytes",
+            "actions/attest@v4",
+            "subject-path",
+            "verified/release-assets/**",
+        ),
+        download_is_bound(publish, verified_artifact, "verified"),
+        step_command_is_bound(
+            publish,
+            "Publish the exact verified release assets",
+            ("python3", "scripts/release_pipeline.py", "publish"),
+            {
+                "--handoff": "verified/verified-handoff.json",
+                "--assets-dir": "verified/release-assets",
+                "--index-json": "verified/release-index.json",
+                "--index-markdown": "verified/RELEASE_INDEX.md",
+                "--tag": "$tag",
+            },
+        ),
+    )
+    if not all(root_contracts):
+        errors.append(
+            "release workflow must bind each handoff stage to its declared root"
+        )
     uploads = text.count("uses: actions/upload-artifact@v4")
     download_steps = action_steps(text, "actions/download-artifact@v4")
     downloads = len(download_steps)
@@ -194,8 +584,6 @@ def validate(text: str) -> list[str]:
         errors.append("every artifact download must flatten into its declared path")
     if re.search(r"(?m)^\s+path:\s*[^\n]*[*?]", text):
         errors.append("release workflow artifact paths must not use wildcards")
-    if re.search(r"gh release (?:create|upload)[^\n]*[*?]", text):
-        errors.append("publish command must enumerate release assets without wildcards")
     return errors
 
 
