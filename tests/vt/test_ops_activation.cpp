@@ -287,3 +287,67 @@ TEST_CASE("embedding bounds-checks ids") {
   Queue q{Cpu(), nullptr};
   CHECK_THROWS_AS(vt::Embedding(q, to, tt, ti), std::runtime_error);
 }
+
+// --- vt::GeluMulSeparate: the SEPARATE-buffer GeGLU (issue #377) -------------
+// Gemma-4's per-layer-embedding path calls this from the SHARED forward
+// (gemma4.cpp, the `ple > 0` block), with gate and up in two distinct buffers
+// rather than one [T, 2D] tensor. It had only a ROCm implementation and threw
+// "ROCm-only fast path in this build" everywhere else, so Gemma-4 aborted on
+// its first layer on CUDA and on CPU. These cases pin the portable path.
+#include "vt/fused_ops.h"
+
+TEST_CASE("gelu_mul_separate golden matches gelu_and_mul on the same values") {
+  // Same numbers as the gelu_and_mul golden above, but split across two
+  // buffers: gate=[1,2], up=[3,4]. The two ops must agree by construction.
+  std::vector<float> gate = {1.0f, 2.0f};
+  std::vector<float> up = {3.0f, 4.0f};
+  std::vector<float> out(2, 0.0f);
+  Queue q{Cpu(), nullptr};
+  vt::GeluMulSeparate(q, out.data(), gate.data(), up.data(), 2, DType::kF32);
+  CHECK(out[0] == doctest::Approx(GeluTanhRef(1.0f) * 3.0f));
+  CHECK(out[1] == doctest::Approx(GeluTanhRef(2.0f) * 4.0f));
+}
+
+TEST_CASE("gelu_mul_separate agrees with gelu_and_mul bit-for-bit at Gemma-4 PLE width") {
+  // gemma-4-E4B per-layer-embedding width; T rows of n = T*ple elements. The
+  // interleaved op is the reference: whatever GeluAndMul produces for
+  // [gate|up], the separate-buffer form must produce byte-for-byte.
+  const int64_t T = 3, ple = 256, n = T * ple;
+  std::vector<float> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    gate[static_cast<size_t>(i)] = std::sin(0.017f * static_cast<float>(i) + 0.3f) * 3.0f;
+    up[static_cast<size_t>(i)] = std::cos(0.011f * static_cast<float>(i) + 1.1f) * 2.0f;
+  }
+  // Reference: one [1, 2n] tensor laid out as [gate | up].
+  std::vector<float> inter(static_cast<size_t>(2 * n));
+  std::copy(gate.begin(), gate.end(), inter.begin());
+  std::copy(up.begin(), up.end(), inter.begin() + static_cast<ptrdiff_t>(n));
+  std::vector<float> ref(static_cast<size_t>(n), 0.0f);
+  Tensor ti = Tensor::Contiguous(inter.data(), DType::kF32, Cpu(), {1, 2 * n});
+  Tensor tr = Tensor::Contiguous(ref.data(), DType::kF32, Cpu(), {1, n});
+  Queue q{Cpu(), nullptr};
+  vt::GeluAndMul(q, tr, ti);
+
+  std::vector<float> got(static_cast<size_t>(n), 0.0f);
+  vt::GeluMulSeparate(q, got.data(), gate.data(), up.data(), n, DType::kF32);
+  CHECK(std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("gelu_mul_separate bf16 in/out at Gemma-4 PLE width") {
+  // The shipped call site is bf16: gemma4.cpp passes DType::kBF16.
+  const int64_t n = 512;
+  std::vector<uint16_t> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+  std::vector<uint16_t> out(static_cast<size_t>(n), 0);
+  for (int64_t i = 0; i < n; ++i) {
+    gate[static_cast<size_t>(i)] = vt::F32ToBF16(std::sin(0.021f * static_cast<float>(i)) * 3.0f);
+    up[static_cast<size_t>(i)] = vt::F32ToBF16(std::cos(0.013f * static_cast<float>(i)) * 2.0f);
+  }
+  Queue q{Cpu(), nullptr};
+  vt::GeluMulSeparate(q, out.data(), gate.data(), up.data(), n, DType::kBF16);
+  for (int64_t i = 0; i < n; ++i) {
+    const float g = vt::BF16ToF32(gate[static_cast<size_t>(i)]);
+    const float u = vt::BF16ToF32(up[static_cast<size_t>(i)]);
+    CHECK(vt::BF16ToF32(out[static_cast<size_t>(i)]) ==
+          doctest::Approx(GeluTanhRef(g) * u).epsilon(0.01));
+  }
+}
