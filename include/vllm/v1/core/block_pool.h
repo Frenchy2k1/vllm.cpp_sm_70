@@ -92,7 +92,8 @@ class BlockPool {
   //   hash_block_size: The block size at which block hashes are computed. The
   //     actual block size usually equals it; with differently-sized KV cache
   //     groups it can be a multiple (the align path, DEFERRED).
-  //   enable_kv_cache_events: Whether to enable kv cache events (DEFERRED).
+  //   enable_kv_cache_events: Whether to enable kv cache events. Default off;
+  //     the Scheduler derives it from --kv-events-config.
   BlockPool(int64_t num_gpu_blocks, bool enable_caching, int hash_block_size,
             bool enable_kv_cache_events = false);
 
@@ -136,10 +137,9 @@ class BlockPool {
   // (kv_events / block_pool.py:373-443). Unlike cache_full_blocks this does NOT
   // modify block state; it only appends events so external consumers learn about
   // reused blocks. No-op unless enable_kv_cache_events and num_cached_blocks > 0.
-  // NOTE: upstream calls this only under the non-default kv_cache_report_mode ==
-  // "full" (kv_cache_manager.py:265-280); our Request has no report_mode field,
-  // so the MANAGER wiring is deferred (the default "incremental" mode never
-  // fires it). The BlockPool method itself is ported + directly gated.
+  // Called only under the non-default kv_cache_report_mode == "full", from
+  // KVCacheManager::get_computed_blocks (kv_cache_manager.py:262-280) -- wired
+  // by KV-EVENTS W3. The default "incremental" mode never fires it.
   void emit_cached_block_events(const Request& request, int num_cached_blocks,
                                 int block_size, int kv_cache_group_id);
 

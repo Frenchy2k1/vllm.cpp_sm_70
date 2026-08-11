@@ -1263,6 +1263,39 @@ across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
 ids win. This is a library-API field today — the OpenAI request field is not
 wired yet.
 
+### KV-cache events, and `kv_cache_report_mode`
+
+`SamplingParams::extra_args` is a per-request string map mirroring vLLM's
+`extra_args`, and the one key read from it today is `kv_cache_report_mode`:
+
+```cpp
+vllm::SamplingParams params;
+params.extra_args = std::map<std::string, std::string>{
+    {"kv_cache_report_mode", "full"}};
+```
+
+It controls how much of that request's prefix-cache activity reaches the
+KV-cache event stream. `"incremental"`, the default and what you get whenever the
+key is absent, reports only blocks the request newly STORED. `"full"` also
+re-reports the blocks it REUSED from the cache, which is what a prefix-cache-aware
+router needs to learn that this engine already holds a prefix.
+
+Events are OFF unless a `vllm::distributed::KVEventsConfig` with
+`enable_kv_cache_events = true` is passed to the `Scheduler`, so
+`kv_cache_report_mode` changes nothing by itself. With events on, each engine step
+publishes at most one `KVEventBatch` — a wall-clock `ts`, that step's
+`BlockStored` / `BlockRemoved` / `AllBlocksCleared` events, and the data-parallel
+rank — to the configured publisher, and its msgpack encoding is byte-identical to
+what vLLM puts on the wire.
+
+Two limits to know. The **`zmq` publisher is not ported**: asking for it throws
+rather than silently downgrading, because the live socket transport needs a
+dependency this project does not carry, so `publisher` must be `"null"` today —
+and it must be set explicitly, since an unset value is not yet resolved the way
+vLLM resolves it ([issue #353](https://github.com/mudler/vllm.cpp/issues/353)).
+And `extra_args` is reachable **only from the C++ API**: the HTTP door to it
+(`vllm_xargs`) is not ported, so an OpenAI request cannot set the report mode.
+
 ## Multimodal input (image, video, audio to text)
 
 Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:

@@ -300,6 +300,12 @@ RUNNABLE_BASELINE = frozenset({
     "ENG-PRIORITY-SCHED",
     "ENG-RELEASE-CONTAINERS",
     "KERNEL-GEMM-CPU-ELEM",
+    # KV-EVENTS W3 (2026-08-11, issue #352): GROWTH, re-pinned in the same
+    # change. The row's Gates section previously described only in-process
+    # assertion counts; W3 names the CPU test binaries and the ctest sweep that
+    # gate the scheduler envelope and the report_mode=="full" reuse path, so the
+    # row now carries a command that can fail and joins the runnable population.
+    "KV-EVENTS",
     "LORA-RUNTIME",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
