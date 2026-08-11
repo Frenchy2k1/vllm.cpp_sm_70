@@ -38,6 +38,8 @@ void GeluTanhKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void GeluErfKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void MoeRouterTopKKernelRocm(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
                              const MoeRouterTopKArgs& args, const Tensor* bias);
+// Companion MoE-path op (same TU): elementwise silu(gate)*up.
+void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
 // pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
 void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
@@ -135,6 +137,8 @@ struct Registrar {
     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelRocm)));
+    RegisterOp(OpId::kMoeSiluMul, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelRocm)));
     RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));

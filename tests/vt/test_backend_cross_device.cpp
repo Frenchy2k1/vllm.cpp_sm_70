@@ -1793,6 +1793,127 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
   }
 }
 
+TEST_CASE("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") {
+  // Elementwise silu(gate)*up (the MoE-path activation). f32 and bf16 arms.
+  const size_t n = 1024;
+  const std::vector<float> gate = RandomVec(n, 901);
+  const std::vector<float> up = RandomVec(n, 902);
+  const std::vector<uint16_t> gate_bf = Bf16Bits(gate);
+  const std::vector<uint16_t> up_bf = Bf16Bits(up);
+  for (bool bf16 : {false, true}) {
+    CAPTURE(bf16);
+    std::vector<float> ref_f(n, 0.0f);
+    std::vector<uint16_t> ref_b(n, 0);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cg = gate, cu = up;
+      std::vector<uint16_t> cgb = gate_bf, cub = up_bf;
+      if (bf16) {
+        Tensor tg = Tensor::Contiguous(cgb.data(), DType::kBF16, cd, {static_cast<int64_t>(n)});
+        Tensor tu = Tensor::Contiguous(cub.data(), DType::kBF16, cd, {static_cast<int64_t>(n)});
+        Tensor tout = Tensor::Contiguous(ref_b.data(), DType::kBF16, cd, {static_cast<int64_t>(n)});
+        vt::MoeSiluMul(cq, tout, tg, tu);
+      } else {
+        Tensor tg = T1(cg.data(), cd, static_cast<int64_t>(n));
+        Tensor tu = T1(cu.data(), cd, static_cast<int64_t>(n));
+        Tensor tout = T1(ref_f.data(), cd, static_cast<int64_t>(n));
+        vt::MoeSiluMul(cq, tout, tg, tu);
+      }
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMoeSiluMul, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dg(dev, q, n), du(dev, q, n), dout(dev, q, n);
+      DevBufBytes dgb(dev, q, n * 2), dub(dev, q, n * 2), doutb(dev, q, n * 2);
+      if (bf16) {
+        dgb.Upload(gate_bf.data());
+        dub.Upload(up_bf.data());
+        Tensor tg = Tensor::Contiguous(dgb.ptr(), DType::kBF16, d, {static_cast<int64_t>(n)});
+        Tensor tu = Tensor::Contiguous(dub.ptr(), DType::kBF16, d, {static_cast<int64_t>(n)});
+        Tensor tout = Tensor::Contiguous(doutb.ptr(), DType::kBF16, d, {static_cast<int64_t>(n)});
+        vt::MoeSiluMul(q, tout, tg, tu);
+        std::vector<uint16_t> got(n);
+        doutb.Download(got.data());
+        CHECK(got == ref_b);  // single multiply + RNE store both sides: exact
+      } else {
+        dg.Upload(gate);
+        du.Upload(up);
+        Tensor tg = T1(dg.ptr(), d, static_cast<int64_t>(n));
+        Tensor tu = T1(du.ptr(), d, static_cast<int64_t>(n));
+        Tensor tout = T1(dout.ptr(), d, static_cast<int64_t>(n));
+        vt::MoeSiluMul(q, tout, tg, tu);
+        CHECK(Nmse(ref_f, dout.Download()) <= kNmseTol);
+      }
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
+  // Ungrouped softmax top-k. Weights are arithmetic (softmax + renorm): NMSE.
+  // The selected INDICES are discrete outputs: exact match required (the
+  // tie-break is lowest-index on both sides). The bf16-logits arm upcasts at
+  // the boundary; the softmax stays f32 on both sides.
+  const int64_t T = 6, E = 48, K = 5;
+  const size_t ln = static_cast<size_t>(T * E);
+  const std::vector<float> logits = RandomVec(ln, 891);
+  const std::vector<uint16_t> logits_bf = Bf16Bits(logits);
+  for (bool bf16 : {false, true}) {
+    for (bool renorm : {false, true}) {
+      CAPTURE(bf16);
+      CAPTURE(renorm);
+      vt::MoeRouterTopKArgs args;
+      args.top_k = static_cast<int>(K);
+      args.renormalize = renorm;
+      std::vector<float> ref_w(static_cast<size_t>(T * K), 0.0f);
+      std::vector<int32_t> ref_i(static_cast<size_t>(T * K), -1);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> cl = logits;
+        std::vector<uint16_t> clb = logits_bf;
+        Tensor tl = bf16 ? Tensor::Contiguous(clb.data(), DType::kBF16, cd, {T, E})
+                         : Tensor::Contiguous(cl.data(), DType::kF32, cd, {T, E});
+        Tensor tw = Tensor::Contiguous(ref_w.data(), DType::kF32, cd, {T, K});
+        Tensor ti = Tensor::Contiguous(ref_i.data(), DType::kI32, cd, {T, K});
+        vt::MoeRouterTopK(cq, tw, ti, tl, args, nullptr);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMoeRouterTopK, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf dl(dev, q, ln), dw(dev, q, static_cast<size_t>(T * K));
+        DevBufBytes dlb(dev, q, ln * 2);
+        DevBufI32 di(dev, q, static_cast<size_t>(T * K));
+        if (bf16) dlb.Upload(logits_bf.data());
+        else dl.Upload(logits);
+        Tensor tl = bf16 ? Tensor::Contiguous(dlb.ptr(), DType::kBF16, d, {T, E})
+                         : Tensor::Contiguous(dl.ptr(), DType::kF32, d, {T, E});
+        Tensor tw = Tensor::Contiguous(dw.ptr(), DType::kF32, d, {T, K});
+        Tensor ti = Tensor::Contiguous(di.ptr(), DType::kI32, d, {T, K});
+        vt::MoeRouterTopK(q, tw, ti, tl, args, nullptr);
+        CHECK(Nmse(ref_w, dw.Download()) <= kNmseTol);
+        std::vector<int32_t> got_i(static_cast<size_t>(T * K));
+        dev.Synchronize(q);
+        dev.Copy(q, got_i.data(), di.ptr(), got_i.size() * sizeof(int32_t));
+        dev.Synchronize(q);
+        CHECK(got_i == ref_i);  // selected experts: exact
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;
