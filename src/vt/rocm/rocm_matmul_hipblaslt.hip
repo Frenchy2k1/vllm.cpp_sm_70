@@ -4,28 +4,13 @@
 //
 // MatmulBT: out[M,N] = a[M,K] @ b[N,K]^T  (b = Linear weight row-major)
 // Matmul:   out[M,N] = a[M,K] @ b[K,N]
-#include <hip/hip_bf16.h>
-#include <hip/hip_runtime.h>
-// hipBLAS ships TWO generations of the *Ex entry points and picks between them
-// in the header. The legacy generation takes `hipblasDatatype_t` (HIPBLAS_R_*);
-// the current one takes the HIP-wide `hipDataType` (HIP_R_*). This file is
-// written entirely against the current one — every data type below is HIP_R_*,
-// and the compute type is already the current `hipblasComputeType_t` — but it
-// never ASKED for it, so it only compiled on a ROCm new enough to make that
-// generation the default (7.x, where the row was developed on gfx1201).
-//
-// On ROCm 6.4 the legacy generation is the default, the two enums are distinct
-// types with no implicit conversion, and all six *Ex call sites fail with
-// "no matching function for call to 'hipblasGemmEx' ... no known conversion
-// from 'const hipDataType' to 'hipblasDatatype_t' for 9th argument" (issue #201,
-// gfx1100). Selecting the generation the file is written for fixes all six at
-// the include, rather than teaching six call sites to switch enums.
-//
-// Must precede <hipblas/hipblas.h>: it is what the header dispatches on. Newer
-// hipBLAS, where this generation is already the default, ignores it.
+// Required on ROCm 6.x for hipblasGemmEx overloads (#201/#132).
 #ifndef HIPBLAS_V2
 #define HIPBLAS_V2
 #endif
+
+#include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 
@@ -41,6 +26,7 @@
 #include <vector>
 
 #include "vt/ops.h"
+#include "vt/rocm/rocm_device_bind.h"
 
 namespace vt::rocm {
 namespace {
@@ -90,12 +76,18 @@ BlasCtx GetBlas(int device, hipStream_t stream) {
     hipblasHandle_t handle = nullptr;
   };
   static thread_local Tls tls;
+  // Bind current device outside capture so create/setStream see the right GPU
+  // after peer-MoE left current on the expert device.
+  if (!StreamIsCapturing(stream)) {
+    int cur = -1;
+    if (hipGetDevice(&cur) != hipSuccess || cur != device) (void)hipSetDevice(device);
+  }
   if (tls.handle == nullptr || tls.dev != device) {
     if (tls.handle) {
-      // device switch rare — destroy old handle
       (void)hipblasDestroy(tls.handle);
       tls.handle = nullptr;
     }
+    if (!StreamIsCapturing(stream)) (void)hipSetDevice(device);
     CheckBlas(hipblasCreate(&tls.handle), "hipblasCreate");
     tls.dev = device;
     tls.stream = nullptr;
@@ -136,48 +128,77 @@ hipblasComputeType_t GemmCompute(DType dt) {
   return k;
 }
 
-// VT_ROCM_GEMV=1 enables naive M=1 BF16 GEMV (default OFF — hipblas faster on gfx1201).
+// VT_ROCM_GEMV: 1=force custom M=1 BF16 GEMV, 0/unset=hipblas (faster on gfx1201 lab).
 bool GemvEnabled() {
   static const bool on = [] {
     if (const char* e = std::getenv("VT_ROCM_GEMV")) return e[0] == '1';
-    return false;
+    return false;  // hipblasGemmEx wins A/B 2026-08-09 (~52 vs ~40 t/s)
   }();
   return on;
 }
 
 // y[n] = alpha * dot(x[0:K], W[n,0:K]) + beta * y[n]
-// W row-major [N,K].
-// Strategy: cache x in LDS; each block owns a tile of output rows.
-// VT_ROCM_GEMV=1 to enable (default off — A/B vs hipblas).
-__global__ void Bf16GemvBTKernel(__hip_bfloat16* __restrict__ y,
-                                 const __hip_bfloat16* __restrict__ x,
-                                 const __hip_bfloat16* __restrict__ W, int N, int K,
-                                 float alpha, float beta) {
-  // Dynamic shared: x_cache[K] floats
+// grid = N — one block per output row; x cached in LDS; block-reduce over K.
+__global__ void Bf16GemvBTRowKernel(__hip_bfloat16* __restrict__ y,
+                                    const __hip_bfloat16* __restrict__ x,
+                                    const __hip_bfloat16* __restrict__ W, int N, int K,
+                                    float alpha, float beta) {
+  const int n = static_cast<int>(blockIdx.x);
+  if (n >= N) return;
   extern __shared__ float smem[];
   float* x_cache = smem;
-
-  // Cooperative load of x into LDS
-  for (int k = static_cast<int>(threadIdx.x); k < K; k += static_cast<int>(blockDim.x)) {
-    x_cache[k] = __bfloat162float(x[k]);
-  }
+  const int tid = static_cast<int>(threadIdx.x);
+  constexpr int kBlock = 256;
+  for (int k = tid; k < K; k += kBlock) x_cache[k] = __bfloat162float(x[k]);
   __syncthreads();
 
-  // Each thread owns one or more output rows
-  for (int n = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); n < N;
-       n += static_cast<int>(gridDim.x * blockDim.x)) {
-    const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
-    float acc = 0.f;
-    // Unroll-friendly scalar loop; x from LDS
-    int k = 0;
-    for (; k + 3 < K; k += 4) {
-      acc += x_cache[k] * __bfloat162float(wrow[k]);
-      acc += x_cache[k + 1] * __bfloat162float(wrow[k + 1]);
-      acc += x_cache[k + 2] * __bfloat162float(wrow[k + 2]);
-      acc += x_cache[k + 3] * __bfloat162float(wrow[k + 3]);
-    }
-    for (; k < K; ++k) acc += x_cache[k] * __bfloat162float(wrow[k]);
-    float v = alpha * acc;
+  const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
+  float acc = 0.f;
+  const int K16 = K & ~15;
+  for (int k = tid * 16; k < K16; k += kBlock * 16) {
+#pragma unroll
+    for (int t = 0; t < 16; ++t) acc += x_cache[k + t] * __bfloat162float(wrow[k + t]);
+  }
+  for (int k = K16 + tid; k < K; k += kBlock) acc += x_cache[k] * __bfloat162float(wrow[k]);
+
+  __shared__ float red[256];
+  red[tid] = acc;
+  __syncthreads();
+#pragma unroll
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float v = alpha * red[0];
+    if (beta != 0.f) v += beta * __bfloat162float(y[n]);
+    y[n] = __float2bfloat16(v);
+  }
+}
+
+// Fallback when K*f32 LDS too big: no x cache, threads stride K from global.
+__global__ void Bf16GemvBTRowNoLdsKernel(__hip_bfloat16* __restrict__ y,
+                                         const __hip_bfloat16* __restrict__ x,
+                                         const __hip_bfloat16* __restrict__ W, int N, int K,
+                                         float alpha, float beta) {
+  const int n = static_cast<int>(blockIdx.x);
+  if (n >= N) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  constexpr int kBlock = 256;
+  const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
+  float acc = 0.f;
+  for (int k = tid; k < K; k += kBlock)
+    acc += __bfloat162float(x[k]) * __bfloat162float(wrow[k]);
+  __shared__ float red[256];
+  red[tid] = acc;
+  __syncthreads();
+#pragma unroll
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float v = alpha * red[0];
     if (beta != 0.f) v += beta * __bfloat162float(y[n]);
     y[n] = __float2bfloat16(v);
   }
@@ -187,12 +208,16 @@ void Bf16GemvBT(hipStream_t s, void* out, const void* a, const void* b, int N, i
                 float alpha, float beta) {
   constexpr int kBlock = 256;
   if (K <= 0 || N <= 0) return;
-  const int grid = (N + kBlock - 1) / kBlock;
   const size_t shmem = static_cast<size_t>(K) * sizeof(float);
-  if (shmem > 48 * 1024) return;  // caller falls through if we no-op — keep K small
-  Bf16GemvBTKernel<<<grid, kBlock, shmem, s>>>(
-      static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
-      static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  if (shmem <= 48 * 1024) {
+    Bf16GemvBTRowKernel<<<N, kBlock, shmem, s>>>(
+        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
+        static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  } else {
+    Bf16GemvBTRowNoLdsKernel<<<N, kBlock, 0, s>>>(
+        static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
+        static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+  }
 }
 
 // VT_ROCM_HIPBLASLT=1 enables. Default OFF — heuristic path aborted on gfx1201 in lab.
@@ -417,6 +442,7 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 //   opB=N, B is KxM col = row A[M,K] with ld=a_rs
 //   C is NxM col = row out[M,N] ld=N
 void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  EnsureQueueDevice(q);
   const bool bf16 = a.dtype == DType::kBF16 && b.dtype == DType::kBF16;
   const bool f32 = a.dtype == DType::kF32 && b.dtype == DType::kF32;
   if (!bf16 && !f32) {
