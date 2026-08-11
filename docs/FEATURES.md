@@ -25,8 +25,8 @@ are our reading of their documented behavior, not measurements.
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 35 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; immutable handoff uses a checkout-disjoint asset root; first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Architectures | 37 registered, 27 gated | 130+ | 100+ | 100+ |
+| Downloadable server binaries | ✅ v0.0.2 publishes eight indexed CPU/CUDA/Vulkan/Metal/MLX archives with checksums, provenance records, manifests, and SBOMs | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 
@@ -82,7 +82,7 @@ are our reading of their documented behavior, not measurements.
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers from its own translation unit via
 `REGISTER_VLLM_MODEL`, and `scripts/check-supported-models.py` gates this list
-against the source so it can never drift. Today that is **35 registered
+against the source so it can never drift. Today that is **37 registered
 architectures**. Each row names the concrete checkpoint it was gated against and
 the honest verdict; per-arch lifecycle caveats are in [STATUS.md](STATUS.md) and
 the agent-facing detail is in `.agents/model-matrix.md`.
@@ -160,7 +160,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 
 27 of the 31 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 35 registered total also covers 3 Parakeet ASR entry points and the
+(The 37 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live
