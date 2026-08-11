@@ -57,6 +57,22 @@ SAFE_FILES = {
           static auto* registry = new WindowsHandlerRegistry();
           return *registry;
         }
+        bool DrainEntrantsWithTimeout(std::atomic<unsigned>& entrants) {
+          const ULONGLONG deadline = GetTickCount64() + 5000;
+          while (entrants.load(std::memory_order_seq_cst) != 0) {
+            if (GetTickCount64() >= deadline) return false;
+            SwitchToThread();
+          }
+          return true;
+        }
+        bool DrainInFlightWithTimeout(std::atomic<unsigned>& in_flight) {
+          const ULONGLONG deadline = GetTickCount64() + 5000;
+          while (in_flight.load(std::memory_order_seq_cst) != 0) {
+            if (GetTickCount64() >= deadline) return false;
+            SwitchToThread();
+          }
+          return true;
+        }
         std::atomic<unsigned> in_flight;
         bool DispatchControlEvent(DWORD event) {
           auto& registry = HandlerRegistry();
@@ -76,11 +92,13 @@ SAFE_FILES = {
           return DispatchControlEvent(event);
         }
         SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
+        ConsoleShutdown::~ConsoleShutdown() {
         registry.published.store(nullptr, std::memory_order_seq_cst);
         DrainEntrantsWithTimeout(registry.entrants);
         DrainInFlightWithTimeout(state->in_flight);
         if (!safe_to_close) RetireHandlerState(std::move(state));
         else state.reset();
+        }
         #else
         #include <unistd.h>
         pipe(fds); read(fds[0], data, 1); write(fds[1], data, 1); close(fds[0]);
@@ -510,6 +528,47 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         result = self.run_checker(root)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("src/vllm/platform/process.h", result.stdout + result.stderr)
+
+    def test_real_console_rejects_state_access_after_final_decrement(self) -> None:
+        console = (REPO / "src/vllm/platform/console_shutdown.cpp").read_text(
+            encoding="utf-8"
+        )
+        decrement = (
+            "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        )
+        self.assertEqual(console.count(decrement), 1)
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            console.replace(
+                decrement,
+                decrement + "\n  SetEvent(state->stop_event);",
+                1,
+            ),
+            "final in-flight decrement",
+        )
+
+    def test_real_console_drains_require_reachable_timeout_branches(self) -> None:
+        console = (REPO / "src/vllm/platform/console_shutdown.cpp").read_text(
+            encoding="utf-8"
+        )
+        timeout = "if (GetTickCount64() >= deadline) return false;"
+        self.assertEqual(console.count(timeout), 2)
+        decoy = (
+            'const char* timeout_decoy = "if (GetTickCount64() >= deadline) '
+            'return false;";\n'
+            "    // if (GetTickCount64() >= deadline) return false;"
+        )
+        for occurrence in (0, 1):
+            position = -1
+            for _ in range(occurrence + 1):
+                position = console.find(timeout, position + 1)
+            self.assertGreaterEqual(position, 0)
+            mutated = console[:position] + decoy + console[position + len(timeout):]
+            self.assert_rejected(
+                "src/vllm/platform/console_shutdown.cpp",
+                mutated,
+                "finite timeout",
+            )
 
     def test_rejects_disabled_smoke_and_missing_crt_audit(self) -> None:
         script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])

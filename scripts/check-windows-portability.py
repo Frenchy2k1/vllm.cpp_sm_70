@@ -276,6 +276,25 @@ def without_cpp_comments(text: str) -> str:
     return re.sub(r"//.*", "", text)
 
 
+_CPP_INERT = re.compile(
+    r'''(?P<block>/\*.*?\*/)|'''
+    r'''(?P<line>//[^\n]*)|'''
+    r'''(?P<raw>R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})\(.*?\)(?P=delimiter)")|'''
+    r'''(?P<string>"(?:\\.|[^"\\])*")|'''
+    r'''(?P<char>'(?:\\.|[^'\\])*')''',
+    re.DOTALL,
+)
+
+
+def without_cpp_comments_and_literals(text: str) -> str:
+    """Blank inert C++ text while preserving offsets and line boundaries."""
+    return _CPP_INERT.sub(
+        lambda match: "".join("\n" if char == "\n" else " "
+                              for char in match.group(0)),
+        text,
+    )
+
+
 def _active_powershell(text: str) -> str:
     """Strip comments and literal `if ($false) { ... }` blocks locally.
 
@@ -362,13 +381,10 @@ def _validate_powershell_source_order(text: str, errors: list[str]) -> None:
     _ordered_matches(active, stages, errors, "source contract")
 
 
-def _cpp_function_body(source: str, signature: str) -> str:
-    match = re.search(signature, source)
-    if match is None:
-        return ""
-    opening = source.find("{", match.end())
-    if opening < 0:
-        return ""
+def _cpp_braced_body(source: str, opening: int) -> tuple[str, int] | None:
+    """Return a balanced braced body and its closing-brace offset."""
+    if opening < 0 or opening >= len(source) or source[opening] != "{":
+        return None
     depth = 0
     for offset in range(opening, len(source)):
         if source[offset] == "{":
@@ -376,8 +392,77 @@ def _cpp_function_body(source: str, signature: str) -> str:
         elif source[offset] == "}":
             depth -= 1
             if depth == 0:
-                return source[opening + 1:offset]
-    return ""
+                return source[opening + 1:offset], offset
+    return None
+
+
+def _cpp_function_body(source: str, signature: str) -> str:
+    active = without_cpp_comments_and_literals(source)
+    match = re.search(signature, active)
+    if match is None:
+        return ""
+    opening = active.find("{", match.end())
+    result = _cpp_braced_body(active, opening)
+    return "" if result is None else result[0]
+
+
+def _finite_timeout_expression(console: str, expression: str) -> bool:
+    expression = expression.strip()
+    if re.fullmatch(r"\d+(?:[uUlL]*)", expression):
+        return True
+    if not re.fullmatch(r"[A-Za-z_]\w*", expression):
+        return False
+    definitions = re.findall(
+        rf"\b(?:constexpr|const)\b[^;=]*\b{re.escape(expression)}\s*=\s*([^;]+);",
+        console,
+    )
+    return (len(definitions) == 1 and
+            re.fullmatch(r"\s*\d+(?:[uUlL]*)\s*", definitions[0]) is not None)
+
+
+def _validate_bounded_drain(console: str, function: str, counter: str,
+                            errors: list[str]) -> None:
+    active_console = without_cpp_comments_and_literals(console)
+    body = _cpp_function_body(
+        active_console,
+        rf"\bbool\s+{re.escape(function)}\s*\(",
+    )
+    label = f"console_shutdown.cpp: {function} requires a finite timeout"
+    if not body or re.search(r"\bINFINITE\b", body):
+        errors.append(label)
+        return
+
+    deadlines = list(re.finditer(
+        r"\b(?:const\s+)?ULONGLONG\s+deadline\s*=\s*"
+        r"GetTickCount64\s*\(\s*\)\s*\+\s*([A-Za-z_]\w*|\d+[uUlL]*)\s*;",
+        body,
+    ))
+    loop = re.search(
+        rf"\bwhile\s*\(\s*{re.escape(counter)}\.load\s*\(\s*"
+        r"std::memory_order_seq_cst\s*\)\s*!=\s*0\s*\)\s*\{",
+        body,
+    )
+    if (len(deadlines) != 1 or loop is None or
+            deadlines[0].start() >= (loop.start() if loop else 0) or
+            not _finite_timeout_expression(active_console, deadlines[0].group(1))):
+        errors.append(label)
+        return
+
+    opening = body.find("{", loop.start(), loop.end())
+    loop_result = _cpp_braced_body(body, opening)
+    if loop_result is None:
+        errors.append(label)
+        return
+    loop_body, loop_close = loop_result
+    timeout_branch = re.match(
+        r"\s*if\s*\(\s*GetTickCount64\s*\(\s*\)\s*>=\s*deadline\s*\)"
+        r"\s*(?:\{\s*)?return\s+false\s*;\s*(?:\}\s*)?",
+        loop_body,
+    )
+    success_tail = body[loop_close + 1:]
+    if timeout_branch is None or re.fullmatch(
+            r"\s*return\s+true\s*;\s*", success_tail) is None:
+        errors.append(label)
 
 
 def _validate_console_protocol(console: str, errors: list[str]) -> None:
@@ -446,6 +531,30 @@ def _validate_console_protocol(console: str, errors: list[str]) -> None:
         errors.append(
             "console_shutdown.cpp: OS handler may use only stable atomics and Win32 events"
         )
+    final_decrements = list(re.finditer(
+        r"state->in_flight\.fetch_sub\s*\(\s*1\s*,\s*"
+        r"std::memory_order_seq_cst\s*\)",
+        dispatch,
+    ))
+    final_tail_ok = False
+    if len(final_decrements) == 1:
+        final_tail = dispatch[final_decrements[0].end():]
+        final_tail_ok = re.fullmatch(
+            r"\s*;\s*(?:\}\s*)*return\s+(?:true|false|[A-Za-z_]\w*)\s*;"
+            r"\s*(?:\}\s*)*",
+            final_tail,
+        ) is not None
+    if not final_tail_ok:
+        errors.append(
+            "console_shutdown.cpp: final in-flight decrement must be the last "
+            "handler operation"
+        )
+    _validate_bounded_drain(
+        console, "DrainEntrantsWithTimeout", "entrants", errors
+    )
+    _validate_bounded_drain(
+        console, "DrainInFlightWithTimeout", "in_flight", errors
+    )
     cleanup = _cpp_function_body(
         console, r"WindowsHandlerState::~WindowsHandlerState\s*\("
     ) or console
