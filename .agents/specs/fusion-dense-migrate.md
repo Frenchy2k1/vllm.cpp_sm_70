@@ -283,6 +283,20 @@ count folded models, i.e. changing a checker's semantics to make a prediction co
 true. Rejected. Drift is 0 and the allowlist holds only stated blockers, which is
 what the gate actually asserts.
 
+**Full CPU `ctest -j 6` on the MERGED head `4b99cefb`: 369 / 370 passed, 1
+failed**, 1441.85 s (370 not 369 — this branch adds one binary). The single
+failure is `test_engine_core_proc`, and it is a starvation flake, not a
+regression: re-run SERIALLY on the same binary it is **10 / 10 cases, 93
+assertions GREEN**. Its signature is the giveaway — under `-j 6` at load average
+~170 (two other worktrees running their own suites concurrently) it failed in
+0.06 s on `CHECK(abort_seen)` at `test_engine_core_proc.cpp:345` having spun to
+**1089 assertions** waiting for the abort to be observed, against 93 assertions
+when it runs alone. It is one of the four known starvation-prone binaries, it
+loads none of the five folded TUs, and the other three (`test_async_llm`,
+`test_openai_conformance`, `test_openai_api_server`) all passed in this run.
+`test_dense_gate_up_seam_forward` passed inside the suite too (32.96 s), which
+also proves the new binary is registered and wired.
+
 **RED-first, executed, not asserted.** Three mutations were run and each was
 restored byte-for-byte (`md5sum` verified against the pre-mutation digest):
 
