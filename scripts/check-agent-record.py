@@ -367,8 +367,13 @@ ENGINE_PREFIXES = (
 # are bot-opened, so nearly every squash red main). Developer-approved,
 # issue #418; `ACTIVE` on its committed spec. Sign-off keeps its rule with no
 # exemption and no product source changes.
+# 152 since 2026-08-11: +`ENG-RELEASE-WINDOWS` (native Windows x86_64 CPU and
+# Vulkan pre-alpha release extension). User-directed, issue #117; `INVENTORIED`
+# while its committed specification awaits implementation and hosted evidence.
+# No build, artifact, runtime evidence, workflow, or publication is claimed by
+# this row-count bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 151
+ENGINE_ROWS = 152
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
