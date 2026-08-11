@@ -335,6 +335,14 @@ than "it works", so it is worth stating precisely.
   which we had read as off — so image and video prompts before that fix skipped
   a normalization step. Still no reference decode for the vision path either
   way, so this corrects the code without changing what has been verified.
+- **A config key that is absent takes the architecture's value**
+  ([#412](https://github.com/mudler/vllm.cpp/issues/412)), not a neutral one:
+  `qk_scale_factor` 43.784 (→ 3.87 at head_dim 128), `sliding_window` 2048,
+  `output_multiplier` 0.196…, `final_logit_softcapping` 20.0, `rms_norm_eps`
+  1e-5, `post_norm_eps` 1e-8. The released 30B `config.json` carries all six, so
+  the text tower above is unchanged; the released GGUF and the DFlash drafter's
+  `config.json` each omit some, and both used to run a quietly different model.
+  Only an explicit `null` still disables the window or the soft-cap.
 - Even at reduced depth this is agreement with independent transcriptions of the
   same upstream source, not agreement with the model's own runtime: the pinned
   oracle cannot load `muse_glimmer` at all.
@@ -443,6 +451,27 @@ MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
 `nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
 throughput changes; the routed experts still use the grouped MoE kernel, which
 is where they belong.
+
+The **dense** MLP's W4A16 gate/up pair takes that same fused gate_up GEMM
+(`VT_DENSE_MARLIN_GATEUP`, **default ON**, opt out with `=0`). vLLM's dense
+Qwen3.6 MLP is one `MergedColumnParallelLinear` `gate_up_proj`, so one
+`[T,H]x[2I,H]` GEMM per layer is the mirrored topology; ours used to launch two,
+which was 193 Marlin calls per decode step against the oracle's 129. The default
+moved on a same-binary A/B: interleaved 4 reps per arm on
+`nvidia/Qwen3.6-27B-NVFP4`@`0893e160` (GB10) with the toggle as the only
+variable measured **+2.12% at c1 and +1.70% at c8**, every fused rep beating
+every split rep at both concurrencies, and the 64-token greedy continuation
+identical on both arms. It is still only ~29% of a measured +4.40 ms/step gap on
+the 27B and does not reach parity on its own. It applies only to an **NVFP4**
+W4A16 pair whose two shards share a global scale; a true-W4A4 checkpoint already
+takes the merged CUTLASS path instead, and a **dense MXFP4** pair is refused and
+keeps the split pair. That MXFP4 refusal is deliberate: the fused entry point the
+dense MLP reaches is NVFP4-only — it sizes the merged block-scale grid at K/16
+and pins `group_size = 16` — so admitting group-32 E8M0 scales would misread them
+as group-16 fp8-e4m3, the defect this project already recorded for the sibling
+implementation. No dense loader produces MXFP4 today, so the refusal changes no
+shipped configuration; it stops one future loader line from silently selecting a
+mis-scaled kernel.
 
 The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
 f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
@@ -807,8 +836,21 @@ attention output gate, `down_proj` and the merged `gate_up` stay quantized, whil
 the merged QKV, `lm_head` and the embedding table expand to bf16 because the
 shared forward consumes them in a form a block encoding cannot take.
 
-Three caveats:
+Four caveats:
 
+- **A key the GGUF omits falls back to Muse Glimmer's own constant, not to a
+  neutral one** ([#412](https://github.com/mudler/vllm.cpp/issues/412)). The
+  released file's 32 metadata keys include no post-norm epsilon, so both sandwich
+  post-norms used to run at `attention.layer_norm_rms_epsilon` (1e-5) where the
+  architecture says 1e-8 — a factor of 1000. The same rule now covers
+  `sliding_window` (2048, not "no window at all"), `output_multiplier`,
+  `final_logit_softcapping` and the query pre-scale. This changes GGUF
+  activations, though a same-binary A/B on the released k-quant produced
+  **token-identical** greedy output on both of the prompts on record. The
+  safetensors arm is unaffected: its `config.json` carries every one of those
+  keys. A converter that emits
+  `muse-glimmer.attention.post_norm_rms_epsilon` or `muse-glimmer.attention.scale`
+  is honoured over the default.
 - **The k-quant generates coherent text, but is not token-exact against
   llama.cpp.** Two defects had to be fixed to get there: the GGUF tokenizer gap
   ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
