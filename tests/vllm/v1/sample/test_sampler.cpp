@@ -387,3 +387,120 @@ TEST_CASE("Sampler: empty custom-logits-processor map is inert") {
   auto out = sampler.forward(q, tl, sm);
   CHECK(out.sampled_token_ids[0][0] == 1);  // untouched argmax
 }
+
+// ---------------------------------------------------------------------------
+// logprobs_mode (issue #238, sampler.py:87-93,255-302). Three of the four modes
+// were runtime-refused stubs; these gate what each one actually returns.
+//
+// The distinction that matters is RAW vs PROCESSED, not logprobs vs logits: the
+// raw pair is snapshotted before any mutation and describes the MODEL's
+// distribution, while the processed pair is taken after temperature and
+// top-k/top-p and describes the distribution actually SAMPLED from. A token
+// top-k masks away reads its true value in the raw modes and -inf in the
+// processed ones. Every case below uses the same logits so the four modes are
+// directly comparable.
+
+// raw_logits: the logits themselves, NOT log_softmax of them.
+TEST_CASE("Sampler: logprobs_mode raw_logits returns the unnormalized logits") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.all_random = false;
+  sm.max_num_logprobs = 2;
+
+  Sampler sampler(vllm::v1::LogprobsMode::kRawLogits);
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  REQUIRE(lt.logprobs.size() == 3);
+  // The raw logit values, verbatim -- every one strictly greater than the
+  // corresponding log_softmax value, which is what makes this mode observable.
+  CHECK(lt.logprobs[0] == doctest::Approx(3.0f));  // sampled (token 0)
+  CHECK(lt.logprobs[1] == doctest::Approx(3.0f));  // top-1
+  CHECK(lt.logprobs[2] == doctest::Approx(2.0f));  // top-2
+  CHECK(lt.logprob_token_ids[0] == 0);
+  CHECK(lt.selected_token_ranks[0] == 1);
+}
+
+// The default mode over the same logits, for contrast: normalized, so strictly
+// less than the raw logits above. Guards the default against this change.
+TEST_CASE("Sampler: logprobs_mode raw_logprobs is unchanged and normalized") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.all_random = false;
+  sm.max_num_logprobs = 2;
+
+  Sampler sampler;  // default == kRawLogprobs
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  const float lse = 3.0f + std::log(std::exp(0.0f) + std::exp(-2.0f) +
+                                    std::exp(-1.0f) + std::exp(-3.0f));
+  CHECK(lt.logprobs[0] == doctest::Approx(3.0f - lse));
+  CHECK(lt.logprobs[0] < 3.0f);  // strictly below the raw_logits answer
+}
+
+// processed_logits under top_k=2: the two surviving tokens keep their
+// temperature-scaled logits and the masked ones read -inf. This is the case the
+// mode exists for, and no raw mode can produce it.
+TEST_CASE("Sampler: logprobs_mode processed_logits shows the top-k mask") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = false;
+  sm.all_random = true;
+  sm.temperature = std::vector<float>{1.0f};
+  sm.top_k = std::vector<int32_t>{2};
+  sm.max_num_logprobs = 3;  // ask for enough to see a masked token
+
+  Sampler sampler(vllm::v1::LogprobsMode::kProcessedLogits);
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  REQUIRE(lt.num_tokens_per_position == 4);  // k + 1
+  // The kept tokens (0 and 2) hold their logits at temperature 1.0; the tail is
+  // masked. Column 0 is the sampled token, then the top-k by value.
+  CHECK(lt.logprobs[1] == doctest::Approx(3.0f));
+  CHECK(lt.logprobs[2] == doctest::Approx(2.0f));
+  // Whatever landed third is one of the masked tokens -> -inf.
+  CHECK(lt.logprobs[3] == -std::numeric_limits<float>::infinity());
+}
+
+// processed_logprobs: the same mask, but renormalized over the surviving
+// tokens, so the kept pair sums to 1 in probability space. That renormalization
+// is the whole difference from processed_logits.
+TEST_CASE("Sampler: logprobs_mode processed_logprobs renormalizes over the kept set") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = false;
+  sm.all_random = true;
+  sm.temperature = std::vector<float>{1.0f};
+  sm.top_k = std::vector<int32_t>{2};
+  sm.max_num_logprobs = 3;
+
+  Sampler sampler(vllm::v1::LogprobsMode::kProcessedLogprobs);
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  // log_softmax over the SURVIVING pair {3.0, 2.0} only.
+  const float kept_lse = 3.0f + std::log(std::exp(0.0f) + std::exp(-1.0f));
+  CHECK(lt.logprobs[1] == doctest::Approx(3.0f - kept_lse));
+  CHECK(lt.logprobs[2] == doctest::Approx(2.0f - kept_lse));
+  CHECK(lt.logprobs[3] == -std::numeric_limits<float>::infinity());
+  // Renormalized: the two kept tokens carry all the mass.
+  const double mass = std::exp(static_cast<double>(lt.logprobs[1])) +
+                      std::exp(static_cast<double>(lt.logprobs[2]));
+  CHECK(mass == doctest::Approx(1.0).epsilon(1e-5));
+}
