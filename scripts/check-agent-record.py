@@ -357,8 +357,14 @@ ENGINE_PREFIXES = (
 # the last 30 commits on main failed the check, unnoticed because those runs were
 # cancelled). User-directed, issue #406; `ACTIVE` on its committed spec. No rule
 # in that checker is relaxed and no product source changes.
+# 151 since 2026-08-11: +`ENG-FORGE-COAUTHOR` (the forbidden-AI-trailer rule was
+# catching GitHub's auto-generated `Co-authored-by`, which attributes the ACCOUNT
+# that opened the PR rather than claiming a model wrote the code; most PRs here
+# are bot-opened, so nearly every squash red main). Developer-approved,
+# issue #418; `ACTIVE` on its committed spec. Sign-off keeps its rule with no
+# exemption and no product source changes.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 150
+ENGINE_ROWS = 151
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

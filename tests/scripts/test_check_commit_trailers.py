@@ -352,5 +352,66 @@ class MergeArtifacts(unittest.TestCase):
         self.assertTrue(errors, "prose after the trailer block must still fail")
 
 
+class ForgeAttribution(unittest.TestCase):
+    """The forge's Co-authored-by is attribution, not an authorship claim (#418).
+
+    AGENTS.md forbids AI tools from adding Co-Authored-By so a model cannot claim
+    it wrote the code. GitHub adds the line itself on squash merge, naming the
+    ACCOUNT that opened the PR -- and most PRs here are opened by localai-bot. The
+    AI-involvement claim is already made, separately and explicitly, by
+    AI-Assisted and Assisted-by. Conflating the two reds main for correct work.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.checker = load_checker()
+
+    def test_a_forge_bot_co_author_is_accepted(self) -> None:
+        """RED-BEFORE: this is f64f2b71 on main.
+
+        GitHub generated this exact line for the account that opened the PR. It
+        was invisible until #406 fixed the parse, which is why it reads as a new
+        failure and is not one.
+        """
+        message = STRICT_MESSAGE + (
+            "\nCo-authored-by: localai-org-maint-bot "
+            "<306269227+localai-org-maint-bot@users.noreply.github.com>\n"
+        )
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+    def test_a_hand_written_ai_co_author_is_still_forbidden(self) -> None:
+        """The guard that matters more than the relaxation.
+
+        The exemption is keyed on the forge's own noreply domain, not on the
+        name. A model crediting itself with an ordinary address still fails, so
+        the rule still does the job it exists for.
+        """
+        message = STRICT_MESSAGE + "\nCo-authored-by: Claude <claude@anthropic.com>\n"
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(errors, "a hand-written AI co-author must still fail")
+
+    def test_signed_off_by_gets_no_exemption(self) -> None:
+        """Sign-off is a legal assertion, not attribution.
+
+        A forge address must NOT buy an AI a Signed-off-by, so this stays red
+        even with the same noreply domain that exempts a co-author.
+        """
+        message = STRICT_MESSAGE + (
+            "\nSigned-off-by: localai-bot "
+            "<1+localai-bot@users.noreply.github.com>\n"
+        )
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(errors, "Signed-off-by must never be exempted")
+
+    def test_a_human_co_author_is_unaffected(self) -> None:
+        """The case #406 already fixed must keep passing."""
+        message = STRICT_MESSAGE + "\nCo-authored-by: Ettore Di Giacinto <mudler@localai.io>\n"
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
