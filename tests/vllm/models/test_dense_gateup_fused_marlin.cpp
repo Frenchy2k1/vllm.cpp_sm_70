@@ -37,6 +37,8 @@
 #include <memory>
 #include <vector>
 
+#include <type_traits>
+
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -45,6 +47,7 @@
 namespace {
 
 using vllm::DenseMlpWeights;
+using vllm::MoeBlockWeights;
 using vllm::Nvfp4Weight;
 using vt::DType;
 
@@ -69,6 +72,38 @@ Nvfp4Weight MakeW4A16(int64_t N, int64_t K, float scale2) {
   w.scale.shape[1] = K / 16;
   w.scale.bytes.resize(static_cast<size_t>(N) * static_cast<size_t>(K / 16), 0);
   return w;
+}
+
+// The MXFP4 analog: compressed-tensors `mxfp4-pack-quantized` — group 32, E8M0
+// block scales [N, K/32], NO per-tensor global (scale2 stays 0). This is what a
+// dense MLP would carry if `LoadDenseMlp` ever grew the MXFP4 spelling the
+// classic-dense loader already has (qwen3_weights.cpp:122, LoadCtMxfp4W4A16).
+Nvfp4Weight MakeMxfp4(int64_t N, int64_t K) {
+  Nvfp4Weight w;
+  w.n = N;
+  w.k = K;
+  w.is_mxfp4 = true;
+  w.group_size = 32;
+  w.packed.dtype = DType::kI8;
+  w.packed.rank = 2;
+  w.packed.shape[0] = N;
+  w.packed.shape[1] = K / 2;
+  w.packed.bytes.resize(static_cast<size_t>(N) * static_cast<size_t>(K / 2), 0);
+  w.scale.dtype = DType::kI8;
+  w.scale.rank = 2;
+  w.scale.shape[0] = N;
+  w.scale.shape[1] = K / 32;
+  w.scale.bytes.resize(static_cast<size_t>(N) * static_cast<size_t>(K / 32), 0);
+  return w;
+}
+
+// Read a lever DIRECTLY from the process environment, deliberately NOT through
+// the header's own parser: these cases exist to catch a reader that was
+// hardwired, misspelled, or dropped, and re-using the thing under test to
+// compute the expectation would make every such mutation self-consistent.
+bool LeverOn(const char* name) {
+  const char* e = std::getenv(name);
+  return !(e != nullptr && e[0] == '0');
 }
 
 // Qwen3.6-27B dense MLP: hidden 5120, intermediate 25600.
@@ -131,6 +166,24 @@ TEST_CASE("dense gate_up fusion: the pair precondition is asserted, not assumed"
     group_only.group_size = 32;
     CHECK_FALSE(dn::GateUpPairFusableShape(gate, group_only));
   }
+
+  SUBCASE("a half flagged MXFP4 at a MATCHING group size is still NOT fusable") {
+    // The subcase above moves `is_mxfp4` AND `group_size` together, so the
+    // group_size term alone accounted for both CHECKs and `gw.is_mxfp4 ==
+    // uw.is_mxfp4` could be deleted with everything still green (fresh-review
+    // mutation M5c). Hold the group fixed and move ONLY the encoding flag: the
+    // two shards then disagree about whether a scale byte is fp8-e4m3 with a
+    // per-tensor global or a bare E8M0 exponent, which row-stacking cannot
+    // reconcile at any group size.
+    Nvfp4Weight encoding_only = MakeW4A16(kN, kK, 0.5F);
+    encoding_only.is_mxfp4 = true;  // group_size deliberately left at 16
+    REQUIRE(encoding_only.group_size == gate.group_size);
+    REQUIRE(encoding_only.scale2 == gate.scale2);
+    REQUIRE(encoding_only.n == gate.n);
+    REQUIRE(encoding_only.k == gate.k);
+    CHECK_FALSE(dn::GateUpPairFusableShape(gate, encoding_only));
+    CHECK_FALSE(dn::GateUpPairFusableShape(encoding_only, gate));
+  }
 }
 
 TEST_CASE("dense gate_up fusion: VT_DENSE_MARLIN_GATEUP defaults ON, opt out with =0") {
@@ -167,6 +220,102 @@ TEST_CASE("dense gate_up fusion: VT_DENSE_MARLIN_GATEUP defaults ON, opt out wit
         dn::DenseMarlinGateUpEnabledFor(std::getenv("VT_DENSE_MARLIN_GATEUP")));
 }
 
+TEST_CASE("dense gate_up fusion: EVERY lever term in the composed guard is load-bearing") {
+  // Fresh-review findings F1/F2. The composed guard ANDs three cached env
+  // levers, the shape/format terms, and an op-registry probe. On a host build
+  // the probe is hard-false, so the whole predicate answered false whatever the
+  // levers said and deleting `DenseMarlinGateUpEnabled()`, `MarlinW4A16Enabled()`
+  // or `FusedGateUpEnabled()` — or hardwiring / misspelling the cached reader —
+  // all stayed green. The consequence is not cosmetic: VT_DENSE_MARLIN_GATEUP=0
+  // silently becomes a no-op on a DEFAULT-ON lever, and the next same-binary A/B
+  // compares fused against fused and reports a confident zero, which is exactly
+  // the failure mode the row's own Outcome warns about.
+  //
+  // Two things make each term testable. `DenseMlpGateUpFusedMarlinEligibleWhen`
+  // INJECTS the device answer, so the lever terms are reachable on CPU; and the
+  // cached readers can only ever observe ONE value per process, so this case is
+  // registered in ctest FOUR times (tests/CMakeLists.txt) — once with the
+  // environment untouched and once with each lever forced to 0.
+  const Nvfp4Weight gate = MakeW4A16(kN, kK, 0.5F);
+  const Nvfp4Weight up = MakeW4A16(kN, kK, 0.5F);
+  REQUIRE(dn::GateUpPairFusableShape(gate, up));
+
+  const bool gateup_lever = LeverOn("VT_DENSE_MARLIN_GATEUP");
+  const bool marlin_lever = LeverOn("VT_NVFP4_MARLIN");
+  const bool fused_lever = LeverOn("VT_MOE_FUSED_W13");
+  CAPTURE(gateup_lever);
+  CAPTURE(marlin_lever);
+  CAPTURE(fused_lever);
+
+  // With the Marlin NVFP4 op available and a perfectly-shaped pair, the answer
+  // is EXACTLY the conjunction of the three levers as the ENVIRONMENT spells
+  // them. Any dropped term reads ON where the environment says OFF.
+  CHECK(dn::DenseMlpGateUpFusedMarlinEligibleWhen(gate, up, true) ==
+        (gateup_lever && marlin_lever && fused_lever));
+
+  // ...and the op term is not decorative either: no realized kernel, no fusion,
+  // whatever the levers say.
+  CHECK_FALSE(dn::DenseMlpGateUpFusedMarlinEligibleWhen(gate, up, false));
+
+  // The device overload adds nothing beyond the registry probe, so on a host
+  // device it must agree with the injected-false answer.
+  CHECK(dn::DenseMlpGateUpFusedMarlinEligible(gate, up, vt::DeviceType::kCPU) ==
+        dn::DenseMlpGateUpFusedMarlinEligibleWhen(
+            gate, up,
+            vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin,
+                             vt::DeviceType::kCPU)));
+
+  // Each cached reader must be the pure parser applied to ITS OWN env name.
+  CHECK(dn::DenseMarlinGateUpEnabled() == gateup_lever);
+  CHECK(dn::MarlinW4A16Enabled() == marlin_lever);
+  CHECK(dn::FusedGateUpEnabled() == fused_lever);
+}
+
+TEST_CASE("dense gate_up fusion: an MXFP4 pair is REFUSED by the DENSE guard") {
+  // Fresh-review finding F3, latent. The shared shape term admits an MXFP4 pair
+  // — correctly, because THIS header's own fused entry point (GateUpFusedMarlinD)
+  // handles E8M0/group-32: it permutes the merged scales with
+  // MarlinProcessExpertScalesMxfp4, skips the combined factor and the global, and
+  // passes group_size/mxfp4 through to the GEMM args.
+  //
+  // The DENSE MLP call site does not reach that one. It reaches qwen3_5.cpp's
+  // private NVFP4-ONLY copy (DenseGateUpFusedMarlinD:2683 ->
+  // SharedGateUpFusedMarlinD:2606 -> BuildMarlinDensePairResident:2549), which
+  // sizes the merged scale buffer at K/16 rows (:2556,:2558), runs the NVFP4
+  // combined-scale-factor + global-scale processing, and hardcodes
+  // `group_size = 16` / `mxfp4 = false` (:2632-2633). Handing it group-32 E8M0
+  // scales is verbatim the defect this project already recorded RED-first for the
+  // OTHER implementation at
+  // tests/vllm/model_executor/layers/test_linear_method.cpp:185-201 — group-32
+  // E8M0 misread as group-16 fp8-e4m3, "GROSSLY wrong".
+  //
+  // No dense loader sets `is_mxfp4` today (LoadNvfp4AnyNaming,
+  // qwen3_5_dense_weights.cpp:358-395, only ever produces NVFP4), so this is one
+  // loader line away rather than live. The guard refuses it so that line cannot
+  // silently light up a mis-scaled kernel; the split pair, which routes MXFP4
+  // correctly through MatmulMxfp4W4A16D, stays the answer.
+  const Nvfp4Weight mx_gate = MakeMxfp4(kN, kK);
+  const Nvfp4Weight mx_up = MakeMxfp4(kN, kK);
+
+  // It passes the SHARED shape term (both halves agree on format and group),
+  // which is what the header's own MXFP4-capable `GateUpFusedEligible` composes
+  // — that predicate itself is CUDA-only (#ifdef VT_MARLIN_NVFP4) and so cannot
+  // be named from a host build, but its shape half is exactly this.
+  REQUIRE(dn::GateUpPairFusableShape(mx_gate, mx_up));
+
+  // The DENSE guard refuses it anyway, even with the kernel available and every
+  // lever ON. Deleting the `!is_mxfp4` terms turns this CHECK red.
+  CHECK_FALSE(dn::DenseMlpGateUpFusedMarlinEligibleWhen(mx_gate, mx_up, true));
+  CHECK_FALSE(dn::DenseMlpGateUpFusedMarlinEligible(mx_gate, mx_up,
+                                                    vt::DeviceType::kCUDA));
+
+  // A single MXFP4 half is refused too — that pair also fails the shape term, so
+  // this pins the ORDER-independence of the refusal, not a second reason.
+  const Nvfp4Weight nv = MakeW4A16(kN, kK, 0.5F);
+  CHECK_FALSE(dn::DenseMlpGateUpFusedMarlinEligibleWhen(mx_gate, nv, true));
+  CHECK_FALSE(dn::DenseMlpGateUpFusedMarlinEligibleWhen(nv, mx_up, true));
+}
+
 TEST_CASE("dense gate_up fusion: a backend with no Marlin NVFP4 op never selects it") {
   // The composed guard has no build-time gate of its own: `vt::OpRegistered` is
   // what makes a CPU/Vulkan/Metal device — and a build without VT_MARLIN_NVFP4 —
@@ -181,13 +330,39 @@ TEST_CASE("dense gate_up fusion: a backend with no Marlin NVFP4 op never selects
       dn::DenseMlpGateUpFusedMarlinEligible(gate, up, vt::DeviceType::kCPU));
 }
 
-TEST_CASE("dense gate_up fusion reuses the EXISTING pair resident, not a new cache") {
-  // MarlinDensePairResident is held on the GATE weight's own
-  // `resident_marlin_pair` slot (issue #237: residency is a member of the
-  // weights, never a static address-keyed map). A dense MLP's `gate_proj_fp4`
-  // carries that same slot, so the dense path keys the pair resident exactly
-  // like the shared expert does — which is why wiring it needed no second cache
-  // and no extension of the existing one.
+TEST_CASE(
+    "dense gate_up fusion: a dense gate weight carries the SAME per-weight pair"
+    " slot the shared expert keys on (the reuse itself is GPU-only)") {
+  // RENAMED after the fresh review (finding F5). The previous name claimed this
+  // case proved the dense path "reuses the EXISTING pair resident, not a new
+  // cache", and it did not: it named no resident function at all, so it would
+  // have passed byte-for-byte against a brand-new second cache or a global
+  // address-keyed map — precisely what the title excluded.
+  //
+  // WHAT CANNOT BE CHECKED HERE, stated rather than implied. The reuse property
+  // lives in `MarlinDensePairResidentFor` /`BuildMarlinDensePairResident` /
+  // `SharedGateUpFusedMarlinD`, which are TU-private to
+  // src/vllm/model_executor/models/qwen3_5.cpp AND compiled only with the
+  // vendored Marlin NVFP4 kernel. There is no host-reachable declaration to call
+  // and no CUDA in this build, so "the fused dense call lands in the shared
+  // expert's existing resident" is a GPU-box observation (the row's decode-window
+  // trace, which counted 129.000 Marlin calls/step with no extra repack).
+  //
+  // WHAT IS CHECKED HERE is the structural precondition that made reuse possible
+  // without touching the cache: issue #237 moved residency OFF a static
+  // address-keyed map and ONTO a `ResidentSlot` member of the weight, and
+  // `MarlinDensePairResidentFor` keys on the GATE weight's `resident_marlin_pair`
+  // slot. A dense MLP's `gate_proj_fp4` is the same `Nvfp4Weight` type as the
+  // shared expert's `shared_gate_proj_fp4`, hence carries that same slot, hence
+  // needs no second cache and no extension of the existing one.
+  static_assert(std::is_same_v<decltype(DenseMlpWeights::gate_proj_fp4),
+                               decltype(MoeBlockWeights::shared_gate_proj_fp4)>,
+                "the dense gate weight must be the SAME type the fused pair "
+                "resident is keyed on, or it cannot share that resident");
+  static_assert(std::is_same_v<decltype(Nvfp4Weight::resident_marlin_pair),
+                               vllm::ResidentSlot>,
+                "the pair resident must live ON the weight (issue #237)");
+
   DenseMlpWeights w;
   CHECK(w.gate_proj_fp4.resident_marlin_pair.state == nullptr);
   CHECK(w.up_proj_fp4.resident_marlin_pair.state == nullptr);
@@ -198,4 +373,12 @@ TEST_CASE("dense gate_up fusion reuses the EXISTING pair resident, not a new cac
   w.gate_proj_fp4.resident_marlin_pair.state = std::make_shared<int>(1);
   CHECK(w.gate_proj_fp4.resident_marlin.state == nullptr);
   CHECK(w.up_proj_fp4.resident_marlin_pair.state == nullptr);
+
+  // Per-INSTANCE, which is the half of #237 that a host build can still see: a
+  // second dense MLP's slots are its own, so two layers (or two engines) never
+  // inherit each other's device pointers the way the address-keyed map let them.
+  DenseMlpWeights other;
+  CHECK(other.gate_proj_fp4.resident_marlin_pair.state == nullptr);
+  MoeBlockWeights moe;
+  CHECK(moe.shared_gate_proj_fp4.resident_marlin_pair.state == nullptr);
 }
