@@ -35,6 +35,19 @@ AI_AUTHORSHIP_TOKENS = (
     "llm",
     "openai",
 )
+# GitHub writes this address for the ACCOUNT that opened a pull request when it
+# composes a squash-merge message. It is attribution of a submitter, not a claim
+# that a model authored the change -- that claim lives in AI-Assisted and
+# Assisted-by, which are checked above and unaffected here (#418).
+#
+# The exemption is keyed on the FORGE'S OWN DOMAIN rather than on the name, so it
+# cannot be borrowed: a hand-written `Co-authored-by: Claude <claude@anthropic.com>`
+# still fails, and Signed-off-by is never exempted at all, because a sign-off is a
+# legal assertion rather than attribution.
+FORGE_ACCOUNT_EMAIL = re.compile(
+    r"<[^>]*@users\.noreply\.github\.com>\s*$", re.IGNORECASE
+)
+
 AI_IDENTITY = re.compile(
     r"(?<![a-z0-9])(?:"
     + "|".join(re.escape(token) for token in AI_AUTHORSHIP_TOKENS)
@@ -185,6 +198,9 @@ def _strict_errors(message: str) -> list[str]:
         )
     for key in ("signed-off-by", "co-authored-by"):
         for original, value in trailers.get(key, []):
+            if key == "co-authored-by" and FORGE_ACCOUNT_EMAIL.search(value):
+                # Forge-generated attribution of the submitting account.
+                continue
             folded_value = value.casefold()
             if AI_IDENTITY.search(value) or any(
                 identity in folded_value for identity in assisted_identities
