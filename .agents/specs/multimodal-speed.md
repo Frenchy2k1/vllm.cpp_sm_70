@@ -1231,3 +1231,74 @@ speed-BEATS-vLLM. **Ranked residual (NOT needed for parity, NOT implemented):**
 2. **Batched/graphed mm SERVING (c2+) + `image_url`/`video_url` ingestion** — the
    structural umbrella-MM gap (lever #3), unchanged. The umbrella MM row stays `PARTIAL`
    for this; the vision-forward speed axis is done (beats vLLM). `benchmark_binding=false`.
+
+## 17. AUDIO ENCODER TTFT lever #1 — FA-2 TENSOR CORES for the hd-64 non-causal encoder attention (`CLAIM-MM-SPEED-AUDIO-ENC-FA2`, 2026-08-11, issue #432)
+
+Executes the residual lever ranked **#1** by §13.5, §14.5 and §15.5 — the one all three
+call LARGE and defer: *"Tensor-core MMA hd-64 non-causal flash — the vendored FA2
+`flash_fwd_kernel.h` compute path … the true ~vLLM gap-closer."*
+
+**Why this slice.** It is the only multimodal axis still below floor. Image/video tower
+0.57× (§16, beats), audio decode 0.97× (§12, beats), 27B mm decode at parity (§9) — and
+audio TTFT ~729 ms vs vLLM's 42.8 ms ≈ **17×** (§15.4), of which §15.5 attributes
+**~617 ms to the 32-layer encoder self-attention** still running the scalar
+warp-per-query recurrence.
+
+**Why it is smaller than "LARGE" against the current tree** (the estimate was made
+before anyone read the vendored launch template):
+- `flash_fwd_launch_template.h:181` already contains upstream's `run_mha_fwd_hdim64`,
+  and `:54` the non-split dense `run_flash_fwd`. Only the *instantiations* were limited
+  to `flash_fwd_split_hdim{128,192,256}` — the template is vendored and complete.
+- `cuda_flash_attn_fa2.cu` already carries a torch-free `Flash_fwd_params` filler, so
+  there is no ATen/torch shim work.
+- The encoder hands attention `[L, nh, hd]` fully contiguous tensors
+  (`whisper_audio.cpp:261-266`) — already exactly FA-2's dense batch layout at b=1,
+  non-causal, hd 64, q/k/v equal length. `BlockInfo` reads the geometry from
+  `seqlen_q`/`seqlen_k` when `cu_seqlens_q == nullptr`, so no varlen adapter is needed.
+
+### 17.1 Scope + upstream grounding
+
+| | |
+|---|---|
+| Scope | New op `vt::AttentionDenseFa2` (`OpId::kAttentionDenseFa2`), a new non-split hd-64 bf16 FA-2 instantiation, a dense single-request launcher, and the Whisper encoder default re-route. Additive: `kAttention` / `kAttentionDenseFast` / `kAttentionDenseFlash` are untouched, so every other caller (Qwen vision tower, Gemma-4 vision, text decode) is byte-identical **by construction**. |
+| Upstream chain | vLLM `WhisperEncoderAttention` (`vllm/model_executor/models/whisper.py:255`) → `forward:298-317` → `self.attn(q,k,v)` → `flash_attn_varlen_func`, `causal=False` @ e24d1b24. That resolves to the FlashAttention-2 forward we already vendor at `src/vt/cuda/flash_attn/` (vllm-project/flash-attention @ 2c839c33). This is a 1:1 port of the kernel the oracle executes, not a new invention. |
+| Port map | `flash_fwd_hdim64_bf16_sm80.cu` (upstream-generated form, `run_mha_fwd_<bf16,64,false>` → `run_mha_fwd_hdim64`); `LaunchDenseFA2Bf16` in `cuda_flash_attn_fa2.cu`; `AttentionDenseFa2KernelCuda` + `Fa2DenseEnabled()` + registration in `cuda_ops.cu`; enum + declaration in `include/vt/ops.h`; validation wrapper in `src/vt/ops.cpp`; CPU registration (maps to `AttentionKernel`) in `cpu_ops.cpp`; default + knobs in `whisper_audio.cpp`; the source in `CMakeLists.txt`'s `_FA2_KERNEL_SRCS`. |
+| Fast-path gate | bf16 + head_dim 64 + non-causal + MHA (`h_k == h`) + FA-2 compiled + `VT_FA2_DENSE != 0`. Anything else falls through to `AttentionDenseFlash`, so the op is total and safe to call generically. |
+
+### 17.2 The correctness question, stated before measuring
+
+Unlike §14 and §15 this is **NOT bit-identical**: `mma.sync` reassociates the QK^T and
+PV reductions, so the encoder's bf16 output can differ in the last places and tokens can
+flip. That is the same situation §12 faced when adopting the FA-2 *decode* kernel, and
+it is resolved the same ratified way: for this fixture the binding gate is the near-tie
+**DISTRIBUTIONAL** form — the teacher-forced comparison against the oracle, which is
+kernel-independent — with the STRICT prefix reported alongside as a diagnostic, not as
+the bar. Image and video keep their STRICT 32/32 gates: they are head_dim 72, which has
+no FA-2 instantiation, and their op call does not change.
+
+### 17.3 Gates (what must hold before this ships)
+
+1. `test_voxtral_e2e` PASS on dgx GB10 sm_121a, clean CUTLASS+FA2+Triton build, with
+   teacher-force `result=PASS` / `divergent=0` — the binding kernel-independent check.
+2. Proof-of-run: nsys shows the FA-2 kernel with 32 instances (= 32 encoder layers) and
+   ZERO `AttentionDenseFlashKernel` / `AttentionWarpKernel` on the encoder path.
+3. RED: corrupt the kernel → gate fails; restore → passes.
+4. Image + video STRICT 32/32 and `test_ops_attention` unchanged; goldens md5 compared
+   before/after and any change explained, not absorbed.
+5. `compute-sanitizer --tool memcheck` = 0 errors.
+6. Same-binary A/B via `VT_FA2_DENSE=0` / `VT_WHISPER_ENC_FLASH=1`, `flock`ed, idle box,
+   rep0 dropped.
+
+### 17.4 Stop conditions
+
+Return rather than improvise if: the oracle identity cannot be asserted (issue #375 —
+the `vllm-oracle` symlink has pointed at the 0.25.0 rollback rather than the recorded
+pin); the gate can only be made green by regenerating a golden whose regeneration cannot
+be teacher-force-validated; or closing the axis would require trading a correctness
+gate.
+
+**Ceiling honesty, stated up front.** Even a perfect attention kernel leaves the ~112 ms
+of conv GEMMs and the `whisper_audio.cpp:205-216` device→host→device im2col bounce
+against vLLM's 42.8 ms, so this lever alone is NOT expected to reach parity. The next
+traceable hypothesis after it is the device im2col kernel for the full cross-channel
+Whisper conv, which §15.1 measured, attributed and deferred as a new-kernel task.
