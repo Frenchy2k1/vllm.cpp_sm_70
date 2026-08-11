@@ -25,8 +25,8 @@ are our reading of their documented behavior, not measurements.
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 35 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; immutable handoff uses a checkout-disjoint asset root; first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Architectures | 37 registered, 27 gated | 130+ | 100+ | 100+ |
+| Downloadable server binaries | ✅ v0.0.2 publishes eight indexed CPU/CUDA/Vulkan/Metal/MLX archives with checksums, provenance records, manifests, and SBOMs | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 
@@ -82,7 +82,7 @@ are our reading of their documented behavior, not measurements.
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
-cannot drift. Today that is **35 registered architectures**. Each row names the
+cannot drift. Today that is **37 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
 [STATUS.md](STATUS.md), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
@@ -164,7 +164,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 
 27 of the 31 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 35 registered total also covers 3 Parakeet ASR entry points and the
+(The 37 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live
@@ -223,13 +223,17 @@ HTTP are not started.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified; gfx1200 M0-M4 MET on one model, #269) | ✅ | ✅ | ✅ |
+| ROCm | W0-W1 verified on 5 gfx archs; classic-dense AND GDN-hybrid e2e run all-native (strict CPU parity not met: near-tie regime, #269; GDN divergence characterization open) | Backend + platform + #140 ops + full GDN op set; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix verified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens, full 16x16 rerun pending ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`) | ✅ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
-Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core
-kernels for it.
+Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,
+so it stays a correctness venue for those; the one fast path it does get is the
+vendored **Marlin NVFP4 W4A16** GEMM, enabled since 2026-08-11 and validated on
+Thor silicon (8.0x-29.0x per GEMM at M=1, e2e 16.61 to 81.63 tok/s at c=1 on
+Qwen3-1.7B-NVFP4A16). That is a kernel-level result, not a token-exact
+model-level gate.
 
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact,
 6/6 prompts vs the vLLM 0.25.0 oracle, every op of that model dispatched
@@ -307,7 +311,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
-| ROCm | W0 verified by community; model e2e MET on gfx1200 (one model), still pending elsewhere | Backend + platform + 1 op, ctest-green on 4 archs ([#41](https://github.com/mudler/vllm.cpp/issues/41)); gfx1200 MET M0-M4, one model ([#269](https://github.com/mudler/vllm.cpp/issues/269)). [ROCM.md](ROCM.md) |
+| ROCm | W0-W1 community-verified on 5 gfx archs; classic-dense e2e runs all-native (near-tie regime, #269); GDN-hybrid blocked on remaining GDN kernels | Backend + platform + #140 ops + GDN state/conv/postconv/recurrence, ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix verified. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
