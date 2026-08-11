@@ -19072,3 +19072,24 @@ They establish **nothing about vLLM**, which is the only bar that counts and
 remains unavailable; nothing about GPU behaviour, which was not built; nothing
 about multimodal; and nothing about token-exactness, which spec §13.4 leaves
 open. **No ceiling is claimed or implied anywhere in this entry.**
+
+## BENCHMARKS.md compaction — the superseded 2026-08-08 `BENCH-VK-LLAMA`
+scoreboard row (moved 2026-08-11)
+
+`docs/BENCHMARKS.md` is a KEYED table: one row per subject, updated in place.
+The key `Vulkan vs llama.cpp Vulkan (BENCH-VK-LLAMA)` carried TWO rows. The
+0.6B one below was written by `468a3876` (2026-08-08); `93852c28` (2026-08-09)
+then added a SECOND row for the same key with the 27B result instead of
+updating this one in place, which is what made it superseded. The 27B row
+stays on the scoreboard, so the key keeps its handle there and nothing is
+lost — only the stale generation moves here. Moved VERBATIM, byte-for-byte,
+to pay for the rows PR #282 and PR #267 owe that page; no cap was raised and
+no evidence was deleted.
+
+Superseded by, and still on the page:
+
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
+
+The moved row:
+
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **Both arms measured, same weights.** 0.6B @128-in/32-out: llama.cpp Vulkan **11,956** pp / **174.8** tg; ours **575** pp / **66.6** tg | Decode **8.59 -> 91.7 t/s** (**10.7x**), 6/6 exact; **2.62x** off llama.cpp at matched shape. CUDA arm unblocked. 27B: fallbacks **11->5**. paged_attn batching REFUTED ([plan](../.agents/specs/bench-27b-five-way.md)) |

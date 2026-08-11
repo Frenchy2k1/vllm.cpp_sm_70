@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared device glue (Dev/DBuf/...)
 #include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
@@ -55,11 +56,14 @@ DBuf Glm4MlpBlock(Dev d, const Glm4MlpWeights& w, const HfConfig& cfg,
                   const Tensor& dh2, int64_t T) {
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H]
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), dh2, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::SiluAndMul(d.q, act.t(), gate_up.t());  // [T,2I] -> [T,I]
+  // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
+  // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
+  // inline path ran — the seam's Apply IS {ResidentWeight; MatmulBT[2I,H];
+  // SiluAndMul} with M = x.shape[0] == T. Mirrors upstream's single
+  // MergedColumnParallelLinear + SiluAndMul (glm4.py:46 aliases llama.py:79
+  // LlamaMLP verbatim), and picks up the nvfp4 GateUpFusedMarlinD arm for free
+  // once a quantized checkpoint ships. (FUSION-DENSE-MIGRATE.)
+  DBuf act = layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, I).Apply(d, dh2);
   Tensor wd = ResidentWeight(d, w.down_proj);  // [H, I]
   DBuf out(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, out.t(), act.t(), wd);

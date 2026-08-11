@@ -71,6 +71,62 @@ void AddLoraLinear(float* y, const float* x, int64_t T, int64_t in_dim,
                    const float* b_stacked, int64_t num_slots, int64_t rank,
                    const int32_t* indices, double scaling);
 
+// ---------------------------------------------------------------------------
+// Multi-slice apply (a PACKED base layer — qkv_proj, gate_up_proj — carries one
+// low-rank pair per output window, so the punica sandwich runs once per slice).
+
+// add_shrink (punica_cpu.py:166-195):
+//   for i in range(n_slices): buffers[i] = scale * (x @ lora_a_stacked[i]^T)
+// `buffers` is [n_slices, T, rank] contiguous and must be pre-zeroed (skip
+// semantics for indices < 0). `a_stacked[i]` is [num_slots, rank_a, in_dim];
+// `rank_a` is `rank` except on the fully-sharded (S-LoRA) path, where it is
+// rank/tp_size — hence the explicit parameter.
+void AddShrink(float* buffers, const float* x, int64_t T, int64_t in_dim,
+               const std::vector<const float*>& a_stacked, int64_t num_slots,
+               int64_t rank_a, int64_t buffer_rank, const int32_t* indices,
+               double scale);
+
+// add_expand (punica_cpu.py:197-236):
+//   offset = offset_start
+//   for i in range(n_slices):
+//       y[:, offset : offset+output_slices[i]] (+)= buffers[i] @ lora_b_stacked[i]^T
+//       offset += output_slices[i]
+// `b_stacked[i]` is [num_slots, output_slices[i], rank].
+void AddExpand(float* y, int64_t y_width, const float* buffers, int64_t T,
+               int64_t rank, const std::vector<const float*>& b_stacked,
+               const std::vector<int64_t>& output_slices, int64_t num_slots,
+               const int32_t* indices, int64_t offset_start, bool add_inputs);
+
+// add_lora_linear (punica_cpu.py:265-312), multi-slice form: allocate the
+// n_slices zeroed [T, rank] float buffers, AddShrink into them, then AddExpand
+// onto `y` with add_inputs=True. `y` is [T, sum(output_slices)] and already
+// holds the base linear output.
+void AddLoraLinear(float* y, const float* x, int64_t T, int64_t in_dim,
+                   const std::vector<const float*>& a_stacked,
+                   const std::vector<const float*>& b_stacked,
+                   const std::vector<int64_t>& output_slices, int64_t num_slots,
+                   int64_t rank_a, int64_t rank, const int32_t* indices,
+                   double scale);
+
+// add_lora_embedding (punica_cpu.py:238-263): the embedding LoRA needs only the
+// EXPAND half — its shrink is an embedding-table lookup, not a GEMM.
+//   y += x @ lora_b_stacked^T           (x is the gathered [T, rank] lora_a rows)
+void AddLoraEmbedding(float* y, const float* x, int64_t T, int64_t rank,
+                      const float* b_stacked, int64_t num_slots,
+                      int64_t embed_dim, const int32_t* indices,
+                      bool add_inputs);
+
+// add_lora_logits (punica_cpu.py:314-351): the same shrink/expand sandwich as a
+// single-slice linear, but indexed by the SAMPLER indices (one per request)
+// rather than the per-token indices. The wrapper always uses bgmv
+// (punica_cpu.py:348). Producing `sampler_indices` from a LoRAMapping is
+// convert_mapping's job (W3 in .agents/specs/lora-adapter.md); here the caller
+// passes the array.
+void AddLoraLogits(float* y, int64_t y_width, const float* x, int64_t T,
+                   int64_t hidden, int64_t vocab, const float* a_stacked,
+                   const float* b_stacked, int64_t num_slots, int64_t rank,
+                   const int32_t* sampler_indices, double scale);
+
 // LoRALinear — the ReplicatedLinear (n_slices == 1) LoRA-wrapped layer
 // (base_linear.py:70). Owns `num_slots` stacked adapter slots and applies the
 // batched delta onto a base linear output. Mirrors create_lora_weights /

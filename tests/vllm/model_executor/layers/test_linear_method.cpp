@@ -339,6 +339,55 @@ TEST_CASE("linear_method: fused gate-up seam == standalone MatmulBT+SiluAndMul (
     CHECK(got[i] == ref[i]);  // BYTE-IDENTICAL — the fold changes nothing numerically
 }
 
+// FUSION-DENSE-MIGRATE fold REUSE PROOF (issue #299, specs/fusion-dense-migrate.md):
+// the five dense SwiGLU archs folded 2026-08-10 (Command-R / GLM-4 / MiniCPM /
+// MiniCPM3 / Phi-3) construct layers::UnquantizedMlpGateUpMethod DIRECTLY --
+// `layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, I).Apply(d, x)` -- rather than
+// through MakeMlpGateUpMethod, because none of their loaders ever populates *_fp4.
+// The case above proves the FACTORY arm at one prefill-shaped M; this one proves the
+// DIRECTLY-CONSTRUCTED arm at BOTH the decode shape (M == 1, the batch-1 GEMV regime
+// every one of these archs actually decodes in) and a prefill shape (M > 1), against
+// the exact {ResidentWeight; MatmulBT[2I,H]; SiluAndMul} sequence each of the five
+// hand-rolled before the fold. Raw bf16 byte compare, not Approx: the fold is a
+// ROUTING change and any numerical difference at all is a defect, not a tolerance.
+TEST_CASE("linear_method: direct UnquantizedMlpGateUpMethod == standalone (byte-exact, decode+prefill)") {
+  const int64_t H = 8, I = 5;
+  OwnedTensor gate_up = MakeBf16({2 * I, H}, 11);  // merged [2I, H] raw-NK
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{b, q};
+
+  for (int64_t M : {int64_t{1}, int64_t{4}}) {  // decode, then prefill
+    CAPTURE(M);
+    OwnedTensor xw = MakeBf16({M, H}, 17);
+    vllm::dense_attn::DBuf x(d, DType::kBF16, {M, H}, xw.bytes.data());
+
+    // (A) The folded call, verbatim as the five model TUs now spell it.
+    vllm::dense_attn::DBuf act_fused =
+        layers::UnquantizedMlpGateUpMethod(&gate_up, I).Apply(d, x.t());
+
+    // (B) The pre-fold hand-rolled sequence, verbatim.
+    vt::Tensor wgu = vllm::dense_attn::ResidentWeight(d, gate_up);  // [2I, H]
+    vllm::dense_attn::DBuf gu(d, DType::kBF16, {M, 2 * I});
+    vt::MatmulBT(d.q, gu.t(), x.t(), wgu);
+    vllm::dense_attn::DBuf act_ref(d, DType::kBF16, {M, I});
+    vt::SiluAndMul(d.q, act_ref.t(), gu.t());
+
+    // The seam derives its row count from the activation, which is what makes the
+    // fold safe: every call site passed a DBuf{T,H}, so x.shape[0] == T identically.
+    REQUIRE(act_fused.t().shape[0] == M);
+    REQUIRE(act_fused.t().shape[1] == I);
+
+    std::vector<uint16_t> got(static_cast<size_t>(M) * I);
+    std::vector<uint16_t> ref(static_cast<size_t>(M) * I);
+    act_fused.Download(d, got.data());
+    act_ref.Download(d, ref.data());
+    for (size_t i = 0; i < got.size(); ++i)
+      CHECK(got[i] == ref[i]);  // BYTE-IDENTICAL — routing changed, numerics did not
+  }
+}
+
 // Tier-C1 fold REUSE PROOF (arch-fusion-fold-plan-2026-07-30 §C1): the SHARED bf16
 // GeGLU gate-up MLP seam (UnquantizedMlpGateUpGeluMethod::Apply) must produce a
 // BYTE-IDENTICAL result to the standalone {ResidentWeight; MatmulBT[2I,H]; GeluAndMul}

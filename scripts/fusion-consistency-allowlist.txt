@@ -20,5 +20,7 @@
 # vt::FusedChain(kFusedAddRmsNorm) behind FusedChainAdoptEnabled(); the sandwich
 # post-norms (no residual add) correctly stay standalone. Removed from the allowlist
 # = the enforcement gate closing for the Gemma family.
-glm4       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending FUSION-DENSE-MIGRATE
-phi3       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending FUSION-DENSE-MIGRATE
+glm4       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending #314 (the GLUE half). FUSION-DENSE-MIGRATE/#299 closed the MERGED-GEMM
+           # half for this model and does NOT cover this check — see scripts/merged-gemm-consistency-allowlist.txt.
+phi3       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending #314 (the GLUE half). FUSION-DENSE-MIGRATE/#299 closed the MERGED-GEMM
+           # half for this model and does NOT cover this check — see scripts/merged-gemm-consistency-allowlist.txt.
