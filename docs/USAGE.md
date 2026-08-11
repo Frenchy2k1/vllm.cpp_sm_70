@@ -229,6 +229,50 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
+### Architectures that resolve but refuse to run
+
+A few architectures are registered so their config and weight layout are
+accounted for, while their forward is deliberately not implemented. Pointing the
+CLI or server at one of these loads far enough to resolve the architecture and
+then fails with a message naming the missing piece, rather than emitting wrong
+tokens quietly.
+
+| Architecture | Why it refuses |
+|---|---|
+| `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
+
+This is a deliberate state, not a bug: registering the architecture is what lets
+the config parse and weight-name mapping be tested before the forward exists.
+
+### Muse Glimmer: exactly what has been checked
+
+`MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that
+table: both towers forward and the perception encoder is wired, so an image or
+video prompt runs instead of refusing. What has been *measured* is much narrower
+than "it works", so it is worth stating precisely.
+
+- The text tower ran on real tensors from the released 30B checkpoint at
+  **reduced depth — 4 of its 52 layers.** Its **5 prefill argmax positions** are
+  identical to a standalone torch transcription of the upstream source and to
+  HF's own `muse_glimmer` implementation. The full-depth 52-layer arm of our
+  forward has **never run**.
+- Those are argmax positions from a single prefill, not generated tokens.
+  **Multi-step decode is untested**, and so is the sliding window across steps.
+- Even at reduced depth this is agreement with independent transcriptions of the
+  same upstream source, not agreement with the model's own runtime: the pinned
+  oracle cannot load `muse_glimmer` at all.
+- The perception encoder has **no reference check of any kind** — the wiring gate
+  proves the tower is reachable and that its output lands on the image/video
+  placeholder rows, not that an image produces the right tokens.
+- Nothing has run end to end through the server, and **no speed number exists for
+  this model on any axis**; there is no denominator to state one against.
+- The ATEM reasoning and tool parsers are ported and unit-gated, but at the
+  server's default `skip_special_tokens: true` the framing tokens they key on
+  (`<|start|>`, `<|message|>`, `<|eom|>`, `<|eot|>`) are stripped before the
+  parser sees the text. Channel scoping is therefore an **open gap at server
+  defaults** — see [FEATURES.md](FEATURES.md) and
+  [the spec](../.agents/specs/muse-glimmer.md) §6.7.
+
 ## OpenAI-compatible server
 
 `vllm-server` is a small HTTP server speaking the OpenAI API. Source:
@@ -526,8 +570,8 @@ a stop token early.
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (40 names over 36 families). `auto` detects from the chat template, `none` disables |
-| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`). `auto` detects, `none` disables |
+| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables |
+| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -543,6 +587,37 @@ a stop token early.
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.
+
+## Muse Glimmer 30B from a GGUF k-quant
+
+The text tower loads from a `muse-glimmer`-architecture GGUF, so the 30B model
+runs from a ~17 GB k-quant instead of a ~60 GB bf16 checkpoint. Point `--model`
+straight at the file; the config comes from the GGUF's own metadata, so no
+`config.json` is needed:
+
+```sh
+./build/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
+```
+
+Both published k-quants load (`muse-glimmer-30B-kquant-17gb.gguf` and the mixed
+per-tensor `muse-glimmer-30B-kquant-dynamic.gguf`). Standard GGUF residency
+knobs apply (`VT_GGUF_KEEP_QUANT`, `VT_GGUF_MMAP`, `VT_CPU_REF`); `o_proj`, the
+attention output gate, `down_proj` and the merged `gate_up` stay quantized, while
+the merged QKV, `lm_head` and the embedding table expand to bf16 because the
+shared forward consumes them in a form a block encoding cannot take.
+
+Two caveats, both properties of the published files rather than of this loader:
+
+- **Image and video need the bf16 safetensors.** The released
+  `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
+  axis, so half the weight is not in the file; loading it is refused by name.
+- **No speed number exists for this model in any weight format.** The pinned
+  vLLM oracle cannot load `muse_glimmer` at all, so there is no denominator to
+  quote and none is claimed.
+
+Set `VLLM_MUSE_GGUF=<file>` (or `VLLM_MUSE_GGUF_LOAD=<file>` for the full
+materialization) to run `test_muse_glimmer_gguf` against a real checkpoint;
+without them the gate runs off committed header-only manifests.
 
 ## MiniMax-H3: video + audio generation
 

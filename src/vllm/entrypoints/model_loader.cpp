@@ -24,6 +24,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
+#include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
@@ -583,6 +584,10 @@ HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
       std::get<std::string>(arch->v) == "deepseek4") {
     return vllm::DeepseekV4HfConfigFromGguf(gguf);
   }
+  // The Muse Glimmer k-quant arm; its config builder recovers the query
+  // pre-scale from the folded attn_q_norm and the iRoPE mask from
+  // sliding_window_pattern (muse_glimmer_gguf_weights.h).
+  if (vllm::IsMuseGlimmerGguf(gguf)) return vllm::MuseGlimmerHfConfigFromGguf(gguf);
   return vllm::HfConfigFromGguf(gguf);
 }
 

@@ -36,6 +36,9 @@ issue is not yet placed. Keyed record: update in place, never append.
 
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
+| [#268](https://github.com/mudler/vllm.cpp/issues/268) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer (Meta, 30B agentic multimodal): text tower, perception encoder, DFlash drafter | feature |
+| [#329](https://github.com/mudler/vllm.cpp/issues/329) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quants: text arm lands; mmproj blocked by a converter axis drop | feature |
+| [#333](https://github.com/mudler/vllm.cpp/issues/333) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer speed: no number on any axis; benchmark vs llama.cpp, HF, and ourselves | perf |
 | [#223](https://github.com/mudler/vllm.cpp/issues/223) | `SAMPLE-PROMPT-LOGPROBS` | `prompt_logprobs` is a silent no-op: the runner never computes logits at prompt positions | bug |
 | [#352](https://github.com/mudler/vllm.cpp/issues/352) | `KV-EVENTS` | The batch envelope is never published and `kv_cache_report_mode` does not exist — events can only be observed by reaching into the `BlockPool` | feature |
 | [#353](https://github.com/mudler/vllm.cpp/issues/353) | `KV-EVENTS` | `KVEventsConfig` has no `__post_init__`: an enabled config with an unset publisher reports `unknown event publisher ''` instead of resolving to zmq | bug |

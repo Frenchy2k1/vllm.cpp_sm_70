@@ -241,6 +241,36 @@ class AgentRecordMutationTests(unittest.TestCase):
 
         require(errors, r"\d+ engine rows; expected \d+")
 
+    def test_model_row_ratchet_is_load_bearing(self) -> None:
+        """The MODEL row pin must catch a row appearing or vanishing.
+
+        Mirrors the ENGINE ratchet above, for the same reason and with more
+        force: the MODEL count is the one that actually moves, because every new
+        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362. Without
+        this, bumping the number to silence a failure is indistinguishable from
+        bumping it because a row really landed.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([error for error in clean if "MODEL rows" in error], [])
+
+        path, expected = agent_record.MATRICES["MODEL"]
+        errors: list[str] = []
+        with mock.patch.dict(
+            agent_record.MATRICES, {"MODEL": (path, expected - 1)}
+        ):
+            agent_record.check_matrices(errors)
+        require(errors, r"\d+ MODEL rows; expected \d+")
+
+        # Both directions: a pin ABOVE the tree must fail too, so a count can
+        # never be inflated ahead of the rows that justify it.
+        errors = []
+        with mock.patch.dict(
+            agent_record.MATRICES, {"MODEL": (path, expected + 1)}
+        ):
+            agent_record.check_matrices(errors)
+        require(errors, r"\d+ MODEL rows; expected \d+")
+
     def test_engine_summary_rejects_stale_area_rollup(self) -> None:
         source = agent_record.ENGINE_MATRIX.read_text(encoding="utf-8")
         current = next(
