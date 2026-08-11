@@ -20,7 +20,25 @@ environment:
 2. Copy `developer-preferences.example.md` to the untracked
    `developer-preferences.md` for the policy choices (Git integration, which
    remote hosts you may use, contention policy).
-3. Add a profile entry to this file, in the same shape as the entries below:
+3. Set `CHECKPOINT_ROOT` in your `.env` if you have shared or network storage,
+   and download model weights there rather than onto a box's system disk. A
+   30B bf16 checkpoint is ~60 GB; a build tree is ~169 GiB on its own, and a
+   full disk surfaces as unrelated test failures rather than an obvious disk
+   error. Fetching once to shared storage means every host, worktree and agent
+   reuses it instead of each pulling its own copy. It states an INTENT and
+   nothing more: no code in the tree reads `CHECKPOINT_ROOT`, so it neither
+   redirects a download nor resolves a bare directory name — you place the
+   weights under it and pass the full path onward. A setup with no shared mount
+   leaves it empty and uses whatever the tool defaults to (usually the Hugging
+   Face cache under `$HOME`).
+
+   Two rules travel with it. Pin an explicit revision when you fetch:
+   publishers re-quantize in place under an unchanged repo name, so a bare
+   branch name is not reproducible and a checkpoint you gated against can
+   change under you. And setting the variable authorizes nothing on its own —
+   a large asset download still needs authority for the task.
+
+4. Add a profile entry to this file, in the same shape as the entries below:
    hardware, arch, toolkit versions, oracle availability, and the box's
    quirks. A PR for it is welcome, so the shared record says where each gate
    can run. New accelerator classes (an AMD/ROCm box, an Intel GPU) register

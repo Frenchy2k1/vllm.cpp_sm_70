@@ -32,7 +32,14 @@ MATRICES = {
     # of the 328 registry architectures: vLLM has no transducer call site at all
     #: so there is nothing in `registry.py` to inventory. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 361),
+    # 362 since 2026-08-10: +`MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation`
+    # (Meta's Muse Glimmer 30B, released 2026-08-08). A THIRD beyond-pin row: it is
+    # not one of the 326 registry architectures at `555967922`, and unlike the two
+    # Parakeet rows it is absent because it did not exist yet, not because vLLM
+    # delegates it. Its only upstream implementation is the still-OPEN
+    # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 362),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

@@ -719,6 +719,12 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/laguna_device.cpp
   src/vllm/model_executor/models/laguna_shared_fp4.cpp
   src/vllm/model_executor/models/laguna.cpp
+  src/vllm/model_executor/models/muse_glimmer_registry.cpp
+  src/vllm/model_executor/models/muse_glimmer_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer.cpp
+  src/vllm/model_executor/models/muse_glimmer_vision.cpp
+  src/vllm/model_executor/models/muse_glimmer_mm.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
@@ -1009,6 +1015,8 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
+  src/vllm/entrypoints/openai/tool_parsers/muse_glimmer.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.cpp
   src/vllm/parser/engine/incremental_lexer.cpp
   src/vllm/parser/engine/token_id_scanner.cpp
   src/vllm/parser/engine/streaming_parser_engine.cpp
