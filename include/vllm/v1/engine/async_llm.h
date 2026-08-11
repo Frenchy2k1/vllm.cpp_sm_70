@@ -159,16 +159,16 @@ class AsyncLLM {
 
   // The stat-logger attach point (async_llm.py:648-652 `logger_ref`, the
   // mutable one-element list holding self.logger_manager). Mirrors
-  // LLMEngine::set_stat_logger: NON-OWNING, must outlive the engine, and null
-  // (the default) keeps RunOutputHandler on its byte-identical no-stats path.
+  // LLMEngine::set_stat_logger: NON-OWNING. A non-null logger must remain alive
+  // until it is detached or the engine is shut down. Detaching is a quiescence
+  // barrier: after set_stat_logger(nullptr) returns, the output thread no longer
+  // holds or uses the previous pointer. Null (the default) keeps RunOutputHandler
+  // on its byte-identical no-stats path.
   //
   // DEVIATION: upstream's one-element list exists to avoid a circular ref from
-  // the handler coroutine back to the AsyncLLM; ours is an atomic pointer,
-  // which additionally makes an attach that happens after construction visible
-  // to the already-running output-handler thread without a lock.
-  void set_stat_logger(metrics::PrometheusStatLogger* logger) {
-    stat_logger_.store(logger, std::memory_order_release);
-  }
+  // the handler coroutine back to the AsyncLLM. The attachment mutex makes
+  // pointer publication visible and gives detach its barrier semantics.
+  void set_stat_logger(metrics::PrometheusStatLogger* logger);
 
   // Idempotent teardown. Active requests receive abort-final outputs before
   // the output handler is woken with the engine-dead sentinel and joined.
@@ -184,7 +184,8 @@ class AsyncLLM {
 
   mutable std::mutex output_processor_mutex_;
   // async_llm.py:650-652 logger_ref. Non-owning; null == log_stats off.
-  std::atomic<metrics::PrometheusStatLogger*> stat_logger_{nullptr};
+  mutable std::mutex stat_logger_mutex_;
+  metrics::PrometheusStatLogger* stat_logger_ = nullptr;
   std::thread output_handler_;
   std::atomic<bool> stopping_{false};
   std::atomic<bool> shutdown_started_{false};

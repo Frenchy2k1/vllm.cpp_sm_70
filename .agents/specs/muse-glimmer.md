@@ -1,0 +1,676 @@
+# Muse Glimmer — Meta's 30B open agentic multimodal model
+
+**Row:** `MODEL-MUSE-GLIMMER`
+**Issue:** [#268](https://github.com/mudler/vllm.cpp/issues/268)
+**Base SHA:** `a0fa12c7219a86832412a6ece1490f452c1d1c40`
+**Upstream anchor:** vLLM PR [#51655](https://github.com/vllm-project/vllm/pull/51655) head `075d645af`
+**Secondary C++ reference:** llama.cpp PR [#26841](https://github.com/ggml-org/llama.cpp/pull/26841) (MERGED 2026-08-10)
+**Checkpoint:** `meta-models/Muse-Glimmer-30B`, Apache-2.0, bf16
+
+## 0. Honesty statement — what is and is not claimed
+
+Three things are unusual about this row and none of them may be papered over.
+
+**The anchor is not the pin.** Our parity pin `555967922` (2026-07-26) contains
+no Muse Glimmer code — `grep -ril 'muse\|glimmer' vllm/model_executor/models/`
+at the pin returns nothing — and neither does vLLM `main`. The only upstream
+implementation is PR #51655, opened 2026-08-10T10:20Z, approved but **unmerged**,
+with 3 of 20 CI checks red. This row therefore ports from a **branch head**, not
+from the pin. That is a deliberate exception, taken on explicit developer
+direction (2026-08-10), recorded as deviation 16 in
+[`.agents/porting-inventory.md`](../porting-inventory.md) §9 and argued for in
+the commit that introduces it, which is where exceptions live now that the
+waiver registry is retired (`a4f72f86`). It owes a re-anchor when #51655
+merges.
+
+**There is no gateable oracle, so no speed number is claimable.** AGENTS.md
+requires both sides of any throughput comparison to run the pinned oracle on
+identical workloads, and requires an oracle to demonstrably build and run the
+model before it is gateable. The pinned vLLM cannot load `muse_glimmer` at all,
+and the checkpoint needs `transformers 5.15.0.dev0` against the pin's 5.14.1.
+**Every performance axis for this model is an open gap** until the pin advances.
+Correctness is gated against the HF reference implementation instead. No
+"parity" or "faster than vLLM" claim may be made from this row's evidence.
+
+**llama.cpp is a secondary reference only.** Per
+[[vllm-is-the-bar-not-llamacpp]], llama.cpp informs C++ structure and is useful
+for cross-checking dequant and tokenizer behaviour, but it is never the
+correctness oracle and never the speed denominator. Anything taken from it is
+cited as such and marked in the porting inventory.
+
+## 1. Architecture
+
+`MuseGlimmerForConditionalGeneration` → `MuseGlimmerForCausalLM`,
+`model_type: muse_glimmer`. The registry maps both the conditional-generation
+and causal-LM architecture strings onto one class
+(`registry.py`, PR #51655).
+
+### 1.1 Text tower
+
+52 layers, hidden 6656, 32 query heads / 2 KV heads (GQA 16:1), head_dim 128,
+vocab 202048, max position 131072, rope theta 500000, `hidden_activation` gated
+MLP, no attention logit softcapping.
+
+| Mechanism | Detail | Anchor |
+|---|---|---|
+| Sandwich norms | `input`, `post_attention`, `pre_feedforward`, `post_feedforward` RMSNorm, fp32 compute, **baked `+1` weight offset** | `muse_glimmer.py:1236-1247` |
+| Split eps | pre-norms use `rms_norm_eps`; post-norms use a separate, smaller `post_norm_eps` | `muse_glimmer.py:1239-1246` |
+| iRoPE | `no_rope_layers[i] == 1` → RoPE **and** sliding window; `== 0` → NoPE **and** full attention | `muse_glimmer.py:1114-1116`, `:1167-1168` |
+| QK-norm | weightless RMSNorm over `head_dim`, fp32, applied **before** RoPE | `muse_glimmer.py:1189-1196` |
+| Query pre-scale | `scale_query_by` (~3.87) multiplies q *after* QK-norm; softmax scaling stays `head_dim**-0.5` | `muse_glimmer.py:1112`, `:1192` |
+| Attention output gate | `sigmoid(output_gate_proj(hidden_states)) * attn_out`, gate reads the **layer input** | `muse_glimmer.py:1203-1206` |
+
+Two of these are correctness traps and get their own RED-first tests:
+
+- **The query pre-scale has two config schemas.** The native `params.json` ships
+  the raw `qk_scale_factor` (~43.784); the modular HF `text_config` ships it
+  pre-folded by `1/sqrt(head_dim)` (~3.87). Upstream disambiguates *by
+  magnitude* — `qk_scale >= sqrt(head_dim)` means native, divide; otherwise use
+  as-is (`muse_glimmer.py:472-517`). Getting this wrong scales every query by
+  11.3x and is not a subtle drift.
+- **`use_qk_norm` and `use_attn_output_gate` read as `None`, not `True`,** in the
+  modular schema. Muse Glimmer always applies both; only an explicit `False`
+  disables them (`muse_glimmer.py:456-469`). A naive `getattr(..., False)`
+  silently drops both mechanisms and still produces plausible text.
+
+### 1.2 Perception encoder
+
+50 layers, hidden 1536, 16 heads (head_dim 96), patch 14×14, `patch_temporal` 2,
+`pos_emb` grid 32×32, interleaved `window_attention` / `full_attention` per
+`layer_types`, projector 4096 → output 6144. Image token 200092, video token
+200091; placeholder strings `<|patch|>` / `<|image|>` / `<|video|>`
+(`muse_glimmer.py:127-129`).
+
+| Stage | Detail | Anchor |
+|---|---|---|
+| Patchify + embed | `conv1_linear: Linear(patch_temporal*3*patch_size^2 → hidden, bias=False)` — a **linear on patchified input**, not a conv | `muse_glimmer.py:696`, `:710` |
+| Positional embedding | learned `[32*32, hidden]`, **bilinear-interpolated** to the actual grid with per-corner validity masking | `muse_glimmer.py:761-820` |
+| 2D RoPE | `spatial_dim = head_dim//2`, base 10000, `freqs = cat([freq_w, freq_h])` — **width first** | `muse_glimmer.py:741-759` |
+| Window attention | blocks of `pos_emb_height × pos_emb_width`, `-1`-padded permutation, per-block valid counts become `seq_lens` | `muse_glimmer.py:844-867` |
+| Pixel-shuffle downsample | by `merge_kernel_size`; asserts `output_dim == hidden * merge^2` | `muse_glimmer.py:822-842`, `:734-739` |
+| ln_pre / ln_post | plain `LayerNorm` (not RMSNorm) | `muse_glimmer.py:714`, `:732` |
+
+The width-before-height RoPE concatenation and the `+0.5 / -0.5` half-pixel
+convention in the positional interpolation are both easy to transpose and both
+produce a plausible-but-wrong image understanding. Each gets a fixture test.
+
+### 1.3 DFlash drafter
+
+The PR adds no new drafter. It reuses `qwen3_dflash`, recognising
+`MuseGlimmerAssistantModel` as a `dflash` method (`config/speculative.py`), and
+threads the **target's** `is_neox_style` into the draft config
+(`qwen3_dflash.py:75-94`, `v1/spec_decode/dflash.py:83-95`). Upstream's own
+comment is the important part: a RoPE-layout mismatch between draft and target
+is **silent** — acceptance collapses, nothing errors, output stays correct. Our
+DFlash row already exists ([[dflash-correctness-done-speed-bf16-blocked]]), so
+this is a recognition-and-threading change, not a new speculator.
+
+## 2. Reuse — the shared seams this must route through
+
+A capability not reachable through the shared surface is not done. Every Muse
+mechanism has an existing home:
+
+| Muse piece | Existing seam | Files |
+|---|---|---|
+| Sandwich norms, `+1` offset, fp32 | Gemma 2/3/4 norm path | `gemma2.cpp`, `gemma4.cpp` |
+| Attention output gate | Qwen3.5 gated attention | `qwen3_5.cpp` |
+| Weightless QK-norm | Qwen3 family | `qwen3_vl_text.cpp` |
+| Windowed-attention vision tower | Qwen3-VL vision seam | `qwen3_vl_vision.cpp` |
+| Gated MLP | `layers::MlpGateUpMethodBase`, `vt::MergedGemmGroup` | — |
+| Decode | `ModelRegistry::Forward`, `dense_attn::AttnBlock`, on-device sampling | — |
+| Fusion | `vt::FusedChain` | — |
+| DFlash | existing speculator path | — |
+
+**iRoPE / per-layer NoPE has no analogue** — we have no Llama-4 — and is the one
+genuinely new text-side mechanism. It extends the existing per-layer attention
+config rather than introducing a parallel path; if the current layer-type seam
+cannot express "NoPE + full attention" alongside "RoPE + sliding", the seam is
+extended, not bypassed.
+
+Everything ships as **additive files** mirroring vLLM's structure:
+`muse_glimmer.cpp`, `muse_glimmer_text.cpp`, `muse_glimmer_vision.cpp`,
+`muse_glimmer_weights.cpp`, `muse_glimmer_registry.cpp`, plus
+`include/vllm/model_executor/models/muse_glimmer.h`. The capability is exposed
+through `include/vllm.h`; examples and the server stay thin ABI clients
+([[examples-are-abi-clients-only]]).
+
+## 3. Work breakdown
+
+| W | Scope | Gate |
+|---|---|---|
+| **W0** ✅ | Config parse + registry + weight map. No forward. | **LANDED 2026-08-10**, see §8 |
+| **W1** | Text tower forward: sandwich norms, iRoPE/NoPE, QK-norm, query pre-scale, output gate | Per-layer reference-dump match, RED-first per mechanism |
+| **W2** | Text e2e greedy vs HF reference | Token-exact on a fixed prompt set |
+| **W3** | Perception encoder: patchify, pos-emb interp, 2D RoPE, window attention, pixel shuffle | Tower dump match, per-stage fixtures |
+| **W4** | Image e2e (placeholder expansion, projector, scatter into text) | STRICT vs HF reference |
+| **W5** | Video (`patch_temporal`, frame sampling) | STRICT vs HF reference |
+| **W6** | DFlash drafter recognition + `is_neox_style` threading | Acceptance-rate check vs spec-off; drafts must actually be consumed |
+| **W7** | Reasoning + tool parsers on the server surface | Ported upstream parser tests |
+
+W0–W2 are the critical path. W3–W5 depend on the vision seam. W6 must force
+async off on both arms ([[engine-proc-dropped-every-speculator-draft]]) or the
+A/B is meaningless.
+
+## 4. Gates
+
+**Correctness, against the HF reference** (not the pinned oracle, which cannot
+run this model — see §0):
+
+1. Config parse: both schemas resolve to the same `scale_query_by` (~3.87), and
+   `use_qk_norm` / `use_attn_output_gate` default **on**.
+2. Per-mechanism RED-first: disabling QK-norm, the output gate, the query
+   pre-scale, the `+1` norm offset, or the NoPE/RoPE layer split must each turn
+   its test red. Mutation is the proof, not inspection.
+3. Text e2e: token-exact greedy vs the HF reference on a fixed prompt set.
+4. Vision: per-stage tower dumps within the bf16-depth envelope; image and video
+   e2e STRICT.
+5. DFlash: drafts demonstrably consumed (not silently dropped), acceptance rate
+   recorded, output identical to spec-off.
+
+**Ported tests.** The upstream tests in PR #51655 —
+`tests/transformers_utils/test_muse_glimmer_config.py`,
+`test_muse_glimmer_config_schema_norm.py`, and the five
+`tests/tool_use/test_muse_glimmer_*.py` — are ported in the same change with
+parameters, fixtures, tolerances and failure cases preserved, each carrying the
+`075d645af` revision anchor. Harness adaptation is documented where unavoidable.
+
+**Speed: OPEN GAP, not measured, not waived.** Recorded in `docs/BENCHMARKS.md`
+as pending on the named external unblocker: #51655 merging and the pin advancing
+to include it plus transformers 5.15. No ceiling is declared
+([[when-stuck-workflow-scan-vllm]]). That row LANDED 2026-08-11 in the
+at-a-glance table; it states no number, claims no waiver, and names the
+unblocker.
+
+`docs/STATUS.md` and `.agents/NOW.md` carry NO Muse row, and that is a stated
+omission rather than an oversight. `STATUS.md` sits byte-exactly on its
+shrink-only ratchet (243,451 of 243,451) and `NOW.md` at 5,986 of its 6,000
+characters, so either page can only take a Muse row by collapsing another row's
+binding narrative — somebody else's keyed record, which this round will not
+rewrite as a side effect. Both are owed by the landing commit, which can pay for
+them; until then the model's public state lives in `docs/FEATURES.md` and
+`docs/USAGE.md`.
+
+## 5. Risks
+
+- **The anchor can change under us.** #51655 is an open branch with red CI; a
+  force-push or review round rewrites what we cite. Mitigation: cite the exact
+  head `075d645af`, keep the fetched ref, and diff before every re-anchor.
+- **Unmerged upstream may itself be wrong.** The approved-but-red state means
+  upstream's own gates have not fully passed. Where our HF-reference gate
+  disagrees with PR #51655, the HF reference wins and the divergence is reported
+  upstream rather than silently mirrored.
+- **No oracle means correctness rests on one leg.** The HF reference is the only
+  cross-check until the pin moves. Per-mechanism mutation testing carries more
+  weight than usual here.
+- **Weights are not local.** ~60 GB bf16. Download needs explicit authority.
+- **GB10 memory.** 30B bf16 will not fit comfortably alongside anything else;
+  `gpu_memory_utilization` reserves host RAM on unified memory
+  ([[gb10-unified-memory-oom-reboots-box]]). Quantized arms first where possible.
+
+## 6. Stop conditions
+
+- #51655 is force-pushed or substantially rewritten → stop, re-diff, re-anchor
+  before continuing.
+- The HF reference and PR #51655 disagree on a mechanism → `NEEDS_DECISION`,
+  do not guess which is authoritative.
+- Any request to state a speed number for this model before the pin advances →
+  refuse; the axis is an open gap by construction.
+- Weight download or GPU time beyond what is already authorised → stop and ask.
+
+## 6.5 REAL-WEIGHTS RESULT — our text tower agrees with an independent
+transcription on the released checkpoint (2026-08-10)
+
+The first evidence for this model that comes from the actual released weights
+rather than a synthetic fixture.
+
+**Reference.** `scripts/mm/muse_glimmer_text_ref.py` transcribes the upstream
+forward (vllm#51655 head `075d645af`) into plain torch, with no `transformers`
+and no `vllm` import, and runs it on the checkpoint's own safetensors. It exists
+because nothing on either box can load this model: released transformers does
+not register `model_type: muse_glimmer`, the checkpoint ships no remote-code
+file, and the parity pin has no `muse_glimmer` at all.
+
+**Full-depth reference sanity (52 layers, real weights).** Prompt "The capital of
+France is" produces argmax `[" key", " of", " the", " is", " Paris"]`, last
+position top-2 17.086 vs 13.445, `|logit|` max 18.66 under the 20.0 soft cap. A
+coherent, correct continuation is good evidence the transcription is faithful.
+It also independently confirms two things W0/W1 had to infer: `scale_query_by`
+resolves to 3.87, and the derived iRoPE mask agrees with the checkpoint's own
+`layer_types` / `layer_rope_theta` encoding.
+
+**Our C++ vs that reference (reduced depth 4/52, real weights).**
+
+| Measure | Result |
+|---|---|
+| Tensor accounting | **51 / 51** enumerated names present |
+| argmax | `27389 110709 32485 122967 152652` — **identical both sides** |
+| max abs logit difference | 0.0889745 |
+| cosine | 0.999981 |
+| assertions | **1,010,282 passed**, 0 failed |
+
+**A verification trap worth recording.** With the env gates unset the same binary
+reports "3 test cases, 3 passed, 15 assertions" — it looks green while comparing
+nothing, because the heavy cases return early and doctest counts them as passed
+rather than skipped. The assertion count is the tell: a real comparison is over a
+million assertions, a no-op is fifteen. Never read this gate's pass/fail without
+reading its assertion count.
+
+**What this is NOT.** Not token-exact against the model's own runtime — no such
+runtime exists here to be exact against, so this is agreement with an independent
+transcription of the same upstream source, which is a weaker claim than a true
+oracle gate and is recorded as such. Not a full-depth comparison of our forward
+(the 52-layer arm needs ~55.7 GB resident and is a named residual). Not any kind
+of speed result; no denominator exists.
+
+## 6.6 A REAL HF REFERENCE EXISTS — and we match it (2026-08-10)
+
+§0 said no gateable reference existed. **That is now out of date**, and this
+section supersedes it for correctness (the speed statement in §0 still stands
+unchanged).
+
+HF's Muse Glimmer implementation lives on the `exportable-muse` branch of
+`huggingface/transformers` (`a9e337e8`, version 5.16.0.dev0) — *not* the
+`new-model-addition-onyx` name vllm#51655's comment gives, which exists neither
+as a branch nor as a repo. The branch carries the full
+`models/muse_glimmer/{configuration,modeling,processing,image_processing,video_processing}`
+set plus `muse_glimmer_assistant` (the DFlash drafter).
+
+Installed on dgx at `$HOME/venvs/muse-onyx`, deliberately isolated: the pinned
+oracle venv is untouched, and the new venv reuses the oracle's torch through a
+`.pth` fallback rather than pulling a second CUDA build. `muse_glimmer` registers
+in `CONFIG_MAPPING_NAMES` and `AutoConfig` resolves the released 52-layer config.
+Note it registers under the multimodal AutoModel classes, so
+`AutoModelForCausalLM` rejects it — use `MuseGlimmerForConditionalGeneration`.
+
+**Result at reduced depth (4/52), real weights, prompt "The capital of France is":**
+
+| Comparison | argmax | max abs diff | cosine |
+|---|---|---|---|
+| HF reference vs our torch transcription | **identical** | 0.117212 | 0.99997157 |
+| our C++ vs our torch transcription | **identical** | 0.0889745 | 0.999981 |
+
+Three independent implementations — HF's own, our transcription, and our C++ —
+agree on `[27389, 110709, 32485, 122967, 152652]`. That is materially stronger
+than §6.5's claim: the earlier evidence was agreement between two things we
+wrote from the same source, and this adds a genuine third-party oracle.
+
+**Still owed.** The full 52-layer HF comparison did not run: dgx had a live
+`vllm serve` holding most of the 119 GB unified pool, leaving ~37 GB against a
+60 GB load, and on GB10 an OOM can reboot the box. That job also did NOT hold
+`${GPU_LOCK}`, so the mutex protected nothing — the reduced-depth run was chosen
+to stay bounded. Re-run at full depth on an idle box.
+
+Also still true: the perception encoder has no reference check, nothing has run
+end to end through the server, multi-step decode and the sliding window are
+untested, and **no speed axis is claimable on any dimension.**
+
+## 6.7 OPEN GAP — the ATEM parsers do not see their own framing at server defaults
+
+Found in the PR #279 review (2026-08-11) and **not fixed**; recorded here because
+it is the difference between "the parsers are ported" and "channel scoping
+works".
+
+Upstream's `MuseGlimmerToolParser.adjust_request` (`:206`) and
+`MuseGlimmerReasoningParser.adjust_request` (`:117`) force
+`skip_special_tokens=False` on any request routed to Muse Glimmer. Both were
+dropped in the port, justified in the shipped headers by the claim that the C++
+seam "carries no `skip_special_tokens`". **That claim was false.**
+
+- `skip_special_tokens` is declared `= true` on both request types
+  (`include/vllm/entrypoints/openai/protocol.h:240` completion, `:461` chat) and
+  honoured at `src/vllm/v1/engine/detokenizer.cpp:68`.
+- The released checkpoint marks the ATEM framing markers special:
+  `tokenizer_config.json` lists them under `extra_special_tokens`, and
+  `tokenizer.json` carries `"special": true` for `<|eom|>` 200007, `<|eot|>`
+  200008, `<|start|>` 200022, `<|message|>` 200023.
+
+So at server defaults the detokenizer strips `<|start|>assistant to=…<|message|>`
+before either parser runs. Channel scoping — the mechanism this port was built
+around, the thing that keeps an `<atem:invoke>` echoed inside a `to=self`
+reasoning block from becoming a tool call — cannot function, and raw ATEM markup
+can fall through to the client. The parsers' own unit gates pass because they are
+handed framed strings directly, which is exactly why this was invisible.
+
+**Why it is not fixed here.** The gap is in the SEAM, not in the port: there is no
+`adjust_request` dispatch site anywhere in the tree. `KimiK2ToolParser::adjust_request`
+(`src/vllm/entrypoints/openai/tool_parsers/kimi_k2.cpp:87`) exists and has no
+callers either, and several other parser headers record the same drop. Building a
+request-mutation hook onto the shared `ToolParser`/`ReasoningParser` surface is a
+seam change owned by no Muse row, and doing it inside a review-findings fix would
+be exactly the "hand-roll a parallel path" AGENTS.md forbids. It is recorded as
+visible debt in the two parser headers, `docs/FEATURES.md` and `docs/USAGE.md`,
+and it owes its own issue and row.
+
+`supports_required_and_named = False` (`tool parser :192`) is dropped for a
+related reason: the seam has no named/required-`tool_choice` fast path to opt out
+of today. If one is ever added it must read this flag, or Muse Glimmer will be
+handed a path upstream explicitly refuses.
+
+## 6.8 PR #279 review findings — what the fix round closed (2026-08-11)
+
+`CLAIM-MUSE-GLIMMER-FIX`, `row/MODEL-MUSE-GLIMMER-FIX`, off reviewed head
+`774c44d8`. The review's verdict was PASS-WITH-FINDINGS. Three findings were
+COVERAGE HOLES — mutations that stayed GREEN, meaning a shipped guarantee had no
+test at all — and those are the ones worth recording.
+
+| Mutation | Before | After |
+|---|---|---|
+| `perception_emb_norm` condition INVERTED (`muse_glimmer_mm.cpp:217`) | wiring gate GREEN | wiring 8/9 pass, **18 assertions RED** |
+| `perception_emb_norm` call DROPPED | wiring gate GREEN | wiring 8/9 pass, **17 assertions RED** |
+| RoPE base hardcoded 10000 instead of `g.rope_theta` (5e5) | text gate GREEN | text 20/21 pass, **4 assertions RED** |
+| RoPE base hardcoded 2.0 (the absurd control) | text gate RED | text gate RED (2 cases) |
+| `else vt::RmsNorm(...)` input-layernorm fallback given the wrong eps | default arm **21/21 GREEN** | fallback arm **1 assertion RED** |
+| `else vt::RmsNorm(...)` final-norm fallback given `gemma=true` | default arm **21/21 GREEN** | fallback arm **59 assertions RED** |
+
+In every case the tree was restored from an in-memory snapshot and `git diff` on
+`src/` verified empty before re-running green.
+
+What closed them:
+
+1. **`perception_emb_norm` had no test at all.** No config in the tree set
+   `normalize_tok_embeddings`, and the scatter case compared merged rows against
+   the same `soft` vector it had just computed, so it was structurally blind to
+   what `EncodePixelGroups` did to that vector. The new case runs the IDENTICAL
+   tower twice — flag off and flag on — which makes the norm the only difference,
+   and requires the soft tokens to stand in the exact algebraic relation the
+   weightless RMSNorm defines, with a control asserting the norm is not a no-op at
+   this geometry.
+2. **The whole non-FusedChain fallback arm was dead.** `FusedChainAdoptEnabled()`
+   defaults ON and is read once per process into a function-local static, so the
+   three `else vt::RmsNorm(...)` branches never executed under test and a
+   same-process env flip could not reach them either. `tests/CMakeLists.txt` now
+   registers the text binary a SECOND time as `test_muse_glimmer_text_fallback`
+   with `VT_FUSED_CHAIN_ADOPT=0`, so the whole gate — including the fp32 reference
+   comparison — runs on both arms, and a case inside the binary asserts the arm it
+   actually took, so the second registration cannot silently repeat the first.
+3. **RoPE theta was ungated at a realistic magnitude.** Every case ran at
+   positions 0..4 with `head_dim` 4, where 5e5 and 1e4 differ by milliradians —
+   under the reference band. The new case moves to positions 0..4096, pins the
+   base three ways (matches its own reference, does NOT match a 1e4 reference,
+   and the two configs cannot produce the same logits), and carries a widened but
+   named band: measured 6.9e-4 against a wrong-base signal of 4.1e-2.
+4. **A stale "OPEN FINDING" had disarmed a live assertion.** The real-weights
+   gate demoted `CHECK(accounted == enumerated)` to a `MESSAGE` whenever
+   `vision.present`, over a 50-tensor shortfall the W4 enumeration correction had
+   already fixed. Re-armed; the same guarantee runs without the NAS in
+   `test_muse_glimmer_wiring`, which asserts it on a multimodal checkpoint.
+5. **Two shipped headers carried a false justification** for dropping
+   `adjust_request`. Corrected, and the real consequence recorded as §6.7 above.
+6. **`docs/USAGE.md` overclaimed and contradicted `docs/FEATURES.md`.** "matches
+   it token for token on the released checkpoint" is now what was actually
+   measured: reduced depth 4 of 52, five prefill argmax positions, not generated
+   tokens, against transcriptions rather than the model's own runtime.
+
+Deliberately left open: the `adjust_request` seam (§6.7, needs its own issue and
+row); the `STATUS.md` / `NOW.md` rows (§4, blocked on their shrink-only budgets);
+the lifecycle-token advance in `.agents/model-matrix.md`, which owes those two
+rows; and the compact-vs-spaced `arguments` JSON, which is the whole parser
+family's convention and is documented rather than changed in one parser.
+
+## 7. Outcome
+
+Pending overall.
+
+## 8. W0 — the CPU scaffold (2026-08-10, `CLAIM-MUSE-GLIMMER-W0`)
+
+Additive only: `include/vllm/model_executor/models/muse_glimmer.h`,
+`src/vllm/model_executor/models/muse_glimmer{,_weights,_registry}.cpp`,
+`tests/vllm/models/test_muse_glimmer_scaffold.cpp`. No forward, no checkpoint,
+no GPU, no download.
+
+Both architecture strings register onto one factory, mirroring upstream. The
+config parse handles the canonical nested layout *and* normalizes the older flat
+layout. The weight-name mapper ports `hf_to_vllm_mapper` for both checkpoint
+conventions. The structural enumeration deliberately omits the three weightless
+modules (`embed_norm`, the per-head `qk_norm`, `perception_emb_norm`) that ship
+no tensor — enumerating them would make the loader demand tensors that do not
+exist in any checkpoint. The forward refuses by name.
+
+**Gate:** `test_muse_glimmer_scaffold` 11/11 cases, 73/73 assertions, clean CPU
+`-Werror` build. Full CPU `ctest` green (regression: the change is additive TUs
+plus two registry entries).
+
+**RED-first mutation evidence.** Each of the four named traps was mutated in
+tree, rebuilt, and confirmed to turn the gate red; the tree was then restored
+byte-for-byte (verified by an empty `git diff`) and the gate re-run green:
+
+| Mutation | Result |
+|---|---|
+| Native raw `qk_scale_factor` treated as already-folded (the 11.3x query blow-up) | 3 assertions RED |
+| Absent `use_qk_norm` / `use_attn_output_gate` defaulted to `false` | 4 assertions RED |
+| iRoPE mask counted forward instead of backward from the last layer | 5 assertions RED |
+| Legacy sandwich-norm renames applied in the wrong order (swapping post-attention with pre-feedforward) | 1 assertion RED |
+
+## 9. W1 readiness — the primitive map (surveyed 2026-08-10, no code yet)
+
+Every primitive the text tower needs already exists, so W1 is a mechanical port
+against `gemma2.cpp` (407 lines) rather than new kernel work. `gemma2.cpp` is the
+template: its sandwich-norm decoder layer is structurally identical to Muse's.
+
+| Muse mechanism | Existing primitive | Note |
+|---|---|---|
+| Sandwich norms with baked `+1` | `vt::RmsNormArgs{eps, gemma=true}` | `gemma=true` IS the `(1+w)` offset |
+| Split pre/post eps | two `RmsNormArgs` values | the ONE delta vs gemma2, which uses a single eps |
+| SwiGLU MLP | `layers::UnquantizedMlpGateUpMethod` | gemma2 uses the `...GeluMethod` sibling; Muse is silu |
+| Attention output gate | `vt::kSigmoidGateBf16` (FusedChain) | already used by Qwen3.5; `attn * sigmoid(gate)` |
+| Sliding vs full attention | `vt::PagedAttentionArgs::window_size` | gemma2 threads this per layer already |
+| RoPE | `vt::RopeNeox` | skip entirely on NoPE layers |
+| Weightless QK-norm / embed_norm | `vt::RmsNorm` with a ones weight | no weightless variant exists; a ones buffer is the cheap path |
+
+Deltas from the `gemma2.cpp` template, each a place to get it wrong:
+
+1. **Embedding scale.** Gemma multiplies by `sqrt(hidden)`; Muse instead applies a
+   weightless RMSNorm (`embed_norm`, `muse_glimmer.py:1286`). Different operation,
+   same slot.
+2. **Split eps.** Pre-norms take `rms_norm_eps`, post-norms `post_norm_eps`.
+   gemma2 threads one eps everywhere.
+3. **Attention scale.** Muse uses plain `head_dim**-0.5`, NOT gemma2's
+   `query_pre_attn_scalar**-0.5`; the query pre-scale is applied separately to q
+   after QK-norm.
+4. **iRoPE.** RoPE and sliding-window travel TOGETHER on `no_rope_layers[l]==1`;
+   NoPE layers are full attention. gemma2's sliding split is independent of RoPE.
+5. **The gate reads the normed layer input** (`dhn`), not the attention output.
+6. **`lm_head` is untied** and there is an `output_multiplier` before the final
+   soft-cap.
+
+The post-attention and post-feedforward norms must stay STANDALONE, exactly as
+gemma2 documents: they are sublayer-output norms with no residual add, so folding
+them onto `kFusedAddRmsNorm` would be an incorrect fold.
+
+**What W0 does NOT establish.** No forward runs, so nothing here says the model
+produces correct tokens. The KV-cache spec is a documented placeholder: the real
+sliding/full split rides the Gemma-4 per-layer spec seam and lands with W1. And
+per §0 no speed axis is measurable at all while the pin lacks `muse_glimmer`. Filled in when the row reaches `DONE`: what was measured, what was
+rejected and why, and why each default is set the way it is.
+
+## 10. The GGUF k-quant arm (2026-08-11, `row/MODEL-MUSE-GLIMMER-GGUF`)
+
+**Issue:** [#329](https://github.com/mudler/vllm.cpp/issues/329). Implements the
+quantized-arm rule added to `AGENTS.md` in [#318](https://github.com/mudler/vllm.cpp/issues/318).
+
+`LoadMuseGlimmer` used to throw `"does not support GGUF weights"`. That was never
+a decision — the quantized arm simply was not on any list — and
+the `.agents/porting-a-model.md` checklist §2 now makes it a rule: a
+model port covers the quantized arms. A 30B bf16 checkpoint is ~60 GB against a
+~17 GB k-quant, so for this model the k-quant is the arm most users can run at
+all, and it is what a quant-matched llama.cpp comparison would need.
+
+**Assets.** `meta-models/Muse-Glimmer-30B-GGUF` @ `2fb01e4e6f`:
+`muse-glimmer-30B-kquant-17gb.gguf` (16.76 GB, arch `muse-glimmer`, 731 tensors),
+`muse-glimmer-30B-kquant-dynamic.gguf` (19.65 GB, same 731, mixed per-tensor
+types), `mmproj-kquant.gguf` (1.40 GB, arch `clip`, 809), `dflash-kquant.gguf`
+(1.63 GB, arch `dflash`, 58).
+
+### 10.1 Three convert-time transforms, each verified against the bf16 checkpoint
+
+Derived from the GGUF's own tensor list and metadata, then cross-checked
+element-by-element against `meta-models/Muse-Glimmer-30B` — not inferred from
+names.
+
+1. **The sandwich norms are stored PRE-OFFSET.** GGUF
+   `blk.0.attn_norm.weight[0..5]` = `1.09619141, 1.11279297, 1.35742188, ...`;
+   safetensors `layers.0.input_layernorm.weight[0..5]` =
+   `0.09619141, 0.11279297, 0.35742188, ...`. Exactly `w_hf + 1`, and the same
+   for all four sandwich norms. Our forward adds the `+1` itself
+   (`RmsNormArgs{gemma=true}`), so the loader **subtracts one**. `output_norm`
+   (the final norm) takes no offset in the model, is stored raw, and must NOT be
+   un-shifted — the released checkpoint's `norm.weight` runs ±5 with mean 0.017,
+   which is visibly not an offset weight.
+2. **The query pre-scale is folded into `attn_q_norm`.** ggml has no weightless
+   RMSNorm, so the converter materializes both weightless norms as vectors:
+   `blk.N.attn_k_norm.weight` is all `1.0`, and `blk.N.attn_q_norm.weight` is the
+   constant `3.87` — exactly `text_config.qk_scale_factor` in the safetensors
+   `config.json`. The GGUF carries **no metadata key** for it, so
+   `scale_query_by` is recovered from that tensor, checked constant on every one
+   of the 52 layers, with a non-constant q-norm or a non-ones k-norm refused
+   rather than averaged.
+3. **The iRoPE mask rides `attention.sliding_window_pattern`** (52 bools,
+   `true, true, true, false, ...`): `true` = RoPE + sliding, `false` = NoPE +
+   full. Agrees with the safetensors config's `layer_types` and
+   `layer_rope_theta` (NoPE at 3, 7, ... 51).
+
+### 10.2 What is kept quantized, and what is not
+
+| Operand | Residency | Why |
+|---|---|---|
+| `o_proj`, `output_gate_proj`, `down_proj` | **keep-quant** | standalone `[N,K]` MatmulBT operands, taken verbatim |
+| `gate_up_proj` | **keep-quant block concat** when `ffn_gate`/`ffn_up` share a ggml type (they do: both Q4_K) | a k-quant row is a whole number of superblocks, so the merge is a byte concatenation |
+| `qkv_proj` | **dequantized** | the forward wants ONE merged operand and the file's shards differ in type (`attn_v` Q6_K vs `attn_q`/`attn_k` Q4_K); two block encodings cannot share one tensor |
+| `lm_head` | **dequantized** | consumed via `vt::Matmul` in Matmul-B `[H, vocab]`; a block encoding cannot be transposed without requantizing |
+| `embed_tokens` | **dequantized** | a `[vocab, H]` gather table, not a GEMM operand |
+| all norms | **dequantized** | `[H]`/`[Dh]` F32 vectors carrying a `-1` value transform |
+
+### 10.3 Named residual — `post_norm_eps`
+
+The GGUF carries one epsilon (`attention.layer_norm_rms_epsilon` = 1e-5) and no
+post-norm key; the safetensors config ships `post_norm_eps` = 1e-8 separately, so
+the GGUF arm falls back to `rms_norm_eps` for the post-norms. Inside
+`1/sqrt(mean_square + eps)` with a mean square of order 1 that is a ~5e-6
+relative change — two orders of magnitude below bf16's ~4e-3 spacing, so it is
+not representable in the activation dtype. A real difference from the safetensors
+arm, just not an observable one. Fixing it needs a converter key upstream.
+
+### 10.4 REFUSED and OWED — the mmproj perception encoder
+
+`mmproj-kquant.gguf` maps cleanly for every tower tensor
+(`v.blk.N.{ln1,ln2,attn_q,attn_k,attn_v,attn_out,ffn_up,ffn_down}`,
+`v.{pre_ln,post_ln,position_embd}`, `mm.{0,1,2}` → adapter fc1/fc2 +
+`vision_projection`) **except one**: `v.patch_embd.weight` is ggml ne
+`[14, 14, 3, 1536]` = torch `[1536, 588]`, while `conv1_linear` needs
+`patch_temporal * 3 * patch_size^2` = `2*3*14*14` = **1176** input features — and
+the safetensors ships exactly `[1536, 1176]`. The `patch_temporal` axis is
+absent, i.e. half the patch embedding does not exist in the file to be loaded.
+
+The arm therefore **refuses by name** (`MuseGlimmerRefuseMmproj`) rather than
+inventing a temporal half, and image/video keep using the bf16 safetensors. This
+is **OWED**, not closed: the fix is upstream in the llama.cpp converter, and the
+refusal should be retired the moment a converted mmproj carries the full weight.
+
+### 10.5 The DFlash drafter — reachable, not exercised
+
+`dflash-kquant.gguf` is arch `dflash` and every one of its 58 tensors is covered
+by the ALREADY-LANDED `qwen3_dflash_gguf` name map (`fc.weight`,
+`enc.output_norm.weight`, `output_norm.weight`, and 11 per block × 5 blocks). It
+ships neither `token_embd` nor `output`, which is correct: a DFlash draft runs
+the TARGET's embedding table and head, and the text GGUF ships both, so
+`LoadGgufSharedEmbedAndHeadBf16` is the right source. **No new seam is needed.**
+That is a structural reachability claim only — nothing here says a Muse Glimmer
+draft proposes useful tokens; an acceptance-rate A/B is OWED and needs hardware
+this row did not have.
+
+### 10.6 What this arm does and does not establish
+
+**Established.** The released 16.76 GB k-quant loads: 731/731 tensors accounted
+with zero unaccounted in both directions, all 52 layers materialized at the right
+shapes and orientations, the sandwich norms un-shifted (layer-0
+`input_layernorm` min = −1.0, matching the safetensors' own min), and the query
+pre-scale recovered as 3.87 across every layer. The 19.65 GB mixed-type
+`dynamic` file accounts identically. Gate
+`tests/vllm/models/test_muse_glimmer_gguf.cpp`: 12/12 cases, 428 assertions
+with `VLLM_MUSE_GGUF`, 636 on the full-load case, with **11 mutations each
+proven RED** and the tree restored byte-for-byte.
+
+**NOT established.** No forward was run on GGUF weights, so there is no e2e, no
+token-exactness against anything, and no claim that the k-quant and the bf16 arm
+agree numerically — that comparison is OWED. And per §0 there is still **no speed
+axis of any kind**: the pinned oracle cannot load `muse_glimmer` in either weight
+format, so there is no denominator, and none is claimed.
+
+## 11. The speed attempt (2026-08-11, `row/MUSE-BENCH`, issue [#333](https://github.com/mudler/vllm.cpp/issues/333))
+
+**Result: no binding speed number was produced, and one bar moved from "assumed
+reachable" to "blocked with a named cause."** Each cell below is either a value
+with its arm stated, or a blocker. Nothing here is a ratio, because no cell has
+two quant-matched sides.
+
+| Bar | Arm | Outcome |
+|---|---|---|
+| **vLLM** | any | **OPEN GAP by construction.** Unchanged from §0: the pin carries no `muse_glimmer`, so there is nothing to divide by. Not waived, not substituted. |
+| **llama.cpp** (SECONDARY) | `muse-glimmer-30B-kquant-17gb.gguf` | **runs**; one contended datapoint, below. **Non-binding** — the box was at load 39-123. |
+| **ours** | same GGUF | **BLOCKED before the forward** — the tokenizer, not the loader. See §11.1. |
+| **HF transformers** | bf16 safetensors | **BLOCKED**: needs dgx (`$HOME/venvs/muse-onyx`), whose GPU lock was held for the whole window by another session's 27B online-serving gate. Not interfered with. |
+| **ours** | bf16 safetensors | **BLOCKED**: same host, and additionally needs a CUDA build that was deliberately not started so it would not perturb that measurement. |
+
+### 11.1 Our GGUF arm cannot generate — the blocker is the TOKENIZER
+
+§10.6 recorded "no forward was run on GGUF weights." The reason it cannot yet be
+run is upstream of the forward and was not previously named:
+
+```
+vllm-bench --model muse-glimmer-30B-kquant-17gb.gguf ...
+  -> failed: tokenizer: unsupported tokenizer.ggml.pre "llama4"
+```
+
+The file declares `tokenizer.ggml.model = gpt2` (which we accept) and
+`tokenizer.ggml.pre = llama4`, which `Tokenizer::FromGguf`
+(`src/vllm/tokenizer/tokenizer.cpp:749`) refuses by name.
+
+**This is not an alias away.** llama.cpp maps `llama4` to
+`LLAMA_VOCAB_PRE_TYPE_GPT4O` with `clean_spaces = false`
+(`src/llama-vocab.cpp:2294-2299` @ `030ebb5`), and that pre-type carries its own
+regex pair (`llama-vocab.cpp:428-434`) which is neither our `kLlama3` nor either
+`kQwen2` variant. Mapping it onto an existing pattern would silently mistokenize,
+which is exactly the failure mode the existing `qwen2`-vs-`qwen35` comment in
+that function refuses. The honest fix is a new `SplitPattern` for the GPT-4o
+family, with its own test, and it is **OWED** --
+issue [#347](https://github.com/mudler/vllm.cpp/issues/347).
+
+**Consequence for this row: a quant-matched llama.cpp comparison is not possible
+today.** Ours runs bf16 (~56 GB on disk) and llama.cpp ships k-quants only, so
+the only common artifact is the GGUF — and we cannot open its tokenizer. Running
+our bf16 against a 4-bit GGUF would report a quantization difference as a speed
+difference, so that cell is recorded **not comparable** rather than published.
+
+### 11.2 The llama.cpp datapoint, and why it is not a result
+
+Built from `ggml-org/llama.cpp` master `030ebb5` (Muse support merged in PR
+[#26841](https://github.com/ggml-org/llama.cpp/pull/26841), 2026-08-10; the local
+checkout at `237ad9b96` predates it), CPU-only Release, `-DGGML_NATIVE=ON`.
+File `muse-glimmer-30B-kquant-17gb.gguf` (16,756,681,056 bytes, rev `2fb01e4e6f`),
+which llama.cpp reports as `muse-glimmer 30B Q4_K - Medium`, 15.59 GiB, 27.85 B
+params. Host: 20-core x86-64, 84 GB RAM, **no GPU**; model read over a CIFS
+`soft` mount at ~117 MB/s, page-cache warmed before the run.
+
+```
+llama-bench -m muse-glimmer-30B-kquant-17gb.gguf -p 32 -n 8 -r 1 -t 4
+  pp32  9.79 t/s      tg8  0.79 t/s
+```
+
+**Why this is not a result.** One repetition, so there is no noise band at all;
+4 threads of 20; and the box was carrying four other agents' concurrent builds
+and test suites at load average 39 to 123 with the root filesystem repeatedly at
+100%. `.agents/benchmarking.md` requires the band to be calibrated from repeated
+identical legs *before* a delta is interpreted, and requires reproduction on an
+idle box. Neither was possible. A `-p 512 -n 64 -r 3 -t 20` leg was attempted
+and abandoned unfinished for the same reason. The number is recorded so the next
+attempt has something to disagree with, and for no other purpose.
+
+### 11.3 What is owed
+
+1. The GPT-4o-family `SplitPattern` (§11.1, issue
+   [#347](https://github.com/mudler/vllm.cpp/issues/347)) — until it lands our
+   GGUF arm has no e2e at all, quantized users included.
+2. Re-run both CPU legs on an idle box, `-r` >= 3, threads matched, band first.
+3. The bf16 pair (HF `exportable-muse` vs ours) on an idle dgx holding
+   `${GPU_LOCK}`, one large model resident at a time.
+4. The vLLM axis stays open until vllm#51655 merges and the pin advances.

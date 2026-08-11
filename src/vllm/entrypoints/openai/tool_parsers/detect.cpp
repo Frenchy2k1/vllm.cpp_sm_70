@@ -51,12 +51,19 @@ namespace {
 //     hermes), GigaChat 3.0's header form (3.1's <|function_call|> is rowed),
 //     qwen3_coder/qwen3_xml/mimo (surface byte-identical to step3p5's), and
 //     glm45/glm47 (surface identical to poolside_v1/hy_v3's arg tags).
+//   - muse_glimmer's "<atem:function_calls>" is a full literal that no other
+//     row contains and that contains no other row's marker, so its position
+//     is free; it sits first because it is the most specific. The Muse
+//     Glimmer chat template writes that literal into its tool-definition
+//     preamble (examples/tool_chat_template_muse_glimmer.jinja), so it is
+//     template-stable, not merely output-stable.
 //   - ENG-wave ordering: seed_oss's wrapper row must precede step3p5's
 //     "<function=" (seed output contains that inner marker); gemma4's
 //     "<|tool_call>call:" shares a prefix with lfm2's "<|tool_call_start|>"
 //     but neither contains the other; kimi's ASCII pipes are distinct from
 //     step3's fullwidth ones.
 constexpr ToolParserMarker kToolParserMarkers[] = {
+    {"muse_glimmer", "<atem:function_calls>"},
     {"longcat", "<longcat_tool_call>"},
     {"deepseek_v3", "<｜tool▁calls▁begin｜>"},
     {"deepseek_v32", "<｜DSML｜function_calls>"},

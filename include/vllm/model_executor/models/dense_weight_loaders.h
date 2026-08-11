@@ -32,6 +32,7 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"           // OwnedTensor, TensorResolver
 #include "vllm/model_executor/models/tensor_parallel.h"           // TensorParallel/TpShard (W2)
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace dense_loaders {
@@ -52,11 +53,15 @@ inline OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
 }
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].
-inline void TransposeBf16(const uint16_t* src, int64_t rows, int64_t cols,
+inline void TransposeBf16(const void* src, int64_t rows, int64_t cols,
                           uint16_t* dst) {
+  const auto* bytes = static_cast<const uint8_t*>(src);
   for (int64_t r = 0; r < rows; ++r) {
-    const uint16_t* src_row = src + r * cols;
-    for (int64_t c = 0; c < cols; ++c) dst[c * rows + r] = src_row[c];
+    for (int64_t c = 0; c < cols; ++c) {
+      const int64_t source_index = r * cols + c;
+      dst[c * rows + r] =
+          vt::LoadUnaligned<uint16_t>(bytes + source_index * 2);
+    }
   }
 }
 
@@ -162,7 +167,7 @@ inline OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   const int64_t out_dim = t.shape[0];
   const int64_t in_dim = t.shape[1];
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(reinterpret_cast<const uint16_t*>(src), out_dim, in_dim,
+  TransposeBf16(src, out_dim, in_dim,
                 reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;

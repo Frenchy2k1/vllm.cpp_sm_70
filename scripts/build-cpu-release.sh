@@ -43,7 +43,7 @@ targets=(server test_ops_matmul_elem)
 if [[ "$arch" == aarch64 ]]; then
   targets+=(test_cpu_isa_arm test_ops_quant_dot test_ops_quant_repack)
 fi
-cmake --build "$build_dir" --target "${targets[@]}" -j 2
+cmake --build "$build_dir" --target "${targets[@]}" -j "${JOBS:-2}"
 
 release_dir="$build_dir/release"
 tier_report="$release_dir/cpu-tier-report.json"

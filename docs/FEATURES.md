@@ -26,7 +26,7 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 35 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; full hosted dry run and first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; immutable handoff uses a checkout-disjoint asset root; first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 
@@ -75,7 +75,7 @@ are our reading of their documented behavior, not measurements.
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
-| Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of a 27B bf16); merged/transposed ones still copy. Post-upload source release covers every single-source upload, bf16 and CT NVFP4/MXFP4 alike; merged fp4 operands do not | ✅ | ✅ | ✅ mmap |
+| Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
 
@@ -127,6 +127,8 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on, via the `laguna-gen` CLI; the registered engine forward VT_CHECKs non-bf16 (`ARCH-ONE-SURFACE` fold) |
 | `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Folded onto the shared paged runner (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (the intrinsic near-tie profile); FA2 paged MLA default-ON; SACRED post-fold green** | Served via `vllm_engine_load` + `vllm_complete_tokens` (ABI v13); server 19.0 tok/s wall vs vLLM ~21 (~0.90×), speed residual open |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
+| `MuseGlimmerForCausalLM` | real tensors, **reduced depth 4/52 only**: 5 prefill argmax positions match a torch transcription of vllm#51655 and HF's own impl; full depth never ran. GGUF k-quant loads (731/731) but no forward | text forward + loader vs an fp32 reference, per-mechanism property tests, scaffold 11/11, GGUF gate 12/12. No generated tokens, multi-step decode untested | not measurable in either format; pinned oracle cannot load `muse_glimmer` |
+| `MuseGlimmerForConditionalGeneration` | vision: **no reference run of any kind**; enumeration gated vs the released 30B index (1436/1436). Image/video need bf16 safetensors: `mmproj-kquant.gguf` is refused by name (spec §10.4) | perception encoder loaded and wired, so an image or video prompt runs. Reachability plus placeholder scatter only, no image or video correctness | not measurable; anchored to open vllm#51655 |
 | `LlamaModel` | landed tiny synthetic embedding fixture (engine path == direct pooler path, identical vectors; f64 LAST+normalize reference); real checkpoint (e5-mistral class) is a NAMED residual | pooling/embed only, text paths refuse by task; `vllm_embed` + `/v1/embeddings` | n/a (CPU correctness-grade embeddings) |
 | `ParakeetForCTC`, `ParakeetForRNNT`, `ParakeetForTDT` | nvidia/parakeet-ctc-0.6b/-1.1b, -rnnt-0.6b, -tdt-0.6b-v3 (transcribed, ids exact vs HF `generate()`, P4/P6 2026-08-07; not retained) + committed synthetic fold fixture | ASR transcription-only (`SupportsTranscription` mirror; text paths refuse by task); fold gate byte-identical to the pre-refactor pipeline | n/a (CPU correctness-grade ASR via `vllm_transcribe` + `/v1/audio/transcriptions`) |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
@@ -204,8 +206,9 @@ HTTP are not started.
 | GBNF grammars | ✅ | ☐ | ☐ | ✅ |
 | xgrammar backend | ✅ | ✅ | ✅ | ☐ |
 | Jump-forward decoding | ✅ opt-in | ☐ | ✅ | ☐ |
-| Tool-call parsers | ✅ 36 families | ✅ | ✅ | ◐ |
-| Reasoning-content parsers | ✅ | ✅ | ✅ | ☐ |
+| Tool-call parsers | ✅ 37 families | ✅ | ✅ | ◐ |
+| Reasoning-content parsers | ✅ 10 | ✅ | ✅ | ☐ |
+| Muse Glimmer ATEM parsers (`muse_glimmer`) | ◐ UNIT-GATED ON STRINGS; **CHANNEL SCOPING FAILS AT SERVER DEFAULTS**: no `adjust_request` seam, so `skip_special_tokens: true` strips the framing. OPEN GAP, [spec](../.agents/specs/muse-glimmer.md) §6.7 | ✅ | ☐ | ☐ |
 | Custom logits processors | ◐ CPU-verified | ✅ | ✅ | ☐ |
 
 ## Backends and hardware
@@ -242,7 +245,9 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | OpenAI-compatible `/v1/chat/completions` | ✅ | ✅ | ✅ | ✅ |
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Offline batch API | ✅ | ✅ | ◐ | ☐ |
-| Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog | ✅ | ✅ | ◐ |
+| Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog; async detach and server teardown wait for the final fold | ✅ | ✅ | ◐ |
+| Container images | ◐ `cuda`/`vulkan`/`cpu` lanes build and gate from one Dockerfile (amd64+arm64, `ENTRYPOINT vllm-server`, ffmpeg included); **nothing published to GHCR yet** | ✅ | ✅ | ✅ |
+| Graceful shutdown on `SIGTERM` | ✅ clean exit in 0.25 s, including as container PID 1 (#312) | ✅ | ✅ | ✅ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
@@ -293,6 +298,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | Gap | State | Detail |
 |---|---|---|
 | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Runner fold LANDS (ROW 7 §21, #122): the ENGINE/SERVER surface serves Kimi at the 122/128 golden profile (engine==CLI 128/128); STRICT stays closed (intrinsic p7 near-tie)** | server 19.0 tok/s wall / CLI 18.9 vs vLLM ~21 (~0.90×), speed residual named (§21) |
+| Muse Glimmer 30B (Meta) | Text gated at **reduced depth 4/52** only; vision wired but never reference-checked | [spec](../.agents/specs/muse-glimmer.md) / [#268](https://github.com/mudler/vllm.cpp/issues/268). Full depth, multi-step decode, image/video correctness, the server path and parser scoping are all open. No speed axis |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |
