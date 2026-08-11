@@ -1064,6 +1064,175 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 // registered unified devices (Metal M4, GB10 CUDA/Vulkan) the pointer is
 // host-accessible, so the fallback runs. On a plain CPU build there is no non-CPU
 // device and the case is inert.
+// i32 device buffer (state_idx / query_start_loc / has_initial_state /
+// conv_state_indices). Same staging discipline as DevBuf.
+class DevBufI32 {
+ public:
+  DevBufI32(vt::Backend& b, Queue& q, size_t n) : b_(b), q_(q), n_(n) {
+    ptr_ = b_.Alloc(n * sizeof(int32_t));
+  }
+  ~DevBufI32() { b_.Free(ptr_); }
+  DevBufI32(const DevBufI32&) = delete;
+  DevBufI32& operator=(const DevBufI32&) = delete;
+  void Upload(const std::vector<int32_t>& src) {
+    REQUIRE(src.size() == n_);
+    b_.Copy(q_, ptr_, src.data(), n_ * sizeof(int32_t));
+  }
+  void* ptr() const { return ptr_; }
+
+ private:
+  vt::Backend& b_;
+  Queue& q_;
+  size_t n_;
+  void* ptr_ = nullptr;
+};
+
+// Byte-addressed device buffer for i8 masks (has_initial_state) and u16 bf16
+// cache contents (sized in ELEMENTS of the templated width).
+class DevBufBytes {
+ public:
+  DevBufBytes(vt::Backend& b, Queue& q, size_t nbytes) : b_(b), q_(q), n_(nbytes) {
+    ptr_ = b_.Alloc(nbytes);
+  }
+  ~DevBufBytes() { b_.Free(ptr_); }
+  DevBufBytes(const DevBufBytes&) = delete;
+  DevBufBytes& operator=(const DevBufBytes&) = delete;
+  void Upload(const void* src) { b_.Copy(q_, ptr_, src, n_); }
+  void Download(void* dst) {
+    b_.Synchronize(q_);
+    b_.Copy(q_, dst, ptr_, n_);
+    b_.Synchronize(q_);
+  }
+  void* ptr() const { return ptr_; }
+
+ private:
+  vt::Backend& b_;
+  Queue& q_;
+  size_t n_;
+  void* ptr_ = nullptr;
+};
+
+// f32 -> bf16 bits through the CPU backend's own cast op, so the test never
+// reimplements the codec it is comparing against.
+std::vector<uint16_t> Bf16Bits(const std::vector<float>& src) {
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> in = src;
+  std::vector<uint16_t> out(src.size(), 0);
+  Tensor tin = T1(in.data(), cd, static_cast<int64_t>(in.size()));
+  Tensor tout = Tensor::Contiguous(out.data(), DType::kBF16, cd,
+                                   {static_cast<int64_t>(out.size())});
+  vt::CastBf16(cq, tout, tin);
+  cpu.DestroyQueue(cq);
+  return out;
+}
+
+
+// --- GDN cases (BACKEND-ROCM-GDN-KERNELS) -------------------------------------
+
+TEST_CASE("GDN state gather/scatter are BIT-EXACT against the CPU oracle") {
+  // Indexed data movement between an f32 working set and a persistent cache:
+  // no arithmetic anywhere, so the bar is byte equality — including the bf16
+  // cache arm, where both sides apply the same RNE round at the boundary.
+  // Covers the uniform layout (cache_inner == work_inner), the spec-widened
+  // layout (leading work_inner cols per channel at the physical stride), the
+  // has_initial_state mask in i8/i32/absent forms, and scatter's untouched-row
+  // preservation.
+  const int64_t S = 8, R = 4, mid = 4, w_in = 6, c_in = 8;  // c_in>w_in: widened
+  for (bool widened : {false, true}) {
+    const int64_t cache_inner = widened ? c_in : w_in;
+    CAPTURE(widened);
+    const size_t cache_n = static_cast<size_t>(S * mid * cache_inner);
+    const size_t work_n = static_cast<size_t>(R * mid * w_in);
+    const std::vector<float> cache_f = RandomVec(cache_n, 910);
+    const std::vector<uint16_t> cache_bf = Bf16Bits(cache_f);
+    const std::vector<int32_t> idx = {1, 0, 7, 6};  // unique slots
+    const std::vector<int32_t> has32 = {1, 0, 1, 0};
+    const std::vector<int8_t> has8 = {1, 0, 1, 0};
+
+    for (int arm = 0; arm < 2; ++arm) {  // 0 = f32 cache, 1 = bf16 cache
+      CAPTURE(arm);
+      for (int has = 0; has < 3; ++has) {  // 0 = absent, 1 = i8, 2 = i32
+        CAPTURE(has);
+        // ---- CPU oracle: gather, then scatter the gathered rows back.
+        std::vector<float> ref_work(work_n, -1.0f);
+        std::vector<float> ref_cache_f = cache_f;
+        std::vector<uint16_t> ref_cache_bf = cache_bf;
+        std::vector<int32_t> ci = idx, ch32 = has32;
+        std::vector<int8_t> ch8 = has8;
+        {
+          vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+          Queue cq = cpu.CreateQueue();
+          const Device cd{DeviceType::kCPU, 0};
+          Tensor tidx = TI32(ci.data(), cd, R);
+          Tensor th8 = Tensor::Contiguous(ch8.data(), DType::kI8, cd, {R});
+          Tensor th32 = TI32(ch32.data(), cd, R);
+          Tensor tw = Tensor::Contiguous(ref_work.data(), DType::kF32, cd, {R, mid, w_in});
+          const Tensor* ph = has == 1 ? static_cast<const Tensor*>(&th8)
+                             : has == 2 ? static_cast<const Tensor*>(&th32)
+                                        : nullptr;
+          if (arm == 0) {
+            Tensor tc = Tensor::Contiguous(ref_cache_f.data(), DType::kF32, cd,
+                                           {S, mid, cache_inner});
+            vt::GdnStateGather(cq, tw, tc, tidx, ph);
+            vt::GdnStateScatter(cq, tc, tw, tidx);
+          } else {
+            Tensor tc = Tensor::Contiguous(ref_cache_bf.data(), DType::kBF16, cd,
+                                           {S, mid, cache_inner});
+            vt::GdnStateGather(cq, tw, tc, tidx, ph);
+            vt::GdnStateScatter(cq, tc, tw, tidx);
+          }
+          cpu.DestroyQueue(cq);
+        }
+
+        for (DeviceType dt : RegisteredDevices()) {
+          if (!OpAvailable(vt::OpId::kGdnStateGather, dt) ||
+              !OpAvailable(vt::OpId::kGdnStateScatter, dt))
+            continue;
+          CAPTURE(DeviceName(dt));
+          vt::Backend& dev = vt::GetBackend(dt);
+          Queue q = dev.CreateQueue();
+          const Device d{dt, 0};
+          DevBuf dwork(dev, q, work_n);
+          DevBufI32 didx(dev, q, R), dhas32(dev, q, R);
+          DevBufBytes dhas8(dev, q, R);
+          didx.Upload(idx);
+          dhas32.Upload(has32);
+          dhas8.Upload(has8.data());
+          Tensor tidx = TI32(didx.ptr(), d, R);
+          Tensor th8 = Tensor::Contiguous(dhas8.ptr(), DType::kI8, d, {R});
+          Tensor th32 = TI32(dhas32.ptr(), d, R);
+          Tensor tw = Tensor::Contiguous(dwork.ptr(), DType::kF32, d, {R, mid, w_in});
+          const Tensor* ph = has == 1 ? &th8 : has == 2 ? &th32 : nullptr;
+
+          const size_t cache_bytes = cache_n * (arm == 0 ? 4 : 2);
+          DevBufBytes dcache(dev, q, cache_bytes);
+          dcache.Upload(arm == 0 ? static_cast<const void*>(cache_f.data())
+                                 : static_cast<const void*>(cache_bf.data()));
+          Tensor tc = Tensor::Contiguous(dcache.ptr(),
+                                         arm == 0 ? DType::kF32 : DType::kBF16, d,
+                                         {S, mid, cache_inner});
+          vt::GdnStateGather(q, tw, tc, tidx, ph);
+          CHECK(dwork.Download() == ref_work);  // gather: bit-exact
+          vt::GdnStateScatter(q, tc, tw, tidx);
+          if (arm == 0) {
+            std::vector<float> got(cache_n);
+            dcache.Download(got.data());
+            CHECK(got == ref_cache_f);  // scatter round-trip: bit-exact
+          } else {
+            std::vector<uint16_t> got(cache_n);
+            dcache.Download(got.data());
+            CHECK(got == ref_cache_bf);
+          }
+          dev.DestroyQueue(q);
+        }
+      }
+    }
+  }
+}
+
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;

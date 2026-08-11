@@ -37,6 +37,16 @@ never use, and its teardown can deadlock at process exit — every test passes,
 ([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
+### ROCm op coverage is incremental (and throws are by design)
+
+The ROCm backend registers native ops family by family
+([#41](https://github.com/mudler/vllm.cpp/issues/41)); the GDN indexed state I/O
+pair (`kGdnStateGather`/`kGdnStateScatter`) is the first GDN slice. On a
+discrete card there is no CPU fallback tier, so a model whose layers call an op
+that is not registered yet fails loudly with `vt: no kernel for op N on device
+type 5` — that is the memory-safety design working, not a crash. Run with
+`VT_OP_PROVIDER_STATS=1` to see which ops resolve native.
+
 ### CUTLASS is fetched as headers only
 
 `-DVLLM_CPP_CUTLASS_FETCH=ON` downloads CUTLASS v4.5.0 and stops there: the
