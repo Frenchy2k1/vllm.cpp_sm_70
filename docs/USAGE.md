@@ -44,8 +44,14 @@ The ROCm backend registers native ops family by family
 the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal
 conv1d pair (`kCausalConv1dFwd`/`kCausalConv1dUpdate`, incl. the exact-chunks
 descriptor form Qwen3.5 prefill passes), the fused post-conv glue
-(`kGdnPostConv`), and the gated-delta recurrence (`kGdnPrefill`/`kGdnDecode`,
-portable scan). On a
+(`kGdnPostConv`), the gated-delta recurrence (`kGdnPrefill`/`kGdnDecode`,
+portable scan), and the norm-gate/preamble ops (`kRmsNormGated`,
+`kSigmoidGateBf16`, `kAttnQkNormRopeGate`) — the full set Qwen3.5-class
+GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
+`mamba_cache_dtype` default) is advertised via the
+`SupportsCompressedConvState`/`SupportsCompressedGdnState` backend probes.
+Known limit on a separate path: the ROCm `MoeRouterTopK` kernel takes f32
+logits only, so MoE-bearing models still throw there. On a
 discrete card there is no CPU fallback tier, so a model whose layers call an op
 that is not registered yet fails loudly with `vt: no kernel for op N on device
 type 5` — that is the memory-safety design working, not a crash. Run with
