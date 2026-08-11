@@ -8,7 +8,7 @@ characters.
 
 ## Live claims
 
-Work: exact chunks; opt-in sm_120 post-conv and K4 conv measured.
+Work: 6 external PRs landed; sm_120 post-conv + K4 opt-in.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
@@ -21,7 +21,7 @@ Work: exact chunks; opt-in sm_120 post-conv and K4 conv measured.
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **2 LEVERS LANDED**: gate_up +1.31%, down bf16 +2.05% (bit-exact) | `SILU-VECTORIZE`: 9.2x/launch = 3.6pts |
-| Qwen3.5-4B sm_120 | Exact; tput **1.0283x** (acceptance `PENDING`). Slower: TTFT/TPOT/E2E **1.0853/1.0165/1.0288x**; VRAM +118.7 MiB | Profile first wave |
+| Qwen3.5-4B sm_120 | tput **1.0283x** `PENDING`; TTFT/TPOT/E2E 1.085/1.017/1.029x slow | Profile first wave |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED** | TERMINAL: at parity |
 | SERVE-ASYNC-DENSE-MIRROR | **LANDED+VERIFIED** (`f9c969ae`): async mirror, dense Qwen3; SACRED 184/184 | Sibling scope one-liner |
@@ -56,12 +56,11 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
    transducer half is NOT in vLLM: separate call).
-3. **Qwen3.5-4B #206:** exact, tput +2.83%; latency/VRAM open. Profile first
-   wave; argmax/writeback closed.
-2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
-   CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
-4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
-5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
+3. **Qwen3.5-4B #206:** tput +2.83% `PENDING`; latency/VRAM open
+4. **Invocation-parity prevention:** CI guard + checklist; build-verify
+   `kGemvHeuristicAlgos` on dgx.
+5. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
+6. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
    `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to
    `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
