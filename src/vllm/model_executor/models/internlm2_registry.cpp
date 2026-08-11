@@ -22,6 +22,7 @@
 
 #include "vllm/model_executor/models/internlm2.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
@@ -82,6 +83,14 @@ void PrepareInternLM2ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardInternLM2ForCausalLM(LoadedModel& model,
                                           const ModelForwardInput& input) {
+  // ROW-SERVE-ASYNC-DENSE-MIRROR (sibling scope): same guard qwen3_dense.cpp
+  // establishes. This family routes through the SAME shared EmbedInto (decode
+  // graph + eager Forward/ForwardDevice), so without it the async runner's
+  // device-resident ids are ignored and the stale host `token_ids` races the
+  // combine's device write — the #31 batch-1 token-0 degeneration. Null on every
+  // non-async-CUDA path, RAII-scoped, byte-identical when the mirror is off.
+  const detail::DeviceTokenIdsScope device_ids_scope(
+      input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
   auto& im2 = static_cast<InternLM2LoadedModel&>(model);
   const InternLM2Weights& weights = im2.weights();
   // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_

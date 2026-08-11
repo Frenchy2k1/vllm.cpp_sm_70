@@ -85,7 +85,11 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 |---|---:|---:|---:|---:|
 | **vllm.cpp** tok/s (canonical 2026-08-10) | 9.4201 | 17.2474 | 29.5132 | 46.7061 |
 | vLLM 0.25.0 tok/s (canonical) | 11.3646 | 20.3858 | 34.6041 | 54.0616 |
-| **Ratio (canonical, BINDING)** | **0.8289x** | **0.8461x** | **0.8529x** | **0.8639x** |
+| **Ratio POST-LEVER (BINDING, main @`348c265d`)** | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| ours tok/s post-lever | 9.366 | 19.529 | 32.870 | 51.753 |
+| Ratio pre-lever (same recipe, superseded) | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| Levers landed | packed NVFP4 `lm_head` + merged GDN fp8 qkvz. Both ACTIVE by kernel signature: `cutlass_80_tensorop` ABSENT, split `nvjet_64x128x128` replaced by merged `192x48x128` | | |
+| OPEN: c1 did not move | c2-c8 gained ~10 points, c1 only +0.010 though both levers execute there. The pre-lever attribution sized them AT c1, so it mis-assigned c1 | | |
 | TPOT / TTFT ratio (canonical) | 1.2245 / 1.0077 | 1.1902 / 1.1111 | 1.2313 / 0.9722 | 1.2250 / 0.9992 |
 | Prior ad-hoc ratio (superseded, consistent) | 0.847x | 0.861x | 0.853x | 0.843x |
 | Before the FP8 tower fix | 8.76 | 17.07 | 33.01 | 62.13 |
@@ -133,15 +137,19 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 **There is no isolated c2/c8 weakness.** Binding grid at `a0fa12c7`
 (2026-08-10), 3 reps, binding-eligible 12/12; the prior c2 0.87x / c8 0.92x
-"weak cells" came from a different harness and were never comparable. The deficit
-is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on both
-engines) and is entirely MARGINAL per-token work, since our FIXED per-step cost
-already beats vLLM (9.02 ms against 9.43 ms).
+"weak cells" came from a different harness and were never comparable. The
+deficit is a flat mid-band (c2 to c16 within 0.935x-0.949x, CoV under 0.81% on
+both engines) and is entirely MARGINAL per-token work, since our FIXED per-step
+cost already beats vLLM (9.02 ms against 9.43 ms). Two glue levers land against
+it, both default ON: the fused shared-expert gate_up sink off the MoE-marlin
+route (**+1.31% c8 / +1.38% c4**, `VT_MARLIN_DENSE_PAIR`) and the shared
+`down_proj` emitted as bf16 rather than f32 (**+2.05% c8 / +0.79% c4**,
+bit-identical, `VT_SHARED_DOWN_BF16`).
 
-Two glue levers land against it, both default ON: routing the fused
-shared-expert gate_up sink off the MoE-marlin route (**+1.31% c8 / +1.38% c4**,
-`VT_MARLIN_DENSE_PAIR`) and emitting the shared `down_proj` as bf16 rather than
-f32 (**+2.05% c8 / +0.79% c4**, bit-identical, `VT_SHARED_DOWN_BF16`). The
+The SiLU lever is NEGATIVE ([spec](../.agents/specs/moe-silu-vectorize.md)):
+the 9.2x per-launch gap that motivated it was a MEAN over a bimodal kernel
+(min 1.34 us, max 979 us) and our decode-phase SiLU is already faster than
+vLLM's, so the remaining band is unattributed. The
 marlin block-size lever is REFUTED (block 8 at c8 is 1.16% SLOWER against a
 +0.29% control), and a per-launch marlin gap is WITHDRAWN as cross-tool
 uncertainty. Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**.
@@ -429,7 +437,7 @@ built on it rather than keeping the flattering one.
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | Embeddings on the ONE surface (ROW 6, `LlamaModel` + `vllm_embed` + `/v1/embeddings`) | **NO number measured, claimed or owed.** Correctness-gated only, CPU: the 2026-08-08 fold (engine path == direct registry path, f64 LAST+normalize reference on the committed fixture) is plumbing, no speed claim | A REAL embedding checkpoint (e5-mistral class) + a same-box `vllm.LLM(task="embed")` oracle; only then does an embed-throughput bar exist |
 | Parakeet/FastConformer ASR (P1-P4 + ONE-SURFACE fold ROW 1) | **NO number measured, claimed or owed.** Correctness-gated only, CPU f32; the 2026-08-07 surface fold (`vllm_transcribe`, `/v1/audio/transcriptions`) is transcript-byte-identical plumbing, no speed claim. | Floor is `parakeet.cpp`, same clip and box; needs a CUDA provider and a pretrained checkpoint |
-| cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
+| cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
 | Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Full-library LINK at `sm_75` + `cuobjdump` SASS, then a build-supported row. The fp16 `fattn` port is speed-only now; its floor when a card exists is llama.cpp on that card |
 

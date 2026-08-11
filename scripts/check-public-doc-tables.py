@@ -501,7 +501,21 @@ STATUS_RATCHET = {
     # and "the async production-serving path wiring" leaves the remaining-work
     # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
     # each rebase); re-pinned byte-tight to the merged measurement.
-    "chars": 243486,
+    #
+    # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
+    # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
+    # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    # 243431 since 2026-08-11 (measured 243431): the #213 post-lever binding
+    # numbers replace the pre-lever narrative in the 27B cell. Strictly DOWN
+    # from 243451.
+    #
+    # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
+    # superseded allowlist clause into the binding result. Strictly DOWN.
+    #
+    # 243389 since 2026-08-10 (measured, #223): the Sampling row gains prompt
+    # logprobs computed on the runner; paid for by collapsing the beam-search
+    # restatements that row carried. Strictly DOWN.
+    "chars": 243389,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
