@@ -292,6 +292,12 @@ touched, so the cubin is not linked and none of these tests observe it.
 - Box load is ~87 at claim time; if the full `ctest` cannot run clean, exactly
   what was and was not run is reported rather than implied.
 
+Public documents owed: `docs/FEATURES.md` only. `check-doc-checkpoint`
+classifies any edit under `src/vllm/model_executor/models/` as a
+`feature_surface` change, so the fp8-weights row records the new toggle. No
+lifecycle state moves, so `STATUS`/`BENCHMARKS`/`NOW` are not owed — and no
+measurement exists to put in `BENCHMARKS` anyway.
+
 ## 9. Evidence
 
 Recorded in the commit body and the row report: base SHA, spec SHA,

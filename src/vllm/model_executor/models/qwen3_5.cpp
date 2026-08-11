@@ -76,6 +76,32 @@ bool detail::ShouldUsePackedGdnDecode(
          e.num_actual_tokens == e.num_decode_tokens;
 }
 
+// PERF-27B-GDN-PACKED-REACHABLE (#365). Mirrors ProjectGdnQkvz's branch order:
+// the merged BF16 owner wins, then the native-FP8 owner, then the split BF16
+// owner. Order matters — a checkpoint that carries both owners projects through
+// the BF16 one, so predicting the FP8 dtype there would be wrong.
+vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
+  if (in.has_bf16_qkvz_owner) return in.in_dtype;
+  if (in.has_fp8_qkv_owner) return in.fp8_out_dtype;
+  return in.in_dtype;
+}
+
+// The dtype rule vt::GdnPackedDecode actually imposes (ops.cpp gdn_packed_decode
+// dtype checks), plus the model leg's BF16 pin. No term keys on weight storage.
+bool detail::GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& d) {
+  // Uniformity over the four activation tensors, pinned to BF16.
+  if (d.mixed_qkv != vt::DType::kBF16) return false;
+  if (d.ba_out != d.mixed_qkv || d.core_out != d.mixed_qkv) return false;
+  // The recurrent state is independent: any of the dtypes the caches can hold.
+  return d.ssm_state == vt::DType::kF32 || d.ssm_state == vt::DType::kF16 ||
+         d.ssm_state == vt::DType::kBF16;
+}
+
+// Default OFF: ON only for a '1'-leading value (vt::cuda::GdnPackedRegTileFlagIsOn).
+bool detail::PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
@@ -3112,6 +3138,25 @@ bool PackedGdnDecodeRuntimeEnabled() {
   return enabled;
 }
 
+// PERF-27B-GDN-PACKED-REACHABLE (#365), DEFAULT OFF. Process-cached like every
+// sibling GDN toggle: a process is one arm, never a per-request mixture.
+bool PackedGdnDecodeFp8TowerEnabled() {
+  static const bool enabled = detail::PackedGdnDecodeFp8TowerFlagIsOn(
+      std::getenv("VT_GDN_PACKED_DECODE_FP8_TOWER"));
+  return enabled;
+}
+
+// PERF-27B-GDN-PACKED-REACHABLE (#365) — the SINGLE source for the dtype the
+// native-FP8 GDN input projection writes for `mixed_qkv`. `ProjectGdnQkvz` reads
+// it instead of hardcoding a literal, and the packed-decode eligibility reads it
+// to predict `mixed.dtype` before the projection has run, so the two cannot
+// drift. Today the fp8 cutlass epilogue always emits F32 (the merged arm's
+// `MergedFp8QkvzD` allocates F32 as well, VT_CHECKed at its call site). Making
+// it BF16 is PERF-27B-BF16-FP8-OUT / #339 (VT_BF16_GEMM_OUT_FP8); when that
+// lands, THIS function is the one line the two rows compose through, and the
+// packed path becomes eligible on the fp8 27B with no further change here.
+DType GdnFp8MixedQkvDType() { return DType::kF32; }
+
 DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
                   DType out_dtype) {
   VT_CHECK(x.rank == 2 && weight.rank == 2,
@@ -3383,6 +3428,13 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
           GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim))) {
     if (g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
       g_gdn_fp8_inproj_merged.fetch_add(1, std::memory_order_relaxed);
+    // MergedFp8QkvzD's output buffer is F32 by construction, so it must agree
+    // with the single source the packed-decode eligibility predicts from
+    // (#365). A future bf16 fp8 epilogue has to change BOTH or the prediction
+    // silently lies and vt::GdnPackedDecode throws on a dtype mismatch.
+    VT_CHECK(GdnFp8MixedQkvDType() == DType::kF32,
+             "qwen3_5 merged FP8 GDN qkvz: the merged arm emits F32; "
+             "GdnFp8MixedQkvDType must agree");
     out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w));
     Tensor packed = out.packed_owner->t();
     out.mixed = packed.Slice(1, 0, conv_dim);
@@ -3402,11 +3454,15 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   if (!w.in_proj_qkv_fp8.Empty() &&
       g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
     g_gdn_fp8_inproj_split.fetch_add(2, std::memory_order_relaxed);
+  // The fp8 arm's output dtype comes from GdnFp8MixedQkvDType(), not a literal:
+  // the packed-decode eligibility predicts `mixed.dtype` from that same helper
+  // before this runs (#365), and a literal here is exactly how the two drift.
+  const DType fp8_mixed_dt = GdnFp8MixedQkvDType();
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
-                                               DType::kF32)
-                   : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
+                                               fp8_mixed_dt)
+                   : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, fp8_mixed_dt))
       : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
                              : MatmulF32D(d, h, w.in_proj_qkv));
   out.z_owner.emplace(
@@ -4080,6 +4136,16 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  // PERF-27B-GDN-PACKED-REACHABLE (#365). `dtype_compatible` is decided by the
+  // ACTIVATION dtypes vt::GdnPackedDecode requires, not by how the GDN weights
+  // are stored. `mixed_qkv` has to be PREDICTED because this decision runs
+  // before ProjectGdnQkvz (it feeds ProjectGdnBA's output dtype below).
+  const bool gdn_fp8_tower =
+      !w.in_proj_qkv_fp8.Empty() || !w.in_proj_z_fp8.Empty();
+  const DType mixed_dt = detail::GdnProjectedMixedQkvDType(
+      detail::GdnMixedQkvDTypeInputs{!w.in_proj_qkvz.Empty(),
+                                     !w.in_proj_qkv_fp8.Empty(), indt,
+                                     GdnFp8MixedQkvDType()});
   const bool packed_decode = detail::ShouldUsePackedGdnDecode(
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
@@ -4087,16 +4153,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
           cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
-          indt == DType::kBF16 && outdt == DType::kBF16 &&
-              MergedGdnBaOutputDType(true) == DType::kBF16 &&
-              // An FP8 GDN tower feeds fp8 projections that vt::GdnPackedDecode
-              // rejects ("mixed_qkv/a/b/out must share FP16/BF16/F32 dtype").
-              // The unpacked decode -- what the 35B fp8 path already runs --
-              // handles them, so an fp8 tower is NOT packed-decode eligible.
-              w.in_proj_qkv_fp8.Empty() && w.in_proj_z_fp8.Empty() &&
-              (state.ssm_state.dtype == DType::kF32 ||
-               state.ssm_state.dtype == DType::kF16 ||
-               state.ssm_state.dtype == DType::kBF16),
+          detail::GdnPackedDecodeDTypesCompatible(
+              detail::GdnPackedDecodeDTypes{mixed_dt,
+                                            MergedGdnBaOutputDType(true), outdt,
+                                            state.ssm_state.dtype}) &&
+              // VT_GDN_PACKED_DECODE_FP8_TOWER, DEFAULT OFF: the same-binary
+              // rollback of the relaxation. OFF reproduces the legacy blanket
+              // exclusion of an fp8 GDN tower exactly; ON lets the dtype rule
+              // above decide alone. Never deselects a non-fp8 checkpoint.
+              (!gdn_fp8_tower || PackedGdnDecodeFp8TowerEnabled()),
           sdi.has_gdn_idx,
           np,
           np_tok,
