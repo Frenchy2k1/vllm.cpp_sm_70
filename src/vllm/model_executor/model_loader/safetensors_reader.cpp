@@ -265,11 +265,12 @@ std::map<std::string, std::string> LoadSafetensorsIndex(
     // index, never paths. Reject separators and parent references so a
     // hostile index cannot traverse outside the model directory.
     if (shard.find('/') != std::string::npos ||
+        shard.find('\\') != std::string::npos ||
         shard.find("..") != std::string::npos)
       Fail(index_json_path, "weight_map value \"" + shard + "\" for \"" +
                                 tensor +
-                                "\" must be a plain filename (no '/' or "
-                                "\"..\")");
+                                "\" must be a plain filename (no '/', '\\', "
+                                "or \"..\")");
     weight_map.emplace(tensor, std::move(shard));
   }
   return weight_map;
