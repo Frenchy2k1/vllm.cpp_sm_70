@@ -109,18 +109,23 @@ bool IsMuseGlimmerGguf(const GgufFile& gguf);
 //
 // `scale_query_by` is recovered from `blk.0.attn_q_norm.weight` (transform 2
 // above) and published as an explicit `text_config.scale_query_by`, which wins
-// outright in `ResolveMuseGlimmerQueryPreScale`.
+// outright in `ResolveMuseGlimmerQueryPreScale`. A file that instead carries
+// llama.cpp's `%s.attention.scale` (LLM_KV_ATTENTION_SCALE, `llama-arch.cpp:240`)
+// takes precedence over the folded tensor: that key is the factor replacing
+// `head_dim ** -0.5` in the softmax, so `scale_query_by = scale * sqrt(head_dim)`.
 //
-// NAMED RESIDUAL — `post_norm_eps`. The GGUF carries ONE epsilon
-// (`muse-glimmer.attention.layer_norm_rms_epsilon`, 1e-5 on the released file)
-// and no key for the post-norm epsilon, which the safetensors config ships
-// separately as 1e-8. `ParseMuseGlimmerParams` therefore falls back to
-// `rms_norm_eps` for the post-norms. The two differ only inside
-// `1/sqrt(mean_square + eps)`; with a mean square of order 1 that is a ~5e-6
-// relative change, roughly two orders of magnitude below bf16's ~4e-3 spacing,
-// so it is not representable in the activation dtype. Recorded rather than
-// hidden: it is a real difference from the safetensors arm, just not an
-// observable one.
+// RESIDUAL CLOSED (#412) — `post_norm_eps`. The released GGUF carries ONE epsilon
+// (`muse-glimmer.attention.layer_norm_rms_epsilon`, 1e-5) and no post-norm key,
+// and this arm used to let the post-norms fall back to it — running them at 1e-5
+// where the architecture says 1e-8, a factor of 1000. The old justification
+// ("~5e-6 relative inside 1/sqrt(ms + eps), two orders below bf16's spacing")
+// assumed a post-norm input mean square of order 1, which was never measured and
+// which these norms, taking a SUBLAYER OUTPUT, need not have. It is now read from
+// `muse-glimmer.attention.post_norm_rms_epsilon` when a converter emits it, and
+// otherwise left to the architecture's own 1e-8 — the same value the safetensors
+// arm gets. `attention.sliding_window`, `logit_scale` and
+// `final_logit_softcapping` follow the same rule: emitted only when the file
+// carries them, so exactly ONE place decides a default.
 //
 // Throws std::runtime_error naming the key on a missing required kv or a
 // non-`muse-glimmer` architecture.
