@@ -425,14 +425,14 @@ HfConfig MuseGlimmerHfConfigFromGguf(const GgufFile& gguf) {
   c.intermediate_size = OptInt(gguf, p + "feed_forward_length", 0);
   c.max_position_embeddings = OptInt(gguf, p + "context_length", 0);
   c.rope_theta = OptDouble(gguf, p + "rope.freq_base", 500000.0);
-  c.rms_norm_eps = OptDouble(gguf, p + "attention.layer_norm_rms_epsilon", 1e-6);
+  c.rms_norm_eps = OptDouble(gguf, p + "attention.layer_norm_rms_epsilon",
+                             static_cast<double>(kMuseGlimmerDefaultRmsNormEps));
   c.torch_dtype = "bfloat16";
   // vocab_size: prefer the kv, else read token_embd's leading (out) dim.
   c.vocab_size = OptInt(gguf, p + "vocab_size", 0);
   if (c.vocab_size == 0) c.vocab_size = gguf.Get("token_embd.weight").shape[0];
 
   const int64_t L = c.num_hidden_layers;
-  const int64_t sliding_window = OptInt(gguf, p + "attention.sliding_window", 0);
 
   // Transform 3: `attention.sliding_window_pattern` IS the iRoPE mask.
   // true  => RoPE AND sliding window   => no_rope_layers[i] = 1
@@ -454,11 +454,30 @@ HfConfig MuseGlimmerHfConfigFromGguf(const GgufFile& gguf) {
     no_rope = DefaultMuseGlimmerNoRopeLayers(L);
   }
 
-  // Transform 2: the query pre-scale lives in the folded attn_q_norm, not in a
-  // metadata key. A file without those tensors has no QK-norm at all.
+  // Transform 2: in the RELEASED file the query pre-scale lives in the folded
+  // attn_q_norm and in no metadata key. But llama.cpp does have a key for the
+  // attention scale — `%s.attention.scale`, LLM_KV_ATTENTION_SCALE
+  // (llama.cpp `src/llama-arch.cpp:240`, `gguf-py/gguf/constants.py:181`) — and it
+  // means the factor that REPLACES `head_dim ** -0.5` in the softmax. We keep that
+  // factor and carry the whole difference in the query pre-scale, so the two are
+  // related by `scale_query_by = attention.scale * sqrt(head_dim)`.
+  //
+  // A converter that emits it WINS over the folded tensor, mirroring
+  // `ResolveMuseGlimmerQueryPreScale`'s rule that an explicit value beats a
+  // derived one — otherwise the file would say one thing and the model do
+  // another, and a converter that writes the key while leaving attn_q_norm at
+  // ones (the natural pairing) would silently lose the scale entirely.
   const bool has_qk_norm = HasTensor(gguf, Blk(0, "attn_q_norm.weight"));
-  const double scale_query_by =
-      has_qk_norm ? MuseGlimmerGgufQueryPreScale(gguf, L, c.head_dim) : 1.0;
+  const GgufValue* attn_scale_kv = gguf.FindKv(p + "attention.scale");
+  double scale_query_by = 1.0;
+  if (attn_scale_kv != nullptr) {
+    VT_CHECK(c.head_dim > 0,
+             "muse_glimmer gguf: attention.scale needs a positive head_dim");
+    scale_query_by = OptDouble(gguf, p + "attention.scale", 1.0) *
+                     std::sqrt(static_cast<double>(c.head_dim));
+  } else if (has_qk_norm) {
+    scale_query_by = MuseGlimmerGgufQueryPreScale(gguf, L, c.head_dim);
+  }
 
   // The head is TIED exactly when the file omits `output.weight`, which is
   // llama.cpp's TENSOR_DUPLICATED convention. The released 30B ships one, so it
@@ -475,20 +494,34 @@ HfConfig MuseGlimmerHfConfigFromGguf(const GgufFile& gguf) {
   text["num_key_value_heads"] = c.num_key_value_heads;
   text["head_dim"] = c.head_dim;
   text["max_position_embeddings"] = c.max_position_embeddings;
-  text["sliding_window"] = sliding_window;
   text["tie_word_embeddings"] = tied;
   text["rms_norm_eps"] = c.rms_norm_eps;
-  // NAMED RESIDUAL: the GGUF carries no post-norm epsilon, so the post-norms
-  // fall back to `rms_norm_eps` (1e-5 vs the safetensors config's 1e-8). See the
-  // header — the difference is ~5e-6 relative inside 1/sqrt(ms + eps), two
-  // orders of magnitude below bf16's spacing, so it is not representable in the
-  // activation dtype. Recorded, not hidden.
+  // RESIDUAL CLOSED (#412). `post_norm_eps` is an ARCHITECTURE CONSTANT, 1e-8 in
+  // the released safetensors config and in both references' class defaults — not
+  // a per-checkpoint knob a converter is entitled to redefine by omission. The
+  // released 17 GB k-quant's 32 KV pairs carry no post-norm epsilon, so this arm
+  // used to fall back to `rms_norm_eps` and run BOTH sandwich post-norms at 1e-5,
+  // a thousand times too loose. It now emits the key only when the file has one
+  // and otherwise leaves it to the parser's architecture default.
+  //
+  // The keys below follow the same rule throughout: WRITE WHAT THE FILE SAYS,
+  // and stay silent where it says nothing so exactly one place decides the
+  // default. Setting them here unconditionally is what made a converter omission
+  // indistinguishable from a converter decision.
+  if (const GgufValue* v = gguf.FindKv(p + "attention.post_norm_rms_epsilon");
+      v != nullptr)
+    text["post_norm_eps"] = OptDouble(gguf, p + "attention.post_norm_rms_epsilon",
+                                      kMuseGlimmerDefaultPostNormEps);
   text["hidden_activation"] = "silu";
   text["rope_parameters"] = nlohmann::json{{"rope_theta", c.rope_theta}};
   text["no_rope_layers"] = no_rope;
-  text["output_multiplier"] = OptDouble(gguf, p + "logit_scale", 1.0);
-  text["final_logit_softcapping"] =
-      OptDouble(gguf, p + "final_logit_softcapping", 0.0);
+  if (gguf.FindKv(p + "attention.sliding_window") != nullptr)
+    text["sliding_window"] = OptInt(gguf, p + "attention.sliding_window", 0);
+  if (gguf.FindKv(p + "logit_scale") != nullptr)
+    text["output_multiplier"] = OptDouble(gguf, p + "logit_scale", 1.0);
+  if (gguf.FindKv(p + "final_logit_softcapping") != nullptr)
+    text["final_logit_softcapping"] =
+        OptDouble(gguf, p + "final_logit_softcapping", 0.0);
   text["use_qk_norm"] = has_qk_norm;
   // The attention output gate is present exactly when the file ships attn_gate.
   text["use_attn_output_gate"] = HasTensor(gguf, Blk(0, "attn_gate.weight"));
