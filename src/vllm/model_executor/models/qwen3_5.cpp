@@ -5990,8 +5990,10 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // PERF-27B-DENSE-MARLIN-GATEUP (issue #365) — the W4A16 sibling of the CUTLASS
   // W4A4 merged branch above. The 27B gate checkpoint (modelopt_mixed) is W4A16,
   // so `MergedGateUpEligible` is false for it and the split gate+up Marlin GEMMs
-  // below are what run; vLLM runs ONE merged gate_up_proj. VT_DENSE_MARLIN_GATEUP
-  // (default OFF this row) substitutes the ALREADY-EXISTING fused Marlin pair —
+  // below are the FALLBACK; vLLM runs ONE merged gate_up_proj.
+  // VT_DENSE_MARLIN_GATEUP (default ON, opt out with =0 — the same-binary A/B
+  // measured +2.12% at c1 and +1.70% at c8 on the 27B, complete separation at
+  // both, tokens identical) substitutes the ALREADY-EXISTING fused Marlin pair —
   // one GEMM into [T,2I] plus the same silu/mul sink — feeding the identical
   // down projection. `nullopt` = not this configuration; nothing below changes.
   if (std::optional<DBuf> gu_act = DenseGateUpFusedMarlinD(d, dh, w))

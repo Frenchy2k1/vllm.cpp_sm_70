@@ -14,8 +14,9 @@
 //     one operand legal — asserted term by term, including the `scale2` equality
 //     that the merged single global scale depends on (spec §4/§6: the fusion is
 //     unreachable, not silently relaxable, if the two shards disagree);
-//   * the row's toggle and its DEFAULT, which is OFF (spec §3.3) until the
-//     operator's same-binary A/B says otherwise;
+//   * the row's toggle and its DEFAULT, which is now ON — spec §3.3 made the
+//     flip conditional on a same-binary A/B, and that A/B measured a win at
+//     both c1 and c8 with complete separation and identical tokens;
 //   * that a device/build with no Marlin NVFP4 op registered NEVER selects the
 //     fused path, so every non-CUDA backend keeps the split pair byte-for-byte;
 //   * that the fused pair resident is the EXISTING one, keyed on the gate
@@ -132,17 +133,33 @@ TEST_CASE("dense gate_up fusion: the pair precondition is asserted, not assumed"
   }
 }
 
-TEST_CASE("dense gate_up fusion: VT_DENSE_MARLIN_GATEUP defaults OFF") {
-  // Spec §3.3 — the lever ships OFF in this row so the operator can run a
-  // same-binary A/B; the default moves on that measurement, not on an
-  // expectation. UNSET must be OFF, which is what an accidental
-  // `!(e && e[0]=='0')` default-ON spelling would break.
-  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor(nullptr));
-  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor(""));
-  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor("0"));
-  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor("true"));
-  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor("10"));
+TEST_CASE("dense gate_up fusion: VT_DENSE_MARLIN_GATEUP defaults ON, opt out with =0") {
+  // Spec §3.3 asked for the default to move on a measured same-binary A/B, and
+  // it did: interleaved 4-rep A/B on nvidia/Qwen3.6-27B-NVFP4@0893e160 (GB10),
+  // toggle the only variable, gave fused +2.12% at c1 (12.0823 vs 11.8313) and
+  // +1.70% at c8 (83.6186 vs 82.2217) with COMPLETE SEPARATION at both — every
+  // fused rep beat every split rep — and a byte-identical 64-token greedy
+  // continuation on both arms. So the lever now ships ON, per the standing
+  // project rule that a parity enabler's default flips before a binding grid.
+  //
+  // UNSET must be ON, which is what a leftover opt-IN
+  // `e && e[0]=='1' && e[1]=='\0'` spelling would break; only an explicit
+  // leading '0' opts back out to the split pair.
+  CHECK(dn::DenseMarlinGateUpEnabledFor(nullptr));
+  CHECK(dn::DenseMarlinGateUpEnabledFor(""));
   CHECK(dn::DenseMarlinGateUpEnabledFor("1"));
+  CHECK(dn::DenseMarlinGateUpEnabledFor("true"));
+  CHECK(dn::DenseMarlinGateUpEnabledFor("10"));
+  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor("0"));
+
+  // The opt-out convention is the one the NEAREST parity levers use — the
+  // sibling fused-gate_up toggles in the same header, VT_MARLIN_DENSE_PAIR
+  // (MarlinDensePairEnabled) and VT_MOE_FUSED_W13 (FusedGateUpEnabled), both
+  // `!(e != nullptr && e[0] == '0')`. That inspects the FIRST character only,
+  // so a leading '0' opts out whatever follows it. Pinned so the choice is a
+  // decision on record rather than an accident of spelling.
+  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor("00"));
+  CHECK_FALSE(dn::DenseMarlinGateUpEnabledFor("0x"));
 
   // The cached reader is that pure parser applied to the process environment —
   // it must not carry a second, differently-spelled default.
