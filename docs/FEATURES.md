@@ -246,6 +246,8 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Offline batch API | ✅ | ✅ | ◐ | ☐ |
 | Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog; async detach and server teardown wait for the final fold | ✅ | ✅ | ◐ |
+| Container images | ◐ `cuda`/`vulkan`/`cpu` lanes build and gate from one Dockerfile (amd64+arm64, `ENTRYPOINT vllm-server`, ffmpeg included); **nothing published to GHCR yet** | ✅ | ✅ | ✅ |
+| Graceful shutdown on `SIGTERM` | ✅ clean exit in 0.25 s, including as container PID 1 (#312) | ✅ | ✅ | ✅ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |

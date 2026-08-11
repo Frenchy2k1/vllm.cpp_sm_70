@@ -400,6 +400,24 @@ class StatusRatchet(unittest.TestCase):
                     f"dropping '{label}' was not rejected",
                 )
 
+    def test_the_ratchet_is_exactly_one_byte_wide(self) -> None:
+        """A page one byte over fails and one byte under passes.
+
+        The number moved for ENG-RELEASE-CONTAINERS, which owed the page a
+        lifecycle line and paid for it inside the release paragraph. What must
+        keep holding is not the value but the shape: byte-tight, shrink-only.
+        A ratchet that tolerated one spare byte would tolerate a hundred.
+        """
+        limit = doc_tables.STATUS_RATCHET["chars"]
+        under = STATUS_VALID + "x" * (limit - len(STATUS_VALID) - 1)
+        self.assertEqual(len(under), limit - 1)
+        self.assertEqual(
+            [e for e in doc_tables.status_errors(under) if "chars is" in e], []
+        )
+        over = STATUS_VALID + "x" * (limit - len(STATUS_VALID) + 1)
+        self.assertEqual(len(over), limit + 1)
+        self.assertTrue(any("chars is" in e for e in doc_tables.status_errors(over)))
+
     def test_growth_past_the_char_ratchet_is_rejected(self) -> None:
         text = STATUS_VALID + "\n" + "x" * doc_tables.STATUS_RATCHET["chars"]
         errors = doc_tables.status_errors(text)

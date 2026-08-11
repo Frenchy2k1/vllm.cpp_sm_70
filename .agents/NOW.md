@@ -17,13 +17,12 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Laguna NVFP4 / DS-V4 decode | **CLOSED, byte-exact**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **c1 0.838, c2-c8 0.95-0.97** (#213 levers ACTIVE); c1 unmoved | c1 decode window; 35B canonical |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
-| Muse Glimmer (#333) | #347 FIXED: ids == HF 57/57; **forward INCOHERENT (#359)** | Triage it |
+| Muse Glimmer (#333) | #347 FIXED: ids==HF 57/57; **forward BAD (#359)** | Triage it |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **canonical 0.918-0.972x** c1-c32 (@`348c265d`, first c16/c32) | Decode-only window, ONE tool |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; tput 1.021x PASS; latency/VRAM OPEN | Spike 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
-| MXFP4 parity | c1 1.020, c2-c8 0.962-0.969; #82 CLOSED, TERMINAL | — |
 | SERVE-ASYNC-MIRROR | **#323 FIXED** (mitigation): graph declines while the mirror is live; 7/7 async gates | Graph read ids at REPLAY |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
 | `SERVE-METRICS` async (#277) | **`/metrics` was DEAD on the shipped server**: AsyncLLM folded nothing. Now live, ctest 366/366 | Config-gated families |
@@ -32,6 +31,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
+| Containers `#170` | **cpu+vulkan CI green**; #312 fixed | W6: cuda/arm64; unpushed |
 | `SAMPLE-PROMPT-LOGPROBS` (#223) | **LANDED** 21/21 | W2 `echo`; CUDA PENDING |
 | `logprobs_mode` (#238) | **3 stubs -> all 4 work** | `logprob_token_ids` half |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |

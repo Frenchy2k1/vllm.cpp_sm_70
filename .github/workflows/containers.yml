@@ -1,0 +1,281 @@
+name: containers
+
+# Published container images -- ENG-RELEASE-CONTAINERS, issue #170.
+# Design: .agents/specs/container-images.md
+#
+# Authority is separated by stage, exactly as release.yml separates it:
+#
+#   plan      contents: read     resolve version and lanes, validate the tag
+#   verify    contents: read     build + validate every lane x arch. NO registry
+#                                write exists in this job, so a pull request
+#                                cannot publish even if a step tried to.
+#   publish   packages: write    tags only. Builds, validates the image it is
+#                                about to push, THEN pushes by digest. The bytes
+#                                that were validated are the bytes that ship.
+#   manifest  packages: write    join the per-arch digests into :<version>-<lane>
+#   attest    id-token: write    provenance over the manifest digest
+#   promote   packages: write    move :latest-<lane> only after everything is green
+#
+# Pull requests and manual dispatch stop after verify.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY_PACKAGE: ghcr.io/mudler/vllm.cpp
+
+jobs:
+  plan:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      is_release: ${{ steps.plan.outputs.is_release }}
+      verify_matrix: ${{ steps.matrix.outputs.verify }}
+      publish_matrix: ${{ steps.matrix.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve the version and validate it against the tag
+        id: plan
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          test -n "$version"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # The tag is untrusted input until it matches the tree.
+            test "${GITHUB_REF_NAME}" = "v${version}"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Gate the container matrix against the Dockerfile
+        run: python3 scripts/check-container-matrix.py
+      - name: Resolve the lane x architecture build matrices
+        id: matrix
+        run: |
+          set -euo pipefail
+          # A release run builds every lane on both architectures. A pull
+          # request builds the reduced set the matrix opts in, because a ten-SM
+          # fat CUDA image does not fit a hosted runner budget per push. Nothing
+          # is published without the full set: publish rebuilds and revalidates
+          # each lane immediately before pushing it.
+          if [ "${{ steps.plan.outputs.is_release }}" = "true" ]; then
+            echo "verify=$(python3 scripts/container_tags.py --build-matrix --release)" >> "$GITHUB_OUTPUT"
+          else
+            echo "verify=$(python3 scripts/container_tags.py --build-matrix)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "publish=$(python3 scripts/container_tags.py --build-matrix --release)" >> "$GITHUB_OUTPUT"
+      - name: Gate this workflow against its own contract
+        run: python3 scripts/check-container-workflow.py
+
+  verify:
+    needs: plan
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.verify_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the lane image for this architecture
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file docker/Dockerfile \
+            --target "${{ matrix.lane }}" \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "VERSION=${{ needs.plan.outputs.version }}" \
+            --build-arg "SOURCE_SHA=${GITHUB_SHA}" \
+            --build-arg "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" \
+            --build-arg "EVIDENCE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-arg "JOBS=$(nproc)" \
+            --tag "vllm-cpp-verify:${{ matrix.lane }}" \
+            --load \
+            .
+      - name: Validate the built image
+        run: |
+          python3 scripts/validate-container-image.py \
+            --image "vllm-cpp-verify:${{ matrix.lane }}" \
+            --lane "${{ matrix.lane }}" \
+            --version "${{ needs.plan.outputs.version }}" \
+            --expect-revision "${GITHUB_SHA}"
+
+  publish:
+    needs: [plan, verify]
+    if: needs.plan.outputs.is_release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.publish_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing immutable tag
+        run: |
+          set -euo pipefail
+          tag="${REGISTRY_PACKAGE}:${{ needs.plan.outputs.version }}-${{ matrix.lane }}"
+          if docker buildx imagetools inspect "$tag" >/dev/null 2>&1; then
+            echo "::error::${tag} already exists; version tags are immutable" >&2
+            exit 1
+          fi
+      - name: Build the exact image this job will push
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file docker/Dockerfile \
+            --target "${{ matrix.lane }}" \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "VERSION=${{ needs.plan.outputs.version }}" \
+            --build-arg "SOURCE_SHA=${GITHUB_SHA}" \
+            --build-arg "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" \
+            --build-arg "EVIDENCE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-arg "JOBS=$(nproc)" \
+            --tag "vllm-cpp-publish:${{ matrix.lane }}" \
+            --load \
+            .
+      - name: Validate the image immediately before pushing it
+        run: |
+          python3 scripts/validate-container-image.py \
+            --image "vllm-cpp-publish:${{ matrix.lane }}" \
+            --lane "${{ matrix.lane }}" \
+            --version "${{ needs.plan.outputs.version }}" \
+            --expect-revision "${GITHUB_SHA}"
+      - name: Push by digest
+        id: push
+        run: |
+          set -euo pipefail
+          docker tag "vllm-cpp-publish:${{ matrix.lane }}" "${REGISTRY_PACKAGE}:stage"
+          docker push "${REGISTRY_PACKAGE}:stage"
+          # `docker push --quiet` prints the image REFERENCE, not the digest, so
+          # read back what the registry actually stored.
+          digest=$(docker image inspect "${REGISTRY_PACKAGE}:stage" \
+            --format '{{index .RepoDigests 0}}' | sed 's/.*@//')
+          case "$digest" in sha256:*) ;; *) echo "::error::no digest" >&2; exit 1 ;; esac
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: Record the exact digest for the manifest stage
+        run: |
+          mkdir -p digests
+          arch=$(echo "${{ matrix.platform }}" | tr '/' '-')
+          echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.lane }}-${arch}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-digest-${{ matrix.lane }}-${{ strategy.job-index }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    needs: [plan, publish]
+    if: needs.plan.outputs.is_release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    outputs:
+      digests: ${{ steps.create.outputs.digests }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: container-digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Join the per-architecture digests into one manifest per lane
+        id: create
+        run: |
+          set -euo pipefail
+          version="${{ needs.plan.outputs.version }}"
+          for lane in cpu vulkan cuda; do
+            refs=""
+            for file in digests/${lane}-linux-*; do
+              refs="${refs} ${REGISTRY_PACKAGE}@$(cat "$file")"
+            done
+            test -n "${refs}"
+            docker buildx imagetools create \
+              --tag "${REGISTRY_PACKAGE}:${version}-${lane}" ${refs}
+          done
+
+  attest:
+    needs: [plan, manifest]
+    if: needs.plan.outputs.is_release == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the manifest digest for each lane
+        id: resolve
+        run: |
+          set -euo pipefail
+          version="${{ needs.plan.outputs.version }}"
+          for lane in cpu vulkan cuda; do
+            digest=$(docker buildx imagetools inspect \
+              "${REGISTRY_PACKAGE}:${version}-${lane}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            echo "${lane}=${digest}" >> "$GITHUB_OUTPUT"
+          done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY_PACKAGE }}
+          subject-digest: ${{ steps.resolve.outputs.cpu }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY_PACKAGE }}
+          subject-digest: ${{ steps.resolve.outputs.vulkan }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY_PACKAGE }}
+          subject-digest: ${{ steps.resolve.outputs.cuda }}
+          push-to-registry: true
+
+  promote:
+    needs: [plan, attest]
+    if: needs.plan.outputs.is_release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Move the lane pointers, and :latest to the default lane
+        run: |
+          set -euo pipefail
+          python3 scripts/container_tags.py \
+            --version "${{ needs.plan.outputs.version }}" --moving > moving-tags.txt
+          test -s moving-tags.txt
+          while read -r source target; do
+            docker buildx imagetools create --tag "$target" "$source"
+          done < moving-tags.txt
