@@ -52,6 +52,12 @@ void ApplyPenaltiesKernelRocm(Queue& q, Tensor& logits, const Tensor& prompt_mas
 void ApplyMinPKernelRocm(Queue& q, Tensor& logits, const Tensor& min_p);
 void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols,
                               const Tensor& biases);
+// BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
+// pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
+void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
+                              const Tensor& state_idx, const Tensor* has_initial_state);
+void GdnStateScatterKernelRocm(Queue& q, Tensor& cache, const Tensor& working,
+                               const Tensor& state_idx);
 
 namespace {
 
@@ -137,6 +143,12 @@ struct Registrar {
     RegisterOp(OpId::kApplyTokenMask, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
+    RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));
+    RegisterOp(OpId::kGdnStateScatter, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<GdnStateScatterFn>(&GdnStateScatterKernelRocm)));
   }
 } registrar;
 
