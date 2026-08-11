@@ -50,6 +50,11 @@ Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;
 embeddings #137 is landed/partial, not an active claim. No runtime change.
 
+Protocol live position (#374): `DONE` at implementation merge `dbd0d51c`.
+Lifecycle changes still update STATUS and BENCHMARKS, while the moved row spec's
+`## Now` replaces the per-row write to `.agents/NOW.md`. Runtime and performance
+are `VOID`; no product behavior changed.
+
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
 `scripts/check-supported-models.py` (+ mutation test), so the 30
