@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/attention/mla_chunked_context.h"
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight glue
 #include "vllm/model_executor/models/deepseek_v2.h"       // BuildMlaBatchSplit/MlaBatchSplit
 #include "vllm/model_executor/models/device_pool.h"       // Pool()
@@ -165,11 +166,15 @@ mla::MlaBlockWeights ResidentMla(Dev d, const MiniCPM3MlaWeights& w,
 // SiluAndMul -> down MatmulBT.
 DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const Tensor& h, int64_t T,
               int64_t H, int64_t I) {
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H]
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), h, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::SiluAndMul(d.q, act.t(), gate_up.t());
+  // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
+  // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
+  // inline path ran — the seam's Apply IS {ResidentWeight; MatmulBT[2I,H];
+  // SiluAndMul} with M = x.shape[0] == T. MiniCPM3 inherits MiniCPMMLP verbatim
+  // upstream (minicpm3.py:186 -> minicpm.py:193), i.e. one
+  // MergedColumnParallelLinear + SiluAndMul; the MLA attention half is untouched.
+  // Direct Unquantized arm, not the factory: no *_fp4 is ever populated here
+  // (spec §Port map). (FUSION-DENSE-MIGRATE.)
+  DBuf act = layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, I).Apply(d, h);
   Tensor wd = ResidentWeight(d, w.down_proj);  // [H, I]
   DBuf out(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, out.t(), act.t(), wd);

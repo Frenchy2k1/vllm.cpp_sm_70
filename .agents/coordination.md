@@ -1622,6 +1622,39 @@ such a conflict, so this is duplication avoidance rather than an unresolvable
 clash — and if #235 closes without landing, #231 loses its roadmap registration
 and this row owes that line.
 
+**`FUSION-DENSE-MIGRATE` merged-GEMM fold (`ROAD-V1-C1` punch-list item 15,
+2026-08-10, issue #299).** Claude Code (claude-opus-5), helper role, isolated
+worktree `/home/mudler/_git/vllm.cpp-fusion-fold`, branch
+`row/FUSION-DENSE-MIGRATE`, base `origin/main` `c70f42b9` — the branch was rebased
+onto it (from `e17e8f8a` pinned at worktree creation, via `688eea12`) because main
+moved 38 commits during the run and a stale base fails `pr-size`/`agent-record` with
+"base must be an ancestor of head". Spec [fusion-dense-migrate.md](specs/fusion-dense-migrate.md). NOT in the
+claims table below: that table keys `SPIKE`/`ACTIVE` rows, and `FUSION-DENSE-MIGRATE`
+is a named tail item of the already-`DONE` `ROAD-V1-C1` cornerstone, not a matrix row
+with a lifecycle state of its own. Scope: the five gate-up folds in
+`src/vllm/model_executor/models/{commandr,glm4,minicpm,minicpm3,phi3}.cpp`, the five
+removed entries in `scripts/merged-gemm-consistency-allowlist.txt`, one byte-exact
+case in `tests/vllm/model_executor/layers/test_linear_method.cpp`, two regression
+cases in `tests/scripts/test_check_fusion_consistency.py`, NEW
+`tests/vllm/models/test_dense_gate_up_seam_forward.cpp` + its two `tests/CMakeLists.txt`
+lines (the executed CPU coverage of the folded TUs, added on review finding F4), the
+roadmap issue-table rows for #299/#337/#338, the `KERNEL-FUSION-FRAMEWORK` evidence
+prose, the `ROAD-V1-C1` tail lines in `specs/roadmap-v1-completion.md`,
+`docs/FEATURES.md`, the parity-ledger line, and this note. Plus one correction this row creates the need for: the `glm4`/`phi3` reasons on
+the OTHER (glue) allowlist `scripts/fusion-consistency-allowlist.txt` read `pending
+FUSION-DENSE-MIGRATE`, which closing this row would leave pointing at closed work, so
+they are repointed at the new issue #314 and its roadmap intake row. The glue FOLD
+itself is NOT done here. **NON-COLLISION:** touches NO shared layer (`linear.h`/
+`nvfp4.h` untouched), NO `vt::` op, NO checker SCRIPT (only two allowlist DATA
+files), and no `src/`/`include/` file beyond the five folds. The only CMake edit is
+two additive `tests/CMakeLists.txt` lines registering the new test binary. CPU-only;
+the five dgx paged-engine SACRED gates SKIP here and are recorded as OWED, tracked by
+#337. Two Group-B allowlist REASONS (`gemma4_moe`, `laguna`) were rewritten in place
+on review finding F2 — they claimed a shared-layer blocker and stated none; their
+STEMS are untouched, so no model's allowlist status moves. Found while reviewing and
+NOT fixed here, its own issue: #338 (MiniCPM/MiniCPM3 hard-code SiLU where upstream
+`MiniCPMMLP` selects `FatreluAndMul` on `hidden_act == "fatrelu"`).
+
 **`logprobs_mode` modes (`SAMPLE-LOGPROB-TOKEN-IDS`, 2026-08-10, `CLAIM-SAMPLE-LOGPROBS-MODE`, issue #238).** Claude Code (claude-opus-5), isolated worktree
 `/home/mudler/_git/vllm.cpp-logprobs-mode`, branch `row/SAMPLE-LOGPROBS-MODE`, rebased onto
 `origin/main` `5e67fcc2`. Spec [logprobs-mode.md](specs/logprobs-mode.md). Scope: the three

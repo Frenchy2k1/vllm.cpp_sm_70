@@ -94,6 +94,13 @@ vllm_cpp_add_test(test_dspark_sample vllm/v1/spec_decode/test_dspark_sample.cpp)
 target_include_directories(test_dspark_sample PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
 target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# FUSION-DENSE-MIGRATE: executed CPU coverage for the four DENSE model TUs whose
+# gate-up MLP now routes through layers::UnquantizedMlpGateUpMethod (their only
+# other gates are checkpoint-gated + dgx-only).
+vllm_cpp_add_test(test_dense_gate_up_seam_forward
+  vllm/models/test_dense_gate_up_seam_forward.cpp)
+target_include_directories(test_dense_gate_up_seam_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 # ARCH-ONE-SURFACE fold ROW 6: embeddings through the registry/runner path on
 # the committed tiny LlamaModel fixture (see scripts/mm/llama_embed_fixture_gen.py).
 vllm_cpp_add_test(test_llama_embedding_fold
