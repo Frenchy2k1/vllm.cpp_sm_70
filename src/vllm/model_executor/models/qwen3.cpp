@@ -678,6 +678,30 @@ std::optional<ForwardLogits> DenseDecodeGraphForward(
       !platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
     return std::nullopt;
   }
+  // #323 — CORRECTNESS FIRST. `Step()` below replays against the HOST
+  // `input.token_ids` and never reads `input.device_token_ids`. On the depth-2
+  // async path the combine has patched the DEVICE ids and `token_ids` is
+  // deliberately stale for decode rows (runner.cpp), so the replay generates
+  // from stale ids and every concurrent request past slot 0 degenerates — the
+  // #31 signature, reproduced on Mistral-7B-v0.3 and InternLM2-chat-1.8B and
+  // latent for EVERY classic-dense model, since the graph is default-ON.
+  //
+  // Measured, same binary, 4-concurrent battery vs a batch-1 sync anchor:
+  //   depth-1, graph ON   PASS 78/78      (no async pipelining)
+  //   depth-2, graph OFF  PASS 82/82      (eager path honours the scope)
+  //   depth-2, graph ON   FAIL, slots 1-3 degenerate
+  // Both conditions are required, which is why the registry-level
+  // DeviceTokenIdsScope (60e71a0e) did not close it: this path returns BEFORE
+  // the eager forward ever runs.
+  //
+  // Declining the graph while the mirror is live falls back to that
+  // proven-correct eager path. This is a MITIGATION, not the end state — the
+  // real fix is for Step() to read the ids at REPLAY time (a stable device
+  // buffer), which restores graphed decode for async serving. Until then a
+  // correct stream outranks the graph's throughput.
+  if (input.device_token_ids != nullptr) {
+    return std::nullopt;
+  }
   // gdn_state_slots carries max_num_reqs for EVERY arch (the runner sets it from
   // max_num_reqs_ regardless of whether the model has GDN layers), so a pure
   // full-attention model reads its capture-size cap from it unchanged.
