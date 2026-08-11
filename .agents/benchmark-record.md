@@ -18081,6 +18081,48 @@ for every request after the first.
 Evidence: `dgx:~/fx_run.log` (7/7), `dgx:~/fx2.log` (SACRED), `dgx:~/diag.log`,
 `dgx:~/diag2.log`, `dgx:~/g9.log`.
 
+## Qwen3.6-35B-A3B: first CANONICAL post-lever grid, and the ad-hoc grid it invalidates (2026-08-11, main `348c265d`, GB10)
+
+Run through `scripts/dgx-online-serving.sh --execute --model 35` on a build made
+to the H1d contract (RelWithDebInfo, oracle ninja, oracle flashinfer cutlass,
+`VLLM_CPP_BENCH_PROFILE_CONTROL=OFF`, tests ON, pinned `/usr/local/cuda-13.0/bin/nvcc`),
+against `nvidia/Qwen3.6-35B-A3B-NVFP4`@`491c2f1e`. FA2 marker verified present.
+
+| c | ours med tok/s (n=3) | vLLM med tok/s (n=2) | ratio |
+|---:|---:|---:|---:|
+| 1 | 65.262 (spread 1.005) | 67.223 (1.001) | **0.9708x** |
+| 2 | 93.012 (1.003) | 100.088 (1.006) | 0.9293x |
+| 4 | 140.174 (1.002) | 144.226 (1.066) | **0.9719x** |
+| 8 | 193.477 (1.018) | 210.679 (1.002) | 0.9183x |
+| 16 | 251.490 (1.007) | 271.479 (1.002) | 0.9264x |
+| 32 | 311.897 (1.007) | 332.606 (1.005) | 0.9377x |
+
+**NOT parity: 0.918x to 0.972x.** These are the campaign's FIRST c16/c32 numbers;
+both earlier canonical attempts died to host reboots.
+
+### This invalidates the ad-hoc 35B grid recorded on 2026-08-10
+
+That grid put our c1 at 32.9 tok/s and the ratio at 0.524, and flagged an
+"unexplained ~14% floor drop". The canonical harness measures our c1 at **65.262
+tok/s**, essentially double, and in line with the historical 70.58. The anomaly
+was an artifact of the ad-hoc harness, NOT of the engine and NOT of the #213
+levers -- which the same-binary lever A/B had already ruled out independently.
+The ad-hoc grid was correctly disclaimed rather than published; this supersedes it.
+
+### The harness rejected the ORACLE, not us
+
+Our arm completed 18/18 legs. The vLLM arm stopped at 12/18 when the stream probe
+caught it emitting **127 token chunks where 128 were requested** with
+`ignore_eos`. So the run has no driver-written summary and vLLM's medians are over
+**2 reps, not 3** -- weaker than ours, and stated rather than averaged away. A
+check strict enough to fail the reference implementation is why these numbers are
+worth more than the ad-hoc ones.
+
+### Known 35B-specific lever result
+
+The #213 merged-qkvz lever measures **-1.5% at c8 on this MoE model** (real,
+against a 0.7% band) while gaining ~10 points on the 27B dense. Scoping that
+default by model family is an open question, worth ~1.5% at c8 here.
 
 ## Closed gaps moved verbatim out of docs/BENCHMARKS.md (2026-08-11)
 
