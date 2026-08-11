@@ -105,6 +105,10 @@ PROCEDURE_FILES = frozenset(
         ".agents/workflow.md",
         ".agents/verification.md",
         ".agents/porting.md",
+        # The per-model coverage checklist that porting.md points at (#318). Same
+        # procedure class as its sibling guides; listed explicitly rather than
+        # letting .agents/ become a blanket exemption.
+        ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
         ".agents/prompts/implementer.md",
@@ -162,6 +166,13 @@ SITE_ASSET = re.compile(r"website/static/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z"
 SPEC = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.md\Z")
 SPEC_EVIDENCE = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.(?:patch|json|log)\Z")
 COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
+# One file per active claim (ENG-RECORD-CONFLICT-SURFACES, #364). The claims
+# TABLE in coordination.md was insert-at-one-anchor, so every concurrent claim
+# collided there -- 8 of the 16 conflicting open PRs at origin/main d928e2c3,
+# including six from ONE author's sequential ROCm stack whose only conflict was
+# this. A claim in its own file has one writer and cannot collide. Classified
+# with the other per-row records it now resembles.
+CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
 # Retired state evidence, moved wholesale under completed/ when history became
 # git. It is archived evidence, classified like every other completed record.
 COMPLETED_STATE_EVENT = re.compile(
@@ -350,6 +361,7 @@ def classify_path(path: str) -> str:
     if (
         path in PROCEDURE_FILES
         or SPEC.fullmatch(path)
+        or CLAIM.fullmatch(path)
         or COMPLETED.fullmatch(path)
         or COMPLETED_STATE_EVENT.fullmatch(path)
     ):

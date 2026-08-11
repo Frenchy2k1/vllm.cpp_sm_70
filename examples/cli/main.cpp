@@ -10,6 +10,7 @@
 //            [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]
 //            [--seed S] [--stream] [--repeat N]
 //            [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
+//            [--max-num-seqs N]
 //
 // <dir> holds config.json, tokenizer.json and the *.safetensors shards (T0:
 // safetensors only). Loading a real checkpoint is a GPU/dgx concern; on a CPU
@@ -49,6 +50,11 @@ struct Args {
   // kv_cache_memory_bytes (> 0) sizes the block count directly.
   double gpu_memory_utilization = 0.92;
   long long kv_cache_memory_bytes = 0;
+  // --max-num-seqs: max concurrent sequences. Exposed because it is the knob the
+  // recurrent-state budget check names (issue #371): under speculative decoding
+  // a GDN model's state is max_num_seqs * (k+1) * per-slot, so this is what a
+  // user must lower to make a speculative run fit. 0 = leave the engine default.
+  int max_num_seqs = 0;
 };
 
 void Usage(const char* argv0, std::FILE* out) {
@@ -59,6 +65,7 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]\n"
       "          [--seed S] [--stream] [--repeat N]\n"
       "          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]\n"
+      "          [--max-num-seqs N]\n"
       "          [--speculative-config '<json>']\n"
       "\n"
       "Runs completion(s) over the vllm.cpp C ABI (libvllm). <dir> holds\n"
@@ -112,6 +119,8 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       a.gpu_memory_utilization = std::atof(NextArg(argc, argv, i));
     } else if (flag == "--kv-cache-memory") {
       a.kv_cache_memory_bytes = std::strtoll(NextArg(argc, argv, i), nullptr, 10);
+    } else if (std::strcmp(argv[i], "--max-num-seqs") == 0) {
+      a.max_num_seqs = std::atoi(NextArg(argc, argv, i));
     } else if (flag == "--device") {
       // The vLLM DeviceConfig.device names (auto/cpu/cuda) -> the ABI int
       // (vllm_model_params.device: 0=auto, 1=cpu, 2=cuda). An unknown name is
@@ -200,6 +209,7 @@ int main(int argc, char** argv) {
   // behaviour; --kv-cache-memory sizes the pool from an absolute byte budget.
   mp.gpu_memory_utilization = args.gpu_memory_utilization;
   mp.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+  if (args.max_num_seqs > 0) mp.max_num_seqs = args.max_num_seqs;
 
   vllm_engine* engine = nullptr;
   std::fprintf(stderr, "vllm-cli: loading model from %s\n",

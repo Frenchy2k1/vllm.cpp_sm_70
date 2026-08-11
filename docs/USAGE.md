@@ -24,6 +24,11 @@ directory (issue #85).
 
 ### One ROCm-specific behaviour
 
+ROCm builds register the full V1 sampler surface (temperature, top-k/top-p, min-p,
+penalties, allowed-token masks, logprobs, random sample) so EngineCore does not
+fatal with `no kernel for op` after prefill on AMD. Non-positive chat
+`max_tokens` is treated as unset on all backends (Hermes `max_tokens=-1`).
+
 Worth knowing before you read a hang as a bug in the tests: a build that sets no
 `CMAKE_BUILD_TYPE` floors **HIP device code** at `-O1` and prints a configure
 line saying so. At `-O0` the ROCm runtime starts a hostcall listener the kernels
@@ -31,6 +36,29 @@ never use, and its teardown can deadlock at process exit — every test passes,
 `Status: SUCCESS!` prints, and the process never returns
 ([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
+
+### ROCm op coverage is incremental (and throws are by design)
+
+The ROCm backend registers native ops family by family
+([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
+the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal
+conv1d pair (`kCausalConv1dFwd`/`kCausalConv1dUpdate`, incl. the exact-chunks
+descriptor form Qwen3.5 prefill passes), the fused post-conv glue
+(`kGdnPostConv`), the gated-delta recurrence (`kGdnPrefill`/`kGdnDecode`,
+portable scan), and the norm-gate/preamble ops (`kRmsNormGated`,
+`kSigmoidGateBf16`, `kAttnQkNormRopeGate`) — the full set Qwen3.5-class
+GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
+`mamba_cache_dtype` default) is advertised via the
+`SupportsCompressedConvState`/`SupportsCompressedGdnState` backend probes.
+MoE-path coverage is partial: `MoeRouterTopK` (f32/bf16 logits, ungrouped
+softmax, no bias) and `MoeSiluMul` are native; the remaining chain
+(`kSharedExpertGate`, `kMoeCombine`/`kMoeCombineGate`, and the grouped quant
+expert GEMM) is not registered yet, so MoE-bearing models still throw on
+those ops. On a
+discrete card there is no CPU fallback tier, so a model whose layers call an op
+that is not registered yet fails loudly with `vt: no kernel for op N on device
+type 5` — that is the memory-safety design working, not a crash. Run with
+`VT_OP_PROVIDER_STATS=1` to see which ops resolve native.
 
 ### CUTLASS is fetched as headers only
 
@@ -55,6 +83,13 @@ never used.
 ```sh
 grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
 ```
+
+Which fast paths a given architecture compiles is decided by the CUDA feature
+table, not by the arch string alone. `110` (Jetson Thor) builds the portable
+kernels plus the vendored Marlin NVFP4 W4A16 GEMM; the CUTLASS FP4/FP8 paths and
+`fp4-mma` stay off there because no kernel body exists for it. `cmake -P
+cmake/CudaArchFeaturesTest.cmake` prints the resolution for any target list
+without a GPU or a CUDA toolkit.
 
 It previously reported the toolkit's detected default (typically `75`) no matter
 what was requested, because the project set the variable without writing it back
@@ -117,6 +152,7 @@ build/examples/vllm-cli \
 | `--seed S` | (unset) | RNG seed (enables seeded sampling) |
 | `--stream` | off | Stream token deltas to stdout |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
@@ -125,9 +161,45 @@ Two more example binaries ship alongside it:
 - `vllm-bench` ([`examples/bench/main.cpp`](../examples/bench/main.cpp)), a
   throughput/latency harness taking `--model`, `--dataset-path`,
   `--num-prompts`, `--input-len`, `--output-len`, `--concurrency`,
-  `--max-num-batched-tokens`, and `--num-blocks`.
+  `--max-num-batched-tokens`, and `--num-blocks`. It pretokenizes before timing
+  and atomically publishes each concurrency wave. Set
+  `VT_BENCH_PRETOKENIZE=0` for the timed-string rollback; the report names the
+  resolved mode.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
+  GGUF `tokenizer.ggml.pre` names accepted: `qwen35`, `qwen2`, `llama-bpe`,
+  `gpt-4o` / `llama4` / `kanana2` / `talkie` (the GPT-4o / o200k family),
+  `joyai-llm`, `deepseek-llm`, `deepseek-v3`, `laguna`. Any other name is
+  refused by name rather than aliased onto a near-miss regex.
+
+### Which HF tokenizers load
+
+A checkpoint's `tokenizer.json` is accepted when its `pre_tokenizer` is one this
+build recognises. Recognition is by exact regex or pipeline shape, not by model
+name, so a checkpoint from any vendor loads if it carries one of these:
+
+| family | shape | examples |
+|---|---|---|
+| Qwen3.6 | one `Split` regex, single-codepoint `\p{N}`, `\p{M}` folded into letter runs | Qwen3.6-27B |
+| Qwen2/Qwen3 classic | as above without `\p{M}` awareness | Qwen3-0.6B, Qwen3-Coder |
+| Llama-3 | `\p{N}{1,3}` digit groups, no `\p{M}` awareness | Llama-3 family |
+| Tekken (Mistral) | case-aware letter runs, single-codepoint `\p{N}`, `/` in the punct tail | Mistral-Nemo-Instruct-2407 |
+| GPT-4o / o200k | the same case-aware letter runs, plus o200k's contraction SUFFIX and `\p{N}{1,3}` | Muse Glimmer (pre `llama4`), GPT-4o |
+| GPT-2 byte-level | `ByteLevel(use_regex=true)` with no explicit `Split` | OPT, GPT-2 |
+| DeepSeek | a seven-stage `Sequence` pipeline, not one alternation | DeepSeek-V2/V3 |
+| SentencePiece | `Metaspace` + byte-fallback vocab | Mistral-7B-v0.3 |
+
+An unrecognised one fails loudly at load with `tokenizer: unrecognized
+pre-tokenizer split regex: <regex>`, rather than tokenizing incorrectly. If you
+hit that, the printed regex is what a new pattern would have to match.
+
+Note that Mistral ships **two** unrelated tokenizer families: Mistral-7B-v0.3 is
+SentencePiece, while Mistral-Nemo is Tekken, a byte-level BPE whose regex is
+tiktoken's `o200k_base` with the contraction group removed and `\p{N}{1,3}`
+reduced to `\p{N}`. Support for one says nothing about the other. Putting those
+two edits back gives the GPT-4o row above, so the two share one scanner's
+character classes but stay separate patterns: they disagree on `don't` and on
+every digit run longer than one.
 
 ### How much memory a Vulkan load needs
 
@@ -630,14 +702,14 @@ a stop token early.
 | `--block-size N` | `32` | KV block size |
 | `--num-blocks N` | `256` | KV blocks |
 | `--max-model-len N` | `0` (config default) | Max sequence length |
-| `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set |
+| `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set. On a GDN/Mamba model under speculative decoding this also multiplies the recurrent state, which is sized `max-num-seqs x (k+1)`; an unservable budget is refused at load with the arithmetic |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
 | `--scheduling-policy fcfs\|priority\|lpm` | `fcfs` | Scheduler policy (`lpm` is the SGLang cache-aware policy, see [docs/SGLANG-COMPAT.md](SGLANG-COMPAT.md)) |
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables |
+| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
@@ -650,6 +722,27 @@ a stop token early.
 | `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
+
+#### Context length vs the KV pool
+
+The KV pool holds `--num-blocks × --block-size` tokens — `256 × 32 = 8192` by
+default. A request longer than that can never be scheduled, so the engine
+refuses it early rather than leaving it in the waiting queue forever. Two checks
+do that, mirroring vLLM:
+
+- **At startup.** If `--max-model-len` is given and the pool cannot hold one
+  sequence that long, the server exits with the sizes and the flags that close
+  the gap (vLLM's `_check_enough_kv_cache_memory`). If it is **not** given, the
+  serving length is auto-fitted down to what the pool holds and logged
+  (vLLM's `_auto_fit_max_model_len`) — so raising `--num-blocks` is what buys a
+  longer context.
+- **At admission.** A prompt at or past the resolved `max_model_len` is
+  rejected with **HTTP 400** (`BadRequestError`) naming both lengths, exactly as
+  vLLM's `_validate_prompt_len` does. It is never a finish reason and never a
+  500.
+
+Set `VT_ENGINE_STEP_LOG=1` to print a per-step engine heartbeat if you need to
+confirm that a quiet engine is idle rather than stalled.
 
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
@@ -673,8 +766,17 @@ attention output gate, `down_proj` and the merged `gate_up` stay quantized, whil
 the merged QKV, `lm_head` and the embedding table expand to bf16 because the
 shared forward consumes them in a form a block encoding cannot take.
 
-Two caveats, both properties of the published files rather than of this loader:
+Three caveats:
 
+- **The k-quant generates coherent text, but is not token-exact against
+  llama.cpp.** Two defects had to be fixed to get there: the GGUF tokenizer gap
+  ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
+  GPT-4o / o200k family) and the converter's Q/K RoPE row permutation
+  ([#359](https://github.com/mudler/vllm.cpp/issues/359), which produced
+  `" is is is ..."`). `"The capital of France is"` at `--temperature 0` now
+  continues `" Paris. The capital of France is Paris. ..."`. llama.cpp on the
+  same file agrees on the first token and then diverges; whether that residual is
+  quantization drift or a second defect is open.
 - **Image and video need the bf16 safetensors.** The released
   `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
   axis, so half the weight is not in the file; loading it is refused by name.
@@ -960,8 +1062,8 @@ that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`,
-19 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
+35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -1000,6 +1102,13 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v8 | Custom logits processors |
 | v9 | Engine sizing: chunked-prefill token budget, scheduling policy, external KV connector / LMCache |
 | v10 | Jump-forward decoding (tri-state, default off) |
+| v11 | Audio transcription through `vllm_transcribe` |
+| v12 | Video and audio generation through `vllm_video_*` |
+| v13 | Pre-tokenized completion through `vllm_complete_tokens` |
+| v14 | Explicit device selection (`auto`, CPU, or CUDA) |
+| v15 | Embeddings through `vllm_embed` |
+| v16 | Absolute KV-cache memory sizing |
+| v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
@@ -1033,6 +1142,14 @@ SAMPLED from — a token top-k masked away reads `-inf` there and its true value
 under the raw pair. It is selectable by constructing a `Sampler` directly; there
 is no config, CLI or request field for it yet.
 
+The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
+[`lora/punica.h`](../include/vllm/lora/punica.h),
+[`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired
+to any engine path**: they are the in-progress runtime (`LORA-RUNTIME`), not a
+supported way to serve an adapter. There is no CLI flag, server flag, config key
+or C-ABI field for LoRA, and adding one is a later work item — see
+[`.agents/specs/lora-adapter.md`](../.agents/specs/lora-adapter.md).
+
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
 per position.
@@ -1045,6 +1162,23 @@ ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
 returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
 count is not rejected. Both are tracked by
 [issue #249](https://github.com/mudler/vllm.cpp/issues/249).
+
+`SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead —
+vLLM's generative-scoring path, and what to reach for when you only need a few
+labels compared, since it avoids the full-vocab sort `logprobs=-1` costs:
+
+```cpp
+vllm::SamplingParams sp;
+sp.max_tokens = 1;
+sp.logprob_token_ids = std::vector<int32_t>{yes_id, no_id};  // `logprobs` unset
+```
+
+Each returned position then carries exactly those ids plus the sampled token,
+whose `rank` is still its rank over the WHOLE vocabulary, so it stays comparable
+across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
+`logprobs` as well is allowed only when it equals the id count, and the explicit
+ids win. This is a library-API field today — the OpenAI request field is not
+wired yet.
 
 ## Multimodal input (image, video, audio to text)
 
@@ -1156,3 +1290,11 @@ were removed when the example became a thin ABI client; see the header comment i
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
+
+## SSE keepalives on long prefill
+
+Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
+waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
+(default 15s; `0` disables). Comment frames are not `data:` events and do not
+carry tokens. Token streaming still uses a timed wait on the request collector
+so deltas are not collapsed by a poll loop.
