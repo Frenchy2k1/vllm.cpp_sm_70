@@ -551,6 +551,14 @@ class ChatSseStream final : public SseStream {
 std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
     const ChatCompletionRequest& request) const {
   if (tool_parser_name_.empty() || !ToolsEnabled(request)) return nullptr;
+  // Lab/Hermes: free-form Gemma4 often emits bare `call:NAME{ARGS}` (or
+  // detokenized <|tool_call>… text) without the engine's special-token IDs.
+  // Prefer the text-seam gemma4 tool parser so both shapes extract to tool_calls.
+  // Engine-backed gemma4 remains available for other entrypoints via
+  // get_parser_engine("gemma4").
+  if (tool_parser_name_ == "gemma4") {
+    return get_tool_parser("gemma4");
+  }
   // An engine-backed name is served by MakeParserEngine, not the legacy seam.
   if (vllm::parser::get_parser_engine(tool_parser_name_) != nullptr) {
     return nullptr;
@@ -561,6 +569,9 @@ std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
 std::unique_ptr<vllm::parser::engine::ParserEngine>
 OpenAIServingChat::MakeParserEngine(const ChatCompletionRequest& request) const {
   if (tool_parser_name_.empty() || !ToolsEnabled(request)) return nullptr;
+  if (tool_parser_name_ == "gemma4") {
+    return nullptr;  // OpenAI chat uses text-seam MakeToolParser above.
+  }
   // parser_manager get_parser_engine returns nullptr for a name that is not an
   // engine-backed format, so the legacy MakeToolParser seam handles those. This
   // is the name-selected dispatch swap: engine-backed (qwen3/seed_oss/kimi_k2)
