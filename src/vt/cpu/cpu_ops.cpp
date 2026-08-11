@@ -16,6 +16,7 @@
 
 #include "cpu_matmul_elem.h"
 #include "cpu_threadpool.h"
+#include "vt/unaligned.h"
 
 namespace vt::cpu {
 namespace {
@@ -27,10 +28,12 @@ inline void ForRows(int64_t nr, const std::function<void(int64_t, int64_t)>& bod
 }
 
 float LoadF32(const Tensor& t, int64_t elem_offset) {
+  const auto* address = static_cast<const uint8_t*>(t.data) +
+                        elem_offset * SizeOf(t.dtype);
   switch (t.dtype) {
-    case DType::kF32: return t.Ptr<float>()[elem_offset];
-    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[elem_offset]);
-    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[elem_offset]);
+    case DType::kF32: return LoadUnaligned<float>(address);
+    case DType::kF16: return F16ToF32(LoadUnaligned<uint16_t>(address));
+    case DType::kBF16: return BF16ToF32(LoadUnaligned<uint16_t>(address));
     default: VT_CHECK(false, "LoadF32: unsupported dtype"); return 0.0f;
   }
 }

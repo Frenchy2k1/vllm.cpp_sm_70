@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "vt/dtype.h"
@@ -249,6 +250,31 @@ TEST_CASE("embedding bf16 output: same golden within bf16 eps") {
   CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(21.0f).epsilon(0.01));
   CHECK(vt::BF16ToF32(out[2]) == doctest::Approx(0.0f).epsilon(0.01));
   CHECK(vt::BF16ToF32(out[3]) == doctest::Approx(1.0f).epsilon(0.01));
+}
+
+TEST_CASE("embedding reads a BF16 table from an unaligned byte address") {
+  // Borrowed safetensors payloads are byte-addressed and may begin at an odd
+  // offset. Construct that exact storage contract rather than accidentally
+  // relying on vector<uint16_t>'s alignment.
+  std::vector<uint8_t> storage(1 + 6 * sizeof(uint16_t));
+  const uint16_t values[] = {
+      vt::F32ToBF16(0.0F), vt::F32ToBF16(1.0F),
+      vt::F32ToBF16(10.0F), vt::F32ToBF16(11.0F),
+      vt::F32ToBF16(20.0F), vt::F32ToBF16(21.0F),
+  };
+  std::memcpy(storage.data() + 1, values, sizeof(values));
+  REQUIRE(reinterpret_cast<uintptr_t>(storage.data() + 1) % alignof(uint16_t) ==
+          1);
+
+  std::vector<int32_t> ids = {2, 0};
+  std::vector<float> out(4, -1.0F);
+  Tensor tt = Tensor::Contiguous(storage.data() + 1, DType::kBF16, Cpu(), {3, 2});
+  Tensor ti = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {2, 2});
+  Queue q{Cpu(), nullptr};
+  vt::Embedding(q, to, tt, ti);
+
+  CHECK(out == std::vector<float>{20.0F, 21.0F, 0.0F, 1.0F});
 }
 
 TEST_CASE("embedding bounds-checks ids") {
