@@ -43,8 +43,9 @@ The ROCm backend registers native ops family by family
 ([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
 the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal
 conv1d pair (`kCausalConv1dFwd`/`kCausalConv1dUpdate`, incl. the exact-chunks
-descriptor form Qwen3.5 prefill passes), and the fused post-conv glue
-(`kGdnPostConv`). On a
+descriptor form Qwen3.5 prefill passes), the fused post-conv glue
+(`kGdnPostConv`), and the gated-delta recurrence (`kGdnPrefill`/`kGdnDecode`,
+portable scan). On a
 discrete card there is no CPU fallback tier, so a model whose layers call an op
 that is not registered yet fails loudly with `vt: no kernel for op N on device
 type 5` — that is the memory-safety design working, not a crash. Run with
