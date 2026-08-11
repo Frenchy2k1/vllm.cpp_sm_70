@@ -81,9 +81,9 @@ jobs:
         with:
           name: release-linux-x86_64-glibc-cpu-${{ github.sha }}
           path: |
-            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz
-            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz.sha256
-            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz.provenance.json
+            build-release-cpu-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cpu.tar.gz
+            build-release-cpu-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cpu.tar.gz.sha256
+            build-release-cpu-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cpu.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -121,9 +121,9 @@ jobs:
         with:
           name: release-linux-aarch64-glibc-cpu-${{ github.sha }}
           path: |
-            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz
-            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz.sha256
-            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz.provenance.json
+            build-release-cpu-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cpu.tar.gz
+            build-release-cpu-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cpu.tar.gz.sha256
+            build-release-cpu-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cpu.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -163,9 +163,9 @@ jobs:
         with:
           name: release-linux-x86_64-musl-cpu-static-${{ github.sha }}
           path: |
-            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz
-            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz.sha256
-            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz.provenance.json
+            build-release-cpu-musl/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-musl-cpu-static.tar.gz
+            build-release-cpu-musl/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-musl-cpu-static.tar.gz.sha256
+            build-release-cpu-musl/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-musl-cpu-static.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -203,9 +203,9 @@ jobs:
         with:
           name: release-linux-x86_64-glibc-cuda-fat-${{ github.sha }}
           path: |
-            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz
-            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz.sha256
-            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz.provenance.json
+            build-release-cuda-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cuda-fat.tar.gz
+            build-release-cuda-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cuda-fat.tar.gz.sha256
+            build-release-cuda-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cuda-fat.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -243,9 +243,9 @@ jobs:
         with:
           name: release-linux-aarch64-glibc-cuda-fat-${{ github.sha }}
           path: |
-            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz
-            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz.sha256
-            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz.provenance.json
+            build-release-cuda-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cuda-fat.tar.gz
+            build-release-cuda-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cuda-fat.tar.gz.sha256
+            build-release-cuda-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cuda-fat.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -278,9 +278,9 @@ jobs:
         with:
           name: release-linux-x86_64-glibc-vulkan-${{ github.sha }}
           path: |
-            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz
-            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz.sha256
-            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz.provenance.json
+            build-release-vulkan-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-vulkan.tar.gz
+            build-release-vulkan-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-vulkan.tar.gz.sha256
+            build-release-vulkan-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-vulkan.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -309,9 +309,9 @@ jobs:
         with:
           name: release-macos-arm64-metal-${{ github.sha }}
           path: |
-            build-release-metal-arm64/release/macos-arm64-metal.tar.gz
-            build-release-metal-arm64/release/macos-arm64-metal.tar.gz.sha256
-            build-release-metal-arm64/release/macos-arm64-metal.tar.gz.provenance.json
+            build-release-metal-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal.tar.gz
+            build-release-metal-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal.tar.gz.sha256
+            build-release-metal-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -351,9 +351,9 @@ jobs:
         with:
           name: release-macos-arm64-metal-mlx-${{ github.sha }}
           path: |
-            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz
-            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz.sha256
-            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz.provenance.json
+            build-release-mlx-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal-mlx.tar.gz
+            build-release-mlx-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal-mlx.tar.gz.sha256
+            build-release-mlx-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal-mlx.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7

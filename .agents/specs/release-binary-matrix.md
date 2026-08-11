@@ -90,11 +90,23 @@ not a copy from a build directory. It contains at least:
 - no model weights, tokenizer assets, Python, PyTorch, Triton runtime, compiler,
   or source/build directory.
 
-The bundle name includes project version, backend, OS, host ABI, and archive
-format. One binary never crosses an OS or host ABI. The primary CPU download is
+The canonical primary archive name is
+`vllm.cpp-<version>-<artifact-id>.tar.gz`. `<version>` is exactly the semantic
+version in the release plan and embedded manifest; `<artifact-id>` is copied
+verbatim from `release/release-matrix.json`, whose stable tuple IDs encode the
+OS, host architecture/ABI, and backend. For example, v0.0.2's x86 glibc CPU
+archive is `vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz`. Its checksum and
+provenance names are derived by appending `.sha256` and `.provenance.json` to
+that complete archive name. Package targets, lane drivers, handoff inventory,
+release-index generation/verification, workflow paths, documentation, and
+publication all use this one spelling; reordered or unversioned aliases are not
+release assets. SHA-bound GitHub Actions artifact names are transport container
+identities and do not replace or alter filenames inside them.
+
+One binary never crosses an OS or host ABI. The primary CPU download is
 one conservative-baseline, runtime-adaptive binary per OS+host ABI; the primary
-CUDA download is one fat binary per OS+host ABI containing every supported SM.
-Its manifest makes compiled CPU tiers or CUDA SMs explicit. Optional per-SM CUDA
+CUDA download is one fat binary per OS+host ABI containing every supported SM. Its
+manifest makes compiled CPU tiers or CUDA SMs explicit. Optional per-SM CUDA
 archives are diagnostic/performance variants, not the primary downloads. A
 future server install component and package target must stage this exact tree.
 The current CMake installs

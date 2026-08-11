@@ -17913,6 +17913,233 @@ kernel's own share — but 3.1% is not this profile's number.
 Both corrections share one failure mode: matching a single kernel name and
 concluding a ratio. Enumerate the whole kernel family and normalise per
 layer-step before claiming any count difference.
+
+## 27B post-lever grid, the 35B lever A/B, and an unattributed 35B c1 anomaly (2026-08-11, main `348c265d`, GB10)
+
+Both #213 levers landed: the NVFP4 `lm_head` kept packed, and the GDN fp8
+`in_proj_qkv`+`in_proj_z` merged into one qkvz GEMM.
+
+**Both are CONFIRMED ACTIVE by kernel signature**, which is the check a contended
+box cannot fake: `cutlass_80_tensorop_s16816gemm_bf16` (lever 1's 11.183 ms/step
+BF16 logits GEMM) is ABSENT; the split `nvjet_sm121_qqsss_mma_64x128x128` (lever
+2's 48 `in_proj_qkv` launches) is ABSENT and a merged `192x48x128` shape appears
+in its place; `marlin::Marlin` now carries the head.
+
+### 27B, same recipe as the pre-lever binding grid
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| post-lever ratio | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| pre-lever ratio | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| ours tok/s, post | 9.366 | 19.529 | 32.870 | 51.753 |
+
+Our legs are tight (spread 1.0013-1.0068); the vLLM arm carried one cold leg per
+concurrency (spread to 1.27), absorbed by medians.
+
+**THE OPEN PROBLEM: c1 did not move.** c2-c8 gained ~10 points, c1 gained 0.010,
+and both levers demonstrably execute at c1. The pre-lever nsys attribution closed
+to four decimal places and sized these levers AT c1 (lm_head 8.6414 + fp8 tower
+7.6068 of 17.3292 ms/step), so it mis-assigned what the c1 step actually spends.
+Two profiling attempts were DISCARDED rather than reasoned from: a whole-lifetime
+two-length diff whose calls/step came out non-integral (114.703) with a total at
+half the wall clock, and a session-based warm capture that produced no report.
+The valid method is the pre-lever one: `nsys start`/`stop` windows inside one
+already-warm server, validity-checked by integral instance deltas.
+
+### 35B-A3B, same-binary lever A/B (`VT_GDN_MERGED_QKVZ_FP8` the only variable)
+
+| | c1 med | c1 spread | c8 med | c8 spread |
+|---|---:|---:|---:|---:|
+| lever OFF (rollback) | 32.261 | 1.076 | 190.150 | 1.006 |
+| lever ON (shipped) | 33.158 | 1.086 | 187.357 | 1.007 |
+
+- **c1: NOT ESTABLISHED.** +2.8% nominal, inside an ~8% band on both arms.
+- **c8: -1.5%, REAL** against a 0.6-0.7% band.
+
+So the lever that gains ~10 points on the 27B **dense** is mildly NEGATIVE on the
+35B **MoE** at c8. Whether the default should be scoped by model family is open.
+
+### The 35B c1 anomaly is NOT the lever, and is unattributed
+
+Our 35B c1 reads ~32 tok/s here against a recorded 70.58. The A/B rules the lever
+out: with it rolled back, c1 still reads ~32. An earlier cache-sizing hypothesis
+was also withdrawn -- `num_blocks=4736` is what the canonical harness uses for
+every model, and the 35B/27B scale ratio (32.9 vs 9.4 tok/s) is what an A3B MoE
+should give. So it is protocol drift from the earlier record, or a build
+property, and the ad-hoc-harness 35B grid is NOT comparable to the 08-05 binding
+grid. It is therefore NOT published as a ratio. Re-run through the canonical
+`--execute` harness (model key `35`), which enforces per-model sizing, cache-drop
+proof and the one-lock boundary.
+
+### Method notes worth keeping
+
+- A fast `Passed` is indistinguishable from a skipped test in ctest output. Check
+  assertion counts, not exit codes. Page-cache warmth varies timings ~50x here.
+- The gate host rebooted SIX times in 18 hours during this work, at least one with
+  no OOM evidence at all (journal ends mid-normal-operation). Long runs are at
+  ongoing risk of silent truncation; c16/c32 still have no numbers because both
+  canonical attempts died that way.
+## `PERF-35B-SILU-VECTORIZE` is NEGATIVE — the 9.2x per-launch gap was an averaging artifact (2026-08-10, GB10, #213)
+
+Implemented the row-blocked SiluAndMul from [the spec](specs/moe-silu-vectorize.md)
+(block per token row, no integer divisions, flat kernel kept as fallback,
+`VT_SILU_ROW`). Bit-identical: 315/315 + 235/235, `Status: SUCCESS`, assertion
+counts unchanged on BOTH arms, all four warm greedy probes byte-identical.
+
+A/B, same binary, 3 reps/arm, order-alternated: **c8 -0.17%** (196.64 -> 196.29)
+and **c4 +0.52%** (141.72 -> 142.45), bands OVERLAPPING at both points. The
+spec's stop condition governs; the knob was NOT landed.
+
+**The premise was wrong.** The 22.6 us per launch that motivated the row is a
+MEAN over a bimodal distribution: `min 1.34 / med 18.88 / max 979.78 / stddev
+47.69 us`. Prefill launches drag the mean up; our DECODE SiluAndMul is ~1.3 us,
+FASTER per launch than the ~2.45 us vLLM mean it was compared against. There was
+no 9.2x gap, and the "3.6 percentage points of glue" scoped around it does not
+survive either.
+
+This is the documented prefill/decode mixing trap, not applied when the spec was
+written. **Read the DISTRIBUTION (min/med/max/stddev) before quoting any
+per-launch ratio** — a mean over a bimodal kernel is not a per-launch cost. The
+same discipline that withdrew the marlin 2.7% applies here: the next attempt
+needs a decode-only window on BOTH engines under ONE tool.
+
+The 35B mid-band therefore stands at two landed levers (`VT_MARLIN_DENSE_PAIR`
++1.31%, `VT_SHARED_DOWN_BF16` +2.05%) with the remaining ~5% UNATTRIBUTED.
+
+## `kGemvHeuristicAlgos` CUDA build-verify CLOSED (2026-08-10, GB10, main `812de8ca`)
+
+`NOW.md` carried "build-verify `kGemvHeuristicAlgos` on dgx" as an open residual
+on the invocation-parity row. **That row was STALE:** both halves were already on
+main (the named constant in `cuda_matmul.cu` and
+`scripts/check-gemv-invocation-consistency.py`), and `docs/STATUS.md` already
+recorded "CUDA build-verified on dgx (clean -Werror, 2026-08-04)". NOW and
+STATUS disagreed; STATUS was right.
+
+Re-verified at current main anyway, since `cuda_matmul.cu` has moved since
+2026-08-04 and a six-day-old verification is not a claim about today's tree.
+
+Guard, on main:
+
+```
+OK (out-dtype): 4 cuBLASLt C/D layout site(s) all take their dtype from the
+                dtype-faithful out_type variable.
+OK (algo-count): 4 requestedAlgoCount site(s) all route through kGemvHeuristicAlgos.
+```
+
+Build-verify, GB10 sm_121a, Release + CUTLASS 4.5.0 + Triton, nvcc 13.0.88:
+`cuda_matmul.cu` **recompiled** (forced — the first attempt was a stale-object
+pass because `812de8ca` was records-only, and a build that skips the TU verifies
+nothing) with **zero warnings** under `-Werror`, and the resulting binary gates
+clean: `test_qwen36_paged_engine` **315/315** and `test_qwen27_paged_engine`
+**235/235**, `Status: SUCCESS`, assertion counts unchanged.
+
+NOW row corrected to match STATUS. Evidence: `dgx:~/gemv2.log`, `dgx:~/g7.log`.
+
+## #323 FIXED: the decode graph replayed against stale HOST token ids (2026-08-11, `row/FIX-323-GRAPH-DECLINE`, GB10)
+
+`DenseDecodeGraphForward` called `graph->Step(input.token_ids, ...)` — the HOST
+ids — and never read `input.device_token_ids`. On the depth-2 async path the
+combine has patched the DEVICE ids and `token_ids` is deliberately stale for
+decode rows, so the replay generated from stale ids and every concurrent request
+past slot 0 degenerated (the #31 signature).
+
+Three discriminators isolated it, same binary and battery:
+
+| async depth | decode graph | result |
+|---|---|---|
+| depth-1 | ON (default) | PASS 78/78 |
+| depth-2 | OFF | PASS 82/82 |
+| depth-2 | ON (default) | **FAIL**, slots 1-3 degenerate |
+
+Both conditions required, which is why the registry-level `DeviceTokenIdsScope`
+(`60e71a0e`) did not close it: this path returns BEFORE the eager forward runs.
+
+**Fix (MITIGATION):** decline the graph while the mirror is live, falling back to
+the eager path that honours the scope. Correctness first — a correct stream
+outranks the graph's throughput. The END STATE is for `Step()` to read the ids at
+REPLAY time from a stable device buffer, which restores graphed decode for async
+serving; that is owed and NOT done here.
+
+**Gates, default configuration (async ON, graph ON):**
+
+```
+test_qwen3_dense_async_serving  7/7 cases, 246/246   (was 2 FAILED, 6 assertions)
+test_qwen3_paged_engine         184/184  SACRED
+test_qwen36_paged_engine        315/315  SACRED
+```
+
+The async suite now carries Llama, Mistral and InternLM2 as permanent regression
+gates. Llama passed even before the fix, but only because it did not engage the
+graph in that battery — the defect is a property of the shared path, so all three
+stay.
+
+**Blast radius, corrected upward twice during this investigation:** first filed
+as a Mistral/InternLM2 bug, then found to be every classic-dense model with the
+graph on (the default). Any concurrent serving on that path could return garbage
+for every request after the first.
+
+Evidence: `dgx:~/fx_run.log` (7/7), `dgx:~/fx2.log` (SACRED), `dgx:~/diag.log`,
+`dgx:~/diag2.log`, `dgx:~/g9.log`.
+
+## Qwen3.6-35B-A3B: first CANONICAL post-lever grid, and the ad-hoc grid it invalidates (2026-08-11, main `348c265d`, GB10)
+
+Run through `scripts/dgx-online-serving.sh --execute --model 35` on a build made
+to the H1d contract (RelWithDebInfo, oracle ninja, oracle flashinfer cutlass,
+`VLLM_CPP_BENCH_PROFILE_CONTROL=OFF`, tests ON, pinned `/usr/local/cuda-13.0/bin/nvcc`),
+against `nvidia/Qwen3.6-35B-A3B-NVFP4`@`491c2f1e`. FA2 marker verified present.
+
+| c | ours med tok/s (n=3) | vLLM med tok/s (n=2) | ratio |
+|---:|---:|---:|---:|
+| 1 | 65.262 (spread 1.005) | 67.223 (1.001) | **0.9708x** |
+| 2 | 93.012 (1.003) | 100.088 (1.006) | 0.9293x |
+| 4 | 140.174 (1.002) | 144.226 (1.066) | **0.9719x** |
+| 8 | 193.477 (1.018) | 210.679 (1.002) | 0.9183x |
+| 16 | 251.490 (1.007) | 271.479 (1.002) | 0.9264x |
+| 32 | 311.897 (1.007) | 332.606 (1.005) | 0.9377x |
+
+**NOT parity: 0.918x to 0.972x.** These are the campaign's FIRST c16/c32 numbers;
+both earlier canonical attempts died to host reboots.
+
+### This invalidates the ad-hoc 35B grid recorded on 2026-08-10
+
+That grid put our c1 at 32.9 tok/s and the ratio at 0.524, and flagged an
+"unexplained ~14% floor drop". The canonical harness measures our c1 at **65.262
+tok/s**, essentially double, and in line with the historical 70.58. The anomaly
+was an artifact of the ad-hoc harness, NOT of the engine and NOT of the #213
+levers -- which the same-binary lever A/B had already ruled out independently.
+The ad-hoc grid was correctly disclaimed rather than published; this supersedes it.
+
+### The harness rejected the ORACLE, not us
+
+Our arm completed 18/18 legs. The vLLM arm stopped at 12/18 when the stream probe
+caught it emitting **127 token chunks where 128 were requested** with
+`ignore_eos`. So the run has no driver-written summary and vLLM's medians are over
+**2 reps, not 3** -- weaker than ours, and stated rather than averaged away. A
+check strict enough to fail the reference implementation is why these numbers are
+worth more than the ad-hoc ones.
+
+### Known 35B-specific lever result
+
+The #213 merged-qkvz lever measures **-1.5% at c8 on this MoE model** (real,
+against a 0.7% band) while gaining ~10 points on the 27B dense. Scoping that
+default by model family is an open question, worth ~1.5% at c8 here.
+
+## Closed gaps moved verbatim out of docs/BENCHMARKS.md (2026-08-11)
+
+The scoreboard's `Open gaps` table is Track / Status / **Next gate**. These three
+rows had reached next gate `none` -- the gap each tracked is closed and no gate
+remains -- so they are not open gaps. They are reproduced here BYTE-FOR-BYTE, per
+this file's header contract, so the page can carry the two void-measurement rows
+that #223 and #238 owe without exceeding its 45,000-character cap. The full
+forensics for each are already in this file: `kGemvHeuristicAlgos CUDA
+build-verify CLOSED`, `DFlash speculative decode ... D14 c1 SPEED GATE MET`, and
+the Laguna-XS-2.1-NVFP4 decode sections. Nothing was edited or dropped.
+
+| Track | Status | Next gate |
+|---|---|---|
+| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
+| DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
+| cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |
 ## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
 
 **Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.

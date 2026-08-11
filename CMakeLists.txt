@@ -9,7 +9,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(InSourceGuard)
 vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
-project(vllm_cpp VERSION 0.0.1 LANGUAGES CXX)
+project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

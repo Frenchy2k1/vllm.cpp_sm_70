@@ -527,12 +527,52 @@ STATUS_RATCHET = {
     # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
     # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
     # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    # 243431 since 2026-08-11 (measured 243431): the #213 post-lever binding
+    # numbers replace the pre-lever narrative in the 27B cell. Strictly DOWN
+    # from 243451.
+    #
+    # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
+    # superseded allowlist clause into the binding result. Strictly DOWN.
+    #
+    # 243389 since 2026-08-10 (measured, #223): the Sampling row gains prompt
+    # logprobs computed on the runner; paid for by collapsing the beam-search
+    # restatements that row carried. Strictly DOWN.
+    #
+    # 243377 since 2026-08-11 (measured 243377, #238): the logprobs_mode row needs
+    # one binding line -- three of four modes were runtime-refused stubs and now
+    # work. Paid for by collapsing the best_of cell's upstream RATIONALE ("vLLM
+    # 0.26 itself has dropped best_of from its live path..."), which is a why, not
+    # a current state, and belongs in the row's spec. A DIFFERENT collapse from
+    # #223's beam-search one directly above: both collapses and both additions are
+    # in the merged page, which is why this pin is RE-MEASURED against it rather
+    # than carried from either PR (#223 measured 243389, #238 measured 243559 --
+    # both stale the moment the other landed). Every measured number and binding
+    # claim kept verbatim. Strictly DOWN.
+    #
+    # 243356 since 2026-08-11 (measured 243356): main re-pinned to 243378 for the
+    # #323 async-serving correction while #223 and #238 were landing. RE-MEASURED
+    # against the page that carries all three -- 243378 less #223's 10 and #238's
+    # 12 -- rather than carried from any one of them. Strictly DOWN.
+    # 243309 since 2026-08-11 (measured 243309): the 35B cell carries the
+    # canonical c1-c32 grid instead of the superseded ad-hoc narrative.
+    # Strictly DOWN from 243378.
+    #
+    # 243287 since 2026-08-11 (measured 243287): main re-pinned to 243309 for the
+    # 35B canonical grid while #223 and #238 were landing. RE-MEASURED against the
+    # page carrying all three -- 243309 less #223's 10 and #238's 12 -- not carried
+    # from any one of them. Strictly DOWN.
+
     #
     # 243368 since 2026-08-10 (measured 243368): reconciled once more when the
     # external-PR landing (#155 + #266) merged current main, which had itself
     # re-pinned to 243512 for #277. Both histories are kept above; this is the
     # single measured value for the merged page. Strictly DOWN from 243455.
-    "chars": 243368,
+    #
+    # 243200 since 2026-08-11 (measured 243200): the external-PR landing merged
+    # current main again; main's newer 27B/35B/dense rows won on their keys and
+    # this landing's Qwen3.5-4B row won on its own. Single measured value for
+    # the merged page. Strictly DOWN from 243287.
+    "chars": 243200,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
