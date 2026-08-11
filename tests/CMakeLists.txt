@@ -211,6 +211,13 @@ target_include_directories(test_muse_glimmer_vision PRIVATE
 # the output multiplier and the soft-cap). CPU-only, no checkpoint. No speed axis
 # exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
 vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
+# The DFlash drafter's RELEASED config.json, committed verbatim. It is the only
+# real artifact that OMITS qk_scale_factor / post_norm_eps / output_multiplier /
+# final_logit_softcapping, so it is what pins their defaults to the architecture's
+# constants rather than to neutral values (issue #412). Committed, not read off
+# the NAS, so the gate is asset-free.
+target_compile_definitions(test_muse_glimmer_text PRIVATE
+  MUSE_GLIMMER_DRAFT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b_assistant")
 # ...and the SAME gate on the HAND-CALL arm. `FusedChainAdoptEnabled()` defaults ON
 # and is read once per process into a function-local static, so the three
 # `else vt::RmsNorm(...)` fallbacks in muse_glimmer.cpp (input layernorm,
