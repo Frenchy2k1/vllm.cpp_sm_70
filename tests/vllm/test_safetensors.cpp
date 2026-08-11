@@ -1,9 +1,9 @@
 #include <doctest/doctest.h>
 
-#include <unistd.h>
 #if defined(__linux__)
 #include <cerrno>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #include <cctype>
@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -24,6 +25,11 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 
 namespace {
+
+std::string Utf8Path(const std::filesystem::path& path) {
+  const auto bytes = path.u8string();
+  return std::string(bytes.begin(), bytes.end());
+}
 
 // Little-endian u64, as the safetensors header-length prefix requires.
 std::string U64Le(uint64_t v) {
@@ -44,24 +50,23 @@ class TempFile {
  public:
   explicit TempFile(const std::string& bytes) {
     static int counter = 0;
-    path_ = (std::filesystem::temp_directory_path() /
-             ("vllm_safetensors_test_" + std::to_string(counter++) +
-              ".safetensors"))
-                .string();
-    std::ofstream out(path_, std::ios::binary);
+    native_path_ = std::filesystem::temp_directory_path() /
+                   ("vllm_safetensors_test_" + std::to_string(counter++) +
+                    ".safetensors");
+    path_ = Utf8Path(native_path_);
+    std::ofstream out(native_path_, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   }
-  ~TempFile() { std::remove(path_.c_str()); }
+  ~TempFile() {
+    std::error_code ignored;
+    std::filesystem::remove(native_path_, ignored);
+  }
   const std::string& path() const { return path_; }
 
  private:
+  std::filesystem::path native_path_;
   std::string path_;
 };
-
-std::string Utf8Path(const std::filesystem::path& path) {
-  const auto bytes = path.u8string();
-  return std::string(bytes.begin(), bytes.end());
-}
 
 class NamedTempFile {
  public:
@@ -85,6 +90,37 @@ class NamedTempFile {
  private:
   std::filesystem::path path_;
 };
+
+class TempDirectory {
+ public:
+  explicit TempDirectory(const std::filesystem::path& suffix) {
+    std::random_device random;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+      root_ = std::filesystem::temp_directory_path() /
+              std::filesystem::path(U"vllm_safetensors_caf\u00e9_\u6a21\u578b_");
+      root_ += std::to_string((static_cast<uint64_t>(random()) << 32) ^ random());
+      path_ = root_ / suffix;
+      std::error_code error;
+      if (std::filesystem::create_directories(path_, error)) return;
+    }
+    throw std::runtime_error("failed to create safetensors test directory");
+  }
+  ~TempDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(root_, ignored);
+  }
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path root_;
+  std::filesystem::path path_;
+};
+
+void WriteFile(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!out) throw std::runtime_error("failed to write safetensors test file");
+}
 
 // 24-byte data section: tensor "a" = F32 [2,2] at [0,16), tensor "b" =
 // BF16 [4] at [16,24).
@@ -447,6 +483,32 @@ TEST_CASE("safetensors index: parses weight_map") {
   CHECK(index.at("b") == "model-00002-of-00002.safetensors");
 }
 
+TEST_CASE(
+    "safetensors index: loads shards through a non-ASCII directory and index path") {
+  TempDirectory directory(std::filesystem::path(U"checkpoints_\u7d22\u5f15"));
+  const std::filesystem::path shard1 =
+      directory.path() / "model-00001-of-00002.safetensors";
+  const std::filesystem::path shard2 =
+      directory.path() / "model-00002-of-00002.safetensors";
+  const std::filesystem::path index_path =
+      directory.path() /
+      std::filesystem::path(U"mod\u00e8le.safetensors.index.json");
+  WriteFile(shard1, MakeSafetensors(kValidHeader, ValidData()));
+  WriteFile(shard2, MakeSafetensors(kValidHeader, ValidData()));
+  WriteFile(index_path,
+            R"({"weight_map":{"a":"model-00001-of-00002.safetensors",)"
+            R"("b":"model-00002-of-00002.safetensors"}})");
+
+  const auto index = vllm::LoadSafetensorsIndex(Utf8Path(index_path));
+  REQUIRE(index.size() == 2);
+  const vllm::SafetensorsFile a = vllm::SafetensorsFile::Open(
+      Utf8Path(directory.path() / index.at("a")));
+  const vllm::SafetensorsFile b = vllm::SafetensorsFile::Open(
+      Utf8Path(directory.path() / index.at("b")));
+  CHECK(a.Get("a").nbytes == 16);
+  CHECK(b.Get("b").nbytes == 8);
+}
+
 TEST_CASE("safetensors index: missing file / missing weight_map throw") {
   CHECK_THROWS_WITH_AS(vllm::LoadSafetensorsIndex("/nonexistent/idx.json"),
                        doctest::Contains("/nonexistent/idx.json"),
@@ -474,6 +536,7 @@ TEST_CASE("safetensors index: shard names with path components throw") {
                   std::runtime_error);
 }
 
+#if defined(__linux__)
 // ---- Windowed source-page release (LOAD-SAFETENSORS memory checkpoint) ----
 // Exercises the real reader (MAP_PRIVATE mmap) + the progressive-release path
 // the 27B/35B loaders call after each tensor copy. See
@@ -655,3 +718,4 @@ TEST_CASE("safetensors: interior-page release never drops a neighbor's bytes") {
   CHECK(rss_after >= b_kb * 3 / 4);          // b retained
   CHECK(rss_both - rss_after >= b_kb / 2);   // a's interior dropped
 }
+#endif
