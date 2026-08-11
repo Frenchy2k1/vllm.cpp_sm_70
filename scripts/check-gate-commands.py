@@ -279,8 +279,14 @@ def audit() -> list[dict]:
 # the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
 # the gated population, so its verdict is None rather than a downgraded one.
 # A shrink for a real record edit, named as the message demands.
+# 2026-08-11: +ENG-FORGE-COAUTHOR. Reaches ACTIVE on its committed spec (issue
+# #418), whose Gates section names the preflight, tests/scripts and
+# agent-integration invocations plus the per-commit re-verification of
+# f64f2b71, and records that no CUDA/GPU/SACRED gate is implicated because no
+# product source is touched. Growth, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
