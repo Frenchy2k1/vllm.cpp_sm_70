@@ -97,6 +97,7 @@ KVCacheManager::KVCacheManager(KVCacheConfig kv_cache_config_in,
       enable_caching(enable_caching_in),
       use_eagle(use_eagle_in),
       log_stats(log_stats_in),
+      enable_kv_cache_events(enable_kv_cache_events),
       num_kv_cache_groups(
           static_cast<int>(kv_cache_config_in.kv_cache_groups.size())),
       kv_cache_config(kv_cache_config_in),
@@ -135,6 +136,28 @@ std::pair<KVCacheBlocks, int> KVCacheManager::get_computed_blocks(
   auto [computed_blocks, num_new_computed_tokens] =
       coordinator->find_longest_cache_hit(request.block_hashes,
                                           max_cache_hit_length);
+
+  // kv_cache_manager.py:262-280. Under the non-default report mode "full", the
+  // blocks this request REUSED from the prefix cache are re-reported as
+  // BlockStored, so an external prefix-cache-aware router learns that this
+  // engine holds them (the default "incremental" mode reports only blocks that
+  // were newly stored). Emits nothing on the default path: report mode is
+  // "incremental" unless the request asked otherwise, and events are off unless
+  // configured, so both guards are false in production.
+  if (num_new_computed_tokens > 0 && enable_kv_cache_events &&
+      request.kv_cache_report_mode == "full") {
+    for (std::size_t group_idx = 0; group_idx < computed_blocks.size();
+         ++group_idx) {
+      const int num_blocks = static_cast<int>(computed_blocks[group_idx].size());
+      if (num_blocks > 0) {
+        const int group_block_size =
+            kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec->block_size;
+        block_pool.emit_cached_block_events(request, num_blocks,
+                                            group_block_size,
+                                            static_cast<int>(group_idx));
+      }
+    }
+  }
 
   // Upstream vllm/v1/core/kv_cache_manager.py:234-240. queries/hits count
   // TOKENS; a previously-preempted request is routed into the
