@@ -77,6 +77,7 @@
 
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
+#include "vllm/distributed/kv_events.h"  // KVEventsConfig, EventPublisher
 #include "vllm/v1/core/kv_cache_manager.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/request_queue.h"
@@ -119,10 +120,23 @@ class Scheduler {
   // present (e.g. SpeculativeConfig::ResolveMtp), num_lookahead_tokens is derived
   // from it (SpeculativeConfig::NumLookaheadTokens) and threaded into
   // allocate_slots so the verify slots are reserved ahead of time.
+  //
+  // kv_events_config (upstream vllm_config.kv_events_config, read at
+  // scheduler.py:86,116-119,155-158): OPTIONAL, and nullptr — the default, and
+  // what every non-event call site passes — is upstream's `None`. It resolves
+  // enable_kv_cache_events to FALSE, which is exactly the value this ctor used
+  // to hard-code, so the KVCacheManager, the BlockPool and update_from_output
+  // all behave byte-identically and the publisher is a no-op NullEventPublisher.
+  // The pointee is read only during construction (to derive the flag and build
+  // the publisher) and is NOT retained, so it need not outlive the call.
+  // data_parallel_rank mirrors parallel_config.data_parallel_index: the
+  // publisher stamps it onto every batch it emits.
   Scheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
             int block_size, bool enable_caching = false,
             StructuredOutputManager* structured_output_manager = nullptr,
-            std::optional<SpeculativeConfig> speculative_config = std::nullopt);
+            std::optional<SpeculativeConfig> speculative_config = std::nullopt,
+            const distributed::KVEventsConfig* kv_events_config = nullptr,
+            int data_parallel_rank = 0);
 
   // VIRTUAL destructor — REQUIRED, not cosmetic. `AsyncScheduler` derives from
   // this class and production/test code owns the derived object through a
@@ -201,6 +215,38 @@ class Scheduler {
   kv_offload::KVConnector* kv_connector() const {
     return kv_connector_;
   }
+
+  // KV-EVENTS W3: replace the publisher the ctor built from the config.
+  //
+  // Upstream has no such setter — it never needs one, because its only non-null
+  // publisher (ZmqEventPublisher) can be constructed from configuration alone.
+  // Ours cannot yet: the ZMQ transport is DEFERRED for want of a socket
+  // dependency, so the only publisher that can be OBSERVED is
+  // CollectingEventPublisher, and teaching EventPublisherFactory a
+  // `publisher="collecting"` kind would invent a --kv-events-config value vLLM
+  // does not have, making our config surface diverge for the sake of a test.
+  // This is the same injection shape set_kv_connector uses above, and for the
+  // same reason. Production never calls it: the config-driven path stays 1:1.
+  // The scheduler OWNS the publisher (unlike the connector).
+  void set_kv_event_publisher(
+      std::unique_ptr<distributed::EventPublisher> publisher) {
+    kv_event_publisher_ = std::move(publisher);
+  }
+  distributed::EventPublisher* kv_event_publisher() const {
+    return kv_event_publisher_.get();
+  }
+
+  // shutdown (scheduler.py:2456-2459): release the scheduler's external
+  // resources. Today that is only the KV-event publisher; upstream also shuts
+  // its KV and EC connectors down here, which are separate rows.
+  //
+  // NOTE: nothing in production calls this yet — upstream calls it from
+  // EngineCore.shutdown, and our EngineCore has no shutdown path at all. Both
+  // shipped publishers make that harmless (Null's shutdown is an empty body,
+  // Collecting's sets a flag); the real consumer is the deferred ZMQ
+  // publisher's background thread, which arrives with the transport.
+  // Idempotent, and safe to call on a scheduler that has no events configured.
+  virtual void shutdown();
 
   // update_draft_token_ids (scheduler.py:1937-1957): install the drafter's
   // freshly-proposed spec token ids onto their requests, to be scheduled for
@@ -309,6 +355,16 @@ class Scheduler {
   // KV-OFFLOAD W4: the scheduler-facing KV connector (non-owning, opt-in, null by
   // default). See set_kv_connector.
   kv_offload::KVConnector* kv_connector_ = nullptr;
+
+  // KV-EVENTS W3 (scheduler.py:116-119,155-158). enable_kv_cache_events_ is
+  // false unless a KVEventsConfig was supplied AND enables them; it is what the
+  // KVCacheManager (and through it the BlockPool) is constructed with, so with
+  // the default it is exactly the previously hard-coded `false`.
+  // kv_event_publisher_ is never null — EventPublisherFactory returns a
+  // NullEventPublisher when events are off — so the publish path needs no null
+  // check, matching upstream where the attribute is always set.
+  bool enable_kv_cache_events_ = false;
+  std::unique_ptr<distributed::EventPublisher> kv_event_publisher_;
 
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;
