@@ -511,7 +511,10 @@ STATUS_RATCHET = {
     #
     # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
     # superseded allowlist clause into the binding result. Strictly DOWN.
-    "chars": 243378,
+    # 243309 since 2026-08-11 (measured 243309): the 35B cell carries the
+    # canonical c1-c32 grid instead of the superseded ad-hoc narrative.
+    # Strictly DOWN from 243378.
+    "chars": 243309,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
