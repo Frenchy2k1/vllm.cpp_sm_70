@@ -149,7 +149,7 @@ def validate(text: str) -> list[str]:
         errors.append("publish job must require an exact tag and approved publish plan")
     if "scripts/release_pipeline.py publish" not in publish:
         errors.append("publish job must use the byte-bound release publisher")
-    if "verified/assets" not in publish or "verified/release-index.json" not in publish:
+    if "verified/release-assets" not in publish or "verified/release-index.json" not in publish:
         errors.append("publish job must release verified assets and generated indexes")
     if "gh release create" in publish:
         errors.append("release workflow must not bypass the byte-bound publisher")
@@ -168,6 +168,19 @@ def validate(text: str) -> list[str]:
     for fragment in required_handoff:
         if fragment not in text:
             errors.append(f"immutable artifact handoff is missing {fragment!r}")
+    isolated_asset_fragments = {
+        "          path: release-assets": 1,
+        "            --assets-dir release-assets \\": 1,
+        "            release-assets\n": 1,
+        "          cp -a unverified/release-assets verified/release-assets": 1,
+        "            --assets-dir verified/release-assets \\": 3,
+        "          subject-path: verified/release-assets/**": 1,
+    }
+    if any(text.count(fragment) != count
+           for fragment, count in isolated_asset_fragments.items()):
+        errors.append(
+            "release workflow must isolate transient release assets from checkout assets"
+        )
     uploads = text.count("uses: actions/upload-artifact@v4")
     download_steps = action_steps(text, "actions/download-artifact@v4")
     downloads = len(download_steps)

@@ -1142,6 +1142,11 @@ TEST_CASE("async_llm: with no logger attached the token stream is unchanged") {
         h.engine.generate(std::string("hello"), Greedy(kN), "req");
     REQUIRE(r.outputs.size() == 1);
     with_logger = r.outputs[0].token_ids;
+    // A terminal collector value is published before the output handler folds
+    // the same iteration into the logger. Detach is therefore a quiescence
+    // barrier: after it returns this caller may destroy the non-owning logger
+    // even while the engine itself remains alive.
+    h.engine.set_stat_logger(nullptr);
   }
   std::vector<int32_t> without_logger;
   {

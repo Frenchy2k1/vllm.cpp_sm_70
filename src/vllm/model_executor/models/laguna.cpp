@@ -52,6 +52,7 @@
 #include "vt/ops.h"      // vt::MatmulBT (dispatches kMatmulBTQuant on block weights)
 #include "vt/recipes.h"  // vt::kFusedAddRmsNormStd (L4 residual-add + RMSNorm fusion)
 #include "vt/tensor.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace {
@@ -147,9 +148,10 @@ std::vector<float> ReadF32(const OwnedTensor& t) {
   if (t.dtype == vt::DType::kF32) {
     std::memcpy(out.data(), raw, static_cast<size_t>(n) * sizeof(float));
   } else if (t.dtype == vt::DType::kBF16) {
-    const auto* b = reinterpret_cast<const uint16_t*>(raw);
     for (int64_t i = 0; i < n; ++i) {
-      const uint32_t bits = static_cast<uint32_t>(b[i]) << 16;
+      const uint32_t bits =
+          static_cast<uint32_t>(vt::LoadUnaligned<uint16_t>(raw + i * 2))
+          << 16;
       std::memcpy(&out[static_cast<size_t>(i)], &bits, sizeof(float));
     }
   } else {
@@ -1022,10 +1024,11 @@ std::vector<float> LagunaEmbed(const OwnedTensor& embed_t,
     VT_CHECK(tok >= 0 && tok < Vsz, "laguna: token id out of range");
     float* dst = hidden.data() + static_cast<size_t>(t * H);
     if (is_bf16) {
-      const auto* b =
-          reinterpret_cast<const uint16_t*>(raw) + static_cast<size_t>(tok * H);
+      const uint8_t* row = raw + static_cast<size_t>(tok * H) * 2;
       for (int64_t i = 0; i < H; ++i) {
-        const uint32_t bits = static_cast<uint32_t>(b[i]) << 16;
+        const uint32_t bits =
+            static_cast<uint32_t>(vt::LoadUnaligned<uint16_t>(row + i * 2))
+            << 16;
         std::memcpy(&dst[i], &bits, sizeof(float));
       }
     } else {

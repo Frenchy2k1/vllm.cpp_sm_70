@@ -26,7 +26,7 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 35 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; full hosted dry run and first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Downloadable server binaries | ◐ eight-tuple CPU/CUDA/Vulkan/Metal/MLX release pipeline implemented in #196; immutable handoff uses a checkout-disjoint asset root; first binary-bearing tag pending | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 
@@ -75,7 +75,7 @@ are our reading of their documented behavior, not measurements.
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
-| Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of a 27B bf16); merged/transposed ones still copy. Post-upload source release covers every single-source upload, bf16 and CT NVFP4/MXFP4 alike; merged fp4 operands do not | ✅ | ✅ | ✅ mmap |
+| Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16), with defined reads at arbitrary payload offsets; merged/transposed weights still copy. Source-page release covers single-source BF16/CT FP4, not merged FP4 | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
 
@@ -242,7 +242,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | OpenAI-compatible `/v1/chat/completions` | ✅ | ✅ | ✅ | ✅ |
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Offline batch API | ✅ | ✅ | ◐ | ☐ |
-| Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog | ✅ | ✅ | ◐ |
+| Prometheus metrics | ✅ live per-step values on the serving path, not just the catalog; async detach and server teardown wait for the final fold | ✅ | ✅ | ◐ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |

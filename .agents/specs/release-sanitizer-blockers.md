@@ -204,4 +204,28 @@ release path one at a time; the corresponding focused gate must fail.
 
 ## Outcome
 
-Pending implementation and immutable review evidence.
+Implementation completed on `row/ENG-RELEASE-SANITIZER-BLOCKERS`; independent
+immutable review and the operator's post-review gate remain pending.
+
+- Arbitrary-address scalar reads now use one `std::memcpy`-based
+  `vt::LoadUnaligned` primitive. The observed CPU-op and Laguna sites are
+  defined without changing mmap borrowing. Replaying the full direct-upload
+  target exposed one additional instance of the same defect in the shared BF16
+  transpose fallback; it was repaired through the same primitive rather than
+  widened into an unrelated loader refactor.
+- `set_stat_logger(nullptr)` is now a synchronous detach barrier. The output
+  handler holds the attachment lock through its final `Record`, while `Record`
+  remains outside `output_processor_mutex_`. The server's declaration order
+  independently guarantees that `LoadedEngine` shuts down and joins before
+  the non-owning logger is destroyed.
+- Every release handoff stage now uses `release-assets` (nested as
+  `unverified/release-assets` and `verified/release-assets`). Immutable artifact
+  IDs, flat extraction, exact inventory, attestation, and publication remain
+  unchanged. A checkout `favicon.png` in the handoff root is still rejected.
+- Address+undefined sanitizer replay passed all six executables that failed in
+  CI; the complete direct-upload target passed 14 cases / 183 assertions after
+  the extra transpose repair. ThreadSanitizer passed the detach regression and
+  the complete engine target (15 cases / 295 assertions) using
+  `setarch x86_64 -R` to avoid this host's pre-main GCC TSan mapping failure.
+  The non-sanitized focused suite passed all four targets, and the release
+  pipeline suite passed all 19 tests including each stage mutation.

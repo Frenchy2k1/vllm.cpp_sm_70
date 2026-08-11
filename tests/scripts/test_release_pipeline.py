@@ -163,6 +163,14 @@ class ReleasePipelineContract(unittest.TestCase):
             files = json.loads(handoff_path.read_text(encoding="utf-8"))["files"]
             self.assertEqual({item["artifact_id"] for item in files}, {artifact_id})
 
+            # A checkout-owned file copied into the transient root is not a
+            # release asset and must remain a hard failure. The workflow fixes
+            # that collision by using a disjoint root, not by weakening this
+            # exact-inventory validator.
+            (assets / "favicon.png").write_bytes(b"checkout asset")
+            with self.assertRaises(ValueError):
+                self.pipeline.make_handoff(plan_path, assets, handoff_path)
+
     def test_publish_enumerates_only_verified_assets_without_shell_globs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -324,6 +332,25 @@ class ReleasePipelineContract(unittest.TestCase):
             "every artifact download must flatten into its declared path",
             self.checker.validate(mutant),
         )
+
+    def test_every_release_stage_uses_a_checkout_disjoint_asset_root(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        required = (
+            "          path: release-assets",
+            "            --assets-dir release-assets \\",
+            "            release-assets",
+            "          cp -a unverified/release-assets verified/release-assets",
+            "            --assets-dir verified/release-assets \\",
+            "          subject-path: verified/release-assets/**",
+        )
+        for fragment in required:
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, original)
+                mutant = original.replace(fragment, fragment.replace("release-assets", "assets"), 1)
+                self.assertIn(
+                    "release workflow must isolate transient release assets from checkout assets",
+                    self.checker.validate(mutant),
+                )
 
     def test_flat_extraction_cannot_be_compensated_by_an_upload(self) -> None:
         original = WORKFLOW.read_text(encoding="utf-8")

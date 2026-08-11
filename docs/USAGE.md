@@ -188,6 +188,10 @@ transposed (`lm_head`) or dequantized at load are not verbatim and still copy.
 `VT_LOAD_DIRECT_UPLOAD=0` turns the direct path off in the same binary; the
 loaded bytes, and therefore the tokens, are identical either way.
 
+Safetensors payloads are byte-addressed and do not promise natural scalar
+alignment. Borrowed BF16/F16/F32 inputs therefore use defined byte-copy loads;
+an odd payload offset neither forces a host copy nor changes the loaded bits.
+
 `device_upload` counts every single-source weight upload: the bf16/fp8 weights
 through `ResidentWeight` and the compressed-tensors NVFP4/MXFP4 `packed`/`scale`
 residents through `ResidentNvfp4`. It does NOT yet count the merged fp4 operands
@@ -282,6 +286,12 @@ without publication. An exact version tag runs the same build, produces
 `release-index.json` and `RELEASE_INDEX.md` from the verified archive manifests,
 attests the archive bytes, and publishes every archive/checksum/provenance
 triplet through the protected release environment.
+
+Inside the workflow, generated archives live under `release-assets` (and then
+`unverified/release-assets` / `verified/release-assets`). This transient root is
+deliberately separate from the checkout's tracked `assets/` directory, so exact
+handoff validation sees only the planned archive/checksum/provenance triplets.
+The release filenames and published eight-tuple inventory are unchanged.
 
 ### Selecting an x86 CPU ISA tier
 
