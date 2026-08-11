@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>Same tokens as vLLM. Same throughput. 140x less to install.</b><br>
-  <sub>Continuous batching, paged KV, 25+ architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
+  <sub>Continuous batching, paged KV, 37 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
 <p align="center">
@@ -37,6 +37,8 @@
 
 ## News
 
+- **2026-08** **v0.0.2 ships eight server archives.** Download CPU, CUDA, Vulkan, Metal, and MLX
+  builds from [GitHub Releases](https://github.com/mudler/vllm.cpp/releases/tag/v0.0.2).
 - **2026-08** **MiniMax-H3 generates video with audio.** All tasks run through `POST /v1/videos`;
   use Q4_K_M.
 - **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
@@ -76,12 +78,9 @@ Where that stands today:
   band; the other five, 0.7% to 1.7%, are ties. Also **1.18x llama.cpp's prefill** on the same
   GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
   correct but speed-pending, and each one says so.
-- **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
+- **Everything.** 37 registered architectures, 36 tool-parser families, structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
-- **Grounded.** Every architecture is **gated token-for-token against a pinned vLLM oracle**, and
-  where vLLM's own greedy decode is non-deterministic at bf16 near-ties, the gate says so instead of
-  quietly loosening.
 
 ## Performance
 
@@ -152,7 +151,7 @@ numbers by [`benchmarks/demo/`](benchmarks/demo/), which reads its values from a
 every figure traces back to the run that produced it.
 
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
-> vLLM oracle across 25+ architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
+> vLLM oracle across 27 gated architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
 > sm_121a) plus a CPU path that matches or beats llama.cpp on GGUF. Every capability is labelled
 > honestly in [docs/STATUS.md](docs/STATUS.md): *correctness-complete*, *speed-pending*,
 > *build-only*, or *hardware-blocked*.
@@ -187,8 +186,8 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), 19 symbols) you can `dlopen` from C, C++, Go, or Rust. No
-  Python interpreter in the process, ever.
+  ([`include/vllm.h`](include/vllm.h), ABI v17, 35 functions) for C, C++, Go, or Rust. No Python
+  interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16
   expansion. Byte-identical greedy output to llama.cpp.
@@ -217,7 +216,7 @@ you get on top, most of it borrowed from whichever engine does it best:
   sample logprobs.
 - **Structured output.** JSON schema, JSON object, regex, choice, and GBNF grammar, enforced in the
   engine with a per-step logits bitmask.
-- **Tool calling and reasoning.** 37 tool-parser families (41 accepted names) and 10 reasoning
+- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 10 reasoning
   parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
 - **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
@@ -250,7 +249,7 @@ InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus Qwen3-VL and Qwen3.6-27B vision
 and Voxtral (audio).
 
 <details>
-<summary><b>The full architecture matrix</b> (28 rows, with per-model correctness and speed state)</summary>
+<summary><b>The full architecture matrix</b> (37 registered architectures grouped by family)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -293,7 +292,7 @@ sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning mod
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
 sliding-window attention are gated feature-positive. The authoritative per-architecture list, bound
-to the C++ registry (all 30 registered architectures with their tested checkpoint and gate, plus the
+to the C++ registry (all 37 registered architectures with their tested checkpoint and gate, plus the
 standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
 [docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
 hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
@@ -305,7 +304,7 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | Backend | Hardware | State |
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
-| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80–sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
+| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 to sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35). Op coverage: [docs/STATUS.md](docs/STATUS.md) |
@@ -386,7 +385,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`, 19 exported symbols) suitable for `dlopen` / FFI.
+llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`, 35 exported functions) suitable for `dlopen` / FFI.
 
 ```c
 vllm_model_params mp = vllm_model_params_default();

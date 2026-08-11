@@ -37,6 +37,29 @@ never use, and its teardown can deadlock at process exit — every test passes,
 ([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
+### ROCm op coverage is incremental (and throws are by design)
+
+The ROCm backend registers native ops family by family
+([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
+the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal
+conv1d pair (`kCausalConv1dFwd`/`kCausalConv1dUpdate`, incl. the exact-chunks
+descriptor form Qwen3.5 prefill passes), the fused post-conv glue
+(`kGdnPostConv`), the gated-delta recurrence (`kGdnPrefill`/`kGdnDecode`,
+portable scan), and the norm-gate/preamble ops (`kRmsNormGated`,
+`kSigmoidGateBf16`, `kAttnQkNormRopeGate`) — the full set Qwen3.5-class
+GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
+`mamba_cache_dtype` default) is advertised via the
+`SupportsCompressedConvState`/`SupportsCompressedGdnState` backend probes.
+MoE-path coverage is partial: `MoeRouterTopK` (f32/bf16 logits, ungrouped
+softmax, no bias) and `MoeSiluMul` are native; the remaining chain
+(`kSharedExpertGate`, `kMoeCombine`/`kMoeCombineGate`, and the grouped quant
+expert GEMM) is not registered yet, so MoE-bearing models still throw on
+those ops. On a
+discrete card there is no CPU fallback tier, so a model whose layers call an op
+that is not registered yet fails loudly with `vt: no kernel for op N on device
+type 5` — that is the memory-safety design working, not a crash. Run with
+`VT_OP_PROVIDER_STATS=1` to see which ops resolve native.
+
 ### CUTLASS is fetched as headers only
 
 `-DVLLM_CPP_CUTLASS_FETCH=ON` downloads CUTLASS v4.5.0 and stops there: the
@@ -60,6 +83,13 @@ never used.
 ```sh
 grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
 ```
+
+Which fast paths a given architecture compiles is decided by the CUDA feature
+table, not by the arch string alone. `110` (Jetson Thor) builds the portable
+kernels plus the vendored Marlin NVFP4 W4A16 GEMM; the CUTLASS FP4/FP8 paths and
+`fp4-mma` stay off there because no kernel body exists for it. `cmake -P
+cmake/CudaArchFeaturesTest.cmake` prints the resolution for any target list
+without a GPU or a CUDA toolkit.
 
 It previously reported the toolkit's detected default (typically `75`) no matter
 what was requested, because the project set the variable without writing it back
@@ -678,7 +708,7 @@ a stop token early.
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables |
+| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
@@ -1031,8 +1061,8 @@ that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`,
-19 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
+35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -1071,6 +1101,13 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v8 | Custom logits processors |
 | v9 | Engine sizing: chunked-prefill token budget, scheduling policy, external KV connector / LMCache |
 | v10 | Jump-forward decoding (tri-state, default off) |
+| v11 | Audio transcription through `vllm_transcribe` |
+| v12 | Video and audio generation through `vllm_video_*` |
+| v13 | Pre-tokenized completion through `vllm_complete_tokens` |
+| v14 | Explicit device selection (`auto`, CPU, or CUDA) |
+| v15 | Embeddings through `vllm_embed` |
+| v16 | Absolute KV-cache memory sizing |
+| v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
@@ -1252,3 +1289,11 @@ were removed when the example became a thin ABI client; see the header comment i
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
+
+## SSE keepalives on long prefill
+
+Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
+waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
+(default 15s; `0` disables). Comment frames are not `data:` events and do not
+carry tokens. Token streaming still uses a timed wait on the request collector
+so deltas are not collapsed by a poll loop.
