@@ -428,7 +428,9 @@ recurrences + fused attn preamble; 27B prefill 21.5x, decode
 on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
 (**blind-written, unverified**); M2 needs verification; gfx1201 hipBLAS +
 Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
-[guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
+[guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
+GGUF k-quant arm loads but cannot generate**: its `tokenizer.ggml.pre` is
+`llama4` (GPT-4o family), which we do not implement (#347). **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
 `device_communicators` across multi-GPU TP+PP, 2×DGX-Spark over ConnectX-7
@@ -1298,12 +1300,10 @@ same-binary rollback. Rebased-main graph-node `nsys` confirms the mechanism:
 causal-conv falls from **718.704 to 233.955 ms (3.072x)**, leaving **1.609x**
 to vLLM. The profiled whole run improves **2.272%** with identical token files.
 
-The enclosing A/B improves total/output **2.152%**, TTFT **2.945%**, TPOT/ITL
-**1.920%** and E2E latency **2.118%** without a local VRAM regression. Against
-the sealed same-workload vLLM baseline, throughput is **1.021246x PASS**; TTFT
-is **1.085812x OPEN**, TPOT/ITL **1.024597x OPEN**, and mean peak VRAM
-13053.3/12820 MiB OPEN. Fresh 18-leg oracle attempts were VOID JIT-environment
-runs and do not replace the sealed denominator.
+Against the sealed same-workload vLLM baseline throughput is
+**1.021246x PASS**; TTFT, TPOT/ITL and peak VRAM are **OPEN**. The A/B
+percentages, the exact OPEN ratios and the VOID 18-leg oracle attempts stay
+verbatim in `.agents/benchmark-record.md` and the evidence file below.
 
 This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
 reproduction:

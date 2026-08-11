@@ -595,3 +595,82 @@ token-exactness against anything, and no claim that the k-quant and the bf16 arm
 agree numerically — that comparison is OWED. And per §0 there is still **no speed
 axis of any kind**: the pinned oracle cannot load `muse_glimmer` in either weight
 format, so there is no denominator, and none is claimed.
+
+## 11. The speed attempt (2026-08-11, `row/MUSE-BENCH`, issue [#333](https://github.com/mudler/vllm.cpp/issues/333))
+
+**Result: no binding speed number was produced, and one bar moved from "assumed
+reachable" to "blocked with a named cause."** Each cell below is either a value
+with its arm stated, or a blocker. Nothing here is a ratio, because no cell has
+two quant-matched sides.
+
+| Bar | Arm | Outcome |
+|---|---|---|
+| **vLLM** | any | **OPEN GAP by construction.** Unchanged from §0: the pin carries no `muse_glimmer`, so there is nothing to divide by. Not waived, not substituted. |
+| **llama.cpp** (SECONDARY) | `muse-glimmer-30B-kquant-17gb.gguf` | **runs**; one contended datapoint, below. **Non-binding** — the box was at load 39-123. |
+| **ours** | same GGUF | **BLOCKED before the forward** — the tokenizer, not the loader. See §11.1. |
+| **HF transformers** | bf16 safetensors | **BLOCKED**: needs dgx (`$HOME/venvs/muse-onyx`), whose GPU lock was held for the whole window by another session's 27B online-serving gate. Not interfered with. |
+| **ours** | bf16 safetensors | **BLOCKED**: same host, and additionally needs a CUDA build that was deliberately not started so it would not perturb that measurement. |
+
+### 11.1 Our GGUF arm cannot generate — the blocker is the TOKENIZER
+
+§10.6 recorded "no forward was run on GGUF weights." The reason it cannot yet be
+run is upstream of the forward and was not previously named:
+
+```
+vllm-bench --model muse-glimmer-30B-kquant-17gb.gguf ...
+  -> failed: tokenizer: unsupported tokenizer.ggml.pre "llama4"
+```
+
+The file declares `tokenizer.ggml.model = gpt2` (which we accept) and
+`tokenizer.ggml.pre = llama4`, which `Tokenizer::FromGguf`
+(`src/vllm/tokenizer/tokenizer.cpp:749`) refuses by name.
+
+**This is not an alias away.** llama.cpp maps `llama4` to
+`LLAMA_VOCAB_PRE_TYPE_GPT4O` with `clean_spaces = false`
+(`src/llama-vocab.cpp:2294-2299` @ `030ebb5`), and that pre-type carries its own
+regex pair (`llama-vocab.cpp:428-434`) which is neither our `kLlama3` nor either
+`kQwen2` variant. Mapping it onto an existing pattern would silently mistokenize,
+which is exactly the failure mode the existing `qwen2`-vs-`qwen35` comment in
+that function refuses. The honest fix is a new `SplitPattern` for the GPT-4o
+family, with its own test, and it is **OWED** --
+issue [#347](https://github.com/mudler/vllm.cpp/issues/347).
+
+**Consequence for this row: a quant-matched llama.cpp comparison is not possible
+today.** Ours runs bf16 (~56 GB on disk) and llama.cpp ships k-quants only, so
+the only common artifact is the GGUF — and we cannot open its tokenizer. Running
+our bf16 against a 4-bit GGUF would report a quantization difference as a speed
+difference, so that cell is recorded **not comparable** rather than published.
+
+### 11.2 The llama.cpp datapoint, and why it is not a result
+
+Built from `ggml-org/llama.cpp` master `030ebb5` (Muse support merged in PR
+[#26841](https://github.com/ggml-org/llama.cpp/pull/26841), 2026-08-10; the local
+checkout at `237ad9b96` predates it), CPU-only Release, `-DGGML_NATIVE=ON`.
+File `muse-glimmer-30B-kquant-17gb.gguf` (16,756,681,056 bytes, rev `2fb01e4e6f`),
+which llama.cpp reports as `muse-glimmer 30B Q4_K - Medium`, 15.59 GiB, 27.85 B
+params. Host: 20-core x86-64, 84 GB RAM, **no GPU**; model read over a CIFS
+`soft` mount at ~117 MB/s, page-cache warmed before the run.
+
+```
+llama-bench -m muse-glimmer-30B-kquant-17gb.gguf -p 32 -n 8 -r 1 -t 4
+  pp32  9.79 t/s      tg8  0.79 t/s
+```
+
+**Why this is not a result.** One repetition, so there is no noise band at all;
+4 threads of 20; and the box was carrying four other agents' concurrent builds
+and test suites at load average 39 to 123 with the root filesystem repeatedly at
+100%. `.agents/benchmarking.md` requires the band to be calibrated from repeated
+identical legs *before* a delta is interpreted, and requires reproduction on an
+idle box. Neither was possible. A `-p 512 -n 64 -r 3 -t 20` leg was attempted
+and abandoned unfinished for the same reason. The number is recorded so the next
+attempt has something to disagree with, and for no other purpose.
+
+### 11.3 What is owed
+
+1. The GPT-4o-family `SplitPattern` (§11.1, issue
+   [#347](https://github.com/mudler/vllm.cpp/issues/347)) — until it lands our
+   GGUF arm has no e2e at all, quantized users included.
+2. Re-run both CPU legs on an idle box, `-r` >= 3, threads matched, band first.
+3. The bf16 pair (HF `exportable-muse` vs ours) on an idle dgx holding
+   `${GPU_LOCK}`, one large model resident at a time.
+4. The vLLM axis stays open until vllm#51655 merges and the pin advances.
