@@ -523,11 +523,15 @@ dependencies.
 
 ## Container images
 
-Published to one GHCR package with the lane in the tag:
-`ghcr.io/mudler/vllm.cpp:<version>-cuda`, `-vulkan`, `-cpu`, plus the moving
-`:latest-<lane>`. The bare `:latest` is the **cpu** lane, so pulling it on a
-machine with no accelerator gets a working server rather than a library-load
-failure. Every lane is a `linux/amd64` + `linux/arm64` manifest.
+Published to one GHCR package with the lane in the tag. Every lane is a
+`linux/amd64` + `linux/arm64` manifest, so the same tag works on both.
+
+| tag | what it is |
+|---|---|
+| `:<version>-cuda` / `-vulkan` / `-cpu` | **immutable.** Never republished |
+| `:latest-cuda` / `-vulkan` / `-cpu` | moves to the newest **release** |
+| `:latest` | the **cpu** lane, so pulling it on a machine with no accelerator gets a working server rather than a library-load failure |
+| `:main-cuda` / `-vulkan` / `-cpu` | moves with **main**: rebuilt when container infrastructure changes and nightly otherwise. Convenience, not a release — no support claim |
 
 The entrypoint is `vllm-server`, so flags go straight after the image name and
 the server keeps its own default of `0.0.0.0:8000`:
@@ -555,27 +559,40 @@ weights under `/models` must be READABLE by it. A model file with mode `0600`
 owned by another uid fails as `safetensors: cannot open file`, which reads like
 a corrupt checkpoint rather than a permissions problem.
 
-### On Jetson (Tegra/L4T)
+### Picking the right flags for your GPU
 
-The cuda image is one SBSA build and it runs on Jetson too -- verified on AGX
-Orin (`sm_87`, L4T R36.4.3) -- but Tegra needs a **different invocation**:
+The two NVIDIA families need **different** invocations, and this is verified on
+both rather than inferred:
+
+| host | verified on | flags |
+|---|---|---|
+| SBSA / datacenter arm64, x86_64 | GB10 `sm_121a` | `--gpus all` |
+| Jetson / Tegra (L4T) | AGX Orin `sm_87`, L4T R36.4.3 | `--runtime nvidia --gpus all` |
+
+On Jetson, `--gpus all` **alone is refused** ("invoking the NVIDIA Container
+Runtime Hook directly ... is not supported"), and `--runtime nvidia` **alone**
+starts a container with no driver that dies on `libcuda.so.1: cannot open
+shared object file` — which looks like a broken image rather than a missing
+flag. Use both:
 
 ```sh
 docker run --rm --runtime nvidia --gpus all -p 8000:8000 \
   -v /path/to/models:/models:ro \
   ghcr.io/mudler/vllm.cpp:latest-cuda \
-  --model /models/your-model
+  --model /models/Qwen3-0.6B
 ```
 
-`--gpus all` on its own is refused there ("invoking the NVIDIA Container Runtime
-Hook directly ... is not supported"), and `--runtime nvidia` on its own starts a
-container with no driver, which dies on `libcuda.so.1: cannot open shared object
-file`. Both flags together are what works. `ffmpeg` is installed in every lane, so `/v1/videos` works out of the box —
-a deliberate difference from the tarballs, which never vendor it because they
-are extracted onto a host that already has a `PATH`.
+That exact recipe was run on an AGX Orin with `Qwen/Qwen3-0.6B`: the server
+serves `/v1/completions` and `tegrastats` shows `GR3D_FREQ` at 95-97% during
+generation, so decode is on the GPU.
 
-macOS Metal and MLX have no image and never will: there is no macOS container
-runtime and no Metal passthrough. ROCm has no image until its backend compiles.
+### If the server exits at startup
+
+| symptom | cause |
+|---|---|
+| `safetensors: cannot open file` | the weights are not readable by **uid 1000**. The container runs as uid 1000; a `0600` model owned by another user fails here and looks like a corrupt checkpoint |
+| `libcuda.so.1: cannot open shared object file` | no driver in the container — on Jetson, add `--gpus all` alongside `--runtime nvidia` |
+| `--model <dir> is required` | the server takes flags directly; everything after the image name goes to `vllm-server` |
 
 ### Building and validating an image locally
 
