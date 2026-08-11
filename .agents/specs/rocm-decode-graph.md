@@ -2,17 +2,14 @@
 
 **Row:** `BACKEND-ROCM` (backend-matrix, `ACTIVE`).
 **Claim:** `CLAIM-ROCM-DECODE-GRAPH` (unclaimed at time of writing).
-**Issue:** **PENDING — file before implementation starts.** Per AGENTS.md "no
-work without an open GitHub issue"; the number then lands here, in the
-[roadmap intake table](../roadmap_v1.md), and in the PR body, and the three must
-agree. Draft text: §9 W0.
-**Base:** `6e4244f0` on `docs/rocm-gfx1200-m2-spec`, so this **stacks on
-[PR #273](https://github.com/mudler/vllm.cpp/pull/273)**, where
-[rocm-gfx1200-m2-correctness.md](rocm-gfx1200-m2-correctness.md) lands;
-`check-agent-record` fails with a dangling link if based on `main`. #273 merges
-first. The source tree is `f323907e` (`upstream/main`, 2026-08-10) — #273 is
-docs-only, so every `file:line` below holds against either. Re-anchor at
-implementation time; `check_links` validates ranges.
+**Issue:** [#332](https://github.com/mudler/vllm.cpp/issues/332), also carried in
+the [roadmap intake table](../roadmap_v1.md) and owed in the PR body — the three
+must agree.
+**Base:** current `upstream/main`. The gfx1200 correctness record this spec
+links, [rocm-gfx1200-m2-correctness.md](rocm-gfx1200-m2-correctness.md), is
+already ON `main` — it landed with #273's commits, so there is nothing left to
+stack on and no dangling link. Every `file:line` below was re-verified against
+this tree. Re-anchor at implementation time; `check_links` validates ranges.
 **Board:** AMD Radeon RX 9060 XT (`gfx1200`, Navi 44, RDNA4, discrete), ROCm
 7.2.3, hipClang/Clang 22.0.0 — the only board with hardware access here. Records
 say gfx1200 and must not imply the four #41 boards
@@ -293,21 +290,8 @@ the W1 approach-(b) delta does today.
 
 ## 9. Work breakdown
 
-- **W0 — file the issue, commit this spec.** No code. *Gate: issue open, number
-  agreeing in three places.* Draft:
-  > **Title:** ROCm: no decode-graph capture — hipGraph seam unimplemented,
-  > costing up to ~3x decode throughput vs vLLM on gfx1200
-  > **Body:** `vt::Backend`'s graph-capture virtuals are CUDA-only;
-  > `SupportsGraphCapture()` is false on ROCm and `support_static_graph_mode()`
-  > inherits false, so every decode step pays full host launch cost. Measured on
-  > RX 9060 XT (gfx1200, ROCm 7.2.3) vs a real vLLM-ROCm oracle at pin
-  > `555967922` in production config, batch 8, 128in/128out: Qwen3-0.6B 184.69
-  > vs 552.65 tok/s (2.99x), Qwen3-1.7B 150.50 vs 286.42 (1.90x), Qwen3-4B 98.49
-  > vs 143.36 (1.46x). The gap shrinks monotonically as per-step compute grows
-  > while launch count stays fixed — the signature of launch overhead, not
-  > kernel quality. vLLM captures 51 piecewise + 35 full hipGraphs on this same
-  > board, so hipGraph capture demonstrably works here.
-  > Spec: `.agents/specs/rocm-decode-graph.md`.
+- **W0 — DONE.** [#332](https://github.com/mudler/vllm.cpp/issues/332) filed and
+  carried in the intake table and this header; this spec committed. No code.
 - **W1 — backend seam + micro-test.** §5 port map, §6 test, RED-first. Verify D1
   with a capture around a GEMM. *Gate: 1, 2, 7.*
 - **W2 — flip `support_static_graph_mode()`, run a real model.** Qwen3-0.6B end
