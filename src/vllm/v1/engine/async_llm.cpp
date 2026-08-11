@@ -36,6 +36,11 @@ AsyncLLM::AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
 
 AsyncLLM::~AsyncLLM() { shutdown(); }
 
+void AsyncLLM::set_stat_logger(metrics::PrometheusStatLogger* logger) {
+  std::lock_guard<std::mutex> lock(stat_logger_mutex_);
+  stat_logger_ = logger;
+}
+
 AsyncRequest AsyncLLM::add_request(const std::string& request_id,
                                    const std::string& prompt,
                                    SamplingParams params, int priority) {
@@ -269,8 +274,12 @@ void AsyncLLM::RunOutputHandler() {
       // async_llm.py:648-652 logger_ref[0] — read ONCE per iteration so the
       // build decision and the fold below cannot disagree if the logger is
       // detached mid-step.
-      metrics::PrometheusStatLogger* logger =
-          stat_logger_.load(std::memory_order_acquire);
+      // Keep the attachment stable through the complete stats fold. In
+      // particular, a terminal output is visible to generate() before Record
+      // below finishes; holding this lock makes a concurrent detach wait until
+      // the last possible use of the old non-owning pointer has retired.
+      std::unique_lock<std::mutex> logger_lock(stat_logger_mutex_);
+      metrics::PrometheusStatLogger* logger = stat_logger_;
 
       // async_llm.py:664-665
       //   iteration_stats = IterationStats() if (log_stats and num_outputs)

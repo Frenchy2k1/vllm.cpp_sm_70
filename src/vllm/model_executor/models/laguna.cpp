@@ -52,8 +52,35 @@
 #include "vt/ops.h"      // vt::MatmulBT (dispatches kMatmulBTQuant on block weights)
 #include "vt/recipes.h"  // vt::kFusedAddRmsNormStd (L4 residual-add + RMSNorm fusion)
 #include "vt/tensor.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
+
+void StageLagunaGraphEmbedding(const OwnedTensor& embed, int32_t token,
+                               int64_t hidden_size, int64_t vocab_size,
+                               float* destination) {
+  VT_CHECK(token >= 0 && token < vocab_size,
+           "laguna: token id out of range");
+  VT_CHECK(embed.dtype == vt::DType::kF32 ||
+               embed.dtype == vt::DType::kBF16,
+           "laguna embed: table dtype must be f32/bf16");
+  const size_t row_offset =
+      static_cast<size_t>(token) * static_cast<size_t>(hidden_size);
+  const uint8_t* row = embed.bytes.data() +
+                       row_offset * vt::SizeOf(embed.dtype);
+  if (embed.dtype == vt::DType::kBF16) {
+    for (int64_t i = 0; i < hidden_size; ++i) {
+      const uint32_t bits =
+          static_cast<uint32_t>(vt::LoadUnaligned<uint16_t>(row + i * 2))
+          << 16;
+      std::memcpy(&destination[i], &bits, sizeof(float));
+    }
+  } else {
+    std::memcpy(destination, row,
+                static_cast<size_t>(hidden_size) * sizeof(float));
+  }
+}
+
 namespace {
 
 // LEVER A: host f32→bf16 round-to-nearest-even (matches CUDA __float2bfloat16 used by the
@@ -147,9 +174,10 @@ std::vector<float> ReadF32(const OwnedTensor& t) {
   if (t.dtype == vt::DType::kF32) {
     std::memcpy(out.data(), raw, static_cast<size_t>(n) * sizeof(float));
   } else if (t.dtype == vt::DType::kBF16) {
-    const auto* b = reinterpret_cast<const uint16_t*>(raw);
     for (int64_t i = 0; i < n; ++i) {
-      const uint32_t bits = static_cast<uint32_t>(b[i]) << 16;
+      const uint32_t bits =
+          static_cast<uint32_t>(vt::LoadUnaligned<uint16_t>(raw + i * 2))
+          << 16;
       std::memcpy(&out[static_cast<size_t>(i)], &bits, sizeof(float));
     }
   } else {
@@ -1013,26 +1041,10 @@ std::vector<float> LagunaEmbed(const OwnedTensor& embed_t,
                                int64_t Vsz) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   std::vector<float> hidden(static_cast<size_t>(T * H));
-  const uint8_t* raw = embed_t.bytes.data();
-  const bool is_bf16 = embed_t.dtype == vt::DType::kBF16;
-  VT_CHECK(embed_t.dtype == vt::DType::kF32 || is_bf16,
-           "laguna embed: table dtype must be f32/bf16 (matches ReadF32)");
   for (int64_t t = 0; t < T; ++t) {
     const int64_t tok = token_ids[static_cast<size_t>(t)];
-    VT_CHECK(tok >= 0 && tok < Vsz, "laguna: token id out of range");
     float* dst = hidden.data() + static_cast<size_t>(t * H);
-    if (is_bf16) {
-      const auto* b =
-          reinterpret_cast<const uint16_t*>(raw) + static_cast<size_t>(tok * H);
-      for (int64_t i = 0; i < H; ++i) {
-        const uint32_t bits = static_cast<uint32_t>(b[i]) << 16;
-        std::memcpy(&dst[i], &bits, sizeof(float));
-      }
-    } else {
-      std::memcpy(dst,
-                  reinterpret_cast<const float*>(raw) + static_cast<size_t>(tok * H),
-                  static_cast<size_t>(H) * sizeof(float));
-    }
+    StageLagunaGraphEmbedding(embed_t, static_cast<int32_t>(tok), H, Vsz, dst);
   }
   return hidden;
 }
@@ -2663,21 +2675,7 @@ struct LagunaGraph {
     if (ondev) {
       argmax_id[0] = static_cast<int64_t>(token);
     } else {
-      const OwnedTensor& et = w->embed;
-      const uint8_t* raw = et.bytes.data();
-      const bool is_bf16 = et.dtype == vt::DType::kBF16;
-      float* dst = hidden.data();
-      if (is_bf16) {
-        const auto* bb =
-            reinterpret_cast<const uint16_t*>(raw) + static_cast<size_t>(token) * H;
-        for (int64_t i = 0; i < H; ++i) {
-          const uint32_t bits = static_cast<uint32_t>(bb[i]) << 16;
-          std::memcpy(&dst[i], &bits, sizeof(float));
-        }
-      } else {
-        std::memcpy(dst, reinterpret_cast<const float*>(raw) + static_cast<size_t>(token) * H,
-                    static_cast<size_t>(H) * sizeof(float));
-      }
+      StageLagunaGraphEmbedding(w->embed, token, H, Vsz, hidden.data());
     }
     // (2) device-read scalars (the ONLY per-step host refresh now: pos indexes the
     // in-graph RoPE table on-device, len drives both the in-graph attention and KV append).
