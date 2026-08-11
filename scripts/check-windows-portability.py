@@ -312,6 +312,98 @@ def _active_powershell(text: str) -> str:
     return re.sub(r"(?is)if\s*\(\s*\$ContractTest\s*\)\s*\{.*?\}", "", text)
 
 
+def _powershell_syntax(text: str) -> str:
+    """Blank PowerShell comments and strings while preserving source offsets."""
+    out = list(text)
+    index = 0
+    quote = ""
+    block_comment = False
+    while index < len(text):
+        if block_comment:
+            if text.startswith("#>", index):
+                out[index:index + 2] = "  "
+                block_comment = False
+                index += 2
+            else:
+                if text[index] != "\n":
+                    out[index] = " "
+                index += 1
+            continue
+        if quote:
+            if quote == '"' and text[index] == "`" and index + 1 < len(text):
+                out[index:index + 2] = "  "
+                index += 2
+                continue
+            if text[index] == quote:
+                if quote == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                    out[index:index + 2] = "  "
+                    index += 2
+                    continue
+                out[index] = " "
+                quote = ""
+                index += 1
+                continue
+            if text[index] != "\n":
+                out[index] = " "
+            index += 1
+            continue
+        if text.startswith("<#", index):
+            out[index:index + 2] = "  "
+            block_comment = True
+            index += 2
+            continue
+        if text[index] == "#":
+            while index < len(text) and text[index] != "\n":
+                out[index] = " "
+                index += 1
+            continue
+        if text[index] in {"'", '"'}:
+            quote = text[index]
+            out[index] = " "
+            index += 1
+            continue
+        index += 1
+    return "".join(out)
+
+
+def _powershell_function_body(text: str, name: str) -> str:
+    syntax = _powershell_syntax(text)
+    match = re.search(
+        rf"\bfunction\s+{re.escape(name)}\s*\{{", syntax, re.IGNORECASE
+    )
+    if match is None:
+        return ""
+    opening = syntax.find("{", match.start(), match.end())
+    depth = 0
+    for offset in range(opening, len(syntax)):
+        if syntax[offset] == "{":
+            depth += 1
+        elif syntax[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[opening + 1:offset]
+    return ""
+
+
+def _powershell_scriptblock_assignment_body(text: str, variable: str) -> str:
+    syntax = _powershell_syntax(text)
+    match = re.search(
+        rf"\${re.escape(variable)}\s*=\s*\{{", syntax, re.IGNORECASE
+    )
+    if match is None:
+        return ""
+    opening = syntax.find("{", match.start(), match.end())
+    depth = 0
+    for offset in range(opening, len(syntax)):
+        if syntax[offset] == "{":
+            depth += 1
+        elif syntax[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[opening + 1:offset]
+    return ""
+
+
 def _ordered_matches(text: str, stages: tuple[tuple[str, str], ...],
                      errors: list[str], label: str) -> None:
     offsets: list[int] = []
@@ -400,18 +492,19 @@ def _cpp_braced_body(source: str, opening: int) -> tuple[str, int] | None:
     return None
 
 
-def _cpp_function_body(source: str, signature: str) -> str:
+def _cpp_function_body_span(source: str,
+                            signature: str) -> tuple[str, int, int] | None:
     active = without_cpp_comments_and_literals(source)
     search_from = 0
     while True:
         match = re.search(signature, active[search_from:])
         if match is None:
-            return ""
+            return None
         match_start = search_from + match.start()
         match_end = search_from + match.end()
         parameters_open = active.rfind("(", match_start, match_end)
         if parameters_open < 0:
-            return ""
+            return None
 
         depth = 0
         parameters_close = -1
@@ -424,7 +517,7 @@ def _cpp_function_body(source: str, signature: str) -> str:
                     parameters_close = offset
                     break
         if parameters_close < 0:
-            return ""
+            return None
 
         suffix_depth: list[str] = []
         declaration = False
@@ -448,13 +541,13 @@ def _cpp_function_body(source: str, signature: str) -> str:
                                 expression = cursor + 1
                                 break
                     else:
-                        return ""
+                        return None
                     while expression < len(active) and active[expression].isspace():
                         expression += 1
                 if expression < len(active) and active[expression] == "{":
                     requires_body = _cpp_braced_body(active, expression)
                     if requires_body is None:
-                        return ""
+                        return None
                     offset = requires_body[1] + 1
                     continue
             if char in pairs:
@@ -467,30 +560,176 @@ def _cpp_function_body(source: str, signature: str) -> str:
                 break
             elif not suffix_depth and char == "{":
                 result = _cpp_braced_body(active, offset)
-                return "" if result is None else result[0]
+                if result is None:
+                    return None
+                return result[0], offset + 1, result[1]
             offset += 1
         if not declaration:
-            return ""
+            return None
 
 
-def _active_cpp_macro_names(source: str) -> set[str]:
-    """Return macros defined in source branches that can compile on Windows."""
-    active = without_cpp_comments_and_literals(source)
-    names: set[str] = set()
-    for _, line in windows_possible_lines(active):
-        match = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)", line)
-        if match is not None:
-            names.add(match.group(1))
-    return names
+def _cpp_function_body(source: str, signature: str) -> str:
+    result = _cpp_function_body_span(source, signature)
+    return "" if result is None else result[0]
+
+
+def _cpp_logical_directives(source: str, stop: int):
+    """Yield preprocessing directives after phase-2 line splicing."""
+    active = without_cpp_comments_and_literals(source[:stop])
+    logical = ""
+    logical_start = 0
+    offset = 0
+    for line in active.splitlines(keepends=True):
+        if not logical:
+            logical_start = offset
+        offset += len(line)
+        continued = re.search(r"\\(?:\r?\n)$", line) is not None
+        logical += re.sub(r"\\(?:\r?\n)$", "", line)
+        if continued:
+            continue
+        if re.match(r"\s*#", logical):
+            yield logical_start, offset, logical
+        logical = ""
+    if logical and re.match(r"\s*#", logical):
+        yield logical_start, offset, logical
+
+
+def _cpp_condition_possibilities(expression: str,
+                                 macros: frozenset[str]) -> tuple[bool, bool]:
+    """Return whether a preprocessing expression may be true and false."""
+    expression = expression.strip()
+    while (expression.startswith("(") and expression.endswith(")") and
+           expression.count("(") == expression.count(")")):
+        expression = expression[1:-1].strip()
+    if re.fullmatch(r"0+[uUlL]*", expression):
+        return False, True
+    if re.fullmatch(r"[1-9]\d*[uUlL]*", expression):
+        return True, False
+    defined = re.fullmatch(
+        r"(!\s*)?defined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|"
+        r"([A-Za-z_]\w*))",
+        expression,
+    )
+    if defined is not None:
+        name = defined.group(2) or defined.group(3)
+        if name in {"_WIN32", "_MSC_VER"}:
+            value = True
+        elif name in {"__GNUC__", "__clang__", "__unix__", "__APPLE__"}:
+            value = False
+        else:
+            value = name in macros
+        if defined.group(1):
+            value = not value
+        return value, not value
+    if expression in {"_WIN32", "_MSC_VER"}:
+        return True, False
+    if expression in {"__GNUC__", "__clang__", "__unix__", "__APPLE__"}:
+        return False, True
+    return True, True
+
+
+def _split_cpp_states(states: set[frozenset[str]], expression: str
+                      ) -> tuple[set[frozenset[str]], set[frozenset[str]]]:
+    true_states: set[frozenset[str]] = set()
+    false_states: set[frozenset[str]] = set()
+    for state in states:
+        may_true, may_false = _cpp_condition_possibilities(expression, state)
+        if may_true:
+            true_states.add(state)
+        if may_false:
+            false_states.add(state)
+    return true_states, false_states
+
+
+def _active_cpp_macro_names_at(source: str, stop: int) -> set[str]:
+    """Return macros possibly active on Windows at one exact source offset."""
+    states: set[frozenset[str]] = {frozenset()}
+    stack: list[dict[str, set[frozenset[str]] | bool]] = []
+    for _, _, logical in _cpp_logical_directives(source, stop):
+        directive = re.match(r"\s*#\s*([A-Za-z_]\w*)(.*)", logical,
+                             re.DOTALL)
+        if directive is None:
+            continue
+        command = directive.group(1).lower()
+        argument = directive.group(2).strip()
+        if command in {"if", "ifdef", "ifndef"}:
+            if command == "ifdef":
+                expression = f"defined({argument.split()[0]})"
+            elif command == "ifndef":
+                expression = f"!defined({argument.split()[0]})"
+            else:
+                expression = argument
+            current, remaining = _split_cpp_states(states, expression)
+            stack.append({
+                "remaining": remaining,
+                "completed": set(),
+                "else_seen": False,
+            })
+            states = current
+        elif command == "elif" and stack:
+            frame = stack[-1]
+            completed = frame["completed"]
+            remaining = frame["remaining"]
+            assert isinstance(completed, set) and isinstance(remaining, set)
+            completed.update(states)
+            states, new_remaining = _split_cpp_states(remaining, argument)
+            frame["remaining"] = new_remaining
+        elif command == "else" and stack:
+            frame = stack[-1]
+            completed = frame["completed"]
+            remaining = frame["remaining"]
+            assert isinstance(completed, set) and isinstance(remaining, set)
+            completed.update(states)
+            states = remaining
+            frame["remaining"] = set()
+            frame["else_seen"] = True
+        elif command == "endif" and stack:
+            frame = stack.pop()
+            completed = frame["completed"]
+            remaining = frame["remaining"]
+            assert isinstance(completed, set) and isinstance(remaining, set)
+            states = completed.union(states, remaining)
+        elif command == "define":
+            name = re.match(r"([A-Za-z_]\w*)", argument)
+            if name is not None:
+                states = {
+                    frozenset(set(state) | {name.group(1)}) for state in states
+                }
+        elif command == "undef":
+            name = re.match(r"([A-Za-z_]\w*)", argument)
+            if name is not None:
+                states = {
+                    frozenset(item for item in state if item != name.group(1))
+                    for state in states
+                }
+    return set().union(*(set(state) for state in states)) if states else set()
 
 
 def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
     active = _active_powershell(text)
-    filter_count = len(re.findall(re.escape(UNSUPPORTED_TIER_FILTER), active))
+    probe = _active_powershell(_powershell_function_body(
+        text, "Invoke-UnsupportedTierProbe"
+    ))
+    contract = _active_powershell(_powershell_function_body(
+        text, "Invoke-UnsupportedTierContractTests"
+    ))
+    good_runner = _active_powershell(
+        _powershell_scriptblock_assignment_body(contract, "good")
+    )
+    if not probe:
+        errors.append(
+            "build-windows-release.ps1: missing active unsupported-tier probe helper"
+        )
+    if not contract:
+        errors.append(
+            "build-windows-release.ps1: missing active unsupported-tier fake-tool contract"
+        )
+
+    filter_count = len(re.findall(re.escape(UNSUPPORTED_TIER_FILTER), probe))
     exact_filter_argument = re.search(
         r"\$arguments\s*=\s*@\(\s*(['\"])" +
         re.escape(UNSUPPORTED_TIER_FILTER) + r"\1\s*\)",
-        active,
+        probe,
         re.IGNORECASE | re.MULTILINE,
     )
     if filter_count == 0:
@@ -522,19 +761,84 @@ def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
         ),
     )
     for pattern, description in requirements:
-        if re.search(pattern, active, re.IGNORECASE | re.MULTILINE) is None:
+        scope = active if description == "unsupported-tier environment restoration" else probe
+        if re.search(pattern, scope, re.IGNORECASE | re.MULTILINE) is None:
             errors.append(
                 f"build-windows-release.ps1: missing active {description}"
             )
 
+    direct_invocations = re.findall(
+        r"&\s*\$TierTest\b", probe, re.IGNORECASE
+    )
+    exact_direct = re.findall(
+        r"@\(\s*&\s*\$TierTest\s+@arguments\s+2>&1\s*\)",
+        probe,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if len(direct_invocations) != 1 or len(exact_direct) != 1:
+        errors.append(
+            "build-windows-release.ps1: unsupported-tier probe requires "
+            "exactly one filtered process invocation"
+        )
+
+    runner_invocations = re.findall(r"&\s*\$Runner\b", probe, re.IGNORECASE)
+    exact_runner = re.findall(
+        r"\$probeResult\s*=\s*&\s*\$Runner\s+\$TierTest\s+\$arguments\b",
+        probe,
+        re.IGNORECASE,
+    )
+    if len(runner_invocations) != 1:
+        errors.append(
+            "build-windows-release.ps1: unsupported-tier probe requires "
+            "exactly one fake-runner invocation"
+        )
+    elif len(exact_runner) != 1:
+        errors.append(
+            "build-windows-release.ps1: fake runner requires exact "
+            "unsupported-tier filter arguments"
+        )
+
     for crash_status in ("134", "-1073741819", "3", "2"):
         if re.search(
-                rf"ExitCode\s*=\s*{re.escape(crash_status)}\b", active,
+                rf"ExitCode\s*=\s*{re.escape(crash_status)}\b", contract,
                 re.IGNORECASE) is None:
             errors.append(
                 "build-windows-release.ps1: unsupported-tier crash contract "
                 f"is missing status {crash_status}"
             )
+
+    fake_contract_requirements = (
+        (r"\$calls\.Count\s*-ne\s*1\b", "exactly one recorded fake call"),
+        (
+            r"\$calls\s*\[\s*0\s*\]\.Arguments\.Count\s*-ne\s*1\b",
+            "exactly one recorded fake argument",
+        ),
+        (
+            r"\$calls\s*\[\s*0\s*\]\.Arguments\s*\[\s*0\s*\]\s*"
+            r"-ne\s*(['\"])" + re.escape(UNSUPPORTED_TIER_FILTER) + r"\1",
+            "exact recorded fake filter argument",
+        ),
+    )
+    for pattern, description in fake_contract_requirements:
+        if re.search(pattern, contract, re.IGNORECASE | re.MULTILINE) is None:
+            errors.append(
+                f"build-windows-release.ps1: missing active {description}"
+            )
+    if re.search(r"\$calls\.Add\s*\(", good_runner, re.IGNORECASE) is None:
+        errors.append(
+            "build-windows-release.ps1: missing active fake runner call recording"
+        )
+    good_calls = re.findall(
+        r"Invoke-UnsupportedTierProbe\s+-TierTest\s+(['\"])"
+        r"fake-tier-test\.exe\1\s+-Runner\s+\$good\b",
+        contract,
+        re.IGNORECASE,
+    )
+    if len(good_calls) != 1:
+        errors.append(
+            "build-windows-release.ps1: fake contract requires exactly one "
+            "unsupported-tier probe invocation"
+        )
 
     uncommented = re.sub(r"(?s)<#.*?#>", "", text)
     uncommented = "\n".join(
@@ -636,7 +940,10 @@ def _validate_bounded_drain(console: str, function: str, counter: str,
 
 def _validate_console_protocol(console: str, errors: list[str]) -> None:
     active_console = without_cpp_comments_and_literals(console)
-    dispatch = _cpp_function_body(console, r"\bbool\s+DispatchControlEvent\s*\(")
+    dispatch_span = _cpp_function_body_span(
+        console, r"\bbool\s+DispatchControlEvent\s*\("
+    )
+    dispatch = "" if dispatch_span is None else dispatch_span[0]
     handler = _cpp_function_body(
         console, r"\bBOOL\s+WINAPI\s+ConsoleControlHandler\s*\("
     )
@@ -710,9 +1017,13 @@ def _validate_console_protocol(console: str, errors: list[str]) -> None:
         "state", "in_flight", "fetch_sub", "std", "memory_order_seq_cst",
         "return", "resumed",
     }
-    macro_collisions = sorted(
-        trusted_tail_tokens.intersection(_active_cpp_macro_names(console))
+    tail_offset = (
+        len(console) if dispatch_span is None or not final_decrements else
+        dispatch_span[1] + final_decrements[0].start()
     )
+    macro_collisions = sorted(trusted_tail_tokens.intersection(
+        _active_cpp_macro_names_at(console, tail_offset)
+    ))
     if macro_collisions:
         errors.append(
             "console_shutdown.cpp: trusted final-tail token must not be a macro "

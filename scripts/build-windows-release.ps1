@@ -105,11 +105,24 @@ function Invoke-UnsupportedTierProbe {
 
 function Invoke-UnsupportedTierContractTests {
     $diagnostic = "unknown x86 ISA tier 'amx'"
+    $calls = [System.Collections.Generic.List[object]]::new()
     $good = {
         param([string]$Program, [string[]]$Arguments)
+        $calls.Add([pscustomobject]@{
+            Program = $Program
+            Arguments = @($Arguments)
+        }) | Out-Null
         [pscustomobject]@{ ExitCode = 1; Output = @($diagnostic) }
     }.GetNewClosure()
     Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" -Runner $good
+    if ($calls.Count -ne 1) {
+        throw "unsupported-tier fake runner was not invoked exactly once"
+    }
+    if ($calls[0].Arguments.Count -ne 1 -or
+        $calls[0].Arguments[0] -ne
+            '--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran') {
+        throw "unsupported-tier fake runner did not receive one exact filter argument"
+    }
 
     $badResults = @(
         [pscustomobject]@{ ExitCode = 0; Output = @($diagnostic) },
