@@ -740,3 +740,76 @@ TEST_CASE("C7 wiring: index-keyed controls follow the row through swap/condense"
   CHECK(batch.allowed_token_ids_mask[static_cast<size_t>(ia)][1] == 0);
   CHECK(batch.allowed_token_ids_mask[static_cast<size_t>(ia)][0] == 1);
 }
+
+// ─── logprob_token_ids plumbing (gpu_input_batch.py:273,443-444,574,934-951) ──
+// The map is keyed by req_ID in the InputBatch and by req_INDEX in the
+// SamplingMetadata, exactly as upstream: id-keying is what makes condense() free
+// (like the sibling num_logprobs map), and make_sampling_metadata re-derives the
+// indices from req_id_to_index over the LIVE batch only.
+//
+// RED before the port: batch.logprob_token_ids does not exist and
+// md.logprob_token_ids is never set.
+TEST_CASE("logprob_token_ids: ids reach SamplingMetadata keyed by req index") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams a;
+  a.temperature = 0.0;
+  vllm::SamplingParams b;
+  b.temperature = 0.0;
+  b.logprob_token_ids = std::vector<int32_t>{7, 42};
+  batch.add_request(make_req_sp("a", a));
+  batch.add_request(make_req_sp("b", b));
+
+  // Tracked by req_id at admission; "a" never appears.
+  REQUIRE(batch.logprob_token_ids.count("b") == 1);
+  CHECK(batch.logprob_token_ids.at("b") == std::vector<int32_t>{7, 42});
+  CHECK(batch.logprob_token_ids.count("a") == 0);
+
+  const auto& md = batch.make_sampling_metadata();
+  REQUIRE(md.logprob_token_ids.has_value());
+  const int ib = batch.req_id_to_index.at("b");
+  REQUIRE(md.logprob_token_ids->count(ib) == 1);
+  CHECK(md.logprob_token_ids->at(ib) == std::vector<int32_t>{7, 42});
+  CHECK(md.logprob_token_ids->count(batch.req_id_to_index.at("a")) == 0);
+
+  // logprob_token_ids alone does NOT populate max_num_logprobs: upstream only
+  // fills num_logprobs when sampling_params.logprobs is set (:435-440), and the
+  // sampler's `or` at sampler.py:86 is what makes the snapshot fire anyway.
+  CHECK_FALSE(md.max_num_logprobs.has_value());
+}
+
+// remove_request pops the entry (gpu_input_batch.py:574), and the ids follow the
+// request through condense because the map is req_id-keyed.
+TEST_CASE("logprob_token_ids: removal pops the entry, condense leaves it alone") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams a;
+  a.temperature = 0.0;
+  a.logprob_token_ids = std::vector<int32_t>{1};
+  vllm::SamplingParams b;
+  b.temperature = 0.0;
+  b.logprob_token_ids = std::vector<int32_t>{2, 3};
+  batch.add_request(make_req_sp("a", a));
+  batch.add_request(make_req_sp("b", b));
+
+  batch.remove_request("a");
+  CHECK(batch.logprob_token_ids.count("a") == 0);
+  batch.condense();
+  REQUIRE(batch.logprob_token_ids.count("b") == 1);
+  CHECK(batch.logprob_token_ids.at("b") == std::vector<int32_t>{2, 3});
+
+  const auto& md = batch.make_sampling_metadata();
+  REQUIRE(md.logprob_token_ids.has_value());
+  CHECK(md.logprob_token_ids->at(batch.req_id_to_index.at("b")) ==
+        std::vector<int32_t>{2, 3});
+}
+
+// Inertness: a request that does not set the field leaves the optional UNSET,
+// mirroring `logprob_token_ids_by_index = None` at gpu_input_batch.py:935-936.
+TEST_CASE("logprob_token_ids: a default request leaves the optional unset") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams sp;
+  sp.temperature = 0.0;
+  batch.add_request(make_req_sp("r0", sp));
+  const auto& md = batch.make_sampling_metadata();
+  CHECK(batch.logprob_token_ids.empty());
+  CHECK_FALSE(md.logprob_token_ids.has_value());
+}

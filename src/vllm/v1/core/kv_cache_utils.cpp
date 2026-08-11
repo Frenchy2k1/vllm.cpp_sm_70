@@ -6,6 +6,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -898,6 +899,187 @@ std::vector<KVCacheBlock*> FreeKVCacheBlockQueue::get_all_free_blocks() const {
     curr_block = curr_block->next_free_block;
   }
   return ret;
+}
+
+namespace {
+
+// vllm/utils/mem_utils.py:30-31 format_gib: `f"{round(b / GiB_bytes, 2)}"`.
+// Fixed 2 decimals rather than Python's float repr (which drops a trailing
+// zero); the value is identical, only "1.50" vs "1.5" differs.
+std::string FormatGiB(int64_t bytes) {
+  const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  std::array<char, 64> buf{};
+  std::snprintf(buf.data(), buf.size(), "%.2f", gib);
+  return std::string(buf.data());
+}
+
+// The vllm.cpp-specific half of the remediation advice. Upstream points at
+// `gpu_memory_utilization`, which our loader does not implement yet
+// (model_loader.cpp ResolveNumBlocks step 3, TODO ROAD-V1-MEM M3), so name the
+// knobs that do size the pool here. Additive: upstream's sentence is kept
+// verbatim ahead of it.
+constexpr const char* kLocalRemediation =
+    " In vllm.cpp the KV pool is sized by `--num-blocks` / `--kv-cache-memory`"
+    " (gpu_memory_utilization profiling is not ported yet), so raise one of"
+    " those or lower `--max-model-len`.";
+
+constexpr const char* kConservingMemoryDoc =
+    " See https://docs.vllm.ai/en/latest/configuration/conserving_memory/"
+    " for more details.";
+
+}  // namespace
+
+int64_t kv_memory_needed_bytes(int64_t max_model_len, int block_size,
+                               int64_t bytes_per_block) {
+  if (max_model_len <= 0 || block_size <= 0 || bytes_per_block <= 0) {
+    return 0;
+  }
+  // Whole blocks only: ceil(max_model_len / block_size).
+  const int64_t blocks =
+      (max_model_len + block_size - 1) / static_cast<int64_t>(block_size);
+  return blocks * bytes_per_block;
+}
+
+int64_t host_available_memory_bytes() {
+  // The pool the allocation actually draws from. On a unified-memory device
+  // (GB10, Jetson Thor) device allocations come out of exactly this, which is why
+  // an oversized state does not fail cleanly there: with vm.overcommit_memory=1
+  // and no swap the kernel promises pages it cannot back and the BOX dies.
+  // MemAvailable (not MemFree) is the kernel's own estimate of what can be handed
+  // out without swapping, which is the honest denominator here.
+  //
+  // Returns 0 when unreadable; callers treat 0 as "unknown" and do not refuse,
+  // because an unknown budget must not become a false refusal.
+  std::FILE* f = std::fopen("/proc/meminfo", "re");
+  if (f == nullptr) return 0;
+  char line[256];
+  int64_t kb = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+  }
+  std::fclose(f);
+  return kb > 0 ? kb * 1024 : 0;
+}
+
+int64_t recurrent_state_bytes(const KVCacheConfig& kv_cfg, int max_num_seqs) {
+  // Mirrors what the runner allocates (runner.cpp:449-451,670-679): one state
+  // row per sequence slot, and under speculation num_spec+1 CONSECUTIVE slots
+  // per sequence for the k+1 draft-timestep snapshots the recurrent rollback
+  // selects among. A group's page_size_bytes() is exactly one slot's conv+ssm
+  // bytes for ONE layer, so the layer count multiplies it.
+  if (max_num_seqs <= 0) return 0;
+  int64_t total = 0;
+  for (const KVCacheGroupSpec& group : kv_cfg.kv_cache_groups) {
+    if (group.kv_cache_spec == nullptr) continue;
+    if (group.kv_cache_spec->kind() != KVCacheSpecKind::kMamba) continue;
+    const auto* mamba = static_cast<const MambaSpec*>(group.kv_cache_spec.get());
+    const int64_t slots_per_seq =
+        static_cast<int64_t>(1 + mamba->num_speculative_blocks);
+    const int64_t layers = static_cast<int64_t>(group.layer_names.size());
+    total += mamba->page_size_bytes() * layers *
+             static_cast<int64_t>(max_num_seqs) * slots_per_seq;
+  }
+  return total;
+}
+
+void check_enough_state_memory(int64_t available_memory, int64_t needed_memory,
+                               int max_num_seqs, int num_spec) {
+  // No recurrent state: nothing to run out of, and checking would refuse a
+  // configuration that works (the `if kv_cache_spec:` guard upstream keeps for
+  // the same reason, kv_cache_utils.py:872-878).
+  if (needed_memory <= 0) return;
+  if (needed_memory <= available_memory) return;
+
+  const int slots = num_spec + 1;
+  std::string msg =
+      "To serve " + std::to_string(max_num_seqs) +
+      " concurrent sequences, " + FormatGiB(needed_memory) +
+      " GiB of recurrent (Mamba/GDN) state is needed, which is larger than the "
+      "available " + FormatGiB(available_memory) + " GiB.";
+  if (num_spec > 0) {
+    msg += " Speculative decoding widens that state to " + std::to_string(slots) +
+           " snapshot slots per sequence (num_speculative_tokens=" +
+           std::to_string(num_spec) + " + 1), so it costs " +
+           std::to_string(slots) + "x the non-speculative state.";
+  }
+  msg +=
+      " Reduce --max-num-seqs, lower num_speculative_tokens, or run without "
+      "speculative decoding.";
+  throw std::invalid_argument(msg);
+}
+
+int64_t estimate_max_model_len(int64_t available_memory,
+                               int64_t bytes_per_block, int block_size) {
+  // Upstream binary-searches `max_memory_usage_bytes(len) <= available_memory`.
+  // That predicate is `ceil(len / block_size) * bytes_per_block <= available`,
+  // whose largest solution is `(available / bytes_per_block) * block_size` —
+  // written closed-form because our per-block geometry does not vary with the
+  // block count (see KVBytesPerBlock).
+  if (available_memory <= 0 || bytes_per_block <= 0 || block_size <= 0) {
+    return 0;
+  }
+  const int64_t blocks = available_memory / bytes_per_block;
+  return blocks * static_cast<int64_t>(block_size);
+}
+
+void check_enough_kv_cache_memory(int64_t available_memory,
+                                  int64_t needed_memory, int64_t max_model_len,
+                                  int64_t estimated_max_model_len) {
+  // kv_cache_utils.py:757-765.
+  if (available_memory <= 0) {
+    throw std::invalid_argument(
+        std::string(
+            "No available memory for the cache blocks. Try increasing "
+            "`gpu_memory_utilization` when initializing the engine (this flag "
+            "also controls CPU memory reservation on the CPU backend, despite "
+            "its name).") +
+        kLocalRemediation + kConservingMemoryDoc);
+  }
+
+  // kv_cache_utils.py:769-788.
+  if (needed_memory > available_memory) {
+    std::string estimated_msg;
+    if (estimated_max_model_len > 0) {
+      estimated_msg = "Based on the available memory, the estimated maximum "
+                      "model length is " +
+                      std::to_string(estimated_max_model_len) + ". ";
+    }
+    throw std::invalid_argument(
+        "To serve at least one request with the model's max seq len (" +
+        std::to_string(max_model_len) + "), (" + FormatGiB(needed_memory) +
+        " GiB KV cache is needed, which is larger than the available KV cache "
+        "memory (" +
+        FormatGiB(available_memory) + " GiB). " + estimated_msg +
+        "Try increasing `gpu_memory_utilization` (which also controls CPU "
+        "memory on the CPU backend) or decreasing `max_model_len` when "
+        "initializing the engine." +
+        kLocalRemediation + kConservingMemoryDoc);
+  }
+}
+
+int64_t auto_fit_max_model_len(int64_t derived_max_model_len,
+                               int64_t available_memory,
+                               int64_t bytes_per_block, int block_size) {
+  // kv_cache_utils.py:1986-1992: an attention-free model has no KV to fit, so
+  // the derived length stands.
+  if (bytes_per_block <= 0) {
+    return derived_max_model_len;
+  }
+  const int64_t auto_fit_max =
+      estimate_max_model_len(available_memory, bytes_per_block, block_size);
+  // kv_cache_utils.py:2005-2010.
+  if (auto_fit_max <= 0) {
+    throw std::invalid_argument(
+        "Cannot auto-fit max_model_len: not enough GPU memory available to "
+        "serve even a single token. Try increasing `gpu_memory_utilization`." +
+        std::string(kLocalRemediation));
+  }
+  // kv_cache_utils.py:2012-2027: keep the full context when it fits, else
+  // reduce to what does.
+  if (auto_fit_max >= derived_max_model_len) {
+    return derived_max_model_len;
+  }
+  return auto_fit_max;
 }
 
 }  // namespace vllm::v1

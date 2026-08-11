@@ -41,7 +41,10 @@
 
 #include "vllm/tokenizer/pretokenizer.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <string_view>
+#include <vector>
 
 #include "vllm/tokenizer/unicode_data.h"
 
@@ -125,6 +128,92 @@ size_t MatchLetterRun(std::string_view t, size_t pos, bool marks_in_run) {
   return p;
 }
 
+// The CASE-AWARE letter classes:
+//   U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]      L = [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+// SHARED by kTekken and kGpt4o. Both regexes build their two word
+// alternatives out of exactly this pair -- `U* L+` and `U+ L*`, each behind an
+// optional [^\r\n\p{L}\p{N}]? prefix -- and differ only AROUND them (kGpt4o
+// keeps o200k's (?i:'s|'t|...) suffix and \p{N}{1,3}; kTekken drops both).
+// They are one definition on purpose: two copies of a character class are two
+// things that can disagree, and a disagreement here mistokenizes silently.
+// The two classes OVERLAP on {Lm, Lo, M}, so `U* L+` genuinely backtracks and
+// cannot be folded into MatchLetterRun's single-predicate scan.
+bool InUpperLetterClass(uint32_t cp) {
+  if (Category(cp) == UCat::kMark) return true;  // \p{M} is in BOTH classes
+  const LetterCase lc = LetterCaseOf(cp);
+  return lc == LetterCase::kUpper || lc == LetterCase::kCaseless;
+}
+
+bool InLowerLetterClass(uint32_t cp) {
+  if (Category(cp) == UCat::kMark) return true;  // \p{M} is in BOTH classes
+  const LetterCase lc = LetterCaseOf(cp);
+  return lc == LetterCase::kLower || lc == LetterCase::kCaseless;
+}
+
+// Scans a maximal run of `pred` from `from`, recording every codepoint
+// boundary so the caller can give characters back (regex backtracking).
+void ScanRun(std::string_view t, size_t from, bool (*pred)(uint32_t),
+             std::vector<size_t>& stops) {
+  stops.clear();
+  stops.push_back(from);
+  size_t p = from;
+  while (p < t.size()) {
+    const Cp c = DecodeAt(t, p);
+    if (!pred(c.cp)) break;
+    p = c.end;
+    stops.push_back(p);
+  }
+}
+
+// `upper_first_required`: alternative 2 needs [U]+ then [L]*; alternative 1
+// needs [U]* then [L]+. Returns the match end, or 0 for no match.
+size_t MatchTekkenAlt(std::string_view t, size_t from, bool upper_first_required,
+                      std::vector<size_t>& scratch) {
+  ScanRun(t, from, InUpperLetterClass, scratch);
+  // [U]* / [U]+ are greedy, so walk the give-back positions longest-first;
+  // the FIRST that lets the second half match is what the regex engine picks.
+  for (size_t i = scratch.size(); i-- > 0;) {
+    const size_t split = scratch[i];
+    const size_t upper_len = i;  // codepoints consumed by the upper run
+    if (upper_first_required && upper_len == 0) break;  // [U]+ needs >= 1
+    size_t p = split;
+    size_t lower_len = 0;
+    while (p < t.size()) {
+      const Cp c = DecodeAt(t, p);
+      if (!InLowerLetterClass(c.cp)) break;
+      p = c.end;
+      ++lower_len;
+    }
+    if (!upper_first_required && lower_len == 0) continue;  // [L]+ needs >= 1
+    if (p > from) return p;
+  }
+  return 0;
+}
+
+size_t MatchTekkenLetterRun(std::string_view t, size_t pos,
+                            std::vector<size_t>& scratch) {
+  // Alternation is ORDERED and `X?` is greedy, so the engine tries, in order:
+  // alt1-with-prefix, alt1-without, alt2-with-prefix, alt2-without.
+  for (int alt = 0; alt < 2; ++alt) {
+    const bool upper_first_required = alt == 1;
+    for (int use_prefix = 1; use_prefix >= 0; --use_prefix) {
+      size_t start = pos;
+      if (use_prefix != 0) {
+        const Cp c0 = DecodeAt(t, pos);
+        const UCat cat = Category(c0.cp);
+        if (c0.cp == U'\r' || c0.cp == U'\n' || cat == UCat::kLetter ||
+            cat == UCat::kNumber || c0.end >= t.size()) {
+          continue;  // this codepoint cannot serve as the optional prefix
+        }
+        start = c0.end;
+      }
+      const size_t end = MatchTekkenAlt(t, start, upper_first_required, scratch);
+      if (end != 0) return end;
+    }
+  }
+  return 0;
+}
+
 // Rule 3: \p{N} (Qwen, max_digits=1) | \p{N}{1,3} (Llama-3, max_digits=3;
 // greedy, so long digit runs split into groups of three from the left).
 size_t MatchNumbers(std::string_view t, size_t pos, int max_digits) {
@@ -139,12 +228,18 @@ size_t MatchNumbers(std::string_view t, size_t pos, int max_digits) {
   return count > 0 ? p : 0;
 }
 
-// Rule 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` (Qwen3.6; marks_excluded=true)
-//         ` ?[^\s\p{L}\p{N}]+[\r\n]*`      (Llama-3; marks_excluded=false)
+// Rule 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`  (Qwen3.6; marks_excluded=true)
+//         ` ?[^\s\p{L}\p{N}]+[\r\n]*`       (Llama-3; marks_excluded=false)
+//         ` ?[^\s\p{L}\p{N}]+[\r\n/]*`      (Tekken and GPT-4o, which share
+//                                            this rule byte-for-byte;
+//                                            slash_in_tail=true)
 // Optional single literal ASCII space, then >=1 codepoints that are not
 // regex-space/letters/numbers (nor marks, for Qwen), then any trailing \r/\n
-// bytes. If only the space matched, the rule fails as a whole.
-size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded) {
+// bytes -- and '/' too for Tekken and GPT-4o. If only the space matched, the
+// rule fails as a whole.
+// as a whole.
+size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded,
+                     bool slash_in_tail) {
   size_t p = pos;
   if (t[p] == ' ') ++p;
   const size_t run_begin = p;
@@ -159,7 +254,10 @@ size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded) {
     p = c.end;
   }
   if (p == run_begin) return 0;
-  while (p < t.size() && IsNewlineByte(t[p])) ++p;
+  while (p < t.size() &&
+         (IsNewlineByte(t[p]) || (slash_in_tail && t[p] == '/'))) {
+    ++p;
+  }
   return p;
 }
 
@@ -210,6 +308,183 @@ size_t MatchWs(std::string_view t, size_t pos) {
     p = c.end;
   }
   return p > pos ? p : 0;
+}
+
+// ---------------------------------------------------------------------------
+// GPT-4o / o200k rules (llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O; GGUF pre names
+// "gpt-4o", "llama4", "kanana2", "talkie" — llama.cpp/src/llama-vocab.cpp:
+// 2294-2299 @ 153d324bcf).
+//
+// The pattern is transcribed VERBATIM from the checkpoint that forced it in,
+// /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json (read 2026-08-11),
+// pre_tokenizer.pretokenizers[0].pattern.Regex, behavior=Isolated. It is the
+// same string llama.cpp records as "original regex from tokenizer.json" above
+// its own GPT4O entry (llama.cpp/src/llama-vocab.cpp:432 @ 153d324bcf):
+//
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |\p{N}{1,3}
+//  | ?[^\s\p{L}\p{N}]+[\r\n/]*
+//  |\s*[\r\n]+
+//  |\s+(?!\S)
+//  |\s+
+//
+// WHY THE ORIGINAL AND NOT llama.cpp's TRANSCRIPTION (llama-vocab.cpp:433):
+// llama.cpp cannot spell the minor letter categories in its regex engine, so
+// it approximates [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] as `((?=[\p{L}])([^a-z]))`
+// and [\p{Ll}\p{Lm}\p{Lo}\p{M}] as `((?=[\p{L}])([^A-Z]))` — "a letter that is
+// not an ASCII lowercase/uppercase char". Those classes are NOT the same sets:
+// they drop \p{M} entirely and they put every non-ASCII cased letter in BOTH.
+// Verified divergences against the HF tokenizers oracle on this checkpoint's
+// own regex (tools/gen_pretok_goldens.py engine):
+//     "éÉ"  (U+00E9 U+00C9)  original ["é","É"]  llama.cpp ["éÉ"]
+//     "éX" (e U+0301 X)      original ["é","X"]    llama.cpp ["e","́X"]
+// The BPE merges were trained under the ORIGINAL regex, so the original is
+// what reproduces the checkpoint's token ids; llama.cpp's approximation is a
+// regex-engine limitation, not the reference behavior. We therefore port the
+// pattern llama.cpp itself cites as authoritative and record the difference
+// here rather than reproducing its approximation error.
+//
+// Structurally this is NOT kLlama3 with different digits. Three differences,
+// each of which changes token ids on ordinary text:
+//   1. ONE letter alternative becomes TWO, over the minor categories:
+//        A = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]   B = [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+//      alternative 1 is `A* B+`, alternative 2 is `A+ B*`. Together they split
+//      a CamelCase word at each lower->upper boundary ("HTMLParser" stays
+//      whole, but "abcDEF" -> ["abc","DEF"]), which \p{L}+ never does.
+//   2. The contraction is a SUFFIX of the word alternatives, not a leading
+//      alternative of its own. "don't" is ONE piece here; kLlama3 gives
+//      ["don","'t"].
+//   3. The punctuation run absorbs a trailing `/` as well as \r/\n.
+//
+// The scanner below is a direct transcription of onig's leftmost-first
+// backtracking for those two alternatives (greedy `?`, `*` and `+`, first
+// success wins), not a re-derivation: every expectation in
+// tests/vllm/test_pretokenizer.cpp and every row of the golden table was
+// produced by running this exact regex through HF tokenizers.
+
+// The `A` and `B` named below are `InUpperLetterClass` and
+// `InLowerLetterClass` from the top of this file:
+//   A = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]   B = [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+// kTekken's regex spells those two classes identically, so this scanner reuses
+// its predicates rather than carrying a second copy that could drift. Lm, Lo
+// and M are in BOTH classes; only Lu/Lt and Ll separate them, which is why the
+// scan below has to backtrack.
+
+// `[^\r\n\p{L}\p{N}]?` — one optional codepoint that is neither a newline nor
+// a letter nor a number. Returns the offset past it, or 0 if it cannot match.
+// NOTE a combining mark passes this class AND is in A and B, which is exactly
+// why the alternatives below have to be backtracked rather than scanned once.
+size_t MatchGpt4oWordPrefix(std::string_view t, size_t pos) {
+  const Cp c = DecodeAt(t, pos);
+  if (c.cp == U'\r' || c.cp == U'\n') return 0;
+  const UCat cat = Category(c.cp);
+  if (cat == UCat::kLetter || cat == UCat::kNumber) return 0;
+  return c.end;
+}
+
+// The shared `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` tail. Greedy and last in the
+// alternative, so it never backtracks.
+size_t ApplyGpt4oContractionSuffix(std::string_view t, size_t end) {
+  if (end >= t.size()) return end;
+  const size_t c = MatchContraction(t, end);
+  return c == 0 ? end : c;
+}
+
+// Alternative 1: `[^\r\n\p{L}\p{N}]? A* B+ (?i:...)?`
+//
+// onig tries the optional prefix present-first, then greedy `A*`, then `B+`
+// which needs at least one codepoint. When `B+` fails at the end of the A run,
+// `A*` gives codepoints back one at a time — so the B run starts at the LAST
+// position in [run start, run end] whose codepoint is in B. If there is none,
+// the whole alternative retries without the prefix, then fails.
+size_t MatchGpt4oWordLower(std::string_view t, size_t pos) {
+  for (int with_prefix = 1; with_prefix >= 0; --with_prefix) {
+    size_t q = pos;
+    if (with_prefix != 0) {
+      const size_t pe = MatchGpt4oWordPrefix(t, pos);
+      if (pe == 0 || pe >= t.size()) continue;
+      q = pe;
+    }
+    // Greedy `A*`, remembering the last A codepoint that is also in B (that is
+    // the backtrack target, since A \ B codepoints can never start `B+`).
+    size_t p = q;
+    size_t last_a_in_b = std::string_view::npos;
+    while (p < t.size()) {
+      const Cp c = DecodeAt(t, p);
+      if (!InUpperLetterClass(c.cp)) break;
+      if (InLowerLetterClass(c.cp)) last_a_in_b = p;
+      p = c.end;
+    }
+    size_t b_begin;
+    if (p < t.size() && InLowerLetterClass(DecodeAt(t, p).cp)) {
+      b_begin = p;  // `A*` kept the whole run; `B+` starts right after it
+    } else if (last_a_in_b != std::string_view::npos) {
+      b_begin = last_a_in_b;  // `A*` backtracked to the last B-capable cp
+    } else {
+      continue;  // `B+` cannot match under this prefix choice
+    }
+    size_t e = b_begin;
+    while (e < t.size()) {
+      const Cp c = DecodeAt(t, e);
+      if (!InLowerLetterClass(c.cp)) break;
+      e = c.end;
+    }
+    return ApplyGpt4oContractionSuffix(t, e);
+  }
+  return 0;
+}
+
+// Alternative 2: `[^\r\n\p{L}\p{N}]? A+ B* (?i:...)?`
+// `B*` and the contraction can both match empty, so greedy `A+` never has to
+// give anything back; only the optional prefix is retried.
+size_t MatchGpt4oWordUpper(std::string_view t, size_t pos) {
+  for (int with_prefix = 1; with_prefix >= 0; --with_prefix) {
+    size_t q = pos;
+    if (with_prefix != 0) {
+      const size_t pe = MatchGpt4oWordPrefix(t, pos);
+      if (pe == 0 || pe >= t.size()) continue;
+      q = pe;
+    }
+    size_t p = q;
+    while (p < t.size()) {
+      const Cp c = DecodeAt(t, p);
+      if (!InUpperLetterClass(c.cp)) break;
+      p = c.end;
+    }
+    if (p == q) continue;  // `A+` needs at least one codepoint
+    size_t e = p;
+    while (e < t.size()) {
+      const Cp c = DecodeAt(t, e);
+      if (!InLowerLetterClass(c.cp)) break;
+      e = c.end;
+    }
+    return ApplyGpt4oContractionSuffix(t, e);
+  }
+  return 0;
+}
+
+std::vector<std::pair<size_t, size_t>> PretokenizeGpt4o(std::string_view text) {
+  std::vector<std::pair<size_t, size_t>> spans;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = MatchGpt4oWordLower(text, pos);
+    if (end == 0) end = MatchGpt4oWordUpper(text, pos);
+    if (end == 0) end = MatchNumbers(text, pos, /*max_digits=*/3);
+    if (end == 0) {
+      end = MatchPunctRun(text, pos, /*marks_excluded=*/false,
+                          /*slash_in_tail=*/true);
+    }
+    if (end == 0) end = MatchWsNewlines(text, pos);
+    if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
+    if (end == 0) end = MatchWs(text, pos);
+    // Unreachable (the rules cover every codepoint class), but guarantee
+    // forward progress rather than looping if the tables ever change.
+    if (end == 0) end = DecodeAt(text, pos).end;
+    spans.emplace_back(pos, end);
+    pos = end;
+  }
+  return spans;
 }
 
 // ---------------------------------------------------------------------------
@@ -512,19 +787,35 @@ std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
   // GPT-2's alternation differs in four of six rules, so it runs its own
   // scanner rather than threading more flags through the Qwen/Llama-3 one.
   if (pattern == SplitPattern::kGpt2) return PretokenizeGpt2(text);
+  // GPT-4o splits its letter rule into two minor-category alternatives with
+  // real backtracking between them (see above), so it too gets its own pass.
+  if (pattern == SplitPattern::kGpt4o) return PretokenizeGpt4o(text);
   // \p{M} awareness (letter runs absorb marks; punct runs exclude them) is
   // UNIQUE to the Qwen3.6 regex. Classic Qwen2/Qwen3 and Llama-3 both treat
   // marks like ordinary punct-run codepoints. Number grouping is single-digit
   // for BOTH Qwen variants; only Llama-3 groups \p{N}{1,3}.
-  const bool marks_aware = pattern == SplitPattern::kQwen2;
+  // kTekken needs these two APART: marks live inside its letter classes (like
+  // kQwen2) while its punct negation is [^\s\p{L}\p{N}] with no \p{M} (like
+  // kLlama3). No other pattern mixes them, which is why one flag sufficed
+  // until now.
+  const bool tekken = pattern == SplitPattern::kTekken;
+  const bool marks_in_run = pattern == SplitPattern::kQwen2 || tekken;
+  const bool marks_excluded = pattern == SplitPattern::kQwen2;
   const int max_digits = pattern == SplitPattern::kLlama3 ? 3 : 1;
   std::vector<std::pair<size_t, size_t>> spans;
+  std::vector<size_t> scratch;  // reused give-back stops for the Tekken scan
   size_t pos = 0;
   while (pos < text.size()) {
-    size_t end = MatchContraction(text, pos);
-    if (end == 0) end = MatchLetterRun(text, pos, /*marks_in_run=*/marks_aware);
+    // Tekken has NO (?i:'s|'t|...) alternative at all.
+    size_t end = tekken ? 0 : MatchContraction(text, pos);
+    if (end == 0) {
+      end = tekken ? MatchTekkenLetterRun(text, pos, scratch)
+                   : MatchLetterRun(text, pos, marks_in_run);
+    }
     if (end == 0) end = MatchNumbers(text, pos, max_digits);
-    if (end == 0) end = MatchPunctRun(text, pos, /*marks_excluded=*/marks_aware);
+    if (end == 0) {
+      end = MatchPunctRun(text, pos, marks_excluded, /*slash_in_tail=*/tekken);
+    }
     if (end == 0) end = MatchWsNewlines(text, pos);
     if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
     if (end == 0) end = MatchWs(text, pos);

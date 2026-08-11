@@ -49,7 +49,8 @@ what vLLM has vs what we have:
 | `RequestOutput` / `CompletionOutput` (public result carriers; FinishReason→string) | `vllm/outputs.py` | T0 ✅ `4d477eb` (+ prompt_logprobs opaque placeholder at M1.1 close-out; logprobs payloads deferred to sampler unit) |
 | `step_with_batch_queue` (pipelined batch queue, deferred sampling) | `v1/engine/core.py` | T1 |
 | Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 ✅ `core_proc.{h,cpp}` + `core_client.{h,cpp}` (W1 `ENG-CORE-BUSY-LOOP`: EngineCoreProc busy loop, shutdown drain/abort, WAKEUP + ENGINE_CORE_DEAD sentinels, InprocClient engine thread; tests `test_engine_core_proc.cpp` ← upstream `tests/v1/engine/test_engine_core_client.py`; GPU G1/G4 gating pending; UTILITY/DP/aborts-queue/batch-queue deferred) |
-| InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) |
+| InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) + `_validate_prompt_len` decoder arm (`input_processor.py:387-432`) landed: empty prompt and prompt ≥ `max_model_len` raise `InputValidationError` → HTTP 400 (`serve/utils/error_response.py:62-65`); tests `tests/vllm/v1/test_input_processor.cpp`, `tests/vllm/entrypoints/openai/test_api_server.cpp`. Encoder arm + out-of-vocab check still deferred |
+| Startup KV sizing: `_check_enough_kv_cache_memory` / `estimate_max_model_len` / `max_memory_usage_bytes` / `_auto_fit_max_model_len` | `v1/core/kv_cache_utils.py:751-788, :791-798, :800-851, :1967-2027` | T0 ✅ `vllm::v1::check_enough_kv_cache_memory` etc. in `v1/core/kv_cache_utils.{h,cpp}`, applied at `LoadedEngine::ResolveMaxModelLen`: a pinned `--max-model-len` the KV pool cannot hold is REFUSED at startup, an unpinned one is auto-fitted down to the pool. Deviations: the two upstream `Callable`s are passed as values (both are pure arithmetic here) and `estimate_max_model_len`'s binary search is written closed-form (our per-block geometry is linear in the block count). Tests `tests/vllm/v1/test_kv_cache_utils.cpp`, `tests/vllm/entrypoints/test_loaded_engine_dense.cpp`. Issue #83 M4 |
 | OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` baseline + W2 `GATING`: process_outputs detokenize/string-stop/DELTA-CUMULATIVE-FINAL_ONLY plus thread-safe single-slot `RequestOutputCollector`, per-request queue handoff, abort-final output and error propagation; logprobs/pooling/parallel-sampling remain deferred |
 | AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 🚧 W2 `ACTIVE`: `AsyncLLM` owns the EngineCoreProc/output-handler threads, concurrent add/generate/abort, collector streams and clean shutdown. The c32 cpp-httplib defect now has fixed `max_num_seqs + 4` delivery workers plus a legacy A/B toggle; the 32-client control-reserve test is 100×/sanitizer-green. Exact GPU G1/G3-G6 remain. Synchronous `LLMEngine` stays for offline/compatibility use |
 | Unified scheduler: token-budget, **no prefill/decode distinction** | `v1/core/sched/scheduler.py` | T0 ✅ `4f12158` (schedule() running-first + chunked prefill + FCFS preemption; update_from_output + check_stop; priority/spec/structured/async deferred behind 1:1 stubs) |
@@ -214,9 +215,12 @@ RandomSample) + penalties/min-p/logit-bias/token-mask/allowed-ids, CPU+CUDA (CUD
 dgx-pending). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
 from T1 below — the OpenAI-serving MVP needs them). Greedy = bit-exact parity gate;
 random RNG = exponential-noise gumbel-max, distribution-correct, **torch-Philox
-bit-exact parity deferred to T1**. Deferred (marked stubs): logprob_token_ids
-(generative-scoring), spec-decode bonus-token, thinking-budget, logprobs_mode
-variants beyond raw/processed. **InputBatch-side tracking of seeds/min_p/min_tokens/
+bit-exact parity deferred to T1**. Deferred (marked stubs): spec-decode
+bonus-token, thinking-budget. **logprob_token_ids (generative scoring) LANDED
+2026-08-10** and is no longer a stub — `SAMPLE-LOGPROB-TOKEN-IDS` in
+engine-matrix.md, [specs/logprob-token-ids.md](specs/logprob-token-ids.md).
+(The `logprobs_mode` variants left the same stub list when #238 landed; the
+sentence is corrected here because this edit rewrites it.) **InputBatch-side tracking of seeds/min_p/min_tokens/
 logit_bias/allowed/bad_words + num_logprobs is an M1.8 wiring dependency**
 (make_sampling_metadata emits empty defaults today — the InputBatch doesn't store
 them yet; SamplingMetadata carries the fields ready to populate).
@@ -247,7 +251,7 @@ reasoning-gating, spec-decode multi-row, optional object properties, strict-comp
 separators, the `has_xgrammar_unsupported_json_features` guard +
 `validate_xgrammar_grammar` feeding the `auto` fallback, production wiring, GPU
 oracle parity.
-T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
+T1: `prompt_logprobs` (`logprob_token_ids` LANDED 2026-08-10), additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection
 sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/

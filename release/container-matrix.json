@@ -1,0 +1,103 @@
+{
+  "bases": {
+    "cuda_builder": "nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:ef2203909e80b8b976cfc672f7e2ae2b00bc0e25c404ee86d89e10a3802f1c52",
+    "runtime": "ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea"
+  },
+  "blocked": [
+    {
+      "id": "rocm",
+      "reason": "VLLM_CPP_HIP has never compiled on AMD hardware; tracks its binary channel"
+    }
+  ],
+  "default_lane": "cpu",
+  "lanes": [
+    {
+      "architectures": [
+        {
+          "platform": "linux/amd64",
+          "runner": "ubuntu-latest",
+          "runtime_evidence": false,
+          "verify_on_pull_request": true
+        },
+        {
+          "platform": "linux/arm64",
+          "runner": "ubuntu-24.04-arm",
+          "runtime_evidence": false,
+          "verify_on_pull_request": false
+        }
+      ],
+      "channel": "stable",
+      "id": "cpu",
+      "moving_tags": [
+        "latest-cpu",
+        "latest"
+      ],
+      "target": "cpu",
+      "verify_on_pull_request": true,
+      "version_tag": "{version}-cpu"
+    },
+    {
+      "architectures": [
+        {
+          "platform": "linux/amd64",
+          "runner": "ubuntu-latest",
+          "runtime_evidence": false,
+          "verify_on_pull_request": true
+        },
+        {
+          "platform": "linux/arm64",
+          "runner": "ubuntu-24.04-arm",
+          "runtime_evidence": false,
+          "verify_on_pull_request": false
+        }
+      ],
+      "channel": "preview",
+      "id": "vulkan",
+      "moving_tags": [
+        "latest-vulkan"
+      ],
+      "target": "vulkan",
+      "verify_on_pull_request": true,
+      "version_tag": "{version}-vulkan"
+    },
+    {
+      "architectures": [
+        {
+          "platform": "linux/amd64",
+          "runner": "ubuntu-latest",
+          "runtime_evidence": false
+        },
+        {
+          "platform": "linux/arm64",
+          "runner": "ubuntu-24.04-arm",
+          "runtime_evidence": true
+        }
+      ],
+      "channel": "preview",
+      "id": "cuda",
+      "moving_tags": [
+        "latest-cuda"
+      ],
+      "target": "cuda",
+      "verify_on_pull_request": false,
+      "version_tag": "{version}-cuda"
+    }
+  ],
+  "not_containerizable": [
+    {
+      "id": "macos-arm64-metal",
+      "reason": "no macOS container runtime and no Metal device passthrough exists"
+    },
+    {
+      "id": "macos-arm64-metal-mlx",
+      "reason": "no macOS container runtime and no Metal device passthrough exists"
+    }
+  ],
+  "package": "ghcr.io/mudler/vllm.cpp",
+  "retention": {
+    "moving_tags": "overwritten on every release",
+    "untagged_digests_days": 30,
+    "version_tags": "maintainer-deletion-only"
+  },
+  "schema": "vllm.cpp.container-matrix.v1"
+}

@@ -190,8 +190,8 @@ hardware the project does not own.
 |---|---|---|
 | `linux-x86_64-glibc-cpu` | stable after baseline and tiered runtime gates | one adaptive binary: SSE2/portable baseline without AVX2, plus only inventoried per-TU F16C/AVX2/AVX-512 and later VNNI/AMX tiers whose kernels and exact probes exist; record glibc/libstdc++ floors and compiled tiers |
 | `linux-aarch64-glibc-cpu` | stable after baseline and tiered runtime gates | one adaptive binary: NEON/portable baseline plus only inventoried HWCAP/HWCAP2-gated DotProd/i8mm and future tiers whose kernels exist; independent arm64 evidence is never inferred from x86_64 |
-| `linux-x86_64-glibc-cuda-fat` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary x86_64 CUDA download; explicit SM set `80,86,87,89,90a,100a,103a,110,120a,121a`; per-source gencode and per-SM runtime/AOT dispatch required |
-| `linux-aarch64-glibc-cuda-fat` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary aarch64 CUDA download with the same ten SM device targets but a distinct host ELF ABI; cannot be the x86_64 archive |
+| `linux-x86_64-glibc-cuda` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary x86_64 CUDA download; explicit SM set `80,86,87,89,90a,100a,103a,110,120a,121a`; per-source gencode and per-SM runtime/AOT dispatch required |
+| `linux-aarch64-glibc-cuda` | preview until the fat prerequisite, archive gates, and per-SM evidence land | primary aarch64 CUDA download with the same ten SM device targets but a distinct host ELF ABI; cannot be the x86_64 archive |
 | `macos-arm64-metal` | stable after M-series runtime gate | native Metal, MLX off; record deployment target and required system frameworks |
 | `macos-arm64-metal-mlx` | preview until its exact bundled MLX tuple is runtime/correctness-gated | Metal plus opt-in MLX provider and redistribution/license audit; record MLX dylib and metallib versions |
 | `linux-x86_64-glibc-vulkan` | preview | Vulkan explicitly on; loader/device/driver remain external; only the Vulkan-supported model/quant surface is declared |
@@ -603,3 +603,10 @@ archive, CPU, Vulkan, workflow, and mutation gates are green. The hosted
 eight-tuple dry run, matching-hardware evidence, and tagged publication remain
 pending, so no published archive or release-channel advancement is claimed.
 W12 remains the optional non-primary diagnostic lane.
+
+## Now
+
+**ACTIVE; required W1-W11/W13 implemented in #196.** Next: finish the hosted
+ten-SM proof, rebase and push, and run the full eight-tuple dry run. Hosted
+ten-SM completion, matching-hardware gates and tagged publication remain pending;
+no binaries are published.

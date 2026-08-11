@@ -275,5 +275,82 @@ class RangeContract(unittest.TestCase):
             )
 
 
+class MergeArtifacts(unittest.TestCase):
+    """The trailer gate must judge the CLAIM, not the paragraph layout (#406).
+
+    Every shape below was taken from a real commit on main. The gate was failing
+    on how commits LAND rather than on how they are written, and 13 of the last
+    30 commits on main failed it -- unnoticed only because those runs were
+    cancelled (#274).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.checker = load_checker()
+
+    def test_github_co_authored_by_does_not_hide_the_block(self) -> None:
+        """RED-BEFORE: this is dbd0d51c, 87308dea and f64f2b71 on main.
+
+        Squash-merging through GitHub appends `Co-authored-by:` as a SEPARATE
+        trailing paragraph. `git interpret-trailers --parse` reads only the last
+        paragraph, so the protocol trailers become invisible and the gate counts
+        zero. The commit is correct; the parse is what breaks.
+
+        AGENTS.md forbids AI tools from adding Co-Authored-By. It does not
+        forbid GitHub from recording a real human co-author, so this must pass.
+        """
+        message = STRICT_MESSAGE + "\nCo-authored-by: Ettore Di Giacinto <mudler@localai.io>\n"
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+    def test_a_squash_that_doubles_the_trailer_block_still_fails(self) -> None:
+        """b8293c88, the commit that turned main red, must STAY red.
+
+        Squashing a multi-commit PR concatenates each commit's trailer block, so
+        every trailer appears twice. That was tempting to collapse -- two
+        identical declarations do say the same thing -- but it is NOT what this
+        change fixes, and relaxing it would delete a rule that catches genuinely
+        malformed messages.
+
+        The distinction that matters: the Co-authored-by case above is a correct
+        commit REJECTED BY THE PARSE, while this one is a message that really is
+        malformed and is fixable at the source by writing the squash body (or by
+        landing a single-commit PR). AGENTS.md's "fix the cause, not the gate"
+        puts this on the process side of the line.
+        """
+        _, _, trailers = STRICT_MESSAGE.rpartition("FOLLOWING_AGENTS_PROTOCOL\n")
+        doubled = STRICT_MESSAGE + "\nFOLLOWING_AGENTS_PROTOCOL\n" + trailers
+        errors = self.checker.validate_commit_message(doubled, strict=True)
+        self.assertTrue(errors, "a doubled trailer block must still be rejected")
+
+    def test_contradictory_declarations_fail(self) -> None:
+        """A commit cannot both declare and deny AI assistance."""
+        conflicting = STRICT_MESSAGE + "AI-Assisted: false\n"
+        errors = self.checker.validate_commit_message(conflicting, strict=True)
+        self.assertTrue(errors, "contradictory declarations must fail")
+
+    def test_a_github_merge_commit_with_no_trailers_still_fails(self) -> None:
+        """This is b580452d. It must STAY red -- a real violation, not a layout
+        artifact. The relaxation is about placement and duplication only."""
+        message = (
+            "Merge pull request #386 from mudler/row/ENG-NOW-DERIVED-DONE\n"
+            "\n"
+            "close the row\n"
+        )
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(errors, "a message with no trailers at all must fail")
+
+    def test_prose_after_the_trailers_still_fails(self) -> None:
+        """A prose paragraph must still terminate the block.
+
+        Without this the relaxation would accept trailers buried anywhere near
+        the end, which is exactly the looseness the gate exists to prevent.
+        """
+        message = STRICT_MESSAGE + "\nAnd then some closing prose about the change.\n"
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(errors, "prose after the trailer block must still fail")
+
+
 if __name__ == "__main__":
     unittest.main()

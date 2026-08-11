@@ -32,7 +32,10 @@ LogprobsProcessor LogprobsProcessor::FromNewRequest(
     const tok::Tokenizer* tokenizer, const SamplingParams& sampling_params) {
   LogprobsProcessor lp;
   lp.tokenizer_ = tokenizer;
-  lp.num_logprobs_ = sampling_params.logprobs;             // sampling_params.num_logprobs
+  // logprobs.py:52 reads the `num_logprobs` PROPERTY, not the raw `logprobs`
+  // field: for a generative-scoring request it is len(logprob_token_ids), which
+  // is the row width the sampler hands back (sampling_params.py:724-729).
+  lp.num_logprobs_ = sampling_params.num_logprobs();
   lp.num_prompt_logprobs_ = sampling_params.prompt_logprobs;
   // cumulative_logprob = None if num_logprobs is None else 0.0 (:54).
   if (lp.num_logprobs_.has_value()) {
