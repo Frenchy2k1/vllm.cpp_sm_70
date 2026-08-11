@@ -157,8 +157,31 @@ instrument.
 
 ### Numerics
 
-**Tokens identical BETWEEN ARMS** (fused vs split), verified by a greedy
-64-token continuation captured on each arm and diffed.
+**CORRECTED AFTER MEASUREMENT: the arms do NOT agree in general.**
+
+The original claim here -- "tokens identical between arms" -- came from a
+SINGLE 64-token prompt. Measured across 4 prompts at 128 tokens:
+
+| control | result |
+|---|---|
+| oracle run2 vs oracle run1 | **4/4 EXACT** |
+| ours SPLIT vs oracle | **0/4** |
+| ours FUSED vs oracle | **0/4** |
+| ours FUSED vs ours SPLIT | **1/4 exact, 3 differ** |
+
+So the ~1 bf16 ULP from Marlin's split-K regrouping DOES reach the output at
+length. One sample was not enough to claim agreement and I over-generalised
+from it.
+
+**But the oracle gap is NOT caused by this row**: the split path -- today's
+shipped behaviour -- is equally 0/4. And vLLM's greedy is DETERMINISTIC here
+(4/4 self-match), so the ratified distributional gate does not apply and
+token-exactness IS the correct bar.
+
+That pre-existing divergence is filed as **#370** and outranks this row. **This
+row must not land on a token bar until #370 resolves.** A speed ratio measured
+on an arm that does not reproduce the reference's tokens is not a parity
+number.
 
 **This is NOT the oracle bar and must not be read as it.** It shows the change
 is self-consistent; it does not show we still match vLLM. Spec §5 requires a
