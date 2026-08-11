@@ -67,6 +67,16 @@ def validate(text: str) -> list[str]:
         "metal_arm64",
         "mlx_arm64",
     )
+    release_outputs = (
+        ("build-release-cpu-x86", "linux-x86_64-glibc-cpu"),
+        ("build-release-cpu-arm64", "linux-aarch64-glibc-cpu"),
+        ("build-release-cpu-musl", "linux-x86_64-musl-cpu-static"),
+        ("build-release-cuda-x86", "linux-x86_64-glibc-cuda-fat"),
+        ("build-release-cuda-arm64", "linux-aarch64-glibc-cuda-fat"),
+        ("build-release-vulkan-x86", "linux-x86_64-glibc-vulkan"),
+        ("build-release-metal-arm64", "macos-arm64-metal"),
+        ("build-release-mlx-arm64", "macos-arm64-metal-mlx"),
+    )
     read_only_jobs = (
         "plan",
         *primary_build_jobs,
@@ -96,6 +106,18 @@ def validate(text: str) -> list[str]:
         reference = f"${{{{ needs.{name}.outputs.artifact_id }}}}"
         if reference not in build:
             errors.append(f"handoff build job does not consume immutable {name} output")
+    for build_dir, artifact_id in release_outputs:
+        archive = (
+            f"{build_dir}/release/vllm.cpp-${{{{ needs.plan.outputs.version }}}}-"
+            f"{artifact_id}.tar.gz"
+        )
+        if any(
+            f"            {archive}{suffix}\n" not in text
+            for suffix in ("", ".sha256", ".provenance.json")
+        ):
+            errors.append(
+                "every release upload path must use its canonical versioned archive name"
+            )
 
     attest = blocks["attest"]
     for permission in (

@@ -1145,7 +1145,19 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
-  const bool gather = LogitsGatherEnabled();
+  // SAMPLE-PROMPT-LOGPROBS: a request that asked for prompt logprobs needs an
+  // lm_head row at each of its prompt positions, not just at the one row the
+  // sampler consumes. The gather seam cannot express that: every model's
+  // gather-before-lm_head is guarded on `logits_indices.size() < T` — it is an
+  // optimization for "far fewer rows than tokens", and scoring a whole prompt
+  // is the opposite. So a step that owes prompt logits takes the full-logits
+  // path instead, which is the same shape upstream computes anyway
+  // (gpu_model_runner.py:5680-5682 runs compute_logits over the prompt slice).
+  //
+  // step.prompt_logprob_indices is EMPTY on every step where no request asked,
+  // and then this is exactly the expression it has always been.
+  const bool gather =
+      LogitsGatherEnabled() && step.prompt_logprob_indices.empty();
   const std::vector<int32_t> kNoGather;
   const std::vector<int32_t>& gather_li = gather ? step.logits_indices : kNoGather;
 
@@ -1379,6 +1391,135 @@ int GPUModelRunner::step_num_logits() const {
   return cu.empty() ? exec_state_.num_reqs : cu.back();
 }
 
+// collect_prompt_logprobs — 1:1 vllm/v1/worker/gpu_model_runner.py:5612-5719
+// (`_get_prompt_logprobs_dict`), minus the row selection, which prepare_inputs
+// did (see StepInputs::PromptLogprobRows). What is left is upstream's scoring
+// (:5688-5697), its slice-by-slice accumulation (:5698-5706) and its
+// emit-and-drop on the final chunk (:5665-5667, :5709-5712).
+void GPUModelRunner::collect_prompt_logprobs(
+    std::map<std::string, LogprobsTensors>& prompt_logprobs_dict) {
+  const std::vector<StepInputs::PromptLogprobRows>& rows =
+      exec_state_.step.prompt_logprob_rows;
+  // An in-progress entry can outlive its request: an ABORT mid-prompt drops the
+  // request from the input batch, and upstream frees the same state with the
+  // request object at :1199. Swept on every call, including the early return
+  // below, so a stale tensor cannot survive to the next request with that id.
+  if (!in_progress_prompt_logprobs_.empty()) drop_stale_prompt_logprobs();
+  if (rows.empty()) return;
+
+  const int64_t vocab = config_.vocab_size;
+  ForwardLogits& fl = exec_state_.logits;
+
+  for (const StepInputs::PromptLogprobRows& r : rows) {
+    // The accumulated tensor covers num_prompt_tokens - 1 positions: the first
+    // prompt token has no logprob because nothing precedes it (:5646-5651, and
+    // logprobs.py:162-167 which fills that leading None). Created on first
+    // sight and filled slice by slice across chunks.
+    auto [it, inserted] = in_progress_prompt_logprobs_.try_emplace(r.req_id);
+    if (inserted) {
+      // The height comes from the REQUEST, not from this chunk: prompt length
+      // less one. dst_start + num_rows reaches exactly that on the final chunk,
+      // and prepare_inputs tiles [0, num_prompt_tokens - 1) in order.
+      it->second.num_positions = prompt_logprob_positions(r.req_id);
+      it->second.num_tokens_per_position = r.num_prompt_logprobs + 1;
+      it->second.logprob_token_ids.assign(
+          static_cast<size_t>(it->second.num_positions) *
+              static_cast<size_t>(it->second.num_tokens_per_position),
+          0);
+      it->second.logprobs.assign(it->second.logprob_token_ids.size(), 0.0f);
+      it->second.selected_token_ranks.assign(
+          static_cast<size_t>(it->second.num_positions), 0);
+    }
+    LogprobsTensors& acc = it->second;
+
+    if (r.num_rows > 0) {
+      // The step that OWES rows took the full-logits path in execute_model, so
+      // there is one row per scheduled token and a prompt row is found by its
+      // token-stream index. This belongs HERE, at the slice, not at the top of
+      // the function: prepare_inputs deliberately keeps a final-chunk entry with
+      // num_rows == 0 on the exact-prefill edge (:5668-5673), and that entry
+      // contributes no gather index, so the step correctly kept the gathered
+      // lm_head and has num_reqs rows, not num_actual_tokens. Asserting on
+      // `rows` non-empty instead of on the slice threw whenever any OTHER
+      // request in the same step contributed more than one token — and VT_CHECK
+      // throws out of engine.step(), taking the whole batch down with it, not
+      // just the asking request. Regression: test_llm_engine §9(h).
+      VT_CHECK(fl.rows == exec_state_.num_actual_tokens,
+               "collect_prompt_logprobs: a step that scores prompt rows must "
+               "carry full logits");
+      // A request's prompt rows are the CONTIGUOUS run starting at its first
+      // scheduled token (prepare_inputs built them as query_start + [0,
+      // num_rows)), so this is one slice, on device or on host.
+      const int64_t first = exec_state_.step.prompt_logprob_indices
+                                [static_cast<size_t>(r.src_start)];
+      vt::Tensor view;
+      if (fl.on_device()) {
+        view = fl.device_tensor.Slice(0, first, first + r.num_rows);
+      } else {
+        view = vt::Tensor::Contiguous(
+            fl.host.data() +
+                static_cast<size_t>(first) * static_cast<size_t>(vocab),
+            vt::DType::kF32, queue_.device,
+            {static_cast<int64_t>(r.num_rows), vocab});
+      }
+
+      const LogprobsTensors chunk = sampler_.compute_prompt_logprobs(
+          queue_, view, r.num_prompt_logprobs, r.target_token_ids);
+
+      // Copy into slice(start_idx, start_idx + num_logits) of the accumulated
+      // tensor (:5698-5706).
+      const size_t width =
+          static_cast<size_t>(acc.num_tokens_per_position);
+      VT_CHECK(chunk.num_tokens_per_position == acc.num_tokens_per_position,
+               "collect_prompt_logprobs: chunk width must match the request's");
+      VT_CHECK(r.dst_start + r.num_rows <= acc.num_positions,
+               "collect_prompt_logprobs: chunk overruns the prompt tensor");
+      const size_t dst = static_cast<size_t>(r.dst_start) * width;
+      std::copy(chunk.logprob_token_ids.begin(), chunk.logprob_token_ids.end(),
+                acc.logprob_token_ids.begin() +
+                    static_cast<std::ptrdiff_t>(dst));
+      std::copy(chunk.logprobs.begin(), chunk.logprobs.end(),
+                acc.logprobs.begin() + static_cast<std::ptrdiff_t>(dst));
+      std::copy(chunk.selected_token_ranks.begin(),
+                chunk.selected_token_ranks.end(),
+                acc.selected_token_ranks.begin() +
+                    static_cast<std::ptrdiff_t>(r.dst_start));
+    }
+
+    if (r.final_chunk) {
+      // The prompt is fully scored: hand the tensor to the output and forget
+      // the request on BOTH sides (:5709-5712).
+      prompt_logprobs_dict[r.req_id] = std::move(acc);
+      in_progress_prompt_logprobs_.erase(it);
+      input_batch_.num_prompt_logprobs.erase(r.req_id);
+    }
+  }
+}
+
+// The height of a request's prompt-logprob tensor: num_prompt_tokens - 1
+// (gpu_model_runner.py:5648-5650). Read off the input batch, which is where the
+// request's prompt length lives for us.
+int GPUModelRunner::prompt_logprob_positions(const std::string& req_id) const {
+  const auto it = input_batch_.req_id_to_index.find(req_id);
+  VT_CHECK(it != input_batch_.req_id_to_index.end(),
+           "prompt_logprob_positions: request is not in the batch");
+  return input_batch_.num_prompt_tokens[static_cast<size_t>(it->second)] - 1;
+}
+
+// Drop in-progress prompt logprobs for requests the input batch no longer
+// carries — an abort mid-prompt. Upstream frees the same state with the request
+// object itself (gpu_model_runner.py:1199).
+void GPUModelRunner::drop_stale_prompt_logprobs() {
+  for (auto it = in_progress_prompt_logprobs_.begin();
+       it != in_progress_prompt_logprobs_.end();) {
+    if (input_batch_.num_prompt_logprobs.count(it->first) == 0) {
+      it = in_progress_prompt_logprobs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 // The SPEC-DECODE VERIFY half (SPEC-REJECTION I3). Ported from
 // gpu/model_runner.py:1069-1077 (the rejection_sampler call) +
 // rejection_sampler.py:111 (draft_sampled = input_ids[logits_indices]) +
@@ -1605,6 +1746,13 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
 
+  // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:3841-3845): score the prompt
+  // rows off the SAME forward result. Done before sampling because sampling
+  // mutates `logits` in place; the prompt rows are outside that view, but
+  // reading them first keeps the two independent of each other. Inert unless a
+  // request asked for prompt logprobs.
+  collect_prompt_logprobs(out.prompt_logprobs_dict);
+
   // SPEC-DECODE VERIFY ROUTING (SPEC-REJECTION I3), mirroring
   // gpu/model_runner.py:1065-1077 (`if input_batch.num_draft_tokens == 0 or
   // self.rejection_sampler is None: sampler(...) else rejection_sampler(...)`).
@@ -1614,6 +1762,7 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   // branch is never taken and the sampler path below is byte-identical.
   if (exec_state_.step.num_draft_tokens > 0) {
     ModelRunnerOutput out_rej = sample_tokens_with_rejection(logits);
+    out_rej.prompt_logprobs_dict = std::move(out.prompt_logprobs_dict);
     // SPEC-MTP I5d: propose the next verify step's drafts after committing this
     // step's accepted tokens. The accept accounting lives in num_accepted_tokens
     // (num_sampled = accepted, seeded/overwritten there); num_rejected is derived.
@@ -2443,6 +2592,11 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
 
   std::vector<float> sampled_logits;
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+  // SAMPLE-PROMPT-LOGPROBS: same seam as the synchronous path. The prompt rows
+  // are read off this step's forward result HERE, synchronously, because that
+  // is where the logits still are — the async output only defers the sampled
+  // IDS. Inert unless a request asked.
+  collect_prompt_logprobs(skeleton.prompt_logprobs_dict);
   const SamplingMetadata sm = input_batch_.make_sampling_metadata();
 
   // Sample DEVICE-RESIDENT: the sampler writes the ids into the pool slot's

@@ -49,7 +49,7 @@ release_dir="$build_dir/release"
 tier_report="$release_dir/cpu-tier-report.json"
 stage_dir="$release_dir/stage"
 metadata_dir="$release_dir/metadata"
-archive="$release_dir/$artifact_id.tar.gz"
+archive="$release_dir/vllm.cpp-$VERSION-$artifact_id.tar.gz"
 mkdir -p "$release_dir"
 
 rich_runner_kind=qemu

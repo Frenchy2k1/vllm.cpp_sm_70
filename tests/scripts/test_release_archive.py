@@ -115,7 +115,10 @@ class ReleaseArchiveContract(unittest.TestCase):
         shutil.copy2(ROOT / "LICENSE", licenses / "LICENSE")
         if mutate is not None:
             mutate(stage, manifest, sbom)
-        archive = scratch / "vllm.cpp-fixture.tar.gz"
+        archive = scratch / (
+            f"vllm.cpp-{manifest['artifact']['version']}-"
+            f"{manifest['artifact']['id']}.tar.gz"
+        )
         with tarfile.open(archive, "w:gz") as bundle:
             for path in sorted(stage.rglob("*")):
                 bundle.add(path, arcname=path.relative_to(stage))
@@ -173,6 +176,32 @@ class ReleaseArchiveContract(unittest.TestCase):
             paths = self.make_release(Path(temporary))
             result = self.run_validator(*paths)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unversioned_archive_name_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            archive, checksum, provenance = self.make_release(scratch)
+            artifact_id = self.manifest(scratch / "stage/bin/vllm-server")["artifact"]["id"]
+            unversioned = scratch / f"{artifact_id}.tar.gz"
+            archive.rename(unversioned)
+            checksum.unlink()
+            statement = json.loads(provenance.read_text(encoding="utf-8"))
+            provenance.unlink()
+            statement["subject"][0]["name"] = unversioned.name
+            digest = hashlib.sha256(unversioned.read_bytes()).hexdigest()
+            unversioned_checksum = Path(f"{unversioned}.sha256")
+            unversioned_checksum.write_text(
+                f"{digest}  {unversioned.name}\n", encoding="utf-8"
+            )
+            unversioned_provenance = Path(f"{unversioned}.provenance.json")
+            unversioned_provenance.write_text(
+                json.dumps(statement), encoding="utf-8"
+            )
+            result = self.run_validator(
+                unversioned, unversioned_checksum, unversioned_provenance
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("canonical archive name", result.stdout + result.stderr)
 
     def test_extra_source_object_and_missing_metadata_fail(self) -> None:
         mutations = (
