@@ -52,6 +52,8 @@ void ApplyPenaltiesKernelRocm(Queue& q, Tensor& logits, const Tensor& prompt_mas
 void ApplyMinPKernelRocm(Queue& q, Tensor& logits, const Tensor& min_p);
 void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols,
                               const Tensor& biases);
+// Companion MoE-path op (same TU): elementwise silu(gate)*up.
+void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
 // pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
 void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
@@ -177,6 +179,8 @@ struct Registrar {
     RegisterOp(OpId::kApplyTokenMask, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
+    RegisterOp(OpId::kMoeSiluMul, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelRocm)));
     RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));
