@@ -203,6 +203,19 @@ target_include_directories(test_muse_glimmer_vision PRIVATE
 # the output multiplier and the soft-cap). CPU-only, no checkpoint. No speed axis
 # exists for this model — the pinned oracle cannot load it (specs/muse-glimmer.md §0).
 vllm_cpp_add_test(test_muse_glimmer_text vllm/models/test_muse_glimmer_text.cpp)
+# ...and the SAME gate on the HAND-CALL arm. `FusedChainAdoptEnabled()` defaults ON
+# and is read once per process into a function-local static, so the three
+# `else vt::RmsNorm(...)` fallbacks in muse_glimmer.cpp (input layernorm,
+# pre-feedforward layernorm, final norm) are UNREACHABLE in a default-env run —
+# mutating one of them left every gate green — and a same-process env flip cannot
+# reach them either. A SECOND ctest registration of the same binary is the only way
+# to gate that arm, and it is the arm that runs wherever the fusion recipes are
+# unavailable, so both must be green. The `... the fusion arm the environment
+# selected` case inside the binary is what proves this registration really took the
+# other branch instead of silently repeating the first.
+add_test(NAME test_muse_glimmer_text_fallback COMMAND test_muse_glimmer_text)
+set_tests_properties(test_muse_glimmer_text_fallback PROPERTIES
+  ENVIRONMENT "VT_FUSED_CHAIN_ADOPT=0")
 
 # Muse Glimmer W4 WIRING gate: the REAL-CHECKPOINT structural contract (every name
 # EnumerateMuseGlimmerTensors produces exists in the released 1436-tensor

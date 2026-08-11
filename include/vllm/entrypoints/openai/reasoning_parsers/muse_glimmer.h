@@ -15,12 +15,28 @@
 // than the single start/end-token base class — which is exactly the shape our
 // text-only ReasoningParser seam already has.
 //
-// DEVIATIONS from the upstream file (each one forced by a seam difference, none
-// of them a behaviour change the client can observe):
+// DEVIATIONS from the upstream file. Each is forced by a seam difference; the
+// FIRST one IS observable by a client and is an open gap, the rest are not:
 //
-//  1. `adjust_request` (upstream:117, forces skip_special_tokens=False) has no
-//     analogue: the C++ ReasoningParser seam carries no request-mutation hook and
-//     our detokenizer does not strip the ATEM markers in the first place.
+//  1. `adjust_request` (upstream:117, forces skip_special_tokens=False) is
+//     DROPPED, and the claim this comment used to make — "our detokenizer does not
+//     strip the ATEM markers in the first place" — is FALSE.
+//     `skip_special_tokens` is declared `= true` at protocol.h:240 (completion)
+//     and :461 (chat) and honoured at v1/engine/detokenizer.cpp:68, and the
+//     released checkpoint marks the framing markers special: `<|eom|>` 200007,
+//     `<|eot|>` 200008, `<|start|>` 200022, `<|message|>` 200023, each
+//     `"special": true` in `tokenizer.json` and listed under
+//     `extra_special_tokens` in `tokenizer_config.json`. At server defaults the
+//     framing this parser keys on is therefore GONE before it runs, which is
+//     exactly the reason upstream forces the flag off.
+//
+//     The seam has no `adjust_request` DISPATCH SITE at all — `KimiK2ToolParser
+//     ::adjust_request` (kimi_k2.cpp:87) has no callers either — so this is a
+//     pre-existing seam gap rather than something this port chose to drop. It is
+//     recorded as an OPEN GAP, not a no-op: channel scoping does not work at
+//     server defaults. The unit gates below pass because they feed the parser
+//     framed strings directly. Tracked in .agents/specs/muse-glimmer.md §6.7 and
+//     docs/FEATURES.md; NOT fixed here.
 //  2. `is_reasoning_end(input_ids)` / `is_reasoning_end_streaming` /
 //     `extract_content_ids` are token-ID methods upstream; this seam's
 //     `is_reasoning_end` is TEXT-based (reasoning_parsers/abstract.h documents

@@ -216,6 +216,15 @@ forms in use, so pick a checkpoint by its quality, not by its head:
 The head is dequantized to BF16 at load, so all three cost the same memory once
 running. Any other dtype fails at load with a message naming what it saw.
 
+A `modelopt_mixed` checkpoint (`nvidia/Qwen3.6-27B-NVFP4`, and the 35B-A3B that
+shares the tower) keeps its `linear_attn` input projections in FP8 W8A8, and
+those two per-layer projections are packed into ONE merged `in_proj_qkvz` GEMM,
+mirroring vLLM's `MergedColumnParallelLinear`. The merge only fires when the two
+shards carry a bitwise-identical per-tensor `input_scale`, since one GEMM
+quantizes the activation once; a checkpoint whose scales differ keeps the two
+separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
+in the same binary.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are
@@ -231,22 +240,34 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
-`MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` no longer belong
-in that table: both towers forward and the perception encoder is wired, so an
-image or video prompt runs instead of refusing. The text tower has been checked
-on the released 30B checkpoint against a standalone torch transcription of the
-upstream source and matches it token for token, but that is not the model's own
-runtime: the pinned oracle cannot load `muse_glimmer` at all. The perception
-encoder has no such check, nothing has been run end to end through the server,
-and no speed number exists for this model.
-A `modelopt_mixed` checkpoint (`nvidia/Qwen3.6-27B-NVFP4`, and the 35B-A3B that
-shares the tower) keeps its `linear_attn` input projections in FP8 W8A8, and
-those two per-layer projections are packed into ONE merged `in_proj_qkvz` GEMM,
-mirroring vLLM's `MergedColumnParallelLinear`. The merge only fires when the two
-shards carry a bitwise-identical per-tensor `input_scale`, since one GEMM
-quantizes the activation once; a checkpoint whose scales differ keeps the two
-separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
-in the same binary.
+### Muse Glimmer: exactly what has been checked
+
+`MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that
+table: both towers forward and the perception encoder is wired, so an image or
+video prompt runs instead of refusing. What has been *measured* is much narrower
+than "it works", so it is worth stating precisely.
+
+- The text tower ran on real tensors from the released 30B checkpoint at
+  **reduced depth — 4 of its 52 layers.** Its **5 prefill argmax positions** are
+  identical to a standalone torch transcription of the upstream source and to
+  HF's own `muse_glimmer` implementation. The full-depth 52-layer arm of our
+  forward has **never run**.
+- Those are argmax positions from a single prefill, not generated tokens.
+  **Multi-step decode is untested**, and so is the sliding window across steps.
+- Even at reduced depth this is agreement with independent transcriptions of the
+  same upstream source, not agreement with the model's own runtime: the pinned
+  oracle cannot load `muse_glimmer` at all.
+- The perception encoder has **no reference check of any kind** — the wiring gate
+  proves the tower is reachable and that its output lands on the image/video
+  placeholder rows, not that an image produces the right tokens.
+- Nothing has run end to end through the server, and **no speed number exists for
+  this model on any axis**; there is no denominator to state one against.
+- The ATEM reasoning and tool parsers are ported and unit-gated, but at the
+  server's default `skip_special_tokens: true` the framing tokens they key on
+  (`<|start|>`, `<|message|>`, `<|eom|>`, `<|eot|>`) are stripped before the
+  parser sees the text. Channel scoping is therefore an **open gap at server
+  defaults** — see [FEATURES.md](FEATURES.md) and
+  [the spec](../.agents/specs/muse-glimmer.md) §6.7.
 
 ## OpenAI-compatible server
 
