@@ -1061,8 +1061,8 @@ that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`,
-19 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
+35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -1101,6 +1101,13 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v8 | Custom logits processors |
 | v9 | Engine sizing: chunked-prefill token budget, scheduling policy, external KV connector / LMCache |
 | v10 | Jump-forward decoding (tri-state, default off) |
+| v11 | Audio transcription through `vllm_transcribe` |
+| v12 | Video and audio generation through `vllm_video_*` |
+| v13 | Pre-tokenized completion through `vllm_complete_tokens` |
+| v14 | Explicit device selection (`auto`, CPU, or CUDA) |
+| v15 | Embeddings through `vllm_embed` |
+| v16 | Absolute KV-cache memory sizing |
+| v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
