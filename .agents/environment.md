@@ -25,10 +25,12 @@ environment:
    30B bf16 checkpoint is ~60 GB; a build tree is ~169 GiB on its own, and a
    full disk surfaces as unrelated test failures rather than an obvious disk
    error. Fetching once to shared storage means every host, worktree and agent
-   reuses it instead of each pulling its own copy. Model operations respect the
-   variable when it is set and fall back to the tool default (usually the
-   Hugging Face cache under `$HOME`) when it is empty, so a setup with no
-   shared mount still works.
+   reuses it instead of each pulling its own copy. It states an INTENT and
+   nothing more: no code in the tree reads `CHECKPOINT_ROOT`, so it neither
+   redirects a download nor resolves a bare directory name — you place the
+   weights under it and pass the full path onward. A setup with no shared mount
+   leaves it empty and uses whatever the tool defaults to (usually the Hugging
+   Face cache under `$HOME`).
 
    Two rules travel with it. Pin an explicit revision when you fetch:
    publishers re-quantize in place under an unchanged repo name, so a bare

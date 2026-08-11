@@ -25,6 +25,7 @@
 // reference run for this checkpoint yet (the oracle cannot load it), so nothing
 // here says an image produces the right tokens — only that the tower is reachable
 // and that the plumbing puts its output in the right rows.
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -344,6 +345,17 @@ HfConfig TinyConfig() {
         {"pos_emb_width", kPosGrid},
         {"layer_norm_eps", 1e-5},
         {"layer_types", {"window_attention", "full_attention"}}}}};
+  return c;
+}
+
+// The same tiny model with `perception_emb_norm` ARMED. The released 30B leaves
+// `normalize_tok_embeddings` unset, so upstream's `perception_emb_norm` is
+// `nn.Identity` there (muse_glimmer.py:1469-1473) and no other config in this file
+// turns it on — which is exactly why the norm needs a config of its own to be
+// reachable by any assertion at all.
+HfConfig TinyConfigNormalizedTokEmbeddings() {
+  HfConfig c = TinyConfig();
+  c.raw["text_config"]["normalize_tok_embeddings"] = true;
   return c;
 }
 
@@ -743,6 +755,80 @@ TEST_CASE("MuseGlimmer: vision soft tokens land on the placeholder rows and nowh
   // Feature count and placeholder count must agree, BY NAME (muse_glimmer.py:1564).
   const std::vector<float> one_row(soft.begin(), soft.begin() + kHidden);
   CHECK_THROWS(vllm::MuseGlimmerMergeMultimodalEmbeds(ids, one_row, w, q));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `perception_emb_norm` — the norm asymmetry between text rows and soft tokens.
+//
+// COVERAGE HOLE this closes (review of #279). Nothing tested this at all: no
+// config in the tree set `normalize_tok_embeddings`, so the branch at
+// muse_glimmer_mm.cpp:217 never ran, and the scatter case above compares the
+// merged rows against the SAME `soft` vector it just computed — so it is
+// structurally blind to what EncodePixelGroups did to that vector. Inverting the
+// condition, or deleting the call entirely, left every gate green.
+//
+// The probe runs the IDENTICAL tower twice, once with the flag and once without,
+// which makes the norm the only difference between the two outputs; the soft
+// tokens are then required to stand in the exact algebraic relation upstream's
+// weightless RMSNorm defines, not merely to differ.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("MuseGlimmer: perception_emb_norm runs IFF normalize_tok_embeddings") {
+  const TempFile file(BuildSt(TinyTensors()));
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+  const MuseGlimmerWeights w_off =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, TinyConfig());
+  const MuseGlimmerWeights w_on =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(
+          shards, TinyConfigNormalizedTokEmbeddings());
+  // The released 30B's case is OFF; only an explicit flag arms the norm.
+  REQUIRE_FALSE(w_off.params.text.normalize_tok_embeddings);
+  REQUIRE(w_on.params.text.normalize_tok_embeddings);
+  vt::Queue q = Qcpu();
+
+  const std::vector<float> off = vllm::MuseGlimmerEncodePixelGroups(TinyImages(), w_off, q);
+  const std::vector<float> on = vllm::MuseGlimmerEncodePixelGroups(TinyImages(), w_on, q);
+  REQUIRE(off.size() == static_cast<size_t>(2 * kHidden));
+  REQUIRE(on.size() == off.size());
+
+  const double eps = static_cast<double>(w_off.params.text.rms_norm_eps);
+  for (int64_t r = 0; r < 2; ++r) {
+    double ms = 0.0;
+    for (int64_t i = 0; i < kHidden; ++i) {
+      const double v = off[static_cast<size_t>(r * kHidden + i)];
+      ms += v * v;
+    }
+    ms /= static_cast<double>(kHidden);
+    const double inv = 1.0 / std::sqrt(ms + eps);
+    // The soft tokens are NOT unit-RMS coming out of the projector, so the norm is
+    // a real change here — without this the equality below would be satisfied by a
+    // forward that never called the norm at all.
+    MESSAGE("perception_emb_norm row " << r << ": 1/rms = " << inv);
+    CHECK(std::abs(inv - 1.0) > 0.05);
+    for (int64_t i = 0; i < kHidden; ++i)
+      CHECK(on[static_cast<size_t>(r * kHidden + i)] ==
+            doctest::Approx(off[static_cast<size_t>(r * kHidden + i)] * inv).epsilon(1e-5));
+  }
+
+  // And the norm reaches the merged rows: a scatter that dropped it would put the
+  // UNNORMALIZED token on the placeholder row.
+  const std::vector<int32_t>& ids = MmPrompt();
+  const std::vector<uint16_t> merged =
+      vllm::MuseGlimmerMergeMultimodalEmbeds(ids, on, w_on, q);
+  const std::vector<bool> mask = vllm::MuseGlimmerMultimodalMask(ids, w_on.params);
+  int64_t slot = 0, differing = 0;
+  for (size_t t = 0; t < ids.size(); ++t) {
+    if (!mask[t]) continue;
+    for (int64_t i = 0; i < kHidden; ++i) {
+      const size_t at = static_cast<size_t>(static_cast<int64_t>(t) * kHidden + i);
+      const size_t s = static_cast<size_t>(slot * kHidden + i);
+      CHECK(merged[at] == vt::F32ToBF16(on[s]));
+      if (merged[at] != vt::F32ToBF16(off[s])) ++differing;
+    }
+    ++slot;
+  }
+  REQUIRE(slot == 2);
+  CHECK(differing > 0);  // the normed and un-normed streams are distinguishable here
 }
 
 TEST_CASE("MuseGlimmer: an image prompt runs through the REGISTERED mm forward") {

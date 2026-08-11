@@ -22,10 +22,32 @@
 //
 // DEVIATIONS from the upstream file:
 //
-//  1. `adjust_request` (upstream:206) and `supports_required_and_named = False`
-//     (upstream:192) have no analogue: the C++ ToolParser seam carries no
-//     request-mutation hook, no `skip_special_tokens`, and no
-//     named/required-tool_choice fast path that would need opting out of.
+//  1. `adjust_request` (upstream:206) IS DROPPED, AND THAT IS AN OPEN GAP — not,
+//     as an earlier version of this comment claimed, a difference with no
+//     consequence. The seam genuinely has no `adjust_request` DISPATCH SITE
+//     (`KimiK2ToolParser::adjust_request`, kimi_k2.cpp:87, has no callers either),
+//     so nothing here could have called it. But the reason upstream needs it does
+//     apply to us: `skip_special_tokens` is real on this seam — declared
+//     `= true` at protocol.h:240 (completion) and :461 (chat) and honoured at
+//     v1/engine/detokenizer.cpp:68 — and the released checkpoint's
+//     `tokenizer_config.json` marks `<|start|>`, `<|message|>`, `<|eom|>` and
+//     `<|eot|>` as `extra_special_tokens`, each carrying `"special": true` in
+//     `tokenizer.json` (ids 200022, 200023, 200007, 200008).
+//
+//     CONSEQUENCE, stated plainly: at server defaults the detokenizer strips the
+//     ATEM channel framing BEFORE this parser sees the text, so the channel
+//     scoping this file is built around cannot do its job and raw `<atem:...>`
+//     markup can fall through to the client. The parser's own unit gates pass
+//     because they feed it framed strings directly. Closing this needs an
+//     `adjust_request` dispatch site on the shared ToolParser seam, which is a
+//     seam change owned by no Muse row — tracked as an open gap in
+//     .agents/specs/muse-glimmer.md §6.7 and docs/FEATURES.md, NOT fixed here.
+//
+//     `supports_required_and_named = False` (upstream:192) is dropped for the
+//     same structural reason: the seam has no named/required-`tool_choice` fast
+//     path, so there is nothing to opt out of TODAY. If one is ever added it must
+//     read this flag, or Muse Glimmer will be handed a code path upstream
+//     explicitly refuses.
 //  2. Upstream logs four warnings (unframed ATEM, unknown tool name, truncated
 //     tool call, and the two `logger.exception` paths). This seam has no logger;
 //     the conditions are preserved exactly, the logging is not.
@@ -39,6 +61,15 @@
 //     reaching the tool parser has already had its framing classified away.
 //     Without the fallback a `to=user` answer would be silently dropped — the
 //     exact failure upstream's own docstring warns about (upstream:432-441).
+//  5. `arguments` IS COMPACT JSON. Upstream builds the wire string with
+//     `json.dumps`, whose default separators put a space after `:` and `,`
+//     (`{"city": "Paris"}`); nlohmann's `dump()` emits none (`{"city":"Paris"}`).
+//     A client parsing the JSON sees the same object, but a client comparing
+//     BYTES sees a different string. This is the convention of every tool parser
+//     in this tree, not a Muse-specific choice — changing it here alone would
+//     make this the only parser that spaces its arguments — so it is recorded
+//     rather than "fixed", and if it is ever changed it is changed for the whole
+//     family in one place.
 #pragma once
 
 #include <optional>

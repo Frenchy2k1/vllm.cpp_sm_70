@@ -177,7 +177,18 @@ parameters, fixtures, tolerances and failure cases preserved, each carrying the
 **Speed: OPEN GAP, not measured, not waived.** Recorded in `docs/BENCHMARKS.md`
 as pending on the named external unblocker: #51655 merging and the pin advancing
 to include it plus transformers 5.15. No ceiling is declared
-([[when-stuck-workflow-scan-vllm]]).
+([[when-stuck-workflow-scan-vllm]]). That row LANDED 2026-08-11 in the
+at-a-glance table; it states no number, claims no waiver, and names the
+unblocker.
+
+`docs/STATUS.md` and `.agents/NOW.md` carry NO Muse row, and that is a stated
+omission rather than an oversight. `STATUS.md` sits byte-exactly on its
+shrink-only ratchet (243,451 of 243,451) and `NOW.md` at 5,986 of its 6,000
+characters, so either page can only take a Muse row by collapsing another row's
+binding narrative — somebody else's keyed record, which this round will not
+rewrite as a side effect. Both are owed by the landing commit, which can pay for
+them; until then the model's public state lives in `docs/FEATURES.md` and
+`docs/USAGE.md`.
 
 ## 5. Risks
 
@@ -292,6 +303,109 @@ to stay bounded. Re-run at full depth on an idle box.
 Also still true: the perception encoder has no reference check, nothing has run
 end to end through the server, multi-step decode and the sliding window are
 untested, and **no speed axis is claimable on any dimension.**
+
+## 6.7 OPEN GAP — the ATEM parsers do not see their own framing at server defaults
+
+Found in the PR #279 review (2026-08-11) and **not fixed**; recorded here because
+it is the difference between "the parsers are ported" and "channel scoping
+works".
+
+Upstream's `MuseGlimmerToolParser.adjust_request` (`:206`) and
+`MuseGlimmerReasoningParser.adjust_request` (`:117`) force
+`skip_special_tokens=False` on any request routed to Muse Glimmer. Both were
+dropped in the port, justified in the shipped headers by the claim that the C++
+seam "carries no `skip_special_tokens`". **That claim was false.**
+
+- `skip_special_tokens` is declared `= true` on both request types
+  (`include/vllm/entrypoints/openai/protocol.h:240` completion, `:461` chat) and
+  honoured at `src/vllm/v1/engine/detokenizer.cpp:68`.
+- The released checkpoint marks the ATEM framing markers special:
+  `tokenizer_config.json` lists them under `extra_special_tokens`, and
+  `tokenizer.json` carries `"special": true` for `<|eom|>` 200007, `<|eot|>`
+  200008, `<|start|>` 200022, `<|message|>` 200023.
+
+So at server defaults the detokenizer strips `<|start|>assistant to=…<|message|>`
+before either parser runs. Channel scoping — the mechanism this port was built
+around, the thing that keeps an `<atem:invoke>` echoed inside a `to=self`
+reasoning block from becoming a tool call — cannot function, and raw ATEM markup
+can fall through to the client. The parsers' own unit gates pass because they are
+handed framed strings directly, which is exactly why this was invisible.
+
+**Why it is not fixed here.** The gap is in the SEAM, not in the port: there is no
+`adjust_request` dispatch site anywhere in the tree. `KimiK2ToolParser::adjust_request`
+(`src/vllm/entrypoints/openai/tool_parsers/kimi_k2.cpp:87`) exists and has no
+callers either, and several other parser headers record the same drop. Building a
+request-mutation hook onto the shared `ToolParser`/`ReasoningParser` surface is a
+seam change owned by no Muse row, and doing it inside a review-findings fix would
+be exactly the "hand-roll a parallel path" AGENTS.md forbids. It is recorded as
+visible debt in the two parser headers, `docs/FEATURES.md` and `docs/USAGE.md`,
+and it owes its own issue and row.
+
+`supports_required_and_named = False` (`tool parser :192`) is dropped for a
+related reason: the seam has no named/required-`tool_choice` fast path to opt out
+of today. If one is ever added it must read this flag, or Muse Glimmer will be
+handed a path upstream explicitly refuses.
+
+## 6.8 PR #279 review findings — what the fix round closed (2026-08-11)
+
+`CLAIM-MUSE-GLIMMER-FIX`, `row/MODEL-MUSE-GLIMMER-FIX`, off reviewed head
+`774c44d8`. The review's verdict was PASS-WITH-FINDINGS. Three findings were
+COVERAGE HOLES — mutations that stayed GREEN, meaning a shipped guarantee had no
+test at all — and those are the ones worth recording.
+
+| Mutation | Before | After |
+|---|---|---|
+| `perception_emb_norm` condition INVERTED (`muse_glimmer_mm.cpp:217`) | wiring gate GREEN | wiring 8/9 pass, **18 assertions RED** |
+| `perception_emb_norm` call DROPPED | wiring gate GREEN | wiring 8/9 pass, **17 assertions RED** |
+| RoPE base hardcoded 10000 instead of `g.rope_theta` (5e5) | text gate GREEN | text 20/21 pass, **4 assertions RED** |
+| RoPE base hardcoded 2.0 (the absurd control) | text gate RED | text gate RED (2 cases) |
+| `else vt::RmsNorm(...)` input-layernorm fallback given the wrong eps | default arm **21/21 GREEN** | fallback arm **1 assertion RED** |
+| `else vt::RmsNorm(...)` final-norm fallback given `gemma=true` | default arm **21/21 GREEN** | fallback arm **59 assertions RED** |
+
+In every case the tree was restored from an in-memory snapshot and `git diff` on
+`src/` verified empty before re-running green.
+
+What closed them:
+
+1. **`perception_emb_norm` had no test at all.** No config in the tree set
+   `normalize_tok_embeddings`, and the scatter case compared merged rows against
+   the same `soft` vector it had just computed, so it was structurally blind to
+   what `EncodePixelGroups` did to that vector. The new case runs the IDENTICAL
+   tower twice — flag off and flag on — which makes the norm the only difference,
+   and requires the soft tokens to stand in the exact algebraic relation the
+   weightless RMSNorm defines, with a control asserting the norm is not a no-op at
+   this geometry.
+2. **The whole non-FusedChain fallback arm was dead.** `FusedChainAdoptEnabled()`
+   defaults ON and is read once per process into a function-local static, so the
+   three `else vt::RmsNorm(...)` branches never executed under test and a
+   same-process env flip could not reach them either. `tests/CMakeLists.txt` now
+   registers the text binary a SECOND time as `test_muse_glimmer_text_fallback`
+   with `VT_FUSED_CHAIN_ADOPT=0`, so the whole gate — including the fp32 reference
+   comparison — runs on both arms, and a case inside the binary asserts the arm it
+   actually took, so the second registration cannot silently repeat the first.
+3. **RoPE theta was ungated at a realistic magnitude.** Every case ran at
+   positions 0..4 with `head_dim` 4, where 5e5 and 1e4 differ by milliradians —
+   under the reference band. The new case moves to positions 0..4096, pins the
+   base three ways (matches its own reference, does NOT match a 1e4 reference,
+   and the two configs cannot produce the same logits), and carries a widened but
+   named band: measured 6.9e-4 against a wrong-base signal of 4.1e-2.
+4. **A stale "OPEN FINDING" had disarmed a live assertion.** The real-weights
+   gate demoted `CHECK(accounted == enumerated)` to a `MESSAGE` whenever
+   `vision.present`, over a 50-tensor shortfall the W4 enumeration correction had
+   already fixed. Re-armed; the same guarantee runs without the NAS in
+   `test_muse_glimmer_wiring`, which asserts it on a multimodal checkpoint.
+5. **Two shipped headers carried a false justification** for dropping
+   `adjust_request`. Corrected, and the real consequence recorded as §6.7 above.
+6. **`docs/USAGE.md` overclaimed and contradicted `docs/FEATURES.md`.** "matches
+   it token for token on the released checkpoint" is now what was actually
+   measured: reduced depth 4 of 52, five prefill argmax positions, not generated
+   tokens, against transcriptions rather than the model's own runtime.
+
+Deliberately left open: the `adjust_request` seam (§6.7, needs its own issue and
+row); the `STATUS.md` / `NOW.md` rows (§4, blocked on their shrink-only budgets);
+the lifecycle-token advance in `.agents/model-matrix.md`, which owes those two
+rows; and the compact-vs-spaced `arguments` JSON, which is the whole parser
+family's convention and is documented rather than changed in one parser.
 
 ## 7. Outcome
 
