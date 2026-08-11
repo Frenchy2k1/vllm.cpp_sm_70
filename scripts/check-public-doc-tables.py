@@ -526,7 +526,12 @@ STATUS_RATCHET = {
     # than carried from either PR (#223 measured 243389, #238 measured 243559 --
     # both stale the moment the other landed). Every measured number and binding
     # claim kept verbatim. Strictly DOWN.
-    "chars": 243377,
+    #
+    # 243356 since 2026-08-11 (measured 243356): main re-pinned to 243378 for the
+    # #323 async-serving correction while #223 and #238 were landing. RE-MEASURED
+    # against the page that carries all three -- 243378 less #223's 10 and #238's
+    # 12 -- rather than carried from any one of them. Strictly DOWN.
+    "chars": 243356,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
