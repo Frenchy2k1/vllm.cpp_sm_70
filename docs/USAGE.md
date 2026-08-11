@@ -395,7 +395,7 @@ python3 scripts/check-cuda-fat-gencode.py \
 ```
 
 The release workflow applies this audit to independently linked x86_64 and
-arm64 host executables, packages each as a preview `cuda-fat` archive, and then
+arm64 host executables, packages each as a preview `cuda` archive, and then
 runs the extracted-archive validator. Each archive must contain all ten SM
 images and the six available exact-SM Triton AOT namespaces; the manifest keeps
 runtime evidence separate per SM. These build-only preview candidates are not
