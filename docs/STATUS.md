@@ -38,7 +38,9 @@ Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**,
 Releases: W1-W11/W13 are implemented in #196; local CPU, Vulkan, archive,
 metadata and mutation gates are green, while the hosted eight-tuple dry run and
 tagged publication stay pending, so no binary is published. Container
-images (#170): the cpu lane passes its gate; nothing is published.
+images (#170): the cpu (amd64) and cuda (arm64) lanes pass their gates, the
+latter RUNTIME-VERIFIED on GB10 `sm_121a` with `--gpus all`; Tegra (Thor, Orin)
+is untested and nothing is published.
 See [RELEASES](RELEASES.md).
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
