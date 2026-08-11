@@ -102,6 +102,65 @@ struct GdnPackedDecodeEnvConfig {
 
 bool PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env);
 
+// PERF-27B-GDN-PACKED-REACHABLE (#365) — what `dtype_compatible` above is
+// ACTUALLY about.
+//
+// Packed-decode selection happens BEFORE `ProjectGdnQkvz` runs, because the
+// decision changes how BA is projected (`ProjectGdnBA(..., packed_decode)`), so
+// the eligibility cannot read `mixed.dtype`; it has to PREDICT it. This mirrors
+// `ProjectGdnQkvz`'s branch order exactly — the merged BF16 `in_proj_qkvz`
+// owner is checked first, then the native-FP8 owner, then the split BF16 owner
+// — and `fp8_out_dtype` is sourced from the same single helper the projection
+// itself reads, so the prediction cannot drift from what the GEMM emits.
+struct GdnMixedQkvDTypeInputs {
+  bool has_bf16_qkvz_owner = false;  // w.in_proj_qkvz populated (27B bf16, 4B)
+  bool has_fp8_qkv_owner = false;    // w.in_proj_qkv_fp8 populated (modelopt)
+  vt::DType in_dtype = vt::DType::kF32;       // GdnInDType()
+  vt::DType fp8_out_dtype = vt::DType::kF32;  // the fp8 in_proj epilogue's dtype
+};
+
+vt::DType GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in);
+
+// The packed-decode dtype rule, keyed on the ACTIVATION dtypes the op needs and
+// on NOTHING about how the weights are stored. `vt::GdnPackedDecode`'s own
+// contract (src/vt/ops.cpp, "gdn_packed_decode: mixed_qkv/a/b/out must share
+// FP16/BF16/F32 dtype") is a uniformity rule over the four activation tensors;
+// the SSM state is explicitly INDEPENDENT of them ("state must use an
+// independent FP16/BF16/F32 dtype"), matching upstream FLA, which requires only
+// last-dim contiguity per tensor and casts each operand to f32 on load
+// (fla/ops/fused_recurrent.py:256-336 @ 702f4814). The model's packed leg pins
+// the shared dtype to BF16 — the dtype both the hand `GdnPackedDecodeKernel`
+// and the vendored FLA AOT cubin (`gdn_decode_h48`) are exercised at.
+//
+// This deliberately replaces the previous `in_proj_qkv_fp8.Empty() &&
+// in_proj_z_fp8.Empty()` term. That term was a PROXY: it excluded an fp8 GDN
+// tower because the fp8 GEMM emits f32 while a/b/out are bf16, which is a
+// statement about the ACTIVATION dtype, not about the weight format. Upstream
+// conditions the packed decode on nothing about the quantization method.
+struct GdnPackedDecodeDTypes {
+  vt::DType mixed_qkv = vt::DType::kF32;  // post-conv activation (== mixed.dtype)
+  vt::DType ba_out = vt::DType::kF32;     // MergedGdnBaOutputDType(packed)
+  vt::DType core_out = vt::DType::kF32;   // dcore, GdnOutDType(dense)
+  vt::DType ssm_state = vt::DType::kF32;  // the recurrent cache, independent
+};
+
+bool GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& dtypes);
+
+// VT_GDN_PACKED_DECODE_FP8_TOWER, DEFAULT OFF — the same-binary rollback of the
+// rule above. OFF reproduces the legacy exclusion exactly (an fp8 GDN tower is
+// never packed-decode eligible, whatever dtypes it produces), so the production
+// default is byte-identical to the pre-#365 selection on every checkpoint. ON
+// drops the weight-format term and lets `GdnPackedDecodeDTypesCompatible` decide
+// alone. Parsed here rather than at the getenv so the CPU tier can pin it;
+// '1'-leading is ON and everything else (including unset) is OFF, the house
+// default-OFF convention (vt::cuda::GdnPackedRegTileFlagIsOn).
+//
+// NOTE this can only ever PERMIT, never DESELECT: the call-site clause is
+// `!fp8_tower || allowed`, so on a checkpoint with no fp8 GDN shards it is
+// unconditionally true and `PackedGdnDecodeEnvSelected`'s truth table above is
+// unaffected.
+bool PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value);
+
 // W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is
 // selected only on CUDA with the packed 27B owner resident, the runtime
