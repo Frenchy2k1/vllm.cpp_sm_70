@@ -382,6 +382,22 @@ cmake --build build --target vllm-server-archive
 build/release/stage/bin/vllm-server --help
 ```
 
+On native Windows, run the CPU staging gate from a Visual Studio 2022 x64
+developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
+`bin/vllm-server.exe`, runs the focused Win32 tests, exercises the portable and
+AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
+`--help`, `/health`, `/version`, and a clean CTRL_BREAK shutdown:
+
+```powershell
+pwsh -File scripts/build-windows-release.ps1
+```
+
+The default smoke model is the committed tiny embedding fixture; pass
+`-SmokeModel C:\path\to\model` to use another complete model directory. This
+command produces a staged developer tree only. The Windows CPU and Vulkan ZIP
+downloads do not exist until the `v0.0.3-pre.1` prerelease workflow and
+post-publication audit succeed.
+
 The basic CMake archive under `build/release/` includes the version, configured
 backend, OS, and host architecture in its name. It is a developer package. The
 release workflow separately produces host-ABI-specific archives with a

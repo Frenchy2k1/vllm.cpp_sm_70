@@ -56,6 +56,8 @@
 #include "vllm/entrypoints/openai/serving_models.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/platform/console_shutdown.h"
+#include "vllm/platform/process.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -2579,4 +2581,25 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
 
   h.server.stop();
   server_thread.join();
+}
+
+TEST_CASE("platform process: Windows command line preserves every argv byte") {
+  const std::vector<std::wstring> argv = {
+      L"ffmpeg", L"two words", L"C:\\path\\", L"a\"b", L""};
+  CHECK(vllm::platform::BuildWindowsCommandLine(argv) ==
+        LR"("ffmpeg" "two words" "C:\path\\" "a\"b" "")");
+}
+
+#if !defined(_WIN32)
+TEST_CASE("platform process: direct argv runner propagates the child exit") {
+  CHECK(vllm::platform::RunProcessArgv({"/bin/sh", "-c", "exit 23"}) == 23);
+}
+#endif
+
+TEST_CASE("platform shutdown: a stop request is thread-safe and idempotent") {
+  std::atomic<int> stops{0};
+  vllm::platform::ConsoleShutdown shutdown([&]() { ++stops; }, false);
+  shutdown.RequestStop();
+  shutdown.RequestStop();
+  CHECK(stops.load() == 1);
 }
