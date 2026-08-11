@@ -175,7 +175,13 @@ std::unique_ptr<Scheduler> CreateScheduler() {
                                      /*enable_caching=*/true);
 }
 
-Tokenizer BuildFixture() {
+// `with_special_post_processor` adds a TemplateProcessing post-processor that
+// prefixes one <tool> special token. It MUST stay opt-in: it lengthens every
+// encoded prompt by one token, and the shared fixture is used by tests that
+// assert exact prompt-token counts (e.g. the depth-2 IterationStats fold
+// asserts vllm:prompt_tokens_total == 1). Turning it on globally silently
+// broke that assertion, which is why it is a parameter and not the default.
+Tokenizer BuildFixture(bool with_special_post_processor = false) {
   static int counter = 0;
   const std::string path =
       (std::filesystem::temp_directory_path() /
@@ -183,8 +189,10 @@ Tokenizer BuildFixture() {
           .string();
   json doc;
   doc["version"] = "1.0";
-  doc["added_tokens"] = json::array(
-      {{{"id", 21}, {"content", "<tool>"}, {"special", true}}});
+  doc["added_tokens"] =
+      with_special_post_processor
+          ? json::array({{{"id", 21}, {"content", "<tool>"}, {"special", true}}})
+          : json::array();
   doc["normalizer"] = nullptr;
   doc["pre_tokenizer"] = {
       {"type", "Sequence"},
@@ -200,17 +208,19 @@ Tokenizer BuildFixture() {
              {"add_prefix_space", false},
              {"trim_offsets", false},
              {"use_regex", false}}})}};
-  doc["post_processor"] = json::parse(R"json({
-    "type": "TemplateProcessing",
-    "single": [
-      {"SpecialToken": {"id": "<tool>", "type_id": 0}},
-      {"Sequence": {"id": "A", "type_id": 0}}
-    ],
-    "pair": [],
-    "special_tokens": {
-      "<tool>": {"id": "<tool>", "ids": [21], "tokens": ["<tool>"]}
-    }
-  })json");
+  if (with_special_post_processor) {
+    doc["post_processor"] = json::parse(R"json({
+      "type": "TemplateProcessing",
+      "single": [
+        {"SpecialToken": {"id": "<tool>", "type_id": 0}},
+        {"Sequence": {"id": "A", "type_id": 0}}
+      ],
+      "pair": [],
+      "special_tokens": {
+        "<tool>": {"id": "<tool>", "ids": [21], "tokens": ["<tool>"]}
+      }
+    })json");
+  }
   json vocab = {{"h", 0},   {"e", 1},    {"l", 2},     {"o", 3},
                 {"w", 4},   {"r", 5},    {"d", 6},     {"Ġ", 7},
                 {"1", 8},   {"2", 9},    {"ll", 10},   {"he", 11},
@@ -348,7 +358,8 @@ TEST_CASE("async_llm test_load: concurrent requests all finish with unique ids")
 TEST_CASE(
     "async_llm ordered waves preserve string/token inputs and one-item behavior") {
   InitHash();
-  Tokenizer tokenizer = BuildFixture();
+  // Opts in: this case asserts EncodeWithSpecialTokens differs from Encode.
+  Tokenizer tokenizer = BuildFixture(/*with_special_post_processor=*/true);
   HfConfig config = MakeConfig();
   auto scheduler = CreateScheduler();
   RunnerStub runner;
