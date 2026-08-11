@@ -313,6 +313,31 @@ class RatchetTests(unittest.TestCase):
         for fragment in ("cmake -S . -B", "cmake --build", "test_llm_engine", "ctest"):
             self.assertIn(fragment, body, fragment)
 
+    def test_lora_runtime_is_credited_for_its_own_invocation(self):
+        # LORA-RUNTIME re-entered the runnable population when the row went back
+        # to ACTIVE for W2 (#278), and the credit it arrived with was WEAK: the
+        # UPSTREAM path `tests/lora/test_qwen35_densemodel_lora.py`, named in
+        # the spec's prose as the eventual model gate, which nothing here runs.
+        # The pin was taken only alongside the row's real CPU invocation, so
+        # assert the real one is what the spec carries. Delete the ctest lines
+        # and this goes red, instead of the row quietly keeping a credit that
+        # rests on an upstream filename.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("LORA-RUNTIME"), "runnable")
+
+        spec = ROOT / ".agents" / "specs" / "lora-adapter.md"
+        section = gates.gates_section(spec.read_text(encoding="utf-8"))
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        self.assertIn(
+            "ctest --test-dir build-cpu -R test_lora_layers --output-on-failure",
+            commands,
+        )
+        self.assertIn(
+            "ctest --test-dir build-cpu -R test_punica_cpu --output-on-failure",
+            commands,
+        )
+
     def test_a_row_that_loses_its_command_is_refused(self):
         # Still present, still gated, no longer runnable -- a real regression.
         victim = sorted(gates.RUNNABLE_BASELINE)[0]

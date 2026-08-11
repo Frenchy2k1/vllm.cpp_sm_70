@@ -29,6 +29,7 @@ endfunction()
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
+vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
 vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)

@@ -585,7 +585,14 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            "chars": 243188,
+            # Lowered 2026-08-11 with the ratchet it guards (LoRA W2, #278):
+            # the STATUS LoRA row now covers W1+W2 in fewer bytes than it spent
+            # on W1 alone. The ceiling moves down in the SAME change, never
+            # after it. RE-MEASURED on the MERGED page at the landing merge of
+            # PR #282 into main `ca261aec`: neither the branch's stale 243482
+            # (basis 243227 against `5812b8b6`) nor main's 243188, but 243128,
+            # which is what `len(open("docs/STATUS.md").read())` reads here.
+            "chars": 243128,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,

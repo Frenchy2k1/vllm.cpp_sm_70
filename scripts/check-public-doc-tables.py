@@ -593,7 +593,26 @@ STATUS_RATCHET = {
     # histories above are kept; this is the single measured value for the merged
     # page; the PENDING paragraph was compressed to pay for itself rather than
     # widen the budget. Strictly DOWN from 243200.
-    "chars": 243188,
+    #
+    # 243227 since 2026-08-11 (measured 243227, LoRA W2 #278): the STATUS LoRA
+    # row now covers W1+W2 in fewer bytes than it used to spend on W1 alone --
+    # the W1 component list collapsed to the two names that matter and the W2
+    # additions replaced the "named W2-W7" enumeration. RE-MEASURED against the
+    # MERGED page (`len(open("docs/STATUS.md").read())` after merging
+    # `origin/main` 5812b8b6), never carried from either side: the branch had
+    # measured 243339 against its own stale base, and main has since re-pinned
+    # to 243287. Net -60, re-pinned byte-tight so the reduction cannot become
+    # untracked growth headroom. Strictly DOWN.
+    #
+    # 243128 since 2026-08-11 (measured 243128): the landing merge of PR #282
+    # into main `ca261aec`. BOTH rationale histories above are kept; neither
+    # side's number survives, because neither was measured against this page.
+    # Main had re-pinned to 243188 after the branch measured 243227 against
+    # `5812b8b6`, so the value here is the RE-MEASUREMENT of the merged page,
+    # `len(open("docs/STATUS.md").read())` == 243128 -- main's 243188 less the
+    # LoRA row's own net -60. Byte-tight, and strictly DOWN from 243188, the
+    # only direction this number may move.
+    "chars": 243128,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
