@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "vllm/model_executor/models/muse_glimmer.h"
+#include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // the k-quant arm
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
@@ -56,10 +57,17 @@ class MuseGlimmerLoadedModel final : public LoadedModel {
 std::unique_ptr<LoadedModel> LoadMuseGlimmer(const ModelRegistration& registration,
                                              const HfConfig& config,
                                              const ModelSource& source) {
-  if (source.kind != ModelSource::Kind::kSafetensors) {
-    throw std::runtime_error(
-        "Model architecture MuseGlimmerForConditionalGeneration does not support "
-        "GGUF weights");
+  // The GGUF k-quant arm (.agents/porting-a-model.md §2). This used to throw
+  // "does not support GGUF weights", which was never a decision — the quantized
+  // arm simply was not on any list, while a ~17 GB k-quant is what most users of
+  // a 30B model can actually run. The loader lives in its OWN translation unit
+  // (muse_glimmer_gguf_weights.cpp) and targets the same MuseGlimmerWeights, so
+  // everything below this branch is unchanged.
+  if (source.kind == ModelSource::Kind::kGguf) {
+    if (source.gguf == nullptr)
+      throw std::runtime_error("muse_glimmer GGUF model source is empty");
+    return std::make_unique<MuseGlimmerLoadedModel>(
+        registration, LoadMuseGlimmerFromGguf(*source.gguf, config));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
