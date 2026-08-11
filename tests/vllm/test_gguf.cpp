@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -50,6 +53,33 @@ std::string BuildValid(uint32_t version = 3) {
   f += Q8Block(0x3c00);  // f16 1.0
   return f;
 }
+
+std::string Utf8Path(const std::filesystem::path& path) {
+  const auto bytes = path.u8string();
+  return std::string(bytes.begin(), bytes.end());
+}
+
+class NamedTempFile {
+ public:
+  NamedTempFile(const std::filesystem::path& name, const std::string& bytes)
+      : path_(std::filesystem::temp_directory_path() / name) {
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+    std::ofstream out(path_, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out) throw std::runtime_error("failed to write GGUF test file");
+  }
+  ~NamedTempFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+  }
+  NamedTempFile(const NamedTempFile&) = delete;
+  NamedTempFile& operator=(const NamedTempFile&) = delete;
+  std::string utf8_path() const { return Utf8Path(path_); }
+
+ private:
+  std::filesystem::path path_;
+};
 
 }  // namespace
 
@@ -143,6 +173,33 @@ TEST_CASE("gguf: move semantics keep the mapping alive") {
   std::memcpy(&first, c.Get("t_f32").data, 4);
   CHECK(first == 0.0f);
 }  // moved-from a and b destroyed here; must not double-munmap
+
+TEST_CASE("gguf: borrowed mapping outlives a moved and destroyed reader") {
+  TempFile f(BuildValid());
+  vllm::GgufTensorInfo borrowed;
+  std::shared_ptr<const vllm::GgufMapping> owner;
+  std::weak_ptr<const vllm::GgufMapping> weak;
+  {
+    vllm::GgufFile source = vllm::GgufFile::Open(f.path());
+    vllm::GgufFile moved = std::move(source);
+    borrowed = moved.Get("t_q8");
+    owner = moved.Mapping();
+    weak = owner;
+  }
+
+  REQUIRE_FALSE(weak.expired());
+  CHECK(borrowed.data[0] == 0x00);
+  CHECK(borrowed.data[1] == 0x3c);
+  owner.reset();
+  CHECK(weak.expired());
+}
+
+TEST_CASE("gguf: non-ASCII filesystem path parses without ANSI conversion") {
+  NamedTempFile f(std::filesystem::path(U"vllm_gguf_caf\u00e9_\u6a21\u578b.gguf"),
+                  BuildValid());
+  vllm::GgufFile g = vllm::GgufFile::Open(f.utf8_path());
+  CHECK(g.Get("t_q8").data[1] == 0x3c);
+}
 
 TEST_CASE("gguf: Get on absent tensor throws with name") {
   TempFile f(BuildValid());

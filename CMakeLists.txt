@@ -680,6 +680,7 @@ add_library(vllm STATIC
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
+  src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
