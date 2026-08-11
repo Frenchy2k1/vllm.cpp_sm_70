@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 CHECKER = REPO / "scripts" / "check-windows-portability.py"
+UNSUPPORTED_TIER_FILTER = (
+    "--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran"
+)
 
 
 SAFE_FILES = {
@@ -129,6 +133,32 @@ SAFE_FILES = {
         #endif
     """,
     "scripts/build-windows-release.ps1": """
+        function Invoke-UnsupportedTierProbe {
+          param([string]$TierTest)
+          $arguments = @(
+            '--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran'
+          )
+          $probeOutput = @(& $TierTest @arguments 2>&1)
+          $probeExitCode = $LASTEXITCODE
+          if ($probeExitCode -ne 1) { throw "unexpected exit" }
+          if (($probeOutput -join "`n") -notmatch
+              [regex]::Escape("unknown x86 ISA tier 'amx'")) {
+            throw "missing diagnostic"
+          }
+        }
+        function Invoke-UnsupportedTierContractTests {
+          $badResults = @(
+            [pscustomobject]@{ ExitCode = 0 },
+            [pscustomobject]@{ ExitCode = 134 },
+            [pscustomobject]@{ ExitCode = -1073741819 },
+            [pscustomobject]@{ ExitCode = 3 },
+            [pscustomobject]@{ ExitCode = 2 }
+          )
+        }
+        if ($ContractTest) {
+          Invoke-CrtContractTests
+          Invoke-UnsupportedTierContractTests
+        }
         New-Item .cmake/api/v1/query/codemodel-v2
         cmake -S . -B $BuildDir -G "Visual Studio 17 2022" -A x64 `
           -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
@@ -140,14 +170,20 @@ SAFE_FILES = {
         dumpbin /imports bin/vllm-server.exe
         Invoke-CrtAudit
         Invoke-Checked $server @("--help")
-        $env:VT_CPU_MATMUL_TIER = "portable"
-        Invoke-Checked $tierTest @()
-        $env:VT_CPU_MATMUL_TIER = "avx2"
-        Invoke-Checked $tierTest @()
+        $savedTier = $env:VT_CPU_MATMUL_TIER
+        try {
+          $env:VT_CPU_MATMUL_TIER = "portable"
+          Invoke-Checked $tierTest @()
+          $env:VT_CPU_MATMUL_TIER = "avx2"
+          Invoke-Checked $tierTest @()
+          $env:VT_CPU_MATMUL_TIER = "amx"
+          Invoke-UnsupportedTierProbe -TierTest $tierTest
+        } finally {
+          $env:VT_CPU_MATMUL_TIER = $savedTier
+        }
         Invoke-WebRequest "$BaseUrl/health"
         Invoke-WebRequest "$BaseUrl/version"
         CTRL_BREAK_EVENT
-        $env:VT_CPU_MATMUL_TIER = "amx"
         Invoke-Checked python @($smokeHarness, $server)
         VCRUNTIME MSVCP CONCRT UCRTBASE api-ms-win-crt- MSVCR LIBCMT
     """,
@@ -436,6 +472,26 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                     "final in-flight decrement",
                 )
 
+    def test_console_final_tail_rejects_macros_for_trusted_tokens(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        mutations = (
+            "#define return SetEvent(state->stop_event); return\n  ",
+            "#define return(value) SetEvent(state->stop_event); return value\n  ",
+            "#define resumed \\\n  (SetEvent(state->stop_event), true)\n  ",
+            "#define fetch_sub(value, order) \\\n  (SetEvent(state->stop_event), 0)\n  ",
+        )
+        for directive in mutations:
+            with self.subTest(directive=directive):
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp",
+                    source.replace(decrement, directive + decrement, 1) +
+                    "\n#undef return\n#undef resumed\n#undef fetch_sub\n",
+                    "trusted final-tail token",
+                )
+
     def test_console_final_tail_ignores_comment_and_string_decoys(self) -> None:
         source = textwrap.dedent(
             SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
@@ -451,6 +507,71 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 source.replace(decrement, decoys + decrement, 1),
         }))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_console_function_body_skips_constrained_template_prototypes(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        prototypes = {
+            "DispatchControlEvent": textwrap.dedent("""
+                template <typename T>
+                bool DispatchControlEvent(T item)
+                    requires requires(T value) { value(); };
+                template <typename T>
+                bool DispatchControlEvent(T item) noexcept
+                    requires (sizeof(T) > 0);
+                template <typename T>
+                bool DispatchControlEvent(T item) [[deprecated]];
+            """),
+            "DrainEntrantsWithTimeout": textwrap.dedent("""
+                template <typename T>
+                bool DrainEntrantsWithTimeout(T item)
+                    requires requires(T value) { value(); };
+                template <typename T>
+                bool DrainEntrantsWithTimeout(T item) noexcept
+                    requires (sizeof(T) > 0);
+                template <typename T>
+                bool DrainEntrantsWithTimeout(T item) [[deprecated]];
+            """),
+            "DrainInFlightWithTimeout": textwrap.dedent("""
+                template <typename T>
+                bool DrainInFlightWithTimeout(T item)
+                    requires requires(T value) { value(); };
+                template <typename T>
+                bool DrainInFlightWithTimeout(T item) noexcept
+                    requires (sizeof(T) > 0);
+                template <typename T>
+                bool DrainInFlightWithTimeout(T item) [[deprecated]];
+            """),
+        }
+        all_prototypes = "\n".join(prototypes.values())
+        valid = source.replace(
+            "bool DrainEntrantsWithTimeout", all_prototypes +
+            "\nbool DrainEntrantsWithTimeout", 1
+        )
+        result = self.run_checker(self.make_tree({
+            "src/vllm/platform/console_shutdown.cpp": valid,
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            valid.replace(decrement, "", 1),
+            "stable event/in-flight",
+        )
+        timeout = "if (GetTickCount64() - start >= 5000) return false;"
+        self.assertEqual(valid.count(timeout), 2)
+        for occurrence in (0, 1):
+            position = -1
+            for _ in range(occurrence + 1):
+                position = valid.find(timeout, position + 1)
+            mutated = valid[:position] + valid[position + len(timeout):]
+            self.assert_rejected(
+                "src/vllm/platform/console_shutdown.cpp",
+                mutated,
+                "finite timeout",
+            )
 
     def test_unsigned_elapsed_subtraction_survives_tick_wrap(self) -> None:
         mask = (1 << 64) - 1
@@ -535,6 +656,89 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             ),
             "live --help smoke",
         )
+
+    def test_build_script_requires_isolated_unsupported_tier_probe(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        result = self.run_checker(self.make_tree({
+            "scripts/build-windows-release.ps1": script,
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for old, new, reason in (
+            (
+                UNSUPPORTED_TIER_FILTER,
+                "",
+                "isolated unsupported-tier filter",
+            ),
+            ("$probeExitCode -ne 1", "$probeExitCode -eq 0",
+             "exact unsupported-tier exit status"),
+            ("unknown x86 ISA tier 'amx'", "unrelated diagnostic",
+             "unsupported-tier diagnostic"),
+            ("ExitCode = 134", "ExitCode = 1",
+             "unsupported-tier crash contract"),
+            ("ExitCode = -1073741819", "ExitCode = 1",
+             "unsupported-tier crash contract"),
+            ("ExitCode = 3", "ExitCode = 1",
+             "unsupported-tier crash contract"),
+            ("ExitCode = 2", "ExitCode = 1",
+             "unsupported-tier crash contract"),
+            ("@(& $TierTest @arguments 2>&1)",
+             "@(& $TierTest @arguments)",
+             "merged unsupported-tier stdout/stderr capture"),
+            ("$env:VT_CPU_MATMUL_TIER = $savedTier", "",
+             "unsupported-tier environment restoration"),
+            ("  Invoke-UnsupportedTierContractTests\n", "",
+             "unsupported-tier fake-tool contract"),
+        ):
+            with self.subTest(old=old):
+                self.assertIn(old, script)
+                self.assert_rejected(
+                    "scripts/build-windows-release.ps1",
+                    script.replace(old, new, 1),
+                    reason,
+                )
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            script.replace(
+                "Invoke-UnsupportedTierProbe -TierTest $tierTest",
+                "& $tierTest",
+                1,
+            ),
+            "AMX refusal must use only the isolated",
+        )
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            script.replace(
+                "Invoke-UnsupportedTierProbe -TierTest $tierTest",
+                "Invoke-Checked $tierTest @()\n"
+                "  Invoke-UnsupportedTierProbe -TierTest $tierTest",
+                1,
+            ),
+            "AMX refusal must use only the isolated",
+        )
+        quoted_filter = f"'{UNSUPPORTED_TIER_FILTER}'"
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            script.replace(
+                quoted_filter,
+                f"{quoted_filter},\n    {quoted_filter}",
+                1,
+            ),
+            "one exact unsupported-tier filter argument",
+        )
+        self.assert_rejected(
+            "scripts/build-windows-release.ps1",
+            f"$filterDecoy = {quoted_filter}\n" + script.replace(
+                quoted_filter, "'--test-case=unrelated test'", 1
+            ),
+            "one exact unsupported-tier filter argument",
+        )
+
+    def test_unsupported_tier_filter_is_one_exact_process_argument(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        arguments = re.findall(
+            r"(?m)^\s*['\"](--test-case=.*)['\"]\s*$", script
+        )
+        self.assertEqual(arguments, [UNSUPPORTED_TIER_FILTER])
 
     def test_real_codemodel_requires_reachable_sources_and_internal_headers(self) -> None:
         root = self.make_tree()
