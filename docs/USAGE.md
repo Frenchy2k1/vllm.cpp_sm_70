@@ -548,7 +548,7 @@ Registered in
 | GET | `/health` | Process liveness (200) |
 | GET, POST | `/ping` | Liveness probe (200, mirrors `/health`) |
 | GET | `/version` | Engine version |
-| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4), recorded per engine step by the engine that serves your requests |
+| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4), recorded per engine step by the engine that serves your requests. Series and families keep stable addresses as new ones register (#330), so a long-lived scrape target does not read through a reallocated registry |
 | POST | `/tokenize` | Tokenize a `prompt` to token ids (optional `token_strs`) |
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
