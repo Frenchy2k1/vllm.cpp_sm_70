@@ -186,7 +186,12 @@ TEST_CASE("HfConfigFromGguf reads the qwen35moe hparams") {
   CHECK(c.linear_value_head_dim == 4);
   CHECK(c.linear_conv_kernel_dim == 3);
   CHECK(c.rope_theta == doctest::Approx(1000000.0));
-  CHECK(c.rms_norm_eps == doctest::Approx(1e-6));
+  // `.scale(0.0)` is load-bearing: doctest's Approx adds a scale term defaulting
+  // to 1.0, so a bare `Approx(1e-6)` has an absolute tolerance of ~1.19e-5 and
+  // accepts ANY eps below it -- including the 1e-05 this very file uses for
+  // another family. Verified: mutating the fixture to 1e-05 left the bare form
+  // passing and fails here.
+  CHECK(c.rms_norm_eps == doctest::Approx(1e-6).scale(0.0));
   CHECK(c.max_position_embeddings == 40960);
   // full_attention_interval=2 -> layer0 linear (GDN), layer1 full attention.
   REQUIRE(c.layer_types.size() == 2);
