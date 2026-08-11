@@ -138,6 +138,32 @@ foreach ($test in @(
     Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
 }
 
+if (Test-Path $StageDir) {
+    Remove-Item -Recurse -Force $StageDir
+}
+Invoke-Checked cmake @(
+    "--install", $BuildDir,
+    "--config", "Release",
+    "--prefix", $StageDir,
+    "--component", "vllm-server"
+)
+
+$server = Join-Path $StageDir "bin/vllm-server.exe"
+if (-not (Test-Path $server)) {
+    throw "native install did not stage bin/vllm-server.exe"
+}
+$crtArtifacts = @(
+    Get-ChildItem -Path $BuildDir -Recurse -File -Include "*.obj", "vllm*.lib" |
+        Where-Object { $_.FullName -notmatch '[\\/](?:_deps|third_party)[\\/]' } |
+        ForEach-Object { $_.FullName }
+)
+if ($crtArtifacts.Count -eq 0) {
+    throw "COFF CRT audit found no project objects or static libraries"
+}
+Invoke-CrtAudit -Artifacts $crtArtifacts -Server $server
+
+Invoke-Checked $server @("--help")
+
 $tierTest = Join-Path $BuildDir "tests/Release/test_ops_matmul_elem.exe"
 $savedTier = $env:VT_CPU_MATMUL_TIER
 try {
@@ -153,32 +179,6 @@ try {
 } finally {
     $env:VT_CPU_MATMUL_TIER = $savedTier
 }
-
-if (Test-Path $StageDir) {
-    Remove-Item -Recurse -Force $StageDir
-}
-Invoke-Checked cmake @(
-    "--install", $BuildDir,
-    "--config", "Release",
-    "--prefix", $StageDir,
-    "--component", "vllm-server"
-)
-
-$server = Join-Path $StageDir "bin/vllm-server.exe"
-if (-not (Test-Path $server)) {
-    throw "native install did not stage bin/vllm-server.exe"
-}
-Invoke-Checked $server @("--help")
-
-$crtArtifacts = @(
-    Get-ChildItem -Path $BuildDir -Recurse -File -Include "*.obj", "vllm*.lib" |
-        Where-Object { $_.FullName -notmatch '[\\/](?:_deps|third_party)[\\/]' } |
-        ForEach-Object { $_.FullName }
-)
-if ($crtArtifacts.Count -eq 0) {
-    throw "COFF CRT audit found no project objects or static libraries"
-}
-Invoke-CrtAudit -Artifacts $crtArtifacts -Server $server
 
 # Python's Windows subprocess path calls CreateProcess with
 # CREATE_NEW_PROCESS_GROUP, letting the smoke target one CTRL_BREAK_EVENT at the

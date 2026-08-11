@@ -2612,6 +2612,7 @@ TEST_CASE("platform shutdown: a stop request is thread-safe and idempotent") {
 
 #if defined(_WIN32)
 TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
+  constexpr DWORD kWaitMs = 5000;
   HANDLE acquired = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE before_drain = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2627,12 +2628,30 @@ TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
     CHECK(vllm::platform::ConsoleShutdown::DispatchControlEventForTest(
         CTRL_BREAK_EVENT, acquired, resume));
   });
-  REQUIRE(WaitForSingleObject(acquired, INFINITE) == WAIT_OBJECT_0);
+  const DWORD acquired_result = WaitForSingleObject(acquired, kWaitMs);
+  if (acquired_result != WAIT_OBJECT_0) {
+    SetEvent(resume);
+    handler.join();
+    shutdown.reset();
+    CloseHandle(before_drain);
+    CloseHandle(resume);
+    CloseHandle(acquired);
+    FAIL("console handler did not acquire state within timeout");
+  }
   std::thread destroyer([&] {
     shutdown.reset();
     destroyed.store(true, std::memory_order_release);
   });
-  REQUIRE(WaitForSingleObject(before_drain, INFINITE) == WAIT_OBJECT_0);
+  const DWORD drain_result = WaitForSingleObject(before_drain, kWaitMs);
+  if (drain_result != WAIT_OBJECT_0) {
+    SetEvent(resume);
+    handler.join();
+    destroyer.join();
+    CloseHandle(before_drain);
+    CloseHandle(resume);
+    CloseHandle(acquired);
+    FAIL("console teardown did not reach drain within timeout");
+  }
   CHECK_FALSE(destroyed.load(std::memory_order_acquire));
   REQUIRE(SetEvent(resume) != 0);
   handler.join();

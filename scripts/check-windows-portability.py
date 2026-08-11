@@ -32,6 +32,36 @@ POSIX_PATTERNS = (
 )
 
 
+CPP_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+
+
+def _project_header_closure(root: Path, sources: set[str],
+                            include_roots: set[Path]) -> set[str]:
+    """Resolve every project-local quoted include reachable from sources."""
+    closure = set(sources)
+    pending = list(sources)
+    include_re = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+    while pending:
+        relative = pending.pop()
+        source = root / relative
+        if not source.is_file() or source.suffix.lower() not in CPP_SUFFIXES:
+            continue
+        for included in include_re.findall(source.read_text(encoding="utf-8")):
+            candidates = [source.parent / included]
+            candidates.extend(directory / included for directory in include_roots)
+            for candidate in candidates:
+                try:
+                    resolved = candidate.resolve()
+                    found = resolved.relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                if resolved.is_file() and found not in closure:
+                    closure.add(found)
+                    pending.append(found)
+                    break
+    return closure
+
+
 def _load_codemodel_sources(root: Path, build_dir: Path) -> set[str]:
     replies = build_dir / ".cmake/api/v1/reply"
     indexes = sorted(replies.glob("index-*.json"))
@@ -68,12 +98,23 @@ def _load_codemodel_sources(root: Path, build_dir: Path) -> set[str]:
     pending = roots[:]
     seen: set[str] = set()
     sources: set[str] = set()
+    include_roots = {root, root / "include", root / "src"}
     while pending:
         target_id = pending.pop()
         if target_id in seen:
             continue
         seen.add(target_id)
         data = json.loads(target_files[target_id].read_text(encoding="utf-8"))
+        for group in data.get("compileGroups", []):
+            for include in group.get("includes", []):
+                path = Path(include.get("path", ""))
+                absolute = path if path.is_absolute() else root / path
+                try:
+                    resolved = absolute.resolve()
+                    resolved.relative_to(root)
+                except (OSError, ValueError):
+                    continue
+                include_roots.add(resolved)
         for source in data.get("sources", []):
             path = Path(source.get("path", ""))
             absolute = path if path.is_absolute() else root / path
@@ -85,19 +126,17 @@ def _load_codemodel_sources(root: Path, build_dir: Path) -> set[str]:
             dependency["id"] for dependency in data.get("dependencies", [])
             if dependency.get("id") in targets
         )
-    # CMake codemodel enumerates compiled translation units. Public/internal
-    # project headers are part of those units but are not separate codemodel
-    # entries, so include the whole shipped header surface conservatively.
-    for pattern in ("include/vllm/**/*.h", "include/vllm/**/*.hpp"):
-        sources.update(path.relative_to(root).as_posix() for path in root.glob(pattern))
-    return sources
+    return _project_header_closure(root, sources, include_roots)
 
 
-def shipped_server_sources(root: Path, build_dir: Path | None) -> set[str]:
-    fixture = root / ".windows-portability-sources.json"
-    if fixture.is_file():
-        data = json.loads(fixture.read_text(encoding="utf-8"))
-        return {str(item) for item in data.get("sources", [])}
+def shipped_server_sources(root: Path, build_dir: Path | None,
+                           source_manifest: Path | None = None) -> set[str]:
+    if source_manifest is not None:
+        data = json.loads(source_manifest.read_text(encoding="utf-8"))
+        sources = {str(item) for item in data.get("sources", [])}
+        return _project_header_closure(
+            root, sources, {root, root / "include", root / "src"}
+        )
     if build_dir is not None:
         return _load_codemodel_sources(root, build_dir.resolve())
     if shutil.which("cmake") is None:
@@ -143,6 +182,11 @@ def windows_possible_lines(text: str):
         elif re.match(r"#\s*if\b.*!\s*defined\s*\(\s*_WIN32\s*\)", stripped):
             stack.append((possible, True, False))
             possible = False
+        elif (re.match(r"#\s*if\b", stripped) and
+              re.search(r"\b(?:__GNUC__|__clang__)\b", stripped) and
+              not re.search(r"\b_MSC_VER\b", stripped)):
+            stack.append((possible, True, False))
+            possible = False
         elif (re.match(r"#\s*if(?:n?def)?\b", stripped) and
               re.search(r"\b(?:__unix__|__APPLE__)\b", stripped) and
               not re.search(r"\b_WIN32\b", stripped)):
@@ -155,7 +199,11 @@ def windows_possible_lines(text: str):
             possible = parent and (not condition if known else True)
         elif re.match(r"#\s*elif\b", stripped) and stack:
             parent, _, _ = stack[-1]
-            possible = parent
+            if (re.search(r"\b(?:__GNUC__|__clang__)\b", stripped) and
+                    not re.search(r"\b_MSC_VER\b", stripped)):
+                possible = False
+            else:
+                possible = parent
         elif re.match(r"#\s*endif\b", stripped) and stack:
             parent, _, _ = stack.pop()
             possible = parent
@@ -237,7 +285,175 @@ def _active_powershell(text: str) -> str:
     text = re.sub(r"(?s)<#.*?#>", "", text)
     lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
     text = "\n".join(lines)
-    return re.sub(r"(?is)if\s*\(\s*\$false\s*\)\s*\{.*?\}", "", text)
+    text = re.sub(r"(?is)if\s*\(\s*\$false\s*\)\s*\{.*?\}", "", text)
+    return re.sub(r"(?is)if\s*\(\s*\$ContractTest\s*\)\s*\{.*?\}", "", text)
+
+
+def _ordered_matches(text: str, stages: tuple[tuple[str, str], ...],
+                     errors: list[str], label: str) -> None:
+    offsets: list[int] = []
+    for description, pattern in stages:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        if match is None:
+            errors.append(
+                f"build-windows-release.ps1: missing active {description} in {label}"
+            )
+            return
+        offsets.append(match.start())
+    if offsets != sorted(offsets) or len(offsets) != len(set(offsets)):
+        errors.append(
+            "build-windows-release.ps1: native gate order must be "
+            "configure/codemodel -> checker -> build/focused tests -> install -> "
+            "CRT audit -> help/tier/server smokes"
+        )
+
+
+def _validate_powershell_ast_order(commands: list[dict],
+                                   errors: list[str]) -> None:
+    stages = (
+        ("codemodel query", r"\bNew-Item\b.*codemodel-v2"),
+        ("configure", r"\bInvoke-Checked\s+cmake\b.*(?:\"-S\"|\s-S\s)"),
+        ("portability checker", r"\bInvoke-Checked\s+python\b.*check-windows-portability\.py"),
+        ("build", r"\bInvoke-Checked\s+cmake\b.*\"--build\""),
+        ("focused tests", r"\bInvoke-Checked\b.*tests[/\\]Release[/\\]\$test"),
+        ("install", r"\bInvoke-Checked\s+cmake\b.*\"--install\""),
+        ("CRT audit", r"\bInvoke-CrtAudit\b"),
+        ("live --help smoke", r"\bInvoke-Checked\s+\$server\b.*--help"),
+        ("forced-tier smoke", r"\bInvoke-Checked\s+\$tierTest\b"),
+        ("server smoke harness", r"\bInvoke-Checked\s+python\b.*\$smokeHarness"),
+    )
+    offsets: list[int] = []
+    for description, pattern in stages:
+        candidates = [
+            int(item.get("offset", -1)) for item in commands
+            if re.search(pattern, item.get("text", ""), re.IGNORECASE | re.DOTALL)
+        ]
+        if not candidates:
+            errors.append(
+                f"build-windows-release.ps1: missing active {description} in PowerShell AST"
+            )
+            return
+        offsets.append(min(candidates))
+    if offsets != sorted(offsets) or len(offsets) != len(set(offsets)):
+        errors.append(
+            "build-windows-release.ps1: native gate order must be "
+            "configure/codemodel -> checker -> build/focused tests -> install -> "
+            "CRT audit -> help/tier/server smokes"
+        )
+
+
+def _validate_powershell_source_order(text: str, errors: list[str]) -> None:
+    active = _active_powershell(text)
+    pipeline = active.find("codemodel-v2")
+    if pipeline >= 0:
+        active = active[pipeline:]
+    stages = (
+        ("codemodel query", r"codemodel-v2"),
+        ("configure", r"(?:^\s*cmake\s+-S\b|^\s*\"-S\"\s*,\s*\$SourceDir)"),
+        ("portability checker", r"check-windows-portability\.py"),
+        ("build", r"(?:^\s*cmake\s+--build\b|\"--build\"\s*,\s*\$BuildDir)"),
+        ("focused tests", r"(?:^\s*foreach\s*\(\s*\$test\b|^\s*&\s+\"\$BuildDir/tests/test_openai_api_server\.exe\")"),
+        ("install", r"(?:^\s*cmake\s+--install\b|\"--install\"\s*,\s*\$BuildDir)"),
+        ("CRT audit", r"^\s*Invoke-CrtAudit\b"),
+        ("live --help smoke", r"^\s*Invoke-Checked\s+\$server\b[^\n]*--help"),
+        ("forced-tier smoke", r"^\s*\$env:VT_CPU_MATMUL_TIER\s*=\s*\"portable\""),
+        ("server smoke harness", r"^\s*Invoke-Checked\s+python\b[^\n]*\$smokeHarness"),
+    )
+    _ordered_matches(active, stages, errors, "source contract")
+
+
+def _cpp_function_body(source: str, signature: str) -> str:
+    match = re.search(signature, source)
+    if match is None:
+        return ""
+    opening = source.find("{", match.end())
+    if opening < 0:
+        return ""
+    depth = 0
+    for offset in range(opening, len(source)):
+        if source[offset] == "{":
+            depth += 1
+        elif source[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1:offset]
+    return ""
+
+
+def _validate_console_protocol(console: str, errors: list[str]) -> None:
+    dispatch = _cpp_function_body(console, r"\bbool\s+DispatchControlEvent\s*\(")
+    handler = _cpp_function_body(
+        console, r"\bBOOL\s+WINAPI\s+ConsoleControlHandler\s*\("
+    )
+    stable_declarations = (
+        re.search(r"std::atomic\s*<\s*WindowsHandlerState\s*\*\s*>\s+published", console),
+        re.search(r"std::atomic\s*<\s*unsigned\s*>\s+entrants", console),
+        re.search(r"std::atomic\s*<\s*unsigned\s*>\s+in_flight", console),
+        re.search(
+            r"static\s+auto\s*\*\s*registry\s*=\s*new\s+WindowsHandlerRegistry",
+            console,
+        ),
+    )
+    dispatch_steps = (
+        r"entrants\.fetch_add\s*\(\s*1\s*,\s*std::memory_order_seq_cst\s*\)",
+        r"published\.load\s*\(\s*std::memory_order_seq_cst\s*\)",
+        r"in_flight\.fetch_add\s*\(\s*1\s*,\s*std::memory_order_seq_cst\s*\)",
+        r"entrants\.fetch_sub\s*\(\s*1\s*,\s*std::memory_order_seq_cst\s*\)",
+        r"SetEvent\s*\(\s*state->stop_event\s*\)",
+        r"in_flight\.fetch_sub\s*\(\s*1\s*,\s*std::memory_order_seq_cst\s*\)",
+    )
+    dispatch_offsets = []
+    for pattern in dispatch_steps:
+        match = re.search(pattern, dispatch)
+        dispatch_offsets.append(-1 if match is None else match.start())
+    teardown = _cpp_function_body(
+        console, r"ConsoleShutdown::~ConsoleShutdown\s*\("
+    ) or console
+    teardown_steps = (
+        r"published\.store\s*\(\s*nullptr\s*,\s*std::memory_order_seq_cst\s*\)",
+        r"DrainEntrantsWithTimeout\s*\(",
+        r"DrainInFlightWithTimeout\s*\(",
+        r"(?:(?:win_state_|state)\.reset\s*\(\s*\))",
+    )
+    teardown_offsets = []
+    for index, pattern in enumerate(teardown_steps):
+        matches = list(re.finditer(pattern, teardown))
+        match = matches[-1] if index == len(teardown_steps) - 1 and matches else (
+            matches[0] if matches else None
+        )
+        teardown_offsets.append(-1 if match is None else match.start())
+    ordered_dispatch = (
+        all(offset >= 0 for offset in dispatch_offsets) and
+        dispatch_offsets == sorted(dispatch_offsets)
+    )
+    ordered_teardown = (
+        all(offset >= 0 for offset in teardown_offsets) and
+        teardown_offsets == sorted(teardown_offsets)
+    )
+    retire = re.search(r"RetireHandlerState\s*\(", teardown)
+    reset = re.search(r"(?:win_state_|state)\.reset\s*\(", teardown)
+    timeout_retained = (
+        re.search(r"if\s*\(\s*!\s*safe_to_close\s*\)", teardown) is not None and
+        retire is not None and reset is not None and retire.start() < reset.start()
+    )
+    if (not all(stable_declarations) or not ordered_dispatch or
+            not ordered_teardown or not timeout_retained):
+        errors.append(
+            "console_shutdown.cpp: stable event/in-flight handler lifetime protocol is required"
+        )
+    forbidden = r"RequestStop|\bimpl_|\bthis\b|std::mutex|condition_variable|\bstop_\s*\("
+    if not dispatch or not handler or re.search(forbidden, dispatch + "\n" + handler):
+        errors.append(
+            "console_shutdown.cpp: OS handler may use only stable atomics and Win32 events"
+        )
+    cleanup = _cpp_function_body(
+        console, r"WindowsHandlerState::~WindowsHandlerState\s*\("
+    ) or console
+    if not all(re.search(rf"CloseHandle\s*\(\s*{event}\s*\)", cleanup)
+               for event in ("stop_event", "quit_event")):
+        errors.append(
+            "console_shutdown.cpp: partial event creation cleanup must close every created handle"
+        )
 
 
 def _validate_powershell_ast(script: Path, errors: list[str]) -> None:
@@ -273,7 +489,17 @@ function Test-Dead([System.Management.Automation.Language.Ast]$Node) {
 }
 $commands = @($ast.FindAll({
   param($node) $node -is [System.Management.Automation.Language.CommandAst]
-}, $true) | Where-Object { -not (Test-Dead $_) } | ForEach-Object {
+}, $true) | Where-Object {
+  if (Test-Dead $_) { return $false }
+  $cursor = $_.Parent
+  while ($null -ne $cursor) {
+    if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+      return $false
+    }
+    $cursor = $cursor.Parent
+  }
+  return $true
+} | ForEach-Object {
   [pscustomobject]@{ text = $_.Extent.Text; offset = $_.Extent.StartOffset }
 })
 $commands | ConvertTo-Json -Compress
@@ -301,6 +527,7 @@ $commands | ConvertTo-Json -Compress
     ):
         if not re.search(pattern, command_text, re.IGNORECASE):
             errors.append(f"build-windows-release.ps1: AST missing active {description}")
+    _validate_powershell_ast_order(decoded, errors)
     contract = subprocess.run(
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script),
          "-SourceDir", str(script.parents[1]), "-ContractTest"],
@@ -311,18 +538,24 @@ $commands | ConvertTo-Json -Compress
                       contract.stdout + contract.stderr)
 
 
-def check(root: Path, build_dir: Path | None = None) -> list[str]:
+def check(root: Path, build_dir: Path | None = None,
+          source_manifest: Path | None = None) -> list[str]:
     errors: list[str] = []
     try:
-        source_paths = shipped_server_sources(root, build_dir)
+        source_paths = shipped_server_sources(root, build_dir, source_manifest)
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         errors.append(f"shipped-server source discovery failed: {exc}")
-        source_paths = set(REQUIRED_CPP)
-    source_paths.update(REQUIRED_CPP)
+        source_paths = set()
+    for required in REQUIRED_CPP:
+        if required not in source_paths:
+            errors.append(
+                f"{required}: required implementation is not reachable from "
+                "the shipped server target"
+            )
     texts = {
         relative: require_file(root, relative, errors)
         for relative in sorted(source_paths)
-        if Path(relative).suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}
+        if Path(relative).suffix.lower() in CPP_SUFFIXES
     }
     cmake = require_file(root, "CMakeLists.txt", errors)
     warnings_path = root / "cmake/CompilerWarnings.cmake"
@@ -340,15 +573,19 @@ def check(root: Path, build_dir: Path | None = None) -> list[str]:
                 re.search(r"(?<![A-Za-z0-9_])::stat\s*\(", line) or
                 re.search(r"\bS_IS(?:DIR|REG)\s*\(", line)
             )
-            scoped_posix = (
-                relative in REQUIRED_CPP and
-                any(re.search(pattern, line) for pattern in POSIX_PATTERNS)
+            platform_boundary = (
+                relative in REQUIRED_CPP or
+                relative.startswith("src/vllm/platform/")
+            )
+            scoped_posix = platform_boundary and any(
+                re.search(pattern, line) for pattern in POSIX_PATTERNS
             )
             if full_source_posix or scoped_posix:
                 errors.append(f"{relative}:{number}: unguarded POSIX include/call reaches Windows")
-            if relative in REQUIRED_CPP and (
-                    re.search(r"\b(?:CreateFileA|LoadLibraryA|MoveFileExA|DeleteFileA)\b", line) or
-                    re.search(r"\.string\s*\(\)", line)):
+            if (re.search(
+                    r"\b(?:CreateFileA|LoadLibraryA|MoveFileExA|DeleteFileA)\b",
+                    line,
+                ) or (platform_boundary and re.search(r"\.string\s*\(\)", line))):
                 errors.append(f"{relative}:{number}: lossy Windows path conversion/API is forbidden")
 
     all_source = "\n".join(texts.values())
@@ -379,49 +616,25 @@ def check(root: Path, build_dir: Path | None = None) -> list[str]:
         errors.append("CMakeLists.txt: F16C translation unit must not require AVX2")
 
     for relative, source in texts.items():
-        if "__builtin_clzll" in without_cpp_comments(source):
+        active_source = without_cpp_comments(source)
+        if any("__builtin_clzll" in line
+               for _, line in windows_possible_lines(active_source)):
             errors.append(f"{relative}: non-portable compiler builtin reaches MSVC")
 
-    server = "\n".join(texts[name] for name in REQUIRED_CPP[:3])
+    server = "\n".join(texts.get(name, "") for name in REQUIRED_CPP[:3])
     for marker in ("CreateProcessW", "SetConsoleCtrlHandler"):
         if marker not in server:
             errors.append(f"server_main.cpp: required Win32 process/console support missing ({marker})")
-    console = texts["src/vllm/platform/console_shutdown.cpp"]
-    console_lifetime = (
-        re.search(r"std::atomic\s*<[^>]+>\s+g?_?handler_acquisitions", console),
-        re.search(r"std::atomic\s*<[^>]+>\s+in_flight", console),
-        "SetEvent" in console,
-        "WaitForSingleObject(impl_->win_state_->drained_event" in console,
-    )
-    if not all(console_lifetime):
-        errors.append(
-            "console_shutdown.cpp: stable event/in-flight handler lifetime protocol is required"
-        )
-    handler = re.search(
-        r"(?s)BOOL\s+WINAPI\s+ConsoleControlHandler\s*\([^)]*\)\s*\{(.*?)\n\}",
-        console,
-    )
-    dispatch = re.search(
-        r"(?s)bool\s+DispatchControlEvent\s*\([^)]*\)\s*\{(.*?)\n\}",
-        console,
-    )
-    handler_code = "\n".join(
-        match.group(1) if match else "" for match in (handler, dispatch)
-    )
-    if not handler or not dispatch or re.search(
-        r"RequestStop|std::mutex|condition_variable|stop_\s*\(", handler_code
-    ):
-        errors.append(
-            "console_shutdown.cpp: OS handler may use only stable atomics and Win32 events"
-        )
+    console = texts.get("src/vllm/platform/console_shutdown.cpp", "")
+    _validate_console_protocol(console, errors)
 
-    lmcache = texts["src/vllm/v1/kv_offload/lmcache/remote_client.cpp"]
+    lmcache = texts.get("src/vllm/v1/kv_offload/lmcache/remote_client.cpp", "")
     if not all(marker in lmcache for marker in ("WSAStartup", "WSAGetLastError", "closesocket")):
         errors.append("remote_client.cpp: LMCache Winsock support is missing or silently disabled")
     if not re.search(r"(?s)if\s*\([^\)]*==\s*0\s*\).*?Close\s*\(\s*\).*?throw", lmcache):
         errors.append("remote_client.cpp: peer-close must invalidate the owned socket")
 
-    fs_io = texts["src/vllm/v1/kv_offload/fs_io.cpp"]
+    fs_io = texts.get("src/vllm/v1/kv_offload/fs_io.cpp", "")
     if not all(marker in fs_io for marker in ("CreateFileW", "FlushFileBuffers", "MoveFileExW")):
         errors.append("fs_io.cpp: Windows KV filesystem support is missing or silently disabled")
     if "#define NOMINMAX" not in fs_io:
@@ -445,6 +658,7 @@ def check(root: Path, build_dir: Path | None = None) -> list[str]:
         '"amx"',
     )
     active_script = _active_powershell(build_script)
+    _validate_powershell_source_order(build_script, errors)
     for marker in required_script_markers:
         if marker not in active_script:
             errors.append(f"build-windows-release.ps1: required native CPU gate missing ({marker})")
@@ -467,7 +681,7 @@ def check(root: Path, build_dir: Path | None = None) -> list[str]:
     # Unit fixtures inject a generated source manifest and exercise the
     # cross-platform structural rules. Only the real repository script owns
     # the native AST/fake-tool execution contract.
-    if not (root / ".windows-portability-sources.json").is_file():
+    if source_manifest is None:
         _validate_powershell_ast(root / "scripts/build-windows-release.ps1", errors)
 
     return errors
@@ -477,8 +691,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--build-dir", type=Path)
+    parser.add_argument(
+        "--test-source-manifest", type=Path,
+        help="explicit source fixture for checker tests; normal runs use CMake codemodel",
+    )
     args = parser.parse_args()
-    errors = check(args.root.resolve(), args.build_dir)
+    errors = check(args.root.resolve(), args.build_dir, args.test_source_manifest)
     if errors:
         for error in errors:
             print(f"ERROR: {error}")
