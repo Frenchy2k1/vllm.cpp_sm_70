@@ -367,6 +367,17 @@ MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
 throughput changes; the routed experts still use the grouped MoE kernel, which
 is where they belong.
 
+The **dense** MLP's W4A16 gate/up pair can take that same fused gate_up GEMM
+with `VT_DENSE_MARLIN_GATEUP=1`, which is **off by default**. vLLM's dense
+Qwen3.6 MLP is one `MergedColumnParallelLinear` `gate_up_proj`, so one
+`[T,H]x[2I,H]` GEMM per layer is the mirrored topology; ours still launches two,
+which is 193 Marlin calls per decode step against the oracle's 129. The flag
+exists so that substitution can be measured as a same-binary A/B before its
+default moves — it is roughly 29% of a measured +4.40 ms/step gap on the 27B and
+does not reach parity on its own. It applies only to a W4A16 pair whose two
+shards share a global scale; a true-W4A4 checkpoint already takes the merged
+CUTLASS path instead.
+
 The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
 f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
 bf16 in-kernel — which is exact — and re-round through bf16 on store, so the

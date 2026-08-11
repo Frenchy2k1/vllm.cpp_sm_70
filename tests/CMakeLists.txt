@@ -73,6 +73,11 @@ vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
+# PERF-27B-DENSE-MARLIN-GATEUP (#365): the pre-kernel DECISIONS that route the
+# 27B's dense W4A16 MLP through the fused Marlin gate_up pair. CPU-only by
+# construction — the fused GEMM itself is CUDA + VT_MARLIN_NVFP4.
+vllm_cpp_add_test(test_dense_gateup_fused_marlin
+  vllm/models/test_dense_gateup_fused_marlin.cpp)
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
