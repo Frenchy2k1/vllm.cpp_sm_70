@@ -1155,6 +1155,7 @@ vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 # switch, memcmp over every dtype the switch handled (spec §3, issue #391).
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
+vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)
 
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)

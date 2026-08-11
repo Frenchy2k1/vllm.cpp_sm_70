@@ -30,6 +30,7 @@
 #include <hip/hip_runtime.h>
 
 #include "vt/ops.h"
+#include "vt/rocm/rocm_device_bind.h"
 
 namespace vt::rocm {
 namespace {
@@ -161,8 +162,11 @@ __global__ void RmsNormPlusAddKernel(T* out, const T* x, const T* w, const T* ad
 
 // The registered RmsNormFn (include/vt/ops.h:810). Signature is the shared vt
 // one, unchanged — that is the whole contract a backend has to meet.
-void RmsNormKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
+void RmsNormKernelRocm(Queue& q,
+  // bind
+ Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
+  EnsureQueueDevice(q);
   VT_CHECK(w.dtype == x.dtype, "rocm rmsnorm: weight dtype must match x");
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   switch (x.dtype) {
@@ -178,8 +182,11 @@ void RmsNormKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
 }
 
 // out = rmsnorm(x, w) + addend
-void RmsNormPlusAddRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
+void RmsNormPlusAddRocm(Queue& q,
+  // bind
+ Tensor& out, const Tensor& x, const Tensor& w,
                         const Tensor& addend, const RmsNormArgs& args) {
+  EnsureQueueDevice(q);
   VT_CHECK(w.dtype == x.dtype && out.dtype == x.dtype && addend.dtype == x.dtype,
            "rocm rmsnorm+add: dtype match");
   VT_CHECK(x.rank >= 2 && out.shape[0] == x.shape[0] && out.shape[1] == x.shape[1] &&
@@ -270,9 +277,12 @@ __global__ void DualRmsNormPlusResKernel(T* out, const T* x1, const T* w1, const
   }
 }
 
-void DualRmsNormPlusResRocm(Queue& q, Tensor& out, const Tensor& x1, const Tensor& w1,
+void DualRmsNormPlusResRocm(Queue& q,
+  // bind
+ Tensor& out, const Tensor& x1, const Tensor& w1,
                             const Tensor& x2, const Tensor& w2, const Tensor& w3,
                             const Tensor& residual, const RmsNormArgs& args) {
+  EnsureQueueDevice(q);
   VT_CHECK(out.dtype == x1.dtype && x1.dtype == x2.dtype && x1.dtype == residual.dtype,
            "dual rms dtype");
   const int64_t t = x1.shape[0], h = x1.shape[1];
