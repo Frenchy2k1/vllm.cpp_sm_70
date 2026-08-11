@@ -302,6 +302,20 @@ class RatchetTests(unittest.TestCase):
         self.assertIsNone(verdicts.get("ENG-TRAILER-MERGE-ARTIFACTS"))
         self.assertNotIn("ENG-TRAILER-MERGE-ARTIFACTS", gates.RUNNABLE_BASELINE)
 
+    def test_forge_coauthor_is_credited_for_real_commands(self):
+        # ENG-FORGE-COAUTHOR (#418) joins the runnable population on arrival, so
+        # it earns the credit the same way: its spec's Gates section must name
+        # commands that can actually fail, including the per-commit re-check of
+        # the real f64f2b71 the row exists to unblock.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-FORGE-COAUTHOR"), "runnable")
+        spec = (ROOT / ".agents/specs/forge-coauthor-attribution.md").read_text(
+            encoding="utf-8"
+        )
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
+
     def test_record_conflict_surfaces_is_credited_for_real_commands(self):
         # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on
         # arrival, so the credit has to be earned the same way ENG-DOCS-SITE
