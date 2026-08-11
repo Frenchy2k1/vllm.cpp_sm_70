@@ -482,3 +482,116 @@ produces correct tokens. The KV-cache spec is a documented placeholder: the real
 sliding/full split rides the Gemma-4 per-layer spec seam and lands with W1. And
 per §0 no speed axis is measurable at all while the pin lacks `muse_glimmer`. Filled in when the row reaches `DONE`: what was measured, what was
 rejected and why, and why each default is set the way it is.
+
+## 10. The GGUF k-quant arm (2026-08-11, `row/MODEL-MUSE-GLIMMER-GGUF`)
+
+**Issue:** [#329](https://github.com/mudler/vllm.cpp/issues/329). Implements the
+quantized-arm rule added to `AGENTS.md` in [#318](https://github.com/mudler/vllm.cpp/issues/318).
+
+`LoadMuseGlimmer` used to throw `"does not support GGUF weights"`. That was never
+a decision — the quantized arm simply was not on any list — and
+the `.agents/porting-a-model.md` checklist §2 now makes it a rule: a
+model port covers the quantized arms. A 30B bf16 checkpoint is ~60 GB against a
+~17 GB k-quant, so for this model the k-quant is the arm most users can run at
+all, and it is what a quant-matched llama.cpp comparison would need.
+
+**Assets.** `meta-models/Muse-Glimmer-30B-GGUF` @ `2fb01e4e6f`:
+`muse-glimmer-30B-kquant-17gb.gguf` (16.76 GB, arch `muse-glimmer`, 731 tensors),
+`muse-glimmer-30B-kquant-dynamic.gguf` (19.65 GB, same 731, mixed per-tensor
+types), `mmproj-kquant.gguf` (1.40 GB, arch `clip`, 809), `dflash-kquant.gguf`
+(1.63 GB, arch `dflash`, 58).
+
+### 10.1 Three convert-time transforms, each verified against the bf16 checkpoint
+
+Derived from the GGUF's own tensor list and metadata, then cross-checked
+element-by-element against `meta-models/Muse-Glimmer-30B` — not inferred from
+names.
+
+1. **The sandwich norms are stored PRE-OFFSET.** GGUF
+   `blk.0.attn_norm.weight[0..5]` = `1.09619141, 1.11279297, 1.35742188, ...`;
+   safetensors `layers.0.input_layernorm.weight[0..5]` =
+   `0.09619141, 0.11279297, 0.35742188, ...`. Exactly `w_hf + 1`, and the same
+   for all four sandwich norms. Our forward adds the `+1` itself
+   (`RmsNormArgs{gemma=true}`), so the loader **subtracts one**. `output_norm`
+   (the final norm) takes no offset in the model, is stored raw, and must NOT be
+   un-shifted — the released checkpoint's `norm.weight` runs ±5 with mean 0.017,
+   which is visibly not an offset weight.
+2. **The query pre-scale is folded into `attn_q_norm`.** ggml has no weightless
+   RMSNorm, so the converter materializes both weightless norms as vectors:
+   `blk.N.attn_k_norm.weight` is all `1.0`, and `blk.N.attn_q_norm.weight` is the
+   constant `3.87` — exactly `text_config.qk_scale_factor` in the safetensors
+   `config.json`. The GGUF carries **no metadata key** for it, so
+   `scale_query_by` is recovered from that tensor, checked constant on every one
+   of the 52 layers, with a non-constant q-norm or a non-ones k-norm refused
+   rather than averaged.
+3. **The iRoPE mask rides `attention.sliding_window_pattern`** (52 bools,
+   `true, true, true, false, ...`): `true` = RoPE + sliding, `false` = NoPE +
+   full. Agrees with the safetensors config's `layer_types` and
+   `layer_rope_theta` (NoPE at 3, 7, ... 51).
+
+### 10.2 What is kept quantized, and what is not
+
+| Operand | Residency | Why |
+|---|---|---|
+| `o_proj`, `output_gate_proj`, `down_proj` | **keep-quant** | standalone `[N,K]` MatmulBT operands, taken verbatim |
+| `gate_up_proj` | **keep-quant block concat** when `ffn_gate`/`ffn_up` share a ggml type (they do: both Q4_K) | a k-quant row is a whole number of superblocks, so the merge is a byte concatenation |
+| `qkv_proj` | **dequantized** | the forward wants ONE merged operand and the file's shards differ in type (`attn_v` Q6_K vs `attn_q`/`attn_k` Q4_K); two block encodings cannot share one tensor |
+| `lm_head` | **dequantized** | consumed via `vt::Matmul` in Matmul-B `[H, vocab]`; a block encoding cannot be transposed without requantizing |
+| `embed_tokens` | **dequantized** | a `[vocab, H]` gather table, not a GEMM operand |
+| all norms | **dequantized** | `[H]`/`[Dh]` F32 vectors carrying a `-1` value transform |
+
+### 10.3 Named residual — `post_norm_eps`
+
+The GGUF carries one epsilon (`attention.layer_norm_rms_epsilon` = 1e-5) and no
+post-norm key; the safetensors config ships `post_norm_eps` = 1e-8 separately, so
+the GGUF arm falls back to `rms_norm_eps` for the post-norms. Inside
+`1/sqrt(mean_square + eps)` with a mean square of order 1 that is a ~5e-6
+relative change — two orders of magnitude below bf16's ~4e-3 spacing, so it is
+not representable in the activation dtype. A real difference from the safetensors
+arm, just not an observable one. Fixing it needs a converter key upstream.
+
+### 10.4 REFUSED and OWED — the mmproj perception encoder
+
+`mmproj-kquant.gguf` maps cleanly for every tower tensor
+(`v.blk.N.{ln1,ln2,attn_q,attn_k,attn_v,attn_out,ffn_up,ffn_down}`,
+`v.{pre_ln,post_ln,position_embd}`, `mm.{0,1,2}` → adapter fc1/fc2 +
+`vision_projection`) **except one**: `v.patch_embd.weight` is ggml ne
+`[14, 14, 3, 1536]` = torch `[1536, 588]`, while `conv1_linear` needs
+`patch_temporal * 3 * patch_size^2` = `2*3*14*14` = **1176** input features — and
+the safetensors ships exactly `[1536, 1176]`. The `patch_temporal` axis is
+absent, i.e. half the patch embedding does not exist in the file to be loaded.
+
+The arm therefore **refuses by name** (`MuseGlimmerRefuseMmproj`) rather than
+inventing a temporal half, and image/video keep using the bf16 safetensors. This
+is **OWED**, not closed: the fix is upstream in the llama.cpp converter, and the
+refusal should be retired the moment a converted mmproj carries the full weight.
+
+### 10.5 The DFlash drafter — reachable, not exercised
+
+`dflash-kquant.gguf` is arch `dflash` and every one of its 58 tensors is covered
+by the ALREADY-LANDED `qwen3_dflash_gguf` name map (`fc.weight`,
+`enc.output_norm.weight`, `output_norm.weight`, and 11 per block × 5 blocks). It
+ships neither `token_embd` nor `output`, which is correct: a DFlash draft runs
+the TARGET's embedding table and head, and the text GGUF ships both, so
+`LoadGgufSharedEmbedAndHeadBf16` is the right source. **No new seam is needed.**
+That is a structural reachability claim only — nothing here says a Muse Glimmer
+draft proposes useful tokens; an acceptance-rate A/B is OWED and needs hardware
+this row did not have.
+
+### 10.6 What this arm does and does not establish
+
+**Established.** The released 16.76 GB k-quant loads: 731/731 tensors accounted
+with zero unaccounted in both directions, all 52 layers materialized at the right
+shapes and orientations, the sandwich norms un-shifted (layer-0
+`input_layernorm` min = −1.0, matching the safetensors' own min), and the query
+pre-scale recovered as 3.87 across every layer. The 19.65 GB mixed-type
+`dynamic` file accounts identically. Gate
+`tests/vllm/models/test_muse_glimmer_gguf.cpp`: 12/12 cases, 428 assertions
+with `VLLM_MUSE_GGUF`, 636 on the full-load case, with **11 mutations each
+proven RED** and the tree restored byte-for-byte.
+
+**NOT established.** No forward was run on GGUF weights, so there is no e2e, no
+token-exactness against anything, and no claim that the k-quant and the bf16 arm
+agree numerically — that comparison is OWED. And per §0 there is still **no speed
+axis of any kind**: the pinned oracle cannot load `muse_glimmer` in either weight
+format, so there is no denominator, and none is claimed.

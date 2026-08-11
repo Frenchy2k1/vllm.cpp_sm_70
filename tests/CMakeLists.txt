@@ -244,6 +244,19 @@ vllm_cpp_add_test(test_muse_glimmer_real_weights
 target_compile_definitions(test_muse_glimmer_real_weights PRIVATE
   VLLM_MUSE_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models")
 
+# Muse Glimmer GGUF K-QUANT gate (.agents/porting-a-model.md §2). The quantized
+# arm the port was missing: config-from-GGUF, the canonical<->GGUF name map, the
+# three convert-time transforms this loader inverts (the +1 sandwich-norm
+# pre-offset, the query pre-scale folded into attn_q_norm, the iRoPE mask on
+# sliding_window_pattern), and STRUCTURAL ACCOUNTING in both directions against
+# COMMITTED header-only manifests of the real 731/809/58-tensor files, so CI
+# needs no asset. A live case runs when VLLM_MUSE_GGUF names the 16.76 GB
+# k-quant. No forward, no e2e, and NO SPEED AXIS: the pinned oracle cannot load
+# `muse_glimmer` in any weight format (specs/muse-glimmer.md §0).
+vllm_cpp_add_test(test_muse_glimmer_gguf vllm/models/test_muse_glimmer_gguf.cpp)
+target_include_directories(test_muse_glimmer_gguf PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
 # checkpoint name-map faithfulness (block_sparse_moe, verified vs the HF index) +
