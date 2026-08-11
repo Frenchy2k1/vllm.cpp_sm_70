@@ -40,6 +40,9 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#305](https://github.com/mudler/vllm.cpp/issues/305) | `KERNEL-SSM-MAMBA` | GDN causal-conv: the `conv_state` initial-state read races the final-state write across blocks (`VT_CONV_REG` + exact chunks, both default ON) | bug |
 | [#206](https://github.com/mudler/vllm.cpp/issues/206) | `KERNEL-SSM-MAMBA` | RTX 5070 Ti: close Qwen3.5-4B TTFT, TPOT and VRAM gaps vs vLLM — owns the sm_120 post-conv token tile and the K=4 causal-conv arm (PR #155) | feature |
 | [#223](https://github.com/mudler/vllm.cpp/issues/223) | `SAMPLE-PROMPT-LOGPROBS` | `prompt_logprobs` is a silent no-op: the runner never computes logits at prompt positions | bug |
+| [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
+| [#321](https://github.com/mudler/vllm.cpp/issues/321) | `SERVE-METRICS` | AsyncLLM output thread outlives metrics logger and uses freed PromRegistry | bug |
+| [#301](https://github.com/mudler/vllm.cpp/issues/301) | `ENG-LOAD-DIRECT-UPLOAD` | `main` is RED on ASan/UBSan: five misaligned BF16 reads from borrowed mmap weights | bug |
 | [#298](https://github.com/mudler/vllm.cpp/issues/298) | `PERF-27B-LMHEAD-DSR` | `main` is RED on the `device-leakage` DSR ratchet: `PrepareLmHeadResident` added a 33rd `vt_ifdef` to the shared layer | bug |
 | [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |
 | [#310](https://github.com/mudler/vllm.cpp/issues/310) | `BACKEND-VULKAN` | docs/FEATURES.md understates Vulkan: says decode 4.24 vs 4.35 where the binding figure is 4.36 vs 4.35 | bug |

@@ -685,6 +685,9 @@ int VllmServerMain(int argc, char** argv) {
       engine_params.speculative_config =
           vllm::ParseSpeculativeConfigJson(args.speculative_config);
     }
+    // Declared before LoadedEngine so reverse destruction order shuts down and
+    // joins AsyncLLM before releasing its non-owning metrics logger pointer.
+    std::unique_ptr<vllm::v1::metrics::PrometheusStatLogger> prom_logger;
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                       engine_params);
@@ -928,7 +931,6 @@ int VllmServerMain(int argc, char** argv) {
               << "\n";
 
     // Prometheus /metrics (Python vLLM always-on family names).
-    std::unique_ptr<vllm::v1::metrics::PrometheusStatLogger> prom_logger;
     if (args.enable_metrics) {
       prom_logger = std::make_unique<vllm::v1::metrics::PrometheusStatLogger>(
           served_model_name, loaded->max_model_len(), /*engine_index=*/0);
