@@ -377,13 +377,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
-          path: assets
+          path: release-assets
           merge-multiple: true
       - name: Produce the byte-bound release handoff
         run: |
           python3 scripts/release_pipeline.py handoff \
             --plan plan/release-plan.json \
-            --assets-dir assets \
+            --assets-dir release-assets \
             --output release-handoff.json
       - name: Upload immutable unverified handoff
         id: upload
@@ -392,7 +392,7 @@ jobs:
           name: release-unverified-${{ github.sha }}
           path: |
             release-handoff.json
-            assets
+            release-assets
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -421,17 +421,17 @@ jobs:
       - name: Verify handoff against plan and workflow SHA
         run: |
           mkdir -p verified
-          cp -a unverified/assets verified/assets
+          cp -a unverified/release-assets verified/release-assets
           python3 scripts/release_pipeline.py verify \
             --plan plan/release-plan.json \
             --handoff unverified/release-handoff.json \
-            --assets-dir verified/assets \
+            --assets-dir verified/release-assets \
             --output verified/verified-handoff.json \
             --sha '${{ github.sha }}'
       - name: Generate byte-derived release indexes
         run: |
           python3 scripts/release_index.py \
-            --assets-dir verified/assets \
+            --assets-dir verified/release-assets \
             --handoff verified/verified-handoff.json \
             --json-output verified/release-index.json \
             --markdown-output verified/RELEASE_INDEX.md \
@@ -464,7 +464,7 @@ jobs:
       - name: Attest verified bytes
         uses: actions/attest@v4
         with:
-          subject-path: verified/assets/**
+          subject-path: verified/release-assets/**
   publish:
     needs: [plan, verify, attest]
     if: needs.plan.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
@@ -488,7 +488,7 @@ jobs:
           test "$tag" = "${GITHUB_REF#refs/tags/}"
           python3 scripts/release_pipeline.py publish \
             --handoff verified/verified-handoff.json \
-            --assets-dir verified/assets \
+            --assets-dir verified/release-assets \
             --index-json verified/release-index.json \
             --index-markdown verified/RELEASE_INDEX.md \
             --tag "$tag"
