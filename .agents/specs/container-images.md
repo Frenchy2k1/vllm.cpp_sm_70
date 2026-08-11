@@ -305,12 +305,14 @@ gate passes, and no publish step uses a wildcard.
 
 ## Risks and open questions
 
-- **Tegra versus SBSA.** A hosted `ubuntu-24.04-arm` runner produces an SBSA
-  CUDA build. GB10 is SBSA and is expected to run it; **Thor (`sm_110`) and
-  Orin (`sm_87`) are Tegra/L4T with a different CUDA runtime**. The arm64 cuda
-  image is claimed to run on Tegra only once it has run on Thor. If it cannot,
-  the honest outcome is a recorded boundary or a separate Tegra lane, never a
-  quiet widening of the arm64 tag.
+- **Tegra versus SBSA: MEASURED 2026-08-11, and the earlier prediction here
+  was WRONG.** This entry used to say the arm64 image made no Tegra claim,
+  on the reasoning that Thor and Orin run Tegra/L4T with a different CUDA
+  runtime. The SBSA image RUNS on Jetson AGX Orin (`sm_87`, L4T R36.4.3):
+  `/health` 200, `/version` 200, in-container healthcheck, clean SIGTERM.
+  There is no CUDA-version wall. What differs is the INVOCATION, not the
+  image -- see the Tegra section below. Thor (`sm_110`) is still unprobed
+  and inherits nothing from this.
 - **CUDA runtime redistribution.** Copying `libcudart.so.12` and
   `libcublasLt.so.12` out of the toolkit is permitted under the CUDA EULA's
   redistributable list, but the exact file list, version, and notice text are a
@@ -485,6 +487,64 @@ a different CUDA runtime, remain unprobed, and are not covered by this result.
 Lock discipline, since the box is shared: the build ran outside `gpu.lock`
 because it needs no GPU, and only the container run took the lock, blocking --
 it queued 16:58:38 -> 17:50:43 behind other users rather than jumping them.
+
+### W6 Tegra result: the SBSA image runs on Orin, but not the same way
+
+Measured 2026-08-11 on a Jetson AGX Orin Developer Kit (`sm_87`, L4T R36.4.3,
+Docker 27.5.1, Kairos immutable OS), running the SBSA image built on GB10:
+
+```
+container image OK  lane=cuda
+  config, layout: verified
+  boot: /health 200, /version 200, declared healthcheck passed, clean SIGTERM,
+        on --runtime nvidia --gpus all
+```
+
+So one image serves both arm64 families and no separate Tegra lane is needed.
+`libcuda.so.1` resolves to `/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1`
+there, against `/usr/lib/aarch64-linux-gnu/libcuda.so.1` on SBSA; the nvidia
+runtime handles that itself, and the image needs no `LD_LIBRARY_PATH` change
+(tried, and it was the wrong hypothesis -- the driver simply was not mounted).
+
+**The invocation differs, and all three cases fail differently:**
+
+| flags | Tegra behaviour |
+|---|---|
+| `--gpus all` alone | REFUSED: "invoking the NVIDIA Container Runtime Hook directly ... is not supported" |
+| `--runtime nvidia` alone | starts, no driver mounted, dies on `libcuda.so.1: cannot open shared object file` |
+| `--runtime nvidia --gpus all` | driver injected, server runs |
+
+The middle case is the trap: the container comes up and dies on a missing
+library, which reads as a broken image rather than a wrong flag.
+
+**Two operator requirements this exposed**, both invisible on GB10 because that
+box happened to match:
+
+- `/models` must be READABLE BY UID 1000. The image runs as uid 1000; on GB10
+  the model was owned by uid 1000 so mode 0600 worked, while on Orin (files
+  owned by 65535) the server initialised CUDA and then died on
+  `safetensors: cannot open file`, which looks like a corrupt checkpoint.
+- `docker stop --timeout` is newer-Docker only. The validator used it and broke
+  on Docker 27.5.1; `-t` is accepted by both.
+
+**It generates, and the GPU does the work.** `/health` alone would only prove
+the engine came up, so the Orin run was taken further with a real model:
+Qwen3-0.6B (HF `Qwen/Qwen3-0.6B`, revision `c1899de289a04d12100db370d81485cdf75e47ca`,
+1.5 GB bf16) loaded in the container and served `/v1/completions`:
+
+```
+prompt      "The capital of France is"
+completion  " Paris. The capital of France is also the capital of the French Republic..."
+usage       prompt_tokens 5, completion_tokens 24
+```
+
+`tegrastats` during a 120-token generation reads **GR3D_FREQ 95-97%**, against
+14-15% at idle -- so decode runs on the Orin GPU rather than falling back to CPU
+paths. That is the distinction `/health` cannot make, and the GB10 result did
+not make either.
+
+**Scope.** Orin (`sm_87`) only. Thor (`sm_110`) has never been probed and
+inherits nothing from this.
 
 ### Pull-request scope, and why it is not a hole
 
