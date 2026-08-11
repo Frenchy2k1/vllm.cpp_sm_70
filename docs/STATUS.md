@@ -467,9 +467,13 @@ parallelism mode is enumerated and ranked in
 ~40% of the TP surface landed/reusable; **TP-W1 LANDED** (group table); W2..W4+W7
 (the engine-level TP2-on-CPU token-exact gate) are CPU-completable
 NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
-(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is **SPIKED,
-not implemented** ([spec](../.agents/specs/dspark-spec-decode.md)): no code,
-no measurement.
+(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is
+**IMPLEMENTED and MEASURED cross-engine**
+([spec](../.agents/specs/dspark-spec-decode.md) §6h): against the pinned,
+graphed oracle the 35B-A3B MoE lane runs at 0.92-0.98x with acceptance matching
+upstream (20.8% vs 20.4%), while the 27B dense lane runs at 0.35-0.94x because
+upstream accepts 49.3% of its drafts where we accept 12.2% (#430). The Gemma4
+`1 + N` layout is coded and unit-tested but has never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the

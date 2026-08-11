@@ -478,5 +478,39 @@ class PerClaimFileSource(unittest.TestCase):
             probe.unlink()
 
 
+class TenstorrentResidualGoldenRowIsCounted(unittest.TestCase):
+    """The BACKEND ratchet bump is backed by a real row (#393).
+
+    The count is re-pinned by hand, so a bump with no row behind it looks
+    exactly like a bump for a new row. This ties this bump to this row.
+    """
+
+    ROW = "BACKEND-TENSTORRENT-RESIDUAL-GOLDEN"
+
+    def test_the_row_exists_in_the_backend_matrix(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_backend_pin_is_load_bearing(self) -> None:
+        """MUTATION: moving the pin by one must make the count disagree."""
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+
+        path, count = agent_record.MATRICES["BACKEND"]
+        errors: list[str] = []
+        with mock.patch.dict(
+            agent_record.MATRICES, {"BACKEND": (path, count - 1)}
+        ):
+            agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("backend rows" in e.lower() for e in errors),
+            f"the BACKEND pin must bind; got {errors}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

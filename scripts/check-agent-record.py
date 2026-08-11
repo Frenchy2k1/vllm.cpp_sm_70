@@ -203,7 +203,11 @@ MATRICES = {
     # 80 since 2026-08-09: +`BACKEND-TENSTORRENT`, an extension platform
     # proposal (Tenstorrent Blackhole, ttnn C++ adapter) in the same class as
     # Metal/Vulkan. INVENTORIED; spec-only, not yet reviewed or accepted.
-    "BACKEND": (AGENTS / "backend-matrix.md", 80),
+    # 81 since 2026-08-11: +`BACKEND-TENSTORRENT-RESIDUAL-GOLDEN`, the child
+    # row owing residual-RMS numerics evidence at the device boundary (rows>=32
+    # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
+    # RED-first probe lands.
+    "BACKEND": (AGENTS / "backend-matrix.md", 81),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

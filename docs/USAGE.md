@@ -1323,6 +1323,30 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
+## MiniMax-H3 browser console (`vllm-video-studio`)
+
+A standalone browser console for MiniMax-H3, deliberately **separate** from the
+OpenAI-compatible API server: `examples/server` is the API surface and a UI does
+not belong in it. The studio owns its own endpoints and drives the public C ABI
+(`vllm_video_*`) like any other FFI consumer, so it is also a worked example of
+that ABI.
+
+Built with the server (`-DVLLM_CPP_SERVER=ON`), because it shares the same
+vendored HTTP transport.
+
+```sh
+vllm-video-studio --models-dir /path/to/h3 --port 8080
+```
+
+Then open `http://localhost:8080`. It discovers the five H3 files under
+`--models-dir`, or each can be pointed at explicitly with `--dit`, `--encoder`,
+`--video-vae`, `--video-vae-config`, `--audio-vae`, `--audio-vae-config` and
+`--tokenizer`. Other flags: `--host`, `--device`, `--workdir`, `--ffmpeg`,
+`--partition`, `--keep-quant`, `--prompt-embeds`, and `--ui` to serve a custom
+web root.
+
+The weights, and why each one is needed, are in the MiniMax-H3 section below.
+
 ## MiniMax-H3: video + audio generation
 
 

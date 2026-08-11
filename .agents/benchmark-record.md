@@ -19353,3 +19353,55 @@ Output identity, pristine binary vs patched binary vs patched with
 | M>1, 8 prompts x 96 input / 24 output, concurrency 1, 4 and 8 | **token ids byte-identical**, md5 `bd489532b183541b`, and identical ACROSS the three concurrencies |
 
 The full-suite regression sweep is deferred to the orchestrator by instruction.
+
+## SPEC-DSPARK cross-engine A/B vs the pinned graphed oracle (2026-08-11)
+
+Binding replacement for every earlier DSpark oracle arm in this row, all of
+which ran `enforce_eager=True` (forbidden as a denominator). Oracle is the
+PINNED build `~/venvs/vllm-oracle-next` = `0.23.1rc1.dev1511+g555967922`,
+FlashInfer 0.6.15.post1, Torch 2.13.0, transformers 5.14.1, in its production
+graphed configuration.
+
+The first attempt measured the WRONG ORACLE: `~/venvs/vllm-oracle` is a symlink
+to the preserved `v0.25.0-stage` rollback (issue #375's failure mode). The
+harness now asserts commit + FlashInfer and aborts on mismatch. The rollback
+misleads in both directions, its DSpark being far slower than the pin's (35B
+89.8 vs 146.4 tok/s), so those numbers are recorded as non-binding context.
+
+Method: same target + draft + k, `max_num_seqs=2`, greedy, `max_tokens=128`,
+one `flock $HOME/gpu.lock`, `local-ai-worker` parked, cold first run discarded,
+warm repeats. Throughput is `completion_tokens / whole-request wall seconds` on
+both sides (`examples/cli/main.cpp:253-270` vs the oracle's `generate()` wall),
+verified to be the same definition before any ratio was taken.
+
+| lane / prompt | ours | pinned vLLM | ours/vLLM | our speedup | its speedup |
+|---|---|---|---|---|---|
+| 35B spec-off, "capital" (128 tok both) | 71.47 | 73.91 | 0.967x | n/a | n/a |
+| 35B DSpark k=8, "capital" (128 tok both) | 74.10 | 75.92 | 0.976x | 1.037x | 1.027x |
+| 35B DSpark k=8, "fibonacci" (89 tok both) | 134.85 | 146.41 | 0.921x | 1.914x | 2.583x |
+| 27B spec-off, "fibonacci" (126 tok both) | 9.80 | 9.51 | 1.031x | n/a | n/a |
+| 27B DSpark k=15, "fibonacci" | 31.83 | 34.06 | 0.935x | 3.248x | 3.583x |
+| 27B DSpark k=15, "capital" | 17.41 | 49.71 | 0.350x | 1.757x | 5.233x |
+
+Acceptance, upstream's own `vllm:spec_decode_*` counters against ours:
+
+| lane | ours | pinned vLLM | accepted per draft (vLLM) |
+|---|---|---|---|
+| 35B A3B MoE, k=8 | 20.8% | 20.4% (212/1040) | 1.63 of 8 |
+| 27B dense, k=15 | 12.2% | 49.3% (281/570) | 7.39 of 15 |
+
+Verdict: the MoE lane is at near parity with acceptance matching upstream; the
+dense lane is a draft-quality gap, tracked as issue #430. The earlier "dense
+1.77x" reading was a self-speedup, not a cross-engine result, and against the
+real reference the dense lane is the weaker of the two, not the stronger.
+
+Caveat: greedy outputs diverge between arms and between engines on several
+cells, so completion counts differ (27B "fibonacci": ours 128, upstream 52;
+27B "capital": ours 84, upstream 128). Per-token throughput still compares but
+the content differs. The cells where every arm returned identical token counts
+are 35B "capital" (128 everywhere) and 35B DSpark "fibonacci" (89 both), giving
+the 0.92-0.98x readings. On the pinned oracle the 35B spec-on and spec-off
+streams are byte-identical, so upstream's DSpark is lossless on that lane.
+
+Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
+`xengine_ours.log`, `xengine_pinned.log`.

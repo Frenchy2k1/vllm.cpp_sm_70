@@ -596,11 +596,143 @@ it, and the counter settled it in one run. A launch-count difference between two
 models is a claim about a gate — read the gate.
 
 **Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
-PRODUCTION GRAPHED config through the project's harness, not the eager arm run
-here; (2) token-exactness against that oracle on the SACRED corpus rather than
-ad-hoc prompts; (3) the acceptance-rate band against the upstream reference;
-(4) the 27B lane and the Gemma4 `1 + N` layout; (5) capturing the SPECULATIVE VERIFY shape, which § 6d measures as the real
-gap (the draft-step capture that looked like the lever is worth ~1%).
+PRODUCTION GRAPHED config — **DONE in §6h**, against the pinned oracle;
+(2) token-exactness against that oracle on the SACRED corpus rather than ad-hoc
+prompts; (3) the acceptance-rate band against the upstream reference — **DONE
+in §6h**, and it is the finding: 35B matches (20.8% vs 20.4%), the 27B dense
+lane does not (12.2% vs 49.3%); (4) the 27B lane — **measured in §6h** — and
+the Gemma4 `1 + N` layout, still unrun on real weights; (5) capturing the
+SPECULATIVE VERIFY shape, which § 6d measures as the real gap (the draft-step
+capture that looked like the lever is worth ~1%).
+
+## 6h. CROSS-ENGINE A/B vs the PINNED, GRAPHED oracle (2026-08-11)
+
+Every earlier oracle arm in this spec ran `enforce_eager=True`, which the house
+rule forbids as a denominator. This is the binding replacement: vLLM in its
+production graphed configuration, same target + draft + k + `max_num_seqs=2`,
+same greedy sampling, one `flock`, both prompts timed per-prompt.
+
+**The first attempt measured the WRONG ORACLE.** `~/venvs/vllm-oracle` is a
+symlink to the preserved `v0.25.0-stage` ROLLBACK, not to the pin, so the run
+recorded `vllm 0.25.0` and proceeded happily — issue #375's failure mode
+exactly, and a deterministic wrong reference is indistinguishable from a right
+one. The pinned build is `~/venvs/vllm-oracle-next`
+(`0.23.1rc1.dev1511+g555967922`, FlashInfer 0.6.15.post1, Torch 2.13.0,
+transformers 5.14.1 — matching `upstream-sync.md` on every axis). The harness
+now ASSERTS commit + FlashInfer and aborts on mismatch. The 0.25.0 numbers are
+kept only as context; they are NOT quotable, and they mislead in both
+directions (the rollback's DSpark is far slower: 35B 89.8 vs the pin's 146.4).
+
+Warm tok/s (`completion_tokens / whole-request wall`, identical on both sides:
+`examples/cli/main.cpp:253-270` vs the oracle's `generate()` wall), median of
+warm repeats, cold first run discarded:
+
+| lane / prompt | ours | pinned vLLM | ours/vLLM | our speedup | its speedup |
+|---|---|---|---|---|---|
+| 35B spec-off, "capital" (128 tok both) | 71.47 | 73.91 | 0.967x | — | — |
+| 35B DSpark k=8, "capital" (128 tok both) | 74.10 | 75.92 | 0.976x | 1.037x | 1.027x |
+| 35B DSpark k=8, "fibonacci" (89 tok both) | 134.85 | 146.41 | 0.921x | 1.914x | 2.583x |
+| 27B spec-off, "fibonacci" (126 tok both) | 9.80 | 9.51 | 1.031x | — | — |
+| 27B DSpark k=15, "fibonacci" | 31.83 | 34.06 | 0.935x | 3.248x | 3.583x |
+| **27B DSpark k=15, "capital"** | 17.41 | **49.71** | **0.350x** | 1.757x | **5.233x** |
+
+Acceptance, from upstream's own `vllm:spec_decode_*` counters against ours:
+
+| lane | ours | pinned vLLM | accepted per draft (vLLM) |
+|---|---|---|---|
+| 35B A3B MoE, k=8 | 20.8% | 20.4% (212/1040) | 1.63 of 8 |
+| 27B dense, k=15 | 12.2% | **49.3%** (281/570) | **7.39 of 15** |
+
+**Result.** Two different verdicts, and the previous framing had them backwards.
+
+- **35B MoE lane: near parity.** 0.92–0.98x cross-engine, and our acceptance
+  MATCHES upstream's (20.8% vs 20.4%). Nothing here points at draft quality;
+  the residual is per-step cost, the same story §6f measured.
+- **27B dense lane: the real gap, and it is DRAFT QUALITY.** Upstream accepts
+  49.3% where we accept 12.2% — 7.39 accepted tokens per draft against our
+  ~1.8 — so upstream extracts 5.23x from the same checkpoint where we get
+  1.76x. §6f called this lane's 1.77x our strongest result; measured against
+  the actual reference it is our weakest. That 1.77x was a self-speedup, never
+  a cross-engine one.
+
+**Ruled out for the dense acceptance gap** (checked, not assumed): mis-resolved
+aux taps. The 27B draft declares five taps at absolute target indices
+`[1, 16, 31, 46, 61]` and the 27B target is a hybrid (linear-attention +
+full-attention layers), so a tap resolved against a filtered layer list would
+land on the wrong layer and degrade drafts silently. Both `MaybeCaptureAuxTap`
+call sites sit inside the full `for (l = 0; l < num_hidden_layers; ++l)` loop
+and index by absolute `l`, covering both layer kinds
+(`qwen3_5.cpp:6707`, `:7546`). Also ruled out: the Markov step loop, which
+matches upstream's shape (`prev` seeded from the anchor, re-biased per step,
+argmax over `base + bias`, then `d2t` — `speculator.py:120-121,148`).
+
+**Next traceable hypothesis** (no ceiling is being declared): the 27B draft uses
+the flat/native config layout and carries NO `draft_vocab_size`, where the 35B
+carries 32000 and reaches upstream-matching acceptance through the Speculators
+translation path. The d2t/reduced-vocab handling on the flat path is therefore
+the next thing to instrument — compare our proposed draft token ids against
+upstream's for an identical prefix, rather than comparing acceptance totals.
+
+**Caveat on the table.** Greedy outputs diverge between arms and between
+engines on several cells, so completion counts differ (27B "fibonacci": ours
+128, upstream 52; 27B "capital": ours 84, upstream 128). Per-token throughput
+still compares, but the content differs. The cleanest cells — where all arms
+returned identical token counts — are 35B "capital" (128 everywhere) and 35B
+DSpark "fibonacci" (89 both), and those are the 0.92–0.98x readings. The 27B
+"capital" 0.350x is a 2.9x gap that content differences cannot account for.
+
+Note for the token gate: on the pinned oracle the 35B spec-on and spec-off
+streams are byte-identical (`[11751, 11, 264, 3177, 34756, ...]` both), i.e.
+upstream's DSpark is lossless on that lane, while its 27B arms diverge at
+position 3. Ours returned different completion counts between arms on 35B
+"fibonacci" (87 off vs 89 on) where upstream returned 89 for both.
+
+Tracked as issue #430. Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json` (pinned),
+`xengine_*.json` (0.25.0, non-binding), `xengine.log`, `xengine_ours.log`.
+
+## 6i. TEXT PARITY vs the pinned oracle: the BASELINE drifts too (2026-08-11)
+
+§6h flagged that our 35B "fibonacci" arms returned 87 tokens spec-off and 89
+spec-on where upstream returned 89 for both, and asked whether our DSpark is
+lossy. Measured, on the same eight arms, greedy, against the pinned oracle's
+own text:
+
+| case | verdict | first divergence |
+|---|---|---|
+| 35B spec-OFF "capital" | DIFFER | char 218 ("the 10th century" vs "the Middle Ages") |
+| 35B spec-OFF "fibonacci" | DIFFER | char 91 |
+| 35B DSpark "capital" | DIFFER | char 76 |
+| 35B DSpark "fibonacci" | DIFFER | char 55 (`return (` vs `return(`) |
+| 27B spec-OFF "capital" | DIFFER | char 244 |
+| 27B spec-OFF "fibonacci" | **EXACT** | 382 chars |
+| 27B DSpark "capital" | DIFFER | char 7 |
+| 27B DSpark "fibonacci" | DIFFER | char 5 |
+
+**The answer is no, and the question was malformed.** Our SPEC-OFF baseline
+already diverges from the pinned oracle's spec-off on three of four prompts, so
+an ad-hoc prompt comparison cannot isolate a DSpark defect: there is nothing to
+subtract it from. The divergences are the ratified near-tie regime (identical
+for 218 and 244 characters, then a single word choice diverging and the
+trajectories separating), which is exactly what the distributional gate exists
+for. Nothing here is attributable to the speculator.
+
+Two consequences:
+
+1. The completion-count asymmetry noted in §6h is withdrawn as evidence about
+   DSpark. It is baseline drift.
+2. The owed token gate is unchanged and cannot be replaced by this check: it
+   must be the SACRED corpus under the ratified near-tie/distributional
+   protocol (ours in the oracle's K-run set), not ad-hoc prompts. What §6i adds
+   is the reason a cheap substitute will not do.
+
+Note the two 27B DSpark arms diverge very early (chars 7 and 5) while the 27B
+spec-off arm on the same prompt matched for 382 characters. That is consistent
+with the #430 acceptance gap rather than independent of it, but it is NOT
+evidence on its own, because the other 27B prompt's spec-off arm diverged at
+char 244. Instrumenting proposed draft ids against upstream's (the #430 next
+step) settles it; this does not.
+
+Evidence: `dgx:~/work/dspark-w6/parity/*.txt` vs `pinned_*.json`.
 
 ## 7. Evidence, authority, stop conditions
 
