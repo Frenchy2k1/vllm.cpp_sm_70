@@ -18034,3 +18034,49 @@ clean: `test_qwen36_paged_engine` **315/315** and `test_qwen27_paged_engine`
 **235/235**, `Status: SUCCESS`, assertion counts unchanged.
 
 NOW row corrected to match STATUS. Evidence: `dgx:~/gemv2.log`, `dgx:~/g7.log`.
+
+## #323 FIXED: the decode graph replayed against stale HOST token ids (2026-08-11, `row/FIX-323-GRAPH-DECLINE`, GB10)
+
+`DenseDecodeGraphForward` called `graph->Step(input.token_ids, ...)` — the HOST
+ids — and never read `input.device_token_ids`. On the depth-2 async path the
+combine has patched the DEVICE ids and `token_ids` is deliberately stale for
+decode rows, so the replay generated from stale ids and every concurrent request
+past slot 0 degenerated (the #31 signature).
+
+Three discriminators isolated it, same binary and battery:
+
+| async depth | decode graph | result |
+|---|---|---|
+| depth-1 | ON (default) | PASS 78/78 |
+| depth-2 | OFF | PASS 82/82 |
+| depth-2 | ON (default) | **FAIL**, slots 1-3 degenerate |
+
+Both conditions required, which is why the registry-level `DeviceTokenIdsScope`
+(`60e71a0e`) did not close it: this path returns BEFORE the eager forward runs.
+
+**Fix (MITIGATION):** decline the graph while the mirror is live, falling back to
+the eager path that honours the scope. Correctness first — a correct stream
+outranks the graph's throughput. The END STATE is for `Step()` to read the ids at
+REPLAY time from a stable device buffer, which restores graphed decode for async
+serving; that is owed and NOT done here.
+
+**Gates, default configuration (async ON, graph ON):**
+
+```
+test_qwen3_dense_async_serving  7/7 cases, 246/246   (was 2 FAILED, 6 assertions)
+test_qwen3_paged_engine         184/184  SACRED
+test_qwen36_paged_engine        315/315  SACRED
+```
+
+The async suite now carries Llama, Mistral and InternLM2 as permanent regression
+gates. Llama passed even before the fix, but only because it did not engage the
+graph in that battery — the defect is a property of the shared path, so all three
+stay.
+
+**Blast radius, corrected upward twice during this investigation:** first filed
+as a Mistral/InternLM2 bug, then found to be every classic-dense model with the
+graph on (the default). Any concurrent serving on that path could return garbage
+for every request after the first.
+
+Evidence: `dgx:~/fx_run.log` (7/7), `dgx:~/fx2.log` (SACRED), `dgx:~/diag.log`,
+`dgx:~/diag2.log`, `dgx:~/g9.log`.
