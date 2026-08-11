@@ -194,9 +194,28 @@ std::vector<int64_t> Sampler::greedy_argmax_host(vt::Queue& q,
 }
 
 std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
-                                     const SamplingMetadata& sm) const {
+                                     const SamplingMetadata& sm,
+                                     std::vector<float>* processed_out) const {
   const int64_t n = logits.shape[0];
   const int64_t vocab = logits.shape[1];
+  // processed_* snapshot (sampler.py:262-271,286-302). Non-null only when the
+  // caller is in one of those two modes AND a request asked for logprobs.
+  const bool want_processed = processed_out != nullptr;
+  auto snapshot_processed = [&]() {
+    processed_out->resize(static_cast<size_t>(n) * static_cast<size_t>(vocab));
+    if (logprobs_mode_ == LogprobsMode::kProcessedLogits) {
+      // processed_logits: the mutated logits tensor itself (:267-268).
+      vt::Backend& b = vt::GetBackend(logits.device.type);
+      b.Copy(q, processed_out->data(), logits.data,
+             processed_out->size() * sizeof(float));
+      b.Synchronize(q);
+    } else {
+      // processed_logprobs: compute_logprobs of it (:269-270).
+      DeviceBuffer plp(logits.device, q, vt::DType::kF32, {n, vocab});
+      vt::ComputeLogprobs(q, plp.tensor(), logits);
+      plp.download(processed_out->data());
+    }
+  };
 
   VT_CHECK(!(sm.all_greedy && sm.all_random),
            "sampler: all_greedy and all_random are mutually exclusive");
@@ -206,7 +225,12 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
   const bool have_greedy = !sm.all_random;
   if (have_greedy) {
     greedy_sampled = greedy_argmax_host(q, logits, n);
-    if (sm.all_greedy) return greedy_sampled;
+    if (sm.all_greedy) {
+      // Upstream returns HERE, before temperature (:262-271), so an all-greedy
+      // batch's "processed" tensor is the post-logits-processor one.
+      if (want_processed) snapshot_processed();
+      return greedy_sampled;
+    }
   }
 
   VT_CHECK(sm.temperature.has_value(),
@@ -226,6 +250,11 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
 
   // 7d. top_k and/or top_p (materialize the per-req optionals; nullptr => skip).
   ApplyTopKTopPFromMeta(q, logits, sm.top_k, sm.top_p);
+
+  // Upstream takes the processed snapshot inside topk_topp_sampler, i.e. right
+  // here: after temperature, min_p and top-k/top-p, before the sampling draw
+  // (:286-290). A token masked away by top-k/top-p therefore reads -inf.
+  if (want_processed) snapshot_processed();
 
   // 7e. probs = softmax(logits); random_sample (exponential-noise gumbel-max).
   DeviceBuffer probs(logits.device, q, vt::DType::kF32, {n, vocab});
@@ -270,20 +299,33 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
              "sampler: sampled_ids_out must have num_reqs elements");
   }
 
-  // 1. Raw-logprobs snapshot BEFORE any mutation (raw_logprobs mode; raw_logits
-  //    and the processed_* modes are deferred stubs — see the header).
+  // 1. RAW snapshot, BEFORE any mutation (sampler.py:85-93). Only the raw_*
+  //    modes snapshot here; the processed_* pair is taken inside sample(),
+  //    after the mutations they are named for, and overwrites this below
+  //    (sampler.py:104-106).
   //    NOTE: logprob_token_ids (generative-scoring) is a deferred stub, so the
   //    snapshot is driven solely by max_num_logprobs.
   const std::optional<int> num_logprobs = sm.max_num_logprobs;
   const bool want_logprobs = num_logprobs.has_value();
+  const bool processed_mode = logprobs_mode_ == LogprobsMode::kProcessedLogprobs ||
+                              logprobs_mode_ == LogprobsMode::kProcessedLogits;
   std::vector<float> raw_logprobs;  // host [n*vocab] when want_logprobs
-  if (want_logprobs) {
-    VT_CHECK(logprobs_mode_ == LogprobsMode::kRawLogprobs,
-             "sampler: only the raw_logprobs logprobs_mode is implemented at T0");
-    DeviceBuffer rlp(logits.device, q, vt::DType::kF32, {n, vocab});
-    vt::ComputeLogprobs(q, rlp.tensor(), logits);
+  if (want_logprobs && !processed_mode) {
     raw_logprobs.resize(static_cast<size_t>(n) * static_cast<size_t>(vocab));
-    rlp.download(raw_logprobs.data());
+    if (logprobs_mode_ == LogprobsMode::kRawLogits) {
+      // raw_logits (sampler.py:90-93): the logits THEMSELVES, no log_softmax.
+      // They are already f32 (checked above), so upstream's `.clone()` /
+      // `.to(torch.float32)` is exactly this copy out — and it must happen here,
+      // before the processors below mutate the tensor in place.
+      vt::Backend& b = vt::GetBackend(logits.device.type);
+      b.Copy(q, raw_logprobs.data(), logits.data,
+             raw_logprobs.size() * sizeof(float));
+      b.Synchronize(q);
+    } else {
+      DeviceBuffer rlp(logits.device, q, vt::DType::kF32, {n, vocab});
+      vt::ComputeLogprobs(q, rlp.tensor(), logits);
+      rlp.download(raw_logprobs.data());
+    }
   }
 
   // 2. float32 (already f32; checked above).
@@ -326,7 +368,13 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
     out.sampled_on_device = true;  // host sampled_token_ids intentionally empty
     return out;
   }
-  const std::vector<int64_t> sampled = sample(q, logits, sm);
+  // processed_* modes take their snapshot INSIDE sample(), where the mutations
+  // they are named for have happened; it then replaces the (empty) raw one, as
+  // upstream's `if processed_logprobs is not None` does (:104-106).
+  std::vector<float> processed;
+  const std::vector<int64_t> sampled = sample(
+      q, logits, sm, (want_logprobs && processed_mode) ? &processed : nullptr);
+  if (!processed.empty()) raw_logprobs = std::move(processed);
   // Async path fallback (random rows or logprobs requested): the host `sample()`
   // above already materialized the ids, so mirror them into the device out-tensor
   // for a uniform async-output D2H. Correct, but no zero-copy win (documented; the
@@ -372,6 +420,39 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   }
   out.logprobs_tensors = std::move(logprobs_tensors);
   return out;
+}
+
+// compute_prompt_logprobs (gpu_model_runner.py:5688-5697). The prompt half of
+// step 1 + step 8 above, with nothing in between: no logits processor, no
+// temperature, no sampling. Upstream spells that out at :5691-5693 — "prompt
+// tokens skip sampling processors, so processed_* and raw_* yield the same
+// scores here" — which is why this reuses the exact ops rather than a
+// prompt-specific variant.
+LogprobsTensors Sampler::compute_prompt_logprobs(
+    vt::Queue& q, const vt::Tensor& logits, int num_logprobs,
+    const std::vector<int64_t>& target_token_ids) const {
+  const int64_t n = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+  VT_CHECK(static_cast<int64_t>(target_token_ids.size()) == n,
+           "compute_prompt_logprobs: one target token id per prompt row");
+  VT_CHECK(num_logprobs >= 0 && static_cast<int64_t>(num_logprobs) <= vocab,
+           "compute_prompt_logprobs: num_logprobs must be in [0, vocab]");
+  VT_CHECK(logits.dtype == vt::DType::kF32 && logits.rank == 2,
+           "compute_prompt_logprobs: logits must be f32 [n, vocab]");
+
+  LogprobsTensors lt;
+  if (n == 0) {
+    lt.num_positions = 0;
+    lt.num_tokens_per_position = num_logprobs + 1;
+    return lt;
+  }
+
+  DeviceBuffer rlp(logits.device, q, vt::DType::kF32, {n, vocab});
+  vt::ComputeLogprobs(q, rlp.tensor(), logits);
+  std::vector<float> raw_logprobs(static_cast<size_t>(n) *
+                                  static_cast<size_t>(vocab));
+  rlp.download(raw_logprobs.data());
+  return GatherLogprobs(raw_logprobs, n, vocab, num_logprobs, target_token_ids);
 }
 
 }  // namespace vllm::v1
