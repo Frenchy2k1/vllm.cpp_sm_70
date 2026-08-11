@@ -538,6 +538,37 @@ For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.
 
+## Muse Glimmer 30B from a GGUF k-quant
+
+The text tower loads from a `muse-glimmer`-architecture GGUF, so the 30B model
+runs from a ~17 GB k-quant instead of a ~60 GB bf16 checkpoint. Point `--model`
+straight at the file; the config comes from the GGUF's own metadata, so no
+`config.json` is needed:
+
+```sh
+./build/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
+```
+
+Both published k-quants load (`muse-glimmer-30B-kquant-17gb.gguf` and the mixed
+per-tensor `muse-glimmer-30B-kquant-dynamic.gguf`). Standard GGUF residency
+knobs apply (`VT_GGUF_KEEP_QUANT`, `VT_GGUF_MMAP`, `VT_CPU_REF`); `o_proj`, the
+attention output gate, `down_proj` and the merged `gate_up` stay quantized, while
+the merged QKV, `lm_head` and the embedding table expand to bf16 because the
+shared forward consumes them in a form a block encoding cannot take.
+
+Two caveats, both properties of the published files rather than of this loader:
+
+- **Image and video need the bf16 safetensors.** The released
+  `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
+  axis, so half the weight is not in the file; loading it is refused by name.
+- **No speed number exists for this model in any weight format.** The pinned
+  vLLM oracle cannot load `muse_glimmer` at all, so there is no denominator to
+  quote and none is claimed.
+
+Set `VLLM_MUSE_GGUF=<file>` (or `VLLM_MUSE_GGUF_LOAD=<file>` for the full
+materialization) to run `test_muse_glimmer_gguf` against a real checkpoint;
+without them the gate runs off committed header-only manifests.
+
 ## MiniMax-H3: video + audio generation
 
 ### The exact weights (so a render is reproducible)
