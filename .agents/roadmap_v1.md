@@ -78,6 +78,8 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
 | [#238](https://github.com/mudler/vllm.cpp/issues/238) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprobs_mode`: three of four modes are runtime-refused stubs | bug |
 | [#264](https://github.com/mudler/vllm.cpp/issues/264) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprob_token_ids`: generative scoring over an explicit token set is unported | feature |
+| [#365](https://github.com/mudler/vllm.cpp/issues/365) | `PERF-27B-DENSE-MARLIN-GATEUP` | 27B gap decomposed vs vLLM's own decode profile; dense W4A16 MLP bypassed the fused gate_up seam (spec `specs/perf-27b-dense-marlin-gateup.md`) | bug |
+| [#362](https://github.com/mudler/vllm.cpp/issues/362) | — | First VALID 27B per-kernel decode attribution: whole-run trace windowed by the profiler's own cudaProfilerStart/Stop | bug |
 | [#223](https://github.com/mudler/vllm.cpp/issues/223) | `SAMPLE-PROMPT-LOGPROBS` | `prompt_logprobs` is a silent no-op: the runner never computes logits at prompt positions | bug |
 | [#294](https://github.com/mudler/vllm.cpp/issues/294) | `SERVE-ASYNC-LLM` | `test_async_llm`: reusing an aborted request id races the core abort — 26% failure rate under contention, on main | bug |
 | [#222](https://github.com/mudler/vllm.cpp/issues/222) | `SERVE-GATE-ONLINE` | The online-serving gate aborts on current main: harness looks for `examples/server`, the build produces `examples/vllm-server` — paths repaired by `2b262622`/`8fce04d3`; residue is the drift guard, the `27n` key and a model gate that recorded a skip as passed | bug |

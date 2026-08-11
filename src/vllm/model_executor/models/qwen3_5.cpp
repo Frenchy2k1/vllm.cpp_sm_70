@@ -2650,6 +2650,46 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   return act;
 }
 
+// PERF-27B-DENSE-MARLIN-GATEUP (issue #365). The DENSE MLP's W4A16 gate/up pair
+// through the SAME fused Marlin gate_up GEMM the shared expert already takes:
+// ONE [T,H]x[2I,H] GEMM + SiluAndMul per layer instead of two GEMMs + a
+// MoeSiluMul. `nullopt` means "not this configuration" and the caller keeps the
+// split path unchanged.
+//
+// It is the SAME call, the SAME MarlinDensePairResident (held on the gate
+// weight's `resident_marlin_pair` slot, so a dense gate weight keys it exactly
+// like a shared-expert gate weight does) and the SAME guard terms — there is no
+// second fused implementation and no second resident cache.
+//
+// The extra `Bf16GemmOutEnabled()` term is what keeps the SINK equivalent: the
+// split path only produces bf16 gate/up operands for its MoeSiluMul when that
+// lever is on, and the fused sink's SiluAndMul reads bf16 halves of one [T,2I]
+// buffer. Both epilogues compute `g/(1+expf(-g))*u` in f32 and round on store
+// (cuda_ops.cu SiluAndMulKernel / cuda_moe.cu MoeSiluMulKernel), so on bf16
+// inputs the two activations agree bit for bit.
+//
+// The GEMM itself does NOT: Marlin's fp32 split-K reduce groups the K-slices
+// differently for a [2N,K] operand than for two [N,K] operands, which is one
+// bf16 ULP on ~0.1% of elements — MEASURED and recorded for this same fused
+// entry point at tests/.../test_linear_method.cpp:202 (99.9% bit-exact vs
+// split). So the bar for flipping this on is token-exactness against the pinned
+// ORACLE, exactly as it was for the shared-expert pair, and NOT bit-equality
+// with our own split path.
+//
+// Like BuildDenseHeadMarlinResident below, it lives INSIDE the region that
+// already owns this kernel family rather than behind a second
+// `#ifdef VT_MARLIN_NVFP4` at the DenseMlpBlock call site, for the DSR-ratchet
+// reason spelled out there.
+std::optional<DBuf> DenseGateUpFusedMarlinD(Dev d, const Tensor& x,
+                                            const DenseMlpWeights& w) {
+  if (x.dtype != DType::kBF16 || !Bf16GemmOutEnabled() ||
+      !dense_nvfp4::DenseMlpGateUpFusedMarlinEligible(w.gate_proj_fp4, w.up_proj_fp4,
+                                                      d.q.device.type)) {
+    return std::nullopt;
+  }
+  return SharedGateUpFusedMarlinD(d, x, w.gate_proj_fp4, w.up_proj_fp4);
+}
+
 // PERF-27B-LMHEAD-FP4 (issue #213). Build the dense head's Marlin resident when
 // THIS configuration will actually take the Marlin logits GEMM, and report
 // whether it did. The predicate is EXACTLY the one MatmulNvfp4F32D selects with,
@@ -2673,8 +2713,12 @@ bool BuildDenseHeadMarlinResident(Dev d, const Nvfp4Weight& w) {
 #else
 // No Marlin NVFP4 in this build: there is no dense-head Marlin resident to
 // build, so PrepareLmHeadResident falls straight through to the arm this
-// backend's logits GEMM will actually take.
+// backend's logits GEMM will actually take, and the dense MLP keeps its split
+// gate/up pair (there is no fused Marlin GEMM to substitute).
 bool BuildDenseHeadMarlinResident(Dev, const Nvfp4Weight&) { return false; }
+std::optional<DBuf> DenseGateUpFusedMarlinD(Dev, const Tensor&, const DenseMlpWeights&) {
+  return std::nullopt;
+}
 #endif  // VT_MARLIN_NVFP4
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
@@ -5943,6 +5987,17 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
 #endif
+  // PERF-27B-DENSE-MARLIN-GATEUP (issue #365) — the W4A16 sibling of the CUTLASS
+  // W4A4 merged branch above. The 27B gate checkpoint (modelopt_mixed) is W4A16,
+  // so `MergedGateUpEligible` is false for it and the split gate+up Marlin GEMMs
+  // below are the FALLBACK; vLLM runs ONE merged gate_up_proj.
+  // VT_DENSE_MARLIN_GATEUP (default ON, opt out with =0 — the same-binary A/B
+  // measured +2.12% at c1 and +1.70% at c8 on the 27B, complete separation at
+  // both, tokens identical) substitutes the ALREADY-EXISTING fused Marlin pair —
+  // one GEMM into [T,2I] plus the same silu/mul sink — feeding the identical
+  // down projection. `nullopt` = not this configuration; nothing below changes.
+  if (std::optional<DBuf> gu_act = DenseGateUpFusedMarlinD(d, dh, w))
+    return MatmulNvfp4Bf16D(d, gu_act->t(), w.down_proj_fp4);
   if (!fp4 && !w.gate_up_proj.Empty()) {
     // Qwen3.5's MergedColumnParallelLinear: one raw-NK [2I,H] projection,
     // followed by SiluAndMul and the raw-NK down projection.
