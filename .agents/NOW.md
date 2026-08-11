@@ -28,7 +28,7 @@ Work: 7 external PRs landed (6 merged + #227 repaired).
 | `SERVE-METRICS` async (#277) | **`/metrics` was DEAD on the shipped server**: AsyncLLM folded nothing. Now live, ctest 366/366 | Config-gated families |
 | `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head |
 | Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
-| `BACKEND-ROCM` | (b) in; #140 landed; gfx1200 M0-M4 (#269); GDN slice landed (#334-#345): Qwen3.5-0.8B e2e all-native | review/merge the stack; MoE router bf16 next |
+| `BACKEND-ROCM` | #140 + gfx1200 M0-M4 (#269) + GDN slice and MoE ops (#334-#348): Qwen3.5-0.8B e2e all-native | strict CPU parity; GDN drift |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
 | Containers `#170` | **cpu+vulkan CI green**; #312 fixed | W6: cuda/arm64; unpushed |
