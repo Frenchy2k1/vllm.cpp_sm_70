@@ -2,6 +2,10 @@
 //              + lmcache/v1/server/__main__.py:34-135 @ LMCache 8570aad.
 #include "vllm/v1/kv_offload/lmcache/remote_client.h"
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -9,16 +13,79 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace vllm::v1::kv_offload::lmcache {
+namespace {
+
+#if defined(_WIN32)
+using NativeSocket = SOCKET;
+constexpr NativeSocket kInvalidNativeSocket = INVALID_SOCKET;
+#else
+using NativeSocket = int;
+constexpr NativeSocket kInvalidNativeSocket = -1;
+#endif
+
+void EnsureSocketRuntime() {
+#if defined(_WIN32)
+  static std::once_flag once;
+  static int startup_error = 0;
+  std::call_once(once, [] {
+    WSADATA data{};
+    startup_error = WSAStartup(MAKEWORD(2, 2), &data);
+  });
+  if (startup_error != 0) {
+    throw std::runtime_error("WSAStartup failed with error " +
+                             std::to_string(startup_error));
+  }
+#endif
+}
+
+int LastSocketError() {
+#if defined(_WIN32)
+  return WSAGetLastError();
+#else
+  return errno;
+#endif
+}
+
+bool InterruptedSocketError(int error) {
+#if defined(_WIN32)
+  return error == WSAEINTR;
+#else
+  return error == EINTR;
+#endif
+}
+
+std::string SocketError(const char* operation, int error) {
+#if defined(_WIN32)
+  return std::string(operation) + " failed with Winsock error " +
+         std::to_string(error);
+#else
+  return std::string(operation) + ": " + std::strerror(error);
+#endif
+}
+
+void CloseNativeSocket(NativeSocket socket) {
+  if (socket == kInvalidNativeSocket) return;
+#if defined(_WIN32)
+  closesocket(socket);
+#else
+  ::close(socket);
+#endif
+}
+
+}  // namespace
 
 LmcacheClientConfig LmcacheClientConfig::FromEnv() {
   LmcacheClientConfig cfg;
@@ -48,16 +115,14 @@ LmcacheRemoteClient::LmcacheRemoteClient(LmcacheClientConfig config)
 LmcacheRemoteClient::~LmcacheRemoteClient() { Close(); }
 
 void LmcacheRemoteClient::Close() {
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
-  }
+  if (!connected()) return;
+  CloseNativeSocket(static_cast<NativeSocket>(socket_));
+  socket_ = kInvalidSocket;
 }
 
 void LmcacheRemoteClient::Connect() {
-  if (fd_ >= 0) {
-    return;
-  }
+  if (connected()) return;
+  EnsureSocketRuntime();
   // socket.socket(AF_INET, SOCK_STREAM); socket.connect((host, port))
   // (lm_connector.py:47-48).  Resolve host via getaddrinfo so both a numeric
   // "127.0.0.1" and a name work.
@@ -76,28 +141,40 @@ void LmcacheRemoteClient::Connect() {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
-    int fd = -1;
+    NativeSocket socket = kInvalidNativeSocket;
     for (addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
-      fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-      if (fd < 0) {
-        last_error = std::string("socket: ") + std::strerror(errno);
+      socket = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+      if (socket == kInvalidNativeSocket) {
+        last_error = SocketError("socket", LastSocketError());
         continue;
       }
-      if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+      if (::connect(socket, ai->ai_addr,
+#if defined(_WIN32)
+                    static_cast<int>(ai->ai_addrlen)
+#else
+                    ai->ai_addrlen
+#endif
+                    ) == 0) {
         break;  // connected
       }
-      last_error = std::string("connect: ") + std::strerror(errno);
-      ::close(fd);
-      fd = -1;
+      last_error = SocketError("connect", LastSocketError());
+      CloseNativeSocket(socket);
+      socket = kInvalidNativeSocket;
     }
     ::freeaddrinfo(res);
-    if (fd >= 0) {
+    if (socket != kInvalidNativeSocket) {
       // Disable Nagle: our frames are small headers followed by a large
       // payload; batching the header with the payload is fine, but we never
       // want the header stalled waiting for more data.
       int one = 1;
-      ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-      fd_ = fd;
+      ::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,
+#if defined(_WIN32)
+                   reinterpret_cast<const char*>(&one),
+#else
+                   &one,
+#endif
+                   static_cast<int>(sizeof(one)));
+      socket_ = static_cast<std::uintptr_t>(socket);
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -108,41 +185,64 @@ void LmcacheRemoteClient::Connect() {
 }
 
 void LmcacheRemoteClient::SendAll(const char* data, std::size_t n) {
-  if (fd_ < 0) {
+  if (!connected()) {
     throw std::runtime_error("LmcacheRemoteClient::SendAll: not connected");
   }
   std::size_t sent = 0;
   while (sent < n) {
     // MSG_NOSIGNAL: a broken pipe returns EPIPE instead of raising SIGPIPE.
-    const ssize_t r = ::send(fd_, data + sent, n - sent, MSG_NOSIGNAL);
+    const std::size_t remaining = n - sent;
+    const int chunk = static_cast<int>(
+        std::min(remaining, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+#if defined(_WIN32)
+    const int r = ::send(static_cast<NativeSocket>(socket_), data + sent, chunk, 0);
+#else
+    const ssize_t r =
+        ::send(static_cast<NativeSocket>(socket_), data + sent,
+               static_cast<std::size_t>(chunk), MSG_NOSIGNAL);
+#endif
     if (r < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      throw std::runtime_error(std::string("LmcacheRemoteClient::SendAll: ") +
-                               std::strerror(errno));
+      const int error = LastSocketError();
+      if (InterruptedSocketError(error)) continue;
+      Close();
+      throw std::runtime_error("LmcacheRemoteClient::SendAll: " +
+                               SocketError("send", error));
+    }
+    if (r == 0) {
+      Close();
+      throw std::runtime_error(
+          "LmcacheRemoteClient::SendAll: connection closed mid-frame");
     }
     sent += static_cast<std::size_t>(r);
   }
 }
 
 void LmcacheRemoteClient::RecvAll(char* data, std::size_t n) {
-  if (fd_ < 0) {
+  if (!connected()) {
     throw std::runtime_error("LmcacheRemoteClient::RecvAll: not connected");
   }
   std::size_t got = 0;
   while (got < n) {
-    const ssize_t r = ::recv(fd_, data + got, n - got, 0);
+    const std::size_t remaining = n - got;
+    const int chunk = static_cast<int>(
+        std::min(remaining, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+#if defined(_WIN32)
+    const int r = ::recv(static_cast<NativeSocket>(socket_), data + got, chunk, 0);
+#else
+    const ssize_t r = ::recv(static_cast<NativeSocket>(socket_), data + got,
+                             static_cast<std::size_t>(chunk), 0);
+#endif
     if (r < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      throw std::runtime_error(std::string("LmcacheRemoteClient::RecvAll: ") +
-                               std::strerror(errno));
+      const int error = LastSocketError();
+      if (InterruptedSocketError(error)) continue;
+      Close();
+      throw std::runtime_error("LmcacheRemoteClient::RecvAll: " +
+                               SocketError("recv", error));
     }
     if (r == 0) {
       // Peer closed mid-frame: a short read is an error (mirrors the server's
       // receive_all returning None on a truncated frame, __main__.py:38-39).
+      Close();
       throw std::runtime_error(
           "LmcacheRemoteClient::RecvAll: connection closed mid-frame");
     }

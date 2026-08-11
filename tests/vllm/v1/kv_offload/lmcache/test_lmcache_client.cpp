@@ -18,16 +18,22 @@
 // is no direct upstream C++ analogue (spec "Tests to port": a NEW interop e2e).
 #include <doctest/doctest.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,16 +46,68 @@ using namespace vllm::v1::kv_offload::lmcache;  // NOLINT(build/namespaces)
 
 namespace {
 
+#if defined(_WIN32)
+using TestSocket = SOCKET;
+constexpr TestSocket kInvalidTestSocket = INVALID_SOCKET;
+void EnsureTestSockets() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    WSADATA data{};
+    REQUIRE(WSAStartup(MAKEWORD(2, 2), &data) == 0);
+  });
+}
+void CloseTestSocket(TestSocket socket) { closesocket(socket); }
+void ShutdownTestSocket(TestSocket socket) { ::shutdown(socket, SD_BOTH); }
+using TestSocketLength = int;
+int TestSend(TestSocket socket, const char* data, std::size_t size) {
+  return ::send(socket, data, static_cast<int>(size), 0);
+}
+int TestRecv(TestSocket socket, char* data, std::size_t size) {
+  return ::recv(socket, data, static_cast<int>(size), 0);
+}
+void SetTestEnv(const char* name, const char* value) {
+  REQUIRE(_putenv_s(name, value == nullptr ? "" : value) == 0);
+}
+#else
+using TestSocket = int;
+constexpr TestSocket kInvalidTestSocket = -1;
+void EnsureTestSockets() {}
+void CloseTestSocket(TestSocket socket) { ::close(socket); }
+void ShutdownTestSocket(TestSocket socket) { ::shutdown(socket, SHUT_RDWR); }
+using TestSocketLength = socklen_t;
+ssize_t TestSend(TestSocket socket, const char* data, std::size_t size) {
+  return ::send(socket, data, size, MSG_NOSIGNAL);
+}
+ssize_t TestRecv(TestSocket socket, char* data, std::size_t size) {
+  return ::recv(socket, data, size, 0);
+}
+void SetTestEnv(const char* name, const char* value) {
+  if (value == nullptr) {
+    REQUIRE(::unsetenv(name) == 0);
+  } else {
+    REQUIRE(::setenv(name, value, 1) == 0);
+  }
+}
+#endif
+
 // A faithful C++ mock of lmcache.v1.server.LMCacheServer (the lm:// CPU store).
 // Binds 127.0.0.1:0 (an ephemeral port), serves one connection at a time in a
 // background thread, and stores PUT payloads verbatim keyed by the header key.
 class MockLmcacheServer {
  public:
-  MockLmcacheServer() {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    REQUIRE(fd >= 0);
+  explicit MockLmcacheServer(bool close_immediately = false)
+      : close_immediately_(close_immediately) {
+    EnsureTestSockets();
+    const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd != kInvalidTestSocket);
     int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+#if defined(_WIN32)
+                 reinterpret_cast<const char*>(&one),
+#else
+                 &one,
+#endif
+                 static_cast<int>(sizeof(one)));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     // htonl/ntohs are called UNQUALIFIED on purpose: they are functions in
@@ -57,8 +115,9 @@ class MockLmcacheServer {
     // `::htonl` does not compile against a macro.
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;  // let the kernel pick a free port
-    REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
-    socklen_t len = sizeof(addr);
+    REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr),
+                   static_cast<TestSocketLength>(sizeof(addr))) == 0);
+    TestSocketLength len = static_cast<TestSocketLength>(sizeof(addr));
     REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
     port_ = ntohs(addr.sin_port);
     REQUIRE(::listen(fd, 4) == 0);
@@ -71,12 +130,11 @@ class MockLmcacheServer {
   ~MockLmcacheServer() {
     stop_.store(true);
     // Unblock accept() by closing the listen socket. This runs BEFORE the join,
-    // so it is concurrent with Run(): the handoff has to be atomic, and a plain
-    // int here is a data race with the accept thread's read.
-    const int fd = listen_fd_.exchange(-1);
-    if (fd >= 0) {
-      ::shutdown(fd, SHUT_RDWR);
-      ::close(fd);
+    // so the handoff has to be atomic with the accept thread's read.
+    const TestSocket fd = listen_fd_.exchange(kInvalidTestSocket);
+    if (fd != kInvalidTestSocket) {
+      ShutdownTestSocket(fd);
+      CloseTestSocket(fd);
     }
     if (thread_.joinable()) {
       thread_.join();
@@ -93,10 +151,10 @@ class MockLmcacheServer {
     std::vector<int32_t> shape;
   };
 
-  static bool RecvAll(int fd, char* data, std::size_t n) {
+  static bool RecvAll(TestSocket fd, char* data, std::size_t n) {
     std::size_t got = 0;
     while (got < n) {
-      const ssize_t r = ::recv(fd, data + got, n - got, 0);
+      const auto r = TestRecv(fd, data + got, n - got);
       if (r <= 0) {
         return false;  // EOF or error -> short frame
       }
@@ -105,10 +163,10 @@ class MockLmcacheServer {
     return true;
   }
 
-  static void SendAll(int fd, const char* data, std::size_t n) {
+  static void SendAll(TestSocket fd, const char* data, std::size_t n) {
     std::size_t sent = 0;
     while (sent < n) {
-      const ssize_t r = ::send(fd, data + sent, n - sent, MSG_NOSIGNAL);
+      const auto r = TestSend(fd, data + sent, n - sent);
       if (r < 0) {
         return;
       }
@@ -132,7 +190,7 @@ class MockLmcacheServer {
     return m;
   }
 
-  void HandleClient(int fd) {
+  void HandleClient(TestSocket fd) {
     while (!stop_.load()) {
       std::string header(ClientMetaMessage::PackLength(), '\0');
       if (!RecvAll(fd, header.data(), header.size())) {
@@ -201,34 +259,35 @@ class MockLmcacheServer {
         }
       }
     }
-    ::close(fd);
+    CloseTestSocket(fd);
   }
 
   void Run() {
     while (!stop_.load()) {
-      const int lfd = listen_fd_.load();
-      if (lfd < 0) {
-        break;  // destructor already took the descriptor
+      const TestSocket listen_fd = listen_fd_.load();
+      if (listen_fd == kInvalidTestSocket) {
+        break;
       }
-      // ACCEPTED residual: the destructor can close `lfd` between this load and
-      // the accept below. That is not a data race and cannot reach a reused
-      // descriptor here -- only two threads exist, the destructor opens nothing
-      // and joins before returning -- so the worst case is EBADF, which is the
-      // intended exit. Closing after the join instead is NOT the fix: on Darwin
-      // `shutdown()` alone does not wake `accept()`.
-      const int fd = ::accept(lfd, nullptr, nullptr);
-      if (fd < 0) {
+      // The destructor may close this descriptor between the load and accept;
+      // accept then fails, which is the intended shutdown path.
+      const TestSocket fd = ::accept(listen_fd, nullptr, nullptr);
+      if (fd == kInvalidTestSocket) {
         break;  // listen socket closed -> shutting down
+      }
+      if (close_immediately_) {
+        CloseTestSocket(fd);
+        break;
       }
       HandleClient(fd);
     }
   }
 
-  std::atomic<int> listen_fd_{-1};
+  std::atomic<TestSocket> listen_fd_{kInvalidTestSocket};
   int port_ = 0;
   std::atomic<bool> stop_{false};
   std::thread thread_;
   std::map<std::string, Entry> store_;
+  bool close_immediately_ = false;
 };
 
 // Deterministic pseudo-random-ish bytes so payloads are non-trivial.
@@ -346,29 +405,44 @@ TEST_CASE("lmcache LmcacheRemoteClient round-trip vs in-process mock server") {
   CHECK(keys.size() >= 1);
 }
 
+TEST_CASE("lmcache peer close invalidates the owned socket") {
+  MockLmcacheServer server(/*close_immediately=*/true);
+  LmcacheClientConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = server.port();
+  cfg.connect_retries = 1;
+  LmcacheRemoteClient client(cfg);
+  client.Connect();
+  REQUIRE(client.connected());
+  CHECK_THROWS(client.Health());
+  CHECK_FALSE(client.connected());
+  client.Close();
+  CHECK_FALSE(client.connected());
+}
+
 TEST_CASE("lmcache LmcacheRemoteClient config from env") {
   // Defaults.
-  ::unsetenv("VT_LMCACHE_HOST");
-  ::unsetenv("VT_LMCACHE_PORT");
-  ::unsetenv("VT_LMCACHE_HASH_ALGO");
+  SetTestEnv("VT_LMCACHE_HOST", nullptr);
+  SetTestEnv("VT_LMCACHE_PORT", nullptr);
+  SetTestEnv("VT_LMCACHE_HASH_ALGO", nullptr);
   {
     const LmcacheClientConfig c = LmcacheClientConfig::FromEnv();
     CHECK(c.host == "127.0.0.1");
     CHECK(c.port == 65432);
     CHECK(c.hash_algo == LmcacheClientConfig::HashAlgo::kBlake3);
   }
-  ::setenv("VT_LMCACHE_HOST", "example.internal", 1);
-  ::setenv("VT_LMCACHE_PORT", "5555", 1);
-  ::setenv("VT_LMCACHE_HASH_ALGO", "vllm", 1);
+  SetTestEnv("VT_LMCACHE_HOST", "example.internal");
+  SetTestEnv("VT_LMCACHE_PORT", "5555");
+  SetTestEnv("VT_LMCACHE_HASH_ALGO", "vllm");
   {
     const LmcacheClientConfig c = LmcacheClientConfig::FromEnv();
     CHECK(c.host == "example.internal");
     CHECK(c.port == 5555);
     CHECK(c.hash_algo == LmcacheClientConfig::HashAlgo::kVllm);
   }
-  ::unsetenv("VT_LMCACHE_HOST");
-  ::unsetenv("VT_LMCACHE_PORT");
-  ::unsetenv("VT_LMCACHE_HASH_ALGO");
+  SetTestEnv("VT_LMCACHE_HOST", nullptr);
+  SetTestEnv("VT_LMCACHE_PORT", nullptr);
+  SetTestEnv("VT_LMCACHE_HASH_ALGO", nullptr);
 }
 
 // Live interop gate: only runs when pointed at a REAL lmcache.v1.server via

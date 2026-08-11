@@ -779,6 +779,7 @@ if(VLLM_CPP_SERVER)
     # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
     # (ARCH-ONE-SURFACE ROW 6).
     LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
