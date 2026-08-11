@@ -690,6 +690,50 @@ position 3. Ours returned different completion counts between arms on 35B
 Tracked as issue #430. Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json` (pinned),
 `xengine_*.json` (0.25.0, non-binding), `xengine.log`, `xengine_ours.log`.
 
+## 6i. TEXT PARITY vs the pinned oracle: the BASELINE drifts too (2026-08-11)
+
+§6h flagged that our 35B "fibonacci" arms returned 87 tokens spec-off and 89
+spec-on where upstream returned 89 for both, and asked whether our DSpark is
+lossy. Measured, on the same eight arms, greedy, against the pinned oracle's
+own text:
+
+| case | verdict | first divergence |
+|---|---|---|
+| 35B spec-OFF "capital" | DIFFER | char 218 ("the 10th century" vs "the Middle Ages") |
+| 35B spec-OFF "fibonacci" | DIFFER | char 91 |
+| 35B DSpark "capital" | DIFFER | char 76 |
+| 35B DSpark "fibonacci" | DIFFER | char 55 (`return (` vs `return(`) |
+| 27B spec-OFF "capital" | DIFFER | char 244 |
+| 27B spec-OFF "fibonacci" | **EXACT** | 382 chars |
+| 27B DSpark "capital" | DIFFER | char 7 |
+| 27B DSpark "fibonacci" | DIFFER | char 5 |
+
+**The answer is no, and the question was malformed.** Our SPEC-OFF baseline
+already diverges from the pinned oracle's spec-off on three of four prompts, so
+an ad-hoc prompt comparison cannot isolate a DSpark defect: there is nothing to
+subtract it from. The divergences are the ratified near-tie regime (identical
+for 218 and 244 characters, then a single word choice diverging and the
+trajectories separating), which is exactly what the distributional gate exists
+for. Nothing here is attributable to the speculator.
+
+Two consequences:
+
+1. The completion-count asymmetry noted in §6h is withdrawn as evidence about
+   DSpark. It is baseline drift.
+2. The owed token gate is unchanged and cannot be replaced by this check: it
+   must be the SACRED corpus under the ratified near-tie/distributional
+   protocol (ours in the oracle's K-run set), not ad-hoc prompts. What §6i adds
+   is the reason a cheap substitute will not do.
+
+Note the two 27B DSpark arms diverge very early (chars 7 and 5) while the 27B
+spec-off arm on the same prompt matched for 382 characters. That is consistent
+with the #430 acceptance gap rather than independent of it, but it is NOT
+evidence on its own, because the other 27B prompt's spec-off arm diverged at
+char 244. Instrumenting proposed draft ids against upstream's (the #430 next
+step) settles it; this does not.
+
+Evidence: `dgx:~/work/dspark-w6/parity/*.txt` vs `pinned_*.json`.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
