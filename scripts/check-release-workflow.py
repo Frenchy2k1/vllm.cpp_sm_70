@@ -121,7 +121,7 @@ def step_run_script(step: str) -> str | None:
     return "\n".join(script)
 
 
-def shell_commands(step: str) -> list[list[str]] | None:
+def logical_shell_commands(step: str) -> list[str] | None:
     script = step_run_script(step)
     if script is None:
         return None
@@ -141,6 +141,13 @@ def shell_commands(step: str) -> list[list[str]] | None:
             current = []
     if current:
         return None
+    return logical
+
+
+def shell_commands(step: str) -> list[list[str]] | None:
+    logical = logical_shell_commands(step)
+    if logical is None:
+        return None
 
     commands: list[list[str]] = []
     try:
@@ -154,6 +161,113 @@ def shell_commands(step: str) -> list[list[str]] | None:
     except ValueError:
         return None
     return commands
+
+
+def executable_shell_segments(command: str) -> tuple[list[list[str]], bool] | None:
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            current.append(char)
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == '"':
+            current.append(char)
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            index += 1
+            if index < len(command):
+                current.append(command[index])
+                index += 1
+            continue
+        if command.startswith(("$(", "<(", ">("), index) or char == "`":
+            return [], True
+        if quote == '"':
+            current.append(char)
+            index += 1
+            continue
+        if char == "'":
+            current.append(char)
+            quote = "'"
+            index += 1
+            continue
+        if char == "#" and (
+            not current or current[-1].isspace() or current[-1] in ";|&(){}"
+        ):
+            break
+        if char in ";|&(){}":
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 1
+            while index < len(command) and command[index] in ";|&":
+                index += 1
+            continue
+        current.append(char)
+        index += 1
+    if quote is not None:
+        return None
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+
+    words: list[list[str]] = []
+    try:
+        for segment in segments:
+            words.append(shlex.split(segment, comments=True, posix=True))
+    except ValueError:
+        return None
+    return words, False
+
+
+def shell_assignment(word: str) -> bool:
+    name, separator, _ = word.partition("=")
+    return (
+        bool(separator)
+        and bool(name)
+        and (name[0].isalpha() or name[0] == "_")
+        and all(char.isalnum() or char == "_" for char in name[1:])
+    )
+
+
+def executable_prefix(words: list[str]) -> list[str]:
+    prefixes = {
+        "!",
+        "builtin",
+        "command",
+        "do",
+        "elif",
+        "else",
+        "env",
+        "exec",
+        "if",
+        "nohup",
+        "sudo",
+        "then",
+        "time",
+        "until",
+        "while",
+    }
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if shell_assignment(word) or word in prefixes:
+            index += 1
+            continue
+        if word.startswith("-") and index > 0 and words[index - 1] in prefixes:
+            index += 1
+            continue
+        break
+    return words[index:]
 
 
 def step_command_is_bound(
@@ -205,11 +319,18 @@ def job_has_shell_command(block: str, prefix: tuple[str, ...]) -> bool:
     for step in workflow_steps(block):
         if "        run: |" not in step:
             continue
-        commands = shell_commands(step)
-        if commands is None:
+        logical = logical_shell_commands(step)
+        if logical is None:
             return True
-        if any(command[: len(prefix)] == list(prefix) for command in commands):
-            return True
+        for command in logical:
+            scanned = executable_shell_segments(command)
+            if scanned is None or scanned[1]:
+                return True
+            if any(
+                executable_prefix(segment)[: len(prefix)] == list(prefix)
+                for segment in scanned[0]
+            ):
+                return True
     return False
 
 

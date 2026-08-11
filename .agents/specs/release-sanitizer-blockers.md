@@ -230,7 +230,12 @@ immutable review and the operator's post-review gate remain pending.
   by comments or inert shell strings. Consumer validation now parses executable
   commands and continuations in the exact named step, binds a unique command's
   complete option map, and fails closed on malformed or duplicate commands and
-  options. A checkout `favicon.png` in the handoff root is still rejected.
+  options. A third fresh mutation review found that direct `gh release` calls
+  could hide after shell control operators or inside command substitution. The
+  scanner now splits executable control-list, pipeline, and group segments and
+  fails closed on active command/process substitutions and backticks while
+  preserving inert comments and quoted literals. A checkout `favicon.png` in
+  the handoff root is still rejected.
 - Address+undefined sanitizer replay passed all six executables that failed in
   CI; the complete direct-upload target passed 14 cases / 183 assertions after
   the extra transpose repair. ThreadSanitizer passed the detach regression and
@@ -238,6 +243,6 @@ immutable review and the operator's post-review gate remain pending.
   `setarch x86_64 -R` to avoid this host's pre-main GCC TSan mapping failure.
   The non-sanitized focused suite passed all four targets. The post-review
   Laguna replay passed 4 cases / 63 assertions under combined address and
-  undefined sanitizers, and the release pipeline suite passed all 23 tests,
+  undefined sanitizers, and the release pipeline suite passed all 24 tests,
   including cross-download, inert-shell-text, duplicate-binding, and direct
-  `gh release` bypass mutations.
+  and nested/control-list `gh release` bypass mutations.
