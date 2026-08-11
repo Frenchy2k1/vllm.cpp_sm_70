@@ -1461,6 +1461,143 @@ TEST_CASE("GdnPostConv matches the CPU oracle within NMSE <= 5e-4") {
   }
 }
 
+TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5e-4") {
+  // §7/§8. All f32. NMSE on out AND on the in-place state (the recurrence is
+  // arithmetic end to end). Decode covers the compact arm, the indexed arm,
+  // and the NULL-slot zero-out.
+  const int64_t HK = 2, HV = 4, DK = 16, DV = 24;  // HV = ratio*HK
+  const float scale = 0.25f;
+  vt::GdnArgs ga;
+  ga.scale = scale;
+
+  // ---- prefill: two sequences, lens 4 and 1, fresh zero state.
+  const std::vector<int32_t> qsl = {0, 4, 5};
+  const int64_t N = 2, T = 5;
+  const size_t qkn = static_cast<size_t>(T * HK * DK), vn = static_cast<size_t>(T * HV * DV);
+  const size_t gbn = static_cast<size_t>(T * HV), stn = static_cast<size_t>(N * HV * DV * DK);
+  const std::vector<float> qin = RandomVec(qkn, 851, -0.5f, 0.5f);
+  const std::vector<float> kin = RandomVec(qkn, 852, -0.5f, 0.5f);
+  const std::vector<float> vin = RandomVec(vn, 853, -0.5f, 0.5f);
+  const std::vector<float> gin = RandomVec(gbn, 854, -0.3f, -0.01f);  // log-decay < 0
+  const std::vector<float> bin = RandomVec(gbn, 855, 0.0f, 0.5f);
+
+  std::vector<float> ref_out(vn, 0.0f), ref_st(stn, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> hq = qin, hk_ = kin, hv_ = vin, hg = gin, hb = bin;
+    std::vector<int32_t> cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {T, HV, DV});
+    Tensor tg = T2(hg.data(), cd, T, HV);
+    Tensor tb = T2(hb.data(), cd, T, HV);
+    Tensor tst = Tensor::Contiguous(ref_st.data(), DType::kF32, cd, {N, HV, DV, DK});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor tout = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, HV, DV});
+    vt::GdnPrefill(cq, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kGdnPrefill, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, qkn), dk(dev, q, qkn), dv(dev, q, vn), dg(dev, q, gbn),
+        db(dev, q, gbn), dout(dev, q, vn), dst(dev, q, stn);
+    DevBufI32 dqsl(dev, q, N + 1);
+    dq.Upload(qin);
+    dk.Upload(kin);
+    dv.Upload(vin);
+    dg.Upload(gin);
+    db.Upload(bin);
+    dst.Upload(std::vector<float>(stn, 0.0f));
+    dqsl.Upload(qsl);
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, HV, DV});
+    Tensor tg = T2(dg.ptr(), d, T, HV);
+    Tensor tb = T2(db.ptr(), d, T, HV);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, HV, DV, DK});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, HV, DV});
+    vt::GdnPrefill(q, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_st, dst.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+
+  // ---- decode: B=3 tokens over a 4-slot cache; slot -1 => zero out row,
+  // state untouched. Compact arm (no indices) alongside.
+  const int64_t B = 3, SLOTS = 4;
+  const size_t dqkn = static_cast<size_t>(B * HK * DK), dvn = static_cast<size_t>(B * HV * DV);
+  const size_t dgbn = static_cast<size_t>(B * HV);
+  const std::vector<int32_t> sidx = {2, -1, 0};
+  const std::vector<float> dq_in = RandomVec(dqkn, 861, -0.5f, 0.5f);
+  const std::vector<float> dk_in = RandomVec(dqkn, 862, -0.5f, 0.5f);
+  const std::vector<float> dv_in = RandomVec(dvn, 863, -0.5f, 0.5f);
+  const std::vector<float> dg_in = RandomVec(dgbn, 864, -0.3f, -0.01f);
+  const std::vector<float> db_in = RandomVec(dgbn, 865, 0.0f, 0.5f);
+  const size_t dstn = static_cast<size_t>(SLOTS * HV * DV * DK);
+  const std::vector<float> dst0 = RandomVec(dstn, 866, -0.4f, 0.4f);
+  for (bool indexed : {false, true}) {
+    CAPTURE(indexed);
+    const int64_t st_rows = indexed ? SLOTS : B;
+    const std::vector<float> dst_arm(dst0.begin(), dst0.begin() + st_rows * HV * DV * DK);
+    std::vector<float> ref_dout(dvn, -7.0f), ref_dst = dst_arm;
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> hq = dq_in, hk_ = dk_in, hv_ = dv_in, hg = dg_in, hb = db_in;
+      std::vector<int32_t> csi = sidx;
+      Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {B, HK, DK});
+      Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {B, HK, DK});
+      Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {B, HV, DV});
+      Tensor tg = T2(hg.data(), cd, B, HV);
+      Tensor tb = T2(hb.data(), cd, B, HV);
+      Tensor tst = Tensor::Contiguous(ref_dst.data(), DType::kF32, cd, {st_rows, HV, DV, DK});
+      Tensor tsi = TI32(csi.data(), cd, B);
+      Tensor tout = Tensor::Contiguous(ref_dout.data(), DType::kF32, cd, {B, HV, DV});
+      vt::GdnDecode(cq, tout, tq, tk, tv, tg, tb, tst, ga, indexed ? &tsi : nullptr);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kGdnDecode, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dq(dev, q, dqkn), dk(dev, q, dqkn), dv(dev, q, dvn), dg(dev, q, dgbn),
+          db(dev, q, dgbn), dout(dev, q, dvn), dst(dev, q, static_cast<size_t>(st_rows * HV * DV * DK));
+      DevBufI32 dsi(dev, q, B);
+      dq.Upload(dq_in);
+      dk.Upload(dk_in);
+      dv.Upload(dv_in);
+      dg.Upload(dg_in);
+      db.Upload(db_in);
+      dst.Upload(dst_arm);
+      dsi.Upload(sidx);
+      dout.Upload(std::vector<float>(dvn, -7.0f));  // untouched-row sentinel
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {B, HK, DK});
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {B, HK, DK});
+      Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {B, HV, DV});
+      Tensor tg = T2(dg.ptr(), d, B, HV);
+      Tensor tb = T2(db.ptr(), d, B, HV);
+      Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {st_rows, HV, DV, DK});
+      Tensor tsi = TI32(dsi.ptr(), d, B);
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {B, HV, DV});
+      vt::GdnDecode(q, tout, tq, tk, tv, tg, tb, tst, ga, indexed ? &tsi : nullptr);
+      CHECK(Nmse(ref_dout, dout.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_dst, dst.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;
