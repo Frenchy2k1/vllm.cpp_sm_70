@@ -53,6 +53,12 @@ void CausalConv1dUpdateKernelRocm(Queue& q, Tensor& out, const Tensor& x, const 
                                   const Tensor* bias, Tensor& conv_state,
                                   const Tensor* conv_state_indices,
                                   const CausalConv1dArgs& args);
+// BACKEND-ROCM-GDN-KERNELS family 3 (rocm_gdn_postconv.hip): the fused
+// post-conv glue (conv-split + q/k l2norm + g/beta), gdn-semantics §4/§6.
+void GdnPostConvKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
+                           Tensor& g_out, Tensor& beta_out, const Tensor& conv,
+                           const Tensor& araw, const Tensor& braw, const Tensor& a_log,
+                           const Tensor& dt_bias, const L2NormArgs& args);
 
 namespace {
 
@@ -122,6 +128,9 @@ struct Registrar {
     RegisterOp(OpId::kCausalConv1dUpdate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernelRocm)));
+    RegisterOp(OpId::kGdnPostConv, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<GdnPostConvFn>(&GdnPostConvKernelRocm)));
   }
 } registrar;
 
