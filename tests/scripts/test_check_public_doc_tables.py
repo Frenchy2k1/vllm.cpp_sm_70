@@ -511,6 +511,25 @@ class StatusRatchet(unittest.TestCase):
         text = doc_tables.STATUS.read_text(encoding="utf-8")
         self.assertEqual(doc_tables.STATUS_RATCHET["chars"], len(text))
 
+    def test_one_char_of_growth_on_the_LIVE_page_is_rejected(self) -> None:
+        """The other growth test grows a SYNTHETIC page by a whole ratchet.
+
+        That proves the comparison exists; it does not prove the cap is on the
+        boundary of the real page. Since the ratchet is re-pinned byte-tight on
+        every STATUS edit, the live page always sits exactly ONE character below
+        rejection, and that off-by-one is the only thing standing between "the
+        cap tracks the page" and "the cap trails it by a byte". So assert it on
+        the live text, and assert the message names both numbers -- an error
+        that says only "too big" cannot tell an author what to collapse.
+        """
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        cap = doc_tables.STATUS_RATCHET["chars"]
+        errors = doc_tables.status_errors(text + "x")
+        self.assertTrue(
+            any(f"chars is {len(text) + 1}" in error for error in errors), errors
+        )
+        self.assertTrue(any(f"{cap} ratchet" in error for error in errors), errors)
+
     def test_a_retired_claim_cannot_come_back_for_free(self) -> None:
         """A claim the page RETIRED must cost something to reinstate.
 
@@ -585,14 +604,17 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            # Lowered 2026-08-11 with the ratchet it guards (LoRA W2, #278):
-            # the STATUS LoRA row now covers W1+W2 in fewer bytes than it spent
-            # on W1 alone. The ceiling moves down in the SAME change, never
-            # after it. RE-MEASURED on the MERGED page at the landing merge of
-            # PR #282 into main `ca261aec`: neither the branch's stale 243482
-            # (basis 243227 against `5812b8b6`) nor main's 243188, but 243128,
-            # which is what `len(open("docs/STATUS.md").read())` reads here.
-            "chars": 243128,
+            # Lowered 2026-08-11 with the ratchet it guards, twice in one
+            # landing (LoRA W2 #278, then `SAMPLE-LOGPROB-TOKEN-IDS` #264):
+            # the LoRA row covers W1+W2 in fewer bytes than it spent on W1
+            # alone, and the Sampling row bought its `logprob_token_ids` line
+            # by collapsing four restatements in the same cell. The ceiling
+            # moves down in the SAME change as the ratchet, never after it,
+            # because a ceiling left above the ratchet is exactly the regrowth
+            # headroom the docstring above says this guard exists to deny.
+            # RE-MEASURED on the MERGED page: neither #282's 243482 nor
+            # #267's 243479, both computed against `5812b8b6`, but 243119.
+            "chars": 243119,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,

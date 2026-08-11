@@ -1108,6 +1108,23 @@ returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
 count is not rejected. Both are tracked by
 [issue #249](https://github.com/mudler/vllm.cpp/issues/249).
 
+`SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead —
+vLLM's generative-scoring path, and what to reach for when you only need a few
+labels compared, since it avoids the full-vocab sort `logprobs=-1` costs:
+
+```cpp
+vllm::SamplingParams sp;
+sp.max_tokens = 1;
+sp.logprob_token_ids = std::vector<int32_t>{yes_id, no_id};  // `logprobs` unset
+```
+
+Each returned position then carries exactly those ids plus the sampled token,
+whose `rank` is still its rank over the WHOLE vocabulary, so it stays comparable
+across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
+`logprobs` as well is allowed only when it equals the id count, and the explicit
+ids win. This is a library-API field today — the OpenAI request field is not
+wired yet.
+
 ## Multimodal input (image, video, audio to text)
 
 Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:

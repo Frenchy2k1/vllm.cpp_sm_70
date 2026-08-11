@@ -1666,6 +1666,31 @@ and the config/CLI plumbing to select a mode from outside the library are both s
 Records a spec-after-code ordering deviation in the spec preamble rather than hiding it behind
 commit order.
 
+**`CLAIM-SAMPLE-LOGPROB-TOKEN-IDS` (`SAMPLE-LOGPROB-TOKEN-IDS`, 2026-08-10, issue
+#264).** Claude Code (claude-opus-5), helper role, isolated worktree
+`/home/mudler/_git/vllm.cpp-token-ids`, branch `row/SAMPLE-LOGPROB-TOKEN-IDS`,
+base `origin/main` `e63d11d3` pinned at worktree creation, PR #267, `origin/main`
+`5812b8b6` MERGED in 2026-08-11 (never rebased -- both heads are published and
+`main` is never force-pushed). Spec
+[logprob-token-ids.md](specs/logprob-token-ids.md). NOT in the claims table
+below: that table keys `SPIKE`/`ACTIVE` rows and this row lands `PARTIAL`
+(the row was already moved `INVENTORIED` -> `PARTIAL` on main by the sibling
+`logprobs_mode` claim, so this change moves no lifecycle counter).
+Scope: `SamplingParams::logprob_token_ids` + `num_logprobs()` + its two
+validations; the `InputBatch` req_id-keyed map and its `make_sampling_metadata`
+emission; `GatherSpecificTokenLogprobs` + the snapshot/precedence wiring in
+`sampler.cpp`; the two `num_logprobs`-property consumers (`scheduler.cpp:920`,
+`logprobs.cpp:35`); cases in `test_sampler.cpp` / `test_input_batch.cpp` /
+`test_sampling_params.cpp` / `test_llm_engine.cpp`; the row + its docs
+checkpoint; this claim; the #264 roadmap intake row. CPU-only; NO kernel, vt op,
+C ABI, CMake, model file, GPU or download. **Textual overlap RESOLVED:** #258
+(`logprobs_mode`) and #223 (`prompt_logprobs`) landed first and both touched the
+same `sampler.cpp` snapshot block and `input_batch.{h,cpp}`; the 2026-08-11
+merge keeps BOTH features -- `logprobs_mode` selects WHICH tensor the snapshot
+holds, `logprob_token_ids` selects WHICH ids are read out of it -- and adds one
+composition case that neither PR could have written against its own base. Does
+NOT touch `GatherLogprobs` -- issue #249's unbounded `k` is a separate row.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-SAMPLE-PROMPT-LOGPROBS-W1` | `SAMPLE-PROMPT-LOGPROBS` (`ACTIVE`; W1 runner source only) | Claude Code (claude-opus-5) | `/home/mudler/_git/vllm.cpp-prompt-logprobs`; CPU-only `build-gate` (`-DVLLM_CPP_CUDA=OFF` Release) — NO GPU, NO download, claims no benchmark device | `row/SAMPLE-PROMPT-LOGPROBS`, opened on `origin/main` `bd6b3936`, rebased onto `8a6704a2` for the 2026-08-10 review repair and onto `e63d11d3` to land, issue #223 | The runner-side prompt-logits source ported from `_get_prompt_logprobs_dict`. Owns ONLY: the `prompt_logprob_rows`/`prompt_logprob_indices` block in `prepare_inputs.{h,cpp}`, `collect_prompt_logprobs` + `in_progress_prompt_logprobs_` in `runner.{h,cpp}`, `Sampler::compute_prompt_logprobs` in `sampler.{h,cpp}`, `num_prompt_logprobs` in `input_batch.{h,cpp}`, section 9 of `tests/vllm/v1/test_llm_engine.cpp`, this claim, the row cells, `.agents/NOW.md`, `.agents/roadmap_v1.md` issue rows, one `docs/STATUS.md` sentence, and the `prompt_logprobs` paragraph in `docs/USAGE.md`. **NON-COLLISION:** NO kernel, NO vt op, NO ABI, NO CMake, NO model file — the full-logits route reuses the existing `VT_LOGITS_GATHER=0` path rather than widening any model's gather contract. EXCLUDED: the OpenAI `echo` serialization (W2) and issue #231, both split out. | `ACTIVE` | 2026-08-10 — W1 landed then REPAIRED after a fresh review returned `VERDICT: FAIL`. Review found a REAL bug: the inertness guard keyed on `prompt_logprob_indices` while the full-logits assertion keyed on `prompt_logprob_rows`, so a zero-row final chunk (the exact-prefill edge, `:5668-5673`) beside another multi-token request threw `VT_CHECK` out of `engine.step()` and killed the whole batch. Fixed by moving the check inside the `num_rows > 0` slice; regression §8(h), RED-first (the throw). Second finding: the on-vs-off inertness case could not see a change to the SHARED route (forcing full logits on every step left it 17/17·346 green), so §8(g) now asserts the route DECISION through a const runner seam and fails under that exact mutation. Third finding recorded, NOT fixed and NOT claimed: the full-logits route hands the sampler a host pointer wearing the device label — sound on unified memory, unverified on CUDA; spec risk 4 + a `PENDING` CUDA smoke gate, and `docs/USAGE.md` narrowed to say so. Three latent lifetime divergences recorded as risks 5-7. Gates on the rebased tree (`e63d11d3`): clean CPU Release build 0 warnings under `-Werror`, `test_llm_engine` **21/21 · 384**, full `ctest -j 6` **365/366** with `test_openai_conformance` (parallel starvation — connection `-1`s) passing serially 1/1 in 0.39 s. Row stays `ACTIVE`: W2 `echo` serialization is the named residual, and the CUDA smoke gate is `PENDING`. |

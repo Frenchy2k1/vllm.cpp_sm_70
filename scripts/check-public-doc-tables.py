@@ -612,7 +612,31 @@ STATUS_RATCHET = {
     # `len(open("docs/STATUS.md").read())` == 243128 -- main's 243188 less the
     # LoRA row's own net -60. Byte-tight, and strictly DOWN from 243188, the
     # only direction this number may move.
-    "chars": 243128,
+    #
+    # 243278 since 2026-08-11 (measured 243278, `SAMPLE-LOGPROB-TOKEN-IDS` #264):
+    # the Sampling row owes the page a line for `logprob_token_ids` generative
+    # scoring, and it is paid for INSIDE the same cell. The branch's original
+    # payment -- collapsing the beam-search wiring narrative -- was NOT available
+    # any more: #223 had already spent exactly that collapse, and its guard
+    # (test_the_repin_was_paid_for_by_a_real_collapse) pins the collapsed form.
+    # So FOUR different restatements were collapsed instead, each a definition of
+    # what an OpenAI field DOES rather than a statement of what we support: what a
+    # custom logits processor is, what `n>1` does, what `best_of` does, and how
+    # the async beam driver is built. Every measured number, endpoint and binding
+    # claim is kept verbatim, including the three substrings #223 and #238 pin.
+    # RE-MEASURED against the MERGED page after `origin/main` 5812b8b6, never
+    # carried from either side: the branch had measured 243479 against its own
+    # stale base. Net -9 against main's 243287, re-pinned byte-tight. Strictly
+    # DOWN, the only direction this number may move.
+    #
+    # 243119 since 2026-08-11 (measured 243119): the landing merge of PR #267
+    # into main `59e6fea0`, the third of three merged in one landing. ALL
+    # rationale histories above are kept. Neither side's number survives:
+    # #267 measured 243278 against `5812b8b6` and the page has since taken
+    # main's own re-pin AND PR #282's LoRA collapse. RE-MEASURED here,
+    # `len(open("docs/STATUS.md").read())` == 243119 -- 243128 after #282,
+    # less the Sampling row's own net -9. Byte-tight, strictly DOWN.
+    "chars": 243119,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
