@@ -274,7 +274,7 @@ class RatchetTests(unittest.TestCase):
         self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
 
     def test_re_adding_done_to_the_gated_population_breaks_the_pin(self):
-        # MUTATION: restoring the departed lifecycle state must expose the three
+        # MUTATION: restoring the departed lifecycle state must expose the four
         # runnable DONE rows and disagree with the re-pinned baseline.
         original = gates.GATED_STATES
         gates.GATED_STATES = frozenset(original | {"DONE"})
@@ -284,30 +284,23 @@ class RatchetTests(unittest.TestCase):
             }
         finally:
             gates.GATED_STATES = original
-        departed = {"ENG-ASYNC-SCHED", "SERVE-HTTP-TRANSPORT", "ENG-NOW-DERIVED"}
+        departed = {
+            "ENG-ASYNC-SCHED",
+            "SERVE-HTTP-TRANSPORT",
+            "ENG-NOW-DERIVED",
+            "ENG-TRAILER-MERGE-ARTIFACTS",
+        }
         self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
         self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
-    def test_trailer_merge_artifacts_is_credited_for_real_commands(self):
-        # ENG-TRAILER-MERGE-ARTIFACTS (#406) joins the runnable population on
-        # arrival, so it earns the credit the same way: its spec's Gates section
-        # must name commands that can actually fail. Its gate is the record gate
-        # plus a per-commit re-verification of the five real main commits.
+    def test_trailer_merge_artifacts_left_the_gated_population_cleanly(self):
+        # Credited runnable on arrival at ACTIVE, then gone the same day on
+        # reaching DONE (157080c8). Assert the departure on BOTH sides -- gone
+        # from the audit AND gone from the baseline -- because a row present in
+        # one and not the other is exactly what the exact pin exists to catch.
         verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
-        self.assertEqual(verdicts.get("ENG-TRAILER-MERGE-ARTIFACTS"), "runnable")
-        spec = (ROOT / ".agents/specs/trailer-merge-artifacts.md").read_text(
-            encoding="utf-8"
-        )
-        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
-            with self.subTest(command=command):
-                self.assertIn(command, spec)
-
-    def test_the_trailer_row_re_pin_is_load_bearing(self):
-        # MUTATION: drop the entry and the exact pin must break.
-        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-TRAILER-MERGE-ARTIFACTS"}
-        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
-        self.assertNotEqual(runnable, reduced)
-        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+        self.assertIsNone(verdicts.get("ENG-TRAILER-MERGE-ARTIFACTS"))
+        self.assertNotIn("ENG-TRAILER-MERGE-ARTIFACTS", gates.RUNNABLE_BASELINE)
 
     def test_record_conflict_surfaces_is_credited_for_real_commands(self):
         # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on
