@@ -159,20 +159,30 @@ inline bool MarlinDenseEnabled() {
 // operand (marlin_utils_fp4.py:221-306), so one GEMM is the MIRRORED topology
 // and the split pair is our divergence.
 //
-// VT_DENSE_MARLIN_GATEUP is DEFAULT OFF in this row, deliberately: a lever's
-// default moves on a measured same-binary A/B, never on an expectation. The
-// operator owns that A/B and the decode-window trace; the default flips in a
-// follow-up if it wins. The correctness bar for that flip is token-exactness
-// against the pinned ORACLE, NOT bit-equality with our own split path — the
-// fused and split Marlin GEMMs differ by one bf16 ULP on ~0.1% of elements
-// (the fp32 split-K reduce regroups the K-slices for a [2N,K] operand),
-// MEASURED for this exact entry point in
-// tests/vllm/model_executor/layers/test_linear_method.cpp:202.
+// VT_DENSE_MARLIN_GATEUP is DEFAULT ON (opt out with =0). It shipped OFF while
+// the row held, because a lever's default moves on a measured same-binary A/B
+// and never on an expectation. That A/B has now run: interleaved 4 reps per arm
+// on nvidia/Qwen3.6-27B-NVFP4@0893e160 (GB10), toggle the only variable, caches
+// dropped between arms — fused +2.12% at c1 (12.0823 vs 11.8313 tok/s) and
+// +1.70% at c8 (83.6186 vs 82.2217), with COMPLETE SEPARATION at both
+// concurrencies (c1 min fused 12.0203 > max split 11.8729; c8 min fused 83.2511
+// > max split 82.4959), 4/4 paired, effect well outside each arm's spread.
+//
+// The correctness bar for the flip was token-exactness against the pinned
+// ORACLE, NOT bit-equality with our own split path — the fused and split Marlin
+// GEMMs differ by one bf16 ULP on ~0.1% of elements (the fp32 split-K reduce
+// regroups the K-slices for a [2N,K] operand), MEASURED for this exact entry
+// point in tests/vllm/model_executor/layers/test_linear_method.cpp:202. A
+// 64-token greedy continuation captured on BOTH arms diffed IDENTICAL.
+//
+// The opt-out spelling mirrors the nearest parity levers, the sibling fused
+// gate_up toggles above: MarlinDensePairEnabled (VT_MARLIN_DENSE_PAIR) and
+// FusedGateUpEnabled (VT_MOE_FUSED_W13).
 //
 // Parsed by a PURE function so the truth table is testable without process
 // -global state (the cached reader below can only ever observe one value).
 inline bool DenseMarlinGateUpEnabledFor(const char* env) {
-  return env != nullptr && env[0] == '1' && env[1] == '\0';
+  return !(env != nullptr && env[0] == '0');
 }
 
 inline bool DenseMarlinGateUpEnabled() {
