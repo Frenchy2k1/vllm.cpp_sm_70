@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import re
 import tempfile
 import subprocess
 import sys
@@ -95,7 +96,16 @@ class PathClassification(unittest.TestCase):
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
             "release/release-matrix.json": "configuration",
+            "release/container-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
+            # The container lane images. `docker/Dockerfile.arm64` already
+            # classified through the suffixed pattern, but the unsuffixed
+            # multi-lane Dockerfile and its healthcheck did not, and
+            # classify_path FAILS CLOSED -- so adding them to the tree made the
+            # PR-size gate reject the change outright.
+            "docker/Dockerfile": "configuration",
+            "docker/Dockerfile.arm64": "configuration",
+            "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
         }
         for path, path_class in expected.items():
@@ -134,6 +144,35 @@ class PathClassification(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(ValueError):
                     checker.classify_path(path)
+
+    def test_the_model_porting_checklist_is_procedure_and_agents_is_not_blanket(
+        self,
+    ) -> None:
+        """The new per-model checklist classifies, and `.agents/` stays explicit.
+
+        `.agents/porting-a-model.md` (#318) is a task guide like its siblings, so
+        it belongs to the procedure class. It is listed by exact path rather than
+        by widening a glob over `.agents/`, because AGENTS.md forbids hiding
+        mutable files behind a blanket directory exemption.
+
+        Both halves matter. Without the first the gate fails closed on the guide
+        -- which is how this was found. Without the second, adding the entry as a
+        directory pattern would silently classify every future `.agents/` file,
+        including ones nobody reviewed, so the check asserts an unknown sibling
+        still fails to classify.
+        """
+        self.assertEqual(
+            checker.classify_path(".agents/porting-a-model.md"), "procedure"
+        )
+        # Its siblings are unchanged.
+        self.assertEqual(checker.classify_path(".agents/porting.md"), "procedure")
+
+        # `.agents/` is NOT a blanket exemption. An unlisted path there does not
+        # quietly inherit a class -- the classifier refuses it outright, which is
+        # what makes the gate fail closed on every new file rather than only on
+        # the ones someone remembered to think about.
+        with self.assertRaises(ValueError):
+            checker.classify_path(".agents/not-a-real-guide-xyz.md")
 
     def test_every_tracked_and_current_change_path_is_classified(self) -> None:
         paths = set(
@@ -340,6 +379,11 @@ class BudgetEnforcement(unittest.TestCase):
             # in the same PR has no BASE version to mutate, so it registers the
             # disabled form its own tests must reject.
             "scripts/check-site.py",
+            # 2026-08-10: the container-image gates (#170). Both suites load the
+            # checker as a module and call into it, so the disabled stub fails
+            # every case rather than quietly passing a reduced one.
+            "scripts/check-container-matrix.py",
+            "scripts/check-container-workflow.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():
@@ -611,6 +655,47 @@ class BudgetEnforcement(unittest.TestCase):
                 self.assertEqual(
                     role.merged_pr_content([git("rev-parse", "HEAD")]), frozenset()
                 )
+
+
+
+
+class PerClaimPathClass(unittest.TestCase):
+    """`.agents/claims/CLAIM-*.md` is a classified path (#364).
+
+    One file per active claim, added because the claims TABLE in
+    coordination.md is insert-at-one-anchor and was the largest single conflict
+    source measured -- 8 of 16 conflicting open PRs. classify_path FAILS CLOSED
+    on an unknown path, so without this the directory cannot be added at all.
+    """
+
+    def test_a_claim_file_is_classified(self) -> None:
+        self.assertEqual(
+            checker.classify_path(".agents/claims/CLAIM-EXAMPLE.md"),
+            checker.classify_path(".agents/specs/example.md"),
+            "a per-claim file is the same class as the per-row spec it mirrors",
+        )
+
+    def test_the_directory_readme_is_classified(self) -> None:
+        checker.classify_path(".agents/claims/README.md")
+
+    def test_dropping_the_pattern_fails_closed(self) -> None:
+        """MUTATION: without the CLAIM pattern the path is unclassified.
+
+        Proves the added clause is load-bearing rather than shadowed by some
+        broader rule that already accepted the path.
+        """
+        with mock.patch.object(checker, "CLAIM", re.compile(r"(?!)")):
+            with self.assertRaises(ValueError):
+                checker.classify_path(".agents/claims/CLAIM-EXAMPLE.md")
+
+    def test_a_non_claim_file_in_the_directory_is_still_rejected(self) -> None:
+        """The pattern must not become a blanket exemption for the directory.
+
+        AGENTS.md forbids hiding mutable files behind a directory exemption, so
+        a non-markdown path here must still fail closed.
+        """
+        with self.assertRaises(ValueError):
+            checker.classify_path(".agents/claims/CLAIM-EXAMPLE.sh")
 
 
 if __name__ == "__main__":

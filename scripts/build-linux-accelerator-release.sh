@@ -51,7 +51,7 @@ targets=(server)
 if [[ "$backend" == vulkan ]]; then
   targets+=(test_vulkan_backend test_backend_cross_device)
 fi
-cmake --build "$build_dir" --target "${targets[@]}" -j 2
+cmake --build "$build_dir" --target "${targets[@]}" -j "${JOBS:-2}"
 
 if [[ "$backend" == cuda ]]; then
   python3 scripts/check-cuda-fat-gencode.py \

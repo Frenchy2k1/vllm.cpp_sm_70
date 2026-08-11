@@ -19,7 +19,9 @@ the reference for behavior and the bar for speed.
    as a coordinator; it is never refused because someone else is coordinating.
    Add `--headless` only when the developer explicitly says the run is
    unattended. Never infer it.
-3. Read `.agents/NOW.md`. It is the live snapshot and fits on one screen.
+3. Run `scripts/now.py` for the live position, and read `.agents/NOW.md`
+   for the operator's current gate and next actions. The first is derived;
+   the second is authored and fits on one screen.
 4. Read only the claimed row, its spec, its evidence, and the task guide for
    what you are about to do.
 5. Run `scripts/agent-preflight.sh` before you edit anything.
@@ -54,8 +56,17 @@ got there. Before concluding anything about past work, check the spec and
 confirm an issue tracks the work; if none exists, open one. Link it in three
 places that must agree: the issue table in
 [`.agents/roadmap_v1.md`](.agents/roadmap_v1.md), the row's spec, and the PR
-body. A bug you found while doing something else gets its own issue rather than
-a silent fix.
+body.
+
+A bug you find while doing something else still gets an issue — but filing it
+does not mean deferring it. File it, fix it in the same flow, reference it in
+the commit, and close it. The traceability is what matters, not the round trip:
+the person who just found the bug has the context to fix it, and making them
+hand it off loses that.
+
+This covers the small and obvious. A fix that needs its own spec, changes a
+checker's semantics, or would surprise a reviewer still takes the normal
+row / spec / fresh-review path — "fix it in-flow" is not a bypass for those.
 
 ## Spec before code
 
@@ -183,6 +194,13 @@ exact tracked exception. Never hand-roll a parallel path.
 New hardware, architectures, and models are **additive** files that mirror
 vLLM's structure.
 
+A model port covers the **quantized arms, not just bf16**. GGUF k-quants in
+particular are a standing requirement, not a per-model choice: they are what most
+users can actually run, and they are what a quant-matched llama.cpp comparison
+needs. An arm that is not implemented is refused with a message naming the
+missing piece and recorded as owed — never left to be discovered later.
+[`.agents/porting-a-model.md`](.agents/porting-a-model.md) is the checklist.
+
 ## Records
 
 Every inventory item has a stable ID and records upstream source, local anchor,
@@ -194,6 +212,23 @@ Resolve concurrent edits to a keyed record by taking the target branch version
 wholesale and reapplying your scoped edit; verify unrelated keys byte-for-byte.
 Union-append only genuinely append-only logs. Never accept an automatic
 three-way merge of a keyed record.
+
+**No surface that every PR must write.** If N concurrent PRs all edit file F,
+then F is a lock. A record surface is admissible in one of three shapes only:
+**one file per row**, globbed for reading; **genuinely append-only**, so it
+union-merges; or **derived at read time**, so nobody writes it. Rewrite anything
+else into one of the three.
+
+Two corollaries. **Cap the entry, never the file** — a budget on a shared file
+turns every addition into evicting someone else's content, and merging two such
+edits cleanly is worse than conflicting, because it applies both evictions.
+**Never store a measurement of one file inside another** — a number that moves on
+every edit couples every PR to lines it does not own.
+
+A gate is what usually creates the lock: if a checker *requires* every change to
+touch a shared file, that is the defect, not the discipline of the people
+touching it. Relocate the obligation to a per-row surface rather than deleting
+it.
 
 Compact by *moving* superseded detail into `.agents/completed/` with links and
 provenance intact. Never delete evidence to save context.
@@ -210,10 +245,12 @@ each fact lives in exactly one of them.
 | `docs/FEATURES.md` | a feature, model, backend, or quantization surface changes |
 | `docs/USAGE.md` | a command, C API, config key, install step, or workflow changes |
 | `README.md` | a user-visible headline, positioning, or quick start changes |
-| `.agents/NOW.md` | the live position moves |
+| the moved row spec's `## Now` | a row changes lifecycle state |
 
 Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
-lifecycle change owes `STATUS`, `BENCHMARKS`, and `NOW`.
+lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
+`.agents/NOW.md` is authored only at operator cadence and is never a per-row
+lifecycle write.
 
 ## Work happens in a worktree
 
@@ -290,6 +327,7 @@ Read the one for the job in front of you.
 
 | Doing this | Read |
 |---|---|
+| Porting a MODEL (the coverage checklist) | [`.agents/porting-a-model.md`](.agents/porting-a-model.md) |
 | Porting a model, kernel, or feature from vLLM | [`.agents/porting.md`](.agents/porting.md) |
 | Running gates, proving correctness, reviewing | [`.agents/verification.md`](.agents/verification.md) |
 | Measuring performance | [`.agents/benchmarking.md`](.agents/benchmarking.md) |

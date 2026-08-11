@@ -440,6 +440,92 @@ std::pair<int, int> resolve_kv_cache_block_sizes(
     std::optional<int> prefix_match_unit, bool enable_prefix_caching,
     bool connector_enabled, int dcp_world_size = 1);
 
+// ---------------------------------------------------------------------------
+// Startup KV sizing: can the pool hold ONE max_model_len sequence?
+//
+// Ported from vllm/v1/core/kv_cache_utils.py @ 555967922:
+//   max_memory_usage_bytes          :791-798  -> kv_memory_needed_bytes
+//   estimate_max_model_len          :800-851  -> estimate_max_model_len
+//   _check_enough_kv_cache_memory   :751-788  -> check_enough_kv_cache_memory
+//   _auto_fit_max_model_len         :1967-2027 -> auto_fit_max_model_len
+//
+// WHY THIS EXISTS: without it a prompt larger than the KV pool is admitted,
+// never allocates, and the engine spins at model_executed=0 with an idle GPU
+// forever (external PR #227's report). Upstream never aborts such a waiter —
+// scheduler.py:919-940 peeks and `break`s. It prevents the state at startup
+// (here) and at admission (input_processor.py:387-432). Issue #83 M4.
+//
+// DEVIATIONS, all recorded:
+//   - Upstream takes `Callable`s (get_needed_memory / estimate_max_model_len) so
+//     the expensive device-profiling variants stay lazy. Both are pure
+//     arithmetic for us, so they are passed as values.
+//   - estimate_max_model_len upstream binary-searches `max_memory_usage_bytes`.
+//     Our per-block geometry is exactly linear in the block count
+//     (KVBytesPerBlock is block-count independent), so the search has the closed
+//     form `num_blocks * block_size` and is written as such.
+//   - The remediation sentence keeps upstream's wording and appends the knobs a
+//     vllm.cpp user can actually act on: `gpu_memory_utilization` profiling is
+//     un-ported (model_loader.cpp ResolveNumBlocks step 3, TODO ROAD-V1-MEM M3),
+//     so `--num-blocks` / `--kv-cache-memory` / `--max-model-len` are the levers.
+
+// max_memory_usage_bytes: the KV bytes ONE sequence of `max_model_len` tokens
+// occupies, at this block geometry. Blocks are whole, so the token count is
+// rounded up to a block boundary.
+int64_t kv_memory_needed_bytes(int64_t max_model_len, int block_size,
+                               int64_t bytes_per_block);
+
+// estimate_max_model_len: the longest sequence `available_memory` can hold.
+// Returns 0 when not even a single block fits.
+int64_t estimate_max_model_len(int64_t available_memory,
+                               int64_t bytes_per_block, int block_size);
+
+// _check_enough_kv_cache_memory: throws std::invalid_argument (upstream
+// ValueError) when the pool cannot hold one `max_model_len` sequence.
+// `estimated_max_model_len` <= 0 suppresses the "Based on the available memory"
+// clause exactly as upstream does.
+void check_enough_kv_cache_memory(int64_t available_memory,
+                                  int64_t needed_memory, int64_t max_model_len,
+                                  int64_t estimated_max_model_len);
+
+// recurrent_state_bytes: the Mamba/GDN state the runner will allocate, in bytes
+// (issue #371). Derived from the KVCacheConfig the runner allocates FROM, so it
+// cannot drift from the allocation: for each Mamba group,
+// `page_size_bytes() * layer_count * max_num_seqs * (1 + num_speculative_blocks)`.
+//
+// The `1 + num_speculative_blocks` factor is upstream's
+// `MambaSpec.max_memory_usage_bytes` (kv_cache_interface.py:713-718) and matches
+// what we allocate: `gdn_state_slots_ = max_num_reqs * (num_spec + 1)`
+// (runner.cpp:449-451). Speculation therefore multiplies the recurrent state by
+// k+1, which for a k=15 draft is SIXTEEN times the spec-off state.
+//
+// Returns 0 for a model with no recurrent state, which keeps every attention-only
+// path byte-identical.
+// host_available_memory_bytes: /proc/meminfo MemAvailable, the pool a unified
+// memory device actually allocates from. 0 means UNKNOWN (unreadable), and an
+// unknown budget must never become a false refusal.
+int64_t host_available_memory_bytes();
+
+int64_t recurrent_state_bytes(const KVCacheConfig& kv_cfg, int max_num_seqs);
+
+// check_enough_state_memory: the recurrent-state analogue of
+// check_enough_kv_cache_memory. Throws std::invalid_argument (upstream
+// ValueError) naming needed vs available, the per-sequence slot count, and the
+// knobs a vllm.cpp user can act on. Like upstream it REFUSES rather than
+// silently reducing concurrency: serving 4 sequences when 32 were asked for is a
+// worse outcome than a clear failure.
+//
+// `needed == 0` (no recurrent state) never throws.
+void check_enough_state_memory(int64_t available_memory, int64_t needed_memory,
+                               int max_num_seqs, int num_spec);
+
+// _auto_fit_max_model_len: the length to serve when the caller did NOT pin one.
+// Upstream reduces max_model_len to what the pool holds and logs the reduction;
+// it raises when not even one token fits. `derived_max_model_len` is the
+// checkpoint's own context length (upstream's `original_max`).
+int64_t auto_fit_max_model_len(int64_t derived_max_model_len,
+                               int64_t available_memory,
+                               int64_t bytes_per_block, int block_size);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_CORE_KV_CACHE_UTILS_H_

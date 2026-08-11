@@ -29,6 +29,7 @@ endfunction()
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
+vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
 vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
@@ -94,6 +95,13 @@ vllm_cpp_add_test(test_dspark_sample vllm/v1/spec_decode/test_dspark_sample.cpp)
 target_include_directories(test_dspark_sample PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
 target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# FUSION-DENSE-MIGRATE: executed CPU coverage for the four DENSE model TUs whose
+# gate-up MLP now routes through layers::UnquantizedMlpGateUpMethod (their only
+# other gates are checkpoint-gated + dgx-only).
+vllm_cpp_add_test(test_dense_gate_up_seam_forward
+  vllm/models/test_dense_gate_up_seam_forward.cpp)
+target_include_directories(test_dense_gate_up_seam_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 # ARCH-ONE-SURFACE fold ROW 6: embeddings through the registry/runner path on
 # the committed tiny LlamaModel fixture (see scripts/mm/llama_embed_fixture_gen.py).
 vllm_cpp_add_test(test_llama_embedding_fold
@@ -322,6 +330,8 @@ vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
+# issue #371: the recurrent-state budget (spec widens GDN state by k+1).
+vllm_cpp_add_test(test_kv_state_budget vllm/v1/core/test_kv_state_budget.cpp)
 vllm_cpp_add_test(test_prefix_match_unit vllm/v1/test_prefix_match_unit.cpp)
 vllm_cpp_add_test(test_kv_cache_interface vllm/v1/test_kv_cache_interface.cpp)
 vllm_cpp_add_test(test_block_pool vllm/v1/test_block_pool.cpp)
@@ -617,6 +627,7 @@ target_compile_definitions(test_chat_mm PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
+vllm_cpp_add_test(test_sse_keepalive vllm/entrypoints/openai/test_sse_keepalive.cpp)
 vllm_cpp_add_test(test_openai_run_batch
   vllm/entrypoints/openai/test_run_batch.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream
@@ -957,6 +968,11 @@ target_include_directories(test_gdn_packed_reg_tile PRIVATE ${CMAKE_SOURCE_DIR}/
 # src/vt/cuda/cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h{48,32}).
 vllm_cpp_add_test(test_gdn_packed_decode_triton vt/test_gdn_packed_decode_triton.cpp)
 target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the opt-in fused-GDN decode BV16 value tile. Reaches
+# the CUDA-free selector/geometry header under src/; the executing kernel lives
+# in cuda_gdn.cu and is covered by same-process byte-exact CUDA comparisons.
+vllm_cpp_add_test(test_gdn_decode_fused vt/test_gdn_decode_fused.cpp)
+target_include_directories(test_gdn_decode_fused PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load
 # fast-path flags (VT_FP4_QUANT_FAST + VT_SILU_FP4_FAST, both default OFF /
 # '1'-opt-in). Reaches the internal header under src/ (not public API); the
@@ -1110,6 +1126,9 @@ target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
+# PERF-CPU-ATTN-DTYPE: the hoisted dtype dispatch vs the pre-change per-element
+# switch, memcmp over every dtype the switch handled (spec §3, issue #391).
+vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)
 
@@ -1138,6 +1157,16 @@ target_compile_definitions(test_tokenizer_parity_deepseek PRIVATE
 # is what unblocks the Mistral paged-engine SACRED gate.
 vllm_cpp_add_test(test_tokenizer_parity_mistral vllm/test_tokenizer_parity_mistral.cpp)
 target_compile_definitions(test_tokenizer_parity_mistral PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
+# TOK-LLAMA4-PRE (issue #347) — the GPT-4o / o200k tokenizer parity gate. This
+# family is what a GGUF tags `tokenizer.ggml.pre = "llama4"` (Muse Glimmer 30B).
+# It shares kLlama3's `\p{N}{1,3}` digit grouping but splits CamelCase and keeps
+# the contraction as a word suffix, so an alias would mistokenize silently —
+# only comparing IDS against HF `tokenizers` catches that, which is what this
+# gate does.
+vllm_cpp_add_test(test_tokenizer_parity_gpt4o vllm/test_tokenizer_parity_gpt4o.cpp)
+target_compile_definitions(test_tokenizer_parity_gpt4o PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)

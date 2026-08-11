@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -503,4 +504,216 @@ TEST_CASE("Sampler: logprobs_mode processed_logprobs renormalizes over the kept 
   const double mass = std::exp(static_cast<double>(lt.logprobs[1])) +
                       std::exp(static_cast<double>(lt.logprobs[2]));
   CHECK(mass == doctest::Approx(1.0).epsilon(1e-5));
+}
+
+// ---------------------------------------------------------------------------
+// logprob_token_ids (generative scoring), sampler.py:151-225. WRITTEN, not
+// ported: upstream's only unit test for the field covers the model-config
+// vocab-bounds branch of verify() (tests/v1/sample/test_logprobs.py:413-425),
+// which is our named engine-time deferral; the algorithm itself is exercised
+// upstream only through an HTTP end-to-end over a real model.
+//
+// One request, explicit ids: the row is [sampled | id0 | id1], the logprobs are
+// the raw logprobs AT those ids (not a top-k), and the rank is the sampled
+// token's rank over the FULL vocab.
+//
+// RED before the port: out.logprobs_tensors has NO value — max_num_logprobs is
+// unset and nothing reads sm.logprob_token_ids.
+TEST_CASE("Sampler: logprob_token_ids gathers exactly the requested ids") {
+  // logits [3,1,2,0] -> greedy token 0 (also the max logprob).
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.all_random = false;
+  sm.max_num_logprobs = std::nullopt;  // ONLY logprob_token_ids is set
+  sm.logprob_token_ids = std::map<int, std::vector<int32_t>>{{0, {3, 1}}};
+
+  Sampler sampler;
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.sampled_token_ids[0][0] == 0);
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  CHECK(lt.num_positions == 1);
+  CHECK(lt.num_tokens_per_position == 3);  // max_num_tokens + 1
+  REQUIRE(lt.logprob_token_ids.size() == 3);
+  // Column 0 is the sampled token; then the requested ids IN REQUEST ORDER
+  // (3 then 1) — NOT sorted by logprob, which is the whole point of the field.
+  CHECK(lt.logprob_token_ids[0] == 0);
+  CHECK(lt.logprob_token_ids[1] == 3);
+  CHECK(lt.logprob_token_ids[2] == 1);
+  const float lse = 3.0f + std::log(std::exp(0.0f) + std::exp(-2.0f) +
+                                    std::exp(-1.0f) + std::exp(-3.0f));
+  CHECK(lt.logprobs[0] == doctest::Approx(3.0f - lse));  // sampled (token 0)
+  CHECK(lt.logprobs[1] == doctest::Approx(0.0f - lse));  // token 3
+  CHECK(lt.logprobs[2] == doctest::Approx(1.0f - lse));  // token 1
+  // Rank over the FULL vocab (sampler.py:212-213), not over the 2 requested
+  // ids: the sampled token is the argmax, so rank 1.
+  CHECK(lt.selected_token_ranks[0] == 1);
+}
+
+// Heterogeneous id lists across the batch, plus a row with NO entry at all.
+// Upstream pads to [batch, max_num_tokens + 1] and masks the padding to -inf,
+// keeping column 0 (the sampled token) valid for EVERY row (sampler.py:186-206).
+TEST_CASE("Sampler: logprob_token_ids pads short and absent rows with -inf") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f,    // row 0 -> token 0
+                               0.0f, 7.0f, 0.0f, 0.0f,    // row 1 -> token 1
+                               0.0f, 0.0f, 0.0f, 9.0f};   // row 2 -> token 3
+  Tensor tl = Logits(logits, 3, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.all_random = false;
+  sm.max_num_logprobs = std::nullopt;
+  // row 0 asks for two ids, row 1 for one, row 2 is absent from the map.
+  sm.logprob_token_ids =
+      std::map<int, std::vector<int32_t>>{{0, {2, 3}}, {1, {0}}};
+
+  Sampler sampler;
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  CHECK(lt.num_positions == 3);
+  CHECK(lt.num_tokens_per_position == 3);  // max(2, 1) + 1
+  REQUIRE(lt.logprob_token_ids.size() == 9);
+  const float kNegInf = -std::numeric_limits<float>::infinity();
+
+  // Row 0: full width, no padding.
+  CHECK(lt.logprob_token_ids[0] == 0);
+  CHECK(lt.logprob_token_ids[1] == 2);
+  CHECK(lt.logprob_token_ids[2] == 3);
+  CHECK(lt.logprobs[2] > kNegInf);
+
+  // Row 1: one requested id, then one padded column.
+  CHECK(lt.logprob_token_ids[3] == 1);  // sampled
+  CHECK(lt.logprob_token_ids[4] == 0);  // requested
+  CHECK(lt.logprobs[4] > kNegInf);
+  CHECK(lt.logprobs[5] == kNegInf);     // padded
+
+  // Row 2: absent from the map — column 0 is still its sampled token, and
+  // BOTH remaining columns are padding.
+  CHECK(lt.logprob_token_ids[6] == 3);
+  CHECK(lt.logprobs[6] > kNegInf);
+  CHECK(lt.logprobs[7] == kNegInf);
+  CHECK(lt.logprobs[8] == kNegInf);
+
+  // Ranks are still the full-vocab ranks of each row's sampled token.
+  CHECK(lt.selected_token_ranks[0] == 1);
+  CHECK(lt.selected_token_ranks[1] == 1);
+  CHECK(lt.selected_token_ranks[2] == 1);
+}
+
+// Precedence (sampler.py:133-136): when a request supplies BOTH an explicit id
+// set and a logprobs COUNT, the explicit ids win.
+TEST_CASE("Sampler: logprob_token_ids wins over max_num_logprobs") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.all_random = false;
+  sm.max_num_logprobs = 2;  // would gather the top-2: tokens 0 and 2
+  sm.logprob_token_ids = std::map<int, std::vector<int32_t>>{{0, {3}}};
+
+  Sampler sampler;
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  // The explicit-ids shape ([sampled | 3]), NOT the top-2 shape ([0 | 0 | 2]).
+  CHECK(lt.num_tokens_per_position == 2);
+  REQUIRE(lt.logprob_token_ids.size() == 2);
+  CHECK(lt.logprob_token_ids[0] == 0);
+  CHECK(lt.logprob_token_ids[1] == 3);
+}
+
+// An out-of-range id must be REJECTED loudly, never read past the row.
+// torch.gather raises on an out-of-range index, so this mirrors upstream rather
+// than adding a check upstream lacks. (Issue #249's unbounded `k` lives in
+// GatherLogprobs and is deliberately NOT touched here.)
+TEST_CASE("Sampler: an out-of-vocab logprob_token_id throws") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.all_random = false;
+  sm.max_num_logprobs = std::nullopt;
+  sm.logprob_token_ids = std::map<int, std::vector<int32_t>>{{0, {4}}};  // vocab is 4
+
+  Sampler sampler;
+  Queue q = Q();
+  CHECK_THROWS(sampler.forward(q, tl, sm));
+}
+
+// The empty map is FALSY in Python (`if sampling_metadata.logprob_token_ids:`),
+// so a set-but-empty optional must behave exactly like an unset one.
+TEST_CASE("Sampler: an empty logprob_token_ids map is inert") {
+  std::vector<float> logits = {0.1f, 5.0f, 0.2f, 0.3f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.max_num_logprobs = std::nullopt;
+  sm.logprob_token_ids = std::map<int, std::vector<int32_t>>{};
+
+  Sampler sampler;
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+  CHECK(out.sampled_token_ids[0][0] == 1);
+  CHECK_FALSE(out.logprobs_tensors.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// The two features above COMPOSE, and this pins the composition that the
+// merge of #238 (logprobs_mode) and #264 (logprob_token_ids) creates: they are
+// orthogonal, so `logprobs_mode` decides WHICH tensor the step-1 snapshot holds
+// and `logprob_token_ids` decides WHICH entries step 8 reads out of it.
+//
+// Neither PR could test this on its own -- each was written against a base
+// without the other. Without it the interaction is untested, and the failure it
+// guards is silent: if the snapshot were driven by `max_num_logprobs` alone
+// (sampler.py:86 is an `or`, not an `and`), a request that sets ONLY
+// logprob_token_ids under a processed_* mode would gather out of an EMPTY
+// buffer.
+//
+// The tell is token 1: top_k=2 keeps only tokens 0 and 2, so a PROCESSED
+// snapshot reads -inf there while either RAW snapshot would read a finite
+// value. Column 0 (the sampled token) is deliberately not asserted -- this is a
+// random batch, so which of the two surviving tokens lands there is not fixed.
+TEST_CASE("Sampler: logprob_token_ids reads the PROCESSED snapshot under a processed mode") {
+  std::vector<float> logits = {3.0f, 1.0f, 2.0f, 0.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = false;
+  sm.all_random = true;
+  sm.temperature = std::vector<float>{1.0f};
+  sm.top_k = std::vector<int32_t>{2};
+  sm.max_num_logprobs = std::nullopt;  // ONLY logprob_token_ids is set
+  sm.logprob_token_ids = std::map<int, std::vector<int32_t>>{{0, {2, 1}}};
+
+  Sampler sampler(vllm::v1::LogprobsMode::kProcessedLogprobs);
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  REQUIRE(out.logprobs_tensors.has_value());
+  const auto& lt = *out.logprobs_tensors;
+  REQUIRE(lt.num_positions == 1);
+  REQUIRE(lt.num_tokens_per_position == 3);  // sampled + the two requested ids
+
+  // log_softmax over the SURVIVING pair {3.0, 2.0}, exactly as the
+  // processed_logprobs case above computes it.
+  const float kept_lse = 3.0f + std::log(std::exp(0.0f) + std::exp(-1.0f));
+
+  // Requested id 2 survived top-k, so it carries the RENORMALIZED value.
+  CHECK(lt.logprob_token_ids[1] == 2);
+  CHECK(lt.logprobs[1] == doctest::Approx(2.0f - kept_lse));
+  // Requested id 1 was masked away. -inf here, and NOT the finite raw value,
+  // is the whole proof that the processed tensor is what was gathered from.
+  CHECK(lt.logprob_token_ids[2] == 1);
+  CHECK(lt.logprobs[2] == -std::numeric_limits<float>::infinity());
+  const float raw_lse = 3.0f + std::log(std::exp(0.0f) + std::exp(-2.0f) +
+                                        std::exp(-1.0f) + std::exp(-3.0f));
+  CHECK(lt.logprobs[2] != doctest::Approx(1.0f - raw_lse));
 }
