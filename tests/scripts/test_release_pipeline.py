@@ -416,6 +416,13 @@ class ReleasePipelineContract(unittest.TestCase):
         bad_option = "            --assets-dir verified/assets \\"
         wrong_publish = publish_command.replace(good_option, bad_option)
         plan_command = "          python3 scripts/release_pipeline.py plan \\"
+        flat_publish = (
+            "python3 scripts/release_pipeline.py publish "
+            "--handoff verified/verified-handoff.json "
+            "--assets-dir verified/release-assets "
+            "--index-json verified/release-index.json "
+            "--index-markdown verified/RELEASE_INDEX.md --tag \"$tag\""
+        )
         self.assertIn(publish_command, original)
         self.assertIn(plan_command, original)
 
@@ -463,6 +470,14 @@ class ReleasePipelineContract(unittest.TestCase):
             ).replace(
                 plan_command, publish_command + "\n" + plan_command, 1
             ),
+            "later control segment": original.replace(
+                publish_command,
+                wrong_publish + "\n          true && " + flat_publish,
+                1,
+            ),
+            "publisher followed by control": original.replace(
+                publish_command, publish_command + " && true", 1
+            ),
         }
         for attack, mutant in mutants.items():
             with self.subTest(attack=attack):
@@ -479,6 +494,10 @@ class ReleasePipelineContract(unittest.TestCase):
             "          # gh release create --notes harmless",
             '          echo "gh release upload --clobber harmless"',
             "          note='gh release create harmless'",
+            '          note="gh release upload harmless"',
+            "          note='$(gh release create harmless)'",
+            "          note='`gh release upload harmless`'",
+            '          note="\\$(gh release create harmless)"',
         ):
             with self.subTest(inert=inert):
                 mutant = original.replace(anchor, anchor + "\n" + inert, 1)
@@ -487,6 +506,30 @@ class ReleasePipelineContract(unittest.TestCase):
         for command in (
             '          gh release create "$tag" verified/release-index.json',
             '          gh release upload "$tag" verified/release-index.json',
+        ):
+            with self.subTest(command=command):
+                mutant = original.replace(anchor, anchor + "\n" + command, 1)
+                self.assertIn(
+                    "release workflow must not bypass the byte-bound publisher",
+                    self.checker.validate(mutant),
+                )
+
+    def test_gh_release_bypass_cannot_hide_in_shell_control_or_substitution(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        anchor = '            --tag "$tag"'
+        self.assertIn(anchor, original)
+        for command in (
+            '          true && gh release create "$tag" verified/release-index.json',
+            '          true; gh release upload "$tag" verified/release-index.json',
+            '          note="$(gh release create "$tag")"',
+            '          false || gh release upload "$tag" verified/release-index.json',
+            '          printf x | gh release create "$tag" verified/release-index.json',
+            '          (gh release create "$tag" verified/release-index.json)',
+            '          { gh release upload "$tag" verified/release-index.json; }',
+            '          gh release create "$tag" verified/release-index.json && true',
+            '          true && gh release create "$tag" one; gh release upload "$tag" two',
+            '          note=`gh release upload "$tag" verified/release-index.json`',
+            '          cat <(gh release create "$tag" verified/release-index.json)',
         ):
             with self.subTest(command=command):
                 mutant = original.replace(anchor, anchor + "\n" + command, 1)
