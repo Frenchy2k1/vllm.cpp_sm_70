@@ -695,6 +695,8 @@ Registered in
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
 | POST | `/reset_prefix_cache` | Reset the prefix cache; returns `{"success": bool}` |
+| POST | `/v1/embeddings` | Embeddings. Registered **only** when an embedder is attached, so a text server answers 404 at the route table |
+| POST | `/v1/audio/transcriptions` | Speech to text (multipart: audio as `file`, `response_format` as a form field). Registered **only** when a transcriber is attached |
 | POST | `/v1/videos` | Start a video generation job, returns `{id, status}` (MiniMax-H3) |
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
