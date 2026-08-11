@@ -265,6 +265,59 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_now_derived_is_credited_for_real_commands(self):
+        # ENG-NOW-DERIVED (#374) joins the runnable population on arrival, so it
+        # earns the credit the same way: its spec's Gates section must name
+        # commands that can actually fail. Its gate is the record gate -- no
+        # CUDA, GPU or SACRED gate is implicated because no product source is
+        # touched, and the spec says so rather than leaving the absence unread.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-NOW-DERIVED"), "runnable")
+        spec = (ROOT / ".agents/specs/now-derived.md").read_text(encoding="utf-8")
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
+
+    def test_the_now_derived_re_pin_is_load_bearing(self):
+        # MUTATION: drop the entry and the exact pin must break, so the baseline
+        # is not decorative.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-NOW-DERIVED"}
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_record_conflict_surfaces_is_credited_for_real_commands(self):
+        # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on
+        # arrival, so the credit has to be earned the same way ENG-DOCS-SITE
+        # earns it: the spec's Gates section must name commands that can
+        # actually fail, not prose. This row's gate is the record gate -- no
+        # CUDA, GPU or SACRED gate is implicated because no product source is
+        # touched, and the spec says so rather than leaving the absence
+        # unexplained.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-RECORD-CONFLICT-SURFACES"), "runnable")
+        spec = (ROOT / ".agents/specs/retire-shared-record-surfaces.md").read_text(
+            encoding="utf-8"
+        )
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
+
+    def test_the_baseline_re_pin_is_load_bearing(self):
+        # MUTATION: the re-pin that added this row must be what makes the audit
+        # agree with the baseline. Drop the entry and the exact-pin assertion
+        # above has to go red -- otherwise the baseline is decorative and a row
+        # could enter or leave the runnable population unnoticed, which is the
+        # failure the exact pin exists to catch.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-RECORD-CONFLICT-SURFACES"}
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(
+            runnable,
+            reduced,
+            "removing the row from the baseline must break the pin",
+        )
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
     def test_eng_docs_site_is_credited_for_real_commands(self):
         # ENG-DOCS-SITE joined the runnable population on arrival rather than
         # being parked as gates-no-command, so the credit has to be earned by
