@@ -235,6 +235,26 @@ def _bash_array(text: str, name: str) -> list[str]:
 
 
 class RatchetTests(unittest.TestCase):
+    def test_the_container_rows_credit_rests_on_scripts_that_exist(self):
+        """Why ENG-RELEASE-CONTAINERS is in the baseline, not merely that it is.
+
+        The row was credited on arrival because its spec binds the release chain
+        it inherits -- scripts that exist and genuinely fail on a broken staged
+        tree. Its OWN gates did not exist when it was pinned. If the credit ever
+        came to rest only on scripts the tree does not have, the pin would be a
+        certificate for nothing, and this is the case that catches that.
+        """
+        spec = ROOT / ".agents/specs/container-images.md"
+        self.assertTrue(spec.exists(), "the container spec is the source of the credit")
+        commands = gates.runnable_commands(spec.read_text(encoding="utf-8"))
+        existing = sorted({c for c in commands if (ROOT / c).exists()})
+        self.assertTrue(
+            existing,
+            "every command the container spec cites is absent from the tree; "
+            "the runnable credit rests on nothing",
+        )
+        self.assertIn("scripts/validate-release-archive.py", existing)
+
     def test_the_baseline_matches_the_shipped_record(self):
         # EXACT equality, in both directions, and that is the whole contract:
         # this is an exact pin, not a shrink-only floor. Lowering the baseline

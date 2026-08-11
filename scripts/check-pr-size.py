@@ -267,6 +267,12 @@ CREATION_MUTATIONS = {
     # which fails every case in tests/scripts/test_check_site.py -- including
     # the clean-tree case, which asserts the "nav in bijection" line.
     "scripts/check-site.py": DISABLED_CREATION_CHECKER,
+    # ENG-RELEASE-CONTAINERS. Both suites load the checker as a module and call
+    # into it (check_shape/check_dockerfile, validate), so the disabled stub --
+    # which defines none of them -- fails every case rather than passing a
+    # reduced one.
+    "scripts/check-container-matrix.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-container-workflow.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
@@ -381,6 +387,7 @@ def classify_path(path: str) -> str:
     if path in {
         "release/manifest-v1.schema.json",
         "release/release-matrix.json",
+        "release/container-matrix.json",
         "scripts/env-doc-allowlist.txt",
     }:
         return "configuration"
@@ -388,7 +395,13 @@ def classify_path(path: str) -> str:
         "CMakeLists.txt", ".env.example", ".gitignore", ".dockerignore",
         ".clang-format", ".gitattributes", "flake.lock", "flake.nix",
         "LICENSE", "NOTICE",
-    } or re.fullmatch(r"docker/Dockerfile\.[A-Za-z0-9_.-]+", path):
+    } or re.fullmatch(r"docker/Dockerfile(?:\.[A-Za-z0-9_.-]+)?", path) or re.fullmatch(
+        r"docker/[A-Za-z0-9_.-]+\.sh", path
+    ):
+        # The suffixed form covered docker/Dockerfile.arm64. ENG-RELEASE-CONTAINERS
+        # adds the unsuffixed multi-lane docker/Dockerfile and its healthcheck
+        # script, and this function FAILS CLOSED, so leaving them out rejected the
+        # whole change rather than misclassifying it.
         return "configuration"
     if path.startswith(("src/", "include/", "examples/", "tools/", "cmake/", "tests/", "scripts/", "benchmarks/", "triton_kernels/")):
         return "product"
