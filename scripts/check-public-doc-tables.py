@@ -593,7 +593,24 @@ STATUS_RATCHET = {
     # histories above are kept; this is the single measured value for the merged
     # page; the PENDING paragraph was compressed to pay for itself rather than
     # widen the budget. Strictly DOWN from 243200.
-    "chars": 243188,
+    #
+    #
+    # 243243 since 2026-08-11 (measured 243243): #347 landed, so this page's claim
+    # that the `llama4` / GPT-4o pre-tokenizer is unimplemented stops being
+    # true. The replacement says LESS, not more: the k-quant's ids match HF on
+    # 57/57 and the blocker moved to the forward (#359); the evidence for both
+    # lives in .agents/specs/muse-glimmer.md §12, not here. Net -2.
+    # Strictly DOWN.
+    #
+    # 243186 since 2026-08-11 (measured 243186): the Tekken (#168)
+    # and GPT-4o (#347) pre-tokenizers landed concurrently and each re-pinned
+    # this ratchet against a page the other had not yet touched -- 243188 and
+    # 243243, both stale the moment the other merged. Both histories are kept
+    # above; this is the single MEASURED value for the merged page, which
+    # carries #347's shorter Muse Glimmer wording on top of main's. Re-measured
+    # rather than carried from either PR, and rather than arithmetic on the two:
+    # zero slack is the only honest re-pin. Strictly DOWN from 243188.
+    "chars": 243186,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
