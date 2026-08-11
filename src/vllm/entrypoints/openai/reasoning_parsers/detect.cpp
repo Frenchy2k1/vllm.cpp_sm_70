@@ -23,8 +23,13 @@ namespace {
 // end-token-only </think>, olmo3's plain-vocab <think>) stay EXPLICIT-ONLY:
 // a template-level probe cannot distinguish them from deepseek_r1, and
 // deepseek_r1's split behavior is the correct default for a plain
-// <think>...</think> stream.
+// <think>...</think> stream. muse_glimmer is rowed on the ATEM literal
+// "<atem:function_calls>" that its chat template writes into the
+// tool-definition preamble: a full literal, shared with nothing else here,
+// and the same tell the tool-parser table uses (the two parsers are always
+// selected together).
 constexpr ReasoningParserMarker kReasoningParserMarkers[] = {
+    {"muse_glimmer", "<atem:function_calls>"},
     {"mistral", "[THINK]"},
     {"think_auto", "<think>"},
 };

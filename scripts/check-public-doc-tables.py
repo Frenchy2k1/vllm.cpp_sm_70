@@ -561,6 +561,21 @@ STATUS_RATCHET = {
     # 35B canonical grid while #223 and #238 were landing. RE-MEASURED against the
     # page carrying all three -- 243309 less #223's 10 and #238's 12 -- not carried
     # from any one of them. Strictly DOWN.
+    #
+    # 243283 since 2026-08-11 (measured 243283): the Muse Glimmer speed attempt
+    # (#333) owes this page the reason its GGUF k-quant arm has no e2e -- the
+    # `llama4` / GPT-4o pre-tokenizer we do not implement (#347) -- and it was
+    # paid for OUT of the page, not into it. The Qwen3.5-4B A/B paragraph in
+    # `Performance detail` restated percentages and OPEN ratios that already
+    # live BOTH in .agents/benchmark-record.md and in the evidence file the
+    # paragraph itself links; that duplicate collapsed to its binding result
+    # (throughput 1.021246x PASS, the other three axes OPEN) plus the pointer.
+    # Nothing was lost, only de-duplicated -- every dropped figure was verified
+    # present in both other surfaces first. Net -4. Strictly DOWN.
+    #
+    # 243245 since 2026-08-11 (measured 243245): ENG-RELEASE-CONTAINERS
+    # owes the page a lifecycle line, paid for inside the release
+    # paragraph rather than out of the page. Strictly DOWN.
 
     #
     # 243368 since 2026-08-10 (measured 243368): reconciled once more when the
@@ -572,7 +587,13 @@ STATUS_RATCHET = {
     # current main again; main's newer 27B/35B/dense rows won on their keys and
     # this landing's Qwen3.5-4B row won on its own. Single measured value for
     # the merged page. Strictly DOWN from 243287.
-    "chars": 243200,
+    #
+    # 243188 since 2026-08-11 (measured 243188): the external-PR landing merged
+    # a 50-commit main (Muse Glimmer, #330 Prom refs, containers). Both ratchet
+    # histories above are kept; this is the single measured value for the merged
+    # page; the PENDING paragraph was compressed to pay for itself rather than
+    # widen the budget. Strictly DOWN from 243200.
+    "chars": 243188,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

@@ -31,6 +31,7 @@
 #include "vllm/entrypoints/openai/tool_parsers/minicpm5.h"
 #include "vllm/entrypoints/openai/tool_parsers/minimax_m2.h"
 #include "vllm/entrypoints/openai/tool_parsers/mistral.h"
+#include "vllm/entrypoints/openai/tool_parsers/muse_glimmer.h"
 #include "vllm/entrypoints/openai/tool_parsers/phi4_mini.h"
 #include "vllm/entrypoints/openai/tool_parsers/poolside_v1.h"
 #include "vllm/entrypoints/openai/tool_parsers/xlam.h"
@@ -252,6 +253,11 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   if (name == "seed_oss") {
     return std::make_unique<SeedOssToolParser>();
   }
+  // muse_glimmer_tool_parser.py:183 (register_module("muse_glimmer")) - the
+  // channel-scoped ATEM <atem:function_calls>/<atem:invoke> dialect.
+  if (name == "muse_glimmer") {
+    return std::make_unique<MuseGlimmerToolParser>();
+  }
   return nullptr;
 }
 
@@ -282,6 +288,7 @@ const std::vector<std::string>& tool_parser_names() {
       "kimi_k2",        "glm45",
       "glm47",          "minimax_m2",
       "gemma4",         "seed_oss",
+      "muse_glimmer",
   };
   return names;
 }

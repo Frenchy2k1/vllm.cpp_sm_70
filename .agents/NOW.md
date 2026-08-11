@@ -8,7 +8,7 @@ characters.
 
 ## Live claims
 
-Work: 6 external PRs landed; sm_120 post-conv + K4 opt-in.
+Work: 7 external PRs landed (6 merged + #227 repaired).
 
 | Claim / track | State | Next command or step |
 |---|---|---|
@@ -17,13 +17,12 @@ Work: 6 external PRs landed; sm_120 post-conv + K4 opt-in.
 | Laguna NVFP4 / DS-V4 decode | **CLOSED, byte-exact**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **c1 0.838, c2-c8 0.95-0.97** (#213 levers ACTIVE); c1 unmoved | c1 decode window; 35B canonical |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
-| Invocation-parity | **CLOSED**: re-verified @`812de8ca` | — |
+| Muse Glimmer (#333) | **no speed number**: GGUF tokenizer blocks it (#347) | Fix #347 |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **canonical 0.918-0.972x** c1-c32 (@`348c265d`, first c16/c32) | Decode-only window, ONE tool |
-| Qwen3.5-4B sm_120 | tput **1.0283x** `PENDING`; TTFT/TPOT/E2E 1.085/1.017/1.029x slow | Profile first wave |
+| Qwen3.5-4B sm_120 | tput **1.0283x** `PENDING`; TTFT/TPOT/E2E 1.085/1.017/1.029x | Profile wave |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
-| MXFP4 parity | c1 1.020, c2-c8 0.962-0.969; #82 CLOSED, TERMINAL | — |
 | SERVE-ASYNC-MIRROR | **#323 FIXED** (mitigation): graph declines while the mirror is live; 7/7 async gates | Graph read ids at REPLAY |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
 | `SERVE-METRICS` async (#277) | **`/metrics` was DEAD on the shipped server**: AsyncLLM folded nothing. Now live, ctest 366/366 | Config-gated families |
@@ -32,6 +31,7 @@ Work: 6 external PRs landed; sm_120 post-conv + K4 opt-in.
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
+| Containers `#170` | **cpu+vulkan CI green**; #312 fixed | W6: cuda/arm64; unpushed |
 | `SAMPLE-PROMPT-LOGPROBS` (#223) | **LANDED** 21/21 | W2 `echo`; CUDA PENDING |
 | `logprobs_mode` (#238) | **3 stubs -> all 4 work** | `logprob_token_ids` half |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
@@ -57,7 +57,7 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
    transducer half is NOT in vLLM: separate call).
-3. **Qwen3.5-4B #206:** tput +2.83% `PENDING`; latency/VRAM open
+3. **Qwen3.5-4B #206:** +2.83% `PENDING`; latency/VRAM open.
 4. **Invocation-parity prevention:** CI guard + checklist; build-verify
    `kGemvHeuristicAlgos` on dgx.
 5. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).

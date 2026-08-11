@@ -18140,6 +18140,110 @@ the Laguna-XS-2.1-NVFP4 decode sections. Nothing was edited or dropped.
 | Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |
+
+## Muse Glimmer 30B — the speed attempt (2026-08-11, issue #333, `row/MUSE-BENCH`)
+
+**Outcome: NO binding number on any axis.** Three of four bars are blocked, each
+with a named cause, and the one bar that ran produced a contended single-leg
+datapoint that is explicitly not a result. No ratio appears below, because no
+cell has two quant-matched sides.
+
+Branch `row/MUSE-BENCH` off `row/MODEL-MUSE-GLIMMER` @ `8af36075`.
+Full reasoning in `.agents/specs/muse-glimmer.md` §11.
+
+### The bars
+
+| Bar | Arm | Value | Quant-matched? | Status |
+|---|---|---|---|---|
+| vLLM | any | — | n/a | **OPEN GAP by construction**: the pin carries no `muse_glimmer`. Nothing substituted for it. |
+| llama.cpp `030ebb5` | `muse-glimmer-30B-kquant-17gb.gguf` | pp32 **9.79 t/s**, tg8 **0.79 t/s** (`-r 1 -t 4`, CPU) | **no** — nothing to match it against | **NON-BINDING**, see contention below |
+| ours | same GGUF | — | — | **BLOCKED**: tokenizer refuses `tokenizer.ggml.pre "llama4"` |
+| HF transformers | bf16 safetensors | — | — | **BLOCKED**: dgx GPU lock held all window |
+| ours | bf16 safetensors | — | — | **BLOCKED**: same host; CUDA build not started, deliberately |
+
+### Blocker 1 — our GGUF arm dies in the tokenizer, not the forward
+
+```
+$ build-cpu/examples/vllm-bench \
+    --model /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/muse-glimmer-30B-kquant-17gb.gguf \
+    --num-prompts 1 --concurrency 1 --input-len 32 --output-len 4
+vllm-bench: ... engine | num_prompts=1 input_len=32 output_len=4 concurrency=1 seed=0 temp=0.00
+vllm-bench: failed: tokenizer: unsupported tokenizer.ggml.pre "llama4"
+```
+
+The file carries `tokenizer.ggml.model = gpt2` (accepted) and
+`tokenizer.ggml.pre = llama4`, refused at `src/vllm/tokenizer/tokenizer.cpp:749`.
+llama.cpp routes `llama4` to `LLAMA_VOCAB_PRE_TYPE_GPT4O`, `clean_spaces = false`
+(`src/llama-vocab.cpp:2294-2299`), whose regex pair (`:428-434`) is neither our
+`kLlama3` nor either `kQwen2`. So this is a genuinely missing pre-tokenizer, not
+a missing alias — aliasing it would mistokenize silently (issue #347). **This is why the
+quant-matched llama.cpp cell cannot be filled today**: the GGUF is the only
+artifact both engines can hold, and we cannot open its tokenizer. Our bf16
+against a 4-bit GGUF would report quantization as speed, so it is recorded
+not-comparable rather than published with a caveat.
+
+Note this is upstream of everything §10.6 listed as unproven: the k-quant
+loader's 731/731 tensor accounting still stands, but no forward can be reached
+through the engine until the pre-tokenizer lands.
+
+### Blocker 2 — dgx was correctly busy for the entire window
+
+Another session held `/tmp/gpu` running the 27B/35B online-serving gate
+(`dgx-online-serving.sh --model 27n`, evidence `348c265d…`) from 04:37 onward; it
+advanced 18 -> 23 of ~36 legs across the window. The lock was respected: no GPU
+work was started, and no CUDA build was started either, because a parallel build
+on the same 20-core host would have perturbed a live serving measurement. Both
+bf16 cells are therefore blocked on host availability, not on any technical gap.
+
+### Blocker 3 — the local box could not host a clean measurement either
+
+The measurement host carried four other agents' concurrent builds and test runs
+(`vllm.cpp-bf16out` full test suite, `tp-task25-mutation-ef36c7ad`,
+`vllm.cpp-bug335`, and others). Observed load average over the window: **39.5,
+44.3, 48.2, 63.5, 88.1, 123.2** on 20 cores. The root filesystem hit **100% (435
+MB free)** twice; a rebuildable Docker build cache was pruned (4.58 GB) to let
+the builds proceed, and an unrelated `/tmp` cleanup deleted in-flight compiler
+temporaries mid-build, which was worked around with a private `TMPDIR`.
+
+`.agents/benchmarking.md` requires the noise band to be calibrated from repeated
+identical legs before any delta is read, and requires reproduction on an idle
+box. Under this contention neither is achievable, so the single llama.cpp leg is
+recorded as an artifact of the attempt, not as a measurement. A
+`-p 512 -n 64 -r 3 -t 20` leg was started and abandoned unfinished.
+
+### Recipe (for the re-run, which is owed)
+
+```sh
+# llama.cpp, CPU, Muse support merged 2026-08-10 (PR #26841)
+git clone --depth 1 -b master https://github.com/ggml-org/llama.cpp   # 030ebb5
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DGGML_NATIVE=ON
+cmake --build build -j --target llama-bench
+build/bin/llama-bench -m muse-glimmer-30B-kquant-17gb.gguf -p 512 -n 64 -r 3 -t 20
+
+# ours, CPU-only (no GPU on this host)
+cmake -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF \
+      -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON
+cmake --build build-cpu -j6 --target vllm-bench
+build-cpu/examples/vllm-bench --model muse-glimmer-30B-kquant-17gb.gguf \
+      --num-prompts 1 --concurrency 1 --input-len 512 --output-len 64
+```
+
+Artifacts: bf16 `/mnt/nas_share/checkpoints/muse-glimmer-30b` rev `f84ecc3a0e`,
+59.55 GB over 2 shards, `model_type: muse_glimmer`, 52 layers, hidden 6656,
+32/2 heads, head_dim 128, vocab 202048, `qk_scale_factor` 3.87,
+`post_norm_eps` 1e-8. GGUF `/mnt/nas_share/checkpoints/muse-glimmer-30b-gguf`
+rev `2fb01e4e6f`, `muse-glimmer-30B-kquant-17gb.gguf` 16,756,681,056 bytes,
+arch `muse-glimmer`, 731 tensors, file_type 15 (Q4_K_M), block_count 52,
+sliding_window 2048. Both read over a CIFS `soft` mount at ~117 MB/s.
+
+### What these numbers do and do not establish
+
+They establish that llama.cpp master loads and runs this GGUF on CPU, and that
+our engine cannot yet reach a forward on it for a reason that is now named and
+located. They establish **nothing** about how fast vllm.cpp runs Muse Glimmer,
+nothing about how it compares to any engine, and nothing about vLLM — which
+remains the only bar that counts and remains unavailable. **No ceiling is
+claimed or implied anywhere in this entry.**
 ## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
 
 **Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
