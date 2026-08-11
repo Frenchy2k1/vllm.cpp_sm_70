@@ -6,6 +6,7 @@
 #include <unistd.h>
 #endif
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +32,28 @@ std::string Utf8Path(const std::filesystem::path& path) {
   return std::string(bytes.begin(), bytes.end());
 }
 
+std::filesystem::path UniqueTempPath(const std::string& prefix,
+                                     const std::string& suffix = {}) {
+  static std::atomic<uint64_t> counter{0};
+  static const uint64_t process_nonce = [] {
+    std::random_device random;
+    return (static_cast<uint64_t>(random()) << 32) ^ random();
+  }();
+  return std::filesystem::temp_directory_path() /
+         (prefix + std::to_string(process_nonce) + "_" +
+          std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) +
+          suffix);
+}
+
+std::filesystem::path CreateUniqueTempDirectory(const std::string& prefix) {
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    std::filesystem::path path = UniqueTempPath(prefix);
+    std::error_code error;
+    if (std::filesystem::create_directory(path, error)) return path;
+  }
+  throw std::runtime_error("failed to create safetensors test directory");
+}
+
 // Little-endian u64, as the safetensors header-length prefix requires.
 std::string U64Le(uint64_t v) {
   std::string s(8, '\0');
@@ -49,10 +72,8 @@ std::string MakeSafetensors(const std::string& header, const std::string& data) 
 class TempFile {
  public:
   explicit TempFile(const std::string& bytes) {
-    static int counter = 0;
-    native_path_ = std::filesystem::temp_directory_path() /
-                   ("vllm_safetensors_test_" + std::to_string(counter++) +
-                    ".safetensors");
+    native_path_ =
+        UniqueTempPath("vllm_safetensors_test_", ".safetensors");
     path_ = Utf8Path(native_path_);
     std::ofstream out(native_path_, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -71,16 +92,15 @@ class TempFile {
 class NamedTempFile {
  public:
   NamedTempFile(const std::filesystem::path& name, const std::string& bytes)
-      : path_(std::filesystem::temp_directory_path() / name) {
-    std::error_code ignored;
-    std::filesystem::remove(path_, ignored);
+      : root_(CreateUniqueTempDirectory("vllm_safetensors_named_")),
+        path_(root_ / name) {
     std::ofstream out(path_, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     if (!out) throw std::runtime_error("failed to write safetensors test file");
   }
   ~NamedTempFile() {
     std::error_code ignored;
-    std::filesystem::remove(path_, ignored);
+    std::filesystem::remove_all(root_, ignored);
   }
   NamedTempFile(const NamedTempFile&) = delete;
   NamedTempFile& operator=(const NamedTempFile&) = delete;
@@ -88,22 +108,20 @@ class NamedTempFile {
   std::string utf8_path() const { return Utf8Path(path_); }
 
  private:
+  std::filesystem::path root_;
   std::filesystem::path path_;
 };
 
 class TempDirectory {
  public:
-  explicit TempDirectory(const std::filesystem::path& suffix) {
-    std::random_device random;
-    for (int attempt = 0; attempt < 32; ++attempt) {
-      root_ = std::filesystem::temp_directory_path() /
-              std::filesystem::path(U"vllm_safetensors_caf\u00e9_\u6a21\u578b_");
-      root_ += std::to_string((static_cast<uint64_t>(random()) << 32) ^ random());
-      path_ = root_ / suffix;
-      std::error_code error;
-      if (std::filesystem::create_directories(path_, error)) return;
+  explicit TempDirectory(const std::filesystem::path& suffix)
+      : root_(CreateUniqueTempDirectory("vllm_safetensors_dir_")),
+        path_(root_ / suffix) {
+    std::error_code error;
+    if (!std::filesystem::create_directories(path_, error)) {
+      std::filesystem::remove_all(root_, error);
+      throw std::runtime_error("failed to create safetensors test directory");
     }
-    throw std::runtime_error("failed to create safetensors test directory");
   }
   ~TempDirectory() {
     std::error_code ignored;
@@ -534,6 +552,23 @@ TEST_CASE("safetensors index: shard names with path components throw") {
   TempFile traverse(R"({"weight_map":{"a":"../../etc/passwd"}})");
   CHECK_THROWS_AS(vllm::LoadSafetensorsIndex(traverse.path()),
                   std::runtime_error);
+  TempFile backslash(
+      R"({"weight_map":{"a":"sub\\model.safetensors"}})");
+  CHECK_THROWS_WITH_AS(vllm::LoadSafetensorsIndex(backslash.path()),
+                       doctest::Contains("plain filename"),
+                       std::runtime_error);
+}
+
+TEST_CASE("safetensors temp fixtures isolate simultaneous caller names") {
+  TempFile first("first");
+  TempFile second("second");
+  CHECK(first.path() != second.path());
+
+  const std::filesystem::path name(
+      U"vllm_mapping_collision_caf\u00e9_\u6a21\u578b.bin");
+  NamedTempFile named_first(name, "first");
+  NamedTempFile named_second(name, "second");
+  CHECK(named_first.path() != named_second.path());
 }
 
 #if defined(__linux__)

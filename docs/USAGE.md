@@ -156,10 +156,10 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
-Model and checkpoint paths are passed through the host's native filesystem
-encoding, including Unicode paths on Windows. Native Windows release artifacts
-are not published yet; they will remain unavailable until the
-`v0.0.3-pre.1` prerelease build and publication gates succeed.
+GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
+host's native filesystem encoding, including Unicode paths on Windows. Native
+Windows release artifacts are not published yet; they will remain unavailable
+until the `v0.0.3-pre.1` prerelease build and publication gates succeed.
 
 Two more example binaries ship alongside it:
 
