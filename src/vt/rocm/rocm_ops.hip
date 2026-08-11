@@ -67,6 +67,17 @@ void GdnPrefillKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
 void GdnDecodeKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta,
                          Tensor& state, const Tensor* state_idx, const GdnArgs& args);
+// BACKEND-ROCM-GDN-KERNELS family 5 (rocm_gdn_fused.hip): gated RMSNorm,
+// sigmoid gate, and the fused full-attention preamble.
+void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                            const Tensor& w, const RmsNormGatedArgs& args);
+void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
+                               const Tensor& gate);
+void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                                  const Tensor& qgate, const Tensor& kf,
+                                  const Tensor& q_norm, const Tensor& k_norm,
+                                  const Tensor& cos_sin, const RmsNormArgs& na,
+                                  const RopeArgs& ra);
 
 namespace {
 
@@ -143,6 +154,15 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelRocm)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelRocm)));
+    RegisterOp(OpId::kRmsNormGated, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<RmsNormGatedFn>(&RmsNormGatedKernelRocm)));
+    RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
+    RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
   }
 } registrar;
 
