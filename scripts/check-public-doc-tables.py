@@ -511,7 +511,7 @@ STATUS_RATCHET = {
     #
     # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
     # superseded allowlist clause into the binding result. Strictly DOWN.
-    "chars": 243399,
+    "chars": 243378,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
