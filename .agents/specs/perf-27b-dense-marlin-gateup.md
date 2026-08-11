@@ -60,9 +60,10 @@ AGENTS.md §"Shared seams": "Route mergeable MLP projections through
 2. In `DenseMlpBlock`, when the CUTLASS W4A4 merged branch is ineligible and the
    new predicate holds, call the fused Marlin pair instead of two
    `MatmulNvfp4MarlinD` launches, then feed the existing `[T,2I]` silu/mul sink.
-3. Behind an env toggle for a same-binary A/B, default **OFF** in this row.
+3. Behind an env toggle for a same-binary A/B, default **OFF** while unmeasured.
    Flip the default only after the A/B measures a win, per the standing lesson
-   that a lever's default moves on evidence.
+   that a lever's default moves on evidence. **The A/B measured a win and the
+   default is now ON** -- see `## Outcome`.
 4. Do NOT duplicate `MarlinDensePairResident`. Reuse it. If its keying (`const
    Nvfp4Weight* gate`) does not admit the dense weights, extend the existing
    cache rather than adding a parallel one — a hand-rolled second resident is
@@ -100,7 +101,7 @@ AGENTS.md §"Shared seams": "Route mergeable MLP projections through
   unreachable as designed. STOP and report; do not silently relax the equality,
   which would change numerics.
 - If the A/B measures flat, record the negative with its regime and do NOT flip
-  the default.
+  the default. (NOT triggered: the A/B separated completely at both c1 and c8.)
 
 ## 7. Honest sizing
 
@@ -108,3 +109,77 @@ This targets **29%** of a measured +4.40 ms/step gap, i.e. ~1.26 ms of 84.85
 (~1.5%). On its own it would move the 27B from 0.9561x to roughly 0.970x. It
 does NOT reach parity. The larger term is the cuDNN fp8 tower at 48%, which is
 a separate row. Nothing here should be described as closing the gap.
+
+## Outcome
+
+**Landed and measured. The default is ON.**
+
+### What was measured
+
+Same-binary interleaved A/B, `VT_DENSE_MARLIN_GATEUP` the only variable, 4 reps
+per arm, caches dropped between arms, FA2 marker verified in the configure log,
+and the toggle verified present in the binary -- an A/B against a binary lacking
+the toggle silently compares OFF against OFF and reports a confident zero.
+
+| c | split mean | fused mean | effect |
+|---|---:|---:|---:|
+| 1 | 11.8313 (spread 1.0051) | 12.0823 (spread 1.0120) | **+2.12%** |
+| 8 | 82.2217 (spread 1.0054) | 83.6186 (spread 1.0102) | **+1.70%** |
+
+Complete separation at both concurrencies -- every fused rep beats every split
+rep (c1: min fused 12.0203 > max split 11.8729; c8: min fused 83.2511 > max
+split 82.4959). 4/4 paired, effect well outside each arm's measured spread.
+
+### The mechanism, proven rather than inferred
+
+A throughput A/B cannot distinguish a working lever from one silently not taken
+-- both can read flat. A decode-window trace counted the launches on the SAME
+binary, both arms passing the integrality check (0/20 non-integral):
+
+| arm | Marlin calls/step | Marlin ms/step | GPU busy ms/step |
+|---|---:|---:|---:|
+| split | **193.000** | 46.7747 | 84.5544 |
+| fused | **129.000** | 45.4176 | 83.1344 |
+| vLLM (reference) | **129** | 45.8048 | 80.4492 |
+
+We now issue **exactly vLLM's 129 Marlin calls per step** -- 129.000 against 129
+-- and our Marlin time is marginally better than the reference's. GPU busy fell
+1.42 ms/step (-1.68%), independently corroborating the A/B from a different
+instrument.
+
+### Numerics
+
+**Tokens identical between arms**, verified by a greedy 64-token continuation
+captured on each arm and diffed.
+
+Byte-identity was deliberately NOT asserted, and this spec's original §4/§5
+wording demanding it was **wrong**. Marlin's fp32 split-K groups K-slices
+differently for a `[2N,K]` operand than for two `[N,K]` operands -- ~1 bf16 ULP
+on ~0.1% of elements, recorded from a measured run at
+`tests/vllm/model_executor/layers/test_linear_method.cpp:190-202`. The
+implementer refused to write a gate it knew to be false and used token-exactness
+instead, the bar the sibling shared-expert pair flipped ON under. That was the
+correct call, and it held: the ULP moved no tokens.
+
+### What this did NOT establish
+
+A new **parity ratio**. The A/B harness reads 11.83 tok/s at c1 where the
+canonical binding grid reads 10.756 -- a different denominator. Translating a
+percentage across harnesses is the error that produced the 0.964-vs-0.867
+confusion earlier in this campaign, where two ratios 8x apart in absolute scale
+were compared as equivalent. The binding number requires re-running the
+canonical grid against vLLM with the default ON, and is **owed**.
+
+### Where it leaves the gap
+
+The measured 27B gap was +4.40 ms/step (#365). This row closes ~1.42 ms of it,
+**32%**. Remaining **+2.68 ms**: the fp8 tower at +2.12 and an unattributed
+residue at +1.02, with Marlin now a -0.39 credit. GPU-busy ratio 0.948 -> 0.968.
+
+The tower term was **reframed** during this row: vLLM does not reach cuDNN
+through any linear layer -- those kernels come from torch/Inductor, and
+`matMul_pointwise_pointwise` is cuDNN's fusion engine folding the epilogue into
+the GEMM. So that gap is **epilogue fusion**, not a missing dependency, and
+`vt::FusedChain` is the named seam. That row must map the kernels via NVTX
+scopes before implementing -- inferring instead of tracing already caused one
+retraction in this campaign.
