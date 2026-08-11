@@ -20,7 +20,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Invocation-parity | **CLOSED** (row was STALE; STATUS had it since 08-04): re-verified @`812de8ca` | — |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
-| 35B mid-band | **2 LANDED**: gate_up +1.31%, down bf16 +2.05%; SILU NEGATIVE | Decode-only window, ONE tool |
+| 35B mid-band | **canonical 0.918-0.972x** c1-c32 (@`348c265d`, first c16/c32) | Decode-only window, ONE tool |
 | Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; tput 1.021x PASS; latency/VRAM OPEN | Spike 1.609x conv gap |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969; #82 CLOSED | TERMINAL: at parity |
