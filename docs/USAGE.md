@@ -737,12 +737,15 @@ shared forward consumes them in a form a block encoding cannot take.
 
 Three caveats:
 
-- **The k-quant does not generate coherent text yet** ([#359](https://github.com/mudler/vllm.cpp/issues/359)).
-  It loads, tokenizes correctly and runs a forward, but emits degenerate output
-  (`" is is is ..."`) where llama.cpp on the same file does not. The GGUF
-  tokenizer gap that used to stop it before the forward
+- **The k-quant generates coherent text, but is not token-exact against
+  llama.cpp.** Two defects had to be fixed to get there: the GGUF tokenizer gap
   ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
-  GPT-4o / o200k family) is fixed.
+  GPT-4o / o200k family) and the converter's Q/K RoPE row permutation
+  ([#359](https://github.com/mudler/vllm.cpp/issues/359), which produced
+  `" is is is ..."`). `"The capital of France is"` at `--temperature 0` now
+  continues `" Paris. The capital of France is Paris. ..."`. llama.cpp on the
+  same file agrees on the first token and then diverges; whether that residual is
+  quantization drift or a second defect is open.
 - **Image and video need the bf16 safetensors.** The released
   `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
   axis, so half the weight is not in the file; loading it is refused by name.
