@@ -165,18 +165,22 @@ TEST_CASE("direct upload: the borrow keeps the mapping alive past ~SafetensorsFi
   {
     vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
     w = vllm::dense_loaders::LoadBf16Direct(ResolverFor(st), "w");
-    expected.assign(reinterpret_cast<const uint16_t*>(w.bytes.data()),
-                    reinterpret_cast<const uint16_t*>(w.bytes.data()) +
-                        kRows * kCols);
+    expected.resize(kRows * kCols);
+    for (size_t i = 0; i < expected.size(); ++i) {
+      std::memcpy(&expected[i], w.bytes.data() + i * sizeof(uint16_t),
+                  sizeof(uint16_t));
+    }
   }
   // The SafetensorsFile is gone. This is the lifetime question the lazy upload
   // poses: the mapping must still be readable here, because ResidentWeight runs
   // long after the loader returned and the shards were released.
   REQUIRE(w.bytes.size() == kBf16Bytes);
-  const auto* got = reinterpret_cast<const uint16_t*>(w.bytes.data());
-  for (size_t i = 0; i < expected.size(); ++i) CHECK(got[i] == expected[i]);
-  for (size_t i = 0; i < expected.size(); ++i)
-    CHECK(got[i] == static_cast<uint16_t>(0x3f00 + i));
+  for (size_t i = 0; i < expected.size(); ++i) {
+    uint16_t got;
+    std::memcpy(&got, w.bytes.data() + i * sizeof(uint16_t), sizeof(got));
+    CHECK(got == expected[i]);
+    CHECK(got == static_cast<uint16_t>(0x3f00 + i));
+  }
 }
 
 TEST_CASE("direct upload: OFF copies, and both arms load the SAME bytes") {

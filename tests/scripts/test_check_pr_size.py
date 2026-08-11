@@ -95,7 +95,16 @@ class PathClassification(unittest.TestCase):
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
             "release/release-matrix.json": "configuration",
+            "release/container-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
+            # The container lane images. `docker/Dockerfile.arm64` already
+            # classified through the suffixed pattern, but the unsuffixed
+            # multi-lane Dockerfile and its healthcheck did not, and
+            # classify_path FAILS CLOSED -- so adding them to the tree made the
+            # PR-size gate reject the change outright.
+            "docker/Dockerfile": "configuration",
+            "docker/Dockerfile.arm64": "configuration",
+            "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
         }
         for path, path_class in expected.items():
@@ -340,6 +349,11 @@ class BudgetEnforcement(unittest.TestCase):
             # in the same PR has no BASE version to mutate, so it registers the
             # disabled form its own tests must reject.
             "scripts/check-site.py",
+            # 2026-08-10: the container-image gates (#170). Both suites load the
+            # checker as a module and call into it, so the disabled stub fails
+            # every case rather than quietly passing a reduced one.
+            "scripts/check-container-matrix.py",
+            "scripts/check-container-workflow.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

@@ -539,7 +539,22 @@ STATUS_RATCHET = {
     # 35B canonical grid while #223 and #238 were landing. RE-MEASURED against the
     # page carrying all three -- 243309 less #223's 10 and #238's 12 -- not carried
     # from any one of them. Strictly DOWN.
-    "chars": 243287,
+    #
+    # 243283 since 2026-08-11 (measured 243283): the Muse Glimmer speed attempt
+    # (#333) owes this page the reason its GGUF k-quant arm has no e2e -- the
+    # `llama4` / GPT-4o pre-tokenizer we do not implement (#347) -- and it was
+    # paid for OUT of the page, not into it. The Qwen3.5-4B A/B paragraph in
+    # `Performance detail` restated percentages and OPEN ratios that already
+    # live BOTH in .agents/benchmark-record.md and in the evidence file the
+    # paragraph itself links; that duplicate collapsed to its binding result
+    # (throughput 1.021246x PASS, the other three axes OPEN) plus the pointer.
+    # Nothing was lost, only de-duplicated -- every dropped figure was verified
+    # present in both other surfaces first. Net -4. Strictly DOWN.
+    #
+    # 243245 since 2026-08-11 (measured 243245): ENG-RELEASE-CONTAINERS
+    # owes the page a lifecycle line, paid for inside the release
+    # paragraph rather than out of the page. Strictly DOWN.
+    "chars": 243245,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

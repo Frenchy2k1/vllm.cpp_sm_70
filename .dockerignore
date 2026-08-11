@@ -1,5 +1,12 @@
 build*/
 **/build*/
+# Docker's ignore patterns do NOT honour a trailing slash as "directories only"
+# the way .gitignore does, so the two lines above also match FILES named build*
+# -- which silently removed scripts/build-cpu-release.sh and
+# scripts/build-linux-accelerator-release.sh from the context and made the
+# container builds fail with "not found". The lane images call those scripts as
+# their single build definition, so re-include them explicitly.
+!scripts/build-*.sh
 .git/
 .hf-cache/
 *.gguf

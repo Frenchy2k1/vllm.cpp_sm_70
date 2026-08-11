@@ -32,14 +32,14 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 ## Capability status
 
 Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**, moving
-**100.2 -> 81.3 GiB** ([detail](../.agents/specs/load-direct-upload.md)). Startup (provisional) —
-27B-NVFP4 first `/health` **36.51 s vs vLLM's 221.51 s = 6.07x**
-([detail](../.agents/specs/startup-latency-axis.md)).
+**100.2 -> 81.3 GiB** ([detail](../.agents/specs/load-direct-upload.md)). Startup (provisional)
+**6.07x** ([detail](../.agents/specs/startup-latency-axis.md)).
 
-Binary releases: required W1-W11/W13 are implemented in draft #196; local CPU,
-Vulkan, archive, metadata and mutation gates are green. The hosted eight-tuple
-dry run and tagged publication remain pending, so no binary is published. W12
-per-SM diagnostics remain optional. See [RELEASES](RELEASES.md).
+Releases: W1-W11/W13 are implemented in #196; local CPU, Vulkan, archive,
+metadata and mutation gates are green, while the hosted eight-tuple dry run and
+tagged publication stay pending, so no binary is published. Container
+images (#170): the cpu lane passes its gate; nothing is published.
+See [RELEASES](RELEASES.md).
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
 append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.
@@ -428,7 +428,9 @@ recurrences + fused attn preamble; 27B prefill 21.5x, decode
 on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
 (**blind-written, unverified**); M2 needs verification; gfx1201 hipBLAS +
 Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
-[guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
+[guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
+GGUF k-quant arm loads but cannot generate**: its `tokenizer.ggml.pre` is
+`llama4` (GPT-4o family), which we do not implement (#347). **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
 `device_communicators` across multi-GPU TP+PP, 2×DGX-Spark over ConnectX-7
@@ -1298,12 +1300,10 @@ same-binary rollback. Rebased-main graph-node `nsys` confirms the mechanism:
 causal-conv falls from **718.704 to 233.955 ms (3.072x)**, leaving **1.609x**
 to vLLM. The profiled whole run improves **2.272%** with identical token files.
 
-The enclosing A/B improves total/output **2.152%**, TTFT **2.945%**, TPOT/ITL
-**1.920%** and E2E latency **2.118%** without a local VRAM regression. Against
-the sealed same-workload vLLM baseline, throughput is **1.021246x PASS**; TTFT
-is **1.085812x OPEN**, TPOT/ITL **1.024597x OPEN**, and mean peak VRAM
-13053.3/12820 MiB OPEN. Fresh 18-leg oracle attempts were VOID JIT-environment
-runs and do not replace the sealed denominator.
+Against the sealed same-workload vLLM baseline throughput is
+**1.021246x PASS**; TTFT, TPOT/ITL and peak VRAM are **OPEN**. The A/B
+percentages, the exact OPEN ratios and the VOID 18-leg oracle attempts stay
+verbatim in `.agents/benchmark-record.md` and the evidence file below.
 
 This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
 reproduction:
