@@ -61,6 +61,13 @@ never used.
 grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
 ```
 
+Which fast paths a given architecture compiles is decided by the CUDA feature
+table, not by the arch string alone. `110` (Jetson Thor) builds the portable
+kernels plus the vendored Marlin NVFP4 W4A16 GEMM; the CUTLASS FP4/FP8 paths and
+`fp4-mma` stay off there because no kernel body exists for it. `cmake -P
+cmake/CudaArchFeaturesTest.cmake` prints the resolution for any target list
+without a GPU or a CUDA toolkit.
+
 It previously reported the toolkit's detected default (typically `75`) no matter
 what was requested, because the project set the variable without writing it back
 to the cache. Only the report was wrong — the emitted gencode always followed the
