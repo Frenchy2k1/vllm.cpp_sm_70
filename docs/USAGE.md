@@ -872,6 +872,15 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
 
+`Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
+from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
+`raw_logits` are snapshotted before any logits processor runs, so they describe
+the MODEL's distribution; `processed_logprobs` and `processed_logits` are taken
+after temperature and top-k/top-p, so they describe the distribution actually
+SAMPLED from — a token top-k masked away reads `-inf` there and its true value
+under the raw pair. It is selectable by constructing a `Sampler` directly; there
+is no config, CLI or request field for it yet.
+
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
 per position.
