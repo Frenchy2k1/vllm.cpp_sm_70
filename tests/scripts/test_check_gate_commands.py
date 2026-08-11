@@ -110,7 +110,7 @@ class ShippedRecordTests(unittest.TestCase):
     def test_the_audit_covers_every_gated_state(self):
         self.assertEqual(
             gates.GATED_STATES,
-            frozenset({"READY", "ACTIVE", "GATING", "DONE", "BLOCKED"}),
+            frozenset({"READY", "ACTIVE", "GATING", "BLOCKED"}),
         )
         # ...and audit() must actually FILTER on it. Asserting the constant's
         # literal value pins nothing about the denominator: deleting the state
@@ -265,26 +265,28 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
-    def test_now_derived_is_credited_for_real_commands(self):
-        # ENG-NOW-DERIVED (#374) joins the runnable population on arrival, so it
-        # earns the credit the same way: its spec's Gates section must name
-        # commands that can actually fail. Its gate is the record gate -- no
-        # CUDA, GPU or SACRED gate is implicated because no product source is
-        # touched, and the spec says so rather than leaving the absence unread.
+    def test_now_derived_left_the_gated_population_cleanly(self):
+        # ENG-NOW-DERIVED (#374) shipped W1-W5 and reached DONE. Closure removes
+        # it from both sides of the exact pin; it is not assigned a weaker
+        # verdict and its implementation evidence remains in the record.
         verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
-        self.assertEqual(verdicts.get("ENG-NOW-DERIVED"), "runnable")
-        spec = (ROOT / ".agents/specs/now-derived.md").read_text(encoding="utf-8")
-        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
-            with self.subTest(command=command):
-                self.assertIn(command, spec)
+        self.assertIsNone(verdicts.get("ENG-NOW-DERIVED"))
+        self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
 
-    def test_the_now_derived_re_pin_is_load_bearing(self):
-        # MUTATION: drop the entry and the exact pin must break, so the baseline
-        # is not decorative.
-        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-NOW-DERIVED"}
-        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
-        self.assertNotEqual(runnable, reduced)
-        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+    def test_re_adding_done_to_the_gated_population_breaks_the_pin(self):
+        # MUTATION: restoring the departed lifecycle state must expose the three
+        # runnable DONE rows and disagree with the re-pinned baseline.
+        original = gates.GATED_STATES
+        gates.GATED_STATES = frozenset(original | {"DONE"})
+        try:
+            runnable = {
+                r["id"] for r in gates.audit() if r["verdict"] == "runnable"
+            }
+        finally:
+            gates.GATED_STATES = original
+        departed = {"ENG-ASYNC-SCHED", "SERVE-HTTP-TRANSPORT", "ENG-NOW-DERIVED"}
+        self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
+        self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
     def test_record_conflict_surfaces_is_credited_for_real_commands(self):
         # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on
