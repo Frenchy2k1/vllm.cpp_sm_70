@@ -410,9 +410,16 @@ moved on a same-binary A/B: interleaved 4 reps per arm on
 variable measured **+2.12% at c1 and +1.70% at c8**, every fused rep beating
 every split rep at both concurrencies, and the 64-token greedy continuation
 identical on both arms. It is still only ~29% of a measured +4.40 ms/step gap on
-the 27B and does not reach parity on its own. It applies only to a W4A16 pair
-whose two shards share a global scale; a true-W4A4 checkpoint already takes the
-merged CUTLASS path instead.
+the 27B and does not reach parity on its own. It applies only to an **NVFP4**
+W4A16 pair whose two shards share a global scale; a true-W4A4 checkpoint already
+takes the merged CUTLASS path instead, and a **dense MXFP4** pair is refused and
+keeps the split pair. That MXFP4 refusal is deliberate: the fused entry point the
+dense MLP reaches is NVFP4-only — it sizes the merged block-scale grid at K/16
+and pins `group_size = 16` — so admitting group-32 E8M0 scales would misread them
+as group-16 fp8-e4m3, the defect this project already recorded for the sibling
+implementation. No dense loader produces MXFP4 today, so the refusal changes no
+shipped configuration; it stops one future loader line from silently selecting a
+mis-scaled kernel.
 
 The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
 f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
