@@ -511,6 +511,27 @@ a stop token early.
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
 
+#### Context length vs the KV pool
+
+The KV pool holds `--num-blocks × --block-size` tokens — `256 × 32 = 8192` by
+default. A request longer than that can never be scheduled, so the engine
+refuses it early rather than leaving it in the waiting queue forever. Two checks
+do that, mirroring vLLM:
+
+- **At startup.** If `--max-model-len` is given and the pool cannot hold one
+  sequence that long, the server exits with the sizes and the flags that close
+  the gap (vLLM's `_check_enough_kv_cache_memory`). If it is **not** given, the
+  serving length is auto-fitted down to what the pool holds and logged
+  (vLLM's `_auto_fit_max_model_len`) — so raising `--num-blocks` is what buys a
+  longer context.
+- **At admission.** A prompt at or past the resolved `max_model_len` is
+  rejected with **HTTP 400** (`BadRequestError`) naming both lengths, exactly as
+  vLLM's `_validate_prompt_len` does. It is never a finish reason and never a
+  500.
+
+Set `VT_ENGINE_STEP_LOG=1` to print a per-step engine heartbeat if you need to
+confirm that a quiet engine is idle rather than stalled.
+
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.
