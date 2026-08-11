@@ -348,9 +348,34 @@ class ReleasePipelineContract(unittest.TestCase):
                 self.assertIn(fragment, original)
                 mutant = original.replace(fragment, fragment.replace("release-assets", "assets"), 1)
                 self.assertIn(
-                    "release workflow must isolate transient release assets from checkout assets",
+                    "release workflow must bind each handoff stage to its declared root",
                     self.checker.validate(mutant),
                 )
+
+    def test_asset_download_root_cannot_be_compensated_by_plan_download(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        plan_download = """          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: plan
+          merge-multiple: true"""
+        asset_download = """          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
+          path: release-assets
+          merge-multiple: true"""
+        self.assertIn(plan_download, original)
+        self.assertIn(asset_download, original)
+
+        mutant = original.replace(
+            plan_download,
+            plan_download.replace("path: plan", "path: release-assets"),
+            1,
+        ).replace(
+            asset_download,
+            asset_download.replace("path: release-assets", "path: assets"),
+            1,
+        )
+        self.assertIn(
+            "release workflow must bind each handoff stage to its declared root",
+            self.checker.validate(mutant),
+        )
 
     def test_flat_extraction_cannot_be_compensated_by_an_upload(self) -> None:
         original = WORKFLOW.read_text(encoding="utf-8")

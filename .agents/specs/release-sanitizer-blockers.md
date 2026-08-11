@@ -211,8 +211,10 @@ immutable review and the operator's post-review gate remain pending.
   `vt::LoadUnaligned` primitive. The observed CPU-op and Laguna sites are
   defined without changing mmap borrowing. Replaying the full direct-upload
   target exposed one additional instance of the same defect in the shared BF16
-  transpose fallback; it was repaired through the same primitive rather than
-  widened into an unrelated loader refactor.
+  transpose fallback; fresh review then found the resident `LagunaGraph::Step`
+  gather had retained its typed BF16 read. Both ordinary and resident-graph
+  embedding now share one byte-addressed staging seam, directly covered with a
+  borrowed BF16 row beginning at an odd byte offset.
 - `set_stat_logger(nullptr)` is now a synchronous detach barrier. The output
   handler holds the attachment lock through its final `Record`, while `Record`
   remains outside `output_processor_mutex_`. The server's declaration order
@@ -221,11 +223,16 @@ immutable review and the operator's post-review gate remain pending.
 - Every release handoff stage now uses `release-assets` (nested as
   `unverified/release-assets` and `verified/release-assets`). Immutable artifact
   IDs, flat extraction, exact inventory, attestation, and publication remain
-  unchanged. A checkout `favicon.png` in the handoff root is still rejected.
+  unchanged. Fresh mutation review proved that global fragment counts could be
+  compensated by changing an unrelated download; the checker now binds each
+  exact artifact ID, job, step, and upload to its declared root. A checkout
+  `favicon.png` in the handoff root is still rejected.
 - Address+undefined sanitizer replay passed all six executables that failed in
   CI; the complete direct-upload target passed 14 cases / 183 assertions after
   the extra transpose repair. ThreadSanitizer passed the detach regression and
   the complete engine target (15 cases / 295 assertions) using
   `setarch x86_64 -R` to avoid this host's pre-main GCC TSan mapping failure.
-  The non-sanitized focused suite passed all four targets, and the release
-  pipeline suite passed all 19 tests including each stage mutation.
+  The non-sanitized focused suite passed all four targets. The post-review
+  Laguna replay passed 4 cases / 63 assertions under combined address and
+  undefined sanitizers, and the release pipeline suite passed all 20 tests,
+  including the cross-download compensation mutation.
