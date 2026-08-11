@@ -610,7 +610,15 @@ STATUS_RATCHET = {
     # carries #347's shorter Muse Glimmer wording on top of main's. Re-measured
     # rather than carried from either PR, and rather than arithmetic on the two:
     # zero slack is the only honest re-pin. Strictly DOWN from 243188.
-    "chars": 243186,
+    #
+    # 243157 since 2026-08-11 (measured 243157): #333 measured Muse Glimmer
+    # against llama.cpp, which made this page's "GGUF arm tokenizes but
+    # generates INCOHERENTLY: ... #347 and #359 are FIXED" self-contradictory --
+    # both fixes landed, so it generates coherently. The replacement says LESS:
+    # coherent, NOT token-exact, llama.cpp-only bar. The numbers live in
+    # docs/BENCHMARKS.md and .agents/specs/muse-glimmer.md §14, not here. Net
+    # -29, re-pinned byte-tight. Strictly DOWN from 243186.
+    "chars": 243157,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
