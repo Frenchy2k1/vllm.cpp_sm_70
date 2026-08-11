@@ -80,8 +80,66 @@ function Invoke-CrtContractTests {
     }
 }
 
+function Invoke-UnsupportedTierProbe {
+    param([Parameter(Mandatory)][string]$TierTest,
+          [scriptblock]$Runner)
+    $arguments = @(
+        '--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran'
+    )
+    if ($null -eq $Runner) {
+        $probeOutput = @(& $TierTest @arguments 2>&1)
+        $probeExitCode = $LASTEXITCODE
+    } else {
+        $probeResult = & $Runner $TierTest $arguments
+        $probeOutput = @($probeResult.Output)
+        $probeExitCode = [int]$probeResult.ExitCode
+    }
+    if ($probeExitCode -ne 1) {
+        throw "unsupported forced CPU tier probe exited with status $probeExitCode instead of 1"
+    }
+    $diagnostic = $probeOutput -join "`n"
+    if ($diagnostic -notmatch [regex]::Escape("unknown x86 ISA tier 'amx'")) {
+        throw "unsupported forced CPU tier probe did not report the expected diagnostic"
+    }
+}
+
+function Invoke-UnsupportedTierContractTests {
+    $diagnostic = "unknown x86 ISA tier 'amx'"
+    $good = {
+        param([string]$Program, [string[]]$Arguments)
+        [pscustomobject]@{ ExitCode = 1; Output = @($diagnostic) }
+    }.GetNewClosure()
+    Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" -Runner $good
+
+    $badResults = @(
+        [pscustomobject]@{ ExitCode = 0; Output = @($diagnostic) },
+        [pscustomobject]@{ ExitCode = 134; Output = @($diagnostic) },
+        [pscustomobject]@{ ExitCode = -1073741819; Output = @($diagnostic) },
+        [pscustomobject]@{ ExitCode = 3; Output = @($diagnostic) },
+        [pscustomobject]@{ ExitCode = 2; Output = @($diagnostic) },
+        [pscustomobject]@{ ExitCode = 1; Output = @("wrong diagnostic") }
+    )
+    foreach ($badResult in $badResults) {
+        $runner = {
+            param([string]$Program, [string[]]$Arguments)
+            return $badResult
+        }.GetNewClosure()
+        $rejected = $false
+        try {
+            Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" `
+                -Runner $runner
+        } catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw "injected bad unsupported-tier result was accepted"
+        }
+    }
+}
+
 if ($ContractTest) {
     Invoke-CrtContractTests
+    Invoke-UnsupportedTierContractTests
     Write-Host "Windows PowerShell/CRT contract tests OK"
     exit 0
 }
@@ -172,10 +230,7 @@ try {
     $env:VT_CPU_MATMUL_TIER = "avx2"
     Invoke-Checked $tierTest @()
     $env:VT_CPU_MATMUL_TIER = "amx"
-    & $tierTest
-    if ($LASTEXITCODE -eq 0) {
-        throw "unsupported forced CPU tier 'amx' was silently accepted"
-    }
+    Invoke-UnsupportedTierProbe -TierTest $tierTest
 } finally {
     $env:VT_CPU_MATMUL_TIER = $savedTier
 }

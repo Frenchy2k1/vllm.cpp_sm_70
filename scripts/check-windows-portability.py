@@ -33,6 +33,10 @@ POSIX_PATTERNS = (
 
 
 CPP_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+UNSUPPORTED_TIER_FILTER = (
+    "--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran"
+)
+UNSUPPORTED_TIER_DIAGNOSTIC = "unknown x86 ISA tier 'amx'"
 
 
 def _project_header_closure(root: Path, sources: set[str],
@@ -338,7 +342,7 @@ def _validate_powershell_ast_order(commands: list[dict],
         ("install", r"\bInvoke-Checked\s+cmake\b.*\"--install\""),
         ("CRT audit", r"\bInvoke-CrtAudit\b"),
         ("live --help smoke", r"\bInvoke-Checked\s+\$server\b.*--help"),
-        ("forced-tier smoke", r"\bInvoke-Checked\s+\$tierTest\b"),
+        ("forced-tier smoke", r"\bInvoke-UnsupportedTierProbe\b.*\$tierTest\b"),
         ("server smoke harness", r"\bInvoke-Checked\s+python\b.*\$smokeHarness"),
     )
     offsets: list[int] = []
@@ -375,7 +379,7 @@ def _validate_powershell_source_order(text: str, errors: list[str]) -> None:
         ("install", r"(?:^\s*cmake\s+--install\b|\"--install\"\s*,\s*\$BuildDir)"),
         ("CRT audit", r"^\s*Invoke-CrtAudit\b"),
         ("live --help smoke", r"^\s*Invoke-Checked\s+\$server\b[^\n]*--help"),
-        ("forced-tier smoke", r"^\s*\$env:VT_CPU_MATMUL_TIER\s*=\s*\"portable\""),
+        ("forced-tier smoke", r"^\s*Invoke-UnsupportedTierProbe\b[^\n]*\$tierTest\b"),
         ("server smoke harness", r"^\s*Invoke-Checked\s+python\b[^\n]*\$smokeHarness"),
     )
     _ordered_matches(active, stages, errors, "source contract")
@@ -425,8 +429,34 @@ def _cpp_function_body(source: str, signature: str) -> str:
         suffix_depth: list[str] = []
         declaration = False
         pairs = {"(": ")", "[": "]"}
-        for offset in range(parameters_close + 1, len(active)):
+        offset = parameters_close + 1
+        while offset < len(active):
             char = active[offset]
+            requires = re.match(r"requires\b", active[offset:])
+            if not suffix_depth and requires is not None:
+                expression = offset + requires.end()
+                while expression < len(active) and active[expression].isspace():
+                    expression += 1
+                if expression < len(active) and active[expression] == "(":
+                    depth = 0
+                    for cursor in range(expression, len(active)):
+                        if active[cursor] == "(":
+                            depth += 1
+                        elif active[cursor] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                expression = cursor + 1
+                                break
+                    else:
+                        return ""
+                    while expression < len(active) and active[expression].isspace():
+                        expression += 1
+                if expression < len(active) and active[expression] == "{":
+                    requires_body = _cpp_braced_body(active, expression)
+                    if requires_body is None:
+                        return ""
+                    offset = requires_body[1] + 1
+                    continue
             if char in pairs:
                 suffix_depth.append(pairs[char])
             elif suffix_depth and char == suffix_depth[-1]:
@@ -438,8 +468,107 @@ def _cpp_function_body(source: str, signature: str) -> str:
             elif not suffix_depth and char == "{":
                 result = _cpp_braced_body(active, offset)
                 return "" if result is None else result[0]
+            offset += 1
         if not declaration:
             return ""
+
+
+def _active_cpp_macro_names(source: str) -> set[str]:
+    """Return macros defined in source branches that can compile on Windows."""
+    active = without_cpp_comments_and_literals(source)
+    names: set[str] = set()
+    for _, line in windows_possible_lines(active):
+        match = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)", line)
+        if match is not None:
+            names.add(match.group(1))
+    return names
+
+
+def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
+    active = _active_powershell(text)
+    filter_count = len(re.findall(re.escape(UNSUPPORTED_TIER_FILTER), active))
+    exact_filter_argument = re.search(
+        r"\$arguments\s*=\s*@\(\s*(['\"])" +
+        re.escape(UNSUPPORTED_TIER_FILTER) + r"\1\s*\)",
+        active,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if filter_count == 0:
+        errors.append(
+            "build-windows-release.ps1: missing active isolated "
+            "unsupported-tier filter"
+        )
+    elif filter_count != 1 or exact_filter_argument is None:
+        errors.append(
+            "build-windows-release.ps1: unsupported-tier probe requires one "
+            "exact unsupported-tier filter argument"
+        )
+    requirements = (
+        (
+            r"\$probeExitCode\s*-ne\s*1\b",
+            "exact unsupported-tier exit status",
+        ),
+        (
+            re.escape(UNSUPPORTED_TIER_DIAGNOSTIC),
+            "unsupported-tier diagnostic",
+        ),
+        (
+            r"@\(\s*&\s*\$TierTest\s+@arguments\s+2>&1\s*\)",
+            "merged unsupported-tier stdout/stderr capture",
+        ),
+        (
+            r"finally\s*\{[^}]*\$env:VT_CPU_MATMUL_TIER\s*=\s*\$savedTier",
+            "unsupported-tier environment restoration",
+        ),
+    )
+    for pattern, description in requirements:
+        if re.search(pattern, active, re.IGNORECASE | re.MULTILINE) is None:
+            errors.append(
+                f"build-windows-release.ps1: missing active {description}"
+            )
+
+    for crash_status in ("134", "-1073741819", "3", "2"):
+        if re.search(
+                rf"ExitCode\s*=\s*{re.escape(crash_status)}\b", active,
+                re.IGNORECASE) is None:
+            errors.append(
+                "build-windows-release.ps1: unsupported-tier crash contract "
+                f"is missing status {crash_status}"
+            )
+
+    uncommented = re.sub(r"(?s)<#.*?#>", "", text)
+    uncommented = "\n".join(
+        line for line in uncommented.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    contract_block = re.search(
+        r"(?ms)^\s*if\s*\(\s*\$ContractTest\s*\)\s*\{(?P<body>.*?)^\s*\}",
+        uncommented,
+    )
+    if (contract_block is None or
+            re.search(r"(?m)^\s*Invoke-UnsupportedTierContractTests\s*$",
+                      contract_block.group("body")) is None):
+        errors.append(
+            "build-windows-release.ps1: missing active unsupported-tier "
+            "fake-tool contract"
+        )
+
+    amx = re.search(
+        r"\$env:VT_CPU_MATMUL_TIER\s*=\s*[\"']amx[\"'](?P<body>.*?)"
+        r"(?:\}\s*finally\b|\bfinally\b)",
+        active,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if (amx is None or
+            re.search(r"Invoke-UnsupportedTierProbe\b[^\n]*\$tierTest\b",
+                      amx.group("body"), re.IGNORECASE) is None or
+            re.search(r"(?:Invoke-Checked\s+|&\s*)\$tierTest\b",
+                      amx.group("body"),
+                      re.IGNORECASE) is not None):
+        errors.append(
+            "build-windows-release.ps1: AMX refusal must use only the isolated "
+            "unsupported-tier probe"
+        )
 
 
 def _finite_timeout_expression(console: str, expression: str) -> bool:
@@ -577,6 +706,18 @@ def _validate_console_protocol(console: str, errors: list[str]) -> None:
         r"std::memory_order_seq_cst\s*\)",
         dispatch,
     ))
+    trusted_tail_tokens = {
+        "state", "in_flight", "fetch_sub", "std", "memory_order_seq_cst",
+        "return", "resumed",
+    }
+    macro_collisions = sorted(
+        trusted_tail_tokens.intersection(_active_cpp_macro_names(console))
+    )
+    if macro_collisions:
+        errors.append(
+            "console_shutdown.cpp: trusted final-tail token must not be a macro "
+            f"({', '.join(macro_collisions)})"
+        )
     final_tail_ok = False
     if len(final_decrements) == 1:
         resumed_declarations = list(re.finditer(
@@ -684,6 +825,10 @@ $commands | ConvertTo-Json -Compress
         ("live --help smoke", r"(?s)Invoke-Checked\s+\$server.*?--help"),
         ("server smoke harness", r"(?s)Invoke-Checked\s+python.*?smokeHarness"),
         ("CRT audit", r"Invoke-CrtAudit"),
+        ("isolated unsupported-tier smoke",
+         r"Invoke-UnsupportedTierProbe\b.*?\$tierTest"),
+        ("unsupported-tier fake-tool contract",
+         r"Invoke-UnsupportedTierContractTests"),
     ):
         if not re.search(pattern, command_text, re.IGNORECASE):
             errors.append(f"build-windows-release.ps1: AST missing active {description}")
@@ -819,6 +964,7 @@ def check(root: Path, build_dir: Path | None = None,
     )
     active_script = _active_powershell(build_script)
     _validate_powershell_source_order(build_script, errors)
+    _validate_unsupported_tier_contract(build_script, errors)
     for marker in required_script_markers:
         if marker not in active_script:
             errors.append(f"build-windows-release.ps1: required native CPU gate missing ({marker})")
