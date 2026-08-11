@@ -224,8 +224,12 @@ HTTP are not started.
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens, full 16x16 rerun pending ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`) | ✅ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
-Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core
-kernels for it.
+Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,
+so it stays a correctness venue for those; the one fast path it does get is the
+vendored **Marlin NVFP4 W4A16** GEMM, enabled since 2026-08-11 and validated on
+Thor silicon (8.0x-29.0x per GEMM at M=1, e2e 16.61 to 81.63 tok/s at c=1 on
+Qwen3-1.7B-NVFP4A16). That is a kernel-level result, not a token-exact
+model-level gate.
 
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact,
 6/6 prompts vs the vLLM 0.25.0 oracle, every op of that model dispatched
