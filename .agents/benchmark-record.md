@@ -19405,3 +19405,34 @@ streams are byte-identical, so upstream's DSpark is lossless on that lane.
 
 Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
 `xengine_ours.log`, `xengine_pinned.log`.
+
+## SPEC-DSPARK W7: device sequential Markov sampling (#436), 2026-08-12
+
+Same binary, only `VT_DSPARK_DEVICE_SAMPLE` differing, one flock, warm repeats,
+cold run discarded, `VT_SPEC_TRACE=1` for the phase split.
+
+| arm | sample ms | warm tok/s | text |
+|---|---|---|---|
+| 27B dense k=15, host loop | 10.44 | 17.31 | - |
+| 27B dense k=15, device | 9.24 | 17.42 | byte-IDENTICAL to host |
+| 35B A3B k=8, host loop | 0.59 | 71.06 | - |
+| 35B A3B k=8, device | 0.50 | 73.3 | byte-IDENTICAL to host |
+
+Byte-identical output on both lanes is the bar: this is a pure cost move, so a
+changed token would void it regardless of the speed delta.
+
+The residual sampling cost is a BANDWIDTH bound, not overhead. `markov_w2` is
+`[draft_vocab, markov_rank]` bf16 and the per-step bias GEMV re-reads all of it:
+27B 15 x 127 MB = 1.9 GB per draft step, 9.3 ms at ~205 GB/s against 9.24 ms
+measured; 35B 8 x 16 MB = 131 MB, 0.6 ms against 0.50 ms measured. Two lanes 13x
+apart in vocab both landing on the bound is not a coincidence. Upstream runs the
+same k sequential GEMVs, so this is not a gap against it, and graph capture
+cannot remove weight traffic.
+
+Unit gate 10 cases / 89 assertions, RED-first proven by MUTATION: dropping
+`first_sample_offset` from the base-row index fails 1 assertion, dropping the
+Markov bias from the sum fails 11 across 2 cases, tree restored byte-for-byte
+after each. Green on the local CPU build and the dgx CUDA build
+(`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`).
+
+Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
