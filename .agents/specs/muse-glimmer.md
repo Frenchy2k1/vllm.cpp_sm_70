@@ -864,3 +864,152 @@ Adjacent gates unchanged and green on the same build: `test_muse_glimmer_text`
   `muse_glimmer`, so there is no denominator and none is claimed here.
 - The bf16 safetensors arm at full depth has still never generated; it is
   unaffected by this fix, which is GGUF-only.
+
+## 14. The speed re-run — first binding numbers on any axis (2026-08-11, `row/MUSE-BENCH-2`, issue [#333](https://github.com/mudler/vllm.cpp/issues/333))
+
+§11 produced no binding number because our GGUF arm could not reach a forward.
+`11d45330` (the `llama4`/GPT-4o pre-tokenizer, #347) and `75a29016` (the Q/K
+interleaved-RoPE row order, #359) removed both blockers, so for the first time
+**both engines can hold AND generate from the same file**, which is what makes a
+quant-matched comparison possible at all.
+
+**vLLM remains an OPEN GAP by construction.** §0 is unchanged: the pin carries
+no `muse_glimmer`, so there is no denominator, nothing was substituted for it,
+and nothing below is a parity claim. llama.cpp is a **labelled SECONDARY**
+reference per [[vllm-is-the-bar-not-llamacpp]].
+
+### 14.1 The one thing that makes these numbers comparable
+
+Every llama.cpp cell reads **the same 16,756,681,056-byte file** we read
+(`muse-glimmer-30B-kquant-17gb.gguf`, md5 `ba8da9b15aed63a1df095cb34f3e7665`,
+copied to local NVMe so neither engine pays a CIFS tax inside a measured
+window). Every HF cell is bf16 safetensors against **our** bf16 safetensors.
+No cell mixes a 4-bit file against a 16-bit one, because that reports
+quantization as speed.
+
+Host `dgx.casa`, GB10 aarch64, 20 cores (10 Cortex-X925 + 10 A725), **idle**
+(load 0.23 at claim, `local-ai-worker` already down, GPU 0%), one `$HOME/gpu.lock`
+held across the whole series, legs **paired and order-alternated**.
+
+### 14.2 GGUF k-quant, CPU, quant-matched — the binding cells
+
+Ours = `vllm-bench` `Prefill token throughput (in/TTFT)` and
+`Mean per-stream decode rate`; llama.cpp = `llama-bench` `pp`/`tg`. The two
+harnesses measure the same two quantities and their absolute scales agree, so
+[[conflicting-ratios-check-absolute-scale-first]] does not bite here.
+
+| Workload | Axis | vllm.cpp | llama.cpp | Ratio |
+|---|---|---:|---:|---:|
+| in 128 / out 16, t=20, r=5 | prefill tok/s | 11.63 (10.36-12.10, **15.0%**) | 12.94 (12.90-13.09, 1.4%) | **0.898x** |
+| in 128 / out 16, t=20, r=5 | decode tok/s | 1.18 (1.04-1.71, **56.8%**) | 5.08 (4.88-5.28, 7.9%) | **0.232x** |
+| in 128 / out 16, t=10, r=3 | prefill tok/s | 9.94 (1.2%) | 9.97 (0.8%) | **0.997x** |
+| in 128 / out 16, t=10, r=3 | decode tok/s | 1.31 (0.8%) | 6.41 (0.7%) | **0.204x** |
+| in 512 / out 16, t=20, r=3 | prefill tok/s | 2.23 (0.4%) | 13.13 (0.5%) | **0.170x** |
+| in 512 / out 16, t=20, r=3 | decode tok/s | 0.29 (0.0%) | 5.00 (9.6%) | **0.058x** |
+| any | peak RSS | 30.29 GiB | 15.74 GiB | **1.92x MORE** |
+
+Values are medians; brackets are min-max and the spread as a percentage of the
+median. The noise band was calibrated from the repeated identical legs
+themselves, per `.agents/benchmarking.md`; no leg was discarded in this table.
+
+### 14.3 What the shape of the table says
+
+**llama.cpp is flat in context length and we are not.** Its prefill goes
+12.94 -> 13.13 tok/s from 128 to 512 input tokens (+1.5%); ours goes
+11.63 -> 2.23 (**-81%**). Its decode is 5.08 -> 5.00 (flat); ours is
+1.18 -> 0.29 (**-75%** for 4x the context). At 128 tokens we are within 10% of
+it on prefill and tie it outright at 10 threads; the gap is created by
+sequence length, not by the GEMMs.
+
+**Idle cores are NOT the explanation; that hypothesis is REFUTED.** The
+aggregate `Percent of CPU` of a whole run reads 466-667% for us against
+1062-1674% for llama.cpp, which looks like an idle-core story and is not one:
+our run is dominated by a load-and-dequantize phase that llama.cpp's mmap never
+pays. A two-length diff (out 4 -> out 36, in 128, the common load phase
+cancelling) gives the decode phase itself:
+
+| Engine | dCPU-seconds | dwindow | decode-phase CPU | CPU-s per decoded token |
+|---|---:|---:|---:|---:|
+| vllm.cpp | 599.95 | 30.19 s | **1987%** (19.9 of 20 cores) | **18.75** |
+| llama.cpp | 106.26 | 5.87 s | **1810%** (18.1 cores) | **3.32** |
+
+Both saturate the box, and we burn **5.6x the CPU-seconds per decoded token**.
+Read that as resource cost, **not** as proof the extra seconds are useful work:
+the 2026-08-06 CPU op-dispatch profile in the benchmark record already measured
+decode on this backend as **47.15% threadpool synchronisation** (`ThreadReady` +
+`PollForWork` + `Barrier`; ~58% on the secondary-thread view), and a spinning
+worker holds a core without advancing a token. The refuted claim is "our pool
+leaves cores idle"; the live one is "our pool burns them at the barrier", which
+is that already-named lever.
+
+**Neither lever is new; this row prices them on a second model.** `.agents/NOW.md`
+carries both from that profile: decode 47% threadpool sync, and prefill ~39% CPU
+paged attention of which ~21% of prefill sits in a **per-element dtype switch in
+the attention dot loop** (`src/vt/cpu/cpu_paged_attn.cpp:29`, called from `:143`),
+the same defect class E1 hoisted out of the elementwise GEMM. What is new here is
+the **context-length shape**: llama.cpp is flat from 128 to 512 input tokens
+while our prefill falls 81% and our decode 75%. That is what an attention inner
+loop paying per element per key looks like beside one that does not, and it
+matches [[no-fa2-arch-means-fallback-attn-is-the-wall]]. The owed next step is a
+decode-window profile of our CPU attention kernel against `ggml`'s on this
+workload. **No ceiling is claimed.**
+
+One observation IS new: at 20 threads our decode spread is **56.8%** against
+llama.cpp's 7.9%, and at 10 threads ours collapses to **0.8%**. GB10's 20 cores
+are 10 Cortex-X925 plus 10 A725, and our barrier is unstable across that split
+in a way llama.cpp's is not, which is consistent with the 47% synchronisation
+finding and is cheap to test.
+
+**Memory is an open gap.** 30.29 GiB resident against llama.cpp's 15.74 GiB for
+the same 15.59 GiB file, exactly as §10.2 predicts: we dequantize `qkv_proj`,
+`lm_head` and `embed_tokens` while llama.cpp keeps every operand in blocks.
+
+### 14.4 Correctness context, captured on the same binaries
+
+Speed without its correctness state is not a result. On the identical build and
+file, prompt `"The capital of France is"`, `--temperature 0`:
+
+| Engine | 12 greedy tokens |
+|---|---|
+| vllm.cpp (GGUF) | `" Paris. The capital of France is Paris. The capital of"` |
+| llama.cpp (GGUF) | `"Paris. It is the most populous city in France and"` |
+| vllm.cpp (bf16) | `" Paris. It is"` (4 tokens) |
+
+Coherent, **not token-identical**; §13.4's residual is unchanged and unclosed.
+
+The HF bf16 reference was probed on CPU and is reachable but needs a warmup:
+its FIRST 8-token forward costs **660.47 s** of one-time lazy materialization and
+the subsequent `generate` costs **5.74 s**, so any HF leg timed without a warmup
+measures page-in, not compute. Load 90.94 s, VmHWM 55,914,364 kB. Our bf16 arm's
+peak RSS is 59,819,588 kB.
+One thing is new: **the bf16 safetensors arm generated at full depth for the
+first time** (§13.4 recorded that it never had), and its first three tokens
+`" Paris. It is"` agree with **llama.cpp's** continuation rather than with our
+own GGUF arm's. That is a directional hint that the §13.4 divergence lives in the
+GGUF path and not in the model wiring, and it is a hint, not a finding: three
+tokens are not a gate. An owed follow-up is a GGUF-vs-bf16 token diff at depth.
+
+### 14.5 Blocked cells, each with its named blocker
+
+| Cell | Blocker |
+|---|---|
+| **vLLM, any arm** | **OPEN GAP by construction.** The pin has no `muse_glimmer`; unblocks when vllm#51655 merges and the pin advances. Not waived, not substituted. |
+| ours bf16 on GPU vs HF bf16 on GPU | **Disk.** A CUDA build tree is ~169 GiB (`.agents/benchmarking.md`); dgx had ~122 GiB free. A full disk voids a binding silently, so no CUDA build was started. |
+| ours bf16 vs HF bf16, CPU, r=3 | **Host availability, twice.** The series was written, syntax-checked and queued on `$HOME/gpu.lock`, then stopped rather than run contended: first behind a foreign CUDA build (14:26, `ptxas`/`cicc` at 100%), then behind another session's `vllm-server` serving gate holding the lock from 15:00. The lock was respected both times. **OWED**, scripts staged on dgx. |
+| clean r=3 repetitions of the two-length CPU diff | Same queue. The r=1 legs in §14.3 are clean and pre-date the foreign build; only the repetitions are owed. |
+| mmproj / perception encoder | Still refused by name (§10.4): `v.patch_embd.weight` lacks the `patch_temporal` axis. No multimodal speed axis exists. |
+| DFlash draft acceptance A/B | Structurally reachable (§10.5), never exercised. |
+
+### 14.6 What these numbers do and do not establish
+
+They establish that on one idle 20-core aarch64 host, reading one identical
+k-quant file, vllm.cpp is **at parity on short-context prefill** (0.997x at 10
+threads, 0.898x at 20), **~4-5x behind on decode**, **~5.9x behind on 512-token
+prefill**, and **uses 1.92x the resident memory** — with the decode gap
+attributed to CPU work per token rather than to idle cores, and the
+context-length gap pointing at the attention path.
+
+They establish **nothing about vLLM**, which is the only bar that counts and
+remains unavailable; nothing about GPU behaviour, which was not built; nothing
+about multimodal; and nothing about token-exactness. **No ceiling is claimed or
+implied anywhere in this section.**
