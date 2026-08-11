@@ -331,10 +331,18 @@ verification only, not a runtime dependency). No dgx / GPU needed.
 ## Evidence
 
 - Issue [#352](https://github.com/mudler/vllm.cpp/issues/352).
-- Branch `row/KV-EVENTS-W2`, based on `main` at `7020de93`.
+- Branch `row/KV-EVENTS-W2`, based on `main` at `7020de93`, merged forward to
+  `origin/main` `157080c8` (158 commits) before the PR.
 - RED-first capture, focused GREEN, and the full CPU `ctest` are recorded in the
   W3 commit message and the `KV-EVENTS` row in
   [`engine-matrix.md`](../engine-matrix.md).
+- Post-merge re-gate on the merged tree (2026-08-11, CPU-only Release
+  `build-cpu`): build 0 warnings; `test_kv_events` 12/12 · 105,
+  `test_scheduler` 36/36 · 423, `test_llm_engine` 24/24 · 493; full
+  `ctest --test-dir build-cpu -j 6` **385/385, 0 failed** in 28.31 s, with
+  `test_openai_conformance` passing in-sweep at 0.35 s — which settles the
+  earlier single failure as load starvation (it failed at load 121+, passes in
+  0.35-0.59 s on a quiet box), not a defect.
 
 ## Stop conditions
 
