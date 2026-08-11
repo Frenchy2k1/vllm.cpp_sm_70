@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -49,6 +50,7 @@
 #include <fstream>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_attn_block.h"  // FusedChainAdoptEnabled
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -638,6 +640,87 @@ TEST_CASE("muse_glimmer text: the sliding window travels WITH RoPE") {
   nope_wide.sliding = 4096;
   CHECK_FALSE(Differs(RunForward(TinyWeights(MakeConfig(nope_narrow)), Positions()),
                       RunForward(TinyWeights(MakeConfig(nope_wide)), Positions())));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE ROPE BASE, AT A REALISTIC MAGNITUDE.
+//
+// COVERAGE HOLE this closes (review of #279): every case above runs at positions
+// 0..4 with head_dim 4, which has exactly ONE non-trivial rotary pair. At those
+// positions the angle a base of 5e5 produces (~0.006 rad at pos 4) and the angle
+// 1e4 produces (~0.04 rad) differ by less than the bf16-depth reference band, so
+// substituting the 1e4 default that almost every OTHER model ships — the
+// archetypal "forgot to read the config" bug — left the whole file GREEN.
+// Only an absurd base (2.0) went red, which gates nothing anybody would write.
+//
+// So this case moves to positions in the thousands, where the two bases are
+// separated by radians rather than milliradians, and pins the base three ways:
+// our forward matches the reference at ITS OWN base, does NOT match a reference
+// built at 1e4, and cannot produce the same logits from the two configs.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("muse_glimmer text: the RoPE base is READ from the config (5e5 vs 1e4)") {
+  TinySpec real;
+  real.no_rope = {1, 1};   // both layers RoPE, so no NoPE layer dilutes the effect
+  real.sliding = 4096;     // window wider than the sequence => every pair attends
+  TinySpec wrong = real;
+  wrong.rope_theta = 10000.0;  // the default every other model ships
+
+  const MuseGlimmerWeights w_real = TinyWeights(MakeConfig(real));
+  const MuseGlimmerWeights w_wrong = TinyWeights(MakeConfig(wrong));
+  REQUIRE(w_real.params.text.rope_theta == doctest::Approx(500000.0));
+  REQUIRE(w_wrong.params.text.rope_theta == doctest::Approx(10000.0));
+
+  // Positions a 131072-context model actually sees. Only the SPACING matters:
+  // RoPE's q·k depends on the position difference, so the base is observable
+  // exactly when that difference times the frequency is O(1) rather than O(1e-3).
+  const std::vector<int32_t> pos = {0, 1024, 2048, 3072, 4096};
+  const std::vector<float> got = RunForward(w_real, pos);
+  for (float x : got) REQUIRE(std::isfinite(x));
+
+  // The weights are seeded from the spec's shape, not its theta, so both arms read
+  // BYTE-IDENTICAL tensors and the base is the only thing that differs.
+  const double good = MaxAbsDiff(got, RefForward(w_real, pos));
+  const double bad = MaxAbsDiff(got, RefForward(w_wrong, pos));
+  MESSAGE("muse_glimmer RoPE base: max|diff| vs its own 5e5 reference " << good
+          << ", vs a 1e4 reference " << bad);
+  // The band here is 2e-3, not the 5e-4 the positions-0..4 case uses: at these
+  // positions RoPE rotates through radians rather than milliradians, and the
+  // bf16-per-op depth error grows with the rotation. MEASURED 6.9e-4 against a
+  // wrong-base signal of 4.1e-2 — 59x the measured error and 20x the band — so the
+  // widening buys the wrong base nothing.
+  CHECK(good <= 2e-3);
+  // A wrong-but-plausible base must land FAR outside the band the right one sits
+  // in — not merely outside it, or the gate would ride on bf16 noise.
+  CHECK(bad > 1e-2);
+  CHECK(bad > 20.0 * good);
+
+  // And end to end: two configs differing only in `rope_theta` cannot agree.
+  CHECK(Differs(got, RunForward(w_wrong, pos)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHICH FUSION ARM THIS BINARY IS RUNNING.
+//
+// COVERAGE HOLE this closes (review of #279): `FusedChainAdoptEnabled()` defaults
+// ON, so every `else vt::RmsNorm(...)` fallback in muse_glimmer.cpp (the input
+// layernorm, the pre-feedforward layernorm and the final norm) was DEAD in every
+// test — mutating one of them stayed green. That fallback is not decoration: it
+// is what runs wherever vt::FusedChain's recipes are unavailable.
+//
+// tests/CMakeLists.txt therefore registers this binary TWICE, once at the default
+// and once with VT_FUSED_CHAIN_ADOPT=0, so the whole file — including the fp32
+// reference gate above — runs on BOTH arms. This case is what stops the second
+// registration from silently re-running the first arm: the flag is read once per
+// process into a function-local static, so a test that flipped the env at runtime
+// would prove nothing at all.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("muse_glimmer text: this binary runs the fusion arm the environment selected") {
+  const char* e = std::getenv("VT_FUSED_CHAIN_ADOPT");
+  const bool want_adopt = !(e != nullptr && e[0] == '0');
+  const std::string env = e != nullptr ? std::string(e) : std::string("(unset)");
+  const std::string arm = want_adopt ? "FusedChain ADOPT" : "hand-call FALLBACK";
+  MESSAGE("VT_FUSED_CHAIN_ADOPT=" << env << " => " << arm << " arm");
+  CHECK(vllm::dense_attn::FusedChainAdoptEnabled() == want_adopt);
 }
 
 TEST_CASE("muse_glimmer text: the post-norms read post_norm_eps, not rms_norm_eps") {

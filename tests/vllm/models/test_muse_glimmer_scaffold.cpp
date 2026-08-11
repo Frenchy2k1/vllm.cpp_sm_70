@@ -17,6 +17,29 @@
 // The forward REFUSES-by-name (asserted). Nothing here claims the 30B model runs:
 // Muse Glimmer is BEYOND the pinned oracle (555967922) and is anchored to the OPEN
 // vllm#51655. See .agents/specs/muse-glimmer.md §0.
+//
+// ─── UPSTREAM ANCHOR, AND WHICH MODULES THIS PORTS ───────────────────────────
+// REVISION ANCHOR: vllm#51655 head `075d645af`. Deliberately NOT the parity pin
+// `555967922`, which carries no muse_glimmer at all (porting-inventory §9
+// deviation 16); every `muse_glimmer.py:NNNN` and `configs/muse_glimmer.py:NNNN`
+// cited below is that head.
+//
+// This file is the local form of the TWO upstream config-test modules that
+// specs/muse-glimmer.md §4 names, both at `075d645af`:
+//
+//   tests/transformers_utils/test_muse_glimmer_config.py
+//       -> nested-and-flat config descent, the dimension reads, the token ids
+//   tests/transformers_utils/test_muse_glimmer_config_schema_norm.py
+//       -> schema normalization: the dual `qk_scale_factor` magnitude rule, the
+//          `None`-not-False defaults for use_qk_norm / use_attn_output_gate, the
+//          BACKWARD-counted iRoPE mask, and the legacy `guac` norm renames
+//
+// HARNESS ADAPTATION (the only kind here): upstream parametrizes with pytest over
+// dict fixtures and asserts on a constructed `MuseGlimmerConfig`; this asserts on
+// `ParseMuseGlimmerParams(HfConfig)` over the equivalent JSON, case by case. The
+// parameters, schemas, expected values and failure cases are carried across
+// unchanged. The five upstream tests/tool_use/test_muse_glimmer_*.py modules are
+// ported separately, under tests/vllm/entrypoints/openai/.
 #include "vllm/model_executor/models/muse_glimmer.h"
 #include "vllm/model_executor/models/model_registry.h"
 
