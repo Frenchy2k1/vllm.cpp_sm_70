@@ -2,7 +2,9 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 #include "vllm/sampling_params.h"
 
@@ -349,5 +351,68 @@ TEST_CASE("PostInit contract: mandatory __post_init__ equivalent") {
     p.seed = -1;
     p.PostInit();
     CHECK_FALSE(p.seed.has_value());
+  }
+}
+
+// ─── logprob_token_ids (sampling_params.py:278-283,724-729,773-801) ──────────
+// The `num_logprobs` PROPERTY, not the raw `logprobs` field, is what the
+// scheduler's slice gate (scheduler.py:1818) and the LogprobsProcessor read.
+//
+// RED before the port: num_logprobs() returns the raw `logprobs` field, so the
+// logprob_token_ids-only case yields nullopt instead of the id count.
+TEST_CASE("SamplingParams::num_logprobs mirrors the upstream property") {
+  SUBCASE("neither set -> unset") {
+    SamplingParams p;
+    CHECK_FALSE(p.num_logprobs().has_value());
+  }
+  SUBCASE("logprobs set -> logprobs wins") {
+    SamplingParams p;
+    p.logprobs = 5;
+    REQUIRE(p.num_logprobs().has_value());
+    CHECK(*p.num_logprobs() == 5);
+  }
+  SUBCASE("only logprob_token_ids -> its length") {
+    SamplingParams p;
+    p.logprob_token_ids = std::vector<int32_t>{7, 42, 3};
+    REQUIRE(p.num_logprobs().has_value());
+    CHECK(*p.num_logprobs() == 3);
+  }
+  SUBCASE("both set -> logprobs (they are validated equal)") {
+    SamplingParams p;
+    p.logprobs = 2;
+    p.logprob_token_ids = std::vector<int32_t>{7, 42};
+    REQUIRE(p.num_logprobs().has_value());
+    CHECK(*p.num_logprobs() == 2);
+  }
+  SUBCASE("an EMPTY list is falsy upstream -> unset") {
+    SamplingParams p;
+    p.logprob_token_ids = std::vector<int32_t>{};
+    CHECK_FALSE(p.num_logprobs().has_value());
+  }
+}
+
+TEST_CASE("SamplingParams::Verify rejects invalid logprob_token_ids") {
+  SUBCASE("length above MAX_LOGPROB_TOKEN_IDS (sampling_params.py:775-781)") {
+    SamplingParams p;
+    p.logprob_token_ids =
+        std::vector<int32_t>(vllm::kMaxLogprobTokenIds + 1, 0);
+    CHECK_THROWS_AS(p.Verify(), std::runtime_error);
+  }
+  SUBCASE("exactly MAX_LOGPROB_TOKEN_IDS is accepted") {
+    SamplingParams p;
+    p.logprob_token_ids = std::vector<int32_t>(vllm::kMaxLogprobTokenIds, 0);
+    CHECK_NOTHROW(p.Verify());
+  }
+  SUBCASE("logprobs != len(logprob_token_ids) (sampling_params.py:795-801)") {
+    SamplingParams p;
+    p.logprobs = 3;
+    p.logprob_token_ids = std::vector<int32_t>{7, 42};
+    CHECK_THROWS_AS(p.Verify(), std::runtime_error);
+  }
+  SUBCASE("logprobs == len(logprob_token_ids) is accepted") {
+    SamplingParams p;
+    p.logprobs = 2;
+    p.logprob_token_ids = std::vector<int32_t>{7, 42};
+    CHECK_NOTHROW(p.Verify());
   }
 }

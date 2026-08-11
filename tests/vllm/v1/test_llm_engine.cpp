@@ -1633,3 +1633,55 @@ TEST_CASE("llm_engine: a zero-row final chunk beside another request still emits
                     "position " << i << " must be scored");
   }
 }
+
+// ─── 9. logprob_token_ids reaches the client end to end (issue #264) ─────────
+// Generative scoring: the caller names the ids it wants scored, and gets back
+// exactly those plus the sampled token — no full-vocab sort, no top-k.
+//
+// This is the reachability gate for the whole feature: it only passes when the
+// SamplingParams field, the InputBatch plumbing, the sampler gather AND the
+// `num_logprobs` property (which the scheduler's slice gate and the
+// LogprobsProcessor read) are all wired.
+//
+// RED before the port: outputs[0].logprobs has NO value — the scheduler gates
+// the slice on the raw `logprobs` field, which this request leaves unset.
+TEST_CASE("llm_engine: logprob_token_ids returns exactly the requested ids") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 3;
+  const std::vector<int32_t> kWanted = {5, 11, 2};
+
+  Harness h(c, w, tok);
+  SamplingParams sp = Greedy(kN);
+  sp.logprob_token_ids = kWanted;  // `logprobs` deliberately left unset
+  const RequestOutput r = h.engine.generate(std::string("hello"), sp, "req");
+
+  REQUIRE(r.finished);
+  REQUIRE(r.outputs.size() == 1);
+  REQUIRE(r.outputs[0].logprobs.has_value());
+  REQUIRE(r.outputs[0].logprobs->size() == static_cast<std::size_t>(kN));
+
+  for (std::size_t i = 0; i < r.outputs[0].logprobs->size(); ++i) {
+    const vllm::LogprobsOnePosition& pos = (*r.outputs[0].logprobs)[i];
+    const int32_t sampled = r.outputs[0].token_ids[i];
+    // Every requested id is present and finite (never the -inf padding).
+    for (int32_t want : kWanted) {
+      const vllm::Logprob* lp = pos.find(want);
+      REQUIRE(lp != nullptr);
+      CHECK(std::isfinite(lp->logprob));
+    }
+    // The sampled token is present too, at its FULL-VOCAB rank (greedy, so 1).
+    const vllm::Logprob* self = pos.find(sampled);
+    REQUIRE(self != nullptr);
+    CHECK(self->rank == 1);
+    // And NOTHING else: the requested ids plus the sampled token, deduped.
+    std::set<int32_t> expected(kWanted.begin(), kWanted.end());
+    expected.insert(sampled);
+    CHECK(pos.entries.size() == expected.size());
+    for (const auto& [tid, unused] : pos.entries) {
+      (void)unused;
+      CHECK(expected.count(tid) == 1);
+    }
+  }
+}

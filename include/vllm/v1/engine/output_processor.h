@@ -49,6 +49,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -84,6 +85,9 @@ class RequestOutputCollector {
   // Stored producer errors are rethrown on the consumer thread.
   RequestOutput get();
   std::optional<RequestOutput> get_nowait();
+  // Timed wait on the single-slot collector. nullopt on timeout (no error);
+  // rethrows producer errors. Wakes immediately when put()/put_error().
+  std::optional<RequestOutput> get_for(std::chrono::milliseconds timeout);
 
   bool has_output() const;
   const std::string& request_id() const { return request_id_; }
@@ -202,6 +206,9 @@ class OutputProcessor {
     return static_cast<int>(request_states_.size());
   }
   bool has_unfinished_requests() const { return !request_states_.empty(); }
+  bool has_request(const std::string& request_id) const {
+    return request_states_.find(request_id) != request_states_.end();
+  }
 
   // add_request (:512): build + register a RequestState. `parent_req` is non-null
   // only for a child of an n>1 parallel-sampling request (SAMPLE-N); it is stored
@@ -236,6 +243,11 @@ class OutputProcessor {
   std::vector<std::string> abort_requests(
       const std::vector<std::string>& request_ids,
       bool produce_final_output = false);
+
+  // Admission-transaction rollback: erase only the named frontend states,
+  // without allocating a return list or manufacturing terminal output. The
+  // caller serializes this with add/process/abort using its existing lock.
+  void rollback_requests(const std::vector<std::string>& request_ids) noexcept;
 
   // AsyncLLM teardown helper: abort every tracked internal request and return
   // the IDs that still need forwarding to EngineCore. The caller provides the
