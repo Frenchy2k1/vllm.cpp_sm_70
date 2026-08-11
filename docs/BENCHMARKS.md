@@ -9,7 +9,7 @@
 | **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |
 | **Binary release delivery topology** | #196: read-only build/verify, OIDC attest, protected publish; generated indexes and explicit handoff-authenticated assets | Fixes the zero-binary release path by attaching all eight archive/checksum/provenance triplets plus indexes. Hosted proof pending; W12 diagnostics optional | n/a |
 | **Container images (ACTIVE)** | `ENG-RELEASE-CONTAINERS`: GHCR lanes `-cuda`/`-vulkan`/`-cpu` ([spec](../.agents/specs/container-images.md)) | cpu linux/amd64 image **783 MB**; SIGTERM shutdown **0.25 s, exit 0** (was 30 s then SIGKILL 137, #312). `PENDING`: cuda/vulkan sizes, arm64, GB10 in-container `/health` | n/a |
-| **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |
+| **Developer/row protocol** | Contribution entry point; `ENG-NOW-DERIVED` #374 @`dbd0d51c` | Entry-point gates retained. #374 W1-W5 DONE; benchmark/runtime/parity `VOID`; row specs now carry `## Now` | n/a |
 | **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
 | **DSR fix: server TU profiler guards (2026-08-09)** | **No number owed:** comments only. #189 moved the server body into the shared layer with its 5 `VT_BENCH_PROFILE_CONTROL` guards, taking DSR 32 -> 37; they are `DSR-ALLOW`'d per site, baseline unchanged at 32 |
 | **DSR fix: async readback capability (2026-08-08)** | **No number owed**: behavior-neutral (CPU/CUDA async-ON, discrete non-CUDA async-OFF, unchanged); moves a `kCUDA` check onto `Backend`, unblocking red CI on #127/#154/#155 |
@@ -24,7 +24,7 @@
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 | **vLLM** | Kimi-Linear-48B-A3B, GB10 | no binding number: the published checkpoint is tiktoken-only, so it cannot drive the warm-server harness | golden 122/128, near-tie profile |
-| **Muse Glimmer 30B (#268)** | no denominator: the pin carries no `muse_glimmer` | **OPEN GAP everywhere; nothing claimed or waived.** GGUF generates coherently (#347, #359) but is not token-exact, so #333 has no correctness gate | GGUF coherent, NOT token-exact; bf16 depth 4/52 |
+| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10 | **vLLM axis is an OPEN GAP.** vs llama.cpp ([#333](../.agents/specs/muse-glimmer.md) §14): prefill **tie 0.997x**, decode **0.232x**, RSS 1.92x | coherent, NOT token-exact |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page. Which architecture each number

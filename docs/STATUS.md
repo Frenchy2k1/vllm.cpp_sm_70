@@ -50,6 +50,11 @@ Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;
 embeddings #137 is landed/partial, not an active claim. No runtime change.
 
+Protocol live position (#374): `DONE` at implementation merge `dbd0d51c`.
+Lifecycle changes still update STATUS and BENCHMARKS, while the moved row spec's
+`## Now` replaces the per-row write to `.agents/NOW.md`. Runtime and performance
+are `VOID`; no product behavior changed.
+
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
 `scripts/check-supported-models.py` (+ mutation test), so the 30
@@ -429,8 +434,8 @@ on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
 (**blind-written, unverified**); M2 needs verification; gfx1201 hipBLAS +
 Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
 [guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
-GGUF arm tokenizes but generates INCOHERENTLY**: the `llama4` pre gap
-(#347) and the forward (#359) are FIXED; not token-exact yet. **Scale-out / distributed execution is scoped, with two legs landed
+GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
+only a llama.cpp bar (#333). **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
 `device_communicators` across multi-GPU TP+PP, 2×DGX-Spark over ConnectX-7
