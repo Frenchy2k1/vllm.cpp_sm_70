@@ -18,8 +18,8 @@ import release_metadata  # noqa: E402
 
 
 ARTIFACTS = {
-    "linux-x86_64-glibc-cuda-fat": ("x86_64", "cuda"),
-    "linux-aarch64-glibc-cuda-fat": ("aarch64", "cuda"),
+    "linux-x86_64-glibc-cuda": ("x86_64", "cuda"),
+    "linux-aarch64-glibc-cuda": ("aarch64", "cuda"),
     "linux-x86_64-glibc-vulkan": ("x86_64", "vulkan"),
 }
 
