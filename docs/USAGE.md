@@ -403,7 +403,7 @@ python3 scripts/check-cuda-fat-gencode.py \
 ```
 
 The release workflow applies this audit to independently linked x86_64 and
-arm64 host executables, packages each as a preview `cuda-fat` archive, and then
+arm64 host executables, packages each as a preview `cuda` archive, and then
 runs the extracted-archive validator. Each archive must contain all ten SM
 images and the six available exact-SM Triton AOT namespaces; the manifest keeps
 runtime evidence separate per SM. These build-only preview candidates are not
@@ -557,9 +557,28 @@ docker run --rm --gpus all -p 8000:8000 \
   --model /models/Qwen3.6-35B-A3B
 ```
 
-`/models` is the weights mount and `/cache` is the tokenizer/HF cache; the
-container runs as uid 1000, so `/cache` must be writable by it if you bind-mount
-one. `ffmpeg` is installed in every lane, so `/v1/videos` works out of the box —
+`/models` is the weights mount and `/cache` is the tokenizer/HF cache. The
+container runs as **uid 1000**, so `/cache` must be writable by it and the
+weights under `/models` must be READABLE by it. A model file with mode `0600`
+owned by another uid fails as `safetensors: cannot open file`, which reads like
+a corrupt checkpoint rather than a permissions problem.
+
+### On Jetson (Tegra/L4T)
+
+The cuda image is one SBSA build and it runs on Jetson too -- verified on AGX
+Orin (`sm_87`, L4T R36.4.3) -- but Tegra needs a **different invocation**:
+
+```sh
+docker run --rm --runtime nvidia --gpus all -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/mudler/vllm.cpp:latest-cuda \
+  --model /models/your-model
+```
+
+`--gpus all` on its own is refused there ("invoking the NVIDIA Container Runtime
+Hook directly ... is not supported"), and `--runtime nvidia` on its own starts a
+container with no driver, which dies on `libcuda.so.1: cannot open shared object
+file`. Both flags together are what works. `ffmpeg` is installed in every lane, so `/v1/videos` works out of the box —
 a deliberate difference from the tarballs, which never vendor it because they
 are extracted onto a host that already has a `PATH`.
 

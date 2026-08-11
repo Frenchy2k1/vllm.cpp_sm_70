@@ -16,8 +16,8 @@ the protected `release` environment must approve publication.
 | `linux-x86_64-glibc-cpu` | stable | One conservative-baseline adaptive x86-64 binary with portable/SSE2, F16C, AVX2, and AVX-512 tiers |
 | `linux-aarch64-glibc-cpu` | stable | One adaptive arm64 binary with portable/NEON and independently gated DotProd/i8mm kernels |
 | `linux-x86_64-musl-cpu-static` | experimental-preview | Literal-static, CPU-only feasibility bundle; not a glibc replacement |
-| `linux-x86_64-glibc-cuda-fat` | preview | One x86-64 binary containing all ten supported SMs and six exact-SM Triton AOT trees |
-| `linux-aarch64-glibc-cuda-fat` | preview | The same complete CUDA architecture inventory for the arm64 host ABI |
+| `linux-x86_64-glibc-cuda` | preview | One x86-64 binary containing all ten supported SMs and six exact-SM Triton AOT trees |
+| `linux-aarch64-glibc-cuda` | preview | The same complete CUDA architecture inventory for the arm64 host ABI |
 | `linux-x86_64-glibc-vulkan` | preview | Vulkan bundle; the loader, ICD, and device driver remain host dependencies |
 | `macos-arm64-metal` | stable | Native Apple Silicon Metal bundle; system frameworks remain host dependencies |
 | `macos-arm64-metal-mlx` | preview | Metal plus the exact redistributable MLX dylib/metallib and license |
