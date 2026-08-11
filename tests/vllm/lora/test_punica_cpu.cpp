@@ -4,6 +4,10 @@
 // UPSTREAM tests re-expressed (${VLLM_SOURCE} @ 555967922):
 //   tests/lora/test_punica_ops.py:36-74   _cpu_bgmv_shrink / _cpu_bgmv_expand
 //                                         (per-LoRA matmul references, idx<0 skip)
+//   vllm/lora/punica_wrapper/punica_cpu.py:166-195 add_shrink (W2: the
+//                                         multi-slice shrink, whose rank_a is
+//                                         narrower than the buffer on the
+//                                         fully-sharded path)
 //   tests/lora/test_punica_ops.py:142-290 check_lora_shrink/expand_kernel
 //   tests/lora/test_lora_functions.py     scaling / optimize
 //   vllm/lora/punica_wrapper/punica_cpu.py:265  add_lora_linear (end-to-end)
@@ -21,6 +25,7 @@
 #include "vllm/lora/punica.h"
 
 using vllm::lora::AddLoraLinear;
+using vllm::lora::AddShrink;
 using vllm::lora::BgmvExpand;
 using vllm::lora::BgmvExpandSlice;
 using vllm::lora::BgmvShrink;
@@ -41,16 +46,22 @@ std::vector<float> Rand(int64_t n, uint32_t seed, float scale = 0.2f) {
   return v;
 }
 
-// Reference: out[t,r] = scaling * sum_i x[t,i]*a[s][r,i], s = idx[t] (skip <0).
+// Reference: out[t,r] = scaling * sum_i x[t,i]*a[s][r,i], s = idx[t].
+// Skips the same slots the kernel skips (punica_cpu.cpp BgmvShrink/AddShrink:
+// `slot < 0 || slot >= num_slots`). Both halves matter: a caller that exercises
+// the out-of-range guard passes `idx[t] == num_slots`, and reading `a` at that
+// slot runs off the end of the stacked adapter. `num_slots` is not a parameter,
+// so derive it from the only place it is knowable here -- `a`'s own extent.
 std::vector<double> RefShrink(const std::vector<float>& x, int64_t T,
                               int64_t in_dim, const std::vector<float>& a,
                               int64_t rank, const std::vector<int32_t>& idx,
                               double scaling) {
   std::vector<double> out(static_cast<size_t>(T * rank), 0.0);
   const int64_t a_stride = rank * in_dim;
+  const int64_t num_slots = static_cast<int64_t>(a.size()) / a_stride;
   for (int64_t t = 0; t < T; ++t) {
     const int32_t s = idx[static_cast<size_t>(t)];
-    if (s < 0) continue;
+    if (s < 0 || s >= num_slots) continue;
     for (int64_t r = 0; r < rank; ++r) {
       double acc = 0.0;
       for (int64_t i = 0; i < in_dim; ++i) {
@@ -281,4 +292,81 @@ TEST_CASE("LoRALinear apply on one ReplicatedLinear vs reference (rank pad)") {
   std::vector<float> y2 = base;
   layer.ApplyLoraToOutput(y2.data(), x.data(), T, only0.data());
   CHECK(y2 == base);  // slot 0 zeroed => identity
+}
+
+TEST_CASE("add_shrink leaves a -1 slot's buffer row UNTOUCHED, not zeroed") {
+  // punica_cpu.py:192-195 -> bgmv_shrink. A base-model token's slot is -1
+  // (utils.py:104-110) and the triton kernel early-exits on it; the caller's
+  // zero-fill of the buffer is what makes the following expand contribute
+  // nothing. Pre-filling with a SENTINEL instead of zero separates "skipped"
+  // from "computed to zero", which is the only difference a dropped guard
+  // makes -- through a layer the expand skips the same token, so the wrong
+  // buffer never reaches the output, and the read at `a_stacked - slot_stride`
+  // is silent.
+  const int64_t T = 4, in_dim = 6, rank = 3, num_slots = 2, n_slices = 2;
+  const std::vector<float> x = Rand(T * in_dim, 11u);
+  const std::vector<float> a0 = Rand(num_slots * rank * in_dim, 22u);
+  const std::vector<float> a1 = Rand(num_slots * rank * in_dim, 33u);
+  // Two base tokens, one active slot each side, and one out-of-range slot.
+  const std::vector<int32_t> idx = {1, -1, 0, num_slots};
+  constexpr float kSentinel = -12345.0f;
+
+  std::vector<float> buffers(static_cast<size_t>(n_slices * T * rank), kSentinel);
+  AddShrink(buffers.data(), x.data(), T, in_dim, {a0.data(), a1.data()}, num_slots,
+            /*rank_a=*/rank, /*buffer_rank=*/rank, idx.data(), /*scale=*/1.0);
+
+  const std::vector<double> ref0 = RefShrink(x, T, in_dim, a0, rank, idx, 1.0);
+  const std::vector<double> ref1 = RefShrink(x, T, in_dim, a1, rank, idx, 1.0);
+  for (int64_t s = 0; s < n_slices; ++s) {
+    const std::vector<double>& ref = s == 0 ? ref0 : ref1;
+    for (int64_t t = 0; t < T; ++t) {
+      const bool skipped = idx[static_cast<size_t>(t)] < 0 ||
+                           idx[static_cast<size_t>(t)] >= num_slots;
+      for (int64_t r = 0; r < rank; ++r) {
+        const float got =
+            buffers[static_cast<size_t>(s * T * rank + t * rank + r)];
+        if (skipped) {
+          REQUIRE(got == kSentinel);
+        } else {
+          REQUIRE(got != kSentinel);
+          CHECK(std::abs(static_cast<double>(got) -
+                         ref[static_cast<size_t>(t * rank + r)]) <= 1e-4);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("add_shrink fills only rank_a columns and strides lora_a by rank_a") {
+  // lora_ops.py:80 -- `output_tensor[:, :outputs.shape[1]]`. The stacked lora_a
+  // has `max_rank / tp_size` rows on the fully-sharded path
+  // (base_linear.py:112-116), narrower than the buffer the expand later reads,
+  // so the per-slot stride is rank_a * in_dim and the columns past rank_a stay
+  // as the caller left them. Every layer-level case runs at tp_size == 1 where
+  // the two ranks coincide, so this contract is only visible here.
+  const int64_t T = 3, in_dim = 5, rank_a = 2, buffer_rank = 4, num_slots = 3;
+  const std::vector<float> a = Rand(num_slots * rank_a * in_dim, 44u);
+  const std::vector<float> x = Rand(T * in_dim, 55u);
+  const std::vector<int32_t> idx = {2, 0, 1};
+
+  std::vector<float> buf(static_cast<size_t>(T * buffer_rank), 0.0f);
+  AddShrink(buf.data(), x.data(), T, in_dim, {a.data()}, num_slots, rank_a,
+            buffer_rank, idx.data(), /*scale=*/1.0);
+
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t s = idx[static_cast<size_t>(t)];
+    for (int64_t r = 0; r < buffer_rank; ++r) {
+      double want = 0.0;
+      if (r < rank_a) {
+        for (int64_t i = 0; i < in_dim; ++i) {
+          want += static_cast<double>(x[static_cast<size_t>(t * in_dim + i)]) *
+                  static_cast<double>(
+                      a[static_cast<size_t>(s * rank_a * in_dim + r * in_dim + i)]);
+        }
+      }
+      CHECK(std::abs(static_cast<double>(
+                         buf[static_cast<size_t>(t * buffer_rank + r)]) -
+                     want) <= 1e-5);
+    }
+  }
 }

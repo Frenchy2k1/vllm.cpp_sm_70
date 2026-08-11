@@ -501,7 +501,7 @@ all, and it is what a quant-matched llama.cpp comparison would need.
 types), `mmproj-kquant.gguf` (1.40 GB, arch `clip`, 809), `dflash-kquant.gguf`
 (1.63 GB, arch `dflash`, 58).
 
-### 10.1 Three convert-time transforms, each verified against the bf16 checkpoint
+### 10.1 Four convert-time transforms, each verified against the bf16 checkpoint
 
 Derived from the GGUF's own tensor list and metadata, then cross-checked
 element-by-element against `meta-models/Muse-Glimmer-30B` — not inferred from
@@ -528,6 +528,11 @@ names.
    `true, true, true, false, ...`): `true` = RoPE + sliding, `false` = NoPE +
    full. Agrees with the safetensors config's `layer_types` and
    `layer_rope_theta` (NoPE at 3, 7, ... 51).
+4. **`attn_q` / `attn_k` are stored in ggml's INTERLEAVED-RoPE row order**
+   (`LlamaModel.permute`, llama.cpp `conversion/llama.py:163-169`, with `n_head`
+   on the query side and `n_head_kv` on the key side), so the loader un-permutes
+   both on the way into the merged `qkv_proj`. Added 2026-08-11: this one was
+   MISSING and is the whole of issue #359 — see §13.
 
 ### 10.2 What is kept quantized, and what is not
 
@@ -590,9 +595,15 @@ pre-scale recovered as 3.87 across every layer. The 19.65 GB mixed-type
 with `VLLM_MUSE_GGUF`, 636 on the full-load case, with **11 mutations each
 proven RED** and the tree restored byte-for-byte.
 
-**NOT established.** No forward was run on GGUF weights, so there is no e2e, no
-token-exactness against anything, and no claim that the k-quant and the bf16 arm
-agree numerically — that comparison is OWED. And per §0 there is still **no speed
+**SUPERSEDED (2026-08-11, §13).** "No forward was run on GGUF weights" held
+when this section was written; a forward now runs and generates coherent text.
+The structural result above was true AND insufficient — it could not see the Q/K
+row permutation of transform 4, which preserves every name, shape, count and
+dtype it checks.
+
+**NOT established.** There is still no token-exactness against anything, and no
+claim that the k-quant and the bf16 arm agree numerically — that comparison is
+OWED (§13.4). And per §0 there is still **no speed
 axis of any kind**: the pinned oracle cannot load `muse_glimmer` in either weight
 format, so there is no denominator, and none is claimed.
 
@@ -667,10 +678,338 @@ attempt has something to disagree with, and for no other purpose.
 
 ### 11.3 What is owed
 
-1. The GPT-4o-family `SplitPattern` (§11.1, issue
-   [#347](https://github.com/mudler/vllm.cpp/issues/347)) — until it lands our
-   GGUF arm has no e2e at all, quantized users included.
-2. Re-run both CPU legs on an idle box, `-r` >= 3, threads matched, band first.
-3. The bf16 pair (HF `exportable-muse` vs ours) on an idle dgx holding
+1. ~~The GPT-4o-family `SplitPattern`~~ — LANDED, §12.
+2. **The GGUF forward** ([#359](https://github.com/mudler/vllm.cpp/issues/359),
+   §12.1): coherent generation from the k-quant — ~~OWED~~ **DONE, §13** — and
+   then token-exactness against llama.cpp or the bf16 arm, which is STILL OWED
+   (§13.4). Until that lands the quant-matched comparison #333 wants has no
+   accepted correctness gate behind it.
+3. Re-run both CPU legs on an idle box, `-r` >= 3, threads matched, band first.
+4. The bf16 pair (HF `exportable-muse` vs ours) on an idle dgx holding
    `${GPU_LOCK}`, one large model resident at a time.
-4. The vLLM axis stays open until vllm#51655 merges and the pin advances.
+5. The vLLM axis stays open until vllm#51655 merges and the pin advances.
+
+## 12. The GPT-4o pre-tokenizer landed, and what it uncovered (2026-08-11, `row/TOK-LLAMA4-PRE`, issue [#347](https://github.com/mudler/vllm.cpp/issues/347))
+
+§11.1's blocker is closed. `SplitPattern::kGpt4o` implements the GPT-4o / o200k
+split; `Tokenizer::FromGguf` accepts the four pre names llama.cpp maps to
+`LLAMA_VOCAB_PRE_TYPE_GPT4O` (`gpt-4o`, `llama4`, `kanana2`, `talkie`,
+llama.cpp `src/llama-vocab.cpp:2294-2299` @ `153d324bcf`).
+
+**Ported the ORIGINAL regex, not llama.cpp's transcription of it.** llama.cpp
+cannot spell `\p{Lu}`/`\p{Ll}` in its engine and approximates the two letter
+classes with `((?=[\p{L}])([^a-z]))` / `((?=[\p{L}])([^A-Z]))`, which drops
+`\p{M}` and puts every non-ASCII cased letter in both. We implement the string
+llama.cpp itself cites as authoritative (`llama-vocab.cpp:432`), which is
+byte-identical to the checkpoint's own
+`tokenizer.json` `pre_tokenizer.pretokenizers[0].pattern.Regex`. MEASURED on the
+57-entry corpus through the 16.76 GB k-quant: **ours 0 mismatches vs HF
+`tokenizers`; llama.cpp `153d324bcf` 4 mismatches** (Devanagari, Thai and
+Arabic, exactly where its approximation loses `\p{M}`).
+
+**A second, silent instance of the same bug.** `DetectPattern` in
+`tokenizer.cpp` selected `kLlama3` for ANY regex containing `\p{N}{1,3}`. The
+GPT-4o regex contains it, so `Tokenizer::FromHfJson` on Muse Glimmer's own
+`tokenizer.json` was already picking `kLlama3` — the bf16 safetensors arm has
+been mistokenizing since the model landed, with no error. Now matched exactly,
+before the heuristic.
+
+**`ignore_merges` is a non-issue for this vocab, measured not assumed.** HF sets
+it; GGUF cannot express it. Encoding 29704 distinct vocab-derived strings plus a
+320-string mixed corpus with the flag on and off gives byte-identical ids in
+every case.
+
+### 12.1 The GGUF arm still does not generate — the blocker MOVED to the forward
+
+With the tokenizer fixed the 16.76 GB k-quant runs end to end and produces
+tokens, but they are degenerate:
+
+```
+vllm-cli --model muse-glimmer-30B-kquant-17gb.gguf \
+         --prompt "The capital of France is" --max-tokens 12 --temperature 0
+  -> prompt_tokens=5   " is is is is is is is is is is is is"
+```
+
+Isolated three ways, all on this 20-core CPU-only box:
+
+* **the file is fine** — llama.cpp `153d324bcf` `llama-completion` on the SAME
+  GGUF, same prompt, `--temp 0`: `"Paris. It is the most populous city in France
+  and"`;
+* **the tokenizer is fine** — `prompt_tokens=5` is the correct GPT-4o
+  tokenization, and the corpus diff above is 0/57 against HF;
+* **the load is fine** — `test_muse_glimmer_gguf` is 12/12 with `VLLM_MUSE_GGUF`
+  (428 assertions) and 12/12 / 1064 assertions with `VLLM_MUSE_GGUF_LOAD`, i.e.
+  the whole 16.76 GB materialised;
+* **the CPU backend is fine in general** — `vllm-cli` on `opt-125m-bf16-st`,
+  same box and build: `" the capital of the French Republic."`.
+
+So the defect is in the Muse Glimmer forward over GGUF weights (numerics or
+wiring), not in the tokenizer, the loader accounting, or the backend. §10.6's
+"no forward was run on GGUF weights" is now "a forward runs and is wrong", which
+is a different and newly actionable claim. It is NOT fixed here: it gets its own
+issue rather than a silent fix folded into a tokenizer change:
+[#359](https://github.com/mudler/vllm.cpp/issues/359).
+
+**No speed axis is claimed from any run in this section.** Every number above is
+a correctness observation on a CPU-only box; the throughput cells in §11 are
+untouched.
+
+## 13. The GGUF forward defect, found and fixed (2026-08-11, `row/MUSE-GGUF-FORWARD`, issue [#359](https://github.com/mudler/vllm.cpp/issues/359))
+
+§12.1's defect was a FOURTH convert-time transform the loader did not know about:
+**`attn_q` and `attn_k` are stored in ggml's interleaved-RoPE row order.**
+
+### 13.1 How it was found — bisect against the bf16 checkpoint, not against a theory
+
+The three transforms §10.1 documents were the obvious suspects and all three were
+INNOCENT. Rather than reason about them, every layer-0 tensor of the released
+k-quant was dequantized and diffed element-wise against
+`meta-models/Muse-Glimmer-30B`:
+
+| GGUF tensor | encoding | mean rel err vs safetensors |
+|---|---|---|
+| `blk.0.attn_v` | Q6_K | 0.029 |
+| `blk.0.ffn_down` | Q6_K | 0.028 |
+| `blk.0.attn_output` | Q4_K | 0.079 |
+| `blk.0.attn_gate` | Q4_K | 0.076 |
+| `blk.0.ffn_gate` / `ffn_up` | Q4_K | 0.077 |
+| `token_embd` | Q4_K | 0.075 |
+| `output` | Q5_K | 0.052 |
+| the four sandwich norms, un-shifted by 1 | F32 | **0** (exact) |
+| `output_norm`, NOT un-shifted | F32 | **0** (exact) |
+| `blk.0.attn_q` | Q4_K | **1.398** |
+| `blk.0.attn_k` | Q4_K | **1.410** |
+
+Every tensor sits at its encoding's quantization noise except `attn_q` and
+`attn_k`, which sit at ~1.4 — the error of comparing unrelated numbers. Reading
+them through llama.cpp's `LlamaModel.permute` puts them back at 0.077, i.e.
+exactly the Q4_K noise of their siblings. Confirmed at layers 0, 3, 25 and 51,
+with `n_head` = 32 on the query side and `n_head_kv` = 2 on the key side. The
+same table CONFIRMS the three suspected transforms were correct all along.
+
+### 13.2 The root cause
+
+llama.cpp's converter applies, per head,
+`w.reshape(heads, 2, Dh/2, K).swapaxes(1, 2)` to the query and key projections
+(`conversion/llama.py:163-169`, inherited by the `muse-glimmer` converter of
+ggml-org/llama.cpp#26841). That is the weight-side half of ggml's `rope_norm`,
+which rotates ADJACENT channel pairs `(2i, 2i+1)`; HF — and our `vt::RopeNeox` —
+rotates HALF-OFFSET pairs `(i, i + Dh/2)`. Consuming the file's rows verbatim
+therefore rotated the wrong channel pairs on the 39 RoPE layers.
+
+**Why every existing gate passed.** The permutation preserves names, shapes,
+counts, dtypes and the tensor accounting, so §10.6's 731/731 structural result
+was true and irrelevant. It is also invisible to attention on the 13 NoPE layers:
+a permutation applied to BOTH q and k leaves `q·k` unchanged. Nothing short of an
+element-wise comparison against the bf16 checkpoint, or a forward with RoPE on,
+could see it — which is why the model loaded, ran, and emitted `" is is is ..."`
+instead of failing.
+
+### 13.3 The fix and its evidence
+
+`LoadMerged` in `muse_glimmer_gguf_weights.cpp` now carries a per-shard head
+count and un-permutes the q and k rows on the way into the merged `qkv_proj`, on
+BOTH residency paths — the dequantized one the released heterogeneous trio takes,
+and the kept-quant byte concat a homogeneous trio would take (whole rows are
+whole numbers of blocks, so the reorder requantizes nothing). `attn_v`,
+`attn_output` and the MLP shards are untouched.
+
+Generated text on the released 16.76 GB k-quant, same box, same build, same
+prompt, `--temperature 0`:
+
+```
+"The capital of France is"             (12 tokens, --temperature 0)
+  before: " is is is is is is is is is is is is"
+  after:  " Paris. The capital of France is Paris. The capital of"
+
+"The history of the Roman Empire began" (20 tokens, --temperature 0)
+  after:  " with the founding of the city of Rome in 753 BC and ended in
+           the west with the fall"
+```
+
+The second prompt is there because the first one's after-text loops, and a loop
+is weak evidence on its own. It does not loop, and it is factually right.
+
+Gate `tests/vllm/models/test_muse_glimmer_gguf.cpp` grew two cases — one per
+residency path, the kept-quant one on a new Q8_0 synthetic file whose geometry
+lets a homogeneous trio exist at all. RED first with the loader reverted: 2 cases
+/ 140 assertions failing, the other 12 cases green. GREEN with the fix: 14/14,
+640 assertions; 706 with `VLLM_MUSE_GGUF` on the released file and 1342 with
+`VLLM_MUSE_GGUF_LOAD` (the whole 16.76 GB materialized).
+
+Five mutations, each proven RED and the tree restored byte-for-byte (md5
+`3fc4335f`):
+
+| Mutation | Result |
+|---|---|
+| un-permute `attn_k` with `n_head` instead of `n_head_kv` | 2 cases / 32 assertions RED |
+| also un-permute `attn_v` | 2 cases / 46 assertions RED |
+| invert the map the other way (`(i%2)*half + i/2`) | 1 case / 90 assertions RED |
+| skip the un-permute on the KEPT-QUANT path only | 1 case / 91 assertions RED |
+| skip the un-permute on the DEQUANTIZED path only | 1 case / 49 assertions RED |
+
+Adjacent gates unchanged and green on the same build: `test_muse_glimmer_text`
+21/21, `_wiring` 9/9 (10316 assertions), `_scaffold` 11/11, `_vision` 7/7,
+`_real_weights` 3/3, `test_gguf` 33/33, `test_qwen3_dflash_gguf` 3/3.
+
+### 13.4 What is STILL not established
+
+- **Not token-exact against anything.** llama.cpp `153d324bcf` on the same file
+  and prompt gives `"Paris. It is the most populous city in France and"`; ours
+  agrees on the first token and then diverges into a repetition. Whether that
+  residual is quantization/accumulation drift, the `post_norm_eps` fallback of
+  §10.3, or a second defect is OPEN and owed. "Coherent" is the claim;
+  "token-identical" is not.
+- **No speed axis, still.** §0 is unchanged: the pinned oracle cannot load
+  `muse_glimmer`, so there is no denominator and none is claimed here.
+- The bf16 safetensors arm at full depth has still never generated; it is
+  unaffected by this fix, which is GGUF-only.
+
+## 14. The speed re-run — first binding numbers on any axis (2026-08-11, `row/MUSE-BENCH-2`, issue [#333](https://github.com/mudler/vllm.cpp/issues/333))
+
+§11 produced no binding number because our GGUF arm could not reach a forward.
+`11d45330` (the `llama4`/GPT-4o pre-tokenizer, #347) and `75a29016` (the Q/K
+interleaved-RoPE row order, #359) removed both blockers, so for the first time
+**both engines can hold AND generate from the same file**, which is what makes a
+quant-matched comparison possible at all.
+
+**vLLM remains an OPEN GAP by construction.** §0 is unchanged: the pin carries
+no `muse_glimmer`, so there is no denominator, nothing was substituted for it,
+and nothing below is a parity claim. llama.cpp is a **labelled SECONDARY**
+reference per [[vllm-is-the-bar-not-llamacpp]].
+
+### 14.1 The one thing that makes these numbers comparable
+
+Every llama.cpp cell reads **the same 16,756,681,056-byte file** we read
+(`muse-glimmer-30B-kquant-17gb.gguf`, md5 `ba8da9b15aed63a1df095cb34f3e7665`,
+copied to local NVMe so neither engine pays a CIFS tax inside a measured
+window). Every HF cell is bf16 safetensors against **our** bf16 safetensors.
+No cell mixes a 4-bit file against a 16-bit one, because that reports
+quantization as speed.
+
+Host `dgx.casa`, GB10 aarch64, 20 cores (10 Cortex-X925 + 10 A725), **idle**
+(load 0.23 at claim, `local-ai-worker` already down, GPU 0%), one `$HOME/gpu.lock`
+held across the whole series, legs **paired and order-alternated**.
+
+### 14.2 GGUF k-quant, CPU, quant-matched — the binding cells
+
+Ours = `vllm-bench` `Prefill token throughput (in/TTFT)` and
+`Mean per-stream decode rate`; llama.cpp = `llama-bench` `pp`/`tg`. The two
+harnesses measure the same two quantities and their absolute scales agree, so
+[[conflicting-ratios-check-absolute-scale-first]] does not bite here.
+
+| Workload | Axis | vllm.cpp | llama.cpp | Ratio |
+|---|---|---:|---:|---:|
+| in 128 / out 16, t=20, r=5 | prefill tok/s | 11.63 (10.36-12.10, **15.0%**) | 12.94 (12.90-13.09, 1.4%) | **0.898x** |
+| in 128 / out 16, t=20, r=5 | decode tok/s | 1.18 (1.04-1.71, **56.8%**) | 5.08 (4.88-5.28, 7.9%) | **0.232x** |
+| in 128 / out 16, t=10, r=3 | prefill tok/s | 9.94 (1.2%) | 9.97 (0.8%) | **0.997x** |
+| in 128 / out 16, t=10, r=3 | decode tok/s | 1.31 (0.8%) | 6.41 (0.7%) | **0.204x** |
+| in 512 / out 16, t=20, r=3 | prefill tok/s | 2.23 (0.4%) | 13.13 (0.5%) | **0.170x** |
+| in 512 / out 16, t=20, r=3 | decode tok/s | 0.29 (0.0%) | 5.00 (9.6%) | **0.058x** |
+| any | peak RSS | 30.29 GiB | 15.74 GiB | **1.92x MORE** |
+
+Values are medians; brackets are min-max and the spread as a percentage of the
+median. The noise band was calibrated from the repeated identical legs
+themselves, per `.agents/benchmarking.md`; no leg was discarded in this table.
+
+### 14.3 What the shape of the table says
+
+**llama.cpp is flat in context length and we are not.** Its prefill goes
+12.94 -> 13.13 tok/s from 128 to 512 input tokens (+1.5%); ours goes
+11.63 -> 2.23 (**-81%**). Its decode is 5.08 -> 5.00 (flat); ours is
+1.18 -> 0.29 (**-75%** for 4x the context). At 128 tokens we are within 10% of
+it on prefill and tie it outright at 10 threads; the gap is created by
+sequence length, not by the GEMMs.
+
+**Idle cores are NOT the explanation; that hypothesis is REFUTED.** The
+aggregate `Percent of CPU` of a whole run reads 466-667% for us against
+1062-1674% for llama.cpp, which looks like an idle-core story and is not one:
+our run is dominated by a load-and-dequantize phase that llama.cpp's mmap never
+pays. A two-length diff (out 4 -> out 36, in 128, the common load phase
+cancelling) gives the decode phase itself:
+
+| Engine | dCPU-seconds | dwindow | decode-phase CPU | CPU-s per decoded token |
+|---|---:|---:|---:|---:|
+| vllm.cpp | 599.95 | 30.19 s | **1987%** (19.9 of 20 cores) | **18.75** |
+| llama.cpp | 106.26 | 5.87 s | **1810%** (18.1 cores) | **3.32** |
+
+Both saturate the box, and we burn **5.6x the CPU-seconds per decoded token**.
+Read that as resource cost, **not** as proof the extra seconds are useful work:
+the 2026-08-06 CPU op-dispatch profile in the benchmark record already measured
+decode on this backend as **47.15% threadpool synchronisation** (`ThreadReady` +
+`PollForWork` + `Barrier`; ~58% on the secondary-thread view), and a spinning
+worker holds a core without advancing a token. The refuted claim is "our pool
+leaves cores idle"; the live one is "our pool burns them at the barrier", which
+is that already-named lever.
+
+**Neither lever is new; this row prices them on a second model.** `.agents/NOW.md`
+carries both from that profile: decode 47% threadpool sync, and prefill ~39% CPU
+paged attention of which ~21% of prefill sits in a **per-element dtype switch in
+the attention dot loop** (`src/vt/cpu/cpu_paged_attn.cpp:29`, called from `:143`),
+the same defect class E1 hoisted out of the elementwise GEMM. What is new here is
+the **context-length shape**: llama.cpp is flat from 128 to 512 input tokens
+while our prefill falls 81% and our decode 75%. That is what an attention inner
+loop paying per element per key looks like beside one that does not, and it
+matches [[no-fa2-arch-means-fallback-attn-is-the-wall]]. The owed next step is a
+decode-window profile of our CPU attention kernel against `ggml`'s on this
+workload. **No ceiling is claimed.**
+
+One observation IS new: at 20 threads our decode spread is **56.8%** against
+llama.cpp's 7.9%, and at 10 threads ours collapses to **0.8%**. GB10's 20 cores
+are 10 Cortex-X925 plus 10 A725, and our barrier is unstable across that split
+in a way llama.cpp's is not, which is consistent with the 47% synchronisation
+finding and is cheap to test.
+
+**Memory is an open gap.** 30.29 GiB resident against llama.cpp's 15.74 GiB for
+the same 15.59 GiB file, exactly as §10.2 predicts: we dequantize `qkv_proj`,
+`lm_head` and `embed_tokens` while llama.cpp keeps every operand in blocks.
+
+### 14.4 Correctness context, captured on the same binaries
+
+Speed without its correctness state is not a result. On the identical build and
+file, prompt `"The capital of France is"`, `--temperature 0`:
+
+| Engine | 12 greedy tokens |
+|---|---|
+| vllm.cpp (GGUF) | `" Paris. The capital of France is Paris. The capital of"` |
+| llama.cpp (GGUF) | `"Paris. It is the most populous city in France and"` |
+| vllm.cpp (bf16) | `" Paris. It is"` (4 tokens) |
+
+Coherent, **not token-identical**; §13.4's residual is unchanged and unclosed.
+
+The HF bf16 reference was probed on CPU and is reachable but needs a warmup:
+its FIRST 8-token forward costs **660.47 s** of one-time lazy materialization and
+the subsequent `generate` costs **5.74 s**, so any HF leg timed without a warmup
+measures page-in, not compute. Load 90.94 s, VmHWM 55,914,364 kB. Our bf16 arm's
+peak RSS is 59,819,588 kB.
+One thing is new: **the bf16 safetensors arm generated at full depth for the
+first time** (§13.4 recorded that it never had), and its first three tokens
+`" Paris. It is"` agree with **llama.cpp's** continuation rather than with our
+own GGUF arm's. That is a directional hint that the §13.4 divergence lives in the
+GGUF path and not in the model wiring, and it is a hint, not a finding: three
+tokens are not a gate. An owed follow-up is a GGUF-vs-bf16 token diff at depth.
+
+### 14.5 Blocked cells, each with its named blocker
+
+| Cell | Blocker |
+|---|---|
+| **vLLM, any arm** | **OPEN GAP by construction.** The pin has no `muse_glimmer`; unblocks when vllm#51655 merges and the pin advances. Not waived, not substituted. |
+| ours bf16 on GPU vs HF bf16 on GPU | **Disk.** A CUDA build tree is ~169 GiB (`.agents/benchmarking.md`); dgx had ~122 GiB free. A full disk voids a binding silently, so no CUDA build was started. |
+| ours bf16 vs HF bf16, CPU, r=3 | **Host availability, twice.** The series was written, syntax-checked and queued on `$HOME/gpu.lock`, then stopped rather than run contended: first behind a foreign CUDA build (14:26, `ptxas`/`cicc` at 100%), then behind another session's `vllm-server` serving gate holding the lock from 15:00. The lock was respected both times. **OWED**, scripts staged on dgx. |
+| clean r=3 repetitions of the two-length CPU diff | Same queue. The r=1 legs in §14.3 are clean and pre-date the foreign build; only the repetitions are owed. |
+| mmproj / perception encoder | Still refused by name (§10.4): `v.patch_embd.weight` lacks the `patch_temporal` axis. No multimodal speed axis exists. |
+| DFlash draft acceptance A/B | Structurally reachable (§10.5), never exercised. |
+
+### 14.6 What these numbers do and do not establish
+
+They establish that on one idle 20-core aarch64 host, reading one identical
+k-quant file, vllm.cpp is **at parity on short-context prefill** (0.997x at 10
+threads, 0.898x at 20), **~4-5x behind on decode**, **~5.9x behind on 512-token
+prefill**, and **uses 1.92x the resident memory** — with the decode gap
+attributed to CPU work per token rather than to idle cores, and the
+context-length gap pointing at the attention path.
+
+They establish **nothing about vLLM**, which is the only bar that counts and
+remains unavailable; nothing about GPU behaviour, which was not built; nothing
+about multimodal; and nothing about token-exactness. **No ceiling is claimed or
+implied anywhere in this section.**
