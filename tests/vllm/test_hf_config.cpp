@@ -189,7 +189,12 @@ TEST_CASE("LoadHfConfig resolves nested text_config for a wrapper config") {
   CHECK(cfg.linear_conv_kernel_dim == 4);
   CHECK(cfg.mamba_ssm_dtype == "float32");
   CHECK(cfg.rope_theta == doctest::Approx(5000000.0));
-  CHECK(cfg.rms_norm_eps == doctest::Approx(1e-6));
+  // `.scale(0.0)` is load-bearing: doctest's Approx adds a scale term defaulting
+  // to 1.0, so a bare `Approx(1e-6)` has an absolute tolerance of ~1.19e-5 and
+  // accepts ANY eps below it -- including the 1e-05 this very file uses for
+  // another family. Verified: mutating the fixture to 1e-05 left the bare form
+  // passing and fails here.
+  CHECK(cfg.rms_norm_eps == doctest::Approx(1e-6).scale(0.0));
   CHECK(cfg.max_position_embeddings == 32768);
 
   // partial_rotary_factor absent -> qwen family default 0.25 applies from the
@@ -285,7 +290,12 @@ TEST_CASE("LoadHfConfig parses a Qwen3-Next-like hybrid MoE config") {
 
   CHECK(cfg.rope_theta == doctest::Approx(5000000.0));
   CHECK(cfg.rotary_dim == 64);  // 0.25 * 256
-  CHECK(cfg.rms_norm_eps == doctest::Approx(1e-6));
+  // `.scale(0.0)` is load-bearing: doctest's Approx adds a scale term defaulting
+  // to 1.0, so a bare `Approx(1e-6)` has an absolute tolerance of ~1.19e-5 and
+  // accepts ANY eps below it -- including the 1e-05 this very file uses for
+  // another family. Verified: mutating the fixture to 1e-05 left the bare form
+  // passing and fails here.
+  CHECK(cfg.rms_norm_eps == doctest::Approx(1e-6).scale(0.0));
   CHECK(cfg.max_position_embeddings == 262144);
   CHECK(cfg.torch_dtype == "bfloat16");
 
