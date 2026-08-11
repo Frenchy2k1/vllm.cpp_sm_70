@@ -2,9 +2,11 @@
 
 Row: [`KV-EVENTS`](../engine-matrix.md) · Claim: `CLAIM-ROADMAP-D4-KV-EVENTS` ·
 State: `ACTIVE` (event generation + payload DONE 2026-07-27; engine/scheduler
-envelope + `report_mode` IN FLIGHT 2026-08-11; live ZMQ transport deferred).
+envelope + `report_mode` DONE 2026-08-11; live ZMQ transport deferred).
 Issues: [#352](https://github.com/mudler/vllm.cpp/issues/352) (W3, the batch
-envelope + `kv_cache_report_mode`).
+envelope + `kv_cache_report_mode`);
+[#353](https://github.com/mudler/vllm.cpp/issues/353) (`KVEventsConfig` has no
+`PostInit` — found during W3, filed rather than silently fixed).
 
 ## Scope
 
@@ -264,7 +266,7 @@ verification only, not a runtime dependency). No dgx / GPU needed.
   buffer, thread, DP port offset) behind the seam. Blocked on a third-party
   socket library — there is no zmq under `third_party/` — which is a dependency
   decision, not an implementation one.
-- **W3 (IN FLIGHT 2026-08-11, issue #352, branch `row/KV-EVENTS-W2`):**
+- **W3 (DONE 2026-08-11, issue #352, branch `row/KV-EVENTS-W2`):**
   engine/scheduler wiring of the `KVEventBatch` envelope + `publish` per step +
   `shutdown`, and the `report_mode == "full"` reuse call in the manager, with
   `Request::kv_cache_report_mode` sourced from `SamplingParams::extra_args`.
@@ -359,9 +361,30 @@ int-truncated block-hash form is the DEFAULT because upstream's env default is
 `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1` (`envs.py:1816-1817`), not because it is
 cheaper; both forms are gated.
 
-**W3 (2026-08-11).** The measured RED/GREEN/`ctest` numbers land with the W3
-implementation commit and the row. The three judgement calls worth
-keeping: the publisher is INJECTED for gating rather than adding a
+**W3 (2026-08-11).** MEASURED. RED came in two stages, because a C++ port of a
+missing API fails to compile before it can fail an assertion, and only the
+second stage proves the tests actually discriminate: stage 1, the API absent —
+14 compile errors naming `extra_args`, `kv_cache_report_mode`,
+`set_kv_event_publisher` and `shutdown`; stage 2, the API present with the four
+behaviours absent — 5 of 12 cases and 5 assertions RED, with the
+default-off inertness case GREEN in BOTH stages, which is the point of having
+it. GREEN 12/12, 105 assertions. Regression: `test_scheduler` 36/423,
+`test_llm_engine` 23/450, `test_block_pool` 14/132, `test_kv_cache_manager`
+10/74, `test_prefix_cache_stats` 12/36, `test_kv_cache_coordinator` 16/106,
+`test_kv_cache_utils` 29/253, `test_async_scheduler` 7/63, `test_scheduler_lpm`
+6/47. Full CPU `ctest` 368/369 at `-j 6`; the one failure, `test_openai_conformance`,
+is a known load-starver and is 23/23, 252/252 re-run serially, so 369/369.
+
+One expectation in the gate was WRONG on the first run and is worth recording,
+because it is the thing the test was written to find out: a `report_mode=="full"`
+hit publishes TWO `BlockStored` events in one batch, not one — the reuse report
+raised by `get_computed_blocks` during `schedule()`, and then the ordinary store
+of the single block the request still had to compute, parented on the last
+reused block. The `"incremental"` control publishes only the second. The gate now
+asserts that whole shape, including the parent linkage that lets a consumer
+chain the prefix, which is strictly more than the count check it started as.
+
+The three judgement calls worth keeping: the publisher is INJECTED for gating rather than adding a
 `publisher="collecting"` config value, because inventing a `--kv-events-config`
 value vLLM does not have would make the config surface diverge from upstream for
 the sake of a test; `extra_args` is ported as a string-valued map rather than a
@@ -370,3 +393,11 @@ are themselves deferred and would dictate the wrong shape; and the connector leg
 of the drain is left out rather than adapted, because `OffloadingEvent` and
 `KVCacheEvent` are different types owned by different rows and coercing one into
 the other here would hide a real gap behind a plausible-looking merge.
+
+A fourth is recorded as a filed gap rather than a decision: `KVEventsConfig` has
+no `PostInit`, so `{enable_kv_cache_events: true}` with an unset publisher throws
+`unknown event publisher ''` where upstream (`kv_events.py:50-52`) resolves it to
+zmq — which here should surface as the deliberately loud zmq-deferral message.
+W3's tests set `publisher = "null"` explicitly and point at
+[#353](https://github.com/mudler/vllm.cpp/issues/353); fixing it inside this
+change would have been a silent repair of a different row's surface.

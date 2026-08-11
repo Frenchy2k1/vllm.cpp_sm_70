@@ -37,6 +37,8 @@ issue is not yet placed. Keyed record: update in place, never append.
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
 | [#223](https://github.com/mudler/vllm.cpp/issues/223) | `SAMPLE-PROMPT-LOGPROBS` | `prompt_logprobs` is a silent no-op: the runner never computes logits at prompt positions | bug |
+| [#352](https://github.com/mudler/vllm.cpp/issues/352) | `KV-EVENTS` | The batch envelope is never published and `kv_cache_report_mode` does not exist — events can only be observed by reaching into the `BlockPool` | feature |
+| [#353](https://github.com/mudler/vllm.cpp/issues/353) | `KV-EVENTS` | `KVEventsConfig` has no `__post_init__`: an enabled config with an unset publisher reports `unknown event publisher ''` instead of resolving to zmq | bug |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#321](https://github.com/mudler/vllm.cpp/issues/321) | `SERVE-METRICS` | AsyncLLM output thread outlives metrics logger and uses freed PromRegistry | bug |
 | [#301](https://github.com/mudler/vllm.cpp/issues/301) | `ENG-LOAD-DIRECT-UPLOAD` | `main` is RED on ASan/UBSan: five misaligned BF16 reads from borrowed mmap weights | bug |
