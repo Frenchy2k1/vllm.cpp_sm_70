@@ -299,6 +299,12 @@ class InputBatch {
   // recorded deviation until it turned out to crash the engine
   // (specs/logprobs-all-sentinel.md).
   std::map<std::string, int> num_logprobs;
+  // req_id -> the EXPLICIT vocab ids to score (gpu_input_batch.py:273,443-444).
+  // Keyed by req_id like its `num_logprobs` sibling, so condense() and
+  // swap_states() need do nothing: reindexing cannot invalidate an id key.
+  // make_sampling_metadata re-derives the req_INDEX keys SamplingMetadata
+  // carries (gpu_input_batch.py:934-951) over the live batch only.
+  std::map<std::string, std::vector<int32_t>> logprob_token_ids;
   // req_id -> requested PROMPT-logprob count (gpu_model_runner.py:1305-1310,
   // where upstream keeps it on the runner rather than the input batch; it is
   // seeded and dropped at exactly the two sites num_logprobs above is, so it

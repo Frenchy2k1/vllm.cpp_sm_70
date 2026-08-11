@@ -17,7 +17,10 @@
 // porter slots them in without reshaping the struct:
 //   - extra_args
 //   (structured_outputs (StructuredOutputsParams) is now ported below — M3.4)
-//   - logprob_token_ids, flat_logprobs, num_logprobs()
+//   - flat_logprobs
+//   (logprob_token_ids + num_logprobs() are now ported below —
+//    `SAMPLE-LOGPROB-TOKEN-IDS`, specs/logprob-token-ids.md. Their vocab-range
+//    validation stays engine-time, like allowed_token_ids'.)
 //   - thinking_token_budget, repetition_detection (RepetitionDetectionParams),
 //     routed_experts_prompt_start, skip_reading_prefix_cache
 //   - skip_clone / clone(), for_sampler_warmup()
@@ -55,6 +58,12 @@ inline constexpr double kSamplingEps = 1e-5;
 inline constexpr double kMaxTemp = 1e-2;
 // envs.VLLM_MAX_N_SEQUENCES default (upper bound on `n`).
 inline constexpr int kMaxNSequences = 16384;
+// sampling_params.MAX_LOGPROB_TOKEN_IDS (sampling_params.py:31-33): upper bound
+// on the `logprob_token_ids` list length. Upstream ties it to the per-request
+// row width its V2 sampler's LogprobTokenIdsState allocates; our V1-shaped
+// sampler builds the row per step, so the bound is carried purely to keep the
+// accepted request surface identical.
+inline constexpr int kMaxLogprobTokenIds = 128;
 
 // SamplingType (IntEnum): int values are load-bearing (serialized / used as
 // tensor row selectors upstream).
@@ -156,6 +165,14 @@ struct SamplingParams {
   std::optional<int> logprobs;
   // Number of prompt logprobs per token; unset => none, -1 => all vocab.
   std::optional<int> prompt_logprobs;
+  // logprob_token_ids (sampling_params.py:278-283): score an EXPLICIT set of
+  // vocab ids instead of the top-k — "more efficient than logprobs=-1 when you
+  // only need logprobs for a small set of tokens". vLLM's generative-scoring
+  // endpoint drives it (generative_scoring/serving.py:247-255: max_tokens=1 +
+  // logprob_token_ids=label_token_ids). The sampler returns the sampled token
+  // plus exactly these ids; when `logprobs` is ALSO set the explicit ids WIN
+  // (sampler.py:133-136). Unset => the ordinary top-k path, byte-identical.
+  std::optional<std::vector<int32_t>> logprob_token_ids;
   // Whether to detokenize the output.
   bool detokenize = true;
   // Whether to skip special tokens in the output.
@@ -231,6 +248,13 @@ struct SamplingParams {
   // sampling_type (cached_property): greedy when temperature < _SAMPLING_EPS,
   // random_seed when a seed is set, else random.
   SamplingType Type() const;
+
+  // num_logprobs (property, sampling_params.py:724-729): the number of sample
+  // logprobs to return per output token, or unset when none were requested.
+  // `logprobs` if set, ELSE len(logprob_token_ids) if set, else unset. This —
+  // not the raw `logprobs` field — is what the scheduler's slice gate
+  // (scheduler.py:1818) and the LogprobsProcessor (logprobs.py) read.
+  std::optional<int> num_logprobs() const;
 
   // _verify_args: pure validation only. Throws std::runtime_error with the
   // upstream-equivalent message on any invalid field. const (no mutation).

@@ -1141,6 +1141,14 @@ SAMPLED from — a token top-k masked away reads `-inf` there and its true value
 under the raw pair. It is selectable by constructing a `Sampler` directly; there
 is no config, CLI or request field for it yet.
 
+The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
+[`lora/punica.h`](../include/vllm/lora/punica.h),
+[`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired
+to any engine path**: they are the in-progress runtime (`LORA-RUNTIME`), not a
+supported way to serve an adapter. There is no CLI flag, server flag, config key
+or C-ABI field for LoRA, and adding one is a later work item — see
+[`.agents/specs/lora-adapter.md`](../.agents/specs/lora-adapter.md).
+
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
 per position.
@@ -1153,6 +1161,23 @@ ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
 returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
 count is not rejected. Both are tracked by
 [issue #249](https://github.com/mudler/vllm.cpp/issues/249).
+
+`SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead —
+vLLM's generative-scoring path, and what to reach for when you only need a few
+labels compared, since it avoids the full-vocab sort `logprobs=-1` costs:
+
+```cpp
+vllm::SamplingParams sp;
+sp.max_tokens = 1;
+sp.logprob_token_ids = std::vector<int32_t>{yes_id, no_id};  // `logprobs` unset
+```
+
+Each returned position then carries exactly those ids plus the sampled token,
+whose `rank` is still its rank over the WHOLE vocabulary, so it stays comparable
+across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
+`logprobs` as well is allowed only when it equals the id count, and the explicit
+ids win. This is a library-API field today — the OpenAI request field is not
+wired yet.
 
 ## Multimodal input (image, video, audio to text)
 
