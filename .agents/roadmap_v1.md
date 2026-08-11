@@ -105,6 +105,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#274](https://github.com/mudler/vllm.cpp/issues/274) | — | `main` is not verified by its own CI: the per-job `github.ref` concurrency groups cancel every long job on the next push, so the suite never completes (spec `specs/main-verifiability.md`) | bug |
 | [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#296](https://github.com/mudler/vllm.cpp/issues/296) | — | Two limitations recorded when #285 landed: a stale TTL comment, and a publish-NAME pin `os.rename` escapes (spec `specs/operator-record.md`, "Follow-up") | bug |
+| [#402](https://github.com/mudler/vllm.cpp/issues/402) | — | 27B: a STALE COMMENT keeps the dense path off an already-built, default-ON, byte-exact quant fusion — 112 -> 16 QuantFp8Static launches/step (and the epilogue-fusion premise is REFUTED). Its §3 "Lever B" (fold the per-column FP8 alpha into the cuBLASLt epilogue) is spec [`perf-fp8-alpha-fold.md`](specs/perf-fp8-alpha-fold.md), row `PERF-FP8-ALPHA-FOLD` | perf |
 | [#408](https://github.com/mudler/vllm.cpp/issues/408) | — | 12 of 54 `tests/scripts` suites are executed by nothing, and `check-test-registration.py`'s fixed `REQUIRED_TESTS` cannot see the class (found while repairing #274) | bug |
 
 ## Top-level portfolio
