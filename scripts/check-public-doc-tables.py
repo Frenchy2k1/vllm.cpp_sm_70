@@ -636,7 +636,35 @@ STATUS_RATCHET = {
     # main's own re-pin AND PR #282's LoRA collapse. RE-MEASURED here,
     # `len(open("docs/STATUS.md").read())` == 243119 -- 243128 after #282,
     # less the Sampling row's own net -9. Byte-tight, strictly DOWN.
-    "chars": 243119,
+    #
+    #
+    # 243243 since 2026-08-11 (measured 243243): #347 landed, so this page's claim
+    # that the `llama4` / GPT-4o pre-tokenizer is unimplemented stops being
+    # true. The replacement says LESS, not more: the k-quant's ids match HF on
+    # 57/57 and the blocker moved to the forward (#359); the evidence for both
+    # lives in .agents/specs/muse-glimmer.md §12, not here. Net -2.
+    # Strictly DOWN.
+    #
+    # 243186 since 2026-08-11 (measured 243186): the Tekken (#168)
+    # and GPT-4o (#347) pre-tokenizers landed concurrently and each re-pinned
+    # this ratchet against a page the other had not yet touched -- 243188 and
+    # 243243, both stale the moment the other merged. Both histories are kept
+    # above; this is the single MEASURED value for the merged page, which
+    # carries #347's shorter Muse Glimmer wording on top of main's. Re-measured
+    # rather than carried from either PR, and rather than arithmetic on the two:
+    # zero slack is the only honest re-pin. Strictly DOWN from 243188.
+    #
+    # 243117 since 2026-08-11 (measured 243117): the landing of PRs #324, #282
+    # and #267 re-merged `origin/main` `75a29016`, which had advanced by 11
+    # commits (#249, #168 Tekken, #347 GPT-4o, #359) WHILE the three were being
+    # gated and had itself re-pinned to 243186. FOUR ratchet histories now sit
+    # above and all four are kept; none of their numbers survives, because no
+    # two of them were measured against the same page. This is the single
+    # MEASURED value for the merged page --
+    # `len(open("docs/STATUS.md").read())` == 243117 -- not arithmetic on the
+    # four, though it happens to equal main's 243186 less the LoRA row's -60
+    # and the Sampling row's -9. Byte-tight, strictly DOWN from 243186.
+    "chars": 243117,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

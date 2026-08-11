@@ -136,6 +136,10 @@ Two more example binaries ship alongside it:
   resolved mode.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
+  GGUF `tokenizer.ggml.pre` names accepted: `qwen35`, `qwen2`, `llama-bpe`,
+  `gpt-4o` / `llama4` / `kanana2` / `talkie` (the GPT-4o / o200k family),
+  `joyai-llm`, `deepseek-llm`, `deepseek-v3`, `laguna`. Any other name is
+  refused by name rather than aliased onto a near-miss regex.
 
 ### Which HF tokenizers load
 
@@ -149,6 +153,7 @@ name, so a checkpoint from any vendor loads if it carries one of these:
 | Qwen2/Qwen3 classic | as above without `\p{M}` awareness | Qwen3-0.6B, Qwen3-Coder |
 | Llama-3 | `\p{N}{1,3}` digit groups, no `\p{M}` awareness | Llama-3 family |
 | Tekken (Mistral) | case-aware letter runs, single-codepoint `\p{N}`, `/` in the punct tail | Mistral-Nemo-Instruct-2407 |
+| GPT-4o / o200k | the same case-aware letter runs, plus o200k's contraction SUFFIX and `\p{N}{1,3}` | Muse Glimmer (pre `llama4`), GPT-4o |
 | GPT-2 byte-level | `ByteLevel(use_regex=true)` with no explicit `Split` | OPT, GPT-2 |
 | DeepSeek | a seven-stage `Sequence` pipeline, not one alternation | DeepSeek-V2/V3 |
 | SentencePiece | `Metaspace` + byte-fallback vocab | Mistral-7B-v0.3 |
@@ -160,7 +165,10 @@ hit that, the printed regex is what a new pattern would have to match.
 Note that Mistral ships **two** unrelated tokenizer families: Mistral-7B-v0.3 is
 SentencePiece, while Mistral-Nemo is Tekken, a byte-level BPE whose regex is
 tiktoken's `o200k_base` with the contraction group removed and `\p{N}{1,3}`
-reduced to `\p{N}`. Support for one says nothing about the other.
+reduced to `\p{N}`. Support for one says nothing about the other. Putting those
+two edits back gives the GPT-4o row above, so the two share one scanner's
+character classes but stay separate patterns: they disagree on `don't` and on
+every digit run longer than one.
 
 ### How much memory a Vulkan load needs
 
@@ -727,8 +735,17 @@ attention output gate, `down_proj` and the merged `gate_up` stay quantized, whil
 the merged QKV, `lm_head` and the embedding table expand to bf16 because the
 shared forward consumes them in a form a block encoding cannot take.
 
-Two caveats, both properties of the published files rather than of this loader:
+Three caveats:
 
+- **The k-quant generates coherent text, but is not token-exact against
+  llama.cpp.** Two defects had to be fixed to get there: the GGUF tokenizer gap
+  ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
+  GPT-4o / o200k family) and the converter's Q/K RoPE row permutation
+  ([#359](https://github.com/mudler/vllm.cpp/issues/359), which produced
+  `" is is is ..."`). `"The capital of France is"` at `--temperature 0` now
+  continues `" Paris. The capital of France is Paris. ..."`. llama.cpp on the
+  same file agrees on the first token and then diverges; whether that residual is
+  quantization drift or a second defect is open.
 - **Image and video need the bf16 safetensors.** The released
   `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
   axis, so half the weight is not in the file; loading it is refused by name.
