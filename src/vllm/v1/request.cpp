@@ -68,6 +68,17 @@ Request::Request(std::string request_id,
   // sampling params (nullopt when there is no structured-output constraint).
   structured_output_request =
       StructuredOutputRequest::from_sampling_params(&this->sampling_params);
+  // request.py:116-127: kv_cache_report_mode is
+  // extra_args.get("kv_cache_report_mode", "incremental"), and "incremental"
+  // when extra_args itself is absent. The sibling keys upstream reads from the
+  // same dict (kv_transfer_params, ec_transfer_params) belong to deferred rows.
+  if (this->sampling_params.extra_args.has_value()) {
+    const auto& args = *this->sampling_params.extra_args;
+    const auto it = args.find("kv_cache_report_mode");
+    if (it != args.end()) {
+      kv_cache_report_mode = it->second;
+    }
+  }
   // Upstream computes the initial block hashes at the end of __init__.
   update_block_hashes();
 }

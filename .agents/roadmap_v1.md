@@ -55,8 +55,11 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
+| [#382](https://github.com/mudler/vllm.cpp/issues/382) | `KERNEL-ATTN-PAGED` | decode-opt attention kernel is head_dim-256 only; head_dim 128 (Qwen3-dense, Llama, Mistral) falls to the block kernel | perf |
 | [#206](https://github.com/mudler/vllm.cpp/issues/206) | `KERNEL-SSM-MAMBA` | RTX 5070 Ti: close Qwen3.5-4B TTFT, TPOT and VRAM gaps vs vLLM — owns the sm_120 post-conv token tile and the K=4 causal-conv arm (PR #155) | feature |
 | [#305](https://github.com/mudler/vllm.cpp/issues/305) | `KERNEL-SSM-MAMBA` | GDN causal-conv: the `conv_state` initial-state read races the final-state write across blocks (`VT_CONV_REG` + exact chunks, both default ON) | bug |
+| [#352](https://github.com/mudler/vllm.cpp/issues/352) | `KV-EVENTS` | The batch envelope is never published and `kv_cache_report_mode` does not exist — events can only be observed by reaching into the `BlockPool` | feature |
+| [#353](https://github.com/mudler/vllm.cpp/issues/353) | `KV-EVENTS` | `KVEventsConfig` has no `__post_init__`: an enabled config with an unset publisher reports `unknown event publisher ''` instead of resolving to zmq | bug |
 | [#396](https://github.com/mudler/vllm.cpp/issues/396) | `KV-EXTERNAL-CACHE` | `test_lmcache_connector` data race under TSan: `MockLmcacheServer` writes non-atomic `listen_fd_` before joining its accept thread | bug |
 | [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |
 | [#278](https://github.com/mudler/vllm.cpp/issues/278) | `LORA-RUNTIME` | LoRA W2: packed adapters, merged qkv/gate_up layers, TP slicing, embedding + logits LoRA | feature |
@@ -98,8 +101,8 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#242](https://github.com/mudler/vllm.cpp/issues/242) | — | `docs/FEATURES.md` drift: arch counts say 30 (registry has 35), multimodal-over-HTTP marked ☐ though W1-W3 landed | bug |
 | [#243](https://github.com/mudler/vllm.cpp/issues/243) | — | `vllm-feature-gap-analysis.md` is a stale 2026-07-28 snapshot: 9 of 16 HIGH/MED gaps have since landed | bug |
 | [#250](https://github.com/mudler/vllm.cpp/issues/250) | — | `a5b52047` reached main without a task branch, and `check-role-discipline` cannot be waived | bug |
-| [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#274](https://github.com/mudler/vllm.cpp/issues/274) | — | `main` is not verified by its own CI: the per-job `github.ref` concurrency groups cancel every long job on the next push, so the suite never completes (spec `specs/main-verifiability.md`) | bug |
+| [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#296](https://github.com/mudler/vllm.cpp/issues/296) | — | Two limitations recorded when #285 landed: a stale TTL comment, and a publish-NAME pin `os.rename` escapes (spec `specs/operator-record.md`, "Follow-up") | bug |
 | [#408](https://github.com/mudler/vllm.cpp/issues/408) | — | 12 of 54 `tests/scripts` suites are executed by nothing, and `check-test-registration.py`'s fixed `REQUIRED_TESTS` cannot see the class (found while repairing #274) | bug |
 
