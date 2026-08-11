@@ -148,9 +148,35 @@ forbidden-AI-trailer rule. Those are the guarantees the gate exists to hold.
 
 ## Now
 
-W3 done; the row is landing. Next: decide the merge-method change that closes the
-four remaining shapes, which is process, not checker.
+`DONE` at `157080c8`. Nothing scheduled. The merge-method decision that would
+close the remaining four shapes is a separate question, recorded in Outcome.
 
 ## Outcome
 
-Pending.
+Landed `157080c8` (PR #409). One of five observed shapes fixed, and that is the
+honest measure of this row.
+
+**What was measured.** Fusing consecutive trailing trailer-shaped paragraphs
+makes `dbd0d51c` pass, where it had been failing while carrying a complete,
+correct trailer block. The other four commits keep their prior verdicts, which is
+the intent.
+
+**What the fix newly surfaced.** `f64f2b71` names a BOT co-author. That is a real
+`AGENTS.md` violation which the broken parse had been hiding, so making the block
+visible turned a silent pass into a correct failure. Worth stating because it
+looks like a regression and is the opposite.
+
+**What was rejected, and why it is the more useful half.** The first attempt also
+collapsed identical duplicate trailers, to fix the multi-commit-squash shape. An
+existing test, `test_protocol_and_ai_declarations_are_unique_and_exact`, pins that
+uniqueness rule. Rewriting an assertion to suit the change is what `AGENTS.md`
+forbids, and the distinction turned out to be substantive rather than procedural:
+a doubled block is a genuinely malformed message fixable at source, whereas the
+`Co-authored-by` case is a correct commit defeated by the parser. Reverted in
+full; `b8293c88` stays red deliberately.
+
+**What is still open.** Four of five shapes are merge-method artifacts — GitHub's
+`---------` squash separator, the doubled block, the trailer-less merge-button
+message, and bot co-authors. Closing them means changing how commits land, not
+what the checker accepts. That decision is the developer's, and it is the reason
+this row does not claim to have made `main` green.
