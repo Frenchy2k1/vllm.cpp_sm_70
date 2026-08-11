@@ -554,7 +554,7 @@ STATUS_RATCHET = {
     # 243245 since 2026-08-11 (measured 243245): ENG-RELEASE-CONTAINERS
     # owes the page a lifecycle line, paid for inside the release
     # paragraph rather than out of the page. Strictly DOWN.
-    "chars": 243245,
+    "chars": 243243,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
