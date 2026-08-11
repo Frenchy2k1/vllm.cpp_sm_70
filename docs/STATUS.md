@@ -32,14 +32,14 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 ## Capability status
 
 Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**, moving
-**100.2 -> 81.3 GiB** ([detail](../.agents/specs/load-direct-upload.md)). Startup (provisional) —
-27B-NVFP4 first `/health` **36.51 s vs vLLM's 221.51 s = 6.07x**
-([detail](../.agents/specs/startup-latency-axis.md)).
+**100.2 -> 81.3 GiB** ([detail](../.agents/specs/load-direct-upload.md)). Startup (provisional)
+**6.07x** ([detail](../.agents/specs/startup-latency-axis.md)).
 
-Binary releases: required W1-W11/W13 are implemented in draft #196; local CPU,
-Vulkan, archive, metadata and mutation gates are green. The hosted eight-tuple
-dry run and tagged publication remain pending, so no binary is published. W12
-per-SM diagnostics remain optional. See [RELEASES](RELEASES.md).
+Releases: W1-W11/W13 are implemented in #196; local CPU, Vulkan, archive,
+metadata and mutation gates are green, while the hosted eight-tuple dry run and
+tagged publication stay pending, so no binary is published. Container
+images (#170): the cpu lane passes its gate; nothing is published.
+See [RELEASES](RELEASES.md).
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
 append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.

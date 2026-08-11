@@ -54,8 +54,17 @@ got there. Before concluding anything about past work, check the spec and
 confirm an issue tracks the work; if none exists, open one. Link it in three
 places that must agree: the issue table in
 [`.agents/roadmap_v1.md`](.agents/roadmap_v1.md), the row's spec, and the PR
-body. A bug you found while doing something else gets its own issue rather than
-a silent fix.
+body.
+
+A bug you find while doing something else still gets an issue — but filing it
+does not mean deferring it. File it, fix it in the same flow, reference it in
+the commit, and close it. The traceability is what matters, not the round trip:
+the person who just found the bug has the context to fix it, and making them
+hand it off loses that.
+
+This covers the small and obvious. A fix that needs its own spec, changes a
+checker's semantics, or would surprise a reviewer still takes the normal
+row / spec / fresh-review path — "fix it in-flow" is not a bypass for those.
 
 ## Spec before code
 

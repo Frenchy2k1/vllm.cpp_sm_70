@@ -551,13 +551,17 @@ STATUS_RATCHET = {
     # Nothing was lost, only de-duplicated -- every dropped figure was verified
     # present in both other surfaces first. Net -4. Strictly DOWN.
     #
-    # 243281 since 2026-08-11 (measured 243281): #347 landed, so the sentence
-    # above stops being true -- the `llama4` pre-tokenizer IS implemented and
-    # the k-quant's ids match HF on 57/57. The replacement says less, not more:
-    # the blocker moved to the forward (#359) and the evidence for both claims
+    # 243245 since 2026-08-11 (measured 243245): ENG-RELEASE-CONTAINERS
+    # owes the page a lifecycle line, paid for inside the release
+    # paragraph rather than out of the page. Strictly DOWN.
+    #
+    # 243243 since 2026-08-11 (measured 243243): #347 landed, so this page's claim
+    # that the `llama4` / GPT-4o pre-tokenizer is unimplemented stops being
+    # true. The replacement says LESS, not more: the k-quant's ids match HF on
+    # 57/57 and the blocker moved to the forward (#359); the evidence for both
     # lives in .agents/specs/muse-glimmer.md §12, not here. Net -2.
     # Strictly DOWN.
-    "chars": 243281,
+    "chars": 243243,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
