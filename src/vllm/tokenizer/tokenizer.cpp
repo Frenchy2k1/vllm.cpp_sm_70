@@ -26,9 +26,17 @@ constexpr const char* kQwen36Regex =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 constexpr const char* kClassicQwen2Regex =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
-// GPT-4o / o200k (the "llama4" GGUF pre name). This one MUST be matched
-// exactly and BEFORE the `\p{N}{1,3}` heuristic below, because it contains
-// `\p{N}{1,3}` too — see the comment at that heuristic.
+// Mistral Tekken (mistralai/Mistral-Nemo-Instruct-2407 and the other Tekken
+// checkpoints). Byte-equal to tiktoken's o200k_base pat_str except that the
+// optional (?i:'s|'t|...) group is absent from both letter alternatives and
+// numbers are \p{N} rather than \p{N}{1,3}.
+constexpr const char* kTekkenRegex =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// GPT-4o / o200k (the "llama4" GGUF pre name). o200k_base pat_str VERBATIM --
+// i.e. kTekkenRegex with the two edits above put back: the contraction group
+// is present as a SUFFIX of both letter alternatives, and numbers are
+// \p{N}{1,3}. That last one is why this MUST be matched exactly and BEFORE the
+// `\p{N}{1,3}` heuristic below -- see the comment at that heuristic.
 constexpr const char* kGpt4oRegex =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
@@ -355,12 +363,16 @@ SplitPattern DetectPattern(const json& doc) {
   }
   if (re == kQwen36Regex) return SplitPattern::kQwen2;
   if (re == kClassicQwen2Regex) return SplitPattern::kQwen2Classic;
-  // BEFORE the `\p{N}{1,3}` heuristic: the GPT-4o / o200k regex groups digits
-  // in threes as well, so the heuristic below claims it and hands back
-  // kLlama3 — a split that tokenizes plausibly and WRONGLY (it never breaks
+  if (re == kTekkenRegex) return SplitPattern::kTekken;
+  // BOTH exact matches BEFORE the `\p{N}{1,3}` heuristic. kGpt4oRegex groups
+  // digits in threes as well, so the heuristic below claims it and hands back
+  // kLlama3 -- a split that tokenizes plausibly and WRONGLY (it never breaks
   // CamelCase and it detaches every contraction). Muse Glimmer's HF
   // tokenizer.json is exactly that shape, so this line is what stops the
   // safetensors path from silently mistokenizing it. Issue #347.
+  // kTekkenRegex uses single-codepoint `\p{N}` and so was never at risk from
+  // the heuristic, but it is matched exactly for the same reason: recognition
+  // here is by whole pattern, never by a substring that a sibling shares.
   if (re == kGpt4oRegex) return SplitPattern::kGpt4o;
   if (re.find(R"(\p{N}{1,3})") != std::string::npos) {
     return SplitPattern::kLlama3;

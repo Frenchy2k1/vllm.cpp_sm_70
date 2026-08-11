@@ -11,9 +11,9 @@ using vllm::tok::Category;
 using vllm::tok::DecodeUtf8;
 using vllm::tok::EncodeUtf8;
 using vllm::tok::IsWhitespace;
-using vllm::tok::LetterSub;
+using vllm::tok::LetterCaseOf;
 using vllm::tok::UCat;
-using vllm::tok::ULetterSub;
+using vllm::tok::LetterCase;
 
 TEST_CASE("Category spot checks") {
   CHECK(Category(U'a') == UCat::kLetter);
@@ -171,40 +171,41 @@ TEST_CASE("Range table sanity: sorted, non-overlapping, non-empty") {
   CHECK(Category(U'[') == UCat::kPunct);  // Ps, immediately after 'Z'
 }
 
-// LetterSub is the minor letter class the GPT-4o / o200k split regex needs
-// (issue #347). Spot checks are Unicode general categories, verifiable against
+// LetterCaseOf is the minor letter class the Tekken (#168) and GPT-4o (#347)
+// split regexes need -- they name the SAME two classes. Spot checks are Unicode
+// general categories, verifiable against
 // `python3 -c "import unicodedata; print(unicodedata.category(chr(0x...)))"`.
-TEST_CASE("LetterSub splits L* three ways") {
-  CHECK(LetterSub(U'a') == ULetterSub::kLl);          // Ll
-  CHECK(LetterSub(U'z') == ULetterSub::kLl);          // Ll
-  CHECK(LetterSub(0x00E9) == ULetterSub::kLl);        // é  Ll
-  CHECK(LetterSub(U'A') == ULetterSub::kLuLt);        // Lu
-  CHECK(LetterSub(0x00C9) == ULetterSub::kLuLt);      // É  Lu
-  CHECK(LetterSub(0x01C5) == ULetterSub::kLuLt);      // ǅ  Lt (title case)
-  CHECK(LetterSub(0x01C4) == ULetterSub::kLuLt);      // Ǆ  Lu
-  CHECK(LetterSub(0x01C6) == ULetterSub::kLl);        // ǆ  Ll
-  CHECK(LetterSub(0x02B0) == ULetterSub::kLmLo);      // ʰ  Lm
-  CHECK(LetterSub(0x99C5) == ULetterSub::kLmLo);      // 駅 Lo
-  CHECK(LetterSub(0x05D0) == ULetterSub::kLmLo);      // א  Lo
+TEST_CASE("LetterCaseOf splits L* three ways") {
+  CHECK(LetterCaseOf(U'a') == LetterCase::kLower);        // Ll
+  CHECK(LetterCaseOf(U'z') == LetterCase::kLower);        // Ll
+  CHECK(LetterCaseOf(0x00E9) == LetterCase::kLower);      // é  Ll
+  CHECK(LetterCaseOf(U'A') == LetterCase::kUpper);        // Lu
+  CHECK(LetterCaseOf(0x00C9) == LetterCase::kUpper);      // É  Lu
+  CHECK(LetterCaseOf(0x01C5) == LetterCase::kUpper);      // ǅ  Lt (title case)
+  CHECK(LetterCaseOf(0x01C4) == LetterCase::kUpper);      // Ǆ  Lu
+  CHECK(LetterCaseOf(0x01C6) == LetterCase::kLower);      // ǆ  Ll
+  CHECK(LetterCaseOf(0x02B0) == LetterCase::kCaseless);   // ʰ  Lm
+  CHECK(LetterCaseOf(0x99C5) == LetterCase::kCaseless);   // 駅 Lo
+  CHECK(LetterCaseOf(0x05D0) == LetterCase::kCaseless);   // א  Lo
   // Non-letters, including the marks that the GPT-4o classes add SEPARATELY.
-  CHECK(LetterSub(U'5') == ULetterSub::kNotLetter);
-  CHECK(LetterSub(U' ') == ULetterSub::kNotLetter);
-  CHECK(LetterSub(0x0301) == ULetterSub::kNotLetter);  // combining acute, Mn
-  CHECK(LetterSub(0x110000) == ULetterSub::kNotLetter);
+  CHECK(LetterCaseOf(U'5') == LetterCase::kNotLetter);
+  CHECK(LetterCaseOf(U' ') == LetterCase::kNotLetter);
+  CHECK(LetterCaseOf(0x0301) == LetterCase::kNotLetter);  // combining acute, Mn
+  CHECK(LetterCaseOf(0x110000) == LetterCase::kNotLetter);
 }
 
-TEST_CASE("LetterSub and Category agree on what a letter is") {
+TEST_CASE("LetterCaseOf and Category agree on what a letter is") {
   // The two tables are generated from the same unicodedata pass; if one is
-  // regenerated without the other they drift, and a GPT-4o letter run silently
-  // changes shape. Sweep the BMP plus a slice of the SMP.
+  // regenerated without the other they drift, and a Tekken or GPT-4o letter run
+  // silently changes shape. Sweep the BMP plus a slice of the SMP.
   for (uint32_t cp = 0; cp < 0x11000; ++cp) {
     const bool by_cat = Category(cp) == UCat::kLetter;
-    const bool by_sub = LetterSub(cp) != ULetterSub::kNotLetter;
-    if (by_cat != by_sub) FAIL("Category/LetterSub disagree at cp ", cp);
+    const bool by_case = LetterCaseOf(cp) != LetterCase::kNotLetter;
+    if (by_cat != by_case) FAIL("Category/LetterCaseOf disagree at cp ", cp);
   }
   for (uint32_t cp = 0x1D400; cp < 0x1D800; ++cp) {
     const bool by_cat = Category(cp) == UCat::kLetter;
-    const bool by_sub = LetterSub(cp) != ULetterSub::kNotLetter;
-    if (by_cat != by_sub) FAIL("Category/LetterSub disagree at cp ", cp);
+    const bool by_case = LetterCaseOf(cp) != LetterCase::kNotLetter;
+    if (by_cat != by_case) FAIL("Category/LetterCaseOf disagree at cp ", cp);
   }
 }

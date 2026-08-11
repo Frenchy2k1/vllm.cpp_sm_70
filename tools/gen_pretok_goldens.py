@@ -33,6 +33,25 @@ LLAMA3 = (
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
+# Tekken (Mistral). Verbatim from mistralai/Mistral-Nemo-Instruct-2407
+# tokenizer.json (pre_tokenizer.pretokenizers[0].pretokenizers[0].pattern.Regex,
+# behavior=Isolated, invert=false); the ByteLevel sibling carries
+# use_regex=false, so this Split is the whole word-splitting rule.
+#
+# Structurally this is tiktoken's o200k_base pat_str with exactly two edits:
+# the optional `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` group is absent from both letter
+# alternatives, and numbers are single-codepoint `\p{N}` rather than
+# `\p{N}{1,3}`. Everything from the punct run onward is byte-identical to
+# o200k_base. Note the two CASE-AWARE letter alternatives, which no other
+# pattern in this file has: an uppercase/caseless run followed by a lowercase
+# run, then the same pair with the quantifiers swapped. Alternation is ORDERED,
+# so the first is tried first at every position.
+TEKKEN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
 # GPT-4o / o200k family (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O; GGUF pre names
 # "gpt-4o", "llama4", "kanana2", "talkie"). VERBATIM from
 # /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json
@@ -96,6 +115,26 @@ DETERMINISTIC = [
     "1234 x 123456789",
     "  12",
     "tab\tnum\t9",
+    # Tekken's case-aware letter split: an uppercase run ends a piece when a
+    # lowercase run follows. Qwen/Llama-3 keep each of these as ONE letter run,
+    # so these rows discriminate the new pattern from both existing ones.
+    "HelloWorld fooBarBaz",
+    "McDonald iOS ABCdef",
+    "ABC A1b2",
+    # Lt (titlecase, U+01C5) and Lu-with-dot (U+0130) must both count as the
+    # UPPER class; ſ is Ll despite looking uppercase-ish.
+    "ǅabc İstanbul aſb",
+    # Marks are in Tekken's letter classes but NOT excluded from its punct run
+    # (unlike Qwen, which excludes them from both) -- the combination that
+    # forces marks_in_run and marks_excluded apart.
+    "é́X word́ ́word",
+    # '/' is in Tekken's punct-run TRAILING class ([\r\n/]*, vs [\r\n]* for
+    # Qwen/Llama-3). Only observable when '/' follows a newline that follows a
+    # punct run -- a bare "a/b" absorbs '/' into the run itself and cannot see
+    # the difference.
+    "!!\n/b",
+    "a.\n//y",
+    "x!\n/",
     # GPT-4o-specific structure (each of these separates it from kLlama3):
     "abcDEF HTMLParser camelCaseWord",   # lower->upper splits, upper run does not
     "don't DON'T It's o'clock",          # contraction is a word SUFFIX here
@@ -107,6 +146,19 @@ DETERMINISTIC = [
     "\u01c5\u01c4\u01c6 \u01c4x",             # Lt (title case) is in A only
     "'s 'S x's X'S ' 's",                # apostrophe with no preceding word
     "\u4f60\u597dABC\u4f60\u597d",             # Lo neighbours a Lu run
+    # \p{M} INSIDE the UPPER letter class (issue #369). Both kTekken and
+    # kGpt4o put marks in BOTH letter classes, but nothing above could tell:
+    # with a LOWERCASE base
+    # ("e\u0301X", "word\u0301") the mark is absorbed by the lower class and the
+    # upper class's \p{M} branch never decides anything. It takes an UPPERCASE
+    # base, a combining mark, and then MORE upper/caseless letters -- the mark
+    # has to keep the upper run alive across itself. Found by mutation: dropping
+    # \p{M} from the upper class left every other row in this file byte-identical
+    # and every gate green, while changing the split on 1957 of 36104 fuzz
+    # inputs. These rows are what makes that mutant die.
+    "A\u0301Aa A\u0301A\u0301 A\u0301\u0308B",
+    "\u00c9CHO A\u0301\u0359\u01c5x",
+    "HTM\u0139Parser",
 ]
 
 ASCII_POOL = (
@@ -148,6 +200,7 @@ def pieces(pt: Split, s: str) -> list[str]:
 def main() -> None:
     qwen = Split(Regex(QWEN), behavior="isolated", invert=False)
     llama = Split(Regex(LLAMA3), behavior="isolated", invert=False)
+    tekken = Split(Regex(TEKKEN), behavior="isolated", invert=False)
     gpt4o = Split(Regex(GPT4O), behavior="isolated", invert=False)
     cases = DETERMINISTIC + random_strings(seed=42, count=60)
 
@@ -164,6 +217,7 @@ def main() -> None:
     for s in cases:
         q = pieces(qwen, s)
         l = pieces(llama, s)
+        t = pieces(tekken, s)
         g = pieces(gpt4o, s)
         # rstrip: a trailing backslash in a // comment splices lines (GCC even
         # splices across "backslash then whitespace then newline").
@@ -171,6 +225,7 @@ def main() -> None:
         w("    SV(%s),\n" % cxx_bytes(s))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in q))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in l))
+        w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in t))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in g))
         w("  },\n")
     w("};\n")
