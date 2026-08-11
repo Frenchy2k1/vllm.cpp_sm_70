@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Enforce finite review budgets for explicit repository path classes."""
+"""Enforce explicit path classification and the checker-evidence contract.
+
+The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10;
+see the note where they stood. What remains: every changed path must classify
+explicitly, binaries fail closed, a governance-checker change must carry
+executable mutation evidence, and product paths must arrive on a PR."""
 
 from __future__ import annotations
 
@@ -14,10 +19,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-try:
-    from scripts.waivers import Waiver, load_waivers
-except ModuleNotFoundError:
-    from waivers import Waiver, load_waivers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,31 +43,19 @@ PATH_CLASSES = frozenset(
         "generated",
     }
 )
-PATH_CLASS_BUDGETS = {
-    "product": 900,
-    "governance_checker": 6000,
-    "governance_test": 3000,
-    "governance_support": 1800,
-    "policy": 1200,
-    "procedure": 3000,
-    "append_only_record": 5000,
-    "project_record": 4000,
-    "public_document": 2500,
-    "design": 1500,
-    "ci": 800,
-    "configuration": 800,
-    "asset": 3000,
-    "evidence": 8000,
-    "vendored_dependency": 8000,
-    # A REVIEW budget is a budget on what a human reads. Nobody reads a hex blob,
-    # and re-deriving one by eye is not review. These files are emitted by a
-    # tracked generator from reviewed sources, and a dedicated gate reproduces
-    # them BYTE-FOR-BYTE from those sources on every push, so their correctness is
-    # established mechanically rather than by reading the diff. The reviewable
-    # surface is the GENERATOR and its INPUTS, both of which stay `product` or
-    # `governance_checker` and keep their own tighter budgets.
-    "generated": 8000,
-}
+# NO LINE BUDGET. The per-class budgets that used to live here were retired on
+# 2026-08-10 by developer decision, on measured grounds: over the last 22 merged
+# PRs the `product` budget of 900 lines was exceeded by 9 of them (41%), and
+# tests were 33-57% of the diff in every large one. A gate that fires on four
+# changes in ten is not a budget, it is noise that teaches people to waive it,
+# and charging RED-first mutation tests against the same allowance as kernel
+# code penalised exactly the discipline the rest of this document demands.
+# Reviewability is now a review judgement, not an arithmetic one.
+#
+# Everything else this checker enforces is unchanged and is NOT a size rule:
+# explicit path classification (no blanket directory exemptions), the
+# fail-closed binary guard, the checker-change mutation-evidence contract, and
+# the role checks that keep product paths on a PR.
 
 # Machine-generated artifacts, each of which MUST be (a) emitted by a tracked
 # generator in this repository, (b) reproduced byte-for-byte by a gate that runs
@@ -83,7 +72,6 @@ GENERATED_FILES = frozenset(
 
 POLICY_FILES = frozenset(
     {
-        ".agents/waivers.csv",
     }
 )
 APPEND_ONLY_FILES = frozenset(
@@ -133,7 +121,6 @@ PROCEDURE_FILES = frozenset(
 )
 GOVERNANCE_SUPPORT_FILES = frozenset(
     {
-        "scripts/waivers.py",
         "scripts/agent-role.py",
         "scripts/claim-view.py",
         "scripts/ready-for-helper.py",
@@ -159,6 +146,19 @@ CHECKER_TEST = re.compile(r"tests/scripts/test_[a-z0-9]+(?:_[a-z0-9]+)*\.py\Z")
 CI = re.compile(r"\.github/(?:workflows/[A-Za-z0-9_.-]+\.ya?ml|dependabot\.yml|pull_request_template\.md)\Z")
 DESIGN = re.compile(r"docs/superpowers/specs/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md\Z")
 DOC = re.compile(r"docs/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|png|svg|json)\Z")
+# The published documentation site. Its layouts, CSS, config and assets are
+# prose and presentation for a PUBLIC surface, reviewed the way the documents
+# themselves are -- not product code, and not CI (the workflow that publishes it
+# keeps its own `ci` class). One class for the whole directory on purpose:
+# splitting layouts from config would let a large redesign hide half its diff in
+# the cheaper bucket, which is the blanket-exemption failure AGENTS.md names.
+SITE = re.compile(r"website/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
+# `website/static/` is the site's artwork and fonts -- logos, a favicon, woff2.
+# Not prose, and the binaries among them have no reviewable line budget at all,
+# so they take the `asset` class the same way any other shipped artwork does.
+# Kept as a separate pattern rather than an extension list: what makes these
+# assets is WHERE they live, and static/ is Hugo's name for exactly that.
+SITE_ASSET = re.compile(r"website/static/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
 SPEC = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.md\Z")
 SPEC_EVIDENCE = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.(?:patch|json|log)\Z")
 COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
@@ -197,6 +197,12 @@ RELEASE_MANIFEST_FIXTURE = re.compile(
 # Each entry keeps the class its path resolved to while it was live, so the
 # review budget a historical diff spends does not move.
 RETIRED_PATHS = {
+    # `policy: retire the waiver registry` (#281): a registry of exceptions is a
+    # state log, so an exception now argues for itself in the commit that needs
+    # it and `git log --grep` is the record. Same reasoning as policy.csv below.
+    ".agents/waivers.csv": "policy",
+    "scripts/waivers.py": "governance_support",
+    "tests/scripts/test_waivers.py": "checker_test",
     # `policy: the code is the state, git is the history` (0f3e44ee): AGENTS.md
     # became the single normative surface and git became the history.
     ".agents/policy.csv": "policy",
@@ -247,8 +253,6 @@ CREATION_MUTATIONS = {
         b"def parsed_trailers(message): return ''\n"
         b"def validate_commit_message(message, *, strict): return []\n"
         b"def validate_range(*args, **kwargs): return []\n"
-        b"def exact_waiver(*args, **kwargs): return None\n"
-        b"def validate_waiver_targets(*args, **kwargs): return None\n"
     ),
     "scripts/check-arm-isa-build.py": DISABLED_CREATION_CHECKER,
     "scripts/check-cpu-isa-build.py": DISABLED_CREATION_CHECKER,
@@ -258,6 +262,11 @@ CREATION_MUTATIONS = {
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
     "scripts/check-triton-aot-multiarch.py": DISABLED_CREATION_CHECKER,
+    # A new checker has no BASE version to mutate, so it registers the disabled
+    # form its own tests must reject. The empty stub exits 0 and prints nothing,
+    # which fails every case in tests/scripts/test_check_site.py -- including
+    # the clean-tree case, which asserts the "nav in bijection" line.
+    "scripts/check-site.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
@@ -351,7 +360,9 @@ def classify_path(path: str) -> str:
         return "governance_support"
     if DESIGN.fullmatch(path):
         return "design"
-    if path in PUBLIC_DOCUMENT_FILES or DOC.fullmatch(path):
+    if SITE_ASSET.fullmatch(path):
+        return "asset"
+    if path in PUBLIC_DOCUMENT_FILES or DOC.fullmatch(path) or SITE.fullmatch(path):
         return "public_document"
     if path in PRODUCT_CHECKER_FILES:
         return "product"
@@ -423,11 +434,8 @@ def change_errors(
     changes: list[ChangedPath],
     *,
     evidence_results: dict[str, EvidenceResult] | None = None,
-    waivers: tuple[Waiver, ...] = (),
-    waiver_scope: str = "",
 ) -> list[str]:
     errors: list[str] = []
-    totals = {path_class: 0 for path_class in PATH_CLASSES}
     changed_paths = {change.path: change for change in changes}
     for change in changes:
         try:
@@ -436,9 +444,8 @@ def change_errors(
             errors.append(str(exc))
             continue
         if change.lines is None:
-            errors.append(f"binary change {change.path!r} has no reviewable line budget")
+            errors.append(f"binary change {change.path!r} is not reviewable as text")
             continue
-        totals[path_class] += change.lines
         if path_class == "governance_checker":
             evidence = recognized_evidence(change.path)
             evidence_change = changed_paths.get(evidence)
@@ -466,23 +473,6 @@ def change_errors(
                     errors.append(
                         f"BASE checker stayed green for {change.path!r}; changed test is not semantic evidence"
                     )
-    for path_class in sorted(PATH_CLASSES):
-        budget = PATH_CLASS_BUDGETS[path_class]
-        if totals[path_class] > budget:
-            applicable = [
-                waiver
-                for waiver in waivers
-                if waiver.checker == SELF_CHECKER and waiver.scope == waiver_scope
-            ]
-            if len(applicable) > 1:
-                raise ValueError(
-                    f"duplicate applicable waivers for {SELF_CHECKER} {waiver_scope}"
-                )
-            if applicable:
-                continue
-            errors.append(
-                f"{path_class} changes total {totals[path_class]} lines, over the {budget}-line budget"
-            )
     return errors
 
 
@@ -686,13 +676,10 @@ def main() -> int:
         base_oid = resolve_commit(ROOT, args.base)
         head_oid = resolve_commit(ROOT, args.head)
         changes = changed_paths(base_oid, head_oid)
-        waivers = load_waivers(ROOT)
         evidence = executable_evidence(ROOT, base_oid, head_oid, changes)
         errors = change_errors(
             changes,
             evidence_results=evidence,
-            waivers=waivers,
-            waiver_scope=f"pr:{args.pr_number}" if args.pr_number else "",
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"ERROR: PR size check could not classify the change: {exc}", file=sys.stderr)

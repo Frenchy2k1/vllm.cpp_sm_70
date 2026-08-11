@@ -47,7 +47,7 @@ cmake --build "$build_dir" --target server test_metal_backend -j 2
 release_dir="$build_dir/release"
 stage_dir="$release_dir/stage"
 metadata_dir="$release_dir/metadata"
-archive="$release_dir/$artifact_id.tar.gz"
+archive="$release_dir/vllm.cpp-$VERSION-$artifact_id.tar.gz"
 mkdir -p "$release_dir"
 python3 scripts/package-server.py --build-dir "$build_dir" --stage-dir "$stage_dir"
 

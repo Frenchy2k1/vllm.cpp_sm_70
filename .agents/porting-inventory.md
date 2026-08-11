@@ -215,10 +215,11 @@ dgx-pending). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
 from T1 below — the OpenAI-serving MVP needs them). Greedy = bit-exact parity gate;
 random RNG = exponential-noise gumbel-max, distribution-correct, **torch-Philox
 bit-exact parity deferred to T1**. Deferred (marked stubs): spec-decode
-bonus-token, thinking-budget, logprobs_mode variants beyond raw/processed.
-**logprob_token_ids (generative scoring) LANDED 2026-08-10** and is no longer a
-stub — `SAMPLE-LOGPROB-TOKEN-IDS` in engine-matrix.md,
-[specs/logprob-token-ids.md](specs/logprob-token-ids.md). **InputBatch-side tracking of seeds/min_p/min_tokens/
+bonus-token, thinking-budget. **logprob_token_ids (generative scoring) LANDED
+2026-08-10** and is no longer a stub — `SAMPLE-LOGPROB-TOKEN-IDS` in
+engine-matrix.md, [specs/logprob-token-ids.md](specs/logprob-token-ids.md).
+(The `logprobs_mode` variants left the same stub list when #238 landed; the
+sentence is corrected here because this edit rewrites it.) **InputBatch-side tracking of seeds/min_p/min_tokens/
 logit_bias/allowed/bad_words + num_logprobs is an M1.8 wiring dependency**
 (make_sampling_metadata emits empty defaults today — the InputBatch doesn't store
 them yet; SamplingMetadata carries the fields ready to populate).

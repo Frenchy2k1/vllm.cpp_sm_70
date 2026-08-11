@@ -98,6 +98,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# `scripts/` is sys.path[0] when this file is RUN, but not when a test loads it by
+# path, so pin it either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from checker_text import strip_comments  # noqa: E402,F401  (re-exported by name)
+
 ROOT = Path(__file__).resolve().parents[1]
 MODELS_DIR = ROOT / "src/vllm/model_executor/models"
 INCLUDE_DIR = ROOT / "include/vllm/model_executor/models"
@@ -177,12 +182,11 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def strip_comments(text: str) -> str:
-    """Drop // line and /* */ block comments so a comment mentioning a seam name
-    never flips a classification."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    text = re.sub(r"//[^\n]*", " ", text)
-    return text
+# `strip_comments` — a comment mentioning a seam name must never flip a
+# classification — is imported above from scripts/checker_text.py, which is the one
+# copy this family shares. It blanks comments in place instead of collapsing them,
+# so offsets and line numbers survive; for the `findall`/`search` uses below that is
+# indistinguishable from the private copy it replaces.
 
 
 def extract_fn_body(text: str, fn: str) -> str | None:

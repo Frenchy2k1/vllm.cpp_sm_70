@@ -102,9 +102,16 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
 
 void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
                          vt::Queue& queue) {
-  (void)model;
-  (void)config;
-  (void)queue;
+  // PERF-27B-LMHEAD-FP4 (issue #213): build the packed lm_head's resident HERE —
+  // on CUDA before the runner captures a decode graph, elsewhere before the first
+  // forward pays the dequant. Inert on every BF16/FP8/GGUF/tied checkpoint.
+  auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
+  Qwen3_5DenseModel::PrepareLmHeadResident(qwen.weights(), queue);
+  // PERF-27B-GDN-FP8-QKVZ: build the merged FP8 GDN [qkv;z] operand here, at
+  // model prepare — before the first forward, so it can never allocate or copy
+  // inside a CUDA-graph capture. No-op on CPU, on a non-FP8 owner, and when the
+  // merge is rolled back (VT_GDN_MERGED_QKVZ_FP8=0).
+  Qwen3_5DenseModel::PrepareGdnFp8Resident(qwen.weights(), config, queue);
 }
 
 ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,

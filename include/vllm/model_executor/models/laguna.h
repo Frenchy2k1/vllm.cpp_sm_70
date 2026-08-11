@@ -271,6 +271,11 @@ struct LagunaMoeWeights {
   Nvfp4Weight shared_gate_fp4;   // [N=moe_I, K=H]
   Nvfp4Weight shared_up_fp4;     // [N=moe_I, K=H]
   Nvfp4Weight shared_down_fp4;   // [N=H, K=moe_I]
+
+  // Resident Marlin MoE constants (issue #237; see ResidentSlot in
+  // qwen3_5_weights.h). Same defect and same fix as the Qwen3.5 blocks: this
+  // used to be a process-lifetime map keyed on the address of these weights.
+  ResidentSlot resident_marlin;
 };
 
 // One Laguna decoder layer.

@@ -279,7 +279,12 @@ TEST_CASE("test_mtp_load_model_unified: dense MTP shares target embedding and lm
   CHECK_FALSE(model.has_own_lm_head());
   CHECK(&model.embed_tokens() == &target.embed_tokens);
   CHECK(model.lm_head() == &target.lm_head);
-  CHECK(model.lm_head_fp4() == nullptr);
+  // PERF-27B-LMHEAD-FP4 (issue #213): the dense drafter shares the target's
+  // PACKED head too, so the pointer is the target's field rather than null. This
+  // target is bf16, so the field is EMPTY and the bf16 arm is still selected.
+  CHECK(model.lm_head_fp4() == &target.lm_head_fp4);
+  REQUIRE(model.lm_head_fp4() != nullptr);
+  CHECK(model.lm_head_fp4()->Empty());
   CHECK(weights.NumLayers() == 1);
   REQUIRE(weights.dense_layers.size() == 1);
   CHECK(weights.fc.nk);

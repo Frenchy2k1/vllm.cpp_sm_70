@@ -278,6 +278,14 @@ def validate_sbom(path: Path, root: Path, manifest: dict[str, Any]) -> list[str]
     return errors
 
 
+def validate_archive_name(archive: Path, manifest: dict[str, Any]) -> list[str]:
+    artifact = manifest.get("artifact", {})
+    expected = f"vllm.cpp-{artifact.get('version')}-{artifact.get('id')}.tar.gz"
+    if archive.name != expected:
+        return [f"canonical archive name must be {expected!r}"]
+    return []
+
+
 def parse_elf_needed(dynamic_output: str) -> list[str]:
     return re.findall(r"\(NEEDED\).*?\[([^]]+)\]", dynamic_output)
 
@@ -615,6 +623,7 @@ def validate_release(args: argparse.Namespace) -> list[str]:
         except (ValueError, OSError, release_manifest.ManifestError) as exc:
             return errors + [str(exc)]
         errors.extend(release_manifest.validate_manifest(manifest, schema, args.repo_root.resolve()))
+        errors.extend(validate_archive_name(archive, manifest))
         values, version_errors = parse_version(extracted / "VERSION")
         errors.extend(version_errors)
         errors.extend(validate_version(values, manifest))

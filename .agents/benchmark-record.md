@@ -17546,3 +17546,597 @@ server refuses to load it; the measurement above only works against a
 hand-prepared `~/kimi-linear-engine-dir` with a converted tokenizer. Giving
 Kimi-Linear a warm-server path is a prerequisite for any binding Kimi speed
 number, and is worth more than re-running this A/B.
+
+## 35B c2/c8 "weak cells" REFUTED — they were a HARNESS MISMATCH, not code (2026-08-10, `row/BENCH-35B-C2C8-REGRID`, GB10, build `a0fa12c7`)
+
+The record carried two conflicting 35B pictures. The 2026-08-05 binding grid read
+c1 0.977 / c2 0.964 / c4 1.025 / c8 0.964 / c16 0.932 / c32 0.971. The 2026-08-09
+router-landing entry read c1 0.980 / c2 0.867 / c4 0.977 / c8 0.919 and concluded
+"c2 and c8 remain the weak cells and both carry the wider run-to-run spread, so
+the next 35B work should start by tightening those measurements". `NOW.md` then
+spliced the two, publishing c1/c4 0.98x alongside c2 0.87x / c8 0.92x.
+
+**The two number sets were never comparable.** Their absolute throughputs differ
+by ~8x (grid c1 593.7 tok/s against the 2026-08-09 run's 70.58), so they are
+different quantities from different harnesses, and no code change connects them.
+A router optimisation that is byte-identical by construction cannot regress c2 by
+10 points; that impossibility was the tell.
+
+**Re-measured on the binding harness** (`dgx-online-serving.sh --execute`, model
+35, 3 repetitions, single whole-model flock, drop_caches per leg, oracle vLLM
+0.25.0, `nvidia/Qwen3.6-35B-A3B-NVFP4` @`491c2f1e`, corpus byte-copied from the
+2026-08-05 grid). Binding-eligible 12/12 groups; gate FAIL (114/124 axes below
+floor), which is the expected result of a uniform sub-1.0 profile.
+
+| Axis | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| output tok/s (ours) | 65.6 | 93.6 | 142.9 | 197.6 | 256.2 | 323.1 |
+| output tok/s (vLLM) | 67.0 | 99.9 | 150.6 | 211.3 | 272.9 | 333.6 |
+| **throughput ratio** | **0.979** | 0.937 | 0.949 | 0.935 | 0.939 | 0.969 |
+| mean TPOT | 0.978 | 0.945 | 0.943 | 0.938 | 0.930 | 0.967 |
+| mean TTFT | 0.972 | **0.872** | 0.970 | 0.965 | 0.969 | 0.968 |
+| p99 TPOT | 0.977 | 0.961 | 0.972 | 0.933 | 0.938 | 0.951 |
+| our CoV | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
+| vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
+
+**There is no isolated c2/c8 weakness.** The deficit is a broad, flat
+mid-concurrency band: c1 and c32 are strongest (0.979 / 0.969) and everything
+from c2 to c16 sits in 0.935-0.949. Chasing "c2" and "c8" as two special cells
+would have been chasing an artefact of harness mixing.
+
+**Spread was not the problem either.** Every point has CoV under 0.81% on BOTH
+engines, so the ~6% c2 deficit is roughly 8x the noise — resolvable now, without
+more repetitions. The prescribed "tighten the measurement first" step is
+therefore DONE, and its answer is that the measurements were never loose; the
+disagreement was which harness produced them.
+
+**Two residues.** (1) The c4 1.025x win recorded 2026-08-05 did NOT reproduce
+(0.949 here) — either a regression since, or a non-robust win; a same-binary A/B
+against that SHA would separate them. (2) mean TTFT at c2 = 0.872 is the sharpest
+single-axis outlier and the one cell that still looks like a distinct effect
+rather than the flat band.
+
+**Memory PASSES decisively** on the same run: peak PSS 3.34 GiB vs vLLM 12.72 GiB
+(**3.81x**), peak RSS 3.34 vs 13.09 GiB (**3.92x**), peak GPU 50.1 vs 70.4 GiB
+(**1.40x**).
+
+**Blocker cleared to get here: the binding harness had been unrunnable since
+2026-08-09.** `examples/CMakeLists.txt` renamed the `server` target's OUTPUT_NAME
+to `vllm-server` with the release packaging; the harness hardcoded
+`examples/server` in 12 places across BOTH halves — the shell drivers (literal
+string) and `online_gate.py`/`gdn_packed_component.py` (pathlib join, which a
+literal-string grep does not match). The last grid before that was 2026-08-05, so
+nothing exercised it in between. Fixed in `5023adec` (shell) and `a0fa12c7`
+(Python). The Python failure mode was actively misleading: `_file_contains`
+returns False for a MISSING file, so a stale path reports as
+"server binary omits target marker b'MatmulNvfp4Cutlass'" when the marker is in
+fact present 12 times in the binary.
+
+Evidence: `dgx:~/work/g35c/evidence/a0fa12c7219a86832412a6ece1490f452c1d1c40`
+(manifest.json + ratios.json + all-runs.json + report.md + 36 raws + memory /
+thermal / cache-drop / memory-return). Build contract: RelWithDebInfo, nvcc
+13.0.88 at the pinned `/usr/local/cuda-13.0/bin/nvcc`, oracle-bundled CUTLASS
+4.5.0, TRITON=ON, BENCH_PROFILE_CONTROL=OFF. SACRED `test_qwen36_paged_engine`
+passed as the harness's own precondition.
+
+## 35B mid-band ATTRIBUTED to per-token MoE work; the marlin block-size lever REFUTED (2026-08-10, `row/BENCH-35B-MIDBAND-ATTRIB`, GB10, build `a0fa12c7` + Release profile build)
+
+The flat 0.935x-0.979x mid-band from the `a0fa12c7` grid, attributed and then
+lever-tested. Paired kernel profile: OURS under `nsys` (`--cuda-graph-trace=node`,
+session start/stop around the measured c8 leg) and vLLM under the harness's own
+`tools/bench/profile_vllm_online_gate.py` torch profiler, same corpus
+(`c8-r1.jsonl`), same server params (`--max-num-seqs 32
+--max-num-batched-tokens 8192 --no-enable-prefix-caching`).
+
+**What the deficit IS (established).** It is a uniform shift of the whole ITL
+distribution, not a tail: median ITL == mean ITL == 0.94 across c2-c32, and
+p90/p99 ITL are BETTER than the median (at c16/c32 we WIN p99 at 1.059/1.088).
+Fitting step time against batch, our FIXED per-step cost is LOWER than vLLM's
+(intercept 9.02 ms vs 9.43 ms); the entire deficit is marginal, per-token work:
+
+| B->B | ours ms/req | vLLM ms/req | ours vs vLLM |
+|---|---:|---:|---|
+| 1->2 | 4.90 | 4.18 | +17% |
+| 2->4 | 2.46 | 2.30 | +7.2% |
+| 4->8 | 1.95 | 1.80 | +8.5% |
+| 8->16 | 2.07 | 1.89 | +9.4% |
+| 16->32 | 1.86 | 1.91 | **-3.0%, we win** |
+
+So there is nothing to win in launch/host overhead, and the c32 recovery is a
+genuine crossover rather than noise. Geometry: 256 experts, top-8,
+`moe_intermediate` 512, 40 layers, so per-expert M stays ~1.0-1.6 even at B=32
+(the experts never densify); what scales is the NUMBER of distinct active
+experts (~8 at B=1 to ~162 at B=32), i.e. NVFP4 expert-slab streaming.
+
+**Kernel profile, both engines.** Both are dominated by the SAME
+`marlin_moe_wna16::Marlin` (we ported it): 42.5% of GPU time ours, 40.3% vLLM.
+Our dominant instantiation is 2.7% slower per launch (172.6 us vs 167.9 us),
+which is within shape-mix noise. The one STRUCTURAL difference is a
+configuration we launch and vLLM never does:
+
+| `<threads, m_blocks, n_blocks, k_blocks, m_block_size_8, stages>` | vLLM | ours |
+|---|---|---|
+| `<128,1,8,4,true,4>` | 91440 @ 167.9 us | 40640 @ 172.6 us |
+| `<256,4,16,4,false,4>` (prefill) | 1200 @ 2462 us | 880 @ 1571 us |
+| `<128,3,8,4,false,4>` | 240 @ 901 us | 80 @ 898 us |
+| `<128,1,8,4,false,4>` | **never launched** | **20320 @ 59.7 us = 5.4% GPU** |
+
+Root cause of the extra variant: `DenseAlignFor` (`qwen3_5.cpp:2344`) routes the
+DENSE projections through the GROUPED-MoE Marlin with a degenerate `E=1,
+top_k=1`, and picks the tile with `MarlinMoeAlignBlockSizeSelect`, a port of
+vLLM's grouped `marlin_moe.py` heuristic whose ratio
+`num_tokens*top_k/num_experts/cand` collapses to `M/cand` in that case. At M=8,
+`8/8 = 1.0` fails the `< 0.9` test, so it selects a 16-row tile (32 at M=16, 48
+at M=32). vLLM instead runs those projections through DENSE `marlin::Marlin`
+(~93k launches to our ~21k, the mirror image).
+
+**The block-size lever is REFUTED (same-binary A/B, `VT_DENSE_ALIGN_BLOCK`, 3
+reps/arm, order-alternated).** Forcing block 8 at M=8 is SLOWER, not faster:
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | default (block 16) | 201.0, 203.6, 202.3 | 202.34 | - |
+| c8 | forced block 8 | 200.6, 200.0, 198.5 | 199.99 | **-1.16%** (ITL +2.12%) |
+| c4 | default (already 8) | 145.1, 144.2, 144.3 | 144.33 | - |
+| c4 | forced block 8 | 145.0, 144.8, 144.5 | 144.76 | +0.29% |
+
+The c4 arm is the internal CONTROL: the default already picks 8 there, so the
+override is a no-op and its +0.29% is the noise floor. Against that floor c8's
+-1.16% is real. **The 16-row tile is the better choice at M=8**; the "wasting
+half the tile" reading was wrong. The knob was NOT landed (a dead diagnostic
+default is debt, not evidence).
+
+Note the heuristic could NEVER have explained c2/c4 anyway: the 16-row tile only
+appears at M>=8, yet the deficit is already ~6% at c2 (0.937) and c4 (0.949)
+where the selector still picks 8. That was flagged before the A/B ran, and the
+A/B confirms the whole line is dead.
+
+**NEXT TRACEABLE HYPOTHESIS (gap stays OPEN, no ceiling declared):** that we
+route dense projections through the grouped-MoE kernel AT ALL. The cost would be
+the `moe_align_block_size` bookkeeping plus row padding (M=2 padded to a
+block) that vLLM's dense path never pays, which -- unlike tile choice -- is
+present at EVERY batch and so is consistent with the deficit appearing at c2.
+Testing it means routing the `E=1` dense path to the dense Marlin entrypoint, a
+real change rather than an env flag. Second candidate: the ~2.7% per-launch gap
+on the shared dominant kernel, which needs an ncu shape-matched comparison to
+separate from mix.
+
+Token identity across the A/B: 3 of 4 greedy probes byte-identical; the 4th
+(`b8` at c8) differs, but that probe is a SINGLE request at M=1 where BOTH arms
+select block 8, so the override is inert and cannot be the cause -- it is the
+run-to-run instability already recorded for this checkpoint.
+
+Evidence: `dgx:~/mbprof` (ours nsys-rep + `kern.csv`), `dgx:~/vlprof2`
+(vLLM torch trace + metadata; vLLM's own `output_digests_equal: false` on that
+run), `dgx:~/abblock` (12 A/B result JSONs + token probes). The harness's
+`--trace-only` and `summarize_torch_kernels.py` are both hard-gated to model 27
+("35B performance remains held"), so this profile was driven directly rather
+than through them.
+
+## 35B mid-band lever LANDS: the fused shared-expert gate_up sink was still on the MoE-marlin route (+1.31% c8 / +1.38% c4, 2026-08-10, `row/PERF-35B-SHARED-GATEUP-DENSE`, GB10)
+
+Direct follow-on to the mid-band attribution above, and it confirms that entry's
+NAMED next hypothesis: the cost is routing dense projections through the
+grouped-MoE kernel AT ALL, not the tile size (that lever was refuted).
+
+`efa6e40d` (#57) already established "dense route beats MoE on every axis" and
+flipped `VT_MARLIN_DENSE` default ON for `MatmulNvfp4MarlinD`. But
+`SharedGateUpFusedMarlinD` — the ONE fused shared-expert gate_up sink — was
+never given that route and still called `MoeGroupedGemmNvfp4Marlin` with a
+degenerate `E=1, top_k=1` plus a `DenseAlignFor` moe_align cache. The c8 profile
+counted it exactly: **20320 launches per leg = 40 layers x 508 steps, one per
+layer per step**, of `<128,1,8,4,m_block_size_8=false>` at 59.7 us = **5.4% of
+GPU time, a configuration the pinned vLLM never launches**.
+
+Fix mirrors the sibling exactly: rank-2 operand views over the SAME resident
+(`mr.w`/`mr.s`/`mr.g`) and workspace, direct-A, no moe_align cache and no row
+padding. `VT_MARLIN_DENSE_PAIR`, default ON (opt out `=0`) per the
+parity-enabler policy.
+
+**MEASURED, same binary, 3 reps/arm, order-alternated (def first at c8, pair
+first at c4), single load per arm, 35B-A3B NVFP4 @`491c2f1e`:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | MoE route (was default) | 198.3, 200.5, 198.1 | 198.27 | - |
+| c8 | dense route | 202.0, 200.9, 200.6 | **200.87** | **+1.31%** |
+| c4 | MoE route | 143.1, 143.9, 142.9 | 143.07 | - |
+| c4 | dense route | 144.4, 145.0, 145.2 | **145.04** | **+1.38%** (ITL -2.17%) |
+
+Bands are NON-OVERLAPPING at both points, and +1.3% is ~4.5x the +-0.29% noise
+floor established by the block-size A/B's c4 control. Unlike that refuted lever
+this one helps at c4 as well as c8, which is what the deficit's onset at c2
+requires.
+
+**SACRED gates unmoved on the new default:** `test_qwen36_paged_engine` 315/315
+and `test_qwen27_paged_engine` 235/235 with the route ON, and 315/315 again on
+the `=0` opt-out path.
+
+**Token identity NOT claimed.** The warm-server greedy probes are not stable
+run-to-run on this checkpoint (the BASELINE arm itself produced two different
+32-token continuations across its own two runs, `ccc8ca62` at c8 vs `e5d301c5`
+at c4, while both dense-route runs agreed at `d4dfa279`). That instability is
+already recorded for this configuration, so the deterministic SACRED fixtures
+are the correctness arbiter here, not the probe.
+
+**Stale doc corrected in the same change:** `docs/ENVIRONMENT.md` described
+`VT_MARLIN_DENSE` as "off (opt-in)" and "DEFAULT OFF until the strict token
+battery proves oracle byte-match", but `efa6e40d` flipped it ON months ago. The
+page disagreed with the code until 2026-08-10.
+
+Residual: the mid-band is not closed. At c8 this recovers ~1.3% of a ~6.5%
+deficit. The remaining term is the ~2.7% per-launch gap on the shared dominant
+`marlin_moe_wna16` (needs an ncu shape-matched comparison to separate from mix)
+plus whatever the routed-expert path itself carries. Gap stays OPEN.
+
+Evidence: `dgx:~/abpair` (12 result JSONs + token probes), `dgx:~/mbprof`
+(the nsys kernel table that named the sink), `dgx:~/gate2.log`.
+
+## The 35B "2.7% per-launch marlin gap" is NOT ESTABLISHED — ncu would have measured two identical kernels (2026-08-10, `row/BENCH-35B-NCU-PREREQ`, GB10)
+
+The mid-band entries above listed a ~2.7% per-launch gap on the shared
+`marlin_moe_wna16` as the next lever, to be settled by an ncu shape-matched
+comparison. Running ncu's PREREQUISITE checks first retires the lever instead:
+there is no implementation difference for ncu to find.
+
+**Everything structural is identical**, ours (nsys sqlite) vs the pinned vLLM
+(torch trace), c8, same corpus:
+
+| property | ours | vLLM |
+|---|---|---|
+| launch geometry | grid 144x1x1, block 128 | grid 144x1x1, block 128 |
+| template instantiation | `<128,1,8,4,true,4,1,false>` | same |
+| registers / stack / shared | REG:94 STACK:32 SHARED:1024 CONST:1043 | **identical** |
+| launches per 24-request leg | 30480 | 30480 |
+
+The register/shared footprint is byte-identical via `cuobjdump -res-usage` on
+our `vllm-server` and the oracle's `_moe_C_stable_libtorch.abi3.so`, so the
+occupancy / wave-quantisation hypothesis (different toolchains -> different
+register allocation -> different waves at small grids) is REFUTED too.
+
+**A COUNTING ERROR of mine, corrected here.** Raw launch counts looked 1.148x
+higher on our side, and per-kernel they were EXACTLY 1.333x (ours 40640 vs vLLM
+30480). That factor is not a finding: our nsys window covered the whole client
+invocation including its `--num-warmups 8`, i.e. 32 requests against the 24 the
+ratio should normalise to (32/24 = 1.3333). After normalising, the big-GEMM
+counts match exactly. Any count-based inference from the raw numbers is void.
+
+**The control that kills the marlin framing.** The SAME FlashAttention kernel,
+same source, same geometry, differs by grid size:
+
+| kernel | grid (CTAs) | ours | vLLM | delta |
+|---|---|---:|---:|---|
+| `flash_fwd_splitkv` (prefill) | (16,8,16) = 2048 | 1027.96 us | 1027.72 us | **+0.02%** |
+| `flash_fwd_splitkv` (decode) | (1,6,16) = 96 | 82.41 us | 78.25 us | **+5.31%** |
+| `marlin_moe_wna16` | 144 | 172.56 us | 167.92 us | +2.76% |
+
+At large grids we are identical to 0.02%; the delta appears only on small-grid
+decode-phase kernels and is LARGER on FlashAttention than on marlin. So it is
+not a marlin property. It is also not GPU idle: merged-interval busy is 97.99%
+ours against 96.14% vLLM -- **we are MORE GPU-busy than the oracle**, so host
+gaps cannot explain it either.
+
+**What remains is cross-tool uncertainty, which cannot carry a 2-5% claim.**
+Ours was measured by `nsys` (CUPTI, `--cuda-graph-trace=node`), vLLM by the
+torch profiler, on separate sessions minutes apart. The protocol says plainly
+that cross-tool comparisons never establish invocation parity; a delta that
+vanishes on long kernels and appears on short ones is exactly the shape of
+per-kernel instrumentation or thermal/phase drift. **The 2.7% is withdrawn as a
+lever.** Re-opening it would need BOTH engines under the SAME tool.
+
+**What IS visible and survives:** glue share is 13.00% of GPU kernel time ours
+against 11.37% vLLM. That is the next thing to characterise, and it is countable
+rather than timing-sensitive: after normalisation we launch ~2x the SiLU kernels
+of vLLM's fused `triton_poi_fused_mul_silu_slice_0`, and we run a
+`CastF32Kernel` (~15.9k/leg) with no obvious oracle counterpart -- the same
+`CastF32` already flagged at 3.1% of the 35B step in the f32-out GEMV audit.
+
+Evidence: `dgx:~/mbprof/ours-c8.sqlite`, `dgx:~/vlprof2/vllm-profile/`,
+`cuobjdump -res-usage` on both binaries.
+
+## 35B glue lever #2 LANDS: shared-expert down-proj emits bf16, one CastF32 per layer-step removed (+2.05% c8, 2026-08-10, `row/PERF-35B-SHARED-DOWN-BF16`, GB10, #213)
+
+Follows the glue lead from the withdrawn per-launch entry: glue was 13.00% of
+GPU kernel time ours against 11.37% vLLM, with a `CastF32Kernel` (~1 per layer
+per step) that has no oracle counterpart.
+
+Root cause: the shared expert's `down_proj` called `MatmulNvfp4F32D`, i.e. the
+Marlin GEMM produced bf16 and was then upcast to f32 across a whole `[T,H]`
+buffer -- while BOTH consumers (`SharedExpertGate` and `MoeCombineGate`) widen
+to float in-kernel and re-round through bf16 on store. The f32 buffer was
+written and re-read for a value that was already bf16.
+
+Fix: `sd` is now templated in both consumers (bf16 or f32) and the sink uses the
+existing `MatmulNvfp4Bf16D`. `VT_SHARED_DOWN_BF16`, default ON per the
+parity-enabler policy.
+
+**BIT-IDENTICAL, and the gates say so on BOTH arms with UNCHANGED assertion
+counts** -- `test_qwen36_paged_engine` 315/315 and `test_qwen27_paged_engine`
+235/235 with `Status: SUCCESS` for ON and for `=0`. The warm-server greedy probe
+is byte-identical across all four runs (`d4dfa279e5a5`), which the previous
+lever could not show because its baseline was unstable run-to-run.
+
+**MEASURED same binary, 3 reps/arm, order-alternated, single load per arm:**
+
+| conc | arm | tput reps (tok/s) | median | delta |
+|---|---|---|---|---|
+| c8 | f32 (opt-out) | 193.2, 193.6, 188.8 | 193.22 | - |
+| c8 | bf16 (default) | 197.2, 197.4, 196.5 | **197.18** | **+2.05%** (ITL -1.72%) |
+| c4 | f32 | 140.3, 141.6, 141.8 | 141.59 | - |
+| c4 | bf16 | 142.2, 142.7, 142.9 | **142.71** | **+0.79%** |
+
+Bands NON-OVERLAPPING at both points (c8 max f32 193.6 < min bf16 196.5; c4
+141.8 < 142.2).
+
+**A METHODOLOGY BUG this exposed, worth more than the lever.** The first attempt
+at this change wired only `SharedExpertGate` and missed `MoeCombineGate`, which
+threw `sd must be f32 [T,H]`. The gate command in use greps `assertions:`, and
+that line read `285 | 285 passed | 0 failed` -- GREEN -- while the run's real
+status was `test cases: 0 passed | 2 failed` / `Status: FAILURE!`. When a case
+throws, assertions already executed still count as passed and the case aborts.
+What caught it was the assertion COUNT (285 against the 315 this gate always
+reports), not the pass/fail. **Gate commands must grep `Status:`/`test cases:`
+as well, and any change in assertion count is RED even when everything
+"passed".**
+
+Cumulative on the mid-band: this plus the shared gate_up dense route. The band
+is still OPEN -- glue was 1.63 points of the ~6.5% deficit and the ~2x SiLU
+launch count against vLLM's fused `triton_poi_fused_mul_silu_slice_0` is the
+next countable item.
+
+Evidence: `dgx:~/abdown` (12 result JSONs + 4 identical token probes),
+`dgx:~/g5.log` (both arms, both gates, with Status lines).
+
+## CORRECTIONS to the two 35B glue entries above (2026-08-10)
+
+Two numbers those entries carry do not survive re-measurement. Corrected here
+rather than left standing.
+
+**"~2x the SiLU launch count" is WRONG.** It matched only ONE of vLLM's two
+SiLU-family kernels. Normalised per layer-step, vLLM runs
+`triton_poi_fused_mul_silu_slice_0` at 1.00 AND
+`vllm::act_and_mul_kernel<..., __nv_bfloat162, ...>` at 0.98 = **1.98**, against
+our 2.00. **The counts MATCH.** What differs is per-launch cost: ours 22.6 us
+against ~2.45 us, a **9.2x** gap — 4.1% of our GPU kernel time against 0.50% of
+vLLM's, i.e. **3.6 percentage points**, over half the remaining mid-band. Now
+spec'd as `PERF-35B-SILU-VECTORIZE` ([spec](specs/moe-silu-vectorize.md)): our
+kernel does two integer divisions per element and no vectorisation; vLLM's does
+neither.
+
+**"CastF32 was 3.1% of the 35B decode step"** was quoted from the older f32-out
+GEMV audit row, not from the c8 profile that justified the change. In that
+profile `CastF32Kernel` is **0.6%** of GPU kernel time at 1.02 launches per
+layer-step. The landed +2.05% is unaffected and gate-verified — the win is the
+eliminated `[T,H]` f32 write plus the consumer's cheaper read, not the cast
+kernel's own share — but 3.1% is not this profile's number.
+
+Both corrections share one failure mode: matching a single kernel name and
+concluding a ratio. Enumerate the whole kernel family and normalise per
+layer-step before claiming any count difference.
+
+## 27B post-lever grid, the 35B lever A/B, and an unattributed 35B c1 anomaly (2026-08-11, main `348c265d`, GB10)
+
+Both #213 levers landed: the NVFP4 `lm_head` kept packed, and the GDN fp8
+`in_proj_qkv`+`in_proj_z` merged into one qkvz GEMM.
+
+**Both are CONFIRMED ACTIVE by kernel signature**, which is the check a contended
+box cannot fake: `cutlass_80_tensorop_s16816gemm_bf16` (lever 1's 11.183 ms/step
+BF16 logits GEMM) is ABSENT; the split `nvjet_sm121_qqsss_mma_64x128x128` (lever
+2's 48 `in_proj_qkv` launches) is ABSENT and a merged `192x48x128` shape appears
+in its place; `marlin::Marlin` now carries the head.
+
+### 27B, same recipe as the pre-lever binding grid
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| post-lever ratio | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| pre-lever ratio | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| ours tok/s, post | 9.366 | 19.529 | 32.870 | 51.753 |
+
+Our legs are tight (spread 1.0013-1.0068); the vLLM arm carried one cold leg per
+concurrency (spread to 1.27), absorbed by medians.
+
+**THE OPEN PROBLEM: c1 did not move.** c2-c8 gained ~10 points, c1 gained 0.010,
+and both levers demonstrably execute at c1. The pre-lever nsys attribution closed
+to four decimal places and sized these levers AT c1 (lm_head 8.6414 + fp8 tower
+7.6068 of 17.3292 ms/step), so it mis-assigned what the c1 step actually spends.
+Two profiling attempts were DISCARDED rather than reasoned from: a whole-lifetime
+two-length diff whose calls/step came out non-integral (114.703) with a total at
+half the wall clock, and a session-based warm capture that produced no report.
+The valid method is the pre-lever one: `nsys start`/`stop` windows inside one
+already-warm server, validity-checked by integral instance deltas.
+
+### 35B-A3B, same-binary lever A/B (`VT_GDN_MERGED_QKVZ_FP8` the only variable)
+
+| | c1 med | c1 spread | c8 med | c8 spread |
+|---|---:|---:|---:|---:|
+| lever OFF (rollback) | 32.261 | 1.076 | 190.150 | 1.006 |
+| lever ON (shipped) | 33.158 | 1.086 | 187.357 | 1.007 |
+
+- **c1: NOT ESTABLISHED.** +2.8% nominal, inside an ~8% band on both arms.
+- **c8: -1.5%, REAL** against a 0.6-0.7% band.
+
+So the lever that gains ~10 points on the 27B **dense** is mildly NEGATIVE on the
+35B **MoE** at c8. Whether the default should be scoped by model family is open.
+
+### The 35B c1 anomaly is NOT the lever, and is unattributed
+
+Our 35B c1 reads ~32 tok/s here against a recorded 70.58. The A/B rules the lever
+out: with it rolled back, c1 still reads ~32. An earlier cache-sizing hypothesis
+was also withdrawn -- `num_blocks=4736` is what the canonical harness uses for
+every model, and the 35B/27B scale ratio (32.9 vs 9.4 tok/s) is what an A3B MoE
+should give. So it is protocol drift from the earlier record, or a build
+property, and the ad-hoc-harness 35B grid is NOT comparable to the 08-05 binding
+grid. It is therefore NOT published as a ratio. Re-run through the canonical
+`--execute` harness (model key `35`), which enforces per-model sizing, cache-drop
+proof and the one-lock boundary.
+
+### Method notes worth keeping
+
+- A fast `Passed` is indistinguishable from a skipped test in ctest output. Check
+  assertion counts, not exit codes. Page-cache warmth varies timings ~50x here.
+- The gate host rebooted SIX times in 18 hours during this work, at least one with
+  no OOM evidence at all (journal ends mid-normal-operation). Long runs are at
+  ongoing risk of silent truncation; c16/c32 still have no numbers because both
+  canonical attempts died that way.
+## `PERF-35B-SILU-VECTORIZE` is NEGATIVE — the 9.2x per-launch gap was an averaging artifact (2026-08-10, GB10, #213)
+
+Implemented the row-blocked SiluAndMul from [the spec](specs/moe-silu-vectorize.md)
+(block per token row, no integer divisions, flat kernel kept as fallback,
+`VT_SILU_ROW`). Bit-identical: 315/315 + 235/235, `Status: SUCCESS`, assertion
+counts unchanged on BOTH arms, all four warm greedy probes byte-identical.
+
+A/B, same binary, 3 reps/arm, order-alternated: **c8 -0.17%** (196.64 -> 196.29)
+and **c4 +0.52%** (141.72 -> 142.45), bands OVERLAPPING at both points. The
+spec's stop condition governs; the knob was NOT landed.
+
+**The premise was wrong.** The 22.6 us per launch that motivated the row is a
+MEAN over a bimodal distribution: `min 1.34 / med 18.88 / max 979.78 / stddev
+47.69 us`. Prefill launches drag the mean up; our DECODE SiluAndMul is ~1.3 us,
+FASTER per launch than the ~2.45 us vLLM mean it was compared against. There was
+no 9.2x gap, and the "3.6 percentage points of glue" scoped around it does not
+survive either.
+
+This is the documented prefill/decode mixing trap, not applied when the spec was
+written. **Read the DISTRIBUTION (min/med/max/stddev) before quoting any
+per-launch ratio** — a mean over a bimodal kernel is not a per-launch cost. The
+same discipline that withdrew the marlin 2.7% applies here: the next attempt
+needs a decode-only window on BOTH engines under ONE tool.
+
+The 35B mid-band therefore stands at two landed levers (`VT_MARLIN_DENSE_PAIR`
++1.31%, `VT_SHARED_DOWN_BF16` +2.05%) with the remaining ~5% UNATTRIBUTED.
+
+## `kGemvHeuristicAlgos` CUDA build-verify CLOSED (2026-08-10, GB10, main `812de8ca`)
+
+`NOW.md` carried "build-verify `kGemvHeuristicAlgos` on dgx" as an open residual
+on the invocation-parity row. **That row was STALE:** both halves were already on
+main (the named constant in `cuda_matmul.cu` and
+`scripts/check-gemv-invocation-consistency.py`), and `docs/STATUS.md` already
+recorded "CUDA build-verified on dgx (clean -Werror, 2026-08-04)". NOW and
+STATUS disagreed; STATUS was right.
+
+Re-verified at current main anyway, since `cuda_matmul.cu` has moved since
+2026-08-04 and a six-day-old verification is not a claim about today's tree.
+
+Guard, on main:
+
+```
+OK (out-dtype): 4 cuBLASLt C/D layout site(s) all take their dtype from the
+                dtype-faithful out_type variable.
+OK (algo-count): 4 requestedAlgoCount site(s) all route through kGemvHeuristicAlgos.
+```
+
+Build-verify, GB10 sm_121a, Release + CUTLASS 4.5.0 + Triton, nvcc 13.0.88:
+`cuda_matmul.cu` **recompiled** (forced — the first attempt was a stale-object
+pass because `812de8ca` was records-only, and a build that skips the TU verifies
+nothing) with **zero warnings** under `-Werror`, and the resulting binary gates
+clean: `test_qwen36_paged_engine` **315/315** and `test_qwen27_paged_engine`
+**235/235**, `Status: SUCCESS`, assertion counts unchanged.
+
+NOW row corrected to match STATUS. Evidence: `dgx:~/gemv2.log`, `dgx:~/g7.log`.
+
+## #323 FIXED: the decode graph replayed against stale HOST token ids (2026-08-11, `row/FIX-323-GRAPH-DECLINE`, GB10)
+
+`DenseDecodeGraphForward` called `graph->Step(input.token_ids, ...)` — the HOST
+ids — and never read `input.device_token_ids`. On the depth-2 async path the
+combine has patched the DEVICE ids and `token_ids` is deliberately stale for
+decode rows, so the replay generated from stale ids and every concurrent request
+past slot 0 degenerated (the #31 signature).
+
+Three discriminators isolated it, same binary and battery:
+
+| async depth | decode graph | result |
+|---|---|---|
+| depth-1 | ON (default) | PASS 78/78 |
+| depth-2 | OFF | PASS 82/82 |
+| depth-2 | ON (default) | **FAIL**, slots 1-3 degenerate |
+
+Both conditions required, which is why the registry-level `DeviceTokenIdsScope`
+(`60e71a0e`) did not close it: this path returns BEFORE the eager forward runs.
+
+**Fix (MITIGATION):** decline the graph while the mirror is live, falling back to
+the eager path that honours the scope. Correctness first — a correct stream
+outranks the graph's throughput. The END STATE is for `Step()` to read the ids at
+REPLAY time from a stable device buffer, which restores graphed decode for async
+serving; that is owed and NOT done here.
+
+**Gates, default configuration (async ON, graph ON):**
+
+```
+test_qwen3_dense_async_serving  7/7 cases, 246/246   (was 2 FAILED, 6 assertions)
+test_qwen3_paged_engine         184/184  SACRED
+test_qwen36_paged_engine        315/315  SACRED
+```
+
+The async suite now carries Llama, Mistral and InternLM2 as permanent regression
+gates. Llama passed even before the fix, but only because it did not engage the
+graph in that battery — the defect is a property of the shared path, so all three
+stay.
+
+**Blast radius, corrected upward twice during this investigation:** first filed
+as a Mistral/InternLM2 bug, then found to be every classic-dense model with the
+graph on (the default). Any concurrent serving on that path could return garbage
+for every request after the first.
+
+Evidence: `dgx:~/fx_run.log` (7/7), `dgx:~/fx2.log` (SACRED), `dgx:~/diag.log`,
+`dgx:~/diag2.log`, `dgx:~/g9.log`.
+
+## Qwen3.6-35B-A3B: first CANONICAL post-lever grid, and the ad-hoc grid it invalidates (2026-08-11, main `348c265d`, GB10)
+
+Run through `scripts/dgx-online-serving.sh --execute --model 35` on a build made
+to the H1d contract (RelWithDebInfo, oracle ninja, oracle flashinfer cutlass,
+`VLLM_CPP_BENCH_PROFILE_CONTROL=OFF`, tests ON, pinned `/usr/local/cuda-13.0/bin/nvcc`),
+against `nvidia/Qwen3.6-35B-A3B-NVFP4`@`491c2f1e`. FA2 marker verified present.
+
+| c | ours med tok/s (n=3) | vLLM med tok/s (n=2) | ratio |
+|---:|---:|---:|---:|
+| 1 | 65.262 (spread 1.005) | 67.223 (1.001) | **0.9708x** |
+| 2 | 93.012 (1.003) | 100.088 (1.006) | 0.9293x |
+| 4 | 140.174 (1.002) | 144.226 (1.066) | **0.9719x** |
+| 8 | 193.477 (1.018) | 210.679 (1.002) | 0.9183x |
+| 16 | 251.490 (1.007) | 271.479 (1.002) | 0.9264x |
+| 32 | 311.897 (1.007) | 332.606 (1.005) | 0.9377x |
+
+**NOT parity: 0.918x to 0.972x.** These are the campaign's FIRST c16/c32 numbers;
+both earlier canonical attempts died to host reboots.
+
+### This invalidates the ad-hoc 35B grid recorded on 2026-08-10
+
+That grid put our c1 at 32.9 tok/s and the ratio at 0.524, and flagged an
+"unexplained ~14% floor drop". The canonical harness measures our c1 at **65.262
+tok/s**, essentially double, and in line with the historical 70.58. The anomaly
+was an artifact of the ad-hoc harness, NOT of the engine and NOT of the #213
+levers -- which the same-binary lever A/B had already ruled out independently.
+The ad-hoc grid was correctly disclaimed rather than published; this supersedes it.
+
+### The harness rejected the ORACLE, not us
+
+Our arm completed 18/18 legs. The vLLM arm stopped at 12/18 when the stream probe
+caught it emitting **127 token chunks where 128 were requested** with
+`ignore_eos`. So the run has no driver-written summary and vLLM's medians are over
+**2 reps, not 3** -- weaker than ours, and stated rather than averaged away. A
+check strict enough to fail the reference implementation is why these numbers are
+worth more than the ad-hoc ones.
+
+### Known 35B-specific lever result
+
+The #213 merged-qkvz lever measures **-1.5% at c8 on this MoE model** (real,
+against a 0.7% band) while gaining ~10 points on the 27B dense. Scoping that
+default by model family is an open question, worth ~1.5% at c8 here.
+
+## Closed gaps moved verbatim out of docs/BENCHMARKS.md (2026-08-11)
+
+The scoreboard's `Open gaps` table is Track / Status / **Next gate**. These three
+rows had reached next gate `none` -- the gap each tracked is closed and no gate
+remains -- so they are not open gaps. They are reproduced here BYTE-FOR-BYTE, per
+this file's header contract, so the page can carry the two void-measurement rows
+that #223 and #238 owe without exceeding its 45,000-character cap. The full
+forensics for each are already in this file: `kGemvHeuristicAlgos CUDA
+build-verify CLOSED`, `DFlash speculative decode ... D14 c1 SPEED GATE MET`, and
+the Laguna-XS-2.1-NVFP4 decode sections. Nothing was edited or dropped.
+
+| Track | Status | Next gate |
+|---|---|---|
+| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
+| DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
+| cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |

@@ -455,6 +455,79 @@ class StatusRatchet(unittest.TestCase):
         text = doc_tables.STATUS.read_text(encoding="utf-8")
         self.assertEqual(doc_tables.STATUS_RATCHET["chars"], len(text))
 
+    def test_one_char_of_growth_on_the_LIVE_page_is_rejected(self) -> None:
+        """The other growth test grows a SYNTHETIC page by a whole ratchet.
+
+        That proves the comparison exists; it does not prove the cap is on the
+        boundary of the real page. Since the ratchet is re-pinned byte-tight on
+        every STATUS edit, the live page always sits exactly ONE character below
+        rejection, and that off-by-one is the only thing standing between "the
+        cap tracks the page" and "the cap trails it by a byte". So assert it on
+        the live text, and assert the message names both numbers -- an error
+        that says only "too big" cannot tell an author what to collapse.
+        """
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        cap = doc_tables.STATUS_RATCHET["chars"]
+        errors = doc_tables.status_errors(text + "x")
+        self.assertTrue(
+            any(f"chars is {len(text) + 1}" in error for error in errors), errors
+        )
+        self.assertTrue(any(f"{cap} ratchet" in error for error in errors), errors)
+
+    def test_a_retired_claim_cannot_come_back_for_free(self) -> None:
+        """A claim the page RETIRED must cost something to reinstate.
+
+        The ratchet is what makes a deletion permanent. #277 paid for its STATUS
+        edit by deleting two claims that had become false -- that `/metrics` has
+        no live async backing, once in the OpenAI-server row and once in the
+        metrics paragraph -- and lowered the char ratchet by the same 30 bytes.
+
+        Two things are asserted, and neither is the byte-tightness above.
+        First, the retired wording is genuinely GONE: a page that still says
+        `/metrics` is unbacked while the AsyncLLM output handler records into it
+        is lying to a reader, and no size ratchet notices a false sentence.
+        Second, putting it back is rejected -- so a future edit reinstating it
+        has to find the space, out loud, instead of spending headroom the
+        deletion left behind.
+        """
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(text), [])
+
+        retired = (
+            "metrics and cache reset lack live async backing",
+            "the async production-serving path wiring",
+        )
+        for claim in retired:
+            with self.subTest(claim=claim):
+                self.assertNotIn(
+                    claim,
+                    text,
+                    "docs/STATUS.md still carries a claim about /metrics that "
+                    "the AsyncLLM wiring made false",
+                )
+
+        restored = text.replace(
+            "cache reset lacks live async backing",
+            retired[0],
+            1,
+        ).replace(
+            "The remaining work is the chat/completion",
+            f"The remaining work is {retired[1]}, the chat/completion",
+            1,
+        )
+        self.assertGreater(
+            len(restored),
+            len(text),
+            "the mutation must actually re-add the retired claims; if the "
+            "anchors stopped matching, this test is asserting nothing",
+        )
+        errors = doc_tables.status_errors(restored)
+        self.assertTrue(
+            any("chars is" in error for error in errors),
+            "reinstating the retired claims must break the char ratchet, "
+            f"otherwise the deletion bought free headroom; got {errors}",
+        )
+
     def test_the_status_ratchet_only_ever_moves_down(self) -> None:
         """A ratchet that can be RAISED is a budget with extra steps.
 
@@ -475,12 +548,13 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            # 243578 -> 243479 (2026-08-10, `SAMPLE-LOGPROB-TOKEN-IDS`): the
-            # Sampling row bought its `logprob_token_ids` line by collapsing the
-            # beam-search wiring narrative in the same cell, so the ratchet fell
-            # by 92. The ceiling is lowered WITH it, in the same change, because
-            # a ceiling left above the ratchet is exactly the regrowth headroom
-            # the docstring above says this guard exists to deny.
+            # 243578 -> 243479 (2026-08-11, `SAMPLE-LOGPROB-TOKEN-IDS`): the
+            # Sampling row bought its `logprob_token_ids` line by collapsing
+            # four restatements in the same cell. The ceiling is lowered WITH
+            # the ratchet, in the same change, because a ceiling left above the
+            # ratchet is exactly the regrowth headroom the docstring above says
+            # this guard exists to deny. Re-checked against the RE-MEASURED
+            # merged ratchet (243278), not the branch's stale 243479 basis.
             "chars": 243479,
             "h2_sections": 11,
             "long_paragraphs": 82,
@@ -503,24 +577,51 @@ class StatusRatchet(unittest.TestCase):
                     "change that lowers the ratchet -- never the reverse",
                 )
 
-    def test_one_char_of_growth_on_the_LIVE_page_is_rejected(self) -> None:
-        """The other growth test grows a SYNTHETIC page by a whole ratchet.
-
-        That proves the comparison exists; it does not prove the cap is on the
-        boundary of the real page. Since the ratchet is re-pinned byte-tight on
-        every STATUS edit, the live page always sits exactly ONE character below
-        rejection, and that off-by-one is the only thing standing between "the
-        cap tracks the page" and "the cap trails it by a byte". So assert it on
-        the live text, and assert the message names both numbers -- an error
-        that says only "too big" cannot tell an author what to collapse.
-        """
+    def test_the_repin_was_paid_for_by_a_real_collapse(self) -> None:
+        # Lowering the cap is the honest half of "STATUS may only shrink"; the
+        # dishonest half is lowering it after growing the page and calling the
+        # difference rounding. The 2026-08-09 prompt-logprobs re-pin added a
+        # Sampling clause and paid for it by collapsing three restatements in the
+        # same row.
+        #
+        # So assert the payment, not the arithmetic: put the collapsed text back
+        # and the page must break the cap it is pinned to. If a later edit
+        # quietly restores that prose, this goes red rather than the slack being
+        # silently re-spent.
         text = doc_tables.STATUS.read_text(encoding="utf-8")
-        cap = doc_tables.STATUS_RATCHET["chars"]
-        errors = doc_tables.status_errors(text + "x")
-        self.assertTrue(
-            any(f"chars is {len(text) + 1}" in error for error in errors), errors
+        restored = text.replace(
+            "); the C-ABI beam",
+            "), so beam search runs on the real server (the C-ABI beam",
+            1,
+        ).replace(
+            "beams are stepped sequentially).",
+            "beams are stepped sequentially, byte-identical to the sync driver).",
+            1,
         )
-        self.assertTrue(any(f"{cap} ratchet" in error for error in errors), errors)
+        self.assertNotEqual(restored, text, "the collapsed prose is not where it was")
+        self.assertGreater(len(restored), doc_tables.STATUS_RATCHET["chars"])
+
+    def test_the_logprobs_mode_repin_was_paid_for(self) -> None:
+        # Same contract as the other re-pin guards: the cap may only come down,
+        # and the reduction must be a real collapse rather than a growth budget.
+        # The 2026-08-10 logprobs_mode line was paid for by dropping the best_of
+        # cell's upstream rationale. Restore it and the page must break its cap,
+        # so a later edit cannot quietly put the prose back and re-spend the
+        # slack.
+        #
+        # This guard and test_the_repin_was_paid_for_by_a_real_collapse above
+        # cover DIFFERENT collapses in the SAME row (#238's best_of rationale,
+        # #223's beam-search restatements). They are complementary, not
+        # alternatives: dropping either one would leave its collapse unguarded.
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        restored = text.replace(
+            "`best_of==n` is the default no-op).",
+            "`best_of==n` is the default no-op) \u2014 vLLM 0.26 itself has dropped "
+            "`best_of` from its live path, so this follows the classic OpenAI contract.",
+            1,
+        )
+        self.assertNotEqual(restored, text, "the collapsed rationale is not where it was")
+        self.assertGreater(len(restored), doc_tables.STATUS_RATCHET["chars"])
 
     def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
         # A ratchet parked well above the page it guards is not a ratchet: it
