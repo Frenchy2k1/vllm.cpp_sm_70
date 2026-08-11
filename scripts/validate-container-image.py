@@ -241,7 +241,12 @@ def wait_for_health(url: str, timeout: float) -> tuple[bool, str]:
 
 
 def check_boot(
-    image: str, model: Path, port: int, timeout: float, gpus: str | None = None
+    image: str,
+    model: Path,
+    port: int,
+    timeout: float,
+    gpus: str | None = None,
+    runtime: str | None = None,
 ) -> list[str]:
     errors: list[str] = []
     name = f"vllm-cpp-smoke-{port}"
@@ -251,6 +256,12 @@ def check_boot(
     # nothing about the GPU it was built for. The driver still comes from the
     # host through the container runtime; the image never carries one.
     gpu_args = ["--gpus", gpus] if gpus else []
+    # Tegra/L4T needs --runtime nvidia and REJECTS --gpus outright:
+    #   "invoking the NVIDIA Container Runtime Hook directly (e.g. specifying
+    #    the docker --gpus flag) is not supported"
+    # so a GPU lane cannot be validated on Jetson through --gpus alone.
+    if runtime:
+        gpu_args = ["--runtime", runtime, *gpu_args]
 
     run(["docker", "rm", "--force", name])
     code, output = run(
@@ -292,7 +303,9 @@ def check_boot(
 
         # SIGTERM, not SIGKILL: an image that has to be killed loses in-flight work
         # on every ordinary orchestrator restart.
-        code, output = run(["docker", "stop", "--timeout", "30", name])
+        # `-t`, not `--timeout`: the long form only exists on newer Docker (the
+        # Jetson node runs 27.5.1 and rejects it), and `-t` is accepted by both.
+        code, output = run(["docker", "stop", "-t", "30", name])
         if code != 0:
             errors.append(f"docker stop failed: {output.strip()}")
         else:
@@ -317,6 +330,11 @@ def main() -> int:
     parser.add_argument("--expect-revision")
     parser.add_argument("--model", type=Path, help="model directory for the boot smoke")
     parser.add_argument(
+        "--docker-runtime",
+        help="pass through to `docker run --runtime` (e.g. nvidia). Required on "
+        "Tegra/L4T, which rejects --gpus",
+    )
+    parser.add_argument(
         "--gpus",
         help="pass through to `docker run --gpus` (e.g. all) so the boot smoke is "
         "real runtime evidence for an accelerator lane",
@@ -335,7 +353,12 @@ def main() -> int:
             errors.append(f"--model {args.model} is not a directory")
         else:
             boot_errors = check_boot(
-                args.image, args.model.resolve(), args.port, args.boot_timeout, args.gpus
+                args.image,
+                args.model.resolve(),
+                args.port,
+                args.boot_timeout,
+                args.gpus,
+                args.docker_runtime,
             )
             errors += boot_errors
             runtime_verified = not boot_errors
@@ -349,7 +372,12 @@ def main() -> int:
     print(f"container image OK: {args.image} lane={args.lane} version={args.version}")
     print(f"  config, layout: verified")
     if runtime_verified:
-        where = f"on --gpus {args.gpus}" if args.gpus else "on CPU paths only (no --gpus)"
+        selectors = []
+        if args.docker_runtime:
+            selectors.append(f"--runtime {args.docker_runtime}")
+        if args.gpus:
+            selectors.append(f"--gpus {args.gpus}")
+        where = f"on {' '.join(selectors)}" if selectors else "on CPU paths only (no GPU)"
         print(
             f"  boot: /health 200, /version 200, declared healthcheck passed, clean "
             f"SIGTERM, {where}"

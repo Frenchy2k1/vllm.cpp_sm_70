@@ -209,7 +209,7 @@ def cuda_facts() -> dict[str, object]:
         )
     return {
         "artifact": {
-            "id": "linux-x86_64-glibc-cuda-fat",
+            "id": "linux-x86_64-glibc-cuda",
             "version": "0.1.0-test",
             "c_abi_version": 17,
             "channel": "preview",
