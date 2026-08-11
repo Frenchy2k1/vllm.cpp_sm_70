@@ -398,12 +398,48 @@ def _cpp_braced_body(source: str, opening: int) -> tuple[str, int] | None:
 
 def _cpp_function_body(source: str, signature: str) -> str:
     active = without_cpp_comments_and_literals(source)
-    match = re.search(signature, active)
-    if match is None:
-        return ""
-    opening = active.find("{", match.end())
-    result = _cpp_braced_body(active, opening)
-    return "" if result is None else result[0]
+    search_from = 0
+    while True:
+        match = re.search(signature, active[search_from:])
+        if match is None:
+            return ""
+        match_start = search_from + match.start()
+        match_end = search_from + match.end()
+        parameters_open = active.rfind("(", match_start, match_end)
+        if parameters_open < 0:
+            return ""
+
+        depth = 0
+        parameters_close = -1
+        for offset in range(parameters_open, len(active)):
+            if active[offset] == "(":
+                depth += 1
+            elif active[offset] == ")":
+                depth -= 1
+                if depth == 0:
+                    parameters_close = offset
+                    break
+        if parameters_close < 0:
+            return ""
+
+        suffix_depth: list[str] = []
+        declaration = False
+        pairs = {"(": ")", "[": "]"}
+        for offset in range(parameters_close + 1, len(active)):
+            char = active[offset]
+            if char in pairs:
+                suffix_depth.append(pairs[char])
+            elif suffix_depth and char == suffix_depth[-1]:
+                suffix_depth.pop()
+            elif not suffix_depth and char == ";":
+                declaration = True
+                search_from = offset + 1
+                break
+            elif not suffix_depth and char == "{":
+                result = _cpp_braced_body(active, offset)
+                return "" if result is None else result[0]
+        if not declaration:
+            return ""
 
 
 def _finite_timeout_expression(console: str, expression: str) -> bool:
@@ -432,9 +468,9 @@ def _validate_bounded_drain(console: str, function: str, counter: str,
         errors.append(label)
         return
 
-    deadlines = list(re.finditer(
-        r"\b(?:const\s+)?ULONGLONG\s+deadline\s*=\s*"
-        r"GetTickCount64\s*\(\s*\)\s*\+\s*([A-Za-z_]\w*|\d+[uUlL]*)\s*;",
+    starts = list(re.finditer(
+        r"\b(?:const\s+)?ULONGLONG\s+start\s*=\s*"
+        r"GetTickCount64\s*\(\s*\)\s*;",
         body,
     ))
     loop = re.search(
@@ -442,9 +478,8 @@ def _validate_bounded_drain(console: str, function: str, counter: str,
         r"std::memory_order_seq_cst\s*\)\s*!=\s*0\s*\)\s*\{",
         body,
     )
-    if (len(deadlines) != 1 or loop is None or
-            deadlines[0].start() >= (loop.start() if loop else 0) or
-            not _finite_timeout_expression(active_console, deadlines[0].group(1))):
+    if (len(starts) != 1 or loop is None or
+            starts[0].start() >= (loop.start() if loop else 0)):
         errors.append(label)
         return
 
@@ -455,17 +490,23 @@ def _validate_bounded_drain(console: str, function: str, counter: str,
         return
     loop_body, loop_close = loop_result
     timeout_branch = re.match(
-        r"\s*if\s*\(\s*GetTickCount64\s*\(\s*\)\s*>=\s*deadline\s*\)"
+        r"\s*if\s*\(\s*GetTickCount64\s*\(\s*\)\s*-\s*start\s*>=\s*"
+        r"([A-Za-z_]\w*|\d+[uUlL]*)\s*\)"
         r"\s*(?:\{\s*)?return\s+false\s*;\s*(?:\}\s*)?",
         loop_body,
     )
     success_tail = body[loop_close + 1:]
-    if timeout_branch is None or re.fullmatch(
-            r"\s*return\s+true\s*;\s*", success_tail) is None:
+    if (timeout_branch is None or
+            not _finite_timeout_expression(active_console,
+                                           timeout_branch.group(1)) or
+            re.fullmatch(
+                r"\s*return\s+true\s*;\s*", success_tail
+            ) is None):
         errors.append(label)
 
 
 def _validate_console_protocol(console: str, errors: list[str]) -> None:
+    active_console = without_cpp_comments_and_literals(console)
     dispatch = _cpp_function_body(console, r"\bbool\s+DispatchControlEvent\s*\(")
     handler = _cpp_function_body(
         console, r"\bBOOL\s+WINAPI\s+ConsoleControlHandler\s*\("
@@ -538,12 +579,22 @@ def _validate_console_protocol(console: str, errors: list[str]) -> None:
     ))
     final_tail_ok = False
     if len(final_decrements) == 1:
+        resumed_declarations = list(re.finditer(
+            r"\b(?:const\s+)?bool\s+resumed\s*=\s*[^;]+;",
+            dispatch[:final_decrements[0].start()],
+        ))
+        resumed_macro = re.search(
+            r"(?m)^\s*#\s*define\s+resumed(?:\s|\()",
+            active_console,
+        )
         final_tail = dispatch[final_decrements[0].end():]
-        final_tail_ok = re.fullmatch(
-            r"\s*;\s*(?:\}\s*)*return\s+(?:true|false|[A-Za-z_]\w*)\s*;"
-            r"\s*(?:\}\s*)*",
-            final_tail,
-        ) is not None
+        final_tail_ok = (
+            len(resumed_declarations) == 1 and resumed_macro is None and
+            re.fullmatch(
+                r"\s*;\s*return\s+resumed\s*;\s*",
+                final_tail,
+            ) is not None
+        )
     if not final_tail_ok:
         errors.append(
             "console_shutdown.cpp: final in-flight decrement must be the last "
