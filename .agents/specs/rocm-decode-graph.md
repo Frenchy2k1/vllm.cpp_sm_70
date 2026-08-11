@@ -67,7 +67,7 @@ compute rather than a measurement of it, and no trace has been taken on either
 side. D4 carries this.
 
 **Structural reason, independent of the numbers.** `vt::Backend`'s capture
-virtuals (`include/vt/backend.h:181-195`) are documented as a multi-backend seam
+virtuals (`include/vt/backend.h:188-202`) are documented as a multi-backend seam
 ("CUDA Graphs / Metal ICB / Vulkan CB"), but CUDA is its only implementation:
 Metal (`metal_backend.mm:13`), Vulkan (`vulkan_backend.cpp:16`) and ROCm all
 carry the same `stays FALSE` note. A one-implementation abstraction is unproven.
@@ -85,14 +85,14 @@ side (~8.0 GB weights + ~3 GB captured graphs against 15.92 GiB). Oracle =
 cell on a board that also drives a display: indicative, and **not** the
 2-3x-reproduced-idle standard gate 5 requires. `Qwen/Qwen3-8B` does not fit
 (~16.4 GB bf16 against 15.92 GiB), and no quantized path is available — ROCm
-registers 23 ops to CUDA's 84, none of them quantized, and a discrete board has
+registers 44 ops to CUDA's 84, none of them quantized, and a discrete board has
 no reference tier, so an unregistered op throws.
 
 ## 2. Scope
 
 **In scope.**
 1. `src/vt/rocm/rocm_backend.hip` — the six capture virtuals against hipGraph,
-   mirroring `cuda_backend.cu:194-286`, replacing the `stays FALSE` note at
+   mirroring `cuda_backend.cu:198-290`, replacing the `stays FALSE` note at
    `:22-26`.
 2. `src/vllm/platforms/rocm.cpp` — add the `support_static_graph_mode()`
    override (`rocm.cpp:67` is today a comment explaining the inherited false,
@@ -104,7 +104,7 @@ no reference tier, so an unregistered op throws.
 **Out of scope.**
 - **New decode-graph model siblings.** Only models that already have one
   benefit; writing more is separate work with its own correctness gate.
-- **`VT_BENCH_PROFILE_CONTROL`** (`cuda_backend.cu:230-262`) — CUDA-profiler
+- **`VT_BENCH_PROFILE_CONTROL`** (`cuda_backend.cu:234-266`) — CUDA-profiler
   instrumentation, not load-bearing. A `rocprofiler` equivalent is later work;
   the first cut omits it and says so in the code.
 - **Any model-level edit.** Every decode-graph class already gates generically
@@ -114,7 +114,7 @@ no reference tier, so an unregistered op throws.
 - **Metal / Vulkan capture.** Different APIs, different specs.
 - **The M3 attention-backend NAME registration** (`rocm.cpp:105` returns `{}`)
   and the stale `rocm.cpp:91` comment claiming `kPagedAttention` is unregistered
-  for `kROCM` — it is registered (`rocm_ops.hip:92`) and ran `vt-native` on this
+  for `kROCM` — it is registered (`rocm_ops.hip:148`) and ran `vt-native` on this
   board. Both real, both separate; a bug found in passing gets its own issue.
 
 ## 3. Upstream chain
@@ -132,12 +132,12 @@ Observed on this board 2026-08-10 — 51 piecewise + 35 full captures, ~6 s, in 
 not inferred.
 
 Internal anchors:
-- `include/vt/backend.h:181-195` — the six virtuals and the multi-backend comment.
+- `include/vt/backend.h:188-202` — the six virtuals and the multi-backend comment.
 - `src/vt/backend.cpp:29-34` — base impls: five `VT_CHECK(false, ...)` throws,
   `DestroyGraph` a no-op. An unimplemented backend fails loudly; the model-level
   `enabled` gate keeps it off the path.
-- `src/vt/cuda/cuda_backend.cu:178-286` — the implementation to mirror. Its
-  capture-contract comment (`:183-193`) is the real specification of what a
+- `src/vt/cuda/cuda_backend.cu:182-290` — the implementation to mirror. Its
+  capture-contract comment (`:187-197`) is the real specification of what a
   caller must honour.
 - `src/vllm/platforms/interface.h:185-189`, `cuda.cpp:58-59`, `rocm.cpp:67`.
 - `src/vllm/model_executor/models/qwen3.cpp:489-560` — the consumer:
@@ -161,13 +161,13 @@ here.
 
 | CUDA (`cuda_backend.cu`) | ROCm (`rocm_backend.hip`) |
 |---|---|
-| `:194` `SupportsGraphCapture()` | same |
-| `:200-203` `BeginCapture` — `cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)` | `hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal)` |
-| `:204-212` `EndCapture` — end → destroy prior `exec_` → instantiate → destroy graph | `hipStreamEndCapture` / `hipGraphExecDestroy` / `hipGraphInstantiate` / `hipGraphDestroy` |
-| `:214-216` `Replay` — `cudaGraphLaunch(exec_, s)` | `hipGraphLaunch` |
-| `:221-227` `EndCaptureGraph` — opaque-handle variant for the multi-size slot map | same shape; returns `hipGraphExec_t` as `void*` |
-| `:229-266` `ReplayGraph(q, graph)` | same, minus `VT_BENCH_PROFILE_CONTROL` (§2) |
-| `:284-286` `DestroyGraph` | `hipGraphExecDestroy` |
+| `:198` `SupportsGraphCapture()` | same |
+| `:204-207` `BeginCapture` — `cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)` | `hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal)` |
+| `:208-216` `EndCapture` — end → destroy prior `exec_` → instantiate → destroy graph | `hipStreamEndCapture` / `hipGraphExecDestroy` / `hipGraphInstantiate` / `hipGraphDestroy` |
+| `:218-220` `Replay` — `cudaGraphLaunch(exec_, s)` | `hipGraphLaunch` |
+| `:225-231` `EndCaptureGraph` — opaque-handle variant for the multi-size slot map | same shape; returns `hipGraphExec_t` as `void*` |
+| `:233-270` `ReplayGraph(q, graph)` | same, minus `VT_BENCH_PROFILE_CONTROL` (§2) |
+| `:288-290` `DestroyGraph` | `hipGraphExecDestroy` |
 | `platforms/cuda.cpp:58-59` `support_static_graph_mode()` | new override in `platforms/rocm.cpp` |
 
 Every name is a long-stable HIP runtime API with the same signature and
@@ -252,7 +252,7 @@ mutations that must turn it red, in a scratch copy, restored byte-for-byte:
 fails.** `rocm_matmul_hipblaslt.hip:243-255` allocates the hipBLASLt workspace
 lazily in the GEMM path, growing on demand (`if (need > cap) { hipFree;
 hipMalloc; }`). Allocation inside a capture region is illegal and invalidates
-it. CUDA's contract comment (`cuda_backend.cu:186-190`) names exactly this and
+it. CUDA's contract comment (`cuda_backend.cu:190-194`) names exactly this and
 notes cuBLASLt's workspace is a one-time per-context alloc there. *Mitigation:*
 the decode-graph pre-warm runs the same shapes at the same padded size before
 capture, which should grow `cap` to its high-water mark. *If it does not:*
