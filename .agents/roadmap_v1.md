@@ -36,7 +36,6 @@ issue is not yet placed. Keyed record: update in place, never append.
 
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
-| [#391](https://github.com/mudler/vllm.cpp/issues/391) | `PERF-CPU-DECODE-BARRIER` | CPU backend: batch-1 decode is barrier-bound (47% sync), and paged attention branches per element | perf |
 | [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
 | [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |
 | [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
@@ -54,6 +53,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-BINARIES` | Binary release | feature |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
+| [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
 | [#206](https://github.com/mudler/vllm.cpp/issues/206) | `KERNEL-SSM-MAMBA` | RTX 5070 Ti: close Qwen3.5-4B TTFT, TPOT and VRAM gaps vs vLLM — owns the sm_120 post-conv token tile and the K=4 causal-conv arm (PR #155) | feature |
 | [#305](https://github.com/mudler/vllm.cpp/issues/305) | `KERNEL-SSM-MAMBA` | GDN causal-conv: the `conv_state` initial-state read races the final-state write across blocks (`VT_CONV_REG` + exact chunks, both default ON) | bug |
 | [#396](https://github.com/mudler/vllm.cpp/issues/396) | `KV-EXTERNAL-CACHE` | `test_lmcache_connector` data race under TSan: `MockLmcacheServer` writes non-atomic `listen_fd_` before joining its accept thread | bug |
@@ -68,6 +68,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#359](https://github.com/mudler/vllm.cpp/issues/359) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quant generates INCOHERENT text where llama.cpp on the same file is coherent | bug |
 | [#298](https://github.com/mudler/vllm.cpp/issues/298) | `PERF-27B-LMHEAD-DSR` | `main` is RED on the `device-leakage` DSR ratchet: `PrepareLmHeadResident` added a 33rd `vt_ifdef` to the shared layer | bug |
 | [#213](https://github.com/mudler/vllm.cpp/issues/213) | `PERF-27B-LMHEAD-FP4` | Qwen3.6 NVFP4 baselines (27B and 35B-A3B) must reach vLLM speed parity | perf |
+| [#391](https://github.com/mudler/vllm.cpp/issues/391) | `PERF-CPU-DECODE-BARRIER` | CPU backend: batch-1 decode is barrier-bound (47% sync), and paged attention branches per element | perf |
 | [#299](https://github.com/mudler/vllm.cpp/issues/299) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: 5 dense SwiGLU models bypass the MUST-route merged-GEMM seam with no stated blocker (spec [`fusion-dense-migrate.md`](specs/fusion-dense-migrate.md)) | bug |
 | [#314](https://github.com/mudler/vllm.cpp/issues/314) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE` glue half: `glm4`/`phi3` still hand-call add+RMSNorm instead of `vt::FusedChain` (split out of #299, which closed the merged-GEMM half only) | bug |
 | [#337](https://github.com/mudler/vllm.cpp/issues/337) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: the five dgx SACRED paged-engine gates are OWED after the merged-GEMM fold (`test_{commandr,glm4,minicpm,minicpm3,phi3}_paged_engine` SKIP on a CPU box) | bug |

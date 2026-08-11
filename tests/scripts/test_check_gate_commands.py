@@ -288,6 +288,27 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
         self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_trailer_merge_artifacts_is_credited_for_real_commands(self):
+        # ENG-TRAILER-MERGE-ARTIFACTS (#406) joins the runnable population on
+        # arrival, so it earns the credit the same way: its spec's Gates section
+        # must name commands that can actually fail. Its gate is the record gate
+        # plus a per-commit re-verification of the five real main commits.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-TRAILER-MERGE-ARTIFACTS"), "runnable")
+        spec = (ROOT / ".agents/specs/trailer-merge-artifacts.md").read_text(
+            encoding="utf-8"
+        )
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
+
+    def test_the_trailer_row_re_pin_is_load_bearing(self):
+        # MUTATION: drop the entry and the exact pin must break.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-TRAILER-MERGE-ARTIFACTS"}
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
     def test_record_conflict_surfaces_is_credited_for_real_commands(self):
         # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on
         # arrival, so the credit has to be earned the same way ENG-DOCS-SITE

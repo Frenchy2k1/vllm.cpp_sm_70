@@ -351,8 +351,14 @@ ENGINE_PREFIXES = (
 # marched every PR into it. User-directed, issue #374; `ACTIVE` on its committed
 # spec. No checker semantic beyond the row's own scope and no product source is
 # changed by the bump.
+# 150 since 2026-08-11: +`ENG-TRAILER-MERGE-ARTIFACTS` (the trailer gate rejects
+# correct commits because GitHub appends `Co-authored-by:` as a separate
+# paragraph, which hides the block from `git interpret-trailers --parse`; 13 of
+# the last 30 commits on main failed the check, unnoticed because those runs were
+# cancelled). User-directed, issue #406; `ACTIVE` on its committed spec. No rule
+# in that checker is relaxed and no product source changes.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 149
+ENGINE_ROWS = 150
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
