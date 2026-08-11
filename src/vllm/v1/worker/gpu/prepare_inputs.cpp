@@ -220,6 +220,60 @@ StepInputs prepare_inputs(InputBatch& input_batch,
     }
   }
 
+  // ─── prompt logprobs (SAMPLE-PROMPT-LOGPROBS) ──────────────────────────────
+  // 1:1 the per-request row selection of _get_prompt_logprobs_dict
+  // (gpu_model_runner.py:5626-5686). Skipped entirely — not one branch taken,
+  // not one byte appended — unless a request asked for prompt logprobs.
+  if (!input_batch.num_prompt_logprobs.empty()) {
+    for (int i = 0; i < num_reqs; ++i) {
+      const std::string& req_id = *input_batch.req_ids[static_cast<size_t>(i)];
+      const auto it = input_batch.num_prompt_logprobs.find(req_id);
+      if (it == input_batch.num_prompt_logprobs.end()) continue;
+
+      const int32_t num_tokens = out.num_scheduled_tokens[static_cast<size_t>(i)];
+      const int32_t num_prompt_tokens =
+          input_batch.num_prompt_tokens[static_cast<size_t>(i)];
+      // start_idx = num_computed_tokens; start_tok = start_idx + 1 (:5654-5655).
+      // The first prompt position has no logprob (nothing precedes it), so the
+      // tensor covers num_prompt_tokens - 1 rows and row r scores prompt[r+1].
+      const int32_t start_idx =
+          input_batch.num_computed_tokens_cpu[static_cast<size_t>(i)];
+      const int32_t start_tok = start_idx + 1;
+      const int32_t num_remaining_tokens = num_prompt_tokens - start_tok;
+
+      StepInputs::PromptLogprobRows rows;
+      rows.req_id = req_id;
+      rows.num_prompt_logprobs = it->second;
+      rows.dst_start = start_idx;
+      if (num_tokens <= num_remaining_tokens) {
+        // A chunk; more prompt remains. In the == case there are no more prompt
+        // logprobs to produce, but upstream still defers the emit to the next
+        // step, where there is a generated token to return alongside them
+        // (:5658-5662).
+        rows.num_rows = num_tokens;
+      } else {
+        rows.num_rows = num_remaining_tokens;
+        rows.final_chunk = true;
+      }
+      // num_rows <= 0 is the exact-prefill edge (:5668-5671): the previous step
+      // consumed exactly num_prompt_tokens - 1 tokens, so there is nothing left
+      // to score. A final chunk still has to be EMITTED, so the entry is kept
+      // with zero rows and no gathered indices.
+      if (rows.num_rows < 0) rows.num_rows = 0;
+      if (rows.num_rows == 0 && !rows.final_chunk) continue;
+
+      rows.src_start = static_cast<int>(out.prompt_logprob_indices.size());
+      const int32_t query_start = out.query_start_loc[static_cast<size_t>(i)];
+      rows.target_token_ids.reserve(static_cast<size_t>(rows.num_rows));
+      for (int j = 0; j < rows.num_rows; ++j) {
+        out.prompt_logprob_indices.push_back(query_start + j);
+        rows.target_token_ids.push_back(
+            static_cast<int64_t>(input_batch.token_id(i, start_tok + j)));
+      }
+      out.prompt_logprob_rows.push_back(std::move(rows));
+    }
+  }
+
   return out;
 }
 

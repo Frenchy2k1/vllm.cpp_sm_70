@@ -314,6 +314,25 @@ class GPUModelRunner final : public ModelRunnerBase {
                         const vllm::HfConfig* config, int k,
                         bool sample_from_anchor);
 
+  // SAMPLE-PROMPT-LOGPROBS route-observation seam. Const, no behaviour, exposed
+  // for the gate: the row count the LAST forward actually produced, the token
+  // count that step ran on, and its request count. On EVERY step where no
+  // request asked for prompt logprobs the forward gathers before lm_head, so
+  // last_forward_rows() == step_num_logits(); a step that owes prompt logits
+  // instead takes the full-logits route and returns num_actual_tokens rows.
+  // test_llm_engine §9(g) asserts that DECISION directly, because an on-vs-off
+  // comparison inside ONE build cannot see a change to the shared route — both
+  // arms move together (review finding 2 on PR #235).
+  int64_t last_forward_rows() const { return exec_state_.logits.rows; }
+  int last_forward_num_actual_tokens() const {
+    return exec_state_.num_actual_tokens;
+  }
+  int last_forward_num_reqs() const { return exec_state_.num_reqs; }
+  // The expanded logit-row count for the stashed step (StepInputs::cu_num_logits
+  // back, == exec_state_.num_reqs on the non-speculative default path). Public
+  // so the gate above can name the expected value instead of re-deriving it.
+  int step_num_logits() const;
+
  private:
   // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed
   // device storage; CPU and VT_DEVICE_KV_CACHE=0 retain the host-vector
@@ -545,9 +564,20 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Tensor assemble_sample_logits(
       const std::optional<GrammarOutput>& grammar_output,
       std::vector<float>& sampled_logits);
-  // The expanded logit-row count for the stashed step (StepInputs::cu_num_logits
-  // back, == exec_state_.num_reqs on the non-speculative default path).
-  int step_num_logits() const;
+  // (step_num_logits is declared in the public section above — the
+  // SAMPLE-PROMPT-LOGPROBS route gate names it.)
+  // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:5612-5719, called at :3841).
+  // Score the extra logit rows the forward produced for prompt positions, fold
+  // each request's chunk into its accumulated tensor, and move out the tensors
+  // whose prompt finished this step. Returns immediately — no branch taken, no
+  // allocation — when the stashed step named no prompt rows, which is every
+  // step unless a request asked for prompt logprobs.
+  void collect_prompt_logprobs(
+      std::map<std::string, LogprobsTensors>& prompt_logprobs_dict);
+  // A request's prompt-logprob tensor height: num_prompt_tokens - 1.
+  int prompt_logprob_positions(const std::string& req_id) const;
+  // Forget in-progress prompt logprobs whose request left the batch (abort).
+  void drop_stale_prompt_logprobs();
   // The SPEC-DECODE VERIFY half (SPEC-REJECTION I3): route the expanded
   // [Σ(1+k_i), vocab] logits through the greedy rejection sampler, write the
   // accepted tokens back, and record num_accepted_tokens. Called by sample_tokens
@@ -696,6 +726,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   // prompt block of each running request to the external cache (offload-prompt-
   // only). No-op unless kv_connector_ is a worker-capable connector.
   void ConnectorStorePromptKv(const SchedulerOutput& scheduler_output);
+
+  // SAMPLE-PROMPT-LOGPROBS: the partially-filled prompt-logprob tensor of every
+  // request whose prompt is still being consumed, keyed by req_id. A chunked
+  // prefill fills it slice by slice and the final chunk moves it out; upstream
+  // hangs the same tensor off the per-request state object as
+  // `request.in_progress_prompt_logprobs_cpu` (gpu_model_runner.py:5645-5651,
+  // cleared at :5712), which we have no equivalent of on the runner. Empty
+  // unless a request asked for prompt logprobs.
+  std::map<std::string, LogprobsTensors> in_progress_prompt_logprobs_;
 
   // Stashed forward result between execute_model and sample_tokens (upstream
   // ExecuteModelState — hidden_states + input_batch handoff, here the full

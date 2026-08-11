@@ -111,6 +111,38 @@ struct StepInputs {
   // num_scheduled_tokens per request in batch order (the array upstream's
   // execute_model builds and passes to _prepare_inputs). [num_reqs]
   std::vector<int32_t> num_scheduled_tokens;
+
+  // ─── prompt logprobs (SAMPLE-PROMPT-LOGPROBS) ─────────────────────────────
+  // One entry per request that asked for prompt logprobs AND has rows to
+  // produce this step, in batch order. Mirrors the per-request body of
+  // gpu_model_runner.py::_get_prompt_logprobs_dict:5626-5686 — the arithmetic
+  // that decides WHICH prompt positions get an lm_head row is pure input prep,
+  // so it is computed here; the scoring and the cross-step accumulation stay on
+  // the runner. EMPTY on every step where no request asked, which is what keeps
+  // the production path byte-identical (see specs/prompt-logprobs.md).
+  struct PromptLogprobRows {
+    std::string req_id;
+    // Requested count k; the tensor is [num_prompt_tokens-1, k+1].
+    int num_prompt_logprobs = 0;
+    // Destination row range in the request's accumulated tensor:
+    // [dst_start, dst_start + num_rows) == upstream's
+    // slice(start_idx, start_idx + num_logits) at :5698.
+    int dst_start = 0;
+    int num_rows = 0;
+    // Offset into prompt_logprob_indices of this request's first row.
+    int src_start = 0;
+    // Prompt token ids scored at those rows — prompt[start_tok + i], the NEXT
+    // token at each position (:5684-5686). [num_rows]
+    std::vector<int64_t> target_token_ids;
+    // This step completes the request's prompt: emit the tensor and drop the
+    // in-progress state (:5665-5667, :5709-5712).
+    bool final_chunk = false;
+  };
+  std::vector<PromptLogprobRows> prompt_logprob_rows;
+  // Flat token-stream indices for every row named above, concatenated in the
+  // same request order. Appended to logits_indices for the forward's gather so
+  // the model's own lm_head produces those rows; empty on the default path.
+  std::vector<int32_t> prompt_logprob_indices;
 };
 
 // update_states: apply a SchedulerOutput to the persistent InputBatch — remove

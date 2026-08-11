@@ -78,9 +78,13 @@ class ServerPackageTest(unittest.TestCase):
                 f"-j{BUILD_JOBS}",
             )
 
-            archives = sorted((build / "release").glob("vllm.cpp-*-cpu-*.tar.gz"))
+            archives = sorted((build / "release").glob("vllm.cpp-*.tar.gz"))
             self.assertEqual(len(archives), 1, "the package target must emit one archive")
             archive = archives[0]
+            self.assertEqual(
+                archive.name,
+                f"vllm.cpp-0.0.2-linux-{platform.machine()}-glibc-cpu.tar.gz",
+            )
             first_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 
             # A second package invocation must reproduce the bytes, not merely a
