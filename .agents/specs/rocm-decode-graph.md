@@ -8,8 +8,15 @@ must agree.
 **Base:** current `upstream/main`. The gfx1200 correctness record this spec
 links, [rocm-gfx1200-m2-correctness.md](rocm-gfx1200-m2-correctness.md), is
 already ON `main` — it landed with #273's commits, so there is nothing left to
-stack on and no dangling link. Every `file:line` below was re-verified against
-this tree. Re-anchor at implementation time; `check_links` validates ranges.
+stack on and no dangling link.
+**Anchors are SYMBOLS, not line numbers, and that is deliberate.** `main` runs
+75-207 commits/day (measured over 2026-08-07..11), so a `file:line` anchor is
+wrong within days: an earlier draft of this spec drifted +4 lines in
+`cuda_backend.cu`, +7 in `backend.h`, and `rocm_ops.hip`'s `kPagedAttention`
+registration moved 92 -> 148, all inside one day. Every anchor below is instead
+a function signature, a `RegisterOp` call, a test-case title or a distinctive
+comment — things `grep -rn` still finds after a thousand commits. Keep it that
+way when editing.
 **Board:** AMD Radeon RX 9060 XT (`gfx1200`, Navi 44, RDNA4, discrete), ROCm
 7.2.3, hipClang/Clang 22.0.0 — the only board with hardware access here. Records
 say gfx1200 and must not imply the four #41 boards
@@ -20,10 +27,10 @@ say gfx1200 and must not imply the four #41 boards
 ## 1. Why this, and what it is worth
 
 `vt::Backend`'s graph-capture virtuals are implemented only for CUDA.
-`SupportsGraphCapture()` is false on ROCm (`rocm_backend.hip:22-26` says so
+`SupportsGraphCapture()` is false on ROCm (the `SupportsGraphCapture() stays FALSE` scope note in `rocm_backend.hip` says so
 explicitly) and `RocmPlatform` does not override `support_static_graph_mode()`,
-inheriting false from `interface.h:189`. Decode-graph classes gate on both
-(`qwen3.cpp:494-498`), so every ROCm decode step pays full host launch cost
+inheriting false from `Platform::support_static_graph_mode()` in `interface.h`. Decode-graph classes gate on both
+(the `enabled =` gate in `Qwen3DenseDecodeGraph::Impl`), so every ROCm decode step pays full host launch cost
 while vLLM on the same board replays captured hipGraphs.
 
 Measured on gfx1200, 2026-08-10, 128in/128out batch 8, ours
@@ -67,10 +74,10 @@ compute rather than a measurement of it, and no trace has been taken on either
 side. D4 carries this.
 
 **Structural reason, independent of the numbers.** `vt::Backend`'s capture
-virtuals (`include/vt/backend.h:188-202`) are documented as a multi-backend seam
+virtuals (`vt::Backend`'s capture virtuals (`SupportsGraphCapture` through `DestroyGraph`, `include/vt/backend.h`)) are documented as a multi-backend seam
 ("CUDA Graphs / Metal ICB / Vulkan CB"), but CUDA is its only implementation:
-Metal (`metal_backend.mm:13`), Vulkan (`vulkan_backend.cpp:16`) and ROCm all
-carry the same `stays FALSE` note. A one-implementation abstraction is unproven.
+Metal (`metal_backend.mm`), Vulkan (`vulkan_backend.cpp`) and ROCm all carry the
+same `SupportsGraphCapture() stays FALSE` note. A one-implementation abstraction is unproven.
 hipGraph is the cheapest available second, since `MTLIndirectCommandBuffer` and
 a pre-recorded `VkCommandBuffer` are genuinely different models.
 
@@ -92,11 +99,10 @@ no reference tier, so an unregistered op throws.
 
 **In scope.**
 1. `src/vt/rocm/rocm_backend.hip` — the six capture virtuals against hipGraph,
-   mirroring `cuda_backend.cu:198-290`, replacing the `stays FALSE` note at
-   `:22-26`.
+   mirroring `cuda_backend.cu`'s capture block, replacing that `stays FALSE` note.
 2. `src/vllm/platforms/rocm.cpp` — add the `support_static_graph_mode()`
-   override (`rocm.cpp:67` is today a comment explaining the inherited false,
-   not an override).
+   override (`rocm.cpp` today only *comments* on the
+   inherited false; there is no override).
 3. `tests/vt/test_rocm_backend.cpp` — a RED-first capture/replay case (§6).
 4. Records: this spec, the roadmap intake row, `backend-matrix.md`, and
    `docs/ROCM.md` §5's M3 text.
@@ -104,17 +110,18 @@ no reference tier, so an unregistered op throws.
 **Out of scope.**
 - **New decode-graph model siblings.** Only models that already have one
   benefit; writing more is separate work with its own correctness gate.
-- **`VT_BENCH_PROFILE_CONTROL`** (`cuda_backend.cu:234-266`) — CUDA-profiler
+- **`VT_BENCH_PROFILE_CONTROL`** (the `#ifdef VT_BENCH_PROFILE_CONTROL` block inside `ReplayGraph`) — CUDA-profiler
   instrumentation, not load-bearing. A `rocprofiler` equivalent is later work;
   the first cut omits it and says so in the code.
 - **Any model-level edit.** Every decode-graph class already gates generically
-  with no `is_cuda()` anywhere (`qwen3.cpp:494-498`, `qwen3_moe.cpp:385`,
-  `deepseek_v2.cpp:896`, `voxtral.cpp:438`, `qwen3_5.cpp:7846,8167`). Flipping
+  with no `is_cuda()` anywhere (the identical `enabled =` gate in `qwen3.cpp`, `qwen3_moe.cpp`,
+  `deepseek_v2.cpp`, `voxtral.cpp` and `qwen3_5.cpp` — `grep -rn
+  support_static_graph_mode src/vllm/model_executor/models/`). Flipping
   the two flags suffices; needing a model edit would mean the seam had failed.
 - **Metal / Vulkan capture.** Different APIs, different specs.
-- **The M3 attention-backend NAME registration** (`rocm.cpp:105` returns `{}`)
-  and the stale `rocm.cpp:91` comment claiming `kPagedAttention` is unregistered
-  for `kROCM` — it is registered (`rocm_ops.hip:148`) and ran `vt-native` on this
+- **The M3 attention-backend NAME registration** (`get_attn_backend_priority` returns `{}`)
+  and the stale `rocm.cpp` comment claiming `kPagedAttention` is unregistered
+  for `kROCM` — it is registered (`RegisterOp(OpId::kPagedAttention, DeviceType::kROCM, ...)` in `rocm_ops.hip`) and ran `vt-native` on this
   board. Both real, both separate; a bug found in passing gets its own issue.
 
 ## 3. Upstream chain
@@ -132,15 +139,17 @@ Observed on this board 2026-08-10 — 51 piecewise + 35 full captures, ~6 s, in 
 not inferred.
 
 Internal anchors:
-- `include/vt/backend.h:188-202` — the six virtuals and the multi-backend comment.
-- `src/vt/backend.cpp:29-34` — base impls: five `VT_CHECK(false, ...)` throws,
+- `vt::Backend`'s capture virtuals (`SupportsGraphCapture` through `DestroyGraph`, `include/vt/backend.h`) — the six virtuals and the multi-backend comment.
+- `Backend::BeginCapture` .. `Backend::DestroyGraph` in `src/vt/backend.cpp` — base impls: five `VT_CHECK(false, ...)` throws,
   `DestroyGraph` a no-op. An unimplemented backend fails loudly; the model-level
   `enabled` gate keeps it off the path.
-- `src/vt/cuda/cuda_backend.cu:182-290` — the implementation to mirror. Its
-  capture-contract comment (`:187-197`) is the real specification of what a
+- the `--- CUDA-graph capture/replay` block in `src/vt/cuda/cuda_backend.cu` — the implementation to mirror. Its
+  capture-contract comment above `BeginCapture` is the real specification of what a
   caller must honour.
-- `src/vllm/platforms/interface.h:185-189`, `cuda.cpp:58-59`, `rocm.cpp:67`.
-- `src/vllm/model_executor/models/qwen3.cpp:489-560` — the consumer:
+- `Platform::support_static_graph_mode()` — declared in
+  `src/vllm/platforms/interface.h`, overridden true in `cuda.cpp`, and left to
+  the inherited false in `rocm.cpp` (with a comment saying why).
+- `Qwen3DenseDecodeGraph::Impl` (`src/vllm/model_executor/models/qwen3.cpp`) — the consumer:
   per-padded-size `SizeSlot`s with fixed-address persistent buffers, `Refresh()`
   in place, invalidate-and-recapture on a block-table column change.
 
@@ -149,7 +158,8 @@ Internal anchors:
 **Reused as-is** — most of the change's value is that none of this is written:
 the whole `vt::Backend` interface (no signature changes); every decode-graph
 class and its capture-contract handling (padded slots, pre-warm, persistent
-buffers, column-change invalidation); `test_cuda_backend.cpp:102-153` as the test
+buffers, column-change invalidation); the `CUDA backend: graph capture/replay
+re-executes captured ops` case in `test_cuda_backend.cpp` as the test
 shape; the `tests/CMakeLists.txt` pattern that compiles
 `test_rocm_backend.cpp` everywhere as a bit-rot guard but links it only under
 `VLLM_CPP_HIP`.
@@ -161,14 +171,14 @@ here.
 
 | CUDA (`cuda_backend.cu`) | ROCm (`rocm_backend.hip`) |
 |---|---|
-| `:198` `SupportsGraphCapture()` | same |
-| `:204-207` `BeginCapture` — `cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)` | `hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal)` |
-| `:208-216` `EndCapture` — end → destroy prior `exec_` → instantiate → destroy graph | `hipStreamEndCapture` / `hipGraphExecDestroy` / `hipGraphInstantiate` / `hipGraphDestroy` |
-| `:218-220` `Replay` — `cudaGraphLaunch(exec_, s)` | `hipGraphLaunch` |
-| `:225-231` `EndCaptureGraph` — opaque-handle variant for the multi-size slot map | same shape; returns `hipGraphExec_t` as `void*` |
-| `:233-270` `ReplayGraph(q, graph)` | same, minus `VT_BENCH_PROFILE_CONTROL` (§2) |
-| `:288-290` `DestroyGraph` | `hipGraphExecDestroy` |
-| `platforms/cuda.cpp:58-59` `support_static_graph_mode()` | new override in `platforms/rocm.cpp` |
+| `SupportsGraphCapture()` | same |
+| `BeginCapture` — `cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)` | `hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal)` |
+| `EndCapture` — end → destroy prior `exec_` → instantiate → destroy graph | `hipStreamEndCapture` / `hipGraphExecDestroy` / `hipGraphInstantiate` / `hipGraphDestroy` |
+| `Replay` — `cudaGraphLaunch(exec_, s)` | `hipGraphLaunch` |
+| `EndCaptureGraph` — opaque-handle variant for the multi-size slot map | same shape; returns `hipGraphExec_t` as `void*` |
+| `ReplayGraph(q, graph)` | same, minus `VT_BENCH_PROFILE_CONTROL` (§2) |
+| `DestroyGraph` | `hipGraphExecDestroy` |
+| `platforms/cuda.cpp` `support_static_graph_mode()` | new override in `platforms/rocm.cpp` |
 
 Every name is a long-stable HIP runtime API with the same signature and
 semantics as its CUDA counterpart — the property that lets upstream compile
@@ -176,8 +186,9 @@ semantics as its CUDA counterpart — the property that lets upstream compile
 
 ## 6. Tests — RED first, and the right red
 
-Nothing to port. One new case in `tests/vt/test_rocm_backend.cpp`, mirroring
-`test_cuda_backend.cpp:102-153`, HIP-header-free like the rest of that file
+Nothing to port. One new case in `tests/vt/test_rocm_backend.cpp`, mirroring the
+`CUDA backend: graph capture/replay re-executes captured ops` case in
+`test_cuda_backend.cpp`, HIP-header-free like the rest of that file
 (every assertion through public `vt::` seams; needing a HIP header would mean the
 seam leaks):
 
@@ -189,7 +200,7 @@ seam leaks):
 5. **Mutate `src` in place (same address) to B, `Replay` → `dst` must read B.**
    The load-bearing assertion: replay re-executes the captured copy over the
    persistent buffer rather than replaying a snapshot, which is how a decode
-   graph picks up each new token's inputs, and the failure `rocm_backend.hip:23-25`
+   graph picks up each new token's inputs, and the failure `rocm_backend.hip`'s `stays FALSE` note
    warns about.
 6. Handle variant: `EndCaptureGraph` → `ReplayGraph` → `DestroyGraph`, same
    A-then-B assertion — that is the path decode graphs actually take.
@@ -249,10 +260,10 @@ mutations that must turn it red, in a scratch copy, restored byte-for-byte:
 ## 8. Risks and decisions
 
 **D1 — `LtWorkspace` can `hipMalloc` mid-capture; the most likely way this
-fails.** `rocm_matmul_hipblaslt.hip:243-255` allocates the hipBLASLt workspace
+fails.** `LtWorkspace()` in `rocm_matmul_hipblaslt.hip` allocates the hipBLASLt workspace
 lazily in the GEMM path, growing on demand (`if (need > cap) { hipFree;
 hipMalloc; }`). Allocation inside a capture region is illegal and invalidates
-it. CUDA's contract comment (`cuda_backend.cu:190-194`) names exactly this and
+it. CUDA's contract comment (`cuda_backend.cu`, the "NO cudaMalloc/cudaFree inside the region" bullet) names exactly this and
 notes cuBLASLt's workspace is a one-time per-context alloc there. *Mitigation:*
 the decode-graph pre-warm runs the same shapes at the same padded size before
 capture, which should grow `cap` to its high-water mark. *If it does not:*
