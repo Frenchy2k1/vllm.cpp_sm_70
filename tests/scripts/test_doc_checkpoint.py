@@ -302,6 +302,28 @@ class ObligationsDoNotOverfire(unittest.TestCase):
             self.assertNotIn(fossil, source)
 
 
+class PublicDocumentPolicyTests(unittest.TestCase):
+    def test_lifecycle_projection_names_the_row_spec_not_now_md(self):
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        section = agents.split("## Public documents", 1)[1].split(
+            "## Work happens in a worktree", 1
+        )[0]
+        self.assertIn("| `docs/STATUS.md` | a row changes lifecycle state |", section)
+        self.assertIn(
+            "| `docs/BENCHMARKS.md` | a row gains an accepted or explicitly "
+            "pending/failed/void measurement |",
+            section,
+        )
+        self.assertIn("| the moved row spec's `## Now` |", section)
+        self.assertNotIn("| `.agents/NOW.md` |", section)
+        prose = " ".join(section.split())
+        self.assertIn(
+            "A lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row "
+            "spec's `## Now`.",
+            prose,
+        )
+
+
 class SupportSurfaces(unittest.TestCase):
     def errors(self, paths):
         original = checker.blob

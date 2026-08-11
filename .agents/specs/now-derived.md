@@ -196,10 +196,58 @@ reliable target and the mapping must be fixed first.
 
 ## Now
 
-W2 next: drop `NOW` from the lifecycle triple and require the moved row's spec to
-carry this section.
+DONE at implementation merge `dbd0d51c`: W1-W5 shipped. Progressive `## Now`
+backfill is the selected compatibility policy, not remaining work; use
+`scripts/now.py` for the derived live position.
 
 ## Outcome
 
-Pending. To be written at `DONE` with the measured changed-path set of a
-lifecycle PR, what was rejected, and why each retained cap sits where it does.
+Landed in `dbd0d51c` (PR #376). Runtime correctness, performance and vLLM
+parity are honestly `VOID`: this is local protocol/checker machinery with no
+upstream analogue, and it changes no model output, latency, throughput, memory
+behavior or product source.
+
+**What was measured.** `.agents/NOW.md` left the lifecycle triple and
+`PUBLIC_SURFACES`. The binding lifecycle test passes with the moved matrix, that
+row's own spec, `docs/STATUS.md`, and `docs/BENCHMARKS.md`; the shared digest is
+absent. Omitting either public projection or the spec, removing `## Now`, or
+leaving it empty fails. Restoring `NOW` to the lifecycle triple makes the
+NOW-free case fail again. `scripts/now.py` rendered 105 live rows in about 50 ms
+offline and reports `REMOTE_UNVERIFIED` rather than dropping the roster.
+
+The draft shorthand that a row advance touches no shared surface is rejected as
+inaccurate. `STATUS` and `BENCHMARKS` intentionally remain shared lifecycle
+projections. The eliminated shared surface is specifically the live-position
+digest: no lifecycle PR writes `.agents/NOW.md`.
+
+**Missed consumers.** The implementation found two readers absent from the
+initial inventory. `check-release-binary-contract.py` pinned a literal Release
+row inside NOW.md, and two #364 tests asserted that adding a row there was free.
+Both consumers were relocated rather than deleted. The finding makes a complete
+reader search part of future shared-surface removal work.
+
+**Rejected alternatives.** Deleting `.agents/NOW.md` would lose the current gate
+and cross-row priorities, which remain authored operator judgement. Enlarging a
+file budget preserves the write lock; dropping freshness loses the obligation
+instead of relocating it. A network-required digest was rejected because cold
+start must work offline, and deriving claims solely from `gh pr list` cannot
+distinguish no claims from a failed remote query.
+
+**One-time conflict cost.** Removing a shared surface conflicts once with every
+in-flight branch that touched it. After merge, 5 of 8 still-conflicting open PRs
+conflicted on `.agents/NOW.md`, 4 on `check-public-doc-tables.py`, and #360 moved
+from MERGEABLE to CONFLICTING. Resolution is mechanical—take main's digest and
+move the row step to its spec—but the cost should have been stated before land.
+
+**Why progressive backfill is the default.** Requiring `## Now` in every legacy
+spec immediately would bulk-edit roughly 100 independently owned files. Instead
+the requirement binds when each row next changes lifecycle state; `now.py` shows
+a dash until then. This preserves compatibility without treating the backfill as
+unfinished work in this row.
+
+**Why the retained defaults remain.** Offline-first rendering preserves cold
+start; `REMOTE_UNVERIFIED` preserves uncertainty. The authored headings and
+freshness stamp retain non-derivable operator context. The 100-line cap keeps it
+readable in one pass, the per-entry cap bounds local narrative growth, and the
+regrowth guard prevents a per-row table from returning. The whole-file byte cap
+stays removed because it forced unrelated evictions.

@@ -1028,9 +1028,12 @@ EngineCoreOutputs Scheduler::update_from_output(
 
     // Extract sample logprobs if needed (scheduler.py:1815-1821). Only when the
     // request asked for logprobs and the runner produced them this step; slice
-    // this request's rows out of the batch-wide LogprobsLists.
+    // this request's rows out of the batch-wide LogprobsLists. The gate is
+    // upstream's `num_logprobs` PROPERTY (:1818), not the raw `logprobs` field,
+    // so a generative-scoring request — which sets logprob_token_ids and leaves
+    // `logprobs` unset — is sliced too.
     std::optional<LogprobsTensors> new_logprobs;
-    if (request->sampling_params.logprobs.has_value() &&
+    if (request->sampling_params.num_logprobs().has_value() &&
         model_runner_output.logprobs.has_value() &&
         model_runner_output.logprobs->num_positions > 0) {
       new_logprobs = model_runner_output.logprobs->slice_request(
