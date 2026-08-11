@@ -531,7 +531,15 @@ STATUS_RATCHET = {
     # #323 async-serving correction while #223 and #238 were landing. RE-MEASURED
     # against the page that carries all three -- 243378 less #223's 10 and #238's
     # 12 -- rather than carried from any one of them. Strictly DOWN.
-    "chars": 243356,
+    # 243309 since 2026-08-11 (measured 243309): the 35B cell carries the
+    # canonical c1-c32 grid instead of the superseded ad-hoc narrative.
+    # Strictly DOWN from 243378.
+    #
+    # 243287 since 2026-08-11 (measured 243287): main re-pinned to 243309 for the
+    # 35B canonical grid while #223 and #238 were landing. RE-MEASURED against the
+    # page carrying all three -- 243309 less #223's 10 and #238's 12 -- not carried
+    # from any one of them. Strictly DOWN.
+    "chars": 243287,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
