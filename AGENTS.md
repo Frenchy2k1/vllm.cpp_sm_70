@@ -19,7 +19,9 @@ the reference for behavior and the bar for speed.
    as a coordinator; it is never refused because someone else is coordinating.
    Add `--headless` only when the developer explicitly says the run is
    unattended. Never infer it.
-3. Read `.agents/NOW.md`. It is the live snapshot and fits on one screen.
+3. Run `scripts/now.py` for the live position, and read `.agents/NOW.md`
+   for the operator's current gate and next actions. The first is derived;
+   the second is authored and fits on one screen.
 4. Read only the claimed row, its spec, its evidence, and the task guide for
    what you are about to do.
 5. Run `scripts/agent-preflight.sh` before you edit anything.
@@ -211,6 +213,23 @@ wholesale and reapplying your scoped edit; verify unrelated keys byte-for-byte.
 Union-append only genuinely append-only logs. Never accept an automatic
 three-way merge of a keyed record.
 
+**No surface that every PR must write.** If N concurrent PRs all edit file F,
+then F is a lock. A record surface is admissible in one of three shapes only:
+**one file per row**, globbed for reading; **genuinely append-only**, so it
+union-merges; or **derived at read time**, so nobody writes it. Rewrite anything
+else into one of the three.
+
+Two corollaries. **Cap the entry, never the file** — a budget on a shared file
+turns every addition into evicting someone else's content, and merging two such
+edits cleanly is worse than conflicting, because it applies both evictions.
+**Never store a measurement of one file inside another** — a number that moves on
+every edit couples every PR to lines it does not own.
+
+A gate is what usually creates the lock: if a checker *requires* every change to
+touch a shared file, that is the defect, not the discipline of the people
+touching it. Relocate the obligation to a per-row surface rather than deleting
+it.
+
 Compact by *moving* superseded detail into `.agents/completed/` with links and
 provenance intact. Never delete evidence to save context.
 
@@ -226,10 +245,12 @@ each fact lives in exactly one of them.
 | `docs/FEATURES.md` | a feature, model, backend, or quantization surface changes |
 | `docs/USAGE.md` | a command, C API, config key, install step, or workflow changes |
 | `README.md` | a user-visible headline, positioning, or quick start changes |
-| `.agents/NOW.md` | the live position moves |
+| the moved row spec's `## Now` | a row changes lifecycle state |
 
 Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
-lifecycle change owes `STATUS`, `BENCHMARKS`, and `NOW`.
+lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
+`.agents/NOW.md` is authored only at operator cadence and is never a per-row
+lifecycle write.
 
 ## Work happens in a worktree
 
@@ -273,6 +294,14 @@ Assisted-by: AGENT:MODEL [TOOL]
 
 AI tools never add `Signed-off-by` or `Co-Authored-By`. The human submitter owns
 and reviews the change.
+
+That forbids an AI *claiming authorship*. It does not forbid the forge from
+recording who submitted: a `Co-authored-by` that GitHub generates for the account
+opening a pull request — the `@users.noreply.github.com` form — is attribution of
+a submitter and is accepted, even when that account is a bot. The claim about AI
+involvement is made by `AI-Assisted` and `Assisted-by`, which are the trailers
+that carry it and are never relaxed. `Signed-off-by` gets no such exemption: a
+sign-off is a legal assertion, not attribution.
 
 Classify policy, checker, doc, script, test, CI, generated, and product paths
 explicitly, and never hide mutable files behind a blanket directory exemption.

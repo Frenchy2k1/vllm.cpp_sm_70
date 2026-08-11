@@ -18863,3 +18863,418 @@ required 1% and raw-leg gates. `nsys` records unchanged gx8/gy800/bx128,
 56 registers/thread, 9,728 dynamic shared bytes and zero local bytes. Evidence
 is `/tmp/qwen35-gdn-vecstore-{rega,veca,vecb,regb}-3ca49e926.*`. Product and
 tests are removed; REGSTATE remains the local opt-in.
+
+## Muse Glimmer 30B — the speed RE-RUN, first binding numbers (2026-08-11, issue #333, `row/MUSE-BENCH-2`)
+
+**Outcome: the quant-matched llama.cpp bar is MEASURED on every axis; the vLLM
+bar remains an OPEN GAP by construction.** Supersedes nothing in the §11 /
+2026-08-11 `row/MUSE-BENCH` entry above, which stands as the record of why no
+number existed then; it is the re-run that entry said was owed.
+
+Branch `row/MUSE-BENCH-2` off `origin/main` `75a29016`. Full reasoning in
+`.agents/specs/muse-glimmer.md` §14.
+
+### Why a number is possible now
+
+`11d45330` (the `llama4` / GPT-4o pre-tokenizer, #347) and `75a29016` (the Q/K
+interleaved-RoPE row order, #359) removed the two blockers §11 recorded. Both
+engines can now hold AND generate from the same file, which is the whole
+precondition for a quant-matched comparison.
+
+### The bars
+
+| Bar | Arm | Value | Quant-matched? | Status |
+|---|---|---|---|---|
+| vLLM | any | — | n/a | **OPEN GAP by construction**: the pin carries no `muse_glimmer`. Nothing substituted, nothing waived. Unblocks on vllm#51655 + a pin advance |
+| llama.cpp `70448594` (SECONDARY) | same 16.76 GB Q4_K_M file | table below | **YES**, byte-identical file | **BINDING** on an idle box, r=3-5, spreads calibrated |
+| ours | same GGUF | table below | **YES** | **BINDING** |
+| HF transformers bf16 | bf16 safetensors | see "bf16" below | would be yes | **PARTIAL**: probe only |
+| ours bf16 | bf16 safetensors | see "bf16" below | would be yes | **PARTIAL**: probe only |
+
+### Host, contention and provenance
+
+`dgx.casa`, NVIDIA GB10, aarch64, 20 cores (10 Cortex-X925 + 10 A725), 119 GB
+unified. **Idle at claim**: load 0.23/0.33/0.72, `local-ai-worker` already
+`Exited (0)`, `nvidia-smi` 0% util, `/mnt/nas_share` mounted, no holder on the
+box lock. `$HOME/gpu.lock` held via `flock` across the entire series; legs
+strictly sequential; loads recorded at every leg boundary (15-21 throughout,
+all of it our own 20-thread job).
+
+Model file copied from the CIFS NAS to local NVMe so neither engine pays a
+network-filesystem tax inside a measured window:
+`muse-glimmer-30B-kquant-17gb.gguf`, 16,756,681,056 bytes, md5
+`ba8da9b15aed63a1df095cb34f3e7665`, arch `muse-glimmer`, Q4_K_M (file_type 15),
+731 tensors, 52 layers; llama-bench reports it as 15.59 GiB / 27.85 B params.
+bf16 arm `/mnt/nas_share/checkpoints/muse-glimmer-30b` rev `f84ecc3a0e`.
+
+### Build and run recipe
+
+```sh
+# ours, CPU-only, on dgx (aarch64, gcc 13.3, cmake 3.28.3)
+cmake -S vllm.cpp -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF \
+      -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON -DVLLM_CPP_SERVER=OFF
+cmake --build build-cpu -j6 --target vllm-bench vllm-cli
+VLLM_CPP_CPU_THREADS=20 build-cpu/examples/vllm-bench --model $GGUF \
+  --num-prompts 1 --concurrency 1 --input-len 128 --output-len 16 \
+  --temperature 0 --seed 0
+
+# llama.cpp master 704485942ab54bbbbf1f241b3550ffba35f5f37e (2026-08-11)
+cmake -S llama.cpp -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+      -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+cmake --build build -j16 --target llama-bench llama-completion
+build/bin/llama-bench -m $GGUF -p 128 -n 16 -r 1 -t 20 -o csv
+```
+
+Note for a future run: on current llama.cpp master the `llama-cli` target no
+longer exists; the one-shot generation tool is `llama-completion` (`tools/cli`
+now builds `llama-app`). The §11 recipe's `--target llama-cli` fails with
+`No rule to make target`.
+
+### The measured table
+
+Ours = `vllm-bench` `Prefill token throughput (in/TTFT)` and `Mean per-stream
+decode rate`. llama.cpp = `llama-bench` `pp`/`tg`. Same two physical quantities,
+same file, same thread count, paired and order-alternated legs.
+
+| Workload | Axis | vllm.cpp | llama.cpp | Ratio |
+|---|---|---:|---:|---:|
+| in 128 / out 16, t=20, r=5 | prefill tok/s | 11.63 (10.36-12.10, 15.0%) | 12.94 (12.90-13.09, 1.4%) | 0.898x |
+| in 128 / out 16, t=20, r=5 | decode tok/s | 1.18 (1.04-1.71, **56.8%**) | 5.08 (4.88-5.28, 7.9%) | 0.232x |
+| in 128 / out 16, t=10, r=3 | prefill tok/s | 9.94 (1.2%) | 9.97 (0.8%) | **0.997x** |
+| in 128 / out 16, t=10, r=3 | decode tok/s | 1.31 (0.8%) | 6.41 (0.7%) | 0.204x |
+| in 512 / out 16, t=20, r=3 | prefill tok/s | 2.23 (0.4%) | 13.13 (0.5%) | 0.170x |
+| in 512 / out 16, t=20, r=3 | decode tok/s | 0.29 (0.0%) | 5.00 (9.6%) | 0.058x |
+| any | peak RSS | 30.29 GiB | 15.74 GiB | 1.92x MORE |
+
+Medians; brackets are min-max and spread as a percentage of the median. The
+noise band comes from the repeated identical legs themselves, before any delta
+was read. **No leg in this table was discarded.**
+
+Raw legs, in order: ours prefill@t20 `[11.63, 10.36, 10.36, 12.10, 11.68]`,
+ours decode@t20 `[1.71, 1.20, 1.04, 1.18, 1.18]`, llama prefill@t20
+`[13.09, 12.94, 13.01, 12.92, 12.90]`, llama decode@t20
+`[4.88, 5.24, 5.28, 5.08, 4.91]`.
+
+### Harness cross-check — the two harnesses agree in absolute scale
+
+`.agents/benchmarking.md` warns that two disagreeing ratio sets are often two
+different harnesses. Cross-checked with each engine's *other* tool on the same
+real prompt (`"The capital of France is"`, greedy, t=20): `vllm-cli` 12 tokens
+in 6.777 s = 1.771 tok/s whole-run; `llama-completion` prompt eval 11.90 tok/s
+and eval 5.33 tok/s, 2.566 s total. Both harness pairs put the two engines in
+the same 4-5x relationship on decode and near-parity on short prefill, so the
+`vllm-bench`/`llama-bench` ratios are not a harness artifact.
+
+### The decode gap is WORK, not occupancy — one hypothesis refuted
+
+The whole-run `Percent of CPU` reads 466-667% for us against 1062-1674% for
+llama.cpp, which looks like an idle-core story. It is not one: our run is
+dominated by a load-and-dequantize phase llama.cpp's mmap never pays. A
+two-length diff (out 4 -> out 36, in 128, t=20, the common load phase
+cancelling) measures the decode phase directly:
+
+| Engine | dCPU-seconds | dwindow | decode-phase CPU | CPU-s per decoded token |
+|---|---:|---:|---:|---:|
+| vllm.cpp | 599.95 (870.84 - 270.89) | 30.19 s (42.72 - 12.53) | **1987%** = 19.9 of 20 cores | **18.75** |
+| llama.cpp | 106.26 (128.58 - 22.32) | 5.87 s (7.97 - 2.10) | **1810%** = 18.1 cores | **3.32** |
+
+Both saturate the box, and we burn **5.6x the CPU-seconds per decoded token**.
+That is resource cost, NOT proof the extra seconds are useful work: the
+2026-08-06 CPU op-dispatch profile above already measured decode on this backend
+as **47.15% threadpool synchronisation** (`ThreadReady` + `PollForWork` +
+`Barrier`, ~58% on the secondary-thread view), and a spinning worker holds a
+core without advancing a token. So "our threadpool leaves cores IDLE" is
+**REFUTED**; "our threadpool burns them at the barrier" is the live lever, and
+it is the one already named.
+
+**Contamination, named.** The second repetition of this two-length diff is
+DISCARDED for a named cause, not for being inconvenient: at 14:26 another
+session started a CUDA build on the same host (`ptxas`/`cicc`/`cc1plus` at 100%,
+load 15-26), and *both* engines degraded together in that window (ours out=36
+201.52 s vs 42.72 s; llama.cpp tg36 1.891 vs 5.069 tok/s). Compilation
+legitimately does not take the box lock. The table above uses rep 1 only, which
+ran before that build started. A clean r=3 re-run of this diff is OWED.
+
+### The shape: llama.cpp is flat in context length and we are not
+
+llama.cpp prefill 12.94 -> 13.13 tok/s going from 128 to 512 input tokens
+(+1.5%); ours 11.63 -> 2.23 (**-81%**). llama.cpp decode 5.08 -> 5.00 (flat);
+ours 1.18 -> 0.29 (**-75%** for 4x the context). At 128 tokens we are within
+10% of it on prefill and a dead tie at 10 threads. The gap is created by
+sequence length, and it points at the **CPU attention path**, not the GEMMs.
+That lever is NOT new and is not claimed as new: the 2026-08-06 profile above
+already measured CPU paged attention at **~39% of prefill**, ~21 points of it
+inside a per-element dtype switch in the attention dot loop
+(`src/vt/cpu/cpu_paged_attn.cpp:29` called from `:143`), the same defect class E1
+hoisted out of the elementwise GEMM. What this row adds is the price: a peer
+that is FLAT over the same 4x context change while we lose 81% / 75%, which is
+the signature in [[no-fa2-arch-means-fallback-attn-is-the-wall]]. The owed next
+step is a decode-window profile of our CPU attention kernel against `ggml`'s on
+this workload. **No ceiling is claimed.**
+
+A second, independent lever sits in the same table: at 20 threads our decode
+spread is 56.8% and llama.cpp's is 7.9%; at 10 threads ours is 0.8%. GB10's 20
+cores are 10 big + 10 little, and our threadpool barrier is unstable across that
+split in a way llama.cpp's is not. Both engines are also faster at decode with
+t=10 than t=20 (ours 1.31 vs 1.18, llama.cpp 6.41 vs 5.08) and slower at
+prefill, which is the ordinary bandwidth-vs-compute split.
+
+### Memory is an open gap with a known cause
+
+30.29 GiB resident against llama.cpp's 15.74 GiB for the same 15.59 GiB file,
+exactly as spec §10.2 predicts: we dequantize `qkv_proj`, `lm_head` and
+`embed_tokens` (the merged-operand and transpose constraints) while llama.cpp
+keeps every operand in blocks. Constant across every leg (spread 0.0%).
+
+### bf16 arm — PARTIAL, and one new correctness fact
+
+Probed, not measured to r=3. `vllm-cli` on the bf16 safetensors **generated at
+full depth for the first time** (spec §13.4 recorded that it never had):
+`"The capital of France is"` -> `" Paris. It is"` at 4 tokens, peak RSS
+59,819,588 kB, wall 9:14 of which almost all is the 59.55 GB CIFS read at 16%
+CPU. HF `MuseGlimmerForConditionalGeneration` bf16 on CPU loads in 90.94 s and
+then costs **660.47 s for its FIRST 8-token forward and 5.74 s for the
+subsequent generate** — that first figure is one-time lazy materialization /
+page-in, not compute, and any HF leg must warm up before it is timed. VmHWM
+55,914,364 kB. A quant-matched bf16 r=3 series at in 128 / out 16 was written
+and queued and is **OWED**: it was stopped rather than run dirty when the
+foreign CUDA build appeared.
+
+**New correctness signal.** Our bf16 arm's first three tokens `" Paris. It is"`
+agree with **llama.cpp's** GGUF continuation (`"Paris. It is the most populous
+city in France and"`) rather than with our own GGUF arm's (`" Paris. The capital
+of France is Paris. The capital of"`). That points spec §13.4's unresolved
+divergence at the GGUF path rather than at the model wiring. It is a hint, not a
+finding: three tokens are not a gate, and a GGUF-vs-bf16 token diff at depth is
+owed.
+
+### Blocked cells, each with its blocker
+
+| Cell | Blocker |
+|---|---|
+| vLLM, any arm | The pin has no `muse_glimmer`. **OPEN GAP by construction**; not waived, not substituted |
+| ours bf16 on GPU vs HF bf16 on GPU | **Disk.** A CUDA build tree is ~169 GiB per `.agents/benchmarking.md`; dgx had ~122 GiB free and a full disk voids a binding silently, so no CUDA build was started |
+| bf16 CPU r=3 series | **Host availability.** Written, syntax-checked, queued on `$HOME/gpu.lock` and stopped twice rather than run contended: first behind a foreign CUDA build (14:26), then behind another session's `vllm-server` serving gate holding the lock from 15:00. The lock was respected both times; nothing was stolen. OWED. Binaries and scripts are staged on dgx (`~/dgx-final.sh`, `~/muse-bench/hf_bf16_bench.py`, `~/muse-bench/{llama.cpp/build/bin,vllm.cpp/build-cpu/examples}`, 546 MB total); the 16 GB local GGUF copy was deleted to return disk (122 GB free), and the recipe above recreates it in ~2.5 min from the NAS |
+| clean r=3 two-length CPU diff | Same cause and same queue. The r=1 numbers above are clean; only the repetitions are owed |
+| mmproj / perception encoder | Still refused by name (spec §10.4): `v.patch_embd.weight` lacks the `patch_temporal` axis. No multimodal speed axis exists |
+| DFlash draft acceptance A/B | Structurally reachable (spec §10.5), never exercised |
+
+### What these numbers do and do not establish
+
+They establish that on one idle 20-core aarch64 host, reading one byte-identical
+k-quant file, vllm.cpp is at **parity on short-context prefill** (0.997x at 10
+threads, 0.898x at 20), **~4-5x behind on decode**, **~5.9x behind on 512-token
+prefill**, and uses **1.92x the resident memory** — with the decode gap
+attributed to CPU work per token rather than idle cores, and the context-length
+gap pointing at the attention path.
+
+They establish **nothing about vLLM**, which is the only bar that counts and
+remains unavailable; nothing about GPU behaviour, which was not built; nothing
+about multimodal; and nothing about token-exactness, which spec §13.4 leaves
+open. **No ceiling is claimed or implied anywhere in this entry.**
+
+## BENCHMARKS.md compaction — the superseded 2026-08-08 `BENCH-VK-LLAMA`
+scoreboard row (moved 2026-08-11)
+
+`docs/BENCHMARKS.md` is a KEYED table: one row per subject, updated in place.
+The key `Vulkan vs llama.cpp Vulkan (BENCH-VK-LLAMA)` carried TWO rows. The
+0.6B one below was written by `468a3876` (2026-08-08); `93852c28` (2026-08-09)
+then added a SECOND row for the same key with the 27B result instead of
+updating this one in place, which is what made it superseded. The 27B row
+stays on the scoreboard, so the key keeps its handle there and nothing is
+lost — only the stale generation moves here. Moved VERBATIM, byte-for-byte,
+to pay for the rows PR #282 and PR #267 owe that page; no cap was raised and
+no evidence was deleted.
+
+Superseded by, and still on the page:
+
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
+
+The moved row:
+
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **Both arms measured, same weights.** 0.6B @128-in/32-out: llama.cpp Vulkan **11,956** pp / **174.8** tg; ours **575** pp / **66.6** tg | Decode **8.59 -> 91.7 t/s** (**10.7x**), 6/6 exact; **2.62x** off llama.cpp at matched shape. CUDA arm unblocked. 27B: fallbacks **11->5**. paged_attn batching REFUTED ([plan](../.agents/specs/bench-27b-five-way.md)) |
+
+## CPU decode barrier — the never-yielding spin-wait was a scheduler cliff (2026-08-11, `PERF-CPU-BARRIER`, issue [#391](https://github.com/mudler/vllm.cpp/issues/391))
+
+Lever 1 of spec `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md` §2. The
+2026-08-06 profile put **47.15% of CPU decode in threadpool synchronisation**
+and called decode synchronisation-bound. This entry finds the mechanism, fixes
+it, and measures what it did and did not move.
+
+### What the cost actually is on the current tree
+
+Not a slow barrier — a **scheduler cliff**. `Threadpool::Barrier` and
+`::PollForWork` spin without ever yielding (1:1 with ggml-cpu.c:587-589 and
+:3137-3139). The moment the pool is wider than the cores available to it, the
+arrival everyone is waiting for can be off-CPU while every other worker burns a
+core spinning, so each dispatch costs a full scheduler timeslice.
+
+Empty-op dispatch, `taskset -c 0-7`, same binary, `VT_CPU_SPIN_ROUNDS` A/B:
+
+| host | CPUs | pool | never-yield | spin-then-yield | ratio |
+|---|---:|---:|---:|---:|---:|
+| dgx.casa (GB10 aarch64) | 8 | 9 | **4473.30 us** (p50 3001) | **4.92 us** | **909x** |
+| dgx.casa | 20 | 20 (fits) | 1.93 us | 1.95 us @4096 | 1.01x — free |
+| local x86 (exploratory, loaded box) | 8 | 8 (fits) | 1.63-1.84 us | 1.68 us | ~1.0x |
+| local x86 (exploratory, loaded box) | 8 | 9 | 5516-6004 us (p50 6000) | 5.93 us | ~930x |
+
+p50 lands on a whole CFS timeslice, which is the signature. The default pool
+width is `hardware_concurrency()`, so a stock run is over that cliff by way of
+its own async-scheduling and API threads — nothing external required.
+
+Instrumented dispatch attribution on the current tree (opt-125m, 32 greedy
+tokens, 20 threads, local box): **1704 `Threadpool::Run` calls, every single one
+over 1 ms, 11.39 s of an 11.53 s run.** At 12 threads the same 1704 calls cost
+258 ms. That is the cliff, not kernel time.
+
+### The change
+
+Bounded spin, then `sched_yield`, in both waits. `VT_CPU_SPIN_ROUNDS` (default
+4096 aarch64 / 256 elsewhere; `0` restores the never-yield spin for a
+same-binary A/B). A scheduling hint only — no atomic, memory order or fence is
+touched, so it cannot change a computed value.
+
+### Measured: dgx.casa, `muse-glimmer-30B-kquant-17gb.gguf`, both locks held
+
+Host idle at claim (1-min load 1.92 at the gate, `local-ai-worker` exited,
+GPU 0%, `/mnt/nas_share` mounted); `$HOME/gpu.lock` **and** `/tmp/cpu-bench.lock`
+held across the whole series; legs strictly sequential and order-alternated;
+load recorded at every leg boundary (5-21 throughout, all of it our own
+20-thread job). Model copied to local NVMe, md5 `ba8da9b15aed63a1df095cb34f3e7665`,
+16,756,681,056 bytes. Ours = `vllm-bench` `Prefill token throughput (in/TTFT)`
+and `Mean per-stream decode rate`; llama.cpp = `llama-bench` pp/tg at
+`7044859` — the same harness pair, file and thread count as the #333 entry.
+**Two separately built binaries**, not one binary with a flag: A is the pristine
+`cpu_threadpool.cpp`, B is the patched one.
+
+Noise band from repeated identical arm-A legs **before any delta was read**.
+Medians; brackets are min-max and spread as a percentage of the median. No leg
+discarded.
+
+| Workload | Axis | A pristine | B yield | B/A | llama.cpp | A/llama | B/llama |
+|---|---|---:|---:|---:|---:|---:|---:|
+| in128 t=20 | prefill | 11.550 (11.05-12.71, 14.4%) n=7 | 13.455 (13.25-13.86, 4.5%) n=4 | **1.165x** | 13.158 (0.7%) | 0.878x | **1.023x** |
+| in128 t=20 | decode | 1.200 (0.79-1.67, **73.3%**) n=7 | 1.715 (1.62-1.88, 15.2%) n=4 | **1.429x** | 5.026 (5.9%) | 0.239x | 0.341x |
+| in512 t=20 | prefill | 2.270 (2.23-2.29, 2.6%) n=3 | 2.330 (2.32-2.34, 0.9%) n=3 | 1.026x NEUTRAL | 13.292 (0.3%) | 0.171x | 0.175x |
+| in512 t=20 | decode | 0.290 (0.0%) n=3 | 0.990 (0.0%) n=3 | **3.414x** | 5.091 (3.8%) | 0.057x | 0.194x |
+| in128 t=10 | prefill | 10.040 (0.3%) n=3 | 9.930 (1.3%) n=3 | 0.989x NEUTRAL | — | — | — |
+| in128 t=10 | decode | 1.310 (0.8%) n=3 | 1.310 (0.8%) n=3 | 1.000x NEUTRAL | — | — | — |
+
+Raw legs in order — ours A prefill@in128t20 `[12.71, 11.30, 11.27, 11.05, 12.47,
+11.55, 11.82]`, A decode `[1.20, 1.08, 1.21, 1.23, 0.79, 0.83, 1.67]`, B prefill
+`[13.25, 13.86, 13.43, 13.48]`, B decode `[1.62, 1.65, 1.78, 1.88]`. **Every B
+prefill leg is above every A leg**; three of four B decode legs are above every
+A leg.
+
+The A arm reproduces the #333 numbers it is meant to (recorded then: 11.63 /
+1.18 at in128 t20, 2.23 / 0.29 at in512, 9.94 / 1.31 at in128 t10), so the
+baseline is the same baseline.
+
+**Same-binary control.** The patched binary with `VT_CPU_SPIN_ROUNDS=0` lands
+inside the pristine arm's distribution — prefill 11.240 (9.88-11.64), decode
+0.880 (0.41-1.46), n=3 — so the delta is the yield and not the rebuild.
+
+**The variance is a result in itself.** Pristine decode at in128 t=20 spreads
+73.3% (and 119.3% on the `SPIN_ROUNDS=0` control); with the yield it is 15.2%,
+and at in512 it is 0.0% against 0.0%. A timeslice cliff you fall off
+intermittently is exactly what a 73% spread on a deterministic greedy workload
+looks like. The #333 entry already recorded 56.8% there and could not explain it.
+
+### Scaling shape, 128 -> 512 input tokens
+
+| Arm | prefill | decode |
+|---|---|---|
+| llama.cpp | 13.158 -> 13.292 = **1.010x FLAT** | 5.026 -> 5.091 = **1.013x FLAT** |
+| ours, pristine | 11.550 -> 2.270 = 0.197x | 1.200 -> 0.290 = 0.242x |
+| ours, yield | 13.455 -> 2.330 = 0.173x | 1.715 -> 0.990 = **0.577x** |
+
+The decode fall-off more than halves. The prefill fall-off does not move at all:
+in512 prefill is 0.175x of llama.cpp before and after. **That half of the shape
+is not this lever** — it is Lever 2 (paged attention, ~39% of prefill and rising
+with context, spec §3).
+
+### Negative and neutral results, recorded as results
+
+- **t=10 is neutral on both axes** (0.989x / 1.000x). Ten threads on twenty
+  cores never reaches the cliff, so there is nothing to remove — and the yield
+  costs nothing when it is not needed. This is the mechanism confirming itself,
+  and it is why the #333 entry saw *better* decode at t=10 (1.31) than at t=20
+  (1.18) on a 20-core box.
+- **in512 prefill is neutral** (1.026x, inside the 2.6% band).
+- **A pool twice as wide as the cores cannot be fixed by any wait policy.** The
+  first version of the regression test asserted on `cores*2` and failed on the
+  fixed code (ratio 1847): every dispatch must wait for 2x as many threads as
+  there are cores to be scheduled at least once. The test asserts on `cores+1`,
+  which is the regime a stock run is actually in.
+
+### No ceiling
+
+Decode at in512 moves 0.057x -> 0.194x of llama.cpp and stays **5x behind**; the
+gap is open, not closed. Next traceable hypotheses, in order: (1) Lever 2, which
+owns the entire prefill half of the shape; (2) the **per-OP kickoff** itself —
+ggml kicks the pool once per GRAPH and we kick per operation, so we pay a mutex,
+a `notify_all` and an epoch broadcast per op, ~1.9 us at 20 threads *even when
+the pool fits*, which fusing or batching dispatches would amortise; (3) the
+**narrow-dispatch path that already exists and is unused** — `Kickoff(n)` and
+`ThreadReady`'s `ith < n_threads` gate already support activating fewer than
+`n_threads_` workers, but `Run()` always kicks all of them, so a
+`ParallelForRows` over 4 rows still wakes 20 threads (ggml caps this:
+`n_tasks = MIN(n_threads, ggml_nrows(...))`, ggml-cpu.c:2342).
+
+### Correctness
+
+TSan (`-fsanitize=thread`, the `VT_CPU_THREAD_SANITIZER` fence path) over
+`Run`/`Kickoff`/`ComputeThread`/`Barrier`/`ParallelForRows` at 8 and at 21
+threads on 20 cores: **clean, 300 rounds each, every output row visited exactly
+once every round.** The 50-test CPU/op ctest scope: **50/50 pass.** The
+determinism battery (byte-identical outputs at n_threads 1/3/20 over matmul,
+paged attention, MoE router, norms and conv) is unchanged and green.
+
+### x86 corroboration, and the mutation proof for the new test
+
+BLOCKED twice first, and that is part of the record: the shared 20-core dev box
+ran at 1-minute load 116-180 continuously from a sibling agent's gates, and this
+series' own quiet-box gate refused to measure both times with
+`/tmp/cpu-bench.lock` held. It got a window on the third attempt at load 3.86.
+Correctness legs did not need the quiet box and were also run on the loaded one,
+with the same answers.
+
+**Mutation proof.** The regression test run from the PRISTINE tree and from the
+patched tree, back to back, 10 threads (fits) against 21 threads (cores+1) on
+20 cores:
+
+| Arm | 10 threads | 21 threads | ratio | doctest |
+|---|---:|---:|---:|---|
+| pristine r1/r2/r3 | 1.563 / 1.443 / 1.634 us | **5996.39 / 2999.93 / 2999.17 us** | 3836 / 2079 / 1835 | **FAILURE x3** |
+| patched r1/r2/r3 | 1.452 / 1.563 / 1.683 us | 20.13 / 19.69 / 18.19 us | 13.9 / 12.6 / 10.8 | SUCCESS x3 |
+
+The pristine 21-thread numbers are whole CFS timeslices. The test does not
+merely pass on the fix, it fails on the defect by ~20x its own threshold.
+
+**Same-binary cliff, x86**, `taskset -c 0-7`, 5000 dispatches, lock held:
+
+| pool | `VT_CPU_SPIN_ROUNDS=0` | `=256` | ratio |
+|---:|---:|---:|---:|
+| 8 (fits) | 1.44 us (p50 1.35) | 1.84 us (p50 1.57) | 0.78x, a small real cost when it fits |
+| 9 (over by one) | **6003.69 us** (p50 5999.89) | **12.80 us** (p50 12.35) | **469x** |
+
+**opt-125m greedy decode, 20 threads (== nproc), r=5 alternated. INDICATIVE
+ONLY, not binding**: the box was still settling out of the sibling's load
+(1-min 10-13, 5-min 40-45) across this leg, and per `.agents/benchmarking.md`
+that is not a measurement surface for this lever. Recorded because the FAILURE
+MODE is the point, not the ratio. Pristine `[6.643, 3.428, 53.505, 64.606,
+61.533]` tok/s is bimodal: it either falls off the cliff or it does not. Patched
+`[60.329, 81.567, 52.845, 66.384, 57.582]` never does. Medians 53.505 -> 60.329.
+The binding model numbers are the dgx ones above.
+
+### Correctness (continued)
+
+Output identity, pristine binary vs patched binary vs patched with
+`VT_CPU_SPIN_ROUNDS=0`, opt-125m greedy:
+
+| Regime | Result |
+|---|---|
+| M=1, 48 tokens, at 20 threads (the cliff regime) and at 8 | **identical**, md5 `fde5d9b0ff5be038` in all six runs |
+| M>1, 8 prompts x 96 input / 24 output, concurrency 1, 4 and 8 | **token ids byte-identical**, md5 `bd489532b183541b`, and identical ACROSS the three concurrencies |
+
+The full-suite regression sweep is deferred to the orchestrator by instruction.

@@ -3,8 +3,20 @@
 Spike + implementation spec for the pure-C++20 1:1 port of vLLM's LoRA adapter
 subsystem. Owning rows: [`LORA-RUNTIME`](../engine-matrix.md) and
 [`LORA-ENDPOINTS`](../engine-matrix.md) in the LoRA-and-adapters section of the
-engine matrix. Claim: `CLAIM-LORA-RUNTIME` in
-[coordination.md](../coordination.md).
+engine matrix. Claims: `CLAIM-LORA-RUNTIME` (W0+W1) and
+`CLAIM-LORA-RUNTIME-W2` in [coordination.md](../coordination.md).
+
+Tracking issue for W2: [#278](https://github.com/mudler/vllm.cpp/issues/278).
+
+Bug found after W2 landed: [#395](https://github.com/mudler/vllm.cpp/issues/395)
+— `test_punica_cpu`'s own `RefShrink` reference read past `a_stacked` for the
+out-of-range slot the case feeds on purpose, so W2 turned the
+`sanitize-cpu (address,undefined)` lane red on `main`. The kernel was correct;
+only the reference was missing the `s >= num_slots` half of the guard the case
+exists to verify. Fixed in the test, with a mutation showing the case still
+fails when the kernel's own guard is dropped. Related coverage gap found in the
+same review and tracked separately:
+[#400](https://github.com/mudler/vllm.cpp/issues/400).
 
 Pinned oracle `${VLLM_SOURCE}` = `/home/mudler/_git/vllm` @ `555967922`
 (vLLM 0.26.0.dev0). Every `file:line` below is read from that pin. This is the
@@ -186,7 +198,16 @@ Named traceably after the upstream cases; ported now unless marked SKIP.
 
 ## Gates
 
-- **W1 (this change):** CPU `-Werror` clean build; `test_punica_cpu` all cases
+The row's runnable CPU gate, in full:
+
+```sh
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build-cpu -j 18
+ctest --test-dir build-cpu -R test_punica_cpu --output-on-failure
+ctest --test-dir build-cpu -R test_lora_layers --output-on-failure
+```
+
+- **W1:** CPU `-Werror` clean build; `test_punica_cpu` all cases
   green; RED-first proven (the un-applied / index-`-1` path must FAIL the
   LoRA-applied reference). Numeric tolerance: exact vs a `double` hand
   reference (portable float path, no dtype rounding). Signal:
@@ -215,9 +236,15 @@ Row-sized, each its own claim/gate. W1 is this change.
   shrink/expand/expand_slice + `add_lora_linear` + a `LoRALinear`
   (ReplicatedLinear, n_slices=1) create/set/reset/apply, unit-gated vs a
   double reference. `LORA-RUNTIME` → `ACTIVE`.
-- **W2 — packed + column/row/merged layers:** `PackedLoRALayerWeights`,
-  qkv/gate_up packing, TP `slice_lora_a/b`, multi-slice `add_shrink`/
-  `add_expand`, embedding + logits LoRA. Ports `test_layers.py`.
+- **W2 — packed + column/row/merged layers (LANDED, issue #278):**
+  `PackedLoRALayerWeights` (`Pack` + per-slice `Optimize` + `is_packed`), the
+  multi-slice `AddShrink`/`AddExpand` (`output_slices` + `offset_start`) and
+  multi-slice `AddLoraLinear`, `AddLoraEmbedding`/`AddLoraLogits`, the wrapped
+  layer family (replicated, column, row, merged-column/gate_up, qkv,
+  merged-qkv, variable-slice) with TP `SliceLoraA`/`SliceLoraB` including the
+  fully-sharded (S-LoRA) rank-dim rules, plus embedding and logits LoRA. Ports
+  `test_layers.py` through `test_merged_column_parallel_variable_slice`. See
+  "W2 as built" below for what is deferred and what is a recorded gap.
 - **W3 — metadata + mapping:** `LoRAMapping`, `convert_mapping`,
   `compute_meta`, the sgmv prefill segmentation, `PunicaWrapperBase` state.
   Ports `test_punica_ops.py` sgmv segment cases + `test_layers_utils.py`.
@@ -252,3 +279,104 @@ Row-sized, each its own claim/gate. W1 is this change.
   scaling explicit (passes `scaling` to `add_lora_linear`) so both modes are
   exercised, matching vLLM (packed layers `optimize` to scaling==1, plain
   layers keep it).
+
+## W2 as built
+
+Files (all additive except the two `punica` files and the two build lists):
+
+| File | Ports FROM (pinned vLLM) |
+|---|---|
+| `include/vllm/lora/lora_weights.h` (+) | `lora_weights.py:99-282` (`PackedLoRALayerWeights`: `pack`, per-slice `optimize`, `is_packed`) |
+| `include/vllm/lora/punica.h` (+) | `punica_cpu.py:166-236` (`add_shrink`/`add_expand`), `:238-263` (`add_lora_embedding`), `:265-312` (multi-slice `add_lora_linear`), `:314-351` (`add_lora_logits`) |
+| `include/vllm/lora/layers.h` (new) | `layers/base_linear.py:70-238`, `layers/column_parallel_linear.py:85-746`, `layers/row_parallel_linear.py:22-177`, `layers/vocal_parallel_embedding.py:17-140`, `layers/logits_processor.py:20-208` |
+| `src/vllm/lora/punica_cpu.cpp` (+) | the same punica_cpu.py ranges |
+| `src/vllm/lora/layers.cpp` (new) | the same layers/ ranges + `lora_weights.py:126-270` |
+| `tests/vllm/lora/test_lora_layers.cpp` (new) | `tests/lora/test_layers.py:116-1035` (through `test_merged_column_parallel_variable_slice`) + `tests/lora/utils.py:29-46` |
+
+**Deferred out of W2, with reason (each is stated in the code it belongs to):**
+
+- **The fully-sharded (S-LoRA) APPLY path** — `_mcp_apply`
+  (`column_parallel_linear.py:24-82`) and
+  `RowParallelLinearWithShardedLoRA.apply` (`row_parallel_linear.py:118-159`)
+  are *defined* by `tensor_model_parallel_all_gather` / `all_reduce` sitting
+  between the shrink and the expand. vllm.cpp's TP seam does not yet expose
+  those collectives, and a version without them is only correct at
+  `tp_size == 1` — a hollow port no gate could catch. The sharded classes
+  therefore carry their **slicing** rules (which W2 does own) and inherit the
+  unsharded apply, which IS the upstream behaviour at `tp_size == 1` — the
+  shrink's `max_rank / tp_size` rows are the whole rank there and the
+  all-gather is the identity. At `tp_size > 1` the inherited apply does NOT
+  reduce to upstream (the shrink fills part of the buffer, the expand consumes
+  all of it; a row-parallel layer's `lora_b` holds only this rank's output
+  shard), so `ApplyLoraToOutput` **throws `std::logic_error`** there rather
+  than adding a partial delta that looks plausible. A deferral refuses; it does
+  not approximate. `CreateLoraWeights` likewise refuses either pairing upstream
+  cannot construct — a sharded class without `fully_sharded_loras`, or a plain
+  parallel class with it — mirroring `_fully_sharded_can_replace` /
+  `_not_fully_sharded_can_replace` (`layers/utils.py:76-101`), which is the
+  only thing binding class to flag upstream. The collective-bearing apply lands
+  with the TP row.
+- **`pack_moe` / `pack_moe_stacked`** (`lora_weights.py:154-261`) — they build
+  the per-expert 3-D stacks that only `FusedMoEWithLoRA.set_lora` consumes; they
+  belong with the fused-MoE LoRA layer, which is W7.
+- **`LoRAConfig`** — W2 keeps taking `max_loras` / `max_lora_rank` /
+  `fully_sharded_loras` explicitly, per the W1 decision above; the typed config
+  lands with the manager (W5).
+- **The metadata that produces the index arrays** — `token_lora_indices`,
+  `sampler_indices` and `_embeddings_indices` all come from `convert_mapping`
+  (W3). W2's entry points take the arrays as parameters, and the embedding layer
+  reproduces `convert_mapping`'s own `slot if lora_id > 0 else 0` derivation for
+  the gather (`punica_wrapper/utils.py:114`) from the single per-token slot
+  array.
+
+**Harness adaptations in the ported tests** (documented in the test header):
+the base linear output is drawn rather than recomputed from a base weight
+(our wrapped layer is a delta applier, exactly like `_apply_lora_to_output`
+receiving an already-computed `output`); `torch.rand` under `set_random_seed`
+becomes a deterministic LCG; upstream's 4096-wide shapes are scaled down while
+keeping the shape *structure* (slice counts, rank padding, q-vs-kv widths);
+tolerances are upstream's `TOLERANCES[torch.float32] = (5e-3, 5e-3)` applied as
+`torch.testing.assert_close`'s `|a-b| <= atol + rtol*|b|`; and the TP slicing
+runs at `tp_size` 2/4 directly, since `slice_lora_a`/`slice_lora_b` are pure
+functions of `(tp_rank, tp_size)` and upstream's own tests only reach them at
+`tp_size == 1`.
+
+**W2 gate:** CPU `-Werror` clean build; `test_lora_layers` 16/16 (4,498
+assertions) + `test_punica_cpu` 8/8 (149 assertions); full CPU `ctest` green
+apart from the pre-existing failures tracked in #274. RED-first captured as a
+compile failure against the absent `layers.h`. Every repair below carries its
+own RED-first mutation, and the six mutations a fresh review found SURVIVING
+(2026-08-10) each now turn a case red — see the commit message for the table.
+
+**Known gaps, recorded rather than implemented (they are real, and W2 does not
+close them):**
+
+- **`ExpandPackedLora` has no test of its own.** It is
+  `expand_packed_lora` (`column_parallel_linear.py:266-300`), reached from
+  `MergedColumnParallelLinearWithLoRA::SetLora` only when the adapter ships
+  fewer groups than the layer has slices. Upstream's own `test_layers.py` never
+  builds that checkpoint shape either, so there is nothing to port; the case it
+  serves (an `in_proj_qkv`-style fused group) arrives with the adapter LOADER
+  in W4, and its test belongs there.
+- **`MergedColumnParallelLinearVariableSliceWithLoRA::SetLora` dispatches on a
+  SHAPE HEURISTIC, not on a type.** Upstream branches on
+  `isinstance(lora_a, torch.Tensor)` (`column_parallel_linear.py:718-746`) — a
+  single fused tensor versus a list. `MatList` erases that distinction, so we
+  infer it from `lora_a.size() == 1 && lora_b.size() == 1 &&
+  lora_b[0].rows != lora_b_rows_[0]`. A one-slice-shaped input whose row count
+  happens to equal the first slice's width would take the wrong branch. The
+  honest fix is a typed carrier for "one fused tensor" rather than a list of
+  one, which belongs with the loader (W4) that produces it; it is an
+  UNDOCUMENTED DEVIATION until then, and this is the record of it.
+- **`ReindexShardedToFull` has no test reference.** It is the pure half of
+  `logits_processor.py:166-183`, and the `sharded_to_full_mapping` it consumes
+  is built by the adapter/vocab plumbing that does not exist yet. It is dead
+  code today.
+- **`MergedQKVParallelLinearWithLoRA`'s `output_sizes_` diverges from upstream
+  when `total_num_kv_heads < tp_size`.** We take `total_num_kv_heads *
+  head_size` as the unsharded k/v window; upstream's `QKVParallelLinear`
+  REPLICATES kv heads in that regime (`num_kv_head_replicas`), so the unsharded
+  size it slices against is not the same number. `num_kv_head_replicas` reaches
+  `output_ids_` but not `output_sizes_`. No ported case has
+  `total_num_kv_heads < tp_size`, so nothing catches it; the replicated-kv TP
+  case lands with the TP row that can actually run it.

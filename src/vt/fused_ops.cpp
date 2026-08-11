@@ -2,7 +2,9 @@
 
 #include <stdexcept>
 
+#include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 
 #if defined(VLLM_CPP_HIP)
 #include "vt/rocm/rocm_gelu_mul_sep.h"
@@ -61,13 +63,39 @@ void GeluMulSeparate(Queue& q, void* out, const void* gate, const void* up, int6
     return;
   }
 #endif
-  (void)q;
-  (void)out;
-  (void)gate;
-  (void)up;
-  (void)n;
-  (void)dtype;
-  throw std::runtime_error("vt::GeluMulSeparate: ROCm-only fast path in this build");
+  // Composed reference (CPU / non-ROCm), same shape as RmsNormPlusAdd above.
+  //
+  // This is NOT an optional fast path: gemma4.cpp's `ple > 0` block calls this
+  // from the SHARED forward, so throwing here aborted Gemma-4 on its first
+  // layer on every non-ROCm backend (issue #377). vt::GeluAndMul computes
+  // exactly this math -- gelu_tanh(gate) * up -- but wants the two halves
+  // adjacent as one [rows, 2D] tensor, so the compose stages them into a
+  // temporary [1, 2n] laid out as [gate | up] and runs the shipped kernel on
+  // it. Whatever GeluAndMul does, this matches it by construction, on every
+  // backend that registers it.
+  if (n <= 0) return;
+  Backend& b = GetBackend(q.device.type);
+  const size_t elem = SizeOf(dtype);
+  const size_t half = static_cast<size_t>(n) * elem;
+  void* tmp = b.Alloc(2 * half);
+  if (tmp == nullptr) {
+    throw std::runtime_error("vt::GeluMulSeparate: temporary allocation failed");
+  }
+  try {
+    b.Copy(q, tmp, gate, half);
+    b.Copy(q, static_cast<char*>(tmp) + half, up, half);
+    Tensor tin = Tensor::Contiguous(tmp, dtype, q.device, {1, 2 * n});
+    Tensor tout = Tensor::Contiguous(out, dtype, q.device, {1, n});
+    GeluAndMul(q, tout, tin);
+    // The temporary is read by work queued on `q`, so it must outlive that
+    // work: on an async backend the Free below would otherwise race the
+    // kernel. Synchronous backends (CPU) no-op this.
+    b.Synchronize(q);
+  } catch (...) {
+    b.Free(tmp);
+    throw;
+  }
+  b.Free(tmp);
 }
 
 void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M, int N, int K,

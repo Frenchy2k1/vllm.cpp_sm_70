@@ -1075,6 +1075,29 @@ LoadedEngine::LoadedEngine(HfConfig config,
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // issue #371: REFUSE an unservable recurrent-state budget instead of
+  // allocating it. Speculation widens the Mamba/GDN state to k+1 snapshot slots
+  // per sequence (runner.cpp:449-451), so a k=15 draft costs SIXTEEN times the
+  // spec-off state; on a unified-memory box the resulting allocation takes the
+  // machine down rather than failing, which is exactly what it did four times on
+  // 2026-08-11. Upstream checks the equivalent budget up front and raises
+  // (kv_cache_utils.py:751-787, with MambaSpec counting num_speculative_blocks at
+  // kv_cache_interface.py:713-718); this is that check for the state term.
+  //
+  // An UNKNOWN budget (MemAvailable unreadable) never refuses.
+  {
+    const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+    const int64_t state_needed =
+        vllm::v1::recurrent_state_bytes(kv_cfg_, seqs);
+    const int64_t host_available = vllm::v1::host_available_memory_bytes();
+    if (state_needed > 0 && host_available > 0) {
+      vllm::v1::check_enough_state_memory(
+          host_available, state_needed, seqs,
+          resolved_spec_config_.has_value()
+              ? resolved_spec_config_->ResolvedNumSpeculativeTokens()
+              : 0);
+    }
+  }
   // SPEC-DFLASH D5: wire the separately-loaded DFlash draft into the runner's
   // verify/propose loop. Done here (after runner_ is fully constructed, before
   // WarmupKernels) so the runner holds a stable borrow of dflash_draft_ (which

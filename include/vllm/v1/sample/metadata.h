@@ -100,13 +100,19 @@ struct SamplingMetadata {
   // registered processor are absent from the map. See logits_processor_callback.h.
   std::map<int, LogitsProcessorCallback> logits_processors;
 
+  // logprob_token_ids (metadata.py:49, `dict[int, list[int]] | None`): req_INDEX
+  // -> the EXPLICIT vocab ids to score, for generative scoring. The sampler
+  // returns the sampled token plus exactly these ids instead of a top-k, and
+  // when a request ALSO carries a logprobs count the explicit ids WIN
+  // (sampler.py:133-136). Fed by InputBatch::make_sampling_metadata, which
+  // re-keys its own req_id-keyed map. Unset — or set-but-empty, both falsy
+  // where upstream tests it — means the ordinary top-k path.
+  std::optional<std::map<int, std::vector<int32_t>>> logprob_token_ids;
+
   // ─── STUBS (marked; defaulted empty/None at T0) ────────────────────────────
   // Upstream `logitsprocs: LogitsProcessors` plugin graph — NOT ported (the
   // three T0 builtins are the flat fields above). No field.
   //
-  // Upstream `logprob_token_ids: dict[int, list[int]] | None` (generative-
-  // scoring: gather logprobs for specific ids). Deferred behind this stub.
-  std::optional<std::map<int, std::vector<int32_t>>> logprob_token_ids;
   // Upstream `spec_token_ids: list[list[int]] | None` (speculative decode).
   // Always empty lists at T0 (kept so the sampler's spec branch ports).
   std::optional<std::vector<std::vector<int32_t>>> spec_token_ids;
