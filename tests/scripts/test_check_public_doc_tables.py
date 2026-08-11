@@ -501,6 +501,27 @@ class StatusRatchet(unittest.TestCase):
             (live + 5000) - live, 2000, "an inflated re-pin must exceed the slack bound"
         )
 
+    def test_a_repin_is_measured_not_estimated(self) -> None:
+        """After a re-pin the constant equals the page exactly, not approximately.
+
+        A ratchet re-pinned to a guessed round number leaves silent headroom, and
+        headroom is where a page regrows without the gate noticing. The honest
+        re-pin is the measured length of the page you just shrank, which is what
+        the GPT-4o pre-tokenizer change did (net -2, re-measured after its merge
+        with main rather than carried over from before it).
+
+        Zero slack is therefore the expected steady state, not a coincidence.
+        Complementary to the direction test above: that one says a re-pin may
+        only go DOWN, this one says it must land exactly ON the page.
+        """
+        live = len(doc_tables.STATUS.read_text(encoding="utf-8"))
+        pinned = doc_tables.STATUS_RATCHET["chars"]
+        self.assertEqual(
+            pinned,
+            live,
+            "a re-pin must be the MEASURED page length; slack is cover for regrowth",
+        )
+
     def test_the_live_page_keeps_the_character_ratchet_tight(self) -> None:
         text = doc_tables.STATUS.read_text(encoding="utf-8")
         slack = doc_tables.STATUS_RATCHET["chars"] - len(text)
