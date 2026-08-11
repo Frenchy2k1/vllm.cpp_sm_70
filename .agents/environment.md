@@ -127,31 +127,54 @@ environment:
     had 359 GB free afterward. Maintain at least 200 GB headroom before adding
     competitor images.
 - **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: `ssh 192.168.68.23`
-  — hostname `thor`, NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, JetPack
-  R38, driver 580.00, 14 CPU cores, ~122 GB UNIFIED memory, `~91 GB` disk free.
-  On-box `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` returns
-  **11.0** — this CONFIRMS the inferred sm_110. This is the FIRST non-GB10 CUDA
-  board here and the host of the first non-GB10 runtime proof
-  (`CLAIM-CUDA-SM110-RUNTIME`, `BACKEND-CUDA-SM110` RUNTIME-VERIFIED for the
-  portable bf16 path, 2026-07-27).
-  - Non-interactive SSH does NOT put nvcc on PATH — prepend
-    `export PATH=/usr/local/cuda-13.0/bin:$PATH` (nvcc is **`/usr/local/cuda-13.0/bin/nvcc`
-    V13.0.48**, the `>=13` compiler branch, sm_110 in its global target list).
-  - **cutlass is NOT installed on Thor** — and the sm_110 portable path needs none
-    (every fast-path FEATURE-TABLE cell resolves EMPTY, so the CMake cutlass block
-    is skipped). Build with `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON
-    -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF`, Release. Do
-    NOT enable the sm12x fp4 features on sm_110. If a future cutlass-dependent build
-    is ever needed, `scp ~/cutlass-4.5.0` from dgx.casa and point
-    `-DVLLM_CPP_CUTLASS_DIR` at it (still do not enable sm12x features on sm_110).
-  - **GPU-lock discipline (CRITICAL):** Thor runs a `local-ai-worker` docker
-    container that holds the GPU (restart policy `always`). BEFORE any GPU run:
-    `ssh 192.168.68.23 'docker stop local-ai-worker'` (frees the GPU). AFTER all GPU
-    work: `ssh 192.168.68.23 'docker start local-ai-worker'` — RESTORE it, leave
-    Thor exactly as found; NEVER leave the worker stopped on exit. Hold
-    `flock $HOME/gpu.lock` on Thor for the GPU run series. Transfer code with
-    `git archive` (NOT rsync — see [[dgx-transfer-git-archive-not-rsync]]); dgx→Thor
-    scp works after a one-time `-o StrictHostKeyChecking=accept-new`.
+  — NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, 14 CPU cores, ~122 GB
+  UNIFIED memory. `nvidia-smi --query-gpu=compute_cap` returns **11.0**. Host of
+  the first non-GB10 runtime proof (`CLAIM-CUDA-SM110-RUNTIME`, 2026-07-27).
+  - **REIMAGED, re-verified 2026-08-11.** The box is now hostname
+    **`kairos-4db2`** (Ubuntu 24.04 under Kairos), driver **595.78**, and there is
+    **NO host CUDA toolkit, no cmake, no nvcc, no huggingface_hub** — the JetPack
+    R38 / `/usr/local/cuda-13.0` profile described here before is GONE. **The GPU
+    is usable only from inside a container** (developer statement, confirmed on
+    box). There is also no `local-ai-worker` container and no `~/gpu.lock`; the
+    worker-restore discipline below does not apply in this state.
+  - **Working container recipe** (each element was required; all three failed
+    first):
+    - `docker` needs `sudo` (the user is in group `admin`, not `docker`).
+    - Use **`--runtime=nvidia`**, NOT `--gpus all`: the hook refuses the latter
+      outright ("invoking the NVIDIA Container Runtime Hook directly ... is not
+      supported").
+    - Add **`-e NVIDIA_DISABLE_REQUIRE=1`**. The image's `NVIDIA_REQUIRE_CUDA`
+      enumerates BOUNDED driver ranges topping out at `driver<576`, so driver
+      595.78 — which is NEWER and forward-compatible — reads as unsupported.
+    - Image already present: `nvidia/cuda:13.0.1-devel-ubuntu24.04` (nvcc
+      **13.0.88**). Install `cmake ninja-build` inside; build
+      `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=OFF`,
+      no cutlass (every sm_110 fast-path cell resolves EMPTY). **VERIFIED
+      2026-08-11: configure + build of `vllm-cli` both exit 0.**
+    - `nsys` from `nsight-systems-cli` in that image is **2024.2.3 and cannot
+      trace CUDA here** ("does not contain CUDA trace data"). Do not plan a
+      graph/kernel-count measurement on Thor without first installing a newer one.
+  - **★ THIS BOX REBOOTS INSTEAD OF OOM-KILLING — size every load for it.**
+    `vm.overcommit_memory=1` ("always overcommit") with **zero swap**: the kernel
+    grants memory it cannot back, and touching those pages takes the WHOLE MACHINE
+    down. Signature: container `exit=255`, `OOMKilled=false`, NO `dmesg`/journal OOM
+    line, host reboot (`uptime` resets). Observed **three times on 2026-08-11**
+    loading a 27B: bf16 (52 GB target + 8.2 GB draft) twice, and NVFP4 (25 GB +
+    8.2 GB) once, the last of which left the box unreachable pending a power cycle.
+    A 27B target alone loads and runs fine; it is target+draft that crosses the
+    line, consistent with the documented transient double-hold in the load path
+    (`114→67 GiB`, see [[gb10-nvfp4-load-recipe-context-first-shard-release]]).
+    **Do not run a >25 GB model plus a second checkpoint here.** Measured OK on
+    this box: Qwen3-4B bf16 spec-off warm ~24.6 tok/s; Qwen3.6-27B bf16 spec-off
+    warm 4.42 tok/s (portable kernels, no fast paths — absolute numbers are NOT
+    comparable to GB10).
+  - `k3s` runs here and is `enabled`; `sudo systemctl stop k3s` frees its pods
+    (5 containerd shims survive the stop). It was not the crash cause.
+  - Transfer code with `git archive` (NOT rsync — see
+    [[dgx-transfer-git-archive-not-rsync]]). Model weights move dgx→Thor over the
+    LAN with `tar -ch | ssh ... tar -x` into a FRESH directory; dgx reaches
+    192.168.68.23 directly. The reimage CHANGED THE HOST KEY, so dgx's
+    `known_hosts` needs `ssh-keygen -R 192.168.68.23` once.
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import

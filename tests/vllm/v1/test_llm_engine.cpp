@@ -325,22 +325,27 @@ SamplingParams Greedy(int max_tokens) {
 // Executor -> EngineCore; InputProcessor/OutputProcessor -> LLMEngine) so the
 // by-reference seams stay valid for the stack's lifetime.
 struct Harness {
+  // `max_num_batched_tokens` 0 means "the default budget, big enough that no
+  // prompt is ever chunked"; a small positive value forces chunked prefill.
   Harness(const HfConfig& c, const Qwen3_5MoeWeights& w, const Tokenizer& tok,
-          int max_num_reqs = 8)
-      : scheduler(MakeSchedulerConfig(), MakeKvConfig(c), kBlockSize,
-                  /*enable_caching=*/true),
+          int max_num_reqs = 8, int max_num_batched_tokens = 0)
+      : scheduler(MakeSchedulerConfig(max_num_batched_tokens), MakeKvConfig(c),
+                  kBlockSize, /*enable_caching=*/true),
         runner(c, w, MakeKvConfig(c), Q(), max_num_reqs, kMaxModelLen,
-               /*max_num_batched_tokens=*/kMaxModelLen * max_num_reqs),
+               max_num_batched_tokens > 0 ? max_num_batched_tokens
+                                          : kMaxModelLen * max_num_reqs),
         executor(runner),
         engine_core(scheduler, executor),
         input_processor(tok, c),
         output_processor(&tok),
         engine(input_processor, engine_core, output_processor, Hasher()) {}
 
-  static SchedulerConfig MakeSchedulerConfig() {
+  static SchedulerConfig MakeSchedulerConfig(int max_num_batched_tokens = 0) {
     SchedulerConfig cfg;
     cfg.max_num_seqs = 8;
-    cfg.max_num_batched_tokens = kMaxModelLen * 8;
+    cfg.max_num_batched_tokens = max_num_batched_tokens > 0
+                                     ? max_num_batched_tokens
+                                     : kMaxModelLen * 8;
     cfg.enable_chunked_prefill = true;
     cfg.max_model_len = kMaxModelLen;
     cfg.watermark = 0.0;
@@ -1277,5 +1282,349 @@ TEST_CASE("llm_engine: a finite logprobs count is unaffected by the -1 widening"
     const vllm::Logprob* self = pos.find(r.outputs[0].token_ids[i]);
     REQUIRE(self != nullptr);
     CHECK(self->rank == 1);  // greedy -> the sampled token IS the argmax
+  }
+}
+
+// ─── 9. Prompt logprobs (SAMPLE-PROMPT-LOGPROBS, issue #223) ─────────────────
+// The runner-side source ported from gpu_model_runner.py:5612-5719
+// (`_get_prompt_logprobs_dict`). Everything below the runner was already
+// landed and gated, so before this row `prompt_logprobs=k` produced a
+// RequestOutput whose prompt_logprobs held ONLY the leading None that
+// LogprobsProcessor::FromNewRequest seeds — the feature was a silent no-op.
+// These cases are RED against that state.
+//
+// The tiny fixture has no eos, vocab 0..23, max_model_len 32.
+namespace {
+
+// The full prompt-logprob payload for `prompt_token_ids`, run to completion.
+std::optional<vllm::PromptLogprobs> PromptLogprobsFor(
+    const HfConfig& c, const Qwen3_5MoeWeights& w, const Tokenizer& tok,
+    const std::vector<int32_t>& prompt_token_ids, int prompt_logprobs,
+    int max_tokens = 2, int max_num_batched_tokens = 0) {
+  Harness h(c, w, tok, /*max_num_reqs=*/8, max_num_batched_tokens);
+  SamplingParams sp = Greedy(max_tokens);
+  sp.prompt_logprobs = prompt_logprobs;
+  const RequestOutput r = h.engine.generate(prompt_token_ids, sp, "req");
+  REQUIRE(r.finished);
+  return r.prompt_logprobs;
+}
+
+}  // namespace
+
+// (a) SHAPE: one entry per prompt token, the first None, the rest carrying the
+// prompt token itself. 1:1 vllm/v1/engine/logprobs.py:162-187.
+TEST_CASE("llm_engine: prompt_logprobs yields one entry per prompt token") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+  const int kK = 2;
+
+  const std::optional<vllm::PromptLogprobs> plp =
+      PromptLogprobsFor(c, w, tok, prompt, kK);
+
+  REQUIRE(plp.has_value());
+  // RED before the runner source: exactly 1 (the seeded leading None).
+  REQUIRE(plp->size() == prompt.size());
+  CHECK_FALSE((*plp)[0].has_value());  // nothing precedes the first token
+  for (std::size_t i = 1; i < plp->size(); ++i) {
+    REQUIRE_MESSAGE((*plp)[i].has_value(), "position " << i << " must be scored");
+    const vllm::LogprobsOnePosition& pos = *(*plp)[i];
+    // The prompt token itself is always present, with its true rank.
+    const vllm::Logprob* self = pos.find(prompt[i]);
+    REQUIRE_MESSAGE(self != nullptr, "prompt token missing at position " << i);
+    CHECK(self->rank >= 1);
+    // sampled + k top-k, deduped when the prompt token IS in the top-k.
+    CHECK(pos.entries.size() >= 1);
+    CHECK(pos.entries.size() <= static_cast<std::size_t>(kK) + 1);
+  }
+}
+
+// (b) VALUES: prompt position i scores the token at i+1 against the model's
+// distribution AT position i. That is the same distribution the sampler sees
+// when the request's prompt is truncated to [0, i), so the two must agree — an
+// independent check that arrives through the SAMPLED-logprobs path instead of
+// the prompt one. The token compared is the truncated run's greedy pick, which
+// is guaranteed present on both sides: it is rank 1 for the sampler, and the
+// prompt row asked for every vocab entry.
+TEST_CASE("llm_engine: a prompt logprob equals the sampled logprob at the same position") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+
+  const std::optional<vllm::PromptLogprobs> plp =
+      PromptLogprobsFor(c, w, tok, prompt, /*prompt_logprobs=*/-1);
+  REQUIRE(plp.has_value());
+  REQUIRE(plp->size() == prompt.size());
+
+  for (std::size_t i = 1; i < prompt.size(); ++i) {
+    // Same model, prompt truncated to [0, i): its ONE sampled position is
+    // prompt position i-1 — the row that scores prompt[i].
+    Harness h(c, w, tok);
+    SamplingParams sp = Greedy(1);
+    sp.logprobs = 1;
+    const std::vector<int32_t> head(prompt.begin(),
+                                    prompt.begin() + static_cast<long>(i));
+    const RequestOutput r = h.engine.generate(head, sp, "head");
+    REQUIRE(r.outputs.size() == 1);
+    REQUIRE(r.outputs[0].token_ids.size() == 1);
+    REQUIRE(r.outputs[0].logprobs.has_value());
+    REQUIRE_FALSE(r.outputs[0].logprobs->empty());
+    const int32_t argmax = r.outputs[0].token_ids[0];
+    const vllm::Logprob* sampled = (*r.outputs[0].logprobs)[0].find(argmax);
+    REQUIRE(sampled != nullptr);
+
+    const vllm::Logprob* from_prompt = (*plp)[i]->find(argmax);
+    REQUIRE_MESSAGE(from_prompt != nullptr,
+                    "argmax absent from the all-vocab prompt row at " << i);
+    // The argmax of the distribution, so rank 1 on both sides.
+    CHECK(sampled->rank == 1);
+    CHECK(from_prompt->rank == 1);
+    // Same distribution reached over a different sequence length, so compare
+    // with a tolerance rather than bit-for-bit.
+    CHECK(from_prompt->logprob == doctest::Approx(sampled->logprob).epsilon(1e-4));
+  }
+}
+
+// (c) NORMALIZATION: prompt_logprobs=-1 widens to the whole vocab, and a row of
+// log_softmax exponentiates to 1. Catches a raw-logits-instead-of-logprobs
+// regression, which no shape assertion would.
+TEST_CASE("llm_engine: prompt_logprobs=-1 rows are a normalized distribution") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+
+  const std::optional<vllm::PromptLogprobs> plp =
+      PromptLogprobsFor(c, w, tok, prompt, /*prompt_logprobs=*/-1);
+  REQUIRE(plp.has_value());
+  REQUIRE(plp->size() == prompt.size());
+
+  for (std::size_t i = 1; i < plp->size(); ++i) {
+    const vllm::LogprobsOnePosition& pos = *(*plp)[i];
+    CHECK(pos.entries.size() == static_cast<std::size_t>(kVocab));
+    double mass = 0.0;
+    int best_rank_token_count = 0;
+    for (const auto& [tid, lp] : pos.entries) {
+      mass += std::exp(static_cast<double>(lp.logprob));
+      if (lp.rank == 1) ++best_rank_token_count;
+    }
+    CHECK(mass == doctest::Approx(1.0).epsilon(1e-4));
+    // Exactly one token holds rank 1 (the argmax), unless the prompt token IS
+    // it — in which case the deduped dict carries that single entry once.
+    CHECK(best_rank_token_count >= 1);
+  }
+}
+
+// (d) CHUNKED PREFILL: the accumulation across chunks
+// (gpu_model_runner.py:5646-5706) must land the identical tensor. Same prompt,
+// a batched-token budget small enough to split it, byte-identical payload.
+TEST_CASE("llm_engine: chunked prefill accumulates the identical prompt logprobs") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+  const int kK = 2;
+
+  const std::optional<vllm::PromptLogprobs> whole =
+      PromptLogprobsFor(c, w, tok, prompt, kK);
+  // A budget of 1 token per step forces one chunk per prompt token, which also
+  // walks the num_logits <= 0 exact-prefill edge (:5668-5671).
+  const std::optional<vllm::PromptLogprobs> chunked = PromptLogprobsFor(
+      c, w, tok, prompt, kK, /*max_tokens=*/2, /*max_num_batched_tokens=*/1);
+
+  REQUIRE(whole.has_value());
+  REQUIRE(chunked.has_value());
+  // Assert the height explicitly: comparing two EMPTY payloads would otherwise
+  // pass vacuously against a runner that produces nothing.
+  REQUIRE(whole->size() == prompt.size());
+  REQUIRE(chunked->size() == prompt.size());
+  for (std::size_t i = 0; i < whole->size(); ++i) {
+    REQUIRE((*whole)[i].has_value() == (*chunked)[i].has_value());
+    if (!(*whole)[i].has_value()) continue;
+    const vllm::LogprobsOnePosition& a = *(*whole)[i];
+    const vllm::LogprobsOnePosition& b = *(*chunked)[i];
+    REQUIRE(a.entries.size() == b.entries.size());
+    for (const auto& [tid, lp] : a.entries) {
+      const vllm::Logprob* other = b.find(tid);
+      REQUIRE_MESSAGE(other != nullptr, "token " << tid << " missing at " << i);
+      CHECK(other->rank == lp.rank);
+      CHECK(other->logprob == doctest::Approx(lp.logprob).epsilon(1e-5));
+    }
+  }
+}
+
+// (e) INERTNESS: a request that did not ask gets nothing, and asking must not
+// move the sampled tokens. The prompt rows widen the lm_head gather, so this is
+// the assertion that the widening stays confined to the request that asked.
+TEST_CASE("llm_engine: prompt_logprobs is inert when unset and does not move tokens") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+  const int kN = 6;
+
+  RequestOutput off;
+  {
+    Harness h(c, w, tok);
+    off = h.engine.generate(prompt, Greedy(kN), "req");
+  }
+  RequestOutput on;
+  {
+    Harness h(c, w, tok);
+    SamplingParams sp = Greedy(kN);
+    sp.prompt_logprobs = 2;
+    on = h.engine.generate(prompt, sp, "req");
+  }
+
+  CHECK_FALSE(off.prompt_logprobs.has_value());  // never asked -> never built
+  REQUIRE(on.prompt_logprobs.has_value());
+  REQUIRE(off.outputs.size() == 1);
+  REQUIRE(on.outputs.size() == 1);
+  CHECK(on.outputs[0].token_ids == off.outputs[0].token_ids);
+}
+
+// (f) CONCURRENCY: two requests in one batch, different k, each gets its own
+// tensor at its own width. Guards the request-order slicing of the appended
+// gather rows.
+TEST_CASE("llm_engine: concurrent requests get their own prompt logprobs") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> p_a = {1, 2, 3, 4, 5};
+  const std::vector<int32_t> p_b = {6, 7, 8};
+
+  Harness h(c, w, tok);
+  SamplingParams sp_a = Greedy(3);
+  sp_a.prompt_logprobs = 1;
+  SamplingParams sp_b = Greedy(3);
+  sp_b.prompt_logprobs = 3;
+  h.engine.add_request("a", p_a, sp_a);
+  h.engine.add_request("b", p_b, sp_b);
+
+  std::map<std::string, RequestOutput> finished;
+  while (h.engine.has_unfinished_requests()) {
+    for (RequestOutput& r : h.engine.step()) {
+      if (r.finished) finished[r.request_id] = std::move(r);
+    }
+  }
+
+  REQUIRE(finished.count("a") == 1);
+  REQUIRE(finished.count("b") == 1);
+  REQUIRE(finished["a"].prompt_logprobs.has_value());
+  REQUIRE(finished["b"].prompt_logprobs.has_value());
+  REQUIRE(finished["a"].prompt_logprobs->size() == p_a.size());
+  REQUIRE(finished["b"].prompt_logprobs->size() == p_b.size());
+  // Widths follow each request's own k, not the batch max.
+  CHECK((*finished["a"].prompt_logprobs)[1]->entries.size() <= 2);
+  CHECK((*finished["b"].prompt_logprobs)[1]->entries.size() <= 4);
+}
+
+// (g) THE ROUTE DECISION ITSELF. Case (e) compares prompt-logprobs-on against
+// -off inside ONE build, so it can never see a change to the SHARED production
+// route: force the full-logits path on every step and both arms move together,
+// still agreeing. (Review finding 2 on PR #235: that exact mutation left the
+// file 17/17 · 346 assertions, SUCCESS.) So assert the decision, not its
+// symmetry — on a step where nobody asked, the forward must have gathered
+// before lm_head and produced step_num_logits() rows, NOT one row per token.
+// The prefill step of a 5-token prompt is 5 tokens against 1 sampler row, so
+// the two counts are far apart and the assertion has teeth.
+TEST_CASE("llm_engine: no prompt-logprob request keeps the lm_head gather on") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+
+  // OFF: every forward this run must be the gathered one.
+  int gathered_prefill_steps = 0;
+  {
+    Harness h(c, w, tok);
+    h.engine.add_request("off", prompt, Greedy(3));
+    while (h.engine.has_unfinished_requests()) {
+      h.engine.step();
+      if (h.runner.last_forward_num_reqs() == 0) continue;  // 0-token flush
+      REQUIRE(h.runner.last_forward_rows() == h.runner.step_num_logits());
+      if (h.runner.last_forward_num_actual_tokens() >
+          h.runner.step_num_logits()) {
+        ++gathered_prefill_steps;
+      }
+    }
+  }
+  // A step where the counts actually differ has to have happened, or the
+  // assertion above would be vacuous.
+  CHECK(gathered_prefill_steps >= 1);
+
+  // ON: the same prefill must take the OTHER route — one lm_head row per
+  // scheduled token — which is what makes the OFF assertion a decision and not
+  // a tautology about ForwardLogits.
+  int full_logits_steps = 0;
+  {
+    Harness h(c, w, tok);
+    SamplingParams sp = Greedy(3);
+    sp.prompt_logprobs = 2;
+    h.engine.add_request("on", prompt, sp);
+    while (h.engine.has_unfinished_requests()) {
+      h.engine.step();
+      if (h.runner.last_forward_num_reqs() == 0) continue;
+      if (h.runner.last_forward_rows() ==
+              h.runner.last_forward_num_actual_tokens() &&
+          h.runner.last_forward_num_actual_tokens() >
+              h.runner.step_num_logits()) {
+        ++full_logits_steps;
+      }
+    }
+  }
+  CHECK(full_logits_steps >= 1);
+}
+
+// (h) THE EXACT-PREFILL EDGE IN A MIXED BATCH. prepare_inputs deliberately
+// keeps a final-chunk entry with num_rows == 0 (gpu_model_runner.py:5668-5673):
+// the previous step consumed exactly num_prompt_tokens - 1 prompt tokens, so
+// there is nothing left to score but the tensor still has to be EMITTED. That
+// entry contributes NO gather indices, so `prompt_logprob_indices` is empty and
+// the step keeps the gathered lm_head — while `prompt_logprob_rows` is not.
+//
+// Case (d) walks the same edge with ONE request, where the full-logits row
+// count and the sampler row count coincide at 1 by accident. Put a SECOND
+// request in the step and they no longer do. Found by review on PR #235: the
+// runner asserted "a prompt-logprob step must carry full logits" on
+// prompt_logprob_rows rather than on the slice it was about to take, so this
+// step threw out of engine.step() and killed the whole batch — including the
+// request that never asked for prompt logprobs.
+//
+// Budget 3: step 1 prefills 3 of A's 4 tokens; step 2 schedules A's last prompt
+// token (a zero-row final chunk) beside 2 tokens of B, so the step runs on 3
+// tokens with 2 sampler rows.
+TEST_CASE("llm_engine: a zero-row final chunk beside another request still emits") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::vector<int32_t> p_a = {1, 2, 3, 4};
+  const std::vector<int32_t> p_b = {5, 6, 7, 8};
+
+  Harness h(c, w, tok, /*max_num_reqs=*/8, /*max_num_batched_tokens=*/3);
+  SamplingParams sp_a = Greedy(2);
+  sp_a.prompt_logprobs = 2;
+  h.engine.add_request("a", p_a, sp_a);
+  h.engine.add_request("b", p_b, Greedy(2));  // never asks
+
+  std::map<std::string, RequestOutput> finished;
+  while (h.engine.has_unfinished_requests()) {
+    for (RequestOutput& r : h.engine.step()) {
+      if (r.finished) finished[r.request_id] = std::move(r);
+    }
+  }
+
+  // Both requests survive the step: the throw took the whole batch down.
+  REQUIRE(finished.count("a") == 1);
+  REQUIRE(finished.count("b") == 1);
+  CHECK_FALSE(finished["b"].prompt_logprobs.has_value());
+  REQUIRE(finished["a"].prompt_logprobs.has_value());
+  REQUIRE(finished["a"].prompt_logprobs->size() == p_a.size());
+  CHECK_FALSE((*finished["a"].prompt_logprobs)[0].has_value());
+  for (std::size_t i = 1; i < p_a.size(); ++i) {
+    REQUIRE_MESSAGE((*finished["a"].prompt_logprobs)[i].has_value(),
+                    "position " << i << " must be scored");
   }
 }
