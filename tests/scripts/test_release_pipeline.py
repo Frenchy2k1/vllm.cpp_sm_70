@@ -18,6 +18,11 @@ ROOT = Path(__file__).resolve().parents[2]
 PIPELINE = ROOT / "scripts/release_pipeline.py"
 CHECKER = ROOT / "scripts/check-release-workflow.py"
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+BUILD_DRIVERS = (
+    ROOT / "scripts/build-cpu-release.sh",
+    ROOT / "scripts/build-linux-accelerator-release.sh",
+    ROOT / "scripts/build-macos-release.sh",
+)
 MATRIX = ROOT / "release/release-matrix.json"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -98,7 +103,7 @@ class ReleasePipelineContract(unittest.TestCase):
             verified_path = root / "verified-handoff.json"
             assets = root / "assets"
             assets.mkdir()
-            archive = assets / "linux-x86_64-glibc-cpu.tar.gz"
+            archive = assets / "vllm.cpp-0.0.1-linux-x86_64-glibc-cpu.tar.gz"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             (assets / f"{archive.name}.sha256").write_text(
@@ -135,12 +140,36 @@ class ReleasePipelineContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.pipeline.make_handoff(plan_path, assets, root / "handoff.json")
 
+    def test_handoff_accepts_only_versioned_matrix_asset_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = self.plan("workflow_dispatch", "refs/heads/main")
+            plan_path = root / "plan.json"
+            self.pipeline.write_json(plan_path, plan)
+            assets = root / "assets"
+            assets.mkdir()
+            artifact_id = "linux-x86_64-glibc-cpu"
+            archive = assets / f"vllm.cpp-{plan['version']}-{artifact_id}.tar.gz"
+            archive.write_bytes(b"release bytes")
+            digest = self.pipeline.file_sha256(archive)
+            (assets / f"{archive.name}.sha256").write_text(
+                f"{digest}  {archive.name}\n", encoding="utf-8"
+            )
+            (assets / f"{archive.name}.provenance.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            handoff_path = root / "handoff.json"
+            self.pipeline.make_handoff(plan_path, assets, handoff_path)
+            files = json.loads(handoff_path.read_text(encoding="utf-8"))["files"]
+            self.assertEqual({item["artifact_id"] for item in files}, {artifact_id})
+
     def test_publish_enumerates_only_verified_assets_without_shell_globs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             assets = root / "assets"
             assets.mkdir()
-            archive = assets / "linux-x86_64-glibc-cpu.tar.gz"
+            artifact_id = "linux-x86_64-glibc-cpu"
+            archive = assets / f"vllm.cpp-0.0.1-{artifact_id}.tar.gz"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             for suffix, content in (
@@ -157,6 +186,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 "release_tag": "v0.0.1",
                 "source_sha": SHA,
                 "verified": True,
+                "version": "0.0.1",
             }
             handoff_path = root / "verified-handoff.json"
             index_json = root / "release-index.json"
@@ -165,7 +195,7 @@ class ReleasePipelineContract(unittest.TestCase):
             self.pipeline.write_json(index_json, {
                 "artifacts": [{
                     "archive": archive.name,
-                    "id": archive.name.removesuffix(".tar.gz"),
+                    "id": artifact_id,
                     "sha256": digest,
                 }],
                 "release_tag": "v0.0.1",
@@ -209,6 +239,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 "publish": True,
                 "release_tag": "v0.0.1",
                 "verified": True,
+                "version": "0.0.1",
             }
             handoff_path = root / "verified-handoff.json"
             index_json = root / "release-index.json"
@@ -260,6 +291,26 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_workflow_has_exact_least_privilege_stage_boundaries(self) -> None:
         errors = self.checker.validate(WORKFLOW.read_text(encoding="utf-8"))
         self.assertEqual(errors, [])
+
+    def test_all_archive_producers_use_the_canonical_versioned_name(self) -> None:
+        assignment = 'archive="$release_dir/vllm.cpp-$VERSION-$artifact_id.tar.gz"'
+        for driver in BUILD_DRIVERS:
+            with self.subTest(driver=driver.name):
+                self.assertIn(assignment, driver.read_text(encoding="utf-8"))
+
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        artifact_id = "linux-x86_64-glibc-cpu"
+        canonical = (
+            "build-release-cpu-x86/release/"
+            "vllm.cpp-${{ needs.plan.outputs.version }}-"
+            f"{artifact_id}.tar.gz"
+        )
+        self.assertIn(canonical, workflow)
+        mutant = workflow.replace(canonical, canonical.replace("vllm.cpp-${{ needs.plan.outputs.version }}-", ""), 1)
+        self.assertIn(
+            "every release upload path must use its canonical versioned archive name",
+            self.checker.validate(mutant),
+        )
 
     def test_every_artifact_download_uses_flat_extraction(self) -> None:
         original = WORKFLOW.read_text(encoding="utf-8")

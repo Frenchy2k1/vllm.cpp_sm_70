@@ -75,9 +75,22 @@ def generate_index(
     if actual_names != set(by_name):
         raise ValueError("release assets do not exactly match the verified handoff")
     archives = sorted(name for name in by_name if name.endswith(".tar.gz"))
+    version = handoff.get("version")
+    if not isinstance(version, str):
+        raise ValueError("verified handoff has no release version")
     rows: list[dict[str, Any]] = []
     for archive_name in archives:
-        artifact_id = archive_name.removesuffix(".tar.gz")
+        manifest = read_manifest(assets_dir / archive_name)
+        artifact = manifest.get("artifact", {})
+        artifact_id = artifact.get("id")
+        expected_archive = f"vllm.cpp-{version}-{artifact_id}.tar.gz"
+        if (
+            not isinstance(artifact_id, str)
+            or artifact.get("version") != version
+            or archive_name != expected_archive
+            or by_name[archive_name].get("artifact_id") != artifact_id
+        ):
+            raise ValueError(f"archive manifest identity mismatch for {archive_name}")
         required_names = {
             archive_name,
             f"{archive_name}.sha256",
@@ -85,9 +98,6 @@ def generate_index(
         }
         if not required_names <= by_name.keys():
             raise ValueError(f"verified asset triplet is incomplete for {artifact_id}")
-        manifest = read_manifest(assets_dir / archive_name)
-        if manifest.get("artifact", {}).get("id") != artifact_id:
-            raise ValueError(f"archive manifest identity mismatch for {archive_name}")
         if manifest.get("build", {}).get("source_commit") != handoff.get("source_sha"):
             raise ValueError(f"archive source identity mismatch for {archive_name}")
         external = [

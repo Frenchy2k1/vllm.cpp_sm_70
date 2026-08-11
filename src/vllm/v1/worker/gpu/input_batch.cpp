@@ -298,6 +298,16 @@ int InputBatch::add_request(const CachedRequestState& request) {
     num_logprobs[req_id] = *sp.logprobs == -1 ? vocab_size : *sp.logprobs;
   }
 
+  // num_prompt_logprobs (gpu_model_runner.py:1305-1310). Unlike num_logprobs
+  // above, the `-1` ("all") sentinel is WIDENED to vocab_size here exactly as
+  // upstream does: the prompt path feeds GatherLogprobs, which needs a concrete
+  // column count, and it never reaches the Sampler that consumes our sentinel.
+  num_prompt_logprobs.erase(req_id);
+  if (sp.prompt_logprobs.has_value()) {
+    num_prompt_logprobs[req_id] =
+        *sp.prompt_logprobs == -1 ? vocab_size : *sp.prompt_logprobs;
+  }
+
   // allowed_token_ids (gpu_input_batch.py:446-467). Lazily allocate the
   // [max_num_reqs][vocab] exclude mask; set the row all-TRUE (exclude) then clear
   // the allowed ids to FALSE (keep).
@@ -525,6 +535,8 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   min_p_reqs.erase(req_id);
   has_allowed_token_ids.erase(req_id);
   num_logprobs.erase(req_id);
+  // gpu_model_runner.py:1199 pops num_prompt_logprobs with the request state.
+  num_prompt_logprobs.erase(req_id);
   min_tokens.erase(req_index);
   logit_bias.erase(req_index);
   logits_processors.erase(req_index);
@@ -688,8 +700,8 @@ void InputBatch::condense() {
     // ROAD-V1-C7 per-slot controls move with the row (gpu_input_batch.py
     // :819-830). min_p is an array; the index-keyed maps pop-and-reinsert; the
     // allowed-ids mask row is copied then the vacated row cleared. The req_id-
-    // keyed predicate sets (min_p_reqs / has_allowed_token_ids / num_logprobs)
-    // need no move — they survive reindexing.
+    // keyed predicate sets (min_p_reqs / has_allowed_token_ids / num_logprobs /
+    // num_prompt_logprobs) need no move — they survive reindexing.
     min_p_cpu[static_cast<size_t>(empty_index)] =
         min_p_cpu[static_cast<size_t>(last_req_index)];
     MoveDictValue(min_tokens, last_req_index, empty_index);

@@ -40,8 +40,8 @@ Each archive is published with a `.sha256` checksum and a
 compiled CPU tiers or CUDA SMs, runtime boundary, and known limitations.
 
 ```sh
-sha256sum --check linux-x86_64-glibc-cpu.tar.gz.sha256
-tar -xzf linux-x86_64-glibc-cpu.tar.gz
+sha256sum --check vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256
+tar -xzf vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz
 ./bin/vllm-server --version
 ./bin/vllm-server --help
 ```
