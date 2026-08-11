@@ -330,6 +330,8 @@ vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
+# issue #371: the recurrent-state budget (spec widens GDN state by k+1).
+vllm_cpp_add_test(test_kv_state_budget vllm/v1/core/test_kv_state_budget.cpp)
 vllm_cpp_add_test(test_prefix_match_unit vllm/v1/test_prefix_match_unit.cpp)
 vllm_cpp_add_test(test_kv_cache_interface vllm/v1/test_kv_cache_interface.cpp)
 vllm_cpp_add_test(test_block_pool vllm/v1/test_block_pool.cpp)
