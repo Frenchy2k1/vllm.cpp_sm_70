@@ -571,6 +571,112 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         }))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_console_drain_tails_reject_active_keyword_macros_independently(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        boundaries = {
+            "DrainEntrantsWithTimeout": "bool DrainInFlightWithTimeout",
+            "DrainInFlightWithTimeout": "std::atomic<unsigned> in_flight",
+        }
+        for function, boundary in boundaries.items():
+            with self.subTest(function=function):
+                definition = f"bool {function}"
+                mutated = source.replace(
+                    definition,
+                    "#define return SwitchToThread(); return\n" + definition,
+                    1,
+                ).replace(boundary, "#undef return\n" + boundary, 1)
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp",
+                    mutated,
+                    f"{function} trusted return-tail token",
+                )
+
+    def test_console_drain_tails_reject_one_spliced_macro_across_both(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        mutated = source.replace(
+            "bool DrainEntrantsWithTimeout",
+            "#define \\\nreturn SwitchToThread(); return\n"
+            "bool DrainEntrantsWithTimeout",
+            1,
+        ).replace(
+            "std::atomic<unsigned> in_flight",
+            "#undef return\nstd::atomic<unsigned> in_flight",
+            1,
+        )
+        for function in ("DrainEntrantsWithTimeout", "DrainInFlightWithTimeout"):
+            with self.subTest(function=function):
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp",
+                    mutated,
+                    f"{function} trusted return-tail token",
+                )
+
+    def test_console_drain_tails_reject_aliases_of_every_trusted_token(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        boundaries = {
+            "DrainEntrantsWithTimeout": "bool DrainInFlightWithTimeout",
+            "DrainInFlightWithTimeout": "std::atomic<unsigned> in_flight",
+        }
+        directives = {
+            "if": "#define if(condition) if ((SwitchToThread(), condition))",
+            "GetTickCount64": "#define GetTickCount64() (SwitchToThread(), GetTickCount64())",
+            "start": "#define start (SwitchToThread(), start)",
+            "return": "#define return SwitchToThread(); return",
+            "false": "#define false (SwitchToThread(), false)",
+            "true": "#define true (SwitchToThread(), true)",
+        }
+        for function, boundary in boundaries.items():
+            for token, directive in directives.items():
+                with self.subTest(function=function, token=token):
+                    definition = f"bool {function}"
+                    mutated = source.replace(
+                        definition, f"{directive}\n{definition}", 1
+                    ).replace(boundary, f"#undef {token}\n{boundary}", 1)
+                    self.assert_rejected(
+                        "src/vllm/platform/console_shutdown.cpp",
+                        mutated,
+                        f"{function} trusted return-tail token",
+                    )
+
+    def test_console_drain_tail_macro_state_is_bound_to_each_return(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        safe_mutations = (
+            source.replace(
+                "bool DrainEntrantsWithTimeout",
+                "#define return unsafe_return\n#undef return\n"
+                "bool DrainEntrantsWithTimeout",
+                1,
+            ),
+            source.replace(
+                "bool DrainInFlightWithTimeout",
+                "#if 0\n#define true unsafe_true\n#endif\n"
+                "bool DrainInFlightWithTimeout",
+                1,
+            ),
+            source.replace(
+                "std::atomic<unsigned> in_flight",
+                "#define false unsafe_after_drain\n#undef false\n"
+                "std::atomic<unsigned> in_flight",
+                1,
+            ),
+        )
+        for index, mutated in enumerate(safe_mutations):
+            with self.subTest(index=index):
+                result = self.run_checker(self.make_tree({
+                    "src/vllm/platform/console_shutdown.cpp": mutated,
+                }))
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+
     def test_console_function_body_skips_constrained_template_prototypes(self) -> None:
         source = textwrap.dedent(
             SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
@@ -886,6 +992,31 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 self.assert_rejected(
                     "scripts/build-windows-release.ps1", mutation, reason
                 )
+
+    def test_unsupported_tier_rejects_equivalent_unfiltered_target_forms(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        capture = "$probeOutput = @(& $TierTest @arguments 2>&1)"
+        equivalent_targets = (
+            "${TierTest}",
+            "${TiErTeSt}",
+            "($TierTest)",
+            "$($TierTest)",
+            "$local:TierTest",
+            "${local:TierTest}",
+            "$script:TiErTeSt",
+            "${private:TierTest}",
+        )
+        for target in equivalent_targets:
+            with self.subTest(target=target):
+                mutated = script.replace(
+                    capture, f"$null = & {target}\n            {capture}", 1
+                )
+                self.assert_rejected(
+                    "scripts/build-windows-release.ps1",
+                    mutated,
+                    "exactly one filtered process invocation",
+                )
+
     def test_unsupported_tier_filter_is_one_exact_process_argument(self) -> None:
         script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
         arguments = re.findall(

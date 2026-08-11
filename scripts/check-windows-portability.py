@@ -767,8 +767,15 @@ def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
                 f"build-windows-release.ps1: missing active {description}"
             )
 
+    tier_test_reference = (
+        r"(?:\$\{\s*(?:(?:global|script|local|private):)?TierTest\s*\}|"
+        r"\$(?:(?:global|script|local|private):)?TierTest\b)"
+    )
+    invocation_target = (
+        r"&\s*(?:(?:\(|\$\()\s*)*" + tier_test_reference
+    )
     direct_invocations = re.findall(
-        r"&\s*\$TierTest\b", probe, re.IGNORECASE
+        invocation_target, _powershell_syntax(probe), re.IGNORECASE
     )
     exact_direct = re.findall(
         r"@\(\s*&\s*\$TierTest\s+@arguments\s+2>&1\s*\)",
@@ -892,10 +899,11 @@ def _finite_timeout_expression(console: str, expression: str) -> bool:
 def _validate_bounded_drain(console: str, function: str, counter: str,
                             errors: list[str]) -> None:
     active_console = without_cpp_comments_and_literals(console)
-    body = _cpp_function_body(
-        active_console,
+    body_span = _cpp_function_body_span(
+        console,
         rf"\bbool\s+{re.escape(function)}\s*\(",
     )
+    body = "" if body_span is None else body_span[0]
     label = f"console_shutdown.cpp: {function} requires a finite timeout"
     if not body or re.search(r"\bINFINITE\b", body):
         errors.append(label)
@@ -936,6 +944,28 @@ def _validate_bounded_drain(console: str, function: str, counter: str,
                 r"\s*return\s+true\s*;\s*", success_tail
             ) is None):
         errors.append(label)
+        return
+
+    assert body_span is not None
+    trusted_fragments = (
+        (
+            body_span[1] + opening + 1 + timeout_branch.start(),
+            timeout_branch.group(0),
+        ),
+        (body_span[1] + loop_close + 1, success_tail),
+    )
+    macro_collisions: set[str] = set()
+    for fragment_start, fragment in trusted_fragments:
+        for token in re.finditer(r"\b[A-Za-z_]\w*\b", fragment):
+            if token.group(0) in _active_cpp_macro_names_at(
+                    console, fragment_start + token.start()):
+                macro_collisions.add(token.group(0))
+    if macro_collisions:
+        errors.append(
+            f"console_shutdown.cpp: {function} trusted return-tail token "
+            "must not be a macro "
+            f"({', '.join(sorted(macro_collisions))})"
+        )
 
 
 def _validate_console_protocol(console: str, errors: list[str]) -> None:
