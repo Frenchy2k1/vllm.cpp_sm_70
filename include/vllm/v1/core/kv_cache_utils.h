@@ -487,6 +487,37 @@ void check_enough_kv_cache_memory(int64_t available_memory,
                                   int64_t needed_memory, int64_t max_model_len,
                                   int64_t estimated_max_model_len);
 
+// recurrent_state_bytes: the Mamba/GDN state the runner will allocate, in bytes
+// (issue #371). Derived from the KVCacheConfig the runner allocates FROM, so it
+// cannot drift from the allocation: for each Mamba group,
+// `page_size_bytes() * layer_count * max_num_seqs * (1 + num_speculative_blocks)`.
+//
+// The `1 + num_speculative_blocks` factor is upstream's
+// `MambaSpec.max_memory_usage_bytes` (kv_cache_interface.py:713-718) and matches
+// what we allocate: `gdn_state_slots_ = max_num_reqs * (num_spec + 1)`
+// (runner.cpp:449-451). Speculation therefore multiplies the recurrent state by
+// k+1, which for a k=15 draft is SIXTEEN times the spec-off state.
+//
+// Returns 0 for a model with no recurrent state, which keeps every attention-only
+// path byte-identical.
+// host_available_memory_bytes: /proc/meminfo MemAvailable, the pool a unified
+// memory device actually allocates from. 0 means UNKNOWN (unreadable), and an
+// unknown budget must never become a false refusal.
+int64_t host_available_memory_bytes();
+
+int64_t recurrent_state_bytes(const KVCacheConfig& kv_cfg, int max_num_seqs);
+
+// check_enough_state_memory: the recurrent-state analogue of
+// check_enough_kv_cache_memory. Throws std::invalid_argument (upstream
+// ValueError) naming needed vs available, the per-sequence slot count, and the
+// knobs a vllm.cpp user can act on. Like upstream it REFUSES rather than
+// silently reducing concurrency: serving 4 sequences when 32 were asked for is a
+// worse outcome than a clear failure.
+//
+// `needed == 0` (no recurrent state) never throws.
+void check_enough_state_memory(int64_t available_memory, int64_t needed_memory,
+                               int max_num_seqs, int num_spec);
+
 // _auto_fit_max_model_len: the length to serve when the caller did NOT pin one.
 // Upstream reduces max_model_len to what the pool holds and logs the reduction;
 // it raises when not even one token fits. `derived_max_model_len` is the
