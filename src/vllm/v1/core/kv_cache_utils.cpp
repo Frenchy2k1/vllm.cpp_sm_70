@@ -940,6 +940,74 @@ int64_t kv_memory_needed_bytes(int64_t max_model_len, int block_size,
   return blocks * bytes_per_block;
 }
 
+int64_t host_available_memory_bytes() {
+  // The pool the allocation actually draws from. On a unified-memory device
+  // (GB10, Jetson Thor) device allocations come out of exactly this, which is why
+  // an oversized state does not fail cleanly there: with vm.overcommit_memory=1
+  // and no swap the kernel promises pages it cannot back and the BOX dies.
+  // MemAvailable (not MemFree) is the kernel's own estimate of what can be handed
+  // out without swapping, which is the honest denominator here.
+  //
+  // Returns 0 when unreadable; callers treat 0 as "unknown" and do not refuse,
+  // because an unknown budget must not become a false refusal.
+  std::FILE* f = std::fopen("/proc/meminfo", "re");
+  if (f == nullptr) return 0;
+  char line[256];
+  int64_t kb = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+  }
+  std::fclose(f);
+  return kb > 0 ? kb * 1024 : 0;
+}
+
+int64_t recurrent_state_bytes(const KVCacheConfig& kv_cfg, int max_num_seqs) {
+  // Mirrors what the runner allocates (runner.cpp:449-451,670-679): one state
+  // row per sequence slot, and under speculation num_spec+1 CONSECUTIVE slots
+  // per sequence for the k+1 draft-timestep snapshots the recurrent rollback
+  // selects among. A group's page_size_bytes() is exactly one slot's conv+ssm
+  // bytes for ONE layer, so the layer count multiplies it.
+  if (max_num_seqs <= 0) return 0;
+  int64_t total = 0;
+  for (const KVCacheGroupSpec& group : kv_cfg.kv_cache_groups) {
+    if (group.kv_cache_spec == nullptr) continue;
+    if (group.kv_cache_spec->kind() != KVCacheSpecKind::kMamba) continue;
+    const auto* mamba = static_cast<const MambaSpec*>(group.kv_cache_spec.get());
+    const int64_t slots_per_seq =
+        static_cast<int64_t>(1 + mamba->num_speculative_blocks);
+    const int64_t layers = static_cast<int64_t>(group.layer_names.size());
+    total += mamba->page_size_bytes() * layers *
+             static_cast<int64_t>(max_num_seqs) * slots_per_seq;
+  }
+  return total;
+}
+
+void check_enough_state_memory(int64_t available_memory, int64_t needed_memory,
+                               int max_num_seqs, int num_spec) {
+  // No recurrent state: nothing to run out of, and checking would refuse a
+  // configuration that works (the `if kv_cache_spec:` guard upstream keeps for
+  // the same reason, kv_cache_utils.py:872-878).
+  if (needed_memory <= 0) return;
+  if (needed_memory <= available_memory) return;
+
+  const int slots = num_spec + 1;
+  std::string msg =
+      "To serve " + std::to_string(max_num_seqs) +
+      " concurrent sequences, " + FormatGiB(needed_memory) +
+      " GiB of recurrent (Mamba/GDN) state is needed, which is larger than the "
+      "available " + FormatGiB(available_memory) + " GiB.";
+  if (num_spec > 0) {
+    msg += " Speculative decoding widens that state to " + std::to_string(slots) +
+           " snapshot slots per sequence (num_speculative_tokens=" +
+           std::to_string(num_spec) + " + 1), so it costs " +
+           std::to_string(slots) + "x the non-speculative state.";
+  }
+  msg +=
+      " Reduce --max-num-seqs, lower num_speculative_tokens, or run without "
+      "speculative decoding.";
+  throw std::invalid_argument(msg);
+}
+
 int64_t estimate_max_model_len(int64_t available_memory,
                                int64_t bytes_per_block, int block_size) {
   // Upstream binary-searches `max_memory_usage_bytes(len) <= available_memory`.
