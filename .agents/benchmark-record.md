@@ -19405,3 +19405,83 @@ streams are byte-identical, so upstream's DSpark is lossless on that lane.
 
 Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
 `xengine_ours.log`, `xengine_pinned.log`.
+
+**MULTIMODAL SPEED - AUDIO ENCODER TTFT: FA-2 TENSOR CORES for the hd-64 non-causal encoder
+attention - 5.50x encoder forward / 115.8x kernel, LANDS OPT-IN because it costs precision
+(2026-08-12, `CLAIM-MM-SPEED-AUDIO-ENC-FA2`, [spec](specs/multimodal-speed.md) S17, issue #432).**
+`benchmark_binding=false` (single-seq test driver; vLLM graphed is the honest denominator).
+Base `origin/main` `dc7a1392`, branch `row/MM-SPEED-ENC-FA2`. dgx GB10 sm_121a
+`~/work/mmenc-fa2/build-cuda`, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`; all three mandatory banners
+CONFIRMED at configure ("CUTLASS found ... sm120a NVFP4 cutlass GEMM", "FlashAttention-2
+prefill/decode: ENABLED for arch(es) [121a]", "Triton AOT ... MANIFEST hashes OK" sm_121a),
+`-Werror` **0 warn**. `local-ai-worker` STOPPED. ALL GPU under `flock $HOME/gpu.lock`;
+**CONTENTION: the box was NOT idle** - three other agents' jobs held or queued on the lock
+during the session, so each arm-group ran inside ONE lock window and could not interleave.
+Cold rep0 dropped. Implements the S14.5/S15.5 residual lever #1 (the one all three prior
+sections ranked first and deferred as LARGE).
+
+**KERNEL:** new `vt::AttentionDenseFa2` (`OpId::kAttentionDenseFa2`) routes a dense,
+non-paged, single-request, non-causal hd-64 bf16 attention to the VENDORED FlashAttention-2
+forward - the kernel vLLM itself dispatches here (`whisper.py` WhisperEncoderAttention:255 ->
+forward:298-317 -> `flash_attn_varlen_func`, causal=False). Three pieces: an upstream-form
+`flash_fwd_hdim64_bf16_sm80.cu` instantiating `run_mha_fwd_hdim64` (head_dim 64 AND the plain
+batch `run_mha_fwd_` entry are both firsts in this tree - every prior caller is paged, hence
+split-KV); `LaunchDenseFA2Bf16` filling `Flash_fwd_params` for b=1 with a null `cu_seqlens_q`
+(which is what selects the batch geometry in `BlockInfo`); and the additive op, whose fast
+path is narrow (bf16 + hd 64 + non-causal + MHA + FA-2 compiled + `VT_FA2_DENSE`) and which
+otherwise falls through to `AttentionDenseFlash`, so it is total. `kAttention` /
+`kAttentionDenseFast` / `kAttentionDenseFlash` untouched => Qwen vision tower, Gemma-4 vision
+and all text paths byte-identical BY CONSTRUCTION.
+
+**SAME-BINARY A/B** (throwaway `VT_ENC_REPS` `steady_clock` around the encoder forward, NOT
+committed; 6 reps/arm, rep0 dropped; one lock window):
+
+| Arm | encoder forward (reps 1-5) | vs shipped default | vs vLLM 0.25.0 TTFT 42.8 ms |
+|---|---|---|---|
+| warp `AttentionDenseFast` (S13) | 844.8 ms (843.6-847.6) | 0.87x | ~19.7x |
+| flash-tiled `AttentionDenseFlash` (S14/S15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **~17.1x** |
+| FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`, opt-in) | **133.0 ms** (131.6-137.9) | **5.50x faster** | **~3.11x** |
+
+Bands non-overlapping by a wide margin. **Proof-of-run** (nsys `cuda_gpu_kern_sum
+--cuda-graph-trace=node`, SAME tool + workload both arms): flash-tiled =
+`AttentionDenseFlashKernel<bf16,bf16>` 32 inst @ 19,278 us = 616.9 ms (24.0% of all GPU);
+FA-2 = `flash_fwd_kernel<Flash_fwd_kernel_traits<64,128,128,4,...>>` **32 inst @ 166.5 us =
+5.33 ms (0.3%)** with **ZERO** `AttentionDenseFlashKernel` - **115.8x on the kernel**, 32
+instances = 32 encoder layers exactly. (The 1410-instance `flash_fwd_splitkv_kernel` in both
+arms is the untouched S12 text decode.)
+
+**CORRECTNESS - why this is OPT-IN and not the default.** `test_voxtral_e2e` FA-2 arm
+**14/16 FAIL**: strict_prefix 12/48 (bar >= 18), determinism anchor repro 13/48 (bar 48);
+token md5 `d6d6ae1b...` vs `89923566...` shared IDENTICALLY by the naive/warp/flash-tiled
+arms. Goldens md5 UNCHANGED (`voxtral_golden.json 8ab87b7e...`, `voxtral_neartie.json
+937b9ad3...`, before == after) - nothing regenerated to make anything pass. ORACLE
+teacher-force of the FA-2 sequence against the fixture's OWN capture stack
+(`~/venvs/vllm-oracle-v0.25.0-stage`, asserted live: vLLM **0.25.0**, torch 2.11.0+cu130,
+transformers 5.13.1, mistral_common **1.11.5**, flashinfer 0.6.13):
+**divergent 3, worst gap 0.1250 nats @ pos 12, over-band 0, RESULT PASS** - inside the
+ratified 0.5-nat band, BUT the shipping scalar kernel has **0 divergent at gap 0.0** (every
+token is vLLM's own argmax). That is a precision step DOWN, not a tie flip, and it is the
+difference from S12 (whose adopted FA-2 decode kept divergent=0 while getting faster).
+**ROOT CAUSE grounded, inherent not a bug:** FA-2 converts the softmax probabilities from
+its f32 accumulator to bf16 before the PV MMA (`flash_attn/src/flash_fwd_kernel.h:347`
+`convert_type<Element>(acc_s)`) because that operand feeds `mma.sync`; our scalar kernel
+keeps `p` in f32. **DISPOSITION: default unchanged (byte-exact flash-tiled, gate 16/16);
+FA-2 opt-in behind `VT_WHISPER_ENC_FA2=1`; ADOPTION IS A DEVELOPER DECISION** - it would buy
+audio TTFT 17.1x -> 3.11x, the last mm axis below floor, at the cost of 0 -> 3 near-tie
+divergences. **NOT a ceiling:** (1) keep the tensor cores AND the precision - the gaps come
+from ONE conversion; an FA-3-style two-stage rescale / f32-correction-term split is the port
+target that would make the adoption question disappear; (2) attention is no longer the
+encoder bottleneck (5.33 ms of 133 ms), so the S15.1-deferred DEVICE im2col kernel for the
+cross-channel Whisper conv is now the top lever; (3) the vLLM 42.8 ms denominator is carried
+forward (as S14.4/S15.4 also did, contended unified-memory box) and a fresh capture is owed
+before this axis is called closed. **Repro:** `git archive` the branch to
+`dgx.casa:~/work/mmenc-fa2`, configure with the three flags above, `cmake --build build-cuda
+--target test_voxtral_e2e`, then `STF=~/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-3B-2507/snapshots/*/consolidated.safetensors;
+flock $HOME/gpu.lock env VLLM_VOXTRAL_SAFETENSORS=$STF VT_WHISPER_ENC_FA2=1 nsys profile
+--cuda-graph-trace=node -t cuda -o /tmp/f ./build-cuda/tests/test_voxtral_e2e; nsys stats
+--report cuda_gpu_kern_sum /tmp/f.nsys-rep | grep flash_fwd_kernel`. NOTE: without
+`VLLM_VOXTRAL_SAFETENSORS` the test SKIPS and still exits 0 - a silent false pass. NOTE 2:
+the oracle needs BOTH `ninja` AND `CC` on PATH in a non-login shell (Triton JIT dies
+"Failed to find C compiler"), which is likely what environment.md records as "v0.25.0-stage
+crashes in EngineCore init". No mm row advances to DONE.
