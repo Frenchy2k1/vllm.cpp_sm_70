@@ -617,6 +617,7 @@ target_compile_definitions(test_chat_mm PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
+vllm_cpp_add_test(test_sse_keepalive vllm/entrypoints/openai/test_sse_keepalive.cpp)
 vllm_cpp_add_test(test_openai_run_batch
   vllm/entrypoints/openai/test_run_batch.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream

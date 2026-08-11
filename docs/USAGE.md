@@ -1217,3 +1217,11 @@ were removed when the example became a thin ABI client; see the header comment i
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
+
+## SSE keepalives on long prefill
+
+Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
+waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
+(default 15s; `0` disables). Comment frames are not `data:` events and do not
+carry tokens. Token streaming still uses a timed wait on the request collector
+so deltas are not collapsed by a poll loop.

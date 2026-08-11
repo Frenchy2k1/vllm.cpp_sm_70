@@ -341,6 +341,22 @@ class ChatSseStream final : public SseStream {
 
   ~ChatSseStream() override { abort(); }
 
+  // Timed wait on this request's collector. On timeout with pings enabled,
+  // writes a pure SSE comment frame to `ping_chunk` and returns false so next()
+  // can deliver it alone (never concatenated with a data frame). On data,
+  // moves into `out` and returns true.
+  bool WaitOutput(RequestOutput& out, std::string& ping_chunk) {
+    const int ping_s = SsePingIntervalSec();
+    if (ping_s <= 0) {
+      out = engine_.get_output(async_request_);
+      return true;
+    }
+    auto ready = engine_.get_output_for(
+        async_request_, std::chrono::milliseconds(ping_s * 1000));
+    // Shared framing with completion: ping is a standalone comment frame.
+    return AssignSseWaitResult(std::move(ready), out, ping_chunk);
+  }
+
   bool next(std::string& chunk) override {
     if (complete_) return false;
     if (role_pending_) {
@@ -349,7 +365,11 @@ class ChatSseStream final : public SseStream {
       // count; the default path retains its immediately available role frame.
       if (usage_.include_continuous_usage) {
         for (;;) {
-          RequestOutput response = engine_.get_output(async_request_);
+          RequestOutput response;
+          if (!WaitOutput(response, chunk)) {
+            // WaitOutput filled chunk with a pure SSE ping — return it first.
+            return true;
+          }
           prompt_tokens_ =
               static_cast<int>(response.prompt_token_ids.size());
           if (!response.outputs.empty() || response.finished) {
@@ -401,7 +421,9 @@ class ChatSseStream final : public SseStream {
         response = std::move(*buffered_response_);
         buffered_response_.reset();
       } else {
-        response = engine_.get_output(async_request_);
+        if (!WaitOutput(response, chunk)) {
+          return true;  // pure ping frame
+        }
       }
       prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
