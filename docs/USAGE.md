@@ -45,8 +45,11 @@ portable scan), and the norm-gate/preamble ops (`kRmsNormGated`,
 GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
 `mamba_cache_dtype` default) is advertised via the
 `SupportsCompressedConvState`/`SupportsCompressedGdnState` backend probes.
-Known limit on a separate path: the ROCm `MoeRouterTopK` kernel takes f32
-logits only, so MoE-bearing models still throw there. On a
+MoE-path coverage is partial: `MoeRouterTopK` (f32/bf16 logits, ungrouped
+softmax, no bias) and `MoeSiluMul` are native; the remaining chain
+(`kSharedExpertGate`, `kMoeCombine`/`kMoeCombineGate`, and the grouped quant
+expert GEMM) is not registered yet, so MoE-bearing models still throw on
+those ops. On a
 discrete card there is no CPU fallback tier, so a model whose layers call an op
 that is not registered yet fails loudly with `vt: no kernel for op N on device
 type 5` — that is the memory-safety design working, not a crash. Run with
