@@ -1233,6 +1233,148 @@ TEST_CASE("GDN state gather/scatter are BIT-EXACT against the CPU oracle") {
 }
 
 
+TEST_CASE("causal conv1d fwd/update match the CPU oracle") {
+  // §2/§3 of gdn-semantics.md. Outputs are arithmetic (silu epilogue) -> NMSE;
+  // the conv_state write-back/roll moves RAW x values -> bit-exact.
+  const int64_t C = 24, K = 4, W = K - 1;
+  const std::vector<int32_t> qsl = {0, 5, 6, 15};  // 3 seqs: lens 5, 1, 9
+  const std::vector<int32_t> has = {1, 0, 1};
+  const int64_t T = 15, N = 3;
+  const size_t xn = static_cast<size_t>(T * C), wn = static_cast<size_t>(C * K);
+  const std::vector<float> x = RandomVec(xn, 811);
+  const std::vector<float> w = RandomVec(wn, 812, -0.5f, 0.5f);
+  const std::vector<float> bias = RandomVec(static_cast<size_t>(C), 813, -0.2f, 0.2f);
+  const std::vector<float> st0 = RandomVec(static_cast<size_t>(N * C * W), 814, -0.5f, 0.5f);
+
+  // CPU oracle (fwd).
+  std::vector<float> ref_out(xn, 0.0f), ref_state = st0;
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cx = x, cw = w, cb = bias;
+    std::vector<int32_t> cqsl = qsl, chas = has;
+    Tensor tx = T2(cx.data(), cd, T, C);
+    Tensor tw = T2(cw.data(), cd, C, K);
+    Tensor tb = T1(cb.data(), cd, C);
+    Tensor tst = Tensor::Contiguous(ref_state.data(), DType::kF32, cd, {N, C, W});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor this_ = TI32(chas.data(), cd, N);
+    Tensor tout = T2(ref_out.data(), cd, T, C);
+    vt::CausalConv1dFwd(cq, tout, tx, tw, &tb, tst, tqsl, this_, vt::CausalConv1dArgs{});
+    cpu.DestroyQueue(cq);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kCausalConv1dFwd, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dx(dev, q, xn), dw(dev, q, wn), db(dev, q, static_cast<size_t>(C)),
+        dout(dev, q, xn), dst(dev, q, static_cast<size_t>(N * C * W));
+    DevBufI32 dqsl(dev, q, N + 1), dhas(dev, q, N);
+    dx.Upload(x);
+    dw.Upload(w);
+    db.Upload(bias);
+    dst.Upload(st0);
+    dqsl.Upload(qsl);
+    dhas.Upload(has);
+    Tensor tx = T2(dx.ptr(), d, T, C);
+    Tensor tw = T2(dw.ptr(), d, C, K);
+    Tensor tb = T1(db.ptr(), d, C);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, C, W});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor this_ = TI32(dhas.ptr(), d, N);
+    Tensor tout = T2(dout.ptr(), d, T, C);
+    vt::CausalConv1dFwd(q, tout, tx, tw, &tb, tst, tqsl, this_, vt::CausalConv1dArgs{});
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(dst.Download() == ref_state);  // raw-x write-back: bit-exact
+
+    // Exact-chunks descriptor form (VT_CONV_EXACT_CHUNKS — the shape Qwen3.5
+    // prefill actually passes on the live path): one program per (sequence,
+    // 8-token chunk). lens 5,1,9 -> programs (s0,c0), (s1,c0), (s2,c0),
+    // (s2,c1). Must equal the same CPU oracle (the CPU keeps the scalar
+    // mapping; the descriptors only re-slice the work).
+    const std::vector<int32_t> batch_ptr = {0, 1, 2, 2};
+    const std::vector<int32_t> chunk_off = {0, 0, 0, 1};
+    DevBufI32 dbp(dev, q, batch_ptr.size()), dtco(dev, q, chunk_off.size());
+    dbp.Upload(batch_ptr);
+    dtco.Upload(chunk_off);
+    dst.Upload(st0);  // reset state for the descriptor run
+    Tensor tbp = TI32(dbp.ptr(), d, static_cast<int64_t>(batch_ptr.size()));
+    Tensor ttco = TI32(dtco.ptr(), d, static_cast<int64_t>(chunk_off.size()));
+    vt::CausalConv1dArgs exact_args;
+    exact_args.batch_ptr = &tbp;
+    exact_args.token_chunk_offset_ptr = &ttco;
+    vt::CausalConv1dFwd(q, tout, tx, tw, &tb, tst, tqsl, this_, exact_args);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(dst.Download() == ref_state);  // descriptor write-back: bit-exact
+    dev.DestroyQueue(q);
+  }
+
+  // Update: B=4 tokens. Compact arm: conv_state [B,C,W] (one row per token,
+  // per the ops.cpp contract). Indexed arm: the full [SLOTS,C,W] cache with one
+  // NULL slot (-1 -> out row untouched).
+  const int64_t B = 4, SLOTS = 6;
+  const size_t un = static_cast<size_t>(B * C);
+  const std::vector<int32_t> cidx = {3, -1, 0, 5};
+  const std::vector<float> ux = RandomVec(un, 821);
+  const std::vector<float> ust0 = RandomVec(static_cast<size_t>(SLOTS * C * W), 822, -0.5f, 0.5f);
+  for (bool indexed : {false, true}) {
+    CAPTURE(indexed);
+    const int64_t st_rows = indexed ? SLOTS : B;
+    const std::vector<float> ust_arm(ust0.begin(), ust0.begin() + st_rows * C * W);
+    // CPU oracle.
+    std::vector<float> ref_uout(un, -2.0f), ref_ust = ust_arm;
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cx = ux, cw = w, cb = bias;
+      std::vector<int32_t> cci = cidx;
+      Tensor tx = T2(cx.data(), cd, B, C);
+      Tensor tw = T2(cw.data(), cd, C, K);
+      Tensor tb = T1(cb.data(), cd, C);
+      Tensor tst = Tensor::Contiguous(ref_ust.data(), DType::kF32, cd, {st_rows, C, W});
+      Tensor tci = TI32(cci.data(), cd, B);
+      Tensor tout = T2(ref_uout.data(), cd, B, C);
+      vt::CausalConv1dUpdate(cq, tout, tx, tw, &tb, tst, vt::CausalConv1dArgs{},
+                             indexed ? &tci : nullptr);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kCausalConv1dUpdate, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dx(dev, q, un), dw(dev, q, wn), db(dev, q, static_cast<size_t>(C)),
+          dout(dev, q, un), dst(dev, q, static_cast<size_t>(st_rows * C * W));
+      DevBufI32 dci(dev, q, B);
+      dx.Upload(ux);
+      dw.Upload(w);
+      db.Upload(bias);
+      dst.Upload(ust_arm);
+      dci.Upload(cidx);
+      // Untouched-row sentinel must match the oracle's initial -2 fill.
+      dout.Upload(std::vector<float>(un, -2.0f));
+      Tensor tx = T2(dx.ptr(), d, B, C);
+      Tensor tw = T2(dw.ptr(), d, C, K);
+      Tensor tb = T1(db.ptr(), d, C);
+      Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {st_rows, C, W});
+      Tensor tci = TI32(dci.ptr(), d, B);
+      Tensor tout = T2(dout.ptr(), d, B, C);
+      vt::CausalConv1dUpdate(q, tout, tx, tw, &tb, tst, vt::CausalConv1dArgs{},
+                             indexed ? &tci : nullptr);
+      CHECK(Nmse(ref_uout, dout.Download()) <= kNmseTol);
+      CHECK(dst.Download() == ref_ust);  // roll: bit-exact
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;
