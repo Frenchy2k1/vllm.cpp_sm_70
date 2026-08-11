@@ -17,7 +17,7 @@
 | **Record/checker repair 2026-08-07–08** | Gates fixed. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited), `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables); nine Gemma4/ROCm tuners internal. No runtime/perf change. |
 | **vLLM** | Qwen3.6-27B NVFP4 `unsloth` @`890bdef7`, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-27B NVFP4 `nvidia` @`0893e160` (ModelOpt `modelopt_mixed`), GB10 | **0.8289x to 0.8639x, BEHIND** at c1 to c8 (canonical 2026-08-10; confirms the prior 0.843-0.861x). Gap fully ATTRIBUTED | near-tie |
-| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | **0.935x to 0.979x, BEHIND at every concurrency** (binding grid @`a0fa12c7`); memory wins: PSS 3.81x, GPU 1.40x | near-tie |
+| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | **CANONICAL 2026-08-11 @`348c265d`: 0.918x-0.972x** over c1-c32 (first c16/c32); best c4 0.9719. Supersedes the ad-hoc grid | near-tie |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-S-2.1 NVFP4 (118B/8B MoE), GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
@@ -41,14 +41,14 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/4 | **BEHIND, uniformly 0.85x** on decode throughput (was 0.72x before the FP8 tower fix); greedy continuation IDENTICAL to vLLM. A different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 GDN/attn tower) |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
-| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, acceptance `PENDING`** | Corrected run, supersedes 1.021246x; `PENDING` operator gate. OPEN: TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | Supersedes 1.021246x; `PENDING` operator gate. OPEN: TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 
 ### GDN prefill kernels by GPU
 
 | GPU | Workload and basis | vllm.cpp | vLLM | Ratio | Status |
 |---|---|---:|---:|---:|---|
-| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 234.605 ms arm 0; **219.506 ms** K4 arm 1 | 145.421 ms | 1.613x arm 0; **1.509x** arm 1 | K4 arm 1 is byte-exact and **6.436% faster** (same-run arm-0 basis, not the earlier 233.955 default); arm 2 falsified; arm 1 opt-in ([result](../.agents/specs/sm120-qwen35-conv-channel-tile-2026-08-08.md)) |
-| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, fused post-conv total | 122.587 ms | 108.035 ms | **1.135x slower** | Opt-in tile is exact and **1.859x faster** than 227.887 ms fast megablock; all axes improved; default/release gates open ([spec](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md)) |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 234.605 ms arm 0; **219.506 ms** K4 arm 1 | 145.421 ms | 1.613x; **1.509x** arm 1 | K4 arm 1 byte-exact, **6.436%** faster (same-run basis); arm 2 falsified; opt-in ([result](../.agents/specs/sm120-qwen35-conv-channel-tile-2026-08-08.md)) |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, fused post-conv total | 122.587 ms | 108.035 ms | **1.135x slower** | Opt-in tile exact, **1.859x** over the 227.887 ms megablock; default gates open ([spec](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-27B NVFP4, historical normalized prefill | 0.43 us/token/layer | 0.18 us/token/layer | **2.39x slower** | Directional only: unequal token clusters, older pin ([ledger](../.agents/parity-ledger.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-35B NVFP4, later local kernel A/B | 321.148 us c1; 960.313 us c6 | - | `PENDING` | Register vs tiled improved 4.7%/7.3%; no paired vLLM denominator ([record](../.agents/specs/gdn-prefill-conv-reg-2026-07-18.md)) |
 | Jetson Thor (`sm_110`), AGX Orin (`sm_87`) | No matched GDN workload | - | - | `PENDING` | Runtime correctness only; no causal-conv speed trace |
@@ -86,7 +86,11 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 |---|---:|---:|---:|---:|
 | **vllm.cpp** tok/s (canonical 2026-08-10) | 9.4201 | 17.2474 | 29.5132 | 46.7061 |
 | vLLM 0.25.0 tok/s (canonical) | 11.3646 | 20.3858 | 34.6041 | 54.0616 |
-| **Ratio (canonical, BINDING)** | **0.8289x** | **0.8461x** | **0.8529x** | **0.8639x** |
+| **Ratio POST-LEVER (BINDING, main @`348c265d`)** | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
+| ours tok/s post-lever | 9.366 | 19.529 | 32.870 | 51.753 |
+| Ratio pre-lever (same recipe, superseded) | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
+| Levers landed | packed NVFP4 `lm_head` + merged GDN fp8 qkvz. Both ACTIVE by kernel signature: `cutlass_80_tensorop` ABSENT, split `nvjet_64x128x128` replaced by merged `192x48x128` | | |
+| OPEN: c1 did not move | c2-c8 gained ~10 points, c1 only +0.010 though both levers execute there. The pre-lever attribution sized them AT c1, so it mis-assigned c1 | | |
 | TPOT / TTFT ratio (canonical) | 1.2245 / 1.0077 | 1.1902 / 1.1111 | 1.2313 / 0.9722 | 1.2250 / 0.9992 |
 | Prior ad-hoc ratio (superseded, consistent) | 0.847x | 0.861x | 0.853x | 0.843x |
 | Before the FP8 tower fix | 8.76 | 17.07 | 33.01 | 62.13 |
@@ -143,9 +147,10 @@ route (**+1.31% c8 / +1.38% c4**, `VT_MARLIN_DENSE_PAIR`) and the shared
 `down_proj` emitted as bf16 rather than f32 (**+2.05% c8 / +0.79% c4**,
 bit-identical, `VT_SHARED_DOWN_BF16`).
 
-Next is `SiluAndMul`: launch counts MATCH vLLM (2.00 against 1.98 per
-layer-step) but ours costs 22.6 us against ~2.45 us, a **9.2x** per-launch gap
-worth 3.6 points ([spec](../.agents/specs/moe-silu-vectorize.md)). The
+The SiLU lever is NEGATIVE ([spec](../.agents/specs/moe-silu-vectorize.md)):
+the 9.2x per-launch gap that motivated it was a MEAN over a bimodal kernel
+(min 1.34 us, max 979 us) and our decode-phase SiLU is already faster than
+vLLM's, so the remaining band is unattributed. The
 marlin block-size lever is REFUTED (block 8 at c8 is 1.16% SLOWER against a
 +0.29% control), and a per-launch marlin gap is WITHDRAWN as cross-tool
 uncertainty. Memory passes decisively: peak PSS **3.81x**, peak GPU **1.40x**.
@@ -402,11 +407,9 @@ built on it rather than keeping the flattering one.
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Qwen3.5 upstream throughput levers (roadmap C10) | NOT MEASURED. vLLM's 2026-08-06 25K tok/s/GPU is a GB200/NVLink72 disaggregated cluster result, not comparable to one GB10, and is NOT adopted as our bar | Advance the parity pin past `555967922` so the referenced PRs exist, re-capture goldens at zero drift, then port the GDN prefill kernel |
-| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | Tensor parallelism (task #287 spike, 2026-08-08) | **No number owed** (`benchmark_binding=false`): records-only scope at pin `555967922` ([spec](../.agents/specs/tensor-parallelism-spike.md)). TP-W1 landed (group table, 6/6); TP-W2..W7 gate on token-exactness, not speed | Perf gate is TP-W6: at or above vLLM TP=2 on every axis, same 2-GPU box (PENDING-HW) |
-| DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | `/v1/videos` OpenAI + ONE-SURFACE ROW 2 | **No number owed:** ABI-v12 device selection is backend-dispatch plumbing; generation math and speed paths are unchanged | DSR 34→32; baseline/allowlist unchanged; 25/25 checker mutations; CPU fold 6/137, including one-queue/device-provenance mutations |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
@@ -429,10 +432,12 @@ built on it rather than keeping the flattering one.
 | Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
 | ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **NOT APPLICABLE: no number measured, claimed or owed.** W0 ctest-green on 4 gfx archs (#41); gfx1201 hipBLAS + Gemma-4 MoE (#140, contributor) ran M0/M1 on 2× R9700, our side CPU-link-verified only. No AMD HW here | The approach-(b) fix (PENDING community) unblocks the first APU model run (M2); the gate becomes a same-box vLLM-ROCm oracle once a model runs ([#41](https://github.com/mudler/vllm.cpp/issues/41)); floor: vLLM |
 | Tenstorrent Blackhole (`BACKEND-TENSTORRENT`) | **NOT APPLICABLE (speed).** Correctness: OPT-125m STRICT 6/6 e2e on real hardware. Qwen3-0.6B has a device-specific golden and short 4-token warm smoke (~0.28 tok/s), not a completed speed run | Full 16x16 Qwen3 gate, then device-resident tensors + `ttnn::sdpa_decode` before any performance comparison. [Spec](../.agents/specs/tenstorrent-backend.md) |
+| Prompt logprobs (`SAMPLE-PROMPT-LOGPROBS`, #223) | **NO number measured, claimed or owed.** Correctness-only, CPU. Upstream ships this path explicitly unoptimized (`gpu_model_runner.py:5622-5623`); a step where no request asks is unchanged | Floor if one is ever wanted: vLLM's own `prompt_logprobs=k`, same model and prompt |
+| `logprobs_mode` (`SAMPLE-LOGPROB-TOKEN-IDS`, #238) | **NO number measured, claimed or owed.** Correctness-only, CPU. One [n, vocab] device->host copy per step when a processed mode is engaged, nothing when not | Nothing to close: observation modes, not a path vLLM optimizes either |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | Embeddings on the ONE surface (ROW 6, `LlamaModel` + `vllm_embed` + `/v1/embeddings`) | **NO number measured, claimed or owed.** Correctness-gated only, CPU: the 2026-08-08 fold (engine path == direct registry path, f64 LAST+normalize reference on the committed fixture) is plumbing, no speed claim | A REAL embedding checkpoint (e5-mistral class) + a same-box `vllm.LLM(task="embed")` oracle; only then does an embed-throughput bar exist |
 | Parakeet/FastConformer ASR (P1-P4 + ONE-SURFACE fold ROW 1) | **NO number measured, claimed or owed.** Correctness-gated only, CPU f32; the 2026-08-07 surface fold (`vllm_transcribe`, `/v1/audio/transcriptions`) is transcript-byte-identical plumbing, no speed claim. | Floor is `parakeet.cpp`, same clip and box; needs a CUDA provider and a pretrained checkpoint |
-| cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
+| Async serving correctness (#323) | **FIXED**: the decode graph replayed stale HOST token ids, degenerating concurrent requests past slot 0 (classic-dense, graph on = default). Graph declines while the mirror is live; async 7/7, SACRED 184/184 | Graph to read ids at REPLAY |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
 | Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Full-library LINK at `sm_75` + `cuobjdump` SASS, then a build-supported row. The fp16 `fattn` port is speed-only now; its floor when a card exists is llama.cpp on that card |
 

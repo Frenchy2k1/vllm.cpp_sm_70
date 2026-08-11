@@ -260,6 +260,39 @@ class RatchetTests(unittest.TestCase):
         self.assertIn("python3 scripts/check-site.py", body)
         self.assertIn("hugo --minify -s website", body)
 
+    def test_the_newly_pinned_row_carries_a_reproducible_invocation(self):
+        # The baseline is hand-edited and `audit()` is not, so the failure mode a
+        # re-pin invites is adding an id whose spec does not actually tell anyone
+        # how to run the gate. Set-equality above cannot catch that: both sides
+        # move together.
+        #
+        # It is worth being precise about what this does and does not prove. The
+        # obvious mutation -- strip the fenced block, expect the credit to vanish
+        # -- does NOT hold, and finding that out is the useful part: with both
+        # blocks removed the section still yields `ctest`, harvested from an
+        # inline code span in the surrounding prose. That is the weak-credit debt
+        # the checker's own header already admits to (see the RUNNABLE_BASELINE
+        # comment and gate-command-audit-2026-08-06.md risk 3), not something
+        # this row introduced, so it is recorded here rather than worked around.
+        #
+        # What is asserted instead is the thing a reader actually needs: the row
+        # is pinned, it audits runnable, and its Gates section carries a real
+        # fenced invocation naming the binaries the gate was run with.
+        row = "SAMPLE-PROMPT-LOGPROBS"
+        self.assertIn(row, gates.RUNNABLE_BASELINE)
+        record = next(r for r in gates.audit() if r["id"] == row)
+        self.assertEqual(record["verdict"], "runnable", record)
+
+        section = gates.gates_section(
+            (ROOT / ".agents/specs/prompt-logprobs.md").read_text(encoding="utf-8")
+        )
+        self.assertIsNotNone(section)
+        blocks = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)
+        self.assertTrue(blocks, "the Gates section carries no fenced invocation")
+        body = "\n".join(blocks)
+        for fragment in ("cmake -S . -B", "cmake --build", "test_llm_engine", "ctest"):
+            self.assertIn(fragment, body, fragment)
+
     def test_a_row_that_loses_its_command_is_refused(self):
         # Still present, still gated, no longer runnable -- a real regression.
         victim = sorted(gates.RUNNABLE_BASELINE)[0]
