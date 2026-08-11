@@ -134,12 +134,18 @@ SAFE_FILES = {
     """,
     "scripts/build-windows-release.ps1": """
         function Invoke-UnsupportedTierProbe {
-          param([string]$TierTest)
+          param([string]$TierTest, [scriptblock]$Runner)
           $arguments = @(
             '--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran'
           )
-          $probeOutput = @(& $TierTest @arguments 2>&1)
-          $probeExitCode = $LASTEXITCODE
+          if ($null -eq $Runner) {
+            $probeOutput = @(& $TierTest @arguments 2>&1)
+            $probeExitCode = $LASTEXITCODE
+          } else {
+            $probeResult = & $Runner $TierTest $arguments
+            $probeOutput = @($probeResult.Output)
+            $probeExitCode = [int]$probeResult.ExitCode
+          }
           if ($probeExitCode -ne 1) { throw "unexpected exit" }
           if (($probeOutput -join "`n") -notmatch
               [regex]::Escape("unknown x86 ISA tier 'amx'")) {
@@ -147,6 +153,21 @@ SAFE_FILES = {
           }
         }
         function Invoke-UnsupportedTierContractTests {
+          $calls = [System.Collections.Generic.List[object]]::new()
+          $good = {
+            param([string]$Program, [string[]]$Arguments)
+            $calls.Add([pscustomobject]@{ Arguments = @($Arguments) })
+            [pscustomobject]@{
+              ExitCode = 1
+              Output = @("unknown x86 ISA tier 'amx'")
+            }
+          }.GetNewClosure()
+          Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" -Runner $good
+          if ($calls.Count -ne 1) { throw "wrong fake call count" }
+          if ($calls[0].Arguments.Count -ne 1) { throw "wrong fake argument count" }
+          if ($calls[0].Arguments[0] -ne '--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran') {
+            throw "wrong fake argument"
+          }
           $badResults = @(
             [pscustomobject]@{ ExitCode = 0 },
             [pscustomobject]@{ ExitCode = 134 },
@@ -492,6 +513,48 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                     "trusted final-tail token",
                 )
 
+    def test_console_final_tail_rejects_split_keyword_macro(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        split_keyword = (
+            "#define \\\n"
+            "return SetEvent(state->stop_event); return\n  "
+        )
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            source.replace(decrement, split_keyword + decrement, 1),
+            "trusted final-tail token",
+        )
+
+    def test_console_final_tail_accepts_only_macros_active_at_the_tail(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        safe_directives = (
+            "#define return unsafe_return\n#undef return\n  ",
+            "#if 0\n#define return unsafe_return\n#endif\n  ",
+            "#if 0\n#define return unsafe_return\n"
+            "#else\n#define harmless_tail_macro 1\n#endif\n  ",
+        )
+        for directives in safe_directives:
+            with self.subTest(directives=directives):
+                result = self.run_checker(self.make_tree({
+                    "src/vllm/platform/console_shutdown.cpp":
+                        source.replace(decrement, directives + decrement, 1),
+                }))
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+
+        result = self.run_checker(self.make_tree({
+            "src/vllm/platform/console_shutdown.cpp":
+                source + "\n#define return unsafe_after_dispatch\n",
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_console_final_tail_ignores_comment_and_string_decoys(self) -> None:
         source = textwrap.dedent(
             SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
@@ -730,9 +793,99 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             f"$filterDecoy = {quoted_filter}\n" + script.replace(
                 quoted_filter, "'--test-case=unrelated test'", 1
             ),
-            "one exact unsupported-tier filter argument",
+            "isolated unsupported-tier filter",
         )
 
+    def test_real_unsupported_tier_helper_is_structurally_scoped(self) -> None:
+        script = (REPO / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        capture = "$probeOutput = @(& $TierTest @arguments 2>&1)"
+        self.assertEqual(script.count(capture), 1)
+        mutations = [(
+            script.replace(
+                capture, "& $TierTest\n        " + capture, 1
+            ),
+            "exactly one filtered process invocation",
+        )]
+
+        runner_call = "$probeResult = & $Runner $TierTest $arguments"
+        self.assertEqual(script.count(runner_call), 1)
+        mutations.extend((
+            (
+                script.replace(
+                    runner_call,
+                    "$null = & $Runner $TierTest @()\n        " + runner_call,
+                    1,
+                ),
+                "exactly one fake-runner invocation",
+            ),
+            (
+                script.replace(
+                    runner_call,
+                    "$probeResult = & $Runner $TierTest @()",
+                    1,
+                ),
+                "exact unsupported-tier filter arguments",
+            ),
+        ))
+
+        helper_start = script.index("function Invoke-UnsupportedTierProbe")
+        helper_end = script.index(
+            "function Invoke-UnsupportedTierContractTests", helper_start
+        )
+        helper = script[helper_start:helper_end]
+        diagnostic = "unknown x86 ISA tier 'amx'"
+        self.assertEqual(helper.count(diagnostic), 1)
+        mutated_helper = helper.replace(diagnostic, "wrong helper diagnostic", 1)
+        mutated = script[:helper_start] + mutated_helper + script[helper_end:]
+        self.assertIn(diagnostic, mutated)
+        mutations.append((mutated, "unsupported-tier diagnostic"))
+        mutations.extend((
+            (
+                script.replace("$calls.Add(", "$calls.Append(", 1),
+                "fake runner call recording",
+            ),
+            (
+                script.replace("$calls.Count -ne 1", "$calls.Count -lt 0", 1),
+                "exactly one recorded fake call",
+            ),
+            (
+                script.replace(
+                    "$calls[0].Arguments.Count -ne 1",
+                    "$calls[0].Arguments.Count -lt 0",
+                    1,
+                ),
+                "exactly one recorded fake argument",
+            ),
+            (
+                script.replace(
+                    'Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" '
+                    "-Runner $good",
+                    'Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" '
+                    "-Runner $good\n    "
+                    'Invoke-UnsupportedTierProbe -TierTest "fake-tier-test.exe" '
+                    "-Runner $good",
+                    1,
+                ),
+                "exactly one unsupported-tier probe invocation",
+            ),
+        ))
+        contract_start = script.index("function Invoke-UnsupportedTierContractTests")
+        contract = script[contract_start:]
+        self.assertIn(UNSUPPORTED_TIER_FILTER, contract)
+        mutated_contract = contract.replace(
+            UNSUPPORTED_TIER_FILTER, "--test-case=wrong fake filter", 1
+        )
+        mutations.append((
+            script[:contract_start] + mutated_contract,
+            "exact recorded fake filter argument",
+        ))
+        for mutation, reason in mutations:
+            with self.subTest(reason=reason):
+                self.assert_rejected(
+                    "scripts/build-windows-release.ps1", mutation, reason
+                )
     def test_unsupported_tier_filter_is_one_exact_process_argument(self) -> None:
         script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
         arguments = re.findall(
