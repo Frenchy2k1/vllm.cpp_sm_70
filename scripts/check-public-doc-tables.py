@@ -492,6 +492,28 @@ STATUS_RATCHET = {
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
     #
+    # 243405 since 2026-08-10 (measured 243405): row KERNEL-SSM-MAMBA (#155)
+    # rewrites the Qwen3.5-4B sm_120 cell for the post-conv token tile and the
+    # K=4 causal-conv specialization. The superseded exact-chunk A/B narrative
+    # (the three-pair local percentages and the rebased-main nsys retelling)
+    # collapses to its binding result; both are carried durably by
+    # docs/BENCHMARKS.md's GDN rows and .agents/benchmark-record.md. Strictly
+    # DOWN from 243542, the only direction this number may move.
+    #
+    # 243519 since 2026-08-10 (measured 243519): issue #206 replaces the stale
+    # pretoken-failure row with the corrected, exact throughput result and its
+    # still-open latency/VRAM axes. Re-pinned byte-tight after current-main
+    # reconciliation so the shorter row cannot become untracked headroom.
+    #
+    # 243455 since 2026-08-10 (measured 243455): #155 and #266 landed together,
+    # so the two ratchets above are reconciled into one. The page had ended up
+    # publishing TWO cross-engine results for the same Qwen3.5-4B key -- 1.0283x
+    # in the row and 1.021246x twice in the prose. The superseded 1.021246x
+    # pair collapses into one paragraph that names the corrected run as the
+    # single standing result, marks its disposition PENDING to match the
+    # campaign spec, and says why the older figure is not a competitor. The
+    # explanation is paid for out of the page, not added to it. Strictly DOWN
+    # from 243519, the only direction this number may move.
     # 243512 since 2026-08-10 (measured 243512, #277): the metrics paragraph and
     # the OpenAI-server row both carried a claim that had become FALSE -- that
     # the async serving path has no live metric backing. Wiring it (the AsyncLLM
@@ -554,6 +576,24 @@ STATUS_RATCHET = {
     # 243245 since 2026-08-11 (measured 243245): ENG-RELEASE-CONTAINERS
     # owes the page a lifecycle line, paid for inside the release
     # paragraph rather than out of the page. Strictly DOWN.
+
+    #
+    # 243368 since 2026-08-10 (measured 243368): reconciled once more when the
+    # external-PR landing (#155 + #266) merged current main, which had itself
+    # re-pinned to 243512 for #277. Both histories are kept above; this is the
+    # single measured value for the merged page. Strictly DOWN from 243455.
+    #
+    # 243200 since 2026-08-11 (measured 243200): the external-PR landing merged
+    # current main again; main's newer 27B/35B/dense rows won on their keys and
+    # this landing's Qwen3.5-4B row won on its own. Single measured value for
+    # the merged page. Strictly DOWN from 243287.
+    #
+    # 243188 since 2026-08-11 (measured 243188): the external-PR landing merged
+    # a 50-commit main (Muse Glimmer, #330 Prom refs, containers). Both ratchet
+    # histories above are kept; this is the single measured value for the merged
+    # page; the PENDING paragraph was compressed to pay for itself rather than
+    # widen the budget. Strictly DOWN from 243200.
+    #
     #
     # 243243 since 2026-08-11 (measured 243243): #347 landed, so this page's claim
     # that the `llama4` / GPT-4o pre-tokenizer is unimplemented stops being
@@ -561,7 +601,16 @@ STATUS_RATCHET = {
     # 57/57 and the blocker moved to the forward (#359); the evidence for both
     # lives in .agents/specs/muse-glimmer.md §12, not here. Net -2.
     # Strictly DOWN.
-    "chars": 243243,
+    #
+    # 243186 since 2026-08-11 (measured 243186): the Tekken (#168)
+    # and GPT-4o (#347) pre-tokenizers landed concurrently and each re-pinned
+    # this ratchet against a page the other had not yet touched -- 243188 and
+    # 243243, both stale the moment the other merged. Both histories are kept
+    # above; this is the single MEASURED value for the merged page, which
+    # carries #347's shorter Muse Glimmer wording on top of main's. Re-measured
+    # rather than carried from either PR, and rather than arithmetic on the two:
+    # zero slack is the only honest re-pin. Strictly DOWN from 243188.
+    "chars": 243186,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,
