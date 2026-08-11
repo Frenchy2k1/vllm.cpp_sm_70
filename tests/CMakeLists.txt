@@ -1145,6 +1145,16 @@ vllm_cpp_add_test(test_tokenizer_parity_mistral vllm/test_tokenizer_parity_mistr
 target_compile_definitions(test_tokenizer_parity_mistral PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
+# TOK-LLAMA4-PRE (issue #347) — the GPT-4o / o200k tokenizer parity gate. This
+# family is what a GGUF tags `tokenizer.ggml.pre = "llama4"` (Muse Glimmer 30B).
+# It shares kLlama3's `\p{N}{1,3}` digit grouping but splits CamelCase and keeps
+# the contraction as a word suffix, so an alias would mistokenize silently —
+# only comparing IDS against HF `tokenizers` catches that, which is what this
+# gate does.
+vllm_cpp_add_test(test_tokenizer_parity_gpt4o vllm/test_tokenizer_parity_gpt4o.cpp)
+target_compile_definitions(test_tokenizer_parity_gpt4o PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
 target_compile_definitions(test_op_parity PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

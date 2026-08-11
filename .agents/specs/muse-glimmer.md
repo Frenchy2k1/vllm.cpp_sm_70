@@ -667,10 +667,77 @@ attempt has something to disagree with, and for no other purpose.
 
 ### 11.3 What is owed
 
-1. The GPT-4o-family `SplitPattern` (§11.1, issue
-   [#347](https://github.com/mudler/vllm.cpp/issues/347)) — until it lands our
-   GGUF arm has no e2e at all, quantized users included.
-2. Re-run both CPU legs on an idle box, `-r` >= 3, threads matched, band first.
-3. The bf16 pair (HF `exportable-muse` vs ours) on an idle dgx holding
+1. ~~The GPT-4o-family `SplitPattern`~~ — LANDED, §12.
+2. **The GGUF forward** ([#359](https://github.com/mudler/vllm.cpp/issues/359),
+   §12.1): coherent generation from the k-quant, and then
+   token-exactness against llama.cpp or the bf16 arm. Until that lands the
+   quant-matched comparison #333 wants still has no numerator, for a NEW reason.
+3. Re-run both CPU legs on an idle box, `-r` >= 3, threads matched, band first.
+4. The bf16 pair (HF `exportable-muse` vs ours) on an idle dgx holding
    `${GPU_LOCK}`, one large model resident at a time.
-4. The vLLM axis stays open until vllm#51655 merges and the pin advances.
+5. The vLLM axis stays open until vllm#51655 merges and the pin advances.
+
+## 12. The GPT-4o pre-tokenizer landed, and what it uncovered (2026-08-11, `row/TOK-LLAMA4-PRE`, issue [#347](https://github.com/mudler/vllm.cpp/issues/347))
+
+§11.1's blocker is closed. `SplitPattern::kGpt4o` implements the GPT-4o / o200k
+split; `Tokenizer::FromGguf` accepts the four pre names llama.cpp maps to
+`LLAMA_VOCAB_PRE_TYPE_GPT4O` (`gpt-4o`, `llama4`, `kanana2`, `talkie`,
+llama.cpp `src/llama-vocab.cpp:2294-2299` @ `153d324bcf`).
+
+**Ported the ORIGINAL regex, not llama.cpp's transcription of it.** llama.cpp
+cannot spell `\p{Lu}`/`\p{Ll}` in its engine and approximates the two letter
+classes with `((?=[\p{L}])([^a-z]))` / `((?=[\p{L}])([^A-Z]))`, which drops
+`\p{M}` and puts every non-ASCII cased letter in both. We implement the string
+llama.cpp itself cites as authoritative (`llama-vocab.cpp:432`), which is
+byte-identical to the checkpoint's own
+`tokenizer.json` `pre_tokenizer.pretokenizers[0].pattern.Regex`. MEASURED on the
+57-entry corpus through the 16.76 GB k-quant: **ours 0 mismatches vs HF
+`tokenizers`; llama.cpp `153d324bcf` 4 mismatches** (Devanagari, Thai and
+Arabic, exactly where its approximation loses `\p{M}`).
+
+**A second, silent instance of the same bug.** `DetectPattern` in
+`tokenizer.cpp` selected `kLlama3` for ANY regex containing `\p{N}{1,3}`. The
+GPT-4o regex contains it, so `Tokenizer::FromHfJson` on Muse Glimmer's own
+`tokenizer.json` was already picking `kLlama3` — the bf16 safetensors arm has
+been mistokenizing since the model landed, with no error. Now matched exactly,
+before the heuristic.
+
+**`ignore_merges` is a non-issue for this vocab, measured not assumed.** HF sets
+it; GGUF cannot express it. Encoding 29704 distinct vocab-derived strings plus a
+320-string mixed corpus with the flag on and off gives byte-identical ids in
+every case.
+
+### 12.1 The GGUF arm still does not generate — the blocker MOVED to the forward
+
+With the tokenizer fixed the 16.76 GB k-quant runs end to end and produces
+tokens, but they are degenerate:
+
+```
+vllm-cli --model muse-glimmer-30B-kquant-17gb.gguf \
+         --prompt "The capital of France is" --max-tokens 12 --temperature 0
+  -> prompt_tokens=5   " is is is is is is is is is is is is"
+```
+
+Isolated three ways, all on this 20-core CPU-only box:
+
+* **the file is fine** — llama.cpp `153d324bcf` `llama-completion` on the SAME
+  GGUF, same prompt, `--temp 0`: `"Paris. It is the most populous city in France
+  and"`;
+* **the tokenizer is fine** — `prompt_tokens=5` is the correct GPT-4o
+  tokenization, and the corpus diff above is 0/57 against HF;
+* **the load is fine** — `test_muse_glimmer_gguf` is 12/12 with `VLLM_MUSE_GGUF`
+  (428 assertions) and 12/12 / 1064 assertions with `VLLM_MUSE_GGUF_LOAD`, i.e.
+  the whole 16.76 GB materialised;
+* **the CPU backend is fine in general** — `vllm-cli` on `opt-125m-bf16-st`,
+  same box and build: `" the capital of the French Republic."`.
+
+So the defect is in the Muse Glimmer forward over GGUF weights (numerics or
+wiring), not in the tokenizer, the loader accounting, or the backend. §10.6's
+"no forward was run on GGUF weights" is now "a forward runs and is wrong", which
+is a different and newly actionable claim. It is NOT fixed here: it gets its own
+issue rather than a silent fix folded into a tokenizer change:
+[#359](https://github.com/mudler/vllm.cpp/issues/359).
+
+**No speed axis is claimed from any run in this section.** Every number above is
+a correctness observation on a CPU-only box; the throughput cells in §11 are
+untouched.
