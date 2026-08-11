@@ -2,14 +2,21 @@
 """Generate src/vllm/tokenizer/unicode_data.cpp + include/vllm/tokenizer/unicode_data.h.
 
 Emits merged (start, end, cat) codepoint ranges for Unicode general-category
-lookup plus a whitespace table with python str.isspace() semantics, both
-binary-searched at runtime. Category mapping (major class of
-unicodedata.category):
+lookup, a letter-SUBcategory table, and a whitespace table with python
+str.isspace() semantics, all binary-searched at runtime. Category mapping
+(major class of unicodedata.category):
 
     L* -> kLetter, N* -> kNumber, Z* -> kSeparator, M* -> kMark,
     P* -> kPunct,  S* -> kSymbol, C* -> kControl,
     except Cn (unassigned) which is omitted from the table so lookup misses
     fall through to kOther.
+
+The letter-subcategory table splits L* three ways (Ll | Lu+Lt | Lm+Lo). It
+exists because the GPT-4o / o200k split regex is the only pretokenizer pattern
+we implement that names the MINOR letter categories rather than \\p{L}:
+    [\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]  and  [\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]
+Lu and Lt always occur together in that regex, as do Lm and Lo, so three
+classes are enough and the table stays small.
 
 Whitespace is enumerated directly with str.isspace() over every codepoint
 (covers 0x85/0xA0 and friends exactly as Python does) rather than hand-listed.
@@ -64,6 +71,32 @@ def build_category_ranges() -> list[tuple[int, int, int]]:
     return ranges
 
 
+# Must match the ULetterSub enum in the generated header.
+LETTER_SUB_NAMES = [
+    "kNotLetter",  # 0 (omitted from the table: lookup miss)
+    "kLl",         # 1
+    "kLuLt",       # 2
+    "kLmLo",       # 3
+]
+GC_TO_LETTER_SUB = {"Ll": 1, "Lu": 2, "Lt": 2, "Lm": 3, "Lo": 3}
+
+
+def letter_sub_index(cp: int) -> int:
+    return GC_TO_LETTER_SUB.get(unicodedata.category(chr(cp)), 0)
+
+
+def build_letter_sub_ranges() -> list[tuple[int, int, int]]:
+    ranges: list[tuple[int, int, int]] = []
+    run_start, run_sub = None, 0
+    for cp in range(MAX_CP + 1):  # +1 sentinel iteration flushes the last run
+        sub = letter_sub_index(cp) if cp < MAX_CP else -1
+        if sub != run_sub:
+            if run_sub != 0 and run_start is not None:
+                ranges.append((run_start, cp - 1, run_sub))
+            run_start, run_sub = cp, sub
+    return ranges
+
+
 def build_whitespace_ranges() -> list[tuple[int, int]]:
     cps = [cp for cp in range(MAX_CP) if chr(cp).isspace()]
     ranges: list[tuple[int, int]] = []
@@ -75,13 +108,13 @@ def build_whitespace_ranges() -> list[tuple[int, int]]:
     return ranges
 
 
-def banner(what: str, n_cat: int, n_ws: int) -> str:
+def banner(what: str, n_cat: int, n_ws: int, n_sub: int) -> str:
     return f"""\
 // GENERATED FILE — do not edit by hand.  ({what})
 // Generator:  tools/gen_unicode_data.py
 // Regenerate: python3 tools/gen_unicode_data.py
 // Unicode data version (Python unicodedata.unidata_version): {unicodedata.unidata_version}
-// Category ranges: {n_cat}; whitespace ranges: {n_ws}.
+// Category ranges: {n_cat}; whitespace ranges: {n_ws}; letter-sub ranges: {n_sub}.
 // Semantics mirror HF tokenizers byte-level BPE: categories are the major
 // Unicode general-category classes (unassigned -> kOther); IsWhitespace is
 // python str.isspace().
@@ -111,6 +144,21 @@ enum class UCat : uint8_t {
 };
 
 UCat Category(uint32_t cp);
+
+// MINOR letter class. Category(cp) == UCat::kLetter is exactly
+// LetterSub(cp) != ULetterSub::kNotLetter; this splits that set three ways.
+// Needed only by the GPT-4o / o200k split regex, whose two letter classes are
+//   A = [\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]   (kLuLt, kLmLo, plus UCat::kMark)
+//   B = [\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]          (kLl,   kLmLo, plus UCat::kMark)
+// Lu/Lt and Lm/Lo are never separated by that regex, hence three classes.
+enum class ULetterSub : uint8_t {
+  kNotLetter = 0,
+  kLl = 1,    // \\p{Ll}
+  kLuLt = 2,  // \\p{Lu} | \\p{Lt}
+  kLmLo = 3,  // \\p{Lm} | \\p{Lo}
+};
+
+ULetterSub LetterSub(uint32_t cp);
 
 // python str.isspace() semantics (per HF byte-level pretokenization):
 // includes 0x1C-0x1F, NEL (0x85) and NBSP (0xA0); excludes ZWSP (0x200B),
@@ -150,6 +198,12 @@ struct WsRange {
   uint32_t start;
   uint32_t end;  // inclusive
 };
+
+struct LetterSubRange {
+  uint32_t start;
+  uint32_t end;  // inclusive
+  uint8_t sub;   // static_cast<uint8_t>(ULetterSub)
+};
 """
 
 SOURCE_EPILOGUE = """\
@@ -165,6 +219,18 @@ UCat Category(uint32_t cp) {
   --it;
   if (cp <= it->end) return static_cast<UCat>(it->cat);
   return UCat::kOther;
+}
+
+ULetterSub LetterSub(uint32_t cp) {
+  const LetterSubRange* first = std::begin(kLetterSubRanges);
+  const LetterSubRange* last = std::end(kLetterSubRanges);
+  const LetterSubRange* it = std::upper_bound(
+      first, last, cp,
+      [](uint32_t v, const LetterSubRange& r) { return v < r.start; });
+  if (it == first) return ULetterSub::kNotLetter;
+  --it;
+  if (cp <= it->end) return static_cast<ULetterSub>(it->sub);
+  return ULetterSub::kNotLetter;
 }
 
 bool IsWhitespace(uint32_t cp) {
@@ -258,16 +324,25 @@ def format_rows(rows: list[str], per_line: int) -> str:
 def main() -> int:
     cat_ranges = build_category_ranges()
     ws_ranges = build_whitespace_ranges()
+    sub_ranges = build_letter_sub_ranges()
 
-    header = banner("declarations", len(cat_ranges), len(ws_ranges)) + HEADER_BODY
+    header = (
+        banner("declarations", len(cat_ranges), len(ws_ranges), len(sub_ranges))
+        + HEADER_BODY
+    )
 
     cat_rows = [f"{{0x{s:X}, 0x{e:X}, {c}}}," for s, e, c in cat_ranges]
     ws_rows = [f"{{0x{s:X}, 0x{e:X}}}," for s, e in ws_ranges]
+    sub_rows = [f"{{0x{s:X}, 0x{e:X}, {c}}}," for s, e, c in sub_ranges]
     legend = "  // cat legend: " + " ".join(
         f"{i}={n}" for i, n in enumerate(CAT_NAMES) if i != 0
     )
+    sub_legend = "  // letter-sub legend: " + " ".join(
+        f"{i}={n}" for i, n in enumerate(LETTER_SUB_NAMES) if i != 0
+    )
     source = (
-        banner("tables + utf8 helpers", len(cat_ranges), len(ws_ranges))
+        banner("tables + utf8 helpers", len(cat_ranges), len(ws_ranges),
+               len(sub_ranges))
         + SOURCE_PROLOGUE
         + "\n"
         + legend
@@ -277,6 +352,11 @@ def main() -> int:
         + "\n};\n\n"
         + f"constexpr WsRange kWhitespaceRanges[{len(ws_ranges)}] = {{\n"
         + format_rows(ws_rows, 6)
+        + "\n};\n\n"
+        + sub_legend
+        + "\n"
+        + f"constexpr LetterSubRange kLetterSubRanges[{len(sub_ranges)}] = {{\n"
+        + format_rows(sub_rows, 4)
         + "\n};\n\n"
         + SOURCE_EPILOGUE
     )
@@ -289,7 +369,8 @@ def main() -> int:
         f"wrote {HEADER_PATH.relative_to(REPO_ROOT)} and "
         f"{SOURCE_PATH.relative_to(REPO_ROOT)}: "
         f"{len(cat_ranges)} category ranges, {len(ws_ranges)} whitespace "
-        f"ranges, unidata {unicodedata.unidata_version}"
+        f"ranges, {len(sub_ranges)} letter-sub ranges, "
+        f"unidata {unicodedata.unidata_version}"
     )
     return 0
 

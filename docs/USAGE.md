@@ -128,6 +128,10 @@ Two more example binaries ship alongside it:
   `--max-num-batched-tokens`, and `--num-blocks`.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
+  GGUF `tokenizer.ggml.pre` names accepted: `qwen35`, `qwen2`, `llama-bpe`,
+  `gpt-4o` / `llama4` / `kanana2` / `talkie` (the GPT-4o / o200k family),
+  `joyai-llm`, `deepseek-llm`, `deepseek-v3`, `laguna`. Any other name is
+  refused by name rather than aliased onto a near-miss regex.
 
 ### How much memory a Vulkan load needs
 
@@ -606,8 +610,14 @@ attention output gate, `down_proj` and the merged `gate_up` stay quantized, whil
 the merged QKV, `lm_head` and the embedding table expand to bf16 because the
 shared forward consumes them in a form a block encoding cannot take.
 
-Two caveats, both properties of the published files rather than of this loader:
+Three caveats:
 
+- **The k-quant does not generate coherent text yet** ([#359](https://github.com/mudler/vllm.cpp/issues/359)).
+  It loads, tokenizes correctly and runs a forward, but emits degenerate output
+  (`" is is is ..."`) where llama.cpp on the same file does not. The GGUF
+  tokenizer gap that used to stop it before the forward
+  ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
+  GPT-4o / o200k family) is fixed.
 - **Image and video need the bf16 safetensors.** The released
   `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
   axis, so half the weight is not in the file; loading it is refused by name.

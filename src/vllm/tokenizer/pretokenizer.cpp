@@ -139,12 +139,15 @@ size_t MatchNumbers(std::string_view t, size_t pos, int max_digits) {
   return count > 0 ? p : 0;
 }
 
-// Rule 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` (Qwen3.6; marks_excluded=true)
-//         ` ?[^\s\p{L}\p{N}]+[\r\n]*`      (Llama-3; marks_excluded=false)
+// Rule 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`  (Qwen3.6; marks_excluded=true)
+//         ` ?[^\s\p{L}\p{N}]+[\r\n]*`       (Llama-3; marks_excluded=false)
+//         ` ?[^\s\p{L}\p{N}]+[\r\n/]*`      (GPT-4o; slash_in_tail=true)
 // Optional single literal ASCII space, then >=1 codepoints that are not
 // regex-space/letters/numbers (nor marks, for Qwen), then any trailing \r/\n
-// bytes. If only the space matched, the rule fails as a whole.
-size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded) {
+// bytes (and `/` too, for GPT-4o). If only the space matched, the rule fails
+// as a whole.
+size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded,
+                     bool slash_in_tail) {
   size_t p = pos;
   if (t[p] == ' ') ++p;
   const size_t run_begin = p;
@@ -159,7 +162,10 @@ size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded) {
     p = c.end;
   }
   if (p == run_begin) return 0;
-  while (p < t.size() && IsNewlineByte(t[p])) ++p;
+  while (p < t.size() &&
+         (IsNewlineByte(t[p]) || (slash_in_tail && t[p] == '/'))) {
+    ++p;
+  }
   return p;
 }
 
@@ -210,6 +216,189 @@ size_t MatchWs(std::string_view t, size_t pos) {
     p = c.end;
   }
   return p > pos ? p : 0;
+}
+
+// ---------------------------------------------------------------------------
+// GPT-4o / o200k rules (llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O; GGUF pre names
+// "gpt-4o", "llama4", "kanana2", "talkie" — llama.cpp/src/llama-vocab.cpp:
+// 2294-2299 @ 153d324bcf).
+//
+// The pattern is transcribed VERBATIM from the checkpoint that forced it in,
+// /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json (read 2026-08-11),
+// pre_tokenizer.pretokenizers[0].pattern.Regex, behavior=Isolated. It is the
+// same string llama.cpp records as "original regex from tokenizer.json" above
+// its own GPT4O entry (llama.cpp/src/llama-vocab.cpp:432 @ 153d324bcf):
+//
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//  |\p{N}{1,3}
+//  | ?[^\s\p{L}\p{N}]+[\r\n/]*
+//  |\s*[\r\n]+
+//  |\s+(?!\S)
+//  |\s+
+//
+// WHY THE ORIGINAL AND NOT llama.cpp's TRANSCRIPTION (llama-vocab.cpp:433):
+// llama.cpp cannot spell the minor letter categories in its regex engine, so
+// it approximates [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] as `((?=[\p{L}])([^a-z]))`
+// and [\p{Ll}\p{Lm}\p{Lo}\p{M}] as `((?=[\p{L}])([^A-Z]))` — "a letter that is
+// not an ASCII lowercase/uppercase char". Those classes are NOT the same sets:
+// they drop \p{M} entirely and they put every non-ASCII cased letter in BOTH.
+// Verified divergences against the HF tokenizers oracle on this checkpoint's
+// own regex (tools/gen_pretok_goldens.py engine):
+//     "éÉ"  (U+00E9 U+00C9)  original ["é","É"]  llama.cpp ["éÉ"]
+//     "éX" (e U+0301 X)      original ["é","X"]    llama.cpp ["e","́X"]
+// The BPE merges were trained under the ORIGINAL regex, so the original is
+// what reproduces the checkpoint's token ids; llama.cpp's approximation is a
+// regex-engine limitation, not the reference behavior. We therefore port the
+// pattern llama.cpp itself cites as authoritative and record the difference
+// here rather than reproducing its approximation error.
+//
+// Structurally this is NOT kLlama3 with different digits. Three differences,
+// each of which changes token ids on ordinary text:
+//   1. ONE letter alternative becomes TWO, over the minor categories:
+//        A = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]   B = [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+//      alternative 1 is `A* B+`, alternative 2 is `A+ B*`. Together they split
+//      a CamelCase word at each lower->upper boundary ("HTMLParser" stays
+//      whole, but "abcDEF" -> ["abc","DEF"]), which \p{L}+ never does.
+//   2. The contraction is a SUFFIX of the word alternatives, not a leading
+//      alternative of its own. "don't" is ONE piece here; kLlama3 gives
+//      ["don","'t"].
+//   3. The punctuation run absorbs a trailing `/` as well as \r/\n.
+//
+// The scanner below is a direct transcription of onig's leftmost-first
+// backtracking for those two alternatives (greedy `?`, `*` and `+`, first
+// success wins), not a re-derivation: every expectation in
+// tests/vllm/test_pretokenizer.cpp and every row of the golden table was
+// produced by running this exact regex through HF tokenizers.
+
+// `A = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and `B = [\p{Ll}\p{Lm}\p{Lo}\p{M}]`.
+// Lm, Lo and M are in BOTH; only Lu/Lt and Ll separate them.
+bool InGpt4oClassA(uint32_t cp) {
+  const ULetterSub sub = LetterSub(cp);
+  return sub == ULetterSub::kLuLt || sub == ULetterSub::kLmLo ||
+         Category(cp) == UCat::kMark;
+}
+
+bool InGpt4oClassB(uint32_t cp) {
+  const ULetterSub sub = LetterSub(cp);
+  return sub == ULetterSub::kLl || sub == ULetterSub::kLmLo ||
+         Category(cp) == UCat::kMark;
+}
+
+// `[^\r\n\p{L}\p{N}]?` — one optional codepoint that is neither a newline nor
+// a letter nor a number. Returns the offset past it, or 0 if it cannot match.
+// NOTE a combining mark passes this class AND is in A and B, which is exactly
+// why the alternatives below have to be backtracked rather than scanned once.
+size_t MatchGpt4oWordPrefix(std::string_view t, size_t pos) {
+  const Cp c = DecodeAt(t, pos);
+  if (c.cp == U'\r' || c.cp == U'\n') return 0;
+  const UCat cat = Category(c.cp);
+  if (cat == UCat::kLetter || cat == UCat::kNumber) return 0;
+  return c.end;
+}
+
+// The shared `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` tail. Greedy and last in the
+// alternative, so it never backtracks.
+size_t ApplyGpt4oContractionSuffix(std::string_view t, size_t end) {
+  if (end >= t.size()) return end;
+  const size_t c = MatchContraction(t, end);
+  return c == 0 ? end : c;
+}
+
+// Alternative 1: `[^\r\n\p{L}\p{N}]? A* B+ (?i:...)?`
+//
+// onig tries the optional prefix present-first, then greedy `A*`, then `B+`
+// which needs at least one codepoint. When `B+` fails at the end of the A run,
+// `A*` gives codepoints back one at a time — so the B run starts at the LAST
+// position in [run start, run end] whose codepoint is in B. If there is none,
+// the whole alternative retries without the prefix, then fails.
+size_t MatchGpt4oWordLower(std::string_view t, size_t pos) {
+  for (int with_prefix = 1; with_prefix >= 0; --with_prefix) {
+    size_t q = pos;
+    if (with_prefix != 0) {
+      const size_t pe = MatchGpt4oWordPrefix(t, pos);
+      if (pe == 0 || pe >= t.size()) continue;
+      q = pe;
+    }
+    // Greedy `A*`, remembering the last A codepoint that is also in B (that is
+    // the backtrack target, since A \ B codepoints can never start `B+`).
+    size_t p = q;
+    size_t last_a_in_b = std::string_view::npos;
+    while (p < t.size()) {
+      const Cp c = DecodeAt(t, p);
+      if (!InGpt4oClassA(c.cp)) break;
+      if (InGpt4oClassB(c.cp)) last_a_in_b = p;
+      p = c.end;
+    }
+    size_t b_begin;
+    if (p < t.size() && InGpt4oClassB(DecodeAt(t, p).cp)) {
+      b_begin = p;  // `A*` kept the whole run; `B+` starts right after it
+    } else if (last_a_in_b != std::string_view::npos) {
+      b_begin = last_a_in_b;  // `A*` backtracked to the last B-capable cp
+    } else {
+      continue;  // `B+` cannot match under this prefix choice
+    }
+    size_t e = b_begin;
+    while (e < t.size()) {
+      const Cp c = DecodeAt(t, e);
+      if (!InGpt4oClassB(c.cp)) break;
+      e = c.end;
+    }
+    return ApplyGpt4oContractionSuffix(t, e);
+  }
+  return 0;
+}
+
+// Alternative 2: `[^\r\n\p{L}\p{N}]? A+ B* (?i:...)?`
+// `B*` and the contraction can both match empty, so greedy `A+` never has to
+// give anything back; only the optional prefix is retried.
+size_t MatchGpt4oWordUpper(std::string_view t, size_t pos) {
+  for (int with_prefix = 1; with_prefix >= 0; --with_prefix) {
+    size_t q = pos;
+    if (with_prefix != 0) {
+      const size_t pe = MatchGpt4oWordPrefix(t, pos);
+      if (pe == 0 || pe >= t.size()) continue;
+      q = pe;
+    }
+    size_t p = q;
+    while (p < t.size()) {
+      const Cp c = DecodeAt(t, p);
+      if (!InGpt4oClassA(c.cp)) break;
+      p = c.end;
+    }
+    if (p == q) continue;  // `A+` needs at least one codepoint
+    size_t e = p;
+    while (e < t.size()) {
+      const Cp c = DecodeAt(t, e);
+      if (!InGpt4oClassB(c.cp)) break;
+      e = c.end;
+    }
+    return ApplyGpt4oContractionSuffix(t, e);
+  }
+  return 0;
+}
+
+std::vector<std::pair<size_t, size_t>> PretokenizeGpt4o(std::string_view text) {
+  std::vector<std::pair<size_t, size_t>> spans;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = MatchGpt4oWordLower(text, pos);
+    if (end == 0) end = MatchGpt4oWordUpper(text, pos);
+    if (end == 0) end = MatchNumbers(text, pos, /*max_digits=*/3);
+    if (end == 0) {
+      end = MatchPunctRun(text, pos, /*marks_excluded=*/false,
+                          /*slash_in_tail=*/true);
+    }
+    if (end == 0) end = MatchWsNewlines(text, pos);
+    if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
+    if (end == 0) end = MatchWs(text, pos);
+    // Unreachable (the rules cover every codepoint class), but guarantee
+    // forward progress rather than looping if the tables ever change.
+    if (end == 0) end = DecodeAt(text, pos).end;
+    spans.emplace_back(pos, end);
+    pos = end;
+  }
+  return spans;
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +701,9 @@ std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
   // GPT-2's alternation differs in four of six rules, so it runs its own
   // scanner rather than threading more flags through the Qwen/Llama-3 one.
   if (pattern == SplitPattern::kGpt2) return PretokenizeGpt2(text);
+  // GPT-4o splits its letter rule into two minor-category alternatives with
+  // real backtracking between them (see above), so it too gets its own pass.
+  if (pattern == SplitPattern::kGpt4o) return PretokenizeGpt4o(text);
   // \p{M} awareness (letter runs absorb marks; punct runs exclude them) is
   // UNIQUE to the Qwen3.6 regex. Classic Qwen2/Qwen3 and Llama-3 both treat
   // marks like ordinary punct-run codepoints. Number grouping is single-digit
@@ -524,7 +716,10 @@ std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
     size_t end = MatchContraction(text, pos);
     if (end == 0) end = MatchLetterRun(text, pos, /*marks_in_run=*/marks_aware);
     if (end == 0) end = MatchNumbers(text, pos, max_digits);
-    if (end == 0) end = MatchPunctRun(text, pos, /*marks_excluded=*/marks_aware);
+    if (end == 0) {
+      end = MatchPunctRun(text, pos, /*marks_excluded=*/marks_aware,
+                          /*slash_in_tail=*/false);
+    }
     if (end == 0) end = MatchWsNewlines(text, pos);
     if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
     if (end == 0) end = MatchWs(text, pos);

@@ -27,6 +27,16 @@ enum class SplitPattern {
             // case-SENSITIVE contractions, a plain ` ?` space prefix instead of
             // the `[^\r\n\p{L}\p{N}]?` prefix, UNBOUNDED `\p{N}+` digit runs,
             // no `[\r\n]*` punct tail and no `\s*[\r\n]+` rule at all.
+  kGpt4o,   // GPT-4o / o200k family (llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O:
+            // pre names "gpt-4o", "llama4", "kanana2", "talkie"). NOT a
+            // variant of kLlama3 despite sharing its \p{N}{1,3} digit
+            // grouping: the single letter-run alternative is replaced by TWO
+            // alternatives over the MINOR letter categories
+            // ([\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] then [\p{Ll}\p{Lm}\p{Lo}\p{M}],
+            // and the mirror image), the contraction is a SUFFIX of the word
+            // rather than its own leading alternative, and the punctuation run
+            // absorbs a trailing `/` as well as \r and \n. See
+            // src/vllm/tokenizer/pretokenizer.cpp for the verbatim pattern.
   kDeepSeek,  // DeepSeek family (DeepSeek-V2/V2-Lite/V3). STRUCTURALLY UNLIKE
               // every pattern above: not ONE alternation regex but a HF
               // `Sequence` PIPELINE of seven pre-tokenizers, each further
