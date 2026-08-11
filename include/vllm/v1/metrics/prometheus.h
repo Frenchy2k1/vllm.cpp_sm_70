@@ -21,6 +21,7 @@
 #ifndef VLLM_V1_METRICS_PROMETHEUS_H_
 #define VLLM_V1_METRICS_PROMETHEUS_H_
 
+#include <deque>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -91,14 +92,21 @@ class PromRegistry {
     MetricType type = MetricType::kCounter;
     std::vector<std::string> labelnames;
     std::vector<double> buckets;  // histogram upper bounds (ascending)
-    std::vector<Series> series;   // insertion-ordered
+    // #330: a DEQUE, not a vector. `SeriesFor` hands out `Series&` and
+    // `Find`/`Register*` hand out `Family*`, and callers hold them across later
+    // registrations. vector::push_back reallocates and invalidates every one of
+    // those, which is the use-after-free TSan reported as a data race inside
+    // `operator delete` at prometheus.cpp:134. deque::push_back never
+    // invalidates references to existing elements, and it keeps the documented
+    // insertion order. Same reason for `families_` below.
+    std::deque<Series> series;   // insertion-ordered; refs must stay stable
   };
 
   Family* Find(const std::string& name);
   const Family* Find(const std::string& name) const;
   Series& SeriesFor(Family& fam, const std::vector<std::string>& labelvalues);
 
-  std::vector<Family> families_;
+  std::deque<Family> families_;  // see the note on Family::series
 };
 
 }  // namespace vllm::v1::metrics

@@ -1024,6 +1024,35 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     by a maintainer. `ACTIVE` means a gated skeleton here, not a supported
     backend — same caveat Metal/Vulkan's own `ACTIVE` status carries.**
 
+16. **Off-pin upstream anchor: Muse Glimmer is ported from an UNMERGED vLLM PR
+    (2026-08-10, `MODEL-MUSE-GLIMMER`, issue
+    [#268](https://github.com/mudler/vllm.cpp/issues/268)).** Meta released
+    Muse Glimmer on 2026-08-08, well after the parity pin `555967922`
+    (2026-07-26). There is no `muse_glimmer` code at the pin — `grep -ril
+    'muse\|glimmer' vllm/model_executor/models/` at the pin returns nothing —
+    and none on vLLM `main` either. The ONLY upstream implementation is
+    [vllm#51655](https://github.com/vllm-project/vllm/pull/51655), OPEN and
+    approved but unmerged, with 3 of 20 CI checks red, at head `075d645af`
+    (a descendant of the pin). Every `file:line` this row cites therefore points
+    at a **branch head, not the pin** — a deliberate exception to "port from the
+    pinned oracle", taken on explicit developer direction (2026-08-10). It is
+    recorded here, and argued for in the commit that introduced it, because no
+    checker enforces the anchor rule and the waiver registry has since been
+    retired (`a4f72f86`): an exception now lives in the commit message that
+    needs it, attached to the diff it excuses. Consequences, all binding while this stands:
+    (a) the anchor is mutable — a force-push or review round on #51655 rewrites
+    what we cite, so the fetched ref is kept and re-diffed before every
+    re-anchor; (b) upstream's own gates have NOT fully passed, so where our
+    HF-reference gate disagrees with #51655 the HF reference wins and the
+    divergence is reported upstream rather than mirrored; (c) **no speed axis is
+    claimable for this model** — the pinned oracle cannot load `muse_glimmer`
+    at all (and the checkpoint wants transformers 5.15.0.dev0 vs the pin's
+    5.14.1), so there is no honest denominator and every performance axis is an
+    OPEN GAP by construction, not a waived one. The exception is discharged by
+    #51655 merging plus a pin advance that includes it; until then the row
+    carries this deviation. Scope and gates: [muse-glimmer
+    spec](specs/muse-glimmer.md) §0.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

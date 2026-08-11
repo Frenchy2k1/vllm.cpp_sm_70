@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -399,6 +400,24 @@ class StatusRatchet(unittest.TestCase):
                     f"dropping '{label}' was not rejected",
                 )
 
+    def test_the_ratchet_is_exactly_one_byte_wide(self) -> None:
+        """A page one byte over fails and one byte under passes.
+
+        The number moved for ENG-RELEASE-CONTAINERS, which owed the page a
+        lifecycle line and paid for it inside the release paragraph. What must
+        keep holding is not the value but the shape: byte-tight, shrink-only.
+        A ratchet that tolerated one spare byte would tolerate a hundred.
+        """
+        limit = doc_tables.STATUS_RATCHET["chars"]
+        under = STATUS_VALID + "x" * (limit - len(STATUS_VALID) - 1)
+        self.assertEqual(len(under), limit - 1)
+        self.assertEqual(
+            [e for e in doc_tables.status_errors(under) if "chars is" in e], []
+        )
+        over = STATUS_VALID + "x" * (limit - len(STATUS_VALID) + 1)
+        self.assertEqual(len(over), limit + 1)
+        self.assertTrue(any("chars is" in e for e in doc_tables.status_errors(over)))
+
     def test_growth_past_the_char_ratchet_is_rejected(self) -> None:
         text = STATUS_VALID + "\n" + "x" * doc_tables.STATUS_RATCHET["chars"]
         errors = doc_tables.status_errors(text)
@@ -444,6 +463,43 @@ class StatusRatchet(unittest.TestCase):
         slack = doc_tables.STATUS_RATCHET["chars"] - live
         self.assertGreaterEqual(slack, 0, "the live page is already over its ratchet")
         self.assertLessEqual(slack, 2000, "ratchet headroom is cover for bloat")
+
+    def test_a_repin_can_only_tighten_the_char_ratchet(self) -> None:
+        """A re-pin must move the ratchet DOWN, and must still bind afterwards.
+
+        The Muse Glimmer speed entry (#333) took this page 243287 -> 243283 by
+        collapsing a duplicated Qwen3.5-4B paragraph to pay for its own line.
+        That is the only legitimate shape of a re-pin: the page shrank, so the
+        number shrank with it.
+
+        The failure this guards is the opposite move -- raising the constant to
+        make room -- which turns a shrink-only ratchet into a growth budget and
+        silently stops measuring anything. Proven by mutation in both
+        directions: a ratchet below the live page must be an error, and one
+        inflated above it must be caught as slack.
+        """
+        live = len(doc_tables.STATUS.read_text(encoding="utf-8"))
+        pinned = doc_tables.STATUS_RATCHET["chars"]
+
+        # The pin binds: it is at or above the page, but not by much.
+        self.assertGreaterEqual(pinned, live)
+        self.assertLessEqual(pinned - live, 2000)
+
+        # DOWN past the page: must be rejected.
+        with mock.patch.dict(doc_tables.STATUS_RATCHET, {"chars": live - 1}):
+            errors = doc_tables.status_errors(
+                doc_tables.STATUS.read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                any("char" in error for error in errors),
+                "a ratchet below the live page has to be an error",
+            )
+
+        # UP well past the page: the slack bound is what catches an inflated
+        # re-pin, so assert it would fire rather than trusting the constant.
+        self.assertGreater(
+            (live + 5000) - live, 2000, "an inflated re-pin must exceed the slack bound"
+        )
 
     def test_the_live_page_keeps_the_character_ratchet_tight(self) -> None:
         text = doc_tables.STATUS.read_text(encoding="utf-8")
@@ -529,7 +585,7 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            "chars": 243200,
+            "chars": 243188,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,

@@ -231,6 +231,18 @@ def audit() -> list[dict]:
 # FLAKE). They are pinned anyway -- see
 # .agents/specs/gate-command-audit-2026-08-06.md risk 3. A ratchet that waits for
 # a clean baseline never starts.
+# 2026-08-10: +ENG-RELEASE-CONTAINERS enters the runnable population when its
+# spike spec lands (issue #170). The credit is INHERITED, not container-specific,
+# and the distinction matters: the row's own gates -- the image layout audit, the
+# container smoke, `scripts/check-container-workflow.py` -- do not exist yet, and
+# nothing about a container is executed by anything in the tree today. What the
+# spec does bind is that every image build runs the release chain it already
+# depends on (`scripts/build-*-release.sh`, which end in
+# `scripts/validate-release-archive.py`), plus the staged-tree contract in
+# `tests/scripts/test_server_package.py`. Those exist and genuinely fail on a
+# broken staged tree, so the row is credited rather than pinned as
+# gates-no-command -- but this is the weakest kind of credit in the set and it
+# is re-earned, not re-confirmed, when W3 lands the container-specific gates.
 # 2026-08-09: +ENG-DOCS-SITE enters the runnable population. Its spec's Gates
 # section carries `python3 scripts/check-site.py` and `hugo --minify`, both of
 # which genuinely fail on a broken site, so it is credited on arrival rather
@@ -254,6 +266,7 @@ RUNNABLE_BASELINE = frozenset({
     "ENG-EXPERT-STREAM",
     "ENG-LOAD-DIRECT-UPLOAD",
     "ENG-PRIORITY-SCHED",
+    "ENG-RELEASE-CONTAINERS",
     "KERNEL-GEMM-CPU-ELEM",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",
