@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -25,33 +27,79 @@ struct WindowsHandlerState {
   std::atomic<bool> pending{false};
   HANDLE stop_event = nullptr;
   HANDLE quit_event = nullptr;
-  HANDLE drained_event = nullptr;
   HANDLE before_drain_test_event = nullptr;
+
+  ~WindowsHandlerState() {
+    if (quit_event != nullptr) CloseHandle(quit_event);
+    if (stop_event != nullptr) CloseHandle(stop_event);
+  }
 };
 
-std::atomic<WindowsHandlerState*> g_handler_state{nullptr};
-std::atomic<unsigned> g_handler_acquisitions{0};
+struct WindowsHandlerRegistry {
+  std::atomic<WindowsHandlerState*> published{nullptr};
+  std::atomic<unsigned> entrants{0};
+};
+
+WindowsHandlerRegistry& HandlerRegistry() {
+  // The OS may enter ConsoleControlHandler on a system-created thread until
+  // unregistration completes. Keep the publication/hazard counters alive for
+  // the process lifetime so the handler never dereferences ConsoleShutdown.
+  static auto* registry = new WindowsHandlerRegistry();
+  return *registry;
+}
+
+constexpr DWORD kHandlerDrainTimeoutMs = 5000;
+
+bool DrainEntrantsWithTimeout(std::atomic<unsigned>& entrants) {
+  const ULONGLONG deadline = GetTickCount64() + kHandlerDrainTimeoutMs;
+  while (entrants.load(std::memory_order_seq_cst) != 0) {
+    if (GetTickCount64() >= deadline) return false;
+    SwitchToThread();
+  }
+  return true;
+}
+
+bool DrainInFlightWithTimeout(std::atomic<unsigned>& in_flight) {
+  const ULONGLONG deadline = GetTickCount64() + kHandlerDrainTimeoutMs;
+  while (in_flight.load(std::memory_order_seq_cst) != 0) {
+    if (GetTickCount64() >= deadline) return false;
+    SwitchToThread();
+  }
+  return true;
+}
+
+void RetireHandlerState(std::unique_ptr<WindowsHandlerState> state) {
+  // A timed-out handler must retain its event handles. Intentionally keep the
+  // rare state until process termination instead of risking a use-after-close.
+  static auto* mutex = new std::mutex();
+  static auto* retired = new std::vector<std::unique_ptr<WindowsHandlerState>>();
+  std::lock_guard<std::mutex> lock(*mutex);
+  retired->push_back(std::move(state));
+}
 
 bool DispatchControlEvent(DWORD event, HANDLE acquired_event = nullptr,
                           HANDLE resume_event = nullptr) {
   if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return false;
-  g_handler_acquisitions.fetch_add(1, std::memory_order_acq_rel);
+  WindowsHandlerRegistry& registry = HandlerRegistry();
+  registry.entrants.fetch_add(1, std::memory_order_seq_cst);
   WindowsHandlerState* state =
-      g_handler_state.load(std::memory_order_acquire);
+      registry.published.load(std::memory_order_seq_cst);
   if (state != nullptr) {
-    state->in_flight.fetch_add(1, std::memory_order_acq_rel);
+    state->in_flight.fetch_add(1, std::memory_order_seq_cst);
   }
-  g_handler_acquisitions.fetch_sub(1, std::memory_order_acq_rel);
+  registry.entrants.fetch_sub(1, std::memory_order_seq_cst);
   if (state == nullptr) return false;
 
   if (acquired_event != nullptr) SetEvent(acquired_event);
-  if (resume_event != nullptr) WaitForSingleObject(resume_event, INFINITE);
-  state->pending.store(true, std::memory_order_release);
-  SetEvent(state->stop_event);
-  if (state->in_flight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-    SetEvent(state->drained_event);
+  const bool resumed =
+      resume_event == nullptr ||
+      WaitForSingleObject(resume_event, kHandlerDrainTimeoutMs) == WAIT_OBJECT_0;
+  if (resumed) {
+    state->pending.store(true, std::memory_order_release);
+    SetEvent(state->stop_event);
   }
-  return true;
+  state->in_flight.fetch_sub(1, std::memory_order_seq_cst);
+  return resumed;
 }
 }  // namespace
 #endif
@@ -63,9 +111,7 @@ class ConsoleShutdown::Impl {
     win_state_ = std::make_unique<WindowsHandlerState>();
     win_state_->stop_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     win_state_->quit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    win_state_->drained_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (win_state_->stop_event == nullptr || win_state_->quit_event == nullptr ||
-        win_state_->drained_event == nullptr) {
+    if (win_state_->stop_event == nullptr || win_state_->quit_event == nullptr) {
       throw std::runtime_error("server: could not create console shutdown events");
     }
     worker_ = std::thread([this] {
@@ -127,11 +173,12 @@ ConsoleShutdown::ConsoleShutdown(std::function<void()> stop,
   if (!install_handlers) return;
 #if defined(_WIN32)
   WindowsHandlerState* expected = nullptr;
-  if (!g_handler_state.compare_exchange_strong(expected, impl_->win_state_.get(),
-                                                std::memory_order_acq_rel) ||
+  WindowsHandlerRegistry& registry = HandlerRegistry();
+  if (!registry.published.compare_exchange_strong(
+          expected, impl_->win_state_.get(), std::memory_order_seq_cst) ||
       !SetConsoleCtrlHandler(ConsoleControlHandler, TRUE)) {
     if (expected == nullptr) {
-      g_handler_state.store(nullptr, std::memory_order_release);
+      registry.published.store(nullptr, std::memory_order_seq_cst);
     }
     std::cerr << "server: could not install console control handler; shutdown "
                  "will not be graceful\n";
@@ -175,26 +222,28 @@ ConsoleShutdown::ConsoleShutdown(std::function<void()> stop,
 
 ConsoleShutdown::~ConsoleShutdown() {
 #if defined(_WIN32)
+  bool safe_to_close = true;
   if (impl_->armed_) {
     SetConsoleCtrlHandler(ConsoleControlHandler, FALSE);
-    WindowsHandlerState* expected = impl_->win_state_.get();
-    g_handler_state.compare_exchange_strong(expected, nullptr,
-                                             std::memory_order_acq_rel);
-    while (g_handler_acquisitions.load(std::memory_order_acquire) != 0) {
-      SwitchToThread();
-    }
+    WindowsHandlerRegistry& registry = HandlerRegistry();
+    registry.published.store(nullptr, std::memory_order_seq_cst);
+    safe_to_close = DrainEntrantsWithTimeout(registry.entrants);
     if (impl_->win_state_->before_drain_test_event != nullptr) {
       SetEvent(impl_->win_state_->before_drain_test_event);
     }
-    while (impl_->win_state_->in_flight.load(std::memory_order_acquire) != 0) {
-      WaitForSingleObject(impl_->win_state_->drained_event, INFINITE);
+    if (safe_to_close) {
+      safe_to_close =
+          DrainInFlightWithTimeout(impl_->win_state_->in_flight);
     }
   }
   SetEvent(impl_->win_state_->quit_event);
   if (impl_->worker_.joinable()) impl_->worker_.join();
-  CloseHandle(impl_->win_state_->drained_event);
-  CloseHandle(impl_->win_state_->quit_event);
-  CloseHandle(impl_->win_state_->stop_event);
+  if (!safe_to_close) {
+    std::cerr << "server: console handler did not drain; retaining event handles\n";
+    RetireHandlerState(std::move(impl_->win_state_));
+  } else {
+    impl_->win_state_.reset();
+  }
 #else
   if (impl_->armed_) {
     std::signal(SIGTERM, SIG_DFL);

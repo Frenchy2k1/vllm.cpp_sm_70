@@ -548,6 +548,69 @@ TEST_CASE("lmcache response lengths match the requested operation") {
   CHECK_FALSE(client.connected());
 }
 
+TEST_CASE("lmcache successful response payload contracts close the connection") {
+  ServerMetaMessage meta;
+  meta.code = ServerReturnCode::kSuccess;
+  meta.length = 0;
+  meta.fmt = MemoryFormat::kKV2LTD;
+  meta.dtype = Dtype::kFloat16;
+  meta.shape = {2, 1, 1, 1};
+
+  SUBCASE("GET requires a non-empty payload") {
+    OneReplyServer server(meta.Serialize());
+    LmcacheRemoteClient client(OneReplyConfig(server));
+    client.Connect();
+    CHECK_THROWS_WITH_AS(client.Get("m@1@0@1@half"),
+                         doctest::Contains("payload is missing"),
+                         std::runtime_error);
+    CHECK_FALSE(client.connected());
+  }
+
+  SUBCASE("EXIST forbids a response payload") {
+    meta.length = 1;
+    OneReplyServer server(meta.Serialize(), "x");
+    LmcacheRemoteClient client(OneReplyConfig(server));
+    client.Connect();
+    CHECK_THROWS_WITH_AS(client.Exist("m@1@0@1@half"),
+                         doctest::Contains("length must be zero"),
+                         std::runtime_error);
+    CHECK_FALSE(client.connected());
+  }
+
+  SUBCASE("HEALTH forbids a response payload") {
+    meta.length = 1;
+    OneReplyServer server(meta.Serialize(), "x");
+    LmcacheRemoteClient client(OneReplyConfig(server));
+    client.Connect();
+    CHECK_THROWS_WITH_AS(client.Health(),
+                         doctest::Contains("length must be zero"),
+                         std::runtime_error);
+    CHECK_FALSE(client.connected());
+  }
+}
+
+TEST_CASE("lmcache LIST rejects malformed key payloads and closes the connection") {
+  ServerMetaMessage meta;
+  meta.code = ServerReturnCode::kSuccess;
+  meta.fmt = MemoryFormat::kKV2LTD;
+  meta.dtype = Dtype::kFloat16;
+  meta.shape = {0, 0, 0, 0};
+
+  for (const std::string& payload : {
+           std::string("m@1@0@1@half\n\nm@1@0@2@half"),
+           std::string("m@1@0@1@half\n"),
+           std::string("not-a-cache-engine-key"),
+       }) {
+    CAPTURE(payload);
+    meta.length = static_cast<int32_t>(payload.size());
+    OneReplyServer server(meta.Serialize(), payload);
+    LmcacheRemoteClient client(OneReplyConfig(server));
+    client.Connect();
+    CHECK_THROWS(client.List());
+    CHECK_FALSE(client.connected());
+  }
+}
+
 TEST_CASE("lmcache oversized PUT is rejected before the signed wire cast") {
   LmcacheRemoteClient client;
   static const char byte = 0;

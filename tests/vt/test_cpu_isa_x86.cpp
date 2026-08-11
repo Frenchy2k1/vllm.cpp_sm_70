@@ -1,5 +1,7 @@
 #include <array>
 #include <bit>
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 #include "doctest/doctest.h"
@@ -36,6 +38,26 @@ TEST_CASE("device pool size classes preserve power-of-two alignment") {
       CHECK(size_class == bytes);
     }
   }
+}
+
+TEST_CASE("device pool size classes reject unrepresentable rounding") {
+  constexpr int kClassBits = 4;
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  const int msb = static_cast<int>(std::bit_width(maximum)) - 1;
+  const int shift = msb - kClassBits;
+  const std::size_t mask = (std::size_t{1} << shift) - 1;
+  const std::size_t maximum_aligned = maximum & ~mask;
+
+  CHECK(vllm::DevicePool::SizeClassForTest(0) == 1);
+  CHECK(vllm::DevicePool::SizeClassForTest(16) == 16);
+  CHECK(vllm::DevicePool::SizeClassForTest(32) == 32);
+  CHECK(vllm::DevicePool::SizeClassForTest(maximum_aligned) == maximum_aligned);
+  CHECK_THROWS_AS(vllm::DevicePool::SizeClassForTest(maximum_aligned + 1),
+                  std::overflow_error);
+  CHECK_THROWS_AS(vllm::DevicePool::SizeClassForTest(maximum - mask + 1),
+                  std::overflow_error);
+  CHECK_THROWS_AS(vllm::DevicePool::SizeClassForTest(maximum),
+                  std::overflow_error);
 }
 
 TEST_CASE("x86 ISA selection requires CPU bits and exact OS-enabled state") {

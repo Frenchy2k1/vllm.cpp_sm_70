@@ -25,7 +25,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -188,6 +190,9 @@ class DevicePool {
     if (msb < kClassBits) return bytes;
     const int shift = msb - kClassBits;
     const size_t mask = (static_cast<size_t>(1) << shift) - 1;
+    if (bytes > std::numeric_limits<size_t>::max() - mask) {
+      throw std::overflow_error("DevicePool size class rounding overflow");
+    }
     return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
   }
 

@@ -394,9 +394,13 @@ pwsh -File scripts/build-windows-release.ps1
 
 The adaptive binary keeps its F16C translation unit at `/arch:AVX`; AVX2 and
 AVX-512 remain separate runtime-selected translation units. The gate derives
-the complete server source set from CMake's generated codemodel, audits project
-COFF directives for static `LIBCMT`, and rejects dynamic/debug CRT imports from
-the staged executable before starting the HTTP smoke.
+the complete server source set from CMake's generated codemodel, recursively
+checks its project-local header closure, and refuses required runtime sources
+that are not reachable from the shipped target. After installation it audits
+project COFF directives for static `LIBCMT` and rejects dynamic/debug CRT
+imports before running the staged executable's `--help`, forced-tier, or HTTP
+shutdown smokes. The Win32 console-control regression uses bounded waits so a
+teardown failure reports an error instead of hanging the gate.
 
 The default smoke model is the committed tiny embedding fixture; pass
 `-SmokeModel C:\path\to\model` to use another complete model directory. This
