@@ -2034,6 +2034,18 @@ void Mamba2ChunkScan(Queue& q, Tensor& out, Tensor& final_states, const Tensor& 
   VT_CHECK(args.chunk_size > 0 && (args.chunk_size & (args.chunk_size - 1)) == 0,
            std::string(name) + ": chunk_size must be an integer power of 2 "
                                "(ssd_combined.py:48)");
+  // dt_limit is caller-supplied and upstream's default is `(0.0, inf)`
+  // (ssd_combined.py:180). A negative `dt_min` would let `dt` go negative, which
+  // makes `dA_cumsum` NON-monotonic within a chunk and turns upstream's
+  // `min(., 0)` clamps (ssd_chunk_state.py:283-285, ssd_chunk_scan.py:339-341)
+  // from algebraic no-ops into a silent truncation of the recurrence. The
+  // companion precondition `A < 0` is checked against the tensor's contents in
+  // the kernel, where the data lives.
+  VT_CHECK(args.dt_min >= 0.0f && args.dt_max >= args.dt_min,
+           std::string(name) +
+               ": dt_limit must satisfy 0 <= dt_min <= dt_max (upstream default is "
+               "(0.0, inf), ssd_combined.py:180); a negative dt_min admits a negative "
+               "dt and breaks the dA_cumsum monotonicity the intra-chunk clamp rests on");
   VT_CHECK(x.rank == 3 && dt.rank == 2 && A.rank == 1 && B.rank == 3 && C.rank == 3 &&
                out.rank == 3 && final_states.rank == 4,
            std::string(name) +

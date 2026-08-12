@@ -92,7 +92,11 @@ Tensor MakeT(void* data, DType dt, const std::vector<int64_t>& shape) {
 // ─── comparison ──────────────────────────────────────────────────────────────
 // torch.testing.assert_close arithmetic, stated explicitly. Reports the worst
 // offending element so a failure names a number, not just "false".
-void ExpectClose(const char* what, const std::vector<float>& got,
+// NOTE — doctest 2.5.2 `INFO` prints a `const char*` VARIABLE as `1` (it binds
+// the bool overload; only a string LITERAL prints as text), so every label here
+// is a `std::string`. A `const char*` label silently turns a failure message
+// into "1: worst element ...".
+void ExpectClose(const std::string& what, const std::vector<float>& got,
                  const std::vector<double>& want, double atol, double rtol) {
   REQUIRE(got.size() == want.size());
   REQUIRE(!got.empty());
@@ -116,7 +120,7 @@ void ExpectClose(const char* what, const std::vector<float>& got,
   CHECK(worst_slack <= 0.0);
 }
 
-void ExpectCloseF(const char* what, const std::vector<float>& got,
+void ExpectCloseF(const std::string& what, const std::vector<float>& got,
                   const std::vector<float>& want, double atol, double rtol) {
   std::vector<double> w(want.begin(), want.end());
   ExpectClose(what, got, w, atol, rtol);
@@ -455,8 +459,16 @@ TEST_CASE("mamba2 chunk scan equals the sequential recurrence (single example)")
 // The same sequence scanned at chunk_size in {8,16,32,64,128} must produce the
 // same output. A state-passing defect is invisible at one chunk size.
 // ─────────────────────────────────────────────────────────────────────────────
+// T IS 300, NOT 128. With T == 128 the largest chunk size in the sweep leaves
+// `nchunks == 1`, so that arm ran ZERO state passing — and 128 is exactly the
+// `chunk_size` Nemotron-3.5 ships (.agents/specs/nemotron-h-model.md), i.e. the
+// one arm that most needed the coverage was the degenerate one. That is the
+// failure shape of [[h3-video-decode-temporal-and-tiling-compose]] again. The
+// test now ASSERTS `nchunks > 1` for every chunk size rather than trusting the
+// shape. Upstream's own tolerance loosens to atol 1e-2 past 256 tokens
+// (test_mamba_ssm_ssd.py:266-355), and this sequence is longer than that.
 TEST_CASE("mamba2 chunk scan is invariant to chunk_size") {
-  const int64_t T = 128, H = 8, P = 16, G = 2, N = 32;
+  const int64_t T = 300, H = 8, P = 16, G = 2, N = 32;
   const Inputs in = GenerateInputs(T, H, P, G, N, 0xC0FFEEu);
   const std::vector<int32_t> cu{0, static_cast<int32_t>(T)};
   const SeqRefOut ref =
@@ -466,17 +478,21 @@ TEST_CASE("mamba2 chunk scan is invariant to chunk_size") {
   for (int64_t chunk : {8, 16, 32, 64, 128}) {
     RunCfg cfg;
     cfg.chunk_size = chunk;
+    // The arm must actually EXERCISE inter-chunk state passing.
+    const int64_t nchunks =
+        static_cast<int64_t>(ComputeVarlenChunkMetadata(cu, chunk).seq_idx.size());
+    INFO("chunk_size=" << chunk << " nchunks=" << nchunks);
+    REQUIRE(nchunks > 1);
     const RunOut got = RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr,
                                     cfg);
-    INFO("chunk_size=" << chunk);
-    ExpectClose("y vs sequential", got.y, ref.y, 8e-3, 5e-3);
-    ExpectClose("final_states vs sequential", got.final_states, ref.final_states, 8e-3, 5e-3);
+    ExpectClose("y vs sequential", got.y, ref.y, 1e-2, 5e-3);
+    ExpectClose("final_states vs sequential", got.final_states, ref.final_states, 1e-2, 5e-3);
     if (first_y.empty()) {
       first_y = got.y;
       first_state = got.final_states;
     } else {
-      ExpectCloseF("y vs chunk_size=8", got.y, first_y, 8e-3, 5e-3);
-      ExpectCloseF("final_states vs chunk_size=8", got.final_states, first_state, 8e-3, 5e-3);
+      ExpectCloseF("y vs chunk_size=8", got.y, first_y, 1e-2, 5e-3);
+      ExpectCloseF("final_states vs chunk_size=8", got.final_states, first_state, 1e-2, 5e-3);
     }
   }
 }
@@ -755,6 +771,71 @@ TEST_CASE("mamba2 chunk scan keeps the state dtype independent of the activation
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// (6b) THE RUNNING STATE DOES NOT COMPOUND ITS OWN ROUNDED STORE.
+// `_state_passing_fwd` keeps `states` in f32 REGISTERS across the chunk loop and
+// stores a `state_dtype` copy per chunk (ssd_state_passing.py:88-97). It never
+// reads that store back into the recurrence — the rounding is observable in
+// `out` (via `_chunk_scan_fwd`, which DOES read the stored copy) but must not
+// accumulate chunk over chunk.
+//
+// Test (6) above pins the STORE side: dropping the rounding at the store makes
+// `out(bf16 state) == out(f32 state)` and reds. It cannot see the other half,
+// because a kernel that ALSO fed the rounded value back still stores rounded
+// values. This is the exact, tolerance-free complement:
+//
+//   the f32 recurrence does not depend on `state_dtype`, so the bf16 run's
+//   `final_states` must be BIT-FOR-BIT the bf16 rounding of the f32 run's.
+//
+// A kernel that compounded would drift from chunk 2 onwards and fail it. The
+// sequences below are deliberately several chunks long — one chunk cannot
+// compound anything.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("mamba2 chunk scan keeps the passed state in f32, never compounding its store") {
+  const int64_t H = 4, P = 8, G = 2, N = 16, chunk = 16;
+  // Two sequences, 6 and 4 logical chunks — continuous batching, and enough
+  // chunks that a per-chunk rounding has somewhere to accumulate.
+  const std::vector<int32_t> cu{0, 96, 160};
+  const int64_t T = cu.back(), S = static_cast<int64_t>(cu.size()) - 1;
+  const Inputs in = GenerateInputs(T, H, P, G, N, 0x5A17Eu);
+  const ChunkMeta meta = ComputeVarlenChunkMetadata(cu, chunk);
+  REQUIRE(meta.seq_idx.size() > 2);
+
+  for (bool with_init : {false, true}) {
+    std::mt19937 rng(0x2468u);
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    std::vector<float> init(static_cast<size_t>(S * H * P * N));
+    for (auto& v : init) v = vt::BF16ToF32(vt::F32ToBF16(nd(rng)));
+
+    RunCfg f32cfg;
+    f32cfg.chunk_size = chunk;
+    f32cfg.state_dtype = DType::kF32;
+    RunCfg bf16cfg = f32cfg;
+    bf16cfg.state_dtype = DType::kBF16;
+    const std::vector<float>* ip = with_init ? &init : nullptr;
+    const RunOut a = RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, ip, f32cfg);
+    const RunOut b = RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, ip, bf16cfg);
+
+    REQUIRE(a.final_states.size() == b.final_states.size());
+    size_t drifted = 0, rounding_bit = 0;
+    double worst = 0.0;
+    for (size_t i = 0; i < a.final_states.size(); ++i) {
+      const float want = vt::BF16ToF32(vt::F32ToBF16(a.final_states[i]));
+      if (want != a.final_states[i]) ++rounding_bit;  // the rounding is non-trivial here
+      if (b.final_states[i] != want) {
+        ++drifted;
+        worst = std::max(worst, std::abs(static_cast<double>(b.final_states[i]) - want));
+      }
+    }
+    INFO("with_init=" << with_init << " nchunks=" << meta.seq_idx.size() << ": " << drifted
+                      << " of " << a.final_states.size()
+                      << " final_states differ from bf16(f32-run), max|diff| = " << worst);
+    // The comparison is only meaningful if bf16 actually rounds these values.
+    REQUIRE(rounding_bit > 0);
+    CHECK(drifted == 0);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // (7) REFUSALS. An unimplemented or ill-formed arm is refused with the missing
 // piece named, never silently mis-computed (mamba2-ssd.md §7).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -803,6 +884,92 @@ TEST_CASE("mamba2 chunk scan refuses the arms it does not implement") {
     RunCfg cfg;
     cfg.chunk_size = 24;
     CHECK_THROWS(RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg));
+  }
+
+  // ── the two PRECONDITIONS the intra-chunk clamp rests on ──────────────────
+  // `exp(min(dA_i - dA_j, 0))` (ssd_chunk_scan.py:339-341) and
+  // `exp(min(dA_last - dA_i, 0))` (ssd_chunk_state.py:283-285) are no-ops only
+  // while `dA_cumsum` is non-increasing, which needs `A < 0` AND `dt >= 0`.
+  // Upstream never has anything else — `A = -exp(A_log)` (mamba_mixer2.py:456)
+  // and `dt_limit` defaults to `(0.0, inf)` (ssd_combined.py:180) — but neither
+  // is derivable from the arguments, so the op has to state them. Fed `A > 0`
+  // the clamp silently truncates a genuinely growing recurrence: the reviewer's
+  // `A = +1.0` case returned `0.5 1 1.5 2 3.79744 ...` where the unclamped
+  // recurrence gives `0.5 1.32436 2.6835 4.92435 ...`. An arm that is not
+  // implemented is REFUSED, never silently mis-computed.
+  SUBCASE("A must be negative (A = -exp(A_log))") {
+    Inputs bad = in;
+    bad.A[static_cast<size_t>(H - 1)] = 1.0f;  // the reviewer's escaping value
+    RunCfg cfg;
+    cfg.chunk_size = 16;
+    bool threw = false;
+    std::string msg;
+    try {
+      RunChunkScan(bad, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+    } catch (const std::exception& e) {
+      threw = true;
+      msg = e.what();
+    }
+    INFO(msg);
+    CHECK(threw);
+    CHECK(msg.find("A_log") != std::string::npos);
+
+    // Zero is refused too: `-exp(A_log)` is strictly negative for every finite
+    // A_log, and dA_cumsum would be flat rather than decaying.
+    Inputs zero = in;
+    zero.A[0] = 0.0f;
+    CHECK_THROWS(RunChunkScan(zero, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg));
+  }
+
+  SUBCASE("dt_limit must not admit a negative dt") {
+    RunCfg cfg;
+    cfg.chunk_size = 16;
+    cfg.dt_min = -1.0f;  // `dt_limit=(0.0, inf)` upstream (ssd_combined.py:180)
+    bool threw = false;
+    std::string msg;
+    try {
+      RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+    } catch (const std::exception& e) {
+      threw = true;
+      msg = e.what();
+    }
+    INFO(msg);
+    CHECK(threw);
+    CHECK(msg.find("dt_min") != std::string::npos);
+
+    RunCfg inverted;
+    inverted.chunk_size = 16;
+    inverted.dt_min = 0.5f;
+    inverted.dt_max = 0.1f;
+    CHECK_THROWS(
+        RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, inverted));
+  }
+
+  // ── empty sequences ────────────────────────────────────────────────────────
+  // `compute_varlen_chunk_metadata` leaves `last_chunk_indices[b] == -1` for a
+  // sequence with no tokens (mamba2_attn.py:56-74 never pushes a chunk for it),
+  // and upstream's `varlen_states = states[last_chunk_indices]`
+  // (ssd_combined.py:154) is then a torch NEGATIVE index: it silently returns
+  // the last chunk of the WHOLE BATCH — some other sequence's state. vLLM never
+  // schedules an empty sequence, so that is an indexing quirk, not a behaviour
+  // to mirror; this op refuses instead of deviating quietly.
+  SUBCASE("an empty sequence is refused, not silently given someone else's state") {
+    const std::vector<int32_t> with_empty{0, 16, 16, static_cast<int32_t>(T)};
+    const ChunkMeta m = ComputeVarlenChunkMetadata(with_empty, 16);
+    REQUIRE(m.last_chunk_indices[1] == -1);
+    RunCfg cfg;
+    cfg.chunk_size = 16;
+    bool threw = false;
+    std::string msg;
+    try {
+      RunChunkScan(in, T, H, P, G, N, with_empty, nullptr, nullptr, nullptr, nullptr, cfg);
+    } catch (const std::exception& e) {
+      threw = true;
+      msg = e.what();
+    }
+    INFO(msg);
+    CHECK(threw);
+    CHECK(msg.find("empty") != std::string::npos);
   }
 
   SUBCASE("seq_idx is per chunk, not per token") {
