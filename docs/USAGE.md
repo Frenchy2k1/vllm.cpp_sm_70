@@ -422,7 +422,7 @@ The default smoke model is the committed tiny embedding fixture; pass
 `-SmokeModel C:\path\to\model` to use another complete model directory. This
 command produces a staged developer tree only. The Windows CPU and Vulkan ZIP
 downloads do not exist until the `v0.0.3-pre.1` prerelease workflow and
-post-publication audit succeed.
+post-publication audit succeed. <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 The basic CMake archive under `build/release/` includes the version, configured
 backend, OS, and host architecture in its name. It is a developer package. The

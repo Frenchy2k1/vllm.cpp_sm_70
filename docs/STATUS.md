@@ -41,6 +41,7 @@ provenance, and two generated indexes (26 assets) from
 CPU/Vulkan W14-W16 are implemented for v0.0.3-pre.1, but hosted MSVC evidence,
 the merged-SHA ten-tuple dry run, prerelease publication, and its 32-asset audit
 remain pending; no Windows ZIP is published.
+<!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 Container images (#170): the cpu (amd64) and cuda (arm64) lanes pass their gates. One SBSA
 arm64 image serves BOTH families: GB10 `sm_121a`, and Jetson AGX Orin `sm_87`
