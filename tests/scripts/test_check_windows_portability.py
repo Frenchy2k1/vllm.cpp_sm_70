@@ -454,6 +454,20 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 with self.subTest(method=method, declaration=declaration):
                     self.assertNotRegex(method_scope, declaration)
 
+        deepseek = (
+            REPO / "src/vllm/model_executor/models/deepseek_v4.cpp"
+        ).read_text(encoding="utf-8")
+        active_deepseek = checker._cpp_structural_view(deepseek)
+        probe_contracts = (
+            r"detail::DeepseekV4ExpertProbeInput\s*\(\s*H\s*,\s*0\.017f\s*\)",
+            r"detail::DeepseekV4ExpertProbeInput\s*\(\s*mi\s*,\s*0\.013f\s*\)",
+            r"0\.5f\s*\*\s*std::sin\s*\(\s*frequency\s*\*\s*"
+            r"static_cast<float>\s*\(\s*i\s*\+\s*1\s*\)\s*\)",
+        )
+        for contract in probe_contracts:
+            with self.subTest(contract=contract):
+                self.assertRegex(active_deepseek, contract)
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):

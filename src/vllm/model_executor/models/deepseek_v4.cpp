@@ -38,6 +38,7 @@
 // quant_block == nope_head_dim (one block) at tiny width. Each reuses the SAME
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_probe.h"
 
 #include <chrono>
 #include <cmath>
@@ -2363,6 +2364,17 @@ void DeepseekV4ProfReset() {
 double DeepseekV4ProfGemmSeconds() { return prof::g_gemm_s; }
 double DeepseekV4ProfSyncSeconds() { return prof::g_sync_s; }
 
+std::vector<float> detail::DeepseekV4ExpertProbeInput(int64_t size,
+                                                       float frequency) {
+  if (size <= 0) return {};
+  std::vector<float> values(static_cast<size_t>(size));
+  for (int64_t i = 0; i < size; ++i) {
+    values[static_cast<size_t>(i)] =
+        0.5f * std::sin(frequency * static_cast<float>(i + 1));
+  }
+  return values;
+}
+
 void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
                                    int64_t head_dim, float eps) {
   for (int64_t h = 0; h < n_head; ++h) {
@@ -2394,9 +2406,8 @@ void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
   const DeepseekV4GgufLayerWeights& Lq = weights.gguf.layers[static_cast<size_t>(layer)];
   const int64_t H = p.hidden_size, mi = p.moe_intermediate_size;
   const V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
-  std::vector<float> xh(static_cast<size_t>(H)), xm(static_cast<size_t>(mi));
-  for (int64_t i = 0; i < H; ++i) xh[static_cast<size_t>(i)] = 0.5f * std::sin(0.017 * (i + 1));
-  for (int64_t i = 0; i < mi; ++i) xm[static_cast<size_t>(i)] = 0.5f * std::sin(0.013 * (i + 1));
+  std::vector<float> xh = detail::DeepseekV4ExpertProbeInput(H, 0.017f);
+  std::vector<float> xm = detail::DeepseekV4ExpertProbeInput(mi, 0.013f);
   // If a real moe_in dump exists for this layer (VT_DUMP_ACT), use it — the smooth
   // synthetic input does NOT reproduce the forward's explosion; the real hidden does.
   if (const char* dir = std::getenv("VT_DUMP_ACT")) {
