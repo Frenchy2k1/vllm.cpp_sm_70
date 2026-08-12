@@ -20182,3 +20182,16 @@ initialise under ncu replay).
 
 Verdict: 0.975x code, 1.012x prose, NOT parity, residual attributed to achieved
 memory bandwidth.
+
+## SPEC-DSPARK: the slab-size lever is REFUTED (2026-08-12)
+
+Proposed as the cheapest next lever, then checked before spending on it: our
+per-expert gate_up slot is 2*wg_i32 = 262144 int32 = exactly the 1.0 MB that a
+[K, 2N] 4-bit weight requires (K=2048, N=512), with no padding, and the full slab
+is 268 MB -- identical to upstream's [E, K, 2N] 4-bit tensor. There is no
+oversizing or stride inflation to remove, so splitting or re-packing the slab
+cannot recover the 12.9% bandwidth difference.
+
+That closes the last cheap lever. What remains needs upstream's ncu counters
+(blocked: its EngineCore will not initialise under ncu kernel replay) or
+cudaMemAdvise-style placement experiments whose premise is currently unverified.
