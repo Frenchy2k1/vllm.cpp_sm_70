@@ -55,6 +55,10 @@ vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
 target_include_directories(test_gguf_nvfp4 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 vllm_cpp_add_test(test_qwen36_weights vllm/test_qwen36_weights.cpp)
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471): resolves the 35B checkpoint through the
+# pinned parity::HfSnapshot, so it needs tests/parity on the include path.
+target_include_directories(test_qwen36_weights PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
@@ -1461,6 +1465,14 @@ target_compile_definitions(test_qwen36_spec_decode PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471). The resolver gate: CPU-only, needs no
+# checkpoint, synthesises its own two-revision cache. It is the direct proof that
+# a pinned accessor selects rather than substitutes, and unlike every gate it
+# protects, it runs everywhere.
+vllm_cpp_add_test(test_hf_snapshot_pinning parity/test_hf_snapshot_pinning.cpp)
+target_include_directories(test_hf_snapshot_pinning PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 
 # SPEC-NGRAM (ROAD-V1-D3) — the 27B draft-free ngram e2e gate: our ngram-ON ==
 # the committed vLLM-ngram-ON golden (STRICT, exactness-preserving greedy) +
