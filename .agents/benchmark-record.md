@@ -19871,3 +19871,36 @@ gap; upstream's profile then showed 57.2% of ITS step, so it was never the gap. 
 share measures where OUR time goes, not where upstream's advantage is.
 
 Evidence: `dgx:~/work/dspark-w6/prof.log`, `prof/ours_{32,96}.nsys-rep`.
+
+## SPEC-DSPARK: paired profile -- 8.2% inside the SAME Marlin MoE kernel (2026-08-12)
+
+Upstream profiled via its own torch profiler (nsys breaks its EngineCore), warm
+generate only, 96 tokens, same model + draft + k as ours.
+
+| | kernel | instances | GPU time |
+|---|---|---|---|
+| ours | marlin_moe_wna16::Marlin | 1520 | 249.22 ms |
+| upstream | marlin_moe_wna16::Marlin | 1520 | 230.39 ms |
+
+Same kernel, same template arguments, same 1520 launches, ours 8.2% slower.
+Shares agree too: excluding our load-time repack (437 ms) it is 38.8% of our
+decode-relevant GPU time vs their 36.9%.
+
+The arithmetic closes: 34% of wall x 8.2% = 2.8% end-to-end against the 2.5%
+measured under pinned clocks. The whole residual is this kernel.
+
+Note for method: the SHARES are near-equal (38.8 vs 36.9), so share reasoning
+would have concluded "not the gap" -- the same mistake a previous campaign made
+with Marlin at 55.5% vs 57.2%. Only ABSOLUTE time at matched call count exposes
+it: identical work, 18.8 ms more of it.
+
+Ruled out by the same pairing: different algorithm, different kernel family,
+launch overhead, acceptance, the repack (load-time), the sampler (bandwidth
+bound) and graph capture (both capture).
+
+Next step is narrow: compare LAUNCH parameters (Marlin selects thread_k/thread_n
+per shape), the grouped-GEMM problem layout at T=9, and the repacked
+scales/zero-point layout. Recovering 8.2% there is worth the full 2.5%.
+
+Evidence: `dgx:~/work/dspark-w6/oracle_prof.log`, `oracle_kernels.json`,
+`prof/ours_{32,96}.nsys-rep`.

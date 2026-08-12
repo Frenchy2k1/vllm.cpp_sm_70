@@ -1237,6 +1237,49 @@ step, i.e. never the gap at all. A 34% share proves where our time goes, NOT tha
 upstream spends less there. Until both profiles exist, "optimise the expert GEMM"
 is a guess.
 
+## 6u. PAIRED PROFILE: the gap is 8.2% INSIDE the same Marlin MoE kernel (2026-08-12)
+
+§6t located our per-token cost in the expert GEMM but refused to act on a share
+alone, because this repo has been burned by exactly that. Here is the other half,
+upstream profiled through its own torch profiler (nsys breaks its EngineCore),
+warm generate only, 96 tokens, same model + draft + k.
+
+**Paired BY CALL COUNT:**
+
+| | kernel | instances | GPU time |
+|---|---|---|---|
+| ours | `marlin_moe_wna16::Marlin` | **1520** | **249.22 ms** |
+| upstream | `marlin_moe_wna16::Marlin` | **1520** | **230.39 ms** |
+
+The SAME kernel with the SAME template arguments and the SAME 1520 launches, and
+we are **8.2% slower inside it**. Shares agree too: excluding our load-time
+repack (437 ms, §6t) it is 38.8% of our decode-relevant GPU time against their
+36.9%.
+
+**The arithmetic closes:** the expert GEMM is ~34% of our wall (§6t), so 8.2%
+slower there is 0.34 x 8.2 = **2.8% end-to-end**, against the **2.5%** measured
+under pinned clocks (§6s). The whole residual is this one kernel; nothing else
+needs explaining.
+
+**This is the outcome the pairing rule exists to produce.** A previous campaign
+found Marlin at 55.5% of our step, called it the gap, and upstream's profile then
+showed 57.2% of ITS step -- a share proving only where time goes. Here the shares
+are ALSO near-equal (38.8 vs 36.9), so share reasoning would again have said
+"not the gap". Only the ABSOLUTE time at matched call count exposes it: identical
+work, 18.8 ms more of it.
+
+**What it is NOT:** not a different algorithm, not a different kernel family, not
+launch overhead, not acceptance, not the repack (load-time), not the sampler
+(bandwidth bound), not the graphs (both capture). Upstream reaches the same
+kernel through `gptq_marlin_repack` at load exactly as we do.
+
+**Next, and it is narrow:** the difference must be in how the kernel is
+CONFIGURED or fed -- tile/thread selection (Marlin picks thread_k/thread_n per
+shape), the grouped-GEMM problem layout at T=9, or the scales/zero-point layout
+the repack produces. The template arguments printed in both profiles match, so
+compare the LAUNCH parameters and the repacked weight layout, not the algorithm.
+An 8.2% recovery on that kernel is worth the full 2.5%.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
