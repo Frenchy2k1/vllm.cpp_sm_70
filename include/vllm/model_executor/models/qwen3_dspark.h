@@ -134,6 +134,33 @@ class Qwen3DSparkModel {
   // a correct sampler cannot produce (argmax over draft_vocab columns).
   static int32_t MapDraftToTarget(int32_t draft_id, const Qwen3DSparkWeights& weights);
 
+  // W7 (#436): the sequential Markov loop with the per-step bias AND the argmax
+  // kept ON DEVICE, instead of downloading [B, draft_vocab] f32 and scanning it
+  // on the host once per step.
+  //
+  // MEASURED motivation: `[spec-phase] backbone=27.44ms sample=10.50ms` on the
+  // 27B lane, i.e. 28% of the draft step spent on host-side sampling, because
+  // the host path downloads k x [B, 248320] f32 of bias and runs k host argmaxes
+  // over the full vocab. Upstream keeps the whole draft step on device under one
+  // captured graph (dspark/speculator.py:22-24); this is spec risk R5.
+  //
+  // TOKEN-IDENTICAL to the host path by construction: `vt::GreedyArgmax` uses
+  // the same LOWEST-INDEX tie-break as the host scan, step i reads the same base
+  // row (r*nqpr + first_sample_offset + i), and `prev` is still the d2t-mapped
+  // TARGET id. Only the k per-step [B, V] downloads and host scans disappear;
+  // the [B] sampled ids still come back each step, because the sequential
+  // dependency is resolved on the host — a few bytes instead of a megabyte.
+  static std::vector<std::vector<int32_t>> SampleSequentialDevice(
+      const std::vector<float>& block_logits, const std::vector<int32_t>& anchor_ids,
+      int64_t num_query_per_req, int64_t first_sample_offset, int64_t num_spec,
+      const Qwen3DSparkWeights& weights, vt::Queue& queue);
+
+  // Whether SampleSequentialDevice can serve this checkpoint. Refuses a non-unit
+  // `logit_scale`, because the host path scales the BIAS ONLY and reproducing
+  // that asymmetry on device would need a scale op this composition avoids;
+  // every shipped DSpark checkpoint has 1.0, and the caller falls back.
+  static bool CanSampleOnDevice(const Qwen3DSparkWeights& weights);
+
   // ---- W3: checkpoint layouts ---------------------------------------------
   //
   // DSpark drafts ship in TWO config layouts with the SAME tensor layout

@@ -734,6 +734,105 @@ step) settles it; this does not.
 
 Evidence: `dgx:~/work/dspark-w6/parity/*.txt` vs `pinned_*.json`.
 
+## 6j. CORRECTION: there is no draft-quality gap; the gap is PER-STEP COST (2026-08-12)
+
+Section 6h concluded "27B dense lane: the real gap, and it is DRAFT QUALITY",
+from upstream's aggregate counters (49.3% accepted) against ours (12.2%). Direct
+instrumentation of BOTH engines refutes that. Issue #430 is closed as refuted.
+
+**Our proposals are nearly token-identical to upstream's.** Dumping upstream's
+`_sample_sequential` (anchor + the k proposed ids) against our `VT_SPEC_TRACE`
+at the same anchors:
+
+| anchor | upstream proposes | we propose |
+|---|---|---|
+| 11751 | `13 271 9764 6511 220 6511 314 279 369 279 198 13 198 ...` | `13 271 9764 6511 220 6511 314 279 369 279 198 13 198 ...` |
+| 248068 | `198 248069 271 760 6511 314 9338 369 ...` | `198 248069 271 760 6511 314 9338 369 ...` |
+| 2972 | `57590 332 369 279 6511 314 9338 9338 13 248046 ...` | `57590 332 369 279 6511 314 9338 9338 13 248046 ...` |
+
+**Acceptance is at parity on matched content.** Same prompt, both engines
+emitting the same tokens: ours 32 tokens in 11 draft steps (12.1% of k=15),
+upstream 32 tokens in 12 steps (11.1%). We are marginally ahead.
+
+**Where 49.3% came from.** Upstream's graphed benchmark run on "The capital of
+France is" DEGENERATED into a repetition loop: **8 distinct token ids across 128
+tokens** ("The capital of France is Paris." ten times), while upstream's OWN
+spec-off arm on that prompt produced ordinary reasoning text. Trivially
+predictable text is trivially draftable, which is what produced 7.39 accepted
+per draft and 49.7 tok/s. Our engine generated real reasoning text there, so the
+"0.350x" cell compared 84 tokens of reasoning against 128 tokens of a loop. It
+was never a like-for-like cell, and §6h's caveat understated that badly.
+
+**Ruled out for the acceptance question** (each checked in source, not assumed):
+aux tap indexing; the Markov step loop; d2t / reduced vocab (this checkpoint has
+NO d2t — both Markov tables are full `[248320, 256]`); `logit_scale` (upstream
+routes base logits AND bias through the same `logits_processor`, so it cancels
+in the argmax); head aliasing (we correctly keep the draft's own shipped
+`embed_tokens`/`lm_head`); **risk R3 RESOLVED** — `attn_output_gate` is inert
+metadata, `q_proj` is `[4096, 5120]`, not doubled; and the non-causal resolution
+(ours mirrors upstream's inverted `causal = is_sliding` rule, so all five draft
+layers are non-causal exactly as upstream has them).
+
+**The anchor layout is CORRECT.** An A/B on our own engine, same weights with
+only `sample_from_anchor` flipped in a copied config, drives acceptance to ZERO
+on every step when forced to the 1+N layout (15.6 -> 6.24 tok/s): the proposals
+land off-by-one because that layout drops the anchor row's prediction. The 27B
+is the only lane on `sample_from_anchor=true` (the flat config defaults it true,
+`model_loader.cpp:407-408`; the Speculators translation writes false explicitly,
+`qwen3_dspark.cpp:133-136`), which is why it was the natural suspect. It is not
+the defect.
+
+**What the gap actually is.** `[spec-phase] backbone=27.44ms sample=10.50ms`:
+28% of the draft step is host-side sampling, because every block-forward variant
+returns `std::vector<float>` and the host loop then downloads a
+`[B, draft_vocab]` bias and argmaxes over the FULL vocab once per step. On the
+27B that is k x 248320 floats per step; the 35B's reduced 32000-vocab draft
+moves 13x less, which is part of why THAT lane already sits at 0.92-0.98x. This
+is spec risk R5, recorded when the lane landed and never closed. W7 (#436)
+closes it.
+
+## 6k. W7 RESULT: device sampling is token-identical, and the residual is a BANDWIDTH bound (2026-08-12)
+
+A/B on the same binary, only `VT_DSPARK_DEVICE_SAMPLE` differing, one flock,
+warm repeats, cold run discarded.
+
+| arm | sample ms | warm tok/s |
+|---|---|---|
+| 27B host loop | 10.44 | 17.31 |
+| 27B device | **9.24** (-11.5%) | 17.42 |
+| 35B host loop | 0.59 | 71.06 |
+| 35B device | **0.50** (-15%) | 73.3 (+3.2%) |
+
+**Text is byte-IDENTICAL on both lanes**, which is the bar for a pure cost move.
+
+**The residual is not host overhead, it is bandwidth, and upstream pays it too.**
+`markov_w2` is `[draft_vocab, markov_rank]` bf16, so the per-step bias GEMV
+re-reads the WHOLE matrix:
+
+| lane | markov_w2 | per draft step | at ~205 GB/s | measured |
+|---|---|---|---|---|
+| 27B (V=248320) | 127 MB | 15 x 127 MB = 1.9 GB | 9.3 ms | **9.24 ms** |
+| 35B (V=32000) | 16 MB | 8 x 16 MB = 131 MB | 0.6 ms | **0.50 ms** |
+
+Two lanes 13x apart in vocab both landing on the bound is not a coincidence. The
+k sequential GEMVs are required by DSpark's mechanism (`speculator.py:151`),
+upstream runs the same math, and no amount of graph capture removes weight
+traffic. **Do not chase this further as if it were overhead**: the only way to
+move it is to change what is computed (pruning the bias to a candidate set),
+which changes tokens and is out of scope for a cost move.
+
+What W7 removed is the host part: k downloads of `[num_reqs, draft_vocab]` f32
+and k host argmaxes over the full vocab, replaced by one base-logits upload and
+a `[num_reqs]` i64 readback per step. Worth 11-15% of the sampling phase and
+~3% e2e on the 35B lane.
+
+The block-forward's own `[nqpr, draft_vocab]` D->H, which every variant still
+performs (`qwen3_dflash.h:155,202,248,284`), sits inside `backbone=27.4ms` and is
+NOT addressed here. At 14.9 MB it is worth ~0.15 ms on GB10, so it is a small
+prize and should be SIZED before it is built.
+
+Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
