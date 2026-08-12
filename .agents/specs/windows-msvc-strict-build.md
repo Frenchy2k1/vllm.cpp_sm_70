@@ -105,4 +105,21 @@ hosted log exposes a diagnostic not present in the fetched CPU/Vulkan evidence.
 
 ## Outcome
 
-Pending implementation and native hosted validation.
+The complete CPU and Vulkan job logs from hosted run `31574038913` were
+reduced to the warning and hard-error classes in this spec. The implementation
+keeps `/W4 /WX`, establishes the central Windows CRT/header/UTF-8 contract,
+pairs the platform allocator correctly, narrows the one intentional aligned
+layout warning to `Threadpool`, and fixes every source-specific diagnostic.
+
+The three focused regression tests failed at the pinned baseline with 15
+intended missing-contract/source-shape failures, then the complete Windows
+portability suite passed 62/62. Clean local CPU and Vulkan configurations built
+403/403 and 413/413 targets respectively. All selected CPU tests passed; all
+selected non-API Vulkan tests passed. The Vulkan configuration newly exposed
+two embedding API runtime cases returning HTTP 500 where the CPU configuration
+passes; that behavior is outside this compile-only repair and requires its own
+tracked decision rather than a silent scope expansion.
+
+Native MSVC CPU/Vulkan reruns remain the authoritative `/W4 /WX` validation and
+are not inferred from Linux. The exact PR-range gate also remains dependent on
+the independent #458 hermetic-tool repair.

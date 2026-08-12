@@ -270,6 +270,71 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         result = self.run_checker(self.make_tree())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_real_tree_declares_strict_msvc_platform_contract(self) -> None:
+        cmake = (REPO / "CMakeLists.txt").read_text(encoding="utf-8")
+        warnings = (REPO / "cmake/CompilerWarnings.cmake").read_text(
+            encoding="utf-8"
+        )
+        contract = cmake + "\n" + warnings
+        for token in (
+            "NOMINMAX",
+            "_CRT_SECURE_NO_WARNINGS",
+            "/utf-8",
+            "/W4",
+            "/WX",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, contract)
+
+    def test_real_tree_uses_portable_windows_allocation_and_math(self) -> None:
+        backend = (REPO / "src/vt/cpu/cpu_backend.cpp").read_text(
+            encoding="utf-8"
+        )
+        for token in ("_aligned_malloc", "_aligned_free", "std::aligned_alloc"):
+            with self.subTest(token=token):
+                self.assertIn(token, backend)
+
+        offenders = []
+        for root in (REPO / "src", REPO / "tests"):
+            for path in root.rglob("*"):
+                if path.suffix in {".cc", ".cpp", ".h", ".hpp"}:
+                    if re.search(r"\bM_PI\b", path.read_text(encoding="utf-8")):
+                        offenders.append(path.relative_to(REPO).as_posix())
+        self.assertEqual(offenders, [])
+
+    def test_real_tree_closes_observed_msvc_source_warnings(self) -> None:
+        forbidden = {
+            "src/vt/cpu/cpu_paged_attn.cpp": "constexpr KvKind kKV",
+            "src/vllm/v1/worker/gpu/runner.cpp": (
+                "std::vector<int32_t> positions(step.positions.begin()"
+            ),
+            "src/vllm/model_executor/models/gemma4_audio.cpp": (
+                "std::max<double>(nts - 1, 1)"
+            ),
+            "src/vllm/v1/kv_offload/lmcache/lmcache_connector.cpp": (
+                "conn_cfg.num_layers = ctx.identity->num_hidden_layers"
+            ),
+            "src/vllm/v1/core/kv_cache_utils.cpp": "MemAvailable: %ld kB",
+            "src/vllm/model_executor/models/minimax_h3_video_vae.cpp": (
+                "float* v = target->data()"
+            ),
+        }
+        for relative, token in forbidden.items():
+            with self.subTest(relative=relative):
+                source = (REPO / relative).read_text(encoding="utf-8")
+                self.assertNotIn(token, source)
+
+        threadpool = (REPO / "src/vt/cpu/cpu_threadpool.h").read_text(
+            encoding="utf-8"
+        )
+        for token in (
+            "#pragma warning(push)",
+            "#pragma warning(disable : 4324)",
+            "#pragma warning(pop)",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, threadpool)
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):

@@ -18,6 +18,12 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 if(MSVC)
   # Keep PE debug directories reproducible and free of runner/build paths.
   add_link_options("/PDBALTPATH:%_PDB%")
+  # Windows headers otherwise replace qualified std::min/std::max calls with
+  # legacy macros. The project intentionally uses the portable ISO CRT entry
+  # points across platforms, and tokenizer tables require a UTF-8 execution
+  # character set. These are platform contracts; /W4 /WX remains unchanged.
+  add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
