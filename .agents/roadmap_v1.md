@@ -56,6 +56,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
+| [#466](https://github.com/mudler/vllm.cpp/issues/466) | `GATE-27B-FP8-TOWER-GOLDEN` | The SACRED 27B gate cannot execute the FP8 tower: it pins unsloth@890bdef7 (zero FP8 tensors) while every fp8 lever targets nvidia@0893e160 | bug |
 | [#382](https://github.com/mudler/vllm.cpp/issues/382) | `KERNEL-ATTN-PAGED` | decode-opt attention kernel is head_dim-256 only; head_dim 128 (Qwen3-dense, Llama, Mistral) falls to the block kernel | perf |
 | [#206](https://github.com/mudler/vllm.cpp/issues/206) | `KERNEL-SSM-MAMBA` | RTX 5070 Ti: close Qwen3.5-4B TTFT, TPOT and VRAM gaps vs vLLM — owns the sm_120 post-conv token tile and the K=4 causal-conv arm (PR #155) | feature |
 | [#305](https://github.com/mudler/vllm.cpp/issues/305) | `KERNEL-SSM-MAMBA` | GDN causal-conv: the `conv_state` initial-state read races the final-state write across blocks (`VT_CONV_REG` + exact chunks, both default ON) | bug |
