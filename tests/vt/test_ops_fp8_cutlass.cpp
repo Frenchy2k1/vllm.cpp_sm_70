@@ -525,6 +525,15 @@ void AlphaVecMatchesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed, flo
 // the epilogue, the double rounding would show up here as a byte difference. With
 // the toggle OFF it degenerates to comparing identical code, which is why the
 // ctest arm test_ops_fp8_alpha_vec_epilogue_on is the one that binds.
+//
+// WHAT THIS CASE DOES NOT COVER — do not cite it as coverage of VT_GDN_FP8_IN_BF16.
+// Both arms here apply alpha AFTER the GEMM, so both are `round -> scale`. The
+// arithmetic the bf16-D lever actually changes is `round-then-scale` vs
+// `scale-then-round`: narrowing D rounds the f32 accumulator to bf16 BEFORE the
+// alpha multiply, where the f32-D path rounds after it. Nothing in the tree
+// compares those two orders, and this case cannot — it pins the epilogue REFUSAL,
+// not the narrowing. See .agents/specs/perf-fp8-alpha-fold.md §Outcome, "What the
+// green suite does and does not say".
 void AlphaVecBf16TakesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed,
                                 float alpha_qkv, float alpha_z) {
   const int N = Nqkv + Nz;
