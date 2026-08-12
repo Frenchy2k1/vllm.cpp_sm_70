@@ -469,11 +469,17 @@ parallelism mode is enumerated and ranked in
 NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
 (DFlash-derived block drafter for our Qwen3 + Gemma4 families) is
 **IMPLEMENTED and MEASURED cross-engine**
-([spec](../.agents/specs/dspark-spec-decode.md) §6h): against the pinned,
+([spec](../.agents/specs/dspark-spec-decode.md) §6h, §6j): against the pinned,
 graphed oracle the 35B-A3B MoE lane runs at 0.92-0.98x with acceptance matching
-upstream (20.8% vs 20.4%), while the 27B dense lane runs at 0.35-0.94x because
-upstream accepts 49.3% of its drafts where we accept 12.2% (#430). The Gemma4
-`1 + N` layout is coded and unit-tested but has never run on real weights.
+upstream (20.8% vs 20.4%). On matched content our proposals are near
+token-identical to upstream's and acceptance is at parity (12.1% vs 11.1%); the
+dense lane's 0.35x cell is void, because upstream's arm there degenerated into a
+repetition loop (8 distinct token ids across 128 tokens) that is trivially
+draftable. The open lever was per-step cost: 28% of the draft step was
+host-side sampling, now moved on device (#436, byte-identical output, sampling
+-11%/-15%, ~3% e2e on the 35B lane); what remains of that phase is a memory
+bandwidth bound on the per-step Markov GEMV that upstream pays identically. The Gemma4 `1 + N` layout is coded and unit-tested but has
+never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the
