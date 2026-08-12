@@ -366,6 +366,245 @@ def _powershell_syntax(text: str) -> str:
     return "".join(out)
 
 
+def _powershell_tokens(text: str) -> list[tuple[str, str]]:
+    """Tokenize the small PowerShell contract without trusting spellings.
+
+    Comments and continuation whitespace are inert, while quoted values remain
+    available for binding the required filter and diagnostic.  This is the
+    cross-platform view; on Windows the native PowerShell parser still owns the
+    syntax check and fake-runner execution below.
+    """
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        if text.startswith("`\r\n", index):
+            index += 3
+            continue
+        if text.startswith("`\n", index):
+            index += 2
+            continue
+        if text.startswith("<#", index):
+            end = text.find("#>", index + 2)
+            if end < 0:
+                return [("error", "unterminated block comment")]
+            index = end + 2
+            continue
+        if text[index] == "#":
+            end = text.find("\n", index + 1)
+            index = len(text) if end < 0 else end + 1
+            continue
+        if text[index] in {"'", '"'}:
+            quote = text[index]
+            start = index
+            index += 1
+            while index < len(text):
+                if quote == "'" and text.startswith("''", index):
+                    index += 2
+                    continue
+                if quote == '"' and text[index] == "`" and index + 1 < len(text):
+                    index += 2
+                    continue
+                if text[index] == quote:
+                    index += 1
+                    tokens.append(("string", text[start:index]))
+                    break
+                index += 1
+            else:
+                return [("error", "unterminated string")]
+            continue
+        if text.startswith("2>&1", index):
+            tokens.append(("symbol", "2>&1"))
+            index += 4
+            continue
+        if text.startswith("::", index):
+            tokens.append(("symbol", "::"))
+            index += 2
+            continue
+        if text.startswith("@(", index):
+            tokens.append(("symbol", "@("))
+            index += 2
+            continue
+        if text[index] == "$":
+            if index + 1 < len(text) and text[index + 1] == "{":
+                end = text.find("}", index + 2)
+                if end < 0:
+                    return [("error", "unterminated variable")]
+                value = "$" + text[index + 2:end]
+                index = end + 1
+            else:
+                match = re.match(r"\$[A-Za-z_][A-Za-z0-9_:]*", text[index:])
+                if match is None:
+                    tokens.append(("symbol", "$"))
+                    index += 1
+                    continue
+                value = match.group(0)
+                index += len(value)
+            tokens.append(("variable", value.lower()))
+            continue
+        if text[index] == "@" and index + 1 < len(text):
+            match = re.match(r"@[A-Za-z_][A-Za-z0-9_]*", text[index:])
+            if match is not None:
+                value = match.group(0)
+                tokens.append(("splat", value.lower()))
+                index += len(value)
+                continue
+        match = re.match(r"-[A-Za-z][A-Za-z0-9-]*", text[index:])
+        if match is not None:
+            value = match.group(0)
+            tokens.append(("operator", value.lower()))
+            index += len(value)
+            continue
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_-]*", text[index:])
+        if match is not None:
+            value = match.group(0)
+            tokens.append(("word", value.lower()))
+            index += len(value)
+            continue
+        match = re.match(r"\d+", text[index:])
+        if match is not None:
+            value = match.group(0)
+            tokens.append(("number", value))
+            index += len(value)
+            continue
+        tokens.append(("symbol", text[index]))
+        index += 1
+    return tokens
+
+
+def _powershell_string_value(token: tuple[str, str]) -> str | None:
+    if token[0] != "string" or len(token[1]) < 2:
+        return None
+    quote = token[1][0]
+    value = token[1][1:-1]
+    if quote == "'":
+        return value.replace("''", "'")
+    return re.sub(r"`(.)", r"\1", value, flags=re.DOTALL)
+
+
+def _safe_powershell_message(token: tuple[str, str]) -> bool:
+    """Allow inert diagnostic strings, but no executable subexpression."""
+    return token[0] == "string" and "$(" not in token[1]
+
+
+def _validate_exact_unsupported_tier_probe(
+        body: str, errors: list[str]) -> list[tuple[str, str]]:
+    tokens = _powershell_tokens(body)
+    string = ("string", "*")
+    expected: list[tuple[str, str]] = [
+        ("word", "param"), ("symbol", "("),
+    ]
+    cursor = 2
+    parameter_prefix = [
+        ("symbol", "["), ("word", "parameter"), ("symbol", "("),
+        ("word", "mandatory"), ("symbol", ")"), ("symbol", "]"),
+    ]
+    if tokens[cursor:cursor + len(parameter_prefix)] == parameter_prefix:
+        expected.extend(parameter_prefix)
+        cursor += len(parameter_prefix)
+    expected.extend([
+        ("symbol", "["), ("word", "string"), ("symbol", "]"),
+        ("variable", "$tiertest"), ("symbol", ","),
+        ("symbol", "["), ("word", "scriptblock"), ("symbol", "]"),
+        ("variable", "$runner"), ("symbol", ")"),
+        ("variable", "$arguments"), ("symbol", "="), ("symbol", "@("),
+        ("string", "FILTER"), ("symbol", ")"),
+        ("word", "if"), ("symbol", "("), ("variable", "$null"),
+        ("operator", "-eq"), ("variable", "$runner"), ("symbol", ")"),
+        ("symbol", "{"),
+        ("variable", "$probeoutput"), ("symbol", "="), ("symbol", "@("),
+        ("symbol", "&"), ("variable", "$tiertest"),
+        ("splat", "@arguments"), ("symbol", "2>&1"), ("symbol", ")"),
+        ("variable", "$probeexitcode"), ("symbol", "="),
+        ("variable", "$lastexitcode"), ("symbol", "}"),
+        ("word", "else"), ("symbol", "{"),
+        ("variable", "$proberesult"), ("symbol", "="), ("symbol", "&"),
+        ("variable", "$runner"), ("variable", "$tiertest"),
+        ("variable", "$arguments"),
+        ("variable", "$probeoutput"), ("symbol", "="), ("symbol", "@("),
+        ("variable", "$proberesult"), ("symbol", "."), ("word", "output"),
+        ("symbol", ")"),
+        ("variable", "$probeexitcode"), ("symbol", "="),
+        ("symbol", "["), ("word", "int"), ("symbol", "]"),
+        ("variable", "$proberesult"), ("symbol", "."), ("word", "exitcode"),
+        ("symbol", "}"),
+        ("word", "if"), ("symbol", "("), ("variable", "$probeexitcode"),
+        ("operator", "-ne"), ("number", "1"), ("symbol", ")"),
+        ("symbol", "{"), ("word", "throw"), string, ("symbol", "}"),
+        ("variable", "$diagnostic"), ("symbol", "="),
+        ("variable", "$probeoutput"), ("operator", "-join"), string,
+        ("word", "if"), ("symbol", "("), ("variable", "$diagnostic"),
+        ("operator", "-notmatch"), ("symbol", "["), ("word", "regex"),
+        ("symbol", "]"), ("symbol", "::"), ("word", "escape"),
+        ("symbol", "("), ("string", "DIAGNOSTIC"), ("symbol", ")"),
+        ("symbol", ")"), ("symbol", "{"), ("word", "throw"), string,
+        ("symbol", "}"),
+    ])
+
+    def matches(actual: tuple[str, str], wanted: tuple[str, str]) -> bool:
+        if wanted == string:
+            return _safe_powershell_message(actual)
+        if wanted == ("string", "FILTER"):
+            return _powershell_string_value(actual) == UNSUPPORTED_TIER_FILTER
+        if wanted == ("string", "DIAGNOSTIC"):
+            return _powershell_string_value(actual) == UNSUPPORTED_TIER_DIAGNOSTIC
+        return actual == wanted
+
+    diagnostic_index = expected.index(("variable", "$diagnostic"))
+    fixture_expected = expected[:diagnostic_index] + [
+        ("word", "if"), ("symbol", "("), ("symbol", "("),
+        ("variable", "$probeoutput"), ("operator", "-join"), string,
+        ("symbol", ")"), ("operator", "-notmatch"),
+        ("symbol", "["), ("word", "regex"), ("symbol", "]"),
+        ("symbol", "::"), ("word", "escape"), ("symbol", "("),
+        ("string", "DIAGNOSTIC"), ("symbol", ")"), ("symbol", ")"),
+        ("symbol", "{"), ("word", "throw"), string, ("symbol", "}"),
+    ]
+
+    def sequence_matches(wanted_tokens: list[tuple[str, str]]) -> bool:
+        return (len(tokens) == len(wanted_tokens) and
+                all(matches(actual, wanted)
+                    for actual, wanted in zip(tokens, wanted_tokens)))
+
+    if not sequence_matches(expected) and not sequence_matches(fixture_expected):
+        errors.append(
+            "build-windows-release.ps1: exact unsupported-tier probe body is required"
+        )
+    return tokens
+
+
+def _validate_exact_amx_refusal_block(
+        text: str, errors: list[str]) -> None:
+    tokens = _powershell_tokens(text)
+    starts = [
+        index for index in range(len(tokens) - 2)
+        if (tokens[index] == ("variable", "$env:vt_cpu_matmul_tier") and
+            tokens[index + 1] == ("symbol", "=") and
+            _powershell_string_value(tokens[index + 2]) == "amx")
+    ]
+    valid = False
+    if len(starts) == 1:
+        start = starts[0]
+        expected = [
+            ("variable", "$env:vt_cpu_matmul_tier"), ("symbol", "="),
+            tokens[start + 2],
+            ("word", "invoke-unsupportedtierprobe"),
+            ("operator", "-tiertest"), ("variable", "$tiertest"),
+            ("symbol", "}"), ("word", "finally"),
+            ("symbol", "{"),
+            ("variable", "$env:vt_cpu_matmul_tier"), ("symbol", "="),
+            ("variable", "$savedtier"), ("symbol", "}"),
+        ]
+        valid = tokens[start:start + len(expected)] == expected
+    if not valid:
+        errors.append(
+            "build-windows-release.ps1: AMX refusal must use only the isolated "
+            "unsupported-tier probe; exact AMX refusal block is required"
+        )
+
+
 def _powershell_function_body(text: str, name: str) -> str:
     syntax = _powershell_syntax(text)
     match = re.search(
@@ -494,7 +733,7 @@ def _cpp_braced_body(source: str, opening: int) -> tuple[str, int] | None:
 
 def _cpp_function_body_span(source: str,
                             signature: str) -> tuple[str, int, int] | None:
-    active = without_cpp_comments_and_literals(source)
+    active = _cpp_structural_view(source)
     search_from = 0
     while True:
         match = re.search(signature, active[search_from:])
@@ -592,6 +831,16 @@ def _cpp_logical_directives(source: str, stop: int):
         logical = ""
     if logical and re.match(r"\s*#", logical):
         yield logical_start, offset, logical
+
+
+def _cpp_structural_view(source: str) -> str:
+    """Blank inert text and complete directives without moving offsets."""
+    out = list(without_cpp_comments_and_literals(source))
+    for start, end, _ in _cpp_logical_directives(source, len(source)):
+        for offset in range(start, end):
+            if out[offset] not in {"\r", "\n"}:
+                out[offset] = " "
+    return "".join(out)
 
 
 def _cpp_condition_possibilities(expression: str,
@@ -707,9 +956,8 @@ def _active_cpp_macro_names_at(source: str, stop: int) -> set[str]:
 
 def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
     active = _active_powershell(text)
-    probe = _active_powershell(_powershell_function_body(
-        text, "Invoke-UnsupportedTierProbe"
-    ))
+    probe_body = _powershell_function_body(text, "Invoke-UnsupportedTierProbe")
+    probe = _active_powershell(probe_body)
     contract = _active_powershell(_powershell_function_body(
         text, "Invoke-UnsupportedTierContractTests"
     ))
@@ -725,81 +973,136 @@ def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
             "build-windows-release.ps1: missing active unsupported-tier fake-tool contract"
         )
 
-    filter_count = len(re.findall(re.escape(UNSUPPORTED_TIER_FILTER), probe))
-    exact_filter_argument = re.search(
-        r"\$arguments\s*=\s*@\(\s*(['\"])" +
-        re.escape(UNSUPPORTED_TIER_FILTER) + r"\1\s*\)",
-        probe,
-        re.IGNORECASE | re.MULTILINE,
+    probe_tokens = _validate_exact_unsupported_tier_probe(probe_body, errors)
+
+    def count_sequence(sequence: list[tuple[str, str]]) -> int:
+        return sum(
+            probe_tokens[index:index + len(sequence)] == sequence
+            for index in range(len(probe_tokens) - len(sequence) + 1)
+        )
+
+    filter_literals = sum(
+        _powershell_string_value(token) == UNSUPPORTED_TIER_FILTER
+        for token in probe_tokens
     )
-    if filter_count == 0:
+    exact_filter_argument = any(
+        probe_tokens[index:index + 3] == [
+            ("variable", "$arguments"), ("symbol", "="), ("symbol", "@(")
+        ] and index + 4 < len(probe_tokens) and
+        _powershell_string_value(probe_tokens[index + 3]) ==
+        UNSUPPORTED_TIER_FILTER and
+        probe_tokens[index + 4] == ("symbol", ")")
+        for index in range(len(probe_tokens) - 4)
+    )
+    if filter_literals == 0:
         errors.append(
             "build-windows-release.ps1: missing active isolated "
             "unsupported-tier filter"
         )
-    elif filter_count != 1 or exact_filter_argument is None:
+    elif not exact_filter_argument:
         errors.append(
             "build-windows-release.ps1: unsupported-tier probe requires one "
             "exact unsupported-tier filter argument"
         )
-    requirements = (
-        (
-            r"\$probeExitCode\s*-ne\s*1\b",
-            "exact unsupported-tier exit status",
-        ),
-        (
-            re.escape(UNSUPPORTED_TIER_DIAGNOSTIC),
-            "unsupported-tier diagnostic",
-        ),
-        (
-            r"@\(\s*&\s*\$TierTest\s+@arguments\s+2>&1\s*\)",
-            "merged unsupported-tier stdout/stderr capture",
-        ),
-        (
+    exit_check = [
+        ("variable", "$probeexitcode"), ("operator", "-ne"),
+        ("number", "1"),
+    ]
+    if count_sequence(exit_check) != 1:
+        errors.append(
+            "build-windows-release.ps1: missing active exact unsupported-tier exit status"
+        )
+    diagnostic_call = [
+        ("variable", "$diagnostic"), ("operator", "-notmatch"),
+        ("symbol", "["), ("word", "regex"), ("symbol", "]"),
+        ("symbol", "::"), ("word", "escape"), ("symbol", "("),
+    ]
+    inline_diagnostic_call = [
+        ("operator", "-notmatch"), ("symbol", "["), ("word", "regex"),
+        ("symbol", "]"), ("symbol", "::"), ("word", "escape"),
+        ("symbol", "("),
+    ]
+    diagnostic_bound = any(
+        ((probe_tokens[index:index + len(diagnostic_call)] == diagnostic_call and
+          index + len(diagnostic_call) < len(probe_tokens) and
+          _powershell_string_value(
+              probe_tokens[index + len(diagnostic_call)]) ==
+          UNSUPPORTED_TIER_DIAGNOSTIC) or
+         (probe_tokens[index:index + len(inline_diagnostic_call)] ==
+          inline_diagnostic_call and
+          index + len(inline_diagnostic_call) < len(probe_tokens) and
+          _powershell_string_value(
+              probe_tokens[index + len(inline_diagnostic_call)]) ==
+          UNSUPPORTED_TIER_DIAGNOSTIC))
+        for index in range(len(probe_tokens))
+    )
+    if not diagnostic_bound:
+        errors.append(
+            "build-windows-release.ps1: missing active unsupported-tier diagnostic"
+        )
+    if re.search(
             r"finally\s*\{[^}]*\$env:VT_CPU_MATMUL_TIER\s*=\s*\$savedTier",
-            "unsupported-tier environment restoration",
-        ),
-    )
-    for pattern, description in requirements:
-        scope = active if description == "unsupported-tier environment restoration" else probe
-        if re.search(pattern, scope, re.IGNORECASE | re.MULTILINE) is None:
-            errors.append(
-                f"build-windows-release.ps1: missing active {description}"
-            )
+            active, re.IGNORECASE | re.MULTILINE) is None:
+        errors.append(
+            "build-windows-release.ps1: missing active unsupported-tier "
+            "environment restoration"
+        )
 
-    tier_test_reference = (
-        r"(?:\$\{\s*(?:(?:global|script|local|private):)?TierTest\s*\}|"
-        r"\$(?:(?:global|script|local|private):)?TierTest\b)"
+    def invokes_tier_test(index: int) -> bool:
+        if probe_tokens[index] != ("symbol", "&"):
+            return False
+        for token in probe_tokens[index + 1:index + 6]:
+            if token[0] == "variable":
+                return token[1].rsplit(":", 1)[-1].lstrip("$") == "tiertest"
+            if token not in {("symbol", "("), ("symbol", "$"),
+                             ("symbol", ")")}:
+                return False
+        return False
+
+    direct_invocations = sum(
+        invokes_tier_test(index) for index in range(len(probe_tokens))
     )
-    invocation_target = (
-        r"&\s*(?:(?:\(|\$\()\s*)*" + tier_test_reference
+    exact_capture = [
+        ("symbol", "@("), ("symbol", "&"),
+        ("variable", "$tiertest"), ("splat", "@arguments"),
+        ("symbol", "2>&1"), ("symbol", ")"),
+    ]
+    exact_direct = sum(
+        probe_tokens[index:index + len(exact_capture)] == exact_capture
+        for index in range(len(probe_tokens) - len(exact_capture) + 1)
     )
-    direct_invocations = re.findall(
-        invocation_target, _powershell_syntax(probe), re.IGNORECASE
-    )
-    exact_direct = re.findall(
-        r"@\(\s*&\s*\$TierTest\s+@arguments\s+2>&1\s*\)",
-        probe,
-        re.IGNORECASE | re.MULTILINE,
-    )
-    if len(direct_invocations) != 1 or len(exact_direct) != 1:
+    if exact_direct != 1:
+        errors.append(
+            "build-windows-release.ps1: missing active merged unsupported-tier "
+            "stdout/stderr capture"
+        )
+    if direct_invocations != 1 or exact_direct != 1:
         errors.append(
             "build-windows-release.ps1: unsupported-tier probe requires "
             "exactly one filtered process invocation"
         )
 
-    runner_invocations = re.findall(r"&\s*\$Runner\b", probe, re.IGNORECASE)
-    exact_runner = re.findall(
-        r"\$probeResult\s*=\s*&\s*\$Runner\s+\$TierTest\s+\$arguments\b",
-        probe,
-        re.IGNORECASE,
+    runner_invocations = sum(
+        probe_tokens[index:index + 2] == [
+            ("symbol", "&"), ("variable", "$runner")
+        ]
+        for index in range(len(probe_tokens) - 1)
     )
-    if len(runner_invocations) != 1:
+    exact_runner_tokens = [
+        ("variable", "$proberesult"), ("symbol", "="),
+        ("symbol", "&"), ("variable", "$runner"),
+        ("variable", "$tiertest"), ("variable", "$arguments"),
+    ]
+    exact_runner = sum(
+        probe_tokens[index:index + len(exact_runner_tokens)] == exact_runner_tokens
+        for index in range(len(probe_tokens) - len(exact_runner_tokens) + 1)
+    )
+    if runner_invocations != 1:
         errors.append(
             "build-windows-release.ps1: unsupported-tier probe requires "
             "exactly one fake-runner invocation"
         )
-    elif len(exact_runner) != 1:
+    elif exact_runner != 1:
         errors.append(
             "build-windows-release.ps1: fake runner requires exact "
             "unsupported-tier filter arguments"
@@ -864,22 +1167,7 @@ def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
             "fake-tool contract"
         )
 
-    amx = re.search(
-        r"\$env:VT_CPU_MATMUL_TIER\s*=\s*[\"']amx[\"'](?P<body>.*?)"
-        r"(?:\}\s*finally\b|\bfinally\b)",
-        active,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if (amx is None or
-            re.search(r"Invoke-UnsupportedTierProbe\b[^\n]*\$tierTest\b",
-                      amx.group("body"), re.IGNORECASE) is None or
-            re.search(r"(?:Invoke-Checked\s+|&\s*)\$tierTest\b",
-                      amx.group("body"),
-                      re.IGNORECASE) is not None):
-        errors.append(
-            "build-windows-release.ps1: AMX refusal must use only the isolated "
-            "unsupported-tier probe"
-        )
+    _validate_exact_amx_refusal_block(active, errors)
 
 
 def _finite_timeout_expression(console: str, expression: str) -> bool:
@@ -898,7 +1186,7 @@ def _finite_timeout_expression(console: str, expression: str) -> bool:
 
 def _validate_bounded_drain(console: str, function: str, counter: str,
                             errors: list[str]) -> None:
-    active_console = without_cpp_comments_and_literals(console)
+    active_console = _cpp_structural_view(console)
     body_span = _cpp_function_body_span(
         console,
         rf"\bbool\s+{re.escape(function)}\s*\(",
