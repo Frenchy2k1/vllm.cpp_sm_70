@@ -981,6 +981,49 @@ never like-for-like), and the padded/multi-request spec shapes — capture takes
 EXACT shape today, which is bounded by `max_num_seqs` but leaves batching on the
 table.
 
+## 6o. METHOD CORRECTION: the oracle is not a stable denominator single-shot (2026-08-12)
+
+§6n quoted 0.986x / 0.995x from ONE oracle run per cell. That method does not
+survive contact with this box, and the corrected numbers are worse.
+
+**The oracle's own result moves up to 27% between same-config sessions:**
+
+| cell | oracle 12:23 | oracle 14:58 |
+|---|---|---|
+| "capital" | 78.76 | 98.01 |
+| "fibonacci" | 142.88 | 152.45 |
+
+Our reps hold to 0.3% across the same span, so the variance is the reference, not
+us. Part of it was self-inflicted: the 14:58 run put the oracle FIRST to dodge a
+GB10 reboot during its load, which handed it a freshly booted idle box — its best
+slot. The same comparison therefore reads 0.995x/0.986x one way and
+0.833x/0.925x the other.
+
+**INTERLEAVED (O,U,O,U,O,U in one flock, medians) is the binding form:**
+
+| cell | ours (per-rep medians) | oracle (per rep) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 75.3, 81.4, 78.2 | 81.5, 85.1, 97.8 | **0.919x** |
+| "fibonacci", 89 tok | 141.4, 141.4, 141.4 | 143.2, 149.4, 142.1 | **0.987x** |
+
+**So the lane is 0.92x-0.99x, NOT parity.** §6n's 0.986x/0.995x is superseded and
+should not be quoted. What survives §6n unchanged is the same-session,
+same-binary A/B, where both arms run adjacent under identical conditions and the
+capture is the only difference:
+
+| cell | capture OFF | capture ON | delta |
+|---|---|---|---|
+| "capital" | 72.7 | 81.6 | **+12.2%** |
+| "fibonacci" | 136.2 | 141.0 | **+3.5%** |
+
+That, the byte-identical output and the four green e2e suites are what justify
+W8; the cross-engine ratio is a separate claim and it is not yet met.
+
+**Rule for this row from here:** no cross-engine ratio without interleaved
+repetitions and medians. A single oracle load is worth nothing on a box whose
+reference swings 27%, and the direction of the error depends on who got the first
+slot.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
