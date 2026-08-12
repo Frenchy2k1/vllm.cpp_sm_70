@@ -869,6 +869,35 @@ static-shape capture increment, not a tuning knob.
 
 Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
 
+## 6m. W8 SLICE: capture the T=1+k verify (the remaining gap), issue #442
+
+§6l localises the residual 0.870x-0.981x to the VERIFY forward. This is the
+scoped increment that closes it; it is dispatch-ready and deliberately NOT
+started here, because a half-finished CUDA-graph capture is worse than none.
+
+**Predicate.** `pure_decode` is `num_actual_tokens == num_reqs`
+(`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`). A verify submits
+`num_reqs x (1+k)` tokens and therefore runs eager EVERY step, while upstream
+captures the uniform `1+k` shape.
+
+**Do NOT just widen the gate.** `Qwen3_5DenseDecodeGraph` is documented
+pure-decode ("all query_len==1"); relaxing the predicate would send a spec batch
+through a graph captured for a different shape AND a different attention path.
+The increment is a sibling capture keyed on `(num_reqs, 1+k)` that routes the
+SPEC paths already landed under `SPEC-GDN-SEGMENTS` (`vt::GdnSpecDecode`,
+`vt::CausalConv1dSpecUpdate`, per-timestep snapshots) and block-diagonal causal
+attention over the query span. k is fixed per config and `num_reqs <=
+max_num_seqs`, so the shape set is small and static.
+
+**Gate:** replayed == eager BIT-IDENTICAL on both gate models; spec-OFF
+byte-identical (SACRED); then the paired cross-engine re-measure on the same two
+35B cells, target >= 1.0x on both.
+
+**Capture safety:** no function-local upload temporaries in the captured region.
+This repo has already shipped a use-after-free from exactly that, and a
+sanitizer-clean run is not proof of capture safety -- pair it with an explicit
+replay-vs-eager bit-compare.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
