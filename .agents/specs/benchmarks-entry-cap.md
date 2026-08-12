@@ -193,35 +193,56 @@ next cadence of parallel work".
 
 `tests/scripts/test_check_public_doc_tables.py`:
 
-- `test_a_new_row_costs_no_eviction`: a page sized just under the retired
-  45,000 budget gains one row and stays valid. RED on BASE (over budget),
-  green on HEAD. This is the acceptance test.
+- `test_the_shipped_page_can_accept_the_next_measurement_row`: **the acceptance
+  test.** It adds the owed 35B canonical regrid row to the REAL page, asserts
+  every pre-existing row survives, and asserts the result is valid above the
+  retired budget. The row is added and dropped inside the test, so the page is
+  not edited and #481 is not collided with.
+- `test_a_new_row_costs_no_eviction`: the same property on a synthetic page
+  sized past the retired 45,000 budget. RED on BASE, which reports
+  `48836 chars, over the 45000-char scoreboard budget`.
 - `test_oversized_row_fails`: a single row past `MAX_ROW_CHARS` is rejected.
   RED on BASE, which has no row cap.
-- `test_row_cap_is_tighter_than_the_cell_cap`: a row of legal cells whose sum is
-  illegal is rejected, so the entry cap is not subsumed by `MAX_CELL_CHARS`.
-- `test_dated_h2_is_rejected` and `test_dated_h3_is_rejected`: an appended
-  per-attempt section fails at the first one, at either depth. RED on BASE for
-  `###`, which no rule covered.
-- `test_subject_headings_are_allowed`: a genuinely new subject subsection
-  passes, so the guard is not a section freeze.
-- `test_the_live_pages_carry_no_dated_heading`: the two shipped pages satisfy
-  the new guard.
+- `test_the_row_cap_is_not_subsumed_by_the_cell_cap`: a row of legal cells whose
+  sum is illegal is rejected, so the entry cap adds a rule `MAX_CELL_CHARS` does
+  not already carry.
+- `test_a_row_at_the_cap_is_allowed`: the boundary is inclusive.
+- `test_a_dated_h2_is_rejected`, `test_a_dated_h3_is_rejected`, and
+  `test_a_dated_h3_is_rejected_on_the_feature_matrix_too`: an appended
+  per-attempt section fails at the first one, at either depth, on either page.
+  RED on BASE for `###`, which no rule covered.
+- `test_a_new_subject_subsection_is_allowed` and `test_a_dated_row_is_still_allowed`:
+  the guard is not a section freeze and does not reach into rows.
+- `test_a_date_inside_a_fence_is_not_a_heading`: sample output is not a section.
+- `test_the_shipped_pages_carry_no_dated_heading`: the two live pages satisfy
+  the new guard as shipped.
+- `test_no_page_carries_a_whole_file_size_budget`: the invariant behind this
+  row, held as a rule rather than as a habit.
 - Replaced: `test_oversized_page_fails`,
   `test_release_projection_fits_after_current_main_merge`'s `max_chars`
   assertion, `test_the_two_pages_have_distinct_budgets`'s `max_chars`
   comparison. Each is replaced by an assertion on the rule that took the
   obligation over, never deleted outright.
 
-`tests/scripts/test_agent_record.py`, new `LinkExtractionTests`:
+`tests/scripts/test_agent_record.py`, new `LinkExtraction`:
 
-- `test_fenced_link_is_not_extracted` and `test_inline_code_link_is_not_extracted`:
-  RED on BASE, which extracts both.
-- `test_live_link_is_still_extracted` and
-  `test_link_after_a_closed_fence_is_still_extracted`: the narrowing does not
-  swallow real links.
-- `test_archived_docs_relative_link_resolves`: the #460 reproduction, moved into
-  the record as live markdown, resolves.
+- `test_fenced_link_is_not_extracted`, `test_tilde_fenced_link_is_not_extracted`
+  and `test_inline_code_link_is_not_extracted`: RED on BASE, which extracts all
+  three.
+- `test_live_link_is_still_extracted`, `test_a_backticked_label_is_still_a_link`,
+  `test_link_after_a_closed_fence_is_still_extracted` and
+  `test_link_beside_an_inline_span_is_still_extracted`: the narrowing does not
+  swallow real links, including the `[`name`](path)` form this tree uses
+  everywhere.
+- `test_stripping_preserves_line_and_column_positions`: spans are blanked, not
+  deleted, so reported line numbers stay honest.
+- `test_an_archived_row_with_a_docs_relative_link_is_accepted`: the #460
+  reproduction, moved into the record as live markdown, resolves. RED on BASE
+  with `dangling link bench-evidence/rpi5-a76-q8-dot-20260806.md`.
+- `test_an_archived_row_with_a_MISSING_link_still_dangles`: the second base is a
+  base, not an amnesty.
+- `test_the_benchmark_record_also_resolves_from_docs` and the two `link_bases`
+  cases in `MigratedLegacyLinks`: every other file keeps single-base resolution.
 - `test_the_tree_has_no_dangling_link`: the whole-tree run stays green.
 
 ## Gates
@@ -283,7 +304,17 @@ is thin (580 of 600). Accepted; the alternative, no row cap, leaves
 rule was always about. A fenced target is not a link under CommonMark, so no
 reader can follow it and no rendering can dangle. Real links, including one on
 the same line after a closed inline span, stay checked, and
-`test_the_tree_has_no_dangling_link` holds the whole tree.
+`test_the_tree_has_no_dangling_link` holds the whole tree. Measured across the
+481 markdown files the checker scans: **4,109 targets before the strip, 4,105
+after**, so 4 stop being validated and all 4 are quoted samples.
+
+**Risk: an unbalanced fence blanks the rest of a file.** It does, and one file
+in the tree has one: `.agents/specs/laguna-s21-scope-2026-07-30.md` ends on a
+stray closing fence at its last line. It costs nothing today, because there is
+no content after it, and the same behaviour already exists in
+`_prose_paragraphs`, `_table_rows` and `split_sections`. Making an unbalanced
+fence an error is a separate rule with a separate red-before, not part of this
+change.
 
 **Risk: two-base resolution in the archive hides a genuine dangling link.** The
 second base applies to one file, `.agents/benchmark-record.md`, the declared
