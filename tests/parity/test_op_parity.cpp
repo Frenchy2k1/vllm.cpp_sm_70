@@ -872,19 +872,12 @@ int GoldenTag(const fs::path& dir) {
 }
 
 // Snapshot dir of the pinned 35B checkpoint (contains config.json), or "".
-std::string Find35BSnapshot() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path snaps =
-      fs::path(home) /
-      ".cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec)) {
-    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
-  }
-  return "";
-}
+// GATE-PIN-UNPINNED-SNAPSHOTS (#471). This used to take the first
+// `directory_iterator` entry under `<repo>/snapshots/`. The 35B goldens name the
+// revision they were captured against (`oracle.model` of
+// goldens/qwen36_*_35b/manifest.json), so there was never a reason not to
+// enforce it. Now pinned; a cache holding another revision skips.
+std::string Find35BSnapshot() { return parity::Qwen36A3bNvfP4Snapshot(); }
 
 std::optional<vllm::SafetensorsFile> OpenShard(const std::string& snapshot,
                                                int n) {
