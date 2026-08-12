@@ -19904,3 +19904,63 @@ scales/zero-point layout. Recovering 8.2% there is worth the full 2.5%.
 
 Evidence: `dgx:~/work/dspark-w6/oracle_prof.log`, `oracle_kernels.json`,
 `prof/ours_{32,96}.nsys-rep`.
+
+## SPEC-DSPARK: narrowing the 8.2% inside the Marlin MoE kernel (2026-08-12)
+
+Instrumentation cross-check (ours nsys, upstream torch profiler):
+
+| | ours | upstream | delta |
+|---|---|---|---|
+| Marlin MoE | 249.2 ms | 230.4 ms | +8.2% |
+| everything else | 392.8 ms | 393.6 ms | -0.2% |
+| total decode GPU | 642.0 ms | 624.0 ms | +2.9% |
+
+All other GPU work matches to 0.2%, so the tools are not the explanation, and the
+total tracks the pinned-clock wall gap (2.5%).
+
+Eliminated by source reading: kernel selection (full template arguments identical
+on both sides), the block_size_m >= 16 clamp for 1-byte inputs (same instantiation
+proves it does not bite here), grid selection (determine_exec_config is
+byte-identical to the pinned csrc copy, 69 lines, and both callers take the auto
+path), and ignore_invalid_experts (only matters with an expert_map).
+
+Remaining: what the kernel READS. Our load path runs TransposeToInt32Kernel and
+ProcessScalesKernel that upstream does not, adapting a different source layout, so
+the stride/padding/alignment of the final B and scales tensors is unverified; and
+weight RESIDENCY is unestablished on this path, against a standing GB10 finding
+that host/ATS-retagged weights are materially slower per GEMM.
+
+Next step is measurement, not a rewrite: dump B/scales strides and pointer
+residency for one expert on both sides and compare. The kernel itself is vendored
+from vLLM and identical where it chooses what to run.
+
+## SPEC-DSPARK: the kernel inputs MATCH -- the 8.2% may be routing (2026-08-12)
+
+Direct comparison of what each engine hands the Marlin MoE kernel:
+
+| property | ours | upstream |
+|---|---|---|
+| w13 scales per expert | 2*(K/16)*N = 131072 B | [256,128,1024] fp8 = 131072 B |
+| w2 scales per expert | (N/16)*K = 65536 B | [256,32,2048] fp8 = 65536 B |
+| pointer alignment | pool over cudaMalloc | ptr%16 == 0, ptr%256 == 0 |
+| residency | cudaMalloc (device) | torch CUDA tensor (device) |
+
+Identical kernel, instantiation, grid rule, launch count, scale layout, alignment
+and residency. "Our kernel is slower" is no longer the simplest explanation.
+
+Likelier: we are not doing the same WORK. The kernel loops
+div_ceil(num_tokens_past_padded, moe_block_size) blocks per launch, and that
+depends on how many DISTINCT experts the batch touches (E=256, top_k=8, M=9 ->
+up to 72 pairs, each padded). The launch COUNT is fixed by layers x steps (1520
+both sides) but the blocks per launch are not. Our token stream is not upstream's
+-- the 35B "fibonacci" outputs diverge at char 55 (`return (` vs `return(`), the
+ratified near-tie regime -- so the two engines can execute different amounts of
+expert work for the same prompt.
+
+If so, the 8.2% is not an implementation gap and cannot be optimised away.
+
+Deciding experiment, required BEFORE any kernel work: instrument
+num_tokens_past_padded (or per-call block count) on both sides for the same
+prompt and compare totals. Equal totals => our kernel is genuinely slower.
+Different totals => the gap is routing and the kernel comparison was never
+like-for-like.
