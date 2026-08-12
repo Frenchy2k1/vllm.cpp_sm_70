@@ -335,6 +335,47 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, threadpool)
 
+        manager_source = (
+            REPO / "src/vllm/v1/core/single_type_kv_cache_manager.cpp"
+        ).read_text(encoding="utf-8")
+        active = checker._cpp_structural_view(manager_source)
+        shadow_contracts = {
+            "FullAttentionManager::find_longest_cache_hit": (
+                r"\bBlockPool\s*&\s*block_pool\b",
+                r"\bKVCacheSpec\s*&\s*kv_cache_spec\b",
+                r"\b(?:const\s+)?int\s+block_size\b",
+            ),
+            "SlidingWindowManager::find_longest_cache_hit": (
+                r"\bBlockPool\s*&\s*block_pool\b",
+                r"\bKVCacheSpec\s*&\s*kv_cache_spec\b",
+                r"\b(?:const\s+)?int\s+block_size\b",
+            ),
+            "SlidingWindowManager::reachable_block_mask": (
+                r"\b(?:const\s+)?int\s+block_size\b",
+            ),
+            "ChunkedLocalAttentionManager::find_longest_cache_hit": (
+                r"\bBlockPool\s*&\s*block_pool\b",
+                r"\bKVCacheSpec\s*&\s*kv_cache_spec\b",
+            ),
+            "MambaManager::find_longest_cache_hit": (
+                r"\bBlockPool\s*&\s*block_pool\b",
+                r"\bKVCacheSpec\s*&\s*kv_cache_spec\b",
+                r"\b(?:const\s+)?int\s+block_size\b",
+            ),
+        }
+        for method, declarations in shadow_contracts.items():
+            signature = rf"\b{re.escape(method)}\s*\("
+            span = checker._cpp_function_body_span(manager_source, signature)
+            self.assertIsNotNone(span, method)
+            assert span is not None
+            match = re.search(signature, active)
+            self.assertIsNotNone(match, method)
+            assert match is not None
+            method_scope = active[match.start():span[2] + 1]
+            for declaration in declarations:
+                with self.subTest(method=method, declaration=declaration):
+                    self.assertNotRegex(method_scope, declaration)
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):

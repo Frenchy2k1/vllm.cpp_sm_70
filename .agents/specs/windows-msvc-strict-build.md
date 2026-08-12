@@ -120,6 +120,15 @@ two embedding API runtime cases returning HTTP 500 where the CPU configuration
 passes; that behavior is outside this compile-only repair and requires its own
 tracked decision rather than a silent scope expansion.
 
+Fresh mutation review then restored
+`src/vllm/v1/core/single_type_kv_cache_manager.cpp` byte-for-byte from the
+parent and found that the real-tree source-warning test did not detect the
+reintroduced C4458 declarations. The repaired test structurally scopes the
+five affected manager methods after removing comments, literals, and complete
+preprocessor directives. Restoring parent blob `98f8665d` now produces 12
+focused failures across the `block_pool`, `kv_cache_spec`, and `block_size`
+shadow families; candidate blob `db3d4f15` passes.
+
 Native MSVC CPU/Vulkan reruns remain the authoritative `/W4 /WX` validation and
-are not inferred from Linux. The exact PR-range gate also remains dependent on
-the independent #458 hermetic-tool repair.
+are not inferred from Linux. The integrated exact PR-range gate uses the
+independent #458 hermetic evidence-tool repair carried by the candidate.
