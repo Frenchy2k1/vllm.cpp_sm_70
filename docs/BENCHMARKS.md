@@ -262,7 +262,7 @@ it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
 measured concurrent serving against llama.cpp's server.
 
-**x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, PARITY**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
+**x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 
 ## MLX-LM, Apple M4
 

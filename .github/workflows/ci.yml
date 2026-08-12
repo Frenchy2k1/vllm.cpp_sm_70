@@ -144,6 +144,13 @@ jobs:
         run: |
           python3 scripts/check-surface-coverage.py
           python3 tests/scripts/test_check_surface_coverage.py
+      - name: The x86_64 CPU floor harness runs from a clean checkout
+        # It shipped unable to run at all: `OUT=evi` with no `mkdir -p`, so every
+        # redirection failed, every leg was discarded for a non-zero exit, and
+        # the series died blaming contention it had never reached. Stub engines,
+        # so this needs no model, no GPU and no quiet box.
+        run: |
+          python3 tests/scripts/test_cpu_x86_llamacpp_floor.py
       - name: Critical regression tests remain executable and CTest-registered
         run: |
           python3 scripts/check-test-registration.py

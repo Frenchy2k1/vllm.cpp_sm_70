@@ -19409,8 +19409,14 @@ Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
 ## Moved out of `docs/BENCHMARKS.md` 2026-08-11 to pay for the x86_64 CPU row (#433)
 
 Moved BYTE-FOR-BYTE, links and provenance intact, because
-`docs/BENCHMARKS.md` is a projection surface under a hard 45,000-character cap
-and had 241 characters of headroom. Nothing is deleted.
+`docs/BENCHMARKS.md` is a projection surface that had reached its hard
+45,000-character cap. Nothing is deleted. The remaining headroom is
+deliberately NOT quoted here: `scripts/check-public-doc-tables.py` measures it,
+in characters, and is the only authority on it — a number that moves on every
+edit of one file does not belong inside another. (The first version of this
+note said "241 characters"; the commit said 64 and the PR body said 80. The
+checker counts characters and 80 was the right answer at that SHA, which is the
+whole argument for not writing it down here.)
 
 The row was already marked SUPERSEDED in place by the BINDING row directly
 above it in the 35B concurrency table. It is quoted inside a fenced block so
@@ -19420,7 +19426,13 @@ A second candidate, the RPi5 `Assembly vs compiler SDOT` row, was NOT moved and
 stays in `docs/BENCHMARKS.md`: it carries a relative link that resolves from
 `docs/` and dangles from here, and rewriting the path would break the
 byte-for-byte guarantee this section exists to provide. The x86_64 row that
-this move pays for was shortened instead.
+this move pays for was shortened instead. That is not a quirk of one row — it
+is the general blocker on compacting this surface at all, filed with its
+mechanism and a reproduction as
+[#460](https://github.com/mudler/vllm.cpp/issues/460): `check_links` in
+`scripts/check-agent-record.py` matches links inside fenced code blocks and
+resolves them from the archive's own directory, so no row carrying a
+`docs/`-relative link can be archived verbatim.
 
 From the Qwen3.6-35B-A3B concurrency table:
 
