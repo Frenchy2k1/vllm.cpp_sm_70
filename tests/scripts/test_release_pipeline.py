@@ -460,6 +460,156 @@ class ReleasePipelineContract(unittest.TestCase):
         ]
         self.assertEqual(missed, [])
 
+    def test_pr_windows_gate_rejects_structural_yaml_authority(self) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(self.checker.validate_pr_ci(original), [])
+        cpu_block = self.checker.job_block(original, "windows-msvc-cpu")
+        self.assertTrue(cpu_block)
+
+        def replace_once(before: str, after: str) -> str:
+            self.assertEqual(cpu_block.count(before), 1, before)
+            changed = cpu_block.replace(before, after, 1)
+            self.assertEqual(original.count(cpu_block), 1)
+            return original.replace(cpu_block, changed, 1)
+
+        job_anchor = (
+            "    timeout-minutes: 180\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+        )
+        contract = (
+            "      - name: Prove PowerShell, static CRT, and unsupported-tier contracts\n"
+            "        run: ./scripts/build-windows-release.ps1 -ContractTest\n"
+        )
+        build_name = (
+            "      - name: Build and execute the native Windows CPU focused gate\n"
+        )
+        build_env = (
+            "        env:\n"
+            "          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n"
+            "          SOURCE_SHA: ${{ github.sha }}\n"
+        )
+        mutations = {
+            "job environment authority": replace_once(
+                job_anchor,
+                "    timeout-minutes: 180\n"
+                "    environment: release\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n",
+            ),
+            "job GH token environment": replace_once(
+                job_anchor,
+                "    timeout-minutes: 180\n"
+                "    env:\n"
+                "      GH_TOKEN: ${{ github.token }}\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n",
+            ),
+            "job malicious shell default": replace_once(
+                job_anchor,
+                "    timeout-minutes: 180\n"
+                "    defaults:\n"
+                "      run:\n"
+                "        shell: cmd /c {0}\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n",
+            ),
+            "job output": replace_once(
+                job_anchor,
+                "    timeout-minutes: 180\n"
+                "    outputs:\n"
+                "      release: ${{ steps.release.outputs.id }}\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n",
+            ),
+            "timeout omitted": replace_once(
+                "    timeout-minutes: 180\n", ""
+            ),
+            "timeout changed": replace_once(
+                "    timeout-minutes: 180\n", "    timeout-minutes: 181\n"
+            ),
+            "contract malicious shell": replace_once(
+                contract,
+                contract + "        shell: cmd /c {0}\n",
+            ),
+            "contract token environment": replace_once(
+                contract,
+                contract
+                + "        env:\n"
+                + "          GH_TOKEN: ${{ github.token }}\n",
+            ),
+            "contract continues on error": replace_once(
+                contract,
+                contract + "        continue-on-error: true\n",
+            ),
+            "contract changes working directory": replace_once(
+                contract,
+                contract + "        working-directory: scripts\n",
+            ),
+            "build malicious shell": replace_once(
+                build_name, build_name + "        shell: cmd /c {0}\n"
+            ),
+            "build continues on error": replace_once(
+                build_name, build_name + "        continue-on-error: true\n"
+            ),
+            "build changes working directory": replace_once(
+                build_name, build_name + "        working-directory: scripts\n"
+            ),
+            "build token environment": replace_once(
+                build_env,
+                build_env + "          GH_TOKEN: ${{ github.token }}\n",
+            ),
+            "duplicate uses key hides release action": replace_once(
+                "      - uses: actions/checkout@v4\n",
+                "      - uses: actions/checkout@v4\n"
+                "        uses: softprops/action-gh-release@v2\n",
+            ),
+            "duplicate timeout key": replace_once(
+                "    timeout-minutes: 180\n",
+                "    timeout-minutes: 180\n    timeout-minutes: 1\n",
+            ),
+            "YAML alias": original
+            + "\nx-windows-template: &windows-template\n"
+            + "  runs-on: windows-2022\n"
+            + "x-windows-copy: *windows-template\n",
+            "YAML merge key": replace_once(
+                "    permissions:\n      contents: read\n",
+                "    permissions: &windows-permissions\n"
+                "      contents: read\n"
+                "    defaults:\n"
+                "      <<: *windows-permissions\n",
+            ),
+        }
+        missed = [
+            label
+            for label, workflow in mutations.items()
+            if not self.checker.validate_pr_ci(workflow)
+        ]
+        self.assertEqual(missed, [])
+
+    def test_pr_windows_gate_yaml_validation_ignores_comments_and_order(self) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        before = (
+            "    if: github.event_name == 'pull_request'\n"
+            "    permissions:\n"
+            "      contents: read\n"
+            "    runs-on: windows-2022\n"
+            "    timeout-minutes: 180\n"
+        )
+        after = (
+            "    # Structural validation must ignore comments and key order.\n"
+            "    timeout-minutes: 180\n"
+            "    runs-on: windows-2022\n"
+            "\n"
+            "    permissions:\n"
+            "      # The sole job permission remains read-only.\n"
+            "      contents: read\n"
+            "    if: github.event_name == 'pull_request'\n"
+        )
+        self.assertEqual(original.count(before), 2)
+        commented = original.replace(before, after)
+        self.assertEqual(self.checker.validate_pr_ci(commented), [])
+
     def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
         tag = "refs/tags/v0.0.3-pre.1"
         self.assertFalse(self.plan("push", tag)["publish"])

@@ -7,11 +7,66 @@ import re
 import shlex
 import sys
 from pathlib import Path
+from typing import Any
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - exercised by the fail-closed caller path.
+    yaml = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+
+
+class WorkflowYamlError(ValueError):
+    """The workflow is not an unambiguous YAML mapping."""
+
+
+if yaml is not None:
+
+    class UniqueWorkflowLoader(yaml.SafeLoader):
+        """Safe YAML loader that rejects duplicate keys and references."""
+
+        def compose_node(self, parent: Any, index: Any) -> Any:
+            if self.check_event(yaml.AliasEvent):
+                raise WorkflowYamlError("YAML aliases are not allowed")
+            event = self.peek_event()
+            if getattr(event, "anchor", None) is not None:
+                raise WorkflowYamlError("YAML anchors are not allowed")
+            return super().compose_node(parent, index)
+
+        def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+            if not isinstance(node, yaml.MappingNode):
+                raise WorkflowYamlError("expected a YAML mapping")
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    raise WorkflowYamlError("YAML merge keys are not allowed")
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in mapping
+                except TypeError as exc:
+                    raise WorkflowYamlError("YAML mapping key is not scalar") from exc
+                if duplicate:
+                    raise WorkflowYamlError(f"duplicate YAML key {key!r}")
+                mapping[key] = self.construct_object(value_node, deep=deep)
+            return mapping
+
+
+def load_workflow_yaml(text: str) -> dict[Any, Any]:
+    """Load one workflow without YAML features that obscure effective authority."""
+
+    if yaml is None:
+        raise WorkflowYamlError("PyYAML is required for workflow validation")
+    try:
+        document = yaml.load(text, Loader=UniqueWorkflowLoader)
+    except yaml.YAMLError as exc:
+        raise WorkflowYamlError(f"invalid workflow YAML: {exc}") from exc
+    if not isinstance(document, dict):
+        raise WorkflowYamlError("workflow root must be a mapping")
+    return document
 
 
 def job_block(text: str, name: str) -> str:
@@ -80,128 +135,76 @@ def workflow_steps(block: str) -> list[str]:
     return [block[start:end] for start, end in zip(starts, starts[1:])]
 
 
-def direct_scalar_values(text: str, indent: int, key: str) -> list[str]:
-    """Return scalar values for a key at one exact YAML indentation level."""
-
-    spaces = " " * indent
-    return re.findall(
-        rf"(?m)^{re.escape(spaces)}{re.escape(key)}:\s*([^\n]+?)\s*$", text
-    )
-
-
-def indented_mapping_blocks(text: str, indent: int, key: str) -> list[str]:
-    """Return mapping bodies for a key at one exact YAML indentation level."""
-
-    lines = text.splitlines()
-    prefix = " " * indent
-    blocks: list[str] = []
-    for index, line in enumerate(lines):
-        if line != f"{prefix}{key}:":
-            continue
-        end = index + 1
-        while end < len(lines):
-            candidate = lines[end]
-            if candidate.strip() and len(candidate) - len(candidate.lstrip()) <= indent:
-                break
-            end += 1
-        blocks.append("\n".join(lines[index + 1 : end]))
-    return blocks
-
-
-def step_run_value(step: str) -> str | None:
-    """Return one inline or literal run value from a workflow step."""
-
-    values = direct_scalar_values(step, 8, "run")
-    if len(values) != 1:
-        return None
-    if values[0] == "|":
-        return step_run_script(step)
-    return values[0]
-
-
-def step_scalar_values(step: str, key: str) -> list[str]:
-    """Return scalar values whether the key starts or follows a list item."""
-
-    return re.findall(
-        rf"(?m)^(?:      - |        ){re.escape(key)}:\s*([^\n]+?)\s*$", step
-    )
-
-
 def validate_pr_ci(text: str) -> list[str]:
     """Require native Windows proof on PRs without release authority."""
 
+    try:
+        workflow = load_workflow_yaml(text)
+    except WorkflowYamlError as exc:
+        return [f"PR CI workflow YAML is ambiguous or invalid: {exc}"]
+    jobs = workflow.get("jobs")
+    if not isinstance(jobs, dict):
+        return ["PR CI workflow must contain one jobs mapping"]
+
     errors: list[str] = []
     contracts = (
-        ("windows-msvc-cpu", "cpu", "build-pr-windows-cpu"),
-        ("windows-msvc-vulkan", "vulkan", "build-pr-windows-vulkan"),
+        (
+            "windows-msvc-cpu",
+            "CPU",
+            "cpu",
+            "build-pr-windows-cpu",
+        ),
+        (
+            "windows-msvc-vulkan",
+            "Vulkan",
+            "vulkan",
+            "build-pr-windows-vulkan",
+        ),
     )
-    for job, backend, build_dir in contracts:
-        if len(re.findall(rf"(?m)^  {re.escape(job)}:$", text)) != 1:
-            errors.append(f"PR CI must contain exactly one {job} job")
-            continue
-        block = job_block(text, job)
-        if not block:
+    for job, backend_label, backend, build_dir in contracts:
+        actual = jobs.get(job)
+        if actual is None:
             errors.append(f"PR CI is missing required {job} job")
             continue
-
-        if direct_scalar_values(block, 4, "if") != [
-            "github.event_name == 'pull_request'"
-        ]:
-            errors.append(f"{job} must use the exact pull-request-only condition")
-        if direct_scalar_values(block, 4, "runs-on") != ["windows-2022"]:
-            errors.append(f"{job} must use exactly the windows-2022 runner")
-
-        permission_blocks = indented_mapping_blocks(block, 4, "permissions")
-        if len(permission_blocks) != 1 or permission_blocks[0].splitlines() != [
-            "      contents: read"
-        ]:
-            errors.append(f"{job} permissions must contain only contents: read")
-
-        if len(indented_mapping_blocks(block, 4, "steps")) != 1:
-            errors.append(f"{job} must contain exactly one steps mapping")
-        steps = workflow_steps(block)
-        if len(steps) != 3:
-            errors.append(f"{job} must contain exactly three native proof steps")
-
-        uses = [value for step in steps for value in step_scalar_values(step, "uses")]
-        if uses != ["actions/checkout@v4"]:
-            errors.append(f"{job} must use exactly one action: actions/checkout@v4")
-        checkout_steps = [
-            step
-            for step in steps
-            if step_scalar_values(step, "uses") == ["actions/checkout@v4"]
-        ]
-        if len(checkout_steps) != 1 or checkout_steps[0].strip() != (
-            "- uses: actions/checkout@v4"
-        ):
-            errors.append(f"{job} checkout must have no explicit ref or extra configuration")
-
-        run_values = [(step, step_run_value(step)) for step in steps]
-        contract_command = "./scripts/build-windows-release.ps1 -ContractTest"
-        if sum(value == contract_command for _, value in run_values) != 1:
-            errors.append(f"{job} must run exactly one authoritative ContractTest")
-
         expected_script = (
             "$env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version\n"
             "$env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()\n"
             "./scripts/build-windows-release.ps1 `\n"
             f"  -Backend {backend} `\n"
             f"  -ArtifactId windows-x86_64-msvc-{backend} `\n"
-            f"  -BuildDir $env:GITHUB_WORKSPACE/{build_dir}"
+            f"  -BuildDir $env:GITHUB_WORKSPACE/{build_dir}\n"
         )
-        build_steps = [step for step, value in run_values if value == expected_script]
-        if len(build_steps) != 1:
-            errors.append(f"{job} must run exactly one correctly bound native build driver")
-        else:
-            env_blocks = indented_mapping_blocks(build_steps[0], 8, "env")
-            expected_env = [
-                "          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                "          SOURCE_SHA: ${{ github.sha }}",
-            ]
-            if len(env_blocks) != 1 or env_blocks[0].splitlines() != expected_env:
-                errors.append(
-                    f"{job} build provenance must bind the exact source SHA and evidence URL"
-                )
+        expected = {
+            "if": "github.event_name == 'pull_request'",
+            "permissions": {"contents": "read"},
+            "runs-on": "windows-2022",
+            "timeout-minutes": 180,
+            "steps": [
+                {"uses": "actions/checkout@v4"},
+                {
+                    "name": "Prove PowerShell, static CRT, and unsupported-tier contracts",
+                    "run": "./scripts/build-windows-release.ps1 -ContractTest",
+                },
+                {
+                    "name": (
+                        "Build and execute the native Windows "
+                        f"{backend_label} focused gate"
+                    ),
+                    "env": {
+                        "EVIDENCE_URL": (
+                            "${{ github.server_url }}/${{ github.repository }}"
+                            "/actions/runs/${{ github.run_id }}"
+                        ),
+                        "SOURCE_SHA": "${{ github.sha }}",
+                    },
+                    "run": expected_script,
+                },
+            ],
+        }
+        if actual != expected:
+            errors.append(
+                f"{job} must exactly match the read-only native Windows PR proof schema"
+            )
     return errors
 
 
