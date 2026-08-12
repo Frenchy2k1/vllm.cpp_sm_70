@@ -6,12 +6,15 @@
 // The forward + loader materialization + strict gate are NAMED W3-W8 residuals
 // (see .agents/specs/deepseek-v4-flash.md §5); nothing here claims the model runs.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_probe.h"
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <doctest/doctest.h>
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -85,6 +88,21 @@ TEST_CASE("deepseek-v4 scaffold: DeepseekV4ForCausalLM RESOLVES through the regi
   CHECK(reg.architecture == "DeepseekV4ForCausalLM");
   CHECK(reg.info.is_text_generation_model);
   CHECK_FALSE(reg.info.supports_multimodal);
+}
+
+TEST_CASE("deepseek-v4 expert probe input stays in the float domain") {
+  for (const float frequency : {0.017f, 0.013f}) {
+    const std::vector<float> actual =
+        vllm::detail::DeepseekV4ExpertProbeInput(10, frequency);
+    REQUIRE(actual.size() == 10);
+    for (int64_t i = 0; i < static_cast<int64_t>(actual.size()); ++i) {
+      const float expected =
+          0.5f * std::sin(frequency * static_cast<float>(i + 1));
+      CAPTURE(frequency);
+      CAPTURE(i);
+      CHECK(actual[static_cast<size_t>(i)] == expected);
+    }
+  }
 }
 
 TEST_CASE("deepseek-v4 scaffold: config DESCENDS (ParseDeepseekV4Params)") {

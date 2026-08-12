@@ -38,13 +38,13 @@ result by `0.5f` remains double before the narrowing assignment.
 Extract the sequence construction into an internal model helper used by the
 expert probe. Its implementation uses `0.5f`, a float frequency, and
 `static_cast<float>(i + 1)`, so overload resolution remains float throughout.
-Add a focused DeepSeek scaffold unit that verifies exact float bit patterns for
-the first four `0.017f` values and representative `0.013f` values. The second
-and later `0.017f` samples deliberately differ by one ULP from the old
-double-then-narrow sequence, so the test proves the intended arithmetic rather
-than accepting a warning-hiding result cast. Add a source-contract assertion to
-the Windows portability suite so reintroducing either double literal is caught
-before hosted MSVC.
+The helper declaration lives under `src/`, not the installed public headers, so
+the semantic test exercises production arithmetic without expanding the public
+ABI. Add a focused DeepSeek scaffold unit that verifies both generated vectors
+against the float-domain formula on the active standard-library implementation.
+Add source-contract assertions to the Windows portability suite that pin both
+float call-site literals and the float `std::sin` expression, so neither a
+double overload nor a warning-hiding result cast can satisfy the contract.
 
 RED must be captured before implementation: the semantic test links against a
 declared but absent helper, and the source-contract test rejects both current
@@ -73,4 +73,15 @@ family.
 
 ## Outcome
 
-Pending implementation and immutable gate evidence.
+The helper now evaluates `0.5f * std::sin(frequency *
+static_cast<float>(i + 1))`, and the two probe inputs pass `0.017f` and `0.013f`.
+The public headers, `/W4 /WX`, inference paths, and release surfaces are
+unchanged. A result cast was rejected because it would only conceal the
+narrowing while preserving double-domain arithmetic.
+
+RED evidence was exact: the portability test failed its two missing call-site
+contracts, and the semantic target failed to link with two undefined helper
+references before the implementation existed. GREEN evidence on Linux is the
+68-test Windows-portability suite, all 10 `deepseek_v4` tests in clean CPU and
+Vulkan builds, and their warning-clean compilation. Native MSVC CPU and Vulkan
+reruns remain the final external gate after the candidate is pushed to PR #446.

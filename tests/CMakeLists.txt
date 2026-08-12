@@ -152,6 +152,7 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # ParseDeepseekV4Params. No checkpoint / GPU — the forward + strict gate are
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
+target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
 # registry + ParseLagunaParams descends the shipped config (nested dual-rope +
