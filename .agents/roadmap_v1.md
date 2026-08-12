@@ -37,6 +37,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
 | [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
+| [#433](https://github.com/mudler/vllm.cpp/issues/433) | `BACKEND-GATE-CPU-LLAMACPP` | No x86_64 arm: the closed CPU floor is Arm/i8mm-only and every lever that closed it is Arm-specific | perf |
 | [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |
 | [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
 | [#132](https://github.com/mudler/vllm.cpp/issues/132) | `BACKEND-ROCM` | ROCm `-O0` RmsNorm CLR HostcallListener teardown deadlock | bug |
@@ -52,6 +53,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#301](https://github.com/mudler/vllm.cpp/issues/301) | `ENG-LOAD-DIRECT-UPLOAD` | `main` is RED on ASan/UBSan: five misaligned BF16 reads from borrowed mmap weights | bug |
 | [#374](https://github.com/mudler/vllm.cpp/issues/374) | `ENG-NOW-DERIVED` | NOW.md is still a surface every PR must write: the doc-checkpoint gate marches them into it | bug |
 | [#364](https://github.com/mudler/vllm.cpp/issues/364) | `ENG-RECORD-CONFLICT-SURFACES` | Shared record surfaces are a lock: 16/29 open PRs conflict, 13 of them in bookkeeping only | bug |
+| [#460](https://github.com/mudler/vllm.cpp/issues/460) | `ENG-RECORD-CONFLICT-SURFACES` | `docs/BENCHMARKS.md` cannot be compacted: `check_links` validates links inside fenced blocks, so no row with a `docs/`-relative link can be archived byte-for-byte | bug |
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-BINARIES` | Binary release | feature |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
@@ -68,6 +70,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#278](https://github.com/mudler/vllm.cpp/issues/278) | `LORA-RUNTIME` | LoRA W2: packed adapters, merged qkv/gate_up layers, TP slicing, embedding + logits LoRA | feature |
 | [#395](https://github.com/mudler/vllm.cpp/issues/395) | `LORA-RUNTIME` | `main` is RED on `sanitize-cpu (address,undefined)`: `test_punica_cpu` `RefShrink` reads past `a_stacked` for an out-of-range slot | bug |
 | [#400](https://github.com/mudler/vllm.cpp/issues/400) | `LORA-RUNTIME` | `test_punica_cpu` does not cover the out-of-range slot guard in `BgmvShrink` or `BgmvExpandSlice`: dropping either leaves the suite green | bug |
+| [#432](https://github.com/mudler/vllm.cpp/issues/432) | `MODEL-MM-voxtral-voxtral-for-conditional-generation` | Voxtral audio TTFT is ~17x vLLM: the Whisper encoder attention is a scalar warp kernel where vLLM runs FA-2 | enhancement |
 | [#268](https://github.com/mudler/vllm.cpp/issues/268) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer (Meta, 30B agentic multimodal): text tower, perception encoder, DFlash drafter | feature |
 | [#329](https://github.com/mudler/vllm.cpp/issues/329) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quants: text arm lands; mmproj blocked by a converter axis drop | feature |
 | [#333](https://github.com/mudler/vllm.cpp/issues/333) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer speed: no number on any axis; benchmark vs llama.cpp, HF, and ourselves | perf |
