@@ -511,7 +511,7 @@ def validate(text: str) -> list[str]:
                 "--event": "${{ github.event_name }}",
                 "--ref": "${{ github.ref }}",
                 "--sha": "${{ github.sha }}",
-                "--version": "$version",
+                "--release-version": "release/release-version.json",
                 "--matrix": "release/release-matrix.json",
                 "--output": "release-plan.json",
                 "--github-output": "$GITHUB_OUTPUT",

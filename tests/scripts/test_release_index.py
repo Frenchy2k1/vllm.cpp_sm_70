@@ -70,7 +70,9 @@ class ReleaseIndexContract(unittest.TestCase):
                 }
                 for path in sorted(assets.iterdir())
             ],
-            "release_tag": "v0.0.1",
+            "release_tag": f"v{manifest['artifact']['version']}",
+            "prerelease": "-" in manifest["artifact"]["version"],
+            "project_version": manifest["artifact"]["version"].split("-", 1)[0],
             "retention": {
                 "ci_artifacts_days": 7,
                 "github_release": "maintainer-deletion-only",
@@ -90,6 +92,9 @@ class ReleaseIndexContract(unittest.TestCase):
             self.tool.generate_index(assets, handoff, json_out, markdown_out)
             index = json.loads(json_out.read_text())
             self.assertEqual(index["schema"], "vllm.cpp.release-index.v1")
+            self.assertTrue(index["prerelease"])
+            self.assertEqual(index["project_version"], "0.1.0")
+            self.assertEqual(index["version"], "0.1.0-test")
             self.assertEqual(index["artifacts"][0]["id"], "linux-x86_64-glibc-cpu")
             self.assertEqual(index["artifacts"][0]["cpu_tiers"], [
                 "portable-sse2", "sse2-f16c", "avx2-f16c", "avx512f"
