@@ -33,8 +33,12 @@ every change to touch a shared file, that is the defect**.
    scoreboard points at works for a row that carries a relative link.
 4. The mutation suites `tests/scripts/test_check_public_doc_tables.py` and
    `tests/scripts/test_agent_record.py`.
-5. One new row on `docs/BENCHMARKS.md`, the owed 35B canonical regrid named by
-   #481, added with nothing evicted, as the acceptance demonstration.
+5. The acceptance demonstration: the owed 35B canonical regrid row named by
+   #481 lands with nothing evicted. **Implemented as a test that adds the row to
+   the real page and drops it again, not as an edit to the page.** #481 is open
+   and rewrites the 35B row in place, so writing a second copy of the same fact
+   would duplicate a keyed row the moment both merge. The surface's ability to
+   accept the row is what this row owes; the row's content is #481's.
 
 **Out of scope, deliberately.** The `STATUS_RATCHET` keys kept by #364; the
 required-section, canonical-section, prose-paragraph, paragraph-length and
@@ -115,8 +119,8 @@ to pick up.
 | `scripts/check-public-doc-tables.py` | `max_chars` removed from `PageRules`; `MAX_ROW_CHARS` and `DATED_HEADING_RE` added; `page_errors` gains the two entry-scoped checks |
 | `scripts/check-agent-record.py` | `check_links` gains `extract_links`, a pure fenced/inline-code-aware link scanner; `link_base` becomes `link_bases` |
 | `tests/scripts/test_check_public_doc_tables.py` | three `max_chars` tests replaced by entry-cap, regrowth and no-eviction tests |
-| `tests/scripts/test_agent_record.py` | new `LinkExtractionTests` |
-| `docs/BENCHMARKS.md` | one row added, nothing removed |
+| `tests/scripts/test_agent_record.py` | new `LinkExtraction` cases |
+| `docs/BENCHMARKS.md` | **unchanged.** The owed row is added and dropped inside `test_the_shipped_page_can_accept_the_next_measurement_row`, so the surface is proven without writing a fact #481 already owns |
 
 ## Design
 
@@ -254,8 +258,10 @@ next cadence of parallel work".
 5. `python3 scripts/check-pr-size.py` red-before/green-after harness on both
    changed checkers: it reruns each HEAD test module against the BASE checker in
    an isolated worktree and refuses the PR unless BASE goes red.
-6. Acceptance: `docs/BENCHMARKS.md` carries one more row than `918c568a` and no
-   fewer, and every checker is green.
+6. Acceptance: the live `docs/BENCHMARKS.md` plus the owed row is valid, carries
+   one more row and no fewer, and exceeds the retired budget while doing it.
+   Measured on the merged tree: **44,832 chars and 162 rows, to 45,173 chars and
+   163 rows, errors `[]`**, with every pre-existing row asserted still present.
 
 **No GPU. Nothing here measures.**
 
@@ -278,6 +284,7 @@ next cadence of parallel work".
 | W4 | Rebuild `docs/BENCHMARKS.md` as a derived index over per-row files | **DEFERRED.** Justified only if the page becomes a *conflict* hotspot after the cap is gone. Trigger: `git merge-tree` shows it conflicting in 3 or more concurrently open PRs, measured, as #364 measured its three surfaces. Not justified by the cap, which W2 removes. |
 | W5 | Teach `roll-benchmark-record.py` to record the archived section's origin explicitly, rather than relying on W3's two-base resolution | **DEFERRED.** W3 makes the move work; W5 would make it self-describing. No blocker depends on it. |
 | W6 | Make `_h2_headers` fence-aware, so the gate and the rollup agree on what a section is ([#495](https://github.com/mudler/vllm.cpp/issues/495)) | **DEFERRED, filed not fixed.** Found doing W2 and reproduced: `_h2_headers` is a bare `startswith("## ")` scan while `split_sections` tracks fences, so a heading-shaped line inside a fence is a section to the gate and not to the script the gate tells you to run. It changes what an existing gate counts, so it takes its own spec and red-before rather than riding along here. Neither page has a fenced heading today. W2's `_headings` is already fence-aware and is the natural basis for the repair. |
+| W7 | Retire `MAX_README_CHARS` the same way ([#498](https://github.com/mudler/vllm.cpp/issues/498)) | **DEFERRED, filed not fixed.** `README.md` measures 29,965 of 30,000: **35 characters free**, tighter than any of the three budgets already retired. 13 of the last 20 commits touching it sat under 60 free, `031410e8` landed it 52 OVER, and `row/DOCS-README-BUDGET` (#161) is a whole merged row whose purpose was paying rent. Same defect, third checker (`check-readme-structure.py`), so it needs its own spec and its own mutation in `tests/scripts/test_check_readme_structure.py` rather than riding along here. |
 
 ## Risks/decisions
 
