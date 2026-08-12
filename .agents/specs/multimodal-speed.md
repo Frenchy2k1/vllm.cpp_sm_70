@@ -1312,7 +1312,8 @@ gate.
 
 **Ceiling honesty, stated up front.** Even a perfect attention kernel leaves the ~112 ms
 of conv GEMMs and the `whisper_audio.cpp:205-216` device→host→device im2col bounce
-against vLLM's 42.8 ms, so this lever alone is NOT expected to reach parity. The next
+against vLLM's whole TTFT (46.02 ms at the pin; 42.8 ms was the 0.25.0 figure this
+section was drafted against), so this lever alone is NOT expected to reach parity. The next
 traceable hypothesis after it is the device im2col kernel for the full cross-channel
 Whisper conv, which §15.1 measured, attributed and deferred as a new-kernel task.
 
@@ -1469,7 +1470,9 @@ flash-tiled kernel**, so `test_voxtral_e2e` remains 16/16 and every other caller
 untouched. AGENTS.md is unambiguous that correctness is not traded for throughput, and
 adopting a default that turns 0 divergences into 3 is exactly that trade — so it goes to
 the developer with both numbers, precisely the shape §11 used before §12's approval.
-**What approval would buy: audio TTFT 17.1x -> 3.11x, the last mm axis below floor.**
+**What approval would buy: the encoder forward going from 15.90x to 2.89x of vLLM's
+TTFT — the last mm axis below floor.** (Stated that way deliberately: it is not a TTFT
+ratio, because our projector, merge and prefill are unmeasured. See "RATIO LABELLING".)
 
 #### NOT a ceiling — the ranked next hypotheses (RE-RANKED 2026-08-12 after M4)
 
@@ -1579,6 +1582,19 @@ builds). Seven findings; all repaired in this branch by a fresh implementer.
 | F6 | The "higher-precision softmax happened to compensate" sentence was never measured | §17.5 rel-L2 table; sentence deleted and replaced with the numbers |
 | F7 | The test's "BINDING CORRECTNESS" checks are fixture constants | §17.3 gate 1 corrected; constants relabelled `fixture_*` in the source |
 
+**Re-gated on the repaired tree** (dgx GB10, fresh `~/work/mmfa2fix` build, all three
+banners, `-Werror` 0 warnings, GPU steps under `flock $HOME/gpu.lock`):
+
+| Gate | Result |
+|---|---|
+| `test_voxtral_e2e` with no `VLLM_VOXTRAL_SAFETENSORS` | loud banner, **exit 77**; `ctest` reports `***Skipped`, not Passed |
+| `test_ops_attention_dense_fa2` (new) | **14/14, 7/7 cases** |
+| `test_ops_attention` (cross-path, unchanged) | **37239/37239, 9/9 cases** |
+| `test_voxtral_e2e` DEFAULT arm | **16/16**, strict prefix 18/48, `repro` 48/48 |
+| DEFAULT-arm token md5 | `89923566f820defb983729251811705e` — the pre-PR value, unchanged by every repair |
+| `test_voxtral_e2e` FA-2 arm | 14/16 (strict prefix 12/48, `repro` 13/48), md5 `d6d6ae1b7d44cc48d471617bfc8255cc` — matches §17.6 exactly |
+| Goldens | md5 **UNCHANGED** (`8ab87b7e…` / `937b9ad3…`) |
+
 **The mutation-methodology trap the reviewer paid for, recorded because it nearly
 inverted a result:** `shutil.copy2` preserves mtime, so restoring a mutated source can
 leave ninja believing a stale object is current and silently carry the previous
@@ -1610,4 +1626,44 @@ The tolerance constants are `rel-L2 < 1e-2` and `max|diff| < 0.15·rms(ref)`: bf
 relative resolution is 2^-8 = 3.9e-3, the two kernels use different reduction orders
 *and* different softmax formulations (§17.5 table i-iii), and the M2a defect lands at
 rel-L2 ~ O(1) — three orders of magnitude clear of the bound.
+
+**Measured on the clean tree** (dgx GB10 sm_121a, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_BUILD_TESTS=ON`, all three banners confirmed, `-Werror` **0 warnings**, under
+`flock $HOME/gpu.lock`): **7 test cases, 14 assertions, 0 failed.**
+
+| Shape | rel-L2 FA-2 vs scalar | max abs diff | rms(ref) | bound |
+|---|---|---|---|---|
+| T=1500 H=20 D=64 | 0.00255 | 2.44e-4 | 0.01569 | 2.35e-3 |
+| T=257 H=4 D=64 | 0.00251 | 9.77e-4 | 0.03859 | 5.79e-3 |
+| T=17 H=2 D=64 | 0.00237 | 1.95e-3 | 0.15431 | 2.31e-2 |
+
+Key-range coverage: perturbing V rows `[750,1500)` moves the FA-2 output by rel-L2
+**254.1**, and the scalar reference by 254.1. Causal vs non-causal rel-L2 **2.17**.
+
+**RED — the tests were proven against the reviewer's own mutations** (mutate, clean
+rebuild, run, restore, rebuild; every write bumps mtime explicitly, never `copy2`):
+
+| Mutation | Result |
+|---|---|
+| **M2a** `p.seqlen_k = static_cast<int>(t) / 2` | **RED, 8/14 assertions fail across 2/7 cases.** The key-range case reports `moved = 0` exactly — the unambiguous signature of a truncating kernel — and all three fast-path shapes blow the envelope (rel-L2 1.023 / 0.969 / 0.914) |
+| **M3** drop `!args.causal` from the dispatch gate | **RED, 1/7 cases fail.** `LaunchDenseFA2Bf16` throws `non-causal only — the sole compiled instantiation is Is_causal=false`; the causal case fails with that message. Assertions 14 → 12: the throw costs that case's two checks, but the other six cases still run — which is the whole point of splitting them |
+| **M3-silent** drop the gate AND the launcher's causal guard (the exact pre-repair code) | **RED, 1/7 cases, 1/14 assertions.** `Mismatches(got, ref) == 0` fails on the causal case: FA-2 returns the non-causal answer, exactly the defect the reviewer demonstrated |
+
+Two structural lessons, both learned the expensive way in this pass:
+
+- **Separate `TEST_CASE`s, not `SUBCASE`s of one.** An uncaught exception ends the whole
+  enclosing test case. In the first arrangement M3's throw silently dropped the GQA,
+  hd≠64 and f32 coverage and the assertion count fell 14 → 9, while the failure looked
+  like one problem. Split, the same mutation costs only that case's two assertions
+  (14 → 12) and the other six cases still run. [[doctest-assertions-line-hides-thrown-cases]].
+- **Never compare two large vectors with `CHECK(a == b)`.** doctest stringifies both
+  operands of a failing CHECK; the first M3-silent run dumped 65,000 floats twice and
+  buried the signal. The bit-exact checks go through a `Mismatches()` helper.
+
+And a process note: the sweep must be launched `setsid nohup` with its marker in `$HOME`.
+Run under a plain `ssh`, the first attempt was killed mid-arm when the client-side timeout
+fired, losing the M3 output; the tree survived only because the harness restores before it
+can be interrupted between arms. Source md5s were compared against the local HEAD
+afterwards and matched byte-for-byte.
 
