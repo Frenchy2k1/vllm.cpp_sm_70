@@ -16,6 +16,15 @@ Documentation-checkpoint repair:
 Archive-target documentation-checkpoint repair:
 [#450](https://github.com/mudler/vllm.cpp/issues/450)
 
+Exact-range checker-evidence repair:
+[#453](https://github.com/mudler/vllm.cpp/issues/453)
+
+Agent-record semantic-evidence repair:
+[#455](https://github.com/mudler/vllm.cpp/issues/455)
+
+Isolated evidence toolchain repair:
+[#456](https://github.com/mudler/vllm.cpp/issues/456)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -399,6 +408,24 @@ target without its usage projection, which the same per-commit checkpoint
 correctly rejected ([#450](https://github.com/mudler/vllm.cpp/issues/450)). The
 replacement documents the numeric project-version tarball without conflating
 it with the prerelease workflow's matrix-selected archive names and formats.
+
+The exact PR range starts before `check-windows-portability.py` and
+`check-windows-release-state.py` existed, so their otherwise recognized
+mutation suites had no BASE checkers to falsify and the fail-closed PR-size
+gate rejected PR #446 ([#453](https://github.com/mudler/vllm.cpp/issues/453)).
+The repair registers the same closed disabled creation form used by other new
+governance checkers. Both real suites stay unchanged and green at HEAD, then
+fail with that stub substituted for each absent BASE implementation; path
+classification and checker-evidence requirements remain unchanged.
+
+The same full range proved that the `ENGINE_ROWS` ratchet change had no semantic
+edit in its recognized agent-record suite ([#455](https://github.com/mudler/vllm.cpp/issues/455));
+the added test binds the unique `ENG-RELEASE-WINDOWS` engine row to that suite.
+It also proved the evidence subprocess's fixed `/bin:/usr/bin` PATH hid a valid
+host Ninja installed elsewhere, falsely reddening the HEAD portability suite
+([#456](https://github.com/mudler/vllm.cpp/issues/456)). The repair copies only
+the explicitly required `ninja` executable into an isolated tool directory;
+the ambient directory and sibling executables remain unreachable.
 
 ## Now
 

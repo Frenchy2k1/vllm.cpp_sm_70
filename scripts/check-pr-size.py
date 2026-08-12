@@ -273,6 +273,11 @@ CREATION_MUTATIONS = {
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
     "scripts/check-triton-aot-multiarch.py": DISABLED_CREATION_CHECKER,
+    # ENG-RELEASE-WINDOWS. The portability suite loads this checker as a module
+    # and calls its validation functions, so the disabled stub leaves the test
+    # cases executable but red instead of inventing a permissive BASE checker.
+    "scripts/check-windows-portability.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-windows-release-state.py": DISABLED_CREATION_CHECKER,
     # A new checker has no BASE version to mutate, so it registers the disabled
     # form its own tests must reject. The empty stub exits 0 and prints nothing,
     # which fails every case in tests/scripts/test_check_site.py -- including
@@ -565,9 +570,29 @@ def load_role_discipline():
 
 
 
-def _sanitized_env(home: Path) -> dict[str, str]:
+def _prepare_evidence_tools(container: Path, module: str) -> Path:
+    """Copy explicitly required host tools without inheriting their PATH."""
+
+    tools = container / "tools"
+    tools.mkdir()
+    required = {"tests.scripts.test_check_windows_portability": ("ninja",)}
+    for name in required.get(module, ()):
+        source = shutil.which(name)
+        if source is None:
+            raise ValueError(f"semantic evidence requires executable {name}")
+        resolved = Path(source).resolve()
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise ValueError(f"semantic evidence tool is not executable: {resolved}")
+        shutil.copy2(resolved, tools / name)
+    return tools
+
+
+def _sanitized_env(home: Path, tools: Path | None = None) -> dict[str, str]:
+    path = os.defpath
+    if tools is not None:
+        path = str(tools) + os.pathsep + path
     return {
-        "PATH": os.defpath,
+        "PATH": path,
         "HOME": str(home),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -576,12 +601,14 @@ def _sanitized_env(home: Path) -> dict[str, str]:
     }
 
 
-def _run_test_module(worktree: Path, module: str) -> tuple[int, bool, str]:
+def _run_test_module(
+    worktree: Path, module: str, tools: Path | None = None
+) -> tuple[int, bool, str]:
     try:
         result = subprocess.run(
             [sys.executable, "-m", "unittest", "-v", module],
             cwd=worktree,
-            env=_sanitized_env(worktree),
+            env=_sanitized_env(worktree, tools),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -641,6 +668,7 @@ def executable_evidence(
         )
         worktree = container / "worktree"
         try:
+            tools = _prepare_evidence_tools(container, module)
             subprocess.run(
                 [
                     "git",
@@ -660,11 +688,15 @@ def executable_evidence(
                 shell=False,
                 env=_sanitized_env(container),
             )
-            head_count, head_passed, head_detail = _run_test_module(worktree, module)
+            head_count, head_passed, head_detail = _run_test_module(
+                worktree, module, tools
+            )
             target = worktree / checker_path
             target.write_bytes(_base_checker(repo, base_oid, checker_path))
             target.chmod(0o755)
-            base_count, base_passed, base_detail = _run_test_module(worktree, module)
+            base_count, base_passed, base_detail = _run_test_module(
+                worktree, module, tools
+            )
             results[checker_path] = EvidenceResult(
                 checker=checker_path,
                 test_module=module,

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import os
 import re
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -395,6 +397,12 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
             "scripts/check-triton-aot-multiarch.py",
+            # PR #446 created the native Windows portability checker after the
+            # range base, so its own suite must reject a closed disabled form.
+            "scripts/check-windows-portability.py",
+            # The release-state truth checker was created in the same range and
+            # owes the identical closed bootstrap proof.
+            "scripts/check-windows-release-state.py",
             # 2026-08-10: the docs-site content guard (#224). A checker created
             # in the same PR has no BASE version to mutate, so it registers the
             # disabled form its own tests must reject.
@@ -459,6 +467,27 @@ class BudgetEnforcement(unittest.TestCase):
                         evidence_results={"scripts/check-pr-size.py": proof},
                     )
                 )
+
+    def test_evidence_tools_do_not_leak_the_ambient_path(self) -> None:
+        """Ninja is allowlisted through one shim, not its ambient directory."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ambient = root / "ambient"
+            ambient.mkdir()
+            for name in ("ninja", "ambient-secret"):
+                executable = ambient / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(ambient)}):
+                tools = checker._prepare_evidence_tools(
+                    root, "tests.scripts.test_check_windows_portability"
+                )
+            env = checker._sanitized_env(root, tools)
+            entries = env["PATH"].split(os.pathsep)
+            self.assertNotIn(str(ambient), entries)
+            self.assertEqual(shutil.which("ninja", path=env["PATH"]), str(tools / "ninja"))
+            self.assertIsNone(shutil.which("ambient-secret", path=env["PATH"]))
 
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
