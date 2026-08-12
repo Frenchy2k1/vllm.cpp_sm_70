@@ -192,11 +192,16 @@ gate → size (S/M/L) → vehicle model. `[H]` = user-directed headline.
     CLOSED (parity or better on every axis) and the four-core A76 arm is OPEN on
     speed (#284), and both are AArch64. The **x86_64** arm had no post-lever
     number at all, and every lever that closed the first arm is Arm-scoped, so
-    nothing transferred. It is now measured: **peak RSS 1.0022x = PARITY (MET)**;
-    prefill/decode/E2E **`PENDING` a quiet host** (this box is `VOID` for binding
-    timing, re-confirmed by a 5-rep series discarded at load 82). Correctness
-    holds byte-identically at the measured length. Next CPU lever is CIQ `G5`
-    (x86 AVX2/AVX-512 quant tier + an AVX-512 consumer for the `G7` repack).
+    nothing transferred. It is now measured, and **no axis of it is met**: peak
+    RSS **1.0022x = a hairline OPEN GAP**, 6.33 MB against us on a lower-is-better
+    axis and 12-55x the leg spread; prefill/decode/E2E **`PENDING` a quiet host**
+    (this box is `VOID` for binding timing, re-confirmed by a 5-rep series
+    discarded at load 82); load-discipline gate `G5` **FAILING**, its raw per-leg
+    output never committed and now gone. Correctness holds byte-identically at
+    the measured length of 32 and **fails at the 64 originally declared** (one
+    divergence, oracle self-stable, so no distributional gate applies). Next CPU
+    lever is CIQ `G5` (x86 AVX2/AVX-512 quant tier + an AVX-512 consumer for the
+    `G7` repack), and a per-pool RSS attribution for the 6.33 MB.
     **The Metal/MLX half is untouched: it needs an Apple M4.**
 14. **`ROAD-V1-C2-LOCAL-BF16` device-resident sampled-token rerun** (small). **Size S.**
 15. **`ROAD-V1-C1` fusion perf interpreter** (cornerstone done; perf tail,
