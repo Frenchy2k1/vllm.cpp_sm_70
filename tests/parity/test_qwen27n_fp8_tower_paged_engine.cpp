@@ -248,8 +248,9 @@ TEST_CASE("qwen27n fp8-tower paged-engine greedy acceptance gate (dgx-only)") {
 #ifdef VLLM_CPP_CUDA
   const vllm::detail::GdnFp8InProjDebugStats fp8_inproj =
       vllm::detail::GetGdnFp8InProjDebugStats();
-  const uint64_t packed_launches =
-      vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
+  const vt::cuda::testing::GdnPackedDecodeDebugStats packed_stats =
+      vt::cuda::testing::GetGdnPackedDecodeDebugStats();
+  const uint64_t packed_launches = packed_stats.launches;
   vllm::detail::DisableGdnFp8InProjDebugStats();
   vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
 
@@ -287,20 +288,63 @@ TEST_CASE("qwen27n fp8-tower paged-engine greedy acceptance gate (dgx-only)") {
         "qwen27n GDN fp8 input-projection dispatch count mismatch");
   }
 
-  // Packed GDN decode is NOT selectable on an FP8 tower and must issue ZERO
-  // launches on every arm. `ShouldUsePackedGdnDecode`'s dtype_compatible term
-  // requires `in_proj_qkv_fp8.Empty() && in_proj_z_fp8.Empty()`
-  // (qwen3_5.cpp:4161-4165) because vt::GdnPackedDecode rejects fp8 shards.
+  // PERF-GDN-PACKED-BRIDGE (#365) makes packed GDN decode REACHABLE on an FP8
+  // tower behind `VT_GDN_PACKED_DECODE_FP8_TOWER` (default OFF), so the
+  // expectation below is now a function of the lever rather than the constant
+  // ZERO this arm landed with. On the DEFAULT arm — no lever set — it is still
+  // exactly `packed_launches == 0`, byte-for-byte the contract that landed, and
+  // the assertion count is unchanged in both directions (one CHECK either way).
   //
-  // Deliberately NOT expressed through `detail::PackedGdnDecodeEnvSelected`,
-  // which the sibling gate uses: that helper mirrors the ENV couplings only and
-  // knows nothing about the weight dtype, so on this checkpoint it would demand
-  // 48 and throw for the wrong reason. The env mirror's divergence from the
-  // real predicate is a separate finding; this arm pins the real behaviour.
-  CHECK(packed_launches == 0U);
-  if (packed_launches != 0U) {
+  // It is still deliberately NOT expressed through
+  // `detail::PackedGdnDecodeEnvSelected`, which mirrors the ENV couplings only
+  // and knows nothing about the weight dtype (#470). The terms below are the
+  // ones `ShouldUsePackedGdnDecode` actually evaluates on this checkpoint: the
+  // fp8-tower relaxation lever, the MERGED fp8 arm (the split arm hardcodes
+  // F32, which the activation-dtype rule rejects), and the merged arm's
+  // predicted `mixed_qkv` dtype through the single shared bridge helper.
+  //
+  // WHAT THIS ARM CANNOT SEE, and where that IS covered. Because the expectation
+  // now reads the same flag parser production reads, a DEFAULT FLIP of either
+  // lever moves both sides together and this CHECK stays green. The default-OFF
+  // contract is therefore NOT held here. It is held in
+  // `tests/vllm/models/test_qwen27_paged_forward.cpp`, which pins
+  // `detail::GdnFp8MergedMixedQkvDType` directly: mutating that helper turns
+  // `test_qwen27_paged_forward` RED at 7 assertions. Do not add a duplicate
+  // default assertion here — add it there, next to the ones that already fail.
+  //
+  // THIS IS ALSO THE ROW'S SELECTION PROOF, and it can only be read here: the
+  // counters are HOST-DISPATCH counts, and CUDA graph REPLAY performs no host
+  // dispatch, so a graphed throughput run reads 0 no matter what was selected.
+  // This harness steps EAGERLY, which is what makes the numbers meaningful.
+  const bool fp8_tower_lever = vllm::detail::PackedGdnDecodeFp8TowerFlagIsOn(
+      std::getenv("VT_GDN_PACKED_DECODE_FP8_TOWER"));
+  const char* fp8_in_bf16_env = std::getenv("VT_GDN_FP8_IN_BF16");
+  const bool fp8_in_bf16 =
+      fp8_in_bf16_env != nullptr && fp8_in_bf16_env[0] == '1';
+  const bool packed_expected =
+      fp8_tower_lever && fp8_merged &&
+      vllm::detail::GdnFp8MergedMixedQkvDType(fp8_in_bf16, vt::DType::kBF16,
+                                              vt::DType::kBF16) ==
+          vt::DType::kBF16;
+  const uint64_t expected_packed = packed_expected ? kGdnLayers : 0U;
+  MESSAGE("qwen27n GDN packed-decode SELECTION (eager step, host dispatch): "
+          << "packed_launches=" << packed_launches
+          << " triton_launches=" << packed_stats.triton_launches
+          << " expected_packed=" << expected_packed
+          // INTEGER rendering, deliberately. doctest's MESSAGE prints a
+          // STRING-LITERAL ternary as its FIRST branch unconditionally --
+          // reproduced standalone on doctest 2.5.2 with
+          // `MESSAGE("x=" << (on ? "1" : "unset/0"))`, which prints `x=1` for
+          // both values of `on` while `(on ? 1 : 0)` in the same MESSAGE
+          // prints correctly. This diagnostic exists to say which arm ran, so
+          // it must not be able to mislabel one.
+          << " VT_GDN_PACKED_DECODE_FP8_TOWER=" << (fp8_tower_lever ? 1 : 0)
+          << " VT_GDN_FP8_IN_BF16=" << (fp8_in_bf16 ? 1 : 0));
+  CHECK(packed_launches == expected_packed);
+  if (packed_launches != expected_packed) {
     throw std::runtime_error(
-        "qwen27n packed GDN decode selected on an FP8 tower (expected 0)");
+        "qwen27n packed GDN decode launch count differs from the count the "
+        "selection predicate implies for this arm");
   }
 #endif
 

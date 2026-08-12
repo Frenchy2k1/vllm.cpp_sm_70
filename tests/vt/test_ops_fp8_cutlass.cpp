@@ -6,10 +6,13 @@
 // GPU (the fp8 cutlass op is sm120a-only, no CPU kernel).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // F32ToF8E4M3
@@ -439,6 +442,202 @@ void ByteExactReuse(int M, int N, int K, uint32_t seed, DType out_dtype) {
   CHECK(cached2 == fresh);   // stable across repeated hits
 }
 }  // namespace
+
+// PERF-FP8-ALPHA-FOLD (.agents/specs/perf-fp8-alpha-fold.md, #402 §3 "Lever B").
+// vt::MatmulFp8CublasLtAlphaVec applies a per-output-COLUMN alpha. When
+// VT_FP8_ALPHA_VEC_EPILOGUE=1 and the selected algo advertises
+// CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO it does so INSIDE the
+// cuBLASLt epilogue; otherwise it runs the shipped two-launch form. Both must
+// produce BYTE-identical output, because both are the same single IEEE f32
+// multiply on the same f32 accumulator (`x1.0 -> store -> load -> xalpha` vs
+// `xalpha`), at the same scale type and the same store dtype.
+//
+// The claim is SHAPE-CONDITIONAL, exactly as #213's merge equivalence is
+// (.agents/specs/perf-27b-gdn-fp8-merged-qkvz.md:106-136): the pointer mode is
+// part of the descriptor the heuristic reads, so it can select a different
+// split-K, and f32 addition is not associative. At the real gate shapes cuBLASLt
+// needs no split-K to fill the device (measured splitK=1 at M=1, K=5120,
+// n=16384), which is the standing precondition of this case. If a future driver
+// splits K here the case goes RED, and that is the correct signal: the two arms
+// would no longer be one arithmetic. Read the selected algos with
+// VT_GEMM_ALGO_LOG=1 (tags `TN-fp8` vs `TN-fp8-alphavec`).
+namespace {
+void AlphaVecMatchesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed, float alpha_qkv,
+                              float alpha_z) {
+  const int N = Nqkv + Nz;
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> ub(0, 255);
+  auto rand_fp8 = [&](size_t n) {
+    std::vector<uint8_t> v(n);
+    for (auto& x : v) {
+      int byte = ub(rng);
+      if ((byte & 0x7F) == 0x7F) byte &= ~0x7;  // avoid NaN encodings (0x7F/0xFF)
+      x = static_cast<uint8_t>(byte);
+    }
+    return v;
+  };
+  const std::vector<uint8_t> a_fp8 = rand_fp8(static_cast<size_t>(M) * K);
+  const std::vector<uint8_t> b_fp8 = rand_fp8(static_cast<size_t>(N) * K);
+  // The model's resident vector: each shard's folded alpha per output column.
+  std::vector<float> alpha_host(static_cast<size_t>(N));
+  std::fill(alpha_host.begin(), alpha_host.begin() + Nqkv, alpha_qkv);
+  std::fill(alpha_host.begin() + Nqkv, alpha_host.end(), alpha_z);
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor da(b, g.q, DType::kI8, {M, K}, a_fp8.data());
+  DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
+  DeviceTensor dalpha(b, g.q, DType::kF32, {N}, alpha_host.data());
+
+  const size_t out_bytes = static_cast<size_t>(M) * N * vt::SizeOf(DType::kF32);
+  // Reference: the form this seam shipped with — GEMM at alpha=1, then the
+  // column vector as a separate full-tensor pass.
+  std::vector<uint8_t> two_launch(out_bytes);
+  {
+    DeviceTensor dout(b, g.q, DType::kF32, {M, N});
+    vt::MatmulFp8CublasLt(g.q, dout.tensor(), da.tensor(), dw.tensor(), 1.0f);
+    vt::MulColVecF32(g.q, dout.tensor(), dalpha.tensor());
+    dout.Download(g.q, two_launch.data());
+  }
+  std::vector<uint8_t> alpha_vec(out_bytes);
+  {
+    DeviceTensor dout(b, g.q, DType::kF32, {M, N});
+    vt::MatmulFp8CublasLtAlphaVec(g.q, dout.tensor(), da.tensor(), dw.tensor(), dalpha.tensor());
+    dout.Download(g.q, alpha_vec.data());
+  }
+  CHECK(alpha_vec == two_launch);  // BYTE-identical, not merely close
+}
+
+// PERF-FP8-ALPHA-FOLD / #417 — the SAME arm-equivalence claim at a BF16 D.
+//
+// Narrowing this GEMM's D to bf16 is the only remaining lever on the per-column
+// alpha pass (it is bandwidth-saturated, so halving its width halves its cost),
+// and bf16 is what vLLM's ModelOptFp8LinearMethod emits here. But at bf16 the
+// epilogue arm and the fallback arm are NOT the same arithmetic: the fallback
+// rounds twice (store bf16, multiply, store bf16) and the epilogue rounds once
+// (multiply, store bf16). So the op REFUSES the epilogue for a bf16 D and always
+// takes the two-launch arm, keeping VT_FP8_ALPHA_VEC_EPILOGUE a pure performance
+// switch that can never move a token at any dtype.
+//
+// This case pins that refusal, and it is written so it is BINDING with the toggle
+// ON: the reference is built from the explicit two-launch calls, so if the bf16
+// gate in MatmulFp8CublasLtAlphaVecKernelCuda were removed and a driver DID serve
+// the epilogue, the double rounding would show up here as a byte difference. With
+// the toggle OFF it degenerates to comparing identical code, which is why the
+// ctest arm test_ops_fp8_alpha_vec_epilogue_on is the one that binds.
+void AlphaVecBf16TakesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed,
+                                float alpha_qkv, float alpha_z) {
+  const int N = Nqkv + Nz;
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> ub(0, 255);
+  auto rand_fp8 = [&](size_t n) {
+    std::vector<uint8_t> v(n);
+    for (auto& x : v) {
+      int byte = ub(rng);
+      if ((byte & 0x7F) == 0x7F) byte &= ~0x7;  // avoid NaN encodings (0x7F/0xFF)
+      x = static_cast<uint8_t>(byte);
+    }
+    return v;
+  };
+  const std::vector<uint8_t> a_fp8 = rand_fp8(static_cast<size_t>(M) * K);
+  const std::vector<uint8_t> b_fp8 = rand_fp8(static_cast<size_t>(N) * K);
+  std::vector<float> alpha_host(static_cast<size_t>(N));
+  std::fill(alpha_host.begin(), alpha_host.begin() + Nqkv, alpha_qkv);
+  std::fill(alpha_host.begin() + Nqkv, alpha_host.end(), alpha_z);
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor da(b, g.q, DType::kI8, {M, K}, a_fp8.data());
+  DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
+  DeviceTensor dalpha(b, g.q, DType::kF32, {N}, alpha_host.data());
+
+  const size_t out_bytes = static_cast<size_t>(M) * N * vt::SizeOf(DType::kBF16);
+  std::vector<uint8_t> two_launch(out_bytes);
+  {
+    DeviceTensor dout(b, g.q, DType::kBF16, {M, N});
+    vt::MatmulFp8CublasLt(g.q, dout.tensor(), da.tensor(), dw.tensor(), 1.0f);
+    vt::MulColVecF32(g.q, dout.tensor(), dalpha.tensor());
+    dout.Download(g.q, two_launch.data());
+  }
+  std::vector<uint8_t> alpha_vec(out_bytes);
+  {
+    DeviceTensor dout(b, g.q, DType::kBF16, {M, N});
+    vt::MatmulFp8CublasLtAlphaVec(g.q, dout.tensor(), da.tensor(), dw.tensor(), dalpha.tensor());
+    dout.Download(g.q, alpha_vec.data());
+  }
+  CHECK(alpha_vec == two_launch);  // BYTE-identical: the bf16 D must not reach the epilogue
+
+  // The bf16 result must also be the bf16 rounding of the f32 result, element for
+  // element -- i.e. narrowing D changed the STORE width and nothing else. This is
+  // what makes the lever a width change rather than a different computation, and
+  // it would catch a bf16 GEMM that accumulated in bf16 or applied alpha at bf16.
+  std::vector<uint8_t> ref_f32(static_cast<size_t>(M) * N * vt::SizeOf(DType::kF32));
+  {
+    DeviceTensor dout(b, g.q, DType::kF32, {M, N});
+    vt::MatmulFp8CublasLt(g.q, dout.tensor(), da.tensor(), dw.tensor(), 1.0f);
+    vt::MulColVecF32(g.q, dout.tensor(), dalpha.tensor());
+    dout.Download(g.q, ref_f32.data());
+  }
+  const auto* f32v = reinterpret_cast<const float*>(ref_f32.data());
+  const auto* bf16v = reinterpret_cast<const uint16_t*>(two_launch.data());
+  size_t mismatches = 0;
+  for (size_t i = 0; i < static_cast<size_t>(M) * N; ++i)
+    if (bf16v[i] != vt::F32ToBF16(f32v[i])) ++mismatches;
+  // NOT exact-equal-or-bust: the f32 arm's GEMM and the bf16 arm's GEMM are
+  // separate cuBLASLt plans (out_type is part of the plan key) and may reduce in a
+  // different order, so a few 1-ulp disagreements are legitimate. A WHOLESALE
+  // divergence is not, and that is what this bounds.
+  CHECK(mismatches * 100 < static_cast<size_t>(M) * N);  // < 1% of words
+}
+}  // namespace
+
+TEST_CASE("fp8 cuBLASLt per-column alpha is BYTE-identical to the two-launch form") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cuBLASLt vector-alpha byte-exact test");
+    return;
+  }
+  // Says which arm actually ran, so a green default run is never mistaken for
+  // the binding proof: with the toggle OFF both sides execute the SAME code and
+  // the case only proves the fallback is unchanged. The binding comparison is
+  // the ctest arm `test_ops_fp8_alpha_vec_epilogue_on`.
+  const char* on = std::getenv("VT_FP8_ALPHA_VEC_EPILOGUE");
+  if (on != nullptr && std::string_view(on) == "1")
+    MESSAGE("VT_FP8_ALPHA_VEC_EPILOGUE=1: epilogue arm vs two-launch — the binding comparison");
+  else
+    MESSAGE("VT_FP8_ALPHA_VEC_EPILOGUE unset: fallback arm only (both sides identical code)");
+
+  // The real 27B GDN in_proj_qkvz dims (hidden 5120; conv_dim 10240 + value_dim
+  // 6144) and the 35B's (hidden 2048), at the prefill and decode token counts.
+  AlphaVecMatchesTwoLaunch(1, 10240, 6144, 5120, 21, 0.035f, 0.017f);   // 27B, decode M=1
+  AlphaVecMatchesTwoLaunch(3, 10240, 6144, 5120, 22, 0.035f, 0.017f);   // 27B, M=3
+  AlphaVecMatchesTwoLaunch(1, 4096, 2048, 2048, 23, 0.041f, 0.0092f);   // 35B family, M=1
+  AlphaVecMatchesTwoLaunch(3, 4096, 2048, 2048, 24, 0.041f, 0.0092f);   // 35B family, M=3
+  AlphaVecMatchesTwoLaunch(128, 10240, 6144, 5120, 25, 0.035f, 0.017f); // prefill tile
+  // Equal shard alphas: the vector degenerates to a constant and must still match.
+  AlphaVecMatchesTwoLaunch(1, 10240, 6144, 5120, 26, 0.028f, 0.028f);
+}
+
+TEST_CASE("fp8 cuBLASLt per-column alpha at a BF16 D stays on the two-launch arm") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cuBLASLt bf16-D vector-alpha test");
+    return;
+  }
+  const char* on = std::getenv("VT_FP8_ALPHA_VEC_EPILOGUE");
+  if (on != nullptr && std::string_view(on) == "1")
+    MESSAGE("VT_FP8_ALPHA_VEC_EPILOGUE=1: the bf16 D must STILL take the fallback");
+  else
+    MESSAGE("VT_FP8_ALPHA_VEC_EPILOGUE unset: fallback arm on both sides");
+
+  // The same real gate shapes as the f32 case above: 27B GDN in_proj_qkvz
+  // (hidden 5120; conv_dim 10240 + value_dim 6144) and the 35B's (hidden 2048),
+  // at decode and prefill token counts. The probe recorded cuBLASLt serving a
+  // bf16 D at every one of these shapes and every M (spec §Outcome), so a refusal
+  // to build a bf16 plan here would be a REGRESSION, not an absent capability.
+  AlphaVecBf16TakesTwoLaunch(1, 10240, 6144, 5120, 31, 0.035f, 0.017f);   // 27B, decode M=1
+  AlphaVecBf16TakesTwoLaunch(3, 10240, 6144, 5120, 32, 0.035f, 0.017f);   // 27B, M=3
+  AlphaVecBf16TakesTwoLaunch(1, 4096, 2048, 2048, 33, 0.041f, 0.0092f);   // 35B family, M=1
+  AlphaVecBf16TakesTwoLaunch(128, 10240, 6144, 5120, 34, 0.035f, 0.017f); // prefill tile
+}
 
 TEST_CASE("fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM") {
   if (!HasCuda()) {

@@ -1361,6 +1361,17 @@ selectors stay default OFF. The 18-leg oracle runs were VOID.
 This local 4B diagnostic does not establish 27B/35B support:
 [exact-chunk outcome](bench-evidence/qwen35-4b-sm120-main-20260807.md).
 
+**27B fp8 tower, packed GDN decode now REACHABLE (`PERF-GDN-PACKED-BRIDGE`,
+#365):** selection PROVEN 48/48 on `nvidia`@`0893e160`. Decode c1 at
+`input_len=16` reads `0.977x -> 0.984x` against the pin — INDICATIVE, not
+binding: the arms were not interleaved and did not share a background state.
+Only the two structural kernel terms (-0.400, -0.131 ms/step) exceed the
+untouched control's own +0.262 drift. Tokens move on neither 27B checkpoint,
+which establishes no gross defect at ~50x coarser sensitivity than the
+perturbation introduced, not equivalence. Both toggles stay DEFAULT OFF
+([spec](../.agents/specs/perf-gdn-packed-bridge.md),
+[record](../.agents/benchmark-record.md)).
+
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).
 
