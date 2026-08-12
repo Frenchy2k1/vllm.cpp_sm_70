@@ -25,7 +25,7 @@ namespace vt::cuda {
 // Declared here at vt::cuda scope — NOT inside the anonymous namespace below —
 // exactly as cuda_paged_attn.cu:53-64 declares the paged FA-2 launchers.
 void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
-                        const Tensor& value, float scale);
+                        const Tensor& value, float scale, bool causal);
 #endif
 
 namespace {
@@ -3398,7 +3398,10 @@ void AttentionDenseFa2KernelCuda(Queue& q, Tensor& out, const Tensor& query, con
                          query.shape[2] == 64 && key.shape[1] == query.shape[1] &&
                          value.shape[1] == query.shape[1] && !args.causal;
   if (fa2_shape && Fa2DenseEnabled()) {
-    LaunchDenseFA2Bf16(AsStream(q), out, query, key, value, args.scale);
+    // args.causal is false here (fa2_shape requires !args.causal); it is threaded
+    // through so the launcher can REFUSE a causal request instead of answering a
+    // different question. See LaunchDenseFA2Bf16's causal guard.
+    LaunchDenseFA2Bf16(AsStream(q), out, query, key, value, args.scale, args.causal);
     return;
   }
 #endif
