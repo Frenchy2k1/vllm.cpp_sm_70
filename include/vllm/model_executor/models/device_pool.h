@@ -20,11 +20,14 @@
 #pragma once
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -46,6 +49,8 @@ namespace vllm {
 // its own class bucket. VT_POOL_EXACT=1 restores exact keying (A/B measurement).
 class DevicePool {
  public:
+  static size_t SizeClassForTest(size_t bytes) { return ClassOf(bytes); }
+
   void* Get(vt::Backend& b, size_t bytes) {
     // BYPASS lane (VT_POOL_BYPASS=1) — the pool is a DETECTOR BLIND SPOT and
     // this is how you see through it. Two ways it hides a real defect from
@@ -181,10 +186,13 @@ class DevicePool {
     }();
     if (exact || bytes == 0) return bytes == 0 ? 1 : bytes;
     constexpr int kClassBits = 4;  // <=6.25% over-allocation per class
-    const int msb = 63 - __builtin_clzll(static_cast<unsigned long long>(bytes));
+    const int msb = static_cast<int>(std::bit_width(bytes)) - 1;
     if (msb < kClassBits) return bytes;
     const int shift = msb - kClassBits;
     const size_t mask = (static_cast<size_t>(1) << shift) - 1;
+    if (bytes > std::numeric_limits<size_t>::max() - mask) {
+      throw std::overflow_error("DevicePool size class rounding overflow");
+    }
     return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
   }
 

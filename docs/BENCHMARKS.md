@@ -1,4 +1,4 @@
-# Benchmarks
+# Benchmarks <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 ## At a glance: W5/W6 green; validated release artifacts pending
 
@@ -6,8 +6,7 @@
 |---|---|---|---|
 | **Weight load (`ENG-LOAD-DIRECT-UPLOAD`, #150)** | Qwen3.6-27B bf16 (50.098 GiB), GB10 Vulkan, same binary both arms, interleaved under one GPU lock | **Load phase 1.54x warm** (19.27 -> 12.48 s), **1.61x cold** (52.62 -> 32.75 s); bytes moved **100.196 -> 81.260 GiB**. Every ON leg beat every OFF leg | byte-identical; 6/6 token-exact |
 | **Structured state record (active)** | v1 scalar + relational + Git-history contracts | No benchmark. At `776c56f1`: 157 imports = 3,231,342 exact bytes; append preserved all 156 wrappers/rows. 95 tests: validator/core 44 (checker 20 + core 24), NOW 18, migration 22, cutover 11. New raw-row mutation guard. | n/a |
-| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |
-| **Binary release delivery topology** | #196: read-only build/verify, OIDC attest, protected publish; generated indexes and explicit handoff-authenticated assets | Fixes the zero-binary release path by attaching all eight archive/checksum/provenance triplets plus indexes. Hosted proof pending; W12 diagnostics optional | n/a |
+| **Binary release (ACTIVE; Windows pre-alpha pending)** | v0.0.2 shipped eight primary archive/checksum/provenance triplets + two indexes (26 assets) from source SHA `7020de93652ca920424a10ac5255b34810dd2f24`, run `31466516224` | Windows W14-W16 implemented. **PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit | W12 optional/non-primary |
 | **Container images (ACTIVE; arm64 cuda verified on GB10 + Orin 2026-08-11)** | `ENG-RELEASE-CONTAINERS` ([spec](../.agents/specs/container-images.md)) | cpu amd64 783 MB; cuda arm64 **1.71 GB**. GB10 `sm_121a`: `/health`+`/version`+SIGTERM on `--gpus all`. Orin `sm_87` (Tegra): Qwen3-0.6B **generates**, GPU **GR3D 95-97%** | n/a |
 | **Developer/row protocol** | Contribution entry point; `ENG-NOW-DERIVED` #374 @`dbd0d51c` | Entry-point gates retained. #374 W1-W5 DONE; benchmark/runtime/parity `VOID`; row specs now carry `## Now` | n/a |
 | **LoRA runtime W2** (`LORA-RUNTIME`, #278) | **No number owed:** correctness-only; a grid PENDS the W7 model gate |
@@ -336,7 +335,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | PAIRED vs the **pinned, graphed** oracle 2026-08-12: MoE **0.919x-0.987x** (INTERLEAVED medians) after W8 captures the T=1+k verify (#442); same-binary capture A/B +12.2%/+3.5%, byte-identical | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | vs the **pinned, graphed** oracle: MoE **0.975x** code / 1.012x prose under PINNED CLOCKS (non-overlapping). NOT parity; residual is the expert GEMM. W8 captures the T=1+k verify (#442): +12.2%/+3.5%, byte-identical | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

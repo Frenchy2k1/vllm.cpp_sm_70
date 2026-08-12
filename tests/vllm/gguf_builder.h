@@ -3,17 +3,36 @@
 // Shared by test_gguf.cpp (reader hardening) and test_bpe.cpp (GGUF vocab).
 #pragma once
 
-#include <unistd.h>
-
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace gguf_test {
+
+inline std::string Utf8Path(const std::filesystem::path& path) {
+  const auto bytes = path.u8string();
+  return std::string(bytes.begin(), bytes.end());
+}
+
+inline std::filesystem::path UniqueTempPath(const std::string& prefix,
+                                            const std::string& suffix) {
+  static std::atomic<uint64_t> counter{0};
+  static const uint64_t process_nonce = [] {
+    std::random_device random;
+    return (static_cast<uint64_t>(random()) << 32) ^ random();
+  }();
+  return std::filesystem::temp_directory_path() /
+         (prefix + std::to_string(process_nonce) + "_" +
+          std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) +
+          suffix);
+}
 
 // Little-endian scalar encoders (GGUF is little-endian on the wire).
 inline std::string U32Le(uint32_t v) {
@@ -149,23 +168,23 @@ class GgufModelBuilder {
 class TempFile {
  public:
   explicit TempFile(const std::string& bytes) {
-    // Distinct test binaries may run concurrently under ctest -j and each
-    // starts its own counter, so the pid keeps the names collision-free.
-    static int counter = 0;
-    path_ = (std::filesystem::temp_directory_path() /
-             ("vllm_gguf_test_" + std::to_string(::getpid()) + "_" +
-              std::to_string(counter++) + ".gguf"))
-                .string();
+    path_ = UniqueTempPath("vllm_gguf_test_", ".gguf");
     std::ofstream out(path_, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out) throw std::runtime_error("failed to write GGUF test file");
+    utf8_path_ = Utf8Path(path_);
   }
-  ~TempFile() { std::remove(path_.c_str()); }
+  ~TempFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+  }
   TempFile(const TempFile&) = delete;
   TempFile& operator=(const TempFile&) = delete;
-  const std::string& path() const { return path_; }
+  const std::string& path() const { return utf8_path_; }
 
  private:
-  std::string path_;
+  std::filesystem::path path_;
+  std::string utf8_path_;
 };
 
 }  // namespace gguf_test

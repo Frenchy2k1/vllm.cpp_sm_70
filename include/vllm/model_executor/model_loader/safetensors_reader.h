@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/read_only_file_mapping.h"
+
 namespace vllm {
 
 // One tensor entry from a .safetensors header. `data` points into the file's
@@ -55,24 +57,11 @@ class SafetensorsFile {
   }
 
  private:
-  // The mmap + fd as one refcounted resource, so a borrowed weight can outlive
-  // the SafetensorsFile that opened it. munmap/close run when the LAST reference
-  // goes — the file object's own, plus any OwnedBytes::Borrow keep-alive.
-  struct Mapping {
-    void* addr = nullptr;
-    size_t size = 0;
-    int fd = -1;
-    Mapping() = default;
-    Mapping(const Mapping&) = delete;
-    Mapping& operator=(const Mapping&) = delete;
-    ~Mapping();
-  };
-
   SafetensorsFile() = default;
   void Release() noexcept;
 
   std::string path_;
-  std::shared_ptr<Mapping> map_;
+  std::shared_ptr<const detail::ReadOnlyFileMapping> map_;
   std::vector<std::string> names_;
   std::map<std::string, StTensor> tensors_;
   std::map<std::string, std::string> metadata_;

@@ -8,16 +8,19 @@ import importlib.util
 import json
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "scripts" / "validate-release-archive.py"
+PACKAGER = ROOT / "scripts" / "package-server.py"
 FIXTURE = ROOT / "tests/scripts/fixtures/release_manifest/v1/cpu-manifest.json"
 CUDA_FIXTURE = ROOT / "tests/scripts/fixtures/release_manifest/v1/cuda-manifest.json"
 
@@ -31,11 +34,21 @@ def load_tool():
     return module
 
 
+def load_packager():
+    spec = importlib.util.spec_from_file_location("package_server", PACKAGER)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {PACKAGER}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "x86_64", "Linux x86_64 W7 fixture")
 class ReleaseArchiveContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tool = load_tool()
+        cls.packager = load_packager()
 
     def manifest(self, executable: Path) -> dict[str, object]:
         manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -156,6 +169,8 @@ class ReleaseArchiveContract(unittest.TestCase):
                 str(TOOL),
                 "--archive",
                 str(archive),
+                "--archive-format",
+                "zip" if archive.name.endswith(".zip") else "tar.gz",
                 "--checksum",
                 str(checksum),
                 "--provenance",
@@ -368,6 +383,191 @@ class ReleaseArchiveContract(unittest.TestCase):
             result = self.run_validator(archive, checksum, provenance)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unsafe archive path", result.stdout + result.stderr)
+
+    def test_zip_is_deterministic_and_rejects_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            (stage / "bin").mkdir(parents=True)
+            (stage / "bin/vllm-server.exe").write_bytes(b"PE fixture")
+            (stage / "VERSION").write_text("version=fixture\n", encoding="utf-8")
+            first = root / "first.zip"
+            second = root / "second.zip"
+            self.packager.write_archive(stage, first, 315532800, "zip")
+            self.packager.write_archive(stage, second, 315532800, "zip")
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as bundle:
+                names = bundle.namelist()
+                self.assertEqual(names, sorted(names))
+                self.assertTrue(all("\\" not in name for name in names))
+            (stage / "link").symlink_to("VERSION")
+            with self.assertRaises(ValueError):
+                self.packager.write_archive(stage, root / "linked.zip", 315532800, "zip")
+
+    def test_archive_writer_requires_an_explicit_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            stage.mkdir()
+            with self.assertRaises(TypeError):
+                self.packager.write_archive(stage, root / "implicit.tar.gz", 0)
+
+    def test_zip_traversal_drive_backslash_and_symlink_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("../escape", "C:/escape", "..\\escape"):
+                with self.subTest(name=name):
+                    archive = root / (hashlib.sha256(name.encode()).hexdigest() + ".zip")
+                    with zipfile.ZipFile(archive, "w") as bundle:
+                        bundle.writestr(name, b"escape")
+                    errors = self.tool.safe_extract(archive, root / "extract", "zip")
+                    self.assertTrue(any("unsafe archive path" in error for error in errors), errors)
+            archive = root / "symlink.zip"
+            info = zipfile.ZipInfo("bin/link")
+            info.create_system = 3
+            info.external_attr = 0o120777 << 16
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr(info, "vllm-server.exe")
+            errors = self.tool.safe_extract(archive, root / "extract-link", "zip")
+            self.assertTrue(any("link" in error for error in errors), errors)
+
+    def test_explicit_archive_format_controls_extraction_and_must_match_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "payload.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("VERSION", b"ok")
+            errors = self.tool.safe_extract(archive, root / "wrong", "tar.gz")
+            self.assertTrue(any("format" in error for error in errors), errors)
+            errors = self.tool.safe_extract(archive, root / "right", "zip")
+            self.assertEqual(errors, [])
+
+    def test_zip_noncanonical_collisions_and_special_types_fail_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mutations = (
+                ("bin//vllm-server.exe", None),
+                ("bin/./vllm-server.exe", None),
+                ("bin/vllm-server.exe", 0o020666 << 16),
+            )
+            for index, (name, attributes) in enumerate(mutations):
+                archive = root / f"bad-{index}.zip"
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    if attributes is not None:
+                        info.external_attr = attributes
+                    bundle.writestr(info, b"bad")
+                    if index == 0:
+                        bundle.writestr("bin/vllm-server.exe", b"collision")
+                destination = root / f"extract-{index}"
+                errors = self.tool.safe_extract(archive, destination, "zip")
+                self.assertTrue(errors, (name, errors))
+                self.assertEqual(list(destination.rglob("*")) if destination.exists() else [], [])
+
+    def test_zip_directory_markers_must_match_unix_type_bits_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = (
+                ("bin/", stat.S_IFREG | 0o755),
+                ("other", stat.S_IFDIR | 0o755),
+            )
+            for index, (name, mode) in enumerate(cases):
+                archive = root / f"type-mismatch-{index}.zip"
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = mode << 16
+                    bundle.writestr(info, b"")
+                destination = root / f"type-mismatch-out-{index}"
+                errors = self.tool.safe_extract(archive, destination, "zip")
+                self.assertTrue(any("type" in error for error in errors), errors)
+                self.assertFalse(destination.exists())
+
+    def test_zip_entries_without_unix_type_bits_use_the_path_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "portable-types.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("python-file", b"python")
+                bundle.writestr("python-dir/", b"")
+                for name, content in (("windows-file", b"windows"), ("windows-dir/", b"")):
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 0
+                    info.external_attr = 0
+                    bundle.writestr(info, content)
+            destination = root / "portable-types-out"
+            self.assertEqual(self.tool.safe_extract(archive, destination, "zip"), [])
+            self.assertEqual((destination / "python-file").read_bytes(), b"python")
+            self.assertEqual((destination / "windows-file").read_bytes(), b"windows")
+            self.assertTrue((destination / "python-dir").is_dir())
+            self.assertTrue((destination / "windows-dir").is_dir())
+
+    def test_zip_windows_aliases_fail_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = (
+                ("bin/X", "BIN/x"), ("bin/name. ",), ("bin/name:stream",),
+                ("bin/CON",), ("bin/prn.txt",), ("bin/AUX",), ("bin/nul.log",),
+                ("bin/COM1.txt",), ("bin/lpt9",),
+            )
+            for index, names in enumerate(cases):
+                archive = root / f"alias-{index}.zip"
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    for name in names:
+                        bundle.writestr(name, b"bad")
+                destination = root / f"alias-out-{index}"
+                errors = self.tool.safe_extract(archive, destination, "zip")
+                self.assertTrue(errors, names)
+                self.assertFalse(destination.exists())
+
+    def test_pe_audit_rejects_wrong_machine_imports_crt_debug_and_paths(self) -> None:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        manifest["host"].update({"os": "windows", "arch": "x86_64", "abi": "msvc"})
+        manifest["dependencies"] = [
+            {"name": name, "linkage": "dynamic"}
+            for name in ("KERNEL32.dll",)
+        ]
+        self.assertEqual(
+            self.tool.validate_pe_audit(
+                manifest, "8664", ["KERNEL32.dll"], [], []
+            ),
+            [],
+        )
+        errors = self.tool.validate_pe_audit(
+            manifest,
+            "14C",
+            ["KERNEL32.dll", "msys-2.0.dll", "VCRUNTIME140D.dll"],
+            [r"C:\\agent\\_work\\build\\vllm-server.pdb"],
+            [r"C:\\agent\\_work\\build"],
+        )
+        joined = "\n".join(errors)
+        for needle in ("AMD64", "undeclared", "MSYS", "debug CRT", "debug path", "build path"):
+            self.assertIn(needle, joined)
+
+        api_crt = "api-ms-win-crt-runtime-l1-1-0.dll"
+        errors = self.tool.validate_pe_audit(
+            manifest, "8664", ["KERNEL32.dll", api_crt], [], []
+        )
+        self.assertTrue(any("static-CRT" in error for error in errors), errors)
+        api_manifest = json.loads(json.dumps(manifest))
+        api_manifest["dependencies"].append({"name": "api-ms-win-core-file-l1-1-0.dll", "linkage": "dynamic"})
+        self.assertEqual(
+            self.tool.validate_pe_audit(
+                api_manifest, "8664", ["KERNEL32.dll", "api-ms-win-core-file-l1-1-0.dll"], [], []
+            ),
+            [],
+        )
+
+    def test_windows_layout_rejects_every_lib_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in ("lib/foo.lib", "LIB/arbitrary.data", "lib/Foo.LIB"):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"inventoried but forbidden")
+            errors = self.tool.validate_windows_layout(root)
+            self.assertEqual(len(errors), 3, errors)
 
 
 if __name__ == "__main__":

@@ -2,15 +2,15 @@
 // vLLM e24d1b24 has no GGUF load format.
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
-#include <fcntl.h>
+#if !defined(_WIN32)
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -18,6 +18,11 @@
 namespace vllm {
 
 namespace {
+
+std::filesystem::path Utf8Path(const std::string& path) {
+  return std::filesystem::path(std::u8string(
+      reinterpret_cast<const char8_t*>(path.data()), path.size()));
+}
 
 [[noreturn]] void Fail(const std::string& path, const std::string& what) {
   throw std::runtime_error("gguf: " + what + " in " + path);
@@ -327,22 +332,13 @@ GgufFile GgufFile::OpenOne(const std::string& path) {
   auto mapping = std::make_shared<GgufMapping>();
   f.map_ = mapping;
 
-  mapping->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (mapping->fd < 0)
-    Fail(path, std::string("cannot open file: ") + std::strerror(errno));
-  struct stat st{};
-  if (::fstat(mapping->fd, &st) != 0)
-    Fail(path, std::string("fstat failed: ") + std::strerror(errno));
-  if (st.st_size <= 0) Fail(path, "empty file");
-  const size_t file_size = static_cast<size_t>(st.st_size);
-
-  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, mapping->fd, 0);
-  if (map == MAP_FAILED)
-    Fail(path, std::string("mmap failed: ") + std::strerror(errno));
-  mapping->addr = map;
-  mapping->size = file_size;
-
-  Cursor cur{static_cast<const uint8_t*>(map), file_size, 0, path};
+  try {
+    mapping->file = detail::ReadOnlyFileMapping::Open(Utf8Path(path));
+  } catch (const std::runtime_error& e) {
+    Fail(path, e.what());
+  }
+  const size_t file_size = mapping->file->size();
+  Cursor cur{mapping->file->data(), file_size, 0, path};
 
   // Header: magic "GGUF", u32 version, u64 tensor_count, u64 kv_count.
   cur.Need(4, "magic");
@@ -579,17 +575,13 @@ const GgufTensorInfo& GgufFile::Get(const std::string& name) const {
   return tensors_[it->second];
 }
 
-GgufMapping::~GgufMapping() {
-  if (addr != nullptr) ::munmap(addr, size);
-  if (fd >= 0) ::close(fd);
-}
-
 bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
   const auto in = [&](const GgufMapping* m) {
-    if (m == nullptr || m->addr == nullptr) return false;
-    const auto* base = static_cast<const uint8_t*>(m->addr);
-    return data >= base && nbytes <= m->size &&
-           static_cast<size_t>(data - base) <= m->size - nbytes;
+    if (m == nullptr || m->file == nullptr) return false;
+    const auto* base = m->file->data();
+    const size_t size = m->file->size();
+    return data >= base && nbytes <= size &&
+           static_cast<size_t>(data - base) <= size - nbytes;
   };
   if (in(map_.get())) return true;
   // A merged split GGUF: the span may live in any sibling shard's mapping.

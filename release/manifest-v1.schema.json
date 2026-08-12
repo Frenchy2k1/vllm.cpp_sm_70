@@ -76,10 +76,12 @@
       "additionalProperties": false,
       "required": ["os", "arch", "abi", "abi_version"],
       "properties": {
-        "os": {"enum": ["linux", "macos"]},
+        "os": {"enum": ["linux", "macos", "windows"]},
         "arch": {"enum": ["x86_64", "aarch64"]},
-        "abi": {"enum": ["glibc", "musl", "macos"]},
-        "abi_version": {"type": "string", "minLength": 1}
+        "abi": {"enum": ["glibc", "musl", "macos", "msvc"]},
+        "abi_version": {"type": "string", "minLength": 1},
+        "toolset_version": {"type": "string", "minLength": 1},
+        "ucrt_version": {"type": "string", "minLength": 1}
       }
     },
     "backendFlags": {

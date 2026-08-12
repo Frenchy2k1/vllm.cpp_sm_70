@@ -85,7 +85,13 @@ struct ComputeState {
   int ith = 0;
 };
 
-// struct ggml_threadpool, ggml-cpu.c:471-495, re-expressed per-op.
+// struct ggml_threadpool, ggml-cpu.c:471-495, re-expressed per-op. Its three
+// cache-line-aligned atomics intentionally introduce padding between hot
+// synchronization fields; MSVC C4324 describes that required layout.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 class Threadpool {
  public:
   // ggml_threadpool_new_impl, ggml-cpu.c:3237-3308 (created unpaused;
@@ -167,6 +173,9 @@ class Threadpool {
 
   std::mutex run_mutex_;             // deviation: serialize concurrent Run()
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // The pool the CPU kernels dispatch through: the test-swapped pool if set,
 // else the lazy global.
