@@ -19,6 +19,9 @@ Archive-target documentation-checkpoint repair:
 Exact-range checker-evidence repair:
 [#453](https://github.com/mudler/vllm.cpp/issues/453)
 
+Native portability-audit repair:
+[#454](https://github.com/mudler/vllm.cpp/issues/454)
+
 Agent-record semantic-evidence repair:
 [#455](https://github.com/mudler/vllm.cpp/issues/455)
 
@@ -293,6 +296,23 @@ channel remains stable. The release index states both levels: overall
 `prerelease=true`; per-artifact channels remain exact. Windows stays preview in
 this first release.
 
+### Hosted portability-audit repair
+
+The native audit transports the PowerShell script path as opaque process
+environment data. The constant parser program remains the final `pwsh
+-Command` argument, and no checkout path is interpolated into PowerShell code
+or appended after the command string. This preserves drive letters,
+backslashes, spaces, and Unicode while keeping Python's direct argv launch and
+PowerShell's `Parser.ParseFile` contract.
+
+Shell-launch rejection is token-aware. Active C++ calls to `system`, `popen`,
+`_popen`, or `ShellExecuteA/W`, and exact `cmd`/`cmd.exe` executable string
+literals remain forbidden. A Vulkan `VkCommandBuffer cmd` identifier, or the
+same words in comments and non-executable prose, is not a shell launch. The
+focused regression runs both CPU and Vulkan source closures and exercises
+Windows drive/backslash/space script paths; deleting the opaque path handoff or
+restoring raw `cmd` token matching must make it red.
+
 ## Tests to port and adapt
 
 Pinned vLLM has no Windows release or Win32 substrate suite to port. Its
@@ -438,6 +458,17 @@ performs tool preparation, sanitized-environment construction, and its
 allowlisted-tool and sibling-exclusion assertions inside one `clear=True`
 hostile environment. The exact ambient-`PATH` mutation must fail while the
 #456 implementation remains unchanged.
+
+Hosted run `31570365638` then exposed two independent portability-audit defects
+([#454](https://github.com/mudler/vllm.cpp/issues/454)). The Vulkan source
+closure legitimately names command buffers `cmd`, which the raw shell regex
+misclassified; both native jobs also passed a Windows checkout path after a
+`pwsh -Command` string, where PowerShell treats the remaining native arguments
+as command text rather than a separately bound script parameter. The repair
+classifies active C++ launch tokens and carries the parser path opaquely in the
+child environment. Local Windows-path fixtures and CPU/Vulkan closure
+mutations are accepted evidence for the checker semantics; a native hosted
+rerun remains required and is not inferred from Linux.
 
 ## Now
 
