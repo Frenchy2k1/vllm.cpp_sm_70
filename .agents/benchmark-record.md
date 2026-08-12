@@ -19436,3 +19436,32 @@ after each. Green on the local CPU build and the dgx CUDA build
 (`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`).
 
 Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
+
+## SPEC-DSPARK paired parity re-measure with W7 (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle
+(`g555967922`), same target+draft+k, `max_num_seqs=2`, greedy, matched token
+counts, cold run discarded, ours 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | 0.981x |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | 0.870x |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40, a 0.4%
+spread, so 0.870x is a reading and not noise. The capital cell spreads ~8%, so
+0.981x is the looser of the two.
+
+SPEED PARITY IS NOT MET. W7 removed host-side sampling waste but sampling is
+0.5 ms of this lane's step, so the e2e effect sits inside the capital cell's own
+noise band. The earlier 79.19 tok/s reading was PRE-REBOOT machine state and is
+not a W7 win; on the idle box both engines moved and the oracle moved more.
+Same-session pairing is what makes these rows quotable.
+
+The deficit is largest in the HIGH-ACCEPTANCE regime (0.870x, verify running
+every step) and smallest in the low-acceptance one (0.981x), which points at the
+T=1+k verify forward: both model families gate their decode CUDA graph on
+`input.pure_decode`, so our speculative verify falls off the captured graph and
+runs eager while upstream captures the uniform 1+k shape. Next lever.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
