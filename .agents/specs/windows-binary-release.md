@@ -507,6 +507,15 @@ narrowing, shadow, and format warning. Clean local CPU/Vulkan builds and the
 Windows portability mutation suite are green; native MSVC reruns remain the
 authoritative acceptance gate.
 
+Hosted run `31580273813` then reduced both native configurations to one
+second-order strict-build failure: the new central `NOMINMAX` command-line
+contract was redefined unconditionally by three legacy translation units
+([#462](https://github.com/mudler/vllm.cpp/issues/462)). Both complete logs
+contain only C4005 promoted through C2220 at the same sources. The repair
+removes those redundant definitions and the identical OpenAI test definition
+compilation had not reached, while retaining the central contract, `/W4 /WX`,
+`WIN32_LEAN_AND_MEAN`, and guarded isolated-source fallbacks.
+
 ## Now
 
 `ACTIVE`; W14-W16 implementation is assembled for one PR. Next: fresh review,

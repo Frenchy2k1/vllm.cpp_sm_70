@@ -132,3 +132,11 @@ shadow families; candidate blob `db3d4f15` passes.
 Native MSVC CPU/Vulkan reruns remain the authoritative `/W4 /WX` validation and
 are not inferred from Linux. The integrated exact PR-range gate uses the
 independent #458 hermetic evidence-tool repair carried by the candidate.
+
+The next native rerun `31580273813` then proved the central command-line
+`NOMINMAX` contract conflicted with three older unguarded source-local
+definitions under `/WX` ([#462](https://github.com/mudler/vllm.cpp/issues/462)).
+Both CPU and Vulkan logs contained only C4005 promoted through C2220 at the
+same three sources. The follow-up removes those redundant definitions plus the
+identical OpenAI test definition compilation had not reached, while retaining
+the central contract and guarded isolated-source fallbacks.

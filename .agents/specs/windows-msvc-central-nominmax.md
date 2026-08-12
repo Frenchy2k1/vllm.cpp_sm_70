@@ -47,8 +47,8 @@ second definition. `WIN32_LEAN_AND_MEAN` is not part of the central contract
 and remains immediately before `<windows.h>`.
 
 The native Vulkan job `94061520778` was still running when the spec was
-committed. Its final log must be inspected before handoff; any distinct
-diagnostic returns `NEEDS_CONTEXT` rather than being guessed into this repair.
+committed. Its final log was inspected before implementation handoff and
+contained the identical three C4005/C2220 paths with no distinct diagnostic.
 
 ## Test and implementation contract
 
@@ -85,4 +85,17 @@ runtime/public behavior change, or release-semantic change.
 
 ## Outcome
 
-Pending implementation and final native hosted evidence.
+The focused regression failed at the pinned baseline with the exact four
+project-owned unguarded definitions: the three translation units reached in
+both hosted jobs and the OpenAI API test translation unit compilation had not
+yet reached. The implementation removes only those four redundant definitions;
+the central CMake `NOMINMAX`, `/W4 /WX`, every `WIN32_LEAN_AND_MEAN`, and the
+guarded source-local fallbacks remain unchanged. The focused regression and the
+complete Windows portability suite then passed, 1/1 and 63/63 respectively.
+
+Clean local CPU and Vulkan source closures built 397/397 and 407/407 targets.
+CPU API, filesystem, and Vulkan-loader tests passed. Vulkan filesystem,
+loader, backend, and cross-device tests passed. The Vulkan-configured API test
+retains the two embedding HTTP-500 failures already tracked independently by
+#461; the same CPU-configured test passes 54/54. Native MSVC CPU/Vulkan reruns
+remain required and are not inferred from Linux.
