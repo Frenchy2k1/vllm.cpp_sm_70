@@ -288,6 +288,20 @@ the provenance fix below.
   hold two revisions.
 - 27n op-parity arms against the four other committed 27n golden directories.
 
+The fresh review of the landed arm raised four more, all filed rather than
+folded in, because each needs its own RED-before evidence:
+
+| issue | what the arm still cannot do |
+|---|---|
+| [#476](https://github.com/mudler/vllm.cpp/issues/476) | see an fp8→bf16 DEQUANT FALLBACK on `out_proj_fp8` or the four `self_attn.*_proj_fp8` — `GdnFp8InProjDebugStats` counts GDN `in_proj` only, and `6603356a` is that exact defect landing token-invisible |
+| [#477](https://github.com/mudler/vllm.cpp/issues/477) | reach a CI log at all: `ctest --output-on-failure` prints nothing for a passing skip, so all three refusal defences are silent there. Also tracks the `MODEL_GATE_CONTRACTS` debt above |
+| [#478](https://github.com/mudler/vllm.cpp/issues/478) | agree with itself: it refuses `PackedGdnDecodeEnvSelected` as an ENV-only mirror yet derives its expected counts from `MergedGdnFp8QkvzEnvSelected`, which is the same kind of mirror |
+| [#479](https://github.com/mudler/vllm.cpp/issues/479) | be audited from its own manifests, which label the pinned oracle `pip-vllm` |
+
+§4's banner text was also corrected in place: it said `NO FP8 TOWER COVERAGE`
+where the code emits `NO-FP8-TOWER-COVERAGE`, so a grep written from this spec
+found nothing. The code is the authority.
+
 ## Now
 
 `DONE` — arm landed with RED-mutation evidence; follow-ons above are separate
