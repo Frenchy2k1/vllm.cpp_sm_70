@@ -479,15 +479,22 @@ class BudgetEnforcement(unittest.TestCase):
                 executable = ambient / name
                 executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
                 executable.chmod(0o755)
-            with mock.patch.dict(os.environ, {"PATH": str(ambient)}):
+            with mock.patch.dict(
+                os.environ, {"PATH": str(ambient)}, clear=True
+            ):
                 tools = checker._prepare_evidence_tools(
                     root, "tests.scripts.test_check_windows_portability"
                 )
-            env = checker._sanitized_env(root, tools)
-            entries = env["PATH"].split(os.pathsep)
-            self.assertNotIn(str(ambient), entries)
-            self.assertEqual(shutil.which("ninja", path=env["PATH"]), str(tools / "ninja"))
-            self.assertIsNone(shutil.which("ambient-secret", path=env["PATH"]))
+                env = checker._sanitized_env(root, tools)
+                entries = env["PATH"].split(os.pathsep)
+                self.assertNotIn(str(ambient), entries)
+                self.assertEqual(
+                    shutil.which("ninja", path=env["PATH"]),
+                    str(tools / "ninja"),
+                )
+                self.assertIsNone(
+                    shutil.which("ambient-secret", path=env["PATH"])
+                )
 
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
