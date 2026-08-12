@@ -50,6 +50,10 @@ LogprobsTensors per-request slice shadow repair:
 [#465](https://github.com/mudler/vllm.cpp/issues/465), specified in
 [windows-msvc-logprobs-shadow.md](windows-msvc-logprobs-shadow.md)
 
+MSVC CHECK stringizing repair for the Windows argv expectation:
+[#474](https://github.com/mudler/vllm.cpp/issues/474), specified in
+[windows-msvc-check-stringizing.md](windows-msvc-check-stringizing.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
