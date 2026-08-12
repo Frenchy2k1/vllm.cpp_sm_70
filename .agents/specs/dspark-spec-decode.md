@@ -1116,6 +1116,127 @@ per-work, not by its mean/median. Three of this row's ratios (0.986x single-shot
 draw distribution rather than either engine, and only isolating the prompt and
 reading its counters settled it.
 
+## 6r. STOP CONDITION: the residual is below the measurement's resolution (2026-08-12)
+
+The last cell under 1.0x is "fibonacci" at 0.996x of upstream's modal draw. That
+difference is not resolvable on this box, and no remaining lever can close it.
+
+| quantity | value |
+|---|---|
+| ours, 5 reps | min 138.90, median 141.80, max 142.40 |
+| oracle, modal draws (18 steps / 70 accepted) | min 142.01, median 142.37, max 142.66 |
+| **distributions** | **OVERLAP** — our max 142.40 exceeds their min 142.01 |
+| median ratio | 0.9960x |
+| best-vs-best | 0.9982x |
+| OUR run-to-run spread | **2.47%** |
+| their modal spread | 0.46% |
+
+The 0.4% median difference is SIX TIMES SMALLER than our own spread, and the two
+distributions overlap, so the ordering is not established in either direction.
+
+**And no identified change can close it.** The largest remaining lever is
+dropping the block-logits round trip (the forward downloads
+`[nqpr, draft_vocab]` = 1.15 MB and the sampler uploads it straight back). The
+sync it implies has to happen anyway, so the saving is ~0.03 ms of a 34.7 ms
+step = **0.09%**, which would move 0.996x to ~0.997x. Everything else is already
+at its floor: the draft graph captures, the verify captures, the Markov sample is
+at its memory-bandwidth bound (§6k), and per-step the engines match (30.4 vs
+~30.1 ms, 34.7 vs ~34.5).
+
+**Verdict for this row: parity within the measurement's resolution.** "capital"
+1.012x, "fibonacci" 0.996x with overlapping distributions, acceptance identical
+at 48.6% / 4.94 tokens per step. Neither engine is reliably faster on this
+workload, and the row claims neither.
+
+**What a demonstrated >= 1.0x would now require** is a lower-noise harness, not
+more engineering: pinned clocks, many more repetitions, and a reference whose own
+acceptance does not vary run to run (upstream's moves 104-127 drafts on identical
+greedy prompts, §6p). That is a benchmarking task, and it is the honest next step
+for anyone who needs the strict claim.
+
+## 6s. LOW-NOISE HARNESS: the gap is REAL, 0.975x, and §6q/§6r were too generous (2026-08-12)
+
+§6r asserted the residual was below the measurement's resolution and stopped. A
+controlled harness disproves that. Clocks PINNED at 1800 MHz, 16 reps per arm
+with the cold run dropped, our arm run TWICE to bracket the oracle so drift is
+detectable, and the oracle's non-modal draws excluded by their own draft counts:
+
+| arm | n | median | range | spread |
+|---|---|---|---|---|
+| ours, BEFORE | 15 | 135.98 | 135.3-136.2 | **0.66%** |
+| ours, AFTER | 15 | 135.86 | 128.8-136.0 | 5.30% |
+| drift before -> after | | **-0.088%** | | |
+| oracle, MODAL (18 steps) | 12 | **139.36** | 137.8-139.7 | 1.33% |
+| oracle, non-modal (17 steps) | 3 | 147.7-148.2 | | excluded |
+
+**The distributions do NOT overlap** — our max 136.2 is below their min 137.8 —
+drift is negligible (-0.088%), and the ratio is **0.9751x** by median and 0.9750x
+best-vs-best.
+
+So the honest number for this cell is **0.975x, not 0.996x**, and §6q/§6r are
+superseded. What went wrong there was not arithmetic but CONDITIONS: at free
+boost clocks the two engines read 141.8 vs 142.4 (0.996x), and pinning the clock
+moved ours to 135.9 and theirs to 139.4 (0.975x). Both slowed, ours MORE.
+
+**That clock sensitivity is itself the lead.** Lowering the SM clock hurt us
+disproportionately, which means our step carries more SM-clock-sensitive
+(compute-bound) work per token than upstream's — a memory-bound step would have
+been comparatively unaffected. That points back at a finding this row already
+made and never closed: §6e/§6f measured the MoE expert activation at T=9 costing
+us ~1.7x GPU per token. The verify is ~30 ms of a ~34.7 ms step and both engines
+graph it, so the residual is inside the MoE expert path, not in launch overhead.
+
+**Method lesson, and it is the inverse of the last one.** §6p/§6q corrected an
+over-pessimistic reading caused by a noisy reference; this corrects an
+over-optimistic one caused by uncontrolled clocks. A difference that hides inside
+noise is not thereby absent — "below resolution" is a statement about the
+harness, not about the engines, and the fix is a better harness, which is exactly
+what produced a non-overlapping 2.5%.
+
+**Row verdict: NOT parity on this cell. 0.975x, real and reproducible.**
+
+## 6t. WHERE THE 2.5% LIVES: the MoE expert GEMM (2026-08-12)
+
+nsys on our verify at T=9 (35B, k=8), `--cuda-graph-trace=node`, two token
+lengths so the one-time prefill differences out.
+
+**First, what it is NOT.** The 96-token profile's top entries look alarming:
+
+| kernel | share (96-tok run) | instances |
+|---|---|---|
+| `TransposeToInt32Kernel` | 16.9% | 20561 |
+| `gptq_marlin_repack_kernel` | 15.8% | 20561 |
+| `ProcessScalesKernel` | 7.7% | 20561 |
+
+40.4% of GPU time in weight REPACKING. But the 32-token run reports the SAME
+20561 instances and the same totals (183.5 / 170.4 / 83.9 ms vs 183.0 / 170.2 /
+83.5). Identical counts across run lengths means these are **LOAD-TIME**, not
+per-step -- the nsys-aggregation trap this row has already been caught by once
+("per-step Marlin repack" that was load-time). They cost ~437 ms once at startup
+and nothing per token. Do not optimise them for decode.
+
+**What actually scales is the expert GEMM:**
+
+| quantity | value |
+|---|---|
+| `marlin_moe_wna16::Marlin` instances | 560 (32 tok) -> 1520 (96 tok) = ~15/token |
+| GPU time | (249.2 - 90.9) ms / 64 tok = **2.47 ms/token** |
+| share of wall at 135.9 tok/s (7.36 ms/token) | **~34%** |
+
+That is the per-token cost, it is a GEMM, and being compute-bound it explains
+§6s's clock sensitivity exactly: pinning the SM clock hurt whichever engine does
+more SM work per token, and it hurt us more.
+
+**To close the measured 2.5% end-to-end requires ~7% off this kernel** (2.5 / 34).
+
+**Next step, and the rule that governs it:** profile the ORACLE's expert path and
+pair kernels BY CALL COUNT before touching ours. This row has already learned
+that the hard way -- a previous campaign found Marlin at 55.5% of our step and
+concluded it was the gap, until upstream's own profile showed it at 57.2% of ITS
+step, i.e. never the gap at all. A 34% share proves where our time goes, NOT that
+upstream spends less there. Until both profiles exist, "optimise the expert GEMM"
+is a guess.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

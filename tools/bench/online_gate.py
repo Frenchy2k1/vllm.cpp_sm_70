@@ -263,10 +263,13 @@ MODEL_GATE_CONTRACTS = {
         "proof": "qwen27_paged_engine: full production stream 16/16 token-exact vs vLLM",
     },
     "test_qwen36_paged_engine": {
-        # Find35BSnapshot() takes the first cached snapshot of the 35B repo and
-        # pins no revision, so this records an honest "unknown" rather than
-        # asserting a match nothing checks.
-        "golden_revision": None,
+        # GATE-PIN-UNPINNED-SNAPSHOTS (#471): Find35BSnapshot() now resolves
+        # through tests/parity/hf_snapshot.h `kQwen36A3bNvfP4Revision`, the
+        # revision the 35B goldens record in `oracle.model`. This was an honest
+        # "unknown" while the gate took the first cached snapshot; it is no
+        # longer unknown, and leaving it None would understate the coverage the
+        # gate now actually has.
+        "golden_revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
         "proof": "qwen36_paged_engine M0-EXIT: produced ",
     },
     "mxfp4_smoke_battery": {
