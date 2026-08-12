@@ -515,9 +515,13 @@ shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
 toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
 COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
 upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime -- allocator-driven L2/DRAM locality, our L2 hit
-rate being 9.5% -- and is real but unattributed. Editing the kernel, its launch
-config, layout or flags is NOT indicated: all are proven identical. (The repack kernels that appear to take 40% of a long run are
+residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
+(L2 hit 9.5%) and we sustain **186.6 GB/s against upstream's 210.7**, a 12.9%
+effective-bandwidth gap that IS the whole per-unit-work difference. Weight
+residency is already staged correctly (cudaMalloc + one upload), so the cause is
+memory-system behaviour for our ~512 MB single-slab expert allocation. Editing
+the kernel, its launch config, layout or flags is NOT indicated: all are proven
+identical. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
