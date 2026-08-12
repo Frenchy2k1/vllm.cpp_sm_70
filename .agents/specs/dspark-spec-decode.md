@@ -833,6 +833,89 @@ prize and should be SIZED before it is built.
 
 Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
 
+## 6l. PAIRED PARITY RE-MEASURE WITH W7: still BELOW parity (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle, same
+target+draft+k, `max_num_seqs=2`, greedy, matched token counts, cold run
+discarded. Ours is 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | **0.981x** |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | **0.870x** |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40 — a 0.4%
+spread — so 0.870x is a real reading, not noise. The capital cell spreads ~8%
+(71.58-77.67), so treat 0.981x as the looser of the two.
+
+**W7 did not close the gap, and the goal of speed parity is NOT met.** W7 removed
+host-side sampling waste worth 11-15% of the sampling phase, but sampling is a
+small share of the step on this lane (0.5 ms of it), so the e2e effect is within
+the capital cell's own noise band. Do not read the earlier 79.19 tok/s as a W7
+win: that was PRE-REBOOT machine state, and on the idle box both engines moved,
+the oracle more than us. Same-session pairing is what makes these two rows
+quotable and the earlier cross-session ones not.
+
+**Where the remaining gap is, and the next lever.** The deficit is largest in the
+HIGH-ACCEPTANCE regime (fibonacci 0.870x, where the block is mostly accepted and
+the T=1+k verify runs every step) and smallest in the low-acceptance one
+(capital 0.981x). That points at the verify forward, not the drafter: §6g
+established that BOTH model families gate their decode CUDA graph on
+`input.pure_decode` (`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`), so our
+speculative verify at T=1+k falls off the captured graph and runs EAGER, while
+upstream captures the uniform `1+k` shape. That is the same unexploited headroom
+DFlash left open (D12 Part C) and it is the next thing to build. It is a
+static-shape capture increment, not a tuning knob.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
+
+## 6m. W8 SLICE: capture the T=1+k verify (the remaining gap), issue #442
+
+§6l localises the residual 0.870x-0.981x to the VERIFY forward. This is the
+scoped increment that closes it; it is dispatch-ready and deliberately NOT
+started here, because a half-finished CUDA-graph capture is worse than none.
+
+**ROOT CAUSE (2026-08-12): we mirrored the model but NOT vLLM's cudagraph
+dispatcher.** Upstream's "uniform" test is that all requests share a query_len,
+NOT that query_len is 1 (`v1/worker/gpu/cudagraph_utils.py:95-105`), and the
+captured decode length is defined as the verify shape:
+`self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens`
+(`v1/cudagraph_dispatcher.py:37`), so a uniform 1+k batch takes the FULL graph
+(`:143-146`). vLLM graphs the speculative verify BY CONSTRUCTION. We never do,
+so our verify runs eager EVERY step — the whole ~4.8 ms/step, and the reason the
+deficit tracks acceptance (0.870x where the block is mostly accepted, 0.981x
+where it is not). Nothing is missing from the model: kernels, drafter and
+acceptance are already at parity. The missing piece is dispatch.
+
+This makes the increment a MIRRORING job with an upstream anchor: generalise the
+predicate to upstream's uniform test with query length `1 + num_spec`, key
+captures on a `(num_tokens, num_reqs, uniform)` descriptor instead of one bespoke
+pure-decode graph, and pad token counts to a captured set as
+`_bs_to_padded_graph_size` does so a handful of shapes covers every batch.
+
+**Predicate.** `pure_decode` is `num_actual_tokens == num_reqs`
+(`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`). A verify submits
+`num_reqs x (1+k)` tokens and therefore runs eager EVERY step, while upstream
+captures the uniform `1+k` shape.
+
+**Do NOT just widen the gate.** `Qwen3_5DenseDecodeGraph` is documented
+pure-decode ("all query_len==1"); relaxing the predicate would send a spec batch
+through a graph captured for a different shape AND a different attention path.
+The increment is a sibling capture keyed on `(num_reqs, 1+k)` that routes the
+SPEC paths already landed under `SPEC-GDN-SEGMENTS` (`vt::GdnSpecDecode`,
+`vt::CausalConv1dSpecUpdate`, per-timestep snapshots) and block-diagonal causal
+attention over the query span. k is fixed per config and `num_reqs <=
+max_num_seqs`, so the shape set is small and static.
+
+**Gate:** replayed == eager BIT-IDENTICAL on both gate models; spec-OFF
+byte-identical (SACRED); then the paired cross-engine re-measure on the same two
+35B cells, target >= 1.0x on both.
+
+**Capture safety:** no function-local upload temporaries in the captured region.
+This repo has already shipped a use-after-free from exactly that, and a
+sanitizer-clean run is not proof of capture safety -- pair it with an explicit
+replay-vs-eager bit-compare.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
