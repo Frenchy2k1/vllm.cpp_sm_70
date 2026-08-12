@@ -481,9 +481,12 @@ draftable. The open lever was per-step cost: 28% of the draft step was
 host-side sampling, now moved on device (#436, byte-identical output, sampling
 -11%/-15%, ~3% e2e on the 35B lane); what remains of that phase is a memory
 bandwidth bound on the per-step Markov GEMV that upstream pays identically.
-A PAIRED re-measure on 2026-08-12 puts the MoE lane at 0.870x-0.981x, so speed
-parity is NOT met; the deficit tracks the high-acceptance regime, pointing at the
-T=1+k verify running eager while upstream captures it. The Gemma4 `1 + N` layout is coded and unit-tested but has
+W8 (#442) then CAPTURED the T=1+k verify, mirroring vLLM's uniform-decode graph
+predicate (`uniform_decode_query_len = 1 + num_speculative_tokens`) instead of
+our `query_len == 1` gate: the MoE lane moves to **0.986x-0.995x** of the pinned
+graphed oracle (from 0.870x-0.981x), byte-identical, +8.5%/+4.7% same-binary.
+Close to parity but not at it: the residual ~1.4% is larger than the 0.3% rep
+spread. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
