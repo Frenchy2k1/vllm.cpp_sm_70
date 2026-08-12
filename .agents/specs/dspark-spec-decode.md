@@ -1154,6 +1154,47 @@ acceptance does not vary run to run (upstream's moves 104-127 drafts on identica
 greedy prompts, §6p). That is a benchmarking task, and it is the honest next step
 for anyone who needs the strict claim.
 
+## 6s. LOW-NOISE HARNESS: the gap is REAL, 0.975x, and §6q/§6r were too generous (2026-08-12)
+
+§6r asserted the residual was below the measurement's resolution and stopped. A
+controlled harness disproves that. Clocks PINNED at 1800 MHz, 16 reps per arm
+with the cold run dropped, our arm run TWICE to bracket the oracle so drift is
+detectable, and the oracle's non-modal draws excluded by their own draft counts:
+
+| arm | n | median | range | spread |
+|---|---|---|---|---|
+| ours, BEFORE | 15 | 135.98 | 135.3-136.2 | **0.66%** |
+| ours, AFTER | 15 | 135.86 | 128.8-136.0 | 5.30% |
+| drift before -> after | | **-0.088%** | | |
+| oracle, MODAL (18 steps) | 12 | **139.36** | 137.8-139.7 | 1.33% |
+| oracle, non-modal (17 steps) | 3 | 147.7-148.2 | | excluded |
+
+**The distributions do NOT overlap** — our max 136.2 is below their min 137.8 —
+drift is negligible (-0.088%), and the ratio is **0.9751x** by median and 0.9750x
+best-vs-best.
+
+So the honest number for this cell is **0.975x, not 0.996x**, and §6q/§6r are
+superseded. What went wrong there was not arithmetic but CONDITIONS: at free
+boost clocks the two engines read 141.8 vs 142.4 (0.996x), and pinning the clock
+moved ours to 135.9 and theirs to 139.4 (0.975x). Both slowed, ours MORE.
+
+**That clock sensitivity is itself the lead.** Lowering the SM clock hurt us
+disproportionately, which means our step carries more SM-clock-sensitive
+(compute-bound) work per token than upstream's — a memory-bound step would have
+been comparatively unaffected. That points back at a finding this row already
+made and never closed: §6e/§6f measured the MoE expert activation at T=9 costing
+us ~1.7x GPU per token. The verify is ~30 ms of a ~34.7 ms step and both engines
+graph it, so the residual is inside the MoE expert path, not in launch overhead.
+
+**Method lesson, and it is the inverse of the last one.** §6p/§6q corrected an
+over-pessimistic reading caused by a noisy reference; this corrects an
+over-optimistic one caused by uncontrolled clocks. A difference that hides inside
+noise is not thereby absent — "below resolution" is a statement about the
+harness, not about the engines, and the fix is a better harness, which is exactly
+what produced a non-overlapping 2.5%.
+
+**Row verdict: NOT parity on this cell. 0.975x, real and reproducible.**
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

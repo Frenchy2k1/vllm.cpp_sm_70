@@ -19811,3 +19811,38 @@ Verdict: parity within the measurement's resolution. "capital" 1.012x,
 / 4.94 tokens per step. A strict >= 1.0x claim now needs a lower-noise harness
 (pinned clocks, many reps, and a reference whose acceptance does not vary), not
 more engineering.
+
+## SPEC-DSPARK: LOW-NOISE harness -- the gap is REAL at 0.975x (2026-08-12)
+
+Supersedes the same day's 0.996x "within resolution" reading, which was measured
+at free boost clocks and was too generous.
+
+Harness: GPU clocks PINNED at 1800 MHz for the whole run, 16 reps per arm with
+the cold run dropped, our arm run TWICE bracketing the oracle so drift is
+detectable, and the oracle's non-modal draws excluded by their own draft counts.
+
+| arm | n | median | range | spread |
+|---|---|---|---|---|
+| ours, BEFORE | 15 | 135.98 | 135.3-136.2 | 0.66% |
+| ours, AFTER | 15 | 135.86 | 128.8-136.0 | 5.30% |
+| drift before -> after | | -0.088% | | |
+| oracle, MODAL (18 steps) | 12 | 139.36 | 137.8-139.7 | 1.33% |
+| oracle, non-modal (17 steps) | 3 | 147.7-148.2 | | excluded |
+
+Distributions do NOT overlap (our max 136.2 < their min 137.8). Ratio 0.9751x by
+median, 0.9750x best-vs-best. Drift is negligible.
+
+At free boost clocks the same two engines read 141.8 vs 142.4 (0.996x); pinning
+the clock moved ours to 135.9 and theirs to 139.4. Both slowed, OURS MORE, which
+means our step carries more SM-clock-sensitive work per token. That points at the
+MoE expert activation at T=9 that this row measured at ~1.7x GPU per token and
+never closed -- the verify is ~30 ms of a ~34.7 ms step and both engines graph
+it, so the residual is inside the expert path, not launch overhead.
+
+Verdict: NOT parity on this cell. 0.975x, real and reproducible.
+
+Method lesson (the inverse of the bimodal-reference one): a difference that hides
+inside noise is not thereby absent. "Below resolution" describes the harness, not
+the engines.
+
+Evidence: `dgx:~/work/dspark-w6/lownoise.log`, `fibacc.json`.
