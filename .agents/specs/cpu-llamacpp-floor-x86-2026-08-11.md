@@ -169,9 +169,8 @@ model hash, per-repetition numbers, load averages, and the correctness hashes.
 
 **Peak RSS MET at 1.0022x (parity); prefill/decode/E2E `PENDING` a quiet host.**
 The x86_64 arm of `BACKEND-GATE-CPU-LLAMACPP` now exists where it did not
-before. Next: run the committed harness
-`docs/bench-evidence/cpu-x86-llamacpp-20260811-harness.sh` on an idle x86_64 box
-to close the three throughput axes, then CIQ `G5`.
+before. Next: run the committed harness `scripts/cpu-x86-llamacpp-floor.sh` on
+an idle x86_64 box to close the three throughput axes, then CIQ `G5`.
 
 ## Outcome
 

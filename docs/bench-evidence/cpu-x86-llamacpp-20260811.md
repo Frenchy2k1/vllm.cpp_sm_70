@@ -37,8 +37,8 @@ waived.** The vllm.cpp figures above come from the single leg that passed the
 quiet gate (one-minute load 2.43, zero compiler processes); no llama.cpp leg
 ever passed it, so no ratio is computed and none is guessed. Publishing a ratio
 against a contended denominator is exactly the error this file documents below.
-The harness is committed beside this file and re-runnable: it blocks each leg
-until the box is quiet and discards any leg a compiler appears during.
+`scripts/cpu-x86-llamacpp-floor.sh` is committed and re-runnable: it blocks
+each leg until the box is quiet and discards any leg a compiler appears during.
 
 ## Correctness
 
@@ -90,9 +90,9 @@ None of those legs contributes to any number above; their spread is recorded
 here because the spread is the finding. The replacement series gates every
 single leg: it will not start one until the one-minute load average is below 3
 with no compiler process running, and it discards and retries any leg during
-which a compiler appears. That harness is committed next to this file as
-`cpu-x86-llamacpp-20260811-harness.sh`, so finishing the pending axes is a
-matter of running it on a quiet box, not of rebuilding the method.
+which a compiler appears. That harness is committed as `scripts/cpu-x86-llamacpp-floor.sh`, so finishing
+the pending axes is a matter of running it on a quiet box, not of rebuilding
+the method.
 
 Peak RSS is the one axis that is immune to this: it varied by at most 0.02%
 across legs that varied by 248% in throughput.
