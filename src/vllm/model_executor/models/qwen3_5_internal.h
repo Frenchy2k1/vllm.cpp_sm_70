@@ -115,11 +115,35 @@ bool PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env);
 struct GdnMixedQkvDTypeInputs {
   bool has_bf16_qkvz_owner = false;  // w.in_proj_qkvz populated (27B bf16, 4B)
   bool has_fp8_qkv_owner = false;    // w.in_proj_qkv_fp8 populated (modelopt)
+  // PERF-GDN-PACKED-BRIDGE (#365). ShouldUseMergedGdnFp8Qkvz held for this
+  // layer, i.e. ProjectGdnQkvz takes the MERGED fp8 arm rather than the split
+  // one. Required because `VT_GDN_FP8_IN_BF16` narrows the merged arm ONLY --
+  // `fp8_indt` reaches MergedFp8QkvzD and nothing else, while the split arm
+  // still hardcodes F32. A prediction that ignored the arm would claim BF16 on
+  // a split-arm checkpoint, which is the UNSAFE direction: vt::GdnPackedDecode
+  // would then be handed an f32 mixed_qkv against bf16 a/b/out and THROW.
+  bool fp8_merged_arm = false;
   vt::DType in_dtype = vt::DType::kF32;       // GdnInDType()
   vt::DType fp8_out_dtype = vt::DType::kF32;  // the fp8 in_proj epilogue's dtype
 };
 
 vt::DType GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in);
+
+// PERF-GDN-PACKED-BRIDGE (#365) -- the SINGLE decision for the dtype the
+// native-FP8 MERGED GDN in_proj emits, shared by the two parties that must
+// agree about it: the PRODUCER (`ProjectGdnQkvz`'s `fp8_indt`, handed to
+// `MergedFp8QkvzD`, which allocates the buffer) and the PREDICTOR
+// (`GdnFp8MixedQkvDType`, read by the packed-decode eligibility BEFORE the
+// projection has run, because the decision feeds `ProjectGdnBA`). They cannot
+// drift because they are the same call.
+//
+// Terms are PERF-FP8-ALPHA-FOLD's own, verbatim: the opt-in toggle
+// (`VT_GDN_FP8_IN_BF16`, default OFF), `indt == BF16` so `VT_GDN_IN_BF16`'s
+// documented rollback still restores f32 on this arm too, and `outdt == BF16`,
+// which confines the narrowing to the dense 27B (the 35B is MoE, so
+// `GdnOutDType` is f32 there and this stays inert).
+vt::DType GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled, vt::DType in_dtype,
+                                    vt::DType out_dtype);
 
 // The packed-decode dtype rule, keyed on the ACTIVATION dtypes the op needs and
 // on NOTHING about how the weights are stored. `vt::GdnPackedDecode`'s own
