@@ -499,10 +499,13 @@ MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
 the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
 noise, and the earlier "within resolution" reading was too generous. Ours slowed
 more than the oracle when the clock was pinned, so the residual is
-SM-clock-sensitive work. Profiling localises it: the MoE expert GEMM is ~15
-instances and 2.47 ms per token, ~34% of wall, so closing 2.5% end-to-end needs
-~7% off that kernel. (The repack kernels that appear to take 40% of a long run
-are LOAD-TIME -- identical instance counts at 32 and 96 tokens.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
+SM-clock-sensitive work. PAIRED profiling localises it exactly: the SAME
+`marlin_moe_wna16::Marlin` kernel, the SAME 1520 launches, ours 249.22 ms vs
+upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall is
+2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm
+difference: the next step is the kernel's launch configuration and repacked
+weight layout. (The repack kernels that appear to take 40% of a long run are
+LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
