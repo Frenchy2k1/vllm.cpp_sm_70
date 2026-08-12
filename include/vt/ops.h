@@ -779,12 +779,13 @@ using MatmulNvfp4CutlassFn =
              const Tensor*, float);
 using MatmulFp8CutlassFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+// The trailing bool is `claims_splitk1_premise` — see MatmulFp8CublasLt below.
 using MatmulFp8CublasLtFn =
-    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float, bool);
 // Same operands as MatmulFp8CublasLtFn, but the trailing scalar alpha becomes a
 // device f32 [N] vector — one folded alpha per OUTPUT COLUMN.
 using MatmulFp8CublasLtAlphaVecFn =
-    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/);
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/, bool);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
@@ -1406,8 +1407,22 @@ void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& 
 // (cublasLt writes the requested output type directly). K,N multiples of 16.
 // CUDA-only. Falls back to the cutlass fp8 GEMM if cublasLt has no fp8 heuristic
 // for a given shape (keeps the correctness gate robust on odd M).
+//
+// `claims_splitk1_premise` (default FALSE) is how a caller opts INTO a stricter
+// contract than the op otherwise offers. Pass it only when this GEMM's bf16 `out`
+// is asserted to be byte-equivalent to the SAME GEMM's f32 `out` — a pure
+// store-width narrowing over one ordered f32 reduction. That claim requires the
+// selected cuBLASLt plan to run at splitK=1 (a split-K sums per-split partials
+// in an order the f32 arm never used, and f32 addition is not associative), so
+// the implementation verifies it and REFUSES otherwise.
+//
+// It is FALSE by default because that claim is unusual. An ordinary bf16 `out`
+// — what every `o_proj` / `out_proj` fp8 projection asks for, on a default-ON
+// path — is just an output dtype: split-K is correct for it, it is compared
+// against nothing, and it is never checked. Do not set this flag merely because
+// `out` is bf16; set it when you are asserting equivalence with an f32 arm.
 void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                       float alpha);
+                       float alpha, bool claims_splitk1_premise = false);
 
 // MatmulFp8CublasLtAlphaVec — the SAME fp8 GEMM with a per-output-COLUMN alpha:
 //   out[m,n] = alpha_vec[n] * (A_fp8[M,K] @ B_fp8[N,K]^T)[m,n]
@@ -1437,8 +1452,12 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
 // the epilogue would round once where the fallback rounds twice, so admitting it
 // would make VT_FP8_ALPHA_VEC_EPILOGUE change VALUES rather than just speed; the
 // toggle is kept a pure performance A/B at every dtype.
+//
+// `claims_splitk1_premise` carries exactly the meaning it has on
+// MatmulFp8CublasLt above, and reaches the same check: a bf16 `out` always takes
+// the two-launch arm, whose GEMM IS MatmulFp8CublasLt.
 void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                               const Tensor& alpha_vec);
+                               const Tensor& alpha_vec, bool claims_splitk1_premise = false);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

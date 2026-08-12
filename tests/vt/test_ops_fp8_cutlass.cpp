@@ -525,6 +525,17 @@ void AlphaVecMatchesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed, flo
 // the epilogue, the double rounding would show up here as a byte difference. With
 // the toggle OFF it degenerates to comparing identical code, which is why the
 // ctest arm test_ops_fp8_alpha_vec_epilogue_on is the one that binds.
+//
+// WHAT THIS CASE DOES AND DOES NOT COVER — do not cite it as a token gate for
+// VT_GDN_FP8_IN_BF16. Its FIRST assertion pins the epilogue REFUSAL only: both of
+// those arms apply alpha after the GEMM, so both are `round -> scale`. Its SECOND
+// assertion does compare the two orders the bf16-D lever actually changes —
+// `round-then-scale` (bf16 D) against `scale-then-round` (f32 D) — but it bounds
+// them at the arithmetic level, one ulp per word, on random fp8 operands. That is
+// a bound on the KERNEL, not evidence that the model's tokens survive it: the
+// SACRED engine gates on the fp8 tower decide the lever, and no committed gate
+// loads that checkpoint yet (#466). See .agents/specs/perf-fp8-alpha-fold.md
+// §Outcome, "What the green suite does and does not say".
 void AlphaVecBf16TakesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed,
                                 float alpha_qkv, float alpha_z) {
   const int N = Nqkv + Nz;
@@ -567,10 +578,13 @@ void AlphaVecBf16TakesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed,
   }
   CHECK(alpha_vec == two_launch);  // BYTE-identical: the bf16 D must not reach the epilogue
 
-  // The bf16 result must also be the bf16 rounding of the f32 result, element for
-  // element -- i.e. narrowing D changed the STORE width and nothing else. This is
-  // what makes the lever a width change rather than a different computation, and
-  // it would catch a bf16 GEMM that accumulated in bf16 or applied alpha at bf16.
+  // The bf16 result must also be the bf16 rounding of the f32 result to within
+  // ONE ulp, element for element -- i.e. narrowing D changed the store width and
+  // the point at which the value is rounded, and NOTHING else. This is what makes
+  // the lever a width change rather than a different computation, and it is what
+  // catches a bf16 GEMM that accumulated in bf16 or applied alpha at bf16: both
+  // move words far beyond the one-ulp double-rounding envelope. See the bound
+  // below for the measured distribution that fixes the number at one.
   std::vector<uint8_t> ref_f32(static_cast<size_t>(M) * N * vt::SizeOf(DType::kF32));
   {
     DeviceTensor dout(b, g.q, DType::kF32, {M, N});
@@ -580,14 +594,85 @@ void AlphaVecBf16TakesTwoLaunch(int M, int Nqkv, int Nz, int K, uint32_t seed,
   }
   const auto* f32v = reinterpret_cast<const float*>(ref_f32.data());
   const auto* bf16v = reinterpret_cast<const uint16_t*>(two_launch.data());
-  size_t mismatches = 0;
-  for (size_t i = 0; i < static_cast<size_t>(M) * N; ++i)
-    if (bf16v[i] != vt::F32ToBF16(f32v[i])) ++mismatches;
-  // NOT exact-equal-or-bust: the f32 arm's GEMM and the bf16 arm's GEMM are
-  // separate cuBLASLt plans (out_type is part of the plan key) and may reduce in a
-  // different order, so a few 1-ulp disagreements are legitimate. A WHOLESALE
-  // divergence is not, and that is what this bounds.
-  CHECK(mismatches * 100 < static_cast<size_t>(M) * N);  // < 1% of words
+  // Map a bf16 bit pattern to a monotonic integer: consecutive representable
+  // bf16 values are exactly 1 apart and the map is continuous through zero
+  // (+0 and -0 both key to 0), so |key(a) - key(b)| IS the ulp distance.
+  auto ulp_key = [](uint16_t b) -> int32_t {
+    return (b & 0x8000u) != 0 ? -static_cast<int32_t>(b & 0x7FFFu) : static_cast<int32_t>(b);
+  };
+  const size_t words = static_cast<size_t>(M) * N;
+  int64_t max_ulp = 0;
+  size_t worst = 0;
+  size_t hist[5] = {0, 0, 0, 0, 0};  // words at 0, 1, 2, 3, >=4 ulp
+  for (size_t i = 0; i < words; ++i) {
+    const int64_t d = std::abs(static_cast<int64_t>(ulp_key(bf16v[i])) -
+                               static_cast<int64_t>(ulp_key(vt::F32ToBF16(f32v[i]))));
+    if (d > max_ulp) {
+      max_ulp = d;
+      worst = i;
+    }
+    ++hist[static_cast<size_t>(std::min<int64_t>(d, 4))];
+  }
+  // A power-of-two alpha makes the multiply an exact exponent shift, so rounding
+  // COMMUTES with it and the two arms must agree BIT for bit — no double rounding
+  // is possible. That turns the same comparison into a control that isolates the
+  // mechanism: at a pow2 alpha every remaining difference would have to come from
+  // the accumulators themselves disagreeing (a different reduction order between
+  // the f32-D and bf16-D plans, which are separate cuBLASLt plans because
+  // `out_type` is part of `Fp8PlanKey`). The spec found the same escape hatch from
+  // the other side: the rejected z-slice fallback is exact iff `qkv.alpha` is a
+  // power of two.
+  auto is_pow2 = [](float a) {
+    int e = 0;
+    return a > 0.0f && std::frexp(a, &e) == 0.5f;
+  };
+  const int64_t bound = (is_pow2(alpha_qkv) && is_pow2(alpha_z)) ? 0 : 1;
+  // Printed on every run, pass or fail: the DISTRIBUTION is the evidence, and a
+  // bound whose measured distribution is not in the log is a bound nobody can
+  // re-derive. MESSAGE is is_warn, so it adds no assertion to the count.
+  MESSAGE("bf16-vs-f32 ulp histogram [0/1/2/3/>=4] at M=" << M << " N=" << N << " alpha="
+          << alpha_qkv << "/" << alpha_z << " (bound " << bound << "): " << hist[0]
+          << "/" << hist[1] << "/" << hist[2] << "/" << hist[3] << "/" << hist[4]
+          << "  max=" << max_ulp << " ulp at i=" << worst << " (f32=" << f32v[worst]
+          << ", bf16=" << vt::BF16ToF32(bf16v[worst])
+          << ", rnd(f32)=" << vt::BF16ToF32(vt::F32ToBF16(f32v[worst])) << ")");
+  // A MAGNITUDE bound, not a COUNT bound.
+  //
+  // What this replaces, and why the old form was wrong. It read
+  // `mismatches * 100 < M * N` — "fewer than 1% of words differ at all" — and it
+  // had never been executed: the .cu half of this row was written on a host with
+  // no nvcc and no GPU. The first CUDA run measured 26.0/26.1/26.8/26.1% of words
+  // differing at the four shapes, so it was RED on arrival. It was ALSO too weak:
+  // a count bound cannot tell a 1-ulp disagreement in a quarter of the words
+  // (benign) from a 10-ulp disagreement in half a percent of them (a broken
+  // reduction), and only the second is a defect.
+  //
+  // A ~26% 1-ulp population is what this comparison MUST produce, by construction.
+  // The bf16 arm computes `rnd_bf16(rnd_bf16(acc) * alpha)`; the f32 arm computes
+  // `rnd_bf16(fl32(acc * alpha))`. The bf16 arm's first rounding perturbs the
+  // product by at most half a bf16 ulp (relative 2^-9), so its second rounding can
+  // land on an ADJACENT bf16 and never further. That is double rounding, it is the
+  // arithmetic this lever deliberately introduces (`round-then-scale` instead of
+  // `scale-then-round`), and the spec's rejected z-slice fallback measured the same
+  // signature — 25-36% of words off by 1 ulp over 2e6 accumulators, 6/6 alpha pairs
+  // (.agents/specs/perf-fp8-alpha-fold.md, "The z-slice fallback is REJECTED").
+  //
+  // MEASURED, which is what fixes the bound at one (GB10 sm_121a, CUDA 13.0.88,
+  // Release, CUTLASS+FA2+Triton, 2026-08-12, #501). At the four production shapes
+  // the histogram is 0-and-1-ulp ONLY: 4253/16384, 12814/49152, 1645/6144 and
+  // 546721/2097152 words at exactly one ulp — the same counts the count bound was
+  // rejecting — and ZERO words at two or beyond, 2.17M words in total. At the
+  // pow2-alpha controls it is 16384/16384 and 2097152/2097152 at zero ulp.
+  //
+  // What the bound still catches, which is the whole point: anything that moves a
+  // word by TWO ulp or more is outside the double-rounding envelope, so it is a
+  // different computation — a bf16 accumulation, an alpha applied at bf16 width, a
+  // split-K reduction the f32 plan did not take, or an epilogue that slipped past
+  // the bf16 refusal. Those are the defects this case exists to find, and the old
+  // count bound would have passed every one of them that touched under 1% of words.
+  // The pow2-alpha arms hold the strictly tighter `bound == 0`, where double
+  // rounding is impossible and ANY difference is one of those defects.
+  CHECK(max_ulp <= bound);
 }
 }  // namespace
 
@@ -637,6 +722,14 @@ TEST_CASE("fp8 cuBLASLt per-column alpha at a BF16 D stays on the two-launch arm
   AlphaVecBf16TakesTwoLaunch(3, 10240, 6144, 5120, 32, 0.035f, 0.017f);   // 27B, M=3
   AlphaVecBf16TakesTwoLaunch(1, 4096, 2048, 2048, 33, 0.041f, 0.0092f);   // 35B family, M=1
   AlphaVecBf16TakesTwoLaunch(128, 10240, 6144, 5120, 34, 0.035f, 0.017f); // prefill tile
+  // CONTROLS. Both shard alphas are powers of two, so the alpha multiply is an
+  // exact exponent shift and rounding commutes with it: these arms demand
+  // BIT-equality (`bound == 0` inside the helper), at both the decode and the
+  // prefill geometry. They are what separates the two candidate mechanisms — a
+  // ~26% 1-ulp population that survives here would NOT be double rounding, it
+  // would be the two plans' accumulators disagreeing, which is a real defect.
+  AlphaVecBf16TakesTwoLaunch(1, 10240, 6144, 5120, 35, 1.0f, 0.25f);      // 27B, decode M=1
+  AlphaVecBf16TakesTwoLaunch(128, 10240, 6144, 5120, 36, 0.5f, 0.25f);    // prefill tile
 }
 
 TEST_CASE("fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM") {
