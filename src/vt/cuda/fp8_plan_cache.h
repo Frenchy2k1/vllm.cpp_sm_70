@@ -168,6 +168,69 @@ inline bool Fp8AlphaVecCapSupported(unsigned int pointer_mode_cap_mask) {
   return (pointer_mode_cap_mask & kFp8PointerModeMaskAlphaDeviceVectorBetaZero) != 0U;
 }
 
+// ---- The bf16-D arm's splitK PRECONDITION -----------------------------------
+// VT_GDN_FP8_IN_BF16 narrows this GEMM's D from f32 to bf16, and the argument
+// that the narrowing is only a STORE-WIDTH change rests on one measured premise:
+// cuBLASLt serves these fp8 shapes at `splitK=1`, so the f32 accumulation the
+// value came out of is a single ordered reduction, exactly as on the f32-D arm
+// (probe pass 2, 2026-08-12; .agents/specs/perf-fp8-alpha-fold.md §Attempt 4).
+//
+// That premise is NOT self-enforcing. `out_type` is part of Fp8PlanKey's == and
+// its hash, so a bf16 D deliberately selects a DIFFERENT plan from the f32 D —
+// which is precisely the freedom cuBLASLt needs to pick a different split-K. A
+// split-K reduction sums per-split partials in an order the f32-D arm never
+// used, so the delta would be a REDUCTION-ORDER change wearing a store-width
+// change's clothes, and f32 addition is not associative.
+//
+// It is also the worst possible defect to leave to a token gate. A bf16 store
+// absorbs small reduction-order differences (the same trap recorded against
+// `bf16 store absorbs reduction-order defects`): the tokens can match, the
+// goldens can pass, and the arithmetic can still not be the arithmetic we
+// claimed. So the precondition is CHECKED, not tolerated, and never waived by a
+// "<1% of elements differ" argument — a tolerance would only be measuring how
+// well bf16 hides it.
+//
+// Pure so the decision is pinned on the CPU tier; the attribute read and the
+// refusal it drives live in cuda_matmul.cu.
+enum class Fp8Bf16DSplitK {
+  kNotBf16D = 0,  // f32 D — the premise is not claimed, nothing to enforce
+  kOk,            // bf16 D and the selected plan reports splitK == 1
+  kUnreadable,    // bf16 D and the driver did not report splitK at all
+  kNotOne,        // bf16 D and the selected plan reports splitK != 1
+};
+
+// `split_k_read_ok` is whether cublasLtMatmulAlgoConfigGetAttribute actually
+// returned CUBLASLT_ALGO_CONFIG_SPLITK_NUM for the selected algo. An unreadable
+// splitK is deliberately NOT folded into "fine": unknown is neither absence nor
+// success, and a premise that cannot be read has not been met.
+inline Fp8Bf16DSplitK Fp8Bf16DSplitKVerdict(bool out_is_bf16, bool split_k_read_ok,
+                                            int32_t split_k) {
+  if (!out_is_bf16) return Fp8Bf16DSplitK::kNotBf16D;
+  if (!split_k_read_ok) return Fp8Bf16DSplitK::kUnreadable;
+  return split_k == 1 ? Fp8Bf16DSplitK::kOk : Fp8Bf16DSplitK::kNotOne;
+}
+
+// May the GEMM proceed? Only kNotBf16D (premise not claimed) and kOk (premise
+// verified). Both kUnreadable and kNotOne refuse.
+inline bool Fp8Bf16DSplitKAdmissible(Fp8Bf16DSplitK v) {
+  return v == Fp8Bf16DSplitK::kNotBf16D || v == Fp8Bf16DSplitK::kOk;
+}
+
+// Stable token for the verdict, for the refusal message. Never returns nullptr.
+inline const char* Fp8Bf16DSplitKTag(Fp8Bf16DSplitK v) {
+  switch (v) {
+    case Fp8Bf16DSplitK::kNotBf16D:
+      return "not-bf16-d";
+    case Fp8Bf16DSplitK::kOk:
+      return "split-k-1";
+    case Fp8Bf16DSplitK::kUnreadable:
+      return "split-k-unreadable";
+    case Fp8Bf16DSplitK::kNotOne:
+      break;
+  }
+  return "split-k-not-1";
+}
+
 // Why a vector-alpha plan build refused, as a NAMED cause. BuildFp8Plan can
 // decline for two materially different reasons that the algo log cannot tell
 // apart from the outside — it emits nothing at all in either case — and they

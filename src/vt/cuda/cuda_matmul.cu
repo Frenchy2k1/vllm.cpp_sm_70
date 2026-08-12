@@ -628,6 +628,58 @@ bool GetOrBuildCachedFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Pla
   return true;
 }
 
+// ---- ENFORCE the bf16-D arm's splitK precondition ---------------------------
+// VT_GDN_FP8_IN_BF16's byte-exactness argument is that narrowing D to bf16
+// changes only the STORE WIDTH. That argument holds only while the accumulation
+// behind the store is the same single ordered f32 reduction the f32-D arm used,
+// i.e. while `splitK == 1` — which is what the 2026-08-12 probe measured (algoId
+// 67, splitK=1, every gate shape, every M) and what the spec has stated as a
+// precondition ever since.
+//
+// Nothing enforced it. Until this function, the ONLY read of
+// CUBLASLT_ALGO_CONFIG_SPLITK_NUM in the tree was inside MaybeLogGemmAlgo, which
+// returns immediately unless VT_GEMM_ALGO_LOG=1 — so on every production run the
+// precondition was unobserved. And `out_type` is part of Fp8PlanKey's == and its
+// hash, so the bf16 D deliberately selects a DIFFERENT plan from the f32 D: a
+// different split-K is exactly the freedom that key grants cuBLASLt. Had it taken
+// it, the delta would have been a reduction-order change, not a store-width one,
+// and a bf16 store is very good at hiding those from a token gate.
+//
+// So: read it on every bf16-D fp8 GEMM and REFUSE unless it reads 1. This is a
+// hard refusal rather than a tolerance — a "<1% of elements differ" allowance
+// would only be measuring how well bf16 conceals the defect — and rather than a
+// silent fallback, because falling through to cutlass would substitute a third
+// reduction order without saying so. The arm is opt-in and default OFF, so a
+// refusal can only ever reach someone who deliberately set the toggle, and it
+// names the shape and the observed value so the spec's premise can be re-measured
+// against the driver that broke it.
+//
+// The f32-D arm never claimed the premise and is never held to it: the verdict
+// short-circuits to kNotBf16D and this function is a predictable-branch no-op.
+void RequireBf16DSplitKOne(const Fp8Plan& plan, cudaDataType_t out_type, int64_t m, int64_t n,
+                           int64_t k, const char* site) {
+  const bool out_is_bf16 = out_type == CUDA_R_16BF;
+  if (!out_is_bf16) return;  // f32 D: precondition not claimed, nothing to check
+  int32_t split_k = -1;
+  size_t written = 0;
+  const cublasStatus_t st = cublasLtMatmulAlgoConfigGetAttribute(
+      &plan.heur.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split_k, sizeof(split_k), &written);
+  // A short read is as unusable as a failed one: `split_k` would keep the -1
+  // sentinel and reporting that as "not 1" would name the wrong cause.
+  const bool read_ok = st == CUBLAS_STATUS_SUCCESS && written == sizeof(split_k);
+  const Fp8Bf16DSplitK verdict = Fp8Bf16DSplitKVerdict(out_is_bf16, read_ok, split_k);
+  if (Fp8Bf16DSplitKAdmissible(verdict)) return;
+  throw std::runtime_error(
+      std::string("vt cuda: ") + site +
+      ": VT_GDN_FP8_IN_BF16 requires the selected cuBLASLt plan to report splitK=1 — the bf16 D "
+      "is only a store-width narrowing while the f32 accumulation behind it is one ordered "
+      "reduction. Got " +
+      Fp8Bf16DSplitKTag(verdict) + " (splitK=" + (read_ok ? std::to_string(split_k) : "unread") +
+      ") at m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k) +
+      ". Re-measure .agents/specs/perf-fp8-alpha-fold.md §Attempt 4's premise on this driver "
+      "before using this arm; unset VT_GDN_FP8_IN_BF16 to take the f32 D.");
+}
+
 void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                                  float alpha) {
   const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
@@ -679,6 +731,10 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
     return;
   }
   MaybeLogGemmAlgo(plan.heur, m, n, k, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_type, "TN-fp8");
+  // The bf16-D precondition, checked on the plan actually selected (cached or
+  // fresh — a cached plan is the same algo, so the check is equally valid and
+  // equally cheap on a hit).
+  RequireBf16DSplitKOne(plan, out_type, m, n, k, "matmul_fp8_cublaslt");
 
   // out = alpha * op(weight) @ op(act) + 0 * C; C and D share out's buffer/layout.
   const float beta = 0.0f;
@@ -760,6 +816,11 @@ void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_
   // bf16(acc * alpha) with its requantized single scalar, modelopt.py:458), so
   // lifting this gate is a deliberate, gated decision worth making, not a bug to
   // fix in passing.
+  //
+  // The bf16-D splitK precondition is therefore enforced for this op too, just
+  // one frame down: two_launch() calls MatmulFp8CublasLtKernelCuda, which runs
+  // RequireBf16DSplitKOne on the plan it selects. Repeating the check here would
+  // be unreachable code, since every bf16 D leaves through this branch.
   if (out.dtype != DType::kF32) {
     two_launch();
     return;
