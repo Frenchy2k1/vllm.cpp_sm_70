@@ -1280,6 +1280,59 @@ the repack produces. The template arguments printed in both profiles match, so
 compare the LAUNCH parameters and the repacked weight layout, not the algorithm.
 An 8.2% recovery on that kernel is worth the full 2.5%.
 
+## 6v. INSIDE THE KERNEL: what the 8.2% is NOT (2026-08-12)
+
+§6u paired the profiles and put the whole residual in `marlin_moe_wna16::Marlin`.
+This narrows it further, and the cross-check below is what makes the finding
+trustworthy in the first place.
+
+**The instrumentation objection, answered.** Our number came from nsys and
+upstream's from its torch profiler, so a sceptic should ask whether the tools
+differ. Split the profiles:
+
+| | ours | upstream | delta |
+|---|---|---|---|
+| Marlin MoE | 249.2 ms | 230.4 ms | **+8.2%** |
+| EVERYTHING ELSE | 392.8 ms | 393.6 ms | **-0.2%** |
+| total decode GPU | 642.0 ms | 624.0 ms | +2.9% |
+
+If nsys inflated our kernels, every kernel would inflate. All other GPU work
+matches to 0.2%, and the total (+2.9%) tracks the independently measured
+pinned-clock wall gap (2.5%). The difference is real and confined to one kernel.
+
+**Eliminated, by reading both sources:**
+
+1. **Kernel selection.** The full template arguments are identical on both sides:
+   `<...128, 1, 8, 4, true, 4, 1, false>`. Same instantiation, same tiling.
+2. **The `block_size_m` clamp.** Upstream clamps to >= 16 for 1-byte input dtypes
+   (`marlin_moe.py:328-329`) and our selector deliberately omits it. Tempting,
+   but the identical template arguments prove both land on the same config here.
+3. **Grid selection.** `determine_exec_config` is BYTE-IDENTICAL between our
+   vendored copy and the pinned `csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu`
+   (69 lines, no diff), and both callers pass `thread_k = thread_n = -1`, so both
+   take the same auto path. The `blocks_per_sm` argument differs in spelling only
+   (we pass 0, upstream defaults -1) and neither reaches the manual branch.
+4. **`ignore_invalid_experts`.** Upstream passes it, but it only changes counting
+   when an `expert_map` exists (expert parallelism). Single GPU has none.
+
+**So: same kernel, same instantiation, same grid rule, same launch count, same
+alignment semantics -- and 18.8 ms more work.** That leaves what the kernel READS:
+
+- the repacked WEIGHT LAYOUT. Our load path runs two kernels upstream does not
+  (`TransposeToInt32Kernel`, `ProcessScalesKernel`, §6t) to adapt a different
+  source layout. Correctness is settled, but stride/padding/alignment of the
+  final B and scales tensors is not, and the kernel's loads are sensitive to it.
+- WEIGHT RESIDENCY. This repo has a standing GB10 finding that host/ATS-retagged
+  weights run materially slower per GEMM than device-resident ones. Whether every
+  35B expert tensor is device-resident on this path is not established here.
+
+Both are checkable without guessing: dump the B/scales tensor strides and the
+pointer residency on both sides for one expert, and compare. That is the next
+step, and it is measurement, not a rewrite.
+
+**Do not "optimise the kernel".** It is vendored from vLLM and byte-identical in
+the parts that choose what to run; the difference is in what we hand it.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
