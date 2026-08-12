@@ -494,11 +494,13 @@ capture A/B worth +12.2%/+3.5%. Upstream's speculative decode is not
 run-to-run deterministic (its fast draw on one prompt is ONE extra accepted
 token, 17 steps instead of 18), and our acceptance equals its modal value
 (48.6%, 4.94 tokens/step). Per-step the engines are aligned (30.4 vs ~30.1 ms,
-34.7 vs ~34.5). This is parity within the measurement's RESOLUTION: the
-distributions overlap (our max 142.40 vs their min 142.01), the 0.4% median
-difference is six times smaller than our own 2.47% spread, and the largest
-remaining lever is worth 0.09%. A strict >= 1.0x claim needs a lower-noise
-harness, not more engineering. The Gemma4 `1 + N` layout is coded and unit-tested but has
+34.7 vs ~34.5). Under a LOW-NOISE harness (clocks pinned at 1800
+MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
+the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
+noise, and the earlier "within resolution" reading was too generous. Ours slowed
+more than the oracle when the clock was pinned, so the residual is
+SM-clock-sensitive work, pointing back at the unclosed MoE expert cost at T=9
+(~1.7x GPU per token). NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
