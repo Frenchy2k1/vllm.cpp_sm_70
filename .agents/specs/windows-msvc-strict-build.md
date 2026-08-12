@@ -140,3 +140,10 @@ Both CPU and Vulkan logs contained only C4005 promoted through C2220 at the
 same three sources. The follow-up removes those redundant definitions plus the
 identical OpenAI test definition compilation had not reached, while retaining
 the central contract and guarded isolated-source fallbacks.
+
+Hosted run `31586472591` next reduced both native configurations to C4244/C2220
+at the two DeepSeek V4 expert-probe sequence assignments
+([#464](https://github.com/mudler/vllm.cpp/issues/464)). Both complete logs
+contain the identical diagnostic family and no other error; the focused
+follow-up is specified in
+[windows-msvc-deepseek-probe.md](windows-msvc-deepseek-probe.md).
