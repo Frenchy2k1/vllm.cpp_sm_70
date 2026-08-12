@@ -16,6 +16,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -256,6 +257,39 @@ class ReleaseArchiveContract(unittest.TestCase):
                 paths = self.make_release(Path(temporary), mutation)
                 result = self.run_validator(*paths)
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_prerelease_manifest_rejects_numeric_only_server_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = root / "bin/vllm-server"
+            server.parent.mkdir(parents=True)
+            server.write_bytes(b"ELF fixture")
+            (root / "VERSION").write_text(
+                "version=0.0.3-pre.1\nc_abi_version=17\n", encoding="utf-8"
+            )
+            manifest = self.manifest(Path("/bin/true"))
+            manifest["artifact"]["version"] = "0.0.3-pre.1"
+
+            def fake_run(command):
+                if command[0] == "file":
+                    return 0, "ELF 64-bit LSB executable, x86-64"
+                if command[0] == "readelf":
+                    return 0, ""
+                if command[0] == "ldd":
+                    return 0, "statically linked"
+                if command[-1] == "--help":
+                    return 0, "usage: vllm-server"
+                if command[-1] == "--version":
+                    return 0, "vllm.cpp 0.0.3 c-abi=17"
+                raise AssertionError(command)
+
+            with mock.patch.object(self.tool.shutil, "which", return_value="tool"), \
+                 mock.patch.object(self.tool, "run", side_effect=fake_run):
+                errors = self.tool.inspect_linux(server, manifest, [], False)
+            self.assertIn(
+                "extracted vllm-server --version disagrees with VERSION/manifest",
+                errors,
+            )
 
     def test_build_path_and_undeclared_dynamic_dependency_fail(self) -> None:
         manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))

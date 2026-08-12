@@ -505,8 +505,16 @@ upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall i
 2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm difference, and not the launch
 geometry either: the full template arguments match, `determine_exec_config` is
 byte-identical to the pinned upstream copy, and every OTHER kernel matches to
-0.2%. What remains is what we HAND the kernel -- the repacked weight/scales
-layout and weight residency. (The repack kernels that appear to take 40% of a long run are
+0.2%. The inputs match too (scale bytes per expert,
+256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
+upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
+routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
+3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
+eliminated -- kernel source, template instantiation, grid config, block size,
+shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
+toolkit (13.0 both) and arch all match -- so the next step is `ncu` on both
+engines (occupancy, registers, memory throughput, stall reasons), not more source
+reading. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
@@ -1362,6 +1370,17 @@ selectors stay default OFF. The 18-leg oracle runs were VOID.
 
 This local 4B diagnostic does not establish 27B/35B support:
 [exact-chunk outcome](bench-evidence/qwen35-4b-sm120-main-20260807.md).
+
+**27B fp8 tower, packed GDN decode now REACHABLE (`PERF-GDN-PACKED-BRIDGE`,
+#365):** selection PROVEN 48/48 on `nvidia`@`0893e160`. Decode c1 at
+`input_len=16` reads `0.977x -> 0.984x` against the pin — INDICATIVE, not
+binding: the arms were not interleaved and did not share a background state.
+Only the two structural kernel terms (-0.400, -0.131 ms/step) exceed the
+untouched control's own +0.262 drift. Tokens move on neither 27B checkpoint,
+which establishes no gross defect at ~50x coarser sensitivity than the
+perturbation introduced, not equivalence. Both toggles stay DEFAULT OFF
+([spec](../.agents/specs/perf-gdn-packed-bridge.md),
+[record](../.agents/benchmark-record.md)).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).

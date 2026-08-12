@@ -183,6 +183,7 @@ Invoke-Checked cmake @(
     "-G", "Visual Studio 17 2022",
     "-A", "x64",
     "-DVLLM_CPP_BUILD_TESTS=ON",
+    "-DVLLM_CPP_BUILD_VERSION=$env:VERSION",
     "-DVLLM_CPP_BUILD_EXAMPLES=ON",
     "-DVLLM_CPP_SERVER=ON",
     "-DVLLM_CPP_CUDA=OFF",
