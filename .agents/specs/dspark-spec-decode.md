@@ -1116,6 +1116,44 @@ per-work, not by its mean/median. Three of this row's ratios (0.986x single-shot
 draw distribution rather than either engine, and only isolating the prompt and
 reading its counters settled it.
 
+## 6r. STOP CONDITION: the residual is below the measurement's resolution (2026-08-12)
+
+The last cell under 1.0x is "fibonacci" at 0.996x of upstream's modal draw. That
+difference is not resolvable on this box, and no remaining lever can close it.
+
+| quantity | value |
+|---|---|
+| ours, 5 reps | min 138.90, median 141.80, max 142.40 |
+| oracle, modal draws (18 steps / 70 accepted) | min 142.01, median 142.37, max 142.66 |
+| **distributions** | **OVERLAP** — our max 142.40 exceeds their min 142.01 |
+| median ratio | 0.9960x |
+| best-vs-best | 0.9982x |
+| OUR run-to-run spread | **2.47%** |
+| their modal spread | 0.46% |
+
+The 0.4% median difference is SIX TIMES SMALLER than our own spread, and the two
+distributions overlap, so the ordering is not established in either direction.
+
+**And no identified change can close it.** The largest remaining lever is
+dropping the block-logits round trip (the forward downloads
+`[nqpr, draft_vocab]` = 1.15 MB and the sampler uploads it straight back). The
+sync it implies has to happen anyway, so the saving is ~0.03 ms of a 34.7 ms
+step = **0.09%**, which would move 0.996x to ~0.997x. Everything else is already
+at its floor: the draft graph captures, the verify captures, the Markov sample is
+at its memory-bandwidth bound (§6k), and per-step the engines match (30.4 vs
+~30.1 ms, 34.7 vs ~34.5).
+
+**Verdict for this row: parity within the measurement's resolution.** "capital"
+1.012x, "fibonacci" 0.996x with overlapping distributions, acceptance identical
+at 48.6% / 4.94 tokens per step. Neither engine is reliably faster on this
+workload, and the row claims neither.
+
+**What a demonstrated >= 1.0x would now require** is a lower-noise harness, not
+more engineering: pinned clocks, many more repetitions, and a reference whose own
+acceptance does not vary run to run (upstream's moves 104-127 drafts on identical
+greedy prompts, §6p). That is a benchmarking task, and it is the honest next step
+for anyone who needs the strict claim.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
