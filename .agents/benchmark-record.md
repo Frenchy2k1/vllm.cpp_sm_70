@@ -19436,3 +19436,70 @@ after each. Green on the local CPU build and the dgx CUDA build
 (`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`).
 
 Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
+
+## SPEC-DSPARK paired parity re-measure with W7 (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle
+(`g555967922`), same target+draft+k, `max_num_seqs=2`, greedy, matched token
+counts, cold run discarded, ours 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | 0.981x |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | 0.870x |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40, a 0.4%
+spread, so 0.870x is a reading and not noise. The capital cell spreads ~8%, so
+0.981x is the looser of the two.
+
+SPEED PARITY IS NOT MET. W7 removed host-side sampling waste but sampling is
+0.5 ms of this lane's step, so the e2e effect sits inside the capital cell's own
+noise band. The earlier 79.19 tok/s reading was PRE-REBOOT machine state and is
+not a W7 win; on the idle box both engines moved and the oracle moved more.
+Same-session pairing is what makes these rows quotable.
+
+The deficit is largest in the HIGH-ACCEPTANCE regime (0.870x, verify running
+every step) and smallest in the low-acceptance one (0.981x), which points at the
+T=1+k verify forward: both model families gate their decode CUDA graph on
+`input.pure_decode`, so our speculative verify falls off the captured graph and
+runs eager while upstream captures the uniform 1+k shape. Next lever.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
+
+## SPEC-DSPARK W8: the T=1+k verify is CAPTURED (#442), 2026-08-12
+
+Paired against the pinned graphed oracle (`g555967922`) in ONE lock session,
+matched token counts, ours = median of 3 warm reps, cold run discarded.
+
+| 35B cell | before W8 | with capture | pinned vLLM | ratio |
+|---|---|---|---|---|
+| "capital", 128 tok both | 72.23 | 78.37 | 78.76 | 0.995x (was 0.981x) |
+| "fibonacci", 89 tok both | 134.55 | 140.82 | 142.88 | 0.986x (was 0.870x) |
+
+Same-binary A/B (`VT_SPEC_DECODE_GRAPH=0` is the eager verify): +8.5% on the
+capital cell, +4.7% on fibonacci, text byte-identical on both lanes.
+
+NOT >= 1.0x. The residual is ~1.4% against reps that spread 0.3%, so it is a real
+gap, not noise, and the row does not claim parity.
+
+Correctness: the four e2e spec-decode suites pass with capture ON and OFF with
+identical assertion counts (qwen27_spec 9, qwen27_dflash 27, qwen36_spec 9,
+qwen27_concurrent 5); default ON re-verified with the env unset.
+
+The mechanism, mirrored from vLLM: upstream's uniform-decode test is that all
+requests share a query_len, not that it is 1 (cudagraph_utils.py:95-105), and its
+captured decode length is `1 + num_speculative_tokens`
+(cudagraph_dispatcher.py:37), so upstream graphs the verify by construction. Ours
+gated on `num_actual_tokens == num_reqs` and ran it eager EVERY step.
+
+Three defects found on the way, each measured rather than reasoned: the aux
+multi-tap forward returned BEFORE the decode-graph gate (so no predicate could
+reach it); a captured replay re-read the PREVIOUS step's `num_accepted`, giving
+incoherent tokens AND 5x SLOWER (26 vs 136 tok/s) because zero acceptance
+multiplies the step count; and the staging path sized PER-REQUEST arrays by the
+TOKEN count, which is correct only when they are equal. Upstream keys graphs on
+BatchDescriptor(num_tokens, num_reqs, uniform) precisely because speculation
+makes them differ.
+
+Evidence: `dgx:~/work/dspark-w6/parity_w8.log`, `w8b.log`, `gates.log`,
+`final.log`, `pinned_35b_on.json`.
