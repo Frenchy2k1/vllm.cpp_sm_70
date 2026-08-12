@@ -512,9 +512,17 @@ routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
 3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
 eliminated -- kernel source, template instantiation, grid config, block size,
 shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
-toolkit (13.0 both) and arch all match -- so the next step is `ncu` on both
-engines (occupancy, registers, memory throughput, stall reasons), not more source
-reading. (The repack kernels that appear to take 40% of a long run are
+toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
+COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
+upstream running its family-compatible sm_120 cubin against our sm_121a). The
+residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
+(L2 hit 9.5%) and we sustain **186.6 GB/s against upstream's 210.7**, a 12.9%
+effective-bandwidth gap that IS the whole per-unit-work difference. Weight
+residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
+same size and stride as upstream's tensor (268 MB, no padding), so the cause is
+memory-system behaviour that no allocation change we can name would alter. Editing
+the kernel, its launch config, layout or flags is NOT indicated: all are proven
+identical. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
