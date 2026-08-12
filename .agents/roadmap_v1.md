@@ -67,6 +67,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#459](https://github.com/mudler/vllm.cpp/issues/459) | `ENG-RELEASE-WINDOWS` | Native MSVC CPU and Vulkan release builds fail under the required strict warning gate | bug |
 | [#462](https://github.com/mudler/vllm.cpp/issues/462) | `ENG-RELEASE-WINDOWS` | Central MSVC NOMINMAX contract conflicts with redundant unguarded source-local definitions under `/WX` | bug |
 | [#464](https://github.com/mudler/vllm.cpp/issues/464) | `ENG-RELEASE-WINDOWS` | DeepSeek V4 expert probe narrows double sine values under native MSVC `/WX` | bug |
+| [#465](https://github.com/mudler/vllm.cpp/issues/465) | `ENG-RELEASE-WINDOWS` | LogprobsTensors per-request slice parameter shadows its member under native MSVC `/WX` | bug |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
