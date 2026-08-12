@@ -1,7 +1,12 @@
 #include <doctest/doctest.h>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -10,14 +15,44 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/read_only_file_mapping.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 
 namespace {
+
+std::string Utf8Path(const std::filesystem::path& path) {
+  const auto bytes = path.u8string();
+  return std::string(bytes.begin(), bytes.end());
+}
+
+std::filesystem::path UniqueTempPath(const std::string& prefix,
+                                     const std::string& suffix = {}) {
+  static std::atomic<uint64_t> counter{0};
+  static const uint64_t process_nonce = [] {
+    std::random_device random;
+    return (static_cast<uint64_t>(random()) << 32) ^ random();
+  }();
+  return std::filesystem::temp_directory_path() /
+         (prefix + std::to_string(process_nonce) + "_" +
+          std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) +
+          suffix);
+}
+
+std::filesystem::path CreateUniqueTempDirectory(const std::string& prefix) {
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    std::filesystem::path path = UniqueTempPath(prefix);
+    std::error_code error;
+    if (std::filesystem::create_directory(path, error)) return path;
+  }
+  throw std::runtime_error("failed to create safetensors test directory");
+}
 
 // Little-endian u64, as the safetensors header-length prefix requires.
 std::string U64Le(uint64_t v) {
@@ -37,20 +72,73 @@ std::string MakeSafetensors(const std::string& header, const std::string& data) 
 class TempFile {
  public:
   explicit TempFile(const std::string& bytes) {
-    static int counter = 0;
-    path_ = (std::filesystem::temp_directory_path() /
-             ("vllm_safetensors_test_" + std::to_string(counter++) +
-              ".safetensors"))
-                .string();
-    std::ofstream out(path_, std::ios::binary);
+    native_path_ =
+        UniqueTempPath("vllm_safetensors_test_", ".safetensors");
+    path_ = Utf8Path(native_path_);
+    std::ofstream out(native_path_, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   }
-  ~TempFile() { std::remove(path_.c_str()); }
+  ~TempFile() {
+    std::error_code ignored;
+    std::filesystem::remove(native_path_, ignored);
+  }
   const std::string& path() const { return path_; }
 
  private:
+  std::filesystem::path native_path_;
   std::string path_;
 };
+
+class NamedTempFile {
+ public:
+  NamedTempFile(const std::filesystem::path& name, const std::string& bytes)
+      : root_(CreateUniqueTempDirectory("vllm_safetensors_named_")),
+        path_(root_ / name) {
+    std::ofstream out(path_, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out) throw std::runtime_error("failed to write safetensors test file");
+  }
+  ~NamedTempFile() {
+    std::error_code ignored;
+    std::filesystem::remove_all(root_, ignored);
+  }
+  NamedTempFile(const NamedTempFile&) = delete;
+  NamedTempFile& operator=(const NamedTempFile&) = delete;
+  const std::filesystem::path& path() const { return path_; }
+  std::string utf8_path() const { return Utf8Path(path_); }
+
+ private:
+  std::filesystem::path root_;
+  std::filesystem::path path_;
+};
+
+class TempDirectory {
+ public:
+  explicit TempDirectory(const std::filesystem::path& suffix)
+      : root_(CreateUniqueTempDirectory("vllm_safetensors_dir_")),
+        path_(root_ / suffix) {
+    std::error_code error;
+    if (!std::filesystem::create_directories(path_, error)) {
+      std::filesystem::remove_all(root_, error);
+      throw std::runtime_error("failed to create safetensors test directory");
+    }
+  }
+  ~TempDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(root_, ignored);
+  }
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path root_;
+  std::filesystem::path path_;
+};
+
+void WriteFile(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!out) throw std::runtime_error("failed to write safetensors test file");
+}
 
 // 24-byte data section: tensor "a" = F32 [2,2] at [0,16), tensor "b" =
 // BF16 [4] at [16,24).
@@ -121,6 +209,87 @@ TEST_CASE("safetensors: move semantics keep the mapping alive") {
   std::memcpy(&first, c.Get("a").data, 4);
   CHECK(first == 1.0f);
 }  // moved-from a and b destroyed here; must not double-munmap
+
+TEST_CASE("safetensors: borrowed tensor outlives a moved and destroyed reader") {
+  TempFile f(MakeSafetensors(kValidHeader, ValidData()));
+  vllm::StTensor borrowed;
+  std::weak_ptr<const void> weak;
+  {
+    vllm::SafetensorsFile source = vllm::SafetensorsFile::Open(f.path());
+    vllm::SafetensorsFile moved = std::move(source);
+    borrowed = moved.Get("a");
+    weak = borrowed.mapping;
+  }
+
+  REQUIRE_FALSE(weak.expired());
+  float first = 0.0f;
+  std::memcpy(&first, borrowed.data, sizeof(first));
+  CHECK(first == 1.0f);
+  borrowed.mapping.reset();
+  CHECK(weak.expired());
+}
+
+TEST_CASE("read-only mapping accepts filesystem paths and immutable bytes") {
+  NamedTempFile f(std::filesystem::path(U"vllm_mapping_caf\u00e9_\u6a21\u578b.bin"),
+                  "immutable");
+  auto mapping = vllm::detail::ReadOnlyFileMapping::Open(f.path());
+  REQUIRE(mapping->size() == 9);
+  CHECK(std::memcmp(mapping->data(), "immutable", 9) == 0);
+  static_assert(std::is_same_v<decltype(mapping->data()), const uint8_t*>);
+#if defined(_WIN32)
+  // CreateFileW intentionally does not grant FILE_SHARE_DELETE. The path is
+  // locked while mapped, then becomes movable as soon as the last owner closes
+  // the view plus both handles.
+  std::filesystem::path moved = f.path();
+  moved += L".moved";
+  std::error_code error;
+  std::filesystem::rename(f.path(), moved, error);
+  CHECK(error);
+  mapping.reset();
+  error.clear();
+  std::filesystem::rename(f.path(), moved, error);
+  CHECK_FALSE(error);
+  std::filesystem::rename(moved, f.path(), error);
+  CHECK_FALSE(error);
+#endif
+}
+
+#if defined(__linux__)
+TEST_CASE("read-only mapping deterministically closes and unmaps at last owner") {
+  NamedTempFile f(std::filesystem::path(U"vllm_mapping_cleanup.bin"),
+                  "immutable");
+  const auto open_fd_count = [] {
+    size_t count = 0;
+    for ([[maybe_unused]] const auto& entry :
+         std::filesystem::directory_iterator("/proc/self/fd")) {
+      ++count;
+    }
+    return count;
+  };
+  const size_t descriptors_before = open_fd_count();
+  auto mapping = vllm::detail::ReadOnlyFileMapping::Open(f.path());
+  REQUIRE(open_fd_count() == descriptors_before + 1);
+  const uint8_t* address = mapping->data();
+  const size_t page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  unsigned char resident = 0;
+  REQUIRE(::mincore(const_cast<uint8_t*>(address), page_size, &resident) == 0);
+
+  mapping.reset();
+
+  CHECK(open_fd_count() == descriptors_before);
+  errno = 0;
+  CHECK(::mincore(const_cast<uint8_t*>(address), page_size, &resident) == -1);
+  CHECK(errno == ENOMEM);
+}
+#endif
+
+TEST_CASE("safetensors: non-ASCII filesystem path parses without ANSI conversion") {
+  NamedTempFile f(
+      std::filesystem::path(U"vllm_safetensors_caf\u00e9_\u6a21\u578b.safetensors"),
+      MakeSafetensors(kValidHeader, ValidData()));
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.utf8_path());
+  CHECK(st.Get("b").data[1] == 0x3f);
+}
 
 TEST_CASE("safetensors: missing file throws with path") {
   CHECK_THROWS_WITH_AS(
@@ -332,6 +501,32 @@ TEST_CASE("safetensors index: parses weight_map") {
   CHECK(index.at("b") == "model-00002-of-00002.safetensors");
 }
 
+TEST_CASE(
+    "safetensors index: loads shards through a non-ASCII directory and index path") {
+  TempDirectory directory(std::filesystem::path(U"checkpoints_\u7d22\u5f15"));
+  const std::filesystem::path shard1 =
+      directory.path() / "model-00001-of-00002.safetensors";
+  const std::filesystem::path shard2 =
+      directory.path() / "model-00002-of-00002.safetensors";
+  const std::filesystem::path index_path =
+      directory.path() /
+      std::filesystem::path(U"mod\u00e8le.safetensors.index.json");
+  WriteFile(shard1, MakeSafetensors(kValidHeader, ValidData()));
+  WriteFile(shard2, MakeSafetensors(kValidHeader, ValidData()));
+  WriteFile(index_path,
+            R"({"weight_map":{"a":"model-00001-of-00002.safetensors",)"
+            R"("b":"model-00002-of-00002.safetensors"}})");
+
+  const auto index = vllm::LoadSafetensorsIndex(Utf8Path(index_path));
+  REQUIRE(index.size() == 2);
+  const vllm::SafetensorsFile a = vllm::SafetensorsFile::Open(
+      Utf8Path(directory.path() / index.at("a")));
+  const vllm::SafetensorsFile b = vllm::SafetensorsFile::Open(
+      Utf8Path(directory.path() / index.at("b")));
+  CHECK(a.Get("a").nbytes == 16);
+  CHECK(b.Get("b").nbytes == 8);
+}
+
 TEST_CASE("safetensors index: missing file / missing weight_map throw") {
   CHECK_THROWS_WITH_AS(vllm::LoadSafetensorsIndex("/nonexistent/idx.json"),
                        doctest::Contains("/nonexistent/idx.json"),
@@ -357,8 +552,26 @@ TEST_CASE("safetensors index: shard names with path components throw") {
   TempFile traverse(R"({"weight_map":{"a":"../../etc/passwd"}})");
   CHECK_THROWS_AS(vllm::LoadSafetensorsIndex(traverse.path()),
                   std::runtime_error);
+  TempFile backslash(
+      R"({"weight_map":{"a":"sub\\model.safetensors"}})");
+  CHECK_THROWS_WITH_AS(vllm::LoadSafetensorsIndex(backslash.path()),
+                       doctest::Contains("plain filename"),
+                       std::runtime_error);
 }
 
+TEST_CASE("safetensors temp fixtures isolate simultaneous caller names") {
+  TempFile first("first");
+  TempFile second("second");
+  CHECK(first.path() != second.path());
+
+  const std::filesystem::path name(
+      U"vllm_mapping_collision_caf\u00e9_\u6a21\u578b.bin");
+  NamedTempFile named_first(name, "first");
+  NamedTempFile named_second(name, "second");
+  CHECK(named_first.path() != named_second.path());
+}
+
+#if defined(__linux__)
 // ---- Windowed source-page release (LOAD-SAFETENSORS memory checkpoint) ----
 // Exercises the real reader (MAP_PRIVATE mmap) + the progressive-release path
 // the 27B/35B loaders call after each tensor copy. See
@@ -540,3 +753,4 @@ TEST_CASE("safetensors: interior-page release never drops a neighbor's bytes") {
   CHECK(rss_after >= b_kb * 3 / 4);          // b retained
   CHECK(rss_both - rss_after >= b_kb / 2);   // a's interior dropped
 }
+#endif

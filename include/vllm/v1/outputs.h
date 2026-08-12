@@ -56,7 +56,8 @@ struct LogprobsTensors {
   // token per request per step) and cu_num_generated_tokens is None, so req_idx
   // indexes positions directly. (Our host-vector LogprobsTensors doubles as the
   // numpy LogprobsLists twin — no torch/numpy split.)
-  LogprobsTensors slice_request(int req_idx, int num_positions) const;
+  LogprobsTensors slice_request(int req_idx,
+                                int request_num_positions) const;
 };
 
 }  // namespace vllm::v1

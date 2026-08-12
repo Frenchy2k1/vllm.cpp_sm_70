@@ -1,4 +1,4 @@
-# Features
+# Features <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 What vllm.cpp supports, next to the engines it is measured against. This page is
 a **keyed table**: one row per feature, kept current. It is not a changelog.
@@ -26,7 +26,8 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 37 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ✅ v0.0.2 publishes eight indexed CPU/CUDA/Vulkan/Metal/MLX archives with checksums, provenance records, manifests, and SBOMs | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
 ## Serving and scheduling
 
@@ -73,10 +74,10 @@ are our reading of their documented behavior, not measurements.
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
-| fp8 weights | ✅ `VT_GDN_PACKED_DECODE_FP8_TOWER` + `VT_GDN_FP8_IN_BF16`, both default **OFF**: together a merged-arm fp8 GDN tower reaches packed decode; no token gate there yet ([spec](../.agents/specs/perf-gdn-packed-bridge.md)) | ✅ | ✅ | ☐ |
-| Merged fp8 projection applies its per-column alpha in the GEMM epilogue | ◐ opt-in `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off; falls back to a second full-tensor pass; gates not run ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | n/a one scale (shards requantized) | n/a | n/a |
-| fp8-tower GDN `in_proj` emits bf16, halving the per-column alpha pass | ◐ `VT_GDN_FP8_IN_BF16`, **default OFF**, UNMEASURED (#417); mirrors ModelOpt fp8's bf16 `out_dtype` and unblocks `VT_GDN_IN_BF16` on `modelopt_mixed`. NOT value-neutral ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
-| `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical, bf16 arm multiplies in f32 and rounds once; CPU + CUDA, so it is a portable op capability and not a CUDA-only path | n/a | ☐ | ☐ |
+| fp8 weights | ✅ `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert without `VT_GDN_FP8_IN_BF16`), default **OFF**: merged fp8 GDN tower reaches packed decode; GROSS-defect token gate ([spec](../.agents/specs/perf-gdn-packed-bridge.md)) | ✅ | ✅ | ☐ |
+| Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off; else a second full-tensor pass; ungated ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | n/a one scale (shards requantized) | n/a | n/a |
+| fp8-tower GDN `in_proj` emits bf16, halving the per-column alpha pass | ◐ `VT_GDN_FP8_IN_BF16`, **default OFF**; decode within drift, PREFILL UNMEASURED (#417); mirrors ModelOpt fp8's bf16 `out_dtype`. NOT value-neutral ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
+| `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm multiplies in f32, rounds once; CPU + CUDA, portable | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
@@ -202,7 +203,7 @@ HTTP are not started.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; the T=1+k verify is CAPTURED (`VT_SPEC_DECODE_GRAPH`). MoE **0.919-0.987x** of the pinned oracle (interleaved) | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; the T=1+k verify is CAPTURED (`VT_SPEC_DECODE_GRAPH`). MoE **0.975x-1.012x** of the pinned oracle (pinned clocks) | ✅ | ◐ |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling

@@ -24,6 +24,7 @@
 #define VLLM_V1_KV_OFFLOAD_LMCACHE_REMOTE_CLIENT_H_
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -75,7 +76,7 @@ class LmcacheRemoteClient {
   // Open the TCP connection (lm_connector.py:47-48).  Throws std::runtime_error
   // after config.connect_retries failed attempts.
   void Connect();
-  bool connected() const { return fd_ >= 0; }
+  bool connected() const { return socket_ != kInvalidSocket; }
   // Close the socket (lm_connector.py:173-176).  Idempotent.
   void Close();
 
@@ -132,12 +133,18 @@ class LmcacheRemoteClient {
                  std::vector<std::string>* v_planes);
 
  private:
+  enum class ResponsePayload { kForbidden, kRequired, kOptional };
+
   // Loop until all n bytes are written / read; throw on error or peer EOF.
   void SendAll(const char* data, std::size_t n);
   void RecvAll(char* data, std::size_t n);
+  ServerMetaMessage ReceiveMeta(const char* operation,
+                                ResponsePayload success_payload);
 
   LmcacheClientConfig config_;
-  int fd_ = -1;
+  static constexpr std::uintptr_t kInvalidSocket =
+      std::numeric_limits<std::uintptr_t>::max();
+  std::uintptr_t socket_ = kInvalidSocket;
 };
 
 }  // namespace vllm::v1::kv_offload::lmcache

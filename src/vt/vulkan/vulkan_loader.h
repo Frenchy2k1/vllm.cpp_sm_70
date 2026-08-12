@@ -6,7 +6,7 @@
 // `VULKAN_HPP_DEFAULT_DISPATCHER.init(...)`, ggml-vulkan.cpp
 // `ggml_vk_instance_init`).
 //
-// WHY dlopen INSTEAD OF LINKING. Both of our boxes ship the Vulkan LOADER
+// WHY RUNTIME LOADING INSTEAD OF LINKING. Both of our boxes ship the Vulkan LOADER
 // (`libvulkan.so.1` — 1.4.328 on dgx.casa, 1.3.275 on the dev box) but NEITHER
 // ships the development package: there is no `libvulkan.so` link name for `-l`
 // to find, no `/usr/include/vulkan`, and no sudo to install either (measured
@@ -117,7 +117,18 @@ struct VulkanApi {
 #undef VT_VK_DECL
 };
 
-// Opens libvulkan.so.1 (or the platform equivalent) and resolves the global
+// Injectable library boundary used by the hardware-independent Win32 loader
+// contract. Production supplies LoadLibraryW/GetProcAddress/FreeLibrary.
+struct VulkanLibraryOps {
+  void* context;
+  void* (*open)(void* context, const wchar_t* name);
+  void* (*lookup)(void* context, void* handle, const char* name);
+  void (*close)(void* context, void* handle);
+};
+
+bool ProbeVulkanLibraryForTesting(const VulkanLibraryOps& ops);
+
+// Opens libvulkan.so.1 (or vulkan-1.dll through LoadLibraryW on Windows) and resolves the global
 // entry points. Returns false — without throwing — when there is no loader on
 // the machine; the registrars treat that as "do not register kVULKAN".
 // Idempotent and thread-safe; the library is never dlclose'd (the process

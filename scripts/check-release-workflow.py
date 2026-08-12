@@ -7,10 +7,66 @@ import re
 import shlex
 import sys
 from pathlib import Path
+from typing import Any
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - exercised by the fail-closed caller path.
+    yaml = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+
+
+class WorkflowYamlError(ValueError):
+    """The workflow is not an unambiguous YAML mapping."""
+
+
+if yaml is not None:
+
+    class UniqueWorkflowLoader(yaml.SafeLoader):
+        """Safe YAML loader that rejects duplicate keys and references."""
+
+        def compose_node(self, parent: Any, index: Any) -> Any:
+            if self.check_event(yaml.AliasEvent):
+                raise WorkflowYamlError("YAML aliases are not allowed")
+            event = self.peek_event()
+            if getattr(event, "anchor", None) is not None:
+                raise WorkflowYamlError("YAML anchors are not allowed")
+            return super().compose_node(parent, index)
+
+        def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+            if not isinstance(node, yaml.MappingNode):
+                raise WorkflowYamlError("expected a YAML mapping")
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    raise WorkflowYamlError("YAML merge keys are not allowed")
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in mapping
+                except TypeError as exc:
+                    raise WorkflowYamlError("YAML mapping key is not scalar") from exc
+                if duplicate:
+                    raise WorkflowYamlError(f"duplicate YAML key {key!r}")
+                mapping[key] = self.construct_object(value_node, deep=deep)
+            return mapping
+
+
+def load_workflow_yaml(text: str) -> dict[Any, Any]:
+    """Load one workflow without YAML features that obscure effective authority."""
+
+    if yaml is None:
+        raise WorkflowYamlError("PyYAML is required for workflow validation")
+    try:
+        document = yaml.load(text, Loader=UniqueWorkflowLoader)
+    except yaml.YAMLError as exc:
+        raise WorkflowYamlError(f"invalid workflow YAML: {exc}") from exc
+    if not isinstance(document, dict):
+        raise WorkflowYamlError("workflow root must be a mapping")
+    return document
 
 
 def job_block(text: str, name: str) -> str:
@@ -77,6 +133,79 @@ def workflow_steps(block: str) -> list[str]:
     starts = [match.start() for match in re.finditer(r"(?m)^      - ", block)]
     starts.append(len(block))
     return [block[start:end] for start, end in zip(starts, starts[1:])]
+
+
+def validate_pr_ci(text: str) -> list[str]:
+    """Require native Windows proof on PRs without release authority."""
+
+    try:
+        workflow = load_workflow_yaml(text)
+    except WorkflowYamlError as exc:
+        return [f"PR CI workflow YAML is ambiguous or invalid: {exc}"]
+    jobs = workflow.get("jobs")
+    if not isinstance(jobs, dict):
+        return ["PR CI workflow must contain one jobs mapping"]
+
+    errors: list[str] = []
+    contracts = (
+        (
+            "windows-msvc-cpu",
+            "CPU",
+            "cpu",
+            "build-pr-windows-cpu",
+        ),
+        (
+            "windows-msvc-vulkan",
+            "Vulkan",
+            "vulkan",
+            "build-pr-windows-vulkan",
+        ),
+    )
+    for job, backend_label, backend, build_dir in contracts:
+        actual = jobs.get(job)
+        if actual is None:
+            errors.append(f"PR CI is missing required {job} job")
+            continue
+        expected_script = (
+            "$env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version\n"
+            "$env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()\n"
+            "./scripts/build-windows-release.ps1 `\n"
+            f"  -Backend {backend} `\n"
+            f"  -ArtifactId windows-x86_64-msvc-{backend} `\n"
+            f"  -BuildDir $env:GITHUB_WORKSPACE/{build_dir}\n"
+        )
+        expected = {
+            "if": "github.event_name == 'pull_request'",
+            "permissions": {"contents": "read"},
+            "runs-on": "windows-2022",
+            "timeout-minutes": 180,
+            "steps": [
+                {"uses": "actions/checkout@v4"},
+                {
+                    "name": "Prove PowerShell, static CRT, and unsupported-tier contracts",
+                    "run": "./scripts/build-windows-release.ps1 -ContractTest",
+                },
+                {
+                    "name": (
+                        "Build and execute the native Windows "
+                        f"{backend_label} focused gate"
+                    ),
+                    "env": {
+                        "EVIDENCE_URL": (
+                            "${{ github.server_url }}/${{ github.repository }}"
+                            "/actions/runs/${{ github.run_id }}"
+                        ),
+                        "SOURCE_SHA": "${{ github.sha }}",
+                    },
+                    "run": expected_script,
+                },
+            ],
+        }
+        if actual != expected:
+            errors.append(
+                f"{job} must exactly match the read-only native Windows PR proof schema"
+            )
+    return errors
 
 
 def named_step(block: str, name: str) -> str | None:
@@ -358,16 +487,20 @@ def validate(text: str) -> list[str]:
         "vulkan_x86",
         "metal_arm64",
         "mlx_arm64",
+        "cpu_windows",
+        "vulkan_windows",
     )
     release_outputs = (
-        ("build-release-cpu-x86", "linux-x86_64-glibc-cpu"),
-        ("build-release-cpu-arm64", "linux-aarch64-glibc-cpu"),
-        ("build-release-cpu-musl", "linux-x86_64-musl-cpu-static"),
-        ("build-release-cuda-x86", "linux-x86_64-glibc-cuda"),
-        ("build-release-cuda-arm64", "linux-aarch64-glibc-cuda"),
-        ("build-release-vulkan-x86", "linux-x86_64-glibc-vulkan"),
-        ("build-release-metal-arm64", "macos-arm64-metal"),
-        ("build-release-mlx-arm64", "macos-arm64-metal-mlx"),
+        ("build-release-cpu-x86", "linux-x86_64-glibc-cpu", "tar.gz"),
+        ("build-release-cpu-arm64", "linux-aarch64-glibc-cpu", "tar.gz"),
+        ("build-release-cpu-musl", "linux-x86_64-musl-cpu-static", "tar.gz"),
+        ("build-release-cuda-x86", "linux-x86_64-glibc-cuda", "tar.gz"),
+        ("build-release-cuda-arm64", "linux-aarch64-glibc-cuda", "tar.gz"),
+        ("build-release-vulkan-x86", "linux-x86_64-glibc-vulkan", "tar.gz"),
+        ("build-release-metal-arm64", "macos-arm64-metal", "tar.gz"),
+        ("build-release-mlx-arm64", "macos-arm64-metal-mlx", "tar.gz"),
+        ("build-release-windows-cpu", "windows-x86_64-msvc-cpu", "zip"),
+        ("build-release-windows-vulkan", "windows-x86_64-msvc-vulkan", "zip"),
     )
     read_only_jobs = (
         "plan",
@@ -398,10 +531,10 @@ def validate(text: str) -> list[str]:
         reference = f"${{{{ needs.{name}.outputs.artifact_id }}}}"
         if reference not in build:
             errors.append(f"handoff build job does not consume immutable {name} output")
-    for build_dir, artifact_id in release_outputs:
+    for build_dir, artifact_id, archive_format in release_outputs:
         archive = (
             f"{build_dir}/release/vllm.cpp-${{{{ needs.plan.outputs.version }}}}-"
-            f"{artifact_id}.tar.gz"
+            f"{artifact_id}.{archive_format}"
         )
         if any(
             f"            {archive}{suffix}\n" not in text
@@ -410,6 +543,40 @@ def validate(text: str) -> list[str]:
             errors.append(
                 "every release upload path must use its canonical versioned archive name"
             )
+    if (
+        text.count(".sha256\n") != len(release_outputs)
+        or text.count(".provenance.json\n") != len(release_outputs)
+    ):
+        errors.append("release workflow must upload exactly ten archive triplets")
+
+    windows_contracts = (
+        ("cpu_windows", "cpu", "build-release-windows-cpu"),
+        ("vulkan_windows", "vulkan", "build-release-windows-vulkan"),
+    )
+    for job, backend, build_dir in windows_contracts:
+        block = blocks[job]
+        required = (
+            "    needs: plan\n",
+            "    permissions:\n      contents: read\n",
+            "    runs-on: windows-2022\n",
+            "      - uses: actions/checkout@v4\n",
+            "        run: ./scripts/build-windows-release.ps1 -ContractTest\n",
+            "          SOURCE_SHA: ${{ github.sha }}\n",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n",
+            "          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()\n",
+            "          $release = Get-Content release/release-version.json -Raw | ConvertFrom-Json\n",
+            "          if ($release.version -ne $env:VERSION) { throw \"release version drift\" }\n",
+            "          ./scripts/build-windows-release.ps1 `\n"
+            f"            -Backend {backend} `\n"
+            f"            -ArtifactId windows-x86_64-msvc-{backend} `\n"
+            f"            -BuildDir $env:GITHUB_WORKSPACE/{build_dir}\n",
+        )
+        if any(fragment not in block for fragment in required):
+            errors.append(f"{job} must bind the exact native Windows build contract")
+        if block.count("./scripts/build-windows-release.ps1") != 2:
+            errors.append(f"{job} must run exactly one contract test and one native build")
+        if block.count("          SOURCE_SHA: ${{ github.sha }}\n") != 2:
+            errors.append(f"{job} must bind both Windows steps to the workflow source SHA")
 
     attest = blocks["attest"]
     for permission in (
@@ -473,7 +640,7 @@ def validate(text: str) -> list[str]:
                 "--event": "${{ github.event_name }}",
                 "--ref": "${{ github.ref }}",
                 "--sha": "${{ github.sha }}",
-                "--version": "$version",
+                "--release-version": "release/release-version.json",
                 "--matrix": "release/release-matrix.json",
                 "--output": "release-plan.json",
                 "--github-output": "$GITHUB_OUTPUT",
@@ -589,6 +756,7 @@ def validate(text: str) -> list[str]:
 
 def main() -> int:
     errors = validate(WORKFLOW.read_text(encoding="utf-8"))
+    errors.extend(validate_pr_ci(CI_WORKFLOW.read_text(encoding="utf-8")))
     if errors:
         print("release workflow policy FAILED:", file=sys.stderr)
         for error in errors:

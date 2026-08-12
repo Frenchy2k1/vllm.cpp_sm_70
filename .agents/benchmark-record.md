@@ -19715,3 +19715,159 @@ and the sign of the error depends on which engine got the first slot.
 
 Evidence: `dgx:~/work/dspark-w6/interleaved.log`, `oracle_rep{1,2,3}.json`,
 `parity_final.log`, `gates.log`.
+
+## SPEC-DSPARK: 5-rep interleaved, and why the ratio must be DISTRIBUTIONAL (2026-08-12)
+
+| cell | ours (median, range) | oracle (median, range) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 78.04 [76.0-79.3] | 77.16 [74.6-96.5] | 1.012x |
+| "fibonacci", 89 tok | 141.83 [138.9-142.4] | 149.03 [142.1-151.6] | 0.952x |
+
+The 3-rep run gave 0.919x / 0.987x for the same two cells. Both are "correct"
+and neither is stable, because the REFERENCE is not:
+
+| oracle rep | fib tok/s | capital tok/s | drafts | acceptance |
+|---|---|---|---|---|
+| 1 | 149.03 | 77.16 | 127 | 21.2% |
+| 2 | 151.61 | 74.60 | 117 | 24.0% |
+| 3 | 142.08 | 76.84 | 124 | 22.6% |
+| 4 | 151.13 | 78.50 | 127 | 21.2% |
+| 5 | 142.31 | 96.48 | 104 | 29.6% |
+
+Upstream's speculative decode is NOT run-to-run deterministic: identical prompts,
+greedy sampling and output lengths (89 / 128 tokens every rep), yet draft count
+104-127 and acceptance 21.2-29.6%. Fewer draft steps is fewer forwards, which is
+the 96.48 outlier and the 142-vs-151 bimodality. Ours is deterministic (identical
+tokens, identical step count), hence our 76-79 and 139-142 ranges.
+
+Distributional reading: on "capital" ours (78.04) is ABOVE the oracle's median
+and above 3 of its 5 draws; on "fibonacci" ours (141.83) sits just BELOW its
+floor (142.08), 0.998x of the worst draw and 0.952x of the median.
+
+Verdict: approximate parity, cell-dependent, NOT a clean >= 1.0x on both cells.
+Per-step the engines are aligned (ours 30.4 ms/step vs ~30.1 on "capital", 34.7
+vs ~34.5 on "fibonacci"), with the draft graph capturing, the verify captured and
+the Markov sample at its bandwidth bound, so there is no structural gap left --
+the residual lives inside the reference's own spread.
+
+Evidence: `dgx:~/work/dspark-w6/interleaved5.log`, `oracle5_rep{1..5}.json`,
+`diag.log`.
+
+## SPEC-DSPARK: the fibonacci gap was the REFERENCE's draw, not a deficit (2026-08-12)
+
+Isolating that prompt on the oracle (only prompt, warm-up on the same prompt, so
+the cumulative spec_decode counters are attributable):
+
+| run | tok/s | drafts | accepted | rate | tokens/step |
+|---|---|---|---|---|---|
+| 0 | 142.01 | 18 | 70 | 48.6% | 4.94 |
+| 1 | 142.66 | 18 | 70 | 48.6% | 4.94 |
+| 2 | 142.37 | 18 | 70 | 48.6% | 4.94 |
+| 3 | 151.18 | 17 | 71 | 52.2% | 5.24 |
+
+The 151 draw is ONE extra accepted token (71 vs 70), removing a whole draft step
+(17 instead of 18). It occurred in 1 run of 4 and is not faster per step; it did
+less work. Our acceptance equals upstream's MODAL value exactly: 48.6%, 4.94
+tokens/step, 18 steps.
+
+On matched work: ours 141.83 vs upstream 142.01-142.66 = 0.996x-0.999x. Against
+its 5-rep median (149.03, inflated by two lucky draws) the same data reads
+0.952x, which is why that figure is withdrawn.
+
+MoE lane on matched work: "capital" 1.012x, "fibonacci" 0.996x-0.999x. That is
+parity within the measurement's resolution, NOT a demonstrated >= 1.0x on both
+cells, and the row records it as such.
+
+Method note: a bimodal reference must be compared modally or per-work, never by
+its mean. Three earlier ratios for this row (0.986x single-shot, 0.919x/0.987x at
+3 reps, 0.952x at 5 reps) were all measuring the reference's draw distribution
+rather than either engine.
+
+Evidence: `dgx:~/work/dspark-w6/fibacc.log`, `fibacc.json`, `diag.log`.
+
+## SPEC-DSPARK: stop condition -- the residual is below measurement resolution (2026-08-12)
+
+| quantity | value |
+|---|---|
+| ours, 5 reps ("fibonacci") | min 138.90, median 141.80, max 142.40 |
+| oracle, modal draws (18 steps / 70 accepted) | min 142.01, median 142.37, max 142.66 |
+| distributions | OVERLAP (our max 142.40 > their min 142.01) |
+| median ratio | 0.9960x |
+| best-vs-best | 0.9982x |
+| our run-to-run spread | 2.47% |
+| their modal spread | 0.46% |
+
+The 0.4% median difference is six times smaller than our own spread and the
+distributions overlap, so the ordering is not established either way.
+
+No identified lever can close it: the largest remaining one is dropping the
+block-logits round trip (1.15 MB down + up), whose sync must happen regardless,
+so it is worth ~0.03 ms of a 34.7 ms step = 0.09%. The draft graph captures, the
+verify captures, the Markov sample is at its bandwidth bound, and per-step the
+engines match (30.4 vs ~30.1 ms; 34.7 vs ~34.5).
+
+Verdict: parity within the measurement's resolution. "capital" 1.012x,
+"fibonacci" 0.996x with overlapping distributions, acceptance identical at 48.6%
+/ 4.94 tokens per step. A strict >= 1.0x claim now needs a lower-noise harness
+(pinned clocks, many reps, and a reference whose acceptance does not vary), not
+more engineering.
+
+## SPEC-DSPARK: LOW-NOISE harness -- the gap is REAL at 0.975x (2026-08-12)
+
+Supersedes the same day's 0.996x "within resolution" reading, which was measured
+at free boost clocks and was too generous.
+
+Harness: GPU clocks PINNED at 1800 MHz for the whole run, 16 reps per arm with
+the cold run dropped, our arm run TWICE bracketing the oracle so drift is
+detectable, and the oracle's non-modal draws excluded by their own draft counts.
+
+| arm | n | median | range | spread |
+|---|---|---|---|---|
+| ours, BEFORE | 15 | 135.98 | 135.3-136.2 | 0.66% |
+| ours, AFTER | 15 | 135.86 | 128.8-136.0 | 5.30% |
+| drift before -> after | | -0.088% | | |
+| oracle, MODAL (18 steps) | 12 | 139.36 | 137.8-139.7 | 1.33% |
+| oracle, non-modal (17 steps) | 3 | 147.7-148.2 | | excluded |
+
+Distributions do NOT overlap (our max 136.2 < their min 137.8). Ratio 0.9751x by
+median, 0.9750x best-vs-best. Drift is negligible.
+
+At free boost clocks the same two engines read 141.8 vs 142.4 (0.996x); pinning
+the clock moved ours to 135.9 and theirs to 139.4. Both slowed, OURS MORE, which
+means our step carries more SM-clock-sensitive work per token. That points at the
+MoE expert activation at T=9 that this row measured at ~1.7x GPU per token and
+never closed -- the verify is ~30 ms of a ~34.7 ms step and both engines graph
+it, so the residual is inside the expert path, not launch overhead.
+
+Verdict: NOT parity on this cell. 0.975x, real and reproducible.
+
+Method lesson (the inverse of the bimodal-reference one): a difference that hides
+inside noise is not thereby absent. "Below resolution" describes the harness, not
+the engines.
+
+Evidence: `dgx:~/work/dspark-w6/lownoise.log`, `fibacc.json`.
+
+## SPEC-DSPARK: the 2.5% is in the MoE expert GEMM, and the repack is LOAD-TIME (2026-08-12)
+
+nsys on our verify at T=9 (35B, k=8), --cuda-graph-trace=node, two token lengths.
+
+NOT the gap: `TransposeToInt32Kernel` (16.9%), `gptq_marlin_repack_kernel`
+(15.8%) and `ProcessScalesKernel` (7.7%) total 40.4% of the 96-token run, but
+report the SAME 20561 instances and the same totals in the 32-token run
+(183.5/170.4/83.9 ms vs 183.0/170.2/83.5). Identical counts across run lengths
+means LOAD-TIME: ~437 ms once at startup, nothing per token. Reading the
+96-token percentages alone would have sent someone optimising a one-time cost.
+
+The per-token cost is the expert GEMM: `marlin_moe_wna16::Marlin` 560 -> 1520
+instances (32 -> 96 tokens) = ~15/token, (249.2 - 90.9) ms / 64 tok = 2.47
+ms/token, which at 135.9 tok/s (7.36 ms/token) is ~34% of wall. Compute-bound,
+matching the clock sensitivity that exposed the 0.975x gap.
+
+Closing 2.5% end-to-end needs ~7% off that kernel.
+
+REQUIRED before acting: profile the oracle's expert path and pair by call count.
+A prior campaign on this repo found Marlin at 55.5% of our step and called it the
+gap; upstream's profile then showed 57.2% of ITS step, so it was never the gap. A
+share measures where OUR time goes, not where upstream's advantage is.
+
+Evidence: `dgx:~/work/dspark-w6/prof.log`, `prof/ours_{32,96}.nsys-rep`.

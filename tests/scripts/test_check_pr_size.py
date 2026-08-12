@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import os
 import re
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -96,6 +98,7 @@ class PathClassification(unittest.TestCase):
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
             "release/release-matrix.json": "configuration",
+            "release/release-version.json": "configuration",
             "release/container-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
             # The container lane images. `docker/Dockerfile.arm64` already
@@ -111,6 +114,25 @@ class PathClassification(unittest.TestCase):
         for path, path_class in expected.items():
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), path_class)
+
+    def test_release_version_classification_is_exact_and_fail_closed(self) -> None:
+        """Only the authoritative immutable declaration earns this class.
+
+        A directory-level ``release/`` rule would silently classify future
+        mutable release state. Near-miss names therefore remain unknown.
+        """
+        self.assertEqual(
+            checker.classify_path("release/release-version.json"),
+            "configuration",
+        )
+        for path in (
+            "release/version.json",
+            "release/release-version.local.json",
+            "release/channel.json",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
 
     def test_generated_class_does_not_swallow_its_own_sources(self) -> None:
         # The generator and the GLSL it compiles are the REVIEWABLE surface and
@@ -375,6 +397,12 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
             "scripts/check-triton-aot-multiarch.py",
+            # PR #446 created the native Windows portability checker after the
+            # range base, so its own suite must reject a closed disabled form.
+            "scripts/check-windows-portability.py",
+            # The release-state truth checker was created in the same range and
+            # owes the identical closed bootstrap proof.
+            "scripts/check-windows-release-state.py",
             # 2026-08-10: the docs-site content guard (#224). A checker created
             # in the same PR has no BASE version to mutate, so it registers the
             # disabled form its own tests must reject.
@@ -439,6 +467,110 @@ class BudgetEnforcement(unittest.TestCase):
                         evidence_results={"scripts/check-pr-size.py": proof},
                     )
                 )
+
+    def test_evidence_tools_do_not_leak_the_ambient_path(self) -> None:
+        """CMake and Ninja are private copies, not ambient PATH leakage."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ambient = root / "ambient"
+            ambient.mkdir()
+            empty_system_path = root / "empty-system-path"
+            empty_system_path.mkdir()
+            for name in ("cmake", "ninja", "ambient-secret"):
+                executable = ambient / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            with mock.patch.dict(
+                os.environ, {"PATH": str(ambient)}, clear=True
+            ), mock.patch.object(
+                checker.os, "defpath", str(empty_system_path)
+            ):
+                tools = checker._prepare_evidence_tools(
+                    root, "tests.scripts.test_check_windows_portability"
+                )
+                env = checker._sanitized_env(root, tools)
+                entries = env["PATH"].split(os.pathsep)
+                self.assertNotIn(str(ambient), entries)
+                for name in ("cmake", "ninja"):
+                    with self.subTest(name=name):
+                        self.assertEqual(
+                            shutil.which(name, path=env["PATH"]),
+                            str(tools / name),
+                        )
+                self.assertIsNone(
+                    shutil.which("ambient-secret", path=env["PATH"])
+                )
+
+    def test_portability_evidence_fails_closed_for_each_missing_tool(self) -> None:
+        module = "tests.scripts.test_check_windows_portability"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for missing in ("cmake", "ninja"):
+                with self.subTest(missing=missing):
+                    container = root / f"container-{missing}"
+                    container.mkdir()
+                    available = root / f"available-{missing}"
+                    available.mkdir()
+                    for name in ({"cmake", "ninja"} - {missing}):
+                        executable = available / name
+                        executable.write_text(
+                            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+                        )
+                        executable.chmod(0o755)
+                    with mock.patch.dict(
+                        os.environ, {"PATH": str(available)}, clear=True
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            rf"semantic evidence requires executable {missing}",
+                        ):
+                            checker._prepare_evidence_tools(container, module)
+
+    def test_private_cmake_retains_its_installed_module_tree(self) -> None:
+        module = "tests.scripts.test_check_windows_portability"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installation = root / "installation"
+            binaries = installation / "bin"
+            modules = installation / "share/cmake/Modules"
+            binaries.mkdir(parents=True)
+            modules.mkdir(parents=True)
+            cmake = binaries / "cmake"
+            cmake.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parent.parent\n"
+                "if not (root / 'share/cmake/Modules').is_dir():\n"
+                "    print('Could not find CMAKE_ROOT', file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "print('Build files have been written')\n",
+                encoding="utf-8",
+            )
+            cmake.chmod(0o755)
+            ninja = binaries / "ninja"
+            ninja.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            ninja.chmod(0o755)
+            empty_system_path = root / "empty-system-path"
+            empty_system_path.mkdir()
+            with mock.patch.dict(
+                os.environ, {"PATH": str(binaries)}, clear=True
+            ), mock.patch.object(
+                checker.os, "defpath", str(empty_system_path)
+            ):
+                tools = checker._prepare_evidence_tools(root, module)
+                result = subprocess.run(
+                    [str(tools / "cmake")],
+                    env=checker._sanitized_env(root, tools),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn("Build files have been written", result.stdout)
 
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
