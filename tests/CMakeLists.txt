@@ -164,6 +164,7 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # ParseDeepseekV4Params. No checkpoint / GPU — the forward + strict gate are
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
+target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
 # registry + ParseLagunaParams descends the shipped config (nested dual-rope +
@@ -793,6 +794,7 @@ if(VLLM_CPP_SERVER)
     # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
     # (ARCH-ONE-SURFACE ROW 6).
     LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
@@ -864,6 +866,14 @@ target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)
 vllm_cpp_add_test(test_backend vt/test_backend.cpp)
+add_executable(test_vulkan_loader
+  vt/test_vulkan_loader.cpp
+  ${CMAKE_SOURCE_DIR}/src/vt/vulkan/vulkan_loader.cpp)
+target_include_directories(test_vulkan_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_vulkan_loader PRIVATE vllm_test_main ${CMAKE_DL_LIBS})
+vllm_cpp_set_warnings(test_vulkan_loader)
+add_test(NAME test_vulkan_loader COMMAND test_vulkan_loader)
 # CPU-vs-device op-equality harness (BACKEND-METAL-MLX W0). Unconditional: it
 # discovers which non-CPU backends this build registered and compares only those,
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
@@ -1060,10 +1070,12 @@ target_include_directories(test_cpu_threadpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_nvfp4_matmul vt/test_ops_nvfp4_matmul.cpp)
 vllm_cpp_add_test(test_ops_nvfp4_fp4 vt/test_ops_nvfp4_fp4.cpp)
 target_include_directories(test_ops_nvfp4_fp4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
-vllm_cpp_add_test(test_nvfp4_persistent_cache vt/test_nvfp4_persistent_cache.cpp)
-target_include_directories(test_nvfp4_persistent_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_definitions(test_nvfp4_persistent_cache PRIVATE
-  TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+if(NOT WIN32)
+  vllm_cpp_add_test(test_nvfp4_persistent_cache vt/test_nvfp4_persistent_cache.cpp)
+  target_include_directories(test_nvfp4_persistent_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(test_nvfp4_persistent_cache PRIVATE
+    TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+endif()
 if(VLLM_CPP_CUTLASS)
   foreach(_NVFP4_TACTIC RANGE 0 31)
     add_test(NAME test_ops_nvfp4_fp4_tactic_${_NVFP4_TACTIC}
@@ -1383,6 +1395,21 @@ vllm_cpp_add_test(test_qwen27_paged_engine parity/test_qwen27_paged_engine.cpp)
 target_compile_definitions(test_qwen27_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen27_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# `GATE-27B-FP8-TOWER-GOLDEN` (issue #466): the SECOND dense 27B arm, pinned to
+# nvidia/Qwen3.6-27B-NVFP4@0893e160 (`modelopt_mixed` — W4A16 NVFP4 MLP + FP8
+# W8A8 tower + NVFP4 head). The gate above pins unsloth@890bdef7, whose GDN
+# input projections are BF16, so every fp8 branch is dead code there and that
+# gate can never fail for an fp8 defect. This arm asserts the fp8 GDN
+# input-projection dispatch contract UNCONDITIONALLY — a zero count is a
+# failure, not a skipped block. Checkpoint-gated, dgx-only; on CPU/CI it refuses
+# loudly instead of reporting a vacuous pass.
+vllm_cpp_add_test(test_qwen27n_fp8_tower_paged_engine
+  parity/test_qwen27n_fp8_tower_paged_engine.cpp)
+target_compile_definitions(test_qwen27n_fp8_tower_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27n_fp8_tower_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.

@@ -156,6 +156,11 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
+GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
+host's native filesystem encoding, including Unicode paths on Windows. Native
+Windows release artifacts are not published yet; they will remain unavailable
+until the `v0.0.3-pre.1` prerelease build and publication gates succeed.
+
 Two more example binaries ship alongside it:
 
 - `vllm-bench` ([`examples/bench/main.cpp`](../examples/bench/main.cpp)), a
@@ -386,6 +391,65 @@ cmake --build build --target vllm-server-archive
 build/release/stage/bin/vllm-server --help
 ```
 
+At the current numeric project version, `vllm-server-archive` emits exactly one
+deterministic developer tarball named
+`build/release/vllm.cpp-0.0.3-<configured-artifact-id>.tar.gz`. The target
+selects `tar.gz` explicitly; it does not infer the format from the filename.
+This is separate from the release workflow, whose `0.0.3-pre.1` asset names and
+per-tuple formats come from the release matrix, including `.zip` for Windows.
+
+On native Windows, run the release-bundle gate from a Visual Studio 2022 x64
+developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
+`bin/vllm-server.exe`, runs the focused Win32 tests, exercises the portable and
+AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
+`--help`, `/health`, `/version`, and a clean CTRL_BREAK shutdown:
+
+The MSVC build defines `NOMINMAX` and the portable ISO CRT contract centrally,
+and compiles C++ sources as UTF-8. Do not add those definitions per target or
+disable `/WX`; both CPU and Vulkan release configurations share this contract.
+
+```powershell
+$env:SOURCE_SHA = git rev-parse HEAD
+$env:VERSION = "0.0.3-pre.1"
+$env:SOURCE_DATE_EPOCH = git show -s --format=%ct HEAD
+$env:EVIDENCE_URL = "https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE"
+pwsh -File scripts/build-windows-release.ps1 -Backend cpu
+pwsh -File scripts/build-windows-release.ps1 -Backend vulkan `
+  -BuildDir build-release-windows-vulkan `
+  -StageDir build-release-windows-vulkan/stage
+```
+
+The adaptive binary keeps its F16C translation unit at `/arch:AVX`; AVX2 and
+AVX-512 remain separate runtime-selected translation units. The gate derives
+the complete server source set from CMake's generated codemodel, recursively
+checks its project-local header closure, and refuses required runtime sources
+that are not reachable from the shipped target. After installation it audits
+project COFF directives for static `LIBCMT` and rejects dynamic/debug CRT
+imports before running the staged executable's `--help`, forced-tier, or HTTP
+shutdown smokes. The Win32 console-control regression uses bounded waits so a
+teardown failure reports an error instead of hanging the gate.
+
+The CUDA graph-replay profiler and its FIFO diagnostic controls remain
+POSIX-only and are not exposed by native Windows server builds. Native Windows
+process launch, environment updates, process IDs, and console shutdown stay on
+the direct CRT/Win32 adapters; they do not require a POSIX compatibility layer
+or a command shell.
+
+Each invocation emits a deterministic `.zip` plus its exact `.sha256` and
+`.provenance.json` sidecars. ZIP members are sorted, use the
+`SOURCE_DATE_EPOCH` timestamp, and reject traversal, drive-qualified paths,
+backslashes, symlinks, and reparse points. The PE audit requires AMD64, `/MT`,
+system DLL imports, and no build/debug/MSYS paths. The Vulkan archive bundles no
+loader, ICD, or driver: `vulkan-1.dll` and a working host Vulkan stack remain
+external, and runtime evidence stays absent unless the extracted server is
+actually probed against a real ICD.
+
+The default smoke model is the committed tiny embedding fixture; pass
+`-SmokeModel C:\path\to\model` to use another complete model directory. This
+command produces a staged developer tree only. The Windows CPU and Vulkan ZIP
+downloads do not exist until the `v0.0.3-pre.1` prerelease workflow and
+post-publication audit succeed. <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
+
 The basic CMake archive under `build/release/` includes the version, configured
 backend, OS, and host architecture in its name. It is a developer package. The
 release workflow separately produces host-ABI-specific archives with a
@@ -525,6 +589,7 @@ provenance sidecars:
 ```sh
 python3 scripts/validate-release-archive.py \
   --archive vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz \
+  --archive-format tar.gz \
   --checksum vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256 \
   --provenance vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.provenance.json \
   --forbid-path "$PWD/build"
@@ -669,12 +734,15 @@ manual entry point:
 gh workflow run release.yml --ref main
 ```
 
-Manual runs are always dry runs. Publication additionally requires an exact
-`v<project-version>` tag, a release matrix whose required lanes are all marked
+Manual runs are always dry runs. Publication additionally requires the exact
+tag declared in `release/release-version.json` (currently
+`v0.0.3-pre.1`), a release matrix whose required lanes are all marked
 ready, successful verification and attestation jobs, and approval of the
 protected `release` environment. Build and verification jobs have read-only
 repository permissions; only attestation receives OIDC authority, and only the
-final protected job receives `contents: write`.
+final protected job receives `contents: write`. The current declaration is a
+prerelease; the publisher must pass GitHub's prerelease flag and a manual dry
+run cannot publish.
 
 Any OpenAI client works by pointing its `base_url` at it:
 
@@ -793,7 +861,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -1235,6 +1303,11 @@ after temperature and top-k/top-p, so they describe the distribution actually
 SAMPLED from — a token top-k masked away reads `-inf` there and its true value
 under the raw pair. It is selectable by constructing a `Sampler` directly; there
 is no config, CLI or request field for it yet.
+
+`LogprobsTensors::slice_request(req_idx, request_num_positions)` cuts that
+batch-wide payload by rows. The second argument is the requested row count;
+each row keeps the source tensor's independent `num_tokens_per_position`
+width.
 
 The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
 [`lora/punica.h`](../include/vllm/lora/punica.h),

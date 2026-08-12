@@ -206,7 +206,9 @@ std::vector<float> Gemma4AudioForward(const std::vector<float>& input_features, 
   const int64_t ctx = cfg.context_size();
   const int64_t P = ctx / 2 + 1;
   const int64_t nts = H / 2;
-  const double log_inc = std::log(10000.0 / 1.0) / std::max<double>(nts - 1, 1);
+  const double log_inc =
+      std::log(10000.0 / 1.0) /
+      std::max<double>(static_cast<double>(nts - 1), 1.0);
   std::vector<double> inv_ts(static_cast<size_t>(nts));
   for (int64_t i = 0; i < nts; ++i) inv_ts[static_cast<size_t>(i)] = std::exp(i * -log_inc);
   std::vector<float> posemb(static_cast<size_t>(P) * H);

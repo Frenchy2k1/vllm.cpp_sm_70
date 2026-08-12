@@ -14,7 +14,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/kv_offload/base.h"
@@ -27,14 +32,38 @@ using vllm::v1::BlockHash;
 
 namespace {
 
+uint64_t TestProcessId() {
+#if defined(_WIN32)
+  return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+  return static_cast<uint64_t>(::getpid());
+#endif
+}
+
+std::string Utf8Path(const std::filesystem::path& path) {
+#if defined(_WIN32)
+  const std::u8string value = path.u8string();
+  return std::string(reinterpret_cast<const char*>(value.data()), value.size());
+#else
+  return path.string();
+#endif
+}
+
+std::filesystem::path PathFromUtf8(const std::string& value) {
+  const std::u8string utf8(reinterpret_cast<const char8_t*>(value.data()),
+                           value.size());
+  return std::filesystem::path(utf8);
+}
+
 // A self-cleaning temporary root. Bounded by construction (gate 9).
 class TempDir {
  public:
   explicit TempDir(const std::string& tag) {
     static int counter = 0;
     path_ = std::filesystem::temp_directory_path() /
-            ("vllmcpp_kvoff_" + tag + "_" + std::to_string(::getpid()) + "_" +
-             std::to_string(counter++));
+            PathFromUtf8("vllmcpp_kvoff_" + tag + "_" +
+                         std::to_string(TestProcessId()) + "_" +
+                         std::to_string(counter++));
     std::filesystem::create_directories(path_);
   }
   ~TempDir() {
@@ -43,7 +72,7 @@ class TempDir {
   }
   TempDir(const TempDir&) = delete;
   TempDir& operator=(const TempDir&) = delete;
-  std::string str() const { return path_.string(); }
+  std::string str() const { return Utf8Path(path_); }
 
  private:
   std::filesystem::path path_;
@@ -166,6 +195,16 @@ TEST_CASE("a stored block round-trips BYTE-IDENTICALLY") {
 
   std::vector<uint8_t> out(kPage, 0);
   CHECK(tier.load(Key(1), out.data(), out.size()));
+  CHECK(out == payload);
+}
+
+TEST_CASE("KV filesystem paths preserve native Unicode") {
+  TempDir dir("日本語_é");
+  FileSystemTier tier(Options(dir, BaseIdentity()));
+  const auto payload = Payload(0x5a);
+  tier.store(Key(9), payload.data(), payload.size());
+  std::vector<uint8_t> out(kPage, 0);
+  REQUIRE(tier.load(Key(9), out.data(), out.size()));
   CHECK(out == payload);
 }
 

@@ -27,12 +27,13 @@ jobs:
       - name: Compute an explicit dry-run or exact-tag plan
         id: plan
         run: |
-          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          project_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["project_version"])')
+          test "$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "$project_version"
           python3 scripts/release_pipeline.py plan \
             --event '${{ github.event_name }}' \
             --ref '${{ github.ref }}' \
             --sha '${{ github.sha }}' \
-            --version "$version" \
+            --release-version release/release-version.json \
             --matrix release/release-matrix.json \
             --output release-plan.json \
             --github-output "$GITHUB_OUTPUT"
@@ -68,8 +69,10 @@ jobs:
         run: |
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
-          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
-          test "$version" = "$VERSION"
+          release_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["version"])')
+          project_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["project_version"])')
+          test "$release_version" = "$VERSION"
+          test "$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "$project_version"
           scripts/build-cpu-release.sh \
             linux-x86_64-glibc-cpu x86_64 stable build-release-cpu-x86 \
             "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" \
@@ -108,8 +111,10 @@ jobs:
         run: |
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
-          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
-          test "$version" = "$VERSION"
+          release_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["version"])')
+          project_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["project_version"])')
+          test "$release_version" = "$VERSION"
+          test "$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "$project_version"
           scripts/build-cpu-release.sh \
             linux-aarch64-glibc-cpu aarch64 stable build-release-cpu-arm64 \
             "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" \
@@ -144,8 +149,10 @@ jobs:
         run: |
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
-          version=$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
-          test "$version" = "$VERSION"
+          release_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["version"])')
+          project_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["project_version"])')
+          test "$release_version" = "$VERSION"
+          test "$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "$project_version"
           scripts/install-intel-sde.sh "$RUNNER_TEMP/intel-sde"
           docker run --rm \
             -e EVIDENCE_URL -e SOURCE_DATE_EPOCH -e SOURCE_SHA -e VERSION \
@@ -357,8 +364,90 @@ jobs:
           if-no-files-found: error
           overwrite: false
           retention-days: 7
+  cpu_windows:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: windows-2022
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove Windows PowerShell and CRT rejection contracts
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_DATE_EPOCH: '0'
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: ./scripts/build-windows-release.ps1 -ContractTest
+      - name: Build, execute, package, and validate native Windows CPU preview
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
+          $release = Get-Content release/release-version.json -Raw | ConvertFrom-Json
+          if ($release.version -ne $env:VERSION) { throw "release version drift" }
+          ./scripts/build-windows-release.ps1 `
+            -Backend cpu `
+            -ArtifactId windows-x86_64-msvc-cpu `
+            -BuildDir $env:GITHUB_WORKSPACE/build-release-windows-cpu
+      - name: Upload exact validated Windows CPU asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64-msvc-cpu-${{ github.sha }}
+          path: |
+            build-release-windows-cpu/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-cpu.zip
+            build-release-windows-cpu/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-cpu.zip.sha256
+            build-release-windows-cpu/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-cpu.zip.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+  vulkan_windows:
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: windows-2022
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove Windows PowerShell and CRT rejection contracts
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_DATE_EPOCH: '0'
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: ./scripts/build-windows-release.ps1 -ContractTest
+      - name: Build, execute, package, and validate native Windows Vulkan preview
+        env:
+          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
+          $release = Get-Content release/release-version.json -Raw | ConvertFrom-Json
+          if ($release.version -ne $env:VERSION) { throw "release version drift" }
+          ./scripts/build-windows-release.ps1 `
+            -Backend vulkan `
+            -ArtifactId windows-x86_64-msvc-vulkan `
+            -BuildDir $env:GITHUB_WORKSPACE/build-release-windows-vulkan
+      - name: Upload exact validated Windows Vulkan asset triplet
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64-msvc-vulkan-${{ github.sha }}
+          path: |
+            build-release-windows-vulkan/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-vulkan.zip
+            build-release-windows-vulkan/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-vulkan.zip.sha256
+            build-release-windows-vulkan/release/vllm.cpp-${{ needs.plan.outputs.version }}-windows-x86_64-msvc-vulkan.zip.provenance.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
   build:
-    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64]
+    needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows, vulkan_windows]
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -376,7 +465,7 @@ jobs:
       - name: Download exact validated CPU artifacts by immutable IDs
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
+          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }},${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }}
           path: release-assets
           merge-multiple: true
       - name: Produce the byte-bound release handoff

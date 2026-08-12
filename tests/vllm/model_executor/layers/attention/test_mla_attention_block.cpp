@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <numbers>
 #include <stdexcept>
 #include <vector>
 
@@ -804,7 +805,7 @@ TEST_CASE("The DeepSeek YaRN cos|sin cache matches an independent transcription"
   auto corr_dim = [&](double nrot) {
     return (static_cast<double>(rot) *
             std::log(static_cast<double>(p.original_max_position_embeddings) /
-                     (nrot * 2.0 * M_PI))) /
+                     (nrot * 2.0 * std::numbers::pi_v<double>))) /
            (2.0 * std::log(p.base));
   };
   double low = std::max(std::floor(corr_dim(p.beta_fast)), 0.0);

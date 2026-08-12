@@ -274,6 +274,18 @@ TEST_CASE("device sampling maps a reduced draft vocab through d2t") {
   for (int64_t p = 0; p < kV; ++p) w2[static_cast<size_t>(((p + 1) % 3) * kV + p)] = kBig;
   w.markov_w2 = MkBf16({3, kV}, w2, /*nk=*/true);
   w.draft_id_to_target_id = {2, 2, 2};  // OFFSETS: draft d -> target d + 2
+  // The device chain feeds the raw argmax (a DRAFT id) back into the embedding,
+  // so a reduced-vocab draft must also carry markov_w1 gathered into DRAFT order
+  // (row j == markov_w1[j + d2t[j]]). Without it the weights are refused rather
+  // than silently gathering the wrong row.
+  {
+    Qwen3DSparkWeights probe = w;
+    CHECK_FALSE(Qwen3DSparkModel::CanSampleOnDevice(probe));
+  }
+  std::vector<float> w1d(static_cast<size_t>(3 * kV), 0.0f);
+  for (int64_t j = 0; j < 3; ++j) w1d[static_cast<size_t>(j * kV + (j + 2))] = 1.0f;
+  w.markov_w1_draft = MkBf16({3, kV}, w1d, /*nk=*/false);
+  CHECK(Qwen3DSparkModel::CanSampleOnDevice(w));
 
   DsparkBlockLayout layout;
   layout.num_speculative_steps = 3;
