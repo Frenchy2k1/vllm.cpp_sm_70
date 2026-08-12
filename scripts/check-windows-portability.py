@@ -507,16 +507,8 @@ def _validate_exact_unsupported_tier_probe(
     string = ("string", "*")
     expected: list[tuple[str, str]] = [
         ("word", "param"), ("symbol", "("),
-    ]
-    cursor = 2
-    parameter_prefix = [
         ("symbol", "["), ("word", "parameter"), ("symbol", "("),
         ("word", "mandatory"), ("symbol", ")"), ("symbol", "]"),
-    ]
-    if tokens[cursor:cursor + len(parameter_prefix)] == parameter_prefix:
-        expected.extend(parameter_prefix)
-        cursor += len(parameter_prefix)
-    expected.extend([
         ("symbol", "["), ("word", "string"), ("symbol", "]"),
         ("variable", "$tiertest"), ("symbol", ","),
         ("symbol", "["), ("word", "scriptblock"), ("symbol", "]"),
@@ -553,7 +545,7 @@ def _validate_exact_unsupported_tier_probe(
         ("symbol", "("), ("string", "DIAGNOSTIC"), ("symbol", ")"),
         ("symbol", ")"), ("symbol", "{"), ("word", "throw"), string,
         ("symbol", "}"),
-    ])
+    ]
 
     def matches(actual: tuple[str, str], wanted: tuple[str, str]) -> bool:
         if wanted == string:
@@ -1443,13 +1435,9 @@ def _validate_console_protocol(console: str, errors: list[str]) -> None:
             r"\b(?:const\s+)?bool\s+resumed\s*=\s*[^;]+;",
             dispatch[:final_decrements[0].start()],
         ))
-        resumed_macro = re.search(
-            r"(?m)^\s*#\s*define\s+resumed(?:\s|\()",
-            active_console,
-        )
         final_tail = dispatch[final_decrements[0].end():]
         final_tail_ok = (
-            len(resumed_declarations) == 1 and resumed_macro is None and
+            len(resumed_declarations) == 1 and
             re.fullmatch(
                 r"\s*;\s*return\s+resumed\s*;\s*",
                 final_tail,

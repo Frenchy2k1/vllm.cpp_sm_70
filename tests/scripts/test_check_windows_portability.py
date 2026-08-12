@@ -134,7 +134,8 @@ SAFE_FILES = {
     """,
     "scripts/build-windows-release.ps1": """
         function Invoke-UnsupportedTierProbe {
-          param([string]$TierTest, [scriptblock]$Runner)
+          param([Parameter(Mandatory)][string]$TierTest,
+                [scriptblock]$Runner)
           $arguments = @(
             '--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran'
           )
@@ -472,26 +473,29 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 "#define POST_DECREMENT_RESULT "
                 "(SetEvent(state->stop_event), resumed)\n  " + decrement,
                 "return POST_DECREMENT_RESULT;",
+                "final in-flight decrement",
             ),
             (
                 "#define resumed (SetEvent(state->stop_event), true)\n  " +
                 decrement,
                 "return resumed;",
+                "trusted final-tail token",
             ),
             (
                 "#define POST_DECREMENT_RESULT() "
                 "(SetEvent(state->stop_event), resumed)\n  " + decrement,
                 "return POST_DECREMENT_RESULT();",
+                "final in-flight decrement",
             ),
         )
-        for macro_and_decrement, returned in mutations:
+        for macro_and_decrement, returned, reason in mutations:
             with self.subTest(returned=returned):
                 mutated = source.replace(decrement, macro_and_decrement, 1)
                 mutated = mutated.replace("return resumed;", returned, 1)
                 self.assert_rejected(
                     "src/vllm/platform/console_shutdown.cpp",
                     mutated,
-                    "final in-flight decrement",
+                    reason,
                 )
 
     def test_console_final_tail_rejects_macros_for_trusted_tokens(self) -> None:
@@ -697,6 +701,38 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                 self.assertEqual(
                     result.returncode, 0, result.stdout + result.stderr
                 )
+
+    def test_console_final_tail_accepts_resumed_macros_inactive_at_return(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        safe_directives = (
+            "#define resumed unsafe_resumed\n#undef resumed\n  ",
+            "#if 0\n#define resumed unsafe_resumed\n#endif\n  ",
+            '#pragma push_macro("resumed")\n'
+            "#define resumed unsafe_resumed\n"
+            '#pragma pop_macro("resumed")\n  ',
+        )
+        for directives in safe_directives:
+            with self.subTest(directives=directives):
+                result = self.run_checker(self.make_tree({
+                    "src/vllm/platform/console_shutdown.cpp":
+                        source.replace(decrement, directives + decrement, 1),
+                }))
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            source.replace(
+                decrement,
+                "#define resumed unsafe_resumed\n  " + decrement,
+                1,
+            ),
+            "trusted final-tail token",
+        )
 
         result = self.run_checker(self.make_tree({
             "src/vllm/platform/console_shutdown.cpp":
@@ -1221,6 +1257,22 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assert_rejected(
                     "scripts/build-windows-release.ps1", mutation, reason
+                )
+
+    def test_unsupported_tier_helper_requires_mandatory_tier_parameter(self) -> None:
+        canonical = "[Parameter(Mandatory)][string]$TierTest"
+        optional = "[string]$TierTest"
+        fixture = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        real = (REPO / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        for label, script in (("fixture", fixture), ("real", real)):
+            with self.subTest(label=label):
+                self.assertEqual(script.count(canonical), 1)
+                self.assert_rejected(
+                    "scripts/build-windows-release.ps1",
+                    script.replace(canonical, optional, 1),
+                    "exact unsupported-tier probe body",
                 )
 
     def test_unsupported_tier_rejects_equivalent_unfiltered_target_forms(self) -> None:
