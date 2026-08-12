@@ -309,11 +309,70 @@ under a split-K reduction scheme whether alpha is applied before or after the
 partial reduction decides whether `fl(acc*A)` is even well-defined. #213 measured
 `splitK=1` at this gate shape; that would have to be re-confirmed.
 
-## Next traceable hypothesis — a DIFFERENT cuBLASLt API for the same fusion
+## The A-scale OUTER_VEC API is ALSO refused — MEASURED 2026-08-12
 
-Not a ceiling: the pointer-mode API is refused, but it is **not the only** way
-cuBLASLt applies a per-column f32 vector in an fp8 epilogue, and the alternative
-has not been tried.
+The second cuBLASLt mechanism for the same fusion was probed directly on GB10 and
+is **refused at heuristic time on every shape and every output dtype tried**.
+Unlike attempt 1 this was settled BEFORE any integration, by a standalone probe
+(`scripts/probe_fp8_outer_vec_scale.cu`, `scripts/probe_fp8_outer_vec_dtypes.cu`)
+whose control arms prove it executed.
+
+Device `NVIDIA GB10` sm_121a, cuBLASLt `130101`, CUDA runtime/driver 13000,
+driver `580.159.03`.
+
+Pass 1 — the ten real gate shapes (27B `N=10240+6144, K=5120` and 35B
+`N=4096+2048, K=2048`, each at `M ∈ {1, 3, 128, 1024, 4096}`), f32 D:
+
+| descriptor form | result, ALL TEN shapes |
+|---|---|
+| host scalar alpha (today's shipped form) | `SUCCESS`, algoId 67, **splitK=1**, matmul + sync OK |
+| `A_SCALE_POINTER` → device f32 **scalar**, mode `SCALAR_32F` | `SUCCESS`, **identical algo**, matmul + sync OK |
+| `A_SCALE_POINTER` → device f32 `[N]`, mode `OUTER_VEC_32F` | heuristic **`CUBLAS_STATUS_INVALID_VALUE`**, 0 algos |
+| `A`+`B` both `OUTER_VEC_32F` | heuristic **`CUBLAS_STATUS_NOT_SUPPORTED`**, 0 algos |
+
+Pass 2 — is the refusal conditioned on our f32 output, or on our shapes? Swept
+`D ∈ {f32, bf16, f16, e4m3}` × 4 shapes (the two gate shapes, plus a canonical
+`4096³` square as a device-level control) × 5 scale configs:
+
+- `OUTER_VEC_32F` accepted in **0 of 48** swept cells (4 shapes × 4 dtypes × the
+  3 vector-scale configs) — of which 36 have a GREEN control at the same
+  shape/dtype, so the refusals are the mode's, not the descriptor's.
+- The no-scale and `SCALAR_32F` controls succeed at **f32, bf16 AND f16** on every
+  shape (algoId 67), so the probe, the layouts and the TN descriptor are sound.
+- `e4m3` D is `NOT_SUPPORTED` for *every* config including the controls — an
+  unrelated limit, not evidence about the scale mode.
+
+**Named cause: `CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F` is not implemented
+for e4m3 TN matmuls by cuBLASLt 13.1.1 on GB10/sm_121a.** It is a
+device/driver-level absence, NOT shape-conditional and NOT output-dtype-
+conditional — the square control and the bf16/f16 columns refuse identically.
+
+Three things this pins that the reasoning had assumed:
+
+1. The A-scale **pointer** mechanism genuinely works here — the `SCALAR_32F` arm
+   returns the same algo as the host scalar. Only the vector **MODE** is missing,
+   so the earlier reading ("gated by scale/compute-type support, not by
+   `POINTER_MODE_CAP_MASK`") was right about *which* gate applies and wrong only
+   about the outcome.
+2. The refusal lands on **`cublasLtMatmulAlgoGetHeuristic`**, not on
+   `cublasLtMatmul` as `cublasLt.h:1420-1430` implies for an unsupported scale
+   combination. A probe that only checked the matmul return code would have read
+   a false green; one that only checked the heuristic on the shipped form would
+   have seen nothing at all.
+3. `splitK=1` at every gate shape and every M — confirming the standing
+   precondition #213 measured, for whichever mechanism a future driver offers.
+
+**Do not re-derive this.** Re-run the two probes (each builds in seconds with
+`nvcc -arch=sm_121a ... -lcublasLt -lcudart` and needs no model, no engine build
+and ~0.5 GB of device memory) against a NEW driver or a different GPU. A cell
+that flips to `ok#NN` is the signal that this row is live again; pass 1 then
+byte-compares the epilogue against the two-launch reference automatically.
+
+### Why it was the right thing to try (kept, so the record explains itself)
+
+The pointer-mode API is refused, but it was **not the only** way cuBLASLt applies
+a per-column f32 vector in an fp8 epilogue, and the alternative had not been
+tried.
 
 `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` (17) with `CUBLASLT_MATMUL_DESC_A_SCALE_MODE`
 (31) set to `CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F` (3) — `cublasLt.h:923-940`,
@@ -337,33 +396,81 @@ Why it is a genuinely different shot rather than the same one renamed:
   so the byte-exactness argument of §Byte-exactness carries over unchanged, and
   the same bitwise gate-shape test decides it.
 
-Cheap to settle before writing any kernel: a standalone cuBLASLt probe on GB10
-that sets the two attributes at the 27B gate shape (M=4096, N=16384, K=5120,
-e4m3, `CUBLAS_COMPUTE_32F`) and reports whether `cublasLtMatmul` accepts them.
-That probe, not another A/B of the refused arm, is the next step.
+That reasoning was sound and the conclusion was wrong: the mode is simply absent
+here. Settling it cost one standalone probe and no integration — which is the
+transferable lesson, since attempt 1 cost an integration plus a void A/B to learn
+strictly less.
+
+## An integration hazard this probe surfaced, for whoever gets a driver that works
+
+`A_SCALE_POINTER` is a **descriptor** attribute, whereas attempt 1's alpha was a
+per-call **argument** to `cublasLtMatmul`. Our fp8 plan cache
+(`GetOrBuildCachedFp8Plan`) is keyed by shape and returns a shared descriptor, so
+caching a plan that carries a baked scale pointer would apply the FIRST GDN
+layer's `alpha_vec` to all 48 same-shaped layers — a silent wrong-numbers bug
+that no shape-keyed test would catch. Any future integration must either set the
+pointer per call on the fetched plan or refuse to cache vector-scale plans;
+`Fp8PlanKey` cannot express the difference, because the pointer is not part of
+the shape. Recorded here because the refusal means nobody will hit it *yet*.
 
 ## Now
 
-Spec + pointer-mode arm committed; the arm is **inert on GB10** (measured above)
-and stays default OFF. The z-slice fallback is **rejected on numerics** and not
-implemented — this row returns **`NEEDS_DECISION`** on it. Landed alongside: the
-named refusal diagnostic and its CPU-tier test, so the next GPU run reports a
-cause instead of an absence.
+Both cuBLASLt mechanisms for this fusion are **measured unavailable on
+GB10/sm_121a**, each with a named cause, and the third route is measured
+non-exact. The row has no remaining implementable path on this hardware:
+
+| attempt | mechanism | verdict |
+|---|---|---|
+| 1 | `POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO` | REFUSED — no algo advertises the cap bit; arm implemented, inert, default OFF |
+| 2 | scalar GEMM alpha + z-slice correction | REJECTED — double rounding, 25-36% of z-slice words off by 1 ulp; not implemented |
+| 3 | `A_SCALE_POINTER` + `OUTER_VEC_32F` | REFUSED — mode unimplemented for e4m3 TN; 0 of 48 cells, all shapes and dtypes |
 
 Open decisions for the operator, in order of value:
 
-1. Run the `OUTER_VEC_32F` probe above. If it is accepted, the FULL 122.99 ms is
-   back on the table with the original byte-exactness argument intact.
-2. If it is refused too, decide explicitly whether a 1-ulp perturbation of ~30%
-   of this tensor is worth ~76 ms/req. Default answer is no.
-3. `#417`'s bf16-output lever (−61.5 ms on this same buffer) is unaffected by any
-   of the above and is now the only *uncontested* saving on this tensor.
+1. `#417`'s bf16-output lever (−61.5 ms on this same buffer) is untouched by all
+   three results and is now the **only uncontested saving on this tensor**. Pass 2
+   incidentally proves cuBLASLt serves a bf16 D for these exact fp8 shapes
+   (algoId 67 at every shape), so that row's premise holds on this hardware.
+2. Whether a 1-ulp perturbation of ~30% of this tensor is worth ~76 ms/req. This
+   row's default answer is no and it is forbidden from deciding unilaterally.
+3. Re-run the two probes on any new driver/GPU before assuming this is permanent.
 
-GPU evidence for everything numerical remains **owed**: this worktree has no
-`nvcc` and no CUDA device.
+**Not a ceiling.** The pass is 43.6% of the measured 27B prefill deficit and the
+arithmetic that would remove it is exact; what is missing is a vendor kernel, on
+this driver, and that is a dated fact rather than a limit. The next traceable
+hypotheses are (a) #417's bf16 narrowing, which halves the same pass with no
+vendor dependency, and (b) fusing the multiply into the *consumer* of this buffer
+(the conv/post-conv reader) so the vector costs no separate DRAM pass at all —
+untried, and dependent on no cuBLASLt capability whatsoever.
+
+GPU evidence for the capability question is now **paid** (probes above, run on
+dgx.casa under the GPU lock). What remains owed is only what a *landed* lever
+would need: the SACRED engine gates and a prefill A/B. Nothing here changes
+runtime behavior, so neither is triggered.
 
 ## Outcome
 
-Pending — see §Now. The primary mechanism is implemented and measured
-UNAVAILABLE on GB10/sm_121a (not refuted); the named fallback is measured
-NOT byte-exact and rejected; one untried mechanism remains.
+**No lever landed, and the reason is external.** All three routes to folding the
+per-column FP8 alpha into the GEMM are now measured, not argued:
+
+- **Measured:** the standalone probes above — controls green on every shape and
+  output dtype, `OUTER_VEC_32F` refused in 0/20 cells; and the earlier
+  `VT_GEMM_ALGO_LOG=1` run showing zero `TN-fp8-alphavec` tags. Also measured
+  incidentally and useful to a neighbouring row: `splitK=1` at every gate shape,
+  and a bf16 D served for these exact fp8 shapes.
+- **Rejected and why:** the z-slice fallback, on double-rounding (25-36% of words
+  off by 1 ulp over 2e6 accumulators, 6/6 alpha pairs) — a correctness trade this
+  row is forbidden to make. Exact only if `qkv.alpha` is a power of two, which no
+  checkpoint guarantees.
+- **Why the defaults are set as they are:** `VT_FP8_ALPHA_VEC_EPILOGUE` stays
+  DEFAULT OFF because its arm cannot execute on this hardware — the fallback
+  fires on every call, so the default is the *only* behavior either way, and the
+  arm is retained solely for hardware that offers the mode. No default flipped;
+  no golden touched; runtime behavior is byte-identical to before this row.
+
+The measured 122.99 ms/req (43.6% of the 27B prefill gap) is therefore still
+open, and is explicitly NOT declared a ceiling — §Now names two hypotheses that
+depend on no vendor capability. The row's lasting product is the elimination of
+two plausible mechanisms with named causes, a re-runnable instrument that settles
+them in seconds on new hardware, and one recorded plan-cache hazard for whoever
+gets that hardware.
