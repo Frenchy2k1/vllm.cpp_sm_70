@@ -25,6 +25,9 @@ Agent-record semantic-evidence repair:
 Isolated evidence toolchain repair:
 [#456](https://github.com/mudler/vllm.cpp/issues/456)
 
+Sanitized evidence environment test repair:
+[#457](https://github.com/mudler/vllm.cpp/issues/457)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -426,6 +429,15 @@ host Ninja installed elsewhere, falsely reddening the HEAD portability suite
 ([#456](https://github.com/mudler/vllm.cpp/issues/456)). The repair copies only
 the explicitly required `ninja` executable into an isolated tool directory;
 the ambient directory and sibling executables remain unreachable.
+
+Independent mutation review then proved that the #456 regression test was not
+load-bearing ([#457](https://github.com/mudler/vllm.cpp/issues/457)): it left
+the hostile `PATH` context before constructing the sanitized environment, so
+replacing `os.defpath` with the ambient `PATH` still passed. The repaired test
+performs tool preparation, sanitized-environment construction, and its
+allowlisted-tool and sibling-exclusion assertions inside one `clear=True`
+hostile environment. The exact ambient-`PATH` mutation must fail while the
+#456 implementation remains unchanged.
 
 ## Now
 
