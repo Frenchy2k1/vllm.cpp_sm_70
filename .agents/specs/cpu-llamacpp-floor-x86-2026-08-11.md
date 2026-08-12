@@ -165,6 +165,57 @@ model hash, per-repetition numbers, load averages, and the correctness hashes.
 - The work turns out to need the GPU → return `NEEDS_DECISION`; another session
   holds `$HOME/gpu.lock`.
 
+## Now
+
+**Peak RSS MET at 1.0022x (parity); prefill/decode/E2E `PENDING` a quiet host.**
+The x86_64 arm of `BACKEND-GATE-CPU-LLAMACPP` now exists where it did not
+before. Next: run the committed harness
+`docs/bench-evidence/cpu-x86-llamacpp-20260811-harness.sh` on an idle x86_64 box
+to close the three throughput axes, then CIQ `G5`.
+
 ## Outcome
 
-To be filled when the series completes.
+**What was measured.** Correctness first: at the 32 output tokens the speed
+recipe actually uses, our greedy continuation is byte-identical to llama.cpp's
+(SHA-256 `e92cf4cd…`) and our own output is reproducible across processes. Peak
+RSS is **2.8343 GiB against llama.cpp's 2.8281 GiB, ratio 1.0022x, parity**,
+over five and three legs with 0.018% and 0.004% spread. Prefill, decode and E2E
+are **`PENDING` a quiet host**: our single quiet-gated leg reads 42.39 / 5.99 /
+19.53 tok/s but no llama.cpp leg ever passed the gate, so no ratio exists and
+none was invented.
+
+**What was rejected and why.** A complete five-repetition interleaved series
+was thrown away rather than reported. A co-tenant build moved the one-minute
+load average from 3.80 to 82.48 mid-series and the resulting spreads were 78.6%
+to 248.2%; the ratios computable from it looked plausible and were meaningless.
+This is the concrete re-confirmation of the record's existing `VOID`-for-binding
+verdict on this box, and the reason the throughput axes are reported pending a
+resource rather than satisfied.
+
+**The near-tie was measured, not asserted.** At 64 output tokens the two engines
+diverge once, at token ~57. Rather than wave that through as "probably a tie",
+llama.cpp's own `--logit-bias` was bisected on the divergent token: the oracle
+holds ` Japan` at -0.07 and flips to ` South` at -0.08, so its own top-2 margin
+there is ~0.075 logits. The oracle was also checked for self-instability across
+4/8/16/20 threads and does not flip, so this is recorded as a cross-engine
+near-tie at a stated margin, not as oracle non-determinism.
+
+**Why the gap, and no ceiling is declared.** The x86 position is not the Arm
+position minus noise: `cpu_quant_dot.cpp:22` and `cpu_quant_repack.h:11` say in
+their own words that the quant dot is portable-tier only on x86 (`G5` open) and
+that the `G7` repacked layout has an i8mm-only consumer. The lever that crossed
+prefill parity on Arm therefore does not exist on this ISA. Next traceable
+hypothesis: CIQ **G5**, porting `ggml-cpu/arch/x86/quants.c` behind the existing
+`cpu_isa_x86` probe, plus an AVX-512 consumer for the already-portable
+`block_q8_0x4` layout.
+
+**Records reconciled.** Two cells were quoting superseded positions as current
+and are corrected here: `QUANT-GGUF` in the feature matrix still said the B4
+speed/RSS checkpoint was "pending" with "no direct compute-in-quant or llama.cpp
+speed parity", and `QUANT-GGUF-COMPUTE` in the quantization matrix still
+presented G4's 3.38x/8.20x/2.29x as the live position. Both now point at
+`BACKEND-GATE-CPU-LLAMACPP` as the single place that gate's position lives.
+
+**Out of scope and stated as such.** The Metal/MLX half of `ROAD-V1-D1`
+punch-list item 13 needs an Apple M4, which this host is not, and was not
+touched.

@@ -19405,3 +19405,25 @@ streams are byte-identical, so upstream's DSpark is lossless on that lane.
 
 Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
 `xengine_ours.log`, `xengine_pinned.log`.
+
+## Moved out of `docs/BENCHMARKS.md` 2026-08-11 to pay for the x86_64 CPU row (#433)
+
+Moved BYTE-FOR-BYTE, links and provenance intact, because
+`docs/BENCHMARKS.md` is a projection surface under a hard 45,000-character cap
+and had 241 characters of headroom. Nothing is deleted.
+
+The row was already marked SUPERSEDED in place by the BINDING row directly
+above it in the 35B concurrency table. It is quoted inside a fenced block so
+its bytes survive verbatim.
+
+A second candidate, the RPi5 `Assembly vs compiler SDOT` row, was NOT moved and
+stays in `docs/BENCHMARKS.md`: it carries a relative link that resolves from
+`docs/` and dangles from here, and rewriting the path would break the
+byte-for-byte guarantee this section exists to provide. The x86_64 row that
+this move pays for was shortened instead.
+
+From the Qwen3.6-35B-A3B concurrency table:
+
+```text
+| Ratio 2026-08-10, same SHA (SUPERSEDED) | 0.8384x | 0.9637x | 0.9545x | 0.9670x | not run | not run |
+```

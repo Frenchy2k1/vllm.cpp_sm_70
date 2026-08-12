@@ -69,7 +69,7 @@ are our reading of their documented behavior, not measurements.
 | Dense W4A16 MLP runs ONE merged `gate_up` Marlin GEMM (vLLM's `MergedColumnParallelLinear` topology) | ✅ `VT_DENSE_MARLIN_GATEUP`, **default ON** (opt out `=0`): the A/B measured +2.12% c1 / +1.70% c8 on the 27B, arms separated, tokens identical (#365). Replaces the split pair's 193 Marlin calls/step vs the oracle's 129 | ✅ | ☐ | ☐ |
 | NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |
 | NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA-gated on `nvidia`@`0893e160` (continuations byte-identical packed vs dequant, 235/235; RSS -1.70 GiB on CUDA, owed a re-measure; a no-fp4-GEMM backend keeps one bf16 operand too) | ✅ | ☐ | ☐ |
-| GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE took a bf16-activation regression in `b4f5610a`; found by bisect and fixed 2026-08-06) | ☐ | ☐ | ✅ |
+| GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE bf16-activation regression in `b4f5610a` fixed 2026-08-06). **CPU quant compute is ISA-tiered:** Arm has i8mm + repack, x86_64 portable-only (CIQ `G5`, #433) | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
