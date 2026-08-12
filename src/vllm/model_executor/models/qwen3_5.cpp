@@ -5519,6 +5519,36 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
       static_cast<int32_t*>(sorted_ids.t().data), static_cast<int32_t*>(expert_ids.t().data),
       static_cast<int32_t*>(num_pad.t().data));
 
+  // SPEC-DSPARK #442 diagnostic (VT_MOE_PAD_STATS=1, DEFAULT OFF, adds a D2H
+  // sync so it must never be on for a timing run). The Marlin MoE kernel loops
+  // div_ceil(num_tokens_past_padded, block) blocks PER LAUNCH, so two engines can
+  // launch it the same number of times and still do different amounts of work if
+  // their tokens route to different numbers of experts. Ours and upstream's token
+  // streams DIVERGE by a near-tie, so this is what decides whether the measured
+  // 8.2% kernel gap is an implementation defect or just a different token path.
+  static const bool pad_stats = [] {
+    const char* v = std::getenv("VT_MOE_PAD_STATS");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (pad_stats) {
+    int32_t npad = 0;
+    d.b.Copy(d.q, &npad, num_pad.t().data, sizeof(int32_t));
+    d.b.Synchronize(d.q);
+    static int64_t calls = 0, sum_pad = 0, sum_blocks = 0;
+    ++calls;
+    sum_pad += npad;
+    sum_blocks += (npad + block - 1) / block;
+    if (calls % 500 == 0)
+      std::fprintf(stderr,
+                   "[MOE-PAD] calls=%lld padded_tokens_total=%lld blocks_total=%lld "
+                   "avg_pad=%.1f avg_blocks=%.1f (block=%d T=%d topk=%d E=%d)\n",
+                   static_cast<long long>(calls), static_cast<long long>(sum_pad),
+                   static_cast<long long>(sum_blocks),
+                   static_cast<double>(sum_pad) / calls,
+                   static_cast<double>(sum_blocks) / calls, block, static_cast<int>(T),
+                   static_cast<int>(top_k), static_cast<int>(E));
+  }
+
   Tensor wd = MakeTensor(mr.w_down, DType::kI32, d.q.device, {E, I / 16, H * 2});
   Tensor sd = MakeTensor(mr.s_down, DType::kI8, d.q.device, {E, I / 16, H});
   Tensor gd = MakeTensor(mr.g_down, DType::kF32, d.q.device, {E});
