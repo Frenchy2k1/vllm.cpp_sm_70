@@ -735,9 +735,41 @@ void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_
     two_launch();
     return;
   }
+  // A bf16 D takes the two-launch arm UNCONDITIONALLY, and that is a correctness
+  // gate, not an oversight (PERF-FP8-ALPHA-FOLD / #417).
+  //
+  // This op's contract — and the whole byte-exactness argument in
+  // .agents/specs/perf-fp8-alpha-fold.md §Byte-exactness — is that the epilogue
+  // arm and the fallback arm compute the SAME thing, so VT_FP8_ALPHA_VEC_EPILOGUE
+  // is a pure performance A/B that can never move a token. At an f32 D that holds:
+  // `acc -> x1.0 -> store f32 -> load f32 -> xalpha -> store f32` and
+  // `acc -> xalpha -> store f32` are the same single IEEE f32 multiply, because
+  // x1.0 and the f32 round-trip are both exact.
+  //
+  // At a bf16 D it does NOT hold. The fallback rounds TWICE (store bf16, then
+  // multiply and store bf16 again) while the epilogue rounds ONCE (multiply, then
+  // store bf16), so the two arms would disagree by up to a ulp on a large
+  // fraction of words — the identical double-rounding defect that got the z-slice
+  // fallback REJECTED in this row's spec. Letting the toggle silently change
+  // values would turn a performance switch into a numerics switch.
+  //
+  // Nothing is lost today: all three cuBLASLt vector-alpha mechanisms are MEASURED
+  // unavailable on GB10/sm_121a (spec §Outcome), so the epilogue arm never
+  // executes at any dtype here. Note for whoever gets hardware that offers it —
+  // the single-rounding epilogue form is the MORE vLLM-faithful one (vLLM computes
+  // bf16(acc * alpha) with its requantized single scalar, modelopt.py:458), so
+  // lifting this gate is a deliberate, gated decision worth making, not a bug to
+  // fix in passing.
+  if (out.dtype != DType::kF32) {
+    two_launch();
+    return;
+  }
 
   const LtContext ctx = GetContext(q.device.index);
-  // out is f32 by the op's contract (the fallback's MulColVecF32 is f32-typed).
+  // f32 D by the gate directly above; the derivation matches the scalar-alpha
+  // GEMM's and is carried into key.out_type below. `out_type` is part of
+  // Fp8PlanKey's == AND its hash, so a bf16-D plan could never be handed back for
+  // an f32-D matmul in any case.
   const cudaDataType_t out_type = CUDA_R_32F;
   Fp8PlanKey key;
   key.device = q.device.index;

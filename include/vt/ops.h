@@ -1410,8 +1410,8 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
 
 // MatmulFp8CublasLtAlphaVec — the SAME fp8 GEMM with a per-output-COLUMN alpha:
 //   out[m,n] = alpha_vec[n] * (A_fp8[M,K] @ B_fp8[N,K]^T)[m,n]
-// `alpha_vec` is f32 [N], contiguous, on the queue device; `out` is f32 [M,N].
-// This is the form an N-CONCATENATED operand needs when its shards carry
+// `alpha_vec` is f32 [N], contiguous, on the queue device; `out` is f32 OR bf16
+// [M,N]. This is the form an N-CONCATENATED operand needs when its shards carry
 // different folded alphas (input_scale * that shard's weight_scale), which no
 // single host scalar can express. Mirrors the tensor-alpha overload the NVFP4
 // CUTLASS path already took (.agents/specs/nvfp4-device-alpha.md).
@@ -1423,6 +1423,19 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
 // with vt::MulColVecF32 — the two-launch form this seam shipped with, byte for
 // byte. Callers therefore never branch on the toggle or the driver's capability;
 // they express the per-column alpha ONCE, here. CUDA-only.
+//
+// A bf16 `out` (PERF-FP8-ALPHA-FOLD / #417) is what vLLM emits for this
+// projection (ModelOptFp8LinearMethod's out_dtype is the model dtype,
+// modelopt.py:458 @ the pin). It halves the bytes the column pass moves — the
+// dominant cost, since that pass is a full read-modify-write measured at 77% of
+// the device's peak bandwidth. It is NOT value-neutral: the GEMM's f32
+// accumulator is rounded to bf16 before the alpha multiply instead of after it,
+// so callers opt in rather than defaulting to it.
+//
+// A bf16 `out` always takes the TWO-LAUNCH arm regardless of the toggle. At bf16
+// the epilogue would round once where the fallback rounds twice, so admitting it
+// would make VT_FP8_ALPHA_VEC_EPILOGUE change VALUES rather than just speed; the
+// toggle is kept a pure performance A/B at every dtype.
 void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                                const Tensor& alpha_vec);
 
@@ -2791,9 +2804,9 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in);
 // value the bf16 output rounds to (mirror of the cutlass f32-output scratch cast).
 void CastF32(Queue& q, Tensor& out, const Tensor& in);
 
-// In-place per-output-column scale: x[m,n] *= col[n], with x an F32 [M,N]
-// (row-major, inner-contiguous rows; row stride may be padded) and col an F32
-// [N] contiguous broadcast vector. The load-time-free realization of a merged
+// In-place per-output-column scale: x[m,n] *= col[n], with x an F32 or BF16
+// [M,N] (row-major, inner-contiguous rows; row stride may be padded) and col an
+// F32 [N] contiguous broadcast vector. The load-time-free realization of a merged
 // per-tensor-fp8 projection's per-shard dequant: one fp8 GEMM over the
 // N-concatenated weight is run with alpha=1 (raw f32 accumulation), then this
 // applies each output column's folded scalar (= input_scale * that shard's
@@ -2801,6 +2814,14 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in);
 // GEMM's accumulation matches (the alpha multiply is the same IEEE f32 op cuBLASLt
 // would fold). CPU + CUDA. (Mirrors the fp4 merge's per-column block-scale
 // concatenation, qwen3_5.cpp ResidentNvfp4Qkv.)
+//
+// The MULTIPLY is f32 on both x dtypes, and `col` is always f32 — x's dtype is
+// the STORE width only. A bf16 x (PERF-FP8-ALPHA-FOLD / #417) halves the bytes
+// this read-modify-write moves, which is its whole cost: it is bandwidth-bound,
+// measured at 209.5 GB/s = 77% of the GB10's peak over the merged FP8 GDN
+// in_proj output. It also rounds the product, so the byte-identity above holds
+// only for the f32 arm; a bf16 x is the vLLM-faithful width (its fp8 linear
+// emits the model dtype) but is a real value change and is opt-in at the caller.
 void MulColVecF32(Queue& q, Tensor& x, const Tensor& col);
 
 // Splits the fused q/gate attention projection into its two halves. qgate is
