@@ -199,7 +199,7 @@ HTTP are not started.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| DSpark (semi-autoregressive block drafter) | ◐ **works on the 35B gate model** ([spec](../.agents/specs/dspark-spec-decode.md)): spec-on output token-identical to spec-off, 48/48, reproducible; speed ~2% behind spec-off, so no speed claim | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; sampling ON DEVICE (`VT_DSPARK_DEVICE_SAMPLE`). MoE 0.92-0.98x of the pinned graphed oracle, no speed claim | ✅ | ◐ |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
@@ -316,7 +316,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
-| Gemma4 MoE ROCm fused helpers + V1 sampler | Partial | `vt::fused_ops` seam; ROCm registers full V1 sample ops (temp/top-p/masks/penalties). Public: `VT_GEMMA4_EXPERT_VRAM_MB`, `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` |
+| Gemma4 MoE ROCm FP8 + SharedK-WMMA | Partial | Dual-GPU FP8 resident experts, SharedK-WMMA prefill (RDNA4); decode-graph and forward extract deferred. Env `VT_GEMMA4_*`/`VT_ATTN_*`, seam `test_gemma4_rocm_fp8_seams`. [spec](../.agents/specs/gemma4-rocm-fp8-moe.md) |
 
 ## How to read this page
 

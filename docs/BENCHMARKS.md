@@ -262,7 +262,7 @@ it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
 measured concurrent serving against llama.cpp's server.
 
-**x86_64 arm, first measured 2026-08-11 ([#433](https://github.com/mudler/vllm.cpp/issues/433)).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, PARITY**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
+**x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, PARITY**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 
 ## MLX-LM, Apple M4
 
@@ -337,7 +337,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | vs the **pinned, graphed** oracle: MoE **0.92-0.98x**, acceptance matches upstream (20.8% vs 20.4%); dense **0.35-0.94x**, upstream accepting **49.3%** to our 12.2% (issue #430) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | vs the **pinned, graphed** oracle: MoE **0.92-0.98x**; acceptance at parity on matched content (12.1% vs 11.1%). Dense 0.35x cell VOID. W7 device sampling: -11/-15% sample, +3% e2e on 35B, byte-identical (#436) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

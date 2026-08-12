@@ -27,7 +27,30 @@ void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M,
 void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,
                         const void* scale_bf16, int M, int N, int K, float alpha, float beta);
 
+// Device FP8 E4M3 + BF16 channel scale → BF16 weights [N,K] (prefill hipBLAS path).
+void DequantFp8ChannelBf16(Queue& q, void* out_bf16, const void* fp8, const void* scale_bf16,
+                           int N, int K);
+
 bool ExpertGeGLUBf16TopKM1(Queue& q, void* ysum, const void* x, const void* const* w_gu,
                            const void* const* w_dn, const float* wts, int G, int I, int H);
+
+// Fused FP8 expert GeGLU top-k (T=1). Uses hipBLASLt FP8 when available, else fast HIP.
+bool ExpertGeGLUFp8TopKM1(Queue& q, void* ysum, const void* x, const void* const* fp8_gu,
+                          const void* const* s_gu, const void* const* fp8_dn,
+                          const void* const* s_dn, const float* wts, int G, int I, int H);
+bool ExpertGeGLUFp8TopKIndexed(Queue& q, void* ysum, const void* x, const void* gu_base,
+                               const void* dn_base, const void* sgu_base, const void* sdn_base,
+                               const int32_t* idx_dev, const float* wts_dev, int G, int I, int H);
+void ApplyExpertScaleRw(Queue& q, float* rw_dev, const int32_t* ri_dev, const float* escale_dev,
+                        int G, int E);
+// Pre-alloc ExpertGeGLU scratch on `dev` (call after resident expert upload).
+bool PrewarmExpertGeGLUFp8TopK(int dev, int G, int I, int H);
+
+// Prefill MoE: GPU gather / weighted scatter (no host accumulation).
+void MoeGatherRows(Queue& q, void* out_bf16, const void* in_bf16, const int32_t* token_ids_dev,
+                   int n, int H);
+void MoeWeightedScatterAdd(Queue& q, void* acc_bf16, const void* y_bf16,
+                           const int32_t* token_ids_dev, const float* weights_dev, int n, int H);
+void MoeZeroBf16(Queue& q, void* buf_bf16, int64_t nelem);
 
 }  // namespace vt
