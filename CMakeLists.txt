@@ -9,7 +9,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(InSourceGuard)
 vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
-project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
+project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)
 
 # Native Windows release ABI: the core and every consumer use the static
 # MSVC/UCRT runtime (/MT in Release, /MTd in Debug), so the installed server

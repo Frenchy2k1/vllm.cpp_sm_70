@@ -2,8 +2,8 @@
 
 Status: accepted contract with required W1-W11/W13 implementation complete for
 `ENG-RELEASE-BINARIES` in the single delivery PR #196. The release row remains
-`ACTIVE`: local gates are green, while the hosted eight-tuple dry run,
-matching-hardware evidence, and tagged publication are still pending. W12 is
+`ACTIVE`: v0.0.2 published all eight primary tuples, while matching-hardware
+evidence and the native Windows v0.0.3-pre.1 extension remain pending. W12 is
 optional/non-primary.
 
 Pins: vLLM parity source `555967922`; vllm.cpp spike baseline `f13c49ee`;
@@ -36,7 +36,11 @@ per_sm_cuda=optional-non-primary
 primary_cpu_artifact=one-adaptive-binary-per-os-host-abi
 x86_64_baseline=portable-sse2-without-avx2
 work_W12_policy=optional-non-blocking
-archive_claims=pending
+archive_claims=published-v0.0.2
+published_tag=v0.0.2
+published_sha=7020de93652ca920424a10ac5255b34810dd2f24
+published_run=31466516224
+published_asset_count=26
 runtime_claims=pending
 metal_channel=stable-after-runtime-gate
 mlx_channel=preview
@@ -599,14 +603,17 @@ hybrid stable/preview channel. Literal-static scope is limited to the
 experimental musl CPU lane. ROCm is blocked. Primary downloads are adaptive CPU
 or fat CUDA per OS+host ABI; per-SM CUDA archives are optional diagnostics. The
 Required W1-W11/W13 are implemented and the row is `ACTIVE`, not `DONE`. Local
-archive, CPU, Vulkan, workflow, and mutation gates are green. The hosted
-eight-tuple dry run, matching-hardware evidence, and tagged publication remain
-pending, so no published archive or release-channel advancement is claimed.
-W12 remains the optional non-primary diagnostic lane.
+archive, CPU, Vulkan, workflow, and mutation gates are green. The v0.0.2 tag
+workflow published the eight archive/checksum/provenance triplets and two
+generated indexes (26 assets) from
+`7020de93652ca920424a10ac5255b34810dd2f24` in run `31466516224`.
+Matching-hardware evidence and the Windows v0.0.3-pre.1 extension remain
+pending. W12 remains the optional non-primary diagnostic lane.
 
 ## Now
 
-**ACTIVE; required W1-W11/W13 implemented in #196.** Next: finish the hosted
-ten-SM proof, rebase and push, and run the full eight-tuple dry run. Hosted
-ten-SM completion, matching-hardware gates and tagged publication remain pending;
-no binaries are published.
+**ACTIVE; required W1-W11/W13 implemented and v0.0.2 published.** The eight
+primary archives and their sidecars/indexes are live from SHA
+`7020de93652ca920424a10ac5255b34810dd2f24` (run `31466516224`, 26 assets).
+Matching-hardware evidence and the Windows v0.0.3-pre.1 extension remain
+pending.

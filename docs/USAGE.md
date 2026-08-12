@@ -708,12 +708,15 @@ manual entry point:
 gh workflow run release.yml --ref main
 ```
 
-Manual runs are always dry runs. Publication additionally requires an exact
-`v<project-version>` tag, a release matrix whose required lanes are all marked
+Manual runs are always dry runs. Publication additionally requires the exact
+tag declared in `release/release-version.json` (currently
+`v0.0.3-pre.1`), a release matrix whose required lanes are all marked
 ready, successful verification and attestation jobs, and approval of the
 protected `release` environment. Build and verification jobs have read-only
 repository permissions; only attestation receives OIDC authority, and only the
-final protected job receives `contents: write`.
+final protected job receives `contents: write`. The current declaration is a
+prerelease; the publisher must pass GitHub's prerelease flag and a manual dry
+run cannot publish.
 
 Any OpenAI client works by pointing its `base_url` at it:
 

@@ -60,11 +60,11 @@ ANCHORS = {
     # made that file a surface every PR had to keep current. The row's live
     # position now lives in the row's OWN spec under `## Now` -- one writer, and
     # the same place check-doc-checkpoint.py requires it.
-    ".agents/specs/release-binary-matrix.md": "**ACTIVE; required W1-W11/W13 implemented in #196.**",
+    ".agents/specs/release-binary-matrix.md": "**ACTIVE; required W1-W11/W13 implemented and v0.0.2 published.**",
     ".agents/coordination.md": "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": "# W6 installed server package green",
-    "docs/STATUS.md": "#196 binary pipeline implemented; no published binaries",
-    "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** |",
+    "docs/STATUS.md": "v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
+    "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; v0.0.2 published, Windows pre-alpha pending)** |",
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
@@ -76,20 +76,20 @@ LIFECYCLE_RECORD_MUTATIONS = (
     ),
     (
         ".agents/engine-matrix.md",
-        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, and tagged publication remain pending",
-        "hosted ten-SM completion, full eight-tuple dry run, matching-hardware gates, and tagged publication are complete",
+        "v0.0.2 published eight archive/checksum/provenance triplets plus two indexes",
+        "v0.0.2 publication is pending",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "`ACTIVE` | Required W1-W11/W13 implementation is complete",
-        "`DONE` | Required W1-W11/W13 implementation is complete",
+        "`ACTIVE` | v0.0.2 published eight primary archive/checksum/provenance triplets",
+        "`DONE` | v0.0.2 published eight primary archive/checksum/provenance triplets",
         "roadmap release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "no published binary exists",
-        "published binaries exist",
+        "Windows W14-W16 are implemented for one PR",
+        "Windows v0.0.3-pre.1 is published",
         "roadmap release lifecycle",
     ),
     (
@@ -119,12 +119,12 @@ LIFECYCLE_RECORD_MUTATIONS = (
 )
 
 BENCHMARKS_RELEASE_ROW = (
-    "| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | "
-    "Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |"
+    "| **Binary release matrix (ACTIVE; v0.0.2 published, Windows pre-alpha pending)** | Eight published CPU/CUDA/Vulkan/Metal/MLX tuples; two Windows preview tuples implemented | "
+    "v0.0.2: SHA `7020de93652ca920424a10ac5255b34810dd2f24`, run `31466516224`, 26 assets. **PENDING:** native Windows runtime/ISA evidence, matching hardware, ten-tuple dry run, v0.0.3-pre.1 publish/audit | n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
-    "Subset; #196 binary pipeline implemented; no published binaries",
+    "Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
 )
 
 BACKEND_POLICY_PROSE = {
@@ -278,14 +278,14 @@ WORK_CONTENT = {
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** hosted full matrix, matching hardware, tagged publish",
-        "**SHIPPED:** archive, runtime, correctness, and performance evidence complete",
+        "**PENDING:** native Windows runtime/ISA evidence, matching hardware, ten-tuple dry run, v0.0.3-pre.1 publish/audit",
+        "**SHIPPED:** Windows v0.0.3-pre.1 runtime, artifacts, and audit complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
         "docs/STATUS.md",
-        "Subset; #196 binary pipeline implemented; no published binaries",
-        "Supported; #196: RELEASE DONE/ARTIFACTS✓",
+        "Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
+        "Supported; Windows v0.0.3-pre.1 published",
         "docs/STATUS.md release row",
     ),
 )
@@ -410,7 +410,11 @@ TEST_LITERAL_INVENTORIES = {
         "work_W5_status": "implemented",
         "work_W6_status": "implemented",
         "work_W12_policy": "optional-non-blocking",
-        "archive_claims": "pending",
+        "archive_claims": "published-v0.0.2",
+        "published_tag": "v0.0.2",
+        "published_sha": "7020de93652ca920424a10ac5255b34810dd2f24",
+        "published_run": "31466516224",
+        "published_asset_count": "26",
         "runtime_claims": "pending",
         "metal_channel": "stable-after-runtime-gate",
         "mlx_channel": "preview",
@@ -584,7 +588,11 @@ EXACT_MACHINE_FIELDS = {
     "work_W5_status": "implemented",
     "work_W6_status": "implemented",
     "work_W12_policy": "optional-non-blocking",
-    "archive_claims": "pending",
+    "archive_claims": "published-v0.0.2",
+    "published_tag": "v0.0.2",
+    "published_sha": "7020de93652ca920424a10ac5255b34810dd2f24",
+    "published_run": "31466516224",
+    "published_asset_count": "26",
     "runtime_claims": "pending",
     "metal_channel": "stable-after-runtime-gate",
     "mlx_channel": "preview",
@@ -1022,11 +1030,11 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
     if engine is not None and (
         engine[7] != "`ACTIVE`"
         or "Required W1-W11/W13 implementation is complete" not in engine[4]
-        or "hosted ten-SM completion, full eight-tuple dry run" not in engine[5]
-        or "tagged publication remain pending" not in engine[5]
+        or "v0.0.2 published eight archive/checksum/provenance triplets" not in engine[5]
+        or "Windows v0.0.3-pre.1 extension remain pending" not in engine[5]
     ):
         errors.append(
-            "engine-matrix release lifecycle must be ACTIVE with required implementation complete and hosted publication pending"
+            "engine-matrix release lifecycle must keep v0.0.2 published and the Windows prerelease pending"
         )
 
     roadmap = _table_record(
@@ -1039,12 +1047,12 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
     )
     if roadmap is not None and (
         roadmap[5] != "`ACTIVE`"
-        or "Required W1-W11/W13 implementation is complete" not in roadmap[6]
-        or "full eight-tuple dry run" not in roadmap[6]
-        or "no published binary exists" not in roadmap[6]
+        or "v0.0.2 published eight primary archive/checksum/provenance triplets" not in roadmap[6]
+        or "Windows W14-W16 are implemented for one PR" not in roadmap[6]
+        or "publication and 32-asset audit remain pending" not in roadmap[6]
     ):
         errors.append(
-            "roadmap release lifecycle must be ACTIVE with required implementation complete and hosted publication pending"
+            "roadmap release lifecycle must keep v0.0.2 published and Windows hosted publication pending"
         )
 
     coordination = _table_record(
@@ -1359,8 +1367,8 @@ def contract_errors(root: Path) -> list[str]:
         encoding="utf-8"
     ):
         errors.append(
-            "docs/BENCHMARKS.md release row must keep hosted validation and "
-            "publication pending"
+            "docs/BENCHMARKS.md release row must keep v0.0.2 published and "
+            "Windows validation/publication pending"
         )
     status = root / "docs/STATUS.md"
     status_text = status.read_text(encoding="utf-8") if status.is_file() else ""
@@ -1370,7 +1378,7 @@ def contract_errors(root: Path) -> list[str]:
     )
     if not all(fragment in status_row for fragment in STATUS_RELEASE_FRAGMENTS):
         errors.append(
-            "docs/STATUS.md release row must keep the binary pipeline unpublished"
+            "docs/STATUS.md release row must keep v0.0.2 published and Windows pending"
         )
     preflight = root / PREFLIGHT_PATH
     ci = root / CI_PATH
