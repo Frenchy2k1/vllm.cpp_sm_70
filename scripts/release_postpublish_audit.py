@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
@@ -12,6 +13,15 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+_INDEX_SPEC = importlib.util.spec_from_file_location(
+    "vllm_release_index", Path(__file__).with_name("release_index.py")
+)
+if _INDEX_SPEC is None or _INDEX_SPEC.loader is None:
+    raise RuntimeError("cannot load the canonical release index generator")
+release_index_tool = importlib.util.module_from_spec(_INDEX_SPEC)
+_INDEX_SPEC.loader.exec_module(release_index_tool)
 
 
 REQUIRED_RELEASE_JOBS = (
@@ -34,6 +44,15 @@ def digest(data: bytes) -> str:
 
 
 def expected_names(matrix: dict[str, Any], version: str) -> tuple[set[str], set[str]]:
+    if set(matrix) != {"artifacts", "release_ready", "retention", "schema"} or (
+        matrix.get("schema") != "vllm.cpp.release-matrix.v1"
+        or matrix.get("release_ready") is not True
+        or matrix.get("retention") != {
+            "ci_artifacts_days": 7,
+            "github_release": "maintainer-deletion-only",
+        }
+    ):
+        raise ValueError("audit requires the exact authoritative release matrix")
     artifacts = matrix.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) != 10:
         raise ValueError("audit requires the canonical ten-artifact matrix")
@@ -41,7 +60,12 @@ def expected_names(matrix: dict[str, Any], version: str) -> tuple[set[str], set[
     names = {"release-index.json", "RELEASE_INDEX.md"}
     ids: set[str] = set()
     for item in artifacts:
-        if not isinstance(item, dict) or item.get("required") is not True:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"archive_format", "channel", "id", "required"}
+            or item.get("required") is not True
+            or not isinstance(item.get("channel"), str)
+        ):
             raise ValueError("every audited artifact must be required")
         artifact_id = item.get("id")
         archive_format = item.get("archive_format")
@@ -54,6 +78,59 @@ def expected_names(matrix: dict[str, Any], version: str) -> tuple[set[str], set[
     if len(names) != 32:
         raise ValueError("audited release must have exactly 32 canonical assets")
     return names, archives
+
+
+def _canonical_index_bytes(
+    remote_bytes: dict[str, bytes], matrix: dict[str, Any], declaration: dict[str, Any],
+    source_sha: str,
+) -> tuple[bytes, bytes]:
+    """Regenerate both indexes from authenticated downloaded triplet bytes."""
+    with tempfile.TemporaryDirectory(prefix="vllm-release-index-audit-") as temporary:
+        root = Path(temporary)
+        assets = root / "assets"
+        assets.mkdir()
+        files: list[dict[str, Any]] = []
+        for item in matrix["artifacts"]:
+            archive = canonical_archive_name(
+                declaration["version"], item["id"], item["archive_format"]
+            )
+            for name in (archive, archive + ".sha256", archive + ".provenance.json"):
+                data = remote_bytes[name]
+                (assets / name).write_bytes(data)
+                files.append({
+                    "artifact_id": item["id"],
+                    "name": name,
+                    "sha256": digest(data),
+                    "size": len(data),
+                })
+        handoff = {
+            "artifacts": matrix["artifacts"],
+            "files": files,
+            "prerelease": declaration["prerelease"],
+            "project_version": declaration["project_version"],
+            "release_tag": declaration["tag"],
+            "retention": matrix["retention"],
+            "source_sha": source_sha,
+            "verified": True,
+            "version": declaration["version"],
+        }
+        json_output = root / "release-index.json"
+        markdown_output = root / "RELEASE_INDEX.md"
+        try:
+            release_index_tool.generate_index(
+                assets, handoff, json_output, markdown_output,
+                matrix["retention"]["ci_artifacts_days"],
+            )
+        except (
+            OSError,
+            KeyError,
+            json.JSONDecodeError,
+            release_index_tool.tarfile.TarError,
+            release_index_tool.zipfile.BadZipFile,
+            ValueError,
+        ) as exc:
+            raise ValueError(f"downloaded release triplets cannot regenerate indexes: {exc}") from exc
+        return json_output.read_bytes(), markdown_output.read_bytes()
 
 
 def _single_subject(provenance: Any, archive: str, expected_digest: str) -> None:
@@ -78,8 +155,9 @@ def validate_remote_release(
     version = declaration.get("version")
     project_version = declaration.get("project_version")
     tag = declaration.get("tag")
-    if (
-        version != "0.0.3-pre.1" or project_version != "0.0.3"
+    if set(declaration) != {"prerelease", "project_version", "schema", "tag", "version"} or (
+        declaration.get("schema") != "vllm.cpp.release-version.v1"
+        or version != "0.0.3-pre.1" or project_version != "0.0.3"
         or tag != "v0.0.3-pre.1" or declaration.get("prerelease") is not True
     ):
         raise ValueError("audit release identity must be the authorized pre-alpha")
@@ -129,26 +207,7 @@ def validate_remote_release(
         if row.get("size") != len(data) or api_digest != "sha256:" + digest(data):
             raise ValueError(f"GitHub API digest/size disagrees with downloaded bytes: {name}")
 
-    index = json.loads(remote_bytes["release-index.json"])
-    if (
-        index.get("schema") != "vllm.cpp.release-index.v1"
-        or index.get("release_tag") != tag or index.get("version") != version
-        or index.get("project_version") != project_version
-        or index.get("prerelease") is not True
-        or index.get("source_sha") != source_sha
-    ):
-        raise ValueError("downloaded release index identity is invalid")
-    rows = index.get("artifacts")
-    if not isinstance(rows, list) or len(rows) != 10:
-        raise ValueError("downloaded release index must contain ten artifacts")
-    indexed: set[str] = set()
-    markdown = remote_bytes["RELEASE_INDEX.md"].decode("utf-8")
-    if tag not in markdown or source_sha not in markdown:
-        raise ValueError("downloaded Markdown index has the wrong release identity")
-    for row in rows:
-        archive = row.get("archive") if isinstance(row, dict) else None
-        if not isinstance(archive, str) or archive not in archives or archive in indexed:
-            raise ValueError("downloaded release index has an invalid archive inventory")
+    for archive in archives:
         archive_digest = digest(remote_bytes[archive])
         checksum_name = archive + ".sha256"
         provenance_name = archive + ".provenance.json"
@@ -156,13 +215,6 @@ def validate_remote_release(
         if checksum != [archive_digest, archive]:
             raise ValueError(f"checksum sidecar does not match downloaded {archive}")
         _single_subject(json.loads(remote_bytes[provenance_name]), archive, archive_digest)
-        if (
-            row.get("sha256") != archive_digest or row.get("size") != len(remote_bytes[archive])
-            or row.get("checksum") != checksum_name
-            or row.get("provenance") != provenance_name
-            or archive not in markdown
-        ):
-            raise ValueError(f"release indexes disagree with downloaded {archive}")
         proofs = attestations.get(archive)
         expected_proof = {
             "digest": archive_digest, "repository": repo, "source_sha": source_sha,
@@ -170,8 +222,14 @@ def validate_remote_release(
         }
         if proofs != [expected_proof]:
             raise ValueError(f"{archive} must have exactly one valid bound attestation")
-        indexed.add(archive)
-    if indexed != archives or set(attestations) != archives:
+    expected_json, expected_markdown = _canonical_index_bytes(
+        remote_bytes, matrix, declaration, source_sha
+    )
+    if remote_bytes["release-index.json"] != expected_json:
+        raise ValueError("downloaded JSON release index is not exact canonical output")
+    if remote_bytes["RELEASE_INDEX.md"] != expected_markdown:
+        raise ValueError("downloaded Markdown release index is not exact canonical output")
+    if set(attestations) != archives:
         raise ValueError("indexes or attestations omit a canonical archive")
     return {"archive_count": len(archives), "asset_count": len(names), "run_id": run_id}
 

@@ -118,6 +118,14 @@ class ReleaseIndexContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.tool.generate_index(assets, handoff, root / "i.json", root / "i.md")
 
+    def test_manifest_channel_must_match_authoritative_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets, handoff = self.assets(root)
+            handoff["artifacts"][0]["channel"] = "stable"
+            with self.assertRaises(ValueError):
+                self.tool.generate_index(assets, handoff, root / "i.json", root / "i.md")
+
 
 if __name__ == "__main__":
     unittest.main()
