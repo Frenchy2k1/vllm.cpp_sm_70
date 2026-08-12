@@ -1278,8 +1278,21 @@ no FA-2 instantiation, and their op call does not change.
 
 ### 17.3 Gates (what must hold before this ships)
 
-1. `test_voxtral_e2e` PASS on dgx GB10 sm_121a, clean CUTLASS+FA2+Triton build, with
-   teacher-force `result=PASS` / `divergent=0` — the binding kernel-independent check.
+1. `test_voxtral_e2e` PASS on dgx GB10 sm_121a, clean CUTLASS+FA2+Triton build.
+   **Corrected 2026-08-12 (review finding F7).** This gate does NOT teacher-force
+   in-process, and the original wording ("teacher-force `result=PASS` / `divergent=0`")
+   read as though it did. The teacher-force runs OFFLINE in
+   `scripts/mm/a3_voxtral_neartie_gate.py` against the live oracle and its verdict is
+   COMMITTED to `voxtral_neartie.json`; the test reads `result` / `n_divergent` /
+   `over_band_failures` / `worst_gap_nats` straight out of that file, so those four are
+   **fixture provenance, constant with respect to the run's output** — which is why the
+   FA-2 arm prints `divergent=0 worst_gap_nats=0` while FAILING. The checks that
+   actually discriminate on our tokens are `got.size() == 48`, `strict_prefix >= 18`,
+   and `repro == 48`. `repro` is what carries the distributional verdict into the
+   build: it asserts our tokens ARE, position for position, the sequence the offline
+   teacher-force validated. The fixture assertions are kept — they stop a regenerated
+   near-tie file that no longer PASSES from slipping in under `repro` — but they are
+   now labelled as provenance in the source, not as "BINDING CORRECTNESS".
 2. Proof-of-run: nsys shows the FA-2 kernel with 32 instances (= 32 encoder layers) and
    ZERO `AttentionDenseFlashKernel` / `AttentionWarpKernel` on the encoder path.
 3. RED: corrupt the kernel → gate fails; restore → passes.
@@ -1320,11 +1333,42 @@ below was taken inside ONE lock window and can never have interleaved with anoth
 Throwaway `VT_ENC_REPS` `steady_clock` instrumentation around the encoder forward (NOT
 committed; the same shape §15 used), 6 reps per arm, cold rep0 discarded:
 
-| Arm | Encoder forward (reps 1-5) | vs default | vs vLLM 0.25.0 TTFT 42.8 ms |
-|---|---|---|---|
-| warp `AttentionDenseFast` (§13) | 844.8 ms (843.6-847.6) | 0.87x | ~19.7x |
-| flash-tiled `AttentionDenseFlash` (§14/§15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **~17.1x** |
-| **FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`)** | **133.0 ms** (131.6-137.9) | **5.50x faster** | **~3.11x** |
+**RATIO LABELLING — corrected 2026-08-12 (review finding F3).** The right-hand column
+is **our ENCODER FORWARD against vLLM's whole TTFT**. It is NOT a TTFT ratio and was
+originally published as one. Our numerator is `WhisperAudioEncoderForward` alone; the
+denominator is vLLM's encode + 388-token prefill + first sampled token. Our projector,
+merge and prefill are still UNMEASURED (§2.3 says so). At ~17x the omission was inside
+the noise of the claim; at ~2.9x it is not — a fair TTFT ratio needs our projector +
+merge + prefill measured, exactly as §2.1 does for the 27B image path with a separate
+LLM-prefill row. Until that measurement exists the column keeps this label.
+
+| Arm | Encoder forward (reps 1-5) | vs default | Enc. fwd vs vLLM TTFT (pin, 46.02 ms) | (vs 0.25.0, 42.8 ms) |
+|---|---|---|---|---|
+| warp `AttentionDenseFast` (§13) | 844.8 ms (843.6-847.6) | 0.87x | 18.36x | ~19.7x |
+| flash-tiled `AttentionDenseFlash` (§14/§15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **15.90x** | ~17.1x |
+| **FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`)** | **133.0 ms** (131.6-137.9) | **5.50x faster** | **2.89x** | ~3.11x |
+
+**DENOMINATOR — now the PIN, measured, not carried forward (2026-08-12).** §17.5 as
+originally written reused §15.4's vLLM 0.25.0 figure of 42.8 ms and listed "the vLLM
+denominator is carried forward, not re-measured" as an open item. The review closed it:
+the pinned oracle (`555967922`) was run on the identical clip in its production/graphed
+configuration, 6 reps with rep0 dropped, giving **TTFT median 46.02 ms (45.60-46.41)**.
+The bands are disjoint from 42.8 ms — the pin is 7.5% SLOWER than the 0.25.0 stage
+build. So the previously published ratios were **conservative**: against the oracle the
+developer actually requires, the default arm is 15.90x rather than ~17.1x and the FA-2
+arm 2.89x rather than ~3.11x. Both columns are kept above so the 0.25.0-era rows in
+§13-§15 remain comparable, but **the pin column is the binding one**.
+
+Two oracle facts worth pinning down, because each looks like a blocker and is not:
+- The pin venv reports version string `0.23.1rc1.dev1511+g555967922`. That is a
+  `setuptools_scm` nearest-ancestor-tag artefact, **not** an identity mismatch — HEAD is
+  `5559679229bc`, which IS the pin. Assert the oracle **by commit**, never by version
+  string. (This corrects the caveat the §17.5 pass added to `.agents/environment.md`,
+  which read the string as suspicious.)
+- The pin could not tokenize Voxtral at all until **`soundfile==0.14.0`** was installed
+  into `~/venvs/vllm-oracle-next`. That single package is what makes the pin gateable
+  for this vehicle; recorded here and against **#375**, which tracks the oracle symlink
+  still pointing at the 0.25.0 rollback.
 
 Bands are non-overlapping by a wide margin. **Proof-of-run** — nsys
 `cuda_gpu_kern_sum --cuda-graph-trace=node`, SAME tool on both arms, same workload:
@@ -1364,17 +1408,59 @@ vLLM's own argmax. FA-2 gives up three of those (gaps 0.125, 0.125, 0.0625). Tha
 correctness step down, not a tie flip, and it is the difference between this and §12:
 §12's adopted FA-2 *decode* kernel kept divergent=0 / gap 0.0 while getting faster.
 
-**ROOT CAUSE, grounded — this is inherent, not a launcher bug.** FA-2 converts the
-softmax probabilities out of its f32 accumulator into bf16 before the PV MMA
+**MECHANISM — a HYPOTHESIS, and the leading candidate has been REFUTED.**
+
+This paragraph originally asserted a root cause as established fact: that the three
+divergent positions come from FA-2 converting the softmax probabilities out of its f32
+accumulator into bf16 before the PV MMA
 (`src/vt/cuda/flash_attn/src/flash_fwd_kernel.h:347`
-`Tensor rP = convert_type<Element>(acc_s)`), because that operand feeds a tensor-core
-`mma.sync`. Our scalar kernel keeps them in f32 (`cuda_ops.cu`: `const float p =
-expf(s - m_new)` then `acc[k] += p * Load(sV, ...)`). FA-2 is therefore **lower
-precision here by construction**, and buys ~116x for it. Note the direction this rules
-out: a *faithful* port of the kernel vLLM itself runs should have moved us CLOSER to
-vLLM's tokens, not further — it moved further because our encoder's other stages
-(conv/LayerNorm/GEMM) differ from vLLM's too, and the scalar kernel's higher-precision
-softmax happened to compensate.
+`Tensor rP = convert_type<Element>(acc_s)`), where our scalar kernel keeps them in f32
+(`cuda_ops.cu`: `const float p = expf(s - m_new)` then `acc[k] += p * Load(sV, ...)`).
+Eight surfaces repeated it. **The review's mutation M4 refutes it** (2026-08-12):
+
+> **M4 (NEGATIVE RESULT, recorded).** Round `p` to bf16 and back inside the SHIPPING
+> scalar kernel — precisely and only the precision loss the claim names — clean
+> rebuild, default arm re-run. Token md5 came back `89923566…`, **UNCHANGED**. The
+> named conversion cannot move a single token on this clip, so it cannot account for
+> three flips.
+
+The two paths differ in **five** ways, and only one of them is a precision loss:
+
+| # | Difference | Where |
+|---|---|---|
+| i | QK^T reduction reassociated by `mma.sync` | `flash_fwd_kernel.h` GEMM over `acc_s` |
+| ii | `exp2f(s·scale_log2 − m·scale_log2)` vs our `expf(s·scale − m)` | `softmax.h:86,118` |
+| iii | the online-max rescale also in `exp2f` | `softmax.h:157` |
+| iv | P converted to bf16 before the PV MMA — **the refuted candidate** | `flash_fwd_kernel.h:347` |
+| v | PV accumulation reassociated by `mma.sync` | `flash_fwd_kernel.h` GEMM over `acc_o` |
+
+(i), (ii)+(iii) and (v) are all untested, and (ii)/(iii) are a *reformulation* rather
+than a widening or narrowing — a base-2 exponential on a pre-scaled score, which
+changes rounding without changing precision class. Naming which of the five is
+responsible needs the same M4 treatment applied one at a time, and until that is done
+the honest statement is: **the mechanism is not established.** What IS established is
+that the divergence is real, reproducible, inside the ratified band, and not a launcher
+bug — the op now has unit tests (§17.10) proving the launcher attends the full key
+range and refuses every shape it cannot serve.
+
+**On "the scalar kernel's higher-precision softmax happened to compensate" — deleted,
+it was not measured, and the measurement refutes it** (review finding F6). Against the
+pin, per-stage taps:
+
+| Tap | default (flash-tiled) | FA-2 | delta |
+|---|---|---|---|
+| `encoder_out` rel-L2 vs vLLM | **8.685%** | **9.053%** | +0.368 pt |
+| `audio_embeds` rel-L2 vs vLLM | **10.933%** | **11.164%** | +0.231 pt |
+
+The first column is not news: `audio-track.md:279` already records the encoder at 8.7%
+(per-stage taps at `:178-181`), the ~0.28%/layer bf16 envelope compounded over 32
+layers, and it is dominated by our conv/LayerNorm/GEMM stages, not by attention. What
+the second column shows is that swapping the attention kernel perturbs that divergence
+by **0.37 points on a number that is ~96% everything else**. There is no meaningful
+compensation to speak of. Three tokens flip because the sequence passes through
+near-ties at pos 12 and after, where a 0.37-point perturbation of an already-8.7%
+divergence is more than enough to take the other branch — not because one stage was
+holding the others up.
 
 #### DISPOSITION — lands OPT-IN, adoption is a DEVELOPER decision
 
@@ -1385,21 +1471,35 @@ adopting a default that turns 0 divergences into 3 is exactly that trade — so 
 the developer with both numbers, precisely the shape §11 used before §12's approval.
 **What approval would buy: audio TTFT 17.1x -> 3.11x, the last mm axis below floor.**
 
-#### NOT a ceiling — the ranked next hypotheses
+#### NOT a ceiling — the ranked next hypotheses (RE-RANKED 2026-08-12 after M4)
 
-1. **Keep the tensor cores AND the precision.** The 0.125-nat gaps come from one
-   conversion. An f32-P variant is not reachable in FA-2's `mma.sync` operand layout,
-   but the FA-3-style two-stage rescale, or splitting the PV accumulation so the
-   correction term stays f32, is a real port target. This is the hypothesis that would
-   make the adoption question disappear rather than answering it.
-2. **The remaining 133 ms is no longer attention** — 5.33 ms of the 133 ms is the
+The original ranking put "the gaps come from ONE conversion; an FA-3-style f32-correction
+rescale would remove the trade" at #1. **M4 refuted its premise**, so it drops to #4 and
+the list is reordered by what is now traceable.
+
+1. **The remaining 133 ms is no longer attention** — 5.33 ms of the 133 ms is the
    attention kernel now, so the encoder is dominated by the conv GEMMs and the
    `whisper_audio.cpp:205-216` device->host->device im2col bounce. That is the §15.1
-   deferred device-im2col kernel, and it is now the top encoder lever by a wide margin.
-3. **The vLLM denominator is carried forward, not re-measured** (42.8 ms, §2.3) — as
-   §14.4 and §15.4 also did, to avoid a big oracle alongside the tree on a contended
-   unified-memory box. The ratio moved so far that the exact denominator does not change
-   any verdict, but a fresh capture is owed before this axis is ever called closed.
+   deferred device-im2col kernel, and it is the top encoder lever by a wide margin. It
+   is also unaffected by the correctness question, since the default arm gets it too.
+2. **Measure our ACTUAL audio TTFT** (finding F3). Our projector + merge + prefill are
+   unmeasured, so the closest thing to a TTFT ratio we can publish is
+   encoder-forward-vs-TTFT. Instrumenting the remaining stages the way §2.1 does for
+   27B image is small, and it is a precondition for ever calling this axis closed.
+3. **Isolate WHICH of the five differences flips the three tokens** (§17.5 table i-v),
+   one M4-style single-difference mutation at a time in the scalar kernel: reassociated
+   QK^T, `exp2f` softmax formulation, `exp2f` online rescale, bf16 P (already refuted),
+   reassociated PV. This is what turns "not established" into a named cause, and it is
+   cheap — each arm is one edit and one gate run.
+4. **Keep the tensor cores AND the precision.** An f32-P variant is not reachable in
+   FA-2's `mma.sync` operand layout, but the FA-3-style two-stage rescale, or splitting
+   the PV accumulation so the correction term stays f32, remains a real port target.
+   Demoted from #1: with M4 refuting the single-conversion premise, there is no longer
+   any evidence that it would remove the trade rather than merely perturb it again.
+   Do #3 before spending on this.
+5. ~~The vLLM denominator is carried forward, not re-measured~~ — **CLOSED 2026-08-12.**
+   The pin was measured on the identical clip: TTFT median 46.02 ms, and the ratios
+   above are restated against it.
 
 #### 17.6 Final verification ON THE SHIPPING TREE (default reversed, same box, one lock window)
 
@@ -1422,8 +1522,19 @@ kernel is reachable, memory-clean, and fully characterized behind one env knob.
 Recorded because each cost a run and each returns exit 0 while proving nothing:
 - **`test_voxtral_e2e` SKIPS without `VLLM_VOXTRAL_SAFETENSORS`** and still reports
   `Status: SUCCESS` with 0 assertions. The first gate script omitted it; the result would
-  have read as a clean pass of a test that never loaded a model. Every gate script here
-  now greps its own log for `SKIP`.
+  have read as a clean pass of a test that never loaded a model.
+  **FIXED 2026-08-12, issue [#463](https://github.com/mudler/vllm.cpp/issues/463)
+  (review finding F1).** The original disposition — "every gate script here now greps
+  its own log for `SKIP`" — was a convention living outside the tree; it binds nobody,
+  cannot be enforced, and AGENTS.md requires a bug found in flow to get an issue AND be
+  fixed in the same flow. The tree fix: `test_voxtral_e2e` now skips through
+  `SkipGate()`, which prints a loud stderr banner and `std::exit(77)`, and
+  `vllm_cpp_add_test` sets `SKIP_RETURN_CODE 77` on every test, so CTest reports such a
+  run **Skipped** rather than Passed and a `&&` chain stops on the non-zero status. The
+  property is inert for any test that never returns 77. #463 also inventories the ~40
+  other early-return skips in `tests/` that share the shape; converting them is a
+  separate pass because several are SACRED-adjacent model gates whose scripts currently
+  depend on exit 0 from a skip.
 - **The 0.25.0 oracle needs `CC` as well as `ninja` on PATH** in a non-login shell, or
   Triton's JIT dies `RuntimeError: Failed to find C compiler` AFTER loading the model,
   surfacing as `EngineCore failed to start`. `environment.md` currently records this venv
@@ -1449,4 +1560,54 @@ One process note worth keeping: dgx's `/tmp` is per-ssh-session private the same
 nothing while its `$HOME` marker simply never appears — indistinguishable from "still
 queued". This regression run died that way once. `setsid nohup` with the marker in
 `$HOME` is the form that survives.
+
+#### 17.9 REVIEW FAIL and repair (fresh reviewer 2026-08-12, PR #439)
+
+An independent reviewer built `ba0039db` on dgx, ran both arms itself, re-measured
+against the **pin**, and returned FAIL. It confirmed the kernel is sound and the default
+path provably inert (token md5 `89923566…` = the pre-PR value, reproduced on two clean
+builds). Seven findings; all repaired in this branch by a fresh implementer.
+
+| # | Finding | Repair |
+|---|---|---|
+| F1 | A gate that passes without running, found and documented but neither fixed nor filed | §17.7 above; issue [#463](https://github.com/mudler/vllm.cpp/issues/463); `SkipGate` + `SKIP_RETURN_CODE 77` |
+| F2 | The stated root cause is REFUTED by mutation M4, and eight surfaces asserted it as fact | §17.5 "MECHANISM"; restated as hypothesis on every surface; M4 recorded; hypotheses re-ranked |
+| F3 | "audio TTFT ~3.11x" is not a TTFT ratio | §17.5 "RATIO LABELLING"; relabelled "encoder forward vs vLLM TTFT" everywhere |
+| — | Ratios were against the carried-forward 0.25.0 denominator, not the pin | §17.5 "DENOMINATOR"; 15.90x / 2.89x against pin TTFT 46.02 ms |
+| F4 | Zero tests; mutation M2a (`p.seqlen_k = t/2`) survived every automated gate | §17.10 — `tests/vt/test_ops_attention_dense_fa2.cpp` |
+| F5 | Causal fails SILENTLY (`p.is_causal` hardcoded false, no `causal` parameter) | `LaunchDenseFA2Bf16` takes `bool causal` and throws; covered by §17.10 |
+| F6 | The "higher-precision softmax happened to compensate" sentence was never measured | §17.5 rel-L2 table; sentence deleted and replaced with the numbers |
+| F7 | The test's "BINDING CORRECTNESS" checks are fixture constants | §17.3 gate 1 corrected; constants relabelled `fixture_*` in the source |
+
+**The mutation-methodology trap the reviewer paid for, recorded because it nearly
+inverted a result:** `shutil.copy2` preserves mtime, so restoring a mutated source can
+leave ninja believing a stale object is current and silently carry the previous
+mutation into the next arm. It was caught only because two unrelated mutations produced
+identical md5s. Restore with `os.utime` to now, or force the object's rebuild.
+
+#### 17.10 The op's unit tests (review finding F4/F5) — `tests/vt/test_ops_attention_dense_fa2.cpp`
+
+`vt::AttentionDenseFa2` shipped in `43ce4f06` with **no test referencing it**: nothing
+in `tests/` named `AttentionDenseFa2`, `VT_FA2_DENSE` or `VT_WHISPER_ENC_FA2`, and the
+whole-tree gate stayed green through a params filler that attended half the keys. The
+gap is closed by a new CUDA test binary, structured around the two demonstrated
+defects. Upstream's nearest equivalent is FlashAttention-2's own
+`tests/test_flash_attn.py::test_flash_attn_output` (vllm-project/flash-attention @
+`2c839c33`, non-causal `d=64`); it is a torch/pytest harness comparing against
+`scaled_dot_product_attention`, so the documented adaptation is: same shape family,
+reference is our byte-exact scalar `AttentionDenseFlash` instead of SDPA, tolerance is a
+bf16-envelope rel-L2 instead of upstream's 2x-reference-error rule.
+
+| Case | What it pins | Kills |
+|---|---|---|
+| bf16 hd-64 non-causal MHA vs `AttentionDenseFlash`, at (1500,20), (257,4), (17,2) | the fast path computes attention, inside the bf16 envelope, including non-multiples of FA-2's 128-wide K block | generic kernel breakage |
+| **attends the FULL key range** — perturb only V rows `[T/2, T)` and require the output to move | reference-free coverage of the key range | **M2a** (`p.seqlen_k = t/2`): a truncating kernel moves by EXACTLY zero |
+| fall-through **causal** at the fast-path shape: bit-equal to `AttentionDenseFlash(causal)`, and that answer must differ from the non-causal one | totality, and that causal really is causal | **M3**: FA-2 returned the non-causal answer bit-identically and refused nothing |
+| fall-through GQA (`h_k != h`), `head_dim != 64`, f32 | totality — every non-fast shape is bit-identical to calling `AttentionDenseFlash` directly | a fast path that widens silently |
+| `VT_FA2_DENSE=0` is bit-equal to `AttentionDenseFlash` | the same-binary A/B arm every §17 measurement used | an A/B that compares FA-2 against itself |
+
+The tolerance constants are `rel-L2 < 1e-2` and `max|diff| < 0.15·rms(ref)`: bf16's
+relative resolution is 2^-8 = 3.9e-3, the two kernels use different reduction orders
+*and* different softmax formulations (§17.5 table i-iii), and the M2a defect lands at
+rel-L2 ~ O(1) — three orders of magnitude clear of the bound.
 

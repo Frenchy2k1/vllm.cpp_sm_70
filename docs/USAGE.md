@@ -237,10 +237,12 @@ a silent fallback cannot post a plausible number:
 
   Audio note: the Voxtral/Whisper encoder attention has an opt-in FlashAttention-2
   tensor-core path, `VT_WHISPER_ENC_FA2=1`, which makes the encoder forward 5.50x
-  faster (audio time-to-first-token roughly 17.1x down to 3.11x versus vLLM). It is
-  off by default because it is lower precision than the shipping kernel and shifts
-  three tokens within the ratified near-tie band on the gate clip, so turn it on only
-  where encoder latency matters more than exact reproduction of the default output.
+  faster — from 15.90x down to 2.89x vLLM's whole time-to-first-token. Those are
+  encoder-forward-versus-TTFT ratios, not TTFT ratios: our projector, merge and
+  prefill are not yet measured. It is off by default because it differs numerically
+  from the shipping kernel and shifts three tokens within the ratified near-tie band
+  on the gate clip, so turn it on only where encoder latency matters more than exact
+  reproduction of the default output.
 
 ### Quantized checkpoints: which weight forms load
 ### How long a load takes, and how to see where it goes

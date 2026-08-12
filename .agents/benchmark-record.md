@@ -19437,11 +19437,25 @@ and all text paths byte-identical BY CONSTRUCTION.
 **SAME-BINARY A/B** (throwaway `VT_ENC_REPS` `steady_clock` around the encoder forward, NOT
 committed; 6 reps/arm, rep0 dropped; one lock window):
 
-| Arm | encoder forward (reps 1-5) | vs shipped default | vs vLLM 0.25.0 TTFT 42.8 ms |
-|---|---|---|---|
-| warp `AttentionDenseFast` (S13) | 844.8 ms (843.6-847.6) | 0.87x | ~19.7x |
-| flash-tiled `AttentionDenseFlash` (S14/S15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **~17.1x** |
-| FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`, opt-in) | **133.0 ms** (131.6-137.9) | **5.50x faster** | **~3.11x** |
+The right-hand columns are **our ENCODER FORWARD against vLLM's whole TTFT**, and they are
+NOT TTFT ratios (review finding F3, 2026-08-12): the numerator is
+`WhisperAudioEncoderForward` alone, while our projector, merge and prefill are unmeasured.
+
+| Arm | encoder forward (reps 1-5) | vs shipped default | enc fwd vs PIN TTFT 46.02 ms | (vs 0.25.0 42.8 ms) |
+|---|---|---|---|---|
+| warp `AttentionDenseFast` (S13) | 844.8 ms (843.6-847.6) | 0.87x | 18.36x | ~19.7x |
+| flash-tiled `AttentionDenseFlash` (S14/S15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **15.90x** | ~17.1x |
+| FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`, opt-in) | **133.0 ms** (131.6-137.9) | **5.50x faster** | **2.89x** | ~3.11x |
+
+**DENOMINATOR RE-MEASURED AGAINST THE PIN (2026-08-12).** The original entry carried
+0.25.0's 42.8 ms forward and listed the fresh capture as owed. The review took it: the
+pinned oracle `555967922` ran the identical clip in its production/graphed configuration,
+6 reps rep0 dropped, **TTFT median 46.02 ms (45.60-46.41)** - disjoint bands from 42.8 ms,
+the pin 7.5% SLOWER. The published ratios were therefore CONSERVATIVE. Assert the oracle BY
+COMMIT: the venv's `0.23.1rc1.dev1511+g555967922` string is a setuptools_scm
+nearest-ancestor-tag artefact, and HEAD is `5559679229bc`. `soundfile==0.14.0` had to be
+installed into `~/venvs/vllm-oracle-next` before the pin could tokenize Voxtral at all -
+that package is what makes the pin gateable for this vehicle (recorded against #375).
 
 Bands non-overlapping by a wide margin. **Proof-of-run** (nsys `cuda_gpu_kern_sum
 --cuda-graph-trace=node`, SAME tool + workload both arms): flash-tiled =
@@ -19463,25 +19477,41 @@ transformers 5.13.1, mistral_common **1.11.5**, flashinfer 0.6.13):
 ratified 0.5-nat band, BUT the shipping scalar kernel has **0 divergent at gap 0.0** (every
 token is vLLM's own argmax). That is a precision step DOWN, not a tie flip, and it is the
 difference from S12 (whose adopted FA-2 decode kept divergent=0 while getting faster).
-**ROOT CAUSE grounded, inherent not a bug:** FA-2 converts the softmax probabilities from
-its f32 accumulator to bf16 before the PV MMA (`flash_attn/src/flash_fwd_kernel.h:347`
-`convert_type<Element>(acc_s)`) because that operand feeds `mma.sync`; our scalar kernel
-keeps `p` in f32. **DISPOSITION: default unchanged (byte-exact flash-tiled, gate 16/16);
+**MECHANISM - HYPOTHESIS, and the leading candidate is REFUTED (corrected 2026-08-12).**
+This entry originally asserted a root cause as fact: FA-2 converting the softmax
+probabilities from its f32 accumulator to bf16 before the PV MMA
+(`flash_attn/src/flash_fwd_kernel.h:347` `convert_type<Element>(acc_s)`) where our scalar
+kernel keeps `p` in f32. **Mutation M4 refutes it** - rounding `p` to bf16 and back inside
+the SHIPPING scalar kernel (`const float p = expf(s - m_new)`), clean rebuild, default arm
+re-run, returned token md5 `89923566...` **UNCHANGED**. That conversion cannot move one
+token on this clip, so it cannot account for three. Five differences remain candidates and
+only one is a precision loss: (i) QK^T reassociated by `mma.sync`; (ii) `exp2f` on a
+log2-scaled score (`softmax.h:86,118`) vs our `expf`; (iii) the online-max rescale also in
+`exp2f` (`softmax.h:157`); (iv) bf16 P - REFUTED; (v) PV reassociated. None is isolated.
+Also deleted as unmeasured and now refuted: "the scalar kernel's higher-precision softmax
+happened to compensate". Measured against the pin, `encoder_out` rel-L2 vs vLLM is 8.685%
+(default) / 9.053% (FA-2) and `audio_embeds` 10.933% / 11.164% - the swap perturbs 0.37
+points of a divergence that is ~96% conv/LayerNorm/GEMM (`audio-track.md:279` already
+records 8.7%). There is no meaningful compensation.
+**DISPOSITION: default unchanged (byte-exact flash-tiled, gate 16/16);
 FA-2 opt-in behind `VT_WHISPER_ENC_FA2=1`; ADOPTION IS A DEVELOPER DECISION** - it would buy
-audio TTFT 17.1x -> 3.11x, the last mm axis below floor, at the cost of 0 -> 3 near-tie
-divergences. **NOT a ceiling:** (1) keep the tensor cores AND the precision - the gaps come
-from ONE conversion; an FA-3-style two-stage rescale / f32-correction-term split is the port
-target that would make the adoption question disappear; (2) attention is no longer the
-encoder bottleneck (5.33 ms of 133 ms), so the S15.1-deferred DEVICE im2col kernel for the
-cross-channel Whisper conv is now the top lever; (3) the vLLM 42.8 ms denominator is carried
-forward (as S14.4/S15.4 also did, contended unified-memory box) and a fresh capture is owed
-before this axis is called closed. **Repro:** `git archive` the branch to
+the encoder forward going from 15.90x to 2.89x of vLLM's TTFT, the last mm axis below
+floor, at the cost of 0 -> 3 near-tie divergences. **NOT a ceiling, RE-RANKED after M4:**
+(1) attention is no longer the encoder bottleneck (5.33 ms of 133 ms), so the S15.1-deferred
+DEVICE im2col kernel for the cross-channel Whisper conv is the top lever; (2) measure our
+ACTUAL audio TTFT - projector + merge + prefill are missing from every ratio here; (3)
+isolate WHICH of the five differences flips the tokens, one M4-style single-difference
+mutation at a time; (4) keep the tensor cores AND the precision via an FA-3-style two-stage
+rescale / f32-correction-term split - DEMOTED from #1, because M4 refuted the
+single-conversion premise it rested on. (The carried-forward-denominator item is CLOSED: the
+pin was measured, see above.) **Repro:** `git archive` the branch to
 `dgx.casa:~/work/mmenc-fa2`, configure with the three flags above, `cmake --build build-cuda
 --target test_voxtral_e2e`, then `STF=~/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-3B-2507/snapshots/*/consolidated.safetensors;
 flock $HOME/gpu.lock env VLLM_VOXTRAL_SAFETENSORS=$STF VT_WHISPER_ENC_FA2=1 nsys profile
 --cuda-graph-trace=node -t cuda -o /tmp/f ./build-cuda/tests/test_voxtral_e2e; nsys stats
 --report cuda_gpu_kern_sum /tmp/f.nsys-rep | grep flash_fwd_kernel`. NOTE: without
-`VLLM_VOXTRAL_SAFETENSORS` the test SKIPS and still exits 0 - a silent false pass. NOTE 2:
+`VLLM_VOXTRAL_SAFETENSORS` the test SKIPPED and still exited 0 - a silent false pass, now
+FIXED (issue #463): it exits 77 and CTest reports Skipped. NOTE 2:
 the oracle needs BOTH `ninja` AND `CC` on PATH in a non-login shell (Triton JIT dies
 "Failed to find C compiler"), which is likely what environment.md records as "v0.25.0-stage
 crashes in EngineCore init". No mm row advances to DONE.

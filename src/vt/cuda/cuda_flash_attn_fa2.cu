@@ -532,8 +532,16 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
 //   query/key/value [t, h, d] contiguous  (h_k == h: Whisper is MHA, no GQA)
 //   out             [t, h, d] contiguous
 // Non-causal only (no encoder is causal), b == 1, seqlen_q == seqlen_k == t.
+//
+// `causal` is a PARAMETER rather than an assumption. The only compiled
+// instantiation is `run_mha_fwd_<bfloat16_t, 64, /*Is_causal=*/false>`, so a causal
+// request cannot be served here; taking the flag and refusing is what makes the
+// refusal real rather than a comment. Before this argument existed the launcher
+// hardcoded `p.is_causal = false` and a caller asking for causal got a silently
+// non-causal answer (review of PR #439, mutation M3: output BIT-IDENTICAL to the
+// non-causal arm with no diagnostic).
 void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
-                        const Tensor& key, const Tensor& value, float scale) {
+                        const Tensor& key, const Tensor& value, float scale, bool causal) {
   const int64_t t = query.shape[0], h = query.shape[1], d = query.shape[2];
   if (t == 0 || h == 0 || d == 0) return;
   // Gates the CALLER must have enforced (mirroring LaunchPrefillFA2Bf16's contract):
@@ -553,6 +561,11 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   if (key.shape[1] != h || value.shape[1] != h) {
     throw std::runtime_error(
         "cuda flash-attn-2 dense: MHA only, h_k must equal h (dispatch gate must enforce)");
+  }
+  if (causal) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: non-causal only — the sole compiled instantiation is "
+        "Is_causal=false (dispatch gate must enforce)");
   }
 
   // softmax_lse [b, h, seqlen_q] f32 — the PADDED (non-varlen) LSE layout the batch
@@ -619,8 +632,10 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.scale_softmax_rp_dropout = scale;
   p.philox_args = at::PhiloxCudaState(0, 0);
 
-  // Fully bidirectional: no causal mask, no local window.
-  p.is_causal = false;
+  // Fully bidirectional: no causal mask, no local window. `causal` is false here —
+  // the guard above threw otherwise — so this mirrors the argument rather than
+  // overriding it.
+  p.is_causal = causal;
   p.window_size_left = -1;
   p.window_size_right = -1;
   p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
