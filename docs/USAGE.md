@@ -409,6 +409,12 @@ imports before running the staged executable's `--help`, forced-tier, or HTTP
 shutdown smokes. The Win32 console-control regression uses bounded waits so a
 teardown failure reports an error instead of hanging the gate.
 
+The CUDA graph-replay profiler and its FIFO diagnostic controls remain
+POSIX-only and are not exposed by native Windows server builds. Native Windows
+process launch, environment updates, process IDs, and console shutdown stay on
+the direct CRT/Win32 adapters; they do not require a POSIX compatibility layer
+or a command shell.
+
 Each invocation emits a deterministic `.zip` plus its exact `.sha256` and
 `.provenance.json` sidecars. ZIP members are sorted, use the
 `SOURCE_DATE_EPOCH` timestamp, and reject traversal, drive-qualified paths,

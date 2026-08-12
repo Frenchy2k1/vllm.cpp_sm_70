@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PIPELINE = ROOT / "scripts/release_pipeline.py"
 CHECKER = ROOT / "scripts/check-release-workflow.py"
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 RELEASE_VERSION = ROOT / "release/release-version.json"
 BUILD_DRIVERS = (
     ROOT / "scripts/build-cpu-release.sh",
@@ -220,6 +221,93 @@ class ReleasePipelineContract(unittest.TestCase):
                 self.assertIn(before, original)
                 mutant = original.replace(before, after, 1)
                 self.assertTrue(self.checker.validate(mutant), label)
+
+    def test_pr_ci_has_two_exact_read_only_native_windows_gates(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(self.checker.validate_pr_ci(workflow), [])
+        for job, backend, build_dir in (
+            ("windows-msvc-cpu", "cpu", "build-pr-windows-cpu"),
+            ("windows-msvc-vulkan", "vulkan", "build-pr-windows-vulkan"),
+        ):
+            with self.subTest(job=job):
+                block = self.checker.job_block(workflow, job)
+                self.assertIn("    if: github.event_name == 'pull_request'", block)
+                self.assertIn("    permissions:\n      contents: read", block)
+                self.assertIn("    runs-on: windows-2022", block)
+                self.assertIn(
+                    "./scripts/build-windows-release.ps1 -ContractTest", block
+                )
+                self.assertIn(
+                    f"./scripts/build-windows-release.ps1 `\n"
+                    f"            -Backend {backend} `\n"
+                    f"            -ArtifactId windows-x86_64-msvc-{backend} `\n"
+                    f"            -BuildDir $env:GITHUB_WORKSPACE/{build_dir}",
+                    block,
+                )
+                for forbidden in (
+                    "actions/upload-artifact",
+                    "actions/attest",
+                    "gh release",
+                    "id-token: write",
+                    "contents: write",
+                ):
+                    self.assertNotIn(forbidden, block)
+
+    def test_pr_windows_gate_mutations_are_rejected(self) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "missing CPU job": (
+                "  windows-msvc-cpu:\n",
+                "  windows-msvc-cpu-removed:\n",
+            ),
+            "missing Vulkan job": (
+                "  windows-msvc-vulkan:\n",
+                "  windows-msvc-vulkan-removed:\n",
+            ),
+            "non-PR execution": (
+                "  windows-msvc-cpu:\n"
+                "    # Native Windows release portability must be proven before merge. This PR\n"
+                "    # lane calls the authoritative driver but retains no artifact and has no\n"
+                "    # release, upload, write-token, or OIDC authority (#117).\n"
+                "    if: github.event_name == 'pull_request'\n",
+                "  windows-msvc-cpu:\n"
+                "    # Native Windows release portability must be proven before merge. This PR\n"
+                "    # lane calls the authoritative driver but retains no artifact and has no\n"
+                "    # release, upload, write-token, or OIDC authority (#117).\n"
+                "    if: always()\n",
+            ),
+            "moving runner": (
+                "    runs-on: windows-2022\n",
+                "    runs-on: windows-latest\n",
+            ),
+            "write authority": (
+                "  windows-msvc-cpu:\n"
+                "    # Native Windows release portability must be proven before merge. This PR\n"
+                "    # lane calls the authoritative driver but retains no artifact and has no\n"
+                "    # release, upload, write-token, or OIDC authority (#117).\n"
+                "    if: github.event_name == 'pull_request'\n"
+                "    permissions:\n      contents: read\n",
+                "  windows-msvc-cpu:\n"
+                "    # Native Windows release portability must be proven before merge. This PR\n"
+                "    # lane calls the authoritative driver but retains no artifact and has no\n"
+                "    # release, upload, write-token, or OIDC authority (#117).\n"
+                "    if: github.event_name == 'pull_request'\n"
+                "    permissions:\n      contents: write\n",
+            ),
+            "CPU build omitted": (
+                "            -Backend cpu `",
+                "            -Backend omitted `",
+            ),
+            "Vulkan build omitted": (
+                "            -Backend vulkan `",
+                "            -Backend omitted `",
+            ),
+        }
+        for label, (before, after) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(before, original)
+                mutant = original.replace(before, after, 1)
+                self.assertTrue(self.checker.validate_pr_ci(mutant), label)
 
     def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
         tag = "refs/tags/v0.0.3-pre.1"

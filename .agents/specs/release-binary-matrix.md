@@ -13,7 +13,9 @@ request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
 `CLAIM-ENG-RELEASE-BINARIES-W5` in draft PR
 [#141](https://github.com/mudler/vllm.cpp/pull/141); W6 implementation claim
 `CLAIM-ENG-RELEASE-BINARIES-W6` in draft PR
-[#196](https://github.com/mudler/vllm.cpp/pull/196).
+[#196](https://github.com/mudler/vllm.cpp/pull/196). The Windows extension's
+per-commit documentation checkpoint repair is tracked by
+[#448](https://github.com/mudler/vllm.cpp/issues/448).
 
 ## Delivery topology
 
