@@ -286,6 +286,55 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, contract)
 
+    def test_real_tree_has_no_unguarded_local_nominmax_redefinitions(self) -> None:
+        cmake = (REPO / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertRegex(
+            cmake,
+            r"add_compile_definitions\([^)]*\bNOMINMAX\b[^)]*\)",
+        )
+
+        def is_absence_guard(directive: str) -> bool:
+            return bool(
+                re.fullmatch(r"ifndef\s+NOMINMAX", directive)
+                or re.fullmatch(
+                    r"if\s+!\s*defined\s*(?:\(\s*NOMINMAX\s*\)|NOMINMAX)",
+                    directive,
+                )
+            )
+
+        offenders = []
+        for root in (REPO / "src", REPO / "tests"):
+            for path in root.rglob("*"):
+                if path.suffix not in {".cc", ".cpp", ".cxx", ".h", ".hpp"}:
+                    continue
+                absence_guards = []
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    match = re.match(r"\s*#\s*(\w+)(.*)$", line)
+                    if match is None:
+                        continue
+                    kind, tail = match.group(1), match.group(2).strip()
+                    if kind in {"if", "ifdef", "ifndef"}:
+                        absence_guards.append(is_absence_guard(f"{kind} {tail}"))
+                    elif kind in {"else", "elif"}:
+                        self.assertTrue(absence_guards, path)
+                        absence_guards[-1] = (
+                            is_absence_guard(f"if {tail}")
+                            if kind == "elif"
+                            else False
+                        )
+                    elif kind == "endif":
+                        self.assertTrue(absence_guards, path)
+                        absence_guards.pop()
+                    elif (
+                        kind == "define"
+                        and re.match(r"NOMINMAX\b", tail)
+                        and not any(absence_guards)
+                    ):
+                        offenders.append(path.relative_to(REPO).as_posix())
+                self.assertEqual(absence_guards, [], path)
+
+        self.assertEqual(sorted(offenders), [])
+
     def test_real_tree_uses_portable_windows_allocation_and_math(self) -> None:
         backend = (REPO / "src/vt/cpu/cpu_backend.cpp").read_text(
             encoding="utf-8"
