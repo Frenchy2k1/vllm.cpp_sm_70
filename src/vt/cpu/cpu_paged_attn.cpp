@@ -182,7 +182,6 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // The token loop, with the K and V element encodings bound at compile time.
   // Body text is unchanged from the per-element form apart from the two loads.
   auto run = [&](auto kv_tag) {
-    constexpr KvKind kKV = decltype(kv_tag)::value;
     ParallelForRows(CurrentThreadpool(), total_q, [&](int64_t t0, int64_t t1) {
       std::vector<float> probs;
       std::vector<float> acc(static_cast<size_t>(d));
@@ -221,7 +220,8 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
             const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
             float dot = 0.0f;
             for (int64_t e = 0; e < d; ++e)
-              dot += q[e] * KvElem<kKV>(k_base, kbase + e, k_scale);
+              dot += q[e] *
+                     KvElem<decltype(kv_tag)::value>(k_base, kbase + e, k_scale);
             dot *= scale;
             if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
             probs[static_cast<size_t>(j - jmin)] = dot;
@@ -243,7 +243,8 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
             const int64_t off = j % block_size;
             const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
             for (int64_t e = 0; e < d; ++e)
-              acc[static_cast<size_t>(e)] += pw * KvElem<kKV>(v_base, vbase + e, v_scale);
+              acc[static_cast<size_t>(e)] +=
+                  pw * KvElem<decltype(kv_tag)::value>(v_base, vbase + e, v_scale);
           }
           StoreRowF32(out, qoff, d, acc.data());
         }

@@ -395,6 +395,10 @@ developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
 AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
 `--help`, `/health`, `/version`, and a clean CTRL_BREAK shutdown:
 
+The MSVC build defines `NOMINMAX` and the portable ISO CRT contract centrally,
+and compiles C++ sources as UTF-8. Do not add those definitions per target or
+disable `/WX`; both CPU and Vulkan release configurations share this contract.
+
 ```powershell
 $env:SOURCE_SHA = git rev-parse HEAD
 $env:VERSION = "0.0.3-pre.1"

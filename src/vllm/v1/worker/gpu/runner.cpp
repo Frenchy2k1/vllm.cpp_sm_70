@@ -1119,7 +1119,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 
   // Flattened dense-order forward inputs (positions int64 -> int32 for RoPE).
   const std::vector<int32_t>& token_ids = step.input_token_ids;
-  std::vector<int32_t> positions(step.positions.begin(), step.positions.end());
+  std::vector<int32_t> positions;
+  positions.reserve(step.positions.size());
+  for (const int64_t position : step.positions) {
+    positions.push_back(static_cast<int32_t>(position));
+  }
 
   // THE FORWARD (Task 3, over the persistent KV caches). Returns f32 logits
   // (lm_head already applied): [num_reqs, vocab] when the gather-before-lm_head

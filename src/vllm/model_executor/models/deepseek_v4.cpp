@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <string>
 #include <utility>
 #include <vector>
@@ -596,7 +597,8 @@ std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>
 // loses positional/context structure (degenerate repetition).
 double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
   return static_cast<double>(n_dims) *
-         std::log(static_cast<double>(n_ctx_orig) / (beta * 2.0 * M_PI)) /
+         std::log(static_cast<double>(n_ctx_orig) /
+                  (beta * 2.0 * std::numbers::pi_v<double>)) /
          (2.0 * std::log(base));
 }
 void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,

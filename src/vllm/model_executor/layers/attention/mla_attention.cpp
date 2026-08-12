@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <numbers>
 #include <stdexcept>
 
 #include "vt/dtype.h"
@@ -78,7 +79,7 @@ double YarnFindCorrectionDim(double num_rotations, int64_t dim, double base,
                              int64_t max_position_embeddings) {
   return (static_cast<double>(dim) *
           std::log(static_cast<double>(max_position_embeddings) /
-                   (num_rotations * 2.0 * M_PI))) /
+                   (num_rotations * 2.0 * std::numbers::pi_v<double>))) /
          (2.0 * std::log(base));
 }
 

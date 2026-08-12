@@ -39,6 +39,7 @@
 #include <cstddef>
 #include <limits>
 #include <map>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,7 @@ double BesselI0(double x) {
 
 double Sinc(double x) {
   if (x == 0.0) return 1.0;
-  const double pix = M_PI * x;
+  const double pix = std::numbers::pi_v<double> * x;
   return std::sin(pix) / pix;
 }
 
@@ -203,7 +204,9 @@ std::vector<float> MiniMaxH3KaiserSincFilter1d(double cutoff, double half_width,
   const int64_t half_size = kernel_size / 2;
 
   const double delta_f = 4.0 * half_width;
-  const double a = 2.285 * (static_cast<double>(half_size) - 1.0) * M_PI * delta_f + 7.95;
+  const double a = 2.285 * (static_cast<double>(half_size) - 1.0) *
+                       std::numbers::pi_v<double> * delta_f +
+                   7.95;
   double beta = 0.0;
   if (a > 50.0) {
     beta = 0.1102 * (a - 8.7);
