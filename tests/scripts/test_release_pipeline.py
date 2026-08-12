@@ -24,6 +24,7 @@ BUILD_DRIVERS = (
     ROOT / "scripts/build-linux-accelerator-release.sh",
     ROOT / "scripts/build-macos-release.sh",
 )
+WINDOWS_BUILD_DRIVER = ROOT / "scripts/build-windows-release.ps1"
 MATRIX = ROOT / "release/release-matrix.json"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -35,6 +36,50 @@ def load(path: Path, name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def shell_package_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    lines = iter(text.splitlines())
+    for line in lines:
+        if not line.startswith("python3 scripts/package-server.py"):
+            continue
+        command = line
+        while command.rstrip().endswith("\\"):
+            command = command.rstrip()[:-1] + " " + next(lines)
+        commands.append(" ".join(command.split()))
+    return commands
+
+
+def powershell_package_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    lines = iter(text.splitlines())
+    for line in lines:
+        if line != "Invoke-Checked python @(":
+            continue
+        block = [line]
+        for continuation in lines:
+            block.append(continuation)
+            if continuation == ")":
+                break
+        command = " ".join(" ".join(block).split())
+        if "scripts/package-server.py" in command:
+            commands.append(command)
+    return commands
+
+
+def assert_archive_producer_format(
+    case: unittest.TestCase, commands: list[str], expected_format: str
+) -> None:
+    producers = [command for command in commands if '"--archive"' in command or "--archive " in command]
+    case.assertEqual(len(producers), 1, producers)
+    producer = producers[0]
+    if expected_format == "zip":
+        case.assertIn('"--archive-format", "zip"', producer)
+        case.assertNotIn('"--archive-format", "tar.gz"', producer)
+    else:
+        case.assertIn("--archive-format tar.gz", producer)
+        case.assertNotIn("--archive-format zip", producer)
 
 
 class ReleasePipelineContract(unittest.TestCase):
@@ -179,11 +224,30 @@ class ReleasePipelineContract(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pipeline.validate_matrix(matrix)
 
-    def test_existing_build_drivers_pass_explicit_tar_format(self) -> None:
+    def test_each_archive_producer_passes_its_explicit_platform_format(self) -> None:
         for driver in BUILD_DRIVERS:
             with self.subTest(driver=driver.name):
                 text = driver.read_text(encoding="utf-8")
-                self.assertIn("--archive-format tar.gz", text)
+                commands = shell_package_commands(text)
+                assert_archive_producer_format(self, commands, "tar.gz")
+                producer = next(command for command in commands if "--archive " in command)
+                for mutant in (
+                    producer.replace(" --archive-format tar.gz", ""),
+                    producer.replace("--archive-format tar.gz", "--archive-format zip"),
+                ):
+                    with self.assertRaises(AssertionError):
+                        assert_archive_producer_format(self, [mutant], "tar.gz")
+
+        text = WINDOWS_BUILD_DRIVER.read_text(encoding="utf-8")
+        commands = powershell_package_commands(text)
+        assert_archive_producer_format(self, commands, "zip")
+        producer = next(command for command in commands if '"--archive"' in command)
+        for mutant in (
+            producer.replace(', "--archive-format", "zip"', ""),
+            producer.replace('"--archive-format", "zip"', '"--archive-format", "tar.gz"'),
+        ):
+            with self.assertRaises(AssertionError):
+                assert_archive_producer_format(self, [mutant], "zip")
 
     def test_publish_matrix_contains_all_ten_primary_bundles_with_explicit_formats(self) -> None:
         matrix = json.loads(MATRIX.read_text(encoding="utf-8"))

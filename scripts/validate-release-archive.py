@@ -184,6 +184,12 @@ def safe_extract_zip(archive: Path, destination: Path) -> list[str]:
                 if (stat.S_ISLNK(unix_mode) or info.external_attr & 0x400 or
                         member_type not in {0, stat.S_IFREG, stat.S_IFDIR}):
                     errors.append(f"archive links/reparse points are forbidden: {info.filename}")
+                    continue
+                is_directory = info.is_dir()
+                if member_type and (is_directory != stat.S_ISDIR(unix_mode)):
+                    errors.append(
+                        f"archive member type disagrees with its path marker: {info.filename}"
+                    )
             if errors:
                 return errors
             destination.mkdir(parents=True, exist_ok=True)
