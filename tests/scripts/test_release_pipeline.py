@@ -309,6 +309,157 @@ class ReleasePipelineContract(unittest.TestCase):
                 mutant = original.replace(before, after, 1)
                 self.assertTrue(self.checker.validate_pr_ci(mutant), label)
 
+    def test_pr_windows_gate_rejects_provenance_authority_and_step_mutations(
+        self,
+    ) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(self.checker.validate_pr_ci(original), [])
+
+        def mutate(job: str, before: str, after: str) -> str:
+            block = self.checker.job_block(original, job)
+            self.assertEqual(block.count(before), 1, (job, before))
+            changed = block.replace(before, after, 1)
+            self.assertEqual(original.count(block), 1, job)
+            return original.replace(block, changed, 1)
+
+        cpu = "windows-msvc-cpu"
+        checkout = "      - uses: actions/checkout@v4\n"
+        contract = (
+            "      - name: Prove PowerShell, static CRT, and unsupported-tier contracts\n"
+            "        run: ./scripts/build-windows-release.ps1 -ContractTest\n"
+        )
+        driver = (
+            "          ./scripts/build-windows-release.ps1 `\n"
+            "            -Backend cpu `\n"
+            "            -ArtifactId windows-x86_64-msvc-cpu `\n"
+            "            -BuildDir $env:GITHUB_WORKSPACE/build-pr-windows-cpu\n"
+        )
+        mutations = {
+            "source SHA drift": mutate(
+                cpu,
+                "          SOURCE_SHA: ${{ github.sha }}\n",
+                "          SOURCE_SHA: unbound\n",
+            ),
+            "evidence URL drift": mutate(
+                cpu,
+                "          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n",
+                "          EVIDENCE_URL: https://example.invalid/run\n",
+            ),
+            "version not loaded from declaration": mutate(
+                cpu,
+                "          $env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version\n",
+                "          $env:VERSION = '0.0.3-pre.1'\n",
+            ),
+            "source epoch not exported from HEAD": mutate(
+                cpu,
+                "          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()\n",
+                "          $env:SOURCE_DATE_EPOCH = '0'\n",
+            ),
+            "checkout removed": mutate(cpu, checkout, ""),
+            "checkout explicit branch ref": mutate(
+                cpu,
+                checkout,
+                checkout + "        with:\n          ref: main\n",
+            ),
+            "duplicate checkout": mutate(cpu, checkout, checkout + checkout),
+            "extra pull request permission": mutate(
+                cpu,
+                "    permissions:\n      contents: read\n",
+                "    permissions:\n      contents: read\n      pull-requests: read\n",
+            ),
+            "duplicate contents permission": mutate(
+                cpu,
+                "    permissions:\n      contents: read\n",
+                "    permissions:\n      contents: read\n      contents: read\n",
+            ),
+            "contract invocation removed": mutate(cpu, contract, ""),
+            "duplicate contract invocation": mutate(cpu, contract, contract + contract),
+            "wrong backend polarity": mutate(
+                cpu, "            -Backend cpu `\n", "            -Backend vulkan `\n"
+            ),
+            "wrong artifact polarity": mutate(
+                cpu,
+                "            -ArtifactId windows-x86_64-msvc-cpu `\n",
+                "            -ArtifactId windows-x86_64-msvc-vulkan `\n",
+            ),
+            "duplicate full driver": mutate(cpu, driver, driver + driver),
+            "opposite backend driver added": mutate(
+                cpu,
+                driver,
+                driver
+                + "          ./scripts/build-windows-release.ps1 `\n"
+                + "            -Backend vulkan `\n"
+                + "            -ArtifactId windows-x86_64-msvc-vulkan `\n"
+                + "            -BuildDir $env:GITHUB_WORKSPACE/build-pr-windows-vulkan\n",
+            ),
+            "upload action added": mutate(
+                cpu,
+                checkout,
+                checkout + "      - uses: actions/upload-artifact@v4\n",
+            ),
+            "release action added": mutate(
+                cpu,
+                checkout,
+                checkout + "      - uses: softprops/action-gh-release@v2\n",
+            ),
+            "unexpected action added": mutate(
+                cpu,
+                checkout,
+                checkout + "      - uses: actions/setup-python@v5\n",
+            ),
+            "release command added": mutate(
+                cpu,
+                contract,
+                contract + "      - run: gh release create v0.0.3-pre.1\n",
+            ),
+            "publish command added": mutate(
+                cpu,
+                contract,
+                contract + "      - run: ./scripts/publish-release.sh\n",
+            ),
+            "tag command added": mutate(
+                cpu,
+                contract,
+                contract + "      - run: git tag v0.0.3-pre.1\n",
+            ),
+            "attestation command added": mutate(
+                cpu,
+                contract,
+                contract + "      - run: gh attestation sign artifact.zip\n",
+            ),
+        }
+        for permission in (
+            "actions: read",
+            "artifact-metadata: read",
+            "attestations: read",
+            "id-token: write",
+            "packages: read",
+            "pull-requests: read",
+            "security-events: read",
+        ):
+            mutations[f"extra {permission} permission"] = mutate(
+                cpu,
+                "    permissions:\n      contents: read\n",
+                f"    permissions:\n      contents: read\n      {permission}\n",
+            )
+        mutations["duplicate permissions mapping"] = mutate(
+            cpu,
+            "    permissions:\n      contents: read\n",
+            "    permissions:\n      contents: read\n"
+            "    permissions:\n      contents: read\n",
+        )
+        mutations["duplicate CPU job"] = (
+            original
+            + "\n  windows-msvc-cpu:\n"
+            + self.checker.job_block(original, cpu)
+        )
+        missed = [
+            label
+            for label, workflow in mutations.items()
+            if not self.checker.validate_pr_ci(workflow)
+        ]
+        self.assertEqual(missed, [])
+
     def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
         tag = "refs/tags/v0.0.3-pre.1"
         self.assertFalse(self.plan("push", tag)["publish"])
