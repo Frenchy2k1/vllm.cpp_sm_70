@@ -34,6 +34,10 @@ Sanitized evidence environment test repair:
 Complete codemodel evidence toolchain repair:
 [#458](https://github.com/mudler/vllm.cpp/issues/458)
 
+Native MSVC strict-build repair:
+[#459](https://github.com/mudler/vllm.cpp/issues/459), specified in
+[windows-msvc-strict-build.md](windows-msvc-strict-build.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -488,6 +492,16 @@ classifies active C++ launch tokens and carries the parser path opaquely in the
 child environment. Local Windows-path fixtures and CPU/Vulkan closure
 mutations are accepted evidence for the checker semantics; a native hosted
 rerun remains required and is not inferred from Linux.
+
+Hosted run `31574038913` then reached native compilation and exposed the full
+strict-MSVC diagnostic closure in both CPU and Vulkan jobs
+([#459](https://github.com/mudler/vllm.cpp/issues/459)). The repair preserves
+`/W4 /WX`, defines the central Windows CRT/header/UTF-8 contract, uses paired
+Win32 aligned allocation, replaces non-standard math constants, narrowly
+documents the intentional cache-line layout, and fixes each genuine unused,
+narrowing, shadow, and format warning. Clean local CPU/Vulkan builds and the
+Windows portability mutation suite are green; native MSVC reruns remain the
+authoritative acceptance gate.
 
 ## Now
 
