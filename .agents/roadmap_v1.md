@@ -37,6 +37,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
 | [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
+| [#433](https://github.com/mudler/vllm.cpp/issues/433) | `BACKEND-GATE-CPU-LLAMACPP` | No x86_64 arm: the closed CPU floor is Arm/i8mm-only and every lever that closed it is Arm-specific | perf |
 | [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |
 | [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
 | [#132](https://github.com/mudler/vllm.cpp/issues/132) | `BACKEND-ROCM` | ROCm `-O0` RmsNorm CLR HostcallListener teardown deadlock | bug |
@@ -52,6 +53,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#301](https://github.com/mudler/vllm.cpp/issues/301) | `ENG-LOAD-DIRECT-UPLOAD` | `main` is RED on ASan/UBSan: five misaligned BF16 reads from borrowed mmap weights | bug |
 | [#374](https://github.com/mudler/vllm.cpp/issues/374) | `ENG-NOW-DERIVED` | NOW.md is still a surface every PR must write: the doc-checkpoint gate marches them into it | bug |
 | [#364](https://github.com/mudler/vllm.cpp/issues/364) | `ENG-RECORD-CONFLICT-SURFACES` | Shared record surfaces are a lock: 16/29 open PRs conflict, 13 of them in bookkeeping only | bug |
+| [#460](https://github.com/mudler/vllm.cpp/issues/460) | `ENG-RECORD-CONFLICT-SURFACES` | `docs/BENCHMARKS.md` cannot be compacted: `check_links` validates links inside fenced blocks, so no row with a `docs/`-relative link can be archived byte-for-byte | bug |
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-BINARIES` | Binary release | feature |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
