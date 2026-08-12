@@ -833,6 +833,42 @@ prize and should be SIZED before it is built.
 
 Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
 
+## 6l. PAIRED PARITY RE-MEASURE WITH W7: still BELOW parity (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle, same
+target+draft+k, `max_num_seqs=2`, greedy, matched token counts, cold run
+discarded. Ours is 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | **0.981x** |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | **0.870x** |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40 — a 0.4%
+spread — so 0.870x is a real reading, not noise. The capital cell spreads ~8%
+(71.58-77.67), so treat 0.981x as the looser of the two.
+
+**W7 did not close the gap, and the goal of speed parity is NOT met.** W7 removed
+host-side sampling waste worth 11-15% of the sampling phase, but sampling is a
+small share of the step on this lane (0.5 ms of it), so the e2e effect is within
+the capital cell's own noise band. Do not read the earlier 79.19 tok/s as a W7
+win: that was PRE-REBOOT machine state, and on the idle box both engines moved,
+the oracle more than us. Same-session pairing is what makes these two rows
+quotable and the earlier cross-session ones not.
+
+**Where the remaining gap is, and the next lever.** The deficit is largest in the
+HIGH-ACCEPTANCE regime (fibonacci 0.870x, where the block is mostly accepted and
+the T=1+k verify runs every step) and smallest in the low-acceptance one
+(capital 0.981x). That points at the verify forward, not the drafter: §6g
+established that BOTH model families gate their decode CUDA graph on
+`input.pure_decode` (`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`), so our
+speculative verify at T=1+k falls off the captured graph and runs EAGER, while
+upstream captures the uniform `1+k` shape. That is the same unexploited headroom
+DFlash left open (D12 Part C) and it is the next thing to build. It is a
+static-shape capture increment, not a tuning knob.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
