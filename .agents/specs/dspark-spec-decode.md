@@ -1071,6 +1071,51 @@ capturing (`[DFLASH-GRAPH] replays=96 captures=2`), the verify captured, and the
 Markov sample at its bandwidth bound. There is no structural gap left to close;
 what remains is inside the reference's own spread.
 
+## 6q. THE FIBONACCI GAP RESOLVED: identical acceptance, one lucky token (2026-08-12)
+
+§6p reported 0.952x on "fibonacci" against the oracle's 5-rep median. Isolating
+that prompt (only prompt, warm-up on the same prompt, so the cumulative
+`spec_decode` counters are attributable) explains it and removes it.
+
+Upstream, per run:
+
+| run | tok/s | drafts | accepted | rate | tokens/step |
+|---|---|---|---|---|---|
+| 0 | 142.01 | 18 | 70 | 48.6% | 4.94 |
+| 1 | 142.66 | 18 | 70 | 48.6% | 4.94 |
+| 2 | 142.37 | 18 | 70 | 48.6% | 4.94 |
+| 3 | **151.18** | **17** | **71** | 52.2% | 5.24 |
+
+The 151 draw is ONE EXTRA ACCEPTED TOKEN (71 vs 70), which removes one whole
+draft step (17 instead of 18). It happened in 1 run of 4. Nothing about that draw
+is faster per step; it simply did less work.
+
+**Our acceptance is IDENTICAL to upstream's modal value**: 48.6%, 4.94
+tokens/step, 18 steps (§ diag: `accepted/step mean=3.89 of k=8`, 36 SPECTRACE
+lines over 2 reps). So on matched work:
+
+| comparison | ours | upstream | ratio |
+|---|---|---|---|
+| vs its MODAL draw (3 of 4 runs) | 141.83 | 142.01-142.66 | **0.996x-0.999x** |
+| vs its 5-rep median (inflated by 2 lucky draws) | 141.83 | 149.03 | 0.952x |
+
+The 0.952x in §6p is therefore an artifact of averaging over a bimodal reference,
+not a deficit. **Read against matched work the MoE lane is 0.996x-1.012x**:
+"capital" 1.012x (§6p, ours above the oracle's median and 3 of its 5 draws) and
+"fibonacci" 0.996x-0.999x here.
+
+That is parity within the measurement's own resolution. It is NOT a demonstrated
+>= 1.0x on both cells -- "fibonacci" sits 0.1-0.4% under upstream's modal draw,
+which is smaller than either engine's run-to-run spread -- so the row records
+parity-within-noise rather than a win, and the remaining honest statement is that
+neither engine is reliably faster on this workload.
+
+**Method note worth keeping:** a bimodal reference must be compared MODALLY or
+per-work, not by its mean/median. Three of this row's ratios (0.986x single-shot,
+0.919x/0.987x at 3 reps, 0.952x at 5 reps) were all measuring the reference's
+draw distribution rather than either engine, and only isolating the prompt and
+reading its counters settled it.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
