@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -308,11 +309,116 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         )
 
     def test_rejects_shell_process_launch(self) -> None:
-        self.assert_rejected(
-            "src/vllm/entrypoints/openai/server_main.cpp",
+        for source in (
             "#ifdef _WIN32\nsystem(command.c_str());\n#endif\n",
-            "shell invocation",
-        )
+            '#ifdef _WIN32\n'
+            'CreateProcessW(L"cmd.exe", nullptr, nullptr);\n'
+            '#endif\n',
+            '#ifdef _WIN32\n'
+            'CreateProcessW(L"C:\\\\Windows\\\\System32\\\\cmd.exe", '
+            'nullptr, nullptr);\n'
+            '#endif\n',
+        ):
+            with self.subTest(source=source):
+                self.assert_rejected(
+                    "src/vllm/entrypoints/openai/server_main.cpp",
+                    source,
+                    "shell invocation",
+                )
+
+    def test_accepts_cpu_and_vulkan_command_buffer_identifiers(self) -> None:
+        closures = {
+            "cpu": "void RecordCpuCommandBuffer(int command_buffer) {}\n",
+            "vulkan": """
+                void RecordVulkanCommands(VkCommandBuffer cmd) {
+                  // A cmd.exe shell is not launched by a command-buffer variable.
+                  const char* note = "the cmd command-buffer variable is inert prose";
+                  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                }
+            """,
+        }
+        for backend, source in closures.items():
+            with self.subTest(backend=backend):
+                result = self.run_checker(self.make_tree({
+                    f"src/vt/{backend}/portability_audit_fixture.cpp": source,
+                }))
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+
+    def test_powershell_ast_path_is_opaque_for_cpu_and_vulkan(self) -> None:
+        ast_commands = [{
+            "text": "\n".join((
+                "Invoke-CrtAudit",
+                'Invoke-Checked $server @("--help")',
+                "Invoke-UnsupportedTierProbe -TierTest $tierTest",
+                "Invoke-Checked python @($smokeHarness)",
+                "Invoke-UnsupportedTierContractTests",
+            )),
+            "offset": 0,
+        }]
+        path_env = "VLLM_CPP_POWERSHELL_AUDIT_PATH"
+
+        for backend, windows_root in (
+            ("cpu", r"C:\actions\vllm.cpp CPU checkout"),
+            ("vulkan", r"D:\a\vllm.cpp Vulkan checkout"),
+        ):
+            with self.subTest(backend=backend):
+                root = Path(self.tempdir.name) / windows_root
+                script = root / "scripts" / "build-windows-release.ps1"
+                calls: list[tuple[list[str], dict[str, object]]] = []
+
+                def fake_run(
+                    command: list[str], **kwargs: object
+                ) -> subprocess.CompletedProcess[str]:
+                    calls.append((command, kwargs))
+                    command_index = (
+                        command.index("-Command") if "-Command" in command
+                        else -1
+                    )
+                    if command_index >= 0 and command_index != len(command) - 2:
+                        return subprocess.CompletedProcess(
+                            command,
+                            1,
+                            "",
+                            "The file could not be read: Cannot process argument "
+                            "because the value of argument path is not valid.",
+                        )
+                    if command_index >= 0:
+                        return subprocess.CompletedProcess(
+                            command, 0, json.dumps(ast_commands), ""
+                        )
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                errors: list[str] = []
+                with mock.patch.object(
+                    checker.shutil,
+                    "which",
+                    return_value=r"C:\Program Files\PowerShell\7\pwsh.exe",
+                ), mock.patch.object(
+                    checker.subprocess, "run", side_effect=fake_run
+                ), mock.patch.object(
+                    checker, "_validate_powershell_ast_order"
+                ):
+                    checker._validate_powershell_ast(script, errors)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(len(calls), 2)
+                ast_argv, ast_kwargs = calls[0]
+                self.assertEqual(ast_argv.index("-Command"), len(ast_argv) - 2)
+                self.assertNotIn("-Path", ast_argv)
+                self.assertEqual(ast_kwargs["env"][path_env], str(script))
+                self.assertFalse(ast_kwargs.get("shell", False))
+                contract_argv, contract_kwargs = calls[1]
+                self.assertEqual(
+                    contract_argv[contract_argv.index("-File") + 1],
+                    str(script),
+                )
+                self.assertEqual(
+                    contract_argv[contract_argv.index("-SourceDir") + 1],
+                    str(root),
+                )
+                self.assertFalse(contract_kwargs.get("shell", False))
 
     def test_rejects_missing_winsock_support(self) -> None:
         self.assert_rejected(

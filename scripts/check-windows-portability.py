@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ UNSUPPORTED_TIER_FILTER = (
 )
 UNSUPPORTED_TIER_DIAGNOSTIC = "unknown x86 ISA tier 'amx'"
 WINDOWS_EXCLUDED_SOURCE = "src/vt/cuda/nvfp4_persistent_cache.cpp"
+POWERSHELL_AUDIT_PATH_ENV = "VLLM_CPP_POWERSHELL_AUDIT_PATH"
 
 
 def windows_excluded_sources(root: Path) -> set[str]:
@@ -310,6 +312,29 @@ def without_cpp_comments_and_literals(text: str) -> str:
                               for char in match.group(0)),
         text,
     )
+
+
+def has_shell_process_launch(text: str) -> bool:
+    """Reject active shell APIs and cmd executable literals, not inert tokens."""
+    active = without_cpp_comments_and_literals(text)
+    if re.search(
+        r"\b(?:system|popen|_popen|ShellExecute[AW]?)\s*\(", active
+    ):
+        return True
+
+    for token in _CPP_INERT.finditer(text):
+        literal = token.group("string")
+        if literal is not None:
+            value = literal[1:-1]
+        else:
+            raw = token.group("raw")
+            if raw is None:
+                continue
+            delimiter = token.group("delimiter") or ""
+            value = raw[len('R"' + delimiter + '('):-len(')' + delimiter + '"')]
+        if re.search(r"(?i)(?:^|[\\/])cmd(?:\.exe)?(?:\s|$)", value):
+            return True
+    return False
 
 
 def _active_powershell(text: str) -> str:
@@ -1482,7 +1507,11 @@ def _validate_powershell_ast(script: Path, errors: list[str]) -> None:
     if pwsh is None:
         return
     parser = r'''
-param([string]$Path)
+$Path = [Environment]::GetEnvironmentVariable('__AUDIT_PATH_ENV__')
+if ([string]::IsNullOrWhiteSpace($Path)) {
+  [Console]::Error.WriteLine("PowerShell audit path is missing")
+  exit 2
+}
 $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -1525,9 +1554,13 @@ $commands = @($ast.FindAll({
 })
 $commands | ConvertTo-Json -Compress
 '''
+    parser = parser.replace("__AUDIT_PATH_ENV__", POWERSHELL_AUDIT_PATH_ENV)
+    parser_environment = os.environ.copy()
+    parser_environment[POWERSHELL_AUDIT_PATH_ENV] = str(script)
     result = subprocess.run(
-        [pwsh, "-NoProfile", "-NonInteractive", "-Command", parser, "-Path", str(script)],
-        text=True, capture_output=True, check=False,
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", parser],
+        text=True, capture_output=True, check=False, shell=False,
+        env=parser_environment,
     )
     if result.returncode != 0:
         errors.append("build-windows-release.ps1: PowerShell AST parse failed: " +
@@ -1556,7 +1589,7 @@ $commands | ConvertTo-Json -Compress
     contract = subprocess.run(
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script),
          "-SourceDir", str(script.parents[1]), "-ContractTest"],
-        text=True, capture_output=True, check=False,
+        text=True, capture_output=True, check=False, shell=False,
     )
     if contract.returncode != 0:
         errors.append("build-windows-release.ps1: injected fake-tool contract failed: " +
@@ -1614,8 +1647,7 @@ def check(root: Path, build_dir: Path | None = None,
                 errors.append(f"{relative}:{number}: lossy Windows path conversion/API is forbidden")
 
     all_source = "\n".join(texts.values())
-    if re.search(r"\b(?:system|popen|_popen|ShellExecute[AW]?)\s*\(", all_source) or \
-            re.search(r"(?i)\bcmd(?:\.exe)?\b", all_source):
+    if has_shell_process_launch(all_source):
         errors.append("server process launch: shell invocation is forbidden; execute argv directly")
 
     runtime_values = re.findall(
