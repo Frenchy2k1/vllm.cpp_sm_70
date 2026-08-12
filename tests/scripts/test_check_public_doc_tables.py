@@ -33,9 +33,11 @@ doc_tables = _load("doc_tables", "scripts/check-public-doc-tables.py")
 roll_record = _load("roll_record", "scripts/roll-benchmark-record.py")
 
 
-# The whole-file character budget retired on 2026-08-12 (#460). Kept here only
-# so the tests that prove a row no longer has to evict one can say what it is
-# that used to make that impossible.
+# The whole-file character budget retired on 2026-08-12 (#460). Used by exactly
+# one test, on a SYNTHETIC page that test builds itself, so that the "a row no
+# longer has to evict one" claim can name the size it is talking about. It must
+# never be compared against a real page: that would store a measurement of one
+# file inside another, which is the defect this row removed.
 RETIRED_PAGE_BUDGET = 45000
 
 # A minimal scoreboard that satisfies every rule, used as the mutation baseline.
@@ -267,9 +269,20 @@ class BenchmarksStructureTests(unittest.TestCase):
         It is added and dropped again inside this test, so the page is not
         edited; what is asserted is that the surface would accept it.
 
-        `RETIRED_PAGE_BUDGET` is the 45,000-char rule that used to make this
-        impossible. If the page is ever compacted far below it this assertion
-        stops being meaningful and should be deleted, not relaxed.
+        The row is inserted DIRECTLY BELOW the last row of the Open gaps table,
+        with no blank line between, so markdown renders it inside that table
+        rather than it merely satisfying _table_rows. An earlier revision
+        separated it by blank lines, which proved the checker claim but not the
+        placement.
+
+        Nothing here compares the grown page against the retired 45,000-char
+        budget. That assertion would store a measurement of docs/BENCHMARKS.md
+        inside this test file, which is exactly what AGENTS.md, Records, forbids
+        and what #460 removed: it had 173 characters of margin, so any PR
+        compacting the page by more than that turned it red in a file it does
+        not own, and 887e04ff shrank the page by 280. The above-the-budget point
+        is made by test_a_new_row_costs_no_eviction, on a synthetic page that
+        test builds itself.
         """
         text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
         self.assertEqual(doc_tables.benchmarks_errors(text), [])
@@ -285,9 +298,19 @@ class BenchmarksStructureTests(unittest.TestCase):
         # so a REALISTIC row was unaffordable, not just a pathological one.
         self.assertGreater(len(owed), 328)
         self.assertLessEqual(len(owed), doc_tables.MAX_ROW_CHARS)
-        grown = text.replace("\n## Reproduce", f"\n{owed}\n\n## Reproduce", 1)
+
+        before, sep, after = text.partition("\n## Reproduce")
+        self.assertEqual(sep, "\n## Reproduce")
+        open_gaps = before.rstrip("\n")
+        self.assertTrue(
+            open_gaps.endswith("|"),
+            "the last thing before ## Reproduce is expected to be the final Open "
+            "gaps table row; if it is not, this test is inserting the owed row "
+            "somewhere markdown will not render it in that table",
+        )
+        grown = f"{open_gaps}\n{owed}\n{sep}{after}"
         self.assertNotEqual(grown, text)
-        self.assertGreater(len(grown), RETIRED_PAGE_BUDGET)
+        self.assertIn(f"|\n{owed}\n", grown)
         self.assertEqual(doc_tables.benchmarks_errors(grown), [])
         # Nothing was evicted to make room.
         for _, _, row in doc_tables._table_rows(text):
@@ -385,6 +408,96 @@ class BenchmarksStructureTests(unittest.TestCase):
         for rules in (doc_tables.BENCHMARKS_RULES, doc_tables.FEATURES_RULES):
             self.assertFalse(hasattr(rules, "max_chars"), rules.name)
         self.assertNotIn("chars", doc_tables.STATUS_RATCHET)
+
+    def test_a_wall_of_BULLETS_fails(self) -> None:
+        """M8: the exact mutant the retired byte cap used to catch.
+
+        3,000 appended bullet lines. Under `max_chars` this was rejected as
+        "113833 chars, over the 45000-char scoreboard budget". Between the entry
+        cap landing and the 2026-08-12 fold it was rejected by NOTHING:
+        _prose_paragraphs excluded every line starting with "-", so the wall was
+        outside the paragraph count, MAX_PARAGRAPH_CHARS, MAX_CELL_CHARS,
+        MAX_ROW_CHARS and the dated-heading guard at once. It is the append-log
+        class the spec's stop condition names, so it is the condition of the
+        removal, not a nicety.
+        """
+        wall = "\n".join(
+            f"- attempt {i}: lever measured neutral, reverted, see the record"
+            for i in range(3000)
+        )
+        errors = doc_tables.benchmarks_errors(VALID + "\n\n" + wall + "\n")
+        self.assertTrue(any("prose paragraph of" in e for e in errors), errors[:3])
+
+    def test_a_wall_of_BLOCKQUOTES_fails(self) -> None:
+        # Same channel, the other excluded prefix.
+        wall = "\n".join(f"> quoted forensic note {i}" for i in range(3000))
+        errors = doc_tables.benchmarks_errors(VALID + "\n\n" + wall + "\n")
+        self.assertTrue(any("prose paragraph of" in e for e in errors), errors[:3])
+
+    def test_appended_UNDATED_subsections_with_bullets_fail(self) -> None:
+        """M7: the dated-heading guard fires on a DATE, so it never saw this.
+
+        500 appended UNDATED "### Attempt N" sections carrying bulleted
+        forensics measured 117,222 characters with the checker exiting 0 and all
+        68 tests green. The heading guard cannot reach it, by construction. The
+        paragraph COUNT does, once the bullets are counted.
+        """
+        appended = "\n".join(
+            f"### Attempt {i}\n\n- lever {i} measured neutral on a warm box\n"
+            f"- reverted, probe kept\n"
+            for i in range(500)
+        )
+        errors = doc_tables.benchmarks_errors(VALID + "\n" + appended)
+        self.assertTrue(any("prose paragraphs" in e for e in errors), errors[:3])
+
+    def test_a_short_bullet_list_is_still_allowed(self) -> None:
+        # The fold is a budget, not a ban: a legitimate short list passes.
+        mutated = VALID.replace(
+            "Greedy, closed loop, three interleaved repetitions.",
+            "Greedy, closed loop.\n\n- three interleaved repetitions\n"
+            "- one flock holder\n- cold leg discarded\n",
+        )
+        self.assertEqual(doc_tables.benchmarks_errors(mutated), [])
+
+    def test_a_bullet_run_is_ONE_paragraph_not_many(self) -> None:
+        # Folding must not turn every legitimate list item into a paragraph, or
+        # the count budget would fire on ordinary documents instead of walls.
+        text = "intro line\n\n- a\n- b\n- c\n\ntail line\n"
+        self.assertEqual(
+            [para for _, para in doc_tables._prose_paragraphs(text)],
+            ["intro line", "- a - b - c", "tail line"],
+        )
+
+    def test_an_EMPHASIS_lead_wall_is_a_KNOWN_residue(self) -> None:
+        """Characterisation, not approval: issue #507, spec W8.
+
+        A line beginning with emphasis still starts with "*" and is still
+        excluded, so a wall led by "**bold**" is unbounded. Closing it turns
+        four paragraphs already shipped on docs/BENCHMARKS.md red against
+        MAX_PARAGRAPH_CHARS (717, 719, 748, 1,084 chars), which owes an edit to
+        a page #481 holds open, so it takes its own spec and red-before.
+
+        This test goes RED the day that lands. That is the point: the residue is
+        recorded where the next author will meet it, and closing it is a
+        deliberate act rather than a silent one.
+        """
+        wall = "\n\n".join(f"**Attempt {i}.** " + "x " * 200 for i in range(500))
+        self.assertEqual(doc_tables.benchmarks_errors(VALID + "\n\n" + wall + "\n"), [])
+
+    def test_the_shipped_pages_sit_at_their_folded_paragraph_budget(self) -> None:
+        # The budgets are pinned to what the pages MEASURE under the fold, which
+        # is what makes re-baselining FEATURES from 20 to 21 a re-measurement
+        # and not slack. If either page shrinks, these numbers come down.
+        for page, rules, expected in (
+            ("docs/BENCHMARKS.md", doc_tables.BENCHMARKS_RULES, 35),
+            ("docs/FEATURES.md", doc_tables.FEATURES_RULES, 21),
+        ):
+            with self.subTest(page=page):
+                text = (ROOT / page).read_text(encoding="utf-8")
+                self.assertEqual(
+                    len(doc_tables._prose_paragraphs(text)), expected
+                )
+                self.assertEqual(rules.max_prose_paragraphs, expected)
 
     def test_missing_record_link_fails(self) -> None:
         mutated = VALID.replace(
@@ -831,7 +944,12 @@ class StatusRatchet(unittest.TestCase):
         """
         ceiling = {
             "h2_sections": 11,
-            "long_paragraphs": 82,
+            # 75, down from 82 on 2026-08-12: _prose_paragraphs now folds list
+            # items in, so docs/STATUS.md measures 75 long paragraphs where it
+            # measured 82, and the ratchet followed the measurement DOWN in the
+            # same change. Lowered here in the same commit, which is what this
+            # test's own message demands.
+            "long_paragraphs": 75,
             "oversized_cells": 44,
         }
         self.assertEqual(

@@ -368,8 +368,76 @@ class LinkExtraction(unittest.TestCase):
         text = "`VT_FLAG=1` and [spec](specs/example.md)\n"
         self.assertEqual(agent_record.extract_links(text), ["specs/example.md"])
 
+    def test_a_fence_with_an_INFO_STRING_does_not_close_a_block(self) -> None:
+        """The F2 defect, minimised.
+
+        CommonMark: a closing fence carries no info string. Treating ```sh as a
+        close INVERTS fence phase for the rest of the file, so prose after the
+        next real fence gets blanked and text inside a block gets validated.
+        The two assertions are the two halves of the inversion. First: with no
+        real close, everything after ```sh is still inside. Second, and this is
+        the half that bit the tree: the BARE fence is the close, so the link
+        below it is live and the one above it is not. Under the loose rule both
+        answers were exactly backwards.
+        """
+        self.assertEqual(
+            agent_record.extract_links("```\nopen\n```sh\ninside [a](nope-a.md)\n"),
+            [],
+        )
+        self.assertEqual(
+            agent_record.extract_links(
+                "```\nopen\n```sh\ninside [a](nope-a.md)\n```\n"
+                "after [b](specs/example.md)\n"
+            ),
+            ["specs/example.md"],
+        )
+
+    def test_a_closing_fence_must_match_the_opener(self) -> None:
+        # Wrong character, then too short: neither closes, so the link after it
+        # is still inside the block.
+        for closer in ("~~~", "``"):
+            with self.subTest(closer=closer):
+                text = f"````\ncode\n{closer}\n[x](nope.md)\n"
+                self.assertEqual(agent_record.extract_links(text), [])
+
+    def test_a_LONGER_closing_fence_does_close(self) -> None:
+        text = "```\ncode\n`````\n\nreal [spec](specs/example.md)\n"
+        self.assertEqual(agent_record.extract_links(text), ["specs/example.md"])
+
+    def test_prose_two_lines_below_a_closed_fence_is_still_scanned(self) -> None:
+        """The live case, in the file that actually mis-paired.
+
+        .agents/completed/state-events/0000-00/STATE-LEGACY-000001.md has an
+        unclosed fence at :17697. Under the loose rule the ```sh at :17948
+        "closed" it, phase inverted, and the ordinary prose link at :18297 was
+        blanked: a reader-followable link silently stopped being validated.
+        """
+        source = ROOT / ".agents/completed/state-events/0000-00/STATE-LEGACY-000001.md"
+        targets = agent_record.extract_links(source.read_text(encoding="utf-8"))
+        self.assertIn("specs/cpu-llamacpp-floor-remeasure-2026-07-22.md", targets)
+
+    def test_a_link_straddled_by_two_INLINE_SPANS_is_not_extracted(self) -> None:
+        """F5: `[`name`](path)` is four backticks, and not a link.
+
+        CommonMark reads it as the code span `[`, the literal text name, and the
+        code span `](path)`, so there is no link and the checker agrees. It
+        earns a test because the effect is to HIDE a target that does not exist:
+        this row's own spec carried the form and hid `path`. An author who wants
+        to SHOW the form writes it with a double-backtick delimiter, which is
+        also code and also correctly skipped; an author who wants a real link
+        writes it without the outer pair, which still resolves.
+        """
+        self.assertEqual(agent_record.extract_links("`[`name`](path)`\n"), [])
+        self.assertEqual(agent_record.extract_links("`` [`name`](path) ``\n"), [])
+        self.assertEqual(
+            agent_record.extract_links("[`name`](specs/example.md)\n"),
+            ["specs/example.md"],
+        )
+
     def test_stripping_preserves_line_and_column_positions(self) -> None:
-        # Blanked, not deleted: reported line numbers must stay honest.
+        # Blanked, not deleted, so every line and column offset survives. NOT
+        # evidence of anything today: check_links reports no line numbers at
+        # all. Held so a caller that does report them cannot be broken here.
         text = "a\n```\nbbbb\n```\nc `dd` e\n"
         stripped = agent_record.strip_code_spans(text)
         self.assertEqual(len(stripped.splitlines()), len(text.splitlines()))

@@ -27,8 +27,11 @@ every change to touch a shared file, that is the defect**.
 
 1. `max_chars` on `PageRules` in `scripts/check-public-doc-tables.py`, which
    applies to `docs/BENCHMARKS.md` (45,000) and `docs/FEATURES.md` (30,000).
-2. The entry-scoped rules that take over its obligation: a per-row character
-   cap, and a regrowth guard on per-attempt headings at any depth.
+2. The rules that take over its obligation: a per-row character cap, a regrowth
+   guard on per-attempt headings at any depth, and, added for review finding F1,
+   a `_prose_paragraphs` that counts list items and blockquote lines so the
+   append-only wall the byte cap was also catching stays caught. The first two
+   are entry-scoped; the third is a count, and Risks says so plainly.
 3. `check_links` in `scripts/check-agent-record.py`, so the archive path the
    scoreboard points at works for a row that carries a relative link.
 4. The mutation suites `tests/scripts/test_check_public_doc_tables.py` and
@@ -106,9 +109,16 @@ instead. The subset of payable rows shrinks every time one is spent.
 **What the cap is actually still catching.** `_h2_headers` matches `## ` only,
 so `### ` subsections are ungoverned by the canonical-section allowlist. The
 live page carries six of them. An appended per-attempt `### ` section is
-rejected today by nothing except the character budget. This is the one real
-obligation `max_chars` still discharges, and it is the one the replacement has
-to pick up.
+rejected today by nothing except the character budget.
+
+**Corrected 2026-08-12, review finding F1: that is not the only obligation.**
+`_prose_paragraphs` also excludes every line starting with `-`, `*`, `>`, `|` or
+`#`, so a bulleted or blockquoted wall of forensics is outside the paragraph
+count, `MAX_PARAGRAPH_CHARS`, `MAX_CELL_CHARS`, `MAX_ROW_CHARS` and the heading
+guard at once. The character budget is the only thing that ever caught it, which
+means the replacement has to pick up **two** obligations, not one: the appended
+subsection, and the append-only wall of list and quote lines. Design §3a is the
+second. The mutation table in Risks is the measurement.
 
 ## Port map
 
@@ -116,8 +126,8 @@ to pick up.
 
 | Anchor | What changes |
 |---|---|
-| `scripts/check-public-doc-tables.py` | `max_chars` removed from `PageRules`; `MAX_ROW_CHARS` and `DATED_HEADING_RE` added; `page_errors` gains the two entry-scoped checks |
-| `scripts/check-agent-record.py` | `check_links` gains `extract_links`, a pure fenced/inline-code-aware link scanner; `link_base` becomes `link_bases` |
+| `scripts/check-public-doc-tables.py` | `max_chars` removed from `PageRules`; `MAX_ROW_CHARS` and `DATED_HEADING_RE` added; `page_errors` gains the two entry-scoped checks; `_prose_paragraphs` folds list items and blockquote lines in (`LIST_ITEM_RE`), so `max_prose_paragraphs` re-baselines to 21 on FEATURES and `STATUS_RATCHET["long_paragraphs"]` tightens 82 to 75 |
+| `scripts/check-agent-record.py` | `check_links` gains `extract_links`, a pure fenced/inline-code-aware link scanner; `FENCE_RE` and `strip_code_spans` implement CommonMark's closing-fence rule; `link_base` becomes `link_bases` |
 | `tests/scripts/test_check_public_doc_tables.py` | three `max_chars` tests replaced by entry-cap, regrowth and no-eviction tests |
 | `tests/scripts/test_agent_record.py` | new `LinkExtraction` cases |
 | `docs/BENCHMARKS.md` | **unchanged.** The owed row is added and dropped inside `test_the_shipped_page_can_accept_the_next_measurement_row`, so the surface is proven without writing a fact #481 already owns |
@@ -144,13 +154,48 @@ characters.
 *3. `DATED_HEADING_RE` rejects a per-attempt heading at any depth.* This is the
 regrowth guard, the same shape as the `ROW_TABLE_LINE` guard `87308dea` added to
 `check-now-current.py`, and it closes the `### ` hole the character cap was
-covering. The shape is measured, not invented: of the **301 sections already
-rolled into `.agents/benchmark-record.md`, 278 name a date in their heading**
+covering. The shape is measured, not invented: of the **305 sections already
+rolled into `.agents/benchmark-record.md`, 282 name a date in their heading**
 (`2026-08-07`, `2026-07-31`, ...), which is what a per-attempt entry looks like
-here. **Zero of the 16 live headings on `docs/BENCHMARKS.md` and zero of the 16
-on `docs/FEATURES.md` name a date.** So the guard fires on the first appended
-checkpoint section, at `##` or `###`, and never on a subject section. This is
-strictly tighter than the status quo, which checks `##` only.
+here. **Zero of the 36 live headings across the two public pages name a date**
+(18 each, at every depth, `_headings`). So the guard fires on the first appended
+DATED checkpoint section, at `##` or `###`, and never on a subject section.
+
+**What this guard is, and is not, tighter than.** It is strictly tighter than
+the canonical-section allowlist it joins, which runs over `_h2_headers` and so
+sees `## ` only: a DATED `### ` subsection was previously rejected by nothing
+but the character budget. It is **not** tighter than the retired byte cap in
+general, and the first revision of this spec, of the checker comment and of the
+PR body all said that it was. That claim is false and was proven false by
+mutation. An **undated** appended subsection passes this guard by construction,
+because the guard fires on a *date*. See §3a, which is the rule that closes
+that.
+
+*3a. `_prose_paragraphs` folds list items and blockquote lines in.* Added
+2026-08-12 in response to review finding F1, which is the finding that showed
+§3 alone does not discharge the stop condition. `_prose_paragraphs` excluded
+every line starting with `-`, `*`, `>`, `|` or `#`, so a bulleted or quoted wall
+was counted by **nothing**: not the paragraph count, not `MAX_PARAGRAPH_CHARS`,
+not `MAX_CELL_CHARS`, not `MAX_ROW_CHARS`, and not the heading guard. Two
+mutations measured it against the real checker with the entry cap in place:
+
+| mutant | page size | verdict before §3a | verdict after |
+|---|---:|---|---|
+| 3,000 appended bullet lines (the exact mutant `test_oversized_page_fails` used, which BASE rejects as `113833 chars, over the 45000-char scoreboard budget`) | 113,833 | **SURVIVED**, `[]` | CAUGHT, `prose paragraph of 194014 chars exceeds 700` |
+| 500 appended UNDATED `### Attempt N` sections with bulleted forensics | 117,222 | **SURVIVED**, exit 0, 68/68 green | CAUGHT, `535 prose paragraphs, over the 35 budget` |
+| 3,000 appended blockquote lines | 127,718 | **SURVIVED**, `[]` | CAUGHT, `prose paragraph of 83014 chars exceeds 700` |
+
+A contiguous run of list items folds into ONE paragraph rather than N, so a
+legitimate short list costs one paragraph and a wall trips
+`MAX_PARAGRAPH_CHARS`, while a run per appended section trips the paragraph
+COUNT. `docs/BENCHMARKS.md` carries no list item and is unmoved at 35;
+`docs/FEATURES.md` carries one and moves 20 to 21, so `max_prose_paragraphs` is
+**re-baselined to 21**, which is a re-measurement under a larger counted
+population and not slack. `docs/STATUS.md` shares the function and moves the
+other way, 82 long paragraphs to 75, because its 29 list items now join
+neighbouring paragraphs instead of splitting them; `STATUS_RATCHET` follows the
+measurement **down** to 75 in the same change, since banking the 7 units would
+be exactly the slack the ratchet exists to refuse.
 
 *4. `check_links` stops validating text that is not a link, and the archive
 resolves what it archived.* Two changes, both narrow:
@@ -161,6 +206,18 @@ resolves what it archived.* Two changes, both narrow:
   resolves") to be about. Today the checker forbids any document in the tree
   from *showing* a link in sample output, which is why #460's own reproduction
   is a fence.
+- **The pairing rule is CommonMark's**, added 2026-08-12 for review finding F2.
+  A closing fence must use the opener's character, be at least as long, and
+  carry nothing but whitespace after the marker; a line with an info string
+  opens a block and never closes one. The first revision closed on any line
+  matching `^\s*(```+|~~~+)`, which does not fail safe: it **inverts fence phase**
+  for the rest of the file. With the one unbalanced fence this tree already has,
+  the bare ` ``` ` at
+  `.agents/completed/state-events/0000-00/STATE-LEGACY-000001.md:17697` was
+  "closed" by the ` ```sh ` at `:17948`, and from there ordinary prose was
+  blanked, including a live reader-followable spec link at `:18297`. Under the
+  corrected rule that link is validated again and three lines of genuinely
+  fenced sample are not.
 - `.agents/benchmark-record.md` resolves a target from `docs/` as well as from
   `.agents/`. It is the declared archive of `docs/BENCHMARKS.md`, so content
   moved into it verbatim was written against `docs/`. `link_base` already
@@ -198,10 +255,16 @@ next cadence of parallel work".
 `tests/scripts/test_check_public_doc_tables.py`:
 
 - `test_the_shipped_page_can_accept_the_next_measurement_row`: **the acceptance
-  test.** It adds the owed 35B canonical regrid row to the REAL page, asserts
-  every pre-existing row survives, and asserts the result is valid above the
-  retired budget. The row is added and dropped inside the test, so the page is
-  not edited and #481 is not collided with.
+  test.** It adds the owed 35B canonical regrid row to the REAL page,
+  immediately below the last row of the Open gaps table so markdown renders it
+  inside that table, and asserts every pre-existing row survives. The row is
+  added and dropped inside the test, so the page is not edited and #481 is not
+  collided with. It does NOT assert the grown page exceeds the retired budget:
+  review finding F3 showed that assertion stored a measurement of
+  `docs/BENCHMARKS.md` inside a test file, with 173 characters of margin, so any
+  PR compacting the page by more than that turned it red in a file it does not
+  own. `887e04ff` shrank the page by 280 and `93613baa` by 43. The
+  above-the-budget point belongs to the synthetic test below and is made there.
 - `test_a_new_row_costs_no_eviction`: the same property on a synthetic page
   sized past the retired 45,000 budget. RED on BASE, which reports
   `48836 chars, over the 45000-char scoreboard budget`.
@@ -222,6 +285,20 @@ next cadence of parallel work".
   the new guard as shipped.
 - `test_no_page_carries_a_whole_file_size_budget`: the invariant behind this
   row, held as a rule rather than as a habit.
+- `test_a_wall_of_BULLETS_fails`, `test_a_wall_of_BLOCKQUOTES_fails` and
+  `test_appended_UNDATED_subsections_with_bullets_fail`: mutants M8, M8b and M7
+  from Risks, each RED on the first revision of this row and on nothing before
+  it except the byte cap.
+- `test_a_short_bullet_list_is_still_allowed` and
+  `test_a_bullet_run_is_ONE_paragraph_not_many`: the fold is a budget, not a ban,
+  and a run costs one paragraph rather than N, which is what keeps the count
+  budget off ordinary documents.
+- `test_an_EMPHASIS_lead_wall_is_a_KNOWN_residue`: characterisation of M11. It
+  goes RED the day W8 lands, which is the point.
+- `test_the_shipped_pages_sit_at_their_folded_paragraph_budget`: the two
+  paragraph budgets are pinned to what the pages measure under the fold, so
+  re-baselining FEATURES from 20 to 21 is a re-measurement and cannot become
+  slack.
 - Replaced: `test_oversized_page_fails`,
   `test_release_projection_fits_after_current_main_merge`'s `max_chars`
   assertion, `test_the_two_pages_have_distinct_budgets`'s `max_chars`
@@ -236,10 +313,22 @@ next cadence of parallel work".
 - `test_live_link_is_still_extracted`, `test_a_backticked_label_is_still_a_link`,
   `test_link_after_a_closed_fence_is_still_extracted` and
   `test_link_beside_an_inline_span_is_still_extracted`: the narrowing does not
-  swallow real links, including the `[`name`](path)` form this tree uses
+  swallow real links, including the `` [`name`](path) `` form this tree uses
   everywhere.
 - `test_stripping_preserves_line_and_column_positions`: spans are blanked, not
-  deleted, so reported line numbers stay honest.
+  deleted, so every line and column offset survives. Review finding F6: this is
+  NOT evidence of anything today, because `check_links` reports no line numbers
+  at all. It is held so that a caller that does report positions cannot be
+  broken by this function, and the docstring now says so.
+- `test_a_fence_with_an_INFO_STRING_does_not_close_a_block`,
+  `test_a_closing_fence_must_match_the_opener` and
+  `test_a_LONGER_closing_fence_does_close`: CommonMark's closing-fence rule, both
+  directions (F2).
+- `test_prose_two_lines_below_a_closed_fence_is_still_scanned`: the live case, on
+  the real file that mis-paired. RED on the first revision of this row.
+- `test_a_link_straddled_by_two_INLINE_SPANS_is_not_extracted`: two stray
+  backticks hide a target, matching the renderer, and the ordinary
+  `` [`name`](path) `` form is still a link (F5).
 - `test_an_archived_row_with_a_docs_relative_link_is_accepted`: the #460
   reproduction, moved into the record as live markdown, resolves. RED on BASE
   with `dangling link bench-evidence/rpi5-a76-q8-dot-20260806.md`.
@@ -258,10 +347,13 @@ next cadence of parallel work".
 5. `python3 scripts/check-pr-size.py` red-before/green-after harness on both
    changed checkers: it reruns each HEAD test module against the BASE checker in
    an isolated worktree and refuses the PR unless BASE goes red.
-6. Acceptance: the live `docs/BENCHMARKS.md` plus the owed row is valid, carries
-   one more row and no fewer, and exceeds the retired budget while doing it.
-   Measured on the merged tree: **44,832 chars and 162 rows, to 45,173 chars and
-   163 rows, errors `[]`**, with every pre-existing row asserted still present.
+6. Acceptance: the live `docs/BENCHMARKS.md` plus the owed row is valid and
+   carries one more row and no fewer, with the row placed directly under the
+   last Open gaps row so it renders in that table. Measured on the merged tree:
+   **162 rows to 163, errors `[]`**, with every pre-existing row asserted still
+   present. The test no longer compares the page against the retired budget: see
+   Tests to port, and review finding F3.
+7. The mutation set, run against three trees. Table in Risks.
 
 **No GPU. Nothing here measures.**
 
@@ -277,6 +369,9 @@ next cadence of parallel work".
   GATE-PIN-UNPINNED-SNAPSHOTS #471 and four SPEC-DSPARK measurements #442).
   Merged, and every gate rerun on the merged tree. The measurements in Our
   baseline are as taken at `918c568a` and are not restated.
+- #481 also blocks W8 / #507, for the same reason it shapes the acceptance
+  demonstration: closing the emphasis-lead residue owes an edit to four
+  paragraphs on a page #481 holds open.
 - Nothing else blocks.
 
 ## Work breakdown
@@ -290,21 +385,63 @@ next cadence of parallel work".
 | W5 | Teach `roll-benchmark-record.py` to record the archived section's origin explicitly, rather than relying on W3's two-base resolution | **DEFERRED.** W3 makes the move work; W5 would make it self-describing. No blocker depends on it. |
 | W6 | Make `_h2_headers` fence-aware, so the gate and the rollup agree on what a section is ([#495](https://github.com/mudler/vllm.cpp/issues/495)) | **DEFERRED, filed not fixed.** Found doing W2 and reproduced: `_h2_headers` is a bare `startswith("## ")` scan while `split_sections` tracks fences, so a heading-shaped line inside a fence is a section to the gate and not to the script the gate tells you to run. It changes what an existing gate counts, so it takes its own spec and red-before rather than riding along here. Neither page has a fenced heading today. W2's `_headings` is already fence-aware and is the natural basis for the repair. |
 | W7 | Retire `MAX_README_CHARS` the same way ([#498](https://github.com/mudler/vllm.cpp/issues/498)) | **DEFERRED, filed not fixed.** `README.md` measures 29,965 of 30,000: **35 characters free**, tighter than any of the three budgets already retired. 13 of the last 20 commits touching it sat under 60 free, `031410e8` landed it 52 OVER, and `row/DOCS-README-BUDGET` (#161) is a whole merged row whose purpose was paying rent. Same defect, third checker (`check-readme-structure.py`), so it needs its own spec and its own mutation in `tests/scripts/test_check_readme_structure.py` rather than riding along here. |
+| W8 | Close the EMPHASIS-lead paragraph residue ([#507](https://github.com/mudler/vllm.cpp/issues/507)) | **DEFERRED, filed not fixed.** §3a folds list items and blockquote lines into `_prose_paragraphs`, but a line opening with emphasis still starts with `*` and is still excluded, so a `**bold**`-led prose wall is unbounded (mutant M11). Replacing the bare `*` prefix with `LIST_ITEM_RE` closes it and immediately turns FOUR paragraphs already shipped on `docs/BENCHMARKS.md` red against `MAX_PARAGRAPH_CHARS`, at 717, 719, 748 and 1,084 characters, so it owes an edit to a page #481 holds open and it changes what an existing gate counts. Own spec, own red-before. `test_an_EMPHASIS_lead_wall_is_a_KNOWN_residue` pins the residue and goes red the day it lands. |
 
 ## Risks/decisions
 
 **Risk: removing a size gate lets the page bloat.** Answered by measurement, not
-assertion. What bloated the page to 11,405 lines was per-attempt sections, and
-after W2 the first one fails at either heading depth, where today only `##` is
-covered. Prose is still capped at 35 paragraphs and 700 characters each, cells
-at 220, and rows now at 600. The one growth W2 permits that the cap forbade is
-*more subject rows*, which is the page doing its job.
+assertion, and the first answer was wrong. What bloated the page to 11,405 lines
+was per-attempt sections, and after W2 a DATED one fails at either heading
+depth, where before only `##` was covered. But a bulleted or blockquoted wall,
+with or without undated `###` headings above it, was caught by nothing at all
+until §3a folded those lines into `_prose_paragraphs`. The full mutation set,
+run against BASE `origin/main`, against the first revision of this row, and
+against the revision that lands (`scratchpad/mutate.py`, reproduced in the PR
+body):
+
+| mutant | BASE | first revision | landed |
+|---|---|---|---|
+| M1 dated `##` appended | CAUGHT | CAUGHT | CAUGHT |
+| M1b dated `###` appended | CAUGHT | CAUGHT | CAUGHT |
+| M2 one row over 600 | CAUGHT (by size) | CAUGHT | CAUGHT |
+| M3 legal cells, illegal row | CAUGHT (by size) | CAUGHT | CAUGHT |
+| M4 required section dropped | CAUGHT | CAUGHT | CAUGHT |
+| M5 em-dash | CAUGHT | CAUGHT | CAUGHT |
+| M6 200 legal rows, 599 chars each | CAUGHT (by size) | SURVIVED | **SURVIVED, intended** |
+| M7 500 undated `###` + bullets | CAUGHT (by size) | **SURVIVED** | CAUGHT |
+| M8 3,000 bullet lines | CAUGHT (by size) | **SURVIVED** | CAUGHT |
+| M8b 3,000 blockquote lines | CAUGHT (by size) | **SURVIVED** | CAUGHT |
+| M9 live post-fence link redirected to a missing target | CAUGHT | **SURVIVED** | CAUGHT |
+| M10 archived row, missing `docs/`-relative link | CAUGHT | CAUGHT | CAUGHT |
+| M11 500 `**bold**`-lead paragraphs | CAUGHT (by size) | SURVIVED | **SURVIVED, known residue** |
+
+Two mutants the byte cap caught are not caught after this row, and both are
+stated rather than glossed. **M6 is the point of the row**: rows are the growth
+mode of a keyed table, each is capped at 600, and no author pays for one by
+deleting another's. **M11 is a defect**, filed as
+[#507](https://github.com/mudler/vllm.cpp/issues/507) and deferred as W8: a line
+opening with emphasis starts with `*` and is still excluded, so a `**bold**`-led
+wall is unbounded. It is deferred, not dismissed, because closing it turns four
+paragraphs already shipped on `docs/BENCHMARKS.md` red against
+`MAX_PARAGRAPH_CHARS` (717, 719, 748 and 1,084 characters) and so owes an edit
+to a page #481 holds open. `test_an_EMPHASIS_lead_wall_is_a_KNOWN_residue` pins
+it and goes red the day it is closed.
 
 **Risk: `DATED_HEADING_RE` fires on a legitimate heading.** A pinned-date
 subject would trip it, for example "vLLM 0.26.0 as of 2026-08-12". Measured
-against both live pages: zero of 32 headings match. If one is ever wanted, the
-date belongs in the row or the prose, which are unaffected. The error message
-says so.
+against both live pages: zero of 36 headings match, 18 per page at every depth.
+If one is ever wanted, the date belongs in the row or the prose, which are
+unaffected. The error message says so.
+
+**Risk: the paragraph budget is itself a whole-page count.** It is, and both
+pages now sit exactly on it: `docs/BENCHMARKS.md` at 35 of 35 and
+`docs/FEATURES.md` at 21 of 21. So this row removes the file lock on ROWS and
+leaves one on PROSE. That is deliberate and is the same line #364 drew when it
+deleted `chars` from `STATUS_RATCHET` and kept `long_paragraphs`: rows are how a
+keyed table grows and prose is how it decays, so the count is a quality gate on
+the decay mode rather than rent on the growth mode. It is still a real cost to
+an author adding a paragraph, and it is now recorded in the `PageRules`
+docstring so the next one meets it there instead of in CI.
 
 **Risk: `MAX_ROW_CHARS = 600` is tuned to current content.** It is, and that is
 sound for an entry cap in a way it is not for a file cap: an author who needs a
@@ -316,9 +453,34 @@ is thin (580 of 600). Accepted; the alternative, no row cap, leaves
 rule was always about. A fenced target is not a link under CommonMark, so no
 reader can follow it and no rendering can dangle. Real links, including one on
 the same line after a closed inline span, stay checked, and
-`test_the_tree_has_no_dangling_link` holds the whole tree. Measured across the
-481 markdown files the checker scans: **4,109 targets before the strip, 4,105
-after**, so 4 stop being validated and all 4 are quoted samples.
+`test_the_tree_has_no_dangling_link` holds the whole tree.
+
+Measured on the merged tree over the markdown files the checker scans:
+**4,114 targets before the strip, 4,110 after**, so 4 stop being validated. All
+4 sit in a genuinely fenced sample: three inside the unclosed block at
+`.agents/completed/state-events/0000-00/STATE-LEGACY-000001.md:17697`
+(`porting.md`, `../tests/vt/test_ops_matmul_elem.cpp`,
+`specs/accelerator-seam-audit.md`), and one inline span in this spec, the
+`path` placeholder in the `` [`name`](path) `` sample. **The first revision of this
+row dropped 5, not 4, and the fifth was NOT a sample**: it was the live prose
+link at `:18297`, lost to the fence mis-pairing F2 describes. The corrected
+pairing restores it. Reproduce with `extract_links` over `markdown_files()`.
+
+**Risk: two stray backticks hide a target that does not exist.** They do. This
+form, which this spec itself carried until F5 found it:
+
+```text
+`[`name`](path)`
+```
+
+is four backticks, so CommonMark reads it as a code span holding an open
+bracket, the literal text name, and a second code span holding the rest, and
+there is no link for the checker to validate. The checker agrees with the
+renderer, which is the rule, but the consequence is that wrapping a dangling
+link in backticks hides it. Pinned by
+`test_a_link_straddled_by_two_INLINE_SPANS_is_not_extracted`, which asserts the
+same answer for the double-backtick form an author should use instead, and
+asserts that the ordinary `` [`name`](path) `` form is still a link.
 
 **Risk: an unbalanced fence blanks the rest of a file.** It does, and one file
 in the tree has one: `.agents/specs/laguna-s21-scope-2026-07-30.md` ends on a
@@ -345,9 +507,18 @@ entry-scoped rules.
   over `git log --format=%h -25 -- docs/BENCHMARKS.md`. Table in Our baseline.
 - `04b2b9fa` over the cap: `git show 04b2b9fa:docs/BENCHMARKS.md | wc -c` gives
   45,007.
-- Heading-shape survey: 278 of 301 archived section titles carry a date, 0 of 32
-  live headings do.
+- Heading-shape survey, re-measured on the merged tree after review finding F8
+  found the first numbers unreproducible: **282 of 305** archived section titles
+  carry a date, and **0 of 36** live headings do, 18 per page. Reproduce with
+  `_headings` and `DATED_HEADING_RE` over the two pages, and with
+  `grep -c '^## '` over `.agents/benchmark-record.md`. The spec previously said
+  278 of 301 and 0 of 32; 32 was `_h2_headers`-shaped, not `_headings`-shaped.
 - #460's reproduction, red before and green after W3.
+- The full mutation set, three trees: BASE `origin/main`, the first revision of
+  this row, and the revision that lands. Table in Risks; harness reproduced in
+  the PR body.
+- Link-extraction census: 4,114 raw targets, 4,110 after the strip, the 4 losses
+  enumerated in Risks.
 - `check-pr-size.py`'s own red-before/green-after harness, for both checkers.
 - **CI on this PR: a red `windows-msvc-*` is NOT this row's.** Both lanes are
   `if: github.event_name == 'pull_request'` (`ci.yml:640`), so the lane
@@ -365,6 +536,12 @@ entry-scoped rules.
 
 - **Stop if** removing `max_chars` cannot be shown to leave the append-log class
   caught. The regrowth guard is the condition of the removal, not a nicety.
+  **This condition failed on the first revision and was met on the second.**
+  M7 and M8, both append-log-shaped, survived the dated-heading guard because it
+  fires on a *date*; §3a is what discharges the condition, and the three-tree
+  mutation table in Risks is the evidence. The residual survivor M11 is the same
+  class and is NOT claimed as caught: it is filed as #507, deferred as W8, and
+  pinned by a test.
 - **Stop if** the entry cap or the heading guard fires on either live page as
   shipped. That would mean the replacement is a different rule, not a relocated
   one, and the page would owe an edit this row is not authorised to make.
