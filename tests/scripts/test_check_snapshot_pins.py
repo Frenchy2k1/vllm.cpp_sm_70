@@ -113,6 +113,80 @@ class SnapshotPinChecker(unittest.TestCase):
         }
         self.assertEqual(set(), pinned_by_this_row & set(mod.LEDGER))
 
+    def test_the_fixture_corpus_sweeps_both_directions(self) -> None:
+        """The claim "it cannot be greened by narrowing its pattern", made testable.
+
+        One fixture proves only that the checker matches THAT fixture. This drives
+        the whole corpus: every positive is an idiom some plausible narrowing would
+        drop, every negative is code some plausible widening would falsely flag, so
+        a mutation to any single branch of the pattern lands on one of them.
+        """
+        self.assertGreaterEqual(len(mod.FIXTURES), 13, "the corpus must cover a class")
+        self.assertTrue(any(f.unpinned for f in mod.FIXTURES))
+        self.assertTrue(any(not f.unpinned for f in mod.FIXTURES))
+        for fixture in mod.FIXTURES:
+            with self.subTest(fixture=fixture.name):
+                with tempfile.TemporaryDirectory() as raw:
+                    tmp = pathlib.Path(raw)
+                    self._tree(tmp, fixture.body, fixture.rel)
+                    reported = [
+                        p
+                        for p in mod.check(tmp)
+                        if "UNPINNED checkpoint resolution" in p
+                    ]
+                self.assertEqual(
+                    fixture.unpinned,
+                    bool(reported),
+                    f"{fixture.name} ({fixture.rel}): {fixture.kills or 'must stay clean'}",
+                )
+
+    def test_every_positive_fixture_records_the_narrowing_it_kills(self) -> None:
+        """A fixture with no stated claim cannot be maintained; it just accretes."""
+        for fixture in mod.FIXTURES:
+            if fixture.unpinned:
+                with self.subTest(fixture=fixture.name):
+                    self.assertTrue(fixture.kills.strip(), fixture.name)
+
+    def test_every_ledger_line_names_a_tracking_issue(self) -> None:
+        """A debt with no issue owing its removal is an exemption wearing a reason."""
+        self.assertEqual([], mod.check_ledger_shape())
+
+    def test_the_checker_runs_in_ci_and_not_only_in_preflight(self) -> None:
+        """AGENTS.md: "Hooks are bypassable convenience, never proof."
+
+        A checker wired only into scripts/agent-preflight.sh gates whoever chooses
+        to run it. Both surfaces are asserted here so removing either is RED.
+        """
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        preflight = (REPO_ROOT / "scripts/agent-preflight.sh").read_text(encoding="utf-8")
+        self.assertIn("scripts/check-snapshot-pins.py", workflow)
+        self.assertIn("tests/scripts/test_check_snapshot_pins.py", workflow)
+        self.assertIn("check-snapshot-pins", preflight)
+        self.assertIn("test_check_snapshot_pins", preflight)
+
+    def test_text_the_toolchain_never_sees_is_not_a_resolution(self) -> None:
+        """Python's arm of the rule scripts/checker_text.py states for C++.
+
+        A `#` comment and a usage-example docstring are both text the interpreter
+        never runs, and a `re.search` reads either as live code.
+        """
+        body = (
+            'import glob\n'
+            'import os\n'
+            '\n'
+            'HELP = 1\n'
+            '\n'
+            'def resolve(cache):\n'
+            '    """Usage: glob.glob(os.path.join(cache, "snapshots", "*"))[0]"""\n'
+            '    # return sorted(glob.glob(os.path.join(cache, "snapshots", "*")))[0]\n'
+            '    return None\n'
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            self._tree(tmp, body, "tools/bench/commented.py")
+            problems = [p for p in mod.check(tmp) if "UNPINNED" in p]
+        self.assertEqual([], problems)
+
     def test_every_header_pin_has_an_accessor(self) -> None:
         """A constant with no accessor is a pin nothing resolves through."""
         import re

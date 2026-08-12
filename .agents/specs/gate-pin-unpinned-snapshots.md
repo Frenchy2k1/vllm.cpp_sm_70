@@ -33,15 +33,18 @@ committed record, and make an unpinned resolution impossible to add later.
   gate "pins no revision", which this row makes false.
 - A new deterministic, GPU-free gate `test_hf_snapshot_pinning` that builds a
   synthetic two-revision cache and proves selection, refusal, and override.
-- A new checker `scripts/check_snapshot_pins.py` that fails on any *new*
-  unpinned checkpoint resolution under `tests/`.
+- A new checker `scripts/check-snapshot-pins.py` that fails on any *new*
+  unpinned checkpoint resolution under `tests/`, `tools/` and `scripts/`.
 
 **Out of scope, recorded as owed on [#472](https://github.com/mudler/vllm.cpp/issues/472).**
-The ~48 remaining unpinned gates whose goldens record no revision at all
+The **55** remaining unpinned resolvers whose goldens record no revision at all
 (19 `*_greedy*` corpora carry no manifest file whatsoever). They cannot be pinned
 from evidence without re-capturing the goldens, and "pin to whatever is cached
 here" is the defect wearing a constant's name. They are enumerated in the
 checker's ledger, each of which is a line that must be *deleted*, never added to.
+50 are the C++ gates; the last 5 are `scripts/` staging and reference-dump
+helpers, which the widened scan (see §3) reaches — they FEED goldens rather than
+assert them, which is the same hazard one step upstream.
 
 `q3mxfp4` is out of scope by the same rule and needs no C++ change: no C++ gate
 resolves `Yi30/Qwen3-8B-MXFP4`, and `tools/bench/online_gate.py` already records
@@ -140,9 +143,17 @@ agent not to call it is how the defect comes back.
 
 ### 3. Making it impossible to add later
 
-`scripts/check_snapshot_pins.py` scans `tests/**/*.{cpp,h}` for a
-`directory_iterator` whose subject path contains `snapshots`, and fails on any
-occurrence not present in an explicit ledger inside the checker. The ledger is a
+`scripts/check-snapshot-pins.py` scans `{tests,tools,scripts}/**/*.{cpp,cc,cxx,h,hpp,hh,py}`
+for any of eleven directory ENUMERATORS — `directory_iterator`,
+`recursive_directory_iterator`, `opendir`/`scandir`/`readdir`,
+`listdir`/`iterdir`/`walk`, `glob`/`iglob`/`rglob` — whose call text (receiver,
+name and *balanced* argument list, so line wrapping is not an evasion) names an
+HF-cache marker or a value the file bound to one, followed to a fixpoint through
+assignments, struct members and helpers that RETURN the path. It fails on any
+occurrence not present in an explicit ledger inside the checker. `src/` is
+deliberately unscanned: resolving a user's cache at run time is the product
+working, not a gate choosing its own subject. The checker's guarantees and its
+known evasions are stated in its own module docstring, which is the authority. The ledger is a
 **shrinking** list: every entry names the file and the issue that owes its
 golden's provenance (#472). Adding a line is a review event; deleting one is the
 work. This is the same shape as the existing device-leakage allowlist
@@ -150,9 +161,23 @@ work. This is the same shape as the existing device-leakage allowlist
 when an unpinned resolver is *added* — which is what it exists to prevent — and
 not by every PR.
 
-The checker ships with its own RED proof: a self-test that synthesises an
-unpinned resolver in a scratch tree and asserts the checker fails on it, so the
-checker cannot be turned green by weakening its own pattern.
+The checker ships with its own RED proof. **The first version of this claim was
+FALSE and is corrected here rather than quietly dropped**, because a future agent
+will cite it: that self-test synthesised ONE unpinned resolver, so it proved only
+that the checker matched that one fixture. A fresh review mutated the checker five
+ways and four of the five kept the self-test green — renaming the required
+subject, requiring the `fs::` spelling, restricting the scan to `.cpp`, and
+restricting it to `tests/parity` (caught only incidentally, by the STALE arm).
+
+What replaces it is a `FIXTURES` corpus swept in BOTH directions: every positive
+is an idiom some plausible narrowing would drop, every negative is code some
+plausible widening would falsely flag, and each positive records in `kills` the
+narrowing it exists to catch. The claim is now bounded rather than absolute:
+**narrowing any single branch of the pattern that the corpus covers turns the
+self-test red.** It is not a proof against an idiom nobody wrote a fixture for,
+and the checker is lexical and defeatable on purpose — `find(1)`, a marker-free
+environment variable, or a `#define`d enumerator all still evade it. The module
+docstring states that scope, and is the authority on it.
 
 ### 4. The skip must be loud and must name the revision
 
@@ -277,7 +302,7 @@ to the other two gates. It selects the right revision today only because
 entry seen, and it encodes a property the goldens correlate with instead of the
 identity they were captured against.
 
-Pinning the remaining ~48 gates was also rejected, for the reason that bounds the
+Pinning the remaining 55 resolvers was also rejected, for the reason that bounds the
 whole row: 80 of 92 committed goldens record no revision, so their pins would
 have to be invented. They are enumerated in the checker ledger and owed on #472.
 
