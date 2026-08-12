@@ -484,6 +484,18 @@ def _powershell_string_value(token: tuple[str, str]) -> str | None:
     return re.sub(r"`(.)", r"\1", value, flags=re.DOTALL)
 
 
+def _powershell_exact_string_value(token: tuple[str, str]) -> str | None:
+    """Return exact literals only when cross-platform semantics are known."""
+    if token[0] != "string" or len(token[1]) < 2:
+        return None
+    # PowerShell maps backtick escapes such as `t and `n to control
+    # characters.  Fail closed here instead of erasing the escape on hosts
+    # where the native PowerShell parser is unavailable.
+    if token[1][0] == '"' and "`" in token[1][1:-1]:
+        return None
+    return _powershell_string_value(token)
+
+
 def _safe_powershell_message(token: tuple[str, str]) -> bool:
     """Allow inert diagnostic strings, but no executable subexpression."""
     return token[0] == "string" and "$(" not in token[1]
@@ -547,28 +559,18 @@ def _validate_exact_unsupported_tier_probe(
         if wanted == string:
             return _safe_powershell_message(actual)
         if wanted == ("string", "FILTER"):
-            return _powershell_string_value(actual) == UNSUPPORTED_TIER_FILTER
+            return _powershell_exact_string_value(actual) == UNSUPPORTED_TIER_FILTER
         if wanted == ("string", "DIAGNOSTIC"):
-            return _powershell_string_value(actual) == UNSUPPORTED_TIER_DIAGNOSTIC
+            return (_powershell_exact_string_value(actual) ==
+                    UNSUPPORTED_TIER_DIAGNOSTIC)
         return actual == wanted
-
-    diagnostic_index = expected.index(("variable", "$diagnostic"))
-    fixture_expected = expected[:diagnostic_index] + [
-        ("word", "if"), ("symbol", "("), ("symbol", "("),
-        ("variable", "$probeoutput"), ("operator", "-join"), string,
-        ("symbol", ")"), ("operator", "-notmatch"),
-        ("symbol", "["), ("word", "regex"), ("symbol", "]"),
-        ("symbol", "::"), ("word", "escape"), ("symbol", "("),
-        ("string", "DIAGNOSTIC"), ("symbol", ")"), ("symbol", ")"),
-        ("symbol", "{"), ("word", "throw"), string, ("symbol", "}"),
-    ]
 
     def sequence_matches(wanted_tokens: list[tuple[str, str]]) -> bool:
         return (len(tokens) == len(wanted_tokens) and
                 all(matches(actual, wanted)
                     for actual, wanted in zip(tokens, wanted_tokens)))
 
-    if not sequence_matches(expected) and not sequence_matches(fixture_expected):
+    if not sequence_matches(expected):
         errors.append(
             "build-windows-release.ps1: exact unsupported-tier probe body is required"
         )
@@ -582,7 +584,7 @@ def _validate_exact_amx_refusal_block(
         index for index in range(len(tokens) - 2)
         if (tokens[index] == ("variable", "$env:vt_cpu_matmul_tier") and
             tokens[index + 1] == ("symbol", "=") and
-            _powershell_string_value(tokens[index + 2]) == "amx")
+            _powershell_exact_string_value(tokens[index + 2]) == "amx")
     ]
     valid = False
     if len(starts) == 1:
@@ -812,30 +814,59 @@ def _cpp_function_body(source: str, signature: str) -> str:
     return "" if result is None else result[0]
 
 
+def _cpp_phase2_view(source: str) -> str:
+    """Apply backslash-newline splicing without changing source offsets."""
+    out = list(source)
+    offset = 0
+    while offset < len(source):
+        if source[offset] != "\\":
+            offset += 1
+            continue
+        end = offset + 1
+        if source.startswith("\r\n", end):
+            end += 2
+        elif end < len(source) and source[end] == "\n":
+            end += 1
+        else:
+            offset += 1
+            continue
+        out[offset:end] = " " * (end - offset)
+        offset = end
+    return "".join(out)
+
+
+def _cpp_directive_view(source: str) -> str:
+    """Apply phase 2 and blank comments while retaining pragma strings."""
+    phase2 = _cpp_phase2_view(source)
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group("block") is None and match.group("line") is None:
+            return match.group(0)
+        return "".join(
+            "\n" if char == "\n" else " " for char in match.group(0)
+        )
+
+    return _CPP_INERT.sub(replace, phase2)
+
+
 def _cpp_logical_directives(source: str, stop: int):
-    """Yield preprocessing directives after phase-2 line splicing."""
-    active = without_cpp_comments_and_literals(source[:stop])
-    logical = ""
-    logical_start = 0
+    """Yield directives after phase-2 splicing and phase-3 comments."""
+    active = _cpp_directive_view(source[:stop])
     offset = 0
     for line in active.splitlines(keepends=True):
-        if not logical:
-            logical_start = offset
-        offset += len(line)
-        continued = re.search(r"\\(?:\r?\n)$", line) is not None
-        logical += re.sub(r"\\(?:\r?\n)$", "", line)
-        if continued:
-            continue
-        if re.match(r"\s*#", logical):
-            yield logical_start, offset, logical
-        logical = ""
-    if logical and re.match(r"\s*#", logical):
-        yield logical_start, offset, logical
+        end = offset + len(line)
+        if re.match(r"\s*#", line):
+            yield offset, end, line
+        offset = end
+    if offset < len(active):
+        line = active[offset:]
+        if re.match(r"\s*#", line):
+            yield offset, len(active), line
 
 
 def _cpp_structural_view(source: str) -> str:
     """Blank inert text and complete directives without moving offsets."""
-    out = list(without_cpp_comments_and_literals(source))
+    out = list(without_cpp_comments_and_literals(_cpp_phase2_view(source)))
     for start, end, _ in _cpp_logical_directives(source, len(source)):
         for offset in range(start, end):
             if out[offset] not in {"\r", "\n"}:
@@ -877,12 +908,61 @@ def _cpp_condition_possibilities(expression: str,
     return True, True
 
 
-def _split_cpp_states(states: set[frozenset[str]], expression: str
-                      ) -> tuple[set[frozenset[str]], set[frozenset[str]]]:
-    true_states: set[frozenset[str]] = set()
-    false_states: set[frozenset[str]] = set()
+CppMacroState = tuple[
+    frozenset[str], tuple[tuple[str, tuple[bool, ...]], ...]
+]
+
+
+def _cpp_macro_state(defined: set[str],
+                     stacks: dict[str, list[bool]]) -> CppMacroState:
+    return (
+        frozenset(defined),
+        tuple(sorted(
+            (name, tuple(values)) for name, values in stacks.items() if values
+        )),
+    )
+
+
+def _cpp_change_macro(state: CppMacroState, name: str,
+                      defined: bool) -> CppMacroState:
+    names = set(state[0])
+    if defined:
+        names.add(name)
+    else:
+        names.discard(name)
+    return _cpp_macro_state(
+        names, {key: list(values) for key, values in state[1]}
+    )
+
+
+def _cpp_push_macro(state: CppMacroState, name: str) -> CppMacroState:
+    stacks = {key: list(values) for key, values in state[1]}
+    stacks.setdefault(name, []).append(name in state[0])
+    return _cpp_macro_state(set(state[0]), stacks)
+
+
+def _cpp_pop_macro(state: CppMacroState, name: str) -> CppMacroState:
+    stacks = {key: list(values) for key, values in state[1]}
+    saved = stacks.get(name, [])
+    # An unmatched pop restores implementation-owned state.  Treat the name
+    # as possibly defined rather than assuming an unsafe alias disappeared.
+    restored = saved.pop() if saved else True
+    if not saved:
+        stacks.pop(name, None)
+    names = set(state[0])
+    if restored:
+        names.add(name)
+    else:
+        names.discard(name)
+    return _cpp_macro_state(names, stacks)
+
+
+def _split_cpp_states(states: set[CppMacroState], expression: str
+                      ) -> tuple[set[CppMacroState], set[CppMacroState]]:
+    true_states: set[CppMacroState] = set()
+    false_states: set[CppMacroState] = set()
     for state in states:
-        may_true, may_false = _cpp_condition_possibilities(expression, state)
+        may_true, may_false = _cpp_condition_possibilities(expression, state[0])
         if may_true:
             true_states.add(state)
         if may_false:
@@ -892,8 +972,8 @@ def _split_cpp_states(states: set[frozenset[str]], expression: str
 
 def _active_cpp_macro_names_at(source: str, stop: int) -> set[str]:
     """Return macros possibly active on Windows at one exact source offset."""
-    states: set[frozenset[str]] = {frozenset()}
-    stack: list[dict[str, set[frozenset[str]] | bool]] = []
+    states: set[CppMacroState] = {_cpp_macro_state(set(), {})}
+    stack: list[dict[str, set[CppMacroState] | bool]] = []
     for _, _, logical in _cpp_logical_directives(source, stop):
         directive = re.match(r"\s*#\s*([A-Za-z_]\w*)(.*)", logical,
                              re.DOTALL)
@@ -942,16 +1022,29 @@ def _active_cpp_macro_names_at(source: str, stop: int) -> set[str]:
             name = re.match(r"([A-Za-z_]\w*)", argument)
             if name is not None:
                 states = {
-                    frozenset(set(state) | {name.group(1)}) for state in states
+                    _cpp_change_macro(state, name.group(1), True)
+                    for state in states
                 }
         elif command == "undef":
             name = re.match(r"([A-Za-z_]\w*)", argument)
             if name is not None:
                 states = {
-                    frozenset(item for item in state if item != name.group(1))
+                    _cpp_change_macro(state, name.group(1), False)
                     for state in states
                 }
-    return set().union(*(set(state) for state in states)) if states else set()
+        elif command == "pragma":
+            pragma = re.fullmatch(
+                r"(push_macro|pop_macro)\s*\(\s*\"([A-Za-z_]\w*)\"\s*\)",
+                argument,
+                re.DOTALL,
+            )
+            if pragma is not None:
+                operation, name = pragma.groups()
+                if operation == "push_macro":
+                    states = {_cpp_push_macro(state, name) for state in states}
+                else:
+                    states = {_cpp_pop_macro(state, name) for state in states}
+    return set().union(*(set(state[0]) for state in states)) if states else set()
 
 
 def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
@@ -982,14 +1075,14 @@ def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
         )
 
     filter_literals = sum(
-        _powershell_string_value(token) == UNSUPPORTED_TIER_FILTER
+        _powershell_exact_string_value(token) == UNSUPPORTED_TIER_FILTER
         for token in probe_tokens
     )
     exact_filter_argument = any(
         probe_tokens[index:index + 3] == [
             ("variable", "$arguments"), ("symbol", "="), ("symbol", "@(")
         ] and index + 4 < len(probe_tokens) and
-        _powershell_string_value(probe_tokens[index + 3]) ==
+        _powershell_exact_string_value(probe_tokens[index + 3]) ==
         UNSUPPORTED_TIER_FILTER and
         probe_tokens[index + 4] == ("symbol", ")")
         for index in range(len(probe_tokens) - 4)
@@ -1025,13 +1118,13 @@ def _validate_unsupported_tier_contract(text: str, errors: list[str]) -> None:
     diagnostic_bound = any(
         ((probe_tokens[index:index + len(diagnostic_call)] == diagnostic_call and
           index + len(diagnostic_call) < len(probe_tokens) and
-          _powershell_string_value(
+          _powershell_exact_string_value(
               probe_tokens[index + len(diagnostic_call)]) ==
           UNSUPPORTED_TIER_DIAGNOSTIC) or
          (probe_tokens[index:index + len(inline_diagnostic_call)] ==
           inline_diagnostic_call and
           index + len(inline_diagnostic_call) < len(probe_tokens) and
-          _powershell_string_value(
+          _powershell_exact_string_value(
               probe_tokens[index + len(inline_diagnostic_call)]) ==
           UNSUPPORTED_TIER_DIAGNOSTIC))
         for index in range(len(probe_tokens))
@@ -1331,21 +1424,18 @@ def _validate_console_protocol(console: str, errors: list[str]) -> None:
         r"std::memory_order_seq_cst\s*\)",
         dispatch,
     ))
-    trusted_tail_tokens = {
-        "state", "in_flight", "fetch_sub", "std", "memory_order_seq_cst",
-        "return", "resumed",
-    }
-    tail_offset = (
-        len(console) if dispatch_span is None or not final_decrements else
-        dispatch_span[1] + final_decrements[0].start()
-    )
-    macro_collisions = sorted(trusted_tail_tokens.intersection(
-        _active_cpp_macro_names_at(console, tail_offset)
-    ))
+    macro_collisions: set[str] = set()
+    if dispatch_span is not None and final_decrements:
+        trusted_tail = dispatch[final_decrements[0].start():]
+        trusted_start = dispatch_span[1] + final_decrements[0].start()
+        for token in re.finditer(r"\b[A-Za-z_]\w*\b", trusted_tail):
+            if token.group(0) in _active_cpp_macro_names_at(
+                    console, trusted_start + token.start()):
+                macro_collisions.add(token.group(0))
     if macro_collisions:
         errors.append(
             "console_shutdown.cpp: trusted final-tail token must not be a macro "
-            f"({', '.join(macro_collisions)})"
+            f"({', '.join(sorted(macro_collisions))})"
         )
     final_tail_ok = False
     if len(final_decrements) == 1:
