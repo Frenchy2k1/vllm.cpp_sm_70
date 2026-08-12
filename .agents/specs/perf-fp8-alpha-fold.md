@@ -622,15 +622,74 @@ than by a gate:
   verdict, and putting a decision inside a `.cu` that the CPU tier cannot compile
   is how a wrong scope survives a green gate.** The verdict itself is unchanged
   and still correct; only who it binds moved.
-- **`AlphaVecBf16TakesTwoLaunch` is NOT coverage of what this lever changes.**
-  It is a good test of a different thing. It pins that a bf16 D REFUSES the
-  cuBLASLt epilogue arm and always takes the two-launch fallback — but *both* of
-  its arms apply alpha AFTER the GEMM, so both are `round -> scale`. The
-  arithmetic §Attempt 4 actually changes is `round-then-scale` vs
-  `scale-then-round`: narrowing D rounds the f32 accumulator to bf16 BEFORE the
-  alpha multiply, where the f32-D path rounds after it. Nothing in the tree
-  compares those two orders. Do not cite this case as evidence that the narrowing
-  is safe; it does not test that, and it was never written to.
+- **`AlphaVecBf16TakesTwoLaunch` is NOT a token gate for what this lever changes.**
+  Its first assertion pins that a bf16 D REFUSES the cuBLASLt epilogue arm and
+  always takes the two-launch fallback — *both* of those arms apply alpha AFTER
+  the GEMM, so both are `round -> scale`, and that assertion says nothing about
+  the narrowing. Its second assertion does compare the two orders §Attempt 4
+  changes — `round-then-scale` (bf16 D) against `scale-then-round` (f32 D) — and
+  as of #501 it bounds them at one ulp per word with a measured distribution
+  behind the number (§The bf16-vs-f32 divergence is DOUBLE ROUNDING below). That
+  is a bound on the KERNEL's arithmetic, not evidence that the model's tokens
+  survive it: no committed gate loads the fp8 tower (#466), so the SACRED engine
+  gates still decide the lever. Do not cite this case as that evidence.
+
+### The bf16-vs-f32 divergence is DOUBLE ROUNDING, bounded at 1 ulp — MEASURED 2026-08-12
+
+Issue: [#501](https://github.com/mudler/vllm.cpp/issues/501).
+
+`AlphaVecBf16TakesTwoLaunch` closed with `CHECK(mismatches * 100 < M * N)` —
+"fewer than 1% of words differ at all". It had never been executed, because the
+implementing host had no `nvcc` and no GPU, and the first CUDA run on GB10 was
+RED at all four shapes (26.0 / 26.1 / 26.8 / 26.1% of words differing). The bound
+was wrong in both directions: it could not be satisfied by the arithmetic this
+row deliberately introduces, and a count bound cannot tell a 1-ulp disagreement
+in a quarter of the words from a 10-ulp disagreement in half a percent of them —
+only the second is a defect, and the old bound passed it.
+
+**The measurement, and it is the point.** GB10 `sm_121a`, CUDA 13.0.88, Release,
+CUTLASS 4.5.0 + FlashAttention-2 `ENABLED for arch(es) [121a]` + Triton AOT
+`sm_121a`, `configure_exit=0 build_exit=0 test_exit=0`, `8 cases | 86 assertions
+| SUCCESS`:
+
+| M | N | alpha qkv / z | 0 ulp | 1 ulp | **>= 2 ulp** | max |
+|---|---|---|---|---|---|---|
+| 1 | 16384 | 0.035 / 0.017 | 12131 | 4253 (26.0%) | **0** | 1 |
+| 3 | 16384 | 0.035 / 0.017 | 36338 | 12814 (26.1%) | **0** | 1 |
+| 1 | 6144 | 0.041 / 0.0092 | 4499 | 1645 (26.8%) | **0** | 1 |
+| 128 | 16384 | 0.035 / 0.017 | 1550431 | 546721 (26.1%) | **0** | 1 |
+| 1 | 16384 | **1.0 / 0.25** | 16384 | 0 | **0** | **0** |
+| 128 | 16384 | **0.5 / 0.25** | 2097152 | 0 | **0** | **0** |
+
+2.17M words compared and **not one exceeds a single ulp**. The 1-ulp counts are
+byte-for-byte the mismatch counts the old bound was rejecting, so every one of
+those "mismatches" was a single ulp.
+
+**Why one ulp is the true bound.** The bf16 arm computes
+`rnd_bf16(rnd_bf16(acc) * alpha)`, the f32 arm `rnd_bf16(fl32(acc * alpha))`. The
+first rounding perturbs the product by at most half a bf16 ulp (relative 2^-9),
+so the second can land on an adjacent bf16 and never further. This is the same
+double rounding that got the z-slice fallback rejected above (25-36% of words off
+by 1 ulp over 2e6 accumulators, 6/6 alpha pairs) — the identical signature,
+pointing the other way. The in-code justification that shipped with the assertion
+named the WRONG mechanism ("separate cuBLASLt plans … may reduce in a different
+order"); reduction order does not produce a shape-independent ~26%.
+
+**The controls prove it is the whole story.** A power-of-two alpha makes the
+multiply an exact exponent shift, so rounding commutes with it and double
+rounding is impossible. The last two rows above are exactly that, and they are
+BIT-exact over 2.1M words. Had the two plans' accumulators disagreed — the
+mechanism the old comment named, and a real risk given that `out_type` is part of
+`Fp8PlanKey` — those rows could not have been zero. Those arms carry the strictly
+tighter `bound == 0` permanently, so a future driver that does split the bf16-D
+reduction differently turns them RED.
+
+**The repair** replaces the count with a magnitude: max ulp distance over all
+words `<= 1`, and `<= 0` at a pow2 alpha. It is stronger where it matters (a
+2-ulp word anywhere is RED, where the old bound tolerated 1% of the tensor at any
+magnitude) and honest about count. RED-first evidence: perturbing ONE output word
+by 2 ulp in a scratch copy — 1 word in 16384 = 0.0061%, which the old `<1%` bound
+would have accepted — turns the case RED.
 
 ### Why this branch ships lever 1 ALONE
 
