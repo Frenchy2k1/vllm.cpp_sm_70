@@ -124,7 +124,7 @@ def write_zip_archive(stage_dir: Path, temporary: Path, epoch: int) -> None:
 
 
 def write_archive(
-    stage_dir: Path, archive: Path, epoch: int, archive_format: str = "tar.gz"
+    stage_dir: Path, archive: Path, epoch: int, archive_format: str
 ) -> None:
     if archive_format not in {"tar.gz", "zip"}:
         raise ValueError("archive format must be exactly 'tar.gz' or 'zip'")

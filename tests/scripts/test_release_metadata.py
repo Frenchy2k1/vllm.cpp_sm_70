@@ -143,7 +143,7 @@ class ReleaseMetadataContract(unittest.TestCase):
             shutil.copytree(args.stage_dir, packaged)
             self.package.install_metadata(args.output_dir, packaged)
             archive = scratch / "vllm.cpp-0.0.1-linux-x86_64-glibc-cpu.tar.gz"
-            self.package.write_archive(packaged, archive, 0)
+            self.package.write_archive(packaged, archive, 0, "tar.gz")
             self.package.write_archive_sidecars(archive, packaged)
             result = subprocess.run(
                 [
@@ -167,7 +167,7 @@ class ReleaseMetadataContract(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             first = Path(f"{archive}.sha256").read_text()
-            self.package.write_archive(packaged, archive, 0)
+            self.package.write_archive(packaged, archive, 0, "tar.gz")
             self.package.write_archive_sidecars(archive, packaged)
             self.assertEqual(first, Path(f"{archive}.sha256").read_text())
 

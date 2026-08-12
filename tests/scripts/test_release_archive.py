@@ -8,6 +8,7 @@ import importlib.util
 import json
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -403,6 +404,14 @@ class ReleaseArchiveContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.packager.write_archive(stage, root / "linked.zip", 315532800, "zip")
 
+    def test_archive_writer_requires_an_explicit_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            stage.mkdir()
+            with self.assertRaises(TypeError):
+                self.packager.write_archive(stage, root / "implicit.tar.gz", 0)
+
     def test_zip_traversal_drive_backslash_and_symlink_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -455,6 +464,44 @@ class ReleaseArchiveContract(unittest.TestCase):
                 errors = self.tool.safe_extract(archive, destination, "zip")
                 self.assertTrue(errors, (name, errors))
                 self.assertEqual(list(destination.rglob("*")) if destination.exists() else [], [])
+
+    def test_zip_directory_markers_must_match_unix_type_bits_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = (
+                ("bin/", stat.S_IFREG | 0o755),
+                ("other", stat.S_IFDIR | 0o755),
+            )
+            for index, (name, mode) in enumerate(cases):
+                archive = root / f"type-mismatch-{index}.zip"
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = mode << 16
+                    bundle.writestr(info, b"")
+                destination = root / f"type-mismatch-out-{index}"
+                errors = self.tool.safe_extract(archive, destination, "zip")
+                self.assertTrue(any("type" in error for error in errors), errors)
+                self.assertFalse(destination.exists())
+
+    def test_zip_entries_without_unix_type_bits_use_the_path_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "portable-types.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("python-file", b"python")
+                bundle.writestr("python-dir/", b"")
+                for name, content in (("windows-file", b"windows"), ("windows-dir/", b"")):
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 0
+                    info.external_attr = 0
+                    bundle.writestr(info, content)
+            destination = root / "portable-types-out"
+            self.assertEqual(self.tool.safe_extract(archive, destination, "zip"), [])
+            self.assertEqual((destination / "python-file").read_bytes(), b"python")
+            self.assertEqual((destination / "windows-file").read_bytes(), b"windows")
+            self.assertTrue((destination / "python-dir").is_dir())
+            self.assertTrue((destination / "windows-dir").is_dir())
 
     def test_zip_windows_aliases_fail_before_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
