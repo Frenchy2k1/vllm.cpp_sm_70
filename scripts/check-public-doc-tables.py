@@ -72,16 +72,21 @@ MAX_ROW_CHARS = 600
 
 # REGROWTH GUARD. What actually bloated BENCHMARKS.md to 11,405 lines was
 # PER-ATTEMPT sections, appended one checkpoint at a time, and the page's own
-# archive records their shape: 278 of the 301 sections already rolled into
-# .agents/benchmark-record.md name a DATE in the heading. Zero of the 32 live
-# headings across the two public pages do. So a dated heading is the append-log
-# entry, and it fails at the FIRST one.
+# archive records their shape: 282 of the 305 sections already rolled into
+# .agents/benchmark-record.md name a DATE in the heading. Zero of the 36 live
+# headings across the two public pages do (18 each; reproduce with _headings).
+# So a dated heading is the append-log entry, and it fails at the FIRST one.
 #
-# This also closes the hole the byte cap was silently covering. The
-# canonical-section allowlist runs over _h2_headers, which matches "## " only,
-# so an appended "### " subsection was rejected by nothing but the character
-# budget. This guard applies at EVERY heading depth, which is strictly tighter
-# than what it replaces.
+# WHAT THIS GUARD IS AND IS NOT TIGHTER THAN. It is strictly tighter than the
+# canonical-section allowlist it joins, which runs over _h2_headers and so
+# matches "## " only: an appended DATED "### " subsection was rejected by
+# nothing but the retired character budget, and is now rejected here at every
+# depth. It is NOT tighter than the retired byte cap in general, and an earlier
+# revision of this comment claimed that it was. An UNDATED appended subsection
+# passes this guard by construction, because the guard fires on a date. What
+# bounds that case is the paragraph budget, once _prose_paragraphs counts the
+# bulleted forensics such a section carries: see the fold recorded there, and
+# the two mutations that measured the gap before it existed.
 DATED_HEADING_RE = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
 
 # The scoreboard must point at the record, and the record must exist, otherwise
@@ -100,8 +105,19 @@ class PageRules:
     NONE of these limits is a budget on the whole file: see the MAX_ROW_CHARS
     comment above for why the per-page `max_chars` key was removed on
     2026-08-12. A limit here either counts a QUALITY defect (sections,
-    paragraphs) or bounds ONE entry, so adding a row never requires deleting a
+    paragraphs) or bounds ONE entry, so adding a ROW never requires deleting a
     row someone else owns.
+
+    THAT SENTENCE IS TRUE OF ROWS, AND ONLY OF ROWS. `max_h2_sections` and
+    `max_prose_paragraphs` are still whole-page COUNTS, and both live pages sit
+    on the paragraph one: docs/BENCHMARKS.md measures 35 of 35 and
+    docs/FEATURES.md 21 of 21. So adding a PARAGRAPH does still cost somebody's
+    paragraph. That is deliberate rather than overlooked. Rows are the growth
+    mode of a keyed table and prose is the decay mode this checker exists to
+    stop, which is the same argument #364 used to keep `long_paragraphs` in
+    STATUS_RATCHET while deleting `chars`. It is a real cost, not a free one,
+    and it is recorded here so the next author meets it in the docstring instead
+    of in CI.
     """
 
     def __init__(
@@ -185,7 +201,12 @@ FEATURES_RULES = PageRules(
         ("How to read this page", ("how to read", "legend", "reading")),
     ),
     max_h2_sections=20,
-    max_prose_paragraphs=20,
+    # 21, not 20, since 2026-08-12: _prose_paragraphs now folds list items in,
+    # and this page carries one (the C-ABI capability note). Re-baselined to
+    # what the page measures under the new definition, exactly as the old number
+    # was pinned to what it measured under the old one. Nothing was widened: the
+    # population counted grew, the headroom did not.
+    max_prose_paragraphs=21,
     min_table_rows=60,
     required_links=("STATUS.md", "BENCHMARKS.md"),
 )
@@ -199,11 +220,37 @@ def _is_separator_row(cells: list[str]) -> bool:
     return all(set(cell) <= set("-: ") for cell in cells)
 
 
-def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
-    """Yield (start_line, paragraph) for prose only.
+LIST_ITEM_RE = re.compile(r"^(?:[-*+](?:\s|$)|\d+[.)]\s)")
 
-    Fenced code blocks, tables, headings, and list items are excluded: the rule
-    targets the narrative paragraph, not legitimate tables or code samples.
+
+def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
+    """Yield (start_line, paragraph) for narrative prose.
+
+    Fenced code blocks, tables and headings are excluded: the rule targets the
+    narrative paragraph, not legitimate tables or code samples.
+
+    LIST ITEMS AND BLOCKQUOTE LINES ARE PROSE HERE, folded into the paragraph
+    that runs through them, and that is a 2026-08-12 repair, not the original
+    behaviour (#460, review finding F1). Excluding them meant a bulleted or
+    quoted wall was counted by NOTHING: not this budget, not MAX_PARAGRAPH_CHARS,
+    not MAX_CELL_CHARS, not MAX_ROW_CHARS, and not the dated-heading guard, which
+    only sees a DATE. Two mutations proved it on the real checker: 3,000 appended
+    bullet lines took docs/BENCHMARKS.md to 113,833 characters and 500 appended
+    UNDATED "### Attempt N" sections with bulleted forensics took it to 117,222,
+    and both reported no errors. Folding makes a contiguous run one paragraph, so
+    the wall trips MAX_PARAGRAPH_CHARS, and a run per section trips the paragraph
+    COUNT. Neither live page gains a paragraph from the fold except
+    docs/FEATURES.md, which gains its one list item; see max_prose_paragraphs.
+
+    KNOWN RESIDUE, deliberately left and filed, not silently kept: a line
+    beginning with EMPHASIS rather than a list marker ("**Protocol.** ...") is
+    still excluded, because it starts with "*". That is the accident this
+    exclusion always was, and closing it turns four paragraphs already shipped on
+    docs/BENCHMARKS.md red at 717, 719, 748 and 1,084 characters against
+    MAX_PARAGRAPH_CHARS = 700. Fixing it therefore owes an edit to a page #481
+    holds open, so it takes its own spec and its own red-before rather than
+    riding along here: issue #507, spec W8. A prose wall led by "**bold**" is
+    UNBOUNDED until then.
     """
     paragraphs: list[tuple[int, str]] = []
     current: list[str] = []
@@ -227,9 +274,8 @@ def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
         is_prose = bool(stripped) and not (
             stripped.startswith("|")
             or stripped.startswith("#")
-            or stripped.startswith("-")
-            or stripped.startswith("*")
-            or stripped.startswith(">")
+            # See KNOWN RESIDUE above: emphasis-lead, but NOT "* item".
+            or (stripped.startswith("*") and not LIST_ITEM_RE.match(stripped))
         )
         if is_prose:
             if not current:
@@ -433,7 +479,15 @@ def features_errors(text: str) -> list[str]:
 STATUS = ROOT / "docs/STATUS.md"
 STATUS_RATCHET = {
     "h2_sections": 11,
-    "long_paragraphs": 82,
+    # 75, down from 82 on 2026-08-12. Not a compaction of the page:
+    # _prose_paragraphs now folds list items and blockquote lines into the
+    # paragraph running through them, so docs/STATUS.md's 29 list items join
+    # neighbouring paragraphs instead of splitting them, and the page measures
+    # 75 long paragraphs where it measured 82. A ratchet is pinned to what the
+    # page measures, so it follows the measurement DOWN in the same change that
+    # moved it. Leaving 82 would have banked 7 units of slack this row did not
+    # earn.
+    "long_paragraphs": 75,
     "oversized_cells": 44,
 }
 STATUS_REQUIRED = (
