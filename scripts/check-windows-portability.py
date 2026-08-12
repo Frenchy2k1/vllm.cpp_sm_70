@@ -60,11 +60,11 @@ def _has_central_msvc_nominmax(cmake: str) -> bool:
     )
 
 
-def _local_nominmax_definitions(source: str) -> list[tuple[int, bool]]:
-    """Return local NOMINMAX definition lines and whether absence-guarded."""
+def _local_nominmax_definitions(active_source: str) -> list[tuple[int, bool]]:
+    """Return active NOMINMAX definition lines and whether absence-guarded."""
     definitions: list[tuple[int, bool]] = []
     absence_guards: list[bool] = []
-    for number, line in enumerate(without_cpp_comments(source).splitlines(), 1):
+    for number, line in enumerate(active_source.splitlines(), 1):
         match = re.match(r"\s*#\s*(\w+)(.*)$", line)
         if match is None:
             continue
@@ -1726,18 +1726,19 @@ def check(root: Path, build_dir: Path | None = None,
 
     central_nominmax = _has_central_msvc_nominmax(cmake)
     for relative, source in texts.items():
-        definitions = _local_nominmax_definitions(source)
+        active_source = without_cpp_comments_and_literals(source)
+        definitions = _local_nominmax_definitions(active_source)
         for line, guarded in definitions:
             if not guarded:
                 errors.append(
                     f"{relative}:{line}: unguarded source-local NOMINMAX is forbidden"
                 )
         windows_header = re.search(
-            r"(?m)^\s*#\s*include\s*<windows\.h>", without_cpp_comments(source)
+            r"(?m)^\s*#\s*include\s*<windows\.h>", active_source
         )
         if windows_header is None or central_nominmax:
             continue
-        header_line = source.count("\n", 0, windows_header.start()) + 1
+        header_line = active_source.count("\n", 0, windows_header.start()) + 1
         if not any(guarded and line < header_line for line, guarded in definitions):
             errors.append(
                 f"{relative}: NOMINMAX must be defined centrally or by an "
