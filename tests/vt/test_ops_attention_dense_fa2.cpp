@@ -21,9 +21,10 @@
 //   M3   Drop `!args.causal` from the dispatch gate and ask for causal attention.
 //        The launcher hardcoded `p.is_causal = false`, so it returned an output
 //        BIT-IDENTICAL to the non-causal one and refused nothing. Killed here by
-//        `fa2 dense falls through ... causal`, which requires bit-equality with the
-//        causal reference (the launcher now also takes `bool causal` and throws;
-//        either way the case is red).
+//        `attention-dense-fa2 falls through for CAUSAL (M3)`, which requires
+//        bit-equality with the causal reference. The launcher now also takes
+//        `bool causal` and throws, so the mutation surfaces as a refusal; with the
+//        guard also removed it surfaces as the bit-equality failure. Both are red.
 //
 // The op is TOTAL: its fast path is bf16 + head_dim 64 + non-causal + MHA + FA-2
 // compiled, and every other shape must fall through to `AttentionDenseFlash`
@@ -157,6 +158,18 @@ double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
   for (size_t i = 0; i < a.size(); ++i)
     m = std::max(m, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
   return m;
+}
+
+// Number of positions where two results differ at all. Used instead of
+// `CHECK(a == b)` on the vectors: doctest stringifies both operands of a failing
+// CHECK, and dumping two 65,000-element vectors buries the actual signal (it did,
+// on the first M3-silent mutation run).
+size_t Mismatches(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size()) return a.size() + b.size();
+  size_t n = 0;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (a[i] != b[i]) ++n;
+  return n;
 }
 
 double Rms(const std::vector<float>& v) {
@@ -296,61 +309,79 @@ TEST_CASE("attention-dense-fa2 attends the FULL key range (M2a: p.seqlen_k = t/2
 // ===========================================================================
 // 3. TOTALITY / FALL-THROUGH — every shape outside the narrow fast path must reach
 //    `AttentionDenseFlash`, and therefore be BIT-identical to calling it directly.
-//    The causal sub-case is the M3 killer: with the dispatch gate's `!args.causal`
+//
+//    Four SEPARATE test cases, not four SUBCASEs of one: an uncaught exception ends
+//    the whole enclosing TEST_CASE and doctest skips its remaining subcases. The M3
+//    mutation throws, and under a single test case that silently dropped the GQA,
+//    hd!=64 and f32 coverage from the run (14 assertions became 9). Separate cases
+//    keep one failure from hiding three others.
+//
+//    The causal case is the M3 killer: with the dispatch gate's `!args.causal`
 //    removed, FA-2 answered the NON-causal question instead and refused nothing.
-TEST_CASE("attention-dense-fa2 falls through to AttentionDenseFlash bit-exactly") {
+TEST_CASE("attention-dense-fa2 falls through for CAUSAL (M3)") {
   if (!HasCuda()) {
-    MESSAGE("no CUDA backend; skipping dense FA-2 fall-through");
+    MESSAGE("no CUDA backend; skipping dense FA-2 causal fall-through");
     return;
   }
+  // bf16, hd 64, MHA — everything the fast path wants EXCEPT non-causality.
+  const int64_t T = 257, H = 4, D = 64;
   const float s64 = 1.0f / std::sqrt(64.0f);
+  const auto q = ToBf16(RandF32(static_cast<size_t>(T * H * D), 51));
+  const auto k = ToBf16(RandF32(static_cast<size_t>(T * H * D), 52));
+  const auto v = ToBf16(RandF32(static_cast<size_t>(T * H * D), 53));
+  const auto ref = RunBf16(Op::kFlash, q, k, v, T, H, H, D, s64, /*causal=*/true);
+  const auto got = RunBf16(Op::kFa2, q, k, v, T, H, H, D, s64, /*causal=*/true);
+  CHECK(Mismatches(got, ref) == 0);  // bit-exact: same kernel, same args
+  // The causal answer must NOT be the non-causal one — otherwise "bit-exact vs the
+  // reference" would be satisfiable by a kernel that ignores the mask entirely.
+  const auto noncausal = RunBf16(Op::kFlash, q, k, v, T, H, H, D, s64, /*causal=*/false);
+  MESSAGE("causal vs non-causal rel-L2 (must be large): ", RelL2(ref, noncausal));
+  CHECK(RelL2(ref, noncausal) > 100.0 * kRelL2Bound);
+}
 
-  SUBCASE("causal at the fast-path shape (M3)") {
-    // bf16, hd 64, MHA — everything the fast path wants EXCEPT non-causality.
-    const int64_t T = 257, H = 4, D = 64;
-    const auto q = ToBf16(RandF32(static_cast<size_t>(T * H * D), 51));
-    const auto k = ToBf16(RandF32(static_cast<size_t>(T * H * D), 52));
-    const auto v = ToBf16(RandF32(static_cast<size_t>(T * H * D), 53));
-    const auto ref = RunBf16(Op::kFlash, q, k, v, T, H, H, D, s64, /*causal=*/true);
-    const auto got = RunBf16(Op::kFa2, q, k, v, T, H, H, D, s64, /*causal=*/true);
-    CHECK(got == ref);  // bit-exact: same kernel, same args
-    // The causal answer must NOT be the non-causal one — otherwise "bit-exact vs the
-    // reference" would be satisfiable by a kernel that ignores the mask entirely.
-    const auto noncausal = RunBf16(Op::kFlash, q, k, v, T, H, H, D, s64, /*causal=*/false);
-    MESSAGE("causal vs non-causal rel-L2 (must be large): ", RelL2(ref, noncausal));
-    CHECK(RelL2(ref, noncausal) > 100.0 * kRelL2Bound);
+TEST_CASE("attention-dense-fa2 falls through for GQA (h_k != h)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping dense FA-2 GQA fall-through");
+    return;
   }
+  const int64_t T = 96, Hq = 8, Hk = 2, D = 64;
+  const float s64 = 1.0f / std::sqrt(64.0f);
+  const auto q = ToBf16(RandF32(static_cast<size_t>(T * Hq * D), 61));
+  const auto k = ToBf16(RandF32(static_cast<size_t>(T * Hk * D), 62));
+  const auto v = ToBf16(RandF32(static_cast<size_t>(T * Hk * D), 63));
+  const auto ref = RunBf16(Op::kFlash, q, k, v, T, Hq, Hk, D, s64, false);
+  const auto got = RunBf16(Op::kFa2, q, k, v, T, Hq, Hk, D, s64, false);
+  CHECK(Mismatches(got, ref) == 0);
+}
 
-  SUBCASE("GQA (h_k != h)") {
-    const int64_t T = 96, Hq = 8, Hk = 2, D = 64;
-    const auto q = ToBf16(RandF32(static_cast<size_t>(T * Hq * D), 61));
-    const auto k = ToBf16(RandF32(static_cast<size_t>(T * Hk * D), 62));
-    const auto v = ToBf16(RandF32(static_cast<size_t>(T * Hk * D), 63));
-    const auto ref = RunBf16(Op::kFlash, q, k, v, T, Hq, Hk, D, s64, false);
-    const auto got = RunBf16(Op::kFa2, q, k, v, T, Hq, Hk, D, s64, false);
-    CHECK(got == ref);
+TEST_CASE("attention-dense-fa2 falls through for head_dim != 64") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping dense FA-2 head_dim fall-through");
+    return;
   }
+  const int64_t T = 96, H = 3, D = 80;  // no non-split FA-2 instantiation at 80
+  const float s = 1.0f / std::sqrt(static_cast<float>(D));
+  const auto q = ToBf16(RandF32(static_cast<size_t>(T * H * D), 71));
+  const auto k = ToBf16(RandF32(static_cast<size_t>(T * H * D), 72));
+  const auto v = ToBf16(RandF32(static_cast<size_t>(T * H * D), 73));
+  const auto ref = RunBf16(Op::kFlash, q, k, v, T, H, H, D, s, false);
+  const auto got = RunBf16(Op::kFa2, q, k, v, T, H, H, D, s, false);
+  CHECK(Mismatches(got, ref) == 0);
+}
 
-  SUBCASE("head_dim != 64") {
-    const int64_t T = 96, H = 3, D = 80;  // no non-split FA-2 instantiation at 80
-    const float s = 1.0f / std::sqrt(static_cast<float>(D));
-    const auto q = ToBf16(RandF32(static_cast<size_t>(T * H * D), 71));
-    const auto k = ToBf16(RandF32(static_cast<size_t>(T * H * D), 72));
-    const auto v = ToBf16(RandF32(static_cast<size_t>(T * H * D), 73));
-    const auto ref = RunBf16(Op::kFlash, q, k, v, T, H, H, D, s, false);
-    const auto got = RunBf16(Op::kFa2, q, k, v, T, H, H, D, s, false);
-    CHECK(got == ref);
+TEST_CASE("attention-dense-fa2 falls through for f32") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping dense FA-2 f32 fall-through");
+    return;
   }
-
-  SUBCASE("f32 dtype") {
-    const int64_t T = 96, H = 3, D = 64;
-    const auto q = RandF32(static_cast<size_t>(T * H * D), 81);
-    const auto k = RandF32(static_cast<size_t>(T * H * D), 82);
-    const auto v = RandF32(static_cast<size_t>(T * H * D), 83);
-    const auto ref = RunF32(Op::kFlash, q, k, v, T, H, H, D, s64, false);
-    const auto got = RunF32(Op::kFa2, q, k, v, T, H, H, D, s64, false);
-    CHECK(got == ref);
-  }
+  const int64_t T = 96, H = 3, D = 64;
+  const float s64 = 1.0f / std::sqrt(64.0f);
+  const auto q = RandF32(static_cast<size_t>(T * H * D), 81);
+  const auto k = RandF32(static_cast<size_t>(T * H * D), 82);
+  const auto v = RandF32(static_cast<size_t>(T * H * D), 83);
+  const auto ref = RunF32(Op::kFlash, q, k, v, T, H, H, D, s64, false);
+  const auto got = RunF32(Op::kFa2, q, k, v, T, H, H, D, s64, false);
+  CHECK(Mismatches(got, ref) == 0);
 }
 
 // ===========================================================================
@@ -380,5 +411,5 @@ TEST_CASE("attention-dense-fa2 VT_FA2_DENSE=0 restores the scalar kernel bit-exa
   else
     (void)unsetenv("VT_FA2_DENSE");
 
-  CHECK(off == ref);  // the knob really does route back to AttentionDenseFlash
+  CHECK(Mismatches(off, ref) == 0);  // the knob really routes back to AttentionDenseFlash
 }
