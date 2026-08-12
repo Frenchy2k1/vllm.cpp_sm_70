@@ -250,3 +250,13 @@ row's scope.
 Native Windows compilation, the complete ten-tuple non-publishing workflow,
 and the tag-run publication/audit remain post-merge acceptance gates. No tag or
 release is authorized by the local evidence alone.
+
+Fresh review of immutable implementation `e0b17eb9` found that the compiled
+version test derived its default expectation from the same cache value under
+test. Mutating the cache default from `${PROJECT_VERSION}` to `9.9.9` therefore
+changed both subject and oracle and left the focused suite green. The review
+loop adds an independent release-contract assertion over the real CMake cache
+declaration. With the `9.9.9` mutation applied, that assertion failed exactly
+with `9.9.9 != ${PROJECT_VERSION}`; after restoration it and the complete
+42-test release pipeline suite passed. Production CMake and runtime code remain
+unchanged by this follow-up.
