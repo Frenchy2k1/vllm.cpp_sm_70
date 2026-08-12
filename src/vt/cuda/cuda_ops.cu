@@ -19,6 +19,15 @@
 #include "vt/ops.h"
 
 namespace vt::cuda {
+
+#ifdef VLLM_CPP_FLASH_ATTN
+// Defined in cuda_flash_attn_fa2.cu (same TU set, gated on the same feature).
+// Declared here at vt::cuda scope — NOT inside the anonymous namespace below —
+// exactly as cuda_paged_attn.cu:53-64 declares the paged FA-2 launchers.
+void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
+                        const Tensor& value, float scale, bool causal);
+#endif
+
 namespace {
 
 constexpr int kBlock = 256;
@@ -3357,6 +3366,48 @@ void AttentionDenseFlashKernelCuda(Queue& q, Tensor& out, const Tensor& query, c
   }
 }
 
+// AttentionDenseFa2 — the same dense non-causal contract run on the VENDORED
+// FlashAttention-2 forward's tensor cores (multimodal-speed §17). The scalar
+// AttentionDenseFlash above tiles K/V through shared memory but still walks the keys
+// with one warp per query through a dependent online-softmax chain, which is
+// serial-latency-bound; FA-2 replaces that with an `mma.sync` block reduction, and it
+// is the kernel vLLM itself dispatches for this shape.
+//
+// The fast path is deliberately NARROW — bf16, head_dim 64, non-causal, MHA, and the
+// vendored kernels compiled in — because head_dim 64 non-split is the only extra
+// instantiation this change compiles. Anything else falls through to
+// AttentionDenseFlash, so callers get the best available kernel for their shape rather
+// than a hard refusal, and every non-encoder caller of this op is byte-identical to
+// the flash-tiled path by construction.
+#ifdef VLLM_CPP_FLASH_ATTN
+// Same-binary A/B + RED knob, mirroring VT_FA2_PREFILL / VT_FA2_DECODE
+// (cuda_paged_attn.cu): VT_FA2_DENSE=0 restores the scalar flash-tiled kernel so both
+// arms run from one build. DEFAULT ON (parity-enabler-as-default). Read fresh each
+// call — this is a host path taken once per encoder layer.
+bool Fa2DenseEnabled() {
+  const char* e = std::getenv("VT_FA2_DENSE");
+  return e == nullptr || e[0] != '0';
+}
+#endif
+
+void AttentionDenseFa2KernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                                 const Tensor& value, const AttentionArgs& args) {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const bool fa2_shape = query.dtype == DType::kBF16 && key.dtype == DType::kBF16 &&
+                         value.dtype == DType::kBF16 && out.dtype == DType::kBF16 &&
+                         query.shape[2] == 64 && key.shape[1] == query.shape[1] &&
+                         value.shape[1] == query.shape[1] && !args.causal;
+  if (fa2_shape && Fa2DenseEnabled()) {
+    // args.causal is false here (fa2_shape requires !args.causal); it is threaded
+    // through so the launcher can REFUSE a causal request instead of answering a
+    // different question. See LaunchDenseFA2Bf16's causal guard.
+    LaunchDenseFA2Bf16(AsStream(q), out, query, key, value, args.scale, args.causal);
+    return;
+  }
+#endif
+  AttentionDenseFlashKernelCuda(q, out, query, key, value, args);
+}
+
 // ---------------------------------------------------------------------------
 // fused_chain (TDR): the Tier-1 single-pass INTERPRETER over the canonical
 // (out, x, weight, residual) 4-operand shape. The Tier-0 composite is device-
@@ -3547,6 +3598,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFastKernelCuda)));
     RegisterOp(OpId::kAttentionDenseFlash, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFlashKernelCuda)));
+    RegisterOp(OpId::kAttentionDenseFa2, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFa2KernelCuda)));
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernelCuda)));
