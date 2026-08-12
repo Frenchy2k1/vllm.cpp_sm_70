@@ -1,6 +1,7 @@
 #include <array>
 #include <bit>
 #include <limits>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 

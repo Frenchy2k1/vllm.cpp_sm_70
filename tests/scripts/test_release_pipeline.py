@@ -135,6 +135,39 @@ class ReleasePipelineContract(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.pipeline.validate_release_version(mutant)
 
+    def test_every_release_builder_forwards_exact_build_version_to_cmake(self) -> None:
+        shell_argument = '-DVLLM_CPP_BUILD_VERSION="$VERSION"'
+        for driver in BUILD_DRIVERS:
+            with self.subTest(driver=driver.name):
+                text = driver.read_text(encoding="utf-8")
+                self.assertEqual(text.count(shell_argument), 1)
+                for replacement in (
+                    "",
+                    '-DVLLM_CPP_BUILD_VERSION="0.0.3-pre.1"',
+                    '-DVLLM_CPP_BUILD_VERSION="$PROJECT_VERSION"',
+                ):
+                    self.assertNotEqual(
+                        text.replace(shell_argument, replacement, 1).count(
+                            shell_argument
+                        ),
+                        1,
+                    )
+
+        powershell_argument = '"-DVLLM_CPP_BUILD_VERSION=$env:VERSION"'
+        text = WINDOWS_BUILD_DRIVER.read_text(encoding="utf-8")
+        self.assertEqual(text.count(powershell_argument), 1)
+        for replacement in (
+            "",
+            '"-DVLLM_CPP_BUILD_VERSION=0.0.3-pre.1"',
+            '"-DVLLM_CPP_BUILD_VERSION=$env:PROJECT_VERSION"',
+        ):
+            self.assertNotEqual(
+                text.replace(powershell_argument, replacement, 1).count(
+                    powershell_argument
+                ),
+                1,
+            )
+
     def test_workflow_has_two_exact_native_windows_preview_lanes(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         for job, backend, build_dir in (

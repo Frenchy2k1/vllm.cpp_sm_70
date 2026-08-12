@@ -208,3 +208,45 @@ binary-release claim advances.
 - RED tests and mutations fail for the two observed defects before code changes.
 - Local, hosted, dry-run, tag-run, and post-publication evidence are separated;
   none is inferred from another.
+
+## Outcome
+
+Implemented both bounded dry-run repairs without changing release topology,
+production ISA behavior, warning policy, or validator strictness.
+
+- `VLLM_CPP_BUILD_VERSION` is now a non-empty CMake cache string defaulting to
+  `PROJECT_VERSION`. The generated version header retains the numeric component
+  macros and also carries that exact identity; `Version()` appends the existing
+  `+cuda` qualifier to it unchanged.
+- The CPU, Linux accelerator, macOS, and Windows release builders each forward
+  their already-required `VERSION` value to CMake exactly once.
+- `tests/vt/test_cpu_isa_x86.cpp` now owns the standard `<ostream>` definition
+  required by its doctest diagnostics.
+
+RED evidence on the pinned candidate preceded implementation. The builder
+contract reported zero `VLLM_CPP_BUILD_VERSION` arguments for all four builder
+families, the portability contract reported no active `<ostream>` include, and
+a separately configured `0.0.3-pre.1` `test_version` failed because the binary
+reported `0.0.3`. The retained strict-validator mutation rejects a numeric-only
+server output when the manifest and `VERSION` declare `0.0.3-pre.1`.
+
+Focused green evidence:
+
+- release pipeline suite: 41 tests passed;
+- Windows portability suite: 71 tests passed, followed by the direct checker;
+- archive and platform metadata suites: 43 tests passed;
+- an explicit empty build-version configure was rejected; and
+- clean CPU builds passed the default and prerelease version tests. The clean
+  prerelease build also passed all 8,242 x86 ISA assertions. Server smoke output
+  was exactly `vllm.cpp 0.0.3 c-abi=17` by default and
+  `vllm.cpp 0.0.3-pre.1 c-abi=17` with the release override.
+
+The two hosted CUDA failures from dry run `31607273683` provide additional
+root-cause evidence: jobs `94152936151` and `94152936356` both completed their
+build and package phases and failed only because the extracted binary reported
+the numeric project version. They did not expose a third repair within this
+row's scope.
+
+Native Windows compilation, the complete ten-tuple non-publishing workflow,
+and the tag-run publication/audit remain post-merge acceptance gates. No tag or
+release is authorized by the local evidence alone.
