@@ -154,8 +154,8 @@ characters.
 *3. `DATED_HEADING_RE` rejects a per-attempt heading at any depth.* This is the
 regrowth guard, the same shape as the `ROW_TABLE_LINE` guard `87308dea` added to
 `check-now-current.py`, and it closes the `### ` hole the character cap was
-covering. The shape is measured, not invented: of the **305 sections already
-rolled into `.agents/benchmark-record.md`, 282 name a date in their heading**
+covering. The shape is measured, not invented: of the **307 sections already
+rolled into `.agents/benchmark-record.md`, 284 name a date in their heading**
 (`2026-08-07`, `2026-07-31`, ...), which is what a per-attempt entry looks like
 here. **Zero of the 36 live headings across the two public pages name a date**
 (18 each, at every depth, `_headings`). So the guard fires on the first appended
@@ -456,15 +456,20 @@ the same line after a closed inline span, stay checked, and
 `test_the_tree_has_no_dangling_link` holds the whole tree.
 
 Measured on the merged tree over the markdown files the checker scans:
-**4,114 targets before the strip, 4,110 after**, so 4 stop being validated. All
-4 sit in a genuinely fenced sample: three inside the unclosed block at
+**4,130 targets before the strip, 4,122 after**, so 8 stop being validated, and
+every one of the 8 is a code sample. Three are inside the unclosed block at
 `.agents/completed/state-events/0000-00/STATE-LEGACY-000001.md:17697`
 (`porting.md`, `../tests/vt/test_ops_matmul_elem.cpp`,
-`specs/accelerator-seam-audit.md`), and one inline span in this spec, the
-`path` placeholder in the `` [`name`](path) `` sample. **The first revision of this
-row dropped 5, not 4, and the fifth was NOT a sample**: it was the live prose
-link at `:18297`, lost to the fence mis-pairing F2 describes. The corrected
-pairing restores it. Reproduce with `extract_links` over `markdown_files()`.
+`specs/accelerator-seam-audit.md`); the other five are the `path` placeholder in
+this spec, once in a fence and four times in an inline span. **The loose fence
+rule the first revision shipped drops 9 on this same tree, and the ninth is NOT
+a sample**: it is the live prose link at `:18297`, lost to the phase inversion
+F2 describes. The corrected pairing restores it. Reproduce with `extract_links`
+over `markdown_files()`.
+
+The spec's earlier figures, 4,109 before and 4,105 after with "all 4 are quoted
+samples", were both stale and wrong about the count: the review re-measured 5
+lost, and the fifth was the live link.
 
 **Risk: two stray backticks hide a target that does not exist.** They do. This
 form, which this spec itself carried until F5 found it:
@@ -508,7 +513,7 @@ entry-scoped rules.
 - `04b2b9fa` over the cap: `git show 04b2b9fa:docs/BENCHMARKS.md | wc -c` gives
   45,007.
 - Heading-shape survey, re-measured on the merged tree after review finding F8
-  found the first numbers unreproducible: **282 of 305** archived section titles
+  found the first numbers unreproducible: **284 of 307** archived section titles
   carry a date, and **0 of 36** live headings do, 18 per page. Reproduce with
   `_headings` and `DATED_HEADING_RE` over the two pages, and with
   `grep -c '^## '` over `.agents/benchmark-record.md`. The spec previously said
@@ -517,8 +522,8 @@ entry-scoped rules.
 - The full mutation set, three trees: BASE `origin/main`, the first revision of
   this row, and the revision that lands. Table in Risks; harness reproduced in
   the PR body.
-- Link-extraction census: 4,114 raw targets, 4,110 after the strip, the 4 losses
-  enumerated in Risks.
+- Link-extraction census: 4,130 raw targets, 4,122 after the strip, the 8
+  losses enumerated in Risks, against 9 for the loose fence rule.
 - `check-pr-size.py`'s own red-before/green-after harness, for both checkers.
 - **CI on this PR: a red `windows-msvc-*` is NOT this row's.** Both lanes are
   `if: github.event_name == 'pull_request'` (`ci.yml:640`), so the lane

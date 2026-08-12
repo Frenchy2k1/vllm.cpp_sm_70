@@ -72,7 +72,7 @@ MAX_ROW_CHARS = 600
 
 # REGROWTH GUARD. What actually bloated BENCHMARKS.md to 11,405 lines was
 # PER-ATTEMPT sections, appended one checkpoint at a time, and the page's own
-# archive records their shape: 282 of the 305 sections already rolled into
+# archive records their shape: 284 of the 307 sections already rolled into
 # .agents/benchmark-record.md name a DATE in the heading. Zero of the 36 live
 # headings across the two public pages do (18 each; reproduce with _headings).
 # So a dated heading is the append-log entry, and it fails at the FIRST one.
@@ -271,10 +271,13 @@ def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
             continue
         if in_fence:
             continue
+        # "-", "+" and ">" are gone from this list entirely, which IS the fold:
+        # a list item or a quoted line now joins the paragraph running through
+        # it. Only "|", "#" and an emphasis-lead "*" still break a paragraph,
+        # and the last of those is the residue documented above, not a rule.
         is_prose = bool(stripped) and not (
             stripped.startswith("|")
             or stripped.startswith("#")
-            # See KNOWN RESIDUE above: emphasis-lead, but NOT "* item".
             or (stripped.startswith("*") and not LIST_ITEM_RE.match(stripped))
         )
         if is_prose:
