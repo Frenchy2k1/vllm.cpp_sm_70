@@ -31,6 +31,9 @@ Isolated evidence toolchain repair:
 Sanitized evidence environment test repair:
 [#457](https://github.com/mudler/vllm.cpp/issues/457)
 
+Complete codemodel evidence toolchain repair:
+[#458](https://github.com/mudler/vllm.cpp/issues/458)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -458,6 +461,19 @@ performs tool preparation, sanitized-environment construction, and its
 allowlisted-tool and sibling-exclusion assertions inside one `clear=True`
 hostile environment. The exact ambient-`PATH` mutation must fail while the
 #456 implementation remains unchanged.
+
+Hosted PR-size run `31574038913` then reached the real codemodel test and
+failed because its private evidence tool directory contained Ninja but not the
+`cmake` executable that launches that generator
+([#458](https://github.com/mudler/vllm.cpp/issues/458)). Inventory of the
+executing portability suite establishes an exact mandatory pair: the tests and
+checker invoke `cmake`, and every configure selects `-G Ninja`; PowerShell is
+an optional extra validation and Python uses an absolute interpreter path.
+The repair declares the complete per-module `cmake`/`ninja` tuple and copies
+each resolved executable into the same private directory. Inheriting ambient
+`PATH` remains forbidden, and sibling executables remain unreachable. Focused
+tests must fail when either required tool is omitted or unresolved and pass
+only when both private copies are selected.
 
 Hosted run `31570365638` then exposed two independent portability-audit defects
 ([#454](https://github.com/mudler/vllm.cpp/issues/454)). The Vulkan source

@@ -63,6 +63,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#455](https://github.com/mudler/vllm.cpp/issues/455) | `ENG-RELEASE-WINDOWS` | PR #446 agent-record ratchet change lacks semantic mutation evidence in its recognized suite | bug |
 | [#456](https://github.com/mudler/vllm.cpp/issues/456) | `ENG-RELEASE-WINDOWS` | PR-size isolated evidence PATH hides Ninja and falsely reds the Windows portability HEAD suite | bug |
 | [#457](https://github.com/mudler/vllm.cpp/issues/457) | `ENG-RELEASE-WINDOWS` | PR-size sanitized-PATH test constructs its asserted environment after the hostile ambient context exits | bug |
+| [#458](https://github.com/mudler/vllm.cpp/issues/458) | `ENG-RELEASE-WINDOWS` | PR-size portability evidence allowlist omits CMake from the CMake-plus-Ninja codemodel toolchain | bug |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
