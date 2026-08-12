@@ -1430,3 +1430,23 @@ Recorded because each cost a run and each returns exit 0 while proving nothing:
   as "crashes in EngineCore KV-cache/model init" — that is very likely this, not a broken
   oracle: with `CC=/usr/bin/gcc` set, the same venv ran the teacher-force to completion.
 
+#### 17.8 Cross-path regression (the additive-op claim, verified not asserted)
+
+`kAttention` / `kAttentionDenseFast` / `kAttentionDenseFlash` are untouched, so every
+non-encoder caller is byte-identical by construction — and it was checked anyway, on the
+shipping tree, under `flock`:
+
+| Gate | Result |
+|---|---|
+| `test_ops_attention` (`kAttention` intact) | **37239/37239**, 9/9 cases |
+| `test_qwen3vl_e2e` (4B image, STRICT) | **46/46** |
+| `test_qwen3_5_vl_e2e` (27B image, STRICT) | **54/54** |
+| `test_qwen3_5_vl_video_e2e` (27B video, STRICT) | **27/27** |
+| Image/video goldens | md5 UNCHANGED (`3bc5f231...`, `b7221f22...`, `bf14a962...`) |
+
+One process note worth keeping: dgx's `/tmp` is per-ssh-session private the same way
+`/dev/shm` is, so a `tmux`-launched job can lose its server and die having produced
+nothing while its `$HOME` marker simply never appears — indistinguishable from "still
+queued". This regression run died that way once. `setsid nohup` with the marker in
+`$HOME` is the form that survives.
+
