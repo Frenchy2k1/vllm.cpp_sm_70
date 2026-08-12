@@ -186,6 +186,18 @@ gate → size (S/M/L) → vehicle model. `[H]` = user-directed headline.
     Metal batched-decode tile kernel + binding harness (M4 quiet/sudo); CPU B4 speed/RSS.
     **Gate:** ≥ MLX-LM (Metal) / ≥ llama.cpp (CPU) binding A/B. **Size M.** **Vehicle:**
     Qwen3-1.7B/4B on M4; Qwen3.5-2B Q8 on CPU.
+    **CPU half, 2026-08-11 ([#433](https://github.com/mudler/vllm.cpp/issues/433),
+    [x86 arm](cpu-llamacpp-floor-x86-2026-08-11.md)):** "CPU B4 speed/RSS" was a
+    two-arm item that had quietly become three. The 20-core Arm/i8mm arm is
+    CLOSED (parity or better on every axis) and the four-core A76 arm is OPEN on
+    speed (#284), and both are AArch64. The **x86_64** arm had no post-lever
+    number at all, and every lever that closed the first arm is Arm-scoped, so
+    nothing transferred. It is now measured: **peak RSS 1.0022x = PARITY (MET)**;
+    prefill/decode/E2E **`PENDING` a quiet host** (this box is `VOID` for binding
+    timing, re-confirmed by a 5-rep series discarded at load 82). Correctness
+    holds byte-identically at the measured length. Next CPU lever is CIQ `G5`
+    (x86 AVX2/AVX-512 quant tier + an AVX-512 consumer for the `G7` repack).
+    **The Metal/MLX half is untouched: it needs an Apple M4.**
 14. **`ROAD-V1-C2-LOCAL-BF16` device-resident sampled-token rerun** (small). **Size S.**
 15. **`ROAD-V1-C1` fusion perf interpreter** (cornerstone done; perf tail,
     ≤3.5%/step ceiling). **Size M.** `FUSION-DENSE-MIGRATE` is CLOSED (2026-08-10,
