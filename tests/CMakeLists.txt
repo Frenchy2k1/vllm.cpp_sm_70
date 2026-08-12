@@ -110,6 +110,7 @@ vllm_cpp_add_test(test_qwen3_dspark_weights vllm/models/test_qwen3_dspark_weight
 target_include_directories(test_qwen3_dspark_weights PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W4: sequential Markov sampling + the anchor block layout.
 vllm_cpp_add_test(test_cudagraph_dispatch vllm/v1/worker/gpu/test_cudagraph_dispatch.cpp)
+target_include_directories(test_cudagraph_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dspark_sample vllm/v1/spec_decode/test_dspark_sample.cpp)
 target_include_directories(test_dspark_sample PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)

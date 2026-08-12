@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // internal header, from src/
 
 using namespace vllm::v1;
 
