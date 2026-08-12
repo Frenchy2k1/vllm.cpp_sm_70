@@ -276,14 +276,19 @@ already gates.
 
 ## 8. Now
 
-**State at this commit:** spec committed, implementation **not started**.
-`KERNEL-SSM-MAMBA` stays `INVENTORIED` — this commit changes no lifecycle
-state, so it owes no `STATUS.md` / `BENCHMARKS.md` projection. The row moves
-when a fresh implementer claims W1 against issue #496.
+**State (updated 2026-08-12):** **W1 is landed on `main`** at `47960a009` —
+the three CPU host references (`vt::Mamba2ChunkScan`, `vt::Mamba2StateUpdate`,
+`vt::RmsNormGatedGroup`) with their unit gates, after two fresh reviews (round 1
+FAIL, round 2 PASS). `KERNEL-SSM-MAMBA` stays `INVENTORIED`: this is a host
+reference, not generic Mamba support, and no lifecycle state moved, so it owes
+no `STATUS.md` / `BENCHMARKS.md` projection. No performance claim is made.
 
-**Next action:** dispatch a fresh implementer for W1 with the
-[implementer contract](../prompts/), scoped to `src/vt/cpu/cpu_mamba2_ssd.cpp`,
-`include/vt/ops.h`, `src/vt/ops.cpp` and the three new test TUs, RED first.
+**Owed before the row can move:** W2 (the CUDA arm, byte-compared to these host
+references, `compute-sanitizer` clean on dgx), W3 (the `MambaSpec` producer for
+Mamba2 shapes), and the one missing decode refusal `SUBCASE` recorded in §8.2.
+
+**Next action:** dispatch a fresh implementer for W2 (CUDA), and fold the §8.2
+`SUBCASE` into that task since it touches the same suites.
 
 ### 8.1 W1 progress (host references landed, awaiting a fresh scoped review)
 
@@ -385,10 +390,17 @@ raised:
   observable) plus a note that **W2 must not inherit either host-reference
   width**.
 
-Every one of those mutations was re-applied after the repair and is now caught;
-the store-side rounding pin from §8.1 was re-checked at the same time and still
-reds. F10 (`.agents/kernel-matrix.md:157` still reading "implementation not
-started") is an operator-owned record line and was left alone.
+All but one of those mutations was re-applied after the repair and is now
+caught; the store-side rounding pin from §8.1 was re-checked at the same time
+and still reds. **Correction (round-2 review, 2026-08-12):** the claim
+originally written here — that *every* one is caught — was wrong for the decode
+half of F4. Dropping `CheckMamba2ANegative` at `cpu_ops.cpp:1877` leaves
+`test_ops_mamba2_state_update` fully green, while the same mutation on its
+chunk-scan twin at `:1633` reds. The guard itself is present, correct and
+reachable (a direct probe refuses `A` = `+1.0`, `0.0`, `-0.0` naming `A_log`,
+and accepts `-1e-30` and `-9.8e-45`), so this is a missing mutation-proof, not
+a defect — **owed:** an "A must be negative" `SUBCASE` on the state-update
+refusal case mirroring `tests/vt/test_ops_mamba2_ssd.cpp:900`.
 
 One repo-wide test trap found while capturing the RED output, and worth carrying
 to any doctest suite: **doctest 2.5.2 `INFO` prints a `const char*` VARIABLE as
