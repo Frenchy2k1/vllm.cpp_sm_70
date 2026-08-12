@@ -468,6 +468,55 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertRegex(active_deepseek, contract)
 
+    def test_logprobs_slice_parameter_does_not_shadow_member(self) -> None:
+        header = (REPO / "include/vllm/v1/outputs.h").read_text(
+            encoding="utf-8"
+        )
+        active_header = checker._cpp_structural_view(header)
+        header_signature = r"\bLogprobsTensors\s+slice_request\s*\("
+        header_matches = list(re.finditer(header_signature, active_header))
+        self.assertEqual(
+            len(header_matches),
+            1,
+            "LogprobsTensors::slice_request declaration",
+        )
+        header_match = header_matches[0]
+        header_end = re.match(
+            r"(?:[^()]|\([^()]*\))*\)\s*const\s*;",
+            active_header[header_match.end():],
+        )
+        self.assertIsNotNone(
+            header_end,
+            "LogprobsTensors::slice_request declaration",
+        )
+        assert header_end is not None
+        header_declaration = active_header[
+            header_match.start():header_match.end() + header_end.end()
+        ]
+
+        source = (REPO / "src/vllm/v1/outputs.cpp").read_text(
+            encoding="utf-8"
+        )
+        active_source = checker._cpp_structural_view(source)
+        source_signature = r"\bLogprobsTensors::slice_request\s*\("
+        span = checker._cpp_function_body_span(source, source_signature)
+        self.assertIsNotNone(span, "LogprobsTensors::slice_request")
+        assert span is not None
+        source_matches = list(re.finditer(source_signature, active_source))
+        self.assertEqual(
+            len(source_matches),
+            1,
+            "LogprobsTensors::slice_request definition",
+        )
+        source_declaration = active_source[source_matches[0].start():span[1]]
+
+        for location, declaration in (
+            ("header", header_declaration),
+            ("source", source_declaration),
+        ):
+            with self.subTest(location=location):
+                self.assertNotRegex(declaration, r"\bint\s+num_positions\b")
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):

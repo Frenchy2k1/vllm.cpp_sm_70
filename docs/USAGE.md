@@ -1295,6 +1295,11 @@ SAMPLED from — a token top-k masked away reads `-inf` there and its true value
 under the raw pair. It is selectable by constructing a `Sampler` directly; there
 is no config, CLI or request field for it yet.
 
+`LogprobsTensors::slice_request(req_idx, request_num_positions)` cuts that
+batch-wide payload by rows. The second argument is the requested row count;
+each row keeps the source tensor's independent `num_tokens_per_position`
+width.
+
 The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
 [`lora/punica.h`](../include/vllm/lora/punica.h),
 [`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired

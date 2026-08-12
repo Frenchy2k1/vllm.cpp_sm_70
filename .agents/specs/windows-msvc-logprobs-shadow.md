@@ -81,4 +81,32 @@ complete native log contains any other diagnostic family.
 
 ## Outcome
 
-Pending RED, implementation, and immutable gate evidence.
+The structural regression failed first with the exact shadowing declaration
+`LogprobsTensors::slice_request(int req_idx, int num_positions) const`. The
+implementation renames only that parameter to `request_num_positions` in the
+declaration and definition, assigns `out.num_positions` explicitly from it, and
+uses it for the slice end. The function types, public symbol, selected rows,
+payload values, warning gates, and release surfaces remain unchanged.
+
+The first structural regression read only `outputs.cpp`, so restoring the
+shadowing parameter in the installed header alone passed both the focused test
+and direct checker. The final regression recognizes the exact `slice_request`
+declaration and definition independently, limits the C4458 assertion to those
+two scopes, and ignores comments and the valid `empty_cpu` parameter of the
+same name. Header-only and source-only mutations each fail their own subtest;
+mutating both fails both.
+
+The first semantic fixture also made the row width and requested row count both
+`2`, so using `request_num_positions` as the flat-vector stride passed. The
+final payload has width `3`, requests two rows from nonzero offset `1`, and
+checks all six token IDs and logprobs. The wrong-stride mutation selects four
+values beginning in the previous row and fails both payload assertions, while
+the correct member assignment, slice end, offset, and width pass.
+
+The focused structural test and direct production portability checker pass, as
+does the complete 69-test Windows portability suite. Clean Release CPU and
+Vulkan source closures built the focused linked tests; in both configurations,
+`test_sampling_metadata` passes 7/7 cases and 61/61 assertions, while
+`test_outputs` passes 9/9 cases and 48/48 assertions. Native MSVC CPU and Vulkan
+reruns remain the authoritative C4458 `/W4 /WX` validation and are not inferred
+from Linux.
