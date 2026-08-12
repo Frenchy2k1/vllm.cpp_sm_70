@@ -27,6 +27,14 @@ it forward reintroduces the duplicate and reds `check-agent-record`. The
 composition here drops that edit; whoever lands `ab0b14a9` owes the same fix or a
 deliberate re-key of the umbrella.
 
+Issues FILED from this row's fresh review and keyed to it in the roadmap table:
+
+| Issue | What it holds |
+|---|---|
+| [#491](https://github.com/mudler/vllm.cpp/issues/491) | The two toggles are NOT independent — no 2x2, the bf16 lever is decode-negative, its PREFILL justification unmeasured, and the three preconditions for any default flip |
+| [#492](https://github.com/mudler/vllm.cpp/issues/492) | The fp8 qkvz `qqsss`->`qqtst` reselection is measured only at M=1, and its reason to exist is a PREFILL cost |
+| [#493](https://github.com/mudler/vllm.cpp/issues/493) | doctest 2.5.2 `MESSAGE` renders a string-literal ternary as its first branch unconditionally |
+
 ## THIS ROW HAS NO TOKEN GATE ON THE PATH IT MODIFIES
 
 Stated first because it bounds every claim below.
@@ -42,7 +50,10 @@ about this change: the gate never executes the branch.
 Consequently:
 
 - **Correctness is NOT claimed by this row.** Not "probably fine", not "byte
-  identical by construction" — unclaimed.
+  identical by construction" — unclaimed. (`GATE-27B-FP8-TOWER-GOLDEN` has since
+  landed and §4 records what its gate does and does not establish: no gross
+  defect, at ~50x coarser sensitivity than the perturbation introduced. That
+  still is not a correctness claim.)
 - Speed MAY be measured, because a speed A/B does not depend on a golden.
 - The token gate is owed by `row/GATE-27B-FP8-TOWER-GOLDEN`, which is capturing
   real goldens for `nvidia@0893e160`. **Both toggles must stay DEFAULT OFF until
@@ -229,7 +240,17 @@ attributable; same-kernel/same-count rows are run-to-run variance:
 | `MulColVecF32Kernel` f32 -> bf16 | 0.1113 | 0.1090 | -0.0023 |
 | `gemvx` template swap | 0.5001 | 0.4988 | -0.0013 |
 | merged fp8 qkvz GEMM `nvjet…qqsss_192x48x128` -> `…qqtst…` (D f32->bf16) | 18.6259 (381.98 us/call) | 18.7209 (383.92 us/call) | **+0.0950** |
-| **net attributable** | | | **-0.5137** |
+| **net attributable** | | | ~~-0.5137~~ **do not quote (below)** |
+
+**Corrected on review: only the STRUCTURAL terms survive the run-to-run drift,
+and `-0.5137` must not be quoted to four figures.** The control is
+`marlin::Marlin` — 8,128 instances in BOTH traces, touched by nothing in this
+row — and it moves **+0.58% = +0.262 ms/step** between them, half the size of the
+"net attributable" above. What is larger than that drift is the pair whose kernel
+identity CHANGES or that DISAPPEARS: **-0.400** (recurrence swap) and **-0.131**
+(post-conv absorbed). The `+-0.09` rows — the -0.0776 bf16 cascade and the
++0.0950 fp8 qkvz GEMM — are INSIDE the drift and are candidates, not findings.
+One run per arm cannot separate them.
 
 End-to-end same-binary A/B (`vllm-bench`, c1, in 16 / out 256, 3 requests per
 leg, order-alternated `off,on,on,off,off,on`):
@@ -261,6 +282,18 @@ at start. Same checkpoint, same in 16 / out 256, same 3 requests, same
 | PIN (81.39, 81.40, 81.39) | **81.39 ms** | 0.01% | 1.000x | — |
 | ours OFF | 83.33 ms | 0.19% | **0.977x** | +1.94 ms/step (+2.38%) |
 | ours ON | 82.72 ms | 0.16% | **0.984x** | +1.33 ms/step (+1.63%) |
+
+**Corrected on review: `0.977x -> 0.984x` is INDICATIVE, not binding.** Two
+methodology gaps separate the numerator from the denominator. (1) The oracle
+driver `bridge-oracle.sh:51` stops `local-ai-worker` before its legs; the script
+that produced ALL SIX of our legs and BOTH nsys traces, `bridge-measure.sh`, does
+not — so the arms did not share a machine state. (2) The arms were NOT
+interleaved: ours 16:52-17:04, the pin 17:14-17:18, under separate lock
+acquisitions, and `oracle.log` pin-leg 3 reports Mean 83.57 / P99 87.88 against
+an 81.39 median, which is a real interference event inside the PIN legs rather
+than a tail artefact. Both defects inflate the pin's time, so the true ratio is
+no better than quoted and this number is CONSERVATIVE — but an interleaved re-run
+under one machine state is OWED before it is binding.
 
 The OFF row REPRODUCES the deficit this row was scoped from (+1.81 ms/step,
 +2.33%) at +1.94 / +2.38%, which is the strongest available check that the
@@ -304,10 +337,22 @@ byte-exact by construction — it is measured. SACRED `test_qwen27_paged_engine`
 (`unsloth@890bdef7`): **235 assertions, SUCCESS, 16/16 token-exact** with the
 lever OFF and ON, confirming the lever is inert on a BF16 tower.
 
-The bound the 27n arm carries travels with this result: a x1.10 fp8 scale
-perturbation is REACHED and still passes, so this is a GROSS-defect token gate on
-one 16-token prompt, not a bound on fp8 numerics. It does not license a default
-flip on its own.
+**What that does and does not establish, stated exactly.** The 27n arm admits a
+**x1.10** fp8 scale perturbation and still passes. The perturbation this row
+actually introduces is bf16 rounding of the `in_proj` D, ~2^-9 ~ **0.2%**. The
+gate is therefore about **50x coarser than the change it is asked to bound**.
+And no test anywhere compares `vt::GdnPackedDecode` against `vt::GdnDecode` —
+precisely the substitution this row makes reachable; the only op-level bound is
+packed-vs-CPU-reference at 2% rtol (`tests/vt/test_ops_gdn.cpp:~1503`), so the
+mutual bound between the two kernels is only ~4%. The ON arm additionally
+BUNDLES two numerical changes — bf16 D narrowed before the alpha multiply, and a
+different recurrence kernel — and neither is isolated from the other.
+
+So the correct phrasing, and the only one this row licenses, is: **no gross
+defect, at ~50x coarser sensitivity than the perturbation introduced, with two
+changes confounded.** Not "token-safe", not "numerically equivalent". A direct
+op-level `GdnPackedDecode` vs `GdnDecode` bound at real 27B decode shapes is
+**OWED** and is a precondition for any default flip.
 
 ### 5. What is NOT established
 
@@ -334,10 +379,30 @@ flip on its own.
 - **Whether the win survives at the gate's concurrency.** Everything above is
   c1. The GDN recurrence is per-sequence, so the saving should scale with batch,
   but that is an expectation and not a measurement.
+- **The two toggles are NOT independent, so there is no 2x2 and no attribution
+  between them.** `VT_GDN_PACKED_DECODE_FP8_TOWER` is INERT without
+  `VT_GDN_FP8_IN_BF16`, so the only reachable arms are OFF/OFF and ON/ON. Read
+  that way, the packed kernel earns the whole structural -0.531 while the bf16
+  lever's own decode terms sum to **+0.017 — slightly NEGATIVE in decode**. It is
+  carried here purely as the price of admission. Its actual justification — a
+  122.99 ms/req PREFILL pass at T~4096 — is entirely UNMEASURED by this row,
+  which ran `input_len=16`.
+- **The `qqsss`->`qqtst` reselection at large M.** The +0.095 ms/step is a real
+  deterministic cuBLASLt reselection for a bf16 D, and its whole reason to exist
+  is a PREFILL cost, so the shape that would justify it is the one shape not
+  measured.
+
+Before any default flip, three things are required and none of them exist yet:
+prefill / long-input both-arms nsys at T~4096; a concurrency sweep (c8/c16/c32);
+and an op-level `GdnPackedDecode` vs `GdnDecode` bound at real 27B decode shapes.
 
 ## Now
 
-Selection PROVEN, decode A/B MEASURED and token-clean on both checkpoints. Both
-toggles remain DEFAULT OFF: the flip is a separate decision that needs the
-per-shape check on the fp8 qkvz GEMM above and a PIN-relative re-measure, and
-this row does not argue it.
+Selection PROVEN (48/48). Decode A/B MEASURED, but only its two STRUCTURAL terms
+(-0.400, -0.131) survive the untouched control's own +0.262 ms/step drift, and
+the `0.977x -> 0.984x` against the pin is INDICATIVE, not binding: the arms ran
+under different background conditions and were not interleaved. Tokens do not
+move on either checkpoint, which establishes **no gross defect at ~50x coarser
+sensitivity than the perturbation introduced, with two changes confounded** —
+not equivalence. Both toggles remain DEFAULT OFF and this row does not argue a
+flip; the preconditions for one are listed at the end of §5.

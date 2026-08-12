@@ -19871,3 +19871,81 @@ gap; upstream's profile then showed 57.2% of ITS step, so it was never the gap. 
 share measures where OUR time goes, not where upstream's advantage is.
 
 Evidence: `dgx:~/work/dspark-w6/prof.log`, `prof/ours_{32,96}.nsys-rep`.
+
+## PERF-GDN-PACKED-BRIDGE: packed GDN decode reaches the fp8 tower — 0.977x -> 0.984x, INDICATIVE (2026-08-12, #365)
+
+Qwen3.6-27B NVFP4 `nvidia`@`0893e160` (ModelOpt `modelopt_mixed`), GB10 `sm_121a`,
+`RelWithDebInfo` + `TRITON=ON` + `CUTLASS` + arch `121a`. **Everything below is c1
+at `input_len=16`, out 256.** That is a DECODE-weighted harness and it is not the
+1024-in/128-out canonical grid six lines up in `docs/BENCHMARKS.md`; the two are
+not comparable and neither supersedes the other.
+
+**SELECTION — PROVEN.** Read from `test_qwen27n_fp8_tower_paged_engine`, the only
+harness that loads this checkpoint AND steps eagerly (CUDA-graph replay performs
+no host dispatch, so the counters read 0 in a graphed run whatever was selected):
+default `packed_launches`/`triton_launches` = 0/0; with
+`VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1` = **48/48**, the vendored
+FLA cubin on every GDN layer. Corroborated by the arm exactly as it landed on
+main — contract `packed_launches == 0` — passing without the lever and FAILING
+with it (`231 assertions | 1 failed`, exit 1).
+
+**e2e vs the PIN — 0.977x -> 0.984x, INDICATIVE, NOT BINDING.** Median TPOT, 3
+requests/leg: pin 81.39 ms, ours OFF 83.33, ours ON 82.72. Two methodology gaps,
+both recorded because the ratio is quotable and someone will quote it:
+
+1. **The arms ran under different background conditions.** The oracle driver
+   (`bridge-oracle.sh:51`) stops `local-ai-worker` before its legs; the script
+   that produced ALL SIX of our legs and BOTH nsys traces (`bridge-measure.sh`)
+   does not. Numerator and denominator therefore did not share a machine state.
+2. **The arms were not interleaved.** Ours ran 16:52-17:04 and the pin 17:14-17:18
+   under SEPARATE lock acquisitions. `oracle.log` pin-leg 3 reports Mean 83.57 /
+   P99 87.88 against an 81.39 median — a real interference event inside the pin
+   legs, not a tail artefact.
+
+Both defects push the same way: they inflate the pin's time, so the true ratio is
+**no better than** quoted and the number is conservative. It is still a
+single-shot cross-engine comparison and an interleaved re-run is OWED before it
+becomes binding.
+
+**Per-kernel A/B — quote the STRUCTURAL terms only.** nsys `-t cuda
+--cuda-graph-trace=node`, `cuda_gpu_kern_sum`, 63 decode steps, one run per arm:
+
+| term | delta ms/step | survives the control drift? |
+|---|---:|---|
+| `GdnDecodeFusedKernel` -> FLA `fused_recurrent_gated_delta_rule_packed_decode_kernel` | **-0.400** | YES — kernel identity CHANGES |
+| `GdnPostConvFastKernel` absorbed (3024 decode calls gone) | **-0.131** | YES — the kernel DISAPPEARS |
+| bf16 cascade (`CastBf16` 4096->1024, conv/`MulColVecF32` f32->bf16, `gemvx`) | -0.078 | NO — within drift |
+| merged fp8 qkvz GEMM `nvjet…qqsss` -> `…qqtst` (D f32->bf16) | +0.095 | NO — within drift |
+
+The control is `marlin::Marlin`: 8,128 instances in BOTH traces, touched by
+nothing in this row, and it moves **+0.58% = +0.262 ms/step** between them. That
+is half the size of the -0.5137 "net attributable" the row's own commit body
+quotes to four figures, so **-0.5137 must not be quoted**. Only the two
+structural terms — a kernel that changes identity and a kernel that disappears —
+are larger than the drift. The +-0.09 terms are inside it and are candidates, not
+findings. The e2e -0.61 ms/step is a separate instrument agreeing on direction.
+
+**Open gap: ~4.6% against vLLM's own launch of the SAME cubin.** Ours runs the
+FLA packed decode at **20.09 us/call**; the profile this row was scoped from
+records vLLM at **19.21 us/call** on the identical kernel — ~0.042 ms/step. Same
+binary artefact on both sides, so this is launch/argument-side, not a ceiling.
+Not re-measured here.
+
+**Also unmeasured, and named so nobody quotes them as measured:** any concurrency
+above c1; any input length above 16 — which matters because the
+`VT_GDN_FP8_IN_BF16` half of the composition earns **+0.017 ms/step (slightly
+NEGATIVE) in decode** and its actual justification is a 122.99 ms/req PREFILL
+pass at T~4096 that this harness never exercises; and the `qqsss`->`qqtst`
+reselection at large M.
+
+**Tokens.** `test_qwen27n_fp8_tower_paged_engine` 236 assertions SUCCESS, 16/16
+token-exact OFF and ON; SACRED `test_qwen27_paged_engine` (`unsloth@890bdef7`)
+235 assertions SUCCESS, 16/16 OFF and ON, confirming the lever is inert on a BF16
+tower. That gate admits a **x1.10** fp8 scale perturbation while the change it is
+asked to bound is bf16 rounding of the `in_proj` D at ~2^-9 ~ **0.2%**, so it is
+~50x coarser than the perturbation and establishes NO GROSS DEFECT, not
+numerical equivalence. No test anywhere compares `vt::GdnPackedDecode` against
+`vt::GdnDecode`; the only op-level bound is packed-vs-CPU-reference at 2% rtol
+(`tests/vt/test_ops_gdn.cpp`), i.e. a ~4% mutual bound. That comparison is OWED.
+
+Both toggles stay DEFAULT OFF; nothing here argues a flip.

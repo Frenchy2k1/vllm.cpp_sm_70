@@ -303,6 +303,15 @@ TEST_CASE("qwen27n fp8-tower paged-engine greedy acceptance gate (dgx-only)") {
   // F32, which the activation-dtype rule rejects), and the merged arm's
   // predicted `mixed_qkv` dtype through the single shared bridge helper.
   //
+  // WHAT THIS ARM CANNOT SEE, and where that IS covered. Because the expectation
+  // now reads the same flag parser production reads, a DEFAULT FLIP of either
+  // lever moves both sides together and this CHECK stays green. The default-OFF
+  // contract is therefore NOT held here. It is held in
+  // `tests/vllm/models/test_qwen27_paged_forward.cpp`, which pins
+  // `detail::GdnFp8MergedMixedQkvDType` directly: mutating that helper turns
+  // `test_qwen27_paged_forward` RED at 7 assertions. Do not add a duplicate
+  // default assertion here — add it there, next to the ones that already fail.
+  //
   // THIS IS ALSO THE ROW'S SELECTION PROOF, and it can only be read here: the
   // counters are HOST-DISPATCH counts, and CUDA graph REPLAY performs no host
   // dispatch, so a graphed throughput run reads 0 no matter what was selected.
