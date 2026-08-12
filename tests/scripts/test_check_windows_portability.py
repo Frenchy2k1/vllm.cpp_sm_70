@@ -677,6 +677,71 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                     result.returncode, 0, result.stdout + result.stderr
                 )
 
+    def test_console_drain_structural_view_blanks_safe_directives(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        safe_replacements = (
+            (
+                "if (GetTickCount64() - start >= 5000) return false;",
+                "#define false unsafe_false\n"
+                "#undef false\n"
+                "if (GetTickCount64() - start >= 5000) return false;",
+            ),
+            (
+                "if (GetTickCount64() - start >= 5000) return false;",
+                "#define \\\n"
+                "false unsafe_false\n"
+                "#undef false\n"
+                "if (GetTickCount64() - start >= 5000) return false;",
+            ),
+            (
+                "return true;",
+                "#define true unsafe_true\n"
+                "#undef true\n"
+                "return true;",
+            ),
+        )
+        for old, new in safe_replacements:
+            for occurrence in (0, 1):
+                with self.subTest(old=old, occurrence=occurrence):
+                    position = -1
+                    for _ in range(occurrence + 1):
+                        position = source.find(old, position + 1)
+                    self.assertGreaterEqual(position, 0)
+                    mutated = source[:position] + new + source[position + len(old):]
+                    result = self.run_checker(self.make_tree({
+                        "src/vllm/platform/console_shutdown.cpp": mutated,
+                    }))
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+
+    def test_console_drain_structural_view_keeps_macro_state_fail_closed(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        timeout = "if (GetTickCount64() - start >= 5000) return false;"
+        uncertain = (
+            "#if UNKNOWN_WINDOWS_BUILD_FLAG\n"
+            "#define false (SwitchToThread(), false)\n"
+            "#endif\n" + timeout
+        )
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            source.replace(timeout, uncertain, 1),
+            "trusted return-tail token",
+        )
+        spliced = (
+            "#define \\\n"
+            "false (SwitchToThread(), false)\n" + timeout
+        )
+        self.assert_rejected(
+            "src/vllm/platform/console_shutdown.cpp",
+            source.replace(timeout, spliced, 1),
+            "trusted return-tail token",
+        )
+
     def test_console_function_body_skips_constrained_template_prototypes(self) -> None:
         source = textwrap.dedent(
             SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
@@ -1016,6 +1081,91 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
                     mutated,
                     "exactly one filtered process invocation",
                 )
+
+    def test_unsupported_tier_helper_rejects_every_extra_executable_form(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        capture = "$probeOutput = @(& $TierTest @arguments 2>&1)"
+        before_forms = (
+            "$alias = $TierTest\n            & $alias",
+            "$env:TierAlias = $TierTest\n"
+            "            Invoke-Expression $env:TierAlias",
+            "$alias = Get-Variable TierTest -ValueOnly\n            . $alias",
+            "Start-Process -FilePath $TierTest -Wait",
+            "[System.Diagnostics.Process]::Start($TierTest)",
+        )
+        for executable in before_forms:
+            for placement in ("before", "after"):
+                with self.subTest(executable=executable, placement=placement):
+                    replacement = (
+                        executable + "\n            " + capture
+                        if placement == "before" else
+                        capture + "\n            " + executable
+                    )
+                    self.assert_rejected(
+                        "scripts/build-windows-release.ps1",
+                        script.replace(capture, replacement, 1),
+                        "exact unsupported-tier probe body",
+                    )
+
+    def test_unsupported_tier_amx_scope_rejects_indirect_execution(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        assignment = '$env:VT_CPU_MATMUL_TIER = "amx"'
+        probe = "Invoke-UnsupportedTierProbe -TierTest $tierTest"
+        indirect_forms = (
+            "$alias = $tierTest; & $alias",
+            "$env:TierAlias = $tierTest; Invoke-Expression $env:TierAlias",
+            "$alias = Get-Variable tierTest -ValueOnly; . $alias",
+            "Start-Process -FilePath $tierTest -Wait",
+            "[System.Diagnostics.Process]::Start($tierTest)",
+        )
+        for executable in indirect_forms:
+            for placement in ("before", "after"):
+                with self.subTest(executable=executable, placement=placement):
+                    mutation = (
+                        script.replace(
+                            assignment,
+                            assignment + "\n          " + executable,
+                            1,
+                        ) if placement == "before" else
+                        script.replace(
+                            probe,
+                            probe + "\n          " + executable,
+                            1,
+                        )
+                    )
+                    self.assert_rejected(
+                        "scripts/build-windows-release.ps1",
+                        mutation,
+                        "exact AMX refusal block",
+                    )
+
+    def test_unsupported_tier_structural_view_ignores_literal_and_comment_decoys(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        capture = "$probeOutput = @(& $TierTest @arguments 2>&1)"
+        decoy = "@(& $TierTest @arguments 2>&1)"
+        accepted = (
+            script.replace(
+                'throw "unexpected exit"',
+                f"throw 'diagnostic text {decoy} {UNSUPPORTED_TIER_FILTER} "
+                "unknown x86 ISA tier ''amx'''",
+                1,
+            ),
+            script.replace(
+                capture,
+                capture + f" # inline decoy {decoy}",
+                1,
+            ),
+            script.replace(
+                capture,
+                f"# full-line decoy {decoy}\n            " + capture,
+                1,
+            ),
+        )
+        for mutation in accepted:
+            result = self.run_checker(self.make_tree({
+                "scripts/build-windows-release.ps1": mutation,
+            }))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unsupported_tier_filter_is_one_exact_process_argument(self) -> None:
         script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
