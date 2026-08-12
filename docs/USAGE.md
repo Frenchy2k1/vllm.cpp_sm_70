@@ -382,6 +382,13 @@ cmake --build build --target vllm-server-archive
 build/release/stage/bin/vllm-server --help
 ```
 
+At the current numeric project version, `vllm-server-archive` emits exactly one
+deterministic developer tarball named
+`build/release/vllm.cpp-0.0.3-<configured-artifact-id>.tar.gz`. The target
+selects `tar.gz` explicitly; it does not infer the format from the filename.
+This is separate from the release workflow, whose `0.0.3-pre.1` asset names and
+per-tuple formats come from the release matrix, including `.zip` for Windows.
+
 On native Windows, run the release-bundle gate from a Visual Studio 2022 x64
 developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
 `bin/vllm-server.exe`, runs the focused Win32 tests, exercises the portable and

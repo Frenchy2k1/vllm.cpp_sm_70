@@ -7,7 +7,8 @@ evidence and the native Windows v0.0.3-pre.1 extension remain pending. W12 is
 optional/non-primary.
 
 Pins: vLLM parity source `555967922`; vllm.cpp spike baseline `f13c49ee`;
-request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
+request [#117](https://github.com/mudler/vllm.cpp/issues/117); hosted CI repair
+[#447](https://github.com/mudler/vllm.cpp/issues/447); claim
 `CLAIM-ENG-RELEASE-BINARIES-SPIKE` in draft PR
 [#129](https://github.com/mudler/vllm.cpp/pull/129); W5 implementation claim
 `CLAIM-ENG-RELEASE-BINARIES-W5` in draft PR
@@ -15,7 +16,9 @@ request [#117](https://github.com/mudler/vllm.cpp/issues/117); claim
 `CLAIM-ENG-RELEASE-BINARIES-W6` in draft PR
 [#196](https://github.com/mudler/vllm.cpp/pull/196). The Windows extension's
 per-commit documentation checkpoint repair is tracked by
-[#448](https://github.com/mudler/vllm.cpp/issues/448).
+[#448](https://github.com/mudler/vllm.cpp/issues/448); its archive-target
+checkpoint repair is tracked by
+[#450](https://github.com/mudler/vllm.cpp/issues/450).
 
 ## Delivery topology
 
@@ -611,6 +614,22 @@ generated indexes (26 assets) from
 `7020de93652ca920424a10ac5255b34810dd2f24` in run `31466516224`.
 Matching-hardware evidence and the Windows v0.0.3-pre.1 extension remain
 pending. W12 remains the optional non-primary diagnostic lane.
+
+## Outcome
+
+PR #446's hosted CPU gate exposed two release-version call sites still pinned
+to `0.0.2` after the project advanced to `0.0.3`, plus the
+`vllm-server-archive` CMake target omitting the packager's required explicit
+archive format. Issue #447 updates both executable expectations to `0.0.3` and
+passes `--archive-format tar.gz` at the existing deterministic archive target;
+the archive remains a tarball and no release workflow behavior changes.
+
+That first local #447 repair changed the public CMake archive target without an
+atomic `docs/USAGE.md` projection, so the per-commit documentation checkpoint
+correctly rejected it ([#450](https://github.com/mudler/vllm.cpp/issues/450)).
+The replacement preserves the version and explicit-format fix and documents
+the developer archive separately from prerelease workflow asset naming; no
+checker or workflow behavior is weakened.
 
 ## Now
 
