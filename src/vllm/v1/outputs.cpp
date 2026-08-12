@@ -21,13 +21,13 @@ LogprobsTensors LogprobsTensors::empty_cpu(int num_positions,
 }
 
 LogprobsTensors LogprobsTensors::slice_request(int req_idx,
-                                               int num_positions) const {
+                                               int request_num_positions) const {
   LogprobsTensors out;
-  out.num_positions = num_positions;
+  out.num_positions = request_num_positions;
   out.num_tokens_per_position = num_tokens_per_position;
   const size_t w = static_cast<size_t>(num_tokens_per_position);
   const size_t begin = static_cast<size_t>(req_idx);
-  const size_t end = begin + static_cast<size_t>(num_positions);
+  const size_t end = begin + static_cast<size_t>(request_num_positions);
   out.logprob_token_ids.assign(logprob_token_ids.begin() + static_cast<std::ptrdiff_t>(begin * w),
                                logprob_token_ids.begin() + static_cast<std::ptrdiff_t>(end * w));
   out.logprobs.assign(logprobs.begin() + static_cast<std::ptrdiff_t>(begin * w),
