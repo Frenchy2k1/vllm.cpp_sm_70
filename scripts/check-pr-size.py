@@ -399,6 +399,10 @@ def classify_path(path: str) -> str:
     if path in {
         "release/manifest-v1.schema.json",
         "release/release-matrix.json",
+        # The single immutable prerelease identity consumed by planning,
+        # workflows, and the post-publication audit (#117). Exact-path only:
+        # mutable or future release state must still fail closed until classified.
+        "release/release-version.json",
         "release/container-matrix.json",
         "scripts/env-doc-allowlist.txt",
     }:

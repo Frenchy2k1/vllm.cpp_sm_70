@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 
 
 def job_block(text: str, name: str) -> str:
@@ -77,6 +78,44 @@ def workflow_steps(block: str) -> list[str]:
     starts = [match.start() for match in re.finditer(r"(?m)^      - ", block)]
     starts.append(len(block))
     return [block[start:end] for start, end in zip(starts, starts[1:])]
+
+
+def validate_pr_ci(text: str) -> list[str]:
+    """Require native Windows proof on PRs without release authority."""
+
+    errors: list[str] = []
+    contracts = (
+        ("windows-msvc-cpu", "cpu", "build-pr-windows-cpu"),
+        ("windows-msvc-vulkan", "vulkan", "build-pr-windows-vulkan"),
+    )
+    for job, backend, build_dir in contracts:
+        block = job_block(text, job)
+        if not block:
+            errors.append(f"PR CI is missing required {job} job")
+            continue
+        required = (
+            "    if: github.event_name == 'pull_request'\n",
+            "    permissions:\n      contents: read\n",
+            "    runs-on: windows-2022\n",
+            "        run: ./scripts/build-windows-release.ps1 -ContractTest\n",
+            f"          ./scripts/build-windows-release.ps1 `\n"
+            f"            -Backend {backend} `\n"
+            f"            -ArtifactId windows-x86_64-msvc-{backend} `\n"
+            f"            -BuildDir $env:GITHUB_WORKSPACE/{build_dir}\n",
+        )
+        for fragment in required:
+            if fragment not in block:
+                errors.append(f"{job} is missing required PR contract: {fragment!r}")
+        for forbidden in (
+            "actions/upload-artifact",
+            "actions/attest",
+            "gh release",
+            "id-token: write",
+            "contents: write",
+        ):
+            if forbidden in block:
+                errors.append(f"{job} must not contain release authority: {forbidden}")
+    return errors
 
 
 def named_step(block: str, name: str) -> str | None:
@@ -627,6 +666,7 @@ def validate(text: str) -> list[str]:
 
 def main() -> int:
     errors = validate(WORKFLOW.read_text(encoding="utf-8"))
+    errors.extend(validate_pr_ci(CI_WORKFLOW.read_text(encoding="utf-8")))
     if errors:
         print("release workflow policy FAILED:", file=sys.stderr)
         for error in errors:

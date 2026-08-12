@@ -55,6 +55,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#374](https://github.com/mudler/vllm.cpp/issues/374) | `ENG-NOW-DERIVED` | NOW.md is still a surface every PR must write: the doc-checkpoint gate marches them into it | bug |
 | [#364](https://github.com/mudler/vllm.cpp/issues/364) | `ENG-RECORD-CONFLICT-SURFACES` | Shared record surfaces are a lock: 16/29 open PRs conflict, 13 of them in bookkeeping only | bug |
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-WINDOWS` | Binary release, including requested native Windows CPU/AVX2 and Vulkan bundles | feature |
+| [#448](https://github.com/mudler/vllm.cpp/issues/448) | `ENG-RELEASE-WINDOWS` | PR #446 device-leakage repair violates the per-commit documentation checkpoint | bug |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |

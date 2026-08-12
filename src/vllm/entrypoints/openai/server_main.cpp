@@ -143,6 +143,7 @@ void SetEnvironment(const char* name, const char* value) {
 #endif
 }
 
+// DSR-ALLOW(ENG-RELEASE-WINDOWS): the profiler process-ID adapter is POSIX-only; #117 keeps native Windows on its CRT process boundary, not a device-dispatch fork.
 #if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
 uint64_t CurrentProcessId() {
   return static_cast<uint64_t>(::getpid());

@@ -96,6 +96,7 @@ class PathClassification(unittest.TestCase):
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
             "release/release-matrix.json": "configuration",
+            "release/release-version.json": "configuration",
             "release/container-matrix.json": "configuration",
             "scripts/env-doc-allowlist.txt": "configuration",
             # The container lane images. `docker/Dockerfile.arm64` already
@@ -111,6 +112,25 @@ class PathClassification(unittest.TestCase):
         for path, path_class in expected.items():
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), path_class)
+
+    def test_release_version_classification_is_exact_and_fail_closed(self) -> None:
+        """Only the authoritative immutable declaration earns this class.
+
+        A directory-level ``release/`` rule would silently classify future
+        mutable release state. Near-miss names therefore remain unknown.
+        """
+        self.assertEqual(
+            checker.classify_path("release/release-version.json"),
+            "configuration",
+        )
+        for path in (
+            "release/version.json",
+            "release/release-version.local.json",
+            "release/channel.json",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
 
     def test_generated_class_does_not_swallow_its_own_sources(self) -> None:
         # The generator and the GLSL it compiles are the REVIEWABLE surface and

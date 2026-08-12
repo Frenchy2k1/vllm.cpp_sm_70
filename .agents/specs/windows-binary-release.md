@@ -10,6 +10,9 @@ Identity: `ENG-RELEASE-WINDOWS`
 
 Issue: [#117](https://github.com/mudler/vllm.cpp/issues/117)
 
+Documentation-checkpoint repair:
+[#448](https://github.com/mudler/vllm.cpp/issues/448)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -381,6 +384,12 @@ extracted Windows runtime/ISA execution, merged-SHA ten-tuple dry run,
 `v0.0.3-pre.1` publication, attestations, and the exact 32-asset API audit are
 not inferred from Linux and remain required hosted gates. Windows stays
 `preview`; no stable `v0.0.3` release is authorized by this row.
+
+PR #446's first local CI repair added the required device-seam annotation to
+the server entrypoint without updating `docs/USAGE.md` in the same commit, so
+the per-commit documentation checkpoint correctly rejected it ([#448](https://github.com/mudler/vllm.cpp/issues/448)).
+The replacement commit keeps the annotation and native Windows PR gates intact
+and adds the narrow usage projection atomically; neither checker is weakened.
 
 ## Now
 
