@@ -84,7 +84,21 @@ resolves or the page no longer merges cleanly enough to isolate this projection.
 
 ## Outcome
 
-Pending implementation and immutable verification.
+The pinned two-row projection failed the focused contract with
+`expected one keyed Binary release row, found 2`; applying that projection to
+`bbc482a2` reproduced the 45,100-character merge result. The implementation
+replaces only those two rows with one keyed release row. The branch page is
+44,579 characters and the projected main merge is 44,820, leaving 180
+characters below the unchanged 45,000-character cap.
+
+The focused contract independently requires all 13 release fact anchors from
+Scope, rejects deletion of each one, rejects restoration of a second release
+row, and validates the projected merged page with the production public-doc
+checker. The two existing release-state checkers initially rejected their
+old exact wording, providing a second RED boundary. Their mutation inventories
+and expected anchors now require the compact row and pending facts; neither
+budget nor lifecycle assertion was relaxed. Full immutable verification is
+recorded on the implementation commit.
 
 ## Now
 
