@@ -13,6 +13,9 @@ Issue: [#117](https://github.com/mudler/vllm.cpp/issues/117)
 Documentation-checkpoint repair:
 [#448](https://github.com/mudler/vllm.cpp/issues/448)
 
+Archive-target documentation-checkpoint repair:
+[#450](https://github.com/mudler/vllm.cpp/issues/450)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -390,6 +393,12 @@ the server entrypoint without updating `docs/USAGE.md` in the same commit, so
 the per-commit documentation checkpoint correctly rejected it ([#448](https://github.com/mudler/vllm.cpp/issues/448)).
 The replacement commit keeps the annotation and native Windows PR gates intact
 and adds the narrow usage projection atomically; neither checker is weakened.
+
+The first local #447 repair also changed the public `vllm-server-archive`
+target without its usage projection, which the same per-commit checkpoint
+correctly rejected ([#450](https://github.com/mudler/vllm.cpp/issues/450)). The
+replacement documents the numeric project-version tarball without conflating
+it with the prerelease workflow's matrix-selected archive names and formats.
 
 ## Now
 
