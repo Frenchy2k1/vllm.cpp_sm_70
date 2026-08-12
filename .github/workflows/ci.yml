@@ -155,6 +155,17 @@ jobs:
         run: |
           python3 scripts/check-test-registration.py
           python3 tests/scripts/test_check_test_registration.py
+      - name: No gate resolves its checkpoint by readdir order (#471)
+        # Registered HERE and not only in `scripts/agent-preflight.sh`: a checker
+        # reachable through a hook gates whoever chooses to run the hook, and
+        # AGENTS.md is explicit that hooks are bypassable convenience, never
+        # proof. The `--self-test` leg sweeps the checker's own fixture corpus in
+        # both directions, so a narrowed pattern fails here rather than passing
+        # quietly on a tree it no longer inspects.
+        run: |
+          python3 scripts/check-snapshot-pins.py
+          python3 scripts/check-snapshot-pins.py --self-test
+          python3 tests/scripts/test_check_snapshot_pins.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py
