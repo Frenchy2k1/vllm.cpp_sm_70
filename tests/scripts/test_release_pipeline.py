@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -119,6 +120,16 @@ class ReleasePipelineContract(unittest.TestCase):
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn("project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)", cmake)
 
+    def test_default_build_version_is_project_version(self) -> None:
+        cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        declaration = re.search(
+            r'^set\(VLLM_CPP_BUILD_VERSION\s+"([^"]*)"\s+CACHE\s+STRING\b',
+            cmake,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(declaration, "missing build-version cache declaration")
+        self.assertEqual(declaration.group(1), "${PROJECT_VERSION}")
+
     def test_release_version_declaration_rejects_every_identity_mismatch(self) -> None:
         original = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
         mutations = {
@@ -134,6 +145,39 @@ class ReleasePipelineContract(unittest.TestCase):
                 mutant[field] = value
                 with self.assertRaises(ValueError):
                     self.pipeline.validate_release_version(mutant)
+
+    def test_every_release_builder_forwards_exact_build_version_to_cmake(self) -> None:
+        shell_argument = '-DVLLM_CPP_BUILD_VERSION="$VERSION"'
+        for driver in BUILD_DRIVERS:
+            with self.subTest(driver=driver.name):
+                text = driver.read_text(encoding="utf-8")
+                self.assertEqual(text.count(shell_argument), 1)
+                for replacement in (
+                    "",
+                    '-DVLLM_CPP_BUILD_VERSION="0.0.3-pre.1"',
+                    '-DVLLM_CPP_BUILD_VERSION="$PROJECT_VERSION"',
+                ):
+                    self.assertNotEqual(
+                        text.replace(shell_argument, replacement, 1).count(
+                            shell_argument
+                        ),
+                        1,
+                    )
+
+        powershell_argument = '"-DVLLM_CPP_BUILD_VERSION=$env:VERSION"'
+        text = WINDOWS_BUILD_DRIVER.read_text(encoding="utf-8")
+        self.assertEqual(text.count(powershell_argument), 1)
+        for replacement in (
+            "",
+            '"-DVLLM_CPP_BUILD_VERSION=0.0.3-pre.1"',
+            '"-DVLLM_CPP_BUILD_VERSION=$env:PROJECT_VERSION"',
+        ):
+            self.assertNotEqual(
+                text.replace(powershell_argument, replacement, 1).count(
+                    powershell_argument
+                ),
+                1,
+            )
 
     def test_workflow_has_two_exact_native_windows_preview_lanes(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

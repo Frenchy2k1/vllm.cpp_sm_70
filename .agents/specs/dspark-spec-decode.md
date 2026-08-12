@@ -1379,6 +1379,92 @@ Recording this BEFORE acting, because every cheap explanation has now been
 eliminated and the expensive one (rewrite the expert path) would be exactly the
 wrong response to a routing difference.
 
+## 6x. ROUTING REFUTED: our kernel is 12.8% slower PER UNIT OF WORK (2026-08-12)
+
+§6w proposed that the 8.2% Marlin gap might not be a defect at all -- that our
+divergent token stream routes to different experts, so the two engines execute
+different amounts of expert work at the same launch count. Measured on both
+sides (`VT_MOE_PAD_STATS=1` here; `moe_align_block_size` wrapped upstream), same
+prompt, same k:
+
+| | avg padded tokens / call | avg blocks / call | block size |
+|---|---|---|---|
+| ours | 311.2 | **38.9** | 8 |
+| upstream | 324.8 | **40.6** | 8 |
+
+**Upstream loops 4.4% MORE blocks per launch than we do, and is still 8.2%
+faster.** The hypothesis is refuted, and it was protective: normalising time by
+the work actually performed makes our deficit BIGGER, not smaller.
+
+| | time | launches | blocks/launch | **per block** |
+|---|---|---|---|---|
+| ours | 249.2 ms | 1520 | 38.9 | **4.21 us** |
+| upstream | 230.4 ms | 1520 | 40.6 | **3.73 us** |
+
+**Our Marlin MoE is ~12.8% slower per unit of work.** Both also choose block_size 8,
+which independently confirms §6v's conclusion that upstream's `>= 16` clamp does
+not bite on this shape.
+
+So the gap is a REAL in-kernel execution difference, now quantified per block and
+with every input-side explanation eliminated (§6v, §6w): same kernel, same
+instantiation, same grid rule, same scale layout, same alignment, same residency,
+and now MORE work on their side. What remains is how the kernel executes given
+identical inputs -- occupancy, shared-memory budget, or the `max_shared_mem`
+value each side passes, which is the one launch input not yet compared.
+
+**Two diagnostic traps recorded**, both hit while measuring this:
+
+1. Our probe read a device value inside the verify, which W8 now CAPTURES:
+   `cudaStreamSynchronize: operation not permitted when stream is capturing`.
+   Our own capture work made the instrument illegal in that region; the count is
+   capture-independent, so it runs with `VT_SPEC_DECODE_GRAPH=0`.
+2. Upstream's wrapper sat inside a `torch.compile` region and broke compilation;
+   the count is compile-independent, so it runs under `enforce_eager=True`.
+
+Neither changes what is counted, and saying so is the point: a work COUNT may be
+taken under different execution modes, a TIME may not.
+
+## 6y. EVERY SOURCE-LEVEL EXPLANATION IS EXHAUSTED (2026-08-12)
+
+§6x quantified the residual at 12.8% per unit of work inside `marlin_moe_wna16`.
+This is the complete elimination list, so the next person does not redo it:
+
+| checked | ours | upstream | verdict |
+|---|---|---|---|
+| kernel source | vendored `marlin_mm_moe.cu` | `csrc/.../ops.cu` | **dispatcher VERBATIM**; our only additions are includes and a default-OFF E=1 clamp that cannot fire for MoE |
+| template instantiation | `<...128, 1, 8, 4, true, 4, 1, false>` | identical | same tiling, same a/b/c/s scalar types |
+| `determine_exec_config` | 69 lines | identical | byte-identical, both callers take the auto path |
+| `moe_block_size` | 8 | 8 | measured on both; upstream's `>= 16` clamp does not fire |
+| `max_shared_mem` | `cudaDeviceGetAttribute` + `/blocks_per_sm - 1024` | identical | same |
+| `use_atomic_add` / `use_fp32_reduce` / `is_k_full` | false / true / true | false / true / true | same |
+| scale bytes per expert | 131072 / 65536 | 131072 / 65536 | same |
+| pointer alignment | pool over `cudaMalloc` | `ptr%256 == 0` | same |
+| residency | `cudaMalloc` (device) | torch CUDA tensor | same |
+| WORK per launch | 38.9 blocks | 40.6 blocks | upstream does **MORE** |
+| CUDA toolkit | 13.0 (V13.0.88) | torch 2.13.0+cu130 | same |
+| arch / flags | `121a`, `-O3 -DNDEBUG` | sm_121 kernels in trace | same |
+
+Identical code, identical parameters, identical toolchain, identical arch, and
+LESS work on our side -- still 4.21 us/block against 3.73.
+
+**So the answer is not in the source, and further source reading is waste.** What
+remains is how the two binaries actually execute: achieved occupancy, register
+count, L2 hit rate, memory throughput and stall reasons. That is an `ncu`
+question, and it is the next step:
+
+    sudo ncu --set full --kernel-name-base mangled \
+             --kernel-name regex:marlin_moe_wna16 --launch-count 20 <cmd>
+
+on BOTH engines (passwordless `sudo ncu` is available on this box), comparing
+`sm__throughput`, `achieved_occupancy`, `launch__registers_per_thread` and the
+top stall reason. Equal occupancy with different memory throughput points at
+data placement; different occupancy points at register pressure, i.e. a codegen
+difference between two builds of the same source.
+
+**Do not start by editing the kernel.** Everything editable has been shown
+identical; the difference is in the compiled artifact or its runtime conditions,
+and only a profiler at that level can say which.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
