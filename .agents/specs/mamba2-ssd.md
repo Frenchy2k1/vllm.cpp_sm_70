@@ -327,6 +327,76 @@ Two findings a reviewer should carry forward:
   upstream verbatim and is a real guard outside that input contract. Recorded
   here rather than "fixed" with an out-of-contract test.
 
+### 8.2 W1 repair (fresh review returned FAIL; `row/KERNEL-SSM-MAMBA-SSD-W1-FIX`)
+
+A fresh scoped review of `9003dfad` returned **FAIL** with nine findings. The
+port itself was confirmed faithful — independent reference, contract points, the
+TP refusal, no `doctest::Approx`, f32 output arms all VERIFIED — and none of
+those were re-done. What the repair changed, in the order the findings were
+raised:
+
+- **F1 (HIGH, memory-unsafe).** `RmsNormGatedGroupKernel` read the gated-norm
+  `weight` through `Tensor::Ptr<float>()`, an unchecked `static_cast`, while the
+  validator accepts f16/bf16. Upstream's `Mixer2RMSNormGated.weight` is
+  `nn.Parameter(torch.ones(...))` (mamba_mixer2.py:91) at the MODEL dtype, i.e.
+  bf16 for these checkpoints — so this was the normal call, not an exotic one:
+  a 2x heap over-read plus garbage output (an all-ones bf16 weight, a
+  mathematical no-op, shifted the output by `max|Δ| = 1.02523`). Fixed by
+  reading it with `LoadF32`, as the sibling `RmsNormGatedKernel` already does.
+  Requiring f32 was rejected: it would refuse the dtype vLLM actually passes.
+- **F2 / F3, the two unpinned dtype claims.** A mutation that COMPOUNDED the
+  running state into its own `state_dtype` store left all three suites green,
+  and so did one that re-read the decode readout from the rounded cache. Both
+  now carry an EXACT, tolerance-free pin, because a tolerance wide enough for
+  the dtype is wide enough for the defect: the f32 recurrence does not depend on
+  `state_dtype`, so `final_states(bf16)` must be bit-for-bit `bf16(final_states(f32))`;
+  and `out` does not depend on the CACHE dtype at all, so the bf16-cache and
+  f32-cache decode runs must be bit-identical. Each test also asserts that the
+  rounding it relies on is live, so neither can degenerate into comparing two
+  identical computations.
+- **F4, the "equivalent mutant" that was not equivalent.** The argument that the
+  `min(·, 0)` clamp can never fire is airtight given `A = -exp(A_log) < 0` and
+  `dt >= 0` — but the op enforced NEITHER. Fed `A = +1.0` it returned a silently
+  truncated recurrence. Both preconditions are now REFUSED: `A >= 0` in the
+  kernels (`CheckMamba2ANegative`, where the data lives), `dt_min < 0` and an
+  inverted `dt_limit` in the validator. §8.1's "one equivalent mutant,
+  deliberately kept" is superseded by this: the clamp is equivalent *inside the
+  enforced contract*, and both clamp sites now say so.
+- **F5.** The `x.to(input_dtype)` cast at mamba_mixer2.py:149 was unpinned, and
+  the test's OWN reference omitted it — it could not have seen the defect. The
+  reference now takes an `input_dt`, and a bf16-activation / f32-out case pins
+  that every output is bf16-representable. `1/(sqrt(var)+eps)` was also
+  unpinned: added a near-zero-variance group, which is the input `eps` exists
+  for.
+- **F6.** The chunk-size invariance sweep ran `T = 128` over
+  `{8,16,32,64,128}`, so at `chunk_size = 128` — Nemotron-3.5's shipped value —
+  `nchunks == 1` and the arm exercised no state passing at all. `T` is now 300
+  and the test ASSERTS `nchunks > 1` rather than trusting the shape.
+- **F7.** `last_chunk_indices[b] == -1` (an empty sequence) was permitted and
+  deviated silently; upstream's `states[last_chunk_indices]`
+  (ssd_combined.py:154) negative-indexes another sequence's chunk there. That is
+  an indexing quirk vLLM never exercises, so the op refuses.
+- **F8.** Duplicate `state_indices` were a documented-but-unchecked precondition
+  over a PARALLEL row dispatch. Now enforced; repeated NULL rows still allowed.
+- **F9, the two over-wide buffers.** The gated-norm sum of squares was reduced in
+  `double`; upstream and the sibling kernel reduce in f32, so it was NARROWED
+  rather than excused. The `passed` working buffer stays f32 with an explicit
+  reason (it holds only `state_dtype`-rounded values, so the width is not
+  observable) plus a note that **W2 must not inherit either host-reference
+  width**.
+
+Every one of those mutations was re-applied after the repair and is now caught;
+the store-side rounding pin from §8.1 was re-checked at the same time and still
+reds. F10 (`.agents/kernel-matrix.md:157` still reading "implementation not
+started") is an operator-owned record line and was left alone.
+
+One repo-wide test trap found while capturing the RED output, and worth carrying
+to any doctest suite: **doctest 2.5.2 `INFO` prints a `const char*` VARIABLE as
+`1`** — it binds the bool overload; only a string *literal* prints as text. Every
+`ExpectClose` in these three suites had a `const char*` label, so a failure
+reported `1: worst element ...` instead of naming the tensor. The labels are
+`std::string` now.
+
 Named residuals unchanged from §2: the CUDA arm (W2), `n_groups` TP sharding,
 spec-decode temporal state, ReplaySSM and Mamba v1. One more, from the port
 itself: the Triton dots downcast their tile inputs (`ssd_chunk_state.py:283-285`,

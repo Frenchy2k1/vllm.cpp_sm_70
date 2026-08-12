@@ -83,7 +83,11 @@ Tensor MakeT(void* data, DType dt, const std::vector<int64_t>& shape) {
   return t;
 }
 
-void ExpectClose(const char* what, const std::vector<float>& got,
+// NOTE — doctest 2.5.2 `INFO` prints a `const char*` VARIABLE as `1` (it binds
+// the bool overload; only a string LITERAL prints as text), so every label here
+// is a `std::string`. A `const char*` label silently turns a failure message
+// into "1: worst element ...".
+void ExpectClose(const std::string& what, const std::vector<float>& got,
                  const std::vector<double>& want, double atol, double rtol) {
   REQUIRE(got.size() == want.size());
   REQUIRE(!got.empty());
@@ -107,7 +111,7 @@ void ExpectClose(const char* what, const std::vector<float>& got,
   CHECK(worst_slack <= 0.0);
 }
 
-void ExpectCloseF(const char* what, const std::vector<float>& got,
+void ExpectCloseF(const std::string& what, const std::vector<float>& got,
                   const std::vector<float>& want, double atol, double rtol) {
   const std::vector<double> w(want.begin(), want.end());
   ExpectClose(what, got, w, atol, rtol);
@@ -548,6 +552,74 @@ TEST_CASE("mamba2 state update keeps the cache dtype independent of the activati
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// (4b) THE READOUT USES THE F32 STATE, NOT THE VALUE RE-READ FROM THE CACHE.
+// The Triton kernel holds `state` in registers and computes `out = sum(state*C)`
+// from those registers, storing the cache-width copy separately
+// (mamba_ssm.py:433,451); upstream's own CPU kernel does the same with `s_new`
+// (csrc/cpu/mamba_kernels.hpp:225-228).
+//
+// Test (4) above cannot see this: its only bf16-cache arm compares at
+// atol/rtol 5e-2, and one bf16 rounding of the state disappears inside that
+// budget ([[token-gates-cannot-see-dequant-fallbacks]] — a tolerance wide enough
+// for the dtype is wide enough for the defect). The exact statement instead:
+//
+//   `out` does not depend on the CACHE dtype at all, so starting from a
+//   bf16-representable state, the bf16-cache run and the f32-cache run must
+//   produce BIT-IDENTICAL outputs.
+//
+// A kernel that read `y` back out of the cache would round once per (p, n) and
+// break it. The stored states, of course, DO differ — that is checked too, so a
+// no-op comparison cannot masquerade as a pass.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("mamba2 state update reads out the f32 state, not the rounded cache") {
+  const int64_t Nb = 2, H = 4, P = 8, G = 2, N = 16;
+  const StepInputs in = GenerateStep(Nb, H, P, G, N, 0xDEC0DEu);
+  std::mt19937 rng(0x99u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> state0(static_cast<size_t>(Nb * H * P * N));
+  // bf16-representable, so the two runs START from the same numbers and the only
+  // difference between them is where the op's OWN store rounds.
+  for (auto& v : state0) v = vt::BF16ToF32(vt::F32ToBF16(nd(rng)));
+
+  for (bool has_z : {false, true}) {
+    StepCfg f32cfg;
+    f32cfg.use_z = has_z;
+    StepCfg bf16cfg = f32cfg;
+    bf16cfg.state_dtype = DType::kBF16;
+
+    std::vector<uint8_t> raw_f32 = Pack(state0, DType::kF32);
+    const std::vector<float> out_f32 =
+        RunStateUpdate(raw_f32, Nb, in, nullptr, Nb, H, P, G, N, f32cfg);
+    std::vector<uint8_t> raw_bf16 = Pack(state0, DType::kBF16);
+    const std::vector<float> out_bf16 =
+        RunStateUpdate(raw_bf16, Nb, in, nullptr, Nb, H, P, G, N, bf16cfg);
+
+    REQUIRE(out_f32.size() == out_bf16.size());
+    size_t differing = 0;
+    double worst = 0.0;
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+      if (out_f32[i] != out_bf16[i]) {
+        ++differing;
+        worst = std::max(worst, std::abs(static_cast<double>(out_f32[i]) - out_bf16[i]));
+      }
+    }
+    INFO("has_z=" << has_z << ": " << differing << " of " << out_f32.size()
+                  << " outputs move with the CACHE dtype, max|diff| = " << worst);
+    CHECK(differing == 0);
+
+    // The cache rounding really is live — otherwise the check above compares two
+    // identical computations and proves nothing.
+    const std::vector<float> after_f32 = Unpack(raw_f32, state0.size(), DType::kF32);
+    const std::vector<float> after_bf16 = Unpack(raw_bf16, state0.size(), DType::kBF16);
+    size_t rounded = 0;
+    for (size_t i = 0; i < after_f32.size(); ++i)
+      if (after_f32[i] != after_bf16[i]) ++rounded;
+    INFO("stored states that the bf16 cache rounded: " << rounded);
+    REQUIRE(rounded > 0);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // (5) REFUSALS.
 // ─────────────────────────────────────────────────────────────────────────────
 TEST_CASE("mamba2 state update refuses the arms it does not implement") {
@@ -575,5 +647,38 @@ TEST_CASE("mamba2 state update refuses the arms it does not implement") {
     StepCfg cfg;
     std::vector<uint8_t> raw(static_cast<size_t>((Nb + 1) * H * P * N) * 4, 0);
     CHECK_THROWS(RunStateUpdate(raw, Nb + 1, in, nullptr, Nb, H, P, G, N, cfg));
+  }
+
+  // Each row owns ONE cache slot: the kernel is a parallel-for over rows
+  // (`ForRows`, src/vt/cpu/cpu_ops.cpp), so two rows pointing at the same slot
+  // race on the same read-modify-write and the result depends on the thread
+  // schedule. Upstream's CPU kernel is sequential and stays deterministic under
+  // duplicates, so this is a LOCAL precondition — which means it has to be
+  // enforced, not just documented.
+  SUBCASE("duplicate state_indices are refused, not raced") {
+    StepCfg cfg;
+    const int64_t S = 8;
+    std::vector<uint8_t> raw(static_cast<size_t>(S * H * P * N) * 4, 0);
+    const std::vector<int32_t> dup{3, 3};
+    bool threw = false;
+    std::string msg;
+    try {
+      RunStateUpdate(raw, S, in, &dup, Nb, H, P, G, N, cfg);
+    } catch (const std::exception& e) {
+      threw = true;
+      msg = e.what();
+    }
+    INFO(msg);
+    CHECK(threw);
+    CHECK(msg.find("state_indices") != std::string::npos);
+
+    // Distinct slots are fine, and repeated NULL rows (index < 0) are NOT
+    // duplicates — they touch no slot at all.
+    const std::vector<int32_t> ok{3, 5};
+    std::vector<uint8_t> raw_ok(static_cast<size_t>(S * H * P * N) * 4, 0);
+    CHECK_NOTHROW(RunStateUpdate(raw_ok, S, in, &ok, Nb, H, P, G, N, cfg));
+    const std::vector<int32_t> nulls{-1, -1};
+    std::vector<uint8_t> raw_null(static_cast<size_t>(S * H * P * N) * 4, 0);
+    CHECK_NOTHROW(RunStateUpdate(raw_null, S, in, &nulls, Nb, H, P, G, N, cfg));
   }
 }
