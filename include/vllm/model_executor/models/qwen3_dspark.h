@@ -70,6 +70,19 @@ struct Qwen3DSparkWeights {
   // identity, qwen3_dspark.py:118-127,137-141).
   std::vector<int32_t> draft_id_to_target_id;
 
+  // W8 follow-up: markov_w1 rows GATHERED into DRAFT-vocab order, i.e.
+  // markov_w1_draft[j] == markov_w1[j + d2t[j]]. Built once at load when a d2t
+  // table exists; EMPTY when the draft is full-vocab (then markov_w1 already is
+  // draft-indexed and is used directly).
+  //
+  // Why: the sequential loop needs the NEXT step's Markov embedding of the token
+  // it just sampled. The argmax produces a DRAFT id on device, but markov_w1 is
+  // indexed by TARGET vocab, so mapping it forced a device->host round trip EVERY
+  // step (k syncs per draft step). Indexing this table with the raw argmax lets
+  // `prev` stay on device for the whole chain; the draft->target mapping then
+  // happens ONCE, on the [num_reqs, k] ids at the end.
+  OwnedTensor markov_w1_draft;
+
   int64_t markov_rank = 0;
   int64_t vocab_size = 0;        // TARGET vocab == markov_w1 rows
   int64_t draft_vocab_size = 0;  // == backbone.draft_vocab_size == markov_w2 rows

@@ -295,7 +295,14 @@ class Qwen3_5DecodeGraph {
                      const v1::CommonAttentionMetadata& attn_meta,
                      const v1::GDNAttentionMetadata& gdn_meta,
                      const std::vector<PagedKvCache>& attn_kv,
-                     const std::vector<GdnStateCache>& gdn_state);
+                     const std::vector<GdnStateCache>& gdn_state,
+                     // SPEC-DSPARK W8 (#442): non-null captures the DFlash/DSpark
+                     // aux hidden taps into this slot's PERSISTENT [S, H*taps]
+                     // buffer and points `aux_out->tensor` at it. The view is
+                     // valid until this slot's next replay, the same contract the
+                     // returned logits already carry. Null keeps the pure-decode
+                     // behavior byte-identical.
+                     Qwen3_5AuxTaps* aux_out = nullptr);
 
   // Diagnostics (A/B + tests): is a graph currently captured, and how many
   // replays have run since the last (re)capture.

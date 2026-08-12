@@ -916,6 +916,114 @@ This repo has already shipped a use-after-free from exactly that, and a
 sanitizer-clean run is not proof of capture safety -- pair it with an explicit
 replay-vs-eager bit-compare.
 
+## 6n. W8 LANDED: the verify is captured, and the 35B lane reaches ~parity (2026-08-12)
+
+§6l put the MoE lane at 0.870x / 0.981x and localised the deficit to the eager
+T=1+k verify. §6m named vLLM's dispatch predicate as the missing mirror. This is
+the implementation and its measurement.
+
+**Paired against the pinned graphed oracle, one lock session, matched token
+counts, ours = median of 3 warm reps:**
+
+| 35B cell | before W8 | with capture | pinned vLLM | ratio |
+|---|---|---|---|---|
+| "capital", 128 tok both | 72.23 | **78.37** | 78.76 | **0.995x** (was 0.981x) |
+| "fibonacci", 89 tok both | 134.55 | **140.82** | 142.88 | **0.986x** (was 0.870x) |
+
+Capture is worth **+8.5%** and **+4.7%** on the SAME binary
+(`VT_SPEC_DECODE_GRAPH=0` is the eager arm), and it closes the high-acceptance
+cell from 0.870x to 0.986x, which is where the ~4.8 ms/step lived. Not >= 1.0x:
+the residual is ~1.4% and our reps spread 0.3%, so it is real, not noise.
+
+**Correctness.** Text byte-identical capture-vs-eager on both lanes, and the
+project's four e2e spec-decode suites pass with capture ON and OFF with identical
+assertion counts: `test_qwen27_spec_decode` 9, `test_qwen27_dflash_spec_decode`
+27, `test_qwen36_spec_decode` 9, `test_qwen27_spec_decode_concurrent` 5. Default
+ON re-verified with the env unset.
+
+**What it took, because four of the five attempts were wrong and each failure
+taught the next.**
+
+| attempt | result | cause |
+|---|---|---|
+| predicate only | INERT, no graph built | `ForwardDeviceMultiTap` returns BEFORE the gate |
+| + aux capture | both arms crashed | padding rewrote spec metadata; Step's fallback dropped aux |
+| + those fixes | captured, but GARBAGE + 5x SLOWER | stale `num_accepted` |
+| + spec staging | `cudaMemcpyAsync: invalid argument` | per-request arrays sized by TOKEN count |
+| + token/request split | correct AND faster | — |
+
+Three of these deserve to be remembered:
+
+1. **The aux tap is why the verify never captured.** DFlash/DSpark must emit the
+   `[T, H*taps]` hidden capture the drafter conditions on, and that path returned
+   before the decode-graph gate. No predicate change could have reached it. Each
+   `SizeSlot` now owns a persistent aux buffer, like its logits.
+2. **Stale `num_accepted` is silent and catastrophic.** `StageStepInputs` refilled
+   only the pure-decode fields, so a replay re-read the PREVIOUS step's
+   acceptance — the value `GdnSpecDecode` uses to pick the initial state (column
+   `num_accepted-1`) and advance the conv window. Wrong state produced incoherent
+   tokens AND 5x slower (26 vs 136 tok/s), because zero acceptance multiplies the
+   step count. `StageSpecStepInputs` refills them per step, outside the region.
+3. **We had collapsed TOKENS and REQUESTS into one count.** The staging sized
+   `block_table` as `S*cols`, `seq_lens` as `S`, `qsl` as `S+1` — correct only
+   because pure decode has `S == num_reqs`. Under speculation `S = num_reqs*(1+k)`,
+   so it overran host and device buffers. Upstream carries BOTH in its graph key
+   (`BatchDescriptor(num_tokens, num_reqs, uniform)`) for exactly this reason.
+   This is the deepest form the "mirror vLLM" rule took here: the divergence was
+   not a kernel or a heuristic, it was a data model.
+
+A false pass to remember too: an early run reported text `IDENTICAL` while
+comparing two EMPTY outputs, because both arms had failed identically. The exit
+codes caught it; the diff did not.
+
+**Owed next:** the residual ~1.4%, the 27B dense lane re-measure (its cells were
+never like-for-like), and the padded/multi-request spec shapes — capture takes the
+EXACT shape today, which is bounded by `max_num_seqs` but leaves batching on the
+table.
+
+## 6o. METHOD CORRECTION: the oracle is not a stable denominator single-shot (2026-08-12)
+
+§6n quoted 0.986x / 0.995x from ONE oracle run per cell. That method does not
+survive contact with this box, and the corrected numbers are worse.
+
+**The oracle's own result moves up to 27% between same-config sessions:**
+
+| cell | oracle 12:23 | oracle 14:58 |
+|---|---|---|
+| "capital" | 78.76 | 98.01 |
+| "fibonacci" | 142.88 | 152.45 |
+
+Our reps hold to 0.3% across the same span, so the variance is the reference, not
+us. Part of it was self-inflicted: the 14:58 run put the oracle FIRST to dodge a
+GB10 reboot during its load, which handed it a freshly booted idle box — its best
+slot. The same comparison therefore reads 0.995x/0.986x one way and
+0.833x/0.925x the other.
+
+**INTERLEAVED (O,U,O,U,O,U in one flock, medians) is the binding form:**
+
+| cell | ours (per-rep medians) | oracle (per rep) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 75.3, 81.4, 78.2 | 81.5, 85.1, 97.8 | **0.919x** |
+| "fibonacci", 89 tok | 141.4, 141.4, 141.4 | 143.2, 149.4, 142.1 | **0.987x** |
+
+**So the lane is 0.92x-0.99x, NOT parity.** §6n's 0.986x/0.995x is superseded and
+should not be quoted. What survives §6n unchanged is the same-session,
+same-binary A/B, where both arms run adjacent under identical conditions and the
+capture is the only difference:
+
+| cell | capture OFF | capture ON | delta |
+|---|---|---|---|
+| "capital" | 72.7 | 81.6 | **+12.2%** |
+| "fibonacci" | 136.2 | 141.0 | **+3.5%** |
+
+That, the byte-identical output and the four green e2e suites are what justify
+W8; the cross-engine ratio is a separate claim and it is not yet met.
+
+**Rule for this row from here:** no cross-engine ratio without interleaved
+repetitions and medians. A single oracle load is worth nothing on a box whose
+reference swings 27%, and the direction of the error depends on who got the first
+slot.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
