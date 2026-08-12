@@ -547,6 +547,21 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             r"\(\s*argv\s*\)\s*==\s*expected\s*\)\s*;",
         )
 
+    def test_cpu_isa_test_owns_ostream_for_string_view_diagnostics(self) -> None:
+        source = (REPO / "tests/vt/test_cpu_isa_x86.cpp").read_text(
+            encoding="utf-8"
+        )
+        directives = checker._cpp_directive_view(source)
+        includes = list(
+            re.finditer(r"(?m)^\s*#\s*include\s*<ostream>\s*$", directives)
+        )
+        self.assertEqual(len(includes), 1)
+        self.assertLess(
+            includes[0].start(),
+            directives.index('#include "doctest/doctest.h"'),
+        )
+        self.assertIn("std::string_view::npos", source)
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):
