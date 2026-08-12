@@ -20077,3 +20077,32 @@ numerical equivalence. No test anywhere compares `vt::GdnPackedDecode` against
 (`tests/vt/test_ops_gdn.cpp`), i.e. a ~4% mutual bound. That comparison is OWED.
 
 Both toggles stay DEFAULT OFF; nothing here argues a flip.
+
+## SPEC-DSPARK: source-level explanations EXHAUSTED for the Marlin residual (2026-08-12)
+
+Complete elimination list for the 12.8%/unit-work gap, so it is not redone:
+
+| checked | verdict |
+|---|---|
+| kernel source | dispatcher VERBATIM vs upstream csrc; our only deltas are includes + a default-OFF E=1 clamp that cannot fire for MoE |
+| template instantiation | identical (<...128, 1, 8, 4, true, 4, 1, false>), same a/b/c/s scalar types |
+| determine_exec_config | byte-identical (69 lines); both callers take the auto path |
+| moe_block_size | 8 on both (measured); upstream's >= 16 clamp does not fire |
+| max_shared_mem | same query + same /blocks_per_sm - 1024 adjustment |
+| use_atomic_add / use_fp32_reduce / is_k_full | false / true / true on both |
+| scale bytes per expert | 131072 and 65536 on both |
+| alignment / residency | 256-byte aligned, cudaMalloc device memory on both |
+| work per launch | ours 38.9 blocks vs upstream 40.6 -- upstream does MORE |
+| CUDA toolkit | 13.0 both (ours V13.0.88; torch 2.13.0+cu130) |
+| arch / flags | 121a, -O3 -DNDEBUG; sm_121 kernels in both traces |
+
+Identical code, parameters, toolchain and arch, with LESS work on our side, still
+4.21 us/block vs 3.73.
+
+Next step is ncu, not source reading:
+  sudo ncu --set full --kernel-name-base mangled --kernel-name regex:marlin_moe_wna16 \
+           --launch-count 20 <cmd>
+on both engines, comparing sm__throughput, achieved_occupancy,
+launch__registers_per_thread and the top stall reason. Equal occupancy with
+different memory throughput => data placement; different occupancy => register
+pressure, i.e. a codegen difference between two builds of the same source.

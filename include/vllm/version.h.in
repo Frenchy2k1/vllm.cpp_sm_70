@@ -4,8 +4,9 @@
 #define VLLM_CPP_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
 #define VLLM_CPP_VERSION_MINOR @PROJECT_VERSION_MINOR@
 #define VLLM_CPP_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define VLLM_CPP_BUILD_VERSION "@VLLM_CPP_BUILD_VERSION@"
 
 namespace vllm {
-// Returns "MAJOR.MINOR.PATCH", plus "+cuda" when built with the CUDA backend.
+// Returns the exact build identity, plus "+cuda" when built with that backend.
 std::string Version();
 }  // namespace vllm

@@ -509,8 +509,12 @@ byte-identical to the pinned upstream copy, and every OTHER kernel matches to
 256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
 upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
 routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
-3.73 us per block, ~12.8% slower per unit of work**. The remaining unknown is how
-the kernel executes on identical inputs (occupancy / shared-memory budget). (The repack kernels that appear to take 40% of a long run are
+3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
+eliminated -- kernel source, template instantiation, grid config, block size,
+shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
+toolkit (13.0 both) and arch all match -- so the next step is `ncu` on both
+engines (occupancy, registers, memory throughput, stall reasons), not more source
+reading. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
