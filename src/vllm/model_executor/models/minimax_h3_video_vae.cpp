@@ -26,6 +26,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -127,11 +128,12 @@ std::vector<float> MiniMaxH3VideoVaeBlockForward(const MiniMaxH3VideoVaeBlockCon
         const float* sin = rope_sin + s * rot_dim;
         for (int64_t head = 0; head < heads; ++head) {
           for (std::vector<float>* target : {&q, &k}) {
-            float* v = target->data() + (s * heads + head) * dim_head;
+            float* values = target->data() + (s * heads + head) * dim_head;
             for (int64_t i = 0; i < half; ++i) {
-              const float lo = v[i], hi = v[i + half];
-              v[i] = lo * cos[i] - hi * sin[i];
-              v[i + half] = hi * cos[i + half] + lo * sin[i + half];
+              const float lo = values[i], hi = values[i + half];
+              values[i] = lo * cos[i] - hi * sin[i];
+              values[i + half] =
+                  hi * cos[i + half] + lo * sin[i + half];
             }
           }
         }
@@ -253,7 +255,8 @@ void MiniMaxH3VideoVaeRope(int64_t latent_t, int64_t latent_h, int64_t latent_w,
     const std::array<double, 3> ids = {coord(t, latent_t), coord(h, latent_h), coord(w, latent_w)};
     for (int64_t axis = 0; axis < kNDim; ++axis) {
       for (int64_t i = 0; i < freqs; ++i) {
-        const double angle = 2.0 * M_PI * ids[static_cast<size_t>(axis)] *
+        const double angle = 2.0 * std::numbers::pi_v<double> *
+                             ids[static_cast<size_t>(axis)] *
                              inv_freq[static_cast<size_t>(i)];
         const int64_t slot = axis * freqs + i;
         // .tile(2): the [3 * freqs] block is repeated to fill rot_dim.

@@ -59,6 +59,7 @@ CHECKERS=(
   check-agent-record
   check-release-binary-contract
   check-release-workflow
+  check-windows-release-state
   check-container-matrix
   check-container-workflow
   check-role-discipline
@@ -85,12 +86,15 @@ SUITES=(
   test_release_manifest
   test_release_archive
   test_release_pipeline
+  test_check_windows_release_state
+  test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
   test_release_index
   test_release_metadata
   test_release_accelerator_metadata
   test_release_macos_metadata
+  test_release_windows_metadata
   test_cpu_release_gates
   test_agent_role
   test_agent_onboard

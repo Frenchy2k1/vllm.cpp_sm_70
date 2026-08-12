@@ -1,16 +1,17 @@
 // vllm.cpp original (container reader); no upstream mirror.
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 
-#include <fcntl.h>
+#if !defined(_WIN32)
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -24,6 +25,11 @@
 namespace vllm {
 
 namespace {
+
+std::filesystem::path Utf8Path(const std::string& path) {
+  return std::filesystem::path(std::u8string(
+      reinterpret_cast<const char8_t*>(path.data()), path.size()));
+}
 
 [[noreturn]] void Fail(const std::string& path, const std::string& what) {
   throw std::runtime_error("safetensors: " + what + " in " + path);
@@ -49,36 +55,15 @@ SafetensorsFile SafetensorsFile::Open(const std::string& path) {
   SafetensorsFile f;  // fully constructed: dtor cleans up on any throw below
   f.path_ = path;
 
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) Fail(path, "cannot open file");
-  struct stat st{};
-  size_t file_size = 0;
-  {
-    struct FdGuard {
-      int fd;
-      ~FdGuard() { if (fd >= 0) ::close(fd); }
-    } guard{fd};
-    if (::fstat(fd, &st) != 0) Fail(path, "fstat failed");
-    if (st.st_size <= 0) Fail(path, "empty file");
-    file_size = static_cast<size_t>(st.st_size);
-    if (file_size < 8) Fail(path, "file shorter than the 8-byte header prefix");
-    guard.fd = -1;  // ownership passes to the Mapping below (or the mmap fail path)
+  try {
+    f.map_ = detail::ReadOnlyFileMapping::Open(Utf8Path(path));
+  } catch (const std::runtime_error& e) {
+    Fail(path, e.what());
   }
-
-  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (map == MAP_FAILED) {
-    ::close(fd);
-    Fail(path, "mmap failed");
-  }
-  // From here the mmap and the fd are owned by the refcounted Mapping, whose
-  // destructor munmaps and closes. A borrowed weight (StTensor::mapping) shares
-  // it, so the mapping outlives this object exactly as long as someone reads it.
-  f.map_ = std::make_shared<Mapping>();
-  f.map_->addr = map;
-  f.map_->size = file_size;
-  f.map_->fd = fd;
+  const size_t file_size = f.map_->size();
+  if (file_size < 8) Fail(path, "file shorter than the 8-byte header prefix");
   const std::shared_ptr<const void> keep_alive = f.map_;
-  const uint8_t* bytes = static_cast<const uint8_t*>(map);
+  const uint8_t* bytes = f.map_->data();
 
   // u64 little-endian header length, assembled byte-wise for portability.
   uint64_t header_len = 0;
@@ -221,11 +206,6 @@ const StTensor& SafetensorsFile::Get(const std::string& name) const {
   return it->second;
 }
 
-SafetensorsFile::Mapping::~Mapping() {
-  if (addr != nullptr) ::munmap(addr, size);
-  if (fd >= 0) ::close(fd);
-}
-
 // Drop THIS object's reference to the mapping. Any weight that borrowed a span
 // of it (StTensor::mapping) holds its own reference and keeps it mapped; when
 // nobody does, this is the last one and ~Mapping munmaps immediately — the
@@ -264,7 +244,7 @@ SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
 
 std::map<std::string, std::string> LoadSafetensorsIndex(
     const std::string& index_json_path) {
-  std::ifstream in(index_json_path, std::ios::binary);
+  std::ifstream in(Utf8Path(index_json_path), std::ios::binary);
   if (!in) Fail(index_json_path, "cannot open index file");
   nlohmann::json doc;
   try {
@@ -285,11 +265,12 @@ std::map<std::string, std::string> LoadSafetensorsIndex(
     // index, never paths. Reject separators and parent references so a
     // hostile index cannot traverse outside the model directory.
     if (shard.find('/') != std::string::npos ||
+        shard.find('\\') != std::string::npos ||
         shard.find("..") != std::string::npos)
       Fail(index_json_path, "weight_map value \"" + shard + "\" for \"" +
                                 tensor +
-                                "\" must be a plain filename (no '/' or "
-                                "\"..\")");
+                                "\" must be a plain filename (no '/', '\\', "
+                                "or \"..\")");
     weight_map.emplace(tensor, std::move(shard));
   }
   return weight_map;
@@ -297,6 +278,7 @@ std::map<std::string, std::string> LoadSafetensorsIndex(
 
 namespace {
 
+#if !defined(_WIN32)
 long HostPageSize() {
   static const long page = [] {
     const long p = ::sysconf(_SC_PAGESIZE);
@@ -304,6 +286,7 @@ long HostPageSize() {
   }();
   return page;
 }
+#endif
 
 // nullopt => env-driven; set => forced (test seam).
 std::optional<bool>& WindowedReleaseOverride() {
@@ -330,6 +313,10 @@ bool LoadWindowedReleaseEnabled() {
 }
 
 void ReleaseSourcePages(const void* data, size_t nbytes) {
+#if defined(_WIN32)
+  (void)data;
+  (void)nbytes;
+#else
   if (data == nullptr || nbytes == 0) return;
   const auto ps = static_cast<uintptr_t>(HostPageSize());
   const auto begin = reinterpret_cast<uintptr_t>(data);
@@ -347,6 +334,7 @@ void ReleaseSourcePages(const void* data, size_t nbytes) {
   // return is deliberately ignored.
   ::madvise(reinterpret_cast<void*>(page_begin),
             static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+#endif
 }
 
 void MaybeReleaseSourcePages(const void* data, size_t nbytes) {

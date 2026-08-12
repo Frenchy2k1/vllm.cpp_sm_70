@@ -336,11 +336,17 @@ class ReleaseManifestTests(unittest.TestCase):
         mutations = (
             (preflight.replace("  test_release_manifest\n", "", 1), ci, "preflight"),
             (preflight, ci.replace("          python3 tests/scripts/test_release_manifest.py\n", "", 1), "CI"),
+            (preflight.replace("  test_release_windows_metadata\n", "", 1), ci, "Windows preflight"),
+            (preflight, ci.replace("          python3 tests/scripts/test_release_windows_metadata.py\n", "", 1), "Windows CI"),
         )
         for mutated_preflight, mutated_ci, reason in mutations:
             with self.subTest(reason=reason):
-                errors = checker.wiring_errors(mutated_preflight, mutated_ci)
-                self.assertTrue(any("W5 manifest suite" in error for error in errors), errors)
+                if reason.startswith("Windows"):
+                    errors = checker.wiring_errors(mutated_preflight, mutated_ci)
+                    self.assertTrue(any("W15 Windows metadata suite" in error for error in errors), errors)
+                else:
+                    errors = checker.wiring_errors(mutated_preflight, mutated_ci)
+                    self.assertTrue(any("W5 manifest suite" in error for error in errors), errors)
 
     def test_schema_required_keys_enums_and_additional_properties_are_live(self) -> None:
         base = self.generated(cpu_facts())
@@ -945,6 +951,51 @@ class ReleaseManifestTests(unittest.TestCase):
             "linkage": "dynamic", "bundled": True, "role": "runtime",
         })
         self.assert_invalid(arbitrary_bundle, "bundled")
+
+    def test_windows_cpu_and_vulkan_require_pinned_msvc_ucrt_contract(self) -> None:
+        cpu = self.generated(cpu_facts())
+        windows = copy.deepcopy(cpu)
+        windows["artifact"].update({
+            "id": "windows-x86_64-msvc-cpu", "channel": "preview"
+        })
+        windows["host"].update({
+            "os": "windows", "abi": "msvc", "abi_version": "14.38",
+            "toolset_version": "14.38.33130", "ucrt_version": "10.0.20348.0",
+        })
+        windows["build"].update({
+            "compiler": "MSVC 19.38.33135", "toolchain": "Visual Studio 2022 v143 /MT"
+        })
+        windows["dependencies"] = [{
+            "name": "KERNEL32.dll", "version": "windows-2022", "kind": "library",
+            "linkage": "dynamic", "bundled": False, "role": "runtime",
+        }]
+        self.assertEqual(self.tool.validate_manifest(windows, self.schema, ROOT), [])
+        for field in ("toolset_version", "ucrt_version"):
+            mutant = copy.deepcopy(windows)
+            del mutant["host"][field]
+            self.assert_invalid(mutant, field)
+        dynamic_crt = copy.deepcopy(windows)
+        dynamic_crt["dependencies"].append({
+            "name": "VCRUNTIME140.dll", "version": "system", "kind": "library",
+            "linkage": "dynamic", "bundled": False, "role": "runtime",
+        })
+        self.assert_invalid(dynamic_crt, "static CRT")
+
+        vulkan = copy.deepcopy(windows)
+        vulkan["artifact"]["id"] = "windows-x86_64-msvc-vulkan"
+        vulkan["backend"].update({
+            "name": "vulkan",
+            "flags": flags("vulkan"),
+            "gpu_driver_boundary": "external-host-never-bundled",
+        })
+        vulkan["build"]["resolved_cmake_options"] = copy.deepcopy(vulkan["backend"]["flags"])
+        del vulkan["cpu"]
+        vulkan["dependencies"].extend([
+            {"name": name, "version": "host", "kind": kind, "linkage": "external", "bundled": False, "role": "external-runtime"}
+            for name, kind in (("vulkan-loader", "library"), ("vulkan-icd", "library"), ("vulkan-driver", "driver"))
+        ])
+        vulkan["evidence"]["runtime"] = evidence("absent")
+        self.assertEqual(self.tool.validate_manifest(vulkan, self.schema, ROOT), [])
 
     def test_cuda_feature_resolution_is_derived_from_current_cmake_table(self) -> None:
         manifest = self.generated(cuda_facts())

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cassert>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -955,7 +956,7 @@ int64_t host_available_memory_bytes() {
   char line[256];
   int64_t kb = 0;
   while (std::fgets(line, sizeof(line), f) != nullptr) {
-    if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+    if (std::sscanf(line, "MemAvailable: %" SCNd64 " kB", &kb) == 1) break;
   }
   std::fclose(f);
   return kb > 0 ? kb * 1024 : 0;

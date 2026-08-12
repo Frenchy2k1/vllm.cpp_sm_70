@@ -8,6 +8,7 @@ import hashlib
 import json
 import sys
 import tarfile
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -23,17 +24,27 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def read_manifest(archive: Path) -> dict[str, Any]:
-    with tarfile.open(archive, "r:gz") as bundle:
-        members = [member for member in bundle.getmembers() if member.name == "release-manifest.json"]
-        if len(members) != 1 or not members[0].isfile() or members[0].size > 4 * 1024 * 1024:
-            raise ValueError(f"{archive.name} must contain one bounded release-manifest.json")
-        if PurePosixPath(members[0].name).is_absolute():
-            raise ValueError(f"{archive.name} has an unsafe manifest member")
-        handle = bundle.extractfile(members[0])
-        if handle is None:
-            raise ValueError(f"{archive.name} manifest cannot be read")
-        value = json.loads(handle.read().decode("utf-8"))
+def read_manifest(archive: Path, archive_format: str) -> dict[str, Any]:
+    if archive_format == "tar.gz":
+        with tarfile.open(archive, "r:gz") as bundle:
+            members = [member for member in bundle.getmembers() if member.name == "release-manifest.json"]
+            if len(members) != 1 or not members[0].isfile() or members[0].size > 4 * 1024 * 1024:
+                raise ValueError(f"{archive.name} must contain one bounded release-manifest.json")
+            if PurePosixPath(members[0].name).is_absolute():
+                raise ValueError(f"{archive.name} has an unsafe manifest member")
+            handle = bundle.extractfile(members[0])
+            if handle is None:
+                raise ValueError(f"{archive.name} manifest cannot be read")
+            raw = handle.read()
+    elif archive_format == "zip":
+        with zipfile.ZipFile(archive) as bundle:
+            members = [info for info in bundle.infolist() if info.filename == "release-manifest.json"]
+            if len(members) != 1 or members[0].is_dir() or members[0].file_size > 4 * 1024 * 1024:
+                raise ValueError(f"{archive.name} must contain one bounded release-manifest.json")
+            raw = bundle.read(members[0])
+    else:
+        raise ValueError(f"unsupported explicit archive format {archive_format!r}")
+    value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"{archive.name} manifest must be an object")
     return value
@@ -74,19 +85,43 @@ def generate_index(
     }
     if actual_names != set(by_name):
         raise ValueError("release assets do not exactly match the verified handoff")
-    archives = sorted(name for name in by_name if name.endswith(".tar.gz"))
     version = handoff.get("version")
     if not isinstance(version, str):
         raise ValueError("verified handoff has no release version")
+    project_version = handoff.get("project_version")
+    prerelease = handoff.get("prerelease")
+    if not isinstance(project_version, str) or type(prerelease) is not bool:
+        raise ValueError("verified handoff has no authenticated release state")
+    declared = handoff.get("artifacts")
+    if not isinstance(declared, list):
+        raise ValueError("verified handoff has no explicit artifact formats")
+    formats: dict[str, str] = {}
+    channels: dict[str, str] = {}
+    expected_archives: dict[str, str] = {}
+    for item in declared:
+        if not isinstance(item, dict) or item.get("archive_format") not in {"tar.gz", "zip"}:
+            raise ValueError("verified handoff artifact format is invalid")
+        artifact_id = item.get("id")
+        if not isinstance(artifact_id, str) or artifact_id in formats:
+            raise ValueError("verified handoff artifact ID is invalid or duplicated")
+        formats[artifact_id] = item["archive_format"]
+        channel = item.get("channel")
+        if not isinstance(channel, str):
+            raise ValueError("verified handoff artifact channel is invalid")
+        channels[artifact_id] = channel
+        expected_archives[f"vllm.cpp-{version}-{artifact_id}.{item['archive_format']}"] = artifact_id
+    archives = sorted(name for name in by_name if name in expected_archives)
     rows: list[dict[str, Any]] = []
     for archive_name in archives:
-        manifest = read_manifest(assets_dir / archive_name)
+        declared_id = expected_archives[archive_name]
+        manifest = read_manifest(assets_dir / archive_name, formats[declared_id])
         artifact = manifest.get("artifact", {})
         artifact_id = artifact.get("id")
-        expected_archive = f"vllm.cpp-{version}-{artifact_id}.tar.gz"
+        expected_archive = f"vllm.cpp-{version}-{artifact_id}.{formats.get(artifact_id)}"
         if (
             not isinstance(artifact_id, str)
             or artifact.get("version") != version
+            or artifact.get("channel") != channels.get(artifact_id)
             or archive_name != expected_archive
             or by_name[archive_name].get("artifact_id") != artifact_id
         ):
@@ -135,6 +170,8 @@ def generate_index(
         )
     index = {
         "artifacts": rows,
+        "prerelease": prerelease,
+        "project_version": project_version,
         "release_tag": handoff.get("release_tag"),
         "retention": {
             "ci_artifacts_days": retention_days,
@@ -142,6 +179,7 @@ def generate_index(
         },
         "schema": SCHEMA,
         "source_sha": handoff.get("source_sha"),
+        "version": version,
     }
     json_output.parent.mkdir(parents=True, exist_ok=True)
     json_output.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -149,6 +187,7 @@ def generate_index(
         f"# vllm.cpp {index['release_tag']} binary index",
         "",
         f"Source: `{index['source_sha']}`",
+        f"Prerelease: `{str(prerelease).lower()}`",
         "",
         "| Artifact | Channel | Host ABI | Backend | CPU tiers / CUDA SMs | Boundary and limitations |",
         "|---|---|---|---|---|---|",
@@ -191,7 +230,7 @@ def main() -> int:
             args.markdown_output,
             args.retention_days,
         )
-    except (OSError, json.JSONDecodeError, tarfile.TarError, ValueError) as exc:
+    except (OSError, json.JSONDecodeError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
         print(f"release index error: {exc}", file=sys.stderr)
         return 1
     return 0
