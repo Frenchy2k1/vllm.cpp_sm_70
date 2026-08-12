@@ -24,6 +24,13 @@ CHECKER_SPEC.loader.exec_module(checker)
 UNSUPPORTED_TIER_FILTER = (
     "--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran"
 )
+NOMINMAX_REAL_CLOSURE = (
+    "src/vllm/model_executor/models/minimax_h3_sharded.cpp",
+    "src/vllm/v1/kv_offload/fs_io.cpp",
+    "src/vt/cpu/cpu_threadpool.cpp",
+    "src/vllm/platform/console_shutdown.cpp",
+    "src/vllm/platform/process.cpp",
+)
 
 
 SAFE_FILES = {
@@ -266,6 +273,27 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         result = self.run_checker(self.make_tree({relative: content}))
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(reason, result.stdout + result.stderr)
+
+    @staticmethod
+    def nominmax_real_sources() -> dict[str, str]:
+        return {
+            relative: (REPO / relative).read_text(encoding="utf-8")
+            for relative in NOMINMAX_REAL_CLOSURE
+        }
+
+    @staticmethod
+    def with_nominmax_fallback(source: str, *, before: bool,
+                               guarded: bool = True) -> str:
+        header = "#include <windows.h>"
+        if source.count(header) != 1:
+            raise AssertionError("expected exactly one windows.h include")
+        definition = "#define NOMINMAX\n"
+        if guarded:
+            definition = "#ifndef NOMINMAX\n#define NOMINMAX\n#endif\n"
+        return source.replace(
+            header,
+            definition + header if before else header + "\n" + definition,
+        )
 
     def test_accepts_complete_guarded_contract(self) -> None:
         result = self.run_checker(self.make_tree())
@@ -703,6 +731,115 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             unguarded,
             "unguarded source-local NOMINMAX",
         )
+
+    def test_nominmax_real_closure_accepts_guarded_fallbacks_before_headers(
+            self) -> None:
+        cmake = textwrap.dedent(SAFE_FILES["CMakeLists.txt"])
+        without_central = cmake.replace(
+            "add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)", ""
+        )
+        safe_fs = textwrap.dedent(
+            SAFE_FILES["src/vllm/v1/kv_offload/fs_io.cpp"]
+        )
+        real_sources = self.nominmax_real_sources()
+        for relative, source in real_sources.items():
+            with self.subTest(relative=relative):
+                result = self.run_checker(self.make_tree({
+                    "CMakeLists.txt": without_central,
+                    "src/vllm/v1/kv_offload/fs_io.cpp":
+                        self.with_nominmax_fallback(safe_fs, before=True),
+                    relative: self.with_nominmax_fallback(
+                        source, before=True
+                    ),
+                }))
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+
+    def test_nominmax_real_closure_rejects_late_and_unguarded_fallbacks(
+            self) -> None:
+        cmake = textwrap.dedent(SAFE_FILES["CMakeLists.txt"])
+        without_central = cmake.replace(
+            "add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)", ""
+        )
+        real_sources = self.nominmax_real_sources()
+        all_guarded = {
+            relative: self.with_nominmax_fallback(source, before=True)
+            for relative, source in real_sources.items()
+        }
+        for relative, source in real_sources.items():
+            with self.subTest(relative=relative, shape="late"):
+                mutations = dict(all_guarded)
+                mutations[relative] = self.with_nominmax_fallback(
+                    source, before=False
+                )
+                result = self.run_checker(self.make_tree({
+                    "CMakeLists.txt": without_central,
+                    **mutations,
+                }))
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn(
+                    f"{relative}: NOMINMAX must be defined centrally",
+                    result.stdout + result.stderr,
+                )
+
+            with self.subTest(relative=relative, shape="unguarded"):
+                mutations = dict(real_sources)
+                mutations[relative] = self.with_nominmax_fallback(
+                    source, before=True, guarded=False
+                )
+                result = self.run_checker(self.make_tree(mutations))
+                self.assertNotEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertRegex(
+                    result.stdout + result.stderr,
+                    rf"{re.escape(relative)}:\d+: unguarded source-local "
+                    r"NOMINMAX is forbidden",
+                )
+
+    def test_nominmax_real_closure_ignores_comment_and_literal_decoys(
+            self) -> None:
+        real_sources = self.nominmax_real_sources()
+        target = "src/vllm/platform/process.cpp"
+        source = real_sources[target]
+        decoys = {
+            "raw string": 'constexpr auto kRaw = R"TAG(\n#define NOMINMAX\n)TAG";\n',
+            "ordinary string": 'constexpr auto kString = "\\\n#define NOMINMAX";\n',
+            "line comment": "// #define NOMINMAX\n",
+            "block comment": "/*\n#define NOMINMAX\n*/\n",
+        }
+        for shape, decoy in decoys.items():
+            with self.subTest(shape=shape):
+                mutations = dict(real_sources)
+                mutations[target] = source.replace(
+                    "#include <windows.h>",
+                    decoy + "#include <windows.h>",
+                )
+                result = self.run_checker(self.make_tree(mutations))
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+
+    def test_nominmax_real_closure_without_contract_rejects_all_five_sources(
+            self) -> None:
+        cmake = textwrap.dedent(SAFE_FILES["CMakeLists.txt"])
+        without_central = cmake.replace(
+            "add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)", ""
+        )
+        result = self.run_checker(self.make_tree({
+            "CMakeLists.txt": without_central,
+            **self.nominmax_real_sources(),
+        }))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = result.stdout + result.stderr
+        for relative in NOMINMAX_REAL_CLOSURE:
+            with self.subTest(relative=relative):
+                self.assertIn(
+                    f"{relative}: NOMINMAX must be defined centrally", output
+                )
 
     def test_pins_peer_close_invalidation(self) -> None:
         source = textwrap.dedent(

@@ -156,3 +156,15 @@ containing directive decoys must pass. Removing the central definition with no
 fallbacks must reject all five sources. The central CMake definition, all four
 source removals, `/W4 /WX`, guarded standalone fallbacks, and the release
 invocation remain unchanged.
+
+The recognized RED run reproduced both defects: the independent guarded-before
+case falsely rejected MiniMax-H3 sharded loading, filesystem offload, and the
+CPU threadpool, and raw/ordinary string decoys were falsely treated as active
+definitions. Line and block comment decoys already passed. The repair reuses
+`without_cpp_comments_and_literals`, whose space-for-byte replacement preserves
+newlines and offsets, and passes that single structural view to both the
+directive state machine and the `windows.h` search. The complete focused matrix
+then passes: guarded-before independently in all five sources, late and
+unguarded definitions rejected in all five, all four inert decoys accepted, and
+central removal without fallbacks rejected in all five. The direct production
+checker and the complete 68-test Windows portability suite pass.
