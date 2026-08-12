@@ -875,6 +875,24 @@ Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
 scoped increment that closes it; it is dispatch-ready and deliberately NOT
 started here, because a half-finished CUDA-graph capture is worse than none.
 
+**ROOT CAUSE (2026-08-12): we mirrored the model but NOT vLLM's cudagraph
+dispatcher.** Upstream's "uniform" test is that all requests share a query_len,
+NOT that query_len is 1 (`v1/worker/gpu/cudagraph_utils.py:95-105`), and the
+captured decode length is defined as the verify shape:
+`self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens`
+(`v1/cudagraph_dispatcher.py:37`), so a uniform 1+k batch takes the FULL graph
+(`:143-146`). vLLM graphs the speculative verify BY CONSTRUCTION. We never do,
+so our verify runs eager EVERY step — the whole ~4.8 ms/step, and the reason the
+deficit tracks acceptance (0.870x where the block is mostly accepted, 0.981x
+where it is not). Nothing is missing from the model: kernels, drafter and
+acceptance are already at parity. The missing piece is dispatch.
+
+This makes the increment a MIRRORING job with an upstream anchor: generalise the
+predicate to upstream's uniform test with query length `1 + num_spec`, key
+captures on a `(num_tokens, num_reqs, uniform)` descriptor instead of one bespoke
+pure-decode graph, and pad token counts to a captured set as
+`_bs_to_padded_graph_size` does so a handful of shapes covers every batch.
+
 **Predicate.** `pure_decode` is `num_actual_tokens == num_reqs`
 (`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`). A verify submits
 `num_reqs x (1+k)` tokens and therefore runs eager EVERY step, while upstream
