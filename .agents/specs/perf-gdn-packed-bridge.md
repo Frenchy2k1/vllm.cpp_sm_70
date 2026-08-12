@@ -180,8 +180,164 @@ defect, not a windfall.
   `TryTritonPackedDecode` guard rejected it; do not relax the AOT predicate.
 - Any token claim -> refused until `row/GATE-27B-FP8-TOWER-GOLDEN` lands.
 
+## Measured (dgx, GB10 sm_121a, 2026-08-12)
+
+Merged forward onto `origin/main` `a2ca83a8`, which lands
+`row/GATE-27B-FP8-TOWER-GOLDEN` — the first gate that EXECUTES the fp8 tower, and
+the token gate this spec recorded as owed. CPU tier unchanged at **29 cases /
+765 assertions, SUCCESS**.
+
+Build: `RelWithDebInfo`, `-DVLLM_CPP_TRITON=ON`,
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`,
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`, 0 warnings. Configure log verified to
+print `CUTLASS found … enabling sm120a NVFP4 cutlass GEMM`,
+`CUDA feature fa2: ENABLED for [121a]` and `Triton AOT: gdn_decode_h48 <-
+sm_121a`. One `flock $HOME/gpu.lock` acquisition, queued behind two other jobs,
+never contended.
+
+### 1. SELECTION — PROVEN, from an EAGER step
+
+The counters are HOST-DISPATCH counts and CUDA graph REPLAY performs no host
+dispatch, so they read 0 in a graphed throughput run whatever was selected. They
+are therefore read from `test_qwen27n_fp8_tower_paged_engine`, the only harness
+that loads `nvidia@0893e160` AND steps eagerly, after
+`ResetGdnPackedDecodeDebugStats()` and one pure non-spec decode step:
+
+| arm | `packed_launches` | `triton_launches` |
+|---|---|---|
+| default (no lever) | **0** | 0 |
+| `VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1` | **48** | **48** |
+
+`48 && 48` is the vendored FLA cubin firing on every GDN layer — the goal state,
+not the `48 && 0` hand-kernel-with-cubin-rejected state and not the
+`0` never-selected state. Corroborated independently: the arm exactly as it
+landed on main, whose contract is the constant `packed_launches == 0`, PASSES
+without the lever and FAILS with it (`231 assertions | 1 failed`, exit 1).
+
+### 2. Decode A/B — two independent instruments agree
+
+Per-kernel (`nsys -t cuda --cuda-graph-trace=node`, `cuda_gpu_kern_sum`, 63
+decode steps, one run per arm). Only kernels whose identity or count CHANGED are
+attributable; same-kernel/same-count rows are run-to-run variance:
+
+| change | OFF ms/step | ON ms/step | delta |
+|---|---|---|---|
+| `GdnDecodeFusedKernel` -> `fused_recurrent_gated_delta_rule_packed_decode_kernel` | 1.3647 (28.43 us/call) | 0.9645 (**20.09 us/call**) | **-0.4002** |
+| `GdnPostConvFastKernel` absorbed (3024 decode calls gone) | 0.1348 | 0.0039 | -0.1309 |
+| `CastBf16Kernel` 4096 -> 1024 instances | 0.0758 | 0.0191 | -0.0567 |
+| `CausalConv1dUpdateFastKernel` f32 -> bf16 | 0.1392 | 0.1219 | -0.0173 |
+| `MulColVecF32Kernel` f32 -> bf16 | 0.1113 | 0.1090 | -0.0023 |
+| `gemvx` template swap | 0.5001 | 0.4988 | -0.0013 |
+| merged fp8 qkvz GEMM `nvjet…qqsss_192x48x128` -> `…qqtst…` (D f32->bf16) | 18.6259 (381.98 us/call) | 18.7209 (383.92 us/call) | **+0.0950** |
+| **net attributable** | | | **-0.5137** |
+
+End-to-end same-binary A/B (`vllm-bench`, c1, in 16 / out 256, 3 requests per
+leg, order-alternated `off,on,on,off,off,on`):
+
+| arm | n | legs (median TPOT ms) | median | spread |
+|---|---|---|---|---|
+| OFF | 3 | 83.17, 83.33, 83.33 | **83.33** | 0.16 ms (0.19%) |
+| ON | 3 | 82.66, 82.72, 82.79 | **82.72** | 0.13 ms (0.16%) |
+
+The arms SEPARATE: every ON leg is below every OFF leg. **-0.61 ms/step
+(-0.73%)** by median, -0.56 by mean, against a within-arm spread of <0.2% — and
+the ordering rules out drift, because the run warms slightly (the earliest OFF
+leg is the fastest OFF leg and the latest ON leg the slowest ON leg), which
+works AGAINST the effect rather than for it.
+
+### 3. Against the PIN
+
+Denominator: `~/venvs/vllm-oracle-next` addressed by EXPLICIT path, never the
+canonical `vllm-oracle` symlink, which still points at the v0.25.0 ROLLBACK
+(#375). Identity ASSERTED before the run and aborting otherwise —
+`vllm.__version__ = 0.23.1rc1.dev1511+g555967922`, FlashInfer `0.6.15.post1`,
+Torch `2.13.0+cu130`. GRAPHED (`vllm serve`, no `--enforce-eager`),
+`--language-model-only`, `--gpu-memory-utilization 0.55`, 115 GiB host RAM free
+at start. Same checkpoint, same in 16 / out 256, same 3 requests, same
+`--max-concurrency 1`, same greedy sampling, `--ignore-eos`.
+
+| arm | median TPOT | spread | vs PIN | decode gap |
+|---|---|---|---|---|
+| PIN (81.39, 81.40, 81.39) | **81.39 ms** | 0.01% | 1.000x | — |
+| ours OFF | 83.33 ms | 0.19% | **0.977x** | +1.94 ms/step (+2.38%) |
+| ours ON | 82.72 ms | 0.16% | **0.984x** | +1.33 ms/step (+1.63%) |
+
+The OFF row REPRODUCES the deficit this row was scoped from (+1.81 ms/step,
++2.33%) at +1.94 / +2.38%, which is the strongest available check that the
+harness is measuring the same thing the original profile did. The lever closes
+**31%** of the measured decode gap.
+
+Medians are used and the reason is recorded rather than hidden: the PIN's per-leg
+MEANS are 81.40, 81.39 and **83.57** — the third leg carries one slow request
+whose tail moves the mean 2.7% while the median does not move at all. Ours has no
+such leg (mean equals median to 0.01 ms on five of six legs). A 2.7% mean spread
+on one arm is inside the ~5% band but it is the largest single source of doubt in
+this comparison, and it is exactly why the ratio is quoted from medians.
+
+TTFT is NOT the story here and is recorded so nobody has to guess: ours ~96 ms
+vs the pin's 131.6 ms at this input length, i.e. we are AHEAD on prefill on this
+workload, so the decode ratio above is not hiding a prefill regression.
+
+The output-token-throughput axis DISAGREES with the decode axis and is not
+quoted as decode: ours 11.20 (OFF) / 11.26 (ON) vs the pin's 12.17 tok/s, a
+0.92x that TTFT and TPOT together do not account for — 96.5 ms + 255 x 83.33 ms
+predicts ~12.0 tok/s for our OFF arm, so about 1.4 s per request sits outside
+BOTH reported metrics in our frontend. That is a real open item, it is larger
+than this lever, and it belongs to whoever owns the bench frontend rather than to
+this row. It is named here so nobody quotes 0.92x as a decode ratio or 0.98x as a
+throughput one.
+
+### 3b. Against the prediction
+
+`## Expected payoff` predicted -0.425 (packed swap) -0.131 (post-conv absorbed)
+= -0.556 ms/step and warned that anything materially larger is a measurement
+defect. Those two terms MEASURE -0.4002 -0.1309 = **-0.5311**, within 4.5% of
+prediction, and the e2e -0.56/-0.61 lands on the same number from a different
+instrument. Nothing here is a windfall.
+
+### 4. Tokens
+
+`test_qwen27n_fp8_tower_paged_engine` on `nvidia@0893e160`: **236 assertions,
+SUCCESS, 16/16 token-exact** with the lever OFF *and* ON. The packed kernel is a
+DIFFERENT kernel and the arm rounds the fp8 accumulator earlier, so this was not
+byte-exact by construction — it is measured. SACRED `test_qwen27_paged_engine`
+(`unsloth@890bdef7`): **235 assertions, SUCCESS, 16/16 token-exact** with the
+lever OFF and ON, confirming the lever is inert on a BF16 tower.
+
+The bound the 27n arm carries travels with this result: a x1.10 fp8 scale
+perturbation is REACHED and still passes, so this is a GROSS-defect token gate on
+one 16-token prompt, not a bound on fp8 numerics. It does not license a default
+flip on its own.
+
+### 5. What is NOT established
+
+- **The residual against vLLM's own launch of the same cubin.** Ours runs the
+  FLA packed decode at 20.09 us/call; the profile this row was scoped from
+  records vLLM at 19.21 us/call — about 4.6% above, ~0.042 ms/step, on the
+  IDENTICAL kernel, which is a launch/argument-side difference and not a
+  ceiling. Not re-measured here.
+- **The +0.0950 ms/step on the merged fp8 qkvz GEMM.** Narrowing D to bf16
+  reselects the cuBLASLt template (`qqsss` -> `qqtst`) and that template is
+  ~0.51% slower per call at this shape. It is one run per arm and smaller than
+  the Marlin run-to-run variance in the same table, so it is a candidate, not a
+  finding. It is the `VT_GDN_FP8_IN_BF16` half of the composition and it pays
+  for itself several times over, but it should be measured per-shape before
+  anyone quotes it.
+- **Absolute scale.** 83 ms/step (~11.2 tok/s) is this harness at its defaults
+  (auto-fit `max_model_len` 8192, 256 blocks), not a tuned production point.
+  Only the paired delta is claimed. Likewise the nsys per-step totals (~42
+  ms/step of kernel time) are instrument-inflated and only their paired
+  difference is used.
+- **The ~1.4 s/request our frontend spends outside TTFT and TPOT** (§3). It is
+  the reason the throughput and decode ratios differ by ~6%, and nothing here
+  attributes it.
+- **Whether the win survives at the gate's concurrency.** Everything above is
+  c1. The GDN recurrence is per-sequence, so the saving should scale with batch,
+  but that is an expectation and not a measurement.
+
 ## Now
 
-Composed and bridged; CPU tier green. Owed: the GPU selection proof under
-`-DVLLM_CPP_TRITON=ON`, then a decode-only A/B, then the token gate from
-`row/GATE-27B-FP8-TOWER-GOLDEN` before any default flip.
+Selection PROVEN, decode A/B MEASURED and token-clean on both checkpoints. Both
+toggles remain DEFAULT OFF: the flip is a separate decision that needs the
+per-shape check on the fp8 qkvz GEMM above and a PIN-relative re-measure, and
+this row does not argue it.
