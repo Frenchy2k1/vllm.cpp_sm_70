@@ -499,8 +499,10 @@ MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
 the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
 noise, and the earlier "within resolution" reading was too generous. Ours slowed
 more than the oracle when the clock was pinned, so the residual is
-SM-clock-sensitive work, pointing back at the unclosed MoE expert cost at T=9
-(~1.7x GPU per token). NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
+SM-clock-sensitive work. Profiling localises it: the MoE expert GEMM is ~15
+instances and 2.47 ms per token, ~34% of wall, so closing 2.5% end-to-end needs
+~7% off that kernel. (The repack kernels that appear to take 40% of a long run
+are LOAD-TIME -- identical instance counts at 32 and 96 tokens.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
