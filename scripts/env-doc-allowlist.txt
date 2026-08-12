@@ -1,22 +1,10 @@
-# Kernel-internal env vars (deferred from docs/ENVIRONMENT.md).
-# These are kernel implementation / micro-tuning / bisect switches whose
-# meaning is tied to a specific kernel; they are recorded in the ledger and
-# docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
-# treats a name here as a known kernel-internal knob. A NEW production env
-# var must be documented in docs/ENVIRONMENT.md OR added here.
-# Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,
-# fallback, or experimental kernel behavior, not supported deployment knobs.
-VT_GEMMA4_BATCH_EXPERTS
-VT_GEMMA4_CUSTOM_EXPERT
-VT_GEMMA4_FP8_NATIVE
-VT_GEMMA4_FUSED_EXPERTS
-VT_GEMMA4_HOST_AXPY
-VT_GEMMA4_PROFILE
-VT_ROCM_GEMM_COMPUTE
-VT_ROCM_GEMV
-VT_ROCM_HIPBLASLT
+VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH
+VLLM_GEMMA4_MM_DEBUG
 VLLM_MM_TOWER_PROFILE
 VT_ARCH_TACTIC_STATS
+VT_ASYNC_EXECUTOR_NO_DBUF
+VT_ASYNC_EXECUTOR_POISON
+VT_ASYNC_EXECUTOR_TRACE
 VT_ATTN_DECODE_D128
 VT_ATTN_DECODE_GQA
 VT_ATTN_DECODE_OPT
@@ -37,6 +25,7 @@ VT_DEEPSEEK_GRAPH_VERIFY
 VT_DENSE_CUBLASLT_FP8
 VT_DENSE_NATIVE
 VT_DIRECT_DEVICE_LOAD
+VT_DUMP_ACT
 VT_FA2_DECODE_35B
 VT_FA2_DECODE_QWEN3
 VT_FA2_NSPLITS_CAP
@@ -123,9 +112,29 @@ VT_GLUE_FUSE
 VT_INTERNLM2_WRONG_SPLIT
 VT_KDA_CHUNK_TRITON
 VT_KV_ALLOC_LOG
+VT_LAGUNA_DECODE_GRAPH
+VT_LAGUNA_FAST_NORM
+VT_LAGUNA_GLUE_FUSED
+VT_LAGUNA_GROUPED_MOE
+VT_LAGUNA_KV_BF16
+VT_LAGUNA_KV_HEADROOM
+VT_LAGUNA_MARLIN_MOE
+VT_LAGUNA_MOE_ADDNORM_FUSED
+VT_LAGUNA_MOE_ONECAST
+VT_LAGUNA_ONDEV_SAMPLE
+VT_LAGUNA_PREAMBLE_FUSED
+VT_LAGUNA_RESIDENT_BF16W
+VT_LAGUNA_RESIDENT_DECODE
+VT_LAGUNA_RESIDENT_MOE
+VT_LAGUNA_SHARED_AUX
+VT_LAGUNA_SHARED_FP4
+VT_LAGUNA_SWA_WINDOW
+VT_LAGUNA_TAIL_FUSED
+VT_LAGUNA_TOPK_SHFL
 VT_LOAD_WINDOWED_RELEASE
 VT_LOGITS_GATHER
 VT_MARLIN_WS_POOL
+VT_MLA_FUSED_NORM_ROPE
 VT_MLA_SPLIT_FILL
 VT_MOE_BF16_FAST
 VT_MOE_BF16_FUSED_GATEUP
@@ -134,16 +143,19 @@ VT_MOE_DECODE
 VT_MOE_FUSED_W13
 VT_MOE_GLUE_FUSE
 VT_MOE_HOST_FREE
+VT_MOE_PAD_STATS
 VT_MOE_SHARED_AUX_STREAM
 VT_MOE_SHARED_AUX_THRESHOLD
 VT_MOE_SPLIT_K
 VT_NVFP4_CUTLASS
+VT_NVFP4_FP4_GEMV
 VT_NVFP4_FP4_NATIVE
 VT_NVFP4_MARLIN
 VT_NVFP4_WMMA
 VT_PAGED_FLASH
 VT_POOL_EXACT
 VT_POOL_STATS
+VT_QWEN35_GROUPED_MOE
 VT_QWEN3MOE_CUDAGRAPH
 VT_QWEN3_ATTN_F32
 VT_QWEN3_QKV_MERGE
@@ -155,81 +167,51 @@ VT_ROCM_GEMM_COMPUTE
 VT_ROCM_GEMV
 VT_ROCM_HIPBLASLT
 VT_SILU_FP4_FAST
-VT_SWIZZLE_IN_QUANT
-VT_W4A4_TRUE
-VLLM_GEMMA4_MM_DEBUG
 VT_SPEC_TRACE
-VT_DUMP_ACT
-VT_V4_PROF
-VT_V4_GROUPED_MOE
+VT_SWIZZLE_IN_QUANT
+VT_V4_DECODE_GRAPH
 VT_V4_DEVICE_ATTN
 VT_V4_DEVICE_GLUE
-VT_V4_RESIDENT_DECODE
-VT_V4_DECODE_GRAPH
-VT_V4_Q8_0_ALIGN
 VT_V4_FUSED_MOE
 VT_V4_FUSED_ROPE
+VT_V4_GROUPED_MOE
 VT_V4_MHC_FUSED
 VT_V4_MHC_LEAN
 VT_V4_MHC_SINK4
-VT_V4_Q8_PREQ_QUANT
 VT_V4_PREQ_FUSED
+VT_V4_PROF
+VT_V4_Q8_0_ALIGN
+VT_V4_Q8_ILP
+VT_V4_Q8_PAIR
+VT_V4_Q8_PREFETCH
+VT_V4_Q8_PREQ_QUANT
+VT_V4_Q8_PROBE
+VT_V4_Q8_SUBWARP
+VT_V4_RESIDENT_DECODE
+VT_V4_RESIDENT_EXPERTS
+VT_V4_RESIDENT_W
 VT_V4_ROPE_FLOAT
 VT_V4_ROUTE_WARP_TOPK
-VT_V4_Q8_SUBWARP
-VT_V4_Q8_PAIR
-VT_V4_Q8_PROBE
-VT_V4_Q8_ILP
-VT_V4_Q8_PREFETCH
-VT_V4_RESIDENT_W
-VT_V4_RESIDENT_EXPERTS
-VT_MLA_FUSED_NORM_ROPE
-VT_LAGUNA_GROUPED_MOE
-VT_QWEN35_GROUPED_MOE
-VT_LAGUNA_RESIDENT_DECODE
-VT_LAGUNA_RESIDENT_MOE
-VT_LAGUNA_RESIDENT_BF16W
-VT_NVFP4_FP4_GEMV
-VT_LAGUNA_DECODE_GRAPH
-VT_LAGUNA_MARLIN_MOE
-VT_LAGUNA_GLUE_FUSED
-VT_LAGUNA_ONDEV_SAMPLE
-VT_LAGUNA_MOE_ADDNORM_FUSED
-VT_LAGUNA_SHARED_FP4
-VT_LAGUNA_SHARED_AUX
-VT_LAGUNA_PREAMBLE_FUSED
-VT_LAGUNA_MOE_ONECAST
-VT_LAGUNA_TAIL_FUSED
-VT_LAGUNA_FAST_NORM
-VT_LAGUNA_TOPK_SHFL
-VT_LAGUNA_SWA_WINDOW
-VT_LAGUNA_KV_BF16
-VT_LAGUNA_KV_HEADROOM
-VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH
-# Test-only escape hatch: skip the depth-2 drain (VT_ASYNC_EXECUTOR=1) while
-# forcing the decode-graph parity ring OFF (single slot), so the async-serving gate
-# SEES the logits/input reuse hazard (a RED arm). Never set in production.
-VT_ASYNC_EXECUTOR_NO_DBUF
-# Test-only: deterministic RED for Option A — poison the PINNED H2D source right
-# after StageStepInputs enqueues the async copy (a true-async DMA reads the garbage),
-# proving the input-staged event boundary is load-bearing. Also a drain-skip counter
+VT_W4A4_TRUE
 # (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
-VT_ASYNC_EXECUTOR_POISON
-VT_ASYNC_EXECUTOR_TRACE
-
 # Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
-# selects a kernel or a batching strategy for the expert GEMMs and each
-# defaults to the measured-best path; none changes an API contract or an output.
+# Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,
+# Kernel-internal env vars (deferred from docs/ENVIRONMENT.md).
 # Kernel-internal, so allowlisted rather than documented as user knobs.
-VT_GEMMA4_BATCH_EXPERTS
-VT_GEMMA4_CUSTOM_EXPERT
-VT_GEMMA4_FP8_NATIVE
-VT_GEMMA4_FUSED_EXPERTS
-VT_GEMMA4_HOST_AXPY
-VT_GEMMA4_PROFILE
 # ROCm GEMM/GEMV tactic selection (rocm_matmul_hipblaslt.hip). Same class: they
-# pick between hipBLASLt and our own kernels, all defaulting to the faster arm
+# SEES the logits/input reuse hazard (a RED arm). Never set in production.
+# Test-only escape hatch: skip the depth-2 drain (VT_ASYNC_EXECUTOR=1) while
+# Test-only: deterministic RED for Option A — poison the PINNED H2D source right
+# These are kernel implementation / micro-tuning / bisect switches whose
+# after StageStepInputs enqueues the async copy (a true-async DMA reads the garbage),
+# defaults to the measured-best path; none changes an API contract or an output.
+# docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
+# fallback, or experimental kernel behavior, not supported deployment knobs.
+# forcing the decode-graph parity ring OFF (single slot), so the async-serving gate
+# meaning is tied to a specific kernel; they are recorded in the ledger and
 # measured on gfx1201.
-VT_ROCM_GEMM_COMPUTE
-VT_ROCM_GEMV
-VT_ROCM_HIPBLASLT
+# pick between hipBLASLt and our own kernels, all defaulting to the faster arm
+# proving the input-staged event boundary is load-bearing. Also a drain-skip counter
+# selects a kernel or a batching strategy for the expert GEMMs and each
+# treats a name here as a known kernel-internal knob. A NEW production env
+# var must be documented in docs/ENVIRONMENT.md OR added here.
