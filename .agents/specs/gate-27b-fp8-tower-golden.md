@@ -129,7 +129,7 @@ zero assertions**, and `ctest` exits 0. That is what let an absent instrument re
 as a pass. The new arm's absent-checkpoint path:
 
 - prints a banner naming the row, the repo, the exact revision, and the words
-  `NO FP8 TOWER COVERAGE`, so the intent cannot be reconstructed as a pass by a
+  `NO-FP8-TOWER-COVERAGE`, so the intent cannot be reconstructed as a pass by a
   reader skimming a log;
 - records at least one assertion in the skip path, so a skipped run is
   distinguishable from a covered run by the assertion count alone, which is the
@@ -216,6 +216,12 @@ with `atol/rtol` 1e-3 to 5e-2 and top-1000 logits — and only the `logits`
 directory is consumed so far. Giving `test_op_parity`'s Qwen27 arms a 27n
 counterpart against the committed tensors would catch the 1.10x case. Owed,
 not done here.
+
+This bound no longer lives only in this spec. It is carried in the test file's
+own header block and, so that it cannot be separated from the claim, in the
+proof `MESSAGE` itself, which now reads `GROSS fp8-defect sensitivity ONLY`.
+A proof line gets pasted into PR bodies; a caveat 200 lines into a spec does
+not travel with it.
 
 ### The token stream does not discriminate the checkpoints
 

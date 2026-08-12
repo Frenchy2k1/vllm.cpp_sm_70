@@ -33,6 +33,32 @@
 // same 16 greedy tokens, same temperature-0 sampling, same engine knobs), from
 // the pinned oracle.
 //
+// WHAT THIS ARM CATCHES, AND WHAT IT DOES NOT — MEASURED, not estimated.
+// Read this before quoting the proof line at the bottom of this file.
+//
+// The RED-mutation sweep perturbed every FP8 weight scale and folded alpha at
+// the single external-linkage load seam (`LoadFp8RawShared`) and re-ran this
+// arm on the dgx production build:
+//
+//   x1.02  REACHED (reachability lines printed) -> 16/16 tokens IDENTICAL, PASS
+//   x1.10  REACHED (reachability lines printed) -> 16/16 tokens IDENTICAL, PASS
+//   x2.00  REACHED                              -> FAILED, ctest EXIT=8
+//
+// So the perturbation is DEMONSTRABLY executing the code under test at 1.02x
+// and 1.10x — it is not passing because the mutation was unreachable — and the
+// token stream still does not move. This arm therefore catches a GROSS fp8
+// defect (a dead, bypassed, dequantized or wrongly-scaled-by-2x tower) and
+// does NOT catch a ~10% per-tensor scale error, a mis-permuted per-channel
+// scale, or any comparable numerical drift. It is a token gate on ONE short
+// prompt, not a numerical-tolerance gate.
+//
+// NEVER quote this arm, or its proof line, as bounding fp8 numerics.
+// The numerical bound is OWED: this row committed per-tensor goldens under
+// tests/parity/goldens/qwen36_{embed,gdn_layer,fullattn_layer,norm}_27n/ with
+// atol/rtol 1e-3..5e-2, and only the `logits` directory is consumed so far.
+// 27n op-parity arms against those tensors would catch the 1.10x case.
+// See .agents/specs/gate-27b-fp8-tower-golden.md `## Outcome`.
+//
 // Checkpoint-GATED + dgx-only: on the CPU dev box / CI the snapshot is absent,
 // so the body emits a refusal that CANNOT be read as coverage (see the SKIP
 // block) and returns. It compiles and links everywhere; it only RUNS where the
@@ -297,7 +323,12 @@ TEST_CASE("qwen27n fp8-tower paged-engine greedy acceptance gate (dgx-only)") {
   REQUIRE(static_cast<int>(got.size()) == kMaxTokens);
   CHECK(got == want_prod);
 
-  // Printed ONLY after tokens were compared.
+  // Printed ONLY after tokens were compared. The bound travels WITH the claim:
+  // this line is quoted as proof, so it states its own measured sensitivity
+  // (x1.02 and x1.10 fp8-scale perturbations are REACHED and still emit these
+  // same 16 tokens; x2.0 fails). See the header block.
   MESSAGE("qwen27n_fp8_tower: FP8 tower 16/16 token-exact vs vLLM "
-          "@0893e160");
+          "@0893e160 — GROSS fp8-defect sensitivity ONLY (measured: x1.10 "
+          "scale perturbation is reached and still passes); NOT a bound on "
+          "fp8 numerics");
 }
