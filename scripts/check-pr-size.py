@@ -568,6 +568,10 @@ def load_role_discipline():
     return module
 
 
+EVIDENCE_REQUIRED_TOOLS = {
+    "tests.scripts.test_check_windows_portability": ("cmake", "ninja"),
+}
+
 
 
 def _prepare_evidence_tools(container: Path, module: str) -> Path:
@@ -575,8 +579,7 @@ def _prepare_evidence_tools(container: Path, module: str) -> Path:
 
     tools = container / "tools"
     tools.mkdir()
-    required = {"tests.scripts.test_check_windows_portability": ("ninja",)}
-    for name in required.get(module, ()):
+    for name in EVIDENCE_REQUIRED_TOOLS.get(module, ()):
         source = shutil.which(name)
         if source is None:
             raise ValueError(f"semantic evidence requires executable {name}")
