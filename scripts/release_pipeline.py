@@ -17,6 +17,7 @@ PLAN_SCHEMA = "vllm.cpp.release-plan.v1"
 HANDOFF_SCHEMA = "vllm.cpp.release-handoff.v1"
 MATRIX_SCHEMA = "vllm.cpp.release-matrix.v1"
 RELEASE_INDEX_SCHEMA = "vllm.cpp.release-index.v1"
+RELEASE_VERSION_SCHEMA = "vllm.cpp.release-version.v1"
 CHANNELS = {"stable", "preview", "experimental-preview"}
 ARCHIVE_FORMATS = {"tar.gz", "zip"}
 PRIMARY_ARTIFACT_FORMATS = {
@@ -32,6 +33,9 @@ PRIMARY_ARTIFACT_FORMATS = {
     "windows-x86_64-msvc-vulkan": "zip",
 }
 RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
+SEMANTIC_VERSION = re.compile(
+    r"(?P<project>[0-9]+\.[0-9]+\.[0-9]+)(?P<suffix>[-+][0-9A-Za-z.-]+)?"
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -67,6 +71,34 @@ def canonical_archive_name(version: str, artifact_id: str, archive_format: str) 
     if archive_format not in ARCHIVE_FORMATS:
         raise ValueError(f"archive format must be one of {sorted(ARCHIVE_FORMATS)}")
     return f"vllm.cpp-{version}-{artifact_id}.{archive_format}"
+
+
+def validate_release_version(declaration: dict[str, Any]) -> dict[str, Any]:
+    if set(declaration) != {
+        "prerelease", "project_version", "schema", "tag", "version"
+    }:
+        raise ValueError("release version declaration has unknown or missing fields")
+    if declaration.get("schema") != RELEASE_VERSION_SCHEMA:
+        raise ValueError(f"release version schema must be {RELEASE_VERSION_SCHEMA}")
+    version = declaration.get("version")
+    project_version = declaration.get("project_version")
+    tag = declaration.get("tag")
+    prerelease = declaration.get("prerelease")
+    match = SEMANTIC_VERSION.fullmatch(version) if isinstance(version, str) else None
+    if match is None:
+        raise ValueError("release version must be a semantic version")
+    if not isinstance(project_version, str) or re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+", project_version
+    ) is None:
+        raise ValueError("project version must be numeric CMake SemVer")
+    if match.group("project") != project_version:
+        raise ValueError("release version must extend the declared project version")
+    if not isinstance(tag, str) or tag != f"v{version}":
+        raise ValueError("release tag must exactly match the declared version")
+    expected_prerelease = "-" in version.split("+", 1)[0]
+    if type(prerelease) is not bool or prerelease is not expected_prerelease:
+        raise ValueError("release prerelease state does not match its semantic version")
+    return dict(declaration)
 
 
 def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
@@ -108,12 +140,16 @@ def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def make_plan(
-    event: str, ref: str, source_sha: str, version: str, matrix: dict[str, Any]
+    event: str,
+    ref: str,
+    source_sha: str,
+    declaration: dict[str, Any],
+    matrix: dict[str, Any],
 ) -> dict[str, Any]:
     if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
         raise ValueError("source SHA must be a full lowercase 40-hex commit")
-    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version) is None:
-        raise ValueError("version must be a semantic version")
+    release = validate_release_version(declaration)
+    version = release["version"]
     artifacts = validate_matrix(matrix)
     if event == "workflow_dispatch":
         if not ref.startswith("refs/heads/"):
@@ -121,7 +157,7 @@ def make_plan(
         release_tag = f"dry-run-{source_sha[:12]}"
         publish = False
     elif event == "push":
-        release_tag = f"v{version}"
+        release_tag = release["tag"]
         if ref != f"refs/tags/{release_tag}":
             raise ValueError(f"release tag must exactly equal {release_tag}")
         publish = matrix["release_ready"]
@@ -130,6 +166,8 @@ def make_plan(
     return {
         "artifacts": artifacts,
         "event": event,
+        "prerelease": release["prerelease"],
+        "project_version": release["project_version"],
         "publish": publish,
         "release_tag": release_tag,
         "retention": matrix["retention"],
@@ -193,6 +231,8 @@ def handoff_value(plan_path: Path, assets_dir: Path) -> dict[str, Any]:
         "artifacts": plan.get("artifacts"),
         "files": inventory_assets(plan, assets_dir),
         "plan_sha256": file_sha256(plan_path),
+        "prerelease": plan.get("prerelease"),
+        "project_version": plan.get("project_version"),
         "publish": plan.get("publish"),
         "release_tag": plan.get("release_tag"),
         "retention": plan.get("retention"),
@@ -235,6 +275,18 @@ def publish_release(
         raise ValueError("release publication requires a verified publish handoff")
     if RELEASE_TAG.fullmatch(tag) is None or handoff.get("release_tag") != tag:
         raise ValueError("release tag does not match the verified handoff")
+    prerelease = handoff.get("prerelease")
+    project_version = handoff.get("project_version")
+    version = handoff.get("version")
+    if type(prerelease) is not bool or not isinstance(project_version, str):
+        raise ValueError("verified handoff has no authenticated release state")
+    validate_release_version({
+        "prerelease": prerelease,
+        "project_version": project_version,
+        "schema": RELEASE_VERSION_SCHEMA,
+        "tag": tag,
+        "version": version,
+    })
     if not assets_dir.is_dir():
         raise ValueError(f"asset directory does not exist: {assets_dir}")
     files = handoff.get("files")
@@ -273,6 +325,9 @@ def publish_release(
         index.get("schema") != RELEASE_INDEX_SCHEMA
         or index.get("release_tag") != tag
         or index.get("source_sha") != handoff.get("source_sha")
+        or index.get("version") != version
+        or index.get("project_version") != project_version
+        or index.get("prerelease") is not prerelease
     ):
         raise ValueError("release index identity does not match the verified handoff")
     index_rows = index.get("artifacts")
@@ -292,7 +347,6 @@ def publish_release(
                 or not isinstance(item.get("id"), str) or item["id"] in artifact_formats):
             raise ValueError("verified handoff artifact format is invalid")
         artifact_formats[item["id"]] = item["archive_format"]
-    version = handoff.get("version")
     indexed_archives: set[str] = set()
     for row in index_rows:
         if not isinstance(row, dict):
@@ -319,23 +373,32 @@ def publish_release(
     if any(not value or value not in markdown for value in required_markdown):
         raise ValueError("release Markdown index does not match the verified handoff")
 
-    subprocess.run(
-        [
-            "gh",
-            "release",
-            "create",
-            tag,
-            *(str(path) for path in actual_paths),
-            str(index_json),
-            str(index_markdown),
-            "--verify-tag",
-            "--title",
-            tag,
-            "--notes-file",
-            str(index_markdown),
-        ],
+    create = [
+        "gh",
+        "release",
+        "create",
+        tag,
+        *(str(path) for path in actual_paths),
+        str(index_json),
+        str(index_markdown),
+        "--verify-tag",
+        "--title",
+        tag,
+        "--notes-file",
+        str(index_markdown),
+    ]
+    if prerelease:
+        create.append("--prerelease")
+    subprocess.run(create, check=True)
+    result = subprocess.run(
+        ["gh", "release", "view", tag, "--json", "isDraft,isPrerelease,tagName"],
         check=True,
+        capture_output=True,
+        text=True,
     )
+    state = json.loads(result.stdout)
+    if state != {"isDraft": False, "isPrerelease": prerelease, "tagName": tag}:
+        raise ValueError("published GitHub release state does not match the verified handoff")
 
 
 def write_outputs(path: Path, values: dict[str, str | bool]) -> None:
@@ -354,7 +417,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     plan.add_argument("--event", required=True)
     plan.add_argument("--ref", required=True)
     plan.add_argument("--sha", required=True)
-    plan.add_argument("--version", required=True)
+    plan.add_argument("--release-version", type=Path, required=True)
     plan.add_argument("--matrix", type=Path, required=True)
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--github-output", type=Path)
@@ -381,7 +444,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         if args.command == "plan":
-            plan = make_plan(args.event, args.ref, args.sha, args.version, read_json(args.matrix))
+            plan = make_plan(
+                args.event,
+                args.ref,
+                args.sha,
+                read_json(args.release_version),
+                read_json(args.matrix),
+            )
             write_json(args.output, plan)
             if args.github_output:
                 write_outputs(

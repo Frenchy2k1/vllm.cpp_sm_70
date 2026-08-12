@@ -91,13 +91,17 @@ class ReleasePipelineContract(unittest.TestCase):
     def plan(self, event: str, ref: str, release_ready: bool = False):
         matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
         matrix["release_ready"] = release_ready
-        return self.pipeline.make_plan(event, ref, SHA, "0.0.1", matrix)
+        declaration = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
+        return self.pipeline.make_plan(event, ref, SHA, declaration, matrix)
 
     def test_manual_dispatch_is_always_a_non_publishing_dry_run(self) -> None:
         plan = self.plan("workflow_dispatch", "refs/heads/main", release_ready=True)
         self.assertFalse(plan["publish"])
         self.assertEqual(plan["release_tag"], f"dry-run-{SHA[:12]}")
         self.assertEqual(plan["source_sha"], SHA)
+        self.assertEqual(plan["version"], "0.0.3-pre.1")
+        self.assertEqual(plan["project_version"], "0.0.3")
+        self.assertTrue(plan["prerelease"])
 
     def test_release_version_declaration_is_the_single_prerelease_identity(self) -> None:
         declaration = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
@@ -113,6 +117,22 @@ class ReleasePipelineContract(unittest.TestCase):
         )
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn("project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)", cmake)
+
+    def test_release_version_declaration_rejects_every_identity_mismatch(self) -> None:
+        original = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
+        mutations = {
+            "version": "0.0.3",
+            "project_version": "0.0.4",
+            "tag": "v0.0.3-pre.2",
+            "prerelease": False,
+            "schema": "vllm.cpp.release-version.v0",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                mutant = copy.deepcopy(original)
+                mutant[field] = value
+                with self.assertRaises(ValueError):
+                    self.pipeline.validate_release_version(mutant)
 
     def test_workflow_has_two_exact_native_windows_preview_lanes(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -202,9 +222,10 @@ class ReleasePipelineContract(unittest.TestCase):
                 self.assertTrue(self.checker.validate(mutant), label)
 
     def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
-        self.assertFalse(self.plan("push", "refs/tags/v0.0.1")["publish"])
-        self.assertTrue(self.plan("push", "refs/tags/v0.0.1", release_ready=True)["publish"])
-        for ref in ("refs/tags/v0.0.2", "refs/heads/v0.0.1", "refs/tags/0.0.1"):
+        tag = "refs/tags/v0.0.3-pre.1"
+        self.assertFalse(self.plan("push", tag)["publish"])
+        self.assertTrue(self.plan("push", tag, release_ready=True)["publish"])
+        for ref in ("refs/tags/v0.0.3", "refs/tags/v0.0.3-pre.2", "refs/heads/v0.0.3-pre.1"):
             with self.subTest(ref=ref):
                 with self.assertRaises(ValueError):
                     self.plan("push", ref, release_ready=True)
@@ -329,7 +350,7 @@ class ReleasePipelineContract(unittest.TestCase):
             verified_path = root / "verified-handoff.json"
             assets = root / "assets"
             assets.mkdir()
-            archive = assets / "vllm.cpp-0.0.1-linux-x86_64-glibc-cpu.tar.gz"
+            archive = assets / "vllm.cpp-0.0.3-pre.1-linux-x86_64-glibc-cpu.tar.gz"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             (assets / f"{archive.name}.sha256").write_text(
@@ -358,7 +379,7 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_publish_ready_plan_requires_every_required_asset_triplet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            plan = self.plan("push", "refs/tags/v0.0.1", release_ready=True)
+            plan = self.plan("push", "refs/tags/v0.0.3-pre.1", release_ready=True)
             plan_path = root / "plan.json"
             self.pipeline.write_json(plan_path, plan)
             assets = root / "assets"
@@ -422,6 +443,8 @@ class ReleasePipelineContract(unittest.TestCase):
                 ],
                 "publish": True,
                 "release_tag": "v0.0.1",
+                "prerelease": False,
+                "project_version": "0.0.1",
                 "source_sha": SHA,
                 "verified": True,
                 "version": "0.0.1",
@@ -437,21 +460,34 @@ class ReleasePipelineContract(unittest.TestCase):
                     "sha256": digest,
                 }],
                 "release_tag": "v0.0.1",
+                "prerelease": False,
+                "project_version": "0.0.1",
                 "schema": "vllm.cpp.release-index.v1",
                 "source_sha": SHA,
+                "version": "0.0.1",
             })
             index_md.write_text(
                 f"# release v0.0.1\n\nSource: `{SHA}`\n\n{archive.name}\n"
             )
-            with mock.patch.object(self.pipeline.subprocess, "run") as run:
+            view = subprocess.CompletedProcess(
+                [], 0,
+                stdout='{"isDraft":false,"isPrerelease":false,"tagName":"v0.0.1"}\n',
+            )
+            with mock.patch.object(
+                self.pipeline.subprocess, "run", side_effect=[None, view]
+            ) as run:
                 self.pipeline.publish_release(
                     handoff_path, assets, index_json, index_md, "v0.0.1"
                 )
-            argv = run.call_args.args[0]
+            argv = run.call_args_list[0].args[0]
             self.assertEqual(argv[:4], ["gh", "release", "create", "v0.0.1"])
             self.assertFalse(any("*" in value or "?" in value for value in argv))
             self.assertIn(str(archive), argv)
-            run.assert_called_once()
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(
+                run.call_args_list[1].args[0],
+                ["gh", "release", "view", "v0.0.1", "--json", "isDraft,isPrerelease,tagName"],
+            )
 
             index = json.loads(index_json.read_text())
             index["source_sha"] = "f" * 40
@@ -460,6 +496,67 @@ class ReleasePipelineContract(unittest.TestCase):
                 self.pipeline.publish_release(
                     handoff_path, assets, index_json, index_md, "v0.0.1"
                 )
+
+    def test_prerelease_publication_sets_flag_and_verifies_github_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            artifact_id = "windows-x86_64-msvc-cpu"
+            archive = assets / f"vllm.cpp-0.0.3-pre.1-{artifact_id}.zip"
+            archive.write_bytes(b"release bytes")
+            digest = self.pipeline.file_sha256(archive)
+            for suffix in (".sha256", ".provenance.json"):
+                (assets / f"{archive.name}{suffix}").write_text("sidecar\n")
+            handoff = {
+                "artifacts": [{"archive_format": "zip", "channel": "preview",
+                               "id": artifact_id, "required": True}],
+                "files": [{"name": path.name,
+                           "sha256": self.pipeline.file_sha256(path),
+                           "size": path.stat().st_size}
+                          for path in sorted(assets.iterdir())],
+                "prerelease": True, "project_version": "0.0.3",
+                "publish": True, "release_tag": "v0.0.3-pre.1",
+                "source_sha": SHA, "verified": True, "version": "0.0.3-pre.1",
+            }
+            handoff_path = root / "handoff.json"
+            index_json = root / "index.json"
+            index_md = root / "index.md"
+            self.pipeline.write_json(handoff_path, handoff)
+            self.pipeline.write_json(index_json, {
+                "artifacts": [{"archive": archive.name, "id": artifact_id,
+                               "sha256": digest}],
+                "prerelease": True, "project_version": "0.0.3",
+                "release_tag": "v0.0.3-pre.1",
+                "schema": "vllm.cpp.release-index.v1", "source_sha": SHA,
+                "version": "0.0.3-pre.1",
+            })
+            index_md.write_text(f"v0.0.3-pre.1\n{SHA}\n{archive.name}\n")
+            good = subprocess.CompletedProcess(
+                [], 0,
+                stdout='{"isDraft":false,"isPrerelease":true,"tagName":"v0.0.3-pre.1"}\n',
+            )
+            with mock.patch.object(
+                self.pipeline.subprocess, "run", side_effect=[None, good]
+            ) as run:
+                self.pipeline.publish_release(
+                    handoff_path, assets, index_json, index_md, "v0.0.3-pre.1"
+                )
+            self.assertIn("--prerelease", run.call_args_list[0].args[0])
+
+            bad_states = (
+                {"isDraft": True, "isPrerelease": True, "tagName": "v0.0.3-pre.1"},
+                {"isDraft": False, "isPrerelease": False, "tagName": "v0.0.3-pre.1"},
+                {"isDraft": False, "isPrerelease": True, "tagName": "v0.0.3-pre.2"},
+            )
+            for state in bad_states:
+                with self.subTest(state=state), mock.patch.object(
+                    self.pipeline.subprocess, "run",
+                    side_effect=[None, subprocess.CompletedProcess([], 0, stdout=json.dumps(state))],
+                ), self.assertRaises(ValueError):
+                    self.pipeline.publish_release(
+                        handoff_path, assets, index_json, index_md, "v0.0.3-pre.1"
+                    )
 
     def test_publish_rejects_missing_or_mismatched_explicit_archive_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -552,8 +649,8 @@ class ReleasePipelineContract(unittest.TestCase):
                     "refs/heads/main",
                     "--sha",
                     SHA,
-                    "--version",
-                    "0.0.1",
+                    "--release-version",
+                    str(RELEASE_VERSION),
                     "--matrix",
                     str(MATRIX),
                     "--output",

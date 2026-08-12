@@ -27,14 +27,13 @@ jobs:
       - name: Compute an explicit dry-run or exact-tag plan
         id: plan
         run: |
-          version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["version"])')
           project_version=$(python3 -c 'import json; print(json.load(open("release/release-version.json"))["project_version"])')
           test "$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)" = "$project_version"
           python3 scripts/release_pipeline.py plan \
             --event '${{ github.event_name }}' \
             --ref '${{ github.ref }}' \
             --sha '${{ github.sha }}' \
-            --version "$version" \
+            --release-version release/release-version.json \
             --matrix release/release-matrix.json \
             --output release-plan.json \
             --github-output "$GITHUB_OUTPUT"

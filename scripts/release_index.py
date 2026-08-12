@@ -88,6 +88,10 @@ def generate_index(
     version = handoff.get("version")
     if not isinstance(version, str):
         raise ValueError("verified handoff has no release version")
+    project_version = handoff.get("project_version")
+    prerelease = handoff.get("prerelease")
+    if not isinstance(project_version, str) or type(prerelease) is not bool:
+        raise ValueError("verified handoff has no authenticated release state")
     declared = handoff.get("artifacts")
     if not isinstance(declared, list):
         raise ValueError("verified handoff has no explicit artifact formats")
@@ -160,6 +164,8 @@ def generate_index(
         )
     index = {
         "artifacts": rows,
+        "prerelease": prerelease,
+        "project_version": project_version,
         "release_tag": handoff.get("release_tag"),
         "retention": {
             "ci_artifacts_days": retention_days,
@@ -167,6 +173,7 @@ def generate_index(
         },
         "schema": SCHEMA,
         "source_sha": handoff.get("source_sha"),
+        "version": version,
     }
     json_output.parent.mkdir(parents=True, exist_ok=True)
     json_output.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -174,6 +181,7 @@ def generate_index(
         f"# vllm.cpp {index['release_tag']} binary index",
         "",
         f"Source: `{index['source_sha']}`",
+        f"Prerelease: `{str(prerelease).lower()}`",
         "",
         "| Artifact | Channel | Host ABI | Backend | CPU tiers / CUDA SMs | Boundary and limitations |",
         "|---|---|---|---|---|---|",
