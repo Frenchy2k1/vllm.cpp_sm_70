@@ -42,11 +42,24 @@ this file claimed more than it delivered.
     directions: every `unpinned=True` idiom must be reported and every
     `unpinned=False` one must not. That is what makes "the checker cannot be
     greened by narrowing its own pattern" a testable claim rather than an
-    assertion — narrowing any single branch (the enumerator alternation, the
-    `fs::` spelling, the scanned roots, the scanned suffixes, the subject-binding
-    rule) drops at least one positive fixture, and dropping the binding rule
-    entirely raises at least one negative. It is still only as good as the
-    corpus: an idiom nobody wrote a fixture for is not covered by the claim.
+    assertion — but THE CLAIM IS BOUNDED BY THE CORPUS, and the bound is the
+    honest part of it.
+
+    What is mechanically guaranteed, one branch at a time: dropping any single
+    entry of `ENUMERATORS`, or any single entry of `CACHE_MARKERS`, stops at
+    least one positive fixture being reported. That is not asserted here, it is
+    PERFORMED — tests/scripts/test_check_snapshot_pins.py
+    ::test_narrowing_any_single_branch_drops_a_positive_fixture carries out each
+    drop and fails if the corpus shrugs it off. Adding an enumerator or a marker
+    without a fixture that isolates it is RED there, so the two lists cannot
+    outgrow their coverage.
+
+    What is NOT guaranteed: every other narrowing — the `fs::` spelling, the
+    scanned roots, the scanned suffixes, the subject-binding rule — is covered
+    only in so far as some fixture happens to exercise it, and an idiom nobody
+    wrote a fixture for is not covered by the claim at all. The first version of
+    this file said "a mutation to any single branch lands on one of them"
+    without that bound; four single-branch narrowings then passed it.
 
 ON THE LEDGER. It exists because the files listed in LEDGER cannot be pinned
 today: their goldens record no revision at all (19 `*_greedy*` corpora have no
@@ -100,12 +113,25 @@ SCANNED_SUFFIXES = CXX_SUFFIXES | PY_SUFFIXES
 # This checker and its suite carry unpinned resolvers as FIXTURE TEXT, by
 # construction. Excluded BY EXACT PATH — never by a directory rule, which would
 # also excuse every future file dropped beside them.
-SELF_EXCLUDED = frozenset(
-    {
-        "scripts/check-snapshot-pins.py",
-        "tests/scripts/test_check_snapshot_pins.py",
-    }
-)
+#
+# THIS IS NOT A SECOND LEDGER, and it used not to say so mechanically: while it
+# was a bare `frozenset`, adding any real gate path to it left the checker, the
+# self-test and the suite all green, which made it the cheapest way to excuse a
+# new unpinned gate — cheaper than `LEDGER`, which at least owes a tracking
+# issue and is held to the STALE ratchet. `check_self_exclusion` now holds it to
+# BOTH of those and to a third rule `LEDGER` does not need: an entry must be
+# this checker's own fixture text, identified by file stem, so a path that is
+# not `check-snapshot-pins` or `test_check_snapshot_pins` is refused outright
+# rather than silently obeyed.
+SELF_EXCLUDED: dict[str, str] = {
+    "scripts/check-snapshot-pins.py": "the FIXTURES corpus lives here (#471)",
+    "tests/scripts/test_check_snapshot_pins.py": "this checker's own suite (#471)",
+}
+
+# The only two stems `SELF_EXCLUDED` may name, derived from this file rather than
+# written out, so a rename cannot leave the rule pointing at nothing.
+SELF_STEM = pathlib.Path(__file__).stem
+SELF_EXCLUDABLE_STEMS = frozenset({SELF_STEM, "test_" + SELF_STEM.replace("-", "_")})
 
 # --------------------------------------------------------------------------- #
 # The pattern
@@ -121,7 +147,20 @@ CACHE_MARKERS = (
     "HF_HOME",
     "TRANSFORMERS_CACHE",
 )
-CACHE_MARKER_RE = re.compile("|".join(re.escape(m) for m in CACHE_MARKERS))
+
+
+def marker_re(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """The marker alternation, as a function of the list.
+
+    A function rather than one inline `re.compile` so the suite can build the
+    pattern MINUS one branch and prove a fixture notices, without restating the
+    pattern — a restated pattern in a test drifts from the real one and then
+    proves nothing about it.
+    """
+    return re.compile("|".join(re.escape(m) for m in markers))
+
+
+CACHE_MARKER_RE = marker_re(CACHE_MARKERS)
 
 # Every way this tree enumerates a directory, C++ and Python. `readdir`/`scandir`
 # are listed with `opendir` because the POSIX idiom resolves at the `opendir`.
@@ -138,9 +177,16 @@ ENUMERATORS = (
     "iglob",
     "glob",
 )
-ENUMERATOR_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:" + "|".join(ENUMERATORS) + r")[ \t\r\n]*\("
-)
+
+
+def enumerator_re(enumerators: tuple[str, ...]) -> re.Pattern[str]:
+    """The enumerator alternation, as a function of the list. See `marker_re`."""
+    return re.compile(
+        r"(?<![A-Za-z0-9_])(?:" + "|".join(enumerators) + r")[ \t\r\n]*\("
+    )
+
+
+ENUMERATOR_RE = enumerator_re(ENUMERATORS)
 
 RECEIVER_SEPARATORS = (".", "::", "->")
 RECEIVER_CLOSERS = {")": "(", "]": "["}
@@ -469,6 +515,57 @@ def check_ledger_shape() -> list[str]:
     return problems
 
 
+def check_self_exclusion(root: pathlib.Path) -> list[str]:
+    """`SELF_EXCLUDED` is this checker's own fixture text, and nothing else.
+
+    Three rules, two of them the ones `LEDGER` already carries and the third the
+    reason this list may stay shorter than a ledger:
+
+      * a reason naming a tracking issue, exactly as `check_ledger_shape` wants;
+      * OWNERSHIP — the stem must be this file's or its suite's. A gate path
+        added here is refused rather than obeyed, which is the whole point: an
+        exclusion that can name any file is a ledger with no ratchet and no
+        review event, and it would be the cheapest way to green the checker for
+        a new unpinned gate;
+      * STALE — a listed file that EXISTS in `root` and no longer reads as a
+        resolution has stopped needing the exclusion, so the line must go. A
+        listed file that is absent from `root` is not flagged: the fixture
+        sweeps run `check()` against synthesised trees that contain neither of
+        these files, and a rule that fired there would fire on every fixture.
+    """
+    problems = []
+    for rel, reason in sorted(SELF_EXCLUDED.items()):
+        if not LEDGER_ISSUE_RE.search(reason or ""):
+            problems.append(
+                f"SELF_EXCLUDED line without a tracking issue: {rel}\n"
+                "    Name the issue, exactly as a LEDGER line must."
+            )
+        if pathlib.PurePosixPath(rel).stem not in SELF_EXCLUDABLE_STEMS:
+            problems.append(
+                f"SELF_EXCLUDED names a file that is not this checker: {rel}\n"
+                "    SELF_EXCLUDED is NOT a second ledger. It excuses the two\n"
+                "    files that carry the FIXTURES corpus, because they hold\n"
+                "    unpinned resolvers as TEXT by construction. A gate belongs\n"
+                "    in LEDGER, where it owes a tracking issue, a STALE ratchet\n"
+                "    and an argument in the commit message -- or, better, in\n"
+                "    parity::HfSnapshot."
+            )
+            continue
+        path = root / rel
+        if not path.is_file():
+            continue
+        if not resolutions_in(
+            path.read_text(encoding="utf-8", errors="replace"),
+            python=path.suffix in PY_SUFFIXES,
+        ):
+            problems.append(
+                f"STALE self-exclusion: {rel} no longer reads as a resolution.\n"
+                "    Delete the line. An exclusion that outlives its fixture\n"
+                "    text starts excusing whatever lands in that file next."
+            )
+    return problems
+
+
 def unpinned_resolutions(root: pathlib.Path) -> dict[str, list[int]]:
     """{relpath: [line numbers]} for every unpinned checkpoint resolution."""
     found: dict[str, list[int]] = {}
@@ -493,7 +590,7 @@ def unpinned_resolutions(root: pathlib.Path) -> dict[str, list[int]]:
 
 def check(root: pathlib.Path) -> list[str]:
     findings = unpinned_resolutions(root)
-    problems: list[str] = check_ledger_shape()
+    problems: list[str] = check_ledger_shape() + check_self_exclusion(root)
     for rel, lines in sorted(findings.items()):
         if rel not in LEDGER:
             where = ", ".join(f"{rel}:{n}" for n in lines)
@@ -781,6 +878,158 @@ std::string Resolve(const fs::path& hub) {
         unpinned=True,
         kills="requiring the literal word `snapshots`",
     ),
+    # ---- One fixture per ENUMERATOR the corpus did not ISOLATE. ----
+    #
+    # `posix_opendir` above exercises `opendir` AND `readdir`, and `d` is marked
+    # by the assignment, so EITHER alone keeps it detected and neither is under
+    # test. Same shape for the four enumerators that had no fixture at all. Each
+    # of these uses exactly ONE enumerator, so dropping that entry from
+    # `ENUMERATORS` is the only way to make it stop being reported.
+    Fixture(
+        name="opendir_alone",
+        rel="tests/parity/test_opendir_alone.cpp",
+        body="""#include <dirent.h>
+#include <string>
+DIR* Resolve(const std::string& base) {
+  const std::string snaps = base + "/snapshots";
+  return opendir(snaps.c_str());
+}
+""",
+        unpinned=True,
+        kills="dropping `opendir` — `posix_opendir` survives it on its `readdir`",
+    ),
+    Fixture(
+        name="readdir_alone",
+        rel="tests/parity/test_readdir_alone.cpp",
+        body="""#include <dirent.h>
+#include <string>
+std::string FirstEntry(DIR* snapshots_dir) {
+  struct dirent* e = readdir(snapshots_dir);
+  return e ? e->d_name : "";
+}
+""",
+        unpinned=True,
+        kills="dropping `readdir` — `posix_opendir` survives it on its `opendir`",
+    ),
+    Fixture(
+        name="scandir_alone",
+        rel="tests/parity/test_scandir_alone.cpp",
+        body="""#include <dirent.h>
+#include <string>
+int Resolve(const std::string& base, struct dirent*** out) {
+  const std::string snaps = base + "/snapshots";
+  return scandir(snaps.c_str(), out, nullptr, alphasort);
+}
+""",
+        unpinned=True,
+        kills="dropping `scandir`, which no fixture covered at all",
+    ),
+    Fixture(
+        name="listdir_alone",
+        rel="tools/bench/listdir_snapshot.py",
+        body='''import os
+
+
+def resolve(cache):
+    base = os.path.join(cache, "snapshots")
+    return sorted(os.listdir(base))[0]
+''',
+        unpinned=True,
+        kills="dropping `listdir`, which no fixture covered at all",
+    ),
+    Fixture(
+        name="walk_alone",
+        rel="tests/tools/walk_snapshot.py",
+        body='''import os
+
+
+def resolve(cache):
+    base = os.path.join(cache, "snapshots")
+    for root, dirs, _files in os.walk(base):
+        return os.path.join(root, sorted(dirs)[0])
+    return ""
+''',
+        unpinned=True,
+        kills="dropping `walk`, which no fixture covered at all",
+    ),
+    Fixture(
+        name="iglob_alone",
+        rel="tools/bench/iglob_snapshot.py",
+        body='''import glob
+import os
+
+
+def resolve(cache):
+    base = os.path.join(cache, "snapshots")
+    return next(iter(sorted(glob.iglob(os.path.join(base, "*")))))
+''',
+        unpinned=True,
+        kills="dropping `iglob` — plain `glob` cannot match inside it",
+    ),
+    Fixture(
+        name="rglob_alone",
+        rel="tests/tools/rglob_snapshot.py",
+        body='''import pathlib
+
+
+def resolve(cache: pathlib.Path) -> pathlib.Path:
+    base = cache / "snapshots"
+    return sorted(base.rglob("config.json"))[0]
+''',
+        unpinned=True,
+        kills="dropping `rglob` — plain `glob` cannot match inside it",
+    ),
+    # ---- One fixture per CACHE_MARKER the corpus did not ISOLATE. ----
+    #
+    # The three environment markers had NO fixture, while the commit that added
+    # them asserted they "ARE caught". They are — but nothing proved it, and
+    # deleting all three left every gate green. Each of these carries exactly ONE
+    # marker: no `snapshots`, no `models--`.
+    Fixture(
+        name="hf_hub_cache_env_marker",
+        rel="tools/bench/hub_env_resolve.py",
+        body='''import os
+import pathlib
+
+
+def resolve() -> pathlib.Path:
+    hub = pathlib.Path(os.environ["HF_HUB_CACHE"])
+    return sorted(hub.iterdir())[0]
+''',
+        unpinned=True,
+        kills="dropping the `HF_HUB_CACHE` marker, which no fixture covered",
+    ),
+    Fixture(
+        name="hf_home_env_marker",
+        rel="tests/parity/test_hf_home_env.cpp",
+        body="""#include <cstdlib>
+#include <filesystem>
+namespace fs = std::filesystem;
+std::string Resolve() {
+  const fs::path hub = fs::path(std::getenv("HF_HOME")) / "hub";
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(hub, ec))
+    return e.path().string();
+  return "";
+}
+""",
+        unpinned=True,
+        kills="dropping the `HF_HOME` marker, which no fixture covered",
+    ),
+    Fixture(
+        name="transformers_cache_env_marker",
+        rel="tests/tools/transformers_cache_resolve.py",
+        body='''import glob
+import os
+
+
+def resolve():
+    root = os.environ.get("TRANSFORMERS_CACHE", "")
+    return sorted(glob.glob(os.path.join(root, "*")))[0]
+''',
+        unpinned=True,
+        kills="dropping the `TRANSFORMERS_CACHE` marker, which no fixture covered",
+    ),
     # ---- NEGATIVES. These are what a WIDENING breaks. ----
     Fixture(
         name="pinned_resolver",
@@ -908,6 +1157,21 @@ def self_test() -> int:
     shape = check_ledger_shape()
     print(f"self-test {'ok  ' if not shape else 'FAIL'} {'every ledger line names an issue':<38}")
     if shape:
+        failures += 1
+
+    # SELF_EXCLUDED is not a second ledger: a gate path added to it is refused.
+    SELF_EXCLUDED["tests/parity/test_some_other_gate.cpp"] = "borrowed (#471)"
+    try:
+        rogue = [p for p in check_self_exclusion(REPO_ROOT) if "not this checker" in p]
+    finally:
+        del SELF_EXCLUDED["tests/parity/test_some_other_gate.cpp"]
+    print(f"self-test {'ok  ' if rogue else 'FAIL'} {'self-exclusion refuses a gate path':<38}")
+    if not rogue:
+        failures += 1
+
+    exclusion = check_self_exclusion(REPO_ROOT)
+    print(f"self-test {'ok  ' if not exclusion else 'FAIL'} {'self-exclusion list is well formed':<38}")
+    if exclusion:
         failures += 1
     return failures
 

@@ -114,12 +114,27 @@ class SnapshotPinChecker(unittest.TestCase):
         self.assertEqual(set(), pinned_by_this_row & set(mod.LEDGER))
 
     def test_the_fixture_corpus_sweeps_both_directions(self) -> None:
-        """The claim "it cannot be greened by narrowing its pattern", made testable.
+        """The claim "it cannot be greened by narrowing its pattern", BOUNDED.
 
         One fixture proves only that the checker matches THAT fixture. This drives
         the whole corpus: every positive is an idiom some plausible narrowing would
-        drop, every negative is code some plausible widening would falsely flag, so
-        a mutation to any single branch of the pattern lands on one of them.
+        drop, every negative is code some plausible widening would falsely flag.
+
+        This test used to close on "so a mutation to any single branch of the
+        pattern lands on one of them". That was not true and this row exists
+        because it was not: dropping the three environment `CACHE_MARKERS`, or
+        `scandir`/`walk`/`iglob`/`rglob`, or `listdir`, or `readdir` each left
+        this test, the self-test and the checker green. Only 4 of 11 enumerators
+        and 2 of 5 markers were isolated by a fixture.
+
+        The claim it makes now is the bounded one: the corpus catches narrowings
+        the corpus COVERS, and what it covers is no longer a matter of trust.
+        `test_narrowing_any_single_branch_drops_a_positive_fixture` performs each
+        single-branch drop of `ENUMERATORS` and `CACHE_MARKERS` and requires a
+        fixture to notice. Narrowings outside those two lists -- the `fs::`
+        spelling, the scanned roots and suffixes, the subject-binding rule -- are
+        covered only where a fixture happens to exercise them, and an idiom
+        nobody wrote a fixture for is not covered at all.
         """
         self.assertGreaterEqual(len(mod.FIXTURES), 13, "the corpus must cover a class")
         self.assertTrue(any(f.unpinned for f in mod.FIXTURES))
@@ -140,6 +155,132 @@ class SnapshotPinChecker(unittest.TestCase):
                     f"{fixture.name} ({fixture.rel}): {fixture.kills or 'must stay clean'}",
                 )
 
+    def _reports(self, fixture) -> bool:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            self._tree(tmp, fixture.body, fixture.rel)
+            return any(
+                "UNPINNED checkpoint resolution" in p for p in mod.check(tmp)
+            )
+
+    def _positives_lost_to(self, **narrowed) -> list[str]:
+        """Names of positive fixtures the checker stops reporting under `narrowed`.
+
+        The narrowed pattern is built by the checker's OWN `enumerator_re` /
+        `marker_re`, never restated here: a pattern copied into a test drifts
+        from the one that ships and then proves nothing about it.
+        """
+        saved = {name: getattr(mod, name) for name in narrowed}
+        try:
+            for name, value in narrowed.items():
+                setattr(mod, name, value)
+            return [
+                f.name for f in mod.FIXTURES if f.unpinned and not self._reports(f)
+            ]
+        finally:
+            for name, value in saved.items():
+                setattr(mod, name, value)
+
+    def test_narrowing_any_single_branch_drops_a_positive_fixture(self) -> None:
+        """The corpus's bound, PERFORMED rather than asserted.
+
+        The failure this row repairs was not a wrong pattern, it was an unearned
+        claim: the corpus asserted it caught every single-branch narrowing while
+        7 of 11 enumerators and 3 of 5 markers had no fixture that isolated them,
+        so deleting them was free. Restating the claim more carefully fixes the
+        honesty and not the hole.
+
+        So the coverage is checked one branch at a time, by actually removing the
+        branch. An enumerator or marker added to the checker without a fixture
+        that isolates it fails HERE, which is what keeps the two lists from
+        outgrowing the corpus again. It says nothing about narrowings outside
+        those two lists; see the docstring above for what stays uncovered.
+        """
+        for enumerator in mod.ENUMERATORS:
+            with self.subTest(enumerator=enumerator):
+                narrowed = tuple(e for e in mod.ENUMERATORS if e != enumerator)
+                self.assertTrue(
+                    self._positives_lost_to(
+                        ENUMERATOR_RE=mod.enumerator_re(narrowed)
+                    ),
+                    f"dropping the `{enumerator}` enumerator leaves every positive "
+                    "fixture still detected: no fixture isolates it, so the "
+                    "branch is unenforced. Add one that uses it and no other "
+                    "enumerator.",
+                )
+        for marker in mod.CACHE_MARKERS:
+            with self.subTest(marker=marker):
+                narrowed = tuple(m for m in mod.CACHE_MARKERS if m != marker)
+                self.assertTrue(
+                    self._positives_lost_to(CACHE_MARKER_RE=mod.marker_re(narrowed)),
+                    f"dropping the `{marker}` cache marker leaves every positive "
+                    "fixture still detected: no fixture isolates it, so the "
+                    "branch is unenforced. Add one that carries it and no other "
+                    "marker.",
+                )
+
+    def test_the_narrowing_sweep_restores_the_checker(self) -> None:
+        """The sweep above monkeypatches module state; a leak would fake a pass."""
+        before = (mod.ENUMERATOR_RE.pattern, mod.CACHE_MARKER_RE.pattern)
+        self._positives_lost_to(
+            ENUMERATOR_RE=mod.enumerator_re(("directory_iterator",)),
+            CACHE_MARKER_RE=mod.marker_re(("models--",)),
+        )
+        self.assertEqual(
+            before, (mod.ENUMERATOR_RE.pattern, mod.CACHE_MARKER_RE.pattern)
+        )
+        self.assertEqual(
+            mod.ENUMERATOR_RE.pattern, mod.enumerator_re(mod.ENUMERATORS).pattern
+        )
+        self.assertEqual(
+            mod.CACHE_MARKER_RE.pattern, mod.marker_re(mod.CACHE_MARKERS).pattern
+        )
+
+    def test_self_exclusion_refuses_a_path_that_is_not_this_checker(self) -> None:
+        """SELF_EXCLUDED was the cheapest way to green the checker for a new gate.
+
+        `LEDGER` owes a tracking issue and is held to the STALE ratchet.
+        SELF_EXCLUDED, as a bare frozenset, owed neither -- so adding any real
+        gate path to it left checker, self-test and suite all green, and the gate
+        it named was never inspected again. It is not a second ledger and now
+        refuses to be used as one.
+        """
+        rogue = "tests/parity/test_qwen36_paged_engine.cpp"
+        self.assertNotIn(rogue, mod.SELF_EXCLUDED)
+        mod.SELF_EXCLUDED[rogue] = "borrowed for a gate (#471)"
+        try:
+            problems = mod.check_self_exclusion(REPO_ROOT)
+        finally:
+            del mod.SELF_EXCLUDED[rogue]
+        self.assertTrue(
+            any("not this checker" in p for p in problems),
+            f"{rogue} was accepted into SELF_EXCLUDED",
+        )
+
+    def test_self_exclusion_refuses_a_line_with_no_tracking_issue(self) -> None:
+        mod.SELF_EXCLUDED["tests/scripts/test_check_snapshot_pins.py"] = "because"
+        try:
+            problems = mod.check_self_exclusion(REPO_ROOT)
+        finally:
+            mod.SELF_EXCLUDED["tests/scripts/test_check_snapshot_pins.py"] = (
+                "this checker's own suite (#471)"
+            )
+        self.assertTrue(any("without a tracking issue" in p for p in problems))
+
+    def test_self_exclusion_refuses_a_line_whose_file_is_now_clean(self) -> None:
+        """The STALE ratchet LEDGER has, applied to the exclusion list too."""
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            self._tree(tmp, "int main() { return 0; }\n", "scripts/check-snapshot-pins.py")
+            problems = mod.check_self_exclusion(tmp)
+        self.assertTrue(
+            any("STALE self-exclusion" in p for p in problems),
+            "an excluded file carrying no resolver text must lose its line",
+        )
+
+    def test_the_real_self_exclusion_list_is_well_formed(self) -> None:
+        self.assertEqual([], mod.check_self_exclusion(REPO_ROOT))
+
     def test_every_positive_fixture_records_the_narrowing_it_kills(self) -> None:
         """A fixture with no stated claim cannot be maintained; it just accretes."""
         for fixture in mod.FIXTURES:
@@ -156,11 +297,23 @@ class SnapshotPinChecker(unittest.TestCase):
 
         A checker wired only into scripts/agent-preflight.sh gates whoever chooses
         to run it. Both surfaces are asserted here so removing either is RED.
+
+        Each CI leg is asserted SEPARATELY, and that is not pedantry. The bare
+        `assertIn("scripts/check-snapshot-pins.py", workflow)` this test used to
+        make is satisfied by the plain invocation on its own, so deleting just
+        the `--self-test` leg -- the leg that sweeps the fixture corpus, which is
+        the entire substance of this row -- left CI green. A checker that runs
+        without its corpus is a checker nobody would notice going blind.
         """
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         preflight = (REPO_ROOT / "scripts/agent-preflight.sh").read_text(encoding="utf-8")
-        self.assertIn("scripts/check-snapshot-pins.py", workflow)
-        self.assertIn("tests/scripts/test_check_snapshot_pins.py", workflow)
+        for leg in (
+            "python3 scripts/check-snapshot-pins.py\n",
+            "python3 scripts/check-snapshot-pins.py --self-test\n",
+            "python3 tests/scripts/test_check_snapshot_pins.py\n",
+        ):
+            with self.subTest(leg=leg.strip()):
+                self.assertIn(leg, workflow, f"CI no longer runs `{leg.strip()}`")
         self.assertIn("check-snapshot-pins", preflight)
         self.assertIn("test_check_snapshot_pins", preflight)
 

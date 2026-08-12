@@ -179,6 +179,53 @@ and the checker is lexical and defeatable on purpose — `find(1)`, a marker-fre
 environment variable, or a `#define`d enumerator all still evade it. The module
 docstring states that scope, and is the authority on it.
 
+**The bound was stated in two places and asserted in a third, and the third
+still made the absolute claim.** A second fresh review found
+`tests/scripts/test_check_snapshot_pins.py::test_the_fixture_corpus_sweeps_both_directions`
+closing on "a mutation to any single branch of the pattern lands on one of
+them" — the exact sentence the paragraph above retracts — and then disproved it
+with four single-branch narrowings that left checker, self-test and suite all
+green: dropping the three environment `CACHE_MARKERS`
+(`HF_HUB_CACHE`/`HF_HOME`/`TRANSFORMERS_CACHE`), dropping
+`scandir`/`walk`/`iglob`/`rglob`, dropping `listdir`, and dropping `readdir`.
+Measured coverage at that point was **4 of 11 enumerators and 2 of 5 markers**
+isolated by some fixture. The environment markers were the sharpest case: the
+commit that added them asserted they "ARE caught", the branch is live, and no
+fixture touched it.
+
+Correcting the sentence again would have fixed the honesty and not the hole, so
+both were closed. Ten fixtures were added, each exercising exactly ONE
+uncovered enumerator or carrying exactly ONE uncovered marker, and the bound
+itself became mechanical:
+`test_narrowing_any_single_branch_drops_a_positive_fixture` builds the pattern
+minus one branch — through the checker's own `enumerator_re`/`marker_re`, never
+a restated copy — and requires some positive fixture to stop being reported, for
+all 11 enumerators and all 5 markers. **An enumerator or marker added to the
+checker without a fixture that isolates it is now RED**, so the two lists cannot
+outgrow their corpus a third time. What stays unguaranteed is unchanged and
+still stated: narrowings outside those two lists are covered only where a
+fixture happens to exercise them.
+
+Known gaps recorded rather than fixed here:
+[#482](https://github.com/mudler/vllm.cpp/issues/482) (the checker
+false-positives on the CORRECT pinned Python form, and the only relief is a
+ledger line — the ratchet running backwards),
+[#483](https://github.com/mudler/vllm.cpp/issues/483) (ordinary modern-C++
+punctuation — brace init, compound assignment, a lambda body severed by the
+`[;{}]` split — evades it, and no cheap subset closes the class),
+[#484](https://github.com/mudler/vllm.cpp/issues/484) (the CI step has never
+been observed on a real runner: UNVERIFIED, not absent and not successful), and
+[#485](https://github.com/mudler/vllm.cpp/issues/485)
+(`_MARK_FIXPOINT_ROUNDS = 6` truncates a long binding chain silently).
+
+`SELF_EXCLUDED` was a second, unguarded ledger and is no longer one. It excuses
+the two files that carry the corpus as text; as a bare `frozenset` it owed
+neither a tracking issue nor a STALE ratchet, so adding any real gate path to it
+left every gate green — strictly cheaper than `LEDGER`, which owes both.
+`check_self_exclusion` now applies both of `LEDGER`'s rules plus OWNERSHIP: an
+entry's file stem must be this checker's or its suite's, derived from
+`__file__`, so a gate path is refused outright rather than obeyed.
+
 ### 4. The skip must be loud and must name the revision
 
 Every converted gate's skip message names the repo **and** the pinned revision,
@@ -193,6 +240,8 @@ across ~40 gates and is not in scope here.
 |---|---|
 | `test_hf_snapshot_pinning` (new, CPU-only, no checkpoint needed) | that the resolver picks the pinned revision when a *decoy* revision of the same repo is also cached; that it returns "" (→ skip) when only the decoy is cached; that the env override still works and still requires `config.json` |
 | `scripts/check_snapshot_pins.py --self-test` | that the checker fails on a synthesised unpinned resolver |
+| `test_narrowing_any_single_branch_drops_a_positive_fixture` (new) | that the corpus's coverage claim is EARNED: it removes each of the 11 `ENUMERATORS` and each of the 5 `CACHE_MARKERS` in turn and requires a positive fixture to notice. An enumerator or marker added without an isolating fixture is RED |
+| `test_self_exclusion_refuses_a_path_that_is_not_this_checker` (new) + 3 siblings | that `SELF_EXCLUDED` cannot be used as a second, unguarded ledger: a gate path, a reason with no tracking issue, and an entry whose file no longer carries resolver text are each refused |
 | `python3 -m unittest tests.tools.test_online_gate_server_binary` | that the single-`kQwen27NvfP4Revision` assertion and the 35B contract update stay consistent — 20/20 before and after |
 | the 3 DFlash + 5 35B gates | build green; SKIP loudly and by name on a box without the pinned revision |
 
@@ -282,11 +331,43 @@ even under `Status: SUCCESS!`:
 | `test_op_parity` | 10 / 123 | 10 / 123 |
 | `test_hf_snapshot_pinning` | — (new) | 4 / 19 |
 | `tests.tools.test_online_gate_server_binary` | 20/20 | 20/20 |
-| `tests.scripts.test_check_snapshot_pins` | — (new) | 8/8 |
+| `tests.scripts.test_check_snapshot_pins` | — (new) | 8/8 → 13/13 → **19/19** |
 
 The zero-assertion `Status: SUCCESS!` shape on the checkpoint-gated arms is
 **not** repaired here and is not this row's defect; it is
 [#463](https://github.com/mudler/vllm.cpp/issues/463), open across ~40 gates.
+
+### Second review: the corpus bound, and the merge-forward
+
+The checker suite went 13 → **19** in the landing pass: six tests added, none
+removed and none weakened. The four narrowings that used to pass now fail, and
+each was confirmed GREEN on the pre-fix tree first, so the RED is the fix's and
+not an artifact:
+
+| single-branch narrowing | before | after |
+|---|---|---|
+| drop `HF_HUB_CACHE`/`HF_HOME`/`TRANSFORMERS_CACHE` | GREEN | **RED** |
+| drop `scandir`/`walk`/`iglob`/`rglob` | GREEN | **RED** |
+| drop `listdir` | GREEN | **RED** |
+| drop `readdir` | GREEN | **RED** |
+| add a gate path to `SELF_EXCLUDED` | GREEN | **RED** |
+| delete the `--self-test` leg from `ci.yml` | GREEN | **RED** |
+
+Detected files still equal the ledger exactly (55 = 55) with the 10 new
+fixtures in place, so the added coverage introduced no false positive on the
+real tree; the 5 shard-iteration negatives are unchanged. `tests/tools` 208/208,
+`test_online_gate_server_binary` 20/20.
+
+The merge-forward resolved `tests/parity/hf_snapshot.h` as a UNION — main's
+#466 `kQwen27nFp8TowerRevision` beside this row's `kQwen36A3bNvfP4Revision` and
+`kQwen27DFlashDraftRevision`, all four defined once and passed to `HfSnapshot`
+once. `scripts/agent-preflight.sh` is a keyed record, so its automatic
+three-way merge was discarded and main's version taken wholesale with this
+row's two lines reapplied.
+
+**UNVERIFIED on this host**: no `nvidia-smi`, no GPU. Every claim about a gate
+running its body against real weights remains owed, as does one observed run of
+the CI step (#484).
 
 ## Outcome
 
