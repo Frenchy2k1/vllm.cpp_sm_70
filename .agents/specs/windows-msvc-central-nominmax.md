@@ -126,3 +126,33 @@ diagnostic. After the checker repair, all five central/local/order cases pass.
 Removing central `NOMINMAX` from the real tree makes the direct checker reject
 the five affected shipped-closure translation units; restoring it makes the
 direct production checker pass.
+
+Second fresh review found two structural-fidelity defects in that checker
+repair. `_local_nominmax_definitions` enumerates a comment-deleted view, so its
+definition line numbers no longer share coordinates with the original source.
+The `windows.h` search then uses an offset from that shortened view as though it
+were an original-source offset. With the central contract removed, valid
+guarded fallbacks inserted before the header are therefore misordered in three
+of the five real closure translation units (`minimax_h3_sharded.cpp`,
+`fs_io.cpp`, and `cpu_threadpool.cpp`), while console shutdown and process happen
+to pass. The same local-definition scan leaves C++ literals active, so ordinary
+and raw strings containing directive-shaped text are falsely diagnosed.
+
+The checker repair must use one offset- and line-preserving view that blanks
+comments, ordinary strings, raw strings, and character literals for both
+directive parsing and `windows.h` location. No original/structural coordinates
+may be mixed. The existing `without_cpp_comments_and_literals` helper is the
+candidate only if direct tests prove it preserves every byte position and line
+boundary needed by the directive state machine.
+
+Recognized RED-first mutations must exercise the production checker over all
+five real shipped-closure translation units that include `windows.h` directly:
+MiniMax-H3 sharded loading, filesystem offload, CPU threadpool, console
+shutdown, and process launch. With the central contract removed, an independent
+valid absence-guarded fallback before the header must pass in each source; the
+same fallback after the header must fail in each. Active unguarded definitions
+must fail. Raw strings, ordinary strings, line comments, and block comments
+containing directive decoys must pass. Removing the central definition with no
+fallbacks must reject all five sources. The central CMake definition, all four
+source removals, `/W4 /WX`, guarded standalone fallbacks, and the release
+invocation remain unchanged.
