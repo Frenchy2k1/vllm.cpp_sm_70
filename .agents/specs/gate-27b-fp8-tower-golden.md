@@ -13,7 +13,9 @@ own goldens captured from the pinned oracle.
 
 **In scope:** a pinned resolver for `nvidia/Qwen3.6-27B-NVFP4`@`0893e160` in
 `tests/parity/hf_snapshot.h`; goldens under
-`tests/parity/goldens/qwen36_logits_27n/`; a new parity test that greedy-decodes
+`tests/parity/goldens/qwen36_{embed,gdn_layer,fullattn_layer,norm,logits}_27n/`
+(the paged-engine arm consumes `logits`; the other four are captured for the
+op-parity follow-on); a new parity test that greedy-decodes
 that checkpoint through the full paged engine and asserts the FP8 GDN
 input-projection dispatch contract **unconditionally**; a skip that cannot be
 read as coverage.
@@ -77,8 +79,10 @@ distinct name does not disturb it.
 
 ### 2. Goldens
 
-Captured by the EXISTING recipe, `tools/parity/dump_qwen36.py`, unmodified, with
-`--tag 27n`. Same prompt (`"The capital of France is Paris, and the"`), same
+Captured by the EXISTING recipe, `tools/parity/dump_qwen36.py`, with `--tag
+27n`. Its MEASURED behaviour is unmodified; only the manifest's provenance
+strings changed (see `## Outcome`), because the old hardcoded `detail` asserted a
+weight layout that is false for this checkpoint. Same prompt (`"The capital of France is Paris, and the"`), same
 `N_GREEDY = 16`, same `TOPK = 1000`, same `SamplingParams(temperature=0.0)`, same
 `LLM(enforce_eager=True, max_model_len=256, max_num_seqs=1, dtype="bfloat16")`,
 same manifest emitter. The engine config is load-bearing, not incidental:
@@ -113,8 +117,9 @@ The new arm differs from its sibling in exactly the places the checkpoint differ
   **unconditionally**. `Total() == 0` is a FAILURE here — it is the precise
   signature of gating a checkpoint with no FP8 tower, which is how this hole
   stayed open. That single inverted guard is the whole point of the row.
-- The engine's own quantization ownership is asserted before decoding: the
-  loaded model must report FP8 owners for the GDN input projections.
+- Packed GDN decode must issue ZERO launches, asserted against the REAL
+  predicate rather than `detail::PackedGdnDecodeEnvSelected`, which mirrors the
+  ENV couplings only and would demand 48 here (#470).
 - No `greedy_ids_emulation` comparison (§2).
 
 ### 4. A skip that cannot be mistaken for coverage
@@ -166,6 +171,118 @@ the addition is additive.
 - The gate host's GPU lock is held by another agent's campaign → hand back rather
   than contend.
 
+## Outcome
+
+`DONE`. The hole was real and is closed. What was measured, what was rejected,
+and what the arm still cannot see:
+
+### Both arms, same production build, dgx (GB10 sm_121a)
+
+`RelWithDebInfo`, `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a`; configure log verified
+to print `CUTLASS found … enabling sm120a NVFP4 cutlass GEMM`,
+`FlashAttention-2 prefill/decode: ENABLED`, and the `sm_121a` Triton-AOT lines.
+`ctest -j 1`, each arm alone, under `flock $HOME/gpu.lock`.
+
+| run | `qwen3_5_weights.cpp` | 27n arm | 27b arm (SACRED) |
+|---|---|---|---|
+| base | pristine | 236 asserts, **SUCCESS** | 235 asserts, SUCCESS |
+| mutant 1.02x | fp8 scale x1.02 | 236 asserts, SUCCESS | 235 asserts, SUCCESS |
+| mutant 1.10x | fp8 scale x1.10 | 236 asserts, SUCCESS | 235 asserts, SUCCESS |
+| **mutant 2.0x** | fp8 scale x2.0 | **236 asserts, 1 FAILED, ctest EXIT=8** | **235 asserts, SUCCESS** |
+| restored | pristine, forced recompile | 236 asserts, SUCCESS | 235 asserts, SUCCESS |
+
+The 2.0x row is the whole thesis in one binary. `LoadFp8RawShared` is the single
+external-linkage seam through which every FP8 GDN in_proj / out_proj /
+attention projection is loaded, and it is entered only for a projection whose
+on-disk dtype is `F8_E4M3`. Under the mutation the 27n arm printed five
+`[VT_RED_MUTATION]` reachability lines (layer 0 `in_proj_qkv`, `in_proj_z`,
+`out_proj`) and failed on `CHECK(got == want_prod)`. The SACRED arm printed
+**zero** — the mutated code was never called at all on its checkpoint — and
+passed 235/235. An fp8 defect that the SACRED gate structurally cannot observe
+is now observed.
+
+### The arm's SENSITIVITY, honestly
+
+A uniform **1.10x** perturbation of every FP8 weight scale and folded alpha is
+REACHED (five reachability lines) and still emits the identical 16 tokens. So
+this arm catches a gross fp8 defect and does NOT catch a ~10% per-tensor scale
+error. It is a token gate on one short prompt, not a numerical-tolerance gate,
+and it should never be quoted as if it bounded fp8 numerics.
+
+The fix for that is already paid for: this row captured
+`qwen36_{embed,gdn_layer,fullattn_layer,norm,logits}_27n` — per-tensor goldens
+with `atol/rtol` 1e-3 to 5e-2 and top-1000 logits — and only the `logits`
+directory is consumed so far. Giving `test_op_parity`'s Qwen27 arms a 27n
+counterpart against the committed tensors would catch the 1.10x case. Owed,
+not done here.
+
+### The token stream does not discriminate the checkpoints
+
+`@0893e160` and `@890bdef7` emit the SAME 16 greedy tokens on this prompt
+(`[6511, 314, 9564, 369, 19241, 13, 198, 760, 6511, 314, 9338, 369, 11751, 11,
+321, 279]`), and the same 9 prefill argmaxes. The token comparison alone would
+therefore NOT notice a wrong-checkpoint run. Two things carry that instead, and
+both are load-bearing rather than decorative: the revision-pinned resolver, and
+the unconditional `Total() != 0` fp8 dispatch assertion — which is the only
+thing in either arm that can tell the two checkpoints apart at runtime.
+
+### Skip behaviour, measured not asserted
+
+| invocation | assertions | status | exit |
+|---|---|---|---|
+| checkpoint present | 236 | SUCCESS | 0 |
+| absent | **1** | SUCCESS | 0 |
+| absent + `VT_REQUIRE_27N_FP8_GATE=1` | **0**, `test case THREW` | **FAILURE** | **1** |
+
+All three print the `NO-FP8-TOWER-COVERAGE` banner naming the exact revision.
+
+### Capture reproducibility
+
+Captured twice from two independent oracle loads of
+`0.23.1rc1.dev1511+g555967922` (identity asserted before each load). Every
+`.npy` is byte-identical between the two runs; only `manifest.json` differs, by
+the provenance fix below.
+
+### Rejected / repaired along the way
+
+- **`dump_qwen36.py`'s hardcoded `detail`.** It asserted "GDN in_proj, embed,
+  norms, lm_head are bf16" — true of `@890bdef7`, FALSE of `@0893e160`. A
+  manifest whose job is to say which model a golden belongs to must not state
+  the wrong layout for the next checkpoint captured, so `detail` now records
+  the engine-resolved `quantization` and `kv_cache_dtype`, and `--pin` records
+  the oracle revision actually run instead of inheriting `e24d1b24`. Measured
+  content, knobs and schema unchanged.
+- **`detail::PackedGdnDecodeEnvSelected` is NOT used by this arm.** It mirrors
+  the ENV couplings only; the real predicate additionally requires
+  `in_proj_qkv_fp8.Empty()` (`qwen3_5.cpp:4161-4165`). On an fp8 tower the mirror
+  would demand 48 packed launches where the truth is 0, so the sibling gate
+  would throw for the wrong reason if ever pointed here via
+  `VT_QWEN27_SNAPSHOT`. This arm pins the real behaviour (0) directly. The
+  mirror's drift is filed as [#470](https://github.com/mudler/vllm.cpp/issues/470).
+- **Two harness traps hit and recorded, because both FAIL OPEN silently.**
+  (1) `set -e` is disabled inside a function whose status is tested by `if`, so
+  the first capture's checkpoint-identity guard printed its own failure message
+  and carried on; the guard was re-run standalone afterwards and the checkpoint
+  is confirmed (96 FP8 `linear_attn.in_proj`, 48 `out_proj`, 192 W4A16 MLP).
+  (2) `shutil.copy2` restores the backup's ORIGINAL mtime, leaving the mutant
+  object NEWER than the restored source: the first "restored" run silently
+  re-used the mutant binary and reported GREEN. Caught by a reachability-line
+  count, not by reading the code. Restoration was only accepted after a forced
+  recompile and zero `[VT_RED_MUTATION]` lines.
+
+### Owed, explicitly
+
+- `tools/bench/online_gate.py::MODEL_GATE_CONTRACTS` still records
+  `test_qwen27_paged_engine` as `27n`'s precondition, i.e. build sanity on a
+  neighbour. Repointing it at this arm needs a `27n` online-gate run to
+  validate and is a separate row.
+- The three DFlash tests and the four 35B tests still resolve their snapshot by
+  unpinned `directory_iterator`; the DFlash trio reads the very repo known to
+  hold two revisions.
+- 27n op-parity arms against the four other committed 27n golden directories.
+
 ## Now
 
-`ACTIVE` — spec committed, implementation and evidence follow on this branch.
+`DONE` — arm landed with RED-mutation evidence; follow-ons above are separate
+rows.
