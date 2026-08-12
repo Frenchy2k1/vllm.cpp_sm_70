@@ -197,6 +197,97 @@ the cache to be in the hazardous state.
   Every runtime claim about a gate actually *running* against a checkpoint is
   therefore UNVERIFIED in this row and is recorded as such.
 
+## Evidence
+
+Host: CPU dev box, **no nvcc, no nvidia-smi**. Build `Release`,
+`-DVLLM_CPP_CUDA=OFF`, clean rebuild after the header change. `build_exit=0`
+captured alongside every run; zero warnings or errors in the final build log.
+Every claim below about a gate *running its body against real weights* is
+therefore **UNVERIFIED** — dgx.casa OOM-rebooted and was inspected read-only
+only, and no GPU work was queued.
+
+### The resolver, RED then GREEN
+
+`test_hf_snapshot_pinning` mutated by replacing the pinned join in
+`HfSnapshot` with exactly the unpinned `directory_iterator` the 56 other files
+use. Restoration verified by **checksum, not timestamp** — `cp -p`/`copy2`
+preserve mtime and a "restored" tree can silently re-run the mutant binary:
+
+| | source md5 | binary md5 | result |
+|---|---|---|---|
+| baseline | `cce879c9…` | `18184e6d…` | 4 cases / 19 assertions / SUCCESS / exit 0 |
+| mutant | `c7ee1a19…` | `9069b3f0…` | 2 cases FAILED / **5 assertions FAILED** / FAILURE / exit 1 |
+| restored | `cce879c9…` | `18184e6d…` | 4 cases / 19 assertions / SUCCESS / exit 0 |
+
+The mutant binary md5 differs from baseline, which is what proves the recompile
+actually happened rather than the old object being re-linked.
+
+### Selection and refusal, MEASURED on a synthetic two-revision cache
+
+Both revisions of `unsloth/Qwen3.6-27B-NVFP4` planted under a scratch `$HOME`.
+Readdir yields the pinned one first in this cache, i.e. the *unpinned* resolver
+would also have "passed" — which is exactly why the decoy-only case is the
+load-bearing one.
+
+| case | cache | all three DFlash gates |
+|---|---|---|
+| A | only `@ccdaab7e` (the FP8 re-quant) + the DFlash draft | SKIP, banner names `@890bdef7` and reports `got: ABSENT`. The repo is present and was **not** substituted. |
+| B | `@890bdef7` **and** `@ccdaab7e` | all three resolve `.../snapshots/890bdef7…`; **0 mentions of the decoy** in any output |
+
+In case B `test_qwen27_dflash_spec_decode` proceeds past the resolution and then
+fails loading the synthetic (empty) `config.json`, exit 1 — which is the
+"reaches its body when the pinned revision is present" half of the proof, on a
+box that cannot hold the real 27 GB checkpoint.
+
+### Assertion counts, before and after
+
+Baseline taken by stashing the working tree back to `origin/main` and rebuilding
+the same targets in place. Identical on both sides — a changed count would be RED
+even under `Status: SUCCESS!`:
+
+| gate | before | after |
+|---|---|---|
+| `test_qwen3_dflash_draft_parity` | 1 case / 0 assertions | 1 / 0 |
+| `test_qwen3_dflash_kvprep_parity` | 1 / 0 | 1 / 0 |
+| `test_qwen27_dflash_spec_decode` | 3 / 0 | 3 / 0 |
+| `test_qwen36_paged_engine` | 2 / 0 | 2 / 0 |
+| `test_qwen36_async_serving` | 1 / 0 | 1 / 0 |
+| `test_qwen36_spec_decode` | 1 / 0 | 1 / 0 |
+| `test_qwen36_weights` | 7 / 45 | 7 / 45 |
+| `test_op_parity` | 10 / 123 | 10 / 123 |
+| `test_hf_snapshot_pinning` | — (new) | 4 / 19 |
+| `tests.tools.test_online_gate_server_binary` | 20/20 | 20/20 |
+| `tests.scripts.test_check_snapshot_pins` | — (new) | 8/8 |
+
+The zero-assertion `Status: SUCCESS!` shape on the checkpoint-gated arms is
+**not** repaired here and is not this row's defect; it is
+[#463](https://github.com/mudler/vllm.cpp/issues/463), open across ~40 gates.
+
+## Outcome
+
+**What was measured.** The defect is real and latent rather than currently
+firing: readdir on the gate host yields `@890bdef7` first today, so no committed
+DFlash result is known to have been taken against the FP8 re-quant. The row
+converts luck into a guarantee.
+
+**What was rejected.** `prefer_single_file` — the heuristic
+`test_qwen27_dflash_spec_decode` already carried — was deleted rather than copied
+to the other two gates. It selects the right revision today only because
+`@890bdef7` happens to be the single-file one, its fallback returns the *last*
+entry seen, and it encodes a property the goldens correlate with instead of the
+identity they were captured against.
+
+Pinning the remaining ~48 gates was also rejected, for the reason that bounds the
+whole row: 80 of 92 committed goldens record no revision, so their pins would
+have to be invented. They are enumerated in the checker ledger and owed on #472.
+
+**Why the DFlash draft pin is set the way it is.** It is a determinism pin on a
+committed provenance record, explicitly not a ratified one. `ckpt_keys.txt`
+looked like it would ratify it and does not — it is vLLM's loaded-module
+namespace, 47 keys against the snapshot's 58. The header says so where a reader
+will hit it, and #472 owes the re-capture.
+
 ## Now
 
-`ACTIVE` — spec committed ahead of implementation.
+`ACTIVE` — implemented and gated on a CPU box; the GPU-side "runs against real
+weights" arm is UNVERIFIED and owed on a dgx window.

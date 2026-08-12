@@ -36,6 +36,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "hf_snapshot.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -63,16 +64,10 @@ vt::Queue GpuQ() {
   return q;
 }
 
-std::string SnapDir(const std::string& rel) {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  fs::path base = fs::path(home) / rel;
-  std::error_code ec;
-  if (!fs::exists(base, ec)) return "";
-  for (const auto& e : fs::directory_iterator(base, ec))
-    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
-  return "";
-}
+// GATE-PIN-UNPINNED-SNAPSHOTS (#471): the private `SnapDir` that used to live
+// here resolved `unsloth/Qwen3.6-27B-NVFP4` by readdir order, on a host caching
+// both @890bdef7 (NVFP4) and @ccdaab7e (the same repo re-quantized to FP8). It is
+// DELETED, not kept beside the pinned call. See parity::HfSnapshot.
 
 std::vector<std::string> Shards(const std::string& dir) {
   std::vector<std::string> out;
@@ -152,17 +147,26 @@ std::vector<T> IntVec(const json& j) {
 }  // namespace
 
 TEST_CASE("qwen3_dflash D3 context-KV + prepare + proposal parity vs the real vLLM draft") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend; skipping DFlash D3 kvprep parity");
-    return;
-  }
-  const std::string draft_dir =
-      SnapDir(".cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash/snapshots");
-  const std::string target_dir =
-      SnapDir(".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots");
+  // Resolve FIRST, then probe CUDA. The pinned revisions are reported on every
+  // box, including the CPU dev box that can never run the body -- a skip banner
+  // that says only "no CUDA backend" hides which checkpoint the gate would have
+  // demanded, and makes the pin unobservable exactly where it is cheapest to
+  // check.
+  const std::string draft_dir = parity::Qwen27DFlashDraftSnapshot();
+  const std::string target_dir = parity::Qwen27NvfP4Snapshot();
+  const bool has_cuda = HasCuda();
   const fs::path fdir = fs::path(PARITY_GOLDENS_DIR) / "dflash_27b_kvprep";
-  if (draft_dir.empty() || target_dir.empty() || !fs::exists(fdir / "ctxkv_ref.json")) {
-    MESSAGE("z-lab draft / NVFP4 target / D3 fixtures absent; skipping (dev box)");
+  if (!has_cuda || draft_dir.empty() || target_dir.empty() ||
+      !fs::exists(fdir / "ctxkv_ref.json")) {
+    MESSAGE("SKIP (dev box): DFlash D3 kvprep parity needs CUDA (got: "
+            << std::string(has_cuda ? "yes" : "NO") << "), "
+               "z-lab/Qwen3.6-27B-DFlash @"
+            << std::string(parity::kQwen27DFlashDraftRevision)
+            << " (got: " << (draft_dir.empty() ? "ABSENT" : draft_dir) << "), "
+            << "unsloth/Qwen3.6-27B-NVFP4 @" << std::string(parity::kQwen27NvfP4Revision)
+            << " (got: " << (target_dir.empty() ? "ABSENT" : target_dir) << "), "
+            << "and the D3 fixtures. A cache holding a DIFFERENT revision of "
+               "either repo skips rather than being substituted (#471).");
     return;
   }
 

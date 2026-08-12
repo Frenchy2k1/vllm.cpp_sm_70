@@ -26,6 +26,8 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 
+#include "hf_snapshot.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -56,20 +58,16 @@ class ScopedEnv {
 };
 
 // Resolve the pinned 35B snapshot's shard 1, or "" if unavailable.
+// GATE-PIN-UNPINNED-SNAPSHOTS (#471). Previously the first snapshot carrying a
+// shard-1 file, whichever revision that was. The 35B goldens name their revision
+// (`oracle.model` of goldens/qwen36_*_35b/manifest.json), so it is enforced.
 std::string FindShard1() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path snaps =
-      fs::path(home) /
-      ".cache/huggingface/hub/"
-      "models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots";
+  const std::string snap = parity::Qwen36A3bNvfP4Snapshot();
+  if (snap.empty()) return "";
+  const fs::path shard = fs::path(snap) / "model-00001-of-00003.safetensors";
   std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec)) {
-    const fs::path shard = e.path() / "model-00001-of-00003.safetensors";
-    if (fs::exists(shard, ec)) return shard.string();
-  }
-  return "";
+  if (!fs::exists(shard, ec)) return "";
+  return shard.string();
 }
 
 uint16_t Bf16At(const vllm::OwnedTensor& t, int64_t i) {
