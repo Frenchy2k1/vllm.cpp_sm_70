@@ -1,8 +1,8 @@
 # Native Windows binary release and pre-alpha publication
 
-Status: design approved by the developer on 2026-08-11; written-spec review
-pending. No implementation may start until this file is committed and the
-developer approves the committed text.
+Status: `ACTIVE`. Design approved by the developer on 2026-08-11. W14-W16 are
+implemented locally; native hosted Windows evidence, the merged-SHA ten-tuple
+dry run, prerelease publication, and the 32-asset audit remain pending.
 
 Identity: `ENG-RELEASE-WINDOWS`
 
@@ -364,7 +364,22 @@ published and the API audit has passed.
 - Ambiguity: tag, version, archive extension, toolchain, runner, channel,
   prerelease state, and post-publish evidence are exact.
 
+## Outcome
+
+W14 and W15 implement the Win32 portability substrate, native MSVC build,
+deterministic ZIP/PE validation, and Vulkan loader/metadata path. W16 adds the
+two read-only `windows-2022` jobs, a ten-tuple immutable handoff, and the single
+`0.0.3-pre.1` prerelease identity while retaining CMake's numeric `0.0.3`
+project version. Linux-hosted portability, release mutation suites, and local
+operator gates are the accepted local evidence. Native MSVC `/W4 /WX`,
+extracted Windows runtime/ISA execution, merged-SHA ten-tuple dry run,
+`v0.0.3-pre.1` publication, attestations, and the exact 32-asset API audit are
+not inferred from Linux and remain required hosted gates. Windows stays
+`preview`; no stable `v0.0.3` release is authorized by this row.
+
 ## Now
 
-Written spec committed for developer review. The row remains `INVENTORIED` and
-no implementation is authorized until that review accepts this exact text.
+`ACTIVE`; W14-W16 implementation is assembled for one PR. Next: fresh review,
+operator gate, native hosted PR CI, merge, and a non-publishing ten-tuple dry
+run on the exact merged SHA. Only after those gates may the authorized
+`v0.0.3-pre.1` prerelease be tagged and audited for exactly 32 assets.

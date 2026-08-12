@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PIPELINE = ROOT / "scripts/release_pipeline.py"
 CHECKER = ROOT / "scripts/check-release-workflow.py"
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+RELEASE_VERSION = ROOT / "release/release-version.json"
 BUILD_DRIVERS = (
     ROOT / "scripts/build-cpu-release.sh",
     ROOT / "scripts/build-linux-accelerator-release.sh",
@@ -52,6 +53,108 @@ class ReleasePipelineContract(unittest.TestCase):
         self.assertFalse(plan["publish"])
         self.assertEqual(plan["release_tag"], f"dry-run-{SHA[:12]}")
         self.assertEqual(plan["source_sha"], SHA)
+
+    def test_release_version_declaration_is_the_single_prerelease_identity(self) -> None:
+        declaration = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
+        self.assertEqual(
+            declaration,
+            {
+                "prerelease": True,
+                "project_version": "0.0.3",
+                "schema": "vllm.cpp.release-version.v1",
+                "tag": "v0.0.3-pre.1",
+                "version": "0.0.3-pre.1",
+            },
+        )
+        cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)", cmake)
+
+    def test_workflow_has_two_exact_native_windows_preview_lanes(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for job, backend, build_dir in (
+            ("cpu_windows", "cpu", "build-release-windows-cpu"),
+            ("vulkan_windows", "vulkan", "build-release-windows-vulkan"),
+        ):
+            with self.subTest(job=job):
+                block = self.checker.job_block(workflow, job)
+                self.assertTrue(block)
+                self.assertIn("    permissions:\n      contents: read", block)
+                self.assertNotIn("write", block.split("    runs-on:", 1)[0])
+                self.assertIn("    runs-on: windows-2022", block)
+                self.assertNotIn("windows-latest", block)
+                self.assertIn("SOURCE_SHA: ${{ github.sha }}", block)
+                self.assertIn("VERSION: ${{ needs.plan.outputs.version }}", block)
+                self.assertIn("./scripts/build-windows-release.ps1 -ContractTest", block)
+                self.assertIn(
+                    f"./scripts/build-windows-release.ps1 `\n"
+                    f"            -Backend {backend} `\n"
+                    f"            -ArtifactId windows-x86_64-msvc-{backend} `\n"
+                    f"            -BuildDir $env:GITHUB_WORKSPACE/{build_dir}",
+                    block,
+                )
+
+    def test_workflow_collects_exactly_ten_triplets_and_two_indexes(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        primary_jobs = (
+            "cpu_x86", "cpu_arm64", "cpu_musl", "cuda_x86", "cuda_arm64",
+            "vulkan_x86", "metal_arm64", "mlx_arm64", "cpu_windows",
+            "vulkan_windows",
+        )
+        build = self.checker.job_block(workflow, "build")
+        self.assertIn(
+            "    needs: [plan, " + ", ".join(primary_jobs) + "]",
+            build,
+        )
+        for job in primary_jobs:
+            self.assertEqual(
+                build.count(f"${{{{ needs.{job}.outputs.artifact_id }}}}"), 1
+            )
+        self.assertEqual(workflow.count(".provenance.json"), 10)
+        self.assertEqual(workflow.count(".sha256"), 10)
+        self.assertEqual(workflow.count("vllm.cpp-${{ needs.plan.outputs.version }}-"), 30)
+        verify = self.checker.job_block(workflow, "verify")
+        self.assertIn("--json-output verified/release-index.json", verify)
+        self.assertIn("--markdown-output verified/RELEASE_INDEX.md", verify)
+
+    def test_windows_workflow_contract_mutations_are_rejected(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(self.checker.validate(original), [])
+        mutations = {
+            "missing CPU job": ("  cpu_windows:\n", "  cpu_windows_removed:\n"),
+            "moving runner": ("    runs-on: windows-2022\n", "    runs-on: windows-latest\n"),
+            "write authority": (
+                "  cpu_windows:\n    needs: plan\n    permissions:\n      contents: read",
+                "  cpu_windows:\n    needs: plan\n    permissions:\n      contents: write",
+            ),
+            "wrong backend": ("            -Backend cpu `", "            -Backend vulkan `"),
+            "wrong tuple": (
+                "            -ArtifactId windows-x86_64-msvc-cpu `",
+                "            -ArtifactId windows-x86_64-msvc-cuda `",
+            ),
+            "source SHA removed": (
+                "      - name: Build, execute, package, and validate native Windows CPU preview\n"
+                "        env:\n"
+                "          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n"
+                "          SOURCE_SHA: ${{ github.sha }}",
+                "      - name: Build, execute, package, and validate native Windows CPU preview\n"
+                "        env:\n"
+                "          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n"
+                "          SOURCE_SHA: unbound",
+            ),
+            "ZIP renamed": (
+                "windows-x86_64-msvc-cpu.zip",
+                "windows-x86_64-msvc-cpu.tar.gz",
+            ),
+            "handoff omits Windows": (
+                ",${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }}",
+                "",
+            ),
+        }
+        for label, (before, after) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(before, original)
+                mutant = original.replace(before, after, 1)
+                self.assertTrue(self.checker.validate(mutant), label)
 
     def test_tag_publish_requires_exact_version_and_ready_matrix(self) -> None:
         self.assertFalse(self.plan("push", "refs/tags/v0.0.1")["publish"])
@@ -395,7 +498,7 @@ class ReleasePipelineContract(unittest.TestCase):
         plan_download = """          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
           merge-multiple: true"""
-        asset_download = """          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
+        asset_download = """          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }},${{ needs.cpu_windows.outputs.artifact_id }},${{ needs.vulkan_windows.outputs.artifact_id }}
           path: release-assets
           merge-multiple: true"""
         self.assertIn(plan_download, original)
@@ -653,8 +756,8 @@ class ReleasePipelineContract(unittest.TestCase):
             "global write": ("permissions:\n  contents: read", "permissions:\n  contents: write"),
             "mutable upload": ("overwrite: false", "overwrite: true"),
             "primary tuple omitted from handoff": (
-                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64]",
-                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64]",
+                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows, vulkan_windows]",
+                "needs: [plan, cpu_x86, cpu_arm64, cpu_musl, cuda_x86, cuda_arm64, vulkan_x86, metal_arm64, mlx_arm64, cpu_windows]",
             ),
             "name not SHA-bound": ("release-unverified-${{ github.sha }}", "release-unverified"),
             "name download": ("artifact-ids: ${{ needs.build.outputs.artifact_id }}", "name: release-unverified"),
