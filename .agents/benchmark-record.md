@@ -19715,3 +19715,40 @@ and the sign of the error depends on which engine got the first slot.
 
 Evidence: `dgx:~/work/dspark-w6/interleaved.log`, `oracle_rep{1,2,3}.json`,
 `parity_final.log`, `gates.log`.
+
+## SPEC-DSPARK: 5-rep interleaved, and why the ratio must be DISTRIBUTIONAL (2026-08-12)
+
+| cell | ours (median, range) | oracle (median, range) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 78.04 [76.0-79.3] | 77.16 [74.6-96.5] | 1.012x |
+| "fibonacci", 89 tok | 141.83 [138.9-142.4] | 149.03 [142.1-151.6] | 0.952x |
+
+The 3-rep run gave 0.919x / 0.987x for the same two cells. Both are "correct"
+and neither is stable, because the REFERENCE is not:
+
+| oracle rep | fib tok/s | capital tok/s | drafts | acceptance |
+|---|---|---|---|---|
+| 1 | 149.03 | 77.16 | 127 | 21.2% |
+| 2 | 151.61 | 74.60 | 117 | 24.0% |
+| 3 | 142.08 | 76.84 | 124 | 22.6% |
+| 4 | 151.13 | 78.50 | 127 | 21.2% |
+| 5 | 142.31 | 96.48 | 104 | 29.6% |
+
+Upstream's speculative decode is NOT run-to-run deterministic: identical prompts,
+greedy sampling and output lengths (89 / 128 tokens every rep), yet draft count
+104-127 and acceptance 21.2-29.6%. Fewer draft steps is fewer forwards, which is
+the 96.48 outlier and the 142-vs-151 bimodality. Ours is deterministic (identical
+tokens, identical step count), hence our 76-79 and 139-142 ranges.
+
+Distributional reading: on "capital" ours (78.04) is ABOVE the oracle's median
+and above 3 of its 5 draws; on "fibonacci" ours (141.83) sits just BELOW its
+floor (142.08), 0.998x of the worst draw and 0.952x of the median.
+
+Verdict: approximate parity, cell-dependent, NOT a clean >= 1.0x on both cells.
+Per-step the engines are aligned (ours 30.4 ms/step vs ~30.1 on "capital", 34.7
+vs ~34.5 on "fibonacci"), with the draft graph capturing, the verify captured and
+the Markov sample at its bandwidth bound, so there is no structural gap left --
+the residual lives inside the reference's own spread.
+
+Evidence: `dgx:~/work/dspark-w6/interleaved5.log`, `oracle5_rep{1..5}.json`,
+`diag.log`.
