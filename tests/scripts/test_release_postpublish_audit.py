@@ -6,9 +6,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import io
 import json
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 AUDIT = ROOT / "scripts/release_postpublish_audit.py"
 MATRIX = ROOT / "release/release-matrix.json"
 VERSION = ROOT / "release/release-version.json"
+INDEX = ROOT / "scripts/release_index.py"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 RUN_ID = "31415926535"
 REPO = "mudler/vllm.cpp"
@@ -31,22 +35,68 @@ def load():
     return module
 
 
+def load_index():
+    spec = importlib.util.spec_from_file_location("release_index", INDEX)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {INDEX}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class PostPublishAuditContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.audit = load()
+        cls.indexer = load_index()
         cls.matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
         cls.version = json.loads(VERSION.read_text(encoding="utf-8"))
 
     def fixture(self):
         remote_bytes: dict[str, bytes] = {}
-        rows = []
         attestations = {}
         for item in self.matrix["artifacts"]:
             archive = self.audit.canonical_archive_name(
                 self.version["version"], item["id"], item["archive_format"]
             )
-            body = f"archive:{item['id']}".encode()
+            artifact_id = item["id"]
+            parts = artifact_id.split("-")
+            os_name = "macos" if artifact_id.startswith("macos-") else parts[0]
+            arch = "aarch64" if "arm64" in artifact_id or "aarch64" in artifact_id else "x86_64"
+            abi = "msvc" if os_name == "windows" else (
+                "darwin" if os_name == "macos" else ("musl" if "musl" in artifact_id else "glibc")
+            )
+            backend = next(
+                (name for name in ("cuda", "vulkan", "metal", "mlx") if name in artifact_id),
+                "cpu",
+            )
+            manifest = {
+                "artifact": {
+                    "channel": item["channel"], "id": artifact_id,
+                    "static_boundary": "literal-static" if "static" in artifact_id else "static-core",
+                    "version": self.version["version"],
+                },
+                "backend": {
+                    "gpu_driver_boundary": "external-driver" if backend != "cpu" else "not-applicable",
+                    "name": backend,
+                },
+                "build": {"source_commit": SHA},
+                "cpu": {"compiled_tiers": [{"name": "portable-sse2"}] if arch == "x86_64" else [{"name": "portable-neon"}]},
+                "cuda": {"compiled_sms": ["80", "90a"] if backend == "cuda" else []},
+                "dependencies": ([{"name": "vulkan-1.dll", "role": "external-runtime"}] if backend == "vulkan" else []),
+                "host": {"abi": abi, "abi_version": "fixture-1", "arch": arch, "os": os_name},
+            }
+            manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+            stream = io.BytesIO()
+            if item["archive_format"] == "zip":
+                with zipfile.ZipFile(stream, "w") as bundle:
+                    bundle.writestr("release-manifest.json", manifest_bytes)
+            else:
+                with tarfile.open(fileobj=stream, mode="w:gz") as bundle:
+                    info = tarfile.TarInfo("release-manifest.json")
+                    info.size = len(manifest_bytes)
+                    bundle.addfile(info, io.BytesIO(manifest_bytes))
+            body = stream.getvalue()
             digest = hashlib.sha256(body).hexdigest()
             checksum = f"{digest}  {archive}\n".encode()
             provenance = json.dumps(
@@ -58,16 +108,6 @@ class PostPublishAuditContract(unittest.TestCase):
                 (archive + ".provenance.json", provenance),
             ):
                 remote_bytes[name] = data
-            rows.append(
-                {
-                    "archive": archive,
-                    "checksum": archive + ".sha256",
-                    "id": item["id"],
-                    "provenance": archive + ".provenance.json",
-                    "sha256": digest,
-                    "size": len(body),
-                }
-            )
             attestations[archive] = [{
                 "digest": digest,
                 "repository": REPO,
@@ -75,20 +115,34 @@ class PostPublishAuditContract(unittest.TestCase):
                 "run_id": RUN_ID,
                 "verified": True,
             }]
-        index = {
-            "artifacts": rows,
-            "prerelease": True,
-            "project_version": "0.0.3",
-            "release_tag": "v0.0.3-pre.1",
-            "schema": "vllm.cpp.release-index.v1",
-            "source_sha": SHA,
-            "version": "0.0.3-pre.1",
-        }
-        remote_bytes["release-index.json"] = json.dumps(index).encode()
-        remote_bytes["RELEASE_INDEX.md"] = (
-            "# vllm.cpp v0.0.3-pre.1 binary index\n"
-            f"Source: `{SHA}`\n" + "\n".join(row["archive"] for row in rows)
-        ).encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            files = []
+            for item in self.matrix["artifacts"]:
+                archive = self.audit.canonical_archive_name(
+                    self.version["version"], item["id"], item["archive_format"]
+                )
+                for name in (archive, archive + ".sha256", archive + ".provenance.json"):
+                    data = remote_bytes[name]
+                    (assets / name).write_bytes(data)
+                    files.append({
+                        "artifact_id": item["id"], "name": name,
+                        "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+                    })
+            handoff = {
+                "artifacts": self.matrix["artifacts"], "files": files,
+                "prerelease": True, "project_version": "0.0.3",
+                "release_tag": "v0.0.3-pre.1",
+                "retention": self.matrix["retention"], "source_sha": SHA,
+                "verified": True, "version": "0.0.3-pre.1",
+            }
+            index_path = root / "release-index.json"
+            markdown_path = root / "RELEASE_INDEX.md"
+            self.indexer.generate_index(assets, handoff, index_path, markdown_path)
+            remote_bytes["release-index.json"] = index_path.read_bytes()
+            remote_bytes["RELEASE_INDEX.md"] = markdown_path.read_bytes()
         assets = [
             {
                 "id": index + 100,
@@ -118,6 +172,13 @@ class PostPublishAuditContract(unittest.TestCase):
             ],
         }
         return snapshot, remote_bytes, attestations
+
+    @staticmethod
+    def replace_remote(snapshot, remote_bytes, name, data) -> None:
+        remote_bytes[name] = data
+        row = next(item for item in snapshot["release"]["assets"] if item["name"] == name)
+        row["size"] = len(data)
+        row["digest"] = "sha256:" + hashlib.sha256(data).hexdigest()
 
     def test_complete_authenticated_remote_fixture_passes(self) -> None:
         snapshot, remote_bytes, attestations = self.fixture()
@@ -172,6 +233,96 @@ class PostPublishAuditContract(unittest.TestCase):
                     mutant_snapshot, mutant_bytes, mutant_attestations,
                     self.matrix, self.version, REPO, SHA, RUN_ID,
                 )
+
+    def test_downloaded_json_index_is_exactly_canonical(self) -> None:
+        row_mutations = {
+            "artifact id": ("id", "wrong-id"),
+            "backend": ("backend", "wrong-backend"),
+            "channel": ("channel", "wrong-channel"),
+            "host": ("host", {"os": "wrong", "arch": "wrong", "abi": "wrong", "abi_version": "wrong"}),
+            "cpu tiers": ("cpu_tiers", ["wrong-tier"]),
+            "driver boundary": ("driver_boundary", "wrong-boundary"),
+            "limitations": ("limitations", ["invented limitation"]),
+            "CUDA SMs": ("sms", ["999"]),
+            "static boundary": ("static_boundary", "wrong-static-boundary"),
+        }
+        accepted = []
+        for name, (field, value) in row_mutations.items():
+            snapshot, remote_bytes, attestations = self.fixture()
+            index = json.loads(remote_bytes["release-index.json"])
+            index["artifacts"][0][field] = value
+            data = (json.dumps(index, indent=2, sort_keys=True) + "\n").encode()
+            self.replace_remote(snapshot, remote_bytes, "release-index.json", data)
+            try:
+                self.audit.validate_remote_release(
+                    snapshot, remote_bytes, attestations, self.matrix, self.version,
+                    REPO, SHA, RUN_ID,
+                )
+            except ValueError:
+                continue
+            accepted.append(name)
+
+        for name, mutate in (
+            ("retention", lambda index: index.__setitem__("retention", {"ci_artifacts_days": 99, "github_release": "forever"})),
+            ("unexpected row field", lambda index: index["artifacts"][0].__setitem__("invented", True)),
+            ("unexpected top field", lambda index: index.__setitem__("invented", True)),
+            ("missing row field", lambda index: index["artifacts"][0].pop("backend")),
+            ("missing top field", lambda index: index.pop("retention")),
+            ("reordered rows", lambda index: index["artifacts"].reverse()),
+        ):
+            snapshot, remote_bytes, attestations = self.fixture()
+            index = json.loads(remote_bytes["release-index.json"])
+            mutate(index)
+            data = (json.dumps(index, indent=2, sort_keys=True) + "\n").encode()
+            self.replace_remote(snapshot, remote_bytes, "release-index.json", data)
+            try:
+                self.audit.validate_remote_release(
+                    snapshot, remote_bytes, attestations, self.matrix, self.version,
+                    REPO, SHA, RUN_ID,
+                )
+            except ValueError:
+                continue
+            accepted.append(name)
+        self.assertEqual(accepted, [], f"audit accepted noncanonical JSON index mutations: {accepted}")
+
+    def test_downloaded_markdown_index_is_byte_exact_canonical_output(self) -> None:
+        snapshot, remote_bytes, _ = self.fixture()
+        canonical = remote_bytes["RELEASE_INDEX.md"].decode()
+        rows = [line for line in canonical.splitlines() if line.startswith("| [")]
+        malformed = (
+            f"v0.0.3-pre.1 {SHA}\n" + "\n".join(
+                self.audit.canonical_archive_name(
+                    self.version["version"], item["id"], item["archive_format"]
+                )
+                for item in self.matrix["artifacts"]
+            ) + "\n"
+        )
+        mutations = {
+            "extra row": canonical + rows[0] + "\n",
+            "duplicate row": canonical.replace(rows[1], rows[0], 1),
+            "reordered rows": canonical.replace(rows[0], "ROW-SWAP", 1).replace(rows[1], rows[0], 1).replace("ROW-SWAP", rows[1], 1),
+            "false prerelease state": canonical.replace("Prerelease: `true`", "Prerelease: `false`", 1),
+            "wrong checksum link": canonical.replace(".sha256)", ".wrong.sha256)", 1),
+            "wrong artifact id": canonical.replace(self.matrix["artifacts"][0]["id"], "wrong-id", 1),
+            "wrong channel": canonical.replace(f"| {self.matrix['artifacts'][0]['channel']} |", "| wrong-channel |", 1),
+            "malformed substring-only document": malformed,
+            "no table": canonical.replace("| Artifact |", "Artifact ", 1),
+        }
+        accepted = []
+        for name, markdown in mutations.items():
+            mutant_snapshot, mutant_bytes, mutant_attestations = self.fixture()
+            self.replace_remote(
+                mutant_snapshot, mutant_bytes, "RELEASE_INDEX.md", markdown.encode()
+            )
+            try:
+                self.audit.validate_remote_release(
+                    mutant_snapshot, mutant_bytes, mutant_attestations,
+                    self.matrix, self.version, REPO, SHA, RUN_ID,
+                )
+            except ValueError:
+                continue
+            accepted.append(name)
+        self.assertEqual(accepted, [], f"audit accepted noncanonical Markdown mutations: {accepted}")
 
     def test_live_collector_uses_mocked_authenticated_apis_and_downloads(self) -> None:
         snapshot, remote_bytes, _ = self.fixture()

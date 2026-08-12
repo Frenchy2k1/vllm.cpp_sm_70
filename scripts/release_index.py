@@ -96,6 +96,7 @@ def generate_index(
     if not isinstance(declared, list):
         raise ValueError("verified handoff has no explicit artifact formats")
     formats: dict[str, str] = {}
+    channels: dict[str, str] = {}
     expected_archives: dict[str, str] = {}
     for item in declared:
         if not isinstance(item, dict) or item.get("archive_format") not in {"tar.gz", "zip"}:
@@ -104,6 +105,10 @@ def generate_index(
         if not isinstance(artifact_id, str) or artifact_id in formats:
             raise ValueError("verified handoff artifact ID is invalid or duplicated")
         formats[artifact_id] = item["archive_format"]
+        channel = item.get("channel")
+        if not isinstance(channel, str):
+            raise ValueError("verified handoff artifact channel is invalid")
+        channels[artifact_id] = channel
         expected_archives[f"vllm.cpp-{version}-{artifact_id}.{item['archive_format']}"] = artifact_id
     archives = sorted(name for name in by_name if name in expected_archives)
     rows: list[dict[str, Any]] = []
@@ -116,6 +121,7 @@ def generate_index(
         if (
             not isinstance(artifact_id, str)
             or artifact.get("version") != version
+            or artifact.get("channel") != channels.get(artifact_id)
             or archive_name != expected_archive
             or by_name[archive_name].get("artifact_id") != artifact_id
         ):
