@@ -19964,3 +19964,39 @@ num_tokens_past_padded (or per-call block count) on both sides for the same
 prompt and compare totals. Equal totals => our kernel is genuinely slower.
 Different totals => the gap is routing and the kernel comparison was never
 like-for-like.
+
+## SPEC-DSPARK: routing REFUTED -- our Marlin MoE is 12.8% slower per unit of work (2026-08-12)
+
+Measured on both sides (VT_MOE_PAD_STATS=1 ours; moe_align_block_size wrapped
+upstream), same prompt, same k:
+
+| | avg padded tokens / call | avg blocks / call | block size |
+|---|---|---|---|
+| ours | 311.2 | 38.9 | 8 |
+| upstream | 324.8 | 40.6 | 8 |
+
+Upstream loops 4.4% MORE blocks per launch and is still 8.2% faster, so the
+divergent-routing explanation is dead. Normalising by the work performed makes
+our deficit larger:
+
+| | time | launches | blocks/launch | per block |
+|---|---|---|---|---|
+| ours | 249.2 ms | 1520 | 38.9 | 4.21 us |
+| upstream | 230.4 ms | 1520 | 40.6 | 3.73 us |
+
+~12.8% slower per unit of work. Both choose block_size 8, independently
+confirming that upstream's >= 16 clamp does not bite on this shape.
+
+Every input-side explanation is now eliminated: same kernel, same instantiation,
+same grid rule, same scale layout, same alignment, same residency, and more work
+on their side. What remains is how the kernel executes given identical inputs
+(occupancy / shared-memory budget / max_shared_mem passed to the launcher).
+
+Two diagnostic traps, both hit here: our probe read a device value inside the
+verify, which W8 now CAPTURES ("cudaStreamSynchronize: operation not permitted
+when stream is capturing"), and upstream's wrapper sat inside a torch.compile
+region and broke compilation. Both counts are capture- and compile-independent,
+so they run with VT_SPEC_DECODE_GRAPH=0 and enforce_eager respectively. A work
+COUNT may be taken under different execution modes; a TIME may not.
+
+Evidence: `dgx:~/work/dspark-w6/padcmp.log`, `oracle_pad.json`.
