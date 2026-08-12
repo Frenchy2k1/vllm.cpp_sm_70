@@ -147,7 +147,8 @@ SAFE_FILES = {
             $probeExitCode = [int]$probeResult.ExitCode
           }
           if ($probeExitCode -ne 1) { throw "unexpected exit" }
-          if (($probeOutput -join "`n") -notmatch
+          $diagnostic = $probeOutput -join "`n"
+          if ($diagnostic -notmatch
               [regex]::Escape("unknown x86 ISA tier 'amx'")) {
             throw "missing diagnostic"
           }
@@ -527,6 +528,154 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             source.replace(decrement, split_keyword + decrement, 1),
             "trusted final-tail token",
         )
+
+    def test_console_final_tail_macro_state_is_checked_at_each_token(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        mutations = (
+            "#define return SetEvent(state->stop_event); return",
+            "#define return(value) SetEvent(state->stop_event); return value",
+        )
+        for directive in mutations:
+            with self.subTest(directive=directive):
+                mutated = source.replace(
+                    decrement,
+                    decrement + "\n  " + directive,
+                    1,
+                )
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp",
+                    mutated,
+                    "trusted final-tail token",
+                )
+
+    def test_console_trusted_tails_restore_pushed_macros(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        timeout = "if (GetTickCount64() - start >= 5000) return false;"
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        cases = (
+            (
+                timeout,
+                '#define false (SwitchToThread(), false)\n'
+                '#pragma push_macro("false")\n'
+                '#undef false\n'
+                '#pragma pop_macro("false")\n' + timeout,
+                "DrainEntrantsWithTimeout trusted return-tail token",
+                0,
+            ),
+            (
+                timeout,
+                '#define GetTickCount64() (SwitchToThread(), GetTickCount64())\n'
+                '#if UNKNOWN_WINDOWS_BUILD_FLAG\n'
+                '#pragma push_macro( \\\n'
+                '                    "GetTickCount64" )\n'
+                '#undef GetTickCount64\n'
+                '#pragma pop_macro("GetTickCount64")\n'
+                '#endif\n' + timeout,
+                "DrainInFlightWithTimeout trusted return-tail token",
+                1,
+            ),
+            (
+                decrement,
+                '#define fetch_sub(value, order) '
+                '(SetEvent(state->stop_event), 0)\n'
+                '#pragma push_macro("fetch_sub")\n'
+                '#undef fetch_sub\n'
+                '#pragma pop_macro("fetch_sub")\n  ' + decrement,
+                "trusted final-tail token",
+                0,
+            ),
+            (
+                decrement,
+                decrement + '\n  '
+                '#define return SetEvent(state->stop_event); return\n'
+                '#pragma push_macro("return")\n'
+                '#undef return\n'
+                '#pragma pop_macro("return")',
+                "trusted final-tail token",
+                0,
+            ),
+        )
+        for old, replacement, reason, occurrence in cases:
+            with self.subTest(reason=reason, occurrence=occurrence):
+                position = -1
+                for _ in range(occurrence + 1):
+                    position = source.find(old, position + 1)
+                self.assertGreaterEqual(position, 0)
+                mutated = source[:position] + replacement + source[position + len(old):]
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp", mutated, reason
+                )
+
+    def test_console_trusted_tails_accept_push_pop_restoring_undefined(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        timeout = "if (GetTickCount64() - start >= 5000) return false;"
+        safe = (
+            '#pragma push_macro("false")\n'
+            '#define false unsafe_false\n'
+            '#pragma pop_macro("false")\n' + timeout
+        )
+        for occurrence in (0, 1):
+            with self.subTest(occurrence=occurrence):
+                position = -1
+                for _ in range(occurrence + 1):
+                    position = source.find(timeout, position + 1)
+                self.assertGreaterEqual(position, 0)
+                mutated = source[:position] + safe + source[position + len(timeout):]
+                result = self.run_checker(self.make_tree({
+                    "src/vllm/platform/console_shutdown.cpp": mutated,
+                }))
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+
+    def test_console_trusted_tails_honor_phase_two_comment_splicing(self) -> None:
+        source = textwrap.dedent(
+            SAFE_FILES["src/vllm/platform/console_shutdown.cpp"]
+        )
+        timeout = "if (GetTickCount64() - start >= 5000) return false;"
+        decrement = "state->in_flight.fetch_sub(1, std::memory_order_seq_cst);"
+        cases = (
+            (
+                timeout,
+                "#define false (SwitchToThread(), false)\n"
+                "// the physical splice swallows the undef \\\n"
+                "#undef false\n" + timeout,
+                "DrainEntrantsWithTimeout trusted return-tail token",
+                0,
+            ),
+            (
+                timeout,
+                "#define return SwitchToThread(); return\n"
+                "// the physical splice swallows the undef \\\n"
+                "#undef return\n" + timeout,
+                "DrainInFlightWithTimeout trusted return-tail token",
+                1,
+            ),
+            (
+                decrement,
+                "#define return SetEvent(state->stop_event); return\n"
+                "// the physical splice swallows the undef \\\n"
+                "#undef return\n  " + decrement,
+                "trusted final-tail token",
+                0,
+            ),
+        )
+        for old, replacement, reason, occurrence in cases:
+            with self.subTest(reason=reason, occurrence=occurrence):
+                position = -1
+                for _ in range(occurrence + 1):
+                    position = source.find(old, position + 1)
+                self.assertGreaterEqual(position, 0)
+                mutated = source[:position] + replacement + source[position + len(old):]
+                self.assert_rejected(
+                    "src/vllm/platform/console_shutdown.cpp", mutated, reason
+                )
 
     def test_console_final_tail_accepts_only_macros_active_at_the_tail(self) -> None:
         source = textwrap.dedent(
@@ -1012,6 +1161,22 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         mutated = script[:helper_start] + mutated_helper + script[helper_end:]
         self.assertIn(diagnostic, mutated)
         mutations.append((mutated, "unsupported-tier diagnostic"))
+        canonical_diagnostic = (
+            '    $diagnostic = $probeOutput -join "`n"\n'
+            '    if ($diagnostic -notmatch '
+            '[regex]::Escape("unknown x86 ISA tier \'amx\'")) {'
+        )
+        fixture_only_diagnostic = (
+            '    if (($probeOutput -join "`n") -notmatch '
+            '[regex]::Escape("unknown x86 ISA tier \'amx\'")) {'
+        )
+        self.assertIn(canonical_diagnostic, helper)
+        mutations.append((
+            script.replace(
+                canonical_diagnostic, fixture_only_diagnostic, 1
+            ),
+            "exact unsupported-tier probe body",
+        ))
         mutations.extend((
             (
                 script.replace("$calls.Add(", "$calls.Append(", 1),
@@ -1173,6 +1338,49 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             r"(?m)^\s*['\"](--test-case=.*)['\"]\s*$", script
         )
         self.assertEqual(arguments, [UNSUPPORTED_TIER_FILTER])
+
+    def test_unsupported_tier_exact_literals_reject_runtime_backtick_escapes(self) -> None:
+        fixture = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        real = (REPO / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        for label, script in (("fixture", fixture), ("real", real)):
+            with self.subTest(label=label, literal="filter"):
+                quoted_filter = f"'{UNSUPPORTED_TIER_FILTER}'"
+                self.assertIn(quoted_filter, script)
+                escaped_filter = '"--`test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran"'
+                self.assert_rejected(
+                    "scripts/build-windows-release.ps1",
+                    script.replace(quoted_filter, escaped_filter, 1),
+                    "exact unsupported-tier probe body",
+                )
+            with self.subTest(label=label, literal="diagnostic"):
+                helper_start = script.index("function Invoke-UnsupportedTierProbe")
+                helper_end = script.index(
+                    "function Invoke-UnsupportedTierContractTests", helper_start
+                )
+                helper = script[helper_start:helper_end]
+                diagnostic = '"unknown x86 ISA tier \'amx\'"'
+                self.assertIn(diagnostic, helper)
+                mutated_helper = helper.replace(
+                    diagnostic, '"u`nknown x86 ISA tier \'amx\'"', 1
+                )
+                mutated = script[:helper_start] + mutated_helper + script[helper_end:]
+                self.assert_rejected(
+                    "scripts/build-windows-release.ps1",
+                    mutated,
+                    "exact unsupported-tier probe body",
+                )
+
+    def test_unsupported_tier_exact_filter_accepts_plain_double_quotes(self) -> None:
+        script = textwrap.dedent(SAFE_FILES["scripts/build-windows-release.ps1"])
+        quoted_filter = f"'{UNSUPPORTED_TIER_FILTER}'"
+        result = self.run_checker(self.make_tree({
+            "scripts/build-windows-release.ps1": script.replace(
+                quoted_filter, f'"{UNSUPPORTED_TIER_FILTER}"', 1
+            ),
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_real_codemodel_requires_reachable_sources_and_internal_headers(self) -> None:
         root = self.make_tree()
