@@ -100,6 +100,7 @@ jobs:
           python3 tests/scripts/test_release_metadata.py
           python3 tests/scripts/test_release_accelerator_metadata.py
           python3 tests/scripts/test_release_macos_metadata.py
+          python3 tests/scripts/test_release_windows_metadata.py
           python3 tests/scripts/test_cpu_release_gates.py
       - name: README stays a human-readable user-facing document
         run: |

@@ -91,6 +91,7 @@ SUITES=(
   test_release_metadata
   test_release_accelerator_metadata
   test_release_macos_metadata
+  test_release_windows_metadata
   test_cpu_release_gates
   test_agent_role
   test_agent_onboard

@@ -114,8 +114,11 @@ def validate_provenance(
     return errors
 
 
-def safe_extract(archive: Path, destination: Path) -> list[str]:
-    if archive.name.endswith(".zip"):
+def safe_extract(archive: Path, destination: Path, archive_format: str) -> list[str]:
+    suffix = ".zip" if archive_format == "zip" else ".tar.gz"
+    if archive_format not in {"tar.gz", "zip"} or not archive.name.endswith(suffix):
+        return ["archive name does not match the explicit archive format"]
+    if archive_format == "zip":
         return safe_extract_zip(archive, destination)
     errors: list[str] = []
     try:
@@ -148,7 +151,18 @@ def unsafe_zip_name(name: str) -> bool:
     if not name or name == "." or "\\" in name or re.match(r"^[A-Za-z]:", name):
         return True
     path = PurePosixPath(name)
-    return path.is_absolute() or ".." in path.parts
+    parts = name.rstrip("/").split("/")
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in parts):
+        return True
+    reserved = re.compile(r"(?i)^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$")
+    return any(
+        ":" in part or part.endswith((".", " ")) or reserved.fullmatch(part)
+        for part in parts
+    )
+
+
+def zip_windows_key(name: str) -> str:
+    return "/".join(part.casefold() for part in name.rstrip("/").split("/"))
 
 
 def safe_extract_zip(archive: Path, destination: Path) -> list[str]:
@@ -160,13 +174,15 @@ def safe_extract_zip(archive: Path, destination: Path) -> list[str]:
                 if unsafe_zip_name(info.filename):
                     errors.append(f"unsafe archive path: {info.filename!r}")
                     continue
-                normalized = info.filename.rstrip("/")
+                normalized = zip_windows_key(info.filename)
                 if normalized in seen:
                     errors.append(f"duplicate archive path: {info.filename!r}")
                     continue
                 seen.add(normalized)
                 unix_mode = info.external_attr >> 16
-                if stat.S_ISLNK(unix_mode) or info.external_attr & 0x400:
+                member_type = stat.S_IFMT(unix_mode)
+                if (stat.S_ISLNK(unix_mode) or info.external_attr & 0x400 or
+                        member_type not in {0, stat.S_IFREG, stat.S_IFDIR}):
                     errors.append(f"archive links/reparse points are forbidden: {info.filename}")
             if errors:
                 return errors
@@ -240,6 +256,14 @@ def validate_contents(root: Path, forbidden_paths: list[str]) -> list[str]:
     license_files = [path for path in files if path.startswith("share/licenses/")]
     if not license_files:
         errors.append("archive has no license files under share/licenses/")
+    return errors
+
+
+def validate_windows_layout(root: Path) -> list[str]:
+    errors: list[str] = []
+    for path in root.rglob("*"):
+        if path.is_file() and path.relative_to(root).as_posix().casefold().startswith("lib/"):
+            errors.append(f"Windows release archive contains forbidden library payload: {path.relative_to(root)}")
     return errors
 
 
@@ -506,6 +530,9 @@ def validate_pe_audit(
     for name in sorted(declared - actual):
         errors.append(f"declared dynamic dependency is not imported: {name}")
     for name in sorted(actual):
+        if name.startswith("API-MS-WIN-CRT-"):
+            errors.append(f"dynamic CRT import violates the /MT static-CRT contract: {name}")
+            continue
         if name.startswith(("API-MS-WIN-", "EXT-MS-WIN-")):
             continue
         if name.startswith(("MSYS-", "MINGW")) or name in {"LIBGCC_S_SEH-1.DLL", "LIBSTDC++-6.DLL"}:
@@ -767,7 +794,7 @@ def validate_release(args: argparse.Namespace) -> list[str]:
     with tempfile.TemporaryDirectory(prefix="vllm-release-validate-") as temporary:
         extracted = Path(temporary) / "extracted"
         extracted.mkdir()
-        errors.extend(safe_extract(archive, extracted))
+        errors.extend(safe_extract(archive, extracted, args.archive_format))
         if errors:
             return errors
         forbidden = [str(Path(value).resolve()) for value in args.forbid_path]
@@ -781,6 +808,8 @@ def validate_release(args: argparse.Namespace) -> list[str]:
         except (ValueError, OSError, release_manifest.ManifestError) as exc:
             return errors + [str(exc)]
         errors.extend(release_manifest.validate_manifest(manifest, schema, args.repo_root.resolve()))
+        if manifest.get("host", {}).get("os") == "windows":
+            errors.extend(validate_windows_layout(extracted))
         errors.extend(validate_archive_name(archive, manifest, args.archive_format))
         values, version_errors = parse_version(extracted / "VERSION")
         errors.extend(version_errors)

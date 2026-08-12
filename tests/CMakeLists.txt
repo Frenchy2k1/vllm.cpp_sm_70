@@ -851,6 +851,14 @@ target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)
 vllm_cpp_add_test(test_backend vt/test_backend.cpp)
+add_executable(test_vulkan_loader
+  vt/test_vulkan_loader.cpp
+  ${CMAKE_SOURCE_DIR}/src/vt/vulkan/vulkan_loader.cpp)
+target_include_directories(test_vulkan_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_vulkan_loader PRIVATE vllm_test_main ${CMAKE_DL_LIBS})
+vllm_cpp_set_warnings(test_vulkan_loader)
+add_test(NAME test_vulkan_loader COMMAND test_vulkan_loader)
 # CPU-vs-device op-equality harness (BACKEND-METAL-MLX W0). Unconditional: it
 # discovers which non-CPU backends this build registered and compares only those,
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-

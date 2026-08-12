@@ -37,6 +37,19 @@ UNSUPPORTED_TIER_FILTER = (
     "--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran"
 )
 UNSUPPORTED_TIER_DIAGNOSTIC = "unknown x86 ISA tier 'amx'"
+WINDOWS_EXCLUDED_SOURCE = "src/vt/cuda/nvfp4_persistent_cache.cpp"
+
+
+def windows_excluded_sources(root: Path) -> set[str]:
+    """Return sources proven by CMake to be absent specifically on WIN32."""
+    text = (root / "CMakeLists.txt").read_text(encoding="utf-8")
+    blocks = re.findall(r"(?ms)^if\(NOT WIN32\)\s*$\n(.*?)^endif\(\)\s*$", text)
+    matches = [block for block in blocks if WINDOWS_EXCLUDED_SOURCE in block]
+    if len(matches) != 1 or not re.search(
+            rf"target_sources\s*\(\s*vllm\s+PRIVATE\s+{re.escape(WINDOWS_EXCLUDED_SOURCE)}\s*\)",
+            matches[0]):
+        return set()
+    return {WINDOWS_EXCLUDED_SOURCE}
 
 
 def _project_header_closure(root: Path, sources: set[str],
@@ -130,6 +143,7 @@ def _load_codemodel_sources(root: Path, build_dir: Path) -> set[str]:
             dependency["id"] for dependency in data.get("dependencies", [])
             if dependency.get("id") in targets
         )
+    sources -= windows_excluded_sources(root)
     return _project_header_closure(root, sources, include_roots)
 
 
@@ -138,9 +152,8 @@ def shipped_server_sources(root: Path, build_dir: Path | None,
     if source_manifest is not None:
         data = json.loads(source_manifest.read_text(encoding="utf-8"))
         sources = {str(item) for item in data.get("sources", [])}
-        return _project_header_closure(
-            root, sources, {root, root / "include", root / "src"}
-        )
+        sources -= windows_excluded_sources(root)
+        return _project_header_closure(root, sources, {root, root / "include", root / "src"})
     if build_dir is not None:
         return _load_codemodel_sources(root, build_dir.resolve())
     if shutil.which("cmake") is None:

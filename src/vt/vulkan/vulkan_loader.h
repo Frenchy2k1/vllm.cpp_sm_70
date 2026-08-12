@@ -117,6 +117,17 @@ struct VulkanApi {
 #undef VT_VK_DECL
 };
 
+// Injectable library boundary used by the hardware-independent Win32 loader
+// contract. Production supplies LoadLibraryW/GetProcAddress/FreeLibrary.
+struct VulkanLibraryOps {
+  void* context;
+  void* (*open)(void* context, const wchar_t* name);
+  void* (*lookup)(void* context, void* handle, const char* name);
+  void (*close)(void* context, void* handle);
+};
+
+bool ProbeVulkanLibraryForTesting(const VulkanLibraryOps& ops);
+
 // Opens libvulkan.so.1 (or vulkan-1.dll through LoadLibraryW on Windows) and resolves the global
 // entry points. Returns false — without throwing — when there is no loader on
 // the machine; the registrars treat that as "do not register kVULKAN".

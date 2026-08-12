@@ -336,11 +336,17 @@ class ReleaseManifestTests(unittest.TestCase):
         mutations = (
             (preflight.replace("  test_release_manifest\n", "", 1), ci, "preflight"),
             (preflight, ci.replace("          python3 tests/scripts/test_release_manifest.py\n", "", 1), "CI"),
+            (preflight.replace("  test_release_windows_metadata\n", "", 1), ci, "Windows preflight"),
+            (preflight, ci.replace("          python3 tests/scripts/test_release_windows_metadata.py\n", "", 1), "Windows CI"),
         )
         for mutated_preflight, mutated_ci, reason in mutations:
             with self.subTest(reason=reason):
-                errors = checker.wiring_errors(mutated_preflight, mutated_ci)
-                self.assertTrue(any("W5 manifest suite" in error for error in errors), errors)
+                if reason.startswith("Windows"):
+                    errors = checker.wiring_errors(mutated_preflight, mutated_ci)
+                    self.assertTrue(any("W15 Windows metadata suite" in error for error in errors), errors)
+                else:
+                    errors = checker.wiring_errors(mutated_preflight, mutated_ci)
+                    self.assertTrue(any("W5 manifest suite" in error for error in errors), errors)
 
     def test_schema_required_keys_enums_and_additional_properties_are_live(self) -> None:
         base = self.generated(cpu_facts())

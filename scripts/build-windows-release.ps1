@@ -17,12 +17,6 @@ if (-not $ArtifactId) { $ArtifactId = "windows-x86_64-msvc-$Backend" }
 if ($ArtifactId -ne "windows-x86_64-msvc-$Backend") {
     throw "artifact ID must exactly match selected Windows backend"
 }
-foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH")) {
-    if (-not [Environment]::GetEnvironmentVariable($name)) {
-        throw "$name is required"
-    }
-}
-
 function Invoke-Checked {
     param([Parameter(Mandatory)][string]$Program,
           [Parameter(Mandatory)][string[]]$Arguments)
@@ -169,6 +163,12 @@ if ($ContractTest) {
     exit 0
 }
 
+foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH")) {
+    if (-not [Environment]::GetEnvironmentVariable($name)) {
+        throw "$name is required"
+    }
+}
+
 if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
     throw "Windows runtime smoke model is incomplete: $SmokeModel"
 }
@@ -208,8 +208,12 @@ $targets = @(
     "test_lmcache_client",
     "test_kv_offload_fs",
     "test_cpu_isa_x86",
-    "test_ops_matmul_elem"
+    "test_ops_matmul_elem",
+    "test_vulkan_loader"
 )
+if ($Backend -eq "vulkan") {
+    $targets += @("test_vulkan_backend", "test_backend_cross_device")
+}
 Invoke-Checked cmake (@("--build", $BuildDir, "--config", "Release", "--target") + $targets)
 
 foreach ($test in @(
@@ -219,6 +223,11 @@ foreach ($test in @(
     "test_cpu_isa_x86.exe"
 )) {
     Invoke-Checked (Join-Path $BuildDir "tests/Release/$test") @()
+}
+Invoke-Checked (Join-Path $BuildDir "tests/Release/test_vulkan_loader.exe") @()
+if ($Backend -eq "vulkan") {
+    Invoke-Checked (Join-Path $BuildDir "tests/Release/test_vulkan_backend.exe") @()
+    Invoke-Checked (Join-Path $BuildDir "tests/Release/test_backend_cross_device.exe") @()
 }
 
 if (Test-Path $StageDir) {
@@ -376,6 +385,15 @@ Invoke-Checked python @(
     "--stage-dir", $StageDir, "--metadata-dir", $metadataDir,
     "--archive", $archive, "--archive-format", "zip", "--config", "Release"
 )
+$archiveExtract = Join-Path $releaseDir "archive-extracted"
+if (Test-Path $archiveExtract) { Remove-Item -Recurse -Force $archiveExtract }
+Expand-Archive -LiteralPath $archive -DestinationPath $archiveExtract
+$archiveServer = Join-Path $archiveExtract "bin/vllm-server.exe"
+if (-not (Test-Path $archiveServer)) {
+    throw "final ZIP does not contain bin/vllm-server.exe"
+}
+Invoke-Checked $archiveServer @("--help")
+Invoke-Checked python @($smokeHarness, $archiveServer, $SmokeModel, "$SmokePort")
 Invoke-Checked python @(
     (Join-Path $SourceDir "scripts/validate-release-archive.py"),
     "--archive", $archive, "--archive-format", "zip",

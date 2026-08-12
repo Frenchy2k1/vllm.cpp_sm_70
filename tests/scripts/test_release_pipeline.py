@@ -226,6 +226,27 @@ class ReleasePipelineContract(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.pipeline.validate_matrix(mutant)
 
+    def test_matrix_rejects_tuple_set_and_platform_format_mutations(self) -> None:
+        matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        mutations = []
+        removed = copy.deepcopy(matrix)
+        removed["artifacts"].pop()
+        mutations.append(removed)
+        added = copy.deepcopy(matrix)
+        added["artifacts"].append({
+            "archive_format": "tar.gz", "channel": "preview",
+            "id": "linux-x86_64-glibc-extra", "required": True,
+        })
+        mutations.append(added)
+        swapped = copy.deepcopy(matrix)
+        swapped["artifacts"][0]["archive_format"] = "zip"
+        swapped["artifacts"][-1]["archive_format"] = "tar.gz"
+        mutations.append(swapped)
+        for mutant in mutations:
+            with self.subTest(ids=[item["id"] for item in mutant["artifacts"]]):
+                with self.assertRaises(ValueError):
+                    self.pipeline.validate_matrix(mutant)
+
     def test_windows_archive_triplet_uses_zip(self) -> None:
         self.assertEqual(
             self.pipeline.canonical_archive_name(
@@ -327,6 +348,10 @@ class ReleasePipelineContract(unittest.TestCase):
             ):
                 (assets / f"{archive.name}{suffix}").write_text(content)
             handoff = {
+                "artifacts": [{
+                    "archive_format": "tar.gz", "channel": "stable",
+                    "id": artifact_id, "required": True,
+                }],
                 "files": [
                     {"name": path.name, "sha256": self.pipeline.file_sha256(path), "size": path.stat().st_size}
                     for path in sorted(assets.iterdir())
@@ -371,6 +396,47 @@ class ReleasePipelineContract(unittest.TestCase):
                 self.pipeline.publish_release(
                     handoff_path, assets, index_json, index_md, "v0.0.1"
                 )
+
+    def test_publish_rejects_missing_or_mismatched_explicit_archive_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            artifact_id = "linux-x86_64-glibc-cpu"
+            archive = assets / f"vllm.cpp-0.0.1-{artifact_id}.tar.gz"
+            archive.write_bytes(b"release bytes")
+            digest = self.pipeline.file_sha256(archive)
+            for suffix in (".sha256", ".provenance.json"):
+                (assets / f"{archive.name}{suffix}").write_text("sidecar\n")
+            files = [
+                {"name": path.name, "sha256": self.pipeline.file_sha256(path),
+                 "size": path.stat().st_size}
+                for path in sorted(assets.iterdir())
+            ]
+            index_json = root / "release-index.json"
+            self.pipeline.write_json(index_json, {
+                "artifacts": [{"archive": archive.name, "id": artifact_id,
+                               "sha256": digest}],
+                "release_tag": "v0.0.1", "schema": "vllm.cpp.release-index.v1",
+                "source_sha": SHA,
+            })
+            index_md = root / "RELEASE_INDEX.md"
+            index_md.write_text(f"v0.0.1\n{SHA}\n{archive.name}\n")
+            for artifacts in ([], [{
+                "archive_format": "zip", "channel": "stable",
+                "id": artifact_id, "required": True,
+            }]):
+                handoff = root / "handoff.json"
+                self.pipeline.write_json(handoff, {
+                    "artifacts": artifacts, "files": files, "publish": True,
+                    "release_tag": "v0.0.1", "source_sha": SHA,
+                    "verified": True, "version": "0.0.1",
+                })
+                with self.subTest(artifacts=artifacts), \
+                        mock.patch.object(self.pipeline.subprocess, "run") as run, \
+                        self.assertRaises(ValueError):
+                    self.pipeline.publish_release(handoff, assets, index_json, index_md, "v0.0.1")
+                run.assert_not_called()
 
     def test_publish_rejects_unverified_drift_and_extra_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

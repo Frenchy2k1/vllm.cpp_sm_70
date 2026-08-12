@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
 import subprocess
 import sys
@@ -15,6 +16,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 CHECKER = REPO / "scripts" / "check-windows-portability.py"
+CHECKER_SPEC = importlib.util.spec_from_file_location("windows_portability", CHECKER)
+assert CHECKER_SPEC is not None and CHECKER_SPEC.loader is not None
+checker = importlib.util.module_from_spec(CHECKER_SPEC)
+CHECKER_SPEC.loader.exec_module(checker)
 UNSUPPORTED_TIER_FILTER = (
     "--test-case=elementwise CPU GEMM: the forced tier is the tier that actually ran"
 )
@@ -263,6 +268,17 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
     def test_accepts_complete_guarded_contract(self) -> None:
         result = self.run_checker(self.make_tree())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
+        source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
+        for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):
+            root = self.make_tree({
+                "CMakeLists.txt": textwrap.dedent(SAFE_FILES["CMakeLists.txt"]) +
+                f"\nif({condition})\n  target_sources(vllm PRIVATE {source})\nendif()\n",
+                source: "#include <unistd.h>\nvoid f() { close(1); }\n",
+            })
+            with self.subTest(condition=condition):
+                self.assertEqual(checker.windows_excluded_sources(root), expected)
 
     def test_rejects_unguarded_posix_surface(self) -> None:
         self.assert_rejected(
