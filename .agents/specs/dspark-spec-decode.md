@@ -1525,6 +1525,52 @@ that calls the op directly, or accepting that the last 2.5% is unattributed.
 **Row verdict unchanged and now final for this campaign: 0.975x on the code cell,
 1.012x on the prose cell, NOT parity, residual real and unattributed.**
 
+## 6aa. FINAL ATTRIBUTION: a 12.9% EFFECTIVE-BANDWIDTH gap on identical code (2026-08-12)
+
+§6z showed the machine code is equivalent and called the residual "runtime,
+unattributed". It can be attributed further, because a memory-bound kernel's
+time IS its achieved bandwidth.
+
+The 35B-A3B expert weights are 4-bit: gate_up `K*2N/2` = 1.05 MB per expert,
+down `N*K/2` = 0.52 MB (K=2048, N=512), so the average launch reads 0.79 MB per
+expert-block. With the measured blocks per launch (§6x) and time per launch:
+
+| | us / launch | MB / launch | **effective bandwidth** |
+|---|---|---|---|
+| ours | 164.0 | 30.59 | **186.6 GB/s** |
+| upstream | 151.6 | 31.93 | **210.7 GB/s** |
+
+**Upstream sustains 12.9% more effective DRAM bandwidth**, which is the whole
+per-unit-work gap (12.8%) to within rounding. The kernel is DRAM-bound (L2 hit
+rate 9.5%, SM throughput 10.6%), so this is not a coincidence -- for this kernel,
+time and achieved bandwidth are the same measurement.
+
+**Residency is not the cause.** This repo has a standing GB10 finding that
+host/ATS-retagged weights run materially slower per GEMM, with staging-at-load as
+the fix. That fix is ALREADY applied here: `ResidentWeight`
+(`dense_attn_block.h:190-196`) and `BuildMoeMarlinResident` both allocate through
+`d.b.Alloc` -> `cudaMalloc` and upload once, so the expert weights are true
+device memory, contiguous and 256-byte aligned, exactly like upstream's tensors.
+
+**So the honest final statement:** identical machine code, identical launch
+parameters, identical weight layout and residency, LESS work on our side, and
+13% lower achieved bandwidth reading the same bytes. The cause is in the memory
+system's behaviour for our allocation (physical page backing / TLB coverage of a
+single ~512 MB slab spanning all 256 experts, versus torch's segmented caching
+allocator), not in anything the kernel or its inputs express.
+
+**Next levers, in order of cheapness:**
+1. Split the per-expert weight slab into per-expert or per-segment allocations and
+   re-measure the kernel; if bandwidth rises, the slab's page backing is the cause.
+2. `cudaMemAdvise` / preferred-location hints on the expert slab.
+3. Upstream's `ncu` counters (currently BLOCKED: its EngineCore will not
+   initialise under ncu kernel replay) to confirm its DRAM efficiency directly
+   rather than deriving it.
+
+**Campaign verdict: 0.975x code cell, 1.012x prose cell, NOT parity.** The
+residual is now measured, localised to one kernel, quantified per unit of work,
+and attributed to achieved memory bandwidth rather than left as "unexplained".
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
