@@ -504,6 +504,23 @@ struct Fp8PlanGuard {
 // nothing is cached, and the caller falls back. This is the exact
 // descriptor/layout/heuristic sequence the pre-cache code ran inline on every
 // call; the key fields are the only inputs.
+// Emit the NAMED cause of a refused plan build under VT_GEMM_ALGO_LOG=1, once
+// per (shape, cause). Default OFF costs a cached bool, exactly like
+// MaybeLogGemmAlgo. `cap_mask` is the mask actually read from the selected algo
+// and is 0 when there was no algo to read one from.
+void MaybeLogFp8PlanRefusal(const Fp8PlanKey& key, Fp8PlanRefusal refusal, uint32_t cap_mask) {
+  if (!GemmAlgoLogEnabled()) return;
+  static LogOncePerKey once;
+  const char* tag = Fp8PlanRefusalTag(refusal);
+  std::string log_key = std::string("cublasLt-fp8-refusal|m=") + std::to_string(key.m) +
+                        " n=" + std::to_string(key.n) + " k=" + std::to_string(key.k) +
+                        "|scale_mode=" + std::to_string(key.scale_mode) + "|" + tag;
+  if (!once.ShouldLog(log_key)) return;
+  std::cerr << "[VT_GEMM_ALGO] backend=cublasLt REFUSED m=" << key.m << " n=" << key.n
+            << " k=" << key.k << " scale_mode=" << key.scale_mode << " reason=" << tag
+            << " pointerModeCapMask=" << cap_mask << std::endl;
+}
+
 bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
   Fp8Plan p;
   const cudaDataType_t out_type = static_cast<cudaDataType_t>(key.out_type);
@@ -556,21 +573,27 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
   // driver that returns an algo without the capability would silently apply
   // something other than the per-column alpha, so the bit is verified rather
   // than assumed; a refusal is not an error, it selects the two-launch fallback.
+  const bool heuristic_ok = hst == CUBLAS_STATUS_SUCCESS && returned > 0;
   bool pointer_mode_ok = true;
-  if (hst == CUBLAS_STATUS_SUCCESS && returned > 0 &&
-      key.scale_mode == kFp8ScaleModeAlphaDeviceVec) {
+  uint32_t cap_mask = 0;
+  if (heuristic_ok && key.scale_mode == kFp8ScaleModeAlphaDeviceVec) {
     static_assert(kFp8PointerModeMaskAlphaDeviceVectorBetaZero ==
                       static_cast<unsigned int>(
                           CUBLASLT_POINTER_MODE_MASK_ALPHA_DEVICE_VECTOR_BETA_ZERO),
                   "fp8_plan_cache.h pointer-mode mask drifted from cublasLt.h");
-    uint32_t cap_mask = 0;
     size_t written = 0;
     const cublasStatus_t cst = cublasLtMatmulAlgoCapGetAttribute(
         &p.heur.algo, CUBLASLT_ALGO_CAP_POINTER_MODE_MASK, &cap_mask, sizeof(cap_mask), &written);
     pointer_mode_ok = cst == CUBLAS_STATUS_SUCCESS && written == sizeof(cap_mask) &&
                       Fp8AlphaVecCapSupported(cap_mask);
   }
-  if (hst != CUBLAS_STATUS_SUCCESS || returned == 0 || !pointer_mode_ok) {
+  if (!heuristic_ok || !pointer_mode_ok) {
+    // A refusal emits NOTHING from MaybeLogGemmAlgo (there is no plan to
+    // describe), so on the GB10 run of 2026-08-11 the vector-alpha arm was
+    // indistinguishable from "never called" — see fp8_plan_cache.h. Under the
+    // existing diagnostic flag, name the cause and the mask that was actually
+    // read, so the next run reports a reason instead of an absence.
+    MaybeLogFp8PlanRefusal(key, Fp8PlanRefusalFor(heuristic_ok, pointer_mode_ok), cap_mask);
     if (p.lc != nullptr) cublasLtMatrixLayoutDestroy(p.lc);
     if (p.lb != nullptr) cublasLtMatrixLayoutDestroy(p.lb);
     if (p.la != nullptr) cublasLtMatrixLayoutDestroy(p.la);

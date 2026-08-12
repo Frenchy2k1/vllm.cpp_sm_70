@@ -9,6 +9,7 @@
 // on every platform, not just DGX.
 #include <doctest/doctest.h>
 
+#include <string>
 #include <unordered_map>
 
 #include "vt/cuda/fp8_plan_cache.h"
@@ -18,6 +19,9 @@ using vt::cuda::Fp8AlphaVecEpilogueFlagIsOn;
 using vt::cuda::Fp8PlanCacheFlagIsOn;
 using vt::cuda::Fp8PlanKey;
 using vt::cuda::Fp8PlanKeyHash;
+using vt::cuda::Fp8PlanRefusal;
+using vt::cuda::Fp8PlanRefusalFor;
+using vt::cuda::Fp8PlanRefusalTag;
 using vt::cuda::Fp8ScaleModeFor;
 
 TEST_CASE("VT_FP8_PLAN_CACHE is OFF by default; ON only for exactly \"1\"") {
@@ -162,4 +166,24 @@ TEST_CASE("Fp8PlanKey: same shape but different output dtype -> distinct plans")
   m[bf16_out] = 1;
   m[f32_out] = 2;
   CHECK(m.size() == 2);
+}
+
+TEST_CASE("Fp8PlanRefusalFor: names WHICH refusal, and never guesses a cap it never read") {
+  // The 2026-08-11 GB10 run saw ZERO TN-fp8-alphavec lines and could not tell
+  // "cuBLASLt offers no fp8 algo once the pointer mode is on the descriptor"
+  // from "it offered one whose cap mask refuses the mode" — two causes with
+  // different next steps. The dominance rule is the load-bearing part: with no
+  // algo returned there is no capability to have read, so a cap refusal must
+  // NOT be reported even when the caller's pointer_mode_ok defaulted false.
+  CHECK(Fp8PlanRefusalFor(true, true) == Fp8PlanRefusal::kNone);
+  CHECK(Fp8PlanRefusalFor(false, true) == Fp8PlanRefusal::kNoHeuristic);
+  CHECK(Fp8PlanRefusalFor(false, false) == Fp8PlanRefusal::kNoHeuristic);
+  CHECK(Fp8PlanRefusalFor(true, false) == Fp8PlanRefusal::kPointerModeUnsupported);
+  // Tags are distinct and stable: the operator greps these out of the log.
+  CHECK(std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kNone)) == "none");
+  CHECK(std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kNoHeuristic)) == "no-heuristic");
+  CHECK(std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kPointerModeUnsupported)) ==
+        "pointer-mode-unsupported");
+  CHECK(std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kNoHeuristic)) !=
+        std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kPointerModeUnsupported)));
 }

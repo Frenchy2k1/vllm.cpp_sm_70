@@ -220,13 +220,150 @@ so the two can land in either order without conflict.
 - Do not flip the default, do not widen into the output dtype, do not touch the
   `folded == true` path.
 
+## The mechanism is UNAVAILABLE on this hardware — MEASURED 2026-08-11
+
+The pointer-mode arm is implemented, correct, and **never executes on GB10**.
+Operator run of the 27B gate, same binary, `VT_GEMM_ALGO_LOG=1`:
+
+| arm | `TN-fp8-alphavec` plan tags | `TN-fp8` algo lines |
+|---|---|---|
+| `VT_FP8_ALPHA_VEC_EPILOGUE=0` | 0 | 5 |
+| `VT_FP8_ALPHA_VEC_EPILOGUE=1` | **0** | **5 (IDENTICAL)** |
+
+The fallback fired on every call, so **both arms ran byte-identical code**. The
+0.9954 / 0.9973 A/B taken from those runs is therefore **VOID, not negative** —
+it measured the same code against itself and says nothing about the lever.
+cuBLASLt on sm_121a does not hand back a vector-alpha-capable algo for this fp8
+shape. The arm stays in the tree, **default OFF**, for hardware or a driver that
+does offer the mode; §Risks already anticipated exactly this outcome.
+
+**What the run could NOT tell us, and now can.** A refused plan emits nothing at
+all, so "no heuristic for the shape once the pointer mode is on the descriptor"
+and "an algo was returned but its `CUBLASLT_ALGO_CAP_POINTER_MODE_MASK` refuses
+our mode" were indistinguishable — and they point at different next steps. The
+refusal now logs its NAMED cause and the mask actually read
+(`cuda_matmul.cu:590-596`, `Fp8PlanRefusalFor` in `fp8_plan_cache.h`, pinned by
+`tests/vt/test_fp8_plan_cache.cpp`). Re-run with `VT_GEMM_ALGO_LOG=1` and read
+`reason=` / `pointerModeCapMask=` rather than re-deriving an absence.
+
+## The z-slice fallback is REJECTED: it cannot be byte-exact
+
+The obvious fallback — run the GEMM with **scalar** `alpha = qkv.alpha` and scale
+only the 6144-column z-slice afterwards, a 2.7x narrower pass worth ~62% of the
+122.99 ms — **fails the row's own correctness bar**, and the arithmetic says so
+before any GPU does.
+
+`alpha_vec` is genuinely two-valued and the slice is genuinely well-shaped; both
+preconditions hold (§Verified below). The defect is the multiply, not the layout.
+A scalar GEMM alpha applies to **every** output column, so the z-slice does not
+keep a raw accumulator to scale — it must be *corrected* by the ratio
+`r = fl(z.alpha / qkv.alpha)`:
+
+```text
+today     out = fl(acc * B)                 -- acc*1.0 is exact, then ONE multiply
+z-slice   out = fl(fl(acc * A) * r)         -- TWO roundings, and r itself inexact
+```
+
+That is double rounding on an already-rounded product, not "the same per-column
+scalar applied elsewhere". Measured over 2e6 random f32 accumulators per case at
+representative modelopt folded alphas (`input_scale * weight_scale`), **25-36% of
+the z-slice's f32 words differ from today's result by 1 ulp** — six of six
+random (A,B) pairs, worst case 35.84%.
+
+There is exactly one escape, and it is a property of the checkpoint, not of the
+code: **iff `qkv.alpha` is exactly a power of two**, `acc * A` is exact and
+`z.alpha / qkv.alpha` is exact (both are pure exponent shifts), so the corrected
+suffix reproduces `fl(acc * B)` bit for bit — the same sweep returns **0 / 2e6**
+mismatches for `A = 0.0078125`. Nothing in `ResidentFp8Qkvz` guarantees or checks
+that, and a modelopt `amax/448` scale is not a power of two in general. Gating
+the arm on `std::frexp(qkv.alpha).first == 0.5` would be sound but would leave a
+lever that silently does nothing on almost every checkpoint.
+
+Per §Stop conditions ("Not bitwise at the gate shapes -> `NEEDS_DECISION`. Never
+adjust a golden"), the z-slice is **not implemented**. It is a ~76 ms/req
+throughput win in exchange for a 1-ulp perturbation of ~30% of the GDN
+`in_proj_qkvz` output on both gate models — a correctness trade this row is
+explicitly forbidden from making unilaterally.
+
+## Verified while rejecting it (both preconditions HOLD)
+
+Recorded so the next attempt does not re-derive them:
+
+1. **`alpha_vec` IS two-valued.** `qwen3_5.cpp:3304-3306` builds it with exactly
+   two `std::fill` runs — `qkv.alpha` over `[0, qkv.n)`, `z.alpha` over
+   `[qkv.n, total_n)`. Two runs, first one longer (10240 vs 6144 at the 27B gate),
+   so the z-slice is correctly the narrower half to correct.
+2. **The z-slice is the right shape for a narrowed launch.** In the row-major
+   `[M, total_n]` f32 output a column range is contiguous *within* each row and
+   strided across rows — 6144 f32 = 24 KB contiguous per row, so coalescing is
+   unaffected and the traffic falls with the width, as a bandwidth-bound pass
+   requires. It needs **no new kernel**: `MulColVecF32Kernel`
+   (`cuda_glue.cu:94-112`) already takes `row_size` and `row_stride` separately,
+   so a strided sub-view with `row_size = z.n`, `row_stride = total_n` and the
+   data pointer offset by `qkv.n` floats drives the existing kernel unchanged.
+
+The third precondition — that folding a scalar alpha into the GEMM leaves the
+**prefix** bit-exact — is UNVERIFIED and is itself shape-conditional: `alpha` is
+a runtime argument, not a descriptor field, so it cannot reselect the algo, but
+under a split-K reduction scheme whether alpha is applied before or after the
+partial reduction decides whether `fl(acc*A)` is even well-defined. #213 measured
+`splitK=1` at this gate shape; that would have to be re-confirmed.
+
+## Next traceable hypothesis — a DIFFERENT cuBLASLt API for the same fusion
+
+Not a ceiling: the pointer-mode API is refused, but it is **not the only** way
+cuBLASLt applies a per-column f32 vector in an fp8 epilogue, and the alternative
+has not been tried.
+
+`CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` (17) with `CUBLASLT_MATMUL_DESC_A_SCALE_MODE`
+(31) set to `CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F` (3) — `cublasLt.h:923-940`,
+"Scaling factors are vectors of `CUDA_R_32F` values ... expected to have M and N
+elements respectively, and each (i,j)-th element of product of A and B is
+multiplied by i-th element of A scale". With our TN layout (`op(A)` = weight
+`[N,K]`, D column-major `[N,M]`), that A-side length "M" **is our N** — so it
+consumes the *same* resident `f32 [N]` vector, in the *same* layout, with no
+repack and no new allocation, exactly as §The mechanism derived for the alpha
+vector.
+
+Why it is a genuinely different shot rather than the same one renamed:
+
+- It is fp8's **per-channel/rowwise scaling** path — the one `torch._scaled_mm`
+  uses for rowwise fp8 on Hopper/Blackwell — not a general alpha-vector epilogue,
+  so it is far likelier to be implemented for exactly our e4m3 TN shape.
+- It is gated by **scale/compute-type support**, surfacing as `CUBLAS_INVALID_VALUE`
+  from `cublasLtMatmul`, *not* by `CUBLASLT_ALGO_CAP_POINTER_MODE_MASK` — the cap
+  bit that refused us has no authority over it.
+- It applies the vector to the product, i.e. one multiply on the f32 accumulator,
+  so the byte-exactness argument of §Byte-exactness carries over unchanged, and
+  the same bitwise gate-shape test decides it.
+
+Cheap to settle before writing any kernel: a standalone cuBLASLt probe on GB10
+that sets the two attributes at the 27B gate shape (M=4096, N=16384, K=5120,
+e4m3, `CUBLAS_COMPUTE_32F`) and reports whether `cublasLtMatmul` accepts them.
+That probe, not another A/B of the refused arm, is the next step.
+
 ## Now
 
-Spec committed. Implementation next: the vt seam + CUDA pointer-mode arm + CPU
-plumbing tests. GPU evidence (tests 2-4 and every gate above) is **owed** and
-cannot be produced in this worktree — the implementer host has no `nvcc` and no
-CUDA device, so every numerical claim ships UNVERIFIED for the operator to run.
+Spec + pointer-mode arm committed; the arm is **inert on GB10** (measured above)
+and stays default OFF. The z-slice fallback is **rejected on numerics** and not
+implemented — this row returns **`NEEDS_DECISION`** on it. Landed alongside: the
+named refusal diagnostic and its CPU-tier test, so the next GPU run reports a
+cause instead of an absence.
+
+Open decisions for the operator, in order of value:
+
+1. Run the `OUTER_VEC_32F` probe above. If it is accepted, the FULL 122.99 ms is
+   back on the table with the original byte-exactness argument intact.
+2. If it is refused too, decide explicitly whether a 1-ulp perturbation of ~30%
+   of this tensor is worth ~76 ms/req. Default answer is no.
+3. `#417`'s bf16-output lever (−61.5 ms on this same buffer) is unaffected by any
+   of the above and is now the only *uncontested* saving on this tensor.
+
+GPU evidence for everything numerical remains **owed**: this worktree has no
+`nvcc` and no CUDA device.
 
 ## Outcome
 
-Pending.
+Pending — see §Now. The primary mechanism is implemented and measured
+UNAVAILABLE on GB10/sm_121a (not refuted); the named fallback is measured
+NOT byte-exact and rejected; one untried mechanism remains.

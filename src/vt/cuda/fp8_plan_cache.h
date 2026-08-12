@@ -84,6 +84,27 @@ inline bool Fp8PlanCacheEnabled() {
 // Pure (CUDA-free) pieces live here so the flag parse, the plan-key separation
 // and the algo-capability predicate are unit-testable on every platform
 // (tests/vt/test_fp8_plan_cache.cpp), exactly like the plan-cache flag above.
+//
+// MEASURED, GB10 / sm_121a, 2026-08-11 — THE CAPABILITY IS NOT OFFERED HERE.
+// A same-binary run of the 27B gate with VT_GEMM_ALGO_LOG=1 emitted ZERO
+// `TN-fp8-alphavec` lines and the identical 5 `TN-fp8` lines under BOTH
+// VT_FP8_ALPHA_VEC_EPILOGUE=0 and =1: the fallback fired on every call, so the
+// two arms ran byte-identical code and the 0.9954/0.9973 A/B taken from them is
+// VOID, not negative — this path never executed. Do not re-derive that; re-run
+// it only against a NEW driver/GPU, and read the refusal REASON the log now
+// names (Fp8PlanRefusal below) rather than inferring one from an absence.
+// The arm stays in the tree, correct and DEFAULT OFF, for the hardware that does
+// offer the mode. The untried alternative for the SAME fusion is a different
+// cuBLASLt API, not this one: CUBLASLT_MATMUL_DESC_A_SCALE_POINTER (17) with
+// CUBLASLT_MATMUL_DESC_A_SCALE_MODE (31) = CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F
+// (3), documented in cublasLt.h as "vectors of CUDA_R_32F ... expected to have M
+// and N elements respectively, and each (i,j)-th element of product of A and B
+// is multiplied by i-th element of A scale" — with our TN layout (op(A)=weight
+// [N,K], D col-major [N,M]) that vector length M is exactly our N, i.e. the SAME
+// resident f32 [N] vector in the SAME layout. It is fp8's per-channel scaling
+// path (what torch `_scaled_mm` rowwise uses), it is gated by scale/compute-type
+// support rather than by CUBLASLT_ALGO_CAP_POINTER_MODE_MASK, and nothing here
+// has tried it. See .agents/specs/perf-fp8-alpha-fold.md §Outcome.
 
 // Pure predicate for the VT_FP8_ALPHA_VEC_EPILOGUE contract: DEFAULT OFF, and
 // enabled only for the exact value "1". nullptr (unset) and every other value
@@ -132,6 +153,43 @@ inline constexpr unsigned int kFp8PointerModeMaskAlphaDeviceVectorBetaZero = 8U;
 // A false here is not an error — it selects the two-launch fallback.
 inline bool Fp8AlphaVecCapSupported(unsigned int pointer_mode_cap_mask) {
   return (pointer_mode_cap_mask & kFp8PointerModeMaskAlphaDeviceVectorBetaZero) != 0U;
+}
+
+// Why a vector-alpha plan build refused, as a NAMED cause. BuildFp8Plan can
+// decline for two materially different reasons that the algo log cannot tell
+// apart from the outside — it emits nothing at all in either case — and they
+// point at different next steps: kNoHeuristic means cuBLASLt offers no fp8 algo
+// for this shape once the pointer mode is on the descriptor, while
+// kPointerModeUnsupported means it offered one that does not advertise the mode.
+// The 2026-08-11 GB10 run above could distinguish neither, which is the whole
+// reason this exists. Pure so the mapping is pinned on the CPU tier.
+enum class Fp8PlanRefusal {
+  kNone = 0,                  // a usable plan was built
+  kNoHeuristic,               // no algo returned for the shape at all
+  kPointerModeUnsupported,    // algo returned, but its cap mask refuses our mode
+};
+
+// heuristic_ok = cuBLASLt returned at least one algo; pointer_mode_ok = the cap
+// check passed (trivially true for scalar-alpha keys, which never set a mode).
+// "No heuristic" dominates: when nothing was returned there is no algo whose
+// capability could have been read, so reporting a cap refusal would be a lie.
+inline Fp8PlanRefusal Fp8PlanRefusalFor(bool heuristic_ok, bool pointer_mode_ok) {
+  if (!heuristic_ok) return Fp8PlanRefusal::kNoHeuristic;
+  if (!pointer_mode_ok) return Fp8PlanRefusal::kPointerModeUnsupported;
+  return Fp8PlanRefusal::kNone;
+}
+
+// Stable log token for a refusal. Never returns nullptr.
+inline const char* Fp8PlanRefusalTag(Fp8PlanRefusal r) {
+  switch (r) {
+    case Fp8PlanRefusal::kNoHeuristic:
+      return "no-heuristic";
+    case Fp8PlanRefusal::kPointerModeUnsupported:
+      return "pointer-mode-unsupported";
+    case Fp8PlanRefusal::kNone:
+      break;
+  }
+  return "none";
 }
 
 // The FULL key that determines the cuBLASLt descriptor + selected algo for the
