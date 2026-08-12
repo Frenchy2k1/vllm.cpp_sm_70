@@ -1,19 +1,16 @@
 # ROCm (AMD GPU) backend — contributor guide
 
-**State today: the W0 skeleton is community-verified on four architectures, and
-the F6 unified-memory fix (approach (b)) is committed but unverified.**
-[Issue #41](https://github.com/mudler/vllm.cpp/issues/41) board owners compiled
-the HIP sources clean and ran the ctest gates on gfx1151 (Strix Halo), gfx1103
-(Radeon 780M), gfx1100 (4x 7900 XTX) and gfx1201 (2x R9700) — M0 and M1 MET on
-all four, with two runtime-teardown caveats recorded in §7. Their headline
-finding, F6: `UnifiedMemory()` probed **false** on the RDNA3 APUs, because
-XNACK-less RDNA reports `PageableMemoryAccess=0`, so the zero-kernel reference
-tier the whole unified-memory plan rests on did not install and M2 was blocked.
-The ratified fix (§3.1) allocates through `hipMallocManaged` on integrated
-managed-capable devices so host access is API-guaranteed — written blind like
-the skeleton before it, so **the (b) branch owes the same community compile+run
-evidence W0 already earned**; a compile error in it is useful data, not a
-mistake on your side.
+**State today: runtime-verified on five architectures, with model execution on
+both integrated and discrete AMD GPUs.** [Issue #41](https://github.com/mudler/vllm.cpp/issues/41)
+board owners compiled and ran the HIP gates on gfx1151 (Strix Halo), gfx1103
+(Radeon 780M), gfx1100 (4x 7900 XTX), gfx1201 (2x R9700), and gfx1200 (RX 9060
+XT). The F6 unified-memory fix is still unverified on the integrated boards. On gfx1200,
+Gemma-3-1B-it is 48/48 token-identical to two independent vLLM-ROCm oracles;
+Qwen3-0.6B exposed a deterministic cross-version near-tie. Qwen3.5-0.8B also
+runs all-native through the GDN stack, but its CPU/ROCm divergence is still an
+open correctness gap. The Gemma-4 FP8 MoE and SharedK-WMMA path has contributor
+runtime evidence on 2x R9700; this repository has only CPU link coverage for
+that path, and no matched oracle performance result.
 
 This page exists because several people offered hardware in
 [issue #41](https://github.com/mudler/vllm.cpp/issues/41), and it answers the
@@ -25,7 +22,7 @@ deliberately left out, is
 unified-memory decision record is
 [.agents/specs/rocm-unified-memory-b.md](../.agents/specs/rocm-unified-memory-b.md).
 
-Everything here is checked against the tree on 2026-08-08. Where a number is
+Everything here is checked against the tree on 2026-08-12. Where a number is
 counted, the command that counts it is given, because these numbers drift.
 
 ## 1. Why ROCm is the cheapest backend to add
@@ -43,8 +40,8 @@ Three structural facts, in the order they matter:
    Metal/Vulkan situation, where every kernel is written from scratch against a
    foreign API. Most of `src/vt/cuda/` is HIP source that has not been hipified
    yet. Upstream also ships RDNA3-specific kernels in `csrc/rocm/`
-   (`q_gemm_rdna3.cu`, `moe_q_gemm_rdna3.cu`, `skinny_gemms.cu`), and every board
-   offered in #41 so far is RDNA3.
+   (`q_gemm_rdna3.cu`, `moe_q_gemm_rdna3.cu`, `skinny_gemms.cu`). The community
+   hardware now spans RDNA3 and RDNA4.
 
    One caveat, so nobody loses an afternoon to it: vLLM's own `cmake/hipify.py`
    imports `torch.utils.hipify`, so it is a **torch-dependent** tool and we
@@ -65,27 +62,26 @@ on a real machine, and what has not.
 |---|---|---|
 | Device enum | [`include/vt/device.h`](../include/vt/device.h) | ✅ compiled; the enum forced exactly one switch site tree-wide |
 | — | [`include/vt/rocm/rocm_arch.h`](../include/vt/rocm/rocm_arch.h) — gfx name → `(major, minor)`, ported 1:1 from `rocm.py:223` | ✅ **unit-tested**, 40 assertions, no GPU needed |
-| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) — the 6 `vt::Backend` virtuals | ✅ W0 compiled + ctest-run on gfx1151/1103/1100/1201 (#41) — ❌ the approach-(b) delta is **unbuilt** |
-| Op table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) — one `RegisterOp` line | ✅ compiled + run on the same four boards |
-| Kernel | [`src/vt/rocm/rocm_rmsnorm.hip`](../src/vt/rocm/rocm_rmsnorm.hip) | ✅ NMSE ≤ 5e-4 vs the CPU oracle on all four boards (F5: RDNA is wave32, the wave64 hazard moves to a future gfx9 board) |
-| Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) — mirrors `vllm/platforms/rocm.py` | ✅ compiles `-Werror` everywhere; ✅ run on the four boards |
-| Attention | *(none yet — `get_attn_backend_priority()` returns empty)* | — |
-| Build | `VLLM_CPP_HIP` in [`CMakeLists.txt`](../CMakeLists.txt) | ✅ ON-path configure+build on the four boards (Arch/TheRock now auto-hinted, §5 M0); ✅ the OFF path and the fail-without-hipcc path |
-| Test | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | ✅ W0 cases run green (1044 assertions in the #41 tables) — ❌ the two approach-(b) cases never run |
+| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) | W0 compiled and ran on five architectures; the integrated managed-allocation branch is committed but still lacks a board run |
+| Op table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) | 44 distinct `OpId` registrations in the current source; dense and GDN model traces report native dispatch on gfx1200 |
+| Kernels | [`src/vt/rocm/`](../src/vt/rocm/) | Dense attention/MLP/sampling plus the GDN state, convolution, recurrence and fused preamble families; Gemma-4 FP8 MoE is contributor-verified on gfx1201 |
+| Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) | Compiles `-Werror`; runtime-verified on five gfx architectures |
+| Attention | [`src/vt/rocm/rocm_paged_attn.hip`](../src/vt/rocm/rocm_paged_attn.hip) | Native paged attention; SharedK-WMMA prefill is available for the contributor-tested RDNA4 Gemma-4 path |
+| Build | `VLLM_CPP_HIP` in [`CMakeLists.txt`](../CMakeLists.txt) | ON-path configure and build verified on five architectures; OFF path and fail-without-hipcc path covered |
+| Test | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | W0 cases run on community hardware; the managed-allocation cases remain pending. Model-level evidence is linked in §4 |
 
-So the shape is decided and the parts that hold a *decision* are tested; what
-you are validating is the API glue. Adding your own op is one line in
-`rocm_ops.hip` plus the kernel — no selector, model or runner edit anywhere.
+The backend stays additive. A native op adds its kernel and a registration in
+`rocm_ops.hip`; model and runner code remain backend-agnostic.
 
-Op coverage as of 2026-08-06 (`OpId` has 106 entries):
+Op coverage as of 2026-08-12:
 
 | Backend | Registered ops |
 |---|---|
-| CUDA | 103 |
-| CPU | 83 |
+| CUDA | 84 |
+| CPU | 70 |
 | Metal | 19 |
-| Vulkan | 8 |
-| **ROCm** | **1** (RmsNorm) |
+| Vulkan | 23 |
+| **ROCm** | **44** distinct `OpId` registrations |
 
 Recount before quoting:
 
@@ -184,7 +180,7 @@ a gated backend.
 
 ## 5. Milestones as concrete PRs
 
-**M0 — build. MET** on gfx1151, gfx1103, gfx1100 and gfx1201 (#41 tables).
+**M0: build. MET** on gfx1151, gfx1103, gfx1100, gfx1201 and gfx1200 (#41 tables).
 Tri-state `VLLM_CPP_HIP`, hipcc detection that fails loudly,
 `VLLM_CPP_HIP_ARCHITECTURES`, `ROCM_PATH`. The Arch/TheRock findings F1/F3 are
 now absorbed into the configure: when `ROCM_PATH` points at a real install
@@ -200,12 +196,12 @@ your compiler identification failed and that configure log is the thing to
 post. *The absorption itself is untested on a real Arch/TheRock layout — a
 configure log from one, with no manual flags, is wanted evidence on #41.*
 
-**M1 — platform + backend. MET** on the same four boards: `ctest -R
+**M1: platform + backend. MET** on the same five boards: `ctest -R
 'rocm|cross_device'` green, RmsNorm within NMSE ≤ 5e-4 of the CPU oracle on
 real silicon — with two runtime caveats, both teardown-related, in §5.1 below.
 
-**M2 — first model end to end. UNBLOCKED-UNVERIFIED on unified parts** by the
-§3.1 fix: assert `ReferenceTierEligible(kROCM)` and run a small dense model.
+**M2: first model end to end. MET on gfx1200; available on unified parts** through
+the §3.1 fix. On an integrated board, assert `ReferenceTierEligible(kROCM)` and run a small dense model.
 Acceptance: greedy token parity against the **CPU backend** on the same build,
 plus the `VT_OP_PROVIDER_STATS=1` output showing which ops fell back, which is
 your kernel to-do list, sorted by real usage rather than by guesswork.
