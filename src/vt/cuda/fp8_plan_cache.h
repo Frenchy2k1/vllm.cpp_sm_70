@@ -231,6 +231,37 @@ inline const char* Fp8Bf16DSplitKTag(Fp8Bf16DSplitK v) {
   return "split-k-not-1";
 }
 
+// ---- WHOSE premise it is: the LEVER's, not the DTYPE's ----------------------
+// The verdict above answers "was splitK 1?". This answers the question that
+// actually gates the GEMM: "may this CALL SITE proceed?" — and the two are not
+// the same question, which was review finding F-A against the first repair.
+//
+// `splitK == 1` is a precondition of the bf16-D LEVER (VT_GDN_FP8_IN_BF16),
+// whose whole claim is that its bf16 D is byte-equivalent to the f32 D of the
+// SAME call site. A split-K plan would break that claim, so the lever is held
+// to it. Nothing else is. A bf16 D is otherwise an ordinary, long-shipped,
+// DEFAULT-ON output dtype on this path — every `o_proj_fp8` / `out_proj_fp8`
+// in qwen3_5.cpp reaches vt::MatmulFp8CublasLt at DType::kBF16 via
+// MatmulFp8Cutlass{,PreQuant}D whenever DenseCublasLtFp8Enabled() (ON unless
+// VT_DENSE_CUBLASLT_FP8=0) — and those call sites never claimed equivalence
+// with an f32-D arm. They want a bf16 output; split-K is simply correct for
+// them, and refusing it would be a new throw on a default path.
+//
+// So the CLAIM is an input, passed down from the call site that makes it, and
+// the ENTIRE decision lives here on the CPU tier: the .cu side reads the
+// attribute and calls this, and carries no branch of its own. That is the
+// structural half of the fix — the first repair's scope lived in an
+// uncompilable `if (!out_is_bf16) return;` inside the .cu, where no CPU-tier
+// test could reach it and, on this host, nothing could even compile it.
+//
+// Refuse iff the caller CLAIMED the premise and the verdict is inadmissible.
+inline bool Fp8Bf16DSplitKRefuses(bool premise_claimed, bool out_is_bf16, bool split_k_read_ok,
+                                  int32_t split_k) {
+  if (!premise_claimed) return false;  // never claimed it -> never held to it
+  return !Fp8Bf16DSplitKAdmissible(
+      Fp8Bf16DSplitKVerdict(out_is_bf16, split_k_read_ok, split_k));
+}
+
 // Why a vector-alpha plan build refused, as a NAMED cause. BuildFp8Plan can
 // decline for two materially different reasons that the algo log cannot tell
 // apart from the outside — it emits nothing at all in either case — and they

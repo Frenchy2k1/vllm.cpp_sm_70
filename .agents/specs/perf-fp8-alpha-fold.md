@@ -591,6 +591,37 @@ than by a gate:
   tolerance, because a tolerance here would only be measuring how well bf16
   conceals the defect. The f32-D arm never claimed the premise and is not held to
   it.
+- **That enforcement was itself scoped WRONG on its first attempt, and the repair
+  is the more interesting record** (review of `33737b4b`, findings F-A/F-B; fixed
+  on `row/PERF-MAXSTACK-27B-FIX2`, issue #339). The first version keyed the
+  refusal on the DTYPE — `if (out_type != CUDA_R_16BF) return;` was its only
+  guard — and the call sits in the generic op, so it fired for **every** bf16-D
+  fp8 cuBLASLt GEMM in the tree. Those are a pre-existing, DEFAULT-ON capability:
+  every `o_proj_fp8` / `out_proj_fp8` in `qwen3_5.cpp` reaches
+  `vt::MatmulFp8CublasLt` at `DType::kBF16` through
+  `MatmulFp8Cutlass{,PreQuant}D` whenever `DenseCublasLtFp8Enabled()`, which is ON
+  unless `VT_DENSE_CUBLASLT_FP8=0`. None of them ever claimed byte-equivalence
+  with an f32-D arm — they just want a bf16 output, and split-K is correct for
+  them. So a repair meant to protect an opt-in, DEFAULT-OFF lever put a NEW THROW
+  on a default path, falsifying this row's own claim that with both toggles unset
+  behavior is byte-identical to before it. The premise belongs to the LEVER, not
+  to the dtype, so it now travels with the caller that makes it:
+  `vt::MatmulFp8CublasLt{,AlphaVec}` take `claims_splitk1_premise` (default
+  FALSE), only `MergedFp8QkvzD` passes it (`want == kBF16`, reachable only under
+  `GdnFp8InBf16Enabled()`), and the entire decision is the pure
+  `Fp8Bf16DSplitKRefuses`, unit-tested and mutation-proved on the CPU tier.
+  Two further consequences of that first attempt: the driver was queried on EVERY
+  bf16-D fp8 GEMM, now observed ONCE at plan build into `Fp8Plan`; and the throw
+  could fire INSIDE a CUDA-graph capture region (`qwen3_5.cpp`, both decode
+  drivers) where a skipped `EndCaptureGraph` leaves the stream in
+  `cudaStreamCaptureModeThreadLocal` capture **permanently**, failing every later
+  CUDA call on it with an error that looks nothing like its cause and that the
+  first catch (the engine thread) cannot repair. Both capture regions now drain
+  and rethrow, mirroring the guard `qwen3_dflash.cpp` already had. **The
+  generalisable lesson: a guard's SCOPE is as much a correctness property as its
+  verdict, and putting a decision inside a `.cu` that the CPU tier cannot compile
+  is how a wrong scope survives a green gate.** The verdict itself is unchanged
+  and still correct; only who it binds moved.
 - **`AlphaVecBf16TakesTwoLaunch` is NOT coverage of what this lever changes.**
   It is a good test of a different thing. It pins that a bf16 D REFUSES the
   cuBLASLt epilogue arm and always takes the two-launch fallback — but *both* of
