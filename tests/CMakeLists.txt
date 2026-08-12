@@ -24,6 +24,14 @@ function(vllm_cpp_add_test name)
   endif()
   vllm_cpp_set_warnings(${name})
   add_test(NAME ${name} COMMAND ${name})
+  # A gate that cannot run must not report success. doctest exits 0 after a
+  # TEST_CASE returns early, printing "assertions: 0 | 0 passed | 0 failed" and
+  # "Status: SUCCESS!" — indistinguishable, in a log or a `&&` chain, from a gate
+  # that loaded a model and matched an oracle (issue #463; multimodal-speed.md
+  # §17.7 hit exactly this). A test whose preconditions are absent exits 77
+  # instead and CTest reports it **Skipped**. Inert for any test that never
+  # returns 77, which today is all but test_voxtral_e2e.
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
@@ -1124,6 +1132,10 @@ vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
 vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
+# vt::AttentionDenseFa2 (multimodal-speed §17, #432): fast-path agreement with the
+# byte-exact scalar kernel, full-key-range coverage, fall-through totality, and the
+# VT_FA2_DENSE A/B knob. CUDA-only content; skips cleanly on a CPU box.
+vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
@@ -1377,6 +1389,21 @@ vllm_cpp_add_test(test_qwen27_paged_engine parity/test_qwen27_paged_engine.cpp)
 target_compile_definitions(test_qwen27_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen27_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# `GATE-27B-FP8-TOWER-GOLDEN` (issue #466): the SECOND dense 27B arm, pinned to
+# nvidia/Qwen3.6-27B-NVFP4@0893e160 (`modelopt_mixed` — W4A16 NVFP4 MLP + FP8
+# W8A8 tower + NVFP4 head). The gate above pins unsloth@890bdef7, whose GDN
+# input projections are BF16, so every fp8 branch is dead code there and that
+# gate can never fail for an fp8 defect. This arm asserts the fp8 GDN
+# input-projection dispatch contract UNCONDITIONALLY — a zero count is a
+# failure, not a skipped block. Checkpoint-gated, dgx-only; on CPU/CI it refuses
+# loudly instead of reporting a vacuous pass.
+vllm_cpp_add_test(test_qwen27n_fp8_tower_paged_engine
+  parity/test_qwen27n_fp8_tower_paged_engine.cpp)
+target_compile_definitions(test_qwen27n_fp8_tower_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27n_fp8_tower_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.

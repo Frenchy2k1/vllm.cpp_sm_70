@@ -105,6 +105,35 @@ Qwen3DSparkWeights LoadQwen3DSpark(const TensorResolver& get, const HfConfig& co
                "qwen3_dspark: d2t maps a draft id outside the target vocab");
       w.draft_id_to_target_id[static_cast<size_t>(i)] = static_cast<int32_t>(off);
     }
+    // Gather markov_w1's rows into DRAFT order once, here, so the sequential
+    // sampler can index it with the raw device argmax and never round-trip the
+    // draft->target map through the host mid-chain. Pure data movement: row j of
+    // the result IS row (j + d2t[j]) of markov_w1.
+    {
+      const int64_t R = w.markov_rank;
+      VT_CHECK(w.markov_w1.rank == 2 && w.markov_w1.shape[0] == w.vocab_size &&
+                   w.markov_w1.shape[1] == R,
+               "qwen3_dspark: markov_w1 must be [vocab_size, markov_rank] before "
+               "the draft-order gather");
+      OwnedTensor t;
+      t.dtype = vt::DType::kBF16;
+      t.rank = 2;
+      t.shape[0] = w.draft_vocab_size;
+      t.shape[1] = R;
+      t.nk = w.markov_w1.nk;
+      t.bytes.resize(static_cast<size_t>(w.draft_vocab_size) *
+                     static_cast<size_t>(R) * sizeof(uint16_t));
+      const auto* src_rows = reinterpret_cast<const uint16_t*>(w.markov_w1.bytes.data());
+      auto* dst_rows = reinterpret_cast<uint16_t*>(t.bytes.data());
+      for (int64_t j = 0; j < w.draft_vocab_size; ++j) {
+        const int64_t target =
+            j + w.draft_id_to_target_id[static_cast<size_t>(j)];
+        std::memcpy(dst_rows + static_cast<size_t>(j * R),
+                    src_rows + static_cast<size_t>(target * R),
+                    static_cast<size_t>(R) * sizeof(uint16_t));
+      }
+      w.markov_w1_draft = std::move(t);
+    }
   } else {
     VT_CHECK(w.draft_vocab_size == w.vocab_size,
              "qwen3_dspark: a reduced draft vocab needs the d2t remap table");

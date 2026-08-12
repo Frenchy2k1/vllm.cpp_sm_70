@@ -2572,6 +2572,35 @@ void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tenso
       q, out, query, key, value, args);
 }
 
+void AttentionDenseFa2(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                       const Tensor& value, const AttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "attention-dense-fa2: query/key/value/out rank-3 [T,H,D]");
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
+           "attention-dense-fa2: query/key/value token count must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention-dense-fa2: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention-dense-fa2: key/value must share the kv-head count");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
+           "attention-dense-fa2: out must be [T,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "attention-dense-fa2: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(args.scale > 0.0f, "attention-dense-fa2: scale must be set (> 0)");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
+           "attention-dense-fa2: query/key/value must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "attention-dense-fa2: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               out.IsContiguous(),
+           "attention-dense-fa2: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               out.device == q.device,
+           "attention-dense-fa2: device mismatch (query/key/value/out/queue)");
+  reinterpret_cast<AttentionFn>(GetOp(OpId::kAttentionDenseFa2, q.device.type))(
+      q, out, query, key, value, args);
+}
+
 void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                           const Tensor& value, const DFlashBlockAttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
