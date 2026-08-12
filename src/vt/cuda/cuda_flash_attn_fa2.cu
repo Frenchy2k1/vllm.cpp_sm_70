@@ -506,6 +506,154 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   Check(cudaGetLastError(), "splitkv dispatch launch");
 }
 
+// ─── DENSE ENCODER SELF-ATTENTION (multimodal-speed §17) ────────────────────
+// Launch FA-2 over a DENSE, non-paged, single-request, non-causal q/k/v triple at
+// head_dim 64 — the Whisper audio encoder's self-attention. This is upstream's
+// plain batch forward (`run_mha_fwd_`, the `mha_fwd` entry), not the split-KV
+// dispatch every other launcher in this file uses.
+//
+// THIS IS A SEPARATE ENTRY POINT ON PURPOSE, exactly as the MLA launcher below is.
+// `LaunchPrefillFA2Bf16` is the PAGED launcher (block_table + seqused_k, 4-D k/v
+// caches, head_dim {128,256}); nothing in it is touched, so the 27B / 35B /
+// Qwen3-dense prefill paths stay byte-identical by construction. What is shared is
+// the vendored kernel template, which supports a null `cu_seqlens_q` — `BlockInfo`
+// then reads the geometry from `params.seqlen_q`/`seqlen_k` and offsets by the
+// BATCH stride (`block_info.h` `q_offset`/`k_offset` with `sum_s_q == -1`), which
+// is precisely the dense single-request layout the encoder already produces.
+//
+// vLLM grounding: `WhisperEncoderAttention.forward`
+// (vllm/model_executor/models/whisper.py:298-317 @ e24d1b24) hands q/k/v straight
+// to `self.attn`, which on CUDA resolves to `flash_attn_varlen_func` with
+// `causal=False` — the SAME FlashAttention-2 forward compiled here. The encoder
+// runs one sequence per forward, so upstream's varlen call over a single sequence
+// and this batch call over b=1 drive the identical kernel geometry.
+//
+// Layouts (elements, bf16):
+//   query/key/value [t, h, d] contiguous  (h_k == h: Whisper is MHA, no GQA)
+//   out             [t, h, d] contiguous
+// Non-causal only (no encoder is causal), b == 1, seqlen_q == seqlen_k == t.
+//
+// `causal` is a PARAMETER rather than an assumption. The only compiled
+// instantiation is `run_mha_fwd_<bfloat16_t, 64, /*Is_causal=*/false>`, so a causal
+// request cannot be served here; taking the flag and refusing is what makes the
+// refusal real rather than a comment. Before this argument existed the launcher
+// hardcoded `p.is_causal = false` and a caller asking for causal got a silently
+// non-causal answer (review of PR #439, mutation M3: output BIT-IDENTICAL to the
+// non-causal arm with no diagnostic).
+void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                        const Tensor& key, const Tensor& value, float scale, bool causal) {
+  const int64_t t = query.shape[0], h = query.shape[1], d = query.shape[2];
+  if (t == 0 || h == 0 || d == 0) return;
+  // Gates the CALLER must have enforced (mirroring LaunchPrefillFA2Bf16's contract):
+  // the dispatch site decides applicability, and this launcher refuses anything else
+  // rather than silently computing something different.
+  if (query.dtype != DType::kBF16 || key.dtype != DType::kBF16 ||
+      value.dtype != DType::kBF16 || out.dtype != DType::kBF16) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: bf16 query/key/value/out required (dispatch gate must "
+        "enforce)");
+  }
+  if (d != 64) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: head_dim 64 only — the sole compiled non-split "
+        "instantiation (dispatch gate must enforce)");
+  }
+  if (key.shape[1] != h || value.shape[1] != h) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: MHA only, h_k must equal h (dispatch gate must enforce)");
+  }
+  if (causal) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: non-causal only — the sole compiled instantiation is "
+        "Is_causal=false (dispatch gate must enforce)");
+  }
+
+  // softmax_lse [b, h, seqlen_q] f32 — the PADDED (non-varlen) LSE layout the batch
+  // kernel writes when `unpadded_lse` is false (flash_fwd_kernel.h:32,41). Written
+  // by the kernel and not consumed here; the per-stream grow-only buffer mirrors the
+  // caching allocator upstream gets from PyTorch and is released with the queue.
+  const auto scratch = Fa2ScratchFor(query.device.index, s);
+  std::lock_guard<std::mutex> submit_lock(scratch->submit_mu);
+  float* softmax_lse = static_cast<float*>(EnsureGrowOnly(
+      scratch->prefill_lse,
+      static_cast<size_t>(h) * static_cast<size_t>(t) * sizeof(float), s,
+      "dense softmax_lse alloc"));
+
+  FLASH_NAMESPACE::Flash_fwd_params p{};  // zero-init: nulls knew/rotary/alibi/accum/leftpad
+  p.is_bf16 = true;
+
+  p.q_ptr = query.data;
+  p.k_ptr = key.data;
+  p.v_ptr = value.data;
+  p.o_ptr = out.data;
+
+  // Strides in ELEMENTS. b == 1, so the batch strides are never actually stepped;
+  // they are set to the full sequence extent so the layout stays self-consistent.
+  p.q_row_stride = query.stride[0];
+  p.k_row_stride = key.stride[0];
+  p.v_row_stride = value.stride[0];
+  p.o_row_stride = out.stride[0];
+  p.q_head_stride = query.stride[1];
+  p.k_head_stride = key.stride[1];
+  p.v_head_stride = value.stride[1];
+  p.o_head_stride = out.stride[1];
+  p.q_batch_stride = t * query.stride[0];
+  p.k_batch_stride = t * key.stride[0];
+  p.v_batch_stride = t * value.stride[0];
+  p.o_batch_stride = t * out.stride[0];
+
+  // Dense mode: null cu_seqlens_q/k and null seqused_k select the batch geometry in
+  // BlockInfo (actual_seqlen_q = params.seqlen_q, offset by the batch stride).
+  p.cu_seqlens_q = nullptr;
+  p.cu_seqlens_k = nullptr;
+  p.seqused_k = nullptr;
+  p.softmax_lse_ptr = softmax_lse;
+
+  p.b = 1;
+  p.h = static_cast<int>(h);
+  p.h_k = static_cast<int>(h);
+  p.h_h_k_ratio = 1;
+  p.seqlen_q = static_cast<int>(t);
+  p.seqlen_k = static_cast<int>(t);
+  p.seqlen_q_rounded = RoundMultiple(static_cast<int>(t), 128);
+  p.seqlen_k_rounded = RoundMultiple(static_cast<int>(t), 128);
+  p.d = static_cast<int>(d);
+  p.d_rounded = RoundMultiple(static_cast<int>(d), 32);
+  p.total_q = static_cast<int>(t);
+
+  p.scale_softmax = scale;
+  p.scale_softmax_log2 = scale * static_cast<float>(M_LOG2E);
+  p.softcap = 0.0f;
+
+  // Dropout disabled (inference): keep-prob 1.0.
+  p.p_dropout = 1.0f;
+  p.p_dropout_in_uint8_t = uint8_t(255);
+  p.rp_dropout = 1.0f;
+  p.scale_softmax_rp_dropout = scale;
+  p.philox_args = at::PhiloxCudaState(0, 0);
+
+  // Fully bidirectional: no causal mask, no local window. `causal` is false here —
+  // the guard above threw otherwise — so this mirrors the argument rather than
+  // overriding it.
+  p.is_causal = causal;
+  p.window_size_left = -1;
+  p.window_size_right = -1;
+  p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
+  p.is_rotary_interleaved = false;
+  p.rotary_dim = 0;
+
+  p.block_table = nullptr;  // dense, not paged
+  p.block_table_batch_stride = 0;
+  p.page_block_size = 0;
+
+  p.unpadded_lse = false;  // LSE is [b, nheads, seqlen_q]
+  p.seqlenq_ngroups_swapped = false;
+  p.num_splits = 1;  // the non-split kernel writes O directly
+
+  FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(p, s);
+  Check(cudaGetLastError(), "dense fa2 launch");
+}
+
 // ─── MLA PREFILL (MLA campaign W5) ──────────────────────────────────────────
 // Launch FA-2 over CONTIGUOUS varlen q/k/v at head_dim 192 — the MLA prefill
 // call `FlashAttnPrefillBackend` makes on GB10

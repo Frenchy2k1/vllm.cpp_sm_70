@@ -90,6 +90,12 @@ std::vector<float> Qwen3DSparkModel::MarkovBiasForTokens(
 }
 
 bool Qwen3DSparkModel::CanSampleOnDevice(const Qwen3DSparkWeights& weights) {
+  // A reduced-vocab draft MUST carry the draft-ordered Markov table, because the
+  // device chain feeds the raw argmax (a DRAFT id) back into the embedding. With
+  // only the target-ordered markov_w1 available that would gather the WRONG row
+  // and silently diverge from the host loop, so such weights fall back instead.
+  if (!weights.draft_id_to_target_id.empty() && weights.markov_w1_draft.Empty())
+    return false;
   return weights.logit_scale == 1.0f && !weights.markov_w1.Empty() &&
          !weights.markov_w2.Empty() && weights.markov_rank > 0 &&
          weights.vocab_size > 0 && weights.draft_vocab_size > 0;
@@ -140,18 +146,34 @@ std::vector<std::vector<int32_t>> Qwen3DSparkModel::SampleSequentialDevice(
   DBuf embed(d, DType::kBF16, {B, R});
   DBuf bias(d, DType::kF32, {B, V});
   DBuf rows(d, DType::kF32, {B, V});
-  DBuf ids(d, DType::kI64, {B});
+  // Every step's argmax, [num_spec, B] i64, written a ROW at a time. Keeping the
+  // whole chain here is what removes the per-step device->host sync: the sampled
+  // id feeds the NEXT step's Embedding directly, on device.
+  DBuf ids(d, DType::kI64, {num_spec, B});
+  // Step 0 alone is seeded from the anchor, which is a TARGET id, so it indexes
+  // markov_w1; every later step indexes the DRAFT-ordered table with the raw
+  // argmax. (A full-vocab draft has no d2t, so the two tables coincide.)
+  DBuf anchor_dev(d, DType::kI32, {B}, anchor_ids.data());
+  const bool have_draft_table = !weights.markov_w1_draft.Empty();
+  Tensor w1_draft =
+      have_draft_table ? ResidentWeight(d, weights.markov_w1_draft, {V, R}) : w1;
 
   std::vector<std::vector<int32_t>> drafts(
       static_cast<size_t>(B), std::vector<int32_t>(static_cast<size_t>(num_spec), 0));
-  std::vector<int64_t> ids_host(static_cast<size_t>(B));
-  std::vector<int32_t> prev_host = anchor_ids;
 
   for (int64_t i = 0; i < num_spec; ++i) {
-    // `prev` is [B] i32; re-uploading a handful of ints per step is what buys
-    // the removal of the per-step [B, V] download.
-    DBuf prev(d, DType::kI32, {B}, prev_host.data());
-    vt::Embedding(d.q, embed.t(), w1, prev.t());
+    Tensor prev_view;
+    if (i == 0) {
+      prev_view = anchor_dev.t();
+      vt::Embedding(d.q, embed.t(), w1, prev_view);
+    } else {
+      prev_view = ids.t();
+      prev_view.rank = 1;
+      prev_view.shape[0] = B;
+      prev_view.stride[0] = 1;
+      prev_view.data = static_cast<int64_t*>(ids.t().data) + (i - 1) * B;
+      vt::Embedding(d.q, embed.t(), w1_draft, prev_view);
+    }
     vt::MatmulBT(d.q, bias.t(), embed.t(), w2);
 
     // Step i's base rows: a [B] slice of the flattened index buffer.
@@ -163,17 +185,25 @@ std::vector<std::vector<int32_t>> Qwen3DSparkModel::SampleSequentialDevice(
     vt::IndexSelect(d.q, rows.t(), base.t(), idx_i);
 
     vt::Add(d.q, bias.t(), bias.t(), rows.t());  // in-place: bias + this step's base row
-    vt::GreedyArgmax(d.q, ids.t(), bias.t());    // LOWEST-INDEX tie-break, as on host
-    ids.Download(d, ids_host.data());            // [B] i64, not [B, V] f32
+    Tensor out_view = ids.t();                   // this step's row of [num_spec, B]
+    out_view.rank = 1;
+    out_view.shape[0] = B;
+    out_view.stride[0] = 1;
+    out_view.data = static_cast<int64_t*>(ids.t().data) + i * B;
+    vt::GreedyArgmax(d.q, out_view, bias.t());   // LOWEST-INDEX tie-break, as on host
+  }
 
+  // ONE readback for the whole chain, then the draft->target map on the host --
+  // the same map the per-step path applied, just applied once.
+  std::vector<int64_t> ids_host(static_cast<size_t>(num_spec * B));
+  ids.Download(d, ids_host.data());
+  for (int64_t i = 0; i < num_spec; ++i) {
     for (int64_t r = 0; r < B; ++r) {
-      const int64_t draft_id = ids_host[static_cast<size_t>(r)];
+      const int64_t draft_id = ids_host[static_cast<size_t>(i * B + r)];
       VT_CHECK(draft_id >= 0 && draft_id < V,
                "qwen3_dspark SampleSequentialDevice: argmax outside the draft vocab");
-      const int32_t target_id =
+      drafts[static_cast<size_t>(r)][static_cast<size_t>(i)] =
           MapDraftToTarget(static_cast<int32_t>(draft_id), weights);
-      drafts[static_cast<size_t>(r)][static_cast<size_t>(i)] = target_id;
-      prev_host[static_cast<size_t>(r)] = target_id;
     }
   }
   return drafts;
