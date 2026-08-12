@@ -18,7 +18,11 @@ request [#117](https://github.com/mudler/vllm.cpp/issues/117); hosted CI repair
 per-commit documentation checkpoint repair is tracked by
 [#448](https://github.com/mudler/vllm.cpp/issues/448); its archive-target
 checkpoint repair is tracked by
-[#450](https://github.com/mudler/vllm.cpp/issues/450).
+[#450](https://github.com/mudler/vllm.cpp/issues/450). The merged-SHA dry-run
+repairs for exact prerelease identity and the native MSVC test translation unit
+are tracked by [#499](https://github.com/mudler/vllm.cpp/issues/499) and
+[#500](https://github.com/mudler/vllm.cpp/issues/500), specified together in
+[release-dry-run-gate-repairs.md](release-dry-run-gate-repairs.md).
 
 ## Delivery topology
 

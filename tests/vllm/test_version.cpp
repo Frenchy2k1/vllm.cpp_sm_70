@@ -2,12 +2,11 @@
 
 #include "vllm/version.h"
 
-TEST_CASE("Version reports semver from project()") {
-  auto v = vllm::Version();
-  CHECK(v.rfind("0.0.3", 0) == 0);  // starts with MAJOR.MINOR.PATCH
+TEST_CASE("Version reports the exact configured build identity") {
+  std::string expected = VLLM_CPP_EXPECTED_BUILD_VERSION;
 #ifndef VLLM_CPP_CUDA
-  CHECK(v == "0.0.3");
+  CHECK(vllm::Version() == expected);
 #else
-  CHECK(v == "0.0.3+cuda");
+  CHECK(vllm::Version() == expected + "+cuda");
 #endif
 }

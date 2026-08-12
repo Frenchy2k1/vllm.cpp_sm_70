@@ -3,9 +3,7 @@
 namespace vllm {
 
 std::string Version() {
-  std::string v = std::to_string(VLLM_CPP_VERSION_MAJOR) + "." +
-                  std::to_string(VLLM_CPP_VERSION_MINOR) + "." +
-                  std::to_string(VLLM_CPP_VERSION_PATCH);
+  std::string v = VLLM_CPP_BUILD_VERSION;
 #ifdef VLLM_CPP_CUDA
   v += "+cuda";
 #endif

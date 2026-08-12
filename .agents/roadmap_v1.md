@@ -72,6 +72,8 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#465](https://github.com/mudler/vllm.cpp/issues/465) | `ENG-RELEASE-WINDOWS` | LogprobsTensors per-request slice parameter shadows its member under native MSVC `/WX` | bug |
 | [#474](https://github.com/mudler/vllm.cpp/issues/474) | `ENG-RELEASE-WINDOWS` | MSVC stringizes a backslash-bearing raw literal inside CHECK and rejects the Windows argv expectation | bug |
 | [#475](https://github.com/mudler/vllm.cpp/issues/475) | `ENG-RELEASE-WINDOWS` | PR #446 release benchmark projection exceeds its page budget after merging current main | bug |
+| [#499](https://github.com/mudler/vllm.cpp/issues/499) | `ENG-RELEASE-WINDOWS` | Release binaries report project version instead of prerelease identity | bug |
+| [#500](https://github.com/mudler/vllm.cpp/issues/500) | `ENG-RELEASE-WINDOWS` | MSVC release build lacks ostream definition for string_view doctest diagnostics | bug |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |
