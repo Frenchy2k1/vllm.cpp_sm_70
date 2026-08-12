@@ -285,6 +285,55 @@ when a fresh implementer claims W1 against issue #496.
 [implementer contract](../prompts/), scoped to `src/vt/cpu/cpu_mamba2_ssd.cpp`,
 `include/vt/ops.h`, `src/vt/ops.cpp` and the three new test TUs, RED first.
 
+### 8.1 W1 progress (host references landed, awaiting a fresh scoped review)
+
+The three CPU host references and their unit gates are on
+`row/KERNEL-SSM-MAMBA-SSD-W1`. `KERNEL-SSM-MAMBA` still stays `INVENTORIED` —
+this lands `src/`, `include/` and `tests/` only, which owes no `STATUS.md` /
+`BENCHMARKS.md` projection; the row moves when the device arm (W2) and the
+`MambaSpec` producer (W3) close.
+
+What landed: `vt::Mamba2ChunkScan` (the 5 stages in upstream order),
+`vt::Mamba2StateUpdate` and `vt::RmsNormGatedGroup`, dispatched through the
+normal `vt::` seam and gated by
+`tests/vt/test_ops_mamba2_{ssd,state_update,gated_norm}.cpp`. The §4 extras both
+hold: chunked == a sequential `double` recurrence, and chunk-size invariance
+across {8,16,32,64,128}. `tp_world_size > 1` is refused naming
+`extra_groups_for_head_shards`.
+
+**Deviation from §3's port map:** the kernels are in `src/vt/cpu/cpu_ops.cpp`,
+not a new `src/vt/cpu/cpu_mamba2_ssd.cpp`. A new library TU has to be listed in
+the root `CMakeLists.txt`, which `check-doc-checkpoint` classifies as
+`user_usage` and `landing_page`, so ANY new `src/vt/` file owes a
+`docs/USAGE.md` update — which a kernel that no command, config key or C-ABI
+entry point exposes has nothing true to write. Landing it beside the GDN and KDA
+references it is a sibling of costs nothing and reds no gate. Whether that
+classification should distinguish "a source file was added to the library" from
+"how the project is used changed" is a policy question for the operator, not
+something to settle by weakening a checker.
+
+Two findings a reviewer should carry forward:
+
+- **`state_dtype` is not cosmetic.** `_state_passing_fwd` stores the inter-chunk
+  state at `state_dtype` and `_chunk_scan_fwd` reads that store back, so the knob
+  moves `out`, not just `final_states`. The running state itself stays f32
+  (ssd_state_passing.py:88-97 never re-reads its own store). Both are pinned by
+  test (6) of the SSD suite, the second only after a mutation escaped the first
+  version of it.
+- **One equivalent mutant, deliberately kept.** Removing the `min(·, 0)` clamp on
+  the intra-chunk decay does not fail any test, and cannot: with `A = -exp(A_log)
+  < 0` and `dt >= 0`, `dA_cumsum` is non-increasing, so `dA_i - dA_j <= 0` for
+  every `j <= i` and the clamp is never active. It is kept because it mirrors
+  upstream verbatim and is a real guard outside that input contract. Recorded
+  here rather than "fixed" with an out-of-contract test.
+
+Named residuals unchanged from §2: the CUDA arm (W2), `n_groups` TP sharding,
+spec-decode temporal state, ReplaySSM and Mamba v1. One more, from the port
+itself: the Triton dots downcast their tile inputs (`ssd_chunk_state.py:283-285`,
+`ssd_chunk_scan.py:266-269`) where this host reference stays f32, so W2's
+device-vs-host comparison is a tolerance comparison at the activation dtype, not
+a byte compare.
+
 ## 9. Stop conditions
 
 - The chunked scan cannot be made to match the sequential double-precision
