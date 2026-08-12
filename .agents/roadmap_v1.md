@@ -139,6 +139,8 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
 | [#296](https://github.com/mudler/vllm.cpp/issues/296) | — | Two limitations recorded when #285 landed: a stale TTL comment, and a publish-NAME pin `os.rename` escapes (spec `specs/operator-record.md`, "Follow-up") | bug |
 | [#408](https://github.com/mudler/vllm.cpp/issues/408) | — | 12 of 54 `tests/scripts` suites are executed by nothing, and `check-test-registration.py`'s fixed `REQUIRED_TESTS` cannot see the class (found while repairing #274) | bug |
+| [#504](https://github.com/mudler/vllm.cpp/issues/504) | `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` | DeepSeek-V4-Pro is the same architecture as V4-Flash (zero new config keys): record the variant and gate the config descent's shape-generality (spec `specs/deepseek-v4-pro.md`) | feature |
+| [#505](https://github.com/mudler/vllm.cpp/issues/505) | `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` | `DsaTopkKernel` sizes `chosen[512]`/`picked[64]` by literal while `index_topk` is 512 (Flash) / 1024 (Pro); latent behind `dsa_dense` today, silent stack overflow once the real-geometry DSA residual lands (found while assessing #504) | bug |
 
 ## Top-level portfolio
 
