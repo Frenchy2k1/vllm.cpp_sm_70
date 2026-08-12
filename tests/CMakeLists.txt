@@ -1109,6 +1109,16 @@ add_test(NAME test_ops_fp8_cutlass_plan_cache_on
     "--test-case=fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM")
 set_tests_properties(test_ops_fp8_cutlass_plan_cache_on PROPERTIES
   ENVIRONMENT "VT_FP8_PLAN_CACHE=1")
+# Opt-in arm: PERF-FP8-ALPHA-FOLD's per-column alpha applied INSIDE the cuBLASLt
+# epilogue (VT_FP8_ALPHA_VEC_EPILOGUE=1) versus the shipped two-launch form. This
+# is the BINDING byte-exactness comparison. The plain test_ops_fp8_cutlass run has
+# the toggle unset, where both sides execute the same fallback code and the case
+# only proves that fallback is unchanged.
+add_test(NAME test_ops_fp8_alpha_vec_epilogue_on
+  COMMAND test_ops_fp8_cutlass
+    "--test-case=fp8 cuBLASLt per-column alpha is BYTE-identical to the two-launch form")
+set_tests_properties(test_ops_fp8_alpha_vec_epilogue_on PROPERTIES
+  ENVIRONMENT "VT_FP8_ALPHA_VEC_EPILOGUE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu

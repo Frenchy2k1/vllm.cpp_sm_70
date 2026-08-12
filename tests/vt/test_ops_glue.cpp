@@ -106,6 +106,94 @@ TEST_CASE("mul_col_vec_f32: honors padded row stride") {
   }
 }
 
+// mul_col_vec_f32 with a BF16 x (PERF-FP8-ALPHA-FOLD / #417). The op's dtype axis
+// is the STORE width only: `col` stays f32, the multiply stays f32, and the
+// result is that f32 product rounded once to bf16. Narrowing x is what halves the
+// bytes this read-modify-write moves — its entire measured cost, since it runs at
+// 77% of the device's peak bandwidth over the merged FP8 GDN in_proj output.
+//
+// The reference is deliberately Bf(BF16ToF32(x) * col), NOT Bf(Bf(x) * col) or a
+// tolerance: it pins that the kernel upcasts, multiplies in f32, and rounds
+// EXACTLY ONCE. A kernel that rounded the operand first, or accumulated in bf16,
+// or applied the column scalar per row-slot instead of per column, fails here.
+TEST_CASE("mul_col_vec_f32: bf16 x scales in f32 and rounds once") {
+  const int64_t M = 3, N = 4;
+  const std::vector<float> src = {1.0f,  2.5f,   3.25f, 4.0f,
+                                  5.5f,  6.125f, 7.0f,  8.75f,
+                                  9.0f, 10.0f,  11.5f, 12.0f};
+  std::vector<uint16_t> x(src.size());
+  for (size_t i = 0; i < src.size(); ++i) x[i] = vt::F32ToBF16(src[i]);
+  // Values a bf16 CANNOT hold exactly, so a rounded-operand kernel diverges.
+  std::vector<float> col = {0.1f, 2.0f, -1.3f, 0.30000001192092896f};
+
+  Tensor tx = Bf16(x, {M, N});
+  Tensor tc = F32(col, {N});
+  Queue q = Q();
+  vt::MulColVecF32(q, tx, tc);
+
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
+      const size_t i = static_cast<size_t>(m * N + n);
+      // ONE rounding, of the f32 product of the (exact) bf16 operand and the f32
+      // column scalar. Exact uint16 comparison, not Approx.
+      const uint16_t want = vt::F32ToBF16(vt::BF16ToF32(vt::F32ToBF16(src[i])) * col[n]);
+      CHECK(x[i] == want);
+    }
+  }
+}
+
+// mul_col_vec_f32 with a BF16 x on a ROW-STRIDED view — the shape the real caller
+// hands it. The merged fp8 [qkv;z] output is one [M, conv_dim+value_dim] buffer
+// and the alpha pass covers all of it, but the same kernel drives the narrower
+// strided sub-views the GDN chain slices out, so the stride path must be exercised
+// at bf16 too: a kernel that indexed by a flat element counter instead of
+// (row*row_stride + col) would corrupt the pad and still pass the contiguous case.
+TEST_CASE("mul_col_vec_f32: bf16 x honors padded row stride") {
+  const int64_t M = 2, N = 3, RS = 5;  // 5-wide rows, only first 3 cols scaled
+  const uint16_t pad = vt::F32ToBF16(-7.0f);
+  std::vector<uint16_t> buf(static_cast<size_t>(M) * RS, pad);  // sentinel pad
+  for (int64_t m = 0; m < M; ++m)
+    for (int64_t n = 0; n < N; ++n)
+      buf[m * RS + n] = vt::F32ToBF16(static_cast<float>(m * 10 + n + 1));
+  std::vector<float> col = {3.0f, 0.5f, -2.0f};
+
+  Tensor tx = Tensor::Contiguous(buf.data(), DType::kBF16, Cpu(), {M, RS});
+  tx.shape[1] = N;  // logical N < row stride (strided packed view)
+  Tensor tc = F32(col, {N});
+  Queue q = Q();
+  vt::MulColVecF32(q, tx, tc);
+
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
+      const uint16_t want =
+          vt::F32ToBF16(static_cast<float>(m * 10 + n + 1) * col[n]);
+      CHECK(buf[m * RS + n] == want);
+    }
+    for (int64_t n = N; n < RS; ++n) CHECK(buf[m * RS + n] == pad);  // pad intact
+  }
+}
+
+// The op is widened to bf16, NOT to every dtype: an f16 x must still be refused
+// rather than silently reinterpreted as bf16 halves (both are 16-bit, so a
+// dtype-blind kernel would read garbage and report success). Same for a bf16
+// `col`: the column vector is the resident folded alpha, it costs [N] bytes not
+// [M,N], so rounding it would perturb every column for no bandwidth saving.
+TEST_CASE("mul_col_vec_f32: rejects dtypes outside the f32/bf16 store contract") {
+  const int64_t M = 2, N = 2;
+  std::vector<uint16_t> x16(static_cast<size_t>(M) * N, 0);
+  std::vector<float> colf(N, 1.0f);
+  std::vector<uint16_t> colb(N, 0);
+  Queue q = Q();
+
+  Tensor x_f16 = Tensor::Contiguous(x16.data(), DType::kF16, Cpu(), {M, N});
+  Tensor col_f32 = F32(colf, {N});
+  CHECK_THROWS(vt::MulColVecF32(q, x_f16, col_f32));
+
+  Tensor x_bf16 = Bf16(x16, {M, N});
+  Tensor col_bf16 = Bf16(colb, {N});
+  CHECK_THROWS(vt::MulColVecF32(q, x_bf16, col_bf16));
+}
+
 // ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh].
 //   T=2, Hq=2, Dh=2. Row layout per (t,hq): [q0 q1 | g0 g1].
