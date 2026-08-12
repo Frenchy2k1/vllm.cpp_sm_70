@@ -62,6 +62,21 @@ After RED, remove only those four redundant definitions. The test must then
 pass without changing the central CMake definition, `/W4 /WX`, guarded
 fallbacks, or `WIN32_LEAN_AND_MEAN`.
 
+The portability checker must apply the same contract. The root-directory
+`add_compile_definitions(NOMINMAX ...)` precedes `vllm`, `server`, and the
+`tests`/`examples` subdirectories, so it protects every translation unit in the
+checker-derived shipped-server target/dependency/header closure from the start
+of preprocessing. When that central definition is present, a source-local
+definition is unnecessary; an unguarded one remains an error because it
+reintroduces C4005 under `/WX`. When the central definition is absent, a source
+that reaches Windows headers must provide an absence-guarded local fallback
+before them. Checker fixtures must prove all four decisions: central-present
+without a local is accepted, central-absent without a local is rejected,
+central-absent with a guarded fallback is accepted, and an unguarded local is
+rejected even when the central definition is present. This changes only the
+checker model of the existing compile contract; it does not exempt a path or
+relax the native compiler gate.
+
 ## Gates
 
 1. RED focused regression at pinned head, with all four paths reported.
