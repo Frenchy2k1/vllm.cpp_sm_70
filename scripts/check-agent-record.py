@@ -431,6 +431,8 @@ ID_RE = re.compile(
 )
 STATE_RE = re.compile(r"`(" + "|".join(re.escape(state) for state in STATES) + r")`")
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
+INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
 CLAIM_RE = re.compile(r"CLAIM-[A-Za-z0-9_.-]+")
 LINE_FRAGMENT_RE = re.compile(r"L(\d+)(?:-L?(\d+))?")
 COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -591,27 +593,71 @@ def parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]:
     return rows
 
 
-def link_base(source: Path, text: str) -> Path:
-    """Resolve migrated legacy links from their original .agents/ location."""
+def strip_code_spans(text: str) -> str:
+    """Blank out fenced blocks and inline code, preserving line and column count.
+
+    A target inside a code span is NOT a link: CommonMark renders it as literal
+    text, so no reader can follow it and there is nothing for "every link
+    resolves" to be about. Before 2026-08-12 this checker validated them anyway
+    (#460), which meant no document in the tree could SHOW a link in sample
+    output, and, worse, that a docs/BENCHMARKS.md row quoting its evidence link
+    could not be archived into .agents/ byte-for-byte. Blanking rather than
+    deleting keeps every reported line number honest.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        marker = FENCE_RE.match(line)
+        if fence is None and marker is not None:
+            fence = marker.group(1)[0]
+            out.append(" " * len(line))
+            continue
+        if fence is not None:
+            if marker is not None and marker.group(1)[0] == fence:
+                fence = None
+            out.append(" " * len(line))
+            continue
+        out.append(INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line))
+    return "\n".join(out)
+
+
+def extract_links(text: str) -> list[str]:
+    """Return every link target a READER could follow in this document."""
+    return LINK_RE.findall(strip_code_spans(text))
+
+
+def link_bases(source: Path, text: str) -> tuple[Path, ...]:
+    """Return every directory a relative link in this file may resolve from.
+
+    Normally exactly one, the file's own directory. Two files are archives that
+    hold content written somewhere else and moved here verbatim, so a target in
+    them was authored against the ORIGINAL directory and must still resolve:
+    migrated legacy state-event payloads came from .agents/, and
+    .agents/benchmark-record.md is the declared archive of docs/BENCHMARKS.md
+    (#460). A target still has to exist under one of the bases returned.
+    """
     if (
         source.is_relative_to(AGENTS / "completed/state-events")
         and "<!-- legacy-payload:begin -->" in text
     ):
-        return AGENTS
-    return source.parent
+        return (AGENTS,)
+    if source == AGENTS / "benchmark-record.md":
+        return (source.parent, ROOT / "docs")
+    return (source.parent,)
 
 
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
         text = source.read_text(encoding="utf-8")
-        base = link_base(source, text)
-        for raw_target in LINK_RE.findall(text):
+        bases = link_bases(source, text)
+        for raw_target in extract_links(text):
             target = raw_target.strip().strip("<>")
             if not target or target.startswith(("http://", "https://", "mailto:")):
                 continue
             target_path, _, fragment = target.partition("#")
-            resolved = (base / target_path).resolve()
-            if not resolved.exists():
+            candidates = [(base / target_path).resolve() for base in bases]
+            resolved = next((c for c in candidates if c.exists()), None)
+            if resolved is None:
                 errors.append(f"{source.relative_to(ROOT)}: dangling link {raw_target}")
                 continue
             line_match = LINE_FRAGMENT_RE.fullmatch(fragment)
