@@ -2242,15 +2242,35 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
-// x[m,n] *= col[n]; x f32 [M,N] (inner-contiguous rows, row stride x.stride[0]),
-// col f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel.
+// x[m,n] *= col[n]; x f32 OR bf16 [M,N] (inner-contiguous rows, row stride
+// x.stride[0]), col always f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel,
+// and the portable reference every other backend ports FROM — so it carries the
+// same bf16 store width the CUDA kernel gained for PERF-FP8-ALPHA-FOLD / #417,
+// not a CUDA-only capability.
+//
+// Both arms do the SAME single IEEE f32 multiply; only the store differs. The
+// f32 arm keeps the direct `*=` loop byte-for-byte (it is the shipped path and
+// the hot one), and the bf16 arm goes through LoadF32/StoreF32, whose F32ToBF16
+// is round-to-nearest-even — the same rounding __float2bfloat16 applies on CUDA,
+// which is what keeps the two tiers comparable element for element.
 void MulColVecF32Kernel(Queue&, Tensor& x, const Tensor& col) {
   const int64_t m = x.shape[0], n = x.shape[1], rs = x.stride[0];
   const float* c = col.Ptr<float>();
+  if (x.dtype == DType::kF32) {
+    ForRows(m, [&](int64_t r0, int64_t r1) {
+      for (int64_t i = r0; i < r1; ++i) {
+        float* row = x.Ptr<float>() + i * rs;
+        for (int64_t j = 0; j < n; ++j) row[j] *= c[j];
+      }
+    });
+    return;
+  }
+  VT_CHECK(x.dtype == DType::kBF16, "cpu mul_col_vec_f32: x must be f32 or bf16");
   ForRows(m, [&](int64_t r0, int64_t r1) {
     for (int64_t i = r0; i < r1; ++i) {
-      float* row = x.Ptr<float>() + i * rs;
-      for (int64_t j = 0; j < n; ++j) row[j] *= c[j];
+      const int64_t base = i * rs;
+      for (int64_t j = 0; j < n; ++j)
+        StoreF32(x, base + j, LoadF32(x, base + j) * c[j]);
     }
   });
 }

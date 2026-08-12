@@ -97,6 +97,7 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 | Step attribution (nsys, node-level, both arms same tool) | ours 98.906 vs vLLM 81.577 ms/step, 99.2/99.3% GPU-busy; lm_head 8.6414 + fp8 tower 7.6068 + splitK 0.0532 + other 1.0279 = **17.3292 vs measured 17.3292** | | |
 | Lever 1, `lm_head` | ships U8/NVFP4 (0.666 GiB), we read 2.368 GiB BF16: **+1.702 GiB/step**, 11.183 ms. Marlin efficiency is EQUAL (207.9 vs 210.0 GiB/s), only bytes differ | | |
 | Lever 2, GDN fp8 in_proj | identical 6.7188 GiB/step both arms; ours 96 GEMMs at 165.9 GiB/s vs vLLM 48 merged qkvz at 204.3; `in_proj_qkv` at **129.3 vs 213.6 GiB/s** | | |
+| Lever 2b, packed GDN decode (#365) | separate c1 in16/out256 harness: 0.977x -> 0.984x, INDICATIVE not binding (arms not interleaved); see the record | | | | | |
 | OPEN: host-memory-state sensitivity | same binaries read c1 0.7604 pre-reboot vs 0.8289 post; vLLM barely moved. Protocols also differed, variables not separated | | |
 | Spread, ours / vLLM | 1.000 / 1.006 | 1.009 / 1.069 | 1.001 / 1.001 | 1.005 / 1.003 |
 | Method | medians of 3, warm servers, one `flock`, greedy, `ignore_eos` so both emit exactly 128 tokens, `--gpu-memory-utilization 0.55 --max-model-len 4096`, vLLM in its production graphed config | | | |
@@ -335,7 +336,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (PINNED CLOCKS, non-overlapping). NOT parity: 8.2% sits in the SAME Marlin MoE kernel (others match to 0.2%); routing is the open suspect (#442) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (PINNED CLOCKS, non-overlapping). NOT parity: our Marlin MoE is **12.8% slower per unit of work**; source-level causes exhausted, next is ncu (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

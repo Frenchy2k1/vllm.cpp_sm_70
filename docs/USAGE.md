@@ -22,6 +22,22 @@ example targets are named after the directories they are built from, so an
 in-source build makes the linker write each executable over its own source
 directory (issue #85).
 
+### Setting the compiled build identity
+
+`vllm-server --version` reports the CMake project version by default. Release
+packaging passes the complete release identity, including any prerelease
+component, with `-DVLLM_CPP_BUILD_VERSION=<version>`:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_VERSION=0.0.3-pre.1
+```
+
+The value must not be empty. CUDA builds append their existing `+cuda`
+qualifier to this identity. This option controls only the compiled binary
+identity; release archives must still use the repository release workflow so
+their manifest, `VERSION` record, archive name, and executable are validated as
+one version.
+
 ### One ROCm-specific behaviour
 
 ROCm builds register the full V1 sampler surface (temperature, top-k/top-p, min-p,

@@ -58,6 +58,11 @@ Release benchmark projection compaction:
 [#475](https://github.com/mudler/vllm.cpp/issues/475), specified in
 [release-benchmark-projection-compaction.md](release-benchmark-projection-compaction.md)
 
+Merged-SHA release dry-run gate repairs:
+[#499](https://github.com/mudler/vllm.cpp/issues/499) and
+[#500](https://github.com/mudler/vllm.cpp/issues/500), specified in
+[release-dry-run-gate-repairs.md](release-dry-run-gate-repairs.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
