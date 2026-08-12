@@ -200,7 +200,7 @@ HTTP are not started.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; the T=1+k verify is CAPTURED (`VT_SPEC_DECODE_GRAPH`). MoE **0.919-0.987x** of the pinned oracle (interleaved) | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; the T=1+k verify is CAPTURED (`VT_SPEC_DECODE_GRAPH`). MoE **0.95-1.01x** of the pinned oracle (distributional) | ✅ | ◐ |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling

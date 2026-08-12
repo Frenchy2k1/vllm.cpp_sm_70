@@ -1024,6 +1024,53 @@ repetitions and medians. A single oracle load is worth nothing on a box whose
 reference swings 27%, and the direction of the error depends on who got the first
 slot.
 
+## 6p. FINAL MEASUREMENT: the oracle's own acceptance is non-deterministic (2026-08-12)
+
+5-rep INTERLEAVED (O,U x5 in one flock), medians of per-rep medians:
+
+| cell | ours (median, range) | oracle (median, range) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | **78.04** [76.0-79.3] | 77.16 [74.6-96.5] | **1.012x** |
+| "fibonacci", 89 tok | **141.83** [138.9-142.4] | 149.03 [142.1-151.6] | **0.952x** |
+
+The 3-rep run gave 0.919x / 0.987x for the same cells. Both are "correct"; the
+ratio is simply not stable, and this is why:
+
+| oracle rep | fib tok/s | capital tok/s | drafts | acceptance |
+|---|---|---|---|---|
+| 1 | 149.03 | 77.16 | 127 | 21.2% |
+| 2 | 151.61 | 74.60 | 117 | 24.0% |
+| 3 | 142.08 | 76.84 | 124 | 22.6% |
+| 4 | 151.13 | 78.50 | 127 | 21.2% |
+| 5 | 142.31 | **96.48** | **104** | **29.6%** |
+
+**Upstream's speculative decode is NOT run-to-run deterministic.** Same prompts,
+same greedy sampling, identical output lengths every rep (89 / 128 tokens), yet
+its draft count moves 104-127 and its acceptance 21.2-29.6%. Fewer draft steps is
+directly fewer forwards, which is the 96.48 outlier and the 142-vs-151 bimodality
+on fibonacci. OURS is deterministic: identical tokens in an identical number of
+steps every run, which is why our range is 76-79 and 139-142.
+
+So a point ratio against this reference measures WHICH DRAW WE CAUGHT as much as
+either engine. Read distributionally instead:
+
+- "capital": ours 78.04 sits ABOVE the oracle's median (77.16) and above 3 of its
+  5 draws.
+- "fibonacci": ours 141.83 sits just BELOW the oracle's floor (142.08), i.e.
+  0.998x of its worst draw and 0.952x of its median.
+
+**Verdict: approximate parity, cell-dependent, and NOT a clean >= 1.0x on both
+cells.** The row does not claim parity. This is the same condition the project
+already ratified for token-exactness — where the oracle's own greedy is
+non-deterministic the gate is distributional — now showing up on the SPEED axis,
+and the honest form of the speed claim is a distribution, not a single ratio.
+
+**Per-step, the engines are aligned** (§ diag): ours 30.4 ms/step on "capital"
+vs the oracle's ~30.1, and 34.7 vs ~34.5 on "fibonacci", with our draft graph
+capturing (`[DFLASH-GRAPH] replays=96 captures=2`), the verify captured, and the
+Markov sample at its bandwidth bound. There is no structural gap left to close;
+what remains is inside the reference's own spread.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
