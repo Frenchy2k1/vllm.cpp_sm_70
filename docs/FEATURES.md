@@ -166,7 +166,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
-| `NemotronHForCausalLM` | Nemotron-H / Nemotron-3.5-Lightning-30B-A3B | 20.1 GiB NVFP4 fits the pool, so capability-blocked, not HW-blocked: Mamba2 SSD is unported ([#496](https://github.com/mudler/vllm.cpp/issues/496)), plus non-gated `relu²` MoE and ModelOpt `MIXED_PRECISION` |
+| `NemotronHForCausalLM` | Nemotron-H / Nemotron-3.5-Lightning-30B-A3B | capability-blocked, not HW-blocked (20.1 GiB fits the pool): Mamba2 SSD unported ([#496](https://github.com/mudler/vllm.cpp/issues/496)), MoE and loader owed; spec [#517](https://github.com/mudler/vllm.cpp/issues/517) |
 
 27 of the 31 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
