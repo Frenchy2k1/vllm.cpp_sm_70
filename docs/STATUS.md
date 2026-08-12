@@ -488,13 +488,14 @@ host-side sampling, now moved on device (#436, byte-identical output, sampling
 bandwidth bound on the per-step Markov GEMV that upstream pays identically.
 W8 (#442) then CAPTURED the T=1+k verify, mirroring vLLM's uniform-decode graph
 predicate (`uniform_decode_query_len = 1 + num_speculative_tokens`) instead of
-our `query_len == 1` gate: the MoE lane measures **0.95x-1.01x** of the
-pinned graphed oracle on 5-rep interleaved medians, byte-identical, with the
-same-binary capture A/B worth +12.2%/+3.5%. Read DISTRIBUTIONALLY, not as a point
-ratio: upstream's own speculative decode is non-deterministic run to run (draft
-count 104-127, acceptance 21-30% on identical greedy prompts), so its throughput
-spans 142-152 where ours is fixed. Per-step the engines are aligned (30.4 vs
-~30.1 ms, 34.7 vs ~34.5). Parity is NOT claimed on both cells. The Gemma4 `1 + N` layout is coded and unit-tested but has
+our `query_len == 1` gate: the MoE lane measures **0.996x-1.012x** of the
+pinned graphed oracle ON MATCHED WORK, byte-identical, with the same-binary
+capture A/B worth +12.2%/+3.5%. Upstream's speculative decode is not
+run-to-run deterministic (its fast draw on one prompt is ONE extra accepted
+token, 17 steps instead of 18), and our acceptance equals its modal value
+(48.6%, 4.94 tokens/step). Per-step the engines are aligned (30.4 vs ~30.1 ms,
+34.7 vs ~34.5). This is parity within the measurement's resolution, not a
+demonstrated win. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has

@@ -19752,3 +19752,35 @@ the residual lives inside the reference's own spread.
 
 Evidence: `dgx:~/work/dspark-w6/interleaved5.log`, `oracle5_rep{1..5}.json`,
 `diag.log`.
+
+## SPEC-DSPARK: the fibonacci gap was the REFERENCE's draw, not a deficit (2026-08-12)
+
+Isolating that prompt on the oracle (only prompt, warm-up on the same prompt, so
+the cumulative spec_decode counters are attributable):
+
+| run | tok/s | drafts | accepted | rate | tokens/step |
+|---|---|---|---|---|---|
+| 0 | 142.01 | 18 | 70 | 48.6% | 4.94 |
+| 1 | 142.66 | 18 | 70 | 48.6% | 4.94 |
+| 2 | 142.37 | 18 | 70 | 48.6% | 4.94 |
+| 3 | 151.18 | 17 | 71 | 52.2% | 5.24 |
+
+The 151 draw is ONE extra accepted token (71 vs 70), removing a whole draft step
+(17 instead of 18). It occurred in 1 run of 4 and is not faster per step; it did
+less work. Our acceptance equals upstream's MODAL value exactly: 48.6%, 4.94
+tokens/step, 18 steps.
+
+On matched work: ours 141.83 vs upstream 142.01-142.66 = 0.996x-0.999x. Against
+its 5-rep median (149.03, inflated by two lucky draws) the same data reads
+0.952x, which is why that figure is withdrawn.
+
+MoE lane on matched work: "capital" 1.012x, "fibonacci" 0.996x-0.999x. That is
+parity within the measurement's resolution, NOT a demonstrated >= 1.0x on both
+cells, and the row records it as such.
+
+Method note: a bimodal reference must be compared modally or per-work, never by
+its mean. Three earlier ratios for this row (0.986x single-shot, 0.919x/0.987x at
+3 reps, 0.952x at 5 reps) were all measuring the reference's draw distribution
+rather than either engine.
+
+Evidence: `dgx:~/work/dspark-w6/fibacc.log`, `fibacc.json`, `diag.log`.
