@@ -4,9 +4,24 @@ Issue: [#402](https://github.com/mudler/vllm.cpp/issues/402) (§3 "Lever B"); th
 same buffer is the subject of [#417](https://github.com/mudler/vllm.cpp/issues/417)
 Finding 1 (the f32-vs-bf16 axis, a DIFFERENT lever on the same tensor — see
 §Coordination).
-Row: `PERF-FP8-ALPHA-FOLD`
+Issue: [#339](https://github.com/mudler/vllm.cpp/issues/339) — **the issue
+§Attempt 4 actually implements**, and it was linked from nowhere until this
+repair. #339 is "every fp8 input projection asks for an f32 output, selecting the
+slower nvjet template family (vLLM emits bf16)"; `VT_GDN_FP8_IN_BF16` is exactly
+its fix for the merged GDN `in_proj`. Its own evidence (48 f32-out projections at
+18.51 ms vs 48 bf16-out at 7.05 ms, `benchmark-record.md:17209-17217`) is the
+prior for this lever, and its upstream anchor `modelopt.py:458` is the one
+§Attempt 4 cites.
+Row: `PERF-27B-LMHEAD-FP4` — the owning roadmap row. `PERF-FP8-ALPHA-FOLD` is
+this work's branch name, not a roadmap block; #339 and #402 are both placed under
+`PERF-27B-LMHEAD-FP4` in the roadmap issue table.
 Gate model: `nvidia/Qwen3.6-27B-NVFP4` @`0893e1606ff3d5f97a441f405d5fc541a6bdf404`
 Also applies to: `nvidia/Qwen3.6-35B-A3B-NVFP4` @`491c2f1e` (same FP8 tower)
+
+> **No committed gate executes this path.** The SACRED 27B gate pins
+> `models--unsloth--Qwen3.6-27B-NVFP4` @`890bdef7`, a **bf16-tower** checkpoint;
+> the fp8 tower named above lives in `nvidia`@`0893e160` and no committed gate
+> loads it. See §Outcome, "What the green suite does and does not say".
 
 ## Scope
 
@@ -533,3 +548,79 @@ is the elimination of two plausible mechanisms with named causes, a re-runnable
 instrument that settles them in seconds on new hardware, one recorded plan-cache
 hazard for whoever gets that hardware, and a portable bf16 store width on
 `vt::MulColVecF32` that the GDN-chain row was blocked on.
+
+### What the green suite does and does not say
+
+**No committed gate executes this path.** This is the single most important
+sentence in the row and it is not softened anywhere: the SACRED 27B gate pins
+`models--unsloth--Qwen3.6-27B-NVFP4` @`890bdef7`, which is a **bf16-tower**
+checkpoint. The fp8 tower that `VT_GDN_FP8_IN_BF16` modifies is
+`nvidia/Qwen3.6-27B-NVFP4` @`0893e160`, and no committed gate loads it.
+
+That is measured, not inferred. Forcing BOTH toggles permanently ON — deleting
+the env checks outright, so the arm cannot be skipped — still leaves the full CPU
+suite green: **395/395** on the four-lever stack the mutation was run against,
+and **392/392** on this reduced stack, which drops the three suites levers 2-4
+added. A suite that is identical with the code forced on and forced off is a suite
+that never ran the code. So the green result carries no information
+about this lever whatsoever, and quoting it as if it did would be the exact
+dishonesty this row is trying not to commit.
+
+`row/GATE-27B-FP8-TOWER-GOLDEN` is building the arm that would actually execute
+it. Until that lands, every numeric claim in §Attempt 4 stays **UNMEASURED**,
+`docs/FEATURES.md` says `UNMEASURED`, and the toggle stays DEFAULT OFF.
+
+Two consequences worth stating plainly, because both were found by review rather
+than by a gate:
+
+- **`splitK=1` is now ENFORCED, not merely stated.** It had been a byte-exactness
+  precondition of the bf16-D arm since §Byte-exactness, and nothing checked it:
+  the only `CUBLASLT_ALGO_CONFIG_SPLITK_NUM` read in the tree lived inside
+  `MaybeLogGemmAlgo`, which returns immediately unless `VT_GEMM_ALGO_LOG=1` — so
+  on every production run the precondition was unobserved. It is not a cosmetic
+  gap: `out_type` is part of `Fp8PlanKey`'s `==` and its hash, so a bf16 D
+  deliberately selects a DIFFERENT plan from the f32 D, and a different split-K is
+  precisely the freedom that key grants cuBLASLt. Had it been taken, the delta
+  would have been a REDUCTION-ORDER change wearing a store-width change's clothes
+  — and a bf16 store is very good at hiding those from a token gate. The verdict
+  now lives in `Fp8Bf16DSplitKVerdict` (`src/vt/cuda/fp8_plan_cache.h`, pure and
+  CPU-tested, four mutations proved red) and `RequireBf16DSplitKOne`
+  (`src/vt/cuda/cuda_matmul.cu`) throws on the bf16-D path unless the selected
+  plan reports `splitK == 1`. An UNREADABLE splitK refuses too — unknown is
+  neither absence nor success — and it is a hard refusal rather than a `<1%`
+  tolerance, because a tolerance here would only be measuring how well bf16
+  conceals the defect. The f32-D arm never claimed the premise and is not held to
+  it.
+- **`AlphaVecBf16TakesTwoLaunch` is NOT coverage of what this lever changes.**
+  It is a good test of a different thing. It pins that a bf16 D REFUSES the
+  cuBLASLt epilogue arm and always takes the two-launch fallback — but *both* of
+  its arms apply alpha AFTER the GEMM, so both are `round -> scale`. The
+  arithmetic §Attempt 4 actually changes is `round-then-scale` vs
+  `scale-then-round`: narrowing D rounds the f32 accumulator to bf16 BEFORE the
+  alpha multiply, where the f32-D path rounds after it. Nothing in the tree
+  compares those two orders. Do not cite this case as evidence that the narrowing
+  is safe; it does not test that, and it was never written to.
+
+### Why this branch ships lever 1 ALONE
+
+The four-lever "maxstack" was measured against lever 1 by itself on the canonical
+shape and could not be told apart from it: **0.9755 mean / 0.9707 median for all
+four, against 0.9758 mean for bf16-D alone**, with spreads of 1.035 and 1.049 —
+overlapping arms, so the grid does not resolve a difference. A decode trace of the
+same shape reads **91.72% decode**, and levers 2-4 are all prefill glue. Their
+measured end-to-end effect on the shape we gate is ZERO.
+
+They are PARKED with their history and evidence intact, not deleted:
+
+| lever | toggle | branch |
+|---|---|---|
+| 2 | `VT_GDN_FP8_ALPHA_IN_CONV` (§Attempt 5) | `row/PERF-ALPHA-IN-CONV-PARKED` |
+| 3 | `VT_SILU_VEC` | `row/PERF-GLUE-KERNELS-PARKED` |
+| 4 | `VT_RMSNORM_PREFILL_GEOMETRY` | `row/PERF-GLUE-KERNELS-PARKED` |
+
+Lever 2 additionally carries an untested seam: 9 kernels across 3 backends and 8
+model call sites, whose model-layer wiring has no test at any tier
+([#468](https://github.com/mudler/vllm.cpp/issues/468)). Shipping that for a
+number the instrument cannot see is not a trade this row makes. The parked
+branches each record the same reasoning in their spec's `## Now`, so it is not
+re-derived by whoever picks them up.
