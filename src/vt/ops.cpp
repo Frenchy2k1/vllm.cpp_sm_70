@@ -733,6 +733,50 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
   reinterpret_cast<MatmulFp8CublasLtFn>(GetOp(OpId::kMatmulFp8CublasLt, q.device.type))(
       q, out, a_fp8, b_fp8, alpha);
 }
+void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                               const Tensor& alpha_vec) {
+  // Same operand contract as MatmulFp8CublasLt, plus the per-column alpha.
+  //
+  // The output was f32 ONLY, because the fallback arm applies the vector with
+  // vt::MulColVecF32 and that op was f32-typed -- accepting bf16 would have been
+  // a capability the fallback could not honor. PERF-FP8-ALPHA-FOLD / #417 removed
+  // that blocker (MulColVecF32 now carries a bf16 store arm), so bf16 is
+  // admitted: the GEMM emits a bf16 D and the column pass runs at bf16, halving
+  // the bytes it moves. bf16 is also what vLLM's ModelOptFp8LinearMethod emits
+  // here (out_dtype = the model dtype, modelopt.py:458).
+  //
+  // A bf16 `out` always takes the TWO-LAUNCH arm, whatever
+  // VT_FP8_ALPHA_VEC_EPILOGUE says -- see the CUDA implementation for why: at
+  // bf16 the epilogue would round ONCE and the fallback rounds TWICE, so letting
+  // the toggle choose between them would turn a performance switch into a
+  // numerics switch. The toggle stays a pure performance A/B at every dtype.
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
+           "matmul_fp8_cublaslt_alpha_vec: all tensors must be rank-2");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  VT_CHECK(k % 16 == 0 && n % 16 == 0,
+           "matmul_fp8_cublaslt_alpha_vec: K and N must be multiples of 16");
+  VT_CHECK(b_fp8.shape[1] == k,
+           "matmul_fp8_cublaslt_alpha_vec: b_fp8 must be [N, K] (K matches a_fp8)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n,
+           "matmul_fp8_cublaslt_alpha_vec: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "matmul_fp8_cublaslt_alpha_vec: out must be f32 or bf16");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_cublaslt_alpha_vec: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && b_fp8.IsContiguous(),
+           "matmul_fp8_cublaslt_alpha_vec: contiguous tensors required");
+  // cuBLASLt reads the alpha vector as one entry per OUTPUT ROW of its
+  // column-major D, which is our row-major out's COLUMN count, N.
+  VT_CHECK(alpha_vec.rank == 1 && alpha_vec.shape[0] == n,
+           "matmul_fp8_cublaslt_alpha_vec: alpha_vec must be [N] (one alpha per output column)");
+  VT_CHECK(alpha_vec.dtype == DType::kF32 && alpha_vec.IsContiguous(),
+           "matmul_fp8_cublaslt_alpha_vec: alpha_vec must be contiguous f32");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device &&
+               alpha_vec.device == q.device,
+           "matmul_fp8_cublaslt_alpha_vec: device mismatch");
+  reinterpret_cast<MatmulFp8CublasLtAlphaVecFn>(
+      GetOp(OpId::kMatmulFp8CublasLtAlphaVec, q.device.type))(q, out, a_fp8, b_fp8, alpha_vec);
+}
 
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,
@@ -3321,7 +3365,16 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in) {
 }
 
 void MulColVecF32(Queue& q, Tensor& x, const Tensor& col) {
-  VT_CHECK(x.dtype == DType::kF32, "mul_col_vec_f32: x must be f32");
+  // PERF-FP8-ALPHA-FOLD / #417: x may be bf16 as well as f32. The op is named
+  // for the ARITHMETIC (an f32 multiply by an f32 column vector), not for the
+  // store width -- `col` stays f32 on both arms and the multiply is f32 on both
+  // arms; only x's store rounds. Narrowing x halves the bytes this
+  // read-modify-write moves, which is its entire measured cost (it runs at 77%
+  // of the GB10's peak bandwidth on the merged FP8 GDN in_proj output). The
+  // narrowing is NOT value-neutral, so it is opt-in at the model layer
+  // (VT_GDN_FP8_IN_BF16, default OFF) and never chosen here.
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
+           "mul_col_vec_f32: x must be f32 or bf16");
   VT_CHECK(col.dtype == DType::kF32, "mul_col_vec_f32: col must be f32");
   VT_CHECK(x.rank == 2, "mul_col_vec_f32: x must be rank-2 [M,N]");
   VT_CHECK(col.rank == 1, "mul_col_vec_f32: col must be rank-1 [N]");

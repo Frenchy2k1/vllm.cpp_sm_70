@@ -74,6 +74,9 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | fp8 weights | ✅ `VT_GDN_PACKED_DECODE_FP8_TOWER` (default **OFF**, #365): an fp8 GDN tower is judged by its activation dtypes, not by being fp8, so it can reach the packed decode path; inert until the fp8 in_proj emits bf16 | ✅ | ✅ | ☐ |
+| Merged fp8 projection applies its per-column alpha in the GEMM epilogue | ◐ opt-in `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off; falls back to a second full-tensor pass; gates not run ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | n/a one scale (shards requantized) | n/a | n/a |
+| fp8-tower GDN `in_proj` emits bf16, halving the per-column alpha pass | ◐ `VT_GDN_FP8_IN_BF16`, **default OFF**, UNMEASURED (#417); mirrors ModelOpt fp8's bf16 `out_dtype` and unblocks `VT_GDN_IN_BF16` on `modelopt_mixed`. NOT value-neutral ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
+| `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical, bf16 arm multiplies in f32 and rounds once; CPU + CUDA, so it is a portable op capability and not a CUDA-only path | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
