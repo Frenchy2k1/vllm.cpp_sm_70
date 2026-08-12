@@ -15,6 +15,10 @@
 #include "vt/cuda/fp8_plan_cache.h"
 
 using vt::cuda::Fp8AlphaVecCapSupported;
+using vt::cuda::Fp8Bf16DSplitK;
+using vt::cuda::Fp8Bf16DSplitKAdmissible;
+using vt::cuda::Fp8Bf16DSplitKTag;
+using vt::cuda::Fp8Bf16DSplitKVerdict;
 using vt::cuda::Fp8AlphaVecEpilogueFlagIsOn;
 using vt::cuda::Fp8PlanCacheFlagIsOn;
 using vt::cuda::Fp8PlanKey;
@@ -186,4 +190,47 @@ TEST_CASE("Fp8PlanRefusalFor: names WHICH refusal, and never guesses a cap it ne
         "pointer-mode-unsupported");
   CHECK(std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kNoHeuristic)) !=
         std::string(Fp8PlanRefusalTag(Fp8PlanRefusal::kPointerModeUnsupported)));
+}
+
+// PERF-FP8-ALPHA-FOLD / #339, F3 repair. `splitK=1` was a STATED byte-exactness
+// precondition of the bf16-D arm (spec §Byte-exactness, §Attempt 4) that nothing
+// enforced: the only splitK read in the tree was the default-OFF VT_GEMM_ALGO_LOG
+// diagnostic, so with the diagnostic unset — which is every production run — a
+// split-K plan would have been used silently. `out_type` is in Fp8PlanKey, so the
+// bf16 D genuinely selects a different plan and cuBLASLt is free to make that
+// choice. This pins the verdict; cuda_matmul.cu refuses on it.
+TEST_CASE("Fp8Bf16DSplitKVerdict: the bf16-D arm refuses any splitK it did not read as 1") {
+  // f32 D never claimed the premise, so it is never held to it — including when
+  // the splitK genuinely is not 1. This is the arm that must stay unaffected.
+  CHECK(Fp8Bf16DSplitKVerdict(false, true, 8) == Fp8Bf16DSplitK::kNotBf16D);
+  CHECK(Fp8Bf16DSplitKVerdict(false, false, -1) == Fp8Bf16DSplitK::kNotBf16D);
+  CHECK(Fp8Bf16DSplitKAdmissible(Fp8Bf16DSplitKVerdict(false, true, 8)));
+
+  // bf16 D at splitK=1: the measured premise, and the only value that proceeds.
+  CHECK(Fp8Bf16DSplitKVerdict(true, true, 1) == Fp8Bf16DSplitK::kOk);
+  CHECK(Fp8Bf16DSplitKAdmissible(Fp8Bf16DSplitK::kOk));
+
+  // bf16 D at any other splitK: REFUSED. 4 and 8 are the values #213 actually
+  // observed a toy shape select, and 0 is what a driver that reports "unset"
+  // would hand back — none of the three is 1, so none may proceed.
+  for (int32_t bad : {0, 2, 4, 8, 16}) {
+    CHECK(Fp8Bf16DSplitKVerdict(true, true, bad) == Fp8Bf16DSplitK::kNotOne);
+    CHECK_FALSE(Fp8Bf16DSplitKAdmissible(Fp8Bf16DSplitKVerdict(true, true, bad)));
+  }
+
+  // bf16 D whose splitK could not be READ is refused too, and is a DIFFERENT
+  // verdict from a bad value: unknown is neither absence nor success. The value
+  // handed alongside a failed read is the caller's uninitialized sentinel and
+  // must not be able to rescue it — not even when it happens to be 1.
+  CHECK(Fp8Bf16DSplitKVerdict(true, false, 1) == Fp8Bf16DSplitK::kUnreadable);
+  CHECK(Fp8Bf16DSplitKVerdict(true, false, -1) == Fp8Bf16DSplitK::kUnreadable);
+  CHECK_FALSE(Fp8Bf16DSplitKAdmissible(Fp8Bf16DSplitK::kUnreadable));
+
+  // Tags are distinct and stable: the refusal message is what an operator greps.
+  CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kNotBf16D)) == "not-bf16-d");
+  CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kOk)) == "split-k-1");
+  CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kUnreadable)) == "split-k-unreadable");
+  CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kNotOne)) == "split-k-not-1");
+  CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kUnreadable)) !=
+        std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kNotOne)));
 }
