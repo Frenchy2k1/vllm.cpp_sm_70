@@ -1195,6 +1195,48 @@ what produced a non-overlapping 2.5%.
 
 **Row verdict: NOT parity on this cell. 0.975x, real and reproducible.**
 
+## 6t. WHERE THE 2.5% LIVES: the MoE expert GEMM (2026-08-12)
+
+nsys on our verify at T=9 (35B, k=8), `--cuda-graph-trace=node`, two token
+lengths so the one-time prefill differences out.
+
+**First, what it is NOT.** The 96-token profile's top entries look alarming:
+
+| kernel | share (96-tok run) | instances |
+|---|---|---|
+| `TransposeToInt32Kernel` | 16.9% | 20561 |
+| `gptq_marlin_repack_kernel` | 15.8% | 20561 |
+| `ProcessScalesKernel` | 7.7% | 20561 |
+
+40.4% of GPU time in weight REPACKING. But the 32-token run reports the SAME
+20561 instances and the same totals (183.5 / 170.4 / 83.9 ms vs 183.0 / 170.2 /
+83.5). Identical counts across run lengths means these are **LOAD-TIME**, not
+per-step -- the nsys-aggregation trap this row has already been caught by once
+("per-step Marlin repack" that was load-time). They cost ~437 ms once at startup
+and nothing per token. Do not optimise them for decode.
+
+**What actually scales is the expert GEMM:**
+
+| quantity | value |
+|---|---|
+| `marlin_moe_wna16::Marlin` instances | 560 (32 tok) -> 1520 (96 tok) = ~15/token |
+| GPU time | (249.2 - 90.9) ms / 64 tok = **2.47 ms/token** |
+| share of wall at 135.9 tok/s (7.36 ms/token) | **~34%** |
+
+That is the per-token cost, it is a GEMM, and being compute-bound it explains
+§6s's clock sensitivity exactly: pinning the SM clock hurt whichever engine does
+more SM work per token, and it hurt us more.
+
+**To close the measured 2.5% end-to-end requires ~7% off this kernel** (2.5 / 34).
+
+**Next step, and the rule that governs it:** profile the ORACLE's expert path and
+pair kernels BY CALL COUNT before touching ours. This row has already learned
+that the hard way -- a previous campaign found Marlin at 55.5% of our step and
+concluded it was the gap, until upstream's own profile showed it at 57.2% of ITS
+step, i.e. never the gap at all. A 34% share proves where our time goes, NOT that
+upstream spends less there. Until both profiles exist, "optimise the expert GEMM"
+is a guess.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

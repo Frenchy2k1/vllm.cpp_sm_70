@@ -19846,3 +19846,28 @@ inside noise is not thereby absent. "Below resolution" describes the harness, no
 the engines.
 
 Evidence: `dgx:~/work/dspark-w6/lownoise.log`, `fibacc.json`.
+
+## SPEC-DSPARK: the 2.5% is in the MoE expert GEMM, and the repack is LOAD-TIME (2026-08-12)
+
+nsys on our verify at T=9 (35B, k=8), --cuda-graph-trace=node, two token lengths.
+
+NOT the gap: `TransposeToInt32Kernel` (16.9%), `gptq_marlin_repack_kernel`
+(15.8%) and `ProcessScalesKernel` (7.7%) total 40.4% of the 96-token run, but
+report the SAME 20561 instances and the same totals in the 32-token run
+(183.5/170.4/83.9 ms vs 183.0/170.2/83.5). Identical counts across run lengths
+means LOAD-TIME: ~437 ms once at startup, nothing per token. Reading the
+96-token percentages alone would have sent someone optimising a one-time cost.
+
+The per-token cost is the expert GEMM: `marlin_moe_wna16::Marlin` 560 -> 1520
+instances (32 -> 96 tokens) = ~15/token, (249.2 - 90.9) ms / 64 tok = 2.47
+ms/token, which at 135.9 tok/s (7.36 ms/token) is ~34% of wall. Compute-bound,
+matching the clock sensitivity that exposed the 0.975x gap.
+
+Closing 2.5% end-to-end needs ~7% off that kernel.
+
+REQUIRED before acting: profile the oracle's expert path and pair by call count.
+A prior campaign on this repo found Marlin at 55.5% of our step and called it the
+gap; upstream's profile then showed 57.2% of ITS step, so it was never the gap. A
+share measures where OUR time goes, not where upstream's advantage is.
+
+Evidence: `dgx:~/work/dspark-w6/prof.log`, `prof/ours_{32,96}.nsys-rep`.
