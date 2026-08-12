@@ -193,6 +193,25 @@ environment:
     LAN with `tar -ch | ssh ... tar -x` into a FRESH directory; dgx reaches
     192.168.68.23 directly. The reimage CHANGED THE HOST KEY, so dgx's
     `known_hosts` needs `ssh-keygen -R 192.168.68.23` once.
+  - **Oracle CAVEAT UPDATE (2026-08-12, `CLAIM-MM-SPEED-AUDIO-ENC-FA2`):** both venvs
+    import cleanly now — `vllm-oracle-next` reports `0.23.1rc1.dev1511+g555967922`.
+    That string is a **`setuptools_scm` nearest-ancestor-tag artefact, NOT an identity
+    mismatch**: HEAD is `5559679229bc`, which IS the pin, and setuptools_scm names a
+    dev build after the newest tag reachable from the commit, not after the release the
+    commit belongs to. **Assert the oracle BY COMMIT, never by version string** — the
+    recorded `0.26.0.dev0` string will not match and nothing is wrong. Its source tree
+    `~/work/vllm-src-5559679` is present again (890 MB).
+  - **`soundfile==0.14.0` is required in `~/venvs/vllm-oracle-next` for Voxtral
+    (2026-08-12).** Without it the pin cannot tokenize the audio prompt at all, so the
+    pinned oracle is not gateable for the Voxtral vehicle. Installed; recorded here and
+    against issue #375. `~/venvs/vllm-oracle-v0.25.0-stage`
+    (vLLM 0.25.0 + mistral_common 1.11.5 — the Voxtral golden-capture stack) **ran a full
+    teacher-force to completion**, so the "crashes in EngineCore KV-cache/model init"
+    below is at least partly a PATH artefact: in a non-login shell Triton's JIT dies
+    `RuntimeError: Failed to find C compiler` AFTER the weights load, which surfaces as
+    `EngineCore failed to start`. Export **`CC=/usr/bin/gcc`** alongside the documented
+    `ninja` PATH fix and it runs. The `vllm-oracle` symlink still points at the 0.25.0
+    rollback rather than the pin (issue #375, open).
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import
