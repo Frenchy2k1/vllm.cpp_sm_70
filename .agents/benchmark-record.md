@@ -19784,3 +19784,30 @@ its mean. Three earlier ratios for this row (0.986x single-shot, 0.919x/0.987x a
 rather than either engine.
 
 Evidence: `dgx:~/work/dspark-w6/fibacc.log`, `fibacc.json`, `diag.log`.
+
+## SPEC-DSPARK: stop condition -- the residual is below measurement resolution (2026-08-12)
+
+| quantity | value |
+|---|---|
+| ours, 5 reps ("fibonacci") | min 138.90, median 141.80, max 142.40 |
+| oracle, modal draws (18 steps / 70 accepted) | min 142.01, median 142.37, max 142.66 |
+| distributions | OVERLAP (our max 142.40 > their min 142.01) |
+| median ratio | 0.9960x |
+| best-vs-best | 0.9982x |
+| our run-to-run spread | 2.47% |
+| their modal spread | 0.46% |
+
+The 0.4% median difference is six times smaller than our own spread and the
+distributions overlap, so the ordering is not established either way.
+
+No identified lever can close it: the largest remaining one is dropping the
+block-logits round trip (1.15 MB down + up), whose sync must happen regardless,
+so it is worth ~0.03 ms of a 34.7 ms step = 0.09%. The draft graph captures, the
+verify captures, the Markov sample is at its bandwidth bound, and per-step the
+engines match (30.4 vs ~30.1 ms; 34.7 vs ~34.5).
+
+Verdict: parity within the measurement's resolution. "capital" 1.012x,
+"fibonacci" 0.996x with overlapping distributions, acceptance identical at 48.6%
+/ 4.94 tokens per step. A strict >= 1.0x claim now needs a lower-noise harness
+(pinned clocks, many reps, and a reference whose acceptance does not vary), not
+more engineering.
