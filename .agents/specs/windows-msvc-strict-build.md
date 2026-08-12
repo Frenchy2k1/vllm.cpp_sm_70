@@ -147,3 +147,10 @@ at the two DeepSeek V4 expert-probe sequence assignments
 contain the identical diagnostic family and no other error; the focused
 follow-up is specified in
 [windows-msvc-deepseek-probe.md](windows-msvc-deepseek-probe.md).
+
+Hosted run `31590520904` next reached `src/vllm/v1/outputs.cpp` in both native
+configurations and stopped on C4458/C2220 because the
+`LogprobsTensors::slice_request` `num_positions` parameter hides the member of
+the same name ([#465](https://github.com/mudler/vllm.cpp/issues/465)). Both
+complete logs contain only this diagnostic family. The follow-up is specified
+in [windows-msvc-logprobs-shadow.md](windows-msvc-logprobs-shadow.md).

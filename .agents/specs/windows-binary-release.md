@@ -46,6 +46,10 @@ DeepSeek V4 expert-probe narrowing repair:
 [#464](https://github.com/mudler/vllm.cpp/issues/464), specified in
 [windows-msvc-deepseek-probe.md](windows-msvc-deepseek-probe.md)
 
+LogprobsTensors per-request slice shadow repair:
+[#465](https://github.com/mudler/vllm.cpp/issues/465), specified in
+[windows-msvc-logprobs-shadow.md](windows-msvc-logprobs-shadow.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
