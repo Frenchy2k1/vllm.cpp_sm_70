@@ -349,6 +349,17 @@ entry-scoped rules.
   live headings do.
 - #460's reproduction, red before and green after W3.
 - `check-pr-size.py`'s own red-before/green-after harness, for both checkers.
+- **CI on this PR: a red `windows-msvc-*` is NOT this row's.** Both lanes are
+  `if: github.event_name == 'pull_request'` (`ci.yml:640`), so the lane
+  `scripts/main-baseline.py` reads never runs them, and it reports main GREEN
+  while they fail on every PR that reaches them. `main` does not compile under
+  MSVC: `tests/vt/test_cpu_isa_x86.cpp` lacks `<ostream>`, and MSVC's
+  `<string_view>` does not supply it transitively. Reproduced byte-for-byte on
+  `row/ENG-RELEASE-WINDOWS` @`673c2f3d` and here @`104d3f36`: same file, same
+  `__msvc_string_view.hpp(550,23) error C2027`, same target, same failing step.
+  This PR touches no `src/`, `include/`, `tests/`, `cmake/` or `.ps1` path, so
+  it cannot be the cause. Filed as
+  [#503](https://github.com/mudler/vllm.cpp/issues/503).
 
 ## Stop conditions
 

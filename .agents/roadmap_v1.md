@@ -60,6 +60,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#498](https://github.com/mudler/vllm.cpp/issues/498) | `ENG-RECORD-CONFLICT-SURFACES` | `README.md` has 35 chars of headroom: `MAX_README_CHARS` is the same whole-file lock retired three times already, and one commit already landed 52 over | bug |
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-WINDOWS` | Binary release, including requested native Windows CPU/AVX2 and Vulkan bundles | feature |
 | [#447](https://github.com/mudler/vllm.cpp/issues/447) | `ENG-RELEASE-WINDOWS` | Native Windows release PR exposed stale version and archive-format contracts in hosted CI | bug |
+| [#503](https://github.com/mudler/vllm.cpp/issues/503) | `ENG-RELEASE-WINDOWS` | `main` does not compile under MSVC (`test_cpu_isa_x86.cpp` lacks `<ostream>`), and `main-baseline.py` reports GREEN because `windows-msvc-*` are PR-only jobs its lane never runs | bug |
 | [#448](https://github.com/mudler/vllm.cpp/issues/448) | `ENG-RELEASE-WINDOWS` | PR #446 device-leakage repair violates the per-commit documentation checkpoint | bug |
 | [#450](https://github.com/mudler/vllm.cpp/issues/450) | `ENG-RELEASE-WINDOWS` | PR #446 archive-target repair lacks its usage projection | bug |
 | [#453](https://github.com/mudler/vllm.cpp/issues/453) | `ENG-RELEASE-WINDOWS` | PR #446 exact-range gate lacks closed creation evidence for its new Windows checkers | bug |
