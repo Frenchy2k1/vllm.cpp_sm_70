@@ -382,14 +382,21 @@ cmake --build build --target vllm-server-archive
 build/release/stage/bin/vllm-server --help
 ```
 
-On native Windows, run the CPU staging gate from a Visual Studio 2022 x64
+On native Windows, run the release-bundle gate from a Visual Studio 2022 x64
 developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
 `bin/vllm-server.exe`, runs the focused Win32 tests, exercises the portable and
 AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
 `--help`, `/health`, `/version`, and a clean CTRL_BREAK shutdown:
 
 ```powershell
-pwsh -File scripts/build-windows-release.ps1
+$env:SOURCE_SHA = git rev-parse HEAD
+$env:VERSION = "0.0.3-pre.1"
+$env:SOURCE_DATE_EPOCH = git show -s --format=%ct HEAD
+$env:EVIDENCE_URL = "https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE"
+pwsh -File scripts/build-windows-release.ps1 -Backend cpu
+pwsh -File scripts/build-windows-release.ps1 -Backend vulkan `
+  -BuildDir build-release-windows-vulkan `
+  -StageDir build-release-windows-vulkan/stage
 ```
 
 The adaptive binary keeps its F16C translation unit at `/arch:AVX`; AVX2 and
@@ -401,6 +408,15 @@ project COFF directives for static `LIBCMT` and rejects dynamic/debug CRT
 imports before running the staged executable's `--help`, forced-tier, or HTTP
 shutdown smokes. The Win32 console-control regression uses bounded waits so a
 teardown failure reports an error instead of hanging the gate.
+
+Each invocation emits a deterministic `.zip` plus its exact `.sha256` and
+`.provenance.json` sidecars. ZIP members are sorted, use the
+`SOURCE_DATE_EPOCH` timestamp, and reject traversal, drive-qualified paths,
+backslashes, symlinks, and reparse points. The PE audit requires AMD64, `/MT`,
+system DLL imports, and no build/debug/MSYS paths. The Vulkan archive bundles no
+loader, ICD, or driver: `vulkan-1.dll` and a working host Vulkan stack remain
+external, and runtime evidence stays absent unless the extracted server is
+actually probed against a real ICD.
 
 The default smoke model is the committed tiny embedding fixture; pass
 `-SmokeModel C:\path\to\model` to use another complete model directory. This
@@ -547,6 +563,7 @@ provenance sidecars:
 ```sh
 python3 scripts/validate-release-archive.py \
   --archive vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz \
+  --archive-format tar.gz \
   --checksum vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256 \
   --provenance vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.provenance.json \
   --forbid-path "$PWD/build"

@@ -190,6 +190,7 @@ def spdx_document(
     server: Path,
     dependency_rows: list[dict[str, Any]],
     bundled_files: list[tuple[str, Path, str]] | None = None,
+    server_relative: str = "bin/vllm-server",
 ) -> dict[str, Any]:
     binary_digest = sha256(server)
     packages = [
@@ -220,7 +221,7 @@ def spdx_document(
             "SPDXID": "SPDXRef-File-vllm-server",
             "checksums": [{"algorithm": "SHA256", "checksumValue": binary_digest}],
             "copyrightText": "NOASSERTION",
-            "fileName": "./bin/vllm-server",
+            "fileName": f"./{server_relative}",
             "licenseConcluded": "Apache-2.0",
         }
     ]
@@ -345,6 +346,154 @@ def prepare_cpu_metadata(args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
+def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]]:
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(report, dict) or report.get("schema") != "vllm.cpp.pe-audit.v1":
+        raise ValueError("PE audit report has the wrong schema")
+    if str(report.get("machine", "")).upper() not in {"8664", "AMD64", "X64"}:
+        raise ValueError("PE audit must prove an AMD64 executable")
+    imports = report.get("imports")
+    if not isinstance(imports, list) or not imports or any(not isinstance(item, str) for item in imports):
+        raise ValueError("PE audit imports must be a non-empty string array")
+    forbidden = [
+        name for name in imports
+        if re.match(r"(?i)^(?:msys-|mingw|libgcc|libstdc\+\+|vcruntime|msvcp|msvcr|ucrtbase|concrt)", name)
+    ]
+    if forbidden:
+        raise ValueError(f"PE audit violates native static-CRT policy: {sorted(forbidden)}")
+    debug_paths = report.get("debug_paths")
+    if not isinstance(debug_paths, list) or any(not isinstance(item, str) for item in debug_paths):
+        raise ValueError("PE audit debug_paths must be a string array")
+    if any(re.match(r"^[A-Za-z]:[\\/]", item) for item in debug_paths):
+        raise ValueError("PE audit embeds a developer-drive debug path")
+    rows = [
+        {
+            "bundled": False,
+            "kind": "library",
+            "linkage": "dynamic",
+            "name": name,
+            "role": "runtime",
+            "version": "windows-2022",
+        }
+        for name in sorted(set(imports), key=str.upper)
+    ]
+    if backend == "vulkan":
+        rows.extend(
+            {
+                "bundled": False,
+                "kind": kind,
+                "linkage": "external",
+                "name": name,
+                "role": "external-runtime",
+                "version": "host",
+            }
+            for name, kind in (
+                ("vulkan-loader", "library"),
+                ("vulkan-icd", "library"),
+                ("vulkan-driver", "driver"),
+            )
+        )
+    return rows
+
+
+def prepare_windows_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    expected_id = f"windows-x86_64-msvc-{args.backend}"
+    if args.artifact_id != expected_id or args.backend not in {"cpu", "vulkan"}:
+        raise ValueError(f"unsupported Windows artifact {args.artifact_id!r}")
+    server = args.stage_dir / "bin/vllm-server.exe"
+    if not server.is_file():
+        raise ValueError("staged bin/vllm-server.exe is missing")
+    flags = backend_flags(parse_cache(args.build_dir / "CMakeCache.txt"))
+    if flags["VLLM_CPP_VULKAN"] is not (args.backend == "vulkan"):
+        raise ValueError("resolved Vulkan flag disagrees with Windows artifact")
+    compiled_tiers, selected_tier, test_commands = load_tier_report(
+        args.tier_report, "x86_64", False
+    )
+    dependency_rows = windows_dependencies(args.pe_report, args.backend)
+    runtime = (
+        passed("extracted Vulkan ICD runtime probe", args.evidence_url)
+        if args.backend == "vulkan" and args.vulkan_runtime_passed
+        else absent("no real extracted-archive Vulkan ICD probe was executed")
+        if args.backend == "vulkan"
+        else passed(" && ".join(test_commands), args.evidence_url)
+    )
+    facts: dict[str, Any] = {
+        "artifact": {
+            "c_abi_version": args.c_abi_version,
+            "channel": "preview",
+            "id": args.artifact_id,
+            "kind": "primary",
+            "static_boundary": "static-core",
+            "version": args.version,
+        },
+        "backend": {
+            "flags": flags,
+            "gpu_driver_boundary": "not-applicable" if args.backend == "cpu" else "external-host-never-bundled",
+            "name": args.backend,
+        },
+        "build": {
+            "compiler": args.compiler,
+            "resolved_cmake_options": flags,
+            "source_clean": args.source_clean,
+            "source_commit": args.source_commit,
+            "test_commands": [*test_commands, "python scripts/validate-release-archive.py --archive-format zip"],
+            "toolchain": args.toolchain,
+        },
+        "dependencies": dependency_rows,
+        "evidence": {
+            "archive_smoke": passed("extracted vllm-server.exe --help && --version", args.evidence_url),
+            "build": passed("cmake --build <build> --config Release --target server", args.evidence_url),
+            "correctness": passed(" && ".join(test_commands), args.evidence_url) if args.backend == "cpu" else absent("no real Vulkan ICD correctness probe was executed"),
+            "dependency_audit": passed("dumpbin /headers /dependents /rawdata", args.evidence_url),
+            "performance": absent("release packaging does not imply a performance claim"),
+            "runtime": runtime,
+        },
+        "host": {
+            "abi": "msvc", "abi_version": args.abi_version, "arch": "x86_64",
+            "os": "windows", "toolset_version": args.toolset_version,
+            "ucrt_version": args.ucrt_version,
+        },
+        "supply_chain": {
+            "archive_checksum": passed("SHA256 final ZIP", args.evidence_url),
+            "licenses": passed("validate notices and licenses", args.evidence_url),
+            "provenance": passed("validate detached in-toto SLSA subject digest", args.evidence_url),
+            "sbom": passed("validate SPDX-2.3 server checksum and dependencies", args.evidence_url),
+        },
+    }
+    if args.backend == "cpu":
+        facts["cpu"] = {
+            "baseline": release_manifest.CPU_TIER_POLICY["x86_64"]["baseline"],
+            "compiled_tiers": compiled_tiers,
+            "selected_tier": selected_tier,
+        }
+    schema = release_manifest.load_schema(args.repo_root / "release/manifest-v1.schema.json")
+    manifest = release_manifest.generate_manifest(facts, args.repo_root, schema)
+    output = args.output_dir
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "release-manifest.json").write_text(canonical_json(manifest), encoding="utf-8")
+    values = {
+        "version": args.version, "commit": args.source_commit,
+        "artifact_id": args.artifact_id, "backend": args.backend,
+        "host_os": "windows", "host_arch": "x86_64", "host_abi": "msvc",
+        "source_clean": "true" if args.source_clean else "false",
+        "c_abi_version": str(args.c_abi_version),
+    }
+    (output / "VERSION").write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+    (output / "sbom.spdx.json").write_text(
+        canonical_json(spdx_document(args.artifact_id, args.version, args.source_commit, server, dependency_rows, server_relative="bin/vllm-server.exe")),
+        encoding="utf-8",
+    )
+    (output / "THIRD_PARTY_NOTICES").write_text(
+        "vllm.cpp release dependency notices\n\n" + "".join(
+            f"- {row['name']} {row['version']} ({row['linkage']})\n" for row in dependency_rows
+        ), encoding="utf-8"
+    )
+    license_dir = output / "share/licenses/vllm.cpp"
+    license_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(args.repo_root / "LICENSE", license_dir / "LICENSE")
+    return manifest
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, default=SCRIPT_DIR.parent)
@@ -362,13 +511,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--toolchain", required=True)
     parser.add_argument("--evidence-url", required=True)
+    parser.add_argument("--backend", choices=("cpu", "vulkan"), default="cpu")
+    parser.add_argument("--pe-report", type=Path)
+    parser.add_argument("--toolset-version")
+    parser.add_argument("--ucrt-version")
+    parser.add_argument("--vulkan-runtime-passed", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        prepare_cpu_metadata(args)
+        if args.artifact_id.startswith("windows-"):
+            if args.pe_report is None or not args.toolset_version or not args.ucrt_version:
+                raise ValueError("Windows metadata requires PE report, toolset version, and UCRT version")
+            prepare_windows_metadata(args)
+        else:
+            prepare_cpu_metadata(args)
     except (OSError, json.JSONDecodeError, KeyError, ValueError, release_manifest.ManifestError) as exc:
         print(f"release metadata error: {exc}", file=sys.stderr)
         return 1

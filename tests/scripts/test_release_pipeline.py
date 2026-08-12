@@ -76,7 +76,13 @@ class ReleasePipelineContract(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pipeline.validate_matrix(matrix)
 
-    def test_publish_matrix_contains_all_eight_primary_bundles(self) -> None:
+    def test_existing_build_drivers_pass_explicit_tar_format(self) -> None:
+        for driver in BUILD_DRIVERS:
+            with self.subTest(driver=driver.name):
+                text = driver.read_text(encoding="utf-8")
+                self.assertIn("--archive-format tar.gz", text)
+
+    def test_publish_matrix_contains_all_ten_primary_bundles_with_explicit_formats(self) -> None:
         matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
         artifacts = self.pipeline.validate_matrix(matrix)
         self.assertTrue(matrix["release_ready"])
@@ -91,9 +97,41 @@ class ReleasePipelineContract(unittest.TestCase):
                 "linux-x86_64-glibc-vulkan": "preview",
                 "macos-arm64-metal": "stable",
                 "macos-arm64-metal-mlx": "preview",
+                "windows-x86_64-msvc-cpu": "preview",
+                "windows-x86_64-msvc-vulkan": "preview",
             },
         )
         self.assertTrue(all(item["required"] is True for item in artifacts))
+        self.assertEqual(
+            {item["archive_format"] for item in artifacts if item["id"].startswith("windows-")},
+            {"zip"},
+        )
+        self.assertEqual(
+            {item["archive_format"] for item in artifacts if not item["id"].startswith("windows-")},
+            {"tar.gz"},
+        )
+
+    def test_matrix_rejects_missing_or_aliased_archive_formats(self) -> None:
+        matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        for value in (None, "tgz", "ZIP"):
+            with self.subTest(value=value):
+                mutant = copy.deepcopy(matrix)
+                if value is None:
+                    mutant["artifacts"][0].pop("archive_format")
+                else:
+                    mutant["artifacts"][0]["archive_format"] = value
+                with self.assertRaises(ValueError):
+                    self.pipeline.validate_matrix(mutant)
+
+    def test_windows_archive_triplet_uses_zip(self) -> None:
+        self.assertEqual(
+            self.pipeline.canonical_archive_name(
+                "0.0.1", "windows-x86_64-msvc-cpu", "zip"
+            ),
+            "vllm.cpp-0.0.1-windows-x86_64-msvc-cpu.zip",
+        )
+        with self.assertRaises(ValueError):
+            self.pipeline.canonical_archive_name("0.0.1", "artifact", "tgz")
 
     def test_handoff_digest_and_source_sha_are_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
