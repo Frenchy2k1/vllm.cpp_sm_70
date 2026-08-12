@@ -54,6 +54,10 @@ MSVC CHECK stringizing repair for the Windows argv expectation:
 [#474](https://github.com/mudler/vllm.cpp/issues/474), specified in
 [windows-msvc-check-stringizing.md](windows-msvc-check-stringizing.md)
 
+Release benchmark projection compaction:
+[#475](https://github.com/mudler/vllm.cpp/issues/475), specified in
+[release-benchmark-projection-compaction.md](release-benchmark-projection-compaction.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
