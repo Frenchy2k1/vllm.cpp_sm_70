@@ -114,13 +114,27 @@ _VERSION_COMMIT_RE = re.compile(r"\+g([0-9a-f]{7,40})")
 def assert_oracle_commit(runtime_version: object) -> None:
     """Require *runtime_version* to name the pinned commit.
 
-    THIS IS THE ASSERTION #375 NEEDED AND DID NOT HAVE.  A version number alone
-    cannot tell the pin from the preserved rollback: the rollback reports a
-    clean "0.25.0", runs, and is deterministic, so it is indistinguishable from
-    a correct reference by every check that existed.  What it cannot produce is
-    the pin's `+g<sha>` local version segment.  Comparing a PREFIX of the
-    recorded 40-hex SHA rather than a fixed abbreviation length keeps this true
-    across git's variable auto-abbreviation (the pin abbreviates to nine).
+    A version number alone cannot tell the pin from the preserved rollback: the
+    rollback reports a clean "0.25.0", runs, and is deterministic, so it is
+    indistinguishable from a correct reference by every check that existed
+    before #520.  What it cannot produce is the pin's `+g<sha>` local version
+    segment.  Comparing a PREFIX of the recorded 40-hex SHA rather than a fixed
+    abbreviation length keeps this true across git's variable auto-abbreviation
+    (the pin abbreviates to nine).
+
+    THIS IS DEFENCE IN DEPTH, NOT THE OPERATIVE TERM AT THIS PIN.  The first
+    commit message of #520 overstated it as "the check #375 needed"; the
+    correction lives here because that message cannot be rewritten.  At all
+    three call sites an exact equality against `VLLM_ORACLE_VERSION` runs first,
+    and today that constant already CONTAINS `+g555967922` -- so any string that
+    passes the equality also passes this function, and it cannot fire in
+    production.  What refuses the rollback today is the updated constant.  This
+    assertion earns its place when the two come apart: a manifest read off disk
+    from another venv or another day, a hand-edited evidence file, or a future
+    pin whose recorded version is a plain release number.  `tests/tools/
+    test_oracle_pin.py` proves the call sites exist by patching the version
+    constant to a release-numbered shape, which is the only input that can reach
+    this function while the equality holds.
     """
 
     text = "" if runtime_version is None else str(runtime_version)

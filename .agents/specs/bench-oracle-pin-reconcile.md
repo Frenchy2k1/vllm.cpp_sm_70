@@ -37,6 +37,15 @@ hardcoded literal outside them. So the reconcile is three values, not N files.
   its own goldens. They move only when the goldens are recaptured.
 - **Historical narrative** in `.agents/**` records, specs, and capture-script
   docstrings. History is git; a past run that used 0.25.0 keeps saying so.
+  *Refined by fresh review (Finding 3):* a **present-tense claim about which
+  oracle is pinned** is not narrative, and two such claims contradicted the
+  record — `tools/bench/scheduler_wave_diff.py:21` ("the pinned vLLM oracle
+  (~/venvs/vllm-oracle == vllm 0.25.0 == 702f481)") and
+  `tools/bench/mxfp4_smoke_gate.py:11` ("captured from the pinned 0.25.0
+  oracle"). Both are corrected to name the current pin while KEEPING the capture
+  provenance, which is the historical fact. Neither is enforced by code. The two
+  `--require-vllm-version 0.25.0` defaults in the GDN oracle scripts stay
+  untouched under the golden-provenance bullet above.
 - **Re-measuring anything.** No grid runs in this row — #522 blocks it, and the
   GPU is queued. This row makes the pin *reachable*; the first binding grid
   against it is a separate row with its own gate.
@@ -113,9 +122,20 @@ Three changes, each closing a hole the old check left open:
 1. **Commit SHA is asserted.** `VLLM_COMMIT` was previously never checked
    against a running oracle at all — only stamped into manifests. The new check
    requires the resolved SHA's `+g<short>` to appear in `vllm.__version__`.
-   **This is the assertion that would have caught #375**: the rollback reports a
-   perfectly clean `0.25.0` and looks healthy; what it cannot produce is
-   `+g555967922`.
+
+   **CORRECTION (fresh review, Finding 2).** The first commit message of this
+   row called that "THE CHECK #375 NEEDED", and that overstates it. The
+   assertion is **defence in depth and is inert at this pin**: at all three call
+   sites an exact equality against `VLLM_ORACLE_VERSION` runs first, and that
+   constant already *contains* `+g555967922`, so every string that passes the
+   equality also passes the assertion. It cannot fire in production today. What
+   refuses the rollback today is **the updated constant** — the equality — which
+   is exactly the reconcile this row is named for. The assertion earns its place
+   where the two come apart: a manifest read off disk from another venv or
+   another day, a hand-edited evidence file, or a pin whose recorded version is
+   a plain release number. The commit message cannot be rewritten (`main` is
+   never force-pushed), so the correction lives here and in the function's own
+   docstring, which is where a reader meets it.
 2. **Metadata is matched against its own recorded string**, so the
    `.precompiled` suffix is asserted rather than assumed away with a
    `startswith` that would also accept an arbitrary suffix.
@@ -124,6 +144,31 @@ Three changes, each closing a hole the old check left open:
 
 `PANDAS_VERSION` stays as-is and keeps failing closed on the pin. That failure
 is the true state of the world (#522) and is not papered over here.
+
+### The pin block permanently requires a `+g<sha>` runtime version
+
+Recorded because it was nowhere written down (fresh review, Finding 4).
+`assert_oracle_commit` extracts `+g<sha>` from a version string and requires it
+to prefix `vllm_commit`, and it is applied to the **recorded** string as much as
+to the oracle's. So `vllm_runtime_version` may never be a released-wheel shape:
+set the block to `0.26.0` and the harness refuses every oracle including the pin
+itself — **measured 2026-08-12: 34 of the 233 `tests/tools` cases go red**. That
+is fail-closed and CI-caught, never silent, and it is the correct polarity. But
+it constrains the next advance: take the value from a source build's measured
+`vllm.__version__`, never transcribe a release number. A genuinely
+released-wheel pin needs the commit carried in its own asserted field first —
+never by deleting the assertion to make the block parse.
+
+### Operational consequence on merge: `record-oracle` will ABORT on dgx
+
+**This is the gate working, not a breakage.** `~/venvs/vllm-oracle` is host state
+and still symlinks the preserved 0.25.0 rollback, so the next
+`scripts/dgx-online-serving.sh record-oracle` through that symlink aborts with
+`vLLM oracle version drift` naming the pinned strings. That is the whole point of
+the row: before this change the same symlink silently produced a manifest
+labelled with the pin it did not run. Repointing the symlink is **#375's**, not
+this row's (see Stop conditions) — whoever hits the abort should fix the symlink
+or pass the pinned venv, and must not "fix" it by editing the constants back.
 
 ## Tests
 
@@ -140,8 +185,31 @@ is the true state of the world (#522) and is not papered over here.
    metadata suffix — the case the old `metadata == runtime` shape rejected.
 4. **A malformed pin block is fatal**, not defaulted.
 
+**Added after fresh review (Finding 1): the guard must be proven WIRED IN.**
+Cases 1–4 exercise `read_parity_pin` and `assert_oracle_commit` as pure
+functions, which says nothing about whether the manifest entry points consult
+them — and they did not have to: the reviewer gutted `record_oracle_manifest`'s
+identity check *and* deleted its `assert_oracle_commit`, and 226/226 stayed
+green. Six mutations survived (each of the three `assert_oracle_commit` call
+sites deleted individually; either equality dropped in `record_oracle_manifest`;
+the runtime equality plus assert dropped in `record_execution_manifest`).
+`OracleIdentityIsWiredIntoEveryEntryPointTests` adds negative cases at each
+of the three entry points — `record_oracle_manifest`, `record_execution_manifest`, and
+`gdn_packed_component._validate_execution` — feeding the rollback's measured
+shape and requiring **that entry point's own refusal message**, not a bare
+`HarnessError`: these functions raise it for a dozen unrelated reasons, so an
+unanchored `assertRaises` stays green on a gutted check that merely fails later.
+
+Two of the six mutations are unreachable by any manifest value, because the
+version equality dominates the assertion (§Design correction, Finding 2), so
+those cases patch the version constant to a release-numbered shape — the only
+input that reaches the assertion while the equality holds. All six mutations,
+plus a seventh (dropping the GDN runtime equality) that also survived, are now
+RED; each restored byte-for-byte and verified by sha256.
+
 Regression surface: `tests/tools` in full (208 tests on the base SHA
-`a89b3c456`; a changed count is RED even when it prints `OK`).
+`a89b3c456`, 226 after the row's first two commits, **233** with the wiring
+cases; a changed count is RED even when it prints `OK`).
 
 ## Gates
 
@@ -171,6 +239,15 @@ Regression surface: `tests/tools` in full (208 tests on the base SHA
 - Constants survey: `grep -rn` over `tools/ scripts/ tests/ .agents/ docs/`;
   1,399 raw hits, of which exactly **3** are live definitions and the rest are
   imports, golden provenance, or narrative. The table is in #520.
+- Wiring mutations (fresh-implementer round, Finding 1): all seven applied one at
+  a time with `count == 1` anchor assertions, each run over the full
+  `tests/tools` suite before the new cases and over `test_oracle_pin` after.
+  Before: 7/7 **survived** at 226 green. After: 7/7 **RED**, each attributed to
+  the intended new case. Every mutation restored byte-for-byte, verified by
+  sha256 rather than timestamp.
+- Released-wheel pin shape (Finding 4): `vllm_runtime_version = 0.26.0` in the
+  block, full suite → `FAILED (failures=29, errors=5)` of 233 collected; record
+  restored from a byte copy.
 
 ## Now
 
