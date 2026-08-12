@@ -1237,6 +1237,148 @@ step, i.e. never the gap at all. A 34% share proves where our time goes, NOT tha
 upstream spends less there. Until both profiles exist, "optimise the expert GEMM"
 is a guess.
 
+## 6u. PAIRED PROFILE: the gap is 8.2% INSIDE the same Marlin MoE kernel (2026-08-12)
+
+§6t located our per-token cost in the expert GEMM but refused to act on a share
+alone, because this repo has been burned by exactly that. Here is the other half,
+upstream profiled through its own torch profiler (nsys breaks its EngineCore),
+warm generate only, 96 tokens, same model + draft + k.
+
+**Paired BY CALL COUNT:**
+
+| | kernel | instances | GPU time |
+|---|---|---|---|
+| ours | `marlin_moe_wna16::Marlin` | **1520** | **249.22 ms** |
+| upstream | `marlin_moe_wna16::Marlin` | **1520** | **230.39 ms** |
+
+The SAME kernel with the SAME template arguments and the SAME 1520 launches, and
+we are **8.2% slower inside it**. Shares agree too: excluding our load-time
+repack (437 ms, §6t) it is 38.8% of our decode-relevant GPU time against their
+36.9%.
+
+**The arithmetic closes:** the expert GEMM is ~34% of our wall (§6t), so 8.2%
+slower there is 0.34 x 8.2 = **2.8% end-to-end**, against the **2.5%** measured
+under pinned clocks (§6s). The whole residual is this one kernel; nothing else
+needs explaining.
+
+**This is the outcome the pairing rule exists to produce.** A previous campaign
+found Marlin at 55.5% of our step, called it the gap, and upstream's profile then
+showed 57.2% of ITS step -- a share proving only where time goes. Here the shares
+are ALSO near-equal (38.8 vs 36.9), so share reasoning would again have said
+"not the gap". Only the ABSOLUTE time at matched call count exposes it: identical
+work, 18.8 ms more of it.
+
+**What it is NOT:** not a different algorithm, not a different kernel family, not
+launch overhead, not acceptance, not the repack (load-time), not the sampler
+(bandwidth bound), not the graphs (both capture). Upstream reaches the same
+kernel through `gptq_marlin_repack` at load exactly as we do.
+
+**Next, and it is narrow:** the difference must be in how the kernel is
+CONFIGURED or fed -- tile/thread selection (Marlin picks thread_k/thread_n per
+shape), the grouped-GEMM problem layout at T=9, or the scales/zero-point layout
+the repack produces. The template arguments printed in both profiles match, so
+compare the LAUNCH parameters and the repacked weight layout, not the algorithm.
+An 8.2% recovery on that kernel is worth the full 2.5%.
+
+## 6v. INSIDE THE KERNEL: what the 8.2% is NOT (2026-08-12)
+
+§6u paired the profiles and put the whole residual in `marlin_moe_wna16::Marlin`.
+This narrows it further, and the cross-check below is what makes the finding
+trustworthy in the first place.
+
+**The instrumentation objection, answered.** Our number came from nsys and
+upstream's from its torch profiler, so a sceptic should ask whether the tools
+differ. Split the profiles:
+
+| | ours | upstream | delta |
+|---|---|---|---|
+| Marlin MoE | 249.2 ms | 230.4 ms | **+8.2%** |
+| EVERYTHING ELSE | 392.8 ms | 393.6 ms | **-0.2%** |
+| total decode GPU | 642.0 ms | 624.0 ms | +2.9% |
+
+If nsys inflated our kernels, every kernel would inflate. All other GPU work
+matches to 0.2%, and the total (+2.9%) tracks the independently measured
+pinned-clock wall gap (2.5%). The difference is real and confined to one kernel.
+
+**Eliminated, by reading both sources:**
+
+1. **Kernel selection.** The full template arguments are identical on both sides:
+   `<...128, 1, 8, 4, true, 4, 1, false>`. Same instantiation, same tiling.
+2. **The `block_size_m` clamp.** Upstream clamps to >= 16 for 1-byte input dtypes
+   (`marlin_moe.py:328-329`) and our selector deliberately omits it. Tempting,
+   but the identical template arguments prove both land on the same config here.
+3. **Grid selection.** `determine_exec_config` is BYTE-IDENTICAL between our
+   vendored copy and the pinned `csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu`
+   (69 lines, no diff), and both callers pass `thread_k = thread_n = -1`, so both
+   take the same auto path. The `blocks_per_sm` argument differs in spelling only
+   (we pass 0, upstream defaults -1) and neither reaches the manual branch.
+4. **`ignore_invalid_experts`.** Upstream passes it, but it only changes counting
+   when an `expert_map` exists (expert parallelism). Single GPU has none.
+
+**So: same kernel, same instantiation, same grid rule, same launch count, same
+alignment semantics -- and 18.8 ms more work.** That leaves what the kernel READS:
+
+- the repacked WEIGHT LAYOUT. Our load path runs two kernels upstream does not
+  (`TransposeToInt32Kernel`, `ProcessScalesKernel`, §6t) to adapt a different
+  source layout. Correctness is settled, but stride/padding/alignment of the
+  final B and scales tensors is not, and the kernel's loads are sensitive to it.
+- WEIGHT RESIDENCY. This repo has a standing GB10 finding that host/ATS-retagged
+  weights run materially slower per GEMM than device-resident ones. Whether every
+  35B expert tensor is device-resident on this path is not established here.
+
+Both are checkable without guessing: dump the B/scales tensor strides and the
+pointer residency on both sides for one expert, and compare. That is the next
+step, and it is measurement, not a rewrite.
+
+**Do not "optimise the kernel".** It is vendored from vLLM and byte-identical in
+the parts that choose what to run; the difference is in what we hand it.
+
+## 6w. THE INPUTS MATCH -- so the 8.2% may be ROUTING, not a defect (2026-08-12)
+
+§6v narrowed the residual to "what we hand the kernel". Comparing that directly
+closes off the layout hypotheses and opens a different, more likely one.
+
+**Everything about the inputs matches:**
+
+| property | ours | upstream |
+|---|---|---|
+| w13 scales per expert | `2*(K/16)*N` = 131072 B | `[256,128,1024]` fp8 = 131072 B |
+| w2 scales per expert | `(N/16)*K` = 65536 B | `[256,32,2048]` fp8 = 65536 B |
+| pointer alignment | pool over `cudaMalloc` | `ptr%16 == 0`, `ptr%256 == 0` |
+| residency | `cudaMalloc` (device) | torch CUDA tensor (device) |
+
+So: identical kernel, identical instantiation, identical grid rule, identical
+launch count, identical scale layout, identical alignment, identical residency.
+At that point "our kernel is slower" stops being the simplest explanation.
+
+**The likelier one: we are not doing the same WORK.** The Marlin MoE kernel loops
+`div_ceil(num_tokens_past_padded, moe_block_size)` blocks per launch, and
+`num_tokens_past_padded` depends on HOW MANY DISTINCT EXPERTS the batch touches:
+E=256, top_k=8, M=9 gives up to 72 (token, expert) pairs, each padded to a
+`block_size_m` multiple. The launch COUNT is fixed by layers x steps (1520 on
+both sides, as measured), but the BLOCKS PER LAUNCH are not.
+
+And our token stream is NOT upstream's. §6i measured our 35B "fibonacci" output
+diverging from the oracle's at char 55 (`return (` vs `return(`) -- a near-tie
+flip, the ratified regime. Different tokens route to different experts, so the
+two engines can execute different amounts of expert work for the "same" prompt
+while launching the kernel the same number of times.
+
+**If that is the cause, the 8.2% is not an implementation gap and cannot be
+optimised away** -- it is the cost of a different (equally valid) token path.
+
+**The experiment that decides it**, and it must run before any kernel work:
+instrument `num_tokens_past_padded` (or the per-call block count) on both sides
+for the same prompt and compare the TOTALS over a run. Equal totals => our kernel
+really is slower and the layout hunt continues elsewhere. Different totals => the
+gap is routing, the comparison was never like-for-like at the kernel level, and
+the honest statement is that the engines diverge in what they compute rather than
+how fast they compute it.
+
+Recording this BEFORE acting, because every cheap explanation has now been
+eliminated and the expensive one (rewrite the expert path) would be exactly the
+wrong response to a routing difference.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
