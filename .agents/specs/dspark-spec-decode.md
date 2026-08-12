@@ -1560,8 +1560,11 @@ single ~512 MB slab spanning all 256 experts, versus torch's segmented caching
 allocator), not in anything the kernel or its inputs express.
 
 **Next levers, in order of cheapness:**
-1. Split the per-expert weight slab into per-expert or per-segment allocations and
-   re-measure the kernel; if bandwidth rises, the slab's page backing is the cause.
+1. ~~Split the per-expert weight slab~~ -- **REFUTED, do not try it.** Our slab is
+   the SAME SIZE and stride as upstream's tensor: per-expert gate_up slot
+   `2*wg_i32` = 262144 int32 = exactly the 1.0 MB a `[K, 2N]` 4-bit weight needs
+   (no padding), and the whole slab is 268 MB on both sides. There is no
+   oversizing or stride inflation to remove.
 2. `cudaMemAdvise` / preferred-location hints on the expert slab.
 3. Upstream's `ncu` counters (currently BLOCKED: its EngineCore will not
    initialise under ncu kernel replay) to confirm its DRAM efficiency directly
