@@ -714,7 +714,7 @@ void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& 
       q, out, a_fp8, b_fp8, alpha);
 }
 void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                       float alpha) {
+                       float alpha, bool claims_splitk1_premise) {
   // Same argument contract as MatmulFp8Cutlass (drop-in fp8 dense GEMM).
   VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
            "matmul_fp8_cublaslt: all tensors must be rank-2");
@@ -731,10 +731,10 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
   VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device,
            "matmul_fp8_cublaslt: device mismatch");
   reinterpret_cast<MatmulFp8CublasLtFn>(GetOp(OpId::kMatmulFp8CublasLt, q.device.type))(
-      q, out, a_fp8, b_fp8, alpha);
+      q, out, a_fp8, b_fp8, alpha, claims_splitk1_premise);
 }
 void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                               const Tensor& alpha_vec) {
+                               const Tensor& alpha_vec, bool claims_splitk1_premise) {
   // Same operand contract as MatmulFp8CublasLt, plus the per-column alpha.
   //
   // The output was f32 ONLY, because the fallback arm applies the vector with
@@ -775,7 +775,8 @@ void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const
                alpha_vec.device == q.device,
            "matmul_fp8_cublaslt_alpha_vec: device mismatch");
   reinterpret_cast<MatmulFp8CublasLtAlphaVecFn>(
-      GetOp(OpId::kMatmulFp8CublasLtAlphaVec, q.device.type))(q, out, a_fp8, b_fp8, alpha_vec);
+      GetOp(OpId::kMatmulFp8CublasLtAlphaVec, q.device.type))(q, out, a_fp8, b_fp8, alpha_vec,
+                                                             claims_splitk1_premise);
 }
 
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,

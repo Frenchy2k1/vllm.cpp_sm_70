@@ -3437,10 +3437,24 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.in_proj_qkv_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
+  // THIS is the call site that claims the splitK=1 premise, and the only one in
+  // the tree (#339, review finding F-A). `want == kBF16` here is reachable ONLY
+  // through GdnFp8InBf16Enabled() — the leaf above resolves `fp8_indt` to bf16
+  // under that toggle and nothing else — and that lever's whole argument is that
+  // its bf16 D is the f32 D narrowed at the STORE, nothing more. A split-K plan
+  // would silently make it a reduction-order change instead, which a bf16 store
+  // is very good at hiding from a token gate, so the op verifies it and refuses.
+  //
+  // The f32 arm passes false: it is the baseline the claim is made AGAINST, so
+  // it claims nothing. Neither does any other bf16-D fp8 GEMM in this file —
+  // o_proj_fp8 / out_proj_fp8 go through MatmulFp8Cutlass{,PreQuant}D at
+  // DType::kBF16 on a DEFAULT-ON path and simply want a bf16 output; split-K is
+  // correct for them and they are never checked.
+  const bool claims_splitk1 = want == DType::kBF16;
   if (qkvz.folded) {
     // One shared alpha: already a single GEMM scalar, nothing to apply after.
     if (DenseCublasLtFp8Enabled())
-      vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+      vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha, claims_splitk1);
     else
       vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
   } else if (DenseCublasLtFp8Enabled()) {
@@ -3449,7 +3463,8 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
     // and the selected algo supports the pointer mode, and otherwise runs the
     // GEMM at alpha=1 plus vt::MulColVecF32 — byte for byte what this line pair
     // did before. The model no longer owns that choice.
-    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha_vec);
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha_vec,
+                                  claims_splitk1);
   } else {
     // CUTLASS arm (VT_DENSE_CUBLASLT_FP8=0): no epilogue alpha vector, so the
     // two-launch form stays here verbatim. Both launches follow `out`'s dtype,
@@ -8927,10 +8942,29 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
-    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                            s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                            impl_->config, {}, nullptr, aux_ids_arg, aux_out_arg,
-                            dbuf ? s.dev.get() : nullptr);
+    // A THROW OUT OF A CAPTURE REGION MUST STILL END THE CAPTURE (#339, review
+    // finding F-B). Capture mode is cudaStreamCaptureModeThreadLocal
+    // (cuda_backend.cu), so if an exception skipped EndCaptureGraph the stream
+    // would stay in capture mode FOREVER and every later CUDA call on it would
+    // fail — a failure mode that looks nothing like its cause, arrives long
+    // after it, and cannot be repaired by the first catch (the engine thread in
+    // v1/engine/core_client.cpp, which only marks the engine dead). Any refusal
+    // raised inside ForwardLayers reaches here: the fp8 splitK premise check is
+    // one such, and it is not the only thing under here that can throw. Drain,
+    // then rethrow the ORIGINAL error — mirrors qwen3_dflash.cpp's capture guard.
+    DBuf lg = [&] {
+      try {
+        return ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                             s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                             impl_->config, {}, nullptr, aux_ids_arg, aux_out_arg,
+                             dbuf ? s.dev.get() : nullptr);
+      } catch (...) {
+        void* g = nullptr;
+        try { g = b.EndCaptureGraph(impl_->queue); } catch (...) {}  // unstick the stream
+        if (g != nullptr) b.DestroyGraph(g);
+        throw;
+      }
+    }();
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
@@ -9329,10 +9363,24 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
-    DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                                 s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                                 impl_->config, {}, nullptr, nullptr, aux_ids_arg,
-                                 aux_out_arg, dbuf ? s.dev.get() : nullptr);
+    // Drain the capture if the forward throws — see the 35B driver above for why
+    // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
+    // is the 27B DENSE driver, and it is the one that matters most here: the
+    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is confined to the
+    // 27B by construction, since the 35B is MoE and its GdnOutDType is f32.
+    DBuf lg = [&] {
+      try {
+        return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                                  s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                                  impl_->config, {}, nullptr, nullptr, aux_ids_arg,
+                                  aux_out_arg, dbuf ? s.dev.get() : nullptr);
+      } catch (...) {
+        void* g = nullptr;
+        try { g = b.EndCaptureGraph(impl_->queue); } catch (...) {}  // unstick the stream
+        if (g != nullptr) b.DestroyGraph(g);
+        throw;
+      }
+    }();
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;

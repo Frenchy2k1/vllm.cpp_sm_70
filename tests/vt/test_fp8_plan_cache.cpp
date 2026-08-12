@@ -17,6 +17,7 @@
 using vt::cuda::Fp8AlphaVecCapSupported;
 using vt::cuda::Fp8Bf16DSplitK;
 using vt::cuda::Fp8Bf16DSplitKAdmissible;
+using vt::cuda::Fp8Bf16DSplitKRefuses;
 using vt::cuda::Fp8Bf16DSplitKTag;
 using vt::cuda::Fp8Bf16DSplitKVerdict;
 using vt::cuda::Fp8AlphaVecEpilogueFlagIsOn;
@@ -233,4 +234,70 @@ TEST_CASE("Fp8Bf16DSplitKVerdict: the bf16-D arm refuses any splitK it did not r
   CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kNotOne)) == "split-k-not-1");
   CHECK(std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kUnreadable)) !=
         std::string(Fp8Bf16DSplitKTag(Fp8Bf16DSplitK::kNotOne)));
+}
+
+// PERF-MAXSTACK-27B-FIX2 / #339, review finding F-A. The verdict above is
+// CORRECT and stays; what was wrong was WHO it was applied to.
+//
+// The premise "splitK must read 1" belongs to the bf16-D LEVER
+// (VT_GDN_FP8_IN_BF16), which claims its bf16 D is byte-equivalent to an f32-D
+// arm of the SAME call site. It does NOT belong to bf16-D-ness. bf16-D fp8
+// cuBLASLt GEMMs are a pre-existing, DEFAULT-ON capability with several call
+// sites that never made that claim and are perfectly correct under split-K —
+// every `o_proj_fp8` / `out_proj_fp8` in qwen3_5.cpp reaches
+// vt::MatmulFp8CublasLt with DType::kBF16 through MatmulFp8Cutlass{,PreQuant}D
+// under DenseCublasLtFp8Enabled(), which is ON unless VT_DENSE_CUBLASLT_FP8=0.
+// Keying the refusal on the DTYPE alone therefore added a new throw to a default
+// path and falsified the row's own claim that "with both toggles unset, runtime
+// behavior is byte-identical to before this row".
+//
+// So the gate takes the caller's CLAIM as an input. This is the scope, and the
+// scope is the defect — the verdict cases above pass either way.
+TEST_CASE("Fp8Bf16DSplitKRefuses: the premise binds the LEVER that claimed it, not every bf16 D") {
+  // THE REGRESSION. A bf16-D fp8 GEMM at a NON-lever call site (o_proj_fp8,
+  // out_proj_fp8 — default-ON, pre-existing, never claimed byte-equivalence
+  // against an f32-D arm) must proceed at ANY splitK. Split-K is simply correct
+  // for them: they want a bf16 output, not a bit-for-bit match with another arm.
+  for (int32_t any : {0, 1, 2, 4, 8, 16}) {
+    CHECK_FALSE(Fp8Bf16DSplitKRefuses(/*premise_claimed=*/false, /*out_is_bf16=*/true,
+                                      /*split_k_read_ok=*/true, any));
+  }
+  // ...including when the driver would not report splitK at all. An unclaimed
+  // premise cannot be violated, so an unreadable one is not a refusal either.
+  CHECK_FALSE(Fp8Bf16DSplitKRefuses(false, true, false, -1));
+
+  // THE GUARD IS STILL A GUARD. The lever's own GEMM — the one call site that
+  // does claim the premise — is refused at every splitK but 1, exactly as F3
+  // required. Deleting the check was never the fix.
+  for (int32_t bad : {0, 2, 4, 8, 16}) {
+    CHECK(Fp8Bf16DSplitKRefuses(/*premise_claimed=*/true, /*out_is_bf16=*/true,
+                                /*split_k_read_ok=*/true, bad));
+  }
+  CHECK(Fp8Bf16DSplitKRefuses(true, true, false, -1));  // unreadable: still refused
+  CHECK(Fp8Bf16DSplitKRefuses(true, true, false, 1));   // and the sentinel cannot rescue it
+
+  // The measured premise proceeds, claimed or not.
+  CHECK_FALSE(Fp8Bf16DSplitKRefuses(true, true, true, 1));
+  CHECK_FALSE(Fp8Bf16DSplitKRefuses(false, true, true, 1));
+
+  // An f32 D is untouched on BOTH sides of the scope. A caller that claims the
+  // premise and then takes the f32 arm (the lever's own rollback: the merged GDN
+  // in_proj emits f32 when VT_GDN_IN_BF16=0 while VT_GDN_FP8_IN_BF16 is still
+  // set) is not held to a premise about a store it did not make.
+  for (int32_t any : {0, 1, 4, 8}) {
+    CHECK_FALSE(Fp8Bf16DSplitKRefuses(true, /*out_is_bf16=*/false, true, any));
+    CHECK_FALSE(Fp8Bf16DSplitKRefuses(false, /*out_is_bf16=*/false, true, any));
+  }
+  CHECK_FALSE(Fp8Bf16DSplitKRefuses(true, false, false, -1));
+
+  // The gate is EXACTLY the composition of the two pieces above, so a future
+  // edit cannot drift one from the other: refuse iff claimed AND inadmissible.
+  for (bool claimed : {false, true})
+    for (bool bf16d : {false, true})
+      for (bool read_ok : {false, true})
+        for (int32_t sk : {-1, 0, 1, 8}) {
+          const bool expect =
+              claimed && !Fp8Bf16DSplitKAdmissible(Fp8Bf16DSplitKVerdict(bf16d, read_ok, sk));
+          CHECK(Fp8Bf16DSplitKRefuses(claimed, bf16d, read_ok, sk) == expect);
+        }
 }
