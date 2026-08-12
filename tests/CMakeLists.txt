@@ -24,6 +24,14 @@ function(vllm_cpp_add_test name)
   endif()
   vllm_cpp_set_warnings(${name})
   add_test(NAME ${name} COMMAND ${name})
+  # A gate that cannot run must not report success. doctest exits 0 after a
+  # TEST_CASE returns early, printing "assertions: 0 | 0 passed | 0 failed" and
+  # "Status: SUCCESS!" — indistinguishable, in a log or a `&&` chain, from a gate
+  # that loaded a model and matched an oracle (issue #463; multimodal-speed.md
+  # §17.7 hit exactly this). A test whose preconditions are absent exits 77
+  # instead and CTest reports it **Skipped**. Inert for any test that never
+  # returns 77, which today is all but test_voxtral_e2e.
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
@@ -1118,6 +1126,10 @@ vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
 vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
+# vt::AttentionDenseFa2 (multimodal-speed §17, #432): fast-path agreement with the
+# byte-exact scalar kernel, full-key-range coverage, fall-through totality, and the
+# VT_FA2_DENSE A/B knob. CUDA-only content; skips cleanly on a CPU box.
+vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)

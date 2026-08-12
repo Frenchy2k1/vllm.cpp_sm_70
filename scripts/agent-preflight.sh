@@ -111,6 +111,7 @@ SUITES=(
   test_check_surface_coverage
   test_check_test_registration
   test_check_snapshot_pins
+  test_cpu_x86_llamacpp_floor
   test_audit_live_rows
   test_check_gate_commands
   test_main_baseline

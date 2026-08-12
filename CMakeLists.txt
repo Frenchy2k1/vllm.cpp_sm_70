@@ -1952,7 +1952,16 @@ if(VLLM_CPP_CUDA)
       # symmetric instantiation of the SAME generic template — no template edit,
       # hence the d128/d256 kernels the 27B/35B/dense paths call are unchanged.
       src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu
-      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu)
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu
+      # d64 bf16 NON-SPLIT (multimodal-speed §17): the Whisper AUDIO ENCODER
+      # self-attention. Two firsts, both deliberate — head_dim 64 (Whisper-large-v3
+      # is d_model 1280 / 20 heads) and the plain batch `run_mha_fwd_` entry rather
+      # than the split-KV dispatch, because the encoder is dense and non-paged where
+      # every prior caller attends over a paged KV cache. vLLM reaches the same FA-2
+      # forward here (whisper.py WhisperEncoderAttention:255 -> forward:298-317 ->
+      # flash_attn_varlen_func, causal=False). Non-causal only: no causal hd-64
+      # caller exists.
+      src/vt/cuda/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu)
     target_sources(vllm PRIVATE
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})

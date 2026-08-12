@@ -88,12 +88,10 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 | **vllm.cpp** tok/s (canonical 2026-08-11) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
 | vLLM 0.25.0 tok/s (canonical 2026-08-11) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
 | **Ratio BINDING (main @`348c265d`, n=3 both arms)** | **0.9561x** | **0.9543x** | **0.9441x** | **0.9414x** | **0.9443x** | **0.9371x** |
-| Ratio 2026-08-10, same SHA (SUPERSEDED) | 0.8384x | 0.9637x | 0.9545x | 0.9670x | not run | not run |
 | Driver verdict | `{"gate_pass": false}`; first six-point grid here. Levers `lm_head`+qkvz ACTIVE by kernel signature | | | | | |
 | OPEN, and what it retracts | vLLM reproduces to 1.0%, OURS moved +14.8% at c1; lottery REFUTED (6 loads, 1.0046x); build diff leads. "c1 did not move" withdrawn: c1 was noise-dominated ([#349](https://github.com/mudler/vllm.cpp/issues/349)) | | | | | |
 
 | Noise band, measured BEFORE any delta | ±0.03% c1 back-to-back; 0.29-1.85% leg-to-leg with reload, drifting down on BOTH arms so it cancels in the ratio | | |
-| c16, c32 | NOT MEASURED. Both canonical attempts void: denominator contended mid-timing once, host OOM-reboot once | | |
 | Startup, cold to `/health` | 33.38 s vs vLLM 182.41 s = **5.46x faster** | | |
 | Peak host RSS | 21.10 vs 13.09 GiB = **1.612x, BELOW FLOOR, open gap** | | |
 | Peak GPU memory | PENDING: `nvidia-smi` returns N/A on this unified-memory part | | |
@@ -263,6 +261,8 @@ it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
 measured concurrent serving against llama.cpp's server.
 
+**x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
+
 ## MLX-LM, Apple M4
 
 Qwen3-0.6B, warm, batch 1, 6 interleaved runs.
@@ -409,6 +409,7 @@ built on it rather than keeping the flattering one.
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | Tensor parallelism (task #287 spike, 2026-08-08) | **No number owed** (`benchmark_binding=false`): records-only scope at pin `555967922` ([spec](../.agents/specs/tensor-parallelism-spike.md)). TP-W1 landed (group table, 6/6); TP-W2..W7 gate on token-exactness, not speed | Perf gate is TP-W6: at or above vLLM TP=2 on every axis, same 2-GPU box (PENDING-HW) |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
+| Voxtral enc attn (`VT_WHISPER_ENC_FA2`, #432) | FA-2 hd-64: 731.7 -> 133.0 ms (5.50x); enc fwd (not TTFT) vs pin TTFT 46.02: 15.90x -> 2.89x | **OPT-IN**: 3 near-tie diverg (band PASS) vs 0. Dev call |
 | `/v1/videos` OpenAI + ONE-SURFACE ROW 2 | **No number owed:** ABI-v12 device selection is backend-dispatch plumbing; generation math and speed paths are unchanged | DSR 34→32; baseline/allowlist unchanged; 25/25 checker mutations; CPU fold 6/137, including one-queue/device-provenance mutations |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **RUNNER FOLD LANDS (ROW 7, §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (near-tie profile); FA2 MLA default-ON; SACRED green.** Server 19.0 tok/s wall; CLI 18.93 reproduced | vLLM ~21 (#111 floor; in-session re-measure ABORTED by GB10 reboot at util 0.82, §21): **~0.90×**, >= vLLM NOT met; residual = KDA host islands + grouped MoE + decode graph |
