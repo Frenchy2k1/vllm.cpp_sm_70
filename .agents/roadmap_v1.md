@@ -59,6 +59,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#448](https://github.com/mudler/vllm.cpp/issues/448) | `ENG-RELEASE-WINDOWS` | PR #446 device-leakage repair violates the per-commit documentation checkpoint | bug |
 | [#450](https://github.com/mudler/vllm.cpp/issues/450) | `ENG-RELEASE-WINDOWS` | PR #446 archive-target repair lacks its usage projection | bug |
 | [#453](https://github.com/mudler/vllm.cpp/issues/453) | `ENG-RELEASE-WINDOWS` | PR #446 exact-range gate lacks closed creation evidence for its new Windows checkers | bug |
+| [#454](https://github.com/mudler/vllm.cpp/issues/454) | `ENG-RELEASE-WINDOWS` | Native Windows portability audit mishandles Vulkan command-buffer identifiers and PowerShell script paths | bug |
 | [#455](https://github.com/mudler/vllm.cpp/issues/455) | `ENG-RELEASE-WINDOWS` | PR #446 agent-record ratchet change lacks semantic mutation evidence in its recognized suite | bug |
 | [#456](https://github.com/mudler/vllm.cpp/issues/456) | `ENG-RELEASE-WINDOWS` | PR-size isolated evidence PATH hides Ninja and falsely reds the Windows portability HEAD suite | bug |
 | [#457](https://github.com/mudler/vllm.cpp/issues/457) | `ENG-RELEASE-WINDOWS` | PR-size sanitized-PATH test constructs its asserted environment after the hostile ambient context exits | bug |
