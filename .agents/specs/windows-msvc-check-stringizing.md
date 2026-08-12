@@ -91,4 +91,20 @@ diagnostic outside this test site.
 
 ## Outcome
 
-Pending RED, implementation, and immutable gate evidence.
+The focused structural test failed first on the pinned shape with
+`named custom-delimited expectation` absent. The repair binds the unchanged
+payload to `const std::wstring expected = LR"cmd(...)cmd"` and leaves only
+`BuildWindowsCommandLine(argv) == expected` inside `CHECK`. The custom
+delimiter is present, but moving the literal outside the stringized macro
+argument is the load-bearing fix identified by the MSVC documentation.
+
+The structural regression extracts the literal payload and verifies every
+character against the pre-repair expectation before requiring the identifier-
+only `CHECK`. It and the direct production portability checker pass, as does
+the complete 70-test portability suite. Clean Release CPU and Vulkan builds of
+`test_openai_api_server` complete 390/390 and 396/396; the exact command-line
+case passes 1/1 in both. The full CPU suite passes 54/54 cases and 635/635
+assertions. The full Vulkan suite compiles and links this repaired site, then
+retains only the two embedding HTTP-500 failures already tracked by #461
+(52/54 cases); this repair neither changes nor claims them. Native MSVC CPU and
+Vulkan reruns remain the authoritative macro/preprocessor validation.
