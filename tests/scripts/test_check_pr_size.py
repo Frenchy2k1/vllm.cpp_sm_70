@@ -531,24 +531,46 @@ class BudgetEnforcement(unittest.TestCase):
         module = "tests.scripts.test_check_windows_portability"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "source"
-            source.mkdir()
-            (source / "CMakeLists.txt").write_text(
-                "cmake_minimum_required(VERSION 3.20)\n"
-                "project(evidence_toolchain LANGUAGES NONE)\n",
+            installation = root / "installation"
+            binaries = installation / "bin"
+            modules = installation / "share/cmake/Modules"
+            binaries.mkdir(parents=True)
+            modules.mkdir(parents=True)
+            cmake = binaries / "cmake"
+            cmake.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parent.parent\n"
+                "if not (root / 'share/cmake/Modules').is_dir():\n"
+                "    print('Could not find CMAKE_ROOT', file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "print('Build files have been written')\n",
                 encoding="utf-8",
             )
-            tools = checker._prepare_evidence_tools(root, module)
-            result = subprocess.run(
-                [str(tools / "cmake"), "-S", str(source), "-B",
-                 str(root / "build"), "-G", "Ninja"],
-                env=checker._sanitized_env(root, tools),
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("Build files have been written", result.stdout)
+            cmake.chmod(0o755)
+            ninja = binaries / "ninja"
+            ninja.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            ninja.chmod(0o755)
+            empty_system_path = root / "empty-system-path"
+            empty_system_path.mkdir()
+            with mock.patch.dict(
+                os.environ, {"PATH": str(binaries)}, clear=True
+            ), mock.patch.object(
+                checker.os, "defpath", str(empty_system_path)
+            ):
+                tools = checker._prepare_evidence_tools(root, module)
+                result = subprocess.run(
+                    [str(tools / "cmake")],
+                    env=checker._sanitized_env(root, tools),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertIn("Build files have been written", result.stdout)
 
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
