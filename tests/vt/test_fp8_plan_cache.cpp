@@ -13,9 +13,12 @@
 
 #include "vt/cuda/fp8_plan_cache.h"
 
+using vt::cuda::Fp8AlphaVecCapSupported;
+using vt::cuda::Fp8AlphaVecEpilogueFlagIsOn;
 using vt::cuda::Fp8PlanCacheFlagIsOn;
 using vt::cuda::Fp8PlanKey;
 using vt::cuda::Fp8PlanKeyHash;
+using vt::cuda::Fp8ScaleModeFor;
 
 TEST_CASE("VT_FP8_PLAN_CACHE is OFF by default; ON only for exactly \"1\"") {
   CHECK_FALSE(Fp8PlanCacheFlagIsOn(nullptr));  // unset -> OFF (default: rebuild per call)
@@ -84,6 +87,67 @@ TEST_CASE("Fp8PlanKey: perturbing ANY descriptor/algo field makes a DISTINCT key
   { Fp8PlanKey k = base; k.trans_b = 1;      differs(k); }
   { Fp8PlanKey k = base; k.epilogue = 2;     differs(k); }
   { Fp8PlanKey k = base; k.scale_mode = 1;   differs(k); }
+}
+
+// --- PERF-FP8-ALPHA-FOLD (spec .agents/specs/perf-fp8-alpha-fold.md) --------
+// The vector-alpha epilogue arm applies each output COLUMN's folded fp8 alpha
+// inside the cuBLASLt epilogue (CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO)
+// instead of paying a separate full-tensor f32 read-modify-write pass. Its three
+// pure pieces are CUDA-free and therefore pinned here, on every platform: the
+// opt-in flag parse, the plan-key separation that stops a vector-alpha matmul
+// reusing a scalar-alpha algo, and the algo-capability predicate that is the only
+// thing standing between an algo that does NOT support the mode and a wrong
+// result. The byte-exact vector-alpha-vs-two-launch GEMM proof is the CUDA-tier
+// test_ops_fp8_cutlass.cpp; it cannot run on a CPU box.
+
+TEST_CASE("VT_FP8_ALPHA_VEC_EPILOGUE is OFF by default; ON only for exactly \"1\"") {
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn(nullptr));  // unset -> OFF (the shipped default)
+  CHECK(Fp8AlphaVecEpilogueFlagIsOn("1"));            // the opt-in: fold alpha into the epilogue
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn(""));
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn("0"));
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn("2"));
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn("on"));
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn("true"));
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn("11"));  // only the exact "1" enables
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn("1 "));  // trailing space must not enable
+  CHECK_FALSE(Fp8AlphaVecEpilogueFlagIsOn(" 1"));  // leading space must not enable
+}
+
+TEST_CASE("Fp8ScaleModeFor: a vector-alpha plan can NEVER alias a scalar-alpha plan") {
+  // The pointer mode is set on the matmul DESCRIPTOR before the heuristic runs,
+  // so it can change the selected algo (including the split-K factor). Two plans
+  // that differ only in scale_mode must therefore be two cache entries; if they
+  // collapsed, a vector-alpha matmul would execute an algo chosen for a host
+  // scalar — a silent wrong-result bug that no shape/dtype field would catch.
+  CHECK(Fp8ScaleModeFor(false) == 0);              // host scalar alpha: the shipped mode
+  CHECK(Fp8ScaleModeFor(true) != Fp8ScaleModeFor(false));
+  Fp8PlanKey host = Base();
+  host.scale_mode = Fp8ScaleModeFor(false);
+  Fp8PlanKey vec = Base();
+  vec.scale_mode = Fp8ScaleModeFor(true);
+  CHECK_FALSE(host == vec);
+  std::unordered_map<Fp8PlanKey, int, Fp8PlanKeyHash> m;
+  m[host] = 1;
+  m[vec] = 2;
+  CHECK(m.size() == 2);
+}
+
+TEST_CASE("Fp8AlphaVecCapSupported: ONLY the ALPHA_DEVICE_VECTOR_BETA_ZERO bit qualifies") {
+  // cublasLtPointerModeMask_t (cublasLt.h): HOST=1, DEVICE=2, DEVICE_VECTOR=4,
+  // ALPHA_DEVICE_VECTOR_BETA_ZERO=8, ALPHA_DEVICE_VECTOR_BETA_HOST=16. We issue
+  // the BETA_ZERO form, so ONLY bit 8 authorizes it. Accepting any other bit
+  // would run an algo that does not implement the mode we asked for.
+  CHECK_FALSE(Fp8AlphaVecCapSupported(0U));   // no capability reported -> fall back
+  CHECK_FALSE(Fp8AlphaVecCapSupported(1U));   // HOST only (the classic scalar algo)
+  CHECK_FALSE(Fp8AlphaVecCapSupported(2U));   // DEVICE scalar
+  CHECK_FALSE(Fp8AlphaVecCapSupported(4U));   // DEVICE_VECTOR, but not the BETA_ZERO form
+  CHECK_FALSE(Fp8AlphaVecCapSupported(7U));   // HOST|DEVICE|DEVICE_VECTOR
+  CHECK_FALSE(Fp8AlphaVecCapSupported(16U));  // BETA_HOST only: a DIFFERENT mode
+  CHECK_FALSE(Fp8AlphaVecCapSupported(23U));  // every neighbouring bit EXCEPT 8
+  CHECK(Fp8AlphaVecCapSupported(8U));         // exactly the mode we set
+  CHECK(Fp8AlphaVecCapSupported(9U));         // HOST|BETA_ZERO
+  CHECK(Fp8AlphaVecCapSupported(31U));        // a fully capable algo
+  CHECK(Fp8AlphaVecCapSupported(0xFFFFFFFFU));
 }
 
 TEST_CASE("Fp8PlanKey: same shape but different output dtype -> distinct plans") {

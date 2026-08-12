@@ -74,6 +74,7 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
+| Merged fp8 projection applies its per-column alpha in the GEMM epilogue | ◐ opt-in `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off; falls back to a second full-tensor pass; gates not run ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | n/a one scale (shards requantized) | n/a | n/a |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |

@@ -362,6 +362,14 @@ enum class OpId : uint8_t {
   kConv2d,
   kDepthwiseConv1d,
   kAttentionRelPos,
+  // PERF-FP8-ALPHA-FOLD (.agents/specs/perf-fp8-alpha-fold.md, #402 §3 "Lever
+  // B"): the vector-alpha form of kMatmulFp8CublasLt — a per-output-column f32
+  // alpha applied INSIDE the cuBLASLt epilogue instead of by a second
+  // full-tensor pass. A distinct id, not a parameter of the existing op,
+  // because the pointer mode lives on the matmul DESCRIPTOR and therefore
+  // participates in plan/algo selection. Appended before kCount so no existing
+  // op's id shifts.
+  kMatmulFp8CublasLtAlphaVec,
   kCount
 };
 
@@ -772,6 +780,10 @@ using MatmulFp8CutlassFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
 using MatmulFp8CublasLtFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+// Same operands as MatmulFp8CublasLtFn, but the trailing scalar alpha becomes a
+// device f32 [N] vector — one folded alpha per OUTPUT COLUMN.
+using MatmulFp8CublasLtAlphaVecFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
@@ -1395,6 +1407,24 @@ void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& 
 // for a given shape (keeps the correctness gate robust on odd M).
 void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                        float alpha);
+
+// MatmulFp8CublasLtAlphaVec — the SAME fp8 GEMM with a per-output-COLUMN alpha:
+//   out[m,n] = alpha_vec[n] * (A_fp8[M,K] @ B_fp8[N,K]^T)[m,n]
+// `alpha_vec` is f32 [N], contiguous, on the queue device; `out` is f32 [M,N].
+// This is the form an N-CONCATENATED operand needs when its shards carry
+// different folded alphas (input_scale * that shard's weight_scale), which no
+// single host scalar can express. Mirrors the tensor-alpha overload the NVFP4
+// CUTLASS path already took (.agents/specs/nvfp4-device-alpha.md).
+//
+// The op is TOTAL: when VT_FP8_ALPHA_VEC_EPILOGUE=1 AND the heuristic returns an
+// algo whose CUBLASLT_ALGO_CAP_POINTER_MODE_MASK advertises
+// ALPHA_DEVICE_VECTOR_BETA_ZERO, the alpha is applied in the cuBLASLt epilogue
+// (one launch). Otherwise it runs the GEMM at alpha=1 and applies the vector
+// with vt::MulColVecF32 — the two-launch form this seam shipped with, byte for
+// byte. Callers therefore never branch on the toggle or the driver's capability;
+// they express the per-column alpha ONCE, here. CUDA-only.
+void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                               const Tensor& alpha_vec);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

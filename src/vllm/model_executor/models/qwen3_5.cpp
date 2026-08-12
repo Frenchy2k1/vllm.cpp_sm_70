@@ -1553,11 +1553,19 @@ DBuf MergedFp8QkvD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.q_proj_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkv.packed, one);
-  else
+  // PERF-FP8-ALPHA-FOLD: same seam as the GDN qkvz merge above — the per-column
+  // alpha is expressed once and applied in the cuBLASLt epilogue when the arm is
+  // enabled and supported, else by the unchanged two-launch form. This site is
+  // default OFF (MergedFp8QkvEnabled), so nothing here moves a gate today; it is
+  // routed anyway so the seam has ONE per-column-alpha path rather than two, and
+  // so enabling the merge later cannot re-add 16 full-tensor passes per step
+  // (#402 §3 "D", which is sequenced after this row for exactly that reason).
+  if (DenseCublasLtFp8Enabled()) {
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkv.packed, qkv.alpha_vec);
+  } else {
     vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkv.packed, one);
-  vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+    vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+  }
   return out;
 }
 
@@ -3342,11 +3350,25 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.in_proj_qkv_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
-  else
+  if (qkvz.folded) {
+    // One shared alpha: already a single GEMM scalar, nothing to apply after.
+    if (DenseCublasLtFp8Enabled())
+      vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+    else
+      vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  } else if (DenseCublasLtFp8Enabled()) {
+    // PERF-FP8-ALPHA-FOLD: express the per-column alpha ONCE, at the seam. The
+    // op applies it in the cuBLASLt epilogue when VT_FP8_ALPHA_VEC_EPILOGUE=1
+    // and the selected algo supports the pointer mode, and otherwise runs the
+    // GEMM at alpha=1 plus vt::MulColVecF32 — byte for byte what this line pair
+    // did before. The model no longer owns that choice.
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha_vec);
+  } else {
+    // CUTLASS arm (VT_DENSE_CUBLASLT_FP8=0): no epilogue alpha vector, so the
+    // two-launch form stays here verbatim.
     vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
-  if (!qkvz.folded) vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+    vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+  }
   return out;
 }
 
