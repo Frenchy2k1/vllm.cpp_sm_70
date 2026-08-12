@@ -84,6 +84,20 @@ class WindowsMetadataContract(unittest.TestCase):
                 {row["name"] for row in manifest["dependencies"] if row["linkage"] == "external"},
                 {"vulkan-loader", "vulkan-icd", "vulkan-driver"},
             )
+            self.assertNotIn(
+                "vulkan-runtime-passed",
+                (ROOT / "scripts/release_metadata.py").read_text(encoding="utf-8"),
+            )
+
+    def test_contract_test_precedes_required_release_environment(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(encoding="utf-8")
+        contract = script.index("if ($ContractTest)")
+        contract_exit = script.index("exit 0", contract)
+        environment = script.index(
+            'foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH"))'
+        )
+        self.assertLess(contract, contract_exit)
+        self.assertLess(contract_exit, environment)
 
     def test_pe_report_rejects_msys_debug_crt_and_developer_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
