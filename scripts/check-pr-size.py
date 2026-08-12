@@ -575,7 +575,7 @@ EVIDENCE_REQUIRED_TOOLS = {
 
 
 def _prepare_evidence_tools(container: Path, module: str) -> Path:
-    """Copy explicitly required host tools without inheriting their PATH."""
+    """Expose exact host tools privately without inheriting their PATH."""
 
     tools = container / "tools"
     tools.mkdir()
@@ -586,7 +586,7 @@ def _prepare_evidence_tools(container: Path, module: str) -> Path:
         resolved = Path(source).resolve()
         if not resolved.is_file() or not os.access(resolved, os.X_OK):
             raise ValueError(f"semantic evidence tool is not executable: {resolved}")
-        shutil.copy2(resolved, tools / name)
+        (tools / name).symlink_to(resolved)
     return tools
 
 

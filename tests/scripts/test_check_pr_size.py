@@ -527,6 +527,29 @@ class BudgetEnforcement(unittest.TestCase):
                         ):
                             checker._prepare_evidence_tools(container, module)
 
+    def test_private_cmake_retains_its_installed_module_tree(self) -> None:
+        module = "tests.scripts.test_check_windows_portability"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\n"
+                "project(evidence_toolchain LANGUAGES NONE)\n",
+                encoding="utf-8",
+            )
+            tools = checker._prepare_evidence_tools(root, module)
+            result = subprocess.run(
+                [str(tools / "cmake"), "-S", str(source), "-B",
+                 str(root / "build"), "-G", "Ninja"],
+                env=checker._sanitized_env(root, tools),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Build files have been written", result.stdout)
+
     def test_arbitrary_test_filename_cannot_claim_mutation_evidence(self) -> None:
         errors = checker.change_errors(
             [
