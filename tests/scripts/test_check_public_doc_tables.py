@@ -33,6 +33,11 @@ doc_tables = _load("doc_tables", "scripts/check-public-doc-tables.py")
 roll_record = _load("roll_record", "scripts/roll-benchmark-record.py")
 
 
+# The whole-file character budget retired on 2026-08-12 (#460). Kept here only
+# so the tests that prove a row no longer has to evict one can say what it is
+# that used to make that impossible.
+RETIRED_PAGE_BUDGET = 45000
+
 # A minimal scoreboard that satisfies every rule, used as the mutation baseline.
 # MIN_TABLE_ROWS forces a real table, so the baseline carries one.
 _ROWS = "\n".join(f"| Model {i} | {i}.0x |" for i in range(60))
@@ -164,7 +169,11 @@ class BenchmarksStructureTests(unittest.TestCase):
         ).stdout
         merged = _project_release_rows(main, text)
         self.assertEqual(_release_projection_errors(merged), [])
-        self.assertLess(len(merged), doc_tables.BENCHMARKS_RULES.max_chars)
+        # The whole-page size assertion this line used to carry went with
+        # `max_chars` on 2026-08-12 (#460). What has to hold after a merge is
+        # that every ENTRY is in budget, which the full check below asserts.
+        for row in _release_rows(merged):
+            self.assertLessEqual(len(row), doc_tables.MAX_ROW_CHARS)
         self.assertEqual(doc_tables.benchmarks_errors(merged), [])
 
     def test_shipped_record_exists(self) -> None:
@@ -224,10 +233,158 @@ class BenchmarksStructureTests(unittest.TestCase):
         errors = doc_tables.benchmarks_errors(mutated)
         self.assertTrue(any("em-dash" in e for e in errors), errors)
 
-    def test_oversized_page_fails(self) -> None:
-        mutated = VALID + "\n" + ("- a filler bullet line\n" * 3000)
+    # THE PAGE HAS NO SIZE BUDGET as of 2026-08-12 (#460), so the test that
+    # used to sit here, asserting a 45,000-char page fails, is gone. It is
+    # replaced, not deleted: the obligation it carried moved to the entry cap
+    # and the regrowth guard below, and the reason it had to move is
+    # test_a_new_row_costs_no_eviction, which the old rule made impossible.
+
+    def test_a_new_row_costs_no_eviction(self) -> None:
+        """The acceptance test for #460: a measurement row lands on its own.
+
+        A page already at the retired 45,000-char budget gains one row and
+        stays valid. Under the old rule this required deleting somebody else's
+        row, and a clean merge of two such payments landed the real page at
+        45,007 chars (04b2b9fa), applying both additions and neither eviction.
+        """
+        filler = "\n".join(
+            f"| Subject {i:04d} | {'measured, byte exact, ' * 6}{i}.0x |"
+            for i in range(300)
+        )
+        big = VALID.replace(_ROWS, _ROWS + "\n" + filler)
+        self.assertGreater(len(big), RETIRED_PAGE_BUDGET)
+        self.assertEqual(doc_tables.benchmarks_errors(big), [])
+
+        added = "| Qwen3.6-35B canonical regrid | PENDING, stale grid |"
+        grown = big.replace(filler, filler + "\n" + added)
+        self.assertEqual(doc_tables.benchmarks_errors(grown), [])
+        self.assertEqual(len(grown), len(big) + len(added) + 1)
+
+    def test_the_shipped_page_can_accept_the_next_measurement_row(self) -> None:
+        """#460 on the REAL page: add a row, keep every existing row.
+
+        The row added here is the 35B canonical regrid PR #481 records as owed.
+        It is added and dropped again inside this test, so the page is not
+        edited; what is asserted is that the surface would accept it.
+
+        `RETIRED_PAGE_BUDGET` is the 45,000-char rule that used to make this
+        impossible. If the page is ever compacted far below it this assertion
+        stops being meaningful and should be deleted, not relaxed.
+        """
+        text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.benchmarks_errors(text), [])
+        owed = (
+            "| Qwen3.6-35B canonical regrid (`ROAD-V1-A`, #378) | "
+            "**STALE, no current number.** The canonical 0.918x-0.972x grid "
+            "predates 136 src commits, one worth +2.05% at c8; holding vLLM "
+            "fixed only IMPLIES c8 ~0.937, an estimate | Recapture the 6-point "
+            "c1-c32 grid on current main, both arms in one session, before any "
+            "35B residual is attributed |"
+        )
+        # The median Open gaps row on this page is 328 chars and 205 were free,
+        # so a REALISTIC row was unaffordable, not just a pathological one.
+        self.assertGreater(len(owed), 328)
+        self.assertLessEqual(len(owed), doc_tables.MAX_ROW_CHARS)
+        grown = text.replace("\n## Reproduce", f"\n{owed}\n\n## Reproduce", 1)
+        self.assertNotEqual(grown, text)
+        self.assertGreater(len(grown), RETIRED_PAGE_BUDGET)
+        self.assertEqual(doc_tables.benchmarks_errors(grown), [])
+        # Nothing was evicted to make room.
+        for _, _, row in doc_tables._table_rows(text):
+            self.assertIn(row, grown)
+
+    def test_oversized_row_fails(self) -> None:
+        # Cap the ENTRY: one row past budget is rejected, and the fix is to
+        # shorten THAT row.
+        wide = "| Subject | " + " | ".join(["x" * 200] * 4) + " |"
+        mutated = VALID.replace("| Thing | Pending |", wide)
         errors = doc_tables.benchmarks_errors(mutated)
-        self.assertTrue(any("scoreboard budget" in e for e in errors), errors)
+        self.assertTrue(any("ENTRY budget" in e for e in errors), errors)
+
+    def test_the_row_cap_is_not_subsumed_by_the_cell_cap(self) -> None:
+        # Every cell legal, the row illegal: without the row cap a five-column
+        # row of 1,100 chars passes.
+        cells = " | ".join(["y" * (doc_tables.MAX_CELL_CHARS - 1)] * 4)
+        mutated = VALID.replace("| Thing | Pending |", f"| {cells} |")
+        errors = doc_tables.benchmarks_errors(mutated)
+        self.assertEqual([e for e in errors if "wall-of-prose" in e], [])
+        self.assertTrue(any("ENTRY budget" in e for e in errors), errors)
+
+    def test_a_row_at_the_cap_is_allowed(self) -> None:
+        # Exactly at MAX_ROW_CHARS, with every cell inside MAX_CELL_CHARS.
+        # "| a | b | c | d |" costs the four cells plus 13 characters.
+        budget = doc_tables.MAX_ROW_CHARS - 13
+        widths = [budget // 4] * 4
+        widths[0] += budget - sum(widths)
+        cells = ["z" * w for w in widths]
+        self.assertTrue(all(w <= doc_tables.MAX_CELL_CHARS for w in widths))
+        row = "| " + " | ".join(cells) + " |"
+        self.assertEqual(len(row), doc_tables.MAX_ROW_CHARS)
+        mutated = VALID.replace("| Thing | Pending |", row)
+        self.assertEqual(doc_tables.benchmarks_errors(mutated), [])
+
+    def test_a_dated_h2_is_rejected(self) -> None:
+        mutated = VALID + "\n## vLLM re-grid 2026-08-12\n\nA paragraph.\n"
+        errors = doc_tables.benchmarks_errors(mutated)
+        self.assertTrue(any("PER-ATTEMPT entry" in e for e in errors), errors)
+
+    def test_a_dated_h3_is_rejected(self) -> None:
+        # The hole the retired byte cap was silently covering: the canonical
+        # allowlist runs over "## " only, so this was caught by nothing else.
+        mutated = VALID.replace(
+            "## How we measure",
+            "### Qwen3.6-27B by concurrency, 2026-08-12 rerun\n\n"
+            "| Point | Ratio |\n|---|---|\n| c1 | 0.9x |\n\n## How we measure",
+        )
+        errors = doc_tables.benchmarks_errors(mutated)
+        self.assertTrue(any("PER-ATTEMPT entry" in e for e in errors), errors)
+        self.assertTrue(any("names a date" in e for e in errors), errors)
+
+    def test_a_dated_h3_is_rejected_on_the_feature_matrix_too(self) -> None:
+        mutated = VALID_FEATURES + "\n### Coverage sweep 2026-08-12\n\nText.\n"
+        errors = doc_tables.features_errors(mutated)
+        self.assertTrue(any("PER-ATTEMPT entry" in e for e in errors), errors)
+
+    def test_a_new_subject_subsection_is_allowed(self) -> None:
+        # The guard is not a section freeze: a genuinely new subject passes.
+        mutated = VALID.replace(
+            "## How we measure",
+            "### Laguna-S-2.1 (NVFP4)\n\n"
+            "| Point | Ratio |\n|---|---|\n| c1 | 1.03x |\n\n## How we measure",
+        )
+        self.assertEqual(doc_tables.benchmarks_errors(mutated), [])
+
+    def test_a_date_inside_a_fence_is_not_a_heading(self) -> None:
+        # Sample output that happens to contain a heading-shaped line is not a
+        # section, so the regrowth guard must not fire on it.
+        mutated = VALID.replace(
+            "vllm-bench run", "vllm-bench run\n### historical 2026-08-04 output"
+        )
+        self.assertEqual(doc_tables.benchmarks_errors(mutated), [])
+
+    def test_a_dated_row_is_still_allowed(self) -> None:
+        # The date belongs in the ROW. Only the heading form is the append log.
+        mutated = VALID.replace(
+            "| Thing | Pending |", "| Thing | Pending, captured 2026-08-12 |"
+        )
+        self.assertEqual(doc_tables.benchmarks_errors(mutated), [])
+
+    def test_the_shipped_pages_carry_no_dated_heading(self) -> None:
+        for page in ("docs/BENCHMARKS.md", "docs/FEATURES.md"):
+            text = (ROOT / page).read_text(encoding="utf-8")
+            dated = [
+                title
+                for _, title in doc_tables._headings(text)
+                if doc_tables.DATED_HEADING_RE.search(title)
+            ]
+            self.assertEqual(dated, [], page)
+
+    def test_no_page_carries_a_whole_file_size_budget(self) -> None:
+        # The invariant behind #460, held as a rule rather than as a habit: a
+        # budget on a shared file makes every addition an eviction.
+        for rules in (doc_tables.BENCHMARKS_RULES, doc_tables.FEATURES_RULES):
+            self.assertFalse(hasattr(rules, "max_chars"), rules.name)
+        self.assertNotIn("chars", doc_tables.STATUS_RATCHET)
 
     def test_missing_record_link_fails(self) -> None:
         mutated = VALID.replace(
@@ -358,10 +515,16 @@ class FeaturesStructureTests(unittest.TestCase):
 
     def test_the_two_pages_have_distinct_budgets(self) -> None:
         # A regression guard on the refactor: FEATURES must not silently
-        # inherit the scoreboard's looser limits.
+        # inherit the scoreboard's looser limits. The `max_chars` comparison
+        # this used to lead with went with the key itself on 2026-08-12 (#460);
+        # the remaining per-page limits still have to differ.
         self.assertNotEqual(
-            doc_tables.FEATURES_RULES.max_chars,
-            doc_tables.BENCHMARKS_RULES.max_chars,
+            doc_tables.FEATURES_RULES.max_prose_paragraphs,
+            doc_tables.BENCHMARKS_RULES.max_prose_paragraphs,
+        )
+        self.assertNotEqual(
+            doc_tables.FEATURES_RULES.min_table_rows,
+            doc_tables.BENCHMARKS_RULES.min_table_rows,
         )
         self.assertNotEqual(
             doc_tables.FEATURES_RULES.required_sections,

@@ -315,12 +315,112 @@ class MigratedLegacyLinks(unittest.TestCase):
     def test_legacy_payload_keeps_original_agents_relative_link_base(self) -> None:
         source = ROOT / ".agents/completed/state-events/0000-00/STATE-LEGACY-000001.md"
         text = "<!-- legacy-payload:begin -->\n[spec](specs/example.md)"
-        self.assertEqual(agent_record.link_base(source, text), ROOT / ".agents")
+        self.assertEqual(agent_record.link_bases(source, text), (ROOT / ".agents",))
 
     def test_post_cutover_event_links_remain_event_relative(self) -> None:
         source = ROOT / ".agents/completed/state-events/2026-08/STATE-20260808T120000-001.md"
-        self.assertEqual(agent_record.link_base(source, "[local](note.md)"), source.parent)
+        self.assertEqual(
+            agent_record.link_bases(source, "[local](note.md)"), (source.parent,)
+        )
 
+
+class LinkExtraction(unittest.TestCase):
+    """#460: what the checker calls a link must be a link a READER can follow.
+
+    docs/BENCHMARKS.md is compacted by MOVING a superseded row into
+    .agents/benchmark-record.md byte-for-byte. Before this, any row carrying a
+    docs/-relative evidence link dangled the moment it was archived, whether it
+    was quoted inside a fence or moved as live markdown, so the documented
+    payment mechanism did not work for exactly the rows that carry evidence.
+    """
+
+    def test_fenced_link_is_not_extracted(self) -> None:
+        text = "```text\n| row | [evidence](bench-evidence/x.md) |\n```\n"
+        self.assertEqual(agent_record.extract_links(text), [])
+
+    def test_tilde_fenced_link_is_not_extracted(self) -> None:
+        text = "~~~console\n$ see [evidence](bench-evidence/x.md)\n~~~\n"
+        self.assertEqual(agent_record.extract_links(text), [])
+
+    def test_inline_code_link_is_not_extracted(self) -> None:
+        self.assertEqual(
+            agent_record.extract_links("write `[label](target.md)` to link\n"), []
+        )
+
+    def test_live_link_is_still_extracted(self) -> None:
+        self.assertEqual(
+            agent_record.extract_links("see [spec](specs/example.md) now\n"),
+            ["specs/example.md"],
+        )
+
+    def test_a_backticked_label_is_still_a_link(self) -> None:
+        # The overwhelmingly common form in this tree: [`name`](path).
+        self.assertEqual(
+            agent_record.extract_links("[`workflow.md`](workflow.md)\n"),
+            ["workflow.md"],
+        )
+
+    def test_link_after_a_closed_fence_is_still_extracted(self) -> None:
+        text = "```sh\nrun [x](nope.md)\n```\n\nreal [spec](specs/example.md)\n"
+        self.assertEqual(agent_record.extract_links(text), ["specs/example.md"])
+
+    def test_link_beside_an_inline_span_is_still_extracted(self) -> None:
+        text = "`VT_FLAG=1` and [spec](specs/example.md)\n"
+        self.assertEqual(agent_record.extract_links(text), ["specs/example.md"])
+
+    def test_stripping_preserves_line_and_column_positions(self) -> None:
+        # Blanked, not deleted: reported line numbers must stay honest.
+        text = "a\n```\nbbbb\n```\nc `dd` e\n"
+        stripped = agent_record.strip_code_spans(text)
+        self.assertEqual(len(stripped.splitlines()), len(text.splitlines()))
+        for original, blanked in zip(text.splitlines(), stripped.splitlines()):
+            self.assertEqual(len(original), len(blanked))
+
+    def test_the_benchmark_record_also_resolves_from_docs(self) -> None:
+        # It is the declared archive of docs/BENCHMARKS.md, so a row moved into
+        # it verbatim keeps its docs/-relative evidence link resolvable.
+        source = ROOT / ".agents/benchmark-record.md"
+        self.assertEqual(
+            agent_record.link_bases(source, ""), (source.parent, ROOT / "docs")
+        )
+
+    def test_an_archived_row_with_a_docs_relative_link_is_accepted(self) -> None:
+        record = ROOT / ".agents/benchmark-record.md"
+        original = record.read_text(encoding="utf-8")
+        moved = (
+            "\n## Assembly vs compiler SDOT\n\n| Result | Evidence |\n|---|---|\n"
+            "| leaf wall | [assembly evidence]"
+            "(bench-evidence/rpi5-a76-q8-dot-20260806.md) |\n"
+        )
+        errors: list[str] = []
+        try:
+            record.write_text(original + moved, encoding="utf-8")
+            agent_record.check_links(errors)
+        finally:
+            record.write_text(original, encoding="utf-8")
+        self.assertEqual(
+            [e for e in errors if "rpi5-a76-q8-dot" in e], [], errors[:5]
+        )
+
+    def test_an_archived_row_with_a_MISSING_link_still_dangles(self) -> None:
+        # The second base is a base, not an amnesty.
+        record = ROOT / ".agents/benchmark-record.md"
+        original = record.read_text(encoding="utf-8")
+        errors: list[str] = []
+        try:
+            record.write_text(
+                original + "\n[gone](bench-evidence/no-such-file-20260812.md)\n",
+                encoding="utf-8",
+            )
+            agent_record.check_links(errors)
+        finally:
+            record.write_text(original, encoding="utf-8")
+        require(errors, r"dangling link bench-evidence/no-such-file-20260812\.md")
+
+    def test_the_tree_has_no_dangling_link(self) -> None:
+        errors: list[str] = []
+        agent_record.check_links(errors)
+        self.assertEqual(errors, [])
 
 
 
