@@ -517,6 +517,36 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             with self.subTest(location=location):
                 self.assertNotRegex(declaration, r"\bint\s+num_positions\b")
 
+    def test_windows_command_line_expectation_is_not_stringized(self) -> None:
+        source = (
+            REPO / "tests/vllm/entrypoints/openai/test_api_server.cpp"
+        ).read_text(encoding="utf-8")
+        case_start = source.index(
+            'TEST_CASE("platform process: Windows command line preserves '
+            'every argv byte")'
+        )
+        case_end = source.index("\nTEST_CASE(", case_start + 1)
+        case = source[case_start:case_end]
+
+        binding = re.search(
+            r'const\s+std::wstring\s+expected\s*=\s*'
+            r'LR"(?P<delimiter>[^\s()\\]{1,16})\('
+            r'(?P<payload>.*?)\)(?P=delimiter)"\s*;',
+            case,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(binding, "named custom-delimited expectation")
+        assert binding is not None
+        self.assertEqual(
+            binding.group("payload"),
+            r'"ffmpeg" "two words" "C:\path\\" "a\"b" ""',
+        )
+        self.assertRegex(
+            case,
+            r"CHECK\s*\(\s*vllm::platform::BuildWindowsCommandLine\s*"
+            r"\(\s*argv\s*\)\s*==\s*expected\s*\)\s*;",
+        )
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):

@@ -2591,8 +2591,9 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
 TEST_CASE("platform process: Windows command line preserves every argv byte") {
   const std::vector<std::wstring> argv = {
       L"ffmpeg", L"two words", L"C:\\path\\", L"a\"b", L""};
-  CHECK(vllm::platform::BuildWindowsCommandLine(argv) ==
-        LR"("ffmpeg" "two words" "C:\path\\" "a\"b" "")");
+  const std::wstring expected =
+      LR"cmd("ffmpeg" "two words" "C:\path\\" "a\"b" "")cmd";
+  CHECK(vllm::platform::BuildWindowsCommandLine(argv) == expected);
 }
 
 #if !defined(_WIN32)
