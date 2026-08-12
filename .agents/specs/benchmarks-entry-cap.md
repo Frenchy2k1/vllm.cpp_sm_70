@@ -269,9 +269,14 @@ next cadence of parallel work".
 
 - #364 / `87308dea`, which set the precedent and removed the two sibling
   budgets, is on `main`.
-- #481 is open and edits `docs/BENCHMARKS.md`. The row added here is additive
-  and placed in `## Open gaps`; a conflict resolves by taking the target
-  branch's page wholesale and reapplying the one added line, per Records.
+- #481 is open and rewrites the 35B row on `docs/BENCHMARKS.md` in place. This
+  row does not edit the page at all, so the two cannot conflict, and #481 keeps
+  ownership of the "regrid owed" fact. That is why the acceptance demonstration
+  is a test rather than an edit.
+- `origin/main` moved from `918c568a` to `e1087a88` mid-row (12 commits,
+  GATE-PIN-UNPINNED-SNAPSHOTS #471 and four SPEC-DSPARK measurements #442).
+  Merged, and every gate rerun on the merged tree. The measurements in Our
+  baseline are as taken at `918c568a` and are not restated.
 - Nothing else blocks.
 
 ## Work breakdown
