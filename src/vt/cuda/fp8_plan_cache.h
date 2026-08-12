@@ -59,6 +59,152 @@ inline bool Fp8PlanCacheEnabled() {
   return enabled;
 }
 
+// --- PERF-FP8-ALPHA-FOLD: the vector-alpha epilogue arm ---------------------
+// Spec: .agents/specs/perf-fp8-alpha-fold.md. Issue #402 (§3 "Lever B").
+//
+// When two FP8 shards are N-concatenated into ONE operand but carry DIFFERENT
+// folded alphas, no single host scalar reproduces both halves, so the model
+// today runs the GEMM at alpha=1 and applies the per-output-COLUMN alpha in a
+// second full-tensor pass (vt::MulColVecF32). At T=4096 prefill that pass is a
+// read-modify-write of a [T,16384] f32 tensor per GDN layer, measured at
+// 209.5 GB/s = 77% of the GB10's 273.1 GB/s peak — 122.99 ms/request over 48
+// calls, 43.6% of the whole measured 27B prefill deficit. It is bandwidth-bound,
+// so its cost is its WIDTH; this is deliberately NOT the launch-count regime
+// that #402 §4 sized as neutral on the decode step.
+//
+// cuBLASLt applies exactly this vector in the epilogue for free:
+// CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO (cublasLt.h, "alpha
+// pointer targets an array in device memory, beta is zero"), whose documented
+// length rule is that the vector must "match number of output matrix ROWS"
+// (CUBLASLT_MATMUL_DESC_POINTER_MODE). Our fp8 D is created COLUMN-MAJOR as
+// (rows=n, cols=m, ld=n) — see the TN derivation in cuda_matmul.cu — so
+// cuBLASLt's output ROWS are our row-major output's COLUMNS, and the model's
+// resident f32 [N] alpha vector is already the right vector in the right layout.
+//
+// Pure (CUDA-free) pieces live here so the flag parse, the plan-key separation
+// and the algo-capability predicate are unit-testable on every platform
+// (tests/vt/test_fp8_plan_cache.cpp), exactly like the plan-cache flag above.
+//
+// MEASURED, GB10 / sm_121a, 2026-08-11 — THE CAPABILITY IS NOT OFFERED HERE.
+// A same-binary run of the 27B gate with VT_GEMM_ALGO_LOG=1 emitted ZERO
+// `TN-fp8-alphavec` lines and the identical 5 `TN-fp8` lines under BOTH
+// VT_FP8_ALPHA_VEC_EPILOGUE=0 and =1: the fallback fired on every call, so the
+// two arms ran byte-identical code and the 0.9954/0.9973 A/B taken from them is
+// VOID, not negative — this path never executed. Do not re-derive that; re-run
+// it only against a NEW driver/GPU, and read the refusal REASON the log now
+// names (Fp8PlanRefusal below) rather than inferring one from an absence.
+// The arm stays in the tree, correct and DEFAULT OFF, for the hardware that does
+// offer the mode.
+//
+// The ALTERNATIVE cuBLASLt API for the SAME fusion has now been tried too, and
+// is ALSO refused here — MEASURED 2026-08-12, GB10/sm_121a, cuBLASLt 130101,
+// driver 580.159.03, by the standalone probes scripts/probe_fp8_outer_vec_*.cu.
+// CUBLASLT_MATMUL_DESC_A_SCALE_POINTER (17) + CUBLASLT_MATMUL_DESC_A_SCALE_MODE
+// (31) = CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F (3) — fp8's per-channel
+// scaling path, whose A-side vector length is exactly our N under this TN layout
+// — returns ZERO algos from cublasLtMatmulAlgoGetHeuristic
+// (CUBLAS_STATUS_INVALID_VALUE for an A-only vector, NOT_SUPPORTED for A+B) on
+// all ten gate shapes AND on a canonical 4096^3 square AND at every output dtype
+// (f32/bf16/f16): 0 of 48 swept cells. The A-scale POINTER itself works — the
+// SCALAR_32F arm returns the identical algo as the host scalar — so it is the
+// vector MODE that cuBLASLt does not implement for e4m3 TN on this device.
+// Note the refusal lands on the HEURISTIC, not on cublasLtMatmul as
+// cublasLt.h's A_SCALE_POINTER doc implies; a matmul-only check reads a false
+// green. Do NOT re-derive either refusal: re-run the probes against a new
+// driver/GPU. See .agents/specs/perf-fp8-alpha-fold.md §Outcome.
+//
+// If a future driver DOES offer a scale-vector mode, note the hazard the probe
+// surfaced: A_SCALE_POINTER lives on the DESCRIPTOR (unlike the pointer-mode
+// alpha, which is a cublasLtMatmul argument), and Fp8PlanKey is keyed by SHAPE.
+// A cached vector-scale plan would apply the first GDN layer's alpha_vec to
+// every same-shaped layer. Set the pointer per call, or do not cache that plan.
+
+// Pure predicate for the VT_FP8_ALPHA_VEC_EPILOGUE contract: DEFAULT OFF, and
+// enabled only for the exact value "1". nullptr (unset) and every other value
+// are OFF. The default stays OFF until an operator-run same-binary prefill A/B
+// (and the CUDA-tier bitwise case) says otherwise; the fallback below is the
+// current two-launch behavior, byte for byte.
+inline bool Fp8AlphaVecEpilogueFlagIsOn(const char* env_value) {
+  return env_value != nullptr && std::string_view(env_value) == "1";
+}
+
+// Process-cached gate, read from the environment exactly once. Same shape as
+// Fp8PlanCacheEnabled/GemmAlgoLogEnabled: the parse is what the unit test pins;
+// this latching getter is deliberately not unit-tested.
+inline bool Fp8AlphaVecEpilogueEnabled() {
+  static const bool enabled =
+      Fp8AlphaVecEpilogueFlagIsOn(std::getenv("VT_FP8_ALPHA_VEC_EPILOGUE"));
+  return enabled;
+}
+
+// Values for Fp8PlanKey::scale_mode. The pointer mode is set on the matmul
+// DESCRIPTOR before cublasLtMatmulAlgoGetHeuristic runs, so it can change the
+// selected algo — including the split-K factor, which changes the f32 reduction
+// order. A vector-alpha plan must therefore never reuse a scalar-alpha plan for
+// the same shape, and vice versa.
+enum : int {
+  kFp8ScaleModeHostAlpha = 0,       // per-tensor scale folded into the host alpha
+  kFp8ScaleModeAlphaDeviceVec = 1,  // per-column alpha vector in the epilogue
+};
+
+// The scale_mode a plan key must carry for the requested alpha form. Trivial by
+// construction; it exists so the two constants can never be swapped or collapsed
+// silently at the one call site that builds the key.
+inline int Fp8ScaleModeFor(bool alpha_device_vector) {
+  return alpha_device_vector ? kFp8ScaleModeAlphaDeviceVec : kFp8ScaleModeHostAlpha;
+}
+
+// Mirror of cublasLtPointerModeMask_t's
+// CUBLASLT_POINTER_MODE_MASK_ALPHA_DEVICE_VECTOR_BETA_ZERO. Kept as a local
+// constant so this header stays CUDA-free; cuda_matmul.cu static_asserts it
+// against the real enum, so a header change cannot drift past the build.
+inline constexpr unsigned int kFp8PointerModeMaskAlphaDeviceVectorBetaZero = 8U;
+
+// Does an algo's CUBLASLT_ALGO_CAP_POINTER_MODE_MASK authorize the mode we set?
+// ONLY the BETA_ZERO bit does: DEVICE_VECTOR (4) and ALPHA_DEVICE_VECTOR_BETA_HOST
+// (16) are different modes, and an algo reporting them does not implement ours.
+// A false here is not an error — it selects the two-launch fallback.
+inline bool Fp8AlphaVecCapSupported(unsigned int pointer_mode_cap_mask) {
+  return (pointer_mode_cap_mask & kFp8PointerModeMaskAlphaDeviceVectorBetaZero) != 0U;
+}
+
+// Why a vector-alpha plan build refused, as a NAMED cause. BuildFp8Plan can
+// decline for two materially different reasons that the algo log cannot tell
+// apart from the outside — it emits nothing at all in either case — and they
+// point at different next steps: kNoHeuristic means cuBLASLt offers no fp8 algo
+// for this shape once the pointer mode is on the descriptor, while
+// kPointerModeUnsupported means it offered one that does not advertise the mode.
+// The 2026-08-11 GB10 run above could distinguish neither, which is the whole
+// reason this exists. Pure so the mapping is pinned on the CPU tier.
+enum class Fp8PlanRefusal {
+  kNone = 0,                  // a usable plan was built
+  kNoHeuristic,               // no algo returned for the shape at all
+  kPointerModeUnsupported,    // algo returned, but its cap mask refuses our mode
+};
+
+// heuristic_ok = cuBLASLt returned at least one algo; pointer_mode_ok = the cap
+// check passed (trivially true for scalar-alpha keys, which never set a mode).
+// "No heuristic" dominates: when nothing was returned there is no algo whose
+// capability could have been read, so reporting a cap refusal would be a lie.
+inline Fp8PlanRefusal Fp8PlanRefusalFor(bool heuristic_ok, bool pointer_mode_ok) {
+  if (!heuristic_ok) return Fp8PlanRefusal::kNoHeuristic;
+  if (!pointer_mode_ok) return Fp8PlanRefusal::kPointerModeUnsupported;
+  return Fp8PlanRefusal::kNone;
+}
+
+// Stable log token for a refusal. Never returns nullptr.
+inline const char* Fp8PlanRefusalTag(Fp8PlanRefusal r) {
+  switch (r) {
+    case Fp8PlanRefusal::kNoHeuristic:
+      return "no-heuristic";
+    case Fp8PlanRefusal::kPointerModeUnsupported:
+      return "pointer-mode-unsupported";
+    case Fp8PlanRefusal::kNone:
+      break;
+  }
+  return "none";
+}
+
 // The FULL key that determines the cuBLASLt descriptor + selected algo for the
 // fp8 (e4m3) TN dense GEMM path in cuda_matmul.cu. EVERY input that changes the
 // descriptor OR the heuristic-selected algo MUST appear here — a missed field =
@@ -80,11 +226,15 @@ inline bool Fp8PlanCacheEnabled() {
 //   scale_type   — cudaDataType_t scale on the descriptor (CUDA_R_32F).
 //   trans_a/b    — CUBLASLT_MATMUL_DESC_TRANSA/TRANSB (OP_T / OP_N for the TN form).
 //   epilogue     — cublasLtEpilogue_t (DEFAULT here; no bias/act fusion).
-//   scale_mode   — 0 = per-tensor scale folded into the host alpha (no device
-//                  scale pointers on the descriptor). alpha is a per-call host
-//                  scalar that does NOT affect the descriptor or the algo, so it
-//                  is deliberately NOT part of the key; a future device-scale-
-//                  pointer mode would be a distinct scale_mode value.
+//   scale_mode   — which alpha FORM the descriptor carries, per Fp8ScaleModeFor:
+//                  kFp8ScaleModeHostAlpha (0) = per-tensor scale folded into the
+//                  host alpha, no pointer mode set; kFp8ScaleModeAlphaDeviceVec
+//                  (1) = CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO on
+//                  the descriptor, alpha a device f32 [N] vector. The VALUE of a
+//                  host alpha does not affect the descriptor or the algo, so it
+//                  is deliberately NOT part of the key — but the pointer MODE is
+//                  on the descriptor the heuristic reads, so the two forms must
+//                  never share a plan.
 struct Fp8PlanKey {
   int device = 0;
   int64_t m = 0, n = 0, k = 0;

@@ -1604,11 +1604,19 @@ DBuf MergedFp8QkvD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.q_proj_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkv.packed, one);
-  else
+  // PERF-FP8-ALPHA-FOLD: same seam as the GDN qkvz merge above — the per-column
+  // alpha is expressed once and applied in the cuBLASLt epilogue when the arm is
+  // enabled and supported, else by the unchanged two-launch form. This site is
+  // default OFF (MergedFp8QkvEnabled), so nothing here moves a gate today; it is
+  // routed anyway so the seam has ONE per-column-alpha path rather than two, and
+  // so enabling the merge later cannot re-add 16 full-tensor passes per step
+  // (#402 §3 "D", which is sequenced after this row for exactly that reason).
+  if (DenseCublasLtFp8Enabled()) {
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkv.packed, qkv.alpha_vec);
+  } else {
     vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkv.packed, one);
-  vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+    vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+  }
   return out;
 }
 
@@ -3099,9 +3107,10 @@ DType GdnActDType() {
 // activation buffers (mixed write+conv read, conv write+post-conv read) that
 // stayed f32 while the chunk trio was already bf16 (GdnActDType). The
 // l2norm/softplus math is f32-accumulated regardless (Load() upcasts); g/beta,
-// ssm_state, and the a/b GEMMs stay f32 (FLA's split). 27B-only by construction:
-// gated on the bf16-weight in_proj branch (the 27B's in_proj_qkv is a plain bf16
-// weight); the 35B's fp8-cutlass in_proj branch keeps its f32 output untouched.
+// ssm_state, and the a/b GEMMs stay f32 (FLA's split). Gated on the bf16-weight
+// in_proj branch (the 27B's in_proj_qkv is a plain bf16 weight); the fp8 in_proj
+// branch reaches it only under GdnFp8InBf16Enabled() below (#417), which is
+// default OFF, so an fp8 tower keeps its f32 output unless opted in.
 // MEASURED (27B, GB10, same-binary A/B): conv kernel -31.5%, post-conv -17.6%
 // (chunk trio FLAT — already bf16); e2e +0.68% (conc16, non-overlapping) / +0.83%
 // (conc32), TTFT -1.5%; token-exact (27B greedy paged-engine + 35B 16/16). The
@@ -3113,6 +3122,52 @@ DType GdnInDType() {
     return e == nullptr || e[0] != '0';
   }();
   return bf16 ? DType::kBF16 : DType::kF32;
+}
+
+// PERF-FP8-ALPHA-FOLD / issue #417 — make GdnInDType() REACHABLE on an fp8-tower
+// checkpoint (VT_GDN_FP8_IN_BF16, DEFAULT OFF).
+//
+// VT_GDN_IN_BF16 above is default ON with recorded conv -31.5% / post-conv
+// -17.6%, but it cannot fire on the ModelOpt FP8 GDN tower (the `nvidia` 27B is
+// `modelopt_mixed`, and the 35B shares the tower) because the merged fp8 in_proj
+// leaf hardcoded DType::kF32 for its output. `convdt = mixed.dtype` then carries
+// that f32 into the conv weight choice, the conv in/out buffer and the post-conv
+// read — the two largest GDN activation buffers, at 2x the bytes vLLM moves.
+//
+// That f32 is also what makes the per-column alpha pass cost what it does. The
+// merged [qkv;z] operand's shards carry DIFFERENT folded alphas on this
+// checkpoint (ResidentFp8Qkvz's `folded` is FALSE), so the alpha is applied by
+// vt::MulColVecF32 in a second full-tensor read-modify-write: MEASURED 122.99
+// ms/request over 48 calls at T=4096 prefill = 43.6% of the whole 27B prefill
+// deficit, at 209.5 GB/s = 77% of the GB10's 273.1 GB/s peak. It is
+// bandwidth-saturated, so its cost IS its width and a bf16 buffer halves it
+// (~61 ms/req, ~21.8% of the gap). All THREE cuBLASLt routes to ELIMINATING that
+// pass are measured unavailable on this hardware
+// (.agents/specs/perf-fp8-alpha-fold.md §Outcome); halving it depends on no
+// vendor capability whatsoever.
+//
+// vLLM emits BF16 here: ModelOptFp8LinearMethod applies with
+// out_dtype = torch.get_default_dtype() (vllm/model_executor/layers/quantization/
+// modelopt.py:458 @ the pin), and qwen_gdn_linear_attn.py:1285-1295 runs the
+// causal conv on that bf16 tensor. So this narrows TOWARD the oracle; our f32 is
+// the deviation, and it is the "too WIDE" kind a token-exactness gate cannot see
+// (.agents/porting.md, "Mirror the memory format, not just the math").
+//
+// It is NOT free, and that is why it is opt-in. Narrowing the GEMM's D rounds the
+// f32 accumulator to bf16 BEFORE the alpha multiply instead of after it, so
+// tokens CAN move. Both SACRED engine gates decide it, at their exact case AND
+// assertion counts; a lost token is NEEDS_DECISION, never a re-cut golden.
+//
+// f32-ONLY consumers are untouched: conv_state, g/beta, a_log/dt_bias, ssm_state
+// and the a/b GEMMs (FLA's split, ops.cpp gdn_g_beta). Only the STORE dtype
+// changes anywhere on this path — every kernel reads through Load(), which
+// upcasts to f32 before any arithmetic.
+bool GdnFp8InBf16Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_FP8_IN_BF16");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
 }
 
 // GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
@@ -3390,20 +3445,35 @@ Fp8QkvzDev ResidentFp8Qkvz(Dev d, const GdnLayerWeights& w) {
   return out;
 }
 
-// ONE fp8 GEMM over the N-concatenated [qkv;z] operand -> f32 [M, conv_dim +
+// ONE fp8 GEMM over the N-concatenated [qkv;z] operand -> `want` [M, conv_dim +
 // value_dim]. `h_fp8` is the shared pre-quantized activation (quantize-once)
 // when supplied, else the activation is quantized here with the shared
 // input_scale — the SAME activation bytes both split GEMMs would have read,
-// which is why one shared input_scale is a hard precondition. Output is f32 so
-// each column's alpha is applied by the same IEEE f32 multiply the folded-alpha
-// GEMM would apply, keeping the merged result identical to the concatenation of
-// the two split f32 GEMM outputs.
+// which is why one shared input_scale is a hard precondition.
+//
+// `want` is f32 (the shipped default) or bf16. At f32 each column's alpha is
+// applied by the same IEEE f32 multiply the folded-alpha GEMM would apply, so
+// the merged result is identical to the concatenation of the two split f32 GEMM
+// outputs — the #213 equivalence this leaf shipped with, unchanged.
+//
+// PERF-FP8-ALPHA-FOLD / #417: `want == kBF16` narrows the GEMM's D, which is the
+// ONLY remaining lever on the unfolded arm's per-column alpha pass — that pass is
+// a bandwidth-saturated full read-modify-write, so halving its width halves its
+// cost, and all three cuBLASLt routes to removing it outright are measured
+// unavailable on this hardware. It applies to BOTH arms uniformly and needs no
+// `folded` condition, because vt::MulColVecF32 now carries a bf16 store arm; the
+// alpha is still the same f32 multiply against the same f32 resident vector.
+// It is NOT byte-preserving — the accumulator is rounded to bf16 before the alpha
+// rather than after — so it is reached only through GdnFp8InBf16Enabled(), which
+// is DEFAULT OFF. Callers must read the returned buffer's dtype, never assume f32.
 DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
-                    const GdnLayerWeights& w) {
+                    const GdnLayerWeights& w, DType want = DType::kF32) {
+  VT_CHECK(want == DType::kF32 || want == DType::kBF16,
+           "qwen3_5 merged FP8 GDN qkvz: output dtype must be f32 or bf16");
   Fp8QkvzDev qkvz = ResidentFp8Qkvz(d, w);
   const int64_t M = h_fp8 != nullptr ? h_fp8->shape[0] : x.shape[0];
   const int64_t total_n = qkvz.packed.shape[0];
-  DBuf out(d, DType::kF32, {M, total_n});
+  DBuf out(d, want, {M, total_n});
   const Tensor* a_fp8_p = h_fp8;
   std::optional<DBuf> a_fp8_owner;
   if (a_fp8_p == nullptr) {
@@ -3412,11 +3482,28 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.in_proj_qkv_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
-  else
+  if (qkvz.folded) {
+    // One shared alpha: already a single GEMM scalar, nothing to apply after.
+    if (DenseCublasLtFp8Enabled())
+      vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+    else
+      vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  } else if (DenseCublasLtFp8Enabled()) {
+    // PERF-FP8-ALPHA-FOLD: express the per-column alpha ONCE, at the seam. The
+    // op applies it in the cuBLASLt epilogue when VT_FP8_ALPHA_VEC_EPILOGUE=1
+    // and the selected algo supports the pointer mode, and otherwise runs the
+    // GEMM at alpha=1 plus vt::MulColVecF32 — byte for byte what this line pair
+    // did before. The model no longer owns that choice.
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha_vec);
+  } else {
+    // CUTLASS arm (VT_DENSE_CUBLASLT_FP8=0): no epilogue alpha vector, so the
+    // two-launch form stays here verbatim. Both launches follow `out`'s dtype,
+    // so this arm narrows with `want` exactly as the cuBLASLt one does — and bf16
+    // is CUTLASS's NATIVE fp8 epilogue, so it also drops the bf16 scratch and the
+    // CastBf16ToF32 pass an f32 `out` costs here.
     vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
-  if (!qkvz.folded) vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+    vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+  }
   return out;
 }
 
@@ -3484,38 +3571,55 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.z = out.z_owner->t();
     return out;
   }
+  // PERF-FP8-ALPHA-FOLD / #417 — the output dtype of the merged fp8 in_proj leaf.
+  // vLLM's ModelOpt fp8 linear emits the model dtype (bf16); ours hardcoded f32,
+  // which is both what made GdnInDType() unreachable on an fp8 tower AND what
+  // makes the unfolded arm's per-column alpha pass cost twice what it needs to
+  // (see GdnFp8InBf16Enabled). All THREE conditions are required:
+  //   1. the opt-in toggle (default OFF; no measurement exists yet, and this
+  //      narrowing is not value-neutral),
+  //   2. indt == BF16, i.e. VT_GDN_IN_BF16 is on (its default) — this IS the
+  //      lever being unblocked, so honouring its rollback is mandatory,
+  //   3. outdt == BF16. This is what confines the change to the 27B: the 35B is
+  //      MoE, so GdnOutDType(dense_model=false) is f32 by default and this stays
+  //      inert there. It also keeps the whole chain dtype-uniform, which the
+  //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
+  //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
+  const DType fp8_indt =
+      (GdnFp8InBf16Enabled() && indt == DType::kBF16 && outdt == DType::kBF16)
+          ? DType::kBF16
+          : DType::kF32;
   // PERF-27B-GDN-FP8-QKVZ — the native-FP8 owner's merged arm. ONE fp8 GEMM
   // over the N-concatenated [qkv;z] operand replaces the two below; `mixed_qkv`
   // and `z` become last-dim views of its output, exactly as in the BF16 leaf.
-  // The merged output is f32 — the dtype the split `mixed_qkv` GEMM already
-  // emits — so `mixed_qkv` is byte-identical. `z`'s split GEMM emits `outdt`;
-  // when that is not f32 the f32 view is cast, which rounds the SAME f32 product
-  // the split GEMM's epilogue would have rounded. Nothing about the split
-  // arithmetic changes, so this leaf is a pure launch/shape change.
+  // At the f32 default the merged output is f32 — the dtype the split
+  // `mixed_qkv` GEMM already emits — so `mixed_qkv` is byte-identical. `z`'s
+  // split GEMM emits `outdt`; when that is not f32 the f32 view is cast, which
+  // rounds the SAME f32 product the split GEMM's epilogue would have rounded.
+  // Nothing about the split arithmetic changes, so this leaf is a pure
+  // launch/shape change.
   if (!w.in_proj_qkv_fp8.Empty() &&
       detail::ShouldUseMergedGdnFp8Qkvz(
           GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim))) {
     if (g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
       g_gdn_fp8_inproj_merged.fetch_add(1, std::memory_order_relaxed);
-    // MergedFp8QkvzD's output buffer is F32 by construction, so it must agree
-    // with the single source the packed-decode eligibility predicts from
-    // (#365). A future bf16 fp8 epilogue has to change BOTH or the prediction
-    // silently lies and vt::GdnPackedDecode throws on a dtype mismatch.
-    VT_CHECK(GdnFp8MixedQkvDType() == DType::kF32,
-             "qwen3_5 merged FP8 GDN qkvz: the merged arm emits F32; "
-             "GdnFp8MixedQkvDType must agree");
-    out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w));
+    out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w, fp8_indt));
     Tensor packed = out.packed_owner->t();
     out.mixed = packed.Slice(1, 0, conv_dim);
-    Tensor z_f32 = packed.Slice(1, conv_dim, conv_dim + value_dim);
-    if (outdt == DType::kF32) {
-      out.z = z_f32;
+    Tensor z_raw = packed.Slice(1, conv_dim, conv_dim + value_dim);
+    // When the merged GEMM already emitted the z gate's dtype, the CastBf16 pass
+    // disappears with it (#417): the strided view IS the bf16 gate, and the
+    // gated-RMSNorm consumes a padded-row gate view natively (GdnGateView3, the
+    // z_strided path the f32 arm and the BF16-weight leaf already take). The
+    // f32-buffer arm below is the pre-existing behavior, unchanged.
+    if (z_raw.dtype == outdt) {
+      out.z = z_raw;
     } else {
-      VT_CHECK(outdt == DType::kBF16,
+      VT_CHECK(outdt == DType::kBF16 && z_raw.dtype == DType::kF32,
                "qwen3_5 merged FP8 GDN qkvz: unsupported z output dtype");
       out.z_owner.emplace(d, DType::kBF16,
                           std::vector<int64_t>{packed.shape[0], value_dim});
-      vt::CastBf16(d.q, out.z_owner->t(), z_f32);
+      vt::CastBf16(d.q, out.z_owner->t(), z_raw);
       out.z = out.z_owner->t();
     }
     return out;
@@ -3583,8 +3687,9 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when
   // supplied; a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h
-  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight
-  // branch); the fp8-cutlass branch (35B) keeps f32. See GdnInDType().
+  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (bf16-weight branch),
+  // and on the merged fp8 branch too under VT_GDN_FP8_IN_BF16 (default OFF, see
+  // GdnFp8InBf16Enabled). See GdnInDType().
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
   GdnQkvzOutput qkvz =
@@ -4259,9 +4364,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when
   // supplied; a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h
-  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight
-  // branch, halves the conv-input traffic); the fp8-cutlass branch (35B) keeps
-  // f32 (GdnInDType()). The z gate follows the recurrence-output dtype
+  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (bf16-weight branch,
+  // halves the conv-input traffic); the merged fp8 branch reaches the same bf16
+  // output under VT_GDN_FP8_IN_BF16 (default OFF, GdnFp8InBf16Enabled) and keeps
+  // f32 otherwise. The z gate follows the recurrence-output dtype
   // (VT_GDN_OUT_BF16): the gated-RMSNorm requires gate.dtype == core.dtype.
   GdnQkvzOutput qkvz =
       ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
