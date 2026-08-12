@@ -256,6 +256,7 @@ next cadence of parallel work".
 | W3 | `check-agent-record.py`: fenced/inline-code-aware `extract_links`, `link_bases` for the archive, with tests | in this PR |
 | W4 | Rebuild `docs/BENCHMARKS.md` as a derived index over per-row files | **DEFERRED.** Justified only if the page becomes a *conflict* hotspot after the cap is gone. Trigger: `git merge-tree` shows it conflicting in 3 or more concurrently open PRs, measured, as #364 measured its three surfaces. Not justified by the cap, which W2 removes. |
 | W5 | Teach `roll-benchmark-record.py` to record the archived section's origin explicitly, rather than relying on W3's two-base resolution | **DEFERRED.** W3 makes the move work; W5 would make it self-describing. No blocker depends on it. |
+| W6 | Make `_h2_headers` fence-aware, so the gate and the rollup agree on what a section is ([#495](https://github.com/mudler/vllm.cpp/issues/495)) | **DEFERRED, filed not fixed.** Found doing W2 and reproduced: `_h2_headers` is a bare `startswith("## ")` scan while `split_sections` tracks fences, so a heading-shaped line inside a fence is a section to the gate and not to the script the gate tells you to run. It changes what an existing gate counts, so it takes its own spec and red-before rather than riding along here. Neither page has a fenced heading today. W2's `_headings` is already fence-aware and is the natural basis for the repair. |
 
 ## Risks/decisions
 
