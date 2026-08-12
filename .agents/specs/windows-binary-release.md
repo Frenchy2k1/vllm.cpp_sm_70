@@ -469,11 +469,14 @@ failed because its private evidence tool directory contained Ninja but not the
 executing portability suite establishes an exact mandatory pair: the tests and
 checker invoke `cmake`, and every configure selects `-G Ninja`; PowerShell is
 an optional extra validation and Python uses an absolute interpreter path.
-The repair declares the complete per-module `cmake`/`ninja` tuple and copies
-each resolved executable into the same private directory. Inheriting ambient
-`PATH` remains forbidden, and sibling executables remain unreachable. Focused
-tests must fail when either required tool is omitted or unresolved and pass
-only when both private copies are selected.
+The repair declares the complete per-module `cmake`/`ninja` tuple and exposes
+each exact resolved executable through the same private directory. A private
+symlink is required instead of a byte copy because CMake resolves its installed
+module tree from its executable location; copying only the binary fails with
+`CMAKE_ROOT` missing. Inheriting ambient `PATH` remains forbidden, and sibling
+executables remain unreachable. Focused tests must fail when either required
+tool is omitted or unresolved and pass only when both private links are
+selected and a real private-path CMake/Ninja configure succeeds.
 
 Hosted run `31570365638` then exposed two independent portability-audit defects
 ([#454](https://github.com/mudler/vllm.cpp/issues/454)). The Vulkan source
