@@ -11,9 +11,11 @@
 // GPU + weights required: point VLLM_VOXTRAL_SAFETENSORS at the downloaded
 // consolidated.safetensors (mistral format, ~8.8 GiB, NOT committed). Fixtures
 // (WAV, log-mel/mel/sinusoid goldens, prompt ids, golden tokens) ARE committed.
-// Without the weights (or without CUDA) the gate is SKIPPED, not failed.
+// Without the weights (or without CUDA) the gate is SKIPPED — and a skip EXITS 77,
+// never 0, so it can never be read as a pass. See SkipGate below (issue #463).
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -34,6 +36,29 @@ using vllm::SafetensorsFile;
 using vllm::VoxtralWeights;
 
 std::string Fix() { return std::string(MM_VOXTRAL_FIXTURE_DIR); }
+
+// A gate that CANNOT RUN must never report success.
+//
+// Returning early out of a doctest TEST_CASE prints `assertions: 0 | 0 passed |
+// 0 failed` followed by `Status: SUCCESS!` and exits 0 — indistinguishable, in a
+// log or in a `&&` chain, from a gate that loaded 8.8 GiB of weights and matched
+// the oracle. multimodal-speed.md §17.7 recorded that trap; issue #463 files it.
+//
+// The fix: exit with CTest's SKIP_RETURN_CODE (77, registered by
+// `vllm_cpp_add_test` in tests/CMakeLists.txt). `ctest` then reports the test as
+// **Skipped**, not Passed; a shell chain stops at the non-zero status; and doctest
+// never gets to print a SUCCESS banner for a run that asserted nothing. Exiting is
+// deliberate rather than a `FAIL_CHECK`: a CPU-only or weightless box legitimately
+// cannot run this gate, and "skipped" is the true result there — what was wrong
+// was reporting it as "passed".
+[[noreturn]] void SkipGate(const char* why) {
+  std::fprintf(stderr,
+               "\n*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***\n"
+               "*** test_voxtral_e2e: %s\n\n",
+               why);
+  std::fflush(stderr);
+  std::exit(77);
+}
 
 std::vector<float> ReadF32(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -87,13 +112,11 @@ HfConfig VoxtralTextConfig() {
 TEST_CASE("voxtral_audio_to_text_e2e_strict_vs_vllm_0_25_0") {
   const char* stf = std::getenv("VLLM_VOXTRAL_SAFETENSORS");
   if (stf == nullptr) {
-    MESSAGE("SKIP: set VLLM_VOXTRAL_SAFETENSORS to Voxtral consolidated.safetensors");
-    return;
+    SkipGate("set VLLM_VOXTRAL_SAFETENSORS to Voxtral consolidated.safetensors");
   }
   vt::Backend* gpu = vt::TryGetBackend(vt::DeviceType::kCUDA);
   if (gpu == nullptr) {
-    MESSAGE("SKIP: no CUDA backend");
-    return;
+    SkipGate("no CUDA backend");
   }
 
   // ---- TEXT-ONLY isolation path (decoder-only, no audio/merge) ----
@@ -227,12 +250,31 @@ TEST_CASE("voxtral_audio_to_text_e2e_strict_vs_vllm_0_25_0") {
   // voxtral_neartie.json::our_tokens is regenerated to the SHIPPING kernel's sequence
   // (FA2) purely as a determinism anchor; the pass/fail VERDICT is the teacher-force
   // PASS below (result==PASS + zero divergent + worst_gap<=0.5), NOT the byte identity.
+  //
+  // WHAT THIS PROCESS CAN AND CANNOT CHECK — read before trusting the printed line.
+  // The teacher-force runs OFFLINE, in Python, against the live oracle
+  // (scripts/mm/a3_voxtral_neartie_gate.py). Its verdict is COMMITTED into
+  // voxtral_neartie.json. This test does not have an oracle in-process and does not
+  // re-run it. So `result` / `n_divergent` / `over_band_failures` / `worst_gap_nats`
+  // below are **FIXTURE PROVENANCE for `our_tokens`** — they record which sequence was
+  // validated and how — and they are CONSTANTS with respect to `got`. Asserting them
+  // pins the fixture (a regenerated near-tie file that no longer PASSES cannot be
+  // committed silently); it says nothing about this run's output. The only checks here
+  // that discriminate on `got` are `got.size()`, `strict_prefix >= 18` and
+  // `repro == 48`: `repro` is what ties `got` to the teacher-force-validated sequence,
+  // and therefore what carries the correctness claim into this process.
+  // Reviewed and corrected on PR #439 (finding F7): the earlier "BINDING CORRECTNESS"
+  // label on the fixture constants overstated what they do — the FA-2 arm prints
+  // `divergent=0 worst_gap_nats=0` while FAILING, precisely because those two came out
+  // of the file rather than out of `got`.
   nlohmann::json nt;
   { std::ifstream f(Fix() + "/voxtral_neartie.json"); f >> nt; }
   std::vector<int32_t> nt_tokens = nt["our_tokens"].get<std::vector<int32_t>>();
-  const double worst_gap = nt["worst_gap_nats"].get<double>();
-  const int n_divergent = nt["n_divergent"].get<int>();
-  const size_t over_band = nt["over_band_failures"].size();
+  // Fixture-provenance constants (see above): loaded from the committed JSON, NOT
+  // computed from `got`.
+  const double fixture_worst_gap = nt["worst_gap_nats"].get<double>();
+  const int fixture_n_divergent = nt["n_divergent"].get<int>();
+  const size_t fixture_over_band = nt["over_band_failures"].size();
 
   int strict_prefix = 0;
   for (size_t i = 0; i < std::min(got.size(), golden_tokens.size()); ++i) {
@@ -242,21 +284,19 @@ TEST_CASE("voxtral_audio_to_text_e2e_strict_vs_vllm_0_25_0") {
   int repro = 0;
   for (size_t i = 0; i < std::min(got.size(), nt_tokens.size()); ++i)
     if (got[i] == nt_tokens[i]) ++repro;
-  MESSAGE("STRICT prefix vs vLLM greedy: ", strict_prefix, "/", golden_tokens.size(),
-          " (exact up to the first genuine bf16 tie; FA2 branch: pos 18)");
-  MESSAGE("near-tie teacher-force gate: result=", nt["result"].get<std::string>(),
-          " divergent=", n_divergent, " worst_gap_nats=", worst_gap,
-          " over-band(>0.5nats)=", over_band, "  reproduces FA2 seq ", repro, "/",
+  MESSAGE("STRICT prefix vs vLLM greedy [THIS RUN]: ", strict_prefix, "/",
+          golden_tokens.size(), " (exact up to the first genuine bf16 tie; FA2 branch: "
+          "pos 18)");
+  MESSAGE("reproduces the teacher-force-validated sequence [THIS RUN]: ", repro, "/",
           nt_tokens.size());
+  MESSAGE("fixture provenance for that sequence [FROM voxtral_neartie.json, NOT from "
+          "this run]: result=", nt["result"].get<std::string>(),
+          " divergent=", fixture_n_divergent, " worst_gap_nats=", fixture_worst_gap,
+          " over-band(>0.5nats)=", fixture_over_band);
 
+  // ---- checks that discriminate on THIS RUN's output ----
   // Length: exactly the golden's token count.
   CHECK(static_cast<int>(got.size()) == static_cast<int>(golden_tokens.size()));
-
-  // BINDING CORRECTNESS = the distributional teacher-force PASS (kernel-independent).
-  CHECK(nt["result"].get<std::string>() == "PASS");
-  CHECK(n_divergent == 0);  // every produced token IS vLLM's teacher-forced argmax
-  CHECK(over_band == 0);    // no divergence exceeds the 0.5-nat near-tie band
-  CHECK(worst_gap <= 0.5);
 
   // Strict prefix: token-exact vs vLLM greedy up to the first genuine bf16 exact tie.
   // The FA2 kernel takes the other side of the pos-18 2-way exact tie (gap 0.000) than
@@ -265,8 +305,18 @@ TEST_CASE("voxtral_audio_to_text_e2e_strict_vs_vllm_0_25_0") {
   // pipeline to reproduce vLLM greedy EXACTLY up to that first tie.
   CHECK(strict_prefix >= 18);
 
-  // Determinism anchor (NOT the correctness bar): the build reproduces the exact
-  // offline-teacher-force-validated FA2 sequence, guarding against silent decode
-  // regressions. Regenerated with the decode kernel via a3_voxtral_neartie_gate.py.
+  // THE BINDING CORRECTNESS CHECK in this process: `got` IS, position for position,
+  // the sequence the offline teacher-force validated against the oracle. This is what
+  // carries the distributional verdict into the build — combined with the fixture
+  // assertions below, which pin what that verdict was.
   CHECK(repro == static_cast<int>(nt_tokens.size()));
+
+  // ---- fixture-provenance assertions (CONSTANTS w.r.t. `got`) ----
+  // These pin the committed near-tie file to a PASSING teacher-force, so a
+  // regenerated fixture that no longer passes cannot slip in under the `repro` check
+  // above. They are not, and must not be read as, a measurement of this run.
+  CHECK(nt["result"].get<std::string>() == "PASS");
+  CHECK(fixture_n_divergent == 0);  // the validated sequence IS vLLM's argmax throughout
+  CHECK(fixture_over_band == 0);    // no divergence exceeded the 0.5-nat near-tie band
+  CHECK(fixture_worst_gap <= 0.5);
 }

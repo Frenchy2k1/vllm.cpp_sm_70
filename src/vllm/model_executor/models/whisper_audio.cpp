@@ -288,21 +288,46 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
     // alone with zero cross-query tile reuse. AttentionDenseFlash streams K/V in
     // shared-memory tiles reused across a block of query-warps (FA2 tiling), with the
     // BIT-IDENTICAL per-warp online-softmax recurrence ⇒ token-identical output.
-    // Same-binary A/B knobs: VT_WHISPER_ENC_EAGER=1 → naive kAttention;
-    // VT_WHISPER_ENC_WARP=1 → warp AttentionDenseFast (the pre-§14 default).
+    //
+    // OPT-IN: vt::AttentionDenseFa2 (`VT_WHISPER_ENC_FA2=1`) — the VENDORED
+    // FlashAttention-2 forward on the GPU's TENSOR CORES (§17). It is 115.8x faster
+    // per layer than the flash-tiled kernel below (19.28 -> 0.167 ms/layer) and takes
+    // the whole encoder forward 731.7 -> 133.0 ms (5.50x), because AttentionDenseFlash
+    // still walks all 1500 keys with one warp per query through a dependent
+    // online-softmax chain — serial-latency-bound regardless of where K/V live.
+    //
+    // It is NOT the default, and the reason is measured, not cautious. FA-2 converts
+    // the softmax probabilities from its f32 accumulator to bf16 before the PV MMA
+    // (`flash_attn/src/flash_fwd_kernel.h:347` `convert_type<Element>(acc_s)`), where
+    // the scalar kernel below keeps `p` in f32 — so FA-2 is inherently lower precision
+    // here in exchange for tensor cores. Teacher-forcing the FA-2 sequence against the
+    // fixture's own oracle (vLLM 0.25.0) PASSES the ratified 0.5-nat near-tie band
+    // (worst gap 0.125 nats, 0 over-band) but shows 3 divergent positions where the
+    // shipping scalar kernel has 0 at gap 0.0. Adopting it would trade a little
+    // correctness for a lot of speed, which is a DEVELOPER decision (exactly the §11 ->
+    // §12 shape), not one to take by flipping a default. See multimodal-speed.md §17.
+    //
+    // Same-binary A/B knobs: VT_WHISPER_ENC_EAGER=1 -> naive kAttention;
+    // VT_WHISPER_ENC_WARP=1 -> warp AttentionDenseFast (the pre-§14 default);
+    // VT_WHISPER_ENC_FA2=1 -> FA-2 tensor cores (fastest, lower precision);
+    // VT_FA2_DENSE=0 -> inside that op, disable the FA-2 fast path (falls back here).
     static const int enc_attn = [] {
       const char* e = std::getenv("VT_WHISPER_ENC_EAGER");
       if (e != nullptr && e[0] == '1') return 0;  // naive
       const char* w = std::getenv("VT_WHISPER_ENC_WARP");
       if (w != nullptr && w[0] == '1') return 1;  // warp
-      return 2;                                   // flash-tiled (default)
+      const char* f2 = std::getenv("VT_WHISPER_ENC_FA2");
+      if (f2 != nullptr && f2[0] == '1') return 3;  // FA-2 tensor cores (opt-in)
+      return 2;                                     // flash-tiled (default, byte-exact)
     }();
     if (enc_attn == 0)
       vt::Attention(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
     else if (enc_attn == 1)
       vt::AttentionDenseFast(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
-    else
+    else if (enc_attn == 2)
       vt::AttentionDenseFlash(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
+    else
+      vt::AttentionDenseFa2(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
     // out_proj + residual.
     Tensor ao2 = ao.tensor(); ao2.rank = 2; ao2.shape[0] = L; ao2.shape[1] = H;
     ao2.stride[0] = H; ao2.stride[1] = 1;

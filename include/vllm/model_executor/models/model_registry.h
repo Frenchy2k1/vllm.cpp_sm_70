@@ -239,6 +239,13 @@ struct ModelForwardInput {
   int num_reqs = 0;
   int64_t gdn_state_slots = 0;
   bool pure_decode = false;
+  // SPEC-DSPARK W8 (#442): the configured speculation width, so the decode-graph
+  // gate can mirror vLLM's UNIFORM-decode predicate instead of "query_len == 1".
+  // Upstream's captured decode length is `1 + num_speculative_tokens`
+  // (cudagraph_dispatcher.py:37), which is why its T=1+k speculative VERIFY is
+  // graph-captured and ours was not. DEFAULT 0 => the predicate reduces exactly
+  // to today's pure-decode shape, so every non-spec caller is byte-identical.
+  int64_t num_speculative_tokens = 0;
   bool gather_logits = true;
   // SPEC-MTP I5d-pre hidden-state tap. When non-null (only the spec verify
   // forward sets it, I5d), the Qwen3.5 dense/MoE forward routes to
