@@ -38,6 +38,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "hf_snapshot.h"
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -49,26 +50,19 @@ using json = nlohmann::json;
 
 namespace {
 
-// Resolve a HF snapshot dir. `prefer_single_file` picks the snapshot containing a
-// single `model.safetensors` (the original bf16 unsloth NVFP4 27B, matching the
-// dflash_27b golden + the 27B SACRED gate) over a sharded re-quant of the same
-// repo whose lm_head is FP8 (which the bf16 dense loader rejects). Without the
-// preference, filesystem iteration can hand back either snapshot.
-std::string SnapDir(const std::string& rel, bool prefer_single_file = false) {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr) return "";
-  const fs::path base = fs::path(home) / rel;
-  std::error_code ec;
-  if (!fs::is_directory(base, ec)) return "";
-  std::string any;
-  for (const auto& e : fs::directory_iterator(base, ec)) {
-    if (!fs::exists(e.path() / "config.json", ec)) continue;
-    any = e.path().string();
-    if (prefer_single_file && fs::exists(e.path() / "model.safetensors", ec))
-      return e.path().string();
-  }
-  return any;
-}
+// GATE-PIN-UNPINNED-SNAPSHOTS (#471). The `SnapDir` that used to live here was a
+// HEURISTIC dressed as a resolver, and it is instructive about why heuristics do
+// not substitute for a pin. It preferred the snapshot holding a single
+// `model.safetensors` -- which does select `unsloth/Qwen3.6-27B-NVFP4`@890bdef7
+// today, because only that revision is single-file. But its fallback returned
+// `any`, i.e. THE LAST entry it saw, so on a cache where no snapshot is
+// single-file it silently preferred the newest re-quant; and the preference
+// itself would break the moment a future single-file revision appeared. It
+// encoded a property the goldens happen to correlate with, not the identity the
+// goldens were captured against.
+//
+// DELETED, not kept. Resolution goes through parity::HfSnapshot, which names the
+// revision and skips rather than substituting.
 
 vllm::SamplingParams Greedy(int max_tokens) {
   vllm::SamplingParams sp;
@@ -119,16 +113,19 @@ std::size_t FirstDiff(const std::vector<int32_t>& a,
 }  // namespace
 
 TEST_CASE("qwen27 DFlash e2e correctness gate (dgx-only, 27B block-diffusion k=16)") {
-  const std::string target = SnapDir(
-      ".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots",
-      /*prefer_single_file=*/true);
-  const std::string draft = SnapDir(
-      ".cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash/snapshots");
+  const std::string target = parity::Qwen27NvfP4Snapshot();
+  const std::string draft = parity::Qwen27DFlashDraftSnapshot();
   const fs::path golden_path =
       fs::path(PARITY_GOLDENS_DIR) / "dflash_27b" / "dflash_27b_spec_on.json";
   if (target.empty() || draft.empty() || !fs::exists(golden_path)) {
-    MESSAGE("27B NVFP4 target / z-lab DFlash draft / golden absent; skipping "
-            "(dgx-only)");
+    MESSAGE("SKIP (dgx-only): the 27B DFlash e2e gate needs "
+               "unsloth/Qwen3.6-27B-NVFP4 @"
+            << std::string(parity::kQwen27NvfP4Revision)
+            << " (got: " << (target.empty() ? "ABSENT" : target) << "), "
+            << "z-lab/Qwen3.6-27B-DFlash @" << std::string(parity::kQwen27DFlashDraftRevision)
+            << " (got: " << (draft.empty() ? "ABSENT" : draft) << "), "
+            << "and the committed golden. A cache holding a DIFFERENT revision "
+               "of either repo skips rather than being substituted (#471).");
     return;
   }
 
@@ -398,10 +395,10 @@ int64_t AbsDelta(int64_t a, int64_t b) { return a > b ? a - b : b - a; }
 }  // namespace
 
 TEST_CASE("dflash axis-A: a GGUF draft and a safetensors draft are the same draft") {
+  // VLLM_DFLASH_TARGET still names an explicit directory for a deliberate
+  // different-checkpoint run; the FALLBACK is now pinned rather than guessed.
   std::string target = Env("VLLM_DFLASH_TARGET");
-  if (target.empty())
-    target = SnapDir(".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots",
-                     /*prefer_single_file=*/true);
+  if (target.empty()) target = parity::Qwen27NvfP4Snapshot();
   const std::string draft_a = Env("VLLM_DFLASH_DRAFT");
   const std::string draft_b = Env("VLLM_DFLASH_DRAFT_B");
   if (target.empty() || draft_a.empty()) {
