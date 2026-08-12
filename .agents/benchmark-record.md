@@ -19674,3 +19674,44 @@ From the Qwen3.6-27B NVFP4 by-concurrency section:
 ```text
 | c16, c32 | NOT MEASURED. Both canonical attempts void: denominator contended mid-timing once, host OOM-reboot once | | |
 ```
+
+## SPEC-DSPARK: INTERLEAVED cross-engine medians, and why single-shot was wrong (2026-08-12)
+
+Supersedes the 0.986x/0.995x figures recorded earlier the same day, which used
+ONE oracle load per cell.
+
+The pinned oracle's own per-prompt result moves up to 27% between same-config
+sessions on this box: "capital" 78.76 -> 98.01, "fibonacci" 142.88 -> 152.45.
+Our reps hold 0.3% across the same span, so the variance is the reference, not
+us. Part of it was self-inflicted: one run put the oracle FIRST to dodge a GB10
+reboot during its load, handing it a freshly booted idle box. The same
+comparison then reads 0.995x/0.986x one way and 0.833x/0.925x the other.
+
+INTERLEAVED (O,U,O,U,O,U in one flock, medians of per-rep medians):
+
+| cell | ours (per-rep medians) | oracle (per rep) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 75.3, 81.4, 78.2 | 81.5, 85.1, 97.8 | 0.919x |
+| "fibonacci", 89 tok | 141.4, 141.4, 141.4 | 143.2, 149.4, 142.1 | 0.987x |
+
+NOT parity: the MoE lane is 0.919x-0.987x.
+
+What is unaffected, because both arms run adjacent under identical conditions
+with the capture as the only difference:
+
+| cell | capture OFF | capture ON | delta |
+|---|---|---|---|
+| "capital" | 72.7 | 81.6 | +12.2% |
+| "fibonacci" | 136.2 | 141.0 | +3.5% |
+
+Plus the sync-free Markov chain (draft-ordered markov_w1 built at load, so the
+argmax feeds the next step's embedding on device and the chain needs ONE readback
+instead of k): the four e2e spec-decode suites pass with capture ON and OFF, 8/8
+runs green.
+
+Rule for this row: no cross-engine ratio without interleaved repetitions and
+medians. A single oracle load is worth nothing where the reference swings 27%,
+and the sign of the error depends on which engine got the first slot.
+
+Evidence: `dgx:~/work/dspark-w6/interleaved.log`, `oracle_rep{1,2,3}.json`,
+`parity_final.log`, `gates.log`.

@@ -483,10 +483,11 @@ host-side sampling, now moved on device (#436, byte-identical output, sampling
 bandwidth bound on the per-step Markov GEMV that upstream pays identically.
 W8 (#442) then CAPTURED the T=1+k verify, mirroring vLLM's uniform-decode graph
 predicate (`uniform_decode_query_len = 1 + num_speculative_tokens`) instead of
-our `query_len == 1` gate: the MoE lane moves to **0.986x-0.995x** of the pinned
-graphed oracle (from 0.870x-0.981x), byte-identical, +8.5%/+4.7% same-binary.
-Close to parity but not at it: the residual ~1.4% is larger than the 0.3% rep
-spread. The Gemma4 `1 + N` layout is coded and unit-tested but has
+our `query_len == 1` gate: the MoE lane measures **0.919x-0.987x** of the
+pinned graphed oracle on INTERLEAVED medians, byte-identical, with the
+same-binary capture A/B worth +12.2%/+3.5%. NOT parity. Single-shot ratios are
+not usable here: the oracle's own result swings up to 27% between same-config
+sessions while our reps hold 0.3%, so cross-engine claims need interleaving. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
