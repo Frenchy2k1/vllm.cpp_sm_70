@@ -38,6 +38,10 @@ Native MSVC strict-build repair:
 [#459](https://github.com/mudler/vllm.cpp/issues/459), specified in
 [windows-msvc-strict-build.md](windows-msvc-strict-build.md)
 
+Central MSVC macro-contract repair:
+[#462](https://github.com/mudler/vllm.cpp/issues/462), specified in
+[windows-msvc-central-nominmax.md](windows-msvc-central-nominmax.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
