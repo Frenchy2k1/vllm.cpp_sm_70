@@ -433,9 +433,11 @@ Vulkan (opt-125m exact; 25 native +8 GDN, both
 recurrences + fused attn preamble; 27B prefill 21.5x, decode
 4.36/4.35 MET; 27B load 100.8 -> 53.4 GiB; #125
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
-on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
-(**blind-written, unverified**); M2 needs verification; gfx1201 hipBLAS +
-Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
+on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
+Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
+oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
+but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
+contributor-measured on 2x R9700 and CPU-link-verified our side;
 [guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
 only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
@@ -478,7 +480,10 @@ repetition loop (8 distinct token ids across 128 tokens) that is trivially
 draftable. The open lever was per-step cost: 28% of the draft step was
 host-side sampling, now moved on device (#436, byte-identical output, sampling
 -11%/-15%, ~3% e2e on the 35B lane); what remains of that phase is a memory
-bandwidth bound on the per-step Markov GEMV that upstream pays identically. The Gemma4 `1 + N` layout is coded and unit-tested but has
+bandwidth bound on the per-step Markov GEMV that upstream pays identically.
+A PAIRED re-measure on 2026-08-12 puts the MoE lane at 0.870x-0.981x, so speed
+parity is NOT met; the deficit tracks the high-acceptance regime, pointing at the
+T=1+k verify running eager while upstream captures it. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
