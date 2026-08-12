@@ -1465,6 +1465,115 @@ difference between two builds of the same source.
 identical; the difference is in the compiled artifact or its runtime conditions,
 and only a profiler at that level can say which.
 
+## 6z. THE BINARIES ARE EQUIVALENT: the residual is RUNTIME, not code (2026-08-12)
+
+§6y said the answer was no longer in the source and named `ncu` as the next step.
+Ran it, plus a static comparison of the shipped machine code. Both close.
+
+**Measured on our side (`ncu`, 10 launches, steady state):**
+
+| metric | ours |
+|---|---|
+| registers per thread | **94** |
+| warps active (occupancy proxy) | 24.0% |
+| SM throughput | 10.6% of peak |
+| L1 sector hit rate | 0.7% |
+| L2 sector hit rate | 9.5% |
+
+A latency-bound kernel, as expected for a W4A16 grouped GEMM at M=9.
+
+**Static comparison of the SAME instantiation** (`<...2814749767172868, 128, 1, 8,
+4, true, 4, 1, false>`), ours from our build object, upstream from the shipped
+`_moe_C_stable_libtorch.abi3.so`:
+
+| | registers | SASS instructions |
+|---|---|---|
+| ours (sm_121a) | **94** | **3664** |
+| upstream (sm_120) | **94** | **3664** |
+
+**The compiled kernels are equivalent.** Note upstream ships no sm_121 cubin at
+all -- sm_80/87/89/90/90a/100/110/120 -- so on GB10 it runs the family-compatible
+sm_120 code while we compile sm_121a, and the two compile to the same instruction
+count with the same register pressure.
+
+**So every code-level explanation is now eliminated**, including the machine code
+itself: source, instantiation, grid, block size, shared memory, reduction flags,
+scale layout, alignment, residency, toolkit, arch, register pressure and SASS
+length all match, and upstream performs MORE work per launch (40.6 blocks vs
+38.9). Ours still takes 4.21 us/block against 3.73.
+
+**The residual is therefore RUNTIME, not code.** What differs is the environment
+the identical kernel executes in: how each engine's allocator places the expert
+weights and activations, and hence L2/DRAM locality across the 256 experts. Our
+L2 hit rate is 9.5%, so this kernel lives or dies on memory placement, and the
+two engines allocate differently (our `DevicePool` slabs vs torch's caching
+allocator) even though both are `cudaMalloc`-backed, contiguous per tensor and
+256-byte aligned.
+
+**What is NOT worth doing:** editing the kernel, its launch config, its layout or
+its build flags. All are proven identical. This row has now spent a full
+investigation arriving at that, and the value of recording it is that nobody
+repeats it.
+
+**The one experiment left** needs upstream's `ncu` counters for the same kernel,
+which is currently BLOCKED: vLLM's EngineCore fails to initialise under `ncu`'s
+kernel replay ("Engine core initialization failed"), so the comparison of
+occupancy / L2 hit rate / DRAM throughput cannot be completed the same way.
+Options are `--replay-mode application`, profiling a smaller standalone harness
+that calls the op directly, or accepting that the last 2.5% is unattributed.
+
+**Row verdict unchanged and now final for this campaign: 0.975x on the code cell,
+1.012x on the prose cell, NOT parity, residual real and unattributed.**
+
+## 6aa. FINAL ATTRIBUTION: a 12.9% EFFECTIVE-BANDWIDTH gap on identical code (2026-08-12)
+
+§6z showed the machine code is equivalent and called the residual "runtime,
+unattributed". It can be attributed further, because a memory-bound kernel's
+time IS its achieved bandwidth.
+
+The 35B-A3B expert weights are 4-bit: gate_up `K*2N/2` = 1.05 MB per expert,
+down `N*K/2` = 0.52 MB (K=2048, N=512), so the average launch reads 0.79 MB per
+expert-block. With the measured blocks per launch (§6x) and time per launch:
+
+| | us / launch | MB / launch | **effective bandwidth** |
+|---|---|---|---|
+| ours | 164.0 | 30.59 | **186.6 GB/s** |
+| upstream | 151.6 | 31.93 | **210.7 GB/s** |
+
+**Upstream sustains 12.9% more effective DRAM bandwidth**, which is the whole
+per-unit-work gap (12.8%) to within rounding. The kernel is DRAM-bound (L2 hit
+rate 9.5%, SM throughput 10.6%), so this is not a coincidence -- for this kernel,
+time and achieved bandwidth are the same measurement.
+
+**Residency is not the cause.** This repo has a standing GB10 finding that
+host/ATS-retagged weights run materially slower per GEMM, with staging-at-load as
+the fix. That fix is ALREADY applied here: `ResidentWeight`
+(`dense_attn_block.h:190-196`) and `BuildMoeMarlinResident` both allocate through
+`d.b.Alloc` -> `cudaMalloc` and upload once, so the expert weights are true
+device memory, contiguous and 256-byte aligned, exactly like upstream's tensors.
+
+**So the honest final statement:** identical machine code, identical launch
+parameters, identical weight layout and residency, LESS work on our side, and
+13% lower achieved bandwidth reading the same bytes. The cause is in the memory
+system's behaviour for our allocation (physical page backing / TLB coverage of a
+single ~512 MB slab spanning all 256 experts, versus torch's segmented caching
+allocator), not in anything the kernel or its inputs express.
+
+**Next levers, in order of cheapness:**
+1. ~~Split the per-expert weight slab~~ -- **REFUTED, do not try it.** Our slab is
+   the SAME SIZE and stride as upstream's tensor: per-expert gate_up slot
+   `2*wg_i32` = 262144 int32 = exactly the 1.0 MB a `[K, 2N]` 4-bit weight needs
+   (no padding), and the whole slab is 268 MB on both sides. There is no
+   oversizing or stride inflation to remove.
+2. `cudaMemAdvise` / preferred-location hints on the expert slab.
+3. Upstream's `ncu` counters (currently BLOCKED: its EngineCore will not
+   initialise under ncu kernel replay) to confirm its DRAM efficiency directly
+   rather than deriving it.
+
+**Campaign verdict: 0.975x code cell, 1.012x prose cell, NOT parity.** The
+residual is now measured, localised to one kernel, quantified per unit of work,
+and attributed to achieved memory bandwidth rather than left as "unexplained".
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

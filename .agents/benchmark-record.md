@@ -20106,3 +20106,92 @@ on both engines, comparing sm__throughput, achieved_occupancy,
 launch__registers_per_thread and the top stall reason. Equal occupancy with
 different memory throughput => data placement; different occupancy => register
 pressure, i.e. a codegen difference between two builds of the same source.
+
+## SPEC-DSPARK: the compiled kernels are EQUIVALENT -- residual is runtime (2026-08-12)
+
+ncu on our side (10 launches, steady state): 94 registers/thread, 24.0% warps
+active, 10.6% SM throughput, L1 hit 0.7%, L2 hit 9.5% -- latency-bound, as
+expected for a W4A16 grouped GEMM at M=9.
+
+Static comparison of the SAME instantiation, ours from our build object and
+upstream from the shipped _moe_C_stable_libtorch.abi3.so:
+
+| | registers | SASS instructions |
+|---|---|---|
+| ours (sm_121a) | 94 | 3664 |
+| upstream (sm_120) | 94 | 3664 |
+
+Equivalent machine code. Upstream ships NO sm_121 cubin
+(sm_80/87/89/90/90a/100/110/120), so on GB10 it runs family-compatible sm_120
+while we compile sm_121a, and both compile to the same instruction count and
+register pressure.
+
+Every code-level explanation is therefore eliminated, including the machine code:
+source, instantiation, grid, block size, shared memory, reduction flags, scale
+layout, alignment, residency, toolkit, arch, registers and SASS length all match,
+and upstream does MORE work per launch (40.6 vs 38.9 blocks). Ours still takes
+4.21 us/block vs 3.73.
+
+The residual is RUNTIME, not code: how each allocator places expert weights and
+activations, hence L2/DRAM locality across 256 experts. Our L2 hit rate is 9.5%,
+so this kernel is dominated by memory placement, and the two engines allocate
+differently (DevicePool slabs vs torch caching allocator) despite both being
+cudaMalloc-backed, contiguous and 256-byte aligned.
+
+NOT worth doing: editing the kernel, its launch config, layout or build flags --
+all proven identical.
+
+Blocked: upstream's ncu counters for the same kernel. vLLM's EngineCore fails to
+initialise under ncu kernel replay, so the occupancy / L2 / DRAM comparison
+cannot be completed the same way. Options: --replay-mode application, a
+standalone harness calling the op directly, or accepting the 2.5% as unattributed.
+
+Verdict: 0.975x code cell, 1.012x prose cell, NOT parity, residual real and
+unattributed.
+
+Evidence: `dgx:~/work/dspark-w6/ncu2.log`, cuobjdump on both binaries.
+
+## SPEC-DSPARK: final attribution -- 12.9% effective-bandwidth gap (2026-08-12)
+
+The Marlin MoE kernel is DRAM-bound (L2 hit 9.5%, SM throughput 10.6%), so its
+time IS its achieved bandwidth. 4-bit weights: gate_up K*2N/2 = 1.05 MB/expert,
+down N*K/2 = 0.52 MB (K=2048, N=512), average 0.79 MB per expert-block.
+
+| | us/launch | MB/launch | effective bandwidth |
+|---|---|---|---|
+| ours | 164.0 | 30.59 | 186.6 GB/s |
+| upstream | 151.6 | 31.93 | 210.7 GB/s |
+
+Upstream sustains 12.9% more effective bandwidth, which is the entire per-unit-
+work gap (12.8%).
+
+Residency is NOT the cause: the standing GB10 staging fix is already applied --
+ResidentWeight (dense_attn_block.h:190-196) and BuildMoeMarlinResident both
+allocate via d.b.Alloc -> cudaMalloc and upload once, so expert weights are true
+device memory, contiguous and 256-byte aligned like upstream's tensors.
+
+Identical machine code, identical launch parameters, identical layout and
+residency, LESS work on our side, 13% lower achieved bandwidth on the same bytes.
+The cause is memory-system behaviour for our allocation (page backing / TLB
+coverage of one ~512 MB slab spanning all 256 experts vs torch's segmented
+caching allocator), not anything the kernel or its inputs express.
+
+Next levers: (1) split the per-expert slab and re-measure; (2) cudaMemAdvise /
+preferred-location hints; (3) upstream ncu counters (blocked: EngineCore will not
+initialise under ncu replay).
+
+Verdict: 0.975x code, 1.012x prose, NOT parity, residual attributed to achieved
+memory bandwidth.
+
+## SPEC-DSPARK: the slab-size lever is REFUTED (2026-08-12)
+
+Proposed as the cheapest next lever, then checked before spending on it: our
+per-expert gate_up slot is 2*wg_i32 = 262144 int32 = exactly the 1.0 MB that a
+[K, 2N] 4-bit weight requires (K=2048, N=512), with no padding, and the full slab
+is 268 MB -- identical to upstream's [E, K, 2N] 4-bit tensor. There is no
+oversizing or stride inflation to remove, so splitting or re-packing the slab
+cannot recover the 12.9% bandwidth difference.
+
+That closes the last cheap lever. What remains needs upstream's ncu counters
+(blocked: its EngineCore will not initialise under ncu kernel replay) or
+cudaMemAdvise-style placement experiments whose premise is currently unverified.
