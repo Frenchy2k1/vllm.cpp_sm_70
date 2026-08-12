@@ -42,6 +42,52 @@ WINDOWS_EXCLUDED_SOURCE = "src/vt/cuda/nvfp4_persistent_cache.cpp"
 POWERSHELL_AUDIT_PATH_ENV = "VLLM_CPP_POWERSHELL_AUDIT_PATH"
 
 
+def _has_central_msvc_nominmax(cmake: str) -> bool:
+    """Return whether root CMake defines NOMINMAX before creating targets."""
+    active = re.sub(r"(?m)#.*$", "", cmake)
+    first_target = re.search(
+        r"(?im)^\s*(?:add_library|add_executable|add_subdirectory)\s*\(",
+        active,
+    )
+    contract = re.search(
+        r"(?ims)^\s*if\s*\(\s*MSVC\s*\)\s*$"
+        r"(?:(?!^\s*endif\b).)*?"
+        r"^\s*add_compile_definitions\s*\([^)]*\bNOMINMAX\b[^)]*\)",
+        active,
+    )
+    return contract is not None and (
+        first_target is None or contract.start() < first_target.start()
+    )
+
+
+def _local_nominmax_definitions(source: str) -> list[tuple[int, bool]]:
+    """Return local NOMINMAX definition lines and whether absence-guarded."""
+    definitions: list[tuple[int, bool]] = []
+    absence_guards: list[bool] = []
+    for number, line in enumerate(without_cpp_comments(source).splitlines(), 1):
+        match = re.match(r"\s*#\s*(\w+)(.*)$", line)
+        if match is None:
+            continue
+        kind, tail = match.group(1), match.group(2).strip()
+        guard = bool(
+            re.fullmatch(r"NOMINMAX", tail) if kind == "ifndef" else
+            kind in {"if", "elif"} and re.fullmatch(
+                r"!\s*defined\s*(?:\(\s*NOMINMAX\s*\)|NOMINMAX)", tail
+            )
+        )
+        if kind in {"if", "ifdef", "ifndef"}:
+            absence_guards.append(guard)
+        elif kind in {"else", "elif"}:
+            if absence_guards:
+                absence_guards[-1] = guard if kind == "elif" else False
+        elif kind == "endif":
+            if absence_guards:
+                absence_guards.pop()
+        elif kind == "define" and re.match(r"NOMINMAX\b", tail):
+            definitions.append((number, any(absence_guards)))
+    return definitions
+
+
 def windows_excluded_sources(root: Path) -> set[str]:
     """Return sources proven by CMake to be absent specifically on WIN32."""
     text = (root / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -1678,6 +1724,26 @@ def check(root: Path, build_dir: Path | None = None,
                for _, line in windows_possible_lines(active_source)):
             errors.append(f"{relative}: non-portable compiler builtin reaches MSVC")
 
+    central_nominmax = _has_central_msvc_nominmax(cmake)
+    for relative, source in texts.items():
+        definitions = _local_nominmax_definitions(source)
+        for line, guarded in definitions:
+            if not guarded:
+                errors.append(
+                    f"{relative}:{line}: unguarded source-local NOMINMAX is forbidden"
+                )
+        windows_header = re.search(
+            r"(?m)^\s*#\s*include\s*<windows\.h>", without_cpp_comments(source)
+        )
+        if windows_header is None or central_nominmax:
+            continue
+        header_line = source.count("\n", 0, windows_header.start()) + 1
+        if not any(guarded and line < header_line for line, guarded in definitions):
+            errors.append(
+                f"{relative}: NOMINMAX must be defined centrally or by an "
+                "absence-guarded local fallback before windows.h"
+            )
+
     server = "\n".join(texts.get(name, "") for name in REQUIRED_CPP[:3])
     for marker in ("CreateProcessW", "SetConsoleCtrlHandler"):
         if marker not in server:
@@ -1694,8 +1760,6 @@ def check(root: Path, build_dir: Path | None = None,
     fs_io = texts.get("src/vllm/v1/kv_offload/fs_io.cpp", "")
     if not all(marker in fs_io for marker in ("CreateFileW", "FlushFileBuffers", "MoveFileExW")):
         errors.append("fs_io.cpp: Windows KV filesystem support is missing or silently disabled")
-    if "#define NOMINMAX" not in fs_io:
-        errors.append("fs_io.cpp: NOMINMAX must precede windows.h")
     if "CREATE_NEW" not in fs_io:
         errors.append("fs_io.cpp: exclusive temporary creation requires CREATE_NEW")
     if not all(flag in fs_io for flag in ("MOVEFILE_REPLACE_EXISTING", "MOVEFILE_WRITE_THROUGH")):

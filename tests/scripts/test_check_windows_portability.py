@@ -30,6 +30,7 @@ SAFE_FILES = {
     "CMakeLists.txt": """
         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
         if(MSVC)
+          add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
           add_compile_options(/fp:strict /W4 /WX)
         else()
           add_compile_options(-ffp-contract=off)
@@ -127,7 +128,7 @@ SAFE_FILES = {
     """,
     "src/vllm/v1/kv_offload/fs_io.cpp": """
         #ifdef _WIN32
-        #define NOMINMAX
+        #include <windows.h>
         CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL, nullptr); CREATE_NEW;
         FlushFileBuffers(file);
@@ -642,11 +643,12 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
 
     def test_pins_windows_file_publish_and_header_contracts(self) -> None:
         fs = textwrap.dedent(SAFE_FILES["src/vllm/v1/kv_offload/fs_io.cpp"])
-        self.assert_rejected(
-            "src/vllm/v1/kv_offload/fs_io.cpp",
-            fs.replace("#define NOMINMAX\n", ""),
-            "NOMINMAX",
+        cmake = textwrap.dedent(SAFE_FILES["CMakeLists.txt"]).replace(
+            "add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)", ""
         )
+        result = self.run_checker(self.make_tree({"CMakeLists.txt": cmake}))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("NOMINMAX", result.stdout + result.stderr)
         self.assert_rejected(
             "src/vllm/v1/kv_offload/fs_io.cpp",
             fs.replace("CREATE_NEW", "CREATE_ALWAYS"),
@@ -657,6 +659,49 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             fs.replace("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH",
                        "MOVEFILE_REPLACE_EXISTING"),
             "MOVEFILE_WRITE_THROUGH",
+        )
+
+    def test_nominmax_contract_follows_central_compile_definition(self) -> None:
+        cmake = textwrap.dedent(SAFE_FILES["CMakeLists.txt"])
+        fs = textwrap.dedent(SAFE_FILES["src/vllm/v1/kv_offload/fs_io.cpp"])
+        central = "add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)"
+
+        result = self.run_checker(self.make_tree())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        without_central = cmake.replace(central, "")
+        result = self.run_checker(self.make_tree({"CMakeLists.txt": without_central}))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("NOMINMAX", result.stdout + result.stderr)
+
+        guarded = fs.replace(
+            "#include <windows.h>",
+            "#ifndef NOMINMAX\n#define NOMINMAX\n#endif\n#include <windows.h>",
+        )
+        result = self.run_checker(self.make_tree({
+            "CMakeLists.txt": without_central,
+            "src/vllm/v1/kv_offload/fs_io.cpp": guarded,
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        late_fallback = fs.replace(
+            "#include <windows.h>",
+            "#include <windows.h>\n#ifndef NOMINMAX\n#define NOMINMAX\n#endif",
+        )
+        result = self.run_checker(self.make_tree({
+            "CMakeLists.txt": without_central,
+            "src/vllm/v1/kv_offload/fs_io.cpp": late_fallback,
+        }))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("before windows.h", result.stdout + result.stderr)
+
+        unguarded = fs.replace(
+            "#include <windows.h>", "#define NOMINMAX\n#include <windows.h>"
+        )
+        self.assert_rejected(
+            "src/vllm/v1/kv_offload/fs_io.cpp",
+            unguarded,
+            "unguarded source-local NOMINMAX",
         )
 
     def test_pins_peer_close_invalidation(self) -> None:

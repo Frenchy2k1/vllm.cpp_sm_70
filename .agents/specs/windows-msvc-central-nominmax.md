@@ -114,3 +114,15 @@ loader, backend, and cross-device tests passed. The Vulkan-configured API test
 retains the two embedding HTTP-500 failures already tracked independently by
 #461; the same CPU-configured test passes 54/54. Native MSVC CPU/Vulkan reruns
 remain required and are not inferred from Linux.
+
+Fresh review found that the production portability checker still required the
+removed source-local definition in `fs_io.cpp`, contradicting the central
+contract above. The repaired checker derives the early command-line contract
+from the root MSVC CMake block, rejects unguarded local definitions throughout
+its shipped-server closure, and requires an absence-guarded fallback before
+`windows.h` whenever the central contract is absent. The new controlled test
+failed first with the exact stale `fs_io.cpp: NOMINMAX must precede windows.h`
+diagnostic. After the checker repair, all five central/local/order cases pass.
+Removing central `NOMINMAX` from the real tree makes the direct checker reject
+the five affected shipped-closure translation units; restoring it makes the
+direct production checker pass.
