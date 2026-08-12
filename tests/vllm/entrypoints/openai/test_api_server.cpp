@@ -30,6 +30,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -56,6 +61,8 @@
 #include "vllm/entrypoints/openai/serving_models.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/platform/console_shutdown.h"
+#include "vllm/platform/process.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -2580,3 +2587,79 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
   h.server.stop();
   server_thread.join();
 }
+
+TEST_CASE("platform process: Windows command line preserves every argv byte") {
+  const std::vector<std::wstring> argv = {
+      L"ffmpeg", L"two words", L"C:\\path\\", L"a\"b", L""};
+  const std::wstring expected =
+      LR"cmd("ffmpeg" "two words" "C:\path\\" "a\"b" "")cmd";
+  CHECK(vllm::platform::BuildWindowsCommandLine(argv) == expected);
+}
+
+#if !defined(_WIN32)
+TEST_CASE("platform process: direct argv runner propagates the child exit") {
+  CHECK(vllm::platform::RunProcessArgv({"/bin/sh", "-c", "exit 23"}) == 23);
+}
+#endif
+
+TEST_CASE("platform shutdown: a stop request is thread-safe and idempotent") {
+  std::atomic<int> stops{0};
+  vllm::platform::ConsoleShutdown shutdown([&]() { ++stops; }, false);
+  shutdown.RequestStop();
+  shutdown.RequestStop();
+  CHECK(stops.load() == 1);
+}
+
+#if defined(_WIN32)
+TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
+  constexpr DWORD kWaitMs = 5000;
+  HANDLE acquired = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE before_drain = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  REQUIRE(acquired != nullptr);
+  REQUIRE(resume != nullptr);
+  REQUIRE(before_drain != nullptr);
+  std::atomic<int> stops{0};
+  std::atomic<bool> destroyed{false};
+  auto shutdown = std::make_unique<vllm::platform::ConsoleShutdown>(
+      [&]() { ++stops; });
+  shutdown->SetBeforeDrainEventForTest(before_drain);
+  std::thread handler([&] {
+    CHECK(vllm::platform::ConsoleShutdown::DispatchControlEventForTest(
+        CTRL_BREAK_EVENT, acquired, resume));
+  });
+  const DWORD acquired_result = WaitForSingleObject(acquired, kWaitMs);
+  if (acquired_result != WAIT_OBJECT_0) {
+    SetEvent(resume);
+    handler.join();
+    shutdown.reset();
+    CloseHandle(before_drain);
+    CloseHandle(resume);
+    CloseHandle(acquired);
+    FAIL("console handler did not acquire state within timeout");
+  }
+  std::thread destroyer([&] {
+    shutdown.reset();
+    destroyed.store(true, std::memory_order_release);
+  });
+  const DWORD drain_result = WaitForSingleObject(before_drain, kWaitMs);
+  if (drain_result != WAIT_OBJECT_0) {
+    SetEvent(resume);
+    handler.join();
+    destroyer.join();
+    CloseHandle(before_drain);
+    CloseHandle(resume);
+    CloseHandle(acquired);
+    FAIL("console teardown did not reach drain within timeout");
+  }
+  CHECK_FALSE(destroyed.load(std::memory_order_acquire));
+  REQUIRE(SetEvent(resume) != 0);
+  handler.join();
+  destroyer.join();
+  CHECK(destroyed.load(std::memory_order_acquire));
+  CHECK(stops.load() == 1);
+  CloseHandle(before_drain);
+  CloseHandle(resume);
+  CloseHandle(acquired);
+}
+#endif

@@ -187,6 +187,27 @@ TEST_CASE("LogprobsTensors::empty_cpu has the right shapes") {
   CHECK(lt.selected_token_ranks.size() == 3);
 }
 
+TEST_CASE("LogprobsTensors::slice_request preserves a multi-row payload") {
+  LogprobsTensors lt = LogprobsTensors::empty_cpu(/*num_positions=*/4,
+                                                  /*num_tokens=*/3);
+  lt.logprob_token_ids = {10, 11, 12, 20, 21, 22,
+                          30, 31, 32, 40, 41, 42};
+  lt.logprobs = {-1.0f, -1.1f, -1.2f, -2.0f, -2.1f, -2.2f,
+                 -3.0f, -3.1f, -3.2f, -4.0f, -4.1f, -4.2f};
+  lt.selected_token_ranks = {1, 2, 3, 4};
+
+  const LogprobsTensors slice = lt.slice_request(/*req_idx=*/1,
+                                                  /*num_positions=*/2);
+
+  CHECK(slice.num_positions == 2);
+  CHECK(slice.num_tokens_per_position == 3);
+  CHECK(slice.logprob_token_ids ==
+        std::vector<int32_t>{20, 21, 22, 30, 31, 32});
+  CHECK(slice.logprobs ==
+        std::vector<float>{-2.0f, -2.1f, -2.2f, -3.0f, -3.1f, -3.2f});
+  CHECK(slice.selected_token_ranks == std::vector<int32_t>{2, 3});
+}
+
 TEST_CASE("SamplerOutput now carries an optional LogprobsTensors payload") {
   SamplerOutput out;
   out.sampled_token_ids = {{42}, {7}};

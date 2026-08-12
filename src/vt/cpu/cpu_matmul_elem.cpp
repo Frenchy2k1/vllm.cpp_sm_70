@@ -2,6 +2,7 @@
 // anchors and the recorded "vectorize across OUTPUT columns, not along K"
 // deviation that keeps every result bit-identical to the scalar reference.
 #include "cpu_matmul_elem.h"
+#include "vt/cpu/cpu_matmul_elem_f16c.h"
 #include "vt/cpu/cpu_isa_arm.h"
 #include "vt/cpu/cpu_isa_x86.h"
 #include "vt/quant.h"
@@ -375,46 +376,6 @@ void BtM2Sse2(const float* af, int64_t a_stride, const void* bv, int64_t k, floa
   }
 }
 
-__attribute__((target("f16c"))) void BtM2F16c(const float* af, int64_t a_stride, const void* bv,
-                                              int64_t k, float* acc) {
-  const uint16_t* b = static_cast<const uint16_t*>(bv);
-  __m128 A[kMrSse2][4];
-  for (int r = 0; r < kMrSse2; ++r) {
-    for (int g = 0; g < 4; ++g) A[r][g] = _mm_setzero_ps();
-  }
-  int64_t p = 0;
-  for (; p + 4 <= k; p += 4) {
-    for (int g = 0; g < 4; ++g) {
-      const uint16_t* br = b + static_cast<int64_t>(4 * g) * k + p;
-      __m128 w0 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br)));
-      __m128 w1 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br + k)));
-      __m128 w2 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br + 2 * k)));
-      __m128 w3 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br + 3 * k)));
-      _MM_TRANSPOSE4_PS(w0, w1, w2, w3);
-      for (int r = 0; r < kMrSse2; ++r) {
-        const __m128 av = _mm_loadu_ps(af + r * a_stride + p);
-        __m128 s = A[r][g];
-        s = _mm_add_ps(s, _mm_mul_ps(w0, _mm_shuffle_ps(av, av, 0x00)));
-        s = _mm_add_ps(s, _mm_mul_ps(w1, _mm_shuffle_ps(av, av, 0x55)));
-        s = _mm_add_ps(s, _mm_mul_ps(w2, _mm_shuffle_ps(av, av, 0xAA)));
-        s = _mm_add_ps(s, _mm_mul_ps(w3, _mm_shuffle_ps(av, av, 0xFF)));
-        A[r][g] = s;
-      }
-    }
-  }
-  for (int r = 0; r < kMrSse2; ++r) {
-    for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + r * kElemLanes + 4 * g, A[r][g]);
-  }
-  for (int64_t pt = p; pt < k; ++pt) {
-    for (int r = 0; r < kMrSse2; ++r) {
-      const float av = af[r * a_stride + pt];
-      for (int l = 0; l < kElemLanes; ++l) {
-        acc[r * kElemLanes + l] += av * F16ToF32(b[static_cast<int64_t>(l) * k + pt]);
-      }
-    }
-  }
-}
-
 template <ElemKind K>
 void Nk16Sse2(const float* af, const void* bv, int64_t k, int64_t n, float* acc) {
   const typename Elem<K>::T* b = static_cast<const typename Elem<K>::T*>(bv);
@@ -427,78 +388,6 @@ void Nk16Sse2(const float* af, const void* bv, int64_t k, int64_t n, float* acc)
     }
   }
   for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + 4 * g, A[g]);
-}
-
-__attribute__((target("f16c"))) void Bt16F16c(const float* af, const void* bv, int64_t k,
-                                              float* acc) {
-  const uint16_t* b = static_cast<const uint16_t*>(bv);
-  __m128 A[4] = {_mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps()};
-  int64_t p = 0;
-  for (; p + 4 <= k; p += 4) {
-    const __m128 av = _mm_loadu_ps(af + p);
-    for (int g = 0; g < 4; ++g) {
-      const uint16_t* br = b + static_cast<int64_t>(4 * g) * k + p;
-      __m128 r0 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br)));
-      __m128 r1 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br + k)));
-      __m128 r2 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br + 2 * k)));
-      __m128 r3 = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(br + 3 * k)));
-      _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
-      __m128 s = A[g];
-      s = _mm_add_ps(s, _mm_mul_ps(r0, _mm_shuffle_ps(av, av, 0x00)));
-      s = _mm_add_ps(s, _mm_mul_ps(r1, _mm_shuffle_ps(av, av, 0x55)));
-      s = _mm_add_ps(s, _mm_mul_ps(r2, _mm_shuffle_ps(av, av, 0xAA)));
-      s = _mm_add_ps(s, _mm_mul_ps(r3, _mm_shuffle_ps(av, av, 0xFF)));
-      A[g] = s;
-    }
-  }
-  for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + 4 * g, A[g]);
-  for (; p < k; ++p) {
-    const float av = af[p];
-    for (int l = 0; l < kElemLanes; ++l) {
-      acc[l] += av * F16ToF32(b[static_cast<int64_t>(l) * k + p]);
-    }
-  }
-}
-
-__attribute__((target("f16c"))) void Nk16F16c(const float* af, const void* bv, int64_t k,
-                                              int64_t n, float* acc) {
-  const uint16_t* b = static_cast<const uint16_t*>(bv);
-  __m128 A[4] = {_mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps()};
-  for (int64_t p = 0; p < k; ++p) {
-    const __m128 av = _mm_set1_ps(af[p]);
-    const uint16_t* row = b + p * n;
-    for (int g = 0; g < 4; ++g) {
-      const __m128 v =
-          _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + 4 * g)));
-      A[g] = _mm_add_ps(A[g], _mm_mul_ps(v, av));
-    }
-  }
-  for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + 4 * g, A[g]);
-}
-
-// M-blocked [K,N] f16 under F16C, sibling of Nk16F16c. Separate from
-// NkM2Sse2<kF16> because the f16 widen needs the F16C target attribute, which
-// is exactly how Bt16F16c/BtM2F16c are already handled.
-__attribute__((target("f16c"))) void NkM2F16c(const float* af, int64_t a_stride,
-                                              const void* bv, int64_t k, int64_t n,
-                                              float* acc) {
-  const uint16_t* b = static_cast<const uint16_t*>(bv);
-  __m128 A[kMrSse2][4];
-  for (int r = 0; r < kMrSse2; ++r)
-    for (int g = 0; g < 4; ++g) A[r][g] = _mm_setzero_ps();
-  for (int64_t p = 0; p < k; ++p) {
-    const uint16_t* row = b + p * n;
-    __m128 w[4];
-    for (int g = 0; g < 4; ++g) {
-      w[g] = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + 4 * g)));
-    }
-    for (int r = 0; r < kMrSse2; ++r) {
-      const __m128 av = _mm_set1_ps(af[r * a_stride + p]);
-      for (int g = 0; g < 4; ++g) A[r][g] = _mm_add_ps(A[r][g], _mm_mul_ps(w[g], av));
-    }
-  }
-  for (int r = 0; r < kMrSse2; ++r)
-    for (int g = 0; g < 4; ++g) _mm_storeu_ps(acc + r * kElemLanes + 4 * g, A[r][g]);
 }
 
 #endif  // x86-64
@@ -612,11 +501,7 @@ ElemGemmTierTable BuildTier() {
   if (selected == X86IsaTier::kSse2F16c ||
       selected == X86IsaTier::kAvx2 ||
       selected == X86IsaTier::kAvx512) {
-    t.bt[kF16] = &Bt16F16c;
-    t.nk[kF16] = &Nk16F16c;
-    t.btm[kF16] = &BtM2F16c;
-    t.nkm[kF16] = &NkM2F16c;
-    t.name = "sse2+f16c";
+    FillF16cTier(&t);
   }
   if (selected == X86IsaTier::kSse2F16c) return t;
   if (selected == X86IsaTier::kAvx2 || selected == X86IsaTier::kAvx512) {

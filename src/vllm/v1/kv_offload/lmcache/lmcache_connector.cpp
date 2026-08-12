@@ -262,8 +262,10 @@ std::unique_ptr<KVConnector> LMCacheConnector::CreateFromConfig(
   // identity is folded into the key's model_name + dtype).
   if (ctx.identity != nullptr) {
     conn_cfg.model_name = ctx.identity->model_name;
-    conn_cfg.num_layers = ctx.identity->num_hidden_layers;
-    conn_cfg.hidden_dim = ctx.identity->num_kv_heads * ctx.identity->head_size;
+    conn_cfg.num_layers =
+        static_cast<int>(ctx.identity->num_hidden_layers);
+    conn_cfg.hidden_dim = static_cast<int>(
+        ctx.identity->num_kv_heads * ctx.identity->head_size);
     const std::string& kd = ctx.identity->kv_dtype;
     if (kd == "bf16" || kd == "bfloat16") {
       conn_cfg.dtype = Dtype::kBFloat16;

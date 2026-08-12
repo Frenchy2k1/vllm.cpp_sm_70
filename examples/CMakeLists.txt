@@ -178,6 +178,7 @@ if(VLLM_CPP_SERVER)
       --build-dir ${CMAKE_BINARY_DIR}
       --stage-dir ${_vllm_server_stage_dir}
       --archive ${_vllm_server_archive}
+      --archive-format tar.gz
       --config $<CONFIG>
     DEPENDS server ${CMAKE_SOURCE_DIR}/scripts/package-server.py
     BYPRODUCTS ${_vllm_server_archive}

@@ -10,6 +10,8 @@
 #include <variant>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/read_only_file_mapping.h"
+
 namespace vllm {
 
 // The read-only mapping of ONE .gguf file, refcounted. `GgufFile` holds one
@@ -20,9 +22,6 @@ namespace vllm {
 // safe to outlive the `GgufFile` value it came from — the entrypoint's
 // `GgufFile` local is destroyed as soon as the model is built.
 struct GgufMapping {
-  int fd = -1;
-  void* addr = nullptr;
-  size_t size = 0;
   // Extra shard mappings kept alive by THIS (primary) mapping, for a multi-file
   // split GGUF (llama.cpp `gguf-split`, "...-00001-of-00003.gguf"). A merged
   // GgufFile exposes ONE mapping (this one) via Mapping(); a borrowed span in
@@ -30,11 +29,16 @@ struct GgufMapping {
   // the whole file. Empty for a normal single-file open. Destroyed after this
   // mapping's own munmap (member-destruction order), releasing each shard.
   std::vector<std::shared_ptr<const GgufMapping>> siblings;
+  // The one platform mapping owned by this logical shard. Declared after
+  // siblings so it is destroyed first, preserving the existing primary-then-
+  // sibling cleanup order. Bytes are immutable and native handles close at the
+  // last borrow.
+  std::shared_ptr<const detail::ReadOnlyFileMapping> file;
 
   GgufMapping() = default;
   GgufMapping(const GgufMapping&) = delete;
   GgufMapping& operator=(const GgufMapping&) = delete;
-  ~GgufMapping();
+  ~GgufMapping() = default;
 };
 
 // GGUF metadata value type ids (wire format).

@@ -4,12 +4,18 @@
 // and the two deliberate omissions (O_DIRECT, the GIL-releasing extension).
 #include "vllm/v1/kv_offload/fs_io.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +27,179 @@
 
 namespace vllm::v1::kv_offload {
 namespace {
+
+std::filesystem::path NativePath(const std::string& utf8) {
+#if defined(_WIN32)
+  const std::u8string value(
+      reinterpret_cast<const char8_t*>(utf8.data()), utf8.size());
+  return std::filesystem::path(value);
+#else
+  return std::filesystem::path(utf8);
+#endif
+}
+
+uint64_t ProcessId() {
+#if defined(_WIN32)
+  return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+  return static_cast<uint64_t>(::getpid());
+#endif
+}
+
+#if defined(_WIN32)
+using NativeFile = HANDLE;
+const NativeFile kInvalidFile = INVALID_HANDLE_VALUE;
+#else
+using NativeFile = int;
+constexpr NativeFile kInvalidFile = -1;
+#endif
+
+std::string FileError(const char* operation, const std::string& path) {
+#if defined(_WIN32)
+  const DWORD error = GetLastError();
+  return std::string("kv_offload: ") + operation + " '" + path +
+         "' failed with Win32 error " + std::to_string(error);
+#else
+  return std::string("kv_offload: ") + operation + " '" + path + "': " +
+         std::strerror(errno);
+#endif
+}
+
+void CloseFile(NativeFile file) {
+  if (file == kInvalidFile) return;
+#if defined(_WIN32)
+  CloseHandle(file);
+#else
+  ::close(file);
+#endif
+}
+
+NativeFile CreateExclusiveFile(const std::string& path) {
+#if defined(_WIN32)
+  return CreateFileW(NativePath(path).c_str(), GENERIC_WRITE, 0, nullptr,
+                     CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+  return ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_TRUNC, 0644);
+#endif
+}
+
+NativeFile OpenReadFile(const std::string& path, bool* missing) {
+  *missing = false;
+#if defined(_WIN32)
+  NativeFile file =
+      CreateFileW(NativePath(path).c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == kInvalidFile) {
+    const DWORD error = GetLastError();
+    *missing = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+  }
+  return file;
+#else
+  NativeFile file = ::open(path.c_str(), O_RDONLY);
+  if (file == kInvalidFile) *missing = errno == ENOENT;
+  return file;
+#endif
+}
+
+void WriteCompleteAt(NativeFile file, const std::string& path,
+                     const char* data, size_t size, uint64_t offset) {
+  size_t written = 0;
+  while (written < size) {
+#if defined(_WIN32)
+    const uint64_t position = offset + written;
+    LARGE_INTEGER location{};
+    location.QuadPart = static_cast<LONGLONG>(position);
+    if (!SetFilePointerEx(file, location, nullptr, FILE_BEGIN)) {
+      throw std::runtime_error(FileError("seek", path));
+    }
+    const DWORD chunk = static_cast<DWORD>(
+        std::min(size - written, static_cast<size_t>(MAXDWORD)));
+    DWORD count = 0;
+    if (!WriteFile(file, data + written, chunk, &count, nullptr)) {
+      throw std::runtime_error(FileError("write", path));
+    }
+    if (count == 0) {
+      throw std::runtime_error("kv_offload: short write on '" + path + "'");
+    }
+    written += count;
+#else
+    const ssize_t count =
+        ::pwrite(file, data + written, size - written,
+                 static_cast<off_t>(offset + written));
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) {
+      throw std::runtime_error(FileError("short write on", path));
+    }
+    written += static_cast<size_t>(count);
+#endif
+  }
+}
+
+void ReadCompleteAt(NativeFile file, const std::string& path, char* data,
+                    size_t size, uint64_t offset) {
+  size_t got = 0;
+  while (got < size) {
+#if defined(_WIN32)
+    const uint64_t position = offset + got;
+    LARGE_INTEGER location{};
+    location.QuadPart = static_cast<LONGLONG>(position);
+    if (!SetFilePointerEx(file, location, nullptr, FILE_BEGIN)) {
+      throw std::runtime_error(FileError("seek", path));
+    }
+    const DWORD chunk = static_cast<DWORD>(
+        std::min(size - got, static_cast<size_t>(MAXDWORD)));
+    DWORD count = 0;
+    if (!ReadFile(file, data + got, chunk, &count, nullptr)) {
+      throw std::runtime_error(FileError("read", path));
+    }
+    if (count == 0) {
+      throw std::runtime_error("kv_offload: short read on '" + path +
+                               "' (file is truncated)");
+    }
+    got += count;
+#else
+    const ssize_t count =
+        ::pread(file, data + got, size - got,
+                static_cast<off_t>(offset + got));
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) throw std::runtime_error(FileError("read", path));
+    if (count == 0) {
+      throw std::runtime_error("kv_offload: short read on '" + path +
+                               "' (file is truncated)");
+    }
+    got += static_cast<size_t>(count);
+#endif
+  }
+}
+
+void FlushFile(NativeFile file, const std::string& path) {
+#if defined(_WIN32)
+  if (!FlushFileBuffers(file)) {
+    throw std::runtime_error(FileError("flush", path));
+  }
+#else
+  if (::fsync(file) != 0) {
+    throw std::runtime_error(FileError("flush", path));
+  }
+#endif
+}
+
+void PublishFile(const std::string& source, const std::string& destination) {
+#if defined(_WIN32)
+  if (!MoveFileExW(NativePath(source).c_str(), NativePath(destination).c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    throw std::runtime_error(FileError("publish", destination));
+  }
+#else
+  std::error_code ec;
+  std::filesystem::rename(source, destination, ec);
+  if (ec) {
+    throw std::system_error(ec, "kv_offload: cannot publish '" + destination +
+                                    "'");
+  }
+#endif
+}
 
 std::string ToHex(const std::string& raw) {
   static const char* kDigits = "0123456789abcdef";
@@ -64,7 +243,7 @@ const std::string& TmpSuffix() {
   static std::atomic<uint64_t> counter{0};
   static thread_local std::string suffix = [&] {
     std::string value = ".";
-    value.append(std::to_string(::getpid()));
+    value.append(std::to_string(ProcessId()));
     value.push_back('.');
     value.append(std::to_string(counter.fetch_add(1)));
     value.append(".tmp");
@@ -76,7 +255,7 @@ const std::string& TmpSuffix() {
 // Remove a file, ignoring "it was not there". Used on every failure path.
 void RemoveQuietly(const std::string& path) {
   std::error_code ec;
-  std::filesystem::remove(path, ec);
+  std::filesystem::remove(NativePath(path), ec);
 }
 
 }  // namespace
@@ -159,14 +338,14 @@ std::string FileMapper::file_name(const OffloadKey& key) const {
 
 void FileMapper::OpenOrCreate() const {
   std::error_code ec;
-  std::filesystem::create_directories(base_path_, ec);
+  std::filesystem::create_directories(NativePath(base_path_), ec);
   if (ec) {
     throw std::runtime_error("kv_offload: cannot create '" + base_path_ +
                              "': " + ec.message());
   }
   const std::string config_path = config_file_path();
 
-  std::ifstream in(config_path, std::ios::binary);
+  std::ifstream in(NativePath(config_path), std::ios::binary);
   if (in.good()) {
     // THE CHECK UPSTREAM DOES NOT DO. Upstream writes config.json once and
     // never reads it (file_mapper.py:122-126); its only defence is the path
@@ -192,30 +371,28 @@ void FileMapper::OpenOrCreate() const {
   // Absent: write it. Temp + rename so a concurrent opener never reads a
   // half-written config.
   const std::string tmp = config_path + TmpSuffix();
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out.good()) {
-      throw std::runtime_error("kv_offload: cannot write '" + tmp + "'");
-    }
-    out << identity_.ToCanonicalJson();
-    out.flush();
-    if (!out.good()) {
-      out.close();
-      RemoveQuietly(tmp);
-      throw std::runtime_error("kv_offload: short write on '" + tmp + "'");
-    }
+  NativeFile config_file = CreateExclusiveFile(tmp);
+  if (config_file == kInvalidFile) {
+    throw std::runtime_error(FileError("cannot create", tmp));
   }
-  std::filesystem::rename(tmp, config_path, ec);
-  if (ec) {
+  try {
+    const std::string contents = identity_.ToCanonicalJson();
+    WriteCompleteAt(config_file, tmp, contents.data(), contents.size(), 0);
+    FlushFile(config_file, tmp);
+    CloseFile(config_file);
+    config_file = kInvalidFile;
+    PublishFile(tmp, config_path);
+    return;
+  } catch (...) {
+    CloseFile(config_file);
     RemoveQuietly(tmp);
     // A concurrent creator winning the race is fine as long as what landed
     // agrees with us — re-enter to perform the comparison.
-    if (std::filesystem::exists(config_path)) {
+    if (std::filesystem::exists(NativePath(config_path))) {
       OpenOrCreate();
       return;
     }
-    throw std::runtime_error("kv_offload: cannot publish '" + config_path +
-                             "': " + ec.message());
+    throw;
   }
 }
 
@@ -229,101 +406,65 @@ void store_block(const std::string& dest_path, const BlockFileHeader& header,
   }
   // Existence-skip: a content-addressed block never needs rewriting
   // (io.py:42-43).
-  if (std::filesystem::exists(dest_path)) {
+  if (std::filesystem::exists(NativePath(dest_path))) {
     return;
   }
 
   std::error_code ec;
   const std::filesystem::path parent =
-      std::filesystem::path(dest_path).parent_path();
+      NativePath(dest_path).parent_path();
   std::filesystem::create_directories(parent, ec);
   if (ec) {
-    throw std::runtime_error("kv_offload: cannot create '" + parent.string() +
+    throw std::runtime_error("kv_offload: cannot create parent for '" + dest_path +
                              "': " + ec.message());
   }
 
   const std::string tmp_path = dest_path + TmpSuffix();
-  const int fd = ::open(tmp_path.c_str(),
-                        O_CREAT | O_EXCL | O_WRONLY | O_TRUNC, 0644);
-  if (fd < 0) {
-    throw std::runtime_error("kv_offload: cannot open '" + tmp_path +
-                             "': " + std::strerror(errno));
+  const NativeFile file = CreateExclusiveFile(tmp_path);
+  if (file == kInvalidFile) {
+    throw std::runtime_error(FileError("cannot create", tmp_path));
   }
-
-  const auto write_all = [&](const char* data, size_t size) {
-    size_t written = 0;
-    while (written < size) {
-      const ssize_t n = ::write(fd, data + written, size - written);
-      if (n <= 0) {
-        if (n < 0 && errno == EINTR) {
-          continue;
-        }
-        // A SHORT WRITE IS AN ERROR, never a partial block.
-        throw std::runtime_error("kv_offload: short write on '" + tmp_path +
-                                 "'");
-      }
-      written += static_cast<size_t>(n);
-    }
-  };
 
   try {
     const std::string encoded = header.Encode();
-    write_all(encoded.data(), encoded.size());
+    WriteCompleteAt(file, tmp_path, encoded.data(), encoded.size(), 0);
     if (payload_size > 0) {
-      write_all(static_cast<const char*>(payload), payload_size);
+      WriteCompleteAt(file, tmp_path, static_cast<const char*>(payload),
+                      payload_size, encoded.size());
     }
+    FlushFile(file, tmp_path);
   } catch (...) {
-    ::close(fd);
+    CloseFile(file);
     RemoveQuietly(tmp_path);
     throw;
   }
-  ::close(fd);
+  CloseFile(file);
 
   // ATOMIC PUBLISH: a reader observes either no file or a complete one.
-  std::filesystem::rename(tmp_path, dest_path, ec);
-  if (ec) {
+  try {
+    PublishFile(tmp_path, dest_path);
+  } catch (...) {
     RemoveQuietly(tmp_path);
     // Another writer publishing the identical content first is a success, not
     // a failure — the block is content-addressed.
-    if (std::filesystem::exists(dest_path)) {
+    if (std::filesystem::exists(NativePath(dest_path))) {
       return;
     }
-    throw std::runtime_error("kv_offload: cannot publish '" + dest_path +
-                             "': " + ec.message());
+    throw;
   }
 }
 
 bool load_block(const std::string& source_path,
                 const BlockFileHeader& expected, void* out,
                 size_t out_capacity) {
-  const int fd = ::open(source_path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    if (errno == ENOENT) {
+  bool missing = false;
+  const NativeFile file = OpenReadFile(source_path, &missing);
+  if (file == kInvalidFile) {
+    if (missing) {
       return false;  // an ordinary miss
     }
-    throw std::runtime_error("kv_offload: cannot open '" + source_path +
-                             "': " + std::strerror(errno));
+    throw std::runtime_error(FileError("cannot open", source_path));
   }
-
-  const auto read_all = [&](char* data, size_t size) {
-    size_t got = 0;
-    while (got < size) {
-      const ssize_t n = ::read(fd, data + got, size - got);
-      if (n == 0) {
-        // A SHORT READ IS AN ERROR: never serve a partial block.
-        throw std::runtime_error("kv_offload: short read on '" + source_path +
-                                 "' (file is truncated)");
-      }
-      if (n < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        throw std::runtime_error("kv_offload: read failed on '" + source_path +
-                                 "': " + std::strerror(errno));
-      }
-      got += static_cast<size_t>(n);
-    }
-  };
 
   try {
     if (out_capacity < expected.payload_size) {
@@ -331,7 +472,7 @@ bool load_block(const std::string& source_path,
           "kv_offload: destination buffer is smaller than the block payload");
     }
     char header_buf[kBlockHeaderBytes];
-    read_all(header_buf, kBlockHeaderBytes);
+    ReadCompleteAt(file, source_path, header_buf, kBlockHeaderBytes, 0);
     const BlockFileHeader on_disk =
         BlockFileHeader::Decode(header_buf, kBlockHeaderBytes);
 
@@ -364,17 +505,18 @@ bool load_block(const std::string& source_path,
     }
 
     if (expected.payload_size > 0) {
-      read_all(static_cast<char*>(out),
-               static_cast<size_t>(expected.payload_size));
+      ReadCompleteAt(file, source_path, static_cast<char*>(out),
+                     static_cast<size_t>(expected.payload_size),
+                     kBlockHeaderBytes);
     }
   } catch (...) {
-    ::close(fd);
+    CloseFile(file);
     // SELF-HEALING (io.py:87-92): an unreadable, truncated or foreign file is
     // removed so the next lookup is a clean miss rather than a repeating error.
     RemoveQuietly(source_path);
     throw;
   }
-  ::close(fd);
+  CloseFile(file);
   return true;
 }
 
