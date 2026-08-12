@@ -172,6 +172,14 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
+# the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
+# reproduces the compressor/indexer layer counts of BOTH real checkpoints
+# (Flash 41/21, Pro 61/30). No checkpoint / GPU — Pro's 805 GiB does not fit one
+# GB10, so a load gate is memory-infeasible (.agents/specs/deepseek-v4-pro.md).
+vllm_cpp_add_test(test_deepseek_v4_pro_variant vllm/models/test_deepseek_v4_pro_variant.cpp)
+target_include_directories(test_deepseek_v4_pro_variant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
 # registry + ParseLagunaParams descends the shipped config (nested dual-rope +
 # variable Q-head + ungrouped sigmoid-noaux MoE). No 73 GB checkpoint / GPU — the
