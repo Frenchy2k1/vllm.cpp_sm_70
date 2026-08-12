@@ -733,6 +733,38 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
   reinterpret_cast<MatmulFp8CublasLtFn>(GetOp(OpId::kMatmulFp8CublasLt, q.device.type))(
       q, out, a_fp8, b_fp8, alpha);
 }
+void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                               const Tensor& alpha_vec) {
+  // Same operand contract as MatmulFp8CublasLt, plus the per-column alpha. The
+  // output is f32 only: the fallback arm applies the vector with
+  // vt::MulColVecF32, which is f32-typed, so accepting bf16 here would be a
+  // capability the fallback cannot honor.
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
+           "matmul_fp8_cublaslt_alpha_vec: all tensors must be rank-2");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  VT_CHECK(k % 16 == 0 && n % 16 == 0,
+           "matmul_fp8_cublaslt_alpha_vec: K and N must be multiples of 16");
+  VT_CHECK(b_fp8.shape[1] == k,
+           "matmul_fp8_cublaslt_alpha_vec: b_fp8 must be [N, K] (K matches a_fp8)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n,
+           "matmul_fp8_cublaslt_alpha_vec: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kF32, "matmul_fp8_cublaslt_alpha_vec: out must be f32");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_cublaslt_alpha_vec: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && b_fp8.IsContiguous(),
+           "matmul_fp8_cublaslt_alpha_vec: contiguous tensors required");
+  // cuBLASLt reads the alpha vector as one entry per OUTPUT ROW of its
+  // column-major D, which is our row-major out's COLUMN count, N.
+  VT_CHECK(alpha_vec.rank == 1 && alpha_vec.shape[0] == n,
+           "matmul_fp8_cublaslt_alpha_vec: alpha_vec must be [N] (one alpha per output column)");
+  VT_CHECK(alpha_vec.dtype == DType::kF32 && alpha_vec.IsContiguous(),
+           "matmul_fp8_cublaslt_alpha_vec: alpha_vec must be contiguous f32");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device &&
+               alpha_vec.device == q.device,
+           "matmul_fp8_cublaslt_alpha_vec: device mismatch");
+  reinterpret_cast<MatmulFp8CublasLtAlphaVecFn>(
+      GetOp(OpId::kMatmulFp8CublasLtAlphaVec, q.device.type))(q, out, a_fp8, b_fp8, alpha_vec);
+}
 
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,

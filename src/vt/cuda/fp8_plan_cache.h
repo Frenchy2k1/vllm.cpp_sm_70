@@ -59,6 +59,81 @@ inline bool Fp8PlanCacheEnabled() {
   return enabled;
 }
 
+// --- PERF-FP8-ALPHA-FOLD: the vector-alpha epilogue arm ---------------------
+// Spec: .agents/specs/perf-fp8-alpha-fold.md. Issue #402 (§3 "Lever B").
+//
+// When two FP8 shards are N-concatenated into ONE operand but carry DIFFERENT
+// folded alphas, no single host scalar reproduces both halves, so the model
+// today runs the GEMM at alpha=1 and applies the per-output-COLUMN alpha in a
+// second full-tensor pass (vt::MulColVecF32). At T=4096 prefill that pass is a
+// read-modify-write of a [T,16384] f32 tensor per GDN layer, measured at
+// 209.5 GB/s = 77% of the GB10's 273.1 GB/s peak — 122.99 ms/request over 48
+// calls, 43.6% of the whole measured 27B prefill deficit. It is bandwidth-bound,
+// so its cost is its WIDTH; this is deliberately NOT the launch-count regime
+// that #402 §4 sized as neutral on the decode step.
+//
+// cuBLASLt applies exactly this vector in the epilogue for free:
+// CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO (cublasLt.h, "alpha
+// pointer targets an array in device memory, beta is zero"), whose documented
+// length rule is that the vector must "match number of output matrix ROWS"
+// (CUBLASLT_MATMUL_DESC_POINTER_MODE). Our fp8 D is created COLUMN-MAJOR as
+// (rows=n, cols=m, ld=n) — see the TN derivation in cuda_matmul.cu — so
+// cuBLASLt's output ROWS are our row-major output's COLUMNS, and the model's
+// resident f32 [N] alpha vector is already the right vector in the right layout.
+//
+// Pure (CUDA-free) pieces live here so the flag parse, the plan-key separation
+// and the algo-capability predicate are unit-testable on every platform
+// (tests/vt/test_fp8_plan_cache.cpp), exactly like the plan-cache flag above.
+
+// Pure predicate for the VT_FP8_ALPHA_VEC_EPILOGUE contract: DEFAULT OFF, and
+// enabled only for the exact value "1". nullptr (unset) and every other value
+// are OFF. The default stays OFF until an operator-run same-binary prefill A/B
+// (and the CUDA-tier bitwise case) says otherwise; the fallback below is the
+// current two-launch behavior, byte for byte.
+inline bool Fp8AlphaVecEpilogueFlagIsOn(const char* env_value) {
+  return env_value != nullptr && std::string_view(env_value) == "1";
+}
+
+// Process-cached gate, read from the environment exactly once. Same shape as
+// Fp8PlanCacheEnabled/GemmAlgoLogEnabled: the parse is what the unit test pins;
+// this latching getter is deliberately not unit-tested.
+inline bool Fp8AlphaVecEpilogueEnabled() {
+  static const bool enabled =
+      Fp8AlphaVecEpilogueFlagIsOn(std::getenv("VT_FP8_ALPHA_VEC_EPILOGUE"));
+  return enabled;
+}
+
+// Values for Fp8PlanKey::scale_mode. The pointer mode is set on the matmul
+// DESCRIPTOR before cublasLtMatmulAlgoGetHeuristic runs, so it can change the
+// selected algo — including the split-K factor, which changes the f32 reduction
+// order. A vector-alpha plan must therefore never reuse a scalar-alpha plan for
+// the same shape, and vice versa.
+enum : int {
+  kFp8ScaleModeHostAlpha = 0,       // per-tensor scale folded into the host alpha
+  kFp8ScaleModeAlphaDeviceVec = 1,  // per-column alpha vector in the epilogue
+};
+
+// The scale_mode a plan key must carry for the requested alpha form. Trivial by
+// construction; it exists so the two constants can never be swapped or collapsed
+// silently at the one call site that builds the key.
+inline int Fp8ScaleModeFor(bool alpha_device_vector) {
+  return alpha_device_vector ? kFp8ScaleModeAlphaDeviceVec : kFp8ScaleModeHostAlpha;
+}
+
+// Mirror of cublasLtPointerModeMask_t's
+// CUBLASLT_POINTER_MODE_MASK_ALPHA_DEVICE_VECTOR_BETA_ZERO. Kept as a local
+// constant so this header stays CUDA-free; cuda_matmul.cu static_asserts it
+// against the real enum, so a header change cannot drift past the build.
+inline constexpr unsigned int kFp8PointerModeMaskAlphaDeviceVectorBetaZero = 8U;
+
+// Does an algo's CUBLASLT_ALGO_CAP_POINTER_MODE_MASK authorize the mode we set?
+// ONLY the BETA_ZERO bit does: DEVICE_VECTOR (4) and ALPHA_DEVICE_VECTOR_BETA_HOST
+// (16) are different modes, and an algo reporting them does not implement ours.
+// A false here is not an error — it selects the two-launch fallback.
+inline bool Fp8AlphaVecCapSupported(unsigned int pointer_mode_cap_mask) {
+  return (pointer_mode_cap_mask & kFp8PointerModeMaskAlphaDeviceVectorBetaZero) != 0U;
+}
+
 // The FULL key that determines the cuBLASLt descriptor + selected algo for the
 // fp8 (e4m3) TN dense GEMM path in cuda_matmul.cu. EVERY input that changes the
 // descriptor OR the heuristic-selected algo MUST appear here — a missed field =
@@ -80,11 +155,15 @@ inline bool Fp8PlanCacheEnabled() {
 //   scale_type   — cudaDataType_t scale on the descriptor (CUDA_R_32F).
 //   trans_a/b    — CUBLASLT_MATMUL_DESC_TRANSA/TRANSB (OP_T / OP_N for the TN form).
 //   epilogue     — cublasLtEpilogue_t (DEFAULT here; no bias/act fusion).
-//   scale_mode   — 0 = per-tensor scale folded into the host alpha (no device
-//                  scale pointers on the descriptor). alpha is a per-call host
-//                  scalar that does NOT affect the descriptor or the algo, so it
-//                  is deliberately NOT part of the key; a future device-scale-
-//                  pointer mode would be a distinct scale_mode value.
+//   scale_mode   — which alpha FORM the descriptor carries, per Fp8ScaleModeFor:
+//                  kFp8ScaleModeHostAlpha (0) = per-tensor scale folded into the
+//                  host alpha, no pointer mode set; kFp8ScaleModeAlphaDeviceVec
+//                  (1) = CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO on
+//                  the descriptor, alpha a device f32 [N] vector. The VALUE of a
+//                  host alpha does not affect the descriptor or the algo, so it
+//                  is deliberately NOT part of the key — but the pointer MODE is
+//                  on the descriptor the heuristic reads, so the two forms must
+//                  never share a plan.
 struct Fp8PlanKey {
   int device = 0;
   int64_t m = 0, n = 0, k = 0;
