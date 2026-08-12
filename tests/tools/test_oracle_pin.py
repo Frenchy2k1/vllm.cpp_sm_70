@@ -194,7 +194,7 @@ class OracleIdentityIsWiredIntoEveryEntryPointTests(unittest.TestCase):
     `assertRaises` would stay green on a gutted identity check that simply
     failed later for want of a fixture file.
 
-    The two `commit-drift` cases patch the pin's version CONSTANTS to the
+    The three `commit-drift` cases patch the pin's version CONSTANTS to the
     rollback's version string. That is deliberate: at today's pin the exact
     equality against `VLLM_ORACLE_VERSION` strictly dominates the commit
     assertion (the pinned string already contains `+g555967922`), so no input
