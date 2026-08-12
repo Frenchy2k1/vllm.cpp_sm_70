@@ -32,6 +32,22 @@ std::vector<std::vector<int32_t>> SampleDsparkBlockDrafts(
              "SampleDsparkBlockDrafts: anchor token id outside the target vocab");
   }
 
+  // W7 (#436): keep the per-step bias and the argmax ON DEVICE. The host path
+  // below downloads [num_reqs, draft_vocab] f32 and scans it once per step,
+  // which `[spec-phase] backbone=27.44ms sample=10.50ms` measured at 28% of the
+  // 27B draft step. Token-identical (same lowest-index argmax, same base row,
+  // same d2t-mapped `prev`), so this is a pure cost move; VT_DSPARK_DEVICE_SAMPLE=0
+  // restores the host loop for an A/B, and an unsupported checkpoint (non-unit
+  // logit_scale) falls back on its own.
+  static const bool device_sample = [] {
+    const char* v = std::getenv("VT_DSPARK_DEVICE_SAMPLE");
+    return v == nullptr || (v[0] != '\0' && v[0] != '0');
+  }();
+  if (device_sample && Qwen3DSparkModel::CanSampleOnDevice(weights)) {
+    return Qwen3DSparkModel::SampleSequentialDevice(block_logits, anchor_ids, nqpr,
+                                                    sample_off, n_spec, weights, queue);
+  }
+
   std::vector<std::vector<int32_t>> drafts(static_cast<size_t>(num_reqs));
   for (auto& row : drafts) row.assign(static_cast<size_t>(n_spec), 0);
 
