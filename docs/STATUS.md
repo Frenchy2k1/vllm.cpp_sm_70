@@ -502,9 +502,15 @@ more than the oracle when the clock was pinned, so the residual is
 SM-clock-sensitive work. PAIRED profiling localises it exactly: the SAME
 `marlin_moe_wna16::Marlin` kernel, the SAME 1520 launches, ours 249.22 ms vs
 upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall is
-2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm
-difference: the next step is the kernel's launch configuration and repacked
-weight layout. (The repack kernels that appear to take 40% of a long run are
+2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm difference, and not the launch
+geometry either: the full template arguments match, `determine_exec_config` is
+byte-identical to the pinned upstream copy, and every OTHER kernel matches to
+0.2%. The inputs match too (scale bytes per expert,
+256-byte alignment, cudaMalloc residency), so the likeliest remaining cause is
+that the engines do not execute the same WORK: our token stream diverges from the
+oracle's by a near-tie, and different tokens route to different experts, which
+changes the kernel's block count at a fixed launch count. That must be measured
+before any kernel work. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal

@@ -74,10 +74,9 @@ are our reading of their documented behavior, not measurements.
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
-| fp8 weights | ✅ `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert without `VT_GDN_FP8_IN_BF16`), default **OFF**: merged fp8 GDN tower reaches packed decode, GROSS-defect gate only ([spec](../.agents/specs/perf-gdn-packed-bridge.md)) | ✅ | ✅ | ☐ |
-| Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated | n/a | n/a | n/a |
-| fp8-tower GDN `in_proj` emits bf16, halving the alpha pass | ◐ `VT_GDN_FP8_IN_BF16`, **default OFF**; NO committed gate runs it (#339); NOT value-neutral ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
-| fp8 cuBLASLt GEMM refuses split-K under a bf16-D byte-equivalence claim | ✅ `claims_splitk1_premise`, per-call, default **off**, CUDA only; binds the CALLER, not the dtype | n/a | n/a | n/a |
+| fp8 weights | ✅ | ✅ | ✅ | ☐ |
+| fp8-tower GDN `in_proj` emits bf16, unlocking packed GDN decode | ◐ `VT_GDN_FP8_IN_BF16` + `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert alone), both default **OFF**, ungated (#339) ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
+| Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
 | `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
@@ -167,6 +166,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
+| `NemotronHForCausalLM` | Nemotron-H / Nemotron-3.5-Lightning-30B-A3B | 20.1 GiB NVFP4 fits the pool, so capability-blocked, not HW-blocked: Mamba2 SSD is unported ([#496](https://github.com/mudler/vllm.cpp/issues/496)), plus non-gated `relu²` MoE and ModelOpt `MIXED_PRECISION` |
 
 27 of the 31 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
