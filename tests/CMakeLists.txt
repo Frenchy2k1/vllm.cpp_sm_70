@@ -1381,6 +1381,21 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# `GATE-27B-FP8-TOWER-GOLDEN` (issue #466): the SECOND dense 27B arm, pinned to
+# nvidia/Qwen3.6-27B-NVFP4@0893e160 (`modelopt_mixed` — W4A16 NVFP4 MLP + FP8
+# W8A8 tower + NVFP4 head). The gate above pins unsloth@890bdef7, whose GDN
+# input projections are BF16, so every fp8 branch is dead code there and that
+# gate can never fail for an fp8 defect. This arm asserts the fp8 GDN
+# input-projection dispatch contract UNCONDITIONALLY — a zero count is a
+# failure, not a skipped block. Checkpoint-gated, dgx-only; on CPU/CI it refuses
+# loudly instead of reporting a vacuous pass.
+vllm_cpp_add_test(test_qwen27n_fp8_tower_paged_engine
+  parity/test_qwen27n_fp8_tower_paged_engine.cpp)
+target_compile_definitions(test_qwen27n_fp8_tower_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27n_fp8_tower_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.
 # Synthetic (no checkpoint, no GPU) BECAUSE test_qwen27_paged_engine runs the
 # unsloth @890bdef7 snapshot, whose head is BF16 — that gate cannot see this path.
