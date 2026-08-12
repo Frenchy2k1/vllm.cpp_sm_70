@@ -506,11 +506,11 @@ upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall i
 geometry either: the full template arguments match, `determine_exec_config` is
 byte-identical to the pinned upstream copy, and every OTHER kernel matches to
 0.2%. The inputs match too (scale bytes per expert,
-256-byte alignment, cudaMalloc residency), so the likeliest remaining cause is
-that the engines do not execute the same WORK: our token stream diverges from the
-oracle's by a near-tie, and different tokens route to different experts, which
-changes the kernel's block count at a fixed launch count. That must be measured
-before any kernel work. (The repack kernels that appear to take 40% of a long run are
+256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
+upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
+routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
+3.73 us per block, ~12.8% slower per unit of work**. The remaining unknown is how
+the kernel executes on identical inputs (occupancy / shared-memory budget). (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
 never run on real weights.
 Multimodal
