@@ -330,6 +330,19 @@ than "it works", so it is worth stating precisely.
   forward has **never run**.
 - Those are argmax positions from a single prefill, not generated tokens.
   **Multi-step decode is untested**, and so is the sliding window across steps.
+- The perception encoder normalizes merged multimodal embeddings again as of
+  #405. Its config key is absent from the released checkpoint and defaults on,
+  which we had read as off — so image and video prompts before that fix skipped
+  a normalization step. Still no reference decode for the vision path either
+  way, so this corrects the code without changing what has been verified.
+- **A config key that is absent takes the architecture's value**
+  ([#412](https://github.com/mudler/vllm.cpp/issues/412)), not a neutral one:
+  `qk_scale_factor` 43.784 (→ 3.87 at head_dim 128), `sliding_window` 2048,
+  `output_multiplier` 0.196…, `final_logit_softcapping` 20.0, `rms_norm_eps`
+  1e-5, `post_norm_eps` 1e-8. The released 30B `config.json` carries all six, so
+  the text tower above is unchanged; the released GGUF and the DFlash drafter's
+  `config.json` each omit some, and both used to run a quietly different model.
+  Only an explicit `null` still disables the window or the soft-cap.
 - Even at reduced depth this is agreement with independent transcriptions of the
   same upstream source, not agreement with the model's own runtime: the pinned
   oracle cannot load `muse_glimmer` at all.
@@ -390,7 +403,7 @@ python3 scripts/check-cuda-fat-gencode.py \
 ```
 
 The release workflow applies this audit to independently linked x86_64 and
-arm64 host executables, packages each as a preview `cuda-fat` archive, and then
+arm64 host executables, packages each as a preview `cuda` archive, and then
 runs the extracted-archive validator. Each archive must contain all ten SM
 images and the six available exact-SM Triton AOT namespaces; the manifest keeps
 runtime evidence separate per SM. These build-only preview candidates are not
@@ -438,6 +451,27 @@ MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
 `nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
 throughput changes; the routed experts still use the grouped MoE kernel, which
 is where they belong.
+
+The **dense** MLP's W4A16 gate/up pair takes that same fused gate_up GEMM
+(`VT_DENSE_MARLIN_GATEUP`, **default ON**, opt out with `=0`). vLLM's dense
+Qwen3.6 MLP is one `MergedColumnParallelLinear` `gate_up_proj`, so one
+`[T,H]x[2I,H]` GEMM per layer is the mirrored topology; ours used to launch two,
+which was 193 Marlin calls per decode step against the oracle's 129. The default
+moved on a same-binary A/B: interleaved 4 reps per arm on
+`nvidia/Qwen3.6-27B-NVFP4`@`0893e160` (GB10) with the toggle as the only
+variable measured **+2.12% at c1 and +1.70% at c8**, every fused rep beating
+every split rep at both concurrencies, and the 64-token greedy continuation
+identical on both arms. It is still only ~29% of a measured +4.40 ms/step gap on
+the 27B and does not reach parity on its own. It applies only to an **NVFP4**
+W4A16 pair whose two shards share a global scale; a true-W4A4 checkpoint already
+takes the merged CUTLASS path instead, and a **dense MXFP4** pair is refused and
+keeps the split pair. That MXFP4 refusal is deliberate: the fused entry point the
+dense MLP reaches is NVFP4-only — it sizes the merged block-scale grid at K/16
+and pins `group_size = 16` — so admitting group-32 E8M0 scales would misread them
+as group-16 fp8-e4m3, the defect this project already recorded for the sibling
+implementation. No dense loader produces MXFP4 today, so the refusal changes no
+shipped configuration; it stops one future loader line from silently selecting a
+mis-scaled kernel.
 
 The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
 f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
@@ -518,11 +552,15 @@ dependencies.
 
 ## Container images
 
-Published to one GHCR package with the lane in the tag:
-`ghcr.io/mudler/vllm.cpp:<version>-cuda`, `-vulkan`, `-cpu`, plus the moving
-`:latest-<lane>`. The bare `:latest` is the **cpu** lane, so pulling it on a
-machine with no accelerator gets a working server rather than a library-load
-failure. Every lane is a `linux/amd64` + `linux/arm64` manifest.
+Published to one GHCR package with the lane in the tag. Every lane is a
+`linux/amd64` + `linux/arm64` manifest, so the same tag works on both.
+
+| tag | what it is |
+|---|---|
+| `:<version>-cuda` / `-vulkan` / `-cpu` | **immutable.** Never republished |
+| `:latest-cuda` / `-vulkan` / `-cpu` | moves to the newest **release** |
+| `:latest` | the **cpu** lane, so pulling it on a machine with no accelerator gets a working server rather than a library-load failure |
+| `:main-cuda` / `-vulkan` / `-cpu` | moves with **main**: rebuilt when container infrastructure changes and nightly otherwise. Convenience, not a release — no support claim |
 
 The entrypoint is `vllm-server`, so flags go straight after the image name and
 the server keeps its own default of `0.0.0.0:8000`:
@@ -544,14 +582,46 @@ docker run --rm --gpus all -p 8000:8000 \
   --model /models/Qwen3.6-35B-A3B
 ```
 
-`/models` is the weights mount and `/cache` is the tokenizer/HF cache; the
-container runs as uid 1000, so `/cache` must be writable by it if you bind-mount
-one. `ffmpeg` is installed in every lane, so `/v1/videos` works out of the box —
-a deliberate difference from the tarballs, which never vendor it because they
-are extracted onto a host that already has a `PATH`.
+`/models` is the weights mount and `/cache` is the tokenizer/HF cache. The
+container runs as **uid 1000**, so `/cache` must be writable by it and the
+weights under `/models` must be READABLE by it. A model file with mode `0600`
+owned by another uid fails as `safetensors: cannot open file`, which reads like
+a corrupt checkpoint rather than a permissions problem.
 
-macOS Metal and MLX have no image and never will: there is no macOS container
-runtime and no Metal passthrough. ROCm has no image until its backend compiles.
+### Picking the right flags for your GPU
+
+The two NVIDIA families need **different** invocations, and this is verified on
+both rather than inferred:
+
+| host | verified on | flags |
+|---|---|---|
+| SBSA / datacenter arm64, x86_64 | GB10 `sm_121a` | `--gpus all` |
+| Jetson / Tegra (L4T) | AGX Orin `sm_87`, L4T R36.4.3 | `--runtime nvidia --gpus all` |
+
+On Jetson, `--gpus all` **alone is refused** ("invoking the NVIDIA Container
+Runtime Hook directly ... is not supported"), and `--runtime nvidia` **alone**
+starts a container with no driver that dies on `libcuda.so.1: cannot open
+shared object file` — which looks like a broken image rather than a missing
+flag. Use both:
+
+```sh
+docker run --rm --runtime nvidia --gpus all -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/mudler/vllm.cpp:latest-cuda \
+  --model /models/Qwen3-0.6B
+```
+
+That exact recipe was run on an AGX Orin with `Qwen/Qwen3-0.6B`: the server
+serves `/v1/completions` and `tegrastats` shows `GR3D_FREQ` at 95-97% during
+generation, so decode is on the GPU.
+
+### If the server exits at startup
+
+| symptom | cause |
+|---|---|
+| `safetensors: cannot open file` | the weights are not readable by **uid 1000**. The container runs as uid 1000; a `0600` model owned by another user fails here and looks like a corrupt checkpoint |
+| `libcuda.so.1: cannot open shared object file` | no driver in the container — on Jetson, add `--gpus all` alongside `--runtime nvidia` |
+| `--model <dir> is required` | the server takes flags directly; everything after the image name goes to `vllm-server` |
 
 ### Building and validating an image locally
 
@@ -625,6 +695,8 @@ Registered in
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
 | POST | `/reset_prefix_cache` | Reset the prefix cache; returns `{"success": bool}` |
+| POST | `/v1/embeddings` | Embeddings. Registered **only** when an embedder is attached, so a text server answers 404 at the route table |
+| POST | `/v1/audio/transcriptions` | Speech to text (multipart: audio as `file`, `response_format` as a form field). Registered **only** when a transcriber is attached |
 | POST | `/v1/videos` | Start a video generation job, returns `{id, status}` (MiniMax-H3) |
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
@@ -712,7 +784,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -766,8 +838,21 @@ attention output gate, `down_proj` and the merged `gate_up` stay quantized, whil
 the merged QKV, `lm_head` and the embedding table expand to bf16 because the
 shared forward consumes them in a form a block encoding cannot take.
 
-Three caveats:
+Four caveats:
 
+- **A key the GGUF omits falls back to Muse Glimmer's own constant, not to a
+  neutral one** ([#412](https://github.com/mudler/vllm.cpp/issues/412)). The
+  released file's 32 metadata keys include no post-norm epsilon, so both sandwich
+  post-norms used to run at `attention.layer_norm_rms_epsilon` (1e-5) where the
+  architecture says 1e-8 — a factor of 1000. The same rule now covers
+  `sliding_window` (2048, not "no window at all"), `output_multiplier`,
+  `final_logit_softcapping` and the query pre-scale. This changes GGUF
+  activations, though a same-binary A/B on the released k-quant produced
+  **token-identical** greedy output on both of the prompts on record. The
+  safetensors arm is unaffected: its `config.json` carries every one of those
+  keys. A converter that emits
+  `muse-glimmer.attention.post_norm_rms_epsilon` or `muse-glimmer.attention.scale`
+  is honoured over the default.
 - **The k-quant generates coherent text, but is not token-exact against
   llama.cpp.** Two defects had to be fixed to get there: the GGUF tokenizer gap
   ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
@@ -1180,6 +1265,39 @@ across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
 ids win. This is a library-API field today — the OpenAI request field is not
 wired yet.
 
+### KV-cache events, and `kv_cache_report_mode`
+
+`SamplingParams::extra_args` is a per-request string map mirroring vLLM's
+`extra_args`, and the one key read from it today is `kv_cache_report_mode`:
+
+```cpp
+vllm::SamplingParams params;
+params.extra_args = std::map<std::string, std::string>{
+    {"kv_cache_report_mode", "full"}};
+```
+
+It controls how much of that request's prefix-cache activity reaches the
+KV-cache event stream. `"incremental"`, the default and what you get whenever the
+key is absent, reports only blocks the request newly STORED. `"full"` also
+re-reports the blocks it REUSED from the cache, which is what a prefix-cache-aware
+router needs to learn that this engine already holds a prefix.
+
+Events are OFF unless a `vllm::distributed::KVEventsConfig` with
+`enable_kv_cache_events = true` is passed to the `Scheduler`, so
+`kv_cache_report_mode` changes nothing by itself. With events on, each engine step
+publishes at most one `KVEventBatch` — a wall-clock `ts`, that step's
+`BlockStored` / `BlockRemoved` / `AllBlocksCleared` events, and the data-parallel
+rank — to the configured publisher, and its msgpack encoding is byte-identical to
+what vLLM puts on the wire.
+
+Two limits to know. The **`zmq` publisher is not ported**: asking for it throws
+rather than silently downgrading, because the live socket transport needs a
+dependency this project does not carry, so `publisher` must be `"null"` today —
+and it must be set explicitly, since an unset value is not yet resolved the way
+vLLM resolves it ([issue #353](https://github.com/mudler/vllm.cpp/issues/353)).
+And `extra_args` is reachable **only from the C++ API**: the HTTP door to it
+(`vllm_xargs`) is not ported, so an OpenAI request cannot set the report mode.
+
 ## Multimodal input (image, video, audio to text)
 
 Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:
@@ -1206,6 +1324,30 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `image_url` | image |
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
+
+## MiniMax-H3 browser console (`vllm-video-studio`)
+
+A standalone browser console for MiniMax-H3, deliberately **separate** from the
+OpenAI-compatible API server: `examples/server` is the API surface and a UI does
+not belong in it. The studio owns its own endpoints and drives the public C ABI
+(`vllm_video_*`) like any other FFI consumer, so it is also a worked example of
+that ABI.
+
+Built with the server (`-DVLLM_CPP_SERVER=ON`), because it shares the same
+vendored HTTP transport.
+
+```sh
+vllm-video-studio --models-dir /path/to/h3 --port 8080
+```
+
+Then open `http://localhost:8080`. It discovers the five H3 files under
+`--models-dir`, or each can be pointed at explicitly with `--dit`, `--encoder`,
+`--video-vae`, `--video-vae-config`, `--audio-vae`, `--audio-vae-config` and
+`--tokenizer`. Other flags: `--host`, `--device`, `--workdir`, `--ffmpeg`,
+`--partition`, `--keep-quant`, `--prompt-embeds`, and `--ui` to serve a custom
+web root.
+
+The weights, and why each one is needed, are in the MiniMax-H3 section below.
 
 ## MiniMax-H3: video + audio generation
 
@@ -1298,3 +1440,10 @@ waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
 (default 15s; `0` disables). Comment frames are not `data:` events and do not
 carry tokens. Token streaming still uses a timed wait on the request collector
 so deltas are not collapsed by a poll loop.
+
+## Gemma4 FP8 on ROCm (RDNA4)
+
+Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
+ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
+This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).

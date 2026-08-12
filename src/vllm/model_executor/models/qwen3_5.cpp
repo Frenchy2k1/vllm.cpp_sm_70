@@ -450,6 +450,31 @@ void detail::ValidateGdnDecodeGraphState(
     const std::vector<GdnStateCache>& state_caches, int64_t real_batch) {
   VT_CHECK(real_batch > 0,
            "qwen3_5 decode graph: real batch must be positive");
+  // SPEC-DSPARK W8 (#442): a UNIFORM SPEC batch is capturable too. vLLM's
+  // captured decode length is `1 + num_speculative_tokens`
+  // (cudagraph_dispatcher.py:37), so its T=1+k verify is graphed by construction
+  // while ours was refused right here. The assertion is RE-EXPRESSED for that
+  // shape, never dropped: a spec batch is still required to be EXACT and pure
+  // (no prefill mixed in), with every token a spec token.
+  const bool spec_batch = metadata.num_spec_decodes > 0;
+  if (spec_batch) {
+    VT_CHECK(metadata.num_prefills == 0 && metadata.num_prefill_tokens == 0 &&
+                 metadata.num_decodes == 0 && metadata.num_decode_tokens == 0 &&
+                 metadata.num_spec_decode_tokens == real_batch &&
+                 metadata.num_actual_tokens == real_batch,
+             "qwen3_5 decode graph: a spec batch must be an exact PURE spec "
+             "decode (every token a spec token, no prefill)");
+    // Uniformity is what makes the shape a graph key: every request contributes
+    // the same 1+k query span, so real_batch == num_spec_decodes * (1+k).
+    VT_CHECK(metadata.num_spec_decodes > 0 &&
+                 real_batch % metadata.num_spec_decodes == 0,
+             "qwen3_5 decode graph: spec batch must be uniform across requests");
+    VT_CHECK(metadata.spec_state_indices_tensor.has_value(),
+             "qwen3_5 decode graph: missing GDN spec state indices");
+    VT_CHECK(!state_caches.empty(),
+             "qwen3_5 decode graph: missing GDN state caches");
+    return;
+  }
   VT_CHECK(metadata.num_prefills == 0 && metadata.num_prefill_tokens == 0 &&
                metadata.num_spec_decodes == 0 &&
                metadata.num_spec_decode_tokens == 0 &&
@@ -2676,6 +2701,46 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   return act;
 }
 
+// PERF-27B-DENSE-MARLIN-GATEUP (issue #365). The DENSE MLP's W4A16 gate/up pair
+// through the SAME fused Marlin gate_up GEMM the shared expert already takes:
+// ONE [T,H]x[2I,H] GEMM + SiluAndMul per layer instead of two GEMMs + a
+// MoeSiluMul. `nullopt` means "not this configuration" and the caller keeps the
+// split path unchanged.
+//
+// It is the SAME call, the SAME MarlinDensePairResident (held on the gate
+// weight's `resident_marlin_pair` slot, so a dense gate weight keys it exactly
+// like a shared-expert gate weight does) and the SAME guard terms — there is no
+// second fused implementation and no second resident cache.
+//
+// The extra `Bf16GemmOutEnabled()` term is what keeps the SINK equivalent: the
+// split path only produces bf16 gate/up operands for its MoeSiluMul when that
+// lever is on, and the fused sink's SiluAndMul reads bf16 halves of one [T,2I]
+// buffer. Both epilogues compute `g/(1+expf(-g))*u` in f32 and round on store
+// (cuda_ops.cu SiluAndMulKernel / cuda_moe.cu MoeSiluMulKernel), so on bf16
+// inputs the two activations agree bit for bit.
+//
+// The GEMM itself does NOT: Marlin's fp32 split-K reduce groups the K-slices
+// differently for a [2N,K] operand than for two [N,K] operands, which is one
+// bf16 ULP on ~0.1% of elements — MEASURED and recorded for this same fused
+// entry point at tests/.../test_linear_method.cpp:202 (99.9% bit-exact vs
+// split). So the bar for flipping this on is token-exactness against the pinned
+// ORACLE, exactly as it was for the shared-expert pair, and NOT bit-equality
+// with our own split path.
+//
+// Like BuildDenseHeadMarlinResident below, it lives INSIDE the region that
+// already owns this kernel family rather than behind a second
+// `#ifdef VT_MARLIN_NVFP4` at the DenseMlpBlock call site, for the DSR-ratchet
+// reason spelled out there.
+std::optional<DBuf> DenseGateUpFusedMarlinD(Dev d, const Tensor& x,
+                                            const DenseMlpWeights& w) {
+  if (x.dtype != DType::kBF16 || !Bf16GemmOutEnabled() ||
+      !dense_nvfp4::DenseMlpGateUpFusedMarlinEligible(w.gate_proj_fp4, w.up_proj_fp4,
+                                                      d.q.device.type)) {
+    return std::nullopt;
+  }
+  return SharedGateUpFusedMarlinD(d, x, w.gate_proj_fp4, w.up_proj_fp4);
+}
+
 // PERF-27B-LMHEAD-FP4 (issue #213). Build the dense head's Marlin resident when
 // THIS configuration will actually take the Marlin logits GEMM, and report
 // whether it did. The predicate is EXACTLY the one MatmulNvfp4F32D selects with,
@@ -2699,8 +2764,12 @@ bool BuildDenseHeadMarlinResident(Dev d, const Nvfp4Weight& w) {
 #else
 // No Marlin NVFP4 in this build: there is no dense-head Marlin resident to
 // build, so PrepareLmHeadResident falls straight through to the arm this
-// backend's logits GEMM will actually take.
+// backend's logits GEMM will actually take, and the dense MLP keeps its split
+// gate/up pair (there is no fused Marlin GEMM to substitute).
 bool BuildDenseHeadMarlinResident(Dev, const Nvfp4Weight&) { return false; }
+std::optional<DBuf> DenseGateUpFusedMarlinD(Dev, const Tensor&, const DenseMlpWeights&) {
+  return std::nullopt;
+}
 #endif  // VT_MARLIN_NVFP4
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
@@ -6008,6 +6077,17 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
 #endif
+  // PERF-27B-DENSE-MARLIN-GATEUP (issue #365) — the W4A16 sibling of the CUTLASS
+  // W4A4 merged branch above. The 27B gate checkpoint (modelopt_mixed) is W4A16,
+  // so `MergedGateUpEligible` is false for it and the split gate+up Marlin GEMMs
+  // below are the FALLBACK; vLLM runs ONE merged gate_up_proj.
+  // VT_DENSE_MARLIN_GATEUP (default ON, opt out with =0 — the same-binary A/B
+  // measured +2.12% at c1 and +1.70% at c8 on the 27B, complete separation at
+  // both, tokens identical) substitutes the ALREADY-EXISTING fused Marlin pair —
+  // one GEMM into [T,2I] plus the same silu/mul sink — feeding the identical
+  // down projection. `nullopt` = not this configuration; nothing below changes.
+  if (std::optional<DBuf> gu_act = DenseGateUpFusedMarlinD(d, dh, w))
+    return MatmulNvfp4Bf16D(d, gu_act->t(), w.down_proj_fp4);
   if (!fp4 && !w.gate_up_proj.Empty()) {
     // Qwen3.5's MergedColumnParallelLinear: one raw-NK [2I,H] projection,
     // followed by SiluAndMul and the raw-NK down projection.
@@ -8293,7 +8373,7 @@ struct PinnedStepInputs {
   int32_t* qsl = nullptr;
   int32_t* gdn_state_idx = nullptr;
   int32_t* token_ids = nullptr;
-  int64_t S = 0, cols = 0, idx = 0;
+  int64_t S = 0, R = 0, cols = 0, idx = 0;  // S = tokens, R = requests
   bool has_idx = false;
   bool ready = false;
 
@@ -8312,14 +8392,21 @@ struct PinnedStepInputs {
     seq_lens = nullptr; qsl = nullptr; gdn_state_idx = nullptr; token_ids = nullptr;
     b = nullptr; ready = false;
   }
-  void Alloc(Backend& bk, int64_t S_, int64_t cols_, int64_t idx_, bool has_idx_) {
+  // SPEC-DSPARK W8 (#442): `S` is TOKENS and `R` is REQUESTS. They are equal for
+  // pure decode, which is why one count sufficed until a speculative verify
+  // arrived with S = R * (1+k). Sizing the per-request arrays by S overran both
+  // the host block table and the device buffer (`cudaMemcpyAsync: invalid
+  // argument`). Upstream keeps both for the same reason: its graph key is
+  // BatchDescriptor(num_tokens, num_reqs, uniform).
+  void Alloc(Backend& bk, int64_t S_, int64_t R_, int64_t cols_, int64_t idx_,
+             bool has_idx_) {
     Free();
-    b = &bk; S = S_; cols = cols_; idx = idx_; has_idx = has_idx_;
+    b = &bk; S = S_; R = R_ > 0 ? R_ : S_; cols = cols_; idx = idx_; has_idx = has_idx_;
     positions = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
     slot_mapping = static_cast<int64_t*>(bk.AllocPinned(sizeof(int64_t) * S));
-    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S * cols));
-    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
-    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (S + 1)));
+    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R * cols));
+    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R));
+    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (R + 1)));
     token_ids = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
     if (has_idx) gdn_state_idx =
         static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * idx));
@@ -8347,17 +8434,64 @@ static DevicePool& PersistentDecodeInputPool() {
 // The caller records the input-staged event immediately after, so the next same-slot
 // Refresh waits only this tiny copy, not the GPU tail. Templated because the two
 // decode-graph drivers nest their own SizeSlot with identical field names.
+// SPEC-DSPARK W8 (#442): refill the PERSISTENT spec device tensors in place from
+// this slot's host metadata, OUTSIDE the captured region.
+//
+// This is the piece whose absence made the first spec capture produce garbage:
+// StageStepInputs refills only the pure-decode fields, so a replay re-read the
+// PREVIOUS step's `num_accepted` -- the very value GdnSpecDecode uses to select
+// each request's initial state (column num_accepted-1) and the conv window
+// advance. Stale there means the recurrence rolls back to the wrong state, which
+// measured as incoherent tokens AND 5x slower (26 vs 136 tok/s), because zero
+// acceptance multiplies the step count.
+//
+// Copies are issued on the main queue before the replay, so the graph reads the
+// addresses it was captured with, holding this step's values.
+template <class Slot>
+static void StageSpecStepInputs(Dev d, Slot& s) {
+  if (s.dev == nullptr) return;
+  StepDevInputs& dev = *s.dev;
+  if (!dev.has_gdn_spec) return;
+  const v1::GDNAttentionMetadata& gm = s.gdn_meta;
+  const auto cp32 = [&](DBuf& dst, const std::optional<std::vector<int32_t>>& src) {
+    if (src.has_value() && !src->empty())
+      d.b.Copy(d.q, dst.ptr(), src->data(), sizeof(int32_t) * src->size());
+  };
+  cp32(dev.gdn_spec_state_idx, gm.spec_state_indices_tensor);
+  cp32(dev.gdn_spec_qsl, gm.spec_query_start_loc);
+  cp32(dev.gdn_num_accepted, gm.num_accepted_tokens);
+  cp32(dev.gdn_spec_token_indx, gm.spec_token_indx);
+  cp32(dev.gdn_non_spec_token_indx, gm.non_spec_token_indx);
+  if (gm.spec_sequence_masks.has_value() && !gm.spec_sequence_masks->empty())
+    d.b.Copy(d.q, dev.gdn_spec_seq_masks.ptr(), gm.spec_sequence_masks->data(),
+             gm.spec_sequence_masks->size());
+  // conv state slot == column 0 of each request's spec_state_indices row
+  // (BuildStepDevInputs derives it the same way).
+  if (gm.spec_state_indices_tensor.has_value() && gm.spec_state_indices_num_cols > 0) {
+    const int64_t ns = gm.num_spec_decodes;
+    const int64_t nc = gm.spec_state_indices_num_cols;
+    const std::vector<int32_t>& ssi = *gm.spec_state_indices_tensor;
+    if (ns > 0 && static_cast<int64_t>(ssi.size()) >= ns * nc) {
+      std::vector<int32_t> col0(static_cast<size_t>(ns));
+      for (int64_t i = 0; i < ns; ++i)
+        col0[static_cast<size_t>(i)] = ssi[static_cast<size_t>(i * nc)];
+      d.b.Copy(d.q, dev.gdn_spec_conv_state_idx.ptr(), col0.data(),
+               sizeof(int32_t) * static_cast<size_t>(ns));
+    }
+  }
+}
+
 template <class Slot>
 static void StageStepInputs(Dev d, Slot& s) {
   PinnedStepInputs& pin = s.pin;
   StepDevInputs& dev = *s.dev;
-  const int64_t S = pin.S, cols = pin.cols;
+  const int64_t S = pin.S, R = pin.R, cols = pin.cols;  // tokens, requests
   std::memcpy(pin.positions, s.positions.data(), sizeof(int32_t) * S);
   std::memcpy(pin.slot_mapping, s.attn_meta.slot_mapping.data(), sizeof(int64_t) * S);
   std::memcpy(pin.block_table, s.attn_meta.block_table_tensor.data(),
-              sizeof(int32_t) * S * cols);
-  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * S);
-  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (S + 1));
+              sizeof(int32_t) * R * cols);
+  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * R);
+  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (R + 1));
   std::memcpy(pin.token_ids, s.token_ids.data(), sizeof(int32_t) * S);
   if (pin.has_idx && dev.has_gdn_idx &&
       s.gdn_meta.non_spec_state_indices_tensor.has_value())
@@ -8366,9 +8500,9 @@ static void StageStepInputs(Dev d, Slot& s) {
                 sizeof(int32_t) * pin.idx);
   d.b.Copy(d.q, dev.positions.ptr(), pin.positions, sizeof(int32_t) * S);
   d.b.Copy(d.q, dev.slot_mapping.ptr(), pin.slot_mapping, sizeof(int64_t) * S);
-  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * S * cols);
-  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * S);
-  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (S + 1));
+  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * R * cols);
+  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * R);
+  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (R + 1));
   if (pin.has_idx && dev.has_gdn_idx)
     d.b.Copy(d.q, dev.gdn_state_idx.ptr(), pin.gdn_state_idx,
              sizeof(int32_t) * pin.idx);
@@ -8426,6 +8560,14 @@ struct Qwen3_5DecodeGraph::Impl {
     v1::GDNAttentionMetadata gdn_meta;
     std::unique_ptr<DBuf> hidden;     // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;     // [S,vocab] f32 held graph output
+    // SPEC-DSPARK W8 (#442): the DFlash/DSpark verify must ALSO emit the
+    // [S, H*taps] aux hidden capture the drafter conditions on. That is exactly
+    // why the verify never reached this graph: ForwardDeviceMultiTap returns
+    // BEFORE the decode-graph gate. Held PERSISTENTLY per slot (like `logits`) so
+    // the captured region writes a fixed address across replays -- the eager path
+    // allocates a fresh buffer per call, which a captured graph cannot do.
+    std::unique_ptr<DBuf> aux;        // [S, H*taps] bf16, null when no aux tap
+    int64_t aux_taps = 0;             // tap count this buffer + graph were built for
     void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
     int fa_cols = -1;                 // captured block-table column count
     bool captured = false;
@@ -8530,7 +8672,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     const v1::CommonAttentionMetadata& attn_meta,
     const v1::GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
-    const std::vector<GdnStateCache>& gdn_state) {
+    const std::vector<GdnStateCache>& gdn_state, Qwen3_5AuxTaps* aux_out) {
   CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                     gdn_state, impl_->weights, impl_->config);
   const int64_t B = static_cast<int64_t>(token_ids.size());
@@ -8546,10 +8688,27 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // first B rows are the real requests; the padded rows follow). Stream ordering
   // guarantees the sampler's later reads see the replay's writes; the next
   // same-size replay overwrites the buffer, so in-place sampler mutation is safe.
-  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  // SPEC-DSPARK W8 (#442): a uniform SPEC batch carries B = num_reqs * (1+k)
+  // tokens, which exceeds max_num_reqs and would make PadToCaptureSize return -1
+  // (eager). Capture its EXACT shape instead of padding: upstream pads only in
+  // whole multiples of the uniform query length (cudagraph_dispatcher.py:145
+  // asserts `num_tokens_padded % uniform_decode_query_len == 0`), and taking the
+  // exact shape trivially satisfies that while keeping the padded-row inertness
+  // question out of the spec path. The shape count stays bounded by max_num_seqs
+  // because num_reqs is.
+  const bool spec_step = gdn_meta.num_spec_decodes > 0;
+  const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
   if (!impl_->enabled || S < 0 ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
+    if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
+      // The graph cannot serve this batch (disabled / unsupported size), so fall
+      // back to the EAGER multi-tap forward, which fills aux_out itself. Without
+      // this the drafter sees no taps at all.
+      return Qwen3_5Model::ForwardDeviceMultiTap(
+          token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
+          impl_->weights, impl_->config, impl_->queue, aux_out, {});
+    }
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                           gdn_state, impl_->weights, impl_->config);
     // ForwardBody returns [B,vocab] (owned pool block; hand ownership out).
@@ -8562,7 +8721,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
   Impl::SlotRing& ring = impl_->slots[S];
-  const bool dbuf = impl_->dbuf;
+  // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
+  // inputs. The per-call StepDevInputs is a pool block freed when the call
+  // returns, so a graph captured against it replays over recycled memory.
+  const bool dbuf = impl_->dbuf || spec_step;
   Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
   if (dbuf) {
     ring.next ^= 1;
@@ -8581,12 +8743,61 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       s.reuse_event = b.CreateEvent(/*blocking=*/true);
     b.RecordEvent(s.reuse_event, impl_->queue);
   };
+
+  // SPEC-DSPARK W8 (#442): size this slot's PERSISTENT aux buffer and invalidate a
+  // graph captured for a different tap count. Only the EXACT-shape case (S == B,
+  // which is what a spec batch takes) is served: the aux contract is [T, H*taps]
+  // and padded rows would change T.
+  const int64_t aux_taps =
+      aux_out != nullptr ? static_cast<int64_t>(aux_out->layer_ids.size()) : 0;
+  if (s.aux_taps != aux_taps) {
+    if (s.graph != nullptr) {
+      b.DestroyGraph(s.graph);
+      s.graph = nullptr;
+    }
+    s.captured = false;
+    s.warm = false;
+    s.aux.reset();
+    s.aux_taps = aux_taps;
+  }
+  if (aux_taps > 0 && (s.aux == nullptr || s.aux->t().shape[0] != S)) {
+    s.aux = std::make_unique<DBuf>(d, DType::kBF16,
+                                   std::vector<int64_t>{S, H * aux_taps});
+  }
+  Tensor aux_view{};
+  const std::vector<int32_t>* aux_ids_arg = nullptr;
+  const Tensor* aux_out_arg = nullptr;
+  if (aux_taps > 0) {
+    ValidateAuxTapLayerIds(aux_out->layer_ids, impl_->config.num_hidden_layers);
+    aux_view = s.aux->t();
+    aux_ids_arg = &aux_out->layer_ids;
+    aux_out_arg = &aux_view;
+  }
+  // The captured region writes into the slot's buffer, so the drafter reads a
+  // NON-owning view valid until this slot's next replay -- the same lifetime the
+  // returned logits already carry.
+  const auto publish_aux = [&] {
+    if (aux_taps > 0) {
+      aux_out->storage.reset();
+      aux_out->tensor = s.aux->t();
+    }
+  };
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   v1::CommonAttentionMetadata pam;
   v1::GDNAttentionMetadata pgm;
-  BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
-                    pam, pgm);
+  if (spec_step) {
+    // S == B for a spec batch, so there is nothing to pad, and BuildPaddedDecode
+    // would REWRITE the metadata as pure non-spec decode (num_decodes = S,
+    // spec fields dropped). Carry the real metadata through untouched.
+    ptok = token_ids;
+    ppos = positions;
+    pam = attn_meta;
+    pgm = gdn_meta;
+  } else {
+    BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+                      pam, pgm);
+  }
 
   // A block-table column-count change reallocates the persistent block_table (the
   // staged/baked H2D dest shape moves) → invalidate this slot's graph and persistent
@@ -8610,12 +8821,14 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
+      StageSpecStepInputs(d, s);
       record_staged();
       MaybePoisonStagedInputs(impl_->poison, s);
     }
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -8662,13 +8875,13 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, cols, idx, has_idx);
+      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
     DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                             s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                            impl_->config, {}, nullptr, nullptr, nullptr,
+                            impl_->config, {}, nullptr, aux_ids_arg, aux_out_arg,
                             dbuf ? s.dev.get() : nullptr);
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
@@ -8678,6 +8891,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     record_staged();
     s.replays = 1;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -8688,9 +8902,11 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, s.gdn_meta,
-                          attn_kv, gdn_state, impl_->weights, impl_->config);
+                          attn_kv, gdn_state, impl_->weights, impl_->config, {},
+                          nullptr, aux_ids_arg, aux_out_arg);
   s.warm = true;
   s.captured = false;
+  publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
@@ -8747,6 +8963,14 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     v1::GDNAttentionMetadata gdn_meta;
     std::unique_ptr<DBuf> hidden;     // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;     // [S,vocab] f32 held graph output
+    // SPEC-DSPARK W8 (#442): the DFlash/DSpark verify must ALSO emit the
+    // [S, H*taps] aux hidden capture the drafter conditions on. That is exactly
+    // why the verify never reached this graph: ForwardDeviceMultiTap returns
+    // BEFORE the decode-graph gate. Held PERSISTENTLY per slot (like `logits`) so
+    // the captured region writes a fixed address across replays -- the eager path
+    // allocates a fresh buffer per call, which a captured graph cannot do.
+    std::unique_ptr<DBuf> aux;        // [S, H*taps] bf16, null when no aux tap
+    int64_t aux_taps = 0;             // tap count this buffer + graph were built for
     void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
     int fa_cols = -1;                 // captured block-table column count
     bool captured = false;
@@ -8852,7 +9076,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     const v1::CommonAttentionMetadata& attn_meta,
     const v1::GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
-    const std::vector<GdnStateCache>& gdn_state) {
+    const std::vector<GdnStateCache>& gdn_state, Qwen3_5AuxTaps* aux_out) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, impl_->weights, impl_->config);
   const int64_t B = static_cast<int64_t>(token_ids.size());
@@ -8866,10 +9090,27 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // paths return a NON-owning view over the slot's persistent [S,vocab] logits
   // (first B rows are the real requests). Stream ordering guarantees the sampler
   // sees the replay's writes; the next same-size replay overwrites the buffer.
-  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  // SPEC-DSPARK W8 (#442): a uniform SPEC batch carries B = num_reqs * (1+k)
+  // tokens, which exceeds max_num_reqs and would make PadToCaptureSize return -1
+  // (eager). Capture its EXACT shape instead of padding: upstream pads only in
+  // whole multiples of the uniform query length (cudagraph_dispatcher.py:145
+  // asserts `num_tokens_padded % uniform_decode_query_len == 0`), and taking the
+  // exact shape trivially satisfies that while keeping the padded-row inertness
+  // question out of the spec path. The shape count stays bounded by max_num_seqs
+  // because num_reqs is.
+  const bool spec_step = gdn_meta.num_spec_decodes > 0;
+  const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
   if (!impl_->enabled || S < 0 ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
+    if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
+      // The graph cannot serve this batch (disabled / unsupported size), so fall
+      // back to the EAGER multi-tap forward, which fills aux_out itself. Without
+      // this the drafter sees no taps at all.
+      return Qwen3_5DenseModel::ForwardDeviceMultiTap(
+          token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
+          impl_->weights, impl_->config, impl_->queue, aux_out, {});
+    }
     DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                                gdn_state, impl_->weights, impl_->config, {});
     return WrapDeviceLogits(d, std::move(lg), vocab);
@@ -8881,7 +9122,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
   Impl::SlotRing& ring = impl_->slots[S];
-  const bool dbuf = impl_->dbuf;
+  // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
+  // inputs. The per-call StepDevInputs is a pool block freed when the call
+  // returns, so a graph captured against it replays over recycled memory.
+  const bool dbuf = impl_->dbuf || spec_step;
   Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
   if (dbuf) {
     ring.next ^= 1;
@@ -8899,12 +9143,61 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       s.reuse_event = b.CreateEvent(/*blocking=*/true);
     b.RecordEvent(s.reuse_event, impl_->queue);
   };
+
+  // SPEC-DSPARK W8 (#442): size this slot's PERSISTENT aux buffer and invalidate a
+  // graph captured for a different tap count. Only the EXACT-shape case (S == B,
+  // which is what a spec batch takes) is served: the aux contract is [T, H*taps]
+  // and padded rows would change T.
+  const int64_t aux_taps =
+      aux_out != nullptr ? static_cast<int64_t>(aux_out->layer_ids.size()) : 0;
+  if (s.aux_taps != aux_taps) {
+    if (s.graph != nullptr) {
+      b.DestroyGraph(s.graph);
+      s.graph = nullptr;
+    }
+    s.captured = false;
+    s.warm = false;
+    s.aux.reset();
+    s.aux_taps = aux_taps;
+  }
+  if (aux_taps > 0 && (s.aux == nullptr || s.aux->t().shape[0] != S)) {
+    s.aux = std::make_unique<DBuf>(d, DType::kBF16,
+                                   std::vector<int64_t>{S, H * aux_taps});
+  }
+  Tensor aux_view{};
+  const std::vector<int32_t>* aux_ids_arg = nullptr;
+  const Tensor* aux_out_arg = nullptr;
+  if (aux_taps > 0) {
+    ValidateAuxTapLayerIds(aux_out->layer_ids, impl_->config.num_hidden_layers);
+    aux_view = s.aux->t();
+    aux_ids_arg = &aux_out->layer_ids;
+    aux_out_arg = &aux_view;
+  }
+  // The captured region writes into the slot's buffer, so the drafter reads a
+  // NON-owning view valid until this slot's next replay -- the same lifetime the
+  // returned logits already carry.
+  const auto publish_aux = [&] {
+    if (aux_taps > 0) {
+      aux_out->storage.reset();
+      aux_out->tensor = s.aux->t();
+    }
+  };
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   v1::CommonAttentionMetadata pam;
   v1::GDNAttentionMetadata pgm;
-  BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
-                    pam, pgm);
+  if (spec_step) {
+    // S == B for a spec batch, so there is nothing to pad, and BuildPaddedDecode
+    // would REWRITE the metadata as pure non-spec decode (num_decodes = S,
+    // spec fields dropped). Carry the real metadata through untouched.
+    ptok = token_ids;
+    ppos = positions;
+    pam = attn_meta;
+    pgm = gdn_meta;
+  } else {
+    BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+                      pam, pgm);
+  }
 
   // A block-table column-count change reallocates the persistent block_table (the
   // staged/baked H2D dest shape moves) → invalidate this slot's graph + device inputs.
@@ -8927,6 +9220,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
+      StageSpecStepInputs(d, s);
       record_staged();
       MaybePoisonStagedInputs(impl_->poison, s);
     }
@@ -8938,6 +9232,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -8982,14 +9277,14 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, cols, idx, has_idx);
+      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
     DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                                  s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                                 impl_->config, {}, nullptr, nullptr, nullptr,
-                                 nullptr, dbuf ? s.dev.get() : nullptr);
+                                 impl_->config, {}, nullptr, nullptr, aux_ids_arg,
+                                 aux_out_arg, dbuf ? s.dev.get() : nullptr);
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
@@ -9002,6 +9297,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     record_staged();
     s.replays = 1;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -9013,9 +9309,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                                s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                               impl_->config);
+                               impl_->config, {}, nullptr, nullptr, aux_ids_arg,
+                               aux_out_arg);
   s.warm = true;
   s.captured = false;
+  publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);

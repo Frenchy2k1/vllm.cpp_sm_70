@@ -83,7 +83,7 @@ class AcceleratorMetadataContract(unittest.TestCase):
 
     def test_cuda_manifest_carries_all_sms_aot_and_external_driver(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            args = self.fixture(Path(temporary), "linux-x86_64-glibc-cuda-fat")
+            args = self.fixture(Path(temporary), "linux-x86_64-glibc-cuda")
             manifest = self.tool.prepare_accelerator_metadata(args)
             self.assertEqual(manifest["cuda"]["compiled_sms"], SMS)
             self.assertEqual(
@@ -103,7 +103,7 @@ class AcceleratorMetadataContract(unittest.TestCase):
 
     def test_cuda_refuses_partial_sm_or_disabled_triton_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            args = self.fixture(Path(temporary), "linux-x86_64-glibc-cuda-fat")
+            args = self.fixture(Path(temporary), "linux-x86_64-glibc-cuda")
             cache = (args.build_dir / "CMakeCache.txt").read_text()
             for before, after in (
                 ("80;86;87;89;90a;100a;103a;110;120a;121a", "80;86"),
@@ -191,7 +191,7 @@ realpath "$2/canonical-runtime"
                 [
                     "bash",
                     f"scripts/{BUILD_SCRIPT.name}",
-                    "linux-x86_64-glibc-cuda-fat",
+                    "linux-x86_64-glibc-cuda",
                     "cuda",
                     build_dir,
                 ],

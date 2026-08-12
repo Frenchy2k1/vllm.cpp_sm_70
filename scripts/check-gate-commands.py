@@ -275,8 +275,18 @@ def audit() -> list[dict]:
 # baseline member. All three departures are the same lifecycle-policy closure,
 # not downgraded verdicts or hidden work. Re-adding DONE to GATED_STATES is the
 # load-bearing mutation pinned in the paired suite.
+# 2026-08-11: +ENG-TRAILER-MERGE-ARTIFACTS on arrival at ACTIVE, then REMOVED
+# the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
+# the gated population, so its verdict is None rather than a downgraded one.
+# A shrink for a real record edit, named as the message demands.
+# 2026-08-11: +ENG-FORGE-COAUTHOR. Reaches ACTIVE on its committed spec (issue
+# #418), whose Gates section names the preflight, tests/scripts and
+# agent-integration invocations plus the per-commit re-verification of
+# f64f2b71, and records that no CUDA/GPU/SACRED gate is implicated because no
+# product source is touched. Growth, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
@@ -290,6 +300,12 @@ RUNNABLE_BASELINE = frozenset({
     "ENG-PRIORITY-SCHED",
     "ENG-RELEASE-CONTAINERS",
     "KERNEL-GEMM-CPU-ELEM",
+    # KV-EVENTS W3 (2026-08-11, issue #352): GROWTH, re-pinned in the same
+    # change. The row's Gates section previously described only in-process
+    # assertion counts; W3 names the CPU test binaries and the ctest sweep that
+    # gate the scheduler envelope and the report_mode=="full" reuse path, so the
+    # row now carries a command that can fail and joins the runnable population.
+    "KV-EVENTS",
     "LORA-RUNTIME",
     "KV-CHUNKED-LOCAL-SPEC",
     "KV-SLIDING-LOCAL-SPECS",

@@ -90,17 +90,17 @@ class PermissionMutationTests(unittest.TestCase):
 class TagGateMutationTests(unittest.TestCase):
     def test_an_ungated_publish_job_is_rejected(self):
         text = SHIPPED.replace(
-            "  publish:\n    needs: [plan, verify]\n    if: needs.plan.outputs.is_release == 'true'\n",
+            "  publish:\n    needs: [plan, verify]\n    if: needs.plan.outputs.publishes == 'true'\n",
             "  publish:\n    needs: [plan, verify]\n",
         )
-        assert_flags(self, text, "nothing publishes between tags")
+        assert_flags(self, text, "a pull request must not reach it")
 
     def test_an_ungated_promote_job_is_rejected(self):
         text = SHIPPED.replace(
             "  promote:\n    needs: [plan, attest]\n    if: needs.plan.outputs.is_release == 'true'\n",
             "  promote:\n    needs: [plan, attest]\n",
         )
-        assert_flags(self, text, "nothing publishes between tags")
+        assert_flags(self, text, ":latest follows a RELEASE")
 
     def test_dropping_the_tag_version_check_is_rejected(self):
         text = SHIPPED.replace('test "${GITHUB_REF_NAME}" = "v${version}"', "true")
@@ -188,6 +188,47 @@ class PlanAndPromoteTests(unittest.TestCase):
     def test_a_missing_job_is_reported_before_anything_else(self):
         text = SHIPPED.replace("  attest:\n", "  attest-disabled:\n")
         assert_flags(self, text, "missing the 'attest' job")
+
+
+class MainPublishTests(unittest.TestCase):
+    """Main ships moving :main-<lane> images. What must stay impossible is a
+    main run writing a version tag or moving :latest, and a pull request
+    reaching a registry at all."""
+
+    def test_promote_stays_release_only(self):
+        promote = guard.job_block(SHIPPED, "promote")
+        text = SHIPPED.replace(
+            promote,
+            promote.replace(
+                "if: needs.plan.outputs.is_release == 'true'",
+                "if: needs.plan.outputs.publishes == 'true'",
+            ),
+        )
+        assert_flags(self, text, ":latest follows a RELEASE")
+
+    def test_publish_must_be_gated_on_publishes(self):
+        publish = guard.job_block(SHIPPED, "publish")
+        text = SHIPPED.replace(
+            publish,
+            publish.replace("if: needs.plan.outputs.publishes == 'true'\n", "", 1),
+        )
+        assert_flags(self, text, "a pull request must not reach it")
+
+    def test_a_pull_request_cannot_be_classified_as_a_main_publish(self):
+        text = SHIPPED.replace('GITHUB_EVENT_NAME}" != "pull_request"', 'true')
+        assert_flags(self, text, "must never be classified as a publish")
+
+    def test_main_publish_must_not_write_a_version_tag(self):
+        manifest = guard.job_block(SHIPPED, "manifest")
+        text = SHIPPED.replace(manifest, manifest.replace("main-${lane}", "${version}-${lane}"))
+        assert_flags(self, text, "never a version")
+
+    def test_promote_must_not_move_main_tags(self):
+        promote = guard.job_block(SHIPPED, "promote")
+        text = SHIPPED.replace(
+            promote, promote.replace("--moving", "--moving # main-cpu")
+        )
+        assert_flags(self, text, "moves :latest* only")
 
 
 class BuildMatrixTests(unittest.TestCase):

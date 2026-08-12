@@ -1423,3 +1423,97 @@ TEST_CASE("kTENSTORRENT SupportsGraphCapture and matmul capture/replay") {
   backend.Free(mb);
   backend.Free(mc);
 }
+
+// BACKEND-TENSTORRENT-RESIDUAL-GOLDEN: op-level numerics probe at the
+// kDeviceResidualMinRows == 32 boundary. The device path (rows >= 32,
+// non-gemma) does ttnn::add + ttnn::rms_norm in bf16; the host/CPU path
+// (cpu_ops.cpp:371) accumulates the variance in f32. This measures the
+// divergence across the boundary both ways so the accept/raise/force-f32
+// decision is grounded in a real number, not a prior. CPU is the oracle.
+TEST_CASE("kTENSTORRENT kRmsNorm residual: device vs CPU f32 oracle across the rows=32 boundary") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  Backend& cpu = *vt::TryGetBackend(DeviceType::kCPU);
+  REQUIRE(&cpu != nullptr);
+
+  // Deterministic inputs: a simple LCG, independent of platform RNG.
+  auto lcg = [](uint32_t& s) {
+    s = s * 1664525u + 1013904223u;
+    return (s >> 8) * (1.0f / 16777216.0f) - 0.5f;  // [-0.5, 0.5)
+  };
+
+  // Qwen3-0.6B hidden width is 1024; use it so the reduction length is
+  // realistic (the bf16 variance accumulation is length-sensitive).
+  constexpr int64_t D = 1024;
+  const vt::RmsNormArgs args{1e-6f, /*gemma=*/false};
+
+  std::vector<float> w(D);
+  {
+    uint32_t s = 999;
+    for (int64_t j = 0; j < D; ++j) w[j] = 0.8f + 0.4f * lcg(s);  // [0.6, 1.0)
+  }
+
+  // rows that span the boundary both ways: below, at, just above, and larger.
+  const std::vector<int64_t> rows_cases = {1, 31, 32, 33, 64, 128};
+
+  for (int64_t rows : rows_cases) {
+    std::vector<float> x(static_cast<size_t>(rows * D));
+    std::vector<float> res(static_cast<size_t>(rows * D));
+    {
+      uint32_t sx = 12345, sr = 54321;
+      for (size_t i = 0; i < x.size(); ++i) {
+        x[i] = 2.0f * lcg(sx);    // [-1, 1)
+        res[i] = 2.0f * lcg(sr);  // [-1, 1)
+      }
+    }
+
+    auto run = [&](Backend& b, DeviceType dt, std::vector<float>& out) -> void {
+      void* mx = b.Alloc(x.size() * sizeof(float));
+      void* mw = b.Alloc(w.size() * sizeof(float));
+      void* mr = b.Alloc(res.size() * sizeof(float));
+      void* mo = b.Alloc(out.size() * sizeof(float));
+      Queue q = b.CreateQueue();
+      b.Copy(q, mx, x.data(), x.size() * sizeof(float));
+      b.Copy(q, mw, w.data(), w.size() * sizeof(float));
+      b.Copy(q, mr, res.data(), res.size() * sizeof(float));
+      Tensor tx = Tensor::Contiguous(mx, vt::DType::kF32, Device{dt, 0}, {rows, D});
+      Tensor tw = Tensor::Contiguous(mw, vt::DType::kF32, Device{dt, 0}, {D});
+      Tensor tr = Tensor::Contiguous(mr, vt::DType::kF32, Device{dt, 0}, {rows, D});
+      Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, Device{dt, 0}, {rows, D});
+      // Residual is passed (&tr) so the fused add->rms path
+      // (tenstorrent_ops.cpp ttnn::add + ttnn::rms_norm for rows>=32) is
+      // exercised on device — NOT plain rms. Dropping &tr would silently
+      // skip the residual merge this probe exists to measure.
+      vt::RmsNorm(q, to, tx, tw, args, &tr);
+      b.Copy(q, out.data(), mo, out.size() * sizeof(float));
+      b.Free(mx); b.Free(mw); b.Free(mr); b.Free(mo);
+    };
+
+    std::vector<float> out_cpu(x.size()), out_tt(x.size());
+    run(cpu, DeviceType::kCPU, out_cpu);
+    run(tt, DeviceType::kTENSTORRENT, out_tt);
+
+    float max_abs = 0.0f, max_rel = 0.0f;
+    for (size_t i = 0; i < out_cpu.size(); ++i) {
+      float d = std::fabs(out_tt[i] - out_cpu[i]);
+      if (d > max_abs) max_abs = d;
+      float denom = std::fabs(out_cpu[i]);
+      if (denom > 1e-3f) {
+        float r = d / denom;
+        if (r > max_rel) max_rel = r;
+      }
+    }
+    const bool device_path = (rows >= 32);  // kDeviceResidualMinRows
+    MESSAGE("rows=", rows, " (device_path=", device_path,
+            "): max_abs=", max_abs, " max_rel=", max_rel);
+    // Loose envelope: the device bf16 path must stay in bf16 territory. This
+    // is NOT the parity verdict — it is the non-vacuous RED hook. A diverging
+    // run (e.g. NaN, or >5%) trips it; the real accept/raise decision is
+    // recorded from the measured band, not asserted here.
+    CHECK(std::isfinite(max_abs));
+    CHECK(max_abs < 0.05f);
+  }
+}

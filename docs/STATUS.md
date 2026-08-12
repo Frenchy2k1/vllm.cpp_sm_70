@@ -38,7 +38,10 @@ Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**,
 Releases: W1-W11/W13 are implemented in #196; local CPU, Vulkan, archive,
 metadata and mutation gates are green, while the hosted eight-tuple dry run and
 tagged publication stay pending, so no binary is published. Container
-images (#170): the cpu lane passes its gate; nothing is published.
+images (#170): the cpu (amd64) and cuda (arm64) lanes pass their gates. One SBSA
+arm64 image serves BOTH families: GB10 `sm_121a`, and Jetson AGX Orin `sm_87`
+where Qwen3-0.6B generates with the GPU at 95-97% (Tegra needs
+`--runtime nvidia --gpus all`). Thor is unprobed; nothing is published.
 See [RELEASES](RELEASES.md).
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
@@ -80,7 +83,7 @@ token-for-token correctness against the pinned oracle.
 
 | Capability | State | Notes |
 |---|---|---|
-| Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **c1 0.838, c2-c8 0.95-0.97** (#213); c1 unmoved |
+| Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **flat 0.937-0.956 c1-c32** (#349; 0.838 void) |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32) | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending. Async-serving P0 FIXED (#323: the decode graph replayed stale HOST ids, now declines while the mirror is live; async 7/7 incl. Llama/Mistral/InternLM2) | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **Async device-mirror (`ROW-SERVE-ASYNC-DENSE-MIRROR`, `f9c969ae`): the #31 fix ported to the classic dense family, dgx-VERIFIED.** The shared dense `EmbedInto` (qwen3.cpp) raced the async combine's device input-ids write against a stale host upload → token-0 degeneration on the depth-2 AsyncLLM serving path (quant-independent). `EmbedInto` now consumes the device override published by `ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` (27B-dense template); gate `test_qwen3_dense_async_serving` RED on `VT_ASYNC_DEVICE_MIRROR=0`, GREEN default, byte-identical mirror-off. dgx GB10: async gate RED→GREEN 0.6B+4B, SACRED 0.6B+4B 184/184 unchanged (byte-neutral sync path), memcheck 0 errors; Yi30/Qwen3-8B-MXFP4 default-config e2e coherent + 3/4 token-exact (p2 = oracle-ratified near-tie, gap 0.0000), closing the QUANT-CT-MXFP4 async-default residual. RESIDUAL: sibling InternLM2/Mistral/Llama scope one-liner; W4 bench RAN; FA2 GQA-swap default-ON, c2-c8 <1.0x. `FLASH-PTXAS` #82: codegen at PARITY (no ptxas lever); gap=engine context. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
 | Qwen3.5-4B BF16 direct-load on discrete CUDA | Correct; throughput/host PSS ahead, acceptance `PENDING`; latency/VRAM open | Atomic pretoken exact. Ratios: tput 1.0283x; TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower; VRAM +118.7 MiB. GDN local stack retained ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
@@ -430,12 +433,21 @@ Vulkan (opt-125m exact; 25 native +8 GDN, both
 recurrences + fused attn preamble; 27B prefill 21.5x, decode
 4.36/4.35 MET; 27B load 100.8 -> 53.4 GiB; #125
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
-on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
-(**blind-written, unverified**); M2 needs verification; gfx1201 hipBLAS +
-Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
+on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
+Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
+oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
+but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
+contributor-measured on 2x R9700 and CPU-link-verified our side;
 [guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
-only a llama.cpp bar (#333). **Scale-out / distributed execution is scoped, with two legs landed
+only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
+kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler
+timeslice per dispatch whenever the pool was wider than the cores available to
+it, which the default `hardware_concurrency()` width reaches on its own. A
+bounded spin then `sched_yield` (#391 Lever 1, 2026-08-11) takes in512 decode
+**3.41x** and in128 prefill to **1.023x of llama.cpp**, and collapses the
+run-to-run decode spread from 73.3% to 15.2%. Prefill at 512 input tokens is
+**unmoved** and remains the open half of the gap (#391 Lever 2). **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
 `device_communicators` across multi-GPU TP+PP, 2×DGX-Spark over ConnectX-7
@@ -457,9 +469,25 @@ parallelism mode is enumerated and ranked in
 ~40% of the TP surface landed/reusable; **TP-W1 LANDED** (group table); W2..W4+W7
 (the engine-level TP2-on-CPU token-exact gate) are CPU-completable
 NOW; only NCCL + gate-model perf wait on hardware. The DSpark speculator
-(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is **SPIKED,
-not implemented** ([spec](../.agents/specs/dspark-spec-decode.md)): no code,
-no measurement.
+(DFlash-derived block drafter for our Qwen3 + Gemma4 families) is
+**IMPLEMENTED and MEASURED cross-engine**
+([spec](../.agents/specs/dspark-spec-decode.md) §6h, §6j): against the pinned,
+graphed oracle the 35B-A3B MoE lane runs at 0.92-0.98x with acceptance matching
+upstream (20.8% vs 20.4%). On matched content our proposals are near
+token-identical to upstream's and acceptance is at parity (12.1% vs 11.1%); the
+dense lane's 0.35x cell is void, because upstream's arm there degenerated into a
+repetition loop (8 distinct token ids across 128 tokens) that is trivially
+draftable. The open lever was per-step cost: 28% of the draft step was
+host-side sampling, now moved on device (#436, byte-identical output, sampling
+-11%/-15%, ~3% e2e on the 35B lane); what remains of that phase is a memory
+bandwidth bound on the per-step Markov GEMV that upstream pays identically.
+W8 (#442) then CAPTURED the T=1+k verify, mirroring vLLM's uniform-decode graph
+predicate (`uniform_decode_query_len = 1 + num_speculative_tokens`) instead of
+our `query_len == 1` gate: the MoE lane moves to **0.986x-0.995x** of the pinned
+graphed oracle (from 0.870x-0.981x), byte-identical, +8.5%/+4.7% same-binary.
+Close to parity but not at it: the residual ~1.4% is larger than the 0.3% rep
+spread. The Gemma4 `1 + N` layout is coded and unit-tested but has
+never run on real weights.
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the

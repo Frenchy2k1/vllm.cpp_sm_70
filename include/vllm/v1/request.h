@@ -234,6 +234,18 @@ struct Request {
   // length_from_prompt_token_ids_or_embeds).
   int num_prompt_tokens = 0;
 
+  // kv_cache_report_mode (request.py:123-127): how much of this request's KV
+  // cache activity reaches the KV-cache event stream. "incremental" (the
+  // default, and upstream's fallback whenever extra_args is absent or lacks the
+  // key) reports only blocks that were newly STORED; "full" additionally
+  // re-reports the prefix blocks this request REUSED from the cache, so a
+  // prefix-cache-aware router learns this engine holds them
+  // (kv_cache_manager.py:262-280 -> BlockPool::emit_cached_block_events).
+  // Set at construction from sampling_params.extra_args, mirroring
+  // `.get("kv_cache_report_mode", "incremental")`. Inert unless KV-cache events
+  // are enabled, which they are not by default.
+  std::string kv_cache_report_mode = "incremental";
+
   // Whether this request is still in its prefill (context) phase, i.e. it has
   // scheduled tokens it has not yet computed. Written by the scheduler in
   // _update_after_schedule (num_computed_tokens < num_tokens + placeholders);

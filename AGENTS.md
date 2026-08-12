@@ -142,6 +142,14 @@ code, and local dispatch — and cite the `file:line` you ported from. Dump the
 generated kernel before calling a lever unreachable. Anything written from
 scratch is recorded as such in the porting inventory.
 
+**Inherit its defaults, do not re-invent them.** vLLM resolves ONE model dtype
+and every layer inherits it; `f32` is a rare, annotated escape. Mirror that
+polarity. A buffer or GEMM output that names `f32` on a model path owes a
+one-line reason next to it. **A token gate cannot catch a dtype that is too
+WIDE** — it is still numerically correct, so tokens match, goldens pass, and we
+move twice the bytes. Check the memory format against the oracle explicitly,
+per [`.agents/porting.md`](.agents/porting.md).
+
 **Port its tests in the same change**, preserving parameters, modes, fixtures,
 tolerances, failure cases, and the upstream revision anchor. Document only
 unavoidable harness adaptation.
@@ -294,6 +302,14 @@ Assisted-by: AGENT:MODEL [TOOL]
 
 AI tools never add `Signed-off-by` or `Co-Authored-By`. The human submitter owns
 and reviews the change.
+
+That forbids an AI *claiming authorship*. It does not forbid the forge from
+recording who submitted: a `Co-authored-by` that GitHub generates for the account
+opening a pull request — the `@users.noreply.github.com` form — is attribution of
+a submitter and is accepted, even when that account is a bot. The claim about AI
+involvement is made by `AI-Assisted` and `Assisted-by`, which are the trailers
+that carry it and are never relaxed. `Signed-off-by` gets no such exemption: a
+sign-off is a legal assertion, not attribution.
 
 Classify policy, checker, doc, script, test, CI, generated, and product paths
 explicitly, and never hide mutable files behind a blanket directory exemption.

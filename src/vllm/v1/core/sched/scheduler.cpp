@@ -226,7 +226,9 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
                      KVCacheConfig kv_cache_config, int block_size,
                      bool enable_caching,
                      StructuredOutputManager* structured_output_manager,
-                     std::optional<SpeculativeConfig> speculative_config)
+                     std::optional<SpeculativeConfig> speculative_config,
+                     const distributed::KVEventsConfig* kv_events_config,
+                     int data_parallel_rank)
     : max_num_running_reqs(scheduler_config.max_num_seqs),
       max_num_scheduled_tokens(
           scheduler_config.ResolvedMaxNumScheduledTokens()),
@@ -250,9 +252,17 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
   // Scheduling policy -> the waiting (FCFS) queue.
   waiting = create_request_queue(ToQueuePolicy(scheduler_config.policy));
 
+  // KV-cache events (scheduler.py:116-119,155-158). A null config is upstream's
+  // `None`: events off, so this resolves to the `false` that used to be
+  // hard-coded below, and the factory hands back a no-op NullEventPublisher.
+  // The config pointee is consumed here and NOT retained.
+  enable_kv_cache_events_ = kv_events_config != nullptr &&
+                            kv_events_config->enable_kv_cache_events;
+  kv_event_publisher_ = distributed::EventPublisherFactory::create(
+      kv_events_config, data_parallel_rank);
+
   // Build the KV cache manager (upstream scheduler.py ctor). hash_block_size
-  // defaults to block_size; use_eagle / kv_cache_events off and dcp/pcp world
-  // sizes 1 at T0.
+  // defaults to block_size; use_eagle off and dcp/pcp world sizes 1 at T0.
   //
   // log_stats is ON: upstream's `disable_log_stats` defaults False, and the
   // benchmark protocol VOIDS any caching arm that cannot report queries/hits.
@@ -262,8 +272,17 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
       /*hash_block_size=*/block_size,
       /*max_num_batched_tokens=*/scheduler_config.max_num_batched_tokens,
       enable_caching, /*use_eagle=*/false, /*log_stats=*/true,
-      /*enable_kv_cache_events=*/false, /*dcp_world_size=*/1,
+      enable_kv_cache_events_, /*dcp_world_size=*/1,
       /*pcp_world_size=*/1, scheduler_config.watermark);
+}
+
+void Scheduler::shutdown() {
+  // scheduler.py:2456-2459. The publisher is never null (the factory returns a
+  // NullEventPublisher when events are off), so this needs no guard; upstream's
+  // `if self.kv_event_publisher:` guards an attribute that can be unset in
+  // partially-constructed teardown, which cannot happen here. The connector /
+  // ec_connector shutdowns upstream also performs belong to their own rows.
+  kv_event_publisher_->shutdown();
 }
 
 void Scheduler::add_request(std::unique_ptr<Request> request) {
@@ -1097,6 +1116,33 @@ EngineCoreOutputs Scheduler::update_from_output(
   // finished Request objects — upstream _free_blocks' `del self.requests[...]`).
   for (const std::string& id : finished_ids_to_erase) {
     requests.erase(id);
+  }
+
+  // Collect and publish this step's KV-cache events (scheduler.py:1901-1915).
+  // This is the LAST thing before the outputs are assembled, exactly as
+  // upstream: eviction events raised by allocate_slots during schedule() and
+  // store events raised by cache_blocks at the end of the step must land in the
+  // SAME batch, so the drain belongs at the end of the step, not in schedule().
+  //
+  // With events disabled (the default) take_events() returns the pool's empty
+  // queue and the `if` below never fires, so this is inert.
+  //
+  // DEFERRED: upstream also merges self.connector.take_events()
+  // (scheduler.py:1903-1910) into the batch. Our kv_offload::KVConnector has no
+  // KVCacheEvent-producing take_events -- the nearest thing,
+  // OffloadingManager::take_events, yields OffloadingEvent, a different type
+  // owned by KV-OFFLOAD. Bridging them is that row's work; coercing one into the
+  // other here would hide a real gap behind a plausible-looking merge.
+  std::vector<KVCacheEvent> kv_events = kv_cache_manager->take_events();
+  if (!kv_events.empty()) {
+    distributed::KVEventBatch batch;
+    // time.time(): wall-clock seconds since the epoch (NOT a steady clock) --
+    // a consumer correlates the batch against its own wall clock.
+    batch.ts = std::chrono::duration<double>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    batch.events = std::move(kv_events);
+    kv_event_publisher_->publish(batch);
   }
 
   EngineCoreOutputs engine_core_outputs;

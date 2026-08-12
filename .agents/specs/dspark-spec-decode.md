@@ -557,12 +557,429 @@ token in the Marlin MoE kernel at T=9, 6e), not by the missing graph. The lever
 worth building is the MoE verify path - expert batching for the 1+k shape, and
 finding why that path loses its graph - not a generic 1+k capture.
 
+## 6g. CORRECTION: there is no graph asymmetry (2026-08-11)
+
+Sections 6e and 6f both asserted that the speculative verify "runs fully eager"
+on the 35B (zero `cudaGraphLaunch`) while the dense path captured. **That does
+not reproduce and the claim is withdrawn.** Re-measured on the current binary
+with the dense lane's recipe (`--max-num-seqs 2`, same tool, same two lengths):
+
+| arm | `cudaGraphLaunch` |
+|---|---:|
+| 35B spec-off 32 / 64 | 30 / 62 |
+| **35B DSpark 32 / 64** | **15 / 28** |
+| 27B spec-off 32 / 64 | 30 / 62 |
+| **27B DSpark 32 / 64** | **11 / 24** |
+
+`VT_DFLASH_GRAPH_STATS=1` confirms it independently: `[DFLASH-GRAPH] captured
+#1 Tq=8 C=5` (35B) and `Tq=15` (27B). BOTH families capture. Issue #389, filed
+on the non-reproducing zero, is CLOSED as not a defect.
+
+**What the gate actually says**, which reading it would have shown before either
+section was written: both target gates require `input.pure_decode`
+(`num_actual_tokens == num_reqs`; qwen3_5_dense.cpp:159, qwen3_5_moe.cpp:128).
+A verify carries 1+k tokens per request, so **the verify is eager on BOTH
+families** — including the dense one that reached 1.77x. The graph launches under
+DSpark are the DRAFT step (D13 Part C, gated `P == 1`), one per propose, which is
+exactly why the count tracked speculative steps.
+
+**Net effect on the attribution: it survives and gets cleaner.** With no graph
+difference between the families, the 35B's 1.15x against the dense 1.77x rests
+entirely on MoE expert activation (1.7x more GPU time per generated token at
+T=9, 6e). And the standing lever is better evidenced than when 6e proposed it:
+the 1+k verify is eager EVERYWHERE, so capturing that shape is unexploited
+headroom on both families rather than a repair to one.
+
+**Method note worth keeping:** 6e drew an architectural conclusion from a single
+profile without a same-binary control. The dense lane was the control that caught
+it, and the counter settled it in one run. A launch-count difference between two
+models is a claim about a gate — read the gate.
+
 **Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
-PRODUCTION GRAPHED config through the project's harness, not the eager arm run
-here; (2) token-exactness against that oracle on the SACRED corpus rather than
-ad-hoc prompts; (3) the acceptance-rate band against the upstream reference;
-(4) the 27B lane and the Gemma4 `1 + N` layout; (5) capturing the SPECULATIVE VERIFY shape, which § 6d measures as the real
-gap (the draft-step capture that looked like the lever is worth ~1%).
+PRODUCTION GRAPHED config — **DONE in §6h**, against the pinned oracle;
+(2) token-exactness against that oracle on the SACRED corpus rather than ad-hoc
+prompts; (3) the acceptance-rate band against the upstream reference — **DONE
+in §6h**, and it is the finding: 35B matches (20.8% vs 20.4%), the 27B dense
+lane does not (12.2% vs 49.3%); (4) the 27B lane — **measured in §6h** — and
+the Gemma4 `1 + N` layout, still unrun on real weights; (5) capturing the
+SPECULATIVE VERIFY shape, which § 6d measures as the real gap (the draft-step
+capture that looked like the lever is worth ~1%).
+
+## 6h. CROSS-ENGINE A/B vs the PINNED, GRAPHED oracle (2026-08-11)
+
+Every earlier oracle arm in this spec ran `enforce_eager=True`, which the house
+rule forbids as a denominator. This is the binding replacement: vLLM in its
+production graphed configuration, same target + draft + k + `max_num_seqs=2`,
+same greedy sampling, one `flock`, both prompts timed per-prompt.
+
+**The first attempt measured the WRONG ORACLE.** `~/venvs/vllm-oracle` is a
+symlink to the preserved `v0.25.0-stage` ROLLBACK, not to the pin, so the run
+recorded `vllm 0.25.0` and proceeded happily — issue #375's failure mode
+exactly, and a deterministic wrong reference is indistinguishable from a right
+one. The pinned build is `~/venvs/vllm-oracle-next`
+(`0.23.1rc1.dev1511+g555967922`, FlashInfer 0.6.15.post1, Torch 2.13.0,
+transformers 5.14.1 — matching `upstream-sync.md` on every axis). The harness
+now ASSERTS commit + FlashInfer and aborts on mismatch. The 0.25.0 numbers are
+kept only as context; they are NOT quotable, and they mislead in both
+directions (the rollback's DSpark is far slower: 35B 89.8 vs the pin's 146.4).
+
+Warm tok/s (`completion_tokens / whole-request wall`, identical on both sides:
+`examples/cli/main.cpp:253-270` vs the oracle's `generate()` wall), median of
+warm repeats, cold first run discarded:
+
+| lane / prompt | ours | pinned vLLM | ours/vLLM | our speedup | its speedup |
+|---|---|---|---|---|---|
+| 35B spec-off, "capital" (128 tok both) | 71.47 | 73.91 | 0.967x | — | — |
+| 35B DSpark k=8, "capital" (128 tok both) | 74.10 | 75.92 | 0.976x | 1.037x | 1.027x |
+| 35B DSpark k=8, "fibonacci" (89 tok both) | 134.85 | 146.41 | 0.921x | 1.914x | 2.583x |
+| 27B spec-off, "fibonacci" (126 tok both) | 9.80 | 9.51 | 1.031x | — | — |
+| 27B DSpark k=15, "fibonacci" | 31.83 | 34.06 | 0.935x | 3.248x | 3.583x |
+| **27B DSpark k=15, "capital"** | 17.41 | **49.71** | **0.350x** | 1.757x | **5.233x** |
+
+Acceptance, from upstream's own `vllm:spec_decode_*` counters against ours:
+
+| lane | ours | pinned vLLM | accepted per draft (vLLM) |
+|---|---|---|---|
+| 35B A3B MoE, k=8 | 20.8% | 20.4% (212/1040) | 1.63 of 8 |
+| 27B dense, k=15 | 12.2% | **49.3%** (281/570) | **7.39 of 15** |
+
+**Result.** Two different verdicts, and the previous framing had them backwards.
+
+- **35B MoE lane: near parity.** 0.92–0.98x cross-engine, and our acceptance
+  MATCHES upstream's (20.8% vs 20.4%). Nothing here points at draft quality;
+  the residual is per-step cost, the same story §6f measured.
+- **27B dense lane: the real gap, and it is DRAFT QUALITY.** Upstream accepts
+  49.3% where we accept 12.2% — 7.39 accepted tokens per draft against our
+  ~1.8 — so upstream extracts 5.23x from the same checkpoint where we get
+  1.76x. §6f called this lane's 1.77x our strongest result; measured against
+  the actual reference it is our weakest. That 1.77x was a self-speedup, never
+  a cross-engine one.
+
+**Ruled out for the dense acceptance gap** (checked, not assumed): mis-resolved
+aux taps. The 27B draft declares five taps at absolute target indices
+`[1, 16, 31, 46, 61]` and the 27B target is a hybrid (linear-attention +
+full-attention layers), so a tap resolved against a filtered layer list would
+land on the wrong layer and degrade drafts silently. Both `MaybeCaptureAuxTap`
+call sites sit inside the full `for (l = 0; l < num_hidden_layers; ++l)` loop
+and index by absolute `l`, covering both layer kinds
+(`qwen3_5.cpp:6707`, `:7546`). Also ruled out: the Markov step loop, which
+matches upstream's shape (`prev` seeded from the anchor, re-biased per step,
+argmax over `base + bias`, then `d2t` — `speculator.py:120-121,148`).
+
+**Next traceable hypothesis** (no ceiling is being declared): the 27B draft uses
+the flat/native config layout and carries NO `draft_vocab_size`, where the 35B
+carries 32000 and reaches upstream-matching acceptance through the Speculators
+translation path. The d2t/reduced-vocab handling on the flat path is therefore
+the next thing to instrument — compare our proposed draft token ids against
+upstream's for an identical prefix, rather than comparing acceptance totals.
+
+**Caveat on the table.** Greedy outputs diverge between arms and between
+engines on several cells, so completion counts differ (27B "fibonacci": ours
+128, upstream 52; 27B "capital": ours 84, upstream 128). Per-token throughput
+still compares, but the content differs. The cleanest cells — where all arms
+returned identical token counts — are 35B "capital" (128 everywhere) and 35B
+DSpark "fibonacci" (89 both), and those are the 0.92–0.98x readings. The 27B
+"capital" 0.350x is a 2.9x gap that content differences cannot account for.
+
+Note for the token gate: on the pinned oracle the 35B spec-on and spec-off
+streams are byte-identical (`[11751, 11, 264, 3177, 34756, ...]` both), i.e.
+upstream's DSpark is lossless on that lane, while its 27B arms diverge at
+position 3. Ours returned different completion counts between arms on 35B
+"fibonacci" (87 off vs 89 on) where upstream returned 89 for both.
+
+Tracked as issue #430. Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json` (pinned),
+`xengine_*.json` (0.25.0, non-binding), `xengine.log`, `xengine_ours.log`.
+
+## 6i. TEXT PARITY vs the pinned oracle: the BASELINE drifts too (2026-08-11)
+
+§6h flagged that our 35B "fibonacci" arms returned 87 tokens spec-off and 89
+spec-on where upstream returned 89 for both, and asked whether our DSpark is
+lossy. Measured, on the same eight arms, greedy, against the pinned oracle's
+own text:
+
+| case | verdict | first divergence |
+|---|---|---|
+| 35B spec-OFF "capital" | DIFFER | char 218 ("the 10th century" vs "the Middle Ages") |
+| 35B spec-OFF "fibonacci" | DIFFER | char 91 |
+| 35B DSpark "capital" | DIFFER | char 76 |
+| 35B DSpark "fibonacci" | DIFFER | char 55 (`return (` vs `return(`) |
+| 27B spec-OFF "capital" | DIFFER | char 244 |
+| 27B spec-OFF "fibonacci" | **EXACT** | 382 chars |
+| 27B DSpark "capital" | DIFFER | char 7 |
+| 27B DSpark "fibonacci" | DIFFER | char 5 |
+
+**The answer is no, and the question was malformed.** Our SPEC-OFF baseline
+already diverges from the pinned oracle's spec-off on three of four prompts, so
+an ad-hoc prompt comparison cannot isolate a DSpark defect: there is nothing to
+subtract it from. The divergences are the ratified near-tie regime (identical
+for 218 and 244 characters, then a single word choice diverging and the
+trajectories separating), which is exactly what the distributional gate exists
+for. Nothing here is attributable to the speculator.
+
+Two consequences:
+
+1. The completion-count asymmetry noted in §6h is withdrawn as evidence about
+   DSpark. It is baseline drift.
+2. The owed token gate is unchanged and cannot be replaced by this check: it
+   must be the SACRED corpus under the ratified near-tie/distributional
+   protocol (ours in the oracle's K-run set), not ad-hoc prompts. What §6i adds
+   is the reason a cheap substitute will not do.
+
+Note the two 27B DSpark arms diverge very early (chars 7 and 5) while the 27B
+spec-off arm on the same prompt matched for 382 characters. That is consistent
+with the #430 acceptance gap rather than independent of it, but it is NOT
+evidence on its own, because the other 27B prompt's spec-off arm diverged at
+char 244. Instrumenting proposed draft ids against upstream's (the #430 next
+step) settles it; this does not.
+
+Evidence: `dgx:~/work/dspark-w6/parity/*.txt` vs `pinned_*.json`.
+
+## 6j. CORRECTION: there is no draft-quality gap; the gap is PER-STEP COST (2026-08-12)
+
+Section 6h concluded "27B dense lane: the real gap, and it is DRAFT QUALITY",
+from upstream's aggregate counters (49.3% accepted) against ours (12.2%). Direct
+instrumentation of BOTH engines refutes that. Issue #430 is closed as refuted.
+
+**Our proposals are nearly token-identical to upstream's.** Dumping upstream's
+`_sample_sequential` (anchor + the k proposed ids) against our `VT_SPEC_TRACE`
+at the same anchors:
+
+| anchor | upstream proposes | we propose |
+|---|---|---|
+| 11751 | `13 271 9764 6511 220 6511 314 279 369 279 198 13 198 ...` | `13 271 9764 6511 220 6511 314 279 369 279 198 13 198 ...` |
+| 248068 | `198 248069 271 760 6511 314 9338 369 ...` | `198 248069 271 760 6511 314 9338 369 ...` |
+| 2972 | `57590 332 369 279 6511 314 9338 9338 13 248046 ...` | `57590 332 369 279 6511 314 9338 9338 13 248046 ...` |
+
+**Acceptance is at parity on matched content.** Same prompt, both engines
+emitting the same tokens: ours 32 tokens in 11 draft steps (12.1% of k=15),
+upstream 32 tokens in 12 steps (11.1%). We are marginally ahead.
+
+**Where 49.3% came from.** Upstream's graphed benchmark run on "The capital of
+France is" DEGENERATED into a repetition loop: **8 distinct token ids across 128
+tokens** ("The capital of France is Paris." ten times), while upstream's OWN
+spec-off arm on that prompt produced ordinary reasoning text. Trivially
+predictable text is trivially draftable, which is what produced 7.39 accepted
+per draft and 49.7 tok/s. Our engine generated real reasoning text there, so the
+"0.350x" cell compared 84 tokens of reasoning against 128 tokens of a loop. It
+was never a like-for-like cell, and §6h's caveat understated that badly.
+
+**Ruled out for the acceptance question** (each checked in source, not assumed):
+aux tap indexing; the Markov step loop; d2t / reduced vocab (this checkpoint has
+NO d2t — both Markov tables are full `[248320, 256]`); `logit_scale` (upstream
+routes base logits AND bias through the same `logits_processor`, so it cancels
+in the argmax); head aliasing (we correctly keep the draft's own shipped
+`embed_tokens`/`lm_head`); **risk R3 RESOLVED** — `attn_output_gate` is inert
+metadata, `q_proj` is `[4096, 5120]`, not doubled; and the non-causal resolution
+(ours mirrors upstream's inverted `causal = is_sliding` rule, so all five draft
+layers are non-causal exactly as upstream has them).
+
+**The anchor layout is CORRECT.** An A/B on our own engine, same weights with
+only `sample_from_anchor` flipped in a copied config, drives acceptance to ZERO
+on every step when forced to the 1+N layout (15.6 -> 6.24 tok/s): the proposals
+land off-by-one because that layout drops the anchor row's prediction. The 27B
+is the only lane on `sample_from_anchor=true` (the flat config defaults it true,
+`model_loader.cpp:407-408`; the Speculators translation writes false explicitly,
+`qwen3_dspark.cpp:133-136`), which is why it was the natural suspect. It is not
+the defect.
+
+**What the gap actually is.** `[spec-phase] backbone=27.44ms sample=10.50ms`:
+28% of the draft step is host-side sampling, because every block-forward variant
+returns `std::vector<float>` and the host loop then downloads a
+`[B, draft_vocab]` bias and argmaxes over the FULL vocab once per step. On the
+27B that is k x 248320 floats per step; the 35B's reduced 32000-vocab draft
+moves 13x less, which is part of why THAT lane already sits at 0.92-0.98x. This
+is spec risk R5, recorded when the lane landed and never closed. W7 (#436)
+closes it.
+
+## 6k. W7 RESULT: device sampling is token-identical, and the residual is a BANDWIDTH bound (2026-08-12)
+
+A/B on the same binary, only `VT_DSPARK_DEVICE_SAMPLE` differing, one flock,
+warm repeats, cold run discarded.
+
+| arm | sample ms | warm tok/s |
+|---|---|---|
+| 27B host loop | 10.44 | 17.31 |
+| 27B device | **9.24** (-11.5%) | 17.42 |
+| 35B host loop | 0.59 | 71.06 |
+| 35B device | **0.50** (-15%) | 73.3 (+3.2%) |
+
+**Text is byte-IDENTICAL on both lanes**, which is the bar for a pure cost move.
+
+**The residual is not host overhead, it is bandwidth, and upstream pays it too.**
+`markov_w2` is `[draft_vocab, markov_rank]` bf16, so the per-step bias GEMV
+re-reads the WHOLE matrix:
+
+| lane | markov_w2 | per draft step | at ~205 GB/s | measured |
+|---|---|---|---|---|
+| 27B (V=248320) | 127 MB | 15 x 127 MB = 1.9 GB | 9.3 ms | **9.24 ms** |
+| 35B (V=32000) | 16 MB | 8 x 16 MB = 131 MB | 0.6 ms | **0.50 ms** |
+
+Two lanes 13x apart in vocab both landing on the bound is not a coincidence. The
+k sequential GEMVs are required by DSpark's mechanism (`speculator.py:151`),
+upstream runs the same math, and no amount of graph capture removes weight
+traffic. **Do not chase this further as if it were overhead**: the only way to
+move it is to change what is computed (pruning the bias to a candidate set),
+which changes tokens and is out of scope for a cost move.
+
+What W7 removed is the host part: k downloads of `[num_reqs, draft_vocab]` f32
+and k host argmaxes over the full vocab, replaced by one base-logits upload and
+a `[num_reqs]` i64 readback per step. Worth 11-15% of the sampling phase and
+~3% e2e on the 35B lane.
+
+The block-forward's own `[nqpr, draft_vocab]` D->H, which every variant still
+performs (`qwen3_dflash.h:155,202,248,284`), sits inside `backbone=27.4ms` and is
+NOT addressed here. At 14.9 MB it is worth ~0.15 ms on GB10, so it is a small
+prize and should be SIZED before it is built.
+
+Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
+
+## 6l. PAIRED PARITY RE-MEASURE WITH W7: still BELOW parity (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle, same
+target+draft+k, `max_num_seqs=2`, greedy, matched token counts, cold run
+discarded. Ours is 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | **0.981x** |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | **0.870x** |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40 — a 0.4%
+spread — so 0.870x is a real reading, not noise. The capital cell spreads ~8%
+(71.58-77.67), so treat 0.981x as the looser of the two.
+
+**W7 did not close the gap, and the goal of speed parity is NOT met.** W7 removed
+host-side sampling waste worth 11-15% of the sampling phase, but sampling is a
+small share of the step on this lane (0.5 ms of it), so the e2e effect is within
+the capital cell's own noise band. Do not read the earlier 79.19 tok/s as a W7
+win: that was PRE-REBOOT machine state, and on the idle box both engines moved,
+the oracle more than us. Same-session pairing is what makes these two rows
+quotable and the earlier cross-session ones not.
+
+**Where the remaining gap is, and the next lever.** The deficit is largest in the
+HIGH-ACCEPTANCE regime (fibonacci 0.870x, where the block is mostly accepted and
+the T=1+k verify runs every step) and smallest in the low-acceptance one
+(capital 0.981x). That points at the verify forward, not the drafter: §6g
+established that BOTH model families gate their decode CUDA graph on
+`input.pure_decode` (`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`), so our
+speculative verify at T=1+k falls off the captured graph and runs EAGER, while
+upstream captures the uniform `1+k` shape. That is the same unexploited headroom
+DFlash left open (D12 Part C) and it is the next thing to build. It is a
+static-shape capture increment, not a tuning knob.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
+
+## 6m. W8 SLICE: capture the T=1+k verify (the remaining gap), issue #442
+
+§6l localises the residual 0.870x-0.981x to the VERIFY forward. This is the
+scoped increment that closes it; it is dispatch-ready and deliberately NOT
+started here, because a half-finished CUDA-graph capture is worse than none.
+
+**ROOT CAUSE (2026-08-12): we mirrored the model but NOT vLLM's cudagraph
+dispatcher.** Upstream's "uniform" test is that all requests share a query_len,
+NOT that query_len is 1 (`v1/worker/gpu/cudagraph_utils.py:95-105`), and the
+captured decode length is defined as the verify shape:
+`self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens`
+(`v1/cudagraph_dispatcher.py:37`), so a uniform 1+k batch takes the FULL graph
+(`:143-146`). vLLM graphs the speculative verify BY CONSTRUCTION. We never do,
+so our verify runs eager EVERY step — the whole ~4.8 ms/step, and the reason the
+deficit tracks acceptance (0.870x where the block is mostly accepted, 0.981x
+where it is not). Nothing is missing from the model: kernels, drafter and
+acceptance are already at parity. The missing piece is dispatch.
+
+This makes the increment a MIRRORING job with an upstream anchor: generalise the
+predicate to upstream's uniform test with query length `1 + num_spec`, key
+captures on a `(num_tokens, num_reqs, uniform)` descriptor instead of one bespoke
+pure-decode graph, and pad token counts to a captured set as
+`_bs_to_padded_graph_size` does so a handful of shapes covers every batch.
+
+**Predicate.** `pure_decode` is `num_actual_tokens == num_reqs`
+(`qwen3_5_dense.cpp:159`, `qwen3_5_moe.cpp:128`). A verify submits
+`num_reqs x (1+k)` tokens and therefore runs eager EVERY step, while upstream
+captures the uniform `1+k` shape.
+
+**Do NOT just widen the gate.** `Qwen3_5DenseDecodeGraph` is documented
+pure-decode ("all query_len==1"); relaxing the predicate would send a spec batch
+through a graph captured for a different shape AND a different attention path.
+The increment is a sibling capture keyed on `(num_reqs, 1+k)` that routes the
+SPEC paths already landed under `SPEC-GDN-SEGMENTS` (`vt::GdnSpecDecode`,
+`vt::CausalConv1dSpecUpdate`, per-timestep snapshots) and block-diagonal causal
+attention over the query span. k is fixed per config and `num_reqs <=
+max_num_seqs`, so the shape set is small and static.
+
+**Gate:** replayed == eager BIT-IDENTICAL on both gate models; spec-OFF
+byte-identical (SACRED); then the paired cross-engine re-measure on the same two
+35B cells, target >= 1.0x on both.
+
+**Capture safety:** no function-local upload temporaries in the captured region.
+This repo has already shipped a use-after-free from exactly that, and a
+sanitizer-clean run is not proof of capture safety -- pair it with an explicit
+replay-vs-eager bit-compare.
+
+## 6n. W8 LANDED: the verify is captured, and the 35B lane reaches ~parity (2026-08-12)
+
+§6l put the MoE lane at 0.870x / 0.981x and localised the deficit to the eager
+T=1+k verify. §6m named vLLM's dispatch predicate as the missing mirror. This is
+the implementation and its measurement.
+
+**Paired against the pinned graphed oracle, one lock session, matched token
+counts, ours = median of 3 warm reps:**
+
+| 35B cell | before W8 | with capture | pinned vLLM | ratio |
+|---|---|---|---|---|
+| "capital", 128 tok both | 72.23 | **78.37** | 78.76 | **0.995x** (was 0.981x) |
+| "fibonacci", 89 tok both | 134.55 | **140.82** | 142.88 | **0.986x** (was 0.870x) |
+
+Capture is worth **+8.5%** and **+4.7%** on the SAME binary
+(`VT_SPEC_DECODE_GRAPH=0` is the eager arm), and it closes the high-acceptance
+cell from 0.870x to 0.986x, which is where the ~4.8 ms/step lived. Not >= 1.0x:
+the residual is ~1.4% and our reps spread 0.3%, so it is real, not noise.
+
+**Correctness.** Text byte-identical capture-vs-eager on both lanes, and the
+project's four e2e spec-decode suites pass with capture ON and OFF with identical
+assertion counts: `test_qwen27_spec_decode` 9, `test_qwen27_dflash_spec_decode`
+27, `test_qwen36_spec_decode` 9, `test_qwen27_spec_decode_concurrent` 5. Default
+ON re-verified with the env unset.
+
+**What it took, because four of the five attempts were wrong and each failure
+taught the next.**
+
+| attempt | result | cause |
+|---|---|---|
+| predicate only | INERT, no graph built | `ForwardDeviceMultiTap` returns BEFORE the gate |
+| + aux capture | both arms crashed | padding rewrote spec metadata; Step's fallback dropped aux |
+| + those fixes | captured, but GARBAGE + 5x SLOWER | stale `num_accepted` |
+| + spec staging | `cudaMemcpyAsync: invalid argument` | per-request arrays sized by TOKEN count |
+| + token/request split | correct AND faster | — |
+
+Three of these deserve to be remembered:
+
+1. **The aux tap is why the verify never captured.** DFlash/DSpark must emit the
+   `[T, H*taps]` hidden capture the drafter conditions on, and that path returned
+   before the decode-graph gate. No predicate change could have reached it. Each
+   `SizeSlot` now owns a persistent aux buffer, like its logits.
+2. **Stale `num_accepted` is silent and catastrophic.** `StageStepInputs` refilled
+   only the pure-decode fields, so a replay re-read the PREVIOUS step's
+   acceptance — the value `GdnSpecDecode` uses to pick the initial state (column
+   `num_accepted-1`) and advance the conv window. Wrong state produced incoherent
+   tokens AND 5x slower (26 vs 136 tok/s), because zero acceptance multiplies the
+   step count. `StageSpecStepInputs` refills them per step, outside the region.
+3. **We had collapsed TOKENS and REQUESTS into one count.** The staging sized
+   `block_table` as `S*cols`, `seq_lens` as `S`, `qsl` as `S+1` — correct only
+   because pure decode has `S == num_reqs`. Under speculation `S = num_reqs*(1+k)`,
+   so it overran host and device buffers. Upstream carries BOTH in its graph key
+   (`BatchDescriptor(num_tokens, num_reqs, uniform)`) for exactly this reason.
+   This is the deepest form the "mirror vLLM" rule took here: the divergence was
+   not a kernel or a heuristic, it was a data model.
+
+A false pass to remember too: an early run reported text `IDENTICAL` while
+comparing two EMPTY outputs, because both arms had failed identically. The exit
+codes caught it; the diff did not.
+
+**Owed next:** the residual ~1.4%, the 27B dense lane re-measure (its cells were
+never like-for-like), and the padded/multi-request spec shapes — capture takes the
+EXACT shape today, which is bounded by `max_num_seqs` but leaves batching on the
+table.
 
 ## 7. Evidence, authority, stop conditions
 

@@ -2,7 +2,7 @@
   "artifact": {
     "c_abi_version": 17,
     "channel": "preview",
-    "id": "linux-x86_64-glibc-cuda-fat",
+    "id": "linux-x86_64-glibc-cuda",
     "kind": "primary",
     "static_boundary": "static-core",
     "version": "0.1.0-test"

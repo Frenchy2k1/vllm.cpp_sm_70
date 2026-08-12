@@ -110,9 +110,20 @@ struct SyntheticMuse {
 
   // `q_norm_scale` / `k_norm_scale` are the MUTATION handles: the real converter
   // folds the query pre-scale into attn_q_norm and leaves attn_k_norm at ones.
+  //
+  // `post_norm_eps` / `attention_scale` are emitted only when POSITIVE. The
+  // released converter writes NEITHER — the real 17 GB file's 32 KV pairs were
+  // dumped and carry no `attention.post_norm_rms_epsilon` and no
+  // `attention.scale` — so the default build reproduces that, and a positive
+  // value gates the "a future converter DOES emit it" path (issue #412).
+  // `omit_optional_kvs` drops the four the real file DOES carry, pinning what
+  // the arm falls back to without them.
   static std::string Build(float q_norm_scale = kQueryPreScale,
                            float k_norm_scale = 1.0f,
-                           bool q_norm_constant = true, bool untied = true) {
+                           bool q_norm_constant = true, bool untied = true,
+                           float post_norm_eps = -1.0f,
+                           float attention_scale = -1.0f,
+                           bool omit_optional_kvs = false) {
     GgufModelBuilder b;
     const std::string a = "muse-glimmer.";
     b.AddKv(StrKv("general.architecture", "muse-glimmer"));
@@ -125,10 +136,15 @@ struct SyntheticMuse {
     b.AddKv(U32Kv(a + "attention.key_length", static_cast<uint32_t>(kHeadDim)));
     b.AddKv(U32Kv(a + "attention.value_length", static_cast<uint32_t>(kHeadDim)));
     b.AddKv(F32Kv(a + "rope.freq_base", 500000.0f));
-    b.AddKv(F32Kv(a + "attention.layer_norm_rms_epsilon", 1e-5f));
-    b.AddKv(F32Kv(a + "final_logit_softcapping", 20.0f));
-    b.AddKv(F32Kv(a + "logit_scale", 0.19611613f));
-    b.AddKv(U32Kv(a + "attention.sliding_window", 2048));
+    if (!omit_optional_kvs) {
+      b.AddKv(F32Kv(a + "attention.layer_norm_rms_epsilon", 1e-5f));
+      b.AddKv(F32Kv(a + "final_logit_softcapping", 20.0f));
+      b.AddKv(F32Kv(a + "logit_scale", 0.19611613f));
+      b.AddKv(U32Kv(a + "attention.sliding_window", 2048));
+    }
+    if (post_norm_eps > 0.0f)
+      b.AddKv(F32Kv(a + "attention.post_norm_rms_epsilon", post_norm_eps));
+    if (attention_scale > 0.0f) b.AddKv(F32Kv(a + "attention.scale", attention_scale));
     // The released 30B pattern, truncated: NoPE (false) every 4th layer.
     b.AddKv(gguf_test::BoolArrayKv(a + "attention.sliding_window_pattern",
                                    {true, true, true, false}));
@@ -333,6 +349,76 @@ TEST_CASE("muse glimmer gguf: config descends from the file's own metadata") {
   CHECK(p.text.scale_query_by == doctest::Approx(SyntheticMuse::kQueryPreScale));
   // The text GGUF carries no perception encoder; that ships as a separate file.
   CHECK(p.vision.present == false);
+}
+
+TEST_CASE("muse glimmer gguf #412: the post-norms run at 1e-8, not at rms_norm_eps") {
+  // THE LIVE HALF OF #412. The released `muse-glimmer-30B-kquant-17gb.gguf` has
+  // 32 KV pairs and NOT ONE of them is a post-norm epsilon (header dumped
+  // 2026-08-11), so this is the value the only runnable quantized arm actually
+  // used: both sandwich post-norms at 1e-5 instead of 1e-8, a thousand times too
+  // large. The released safetensors `config.json` ships `post_norm_eps = 1e-08`,
+  // which makes it an ARCHITECTURE CONSTANT the converter merely fails to carry,
+  // not a per-checkpoint knob the GGUF is entitled to redefine.
+  const TempFile f(SyntheticMuse::Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  REQUIRE(g.FindKv("muse-glimmer.attention.post_norm_rms_epsilon") == nullptr);
+
+  const vllm::MuseGlimmerParams p =
+      vllm::ParseMuseGlimmerParams(vllm::MuseGlimmerHfConfigFromGguf(g));
+  // `.scale(0)`: doctest's Approx carries a scale term defaulting to 1.0, so a
+  // bare `Approx(1e-8)` accepts 1e-5 — the very value under test — as equal.
+  CHECK(static_cast<double>(p.text.rms_norm_eps) == doctest::Approx(1e-5).scale(0.0));
+  CHECK(static_cast<double>(p.text.post_norm_eps) == doctest::Approx(1e-8).scale(0.0));
+  CHECK(static_cast<double>(p.text.post_norm_eps) !=
+        doctest::Approx(static_cast<double>(p.text.rms_norm_eps)).scale(0.0));
+}
+
+TEST_CASE("muse glimmer gguf #412: a converter that DOES emit the two keys is honoured") {
+  // The default must not become a ceiling. A future converter emitting
+  // `attention.post_norm_rms_epsilon` or llama.cpp's `attention.scale`
+  // (LLM_KV_ATTENTION_SCALE, llama-arch.cpp:240) has to WIN over both the
+  // architecture default and the value recovered from the folded attn_q_norm —
+  // otherwise the file says one thing and the model does another.
+  const float kEps = 3e-7f;
+  const float kScale = 0.5f;  // the SOFTMAX scale; head_dim 4 => pre-scale 1.0
+  const TempFile f(SyntheticMuse::Build(SyntheticMuse::kQueryPreScale, 1.0f, true,
+                                        /*untied=*/true, /*post_norm_eps=*/kEps,
+                                        /*attention_scale=*/kScale));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::MuseGlimmerParams p =
+      vllm::ParseMuseGlimmerParams(vllm::MuseGlimmerHfConfigFromGguf(g));
+
+  CHECK(static_cast<double>(p.text.post_norm_eps) ==
+        doctest::Approx(static_cast<double>(kEps)).scale(0.0));
+  CHECK(static_cast<double>(p.text.post_norm_eps) !=
+        doctest::Approx(1e-8).scale(0.0));
+  // llama.cpp's `attention.scale` REPLACES `head_dim ** -0.5` in the softmax; we
+  // keep that factor and carry the difference in the query pre-scale, so
+  // scale_query_by = attention.scale * sqrt(head_dim). It must override the 3.87
+  // still folded into attn_q_norm in this same file.
+  CHECK(p.text.scale_query_by ==
+        doctest::Approx(static_cast<double>(kScale) *
+                        std::sqrt(static_cast<double>(SyntheticMuse::kHeadDim))));
+  CHECK(p.text.scale_query_by != doctest::Approx(SyntheticMuse::kQueryPreScale));
+}
+
+TEST_CASE("muse glimmer gguf #412: the arm's OWN fallbacks are the architecture's") {
+  // A converter that writes none of the four optional keys must still produce
+  // the architecture's model, not a windowless, uncapped, unscaled one.
+  const TempFile f(SyntheticMuse::Build(SyntheticMuse::kQueryPreScale, 1.0f, true,
+                                        /*untied=*/true, /*post_norm_eps=*/-1.0f,
+                                        /*attention_scale=*/-1.0f,
+                                        /*omit_optional_kvs=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::MuseGlimmerParams p =
+      vllm::ParseMuseGlimmerParams(vllm::MuseGlimmerHfConfigFromGguf(g));
+  CHECK(static_cast<double>(p.text.rms_norm_eps) == doctest::Approx(1e-5).scale(0.0));
+  CHECK(static_cast<double>(p.text.post_norm_eps) == doctest::Approx(1e-8).scale(0.0));
+  CHECK(p.text.sliding_window == 2048);
+  CHECK(p.text.output_multiplier == doctest::Approx(0.19611613513818404));
+  CHECK(p.text.final_logit_softcapping == doctest::Approx(20.0));
+  // The pre-scale still comes from the folded tensor, which no metadata replaces.
+  CHECK(p.text.scale_query_by == doctest::Approx(SyntheticMuse::kQueryPreScale));
 }
 
 TEST_CASE("muse glimmer gguf: a tied checkpoint is read off the missing output.weight") {
@@ -837,6 +923,20 @@ TEST_CASE("muse glimmer gguf: the LIVE k-quant, when VLLM_MUSE_GGUF names it") {
   // Recovered from the folded attn_q_norm, and it must equal the safetensors
   // config's `qk_scale_factor` — two independent encodings of one number.
   CHECK(p.text.scale_query_by == doctest::Approx(3.87).epsilon(1e-4));
+
+  // #412 ON THE REAL ARTIFACT. The released file carries neither of the two keys,
+  // so what it gets is entirely the default — and the default must be the same
+  // model the safetensors `config.json` describes (post_norm_eps 1e-08,
+  // sliding_window 2048, logit_scale/softcap as shipped), not a looser one.
+  CHECK(g.FindKv("muse-glimmer.attention.post_norm_rms_epsilon") == nullptr);
+  CHECK(g.FindKv("muse-glimmer.attention.scale") == nullptr);
+  CHECK(static_cast<double>(p.text.rms_norm_eps) ==
+        doctest::Approx(1e-5).scale(0.0).epsilon(1e-3));
+  CHECK(static_cast<double>(p.text.post_norm_eps) ==
+        doctest::Approx(1e-8).scale(0.0));
+  CHECK(p.text.sliding_window == 2048);
+  CHECK(p.text.final_logit_softcapping == doctest::Approx(20.0));
+  CHECK(p.text.output_multiplier == doctest::Approx(0.19611613513818404).epsilon(1e-6));
   // The iRoPE mask the released config encodes as layer_types/layer_rope_theta:
   // NoPE at 3, 7, ... 51.
   REQUIRE(p.text.no_rope_layers.size() == 52);

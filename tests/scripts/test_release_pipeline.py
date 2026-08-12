@@ -66,7 +66,7 @@ class ReleasePipelineContract(unittest.TestCase):
         ids = [item["id"] for item in plan["artifacts"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertIn("linux-x86_64-glibc-cpu", ids)
-        self.assertIn("linux-aarch64-glibc-cuda-fat", ids)
+        self.assertIn("linux-aarch64-glibc-cuda", ids)
         self.assertNotIn("rocm", " ".join(ids))
         self.assertEqual(plan["retention"]["ci_artifacts_days"], 7)
 
@@ -86,8 +86,8 @@ class ReleasePipelineContract(unittest.TestCase):
                 "linux-x86_64-glibc-cpu": "stable",
                 "linux-aarch64-glibc-cpu": "stable",
                 "linux-x86_64-musl-cpu-static": "experimental-preview",
-                "linux-x86_64-glibc-cuda-fat": "preview",
-                "linux-aarch64-glibc-cuda-fat": "preview",
+                "linux-x86_64-glibc-cuda": "preview",
+                "linux-aarch64-glibc-cuda": "preview",
                 "linux-x86_64-glibc-vulkan": "preview",
                 "macos-arm64-metal": "stable",
                 "macos-arm64-metal-mlx": "preview",

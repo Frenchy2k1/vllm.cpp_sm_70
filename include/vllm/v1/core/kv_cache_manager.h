@@ -211,7 +211,8 @@ class KVCacheManager {
       const std::string& running_request_id);
 
   // Take the KV cache events from the block pool. DEFERRED annotation (see
-  // header): forwards block_pool.take_events() unannotated.
+  // header): forwards block_pool.take_events() unannotated. Drained once per
+  // step by Scheduler::update_from_output (scheduler.py:1901).
   std::vector<KVCacheEvent> take_events();
 
   // The blocks of a request.
@@ -240,6 +241,10 @@ class KVCacheManager {
   bool enable_caching;
   bool use_eagle;
   bool log_stats;
+  // enable_kv_cache_events (upstream self.enable_kv_cache_events): RETAINED, not
+  // merely forwarded to the coordinator, because get_computed_blocks gates the
+  // report_mode == "full" reuse emission on it (kv_cache_manager.py:262-280).
+  bool enable_kv_cache_events;
   int num_kv_cache_groups;
   KVCacheConfig kv_cache_config;
   // Minimum number of free blocks to keep when admitting waiting/preempted
