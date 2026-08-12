@@ -3,12 +3,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <unistd.h>
 
 #include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -23,6 +25,8 @@ using gguf_test::PadTo;
 using gguf_test::TempFile;
 using gguf_test::U32Le;
 using gguf_test::U64Le;
+using gguf_test::UniqueTempPath;
+using gguf_test::Utf8Path;
 
 // One Q8_0 block: f16 scale + 32 int8 quants = 34 bytes.
 std::string Q8Block(uint16_t scale_f16_bits) {
@@ -50,6 +54,63 @@ std::string BuildValid(uint32_t version = 3) {
   f += Q8Block(0x3c00);  // f16 1.0
   return f;
 }
+
+class NamedTempFile {
+ public:
+  NamedTempFile(const std::filesystem::path& name, const std::string& bytes)
+      : directory_(UniqueTempPath("vllm_gguf_named_", "")),
+        path_(directory_ / name) {
+    if (!std::filesystem::create_directory(directory_))
+      throw std::runtime_error("failed to create GGUF test directory");
+    std::ofstream out(path_, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out) throw std::runtime_error("failed to write GGUF test file");
+  }
+  ~NamedTempFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path_, ignored);
+    std::filesystem::remove(directory_, ignored);
+  }
+  NamedTempFile(const NamedTempFile&) = delete;
+  NamedTempFile& operator=(const NamedTempFile&) = delete;
+  std::string utf8_path() const { return Utf8Path(path_); }
+
+ private:
+  std::filesystem::path directory_;
+  std::filesystem::path path_;
+};
+
+void SetEnvironment(const char* name, const char* value) {
+#if defined(_WIN32)
+  if (::_putenv_s(name, value) != 0)
+    throw std::runtime_error("failed to update test environment");
+#else
+  const int result =
+      value[0] == '\0' ? ::unsetenv(name) : ::setenv(name, value, 1);
+  if (result != 0)
+    throw std::runtime_error("failed to update test environment");
+#endif
+}
+
+class ScopedEnvironment final {
+ public:
+  ScopedEnvironment(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name); old != nullptr) old_ = old;
+    SetEnvironment(name_.c_str(), value);
+  }
+  ~ScopedEnvironment() {
+    try {
+      SetEnvironment(name_.c_str(), old_.has_value() ? old_->c_str() : "");
+    } catch (...) {
+    }
+  }
+  ScopedEnvironment(const ScopedEnvironment&) = delete;
+  ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
+
+ private:
+  std::string name_;
+  std::optional<std::string> old_;
+};
 
 }  // namespace
 
@@ -143,6 +204,33 @@ TEST_CASE("gguf: move semantics keep the mapping alive") {
   std::memcpy(&first, c.Get("t_f32").data, 4);
   CHECK(first == 0.0f);
 }  // moved-from a and b destroyed here; must not double-munmap
+
+TEST_CASE("gguf: borrowed mapping outlives a moved and destroyed reader") {
+  TempFile f(BuildValid());
+  vllm::GgufTensorInfo borrowed;
+  std::shared_ptr<const vllm::GgufMapping> owner;
+  std::weak_ptr<const vllm::GgufMapping> weak;
+  {
+    vllm::GgufFile source = vllm::GgufFile::Open(f.path());
+    vllm::GgufFile moved = std::move(source);
+    borrowed = moved.Get("t_q8");
+    owner = moved.Mapping();
+    weak = owner;
+  }
+
+  REQUIRE_FALSE(weak.expired());
+  CHECK(borrowed.data[0] == 0x00);
+  CHECK(borrowed.data[1] == 0x3c);
+  owner.reset();
+  CHECK(weak.expired());
+}
+
+TEST_CASE("gguf: non-ASCII filesystem path parses without ANSI conversion") {
+  NamedTempFile f(std::filesystem::path(U"vllm_gguf_caf\u00e9_\u6a21\u578b.gguf"),
+                  BuildValid());
+  vllm::GgufFile g = vllm::GgufFile::Open(f.utf8_path());
+  CHECK(g.Get("t_q8").data[1] == 0x3c);
+}
 
 TEST_CASE("gguf: Get on absent tensor throws with name") {
   TempFile f(BuildValid());
@@ -353,26 +441,30 @@ std::string SplitShard(const std::string& tname, float v0, uint32_t split_no,
 // Writes two shard files under a unique split-named base and removes them on
 // destruction. `Open(shard1())` must transparently merge both.
 struct SplitFiles {
-  std::string base, s1, s2;
   explicit SplitFiles(const std::string& tag) {
-    static int n = 0;
-    base = (std::filesystem::temp_directory_path() /
-            ("vllm_gguf_split_" + std::to_string(::getpid()) + "_" + tag + "_" +
-             std::to_string(n++)))
-               .string();
-    s1 = base + "-00001-of-00002.gguf";
-    s2 = base + "-00002-of-00002.gguf";
+    const std::filesystem::path base =
+        UniqueTempPath("vllm_gguf_split_" + tag + "_", "");
+    s1_ = base;
+    s1_ += "-00001-of-00002.gguf";
+    s2_ = base;
+    s2_ += "-00002-of-00002.gguf";
   }
   void Write(const std::string& a, const std::string& b) const {
-    std::ofstream(s1, std::ios::binary)
+    std::ofstream(s1_, std::ios::binary)
         .write(a.data(), static_cast<std::streamsize>(a.size()));
-    std::ofstream(s2, std::ios::binary)
+    std::ofstream(s2_, std::ios::binary)
         .write(b.data(), static_cast<std::streamsize>(b.size()));
   }
+  std::string shard1() const { return Utf8Path(s1_); }
   ~SplitFiles() {
-    std::remove(s1.c_str());
-    std::remove(s2.c_str());
+    std::error_code ignored;
+    std::filesystem::remove(s1_, ignored);
+    std::filesystem::remove(s2_, ignored);
   }
+
+ private:
+  std::filesystem::path s1_;
+  std::filesystem::path s2_;
 };
 }  // namespace
 
@@ -381,7 +473,7 @@ TEST_CASE("gguf: split shards are merged into one logical file") {
   f.Write(SplitShard("t_shard0", 10.0f, 0, 2, /*full_kv=*/true),
           SplitShard("t_shard1", 20.0f, 1, 2, /*full_kv=*/false));
 
-  vllm::GgufFile g = vllm::GgufFile::Open(f.s1);
+  vllm::GgufFile g = vllm::GgufFile::Open(f.shard1());
   // Both shards' tensors are visible through the merged file.
   REQUIRE(g.Tensors().size() == 2);
   // KV metadata comes from shard 00001.
@@ -404,9 +496,8 @@ TEST_CASE("gguf: VT_GGUF_NO_SPLIT opens a single shard as-is") {
   SplitFiles f("nosplit");
   f.Write(SplitShard("t_shard0", 1.0f, 0, 2, true),
           SplitShard("t_shard1", 2.0f, 1, 2, false));
-  ::setenv("VT_GGUF_NO_SPLIT", "1", 1);
-  vllm::GgufFile g = vllm::GgufFile::Open(f.s1);
-  ::unsetenv("VT_GGUF_NO_SPLIT");
+  ScopedEnvironment no_split("VT_GGUF_NO_SPLIT", "1");
+  vllm::GgufFile g = vllm::GgufFile::Open(f.shard1());
   CHECK(g.Tensors().size() == 1);  // only shard 00001's tensor
 }
 
@@ -415,7 +506,7 @@ TEST_CASE("gguf: split.count disagreeing with the -of- filename throws") {
   // Filename says -of-00002, but the header KV claims 3 shards.
   f.Write(SplitShard("t_shard0", 1.0f, 0, /*count=*/3, true),
           SplitShard("t_shard1", 2.0f, 1, /*count=*/3, false));
-  CHECK_THROWS_AS(vllm::GgufFile::Open(f.s1), std::runtime_error);
+  CHECK_THROWS_AS(vllm::GgufFile::Open(f.shard1()), std::runtime_error);
 }
 
 TEST_CASE("ggml traits: standard table values") {

@@ -9,7 +9,22 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(InSourceGuard)
 vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
-project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
+project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)
+
+# Native Windows release ABI: the core and every consumer use the static
+# MSVC/UCRT runtime (/MT in Release, /MTd in Debug), so the installed server
+# does not depend on a developer-machine CRT deployment.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC)
+  # Keep PE debug directories reproducible and free of runner/build paths.
+  add_link_options("/PDBALTPATH:%_PDB%")
+  # Windows headers otherwise replace qualified std::min/std::max calls with
+  # legacy macros. The project intentionally uses the portable ISO CRT entry
+  # points across platforms, and tokenizer tables require a UTF-8 execution
+  # character set. These are platform contracts; /W4 /WX remains unchanged.
+  add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +43,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Pinning contract=off gives every TU (kernels AND tests) the exact numerics of
 # the plain x86-64 Release build on every platform. CUDA device code is NOT
 # affected (nvcc flags are separate; GPU parity tests compare GPU-vs-GPU).
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/fp:strict>)
+else()
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+endif()
 
 option(VLLM_CPP_BUILD_TESTS "Build tests" ON)
 option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
@@ -680,6 +699,7 @@ add_library(vllm STATIC
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
+  src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
@@ -912,6 +932,8 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
   src/vllm/v1/worker/gpu/async_output.cpp
   src/vllm/v1/worker/gpu/runner.cpp
+  src/vllm/platform/process.cpp
+  src/vllm/platform/console_shutdown.cpp
   src/vllm/platforms/platform.cpp
   src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
@@ -1042,7 +1064,6 @@ add_library(vllm STATIC
   src/vt/ops.cpp
   src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
-  src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
@@ -1077,7 +1098,7 @@ add_library(vllm::vllm ALIAS vllm)
 # extension enabled so <arm_neon.h> exposes `vmmlaq_s32` and defines
 # `__ARM_FEATURE_MATMUL_INT8`. The project sets no global -march, so build ONLY
 # this translation unit with armv8.2-a+i8mm (surgical, exactly like the x86
-# tier's per-function `target("f16c")`): every other TU stays on the default
+# tier's dedicated F16C translation unit): every other TU stays on the default
 # baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
 # binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
 # KERNEL-GEMM-CPU-ELEM-X86WIDE W1: the AVX2 elementwise tier needs the ISA
@@ -1093,14 +1114,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   # x86-only TUs: <immintrin.h> does not exist on aarch64, so they are ADDED
   # here rather than in the unconditional source list.
   target_sources(vllm PRIVATE
+    src/vt/cpu/cpu_matmul_elem_f16c.cpp
     src/vt/cpu/cpu_matmul_elem_avx2.cpp
     src/vt/cpu/cpu_matmul_elem_avx512.cpp)
   set_source_files_properties(
+    src/vt/cpu/cpu_matmul_elem_f16c.cpp PROPERTIES
+    COMPILE_OPTIONS
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mf16c>")
+  set_source_files_properties(
     src/vt/cpu/cpu_matmul_elem_avx2.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx2;-mf16c>")
+    COMPILE_OPTIONS
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX2>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mavx2;-mf16c>")
   set_source_files_properties(
     src/vt/cpu/cpu_matmul_elem_avx512.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
+    COMPILE_OPTIONS
+      "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/arch:AVX512>;$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   # The portable Q8 DotProd C++ tier is valid on Linux and Darwin. Compile only
@@ -1140,7 +1168,9 @@ endif()
 # (.agents/specs/backend-fanout-metal-vulkan-xpu.md § Our baseline). ld64 has no
 # `--whole-archive`; the equivalent is `-force_load <archive>`. This unblocks the
 # CPU backend on macOS as well as any future Metal backend.
-if(APPLE)
+if(MSVC)
+  target_link_options(vllm INTERFACE "/WHOLEARCHIVE:$<TARGET_FILE:vllm>")
+elseif(APPLE)
   target_link_options(vllm INTERFACE "LINKER:-force_load,$<TARGET_FILE:vllm>")
 elseif(UNIX)
   target_link_options(vllm INTERFACE "LINKER:--whole-archive,$<TARGET_FILE:vllm>,--no-whole-archive")
@@ -1193,6 +1223,9 @@ target_compile_definitions(blake3_vendored PRIVATE
 target_include_directories(blake3_vendored PUBLIC third_party/blake3)
 set_target_properties(blake3_vendored PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(vllm PUBLIC blake3_vendored)
+if(WIN32)
+  target_link_libraries(vllm PUBLIC ws2_32)
+endif()
 # --- Metal backend (BACKEND-METAL-MLX W0 skeleton) --------------------------
 # Purely ADDITIVE, exactly like the CUDA block below: a `target_sources` list, a
 # PUBLIC compile definition tests can gate on, and two framework links. No
@@ -1260,6 +1293,11 @@ if(VLLM_CPP_VULKAN)
     # ONE TU's compile time instead of every TU that includes the table.
     src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
+endif()
+if(NOT WIN32)
+  # The persistent cache is also exercised by CPU-only NVFP4 emulation. Its
+  # current file-lock implementation is POSIX-only; Windows CUDA is out of W15.
+  target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)
 endif()
 # --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
 # Mostly ADDITIVE like the Metal/Vulkan/ROCm blocks above: a source list, a

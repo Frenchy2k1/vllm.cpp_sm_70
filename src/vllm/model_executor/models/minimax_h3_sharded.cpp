@@ -19,15 +19,21 @@
 //
 // The STREAMING stager that a real 66.3 GB run uses lives next to its GGUF and
 // NVFP4 twins in minimax_h3_device.cpp, because it shares their view binder.
-#include <sys/stat.h>
-
 #include <cstring>
+#include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
@@ -46,14 +52,41 @@ const char* const kIndexNames[] = {
     "diffusion_pytorch_model.safetensors.index.json",
 };
 
+std::filesystem::path NativePath(const std::string& utf8) {
+#if defined(_WIN32)
+  if (utf8.empty()) return {};
+  if (utf8.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("MiniMax-H3 path exceeds the Win32 UTF-8 limit");
+  }
+  const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                         utf8.data(),
+                                         static_cast<int>(utf8.size()), nullptr,
+                                         0);
+  if (length <= 0) {
+    throw std::invalid_argument("MiniMax-H3 path is not valid UTF-8");
+  }
+  std::wstring wide(static_cast<std::size_t>(length), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                          static_cast<int>(utf8.size()), wide.data(), length) !=
+      length) {
+    throw std::invalid_argument("MiniMax-H3 path is not valid UTF-8");
+  }
+  return std::filesystem::path(wide);
+#else
+  return std::filesystem::path(utf8);
+#endif
+}
+
 bool IsDir(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+  std::error_code error;
+  const bool result = std::filesystem::is_directory(NativePath(path), error);
+  return !error && result;
 }
 
 bool IsFile(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+  std::error_code error;
+  const bool result = std::filesystem::is_regular_file(NativePath(path), error);
+  return !error && result;
 }
 
 std::string StripTrailingSlash(const std::string& dir) {

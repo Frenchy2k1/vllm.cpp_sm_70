@@ -287,8 +287,8 @@ void SingleTypeKVCacheManager::new_step_starts() {}
 std::vector<std::vector<KVCacheBlock*>>
 FullAttentionManager::find_longest_cache_hit(
     const std::vector<BlockHash>& block_hashes, int max_length,
-    const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
-    const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+    const std::vector<int>& kv_cache_group_ids, BlockPool& pool,
+    const KVCacheSpec& spec, bool drop_eagle_block,
     int alignment_tokens, int dcp_world_size, int pcp_world_size) {
   // Upstream precondition (single_type_kv_cache_manager.py:578-582):
   //   assert isinstance(spec, FullAttentionSpec | ChunkedLocalAttentionSpec)
@@ -299,23 +299,23 @@ FullAttentionManager::find_longest_cache_hit(
   // cache-hit walk below is spec-kind-agnostic, so MLA groups use it unchanged.
   // Mirror the exact upstream admissible set; a strict `== kFullAttention` here
   // wrongly aborted MLA prefix-cache lookups (DeepSeek-V2 with APC on).
-  assert((kv_cache_spec.kind() == KVCacheSpecKind::kFullAttention ||
-          kv_cache_spec.kind() == KVCacheSpecKind::kMlaAttention ||
-          kv_cache_spec.kind() == KVCacheSpecKind::kChunkedLocalAttention) &&
+  assert((spec.kind() == KVCacheSpecKind::kFullAttention ||
+          spec.kind() == KVCacheSpecKind::kMlaAttention ||
+          spec.kind() == KVCacheSpecKind::kChunkedLocalAttention) &&
          "FullAttentionManager can only be used for full attention and "
          "chunked local attention groups");
   std::vector<std::vector<KVCacheBlock*>> computed_blocks(
       kv_cache_group_ids.size());
-  int block_size = kv_cache_spec.block_size;
+  int effective_block_size = spec.block_size;
   if (dcp_world_size * pcp_world_size > 1) {
-    block_size *= dcp_world_size * pcp_world_size;
+    effective_block_size *= dcp_world_size * pcp_world_size;
   }
-  int max_num_blocks = max_length / block_size;
+  int max_num_blocks = max_length / effective_block_size;
   int n = std::min<int>(max_num_blocks, static_cast<int>(block_hashes.size()));
   for (int i = 0; i < n; ++i) {
     // block_hashes is a chain: on the first miss, later blocks are not computed.
     std::optional<std::vector<KVCacheBlock*>> cached_block =
-        block_pool.get_cached_block(block_hashes[i], kv_cache_group_ids);
+        pool.get_cached_block(block_hashes[i], kv_cache_group_ids);
     if (cached_block.has_value()) {
       for (size_t g = 0; g < computed_blocks.size(); ++g) {
         computed_blocks[g].push_back((*cached_block)[g]);
@@ -329,8 +329,8 @@ FullAttentionManager::find_longest_cache_hit(
       computed.pop_back();
     }
   }
-  while (block_size != alignment_tokens &&
-         static_cast<int>(computed_blocks[0].size()) * block_size %
+  while (effective_block_size != alignment_tokens &&
+         static_cast<int>(computed_blocks[0].size()) * effective_block_size %
                  alignment_tokens !=
              0) {
     for (auto& computed : computed_blocks) {
@@ -388,10 +388,10 @@ int SlidingWindowManager::_contiguous_blocks_for_hit(int window_size,
 std::vector<std::vector<KVCacheBlock*>>
 SlidingWindowManager::find_longest_cache_hit(
     const std::vector<BlockHash>& block_hashes, int max_length,
-    const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
-    const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+    const std::vector<int>& kv_cache_group_ids, BlockPool& pool,
+    const KVCacheSpec& spec, bool drop_eagle_block,
     int alignment_tokens, int dcp_world_size, int pcp_world_size) {
-  const auto* sliding = dynamic_cast<const SlidingWindowSpec*>(&kv_cache_spec);
+  const auto* sliding = dynamic_cast<const SlidingWindowSpec*>(&spec);
   if (sliding == nullptr) {
     throw std::invalid_argument(
         "SlidingWindowManager can only be used for sliding window groups");
@@ -411,23 +411,24 @@ SlidingWindowManager::find_longest_cache_hit(
 
   const int contiguous_blocks = _contiguous_blocks_for_hit(
       sliding->sliding_window, sliding->block_size, drop_eagle_block);
-  const int block_size = sliding->block_size;
+  const int effective_block_size = sliding->block_size;
   const int max_num_blocks = std::min(
-      max_length / block_size, static_cast<int>(block_hashes.size()));
+      max_length / effective_block_size, static_cast<int>(block_hashes.size()));
   std::vector<std::vector<KVCacheBlock*>> computed_blocks(
       kv_cache_group_ids.size(),
       std::vector<KVCacheBlock*>(static_cast<size_t>(max_num_blocks),
-                                 block_pool.null_block));
+                                 pool.null_block));
 
   int num_contiguous_blocks = 0;
   bool match_found = false;
   for (int i = max_num_blocks - 1; i >= 0; --i) {
-    auto cached_block = block_pool.get_cached_block(
+    auto cached_block = pool.get_cached_block(
         block_hashes[static_cast<size_t>(i)], kv_cache_group_ids);
     if (cached_block.has_value()) {
-      if (num_contiguous_blocks == 0 && block_size != alignment_tokens) {
+      if (num_contiguous_blocks == 0 &&
+          effective_block_size != alignment_tokens) {
         const int post_pop_blocks = drop_eagle_block ? i : i + 1;
-        if (post_pop_blocks * block_size % alignment_tokens != 0) {
+        if (post_pop_blocks * effective_block_size % alignment_tokens != 0) {
           continue;
         }
       }
@@ -452,8 +453,9 @@ SlidingWindowManager::find_longest_cache_hit(
     for (auto& computed : computed_blocks) {
       computed.resize(static_cast<size_t>(num_contiguous_blocks));
     }
-    while (block_size != alignment_tokens &&
-           static_cast<int>(computed_blocks.front().size()) * block_size %
+    while (effective_block_size != alignment_tokens &&
+           static_cast<int>(computed_blocks.front().size()) *
+                   effective_block_size %
                    alignment_tokens !=
                0) {
       for (auto& computed : computed_blocks) {
@@ -466,8 +468,9 @@ SlidingWindowManager::find_longest_cache_hit(
     for (auto& computed : computed_blocks) {
       computed.pop_back();
     }
-    while (block_size != alignment_tokens &&
-           static_cast<int>(computed_blocks.front().size()) * block_size %
+    while (effective_block_size != alignment_tokens &&
+           static_cast<int>(computed_blocks.front().size()) *
+                   effective_block_size %
                    alignment_tokens !=
                0) {
       for (auto& computed : computed_blocks) {
@@ -491,9 +494,9 @@ SlidingWindowManager::reachable_block_mask(
   }
   assert(*alignment_tokens % sliding->block_size == 0);
 
-  const int block_size = sliding->block_size;
+  const int effective_block_size = sliding->block_size;
   const int need = _contiguous_blocks_for_hit(
-      sliding->sliding_window, block_size, use_eagle);
+      sliding->sliding_window, effective_block_size, use_eagle);
   const int shift = use_eagle ? 1 : 0;
   std::vector<bool> mask(static_cast<size_t>(end_block - start_block), false);
 
@@ -505,7 +508,7 @@ SlidingWindowManager::reachable_block_mask(
   }
 
   if (segment_tokens.has_value()) {
-    const int per_segment = *segment_tokens / block_size;
+    const int per_segment = *segment_tokens / effective_block_size;
     if (need >= per_segment) {
       return std::nullopt;
     }
@@ -521,7 +524,7 @@ SlidingWindowManager::reachable_block_mask(
       *num_prompt_tokens > 0) {
     const int latest =
         (*num_prompt_tokens - 1) / *alignment_tokens * *alignment_tokens;
-    const int prompt_end_block = latest / block_size + shift;
+    const int prompt_end_block = latest / effective_block_size + shift;
     for (int i = std::max(start_block, prompt_end_block - need);
          i < std::min(end_block, prompt_end_block); ++i) {
       mask[static_cast<size_t>(i - start_block)] = true;
@@ -564,11 +567,11 @@ ChunkedLocalAttentionManager::ChunkedLocalAttentionManager(
 std::vector<std::vector<KVCacheBlock*>>
 ChunkedLocalAttentionManager::find_longest_cache_hit(
     const std::vector<BlockHash>& block_hashes, int max_length,
-    const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
-    const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+    const std::vector<int>& kv_cache_group_ids, BlockPool& pool,
+    const KVCacheSpec& spec, bool drop_eagle_block,
     int alignment_tokens, int dcp_world_size, int pcp_world_size) {
   const auto* chunked =
-      dynamic_cast<const ChunkedLocalAttentionSpec*>(&kv_cache_spec);
+      dynamic_cast<const ChunkedLocalAttentionSpec*>(&spec);
   if (chunked == nullptr) {
     throw std::invalid_argument(
         "ChunkedLocalAttentionManager can only be used for chunked-local "
@@ -612,10 +615,10 @@ ChunkedLocalAttentionManager::find_longest_cache_hit(
       kv_cache_group_ids.size(),
       std::vector<KVCacheBlock*>(
           static_cast<size_t>(local_attention_start_block_idx),
-          block_pool.null_block));
+          pool.null_block));
 
   for (int i = local_attention_start_block_idx; i < max_num_blocks; ++i) {
-    auto cached_block = block_pool.get_cached_block(
+    auto cached_block = pool.get_cached_block(
         block_hashes[static_cast<size_t>(i)], kv_cache_group_ids);
     if (!cached_block.has_value()) {
       break;
@@ -654,10 +657,10 @@ MambaManager::MambaManager(std::shared_ptr<KVCacheSpec> kv_cache_spec,
 
 std::vector<std::vector<KVCacheBlock*>> MambaManager::find_longest_cache_hit(
     const std::vector<BlockHash>& block_hashes, int max_length,
-    const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
-    const KVCacheSpec& kv_cache_spec, bool /*drop_eagle_block*/,
+    const std::vector<int>& kv_cache_group_ids, BlockPool& pool,
+    const KVCacheSpec& spec, bool /*drop_eagle_block*/,
     int alignment_tokens, int dcp_world_size, int pcp_world_size) {
-  assert(kv_cache_spec.kind() == KVCacheSpecKind::kMamba &&
+  assert(spec.kind() == KVCacheSpecKind::kMamba &&
          "MambaManager can only be used for mamba groups");
   assert(dcp_world_size == 1 && "DCP not support mamba now.");
   assert(pcp_world_size == 1 && "PCP not support mamba now.");
@@ -666,20 +669,20 @@ std::vector<std::vector<KVCacheBlock*>> MambaManager::find_longest_cache_hit(
   std::vector<std::vector<KVCacheBlock*>> computed_blocks(
       kv_cache_group_ids.size());
 
-  int block_size = kv_cache_spec.block_size;
-  int max_num_blocks = max_length / block_size;
+  int effective_block_size = spec.block_size;
+  int max_num_blocks = max_length / effective_block_size;
   // Search from right to left and early stop when a match is found.
   for (int i = max_num_blocks - 1; i >= 0; --i) {
     if (i >= static_cast<int>(block_hashes.size())) {
       continue;
     }
     std::optional<std::vector<KVCacheBlock*>> cached_block =
-        block_pool.get_cached_block(block_hashes[i], kv_cache_group_ids);
+        pool.get_cached_block(block_hashes[i], kv_cache_group_ids);
     if (cached_block.has_value()) {
       // Mamba prefix caching aligns block_size across attention and mamba
       // layers so the hit length is block-aligned.
-      if (block_size != alignment_tokens &&
-          (i + 1) * block_size % alignment_tokens != 0) {
+      if (effective_block_size != alignment_tokens &&
+          (i + 1) * effective_block_size % alignment_tokens != 0) {
         continue;
       }
       for (size_t g = 0; g < computed_blocks.size(); ++g) {
@@ -687,7 +690,7 @@ std::vector<std::vector<KVCacheBlock*>> MambaManager::find_longest_cache_hit(
         // len(hit_blocks[0]) * other_block_size, so pad with dummy nulls up to
         // i, then append the single state block.
         computed_blocks[g].insert(computed_blocks[g].end(), i,
-                                  block_pool.null_block);
+                                  pool.null_block);
         computed_blocks[g].push_back((*cached_block)[g]);
       }
       break;  // just need the last match — early stopping.

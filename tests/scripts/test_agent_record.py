@@ -241,6 +241,16 @@ class AgentRecordMutationTests(unittest.TestCase):
 
         require(errors, r"\d+ engine rows; expected \d+")
 
+    def test_windows_release_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #117 row and its ratchet bump are one semantic change."""
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+        windows = [row for row in rows if row.item_id == "ENG-RELEASE-WINDOWS"]
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].path.name, "engine-matrix.md")
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 
