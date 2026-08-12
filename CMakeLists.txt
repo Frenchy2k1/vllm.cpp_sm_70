@@ -11,6 +11,12 @@ vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
 project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)
 
+set(VLLM_CPP_BUILD_VERSION "${PROJECT_VERSION}" CACHE STRING
+  "Exact version identity reported by this build")
+if(VLLM_CPP_BUILD_VERSION STREQUAL "")
+  message(FATAL_ERROR "VLLM_CPP_BUILD_VERSION must not be empty")
+endif()
+
 # Native Windows release ABI: the core and every consumer use the static
 # MSVC/UCRT runtime (/MT in Release, /MTd in Debug), so the installed server
 # does not depend on a developer-machine CRT deployment.
