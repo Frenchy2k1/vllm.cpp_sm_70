@@ -1465,6 +1465,66 @@ difference between two builds of the same source.
 identical; the difference is in the compiled artifact or its runtime conditions,
 and only a profiler at that level can say which.
 
+## 6z. THE BINARIES ARE EQUIVALENT: the residual is RUNTIME, not code (2026-08-12)
+
+§6y said the answer was no longer in the source and named `ncu` as the next step.
+Ran it, plus a static comparison of the shipped machine code. Both close.
+
+**Measured on our side (`ncu`, 10 launches, steady state):**
+
+| metric | ours |
+|---|---|
+| registers per thread | **94** |
+| warps active (occupancy proxy) | 24.0% |
+| SM throughput | 10.6% of peak |
+| L1 sector hit rate | 0.7% |
+| L2 sector hit rate | 9.5% |
+
+A latency-bound kernel, as expected for a W4A16 grouped GEMM at M=9.
+
+**Static comparison of the SAME instantiation** (`<...2814749767172868, 128, 1, 8,
+4, true, 4, 1, false>`), ours from our build object, upstream from the shipped
+`_moe_C_stable_libtorch.abi3.so`:
+
+| | registers | SASS instructions |
+|---|---|---|
+| ours (sm_121a) | **94** | **3664** |
+| upstream (sm_120) | **94** | **3664** |
+
+**The compiled kernels are equivalent.** Note upstream ships no sm_121 cubin at
+all -- sm_80/87/89/90/90a/100/110/120 -- so on GB10 it runs the family-compatible
+sm_120 code while we compile sm_121a, and the two compile to the same instruction
+count with the same register pressure.
+
+**So every code-level explanation is now eliminated**, including the machine code
+itself: source, instantiation, grid, block size, shared memory, reduction flags,
+scale layout, alignment, residency, toolkit, arch, register pressure and SASS
+length all match, and upstream performs MORE work per launch (40.6 blocks vs
+38.9). Ours still takes 4.21 us/block against 3.73.
+
+**The residual is therefore RUNTIME, not code.** What differs is the environment
+the identical kernel executes in: how each engine's allocator places the expert
+weights and activations, and hence L2/DRAM locality across the 256 experts. Our
+L2 hit rate is 9.5%, so this kernel lives or dies on memory placement, and the
+two engines allocate differently (our `DevicePool` slabs vs torch's caching
+allocator) even though both are `cudaMalloc`-backed, contiguous per tensor and
+256-byte aligned.
+
+**What is NOT worth doing:** editing the kernel, its launch config, its layout or
+its build flags. All are proven identical. This row has now spent a full
+investigation arriving at that, and the value of recording it is that nobody
+repeats it.
+
+**The one experiment left** needs upstream's `ncu` counters for the same kernel,
+which is currently BLOCKED: vLLM's EngineCore fails to initialise under `ncu`'s
+kernel replay ("Engine core initialization failed"), so the comparison of
+occupancy / L2 hit rate / DRAM throughput cannot be completed the same way.
+Options are `--replay-mode application`, profiling a smaller standalone harness
+that calls the op directly, or accepting that the last 2.5% is unattributed.
+
+**Row verdict unchanged and now final for this campaign: 0.975x on the code cell,
+1.012x on the prose cell, NOT parity, residual real and unattributed.**
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
