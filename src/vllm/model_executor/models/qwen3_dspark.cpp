@@ -89,6 +89,96 @@ std::vector<float> Qwen3DSparkModel::MarkovBiasForTokens(
                     static_cast<int64_t>(prev_token_ids.size()), weights, queue);
 }
 
+bool Qwen3DSparkModel::CanSampleOnDevice(const Qwen3DSparkWeights& weights) {
+  return weights.logit_scale == 1.0f && !weights.markov_w1.Empty() &&
+         !weights.markov_w2.Empty() && weights.markov_rank > 0 &&
+         weights.vocab_size > 0 && weights.draft_vocab_size > 0;
+}
+
+std::vector<std::vector<int32_t>> Qwen3DSparkModel::SampleSequentialDevice(
+    const std::vector<float>& block_logits, const std::vector<int32_t>& anchor_ids,
+    int64_t num_query_per_req, int64_t first_sample_offset, int64_t num_spec,
+    const Qwen3DSparkWeights& weights, vt::Queue& queue) {
+  VT_CHECK(CanSampleOnDevice(weights),
+           "qwen3_dspark SampleSequentialDevice: unsupported checkpoint (see "
+           "CanSampleOnDevice); the caller must fall back to the host path");
+  const int64_t B = static_cast<int64_t>(anchor_ids.size());
+  const int64_t R = weights.markov_rank;
+  const int64_t V = weights.draft_vocab_size;
+  VT_CHECK(B > 0 && num_spec > 0 && num_query_per_req > 0,
+           "qwen3_dspark SampleSequentialDevice: bad dims");
+  VT_CHECK(first_sample_offset >= 0 && first_sample_offset + num_spec <= num_query_per_req,
+           "qwen3_dspark SampleSequentialDevice: the sampled rows must fit the block");
+  VT_CHECK(static_cast<int64_t>(block_logits.size()) == B * num_query_per_req * V,
+           "qwen3_dspark SampleSequentialDevice: block_logits must be "
+           "[num_reqs * num_query_per_req, draft_vocab]");
+  for (int32_t id : anchor_ids) {
+    VT_CHECK(id >= 0 && static_cast<int64_t>(id) < weights.vocab_size,
+             "qwen3_dspark SampleSequentialDevice: anchor id outside the target vocab");
+  }
+
+  Dev d{vt::GetBackend(queue.device.type), queue};
+
+  // The base logits go up ONCE. The host path instead pulls a [B, V] bias DOWN
+  // every step; both touch comparable bytes, but this direction happens k times
+  // less often, and the k host argmaxes over V disappear entirely.
+  DBuf base(d, DType::kF32, {B * num_query_per_req, V}, block_logits.data());
+  Tensor w1 = ResidentWeight(d, weights.markov_w1, {weights.vocab_size, R});
+  Tensor w2 = ResidentWeight(d, weights.markov_w2, {V, R});
+
+  // The base row of request r at step i, flattened for every step, so the
+  // per-step gather is a view into ONE upload rather than its own transfer.
+  std::vector<int32_t> idx_host(static_cast<size_t>(num_spec * B));
+  for (int64_t i = 0; i < num_spec; ++i) {
+    for (int64_t r = 0; r < B; ++r) {
+      idx_host[static_cast<size_t>(i * B + r)] =
+          static_cast<int32_t>(r * num_query_per_req + first_sample_offset + i);
+    }
+  }
+  DBuf idx(d, DType::kI32, {num_spec * B}, idx_host.data());
+
+  DBuf embed(d, DType::kBF16, {B, R});
+  DBuf bias(d, DType::kF32, {B, V});
+  DBuf rows(d, DType::kF32, {B, V});
+  DBuf ids(d, DType::kI64, {B});
+
+  std::vector<std::vector<int32_t>> drafts(
+      static_cast<size_t>(B), std::vector<int32_t>(static_cast<size_t>(num_spec), 0));
+  std::vector<int64_t> ids_host(static_cast<size_t>(B));
+  std::vector<int32_t> prev_host = anchor_ids;
+
+  for (int64_t i = 0; i < num_spec; ++i) {
+    // `prev` is [B] i32; re-uploading a handful of ints per step is what buys
+    // the removal of the per-step [B, V] download.
+    DBuf prev(d, DType::kI32, {B}, prev_host.data());
+    vt::Embedding(d.q, embed.t(), w1, prev.t());
+    vt::MatmulBT(d.q, bias.t(), embed.t(), w2);
+
+    // Step i's base rows: a [B] slice of the flattened index buffer.
+    Tensor idx_i = idx.t();
+    idx_i.rank = 1;
+    idx_i.shape[0] = B;
+    idx_i.stride[0] = 1;
+    idx_i.data = static_cast<int32_t*>(idx.t().data) + i * B;
+    vt::IndexSelect(d.q, rows.t(), base.t(), idx_i);
+
+    vt::Add(d.q, bias.t(), bias.t(), rows.t());  // in-place: bias + this step's base row
+    vt::GreedyArgmax(d.q, ids.t(), bias.t());    // LOWEST-INDEX tie-break, as on host
+    ids.Download(d, ids_host.data());            // [B] i64, not [B, V] f32
+
+    for (int64_t r = 0; r < B; ++r) {
+      const int64_t draft_id = ids_host[static_cast<size_t>(r)];
+      VT_CHECK(draft_id >= 0 && draft_id < V,
+               "qwen3_dspark SampleSequentialDevice: argmax outside the draft vocab");
+      const int32_t target_id =
+          MapDraftToTarget(static_cast<int32_t>(draft_id), weights);
+      drafts[static_cast<size_t>(r)][static_cast<size_t>(i)] = target_id;
+      prev_host[static_cast<size_t>(r)] = target_id;
+    }
+  }
+  return drafts;
+}
+
 int32_t Qwen3DSparkModel::MapDraftToTarget(int32_t draft_id,
                                            const Qwen3DSparkWeights& weights) {
   // Upstream: `draft_ids + self.draft_id_to_target_id[draft_ids]` when the table
