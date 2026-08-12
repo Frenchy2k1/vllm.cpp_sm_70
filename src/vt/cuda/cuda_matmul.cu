@@ -481,6 +481,15 @@ struct Fp8Plan {
   cublasLtMatrixLayout_t lb = nullptr;  // B = act,    col-major [K,M] ld=K
   cublasLtMatrixLayout_t lc = nullptr;  // C = D = out, col-major [N,M] ld=N
   cublasLtMatmulHeuristicResult_t heur{};
+  // The selected algo's CUBLASLT_ALGO_CONFIG_SPLITK_NUM, OBSERVED ONCE here at
+  // plan-build time rather than per GEMM (review finding F-C). It is a property
+  // of `heur.algo`, so it is fixed the moment the algo is, and re-reading it on
+  // every call bought nothing: a driver round-trip per layer per step, on a path
+  // whose plan cache is DEFAULT OFF, so "equally cheap on a hit" described a
+  // configuration almost nobody runs. Read only for a bf16 D — it is the only
+  // arm any caller can claim a premise about (see Fp8Bf16DSplitKRefuses).
+  bool split_k_read_ok = false;
+  int32_t split_k = -1;
 };
 
 // RAII teardown for a FRESHLY-built plan (used only on the VT_FP8_PLAN_CACHE=0
@@ -498,10 +507,29 @@ struct Fp8PlanGuard {
 
 // Build the fp8 TN descriptor + three layouts + heuristic algo for `key` on
 // `ctx.handle`. On success fills *out with raw handles (caller owns lifetime) and
-// returns true. Returns false iff cuBLASLt reports no fp8 heuristic for the shape
-// (any partially-created handles are destroyed) — the caller then falls back to
-// the cutlass fp8 GEMM. This is the exact descriptor/layout/heuristic sequence the
-// pre-cache code ran inline on every call; the key fields are the only inputs.
+// returns true. Returns false iff cuBLASLt reports no fp8 heuristic for the shape,
+// or (vector-alpha keys only) the selected algo does not advertise the pointer
+// mode we set — in either case any partially-created handles are destroyed and
+// nothing is cached, and the caller falls back. This is the exact
+// descriptor/layout/heuristic sequence the pre-cache code ran inline on every
+// call; the key fields are the only inputs.
+// Emit the NAMED cause of a refused plan build under VT_GEMM_ALGO_LOG=1, once
+// per (shape, cause). Default OFF costs a cached bool, exactly like
+// MaybeLogGemmAlgo. `cap_mask` is the mask actually read from the selected algo
+// and is 0 when there was no algo to read one from.
+void MaybeLogFp8PlanRefusal(const Fp8PlanKey& key, Fp8PlanRefusal refusal, uint32_t cap_mask) {
+  if (!GemmAlgoLogEnabled()) return;
+  static LogOncePerKey once;
+  const char* tag = Fp8PlanRefusalTag(refusal);
+  std::string log_key = std::string("cublasLt-fp8-refusal|m=") + std::to_string(key.m) +
+                        " n=" + std::to_string(key.n) + " k=" + std::to_string(key.k) +
+                        "|scale_mode=" + std::to_string(key.scale_mode) + "|" + tag;
+  if (!once.ShouldLog(log_key)) return;
+  std::cerr << "[VT_GEMM_ALGO] backend=cublasLt REFUSED m=" << key.m << " n=" << key.n
+            << " k=" << key.k << " scale_mode=" << key.scale_mode << " reason=" << tag
+            << " pointerModeCapMask=" << cap_mask << std::endl;
+}
+
 bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
   Fp8Plan p;
   const cudaDataType_t out_type = static_cast<cudaDataType_t>(key.out_type);
@@ -514,6 +542,17 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
           "fp8 set TRANSA=T");
   CheckLt(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_b, sizeof(op_b)),
           "fp8 set TRANSB=N");
+  // PERF-FP8-ALPHA-FOLD: the per-column alpha arm. The pointer mode goes on the
+  // descriptor BEFORE the heuristic so cuBLASLt selects an algo that implements
+  // it; that is exactly why scale_mode is in the plan key. `alpha` then points
+  // at a device f32 array whose length must match the number of D's ROWS —
+  // and D is our column-major [N,M], so its rows are our output's N columns.
+  if (key.scale_mode == kFp8ScaleModeAlphaDeviceVec) {
+    const int32_t mode = CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO;
+    CheckLt(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &mode,
+                                           sizeof(mode)),
+            "fp8 set POINTER_MODE=ALPHA_DEVICE_VECTOR_BETA_ZERO");
+  }
 
   // Column-major TN layouts (default order — NOT ORDER_ROW; fp8 needs the native
   // col-major TN form). See the derivation in the block comment above.
@@ -538,12 +577,50 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
   const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
       ctx.handle, p.desc, p.la, p.lb, p.lc, p.lc, pref.v, /*requestedAlgoCount=*/kGemvHeuristicAlgos, &p.heur,
       &returned);
-  if (hst != CUBLAS_STATUS_SUCCESS || returned == 0) {
+  // The vector-alpha arm additionally REQUIRES that the selected algo advertise
+  // the mode we set. The heuristic is documented to honor the descriptor, but a
+  // driver that returns an algo without the capability would silently apply
+  // something other than the per-column alpha, so the bit is verified rather
+  // than assumed; a refusal is not an error, it selects the two-launch fallback.
+  const bool heuristic_ok = hst == CUBLAS_STATUS_SUCCESS && returned > 0;
+  bool pointer_mode_ok = true;
+  uint32_t cap_mask = 0;
+  if (heuristic_ok && key.scale_mode == kFp8ScaleModeAlphaDeviceVec) {
+    static_assert(kFp8PointerModeMaskAlphaDeviceVectorBetaZero ==
+                      static_cast<unsigned int>(
+                          CUBLASLT_POINTER_MODE_MASK_ALPHA_DEVICE_VECTOR_BETA_ZERO),
+                  "fp8_plan_cache.h pointer-mode mask drifted from cublasLt.h");
+    size_t written = 0;
+    const cublasStatus_t cst = cublasLtMatmulAlgoCapGetAttribute(
+        &p.heur.algo, CUBLASLT_ALGO_CAP_POINTER_MODE_MASK, &cap_mask, sizeof(cap_mask), &written);
+    pointer_mode_ok = cst == CUBLAS_STATUS_SUCCESS && written == sizeof(cap_mask) &&
+                      Fp8AlphaVecCapSupported(cap_mask);
+  }
+  if (!heuristic_ok || !pointer_mode_ok) {
+    // A refusal emits NOTHING from MaybeLogGemmAlgo (there is no plan to
+    // describe), so on the GB10 run of 2026-08-11 the vector-alpha arm was
+    // indistinguishable from "never called" — see fp8_plan_cache.h. Under the
+    // existing diagnostic flag, name the cause and the mask that was actually
+    // read, so the next run reports a reason instead of an absence.
+    MaybeLogFp8PlanRefusal(key, Fp8PlanRefusalFor(heuristic_ok, pointer_mode_ok), cap_mask);
     if (p.lc != nullptr) cublasLtMatrixLayoutDestroy(p.lc);
     if (p.lb != nullptr) cublasLtMatrixLayoutDestroy(p.lb);
     if (p.la != nullptr) cublasLtMatrixLayoutDestroy(p.la);
     if (p.desc != nullptr) cublasLtMatmulDescDestroy(p.desc);
     return false;  // caller falls back to cutlass; nothing cached
+  }
+  // OBSERVE the selected algo's split-K, once, here — the decision that consumes
+  // it is Fp8Bf16DSplitKRefuses at the call site, and only a caller that CLAIMED
+  // the splitK=1 premise is refused by it. Reading it at build time (rather than
+  // per GEMM, as the first repair did) keeps the observation on the cold path
+  // beside the ~0.8 ms heuristic it belongs to, and leaves the hot path a plain
+  // struct read. A short read counts as UNREAD: `split_k` would keep the -1
+  // sentinel, and reporting that as a bad VALUE would name the wrong cause.
+  if (out_type == CUDA_R_16BF) {
+    size_t written = 0;
+    const cublasStatus_t sst = cublasLtMatmulAlgoConfigGetAttribute(
+        &p.heur.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &p.split_k, sizeof(p.split_k), &written);
+    p.split_k_read_ok = sst == CUBLAS_STATUS_SUCCESS && written == sizeof(p.split_k);
   }
   *out = p;
   return true;
@@ -573,8 +650,65 @@ bool GetOrBuildCachedFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Pla
   return true;
 }
 
+// ---- ENFORCE the splitK precondition, ON THE CALLER THAT CLAIMED IT ---------
+// A caller passes `claims_splitk1_premise` when its bf16 D is asserted to be
+// byte-equivalent to the f32 D of the same call site — i.e. when it claims the
+// narrowing changed only the STORE WIDTH. That claim holds only while the
+// accumulation behind the store is the same single ordered f32 reduction the
+// f32-D arm used, i.e. while `splitK == 1` (measured 2026-08-12: algoId 67,
+// splitK=1, every gate shape, every M; .agents/specs/perf-fp8-alpha-fold.md
+// §Attempt 4). `out_type` is part of Fp8PlanKey's == and its hash, so the bf16 D
+// deliberately selects a DIFFERENT plan from the f32 D — which is exactly the
+// freedom cuBLASLt needs to pick a different split-K. Had it taken it, the delta
+// would be a REDUCTION-ORDER change wearing a store-width change's clothes, and
+// a bf16 store is very good at hiding those from a token gate.
+//
+// It is a hard refusal, not a tolerance — a "<1% of elements differ" allowance
+// would only be measuring how well bf16 conceals the defect — and not a silent
+// fallback to cutlass, which would substitute a third reduction order without
+// saying so.
+//
+// WHAT THIS FUNCTION DOES NOT DO, and the first repair did (review finding F-A):
+// it does not key off the DTYPE. bf16-D fp8 cuBLASLt GEMMs are a pre-existing,
+// DEFAULT-ON capability — every `o_proj_fp8` / `out_proj_fp8` in qwen3_5.cpp
+// arrives here at bf16 through MatmulFp8Cutlass{,PreQuant}D under
+// DenseCublasLtFp8Enabled() — and NONE of those call sites ever claimed
+// byte-equivalence with an f32-D arm. Split-K is perfectly correct for them.
+// Guarding on `out_type == CUDA_R_16BF` alone therefore put a new throw on a
+// default path and falsified the row's claim that with both toggles unset,
+// behavior is byte-identical to before it. The premise travels WITH the caller
+// that makes it.
+//
+// The whole decision is Fp8Bf16DSplitKRefuses, on the CPU tier, where it is
+// unit-tested and mutation-proved. Nothing is decided here: this host has no
+// nvcc, so a branch written HERE is a branch nothing on it can compile, let
+// alone execute — which is how F-A survived the first repair's gate.
+void RequireBf16DSplitKOne(const Fp8Plan& plan, bool claims_splitk1_premise,
+                           cudaDataType_t out_type, int64_t m, int64_t n, int64_t k,
+                           const char* site) {
+  const bool out_is_bf16 = out_type == CUDA_R_16BF;
+  if (!Fp8Bf16DSplitKRefuses(claims_splitk1_premise, out_is_bf16, plan.split_k_read_ok,
+                             plan.split_k))
+    return;
+  const Fp8Bf16DSplitK verdict =
+      Fp8Bf16DSplitKVerdict(out_is_bf16, plan.split_k_read_ok, plan.split_k);
+  throw std::runtime_error(
+      std::string("vt cuda: ") + site +
+      ": this call site asked for a bf16 D on the express claim that it is byte-equivalent to "
+      "the same GEMM's f32 D — a store-width narrowing over one ordered f32 reduction — which "
+      "requires the selected cuBLASLt plan to report splitK=1. Got " +
+      Fp8Bf16DSplitKTag(verdict) +
+      " (splitK=" + (plan.split_k_read_ok ? std::to_string(plan.split_k) : "unread") +
+      ") at m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k) +
+      ". Re-measure .agents/specs/perf-fp8-alpha-fold.md §Attempt 4's premise on this driver "
+      "before using that arm. Only a caller that CLAIMS the premise can reach this refusal; the "
+      "one that does today is the merged GDN fp8 in_proj under VT_GDN_FP8_IN_BF16 (default OFF) "
+      "— unset it to take the f32 D. An ordinary bf16-D fp8 GEMM (o_proj/out_proj) makes no such "
+      "claim and is never checked.");
+}
+
 void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                                 float alpha) {
+                                 float alpha, bool claims_splitk1_premise) {
   const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
   if (m == 0 || n == 0) return;
   cudaStream_t s = static_cast<cudaStream_t>(q.handle);
@@ -624,6 +758,11 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
     return;
   }
   MaybeLogGemmAlgo(plan.heur, m, n, k, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_type, "TN-fp8");
+  // The splitK precondition, on the plan actually selected (cached or fresh —
+  // same algo either way, and the observation was taken when it was chosen). A
+  // no-op for every caller that did not claim it, which is every caller but the
+  // bf16-D lever: no driver round-trip, no branch beyond one bool.
+  RequireBf16DSplitKOne(plan, claims_splitk1_premise, out_type, m, n, k, "matmul_fp8_cublaslt");
 
   // out = alpha * op(weight) @ op(act) + 0 * C; C and D share out's buffer/layout.
   const float beta = 0.0f;
@@ -631,6 +770,141 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
                          &beta, out.data, plan.lc, out.data, plan.lc, &plan.heur.algo,
                          ctx.workspace, kWorkspaceBytes, s),
           "fp8 cublasLtMatmul");
+}
+
+// ---- cuBLASLt FP8 with a per-output-COLUMN alpha ---------------------------
+// PERF-FP8-ALPHA-FOLD (.agents/specs/perf-fp8-alpha-fold.md, #402 §3 "Lever B").
+//
+// An N-concatenated fp8 operand whose shards carry DIFFERENT folded alphas
+// cannot express its scale as one host scalar, so this seam shipped applying the
+// per-column vector in a SECOND full-tensor pass (vt::MulColVecF32). At T=4096
+// prefill that pass is a read-modify-write of a [T,16384] f32 tensor per GDN
+// layer running at 77% of the device's peak bandwidth — 43.6% of the measured
+// 27B prefill deficit. cuBLASLt can apply the same vector in the epilogue at no
+// cost via CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO, whose vector
+// length must equal the number of D's ROWS; our D is column-major [N,M], so its
+// rows are the output's N columns and the caller's f32 [N] resident vector is
+// already exactly right (no repack, no new allocation).
+//
+// Numerically the two forms are the same single IEEE f32 multiply on the same
+// f32 accumulator: today is `accum -> x1.0 -> store f32 -> load f32 -> xalpha ->
+// store f32`, this is `accum -> xalpha -> store f32`, at the same
+// scale_type=CUDA_R_32F and the same store dtype. What CAN differ is the ALGO:
+// the pointer mode is on the descriptor the heuristic reads, so it may select a
+// different split-K, and f32 addition is not associative. That is why the mode
+// is part of the plan key, why the arm is DEFAULT OFF, and why the CUDA-tier
+// test asserts BITWISE equality at the real gate shapes (the same
+// shape-conditional method #213 established for the merge itself).
+//
+// Falls back to the two-launch form — byte for byte what this file did before —
+// when the toggle is off, when cuBLASLt has no plan, or when the selected algo
+// does not advertise the pointer mode.
+void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8,
+                                         const Tensor& b_fp8, const Tensor& alpha_vec,
+                                         bool claims_splitk1_premise) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  if (m == 0 || n == 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  if (k == 0) {  // empty reduction: out = 0, and alpha * 0 == 0 (as in the fallback)
+    CheckCuda(cudaMemsetAsync(out.data, 0, out.Bytes(), s), "fp8 alpha-vec k=0 memset");
+    return;
+  }
+
+  // The shipped two-launch form: GEMM at alpha=1, then the column vector. Also
+  // the rollback arm, reached in the same binary with the toggle unset.
+  auto two_launch = [&]() {
+    // The caller's premise travels WITH the GEMM it is a premise about.
+    MatmulFp8CublasLtKernelCuda(q, out, a_fp8, b_fp8, 1.0F, claims_splitk1_premise);
+    ::vt::MulColVecF32(q, out, alpha_vec);
+  };
+  if (!Fp8AlphaVecEpilogueEnabled()) {
+    two_launch();
+    return;
+  }
+  // A bf16 D takes the two-launch arm UNCONDITIONALLY, and that is a correctness
+  // gate, not an oversight (PERF-FP8-ALPHA-FOLD / #417).
+  //
+  // This op's contract — and the whole byte-exactness argument in
+  // .agents/specs/perf-fp8-alpha-fold.md §Byte-exactness — is that the epilogue
+  // arm and the fallback arm compute the SAME thing, so VT_FP8_ALPHA_VEC_EPILOGUE
+  // is a pure performance A/B that can never move a token. At an f32 D that holds:
+  // `acc -> x1.0 -> store f32 -> load f32 -> xalpha -> store f32` and
+  // `acc -> xalpha -> store f32` are the same single IEEE f32 multiply, because
+  // x1.0 and the f32 round-trip are both exact.
+  //
+  // At a bf16 D it does NOT hold. The fallback rounds TWICE (store bf16, then
+  // multiply and store bf16 again) while the epilogue rounds ONCE (multiply, then
+  // store bf16), so the two arms would disagree by up to a ulp on a large
+  // fraction of words — the identical double-rounding defect that got the z-slice
+  // fallback REJECTED in this row's spec. Letting the toggle silently change
+  // values would turn a performance switch into a numerics switch.
+  //
+  // Nothing is lost today: all three cuBLASLt vector-alpha mechanisms are MEASURED
+  // unavailable on GB10/sm_121a (spec §Outcome), so the epilogue arm never
+  // executes at any dtype here. Note for whoever gets hardware that offers it —
+  // the single-rounding epilogue form is the MORE vLLM-faithful one (vLLM computes
+  // bf16(acc * alpha) with its requantized single scalar, modelopt.py:458), so
+  // lifting this gate is a deliberate, gated decision worth making, not a bug to
+  // fix in passing.
+  //
+  // A caller's splitK premise is therefore enforced for this op too, just one
+  // frame down: two_launch() forwards `claims_splitk1_premise` to
+  // MatmulFp8CublasLtKernelCuda, which runs RequireBf16DSplitKOne on the plan it
+  // selects. Repeating the check here would be unreachable code, since every
+  // bf16 D leaves through this branch — and the epilogue arm below is f32-D
+  // only, where no premise about a bf16 store can apply.
+  if (out.dtype != DType::kF32) {
+    two_launch();
+    return;
+  }
+
+  const LtContext ctx = GetContext(q.device.index);
+  // f32 D by the gate directly above; the derivation matches the scalar-alpha
+  // GEMM's and is carried into key.out_type below. `out_type` is part of
+  // Fp8PlanKey's == AND its hash, so a bf16-D plan could never be handed back for
+  // an f32-D matmul in any case.
+  const cudaDataType_t out_type = CUDA_R_32F;
+  Fp8PlanKey key;
+  key.device = q.device.index;
+  key.m = m;
+  key.n = n;
+  key.k = k;
+  key.out_type = static_cast<int>(out_type);
+  key.a_type = static_cast<int>(CUDA_R_8F_E4M3);
+  key.compute_type = static_cast<int>(CUBLAS_COMPUTE_32F);
+  key.scale_type = static_cast<int>(CUDA_R_32F);
+  key.trans_a = static_cast<int>(CUBLAS_OP_T);
+  key.trans_b = static_cast<int>(CUBLAS_OP_N);
+  key.epilogue = static_cast<int>(CUBLASLT_EPILOGUE_DEFAULT);
+  // The ONLY field that separates this plan from the scalar-alpha plan for the
+  // identical shape. Without it the cache would hand back an algo selected under
+  // a different pointer mode.
+  key.scale_mode = Fp8ScaleModeFor(/*alpha_device_vector=*/true);
+
+  Fp8Plan plan;
+  Fp8PlanGuard guard;  // engaged only when the plan is built fresh (cache off)
+  bool have_plan;
+  if (Fp8PlanCacheEnabled()) {
+    have_plan = GetOrBuildCachedFp8Plan(ctx, key, &plan);
+  } else {
+    have_plan = BuildFp8Plan(ctx, key, &plan);
+    if (have_plan) guard.p = &plan;
+  }
+  if (!have_plan) {  // no fp8 plan, or the algo refuses the pointer mode
+    two_launch();
+    return;
+  }
+  MaybeLogGemmAlgo(plan.heur, m, n, k, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_type,
+                   "TN-fp8-alphavec");
+
+  // alpha is a DEVICE pointer here (one f32 per output column); beta is zero by
+  // the pointer mode's definition, and is passed as a host zero so the argument
+  // is never an uninitialized read whatever the driver does with it.
+  const float beta = 0.0f;
+  CheckLt(cublasLtMatmul(ctx.handle, plan.desc, alpha_vec.data, b_fp8.data, plan.la, a_fp8.data,
+                         plan.lb, &beta, out.data, plan.lc, out.data, plan.lc, &plan.heur.algo,
+                         ctx.workspace, kWorkspaceBytes, s),
+          "fp8 cublasLtMatmul (device alpha vector)");
 }
 
 // Registers the CUDA matmul during static init (table fill only, no CUDA
@@ -645,6 +919,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<BatchedMatmulFn>(&BatchedMatmulKernelCuda)));
     RegisterOp(OpId::kMatmulFp8CublasLt, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFp8CublasLtFn>(&MatmulFp8CublasLtKernelCuda)));
+    RegisterOp(OpId::kMatmulFp8CublasLtAlphaVec, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulFp8CublasLtAlphaVecFn>(&MatmulFp8CublasLtAlphaVecKernelCuda)));
   }
 } registrar;
 
