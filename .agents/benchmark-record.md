@@ -19933,3 +19933,34 @@ that host/ATS-retagged weights are materially slower per GEMM.
 Next step is measurement, not a rewrite: dump B/scales strides and pointer
 residency for one expert on both sides and compare. The kernel itself is vendored
 from vLLM and identical where it chooses what to run.
+
+## SPEC-DSPARK: the kernel inputs MATCH -- the 8.2% may be routing (2026-08-12)
+
+Direct comparison of what each engine hands the Marlin MoE kernel:
+
+| property | ours | upstream |
+|---|---|---|
+| w13 scales per expert | 2*(K/16)*N = 131072 B | [256,128,1024] fp8 = 131072 B |
+| w2 scales per expert | (N/16)*K = 65536 B | [256,32,2048] fp8 = 65536 B |
+| pointer alignment | pool over cudaMalloc | ptr%16 == 0, ptr%256 == 0 |
+| residency | cudaMalloc (device) | torch CUDA tensor (device) |
+
+Identical kernel, instantiation, grid rule, launch count, scale layout, alignment
+and residency. "Our kernel is slower" is no longer the simplest explanation.
+
+Likelier: we are not doing the same WORK. The kernel loops
+div_ceil(num_tokens_past_padded, moe_block_size) blocks per launch, and that
+depends on how many DISTINCT experts the batch touches (E=256, top_k=8, M=9 ->
+up to 72 pairs, each padded). The launch COUNT is fixed by layers x steps (1520
+both sides) but the blocks per launch are not. Our token stream is not upstream's
+-- the 35B "fibonacci" outputs diverge at char 55 (`return (` vs `return(`), the
+ratified near-tie regime -- so the two engines can execute different amounts of
+expert work for the same prompt.
+
+If so, the 8.2% is not an implementation gap and cannot be optimised away.
+
+Deciding experiment, required BEFORE any kernel work: instrument
+num_tokens_past_padded (or per-call block count) on both sides for the same
+prompt and compare totals. Equal totals => our kernel is genuinely slower.
+Different totals => the gap is routing and the kernel comparison was never
+like-for-like.
