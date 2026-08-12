@@ -108,6 +108,7 @@ enum class OpId : uint8_t {
   kAttention,
   kAttentionDenseFast,
   kAttentionDenseFlash,
+  kAttentionDenseFa2,
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
   kReshapeAndCache,
@@ -2254,6 +2255,23 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
 // so kAttention / kAttentionDenseFast stay untouched.
 void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                          const Tensor& value, const AttentionArgs& args);
+
+// Same contract as AttentionDenseFlash, but the CUDA impl runs the VENDORED
+// FlashAttention-2 forward (src/vt/cuda/flash_attn/) on its tensor cores instead of a
+// scalar per-warp recurrence — the kernel vLLM itself dispatches for dense non-causal
+// encoder self-attention (vllm/model_executor/models/whisper.py
+// WhisperEncoderAttention:255 -> forward:298-317 -> flash_attn_varlen_func).
+//
+// NOT bit-identical to AttentionDenseFast/Flash: `mma.sync` reassociates the QK^T and
+// PV reductions, so results differ within the bf16 envelope and adoption is gated on
+// the token-exact / ratified near-tie gate, never assumed. The FA-2 fast path applies
+// only to bf16, head_dim 64, non-causal, MHA (h_k == h) on CUDA with the vendored
+// kernels compiled; every other shape falls back to kAttentionDenseFlash, which is why
+// this op is safe to call generically. On CPU it dispatches to the SAME kernel as
+// Attention. Separate op so kAttention / kAttentionDenseFast / kAttentionDenseFlash
+// stay untouched.
+void AttentionDenseFa2(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                       const Tensor& value, const AttentionArgs& args);
 
 // DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the project's FIRST
 // non-causal / bidirectional attention primitive. See DFlashBlockAttentionArgs for
