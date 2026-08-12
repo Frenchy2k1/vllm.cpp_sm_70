@@ -424,16 +424,19 @@ non-exact. The row has no remaining implementable path on this hardware:
 | 1 | `POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO` | REFUSED — no algo advertises the cap bit; arm implemented, inert, default OFF |
 | 2 | scalar GEMM alpha + z-slice correction | REJECTED — double rounding, 25-36% of z-slice words off by 1 ulp; not implemented |
 | 3 | `A_SCALE_POINTER` + `OUTER_VEC_32F` | REFUSED — mode unimplemented for e4m3 TN; 0 of 48 cells, all shapes and dtypes |
+| 4 | bf16 D — HALVE the pass, don't eliminate it | IMPLEMENTED, default OFF, UNMEASURED. No vendor capability needed; see §Attempt 4 |
 
 Open decisions for the operator, in order of value:
 
-1. `#417`'s bf16-output lever (−61.5 ms on this same buffer) is untouched by all
-   three results and is now the **only uncontested saving on this tensor**. Pass 2
-   incidentally proves cuBLASLt serves a bf16 D for these exact fp8 shapes
-   (algoId 67 at every shape), so that row's premise holds on this hardware.
-2. Whether a 1-ulp perturbation of ~30% of this tensor is worth ~76 ms/req. This
-   row's default answer is no and it is forbidden from deciding unilaterally.
-3. Re-run the two probes on any new driver/GPU before assuming this is permanent.
+1. Run attempt 4's gates and A/B (§Attempt 4). It is the only lever on this tensor
+   that depends on no cuBLASLt capability, it is built and default OFF, and Pass 2
+   already proved cuBLASLt serves a bf16 D for these exact fp8 shapes (algoId 67 at
+   every shape, `splitK=1`). It is NOT value-neutral, so the SACRED gates decide it.
+2. Whether a 1-ulp perturbation of ~30% of this tensor is worth ~76 ms/req
+   (attempt 2). This row's default answer is no and it is forbidden from deciding
+   unilaterally.
+3. Re-run the two probes on any new driver/GPU before assuming attempts 1 and 3
+   are permanently refused.
 
 **Not a ceiling.** The pass is 43.6% of the measured 27B prefill deficit and the
 arithmetic that would remove it is exact; what is missing is a vendor kernel, on
@@ -448,10 +451,57 @@ dgx.casa under the GPU lock). What remains owed is only what a *landed* lever
 would need: the SACRED engine gates and a prefill A/B. Nothing here changes
 runtime behavior, so neither is triggered.
 
+## Attempt 4 — HALVE the pass instead of eliminating it (IMPLEMENTED, UNMEASURED)
+
+Hypothesis (a) of §Not a ceiling is now built, DEFAULT OFF, behind
+`VT_GDN_FP8_IN_BF16`. It depends on **no cuBLASLt capability at all**: it does not
+try to remove the pass, only to halve the bytes it moves.
+
+The pass is bandwidth-saturated at 77% of peak, so its cost IS its width. Emitting
+the merged fp8 qkvz GEMM's D as **bf16** makes the read-modify-write move 4
+bytes/element instead of 8 — an expected ~61 ms/req, ~21.8% of the measured 27B
+prefill gap. Pass 2 of the probe already established the premise on this hardware:
+cuBLASLt serves a bf16 D at algoId 67 for these exact fp8 shapes, at every gate
+shape and every M, with `splitK=1`.
+
+What changed, and why none of it is a parallel path:
+
+- `vt::MulColVecF32` gained a **bf16 store arm** as a dtype axis on the existing
+  kernel — the same widening `SigmoidGateBf16Kernel` took for `Tattn` — on CUDA
+  *and* CPU, so it stays a portable op rather than a CUDA-only capability. `col`
+  stays f32 and the multiply stays f32 on both arms; only the store rounds. The
+  f32 arm is byte-identical to the `*=` it replaces.
+- `vt::MatmulFp8CublasLtAlphaVec` accepts a bf16 `out`, which is what removed the
+  blocker `row/PERF-GDN-BF16-CHAIN` had to decline against.
+- `MergedFp8QkvzD` takes a `want` dtype (default f32 = today, byte for byte).
+
+**A bf16 D is REFUSED the epilogue arm, deliberately.** At f32 the epilogue and
+fallback arms are one arithmetic, which is what lets
+`VT_FP8_ALPHA_VEC_EPILOGUE` be a pure performance A/B. At bf16 they are not: the
+fallback rounds twice (store bf16, multiply, store bf16) and the epilogue rounds
+once — the *same* double-rounding defect that got attempt 2 rejected, pointing the
+other way. Rather than let a performance toggle move tokens, a bf16 D always takes
+the two-launch arm. Nothing is lost today (the epilogue arm is measured dead at
+every dtype here), and the note is left that the single-rounding epilogue form is
+the MORE vLLM-faithful one, so lifting the gate is a deliberate future decision.
+
+**This attempt is NOT byte-preserving and does not claim to be.** Narrowing D
+rounds the accumulator to bf16 *before* the alpha multiply instead of after it, so
+tokens can move. The direction is toward the oracle — vLLM emits bf16 here
+(`modelopt.py:458`) and our f32 is the deviation — but that is an expectation, not
+evidence. **The two SACRED engine gates decide it**, at their exact case AND
+assertion counts; a lost token is `NEEDS_DECISION`, never a re-cut golden.
+
+Owed before any default flip: both SACRED gates per arm, the same-binary
+`VT_GDN_FP8_IN_BF16=0|1` A/B at T=4096 prefill, and an nsys kernel list showing
+`MulColVecF32Kernel` unchanged in COUNT (48) but halved in bytes/time, with
+`CastBf16Kernel` falling as the `z` cast disappears.
+
 ## Outcome
 
-**No lever landed, and the reason is external.** All three routes to folding the
-per-column FP8 alpha into the GEMM are now measured, not argued:
+**No ELIMINATION lever landed, and the reason is external; a HALVING lever is now
+built and awaiting its gates.** All three routes to folding the per-column FP8
+alpha into the GEMM are measured, not argued:
 
 - **Measured:** the standalone probes above — controls green on every shape and
   output dtype, `OUTER_VEC_32F` refused in 0/20 cells; and the earlier
@@ -462,15 +512,24 @@ per-column FP8 alpha into the GEMM are now measured, not argued:
   off by 1 ulp over 2e6 accumulators, 6/6 alpha pairs) — a correctness trade this
   row is forbidden to make. Exact only if `qkv.alpha` is a power of two, which no
   checkpoint guarantees.
+- **Built, not measured:** attempt 4 (§Attempt 4) halves the pass instead of
+  removing it, by emitting a bf16 D. It needs no vendor capability, it is DEFAULT
+  OFF, and it is NOT byte-preserving — the SACRED gates decide it. The implementing
+  host had no `nvcc` and no GPU, so nothing in it is numerically verified.
 - **Why the defaults are set as they are:** `VT_FP8_ALPHA_VEC_EPILOGUE` stays
   DEFAULT OFF because its arm cannot execute on this hardware — the fallback
   fires on every call, so the default is the *only* behavior either way, and the
-  arm is retained solely for hardware that offers the mode. No default flipped;
-  no golden touched; runtime behavior is byte-identical to before this row.
+  arm is retained solely for hardware that offers the mode. `VT_GDN_FP8_IN_BF16`
+  stays DEFAULT OFF because it changes values and no gate has run. No default
+  flipped; no golden touched; with both toggles unset, runtime behavior is
+  byte-identical to before this row.
 
 The measured 122.99 ms/req (43.6% of the 27B prefill gap) is therefore still
-open, and is explicitly NOT declared a ceiling — §Now names two hypotheses that
-depend on no vendor capability. The row's lasting product is the elimination of
-two plausible mechanisms with named causes, a re-runnable instrument that settles
-them in seconds on new hardware, and one recorded plan-cache hazard for whoever
-gets that hardware.
+open — half of it addressable by a lever that is now built and unmeasured, and the
+whole of it explicitly NOT declared a ceiling. §Not a ceiling's remaining untried
+hypothesis is fusing the multiply into the buffer's CONSUMER (the conv/post-conv
+reader) so the vector costs no separate DRAM pass at all. The row's lasting product
+is the elimination of two plausible mechanisms with named causes, a re-runnable
+instrument that settles them in seconds on new hardware, one recorded plan-cache
+hazard for whoever gets that hardware, and a portable bf16 store width on
+`vt::MulColVecF32` that the GDN-chain row was blocked on.

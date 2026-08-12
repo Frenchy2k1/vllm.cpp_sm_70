@@ -88,17 +88,37 @@ void CastF32KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   Check(cudaGetLastError(), "cast_f32 launch");
 }
 
-// mul_col_vec_f32: x[m,n] *= col[n]. x f32 [M,N] with row stride row_stride
-// (inner-contiguous rows), col f32 [N]. Thread per logical element (flat over
-// M*N); recover (row,col-index) and apply the broadcast column scalar.
-__global__ void MulColVecF32Kernel(float* x, const float* col, int64_t n_elem,
+// mul_col_vec_f32: x[m,n] *= col[n]. x f32 OR bf16 [M,N] with row stride
+// row_stride (inner-contiguous rows), col always f32 [N]. Thread per logical
+// element (flat over M*N); recover (row,col-index) and apply the broadcast
+// column scalar.
+//
+// PERF-FP8-ALPHA-FOLD / #417: `Tx` is the STORE width, added as a dtype axis on
+// THIS kernel rather than as a second kernel — the same widening
+// SigmoidGateBf16Kernel took for its `Tattn` operand just below. The pass is a
+// full read-modify-write of the merged FP8 GDN in_proj output, measured
+// bandwidth-bound at 209.5 GB/s = 77% of the GB10's 273.1 GB/s peak, so its cost
+// IS its width and a bf16 x moves half the bytes.
+//
+// The ARITHMETIC is unchanged on both arms: Load() upcasts to f32, the multiply
+// is the same single IEEE f32 multiply, and only Store() differs. The f32 arm is
+// byte-identical to the `*=` it replaces (for float, Store(x,i,Load(x,i)*c) IS
+// `x[i] *= c`); the bf16 arm rounds the product to bf16, which is the whole
+// point of the narrowing and is why the caller opts in.
+//
+// `col` stays f32 on BOTH arms deliberately: it is the resident folded alpha
+// (input_scale * that shard's weight_scale), it costs [N] bytes and not [M,N],
+// so rounding it would perturb every column for no bandwidth saving at all.
+template <typename Tx>
+__global__ void MulColVecF32Kernel(Tx* x, const float* col, int64_t n_elem,
                                    int64_t row_size, int64_t row_stride) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n_elem; i += step) {
     const int64_t row = i / row_size;
     const int64_t c = i - row * row_size;
-    x[row * row_stride + c] *= col[c];
+    const int64_t off = row * row_stride + c;
+    Store(x, off, Load(x, off) * col[c]);
   }
 }
 
@@ -106,8 +126,17 @@ void MulColVecF32KernelCuda(Queue& q, Tensor& x, const Tensor& col) {
   const int64_t rows = x.shape[0], row_size = x.shape[1];
   const int64_t n_elem = rows * row_size;
   if (n_elem == 0) return;
-  MulColVecF32Kernel<<<GridFor(n_elem), kBlock, 0, AsStream(q)>>>(
-      x.Ptr<float>(), col.Ptr<float>(), n_elem, row_size, x.stride[0]);
+  switch (x.dtype) {
+    case DType::kF32:
+      MulColVecF32Kernel<float><<<GridFor(n_elem), kBlock, 0, AsStream(q)>>>(
+          x.Ptr<float>(), col.Ptr<float>(), n_elem, row_size, x.stride[0]);
+      break;
+    case DType::kBF16:
+      MulColVecF32Kernel<__nv_bfloat16><<<GridFor(n_elem), kBlock, 0, AsStream(q)>>>(
+          x.Ptr<__nv_bfloat16>(), col.Ptr<float>(), n_elem, row_size, x.stride[0]);
+      break;
+    default: VT_CHECK(false, "cuda mul_col_vec_f32: x must be f32 or bf16");
+  }
   Check(cudaGetLastError(), "mul_col_vec_f32 launch");
 }
 
