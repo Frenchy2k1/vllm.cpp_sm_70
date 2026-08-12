@@ -40,6 +40,23 @@ constexpr const char* kLibraryNames[] = {
 };
 #endif
 
+#if defined(_WIN32)
+void* Win32Open(void*, const wchar_t* name) {
+  return reinterpret_cast<void*>(LoadLibraryW(name));
+}
+
+void* Win32Lookup(void*, void* handle, const char* name) {
+  return reinterpret_cast<void*>(
+      GetProcAddress(reinterpret_cast<HMODULE>(handle), name));
+}
+
+void Win32Close(void*, void* handle) {
+  FreeLibrary(reinterpret_cast<HMODULE>(handle));
+}
+
+constexpr VulkanLibraryOps kWin32Ops{nullptr, Win32Open, Win32Lookup, Win32Close};
+#endif
+
 void CloseLibrary() {
 #if defined(_WIN32)
   FreeLibrary(g_handle);
@@ -49,6 +66,15 @@ void CloseLibrary() {
   g_handle = nullptr;
 }
 
+#if defined(_WIN32)
+struct Win32LibraryShutdown {
+  ~Win32LibraryShutdown() {
+    if (g_handle != nullptr) CloseLibrary();
+  }
+};
+Win32LibraryShutdown g_win32_library_shutdown;
+#endif
+
 void* LookupSymbol(const char* name) {
 #if defined(_WIN32)
   return reinterpret_cast<void*>(GetProcAddress(g_handle, name));
@@ -57,19 +83,47 @@ void* LookupSymbol(const char* name) {
 #endif
 }
 
+bool ProbeWithOps(const VulkanLibraryOps& ops, bool close_success,
+                  VulkanApi* api = nullptr, void** retained_handle = nullptr) {
+  void* handle = ops.open(ops.context, L"vulkan-1.dll");
+  if (handle == nullptr) return false;
+  auto close = [&] { ops.close(ops.context, handle); };
+  auto get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+      ops.lookup(ops.context, handle, "vkGetInstanceProcAddr"));
+  if (get_instance_proc_addr == nullptr ||
+      get_instance_proc_addr(VK_NULL_HANDLE, "vkCreateInstance") == nullptr) {
+    close();
+    return false;
+  }
+  if (api != nullptr) {
+    api->vkGetInstanceProcAddr = get_instance_proc_addr;
+    api->vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(
+        get_instance_proc_addr(VK_NULL_HANDLE, "vkCreateInstance"));
+  }
+  if (retained_handle != nullptr) *retained_handle = handle;
+  if (close_success) close();
+  return true;
+}
+
 }  // namespace
+
+bool ProbeVulkanLibraryForTesting(const VulkanLibraryOps& ops) {
+  if (ops.open == nullptr || ops.lookup == nullptr || ops.close == nullptr) return false;
+  return ProbeWithOps(ops, true);
+}
 
 bool LoadVulkanLibrary() {
   static std::once_flag once;
   std::call_once(once, [] {
 #if defined(_WIN32)
-    g_handle = LoadLibraryW(L"vulkan-1.dll");
+    void* retained = nullptr;
+    if (!ProbeWithOps(kWin32Ops, false, &g_api, &retained)) return;
+    g_handle = reinterpret_cast<HMODULE>(retained);
 #else
     for (const char* name : kLibraryNames) {
       g_handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
       if (g_handle != nullptr) break;
     }
-#endif
     if (g_handle == nullptr) return;
 
     // vkGetInstanceProcAddr is the ONE symbol a conformant loader must export
@@ -80,12 +134,20 @@ bool LoadVulkanLibrary() {
       CloseLibrary();
       return;
     }
+#endif
 
+#if !defined(_WIN32)
 #define VT_VK_LOAD_GLOBAL(name)                                          \
   g_api.name = reinterpret_cast<PFN_##name>(                             \
       g_api.vkGetInstanceProcAddr(VK_NULL_HANDLE, #name));
     VT_VK_GLOBAL_FUNCS(VT_VK_LOAD_GLOBAL)
 #undef VT_VK_LOAD_GLOBAL
+#else
+    g_api.vkEnumerateInstanceVersion =
+        reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+            g_api.vkGetInstanceProcAddr(VK_NULL_HANDLE,
+                                        "vkEnumerateInstanceVersion"));
+#endif
 
     // vkCreateInstance is mandatory even on a Vulkan 1.0 loader.
     // vkEnumerateInstanceVersion is 1.1 and may legitimately be null; the

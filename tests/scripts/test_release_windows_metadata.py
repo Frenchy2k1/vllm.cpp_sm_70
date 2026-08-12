@@ -63,7 +63,6 @@ class WindowsMetadataContract(unittest.TestCase):
             source_commit=SHA, stage_dir=stage, tier_report=tier_report,
             toolchain="Visual Studio 2022 v143 /MT", toolset_version="14.38.33130",
             ucrt_version="10.0.20348.0", version="0.0.3-pre.1",
-            vulkan_runtime_passed=False,
         )
 
     def test_cpu_metadata_is_native_preview_and_sbom_names_exe(self) -> None:
@@ -100,14 +99,20 @@ class WindowsMetadataContract(unittest.TestCase):
                 with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                     self.tool.prepare_windows_metadata(args)
 
+            report = json.loads(args.pe_report.read_text())
+            report.update({"imports": ["api-ms-win-crt-runtime-l1-1-0.dll"],
+                           "debug_paths": []})
+            args.pe_report.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.tool.prepare_windows_metadata(args)
+
     def test_vulkan_loader_uses_wide_win32_api_and_releases_invalid_dll(self) -> None:
         source = (ROOT / "src/vt/vulkan/vulkan_loader.cpp").read_text(encoding="utf-8")
-        self.assertIn('LoadLibraryW(L"vulkan-1.dll")', source)
-        self.assertIn("GetProcAddress(g_handle, name)", source)
-        self.assertIn("FreeLibrary(g_handle)", source)
-        self.assertIn('LookupSymbol("vkGetInstanceProcAddr")', source)
-        self.assertIn("if (g_api.vkGetInstanceProcAddr == nullptr)", source)
-        self.assertIn("CloseLibrary();", source)
+        self.assertIn("LoadLibraryW(name)", source)
+        self.assertIn("GetProcAddress(reinterpret_cast<HMODULE>(handle), name)", source)
+        self.assertIn("FreeLibrary(reinterpret_cast<HMODULE>(handle))", source)
+        self.assertIn('ops.lookup(ops.context, handle, "vkGetInstanceProcAddr")', source)
+        self.assertIn("Win32LibraryShutdown", source)
 
     def test_persistent_cache_stays_on_linux_cpu_and_is_excluded_only_on_windows(self) -> None:
         root_cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -124,6 +129,18 @@ class WindowsMetadataContract(unittest.TestCase):
         block_end = tests_cmake.index("endif()", target)
         self.assertLess(block_start, target)
         self.assertLess(target, block_end)
+
+    def test_windows_script_smokes_the_final_zip_server_lifecycle(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(encoding="utf-8")
+        package = script.index('"scripts/package-server.py"')
+        expand = script.index("Expand-Archive", package)
+        archive_server = script.index('bin/vllm-server.exe', expand)
+        lifecycle = script.index("$smokeHarness, $archiveServer", archive_server)
+        validate = script.index('"scripts/validate-release-archive.py"', lifecycle)
+        self.assertLess(package, expand)
+        self.assertLess(expand, archive_server)
+        self.assertLess(archive_server, lifecycle)
+        self.assertLess(lifecycle, validate)
 
 
 if __name__ == "__main__":

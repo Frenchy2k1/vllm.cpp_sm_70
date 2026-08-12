@@ -955,16 +955,21 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
         errors.append("release mutation suite is missing from preflight SUITES")
     if suites is None or "test_release_manifest" not in suites:
         errors.append("W5 manifest suite is missing from preflight SUITES")
+    if suites is None or "test_release_windows_metadata" not in suites:
+        errors.append("W15 Windows metadata suite is missing from preflight SUITES")
     returncode, invocations = _trace_preflight_commands(preflight_text)
     checker_argv = ("scripts/check-release-binary-contract.py",)
     suite_argv = ("tests/scripts/test_check_release_binary_contract.py",)
     manifest_suite_argv = ("tests/scripts/test_release_manifest.py",)
+    windows_suite_argv = ("tests/scripts/test_release_windows_metadata.py",)
     if invocations.count(checker_argv) != 1:
         errors.append("preflight does not execute release CHECKERS through its checker loop")
     if invocations.count(suite_argv) != 1:
         errors.append("preflight does not execute release SUITES through its suite loop")
     if invocations.count(manifest_suite_argv) != 1:
         errors.append("preflight does not execute the W5 manifest suite exactly once")
+    if invocations.count(windows_suite_argv) != 1:
+        errors.append("preflight does not execute the W15 Windows metadata suite exactly once")
     if returncode != 0:
         errors.append(f"instrumented preflight execution failed with rc={returncode}")
     active = _active_ci_commands(ci_text)
@@ -977,6 +982,8 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
         errors.append("release mutation suite is missing from the explicit CI step")
     if ("python3", "tests/scripts/test_release_manifest.py") not in active:
         errors.append("W5 manifest suite is missing from an unconditional CI step")
+    if ("python3", "tests/scripts/test_release_windows_metadata.py") not in active:
+        errors.append("W15 Windows metadata suite is missing from an unconditional CI step")
     if not _ci_has_active_release_step(ci_text):
         errors.append(
             "CI release step must contain checker and suite as direct active commands"

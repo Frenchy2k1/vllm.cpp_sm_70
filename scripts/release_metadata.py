@@ -357,7 +357,7 @@ def windows_dependencies(report_path: Path, backend: str) -> list[dict[str, Any]
         raise ValueError("PE audit imports must be a non-empty string array")
     forbidden = [
         name for name in imports
-        if re.match(r"(?i)^(?:msys-|mingw|libgcc|libstdc\+\+|vcruntime|msvcp|msvcr|ucrtbase|concrt)", name)
+        if re.match(r"(?i)^(?:msys-|mingw|libgcc|libstdc\+\+|vcruntime|msvcp|msvcr|ucrtbase|concrt|api-ms-win-crt-)", name)
     ]
     if forbidden:
         raise ValueError(f"PE audit violates native static-CRT policy: {sorted(forbidden)}")
@@ -410,13 +410,9 @@ def prepare_windows_metadata(args: argparse.Namespace) -> dict[str, Any]:
         args.tier_report, "x86_64", False
     )
     dependency_rows = windows_dependencies(args.pe_report, args.backend)
-    runtime = (
-        passed("extracted Vulkan ICD runtime probe", args.evidence_url)
-        if args.backend == "vulkan" and args.vulkan_runtime_passed
-        else absent("no real extracted-archive Vulkan ICD probe was executed")
-        if args.backend == "vulkan"
-        else passed(" && ".join(test_commands), args.evidence_url)
-    )
+    runtime = (absent("no real extracted-archive Vulkan ICD probe was executed")
+               if args.backend == "vulkan"
+               else passed(" && ".join(test_commands), args.evidence_url))
     facts: dict[str, Any] = {
         "artifact": {
             "c_abi_version": args.c_abi_version,
@@ -515,7 +511,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pe-report", type=Path)
     parser.add_argument("--toolset-version")
     parser.add_argument("--ucrt-version")
-    parser.add_argument("--vulkan-runtime-passed", action="store_true")
     return parser.parse_args(argv)
 
 

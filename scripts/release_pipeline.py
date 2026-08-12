@@ -19,6 +19,18 @@ MATRIX_SCHEMA = "vllm.cpp.release-matrix.v1"
 RELEASE_INDEX_SCHEMA = "vllm.cpp.release-index.v1"
 CHANNELS = {"stable", "preview", "experimental-preview"}
 ARCHIVE_FORMATS = {"tar.gz", "zip"}
+PRIMARY_ARTIFACT_FORMATS = {
+    "linux-x86_64-glibc-cpu": "tar.gz",
+    "linux-aarch64-glibc-cpu": "tar.gz",
+    "linux-x86_64-musl-cpu-static": "tar.gz",
+    "linux-x86_64-glibc-cuda": "tar.gz",
+    "linux-aarch64-glibc-cuda": "tar.gz",
+    "macos-arm64-metal": "tar.gz",
+    "macos-arm64-metal-mlx": "tar.gz",
+    "linux-x86_64-glibc-vulkan": "tar.gz",
+    "windows-x86_64-msvc-cpu": "zip",
+    "windows-x86_64-msvc-vulkan": "zip",
+}
 RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 
 
@@ -89,6 +101,9 @@ def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
     ids = [item["id"] for item in normalized]
     if len(ids) != len(set(ids)):
         raise ValueError("release matrix artifact ids must be unique")
+    formats = {item["id"]: item["archive_format"] for item in normalized}
+    if formats != PRIMARY_ARTIFACT_FORMATS:
+        raise ValueError("release matrix must declare the exact primary tuple/archive-format policy")
     return normalized
 
 
@@ -268,11 +283,15 @@ def publish_release(
         for name, item in expected.items()
         if name.endswith((".tar.gz", ".zip"))
     }
-    artifact_formats = {
-        item.get("id"): item.get("archive_format")
-        for item in handoff.get("artifacts", [])
-        if isinstance(item, dict)
-    }
+    declared_artifacts = handoff.get("artifacts")
+    if not isinstance(declared_artifacts, list) or not declared_artifacts:
+        raise ValueError("verified handoff has no explicit artifact formats")
+    artifact_formats: dict[str, str] = {}
+    for item in declared_artifacts:
+        if (not isinstance(item, dict) or item.get("archive_format") not in ARCHIVE_FORMATS
+                or not isinstance(item.get("id"), str) or item["id"] in artifact_formats):
+            raise ValueError("verified handoff artifact format is invalid")
+        artifact_formats[item["id"]] = item["archive_format"]
     version = handoff.get("version")
     indexed_archives: set[str] = set()
     for row in index_rows:
@@ -281,12 +300,11 @@ def publish_release(
         archive = row.get("archive")
         artifact_id = row.get("id")
         archive_format = artifact_formats.get(artifact_id)
-        if archive_format is None and isinstance(archive, str):
-            archive_format = "tar.gz" if archive.endswith(".tar.gz") else "zip"
         if (
             not isinstance(archive, str)
             or not isinstance(artifact_id, str)
             or not isinstance(version, str)
+            or archive_format not in ARCHIVE_FORMATS
             or archive != canonical_archive_name(version, artifact_id, archive_format)
             or archive not in expected_archives
             or archive in indexed_archives
