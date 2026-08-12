@@ -1333,6 +1333,52 @@ step, and it is measurement, not a rewrite.
 **Do not "optimise the kernel".** It is vendored from vLLM and byte-identical in
 the parts that choose what to run; the difference is in what we hand it.
 
+## 6w. THE INPUTS MATCH -- so the 8.2% may be ROUTING, not a defect (2026-08-12)
+
+§6v narrowed the residual to "what we hand the kernel". Comparing that directly
+closes off the layout hypotheses and opens a different, more likely one.
+
+**Everything about the inputs matches:**
+
+| property | ours | upstream |
+|---|---|---|
+| w13 scales per expert | `2*(K/16)*N` = 131072 B | `[256,128,1024]` fp8 = 131072 B |
+| w2 scales per expert | `(N/16)*K` = 65536 B | `[256,32,2048]` fp8 = 65536 B |
+| pointer alignment | pool over `cudaMalloc` | `ptr%16 == 0`, `ptr%256 == 0` |
+| residency | `cudaMalloc` (device) | torch CUDA tensor (device) |
+
+So: identical kernel, identical instantiation, identical grid rule, identical
+launch count, identical scale layout, identical alignment, identical residency.
+At that point "our kernel is slower" stops being the simplest explanation.
+
+**The likelier one: we are not doing the same WORK.** The Marlin MoE kernel loops
+`div_ceil(num_tokens_past_padded, moe_block_size)` blocks per launch, and
+`num_tokens_past_padded` depends on HOW MANY DISTINCT EXPERTS the batch touches:
+E=256, top_k=8, M=9 gives up to 72 (token, expert) pairs, each padded to a
+`block_size_m` multiple. The launch COUNT is fixed by layers x steps (1520 on
+both sides, as measured), but the BLOCKS PER LAUNCH are not.
+
+And our token stream is NOT upstream's. §6i measured our 35B "fibonacci" output
+diverging from the oracle's at char 55 (`return (` vs `return(`) -- a near-tie
+flip, the ratified regime. Different tokens route to different experts, so the
+two engines can execute different amounts of expert work for the "same" prompt
+while launching the kernel the same number of times.
+
+**If that is the cause, the 8.2% is not an implementation gap and cannot be
+optimised away** -- it is the cost of a different (equally valid) token path.
+
+**The experiment that decides it**, and it must run before any kernel work:
+instrument `num_tokens_past_padded` (or the per-call block count) on both sides
+for the same prompt and compare the TOTALS over a run. Equal totals => our kernel
+really is slower and the layout hunt continues elsewhere. Different totals => the
+gap is routing, the comparison was never like-for-like at the kernel level, and
+the honest statement is that the engines diverge in what they compute rather than
+how fast they compute it.
+
+Recording this BEFORE acting, because every cheap explanation has now been
+eliminated and the expensive one (rewrite the expert path) would be exactly the
+wrong response to a routing difference.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
