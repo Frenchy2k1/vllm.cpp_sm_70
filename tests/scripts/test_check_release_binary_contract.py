@@ -139,7 +139,7 @@ RECORD_ANCHORS = {
     ),
     "docs/STATUS.md": "v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
     "docs/BENCHMARKS.md": (
-        "| **Binary release matrix (ACTIVE; v0.0.2 published, Windows pre-alpha pending)** |"
+        "| **Binary release (ACTIVE; Windows pre-alpha pending)** |"
     ),
 }
 
@@ -231,7 +231,7 @@ HUMAN_WORK_IDS = (
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** native Windows runtime/ISA evidence, matching hardware, ten-tuple dry run, v0.0.3-pre.1 publish/audit",
+        "**PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit",
         "**SHIPPED:** Windows v0.0.3-pre.1 runtime, artifacts, and audit complete",
         "docs/BENCHMARKS.md release row",
     ),

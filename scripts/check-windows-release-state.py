@@ -18,6 +18,15 @@ REQUIRED_SURFACES = (
     "docs/FEATURES.md",
     "docs/USAGE.md",
 )
+BENCHMARKS_PENDING_FRAGMENTS = (
+    "Windows pre-alpha pending",
+    "Windows W14-W16 implemented",
+    "**PENDING:** native hosted gates",
+    "merged-SHA ten-tuple dry run",
+    "matching-hardware evidence",
+    "v0.0.3-pre.1 publication",
+    "32-asset audit",
+)
 
 
 def read_surfaces(root: Path) -> dict[str, str]:
@@ -42,7 +51,10 @@ def validate_texts(texts: dict[str, str]) -> list[str]:
     roadmap = texts[".agents/roadmap_v1.md"]
     if "v0.0.3-pre.1` publication and 32-asset audit remain pending" not in roadmap:
         errors.append("roadmap must retain the pending Windows publication/audit gate")
-    if "Windows pre-alpha pending" not in texts["docs/BENCHMARKS.md"] or "**PENDING:** native Windows" not in texts["docs/BENCHMARKS.md"]:
+    if any(
+        fragment not in texts["docs/BENCHMARKS.md"]
+        for fragment in BENCHMARKS_PENDING_FRAGMENTS
+    ):
         errors.append("benchmarks must retain pending native Windows evidence")
     if "Windows v0.0.3-pre.1 pending" not in texts["docs/STATUS.md"]:
         errors.append("status must retain pending Windows publication")

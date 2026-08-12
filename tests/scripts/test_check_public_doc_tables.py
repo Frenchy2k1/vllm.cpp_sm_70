@@ -9,6 +9,7 @@ rollup the gate points at).
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -68,6 +69,60 @@ VALID = "\n".join(
 )
 
 
+RELEASE_FACTS = (
+    "v0.0.2",
+    "eight primary archive/checksum/provenance triplets",
+    "two indexes",
+    "26 assets",
+    "7020de93652ca920424a10ac5255b34810dd2f24",
+    "31466516224",
+    "Windows W14-W16 implemented",
+    "native hosted gates",
+    "merged-SHA ten-tuple dry run",
+    "matching-hardware evidence",
+    "v0.0.3-pre.1 publication",
+    "32-asset audit",
+    "W12 optional/non-primary",
+)
+
+
+def _release_rows(text: str) -> list[str]:
+    at_a_glance = text.split("## At a glance", 1)[1].split("\n## ", 1)[0]
+    return [
+        line for line in at_a_glance.splitlines()
+        if line.startswith("| **Binary release")
+    ]
+
+
+def _release_projection_errors(text: str) -> list[str]:
+    rows = _release_rows(text)
+    errors = []
+    if len(rows) != 1:
+        errors.append(f"expected one keyed Binary release row, found {len(rows)}")
+    projection = "\n".join(rows)
+    for fact in RELEASE_FACTS:
+        if fact not in projection:
+            errors.append(f"release projection is missing {fact!r}")
+    return errors
+
+
+def _project_release_rows(onto: str, from_text: str) -> str:
+    """Apply only PR #446's heading and release projection to another page."""
+    release_rows = _release_rows(from_text)
+    projected = []
+    inserted = False
+    for line in onto.splitlines():
+        if line.startswith("# Benchmarks"):
+            projected.append(from_text.splitlines()[0])
+        elif line.startswith("| **Binary release"):
+            if not inserted:
+                projected.extend(release_rows)
+                inserted = True
+        else:
+            projected.append(line)
+    return "\n".join(projected) + "\n"
+
+
 class BenchmarksStructureTests(unittest.TestCase):
     def test_minimal_valid_document_passes(self) -> None:
         self.assertEqual(doc_tables.benchmarks_errors(VALID), [])
@@ -75,6 +130,42 @@ class BenchmarksStructureTests(unittest.TestCase):
     def test_shipped_benchmarks_page_passes(self) -> None:
         text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
         self.assertEqual(doc_tables.benchmarks_errors(text), [])
+
+    def test_release_projection_is_single_and_complete(self) -> None:
+        text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
+        self.assertEqual(_release_projection_errors(text), [])
+
+    def test_each_release_projection_fact_is_load_bearing(self) -> None:
+        text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
+        for fact in RELEASE_FACTS:
+            with self.subTest(fact=fact):
+                mutated = text.replace(fact, "[REMOVED]", 1)
+                self.assertTrue(
+                    any(fact in error for error in _release_projection_errors(mutated))
+                )
+
+    def test_second_release_projection_row_is_rejected(self) -> None:
+        text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
+        row = _release_rows(text)[0]
+        mutated = text.replace(row, f"{row}\n{row}", 1)
+        self.assertIn(
+            "expected one keyed Binary release row, found 2",
+            _release_projection_errors(mutated),
+        )
+
+    def test_release_projection_fits_after_current_main_merge(self) -> None:
+        text = (ROOT / "docs/BENCHMARKS.md").read_text(encoding="utf-8")
+        main = subprocess.run(
+            ["git", "show", "bbc482a2:docs/BENCHMARKS.md"],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        merged = _project_release_rows(main, text)
+        self.assertEqual(_release_projection_errors(merged), [])
+        self.assertLess(len(merged), doc_tables.BENCHMARKS_RULES.max_chars)
+        self.assertEqual(doc_tables.benchmarks_errors(merged), [])
 
     def test_shipped_record_exists(self) -> None:
         self.assertEqual(

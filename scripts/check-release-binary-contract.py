@@ -64,7 +64,7 @@ ANCHORS = {
     ".agents/coordination.md": "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": "# W6 installed server package green",
     "docs/STATUS.md": "v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending",
-    "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; v0.0.2 published, Windows pre-alpha pending)** |",
+    "docs/BENCHMARKS.md": "| **Binary release (ACTIVE; Windows pre-alpha pending)** |",
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
@@ -119,8 +119,8 @@ LIFECYCLE_RECORD_MUTATIONS = (
 )
 
 BENCHMARKS_RELEASE_ROW = (
-    "| **Binary release matrix (ACTIVE; v0.0.2 published, Windows pre-alpha pending)** | Eight published CPU/CUDA/Vulkan/Metal/MLX tuples; two Windows preview tuples implemented | "
-    "v0.0.2: SHA `7020de93652ca920424a10ac5255b34810dd2f24`, run `31466516224`, 26 assets. **PENDING:** native Windows runtime/ISA evidence, matching hardware, ten-tuple dry run, v0.0.3-pre.1 publish/audit | n/a |"
+    "| **Binary release (ACTIVE; Windows pre-alpha pending)** | v0.0.2 shipped eight primary archive/checksum/provenance triplets + two indexes (26 assets) from source SHA `7020de93652ca920424a10ac5255b34810dd2f24`, run `31466516224` | "
+    "Windows W14-W16 implemented. **PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit | W12 optional/non-primary |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
@@ -278,7 +278,7 @@ WORK_CONTENT = {
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** native Windows runtime/ISA evidence, matching hardware, ten-tuple dry run, v0.0.3-pre.1 publish/audit",
+        "**PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit",
         "**SHIPPED:** Windows v0.0.3-pre.1 runtime, artifacts, and audit complete",
         "docs/BENCHMARKS.md release row",
     ),
