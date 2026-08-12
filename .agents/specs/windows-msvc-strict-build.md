@@ -154,3 +154,12 @@ configurations and stopped on C4458/C2220 because the
 the same name ([#465](https://github.com/mudler/vllm.cpp/issues/465)). Both
 complete logs contain only this diagnostic family. The follow-up is specified
 in [windows-msvc-logprobs-shadow.md](windows-msvc-logprobs-shadow.md).
+
+Hosted run `31597279008` then compiled the library in both native configurations
+and stopped while compiling the OpenAI API test. CPU job `94115788855` and
+Vulkan job `94115788793` contain the same C4129/C2017/C3688 family (plus
+cascading C2661/C2220) at the byte-exact Windows command-line expectation
+([#474](https://github.com/mudler/vllm.cpp/issues/474)). The raw literal is
+standard-valid; the defect is MSVC stringizing the backslash-bearing literal as
+part of the `CHECK` macro argument. The follow-up is specified in
+[windows-msvc-check-stringizing.md](windows-msvc-check-stringizing.md).
