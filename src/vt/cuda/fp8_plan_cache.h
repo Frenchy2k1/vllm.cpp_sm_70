@@ -94,17 +94,30 @@ inline bool Fp8PlanCacheEnabled() {
 // it only against a NEW driver/GPU, and read the refusal REASON the log now
 // names (Fp8PlanRefusal below) rather than inferring one from an absence.
 // The arm stays in the tree, correct and DEFAULT OFF, for the hardware that does
-// offer the mode. The untried alternative for the SAME fusion is a different
-// cuBLASLt API, not this one: CUBLASLT_MATMUL_DESC_A_SCALE_POINTER (17) with
-// CUBLASLT_MATMUL_DESC_A_SCALE_MODE (31) = CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F
-// (3), documented in cublasLt.h as "vectors of CUDA_R_32F ... expected to have M
-// and N elements respectively, and each (i,j)-th element of product of A and B
-// is multiplied by i-th element of A scale" — with our TN layout (op(A)=weight
-// [N,K], D col-major [N,M]) that vector length M is exactly our N, i.e. the SAME
-// resident f32 [N] vector in the SAME layout. It is fp8's per-channel scaling
-// path (what torch `_scaled_mm` rowwise uses), it is gated by scale/compute-type
-// support rather than by CUBLASLT_ALGO_CAP_POINTER_MODE_MASK, and nothing here
-// has tried it. See .agents/specs/perf-fp8-alpha-fold.md §Outcome.
+// offer the mode.
+//
+// The ALTERNATIVE cuBLASLt API for the SAME fusion has now been tried too, and
+// is ALSO refused here — MEASURED 2026-08-12, GB10/sm_121a, cuBLASLt 130101,
+// driver 580.159.03, by the standalone probes scripts/probe_fp8_outer_vec_*.cu.
+// CUBLASLT_MATMUL_DESC_A_SCALE_POINTER (17) + CUBLASLT_MATMUL_DESC_A_SCALE_MODE
+// (31) = CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F (3) — fp8's per-channel
+// scaling path, whose A-side vector length is exactly our N under this TN layout
+// — returns ZERO algos from cublasLtMatmulAlgoGetHeuristic
+// (CUBLAS_STATUS_INVALID_VALUE for an A-only vector, NOT_SUPPORTED for A+B) on
+// all ten gate shapes AND on a canonical 4096^3 square AND at every output dtype
+// (f32/bf16/f16): 0 of 48 swept cells. The A-scale POINTER itself works — the
+// SCALAR_32F arm returns the identical algo as the host scalar — so it is the
+// vector MODE that cuBLASLt does not implement for e4m3 TN on this device.
+// Note the refusal lands on the HEURISTIC, not on cublasLtMatmul as
+// cublasLt.h's A_SCALE_POINTER doc implies; a matmul-only check reads a false
+// green. Do NOT re-derive either refusal: re-run the probes against a new
+// driver/GPU. See .agents/specs/perf-fp8-alpha-fold.md §Outcome.
+//
+// If a future driver DOES offer a scale-vector mode, note the hazard the probe
+// surfaced: A_SCALE_POINTER lives on the DESCRIPTOR (unlike the pointer-mode
+// alpha, which is a cublasLtMatmul argument), and Fp8PlanKey is keyed by SHAPE.
+// A cached vector-scale plan would apply the first GDN layer's alpha_vec to
+// every same-shaped layer. Set the pointer per call, or do not cache that plan.
 
 // Pure predicate for the VT_FP8_ALPHA_VEC_EPILOGUE contract: DEFAULT OFF, and
 // enabled only for the exact value "1". nullptr (unset) and every other value
