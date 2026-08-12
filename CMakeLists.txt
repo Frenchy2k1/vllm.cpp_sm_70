@@ -15,6 +15,10 @@ project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
 # MSVC/UCRT runtime (/MT in Release, /MTd in Debug), so the installed server
 # does not depend on a developer-machine CRT deployment.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC)
+  # Keep PE debug directories reproducible and free of runner/build paths.
+  add_link_options("/PDBALTPATH:%_PDB%")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -1284,6 +1288,11 @@ if(VLLM_CPP_VULKAN)
     src/vt/vulkan/vulkan_spirv.cpp)
   target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
 endif()
+if(NOT WIN32)
+  # The persistent cache is also exercised by CPU-only NVFP4 emulation. Its
+  # current file-lock implementation is POSIX-only; Windows CUDA is out of W15.
+  target_sources(vllm PRIVATE src/vt/cuda/nvfp4_persistent_cache.cpp)
+endif()
 # --- Tenstorrent backend (BACKEND-TENSTORRENT W0 skeleton) -------------------
 # Mostly ADDITIVE like the Metal/Vulkan/ROCm blocks above: a source list, a
 # PUBLIC compile definition, and one link library. TTNN::TTNN is TT-NN's own
@@ -1439,7 +1448,6 @@ if(VLLM_CPP_CUDA)
   endif()
   target_sources(vllm PRIVATE
     src/vllm/platforms/cuda.cpp
-    src/vt/cuda/nvfp4_persistent_cache.cpp
     src/vt/cuda/cuda_arch_tactics.cu
     src/vt/cuda/cuda_backend.cu
     src/vt/cuda/nccl_communicator.cu

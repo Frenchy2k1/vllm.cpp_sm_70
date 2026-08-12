@@ -18,6 +18,7 @@ HANDOFF_SCHEMA = "vllm.cpp.release-handoff.v1"
 MATRIX_SCHEMA = "vllm.cpp.release-matrix.v1"
 RELEASE_INDEX_SCHEMA = "vllm.cpp.release-index.v1"
 CHANNELS = {"stable", "preview", "experimental-preview"}
+ARCHIVE_FORMATS = {"tar.gz", "zip"}
 RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 
 
@@ -46,12 +47,14 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def canonical_archive_name(version: str, artifact_id: str) -> str:
+def canonical_archive_name(version: str, artifact_id: str, archive_format: str) -> str:
     if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version) is None:
         raise ValueError("archive version must be a semantic version")
     if re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", artifact_id) is None:
         raise ValueError("archive artifact ID is unsafe")
-    return f"vllm.cpp-{version}-{artifact_id}.tar.gz"
+    if archive_format not in ARCHIVE_FORMATS:
+        raise ValueError(f"archive format must be one of {sorted(ARCHIVE_FORMATS)}")
+    return f"vllm.cpp-{version}-{artifact_id}.{archive_format}"
 
 
 def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
@@ -71,13 +74,17 @@ def validate_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("release matrix artifacts must be a non-empty array")
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(artifacts):
-        if not isinstance(item, dict) or set(item) != {"id", "channel", "required"}:
+        if not isinstance(item, dict) or set(item) != {
+            "archive_format", "id", "channel", "required"
+        }:
             raise ValueError(f"release matrix artifact {index} has unknown or missing fields")
         artifact_id = item.get("id")
         if not isinstance(artifact_id, str) or re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", artifact_id) is None:
             raise ValueError(f"release matrix artifact {index} has unsafe id")
         if item.get("channel") not in CHANNELS or type(item.get("required")) is not bool:
             raise ValueError(f"release matrix artifact {artifact_id} has invalid policy")
+        if item.get("archive_format") not in ARCHIVE_FORMATS:
+            raise ValueError(f"release matrix artifact {artifact_id} has invalid archive format")
         normalized.append(dict(item))
     ids = [item["id"] for item in normalized]
     if len(ids) != len(set(ids)):
@@ -130,7 +137,7 @@ def inventory_assets(plan: dict[str, Any], assets_dir: Path) -> list[dict[str, A
         raise ValueError("plan version is invalid")
     for item in artifacts:
         artifact_id = item["id"]
-        archive = canonical_archive_name(version, artifact_id)
+        archive = canonical_archive_name(version, artifact_id, item["archive_format"])
         names = {
             archive,
             f"{archive}.sha256",
@@ -257,7 +264,14 @@ def publish_release(
     if not isinstance(index_rows, list):
         raise ValueError("release index artifacts must be an array")
     expected_archives = {
-        name: item for name, item in expected.items() if name.endswith(".tar.gz")
+        name: item
+        for name, item in expected.items()
+        if name.endswith((".tar.gz", ".zip"))
+    }
+    artifact_formats = {
+        item.get("id"): item.get("archive_format")
+        for item in handoff.get("artifacts", [])
+        if isinstance(item, dict)
     }
     version = handoff.get("version")
     indexed_archives: set[str] = set()
@@ -266,11 +280,14 @@ def publish_release(
             raise ValueError("release index artifact row is malformed")
         archive = row.get("archive")
         artifact_id = row.get("id")
+        archive_format = artifact_formats.get(artifact_id)
+        if archive_format is None and isinstance(archive, str):
+            archive_format = "tar.gz" if archive.endswith(".tar.gz") else "zip"
         if (
             not isinstance(archive, str)
             or not isinstance(artifact_id, str)
             or not isinstance(version, str)
-            or archive != canonical_archive_name(version, artifact_id)
+            or archive != canonical_archive_name(version, artifact_id, archive_format)
             or archive not in expected_archives
             or archive in indexed_archives
             or row.get("sha256") != expected_archives[archive].get("sha256")

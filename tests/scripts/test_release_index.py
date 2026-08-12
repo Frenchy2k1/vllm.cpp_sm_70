@@ -8,6 +8,7 @@ import json
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -30,22 +31,36 @@ class ReleaseIndexContract(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tool = load()
 
-    def assets(self, scratch: Path) -> tuple[Path, dict]:
+    def assets(self, scratch: Path, windows: bool = False) -> tuple[Path, dict]:
         assets = scratch / "assets"
         assets.mkdir()
         manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        archive_format = "zip" if windows else "tar.gz"
+        if windows:
+            manifest["artifact"].update({"id": "windows-x86_64-msvc-cpu", "channel": "preview"})
+            manifest["host"].update({"os": "windows", "arch": "x86_64", "abi": "msvc"})
         artifact_id = manifest["artifact"]["id"]
         archive = assets / (
-            f"vllm.cpp-{manifest['artifact']['version']}-{artifact_id}.tar.gz"
+            f"vllm.cpp-{manifest['artifact']['version']}-{artifact_id}.{archive_format}"
         )
         manifest_path = scratch / "release-manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        with tarfile.open(archive, "w:gz") as bundle:
-            bundle.add(manifest_path, arcname="release-manifest.json")
+        if windows:
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.write(manifest_path, arcname="release-manifest.json")
+        else:
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(manifest_path, arcname="release-manifest.json")
         digest = self.tool.sha256(archive)
         (assets / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n")
         (assets / f"{archive.name}.provenance.json").write_text("{}\n")
         handoff = {
+            "artifacts": [{
+                "archive_format": archive_format,
+                "channel": manifest["artifact"]["channel"],
+                "id": artifact_id,
+                "required": True,
+            }],
             "files": [
                 {
                     "artifact_id": artifact_id,
@@ -80,6 +95,15 @@ class ReleaseIndexContract(unittest.TestCase):
                 "portable-sse2", "sse2-f16c", "avx2-f16c", "avx512f"
             ])
             self.assertIn("linux-x86_64-glibc-cpu", markdown_out.read_text())
+
+    def test_index_reads_windows_zip_from_explicit_handoff_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets, handoff = self.assets(root, windows=True)
+            index = self.tool.generate_index(
+                assets, handoff, root / "index.json", root / "index.md"
+            )
+            self.assertEqual(index["artifacts"][0]["archive"], "vllm.cpp-0.1.0-test-windows-x86_64-msvc-cpu.zip")
 
     def test_manifest_identity_or_handoff_digest_drift_is_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

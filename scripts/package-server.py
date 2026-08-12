@@ -9,9 +9,12 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
+import time
+import zipfile
 from pathlib import Path
 
 
@@ -20,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--stage-dir", type=Path, required=True)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--archive-format", choices=("tar.gz", "zip"))
     parser.add_argument("--metadata-dir", type=Path)
     parser.add_argument("--config", default="")
     return parser.parse_args()
@@ -74,7 +78,59 @@ def normalized_info(tar: tarfile.TarFile, path: Path, arcname: str, epoch: int) 
     return info
 
 
-def write_archive(stage_dir: Path, archive: Path, epoch: int) -> None:
+def archive_paths(stage_dir: Path) -> list[Path]:
+    paths = sorted(stage_dir.rglob("*"), key=lambda item: item.relative_to(stage_dir).as_posix())
+    for path in paths:
+        status = path.lstat()
+        if stat.S_ISLNK(status.st_mode):
+            raise ValueError(f"release archives cannot contain symlinks: {path}")
+        if getattr(status, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"release archives cannot contain reparse points: {path}")
+        if not (stat.S_ISREG(status.st_mode) or stat.S_ISDIR(status.st_mode)):
+            raise ValueError(f"release archives require regular files/directories: {path}")
+    return paths
+
+
+def write_tar_archive(stage_dir: Path, temporary: Path, epoch: int) -> None:
+    with temporary.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as bundle:
+                for path in archive_paths(stage_dir):
+                    arcname = path.relative_to(stage_dir).as_posix()
+                    info = normalized_info(bundle, path, arcname, epoch)
+                    if info.isfile():
+                        with path.open("rb") as source:
+                            bundle.addfile(info, source)
+                    else:
+                        bundle.addfile(info)
+
+
+def write_zip_archive(stage_dir: Path, temporary: Path, epoch: int) -> None:
+    # ZIP timestamps cannot represent dates before 1980 and have two-second precision.
+    timestamp = time.gmtime(max(epoch, 315532800))[:6]
+    timestamp = (*timestamp[:5], timestamp[5] - timestamp[5] % 2)
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as bundle:
+        for path in archive_paths(stage_dir):
+            relative = path.relative_to(stage_dir).as_posix()
+            directory = path.is_dir()
+            info = zipfile.ZipInfo(relative + ("/" if directory else ""), timestamp)
+            info.create_system = 3
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = ((0o40755 if directory else (0o100755 if path.stat().st_mode & 0o111 else 0o100644)) << 16)
+            if directory:
+                bundle.writestr(info, b"")
+            else:
+                bundle.writestr(info, path.read_bytes())
+
+
+def write_archive(
+    stage_dir: Path, archive: Path, epoch: int, archive_format: str = "tar.gz"
+) -> None:
+    if archive_format not in {"tar.gz", "zip"}:
+        raise ValueError("archive format must be exactly 'tar.gz' or 'zip'")
+    expected_suffix = ".tar.gz" if archive_format == "tar.gz" else ".zip"
+    if not archive.name.endswith(expected_suffix):
+        raise ValueError(f"{archive_format} archive must end with {expected_suffix}")
     archive.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=archive.parent, prefix=f".{archive.name}.", suffix=".tmp"
@@ -82,17 +138,10 @@ def write_archive(stage_dir: Path, archive: Path, epoch: int) -> None:
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        with temporary.open("wb") as raw:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as compressed:
-                with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as bundle:
-                    for path in sorted(stage_dir.rglob("*"), key=lambda item: item.as_posix()):
-                        arcname = path.relative_to(stage_dir).as_posix()
-                        info = normalized_info(bundle, path, arcname, epoch)
-                        if info.isfile():
-                            with path.open("rb") as source:
-                                bundle.addfile(info, source)
-                        else:
-                            bundle.addfile(info)
+        if archive_format == "tar.gz":
+            write_tar_archive(stage_dir, temporary, epoch)
+        else:
+            write_zip_archive(stage_dir, temporary, epoch)
         os.replace(temporary, archive)
     finally:
         temporary.unlink(missing_ok=True)
@@ -163,6 +212,10 @@ def main() -> int:
     require_build_output(stage_dir, build_dir, "--stage-dir")
     if args.archive is not None:
         require_build_output(args.archive.resolve(), build_dir, "--archive")
+        if args.archive_format is None:
+            raise SystemExit("--archive-format is required with --archive")
+    elif args.archive_format is not None:
+        raise SystemExit("--archive-format requires --archive")
     metadata_dir = args.metadata_dir.resolve() if args.metadata_dir is not None else None
     if metadata_dir is not None and not metadata_dir.is_dir():
         raise SystemExit("--metadata-dir must name a prepared metadata directory")
@@ -178,7 +231,12 @@ def main() -> int:
         if metadata_dir is not None:
             install_metadata(metadata_dir, fresh_stage)
         if args.archive is not None:
-            write_archive(fresh_stage, args.archive.resolve(), source_date_epoch())
+            write_archive(
+                fresh_stage,
+                args.archive.resolve(),
+                source_date_epoch(),
+                args.archive_format,
+            )
             if metadata_dir is not None:
                 write_archive_sidecars(args.archive.resolve(), fresh_stage)
 

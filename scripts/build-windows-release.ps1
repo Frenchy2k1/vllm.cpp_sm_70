@@ -3,6 +3,8 @@ param(
     [string]$SourceDir = (Resolve-Path (Join-Path $PSScriptRoot "..")),
     [string]$BuildDir = (Join-Path $SourceDir "build-release-windows-cpu"),
     [string]$StageDir = (Join-Path $BuildDir "stage"),
+    [ValidateSet("cpu", "vulkan")][string]$Backend = "cpu",
+    [string]$ArtifactId = "",
     [string]$SmokeModel = (Join-Path $SourceDir "tests/vllm/models/fixtures/llama_embed_e2e"),
     [int]$SmokePort = 18080,
     [switch]$ContractTest
@@ -10,6 +12,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if (-not $ArtifactId) { $ArtifactId = "windows-x86_64-msvc-$Backend" }
+if ($ArtifactId -ne "windows-x86_64-msvc-$Backend") {
+    throw "artifact ID must exactly match selected Windows backend"
+}
+foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH")) {
+    if (-not [Environment]::GetEnvironmentVariable($name)) {
+        throw "$name is required"
+    }
+}
 
 function Invoke-Checked {
     param([Parameter(Mandatory)][string]$Program,
@@ -181,7 +193,7 @@ Invoke-Checked cmake @(
     "-DVLLM_CPP_MLX=OFF",
     "-DMLX_ROOT=",
     "-DVLLM_CPP_TRITON=OFF",
-    "-DVLLM_CPP_VULKAN=OFF",
+    "-DVLLM_CPP_VULKAN=$(if ($Backend -eq 'vulkan') { 'ON' } else { 'OFF' })",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
 )
 Invoke-Checked python @(
@@ -293,4 +305,81 @@ finally:
 '@ | Set-Content -LiteralPath $smokeHarness -Encoding utf8NoBOM
 
 Invoke-Checked python @($smokeHarness, $server, $SmokeModel, "$SmokePort")
-Write-Host "Windows native CPU build/stage/runtime gate OK: $server"
+
+$releaseDir = Join-Path $BuildDir "release"
+$metadataDir = Join-Path $releaseDir "metadata"
+$tierReport = Join-Path $releaseDir "cpu-tier-report.json"
+$peReport = Join-Path $releaseDir "pe-audit.json"
+$archive = Join-Path $releaseDir "vllm.cpp-$($env:VERSION)-$ArtifactId.zip"
+New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+$passed = @{
+    command = "forced Windows CPU tier"; reason = ""; result = "exit 0"
+    state = "passed"; url = $env:EVIDENCE_URL
+}
+$absent = @{
+    command = ""; reason = "not executed by the Windows preview gate"; result = ""
+    state = "absent"; url = ""
+}
+@{
+    schema = "vllm.cpp.cpu-tier-report.v1"
+    selected_tier = "avx2-f16c"
+    commands = @("VT_CPU_MATMUL_TIER=portable", "VT_CPU_MATMUL_TIER=avx2")
+    tiers = [ordered]@{
+        "portable-sse2" = $passed
+        "sse2-f16c" = $absent
+        "avx2-f16c" = $passed
+        "avx512f" = $absent
+    }
+} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tierReport -Encoding utf8NoBOM
+
+$headerOutput = @(& dumpbin /nologo /headers $server 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "dumpbin /headers failed" }
+$dependentOutput = @(& dumpbin /nologo /dependents $server 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed" }
+$rawOutput = @(& dumpbin /nologo /rawdata $server 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "dumpbin /rawdata failed" }
+$machine = if (($headerOutput -join "`n") -match '(?im)^\s*(8664)\s+machine') { $Matches[1] } else { "" }
+$imports = @(
+    $dependentOutput | ForEach-Object {
+        if ($_ -match '^\s*([A-Za-z0-9_.+-]+\.dll)\s*$') { $Matches[1] }
+    } | Sort-Object -Unique
+)
+$debugPaths = @(
+    (($headerOutput + $rawOutput) -join "`n") |
+        Select-String -AllMatches -Pattern '(?i)[A-Za-z]:[\\/][^\r\n\x00]*?\.pdb' |
+        ForEach-Object { $_.Matches.Value } | Sort-Object -Unique
+)
+@{
+    schema = "vllm.cpp.pe-audit.v1"; machine = $machine
+    imports = $imports; debug_paths = $debugPaths
+} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $peReport -Encoding utf8NoBOM
+
+$compiler = (& cl 2>&1 | Select-Object -First 1) -join ""
+$toolsetVersion = if ($env:VCToolsVersion) { $env:VCToolsVersion.TrimEnd('\') } else { throw "VCToolsVersion is required" }
+$ucrtVersion = if ($env:UCRTVersion) { $env:UCRTVersion.TrimEnd('\') } else { throw "UCRTVersion is required" }
+$abiVersion = ($toolsetVersion -split '\.')[0..1] -join '.'
+$cAbiVersion = (Select-String -Path (Join-Path $SourceDir "include/vllm.h") -Pattern '^#define VLLM_ABI_VERSION ([0-9]+)$').Matches.Groups[1].Value
+Invoke-Checked python @(
+    (Join-Path $SourceDir "scripts/release_metadata.py"),
+    "--repo-root", $SourceDir, "--build-dir", $BuildDir, "--stage-dir", $StageDir,
+    "--output-dir", $metadataDir, "--tier-report", $tierReport,
+    "--artifact-id", $ArtifactId, "--channel", "preview", "--backend", $Backend,
+    "--version", $env:VERSION, "--c-abi-version", $cAbiVersion,
+    "--source-commit", $env:SOURCE_SHA, "--source-clean", "--abi-version", $abiVersion,
+    "--compiler", $compiler, "--toolchain", "Visual Studio 2022 v143 /MT",
+    "--toolset-version", $toolsetVersion, "--ucrt-version", $ucrtVersion,
+    "--pe-report", $peReport, "--evidence-url", $env:EVIDENCE_URL
+)
+Invoke-Checked python @(
+    (Join-Path $SourceDir "scripts/package-server.py"), "--build-dir", $BuildDir,
+    "--stage-dir", $StageDir, "--metadata-dir", $metadataDir,
+    "--archive", $archive, "--archive-format", "zip", "--config", "Release"
+)
+Invoke-Checked python @(
+    (Join-Path $SourceDir "scripts/validate-release-archive.py"),
+    "--archive", $archive, "--archive-format", "zip",
+    "--checksum", "$archive.sha256", "--provenance", "$archive.provenance.json",
+    "--repo-root", $SourceDir, "--forbid-path", $BuildDir
+)
+Write-Host "Windows native $Backend build/stage/ZIP gate OK: $archive"

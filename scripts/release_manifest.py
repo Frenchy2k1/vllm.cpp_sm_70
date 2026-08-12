@@ -343,6 +343,8 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         "macos-arm64-metal-mlx": ("macos", "aarch64", "macos", "mlx", "static-core", {"preview"}),
         "linux-x86_64-glibc-vulkan": ("linux", "x86_64", "glibc", "vulkan", "static-core", {"preview"}),
         "linux-x86_64-musl-cpu-static": ("linux", "x86_64", "musl", "cpu", "literal-static", {"experimental-preview"}),
+        "windows-x86_64-msvc-cpu": ("windows", "x86_64", "msvc", "cpu", "static-core", {"preview"}),
+        "windows-x86_64-msvc-vulkan": ("windows", "x86_64", "msvc", "vulkan", "static-core", {"preview"}),
     }
     policy = policies.get(artifact_id)
     if policy is None and artifact.get("kind") == "diagnostic" and name == "cuda":
@@ -364,6 +366,13 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
         errors.append(f"$.artifact.channel: wrong channel for {artifact_id}")
     if artifact.get("kind") != "primary":
         errors.append(f"$.artifact.kind: matrix artifact {artifact_id} must be primary")
+    if os_name == "windows":
+        for field in ("toolset_version", "ucrt_version"):
+            if not isinstance(host.get(field), str) or not host[field]:
+                errors.append(f"$.host.{field}: Windows artifacts require a pinned value")
+        build = manifest.get("build", {})
+        if not isinstance(build, dict) or "/MT" not in str(build.get("toolchain", "")):
+            errors.append("$.build.toolchain: Windows artifacts require the /MT static CRT")
     return errors
 
 
@@ -474,6 +483,11 @@ def _dependency_policy(manifest: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"$.dependencies[{index}]: bundled dynamic dependency is not permitted"
                 )
+        if (
+            manifest.get("host", {}).get("os") == "windows"
+            and re.match(r"(?i)^(?:vcruntime|msvcp|msvcr|ucrtbase|concrt).*\.dll$", str(dependency_name))
+        ):
+            errors.append(f"$.dependencies[{index}]: Windows release requires the static CRT")
     if len(names) != len(set(names)):
         errors.append("$.dependencies: dependency names must be unique")
 

@@ -9,10 +9,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -24,10 +26,9 @@ import release_manifest  # noqa: E402
 
 PRIMARY_CUDA_SMS = release_manifest.PRIMARY_CUDA_SMS
 AOT_SMS = tuple(sm for sm in PRIMARY_CUDA_SMS if release_manifest.AOT_AVAILABILITY[sm])
-REQUIRED_FILES = {
+REQUIRED_METADATA = {
     "VERSION",
     "THIRD_PARTY_NOTICES",
-    "bin/vllm-server",
     "release-manifest.json",
     "sbom.spdx.json",
 }
@@ -114,6 +115,8 @@ def validate_provenance(
 
 
 def safe_extract(archive: Path, destination: Path) -> list[str]:
+    if archive.name.endswith(".zip"):
+        return safe_extract_zip(archive, destination)
     errors: list[str] = []
     try:
         with tarfile.open(archive, "r:*") as bundle:
@@ -141,8 +144,52 @@ def safe_extract(archive: Path, destination: Path) -> list[str]:
     return errors
 
 
+def unsafe_zip_name(name: str) -> bool:
+    if not name or name == "." or "\\" in name or re.match(r"^[A-Za-z]:", name):
+        return True
+    path = PurePosixPath(name)
+    return path.is_absolute() or ".." in path.parts
+
+
+def safe_extract_zip(archive: Path, destination: Path) -> list[str]:
+    errors: list[str] = []
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            seen: set[str] = set()
+            for info in bundle.infolist():
+                if unsafe_zip_name(info.filename):
+                    errors.append(f"unsafe archive path: {info.filename!r}")
+                    continue
+                normalized = info.filename.rstrip("/")
+                if normalized in seen:
+                    errors.append(f"duplicate archive path: {info.filename!r}")
+                    continue
+                seen.add(normalized)
+                unix_mode = info.external_attr >> 16
+                if stat.S_ISLNK(unix_mode) or info.external_attr & 0x400:
+                    errors.append(f"archive links/reparse points are forbidden: {info.filename}")
+            if errors:
+                return errors
+            destination.mkdir(parents=True, exist_ok=True)
+            for info in bundle.infolist():
+                relative = PurePosixPath(info.filename.rstrip("/"))
+                target = destination.joinpath(*relative.parts)
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.open(info) as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+                    mode = info.external_attr >> 16
+                    if mode:
+                        target.chmod(stat.S_IMODE(mode))
+    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+        return [f"archive cannot be extracted: {exc}"]
+    return errors
+
+
 def allowed_file(relative: str) -> bool:
-    if relative in REQUIRED_FILES:
+    if relative in REQUIRED_METADATA or relative in {"bin/vllm-server", "bin/vllm-server.exe"}:
         return True
     return relative.startswith("lib/") or relative.startswith("share/licenses/")
 
@@ -165,9 +212,12 @@ def scan_file(path: Path, needles: list[bytes]) -> tuple[set[bytes], bool]:
 def validate_contents(root: Path, forbidden_paths: list[str]) -> list[str]:
     errors: list[str] = []
     files = {path.relative_to(root).as_posix(): path for path in root.rglob("*") if not path.is_dir()}
-    missing = sorted(REQUIRED_FILES - files.keys())
+    missing = sorted(REQUIRED_METADATA - files.keys())
     if missing:
         errors.append(f"archive is missing required files: {missing}")
+    servers = {"bin/vllm-server", "bin/vllm-server.exe"} & files.keys()
+    if len(servers) != 1:
+        errors.append("archive must contain exactly one platform server executable")
     for relative, path in sorted(files.items()):
         if not allowed_file(relative):
             errors.append(f"archive contains undeclared path: {relative}")
@@ -258,7 +308,8 @@ def validate_sbom(path: Path, root: Path, manifest: dict[str, Any]) -> list[str]
     if not isinstance(files, list):
         return errors + ["SBOM files must be an array"]
     by_name = {item.get("fileName"): item for item in files if isinstance(item, dict)}
-    shipped = [root / "bin/vllm-server"]
+    server_name = "vllm-server.exe" if manifest.get("host", {}).get("os") == "windows" else "vllm-server"
+    shipped = [root / "bin" / server_name]
     lib_dir = root / "lib"
     if lib_dir.is_dir():
         shipped.extend(path for path in lib_dir.rglob("*") if path.is_file() and not path.is_symlink())
@@ -278,9 +329,11 @@ def validate_sbom(path: Path, root: Path, manifest: dict[str, Any]) -> list[str]
     return errors
 
 
-def validate_archive_name(archive: Path, manifest: dict[str, Any]) -> list[str]:
+def validate_archive_name(
+    archive: Path, manifest: dict[str, Any], archive_format: str
+) -> list[str]:
     artifact = manifest.get("artifact", {})
-    expected = f"vllm.cpp-{artifact.get('version')}-{artifact.get('id')}.tar.gz"
+    expected = f"vllm.cpp-{artifact.get('version')}-{artifact.get('id')}.{archive_format}"
     if archive.name != expected:
         return [f"canonical archive name must be {expected!r}"]
     return []
@@ -421,6 +474,70 @@ def validate_macho_install_id(install_id: str, forbidden_paths: list[str]) -> li
     if any(path and path in install_id for path in forbidden_paths):
         return [f"bundled Mach-O install ID contains a forbidden build path: {install_id}"]
     return []
+
+
+WINDOWS_SYSTEM_DLLS = {
+    "ADVAPI32.DLL", "BCRYPT.DLL", "COMDLG32.DLL", "CRYPT32.DLL", "DNSAPI.DLL",
+    "GDI32.DLL", "IPHLPAPI.DLL", "KERNEL32.DLL", "NORMALIZ.DLL", "NTDLL.DLL",
+    "OLE32.DLL", "OLEAUT32.DLL", "PSAPI.DLL", "RPCRT4.DLL", "SECUR32.DLL",
+    "SETUPAPI.DLL", "SHELL32.DLL", "SHLWAPI.DLL", "USER32.DLL", "VERSION.DLL",
+    "WINMM.DLL", "WS2_32.DLL",
+}
+
+
+def validate_pe_audit(
+    manifest: dict[str, Any],
+    machine: str,
+    imports: list[str],
+    debug_paths: list[str],
+    forbidden_paths: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    if machine.upper() not in {"8664", "AMD64", "X64"}:
+        errors.append(f"PE executable must target AMD64, got {machine!r}")
+    actual = {name.upper() for name in imports}
+    declared = {
+        str(item.get("name", "")).upper()
+        for item in manifest.get("dependencies", [])
+        if isinstance(item, dict) and item.get("linkage") == "dynamic"
+    }
+    for name in sorted(actual - declared):
+        errors.append(f"undeclared PE import: {name}")
+    for name in sorted(declared - actual):
+        errors.append(f"declared dynamic dependency is not imported: {name}")
+    for name in sorted(actual):
+        if name.startswith(("API-MS-WIN-", "EXT-MS-WIN-")):
+            continue
+        if name.startswith(("MSYS-", "MINGW")) or name in {"LIBGCC_S_SEH-1.DLL", "LIBSTDC++-6.DLL"}:
+            errors.append(f"MinGW/MSYS runtime import is forbidden: {name}")
+        if re.search(r"(?:VCRUNTIME|MSVCP|MSVCR|UCRTBASE|CONCRT).*D\.DLL$", name):
+            errors.append(f"debug CRT import is forbidden: {name}")
+        elif re.search(r"(?:VCRUNTIME|MSVCP|MSVCR|UCRTBASE|CONCRT).*\.DLL$", name):
+            errors.append(f"dynamic CRT import violates the /MT static-CRT contract: {name}")
+        elif name not in WINDOWS_SYSTEM_DLLS:
+            errors.append(f"non-system PE import is forbidden: {name}")
+    for value in debug_paths:
+        if re.match(r"^[A-Za-z]:[\\/]", value):
+            errors.append(f"PE debug path contains a developer drive path: {value}")
+        if any(path and path.lower() in value.lower() for path in forbidden_paths):
+            errors.append(f"PE debug/build path contains a forbidden build path: {value}")
+    return errors
+
+
+def parse_dumpbin_machine(output: str) -> str:
+    match = re.search(r"\b(8664|14C)\s+machine\b", output, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"machine\s*\(([^)]+)\)", output, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def parse_dumpbin_imports(output: str) -> list[str]:
+    return sorted(set(re.findall(r"(?im)^\s*([A-Za-z0-9_.+-]+\.dll)\s*$", output)))
+
+
+def parse_pe_debug_paths(output: str) -> list[str]:
+    return sorted(set(re.findall(r"(?i)[A-Za-z]:[\\/][^\r\n\x00]*?\.pdb", output)))
 
 
 def validate_cuda_inventory(
@@ -600,6 +717,47 @@ def inspect_macos(
     return errors
 
 
+def inspect_windows(
+    root: Path,
+    server: Path,
+    manifest: dict[str, Any],
+    forbidden_paths: list[str],
+    skip_version_smoke: bool,
+) -> list[str]:
+    dumpbin = shutil.which("dumpbin") or shutil.which("dumpbin.exe")
+    if dumpbin is None:
+        return ["required Windows PE inspector is unavailable: dumpbin"]
+    headers_rc, headers = run([dumpbin, "/nologo", "/headers", str(server)])
+    imports_rc, imports = run([dumpbin, "/nologo", "/dependents", str(server)])
+    raw_rc, raw = run([dumpbin, "/nologo", "/rawdata", str(server)])
+    if headers_rc != 0 or imports_rc != 0 or raw_rc != 0:
+        return ["dumpbin could not inspect the extracted Windows server"]
+    errors = validate_pe_audit(
+        manifest,
+        parse_dumpbin_machine(headers),
+        parse_dumpbin_imports(imports),
+        parse_pe_debug_paths(headers + "\n" + raw),
+        forbidden_paths,
+    )
+    bundled_dlls = sorted(path.relative_to(root).as_posix() for path in root.rglob("*.dll"))
+    if bundled_dlls:
+        errors.append(f"Windows archive contains unexpected bundled DLLs: {bundled_dlls}")
+    help_rc, help_output = run([str(server), "--help"])
+    if help_rc != 0 or "usage" not in help_output.lower():
+        errors.append("extracted Windows vllm-server.exe --help smoke failed")
+    if not skip_version_smoke:
+        version_rc, version_output = run([str(server), "--version"])
+        expected_version = manifest.get("artifact", {}).get("version", "")
+        expected_abi = parse_version(root / "VERSION")[0].get("c_abi_version", "")
+        if (
+            version_rc != 0
+            or f"vllm.cpp {expected_version}" not in version_output
+            or f"c-abi={expected_abi}" not in version_output
+        ):
+            errors.append("extracted Windows vllm-server.exe --version disagrees with VERSION/manifest")
+    return errors
+
+
 def validate_release(args: argparse.Namespace) -> list[str]:
     archive = args.archive.resolve()
     digest, errors = validate_checksum(archive, args.checksum.resolve())
@@ -623,7 +781,7 @@ def validate_release(args: argparse.Namespace) -> list[str]:
         except (ValueError, OSError, release_manifest.ManifestError) as exc:
             return errors + [str(exc)]
         errors.extend(release_manifest.validate_manifest(manifest, schema, args.repo_root.resolve()))
-        errors.extend(validate_archive_name(archive, manifest))
+        errors.extend(validate_archive_name(archive, manifest, args.archive_format))
         values, version_errors = parse_version(extracted / "VERSION")
         errors.extend(version_errors)
         errors.extend(validate_version(values, manifest))
@@ -648,6 +806,16 @@ def validate_release(args: argparse.Namespace) -> list[str]:
                     args.skip_version_smoke,
                 )
             )
+        elif manifest.get("host", {}).get("os") == "windows":
+            errors.extend(
+                inspect_windows(
+                    extracted,
+                    extracted / "bin/vllm-server.exe",
+                    manifest,
+                    forbidden,
+                    args.skip_version_smoke,
+                )
+            )
         else:
             errors.append("release archive has an unsupported host OS")
     return errors
@@ -660,6 +828,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provenance", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=SCRIPT_DIR.parent)
     parser.add_argument("--schema", type=Path, default=SCRIPT_DIR.parent / "release/manifest-v1.schema.json")
+    parser.add_argument("--archive-format", choices=("tar.gz", "zip"), required=True)
     parser.add_argument("--forbid-path", action="append", default=[])
     parser.add_argument("--skip-version-smoke", action="store_true")
     return parser.parse_args()

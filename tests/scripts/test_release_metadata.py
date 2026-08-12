@@ -151,6 +151,8 @@ class ReleaseMetadataContract(unittest.TestCase):
                     str(VALIDATOR),
                     "--archive",
                     str(archive),
+                    "--archive-format",
+                    "tar.gz",
                     "--checksum",
                     f"{archive}.sha256",
                     "--provenance",
