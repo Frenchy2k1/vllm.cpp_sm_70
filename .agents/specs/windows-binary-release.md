@@ -42,6 +42,10 @@ Central MSVC macro-contract repair:
 [#462](https://github.com/mudler/vllm.cpp/issues/462), specified in
 [windows-msvc-central-nominmax.md](windows-msvc-central-nominmax.md)
 
+DeepSeek V4 expert-probe narrowing repair:
+[#464](https://github.com/mudler/vllm.cpp/issues/464), specified in
+[windows-msvc-deepseek-probe.md](windows-msvc-deepseek-probe.md)
+
 Parent contract: [release-binary-matrix.md](release-binary-matrix.md)
 
 Planned publication: GitHub prerelease tag `v0.0.3-pre.1`.
@@ -515,6 +519,14 @@ contain only C4005 promoted through C2220 at the same sources. The repair
 removes those redundant definitions and the identical OpenAI test definition
 compilation had not reached, while retaining the central contract, `/W4 /WX`,
 `WIN32_LEAN_AND_MEAN`, and guarded isolated-source fallbacks.
+
+Hosted run `31586472591` then reached deeper compilation and reduced both
+native configurations to the same two DeepSeek V4 expert-probe assignments
+([#464](https://github.com/mudler/vllm.cpp/issues/464)). Complete CPU and Vulkan
+logs contain only C4244 promoted through C2220: double literals select the
+double `std::sin` overload before assigning into float vectors. The scoped
+repair makes the deterministic probe sequence intentionally float-typed while
+preserving `/W4 /WX`.
 
 ## Now
 
