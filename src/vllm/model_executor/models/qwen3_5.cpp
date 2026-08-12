@@ -82,8 +82,25 @@ bool detail::ShouldUsePackedGdnDecode(
 // the BF16 one, so predicting the FP8 dtype there would be wrong.
 vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
   if (in.has_bf16_qkvz_owner) return in.in_dtype;
-  if (in.has_fp8_qkv_owner) return in.fp8_out_dtype;
+  // PERF-GDN-PACKED-BRIDGE (#365): only the MERGED fp8 arm can carry the
+  // narrowed epilogue dtype; the split arm hardcodes F32 (ProjectGdnQkvz).
+  if (in.has_fp8_qkv_owner)
+    return in.fp8_merged_arm ? in.fp8_out_dtype : vt::DType::kF32;
   return in.in_dtype;
+}
+
+// PERF-GDN-PACKED-BRIDGE (#365). PERF-FP8-ALPHA-FOLD's three terms, verbatim,
+// in the ONE place both the producer and the predictor read. See the header for
+// why each term is required; the short version is that the toggle is the opt-in,
+// `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
+// confines the narrowing to the dense 27B.
+vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
+                                           vt::DType in_dtype,
+                                           vt::DType out_dtype) {
+  return (fp8_in_bf16_enabled && in_dtype == vt::DType::kBF16 &&
+          out_dtype == vt::DType::kBF16)
+             ? vt::DType::kBF16
+             : vt::DType::kF32;
 }
 
 // The dtype rule vt::GdnPackedDecode actually imposes (ops.cpp gdn_packed_decode
@@ -3279,7 +3296,9 @@ bool PackedGdnDecodeFp8TowerEnabled() {
 // it BF16 is PERF-27B-BF16-FP8-OUT / #339 (VT_BF16_GEMM_OUT_FP8); when that
 // lands, THIS function is the one line the two rows compose through, and the
 // packed path becomes eligible on the fp8 27B with no further change here.
-DType GdnFp8MixedQkvDType() { return DType::kF32; }
+DType GdnFp8MergedInProjDType(DType indt, DType outdt) {
+  return detail::GdnFp8MergedMixedQkvDType(GdnFp8InBf16Enabled(), indt, outdt);
+}
 
 DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
                   DType out_dtype) {
@@ -3585,10 +3604,13 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   //      inert there. It also keeps the whole chain dtype-uniform, which the
   //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
   //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
-  const DType fp8_indt =
-      (GdnFp8InBf16Enabled() && indt == DType::kBF16 && outdt == DType::kBF16)
-          ? DType::kBF16
-          : DType::kF32;
+  // PERF-GDN-PACKED-BRIDGE (#365): PERF-FP8-ALPHA-FOLD's three-term decision,
+  // moved into the shared `GdnFp8MergedInProjDType` so the PRODUCER (this line,
+  // which reaches MergedFp8QkvzD and allocates the buffer) and the PREDICTOR
+  // (the packed-decode eligibility, which must answer BEFORE this runs because
+  // the decision feeds ProjectGdnBA) are literally the same call and cannot
+  // drift. The terms themselves are unchanged.
+  const DType fp8_indt = GdnFp8MergedInProjDType(indt, outdt);
   // PERF-27B-GDN-FP8-QKVZ — the native-FP8 owner's merged arm. ONE fp8 GEMM
   // over the N-concatenated [qkv;z] operand replaces the two below; `mixed_qkv`
   // and `z` become last-dim views of its output, exactly as in the BF16 leaf.
@@ -3605,6 +3627,20 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
       g_gdn_fp8_inproj_merged.fetch_add(1, std::memory_order_relaxed);
     out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w, fp8_indt));
     Tensor packed = out.packed_owner->t();
+    // PERF-GDN-PACKED-BRIDGE (#365) -- the replacement anti-drift guard.
+    // The deleted one read `GdnFp8MixedQkvDType() == DType::kF32`: a property of
+    // the PREDICTOR against a literal, which cannot observe the producer and so
+    // passed unchanged once the merged arm began emitting bf16. This asserts the
+    // invariant that actually matters -- the dtype the eligibility PREDICTED
+    // equals the dtype this GEMM ALLOCATED -- read off the allocated buffer, so
+    // it fails whichever side moves.
+    VT_CHECK(packed.dtype == detail::GdnProjectedMixedQkvDType(
+                                 detail::GdnMixedQkvDTypeInputs{
+                                     !w.in_proj_qkvz.Empty(),
+                                     !w.in_proj_qkv_fp8.Empty(),
+                                     /*fp8_merged_arm=*/true, indt, fp8_indt}),
+             "qwen3_5 merged FP8 GDN qkvz: the allocated mixed_qkv dtype and the "
+             "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
     out.mixed = packed.Slice(1, 0, conv_dim);
     Tensor z_raw = packed.Slice(1, conv_dim, conv_dim + value_dim);
     // When the merged GEMM already emitted the z gate's dtype, the CastBf16 pass
@@ -3627,10 +3663,23 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   if (!w.in_proj_qkv_fp8.Empty() &&
       g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
     g_gdn_fp8_inproj_split.fetch_add(2, std::memory_order_relaxed);
-  // The fp8 arm's output dtype comes from GdnFp8MixedQkvDType(), not a literal:
-  // the packed-decode eligibility predicts `mixed.dtype` from that same helper
-  // before this runs (#365), and a literal here is exactly how the two drift.
-  const DType fp8_mixed_dt = GdnFp8MixedQkvDType();
+  // PERF-GDN-PACKED-BRIDGE (#365): the SPLIT fp8 arm stays F32. VT_GDN_FP8_IN_BF16
+  // narrows the MERGED arm only (PERF-FP8-ALPHA-FOLD `fp8_indt`), so this literal
+  // is correct rather than a drift risk -- and the eligibility predicts exactly
+  // this, via GdnMixedQkvDTypeInputs::fp8_merged_arm == false. The guard below
+  // asserts the two agree, so if either side ever moves the build fails loudly.
+  const DType fp8_mixed_dt = DType::kF32;
+  // Same invariant on the other arm, and in the direction that matters here: a
+  // predictor that ever claimed BF16 for a split-arm layer would hand
+  // vt::GdnPackedDecode an f32 mixed_qkv against bf16 a/b/out and make it throw.
+  if (!w.in_proj_qkv_fp8.Empty())
+    VT_CHECK(fp8_mixed_dt == detail::GdnProjectedMixedQkvDType(
+                                 detail::GdnMixedQkvDTypeInputs{
+                                     !w.in_proj_qkvz.Empty(), true,
+                                     /*fp8_merged_arm=*/false, indt,
+                                     GdnFp8MergedInProjDType(indt, outdt)}),
+             "qwen3_5 split FP8 GDN qkv: the allocated mixed_qkv dtype and the "
+             "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -4316,10 +4365,18 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // before ProjectGdnQkvz (it feeds ProjectGdnBA's output dtype below).
   const bool gdn_fp8_tower =
       !w.in_proj_qkv_fp8.Empty() || !w.in_proj_z_fp8.Empty();
+  // PERF-GDN-PACKED-BRIDGE (#365): the arm term is the SAME predicate over the
+  // SAME inputs that ProjectGdnQkvz uses to choose the merged fp8 leaf, so the
+  // prediction cannot select a different arm than the projection does.
+  const bool gdn_fp8_merged_arm =
+      !w.in_proj_qkv_fp8.Empty() &&
+      detail::ShouldUseMergedGdnFp8Qkvz(
+          GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim));
   const DType mixed_dt = detail::GdnProjectedMixedQkvDType(
       detail::GdnMixedQkvDTypeInputs{!w.in_proj_qkvz.Empty(),
-                                     !w.in_proj_qkv_fp8.Empty(), indt,
-                                     GdnFp8MixedQkvDType()});
+                                     !w.in_proj_qkv_fp8.Empty(),
+                                     gdn_fp8_merged_arm, indt,
+                                     GdnFp8MergedInProjDType(indt, outdt)});
   const bool packed_decode = detail::ShouldUsePackedGdnDecode(
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),

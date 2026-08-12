@@ -474,27 +474,117 @@ TEST_CASE("qwen27 packed GDN predicts the mixed_qkv dtype ProjectGdnQkvz emits")
 
   // Merged BF16 owner (the 27B bf16 / 4B path): mixed_qkv is GdnInDType().
   CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-            true, false, DType::kBF16, DType::kF32}) == DType::kBF16);
+            true, false, false, DType::kBF16, DType::kF32}) == DType::kBF16);
   CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-            true, false, DType::kF32, DType::kF32}) == DType::kF32);
+            true, false, false, DType::kF32, DType::kF32}) == DType::kF32);
 
   // Split BF16 owner (GGUF/synthetic): also GdnInDType().
   CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-            false, false, DType::kBF16, DType::kF32}) == DType::kBF16);
+            false, false, false, DType::kBF16, DType::kF32}) == DType::kBF16);
 
   // Native-FP8 owner (modelopt_mixed): the fp8 epilogue's dtype, NOT
   // GdnInDType() — precisely the case the old fp8-weight term stood in for.
-  // Today the epilogue emits F32 even though GdnInDType() is BF16.
+  // At the f32 default the epilogue emits F32 even though GdnInDType() is BF16.
   CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-            false, true, DType::kBF16, DType::kF32}) == DType::kF32);
-  // ...and BF16 once the fp8 GEMM is made to emit it (PERF-27B-BF16-FP8-OUT).
+            false, true, true, DType::kBF16, DType::kF32}) == DType::kF32);
+  // ...and BF16 once the fp8 GEMM is made to emit it (PERF-FP8-ALPHA-FOLD).
   CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-            false, true, DType::kBF16, DType::kBF16}) == DType::kBF16);
+            false, true, true, DType::kBF16, DType::kBF16}) == DType::kBF16);
+
+  // PERF-GDN-PACKED-BRIDGE. `VT_GDN_FP8_IN_BF16` narrows the MERGED fp8 arm
+  // only: `fp8_indt` reaches MergedFp8QkvzD and nothing else, while the SPLIT
+  // fp8 arm still hardcodes F32 on both of its call paths. So the prediction
+  // must know which arm runs. Getting this wrong is not symmetric — predicting
+  // BF16 on a checkpoint that takes the split path is the UNSAFE direction, in
+  // which vt::GdnPackedDecode is handed an f32 mixed_qkv with bf16 a/b/out and
+  // THROWS on its uniformity check.
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, true, false, DType::kBF16, DType::kBF16}) == DType::kF32);
+  // ...and the split arm is F32 whatever the epilogue dtype says.
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            false, true, false, DType::kF32, DType::kBF16}) == DType::kF32);
 
   // Branch ORDER: a checkpoint carrying BOTH owners projects through the BF16
-  // one, so the FP8 epilogue dtype must not win.
+  // one, so neither the FP8 epilogue dtype nor the fp8 arm flag may win.
   CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-            true, true, DType::kBF16, DType::kF32}) == DType::kBF16);
+            true, true, true, DType::kBF16, DType::kF32}) == DType::kBF16);
+  CHECK(GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+            true, true, false, DType::kBF16, DType::kBF16}) == DType::kBF16);
+}
+
+// PERF-GDN-PACKED-BRIDGE (#365). The single source for the dtype the native-FP8
+// merged GDN in_proj emits. ONE function answers it for BOTH the producer
+// (ProjectGdnQkvz's `fp8_indt`, handed to MergedFp8QkvzD) and the predictor
+// (GdnFp8MixedQkvDType, which the packed-decode eligibility reads BEFORE the
+// projection has run). They cannot drift because they are the same call.
+//
+// The three terms are PERF-FP8-ALPHA-FOLD's own, kept verbatim: the opt-in
+// toggle, `indt == BF16` (honouring VT_GDN_IN_BF16's documented rollback, since
+// that lever is the one being unblocked), and `outdt == BF16` (which is what
+// confines this to the dense 27B — the 35B is MoE, so GdnOutDType is f32 there
+// and the whole arm stays inert).
+TEST_CASE("qwen27 fp8 merged in_proj dtype is one decision, all three terms") {
+  using vllm::detail::GdnFp8MergedMixedQkvDType;
+  using vt::DType;
+
+  // All three: BF16. This is the ONLY combination that narrows.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kBF16, DType::kBF16) ==
+        DType::kBF16);
+
+  // Toggle OFF is the shipped default and must be F32 regardless.
+  CHECK(GdnFp8MergedMixedQkvDType(false, DType::kBF16, DType::kBF16) ==
+        DType::kF32);
+
+  // Each dtype term is independently necessary.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kBF16) ==
+        DType::kF32);  // VT_GDN_IN_BF16=0 rollback.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kBF16, DType::kF32) ==
+        DType::kF32);  // VT_GDN_OUT_BF16=0 / the 35B MoE default.
+  CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kF32) ==
+        DType::kF32);
+  CHECK(GdnFp8MergedMixedQkvDType(false, DType::kF32, DType::kF32) ==
+        DType::kF32);
+}
+
+// PERF-GDN-PACKED-BRIDGE (#365). The composition end to end, as a decision:
+// does the packed arm become eligible when — and ONLY when — the fp8 merged
+// in_proj actually emits BF16? This is the assertion that was false before the
+// bridge: both toggles ON still predicted F32, so the arm stayed inert and any
+// A/B measured nothing.
+TEST_CASE("qwen27 fp8 tower reaches the packed dtype rule only when it emits BF16") {
+  using vllm::detail::GdnFp8MergedMixedQkvDType;
+  using vllm::detail::GdnMixedQkvDTypeInputs;
+  using vllm::detail::GdnPackedDecodeDTypes;
+  using vllm::detail::GdnPackedDecodeDTypesCompatible;
+  using vllm::detail::GdnProjectedMixedQkvDType;
+  using vt::DType;
+
+  // The real modelopt_mixed 27B: no bf16 qkvz owner, fp8 owner, merged arm.
+  // `ba_out`/`core_out` are BF16 at their defaults (MergedGdnBaOutputDType under
+  // packed, GdnOutDType dense) and the SSM cache is F32, native to the
+  // checkpoint's own `mamba_ssm_dtype: "float32"`.
+  auto rule_for = [](bool toggle_on) {
+    const DType mixed = GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+        false, true, true, DType::kBF16,
+        GdnFp8MergedMixedQkvDType(toggle_on, DType::kBF16, DType::kBF16)});
+    return GdnPackedDecodeDTypesCompatible(
+        GdnPackedDecodeDTypes{mixed, DType::kBF16, DType::kBF16, DType::kF32});
+  };
+
+  CHECK_FALSE(rule_for(false));  // shipped default: fp8 tower stays unpacked.
+  CHECK(rule_for(true));         // VT_GDN_FP8_IN_BF16=1: packed becomes eligible.
+
+  // The SPLIT fp8 arm never becomes eligible, toggle or not — it still emits
+  // F32, and predicting otherwise is the throw described above.
+  auto split_rule_for = [](bool toggle_on) {
+    const DType mixed = GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
+        false, true, false, DType::kBF16,
+        GdnFp8MergedMixedQkvDType(toggle_on, DType::kBF16, DType::kBF16)});
+    return GdnPackedDecodeDTypesCompatible(
+        GdnPackedDecodeDTypes{mixed, DType::kBF16, DType::kBF16, DType::kF32});
+  };
+  CHECK_FALSE(split_rule_for(false));
+  CHECK_FALSE(split_rule_for(true));
 }
 
 // The rule itself: vt::GdnPackedDecode's uniformity contract over the four
@@ -581,8 +671,10 @@ TEST_CASE("qwen27 packed GDN selection keys on dtypes, not on fp8 weights") {
   auto selects = [](bool fp8_tower, DType fp8_out_dtype, DType ssm_state,
                     const char* toggle) {
     const bool bf16_owner = !fp8_tower;
+    // PERF-GDN-PACKED-BRIDGE: an fp8 tower here means the MERGED arm, which is
+    // the one VT_GDN_FP8_IN_BF16 narrows and the only one that can reach packed.
     const DType mixed = GdnProjectedMixedQkvDType(GdnMixedQkvDTypeInputs{
-        bf16_owner, fp8_tower, DType::kBF16, fp8_out_dtype});
+        bf16_owner, fp8_tower, fp8_tower, DType::kBF16, fp8_out_dtype});
     GdnPackedDecodeEligibility e;
     e.runtime_enabled = true;
     e.cuda = true;
@@ -621,7 +713,7 @@ TEST_CASE("qwen27 packed GDN selection keys on dtypes, not on fp8 weights") {
   // "does not key on fp8 per se" means: the SAME dtypes give the SAME answer.
   {
     const DType mixed_f32 = GdnProjectedMixedQkvDType(
-        GdnMixedQkvDTypeInputs{true, false, DType::kF32, DType::kF32});
+        GdnMixedQkvDTypeInputs{true, false, false, DType::kF32, DType::kF32});
     CHECK(mixed_f32 == DType::kF32);
     CHECK_FALSE(GdnPackedDecodeDTypesCompatible(GdnPackedDecodeDTypes{
         mixed_f32, DType::kBF16, DType::kBF16, DType::kF32}));
