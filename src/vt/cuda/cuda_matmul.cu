@@ -481,6 +481,15 @@ struct Fp8Plan {
   cublasLtMatrixLayout_t lb = nullptr;  // B = act,    col-major [K,M] ld=K
   cublasLtMatrixLayout_t lc = nullptr;  // C = D = out, col-major [N,M] ld=N
   cublasLtMatmulHeuristicResult_t heur{};
+  // The selected algo's CUBLASLT_ALGO_CONFIG_SPLITK_NUM, OBSERVED ONCE here at
+  // plan-build time rather than per GEMM (review finding F-C). It is a property
+  // of `heur.algo`, so it is fixed the moment the algo is, and re-reading it on
+  // every call bought nothing: a driver round-trip per layer per step, on a path
+  // whose plan cache is DEFAULT OFF, so "equally cheap on a hit" described a
+  // configuration almost nobody runs. Read only for a bf16 D — it is the only
+  // arm any caller can claim a premise about (see Fp8Bf16DSplitKRefuses).
+  bool split_k_read_ok = false;
+  int32_t split_k = -1;
 };
 
 // RAII teardown for a FRESHLY-built plan (used only on the VT_FP8_PLAN_CACHE=0
@@ -600,6 +609,19 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
     if (p.desc != nullptr) cublasLtMatmulDescDestroy(p.desc);
     return false;  // caller falls back to cutlass; nothing cached
   }
+  // OBSERVE the selected algo's split-K, once, here — the decision that consumes
+  // it is Fp8Bf16DSplitKRefuses at the call site, and only a caller that CLAIMED
+  // the splitK=1 premise is refused by it. Reading it at build time (rather than
+  // per GEMM, as the first repair did) keeps the observation on the cold path
+  // beside the ~0.8 ms heuristic it belongs to, and leaves the hot path a plain
+  // struct read. A short read counts as UNREAD: `split_k` would keep the -1
+  // sentinel, and reporting that as a bad VALUE would name the wrong cause.
+  if (out_type == CUDA_R_16BF) {
+    size_t written = 0;
+    const cublasStatus_t sst = cublasLtMatmulAlgoConfigGetAttribute(
+        &p.heur.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &p.split_k, sizeof(p.split_k), &written);
+    p.split_k_read_ok = sst == CUBLAS_STATUS_SUCCESS && written == sizeof(p.split_k);
+  }
   *out = p;
   return true;
 }
@@ -628,8 +650,65 @@ bool GetOrBuildCachedFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Pla
   return true;
 }
 
+// ---- ENFORCE the splitK precondition, ON THE CALLER THAT CLAIMED IT ---------
+// A caller passes `claims_splitk1_premise` when its bf16 D is asserted to be
+// byte-equivalent to the f32 D of the same call site — i.e. when it claims the
+// narrowing changed only the STORE WIDTH. That claim holds only while the
+// accumulation behind the store is the same single ordered f32 reduction the
+// f32-D arm used, i.e. while `splitK == 1` (measured 2026-08-12: algoId 67,
+// splitK=1, every gate shape, every M; .agents/specs/perf-fp8-alpha-fold.md
+// §Attempt 4). `out_type` is part of Fp8PlanKey's == and its hash, so the bf16 D
+// deliberately selects a DIFFERENT plan from the f32 D — which is exactly the
+// freedom cuBLASLt needs to pick a different split-K. Had it taken it, the delta
+// would be a REDUCTION-ORDER change wearing a store-width change's clothes, and
+// a bf16 store is very good at hiding those from a token gate.
+//
+// It is a hard refusal, not a tolerance — a "<1% of elements differ" allowance
+// would only be measuring how well bf16 conceals the defect — and not a silent
+// fallback to cutlass, which would substitute a third reduction order without
+// saying so.
+//
+// WHAT THIS FUNCTION DOES NOT DO, and the first repair did (review finding F-A):
+// it does not key off the DTYPE. bf16-D fp8 cuBLASLt GEMMs are a pre-existing,
+// DEFAULT-ON capability — every `o_proj_fp8` / `out_proj_fp8` in qwen3_5.cpp
+// arrives here at bf16 through MatmulFp8Cutlass{,PreQuant}D under
+// DenseCublasLtFp8Enabled() — and NONE of those call sites ever claimed
+// byte-equivalence with an f32-D arm. Split-K is perfectly correct for them.
+// Guarding on `out_type == CUDA_R_16BF` alone therefore put a new throw on a
+// default path and falsified the row's claim that with both toggles unset,
+// behavior is byte-identical to before it. The premise travels WITH the caller
+// that makes it.
+//
+// The whole decision is Fp8Bf16DSplitKRefuses, on the CPU tier, where it is
+// unit-tested and mutation-proved. Nothing is decided here: this host has no
+// nvcc, so a branch written HERE is a branch nothing on it can compile, let
+// alone execute — which is how F-A survived the first repair's gate.
+void RequireBf16DSplitKOne(const Fp8Plan& plan, bool claims_splitk1_premise,
+                           cudaDataType_t out_type, int64_t m, int64_t n, int64_t k,
+                           const char* site) {
+  const bool out_is_bf16 = out_type == CUDA_R_16BF;
+  if (!Fp8Bf16DSplitKRefuses(claims_splitk1_premise, out_is_bf16, plan.split_k_read_ok,
+                             plan.split_k))
+    return;
+  const Fp8Bf16DSplitK verdict =
+      Fp8Bf16DSplitKVerdict(out_is_bf16, plan.split_k_read_ok, plan.split_k);
+  throw std::runtime_error(
+      std::string("vt cuda: ") + site +
+      ": this call site asked for a bf16 D on the express claim that it is byte-equivalent to "
+      "the same GEMM's f32 D — a store-width narrowing over one ordered f32 reduction — which "
+      "requires the selected cuBLASLt plan to report splitK=1. Got " +
+      Fp8Bf16DSplitKTag(verdict) +
+      " (splitK=" + (plan.split_k_read_ok ? std::to_string(plan.split_k) : "unread") +
+      ") at m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k) +
+      ". Re-measure .agents/specs/perf-fp8-alpha-fold.md §Attempt 4's premise on this driver "
+      "before using that arm. Only a caller that CLAIMS the premise can reach this refusal; the "
+      "one that does today is the merged GDN fp8 in_proj under VT_GDN_FP8_IN_BF16 (default OFF) "
+      "— unset it to take the f32 D. An ordinary bf16-D fp8 GEMM (o_proj/out_proj) makes no such "
+      "claim and is never checked.");
+}
+
 void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                                 float alpha) {
+                                 float alpha, bool claims_splitk1_premise) {
   const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
   if (m == 0 || n == 0) return;
   cudaStream_t s = static_cast<cudaStream_t>(q.handle);
@@ -679,6 +758,11 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
     return;
   }
   MaybeLogGemmAlgo(plan.heur, m, n, k, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_type, "TN-fp8");
+  // The splitK precondition, on the plan actually selected (cached or fresh —
+  // same algo either way, and the observation was taken when it was chosen). A
+  // no-op for every caller that did not claim it, which is every caller but the
+  // bf16-D lever: no driver round-trip, no branch beyond one bool.
+  RequireBf16DSplitKOne(plan, claims_splitk1_premise, out_type, m, n, k, "matmul_fp8_cublaslt");
 
   // out = alpha * op(weight) @ op(act) + 0 * C; C and D share out's buffer/layout.
   const float beta = 0.0f;
@@ -716,7 +800,8 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
 // when the toggle is off, when cuBLASLt has no plan, or when the selected algo
 // does not advertise the pointer mode.
 void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8,
-                                         const Tensor& b_fp8, const Tensor& alpha_vec) {
+                                         const Tensor& b_fp8, const Tensor& alpha_vec,
+                                         bool claims_splitk1_premise) {
   const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
   if (m == 0 || n == 0) return;
   cudaStream_t s = static_cast<cudaStream_t>(q.handle);
@@ -728,7 +813,8 @@ void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_
   // The shipped two-launch form: GEMM at alpha=1, then the column vector. Also
   // the rollback arm, reached in the same binary with the toggle unset.
   auto two_launch = [&]() {
-    MatmulFp8CublasLtKernelCuda(q, out, a_fp8, b_fp8, 1.0F);
+    // The caller's premise travels WITH the GEMM it is a premise about.
+    MatmulFp8CublasLtKernelCuda(q, out, a_fp8, b_fp8, 1.0F, claims_splitk1_premise);
     ::vt::MulColVecF32(q, out, alpha_vec);
   };
   if (!Fp8AlphaVecEpilogueEnabled()) {
@@ -760,6 +846,13 @@ void MatmulFp8CublasLtAlphaVecKernelCuda(Queue& q, Tensor& out, const Tensor& a_
   // bf16(acc * alpha) with its requantized single scalar, modelopt.py:458), so
   // lifting this gate is a deliberate, gated decision worth making, not a bug to
   // fix in passing.
+  //
+  // A caller's splitK premise is therefore enforced for this op too, just one
+  // frame down: two_launch() forwards `claims_splitk1_premise` to
+  // MatmulFp8CublasLtKernelCuda, which runs RequireBf16DSplitKOne on the plan it
+  // selects. Repeating the check here would be unreachable code, since every
+  // bf16 D leaves through this branch — and the epilogue arm below is f32-D
+  // only, where no premise about a bf16 store can apply.
   if (out.dtype != DType::kF32) {
     two_launch();
     return;
