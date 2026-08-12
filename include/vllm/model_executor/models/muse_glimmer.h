@@ -67,6 +67,40 @@ enum class MuseGlimmerCheckpointConvention {
                 // PRE-feedforward norm; `post_attn_norm` is the true post-attn one
 };
 
+// ─── THE ARCHITECTURE'S OWN CONSTANTS (issue #412) ───────────────────────────
+// An ABSENT key falls back to the ARCHITECTURE's value, never to a neutral one
+// (identity / zero / "off"). Both independent references agree on all six, and
+// both express them as CLASS DEFAULTS on the config — which is precisely the
+// value a checkpoint that omits the key gets:
+//
+//   vLLM #51655 @ 075d645af  transformers_utils/configs/muse_glimmer.py
+//                              :45 rms_norm_eps            1e-5
+//                              :56 sliding_window          2048
+//                              :58 final_logit_softcapping 20.0
+//                              :62 qk_scale_factor         43.7840518911
+//                              :65 output_multiplier       0.19611613513818404
+//                              :67 post_norm_eps           1e-8
+//   SGLang @ 38a1bc5d2f      python/sglang/srt/configs/muse_glimmer.py
+//                              :90, :93, :102 (output_soft_cap_temp), :98, :101, :91
+//
+// Defaulting them to neutral values does not error and does not produce
+// gibberish — it silently runs a DIFFERENT model. The released 30B `config.json`
+// carries all six, which is exactly why the defaults went untested; the two
+// checkpoints that DO omit keys are the released GGUF (no post-norm epsilon key
+// at all, so both sandwich post-norms ran 1000x too loose) and the DFlash
+// drafter's `config.json` (no `qk_scale_factor`, `post_norm_eps`,
+// `output_multiplier`, `final_logit_softcapping`, `vocab_size`).
+inline constexpr float kMuseGlimmerDefaultRmsNormEps = 1e-5f;
+inline constexpr float kMuseGlimmerDefaultPostNormEps = 1e-8f;
+inline constexpr int64_t kMuseGlimmerDefaultSlidingWindow = 2048;
+inline constexpr double kMuseGlimmerDefaultOutputMultiplier = 0.19611613513818404;
+inline constexpr double kMuseGlimmerDefaultFinalLogitSoftcapping = 20.0;
+// The NATIVE (unfolded) query scale. What the forward applies is this divided by
+// `sqrt(head_dim)` — exactly 3.87 at the released head_dim 128 — so unlike the
+// five above it cannot be a plain member default: it depends on the geometry.
+// `ResolveMuseGlimmerQueryPreScale` resolves it.
+inline constexpr double kMuseGlimmerDefaultQkScaleFactor = 43.7840518911;
+
 // The Muse Glimmer text tower. Values in comments are the released
 // `meta-models/Muse-Glimmer-30B` scale.
 struct MuseGlimmerTextParams {
@@ -78,15 +112,18 @@ struct MuseGlimmerTextParams {
   int64_t num_key_value_heads = 0;    // 2  (GQA 16:1)
   int64_t head_dim = 0;               // 128
   int64_t max_position_embeddings = 0;  // 131072
-  int64_t sliding_window = 0;
+  // 0 means NO WINDOW AT ALL (muse_glimmer.cpp:229), which is why it cannot be
+  // the absent-key fallback — that is a different model, not a looser one.
+  int64_t sliding_window = kMuseGlimmerDefaultSlidingWindow;
   double rope_theta = 500000.0;
   bool tie_word_embeddings = false;
 
   // Sandwich norms: pre-norms use `rms_norm_eps`, post-norms use the separate,
-  // typically SMALLER `post_norm_eps` (muse_glimmer.py:1236-1247). Both norms
-  // carry a baked `+1` weight offset and are computed in fp32.
-  float rms_norm_eps = 1e-6f;
-  float post_norm_eps = 1e-6f;
+  // SMALLER `post_norm_eps` (muse_glimmer.py:1236-1247) — 1e-5 against 1e-8 in
+  // the released config, three orders apart. Both norms carry a baked `+1`
+  // weight offset and are computed in fp32.
+  float rms_norm_eps = kMuseGlimmerDefaultRmsNormEps;
+  float post_norm_eps = kMuseGlimmerDefaultPostNormEps;
 
   // iRoPE mask, one entry per layer (configs/muse_glimmer.py:20-26, 108-112):
   //   0 => NoPE   AND full attention
@@ -104,9 +141,14 @@ struct MuseGlimmerTextParams {
   bool use_qk_norm = true;
   bool use_attn_output_gate = true;
 
-  bool normalize_tok_embeddings = false;
-  double output_multiplier = 1.0;
-  double final_logit_softcapping = 0.0;  // 0 == none
+  // Defaults TRUE when absent, like the two flags above (#405): the released
+  // config omits it, and upstream gates `perception_emb_norm` on it.
+  bool normalize_tok_embeddings = true;
+  double output_multiplier = kMuseGlimmerDefaultOutputMultiplier;
+  // 0 == none. As with `sliding_window`, that is a state a config reaches only
+  // by saying so explicitly (`"final_logit_softcapping": null`), never by
+  // omitting the key.
+  double final_logit_softcapping = kMuseGlimmerDefaultFinalLogitSoftcapping;
   std::string hidden_activation = "silu";
 };
 

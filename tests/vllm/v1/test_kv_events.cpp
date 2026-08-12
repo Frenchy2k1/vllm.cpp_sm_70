@@ -19,15 +19,24 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
+#include "vllm/config/scheduler.h"
 #include "vllm/distributed/kv_events.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/block_pool.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/v1/core/sched/scheduler.h"
+#include "vllm/v1/engine/types.h"
+#include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
+#include "vt/dtype.h"
 
 using vllm::distributed::AllBlocksCleared;
 using vllm::distributed::BlockRemoved;
@@ -362,4 +371,323 @@ TEST_CASE("kv_events: events-disabled path emits nothing") {
   pool.free_blocks({blocks[2], blocks[1], blocks[0]});
   CHECK(pool.reset_prefix_cache());
   CHECK(pool.take_events().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3 (W3, issue #352): the ENGINE/SCHEDULER wiring of the batch envelope,
+// and the per-request kv_cache_report_mode == "full" reuse path.
+//
+// Upstream has NO test that drives either: `grep -rn kv_cache_report_mode
+// --include="*.py"` over the pin returns three SOURCE sites and no test, and the
+// event coverage in tests/v1/core/test_prefix_caching.py calls the pool /
+// manager directly rather than stepping a scheduler. These cases are therefore
+// written against the upstream SOURCE anchors, recorded as written-from-scratch:
+//   scheduler.py:86,116-119,155-158  ctor: config -> enable flag + publisher
+//   scheduler.py:1901-1915           update_from_output: take_events + publish
+//   scheduler.py:2456-2459           shutdown -> publisher.shutdown()
+//   request.py:116-127               kv_cache_report_mode from extra_args
+//   kv_cache_manager.py:262-280      report_mode == "full" reuse emission
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kSchedBlockSize = 16;
+
+// Mirror of test_scheduler.cpp's CreateScheduler, plus the KVEventsConfig the
+// upstream ctor reads out of vllm_config (scheduler.py:86).
+std::unique_ptr<vllm::v1::Scheduler> CreateEventScheduler(
+    const KVEventsConfig* kv_events_config, int data_parallel_rank = 0,
+    int num_blocks = 512) {
+  // NOTE: every enabled config below sets publisher = "null" EXPLICITLY. Our
+  // KVEventsConfig has no PostInit, so an unset publisher reaches the factory as
+  // "" and throws "unknown event publisher ''" instead of resolving the way
+  // kv_events.py:50-52 does. That is issue #353, deliberately not fixed inside
+  // KV-EVENTS W3.
+  vllm::SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+
+  vllm::v1::KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = num_blocks;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<vllm::v1::FullAttentionSpec>(
+          kSchedBlockSize, /*num_kv_heads=*/1, /*head_size=*/1, vt::DType::kF32));
+
+  return std::make_unique<vllm::v1::Scheduler>(
+      cfg, kv_cfg, kSchedBlockSize, /*enable_caching=*/true,
+      /*structured_output_manager=*/nullptr,
+      /*speculative_config=*/std::nullopt, kv_events_config,
+      data_parallel_rank);
+}
+
+// A request whose prompt is `num_tokens` copies of `fill` (so two requests
+// built with the same fill share a prefix, and different fills never do).
+std::unique_ptr<Request> MakeSchedRequest(
+    const std::string& id, int num_tokens, int32_t fill,
+    const std::optional<std::string>& report_mode = std::nullopt) {
+  init_none_hash(sha256_cbor);
+  vllm::SamplingParams params;
+  params.max_tokens = 16;
+  if (report_mode.has_value()) {
+    params.extra_args = std::map<std::string, std::string>{
+        {"kv_cache_report_mode", *report_mode}};
+  }
+  return std::make_unique<Request>(
+      id, std::vector<int32_t>(static_cast<std::size_t>(num_tokens), fill),
+      params, /*arrival_time=*/0.0,
+      get_request_block_hasher(kSchedBlockSize, sha256_cbor));
+}
+
+vllm::v1::ModelRunnerOutput RunnerOutput(
+    const std::vector<std::pair<std::string, std::vector<int32_t>>>& per_req) {
+  vllm::v1::ModelRunnerOutput mro;
+  int idx = 0;
+  for (const auto& [id, toks] : per_req) {
+    mro.req_ids.push_back(id);
+    mro.req_id_to_index[id] = idx++;
+    mro.sampled_token_ids.push_back(toks);
+  }
+  return mro;
+}
+
+// Drive one full engine step for `ids` and return the scheduler output.
+void Step(vllm::v1::Scheduler& sched, const std::vector<std::string>& ids) {
+  auto out = sched.schedule();
+  std::vector<std::pair<std::string, std::vector<int32_t>>> per_req;
+  for (const auto& id : ids) per_req.emplace_back(id, std::vector<int32_t>{7});
+  sched.update_from_output(out, RunnerOutput(per_req));
+}
+
+// Every BlockStored in every published batch, flattened in publish order.
+std::vector<BlockStored> AllStored(const CollectingEventPublisher& pub) {
+  std::vector<BlockStored> out;
+  for (const auto& batch : pub.batches()) {
+    for (const auto& ev : batch.events) {
+      if (const auto* s = std::get_if<BlockStored>(&ev)) out.push_back(*s);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+// scheduler.py:1901-1915 — a step that raised events publishes exactly ONE
+// KVEventBatch, carrying the pool's events, annotated with the publisher's
+// data_parallel_rank, stamped with a wall-clock ts, and byte-identical to the
+// encoder's output for that batch.
+TEST_CASE("kv_events: a scheduler step publishes the KVEventBatch envelope") {
+  KVEventsConfig cfg;
+  cfg.enable_kv_cache_events = true;
+  cfg.publisher = "null";
+  auto sched = CreateEventScheduler(&cfg, /*data_parallel_rank=*/3);
+
+  auto* pub = new CollectingEventPublisher(/*data_parallel_rank=*/3);
+  sched->set_kv_event_publisher(
+      std::unique_ptr<vllm::distributed::EventPublisher>(pub));
+
+  auto req = MakeSchedRequest("A", /*num_tokens=*/32, /*fill=*/1);
+  Request* raw = req.get();
+  sched->add_request(std::move(req));
+
+  // schedule() alone must NOT publish: upstream drains in update_from_output.
+  auto out = sched->schedule();
+  CHECK(pub->batches().empty());
+
+  sched->update_from_output(out, RunnerOutput({{"A", {7}}}));
+
+  REQUIRE(pub->batches().size() == 1);
+  const KVEventBatch& batch = pub->batches()[0];
+  // ts is time.time(): wall-clock seconds since the epoch, not a steady clock.
+  CHECK(batch.ts > 1.7e9);
+  REQUIRE(batch.data_parallel_rank.has_value());
+  CHECK(batch.data_parallel_rank.value() == 3);
+
+  REQUIRE(batch.events.size() == 1);
+  const BlockStored* stored = std::get_if<BlockStored>(&batch.events[0]);
+  REQUIRE(stored != nullptr);
+  CHECK(stored->block_size == kSchedBlockSize);
+  REQUIRE(stored->medium.has_value());
+  CHECK(stored->medium.value() == "GPU");
+  CHECK_FALSE(stored->parent_block_hash.has_value());
+  // 32 prompt tokens / 16 = the two full blocks cached by allocate_slots.
+  REQUIRE(stored->block_hashes.size() == 2);
+  for (std::size_t i = 0; i < stored->block_hashes.size(); ++i) {
+    CHECK(stored->block_hashes[i] ==
+          maybe_convert_block_hash(raw->block_hashes[i]));
+  }
+
+  // The wire bytes the (deferred) transport would ship are the encoder's.
+  REQUIRE(pub->encoded().size() == 1);
+  CHECK(pub->encoded()[0] == encode_kv_event_batch(batch));
+}
+
+// scheduler.py:1913 `if events:` — a step that raised nothing publishes nothing
+// (no empty envelopes on the wire).
+TEST_CASE("kv_events: a step with no events publishes no batch") {
+  KVEventsConfig cfg;
+  cfg.enable_kv_cache_events = true;
+  cfg.publisher = "null";  // see CreateEventScheduler / issue #353
+  auto sched = CreateEventScheduler(&cfg);
+  auto* pub = new CollectingEventPublisher();
+  sched->set_kv_event_publisher(
+      std::unique_ptr<vllm::distributed::EventPublisher>(pub));
+
+  sched->add_request(MakeSchedRequest("A", /*num_tokens=*/32, /*fill=*/1));
+  Step(*sched, {"A"});
+  REQUIRE(pub->batches().size() == 1);
+
+  // A decode step appends one token: no block fills, so nothing is emitted.
+  Step(*sched, {"A"});
+  CHECK(pub->batches().size() == 1);
+}
+
+// scheduler.py:2456-2459 — shutdown reaches the publisher.
+TEST_CASE("kv_events: Scheduler::shutdown shuts the publisher down") {
+  KVEventsConfig cfg;
+  cfg.enable_kv_cache_events = true;
+  cfg.publisher = "null";  // see CreateEventScheduler / issue #353
+  auto sched = CreateEventScheduler(&cfg);
+  auto* pub = new CollectingEventPublisher();
+  sched->set_kv_event_publisher(
+      std::unique_ptr<vllm::distributed::EventPublisher>(pub));
+
+  CHECK_FALSE(pub->was_shut_down());
+  sched->shutdown();
+  CHECK(pub->was_shut_down());
+}
+
+// request.py:116-127 — kv_cache_report_mode comes from
+// sampling_params.extra_args and defaults to "incremental".
+TEST_CASE("kv_events: Request::kv_cache_report_mode mirrors extra_args") {
+  init_none_hash(sha256_cbor);
+  vllm::SamplingParams bare;
+  bare.max_tokens = 4;
+  Request no_args("r0", {1, 2, 3}, bare, 0.0);
+  CHECK(no_args.kv_cache_report_mode == "incremental");
+
+  vllm::SamplingParams other;
+  other.max_tokens = 4;
+  other.extra_args =
+      std::map<std::string, std::string>{{"something_else", "x"}};
+  Request other_key("r1", {1, 2, 3}, other, 0.0);
+  CHECK(other_key.kv_cache_report_mode == "incremental");
+
+  vllm::SamplingParams full;
+  full.max_tokens = 4;
+  full.extra_args =
+      std::map<std::string, std::string>{{"kv_cache_report_mode", "full"}};
+  Request full_req("r2", {1, 2, 3}, full, 0.0);
+  CHECK(full_req.kv_cache_report_mode == "full");
+}
+
+// kv_cache_manager.py:262-280 — under report_mode == "full" a prefix-cache HIT
+// re-reports the REUSED blocks as BlockStored; under the default "incremental"
+// it does not.
+TEST_CASE("kv_events: report_mode==full re-reports reused prefix blocks") {
+  KVEventsConfig cfg;
+  cfg.enable_kv_cache_events = true;
+  cfg.publisher = "null";  // see CreateEventScheduler / issue #353
+
+  // Prime the cache with a 48-token prompt, then finish the request so its
+  // blocks are free but still in the prefix cache.
+  auto prime = [&](vllm::v1::Scheduler& sched) {
+    sched.add_request(MakeSchedRequest("A", /*num_tokens=*/48, /*fill=*/5));
+    Step(sched, {"A"});
+    sched.finish_requests("A", vllm::v1::RequestStatus::kFinishedAborted);
+  };
+
+  std::vector<ExternalBlockHash> reused_hashes;
+  {
+    // report_mode == "full": the hit is re-reported.
+    auto sched = CreateEventScheduler(&cfg);
+    auto* pub = new CollectingEventPublisher();
+    sched->set_kv_event_publisher(
+        std::unique_ptr<vllm::distributed::EventPublisher>(pub));
+    prime(*sched);
+    const std::size_t after_prime = AllStored(*pub).size();
+    REQUIRE(after_prime == 1);
+
+    auto b = MakeSchedRequest("B", /*num_tokens=*/48, /*fill=*/5, "full");
+    Request* raw_b = b.get();
+    CHECK(raw_b->kv_cache_report_mode == "full");
+    sched->add_request(std::move(b));
+    Step(*sched, {"B"});
+
+    auto stored = AllStored(*pub);
+    // The prime's store, then TWO events for B in one batch: the REUSE report
+    // raised by get_computed_blocks during schedule(), followed by the ordinary
+    // store of the one block B actually had to compute. Both are drained by the
+    // same end-of-step take_events, in that order.
+    REQUIRE(stored.size() == after_prime + 2);
+
+    const BlockStored& reuse = stored[after_prime];
+    // max_cache_hit_length is num_tokens - 1 == 47, so 2 of the 3 blocks hit.
+    REQUIRE(reuse.block_hashes.size() == 2);
+    for (std::size_t i = 0; i < reuse.block_hashes.size(); ++i) {
+      CHECK(reuse.block_hashes[i] ==
+            maybe_convert_block_hash(raw_b->block_hashes[i]));
+    }
+    CHECK(reuse.block_size == kSchedBlockSize);
+    REQUIRE(reuse.group_idx.has_value());
+    CHECK(reuse.group_idx.value() == 0);
+
+    // The follow-on store covers only the third block, parented on the last
+    // REUSED one -- so a consumer can chain the whole prefix.
+    const BlockStored& tail = stored[after_prime + 1];
+    REQUIRE(tail.block_hashes.size() == 1);
+    CHECK(tail.block_hashes[0] == maybe_convert_block_hash(raw_b->block_hashes[2]));
+    REQUIRE(tail.parent_block_hash.has_value());
+    CHECK(tail.parent_block_hash.value() ==
+          maybe_convert_block_hash(raw_b->block_hashes[1]));
+
+    reused_hashes = reuse.block_hashes;
+  }
+
+  {
+    // Default "incremental": the identical hit reports NOTHING extra.
+    auto sched = CreateEventScheduler(&cfg);
+    auto* pub = new CollectingEventPublisher();
+    sched->set_kv_event_publisher(
+        std::unique_ptr<vllm::distributed::EventPublisher>(pub));
+    prime(*sched);
+    const std::size_t after_prime = AllStored(*pub).size();
+
+    auto c = MakeSchedRequest("C", /*num_tokens=*/48, /*fill=*/5);
+    CHECK(c->kv_cache_report_mode == "incremental");
+    sched->add_request(std::move(c));
+    Step(*sched, {"C"});
+
+    auto stored = AllStored(*pub);
+    // Only the ordinary store of C's third block -- ONE event where "full"
+    // produced two. The reused prefix is never re-reported.
+    REQUIRE(stored.size() == after_prime + 1);
+    CHECK(stored[after_prime].block_hashes.size() == 1);
+    for (const BlockStored& s : stored) {
+      CHECK(s.block_hashes != reused_hashes);
+    }
+  }
+}
+
+// The DEFAULT scheduler (no KVEventsConfig, exactly what every existing call
+// site constructs) is INERT: nothing is ever published, even with a publisher
+// injected and a request explicitly asking for report_mode == "full".
+TEST_CASE("kv_events: the default scheduler path publishes nothing") {
+  auto sched = CreateEventScheduler(/*kv_events_config=*/nullptr);
+  auto* pub = new CollectingEventPublisher();
+  sched->set_kv_event_publisher(
+      std::unique_ptr<vllm::distributed::EventPublisher>(pub));
+
+  sched->add_request(MakeSchedRequest("A", /*num_tokens=*/48, /*fill=*/9));
+  Step(*sched, {"A"});
+  sched->finish_requests("A", vllm::v1::RequestStatus::kFinishedAborted);
+
+  sched->add_request(MakeSchedRequest("B", /*num_tokens=*/48, /*fill=*/9, "full"));
+  Step(*sched, {"B"});
+
+  CHECK(pub->batches().empty());
+  CHECK(pub->encoded().empty());
 }

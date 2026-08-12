@@ -4,11 +4,6 @@ How to port a model, kernel, or feature. The rules are in
 [`AGENTS.md`](../AGENTS.md); this is the method. Nothing here is binding on its
 own.
 
-Porting a **model** specifically? Work through
-[`porting-a-model.md`](porting-a-model.md) as well — this file is the method,
-that one is the coverage checklist (weight formats including GGUF k-quants,
-multimodal, speculative decoding, the serving surface, records).
-
 ## Before you write anything
 
 Verify the recorded gap against the *current* pinned upstream and the current
@@ -47,6 +42,36 @@ lever is unreachable.
 Anything genuinely written from scratch is recorded as such in
 [`porting-inventory.md`](porting-inventory.md) §9. "I couldn't find it upstream"
 is a search result, not a conclusion — say which paths you searched.
+
+## Mirror the memory format, not just the math
+
+**A token-exactness gate cannot catch a dtype that is too WIDE.** F32 where
+upstream uses bf16 is *more* precise: tokens still match, SACRED still passes,
+and we quietly move twice the bytes. Every correctness gate we own is blind to
+it. So it has to be checked deliberately, once per ported path:
+
+| Ask | Where upstream answers it |
+|---|---|
+| What dtype does the linear method OUTPUT? | the quant method's `apply`/`out_dtype` (e.g. ModelOpt fp8 uses `torch.get_default_dtype()` = bf16) |
+| What `kv_cache_dtype` is RESOLVED for this checkpoint? | it is not always the CLI default — vLLM derives it from `kv_cache_quant_algo` in the checkpoint's `quantization_config` |
+| What dtype do the intermediate activation buffers carry? | read the consumer, not the producer: a buffer is only as narrow as whoever reads it |
+| Is a projection one physical GEMM or several? | merged linears (`QKVParallelLinear`, `MergedColumnParallelLinear`) are one, and upstream may requantize mismatched shards rather than decline to merge |
+
+Record the answers in the row's spec. If we deliberately diverge — a wider
+accumulate for a reason — say so and say what it costs in bytes per token.
+
+**Confirm the resolved config at RUNTIME, not from source.** Upstream logs its
+resolved engine config on startup; read it. This project has repeatedly had a
+confident source reading contradicted by a runtime log — a kernel name read as a
+fusion, a code path read as selected when a capability predicate excluded it, a
+cache dtype read as the CLI default when the checkpoint overrode it. Source
+inspection establishes candidates; the running engine establishes what ran.
+
+**Why this section exists:** a dtype divergence on the largest activation
+buffers is a per-token cost. It is therefore invisible at batch 1 with a short
+prompt, invisible to token gates, and shows up only as a flat throughput deficit
+that does not shrink with concurrency — the hardest signature to attribute after
+the fact.
 
 ## Shared seams
 

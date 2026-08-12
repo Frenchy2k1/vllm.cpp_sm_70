@@ -1153,8 +1153,11 @@ TEST_CASE("muse_glimmer: the RELEASED 30B config parses to the real geometry") {
   CHECK(t.final_logit_softcapping == doctest::Approx(20.0));
 
   // The split eps is REAL: three orders of magnitude apart in the shipped config.
-  CHECK(t.rms_norm_eps == doctest::Approx(1e-5f));
-  CHECK(t.post_norm_eps == doctest::Approx(1e-8f));
+  // `.scale(0)` is load-bearing on every epsilon assertion in this file: doctest's
+  // Approx adds a scale term that defaults to 1.0, so a bare `Approx(1e-8)` accepts
+  // 1e-5 — the exact wrong value #412 is about — as equal.
+  CHECK(static_cast<double>(t.rms_norm_eps) == doctest::Approx(1e-5).scale(0.0));
+  CHECK(static_cast<double>(t.post_norm_eps) == doctest::Approx(1e-8).scale(0.0));
   CHECK(t.post_norm_eps < t.rms_norm_eps);
 
   // The pre-folded schema at the REAL head_dim: 3.87 < sqrt(128) = 11.31, so it is
@@ -1246,4 +1249,180 @@ TEST_CASE("muse_glimmer: the released vision block's REAL field spellings resolv
 
   CHECK(p.image_token_id == 200092);
   CHECK(p.video_token_id == 200091);
+}
+
+// ── issue #412: an ABSENT key falls back to the ARCHITECTURE, not to neutral ──
+// The released 30B `config.json` above carries every one of these six, which is
+// exactly why their defaults went untested: the only checkpoints that hit a
+// default are the ones that OMIT the key. Two of those exist and both are real
+// artifacts — the released GGUF (no post-norm epsilon; see the GGUF gate) and
+// the DFlash drafter's `config.json`, committed verbatim as a fixture below.
+//
+// Every value asserted here is a LITERAL, transcribed from the two independent
+// references rather than from our own constants, so the assertion is a second
+// opinion and not a restatement:
+//   vLLM #51655 @ 075d645af  transformers_utils/configs/muse_glimmer.py:45,56,58,62,65,67
+//   SGLang     @ 38a1bc5d2f  python/sglang/srt/configs/muse_glimmer.py:90,91,93,98,101,102
+// The two AGREE on all six; there is nothing to adjudicate.
+namespace {
+
+std::string DraftFixtureDir() {
+#ifdef MUSE_GLIMMER_DRAFT_FIXTURE_DIR
+  return MUSE_GLIMMER_DRAFT_FIXTURE_DIR;
+#else
+  return "tests/vllm/models/fixtures/muse_glimmer_30b_assistant";
+#endif
+}
+
+// The DFlash drafter's config, byte-for-byte as released with
+// `meta-models/Muse-Glimmer-30B-Assistant`. It is a FLAT config (no
+// `text_config`) and it omits `qk_scale_factor`, `post_norm_eps`,
+// `output_multiplier`, `final_logit_softcapping` and `vocab_size`.
+HfConfig DrafterConfig() {
+  const std::string path = DraftFixtureDir() + "/config.json";
+  std::ifstream in(path);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+  nlohmann::json raw;
+  in >> raw;
+
+  // The five omissions are the POINT of this fixture. If a future re-release
+  // starts shipping them the defaults stop being exercised, so assert the shape
+  // of the artifact before asserting anything about the parse.
+  for (const char* absent : {"qk_scale_factor", "post_norm_eps", "output_multiplier",
+                             "final_logit_softcapping", "vocab_size"})
+    REQUIRE_MESSAGE(!raw.contains(absent), "fixture unexpectedly carries " << absent);
+
+  HfConfig c;
+  c.architectures = {"MuseGlimmerAssistantModel"};
+  c.hidden_size = raw["hidden_size"].get<int64_t>();
+  c.num_hidden_layers = raw["num_hidden_layers"].get<int64_t>();
+  c.num_attention_heads = raw["num_attention_heads"].get<int64_t>();
+  c.raw = std::move(raw);
+  return c;
+}
+
+// The minimum a config can carry and still parse: the three required geometry
+// fields plus head_dim. Everything else must come from the architecture.
+HfConfig GeometryOnlyConfig() {
+  HfConfig c;
+  c.architectures = {"MuseGlimmerForCausalLM"};
+  c.hidden_size = 512;
+  c.num_hidden_layers = 4;
+  c.num_attention_heads = 4;
+  c.raw = nlohmann::json{{"model_type", "muse_glimmer"},
+                         {"text_config",
+                          {{"hidden_size", 512},
+                           {"intermediate_size", 1024},
+                           {"num_hidden_layers", 4},
+                           {"num_attention_heads", 4},
+                           {"num_key_value_heads", 2},
+                           {"head_dim", 128}}}};
+  return c;
+}
+
+}  // namespace
+
+TEST_CASE("muse_glimmer #412: the DRAFTER config omits five keys and still gets"
+          " the architecture's constants") {
+  const MuseGlimmerParams p = vllm::ParseMuseGlimmerParams(DrafterConfig());
+  const vllm::MuseGlimmerTextParams& t = p.text;
+
+  // Control — the keys the drafter DOES ship must come from the file.
+  CHECK(t.hidden_size == 6656);
+  CHECK(t.num_hidden_layers == 5);
+  CHECK(t.num_key_value_heads == 8);  // 8, not the target's 2
+  CHECK(t.head_dim == 128);
+  CHECK(t.sliding_window == 2048);
+  CHECK(static_cast<double>(t.rms_norm_eps) == doctest::Approx(1e-5).scale(0.0));
+  CHECK(t.hidden_activation == "silu");  // via the flat `hidden_act` rename
+  REQUIRE(t.no_rope_layers.size() == 5u);
+  for (int64_t v : t.no_rope_layers) CHECK(v == 1);  // all "sliding_attention"
+
+  // THE DEFECT. `use_qk_norm` is absent too and correctly reads TRUE, so the
+  // drafter runs its QK-norm — and then, with a neutral 1.0 here, multiplies the
+  // normed queries by nothing at all instead of by 3.87. No error, coherent
+  // draft tokens, acceptance quietly collapses.
+  CHECK(t.use_qk_norm);
+  CHECK(t.scale_query_by == doctest::Approx(3.87).epsilon(1e-9));
+  CHECK(t.scale_query_by != doctest::Approx(1.0));
+
+  // 1e-8, NOT rms_norm_eps: the post-norms are a thousand times tighter.
+  CHECK(static_cast<double>(t.post_norm_eps) == doctest::Approx(1e-8).scale(0.0));
+  CHECK(static_cast<double>(t.post_norm_eps) !=
+        doctest::Approx(static_cast<double>(t.rms_norm_eps)).scale(0.0));
+
+  CHECK(t.output_multiplier == doctest::Approx(0.19611613513818404));
+  CHECK(t.final_logit_softcapping == doctest::Approx(20.0));
+
+  // `vocab_size` stays 0 DELIBERATELY. A DFlash draft has no head of its own and
+  // borrows the target's, which is what SGLang encodes as
+  // `MuseGlimmerAssistantConfig.vocab_size = None`
+  // (srt/configs/muse_glimmer.py:28-32). 0 is the "ask the target" sentinel, not
+  // a default that lost a value.
+  CHECK(t.vocab_size == 0);
+}
+
+TEST_CASE("muse_glimmer #412: a config that omits EVERY defaulted key lands on"
+          " the architecture, not on neutral values") {
+  const MuseGlimmerParams p = vllm::ParseMuseGlimmerParams(GeometryOnlyConfig());
+  const vllm::MuseGlimmerTextParams& t = p.text;
+
+  // Each of the six, against the value the OLD neutral default produced.
+  CHECK(t.scale_query_by == doctest::Approx(3.87).epsilon(1e-9));  // was 1.0
+  CHECK(t.sliding_window == 2048);                                 // was 0 = none
+  CHECK(static_cast<double>(t.rms_norm_eps) ==
+        doctest::Approx(1e-5).scale(0.0));  // was 1e-6
+  CHECK(static_cast<double>(t.post_norm_eps) ==
+        doctest::Approx(1e-8).scale(0.0));  // was rms_norm_eps
+  CHECK(t.output_multiplier == doctest::Approx(0.19611613513818404));  // was 1.0
+  CHECK(t.final_logit_softcapping == doctest::Approx(20.0));           // was 0 = off
+
+  // `sliding_window == 0` is the switch that turns the window OFF entirely
+  // (muse_glimmer.cpp:229). Defaulting to it did not soften the window — it
+  // deleted it, turning all 52 layers into global attention.
+  CHECK(t.sliding_window > 0);
+  // and 0 is likewise the "no soft-cap" sentinel, so the old default silently
+  // dropped the tanh cap at :1618-1621.
+  CHECK(t.final_logit_softcapping > 0.0);
+}
+
+TEST_CASE("muse_glimmer #412: an EXPLICIT null still means OFF") {
+  // Both nullable fields are `X | None` upstream (configs/muse_glimmer.py:56,58),
+  // so ABSENT and NULL are different states and only ABSENT takes the default.
+  // Without this the new defaults would make a checkpoint that deliberately
+  // disables the window or the soft-cap impossible to express.
+  HfConfig off = GeometryOnlyConfig();
+  off.raw["text_config"]["sliding_window"] = nullptr;
+  off.raw["text_config"]["final_logit_softcapping"] = nullptr;
+  const vllm::MuseGlimmerTextParams& t = vllm::ParseMuseGlimmerParams(off).text;
+  CHECK(t.sliding_window == 0);
+  CHECK(t.final_logit_softcapping == doctest::Approx(0.0));
+
+  // The FLAT layout must agree — the hoist has to carry an explicit null through
+  // rather than dropping the key and re-defaulting it.
+  HfConfig flat;
+  flat.architectures = {"MuseGlimmerForCausalLM"};
+  flat.hidden_size = 512;
+  flat.num_hidden_layers = 4;
+  flat.num_attention_heads = 4;
+  flat.raw = nlohmann::json{{"model_type", "muse_glimmer"},
+                            {"hidden_size", 512},
+                            {"intermediate_size", 1024},
+                            {"num_hidden_layers", 4},
+                            {"num_attention_heads", 4},
+                            {"num_key_value_heads", 2},
+                            {"head_dim", 128},
+                            {"sliding_window", nullptr},
+                            {"final_logit_softcapping", nullptr}};
+  const vllm::MuseGlimmerTextParams& ft = vllm::ParseMuseGlimmerParams(flat).text;
+  CHECK(ft.sliding_window == 0);
+  CHECK(ft.final_logit_softcapping == doctest::Approx(0.0));
+  // ...while the same flat config WITHOUT the keys takes the defaults.
+  HfConfig flat_absent = flat;
+  flat_absent.raw.erase("sliding_window");
+  flat_absent.raw.erase("final_logit_softcapping");
+  const vllm::MuseGlimmerTextParams& at =
+      vllm::ParseMuseGlimmerParams(flat_absent).text;
+  CHECK(at.sliding_window == 2048);
+  CHECK(at.final_logit_softcapping == doctest::Approx(20.0));
 }

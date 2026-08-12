@@ -149,6 +149,117 @@ inline bool MarlinDenseEnabled() {
   return on;
 }
 
+// --- PERF-27B-DENSE-MARLIN-GATEUP (issue #365) -----------------------------
+// The fused Marlin gate_up pair exists and is default-ON, but its only callers
+// are the MoE shared expert. The DENSE MLP's W4A16 gate/up pair still launches
+// TWO Marlin GEMMs, which is the measured 193-vs-129 Marlin calls/step against
+// the pinned oracle on the identical batch-1 27B decode. vLLM's dense Qwen3.6
+// MLP is ONE `MergedColumnParallelLinear` `gate_up_proj`
+// (vllm/model_executor/layers/linear.py), repacked WHOLE as a single Marlin
+// operand (marlin_utils_fp4.py:221-306), so one GEMM is the MIRRORED topology
+// and the split pair is our divergence.
+//
+// VT_DENSE_MARLIN_GATEUP is DEFAULT ON (opt out with =0). It shipped OFF while
+// the row held, because a lever's default moves on a measured same-binary A/B
+// and never on an expectation. That A/B has now run: interleaved 4 reps per arm
+// on nvidia/Qwen3.6-27B-NVFP4@0893e160 (GB10), toggle the only variable, caches
+// dropped between arms — fused +2.12% at c1 (12.0823 vs 11.8313 tok/s) and
+// +1.70% at c8 (83.6186 vs 82.2217), with COMPLETE SEPARATION at both
+// concurrencies (c1 min fused 12.0203 > max split 11.8729; c8 min fused 83.2511
+// > max split 82.4959), 4/4 paired, effect well outside each arm's spread.
+//
+// The correctness bar for the flip was token-exactness against the pinned
+// ORACLE, NOT bit-equality with our own split path — the fused and split Marlin
+// GEMMs differ by one bf16 ULP on ~0.1% of elements (the fp32 split-K reduce
+// regroups the K-slices for a [2N,K] operand), MEASURED for this exact entry
+// point in tests/vllm/model_executor/layers/test_linear_method.cpp:202. A
+// 64-token greedy continuation captured on BOTH arms diffed IDENTICAL.
+//
+// The opt-out spelling mirrors the nearest parity levers, the sibling fused
+// gate_up toggles above: MarlinDensePairEnabled (VT_MARLIN_DENSE_PAIR) and
+// FusedGateUpEnabled (VT_MOE_FUSED_W13).
+//
+// Parsed by a PURE function so the truth table is testable without process
+// -global state (the cached reader below can only ever observe one value).
+inline bool DenseMarlinGateUpEnabledFor(const char* env) {
+  return !(env != nullptr && env[0] == '0');
+}
+
+inline bool DenseMarlinGateUpEnabled() {
+  static const bool on =
+      DenseMarlinGateUpEnabledFor(std::getenv("VT_DENSE_MARLIN_GATEUP"));
+  return on;
+}
+
+// The shape/scale precondition that makes N-concatenating a gate/up pair into
+// ONE Marlin operand LEGAL — factored OUT of GateUpFusedEligible below so the
+// dense MLP composes the SAME terms instead of restating them, and so a CPU
+// test can pin the truth table (the composed guards below reach into a CUDA
+// -only kernel family and answer false everywhere else).
+//
+// `scale2` equality is the load-bearing term. The merged resident emits ONE
+// per-GEMM global scale over both shards, mirroring vLLM's merged parameter,
+// which has exactly one `weight_global_scale`
+// (compressed_tensors_w4a4_nvfp4.py:111-114). Two shards with DIFFERENT scale2
+// cannot share it, so relaxing this equality would silently change numerics
+// rather than fuse them.
+inline bool GateUpPairFusableShape(const Nvfp4Weight& gw, const Nvfp4Weight& uw) {
+  return !gw.Empty() && !uw.Empty() && !gw.IsTrueW4A4() && !uw.IsTrueW4A4() &&
+         gw.is_mxfp4 == uw.is_mxfp4 && gw.group_size == uw.group_size &&
+         gw.n == uw.n && gw.k == uw.k && gw.scale2 == uw.scale2;
+}
+
+// True when a DENSE MLP's gate/up pair takes the fused Marlin gate_up path,
+// with the ONE thing a CPU test cannot observe — whether the vendored Marlin
+// NVFP4 grouped GEMM is realized for the target device — INJECTED rather than
+// probed. Every other term is a lever read or a shape/format term, so this
+// overload is exactly the part of the guard a host build can put under test;
+// `DenseMlpGateUpFusedMarlinEligible` below is this function applied to the real
+// op registry and adds nothing else.
+//
+// Splitting it this way is what makes each term load-bearing under test: with
+// the device term hard-false on CPU the composed predicate answered false no
+// matter what the lever terms said, so deleting any one of them stayed green
+// (fresh-review findings F1/F2). The composition is otherwise UNCHANGED — same
+// terms, same order, same short-circuit — apart from the MXFP4 refusal below.
+//
+// MXFP4 IS REFUSED HERE, and that is not redundant with GateUpPairFusableShape.
+// That shape term only requires the two shards to AGREE on the format, so a pair
+// that is MXFP4 on both halves passes it — correctly, because the fused entry
+// point this header owns (`GateUpFusedMarlinD`) handles E8M0/group-32 properly.
+// The DENSE MLP call site does NOT reach that one: it reaches qwen3_5.cpp's
+// `DenseGateUpFusedMarlinD` -> `SharedGateUpFusedMarlinD` ->
+// `BuildMarlinDensePairResident`, a private NVFP4-ONLY copy that sizes the merged
+// scale buffer at K/16 rows, runs the NVFP4 combined-scale-factor + global-scale
+// processing, and pins `group_size = 16` / `mxfp4 = false` in the GEMM args. That
+// is verbatim the defect recorded RED-first for the OTHER implementation at
+// tests/vllm/model_executor/layers/test_linear_method.cpp:185-201 — group-32 E8M0
+// scales misread as group-16 fp8-e4m3, "GROSSLY wrong". No dense loader sets
+// `is_mxfp4` today (`LoadNvfp4AnyNaming`, qwen3_5_dense_weights.cpp:358-395, only
+// ever produces NVFP4), so the defect is latent, not live — one loader line away.
+// Refusing it here costs the currently-reached W4A16 NVFP4 config nothing
+// (`is_mxfp4` is false on both halves) and keeps the split pair, which DOES
+// handle MXFP4, as the answer for any dense MXFP4 checkpoint.
+inline bool DenseMlpGateUpFusedMarlinEligibleWhen(const Nvfp4Weight& gw,
+                                                  const Nvfp4Weight& uw,
+                                                  bool marlin_nvfp4_op_available) {
+  return DenseMarlinGateUpEnabled() && MarlinW4A16Enabled() &&
+         FusedGateUpEnabled() && !gw.is_mxfp4 && !uw.is_mxfp4 &&
+         GateUpPairFusableShape(gw, uw) && marlin_nvfp4_op_available;
+}
+
+// `vt::OpRegistered` is what makes a build WITHOUT the vendored Marlin NVFP4
+// kernel (no VT_MARLIN_NVFP4) — and every non-CUDA device — answer false, so
+// this needs no build-time gate of its own; the DSR ratchet
+// (scripts/check-device-leakage.py) counts those, and a runtime probe of the
+// op registry is the device-agnostic way to ask the same question.
+inline bool DenseMlpGateUpFusedMarlinEligible(const Nvfp4Weight& gw,
+                                              const Nvfp4Weight& uw,
+                                              vt::DeviceType dev) {
+  return DenseMlpGateUpFusedMarlinEligibleWhen(
+      gw, uw, vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, dev));
+}
+
 // --- Execution counters (the "this path actually RAN" positive signal) ------
 // A passing correctness gate does NOT prove a new code path was exercised — a
 // mis-wired dispatch that silently fell back to the BF16 arm would also pass if
@@ -546,10 +657,10 @@ inline bool GateUpFusedEligible(const Nvfp4Weight& gw, const Nvfp4Weight& uw) {
   // needs scale2 equality because its combined factor spans both shards). The
   // format/group must match (a MLP's gate and up always share both) and, for the
   // NVFP4 arm, scale2 must be equal (trivially true for MXFP4: both 0).
-  return FusedGateUpEnabled() && !gw.Empty() && !uw.Empty() && !gw.IsTrueW4A4() &&
-         !uw.IsTrueW4A4() && gw.is_mxfp4 == uw.is_mxfp4 &&
-         gw.group_size == uw.group_size && gw.n == uw.n && gw.k == uw.k &&
-         gw.scale2 == uw.scale2;
+  //
+  // Those shape/scale terms are GateUpPairFusableShape above — factored out, not
+  // restated, so the dense MLP's guard cannot drift from this one.
+  return FusedGateUpEnabled() && GateUpPairFusableShape(gw, uw);
 }
 
 // silu(x@gate.T) * (x@up.T) -> bf16 [M,N] via ONE fused Marlin gate_up GEMM.

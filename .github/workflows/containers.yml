@@ -21,6 +21,22 @@ name: containers
 on:
   push:
     tags: ['v*']
+    # main publishes moving :main-<lane> images. Only container INFRASTRUCTURE
+    # paths trigger it: main takes dozens of pushes a day and three lanes on two
+    # architectures each time is prohibitive, so product changes ride the
+    # nightly below and container changes rebuild immediately.
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'release/container-matrix.json'
+      - 'scripts/validate-container-image.py'
+      - 'scripts/container_tags.py'
+      - 'scripts/build-cpu-release.sh'
+      - 'scripts/build-linux-accelerator-release.sh'
+      - '.github/workflows/containers.yml'
+  schedule:
+    # Nightly, so a main image is never more than a day behind the tree.
+    - cron: '0 4 * * *'
   pull_request:
   workflow_dispatch:
     inputs:
@@ -46,6 +62,8 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       is_release: ${{ steps.plan.outputs.is_release }}
+      is_main: ${{ steps.plan.outputs.is_main }}
+      publishes: ${{ steps.plan.outputs.publishes }}
       verify_matrix: ${{ steps.matrix.outputs.verify }}
       publish_matrix: ${{ steps.matrix.outputs.publish }}
     steps:
@@ -62,6 +80,20 @@ jobs:
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+          # A main publish is a push to main or the nightly -- never a pull
+          # request, which has no credentials and must not reach a registry.
+          is_main=false
+          if [ "${GITHUB_REF_TYPE}" != "tag" ] \
+             && [ "${GITHUB_REF_NAME}" = "main" ] \
+             && [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            is_main=true
+          fi
+          echo "is_main=${is_main}" >> "$GITHUB_OUTPUT"
+          if [ "${is_main}" = "true" ] || [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "publishes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publishes=false" >> "$GITHUB_OUTPUT"
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Gate the container matrix against the Dockerfile
@@ -122,7 +154,7 @@ jobs:
 
   publish:
     needs: [plan, verify]
-    if: needs.plan.outputs.is_release == 'true'
+    if: needs.plan.outputs.publishes == 'true'
     permissions:
       contents: read
       packages: write
@@ -140,6 +172,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Refuse to overwrite an existing immutable tag
+        # Version tags only. :main-<lane> moves by design and is skipped here;
+        # what must never happen is a republished :<version>-<lane>.
+        if: needs.plan.outputs.is_release == 'true'
         run: |
           set -euo pipefail
           tag="${REGISTRY_PACKAGE}:${{ needs.plan.outputs.version }}-${{ matrix.lane }}"
@@ -195,7 +230,7 @@ jobs:
 
   manifest:
     needs: [plan, publish]
-    if: needs.plan.outputs.is_release == 'true'
+    if: needs.plan.outputs.publishes == 'true'
     permissions:
       contents: read
       packages: write
@@ -225,13 +260,18 @@ jobs:
               refs="${refs} ${REGISTRY_PACKAGE}@$(cat "$file")"
             done
             test -n "${refs}"
-            docker buildx imagetools create \
-              --tag "${REGISTRY_PACKAGE}:${version}-${lane}" ${refs}
+            if [ "${{ needs.plan.outputs.is_release }}" = "true" ]; then
+              tag="${REGISTRY_PACKAGE}:${version}-${lane}"
+            else
+              # A main image is a moving convenience tag, never a version.
+              tag="${REGISTRY_PACKAGE}:main-${lane}"
+            fi
+            docker buildx imagetools create --tag "${tag}" ${refs}
           done
 
   attest:
     needs: [plan, manifest]
-    if: needs.plan.outputs.is_release == 'true'
+    if: needs.plan.outputs.publishes == 'true'
     permissions:
       contents: read
       id-token: write
@@ -244,9 +284,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.plan.outputs.version }}"
+          if [ "${{ needs.plan.outputs.is_release }}" = "true" ]; then prefix="${version}-"; else prefix="main-"; fi
           for lane in cpu vulkan cuda; do
             digest=$(docker buildx imagetools inspect \
-              "${REGISTRY_PACKAGE}:${version}-${lane}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+              "${REGISTRY_PACKAGE}:${prefix}${lane}" --format '{{json .Manifest.Digest}}' | tr -d '"')
             echo "${lane}=${digest}" >> "$GITHUB_OUTPUT"
           done
       - uses: actions/attest-build-provenance@v2

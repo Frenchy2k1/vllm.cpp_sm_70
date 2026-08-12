@@ -274,7 +274,7 @@ class RatchetTests(unittest.TestCase):
         self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
 
     def test_re_adding_done_to_the_gated_population_breaks_the_pin(self):
-        # MUTATION: restoring the departed lifecycle state must expose the three
+        # MUTATION: restoring the departed lifecycle state must expose the four
         # runnable DONE rows and disagree with the re-pinned baseline.
         original = gates.GATED_STATES
         gates.GATED_STATES = frozenset(original | {"DONE"})
@@ -284,9 +284,37 @@ class RatchetTests(unittest.TestCase):
             }
         finally:
             gates.GATED_STATES = original
-        departed = {"ENG-ASYNC-SCHED", "SERVE-HTTP-TRANSPORT", "ENG-NOW-DERIVED"}
+        departed = {
+            "ENG-ASYNC-SCHED",
+            "SERVE-HTTP-TRANSPORT",
+            "ENG-NOW-DERIVED",
+            "ENG-TRAILER-MERGE-ARTIFACTS",
+        }
         self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
         self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_trailer_merge_artifacts_left_the_gated_population_cleanly(self):
+        # Credited runnable on arrival at ACTIVE, then gone the same day on
+        # reaching DONE (157080c8). Assert the departure on BOTH sides -- gone
+        # from the audit AND gone from the baseline -- because a row present in
+        # one and not the other is exactly what the exact pin exists to catch.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("ENG-TRAILER-MERGE-ARTIFACTS"))
+        self.assertNotIn("ENG-TRAILER-MERGE-ARTIFACTS", gates.RUNNABLE_BASELINE)
+
+    def test_forge_coauthor_is_credited_for_real_commands(self):
+        # ENG-FORGE-COAUTHOR (#418) joins the runnable population on arrival, so
+        # it earns the credit the same way: its spec's Gates section must name
+        # commands that can actually fail, including the per-commit re-check of
+        # the real f64f2b71 the row exists to unblock.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-FORGE-COAUTHOR"), "runnable")
+        spec = (ROOT / ".agents/specs/forge-coauthor-attribution.md").read_text(
+            encoding="utf-8"
+        )
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
 
     def test_record_conflict_surfaces_is_credited_for_real_commands(self):
         # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on

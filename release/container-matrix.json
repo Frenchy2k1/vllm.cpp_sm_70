@@ -28,6 +28,7 @@
       ],
       "channel": "stable",
       "id": "cpu",
+      "main_tag": "main-cpu",
       "moving_tags": [
         "latest-cpu",
         "latest"
@@ -53,6 +54,7 @@
       ],
       "channel": "preview",
       "id": "vulkan",
+      "main_tag": "main-vulkan",
       "moving_tags": [
         "latest-vulkan"
       ],
@@ -70,11 +72,12 @@
         {
           "platform": "linux/arm64",
           "runner": "ubuntu-24.04-arm",
-          "runtime_evidence": false
+          "runtime_evidence": true
         }
       ],
       "channel": "preview",
       "id": "cuda",
+      "main_tag": "main-cuda",
       "moving_tags": [
         "latest-cuda"
       ],
@@ -95,6 +98,7 @@
   ],
   "package": "ghcr.io/mudler/vllm.cpp",
   "retention": {
+    "main_tags": "overwritten on every main publish; not immutable, no support claim",
     "moving_tags": "overwritten on every release",
     "untagged_digests_days": 30,
     "version_tags": "maintainer-deletion-only"

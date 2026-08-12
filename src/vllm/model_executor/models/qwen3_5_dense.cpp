@@ -6,6 +6,7 @@
 // over the shared DevicePool/matmul/GDN helpers; this TU only wires it into the
 // registry. Extracted verbatim (behavior-preserving) from the former
 // model_registry.cpp monolith.
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <cstdlib>
@@ -142,12 +143,6 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
   // SPEC-DFLASH D1 (DF-AUX-TAPS): non-null routes to ForwardDeviceMultiTap
   // (byte-identical logits + the [T,H×taps] aux capture); null is byte-identical to
   // the path below. Mutually exclusive with hidden_tap.
-  if (input.aux_tap != nullptr) {
-    return Qwen3_5DenseModel::ForwardDeviceMultiTap(
-        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-        input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-        input.aux_tap, input.logits_indices);
-  }
 
   // vLLM's CUDA-graph selection is independent of weight quantization. The
   // driver below already captures the shared dense forward, so restricting it
@@ -156,7 +151,36 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
       platforms::GetPlatform(input.queue.device.type).support_static_graph_mode();
   constexpr int kMaxDecodeGraphBatch = 64;
 
-  if (DenseDecodeGraphEnabled() && input.pure_decode && graph_cuda &&
+  // SPEC-DSPARK W8 (#442): mirror vLLM's UNIFORM-decode predicate instead of
+  // "query_len == 1". Upstream's captured decode length is
+  // `1 + num_speculative_tokens` (cudagraph_dispatcher.py:37), so its T=1+k
+  // speculative VERIFY is graph-captured; ours fell to the eager path EVERY step,
+  // which the paired 35B measurement charged at ~4.8 ms/step (0.870x where
+  // acceptance is high). With num_speculative_tokens == 0 this is exactly
+  // `pure_decode`, so the non-spec path is unchanged.
+  // DEFAULT ON. The staging defect that forced this off is fixed: the captured
+  // graph reads gdn_spec_* / num_accepted, which StageSpecStepInputs now refills
+  // per step, and the per-request arrays are sized by the REQUEST count rather
+  // than the token count. Gated green with capture ON and OFF across the MTP,
+  // DFlash, 35B and concurrent e2e suites, and measured +8.5% / +4.7% on the 35B
+  // cells (0.870x -> 0.986x of the pinned graphed oracle on the high-acceptance
+  // one). VT_SPEC_DECODE_GRAPH=0 restores the eager verify for an A/B.
+  static const bool spec_graph = [] {
+    const char* v = std::getenv("VT_SPEC_DECODE_GRAPH");
+    return v == nullptr || (v[0] != '\0' && v[0] != '0');
+  }();
+  const bool uniform_decode =
+      input.pure_decode ||
+      (spec_graph && input.num_speculative_tokens > 0 && input.gdn_meta.num_prefill_tokens == 0 &&
+       v1::IsUniformDecodeBatch(input.num_reqs, input.attn_meta.num_actual_tokens,
+                                input.attn_meta.max_query_len,
+                                input.num_speculative_tokens) &&
+       // The captured region emits EVERY row, so only a no-op gather may take it.
+       // A spec verify needs all 1+k rows anyway, so this holds there.
+       (input.logits_indices.empty() ||
+        static_cast<int64_t>(input.logits_indices.size()) ==
+            input.attn_meta.num_actual_tokens));
+  if (DenseDecodeGraphEnabled() && uniform_decode && graph_cuda &&
       input.num_reqs <= kMaxDecodeGraphBatch) {
     if (!qwen.decode_graph()) {
       qwen.decode_graph() = std::make_unique<Qwen3_5DenseDecodeGraph>(
@@ -164,9 +188,20 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
     }
     return qwen.decode_graph()->Step(
         input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-        input.attn_kv, input.gdn_state);
+        input.attn_kv, input.gdn_state, input.aux_tap);
   }
 
+  // SPEC-DSPARK W8 (#442): the aux multi-tap forward is the DFlash/DSpark
+  // VERIFY path, and it used to return BEFORE the decode-graph gate, which is
+  // why the T=1+k verify never captured. The graph branch above now serves it
+  // (writing the taps into the slot's persistent buffer); this remains the
+  // eager fallback for every batch the graph declines.
+  if (input.aux_tap != nullptr) {
+    return Qwen3_5DenseModel::ForwardDeviceMultiTap(
+        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
+        input.attn_kv, input.gdn_state, weights, input.config, input.queue,
+        input.aux_tap, input.logits_indices);
+  }
   if (input.gather_logits) {
     return Qwen3_5DenseModel::ForwardDevice(
         input.token_ids, input.positions, input.attn_meta, input.gdn_meta,

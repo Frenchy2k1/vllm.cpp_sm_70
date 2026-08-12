@@ -195,3 +195,119 @@ TEST_CASE("shape and range violations are refused") {
   CHECK_THROWS_AS(SampleDsparkBlockDrafts(good, {static_cast<int32_t>(kV)}, layout, w, q),
                   std::exception);
 }
+
+// ---- W7 (#436): the device sequential sampler ------------------------------
+//
+// The host loop downloads [num_reqs, draft_vocab] f32 and scans it once per
+// step, measured at 10.5 ms of a 37.9 ms draft step on the 27B lane (28%).
+// SampleSequentialDevice keeps the bias and the argmax on device. It is a pure
+// COST move, so the bar is exact token identity, not "close": these cases run
+// both paths over the same inputs and compare ids.
+
+TEST_CASE("device sequential sampling is TOKEN-IDENTICAL to the host loop") {
+  vt::Queue q = Cpu();
+  const Qwen3DSparkWeights w = ChainWeights();
+
+  // Both layouts, several batch sizes: the device path computes its base row as
+  // r*nqpr + first_sample_offset + i and must agree with the host indexing for
+  // each, which is where an off-by-one would hide.
+  for (bool from_anchor : {true, false}) {
+    for (int num_reqs : {1, 2, 3}) {
+      DsparkBlockLayout layout;
+      layout.num_speculative_steps = 4;
+      layout.sample_from_anchor = from_anchor;
+      const int nqpr = layout.num_query_per_req();
+      const std::vector<float> logits = BaseLogits(num_reqs, nqpr);
+      std::vector<int32_t> anchors;
+      for (int r = 0; r < num_reqs; ++r) anchors.push_back((r * 2) % static_cast<int>(kV));
+
+      const auto device = Qwen3DSparkModel::SampleSequentialDevice(
+          logits, anchors, nqpr, layout.first_sample_offset(),
+          layout.num_speculative_steps, w, q);
+      const auto host = SampleDsparkBlockDrafts(logits, anchors, layout, w, q);
+
+      REQUIRE(device.size() == host.size());
+      for (size_t r = 0; r < host.size(); ++r) {
+        CHECK(device[r] == host[r]);
+      }
+    }
+  }
+}
+
+TEST_CASE("device sampling reproduces the chain, not just the parallel argmax") {
+  // Guards against a device path that silently drops the Markov bias and still
+  // "matches" because the base argmax happens to agree: with ChainWeights the
+  // bias DOMINATES (kBig vs 1.0), so each step must be (prev + 1) % kV. A zero
+  // head must instead give the plain per-row argmax, and the two must DIFFER.
+  vt::Queue q = Cpu();
+  DsparkBlockLayout layout;
+  layout.num_speculative_steps = 4;
+  layout.sample_from_anchor = true;
+  const int nqpr = layout.num_query_per_req();
+  const std::vector<float> logits = BaseLogits(1, nqpr);
+  const std::vector<int32_t> anchors = {1};
+
+  const auto chained = Qwen3DSparkModel::SampleSequentialDevice(
+      logits, anchors, nqpr, layout.first_sample_offset(),
+      layout.num_speculative_steps, ChainWeights(), q);
+  REQUIRE(chained.size() == 1);
+  int32_t expect = anchors[0];
+  for (int i = 0; i < layout.num_speculative_steps; ++i) {
+    expect = static_cast<int32_t>((expect + 1) % kV);
+    CHECK(chained[0][static_cast<size_t>(i)] == expect);
+  }
+
+  const auto flat = Qwen3DSparkModel::SampleSequentialDevice(
+      logits, anchors, nqpr, layout.first_sample_offset(),
+      layout.num_speculative_steps, ZeroHeadWeights(), q);
+  CHECK(flat[0] != chained[0]);
+}
+
+TEST_CASE("device sampling maps a reduced draft vocab through d2t") {
+  // The device argmax runs over draft-vocab columns; the emitted id must still
+  // be the TARGET id (draft + d2t[draft]), exactly as the host path emits.
+  vt::Queue q = Cpu();
+  Qwen3DSparkWeights w = ChainWeights();
+  w.draft_vocab_size = 3;
+  w.backbone.draft_vocab_size = 3;
+  std::vector<float> w2(static_cast<size_t>(3 * kV), 0.0f);
+  for (int64_t p = 0; p < kV; ++p) w2[static_cast<size_t>(((p + 1) % 3) * kV + p)] = kBig;
+  w.markov_w2 = MkBf16({3, kV}, w2, /*nk=*/true);
+  w.draft_id_to_target_id = {2, 2, 2};  // OFFSETS: draft d -> target d + 2
+
+  DsparkBlockLayout layout;
+  layout.num_speculative_steps = 3;
+  layout.sample_from_anchor = true;
+  const int nqpr = layout.num_query_per_req();
+  std::vector<float> logits(static_cast<size_t>(nqpr) * 3, 0.0f);
+  const std::vector<int32_t> anchors = {0};
+
+  const auto device = Qwen3DSparkModel::SampleSequentialDevice(
+      logits, anchors, nqpr, layout.first_sample_offset(),
+      layout.num_speculative_steps, w, q);
+  const auto host = SampleDsparkBlockDrafts(logits, anchors, layout, w, q);
+  CHECK(device[0] == host[0]);
+  for (int32_t id : device[0]) CHECK(id >= 2);  // every id went through the +2 offset
+}
+
+TEST_CASE("the device sampler refuses what it cannot reproduce") {
+  vt::Queue q = Cpu();
+  Qwen3DSparkWeights w = ChainWeights();
+  CHECK(Qwen3DSparkModel::CanSampleOnDevice(w));
+
+  // The host path scales the BIAS ONLY by logit_scale; the device composition
+  // does not, so a non-unit scale must route back to the host loop rather than
+  // silently produce different tokens.
+  w.logit_scale = 2.0f;
+  CHECK_FALSE(Qwen3DSparkModel::CanSampleOnDevice(w));
+  CHECK_THROWS(Qwen3DSparkModel::SampleSequentialDevice(
+      BaseLogits(1, 4), std::vector<int32_t>{0}, 4, 0, 4, w, q));
+
+  // And the shape contract is enforced, not assumed.
+  Qwen3DSparkWeights ok = ChainWeights();
+  CHECK_THROWS(Qwen3DSparkModel::SampleSequentialDevice(
+      BaseLogits(1, 4), std::vector<int32_t>{0}, 4, /*first_sample_offset=*/2,
+      /*num_spec=*/4, ok, q));  // 2 + 4 > 4 rows
+  CHECK_THROWS(Qwen3DSparkModel::SampleSequentialDevice(
+      BaseLogits(1, 4), std::vector<int32_t>{0}, /*nqpr=*/5, 0, 4, ok, q));  // size mismatch
+}

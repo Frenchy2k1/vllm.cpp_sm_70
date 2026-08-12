@@ -66,6 +66,17 @@ endif()
 
 # The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
 if(VLLM_CPP_SERVER)
+  # vllm-video-studio: a STANDALONE browser console for MiniMax-H3, deliberately
+  # SEPARATE from the API server. examples/server is the OpenAI-compatible API
+  # surface and a UI does not belong in it; this owns its own endpoints and
+  # drives the public C ABI (vllm_video_*) like any FFI consumer would. It shares
+  # the server's gate only because it uses the same vendored httplib transport.
+  add_executable(video-studio video_studio/main.cpp)
+  target_link_libraries(video-studio PRIVATE vllm::shared)
+  target_include_directories(video-studio SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
+  set_target_properties(video-studio PROPERTIES OUTPUT_NAME vllm-video-studio)
+  vllm_cpp_set_warnings(video-studio)
+
   add_executable(server server/main.cpp)
   # ARCH-ONE-SURFACE: server/main.cpp is a THIN CLIENT of the public C ABI
   # (vllm_server_main, v17) -- it includes vllm.h and nothing else.  The release
@@ -129,7 +140,7 @@ if(VLLM_CPP_SERVER)
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _vllm_server_arch)
   set(_vllm_server_artifact_backend "${_vllm_server_backend}")
   if(VLLM_CPP_CUDA)
-    set(_vllm_server_artifact_backend cuda-fat)
+    set(_vllm_server_artifact_backend cuda)
   elseif(VLLM_CPP_LITERAL_STATIC)
     set(_vllm_server_artifact_backend cpu-static)
   endif()

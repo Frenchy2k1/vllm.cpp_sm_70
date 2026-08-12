@@ -248,6 +248,15 @@ class RocmBackend final : public Backend {
 
   bool UnifiedMemory() const override { return unified_memory_; }
 
+  bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes) const override {
+    size_t free_b = 0, tot_b = 0;
+    if (hipSetDevice(device_) != hipSuccess) return false;
+    if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return false;
+    if (free_bytes) *free_bytes = free_b;
+    if (total_bytes) *total_bytes = tot_b;
+    return true;
+  }
+
  private:
   int device_ = 0;
   bool unified_memory_ = false;

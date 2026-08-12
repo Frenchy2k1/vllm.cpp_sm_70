@@ -203,7 +203,11 @@ MATRICES = {
     # 80 since 2026-08-09: +`BACKEND-TENSTORRENT`, an extension platform
     # proposal (Tenstorrent Blackhole, ttnn C++ adapter) in the same class as
     # Metal/Vulkan. INVENTORIED; spec-only, not yet reviewed or accepted.
-    "BACKEND": (AGENTS / "backend-matrix.md", 80),
+    # 81 since 2026-08-11: +`BACKEND-TENSTORRENT-RESIDUAL-GOLDEN`, the child
+    # row owing residual-RMS numerics evidence at the device boundary (rows>=32
+    # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
+    # RED-first probe lands.
+    "BACKEND": (AGENTS / "backend-matrix.md", 81),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -351,8 +355,20 @@ ENGINE_PREFIXES = (
 # marched every PR into it. User-directed, issue #374; `ACTIVE` on its committed
 # spec. No checker semantic beyond the row's own scope and no product source is
 # changed by the bump.
+# 150 since 2026-08-11: +`ENG-TRAILER-MERGE-ARTIFACTS` (the trailer gate rejects
+# correct commits because GitHub appends `Co-authored-by:` as a separate
+# paragraph, which hides the block from `git interpret-trailers --parse`; 13 of
+# the last 30 commits on main failed the check, unnoticed because those runs were
+# cancelled). User-directed, issue #406; `ACTIVE` on its committed spec. No rule
+# in that checker is relaxed and no product source changes.
+# 151 since 2026-08-11: +`ENG-FORGE-COAUTHOR` (the forbidden-AI-trailer rule was
+# catching GitHub's auto-generated `Co-authored-by`, which attributes the ACCOUNT
+# that opened the PR rather than claiming a model wrote the code; most PRs here
+# are bot-opened, so nearly every squash red main). Developer-approved,
+# issue #418; `ACTIVE` on its committed spec. Sign-off keeps its rule with no
+# exemption and no product source changes.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 149
+ENGINE_ROWS = 151
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

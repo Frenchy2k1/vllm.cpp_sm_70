@@ -42,6 +42,24 @@ def moving_pairs(matrix: dict, version: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def main_pairs(matrix: dict) -> list[tuple[str, str]]:
+    """`<immutable source> <main tag>` pairs for a publish from main.
+
+    Main images are a convenience, not a release: they move, they carry no
+    support claim, and they must never touch `latest*` or a version tag.
+    """
+    package = matrix["package"]
+    return [
+        (f"{package}:{lane['id']}", f"{package}:{lane['main_tag']}")
+        for lane in matrix["lanes"]
+    ]
+
+
+def main_tags(matrix: dict) -> list[str]:
+    package = matrix["package"]
+    return [f"{package}:{lane['main_tag']}" for lane in matrix["lanes"]]
+
+
 def lane_ids(matrix: dict) -> list[str]:
     return [lane["id"] for lane in matrix["lanes"]]
 
@@ -86,12 +104,17 @@ def main() -> int:
     view.add_argument("--moving", action="store_true")
     view.add_argument("--lanes", action="store_true")
     view.add_argument("--build-matrix", action="store_true")
+    view.add_argument("--main-tags", action="store_true")
     args = parser.parse_args()
 
     matrix = json.loads(args.matrix.read_text(encoding="utf-8"))
 
     if args.lanes:
         print("\n".join(lane_ids(matrix)))
+        return 0
+
+    if args.main_tags:
+        print("\n".join(main_tags(matrix)))
         return 0
 
     if args.build_matrix:

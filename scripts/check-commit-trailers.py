@@ -35,6 +35,19 @@ AI_AUTHORSHIP_TOKENS = (
     "llm",
     "openai",
 )
+# GitHub writes this address for the ACCOUNT that opened a pull request when it
+# composes a squash-merge message. It is attribution of a submitter, not a claim
+# that a model authored the change -- that claim lives in AI-Assisted and
+# Assisted-by, which are checked above and unaffected here (#418).
+#
+# The exemption is keyed on the FORGE'S OWN DOMAIN rather than on the name, so it
+# cannot be borrowed: a hand-written `Co-authored-by: Claude <claude@anthropic.com>`
+# still fails, and Signed-off-by is never exempted at all, because a sign-off is a
+# legal assertion rather than attribution.
+FORGE_ACCOUNT_EMAIL = re.compile(
+    r"<[^>]*@users\.noreply\.github\.com>\s*$", re.IGNORECASE
+)
+
 AI_IDENTITY = re.compile(
     r"(?<![a-z0-9])(?:"
     + "|".join(re.escape(token) for token in AI_AUTHORSHIP_TOKENS)
@@ -57,12 +70,54 @@ def _git(repo: Path, *args: str, input_text: str | None = None) -> str:
     return result.stdout.strip()
 
 
+TRAILER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t].+$")
+CONTINUATION_LINE = re.compile(r"^[ \t]+\S")
+
+
+def _is_trailer_paragraph(paragraph: str) -> bool:
+    """Whether every line of a paragraph is trailer-shaped."""
+    lines = [line for line in paragraph.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if not TRAILER_LINE.match(lines[0]):
+        return False
+    return all(
+        TRAILER_LINE.match(line) or CONTINUATION_LINE.match(line) for line in lines[1:]
+    )
+
+
+def join_trailing_trailer_paragraphs(message: str) -> str:
+    """Fuse consecutive trailer-shaped paragraphs at the END into one block.
+
+    `git interpret-trailers --parse` reads ONLY the final paragraph, so anything
+    appended after the trailer block hides it completely. GitHub does exactly
+    that on a squash merge: it adds `Co-authored-by:` as a new paragraph, and the
+    protocol trailers above it stop being visible. Measured on main: dbd0d51c,
+    87308dea and f64f2b71 all parse to nothing but that one line, and the gate
+    reported them as missing trailers they plainly carry (#406).
+
+    Only TRAILER-SHAPED paragraphs are fused. A prose paragraph still terminates
+    the block, so trailers buried mid-message remain invalid -- the looseness
+    this gate exists to prevent is untouched.
+    """
+    paragraphs = _paragraphs(message)
+    if not paragraphs:
+        return message
+    fused: list[str] = []
+    while paragraphs and _is_trailer_paragraph(paragraphs[-1]):
+        fused.insert(0, paragraphs.pop())
+    if len(fused) < 2:
+        return message
+    return "\n\n".join(paragraphs + ["\n".join(fused)])
+
+
 def parsed_trailers(message: str) -> str:
-    """Return exactly what ``git interpret-trailers --parse`` returns."""
+    """Return what ``git interpret-trailers --parse`` returns, after fusing any
+    trailer-shaped paragraphs appended below the block (see the helper above)."""
 
     result = subprocess.run(
         ["git", "interpret-trailers", "--parse"],
-        input=message,
+        input=join_trailing_trailer_paragraphs(message),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -143,6 +198,9 @@ def _strict_errors(message: str) -> list[str]:
         )
     for key in ("signed-off-by", "co-authored-by"):
         for original, value in trailers.get(key, []):
+            if key == "co-authored-by" and FORGE_ACCOUNT_EMAIL.search(value):
+                # Forge-generated attribution of the submitting account.
+                continue
             folded_value = value.casefold()
             if AI_IDENTITY.search(value) or any(
                 identity in folded_value for identity in assisted_identities

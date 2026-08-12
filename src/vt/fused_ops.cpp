@@ -140,6 +140,23 @@ void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,
   throw std::runtime_error("vt::MatmulBTFp8Channel: ROCm-only in this build");
 }
 
+void DequantFp8ChannelBf16(Queue& q, void* out_bf16, const void* fp8, const void* scale_bf16,
+                           int N, int K) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    rocm::DequantFp8ChannelBf16Rocm(q, out_bf16, fp8, scale_bf16, N, K);
+    return;
+  }
+#endif
+  (void)q;
+  (void)out_bf16;
+  (void)fp8;
+  (void)scale_bf16;
+  (void)N;
+  (void)K;
+  throw std::runtime_error("vt::DequantFp8ChannelBf16: ROCm-only in this build");
+}
+
 bool ExpertGeGLUBf16TopKM1(Queue& q, void* ysum, const void* x, const void* const* w_gu,
                            const void* const* w_dn, const float* wts, int G, int I, int H) {
 #if defined(VLLM_CPP_HIP)
@@ -157,6 +174,110 @@ bool ExpertGeGLUBf16TopKM1(Queue& q, void* ysum, const void* x, const void* cons
   (void)I;
   (void)H;
   return false;
+}
+
+bool ExpertGeGLUFp8TopKM1(Queue& q, void* ysum, const void* x, const void* const* fp8_gu,
+                          const void* const* s_gu, const void* const* fp8_dn,
+                          const void* const* s_dn, const float* wts, int G, int I, int H) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    return rocm::ExpertGeGLUFp8TopKM1Rocm(q, ysum, x, fp8_gu, s_gu, fp8_dn, s_dn, wts, G, I, H);
+  }
+#endif
+  (void)q;
+  (void)ysum;
+  (void)x;
+  (void)fp8_gu;
+  (void)s_gu;
+  (void)fp8_dn;
+  (void)s_dn;
+  (void)wts;
+  (void)G;
+  (void)I;
+  (void)H;
+  return false;
+}
+
+bool ExpertGeGLUFp8TopKIndexed(Queue& q, void* ysum, const void* x, const void* gu_base,
+                               const void* dn_base, const void* sgu_base, const void* sdn_base,
+                               const int32_t* idx_dev, const float* wts_dev, int G, int I, int H) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    return rocm::ExpertGeGLUFp8TopKIndexedRocm(q, ysum, x, gu_base, dn_base, sgu_base, sdn_base,
+                                               idx_dev, wts_dev, G, I, H);
+  }
+#endif
+  (void)q; (void)ysum; (void)x; (void)gu_base; (void)dn_base; (void)sgu_base; (void)sdn_base;
+  (void)idx_dev; (void)wts_dev; (void)G; (void)I; (void)H;
+  return false;
+}
+
+void ApplyExpertScaleRw(Queue& q, float* rw_dev, const int32_t* ri_dev, const float* escale_dev,
+                        int G, int E) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    rocm::ApplyExpertScaleRwRocm(q, rw_dev, ri_dev, escale_dev, G, E);
+    return;
+  }
+#endif
+  (void)q; (void)rw_dev; (void)ri_dev; (void)escale_dev; (void)G; (void)E;
+}
+
+bool PrewarmExpertGeGLUFp8TopK(int dev, int G, int I, int H) {
+#if defined(VLLM_CPP_HIP)
+  return rocm::PrewarmExpertGeGLUFp8TopKIndexedRocm(dev, G, I, H);
+#else
+  (void)dev; (void)G; (void)I; (void)H;
+  return false;
+#endif
+}
+
+void MoeGatherRows(Queue& q, void* out_bf16, const void* in_bf16, const int32_t* token_ids_dev,
+                   int n, int H) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    rocm::MoeGatherRowsRocm(q, out_bf16, in_bf16, token_ids_dev, n, H);
+    return;
+  }
+#endif
+  (void)q;
+  (void)out_bf16;
+  (void)in_bf16;
+  (void)token_ids_dev;
+  (void)n;
+  (void)H;
+  throw std::runtime_error("vt::MoeGatherRows: ROCm-only in this build");
+}
+
+void MoeWeightedScatterAdd(Queue& q, void* acc_bf16, const void* y_bf16,
+                           const int32_t* token_ids_dev, const float* weights_dev, int n, int H) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    rocm::MoeWeightedScatterAddRocm(q, acc_bf16, y_bf16, token_ids_dev, weights_dev, n, H);
+    return;
+  }
+#endif
+  (void)q;
+  (void)acc_bf16;
+  (void)y_bf16;
+  (void)token_ids_dev;
+  (void)weights_dev;
+  (void)n;
+  (void)H;
+  throw std::runtime_error("vt::MoeWeightedScatterAdd: ROCm-only in this build");
+}
+
+void MoeZeroBf16(Queue& q, void* buf_bf16, int64_t nelem) {
+#if defined(VLLM_CPP_HIP)
+  if (q.device.type == DeviceType::kROCM) {
+    rocm::MoeZeroBf16Rocm(q, buf_bf16, nelem);
+    return;
+  }
+#endif
+  (void)q;
+  (void)buf_bf16;
+  (void)nelem;
+  throw std::runtime_error("vt::MoeZeroBf16: ROCm-only in this build");
 }
 
 }  // namespace vt

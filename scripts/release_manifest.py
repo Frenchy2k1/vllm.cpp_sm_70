@@ -337,8 +337,8 @@ def _artifact_policy(manifest: dict[str, Any]) -> list[str]:
     policies = {
         "linux-x86_64-glibc-cpu": ("linux", "x86_64", "glibc", "cpu", "static-core", {"preview", "stable"}),
         "linux-aarch64-glibc-cpu": ("linux", "aarch64", "glibc", "cpu", "static-core", {"preview", "stable"}),
-        "linux-x86_64-glibc-cuda-fat": ("linux", "x86_64", "glibc", "cuda", "static-core", {"preview", "stable"}),
-        "linux-aarch64-glibc-cuda-fat": ("linux", "aarch64", "glibc", "cuda", "static-core", {"preview", "stable"}),
+        "linux-x86_64-glibc-cuda": ("linux", "x86_64", "glibc", "cuda", "static-core", {"preview", "stable"}),
+        "linux-aarch64-glibc-cuda": ("linux", "aarch64", "glibc", "cuda", "static-core", {"preview", "stable"}),
         "macos-arm64-metal": ("macos", "aarch64", "macos", "metal", "static-core", {"preview", "stable"}),
         "macos-arm64-metal-mlx": ("macos", "aarch64", "macos", "mlx", "static-core", {"preview"}),
         "linux-x86_64-glibc-vulkan": ("linux", "x86_64", "glibc", "vulkan", "static-core", {"preview"}),

@@ -1178,6 +1178,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       .num_reqs = num_reqs,
       .gdn_state_slots = gdn_state_slots_,
       .pure_decode = pure_decode,
+      // SPEC-DSPARK W8 (#442): the decode-graph gate mirrors vLLM's UNIFORM
+      // decode predicate, whose captured length is 1 + num_speculative_tokens
+      // (cudagraph_dispatcher.py:37). 0 when speculation is off, which makes
+      // the predicate reduce to today's pure-decode shape.
+      .num_speculative_tokens = num_spec(),
       .gather_logits = gather,
       // SPEC-MTP I5d: capture the target's post-final-norm [T,H] hidden for the
       // MTP drafter. Non-null only when a speculator is configured — the Qwen3.5

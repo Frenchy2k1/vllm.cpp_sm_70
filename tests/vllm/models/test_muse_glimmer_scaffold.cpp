@@ -229,9 +229,22 @@ TEST_CASE("MuseGlimmer: the query pre-scale agrees across BOTH config schemas") 
   // An explicit scale_query_by is already final and wins outright.
   CHECK(ResolveMuseGlimmerQueryPreScale(43.784, true, 2.5, true, head_dim) ==
         doctest::Approx(2.5));
-  // No scale info at all degrades to the identity, not to 0.
+
+  // ── ABSENT is NOT "no scaling" (issue #412) ────────────────────────────────
+  // `qk_scale_factor` is a class default in BOTH references, not a required key:
+  // configs/muse_glimmer.py:62 and SGLang srt/configs/muse_glimmer.py:98 both ship
+  // 43.7840518911, which folds to EXACTLY 3.87 at the released head_dim 128
+  // (11.31370849898476 * 3.87 = 43.7840518911). The DFlash drafter's released
+  // config.json omits the key, so the identity here would run its queries ~3.87x
+  // too small with `use_qk_norm` still on — coherent text, collapsed acceptance.
   CHECK(ResolveMuseGlimmerQueryPreScale(0.0, false, 0.0, false, head_dim) ==
+        doctest::Approx(3.87).epsilon(1e-9));
+  CHECK(ResolveMuseGlimmerQueryPreScale(0.0, false, 0.0, false, head_dim) !=
         doctest::Approx(1.0));
+  // It runs through the SAME magnitude disambiguation, so it is the native value
+  // that is defaulted, not the folded one: at head_dim 4 the fold is by 2.
+  CHECK(ResolveMuseGlimmerQueryPreScale(0.0, false, 0.0, false, 4) ==
+        doctest::Approx(43.7840518911 / 2.0));
 }
 
 TEST_CASE("MuseGlimmer: qk-norm and the output gate default ON when ABSENT") {
@@ -248,6 +261,19 @@ TEST_CASE("MuseGlimmer: qk-norm and the output gate default ON when ABSENT") {
   const MuseGlimmerParams disabled = ParseMuseGlimmerParams(off);
   CHECK_FALSE(disabled.text.use_qk_norm);
   CHECK_FALSE(disabled.text.use_attn_output_gate);
+
+  // THE SAME TRAP, third field (#405). `normalize_tok_embeddings` is ABSENT
+  // from the released config too, and upstream defaults it TRUE
+  // (configs/muse_glimmer.py:66; SGLang srt/configs/muse_glimmer.py:100 agrees
+  // independently). We defaulted it false, which made `perception_emb_norm` a
+  // silent no-op on the vision path.
+  //
+  // The wiring gate drives that norm by setting the flag EXPLICITLY, so it
+  // exercised the mechanism and never the DEFAULT — and the default is the only
+  // case a released checkpoint actually hits.
+  CHECK(absent.text.normalize_tok_embeddings);
+  off.raw["text_config"]["normalize_tok_embeddings"] = false;
+  CHECK_FALSE(ParseMuseGlimmerParams(off).text.normalize_tok_embeddings);
 }
 
 TEST_CASE("MuseGlimmer: the iRoPE mask counts BACKWARD from the last layer") {

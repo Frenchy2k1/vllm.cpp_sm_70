@@ -18244,6 +18244,81 @@ located. They establish **nothing** about how fast vllm.cpp runs Muse Glimmer,
 nothing about how it compares to any engine, and nothing about vLLM — which
 remains the only bar that counts and remains unavailable. **No ceiling is
 claimed or implied anywhere in this entry.**
+
+## 27B NVFP4 canonical SIX-POINT regrid, and the two grids that disagree (2026-08-11, main `348c265d`, GB10)
+
+Issue: [#349](https://github.com/mudler/vllm.cpp/issues/349).
+
+Canonical driver, model key `27n`, SAME SHA and SAME build (`build-gate2`) as the
+recorded c1-c8 cells, so all six points form one coherent grid. Corpus
+regenerated with this checkpoint's own tokenizer. Model gate passed token-exact
+16/16 vs vLLM before any timing.
+
+| | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| ours tok/s (n=3) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
+| vLLM tok/s (n=3) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
+| ratio | 0.9561x | 0.9543x | 0.9441x | 0.9414x | 0.9443x | 0.9371x |
+| ours spread | 1.005 | 1.006 | 1.006 | 1.001 | 1.004 | 1.006 |
+| vLLM spread | 1.006 | 1.006 | 1.005 | 1.005 | 1.003 | 1.004 |
+
+Driver verdict `{"gate_pass": false}`. No cell at or above parity.
+
+Superseded rows moved here from the scoreboard to stay inside its budget:
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| TPOT / TTFT ratio (2026-08-10) | 1.2245 / 1.0077 | 1.1902 / 1.1111 | 1.2313 / 0.9722 | 1.2250 / 0.9992 |
+| prior ad-hoc ratio | 0.847x | 0.861x | 0.853x | 0.843x |
+| before the FP8 tower fix (tok/s) | 8.76 | 17.07 | 33.01 | 62.13 |
+| leg spread ours / vLLM (regrid) | 1.005 / 1.006 | 1.006 / 1.006 | 1.006 / 1.005 | 1.001 / 1.005 |
+
+### The published grid does not reproduce
+
+| arm, c1 | 2026-08-10 | 2026-08-11 | delta |
+|---|---:|---:|---:|
+| vLLM | 11.3646 | 11.250 | 1.0% |
+| ours | 9.366 | 10.756 | **+14.8%** |
+| ratio | 0.8384x | 0.9561x | +0.118 |
+
+Same SHA, same driver, same box. The denominator reproduces to 1%; our own arm
+moved ~15%. A third value exists for our c1 (8.1176, the no-lever floor of
+[#319](https://github.com/mudler/vllm.cpp/issues/319)), giving an 8.12-10.76
+span (32%) while vLLM stays inside 1%. The SHAPE also inverts: c1 was the WORST
+cell and is now the BEST. There is no c1 cliff.
+
+### Refuted: a per-load residency lottery
+
+Both grids are internally tight (08-10 spreads 1.0013-1.0068; regrid 1.001-1.006)
+yet disagree by 15%, which looks like a state fixed per server lifetime. Tested:
+ONE identical binary, 6 cold loads, page cache dropped before each.
+
+```
+11.7933  11.7642  11.7573  11.7541  11.7392  11.7484   (batch-1 tok/s)
+min 11.739  max 11.793  spread 1.0046x  -> SINGLE MODE
+```
+
+0.46% reload-to-reload, ~30x smaller than the cross-grid delta. Not a lottery,
+and not per-load nondeterminism at this magnitude. (Absolute values are not
+comparable to the grid: 5-token prompt, decode-dominated. It tests VARIANCE of
+one fixed method and must not be quoted as a ratio.)
+
+Leading remaining candidate is a BUILD difference. The regrid used
+RelWithDebInfo, `VLLM_CPP_TRITON=ON`, oracle ninja, flashinfer-bundled CUTLASS,
+`BENCH_PROFILE_CONTROL=OFF`, FA2 marker verified. The 08-10 grid records its
+recipe only as "same recipe as the pre-lever binding grid". This project has a
+recorded incident of a bench tree silently omitting `-DVLLM_CPP_TRITON=ON`, and
+another of a degraded CUTLASS build drifting near-tie gates. Settle it from that
+grid's configure log, not by re-measuring.
+
+### What this retracts
+
+"THE OPEN PROBLEM: c1 did not move" is withdrawn as a statement about the
+levers. Both demonstrably executed. Any per-lever attribution taken at c1 before
+2026-08-11 is noise-dominated, including the four-decimal pre-lever attribution
+(lm_head 8.6414 + fp8 tower 7.6068 of 17.3292), which
+[#339](https://github.com/mudler/vllm.cpp/issues/339) independently found
+mis-assigned its terms.
 ## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
 
 **Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
@@ -19093,3 +19168,338 @@ Superseded by, and still on the page:
 The moved row:
 
 | Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **Both arms measured, same weights.** 0.6B @128-in/32-out: llama.cpp Vulkan **11,956** pp / **174.8** tg; ours **575** pp / **66.6** tg | Decode **8.59 -> 91.7 t/s** (**10.7x**), 6/6 exact; **2.62x** off llama.cpp at matched shape. CUDA arm unblocked. 27B: fallbacks **11->5**. paged_attn batching REFUTED ([plan](../.agents/specs/bench-27b-five-way.md)) |
+
+## CPU decode barrier — the never-yielding spin-wait was a scheduler cliff (2026-08-11, `PERF-CPU-BARRIER`, issue [#391](https://github.com/mudler/vllm.cpp/issues/391))
+
+Lever 1 of spec `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md` §2. The
+2026-08-06 profile put **47.15% of CPU decode in threadpool synchronisation**
+and called decode synchronisation-bound. This entry finds the mechanism, fixes
+it, and measures what it did and did not move.
+
+### What the cost actually is on the current tree
+
+Not a slow barrier — a **scheduler cliff**. `Threadpool::Barrier` and
+`::PollForWork` spin without ever yielding (1:1 with ggml-cpu.c:587-589 and
+:3137-3139). The moment the pool is wider than the cores available to it, the
+arrival everyone is waiting for can be off-CPU while every other worker burns a
+core spinning, so each dispatch costs a full scheduler timeslice.
+
+Empty-op dispatch, `taskset -c 0-7`, same binary, `VT_CPU_SPIN_ROUNDS` A/B:
+
+| host | CPUs | pool | never-yield | spin-then-yield | ratio |
+|---|---:|---:|---:|---:|---:|
+| dgx.casa (GB10 aarch64) | 8 | 9 | **4473.30 us** (p50 3001) | **4.92 us** | **909x** |
+| dgx.casa | 20 | 20 (fits) | 1.93 us | 1.95 us @4096 | 1.01x — free |
+| local x86 (exploratory, loaded box) | 8 | 8 (fits) | 1.63-1.84 us | 1.68 us | ~1.0x |
+| local x86 (exploratory, loaded box) | 8 | 9 | 5516-6004 us (p50 6000) | 5.93 us | ~930x |
+
+p50 lands on a whole CFS timeslice, which is the signature. The default pool
+width is `hardware_concurrency()`, so a stock run is over that cliff by way of
+its own async-scheduling and API threads — nothing external required.
+
+Instrumented dispatch attribution on the current tree (opt-125m, 32 greedy
+tokens, 20 threads, local box): **1704 `Threadpool::Run` calls, every single one
+over 1 ms, 11.39 s of an 11.53 s run.** At 12 threads the same 1704 calls cost
+258 ms. That is the cliff, not kernel time.
+
+### The change
+
+Bounded spin, then `sched_yield`, in both waits. `VT_CPU_SPIN_ROUNDS` (default
+4096 aarch64 / 256 elsewhere; `0` restores the never-yield spin for a
+same-binary A/B). A scheduling hint only — no atomic, memory order or fence is
+touched, so it cannot change a computed value.
+
+### Measured: dgx.casa, `muse-glimmer-30B-kquant-17gb.gguf`, both locks held
+
+Host idle at claim (1-min load 1.92 at the gate, `local-ai-worker` exited,
+GPU 0%, `/mnt/nas_share` mounted); `$HOME/gpu.lock` **and** `/tmp/cpu-bench.lock`
+held across the whole series; legs strictly sequential and order-alternated;
+load recorded at every leg boundary (5-21 throughout, all of it our own
+20-thread job). Model copied to local NVMe, md5 `ba8da9b15aed63a1df095cb34f3e7665`,
+16,756,681,056 bytes. Ours = `vllm-bench` `Prefill token throughput (in/TTFT)`
+and `Mean per-stream decode rate`; llama.cpp = `llama-bench` pp/tg at
+`7044859` — the same harness pair, file and thread count as the #333 entry.
+**Two separately built binaries**, not one binary with a flag: A is the pristine
+`cpu_threadpool.cpp`, B is the patched one.
+
+Noise band from repeated identical arm-A legs **before any delta was read**.
+Medians; brackets are min-max and spread as a percentage of the median. No leg
+discarded.
+
+| Workload | Axis | A pristine | B yield | B/A | llama.cpp | A/llama | B/llama |
+|---|---|---:|---:|---:|---:|---:|---:|
+| in128 t=20 | prefill | 11.550 (11.05-12.71, 14.4%) n=7 | 13.455 (13.25-13.86, 4.5%) n=4 | **1.165x** | 13.158 (0.7%) | 0.878x | **1.023x** |
+| in128 t=20 | decode | 1.200 (0.79-1.67, **73.3%**) n=7 | 1.715 (1.62-1.88, 15.2%) n=4 | **1.429x** | 5.026 (5.9%) | 0.239x | 0.341x |
+| in512 t=20 | prefill | 2.270 (2.23-2.29, 2.6%) n=3 | 2.330 (2.32-2.34, 0.9%) n=3 | 1.026x NEUTRAL | 13.292 (0.3%) | 0.171x | 0.175x |
+| in512 t=20 | decode | 0.290 (0.0%) n=3 | 0.990 (0.0%) n=3 | **3.414x** | 5.091 (3.8%) | 0.057x | 0.194x |
+| in128 t=10 | prefill | 10.040 (0.3%) n=3 | 9.930 (1.3%) n=3 | 0.989x NEUTRAL | — | — | — |
+| in128 t=10 | decode | 1.310 (0.8%) n=3 | 1.310 (0.8%) n=3 | 1.000x NEUTRAL | — | — | — |
+
+Raw legs in order — ours A prefill@in128t20 `[12.71, 11.30, 11.27, 11.05, 12.47,
+11.55, 11.82]`, A decode `[1.20, 1.08, 1.21, 1.23, 0.79, 0.83, 1.67]`, B prefill
+`[13.25, 13.86, 13.43, 13.48]`, B decode `[1.62, 1.65, 1.78, 1.88]`. **Every B
+prefill leg is above every A leg**; three of four B decode legs are above every
+A leg.
+
+The A arm reproduces the #333 numbers it is meant to (recorded then: 11.63 /
+1.18 at in128 t20, 2.23 / 0.29 at in512, 9.94 / 1.31 at in128 t10), so the
+baseline is the same baseline.
+
+**Same-binary control.** The patched binary with `VT_CPU_SPIN_ROUNDS=0` lands
+inside the pristine arm's distribution — prefill 11.240 (9.88-11.64), decode
+0.880 (0.41-1.46), n=3 — so the delta is the yield and not the rebuild.
+
+**The variance is a result in itself.** Pristine decode at in128 t=20 spreads
+73.3% (and 119.3% on the `SPIN_ROUNDS=0` control); with the yield it is 15.2%,
+and at in512 it is 0.0% against 0.0%. A timeslice cliff you fall off
+intermittently is exactly what a 73% spread on a deterministic greedy workload
+looks like. The #333 entry already recorded 56.8% there and could not explain it.
+
+### Scaling shape, 128 -> 512 input tokens
+
+| Arm | prefill | decode |
+|---|---|---|
+| llama.cpp | 13.158 -> 13.292 = **1.010x FLAT** | 5.026 -> 5.091 = **1.013x FLAT** |
+| ours, pristine | 11.550 -> 2.270 = 0.197x | 1.200 -> 0.290 = 0.242x |
+| ours, yield | 13.455 -> 2.330 = 0.173x | 1.715 -> 0.990 = **0.577x** |
+
+The decode fall-off more than halves. The prefill fall-off does not move at all:
+in512 prefill is 0.175x of llama.cpp before and after. **That half of the shape
+is not this lever** — it is Lever 2 (paged attention, ~39% of prefill and rising
+with context, spec §3).
+
+### Negative and neutral results, recorded as results
+
+- **t=10 is neutral on both axes** (0.989x / 1.000x). Ten threads on twenty
+  cores never reaches the cliff, so there is nothing to remove — and the yield
+  costs nothing when it is not needed. This is the mechanism confirming itself,
+  and it is why the #333 entry saw *better* decode at t=10 (1.31) than at t=20
+  (1.18) on a 20-core box.
+- **in512 prefill is neutral** (1.026x, inside the 2.6% band).
+- **A pool twice as wide as the cores cannot be fixed by any wait policy.** The
+  first version of the regression test asserted on `cores*2` and failed on the
+  fixed code (ratio 1847): every dispatch must wait for 2x as many threads as
+  there are cores to be scheduled at least once. The test asserts on `cores+1`,
+  which is the regime a stock run is actually in.
+
+### No ceiling
+
+Decode at in512 moves 0.057x -> 0.194x of llama.cpp and stays **5x behind**; the
+gap is open, not closed. Next traceable hypotheses, in order: (1) Lever 2, which
+owns the entire prefill half of the shape; (2) the **per-OP kickoff** itself —
+ggml kicks the pool once per GRAPH and we kick per operation, so we pay a mutex,
+a `notify_all` and an epoch broadcast per op, ~1.9 us at 20 threads *even when
+the pool fits*, which fusing or batching dispatches would amortise; (3) the
+**narrow-dispatch path that already exists and is unused** — `Kickoff(n)` and
+`ThreadReady`'s `ith < n_threads` gate already support activating fewer than
+`n_threads_` workers, but `Run()` always kicks all of them, so a
+`ParallelForRows` over 4 rows still wakes 20 threads (ggml caps this:
+`n_tasks = MIN(n_threads, ggml_nrows(...))`, ggml-cpu.c:2342).
+
+### Correctness
+
+TSan (`-fsanitize=thread`, the `VT_CPU_THREAD_SANITIZER` fence path) over
+`Run`/`Kickoff`/`ComputeThread`/`Barrier`/`ParallelForRows` at 8 and at 21
+threads on 20 cores: **clean, 300 rounds each, every output row visited exactly
+once every round.** The 50-test CPU/op ctest scope: **50/50 pass.** The
+determinism battery (byte-identical outputs at n_threads 1/3/20 over matmul,
+paged attention, MoE router, norms and conv) is unchanged and green.
+
+### x86 corroboration, and the mutation proof for the new test
+
+BLOCKED twice first, and that is part of the record: the shared 20-core dev box
+ran at 1-minute load 116-180 continuously from a sibling agent's gates, and this
+series' own quiet-box gate refused to measure both times with
+`/tmp/cpu-bench.lock` held. It got a window on the third attempt at load 3.86.
+Correctness legs did not need the quiet box and were also run on the loaded one,
+with the same answers.
+
+**Mutation proof.** The regression test run from the PRISTINE tree and from the
+patched tree, back to back, 10 threads (fits) against 21 threads (cores+1) on
+20 cores:
+
+| Arm | 10 threads | 21 threads | ratio | doctest |
+|---|---:|---:|---:|---|
+| pristine r1/r2/r3 | 1.563 / 1.443 / 1.634 us | **5996.39 / 2999.93 / 2999.17 us** | 3836 / 2079 / 1835 | **FAILURE x3** |
+| patched r1/r2/r3 | 1.452 / 1.563 / 1.683 us | 20.13 / 19.69 / 18.19 us | 13.9 / 12.6 / 10.8 | SUCCESS x3 |
+
+The pristine 21-thread numbers are whole CFS timeslices. The test does not
+merely pass on the fix, it fails on the defect by ~20x its own threshold.
+
+**Same-binary cliff, x86**, `taskset -c 0-7`, 5000 dispatches, lock held:
+
+| pool | `VT_CPU_SPIN_ROUNDS=0` | `=256` | ratio |
+|---:|---:|---:|---:|
+| 8 (fits) | 1.44 us (p50 1.35) | 1.84 us (p50 1.57) | 0.78x, a small real cost when it fits |
+| 9 (over by one) | **6003.69 us** (p50 5999.89) | **12.80 us** (p50 12.35) | **469x** |
+
+**opt-125m greedy decode, 20 threads (== nproc), r=5 alternated. INDICATIVE
+ONLY, not binding**: the box was still settling out of the sibling's load
+(1-min 10-13, 5-min 40-45) across this leg, and per `.agents/benchmarking.md`
+that is not a measurement surface for this lever. Recorded because the FAILURE
+MODE is the point, not the ratio. Pristine `[6.643, 3.428, 53.505, 64.606,
+61.533]` tok/s is bimodal: it either falls off the cliff or it does not. Patched
+`[60.329, 81.567, 52.845, 66.384, 57.582]` never does. Medians 53.505 -> 60.329.
+The binding model numbers are the dgx ones above.
+
+### Correctness (continued)
+
+Output identity, pristine binary vs patched binary vs patched with
+`VT_CPU_SPIN_ROUNDS=0`, opt-125m greedy:
+
+| Regime | Result |
+|---|---|
+| M=1, 48 tokens, at 20 threads (the cliff regime) and at 8 | **identical**, md5 `fde5d9b0ff5be038` in all six runs |
+| M>1, 8 prompts x 96 input / 24 output, concurrency 1, 4 and 8 | **token ids byte-identical**, md5 `bd489532b183541b`, and identical ACROSS the three concurrencies |
+
+The full-suite regression sweep is deferred to the orchestrator by instruction.
+
+## SPEC-DSPARK cross-engine A/B vs the pinned graphed oracle (2026-08-11)
+
+Binding replacement for every earlier DSpark oracle arm in this row, all of
+which ran `enforce_eager=True` (forbidden as a denominator). Oracle is the
+PINNED build `~/venvs/vllm-oracle-next` = `0.23.1rc1.dev1511+g555967922`,
+FlashInfer 0.6.15.post1, Torch 2.13.0, transformers 5.14.1, in its production
+graphed configuration.
+
+The first attempt measured the WRONG ORACLE: `~/venvs/vllm-oracle` is a symlink
+to the preserved `v0.25.0-stage` rollback (issue #375's failure mode). The
+harness now asserts commit + FlashInfer and aborts on mismatch. The rollback
+misleads in both directions, its DSpark being far slower than the pin's (35B
+89.8 vs 146.4 tok/s), so those numbers are recorded as non-binding context.
+
+Method: same target + draft + k, `max_num_seqs=2`, greedy, `max_tokens=128`,
+one `flock $HOME/gpu.lock`, `local-ai-worker` parked, cold first run discarded,
+warm repeats. Throughput is `completion_tokens / whole-request wall seconds` on
+both sides (`examples/cli/main.cpp:253-270` vs the oracle's `generate()` wall),
+verified to be the same definition before any ratio was taken.
+
+| lane / prompt | ours | pinned vLLM | ours/vLLM | our speedup | its speedup |
+|---|---|---|---|---|---|
+| 35B spec-off, "capital" (128 tok both) | 71.47 | 73.91 | 0.967x | n/a | n/a |
+| 35B DSpark k=8, "capital" (128 tok both) | 74.10 | 75.92 | 0.976x | 1.037x | 1.027x |
+| 35B DSpark k=8, "fibonacci" (89 tok both) | 134.85 | 146.41 | 0.921x | 1.914x | 2.583x |
+| 27B spec-off, "fibonacci" (126 tok both) | 9.80 | 9.51 | 1.031x | n/a | n/a |
+| 27B DSpark k=15, "fibonacci" | 31.83 | 34.06 | 0.935x | 3.248x | 3.583x |
+| 27B DSpark k=15, "capital" | 17.41 | 49.71 | 0.350x | 1.757x | 5.233x |
+
+Acceptance, upstream's own `vllm:spec_decode_*` counters against ours:
+
+| lane | ours | pinned vLLM | accepted per draft (vLLM) |
+|---|---|---|---|
+| 35B A3B MoE, k=8 | 20.8% | 20.4% (212/1040) | 1.63 of 8 |
+| 27B dense, k=15 | 12.2% | 49.3% (281/570) | 7.39 of 15 |
+
+Verdict: the MoE lane is at near parity with acceptance matching upstream; the
+dense lane is a draft-quality gap, tracked as issue #430. The earlier "dense
+1.77x" reading was a self-speedup, not a cross-engine result, and against the
+real reference the dense lane is the weaker of the two, not the stronger.
+
+Caveat: greedy outputs diverge between arms and between engines on several
+cells, so completion counts differ (27B "fibonacci": ours 128, upstream 52;
+27B "capital": ours 84, upstream 128). Per-token throughput still compares but
+the content differs. The cells where every arm returned identical token counts
+are 35B "capital" (128 everywhere) and 35B DSpark "fibonacci" (89 both), giving
+the 0.92-0.98x readings. On the pinned oracle the 35B spec-on and spec-off
+streams are byte-identical, so upstream's DSpark is lossless on that lane.
+
+Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
+`xengine_ours.log`, `xengine_pinned.log`.
+
+## SPEC-DSPARK W7: device sequential Markov sampling (#436), 2026-08-12
+
+Same binary, only `VT_DSPARK_DEVICE_SAMPLE` differing, one flock, warm repeats,
+cold run discarded, `VT_SPEC_TRACE=1` for the phase split.
+
+| arm | sample ms | warm tok/s | text |
+|---|---|---|---|
+| 27B dense k=15, host loop | 10.44 | 17.31 | - |
+| 27B dense k=15, device | 9.24 | 17.42 | byte-IDENTICAL to host |
+| 35B A3B k=8, host loop | 0.59 | 71.06 | - |
+| 35B A3B k=8, device | 0.50 | 73.3 | byte-IDENTICAL to host |
+
+Byte-identical output on both lanes is the bar: this is a pure cost move, so a
+changed token would void it regardless of the speed delta.
+
+The residual sampling cost is a BANDWIDTH bound, not overhead. `markov_w2` is
+`[draft_vocab, markov_rank]` bf16 and the per-step bias GEMV re-reads all of it:
+27B 15 x 127 MB = 1.9 GB per draft step, 9.3 ms at ~205 GB/s against 9.24 ms
+measured; 35B 8 x 16 MB = 131 MB, 0.6 ms against 0.50 ms measured. Two lanes 13x
+apart in vocab both landing on the bound is not a coincidence. Upstream runs the
+same k sequential GEMVs, so this is not a gap against it, and graph capture
+cannot remove weight traffic.
+
+Unit gate 10 cases / 89 assertions, RED-first proven by MUTATION: dropping
+`first_sample_offset` from the base-row index fails 1 assertion, dropping the
+Markov bias from the sum fails 11 across 2 cases, tree restored byte-for-byte
+after each. Green on the local CPU build and the dgx CUDA build
+(`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`).
+
+Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
+
+## SPEC-DSPARK paired parity re-measure with W7 (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle
+(`g555967922`), same target+draft+k, `max_num_seqs=2`, greedy, matched token
+counts, cold run discarded, ours 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | 0.981x |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | 0.870x |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40, a 0.4%
+spread, so 0.870x is a reading and not noise. The capital cell spreads ~8%, so
+0.981x is the looser of the two.
+
+SPEED PARITY IS NOT MET. W7 removed host-side sampling waste but sampling is
+0.5 ms of this lane's step, so the e2e effect sits inside the capital cell's own
+noise band. The earlier 79.19 tok/s reading was PRE-REBOOT machine state and is
+not a W7 win; on the idle box both engines moved and the oracle moved more.
+Same-session pairing is what makes these rows quotable.
+
+The deficit is largest in the HIGH-ACCEPTANCE regime (0.870x, verify running
+every step) and smallest in the low-acceptance one (0.981x), which points at the
+T=1+k verify forward: both model families gate their decode CUDA graph on
+`input.pure_decode`, so our speculative verify falls off the captured graph and
+runs eager while upstream captures the uniform 1+k shape. Next lever.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
+
+## SPEC-DSPARK W8: the T=1+k verify is CAPTURED (#442), 2026-08-12
+
+Paired against the pinned graphed oracle (`g555967922`) in ONE lock session,
+matched token counts, ours = median of 3 warm reps, cold run discarded.
+
+| 35B cell | before W8 | with capture | pinned vLLM | ratio |
+|---|---|---|---|---|
+| "capital", 128 tok both | 72.23 | 78.37 | 78.76 | 0.995x (was 0.981x) |
+| "fibonacci", 89 tok both | 134.55 | 140.82 | 142.88 | 0.986x (was 0.870x) |
+
+Same-binary A/B (`VT_SPEC_DECODE_GRAPH=0` is the eager verify): +8.5% on the
+capital cell, +4.7% on fibonacci, text byte-identical on both lanes.
+
+NOT >= 1.0x. The residual is ~1.4% against reps that spread 0.3%, so it is a real
+gap, not noise, and the row does not claim parity.
+
+Correctness: the four e2e spec-decode suites pass with capture ON and OFF with
+identical assertion counts (qwen27_spec 9, qwen27_dflash 27, qwen36_spec 9,
+qwen27_concurrent 5); default ON re-verified with the env unset.
+
+The mechanism, mirrored from vLLM: upstream's uniform-decode test is that all
+requests share a query_len, not that it is 1 (cudagraph_utils.py:95-105), and its
+captured decode length is `1 + num_speculative_tokens`
+(cudagraph_dispatcher.py:37), so upstream graphs the verify by construction. Ours
+gated on `num_actual_tokens == num_reqs` and ran it eager EVERY step.
+
+Three defects found on the way, each measured rather than reasoned: the aux
+multi-tap forward returned BEFORE the decode-graph gate (so no predicate could
+reach it); a captured replay re-read the PREVIOUS step's `num_accepted`, giving
+incoherent tokens AND 5x SLOWER (26 vs 136 tok/s) because zero acceptance
+multiplies the step count; and the staging path sized PER-REQUEST arrays by the
+TOKEN count, which is correct only when they are equal. Upstream keys graphs on
+BatchDescriptor(num_tokens, num_reqs, uniform) precisely because speculation
+makes them differ.
+
+Evidence: `dgx:~/work/dspark-w6/parity_w8.log`, `w8b.log`, `gates.log`,
+`final.log`, `pinned_35b_on.json`.

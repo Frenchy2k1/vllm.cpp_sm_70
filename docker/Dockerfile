@@ -146,8 +146,8 @@ ARG JOBS=2
 COPY . /src
 RUN --mount=type=cache,target=/src/build-container-cuda,id=vllm-cpp-container-cuda-$TARGETARCH \
     set -eux; \
-    if [ "$TARGETARCH" = "amd64" ]; then artifact=linux-x86_64-glibc-cuda-fat; \
-    else artifact=linux-aarch64-glibc-cuda-fat; fi; \
+    if [ "$TARGETARCH" = "amd64" ]; then artifact=linux-x86_64-glibc-cuda; \
+    else artifact=linux-aarch64-glibc-cuda; fi; \
     VERSION="${VERSION:-$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)}" \
     SOURCE_SHA="$SOURCE_SHA" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     EVIDENCE_URL="$EVIDENCE_URL" JOBS="$JOBS" \

@@ -15,7 +15,7 @@
 //
 // DEFERRED (T1/T2) upstream fields, intentionally omitted here — a future
 // porter slots them in without reshaping the struct:
-//   - extra_args
+//   (extra_args is now ported below, as a STRING-VALUED slice — KV-EVENTS W3)
 //   (structured_outputs (StructuredOutputsParams) is now ported below — M3.4)
 //   - flat_logprobs
 //   (logprob_token_ids + num_logprobs() are now ported below —
@@ -244,6 +244,28 @@ struct SamplingParams {
   // user-facing sampling knob: the engine populates it before the params reach
   // the scheduler, and Verify() must not validate it (upstream doesn't).
   std::optional<int32_t> eos_token_id;
+
+  // extra_args (sampling_params.py `extra_args: dict[str, Any] | None`): the
+  // out-of-band per-request knobs the engine reads but the sampler never does.
+  // Upstream reads three keys out of it in Request.__init__
+  // (vllm/v1/request.py:116-127): kv_transfer_params, ec_transfer_params, and
+  // kv_cache_report_mode.
+  //
+  // RECORDED RESTRICTION: this is a STRING-VALUED slice of upstream's
+  // `dict[str, Any]`. Only kv_cache_report_mode (a plain string, KV-EVENTS W3)
+  // is consumed today; the other two keys are nested dicts belonging to
+  // KV-CONNECTORS / EC transfer, which are deferred with their own rows and
+  // would dictate a different value shape. Modelling the ported slice as
+  // map<string,string> matches the precedent already in the tree
+  // (include/vllm/v1/kv_offload/kv_connector.h:109 models kv_transfer_params
+  // the same way). nullopt (the default) is upstream's `None` and leaves every
+  // consumer on its default -> byte-identical.
+  //
+  // The HTTP door to this (`vllm_xargs` on the OpenAI request) is still
+  // DEFERRED — see include/vllm/entrypoints/openai/protocol.h — so today this
+  // is settable from the C++ engine API only. Not validated by Verify()
+  // (upstream does not validate extra_args either).
+  std::optional<std::map<std::string, std::string>> extra_args;
 
   // sampling_type (cached_property): greedy when temperature < _SAMPLING_EPS,
   // random_seed when a seed is set, else random.

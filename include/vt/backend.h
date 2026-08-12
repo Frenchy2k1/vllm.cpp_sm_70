@@ -75,6 +75,13 @@ class Backend {
   // device pointer to a host memcpy and segfaults.
   virtual bool DeviceMemoryIsHostAddressable() const { return false; }
 
+  // Optional device free/total VRAM probe (bytes). Default false = unknown.
+  // ROCm/CUDA override with hipMemGetInfo/cudaMemGetInfo so model code can
+  // size LRU caches without including vendor headers (device-leakage).
+  virtual bool DeviceMemoryInfo(size_t* /*free_bytes*/, size_t* /*total_bytes*/) const {
+    return false;
+  }
+
   // --- Device compute capability (BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4) ---
   // The architecture the backend is actually running on, as the familiar
   // `(major, minor)` pair (GB10/sm_121 -> {12, 1}). Before this, the capability
