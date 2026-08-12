@@ -1,5 +1,7 @@
 # Engine and serving execution matrix
 
+<!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
+
 This is the canonical stable-ID inventory for cross-cutting engine behavior at
 the parity pin `555967922` (vLLM 0.26.0.dev0 + transformers 5.14.1; advanced
 2026-07-26 from the prior `e24d1b24`/0.25.0 pin, see

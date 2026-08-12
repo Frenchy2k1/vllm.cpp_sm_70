@@ -1,4 +1,4 @@
-# Benchmarks
+# Benchmarks <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 ## At a glance: W5/W6 green; validated release artifacts pending
 

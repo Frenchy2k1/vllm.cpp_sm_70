@@ -1,5 +1,7 @@
 # Roadmap v1 — post-MVP
 
+<!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
+
 *(user-directed 2026-07-10: this document is the live roadmap; the completed
 M0-M3 record is archived at [completed/roadmap_mvp_v0.md](completed/roadmap_mvp_v0.md).)*
 
