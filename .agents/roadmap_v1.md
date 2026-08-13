@@ -47,6 +47,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | `hipblasGemmEx` overload mismatch in `rocm_matmul_hipblaslt.hip` | bug |
 | [#269](https://github.com/mudler/vllm.cpp/issues/269) | `BACKEND-ROCM` | ROCm gfx1200: Gemma-3 is 48/48 exact vs two vLLM-ROCm oracles; Qwen3-0.6B exposes a deterministic cross-version near-tie, not a backend defect | verification |
 | [#332](https://github.com/mudler/vllm.cpp/issues/332) | `BACKEND-ROCM` | ROCm: no decode-graph capture — the hipGraph seam is unimplemented, costing ~3x decode throughput vs vLLM on gfx1200 | perf |
+| [#444](https://github.com/mudler/vllm.cpp/issues/444) | `BACKEND-ROCM` | ROCm: main does not build for gfx1200/gfx1201 — `rocm_paged_attn.hip` includes rocwmma unconditionally on arch, not availability | bug |
 | [#125](https://github.com/mudler/vllm.cpp/issues/125) | `BACKEND-VULKAN` | Vulkan on AMD Strix Halo (gfx1151) does not load | bug |
 | [#203](https://github.com/mudler/vllm.cpp/issues/203) | `BACKEND-VULKAN` | Vulkan on unified memory holds TWO copies of the weights: 27B peaks at 100.8 GiB RSS and OOM-reboots a Spark | bug |
 | [#310](https://github.com/mudler/vllm.cpp/issues/310) | `BACKEND-VULKAN` | docs/FEATURES.md understates Vulkan: says decode 4.24 vs 4.35 where the binding figure is 4.36 vs 4.35 | bug |
