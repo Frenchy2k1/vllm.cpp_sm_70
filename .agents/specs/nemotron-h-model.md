@@ -3,6 +3,13 @@
 **Claim:** `CLAIM-MODEL-NEMOTRON-H`. **Model row:**
 `MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm` (existing, stays `INVENTORIED`
 at this spec commit). **Issue:** [#517](https://github.com/mudler/vllm.cpp/issues/517).
+**Gate-infrastructure issues this row depends on:**
+[#569](https://github.com/mudler/vllm.cpp/issues/569) (checkpoint pinned by
+CONTENT — **closed**, `751325460`; W6 must run with `VT_NEMOTRON35_SNAPSHOT`
+UNSET and record the resolved directory, because that override is deliberately
+never revision-checked),
+[#547](https://github.com/mudler/vllm.cpp/issues/547) (GB10 reference-tier runs
+the CPU kernel over device pointers).
 
 **Hard blocker:** `KERNEL-SSM-MAMBA` [#496](https://github.com/mudler/vllm.cpp/issues/496)
 ([spec](mamba2-ssd.md)). W1 (CPU host references) is in fresh review on
@@ -331,17 +338,28 @@ env override is deliberately never revision-checked. A re-download of the same
 repo name lands a different revision under the identical path — exactly the
 substitution `kQwen27NvfP4Revision` exists because of.
 
-`hf download --local-dir` does record the revision, just not in the path: it
-writes a per-revision file manifest at
-`<dir>/.cache/huggingface/trees/<revision>.json`, confirmed present on the NAS
-tree for `29f2d174…`. `Nemotron35LightningSnapshot()` is now the SINGLE resolver
-for both spellings and gates the `CHECKPOINT_ROOT` path on that manifest. Proven
-by construction, the manifest being the only thing that differs between A and B:
+`hf download --local-dir` does record the revision, just not in the path.
+`Nemotron35LightningSnapshot()` is the SINGLE resolver for both spellings.
 
-| Run | Setup | Result |
+**SUPERSEDED 2026-08-13 by #569 (`751325460`).** The manifest at
+`<dir>/.cache/huggingface/trees/<revision>.json` records *"this revision was
+downloaded here once"*, **not** *"these bytes are that revision"*, so gating on
+it was existence-only: a directory holding `LlamaForCausalLM` with every sidecar
+naming a different revision, an **empty** `touch`ed manifest and a decoy beside
+it, still RESOLVED. `huggingface_hub`'s `_tree_cache.py` never invalidates — its
+docstring says a tree listing "can be cached forever without any invalidation
+logic" — so manifests **accumulate** and an old revision's manifest vouches for
+new bytes.
+
+The resolver now sweeps the per-file `.cache/huggingface/download/<file>.metadata`
+sidecars, whose `commit_hash` tracks the bytes. Row B below **no longer
+reproduces**: adding the manifest changes nothing. Retained as the record of what
+was tried and why it was insufficient.
+
+| Run | Setup | Result (at the time; B is now superseded) |
 |---|---|---|
 | A | staged dir carries only `deadbeef….json` | `EXIT=77`, loud skip |
-| B | add `29f2d174….json`, nothing else changed | `EXIT=0`, 3 / 12181 |
+| B | add `29f2d174….json`, nothing else changed | `EXIT=0`, 3 / 12181 — **no longer true; the sidecars decide** |
 | C | `VT_NEMOTRON35_SNAPSHOT` at the real NAS dir | `EXIT=0`, 3 / 12181 |
 | D | neither env var set | `EXIT=77`, banner names the export AND the manifest |
 | E | `VT_` set to a nonexistent dir, `CHECKPOINT_ROOT` valid | `EXIT=77` — refuses, never falls back |
