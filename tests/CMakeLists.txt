@@ -1282,6 +1282,7 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
+vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)
