@@ -19,20 +19,33 @@ a practical unit that one agent can spike without silently dropping aliases.
 ## Architecture-support checklist
 
 At-a-glance view of which architectures we have actually engaged, and how far.
-**326 architecture rows are inventoried at the pin, plus 10 rows that the pinned
-registry does not contain = 336 total.** Those 10 are, by why they are not at the
-pin: `KimiK3ForConditionalGeneration` and `MuseGlimmerForConditionalGeneration`,
-both released after the pin; `BailingMoeV3ForCausalLM`, a pin-lag row registered
-on vLLM `main` and absent only at the pin (#609); `MiniMaxH3DiTModel`, a DIFFUSION architecture living in the
-separate `vllm-omni` repository; the four TTS / audio-generation architectures
+**355 architecture rows are inventoried at the pin, plus 11 rows that the pinned
+registry does not contain = 366 architecture rows.** Those 11 are, by why they
+are not at the pin: `KimiK3ForConditionalGeneration` and
+`MuseGlimmerForConditionalGeneration`, both released after the pin;
+`BailingMoeV3ForCausalLM`, a pin-lag row registered
+on vLLM `main` and absent only at the pin (#609); `MiniMaxH3DiTModel` and
+`LTX2VideoTransformer3DModel`, both DIFFUSION architectures released after the
+pin and absent from the vLLM repository entirely, reached through the
+separate `vllm-omni` repository (#435); the four TTS / audio-generation architectures
 registered in that same `vllm-omni` repository — `MossTTSDelayModel`,
 `MossTTSRealtime`, `Qwen3TTSForConditionalGeneration` and
 `HiggsMultimodalQwen3ForConditionalGeneration`; and two whose upstream target is
 still pending because the exact `config.json` architecture string is registered
 in neither core vLLM `main` nor `vllm-omni` —
 `VoxtralRealtimeForConditionalGeneration` and
-`BailingMMNativeForConditionalGeneration` (#610). Of the 336, 45 are
-past `INVENTORIED` (engaged), the remaining 291 are known-but-not-started long tail. Every mark
+`BailingMMNativeForConditionalGeneration` (#610).
+
+The rollup below counts **370 rows**, which is those 366 plus the four that are
+not architectures at all and say so in their own sections:
+`MODEL-FACTORY-registry` (the cross-cutting registry contract), the two
+`MODEL-AUDIO` encoder-component rows, and the one `MODEL-HFDYNAMIC` row (dynamic
+Transformers compatibility is capability-driven and excluded from finite counts).
+Of those 370, 49 are past `INVENTORIED` (engaged) and the remaining 321 are the
+known-but-not-started long tail — the same two numbers the rollup table states,
+and the way to re-derive every count here is to re-run
+[`scripts/check-agent-record.py`](../scripts/check-agent-record.py)'s parser over
+this file rather than to carry any of them forward. Every mark
 below is grounded in the row's lifecycle `State` cell plus its ledger evidence,
 and this section is CI-enforced against those rows by
 [`scripts/check-model-checklist.py`](../scripts/check-model-checklist.py): a mark
@@ -62,7 +75,7 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 | GATING | 1 |
 | **Total** | **370** |
 
-Engaged architectures (the 48 non-`INVENTORIED` rows):
+Engaged architectures (the 49 non-`INVENTORIED` rows):
 
 | Support | Architecture | Family / example | Status | Row |
 |---|---|---|---|---|
@@ -493,7 +506,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 
 Rows here are audio TOWERS that vLLM ships as a component of some registry
 architecture rather than as one themselves, so they have no `registry.py` entry
-of their own and are NOT part of the 328 architecture rows counted above.
+of their own and are NOT part of the 366 architecture rows counted above.
 
 | ID | Item / architecture aliases | Upstream | Task / modality | Dependencies | Spike/spec | State | Our code + tests/evidence | Owner |
 |---|---|---|---|---|---|---|---|---|
