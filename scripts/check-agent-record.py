@@ -65,7 +65,13 @@ MATRICES = {
     # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
     # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 370),
+    # 372 since 2026-08-13: +2 for IndexTTS-2.5, which vLLM-Omni registers as TWO
+    # architectures (`IndexTTS2TalkerForConditionalGeneration` stage 0 and
+    # `IndexTTS2S2MelDecoder` stage 1), so a port described in prose as "a model"
+    # moves this pin by two. Both land `INVENTORIED`, unclaimed and blocked on the
+    # absent vllm-omni pin (#633). Bumped because two rows EXIST, never to make a
+    # transition pass. #634.
+    "MODEL": (AGENTS / "model-matrix.md", 372),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
