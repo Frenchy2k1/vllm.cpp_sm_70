@@ -21,6 +21,15 @@ cmake_minimum_required(VERSION 3.24)
 get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
 include("${_here}/CudaArchFeatures.cmake")
 
+# --- PROBE mode (toolchain gate, W0) ---------------------------------------
+# The sm_70 toolchain gate raises FATAL_ERROR, which cannot be caught in-process,
+# so each gate case in the section below runs THIS file in a child `cmake -P`
+# with PROBE_ARCHS/PROBE_TOOLKIT set and asserts on the child's exit status.
+if(DEFINED PROBE_ARCHS AND DEFINED PROBE_TOOLKIT)
+  vt_cuda_check_arch_toolchain("${PROBE_ARCHS}" "${PROBE_TOOLKIT}")
+  return()
+endif()
+
 set(_failures 0)
 
 # expect_feature(<target-list> <feature> <expected-archs>)
@@ -253,6 +262,79 @@ expect_feature("100a" "scaledmm-c3x-sm90" "")
 expect_feature("121a" "cutlass-fp8" "121a")
 expect_feature("121a" "cutlass-nvfp4" "121a")
 expect_feature("121a" "cutlass-nvfp4-sm100" "")
+
+# --- SM70 / VOLTA (BACKEND-CUDA-SM070, W0) ----------------------------------
+# Volta is a PORTABLE-KERNELS-ONLY target: no fast-path kernel body exists
+# here (fp4/cutlass/marlin/fa2 all resolve EMPTY — no `7.0` in any cell), the
+# same treatment the cross-family fan-out got. The assertions pin that nothing
+# can light up for `70` without a real ported body, and that a `70` request
+# shares a fat build without un-supporting the sm_12x archs next to it.
+foreach(_f IN LISTS _ALL_FEATURES)
+  expect_feature("70" "${_f}" "")
+endforeach()
+expect_feature("70" "cutlass-nvfp4-sm100" "")
+expect_feature("70" "scaledmm-c3x-sm90" "")
+expect_feature("70" "scaledmm-c3x-sm100" "")
+# Neutrality: `70` in a heterogeneous request resolves EMPTY for itself and
+# leaves the supported arch fully enabled; the sm_12x resolution is unchanged.
+foreach(_f IN LISTS _ALL_FEATURES)
+  expect_feature("70;121a" "${_f}" "121a")
+endforeach()
+# A Volta + Ampere fat request keeps FA2 for the Ampere leg only.
+expect_feature("70;80" "fa2" "80")
+# Pinned so the 12x marlin cell stays untouched by the Volta request.
+expect_feature("70;120a" "marlin-nvfp4" "120a")
+
+# --- SM70 TOOLCHAIN GATE (nvcc < 13 only) ----------------------------------
+# CUDA 13.0 removed offline compilation for architectures below 7.5, so a `70`
+# request must be refused on nvcc >= 13 at configure time and allowed on the
+# whole 12.x line (12.9.1 = last). Every row is ARCHS|TOOLKIT|expected-exit-0.
+set(_SM70_GATE_CASES
+  "70|12.0.0|0"
+  "70|12.8.0|0"
+  "70|12.9.1|0"
+  "70|13.0.0|1"
+  "70|13.3.0|1"
+  "7.0|12.9.1|0"
+  "70,121a|12.9.1|0"
+  "70,121a|13.0.0|1"
+  "121a|13.0.0|0"
+  "121a|12.9.1|0"
+  "90a|13.0.0|0"
+)
+foreach(_gate IN LISTS _SM70_GATE_CASES)
+  string(REPLACE "|" ";" _parts "${_gate}")
+  list(GET _parts 0 _gate_archs_raw)
+  list(GET _parts 1 _gate_toolkit)
+  list(GET _parts 2 _gate_expect)
+  # `,` separates archs inside a row so the row stays ONE list element
+  # (`;` would be split by foreach over the rows again).
+  string(REPLACE "," ";" _gate_archs "${_gate_archs_raw}")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+      "-DPROBE_ARCHS=${_gate_archs}"
+      "-DPROBE_TOOLKIT=${_gate_toolkit}"
+      -P "${CMAKE_CURRENT_LIST_DIR}/CudaArchFeaturesTest.cmake"
+    RESULT_VARIABLE _gate_result
+    OUTPUT_QUIET ERROR_QUIET)
+  if(_gate_expect STREQUAL "0")
+    if(NOT _gate_result EQUAL 0)
+      message(SEND_ERROR
+        "toolchain gate: wrongly REJECTED archs [${_gate_archs}] on nvcc "
+        "${_gate_toolkit} (child exit ${_gate_result})")
+      math(EXPR _failures "${_failures} + 1")
+      set(_failures "${_failures}" PARENT_SCOPE)
+    endif()
+  else()
+    if(_gate_result EQUAL 0)
+      message(SEND_ERROR
+        "toolchain gate: wrongly ALLOWED archs [${_gate_archs}] on nvcc "
+        "${_gate_toolkit}")
+      math(EXPR _failures "${_failures} + 1")
+      set(_failures "${_failures}" PARENT_SCOPE)
+    endif()
+  endif()
+endforeach()
 
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")
