@@ -913,6 +913,41 @@ a stop token early.
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
 
+#### Accepted for recipe compatibility — these flags have NO effect
+
+A published `vllm serve` line has to reach model load. The flags below appear in
+most official [vllm-project/recipes](https://github.com/vllm-project/recipes)
+commands, mean nothing to this engine, and are therefore **accepted and ignored**
+rather than rejected. Each one prints a notice on startup naming itself and the
+reason it does nothing, so a log never implies it took effect.
+
+| Flag | Effect here | Why it is inert |
+|---|---|---|
+| `--enable-auto-tool-choice` | **none** | Tool parsing is already unconditional once `--tool-call-parser` resolves; there is no second gate to open. Note `--tool-call-parser` defaults to `hermes` here, where upstream's defaults to unset, so the two flags do not line up when the parser is omitted. Upstream's validation is still mirrored: combining it with `--tool-call-parser none` is refused, as in `vllm/entrypoints/openai/cli_args.py:395` |
+| `--trust-remote-code` | **none** | It authorizes executing Python from the checkpoint. This engine has no Python runtime, so there is nothing to authorize — N/A by construction, not unimplemented |
+
+The notice is on stderr at startup, one line per flag actually passed, so what
+you see in a log matches this table:
+
+```text
+server: accepted '--trust-remote-code' for published-recipe compatibility; it has no effect here: no Python runtime, so there is no remote code to trust
+```
+
+The mirrored validation is reported before the parser dialect is checked, so a
+contradiction is named as a contradiction rather than passing silently (`none` is
+itself a valid selection):
+
+```text
+server: Error: --enable-auto-tool-choice requires --tool-call-parser
+server: (--tool-call-parser none selects NO parser; name a parser, or drop --tool-call-parser to keep the hermes default)
+```
+
+This list is **enumerated, not a catch-all**. Any other unrecognized flag still
+aborts with `server: unknown argument '<flag>'`, including flags that are inert
+only because the capability is missing (`--tensor-parallel-size` and the other
+parallelism flags) — silently accepting those would let you believe you got
+tensor parallelism when you did not.
+
 #### Context length vs the KV pool
 
 The KV pool holds `--num-blocks × --block-size` tokens — `256 × 32 = 8192` by
