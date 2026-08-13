@@ -927,10 +927,12 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
     vllm::Ltx2DitQuant quant = vllm::Ltx2DitQuant::kFp8;
     vllm::Ltx2DitParams from_shapes = vllm::Ltx2ParseDitParamsFromCheckpoint(file, &quant);
-    // The manifest parser leaves `use_prompt_adaln_single` at its default; the
-    // LOADER clears it for the contract (ltx2_loader.cpp), and so does the
-    // engine. Mirror that here so the two contracts are compared like for like.
-    from_shapes.use_prompt_adaln_single = false;
+    // MEASURED from this file's own header: it carries `prompt_adaln_single`, so
+    // the manifest parser resolves `use_prompt_adaln_single = TRUE` — and nothing
+    // clears it any more (.agents/specs/ltx25-prompt-adaln.md, issue #644). This
+    // line used to force it false on BOTH sides of the comparison below, which is
+    // what made a config/shape disagreement about it unobservable.
+    CHECK(from_shapes.use_prompt_adaln_single);
     CHECK(quant == vllm::Ltx2DitQuant::kNvfp4);
     CHECK(from_shapes.num_layers == 48);
     CHECK(from_shapes.inner_dim() == 4096);
@@ -950,8 +952,12 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
     nlohmann::json wrapper;
     wrapper["config"] = config;
-    vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
-    declared.use_prompt_adaln_single = false;
+    const vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
+    // The shipped config OMITS `use_prompt_adaln_single`, so it resolves to
+    // upstream's TRUE default (model_configurator.py:76) — which is what the
+    // file's own tensors say. Asserted rather than forced: the two sides of the
+    // contract comparison below must AGREE about it, not be made to.
+    CHECK(declared.use_prompt_adaln_single);
     CHECK(declared.double_precision_rope);              // frequencies_precision float64
     CHECK(declared.av_ca_timestep_scale_multiplier == 1000);
     CHECK(declared.apply_gated_attention);
