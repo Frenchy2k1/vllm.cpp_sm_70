@@ -168,6 +168,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#505](https://github.com/mudler/vllm.cpp/issues/505) | `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` | `DsaTopkKernel` sizes `chosen[512]`/`picked[64]` by literal while `index_topk` is 512 (Flash) / 1024 (Pro); latent behind `dsa_dense` today, silent stack overflow once the real-geometry DSA residual lands (found while assessing #504) | bug |
 | [#552](https://github.com/mudler/vllm.cpp/issues/552) | `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` | DSA top-k review findings: the `w < topk` guard comment overclaims what it defends, the window clamps and non-positive `topk` are ungated, and `DsaTopkLaunch` swallows its launch error (spec `specs/dsa-topk-bounds.md` §7) | bug |
 | [#469](https://github.com/mudler/vllm.cpp/issues/469) | — | `test_ops_glue.cpp:190`'s `CHECK_THROWS` is satisfied by the CPU kernel's second guard, not the dispatch guard it names — mutation M8 survives. Behavior is correct; test strength only | bug |
+| [#558](https://github.com/mudler/vllm.cpp/issues/558) | — | `tests/parity/hf_snapshot.h` has no guard against declaration-order breaks: the C++ build catches them, but the records-only lane that broke it never builds C++, and all 14 TUs that include the header are checkpoint-gated so `ctest` reports the break as `***Not Run`. `fafa16f0f` (#546, #551) fixed the ordering and carried no guard | bug |
 
 ## Top-level portfolio
 
