@@ -29,10 +29,15 @@ so the token-exact claims hold against the new pin. Every speed figure citing
 "vLLM 0.25.0" was measured against the preserved rollback, and NOT only before
 the advance: the benchmark harness hard-enforced 0.25.0 and *raised* on the pin
 until 2026-08-12, so no run through it could have used the pin
-([#520](https://github.com/mudler/vllm.cpp/issues/520)). Those figures are
-attributed rather than withdrawn (our engine is unchanged by the advance, and
-the two oracles tie in speed where that was checked); a re-benchmark at the pin
-is pending and blocked on [#522](https://github.com/mudler/vllm.cpp/issues/522).
+([#520](https://github.com/mudler/vllm.cpp/issues/520)). **That re-benchmark
+has now RUN.** The 2026-08-13 series selects the oracle by explicit path
+(`0.23.1rc1.dev1511+g555967922`, FlashInfer `0.6.15.post1`), asserts that
+identity per leg, runs it graphed and passes `--language-model-only`, which the
+canonical driver never did
+([#414](https://github.com/mudler/vllm.cpp/issues/414)). Every figure citing
+"vLLM 0.25.0" is therefore SUPERSEDED and OPTIMISTIC on two counts that both
+flattered us, not merely stale: nothing is withdrawn, and the values keep their
+attribution.
 
 **Clock attribution (`BENCH-ASSERT-CLOCK-STATE`, ACTIVE, 2026-08-12,
 [#543](https://github.com/mudler/vllm.cpp/issues/543)):** the SM clock on
@@ -41,14 +46,16 @@ byte-identical `marlin::Marlin` by +9.65%, larger than either deficit that
 comparison ranked. The harness now records the clock window, `clocks.max.sm`,
 the applications clock, the active throttle reasons, persistence mode and the
 **boot id** per leg, refuses a cross-boot pair, and voids a run whose window was
-over-spread or barely observed — a single busy sample scores a perfect 0.00%
-spread, so the retained sample count and the busy fraction are floored and
-printed. The cross-boot override waives the boot id and nothing else: the GPU,
-driver and clock ceilings are compared across the arms either way
-([spec](../.agents/specs/bench-assert-clock-state.md)). Every speed figure
-recorded before this date predates the assertion: not withdrawn, not restated,
-but carrying no clock attribution. The first attributable grid is pending on the
-box lock and on [#545](https://github.com/mudler/vllm.cpp/issues/545).
+over-spread or barely observed. The cross-boot override waives the boot id and
+nothing else ([spec](../.agents/specs/bench-assert-clock-state.md)); the sample
+floors and the comparison it keeps are derived there. Every figure recorded
+before this date carries no clock attribution: not withdrawn, not restated. The
+first attributable grid has now landed (2026-08-13): clocks pinned with
+`sudo -n nvidia-smi -lgc 2190` while holding `$HOME/gpu.lock`, under an
+always-fires reset trap, delivering a flat 2184 MHz across every timed window on
+one boot id (a leg reads n=861, min 2158, med 2184). GB10 enumerates no
+`SUPPORTED_CLOCKS`, so 2190 is the frequency the worst observed boot sustained
+flat.
 
 ## Capability status
 
@@ -1420,9 +1427,24 @@ binding: the arms were not interleaved and did not share a background state.
 Only the two structural kernel terms (-0.400, -0.131 ms/step) exceed the
 untouched control's own +0.262 drift. Tokens move on neither 27B checkpoint,
 which establishes no gross defect at ~50x coarser sensitivity than the
-perturbation introduced, not equivalence. Both toggles stay DEFAULT OFF
+perturbation introduced, not equivalence. **That indicative reading is now
+superseded by an interleaved same-binary A/B** on the 1024/128 workload at the
+pin and a pinned clock: decode **1.007x** (c1), **1.012x** (c4), 1.027x (c16,
+#577-exposed); TTFT **1.048x** (c1), **1.041x** (c4). Both toggles stay DEFAULT
+OFF; flipping a default is a separate change with its own token gate
 ([spec](../.agents/specs/perf-gdn-packed-bridge.md),
 [record](../.agents/benchmark-record.md)).
+
+**Binding parity at the pin (2026-08-13), 1024/128, n=3, arms interleaved,
+clocks flat at 2184 MHz:** 27B decode TPOT **0.976x** (c1) and **0.946x** (c4),
+prefill TTFT 0.944x (c1); 35B decode TPOT **0.995x** (c1) and **0.946x** (c4),
+prefill TTFT 0.920x (c1) and 0.849x (c4). 27B c16 is **VOID, not a number**: our
+arm completed 93 of 96 requests where the pin completed 96 of 96 and the three
+missing are the SLOWEST, because our SSE keepalive (`VT_SERVER_SSE_PING_S`,
+default 15 s) was ENABLED on every leg
+([#577](https://github.com/mudler/vllm.cpp/issues/577)). 35B c16 TPOT and TTFT
+are NOT ESTABLISHED (6.8% and 15.0% leg spread). Forensics in
+[the benchmark record](../.agents/benchmark-record.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).
