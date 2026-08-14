@@ -1125,6 +1125,7 @@ Registered in
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+| POST | `/v1/audio/speech` | Text (or lyrics + a music description) to audio; responds with `audio/wav` bytes. Registered **only** when a synthesizer is attached (`--speech-model`) |
 
 The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
 clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
@@ -1196,6 +1197,74 @@ The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. See
 [MiniMax-H3: video + audio generation](#minimax-h3-video--audio-generation).
+
+`/v1/audio/speech` is registered **only** when the server was started with
+`--speech-model`; without it the route is absent (404) and the server is
+identical to one built before it existed. See
+[Speech and music generation](#speech-and-music-generation).
+
+### Speech and music generation
+
+    vllm-server --model /path/to/text-model \
+      --speech-model /path/to/minimax-music3 \
+      [--speech-family minimax-music3]
+
+`--speech-model` names the checkpoint **set** — MiniMax-Music3 ships six
+component directories beside a `modular_model_index.json`, so this is not a
+single model directory. `--speech-family` is optional: omitted, the family is
+**detected** by inspecting the artifact, and a directory no registered family
+claims is refused at startup naming every family that was tried. A name that is
+not registered is refused too; it is never treated as a hint, because the wrong
+family would not fail — it would render noise.
+
+The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
+additional named fields:
+
+    curl http://localhost:8000/v1/audio/speech \
+      -H 'Content-Type: application/json' \
+      -d '{"model": "minimax-music3",
+           "lyrics": "[Verse]\nMorning light filtering through the pine\n",
+           "description": "Genre: acoustic pop. BPM: 96. Key: C major.",
+           "audio_duration": 30, "num_inference_steps": 30, "seed": 7}' \
+      --output song.wav
+
+The response body is RIFF/WAVE 16-bit PCM at the family's **native** rate
+(44100 Hz stereo for MiniMax-Music3, never resampled), with content type
+`audio/wav`.
+
+`lyrics` and `description` are separate fields rather than one `input` behind a
+separator because upstream runs a different normalizer over each. A
+one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
+alias for `description`, and supplying both with different values is a 400
+rather than a silent winner.
+
+Refused by name rather than ignored, because honouring any of them silently
+would return audio the caller did not ask for: `voice` (no registered family
+exposes named voices), `speed` (no family implements a rate control), `stream` /
+`stream_format` (MiniMax-Music3 generates the whole song before the first sample
+exists, so buffering it would be a stream in name only) and any
+`response_format` other than `"wav"` (no mp3/opus/aac/flac encoder is vendored).
+
+A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
+**before** anything stages: the route asks the loaded engine's
+`requires_reference_audio()` and answers 400 naming the family and the missing
+`reference_audio`, which is supplied as a `data:` URL carrying a 16-bit PCM mono
+WAV.
+
+**What this does NOT do yet.** No family renders a song from a prompt.
+MiniMax-Music3's condition mix, flow-matching DiT, scheduler, window
+bookkeeping and DAC vocoder are implemented and gated against the oracle's own
+waveform, but the 8.6B `Qwen3ForCausalLM` forward that produces the frame
+hidden states is not, so a request is answered with a 500 naming that stage, the
+phase that owes it (W2 of `.agents/specs/minimax-music3.md`) and issue #672.
+IndexTTS-2.5 refuses naming its own missing pieces.
+
+The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
+`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
+`vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI drive one
+implementation. `vllm_speech_result` carries both the float waveform and the
+RIFF/WAVE bytes, so an embedder writes a playable file without a second encoder.
+
 
 ### `max_tokens`: what a non-positive value means
 
