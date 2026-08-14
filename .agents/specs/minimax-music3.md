@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0 DONE, W1 LANDED.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, and the modular loader in the tree. W2/W3 dispatched.
+**Status:** **W0 + W1 DONE, W3 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, and the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path. The 8.6B language-model forward and W4-W7 are owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -292,9 +292,55 @@ LLM→diffusion handoff on *continuous hidden states* rather than discrete token
 
 ## 5. Gates
 
-**LLM half — token-exact.** The global LLM and the depth decoder emit discrete RVQ
-codes. Greedy decode of the code sequence is compared against the oracle
-token-for-token on a fixed prompt. This is a real token gate and it binds.
+**LLM half — token-exact. WITHDRAWN 2026-08-14 by W2/W3; the artifact refuted
+it.** What this paragraph said was: "The global LLM and the depth decoder emit
+discrete RVQ codes. Greedy decode of the code sequence is compared against the
+oracle token-for-token on a fixed prompt. This is a real token gate and it
+binds." It is kept in full, because a withdrawn claim that leaves no trace is how
+the same wrong gate gets re-specified.
+
+**There is no greedy decode of this model to compare against.** `_sample_top_k`
+(`encoders.py:94-103`) is the only sampler either stage uses; `_AR_SAMPLING_TOP_K`
+is a module constant of 50, there is no temperature and no argmax branch, and the
+last line is `torch.multinomial(probs, 1, generator=generator)`. The committed
+`rvq_codes.npy` is therefore a **seeded sample**, and reproducing it
+token-for-token means reproducing torch's CPU Mersenne-Twister and its
+multinomial — a claim about torch's RNG, not about this model.
+
+A second, independent reason the same conclusion holds, and the one that would
+survive even a bit-exact RNG: **both** stages sample from a CFG mix of a
+conditional and an unconditional row (`encoders.py:327-328`, `:134-135`), and the
+goldens store the **conditional row only** (`encoders.py:132,343`, both slice
+`[:1]`). The unconditional branch is not in the golden set, so the guided
+distribution the codes were drawn from cannot be reconstructed from what is
+committed.
+
+**What replaces it.** The codes are consumed as INPUTS and the AR half is gated
+on TENSORS, at two scales:
+
+* reduced dimensions, float32, against goldens produced by *executing* upstream's
+  own `MiniMaxMusic3ConditionEncoder` and `MiniMaxMusic3RVQDepthDecoder`
+  (`scripts/gen-minimax-music3-ar-goldens.py`). This separates an algebra defect
+  from rounding, and it runs in CI with no checkpoint;
+* full scale, bf16, real weights: the condition mix against
+  `condition_chunk0.npy` (176 128 values) and the depth decoder against
+  `frame_hiddens[:, 4096:]` (716 800 values), driven by the golden codes and the
+  golden `last_hidden`.
+
+The full-scale bound is calibrated against a **matched control** rather than
+guessed. torch's own `sdpa_kernel(MATH)` arm, running upstream's own module on
+the identical inputs, reproduces the goldens to 46.34% bit-identical at mean
+absolute error 1.659e-03 — its CPU attention kernel runs a blocked online softmax
+that no closed-form rounding model reproduced. Ours is 43.61% and 1.824e-03,
+inside that spread. Chasing a particular kernel's rounding below the control is
+not "more correct" (AGENTS.md's near-tie discipline).
+
+**Still owed on the LLM half:** the 8.6B `Qwen3ForCausalLM` forward itself.
+`frame_hiddens[:, :4096]` is the language model's own hidden state, and
+reproducing it means running that model teacher-forced on the golden codes
+through our landed Qwen3 path, which needs an `inputs_embeds` entry it does not
+have. That is the remainder of W2 and it is recorded here rather than discovered
+later.
 
 **Acoustic half — per-stage tensor parity.** No logits, no sampler, so no token
 gate exists to have. Each stage is compared against the oracle's own output for
@@ -372,15 +418,41 @@ pinned SHA.
 
 ## Now
 
-**W0 DONE, W1 LANDED, row `ACTIVE`.** The diffusers oracle generates audio and is
-`gateable = yes` against 13 committed per-stage goldens; both oracles are pinned;
-§1.1 is resolved and confirmed at runtime; the modular loader is in the tree with
-the dtype invariant §2.1 enforced and the native arm refused by name.
+**W0 + W1 DONE, W3 DONE, W2 PARTIAL; row `ACTIVE`.** The diffusers oracle
+generates audio and is `gateable = yes` against 13 committed per-stage goldens;
+both oracles are pinned; §1.1 is resolved and confirmed at runtime; the modular
+loader is in the tree with the dtype invariant §2.1 enforced and the native arm
+refused by name. W2/W3 add the autoregressive half's compute —
+[`minimax_music3_ar.h`](../../include/vllm/model_executor/models/minimax_music3_ar.h)
+and its two gates. Nothing generates a song yet.
 
-W2/W3 (the autoregressive half) are dispatched. Then W4/W5 acoustic, W6 the
-speech-family registration plus the `vllm_speech_*` ABI and the example HTTP
-server, W7 the quantized arms.
+**W3 is complete and gated at both scales.** The learned 8-layer condition mix
+reproduces `condition_chunk0.npy` to 175 989 of 176 128 values **bit-identical**
+(mean absolute error 1.99e-07, no value beyond one bf16 ULP-or-2^-7), and the
+4-layer RVQ depth decoder reproduces `frame_hiddens[:, 4096:]` — 716 800 values
+over 25 frames × 7 depth steps — inside the matched control's spread (§5). The
+16-position window is exercised at its boundary and one past it. The reduced
+dimension gate is 25 cases / 338 assertions and needs no checkpoint.
 
-Two things are owed and neither is W0's to close: **no speed number exists** — the
-oracle capture was CPU-only because `dgx.casa` was down, so nothing here touches
-the speed axis — and SGLang-Omni remains `gateable = no`, read but never executed.
+**W2 is partial, and the split is exact.** Everything the autoregressive loop
+does *around* the language model has landed and is gated: the prompt the
+checkpoint contract fixes (both upstream rewrite passes, string for string, on
+the oracle capture's own prompt), the unconditional CFG row, the frame budget and
+its two refusals, the semantic vocabulary mask, the guided-logit pipeline
+including the re-mask that keeps a NaN from becoming a candidate, `_sample_top_k`
+up to its draw, and the frame feedback embedding. What has NOT landed is the
+8.6B `Qwen3ForCausalLM` forward itself — see §5's "still owed".
+
+**§5's token-exact claim is withdrawn**, and that is this phase's most important
+finding rather than a footnote: upstream's AR stage has no greedy path at all, so
+`rvq_codes.npy` is a seeded sample and is consumed as an input by these gates.
+§5 now records the reasoning and the tensor gates that replace it.
+
+Next: W4/W5 acoustic, W6 the speech-family registration plus the `vllm_speech_*`
+ABI and the example HTTP server, W7 the quantized arms. W4 is unblocked and does
+not depend on W2's remainder.
+
+Two things are owed and neither is this phase's to close: **no speed number
+exists** — every capture so far ran on CPU because `dgx.casa` was down, so
+nothing here touches the speed axis — and SGLang-Omni remains `gateable = no`,
+read but never executed.
