@@ -14,10 +14,10 @@
 //
 // Dispatch (BACKEND-CUDA-ARCH-ADDITIVITY): this TU registers ONE tactic for
 // TacticFamily::kSm70Nvfp4W4a16; the launcher's portable path is untouched.
-// Bands: SIMT decode M <= 3 (brick A) and WMMA tiles M 4..64 (brick B, m-padded
-// 16-row tiles, k%512==0 and n%16==0). The QPN m8n8k4 Volta tensor-core band
-// (the bw-optimal M 4..16) remains the next brick; otherwise Launch returns
-// false => caller falls back.
+// Bands: SIMT decode M <= 3 (A), QPN m8n8k4 M 4..16 (C, prepacked fragment
+// layout), WMMA tiles M 4..64 (B, m-padded; the QPN fallback). All three
+// share the CT layout + self-check; Launch returns false => caller falls
+// back.
 //
 // Self-check contract (inherited from skinny): the first two eager calls are
 // cross-checked against a CPU fp32 reference on the LIVE arguments; a mismatch
@@ -318,6 +318,116 @@ __global__ void Sm70Nvfp4Wmma(const uint8_t* __restrict__ codes,
 }
 
 // ---------------------------------------------------------------------------
+// QPN band (brick C): the Volta-native four-quadpair mma.m8n8k4 tensor-op
+// kernel, fed from the fragment-order PREPACK of the CT layout (byte-equal
+// permutation, rebuilt per call into a cached scratch). One CTA per 32-column
+// tile, K split across 4 warps in 16-wide groups. This is the bw-optimal path
+// for M in 4..16 (the WMMA tile above is its correctness fallback).
+// ---------------------------------------------------------------------------
+#define MMA_8N8K4(C, A0, A1, B0, B1)                                        \
+  asm volatile(                                                             \
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "                    \
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "                     \
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"                                        \
+      : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]), "+f"(C[4]),         \
+        "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                                  \
+      : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
+
+template <int MT>
+__global__ void Sm70Nvfp4Qpn(const uint8_t* __restrict__ qcodes,
+                             const uint8_t* __restrict__ qscales,
+                             const __half* __restrict__ x,
+                             __half* __restrict__ y, int N, int K, int M,
+                             float gscale) {
+  constexpr int WARPS = 4;
+  __shared__ float cs[WARPS][MT * 256];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / WARPS;
+  const int g0 = warp * Gq;
+  const uint2* cb = reinterpret_cast<const uint2*>(qcodes) + (size_t)tile * G * 32 + lane;
+  const uint8_t* sb = qscales + (size_t)tile * G * 32 + lane;
+
+  const __half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float c[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) c[t][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+    const __half2 sc2 = __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+    __half2 b[8];
+    dequant8_k2(q2.x, sc2, b + 0);
+    dequant8_k2(q2.y, sc2, b + 4);
+    const unsigned* B = reinterpret_cast<const unsigned*>(b);
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      const int ar = t * 8 + r;
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (ar < M) {
+        const __half* xrow = x + (size_t)ar * K;
+        a01 = *reinterpret_cast<const uint4*>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4*>(xrow + g * 16 + 8);
+      }
+      const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      MMA_8N8K4(c[t], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t * 8 + row) * 32 + qp * 8 + col] = c[t][i];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < MT * 256; e += blockDim.x) {
+    const float v = cs[0][e] + cs[1][e] + cs[2][e] + cs[3][e];
+    const int row = e >> 5, col = e & 31;
+    if (row < M) y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
+// Fragment-order prepack (device; byte-equal to the fork's python build):
+//   qcodes[(tile*G + g)*32*8 + lane*8] = 8 bytes of korder-ordered, pair-
+//   interleaved nibbles; qscales[(tile*G+g)*32 + lane] = the group scale.
+__global__ void Sm70Nvfp4PackQpn(const uint8_t* __restrict__ codes,
+                                 const uint8_t* __restrict__ scales,
+                                 uint8_t* __restrict__ qcodes,
+                                 uint8_t* __restrict__ qscales, int K) {
+  constexpr unsigned short korder[16] = {0, 2, 4, 6, 1, 3, 5, 7,
+                                         8, 10, 12, 14, 9, 11, 13, 15};
+  const int tile = blockIdx.x, g = blockIdx.y, lane = threadIdx.x;
+  const int G = K >> 4;
+  const int col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int row = tile * 32 + col;
+  const uint8_t* crow = codes + (size_t)row * (K >> 1);
+  unsigned char nb[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) {
+    const int kk = g * 16 + korder[j];
+    const uint8_t b = crow[kk >> 1];
+    nb[j] = (kk & 1) ? (uint8_t)(b >> 4) : (uint8_t)(b & 0xF);
+  }
+  uint8_t* dst = qcodes + (size_t)(tile * G + g) * 32 * 8 + lane * 8;
+#pragma unroll
+  for (int j = 0; j < 8; j++)
+    dst[j] = (uint8_t)(nb[2 * j] | (nb[2 * j + 1] << 4));
+  qscales[(size_t)(tile * G + g) * 32 + lane] = scales[(size_t)row * G + g];
+}
+
+// ---------------------------------------------------------------------------
 // Host side helpers (bit-exact against the device arithmetic).
 // ---------------------------------------------------------------------------
 
@@ -374,9 +484,13 @@ bool RunSelfCheck(const Sm70Nvfp4W4a16Args& args, SelfCheckState& state) {
   if (m <= 0 || m > 64 || n <= 0 || k <= 0 || (size_t)m * n * k > (1 << 22)) {
     return !state.disabled;  // shape too large to host-check; trust the band
   }
-  // The WMMA band (M 4..64) requires its own preconditions; CPU-verify it
-  // only where it would actually have launched.
-  if (m >= 4 && ((n & 15) != 0 || (k % 512) != 0)) return !state.disabled;
+  // The WMMA band (M 4..64) and the QPN band (M 4..16) each carry their own
+  // preconditions; CPU-verify only where that band would actually have run.
+  if (m >= 4) {
+    const bool qpn_ok = (k % 64) == 0 && (n % 32) == 0;
+    const bool wmma_ok = (k % 512) == 0 && (n & 15) == 0;
+    if (!(qpn_ok || wmma_ok)) return !state.disabled;
+  }
 
   std::vector<__half> x((size_t)m * k);
   std::vector<__half> y((size_t)m * n);
@@ -416,10 +530,6 @@ bool LaunchSm70Nvfp4W4a16(const DeviceCaps&, void* argsPtr) {
   static SelfCheckState self;
   const char* sk = std::getenv("VT_SM70_SELFCHECK");
   const bool check_enabled = !(sk && sk[0] == '0');
-  // Band preconditions; the check must only compare output of a kernel that
-  // WILL run (never host-memory of a declined shape).
-  const bool mma_band = m >= 4 && (n & 15) == 0 && k % 512 == 0;
-  if (check_enabled && (((m <= 3) || mma_band) && !RunSelfCheck(args, self))) return false;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(args.stream);
   auto* y = static_cast<__half*>(args.out);
@@ -442,10 +552,38 @@ if (m <= 3) {
         Sm70Nvfp4SimtDecode<3, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
         break;
     }
+    if (check_enabled && !RunSelfCheck(args, self)) return false;
     return cudaGetLastError() == cudaSuccess;
   }
 
-  // WMMA band (brick B): M 4..64 served by 1..4 16-row tiles with row padding.
+  // QPN band: M 4..16 via the Volta mma.m8n8k4 tensor cores, fed from the
+    // fragment-order prepack (byte-equal CT permutation, rebuilt per call into
+    // a cached scratch; n%32 and k%64 are the tensor geometry).
+    if (m >= 4 && m <= 16 && (n % 32) == 0 && (k % 64) == 0) {
+      static uint8_t* s_qc = nullptr;
+      static uint8_t* s_qs = nullptr;
+      static size_t s_cap = 0;
+      const size_t tiles = (size_t)n / 32;
+      const size_t G = (size_t)(k / 16);
+      const size_t need = tiles * G * 32 * 8 + tiles * G * 32;
+      if (need > s_cap) {
+        cudaFree(s_qc);
+        cudaFree(s_qs);
+        cudaMalloc(&s_qc, tiles * G * 32 * 8);
+        cudaMalloc(&s_qs, tiles * G * 32);
+        s_cap = need;
+      }
+      Sm70Nvfp4PackQpn<<<dim3((unsigned)tiles, (unsigned)G), 32, 0, stream>>>(
+          codes, scales, s_qc, s_qs, k);
+      if (m <= 8)
+        Sm70Nvfp4Qpn<1><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
+      else
+        Sm70Nvfp4Qpn<2><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
+      if (check_enabled && !RunSelfCheck(args, self)) return false;
+      return cudaGetLastError() == cudaSuccess;
+    }
+
+    // WMMA band (brick B): M 4..16 served by 1..4 16-row tiles with row padding.
   // The tensor-core tiles have no k-tail: require k % 512 == 0 (falls back to
   // the portable path otherwise). n must be 16-aligned for the tile grid.
   if (m >= 4 && (n & 15) == 0 && k % 512 == 0) {
@@ -480,6 +618,7 @@ if (m <= 3) {
         Sm70Nvfp4Wmma<1, 4, KC><<<n / 16, 128, smem, stream>>>(codes, scales, x, y, n, k, m, args.gscale);
         break;
     }
+    if (check_enabled && !RunSelfCheck(args, self)) return false;
     return cudaGetLastError() == cudaSuccess;
   }
   return false;
