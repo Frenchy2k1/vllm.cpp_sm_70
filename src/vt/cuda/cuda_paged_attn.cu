@@ -2183,7 +2183,7 @@ bool Sm70FaEligible(const PagedAttentionArgs& a, int64_t d, int64_t nkv) {
   if constexpr (!(std::is_same_v<TQ, __half> && std::is_same_v<TKV, __half> &&
                   std::is_same_v<Tout, float>)) return false;
   if (!std::is_arithmetic_v<decltype(d)>) return false;
-  if (d != 64 || nkv <= 0) return false;
+  if ((d != 64 && d != 128) || nkv <= 0) return false;  // real head widths
   if (a.logits_soft_cap != 0.f || !a.causal) return false;
   if (a.window_size.has_value()) return false;
   const DeviceCaps& caps = GetDeviceCaps();
