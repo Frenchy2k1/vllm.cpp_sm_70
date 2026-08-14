@@ -973,5 +973,78 @@ class Qwen35TextOnlyRowsAreCounted(unittest.TestCase):
         self.assertEqual([error for error in errors if "MODEL rows" in error], [])
 
 
+class TenstorrentMistralRowIsCounted(unittest.TestCase):
+    """The BACKEND ratchet bump to 82 is backed by a real row (#670).
+
+    Same shape as TenstorrentResidualGoldenRowIsCounted and for the same
+    reason: the count is re-pinned by hand, so a bump with no row behind it is
+    indistinguishable from a bump for a new row. `b55f6ec14` set the precedent
+    that a ratchet bump lands with a case keyed to ITS OWN row; this is that
+    case for BACKEND-TENSTORRENT-MISTRAL.
+    """
+
+    ROW = "BACKEND-TENSTORRENT-MISTRAL"
+
+    def test_the_row_exists_in_the_backend_matrix(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        """A row whose issue is only in the PR body is untraceable from the tree.
+
+        This row shipped originally citing PR #354 -- a merged PR, not an issue
+        -- so nothing in the repository pointed at anything trackable. Pin both
+        links here so a future edit cannot quietly drop them again.
+        """
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("tenstorrent-mistral.md", row)
+        roadmap = (ROOT / ".agents/roadmap_v1.md").read_text(encoding="utf-8")
+        self.assertIn("issues/670", roadmap)
+
+    def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the BACKEND entry at a mutated copy on disk. Patching
+        `Path.read_text` globally would feed backend content to every matrix and
+        this test would then pass on errors that have nothing to do with the
+        removal -- green for the wrong reason, which is the failure mode these
+        cases exist to catch.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+
+        path, count = agent_record.MATRICES["BACKEND"]
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        # Under ROOT, not /tmp: check_matrices reports via
+        # `path.relative_to(ROOT)`, which raises on a path outside the repo.
+        # And BOTH tables need redirecting -- rows are parsed from
+        # MATRIX_PATHS while the count is pinned in MATRICES, so patching only
+        # the latter counts zero rows for a reason unrelated to the removal.
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "backend-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.dict(
+                     agent_record.MATRICES, {"BACKEND": (mutated, count)}
+                 ):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("backend rows" in e.lower() for e in errors),
+            f"removing {self.ROW} must break the BACKEND count; got {errors}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

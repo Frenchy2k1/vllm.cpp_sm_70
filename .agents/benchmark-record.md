@@ -20988,3 +20988,26 @@ refusal never fired: `Ltx2SelectTextFeatureVariant` **does** refuse a partial se
 (`ltx2_text_encoder.cpp:184-192`). It never fired because **no production path
 called the selector before L13** — the marker keys and the engine's first call to
 it landed in the same commit, so there was no earlier run for it to refuse.
+
+## BACKEND-TENSTORRENT-MISTRAL — Mistral-7B-v0.3 first data point (2026-08-14)
+
+`vllm-cli --prompt "Hello" --max-tokens 32 --repeat 2 --device auto` on a
+Blackhole P150. Run 1 (cold) 182.6 s for the 7B JIT shape set; run 2 (warm)
+7.5 s → **4.26 tok/s**. Batch 1, 32 tokens, single run.
+
+Context on the same box: Qwen3-0.6B measures 7.3 tok/s warm at 64 tokens, so a
+7B at 4.26 is in the expected band rather than an anomaly.
+
+**Not a gate, and deliberately not a claim.** One run, no idle-box statement, no
+clock state, no same-binary A/B — it does not meet the bar in
+`.agents/benchmarking.md` and is recorded here so the next person does not
+re-run it believing it is unmeasured, not so it can be quoted.
+
+**No vLLM denominator exists or can:** vLLM has no Tenstorrent backend at all,
+which is the AGENTS.md "When vLLM has no implementation" case. The correctness
+oracle for this lane is `transformers` (`.agents/oracles/transformers.md`); there
+is no throughput oracle, so the vLLM speed axis is an **OPEN GAP** for this row
+rather than a comparison that was run and lost.
+
+Measured by lu-zero (PR #431, issue #670); recorded here because a measurement
+belongs on the measurement surfaces, not only in a row spec.
