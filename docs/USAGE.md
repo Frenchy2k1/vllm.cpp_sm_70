@@ -2196,3 +2196,95 @@ NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
 still says the projection is biased. Without the refusal that renders a plausible
 video for the wrong prompt: every conditioning row is shifted by the missing bias
 and every padded row projects to 0 instead of to the bias.
+
+## MiniMax-Music3: the checkpoint loader
+
+**It loads, it does not generate.** `include/vllm/model_executor/models/`
+`minimax_music3_loader.h` is phase W1 of #672 — it resolves the shipped
+`diffusers` layout, parses the six component configs, and accounts every tensor
+in the files against what those configs owe. No forward, no scheduler step and
+no audio; those are W2-W7, and nothing below produces a song.
+
+Point it at the **diffusers arm**, the six-component tree:
+
+```
+minimax-music3/
+  modular_model_index.json
+  transformer/           config.json + 2 shards + index   441 tensors  F32
+  condition_encoder/     config.json + 1 file               4 tensors  F32
+  rvq_depth_decoder/     config.json + 1 file              47 tensors  BF16
+  vocoder/               config.json + 1 file             121 tensors  F32
+  language_model/        config.json + 4 shards + index   399 tensors  BF16
+  scheduler/scheduler_config.json
+  tokenizer/
+```
+
+`MiniMaxMusic3ResolveCheckpoint` refuses anything else **by name**, and the
+refusal you are most likely to hit is the useful one. The same repository also
+ships a **native** arm — `qwen_7B/qwen_7B/`, `flowmatching_vae.pth`, `dav.pth` —
+which SGLang-Omni serves and which holds every weight this port needs in a layout
+nothing here reads. Pointed at that tree the loader names it as the native arm,
+lists the diffusers components it lacks, and tells you to convert it with
+diffusers' `scripts/convert_minimax_music3_to_diffusers.py`. It is never
+silently mis-loaded.
+
+Two things the loader enforces that a correctness gate later could not catch:
+
+**On-disk dtype and runtime dtype are different things, and the loader keeps
+them apart.** The files store F32 for the transformer, condition encoder and
+vocoder and BF16 for the RVQ depth decoder and language model, and
+`MiniMaxMusic3AccountTensors` refuses a file that disagrees. That set is *not* a
+runnable configuration. Upstream casts in exactly two places, `denoise.py:83`
+(condition encoder output into the transformer) and `decoders.py:84` (latents
+into the vocoder), and never on the way in: `denoise.py:82` hands the language
+model's hidden states to the condition encoder with a device move and no dtype
+move. So the autoregressive half must share one dtype, and loading the on-disk
+set raises `Input type (c10::BFloat16) and bias type (float) should be the same`
+from `condition_embedder_minimax_music3.py:64`.
+
+`MiniMaxMusic3ResolveRuntimeDtypes` answers the runtime question.
+`kBf16ArFp32Acoustic` is the gated configuration: language model, depth decoder
+and condition encoder in bf16, transformer and vocoder in fp32.
+`MiniMaxMusic3CheckRuntimeDtypes` refuses a violation by name, listing all three
+autoregressive components with their dtypes, because upstream's own error names
+a bias dtype and never says which component disagreed with which.
+`kAsStored` is kept selectable so that failure stays reproducible; it is
+reported as not runnable rather than quietly repaired.
+
+**The vocoder's weight norm is folded at load.** Its 30 weight-normed
+convolutions ship as torch's legacy `weight_g`/`weight_v` pairs;
+`MiniMaxMusic3LoadVocoderWeights` collapses each to a single `<module>.weight`
+through `vocoder1d::MaterializeWeightNorm`, so no `_g`/`_v` name survives and
+nothing downstream can read the direction `v` as if it were the weight. Four of
+the thirty are `ConvTranspose1d`, whose weight is `[C_in, C_out, K]` — torch
+reduces over dimension 0 either way, which for those four is the *input* channel.
+
+### Running its gate
+
+The suite needs no checkpoint. `tests/vllm/models/minimax_music3_manifest.inc`
+carries the real checkpoint's own safetensors headers — 1012 entries of names,
+dtypes and shapes, no weight bytes — and every geometry claim is asserted
+against it:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_loader
+./build/tests/test_minimax_music3_loader
+```
+
+One test case additionally exercises the real 27 GB tree when you name it, and
+loudly skips when you do not:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_loader
+```
+
+Regenerate the manifest after a checkpoint revision moves — it reads headers
+only, so it does not stream the weights:
+
+```sh
+python3 scripts/gen-minimax-music3-manifest.py \
+  --checkpoint /path/to/minimax-music3 \
+  --output tests/vllm/models/minimax_music3_manifest.inc
+```

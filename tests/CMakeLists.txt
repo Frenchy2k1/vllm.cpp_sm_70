@@ -127,6 +127,12 @@ target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vll
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
 target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
+# MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
+# the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
+# weight bytes) so CI never needs the 28.5 GB asset.
+vllm_cpp_add_test(test_minimax_music3_loader vllm/models/test_minimax_music3_loader.cpp)
+target_include_directories(test_minimax_music3_loader PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).
