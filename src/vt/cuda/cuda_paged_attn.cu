@@ -129,6 +129,7 @@ void SetDynamicSmemOptIn(const void* kernel, size_t bytes, const char* what) {
 
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
+__device__ inline float Load(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
 
@@ -2112,6 +2113,36 @@ void LaunchPagedBlock(cudaStream_t s, Tensor& out, const Tensor& query, const Te
       v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal, WindowLeft(args),
       WindowRight(args), args.k_scale, args.v_scale);
   Check(cudaGetLastError(), "paged_attention decode launch");
+}
+
+// Parity oracle for the sm70 FA2 decode fast path (Phase 2 brick F): re-runs
+// the SAME paged tensors through the generic reference PagedAttentionKernel so
+// a host test can diff the two. Decode => one token per request; here we
+// synthesize the decode query_start_loc (r -> r) the reference scans.
+extern "C" void vt_sm70_fa2_ref_decode(
+    float* out, const void* q, const void* k, const void* v,
+    const int32_t* block_table, const int32_t* seq_lens,
+    int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d, int64_t block_size,
+    int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale, cudaStream_t stream) {
+  int32_t* d_qsl = nullptr;
+  if (cudaMalloc(&d_qsl, (num_reqs + 1) * sizeof(int32_t)) != cudaSuccess) return;
+  {
+    int32_t* h_qsl = new int32_t[(size_t)num_reqs + 1];
+    for (int64_t i = 0; i <= num_reqs; ++i) h_qsl[i] = (int32_t)i;
+    cudaMemcpy(d_qsl, h_qsl, (num_reqs + 1) * sizeof(int32_t), cudaMemcpyHostToDevice);
+    delete[] h_qsl;
+  }
+  const dim3 grid((unsigned)num_reqs, (unsigned)hq);
+  const size_t shmem = ((size_t)d + kPagedBlock) * sizeof(float);
+  PagedAttentionKernel<__half, __half, float, false><<<grid, kPagedBlock, shmem, stream>>>(
+      out, static_cast<const __half*>(q), static_cast<const __half*>(k),
+      static_cast<const __half*>(v), block_table, seq_lens, d_qsl,
+      num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
+      vc_blk, vc_pg, vc_hd, scale, /*softcap=*/0.f, /*causal=*/true,
+      /*window_left=*/1, /*window_right=*/1);
+  Check(cudaGetLastError(), "sm70 fa2 oracle decode");
+  cudaFree(d_qsl);
 }
 
 template <typename TQ, typename TKV, typename Tout>
