@@ -325,6 +325,18 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+# UNALIGNED SAFETENSORS PAYLOADS (#772, fourth recurrence after #301/#627/#674).
+# The four loaders that formed a `const uint16_t*` over an mmap'd tensor, driven
+# over checkpoints whose payload parity is FORCED odd by one space of JSON header
+# padding. Two of the four launder every access through `memcpy`, so UBSan cannot
+# see them and only these value checks can — which is why this is a suite of its
+# own and not another sanitizer sweep.
+vllm_cpp_add_test(test_loader_unaligned_offsets
+  vllm/models/test_loader_unaligned_offsets.cpp)
+# The two Voxtral loader steps are declared in an INTERNAL header (src/, not
+# include/): they are not public ABI and must not become so for a test's sake.
+target_include_directories(test_loader_unaligned_offsets PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
 # The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
 # config-resolution case reads the real document (nested `rope_parameters`, 92
