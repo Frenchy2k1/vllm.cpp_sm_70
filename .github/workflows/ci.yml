@@ -330,8 +330,25 @@ jobs:
         # the triggering ref, on a PR `refs/pull/N/merge`); with no match it
         # writes FETCH_HEAD only. Naming the refspec creates the ref whatever
         # the checkout is configured to do.
+        #
+        # The `row/*` refspec is the OTHER half of the same argument (#726).
+        # The classifier's IN-FLIGHT verdict is reached only through a ref named
+        # `row/<ID>`, and fetching `main` alone left none in the checkout -- so
+        # IN-FLIGHT was unreachable and a row whose work is genuinely in flight
+        # produced the same verdict as one nobody is working on. Every PR that
+        # moves a row to ACTIVE before its code lands failed here, which is the
+        # normal shape of the work. `require_branch_information` now aborts
+        # rather than misreport if this refspec is ever dropped again.
+        #
+        # It does not cover a FORK, whose branch is a ref `origin` cannot hold;
+        # that case is covered inside the audit, by reading `origin/main..HEAD`.
+        #
+        # Cost measured at `af026e524`: 267 `row/*` heads carrying 648 commits
+        # not on `origin/main`, over a `fetch-depth: 0` checkout that already
+        # holds main's history.
         run: |
-          git fetch -q origin +refs/heads/main:refs/remotes/origin/main
+          git fetch -q origin +refs/heads/main:refs/remotes/origin/main \
+            '+refs/heads/row/*:refs/remotes/origin/row/*'
           python3 scripts/audit-live-rows.py --check
           python3 tests/scripts/test_audit_live_rows.py
   documentation-checkpoint:
