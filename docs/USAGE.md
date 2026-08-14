@@ -198,6 +198,26 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
+`--model` resolves a Qwen3.5-family checkpoint's backbone under EITHER weight
+namespace. The multimodal wrappers (`Qwen3_5ForConditionalGeneration`,
+`Qwen3_5MoeForConditionalGeneration`) publish the text backbone nested under
+`model.language_model.`; the text-only arms (`Qwen3_5ForCausalLM`,
+`Qwen3_5MoeForCausalLM`) publish it flat under `model.`. The loader decides which
+ONCE per checkpoint from the shard index, and REFUSES a checkpoint that carries
+backbone tensors under both rather than binding half the model from each.
+
+**Resolving the namespace is not the same as loading the checkpoint, and the
+MoE and dense arms differ.** The dense loader routes each projection to BF16,
+FP8 or NVFP4 by tensor presence, so a flat bf16 `Qwen3_5ForCausalLM` checkpoint
+is expected to load. The **MoE** loader reads only PER-EXPERT NVFP4 routed
+experts, while the published MoE repos (`Qwen/Qwen3.8-2.4T-A95B`,
+`Qwen/Qwen3.6-35B-A3B`) ship 3-D stacked, unquantized experts — that arm is
+**not implemented**, and such a checkpoint is refused at load with a message
+naming what is missing. Use an NVFP4 requant (e.g.
+`nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE path. No text-only Qwen3.5
+checkpoint has been RUN here at all — see [STATUS.md](STATUS.md) for the owed
+run gates.
+
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native
 Windows release artifacts are not published yet; they will remain unavailable
