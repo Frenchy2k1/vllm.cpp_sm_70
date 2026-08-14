@@ -33,3 +33,16 @@ TEST_CASE("sm70 nvfp4-w4a16 tactic is registered and selectable for sm70") {
 }
 
 }  // namespace vt::cuda
+
+// On-box device driver for the W4A16 family (cuda_sm70_nvfp4_gemm.cu):
+// SIMT decode, fused greedy-argmax vs CPU max, and the k%128 decline path.
+extern "C" int vt_sm70_nvfp4_selfcheck(void);
+
+TEST_CASE("sm70 nvfp4-w4a16 device self-check (SIMT + fused-argmax + decline)") {
+  const int rc = vt_sm70_nvfp4_selfcheck();
+  if (rc == 2) {
+    MESSAGE("not an sm_70 CUDA device: device self-check skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}

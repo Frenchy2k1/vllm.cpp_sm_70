@@ -668,6 +668,14 @@ bool LaunchSm70Nvfp4W4a16(const DeviceCaps&, void* argsPtr) {
   auto* scales = static_cast<const uint8_t*>(args.scales);
 
 if (m <= 3) {
+    // Fused greedy-argmax only serves M == 1 with k % 128 == 0 (the fork
+    // contract). Any other argmax request must be DECLINED so the caller uses
+    // its portable path — never silently plain-decode while leaving the
+    // argmax buffers untouched (which would also poison the live self-check).
+    if (m == 1 && (args.argmax_idx != nullptr || args.argmax_val != nullptr) &&
+        !(args.argmax_idx != nullptr && args.argmax_val != nullptr && (k % 128) == 0)) {
+      return false;
+    }
     constexpr int KC = 512;
     // Fused greedy-argmax: single-row decode that emits the per-8-column
     // winners instead of the row (n%8; cross-block reduce is the caller's).
@@ -776,4 +784,148 @@ struct Registrar {
 static Registrar g_registrar;
 
 }  // namespace
+
+// On-box driver for the brick A-D family: builds small W4A16 fixtures and runs
+// the registered tactic's launcher directly (the live path a real head would
+// call), CPU-oracle parity per band + the fused-argmax CPU max + the k%128
+// decline contract. Returns 0 = all good, 2 = not an sm_70 device (skip).
+extern "C" int vt_sm70_nvfp4_selfcheck(void) {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
+
+  auto rnd = [](uint64_t& s) -> uint32_t {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s;
+  };
+  auto f2h = [](float f) -> __half { return __float2half_rn(f); };
+
+  cudaStream_t st = 0;
+  Sm70Nvfp4W4a16Args args{};
+  args.stream = st;
+  args.gscale = 1.0f;
+
+  // Case A: SIMT decode M=2, n=64, k=512.
+  {
+    const int m = 2, n = 64, k = 512;
+    uint64_t s = 0x1234;
+    std::vector<__half> x((size_t)m * k), y((size_t)m * n);
+    std::vector<uint8_t> codes((size_t)n * (k >> 1)), scales((size_t)n * (k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd(s);
+    for (auto& v : scales) v = (uint8_t)rnd(s);
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 2000) - 10.f);
+    void* dx; void* dc; void* ds; void* dy;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, y.size() * sizeof(__half));
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&ds, scales.size());
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    args.m = m; args.n = n; args.k = k; args.out = dy; args.x = dx;
+    args.codes = dc; args.scales = ds;
+    args.argmax_val = nullptr; args.argmax_idx = nullptr;
+    const bool ok = LaunchSm70Nvfp4W4a16(caps, &args);
+    cudaDeviceSynchronize();
+    if (!ok) { cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); return 1; }
+    cudaMemcpy(y.data(), dy, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    const auto ref = CpuReference(m, n, k, x, codes, scales, args.gscale);
+    for (size_t i = 0; i < y.size(); ++i) {
+      if (std::fabs((double)__half2float(y[i]) - (double)ref[i]) >
+          2.0e-2 * std::max(1.0, std::fabs((double)ref[i]))) {
+        cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); return 1;
+      }
+    }
+    cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds);
+    fprintf(stderr, " [selfcheck] case A (SIMT M2xN64) parity OK\n");
+  }
+
+  // Case B: fused greedy-argmax M=1, n=128, k=512 (k%128==0) -> per-8-col
+  // winners; harness reduces to the row argmax and CPU-checks val+idx.
+  {
+    const int m = 1, n = 128, k = 512;
+    uint64_t s = 0x2223;
+    std::vector<__half> x((size_t)m * k), amval((size_t)(n / 8));
+    std::vector<int> amidx((size_t)(n / 8));
+    std::vector<uint8_t> codes((size_t)n * (k >> 1)), scales((size_t)n * (k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd(s);
+    for (auto& v : scales) v = (uint8_t)rnd(s);
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 100) - 0.f);
+    void *dx, *dc, *ds, *dv, *di, *dy;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, sizeof(__half));
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&ds, scales.size());
+    cudaMalloc(&dv, (n / 8) * sizeof(__half));
+    cudaMalloc(&di, (n / 8) * sizeof(int));
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    args.m = m; args.n = n; args.k = k; args.out = dy; args.x = dx;
+    args.codes = dc; args.scales = ds; args.argmax_val = dv; args.argmax_idx = reinterpret_cast<int*>(di);
+    const bool ok = LaunchSm70Nvfp4W4a16(caps, &args);
+    cudaDeviceSynchronize();
+    cudaMemcpy(amval.data(), dv, (n / 8) * sizeof(__half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(amidx.data(), di, (n / 8) * sizeof(int), cudaMemcpyDeviceToHost);
+    if (!ok) { cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); cudaFree(dv); cudaFree(di); return 1; }
+    const auto ref = CpuReference(m, n, k, x, codes, scales, args.gscale);
+    // The kernel's winner per 8-col block is the argmax of the HALF-ROUNDED
+    // values, strict > (lowest index wins). Verify each block against that
+    // exact rule (not the fp32 global max, which can tie differently after
+    // __float2half and spuriously fail the check).
+    bool bad = false;
+    for (int b = 0; b < n / 8 && !bad; ++b) {
+      int bb = 0;
+      float bbv = __half2float(__float2half_rn(ref[(size_t)(b * 8)]));
+      for (int c2 = 1; c2 < 8; ++c2) {
+        const float c2v = __half2float(__float2half_rn(ref[(size_t)(b * 8 + c2)]));
+        if (c2v > bbv) { bbv = c2v; bb = c2; }
+      }
+      if (amidx[(size_t)b] != b * 8 + bb ||
+          std::fabs((double)__half2float(amval[(size_t)b]) - (double)bbv) > 1.0e-3) {
+        bad = true;
+      }
+    }
+    fprintf(stderr, " [selfcheck] case B (fused argmax) bad=%d\n", bad ? 1 : 0);
+    cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); cudaFree(dv); cudaFree(di);
+    if (bad) return 1;
+  }
+
+  // Case C: argmax requested at k%128 != 0 must be DECLINED (portable path),
+  // not silently plain-decoded.
+  {
+    const int n = 8, k = 96;
+    uint64_t s = 0xbeef;
+    std::vector<__half> x((size_t)k);
+    std::vector<uint8_t> codes((size_t)n * (k >> 1)), scales((size_t)n * (k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd(s);
+    for (auto& v : scales) v = (uint8_t)rnd(s);
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 100));
+    void* dx, *dc, *ds, *dv, *di, *dy;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, sizeof(__half));
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&ds, scales.size());
+    cudaMalloc(&dv, 1 * sizeof(__half));
+    cudaMalloc(&di, 1 * sizeof(int));
+    __half sentinel_v = f2h(-99.f); int sentinel_i = -77;
+    cudaMemcpy(dv, &sentinel_v, 1 * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(di, &sentinel_i, 1 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    args.m = 1; args.n = n; args.k = k; args.out = dy; args.x = dx;
+    args.codes = dc; args.scales = ds; args.argmax_val = dv; args.argmax_idx = reinterpret_cast<int*>(di);
+    const bool declined = !LaunchSm70Nvfp4W4a16(caps, &args);
+    cudaDeviceSynchronize();
+    __half gotv; int goti;
+    cudaMemcpy(&gotv, dv, sizeof(__half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&goti, di, sizeof(int), cudaMemcpyDeviceToHost);
+    fprintf(stderr, " [selfcheck] case C decline ok=%d goti=%d gotv=%f\n",
+            declined ? 1 : 0, goti, (double)__half2float(gotv));
+    cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); cudaFree(dv); cudaFree(di);
+    // declined AND the argmax buffers are untouched (still sentinels -77 / -99)
+    if (!declined || goti != -77 || std::fabs((double)__half2float(gotv) + 99.0) > 1e-3) return 1;
+  }
+  return 0;
+}
+
 }  // namespace vt::cuda
