@@ -488,6 +488,22 @@ target_compile_definitions(test_nemotron_h_scaffold PRIVATE
 target_include_directories(test_nemotron_h_scaffold PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# Nemotron-H W4 FORWARD gate (#517, .agents/specs/nemotron-h-model.md §4 W4): the
+# hybrid layer loop over all three block kinds, every block compared ELEMENTWISE
+# against a reference written independently in `double` from the upstream
+# formulas — not against a second call of the code under test, and not through a
+# helper both arms share. Both dtype arms (f32 and the released bf16) on every
+# case; a LONG-prompt arm as well as a short one, because only 6 of 52 layers are
+# attention; the SSD chunk-size invariance; the SSM state dtype carried across
+# two legs, which is the only way it is observable at all; the routed scale on
+# the OUTPUT rather than the router weights or logits; the f32 router; and the
+# no-RoPE finding. CPU-only, no checkpoint, no speed claim.
+vllm_cpp_add_test(test_nemotron_h_forward vllm/models/test_nemotron_h_forward.cpp)
+# nemotron_h.h / nemotron_h_forward.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/: W4 ships nothing on the public ABI and include/vllm/ is a
+# USER_USAGE_PREFIXES surface (#515). Same call as the W1 resolver header.
+target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole
