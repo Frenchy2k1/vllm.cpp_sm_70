@@ -494,8 +494,16 @@ ENGINE_PREFIXES = (
 # selects them platform-wide via `current_platform.is_cpu()`, so hybrid placement
 # is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
 # `READY`, spec `specs/hybrid-placement.md`, issue #149.
+# 156 since 2026-08-14: +`ENG-RECORD-ANCHOR-RATCHET` (the record's own `path:line`
+# citations are 82% unchecked -- `LINK_RE` in THIS file matches only markdown
+# links, so 2137 bare `file.cpp:123` citations across the five matrices are never
+# parsed, against 480 that are; and the 18% seen is only range-checked, never
+# checked to contain the symbol named beside it). Found by three stale anchors that
+# humans caught by reading during the 2026-08-13/14 campaign, all of them IN RANGE.
+# Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
+# parser, no baseline and no test exists yet.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 155
+ENGINE_ROWS = 156
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
