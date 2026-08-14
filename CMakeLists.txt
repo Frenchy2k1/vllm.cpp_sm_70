@@ -770,6 +770,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/vocoder1d.cpp
   src/vllm/model_executor/models/minimax_music3_loader.cpp
+  src/vllm/model_executor/models/minimax_music3_quant.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
