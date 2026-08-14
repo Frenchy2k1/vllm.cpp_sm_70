@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** W0 — spec committed, no engine code.
+**Status:** W0 — spec committed, diffusers oracle gateable, no engine code.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -29,10 +29,11 @@ from what is still assumed.
 **Measured** (safetensors headers by HTTP range request, and each component's
 `config.json`): every geometry and dtype in §1. **Read** (upstream source at the
 pinned SHAs): the component decomposition, the native↔diffusers relationship, and
-the dtype policy. **Not established:** that the oracle runs here at all — no
-diffusers execution of this model has happened on this project's hardware, which
-is why `.agents/oracles/diffusers.md` still records `gateable = no`. W0 is not
-complete until it does.
+the dtype policy. **Established 2026-08-14, after this section was
+written:** the oracle runs here — `tools/oracle/music3_oracle.py` loaded all seven
+components and generated audio, so `.agents/oracles/diffusers.md` records
+`gateable = yes` against a golden path. That measurement was taken on CPU;
+nothing about speed is established.
 
 **This model has no token-exact gate on its generative half.** Like MiniMax-H3, the
 acoustic path is a flow-matching denoise loop with no logits and no sampler, so the
@@ -152,20 +153,47 @@ assumed from reading the script.
 that layout is **refused by name** with a message saying so. It is not silently
 mis-loaded, and it is recorded as owed rather than discovered later.
 
-### 2.1 The dtype policy is upstream's, and it is deliberate
+### 2.1 dtype — ON DISK IS NOT RUNNABLE (corrected 2026-08-14 by the oracle)
 
-`convert_minimax_music3_to_diffusers.py:267` defaults `--dtype float32`; the
-transformer, condition encoder and vocoder take that dtype (`:208-211`) while the
-RVQ depth decoder is forced to bf16 regardless (`:214`). That matches the measured
-headers exactly, and SGLang-Omni's README states both of its placements "run the
-acoustic stage in FP32".
+**An earlier revision of this section was wrong, and the correction is the point.**
+It read the converter — `convert_minimax_music3_to_diffusers.py:267` defaults
+`--dtype float32`, transformer/condition_encoder/vocoder take it (`:208-211`), the
+RVQ depth decoder is forced to bf16 (`:214`) — saw that it matched the measured
+headers exactly, and concluded that the on-disk set *was* upstream's resolved
+runtime policy, to be mirrored as-is. Standing the oracle up refuted that.
 
-So fp32 on the DiT and the vocoder is **upstream's resolved choice, not a
-too-wide accident** — the case AGENTS.md warns about (a token gate cannot see a
-dtype that is too wide) does not apply here, because the oracle is fp32 too. Each
-fp32 buffer on this path still carries the one-line reason the policy requires,
-naming this section. Any future narrowing to bf16 is a measured change with its
-own evidence, never a silent default.
+**Loading the on-disk dtypes and running upstream's own pipeline raises**
+`RuntimeError: Input type (c10::BFloat16) and bias type (float) should be the
+same` at `condition_embedder_minimax_music3.py:64`. The reason is that upstream
+casts in exactly **two** places and nowhere else — `denoise.py:83` (condition →
+`transformer.dtype`) and `decoders.py:84` (latents → `vocoder.dtype`) — so the
+condition encoder and the depth decoder consume the language model's hidden states
+**uncast**.
+
+**The invariant every runnable configuration satisfies:**
+
+```
+dtype(language_model) == dtype(rvq_depth_decoder) == dtype(condition_encoder)
+```
+
+**The gated configuration is bf16 AR half / fp32 acoustic half**: language model,
+depth decoder and condition encoder in bf16; transformer and vocoder in fp32. That
+is the converter's default for the DiT and vocoder, and what SGLang-Omni states it
+runs ("both layouts run the acoustic stage in FP32").
+
+Two things follow, and they are the reason this correction is worth its space.
+**On-disk dtype and runtime dtype are different facts about this checkpoint**, and
+a per-tensor header read answers only the first — the measurement in §1 is still
+correct, the inference drawn from it was not. And **fp32 on the acoustic half is
+still upstream's choice rather than a too-wide accident**, so the original
+conclusion survives for the DiT and vocoder even though its reasoning did not;
+each fp32 buffer carries the one-line reason AGENTS.md requires, naming this
+section.
+
+**W1 therefore enforces the equality above at load time and refuses a violating
+configuration BY NAME**, naming the three components and their dtypes, rather than
+letting it surface as a type error deep inside a forward pass. The oracle keeps
+`--dtype-policy on-disk` selectable so the failure stays reproducible.
 
 ---
 
@@ -275,7 +303,7 @@ the operator. Phases are separately claimable except where noted.
 
 | Phase | Scope | Done when |
 |---|---|---|
-| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**); **stand the diffusers oracle up and prove it builds and runs** | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
+| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**) and confirmed at runtime (**DONE**); stand the diffusers oracle up and prove it builds and runs (**DONE**, `tools/oracle/music3_oracle.py`) | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
 | **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
 | **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
 | **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
@@ -325,7 +353,20 @@ pinned SHA.
 
 ## Now
 
-W0 — spec committed, no engine code. Next: pin both oracles in `.agents/oracles/`,
-stand the diffusers oracle up far enough to prove it builds and runs this model,
-and resolve the sample-rate contradiction in §1.1 from source. W1 is not
-dispatched until W0's oracle is gateable.
+W0 — spec committed, the diffusers oracle **stood up and running**, no engine
+code. `.agents/oracles/diffusers.md` is `gateable = yes`: the oracle generated a
+44100 Hz stereo waveform from a fixed seed, §1's geometry and dtypes were
+re-derived from the loaded modules and agree, and the per-stage reference tensors
+W3–W5 gate against are committed under
+`tests/parity/goldens/minimax_music3_oracle/` with
+[`tools/oracle/music3_oracle.py`](../../tools/oracle/music3_oracle.py) as the
+reproducible recipe. §1.1 is confirmed at runtime, not merely from source: the
+pipeline returns 44100 Hz stereo with no resample.
+
+Two things W0 hands forward rather than closes. The on-disk dtype set of §2.1 is
+**not runnable through upstream's own pipeline** — the condition encoder and the
+depth decoder consume the language model's hidden states uncast, so they must
+share its dtype — which W1's loader has to mirror deliberately rather than
+inherit by accident. And the capture ran on CPU, so it is a correctness
+reference and no part of the speed axis. Still owed in W0: the SGLang-Omni
+oracle record. W1 is unblocked.
