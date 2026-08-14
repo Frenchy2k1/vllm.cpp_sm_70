@@ -174,6 +174,26 @@ target_compile_definitions(test_minimax_music3_ar_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 target_include_directories(test_minimax_music3_ar_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W4+W5 (#672): the ACOUSTIC half — the flow-matching DiT, the
+# FlowMatchEulerDiscreteScheduler with invert_sigmas, the CFG mix, the denoise
+# loop's window bookkeeping and the DAC Flow-VAE vocoder — against goldens
+# produced by EXECUTING upstream's own classes at reduced dimensions in float32
+# (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
+# companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
+vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+target_include_directories(test_minimax_music3_acoustic PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
+# the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
+# vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;
+# every case emits a loud SKIP when the 28.5 GB asset is absent, so CI still
+# compiles, links and runs it.
+vllm_cpp_add_test(test_minimax_music3_acoustic_real
+  parity/test_minimax_music3_acoustic_real.cpp)
+target_compile_definitions(test_minimax_music3_acoustic_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_acoustic_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).
