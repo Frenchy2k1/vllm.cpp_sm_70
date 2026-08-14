@@ -771,6 +771,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_loader.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
@@ -850,6 +851,7 @@ add_library(vllm STATIC
   # load-time device staging GB10's ATS penalty makes the default.
   src/vllm/model_executor/models/ltx2_loader.cpp
   src/vllm/entrypoints/openai/video_api.cpp
+  src/vllm/entrypoints/openai/speech_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
