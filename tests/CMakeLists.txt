@@ -215,6 +215,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
+# PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
+# ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
+# lives next to the test source.
+vllm_cpp_add_test(test_ltx2_image_cond vllm/multimodal/test_ltx2_image_cond.cpp)
+target_include_directories(test_ltx2_image_cond
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
