@@ -294,6 +294,12 @@ expect_feature("120a" "sm70-nvfp4-gemm" "")
 expect_feature("70;121a" "sm70-nvfp4-gemm" "70")
 expect_feature("70;80" "sm70-nvfp4-gemm" "70")
 
+# --- SM70 FA2-V1 (vendored fragment core) ----------------------------------
+expect_feature("70" "sm70-fa2-v1" "70")
+expect_feature("121a" "sm70-fa2-v1" "")
+expect_feature("80" "sm70-fa2-v1" "")
+expect_feature("70;121a" "sm70-fa2-v1" "70")
+
 # --- SM70 TOOLCHAIN GATE (nvcc < 13 only) ----------------------------------
 # CUDA 13.0 removed offline compilation for architectures below 7.5, so a `70`
 # request must be refused on nvcc >= 13 at configure time and allowed on the
