@@ -247,6 +247,12 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
+# The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
+# config-resolution case reads the real document (nested `rope_parameters`, 92
+# `layer_types`, transformers-4.57.3 `dtype`) instead of a paraphrase of it.
+target_compile_definitions(test_qwen3_8_text_only PRIVATE
+  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json")
 # POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
 # pool's free list must be keyed by DEVICE as well as size class, or a block
 # allocated through one backend is handed to a DBuf running on another —

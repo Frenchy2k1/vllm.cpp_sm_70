@@ -80,7 +80,7 @@ are our reading of their documented behavior, not measurements.
 | Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
 | `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
-| Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
+| Safetensors direct load, no conversion | ✅ at ANY tensor byte offset: the format aligns nothing, so the `*_weights.cpp` loaders never form a typed pointer into the mapping (#627). `voxtral.cpp`, `qwen3_vl.cpp`, `qwen3_5_mtp.cpp` still do and are OWED | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
@@ -111,6 +111,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 |---|---|---|---|
 | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16 | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3 | `unsloth` 27B at/above vLLM, `nvidia` ModelOpt 0.85x; 4B throughput 1.021x. Loads BF16, FP8 and NVFP4 (CT + ModelOpt naming); a `modelopt_mixed` FP8 tower stays NATIVE (#164), GDN `in_proj_qkvz` merged. CUDA/CPU only |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
+| `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | none: no text-only Qwen3.5 checkpoint fits this hardware | **NO RUN GATE, OWED.** Dispatch/config/namespace gated on `test_qwen3_8_text_only.cpp`; NO token claim. MoE reads ONLY per-expert NVFP4: the published stacked/bf16 layout is unimplemented, OWED, refused by name | not measured |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
 | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |
 | `Qwen3VLForConditionalGeneration` | Qwen3-VL-4B-Instruct (image + video) | image strict 32/32, video near-tie vs vLLM 0.25.0 | vision tower 0.57x vs vLLM encode; umbrella pending |
