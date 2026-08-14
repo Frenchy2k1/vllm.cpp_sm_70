@@ -1503,6 +1503,8 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT`: `ACTIVE`: OPT-125m strict 6/6 on Blackhole; 17 ops. Qwen3 is wired; its full 16x16 gate and speed remain pending.
 
+`BACKEND-TENSTORRENT-MISTRAL`: `ACTIVE`: Mistral-7B-v0.3 gated on a Blackhole P150, 16/16 prompts (12/16 strict token-exact, 4/16 inside the near-tie band, 0 forward-divergent), max gap 0.062 nats. `MistralForCausalLM` is allowlisted by exact match, so `Mistral3ForConditionalGeneration` (#387, unported) still falls through. Correctness only -- no speed claim.
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`

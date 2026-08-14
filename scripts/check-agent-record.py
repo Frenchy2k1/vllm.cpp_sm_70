@@ -281,7 +281,11 @@ MATRICES = {
     # row owing residual-RMS numerics evidence at the device boundary (rows>=32
     # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
     # RED-first probe lands.
-    "BACKEND": (AGENTS / "backend-matrix.md", 81),
+    # 82 since 2026-08-11: +`BACKEND-TENSTORRENT-MISTRAL`, allowlist
+    # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
+    # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
+    # gate.
+    "BACKEND": (AGENTS / "backend-matrix.md", 82),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
