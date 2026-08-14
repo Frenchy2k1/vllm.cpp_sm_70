@@ -380,7 +380,10 @@ set(VT_CUDA_FEATURE_TABLE
   # the Ampere sm_8x cells are DERIVED+BUILD-VERIFIED (testing-welcome) — compiled
   # + cuobjdump-proven sm_8x cubins, NO Ampere board ran them here. A green build
   # is never a runtime claim. See .agents/specs/cuda-arch-ampere-fastpath.md WA-1.
-  "fa2|8.0,8.6,8.7,8.9,12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)")
+  "fa2|8.0,8.6,8.7,8.9,12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)"
+  # Volta W4A16 NVFP4 decode GEMM (cuda_sm70_nvfp4_gemm.cu), Phase-2 brick A.
+  # upstream: none (Volta removed upstream); source: dnv2003/v100-skinny SIMT.
+  "sm70-nvfp4-gemm|7.0|sm70 W4A16 NVFP4 SIMT decode (M<=3; QPN/WMMA next)")
 
 # vt_cuda_feature_archs(<OUT_ARCHS> <FEATURE>)
 #   Resolves FEATURE against the requested VLLM_CPP_CUDA_ARCHITECTURES and sets

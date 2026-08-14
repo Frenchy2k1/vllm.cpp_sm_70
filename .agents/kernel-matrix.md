@@ -279,3 +279,5 @@ were removed while their specs and same-tool traces remain. Lifecycle stays
 - Adding a family requires an upstream/dependency anchor, tests-to-port entry,
   spike order, and updated counts in the same commit. Splitting a block preserves
   its original ID as an umbrella or records an explicit supersession mapping.
+
+| `KERNEL-SM70-NVFP4-W4A16-SIMT` | sm70 W4A16 NVFP4 decode GEMM, SIMT band (M<=3), Volta | ported from dnv2003/v100-skinny `skinny_kernels.cu` (Apache-2.0); TurboMind E2M1 decoder | `src/vt/cuda/cuda_sm70_nvfp4_gemm.cu` + `TacticFamily::kSm70Nvfp4W4a16` | self-check contract: first two calls vs CPU fp32 ref; `test_sm70_nvfp4_gemm`, ctest green on the V100 box | `SM70` | `ACTIVE` — QPN/WMMA bands next |
