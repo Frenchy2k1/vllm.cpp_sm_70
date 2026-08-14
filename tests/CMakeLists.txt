@@ -149,6 +149,24 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 vllm_cpp_add_test(test_minimax_music3_loader vllm/models/test_minimax_music3_loader.cpp)
 target_include_directories(test_minimax_music3_loader PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# MiniMax-Music3 W2+W3 (#672): the AUTOREGRESSIVE half — prompt assembly, the
+# semantic CFG logit pipeline, the learned 8-layer condition mix and the RVQ
+# depth decoder — against goldens produced by EXECUTING upstream's own classes at
+# reduced dimensions in float32 (minimax_music3_ar_goldens.inc, no weight bytes).
+# The full-scale bf16 companion is tests/parity/test_minimax_music3_ar_real.cpp.
+vllm_cpp_add_test(test_minimax_music3_ar vllm/models/test_minimax_music3_ar.cpp)
+target_include_directories(test_minimax_music3_ar PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The FULL-SCALE companion: the REAL bf16 checkpoint driven on the REAL inputs,
+# against the committed oracle capture (frame_hiddens / condition_chunk0 /
+# rvq_codes). Checkpoint-gated on MUSIC3_CHECKPOINT or CHECKPOINT_ROOT; every
+# case emits a loud SKIP when the 28.5 GB asset is absent, so CI still compiles,
+# links and runs it.
+vllm_cpp_add_test(test_minimax_music3_ar_real parity/test_minimax_music3_ar_real.cpp)
+target_compile_definitions(test_minimax_music3_ar_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_ar_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).

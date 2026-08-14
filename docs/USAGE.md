@@ -2367,3 +2367,88 @@ python3 scripts/convert-indextts2-checkpoint.py \
 VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors \
   ./build/tests/test_indextts2_s2mel_loader
 ```
+
+## MiniMax-Music3: the autoregressive half
+
+Phases W2 and W3 of #672.
+`include/vllm/model_executor/models/minimax_music3_ar.h` is what consumes three
+of W1's six components: the prompt the `language_model` is driven with, the
+semantic stage's classifier-free-guidance logit pipeline, the learned 8-layer
+condition mix, and the 4-layer RVQ depth decoder. **It still does not generate a
+song** — the DiT, the scheduler and the vocoder are W4–W5, and the 8.6B
+`Qwen3ForCausalLM` forward itself is the remainder of W2.
+
+### The token gate the spec promised does not exist
+
+Worth stating plainly, because the spec said otherwise until this phase measured
+it. MiniMax-Music3's autoregressive stage has **no greedy path**:
+`_sample_top_k` (`encoders.py:94-103`) is the only sampler either stage uses, it
+has no temperature and no argmax branch, and it ends in
+`torch.multinomial(probs, 1, generator=generator)`. The oracle's
+`rvq_codes.npy` is a *seeded sample*, so matching it token-for-token would be
+reproducing torch's RNG rather than this model. Independently: both stages sample
+from a CFG mix of a conditional and an unconditional row, and the goldens store
+the conditional row only, so the guided distribution is not reconstructible from
+what is committed.
+
+The codes are therefore **inputs** to these gates, and the AR half is gated on
+tensors.
+
+### Running the gates
+
+The reduced-dimension gate needs no checkpoint. Its goldens come from executing
+upstream's own `MiniMaxMusic3ConditionEncoder` and `MiniMaxMusic3RVQDepthDecoder`
+at small dimensions in float32, so it isolates an algebra defect from rounding:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_ar
+./build/tests/test_minimax_music3_ar
+```
+
+The full-scale gate drives the real bf16 weights on the oracle capture's own
+inputs and skips loudly without the checkpoint:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_ar_real
+```
+
+It compares 176 128 values for the condition mix (against `condition_chunk0.npy`)
+and 716 800 for the depth decoder (against `frame_hiddens[:, 4096:]`, 25 frames ×
+7 depth steps), and it reports the counts rather than only a verdict.
+
+Regenerate the reduced-dimension goldens with the pinned oracle's interpreter
+(see `tools/oracle/README.md`) after an upstream change:
+
+```sh
+~/venvs/music3-oracle/bin/python scripts/gen-minimax-music3-ar-goldens.py \
+  --out tests/vllm/models/minimax_music3_ar_goldens.inc
+```
+
+### Two things that will bite a later phase
+
+**The code rows are offset by one from the frames.** `rvq_codes.npy` is `[26, 8]`
+and `frame_hiddens` is `[25, ...]`: row 0 of the codes is the priming decode step,
+which emits no frame (`encoders.py:342`). `rows[1:]` align with the frames.
+Comparing the unshifted sequences yields two individually plausible tensors and a
+wrong gate.
+
+**`ArCompute` is not a precision knob.** The autoregressive half runs bf16, and a
+bf16 torch module rounds at *every* op boundary, so an fp32 host forward is a
+different computation rather than a more precise one — measured, it leaves
+448 450 of 716 800 values beyond one bf16 ULP. `ArCompute::kBFloat16` mirrors the
+rounding; `kFloat32` is the reduced-dimension goldens' dtype. A caller at
+`kBFloat16` also owes its weights at bf16, *including* the condition encoder,
+whose file is fp32 while its runtime is not.
+
+And bit-exactness against torch is not on offer here, which is worth knowing
+before a later phase spends a day chasing it. torch's bf16 `nn.Linear` on CPU
+reproduces to 32 759 of 32 768 values, but its dispatched attention reproduces to
+only 25 736: the CPU kernel runs a blocked online softmax, and four candidate
+rounding models (pre-scaled q, bf16-rounded scores, bf16-rounded probabilities,
+and their combinations) were all *worse* than the plain form. The full-scale
+bound is therefore
+calibrated against torch's own `sdpa_kernel(MATH)` arm on the identical inputs
+(46.34% bit-identical, mean absolute error 1.659e-03) rather than against a
+bit-exactness that no second implementation can reach.
