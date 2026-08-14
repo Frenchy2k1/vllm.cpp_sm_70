@@ -36,6 +36,8 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <atomic>
+#include <cmath>
 
 #include "vt/cuda/cuda_device_caps.h"
 #include "vt/ops.h"
@@ -362,6 +364,13 @@ __device__ inline void LoadRow8(const float* p, int64_t base, int lane, float r[
     r[i + 4] = fb[i];
   }
 }
+// fp16 KV-cache decode (the sm70 wmma fast path's dtype). One uint4 = 8 halves.
+__device__ inline void LoadRow8(const __half* p, int64_t base, int lane, float r[8]) {
+  const uint4 w = reinterpret_cast<const uint4*>(p + base)[lane];
+  const __half* h = reinterpret_cast<const __half*>(&w);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) r[i] = __half2float(h[i]);
+}
 
 // EPL-generic row loaders, so the decode-opt kernel can serve a head_dim other
 // than 256. EPL == 8 forwards to LoadRow8, so the d256 path stays BYTE-FOR-BYTE
@@ -397,6 +406,17 @@ __device__ inline void LoadRowN<4, float>(const float* p, int64_t base, int lane
   for (int i = 0; i < 4; ++i) r[i] = fa[i];
 }
 
+template <>
+__device__ inline void LoadRowN<8, __half>(const __half* p, int64_t base, int lane, float* r) {
+  LoadRow8(p, base, lane, r);
+}
+template <>
+__device__ inline void LoadRowN<4, __half>(const __half* p, int64_t base, int lane, float* r) {
+  const uint2 w = reinterpret_cast<const uint2*>(p + base)[lane];
+  const __half* h = reinterpret_cast<const __half*>(&w);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) r[i] = __half2float(h[i]);
+}
 template <typename TQ, typename TKV, typename Tout, bool HasWindow, int EPL = kDecEpl>
 __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                               const TKV* v_cache, const int32_t* block_table,
@@ -2145,6 +2165,84 @@ extern "C" void vt_sm70_fa2_ref_decode(
   cudaFree(d_qsl);
 }
 
+#ifdef VLLM_CPP_HAS_SM70_FA2
+// --- sm70 WMMA decode fast path (Phase 2 brick F) adoption -------------------
+// Fast path entry (cuda_sm70_flash_attn.cu): raw-pointer decode; extern "C".
+extern "C" void vt_sm70_fa2_decode(
+    float* out, const void* q, const void* k, const void* v,
+    const int32_t* block_table, const int32_t* seq_lens,
+    int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d, int64_t block_size,
+    int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale, cudaStream_t stream);
+
+// Qtga2 build gate: exact profile the fast path serves (sm_70, fp16 q/kv,
+// float out, head_dim 64, causal, no softcap, no window). Everything else
+// falls through to the reference arms below.
+template <typename TQ, typename TKV, typename Tout>
+bool Sm70FaEligible(const PagedAttentionArgs& a, int64_t d, int64_t nkv) {
+  if constexpr (!(std::is_same_v<TQ, __half> && std::is_same_v<TKV, __half> &&
+                  std::is_same_v<Tout, float>)) return false;
+  if (!std::is_arithmetic_v<decltype(d)>) return false;
+  if (d != 64 || nkv <= 0) return false;
+  if (a.logits_soft_cap != 0.f || !a.causal) return false;
+  if (a.window_size.has_value()) return false;
+  const DeviceCaps& caps = GetDeviceCaps();
+  return caps.valid && caps.sm_major == 7 && caps.sm_minor == 0;
+}
+// Env gate (installable per-call so a test can toggle on/off the state): the
+// fast path is ON unless VT_SM70_FA2_DECODE == "0".
+inline bool Sm70FaEnabled() {
+  const char* e = getenv("VT_SM70_FA2_DECODE");
+  return !e || e[0] != '0';
+}
+// Live first-call parity against the reference on THESE tensors (the adoption
+// proves dispatch routing, then the mismatch disables the fast path).
+template <typename TQ, typename TKV, typename Tout>
+bool Sm70FaValidate(cudaStream_t s, float* out, const Tensor& query,
+                    const Tensor& k_cache, const Tensor& v_cache,
+                    const Tensor& block_table, const Tensor& seq_lens,
+                    const Tensor& query_start_loc, int64_t num_tokens, int64_t hq,
+                    int64_t d, int64_t num_reqs, int64_t nkv, int64_t block_size,
+                    float scale) {
+  const size_t bytes = (size_t)num_tokens * hq * d * sizeof(float);
+  float* tmp = nullptr;
+  if (cudaMalloc((void**)&tmp, bytes) != cudaSuccess) return false;
+  const dim3 grid((unsigned)num_tokens, (unsigned)hq);
+  const size_t shmem = ((size_t)d + kPagedBlock) * sizeof(float);
+  PagedAttentionKernel<__half, __half, float, false><<<grid, kPagedBlock, shmem, s>>>(
+      tmp, query.Ptr<__half>(), k_cache.Ptr<__half>(), v_cache.Ptr<__half>(),
+      block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+      query_start_loc.Ptr<int32_t>(), num_tokens, hq, nkv, d, block_size,
+      block_table.stride[0], block_table.stride[1],
+      k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
+      v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+      scale, /*softcap=*/0.f, /*causal=*/true, /*wl=*/1, /*wr=*/1);
+  vt_sm70_fa2_decode(out, query.Ptr<__half>(), k_cache.Ptr<__half>(),
+                     v_cache.Ptr<__half>(), block_table.Ptr<int32_t>(),
+                     seq_lens.Ptr<int32_t>(), num_tokens, hq, nkv, d, block_size,
+                     block_table.stride[0], block_table.stride[1],
+                     k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
+                     v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+                     scale, s);
+  cudaError_t err = cudaDeviceSynchronize();
+  bool ok = (err == cudaSuccess);
+  if (ok) {
+    std::vector<float> a(bytes / 4), b(bytes / 4);
+    cudaMemcpy(a.data(), out, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.data(), tmp, bytes, cudaMemcpyDeviceToHost);
+    ok = (cudaGetLastError() == cudaSuccess);
+    if (ok) {
+      for (size_t i = 0; i < a.size(); ++i) {
+        const double denom = b[i] > 1.0 ? b[i] : 1.0;
+        if (std::fabs((double)a[i] - b[i]) / denom > 3e-2) { ok = false; break; }
+      }
+    }
+  }
+  cudaFree(tmp);
+  return ok;
+}
+#endif  // VLLM_CPP_HAS_SM70_FA2
+
 template <typename TQ, typename TKV, typename Tout>
 void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                   const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
@@ -2152,11 +2250,43 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
                   int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
                   int64_t block_size) {
   const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(hq));
+#ifdef VLLM_CPP_HAS_SM70_FA2
+  // --- sm70 WMMA decode fast path (Phase 2 brick F) ---
+  // First-class adoption: when the head/arch/dtype profile matches, run the
+  // Volta WMMA decoder instead of the reference. First call (while enabled)
+  // live-checks against the reference on these same tensors and permanently
+  // disables the fast path on any mismatch (matches reference-on-first-call).
+  // VT_SM70_FA2_DECODE=0 forces the fallback for testing.
+  if (Sm70FaEligible<TQ, TKV, Tout>(args, d, num_kv_heads) && Sm70FaEnabled()) {
+    static std::atomic<int> g_sm70FaOk(-1);
+    if (g_sm70FaOk.load(std::memory_order_relaxed) == -1) {
+      const bool ok = Sm70FaValidate<TQ, TKV, Tout>(
+          s, out.Ptr<float>(), query, k_cache, v_cache, block_table, seq_lens,
+          query_start_loc, num_tokens, hq, d, num_reqs, num_kv_heads, block_size,
+          args.scale);
+      g_sm70FaOk.store(ok ? 1 : 0, std::memory_order_relaxed);
+    }
+    if (g_sm70FaOk.load(std::memory_order_relaxed) == 1) {
+      vt_sm70_fa2_decode(out.Ptr<float>(), query.Ptr<__half>(), k_cache.Ptr<__half>(),
+                         v_cache.Ptr<__half>(), block_table.Ptr<int32_t>(),
+                         seq_lens.Ptr<int32_t>(), num_tokens, hq, num_kv_heads, d,
+                         block_size, block_table.stride[0], block_table.stride[1],
+                         k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
+                         v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+                         args.scale, s);
+      Check(cudaGetLastError(), "paged_attention decode (sm70 fa2)");
+      return;
+    }
+  }
+
   // head_dim 128 (EPL=4), opt-in. No GQA carve-out: PagedAttentionDecodeGqaKernel
   // sits inside the `d == 32 * kDecEpl` (256) branch below, so at head_dim 128 it
   // can never run, and excluding qpk == kDecGqaQG here would strand exactly those
   // models (e.g. Qwen3-32B, hq/num_kv_heads == 8) on the generic block kernel this
   // arm exists to replace.
+
+#endif  // VLLM_CPP_HAS_SM70_FA2
+
   if (DecodeOptEnabled() && DecodeD128Enabled() && d == 32 * 4) {
     const int block = kDecWarps * 32;
     const size_t shmem = (static_cast<size_t>(kDecWarps) * d + 2 * kDecWarps) * sizeof(float);
@@ -2223,6 +2353,98 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
   LaunchPagedBlock<TQ, TKV, Tout>(s, out, query, k_cache, v_cache, block_table, seq_lens,
                                   query_start_loc, args, num_tokens, hq, d, num_reqs,
                                   num_kv_heads, block_size);
+}
+
+// --- op-level parity driver (brick F adoption proof) ----
+// Builds real decode tensors and runs the ACTUAL op path (LaunchDecode) twice:
+// once with the sm70 fast path forced ON (env=1) and once OFF (env=0, so it
+// falls to the reference). Compares the two op outputs — i.e. proves dispatch
+// routing end-to-end, not just kernel parity. Returns 0 on parity ok, 1 on
+// mismatch, 2 when not on sm_70 (fast path can't engage; test skips).
+extern "C" int vt_sm70_fa2_op_parity(float tol_rel, int verbose) {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) {
+    if (verbose) fprintf(stdout, "  op-parity: not sm_70 (sm_%d) -> fast path not engaged, skip\n",
+                         caps.valid ? caps.sm_arch() : -1);
+    return 2;
+  }
+  const int64_t nt = 2, hq = 4, nkv = 2, d = 64, bs = 16, maxblocks = 2;
+  const int64_t pages = nt * maxblocks;
+  const size_t kv = (size_t)pages * (bs * nkv * d);
+  const Device dev{DeviceType::kCUDA, 0};
+
+  __half *q_d = nullptr, *k_d = nullptr, *v_d = nullptr;
+  int32_t *bt_d = nullptr, *sl_d = nullptr, *qsl_d = nullptr;
+  float *of = nullptr, *or0 = nullptr;
+  cudaError_t err = cudaMalloc((void**)&q_d, (size_t)nt * hq * d * sizeof(__half));
+  err = (err ?: cudaMalloc((void**)&k_d, kv * sizeof(__half)));
+  err = (err ?: cudaMalloc((void**)&v_d, kv * sizeof(__half)));
+  err = (err ?: cudaMalloc((void**)&bt_d, (size_t)nt * maxblocks * sizeof(int32_t)));
+  err = (err ?: cudaMalloc((void**)&sl_d, (size_t)nt * sizeof(int32_t)));
+  err = (err ?: cudaMalloc((void**)&qsl_d, (size_t)(nt + 1) * sizeof(int32_t)));
+  err = (err ?: cudaMalloc((void**)&of, (size_t)nt * hq * d * sizeof(float)));
+  err = (err ?: cudaMalloc((void**)&or0, (size_t)nt * hq * d * sizeof(float)));
+  if (err != cudaSuccess) {
+    fprintf(stderr, "op-parity: alloc: %s\n", cudaGetErrorString(err));
+    return 1;
+  }
+  // deterministic fractional hosts
+  auto f2h = [](float f) -> __half { return __float2half_rn(f); };
+  std::vector<__half> hq_( (size_t)nt * hq * d), hk(kv), hv(kv);
+  for (size_t i = 0; i < hq_.size(); ++i) hq_[i] = f2h(0.61f * (float)((i * 3 + 1) % 11) + 0.31f);
+  const size_t stride_hd = nkv * d, stride_blk = bs * nkv * d;
+  for (size_t i = 0; i < kv; ++i) {
+    hk[i] = f2h(0.37f * (float)((i * 13 + 7) % 19) + 0.11f);
+    hv[i] = f2h(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f);
+  }
+  std::vector<int32_t> hbt((size_t)nt * maxblocks), hsl{9, 25}, hqsl{0, 1, 2};
+  for (int64_t r = 0; r < nt; ++r)
+    for (int64_t b = 0; b < maxblocks; ++b)
+      hbt[(size_t)r * maxblocks + b] = (int32_t)(r * maxblocks + b);
+  cudaMemcpy(q_d, hq_.data(), (size_t)nt*hq*d*sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(k_d, hk.data(), kv*sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(v_d, hv.data(), kv*sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(bt_d, hbt.data(), (size_t)nt*maxblocks*sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(sl_d, hsl.data(), (size_t)nt*sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(qsl_d, hqsl.data(), (size_t)(nt+1)*sizeof(int32_t), cudaMemcpyHostToDevice);
+  (void)stride_hd; (void)stride_blk;
+
+  Tensor squery = Tensor::Contiguous(q_d, DType::kF16, dev, {nt, hq, d});
+  Tensor sk = Tensor::Contiguous(k_d, DType::kF16, dev, {pages, bs, nkv, d});
+  Tensor sv = Tensor::Contiguous(v_d, DType::kF16, dev, {pages, bs, nkv, d});
+  Tensor sbt = Tensor::Contiguous(bt_d, DType::kI32, dev, {nt, maxblocks});
+  Tensor ssl = Tensor::Contiguous(sl_d, DType::kI32, dev, {nt});
+  Tensor sqsl = Tensor::Contiguous(qsl_d, DType::kI32, dev, {nt + 1});
+  Tensor out_f = Tensor::Contiguous(of, DType::kF32, dev, {nt, hq, d});
+  Tensor out_r = Tensor::Contiguous(or0, DType::kF32, dev, {nt, hq, d});
+
+  PagedAttentionArgs args;
+  args.scale = 0.125f;
+  cudaStream_t st = 0;
+  setenv("VT_SM70_FA2_DECODE", "1", 1);
+  LaunchDecode<__half, __half, float>(st, out_f, squery, sk, sv, sbt, ssl, sqsl,
+                                      args, nt, hq, d, nt, nkv, bs);
+  err = cudaDeviceSynchronize();
+  setenv("VT_SM70_FA2_DECODE", "0", 1);
+  LaunchDecode<__half, __half, float>(st, out_r, squery, sk, sv, sbt, ssl, sqsl,
+                                      args, nt, hq, d, nt, nkv, bs);
+  cudaDeviceSynchronize();
+  if (err != cudaSuccess) { fprintf(stderr, "op-parity: launch: %s\n", cudaGetErrorString(err)); return 1; }
+
+  std::vector<float> a((size_t)nt*hq*d), b((size_t)nt*hq*d);
+  cudaMemcpy(a.data(), of, (size_t)nt*hq*d*sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(b.data(), or0, (size_t)nt*hq*d*sizeof(float), cudaMemcpyDeviceToHost);
+  double worst = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const double denom = b[i] > 1.0 ? b[i] : 1.0;
+    const double rel = std::fabs((double)a[i] - b[i]) / denom;
+    if (rel > worst) worst = rel;
+  }
+  cudaFree((void*)q_d); cudaFree((void*)k_d); cudaFree((void*)v_d);
+  cudaFree((void*)bt_d); cudaFree((void*)sl_d); cudaFree((void*)qsl_d);
+  cudaFree((void*)of); cudaFree((void*)or0);
+  if (verbose) fprintf(stdout, "  op-parity (fast vs fallback): worst reldev %.3e\n", worst);
+  return (worst <= (double)tol_rel) ? 0 : 1;
 }
 
 // Per-request query-tile layout, built DIRECTLY on the device from the device

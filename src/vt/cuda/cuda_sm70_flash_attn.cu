@@ -186,12 +186,16 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
     const size_t kv_elems = (size_t)pages * kc_blk;
     std::vector<unsigned short> hk16(kv_elems), hv16(kv_elems);
     std::vector<unsigned short> hq16((size_t)c.nr * c.hq * d);
+    // Fractional, non-half-representable values so the fp16-WMMA vs fp32-fma
+    // rounding is actually exercised (exact small-half inputs made the two
+    // paths bit-identical, hiding a tolerance regression behind 0.000e+00).
+    auto f2h = [](float f) -> unsigned short { return __half_as_ushort(__float2half_rn(f)); };
     for (size_t i = 0; i < kv_elems; ++i) {
-      hk16[i] = (unsigned short)(((i * 13 + 7) % 19) + 1);
-      hv16[i] = (unsigned short)(((i * 7 + 3) % 13) + 2);
+      hk16[i] = f2h(0.37f * (float)((i * 13 + 7) % 19) + 0.11f);   // non-exact
+      hv16[i] = f2h(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f);
     }
     for (size_t i = 0; i < hq16.size(); ++i)
-      hq16[i] = (unsigned short)(((i * 3 + 1) % 11) + 1);
+      hq16[i] = f2h(0.61f * (float)((i * 3 + 1) % 11) + 0.31f);
 
     __half *q_d = nullptr, *k_d = nullptr, *v_d = nullptr;
     int32_t *bt_d = nullptr, *sl_d = nullptr;
