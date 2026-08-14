@@ -838,6 +838,13 @@ add_library(vllm STATIC
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L11): the conditioning items that
   # place the VAE ENCODERS' output into the denoise state.
   src/vllm/model_executor/models/ltx2_conditioning.cpp
+  # LTX-2.5 (ROW LTX25-IMAGE-COND, issue #644): the video VAE ENCODER's LOAD
+  # path — key filter and config parser, which existed nowhere before — and the
+  # pixel front-end an image conditioning arrives through. Separate TUs rather
+  # than additions to ltx2_loader.cpp, which two concurrent rows of the same
+  # campaign need to edit.
+  src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_image_preprocess.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.

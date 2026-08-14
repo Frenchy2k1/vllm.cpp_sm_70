@@ -435,21 +435,44 @@ the embeddings connector) are implemented and gated. Several limits decide what
 you can actually ask for, and each refuses by name rather than rendering
 something else.
 
-In particular, the encoders being present does NOT mean image, keyframe,
-reference-video or reference-audio conditioning is usable: the video engine
-still refuses every one of those by name, because the request-side work between
-a file on disk and a tensor the encoder accepts — image decode, aspect-fill
-resize, and the H.264 CRF re-compression upstream performs before encoding
-whenever the resolved CRF is not `0` and the image is at least 2 pixels on its
-shorter side — is not ported. The engine also holds no
-encoder to call: it materializes the VAE DECODER key filters only, so no
-encoder weights are ever in memory, and the refusal names that rather than
-claiming the encoder itself is missing. Two encoder-level limits are worth
+**Image conditioning (image-to-video) runs at `image_crf=0`, and only there.**
+Pass a first frame as binary PPM (`first_frame_path` / `first_frame_ppm`) plus
+the per-generation extra `image_crf=0`; the engine decodes it, aspect-fills and
+centre-crops it to each phase's own resolution, VAE-encodes it, and replaces
+latent frame 0's clean tokens. `noise_aug` is the pinning strength (`1.0`, the
+default, pins the frame exactly).
+
+`image_crf=0` must be asked for **explicitly**, and it is **out of
+distribution**. Upstream re-compresses a conditioning image through H.264 at the
+CRF the checkpoint's generation was trained with, and an LTX-2.5 checkpoint
+resolves that to **18**. That round trip needs libx264 and no codec is vendored
+here, so a non-zero CRF — including the default a caller gets by saying nothing —
+is refused by name. `image_crf=0` is upstream-legal (upstream short-circuits it
+and documents an explicit `0` as "skip re-compression entirely") but conditions
+the model on pixels it was not trained to see. That is a render-quality cost, and
+it is stated rather than applied silently.
+
+Keyframe, reference-image, reference-video and reference-audio conditioning are
+still refused, each naming a different missing piece: a last-frame keyframe needs
+the token-APPEND machinery — a keyframe is appended to the sequence with its own
+positions and a rebuilt attention mask, then trimmed back off, and this engine's
+phase loop is fixed at the target grid's token count — while the served
+first-frame arm only REPLACES tokens that already exist; the reference arms need
+the IC-LoRA's scale factors, which live in LoRA metadata this project does not
+read; reference audio additionally needs the AUDIO VAE's encoder key filter,
+which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
+DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
+is appended unmarked, so the embedding never applies to it. Where the embedding
+does bite is the FIRST latent frame of every render, which is a separate gap,
+tracked as issue #658.) Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
-project does not carry. And a VAE configured with `latent_log_var: none` is
-refused, because upstream itself raises on it.
+project does not carry. A VAE configured with `latent_log_var: none` is
+refused, because upstream itself raises on it. And a video-VAE `res_x` encoder
+block that declares no `num_layers` is refused rather than defaulted, because
+upstream subscripts that key and raises `KeyError` on it; no other encoder block
+kind reads it.
 
 **A typed prompt works.** `--encoder` names the Gemma-4 12B text tower and
 `--prompt` carries the words. The tower tokenizes them with its OWN embedded
@@ -487,7 +510,11 @@ refused, because a stream left unconditioned renders instead of failing.
 returns the trace of the last `Generate()` — whether the conditioning came from a
 prompt or from embeds, the prompt string, the row count and both stream widths, an
 FNV-1a digest over the exact f32 buffers cross-attention read, and each stream's
-absmax. It is returned **by value, under the engine's own lock**, so it is safe to
+absmax. When the request carried an image it also reports the CRF and strength it
+was conditioned at, how many tokens the encoded image replaced, and a digest over
+**those tokens as written into the state** — not over the encoder's output, so a
+build that encoded an image and never placed it reads as unconditioned rather
+than healthy. It is returned **by value, under the engine's own lock**, so it is safe to
 call from a server thread while another thread renders — but `Generate` holds that
 same lock for the WHOLE render, so such a call blocks for minutes rather than
 returning a stale answer immediately. `completed` is true only if that
@@ -540,6 +567,11 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
 
 Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 `--audio-prompt-embeds` to condition from files instead.
+
+Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
+binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
+required and is not the default, because omitting it resolves the checkpoint's
+own CRF 18 and refuses — see the out-of-distribution note above.
 
 `--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
 64 (32 for the VAE, twice that because the distilled recipe's first phase runs at

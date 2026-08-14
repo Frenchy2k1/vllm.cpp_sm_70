@@ -853,8 +853,16 @@ typedef struct vllm_video_params {
   /* Where frame_%06d.ppm + audio.wav land (created if absent). REQUIRED. */
   const char* output_dir;
   /* v18: FAMILY-SPECIFIC per-generation settings, same parallel-array shape as
-   * the load-time extras. MiniMax-H3 defines none, and refuses any key it does
-   * not know rather than ignoring it. 0 => none. */
+   * the load-time extras. Every family refuses a key it does not know rather
+   * than ignoring it. 0 => none.
+   *   MiniMax-H3: none.
+   *   LTX-2.5:    "image_crf" — the H.264 CRF an image conditioning is
+   *               re-compressed at. Only "0" is served; an LTX-2.5 checkpoint
+   *               RESOLVES 18 when this is absent and the codec round trip is
+   *               unported, so leaving it out refuses BY NAME rather than
+   *               rendering. "0" is upstream-legal and out of distribution;
+   *               see docs/USAGE.md. No ABI change was needed for it, which is
+   *               what this parallel-array shape exists for. */
   const char* const* extra_keys;
   const char* const* extra_values;
   int32_t n_extras;
