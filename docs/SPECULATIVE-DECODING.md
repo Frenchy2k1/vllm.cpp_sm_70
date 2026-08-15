@@ -17,7 +17,7 @@ the list of accepted ones (`src/vllm/config/speculative.cpp`).
 |---|---|---|---|
 | `mtp` | the target's own `mtp.*` head | 1 | Gated, and the default recommendation. Token-exact against vLLM at concurrency 1, ~1.04x its speculative-on decode |
 | `dflash` | a separate z-lab block-diffusion checkpoint | block size, e.g. 16 | Gated. 2.9x over speculative-off at concurrency 1, at or above vLLM's own DFlash-on |
-| `dspark` | a separate DSpark checkpoint | block size, at least the draft's own | Runs end to end, **not gated**. Token-identical to speculative-off on the 35B, but currently about 2% slower than plain decode; no speed win is claimed |
+| `dspark` | a separate DSpark checkpoint | block size, at least the draft's own | Runs end to end, **not gated**. Token-identical to speculative-off on the 35B. Speculation works (drafts proposed and accepted), but the cross-engine ratio is UNSETTLED: the last matched-and-warm paired measurement is 0.834x of the pinned oracle. No speed win is claimed |
 | `ngram` | none, drafts come from the prompt's own suffix | required, no default | Accepted and wired; no published measurement |
 | `draft_model` | a separate full model | from the draft | **Config only.** The JSON parses, but the engine has no branch for it and refuses the load |
 
@@ -91,11 +91,19 @@ all 48 tokens and reproducible** (both arms run on the synchronous path; the
 speculative path forces async scheduling off, so a fair comparison has to force
 it off on the other side too).
 
-**It is still not gated.** Speculation is currently about 2% SLOWER than plain
-decode at concurrency 1 — the sequential stage is a host-side loop with a device
-round-trip per step — and the cross-engine comparison against vLLM's own DSpark,
-the acceptance-rate band, and the other target families are all still owed. No
-speed win is claimed. A GGUF target, and a target architecture with no aux
+**It is still not gated**, and the cross-engine number is UNSETTLED rather than
+merely owed. The host-side sequential stage described above was since moved on
+device, the T=1+k verify was captured, and the draft chain made sync-free; all
+three are byte-identical and landed. What is not settled is the ratio against
+vLLM's own DSpark. Ratios recorded through 2026-08-13 (0.957x-0.989x) were taken
+with a SINGLE COLD oracle invocation per paired run, so the denominator paid
+compile-JIT the numerator did not; with the oracle warm and generation length
+matched, the paired measurement is **0.834x**. Those two cannot be differenced
+directly, because the gate host was reimaged in between and is no longer the same
+machine. The deciding experiment — a single cold oracle invocation on the CURRENT
+box — is specified in the benchmark record and has not yet run. Until it does, no
+speed claim in either direction is supportable. The acceptance-rate band and the
+other target families remain owed. A GGUF target, and a target architecture with no aux
 multi-tap, are both refused by name.
 
 ```bash
