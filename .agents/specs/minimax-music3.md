@@ -960,10 +960,9 @@ that — five registrations ride it — so the rounding is restored in the Music
 on the way out, at the one place it is observable. It is a NARROWING, which is
 the direction `.agents/porting.md` cares about.
 
-**End to end, over HTTP — WRITTEN AND WIRED, NOT YET OBSERVED. Read this
-before believing anything about a running request.** The gate exists
-(`tests/parity/test_minimax_music3_e2e_real.cpp`, "an HTTP request generates a
-real 44100 Hz stereo WAV"): it posts a body at `ApiServer::handle_audio_speech`,
+**End to end, over HTTP — OBSERVED TO PASS 2026-08-15 (#852).** The gate is
+`tests/parity/test_minimax_music3_e2e_real.cpp`, "an HTTP request generates a
+real 44100 Hz stereo WAV": it posts a body at `ApiServer::handle_audio_speech`,
 and it asserts the RIFF header, the length the request's duration implies, and
 four properties that each rule out a different way of returning a well-formed
 non-song — non-zero, unclipped (a scale error would otherwise hide behind the
@@ -972,55 +971,124 @@ mapping was hoisted out of `server_main.cpp`'s lambda into
 `vllm::openai::SynthesizeSpeechRequest` so the gate calls the code HTTP runs
 rather than a test-only copy of it; the server is a one-line client of it now.
 
-**IT HAS NOT BEEN SEEN TO PASS.** Two runs were taken on this box, at the
-shortest request that still enters every stage (0.1 s of audio -> 2 AR frames,
-2 denoise steps, a 26-token prompt). Both were stopped, at 85 and 34 minutes,
-and neither reached a waveform. The evidence about WHERE they were is specific
-rather than inferred: the four `language_model/*.safetensors` file descriptors
-were still OPEN, so `Music3LoadArWeights` had not returned; the depth decoder's
-file was never opened; resident size was flat at 17.38 GiB; and ~1.9 cores were
-burning. That places both runs inside `LoadQwen3ForCausalLMWeights`, after the
-bytes are materialized — so in the qkv/gate_up merges or the 200000 x 4096
-`lm_head` transpose — and NOT in any Music3 code.
+MEASURED, this box (20-core x86_64, CPU only; `dgx.casa` down), watched in the
+foreground:
 
-The first run was self-inflicted (a full `ctest -j 6` and a full build were
-running against the same 18.5 GB working set, forcing reclaim). The second was
-not: the box was quiet, and a sequential `cat` of the same 17.2 GB completes in
-20.6 s, so the mount is not the bottleneck either. It is therefore REPRODUCIBLE
-and unexplained, and the honest statement is that it is unexplained.
+```
+POST /v1/audio/speech -> 200 audio/wav, 12332 bytes
+request shape: 2 AR frames -> 6 latent frames -> 3072 samples/channel (0.06966 s)
+waveform:      6144 int16 samples, 6144 non-zero, 0 clipped, range [42, 156],
+               RMS 0.00267716, 2818 of 3072 positions differ between L and R
+```
 
-**What makes this a performance question and not a correctness one** is that the
-same `Music3LmSession`, the same `ForwardEmbeds`, and the same weights DO load
-and run in `tests/parity/test_minimax_music3_llm_real.cpp`, which loads in about
-3 minutes and completes 25 teacher-forced decode steps — so the load path and the
-forward are both exercised end to end there, against the oracle. Every stage
-below the language model was already gated by W3-W6 against the capture. What is
-missing is one observation of the composition, and NOT a stage.
+The HTTP case alone: **1 case | 21 assertions | 0 failed**, 7:54 wall
+(205.63 s user + 20.75 s sys), peak RSS 18.17 GiB, loadavg 47 -> 28. The whole
+file with both env vars set: **5 cases | 535 assertions | 0 failed**, 31:14 wall
+(1424.17 s user + 38.91 s sys), peak RSS 18.17 GiB, loadavg 29 -> 47. The WAV is
+re-read independently of the gate at
+`build/music3/minimax_music3_e2e_http.wav`: 44100 Hz, 2 channels, 16-bit,
+3072 frames, 0.069660 s, peak 156, 67 distinct left-channel values.
 
-**Owed, and named rather than discovered:** find out why
-`LoadQwen3ForCausalLMWeights` takes 30+ minutes on this checkpoint in one binary
-and ~3 in another, then run the e2e case and record its numbers here. Until that
-is done, no document in this tree may say this model has produced a song.
+Two honest qualifications. This is **0.07 s of audio, not a song** — it is the
+shortest request that still enters every stage, and its length is what makes the
+gate affordable on CPU. And its samples are **not compared to anything**: §5
+withdrew the token gate because the AR codes are a seeded `torch.multinomial`
+draw and the initial latents a seeded `randn_tensor`, so no request's waveform
+can equal the capture. What this case proves is that the composition runs, that
+every stage hands the next one a shape it accepts, and that the bytes leaving
+`/v1/audio/speech` are a well-formed, non-constant, unclipped, genuinely stereo
+44100 Hz PCM WAV of the length the request implies. The per-stage NUMERIC gates
+are the other four cases in the same file, which compare against the capture and
+pass in the same run.
+
+**Why it had never been seen, and it was not the weight load.** The body posted
+`"audio_duration_s": 0.1`. That is the name of the FIELD
+(`speech_api.h:55`), not the wire key: `ParseSpeechRequest` reads
+`audio_duration` (or `duration`), documented at `docs/USAGE.md:1235` and used by
+every other test. The key was silently dropped, `audio_duration_s` stayed at its
+`0.0` sentinel, and `Music3ResolveRequest` substituted
+`kMusic3DefaultDurationSeconds = 60.0`. So the gate asked for a **60-second
+song**:
+
+| | asked for | actually ran |
+|---|---:|---:|
+| duration | 0.1 s | 60 s |
+| AR frames | 2 | 1500 |
+| denoise windows | 1 | 8 |
+| vocoder latents | 6 | 5167 |
+| samples/channel | 3072 | 2645504 |
+
+A ~750x job — and one that could never have passed anyway, because the case
+asserts the payload length 0.1 s implies. `audio_duration_s` is now REFUSED and
+named by `ParseSpeechRequest` (#925), red-first in `test_speech_api.cpp`.
+
+**The recorded diagnosis was wrong, and the way it was wrong is the lesson.**
+Earlier runs were placed "inside `LoadQwen3ForCausalLMWeights`" because the four
+`language_model/*.safetensors` fds were still open and the depth decoder's file
+was not. Neither fact says that. `LoadBf16Direct` **borrows** the mapping when it
+can (`BorrowStTensorBytes`), and a borrowed `OwnedTensor` holds its own
+`shared_ptr` to it, so those fds stay open for the whole request long after the
+loader returned; the depth decoder's tensors are COPIED, so its `SafetensorsFile`
+dies and its fd closes on return. The fd pattern is a copy-vs-borrow artifact,
+not a program counter.
+
+What actually resolves it is a symbol-resolved profile, and the phases are
+unambiguous (`perf record -g` on the live process, 173K samples):
+
+| phase | span | signature |
+|---|---|---|
+| LM weight load | 0 -> **180 s** | 1 thread, state `D`, ~92 MB/s off the NAS, 3.7 s of user CPU |
+| AR generate | 180 -> 19154 s | 20 threads, `LinearNoBias` 42-57%, `Threadpool::Barrier` 25%, `Bt16Avx512` 12-14% |
+| acoustic | 19154 s -> killed at 15 h 19 m | `vocoder1d::ConvTranspose1d` 88.5%, `Conv1d` 7.7% |
+
+The load is **3 minutes in both binaries** — the same ~3 minutes
+`test_minimax_music3_llm_real` takes — and it is I/O bound, not spinning. The
+`__sched_yield` frames in the earlier profile are `Threadpool::PollForWork`'s
+bounded hybrid poll (`cpu_threadpool.h`, ggml's `poll = 50`) around a genuinely
+compute-bound run, not a stall. Two supporting measurements, both taken rather
+than argued: the `lm_head` 200000 x 4096 scalar transpose that was suspected
+costs **1.388 s**, and the vocoder at this request's real shape costs **5.4 s**
+against 84 s at the capture's L=86.
+
+**Still true, and not this phase's to change.** The CPU run is slow for the
+reason recorded below — `LinearNoBias` is a scalar triple loop under
+`-ffp-contract=off` by construction, and it is 42-57% of the AR half's profile
+while the `vt` threadpool sits at a barrier. Parallelising it over OUTPUT ROWS
+would not change its reduction order and so would not move a gated number, but
+it is a separate, measured change with its own evidence. There is **still no
+speed number** and no oracle comparison: every gate for this row was taken on
+CPU because `dgx.casa` was down throughout, and a CPU number against
+SGLang-Omni's CUDA-graphed production configuration would be a dishonest
+denominator. `PENDING` on the hardware, not on the work. W7's quantized arms are
+owed, and W6's multi-window coverage gap is unchanged (the capture is a single
+25-frame window).
 
 **Why the CPU run is slow, named rather than left to be rediscovered.** The
 autoregressive half's host GEMM (`LinearNoBias`, `minimax_music3_ar.cpp`) is a
 scalar triple loop with a DOUBLE accumulator under `-ffp-contract=off` — it does
 not vectorize, by construction, because W2/W3 needed a reproducible reduction
 order to gate rounding against torch. That is fine for the W2/W3 gate, which
-makes 25 calls at sequence length 8. The GENERATION loop makes 42 calls at
-sequence lengths 2..8, and the depth decoder streams its whole 2.3 GB of weights
-per call, so the short sequences get roughly 4x less arithmetic per streamed byte
-than the gate's single seq-8 call does. MEASURED on this box: the AR half of one
-0.1 s request is ~1500 s of single-threaded CPU, and the `vt` CPU backend's
-threadpool is idle throughout it because none of this code goes through `vt`.
+makes 25 calls at sequence length 8. The GENERATION loop makes calls at sequence
+lengths 2..8, and the depth decoder streams its whole 2.3 GB of weights per call,
+so the short sequences get roughly 4x less arithmetic per streamed byte than the
+gate's single seq-8 call does. The acoustic half's `vocoder1d::ConvTranspose1d`
+and `Conv1d` are the same shape of code and dominate that half.
+
+MEASURED on this box (`perf record -g`, 173K samples, symbols resolved),
+per AR frame of the accidental 60 s run: **12.65 s** of wall per frame, with
+`LinearNoBias` 42-57% of samples and `vt::cpu::Threadpool::Barrier` a further
+25% — the `vt` threadpool spends a quarter of the AR half waiting, because the
+depth decoder and the DiT do not go through `vt` at all and the LM steps it does
+run are sequence length 2..8, too small to amortise a barrier.
+
+An earlier revision of this paragraph recorded "~1500 s of single-threaded CPU
+for the AR half of one 0.1 s request". That number is WITHDRAWN: it was taken
+against the request that had silently become 60 s (#925), so it describes 1500
+frames, not 2. The whole 0.1 s request is **7:54 wall / 226 s CPU** including
+both weight loads off the NAS.
+
 This is a correctness-first implementation doing exactly what it was written to
 do; it is recorded here because the obvious first read of a slow run is "the
-language model is slow", and the language model is not the part that is slow.
-
-**Two things are still true and are not this phase's to change.** The
-multi-window coverage gap W6 named is unchanged — the capture is a single
-25-frame window. And there is **still no speed number**: every gate for this row
-was taken on CPU because `dgx.casa` was down throughout, the acoustic half is
-upstream's own fp32, and a CPU number against SGLang-Omni's CUDA-graphed compiled
-production configuration would be a dishonest denominator. `PENDING` on the
-hardware, not on the work. W7's quantized arms are owed.
+language model is slow", and the language model is not the part that is slow —
+the LM's own weight load is 180 s of I/O and its forward is 12-14% of the AR
+profile.

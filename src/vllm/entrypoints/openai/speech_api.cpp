@@ -159,6 +159,18 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   const nlohmann::json& extra =
       (json.contains("extra_params") && json.at("extra_params").is_object()) ? json.at("extra_params")
                                                                             : json;
+  // `audio_duration_s` is the name of the C++/C-API FIELD this key fills, not a
+  // wire key, and it is the one misspelling a caller reaches for by reading the
+  // struct instead of the docs. Dropping it silently hands back the family's
+  // default duration — 60 s for MiniMax-Music3 — while returning 200, so the
+  // caller cannot tell. That is exactly how the Music3 e2e gate spent three
+  // multi-hour runs generating a 60 s song it had asked 0.1 s for (#852): 2 AR
+  // frames became 1500 and the run was misread as a hung weight load. REFUSED
+  // and NAMED, like every other unsupported field above.
+  VT_CHECK(!Has(extra, "audio_duration_s"),
+           "speech request: `audio_duration_s` is not a request key — it is the name of the "
+           "field it fills. Use `audio_duration` (seconds), or omit it for the family's "
+           "default; accepting it here would silently return the default duration instead");
   if (Has(extra, "audio_duration")) {
     out.audio_duration_s = ReadNumber(extra, "audio_duration");
   }
