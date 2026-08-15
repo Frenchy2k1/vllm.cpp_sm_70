@@ -30,6 +30,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/owned_bytes.h"
+#include "vllm/model_executor/models/qwen3_vl_vision.h"  // MoE vision tower (#891)
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
@@ -802,5 +803,51 @@ Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(
 Qwen3_5MoeWeights LoadQwen3_5Moe(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config,
     std::shared_ptr<const std::vector<SafetensorsFile>> shards_owner = nullptr);
+
+// ── The MoE arm's VISION TOWER (issue #891, .agents/specs/moe-vision-tower.md) ─
+//
+// `LoadQwen3_5Moe` above reads the TEXT backbone only. `Qwen/Qwen3.6-35B-A3B`
+// ships 333 `model.visual.*` tensors alongside it, and until this seam existed
+// they were simply not read — the load succeeded and produced a text-only model,
+// which is the silent-drop failure class this project keeps rediscovering.
+//
+// Upstream composes the SAME tower on both arms: `Qwen3_5MoeForConditionalGener
+// ation` and `Qwen3_5ForConditionalGeneration` each hold a `Qwen3_VisionTransfor
+// mer` (pinned vLLM `qwen3_5.py`), so this is the SHARED
+// `LoadQwen3VLVisionWeights` reader (`qwen3_vl.h`) the dense 27B arm already
+// gates at image 32/32 + video 32/32 — deliberately NOT a second tower.
+
+// The tower geometry for a Qwen3.6 conditional-generation checkpoint. Mirrors
+// the checkpoint's `config.json::vision_config`; `Qwen/Qwen3.6-35B-A3B` and
+// `Qwen/Qwen3.6-27B` publish the SAME tower (depth 27, hidden 1152, heads 16,
+// intermediate 4304, patch 16, temporal patch 2, spatial merge 2, 2304 position
+// embeddings, EMPTY `deepstack_visual_indexes`) and differ only in
+// `out_hidden_size`, which is the text backbone's hidden size (2048 on the 35B
+// MoE, 5120 on the 27B dense) because the merger writes straight into the text
+// residual stream. That one field is therefore taken from `config.hidden_size`
+// rather than hardcoded. `HfConfig` does not parse `vision_config` (the dense
+// arm's gate hardcodes the same numbers in-test).
+//
+// NO DeepStack: `deepstack_visual_indexes: []` compiles that path out for this
+// family upstream (`qwen3_vl.py:1709-1716`), so the tower output is exactly
+// [N, out_hidden_size].
+multimodal::Qwen3VLVisionConfig Qwen3_5MoeVisionConfig(const HfConfig& config);
+
+// Load the MoE arm's vision tower from the SAME shards the text backbone came
+// from, through the shared `LoadQwen3VLVisionWeights`.
+//
+// REFUSES BY NAME when the checkpoint carries no `model.visual.*` tensor at all:
+// a Qwen3.5-family `*ForConditionalGeneration` checkpoint without a tower cannot
+// answer an image or video prompt, and returning an empty tower would let it
+// answer from text alone and still emit plausible tokens. AGENTS.md: an arm that
+// is not implemented "is refused with a message naming the missing piece ...
+// never left to be discovered later". `nvidia/Qwen3.6-35B-A3B-NVFP4` is exactly
+// such a checkpoint (`vision_config` declared, `visual.*` weights absent).
+multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
+// True iff any shard carries a `model.visual.` tensor. Exposed so a caller can
+// route to the text-only path deliberately instead of discovering the refusal.
+bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 
 }  // namespace vllm

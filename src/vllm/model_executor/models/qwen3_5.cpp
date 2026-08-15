@@ -7003,6 +7003,7 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const Qwen3_5MoeWeights& weights, const HfConfig& config,
                           const std::vector<int32_t>& logits_indices = {},
                           const Tensor* hidden_tap = nullptr,
+                          const std::vector<float>* mrope_cos_sin = nullptr,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
                           const Tensor* aux_out = nullptr,
                           StepDevInputs* persistent_sdi = nullptr) {
@@ -7042,10 +7043,23 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   StepDevInputs& sdi = persistent_sdi != nullptr ? *persistent_sdi : *local_sdi;
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
+  //
+  // MOE VL path (issue #891): a prebuilt MRoPE cos|sin cache [T, rotary_dim]
+  // (host f32, interleaved 3-section selection already baked in) is injected
+  // verbatim into the fused full-attn preamble, replacing the 1-D RoPE cache
+  // MaybeBuildAttnCosSin would build — the SAME injection point the dense arm's
+  // VL forward uses (DenseForwardLayers below). mrope_cos_sin == nullptr (every
+  // text caller, and every graph-captured caller) ⇒ byte-identical to before.
   if (persistent_sdi != nullptr) {
     // Persistent buffer already allocated (pre-capture); re-fill only, captured so
     // every replay re-derives rope from the freshly-staged positions.
     if (sdi.has_attn_cos_sin) FillAttnCosSin(d, sdi, config);
+  } else if (mrope_cos_sin != nullptr) {
+    const int rot = static_cast<int>(config.rotary_dim);
+    VT_CHECK(rot > 0 && static_cast<int64_t>(mrope_cos_sin->size()) == T * rot,
+             "qwen3_5 moe VL: MRoPE cos|sin cache must be [T, rotary_dim]");
+    sdi.attn_cos_sin = DBuf(d, DType::kF32, {T, rot}, mrope_cos_sin->data());
+    sdi.has_attn_cos_sin = true;
   } else {
     MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
   }
@@ -7128,7 +7142,7 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices, hidden_tap,
-                       aux_layer_ids, aux_out);
+                       /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
 }
 
 // Shared shape/count validation for the paged forward entry points.
@@ -8052,12 +8066,74 @@ int32_t VLArgMaxDevice(Dev d, DBuf& dlogits) {
 // Qwen3VLGetRopeIndex vs video_token mask + Qwen3VLGetRopeIndexVideo); the
 // forward, KV/GDN state, MRoPE application, and decode continuation here are
 // IDENTICAL, so the image path is byte-identical across the M3d refactor.
+//
+// MOE ARM (issue #891, .agents/specs/moe-vision-tower.md): the core is templated
+// on the weights arm rather than copied. Upstream composes the SAME
+// `Qwen3_VisionTransformer` on `Qwen3_5MoeForConditionalGeneration` and
+// `Qwen3_5ForConditionalGeneration` (pinned `qwen3_5.py`) over two text
+// backbones, so the tower, the processor, the MRoPE index math and this driver
+// are shared and the ONLY difference is which backbone consumes the merger
+// output. Two implementations of one tower would drift; the dense one is gated
+// at image 32/32 + video 32/32. The dense instantiation calls exactly the
+// functions it called before, in the same order.
+//
+// `graph_decode_supported` mirrors what the arm's PRODUCTION forward routes to a
+// captured decode graph: the dense arm always (qwen3_5_dense.h), the MoE arm
+// only on the fp4 CUDA path (`ForwardQwen3_5Moe`, qwen3_5_moe.cpp) — a bf16 MoE
+// checkpoint decodes eagerly in production and so decodes eagerly here.
+template <class W>
+struct VLDecodeGraphFor;
+template <>
+struct VLDecodeGraphFor<Qwen3_5DenseWeights> {
+  using type = Qwen3_5DenseDecodeGraph;
+};
+template <>
+struct VLDecodeGraphFor<Qwen3_5MoeWeights> {
+  using type = Qwen3_5DecodeGraph;
+};
+
+static void VLEmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& ids,
+                        const Qwen3_5DenseWeights& w, const HfConfig& c) {
+  DenseEmbedInto(d, hidden, ids, w, c);
+}
+static void VLEmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& ids,
+                        const Qwen3_5MoeWeights& w, const HfConfig& c) {
+  EmbedInto(d, hidden, ids, w, c);
+}
+static DBuf VLForwardLayersFor(Dev d, const Tensor& hidden_in,
+                               const std::vector<int32_t>& positions,
+                               const CommonAttentionMetadata& am,
+                               const GDNAttentionMetadata& gm,
+                               const std::vector<PagedKvCache>& attn_kv,
+                               const std::vector<GdnStateCache>& gdn_state,
+                               const Qwen3_5DenseWeights& w, const HfConfig& c,
+                               const std::vector<int32_t>& logits_indices,
+                               const std::vector<float>* mrope_cos_sin) {
+  return DenseForwardLayers(d, hidden_in, positions, am, gm, attn_kv, gdn_state,
+                            w, c, logits_indices, /*hidden_tap=*/nullptr,
+                            mrope_cos_sin);
+}
+static DBuf VLForwardLayersFor(Dev d, const Tensor& hidden_in,
+                               const std::vector<int32_t>& positions,
+                               const CommonAttentionMetadata& am,
+                               const GDNAttentionMetadata& gm,
+                               const std::vector<PagedKvCache>& attn_kv,
+                               const std::vector<GdnStateCache>& gdn_state,
+                               const Qwen3_5MoeWeights& w, const HfConfig& c,
+                               const std::vector<int32_t>& logits_indices,
+                               const std::vector<float>* mrope_cos_sin) {
+  return ForwardLayers(d, hidden_in, positions, am, gm, attn_kv, gdn_state, w, c,
+                       logits_indices, /*hidden_tap=*/nullptr, mrope_cos_sin);
+}
+
+template <class W>
 static std::vector<int32_t> VLGenerateCoreGdn(
     Dev d, const std::vector<int32_t>& prompt_ids,
     const std::vector<float>& mm_main, const std::vector<bool>& mask,
     const std::vector<int32_t>& pos3_prefill, int64_t delta,
-    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
-    const HfConfig& config, int max_new_tokens) {
+    int32_t eos_token_id, const W& weights,
+    const HfConfig& config, int max_new_tokens,
+    bool graph_decode_supported = true) {
   Backend& backend = d.b;
   const int64_t H = config.hidden_size;
   const int64_t Hkv = config.num_key_value_heads;
@@ -8167,7 +8243,7 @@ static std::vector<int32_t> VLGenerateCoreGdn(
   std::vector<uint16_t> emb_bits(static_cast<size_t>(T0 * H));
   {
     DBuf hemb(d, DType::kBF16, {T0, H});
-    DenseEmbedInto(d, hemb, prompt_ids, weights, config);
+    VLEmbedInto(d, hemb, prompt_ids, weights, config);
     hemb.Download(d, emb_bits.data());
   }
   {
@@ -8196,10 +8272,9 @@ static std::vector<int32_t> VLGenerateCoreGdn(
     const CommonAttentionMetadata am = attn_meta(T0, 0);
     const GDNAttentionMetadata gm = gdn_prefill_meta(T0);
     const std::vector<int32_t> last_idx = {static_cast<int32_t>(T0 - 1)};
-    DBuf dlogits = DenseForwardLayers(d, merged.t(), pos1d_prefill, am, gm,
-                                      attn_kv, gdn_state, weights, config,
-                                      last_idx, /*hidden_tap=*/nullptr,
-                                      &mrope_prefill);
+    DBuf dlogits =
+        VLForwardLayersFor(d, merged.t(), pos1d_prefill, am, gm, attn_kv,
+                           gdn_state, weights, config, last_idx, &mrope_prefill);
     generated.push_back(VLArgMaxDevice(d, dlogits));
   }
 
@@ -8226,10 +8301,11 @@ static std::vector<int32_t> VLGenerateCoreGdn(
   const bool decode_eager =
       (std::getenv("VT_MM_DECODE_EAGER") != nullptr &&
        std::string(std::getenv("VT_MM_DECODE_EAGER")) == "1");
-  std::unique_ptr<Qwen3_5DenseDecodeGraph> dgraph;
-  if (!decode_eager)
-    dgraph = std::make_unique<Qwen3_5DenseDecodeGraph>(weights, config, d.q,
-                                                       /*max_num_reqs=*/1);
+  using DecodeGraph = typename VLDecodeGraphFor<W>::type;
+  std::unique_ptr<DecodeGraph> dgraph;
+  if (!decode_eager && graph_decode_supported)
+    dgraph = std::make_unique<DecodeGraph>(weights, config, d.q,
+                                           /*max_num_reqs=*/1);
   for (int step = 1; step < max_new_tokens; ++step) {
     if (generated.back() == eos_token_id) break;
     const int64_t abs_idx = T0 + (step - 1);  // sequence index of the fed token
@@ -8256,15 +8332,81 @@ static std::vector<int32_t> VLGenerateCoreGdn(
       const std::vector<int32_t> pos1d_dec = {static_cast<int32_t>(abs_idx)};
       const std::vector<float> mrope_dec = BuildMropeCosSinHost(pos3_dec, 1, config);
       DBuf tok(d, DType::kBF16, {1, H});
-      DenseEmbedInto(d, tok, one_id, weights, config);
-      DBuf dlogits = DenseForwardLayers(d, tok.t(), pos1d_dec, am, gm, attn_kv,
-                                        gdn_state, weights, config, {},
-                                        /*hidden_tap=*/nullptr, &mrope_dec);
+      VLEmbedInto(d, tok, one_id, weights, config);
+      DBuf dlogits = VLForwardLayersFor(d, tok.t(), pos1d_dec, am, gm, attn_kv,
+                                        gdn_state, weights, config, {}, &mrope_dec);
       generated.push_back(VLArgMaxDevice(d, dlogits));
     }
   }
   return generated;
 }
+
+// ── Shared image / video PREFILL PLAN (both arms). ──────────────────────────
+// The merge mask, the mm_main row-count check and the MRoPE 3-D prefill
+// positions + decode continuation delta. NONE of this depends on the text
+// backbone — the tower, the processor and the rope-index math are shared between
+// `Qwen3_5ForConditionalGeneration` (dense 27B) and
+// `Qwen3_5MoeForConditionalGeneration` (MoE 35B) upstream — so it is computed
+// once here rather than copied per arm (issue #891).
+namespace {
+struct VLPrefillPlan {
+  std::vector<bool> mask;
+  std::vector<int32_t> pos3_prefill;
+  int64_t delta = 0;
+};
+
+// spatial_merge_size is 2 for the whole Qwen3-VL lineage (not a text-config
+// field; matches the 4B, the 27B and the 35B `vision_config`).
+constexpr int64_t kVLSpatialMergeSize = 2;
+
+VLPrefillPlan VLPlanImage(const std::vector<int32_t>& prompt_ids,
+                          const std::vector<float>& mm_main, int64_t H,
+                          const std::array<int64_t, 3>& grid_thw,
+                          int32_t image_token_id) {
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  VLPrefillPlan plan;
+  plan.mask.assign(static_cast<size_t>(T0), false);
+  int64_t offset = -1, n_img = 0;
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
+      if (offset < 0) offset = t;
+      plan.mask[static_cast<size_t>(t)] = true;
+      ++n_img;
+    }
+  }
+  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
+  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
+  plan.pos3_prefill = multimodal::Qwen3VLGetRopeIndex(
+      prompt_ids, spans, kVLSpatialMergeSize, &plan.delta);
+  return plan;
+}
+
+VLPrefillPlan VLPlanVideo(const std::vector<int32_t>& prompt_ids,
+                          const std::vector<float>& mm_main, int64_t H,
+                          const std::array<int64_t, 3>& grid_thw,
+                          int32_t video_token_id, int32_t vision_start_token_id,
+                          int32_t vision_end_token_id) {
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  VLPrefillPlan plan;
+  plan.mask.assign(static_cast<size_t>(T0), false);
+  int64_t n_vid = 0;
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == video_token_id) {
+      plan.mask[static_cast<size_t>(t)] = true;
+      ++n_vid;
+    }
+  }
+  VT_CHECK(n_vid > 0, "qwen3_5 VL: no video token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_vid, "qwen3_5 VL: mm_main rows != video-token count");
+  plan.pos3_prefill = multimodal::Qwen3VLGetRopeIndexVideo(
+      prompt_ids, grid_thw, kVLSpatialMergeSize, vision_start_token_id,
+      video_token_id, vision_end_token_id, &plan.delta);
+  return plan;
+}
+}  // namespace
 
 std::vector<int32_t> Qwen3_5VLGenerateGreedy(
     const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
@@ -8273,33 +8415,11 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedy(
     const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
   Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
-  const int64_t H = config.hidden_size;
-  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
-
-  // Image span offset + visual mask + N.
-  int64_t offset = -1, n_img = 0;
-  std::vector<bool> mask(static_cast<size_t>(T0), false);
-  for (int64_t t = 0; t < T0; ++t) {
-    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
-      if (offset < 0) offset = t;
-      mask[static_cast<size_t>(t)] = true;
-      ++n_img;
-    }
-  }
-  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
-  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
-  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
-
-  // MRoPE 3-D positions [3,T0] + decode continuation delta. spatial_merge_size is
-  // 2 for the whole Qwen3-VL lineage (not a text-config field; matches the 4B).
-  const int64_t sms = 2;
-  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
-  int64_t delta = 0;
-  const std::vector<int32_t> pos3_prefill =
-      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, sms, &delta);
-
-  return VLGenerateCoreGdn(d, prompt_ids, mm_main, mask, pos3_prefill, delta,
-                           eos_token_id, weights, config, max_new_tokens);
+  const VLPrefillPlan plan = VLPlanImage(prompt_ids, mm_main, config.hidden_size,
+                                         grid_thw, image_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens);
 }
 
 // ── M3d: the Qwen3.6-27B GDN-hybrid VL video->text greedy driver. ───────────
@@ -8319,31 +8439,71 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedyVideo(
     const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
   Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
-  const int64_t H = config.hidden_size;
-  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  const VLPrefillPlan plan =
+      VLPlanVideo(prompt_ids, mm_main, config.hidden_size, grid_thw,
+                  video_token_id, vision_start_token_id, vision_end_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens);
+}
 
-  // Video merge mask (all video_token_id positions across all frames).
-  int64_t n_vid = 0;
-  std::vector<bool> mask(static_cast<size_t>(T0), false);
-  for (int64_t t = 0; t < T0; ++t) {
-    if (prompt_ids[static_cast<size_t>(t)] == video_token_id) {
-      mask[static_cast<size_t>(t)] = true;
-      ++n_vid;
-    }
-  }
-  VT_CHECK(n_vid > 0, "qwen3_5 VL: no video token in prompt");
-  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
-  VT_CHECK(N == n_vid, "qwen3_5 VL: mm_main rows != video-token count");
+// ── issue #891: the Qwen3.6-35B-A3B MoE GDN-hybrid VL image / video drivers. ──
+//
+// The MoE arm of the SAME model family. Upstream's
+// `Qwen3_5MoeForConditionalGeneration` composes the SAME `Qwen3_VisionTransformer`
+// as `Qwen3_5ForConditionalGeneration` over the MoE text backbone (pinned vLLM
+// `qwen3_5.py`), and `deepstack_visual_indexes: []` compiles the deepstack path
+// out for the whole family (`qwen3_vl.py:1709-1716`). So these are the dense
+// drivers above with `Qwen3_5MoeWeights` substituted: the SAME shared tower
+// (`LoadQwen3_5MoeVision` -> `LoadQwen3VLVisionWeights` ->
+// `Qwen3VLVisionForward`), the SAME processor, the SAME MRoPE index math
+// (`VLPlanImage` / `VLPlanVideo`) and the SAME greedy core
+// (`VLGenerateCoreGdn<Qwen3_5MoeWeights>`).
+//
+// GATED ON MM INPUT: these are separate entry points, reached only when a request
+// carries an image or a video. A text-only request never enters here — it goes
+// through the registered `ForwardQwen3_5Moe`, which is untouched, so the text
+// path executes the identical instruction sequence it did before.
+//
+// DECODE GRAPH: `graph_decode_supported` mirrors `ForwardQwen3_5Moe`'s own
+// routing — the MoE decode graph is taken only on the fp4 CUDA path, so a bf16
+// checkpoint (`Qwen/Qwen3.6-35B-A3B`) decodes eagerly here exactly as it does in
+// production text decode.
+namespace {
+bool MoeDecodeGraphSupported(const Qwen3_5MoeWeights& weights) {
+  return !weights.layers.empty() &&
+         !weights.layers.front().moe.expert_gate_fp4.empty();
+}
+}  // namespace
 
-  // MRoPE 3-D positions [3,T0] + decode delta via the per-frame video scan.
-  const int64_t sms = 2;
-  int64_t delta = 0;
-  const std::vector<int32_t> pos3_prefill = multimodal::Qwen3VLGetRopeIndexVideo(
-      prompt_ids, grid_thw, sms, vision_start_token_id, video_token_id,
-      vision_end_token_id, &delta);
+std::vector<int32_t> Qwen3_5MoeVLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const VLPrefillPlan plan = VLPlanImage(prompt_ids, mm_main, config.hidden_size,
+                                         grid_thw, image_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens, MoeDecodeGraphSupported(weights));
+}
 
-  return VLGenerateCoreGdn(d, prompt_ids, mm_main, mask, pos3_prefill, delta,
-                           eos_token_id, weights, config, max_new_tokens);
+std::vector<int32_t> Qwen3_5MoeVLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const VLPrefillPlan plan =
+      VLPlanVideo(prompt_ids, mm_main, config.hidden_size, grid_thw,
+                  video_token_id, vision_start_token_id, vision_end_token_id);
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, plan.mask, plan.pos3_prefill,
+                           plan.delta, eos_token_id, weights, config,
+                           max_new_tokens, MoeDecodeGraphSupported(weights));
 }
 
 ForwardLogits Qwen3_5DenseModel::ForwardDevice(
@@ -9148,7 +9308,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       try {
         return ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                              s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                             impl_->config, {}, nullptr, aux_ids_arg, aux_out_arg,
+                             impl_->config, {}, nullptr, /*mrope_cos_sin=*/nullptr,
+                             aux_ids_arg, aux_out_arg,
                              dbuf ? s.dev.get() : nullptr);
       } catch (...) {
         void* g = nullptr;
@@ -9177,7 +9338,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, s.gdn_meta,
                           attn_kv, gdn_state, impl_->weights, impl_->config, {},
-                          nullptr, aux_ids_arg, aux_out_arg);
+                          nullptr, /*mrope_cos_sin=*/nullptr, aux_ids_arg,
+                          aux_out_arg);
   s.warm = true;
   s.captured = false;
   publish_aux();
