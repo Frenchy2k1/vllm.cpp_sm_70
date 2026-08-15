@@ -1955,14 +1955,47 @@ knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
-declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
-`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
-family does not define is refused, never ignored. One caveat inside that set:
-`duration_head_path` is accepted but INERT — the duration head is ported and gated
-as a brick, nothing in the video engine constructs one, and no code reads that
-key, so supplying it neither loads a head nor enables an AUTO duration. Give
+declares none), `dit_config_path`, `encoder_config_path`,
+`allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
+`upsampler_path` and `duration_head_path`. An extra a family does not define is
+refused, never ignored. One caveat inside that set: `duration_head_path` is
+defined but UNSERVED — the duration head is ported and gated as a brick, and
+nothing in the video engine constructs one — so supplying it is **refused by
+name** at load rather than accepted. It used to be accepted and read by nothing,
+which silently substituted the recipe default for the file you named. Give
 `num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
-rate) instead.
+rate) instead. Every other key in that list reaches a reader.
+
+One LTX-2.5 arm is refused where a render would otherwise silently downgrade:
+the spatiotemporal latent upsampler. It is reachable — supplying that checkpoint
+as `upsampler_path` gets a refusal naming the arm you actually supplied. The
+spatiotemporal upsampler is the arm with `spatial_upsample` AND
+`temporal_upsample` set, which upstream builds as a different operator
+(`Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`). The temporal-only x2 upsampler is
+**ported** and is not refused; nothing shipped drives it yet, so it is gated
+rather than served. Four more are
+recorded as out of scope but are **not requestable**, so no flag or extra can
+reach them: LoRA fusion, `int8-convrot`, single-node multi-GPU, and
+`BetaScheduler`. Their messages
+say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
+`BetaScheduler` is in that group rather than the reachable one because upstream
+selects it nowhere: every `ltx-pipelines` entry point hard-codes
+`LTX2Scheduler()`, so there is no scheduler-kind field to mirror and nothing here
+carries one either. `int8-convrot`
+in particular is a ComfyUI-ecosystem format: upstream LTX-2's own inference
+quantization kinds are `fp8-cast`, `fp8-scaled-mm`, `nvfp4-cast` and
+`nvfp4-prequant`, and nothing wired upstream reaches int8 at all.
+
+What is **not** on that list, and why: **multi-shot or multi-scene generation.**
+A request that composes several camera takes into one output has no flag here
+because upstream LTX-2 has no such mode to mirror — its `shot` is one continuous
+take, and its own prompt-enhancement prompts instruct the model to keep a "single
+continuous take" and not to describe scene cuts. `scene` does appear across the
+upstream tree, in three unrelated senses (`scene-linear` HDR colour, PySceneDetect
+in the trainer's dataset preprocessor, and that prompt-writing guidance); none of
+them is a generation mode. This port carried a `multishot` refusal until
+2026-08-13, which was a defect in our own record rather than a gap, and it was
+retired. Generate one take per request.
 
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector

@@ -114,8 +114,24 @@ std::vector<float> Ltx2LinearQuadraticSchedule(int64_t steps, double threshold_n
 // `Ltx2Schedule` REFUSES it by name rather than substituting LTX2Scheduler.
 enum class Ltx2SchedulerKind { kLtx2, kLinearQuadratic, kBeta };
 
-// The seam a caller reaches for when it holds a configured kind. Forwards to the
-// two ported schedulers and throws for `kBeta`.
+// The seam a caller would reach for if it held a configured kind. NOTHING IN
+// `src/`, `include/` OR `examples/` CALLS THIS, and that is upstream's shape, not
+// an omission: no ltx-pipelines entry point selects a scheduler either, so there
+// is no request field to carry a kind and the engine calls `Ltx2SigmaSchedule`
+// directly, in `ltx2_video.cpp`'s phase driver. Say "no caller" rather than "the
+// seam a caller reaches for": that wording is what published `kBetaScheduler` as
+// a reachable refusal (#889). No line number: that file moves on every merge, and
+// this row has already shipped three anchors that went stale inside one branch.
+//
+// UNREACHED, AND DELIBERATELY SO UNTIL #893 DECIDES OTHERWISE. Under AGENTS.md
+// `## Nothing lands dead` this is the "test-only driver" shape, and the rule asks
+// for the unreached thing, its owning row and its issue to be named rather than
+// left for the next reader to discover. Owning row LTX25-RETIRE-DEAD-ARMS, which
+// lists it under `## Owed`. There is no wiring wave coming — upstream has no
+// scheduler selection to mirror — so the open question is retire-or-keep, not
+// when to wire it.
+//
+// Forwards to the two ported schedulers and throws for `kBeta`.
 std::vector<float> Ltx2Schedule(Ltx2SchedulerKind kind, int64_t steps, int64_t tokens,
                                 const Ltx2SchedulerParams& params = {});
 
@@ -571,23 +587,110 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
                                              const std::string& model_version);
 
 // ---------------------------------------------------------------------------
-// Out of scope for L5, refused by name (spec section 2, "Out")
+// Out of scope, refused by name (spec section 2 "Out"; the 2026-08-13 grounding
+// pass is .agents/specs/ltx25-retire-dead-arms.md, row LTX25-RETIRE-DEAD-ARMS)
 // ---------------------------------------------------------------------------
 
 // Each of these renders something plausible if it is silently downgraded, which
 // is why none of them falls back. `Ltx2RefuseUnportedPipelineFeature` throws with
-// a message naming the missing piece and the phase or row that owes it.
+// a message naming the missing piece and the row that owes it.
+//
+// TWO KINDS live here, and conflating them overstated what this port refuses:
+//
+//   REACHABLE REFUSAL — a product path constructs the condition and throws, so a
+//   caller CAN trip it. `kSpatiotemporalUpsampler` (ltx2_upsampler.cpp:465) is
+//   the ONE. `ltx2_video.cpp` reaches it through `Ltx2UpsampleVideoLatent` when a
+//   phase asks for the spatial-upsample transform. The TEMPORAL-ONLY x2
+//   upsampler is NOT among them: it is ported (`2e9d95e74`, spec
+//   .agents/specs/ltx25-temporal-upsampler.md), which is why the enumerator that
+//   used to be spelled `kTemporalUpsampler` now names the spatiotemporal arm
+//   only. Nothing shipped drives the ported arm yet, so it is gated, not served.
+//
+//   The definition above is a claim about CALLERS, and it takes a caller to
+//   satisfy it. A `case` label is not one. `kBetaScheduler` was published here as
+//   the second reachable arm for the whole of row LTX25-RETIRE-DEAD-ARMS, and it
+//   is not: its call site `ltx2_pipeline.cpp:199` sits inside `Ltx2Schedule`,
+//   which nothing calls (#889). Recorded rather than quietly moved, because the
+//   row's subject is exactly this — a classification asserted instead of derived,
+//   and AGENTS.md `## Nothing lands dead` now names the shape it took. The split
+//   is gated by `test_ltx2_pipeline`'s "the reachable/marker split matches the
+//   source", which walks src/, include/ and examples/ and carries two positive
+//   controls in the same walk. That gate is the anti-tautological shape #691
+//   asked for, for the beta arm; #691 stays open for the other three markers.
+//
+//   DECLARED-OUT-OF-SCOPE MARKER — no request field, load extra or CLI flag asks
+//   for it, so nothing outside the ledger test reaches it. It is a record of what
+//   upstream HAS and this port does NOT, which is worth keeping; calling it a
+//   refusal is what was wrong. `kBetaScheduler`, `kLoraFusion`, `kInt8ConvRot`
+//   and `kMultiGpuParallelism` are markers, and their messages say so.
+//
+// TWO ENUMERATORS WERE RETIRED on 2026-08-13, recorded here because the
+// retirement IS the record — a reader who finds them in git history needs to know
+// they did not simply move:
+//
+//   `kMultishot` — FABRICATED. It refused "multishot generation" and cited
+//   "ltx-pipelines multishot entry points". No such entry point, symbol or string
+//   exists in Lightricks/LTX-2 @ fd4ded7f or huggingface/diffusers @ 3a2f35d4.
+//   Searched as a SUBJECT rather than by our own phrasing: upstream's only sense
+//   of "shot" is ONE camera take (duration_head.py:1,5 "predicts shot duration";
+//   README.md:136 "a cinematographer describing a shot list"). `scene` has THREE
+//   senses upstream and none is a generation mode: `scene-linear` HDR colour
+//   (ltx-core color/hlg.py, hdr.py), PySceneDetect in the TRAINER — the only CODE
+//   sense — and prompt-writing guidance, which ships at INFERENCE inside
+//   `ltx-core`, in text_encoders/gemma/encoders/prompts/ as
+//   gemma{3,4}_{i2v,t2v}_system_prompt.txt. That third sense is why the
+//   retirement HOLDS rather than being undermined: those prompts tell the
+//   enhancer NOT to describe scene cuts and to keep a "Single continuous take"
+//   (gemma3_i2v:6,18, gemma3_t2v:24, gemma4_i2v:3). A defect in our record is not
+//   a gap in our port, so there was nothing to owe.
+//
+//   Recorded because it is the row's own subject: this paragraph used to claim
+//   that `scene` appeared upstream ONLY as PySceneDetect in the trainer. It was
+//   an absence asserted from our own vocabulary with no positive control — #604 —
+//   shipped in the header of the row that exists to retire #604 instances, and it
+//   took a third review round to find. The derivation, with its positive control
+//   in the same command, is .agents/specs/ltx25-retire-dead-arms.md §1.1.
+//
+//   `kVideoEngineWiring` — LANDED. It said the end-to-end composition through
+//   `vllm::multimodal::VideoEngine` "is phase L7, not L5"; L7 shipped in
+//   `cefacd2d0`. A refusal whose subject shipped is a false statement.
 enum class Ltx2UnportedPipelineFeature {
+  // Reachable refusal. Singular.
   // model/upsampler with BOTH flags set. The temporal-ONLY arm is ported
   // (.agents/specs/ltx25-temporal-upsampler.md); this one is a different
   // operator — `Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`, model.py:55-59.
   kSpatiotemporalUpsampler,
-  kLoraFusion,          // loader/LoraPathStrengthAndSDOps
-  kMultishot,           // ltx-pipelines multishot entry points
-  kInt8ConvRot,         // ComfyUI-only quantization
-  kCfgParallelism,      // ltx-pipelines/multigpu
-  kVideoEngineWiring,   // end-to-end through vllm::multimodal::VideoEngine (L7)
-  kBetaScheduler,       // components/schedulers.py:91-120
+  // Declared-out-of-scope markers.
+  kBetaScheduler,        // ltx-core components/schedulers.py:91-120. A MARKER because
+                         //   upstream constructs it nowhere: all seven ltx-pipelines entry
+                         //   points hard-code `LTX2Scheduler()`, and vLLM-Omni @ a4ea67a21
+                         //   has zero hits for the name. Mirroring that means no
+                         //   scheduler-kind field here either, so nothing reaches the
+                         //   refusal — `Ltx2Schedule`, which holds it, has no caller.
+  kLoraFusion,           // ltx-core loader/primitives.py:160 (LoraPathStrengthAndSDOps),
+                         //   fused by loader/fuse_loras.py
+  kInt8ConvRot,          // ComfyUI-ecosystem quantization, and NOT an LTX-2 arm: the four
+                         //   inference kinds upstream defines are fp8-cast / fp8-scaled-mm /
+                         //   nvfp4-cast / nvfp4-prequant (quantization_factory.py:23-26).
+                         //   `convrot` is nowhere at all; int8 is UNREACHABLE rather than
+                         //   absent — trainer-only for anything wired, plus one DEAD kernel
+                         //   in ltx-kernels (triton_ops.py:35,43). §1.2 of the row spec
+  kMultiGpuParallelism,  // ltx-pipelines/multigpu — four forms: sequence-parallel,
+                         //   tiled data parallel, distributed VAE decode, and
+                         //   batch-parallel Gemma encoding (bp_gemma_builder.py:42,
+                         //   `BatchParallelGemmaBuilder`), which partitions a prompt
+                         //   list across ranks. None is CFG batching, and the reason
+                         //   is upstream's own: docs/multigpu/gemma.md:103-104 calls a
+                         //   positive+negative pair "the typical CFG case" and records
+                         //   that the DISTILLED pipeline this port runs takes no
+                         //   negative_prompt, so it "runs without CFG". This used to
+                         //   assert instead that the string was absent from both
+                         //   multigpu trees, which came from a PATH-FILTERED grep that
+                         //   excluded the docs/ tree carrying the answer: 5 hits, not
+                         //   0, against 33 files as the control (#892, §1.3 of the row
+                         //   spec). The false sentence is not repeated here, because
+                         //   the gate on it matches TEXT and cannot tell a quotation
+                         //   from a claim
 };
 [[noreturn]] void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature);
 
