@@ -14,6 +14,7 @@
 extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_op_parity(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose);
+extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose);
 
 TEST_CASE("sm70 fa2 decode fast path matches the reference (kernel parity)") {
   // fp16-WMMA vs fp32-fma rounding -> sub-percent rel deviation expected.
@@ -34,6 +35,15 @@ TEST_CASE("sm70 fa2 prefill fast path matches CPU flash (causal, 2 req)") {
   const int rc = vt_sm70_fa2_prefill_self_check(/*tol_rel=*/3e-2f, /*verbose=*/1);
   if (rc == 2) {
     MESSAGE("not an sm_70 CUDA device: prefill self-check skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("sm70 fa2 prefill matches the engine's paged prefill op (routing parity)") {
+  const int rc = vt_sm70_fa2_prefill_op_parity(/*tol_rel=*/3e-2f, /*verbose=*/1);
+  if (rc == 2) {
+    MESSAGE("not an sm_70 CUDA device: prefill op-parity skipped");
     return;
   }
   CHECK(rc == 0);
