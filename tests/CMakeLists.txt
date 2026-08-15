@@ -258,6 +258,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# The reader-anchor claim this suite gates is a claim ABOUT a source file, so it
+# reads that file. Recorded `file:line` anchors go stale within the same PR here
+# (a merge of origin/main moved all nine of these by 25 lines mid-review), which
+# is why the anchors are derived from the source and compared with the recorded
+# ones rather than trusted.
+target_compile_definitions(test_ltx2_video PRIVATE
+  LTX2_VIDEO_SOURCE_PATH="${CMAKE_SOURCE_DIR}/src/vllm/multimodal/ltx2_video.cpp")
 # LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
 # PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
 # ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
@@ -294,6 +301,23 @@ target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE
 # next to the test source.
 vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
 target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The out-of-scope ledger separates a REACHABLE refusal from a declared marker, and
+# docs/FEATURES.md is where that distinction reaches a user. It had re-merged the two
+# into one "Declared, not requestable" row, so the public surface contradicted the
+# ledger it projects; the case below reads the doc and holds it to the split.
+# The ledger's RETIREMENT note carries an absence claim about upstream, and it
+# shipped false twice in the same header. The case that guards it reads the header
+# itself rather than a copy of the sentence kept in the test.
+# The ledger's reachable/marker split is a claim about the PRODUCT TREE — that
+# something calls the function holding a reachable refusal, and that nothing calls
+# the one holding a marker. It was wrong about `kBetaScheduler` for the whole of
+# this row because it was maintained by hand, so the case now walks src/, include/
+# and examples/ under this root and derives it, with two positive controls in the
+# same walk (an absence claim about our own tree is still an absence claim).
+target_compile_definitions(test_ltx2_pipeline PRIVATE
+  VLLM_CPP_FEATURES_DOC_PATH="${CMAKE_SOURCE_DIR}/docs/FEATURES.md"
+  LTX2_PIPELINE_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_pipeline.h"
+  VLLM_CPP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
 # LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the

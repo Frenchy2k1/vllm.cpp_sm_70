@@ -27,11 +27,15 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1231,26 +1235,593 @@ TEST_CASE("ltx2 the two references disagree on the default negative prompt, and 
 // Out-of-scope refusals
 // ===========================================================================
 
-TEST_CASE("ltx2 every L5 out-of-scope feature is refused BY NAME") {
-  // Spec section 2 "Out", plus the L7 boundary. A silent downgrade of any of
-  // these produces a video, which is exactly why none of them may fall back.
-  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> owed = {
-      {vllm::Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler, "temporal"},
-      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
-      {vllm::Ltx2UnportedPipelineFeature::kMultishot, "multishot"},
-      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
-      {vllm::Ltx2UnportedPipelineFeature::kCfgParallelism, "parallelism"},
-      {vllm::Ltx2UnportedPipelineFeature::kVideoEngineWiring, "VideoEngine"},
-      {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
+// THE LIST SHRANK FROM SEVEN TO FIVE on 2026-08-13, and the shrink is the point.
+// Two enumerators were retired by row LTX25-RETIRE-DEAD-ARMS (#644):
+// `kMultishot`, which refused a feature that exists in NEITHER reference, and
+// `kVideoEngineWiring`, whose subject shipped in `cefacd2d0`. See
+// .agents/specs/ltx25-retire-dead-arms.md §1.1 and §1.5. A CHANGED CASE COUNT
+// here is that retirement, not a lost assertion.
+TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
+  // Spec section 2 "Out". A silent downgrade of any of these produces a video,
+  // which is exactly why none of them may fall back.
+  //
+  // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
+  // trip this. ONE of the five is, not two. The engine reaches
+  // `ltx2_upsampler.cpp:465` through `Ltx2UpsampleVideoLatent`, which
+  // `ltx2_video.cpp` calls when a phase asks for the spatial-upsample transform.
+  //
+  // `kBetaScheduler` USED TO BE LISTED HERE and is not reachable. Its call site
+  // `ltx2_pipeline.cpp:199` sits inside `Ltx2Schedule`, and `Ltx2Schedule` has no
+  // product caller at all — the engine calls `Ltx2SigmaSchedule` directly
+  // in `ltx2_video.cpp`'s phase driver — and no ABI field, load extra or CLI flag
+  // carries a scheduler kind. A refusal is only reachable if something CALLS the function
+  // holding it; an enumerator with a `case` label is not a caller. The case
+  // "ltx2 the reachable/marker split matches the source" below derives that
+  // reachability from the tree rather than restating it here.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> reachable = {
+      {vllm::Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler, "SPATIOTEMPORAL"},
   };
-  for (const auto& item : owed) {
+  // DECLARED-OUT-OF-SCOPE MARKERS: nothing a caller can send reaches these, so
+  // the message must not claim otherwise. Recording them as refusals overstated
+  // what this port has, which is the defect this row closes.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> markers = {
+      {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
+      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
+      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
+      {vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism, "multi-GPU"},
+  };
+
+  std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> all = reachable;
+  all.insert(all.end(), markers.begin(), markers.end());
+  for (const auto& item : all) {
     const std::string message =
         RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
     INFO("feature = ", item.second, " refusal = ", message);
     CHECK(Mentions(message, item.second));
     // Naming WHERE the work is owed is what keeps it from being rediscovered.
     CHECK(Mentions(message, "ltx-2-5.md"));
+    // The RETIRED arm must not come back: a refusal that cites a feature neither
+    // reference has sends the next reader looking upstream for it.
+    CHECK_FALSE(Mentions(message, "multishot"));
   }
+  for (const auto& item : reachable) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("reachable = ", item.second, " refusal = ", message);
+    CHECK_FALSE(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+  for (const auto& item : markers) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("marker = ", item.second, " refusal = ", message);
+    CHECK(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+
+  // THE ABSENCE THIS MESSAGE STATES IS ITSELF EVIDENCE, so it is gated. The first
+  // version of this marker ended "int8 appears upstream only in the trainer" — a
+  // false-absence claim of exactly the kind row LTX25-RETIRE-DEAD-ARMS exists to
+  // retire (#604), shipped inside a user-visible refusal. LTX-2 @ fd4ded7f carries
+  // a per-row int8 quantize kernel with fp32 scales in `ltx-kernels`, which is an
+  // INFERENCE package, not the trainer: `blockwise/triton_ops.py:35,43`, aliased
+  // `rowwise_int_quantize_triton` at `:436`. It is dead — that alias is its only
+  // reference and `blockwise/functional.py:12-18` does not re-export it — so the
+  // disposition is unchanged and only the sentence was wrong. See
+  // .agents/specs/ltx25-retire-dead-arms.md §1.2.
+  {
+    const std::string message = RefusalMessage([] {
+      vllm::Ltx2RefuseUnportedPipelineFeature(vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot);
+    });
+    INFO("int8 marker = ", message);
+    CHECK_FALSE(Mentions(message, "only in the trainer"));
+    // The true statement names where the one inference-side int8 lives, so a
+    // reader who greps upstream and finds it is not left thinking we missed it.
+    CHECK(Mentions(message, "ltx-kernels"));
+  }
+
+  // THE MULTI-GPU MARKER'S OWN EVIDENCE, for the same reason and after the same
+  // defect. This message shipped "Upstream has three forms and none of them is
+  // CFG batching", and the header above the enum shipped "zero `cfg` hits in
+  // either multigpu tree". Both are false at LTX-2 @ fd4ded7f, and both are #604
+  // again: the spec's grep was correct but PATH-FILTERED to the two SOURCE trees,
+  // excluding `ltx-pipelines/docs/multigpu/` where the answer lives. Re-derived
+  // without the filter, with the file list as its own positive control:
+  //
+  //   git ls-files -- '*multigpu*'          -> 33 files (the control)
+  //   git grep -n -i cfg -- '*multigpu*'    -> 5 lines, NOT zero
+  //
+  // Two of the five are substantive, at `docs/multigpu/gemma.md:103-104`. And
+  // there is a FOURTH `BuilderProtocol` in the very directory the message cites:
+  // `multigpu/bp_gemma_builder.py:42` `BatchParallelGemmaBuilder`, wrapping
+  // `ltx-core multigpu/gemma/batch_parallel_wrapper.py`, which partitions a PROMPT
+  // LIST across ranks.
+  //
+  // The disposition is unchanged and in fact stronger: `gemma.md:104` says the
+  // distilled pipeline runs "without CFG", so the one form that would batch a
+  // CFG pair is the one upstream tells you not to use for the recipe this port
+  // runs. Only the sentences were wrong. See
+  // .agents/specs/ltx25-retire-dead-arms.md §1.3.
+  {
+    const std::string message = RefusalMessage([] {
+      vllm::Ltx2RefuseUnportedPipelineFeature(
+          vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism);
+    });
+    INFO("multi-GPU marker = ", message);
+    // The retired count. "three forms" was an undercount produced by a path
+    // filter, so the count itself is the assertion.
+    CHECK_FALSE(Mentions(message, "three forms"));
+    CHECK(Mentions(message, "four forms"));
+    // The form the undercount missed, by name, so a reader who greps the cited
+    // directory and finds a fourth builder is not left thinking we missed it.
+    CHECK(Mentions(message, "BatchParallelGemmaBuilder"));
+    // And the REASON CFG batching is inapplicable, cited to the upstream line
+    // that says it, rather than asserted as an absence of the string `cfg`.
+    CHECK(Mentions(message, "gemma.md"));
+  }
+}
+
+// THE REACHABLE/MARKER SPLIT, DERIVED FROM THE TREE INSTEAD OF ASSERTED.
+//
+// The ledger above and `docs/USAGE.md` both make a claim about the PRODUCT CODE:
+// that a render asking for a reachable arm gets a refusal, and that nothing a
+// caller can send reaches a marker. Until this case existed, that claim was two
+// hand-maintained vectors and a paragraph, and it was wrong about
+// `kBetaScheduler` for the whole of this row: the header defined reachable as "a
+// caller CAN trip it", `docs/USAGE.md` published "Both are reachable", and the
+// refusal was inside `Ltx2Schedule`, which nothing calls.
+//
+// THE RULE THIS ENCODES. A refusal is reachable only if something CALLS the
+// function that holds it. A `case` label in a switch is not a caller, and an
+// enumerator that appears in `src/` proves only that the compiler can see it.
+// So the check is on the ENTRY FUNCTION of each arm's chain:
+//
+//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:465)
+//                             <- `Ltx2UpsampleVideoLatent` (:566)
+//                             <- `ltx2_video.cpp`, the phase that upsamples
+//   kBetaScheduler            `Ltx2Schedule` (ltx2_pipeline.cpp:199)
+//                             <- NOTHING
+//
+// TWO POSITIVE CONTROLS, because this case is an ABSENCE claim about our own tree
+// and #604 is the row's whole subject. A scan that reports zero because it opened
+// no files, or because it cannot match a symbol of this shape, reports the same
+// zero as a genuine absence. So the same walk, with the same predicate and the
+// same exclusions, must find `Ltx2UpsampleVideoLatent` called from product code
+// (the reachable arm, proving the walk sees callers at all) and `Ltx2SigmaSchedule`
+// called from product code (proving a SCHEDULER entry point in this same header
+// is findable, so the zero for `Ltx2Schedule` is not an artifact of the name).
+namespace {
+
+// Every product translation unit: `src/`, `include/` and `examples/`. Tests are
+// deliberately excluded — a unit test constructing an enumerator by hand is
+// exactly what a marker is, so counting it as a caller would erase the split.
+std::vector<std::filesystem::path> ProductSources() {
+  std::vector<std::filesystem::path> out;
+  for (const char* dir : {"src", "include", "examples"}) {
+    const std::filesystem::path root = std::filesystem::path(VLLM_CPP_SOURCE_ROOT) / dir;
+    if (!std::filesystem::is_directory(root)) continue;
+    for (const std::filesystem::directory_entry& e :
+         std::filesystem::recursive_directory_iterator(root)) {
+      if (!e.is_regular_file()) continue;
+      const std::string ext = e.path().extension().string();
+      if (ext == ".cpp" || ext == ".cc" || ext == ".h" || ext == ".hpp" || ext == ".cu") {
+        out.push_back(e.path());
+      }
+    }
+  }
+  return out;
+}
+
+// Product files mentioning `symbol(`, excluding the files that DECLARE and DEFINE
+// it. Reported as `path:line` strings so a failure names the caller rather than a
+// count the reader then has to go and find.
+std::vector<std::string> ProductCallSites(const std::vector<std::filesystem::path>& files,
+                                          const std::string& symbol,
+                                          const std::vector<std::string>& owning_files) {
+  std::vector<std::string> hits;
+  for (const std::filesystem::path& path : files) {
+    const std::string name = path.filename().string();
+    if (std::find(owning_files.begin(), owning_files.end(), name) != owning_files.end()) continue;
+    std::ifstream in(path);
+    if (!in.good()) continue;
+    std::string line;
+    size_t line_no = 0;
+    while (std::getline(in, line)) {
+      ++line_no;
+      if (line.find(symbol + "(") != std::string::npos) {
+        hits.push_back(path.filename().string() + ":" + std::to_string(line_no));
+      }
+    }
+  }
+  return hits;
+}
+
+std::string Join(const std::vector<std::string>& v) {
+  std::string s;
+  for (const std::string& x : v) s += (s.empty() ? "" : ", ") + x;
+  return s.empty() ? "<none>" : s;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 the reachable/marker split matches the source") {
+  const std::vector<std::filesystem::path> files = ProductSources();
+  // ANTI-VACUOUS, control zero: a walk that opened nothing reports every symbol
+  // as unreachable and passes the half of this case that matters least.
+  REQUIRE_MESSAGE(files.size() > 100,
+                  "the product-source walk found only " << files.size()
+                                                        << " files; VLLM_CPP_SOURCE_ROOT is wrong");
+
+  // ── CONTROL ONE: the reachable arm's entry function IS called ──────────────
+  const std::vector<std::string> upsample_callers =
+      ProductCallSites(files, "Ltx2UpsampleVideoLatent",
+                       {"ltx2_upsampler.cpp", "ltx2_upsampler.h", "ltx2_video_vae_encoder.h"});
+  INFO("Ltx2UpsampleVideoLatent callers = " << Join(upsample_callers));
+  CHECK_MESSAGE(!upsample_callers.empty(),
+                "the SPATIOTEMPORAL refusal is published as REACHABLE, but nothing in src/, "
+                "include/ or examples/ calls Ltx2UpsampleVideoLatent. Either the engine stopped "
+                "upsampling, or this walk is broken — resolve which before trusting the zero "
+                "below");
+
+  // ── CONTROL TWO: a scheduler entry point in the SAME header is findable ────
+  const std::vector<std::string> sigma_callers =
+      ProductCallSites(files, "Ltx2SigmaSchedule", {"ltx2_pipeline.cpp", "ltx2_pipeline.h"});
+  INFO("Ltx2SigmaSchedule callers = " << Join(sigma_callers));
+  CHECK_MESSAGE(!sigma_callers.empty(),
+                "no product caller of Ltx2SigmaSchedule either, so the walk cannot see scheduler "
+                "call sites and the Ltx2Schedule zero below proves nothing");
+
+  // ── THE CLAIM: the Beta refusal is reached by no product path ──────────────
+  const std::vector<std::string> schedule_callers =
+      ProductCallSites(files, "Ltx2Schedule", {"ltx2_pipeline.cpp", "ltx2_pipeline.h"});
+  INFO("Ltx2Schedule callers = " << Join(schedule_callers));
+
+  const std::string beta = RefusalMessage([] {
+    vllm::Ltx2RefuseUnportedPipelineFeature(vllm::Ltx2UnportedPipelineFeature::kBetaScheduler);
+  });
+  INFO("BetaScheduler refusal = " << beta);
+
+  // The two must AGREE, in both directions, which is what makes this a gate on
+  // the classification rather than a restatement of it. No caller means marker;
+  // a caller appearing later means the marker wording has to go.
+  if (schedule_callers.empty()) {
+    CHECK_MESSAGE(Mentions(beta, "DECLARED, NOT REQUESTABLE"),
+                  "nothing in src/, include/ or examples/ calls Ltx2Schedule, so no request can "
+                  "reach the BetaScheduler refusal, yet its message does not say DECLARED, NOT "
+                  "REQUESTABLE. Either route the engine through Ltx2Schedule or classify it as a "
+                  "marker, per .agents/specs/ltx25-retire-dead-arms.md §1.6");
+  } else {
+    CHECK_MESSAGE(!Mentions(beta, "DECLARED, NOT REQUESTABLE"),
+                  "Ltx2Schedule now HAS a product caller ("
+                      << Join(schedule_callers)
+                      << "), so the BetaScheduler refusal is reachable and must stop calling "
+                         "itself unrequestable. Move it back to the reachable group in the ledger "
+                         "case, docs/FEATURES.md and docs/USAGE.md");
+  }
+}
+
+// THE PUBLIC SURFACE MUST NOT RE-MERGE WHAT THE LEDGER SPLIT. `docs/FEATURES.md`
+// is where the reachable/marker distinction reaches a user, and it carried ONE
+// "Declared, not requestable" row listing all five arms — including the two a
+// caller CAN trip. That is the same conflation the ledger above stopped making,
+// reintroduced one surface out. Gated here rather than left to review because a
+// doc row and an enum drift silently.
+//
+// Deliberately narrow: it asserts only that no row calling something
+// unrequestable names a REACHABLE arm. It does not police the wording of the doc.
+TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable") {
+  std::ifstream in(VLLM_CPP_FEATURES_DOC_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << VLLM_CPP_FEATURES_DOC_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string doc = buf.str();
+  REQUIRE(doc.size() > 1000);
+
+  // The ONE arm with a product call site: `ltx2_upsampler.cpp:465` constructs the
+  // SPATIOTEMPORAL upsampler condition, and `ltx2_video.cpp` reaches it through
+  // `Ltx2UpsampleVideoLatent`. Named by the word the doc uses for it, since that
+  // is what a reader sees.
+  //
+  // `betascheduler` WAS IN THIS LIST and had to come out. It is a marker, not a
+  // reachable refusal — `Ltx2Schedule`, the only function holding its call site,
+  // has no product caller — so the doc's markers row now names it, and a check
+  // that no "not requestable" row may name it would fire on the correct sentence.
+  // Kept as a comment rather than deleted because the wrong classification is what
+  // this repair fixes; see the ledger case above and §1.6 of the row spec.
+  //
+  // `spatiotemporal upsampler`, NOT a bare `upsampler`, and that is the whole
+  // repair. `2e9d95e74` ported the TEMPORAL-ONLY x2 upsampler on this same issue
+  // and renamed the enumerator, so there are now two upsampler arms in this
+  // model: one refused, one shipped-but-undriven. A bare `upsampler` matches both
+  // and therefore cannot tell a refusal from a shipped feature — it fires on a
+  // correct sentence about the ported arm and stays silent on the distinction it
+  // exists to police. Matched case-insensitively because the doc capitalizes the
+  // word for emphasis in one row and not the other.
+  const std::vector<std::string> reachable_words = {"spatiotemporal upsampler"};
+
+  auto lowered = [](const std::string& text) {
+    std::string out = text;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+  };
+
+  size_t rows_examined = 0;
+  size_t reachable_rows = 0;
+  size_t line_no = 0;
+  size_t at = 0;
+  while (at <= doc.size()) {
+    const size_t end = doc.find('\n', at);
+    const std::string line = doc.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    ++line_no;
+    const std::string lower = lowered(line);
+    // A table row that makes the not-requestable claim, in either casing the doc
+    // uses for it.
+    const bool is_row = !line.empty() && line[0] == '|';
+    const bool claims_unrequestable = lower.find("not requestable") != std::string::npos;
+    const bool is_ltx = line.find("LTX-2.5") != std::string::npos;
+    if (is_row && claims_unrequestable && is_ltx) {
+      ++rows_examined;
+      for (const std::string& word : reachable_words) {
+        INFO("FEATURES.md:" << line_no << " = " << line);
+        CHECK_MESSAGE(lower.find(word) == std::string::npos,
+                      "a row claiming 'not requestable' names the REACHABLE arm '"
+                          << word
+                          << "'; split the reachable refusals out, per "
+                             ".agents/specs/ltx25-retire-dead-arms.md §1.6");
+      }
+    }
+    // AND THE REACHABLE ROW ITSELF, because the defect this repair closes was
+    // produced by a MERGE rather than by an author: `2e9d95e74` landed the
+    // temporal-only arm while this row's doc edit still called that arm refused,
+    // and both files auto-merged clean, so nothing said a word. Publishing a
+    // refusal for a shipped feature is #604 in the most user-facing surface there
+    // is, which is why the doc must name the arm that is ACTUALLY refused.
+    if (is_row && is_ltx && lower.find("refused by name at the call site") != std::string::npos) {
+      ++reachable_rows;
+      INFO("FEATURES.md:" << line_no << " = " << line);
+      CHECK_MESSAGE(lower.find("spatiotemporal") != std::string::npos,
+                    "the LTX-2.5 reachable-refusal row must name the SPATIOTEMPORAL upsampler. "
+                    "The temporal-only x2 arm is PORTED (2e9d95e74); a row that calls it "
+                    "refused publishes a refusal for a shipped feature");
+    }
+    if (end == std::string::npos) break;
+    at = end + 1;
+  }
+  // ANTI-VACUOUS. Without these the case passes when a row is renamed away and
+  // proves nothing — the failure mode this whole row is about.
+  CHECK_MESSAGE(rows_examined == 1,
+                "expected exactly ONE LTX-2.5 'not requestable' row in docs/FEATURES.md, found "
+                    << rows_examined);
+  CHECK_MESSAGE(reachable_rows == 1,
+                "expected exactly ONE LTX-2.5 'refused by name at the call site' row in "
+                "docs/FEATURES.md, found "
+                    << reachable_rows);
+}
+
+// THE RETIREMENT NOTE'S OWN EVIDENCE, held to what upstream actually says.
+//
+// Retiring `kMultishot` rests on an ABSENCE claim about upstream, and the header
+// above the enum is where a porter reads it. That sentence shipped wrong: it said
+// the only `scene` hit upstream was PySceneDetect in the TRAINER. At
+// Lightricks/LTX-2 @ fd4ded7f `scene` has THREE senses, and the third —
+// prompt-writing guidance — lives in `ltx-core`, which ships at INFERENCE. So a
+// porter greps `scene`, finds "scene cuts" in a shipped prompt-enhancer prompt,
+// and concludes we missed a multi-shot path that our own header told them did not
+// exist. Third instance of #604 inside the row whose subject is retiring #604.
+//
+// The disposition did not move — it got STRONGER. Those prompts instruct the
+// enhancer NOT to describe scene cuts and to keep a "Single continuous take"
+// (gemma3_i2v:18, gemma3_t2v:24, gemma4_i2v:3), which is affirmative evidence
+// that no multi-shot generation mode exists.
+//
+// WHAT THIS CASE CAN AND CANNOT PROVE. It reads the shipped header and holds its
+// text, so the false sentence cannot come back and the true evidence cannot be
+// dropped. It CANNOT verify the upstream claim — no upstream checkout exists in
+// this tree — so the derivation, with the positive control in the same command,
+// lives in .agents/specs/ltx25-retire-dead-arms.md §1.1.
+TEST_CASE("ltx2 the kMultishot retirement note states the scene evidence correctly") {
+  std::ifstream in(LTX2_PIPELINE_HEADER_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << LTX2_PIPELINE_HEADER_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string header = buf.str();
+  REQUIRE(header.size() > 1000);
+
+  // The note is prose wrapped across comment lines, so every claim below is
+  // matched against a flattened copy: comment markers dropped, runs of whitespace
+  // collapsed to one space. Without this a reflow of the paragraph would silently
+  // turn every assertion vacuous.
+  std::string flat;
+  flat.reserve(header.size());
+  bool pending_space = false;
+  for (size_t i = 0; i < header.size(); ++i) {
+    const char c = header[i];
+    if (c == '/' && i + 1 < header.size() && header[i + 1] == '/') {
+      i += 1;
+      pending_space = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      pending_space = true;
+      continue;
+    }
+    if (pending_space && !flat.empty()) flat += ' ';
+    pending_space = false;
+    flat += c;
+  }
+
+  // ANTI-VACUOUS. Every assertion below is about ONE paragraph; if that paragraph
+  // is renamed or removed they all pass while proving nothing.
+  size_t notes = 0;
+  for (size_t at = flat.find("`kMultishot` — FABRICATED"); at != std::string::npos;
+       at = flat.find("`kMultishot` — FABRICATED", at + 1)) {
+    ++notes;
+  }
+  REQUIRE_MESSAGE(notes == 1,
+                  "expected exactly ONE `kMultishot` — FABRICATED retirement note in "
+                      << LTX2_PIPELINE_HEADER_PATH << ", found " << notes);
+
+  // The sentence that was false. It asserted an upstream absence from our own
+  // vocabulary, with no positive control, in a SHIPPED header.
+  CHECK_MESSAGE(flat.find("the only `scene` hit is PySceneDetect") == std::string::npos,
+                "the retired false claim is back: `scene` is not trainer-only upstream — "
+                "ltx-core's shipped gemma prompt files carry it, see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(flat.find("only `scene` hit") == std::string::npos);
+
+  // SCOPE THE POSITIVE CHECKS TO THE NOTE. Searching the whole flattened header
+  // for a positive phrase is what made the `ltx-core` assertion below structurally
+  // unable to fail: `ltx-core` occurs SIX times in this header — the upstream map
+  // at :8 and :28, `parse_model_version` at :452, `kLoraFusion` at :629, and twice
+  // inside the note — so a file-wide `find` survived deleting the clause it exists
+  // to hold. Proved by mutation: rewriting the note to say the guidance ships
+  // "inside the TRAINER ONLY" left the case GREEN at 8/8. It also never went red
+  // in this row's own red-first run (4 of 8 failed; this was not one of them).
+  //
+  // The paragraph runs from the retirement marker to the NEXT enumerator heading,
+  // derived rather than pinned to a line number, because a recorded anchor in this
+  // header went stale inside this very pull request.
+  const size_t note_at = flat.find("`kMultishot` — FABRICATED");
+  REQUIRE(note_at != std::string::npos);
+  const std::string heading_tail = "` — ";
+  size_t note_end = std::string::npos;
+  for (size_t at = flat.find("`k", note_at + 1); at != std::string::npos;
+       at = flat.find("`k", at + 1)) {
+    const size_t close = flat.find('`', at + 1);
+    if (close == std::string::npos) break;
+    if (flat.compare(close, heading_tail.size(), heading_tail) == 0) {
+      note_end = at;
+      break;
+    }
+  }
+  if (note_end == std::string::npos) note_end = flat.size();
+  const std::string note = flat.substr(note_at, note_end - note_at);
+  // ANTI-VACUOUS, again: an empty or truncated slice would pass a negative check
+  // and fail a positive one for the wrong reason. The note is a long paragraph.
+  REQUIRE_MESSAGE(note.size() > 400,
+                  "the `kMultishot` retirement note sliced to " << note.size()
+                                                                << " chars; the slice is wrong");
+
+  // And the evidence that replaced it, by the three things a porter needs: that
+  // the narrative sense is PROMPT GUIDANCE, that it ships in `ltx-core` rather
+  // than only the trainer, and that the guidance FORBIDS scene cuts.
+  //
+  // The middle one is asserted as the CLAIM, not as the package name. The axis it
+  // holds — the guidance ships at inference, it is not trainer-only — is exactly
+  // the axis that shipped false for two review rounds, and a bare `ltx-core` does
+  // not hold it: neither sibling below covers it either, since both survive the
+  // trainer-only mutation.
+  CHECK_MESSAGE(note.find("scene cuts") != std::string::npos,
+                "the retirement note must name the prompt guidance it now rests on");
+  CHECK_MESSAGE(note.find("ships at INFERENCE inside `ltx-core`") != std::string::npos,
+                "the note must state WHERE the third `scene` sense ships. Trainer-only is what "
+                "it wrongly said for two rounds, and `ltx-core` shipping at inference is the "
+                "whole reason the retirement holds — see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(note.find("system_prompt") != std::string::npos);
+}
+
+// THE MULTI-GPU MARKER'S NOTE, held to what upstream actually contains.
+//
+// Same shape as the case above and the same defect, found in the same review. The
+// header shipped "NOT CFG batching: zero `cfg` hits in either multigpu tree". At
+// LTX-2 @ fd4ded7f that is FIVE hits, not zero, and two of them are substantive
+// prose about CFG. The spec's grep was right and its PATH FILTER was wrong: it
+// covered `ltx-pipelines/src/.../multigpu/` and `ltx-core/src/.../multigpu/` and
+// therefore excluded `ltx-pipelines/docs/multigpu/`, where the answer is written
+// out. That is this row's own transferable lesson — a path filter is an absence
+// claim too — committed by the row a fourth time.
+//
+// The header is where a porter reads the claim, so the header is what this holds.
+// The derivation, with `git ls-files -- '*multigpu*'` as its positive control,
+// is .agents/specs/ltx25-retire-dead-arms.md §1.3.
+//
+// WHAT THIS CAN AND CANNOT PROVE, stated for the same reason as above: it gates
+// the TEXT, so the false sentence cannot return and the correction cannot be
+// dropped. It cannot verify the upstream fact — there is no upstream checkout in
+// this tree — and pretending otherwise is worse than saying so.
+namespace {
+
+// Comment markers dropped, whitespace runs collapsed. A reflow of the paragraph
+// must not turn an assertion vacuous, which is why nothing below matches raw
+// header text.
+std::string FlattenHeaderComments(const std::string& header) {
+  std::string flat;
+  flat.reserve(header.size());
+  bool pending_space = false;
+  for (size_t i = 0; i < header.size(); ++i) {
+    const char c = header[i];
+    if (c == '/' && i + 1 < header.size() && header[i + 1] == '/') {
+      i += 1;
+      pending_space = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      pending_space = true;
+      continue;
+    }
+    if (pending_space && !flat.empty()) flat += ' ';
+    pending_space = false;
+    flat += c;
+  }
+  return flat;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 the multi-GPU marker note states the CFG evidence correctly") {
+  std::ifstream in(LTX2_PIPELINE_HEADER_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << LTX2_PIPELINE_HEADER_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string header = buf.str();
+  REQUIRE(header.size() > 1000);
+  const std::string flat = FlattenHeaderComments(header);
+
+  // ANTI-VACUOUS: every assertion below is about the ONE enumerator comment. If
+  // it is renamed or deleted they all pass while proving nothing.
+  size_t notes = 0;
+  for (size_t at = flat.find("kMultiGpuParallelism,"); at != std::string::npos;
+       at = flat.find("kMultiGpuParallelism,", at + 1)) {
+    ++notes;
+  }
+  REQUIRE_MESSAGE(notes == 1, "expected exactly ONE `kMultiGpuParallelism` enumerator in "
+                                  << LTX2_PIPELINE_HEADER_PATH << ", found " << notes);
+
+  // The sentence that was false, in the two spellings it could come back as. An
+  // absence asserted from our own vocabulary, with no positive control, in a
+  // SHIPPED header — #604, in the row that exists to retire #604.
+  CHECK_MESSAGE(flat.find("zero `cfg` hits") == std::string::npos,
+                "the retired false claim is back: `cfg` is 5 hits across the multigpu trees at "
+                "LTX-2 @ fd4ded7f, two of them substantive prose in docs/multigpu/gemma.md. See "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.3");
+  CHECK(flat.find("zero cfg hits") == std::string::npos);
+
+  // SCOPE THE POSITIVE CHECKS TO THE NOTE. A file-wide `find` for a word like
+  // `four` is structurally unable to fail here: `kInt8ConvRot`'s own comment
+  // already says "the four inference kinds upstream defines". The note runs from
+  // its enumerator to the end of the enum, derived rather than pinned to a line
+  // number, because a recorded anchor in this header went stale mid-review.
+  const size_t note_at = flat.find("kMultiGpuParallelism,");
+  REQUIRE(note_at != std::string::npos);
+  size_t note_end = flat.find("};", note_at);
+  if (note_end == std::string::npos) note_end = flat.size();
+  const std::string note = flat.substr(note_at, note_end - note_at);
+  // ANTI-VACUOUS, again: a truncated slice passes every negative check and fails
+  // every positive one for the wrong reason.
+  REQUIRE_MESSAGE(note.size() > 200, "the kMultiGpuParallelism note sliced to "
+                                         << note.size() << " chars; the slice is wrong");
+
+  // And the evidence that replaced it: the corrected count, the form the path
+  // filter hid, and the upstream line that gives the REASON rather than an
+  // absence of a string.
+  CHECK_MESSAGE(note.find("four") != std::string::npos,
+                "the marker must state the corrected COUNT; three was an undercount produced by "
+                "a path filter, and the count is the part that was wrong");
+  CHECK_MESSAGE(note.find("BatchParallelGemmaBuilder") != std::string::npos,
+                "the marker must name the FOURTH multigpu form, which sits in the very directory "
+                "the message cites (multigpu/bp_gemma_builder.py:42)");
+  CHECK_MESSAGE(note.find("gemma.md") != std::string::npos,
+                "the marker must cite the upstream line stating the distilled pipeline runs "
+                "without CFG, which is why CFG batching is inapplicable here");
 }
 
 // ===========================================================================

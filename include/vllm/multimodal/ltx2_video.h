@@ -9,10 +9,13 @@
 // Phases L2-L6 shipped a DiT forward, a text feature extractor, two VAEs, a
 // vocoder, an upsampler, a duration head, and a pipeline COMPONENT library —
 // schedules, noisers, steppers, guiders, patchifiers, recipes. Nothing drove
-// them: `Ltx2RefuseUnportedPipelineFeature(kVideoEngineWiring)` refused the
+// them: an `Ltx2UnportedPipelineFeature::kVideoEngineWiring` refusal named the
 // composition BY NAME and named this phase as its owner. This TU is that
 // composition and nothing else. It adds no numerics; every line either resolves
-// a parameter, moves a buffer, or calls a brick that already has a golden.
+// a parameter, moves a buffer, or calls a brick that already has a golden. (That
+// enumerator was RETIRED in row LTX25-RETIRE-DEAD-ARMS once L7 landed in
+// `cefacd2d0` — a refusal whose subject shipped is a false statement, not a
+// record of debt. It is named here in the past tense on purpose.)
 //
 // ─── WHAT IT IS A PORT OF (file:line on BOTH sides) ──────────────────────────
 // Upstream: Lightricks/LTX-2 @ fd4ded7, packages/ltx-pipelines/src/ltx_pipelines/

@@ -179,6 +179,9 @@ int main(int argc, char** argv) {
     else if (f == "--model-version") SetExtra("model_version", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--pipeline-kind") SetExtra("pipeline_kind", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--upsampler") SetExtra("upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    // Kept although the library REFUSES this extra by name (#611): the duration
+    // head is unported, and forwarding the flag gets the caller that named
+    // refusal instead of "unknown option", which says nothing about why.
     else if (f == "--duration-head")
       SetExtra("duration_head_path", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--max-phase") SetExtra("max_phase", Need(argc, argv, ++i, f.c_str()));

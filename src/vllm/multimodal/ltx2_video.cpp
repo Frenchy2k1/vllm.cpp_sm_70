@@ -257,15 +257,36 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
   }
 }
 
+// The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
+// ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
+// constructs one, so a supplied path names a file the engine never opens.
+constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
+
 // Every extra key this family DEFINES. An extra outside this set is refused
 // rather than ignored, for the same reason H3 refuses one
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
+//
+// DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
+// these ten reach a reader, and `duration_head_path` reached none, so supplying a
+// duration head substituted the recipe default in silence — the failure mode this
+// very list exists to prevent, one level in. It stays in the list because the
+// family DOES define the key and DOES know what it means; `CheckUnservedExtras`
+// refuses it by name instead, which is a different and truer message than
+// "unknown load extra". The full audit is in
+// .agents/specs/ltx25-retire-dead-arms.md §2.1.
+//
+// The first hand-written set of these anchors named nine lines that were readers
+// of NOTHING, in this very file, and a later merge moved the real ones again. So
+// they are no longer trusted: the list below is derived from this file on every
+// run and compared, and the failure prints the replacement to paste in.
+// READER ANCHORS (derived and gated by test_ltx2_video):
+// 660 715 811 827 829 899 924 1029 1070
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
-    "upsampler_path",            "duration_head_path",
+    "upsampler_path",            kLtx2DurationHeadPathExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -301,6 +322,27 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
       for (const char* name : kKnownLoadExtras) listing += std::string(listing.empty() ? "" : ", ") + name;
       Fail("unknown load extra '" + kv.first + "'. This family defines: " + listing);
     }
+  }
+}
+
+// A key this family DEFINES but does not SERVE, refused BY NAME when supplied
+// (#611). The alternative — accepting it — is the worst of the three options:
+// worse than refusing, and worse than not defining the key, because the caller
+// pointed at a specific file and got the recipe default with no diagnostic.
+//
+// Deliberately NOT the "unknown load extra" path above. That message says the
+// family does not define the key, which is false here and would send the reader
+// looking for a typo instead of for the unported head.
+void CheckUnservedExtras(const std::map<std::string, std::string>& extras) {
+  const std::string duration_head = VideoExtra(extras, kLtx2DurationHeadPathExtra);
+  if (!duration_head.empty()) {
+    Fail("the '" + std::string(kLtx2DurationHeadPathExtra) + "' extra names '" + duration_head +
+         "', but the duration head is NOT WIRED into this engine: `Ltx2DurationPredict` is ported "
+         "and gated as a brick (ltx2_duration_head.h, upstream duration_head.py:89-118) and "
+         "nothing here constructs one, so that file would never be opened and an AUTO duration "
+         "would fall back to the recipe default. Give 'num_frames', or 'duration' (exact "
+         "arithmetic against the recipe frame rate), instead. Refused rather than ignored; "
+         "recorded as owed in .agents/specs/ltx25-retire-dead-arms.md (#611).");
   }
 }
 
@@ -533,6 +575,7 @@ Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
   CheckKnownExtras(params.extras);
+  CheckUnservedExtras(params.extras);
 
   auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
@@ -1338,12 +1381,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // needs an encoded prompt this engine cannot produce", and since `has_encoder`
     // above the engine produces exactly that. What is missing now is the head
     // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
-    // here constructs one, and `duration_head_path` is accepted in
-    // `kKnownLoadExtras` while NO code reads it (grep: it appears at that one
-    // site). So the extra is inert rather than wired, and that is recorded as owed
-    // rather than left to be discovered by someone who supplies it and gets the
-    // recipe default. An explicit duration is exact arithmetic, so it is served;
-    // the AUTO path is what is missing, and `num_frames` is how to avoid it.
+    // here constructs one. `duration_head_path` used to be ACCEPTED while no code
+    // read it, so a caller who supplied a head silently landed on this line
+    // instead; `CheckUnservedExtras` now refuses that key by name at load (#611,
+    // .agents/specs/ltx25-retire-dead-arms.md §2). What remains owed is the head
+    // itself. An explicit duration is exact arithmetic, so it is served; the AUTO
+    // path is what is missing, and `num_frames` is how to avoid it.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
   }
   if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
@@ -1438,7 +1481,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // the difference between "you gave me the wrong checkpoint" and "something
       // is 3 frames short". Ported and gated, not driven — see
       // .agents/specs/ltx25-temporal-upsampler.md section 7.
-      if (im.upsampler_cfg.temporal_upsample) {
+      //
+      // `&& !spatial_upsample` IS LOAD-BEARING. This guard used to test
+      // `temporal_upsample` alone, which every BOTH-flags config also satisfies,
+      // so it fired by implication over the same variable and told the caller who
+      // supplied a genuine SPATIOTEMPORAL checkpoint that they had handed over the
+      // temporal one — wrong on both counts, and pointing them at the arm they
+      // already had. It also shadowed the ledger refusal at
+      // `ltx2_upsampler.cpp:465`, which names the spatiotemporal arm and was
+      // therefore unreachable from any request. Narrowed here so a both-flags
+      // config falls THROUGH to that refusal. Gated by test_ltx2_video's
+      // "a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL".
+      if (im.upsampler_cfg.temporal_upsample && !im.upsampler_cfg.spatial_upsample) {
         Fail("phase '" + phase.name +
              "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
              "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "
