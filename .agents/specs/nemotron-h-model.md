@@ -2024,11 +2024,17 @@ forward is still the HOST reference and nothing runs on the paged runner (W6).
 
 ## Owed
 
-- [#847](https://github.com/mudler/vllm.cpp/issues/847) — the registry
-  type-confusion class this row's §6d fix names but does not sweep: 34
-  `prepare`/`forward` entry points across 32 model TUs still open a type-erased
-  `LoadedModel&` with an unchecked `static_cast`. Owed here, by the row that
-  found it, until a row claims the sweep. It is NOT NemotronH work — the sweep's
-  blocking question is what architecture name a shared forward refuses under when
-  one TU registers three architectures — and this entry exists so the class has a
-  named owner rather than sitting unowned.
+- [#847](https://github.com/mudler/vllm.cpp/issues/847) — **SWEPT, no longer
+  owed here.** Row `FIX-REGISTRY-DOWNCAST-SWEEP` claimed the registry
+  type-confusion class this row's §6d fix named but did not sweep, and closed it:
+  all 34 remaining `prepare`/`forward` entry points now open their handle through
+  `ModelAs`, and the class residue is zero. Spec
+  [`registry-downcast-sweep.md`](registry-downcast-sweep.md), which also answers
+  the blocking question (a shared forward refuses under the FAMILY PRIMARY — the
+  architecture whose `load_weights` produces the type it opens) and corrects this
+  entry's arithmetic: 30 model TUs, not 32, and the affected registries carry two
+  architectures each, not three.
+
+  The entry stays rather than being deleted because #847's row in the
+  append-only `.agents/issue-index.md` names no owning row, so a spec must keep
+  claiming it; GitHub holds the closed state. Do not read it as open work.
