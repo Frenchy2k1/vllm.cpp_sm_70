@@ -2241,6 +2241,95 @@ bool Sm70FaValidate(cudaStream_t s, float* out, const Tensor& query,
   cudaFree(tmp);
   return ok;
 }
+
+#ifdef VLLM_CPP_HAS_SM70_FA2
+template <typename TQ, typename TKV, typename Tout>
+void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                        const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                        const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t hq,
+                        int64_t d, int64_t num_reqs, int64_t num_kv_heads, int64_t block_size);
+
+// sm70 fp16 WMMA prefill entry (cuda_sm70_flash_attn.cu), declared here so the
+// adoption helper below can reference a non-dependent name at definition.
+extern "C" void vt_sm70_fa2_prefill(
+    float* out, const void* query, const void* k, const void* v,
+    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_start,
+    int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d, int64_t block_size,
+    int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale, cudaStream_t stream);
+
+// sm70 fp16 WMMA prefill adoption (brick G -> the paged prefill op arm). Runs
+// the fast path when the exact profile holds (sm_70, fp16 q/kv, float out,
+// head_dim 64/128, causal, no softcap, no window). First call while enabled
+// live-parities against the op's OWN prefill (LaunchPrefillFlash<half>) on
+// these tensors and permanently falls back on any mismatch.
+// VT_SM70_FA2_PREFILL=0 forces the fallback (A/B). Returns true when it
+// launched (caller must break), false to fall through to the reference.
+template <typename TQ, typename TKV>
+bool Sm70PrefillTakeover(cudaStream_t c, Tensor& out, const Tensor& query,
+                         const Tensor& k_cache, const Tensor& v_cache,
+                         const Tensor& block_table, const Tensor& seq_lens,
+                         const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                         int64_t hq, int64_t d, int64_t num_reqs, int64_t nkv,
+                         int64_t block_size) {
+  const char* e = std::getenv("VT_SM70_FA2_PREFILL");
+  if (e && e[0] == '0') return false;
+  if constexpr (!(std::is_same_v<TQ, __half> && std::is_same_v<TKV, __half>)) return false;
+  if ((d != 64 && d != 128) || nkv <= 0 || block_size <= 0) return false;
+  if (args.logits_soft_cap != 0.f || !args.causal) return false;
+  if (args.window_size.has_value()) return false;
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return false;
+
+  static std::atomic<int> g_ok(-1);
+  if (g_ok.load(std::memory_order_relaxed) == -1) {
+    bool ok = false;
+    void* tmp = nullptr;
+    const size_t bytes = out.Bytes();
+    if (bytes && cudaMalloc(&tmp, bytes) == cudaSuccess) {
+      const Device dev{DeviceType::kCUDA, 0};
+      Tensor scratch = Tensor::Contiguous(tmp, DType::kF32, dev,
+          {out.shape[0], out.shape[1], out.shape[2]});
+      LaunchPrefillFlash<TQ, TKV, float>(c, scratch, query, k_cache, v_cache, block_table,
+                                         seq_lens, query_start_loc, args, hq, d, num_reqs, nkv,
+                                         block_size);
+      vt_sm70_fa2_prefill(out.Ptr<float>(), query.Ptr<__half>(), k_cache.Ptr<__half>(),
+                          v_cache.Ptr<__half>(), block_table.Ptr<int32_t>(),
+                          seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
+                          num_reqs, hq, nkv, d, block_size,
+                          block_table.stride[0], block_table.stride[1],
+                          k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
+                          v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+                          args.scale, c);
+      if (cudaDeviceSynchronize() == cudaSuccess) {
+        const size_t n = out.Numel();
+        std::vector<float> a(n), b(n);
+        cudaMemcpy(a.data(), out.Ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(b.data(), tmp, n * sizeof(float), cudaMemcpyDeviceToHost);
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+          const double denom = b[i] > 1.0 ? b[i] : 1.0;
+          worst = std::max(worst, std::fabs((double)a[i] - (double)b[i]) / denom);
+        }
+        ok = (worst <= 3e-2);
+      }
+      cudaFree(tmp);
+    }
+    g_ok.store(ok ? 1 : 0, std::memory_order_relaxed);
+  }
+  if (g_ok.load(std::memory_order_relaxed) != 1) return false;
+  vt_sm70_fa2_prefill(out.Ptr<float>(), query.Ptr<__half>(), k_cache.Ptr<__half>(),
+                      v_cache.Ptr<__half>(), block_table.Ptr<int32_t>(),
+                      seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
+                      num_reqs, hq, nkv, d, block_size,
+                      block_table.stride[0], block_table.stride[1],
+                      k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
+                      v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+                      args.scale, c);
+  Check(cudaGetLastError(), "paged_attention prefill (sm70 fa2)");
+  return true;
+}
+#endif  // VLLM_CPP_HAS_SM70_FA2
 #endif  // VLLM_CPP_HAS_SM70_FA2
 
 template <typename TQ, typename TKV, typename Tout>
@@ -2453,8 +2542,8 @@ setenv("VT_SM70_FA2_DECODE", "0", 1);
 // sm_70. Mirrors the decode op-parity driver.
 extern "C" void vt_sm70_fa2_prefill(
     float* out, const void* query, const void* k, const void* v,
-    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_lens,
-    const int32_t* q_start, int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d,
+    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_start,
+    int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d,
     int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
     int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale,
     cudaStream_t stream);
@@ -2484,19 +2573,18 @@ extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose) {
     k16[i] = f2h(0.37f * (float)((i * 13 + 7) % 19) + 0.11f);
     v16[i] = f2h(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f);
   }
-  std::vector<int32_t> bt((size_t)nr * mxb), sl_(sl, sl + 2), ql_(ql, ql + 2), qs_(qs, qs + 3);
+  std::vector<int32_t> bt((size_t)nr * mxb), sl_(sl, sl + 2), qs_(qs, qs + 3);
   for (int64_t r = 0; r < nr; ++r)
     for (int64_t b = 0; b < mxb; ++b) bt[(size_t)r * mxb + b] = (int32_t)(r * mxb + b);
 
   __half *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
-  int32_t *d_bt = nullptr, *d_sl = nullptr, *d_ql = nullptr, *d_qs = nullptr;
+  int32_t *d_bt = nullptr, *d_sl = nullptr, *d_qs = nullptr;
   float *d_mine = nullptr, *d_ref = nullptr;
   cudaMalloc((void**)&d_q, q16.size() * sizeof(__half));
   cudaMalloc((void**)&d_k, kv * sizeof(__half));
   cudaMalloc((void**)&d_v, kv * sizeof(__half));
   cudaMalloc((void**)&d_bt, bt.size() * sizeof(int32_t));
   cudaMalloc((void**)&d_sl, sl_.size() * sizeof(int32_t));
-  cudaMalloc((void**)&d_ql, ql_.size() * sizeof(int32_t));
   cudaMalloc((void**)&d_qs, qs_.size() * sizeof(int32_t));
   if (cudaMalloc((void**)&d_mine, qn * hq * d * sizeof(float)) != cudaSuccess) return 1;
   if (cudaMalloc((void**)&d_ref, qn * hq * d * sizeof(float)) != cudaSuccess) return 1;
@@ -2505,7 +2593,6 @@ extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose) {
   cudaMemcpy(d_v, v16.data(), kv * sizeof(__half), cudaMemcpyHostToDevice);
   cudaMemcpy(d_bt, bt.data(), bt.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
   cudaMemcpy(d_sl, sl_.data(), sl_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_ql, ql_.data(), ql_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
   cudaMemcpy(d_qs, qs_.data(), qs_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
 
   Tensor tq = Tensor::Contiguous(d_q, DType::kF16, dev, {(int64_t)qn, hq, d});
@@ -2524,7 +2611,7 @@ extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose) {
   LaunchPrefillFlash<__half, __half, float>(st, tr, tq, tk, tv, tbt, tsl, tqs,
                                             args, hq, d, nr, nkv, bs);
   // mine (fp16 sm70 WMMA prefill)
-  vt_sm70_fa2_prefill(d_mine, d_q, d_k, d_v, d_bt, d_sl, d_ql, d_qs,
+  vt_sm70_fa2_prefill(d_mine, d_q, d_k, d_v, d_bt, d_sl, d_qs,
                       nr, hq, nkv, d, bs, mxb, /*bt_col=*/1,
                       kc_blk, kc_pg, kc_hd, kc_blk, kc_pg, kc_hd, 0.125f, st);
   cudaDeviceSynchronize();
@@ -2538,7 +2625,7 @@ extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose) {
   }
   if (verbose) fprintf(stdout, "  prefill op-parity: worst reldev %.3e\n", worst);
   cudaFree((void*)d_q); cudaFree((void*)d_k); cudaFree((void*)d_v); cudaFree((void*)d_bt);
-  cudaFree((void*)d_sl); cudaFree((void*)d_ql); cudaFree((void*)d_qs);
+  cudaFree((void*)d_sl); cudaFree((void*)d_qs);
   cudaFree((void*)d_mine); cudaFree((void*)d_ref);
   return (worst <= (double)tol_rel) ? 0 : 1;
 }
@@ -3201,6 +3288,9 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   (void)fa2_decode;
   (void)fa2_decode_qwen3;
 #endif
+
+
+
   switch (out.dtype) {
     case DType::kF32:
       if (flash2vec) {
@@ -3221,6 +3311,13 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
                                           query_start_loc, args, hq, d, num_reqs, num_kv_heads,
                                           block_size);
       } else if (prefill) {
+#ifdef VLLM_CPP_HAS_SM70_FA2
+        if (Sm70PrefillTakeover<TQ, TKV>(s, out, query, k_cache, v_cache, block_table,
+                                        seq_lens, query_start_loc, args, hq, d, num_reqs,
+                                        num_kv_heads, block_size)) {
+          break;
+        }
+#endif
         LaunchPrefillFlash<TQ, TKV, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
                                            query_start_loc, args, hq, d, num_reqs, num_kv_heads,
                                            block_size);
