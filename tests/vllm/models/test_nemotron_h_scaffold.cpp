@@ -739,6 +739,79 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
   }
 }
 
+// A FOREIGN `LoadedModel` handed to the NemotronH forward entry point. It is a
+// complete, well-formed object of a type that simply is not
+// `NemotronHLoadedModel` — the shape a caller produces by pairing one
+// architecture's `ModelRegistration` with another architecture's model, which
+// is exactly what `ModelRegistry::Forward` cannot check for its callers.
+//
+// NOT a revival of the stub #784 removed, and it must not be "repaired" back
+// into a real NemotronH model. That stub existed because the subcase above had
+// no other way to reach the refusal; it was wrong because the forward
+// DEREFERENCED it. This one exists to prove the opposite guarantee: that the
+// entry point now establishes the dynamic type BEFORE any member call and
+// refuses a mismatch by name. The subcase above still asserts the
+// unmaterialized-weights refusal on the real production type; this one asserts
+// what happens to a type that never was one.
+namespace {
+class ForeignLoadedModel final : public vllm::LoadedModel {
+ public:
+  explicit ForeignLoadedModel(const vllm::ModelRegistration& registration)
+      : vllm::LoadedModel(registration) {}
+};
+}  // namespace
+
+TEST_CASE(
+    "NemotronH: the forward entry point REFUSES a foreign LoadedModel by name") {
+  TempConfig cfg(FixtureConfigDoc());
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+
+  // `ForwardNemotronHForCausalLM` opens its handle by downcasting the
+  // type-erased `LoadedModel&` it is handed. An unconditional `static_cast`
+  // down that hierarchy is a PROMISE the compiler is entitled to act on, so on
+  // any object that is not really a `NemotronHLoadedModel` every member call
+  // through the resulting reference is undefined behaviour — UBSan's vptr check
+  // reports "member call on address ... which does not point to an object of
+  // type 'NemotronHLoadedModel'" and `-fno-sanitize-recover=all` aborts the
+  // process (issue #775). The type confusion is invisible without a sanitizer
+  // because it happens on the way to a refusal that throws anyway, and it stays
+  // invisible after the weight loader lands unless the CAST is what gets fixed.
+  ForeignLoadedModel foreign(reg);
+  const std::vector<int32_t> token_ids{0};
+  const std::vector<int32_t> positions{0};
+  const std::vector<int32_t> logits_indices{0};
+  const vllm::v1::CommonAttentionMetadata attn_meta{};
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::ModelForwardInput input{.token_ids = token_ids,
+                                      .positions = positions,
+                                      .attn_meta = attn_meta,
+                                      .gdn_meta = gdn_meta,
+                                      .attn_kv = attn_kv,
+                                      .gdn_state = gdn_state,
+                                      .config = config,
+                                      .queue = queue,
+                                      .logits_indices = logits_indices,
+                                      .num_reqs = 1};
+
+  // The refusal must NAME the architecture whose entry point refused, so a
+  // mismatch reported from one of the ~36 identical registry entry points can
+  // be told from a mismatch reported by another.
+  CHECK_THROWS_WITH_AS(reg.factory->forward(foreign, input),
+                       doctest::Contains("NemotronHForCausalLM"),
+                       std::runtime_error);
+  // ...and it must name what actually went wrong, rather than blaming the
+  // unmaterialized weights the real object would have failed on. Getting this
+  // wrong would send the next reader to the weight loader, which is not the
+  // defect.
+  CHECK_THROWS_WITH_AS(reg.factory->forward(foreign, input),
+                       doctest::Contains("was not produced by"),
+                       std::runtime_error);
+}
+
 TEST_CASE("NemotronH: the committed fixture matches the LIVE checkpoint") {
   const std::string dir = parity::Nemotron35LightningSnapshot();
   if (dir.empty()) {
