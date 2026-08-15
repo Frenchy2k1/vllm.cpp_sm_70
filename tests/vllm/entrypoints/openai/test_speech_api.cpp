@@ -133,6 +133,22 @@ TEST_CASE("speech api: the generation controls default to the FAMILY's, and expl
   CHECK_THROWS(ParseSpeechRequest(R"({"lyrics":"x","num_inference_steps":0})"));
   CHECK_THROWS(ParseSpeechRequest(R"({"lyrics":"x","audio_duration":-1})"));
   CHECK_THROWS(ParseSpeechRequest(R"({"lyrics":"x","guidance_scale":-0.5})"));
+
+  // `audio_duration_s` is the C++/C-API FIELD name, not the wire key, and a
+  // request carrying it was accepted with the key silently dropped — so the
+  // caller got the family's 60 s default instead of the duration it asked for.
+  // That is not a small error: it cost the MiniMax-Music3 e2e gate three
+  // multi-hour runs (#852), because 0.1 s became 60 s, 2 AR frames became 1500,
+  // and the run was read as a hung weight load. A duration the server will not
+  // honour is REFUSED, exactly like every other unsupported field in this file.
+  CHECK_THROWS(ParseSpeechRequest(R"({"lyrics":"x","audio_duration_s":0.1})"));
+  CHECK_THROWS(
+      ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"audio_duration_s":0.1}})"));
+  // The honoured spellings are unaffected by the guard.
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","audio_duration":0.1})").audio_duration_s ==
+        doctest::Approx(0.1));
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","duration":0.1})").audio_duration_s ==
+        doctest::Approx(0.1));
 }
 
 TEST_CASE("speech api: every unsupported field is REFUSED, never ignored") {

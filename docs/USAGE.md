@@ -1338,6 +1338,14 @@ one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
 alias for `description`, and supplying both with different values is a 400
 rather than a silent winner.
 
+The duration key is `audio_duration`, in seconds, with `duration` accepted as an
+alias. Omit it and the family's own default applies, which is 60 s for
+MiniMax-Music3. **`audio_duration_s` is refused**: that is the name of the field
+the key fills, not a key, and accepting it would return the default duration
+behind a 200 with nothing to tell the caller its request had been dropped. That
+is not hypothetical, it cost this project's own end-to-end gate four multi-hour
+runs, because 0.1 s silently became 60 s.
+
 Refused by name rather than ignored, because honouring any of them silently
 would return audio the caller did not ask for: `voice` (no registered family
 exposes named voices), `speed` (no family implements a rate control), `stream` /

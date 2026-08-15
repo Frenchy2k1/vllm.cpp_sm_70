@@ -541,7 +541,7 @@ TEST_CASE("music3 e2e real: the whole tail reaches waveform.npy from frame_hidde
 // every stage, because every stage here is host-side scalar float on CPU (the
 // box the whole row was gated on; dgx.casa was down for all of it):
 //
-//   audio_duration_s 0.1  -> MaxArFrames = int(0.1 * 25 Hz) = 2 frames, so the
+//   audio_duration 0.1    -> MaxArFrames = int(0.1 * 25 Hz) = 2 frames, so the
 //                            AR loop runs its PRIMING step, one emitting step
 //                            and one more — the feedback path is exercised, not
 //                            just the prefill — and the depth decoder runs 3
@@ -603,11 +603,20 @@ TEST_CASE("music3 e2e real: an HTTP request generates a real 44100 Hz stereo WAV
 
   // The body a client posts. `lyrics` and `description` are the two music
   // inputs; `input` is deliberately absent, because Music3 REFUSES it.
+  //
+  // The duration key is `audio_duration`, which is what `ParseSpeechRequest`
+  // reads and what docs/USAGE.md documents. This body used to spell it
+  // `audio_duration_s` — the name of the FIELD it fills — which the parser did
+  // not read, so the request fell back to the family's 60 s default: 1500 AR
+  // frames instead of 2, eight denoise windows instead of one, and 5167 vocoder
+  // latents instead of 6. That is the 750x job three runs were killed inside
+  // and reported as a hung weight load (#852). The parser now REFUSES the
+  // misspelling instead of defaulting past it.
   const std::string body = R"({
     "model": "minimax-music3",
     "lyrics": "[verse]\nMorning light\n",
     "description": "Genre: acoustic pop. BPM: 96.",
-    "audio_duration_s": 0.1,
+    "audio_duration": 0.1,
     "num_inference_steps": 2,
     "seed": 7,
     "response_format": "wav"
