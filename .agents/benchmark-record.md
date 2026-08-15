@@ -21723,3 +21723,119 @@ OWED: re-run the pre-reimage protocol (single cold oracle invocation) on THIS
 box. If it reproduces ~0.97 here, cold JIT is confirmed as the inflator and every
 recorded ratio needs revising. If it reproduces ~0.83, the machine changed and
 the old numbers stand for the old box.
+## Q38-27B-BF16 — Qwen3.8-27B bf16 online serving vs the pinned oracle, first numbers on this checkpoint (2026-08-15, `row/MODEL-Q38-27B-GATE`, base `origin/main`, GB10 sm_121a, #915)
+
+TOKEN AXIS FIRST, because a speed number on a checkpoint that has not been
+adjudicated is not a result. `Qwen/Qwen3.8-27B` @`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`,
+bf16, 55,586,114,863 bytes over 18 shards. Greedy, 7 prompts x 16 tokens vs
+`0.23.1rc1.dev1511+g555967922` / FlashInfer `0.6.15.post1`: 4/7 prompts STRICT
+16/16, three first-divergence positions, all EXACT fp32 TIES at 0.000 mnats with
+our token at rank 3 / 2 / 2. `ALL_TIES_OR_IN_BAND` against `kNearTieMnats = 500`.
+Detail and the instrument argument in
+[`specs/qwen38-27b-bf16-gate.md`](specs/qwen38-27b-bf16-gate.md).
+
+BUILD AND RECIPE. Source `11a42dc4c46b9f6d78d9a43064a8b29880a45a46`, staged by
+`git archive` (md5 `2801ab2e49079393ea01b00381d5e6a8` verified both ends), built
+in `nvidia/cuda:13.0.1-devel-ubuntu24.04` with `--runtime nvidia`:
+
+```
+cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_SERVER=ON
+```
+
+Fast path ASSERTED from the configure log, not assumed: `CUTLASS found ...
+enabling sm120a NVFP4 cutlass GEMM`, `CUDA feature fa2: ENABLED for [121a]`,
+`fp4-mma` / `cutlass-nvfp4` / `cutlass-fp8` / `marlin-nvfp4` all ENABLED, 22
+`sm_121a` Triton AOT manifest lines, and `cuobjdump -lelf` on the shipped
+library reporting `sm_121a`. `NINJA_EXIT=0`, zero `error:` hits, zero ENOSPC.
+`vllm-server` md5 `bda95d34a7e2587c6e2195e365f77bc0`, `libvllm.so.0.0.3` md5
+`bacf61ad3090af11c8fa13e3eab955bd`, both relinked at 15:22:59Z (the script
+deletes the artifacts up front, so their existence after the build is itself
+evidence the link ran).
+
+THE DENOMINATOR IS vLLM'S PRODUCTION CONFIG. No `--enforce-eager` anywhere on
+the vLLM arm, so CUDA graphs are ON. `--language-model-only` is passed to BOTH
+arms so the denominator is not handicapped by a vision tower neither workload
+uses (#414). Timed requests are issued only by the oracle's own
+`vllm bench serve`, so the client is identical across arms. One `flock` for the
+whole series, so the two arms are never interleaved with a neighbour's job.
+
+`--mamba-ssm-cache-dtype float32` on the vLLM arm is FIDELITY, NOT A HANDICAP,
+and this was checked rather than inherited: `config.json` for this checkpoint
+declares `text_config.mamba_ssm_dtype = float32`, which is what vLLM's own
+Qwen3.5 verification hook copies into `mamba_ssm_cache_dtype`, and our C++
+boundary mirrors the same split (BF16 conv + FP32 SSM,
+[`specs/gdn-semantics.md`](specs/gdn-semantics.md)). Passing it makes resolved
+behaviour explicit instead of relying on the hook.
+
+WORKLOAD. `--dataset-name random --random-input-len 1024 --random-output-len 128
+--random-range-ratio 0 --request-rate inf --ignore-eos --temperature 0 --seed 0`,
+`num-prompts = 6 x concurrency`, concurrency 1 / 4 / 8, 3 reps per arm,
+interleaved ours/vllm so clock or thermal drift lands on both alike, page cache
+dropped before every leg. Server config identical across arms:
+`--max-num-seqs 32 --max-num-batched-tokens 8192 --max-model-len 2048
+--no-enable-prefix-caching`.
+
+RESULT, 3 paired reps, every leg retained, medians over reps. vLLM completed
+every request in all nine of its legs. We did not, and that decides the shape of
+this record:
+
+| Leg | c1 | c4 | c8 |
+|---|---|---|---|
+| ours completed | 5, 5, 5 of 6 | 24, 24, 24 of 24 | 36, 37, 36 of 48 |
+| vLLM completed | 6, 6, 6 of 6 | 24, 24, 24 of 24 | 48, 48, 48 of 48 |
+| output tok/s, ours / vLLM | 2.37 / 3.50 | 15.01 / 15.58 | 15.96 / 27.85 |
+| median TPOT ms, ours / vLLM | 220.6 / 223.6 | 239.0 / 234.3 | 261.1 / 241.4 |
+| output throughput ratio | WITHHELD | 0.963x | WITHHELD |
+| median ITL ratio | 1.013x | 1.008x | 1.021x |
+| median TTFT ratio | 0.733x | 0.881x | 1.268x |
+
+WHY TWO CELLS ARE WITHHELD RATHER THAN QUOTED. `output_throughput` is tokens
+divided by the leg's wall duration, and that duration still contains the time a
+FAILED request spent before dying. At c1 our leg reads 2.37 tok/s against vLLM's
+3.50, which is 0.677x, while median TPOT in the SAME result file reads 220.6 ms
+against 223.6 ms, which is 1.014x in our favour. One of those two numbers is
+describing dropped requests, not speed. Quoting 0.677x would have recorded a 32%
+throughput deficit that the per-token evidence beside it contradicts. Filed as
+[#931](https://github.com/mudler/vllm.cpp/issues/931), which also records that
+NO harness here asserted `failed == 0` before summarising a ratio.
+
+THE FAILURES ARE REPRODUCIBLE AND ASYMMETRIC, which is what makes them a defect
+rather than noise: 1 of 6 at c1 in all three reps, 0 of 24 at c4 in all three,
+and 12/11/12 of 48 at c8, against 0 failures in all nine vLLM legs on the identical
+workload from the identical client. Our server logged NOTHING for them: the
+captured log is 27 lines, all startup, with no error, no request line and no
+rejection, sampled live during a failing leg by a read-only sidecar. So the
+failures are silent server-side, which points at the HTTP or connection layer
+rather than an application-level rejection, and the cause is not yet named.
+
+WHAT c4 SAYS, being the one cell where both arms completed everything: we are at
+0.963x output throughput and 1.008x median ITL. Per-output-token we are at
+parity, and the throughput deficit at c4 is small. That is the only speed claim
+this row supports today.
+
+RESOURCE AXES. Cold start to first `/health` is 53 s against vLLM's 780 s
+(14.7x, medians of 3), ours reproducible to the second (53/53/53; vLLM
+786/780/771). Host memory
+after warmup is 42.5 GiB against 110.1 GiB (2.59x), and that one carries a
+caveat rather than a win: vLLM was run with `--gpu-memory-utilization 0.85`,
+which pre-reserves the KV pool on a unified-memory box, so the figure is what
+the CONFIGURED engine holds, not what the model needs.
+
+CONTENTION ACTUALLY OBSERVED. The box was shared throughout with other
+campaigns. This series queued behind an LTX-2.5 121-frame render and then an
+`oracle_run.sh goldens` job, ~44 minutes of waiting on `$HOME/gpu.lock`, and
+took the lock for the whole series so no leg was interleaved with a neighbour.
+Load average at each leg boundary was recorded before the leg ran: 2.84, 0.91,
+0.34, 1.03. A k3s-managed `local-ai-worker` pod was present and restarting
+throughout; it was NOT stopped, because no developer preference or task
+authority covers managing another service on a shared host, so it is recorded as
+observed contention rather than removed.
+
+CLOCKS. Pinned under the lock with a trap that always resets: `nvidia-smi -lgc
+2190` accepted (`gpuClkMin 2190, gpuClkMax 2190`), observed flat 2184 MHz during
+the legs with `clocks_event_reasons.active = 0x0`, one boot id
+`03717c9d-63c8-4652-a8fe-a63d012c5718`, persistence mode Disabled. 2184 MHz is
+the same clock the existing clock-controlled 27B and 35B grids were taken at, so
+those are comparable to this one.
