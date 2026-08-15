@@ -247,13 +247,30 @@ NVFP4 requant ships) and the 3-D stacked BF16
 `Qwen/Qwen3.6-35B-A3B`) ship. A checkpoint carrying BOTH spellings under its
 backbone is refused rather than half-bound.
 
-**A published bf16 MoE repo still does not load end to end.** It is bf16
-*throughout*, and the MoE arm implements only per-tensor FP8 for the
-attention/GDN tower and NVFP4 for the shared expert and `lm_head`; those arms are
-OWED, and such a checkpoint is refused at load with a message naming what is
-missing. Use an NVFP4 requant (e.g. `nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE
-path. No text-only Qwen3.5 checkpoint has been RUN here at all — see
-[STATUS.md](STATUS.md) for the owed run gates.
+**Outside the routed experts the MoE arm routes by tensor presence too.** The GDN
+tower (`linear_attn.{in_proj_qkv,in_proj_z,out_proj}`) and the attention tower
+(`self_attn.{q,k,v,o}_proj`) read BF16 or per-tensor FP8; the shared expert
+(`mlp.shared_expert.{gate,up,down}_proj`) and `lm_head` read BF16 or NVFP4. Each
+of the four is resolved ONCE per checkpoint, and a component whose own
+projections disagree — layer 0's `q_proj` BF16 beside layer 4's F8_E4M3 — is
+refused naming both sides rather than bound half from each. Different components
+MAY disagree with each other: a `modelopt_mixed` checkpoint really does ship an
+FP8 tower beside an NVFP4 MLP, and the dense arm reads exactly that.
+
+Still OWED for the MoE arm, and refused BY NAME rather than discovered as a dtype
+complaint: an NVFP4 attention or GDN tower, an FP8 shared expert, an FP8
+`lm_head`, a per-expert-but-unquantized routed layout, and a non-BF16 stacked
+expert tensor.
+
+**What is and is not proven about a published bf16 MoE repo.** Every arm is
+byte-exact on synthetic fixtures, and the real published `Qwen/Qwen3.6-35B-A3B`
+and `Qwen/Qwen3.8-2.4T-A95B` indices satisfy the load plan completely — every
+name, dtype and enforced shape the reader asks for
+(`tests/vllm/models/test_qwen3_8_text_only.cpp`). That reads NO weight byte and
+is NOT a token claim: a wrong dtype path or a missing dequant produces wrong
+logits rather than an error, so only a token-exact gate closes it. No text-only
+Qwen3.5 checkpoint has been RUN here — see [STATUS.md](STATUS.md) for the owed
+run gates.
 
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native

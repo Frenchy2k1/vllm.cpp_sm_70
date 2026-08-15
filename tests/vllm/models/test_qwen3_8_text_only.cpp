@@ -798,6 +798,191 @@ void CheckSameMoeBlock(const vllm::MoeBlockWeights& a,
   }
 }
 
+// ---------------------------------------------------------------------------
+// THE FOUR NON-ROUTED-EXPERT COMPONENTS (issue #864). #740 taught the loader the
+// published repos' routed experts; it did not make a published repo load. The
+// GDN tower, the attention tower, the shared expert and `lm_head` each still
+// hard-required a quantized dtype, and `Qwen/Qwen3.6-35B-A3B` /
+// `Qwen/Qwen3.8-2.4T-A95B` carry ZERO `weight_scale`, `input_scale` or
+// `scale_inv` tensors ANYWHERE.
+//
+// ONE generator covers all sixteen combinations, because the arms must be
+// provable INDEPENDENTLY -- a fixture that flipped all four at once could not
+// tell "the attention arm reads bf16" from "the head arm does".
+// ---------------------------------------------------------------------------
+
+// A GDN (linear_attention) layer's dimensions. `in_proj_qkv` packs two key
+// groups plus the value group, exactly as `PlanGdn` computes it, so a fixture
+// and the planner cannot drift: 2*2*4 + 2*4 = 24.
+constexpr int64_t kGdnKeyHeads = 2;
+constexpr int64_t kGdnKeyHeadDim = 4;
+constexpr int64_t kGdnValueHeads = 2;
+constexpr int64_t kGdnValueHeadDim = 4;
+constexpr int64_t kGdnQkv =
+    2 * kGdnKeyHeads * kGdnKeyHeadDim + kGdnValueHeads * kGdnValueHeadDim;
+constexpr int64_t kGdnVDim = kGdnValueHeads * kGdnValueHeadDim;
+constexpr int64_t kGdnConv = 4;
+
+// A plain torch-Linear BF16 projection: ONE `[out, in]` tensor and no scales at
+// all. This is what a published repo ships for every one of the four.
+void AppendBf16Proj(std::vector<Spec>& out, const std::string& proj,
+                    int64_t out_dim, int64_t in_dim) {
+  out.push_back({proj + ".weight", {out_dim, in_dim}});
+}
+
+// A TOWER projection: BF16, or the per-tensor FP8 triple the loader read before.
+void AppendTower(std::vector<Spec>& out, const std::string& proj,
+                 int64_t out_dim, int64_t in_dim, bool bf16) {
+  if (bf16) {
+    AppendBf16Proj(out, proj, out_dim, in_dim);
+  } else {
+    AppendFp8(out, proj, out_dim, in_dim);
+  }
+}
+
+// A SINK projection (shared expert / lm_head): BF16, or the NVFP4 triple.
+void AppendSink(std::vector<Spec>& out, const std::string& proj,
+                int64_t out_dim, int64_t in_dim, bool bf16) {
+  if (bf16) {
+    AppendBf16Proj(out, proj, out_dim, in_dim);
+  } else {
+    AppendNvfp4(out, proj, out_dim, in_dim);
+  }
+}
+
+// Which of the four components this fixture publishes as BF16, and which expert
+// spelling it carries. All-false is the NVFP4-requant shape every gated row
+// reads today; all-true (with `stacked_experts`) is a PUBLISHED bf16 repo.
+struct TowerChoice {
+  bool gdn_bf16 = false;
+  bool attn_bf16 = false;
+  bool shared_bf16 = false;
+  bool head_bf16 = false;
+  bool stacked_experts = false;
+};
+
+TowerChoice AllBf16() {
+  TowerChoice c;
+  c.gdn_bf16 = true;
+  c.attn_bf16 = true;
+  c.shared_bf16 = true;
+  c.head_bf16 = true;
+  c.stacked_experts = true;
+  return c;
+}
+
+// A ONE-layer MoE checkpoint under prefix `p`. `gdn_layer` picks the attention
+// kind, which is what decides whether the GDN or the attention tower is the one
+// this fixture exercises; the shared expert, the routed experts and the head are
+// present either way.
+std::vector<Spec> TowerMoeSpecs(const std::string& p, bool gdn_layer,
+                                const TowerChoice& choice) {
+  const std::string l = p + "layers.0.";
+  const std::string mlp = l + "mlp.";
+  std::vector<Spec> s{
+      {p + "embed_tokens.weight", {kMoeVocab, kMoeHidden}},
+      {p + "norm.weight", {kMoeHidden}},
+      {l + "input_layernorm.weight", {kMoeHidden}},
+      {l + "post_attention_layernorm.weight", {kMoeHidden}},
+  };
+  if (gdn_layer) {
+    const std::string la = l + "linear_attn.";
+    AppendTower(s, la + "in_proj_qkv", kGdnQkv, kMoeHidden, choice.gdn_bf16);
+    AppendTower(s, la + "in_proj_z", kGdnVDim, kMoeHidden, choice.gdn_bf16);
+    AppendTower(s, la + "out_proj", kMoeHidden, kGdnVDim, choice.gdn_bf16);
+    // The GDN's bf16 tail is bf16 in EVERY published and requantized
+    // checkpoint; it is not one of the four arms and never varies here.
+    s.push_back({la + "in_proj_b.weight", {kGdnValueHeads, kMoeHidden}});
+    s.push_back({la + "in_proj_a.weight", {kGdnValueHeads, kMoeHidden}});
+    s.push_back({la + "conv1d.weight", {kGdnQkv, 1, kGdnConv}});
+    s.push_back({la + "A_log", {kGdnValueHeads}});
+    s.push_back({la + "dt_bias", {kGdnValueHeads}});
+    s.push_back({la + "norm.weight", {kGdnValueHeadDim}});
+  } else {
+    const std::string sa = l + "self_attn.";
+    AppendTower(s, sa + "q_proj", kMoeQ, kMoeHidden, choice.attn_bf16);
+    AppendTower(s, sa + "k_proj", kMoeKv, kMoeHidden, choice.attn_bf16);
+    AppendTower(s, sa + "v_proj", kMoeKv, kMoeHidden, choice.attn_bf16);
+    AppendTower(s, sa + "o_proj", kMoeHidden, kMoeQ, choice.attn_bf16);
+    s.push_back({sa + "q_norm.weight", {kMoeHeadDim}});
+    s.push_back({sa + "k_norm.weight", {kMoeHeadDim}});
+  }
+  s.push_back({mlp + "gate.weight", {kMoeExperts, kMoeHidden}});
+  s.push_back({mlp + "shared_expert_gate.weight", {1, kMoeHidden}});
+  if (choice.stacked_experts) {
+    s.push_back({mlp + "experts.gate_up_proj",
+                 {kMoeExperts, 2 * kStackedInter, kMoeHidden}});
+    s.push_back(
+        {mlp + "experts.down_proj", {kMoeExperts, kMoeHidden, kStackedInter}});
+  } else {
+    for (int64_t e = 0; e < kMoeExperts; ++e) {
+      const std::string ex = mlp + "experts." + std::to_string(e) + ".";
+      AppendNvfp4(s, ex + "gate_proj", kMoeInter, kMoeHidden);
+      AppendNvfp4(s, ex + "up_proj", kMoeInter, kMoeHidden);
+      AppendNvfp4(s, ex + "down_proj", kMoeHidden, kMoeInter);
+    }
+  }
+  const std::string se = mlp + "shared_expert.";
+  AppendSink(s, se + "gate_proj", kMoeInter, kMoeHidden, choice.shared_bf16);
+  AppendSink(s, se + "up_proj", kMoeInter, kMoeHidden, choice.shared_bf16);
+  AppendSink(s, se + "down_proj", kMoeHidden, kMoeInter, choice.shared_bf16);
+  AppendSink(s, "lm_head", kMoeVocab, kMoeHidden, choice.head_bf16);
+  return s;
+}
+
+// A loaded BF16 projection, checked ELEMENT BY ELEMENT against the payload the
+// fixture declared for it.
+//
+// WHY BYTES AND NOT "IT RETURNED". Every failure mode of these four arms except
+// a missing tensor is silent: a projection read without its transpose, or read
+// through a path that skipped a dequant, loads cleanly and only shows up in
+// logits. The expectation is recomputed here from `Bf16At` and the DECLARED
+// `[out, in]` shape, so nothing the loader does can move it.
+//
+// The loader's convention for all four is Matmul-B `[in, out]`, transposed from
+// the checkpoint's `[out, in]` (`qwen3_5_weights.h:289-312,347-350,432-434,469`)
+// -- the same orientation the fp8-dequant and GGUF arms produce, which is why
+// the forward is reached unchanged.
+void CheckBf16Transposed(const vllm::OwnedTensor& t,
+                         const std::vector<Spec>& specs,
+                         const std::string& name, int64_t out_dim,
+                         int64_t in_dim, const char* what) {
+  CAPTURE(what);
+  CAPTURE(name);
+  const size_t si = SpecIndex(specs, name);
+  REQUIRE(t.rank == 2);
+  CHECK(t.shape[0] == in_dim);
+  CHECK(t.shape[1] == out_dim);
+  REQUIRE(t.bytes.size() == static_cast<size_t>(in_dim * out_dim) * 2);
+  for (int64_t r = 0; r < out_dim; ++r) {
+    for (int64_t c = 0; c < in_dim; ++c) {
+      CHECK(Bf16Of(t, c * out_dim + r) ==
+            Bf16At(si, static_cast<size_t>(r * in_dim + c)));
+    }
+  }
+}
+
+// The same one-layer MoE config, but with the layer declared `linear_attention`
+// so `LoadLayerImpl` takes the GDN branch.
+HfConfig OneLayerGdnMoeConfig() {
+  HfConfig config = OneLayerMoeConfig();
+  config.layer_types = {"linear_attention"};
+  return config;
+}
+
+// Load one synthetic MoE checkpoint through the PRODUCTION entry point. The
+// backing file is kept alive for the process: a loaded weight may BORROW the
+// safetensors mmap (`BorrowStTensorBytes`), and while the borrow carries its own
+// keep-alive, retaining the file keeps a failure readable.
+vllm::Qwen3_5MoeWeights LoadSpecs(const std::vector<Spec>& specs,
+                                  const HfConfig& config, const char* tag) {
+  static std::vector<std::unique_ptr<TempFile>> live;
+  live.push_back(std::make_unique<TempFile>(BuildSafetensors(specs), tag));
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(live.back()->path()));
+  return vllm::LoadQwen3_5Moe(shards, config);
+}
+
 void CheckSameMoeModel(const vllm::Qwen3_5MoeWeights& a,
                        const vllm::Qwen3_5MoeWeights& b) {
   REQUIRE(a.layers.size() == b.layers.size());
@@ -1187,45 +1372,27 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
     CHECK_FALSE(Mentions(message, "tensor not found"));
   };
 
-  // WHAT CHANGED IN THESE TWO SUBCASES, AND WHY THEY WERE NOT DELETED (#740).
+  // WHAT CHANGED IN THESE THREE SUBCASES, AND WHY NONE WAS DELETED.
   //
-  // They were written when the STACKED EXPERT SPELLING was itself the refusal.
-  // It is not any more — case 4d loads it — so asserting that a stacked name is
-  // refused would now assert the opposite of the implemented behavior. Deleting
-  // them instead would have quietly dropped the only CPU-visible pin on what a
-  // FULLY published bf16 index does, which is the claim most likely to be
-  // over-read from this row ("the stacked arm landed, so Qwen3.6-35B-A3B
-  // loads").
+  // #740 wrote them as refusals of the STACKED EXPERT SPELLING, then narrowed
+  // them to refusals of the bf16 `lm_head` (and, behind it, the bf16 tower)
+  // once case 4d loaded the stacked experts. #864 implements those too, so a
+  // FULLY published index now LOADS and asserting a refusal here would assert
+  // the opposite of the implemented behavior.
   //
-  // So they are RETAINED WITH THEIR SUBJECT NARROWED: a published repo is bf16
-  // THROUGHOUT, and the MoE arm still implements only NVFP4 for `lm_head` (and
-  // only per-tensor FP8 for the attention/GDN tower). The refusal therefore
-  // still fires, one layer further in, and must still NAME what is missing.
-  // Both remain out of scope in .agents/specs/moe-bf16-stacked-experts.md
-  // §Scope, and this is where that stays visible.
+  // They are RETAINED AND INVERTED IN PLACE rather than dropped, because they
+  // are the only CPU-visible pin on the claim most likely to be over-read from
+  // either row. The positive proof lives in 4i; what stays here is the
+  // statement that THIS shape — the one that used to be refused, byte for byte
+  // — is the shape that now loads, so the two rows' scope stays legible from
+  // the refusal case itself.
   SUBCASE("a FULLY published index, flat namespace — the Qwen3.8-2.4T-A95B shape") {
-    const std::string message = load(PublishedStackedMoeSpecs("model."), "stacked_flat");
-    CAPTURE(message);
-    // NOT a complaint about a stacked expert name, and NOT the raw dtype
-    // complaint #490 replaced: the head is the first unimplemented thing here.
-    CHECK_FALSE(Mentions(message, "model.layers.0.mlp.experts.gate_up_proj"));
-    CHECK(Mentions(message, "lm_head.weight_scale"));
-    CHECK(Mentions(message, "unquantized"));
-    names_the_requirement(message);
+    CHECK(load(PublishedStackedMoeSpecs("model."), "stacked_flat").empty());
   }
 
   SUBCASE("a FULLY published index, VL namespace — the Qwen3.6-35B-A3B shape") {
-    // The published 35B repo is stacked and unquantized throughout; only the
-    // NVFP4 REQUANT loads end to end. This row made its ROUTED EXPERTS
-    // readable, which is not the same claim.
-    const std::string message =
-        load(PublishedStackedMoeSpecs("model.language_model."), "stacked_vl");
-    CAPTURE(message);
-    CHECK_FALSE(Mentions(
-        message, "model.language_model.layers.0.mlp.experts.gate_up_proj"));
-    CHECK(Mentions(message, "lm_head.weight_scale"));
-    CHECK(Mentions(message, "unquantized"));
-    names_the_requirement(message);
+    CHECK(load(PublishedStackedMoeSpecs("model.language_model."), "stacked_vl")
+              .empty());
   }
 
   SUBCASE("per-expert but UNQUANTIZED experts") {
@@ -1237,15 +1404,78 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
     names_the_requirement(message);
   }
 
-  SUBCASE("NVFP4 experts but an UNQUANTIZED lm_head") {
-    // The dense arm accepts a bf16 head (`LoadLmHeadAnyDtype`,
-    // qwen3_5_dense_weights.cpp:215-233); the MoE arm hard-requires NVFP4.
-    const std::string message =
-        load(MoeSpecsWithBf16LmHead("model."), "bf16_lmhead");
+  SUBCASE("NVFP4 experts but an UNQUANTIZED lm_head — now LOADS (#864)") {
+    // The dense arm has always accepted a bf16 head (`LoadLmHeadAnyDtype`,
+    // qwen3_5_dense_weights.cpp:246-340); the MoE arm hard-required NVFP4 and
+    // refused here. #864 gave it the bf16 arm, so the same fixture loads and
+    // binds the head to the bf16 slot. Kept, inverted, for the reason above.
+    CHECK(load(MoeSpecsWithBf16LmHead("model."), "bf16_lmhead").empty());
+  }
+
+  // WHAT IS STILL OWED, refused BY NAME rather than discovered as a dtype
+  // complaint from inside a reader (#490). Every one of these already failed
+  // before #864 — naming it is the whole change — and each is a shape no
+  // published Qwen3.5-family MoE repo ships today.
+  SUBCASE("an FP8 lm_head is refused, and the message names it") {
+    std::vector<Spec> specs;
+    for (const Spec& x : TowerMoeSpecs("model.", false, AllBf16())) {
+      if (x.name.rfind("lm_head.", 0) != 0) specs.push_back(x);
+    }
+    AppendFp8(specs, "lm_head", kMoeVocab, kMoeHidden);
+    const std::string message = load(specs, "fp8_lmhead");
     CAPTURE(message);
-    CHECK(Mentions(message, "lm_head.weight_scale"));
-    CHECK(Mentions(message, "unquantized"));
-    names_the_requirement(message);
+    CHECK(Mentions(message, "qwen3_5 weights"));
+    CHECK(Mentions(message, "not implemented"));
+    CHECK(Mentions(message, "lm_head"));
+    CHECK(Mentions(message, "per-tensor FP8"));
+    CHECK(Mentions(message, "BF16 or NVFP4"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("an FP8 shared expert is refused, and the message names it") {
+    std::vector<Spec> specs;
+    const std::string se = "model.layers.0.mlp.shared_expert.";
+    for (const Spec& x : TowerMoeSpecs("model.", false, AllBf16())) {
+      if (x.name.rfind(se, 0) != 0) specs.push_back(x);
+    }
+    AppendFp8(specs, se + "gate_proj", kMoeInter, kMoeHidden);
+    AppendFp8(specs, se + "up_proj", kMoeInter, kMoeHidden);
+    AppendFp8(specs, se + "down_proj", kMoeHidden, kMoeInter);
+    const std::string message = load(specs, "fp8_shared");
+    CAPTURE(message);
+    CHECK(Mentions(message, "shared expert"));
+    CHECK(Mentions(message, "not implemented"));
+    CHECK(Mentions(message, "per-tensor FP8"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("an NVFP4 attention tower is refused, and the message names it") {
+    std::vector<Spec> specs;
+    const std::string sa = "model.layers.0.self_attn.";
+    for (const Spec& x : TowerMoeSpecs("model.", false, AllBf16())) {
+      if (x.name.rfind(sa + "q_proj", 0) == 0 ||
+          x.name.rfind(sa + "k_proj", 0) == 0 ||
+          x.name.rfind(sa + "v_proj", 0) == 0 ||
+          x.name.rfind(sa + "o_proj", 0) == 0) {
+        continue;
+      }
+      specs.push_back(x);
+    }
+    AppendNvfp4(specs, sa + "q_proj", kMoeQ, kMoeHidden);
+    AppendNvfp4(specs, sa + "k_proj", kMoeKv, kMoeHidden);
+    AppendNvfp4(specs, sa + "v_proj", kMoeKv, kMoeHidden);
+    // `o_proj`'s real in_dim is kMoeQ (8), but NVFP4 needs K % 16 == 0 to be
+    // WRITABLE at all (its block-scale axis is K/16). The refusal fires from
+    // the up-front check before any reader touches a byte, so the width here is
+    // immaterial and a legal one is used rather than a zero-column scale.
+    AppendNvfp4(specs, sa + "o_proj", kMoeHidden, kMoeHidden);
+    const std::string message = load(specs, "nvfp4_attn");
+    CAPTURE(message);
+    CHECK(Mentions(message, "attention tower"));
+    CHECK(Mentions(message, "not implemented"));
+    CHECK(Mentions(message, "NVFP4"));
+    CHECK(Mentions(message, "BF16 or per-tensor FP8"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
   }
 
   SUBCASE("the SUPPORTED per-expert NVFP4 layout is untouched by the check") {
@@ -1496,6 +1726,428 @@ TEST_CASE("qwen3_8: 3-D stacked bf16 routed experts load, with upstream's gate/u
 }
 
 // ===========================================================================
+// 4e-4i. THE FOUR ARMS THAT STILL REFUSED A PUBLISHED BF16 MoE REPO (#864).
+//
+//     #740 landed the routed experts and closed ONE arm of four. A published
+//     Qwen bf16 MoE repo still refused at load, just later: the GDN tower, the
+//     attention tower, the shared expert and `lm_head` each hard-required a
+//     QUANTIZED dtype, and `Qwen/Qwen3.6-35B-A3B` and `Qwen/Qwen3.8-2.4T-A95B`
+//     carry ZERO `weight_scale`, `input_scale` or `scale_inv` tensors anywhere.
+//
+//     EACH ARM IS PROVEN ALONE, on a fixture that is bf16 in exactly ONE
+//     component and quantized in the other three. A single all-bf16 fixture
+//     could not tell "the attention arm reads bf16" from "the head arm does",
+//     and three of the four would then be carried by the fourth's assertion.
+//     4i is the all-bf16 one, and it is a claim about the WHOLE index rather
+//     than about any single arm.
+//
+//     WHY THE ARM IS SELECTED BY PRESENCE AND NOT BY `DenseNativeEnabled()`:
+//     that lever switches fp8-RESIDENT against fp8-DEQUANT and BOTH of its
+//     branches assume an fp8 input, so it cannot express a third thing without
+//     destroying the A/B evidence recorded against it.
+// ===========================================================================
+TEST_CASE("qwen3_8: the bf16 ATTENTION tower loads through the MoE arm") {
+  for (const char* p : {"model.", "model.language_model."}) {
+    CAPTURE(p);
+    TowerChoice choice;
+    choice.attn_bf16 = true;
+    const std::vector<Spec> specs =
+        TowerMoeSpecs(p, /*gdn_layer=*/false, choice);
+    const vllm::Qwen3_5MoeWeights w =
+        LoadSpecs(specs, OneLayerMoeConfig(), "attn_bf16");
+    REQUIRE(w.layers.size() == 1u);
+    const vllm::FullAttnLayerWeights& a = w.layers[0].attn;
+    const std::string sa = std::string(p) + "layers.0.self_attn.";
+
+    // EXACTLY ONE residency per projection. A load that filled the bf16 field
+    // AND an fp8/fp4 one would be two contradictory bindings of one weight, and
+    // the forward's fp8-then-fp4-then-bf16 preference would silently pick the
+    // other one.
+    CHECK(a.q_proj_fp8.Empty());
+    CHECK(a.k_proj_fp8.Empty());
+    CHECK(a.v_proj_fp8.Empty());
+    CHECK(a.o_proj_fp8.Empty());
+    CHECK(a.q_proj_fp4.Empty());
+    CHECK(a.o_proj_fp4.Empty());
+    CheckBf16Transposed(a.q_proj, specs, sa + "q_proj.weight", kMoeQ,
+                        kMoeHidden, "q_proj");
+    CheckBf16Transposed(a.k_proj, specs, sa + "k_proj.weight", kMoeKv,
+                        kMoeHidden, "k_proj");
+    CheckBf16Transposed(a.v_proj, specs, sa + "v_proj.weight", kMoeKv,
+                        kMoeHidden, "v_proj");
+    CheckBf16Transposed(a.o_proj, specs, sa + "o_proj.weight", kMoeHidden,
+                        kMoeQ, "o_proj");
+
+    // The other three components are UNCHANGED by this arm: the fixture left
+    // them quantized and they must still resolve that way. This is what makes
+    // the four decisions independent rather than one decision with four names.
+    CHECK_FALSE(w.lm_head_fp4.Empty());
+    CHECK(w.lm_head.Empty());
+    CHECK_FALSE(w.layers[0].moe.shared_gate_proj_fp4.Empty());
+    CHECK(w.layers[0].moe.shared_gate_proj.Empty());
+  }
+}
+
+TEST_CASE("qwen3_8: the bf16 GDN tower loads through the MoE arm") {
+  for (const char* p : {"model.", "model.language_model."}) {
+    CAPTURE(p);
+    TowerChoice choice;
+    choice.gdn_bf16 = true;
+    const std::vector<Spec> specs =
+        TowerMoeSpecs(p, /*gdn_layer=*/true, choice);
+    const vllm::Qwen3_5MoeWeights w =
+        LoadSpecs(specs, OneLayerGdnMoeConfig(), "gdn_bf16");
+    REQUIRE(w.layers.size() == 1u);
+    REQUIRE(w.layers[0].is_linear_attention);
+    const vllm::GdnLayerWeights& g = w.layers[0].gdn;
+    const std::string la = std::string(p) + "layers.0.linear_attn.";
+
+    CHECK(g.in_proj_qkv_fp8.Empty());
+    CHECK(g.in_proj_z_fp8.Empty());
+    CHECK(g.out_proj_fp8.Empty());
+    CHECK(g.out_proj_fp4.Empty());
+    CheckBf16Transposed(g.in_proj_qkv, specs, la + "in_proj_qkv.weight",
+                        kGdnQkv, kMoeHidden, "in_proj_qkv");
+    CheckBf16Transposed(g.in_proj_z, specs, la + "in_proj_z.weight", kGdnVDim,
+                        kMoeHidden, "in_proj_z");
+    CheckBf16Transposed(g.out_proj, specs, la + "out_proj.weight", kMoeHidden,
+                        kGdnVDim, "out_proj");
+    // The GDN's bf16 TAIL is bf16 on every checkpoint and must be untouched by
+    // the arm: a change that routed the whole GDN block through one dtype
+    // decision would break these, which are not part of it.
+    CHECK_FALSE(g.conv1d_weight.Empty());
+    CHECK_FALSE(g.a_log.Empty());
+    CHECK_FALSE(g.dt_bias.Empty());
+    CHECK_FALSE(g.norm_weight.Empty());
+    CHECK_FALSE(g.in_proj_a.Empty());
+    CHECK_FALSE(g.in_proj_b.Empty());
+    // ...and the other three components stay quantized.
+    CHECK_FALSE(w.lm_head_fp4.Empty());
+    CHECK_FALSE(w.layers[0].moe.shared_gate_proj_fp4.Empty());
+  }
+}
+
+TEST_CASE("qwen3_8: the bf16 SHARED EXPERT loads through the MoE arm") {
+  for (const char* p : {"model.", "model.language_model."}) {
+    CAPTURE(p);
+    TowerChoice choice;
+    choice.shared_bf16 = true;
+    const std::vector<Spec> specs =
+        TowerMoeSpecs(p, /*gdn_layer=*/false, choice);
+    const vllm::Qwen3_5MoeWeights w =
+        LoadSpecs(specs, OneLayerMoeConfig(), "shared_bf16");
+    REQUIRE(w.layers.size() == 1u);
+    const vllm::MoeBlockWeights& m = w.layers[0].moe;
+    const std::string se = std::string(p) + "layers.0.mlp.shared_expert.";
+
+    CHECK(m.shared_gate_proj_fp4.Empty());
+    CHECK(m.shared_up_proj_fp4.Empty());
+    CHECK(m.shared_down_proj_fp4.Empty());
+    CheckBf16Transposed(m.shared_gate_proj, specs, se + "gate_proj.weight",
+                        kMoeInter, kMoeHidden, "shared gate_proj");
+    CheckBf16Transposed(m.shared_up_proj, specs, se + "up_proj.weight",
+                        kMoeInter, kMoeHidden, "shared up_proj");
+    CheckBf16Transposed(m.shared_down_proj, specs, se + "down_proj.weight",
+                        kMoeHidden, kMoeInter, "shared down_proj");
+    // The ROUTED experts are a different decision entirely (`MoeExpertLayout`,
+    // #740) and this fixture leaves them per-expert NVFP4.
+    REQUIRE(m.expert_gate_fp4.size() == static_cast<size_t>(kMoeExperts));
+    CHECK(m.expert_gate.empty());
+    CHECK_FALSE(w.lm_head_fp4.Empty());
+  }
+}
+
+TEST_CASE("qwen3_8: the bf16 lm_head loads through the MoE arm") {
+  for (const char* p : {"model.", "model.language_model."}) {
+    CAPTURE(p);
+    TowerChoice choice;
+    choice.head_bf16 = true;
+    const std::vector<Spec> specs =
+        TowerMoeSpecs(p, /*gdn_layer=*/false, choice);
+    const vllm::Qwen3_5MoeWeights w =
+        LoadSpecs(specs, OneLayerMoeConfig(), "head_bf16");
+    REQUIRE(w.layers.size() == 1u);
+
+    // `lm_head` is TOP-LEVEL in both spellings, so the head arm must not depend
+    // on the backbone prefix at all -- both loops here read the same name.
+    CHECK(w.lm_head_fp4.Empty());
+    CheckBf16Transposed(w.lm_head, specs, "lm_head.weight", kMoeVocab,
+                        kMoeHidden, "lm_head");
+    CHECK_FALSE(w.layers[0].moe.shared_gate_proj_fp4.Empty());
+    // The attention tower stays QUANTIZED here, on whichever arm this build
+    // takes: fp8-resident by default, dequant-to-bf16 under VT_DENSE_NATIVE=0.
+    const bool attn_bound = !w.layers[0].attn.q_proj_fp8.Empty() ||
+                            !w.layers[0].attn.q_proj.Empty();
+    CHECK(attn_bound);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4i. A FULLY PUBLISHED BF16 INDEX, END TO END. All four arms plus #740's
+//     stacked routed experts, which is what `Qwen/Qwen3.6-35B-A3B` and
+//     `Qwen/Qwen3.8-2.4T-A95B` are. Case 4c used to pin this shape as a
+//     REFUSAL; that subcase was not deleted, it was inverted in place with its
+//     reason, and this is the positive half.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: a FULLY published bf16 MoE index loads end to end") {
+  auto check_all_bf16 = [](const vllm::Qwen3_5MoeWeights& w,
+                           const std::vector<Spec>& specs,
+                           const std::string& p, bool gdn_layer) {
+    REQUIRE(w.layers.size() == 1u);
+    const vllm::Qwen3_5MoeLayerWeights& layer = w.layers[0];
+    const vllm::MoeBlockWeights& m = layer.moe;
+    // NOT ONE QUANTIZED RESIDENCY ANYWHERE. A published repo carries no scale
+    // tensor at all, so any populated fp8/fp4 slot would mean the loader
+    // fabricated one.
+    CHECK(w.lm_head_fp4.Empty());
+    CHECK(m.shared_gate_proj_fp4.Empty());
+    CHECK(m.shared_up_proj_fp4.Empty());
+    CHECK(m.shared_down_proj_fp4.Empty());
+    CHECK(m.expert_gate_fp4.empty());
+    CHECK(m.expert_up_fp4.empty());
+    CHECK(m.expert_down_fp4.empty());
+    if (gdn_layer) {
+      CHECK(layer.gdn.in_proj_qkv_fp8.Empty());
+      CHECK(layer.gdn.in_proj_z_fp8.Empty());
+      CHECK(layer.gdn.out_proj_fp8.Empty());
+      CHECK(layer.gdn.out_proj_fp4.Empty());
+      CHECK_FALSE(layer.gdn.in_proj_qkv.Empty());
+      CHECK_FALSE(layer.gdn.in_proj_z.Empty());
+      CHECK_FALSE(layer.gdn.out_proj.Empty());
+    } else {
+      CHECK(layer.attn.q_proj_fp8.Empty());
+      CHECK(layer.attn.o_proj_fp8.Empty());
+      CHECK(layer.attn.q_proj_fp4.Empty());
+      CHECK_FALSE(layer.attn.q_proj.Empty());
+      CHECK_FALSE(layer.attn.o_proj.Empty());
+    }
+    // The head and the shared expert carry VALUES, not merely non-emptiness.
+    CheckBf16Transposed(w.lm_head, specs, "lm_head.weight", kMoeVocab,
+                        kMoeHidden, "lm_head");
+    const std::string se = p + "layers.0.mlp.shared_expert.";
+    CheckBf16Transposed(m.shared_down_proj, specs, se + "down_proj.weight",
+                        kMoeHidden, kMoeInter, "shared down_proj");
+    // ...and #740's stacked routed experts are still read byte-exact, with
+    // upstream's gate/up split, on a checkpoint whose TOWER is now bf16 too.
+    CheckStackedExperts(m, specs, p, /*transposed=*/false);
+  };
+
+  SUBCASE("full-attention layer, both namespaces") {
+    for (const char* p : {"model.", "model.language_model."}) {
+      CAPTURE(p);
+      const std::vector<Spec> specs =
+          TowerMoeSpecs(p, /*gdn_layer=*/false, AllBf16());
+      check_all_bf16(LoadSpecs(specs, OneLayerMoeConfig(), "published_attn"),
+                     specs, p, /*gdn_layer=*/false);
+    }
+  }
+
+  SUBCASE("linear-attention (GDN) layer, both namespaces") {
+    for (const char* p : {"model.", "model.language_model."}) {
+      CAPTURE(p);
+      const std::vector<Spec> specs =
+          TowerMoeSpecs(p, /*gdn_layer=*/true, AllBf16());
+      check_all_bf16(LoadSpecs(specs, OneLayerGdnMoeConfig(), "published_gdn"),
+                     specs, p, /*gdn_layer=*/true);
+    }
+  }
+
+  SUBCASE("DEFERRED routed experts — the streaming closure still runs") {
+    // The tower decision is resolved once and threaded; the routed-expert
+    // closure captures ITS decision by value and runs long after the resolving
+    // frame is gone. Nothing about a bf16 tower may disturb that.
+    const std::string p = "model.";
+    const std::vector<Spec> specs =
+        TowerMoeSpecs(p, /*gdn_layer=*/false, AllBf16());
+    const TempFile file(BuildSafetensors(specs), "published_deferred");
+    auto owner = std::make_shared<std::vector<vllm::SafetensorsFile>>();
+    owner->push_back(vllm::SafetensorsFile::Open(file.path()));
+    vllm::Qwen3_5MoeWeights w =
+        vllm::LoadQwen3_5Moe(*owner, OneLayerMoeConfig(), owner);
+    REQUIRE(static_cast<bool>(w.load_layer_experts));
+    REQUIRE(w.layers.size() == 1u);
+    CHECK(w.layers[0].moe.expert_gate.empty());
+    vllm::Qwen3_5MoeWeights moved = std::move(w);
+    moved.load_layer_experts(0, moved.layers[0].moe);
+    check_all_bf16(moved, specs, p, /*gdn_layer=*/false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4j. A COMPONENT THAT DISAGREES WITH ITSELF IS REFUSED, NAMING BOTH SIDES.
+//
+//     The four decisions are INDEPENDENT of each other on purpose -- a
+//     checkpoint that is FP8 in the attention tower and NVFP4 in the MLP is
+//     ordinary upstream (`nvidia/Qwen3.6-27B-NVFP4` is `modelopt_mixed`), and
+//     the dense arm reads exactly that by asking per projection. What is NOT
+//     ordinary, and what would load cleanly and produce wrong logits, is ONE
+//     component bound half from each dtype. That is resolved once and refused.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: a component that disagrees with itself is REFUSED") {
+  auto load_message = [](const std::vector<Spec>& specs, const HfConfig& config,
+                         const char* tag) {
+    return CaptureThrow([&specs, &config, tag] {
+      const TempFile file(BuildSafetensors(specs), tag);
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      (void)vllm::LoadQwen3_5Moe(shards, config);
+    });
+  };
+
+  SUBCASE("attention tower: BF16 q_proj beside an FP8 k_proj") {
+    // Built by REPLACING one projection in an otherwise all-bf16 tower, so the
+    // ONLY difference from the loading fixture in 4i is the disagreement.
+    std::vector<Spec> specs;
+    const std::string sa = "model.layers.0.self_attn.";
+    for (const Spec& x : TowerMoeSpecs("model.", false, AllBf16())) {
+      if (x.name == sa + "k_proj.weight") continue;
+      specs.push_back(x);
+    }
+    AppendFp8(specs, sa + "k_proj", kMoeKv, kMoeHidden);
+    const std::string message =
+        load_message(specs, OneLayerMoeConfig(), "mixed_attn");
+    CAPTURE(message);
+    CHECK(Mentions(message, "attention tower"));
+    CHECK(Mentions(message, "disagrees with itself"));
+    CHECK(Mentions(message, (sa + "q_proj").c_str()));
+    CHECK(Mentions(message, (sa + "k_proj").c_str()));
+    CHECK(Mentions(message, "BF16"));
+    CHECK(Mentions(message, "per-tensor FP8"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("shared expert: BF16 gate_proj beside an NVFP4 down_proj") {
+    std::vector<Spec> specs;
+    const std::string se = "model.layers.0.mlp.shared_expert.";
+    for (const Spec& x : TowerMoeSpecs("model.", false, AllBf16())) {
+      if (x.name == se + "down_proj.weight") continue;
+      specs.push_back(x);
+    }
+    AppendNvfp4(specs, se + "down_proj", kMoeHidden, kMoeInter);
+    const std::string message =
+        load_message(specs, OneLayerMoeConfig(), "mixed_shared");
+    CAPTURE(message);
+    CHECK(Mentions(message, "shared expert"));
+    CHECK(Mentions(message, "disagrees with itself"));
+    CHECK(Mentions(message, (se + "gate_proj").c_str()));
+    CHECK(Mentions(message, (se + "down_proj").c_str()));
+    CHECK(Mentions(message, "NVFP4"));
+  }
+
+  SUBCASE("GDN tower: BF16 in_proj_qkv beside an FP8 out_proj") {
+    std::vector<Spec> specs;
+    const std::string la = "model.layers.0.linear_attn.";
+    for (const Spec& x : TowerMoeSpecs("model.", true, AllBf16())) {
+      if (x.name == la + "out_proj.weight") continue;
+      specs.push_back(x);
+    }
+    AppendFp8(specs, la + "out_proj", kMoeHidden, kGdnVDim);
+    const std::string message =
+        load_message(specs, OneLayerGdnMoeConfig(), "mixed_gdn");
+    CAPTURE(message);
+    CHECK(Mentions(message, "GDN tower"));
+    CHECK(Mentions(message, (la + "in_proj_qkv").c_str()));
+    CHECK(Mentions(message, (la + "out_proj").c_str()));
+  }
+
+  SUBCASE("a MIXED CHECKPOINT ACROSS components is NOT refused") {
+    // The complement, and the reason the refusal above is scoped to ONE
+    // component. `modelopt_mixed` really ships an FP8 tower next to an NVFP4
+    // MLP, the dense arm reads it, and refusing it here would diverge from the
+    // ladder this probe is required to mirror.
+    TowerChoice choice;
+    choice.attn_bf16 = true;   // BF16 tower...
+    choice.shared_bf16 = false;  // ...beside an NVFP4 shared expert and head.
+    const std::vector<Spec> specs = TowerMoeSpecs("model.", false, choice);
+    CHECK(load_message(specs, OneLayerMoeConfig(), "cross_mixed").empty());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4k. THE MoE PROBE AND THE DENSE PROBE ARE THE SAME LADDER.
+//
+//     If the two disagreed about one projection, a single build could route the
+//     same checkpoint differently through two loaders -- and neither a token
+//     gate on one arm nor a green suite would show it. So the agreement is
+//     asserted BEHAVIORALLY: the same synthetic projection is loaded through
+//     the DENSE loader, and which slot it filled is compared against what
+//     `ClassifyQwen3_5Projection` says. Comparing the classifier with itself
+//     would prove nothing.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: the MoE and dense probes classify a projection identically") {
+  // A one-layer DENSE checkpoint whose self_attn projections carry the dtype
+  // under test; everything else stays bf16.
+  auto dense_specs = [](const std::string& kind) {
+    const std::string p = "model.";
+    const std::string sa = p + "layers.0.self_attn.";
+    std::vector<Spec> s;
+    for (const Spec& x : DenseOneLayerSpecs(p)) {
+      if (x.name.rfind(sa + "q_proj", 0) == 0) continue;
+      s.push_back(x);
+    }
+    if (kind == "bf16") {
+      AppendBf16Proj(s, sa + "q_proj", 8, 8);
+    } else if (kind == "fp8") {
+      AppendFp8(s, sa + "q_proj", 8, 8);
+    } else {
+      // ModelOpt NVFP4: `.weight` U8 + `.weight_scale` F8 + `.weight_scale_2`.
+      // K must be a multiple of 16, so this projection is widened to 16.
+      AppendNvfp4(s, sa + "q_proj", 8, 16);
+    }
+    return s;
+  };
+
+  for (const char* kind : {"bf16", "fp8", "nvfp4"}) {
+    CAPTURE(kind);
+    const std::vector<Spec> specs = dense_specs(kind);
+    const ShardBag bag(specs, "probe_agreement");
+    const vllm::TensorDtypeProbe dtype_of =
+        [&specs](const std::string& name) -> std::string {
+      for (const Spec& x : specs) {
+        if (x.name == name) return x.dtype;
+      }
+      return std::string();
+    };
+    const std::string q = "model.layers.0.self_attn.q_proj";
+    const vllm::MoeProjDtype classified =
+        vllm::ClassifyQwen3_5Projection(dtype_of, q);
+    CHECK(vllm::Qwen3_5ProjectionPresent(dtype_of, q));
+
+    // What the DENSE loader actually did with the very same tensors.
+    const vllm::Qwen3_5DenseLayerWeights dense = vllm::LoadQwen3_5DenseLayer(
+        bag.Resolver(), bag.Has(), "full_attention", 0, "model.");
+    const bool dense_fp4 = !dense.attn.q_proj_fp4.Empty();
+    const bool dense_fp8 = !dense.attn.q_proj_fp8.Empty();
+    const bool dense_bf16 = !dense.attn.q_proj.Empty();
+    // Exactly one slot, whichever it is.
+    REQUIRE((static_cast<int>(dense_fp4) + static_cast<int>(dense_fp8) +
+             static_cast<int>(dense_bf16)) == 1);
+    CHECK(dense_fp4 == (classified == vllm::MoeProjDtype::kNvfp4));
+    CHECK(dense_fp8 == (classified == vllm::MoeProjDtype::kFp8));
+    CHECK(dense_bf16 == (classified == vllm::MoeProjDtype::kBf16));
+  }
+
+  SUBCASE("an ABSENT projection is reported absent, not classified as bf16") {
+    // The tied-head case: no `lm_head` at all. Classifying that as BF16 and
+    // reading it would be a lookup miss dressed up as a decision, so presence
+    // is a separate question -- exactly as `DenseCheckpointHasLmHead` treats it.
+    const vllm::TensorDtypeProbe none =
+        [](const std::string&) { return std::string(); };
+    CHECK_FALSE(vllm::Qwen3_5ProjectionPresent(none, "lm_head"));
+  }
+
+  SUBCASE("a compressed-tensors projection is present under weight_packed") {
+    const vllm::TensorDtypeProbe ct =
+        [](const std::string& name) -> std::string {
+      return name == "lm_head.weight_packed" ? "U8" : std::string();
+    };
+    CHECK(vllm::Qwen3_5ProjectionPresent(ct, "lm_head"));
+    CHECK(vllm::ClassifyQwen3_5Projection(ct, "lm_head") ==
+          vllm::MoeProjDtype::kNvfp4);
+  }
+}
+
+// ===========================================================================
 // 5. INERTNESS of the gated rows. 27B / 35B / Coder are VL-prefixed
 //    checkpoints; the per-layer public seams keep the VL prefix as their
 //    DEFAULT, so every existing caller is unchanged by construction.
@@ -1653,12 +2305,19 @@ TEST_CASE("qwen3_8: the load plan is exactly what LoadQwen3_5Moe fetches") {
   const HfConfig config = PlanMoeConfig();
 
   auto exercise = [&config](const std::string& prefix,
-                            vllm::MoeExpertLayout layout) {
+                            vllm::MoeExpertLayout layout,
+                            vllm::Qwen3_5MoeTowerDtypes tower = {}) {
     CAPTURE(prefix);
     CAPTURE(layout == vllm::MoeExpertLayout::kStackedBf16);
+    CAPTURE(vllm::MoeProjDtypeName(tower.attn));
+    CAPTURE(vllm::MoeProjDtypeName(tower.lm_head));
     const std::vector<vllm::PlannedTensor> plan =
-        vllm::PlanQwen3_5MoeLoad(config, prefix, layout);
-    REQUIRE(plan.size() > 40u);
+        vllm::PlanQwen3_5MoeLoad(config, prefix, layout, tower);
+    // A floor, not a count: the real binding is the two directions below. It is
+    // 30 rather than 40 because a BF16 projection is ONE tensor where an FP8 one
+    // is two or three, so the all-bf16 published arm plans 36 where the
+    // NVFP4-requant arm plans far more (#864).
+    REQUIRE(plan.size() > 30u);
 
     // No plan entry may repeat: a duplicate would let the deletion sweep below
     // remove one copy, leave the other, and score a false "the loader did not
@@ -1692,6 +2351,23 @@ TEST_CASE("qwen3_8: the load plan is exactly what LoadQwen3_5Moe fetches") {
     for (const Spec& s : full) names.push_back(s.name);
     CHECK(vllm::ResolveQwen3_5BackbonePrefix(names) == prefix);
     CHECK(vllm::ResolveQwen3_5MoeExpertLayout(names, prefix) == layout);
+    // ...and the four non-routed components the plan was built for are the ones
+    // the resulting index resolves to (#864). A plan built with the wrong tower
+    // is self-consistent and would load above; only this catches it.
+    const vllm::TensorDtypeProbe dtype_of =
+        [&full](const std::string& name) -> std::string {
+      for (const Spec& x : full) {
+        if (x.name == name) return x.dtype;
+      }
+      return std::string();
+    };
+    const vllm::Qwen3_5MoeTowerDtypes resolved =
+        vllm::ResolveQwen3_5MoeTowerDtypes(dtype_of, prefix,
+                                           config.layer_types);
+    CHECK(resolved.gdn == tower.gdn);
+    CHECK(resolved.attn == tower.attn);
+    CHECK(resolved.shared_expert == tower.shared_expert);
+    CHECK(resolved.lm_head == tower.lm_head);
 
     // DIRECTION 2 — the plan is NECESSARY. Remove one planned tensor at a time;
     // the load must fail, and the failure must NAME the tensor removed. A plan
@@ -1722,6 +2398,21 @@ TEST_CASE("qwen3_8: the load plan is exactly what LoadQwen3_5Moe fetches") {
   }
   SUBCASE("per-expert NVFP4 experts — the arm every gated row reads") {
     exercise("model.", vllm::MoeExpertLayout::kPerExpertNvfp4);
+  }
+
+  // ...and the shape a PUBLISHED repo actually is (#864): stacked bf16 experts
+  // AND all four non-routed components bf16. The deletion sweep is what binds
+  // the new arm's REQUEST SET to the plan: an FP8 projection asks for two or
+  // three tensors where a BF16 one asks for a single `.weight`, so a plan that
+  // kept emitting the fp8 triple would fail direction 1 immediately.
+  SUBCASE("a FULLY published bf16 checkpoint — stacked experts and bf16 towers") {
+    vllm::Qwen3_5MoeTowerDtypes bf16;
+    bf16.gdn = vllm::MoeProjDtype::kBf16;
+    bf16.attn = vllm::MoeProjDtype::kBf16;
+    bf16.shared_expert = vllm::MoeProjDtype::kBf16;
+    bf16.lm_head = vllm::MoeProjDtype::kBf16;
+    exercise("model.", vllm::MoeExpertLayout::kStackedBf16, bf16);
+    exercise("model.language_model.", vllm::MoeExpertLayout::kStackedBf16, bf16);
   }
 }
 
@@ -1856,22 +2547,23 @@ bool Contains(const std::string& haystack, const std::string& needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
-// The three arms `.agents/specs/moe-bf16-stacked-experts.md` §Scope puts OUT of
-// scope, and which a published bf16 repo therefore cannot satisfy: the FP8
-// attention tower, the FP8 GDN tower, the NVFP4 shared expert, and the NVFP4
-// head. Anything unsatisfied outside these is a defect in the reader, not an
-// owed arm, and this predicate is what keeps the two apart.
-bool IsOwedArm(const std::string& name) {
-  return Contains(name, ".self_attn.") || Contains(name, ".linear_attn.") ||
-         Contains(name, ".mlp.shared_expert.") ||
-         name.rfind("lm_head.", 0) == 0;
+// The published manifest AS A CHECKPOINT INDEX: the exact question
+// `LoadQwen3_5Moe` asks of its shards' headers, answered from the captured
+// shapes rather than from a paraphrase of them.
+vllm::TensorDtypeProbe ProbeOf(const PublishedRepo& repo) {
+  return [&repo](const std::string& name) -> std::string {
+    const auto it = repo.tensors.find(name);
+    return it == repo.tensors.end() ? std::string() : it->second.first;
+  };
 }
 
-// Walks a published repo the way `LoadQwen3_5Moe` would: resolve the namespace
-// once, resolve the routed-expert layout once, then plan.
+// Walks a published repo exactly the way `LoadQwen3_5Moe` does: resolve the
+// namespace once, the routed-expert layout once, the four non-routed components
+// once (#864), then plan with all three.
 PlanAudit AuditPublished(const PublishedRepo& repo, const HfConfig& config,
                          const std::string& expect_prefix,
-                         vllm::MoeExpertLayout expect_layout) {
+                         vllm::MoeExpertLayout expect_layout,
+                         vllm::Qwen3_5MoeTowerDtypes* out_tower = nullptr) {
   std::vector<std::string> names;
   names.reserve(repo.tensors.size());
   for (const auto& [name, unused] : repo.tensors) names.push_back(name);
@@ -1881,7 +2573,11 @@ PlanAudit AuditPublished(const PublishedRepo& repo, const HfConfig& config,
   const vllm::MoeExpertLayout layout =
       vllm::ResolveQwen3_5MoeExpertLayout(names, prefix);
   CHECK(layout == expect_layout);
-  return AuditPlan(vllm::PlanQwen3_5MoeLoad(config, prefix, layout), repo);
+  const vllm::Qwen3_5MoeTowerDtypes tower = vllm::ResolveQwen3_5MoeTowerDtypes(
+      ProbeOf(repo), prefix, config.layer_types);
+  if (out_tower != nullptr) *out_tower = tower;
+  return AuditPlan(vllm::PlanQwen3_5MoeLoad(config, prefix, layout, tower),
+                   repo);
 }
 
 // Every claim that holds for BOTH published repos, so neither is a special case.
@@ -1890,14 +2586,30 @@ void CheckPublishedPlan(const PublishedRepo& repo, const HfConfig& config,
                         int64_t experts, int64_t inter, int64_t hidden,
                         int64_t expect_unplanned) {
   CAPTURE(repo.name);
-  const PlanAudit audit =
-      AuditPublished(repo, config, prefix, vllm::MoeExpertLayout::kStackedBf16);
+  vllm::Qwen3_5MoeTowerDtypes tower;
+  const PlanAudit audit = AuditPublished(
+      repo, config, prefix, vllm::MoeExpertLayout::kStackedBf16, &tower);
+
+  // (0) THE FOUR NON-ROUTED COMPONENTS RESOLVE BF16 (#864). A published repo
+  //     carries no `weight_scale`, `input_scale` or `scale_inv` ANYWHERE, so
+  //     every one of them must land on the bf16 arm. Resolved from the real
+  //     manifest's own dtypes, not asserted about a fixture.
+  CHECK(tower.gdn == vllm::MoeProjDtype::kBf16);
+  CHECK(tower.attn == vllm::MoeProjDtype::kBf16);
+  CHECK(tower.shared_expert == vllm::MoeProjDtype::kBf16);
+  CHECK(tower.lm_head == vllm::MoeProjDtype::kBf16);
+  for (const auto& [name, unused] : repo.tensors) {
+    CAPTURE(name);
+    CHECK_FALSE(Contains(name, "weight_scale"));
+    CHECK_FALSE(Contains(name, "input_scale"));
+    CHECK_FALSE(Contains(name, "scale_inv"));
+  }
 
   // (1) THE ROUTED EXPERTS RESOLVE EXACTLY, at this repo's real dimensions.
   //     Two stacked tensors per layer, and their shapes are the ones the READER
   //     enforces (`shape_enforced`), not ones this planner merely computed.
   const std::vector<vllm::PlannedTensor> plan = vllm::PlanQwen3_5MoeLoad(
-      config, prefix, vllm::MoeExpertLayout::kStackedBf16);
+      config, prefix, vllm::MoeExpertLayout::kStackedBf16, tower);
   int64_t enforced = 0;
   for (const vllm::PlannedTensor& t : plan) {
     if (!t.shape_enforced) continue;
@@ -1913,36 +2625,42 @@ void CheckPublishedPlan(const PublishedRepo& repo, const HfConfig& config,
   }
   CHECK(enforced == 2 * layers);
 
-  // (2) EVERY BF16 REQUEST IS SATISFIED, shape and dtype exact. That is the
-  //     whole backbone this arm implements: embeds, norms, every layernorm, the
-  //     router gate, the shared-expert gate, the GDN's bf16 tail and both
-  //     attention norms — plus the stacked experts above.
+  // (2) EVERY PLANNED TENSOR IS SATISFIED, name, dtype and shape exact — and
+  //     every planned tensor is BF16, because a published repo is bf16
+  //     throughout. This is what #864 changed and it is the row's headline CPU
+  //     evidence: BEFORE it, this audit's `missing` and `mismatched` sets were
+  //     required to be NON-empty (the FP8 towers, the NVFP4 shared expert and
+  //     the NVFP4 head were owed arms a published repo could not satisfy).
   const std::set<std::string> satisfied(audit.satisfied.begin(),
                                         audit.satisfied.end());
   int64_t bf16_planned = 0;
   for (const vllm::PlannedTensor& t : plan) {
-    if (t.dtype != "BF16") continue;
-    ++bf16_planned;
     CAPTURE(t.name);
+    CHECK(t.dtype == "BF16");
+    ++bf16_planned;
     CHECK(satisfied.count(t.name) == 1u);
   }
   CHECK(bf16_planned == static_cast<int64_t>(audit.satisfied.size()));
 
-  // (3) NOTHING ELSE IS SATISFIED, AND WHAT IS NOT IS EXACTLY THE OWED SET.
-  //     A published repo is bf16 THROUGHOUT, so every quantized request fails —
-  //     the `.weight`s by dtype and the `.weight_scale`s by absence. This is the
-  //     claim most likely to be over-read from this row ("the stacked arm
-  //     landed, so Qwen3.6-35B-A3B loads"), and it is pinned here rather than
-  //     left to a reader's optimism.
-  CHECK_FALSE(audit.missing.empty());
-  CHECK_FALSE(audit.mismatched.empty());
+  // (3) NOTHING IS MISSING AND NOTHING MISMATCHES.
+  //
+  //     BE PRECISE ABOUT WHAT THIS DOES AND DOES NOT ESTABLISH. It reads NO
+  //     weight byte. It says every name the reader would request exists in the
+  //     published index with the dtype and (where the loader states one) the
+  //     shape the reader expects. It says nothing about a generated token,
+  //     throughput, memory headroom, or whether an allocation path survives
+  //     4.89 TB. The gate/up split, the expert stride and the tower transposes
+  //     are proven byte-exact only at toy dimensions in 4d/4e-4i and, upstream,
+  //     by source; a wrong transpose still passes everything on this machine.
+  CHECK(audit.missing.empty());
   for (const std::string& name : audit.missing) {
     CAPTURE(name);
-    CHECK(IsOwedArm(name));
+    CHECK(false);
   }
+  CHECK(audit.mismatched.empty());
   for (const std::string& name : audit.mismatched) {
     CAPTURE(name);
-    CHECK(IsOwedArm(name));
+    CHECK(false);
   }
 
   // (4) THE PUBLISHED TENSORS THE PLAN DOES NOT WANT ARE EXACTLY TWO FAMILIES,
