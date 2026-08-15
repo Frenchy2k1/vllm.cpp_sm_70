@@ -787,10 +787,47 @@ checkpoint that fits GB10 appears; the MoE one when a fitting
 `Qwen3_5MoeForCausalLM` checkpoint does.
 
 `Qwen/Qwen3.8-2.4T-A95B` is ~4.8 TB bf16 (~2.4 TB FP8) against 128 GB of unified
-memory and no smaller Qwen3.8 sibling exists, so it remains unrunnable here. Its
-load plan resolves completely against the published index — name, shape and
-dtype resolution, **not a token**. Still owed: the MTP and GGUF arms for 3.8.
-This does not advance the parity pin.
+memory, so it remains unrunnable here. Its load plan resolves completely against
+the published index — name, shape and dtype resolution, **not a token**. Still
+owed: the MTP and GGUF arms for 3.8. This does not advance the parity pin.
+
+**A smaller Qwen3.8 sibling DOES exist, and this page said otherwise until
+2026-08-15.** `Qwen/Qwen3.8-27B` @`1d4bf0f2` (55.6 GB bf16, 18 shards) fits GB10
+and declares `Qwen3_5ForConditionalGeneration` — the already-gated Qwen3.6-27B
+shape retrained, `config.json` differing in exactly one key. It closes neither
+text-only run gate above, because it is not a `Qwen3_5[Moe]ForCausalLM`.
+
+**It is now token-gated ([#915](https://github.com/mudler/vllm.cpp/issues/915),
+[spec](../.agents/specs/qwen38-27b-bf16-gate.md)).** Greedy, 7 prompts x 16
+tokens vs the pinned oracle on GB10: **4/7 prompts STRICT 16/16**, and all three
+first-divergence positions are **EXACT fp32 ties** — top-2 gap and
+oracle-minus-ours both **0.000 mnats**, our token at rank 3 / 2 / 2 in the
+oracle top-20, so `ALL_TIES_OR_IN_BAND` against `kNearTieMnats = 500`. All three
+are the [#910](https://github.com/mudler/vllm.cpp/issues/910) tie-break and
+nothing else: vLLM takes the lower token id, we take the higher.
+
+Only the first divergence per prompt is adjudicable, so that is three numbers,
+and a raw position count over the grid is not a quality score. The tie verdict
+rests on the oracle's **fp32** logprobs, read twice — a greedy re-decode and a
+teacher-forced probe that asserts the prefix it conditions on. A `transformers`
+bf16 CPU probe agreed, but is recorded as secondary only: every runner-up gap it
+printed was a multiple of 0.125, one bf16 ULP, so it could not have resolved a
+real gap below that and could not have reported anything but a tie.
+
+**Speed: one of three concurrency cells is established, and the reason the other
+two are not is a defect of ours.** Against vLLM's production graphed config on
+GB10, clocks pinned at 2184 MHz, c4 is the only cell where both arms completed
+every request: **0.963x** output throughput and **1.008x** median ITL. At c1 and
+c8 our server failed 1 of 6 in all three reps and 12/11/12 of 48 where vLLM failed none, so
+those throughput cells are **withheld, not quoted**
+([#931](https://github.com/mudler/vllm.cpp/issues/931)) — the metric divides
+tokens by a duration that still contains the dead request, which is why c1 reads
+0.677x while median TPOT in the same file reads 1.014x in our favour.
+
+Resource axes on the same series: cold start to first `/health` **53 s vs
+780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —
+the latter with the caveat that vLLM's figure is set by
+`--gpu-memory-utilization 0.85` pre-reserving KV on a unified-memory box.
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or

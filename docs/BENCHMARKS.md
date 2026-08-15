@@ -52,6 +52,7 @@ The first series free of both, at the pin, graphed, and at a pinned clock is in
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 ROLLBACK, SUPERSEDED | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x, VOID as ratios (#520, #414). At the pin, clocks pinned: **0.995x c1 / 0.946x c4 TPOT**. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 ROLLBACK, SUPERSEDED | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | OPEN: TTFT/TPOT/E2E 1.085/1.017/1.029x, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| Qwen3.8-27B | bf16 (@`1d4bf0f2`) | 0.26.0.dev0 at the pin, graphed, clocks 2184 MHz | **1 of 3 concurrency cells** | Token gate PASSES. Only c4 is like-for-like: tput **0.963x**, ITL **1.008x**. c1/c8 tput NOT ESTABLISHED: we failed 1/6 and ~11/48 requests, vLLM none ([#931](https://github.com/mudler/vllm.cpp/issues/931)) |
 
 ### GDN prefill kernels by GPU
 
@@ -185,6 +186,23 @@ AsyncLLM, batch-1 + concurrency, token-exact vs the SACRED oracle): RED on `=0`,
 on the default. c16 re-checked on the default: 2312.9/2303.9/2294.4 (median
 **2303.9**), c32 2942.7 (no regression). Root cause + file:line in the benchmark
 record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fixed by `ROW-SERVE-ASYNC-DENSE-MIRROR` (see the MXFP4 Qwen3-8B row). The intake-drain lever likewise measured NEUTRAL (2026-08-06, `VT_INTAKE_DRAIN` A/B 3+3 reps): admitting during the forward wait collapses intake -91% but shifts it into queued, arrival-to-scheduled invariant, so the recorded INTAKE term is an attribution boundary over a GPU-bound prefill wait, not reducible; lever reverted, byte-exact `VT_LOOP_TRACE` probe kept.
+
+### Qwen3.8-27B (bf16) by concurrency
+
+| Axis | c1 | c4 | c8 |
+|---|---:|---:|---:|
+| Requests completed, ours / vLLM | 5,5,5 / 6,6,6 of 6 | 24,24,24 / 24,24,24 of 24 | 36,37,36 / 48,48,48 of 48 |
+| Output token throughput | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | **0.963x** | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) |
+| Total token throughput | NOT ESTABLISHED | **0.918x** | NOT ESTABLISHED |
+| Median ITL, over completed only | 1.013x | **1.008x** | 1.021x |
+| Median TPOT, over completed only | 1.014x | 0.980x | 0.925x |
+| Median TTFT, over completed only | 0.733x | 0.881x | 1.268x |
+| Median E2EL, over completed only | 1.003x | 0.974x | 0.983x |
+| ours / vLLM output tok/s | 2.37 / 3.50 | 15.01 / 15.58 | 15.96 / 27.85 |
+| ours / vLLM median TPOT ms | 220.6 / 223.6 | 239.0 / 234.3 | 261.1 / 241.4 |
+| Cold start to first `/health` | **53 s vs 780 s = 14.7x**, medians of 3 (ours 53/53/53, vLLM 786/780/771) | same binary | same binary |
+| Host memory after warmup | **42.5 vs 110.1 GiB = 2.59x**, but vLLM's is set by `--gpu-memory-utilization 0.85` pre-reserving KV, so it is what the configured engine holds, not what the model needs | | |
+| Why only c4 counts | `output_throughput` divides tokens by a wall duration that still contains the dead request, so a cell where one arm dropped requests is withheld, not quoted | 3 paired reps, clocks 2184 MHz | token gate: 4/7 strict, 3 exact fp32 ties ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 
 ### DeepSeek-V2-Lite (MLA)
 
