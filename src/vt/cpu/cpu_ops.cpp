@@ -532,6 +532,72 @@ uint8_t F32ToFp8(float f) {
                               static_cast<uint8_t>(mant));
 }
 
+// --- Static per-tensor FP8 W8A8 (VT-FP8-W8A8-CPU-ARM, #468). The CPU arm of the
+// path vLLM's ModelOptFp8LinearMethod runs: a static per-tensor activation quant
+// followed by a per-tensor fp8 GEMM. It exists so the fp8 seam is reachable, and
+// therefore testable, without a GPU.
+
+// QuantFp8Static CPU kernel — mirror of vLLM's static_scaled_fp8_quant
+// (csrc/quantization/w8a8/fp8/common.cuh:58-77 `scaled_fp8_conversion`):
+//   x = val * scale;  r = fmaxf(-448, fminf(x, 448));  hardware RNE convert
+// with the RECIPROCAL formed ONCE outside the loop, exactly as upstream forms it
+// (csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31 `1.0f / scale[...]`)
+// and exactly as our CUDA kernel does (cuda_matmul_fp8_cutlass.cu: `const float
+// inv = 1.0f / input_scale;` then `LoadIn(x, i) * inv`). It is a MULTIPLY BY THE
+// RECIPROCAL, not a divide: the two differ by up to one f32 ulp before the fp8
+// round, and near an e4m3 tie that ulp changes the emitted byte.
+//
+// F32ToFp8 supplies both remaining halves: it saturates (|a| >= 448 -> 0x7E,
+// which IS the encoding of 448, so clamp-then-convert and saturating-convert
+// coincide because 448 is the largest finite e4m3fn value) and it rounds to
+// nearest-even. The scale is per-TENSOR — upstream collapses the per-shard
+// input_scale to one scalar with `.max()` (modelopt.py:528) and then treats
+// `scale.numel() == 1` as a single group spanning the whole tensor
+// (common.cu:204-210). LoadF32 widens a bf16 x to f32 BEFORE the multiply, as
+// the CUDA kernel's LoadIn overload does, so both backends round at one point.
+void QuantFp8StaticKernel(Queue&, Tensor& out_fp8, const Tensor& x, float input_scale) {
+  const int64_t n = x.shape[0] * x.shape[1];
+  const float inv_scale = 1.0F / input_scale;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) op[i] = F32ToFp8(LoadF32(x, i) * inv_scale);
+  });
+}
+
+// MatmulFp8Cutlass CPU kernel: out[m,n] = alpha * Sum_k f8val(a[m,k])*f8val(b[n,k]),
+// f32 accumulate, ONE folded alpha (= input_scale*weight_scale — our recorded
+// deviation from upstream's two epilogue scalars, see include/vt/ops.h).
+//
+// A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH. It is a naive triple loop; it
+// makes no speed claim and nothing routes a production model through it. Its
+// purpose is that the fp8 GEMM seam resolves on a CPU queue so the surrounding
+// wiring can be gated without a GPU (#468).
+//
+// It is deliberately NOT a bit-mirror of the CUDA GEMM and does not claim to be:
+// the CUDA arm reduces K in tensor-core order and rounds its epilogue through
+// bf16, so the two agree to fp8/bf16 tolerance. Only the QUANT half above carries
+// a bit-exactness claim. Shaped like MatmulNvfp4Fp4Kernel: the A row is decoded
+// once per M and reused across N.
+void MatmulFp8CutlassKernel(Queue&, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                            float alpha) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  const auto* ap = a_fp8.Ptr<uint8_t>();
+  const auto* bp = b_fp8.Ptr<uint8_t>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    std::vector<float> arow(static_cast<size_t>(k));
+    for (int64_t i = r0; i < r1; ++i) {
+      for (int64_t kk = 0; kk < k; ++kk)
+        arow[static_cast<size_t>(kk)] = Fp8ToF32(ap[i * k + kk]);
+      for (int64_t col = 0; col < n; ++col) {
+        float acc = 0.0F;
+        for (int64_t kk = 0; kk < k; ++kk)
+          acc += arow[static_cast<size_t>(kk)] * Fp8ToF32(bp[col * k + kk]);
+        StoreF32(out, i * n + col, alpha * acc);
+      }
+    }
+  });
+}
+
 // Fused fp8 RMSNorm -> static per-tensor quant (mirror vLLM Inductor
 // fused_add_rms_norm_static_fp8_quant, rms_quant_fusion.py:124). Same reduction
 // order as RmsNormKernel; the fp8 is taken from the SAME bf16-rounded normed value
@@ -3120,6 +3186,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
+    RegisterOp(OpId::kQuantFp8Static, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernel)));
+    RegisterOp(OpId::kMatmulFp8Cutlass, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFp8CutlassFn>(&MatmulFp8CutlassKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
     RegisterOp(OpId::kGeluAndMul, DeviceType::kCPU,

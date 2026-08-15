@@ -317,8 +317,25 @@ void MatmulFp8CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, cons
 }
 
 // ---- Static per-tensor fp8 activation quant (vLLM static_scaled_fp8_quant) ---
-// out_fp8[i] = fp8_e4m3(clamp(x[i]/input_scale, -448, 448)). __NV_SATFINITE cvt
-// saturates == clamp-then-cvt; RNE == vLLM's hardware cvt. Tin f32/bf16.
+// inv = 1/input_scale; out_fp8[i] = fp8_e4m3(clamp(x[i]*inv, -448, 448)).
+// A RECIPROCAL MULTIPLY, not a divide, and the reciprocal is hoisted out of the
+// loop — that is upstream's shipped form (`x = val * scale` with the inverse
+// formed by the caller: csrc/quantization/w8a8/fp8/common.cuh:62 and
+// csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31). The code below is
+// RIGHT; do not "fix" it into `x / input_scale` to match a prose formula. The two
+// differ by up to one f32 ulp before the fp8 round, and near an e4m3 tie that
+// ulp changes the emitted byte on a default-ON 35B path.
+// __NV_SATFINITE cvt saturates == clamp-then-cvt; RNE == vLLM's hardware cvt.
+// Tin f32/bf16.
+//
+// The CPU arm (src/vt/cpu/cpu_ops.cpp QuantFp8StaticKernel) is INTENDED to be the
+// byte-for-byte mirror of this kernel, and that equivalence is DECLARED AND OWED,
+// not measured. It is gate G2 of .agents/specs/vt-fp8-w8a8-cpu-arm.md, which is
+// PENDING for want of a GPU (#468). What IS measured is weaker and lives on the
+// CPU side: G1 proves the CPU kernel matches an independent e4m3 reference derived
+// from the format. Two implementations each matching a reference is not the same
+// claim as the two matching each other, so do not cite this comment as evidence
+// that they agree. Run tests/vt/test_ops_fp8_cpu.cpp on a CUDA host to close it.
 __device__ __forceinline__ uint8_t F32ToFp8Dev(float f) {
   return static_cast<uint8_t>(__nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3));
 }

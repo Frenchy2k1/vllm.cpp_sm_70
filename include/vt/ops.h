@@ -1453,10 +1453,19 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
 // per-tensor weight_scale + a f32 per-tensor input_scale (both applied directly:
 // dequant(w)=f8(w)*weight_scale, dequant(a)=f8(a)*input_scale).
 
-// QuantFp8Static (mirror vLLM static_scaled_fp8_quant, is_scale_inverted=False):
-//   out_fp8[i] = fp8_e4m3( clamp(x[i] / input_scale, -448, 448) )   // RNE hw cvt
+// QuantFp8Static (mirror vLLM static_scaled_fp8_quant):
+//   inv = 1/input_scale;  out_fp8[i] = fp8_e4m3( clamp(x[i] * inv, -448, 448) )
+// RNE convert. The scale is applied as a RECIPROCAL MULTIPLY, not a divide, and
+// the reciprocal is formed ONCE outside the elementwise loop — that is what
+// upstream ships: `x = val * scale` under is_scale_inverted=true
+// (csrc/quantization/w8a8/fp8/common.cuh:62, clamp at :68) with the inverse formed
+// by the caller (csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31,
+// `1.0f / scale[...]`). DO NOT "correct" the kernels to a divide to match a
+// prose formula: `x/s` and `x*(1/s)` differ by up to one f32 ulp, and near an
+// e4m3 tie that ulp changes the emitted byte on a default-ON 35B path.
 // Static per-tensor scale (NOT dynamic/per-token). x [M,K] f32/bf16, out [M,K]
-// i8 (raw fp8-e4m3fn bytes). CUDA only (the 35B W8A8 path is CUDA-resident).
+// i8 (raw fp8-e4m3fn bytes). CUDA + CPU (the CPU arm is the portable reference
+// that makes the fp8 seam testable without a GPU, #468).
 void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale);
 
 // RmsNormQuantFp8 (fused fp8 RMSNorm -> static per-tensor activation quant). One
@@ -1507,7 +1516,16 @@ void RmsNormGatedQuantFp8(Queue& q, Tensor& out_fp8, const Tensor& x, const Tens
 // sequential scale_a·(scale_b·acc) — within fp8 tolerance, ported deviation).
 // a_fp8 [M,K] (= QuantFp8Static output), b_fp8 [N,K] the on-disk raw fp8-e4m3fn
 // weight (K contiguous). out [M,N] bf16 (cutlass epilogue) or f32 (via cast).
-// K,N multiples of 16 (128-bit fp8 alignment). CUDA-only (sm120a).
+// K,N multiples of 16 (128-bit fp8 alignment). CUDA (sm120a) + a CPU CORRECTNESS
+// REFERENCE (f32 accumulate, naive triple loop — no speed claim, and no
+// production model routes through it; it exists so the fp8 seam resolves on a
+// CPU queue and can be gated without a GPU, #468). The CPU arm is EXPECTED to
+// agree with the CUDA kernel to fp8/bf16 tolerance and NOT byte-for-byte, because
+// the CUDA arm reduces K in tensor-core order and rounds its epilogue through
+// bf16 — but that agreement is DECLARED AND OWED, not measured. No committed run
+// has compared the two arms: gate G2 of .agents/specs/vt-fp8-w8a8-cpu-arm.md is
+// PENDING for want of a GPU. Treat the tolerance above as the claim to be tested,
+// not as a result.
 void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                       float alpha);
 
