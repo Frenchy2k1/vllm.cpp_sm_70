@@ -1547,6 +1547,10 @@ if(VLLM_CPP_CUTLASS)
       "VT_FP4_TEST_PERSISTENT_SAVE=1;VT_FP4_PERSISTENT_CACHE=1;VT_FP4_AUTOTUNE_CACHE_READONLY=0;VT_FP4_AUTOTUNE_CACHE_PATH=${CMAKE_CURRENT_BINARY_DIR}/nvfp4-runtime-save-lifecycle.json;VT_FP4_AUTOTUNE_DELAY_US=0;VT_FP4_PLAN_CACHE=1;VT_FP4_AUTOTUNE=1;VT_FP4_FULL_TACTICS=1")
 endif()
 vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
+# VT-FP8-W8A8-CPU-ARM (#468): the CPU arm of the static fp8 W8A8 path. Runs on a
+# box with NO GPU by construction — that is the point of the row — and carries a
+# CUDA-gated arm (G2) for CPU-vs-CUDA byte agreement wherever a device exists.
+vllm_cpp_add_test(test_ops_fp8_cpu vt/test_ops_fp8_cpu.cpp)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the
