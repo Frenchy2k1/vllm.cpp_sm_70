@@ -493,8 +493,9 @@ read; reference audio additionally needs the AUDIO VAE's encoder key filter,
 which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
 DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
 is appended unmarked, so the embedding never applies to it. Where the embedding
-does bite is the FIRST latent frame of every render, which is a separate gap,
-tracked as issue #658.) Three encoder-level limits are worth
+does bite is the FIRST latent frame of every render, which was a separate gap;
+it was closed on 2026-08-14 under issue #658, so the marker is now applied on
+every render.) Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -584,7 +585,7 @@ the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
 ```sh
 ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
          --dit-config ltx-2.5-transformer-config.json \
-         --model-version 2.5 --allow-unported \
+         --model-version 2.5 \
          --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
@@ -714,7 +715,8 @@ memory number:
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT
 file, were among the modules the DiT loader would not load. They are loaded
-(`ltx2_loader.cpp:416-427` carries them as their own contract, outside the DiT's),
+(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1221`, enumerates their own
+contract at `:1224`, outside the DiT's),
 so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
 needs a matching pair of embeds files. The gap that remains is a numeric one: the
 tower, the connector's forward and both caption projections each have an oracle
@@ -1847,8 +1849,13 @@ vllm-server --model /path/to/text-model \
   --video-encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
   --video-extra encoder_config_path=ltx-2.5-gemma4-text-config.json \
   --video-extra dit_config_path=ltx-2.5-transformer-config.json \
-  --video-extra model_version=2.5 --video-extra allow_unported_modules=1
+  --video-extra model_version=2.5
 ```
+
+`allow_unported_modules=1` is no longer needed for either shipped LTX-2.5 DiT —
+`keyframes_abs_pos_embedding`, the last family that demanded it, was ported on
+2026-08-14 (issue #658). The flag still exists for a checkpoint that carries
+something else this port does not.
 
 ## Consuming it as a library (C ABI)
 
@@ -2414,18 +2421,26 @@ Only the LTX-2.5 DiT is gated against an independent oracle here, so treat any
 other marker-less NVFP4 checkpoint as unsupported until it is. See
 `.agents/specs/nvfp4-nibble-order.md`.
 
-Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
-shipped DiT by default, because that file carries **one** module family this port
-does not carry (`keyframes_abs_pos_embedding`); pass
-`Ltx2DitLoadOptions::allow_unported_modules`
-to load the ported subset, which still reports every one of them in
-`Ltx2DitCheckpoint::unported`. `prompt_adaln_single` and
-`audio_prompt_adaln_single` were on that list until 2026-08-13 and are now
-PORTED, so a checkpoint carrying them needs no opt-in on their account, and the
-opt-in no longer disables them. The two `*_embeddings_connector` towers are
+Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` ACCEPTS both
+shipped DiTs with no opt-in as of 2026-08-14. `Ltx2DitLoadOptions::allow_unported_modules`
+still exists, and still loads the ported subset while reporting every dropped
+family in `Ltx2DitCheckpoint::unported`, but neither shipped LTX-2.5 checkpoint
+needs it any more. `keyframes_abs_pos_embedding` was the last family on that
+list; it is PORTED (issue #658), and `prompt_adaln_single` /
+`audio_prompt_adaln_single` left the list the same way on 2026-08-13. The two
+DiTs used to be refused from OPPOSITE directions — the vonkaiser FP8 copy for
+carrying a trained `keyframes_abs_pos_embedding` this port did not apply, and the
+first-party NVFP4 copy for declaring `use_keyframes_abs_pos_embedding` while
+carrying no tensor at all. The second case is upstream-legal and means "apply
+nothing": upstream builds the parameter on the meta device and
+`supports_keyframes_abs_pos_embedding` stays False, so
+`Ltx2AdoptDeclaredDitParams` resolves the declared flag against what the file
+actually carries rather than refusing it or inventing a zero. The two
+`*_embeddings_connector` towers are
 **not** among them and never will be:
-`UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
-`RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,
+`UnportedFamilies` filters them out at `ltx2_loader.cpp:527` through
+`LoadedElsewhere` (`ltx2_loader.cpp:514`), `RefuseUnported`
+(`ltx2_loader.cpp:537`) says so in its own message at `ltx2_loader.cpp:553-557`,
 and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
 what the video engine calls, so a checkpoint this port reads completely is never
 made to ask for `allow_unported_modules` on their account. (The "five" this

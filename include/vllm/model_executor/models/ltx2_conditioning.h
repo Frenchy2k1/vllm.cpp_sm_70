@@ -78,6 +78,25 @@ Ltx2LatentState Ltx2CreateVideoLatentState(const Ltx2VideoLatentShape& shape, in
                                            bool causal_fix, const float* initial_latent = nullptr,
                                            std::vector<float>* out_keyframes_mask = nullptr);
 
+// `_first_frame_keyframes_mask` (tools.py:186-196) on its own, [tokens] in {0, 1}.
+//
+// THE RULE IS UNCONDITIONAL. Upstream marks the target's first latent frame on
+// every generation, whether or not a keyframe was supplied — its own comment says
+// "the reference implementation marks it unconditionally -- independently of
+// whether any keyframe slots exist" (:190-191). The reason is a fact about the
+// latent, not about the request: the video encoder is CAUSAL, so the first
+// temporal latent frame covers one pixel frame while every later one covers
+// `temporal_scale_factor`, which puts it in the same token class as a generated
+// keyframe slot.
+//
+// Exposed because two callers need it — `Ltx2CreateVideoLatentState` and the video
+// engine, which builds its per-phase stream state by hand — and re-deriving
+// `tokens_per_latent_frame` at a call site is how "only when keyframes exist"
+// gets written by accident. That defect is invisible to every output check: it
+// renders a finite, correctly shaped clip that is simply missing a trained term.
+std::vector<float> Ltx2FirstFrameKeyframesMask(const Ltx2VideoLatentShape& shape,
+                                               int64_t patch_size);
+
 // AudioLatentTools.create_initial_state (tools.py:246-279) at batch 1. The audio
 // positions are the patch grid bounds THEMSELVES, in seconds — there is no
 // `get_pixel_coords` and no division by fps on this side.

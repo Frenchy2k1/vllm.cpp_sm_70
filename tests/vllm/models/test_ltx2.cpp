@@ -17,6 +17,8 @@
 // numbers to f32 round-off.
 #include "vllm/model_executor/models/ltx2.h"
 
+#include "vllm/model_executor/models/ltx2_conditioning.h"
+
 #include <doctest/doctest.h>
 
 #include <nlohmann/json.hpp>
@@ -417,10 +419,25 @@ TEST_CASE("ltx2 config: ParseLtx2DitParams mirrors LTXModelConfigurator") {
     cfg["config"]["transformer"]["caption_proj_before_connector"] = false;
     CHECK_THROWS(ParseLtx2DitParams(cfg));
   }
-  SUBCASE("keyframe absolute-position embeddings are REFUSED") {
-    nlohmann::json cfg = ReducedConfig();
-    cfg["config"]["transformer"]["use_keyframes_abs_pos_embedding"] = true;
-    CHECK_THROWS(ParseLtx2DitParams(cfg));
+  // REPLACES "keyframe absolute-position embeddings are REFUSED". That refusal is
+  // retired by row LTX25-KEYFRAMES-ABS-POS (issue #658): the flag is now READ, and
+  // this asserts the value it produces in both directions plus its default, which
+  // is strictly more than the refusal asserted.
+  SUBCASE("use_keyframes_abs_pos_embedding is READ, not refused") {
+    nlohmann::json on = ReducedConfig();
+    on["config"]["transformer"]["use_keyframes_abs_pos_embedding"] = true;
+    CHECK(ParseLtx2DitParams(on).use_keyframes_abs_pos_embedding);
+
+    nlohmann::json off = ReducedConfig();
+    off["config"]["transformer"]["use_keyframes_abs_pos_embedding"] = false;
+    CHECK_FALSE(ParseLtx2DitParams(off).use_keyframes_abs_pos_embedding);
+
+    // model_configurator.py:82/:142 — `config.get(..., False)`. A config that
+    // omits the key means the model has no such parameter, which is what every
+    // pre-2.5 checkpoint is.
+    nlohmann::json absent = ReducedConfig();
+    absent["config"]["transformer"].erase("use_keyframes_abs_pos_embedding");
+    CHECK_FALSE(ParseLtx2DitParams(absent).use_keyframes_abs_pos_embedding);
   }
 }
 
@@ -970,6 +987,330 @@ TEST_CASE("ltx2 forward: the prompt-AdaLN term is LOAD-BEARING, not decoration")
   MESSAGE("flag-ON vs flag-OFF: video=" << vdiff << " audio=" << adiff);
   CHECK(vdiff > 20.0 * kRoundOff);
   CHECK(adiff > 20.0 * kRoundOff);
+}
+
+// ---------------------------------------------------------------------------
+// The keyframe absolute-position embedding
+// (.agents/specs/ltx25-keyframes-abs-pos.md, issue #658)
+// ---------------------------------------------------------------------------
+//
+// Upstream: `apply_keyframes_absolute_embedding` (transformer_args.py:23-43),
+// called ONCE at :269 over the parameter `_init_video` builds at model.py:217-219.
+// On a TRAINED checkpoint — which the shipped vonkaiser FP8 DiT is, 4096 of 4096
+// bytes non-zero — it adds a learned per-token bias to every token the keyframes
+// mask marks, on every forward.
+
+namespace {
+
+Ltx2DitParams ReducedParamsKeyframes(Ltx2RopeType rope_type, bool double_precision) {
+  Ltx2DitParams p = ReducedParams(rope_type, double_precision);
+  p.use_keyframes_abs_pos_embedding = true;
+  return p;
+}
+
+// `_first_frame_keyframes_mask` at the fixture's geometry, taken from the GOLDEN
+// rather than recomputed here: the golden is `zeros_like(denoise_mask)` with
+// `[:, :tokens_per_latent_frame] = 1.0` as upstream wrote it (tools.py:194-195),
+// and re-deriving it in the test would let both sides be wrong together.
+std::vector<float> KeyframesMaskFromGolden() {
+  const int64_t b = vllm_test::kLtx2Batch;
+  const int64_t tv = vllm_test::kLtx2VideoTokens;
+  std::vector<float> mask(static_cast<size_t>(b * tv));
+  for (int64_t i = 0; i < b * tv; ++i) {
+    // The golden is (B, T, 1); the port's field is [batch, tokens], the same
+    // values with the trailing broadcast axis dropped.
+    mask[static_cast<size_t>(i)] = vllm_test::kLtx2KeyframesMask[i];
+  }
+  return mask;
+}
+
+}  // namespace
+
+// The parameter the flag adds, and WHERE it sits. Registration order is the half
+// no shape encodes: `keyframes_abs_pos_embedding` is a module-OWN parameter
+// created at model.py:217, BEFORE `scale_shift_table` at :230, so it leads
+// `named_parameters()`.
+TEST_CASE("ltx2 layout: the keyframes contract matches upstream named_parameters()") {
+  const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+  const std::vector<Ltx2TensorSpec> manifest = EnumerateLtx2DitTensors(p);
+  REQUIRE(static_cast<int64_t>(manifest.size()) == vllm_test::kLtx2KeyframesParamCount);
+  // Exactly ONE parameter, which is what makes the count delta the module.
+  CHECK(vllm_test::kLtx2KeyframesParamCount - vllm_test::kLtx2ParamCount == 1);
+  size_t dim_cursor = 0;
+  for (size_t i = 0; i < manifest.size(); ++i) {
+    CAPTURE(i);
+    CAPTURE(manifest[i].name);
+    CHECK(manifest[i].name == std::string(vllm_test::kLtx2KeyframesParamNames[i]));
+    const int64_t rank = vllm_test::kLtx2KeyframesParamRanks[i];
+    REQUIRE(static_cast<int64_t>(manifest[i].shape.size()) == rank);
+    for (int64_t d = 0; d < rank; ++d) {
+      CHECK(manifest[i].shape[static_cast<size_t>(d)] ==
+            vllm_test::kLtx2KeyframesParamDims[dim_cursor]);
+      ++dim_cursor;
+    }
+  }
+  // And the flag-OFF contract must not name it at all — with a positive control
+  // in the same loop, so "found none" cannot be an artefact of looking for the
+  // wrong string.
+  const std::vector<Ltx2TensorSpec> off =
+      EnumerateLtx2DitTensors(ReducedParams(Ltx2RopeType::kSplit, false));
+  int64_t named = 0;
+  int64_t control = 0;
+  for (const Ltx2TensorSpec& spec : off) {
+    if (spec.name == "keyframes_abs_pos_embedding") ++named;
+    if (spec.name == "scale_shift_table") ++control;
+  }
+  CHECK(named == 0);
+  CHECK(control == 1);
+}
+
+// THE MASK RULE, and the half most likely to be ported wrong. Upstream marks the
+// target's first latent frame UNCONDITIONALLY — its own comment says so in terms
+// (tools.py:190-191) — so a generation with NO keyframe supplied still carries the
+// marker. A port that made this conditional would render every clip missing a
+// trained term while every shape, every token count and every finite-value check
+// stayed green.
+TEST_CASE("ltx2 keyframes: the first latent frame is marked with NO keyframe supplied") {
+  vllm::Ltx2VideoLatentShape shape;
+  shape.batch = 1;
+  shape.channels = 4;
+  shape.frames = 3;
+  shape.height = 2;
+  shape.width = 2;
+
+  // No keyframe, no conditioning item, no image — the plainest possible request.
+  const std::vector<float> mask = vllm::Ltx2FirstFrameKeyframesMask(shape, /*patch_size=*/1);
+  const int64_t tokens = vllm::Ltx2VideoTokenCount(shape, 1);
+  REQUIRE(static_cast<int64_t>(mask.size()) == tokens);
+
+  vllm::Ltx2VideoLatentShape one = shape;
+  one.frames = 1;
+  const int64_t per_frame = vllm::Ltx2VideoTokenCount(one, 1);
+  REQUIRE(per_frame > 0);
+  REQUIRE(per_frame < tokens);  // or "first frame" and "every token" coincide
+  int64_t marked = 0;
+  for (int64_t i = 0; i < tokens; ++i) {
+    CAPTURE(i);
+    CHECK(mask[static_cast<size_t>(i)] == (i < per_frame ? 1.0F : 0.0F));
+    if (mask[static_cast<size_t>(i)] > 0.0F) ++marked;
+  }
+  CHECK(marked == per_frame);
+
+  // The same rule the state builder applies, so the two cannot drift.
+  vllm::Ltx2ScaleFactors factors;
+  std::vector<float> from_state;
+  (void)vllm::Ltx2CreateVideoLatentState(shape, /*patch_size=*/1, factors, /*fps=*/24.0,
+                                         /*causal_fix=*/true, /*initial_latent=*/nullptr,
+                                         &from_state);
+  CHECK(from_state == mask);
+}
+
+// The three lines of maths on their own, against upstream's own function run on
+// the identical `patchify_proj(latent)` rows.
+TEST_CASE("ltx2 brick: apply_keyframes_absolute_embedding") {
+  const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const int64_t b = vllm_test::kLtx2Batch;
+  const int64_t tv = vllm_test::kLtx2VideoTokens;
+  const int64_t dim = p.inner_dim();
+
+  // The parameter itself must be bound, and bound to the right tensor.
+  REQUIRE(set.weights.keyframes_abs_pos_embedding.data != nullptr);
+  REQUIRE(set.weights.keyframes_abs_pos_embedding.rank == 2);
+  CHECK(set.weights.keyframes_abs_pos_embedding.shape[0] == 1);
+  CHECK(set.weights.keyframes_abs_pos_embedding.shape[1] == dim);
+  const std::vector<float> bound(set.weights.keyframes_abs_pos_embedding.Ptr<float>(),
+                                 set.weights.keyframes_abs_pos_embedding.Ptr<float>() + dim);
+  CHECK(MaxAbsDiff(bound, vllm_test::kLtx2KeyframesEmbedding, static_cast<size_t>(dim)) <
+        kRoundOff);
+
+  const std::vector<float> mask = KeyframesMaskFromGolden();
+  const float* emb = vllm_test::kLtx2KeyframesEmbedding;
+
+  // `hidden_states + mask * embedding`, computed the way the port computes it,
+  // against upstream's own output for the same input.
+  std::vector<float> got(vllm_test::kLtx2KeyframesHidden,
+                         vllm_test::kLtx2KeyframesHidden + b * tv * dim);
+  for (int64_t r = 0; r < b * tv; ++r) {
+    if (!(mask[static_cast<size_t>(r)] > 0.0F)) continue;
+    for (int64_t c = 0; c < dim; ++c) got[static_cast<size_t>(r * dim + c)] += emb[c];
+  }
+  CHECK(MaxAbsDiff(got, vllm_test::kLtx2KeyframesApplied, static_cast<size_t>(b * tv * dim)) <
+        kRoundOff);
+
+  // WHICH tokens moved, stated per row rather than as an aggregate: a marked row
+  // must differ from its input by EXACTLY the bias, and an unmarked row must be
+  // untouched. A port that applied the bias to the wrong frame passes an
+  // aggregate norm and fails here.
+  int64_t moved = 0;
+  for (int64_t r = 0; r < b * tv; ++r) {
+    CAPTURE(r);
+    const bool marked = mask[static_cast<size_t>(r)] > 0.0F;
+    for (int64_t c = 0; c < dim; ++c) {
+      const size_t i = static_cast<size_t>(r * dim + c);
+      const double want = static_cast<double>(vllm_test::kLtx2KeyframesHidden[i]) +
+                          (marked ? static_cast<double>(emb[c]) : 0.0);
+      CHECK(std::fabs(static_cast<double>(vllm_test::kLtx2KeyframesApplied[i]) - want) <
+            kRoundOff);
+    }
+    if (marked) ++moved;
+  }
+  CHECK(moved == vllm_test::kLtx2KeyframesTokensPerLatentFrame * b);
+
+  // The `keyframes_mask is None` exit (:37-38): upstream returns `hidden_states`
+  // itself, so this is a BIT-for-BIT identity, not a tolerance.
+  for (int64_t i = 0; i < b * tv * dim; ++i) {
+    CAPTURE(i);
+    CHECK(vllm_test::kLtx2KeyframesUnmarked[i] == vllm_test::kLtx2KeyframesHidden[i]);
+  }
+}
+
+TEST_CASE("ltx2 forward: the keyframe marker arm") {
+  const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  BuildModalities(&m, false);
+  const std::vector<float> mask = KeyframesMaskFromGolden();
+  m.video.keyframes_mask = mask.data();
+  const vllm::Ltx2DitOutputs out =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  const size_t vcount = static_cast<size_t>(m.video.batch * m.video.tokens * p.out_channels);
+  const size_t acount =
+      static_cast<size_t>(m.audio.batch * m.audio.tokens * p.audio_out_channels);
+  const double vdiff = MaxAbsDiff(out.video, vllm_test::kLtx2ForwardKeyframesVideo, vcount);
+  const double adiff = MaxAbsDiff(out.audio, vllm_test::kLtx2ForwardKeyframesAudio, acount);
+  MESSAGE("max|diff| video=" << vdiff << " audio=" << adiff);
+  CHECK(vdiff < kRoundOff);
+  CHECK(adiff < kRoundOff);
+}
+
+// Flag ON, marker ABSENT — upstream's `keyframes_mask is None` early return
+// carried all the way through a full forward. A port that applied the bias
+// unconditionally (to every token, or whenever the parameter exists) reproduces
+// the MARKED numbers here and fails.
+TEST_CASE("ltx2 forward: the parameter alone applies NOTHING without the marker") {
+  const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  BuildModalities(&m, false);
+  REQUIRE(m.video.keyframes_mask == nullptr);
+  const vllm::Ltx2DitOutputs out =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  const size_t vcount = static_cast<size_t>(m.video.batch * m.video.tokens * p.out_channels);
+  const size_t acount =
+      static_cast<size_t>(m.audio.batch * m.audio.tokens * p.audio_out_channels);
+  CHECK(MaxAbsDiff(out.video, vllm_test::kLtx2ForwardKeyframesNoMaskVideo, vcount) < kRoundOff);
+  CHECK(MaxAbsDiff(out.audio, vllm_test::kLtx2ForwardKeyframesNoMaskAudio, acount) < kRoundOff);
+}
+
+// THE INSTRUMENT THAT MAKES THE ARM ABOVE MEAN SOMETHING, and the reason the
+// generator TRAINS the parameter rather than leaving it at upstream's
+// zero-initialization: a zero bias is an exact no-op, because the term is ADDED.
+//
+// Measured on this fixture (generator stderr, and the comment block at the end of
+// ltx2_goldens.inc): supplying the marker moves the DiT's video output by 0.278,
+// which is 71.5% of max|unmarked| and five orders of magnitude above kRoundOff.
+// The audio row moves too, by 1.49%, and only through the audio<->video cross
+// attention — nothing adds this bias to the audio stream.
+TEST_CASE("ltx2 forward: the keyframe marker is LOAD-BEARING, not decoration") {
+  const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const size_t vcount = static_cast<size_t>(vllm_test::kLtx2Batch *
+                                            vllm_test::kLtx2VideoTokens * p.out_channels);
+  const size_t acount = static_cast<size_t>(vllm_test::kLtx2Batch *
+                                            vllm_test::kLtx2AudioTokens * p.audio_out_channels);
+  // Both operands are goldens, so the vector-taking overload does not apply;
+  // `MaxAbsDiffScan` is the same reduction with the same non-finite polarity.
+  const vllm_test::MaxAbsDiffScanResult vscan = vllm_test::MaxAbsDiffScan(
+      vllm_test::kLtx2ForwardKeyframesNoMaskVideo, vllm_test::kLtx2ForwardKeyframesVideo, vcount);
+  const vllm_test::MaxAbsDiffScanResult ascan = vllm_test::MaxAbsDiffScan(
+      vllm_test::kLtx2ForwardKeyframesNoMaskAudio, vllm_test::kLtx2ForwardKeyframesAudio, acount);
+  REQUIRE(vscan.ok());
+  REQUIRE(ascan.ok());
+  const double vdiff = vscan.worst;
+  const double adiff = ascan.worst;
+  MESSAGE("marked vs unmarked: video=" << vdiff << " audio=" << adiff);
+  CHECK(vdiff > 20.0 * kRoundOff);
+  CHECK(adiff > 20.0 * kRoundOff);
+
+  // And the flag-OFF arm: with the parameter absent entirely, upstream's provider
+  // yields None and the marker cannot apply, so the no-mask forward must equal
+  // the flag-OFF forward BIT-for-BIT over the shared weight stream.
+  for (size_t i = 0; i < vcount; ++i) {
+    CAPTURE(i);
+    CHECK(vllm_test::kLtx2ForwardKeyframesNoMaskVideo[i] == vllm_test::kLtx2ForwardSplitVideo[i]);
+  }
+}
+
+// A marker handed to a stream that has no parameter is REFUSED, not dropped.
+// Upstream builds the AUDIO args preprocessor with no keyframes_embedding_provider
+// at all (model.py:333 against :314), so an audio marker cannot mean anything;
+// and a model whose checkpoint omitted the parameter leaves it on `meta`
+// (supports_keyframes_abs_pos_embedding, model.py:166-173).
+TEST_CASE("ltx2 keyframes: a marker with no parameter is REFUSED, not silently dropped") {
+  const std::vector<float> vmask = KeyframesMaskFromGolden();
+
+  SUBCASE("the AUDIO stream never carries one") {
+    const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+    WeightSet set = BuildWeights(p);
+    Modalities m;
+    BuildModalities(&m, false);
+    std::vector<float> amask(
+        static_cast<size_t>(vllm_test::kLtx2Batch * vllm_test::kLtx2AudioTokens), 1.0F);
+    m.audio.keyframes_mask = amask.data();
+    CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
+  }
+
+  SUBCASE("a flag-OFF model handed a video marker") {
+    const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+    WeightSet set = BuildWeights(p);
+    Modalities m;
+    BuildModalities(&m, false);
+    m.video.keyframes_mask = vmask.data();
+    CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
+  }
+
+  SUBCASE("the flag set with the view UNBOUND, which is not a zero bias") {
+    // The pairing IS `supports_keyframes_abs_pos_embedding` (model.py:166-173):
+    // a config that says the parameter exists and a weight map that does not
+    // carry it cannot both be believed. A default-constructed `vt::Tensor` here
+    // would read as a zero-length bias — no bias at all — on a model whose
+    // config says it has one.
+    const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+    WeightSet set = BuildWeights(p);
+    Modalities m;
+    BuildModalities(&m, false);
+    m.video.keyframes_mask = vmask.data();
+    // Bound is fine — the positive control for the swap below.
+    REQUIRE(set.weights.keyframes_abs_pos_embedding.data != nullptr);
+    CHECK_NOTHROW(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
+    set.weights.keyframes_abs_pos_embedding = vt::Tensor{};
+    CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
+  }
+}
+
+// THE MEMORY-FORMAT CHECK. Upstream casts BOTH operands to `hidden_states.dtype`
+// (transformer_args.py:42-43) and there is no wider accumulator anywhere on this
+// path. `hidden_states` is f32 throughout this TU (the DTYPE note at the top of
+// ltx2.h), so the addend must be f32 too — and the FP8 arm materializes this
+// tensor as BF16 (MaterializeDitTensor's F8_E4M3 arm), reaching f32 only through
+// `Ltx2WidenDitToF32`. A bf16 view read as f32 would consume two lanes per float:
+// finite, plausible, and invisible to any output check. So it is asserted.
+TEST_CASE("ltx2 keyframes: a bf16 embedding view is REFUSED by the f32 forward") {
+  const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  BuildModalities(&m, false);
+  const std::vector<float> mask = KeyframesMaskFromGolden();
+  m.video.keyframes_mask = mask.data();
+
+  // Same bytes, same shape, wrong DTYPE — which is exactly the shape of the
+  // defect: a checkpoint loaded without `widen_to_f32`.
+  const int64_t dim = p.inner_dim();
+  std::vector<uint16_t> narrow(static_cast<size_t>(dim), 0x3F80);
+  set.weights.keyframes_abs_pos_embedding =
+      vt::Tensor::Contiguous(narrow.data(), vt::DType::kBF16, vt::Device{}, {1, dim});
+  CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
 }
 
 TEST_CASE("ltx2 forward: a single-stream model type is REFUSED") {

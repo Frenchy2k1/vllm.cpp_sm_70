@@ -109,14 +109,26 @@
 //
 // UNPORTED. `Ltx2LoadDitFromSafetensors` REFUSES the load by naming these, and
 // only an explicit `allow_unported_modules` — which exists so the ported subset
-// stays gateable — proceeds, still reporting every one of them in `unported`:
+// stays gateable — proceeds, still reporting every one of them in `unported`.
+//
+// THAT GROUP IS NOW EMPTY for both shipped DiTs. It last held
+// `keyframes_abs_pos_embedding [1, 4096]`, which row LTX25-KEYFRAMES-ABS-POS
+// (.agents/specs/ltx25-keyframes-abs-pos.md, issue #658) ported on 2026-08-14 —
+// see the PORTED paragraph below.
+//
+// PORTED 2026-08-14 — no longer named in that refusal:
 //
 //   keyframes_abs_pos_embedding  [1, 4096]
-//       So `use_keyframes_abs_pos_embedding = TRUE`, contradicting ltx2.h:47-49.
-//       This is now the ONLY flag `Ltx2AdoptDeclaredDitParams` clears in its
-//       config copy, and it must stay that way: a flag cleared there is invisible
-//       to the contract-equality check, so clearing a PORTED one silently drops
-//       its tensors.
+//       Trained on the vonkaiser FP8 DiT: `F8_E4M3` with an `F32` scale, 4096 of
+//       4096 bytes NON-ZERO. Upstream adds it to every token the keyframes mask
+//       marks (model.py:217-219, transformer_args.py:23-43 called once at :269),
+//       and `_first_frame_keyframes_mask` marks the target's first latent frame
+//       UNCONDITIONALLY (tools.py:186-196), so it is live on every render.
+//       `Ltx2AdoptDeclaredDitParams` no longer force-clears the flag under
+//       `allow_unported_modules`; it resolves `supports_keyframes_abs_pos_embedding`
+//       (model.py:166-173) against what the file carries, which is what lets the
+//       first-party NVFP4 DiT — flag declared, tensor absent — load and apply
+//       nothing, exactly as upstream's meta-device load does.
 //
 // PORTED 2026-08-13 — no longer named in that refusal:
 //
@@ -525,23 +537,29 @@ nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file);
 // engine (`Ltx2VideoEngine::Load`) and the device gate, which drives
 // `Ltx2StreamDitToDevice` directly and therefore owes the same adoption.
 //
-// `allow_unported_modules` clears `use_keyframes_abs_pos_embedding` IN A COPY of
-// the config before parsing: the flag is cleared for the CONTRACT, the module
-// stays unported, and the checkpoint's `unported` list still names it. Without
-// the opt-in `ParseLtx2DitParams` throws, which is the refusal.
+// THE ONE KEY IT RESOLVES RATHER THAN BELIEVES is
+// `use_keyframes_abs_pos_embedding`, and it is a MIRROR, not an escape hatch.
+// Upstream's `supports_keyframes_abs_pos_embedding` (model.py:166-173) is False
+// for "the config set the flag but the checkpoint carried no weight for it",
+// because models are built on the meta device and loaded with
+// `strict=False, assign=True`, so such a parameter stays on `meta` and the add is
+// never reached. So a declared flag over a file that omits the tensor is cleared
+// in a COPY of the config before parsing — no refusal, and no synthesised zero.
+// That case is the shipped first-party NVFP4 DiT exactly.
 //
-// IT CLEARS EXACTLY THAT ONE FLAG, and the scoping is the rule, not an accident.
-// It also used to clear `use_prompt_adaln_single`, whose module has been ported
-// since 2026-08-13 — so the opt-in a real render REQUIRES was silently turning a
+// This USED TO be conditioned on `allow_unported_modules`, which made a real
+// render's opt-in decide a correctness question; that parameter is gone. It also
+// used to clear `use_prompt_adaln_single`, whose module has been ported since
+// 2026-08-13 — so the opt-in a real render REQUIRES was silently turning a
 // correctness setting off, and the contract-equality check below could not see it
-// because both sides had been forced to the same cleared value. A ported module's
-// flag belongs in the contract; only a module nothing applies may be cleared here.
+// because both sides had been forced to the same cleared value. Nothing else is
+// cleared here: every other flag belongs in the contract, where that check can see
+// it.
 //
 // `source` names the config in every refusal, so a reader knows whether the
 // checkpoint declared it or a caller supplied it.
 Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
                                          const Ltx2DitParams& from_shapes,
-                                         bool allow_unported_modules,
                                          const std::string& source);
 
 // ---------------------------------------------------------------------------

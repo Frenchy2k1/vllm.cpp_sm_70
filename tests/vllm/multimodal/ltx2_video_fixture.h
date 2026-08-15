@@ -256,6 +256,22 @@ inline vllm::Ltx2DitParams ReducedDitParams() {
   // than a configuration nothing ships, and the whole video engine renders
   // through the prompt-side AdaLN path (.agents/specs/ltx25-prompt-adaln.md).
   p.use_prompt_adaln_single = true;
+  // TRUE, exactly as the shipped vonkaiser FP8 DiT resolves it: that file carries
+  // `keyframes_abs_pos_embedding` `F8_E4M3 [1, 4096]` with 4096 of 4096 bytes
+  // NON-ZERO, so `supports_keyframes_abs_pos_embedding` (model.py:166-173) holds
+  // for it and the marker is live on every forward.
+  //
+  // THE FIXTURE CARRIES IT SO THE ENGINE PATH IS EXERCISED AT ALL. With the flag
+  // off, `Ltx2VideoEngine` never hands the DiT a marker, and a defect that made
+  // the marker CONDITIONAL — the one this module invites — was measured to leave
+  // all five LTX-2.5 suites green. With it on, every e2e render in this file goes
+  // through `apply_keyframes_absolute_embedding`
+  // (.agents/specs/ltx25-keyframes-abs-pos.md, issue #658).
+  //
+  // The first-party NVFP4 DiT is the OTHER case and is covered by its own
+  // env-gated test: it declares the flag and carries no tensor, which upstream's
+  // meta-device load turns into "apply nothing".
+  p.use_keyframes_abs_pos_embedding = true;
   p.ff_bias = false;                // LTX-2.5 (gemma4) sets ff_bias=false
   p.audio_ff_bias = true;
   return p;
@@ -402,6 +418,11 @@ inline nlohmann::json ReducedDitTransformerConfig(
   transformer["audio_cross_attention_dim"] = params.audio_cross_attention_dim;
   transformer["apply_gated_attention"] = params.apply_gated_attention;
   transformer["cross_attention_adaln"] = params.cross_attention_adaln;
+  // Written EXPLICITLY, because `Ltx2AdoptDeclaredDitParams` resolves this key
+  // against the file's shapes: a config that omitted it while the fixture writes
+  // the tensor would describe a different weight contract and be refused. The
+  // shipped first-party NVFP4 config declares it TRUE the same way.
+  transformer["use_keyframes_abs_pos_embedding"] = params.use_keyframes_abs_pos_embedding;
   transformer["ff_bias"] = params.ff_bias;
   transformer["rope_type"] = "split";
   transformer["use_middle_indices_grid"] = params.use_middle_indices_grid;

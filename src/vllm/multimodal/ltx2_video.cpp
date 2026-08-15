@@ -170,6 +170,11 @@ struct StreamState {
   std::vector<float> latent, clean;  // [tokens, width]
   std::vector<float> mask;           // [tokens], patchified denoise mask
   std::vector<double> positions;     // [n_pos_dims, tokens, 2]
+  // `_first_frame_keyframes_mask` (tools.py:186-196), [tokens]. VIDEO only, and
+  // populated on EVERY generation — the rule has no branch on whether a keyframe
+  // was supplied. Empty on the audio stream, whose args preprocessor upstream
+  // builds with no keyframes_embedding_provider (model.py:333).
+  std::vector<float> keyframes_mask;
 };
 
 // `post_process_latent` (utils/helpers.py:462-464):
@@ -700,8 +705,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // `Ltx2AdoptDeclaredDitParams` (ltx2_loader.h) is the ONE place the adoption
     // rule lives, because the device gate drives `Ltx2StreamDitToDevice` without
     // this engine and owes the same check; two copies would be two rules.
-    const Ltx2DitParams declared = Ltx2AdoptDeclaredDitParams(
-        dit_config, im.dit.params, dit_options.allow_unported_modules, source);
+    const Ltx2DitParams declared =
+        Ltx2AdoptDeclaredDitParams(dit_config, im.dit.params, source);
     im.dit.params = declared;
   }
 
@@ -1251,8 +1256,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "these tokens the embedding contributes nothing, and porting it would not serve this "
         "arm. The tokens that DO reach it are the target's own first latent frame, marked "
         "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
-        "is the frame the SERVED first-frame arm writes into. That omission is real and is "
-        "tracked as issue #658; it is not what blocks a last-frame keyframe.");
+        "is the frame the SERVED first-frame arm writes into. That omission WAS real; row "
+        "LTX25-KEYFRAMES-ABS-POS closed it on 2026-08-14 (issue #658), so the marker is now "
+        "applied on every render. It was never what blocks a last-frame keyframe.");
   }
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
     Fail(
@@ -1483,6 +1489,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video.latent = Ltx2VideoPatchify(volume.data(), vshape, 1);
       video.clean = video.latent;
       video.mask.assign(static_cast<size_t>(video.tokens), 1.0F);
+      // tools.py:184 — `create_initial_state` returns the state with
+      // `keyframes_mask=self._first_frame_keyframes_mask(state)` ALWAYS, on the
+      // same line that builds it. Not conditioned on `wants_image`, not
+      // conditioned on any keyframe: the marker is a fact about the causal
+      // encoder's first latent frame, which spans a single pixel frame while
+      // every later one spans `temporal_scale_factor`.
+      video.keyframes_mask = Ltx2FirstFrameKeyframesMask(vshape, /*patch_size=*/1);
       const std::vector<int64_t> bounds = Ltx2VideoPatchBounds(vshape, 1);
       const std::vector<int64_t> pixels = Ltx2PixelCoords(bounds, 1, video.tokens, factors, true);
       // `positions = get_pixel_coords(...).float()` then
@@ -1650,6 +1663,54 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
       vin.context = video_context;
+      // transformer_args.py:269 through modality.py:63. Handed over only when the
+      // model HAS the parameter: a mask on a model without one is refused by the
+      // forward, and upstream's own `supports_keyframes_abs_pos_embedding`
+      // (model.py:166-173) is exactly this condition. The mask itself is built
+      // unconditionally above, because it is data about the latent.
+      //
+      // THE EMPTINESS IS CHECKED, and that is not defensive noise. Making the
+      // mask conditional — on `wants_image`, on a keyframe, on anything — is the
+      // one defect this module invites, and it is INVISIBLE to every output
+      // check: the render stays finite, the right shape, the right token count,
+      // and simply omits a trained term. Without this line a conditional mask
+      // reaches the DiT as `data()` on an empty vector, which is a null pointer
+      // and therefore upstream's legal "no token is marked" — a silent drop
+      // dressed as a supported path. MEASURED: with the mask made conditional
+      // and this check absent, all five LTX-2.5 suites stayed GREEN.
+      if (im.dit.params.use_keyframes_abs_pos_embedding) {
+        VT_CHECK(static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens,
+                 "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so every forward owes "
+                 "the marker `_first_frame_keyframes_mask` builds (ltx_core/tools.py:184-196) — "
+                 "one value per video token, populated on EVERY generation whether or not a "
+                 "keyframe was supplied. Handing the forward no marker would render without a "
+                 "trained term and look exactly like a working render.");
+        vin.keyframes_mask = video.keyframes_mask.data();
+      }
+      // AND THE HANDOVER IS CHECKED SEPARATELY FROM THE CONSTRUCTION, because the
+      // check above cannot see the handover. It reads `video.keyframes_mask` — the
+      // VECTOR — so it fires when the mask is built conditionally and stays silent
+      // when the ASSIGNMENT is. MEASURED: with the vector left unconditional and
+      // this assignment written `if (wants_image) vin.keyframes_mask = ...`, all
+      // five LTX-2.5 suites stayed GREEN while the rendered pixels moved — frame 0
+      // went from a flat 127 to a flat 130 — so the drop was real and nothing in
+      // the tree named it. Two sites, one invariant, and the earlier guard covered
+      // only one of them.
+      //
+      // `vin.keyframes_mask` is the field `Ltx2DitForward` reads, so it is the only
+      // fact that decides whether the trained term is applied. The condition stays
+      // on the flag rather than becoming a bare `!= nullptr`: a DiT that does NOT
+      // carry the parameter must reach the forward with a null marker, which is
+      // upstream's `keyframes_mask is None` exit and is itself gated at
+      // `ltx2_dit.cpp`'s `m.keyframes_mask == nullptr || keyframes_embedding !=
+      // nullptr`. Handing that model a marker would be a refusal, not a fix.
+      VT_CHECK(!im.dit.params.use_keyframes_abs_pos_embedding || vin.keyframes_mask != nullptr,
+               "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so the forward owes the "
+               "marker on EVERY step — and this forward was handed none. "
+               "`_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) is built on the same "
+               "line as the state, unconditionally, whether or not a keyframe or an image was "
+               "supplied. A marker that is BUILT and then not HANDED OVER renders without a "
+               "trained term and looks exactly like a working render.");
 
       Ltx2ModalityInput ain;
       ain.batch = 1;

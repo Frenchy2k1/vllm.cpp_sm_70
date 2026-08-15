@@ -894,13 +894,37 @@ TEST_CASE("ltx2 loader: the L2 contract's every name is present in the shipped D
   // (.agents/specs/ltx-2-5.md §1.2) and the module is PORTED
   // (.agents/specs/ltx25-prompt-adaln.md, issue #644).
   CHECK(p.use_prompt_adaln_single);
+  // MEASURED the same way: the SHIPPED vonkaiser FP8 checkpoint carries
+  // `keyframes_abs_pos_embedding`, so `supports_keyframes_abs_pos_embedding`
+  // (model.py:166-173) holds for it and the marker is live on every forward.
+  // This is the file's OWN evidence that ltx2.h's old "LTX-2.5's checkpoint does
+  // not carry the parameter" was false (row LTX25-KEYFRAMES-ABS-POS, issue #658).
+  CHECK(p.use_keyframes_abs_pos_embedding);
+  {
+    // The tensor the flag was resolved from, named and shaped, with a positive
+    // control in the same loop so "found it" is not an artefact of the search.
+    int64_t found = 0;
+    int64_t control = 0;
+    for (const Ltx2TensorSpec& spec : manifest) {
+      if (spec.name == "keyframes_abs_pos_embedding") {
+        ++found;
+        CHECK(spec.shape == std::vector<int64_t>{1, 4096});
+      }
+      if (spec.name == "patchify_proj.weight") ++control;
+    }
+    CHECK(found == 1);
+    CHECK(control == 1);
+  }
 
   // Enumerate the contract AS THE FILE DESCRIBES IT — no flag is forced here any
   // more — and require every one of its names in the file. This line used to read
   // `contract.use_prompt_adaln_single = false`, which is the shape of the defect:
   // the gate agreed with the port about a module they were both dropping.
   const std::vector<Ltx2TensorSpec> want = vllm::EnumerateLtx2DitTensors(p);
-  CHECK(want.size() == 4078 + 12);
+  //   4078 = the original L2 contract
+  //     12 = prompt_adaln_single + audio_prompt_adaln_single (issue #644)
+  //      1 = keyframes_abs_pos_embedding (issue #658)
+  CHECK(want.size() == 4078 + 12 + 1);
   int64_t missing = 0;
   std::string first_missing;
   for (const Ltx2TensorSpec& spec : want) {
@@ -916,16 +940,19 @@ TEST_CASE("ltx2 loader: the L2 contract's every name is present in the shipped D
   // ... and account for every name the file has that the contract does not, so
   // "the rest is fine" is a counted claim rather than a hope.
   //   258 = 2 connectors x (8 blocks x 16 + 1 learnable_registers)
-  //     1 = keyframes_abs_pos_embedding
-  // The 12 prompt-AdaLN tensors are no longer here: they moved INTO `want` when
-  // the module was ported, which is the whole delta this row landed.
+  // NOTHING ELSE. `keyframes_abs_pos_embedding` used to be the `+ 1` on this
+  // line; it moved INTO `want` when row LTX25-KEYFRAMES-ABS-POS ported it, which
+  // is the whole delta this row lands — exactly as the 12 prompt-AdaLN tensors
+  // did before it. The unported group is now EMPTY for this checkpoint, and the
+  // only names outside the DiT contract are the two connectors, which
+  // `Ltx2LoadConnectorWeights` owns.
   std::set<std::string> want_set;
   for (const Ltx2TensorSpec& spec : want) want_set.insert(spec.name);
   int64_t extra = 0;
   for (const std::string& name : present) {
     if (want_set.count(name) == 0) ++extra;
   }
-  CHECK(extra == 258 + 1);
+  CHECK(extra == 258);
 }
 
 // ===========================================================================
@@ -1544,9 +1571,14 @@ TEST_CASE("ltx2 loader: a missing tensor throws BY NAME and never reads as zeros
 
 TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed") {
   const Ltx2DitParams p = TinyParams();
+  // `caption_projection` is the 19B form the DiT would carry under
+  // `caption_proj_before_connector=false` (text_projection.py:31-38), which phase
+  // L3 owes. It replaced `keyframes_abs_pos_embedding` here when row
+  // LTX25-KEYFRAMES-ABS-POS ported that one (issue #658) — the mechanism is what
+  // this case gates, and it needs SOME family that is genuinely unported.
   const SyntheticDit syn = BuildSyntheticDit(
       p, Ltx2DitQuant::kFp8,
-      {"keyframes_abs_pos_embedding", "video_embeddings_connector.learnable_registers",
+      {"caption_projection.linear_1.weight", "video_embeddings_connector.learnable_registers",
        "audio_embeddings_connector.learnable_registers"});
   const std::string path = TmpPath("unported");
   WriteSafetensors(syn.entries, path);
@@ -1561,8 +1593,9 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const std::string what_msg = "what: " + what;
   INFO(what_msg);
   // ONE family in the LIST now, not five. `prompt_adaln_single` /
-  // `audio_prompt_adaln_single` left it when they were PORTED (issue #644); the
-  // case below proves a checkpoint carrying them needs no opt-in at all.
+  // `audio_prompt_adaln_single` left it when they were PORTED (issue #644), and
+  // `keyframes_abs_pos_embedding` left it for the same reason (issue #658); the
+  // cases below prove a checkpoint carrying either needs no opt-in at all.
   //
   // The list is asserted as a whole rather than by substring, because the message
   // deliberately goes on to NAME the families that are not in it — a
@@ -1571,7 +1604,10 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const size_t at = what.find(head);
   REQUIRE(at != std::string::npos);
   const std::string list = what.substr(at + head.size(), what.find('.', at) - at - head.size());
-  CHECK(list == "keyframes_abs_pos_embedding");
+  CHECK(list == "caption_projection");
+  // ASSERTED AS AN ABSENCE, with the positive control right above it: the retired
+  // family must not reappear in the refusal list.
+  CHECK(list.find("keyframes_abs_pos_embedding") == std::string::npos);
 
   // THE TWO CONNECTOR FAMILIES ARE NOT UNPORTED AS OF PHASE L9c. They are
   // outside the DiT's contract by design — upstream loads them into the text
@@ -1609,6 +1645,59 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const vllm::Ltx2DitCheckpoint conn_ck = vllm::Ltx2LoadDitFromSafetensors(conn_file);
   CHECK(conn_ck.unported.empty());
   std::remove(conn_path.c_str());
+}
+
+// REPLACES the half of the case above that used `keyframes_abs_pos_embedding` as
+// its unported example. The module is ported now (row LTX25-KEYFRAMES-ABS-POS,
+// issue #658), so what is gated here is the OPPOSITE claim: a checkpoint carrying
+// it loads with NO opt-in, resolves the flag, and BINDS the tensor rather than
+// stepping over it. That is what neither shipped LTX-2.5 DiT could do before.
+TEST_CASE("ltx2 loader: a keyframes-carrying checkpoint loads with NO opt-in") {
+  Ltx2DitParams p = TinyParams();
+  p.use_keyframes_abs_pos_embedding = true;
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string path = TmpPath("keyframes");
+  WriteSafetensors(syn.entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  // No `allow_unported_modules`. Before this row this threw by name.
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.unported.empty());
+  // Resolved from the file's own shapes, which is the only evidence a manifest
+  // carries — `supports_keyframes_abs_pos_embedding` (model.py:166-173).
+  CHECK(ck.params.use_keyframes_abs_pos_embedding);
+
+  // BOUND, not merely enumerated. A contract entry nothing binds is the exact
+  // failure mode the prompt-AdaLN row found (issue #644 row 0).
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.data != nullptr);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.rank == 2);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[0] == 1);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[1] == p.inner_dim());
+
+  // THE FP8 CONVENTION, stated rather than assumed. The synthetic file stores
+  // this tensor exactly as the shipped vonkaiser DiT does — `F8_E4M3` plus a
+  // scalar `F32` `<name>_scale` — and `MaterializeDitTensor`'s F8_E4M3 arm is the
+  // ONE convention that reads it: `ReadScalarF32` then `DequantFp8ToBf16`, giving
+  // a BF16 view. No second convention was invented for a rank-2 [1, D] tensor.
+  CHECK(ck.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+  {
+    const auto want = syn.expected.find("keyframes_abs_pos_embedding");
+    REQUIRE(want != syn.expected.end());
+    const uint16_t* got = ck.weights.keyframes_abs_pos_embedding.Ptr<uint16_t>();
+    REQUIRE(want->second.size() == static_cast<size_t>(p.inner_dim()));
+    for (size_t i = 0; i < want->second.size(); ++i) {
+      CAPTURE(i);
+      CHECK(got[i] == want->second[i]);
+    }
+  }
+
+  // ... and the f32 widening the L2 forward requires reaches it too, so the
+  // dtype assertion in `PrepareStream` is satisfiable rather than a dead end.
+  Ltx2DitLoadOptions widen;
+  widen.widen_to_f32 = true;
+  const vllm::Ltx2DitCheckpoint wide = vllm::Ltx2LoadDitFromSafetensors(file, widen);
+  CHECK(wide.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kF32);
+  std::remove(path.c_str());
 }
 
 // THE REGRESSION GATE FOR ISSUE #644 ROW 0.
@@ -1666,15 +1755,11 @@ TEST_CASE("ltx2 loader: a DiT carrying prompt_adaln_single loads with NO opt-in"
   std::remove(path2.c_str());
 }
 
-// The DECLARED config path. `Ltx2AdoptDeclaredDitParams` no longer forces both
-// sides of its comparison to a cleared flag, so a config that disagrees with the
-// file's shapes about `use_prompt_adaln_single` now produces two DIFFERENT
-// contracts and is refused — which is an INPUT-driven gate, not a mutation-only
-// one. Both directions are checked, because the equality is the point.
-TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is REFUSED") {
-  Ltx2DitParams shapes = TinyParams();
-  shapes.use_prompt_adaln_single = true;
-
+// The `transformer` object `ParseLtx2DitParams` needs in order to say YES: every
+// geometry key the shapes carry, plus every `check_config_value` the configurator
+// asserts verbatim (model_configurator.py:26-44). Shared by the two adoption
+// cases below so neither drifts from the other's idea of a valid config.
+nlohmann::json MinimalTransformerConfig(const Ltx2DitParams& shapes) {
   nlohmann::json t;
   t["num_attention_heads"] = shapes.num_attention_heads;
   t["attention_head_dim"] = shapes.attention_head_dim;
@@ -1712,28 +1797,111 @@ TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is
   t["av_cross_ada_norm"] = true;
   t["use_middle_indices_grid"] = true;
   t["caption_proj_before_connector"] = true;
+  return t;
+}
+
+// The DECLARED config path. `Ltx2AdoptDeclaredDitParams` no longer forces both
+// sides of its comparison to a cleared flag, so a config that disagrees with the
+// file's shapes about `use_prompt_adaln_single` now produces two DIFFERENT
+// contracts and is refused — which is an INPUT-driven gate, not a mutation-only
+// one. Both directions are checked, because the equality is the point.
+TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is REFUSED") {
+  Ltx2DitParams shapes = TinyParams();
+  shapes.use_prompt_adaln_single = true;
+  const nlohmann::json t = MinimalTransformerConfig(shapes);
 
   nlohmann::json agreeing;
   agreeing["transformer"] = t;
   agreeing["transformer"]["use_prompt_adaln_single"] = true;
   // Agreement is adopted, and carries the flag through.
   const Ltx2DitParams adopted =
-      vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes, false, "the test config");
+      vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes, "the test config");
   CHECK(adopted.use_prompt_adaln_single);
 
   nlohmann::json disagreeing;
   disagreeing["transformer"] = t;
   disagreeing["transformer"]["use_prompt_adaln_single"] = false;
-  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, false, "the test config"));
-  // The opt-in must not rescue it: clearing a PORTED flag in the config copy is
-  // exactly what made this comparison blind before.
-  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, true, "the test config"));
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, "the test config"));
 
   // And the other direction: shapes WITHOUT the module against a config that
   // declares it.
   Ltx2DitParams shapes_off = shapes;
   shapes_off.use_prompt_adaln_single = false;
-  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes_off, false, "the test config"));
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes_off, "the test config"));
+}
+
+// REPLACES the test that asserted `use_keyframes_abs_pos_embedding` was cleared
+// only under `allow_unported_modules`. That refusal is retired (row
+// LTX25-KEYFRAMES-ABS-POS, issue #658); what took its place is upstream's
+// `supports_keyframes_abs_pos_embedding` (model.py:166-173), resolved against
+// what the FILE carries — and this asserts all three of its outcomes, plus the
+// one thing that must NOT happen.
+TEST_CASE("ltx2 loader: a declared keyframes flag is RESOLVED against the file, not refused") {
+  Ltx2DitParams shapes = TinyParams();
+  shapes.use_prompt_adaln_single = false;
+
+  nlohmann::json t = MinimalTransformerConfig(shapes);
+  t["use_prompt_adaln_single"] = false;
+
+  SUBCASE("declared TRUE, tensor ABSENT: adopted as FALSE, and NOT refused") {
+    // The shipped first-party NVFP4 DiT exactly: `__metadata__` declares the
+    // flag, `declared - state_dict` is precisely this one key, and upstream's
+    // meta-device load leaves the parameter unmaterialized so the add is never
+    // reached. Before this row, `ltx2.cpp` threw here unless the caller passed
+    // `allow_unported_modules` — stricter than upstream.
+    nlohmann::json cfg;
+    cfg["transformer"] = t;
+    cfg["transformer"]["use_keyframes_abs_pos_embedding"] = true;
+    REQUIRE_FALSE(shapes.use_keyframes_abs_pos_embedding);
+    const Ltx2DitParams adopted =
+        vllm::Ltx2AdoptDeclaredDitParams(cfg, shapes, "the test config");
+    CHECK_FALSE(adopted.use_keyframes_abs_pos_embedding);
+    // NOT a synthesised zero: the contract must not name the tensor at all, or a
+    // loader would go looking for a weight the file does not have.
+    const std::vector<vllm::Ltx2TensorSpec> contract = vllm::EnumerateLtx2DitTensors(adopted);
+    int64_t named = 0;
+    for (const vllm::Ltx2TensorSpec& spec : contract) {
+      if (spec.name == "keyframes_abs_pos_embedding") ++named;
+    }
+    CHECK(named == 0);
+    // Positive control for that count, so a renamed contract entry cannot make
+    // the assertion above pass by finding nothing at all.
+    int64_t control = 0;
+    for (const vllm::Ltx2TensorSpec& spec : contract) {
+      if (spec.name == "patchify_proj.weight") ++control;
+    }
+    CHECK(control == 1);
+  }
+
+  SUBCASE("declared TRUE, tensor PRESENT: adopted TRUE and the contract names it") {
+    // The vonkaiser FP8 DiT plus the first-party config it needs (that file
+    // carries no `__metadata__` at all, so its config always arrives separately).
+    Ltx2DitParams with = shapes;
+    with.use_keyframes_abs_pos_embedding = true;
+    nlohmann::json cfg;
+    cfg["transformer"] = t;
+    cfg["transformer"]["use_keyframes_abs_pos_embedding"] = true;
+    const Ltx2DitParams adopted = vllm::Ltx2AdoptDeclaredDitParams(cfg, with, "the test config");
+    CHECK(adopted.use_keyframes_abs_pos_embedding);
+    const std::vector<vllm::Ltx2TensorSpec> contract = vllm::EnumerateLtx2DitTensors(adopted);
+    REQUIRE_FALSE(contract.empty());
+    // Registration order, which no shape encodes: model.py:217 is BEFORE :230.
+    CHECK(contract[0].name == "keyframes_abs_pos_embedding");
+    CHECK(contract[0].shape == std::vector<int64_t>{1, adopted.inner_dim()});
+  }
+
+  SUBCASE("NOT declared while the file CARRIES it is a real disagreement, refused") {
+    // Upstream would build no parameter and `strict=False` would drop the key.
+    // We refuse instead, because the tensor is already BOUND by the time the
+    // config is adopted and the two would describe different contracts — the
+    // same equality every other key is held to. Named rather than silent.
+    Ltx2DitParams with = shapes;
+    with.use_keyframes_abs_pos_embedding = true;
+    nlohmann::json cfg;
+    cfg["transformer"] = t;
+    cfg["transformer"]["use_keyframes_abs_pos_embedding"] = false;
+    CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(cfg, with, "the test config"));
+  }
 }
 
 TEST_CASE("ltx2 loader: the f32 widening is OPT-IN and bit-exact over bf16") {
