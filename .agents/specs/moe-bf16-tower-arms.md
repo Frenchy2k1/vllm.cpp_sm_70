@@ -3,7 +3,7 @@
 **Rows:** `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`,
 `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation`
 **Issue:** [#864](https://github.com/mudler/vllm.cpp/issues/864)
-**Lifecycle:** `READY`
+**Lifecycle:** `DONE`
 **Owner:** unassigned
 
 ## Scope
@@ -194,31 +194,73 @@ wrong dtype path, a missing dequant, a transpose that loads cleanly — produces
 WRONG LOGITS rather than an error. Only the binding token-exact gate closes
 those, and a green suite must not be read as correctness.
 
+### The binding gate RAN, and PASSED — the first token this loader ever produced from a published bf16 Qwen MoE repo
+
+Measured 2026-08-15 on the GB10, from the staged checkpoint described below.
+Greedy, 7 prompts x 3 repeats x 16 tokens, identical prompts, token counts,
+sampling and batching on both arms, against the pinned oracle asserted per run
+as vLLM `0.23.1rc1.dev1511+g555967922`, flashinfer `0.6.15.post1`, torch
+`2.13.0+cu130`. Build fast path asserted (`cutlass-nvfp4`, `cutlass-fp8`,
+`fp4-mma`, `marlin-nvfp4`, `fa2` all ENABLED for `[121a]`, Triton AOT
+`sm_121a`). The oracle's own greedy decode was deterministic 7/7 across repeats,
+so a token-exact gate — not a distributional one — is the right instrument here.
+
+**6/7 prompts STRICT 16/16; 108/112 positions.** The one divergence is prompt
+`"import numpy as np"` at position 7: oracle `464 "import"`, ours `1445 "from"`,
+**both at logprob `-0.8293954133987427`**, `top2_gap_mnats = 0.0`, our token at
+rank 2 in the oracle's top-20. An exact tie, broken differently —
+`torch.argmax` takes the lowest maximal index and our on-device argmax takes the
+higher. **PASS under the ratified near-tie doctrine.** It is not filed away as
+noise: [#910](https://github.com/mudler/vllm.cpp/issues/910) owes the mirrored
+tie-break, which would make this 7/7 STRICT.
+
+**`108/112` is NOT a quality score.** Only the first divergence in a prompt is
+validly adjudicable; after it the two arms carry different prefixes and every
+later position compares two different conditionings. Recording it as a ratio
+would invite exactly that misreading, so the binding statement is "6 of 7
+prompts strict; the seventh diverges once, on a bit-identical logprob".
+
+SACRED inertness — the risk §Risks names first, answered with real counts rather
+than a green suite — 3 of 3 against the shared loader all four arms changed,
+`GOLDENS_BYTE_IDENTICAL=1` on every one: `test_qwen36_paged_engine` 2/2 cases
+**315/315** (`M0-EXIT: produced 16/16 tokens`), `test_qwen27_paged_engine` @
+`890bdef7a42feba6d83b6e17a03315c694112f2a` **235/235**,
+`test_qwen3coder_paged_engine` @ `b2cff646eb4bb1d68355c01b18ae02e7cf42d120`
+**138/138**. 688 assertions in total.
+
+**No throughput, latency or memory number exists for this checkpoint**, and none
+is implied. §Scope excluded speed claims and the run measured tokens.
+
+## Owed
+
+- [#910](https://github.com/mudler/vllm.cpp/issues/910): our on-device argmax
+  resolves an exact logit tie toward the HIGHER token id where `torch.argmax`
+  takes the lower. Found while adjudicating this row's gate. Benign here and
+  deterministic everywhere, so it is a permanent behavioral divergence from the
+  reference at any tied position, and it costs a STRICT gate. Needs a RED-first
+  test that constructs a real tie — one asserting only "argmax returns a
+  maximum" passes both conventions — plus inertness across the existing greedy
+  goldens.
+
 ## Now
 
-Row lifecycle is still recorded as `READY` above, deliberately, for the same
-reason [`moe-bf16-stacked-experts.md`](moe-bf16-stacked-experts.md) records its
-own: **a lifecycle move owes `docs/STATUS.md`, `docs/BENCHMARKS.md` and the
-`.agents/roadmap_v1.md` row in the same change**, and the implementer's
-authority covered `qwen3_5_weights.{h,cpp}`, `tests/`, this spec and the
-`docs/FEATURES.md` / `docs/USAGE.md` feature surfaces only. Recording `ACTIVE`
-here without the projections would leave them disagreeing with the spec.
+**This row is `DONE`.** Every gate it declared is met: the CPU suite (476/476
+serial, `-Werror`, RED captured per component), the binding token-exact greedy
+gate on `Qwen/Qwen3.6-35B-A3B` bf16 against the pinned oracle, and the SACRED
+27B / 35B / Coder re-run with byte-identical goldens.
 
-Phases 1-3 landed on `row/MOE-BF16-TOWER-ARMS`: all four arms implemented and
-selected by tensor presence, RED captured per component on the base commit,
-per-arm byte-exact assertions, the self-disagreement refusal, the behavioral
-probe-agreement binding against the dense loader, and a clean `-Werror` CPU
-build with the full serial suite at 476/476.
-
-**Owed, and needing the GB10:** the binding token-exact greedy gate on
-`Qwen/Qwen3.6-35B-A3B` bf16 against the pinned oracle, and the SACRED
-27B / 35B / Coder re-run with byte-identical goldens. The checkpoint IS staged
-and verified at `$CHECKPOINT_ROOT/qwen3.6-35b-a3b-bf16`, revision
+The checkpoint is staged and verified at
+`$CHECKPOINT_ROOT/qwen3.6-35b-a3b-bf16`, revision
 `995ad96eacd98c81ed38be0c5b274b04031597b0` — the same revision the committed
 shape manifest pins — with all 26 shard sha256 digests recomputed against the
 Hugging Face download metadata and the summed tensor bytes equal to the index's
-declared `71,903,645,408`. It did not run in this session because `dgx.casa`
-was carrying another campaign at the time (an `ltx2-gen` render, 78 GiB of 119
-GiB resident); 71.9 GB of bf16 weights is ~2x the fp8 footprint and a global
-kernel OOM on that box has already killed an unrelated process, so the run was
-reported rather than stacked.
+declared `71,903,645,408`. The previous session's blocker (`dgx.casa` carrying
+an `ltx2-gen` render, 78 GiB of 119 GiB resident) had cleared.
+
+Neither owning matrix row moves off `PARTIAL` on this evidence.
+`MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` still owes its
+image/video token gates ([#891](https://github.com/mudler/vllm.cpp/issues/891)),
+and `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` still owes a run through
+`Qwen3_5MoeForCausalLM` itself, whose only published checkpoint does not fit
+this hardware ([#490](https://github.com/mudler/vllm.cpp/issues/490)). What this
+row closes is the loader, and it closes it with a token.

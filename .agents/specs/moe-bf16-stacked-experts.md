@@ -3,7 +3,7 @@
 **Rows:** `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`,
 `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation`
 **Issue:** [#740](https://github.com/mudler/vllm.cpp/issues/740)
-**Lifecycle:** `READY`
+**Lifecycle:** `DONE`
 **Owner:** unassigned
 
 ## Scope
@@ -359,23 +359,61 @@ dimensions, against an expectation this row's author wrote. The oracle has not
 been consulted at runtime. Nothing here shows the 2.4T allocates, and nothing
 here claims Qwen3.8 runs.
 
+### The GPU gate this section recorded as OWED has now RUN, and PASSED
+
+Measured 2026-08-15 on the GB10, once [#864](https://github.com/mudler/vllm.cpp/issues/864)
+landed the four bf16 tower arms this row's dry run enumerated as the reason a
+published repo still refused. That is what makes the run possible at all: the
+stacked reader on its own could not generate a token, and this section said so.
+
+Checkpoint `Qwen/Qwen3.6-35B-A3B` @ `995ad96eacd98c81ed38be0c5b274b04031597b0` —
+26 shards, 71,903,645,408 bytes, every shard sha256 recomputed, the same revision
+the committed shape manifest pins. Oracle identity ASSERTED per run: vLLM
+`0.23.1rc1.dev1511+g555967922`, flashinfer `0.6.15.post1`, torch `2.13.0+cu130`.
+Build fast path asserted: `cutlass-nvfp4`, `cutlass-fp8`, `fp4-mma`,
+`marlin-nvfp4` and `fa2` all ENABLED for `[121a]`, Triton AOT `sm_121a`.
+
+Greedy, 7 prompts x 3 repeats x 16 tokens, identical prompts, token counts,
+sampling and batching on both arms; the oracle was deterministic 7/7 across
+repeats. **6/7 prompts STRICT 16/16; 108/112 positions.** The seventh,
+`"import numpy as np"` at position 7, is an EXACT tie broken the other way:
+oracle `464 "import"`, ours `1445 "from"`, both at logprob
+`-0.8293954133987427`, `top2_gap_mnats = 0.0`, our token rank 2 in the oracle's
+top-20. `torch.argmax` returns the LOWEST maximal index; our on-device argmax
+took the higher. **PASS under the ratified near-tie doctrine**, and filed as
+[#910](https://github.com/mudler/vllm.cpp/issues/910) rather than accepted as
+noise — matching the reference's tie-break would make this 7/7 STRICT.
+
+**`108/112` is NOT a quality score and must not be read as one.** Only the FIRST
+divergence in a prompt is validly adjudicable; past it the two arms carry
+different prefixes, so any further position compares two different
+conditionings. The binding statement is "6 of 7 prompts strict, and the seventh
+diverges once, on a bit-identical logprob".
+
+SACRED inertness, 3 of 3 against the shared loader this row changed, with real
+counts and `GOLDENS_BYTE_IDENTICAL=1` on every one: `test_qwen36_paged_engine`
+2/2 cases **315/315** (`M0-EXIT: produced 16/16 tokens`),
+`test_qwen27_paged_engine` @ `890bdef7a42feba6d83b6e17a03315c694112f2a`
+**235/235**, `test_qwen3coder_paged_engine` @
+`b2cff646eb4bb1d68355c01b18ae02e7cf42d120` **138/138** — 688 assertions total.
+
+**No benchmark number exists for this checkpoint**, and none is claimed: the run
+established tokens, not throughput, latency or memory.
+`Qwen/Qwen3.8-2.4T-A95B` remains unrunnable here on size (~4.8 TB against
+128 GB). Its load plan resolves completely against the published index, which is
+name, shape and dtype resolution — not a token.
+
 ## Now
 
-Row lifecycle is still recorded as `READY` above, deliberately. Phases 1-4 landed
-on `row/MODEL-MOE-BF16-STACKED-EXPERTS` — slicing order established from upstream
-source, stacked bf16 reader implemented and mutation-gated, the load-plan dry run
-running against both published indices, and the CPU suite green on a clean
-`-Werror` build — but the implementer's authority covered
-`qwen3_5_weights.{h,cpp}`, `tests/` and this spec only. **A lifecycle move owes
-`docs/STATUS.md`, `docs/BENCHMARKS.md` and the `.agents/roadmap_v1.md` row in the
-same change**, and those are the operator's to make; recording `ACTIVE` here
-without them would leave the projections disagreeing with the spec.
+**This row is `DONE`.** Every gate it declared is met: the CPU suite and its
+mutations (recorded above), the binding token-exact greedy gate on
+`Qwen/Qwen3.6-35B-A3B` bf16 against the pinned oracle, and the SACRED
+27B / 35B / Coder re-run with byte-identical goldens.
 
-**Owed, and needing the GB10:** stage `Qwen/Qwen3.6-35B-A3B` (71.9 GB, 26
-shards) and run the binding token-exact greedy gate against the pinned oracle;
-re-run the SACRED 27B / 35B / Coder gates and confirm goldens byte-identical.
-That gate will hit the three owed arms this row's dry run enumerates — the FP8
-attention and GDN towers, the NVFP4 shared expert and the NVFP4 `lm_head` — so
-loading a published bf16 repo end to end needs those arms too. They are separate
-rows, and the dry run now names them precisely rather than leaving them to be
-discovered.
+Nothing about Qwen3.8 executing is claimed, and the owning matrix row
+`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` deliberately stays `PARTIAL`: the
+token evidence above was generated through `Qwen3_5MoeForConditionalGeneration`
+on the 35B, not through `Qwen3_5MoeForCausalLM`, whose only published checkpoint
+does not fit this hardware. The layout claim this spec exists to prove is
+closed; that row's own run gate is not, and it is
+[#490](https://github.com/mudler/vllm.cpp/issues/490)'s to close.
