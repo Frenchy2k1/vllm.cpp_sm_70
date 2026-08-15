@@ -144,7 +144,7 @@ Evidence obtained:
   speed number was taken.
 
 **OWED, and nothing here substitutes for it: the image and video token-exact
-gates vs the pinned oracle at 35B.** Both blockers are external, not a missing
+gates vs the pinned oracle at 35B.** Both blockers were external, not a missing
 implementation:
 
 - the pinned oracle cannot run on Thor -- vLLM does not import there
@@ -161,3 +161,34 @@ implementation:
 **A tower that loads but is never invoked passes every offline test and still
 answers image prompts from text alone.** The CPU reduction above closes that on
 the synthetic model; only the oracle comparison closes it on the real one.
+
+### Update 2026-08-15: the TEXT arm of this checkpoint is now oracle-gated; the VISION arm is not
+
+The sibling rows [#740](https://github.com/mudler/vllm.cpp/issues/740) and
+[#864](https://github.com/mudler/vllm.cpp/issues/864) ran their binding
+token-exact greedy gate on `Qwen/Qwen3.6-35B-A3B` bf16
+(@ `995ad96eacd98c81ed38be0c5b274b04031597b0`) against the pinned oracle on the
+GB10 and PASSED — 6/7 prompts strict 16/16, the seventh an exact-tie divergence
+at a bit-identical logprob (#910). That closes the loader and the text backbone
+underneath this row's tower. **It says nothing about image or video**, and it is
+recorded here only so the next reader does not mistake a green sibling for
+coverage of this one.
+
+`#908`'s dense-arm regression check is likewise PARTIAL: the dense TEXT gate at
+`2f2bce926` is **235/235**, identical to pre-merge and a true before/after
+(binary md5 `db889909d4…` vs `49ded1ece8…`, 500 TUs recompiled). The dense
+**image/video** arm was NOT re-verified — network-blocked — so the claim "#891
+did not regress the dense arm" holds for text and is UNVERIFIED for the
+modalities this row is actually about.
+
+This row's own claim is unchanged and deliberately narrow: **the tower loads and
+computes**, not that it produces correct tokens. On Thor (sm_110) the real 333
+`model.visual.*` tensors load and the tower runs — grid `[1,28,28] →
+[196,2048]`, finite, absmax 2.08 — with text inertness 315/315 unchanged. That
+box has `fa2` and CUTLASS fp8/nvfp4 legitimately DISABLED, so it exercised the
+FALLBACK attention path: valid for correctness, and NOT coverage of the shipped
+GB10 path.
+
+**Still OWED, and it is the whole point of this row: image and video token-exact
+vs the pinned oracle at 35B, on GB10, through the shipped fast path.** Row stays
+`PARTIAL`; this spec stays `READY` until that gate produces counts.

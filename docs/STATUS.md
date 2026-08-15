@@ -118,6 +118,8 @@ token-for-token correctness against the pinned oracle.
 |---|---|---|
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **flat 0.937-0.956 c1-c32** (#349; 0.838 void) |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32) | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration |
+| Qwen3.6-35B-A3B (published BF16, GDN MoE) — TEXT | Correctness-gated 2026-08-15 (#740, #864, both `DONE`); **no throughput, latency or memory number exists for this checkpoint, and none is claimed** | Greedy vs the pinned oracle @`995ad96e`: **6/7 prompts STRICT 16/16**; the 7th is one exact logit tie (`0.0 mnats`) our argmax breaks toward the higher id (#910). SACRED 3/3, goldens byte-identical |
+| Qwen3.6-35B-A3B (BF16) — IMAGE / VIDEO | Implemented, **NOT gated** (#891); row stays `PARTIAL` | The 333 `model.visual.*` tensors load and the tower computes (`[1,28,28]`→`[196,2048]`, finite, absmax 2.08) on sm_110 FALLBACK attention. The token-exact mm gate vs the oracle is OWED |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending. Async-serving P0 FIXED (#323: the decode graph replayed stale HOST ids, now declines while the mirror is live; async 7/7 incl. Llama/Mistral/InternLM2) | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **Async device-mirror (`ROW-SERVE-ASYNC-DENSE-MIRROR`, `f9c969ae`): the #31 fix ported to the classic dense family, dgx-VERIFIED.** The shared dense `EmbedInto` (qwen3.cpp) raced the async combine's device input-ids write against a stale host upload → token-0 degeneration on the depth-2 AsyncLLM serving path (quant-independent). `EmbedInto` now consumes the device override published by `ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` (27B-dense template); gate `test_qwen3_dense_async_serving` RED on `VT_ASYNC_DEVICE_MIRROR=0`, GREEN default, byte-identical mirror-off. dgx GB10: async gate RED→GREEN 0.6B+4B, SACRED 0.6B+4B 184/184 unchanged (byte-neutral sync path), memcheck 0 errors; Yi30/Qwen3-8B-MXFP4 default-config e2e coherent + 3/4 token-exact (p2 = oracle-ratified near-tie, gap 0.0000), closing the QUANT-CT-MXFP4 async-default residual. RESIDUAL: sibling InternLM2/Mistral/Llama scope one-liner; W4 bench RAN; FA2 GQA-swap default-ON, c2-c8 <1.0x. `FLASH-PTXAS` #82: codegen at PARITY (no ptxas lever); gap=engine context. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
 | Qwen3.5-4B BF16 direct-load on discrete CUDA | Correct; throughput/host PSS ahead, acceptance `PENDING`; latency/VRAM open | Atomic pretoken exact. Ratios: tput 1.0283x; TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower; VRAM +118.7 MiB. GDN local stack retained ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
@@ -747,35 +749,48 @@ config-driven, with the BACKBONE weight names identical modulo that prefix.
 
 **CORRECTED 2026-08-12: the prefix is NOT the only thing between this code and
 `Qwen/Qwen3.8-2.4T-A95B`, and the first two commits of this row said it was.**
-The MoE loader reads only PER-EXPERT NVFP4 routed experts (`LoadMoeExpertsInto`
--> `LoadNvfp4Raw`: `U8` weight + `F8_E4M3` `.weight_scale` + `.weight_scale_2`),
-with no stacked and no bf16 branch. The published indices (read live 2026-08-12)
-have neither: `Qwen/Qwen3.8-2.4T-A95B` carries 93x `mlp.experts.gate_up_proj` +
-93x `.down_proj` (3-D STACKED) and **zero** `weight_scale` / `input_scale`
-tensors, and `Qwen/Qwen3.6-35B-A3B` is the same under the VL prefix — our gated
-35B row reads the REQUANTIZED `nvidia/Qwen3.6-35B-A3B-NVFP4`.
+The MoE loader then read only PER-EXPERT NVFP4 routed experts, with no stacked
+and no bf16 branch, while both published indices carry 3-D STACKED experts and
+**zero** `weight_scale` / `input_scale` tensors — so a published MoE checkpoint
+was REFUSED by a message naming the gap. The DENSE arm was never affected:
+`LoadQwen3_5Dense` already routed BF16 / FP8 / NVFP4 per projection by presence.
 
-So the **bf16 / 3-D-stacked MoE routed-expert arm is NOT implemented and is
-OWED**, and a published MoE checkpoint is now REFUSED by a message naming it
-rather than dying on `expected U8 for lm_head.weight`. The DENSE arm is not
-affected: `LoadQwen3_5Dense` routes BF16 vs FP8 vs NVFP4 per projection by
-tensor presence, so it may genuinely load a flat bf16 checkpoint. That asymmetry
-is the record.
+**That loader gap is CLOSED, and closed with a token (2026-08-15,
+[#740](https://github.com/mudler/vllm.cpp/issues/740) +
+[#864](https://github.com/mudler/vllm.cpp/issues/864), both now `DONE`).**
+`LoadQwen3_5Moe` reads 3-D stacked bf16 routed experts and resolves the GDN
+tower, attention tower, shared expert and `lm_head` by tensor presence, so a
+published bf16 Qwen MoE repo loads end to end and both published indices satisfy
+the load plan completely.
 
-What is claimed is dispatch, flat-config resolution, namespace resolution and
-the refusal, gated by `tests/vllm/models/test_qwen3_8_text_only.cpp`, with
-27B/35B/Coder inert and parity goldens md5-unchanged. **What is NOT claimed is a
-single generated token.** 2.4T bf16 is ~4.8 TB and the released FP8 variant
-~2.4 TB against 128 GB of unified memory, and no smaller Qwen3.8 sibling exists,
-so there is no token-exact oracle run and no speed number.
+**Binding gate — `Qwen/Qwen3.6-35B-A3B` bf16 @`995ad96e` (26 shards,
+71,903,645,408 bytes, sha256 recomputed), greedy 7 prompts x 3 repeats x 16
+tokens vs the pinned oracle `0.23.1rc1.dev1511+g555967922` on GB10, oracle
+deterministic 7/7 across repeats: 6/7 prompts STRICT 16/16.** The seventh
+diverges once on a bit-identical logprob (`top2_gap_mnats = 0.0`), where
+`torch.argmax` takes the lower id and our on-device argmax the higher — an exact
+tie, PASS under the ratified near-tie doctrine, filed as
+[#910](https://github.com/mudler/vllm.cpp/issues/910).
 
-Both rows therefore stay `PARTIAL`. The owed **DENSE** run gate closes when a
-`Qwen3_5ForCausalLM` checkpoint that fits GB10 appears. The **MoE** run gate
-needs more: a fitting *published* (bf16/stacked) MoE checkpoint would still be
-refused at load, so it needs a fitting checkpoint whose routed experts are
-per-expert NVFP4, or the owed stacked/bf16 arm implemented first. Also NOT
-implemented and recorded as owed: that stacked/bf16 MoE expert arm, and the MTP
-and GGUF arms for 3.8. This does not advance the parity pin.
+Only the FIRST divergence in a prompt is validly adjudicable — past it the arms
+carry different prefixes — so the raw 108/112 position count is not a quality
+score and is not recorded as one. SACRED inertness 3/3 with real counts and
+`GOLDENS_BYTE_IDENTICAL=1`: 27B **235/235** @`890bdef7`, 35B **315/315**, Coder
+**138/138** @`b2cff646`, 688 assertions. **No throughput, latency or memory
+number exists for this checkpoint, and none is claimed.**
+
+**Both rows nevertheless stay `PARTIAL`, and the reason has changed: what was
+owed was the loader, what is owed now is hardware.** That gate ran through
+`Qwen3_5MoeForConditionalGeneration` on the 35B, not through
+`Qwen3_5MoeForCausalLM`. The DENSE run gate closes when a `Qwen3_5ForCausalLM`
+checkpoint that fits GB10 appears; the MoE one when a fitting
+`Qwen3_5MoeForCausalLM` checkpoint does.
+
+`Qwen/Qwen3.8-2.4T-A95B` is ~4.8 TB bf16 (~2.4 TB FP8) against 128 GB of unified
+memory and no smaller Qwen3.8 sibling exists, so it remains unrunnable here. Its
+load plan resolves completely against the published index — name, shape and
+dtype resolution, **not a token**. Still owed: the MTP and GGUF arms for 3.8.
+This does not advance the parity pin.
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
