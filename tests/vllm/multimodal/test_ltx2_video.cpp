@@ -1333,15 +1333,25 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     // cannot see. The two must agree on the weight contract.
     CHECK(vllm::Ltx2ReadCheckpointModelVersion(file) == "2.5.0");
     nlohmann::json config = vllm::Ltx2ReadCheckpointConfig(file);
-    // The shipped DiT DECLARES `use_keyframes_abs_pos_embedding: true`, which
-    // `ParseLtx2DitParams` refuses by name because the module is unported. The
-    // engine clears it in a copy under `allow_unported_modules`; this mirrors
-    // that, and asserting the file declares it is the point.
+    // The shipped DiT DECLARES `use_keyframes_abs_pos_embedding: true` while
+    // carrying NO tensor for it — which is upstream-LEGAL and means "apply
+    // nothing": the parameter is built on the meta device and
+    // `supports_keyframes_abs_pos_embedding` is False both before and after the
+    // load (model.py:166-173; reproduce with
+    // scripts/measure-ltx2-keyframes-meta.py).
+    //
+    // This test used to CLEAR the flag by hand here, mirroring an engine that
+    // cleared it under `allow_unported_modules`. Both are gone (row
+    // LTX25-KEYFRAMES-ABS-POS, issue #658): `Ltx2AdoptDeclaredDitParams` resolves
+    // it against the file's own shapes, so the declared config is adopted
+    // VERBATIM and the contracts agree with no hand edit at all.
     REQUIRE(config["transformer"]["use_keyframes_abs_pos_embedding"].get<bool>());
-    config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
-    nlohmann::json wrapper;
-    wrapper["config"] = config;
-    const vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
+    REQUIRE_FALSE(from_shapes.use_keyframes_abs_pos_embedding);  // the file carries no tensor
+    const vllm::Ltx2DitParams declared = vllm::Ltx2AdoptDeclaredDitParams(
+        config, from_shapes, "the shipped NVFP4 DiT's own __metadata__[\"config\"]");
+    // RESOLVED to FALSE, which is `supports_...`. Not a refusal, and not a
+    // synthesised zero — the two failure modes spec §6 names.
+    CHECK_FALSE(declared.use_keyframes_abs_pos_embedding);
     // The shipped config OMITS `use_prompt_adaln_single`, so it resolves to
     // upstream's TRUE default (model_configurator.py:76) — which is what the
     // file's own tensors say. Asserted rather than forced: the two sides of the
@@ -1363,6 +1373,77 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     MESSAGE("shipped NVFP4 DiT: " << a.size() << " contract tensors, "
             << file.Names().size() << " in the file");
   }
+
+  // THE CLAIM THIS ROW EXISTS TO MAKE TRUE (row LTX25-KEYFRAMES-ABS-POS, issue
+  // #658): the shipped DiT loads INSIDE THE CONTRACT — no `allow_unported_modules`
+  // — which neither shipped copy could do before. `Ltx2LoadDitFromSafetensors`
+  // with default options is precisely "no opt-in".
+  //
+  // The full load reads ~19 GB. It is the same file the subcase above parses; if
+  // this box cannot hold it, that shows up as a load failure and not as a pass.
+  SUBCASE("the first-party NVFP4 DiT loads with NO allow_unported_modules") {
+    const std::string path =
+        root + "/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors";
+    const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+    const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+    CHECK(ck.unported.empty());
+    // Absent from the file, so nothing is bound and nothing will be applied.
+    CHECK_FALSE(ck.params.use_keyframes_abs_pos_embedding);
+    CHECK(ck.weights.keyframes_abs_pos_embedding.data == nullptr);
+    MESSAGE("shipped NVFP4 DiT loaded inside the contract, unported=" << ck.unported.size());
+  }
+}
+
+// The OTHER shipped DiT, which lives under a different publisher root and so
+// takes its own env. It is the one that carries the TRAINED
+// `keyframes_abs_pos_embedding` — `F8_E4M3 [1, 4096]` with a scalar `F32` scale,
+// 4096 of 4096 bytes non-zero — and it was refused from the opposite direction:
+// "the checkpoint carries modules this port does NOT carry".
+//
+// CI SETS NEITHER ENV (issue #673), so this is host-local evidence, not a gate.
+TEST_CASE("ltx2 video: the SHIPPED vonkaiser FP8 DiT loads with NO allow_unported_modules") {
+  const char* dit_env = std::getenv("LTX2_FP8_DIT");
+  if (dit_env == nullptr) {
+    MESSAGE("SKIPPED: set LTX2_FP8_DIT to the vonkaiser ltx-2.5-22b-distilled-fp8.safetensors");
+    return;
+  }
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(std::string(dit_env));
+  // It carries no `__metadata__` at all, which is why its config always arrives
+  // separately and why the manifest is the only evidence about this flag.
+  CHECK(file.Metadata().count("config") == 0);
+
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.unported.empty());
+  // RESOLVED TRUE from the file's own shapes — `supports_...` holds here.
+  CHECK(ck.params.use_keyframes_abs_pos_embedding);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.data != nullptr);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.rank == 2);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[0] == 1);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[1] == ck.params.inner_dim());
+  // Dequantized through the ONE existing FP8 convention — F8_E4M3 plus a scalar
+  // F32 `<name>_scale`, `DequantFp8ToBf16` — so the view is BF16.
+  CHECK(ck.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+  // TRAINED, not `torch.zeros`. A zero bias would be an exact no-op because the
+  // term is ADDED, so this is the assertion that makes the port matter at all.
+  {
+    const uint16_t* p = ck.weights.keyframes_abs_pos_embedding.Ptr<uint16_t>();
+    int64_t nonzero = 0;
+    for (int64_t i = 0; i < ck.params.inner_dim(); ++i) {
+      if (p[i] != 0) ++nonzero;
+    }
+    MESSAGE("shipped FP8 keyframes_abs_pos_embedding: " << nonzero << " of "
+            << ck.params.inner_dim() << " non-zero");
+    CHECK(nonzero > 0);
+  }
+}
+
+TEST_CASE("ltx2 video: the SHIPPED Lightricks VAEs and upsampler load") {
+  const char* root_env = std::getenv("LTX2_CHECKPOINT_ROOT");
+  if (root_env == nullptr) {
+    MESSAGE("SKIPPED: set LTX2_CHECKPOINT_ROOT to the Lightricks/LTX-2.5 tree to run this");
+    return;
+  }
+  const std::string root = root_env;
 
   SUBCASE("the Conv video VAE loads and configures from its own metadata") {
     const std::string path = root + "/vae/ltx-2.5-video-vae-conv-bf16.safetensors";
@@ -1674,6 +1755,78 @@ TEST_CASE("ltx2 video: the render READS the checkpoint's connector weights") {
   // ...and the same render twice is byte-identical, which is what makes the
   // inequality above a statement about the connector rather than about noise.
   CHECK(RenderBytes(a, ws.root + "/conn_a2") == frames_a);
+}
+
+// ─── the keyframe marker, measured at the PIXELS ────────────────────────────
+//
+// WHY THIS CASE EXISTS, and it is not a duplicate of the DiT-level goldens.
+// Every other check in this file is RELATIVE — `digest != digest`, `absmax > 0`,
+// "the frames are not one flat value" — and none of them is anchored to what the
+// render is SUPPOSED to contain. That is why a defect measured on this head was
+// invisible: the engine builds `video.keyframes_mask` unconditionally, and the
+// guard beside it asserts the VECTOR is populated, so making the mask
+// conditional REDs 11 cases here while making the HANDOVER conditional — one
+// line lower, `if (wants_image) vin.keyframes_mask = ...` — compiled clean and
+// left all five LTX-2.5 suites GREEN. The pixels moved (frame 0 flat 127 → flat
+// 130) and nothing in the tree said so.
+//
+// The fix in `ltx2_video.cpp` closes that one line. THIS CASE CLOSES THE CLASS,
+// because it does not look at any line: it compares a render whose DiT carries
+// the parameter against a render whose DiT does not, on a request with NO image
+// and NO keyframe — upstream's unconditional case. Any route by which the
+// trained term fails to reach the forward collapses the two renders into one and
+// REDs here, whether the drop is in the mask, the handover, the binding, or the
+// add.
+//
+// The two checkpoints differ in exactly one thing. `Param()` seeds every tensor
+// from its own NAME, so dropping `keyframes_abs_pos_embedding` from the contract
+// perturbs no other value; the DiT config's flag follows the shapes because both
+// come from the same `Ltx2DitParams`.
+TEST_CASE("ltx2 video: the keyframe marker reaches the PIXELS with no image supplied") {
+  Workspace ws;
+  const vllm::Ltx2DitParams marked = ltx2_fixture::ReducedDitParams();
+  // The fixture's own default, asserted rather than assumed: with the flag off
+  // this whole case would compare two identical renders and pass vacuously.
+  REQUIRE(marked.use_keyframes_abs_pos_embedding);
+
+  vllm::Ltx2DitParams unmarked = marked;
+  unmarked.use_keyframes_abs_pos_embedding = false;
+  const std::string unmarked_dit = ws.root + "/dit_no_keyframes.safetensors";
+  ltx2_fixture::WriteReducedDit(unmarked, unmarked_dit, ltx2_fixture::ReducedDitOptions{});
+
+  vllm::multimodal::VideoModelParams with_marker = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams without_marker = with_marker;
+  without_marker.dit_path = unmarked_dit;
+
+  // `FixtureGen` supplies no image and no keyframe, which is the whole point:
+  // upstream marks the first latent frame "independently of whether any keyframe
+  // slots exist" (tools.py:186-196). A port that marked it only when something
+  // was conditioned would be silently wrong on every plain text-to-video render,
+  // and that is the render this case takes.
+  const std::string with = RenderBytes(with_marker, ws.root + "/kf_marked");
+  const std::string without = RenderBytes(without_marker, ws.root + "/kf_unmarked");
+  REQUIRE(with.size() == without.size());
+
+  size_t differing = 0;
+  for (size_t i = 0; i < with.size(); ++i) {
+    if (with[i] != without[i]) ++differing;
+  }
+  MESSAGE("keyframe marker moves " << differing << " of " << with.size()
+                                   << " artifact bytes");
+  // Strictly greater than zero, and no count floor above it. A count-based
+  // tolerance would bound nothing — it would red on unrelated numerical drift and
+  // still admit a term applied to the wrong frame — and the frame the marker
+  // belongs on is gated by the DiT goldens, which mark one frame and check the
+  // others are untouched. What this case owns is the ENGINE-to-PIXEL route, and
+  // for that the question is binary: did the trained term reach the render at
+  // all.
+  CHECK_MESSAGE(differing > 0,
+                "the DiT that carries keyframes_abs_pos_embedding rendered the same bytes as the "
+                "DiT that does not, so the trained term never reached the forward");
+
+  // ...and the same DiT twice is byte-identical, which is what makes the
+  // inequality a statement about the marker rather than about noise.
+  CHECK(RenderBytes(with_marker, ws.root + "/kf_marked2") == with);
 }
 
 TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {

@@ -542,12 +542,15 @@ std::vector<Ltx2TensorSpec> ContractOf(const Ltx2DitParams& params) {
   }
   Fail(
       "the checkpoint carries modules this port does NOT carry: " + list +
-      ". They are not dropped silently: keyframes_abs_pos_embedding means "
-      "use_keyframes_abs_pos_embedding is TRUE, and nothing here applies it. "
+      ". They are not dropped silently. "
       "prompt_adaln_single / audio_prompt_adaln_single are NO LONGER in this list "
       "— they were ported by row LTX25-PROMPT-ADALN "
       "(.agents/specs/ltx25-prompt-adaln.md, issue #644) and are now part of the "
-      "contract whenever the checkpoint carries them. The two "
+      "contract whenever the checkpoint carries them. NEITHER IS "
+      "keyframes_abs_pos_embedding, which row LTX25-KEYFRAMES-ABS-POS ported "
+      "(.agents/specs/ltx25-keyframes-abs-pos.md, issue #658): the contract now "
+      "includes it whenever the file carries it, and the shipped vonkaiser FP8 DiT "
+      "carries it TRAINED. The two "
       "*_embeddings_connector families are not in this list either and never will "
       "be — they are outside the DiT contract by design and are loaded by "
       "Ltx2LoadConnectorWeights, which is what the video engine calls. Pass "
@@ -1002,22 +1005,32 @@ Ltx2VocoderConfig ParseVocoderArm(const nlohmann::json& cfg, const std::string& 
 
 Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
                                          const Ltx2DitParams& from_shapes,
-                                         bool allow_unported_modules,
                                          const std::string& source) {
   nlohmann::json copy = config;
-  // THE UNPORTED FLAG IS CLEARED IN THE COPY, NOT ARGUED WITH. `ParseLtx2DitParams`
-  // refuses `use_keyframes_abs_pos_embedding` by name (ltx2.cpp:191-196) and the
-  // first-party LTX-2.5 DiT declares it, so reading the declared config verbatim
-  // would refuse a real checkpoint the loader has just accepted under
-  // `allow_unported_modules`.
+  // `supports_keyframes_abs_pos_embedding` (model.py:166-173), RESOLVED — not the
+  // old force-clear, which fired on `allow_unported_modules` and was an escape
+  // hatch rather than a mirror.
   //
-  // EXACTLY ONE FLAG, and that is now structural rather than a comment. This block
-  // also cleared `use_prompt_adaln_single`, whose module IS ported
-  // (.agents/specs/ltx25-prompt-adaln.md, issue #644) — so `allow_unported=1`,
-  // which a real render needs, silently turned off a correctness setting. Whatever
-  // is cleared here must be a module nothing below applies; a ported one belongs
-  // in the contract, where the equality check further down can see it.
-  if (allow_unported_modules && copy.contains("transformer") &&
+  // Upstream builds the model on the META device (loader/helpers.py:84-95,
+  // create_meta_model) and loads with `strict=False, assign=True`
+  // (single_gpu_model_builder.py:98), so a config that DECLARES the flag over a
+  // checkpoint carrying no tensor leaves the parameter on `meta`:
+  // `supports_keyframes_abs_pos_embedding` is False both BEFORE and AFTER the
+  // load, and the add is never reached. That is the shipped first-party NVFP4 DiT
+  // exactly — `declared - state_dict` is precisely this one key — and it was
+  // settled by EXECUTING upstream's own loader, not by reading it
+  // (.agents/specs/ltx25-keyframes-abs-pos.md §2, scripts/measure-ltx2-keyframes-meta.py).
+  //
+  // So the declared flag is resolved against what the FILE carries. Three
+  // outcomes, all of them upstream's:
+  //   declared + present -> applied (the vonkaiser FP8 DiT, trained)
+  //   declared + absent  -> nothing applied, no refusal (the NVFP4 DiT)
+  //   not declared       -> nothing applied
+  // Synthesising a zero tensor for the middle case would be inventing the very
+  // thing `supports_…` exists to prevent, and refusing it is stricter than
+  // upstream. The clear is INDEPENDENT of `allow_unported_modules`, which is what
+  // makes the NVFP4 DiT loadable inside the contract at all.
+  if (!from_shapes.use_keyframes_abs_pos_embedding && copy.contains("transformer") &&
       copy["transformer"].is_object()) {
     copy["transformer"]["use_keyframes_abs_pos_embedding"] = false;
   }

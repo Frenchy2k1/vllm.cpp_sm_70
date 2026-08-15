@@ -484,6 +484,7 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
                              const Ltx2AdaLayerNormSingleWeights& cross_scale_shift_adaln,
                              const Ltx2AdaLayerNormSingleWeights& cross_gate_adaln,
                              const Ltx2AdaLayerNormSingleWeights* prompt_adaln,
+                             const vt::Tensor* keyframes_embedding,
                              const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                              int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
                              int64_t heads, const Ltx2ModalityInput* cross) {
@@ -505,6 +506,61 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
     for (int64_t r = 0; r < rows; ++r) {
       float* dst = out.x.data() + r * width;
       for (int64_t c = 0; c < width; ++c) dst[c] += b[c];
+    }
+  }
+
+  // transformer_args.py:269 — `apply_keyframes_absolute_embedding` runs HERE,
+  // immediately after patchify_proj and before the timestep, so it is the input
+  // every later stage sees.
+  //
+  // A mask on a stream that has no provider is REFUSED rather than dropped:
+  // `_init_preprocessors` gives the video preprocessor one (model.py:314) and the
+  // audio one none (:333), so a caller that put the marker on the audio input has
+  // made a mistake that silently renders without it.
+  VT_CHECK(m.keyframes_mask == nullptr || keyframes_embedding != nullptr,
+           "ltx2: a keyframes_mask was supplied for a stream that carries no "
+           "keyframes_abs_pos_embedding. Upstream builds the AUDIO args preprocessor with no "
+           "keyframes_embedding_provider at all (model.py:333 against :314), and a model whose "
+           "checkpoint omitted the parameter leaves it on the meta device "
+           "(supports_keyframes_abs_pos_embedding, model.py:166-173). Either way the marker "
+           "cannot be applied, and dropping it silently would render without a trained term.");
+  if (keyframes_embedding != nullptr && m.keyframes_mask != nullptr) {
+    // transformer_args.py:42-43:
+    //   mask = (keyframes_mask > 0).to(dtype=hidden_states.dtype)
+    //   return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
+    // BOTH operands are cast to `hidden_states.dtype` — there is no wider
+    // accumulator upstream and there is none here. `hidden_states` is `out.x`,
+    // which this TU holds in f32 because the WHOLE L2 forward is f32 (the DTYPE
+    // note at the top of ltx2.h); the embedding is read at that same width, so
+    // the term is added in the stream dtype exactly as upstream adds it.
+    //
+    // The view's dtype is asserted rather than assumed: the FP8 arm materializes
+    // this tensor as BF16 (MaterializeDitTensor's F8_E4M3 arm) and only
+    // `Ltx2WidenDitToF32` brings it to f32, so reading `Ptr<float>()` off an
+    // unwidened view would consume two bf16 lanes per float — finite, plausible,
+    // and invisible to any output check.
+    // BOUND, not merely declared. `BindLtx2DitWeights` binds this whenever the
+    // flag resolves true and throws by name when the map lacks it, so an unbound
+    // view here means a caller assembled `Ltx2DitWeights` itself and forgot one —
+    // and a default-constructed `vt::Tensor` would read as a zero-length bias,
+    // i.e. no bias at all, on a model whose config says it has one.
+    VT_CHECK(keyframes_embedding->data != nullptr,
+             "ltx2: use_keyframes_abs_pos_embedding is set but the weight view is unbound; "
+             "upstream's `supports_keyframes_abs_pos_embedding` (model.py:166-173) is exactly "
+             "the pair of these two facts and they cannot disagree");
+    VT_CHECK(keyframes_embedding->dtype == vt::DType::kF32,
+             "ltx2: keyframes_abs_pos_embedding must be f32 on the L2 forward, which computes in "
+             "f32 throughout; a bf16 view read as f32 would silently halve its length");
+    VT_CHECK(keyframes_embedding->rank == 2 && keyframes_embedding->shape[0] == 1 &&
+                 keyframes_embedding->shape[1] == width,
+             "ltx2: keyframes_abs_pos_embedding must be [1, stream width] (model.py:217-219)");
+    const float* e = keyframes_embedding->Ptr<float>();
+    for (int64_t r = 0; r < rows; ++r) {
+      // `(keyframes_mask > 0)` — a STRICT comparison cast to the stream dtype,
+      // so the marker is a 0/1 selector and never a scale.
+      if (!(m.keyframes_mask[r] > 0.0f)) continue;
+      float* dst = out.x.data() + r * width;
+      for (int64_t c = 0; c < width; ++c) dst[c] += e[c];
     }
   }
 
@@ -734,14 +790,24 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
              "ltx2: the video stream needs a context when context_tokens > 0");
     vs = PrepareStream(device, params, weights.patchify_proj, weights.adaln_single,
                        weights.av_ca_video_scale_shift, weights.av_ca_a2v_gate,
-                       prompt_adaln ? &weights.prompt_adaln_single : nullptr, *video, dim,
+                       prompt_adaln ? &weights.prompt_adaln_single : nullptr,
+                       // model.py:314 — only the VIDEO preprocessor gets the provider.
+                       params.use_keyframes_abs_pos_embedding
+                           ? &weights.keyframes_abs_pos_embedding
+                           : nullptr,
+                       *video, dim,
                        params.in_channels, 3, params.positional_embedding_max_pos,
                        params.num_attention_heads, have_both ? audio : nullptr);
   }
   if (audio != nullptr) {
     as = PrepareStream(device, params, weights.audio_patchify_proj, weights.audio_adaln_single,
                        weights.av_ca_audio_scale_shift, weights.av_ca_v2a_gate,
-                       prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr, *audio, adim,
+                       prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr,
+                       // model.py:333 — the audio preprocessor is built with NO
+                       // keyframes_embedding_provider. Not an omission: nothing
+                       // adds this bias to the audio stream upstream.
+                       /*keyframes_embedding=*/nullptr,
+                       *audio, adim,
                        params.audio_in_channels, 1, params.audio_positional_embedding_max_pos,
                        params.audio_num_attention_heads, have_both ? video : nullptr);
   }

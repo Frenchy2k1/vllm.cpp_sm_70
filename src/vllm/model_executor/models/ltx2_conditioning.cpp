@@ -103,14 +103,27 @@ Ltx2LatentState Ltx2CreateVideoLatentState(const Ltx2VideoLatentShape& shape, in
   DivideTemporalByFps(&state.positions, tokens, fps);
 
   if (out_keyframes_mask != nullptr) {
-    // _first_frame_keyframes_mask (tools.py:186-197): the TARGET's first latent
-    // frame, marked unconditionally, because the causal encoder makes it span a
-    // single pixel frame while every later one spans `factors.time`.
-    const int64_t per_frame = tokens / std::max<int64_t>(1, shape.frames);
-    out_keyframes_mask->assign(static_cast<size_t>(tokens), 0.0f);
-    for (int64_t i = 0; i < per_frame; ++i) (*out_keyframes_mask)[static_cast<size_t>(i)] = 1.0f;
+    *out_keyframes_mask = Ltx2FirstFrameKeyframesMask(shape, patch_size);
   }
   return state;
+}
+
+std::vector<float> Ltx2FirstFrameKeyframesMask(const Ltx2VideoLatentShape& shape,
+                                               int64_t patch_size) {
+  // tools.py:194-195 — `zeros_like(denoise_mask)` then
+  // `mask[:, :tokens_per_latent_frame] = 1.0`, with NO branch on whether a
+  // keyframe exists. `tokens_per_latent_frame` is
+  // `get_token_count(target._replace(frames=1))` (:198-201), so it is derived the
+  // same way rather than as `tokens / frames`.
+  const int64_t tokens = Ltx2VideoTokenCount(shape, patch_size);
+  Ltx2VideoLatentShape one = shape;
+  one.frames = 1;
+  const int64_t per_frame = Ltx2VideoTokenCount(one, patch_size);
+  VT_CHECK(per_frame <= tokens,
+           "ltx2 conditioning: one latent frame cannot hold more tokens than the whole target");
+  std::vector<float> mask(static_cast<size_t>(tokens), 0.0f);
+  for (int64_t i = 0; i < per_frame; ++i) mask[static_cast<size_t>(i)] = 1.0f;
+  return mask;
 }
 
 Ltx2LatentState Ltx2CreateAudioLatentState(const Ltx2AudioLatentShape& shape,

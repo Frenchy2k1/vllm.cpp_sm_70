@@ -162,6 +162,11 @@ Ltx2DitParams ParseLtx2DitParams(const nlohmann::json& metadata) {
   get_bool("use_prompt_adaln_single", p.use_prompt_adaln_single);
   get_bool("ff_bias", p.ff_bias);
   get_bool("audio_ff_bias", p.audio_ff_bias);
+  // model_configurator.py:82/:142 — `config.get("use_keyframes_abs_pos_embedding",
+  // False)`. What a CONFIG can say is only half of `supports_…`; the other half is
+  // whether the checkpoint carried the tensor, which `Ltx2AdoptDeclaredDitParams`
+  // resolves against the shapes.
+  get_bool("use_keyframes_abs_pos_embedding", p.use_keyframes_abs_pos_embedding);
 
   // model_configurator.py:44 — the AV configurator asserts the two head counts agree.
   VT_CHECK(p.num_attention_heads == p.audio_num_attention_heads,
@@ -183,19 +188,15 @@ Ltx2DitParams ParseLtx2DitParams(const nlohmann::json& metadata) {
                             cfg.at("frequencies_precision").is_string() &&
                             cfg.at("frequencies_precision").get<std::string>() == "float64";
 
-  // The two arms this phase does not carry are REFUSED by name rather than
-  // silently ignored. Both are real upstream configurations.
+  // The one arm this phase does not carry is REFUSED by name rather than
+  // silently ignored. It is a real upstream configuration.
+  // (`use_keyframes_abs_pos_embedding` used to be the second entry here; it is
+  // read as a parameter above since row LTX25-KEYFRAMES-ABS-POS, issue #658.)
   VT_CHECK(cfg.contains("caption_proj_before_connector") &&
                cfg.at("caption_proj_before_connector").is_boolean() &&
                cfg.at("caption_proj_before_connector").get<bool>(),
            "ltx2: caption_proj_before_connector=false puts the caption projections inside the DiT "
            "(19B form, text_projection.py:31-38); phase L3 ports them");
-  VT_CHECK(!cfg.contains("use_keyframes_abs_pos_embedding") ||
-               !cfg.at("use_keyframes_abs_pos_embedding").is_boolean() ||
-               !cfg.at("use_keyframes_abs_pos_embedding").get<bool>(),
-           "ltx2: use_keyframes_abs_pos_embedding is not ported (transformer_args.py:23-43); "
-           "the LTX-2.5 checkpoint does not carry keyframes_abs_pos_embedding");
-
   VT_CHECK(p.num_attention_heads > 0 && p.attention_head_dim > 0 &&
                p.audio_num_attention_heads > 0 && p.audio_attention_head_dim > 0 &&
                p.num_layers > 0,
@@ -264,8 +265,16 @@ std::vector<Ltx2TensorSpec> EnumerateLtx2DitTensors(const Ltx2DitParams& p) {
   const int64_t coefficient = p.adaln_embedding_coefficient();
   const bool gated = p.apply_gated_attention;
 
-  // torch lists a module's OWN parameters before its children, so the two output
-  // tables come first (model.py:230, :260).
+  // torch lists a module's OWN parameters before its children, and among a
+  // module's own parameters in REGISTRATION order. `keyframes_abs_pos_embedding`
+  // is registered inside `_init_video` at model.py:217 — BEFORE
+  // `scale_shift_table` (:230) — so it leads the list whenever it exists. No
+  // shape encodes that ordering; it is checked against upstream's own
+  // `named_parameters()` in the section-7 golden.
+  if (p.use_keyframes_abs_pos_embedding) {
+    out.push_back({"keyframes_abs_pos_embedding", {1, dim}});
+  }
+  // The two output tables (model.py:230, :260).
   out.push_back({"scale_shift_table", {2, dim}});
   out.push_back({"audio_scale_shift_table", {2, adim}});
 
@@ -413,6 +422,12 @@ Ltx2DitParams ParseLtx2DitParamsFromManifest(const std::vector<Ltx2TensorSpec>& 
            "ltx2 manifest: prompt_scale_shift_table presence disagrees with the AdaLN row count");
 
   p.use_prompt_adaln_single = FindShape(manifest, "prompt_adaln_single.linear.weight") != nullptr;
+  // PRESENCE DECIDES, and a manifest has no other evidence. This resolves
+  // `supports_keyframes_abs_pos_embedding` (model.py:166-173) rather than the
+  // config flag: a file that omits the tensor leaves upstream's parameter on the
+  // meta device, so the add is never reached and there is nothing to bind.
+  p.use_keyframes_abs_pos_embedding =
+      FindShape(manifest, "keyframes_abs_pos_embedding") != nullptr;
   p.ff_bias = FindShape(manifest, "transformer_blocks.0.ff.net.0.proj.bias") != nullptr;
   p.audio_ff_bias = FindShape(manifest, "transformer_blocks.0.audio_ff.net.0.proj.bias") != nullptr;
 
@@ -483,6 +498,12 @@ Ltx2AdaLayerNormSingleWeights BindAdaln(const std::map<std::string, Tensor>& t,
 Ltx2DitWeights BindLtx2DitWeights(const Ltx2DitParams& p,
                                   const std::map<std::string, Tensor>& t) {
   Ltx2DitWeights w;
+  // model.py:217-219 — bound only when the flag RESOLVES true, exactly as the
+  // optional prompt tables below are. Left default-constructed otherwise, which
+  // is what `_keyframes_embedding` returning `None` means at the forward.
+  if (p.use_keyframes_abs_pos_embedding) {
+    w.keyframes_abs_pos_embedding = Lookup(t, "keyframes_abs_pos_embedding");
+  }
   w.scale_shift_table = Lookup(t, "scale_shift_table");
   w.audio_scale_shift_table = Lookup(t, "audio_scale_shift_table");
   w.patchify_proj = BindLinear(t, "patchify_proj", true);
