@@ -77,8 +77,21 @@ becomes true for `push` as well as `pull_request`. `schedule` and
 baseline lane is untouched.
 
 **A closed pull request cancels its run.** `pull_request` gains the `closed`
-type, and every job's `if` excludes it, so the run enters the group, supersedes
-the open run, and finishes immediately without executing gates.
+type and every job is skipped on it, so the run enters the group, supersedes the
+open run, and finishes without executing gates.
+
+*Revised by #873.* The skip was first written as a clause in every job's own
+`if`, and that is not available to every job. A job carrying any `if` at all is
+dropped by `_unconditional_ci_run_blocks` in
+`scripts/check-release-binary-contract.py` and
+`scripts/check-test-registration.py`, so putting one on `agent-record`
+un-registered every checker that job owns, and six gates went red on `main`. A
+job may instead be skipped **transitively**: `needs:` a job that carries the
+guard, and a skipped dependency skips its dependents. `agent-record` takes that
+form -- no `if:`, no `always()`, `needs: [last-gated-commit]` -- and
+`last-gated-commit` widens to every lane but the closed action so it can carry
+the guard for it. The two `windows-msvc-*` jobs can take neither form; see
+`## Owed`.
 
 **`containers.yml` gains a policy.** #822 names it as the largest source of
 queued duplicates and it has none at all. Pull request and main-push runs become
@@ -107,7 +120,9 @@ Out of scope and stated as owed:
 | `agent-record` keeps no diff-scoped step | Assert no `--range` under it | Passes |
 | Push lane is latest-only | Assert group keys on `ref`, cancel true for push | Passes |
 | Schedule stays non-cancellable | Assert cancel false for `schedule` | Passes |
-| Closed PR runs no gate job | Assert every job `if` excludes `closed` | Passes |
+| Closed PR runs no gate job | Assert every job is skipped on `closed`, by its own `if` or transitively through `needs:` | Passes |
+| `agent-record` carries no `if:` at all (#873) | Re-add the #865 condition: 3 checkers and 3 suites red | Passes |
+| Windows PR proofs match the pinned schema (#873) | Re-add the #865 closed clause: `check-release-workflow` and `test_release_pipeline` red | Passes |
 | Containers has a policy | Assert a workflow group exists | Passes |
 | Base falls back when no successful run | Simulate an empty query | Falls back to `before` |
 
@@ -172,7 +187,56 @@ with a strict loader, because no `safe_load`-based assertion ever can.
   inline script (`ci.yml:584`). Pre-existing, confirmed by linting the base
   revision, and not introduced here. It is untrusted input on a fork pull request and should move
   to an environment variable.
+- [#874](https://github.com/mudler/vllm.cpp/issues/874). `windows-msvc-cpu` and
+  `windows-msvc-vulkan` still START on a closed pull request.
+  `scripts/check-release-workflow.py::validate_pr_ci` compares their WHOLE job
+  mapping for equality against the read-only native Windows PR proof schema --
+  the artifact that proves the PR lane holds no release, upload, write-token or
+  OIDC authority (#117). The schema admits no extra key, so `needs:` is
+  rejected, and it fixes the `if:` string, so a closed-action clause is
+  rejected. No third mechanism reaches these two jobs *while the schema stands
+  as written* -- which is the whole cost, and not an impossibility: the literal
+  is pinned in exactly seven places (`scripts/check-release-workflow.py:178` and
+  `tests/scripts/test_release_pipeline.py:278,316,332,338,637,651`), and
+  advancing all seven would NARROW the condition while leaving `validate_pr_ci`'s
+  whole-mapping equality exactly as strong. #865 added the clause anyway and left
+  that checker and `test_release_pipeline.py` red; #873 restores the schema,
+  because a pinned authority proof outranks a cost optimisation. The residual is
+  two Windows runners started per closed pull request, which is still less than
+  the superseded run #822 cancels. Resolving it means either extending the
+  pinned schema to one new exact string, or moving the supersession trigger to a
+  workflow that shares the concurrency group so `ci.yml` never subscribes to
+  `closed` at all. Both change a ratified mechanism and neither is taken here.
+
+## Outcome — #873, the checker regression this row left on `main`
+
+The `## Design` note above records what changed. What it cost is worth keeping.
+
+**A relaxed pin is not a green gate.** #865 hit
+`test_the_agent_record_job_is_unconditional`, whose whole subject was that a CI
+registration behind an `if:` is not a registration, and rewrote it to permit one
+condition. The three checkers that assert the same property in the workflow
+itself stayed red, and `main` shipped red for every branch cut from it. The pin
+was the cheapest of the four to see and the only one that could be edited from
+inside the row -- which is exactly why AGENTS.md forbids turning a red gate green
+by weakening an assertion. It is restored, and it now says in its docstring what
+it is protecting rather than only what it forbids.
+
+**Two ratified requirements could not both be met.** "Every job excludes the
+closed action" and "the Windows PR proof is byte-exact" are unsatisfiable
+together, and no amount of care in `ci.yml` resolves it. That is a decision, not
+an implementation detail, so it is written down as #874 rather than split
+silently: precedence went to the authority proof, and the exception is pinned to
+exactly two jobs in
+`test_main_baseline.py::ConcurrencySemanticsTests.UNGUARDABLE_JOBS` so a third
+cannot join them quietly.
+
+**The mechanism the checkers could not see.** A job-level `if:` is invisible as
+a *guard* to a checker reading for *registration*: both are the same key. The
+transitive form separates them -- the guard lives on the dependency, the
+registration stays unconditional on the job -- and it is what makes both
+requirements expressible for every job that is allowed a `needs:` at all.
 
 ## Now
 
-Implemented and gated. Awaiting review on the pull request.
+Implemented and gated. #873's repair is on its own pull request; #874 is owed.
