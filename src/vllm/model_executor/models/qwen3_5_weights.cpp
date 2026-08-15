@@ -499,12 +499,32 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   return r;
 }
 
-GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
+GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base,
+                        MoeProjDtype in_dtype) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  // W8A8 fp8 (35B), DEFAULT: keep raw fp8 + input_scale, run the native fp8 GEMM.
-  // VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields (parent A/B).
-  if (DenseNativeEnabled()) {
+  // THE BF16 GDN TOWER (issue #864) -- what `Qwen/Qwen3.6-35B-A3B` and
+  // `Qwen/Qwen3.8-2.4T-A95B` actually ship, both of which carry ZERO
+  // `weight_scale` tensors. Selected by tensor PRESENCE
+  // (`ResolveQwen3_5MoeTowerDtypes`), NOT by `DenseNativeEnabled()`: that lever
+  // switches fp8-resident against fp8-dequant and both of its arms would read
+  // an fp8 tensor here.
+  //
+  // The destination is the SAME bf16 Matmul-B `[in, out]` field the
+  // `VT_DENSE_NATIVE=0` dequant arm below fills (`qwen3_5_weights.h:289-312`),
+  // so the forward is reached unchanged -- `ProjectGdn*` already selects the
+  // bf16 field when the fp8 one is empty, which is the path the GGUF and
+  // synthetic loaders have always taken. The transpose runs through
+  // `LoadBf16Transposed` -> `TransposeBf16Strided` -> `vt::LoadUnaligned`, so a
+  // tower tensor at an odd safetensors offset is read the one legal way (#627).
+  if (in_dtype == MoeProjDtype::kBf16) {
+    g.in_proj_qkv = LoadBf16Transposed(get, la + "in_proj_qkv.weight");
+    g.in_proj_z = LoadBf16Transposed(get, la + "in_proj_z.weight");
+    g.out_proj = LoadBf16Transposed(get, la + "out_proj.weight");
+  } else if (DenseNativeEnabled()) {
+    // W8A8 fp8 (35B), DEFAULT: keep raw fp8 + input_scale, run the native fp8
+    // GEMM. VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields
+    // (parent A/B).
     g.in_proj_qkv_fp8 = LoadFp8Raw(get, la + "in_proj_qkv");
     g.in_proj_z_fp8 = LoadFp8Raw(get, la + "in_proj_z");
     g.out_proj_fp8 = LoadFp8Raw(get, la + "out_proj");
@@ -528,12 +548,22 @@ GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
 }
 
 FullAttnLayerWeights LoadAttn(const TensorResolver& get,
-                              const std::string& base) {
+                              const std::string& base, MoeProjDtype in_dtype) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  // W8A8 fp8 (35B), DEFAULT: keep raw fp8 + input_scale, run the native fp8 GEMM.
-  // VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields (parent A/B).
-  if (DenseNativeEnabled()) {
+  // THE BF16 ATTENTION TOWER (issue #864). Same reasoning as `LoadGdn` above:
+  // selected by tensor presence, landing in the SAME bf16 Matmul-B `[in, out]`
+  // fields the fp8-dequant arm fills (`qwen3_5_weights.h:347-350`), which the
+  // GGUF and synthetic loaders already populate and the forward already reads.
+  if (in_dtype == MoeProjDtype::kBf16) {
+    a.q_proj = LoadBf16Transposed(get, sa + "q_proj.weight");
+    a.k_proj = LoadBf16Transposed(get, sa + "k_proj.weight");
+    a.v_proj = LoadBf16Transposed(get, sa + "v_proj.weight");
+    a.o_proj = LoadBf16Transposed(get, sa + "o_proj.weight");
+  } else if (DenseNativeEnabled()) {
+    // W8A8 fp8 (35B), DEFAULT: keep raw fp8 + input_scale, run the native fp8
+    // GEMM. VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields
+    // (parent A/B).
     a.q_proj_fp8 = LoadFp8Raw(get, sa + "q_proj");
     a.k_proj_fp8 = LoadFp8Raw(get, sa + "k_proj");
     a.v_proj_fp8 = LoadFp8Raw(get, sa + "v_proj");
@@ -738,7 +768,8 @@ void LoadMoeExpertsStackedBf16Into(const TensorResolver& get,
 
 MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
                         int64_t num_experts, bool with_experts,
-                        MoeExpertLayout layout, int64_t hidden) {
+                        MoeExpertLayout layout, int64_t hidden,
+                        MoeProjDtype shared_dtype) {
   const std::string mlp = base + "mlp.";
   MoeBlockWeights m;
   m.router_gate = LoadBf16Transposed(get, mlp + "gate.weight");
@@ -757,9 +788,20 @@ MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
     }
   }
   const std::string se = mlp + "shared_expert.";
-  m.shared_gate_proj_fp4 = LoadNvfp4Raw(get, se + "gate_proj");
-  m.shared_up_proj_fp4 = LoadNvfp4Raw(get, se + "up_proj");
-  m.shared_down_proj_fp4 = LoadNvfp4Raw(get, se + "down_proj");
+  // THE BF16 SHARED EXPERT (issue #864). Destination convention is the bf16 one
+  // the header declares (`qwen3_5_weights.h:432-434`): gate/up `[H, Is]`, down
+  // `[Is, H]`, i.e. transposed from the checkpoint's `[out, in]` -- the same
+  // fields the GGUF and synthetic arms fill, so `MoeBlock`'s bf16 branch reads
+  // it unchanged. Exactly one of the bf16 and fp4 sets is populated.
+  if (shared_dtype == MoeProjDtype::kBf16) {
+    m.shared_gate_proj = LoadBf16Transposed(get, se + "gate_proj.weight");
+    m.shared_up_proj = LoadBf16Transposed(get, se + "up_proj.weight");
+    m.shared_down_proj = LoadBf16Transposed(get, se + "down_proj.weight");
+  } else {
+    m.shared_gate_proj_fp4 = LoadNvfp4Raw(get, se + "gate_proj");
+    m.shared_up_proj_fp4 = LoadNvfp4Raw(get, se + "up_proj");
+    m.shared_down_proj_fp4 = LoadNvfp4Raw(get, se + "down_proj");
+  }
   return m;
 }
 
@@ -770,7 +812,8 @@ Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
                                      int64_t layer_idx, int64_t num_experts,
                                      bool with_experts,
                                      const std::string& backbone_prefix,
-                                     MoeExpertLayout layout, int64_t hidden) {
+                                     MoeExpertLayout layout, int64_t hidden,
+                                     const Qwen3_5MoeTowerDtypes& tower) {
   const std::string base =
       backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5MoeLayerWeights layer;
@@ -779,14 +822,15 @@ Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
       LoadBf16Direct(get, base + "post_attention_layernorm.weight");
   if (layer_type == "linear_attention") {
     layer.is_linear_attention = true;
-    layer.gdn = LoadGdn(get, base);
+    layer.gdn = LoadGdn(get, base, tower.gdn);
   } else if (layer_type == "full_attention") {
     layer.is_linear_attention = false;
-    layer.attn = LoadAttn(get, base);
+    layer.attn = LoadAttn(get, base, tower.attn);
   } else {
     VT_CHECK(false, "qwen3_5 weights: unknown layer_type " + layer_type);
   }
-  layer.moe = LoadMoe(get, base, num_experts, with_experts, layout, hidden);
+  layer.moe = LoadMoe(get, base, num_experts, with_experts, layout, hidden,
+                      tower.shared_expert);
   return layer;
 }
 
@@ -823,11 +867,15 @@ bool HasBackboneUnder(const std::vector<std::string>& names,
 //
 // WHAT IS STILL NOT IMPLEMENTED, and is refused rather than discovered: an
 // unquantized PER-EXPERT layout, a non-bf16 stacked one (refused by dtype in the
-// stacked reader itself), and an unquantized `lm_head`. So a fully published
-// bf16 repo still does not load end to end — its routed experts now read, but
-// its head does not, and neither does its bf16 attention/GDN tower, which this
-// arm implements only as per-tensor FP8. Both remain OWED and out of scope in
-// .agents/specs/moe-bf16-stacked-experts.md §Scope.
+// stacked reader itself), an NVFP4 attention or GDN tower, an FP8 shared expert,
+// and an FP8 `lm_head`. Every one of those already FAILED before #864 -- at a
+// raw dtype complaint from inside a reader -- so refusing them by name is
+// strictly a better report of the same unsupported checkpoint.
+//
+// The bf16 tower, bf16 shared expert and bf16 `lm_head` are NO LONGER refused:
+// issue #864 implements all four, which is what makes a published Qwen bf16 MoE
+// repo load. The refusals below were narrowed for exactly those shapes and for
+// nothing else.
 //
 // AGENTS.md: an arm that is not implemented "is refused with a message naming
 // the missing piece ... never left to be discovered later". Left alone, such a
@@ -848,11 +896,13 @@ static const std::string kMoeExpertLayoutHelp =
     "Qwen/Qwen3.8-2.4T-A95B and Qwen/Qwen3.6-35B-A3B repos ship; and per-expert "
     "NVFP4 -- <layer>.mlp.experts.<e>.{gate,up,down}_proj.weight (U8 packed) + "
     ".weight_scale (F8_E4M3) + .weight_scale_2, which is what an NVFP4 requant "
-    "(e.g. nvidia/Qwen3.6-35B-A3B-NVFP4) ships and which lm_head must use too. "
+    "(e.g. nvidia/Qwen3.6-35B-A3B-NVFP4) ships. Outside the routed experts it "
+    "reads a BF16 or per-tensor-FP8 attention/GDN tower, a BF16 or NVFP4 shared "
+    "expert, and a BF16 or NVFP4 lm_head, each resolved by tensor presence. "
     "Per-expert-but-unquantized experts, a non-BF16 stacked expert tensor, an "
-    "unquantized lm_head, and a bf16 (rather than per-tensor FP8) attention/GDN "
-    "tower are all still OWED, not silently unsupported: see "
-    ".agents/specs/moe-bf16-stacked-experts.md.";
+    "NVFP4 attention/GDN tower, an FP8 shared expert and an FP8 lm_head are all "
+    "still OWED, not silently unsupported: see "
+    ".agents/specs/moe-bf16-tower-arms.md.";
 
 // True iff `name` is a routed-expert tensor under this checkpoint's backbone,
 // and if so whether it is the PER-EXPERT spelling (`experts.<digit>...`) rather
@@ -869,11 +919,12 @@ bool ClassifyRoutedExpertName(const std::string& name,
   return true;
 }
 
-// Inert on either supported layout — every name it inspects already has to exist
+// Inert on every supported layout — every name it inspects already has to exist
 // for the load to succeed at all.
-void CheckMoeExpertLayoutSupported(const std::vector<std::string>& names,
-                                   const std::string& backbone,
-                                   MoeExpertLayout layout) {
+void CheckMoeQuantLayoutSupported(const std::vector<std::string>& names,
+                                  const std::string& backbone,
+                                  MoeExpertLayout layout,
+                                  const Qwen3_5MoeTowerDtypes& tower) {
   const std::string& kRequired = kMoeExpertLayoutHelp;
   const std::string layers = backbone + "layers.";
   const std::string weight = ".weight";
@@ -895,16 +946,33 @@ void CheckMoeExpertLayoutSupported(const std::vector<std::string>& names,
                    kRequired);
     }
   }
-  // The MoE head is likewise NVFP4-only here, where the DENSE loader routes a
-  // head by dtype (`LoadDenseLmHead` / `LoadLmHeadAnyDtype`). A checkpoint with
-  // no `lm_head.weight` at all is the tied-head case and is not this refusal.
-  if (present.count("lm_head.weight") != 0 &&
-      present.count("lm_head.weight_scale") == 0) {
-    VT_CHECK(false,
-             "qwen3_5 weights: an unquantized lm_head is not implemented for "
-             "the safetensors MoE arm -- \"lm_head.weight\" has no "
-             "\"lm_head.weight_scale\" beside it." +
-                 kRequired);
+  // ...and the three NON-routed components, refused by the dtype the probe
+  // RESOLVED rather than discovered as a complaint from inside a reader (#490).
+  // Each of these already failed before #864; naming it is the whole change.
+  const auto refuse = [&kRequired](const char* what, MoeProjDtype got,
+                                   const char* supported) {
+    VT_CHECK(false, std::string("qwen3_5 weights: a ") +
+                        MoeProjDtypeName(got) + " " + what +
+                        " is not implemented for the safetensors MoE arm -- it "
+                        "reads " +
+                        supported + " there." + kRequired);
+  };
+  if (tower.gdn == MoeProjDtype::kNvfp4) {
+    refuse("GDN tower (<layer>.linear_attn.{in_proj_qkv,in_proj_z,out_proj})",
+           tower.gdn, "BF16 or per-tensor FP8");
+  }
+  if (tower.attn == MoeProjDtype::kNvfp4) {
+    refuse("attention tower (<layer>.self_attn.{q,k,v,o}_proj)", tower.attn,
+           "BF16 or per-tensor FP8");
+  }
+  if (tower.shared_expert == MoeProjDtype::kFp8) {
+    refuse("shared expert (<layer>.mlp.shared_expert.{gate,up,down}_proj)",
+           tower.shared_expert, "BF16 or NVFP4");
+  }
+  if (tower.lm_head == MoeProjDtype::kFp8) {
+    // The DENSE loader dequantizes an FP8 head (`LoadLmHeadAnyDtype`); the MoE
+    // arm does not, and says so rather than dying on a dtype assert.
+    refuse("lm_head", tower.lm_head, "BF16 or NVFP4");
   }
 }
 
@@ -939,6 +1007,141 @@ MoeExpertLayout ResolveQwen3_5MoeExpertLayout(
                kMoeExpertLayoutHelp);
   return saw_stacked ? MoeExpertLayout::kStackedBf16
                      : MoeExpertLayout::kPerExpertNvfp4;
+}
+
+const char* MoeProjDtypeName(MoeProjDtype dtype) {
+  switch (dtype) {
+    case MoeProjDtype::kBf16:
+      return "BF16";
+    case MoeProjDtype::kFp8:
+      return "per-tensor FP8";
+    case MoeProjDtype::kNvfp4:
+      return "NVFP4";
+  }
+  return "unknown";
+}
+
+// THE DENSE ARM'S LADDER, MIRRORED EXACTLY (qwen3_5_dense_weights.cpp:357-359
+// `IsNvfp4Projection`, :475-484 `load_projection`). See the header for why the
+// order matters and what binds the two in test.
+MoeProjDtype ClassifyQwen3_5Projection(const TensorDtypeProbe& dtype_of,
+                                       const std::string& proj) {
+  // 1. NVFP4 under EITHER spelling: compressed-tensors names the packed weight
+  //    `weight_packed`; ModelOpt keeps `.weight` and adds `weight_scale_2`.
+  //    Probing only one of the two missed nvidia/Qwen3.6-27B-NVFP4 entirely.
+  if (!dtype_of(proj + ".weight_packed").empty() ||
+      !dtype_of(proj + ".weight_scale_2").empty()) {
+    return MoeProjDtype::kNvfp4;
+  }
+  // 2. per-tensor FP8, decided by the WEIGHT'S OWN DTYPE and not by the presence
+  //    of a scale: a `.weight` that is F8_E4M3 with no `weight_scale` beside it
+  //    is a broken fp8 projection, and it must fail as one (naming the missing
+  //    scale) rather than be re-read as bf16 and produce garbage.
+  const std::string weight_dtype = dtype_of(proj + ".weight");
+  if (weight_dtype == "F8_E4M3") return MoeProjDtype::kFp8;
+  // 3. otherwise plain BF16 -- what every published Qwen bf16 MoE repo ships.
+  //
+  // ...but ONLY if the weight really is bf16. A `.weight` that is U8 has packed
+  // 4-bit codes in it and is an NVFP4 projection MISSING ITS GLOBAL SCALE, and
+  // falling through to the bf16 arm reports that as "expected BF16 for
+  // <proj>.weight" -- the exact shape of complaint issue #490 exists to stop,
+  // because it reads as a corrupt checkpoint rather than as an absent tensor.
+  // The DENSE arm has the same hole (`LoadBf16RawNK` asserts the dtype); naming
+  // the missing companion is strictly a better report of the same refusal and
+  // changes no answer for a well-formed projection.
+  VT_CHECK(weight_dtype.empty() || weight_dtype == "BF16",
+           "qwen3_5 weights: \"" + proj + ".weight\" is " + weight_dtype +
+               ", which this loader can only read as a QUANTIZED projection, "
+               "and the tensor that says which is missing: an NVFP4 weight "
+               "needs \"" +
+               proj + ".weight_scale_2\" (ModelOpt) or the compressed-tensors "
+                      "\"" +
+               proj + ".weight_packed\" spelling beside it, and an F8_E4M3 "
+                      "weight needs \"" +
+               proj + ".weight_scale\"." + kMoeExpertLayoutHelp);
+  return MoeProjDtype::kBf16;
+}
+
+bool Qwen3_5ProjectionPresent(const TensorDtypeProbe& dtype_of,
+                              const std::string& proj) {
+  return !dtype_of(proj + ".weight").empty() ||
+         !dtype_of(proj + ".weight_packed").empty();
+}
+
+namespace {
+
+// One component's vote. `resolved` is the decision so far and `owner` the
+// projection that cast it, so a disagreement can name BOTH sides.
+struct TowerVote {
+  MoeProjDtype resolved = MoeProjDtype::kBf16;
+  std::string owner;
+  bool seen = false;
+};
+
+void CastTowerVote(const TensorDtypeProbe& dtype_of, const std::string& proj,
+                   const char* component, TowerVote& vote) {
+  if (!Qwen3_5ProjectionPresent(dtype_of, proj)) return;
+  const MoeProjDtype got = ClassifyQwen3_5Projection(dtype_of, proj);
+  if (!vote.seen) {
+    vote.resolved = got;
+    vote.owner = proj;
+    vote.seen = true;
+    return;
+  }
+  VT_CHECK(got == vote.resolved,
+           std::string("qwen3_5 weights: the ") + component +
+               " disagrees with itself about its quantization -- \"" +
+               vote.owner + "\" is " + MoeProjDtypeName(vote.resolved) +
+               " but \"" + proj + "\" is " + MoeProjDtypeName(got) +
+               ". This loader resolves each component ONCE per checkpoint and "
+               "refuses a component bound half from each dtype, exactly as it "
+               "refuses a mixed weight namespace and a mixed routed-expert "
+               "layout: a half-quantized tower loads cleanly and produces wrong "
+               "logits rather than an error." +
+               kMoeExpertLayoutHelp);
+}
+
+}  // namespace
+
+Qwen3_5MoeTowerDtypes ResolveQwen3_5MoeTowerDtypes(
+    const TensorDtypeProbe& dtype_of, const std::string& backbone_prefix,
+    const std::vector<std::string>& layer_types) {
+  TowerVote gdn;
+  TowerVote attn;
+  TowerVote shared;
+  TowerVote head;
+  for (size_t l = 0; l < layer_types.size(); ++l) {
+    const std::string base =
+        backbone_prefix + "layers." + std::to_string(l) + ".";
+    if (layer_types[l] == "linear_attention") {
+      const std::string la = base + "linear_attn.";
+      for (const char* p : {"in_proj_qkv", "in_proj_z", "out_proj"}) {
+        CastTowerVote(dtype_of, la + p, "GDN tower", gdn);
+      }
+    } else if (layer_types[l] == "full_attention") {
+      const std::string sa = base + "self_attn.";
+      for (const char* p : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+        CastTowerVote(dtype_of, sa + p, "attention tower", attn);
+      }
+    }
+    // Every Qwen3.5 MoE layer carries the shared expert, whichever attention
+    // kind it is.
+    const std::string se = base + "mlp.shared_expert.";
+    for (const char* p : {"gate_proj", "up_proj", "down_proj"}) {
+      CastTowerVote(dtype_of, se + p, "shared expert", shared);
+    }
+  }
+  // The head is TOP-LEVEL (unprefixed) in both published spellings. A checkpoint
+  // with no head at all is the tied-word-embeddings case; it casts no vote and
+  // the load then fails at the reader, exactly as it did before.
+  CastTowerVote(dtype_of, "lm_head", "lm_head", head);
+
+  Qwen3_5MoeTowerDtypes tower;
+  if (gdn.seen) tower.gdn = gdn.resolved;
+  if (attn.seen) tower.attn = attn.resolved;
+  if (shared.seen) tower.shared_expert = shared.resolved;
+  if (head.seen) tower.lm_head = head.resolved;
+  return tower;
 }
 
 std::string ResolveQwen3_5BackbonePrefix(
@@ -1009,9 +1212,43 @@ void PlanNvfp4(std::vector<PlannedTensor>& p, const std::string& proj,
   p.push_back({proj + ".weight_scale_2", "F32", {}, false});
 }
 
+// Mirror of the TOWER dispatch `LoadGdn` / `LoadAttn` perform (issue #864). A
+// BF16 projection asks for ONE tensor where an FP8 one asks for two or three,
+// so the arm is a request-set difference and the plan must take the same one.
+void PlanTowerProjection(std::vector<PlannedTensor>& p, const std::string& proj,
+                         std::vector<int64_t> shape, MoeProjDtype dtype) {
+  if (dtype == MoeProjDtype::kBf16) {
+    PlanBf16(p, proj + ".weight", std::move(shape));
+    return;
+  }
+  VT_CHECK(dtype == MoeProjDtype::kFp8,
+           "qwen3_5 weights: the MoE attention/GDN tower reads BF16 or "
+           "per-tensor FP8; there is no plan for a " +
+               std::string(MoeProjDtypeName(dtype)) + " " + proj);
+  PlanFp8(p, proj, std::move(shape));
+}
+
+// Mirror of the SINK dispatch (`LoadMoe`'s shared expert, and `lm_head` in
+// `LoadQwen3_5Moe`): BF16 `[out, in]` verbatim, or the NVFP4 triple.
+void PlanSinkProjection(std::vector<PlannedTensor>& p, const std::string& proj,
+                        int64_t out_dim, int64_t in_dim, MoeProjDtype dtype) {
+  if (dtype == MoeProjDtype::kBf16) {
+    const bool known = out_dim > 0 && in_dim > 0;
+    PlanBf16(p, proj + ".weight",
+             known ? std::vector<int64_t>{out_dim, in_dim}
+                   : std::vector<int64_t>{});
+    return;
+  }
+  VT_CHECK(dtype == MoeProjDtype::kNvfp4,
+           "qwen3_5 weights: the MoE shared expert and lm_head read BF16 or "
+           "NVFP4; there is no plan for a " +
+               std::string(MoeProjDtypeName(dtype)) + " " + proj);
+  PlanNvfp4(p, proj, out_dim, in_dim);
+}
+
 // Mirror of `LoadGdn`.
 void PlanGdn(std::vector<PlannedTensor>& p, const HfConfig& c,
-             const std::string& base) {
+             const std::string& base, MoeProjDtype tower_dtype) {
   const std::string la = base + "linear_attn.";
   const int64_t h = c.hidden_size;
   // The GDN input projection packs q, k and v: two key groups of
@@ -1022,9 +1259,9 @@ void PlanGdn(std::vector<PlannedTensor>& p, const HfConfig& c,
       2 * c.linear_num_key_heads * c.linear_key_head_dim +
       c.linear_num_value_heads * c.linear_value_head_dim;
   const int64_t v_dim = c.linear_num_value_heads * c.linear_value_head_dim;
-  PlanFp8(p, la + "in_proj_qkv", {qkv, h});
-  PlanFp8(p, la + "in_proj_z", {v_dim, h});
-  PlanFp8(p, la + "out_proj", {h, v_dim});
+  PlanTowerProjection(p, la + "in_proj_qkv", {qkv, h}, tower_dtype);
+  PlanTowerProjection(p, la + "in_proj_z", {v_dim, h}, tower_dtype);
+  PlanTowerProjection(p, la + "out_proj", {h, v_dim}, tower_dtype);
   PlanBf16(p, la + "in_proj_b.weight", {c.linear_num_value_heads, h});
   PlanBf16(p, la + "in_proj_a.weight", {c.linear_num_value_heads, h});
   // `LoadGdn` REQUIRES rank 3 with a singleton middle before collapsing it.
@@ -1041,19 +1278,20 @@ void PlanGdn(std::vector<PlannedTensor>& p, const HfConfig& c,
 // depends on `attn_output_gate`, which `HfConfig` does not carry, so this
 // planner declines to state one rather than state a wrong one.
 void PlanAttn(std::vector<PlannedTensor>& p, const HfConfig& c,
-              const std::string& base) {
+              const std::string& base, MoeProjDtype tower_dtype) {
   const std::string sa = base + "self_attn.";
-  PlanFp8(p, sa + "q_proj", {});
-  PlanFp8(p, sa + "k_proj", {});
-  PlanFp8(p, sa + "v_proj", {});
-  PlanFp8(p, sa + "o_proj", {});
+  PlanTowerProjection(p, sa + "q_proj", {}, tower_dtype);
+  PlanTowerProjection(p, sa + "k_proj", {}, tower_dtype);
+  PlanTowerProjection(p, sa + "v_proj", {}, tower_dtype);
+  PlanTowerProjection(p, sa + "o_proj", {}, tower_dtype);
   PlanBf16(p, sa + "q_norm.weight", {c.head_dim});
   PlanBf16(p, sa + "k_norm.weight", {c.head_dim});
 }
 
 // Mirror of `LoadMoe` + `LoadMoeExpertsInto` / `LoadMoeExpertsStackedBf16Into`.
 void PlanMoe(std::vector<PlannedTensor>& p, const HfConfig& c,
-             const std::string& base, MoeExpertLayout layout) {
+             const std::string& base, MoeExpertLayout layout,
+             MoeProjDtype shared_dtype) {
   const std::string mlp = base + "mlp.";
   const int64_t h = c.hidden_size;
   const int64_t inter = c.moe_intermediate_size;
@@ -1081,16 +1319,17 @@ void PlanMoe(std::vector<PlannedTensor>& p, const HfConfig& c,
   }
   const std::string se = mlp + "shared_expert.";
   const int64_t si = c.shared_expert_intermediate_size;
-  PlanNvfp4(p, se + "gate_proj", si, h);
-  PlanNvfp4(p, se + "up_proj", si, h);
-  PlanNvfp4(p, se + "down_proj", h, si);
+  PlanSinkProjection(p, se + "gate_proj", si, h, shared_dtype);
+  PlanSinkProjection(p, se + "up_proj", si, h, shared_dtype);
+  PlanSinkProjection(p, se + "down_proj", h, si, shared_dtype);
 }
 
 }  // namespace
 
 std::vector<PlannedTensor> PlanQwen3_5MoeLoad(const HfConfig& config,
                                               const std::string& backbone_prefix,
-                                              MoeExpertLayout layout) {
+                                              MoeExpertLayout layout,
+                                              Qwen3_5MoeTowerDtypes tower) {
   // The same two preconditions `LoadQwen3_5Moe` checks before it reads anything.
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
@@ -1103,7 +1342,8 @@ std::vector<PlannedTensor> PlanQwen3_5MoeLoad(const HfConfig& config,
   PlanBf16(p, backbone_prefix + "embed_tokens.weight",
            {config.vocab_size, config.hidden_size});
   PlanBf16(p, backbone_prefix + "norm.weight", {config.hidden_size});
-  PlanNvfp4(p, "lm_head", config.vocab_size, config.hidden_size);
+  PlanSinkProjection(p, "lm_head", config.vocab_size, config.hidden_size,
+                     tower.lm_head);
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const std::string base =
         backbone_prefix + "layers." + std::to_string(l) + ".";
@@ -1111,13 +1351,13 @@ std::vector<PlannedTensor> PlanQwen3_5MoeLoad(const HfConfig& config,
     PlanBf16(p, base + "post_attention_layernorm.weight", {config.hidden_size});
     const std::string& type = config.layer_types[static_cast<size_t>(l)];
     if (type == "linear_attention") {
-      PlanGdn(p, config, base);
+      PlanGdn(p, config, base, tower.gdn);
     } else if (type == "full_attention") {
-      PlanAttn(p, config, base);
+      PlanAttn(p, config, base, tower.attn);
     } else {
       VT_CHECK(false, "qwen3_5 weights: unknown layer_type " + type);
     }
-    PlanMoe(p, config, base, layout);
+    PlanMoe(p, config, base, layout, tower.shared_expert);
   }
   return p;
 }
@@ -1128,9 +1368,11 @@ Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
                                            int64_t num_experts,
                                            const std::string& backbone_prefix,
                                            MoeExpertLayout layout,
-                                           int64_t hidden) {
+                                           int64_t hidden,
+                                           Qwen3_5MoeTowerDtypes tower) {
   return LoadLayerImpl(get, layer_type, layer_idx, num_experts,
-                       /*with_experts=*/true, backbone_prefix, layout, hidden);
+                       /*with_experts=*/true, backbone_prefix, layout, hidden,
+                       tower);
 }
 
 Qwen3_5MoeWeights LoadQwen3_5Moe(
@@ -1160,10 +1402,24 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   // decided here and THREADED, never re-probed per lookup.
   const MoeExpertLayout expert_layout =
       ResolveQwen3_5MoeExpertLayout(all_names, backbone);
+  // ...and ONE decision per NON-routed component (issue #864): the GDN tower,
+  // the attention tower, the shared expert and `lm_head`, each resolved from the
+  // same index by the same ladder the DENSE loader uses, and THREADED. A
+  // per-lookup probe could answer differently per layer, which is how a
+  // checkpoint ends up half quantized and half bf16 while still appearing to
+  // load. Reading only the header, so no weight byte is touched here.
+  const TensorDtypeProbe dtype_of =
+      [&where](const std::string& name) -> std::string {
+    auto it = where->find(name);
+    if (it == where->end()) return std::string();
+    return it->second->Get(name).dtype;
+  };
+  const Qwen3_5MoeTowerDtypes tower =
+      ResolveQwen3_5MoeTowerDtypes(dtype_of, backbone, config.layer_types);
   // ...and then, before any tensor is touched, an arm we do not implement is
   // refused by name rather than discovered as a dtype complaint about `lm_head`
   // (issue #490).
-  CheckMoeExpertLayoutSupported(all_names, backbone, expert_layout);
+  CheckMoeQuantLayoutSupported(all_names, backbone, expert_layout, tower);
   const TensorResolver get =
       [where](const std::string& name) -> const StTensor& {
     auto it = where->find(name);
@@ -1190,14 +1446,23 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   Qwen3_5MoeWeights w;
   w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
   w.final_norm = LoadBf16Direct(get, backbone + "norm.weight");
-  w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head");  // M2.2b fp4-resident
+  // THE BF16 OUTPUT HEAD (issue #864): `lm_head.weight` [vocab, H] -> owned bf16
+  // [H, vocab], the Matmul-B orientation `DenseLmHead`/`MoeLogits` already reads
+  // on the GGUF and tied paths (`qwen3_5_weights.h:469`, `qwen3_5.cpp:7101`).
+  // Exactly one of `lm_head` and `lm_head_fp4` is populated, and the NVFP4 arm
+  // is byte-unchanged for every gated row.
+  if (tower.lm_head == MoeProjDtype::kBf16) {
+    w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
+  } else {
+    w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head");  // M2.2b fp4-resident
+  }
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadLayerImpl(get,
                                      config.layer_types[static_cast<size_t>(l)],
                                      l, config.num_experts,
                                      /*with_experts=*/!defer_experts, backbone,
-                                     expert_layout, config.hidden_size));
+                                     expert_layout, config.hidden_size, tower));
   }
 
   if (defer_experts) {
