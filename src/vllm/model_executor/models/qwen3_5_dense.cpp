@@ -106,7 +106,7 @@ void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
   // PERF-27B-LMHEAD-FP4 (issue #213): build the packed lm_head's resident HERE —
   // on CUDA before the runner captures a decode graph, elsewhere before the first
   // forward pays the dequant. Inert on every BF16/FP8/GGUF/tied checkpoint.
-  auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
+  auto& qwen = ModelAs<Qwen3_5DenseLoadedModel>(model, "Qwen3_5ForConditionalGeneration");
   Qwen3_5DenseModel::PrepareLmHeadResident(qwen.weights(), queue);
   // PERF-27B-GDN-FP8-QKVZ: build the merged FP8 GDN [qkv;z] operand here, at
   // model prepare — before the first forward, so it can never allocate or copy
@@ -117,7 +117,7 @@ void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
                                   const ModelForwardInput& input) {
-  auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
+  auto& qwen = ModelAs<Qwen3_5DenseLoadedModel>(model, "Qwen3_5ForConditionalGeneration");
   const Qwen3_5DenseWeights& weights = qwen.weights();
 
   // ENG-ASYNC-SCHED W4: publish the async runner's device-resident input ids for

@@ -1994,3 +1994,14 @@ target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# The registry type-confusion CLASS gate (#847, .agents/specs/registry-downcast-sweep.md).
+# One case per SHAPE of the swept `static_cast<XLoadedModel&>(model)` site — const
+# and non-const binding, `prepare` and `forward`, an alias family that shares one
+# factory across two registered architectures, and the one inline-call site that a
+# uniform search-and-replace over the other 33 would step past. Every case enters
+# through the production seam (`reg.factory->forward` / `->prepare`, what
+# `ModelRegistry::Forward` calls) and refuses before any weight is touched, so it is
+# CPU-only and needs no checkpoint.
+vllm_cpp_add_test(test_registry_downcast_refusal
+  vllm/models/test_registry_downcast_refusal.cpp)

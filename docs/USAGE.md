@@ -447,10 +447,15 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
-A refusal here is always a thrown message you can read. `NemotronHForCausalLM`
-also refuses when it is handed a model some other architecture loaded, naming
-both itself and the architecture the passed model claims, instead of reading
-that model as though it were its own (#775).
+A refusal here is always a thrown message you can read. Every registered
+architecture also refuses when it is handed a model some other architecture
+loaded, naming both itself and the architecture the passed model claims, instead
+of reading that model as though it were its own (#775, swept across the
+remaining 34 entry points in #847). Where two architecture names share one
+implementation — `Olmo2ForCausalLM` and `Olmo3ForCausalLM`, or
+`LlamaForCausalLM` and `InternLM3ForCausalLM` — the refusal names the family's
+primary architecture as the one that refused, and the alias you asked for as
+what the passed model claimed.
 
 ### LTX-2.5: what runs, and what it cannot do
 
