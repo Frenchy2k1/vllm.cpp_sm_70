@@ -277,6 +277,13 @@ vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
 target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX25-TILED-DECODE (issue #644): the tiling algebra, the AUTO layout and the
+# STREAMING tiled decode, gated against upstream ltx_core executed at reduced
+# dimensions. Its own target so the decode arms — which run the reduced decoder 18
+# times per arm — do not lengthen test_ltx2_vae's recorded case count.
+# ltx2_tiling_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_tiling vllm/models/test_ltx2_tiling.cpp)
+target_include_directories(test_ltx2_tiling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # LTX-2.5 L3: the text conditioning path, gated against upstream ltx_core executed
 # at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
