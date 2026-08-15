@@ -262,6 +262,20 @@ complaint: an NVFP4 attention or GDN tower, an FP8 shared expert, an FP8
 `lm_head`, a per-expert-but-unquantized routed layout, and a non-BF16 stacked
 expert tensor.
 
+**The MoE arm's VISION TOWER.** `LoadQwen3_5Moe` reads the text backbone only.
+`Qwen/Qwen3.6-35B-A3B` ships 333 `model.visual.*` tensors alongside it, and until
+issue #891 they were dropped without a word — the load succeeded and produced a
+text-only model. `LoadQwen3_5MoeVision` now reads them, through the SAME
+`LoadQwen3VLVisionWeights` the dense `Qwen3_5ForConditionalGeneration` arm uses,
+with the tower geometry from the checkpoint's `vision_config` (depth 27, hidden
+1152, 16 heads, intermediate 4304, patch 16, spatial merge 2, EMPTY
+`deepstack_visual_indexes`) and `out_hidden_size` taken from the text hidden size
+because the merger writes into the text residual stream. A checkpoint carrying NO
+`model.visual.*` tensor is REFUSED naming them, rather than quietly loading a
+model that answers image prompts from text alone — `nvidia/Qwen3.6-35B-A3B-NVFP4`
+declares `vision_config` and ships no `visual.*` weights, and is exactly that
+case.
+
 **What is and is not proven about a published bf16 MoE repo.** Every arm is
 byte-exact on synthetic fixtures, and the real published `Qwen/Qwen3.6-35B-A3B`
 and `Qwen/Qwen3.8-2.4T-A95B` indices satisfy the load plan completely — every

@@ -110,7 +110,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | Architecture | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
 | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16 | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3 | `unsloth` 27B at/above vLLM, `nvidia` ModelOpt 0.85x; 4B throughput 1.021x. Loads BF16, FP8 and NVFP4 (CT + ModelOpt naming); a `modelopt_mixed` FP8 tower stays NATIVE (#164), GDN `in_proj_qkvz` merged. CUDA/CPU only |
-| `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
+| `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4 text; BF16 for the vision tower) | strict 315/315 text vs vLLM 0.25.0. Image/video IMPLEMENTED, NOT GATED (#891): the 333 `model.visual.*` tensors load and the tower runs on the real ckpt; the token-exact mm gate is OWED | gate model: 0.93x to 1.03x grid; NO mm speed claim |
 | `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | none: no text-only Qwen3.5 checkpoint fits this hardware | **NO RUN GATE, OWED.** Gated on `test_qwen3_8_text_only.cpp`; NO token claim. Loader reads stacked BF16 experts (#740) plus BF16 towers, shared expert and `lm_head` (#864), so both published indices satisfy the load plan | not measured |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
 | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |

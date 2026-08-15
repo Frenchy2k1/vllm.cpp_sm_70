@@ -334,6 +334,9 @@ vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_meth
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
+# MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
+# and the forked VL forward actually CONSUMES the merger rows.
+vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)
 # SPEC-MTP I5a: GDN layer spec routing (GdnBlockPaged spec branch) — needs the
 # internal header under src/ for the GdnBlockPagedForTest entry point.
 vllm_cpp_add_test(test_qwen3_5_gdn_spec_routing vllm/models/test_qwen3_5_gdn_spec_routing.cpp)
@@ -862,6 +865,12 @@ vllm_cpp_add_test(test_qwen3_5_vl_e2e vllm/multimodal/test_qwen3_5_vl_e2e.cpp)
 target_compile_definitions(test_qwen3_5_vl_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   GOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b")
+# MoE vision tower (#891) — the HARDWARE gate on Qwen/Qwen3.6-35B-A3B bf16: the
+# 333 model.visual.* tensors load and the tower runs; the full ~67 GiB e2e is
+# opt-in behind VLLM_MOE_VISION_E2E=1. Skipped without the checkpoint.
+vllm_cpp_add_test(test_qwen3_5_moe_vision_hw vllm/multimodal/test_qwen3_5_moe_vl_hw.cpp)
+target_compile_definitions(test_qwen3_5_moe_vision_hw PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl")
 # Vision-tower SPEED A-B (CLAIM-MULTIMODAL-SPEED-TOWER): baseline host-weights
 # forward (per-call marshal+compute) vs the resident-weights fast forward (compute
 # only), on the Qwen3.6-27B vision tower. Timing only; correctness is proven by

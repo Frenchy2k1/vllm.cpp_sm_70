@@ -20,6 +20,7 @@
 #endif
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/models/qwen3_vl.h"  // LoadQwen3VLVisionWeights (#891)
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/unaligned.h"
@@ -1498,6 +1499,52 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
     };
   }
   return w;
+}
+
+// ── The MoE arm's VISION TOWER (issue #891) ──────────────────────────────────
+// See the header for why this exists and why it refuses rather than shrugs.
+
+bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards) {
+  static const std::string kVisual = "model.visual.";
+  for (const SafetensorsFile& shard : shards)
+    for (const std::string& name : shard.Names())
+      if (name.compare(0, kVisual.size(), kVisual) == 0) return true;
+  return false;
+}
+
+multimodal::Qwen3VLVisionConfig Qwen3_5MoeVisionConfig(const HfConfig& config) {
+  multimodal::Qwen3VLVisionConfig v;
+  v.hidden_size = 1152;
+  v.num_heads = 16;
+  v.depth = 27;
+  v.intermediate_size = 4304;
+  // The merger writes straight into the text residual stream, so the tower's
+  // output width IS the text hidden size (2048 on Qwen3.6-35B-A3B).
+  v.out_hidden_size = config.hidden_size;
+  v.patch_size = 16;
+  v.temporal_patch_size = 2;
+  v.spatial_merge_size = 2;
+  v.num_position_embeddings = 2304;
+  v.in_channels = 3;
+  v.deepstack_visual_indexes = {};  // NO DeepStack on this family.
+  v.norm_eps = 1e-6f;
+  return v;
+}
+
+multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
+  VT_CHECK(HasQwen3_5MoeVisionTower(shards),
+           "qwen3_5 moe vision: this checkpoint carries NO `model.visual.*` "
+           "tensors, so it has no vision tower and cannot answer an image or "
+           "video prompt. A Qwen3.5-family *ForConditionalGeneration checkpoint "
+           "publishes its tower as `model.visual.patch_embed.proj.{weight,bias}`,"
+           " `model.visual.pos_embed.weight`, `model.visual.blocks.<0..depth-1>."
+           "{norm1,norm2,attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2}."
+           "{weight,bias}` and `model.visual.merger.*` (333 tensors on "
+           "Qwen/Qwen3.6-35B-A3B). Load the vision-inclusive repo; the text-only "
+           "and NVFP4-requant repos (e.g. nvidia/Qwen3.6-35B-A3B-NVFP4) declare "
+           "`vision_config` but ship no `visual.*` weights.");
+  return LoadQwen3VLVisionWeights(shards, Qwen3_5MoeVisionConfig(config));
 }
 
 }  // namespace vllm
