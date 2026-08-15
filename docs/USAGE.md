@@ -447,6 +447,11 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
+A refusal here is always a thrown message you can read. `NemotronHForCausalLM`
+also refuses when it is handed a model some other architecture loaded, naming
+both itself and the architecture the passed model claims, instead of reading
+that model as though it were its own (#775).
+
 ### LTX-2.5: what runs, and what it cannot do
 
 LTX-2.5 is reachable as video family `ltx-2.5`, through the same

@@ -1840,6 +1840,121 @@ on GB10, and this box finished the run at **95% full**, where an ENOSPC leaves
 the PREVIOUS binary in place and prints a green status
 ([[stale-binary-prints-green-status]], [[enospc-makes-checkers-emit-false-policy-refusals]]).
 
+## 6d. The forward's downcast was a promise, not a check (#775, 2026-08-14)
+
+**Issue:** [#775](https://github.com/mudler/vllm.cpp/issues/775). **Class
+residue:** [#847](https://github.com/mudler/vllm.cpp/issues/847). **Related, and
+NOT the same fix:** [#730](https://github.com/mudler/vllm.cpp/issues/730) / PR
+#784.
+
+`ForwardNemotronHForCausalLM` opened its handle with an unconditional
+`static_cast<NemotronHLoadedModel&>(model)` — the seam shape every other arch's
+forward shares. A `static_cast` down a hierarchy is a promise the compiler is
+entitled to act on, so on an object whose dynamic type is not that model, every
+`nh.` member call is type confusion. UBSan's vptr check named
+`nemotron_h_registry.cpp:112:30` (`nh.params()`, the member call THROUGH the
+reference; the cast itself is `:102`) and `-fno-sanitize-recover=all` aborted
+`test_nemotron_h_scaffold` on the `sanitize-cpu (address,undefined)` lane.
+
+**Why the earlier repair did not close it.** PR #784 fixed #730 by removing the
+`StubModel` the refusal subcase was handing in, so the subcase now forwards
+through the real `NemotronHLoadedModel` that `factory->load_weights` returns.
+That is a genuine improvement and it stands — but it cleared the *symptom* on
+the lane while leaving the cast unchecked. The UB happened on the way to a
+refusal that throws anyway, so nothing outside a sanitizer could ever see it,
+and it would have stayed invisible after the weight loader lands. Baseline
+measured at `0e8b15d56`: `test_nemotron_h_scaffold` is GREEN under
+address+undefined, 12 cases / 38286 assertions — i.e. the reported diagnostic is
+no longer reproducible verbatim, which is exactly why the cast needed fixing on
+its own evidence rather than on the old run's.
+
+**What was ported vs. written.** Nothing here mirrors an upstream path: vLLM's
+registry hands a Python object to a Python `forward`, so there is no C++ downcast
+to mirror and no upstream anchor to cite. `ModelAs` is written from scratch
+against the seam this project already has, and it mirrors the local established
+idiom rather than inventing one — `dynamic_cast`-with-refusal is how
+`kv_cache_spec_registry.cpp:162-193`, `single_type_kv_cache_manager.cpp:370-949`
+and `attention/backend.cpp:155` already establish a spec's or metadata's dynamic
+type before using it.
+
+**The fix.**
+`include/vllm/model_executor/models/model_registry.h` gains
+`vllm::ModelAs<Model>(model, architecture)` (and a `const` overload): a
+`dynamic_cast` and a branch, with the refusal authored ONCE, out of line, in
+`RaiseModelTypeMismatch` (`src/vllm/model_executor/models/model_registry.cpp`).
+The message names the entry point that refused and the architecture the passed
+model's own registration claims. `nemotron_h_registry.cpp:102` calls it.
+
+Cost: one `dynamic_cast` per forward *step*. `ModelRegistry::Forward`
+(`model_registry.cpp:326`) is the seam's single call site and is entered once per
+step, not per layer, against a step that is milliseconds of GEMMs.
+
+**Rejected alternatives.**
+
+1. *Compare `model.registration().architecture` against the expected name.* It
+   needs no RTTI, but it answers the wrong question: it establishes what the
+   registration claims, not what the object IS. The realistic defect — a caller
+   that resolves a registration and hands `factory->forward` a model another path
+   produced — carries the RIGHT architecture string on the WRONG object, so this
+   check passes and the UB proceeds. The RED test in this row is precisely that
+   shape.
+2. *Hand the forward a correctly-typed reference — make `forward` a virtual on
+   `LoadedModel`.* This removes the cast class entirely and is arguably the
+   better design. It is also a change to the `ModelFactory` seam and 32 model
+   TUs, against a deliberate type-erasure contract (`model_registry.h:300`,
+   "forward remains type-erased over LoadedModel"). Out of scope for a red-lane
+   repair; recorded in #847 as the option a sweep should weigh.
+3. *Fix the test again.* Refused by the issue and by this spec: the by-name
+   refusal on a missing weight loader is load-bearing, and the defect is in the
+   product path.
+
+**RED-first.** `tests/vllm/models/test_nemotron_h_scaffold.cpp` gains
+`NemotronH: the forward entry point REFUSES a foreign LoadedModel by name`,
+which hands `reg.factory->forward` a complete `ForeignLoadedModel` — a
+well-formed `LoadedModel` that simply is not a `NemotronHLoadedModel`. Against
+the unfixed cast it reproduced the issue's diagnostic exactly:
+
+```
+src/vllm/model_executor/models/nemotron_h_registry.cpp:112:30: runtime error:
+member call on address 0x7fffcab04070 which does not point to an object of type
+'NemotronHLoadedModel'
+0x7fffcab04070: note: object is of type '*N12_GLOBAL__N_118ForeignLoadedModelE'
+    #0 ForwardNemotronHForCausalLM nemotron_h_registry.cpp:112
+```
+
+process exit 1, no doctest summary reached. After the fix: 13 cases / 38289
+assertions, `Status: SUCCESS`.
+
+This test is NOT a revival of the stub #784 removed, and must not be "repaired"
+back into a real NemotronH model. That stub existed because the old subcase had
+no other way to reach the refusal, and it was wrong because the forward
+DEREFERENCED it. This one asserts the opposite guarantee — that the entry point
+establishes the dynamic type BEFORE any member call — and after the fix it
+performs no UB at all.
+
+**Mutation proof.** Applied alone, rebuilt, run, restored, checksums verified.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | `ModelAs<NemotronHLoadedModel>(...)` → `static_cast<NemotronHLoadedModel&>(model)` | RED: same UBSan vptr report at `nemotron_h_registry.cpp:118:30`, process aborted before any doctest summary |
+| M2 | `RaiseModelTypeMismatch` message replaced by `"model type mismatch"` | RED: 2 failed assertions, 12/13 cases, `Status: FAILURE!` — both by-name CHECKs fired |
+
+M2 is the one that matters for the *guarantee* rather than the crash: it proves
+the test is asserting a NAMED refusal, not merely the absence of an abort.
+
+**The class is 34 more sites, and it is NOT swept here.** `grep -rn
+"static_cast<[A-Za-z0-9_:]*LoadedModel&>" src/` returns 34 remaining
+`prepare`/`forward` entry points across 32 model TUs, all the same shape; there
+is no `const`-reference or pointer spelling, so that grep is the whole class.
+They are not swept in this change because the sweep is not mechanical:
+`llama_registry.cpp`, `qwen3_5_dense.cpp` and `gemma4_registry.cpp` each register
+THREE architectures against ONE forward and `mistral_registry.cpp` registers two,
+so those sites have no single architecture name to refuse under. That is a design
+question with three defensible answers, enumerated in #847, and answering it
+inside a red-lane repair would have made the repair unreviewable. This follows
+how the unaligned-read class was handled — named site in #674/PR #688, residue
+filed as #772 — rather than widening silently.
+
 ## 7. Now
 
 **State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
@@ -1906,3 +2021,14 @@ forward is still the HOST reference and nothing runs on the paged runner (W6).
   that is invisible to a token gate.
 - The non-gated expert cannot be expressed on the shared merged-GEMM seam →
   `NEEDS_DECISION`, do not fork a parallel MoE path.
+
+## Owed
+
+- [#847](https://github.com/mudler/vllm.cpp/issues/847) — the registry
+  type-confusion class this row's §6d fix names but does not sweep: 34
+  `prepare`/`forward` entry points across 32 model TUs still open a type-erased
+  `LoadedModel&` with an unchecked `static_cast`. Owed here, by the row that
+  found it, until a row claims the sweep. It is NOT NemotronH work — the sweep's
+  blocking question is what architecture name a shared forward refuses under when
+  one TU registers three architectures — and this entry exists so the class has a
+  named owner rather than sitting unowned.

@@ -119,7 +119,13 @@ void PrepareNemotronHForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardNemotronHForCausalLM(LoadedModel& model,
                                           const ModelForwardInput& input) {
-  auto& nh = static_cast<NemotronHLoadedModel&>(model);
+  // #775: CHECKED, not `static_cast`. A bare downcast down this hierarchy is a
+  // promise the compiler is entitled to act on, so on a model that is not
+  // really a `NemotronHLoadedModel` every `nh.` member call below is undefined
+  // behaviour — and it happens on the way to a refusal that throws anyway,
+  // which is what kept it invisible outside the sanitizer lane. `ModelAs`
+  // establishes the dynamic type first and refuses by name instead.
+  auto& nh = ModelAs<NemotronHLoadedModel>(model, "NemotronHForCausalLM");
   // W4: the hybrid layer loop, the Mamba2 mixer wiring, the 6 attention layers
   // and the MoE layers are ported (nemotron_h.cpp) and reached HERE, through the
   // shared `ModelRegistry::Forward` seam — never through a parallel entry point.
