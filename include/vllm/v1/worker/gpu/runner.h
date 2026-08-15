@@ -252,6 +252,23 @@ class GPUModelRunner final : public ModelRunnerBase {
   // value the old HF-config arithmetic could not.
   int64_t fa_page_size_bytes() const { return fa_page_size_bytes_; }
 
+  // #810: the per-layer KV class `initialize_kv_cache` RESOLVED, index == model
+  // layer index, one entry per hidden layer. `kNone` is a layer that no KV
+  // cache group named and that therefore caches nothing — NemotronH's 23
+  // MoE blocks, which upstream's module walk yields no kv_cache_spec entry for
+  // (`gpu_model_runner.py:7785-7801`). Recorded because the routing decision is
+  // otherwise observable only as buffer COUNTS, and a count cannot see a
+  // routing inversion: 3 recurrent + 1 attention has the same counts whichever
+  // three layers got which.
+  enum class LayerKvClass : uint8_t {
+    kNone = 0,
+    kFullAttention = 1,
+    kRecurrent = 2,
+  };
+  const std::vector<LayerKvClass>& layer_kv_class() const {
+    return layer_kv_class_;
+  }
+
   // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
   // ON, execute_model rebuilds each decode row's input token id from the
   // GPU-resident-analog InputBatch::last_sampled_tokens via
@@ -441,6 +458,8 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Per-block attention-cache bytes as reported by the KV spec (see the
   // fa_page_size_bytes() accessor).
   int64_t fa_page_size_bytes_ = 0;
+  // #810: per-layer KV class, index == model layer index (layer_kv_class()).
+  std::vector<LayerKvClass> layer_kv_class_;
   // Persistent-batch capacity = max concurrent sequences. The GDN mamba-state
   // cache is sized by this (one recurrent state per sequence), decoupled from
   // the attention num_blocks. See remap_gdn_state_slots.

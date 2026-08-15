@@ -812,6 +812,104 @@ TEST_CASE(
                        std::runtime_error);
 }
 
+// ★ G-SAFE (#810, .agents/specs/nemotron-h-abi-e2e.md §0) — THE SAFETY
+// INTERLOCK, gated.
+//
+// #810 A1 makes `GPUModelRunner::initialize_kv_cache` allocate the recurrent
+// half from the MambaSpec the model published, which removes the refusal that
+// was the ONLY thing stopping a NemotronH engine from being built. From that
+// commit on, `vllm_engine_load` succeeds and a scheduler step reaches
+// `ForwardNemotronHForCausalLM` — which is the HOST reference: it consumes
+// three of `ModelForwardInput`'s eighteen fields and ignores `attn_kv`,
+// `gdn_state`, `gdn_meta`, `gdn_state_slots` and `num_reqs`. Decode step 2
+// onward would run with fresh recurrent state and no KV, and a batch would be
+// treated as one concatenated causal sequence: fluent output, WRONG tokens, no
+// error. That is strictly worse than the loud failure A1 removes.
+//
+// So the same change installs a by-name refusal for exactly those steps, and
+// this case is what keeps it armed. It must RED if the refusal is replaced by a
+// fall-through. The interlock is NARROWED, never deleted, until A2 lands the
+// device/paged forward that consumes those fields.
+TEST_CASE("NemotronH: the PAGED/BATCHED step REFUSES by name (G-SAFE #810)") {
+  TempConfig cfg(FixtureConfigDoc());
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+
+  // The model object is irrelevant to this guard: it reads only `input`, and it
+  // runs BEFORE the `ModelAs` downcast precisely so that it is reachable
+  // without fabricating a look-alike `NemotronHLoadedModel` (the stub #784
+  // removed). #775's guarantee is untouched — the guard makes no member call.
+  ForeignLoadedModel model(reg);
+  const std::vector<int32_t> token_ids{0};
+  const std::vector<int32_t> positions{0};
+  const std::vector<int32_t> logits_indices{0};
+  const vllm::v1::CommonAttentionMetadata attn_meta{};
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  const auto make_input = [&](std::vector<vllm::PagedKvCache>& attn_kv,
+                              std::vector<vllm::GdnStateCache>& gdn_state,
+                              int num_reqs) {
+    return vllm::ModelForwardInput{.token_ids = token_ids,
+                                   .positions = positions,
+                                   .attn_meta = attn_meta,
+                                   .gdn_meta = gdn_meta,
+                                   .attn_kv = attn_kv,
+                                   .gdn_state = gdn_state,
+                                   .config = config,
+                                   .queue = queue,
+                                   .logits_indices = logits_indices,
+                                   .num_reqs = num_reqs};
+  };
+
+  std::vector<vllm::PagedKvCache> no_attn_kv;
+  std::vector<vllm::GdnStateCache> no_gdn_state;
+
+  SUBCASE("paged attention KV supplied") {
+    std::vector<vllm::PagedKvCache> attn_kv(1);
+    const auto input = make_input(attn_kv, no_gdn_state, /*num_reqs=*/1);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("NemotronHForCausalLM"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("PAGED/BATCHED decode path"),
+                         std::runtime_error);
+    // The message must name the missing piece and where it is owed, so the next
+    // reader is not sent to the weight loader or to the runner's allocation.
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("#810"), std::runtime_error);
+  }
+
+  SUBCASE("recurrent state supplied") {
+    std::vector<vllm::GdnStateCache> gdn_state(1);
+    const auto input = make_input(no_attn_kv, gdn_state, /*num_reqs=*/1);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("PAGED/BATCHED decode path"),
+                         std::runtime_error);
+  }
+
+  SUBCASE("a multi-request batch") {
+    // The gap a token gate cannot see: two concatenated requests decoded as one
+    // causal sequence produce fluent, plausible, wrong output.
+    const auto input = make_input(no_attn_kv, no_gdn_state, /*num_reqs=*/2);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("PAGED/BATCHED decode path"),
+                         std::runtime_error);
+  }
+
+  SUBCASE("the non-paged single-request seam stays alive BELOW the guard") {
+    // The interlock must not swallow the host-reference path the CLI/unit
+    // vehicles drive. With no caches and one request it falls through to the
+    // #775 type check, which is a DIFFERENT refusal — if this subcase reported
+    // the G-SAFE message instead, the guard would be refusing everything and
+    // the three subcases above would prove nothing.
+    const auto input = make_input(no_attn_kv, no_gdn_state, /*num_reqs=*/1);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("was not produced by"),
+                         std::runtime_error);
+  }
+}
+
 TEST_CASE("NemotronH: the committed fixture matches the LIVE checkpoint") {
   const std::string dir = parity::Nemotron35LightningSnapshot();
   if (dir.empty()) {

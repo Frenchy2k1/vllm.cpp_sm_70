@@ -119,6 +119,55 @@ void PrepareNemotronHForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardNemotronHForCausalLM(LoadedModel& model,
                                           const ModelForwardInput& input) {
+  // ★ G-SAFE (#810, .agents/specs/nemotron-h-abi-e2e.md §0) — THE SAFETY
+  // INTERLOCK. Do not remove or weaken it without landing the device/paged
+  // forward it guards.
+  //
+  // Before #810 A1, `GPUModelRunner::initialize_kv_cache` REFUSED to build a
+  // NemotronH engine at all: it rebuilt the recurrent half of the KV allocation
+  // from Qwen3.5's `linear_*` config fields and cross-checked the model's own
+  // MambaSpec against that reconstruction. A1 makes that allocation
+  // spec-driven, so `vllm_engine_load` now SUCCEEDS and a scheduler step
+  // reaches this forward.
+  //
+  // This forward is the HOST REFERENCE. It consumes exactly three of
+  // `ModelForwardInput`'s eighteen fields — `token_ids`, `logits_indices`,
+  // `queue` — and ignores `attn_kv`, `gdn_state`, `gdn_meta`,
+  // `gdn_state_slots`, `num_reqs` and `positions`.
+  // `NemotronHAttentionMixer` (nemotron_h.cpp:585-630) recomputes Q/K/V over
+  // the whole sequence on every call and pages nothing, and the recurrent state
+  // is rebuilt from scratch each step. A server past the old refusal would
+  // therefore decode step 2 onward with FRESH recurrent state and NO KV, and
+  // treat a multi-request batch as one concatenated causal sequence: fluent
+  // output, wrong tokens, no error. That is strictly worse than the loud
+  // failure A1 removes, which is why A1 does not land without this guard.
+  //
+  // Structurally the inverse of the predicate
+  // `ForwardKimiLinearForCausalLM` already uses to select its paged fold
+  // (kimi_linear_registry.cpp:99-102, `!input.attn_kv.empty() &&
+  // !input.gdn_state.empty()`): there the paged caches SELECT the paged path;
+  // here their presence means the caller expects a path that does not exist.
+  //
+  // The guard runs BEFORE `ModelAs` deliberately. It reads only `input` and
+  // never touches `model`, so #775's guarantee — no member call before the
+  // dynamic type is established — is untouched; and putting it first is what
+  // makes it reachable from a test without fabricating a look-alike
+  // `NemotronHLoadedModel`, which is exactly the stub #784 removed. Order is
+  // not part of the G-SAFE requirement; being gated is.
+  //
+  // NARROWED, NEVER DELETED: A2 (the device/paged forward) drops the `attn_kv`
+  // / `gdn_state` clauses when it consumes them, and A2b drops `num_reqs` when
+  // batching lands.
+  VT_CHECK(
+      input.attn_kv.empty() && input.gdn_state.empty() && input.num_reqs <= 1,
+      "Model architecture NemotronHForCausalLM: the PAGED/BATCHED decode path "
+      "is not ported (issue #810, .agents/specs/nemotron-h-abi-e2e.md A2). "
+      "This forward is the host reference: it recomputes K/V over the whole "
+      "sequence every step, carries no recurrent state between steps, and "
+      "treats token_ids as ONE causal sequence -- so running it against the "
+      "runner's paged KV / recurrent state, or against a multi-request batch, "
+      "would return plausible WRONG tokens instead of failing. Refusing by "
+      "name until the device/paged forward lands.");
   // #775: CHECKED, not `static_cast`. A bare downcast down this hierarchy is a
   // promise the compiler is entitled to act on, so on a model that is not
   // really a `NemotronHLoadedModel` every `nh.` member call below is undefined

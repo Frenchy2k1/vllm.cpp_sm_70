@@ -456,7 +456,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
