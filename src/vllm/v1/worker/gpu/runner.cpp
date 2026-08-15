@@ -14,10 +14,14 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre: Qwen3_5MTPModel complete type for the owned draft member
@@ -308,6 +312,66 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
   }
   return sizes;
 }
+
+// ── #810: per-layer KV membership from the GROUP the model published ────────
+//
+// Upstream never parses a per-layer config string to decide what a layer's
+// cache is. `get_kv_cache_spec()` walks the instantiated modules
+// (`gpu_model_runner.py:7785-7787`), groups layers by their SPEC OBJECT
+// (`kv_cache_utils.py:1209-1211` `same_type_layers[layer_spec].append(name)`),
+// and then fans metadata out BY LAYER NAME (`gpu_model_runner.py:2548-2549`).
+// `KVCacheGroupSpec.layer_names` (`kv_cache_interface.py:938-947`, mirrored at
+// `include/vllm/v1/kv_cache_interface.h:343`) is the durable signal; a config
+// spelling such as `layer_types` is not, and a hybrid whose config does not
+// speak Qwen3.5's dialect (NemotronH ships `layers_block_type`, no
+// `layer_types`) has an EMPTY one.
+//
+// Our runner still indexes buffers by layer POSITION, so a published name has
+// to be resolved back to an index. `LayerIndexOfName` does exactly that and
+// nothing else: the integer of the `.layers.<N>.` segment of an upstream-style
+// module path ("backbone.layers.5.mixer", "model.layers.12.self_attn").
+//
+// It deliberately returns nullopt for a PLACEHOLDER group name — "fa", "gdn",
+// "mla", "kda", "fa_draft", the single-name convention every other registry
+// uses today — because such a name carries no layer identity at all. That is
+// what keeps this additive: a group that does not publish per-layer names falls
+// back to the historical `config_.layer_types` predicate, byte for byte.
+std::optional<int64_t> LayerIndexOfName(std::string_view name) {
+  constexpr std::string_view kSep = ".layers.";
+  const size_t at = name.find(kSep);
+  if (at == std::string_view::npos) return std::nullopt;
+  size_t i = at + kSep.size();
+  const size_t start = i;
+  int64_t value = 0;
+  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+    value = value * 10 + (name[i] - '0');
+    if (value > (1 << 20)) return std::nullopt;  // not a layer index
+    ++i;
+  }
+  if (i == start) return std::nullopt;              // ".layers.mixer"
+  if (i < name.size() && name[i] != '.') return std::nullopt;  // ".layers.5x"
+  return value;
+}
+
+// The per-layer membership mask of one KV cache group, or nullopt when the
+// group does not publish per-layer names.
+//
+// ALL-OR-NOTHING on purpose: a group is only read by name when EVERY one of its
+// names resolves to a distinct in-range layer index. A partially-parseable
+// group would silently drop the layers whose names did not parse, which is the
+// silent-wrong-answer shape this whole row exists to remove.
+std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
+                                                int64_t num_layers) {
+  if (group.layer_names.empty()) return std::nullopt;
+  std::vector<bool> mask(static_cast<size_t>(num_layers), false);
+  for (const std::string& name : group.layer_names) {
+    const std::optional<int64_t> l = LayerIndexOfName(name);
+    if (!l.has_value() || *l < 0 || *l >= num_layers) return std::nullopt;
+    if (mask[static_cast<size_t>(*l)]) return std::nullopt;  // duplicate index
+    mask[static_cast<size_t>(*l)] = true;
+  }
+  return mask;
+}
 }  // namespace
 
 GPUModelRunner::GPUModelRunner(
@@ -495,16 +559,37 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // layer, in LAYER ORDER (matches Qwen3_5Model::Forward's per-layer fa_idx /
   // gdn_idx indexing). As in upstream, MambaSpec is the source of truth for the
   // recurrent tensors' order, shapes, dtypes, and page bytes.
-  const int64_t Hk = config_.linear_num_key_heads;
-  const int64_t Hv = config_.linear_num_value_heads;
-  const int64_t Dk = config_.linear_key_head_dim;
-  const int64_t Dv = config_.linear_value_head_dim;
-  const int64_t Kw = config_.linear_conv_kernel_dim;
-  const int64_t key_dim = Hk * Dk;
-  const int64_t value_dim = Hv * Dv;
-  const int64_t conv_dim = 2 * key_dim + value_dim;
-  // SPEC-MTP I5d: conv state row width, (Kw-1)+num_spec under speculation.
-  const int64_t conv_state_len = spec_on() ? (Kw - 1 + num_spec()) : (Kw - 1);
+  //
+  // #810: SPEC-DRIVEN, exactly like the attention half below. This block used
+  // to rebuild the geometry from `config_.linear_num_key_heads` /
+  // `linear_conv_kernel_dim` and then REFUSE when the model's own published
+  // spec disagreed with that reconstruction — so the comment above stated a
+  // polarity the code did not have, and every hybrid whose config does not
+  // speak Qwen3.5's `linear_*` dialect (NemotronH ships `mamba_num_heads`,
+  // `mamba_head_dim`, `ssm_state_size`, `conv_kernel`) was refused by Qwen3.5's
+  // name for shapes it never claimed.
+  //
+  // Upstream cannot express that cross-check at all. Its runner allocates raw
+  // BYTES (`gpu_model_runner.py:7311-7313` `torch.zeros(..., dtype=torch.int8)`)
+  // and hands the Mamba layer an untyped page view (`:7429-7441`); the unpack
+  // into typed conv/SSM views happens in the LAYER
+  // (`mamba/abstract.py:38-43`: `nbytes = prod(shape) * get_dtype_size(dtype)`).
+  // The runner never holds a conv shape, so it has nothing to compare. That is
+  // why the check is DELETED rather than widened or put behind a per-arch
+  // switch: it was a SECOND, independent derivation of a number the model had
+  // already published, and a second derivation is the thing that can disagree.
+  // It is also why `MambaSpec` (`kv_cache_interface.py:690-703`, mirrored at
+  // `include/vllm/v1/kv_cache_interface.h:302-323`) deliberately carries no
+  // num_heads/head_dim/conv_dim: the geometry IS `shapes`.
+  //
+  // SPEC-MTP I5d is now free: the conv row widened to (K-1)+num_spec under
+  // speculation is simply what `MakeQwen3_5KVCacheSpec` publishes
+  // (mamba_utils.py:226), so reading the spec picks it up with no spec_on()
+  // branch here at all.
+  std::vector<int64_t> conv_state_shape;  // per SLOT, spec order [0]
+  std::vector<int64_t> ssm_state_shape;   // per SLOT, spec order [1]
+  int64_t conv_row_elems = 0;
+  int64_t ssm_row_elems = 0;
 
   const MambaSpec* mamba_spec = nullptr;
   if (gdn_group_id_ >= 0) {
@@ -512,19 +597,27 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         kv_cache_config.kv_cache_groups[static_cast<size_t>(gdn_group_id_)]
             .kv_cache_spec.get());
     VT_CHECK(mamba_spec != nullptr,
-             "runner: GDN cache group must carry a MambaSpec");
+             "runner: recurrent cache group must carry a MambaSpec");
     VT_CHECK(mamba_spec->shapes.size() == 2 &&
                  mamba_spec->dtypes.size() == 2,
-             "runner: Qwen3.5 MambaSpec must contain conv then temporal state");
-    // SPEC-MTP I5d: the conv state row is widened to (Kw-1)+num_spec when
-    // speculation is on (MakeQwen3_5KVCacheSpec / mamba_utils.py:226), so accept
-    // the spec-driven width rather than the fixed Kw-1. The SSM state shape is
-    // unchanged (the extra draft snapshots live in extra SLOTS, not a wider row).
-    const std::vector<int64_t> expected_conv_shape{conv_dim, conv_state_len};
-    const std::vector<int64_t> expected_ssm_shape{Hv, Dv, Dk};
-    VT_CHECK(mamba_spec->shapes[0] == expected_conv_shape &&
-                 mamba_spec->shapes[1] == expected_ssm_shape,
-             "runner: Qwen3.5 MambaSpec shapes disagree with model config");
+             "runner: recurrent MambaSpec must contain conv then temporal state");
+    conv_state_shape = mamba_spec->shapes[0];
+    ssm_state_shape = mamba_spec->shapes[1];
+    // The GdnStateCache view prepends the SLOT dim, so a state shape may carry
+    // at most kMaxRank-1 dims. Refuse rather than silently truncate.
+    VT_CHECK(!conv_state_shape.empty() && !ssm_state_shape.empty() &&
+                 conv_state_shape.size() < static_cast<size_t>(vt::kMaxRank) &&
+                 ssm_state_shape.size() < static_cast<size_t>(vt::kMaxRank),
+             "runner: MambaSpec state shapes must be 1..kMaxRank-1 dims");
+    const auto row_elems = [](const std::vector<int64_t>& shape) {
+      int64_t n = 1;
+      for (int64_t d : shape) n *= d;
+      return n;
+    };
+    conv_row_elems = row_elems(conv_state_shape);
+    ssm_row_elems = row_elems(ssm_state_shape);
+    VT_CHECK(conv_row_elems > 0 && ssm_row_elems > 0,
+             "runner: MambaSpec state shapes must be positive");
     gdn_conv_cache_dtype_ = mamba_spec->dtypes[0];
     gdn_ssm_cache_dtype_ = mamba_spec->dtypes[1];
     const auto supported_state_dtype = [](vt::DType dtype) {
@@ -533,7 +626,18 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     };
     VT_CHECK(supported_state_dtype(gdn_conv_cache_dtype_) &&
                  supported_state_dtype(gdn_ssm_cache_dtype_),
-             "runner: Qwen3.5 MambaSpec state dtypes must be floating");
+             "runner: recurrent MambaSpec state dtypes must be floating");
+    // The per-slot byte cost the allocator will use IS the spec's page size —
+    // upstream's `MambaSpec.page_size_bytes` is the sum of `prod(shape) *
+    // dtype_size` over the state tensors (`kv_cache_interface.py:699-703`).
+    // Assert the identity rather than re-deriving it anywhere else.
+    VT_CHECK(conv_row_elems *
+                     static_cast<int64_t>(vt::SizeOf(gdn_conv_cache_dtype_)) +
+                 ssm_row_elems *
+                     static_cast<int64_t>(vt::SizeOf(gdn_ssm_cache_dtype_)) ==
+                 mamba_spec->page_size_bytes(),
+             "runner: MambaSpec page_size_bytes disagrees with its own "
+             "shapes and dtypes");
   }
 
   // SPEC-DRIVEN attention-cache sizing and layout (MLA campaign W1).
@@ -633,6 +737,55 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // group), then the per-layer layer_types tag. This is model-shape-agnostic:
   // the hybrid gate models keep a GDN group, so their path is byte-identical.
   const bool has_mamba_group = gdn_group_id_ >= 0;
+  // #810: PER-LAYER MEMBERSHIP FROM THE PUBLISHED GROUP, when the model
+  // publishes one. `KVCacheGroupSpec::layer_names` is what upstream keys
+  // per-layer KV on end to end (see LayerIndexOfName above); the runner keyed
+  // on `config_.layer_types[l] == "linear_attention"` instead, which is a
+  // Qwen3.5 config spelling. NemotronH's `layer_types` is EMPTY, so all 52
+  // layers classified as full attention: zero recurrent buffers and ~8.7x the
+  // attention pages actually needed (52 against 6 real GQA layers).
+  //
+  // BYTE-NEUTRALITY CONTRACT, mirroring the one `per_layer_attn_specs` states
+  // at `include/vllm/v1/kv_cache_interface.h:354-374`: the by-name path is
+  // entered ONLY when the recurrent group — and the target attention group, if
+  // there is one — publish per-layer names that all resolve to distinct
+  // in-range layer indices. Every registry shipping today publishes a single
+  // PLACEHOLDER name per group ("fa"/"gdn", "mla"/"kda", "fa_draft"), which
+  // resolves to nothing, so every existing model takes the `layer_types`
+  // fallback below and gets byte-identical allocation, view, indexing and
+  // kernel dispatch to before this field was read. This is a capability probe
+  // on the record the model published, NOT a per-architecture switch: any
+  // future hybrid that publishes real names is routed correctly with no new
+  // branch, which is the whole point (`hf_config.cpp:484-528` synthesizing
+  // Qwen3.5's dialect for Kimi-Linear is the anti-pattern this replaces).
+  const int64_t num_layers = config_.num_hidden_layers;
+  std::optional<std::vector<bool>> gdn_layer_mask;
+  std::optional<std::vector<bool>> attn_layer_mask;
+  if (has_mamba_group) {
+    gdn_layer_mask = GroupLayerMask(
+        kv_cache_config.kv_cache_groups[static_cast<size_t>(gdn_group_id_)],
+        num_layers);
+    if (gdn_layer_mask.has_value() && full_attn_group_id_ >= 0) {
+      attn_layer_mask =
+          GroupLayerMask(kv_cache_config
+                             .kv_cache_groups[static_cast<size_t>(
+                                 full_attn_group_id_)],
+                         num_layers);
+      // A recurrent group that names its layers next to an attention group that
+      // does not leaves the non-recurrent layers unclassifiable. Fall back
+      // wholesale rather than guess.
+      if (!attn_layer_mask.has_value()) gdn_layer_mask.reset();
+    }
+  }
+  const bool membership_by_name = gdn_layer_mask.has_value();
+  if (membership_by_name && attn_layer_mask.has_value()) {
+    for (int64_t l = 0; l < num_layers; ++l) {
+      VT_CHECK(!((*gdn_layer_mask)[static_cast<size_t>(l)] &&
+                 (*attn_layer_mask)[static_cast<size_t>(l)]),
+               "runner: a layer is named by BOTH the attention and the "
+               "recurrent KV cache group");
+    }
+  }
   // PER-LAYER KV head_dim (Gemma-4 G1b). When the model publishes a per-layer
   // attention spec (heterogeneous head_dim: sliding 256 / global 512), each
   // non-GDN layer allocates + views its OWN head_size/num_kv_heads/page_size.
@@ -656,19 +809,35 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     vt::DType dtype;
   };
   std::vector<FaDims> fa_dims;
-  for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
-    const bool is_gdn =
-        has_mamba_group && !config_.layer_types.empty() &&
-        config_.layer_types[static_cast<size_t>(l)] == "linear_attention";
+  layer_kv_class_.assign(static_cast<size_t>(num_layers), LayerKvClass::kNone);
+  for (int64_t l = 0; l < num_layers; ++l) {
+    bool is_gdn = false;
+    bool is_full_attn = false;
+    if (membership_by_name) {
+      is_gdn = (*gdn_layer_mask)[static_cast<size_t>(l)];
+      is_full_attn = !is_gdn && attn_layer_mask.has_value() &&
+                     (*attn_layer_mask)[static_cast<size_t>(l)];
+    } else {
+      // The historical predicate, unchanged. A full-attention-only model (e.g.
+      // dense Qwen3ForCausalLM) has NO recurrent group and an EMPTY
+      // layer_types — indexing layer_types[l] would be out of bounds.
+      is_gdn = has_mamba_group && !config_.layer_types.empty() &&
+               config_.layer_types[static_cast<size_t>(l)] ==
+                   "linear_attention";
+      is_full_attn = !is_gdn;
+    }
+    layer_kv_class_[static_cast<size_t>(l)] =
+        is_gdn ? LayerKvClass::kRecurrent
+               : (is_full_attn ? LayerKvClass::kFullAttention
+                               : LayerKvClass::kNone);
     if (is_gdn) {
       VT_CHECK(mamba_spec != nullptr,
                "runner: linear-attention layer has no MambaSpec");
       // Raw buffers use their independent cache dtypes. Zero bytes are +0.0f
-      // for every supported floating storage type.
+      // for every supported floating storage type. Per-slot element counts come
+      // from the SPEC's shapes (#810), not from HF-config arithmetic.
       const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
       const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
-      const int64_t conv_row_elems = conv_dim * conv_state_len;
-      const int64_t ssm_row_elems = Hv * Dv * Dk;
       ssm_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
           static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
@@ -677,7 +846,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           dev, queue_,
           static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
           kv_cache_backend_resident_));
-    } else {
+    } else if (is_full_attn) {
       // Bytes come from the SPEC, not from HF-config arithmetic: exactly
       // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
       // `kv_cache_interface.py:380-398` sizing contract. For a symmetric
@@ -719,6 +888,15 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           kv_cache_backend_resident_));
       fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
     }
+    // else: this layer is named by NO KV cache group, so it caches nothing.
+    // Reachable only on the by-name path, and it is the correct answer there:
+    // NemotronH's 52 blocks are 6 attention + 23 Mamba2 + 23 MoE, and an MoE
+    // block registers no attention module at all, so upstream's
+    // `get_kv_cache_spec()` yields no entry for it
+    // (`gpu_model_runner.py:7785-7801` walks `AttentionLayerBase` instances).
+    // The `layer_types` fallback cannot express this third class — every
+    // non-recurrent layer there is an attention layer — which is why it
+    // allocated 52 attention pages for a model that needs 6.
   }
 
   // Build the views over the (now stable) backing storage. `fa_dims` is parallel
@@ -769,17 +947,33 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     }
   }
 
+  // #810: the recurrent VIEWS carry the spec's own per-slot shape with the slot
+  // dim prepended — the mirror of `mamba/abstract.py:38-43`'s
+  // `state.view(-1, *shape)`. Rank-general up to vt::kMaxRank (checked above),
+  // so a 2-D conv state and a 3-D temporal state are both expressible without
+  // the runner knowing what either MEANS.
+  const auto slot_major_view = [&](void* data, vt::DType dtype,
+                                   const std::vector<int64_t>& shape) {
+    switch (shape.size()) {
+      case 1:
+        return vt::Tensor::Contiguous(data, dtype, dev,
+                                      {gdn_state_slots_, shape[0]});
+      case 2:
+        return vt::Tensor::Contiguous(data, dtype, dev,
+                                      {gdn_state_slots_, shape[0], shape[1]});
+      default:
+        return vt::Tensor::Contiguous(
+            data, dtype, dev,
+            {gdn_state_slots_, shape[0], shape[1], shape[2]});
+    }
+  };
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
-    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g]->data(),
-                                          gdn_ssm_cache_dtype_,
-                                          dev, {gdn_state_slots_, Hv, Dv, Dk});
-    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g]->data(),
-                                           gdn_conv_cache_dtype_,
-                                           dev,
-                                           {gdn_state_slots_, conv_dim,
-                                            conv_state_len});
+    gs.ssm_state = slot_major_view(ssm_buf_[g]->data(), gdn_ssm_cache_dtype_,
+                                   ssm_state_shape);
+    gs.conv_state = slot_major_view(conv_buf_[g]->data(), gdn_conv_cache_dtype_,
+                                    conv_state_shape);
     gdn_state_.push_back(gs);
   }
 }
