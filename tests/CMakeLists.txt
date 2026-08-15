@@ -272,6 +272,13 @@ target_compile_definitions(test_ltx2_video PRIVATE
 vllm_cpp_add_test(test_ltx2_image_cond vllm/multimodal/test_ltx2_image_cond.cpp)
 target_include_directories(test_ltx2_image_cond
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal)
+# #659/#660: both diffusion lanes' device resolution held against a PARTIAL
+# backend that DECLINES the architecture. Its own executable for the same reason
+# test_device_selection is one — it registers a fake platform and backend in the
+# global registries (XPU slot, and over the CUDA slot so CurrentPlatform()
+# resolves to it on a CUDA build too), and process isolation keeps that out of
+# every other suite.
+vllm_cpp_add_test(test_diffusion_device_seam vllm/multimodal/test_diffusion_device_seam.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)

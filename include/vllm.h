@@ -439,8 +439,9 @@ typedef struct vllm_model_params {
    *        silently replaced by another (mirror of vLLM assigning an explicit
    *        device verbatim, device.py:61-66).
    * 0 must stay auto so a zero-initialized struct preserves pre-v14 behaviour;
-   * the cpu-before-cuda value order follows the v12 precedent
-   * (vllm_video_model_params.device: 0 cpu, 1 cuda) shifted by the auto slot.
+   * the cpu-before-accelerator value order follows the v12 precedent
+   * (vllm_video_model_params.device: 0 cpu, 1 the resolved accelerator)
+   * shifted by the auto slot.
    * Any other value fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
   int32_t device;
   /* ── KV-pool sizing (ABI v16) ──────────────────────────────────────────────
@@ -874,7 +875,13 @@ typedef struct vllm_video_model_params {
    * are byte-structurally identical, so it must be DECLARED; NULL/empty makes
    * every generate refuse with the guidance (the #77 guard). */
   const char* partition;
-  int32_t device;       /* 0 cpu, 1 cuda */
+  /* 0 is the CPU; 1 is THE ACCELERATOR THIS BUILD RESOLVES, through the
+   * platform seam (CurrentPlatform + TryGetBackend +
+   * supports_model_architecture), never the enum value 1. It is therefore CUDA
+   * on a CUDA build and refused BY NAME on a build with no accelerator backend,
+   * or one whose partial backend declines this architecture (#659, #660). The
+   * ABI value is unchanged; what it means was never "cuda". */
+  int32_t device;
   int32_t dequant_bf16; /* 0 keep-quant, 1 dequant/stream bf16 */
   int32_t fp4_resident; /* NVFP4+cuda: keep FP4 packed, Marlin W4A16 GEMM */
   /* ── v18 additions (the generalized seam) ─────────────────────────────────

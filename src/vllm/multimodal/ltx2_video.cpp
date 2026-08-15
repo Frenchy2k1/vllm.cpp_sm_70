@@ -281,7 +281,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 660 715 811 827 829 899 924 1029 1070
+// 690 745 841 857 859 929 954 1059 1100
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -613,8 +613,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // what would make every later timing and every "it ran on the GPU" claim false.
   im.on_device = params.device != 0;
   if (im.on_device) {
-    const vt::DeviceType accelerator =
-        vllm::platforms::CurrentPlatform().device_type();
+    const vllm::platforms::Platform& platform = vllm::platforms::CurrentPlatform();
+    const vt::DeviceType accelerator = platform.device_type();
     if (accelerator == vt::DeviceType::kCPU ||
         vt::TryGetBackend(accelerator) == nullptr) {
       Fail("device " + std::to_string(params.device) +
@@ -624,6 +624,36 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "'). The LTX-2.5 device-resident forward is present (Ltx2DitForwardDevice); "
            "what is missing is the backend. Refusing rather than running the CPU forward "
            "behind an accelerator handle.");
+    }
+    // The THIRD question, which the seam's own precedent asks and this file did
+    // not (#659). "Is there an accelerator" and "is a backend registered" are
+    // both true on a PARTIAL backend — Metal registers 15 of 75 ops, Tenstorrent
+    // a comparable slice — and both name exactly two text architectures in their
+    // `supports_model_architecture` allow-lists (src/vllm/platforms/metal.cpp:70,
+    // src/vllm/platforms/tenstorrent.cpp:55). Before the seam landed, such a
+    // build asked `TryGetBackend(kCUDA)`, got nullptr, and REFUSED BY NAME; after
+    // it, it is handed a queue and dies later inside a kernel bind with a shape
+    // error that says nothing about what is missing. CUDA and CPU are unaffected:
+    // `supports_model_architecture` defaults to true (interface.h:263) and is a
+    // claim only a partial backend ever narrows.
+    //
+    // The refusal above argues that serving the CPU forward behind an accelerator
+    // handle "would make every later timing and every 'it ran on the GPU' claim
+    // false". A partial backend that binds and dies is the same thing one level
+    // down: a device claim this build cannot honour.
+    //
+    // The key is the FAMILY string — this lane's stable registry name
+    // (`VideoModelParams::family`) — because the diffusion engines are reached
+    // through `LoadVideoEngine`, not through ModelRegistry's HF `architectures`.
+    if (!platform.supports_model_architecture(kLtx2VideoFamily)) {
+      Fail("device " + std::to_string(params.device) + " resolves to platform '" +
+           std::string(vt::DeviceTypeName(accelerator)) +
+           "', and that platform DECLINES the architecture '" +
+           std::string(kLtx2VideoFamily) +
+           "' (Platform::supports_model_architecture): it is a PARTIAL backend that has "
+           "not registered the kernels this model needs. The build is partial, not "
+           "broken. Refusing by name rather than binding a queue that would die inside a "
+           "kernel bind with an error that names none of this.");
     }
     // `vt::CreateQueue(Device)`, NOT `Backend::CreateQueue()`. backend.h:212-217
     // records the method as a "temporary index-0 migration shim" and says new
