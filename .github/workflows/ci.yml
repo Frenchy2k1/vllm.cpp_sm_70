@@ -3,8 +3,13 @@ on:
   push:
     branches: [main]
   # `closed` so a merged or abandoned pull request ENTERS the concurrency
-  # group and supersedes its own in-flight run. Every job below excludes it, so
-  # the run finishes immediately without executing a gate (#822).
+  # group and supersedes its own in-flight run (#822). Every job below is
+  # skipped on it -- directly through its own `if:`, or transitively by
+  # `needs:`-ing a job that is -- except the two `windows-msvc-*` PR proofs,
+  # whose whole job mapping is pinned byte-for-byte by
+  # `scripts/check-release-workflow.py` and can carry neither key. Those two
+  # therefore still start on a close; recorded as owed in
+  # .agents/specs/ci-concurrency.md and tracked by #874.
   pull_request:
     types: [opened, synchronize, reopened, closed]
   # THE BASELINE LANE (issue #274, spec .agents/specs/main-verifiability.md).
@@ -84,11 +89,27 @@ jobs:
     concurrency:
       group: ci-agent-record-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
-    # Skip when the pull request was CLOSED: the run exists only to enter
-    # the concurrency group and supersede the in-flight one (#822).
-    # always(): `last-gated-commit` is skipped on the PR lane, and a
-    # skipped dependency would otherwise skip this gate too.
-    if: always() && github.event.action != 'closed'
+    # NO job-level `if:`, deliberately, and no `always()`.
+    #
+    # `check-release-binary-contract.py` and `check-test-registration.py` count
+    # a checker as wired into CI only when the job owning its step carries no
+    # `if:` at all: a registration behind a condition is not a registration.
+    # #865 gave this job one, and both checkers plus three of their suites went
+    # RED on `main` (#873).
+    #
+    # The closed-pull-request skip #822 needs is carried by `needs:` instead.
+    # `last-gated-commit` excludes the closed action and runs on every other
+    # lane, so a closed pull request skips it and skips this job with it, while
+    # push, pull_request and the baseline lane all still run it. That is also
+    # why `always()` must NOT come back here: it would defeat the skip.
+    #
+    # The asymmetry that buys is deliberate but real: without `always()` the
+    # implicit `success()` couples this job to `last-gated-commit` SUCCEEDING,
+    # not merely running, while `documentation-checkpoint` and
+    # `commit-protocol-tag` on the same `needs:` keep `always()` and run
+    # regardless. A failure in the sha resolver therefore silences this job's
+    # checkers rather than reding them -- which is why that job does nothing but
+    # resolve a string and falls back instead of failing.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
     steps:
@@ -434,7 +455,15 @@ jobs:
     # protocol's ban on network calls is about a CHECKER failing on
     # connectivity; this falls back to `before` when the query returns nothing,
     # so a failed query is the status quo rather than a skipped gate.
-    if: github.event.action != 'closed' && (github.event_name == 'push')
+    #
+    # It runs on EVERY lane except a closed pull request, and resolves a sha
+    # only on the push lane -- there is no gated `main` run to find for a pull
+    # request or a schedule. The wider condition is deliberate: `agent-record`
+    # may not carry an `if:` of its own without un-registering three checkers
+    # (#873), so this job's condition is the closed-PR guard it inherits through
+    # `needs:`. A skipped dependency skips its dependents, which is the same
+    # skip #822 asked for, expressed where a checker can still see the gate.
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -447,11 +476,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -eu
-          sha="$(gh api \
-            "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
-            --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
+          # Only the push lane has a gated `main` history to resolve against.
+          # Every other lane leaves this EMPTY and its consumers fall back,
+          # which is what they already do when the query finds nothing.
+          sha=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            sha="$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
+              --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
+          fi
           # NOT `[ ... ] && sha=""`: that returns non-zero when the test is
           # false, which aborts the step under `set -e`.
           if [ "$sha" = "null" ]; then sha=""; fi
@@ -798,7 +834,7 @@ jobs:
     # Native Windows release portability must be proven before merge. This PR
     # lane calls the authoritative driver but retains no artifact and has no
     # release, upload, write-token, or OIDC authority (#117).
-    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
     runs-on: windows-2022
@@ -821,7 +857,7 @@ jobs:
   windows-msvc-vulkan:
     # Independent Vulkan build/loader/backend proof on the native MSVC ABI.
     # Like the CPU lane it is PR-only, read-only, and retains no release asset.
-    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
     runs-on: windows-2022
