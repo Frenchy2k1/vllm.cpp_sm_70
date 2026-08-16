@@ -950,7 +950,7 @@ void CheckMoeQuantLayoutSupported(const std::vector<std::string>& names,
   // ...and the three NON-routed components, refused by the dtype the probe
   // RESOLVED rather than discovered as a complaint from inside a reader (#490).
   // Each of these already failed before #864; naming it is the whole change.
-  const auto refuse = [&kRequired](const char* what, MoeProjDtype got,
+  const auto refuse = [](const char* what, MoeProjDtype got,
                                    const char* supported) {
     VT_CHECK(false, std::string("qwen3_5 weights: a ") +
                         MoeProjDtypeName(got) + " " + what +

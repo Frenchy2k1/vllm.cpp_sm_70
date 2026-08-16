@@ -2531,6 +2531,12 @@ The next run also guarded Voxtral's GCC-only `-Wstringop-overflow` suppression
 out of Clang, where it was fatal. Its Go `go-m1cpu` diagnostics were nonfatal
 and outside this repo.
 
+**Darwin Qwen3.5 build repair (2026-08-16).** The MoE layout refusal lambda no
+longer captures its namespace-scope help string. Apple Clang diagnosed that
+redundant capture as `-Wunused-lambda-capture`, and the project promotes the
+warning to an error. The lambda can still read the namespace-scope name
+directly. Runtime behavior and the Qwen3.5 lifecycle state are unchanged.
+
 **Agent onboarding:** [session](../.agents/specs/session-onboarding.md) +
 [entry](../.agents/specs/developer-agent-protocol-entrypoint.md) implemented;
 documentation-only.
