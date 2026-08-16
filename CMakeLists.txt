@@ -883,6 +883,10 @@ add_library(vllm STATIC
   # config descent, the on-disk name map, the registry entry and the het-KV
   # topology. No forward: nemotron_h.cpp is W4.
   src/vllm/model_executor/models/nemotron_h.cpp
+  # A2-R (#810): the DEVICE arm — the residual stream, the 52 norms, the
+  # embedding lookup and the 6 GQA attention blocks. Mamba/MoE/lm_head stay
+  # host; see the file header for why the line falls where it does.
+  src/vllm/model_executor/models/nemotron_h_device.cpp
   src/vllm/model_executor/models/nemotron_h_registry.cpp
   src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp

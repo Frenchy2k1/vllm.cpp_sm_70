@@ -514,6 +514,43 @@ NemotronHOwned CopyDense(Loader& ld, const std::string& name, vt::DType want,
   return CopyDense(ld, name, want, shape, shape);
 }
 
+// A2-R (#810): the same dense copy, delivered in the tree's SHARED residency
+// type so the weight can be uploaded once by `dense_attn::ResidentWeight`.
+//
+// It DELEGATES to CopyDense rather than duplicating it. That is deliberate:
+// CopyDense owns the unaligned-read seam, the dtype widening/narrowing arms and
+// every `report` counter, and a second copy of that logic would be a second
+// place for the load composition to drift from what the gate asserts. The bytes
+// are MOVED into the OwnedBytes, so this costs one vector move and the reported
+// `host_bytes` total is byte-identical to before the conversion.
+//
+// `nk` records the matmul orientation for the four attention projections: the
+// checkpoint ships raw torch Linear [out, in] and BOTH arms consume them via
+// vt::MatmulBT, which is what `nk = true` means (qwen3_5_weights.h:60-63). It
+// is left false for the embedding table and the norms, which are not matmul
+// weights and for which the field has no meaning.
+OwnedTensor CopyDenseOwned(Loader& ld, const std::string& name, vt::DType want,
+                           const std::vector<int64_t>& shape, bool nk) {
+  NemotronHOwned w = CopyDense(ld, name, want, shape, shape);
+  OwnedTensor t;
+  t.dtype = w.dtype;
+  t.nk = nk;
+  VT_CHECK(!w.shape.empty() && w.shape.size() <= static_cast<size_t>(vt::kMaxRank),
+           "NemotronH loader: '" + name + "' rank is out of range for OwnedTensor");
+  t.rank = static_cast<int>(w.shape.size());
+  for (int i = 0; i < t.rank; ++i) t.shape[i] = w.shape[static_cast<size_t>(i)];
+  t.bytes = OwnedBytes(std::move(w.bytes));
+  return t;
+}
+
+// Bytes resident for an OwnedTensor-held weight. The NemotronHOwned twin is
+// `HostBytes()` (payload + scales); a dense OwnedTensor has no scales, so this
+// is just the payload — exactly what HostBytes() returned for the same weight
+// before A2-R converted it, which is why the load report's total is unchanged.
+int64_t OwnedHostBytes(const OwnedTensor& t) {
+  return static_cast<int64_t>(t.bytes.size());
+}
+
 // A per-tensor f32 scalar companion. ModelOpt writes `weight_scale_2` and
 // `weight_scale` as rank-0 and `input_scale` / `k_scale` / `v_scale` as [1];
 // both spellings are one number and both are accepted, nothing else is.
@@ -644,10 +681,12 @@ void LoadAttention(Loader& ld, const NemotronHParams& p, const std::string& mixe
   const int64_t H = p.hidden_size;
   const int64_t qd = p.q_proj_out_features();
   const int64_t kvd = p.kv_proj_out_features();
-  out.q_proj = CopyDense(ld, mixer + ".q_proj.weight", adt, {qd, H});
-  out.k_proj = CopyDense(ld, mixer + ".k_proj.weight", adt, {kvd, H});
-  out.v_proj = CopyDense(ld, mixer + ".v_proj.weight", adt, {kvd, H});
-  out.o_proj = CopyDense(ld, mixer + ".o_proj.weight", adt, {H, qd});
+  // A2-R: OwnedTensor, nk=true — raw torch Linear [out, in], consumed via
+  // vt::MatmulBT by both the host mixer and the device NemotronHAttnBlock.
+  out.q_proj = CopyDenseOwned(ld, mixer + ".q_proj.weight", adt, {qd, H}, true);
+  out.k_proj = CopyDenseOwned(ld, mixer + ".k_proj.weight", adt, {kvd, H}, true);
+  out.v_proj = CopyDenseOwned(ld, mixer + ".v_proj.weight", adt, {kvd, H}, true);
+  out.o_proj = CopyDenseOwned(ld, mixer + ".o_proj.weight", adt, {H, qd}, true);
   if (fp8_kv) {
     out.k_scale = ReadF32Scalar(ld, mixer + ".k_proj.k_scale");
     out.v_scale = ReadF32Scalar(ld, mixer + ".v_proj.v_scale");
@@ -704,16 +743,19 @@ void LoadMlp(Loader& ld, const NemotronHParams& p, const std::string& mixer,
 }
 
 int64_t HostBytesOf(const NemotronHHostWeights& h) {
-  int64_t n = h.embeddings.HostBytes() + h.norm_f.HostBytes() +
+  // A2-R: embeddings / norm_f / per-layer norm / attention q,k,v,o are now
+  // OwnedTensor, so they are counted through OwnedHostBytes. Same bytes, same
+  // total — the conversion changed the holder, not the payload.
+  int64_t n = OwnedHostBytes(h.embeddings) + OwnedHostBytes(h.norm_f) +
               h.lm_head.HostBytes();
   for (const NemotronHLayerWeights& l : h.layers) {
-    n += l.norm.HostBytes();
+    n += OwnedHostBytes(l.norm);
     n += l.mamba.in_proj.HostBytes() + l.mamba.out_proj.HostBytes() +
          l.mamba.conv1d_weight.HostBytes() + l.mamba.conv1d_bias.HostBytes() +
          l.mamba.A_log.HostBytes() + l.mamba.D.HostBytes() +
          l.mamba.dt_bias.HostBytes() + l.mamba.norm_weight.HostBytes();
-    n += l.attn.q_proj.HostBytes() + l.attn.k_proj.HostBytes() +
-         l.attn.v_proj.HostBytes() + l.attn.o_proj.HostBytes();
+    n += OwnedHostBytes(l.attn.q_proj) + OwnedHostBytes(l.attn.k_proj) +
+         OwnedHostBytes(l.attn.v_proj) + OwnedHostBytes(l.attn.o_proj);
     n += l.moe.gate.HostBytes() + l.moe.e_score_correction_bias.HostBytes();
     for (const NemotronHExpertWeights& e : l.moe.experts) {
       n += e.up_proj.HostBytes() + e.down_proj.HostBytes();
@@ -1037,9 +1079,10 @@ NemotronHHostWeights LoadNemotronHHostWeights(
   Loader ld{index, rep, {}};
 
   // --- root ---
-  host.embeddings = CopyDense(ld, "backbone.embeddings.weight", act_dtype,
-                              {p.vocab_size, p.hidden_size});
-  host.norm_f = CopyDense(ld, "backbone.norm_f.weight", act_dtype, {p.hidden_size});
+  host.embeddings = CopyDenseOwned(ld, "backbone.embeddings.weight", act_dtype,
+                                   {p.vocab_size, p.hidden_size}, false);
+  host.norm_f =
+      CopyDenseOwned(ld, "backbone.norm_f.weight", act_dtype, {p.hidden_size}, false);
   if (!p.tie_word_embeddings) {
     host.lm_head = quantized
                        ? LoadNvfp4(ld, "lm_head", act_dtype, p.vocab_size,
@@ -1056,7 +1099,8 @@ NemotronHHostWeights LoadNemotronHHostWeights(
     const std::string layer = "backbone.layers." + std::to_string(i);
     const std::string mixer = layer + ".mixer";
     lw.block = p.layers_block_type[static_cast<size_t>(i)];
-    lw.norm = CopyDense(ld, layer + ".norm.weight", act_dtype, {p.hidden_size});
+    lw.norm =
+        CopyDenseOwned(ld, layer + ".norm.weight", act_dtype, {p.hidden_size}, false);
     switch (lw.block) {
       case NemotronHBlock::kMamba:
         LoadMamba(ld, p, mixer, act_dtype, quantized, lw.mamba);
