@@ -565,6 +565,44 @@ struct Ltx2PipelineRecipe {
   int64_t max_spatial_downscale() const;
 };
 
+// `assert_resolution` (ltx-pipelines utils/helpers.py:540-551). Upstream calls it
+// at the top of a pipeline's `__call__`, before any work is paid for — NINE
+// invocations, counted at the pin, among them ti2vid_two_stages.py:184 and
+// ti2vid_two_stages_hq.py:199 (both `is_two_stage=True`) against
+// ti2vid_one_stage.py:156 (`False`). Nine, and not the twenty-one lines a grep
+// for the name returns: those are 9 invocations + 1 definition + 10 imports + 1
+// `__all__` string. Nor is it every pipeline: 13 pipeline `__call__`s take a
+// height and a width, and the four that do NOT call the guard are
+// distilled_mgpu.py:143, ti2vid_two_stages_mgpu.py:163,
+// ti2vid_two_stages_hq_mgpu.py:164 and hdr_ic_lora.py:352.
+//
+// Upstream spells the divisor as a literal 64 or 32 chosen by a bool. That pair
+// is not two constants: it is the VAE spatial factor (32,
+// ltx_core/types.py:31-33) times the worst spatial downscale any phase applies.
+// A two-stage pipeline runs stage 1 at `width // 2`
+// (ti2vid_two_stages.py:226-228), so the request must survive being halved and
+// still divide the grid — hence 32 * 2. Taking the divisor as a parameter lets
+// the caller derive it from the recipe it actually holds, which reproduces
+// upstream's two numbers on the two shipped arms rather than restating them as
+// literals.
+//
+// It reproduces them; it does not generalise past them, and the limit is stated
+// rather than implied. `max_spatial_downscale()` takes the MAXIMUM, and the
+// quantity a request must survive is the LEAST COMMON MULTIPLE of the phase
+// downscales. The two agree on every shipped recipe, whose downscales are 1 and
+// 2, and they part on a recipe with phases at 2 and 3: the max gives 96, a
+// 96-wide request passes, and the downscale-2 phase then floors 48 onto one
+// latent cell — the very defect this guard exists to stop. No shipped recipe has
+// a non-power-of-two downscale, so the lcm form would change no behaviour any
+// production entry point can reach and no test entering there could gate it.
+// Recorded as a limitation in `.agents/specs/ltx25-resolution-envelope.md`
+// instead of implemented unreached.
+//
+// This is a REFUSAL and not a rounding on purpose. Integer division is what the
+// engine did before, and it renders a clip at a size nobody asked for
+// (#919) — 80 became 64, successfully, with the wrong size reported back.
+void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
+
 // resolve_ltx_pipeline_recipe (ltx2_recipes.py:170-175). Keyed on the EXACT
 // (pipeline_kind, model_version) pair and throwing by name on anything else —
 // never defaulting. The table:
