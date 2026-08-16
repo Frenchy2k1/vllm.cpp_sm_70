@@ -240,6 +240,81 @@ class GPUModelRunner final : public ModelRunnerBase {
   // SPEC-MTP I5d acceptance telemetry accessors (the gate reads these).
   int64_t spec_drafts_proposed() const { return spec_drafts_proposed_; }
   int64_t spec_drafts_accepted() const { return spec_drafts_accepted_; }
+  // SPEC-MTP-K-GT-1 (#81) PER-DEPTH acceptance. Index d counts the drafts
+  // verified and accepted at draft depth d+1, so `[0]` is each request's first
+  // drafted token and `[k-1]` its deepest. The aggregate counters above cannot
+  // answer "how deep did acceptance actually reach", which is what #81's M1 asks
+  // for and the only signal an acceptance-driven depth policy could use. The
+  // vectors grow to the deepest draft the engine has verified.
+  //
+  // Their SIZE is NOT a witness that the propose loop ran k times, and an earlier
+  // revision of this comment claimed it was. The size is grown from
+  // `step.num_draft_tokens_per_req[i]`, which is the LENGTH of the emitted draft
+  // list, a pure function of how `propose_drafts` slices whatever the proposer
+  // returned. A propose that runs ONE forward and pads all k columns with its
+  // step-0 draft satisfies it exactly, and the emitted tokens do not move either,
+  // because greedy plus accept-iff-equal makes the sequence independent of k.
+  // That mutation was applied and the whole depth suite stayed green on it. The
+  // witness that DOES separate them is `spec_mtp_draft_decode_forwards()` below.
+  const std::vector<int64_t>& spec_drafts_proposed_by_depth() const {
+    return spec_drafts_proposed_by_depth_;
+  }
+  const std::vector<int64_t>& spec_drafts_accepted_by_depth() const {
+    return spec_drafts_accepted_by_depth_;
+  }
+  // SPEC-MTP-K-GT-1 (#81): the WORK witness, counted where the work happens.
+  //
+  // `spec_mtp_propose_calls()` counts MTP propose invocations that reached the
+  // proposer. `spec_mtp_draft_decode_forwards()` counts draft DECODE forwards
+  // those calls actually executed, incremented after each forward returns.
+  // Upstream runs `num_speculative_steps - 1` of them per propose
+  // (`_multi_step_decode`, autoregressive/speculator.py:374-419 @ 555967922), so
+  // the exact relation a caller asserts is
+  //
+  //     spec_mtp_draft_decode_forwards() == spec_mtp_propose_calls() * (k - 1)
+  //
+  // with both sides falling to 0 forwards at k=1. Nothing about the shape of the
+  // emitted draft list can satisfy that equality, so it is the assertion a
+  // propose that SHORT-CIRCUITS or CLAMPS the loop fails.
+  //
+  // It does NOT see padding, and an earlier revision of this comment said it
+  // did. A propose that runs every forward, discards the results and writes the
+  // step-0 draft into all k columns increments this counter exactly as the real
+  // loop does. That mutation was applied and the whole depth suite stayed green
+  // on it. `spec_mtp_proposals_with_varied_drafts()` below is the counter that
+  // separates those two.
+  int64_t spec_mtp_propose_calls() const { return spec_mtp_propose_calls_; }
+  int64_t spec_mtp_draft_decode_forwards() const {
+    return spec_mtp_draft_decode_forwards_;
+  }
+  // SPEC-MTP-K-GT-1 (#81): the RESULT witness, computed on the array the
+  // proposer DELIVERED rather than inside the loop that filled it.
+  //
+  // It counts propose calls whose returned draft row held, for at least one
+  // request, a column that differed from column 0. A propose that pads every
+  // column with its step-0 draft leaves this at 0 at every k, because a padded
+  // row is by construction a pure function of its own first column, and that is
+  // the whole reason the counter exists. At k=1 it is 0 by definition, since a
+  // one-column row has nothing to differ from.
+  //
+  // Its bound is stated here because it is easy to over-read. It says the
+  // delivered array carries information the prefill draft alone does not
+  // determine. It does NOT say that column j came from forward j, so an
+  // off-by-one in the column index or a broken carry still satisfies it. It is
+  // also a NECESSARY rather than a sufficient condition, and one the fixture
+  // participates in: a drafter that resampled the same token on every step of
+  // every call would leave it 0 while running the loop correctly. Measured on
+  // the synthetic CPU gate model that does happen on individual calls (a
+  // `2 2 2` row at k=3) and never on all of them, so the assertion the depth
+  // suite makes is `> 0` over a run and never a per-call one. Per-column
+  // provenance stays owed to the DGX gate on real weights, and NOT as a
+  // non-zero acceptance count at depth, which a padded row also earns whenever
+  // the target's greedy continuation repeats a token. It is owed as an
+  // acceptance-RATE comparison against a padded control, specified in the
+  // row spec under `## Owed`.
+  int64_t spec_mtp_proposals_with_varied_drafts() const {
+    return spec_mtp_proposals_with_varied_drafts_;
+  }
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
@@ -670,6 +745,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // rate; total generated / total verify steps is the effective speedup proxy.
   int64_t spec_drafts_proposed_ = 0;
   int64_t spec_drafts_accepted_ = 0;
+  // SPEC-MTP-K-GT-1 (#81): the same two counts, split by draft depth. Grown on
+  // demand to the deepest draft verified, so they stay EMPTY on the default
+  // no-speculation path.
+  std::vector<int64_t> spec_drafts_proposed_by_depth_;
+  std::vector<int64_t> spec_drafts_accepted_by_depth_;
+  // SPEC-MTP-K-GT-1 (#81): the propose-side depth witnesses. All three stay 0
+  // unless the MTP proposer runs. The first two carry the RATIO k-1, which the
+  // draft list shape cannot produce. The third reads the delivered array, which
+  // is the only place padding is visible. See the accessors above for why the
+  // per-depth vectors serve neither purpose.
+  int64_t spec_mtp_propose_calls_ = 0;
+  int64_t spec_mtp_draft_decode_forwards_ = 0;
+  int64_t spec_mtp_proposals_with_varied_drafts_ = 0;
   // ── SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION) ──────────────────────────────────
   // The separately-loaded DFlash draft (borrows owned by LoadedEngine; null
   // unless method=="dflash"). use_dflash() gates the aux-tap capture + the DFlash

@@ -182,9 +182,20 @@ token-for-token correctness against the pinned oracle.
 
 ## Speculative decoding
 
+**MTP draft DEPTH is configurable** as of `SPEC-MTP-K-GT-1` (`ACTIVE`,
+2026-08-16, [spec](../.agents/specs/mtp-k-gt-1.md), #81):
+`num_speculative_tokens` loops the single MTP head autoregressively, CPU-gated
+at k=1..4. A token-identity gate cannot see a clamped drafter, so each arm
+carries TWO witnesses: the `k-1` draft decode forwards per propose call catch a
+propose that never ran the loop, and a varied-draft counter over the DELIVERED
+rows catches one that ran it and then padded. Neither proves that column j came
+from forward j, and no draft is ACCEPTED at any depth here, so provenance and
+the accept path both await the owed DGX gate. The DEFAULT is unchanged at k=1
+and **no speed number is claimed above it**.
+
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
-`--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on both
-gate models (the 27B GDN hybrid `Qwen3_5MTP` and the 35B MoE `Qwen3_5MoeMTP`):
+`--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on
+both gate models (the 27B GDN hybrid `Qwen3_5MTP` and the 35B MoE `Qwen3_5MoeMTP`):
 three-way identical at concurrency 1 (our spec-ON == our spec-OFF == vLLM
 `--speculative-config mtp` greedy) and faster than vLLM there, on par or above
 at higher concurrency (mixed-batch), with the draft head alive and acceptance
@@ -197,7 +208,7 @@ concurrency-1 A/B our-on 29.32 tok/s vs vLLM-on 29.24, non-overlapping bands,
 vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it remains gated behind
 a spike while its user-facing serving surface is finalized.
 
-**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash, DSpark and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH (k>1, dynamic, adaptive) unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
+**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (any k), DFlash, DSpark and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH: MTP k>1 is BUILT and CPU-gated (`SPEC-MTP-K-GT-1`, no speed number yet). Dynamic (batch-size-keyed) and adaptive (acceptance-driven) depth stay unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
