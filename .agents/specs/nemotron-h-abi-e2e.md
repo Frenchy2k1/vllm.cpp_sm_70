@@ -240,6 +240,25 @@ size is a review judgement, not a counter): A2 may split into **A2a**
 interlock is **narrowed** to the `num_reqs > 1` clause, not removed. A2a with
 the interlock deleted is not an acceptable split.
 
+**WHAT A2 ACTUALLY SPLIT INTO — read this before using the `A2a`/`A2b` names
+above.** A2 was scoped as one unit and came back as a campaign. The A2-R landing
+commit (`598226e96`) renamed the units, because `A2a`/`A2b` collide with both the
+paragraph above and Laguna's unrelated "Brick A2b": **A2-R** (dense weights on
+the residency seam, landed), **A2-Q** (the quantized arms), **A2-P** (this
+paragraph's `A2a`, single-request paged decode, and the unit that NARROWS the
+interlock), **A2-B** (this paragraph's `A2b`, batching). A2-Q was then split
+again on 2026-08-16, for a reason that is not size: its two halves have
+DIFFERENT blockers, so bundling them makes the NVFP4 half wait on a build-file
+fix it does not need.
+
+| Unit | Spec | Blocker |
+|---|---|---|
+| A2-Q1 — FP8 W8A8 mamba | [`nemotron-h-a2q1-fp8-mamba.md`](nemotron-h-a2q1-fp8-mamba.md) | [#960](https://github.com/mudler/vllm.cpp/issues/960), declared as a base |
+| A2-Q2 — NVFP4 MoE + `lm_head` | [`nemotron-h-a2q2-nvfp4-moe-lmhead.md`](nemotron-h-a2q2-nvfp4-moe-lmhead.md) | none for the build; the Thor leg is PENDING [#962](https://github.com/mudler/vllm.cpp/issues/962) |
+
+Both leave G-SAFE fully intact, and both inherit A2-R's unreached posture — the
+device forward still has no production caller until A2-P.
+
 ### 1.1 Dependency order
 
 ```
