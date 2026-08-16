@@ -201,6 +201,22 @@ inline constexpr char kLtx2AllowUnportedExtra[] = "allow_unported_modules";
 // say so rather than skipping the phase silently.
 inline constexpr char kLtx2MaxPhaseExtra[] = "max_phase";
 
+// An IC-LoRA adapter to FUSE into the DiT, and its strength
+// (ltx-core loader/primitives.py:160-167 `LoraPathStrengthAndSDOps`, fused by
+// loader/fuse_loras.py:119-150; the CLI pair is ltx-pipelines utils/args.py:600-611).
+//
+// LOAD extras rather than generation fields, because upstream takes the LoRAs as
+// a `DiffusionStage.from_checkpoint` CONSTRUCTOR argument (ic_lora.py:104-114)
+// and fuses them into the weights, so the adapter is a property of the loaded
+// model and cannot vary per request. A per-generation field would promise
+// something the mechanism cannot do.
+//
+// `lora_strength` absent is 1.0, upstream's DEFAULT_LORA_STRENGTH. Supplying a
+// strength without a path refuses, because a strength alone is a request that
+// silently did nothing.
+inline constexpr char kLtx2LoraPathExtra[] = "lora_path";
+inline constexpr char kLtx2LoraStrengthExtra[] = "lora_strength";
+
 // How many of the supplied prompt-embeds rows are REAL tokens; the rest are
 // padding. Absent means every row is real.
 //

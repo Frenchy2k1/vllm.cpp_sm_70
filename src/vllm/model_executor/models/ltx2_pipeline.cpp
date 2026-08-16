@@ -1218,10 +1218,6 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
              "every ltx-pipelines entry point hard-codes LTX2Scheduler() — so mirroring upstream "
              "means this port has no scheduler-kind field either." +
              marker + owed);
-    case Ltx2UnportedPipelineFeature::kLoraFusion:
-      Refuse("ltx2: LoRA fusion (ltx-core loader/primitives.py:160 LoraPathStrengthAndSDOps, "
-             "fused by loader/fuse_loras.py) is out of scope." +
-             marker + owed);
     case Ltx2UnportedPipelineFeature::kInt8ConvRot:
       // VERIFIED UNREACHABLE so nobody re-audits it, and stated as UNREACHABLE rather
       // than ABSENT because absent is what the first version of this message claimed

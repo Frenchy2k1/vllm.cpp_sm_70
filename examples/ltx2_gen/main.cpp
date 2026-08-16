@@ -98,6 +98,7 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--model-version 2.5] [--pipeline-kind distilled_two_stage]\n"
       "                [--upsampler <latent-spatial-x2.safetensors>]  phase 2 needs it\n"
       "                [--max-phase N] [--allow-unported]\n"
+      "                [--lora <ic-lora.safetensors> [STRENGTH]]  fused at load; 1.0\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
       "                [--first-frame <image.ppm>] [--image-crf 0]\n"
@@ -213,6 +214,19 @@ int main(int argc, char** argv) {
     else if (f == "--prompt-valid-rows")
       SetExtra("prompt_embeds_valid_rows", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--allow-unported") SetExtra("allow_unported_modules", "1");
+    // IC-LoRA (row LTX25-IC-LORA, issue #923), mirroring upstream's
+    // `--lora PATH [STRENGTH]` (ltx-pipelines utils/args.py:600-611): the
+    // strength is optional and defaults to upstream's DEFAULT_LORA_STRENGTH.
+    // LOAD extras, because upstream fuses the adapter into the weights at
+    // construction (ic_lora.py:104-114) and it cannot vary per request.
+    else if (f == "--lora") {
+      SetExtra("lora_path", Need(argc, argv, ++i, f.c_str()));
+      // The optional second word. Consumed only when it does not look like the
+      // next flag, which is how upstream's `nargs="+"` LoraAction disambiguates.
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        SetExtra("lora_strength", argv[++i]);
+      }
+    }
     // Image conditioning (row LTX25-IMAGE-COND, issue #644). `--first-frame` is
     // a binary PPM; `--image-crf` is the PER-GENERATION extra, so it rides
     // vp.extra_* rather than mp.extra_*. Only 0 is served, and it is NOT
