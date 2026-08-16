@@ -319,6 +319,15 @@ unimplemented arm with a message that names the missing part. Record the arm as
 owed. Never leave the missing path to be discovered later. Use
 [`.agents/porting-a-model.md`](.agents/porting-a-model.md) as the checklist.
 
+**Say which weights, and from where.** Every ported model documents the
+checkpoints it was built and gated against in [`docs/USAGE.md`](docs/USAGE.md),
+in the same change that makes the capability reachable: file name, size, and the
+exact HuggingFace repo *and revision*, grouped by arm, with a sha256 for a
+quantized artifact and the refused arms named beside them. A repo id alone is not
+a pin, because checkpoints get re-quantized in place under an unchanged name.
+Weights are the one part of a port a reader cannot infer from the code, so code
+shipped without them is something nobody can feed.
+
 ## Nothing lands dead
 
 A shared seam says where a capability routes. This section says whether anything
