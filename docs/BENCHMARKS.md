@@ -456,11 +456,6 @@ built on it rather than keeping the flattering one.
 
 **CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07).** On dgx aarch64 the `[K,N]` path beats `[N,K]` by 1.16x to 1.30x, byte-identically. The x86 arm is INDICATIVE ONLY, not binding: that box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. `VT_CPU_MATMUL_STEAL` ships default OFF and is NOT measured; it must justify itself by measurement and may measure neutral.
 
-**Darwin Qwen3.5 build repair (2026-08-16).** Benchmarking is NOT APPLICABLE.
-The change removes a redundant namespace-scope lambda capture that Apple Clang
-rejects under `-Werror`; it does not change generated refusal text, model math,
-or any runtime path. The binding gate is the Apple Clang build.
-
 ## Open gaps
 
 | Track | Status | Next gate |
@@ -474,6 +469,7 @@ or any runtime path. The binding gate is the Apple Clang build.
 | Accepted-and-inert serve args (`SERVE-RECIPE-ARGS`, #606) | **No number owed**: argument parsing only, so nothing to time and no oracle leg. Correctness gate 4 cases / 58 asserts GREEN, RED-first, mutation-proven | None. A speed axis would be fabricated; closes on review plus the operator gate rerun |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Qwen3.5 text-only arms (#490) | **No number; run gates OWED**, both `PARTIAL`. The loader half is CLOSED (#740, #864 `DONE`), so what blocks these is hardware, not a refusal | No fitting ckpt for either causal-LM arm: no denominator. `Qwen3.8-2.4T-A95B` is ~4.8 TB vs 128 GB; its load plan resolves, which is not a token |
+| Darwin Qwen3.5 build repair (#1054, 2026-08-16) | **NOT APPLICABLE.** Removing a redundant namespace-scope lambda capture that Apple Clang rejects under `-Werror` changes no generated refusal text, no model math and no runtime path | None. The binding gate is the Apple Clang build |
 | Qwen3.6-35B-A3B published BF16 (#740, #864) | **No number, and none was owed: the 2026-08-15 gate measured TOKENS.** Correctness MET vs the pinned oracle: 6/7 prompts STRICT 16/16, the 7th an exact tie (#910); SACRED 3/3 byte-identical | A throughput / latency / memory grid on this checkpoint. Nothing is measured, so nothing is claimed |
 | MoE vision tower image + video (#891) | **NOT gated, no number.** The 333 `model.visual.*` tensors load and the tower computes, on sm_110 FALLBACK attention, not the shipped GB10 path. The token-exact mm gates never ran | Both modality gates on GB10 through the shipped fast path, then a per-modality speed grid |
 | Dense image/video after the #891 merge (#908) | **UNVERIFIED, network-blocked.** Dense TEXT is 235/235 at `2f2bce926`, a true before/after (binary md5 `db889909d4…` vs `49ded1ece8…`, 500 TUs recompiled). The modality arms were not re-run | Re-run the dense image and video gates once the fixtures are reachable |
