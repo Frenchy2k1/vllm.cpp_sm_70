@@ -271,11 +271,57 @@ TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits"
   // bytes, and the routed experts alone would be 58.7 GB at bf16.
   CHECK(rep.host_bytes < 24LL * 1024 * 1024 * 1024);
   CHECK(rep.host_bytes > 16LL * 1024 * 1024 * 1024);
+
+  // ─── (3b) THE PAYLOAD IS WHOLE, TO THE BYTE ───────────────────────────────
+  //
+  // PRINTING A NUMBER IS NOT GATING IT. The MiB line above was printed and read
+  // by nothing: truncating every payload produced by the production
+  // `CopyDenseOwned` (`nemotron_h_weights.cpp:532`) to half moved `host_bytes`
+  // by 470 MiB and left this suite 2/2 green WITH 3/3 oracle goldens matching —
+  // a shrunk `std::vector` keeps its buffer, so `View()` reads the same values
+  // back and every token stays identical. Only the accounting moved, and
+  // nothing asserted on the accounting.
+  //
+  // So both totals are asserted EXACTLY. They can be exact because the
+  // checkpoint is pinned BY CONTENT (revision 29f2d174, asserted below), so
+  // `source_bytes` is a property of that revision and `host_bytes` is a
+  // property of that revision plus this loader. A range would not catch a
+  // truncation of one weight family; these do.
+  //
+  // THEY ARE NOT EQUAL, and the 15324-byte gap is fully accounted for rather
+  // than tolerated — asserting `host_bytes == source_bytes` would have been
+  // wrong. Two effects, in opposite directions:
+  //
+  //   -24156  scalars READ but not STORED as bytes: 5935 NVFP4 `weight_scale_2`
+  //           + 46*2 FP8 `input_scale`/`weight_scale` + 12 fp8-KV k/v scales
+  //           = 6039 f32 scalars * 4 B. `Loader::Need` counts them into
+  //           `source_bytes` (`nemotron_h_weights.cpp:410`); they land in float
+  //           members, not in a payload `HostBytesOf` walks.
+  //   + 8832  the 69 f32-by-contract SSM widenings asserted just above: 23
+  //           layers * 3 tensors * 64 heads * (4 - 2) B.
+  //   ───────
+  //    -15324 = 18888922112 - 18888937436.
+  //
+  // If either literal moves, the loader's memory format changed — say so in the
+  // commit and re-derive it, never widen it into a range.
+  MESSAGE("host bytes exact: " << rep.host_bytes
+                               << ", source bytes exact: " << rep.source_bytes);
+  CHECK(rep.source_bytes == 18888937436LL);
+  CHECK(rep.host_bytes == 18888922112LL);
+  CHECK(rep.source_bytes - rep.host_bytes == 6039LL * 4 - 69LL * 64 * 2);
   // Peak RSS is the number a unified-memory box lives or dies by.
   MESSAGE("peak RSS after load (GiB): " << static_cast<double>(rss_after_kib) /
                                                (1024.0 * 1024.0));
 
   // The forward, through the SHARED registry seam — never a private entry point.
+  //
+  // A2-R: this is also where the loader's recorded MATMUL ORIENTATION is gated.
+  // `nemotron_h.cpp:306` refuses an `OwnedTensor` whose `nk` is not the
+  // [out, in] torch-Linear orientation `vt::MatmulBT` consumes, and the four
+  // attention projections reach that call from HERE. The synthetic fixture in
+  // `test_nemotron_h_forward.cpp` sets its own `nk`, so it cannot see the
+  // loader get it wrong; this can, and does — flipping
+  // `nemotron_h_weights.cpp:686-689` throws out of this call.
   const std::vector<int32_t> token_ids{1, 2, 3, 4};
   const std::vector<int32_t> positions{0, 1, 2, 3};
   const std::vector<int32_t> logits_indices{3};
