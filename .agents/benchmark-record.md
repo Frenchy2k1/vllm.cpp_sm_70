@@ -22191,3 +22191,67 @@ No end-to-end speedup is claimed from these numbers. The vocoder is one of six
 stages, the 8.6B language model's decode is elsewhere, and the checkpoint load
 dominates a short request. A contention-guarded e2e pair is running and will be
 appended when it lands. No reference comparison exists.
+
+## ENG-EXPERT-STREAM — RETRACTION: the "streaming ON, no decode gain" figure was measured on a cache that had switched itself off (2026-08-16, `row/ENG-EXPERT-STREAM-WIRING-REPAIR2`, #912, #1066)
+
+The W4 run recorded on 16 August 2026 (`[expert-stream] ON slots=8000
+slot_bytes=2490368 resident=18.55 GiB`, Qwen3.8-2.4T-A95B `UD-Q1_0` on one GB10)
+reported:
+
+| Axis | Baseline (no streaming) | Streaming ON |
+|---|---|---|
+| output | `" Paris. Q: What"` | `" Paris. Q:"` (identical tokens) |
+| TTFT | 3318.1 s | 733.4 s (4.5x) |
+| steady decode | 66.5 / 66.9 / 66.8 s | 68.7 / 67.7 s (unchanged) |
+
+**The decode row is VOID. The TTFT row stands.** An independent wiring review
+(#912, findings F1-F11) established that `Qwen35ExpertStream::EndStep()` had no
+caller anywhere in `src/` or `include/`; deleting its definition still compiled.
+
+Why that voids exactly one of the two rows, and why the arithmetic is worth
+recording rather than just the verdict:
+
+`ExpertSlotCache::Acquire` marks every entry it serves `protected_this_step`,
+because evicting a slot the current step is about to read would hand the kernel
+bytes being overwritten. ONLY `EndStep` clears that mark. With no caller the
+protection is permanent, so once the cache fills, `ColdestEvictable` returns -1,
+`Acquire` returns slot -1, `Slice` returns nullptr, and `KqExpertSlice` falls
+back to the mmap path — which IS the baseline.
+
+The run's own numbers say when that happened. 8000 slots against **2790 slices
+per token** (10 experts x 3 matrices x 93 layers) is **2.87 tokens** of capacity.
+
+- **Prefill is ONE forward and therefore one step.** Its working set fit inside
+  the budget, the cache served it, and the 4.5x TTFT is a real measurement of
+  the streaming path.
+- **Decode is one forward per token.** From partway through token 3 onward every
+  slice was refused and served from the mapping. The three decode samples were
+  taken after that point, so they measure the lane being OFF — which is why they
+  match the baseline to within noise (68.7 / 67.7 vs 66.5 / 66.9 / 66.8).
+
+Reviewer probe against unmodified sources, 8 slots and 40 distinct slices:
+`served=8 REFUSED=32, hits=0 misses=40 evictions=0 steps=0, exhausted=1`. With
+`EndStep()` called: `40 slices over 10 steps -> refused=0 evictions=32 steps=10`.
+Independently reproduced by the operator on current `main` with matching numbers.
+
+**A causal claim recorded alongside that figure is also retracted as
+unestablished.** The W4 section attributed the flat decode to `EnsureSpan`
+copying from `base + offset`, a pointer into the mmap, so that filling a slot
+still takes the page fault it was meant to avoid. That is a true statement about
+the code and it was **not established by this measurement**, because the
+measurement never exercised the fill path it blames. It stays on the list as a
+plausible bound, now unmeasured.
+
+**Nothing in the run could have revealed this**, which is the second lesson. The
+process printed `[expert-stream] ON ...` once at startup and nothing afterwards,
+so a cache that died in token 3 was indistinguishable from one that worked for
+the whole run. The lane now emits one line carrying `steps`, `hits`, `misses`,
+`evictions`, `fills`, `bytes`, `exhausted` and `advised`. `steps == 0` and
+`exhausted > 0` are exactly the F1 signature, and either is wrong at a glance.
+
+**Owed, and unmeasurable from here:** a re-run of both axes on a live cache.
+`dgx.casa` was unreachable throughout this repair, this host has no CUDA device
+and cannot hold a 370 GiB checkpoint, and three earlier attempts on that box were
+OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. Tracked under
+`## Owed` in [`expert-streaming.md`](specs/expert-streaming.md). No new
+performance number is claimed by the repair that produced this retraction.
