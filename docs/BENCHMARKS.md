@@ -194,13 +194,16 @@ record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fi
 | Requests completed, ours / vLLM | 5,5,5 / 6,6,6 of 6 | 24,24,24 / 24,24,24 of 24 | 36,37,36 / 48,48,48 of 48 |
 | Output token throughput | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | **0.963x** | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) |
 | Total token throughput | NOT ESTABLISHED | **0.918x** | NOT ESTABLISHED |
+| Status of the two withheld cells | cause LANDED: the drop was our own SSE keepalive frame, and `VT_SERVER_SSE_PING_S` now defaults to 0 ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | (cell stands) | still withheld, now awaiting the paired 3-rep re-run owed by [#915](https://github.com/mudler/vllm.cpp/issues/915), not a diagnosis |
 | Median ITL, over completed only | 1.013x | **1.008x** | 1.021x |
 | Median TPOT, over completed only | 1.014x | 0.980x | 0.925x |
 | Median TTFT, over completed only | 0.733x | 0.881x | 1.268x |
 | Median E2EL, over completed only | 1.003x | 0.974x | 0.983x |
 | ours / vLLM output tok/s | 2.37 / 3.50 | 15.01 / 15.58 | 15.96 / 27.85 |
 | ours / vLLM median TPOT ms | 220.6 / 223.6 | 239.0 / 234.3 | 261.1 / 241.4 |
-| Cold start to first `/health` | **53 s vs 780 s = 14.7x**, medians of 3 (ours 53/53/53, vLLM 786/780/771) | same binary | same binary |
+| Cold start to first `/health` | **53 s vs 780 s = 14.7x**, medians of 3 (ours 53/53/53, vLLM 786/780/771), NOT like-for-like readiness (next two rows) | same binary | same binary |
+| Why that ratio is not like-for-like | ours answers `/health` on process liveness only (`api_server.cpp:286-294`); no dummy run, no kernel warmup, decode CUDA graph captures lazily on first use | vLLM warms up and captures before it serves (`gpu_worker.py:697-708`, `api_server.py:780-785`) | 53 s is "weights loaded", 780 s is "warmed and graph-captured" |
+| What our readiness signal defers | first request TTFT **91.613 s**, the same with the SSE keepalive on and off, so it is genuine first-inference cost, not the [#931](https://github.com/mudler/vllm.cpp/issues/931) defect | cell stands as measured; a like-for-like comparison has not been taken | forensics in `.agents/benchmark-record.md` |
 | Host memory after warmup | **42.5 vs 110.1 GiB = 2.59x**, but vLLM's is set by `--gpu-memory-utilization 0.85` pre-reserving KV, so it is what the configured engine holds, not what the model needs | | |
 | Why only c4 counts | `output_throughput` divides tokens by a wall duration that still contains the dead request, so a cell where one arm dropped requests is withheld, not quoted | 3 paired reps, clocks 2184 MHz | token gate: 4/7 strict, 3 exact fp32 ties ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 
@@ -437,7 +440,7 @@ built on it rather than keeping the flattering one.
 |---|---|---|
 | Surface coverage (`ARCH-ONE-SURFACE`) | **CORRECTNESS COMPLETE:** #139 restores DSR 32 (`kcuda=0`) via registry/name resolution; ABI-v14 selection unchanged; no speed claim | Selector 2/2·11 plus execution-bound CMake/File-API/CTest + CI/preflight + manifest-integrity guard 52/52; CPU platform/loader/C-ABI tests green; CUDA A/B remains residual |
 | 35B prefill TTFT | **0.920x c1 / 0.849x c4** against a correctly FUSED denominator at the pin; the 0.93x-0.98x reading came from an UNFUSED oracle (#414) and is void | Re-attribute the residual against the fused denominator, then close |
-| c16 and above, both models (#577) | **VOID, not a number.** Our arm completed 93/96 requests where the pin completed 96/96 and the three missing are the SLOWEST: our SSE keepalive (`VT_SERVER_SSE_PING_S`, default 15 s) was ENABLED on every leg | Disable the keepalive in the recipe, assert it in the harness, then re-run c16/c32 |
+| c16 and above, both models (#577) | **VOID, not a number.** 93/96 against the pin's 96/96, the three missing being the SLOWEST: our SSE keepalive was ON. Recurred on Qwen3.8-27B at 5/6 and 36/48 ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | Keepalive now default OFF and rate harnesses refuse `failed != 0`; re-run c16/c32 on a binary carrying both |
 | Clock-controlled pin grid (#520, #414, #543) | **First defensible series LANDED** at 1024/128, n=3, interleaved, one boot, flat 2184 MHz. Only c1, c4 and a partial c16 exist | c2, c8 and c32 at the pin under clock control, so the sweep is a sweep |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
