@@ -21839,3 +21839,120 @@ the legs with `clocks_event_reasons.active = 0x0`, one boot id
 `03717c9d-63c8-4652-a8fe-a63d012c5718`, persistence mode Disabled. 2184 MHz is
 the same clock the existing clock-controlled 27B and 35B grids were taken at, so
 those are comparable to this one.
+## Q38-27B-BF16 SSE KEEPALIVE A/B — the #915 dropped requests were our own comment frame, and the cold-start cell is not like-for-like (2026-08-15, `row/FIX-SERVER-CONCURRENCY-931`, GB10 sm_121a, #931, #915)
+
+ONE VARIABLE, on the BYTE-IDENTICAL #915 binary (`vllm-server` md5
+`bda95d34a7e2587c6e2195e365f77bc0`), same workload, same box, clocks flat at
+2184 MHz. Evidence at `dgx:~/fix931/out_noping_run1/`.
+
+| leg | keepalive ON (the old default) | `VT_SERVER_SSE_PING_S=0` |
+|---|---|---|
+| c1 | 5 of 6, failed 1 (index 0) | 6 of 6, failed 0 |
+| c8 | 37 of 48, failed 11 | 48 of 48, failed 0 |
+
+Server log 27 lines in all four legs, `diff` empty throughout. All 12 failures
+across both default-arm legs carry ONE distinct error string, byte-identical to
+the single-comment-frame signature reproduced over a socket without a GPU:
+`Never received a valid chunk to calculate TTFT.This response will be marked as
+failed!`. c8 reproduces #915 (37/11 here against 36/37/36 and 12/11/12 there).
+The keepalive is CAUSAL AT BOTH CONCURRENCIES; c8 is not a second defect.
+
+THROUGHPUT, INDICATIVE ONLY, NOT #915'S RE-RUN. Single unpaired legs, and the
+vLLM arm was NOT re-run, so the denominators are #915's. This is not the paired
+interleaved 3-rep protocol and must never be quoted as if it were.
+
+| leg | default | no-ping | ratio then -> now |
+|---|---:|---:|---|
+| c1 output tok/s | 2.3954 | 2.8553 | 0.675x -> 0.816x |
+| c8 output tok/s | 16.4185 | 21.0875 | 0.572x -> 0.757x |
+
+#915's c1 and c8 cells stay WITHHELD. Both remain REAL GAPS once honest: 0.816x
+and 0.757x are not parity. The fix makes the numbers honest, not good. It stops
+us deleting our own slowest requests from a measurement taken with vLLM's own
+client, and what is left is the deficit that was underneath.
+
+WHAT THE IMPUTATION COST, kept because it prices the technique. Before per-request
+data existed, failed-request TTFTs were imputed by treating the leg's wall
+duration as a slot budget. Measured against that imputation:
+
+| leg | imputed | measured | error |
+|---|---|---|---|
+| c1 | 93.9 s | 91.613 s | +2.5% |
+| c8 | 47.0 / 47.5 / 46.7 s | 33.8-40.8 s | +25% to +40% |
+
+At c1 the semaphore serialises and the arithmetic was nearly exact. At c8 it
+assumed perfectly packed slots and ran 25-40% high. The claim it supported, that
+"the 15 s threshold separates the two populations exactly, in every leg, in all
+three repeats", OVERCLAIMED and is withdrawn. A later retraction saying the
+threshold "neither predicts failure nor follows from it" UNDERCLAIMED. Measured:
+failure implies TTFT > 15 s in 11 of 11; TTFT > 15 s implies failure in 11 of 12.
+Index 1 SURVIVED at 38.58 s (43.88 s in the default arm) and is UNEXPLAINED.
+The trigger is not TTFT: the ping bounds a wait on ONE REQUEST'S COLLECTOR, and
+the stream loops on empty-but-unfinished outputs (`serving_completion.cpp:73-89`),
+so a long prefill that keeps yielding intermediate entries never pings.
+
+COLD START, 53 s vs 780 s = 14.7x, NEEDS A CAVEAT AND KEEPS ITS VALUE. The two
+servers answer `/health` at different points in startup, so the ratio compares
+two different quantities. Ours returns an unconditional 200
+(`api_server.cpp:286-294`, "process liveness only"); weights load before the
+socket listens, but there is no dummy run, no kernel warmup, and the decode CUDA
+graph captures once per padded batch size on the first pure-decode step
+(`runner.cpp:1329-1334`). vLLM runs `compile_or_warm_up_model` (dummy runs,
+`kernel_warmup`, `capture_model`, `gpu_worker.py:697-708`) inside the engine
+client's construction, BEFORE the app is served (`api_server.py:780-785`), and
+its `/health` additionally calls `check_health()`
+(`serve/instrumentator/health.py:22-33`). So 53 s is "process up, weights
+loaded" and 780 s is "process up, weights loaded, warmed and graph-captured".
+
+CONFIRMED, and NOT caused by the keepalive: `ttfts[0] = 91.613 s` appears in BOTH
+arms, so the first request's cost is genuine first-inference work our readiness
+signal does not wait for. Likewise the c8 tail, 11 requests at 33.8-40.8 s, is a
+real scheduling tail the keepalive was DELETING from the measurement rather than
+causing. Both are now reported.
+
+UNVERIFIED, stated so it is not re-derived as fact: whether dropping the page
+cache before every leg makes the first request fault in the ~55 GB of weights.
+The loader runs before `listen`, so the read is nominally inside the 53 s; no
+claim here depends on the answer.
+## Q38-27B-BF16 SSE KEEPALIVE A/B, CORRECTION: the c8 imputation error band does not follow from its own columns (2026-08-16, `row/FIX-SERVER-CONCURRENCY-931`, GB10 sm_121a, #931, #915)
+
+APPENDED, NOT EDITED. This file is append-only, so lines 21881 and 21884 of the
+preceding section stand as written and are SUPERSEDED here. Both say the c8
+slot-packing imputation ran `+25% to +40%` high. The high end is right. The low
+end follows from no pairing of the numbers printed beside it, and this is the
+table whose whole purpose is to let the next person price the technique before
+reusing it.
+
+THE CONVENTION IS THE ONE THE c1 ROW ALREADY USES, and that row is exact:
+error = (imputed - measured) / measured, denominator MEASURED.
+
+  c1  (93.9 - 91.613) / 91.613 = +2.4964% -> +2.50%, as recorded
+
+At c8 the imputation produced ONE number per rep (47.0 / 47.5 / 46.7 s over three
+reps) while the measurement is a RANGE over the eleven failed requests
+(33.8-40.8 s), so the band is the extremes of that pairing:
+
+  low   (46.7 - 40.8) / 40.8 = +14.4608% -> +14.5%
+  high  (47.5 - 33.8) / 33.8 = +40.5325% -> +40.5%
+
+CORRECTED BAND: **+14.5% to +40.5% high, against the MEASURED TTFT.** All six
+pairings of an imputed value with an end of the measured range lie inside it and
+none reaches +25%: 47.0 vs 40.8 = +15.20, 47.0 vs 33.8 = +39.05, 47.5 vs 40.8 =
++16.42, 47.5 vs 33.8 = +40.53, 46.7 vs 40.8 = +14.46, 46.7 vs 33.8 = +38.17
+percent. There is no denominator under which +25% is the low end. It was a slip
+and not a different convention, and the exact c1 row is what establishes that.
+
+NOTHING ELSE IN THE SUPERSEDED SECTION CHANGES. The A/B, the completion counts,
+the single error string, the 11-of-11 and 11-of-12 implications, the withdrawn
+15 s threshold claim, the INDICATIVE-ONLY throughput rows and the cold-start
+caveat all stand exactly as recorded. The only quantity that moves is how badly
+the imputation is priced, and it moves in the imputation's favour: it was less
+wrong at the low end than the section says. Recorded anyway, because a table
+that misprices its own technique cannot be used to decide whether to reuse it.
+
+RELATED WITHDRAWAL, for the reader who arrives from the count. The spec section
+that carries the same table said "Two earlier per-request figures for c8 are
+withdrawn" and then withdrew THREE (the ~3.7 / 5.9 / 6.4 s spans for indices
+2 / 12 / 18, measured at 40.8 / 37.6 / 38.6 s). Three is the count. That figure
+set is a different derivation from the 47.0 / 47.5 / 46.7 s wall-duration
+imputation above and is not part of this band.
