@@ -110,6 +110,14 @@ vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
 vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
+# The bit-identity gate for the row-wise parallelisation of the host-reference
+# kernels (#672). It carries VERBATIM copies of the pre-parallel serial loops as
+# its oracle, so it reaches src/ for `host_parallel.h` (the size guard whose
+# threshold every case must clear, or it would test the inline path twice) and
+# for `Threadpool::SwapForTesting`, the same hook the vt determinism suites use.
+# CPU-only.
+vllm_cpp_add_test(test_host_parallel vllm/models/test_host_parallel.cpp)
+target_include_directories(test_host_parallel PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
