@@ -148,6 +148,10 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
 
+The Qwen3.5 MoE loader also builds under Apple Clang with project warnings
+promoted to errors. Its layout-refusal path uses the same messages and behavior
+on every platform.
+
 ### Standalone and non-registered lanes
 
 These run through dedicated forwards, not the `REGISTER_VLLM_MODEL` registry, so

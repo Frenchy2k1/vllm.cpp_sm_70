@@ -456,6 +456,11 @@ built on it rather than keeping the flattering one.
 
 **CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07).** On dgx aarch64 the `[K,N]` path beats `[N,K]` by 1.16x to 1.30x, byte-identically. The x86 arm is INDICATIVE ONLY, not binding: that box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. `VT_CPU_MATMUL_STEAL` ships default OFF and is NOT measured; it must justify itself by measurement and may measure neutral.
 
+**Darwin Qwen3.5 build repair (2026-08-16).** Benchmarking is NOT APPLICABLE.
+The change removes a redundant namespace-scope lambda capture that Apple Clang
+rejects under `-Werror`; it does not change generated refusal text, model math,
+or any runtime path. The binding gate is the Apple Clang build.
+
 ## Open gaps
 
 | Track | Status | Next gate |
