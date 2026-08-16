@@ -177,6 +177,7 @@
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_lora.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -374,6 +375,19 @@ struct Ltx2DitLoadOptions {
   // Widen the bf16 materialization to f32 for `Ltx2DitForward`, whose gate is
   // f32 by declaration. Doubles the footprint; see the DTYPE note above.
   bool widen_to_f32 = false;
+  // IC-LoRA adapters to FUSE INTO the weights as they are materialized
+  // (ltx-core loader/fuse_loras.py:119-150; `DiffusionStage.from_checkpoint`
+  // takes them as a constructor argument, ic_lora.py:104-114, which is why they
+  // live on the LOAD options rather than on a generation request).
+  //
+  // Fusion happens immediately after `MaterializeDitTensor` and therefore serves
+  // the F32, BF16, FP8 and NVFP4 arms with one code path: both quantized
+  // branches dequantize to bf16 before returning. On the streaming arm it runs
+  // before the device copy, so the "one host buffer live at a time" invariant is
+  // unchanged. See `ltx2_lora.h` for the arithmetic and the dtype argument.
+  //
+  // Exactly one adapter is accepted; a second refuses by name.
+  std::vector<Ltx2LoraSpec> loras;
 };
 
 // A host buffer owned by a loaded checkpoint. Pointer-stable: the views index
@@ -395,6 +409,19 @@ struct Ltx2DitCheckpoint {
   // Module prefixes present in the file and outside the L2 contract, in header
   // order, deduplicated. Empty means the file and the contract agree.
   std::vector<std::string> unported;
+  // How many contract tensors an IC-LoRA delta was fused into. Zero when no
+  // adapter was given; never zero WITH one, because a LoRA that fused into
+  // nothing is refused at load.
+  int64_t lora_fused_tensors = 0;
+  // The reference scale factors the fused adapter declares in its own
+  // `__metadata__` (iclora_utils.py:30-49), resolved by
+  // `Ltx2ResolveLoraReferenceFactors`. Both 1 with no adapter, which is also
+  // upstream's default for an adapter that declares neither.
+  //
+  // These are what `Ltx2ConditionVideoByReference` takes and what the reference
+  // refusal used to name as unreadable. They are read here so that the refusal
+  // can name the cause that ACTUALLY remains.
+  Ltx2LoraReferenceFactors lora_reference;
   Ltx2DitWeights weights;
   std::map<std::string, vt::Tensor> views;
   // Host-resident buffers (`Ltx2LoadDitFromSafetensors`). Pointer-stable.

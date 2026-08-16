@@ -536,10 +536,21 @@ render already applies. A negative count is refused separately with upstream's
 own reason, since a malformed request and an unported arm are different answers.
 
 Reference-image, reference-video and reference-audio conditioning are still
-refused, each naming a different missing piece: the reference arms need the
-IC-LoRA's scale factors, which live in LoRA metadata this project does not
-read; reference audio additionally needs the AUDIO VAE's encoder key filter,
-which is not built. Three encoder-level limits are worth
+refused, each naming a different missing piece. **Two reasons this page used to
+give are now false and are recorded rather than deleted**, because a reader may
+have planned around them: the IC-LoRA scale factors are read as of `--lora`
+(2026-08-15), and the token-APPEND machinery landed with the last-frame keyframe
+above (2026-08-16). What is left for reference VIDEO and reference IMAGE is a
+pixel path and a stage split. Nothing here turns a clip into latents: upstream
+decodes the reference at `height/downscale x width/downscale`, keeps frame 0 and
+then every Nth frame, and encodes the result
+(`ltx_pipelines/iclora_utils.py:87-89`, `:112-148`), and this engine's only
+pixel-to-latent route encodes exactly one frame at the phase's full resolution.
+And the reference item belongs to stage 1 only: upstream fuses the adapter into
+stage 1 and gives stage 2 `loras=()` and no reference item at all
+(`ic_lora.py:108`, `:119`, `:314-321`), while this engine holds ONE DiT, fused
+at load, that every phase runs. Reference audio additionally needs the AUDIO
+VAE's encoder key filter, which is not built. Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -723,6 +734,30 @@ a resolution cap: there is no maximum-size check anywhere in this path, and the
 60 GB is **not attributed** — the decode's own heap peak at that size is 361.72
 MiB, some 170x too small to account for it. See the note below on what bounds a
 render, and `.agents/specs/ltx25-tiled-decode.md`.
+
+`--lora ic-lora.safetensors [STRENGTH]` fuses an IC-LoRA adapter into the DiT at
+load, mirroring upstream's `--lora PATH [STRENGTH]`
+(`ltx-pipelines/utils/args.py:600-611`). The strength is optional and defaults to
+1.0. It is a LOAD-time flag, not a per-request one, because the adapter is fused
+into the weights and cannot vary between generations - upstream takes it as a
+`DiffusionStage.from_checkpoint` constructor argument for the same reason
+(`ic_lora.py:104-114`).
+
+The adapter is a safetensors file of `.lora_A.weight` / `.lora_B.weight` pairs,
+with or without ComfyUI's `diffusion_model.` prefix. It works on every arm the
+DiT loads - bf16, FP8 and NVFP4 alike - because those are all dequantized to
+bf16 before the delta is added. Three things REFUSE by name rather than
+proceeding quietly: an adapter naming a module this port does not bind (upstream
+would skip it, and a skip cannot be told apart from a typo), an adapter that
+fuses into nothing at all, and a second `--lora`, since only one adapter is
+accepted so far.
+
+Supplying an adapter also reads its `reference_downscale_factor` and
+`reference_temporal_scale_factor` metadata (`iclora_utils.py:30-49`). Those are
+what a reference video needs, and reading them was what the reference refusal
+used to say was missing. It no longer says that, and it does not say
+token-append either: that seam landed too. What it names now is the reference
+CLIP's own pixel path and the stage split, both above.
 
 `--upsampler` is what the distilled recipe's second phase needs. Without it that
 phase refuses rather than skipping: its three-step refinement is what makes the
@@ -2199,8 +2234,9 @@ spatiotemporal upsampler is the arm with `spatial_upsample` AND
 **ported** and is not refused; nothing shipped drives it yet, so it is gated
 rather than served. Four more are
 recorded as out of scope but are **not requestable**, so no flag or extra can
-reach them: LoRA fusion, `int8-convrot`, single-node multi-GPU, and
-`BetaScheduler`. Their messages
+reach them: `int8-convrot`, single-node multi-GPU, and
+`BetaScheduler`. (LoRA fusion was in that list until 2026-08-15 and is now
+SERVED - see `--lora` above - so its marker was retired rather than moved.) Their messages
 say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
 `BetaScheduler` is in that group rather than the reachable one because upstream
 selects it nowhere: every `ltx-pipelines` entry point hard-codes
@@ -2281,6 +2317,8 @@ batch-wide payload by rows. The second argument is the requested row count;
 each row keeps the source tensor's independent `num_tokens_per_position`
 width.
 
+(That brick is the TEXT decode path and is a different mechanism from LTX-2.5's
+IC-LoRA, which fuses into the weights at load and IS served - see `--lora`.)
 The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
 [`lora/punica.h`](../include/vllm/lora/punica.h),
 [`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired

@@ -499,6 +499,61 @@ vt::DType MaterializeDitTensor(const SafetensorsFile& file, const DitPlan& plan,
   Fail("'" + spec.name + "' has dtype " + t.dtype + ", which this loader does not read");
 }
 
+// --- IC-LoRA fusion, the three helpers the two load arms share ---------------
+//
+// Kept here rather than in `ltx2_lora.cpp` because they are about the LOADER's
+// contract — `Ltx2TensorSpec`, the enumerated name set, the "did anything
+// happen" check — and `ltx2_lora.cpp` is about the adapter format.
+
+// Open every requested adapter against the contract this load will bind, and
+// resolve the reference factors, whose conflict and arity refusals fire here
+// rather than at first use (ic_lora.py:150-173 resolves them in __init__).
+std::vector<Ltx2LoraAdapter> OpenDitLoras(const Ltx2DitLoadOptions& options,
+                                          const std::vector<Ltx2TensorSpec>& contract) {
+  if (options.loras.empty()) return {};
+  std::vector<std::string> names;
+  names.reserve(contract.size());
+  for (const Ltx2TensorSpec& spec : contract) names.push_back(spec.name);
+
+  std::vector<Ltx2LoraAdapter> out;
+  out.reserve(options.loras.size());
+  for (const Ltx2LoraSpec& spec : options.loras) {
+    out.push_back(Ltx2LoraAdapter::Open(spec, names));
+  }
+  // The caller resolves the reference factors immediately, and that call is what
+  // refuses more than one adapter and refuses conflicting metadata — before any
+  // tensor is materialized.
+  return out;
+}
+
+bool FuseLorasInto(const std::vector<Ltx2LoraAdapter>& loras, const Ltx2TensorSpec& spec,
+                   vt::DType dtype, std::vector<uint8_t>& buffer) {
+  if (loras.empty()) return false;
+  // A LoRA factor pair is rank 2 and so is its target. A contract tensor of any
+  // other rank cannot be a LoRA target, and `Ltx2LoraAdapter::Open` has already
+  // refused a pair naming a name outside the contract, so this is a shape
+  // filter rather than a silent skip of a possible target.
+  if (spec.shape.size() != 2) return false;
+  return Ltx2FuseLoraIntoTensor(loras, spec.name, dtype, spec.shape[0], spec.shape[1],
+                                buffer.data(), buffer.size());
+}
+
+// A LoRA that fused into NOTHING loads green and renders identically to no LoRA
+// at all. That is a user error — a wrong file, or one trained against another
+// model — and it must not read as success.
+void CheckLorasWereApplied(const std::vector<Ltx2LoraAdapter>& loras, int64_t fused) {
+  if (loras.empty() || fused > 0) return;
+  std::string paths;
+  for (const Ltx2LoraAdapter& lora : loras) {
+    paths += std::string(paths.empty() ? "" : ", ") + "'" + lora.path() + "'";
+  }
+  Fail("the adapter(s) " + paths +
+       " fused into ZERO tensors of this checkpoint. Every A/B pair named a tensor the "
+       "contract binds, so the delta was computed for none of them — which means the "
+       "render would be byte-identical to loading no adapter, while reporting success. "
+       "Refusing instead.");
+}
+
 // The families the file carries and NOTHING IN THIS PORT reads.
 //
 // The two `*_embeddings_connector` families are outside the DiT contract and are
@@ -615,13 +670,21 @@ Ltx2DitCheckpoint Ltx2LoadDitFromSafetensors(const SafetensorsFile& file,
     RefuseUnported(out.unported);
   }
 
+  const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
+  out.lora_reference = Ltx2ResolveLoraReferenceFactors(loras);
+  int64_t fused = 0;
   for (const Ltx2TensorSpec& spec : contract) {
     auto buffer = std::make_shared<Ltx2HostBuffer>();
     buffer->dtype = MaterializeDitTensor(file, plan, spec, buffer->bytes);
+    // AFTER materialize, so one hook serves F32, BF16, FP8 and NVFP4 alike:
+    // both quantized branches above have already returned bf16.
+    if (FuseLorasInto(loras, spec, buffer->dtype, buffer->bytes)) ++fused;
     out.views[spec.name] =
         MakeView(buffer->bytes.data(), buffer->dtype, vt::Device{}, spec.shape);
     out.storage.push_back(std::move(buffer));
   }
+  CheckLorasWereApplied(loras, fused);
+  out.lora_fused_tensors = fused;
 
   if (options.widen_to_f32) Ltx2WidenDitToF32(out);
   out.weights = BindLtx2DitWeights(out.params, out.views);
@@ -668,6 +731,9 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
     RefuseUnported(out.unported);
   }
 
+  const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
+  out.lora_reference = Ltx2ResolveLoraReferenceFactors(loras);
+  int64_t fused = 0;
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   for (const Ltx2TensorSpec& spec : contract) {
     // ONE tensor's host buffer is live at a time: it is dequantized, uploaded,
@@ -675,6 +741,9 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
     // the device copy plus one tensor rather than two whole models.
     std::vector<uint8_t> host;
     const vt::DType dtype = MaterializeDitTensor(file, plan, spec, host);
+    // Fused BEFORE the upload, on the host buffer that is already live, so the
+    // invariant above is unchanged: no second device allocation, no round trip.
+    if (FuseLorasInto(loras, spec, dtype, host)) ++fused;
     void* device = backend.Alloc(host.size());
     backend.Copy(queue, device, host.data(), host.size());
     backend.Synchronize(queue);  // `host` dies at the end of this iteration
@@ -685,6 +754,8 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
     out.device_storage.emplace_back(device, [&backend](void* p) { backend.Free(p); });
     load_stats::AddDeviceUpload(host.size());
   }
+  CheckLorasWereApplied(loras, fused);
+  out.lora_fused_tensors = fused;
   out.weights = BindLtx2DitWeights(out.params, out.views);
   return out;
 }

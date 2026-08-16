@@ -1266,7 +1266,13 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
   // what this port has, which is the defect this row closes.
   const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> markers = {
       {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
-      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
+      // `kLoraFusion` WAS here and is RETIRED (row LTX25-IC-LORA, #923). It is
+      // not moved to `reachable`: it is gone. The `lora_path` load extra now
+      // fuses an adapter, so there is no unported LoRA-fusion feature left to
+      // name, and #691's prediction — that this list gates message TEXT and
+      // would not notice the property going false — is why the enumerator was
+      // deleted rather than reclassified. The compiler is what caught it, which
+      // is a weaker guarantee than #691 asks for and does not close #691.
       {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
       {vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism, "multi-GPU"},
   };

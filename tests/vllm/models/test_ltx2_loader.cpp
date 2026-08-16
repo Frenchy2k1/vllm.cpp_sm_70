@@ -2156,3 +2156,217 @@ TEST_CASE("ltx2 loader: BindLtx2DitWeights names the tensor it is missing") {
   CHECK(what.find(dropped) != std::string::npos);
   std::remove(path.c_str());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IC-LoRA fusion on the QUANTIZED arms (row LTX25-IC-LORA, issue #923)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHY THESE TWO CASES EXIST AND ARE NOT REDUNDANT WITH test_ltx2_lora. That
+// suite gates the fusion arithmetic against a bf16 buffer it hands over itself.
+// It cannot show that an FP8 or NVFP4 CHECKPOINT reaches the same code, and the
+// design claim this row makes is precisely that one hook serves every arm
+// because `MaterializeDitTensor`'s `F8_E4M3` and `U8` branches both
+// `return vt::DType::kBF16` before anything else sees a byte.
+//
+// If that claim were wrong — if either quantized branch returned its packed
+// dtype — the fuser's final `Fail` would fire and these cases would throw. So
+// they are the gate on the "one hook serves four arms" design, not a second
+// copy of the arithmetic gate.
+namespace {
+
+// Write a one-target IC-LoRA whose delta is a known constant, against the same
+// contract `BuildSyntheticDit` writes.
+std::string WriteLoraFor(const Ltx2DitParams& p, const std::string& target, float scale,
+                         const std::string& path) {
+  std::vector<int64_t> shape;
+  for (const Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(p)) {
+    if (spec.name == target) shape = spec.shape;
+  }
+  REQUIRE_MESSAGE(shape.size() == 2, "LoRA target '", target, "' is not rank 2");
+  const int64_t rank = 2;
+  const std::string module = target.substr(0, target.size() - std::string(".weight").size());
+
+  std::vector<StEntry> entries;
+  {
+    StEntry a;
+    a.name = "diffusion_model." + module + ".lora_A.weight";
+    a.dtype = "BF16";
+    a.shape = {rank, shape[1]};
+    for (int64_t i = 0; i < rank * shape[1]; ++i) {
+      const uint16_t v = vt::F32ToBF16(1.0F);
+      a.bytes.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    entries.push_back(std::move(a));
+
+    StEntry b;
+    b.name = "diffusion_model." + module + ".lora_B.weight";
+    b.dtype = "BF16";
+    b.shape = {shape[0], rank};
+    for (int64_t i = 0; i < shape[0] * rank; ++i) {
+      const uint16_t v = vt::F32ToBF16(scale);
+      b.bytes.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    entries.push_back(std::move(b));
+  }
+  WriteSafetensors(entries, path);
+  return path;
+}
+
+// The delta every case above produces: rank terms of `1.0 * scale`, so a
+// uniform `rank * scale` on every element of the target.
+constexpr float kLoraScale = 0.5F;
+constexpr float kExpectedDelta = 2 * kLoraScale;
+
+void CheckArmFuses(Ltx2DitQuant quant, const char* tag) {
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, quant, {});
+  const std::string dit_path = TmpPath((std::string("lora_") + tag).c_str());
+  WriteSafetensors(syn.entries, dit_path);
+
+  // A target that is quantized on BOTH arms: a rank-2 non-table weight.
+  const std::string target = "transformer_blocks.0.attn1.to_q.weight";
+  const std::string lora_path =
+      WriteLoraFor(p, target, kLoraScale, TmpPath((std::string("lora_a_") + tag).c_str()));
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+
+  // The control: the same checkpoint with no adapter, so the delta is measured
+  // against what this loader actually produces rather than against an
+  // independently computed dequantization.
+  const vllm::Ltx2DitCheckpoint plain = vllm::Ltx2LoadDitFromSafetensors(file);
+  REQUIRE(plain.lora_fused_tensors == 0);
+
+  vllm::Ltx2DitLoadOptions options;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  spec.strength = 1.0;
+  options.loras.push_back(spec);
+  const vllm::Ltx2DitCheckpoint fused = vllm::Ltx2LoadDitFromSafetensors(file, options);
+
+  INFO("arm = ", std::string(tag));
+  // Exactly one contract tensor was touched.
+  CHECK(fused.lora_fused_tensors == 1);
+  // No adapter metadata, so both factors are upstream's default of 1.
+  CHECK(fused.lora_reference.downscale == 1);
+  CHECK(fused.lora_reference.temporal == 1);
+
+  const vt::Tensor& before = plain.views.at(target);
+  const vt::Tensor& after = fused.views.at(target);
+  REQUIRE(before.dtype == vt::DType::kBF16);
+  REQUIRE(after.dtype == vt::DType::kBF16);
+  REQUIRE(before.Numel() == after.Numel());
+
+  // THE VALUE CLAIM: every element moved by exactly the delta. Checked
+  // element-wise rather than as a norm, because a norm cannot see a delta
+  // applied to the wrong half of the tensor.
+  const uint16_t* b0 = before.Ptr<uint16_t>();
+  const uint16_t* a0 = after.Ptr<uint16_t>();
+  int64_t moved = 0;
+  for (int64_t i = 0; i < before.Numel(); ++i) {
+    // Rounded to bf16, because the STORE is bf16: comparing against an f32 sum
+    // fails on the last mantissa bit for every element whose sum is not exactly
+    // representable, which is most of them.
+    const float want = vt::BF16ToF32(vt::F32ToBF16(vt::BF16ToF32(b0[i]) + kExpectedDelta));
+    CHECK(vt::BF16ToF32(a0[i]) == doctest::Approx(want));
+    if (a0[i] != b0[i]) ++moved;
+  }
+  // And it is not vacuous: the delta is non-zero, so the bytes must actually
+  // differ. A fuser that returned early would pass the Approx loop above only
+  // if `kExpectedDelta` were 0.
+  CHECK(moved == before.Numel());
+
+  // A tensor NO adapter targets is byte-identical, which is what shows the hook
+  // is keyed on the name rather than applied to everything materialized.
+  const std::string untouched = "transformer_blocks.0.attn1.to_k.weight";
+  const vt::Tensor& u0 = plain.views.at(untouched);
+  const vt::Tensor& u1 = fused.views.at(untouched);
+  REQUIRE(u0.Numel() == u1.Numel());
+  int64_t untouched_moved = 0;
+  for (int64_t i = 0; i < u0.Numel(); ++i) {
+    if (u0.Ptr<uint16_t>()[i] != u1.Ptr<uint16_t>()[i]) ++untouched_moved;
+  }
+  CHECK(untouched_moved == 0);
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 loader: an IC-LoRA fuses into the FP8 arm") {
+  // The arm most users run. `MaterializeDitTensor`'s F8_E4M3 branch calls
+  // DequantFp8ToBf16 and returns kBF16, so the delta lands on a dequantized
+  // weight and no FP8 quantizer is needed — which is the whole reason this port
+  // can serve every arm with one hook (ltx2_lora.h, the WHERE IT IS APPLIED
+  // note).
+  CheckArmFuses(Ltx2DitQuant::kFp8, "fp8");
+}
+
+TEST_CASE("ltx2 loader: an IC-LoRA fuses into the NVFP4 arm") {
+  // Same claim, the other quantized branch: U8-packed NVFP4 with its two scale
+  // sidecars, dequantized by Ltx2DequantNvfp4ToBf16 which also returns kBF16.
+  //
+  // Upstream RE-QUANTIZES here (quantization/nvfp4/fuse.py:40-47) because it
+  // keeps the packed weight resident for its NVFP4 kernels. This tree keeps
+  // bf16 (ltx2_loader.h's DTYPE note), so there is nothing to re-quantize into
+  // and no NVFP4 quantizer in the tree to do it with. The divergence is
+  // deliberate and recorded in the row's spec §3.1: our fused weight SKIPS
+  // upstream's lossy round trip, at no extra bytes.
+  CheckArmFuses(Ltx2DitQuant::kNvfp4, "nvfp4");
+}
+
+TEST_CASE("ltx2 loader: an adapter that fuses into NOTHING refuses rather than loading green") {
+  // Reachable because the contract carries rank-1 and rank-3 tensors a LoRA
+  // pair can legitimately name but never fuse into. A load that reported
+  // success here would render byte-identically to no adapter at all.
+  const Ltx2DitParams p = TinyParams();
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string dit_path = TmpPath("lora_none");
+  WriteSafetensors(syn.entries, dit_path);
+
+  // A non-rank-2 contract tensor: the scale-shift table is [rows, inner] rank 2,
+  // so pick a genuinely rank-1 one.
+  std::string rank1;
+  for (const Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(p)) {
+    const bool is_weight = spec.name.size() > 7 &&
+                           spec.name.compare(spec.name.size() - 7, 7, ".weight") == 0;
+    if (spec.shape.size() == 1 && is_weight) {
+      rank1 = spec.name;
+      break;
+    }
+  }
+  REQUIRE_MESSAGE(!rank1.empty(), "the contract has no rank-1 tensor to build this case on");
+
+  const std::string module = rank1.substr(0, rank1.size() - std::string(".weight").size());
+  std::vector<StEntry> entries;
+  for (const char* side : {".lora_A.weight", ".lora_B.weight"}) {
+    StEntry e;
+    e.name = "diffusion_model." + module + side;
+    e.dtype = "BF16";
+    e.shape = {1, 1};
+    const uint16_t v = vt::F32ToBF16(1.0F);
+    e.bytes.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    entries.push_back(std::move(e));
+  }
+  const std::string lora_path = TmpPath("lora_none_a");
+  WriteSafetensors(entries, lora_path);
+
+  const SafetensorsFile file = SafetensorsFile::Open(dit_path);
+  vllm::Ltx2DitLoadOptions options;
+  vllm::Ltx2LoraSpec spec;
+  spec.path = lora_path;
+  options.loras.push_back(spec);
+
+  std::string what;
+  try {
+    (void)vllm::Ltx2LoadDitFromSafetensors(file, options);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  INFO("what: ", what);
+  CHECK(what.find("fused into ZERO tensors") != std::string::npos);
+  CHECK(what.find(lora_path) != std::string::npos);
+
+  std::remove(dit_path.c_str());
+  std::remove(lora_path.c_str());
+}

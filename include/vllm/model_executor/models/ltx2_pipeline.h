@@ -659,12 +659,24 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
 //   DECLARED-OUT-OF-SCOPE MARKER — no request field, load extra or CLI flag asks
 //   for it, so nothing outside the ledger test reaches it. It is a record of what
 //   upstream HAS and this port does NOT, which is worth keeping; calling it a
-//   refusal is what was wrong. `kBetaScheduler`, `kLoraFusion`, `kInt8ConvRot`
-//   and `kMultiGpuParallelism` are markers, and their messages say so.
+//   refusal is what was wrong. `kBetaScheduler`, `kInt8ConvRot` and
+//   `kMultiGpuParallelism` are markers, and their messages say so.
 //
-// TWO ENUMERATORS WERE RETIRED on 2026-08-13, recorded here because the
-// retirement IS the record — a reader who finds them in git history needs to know
-// they did not simply move:
+// THREE ENUMERATORS HAVE BEEN RETIRED, recorded here because the retirement IS
+// the record — a reader who finds them in git history needs to know they did not
+// simply move. Two on 2026-08-13 because they were wrong, one on 2026-08-15
+// because it came true:
+//
+//   `kLoraFusion` — RETIRED 2026-08-15 by row LTX25-IC-LORA (#923) because it
+//   came TRUE. It said LoRA fusion was out of scope and carried the
+//   DECLARED, NOT REQUESTABLE marker, which asserted that no request field or
+//   load extra asks for it. The `lora_path` / `lora_strength` load extras now
+//   do, and `Ltx2DitLoadOptions::loras` fuses the delta into every arm, so the
+//   marker's own sentence had become false. #691 predicted this exact drift in
+//   its own words — the ledger test gates the message TEXT and not the property,
+//   so nothing here would have caught it — and that is why the enumerator is
+//   REMOVED rather than reclassified: there is no longer an unported LoRA-fusion
+//   feature to name, and a refusal for a served capability is worse than none.
 //
 //   `kMultishot` — FABRICATED. It refused "multishot generation" and cited
 //   "ltx-pipelines multishot entry points". No such entry point, symbol or string
@@ -705,8 +717,6 @@ enum class Ltx2UnportedPipelineFeature {
                          //   has zero hits for the name. Mirroring that means no
                          //   scheduler-kind field here either, so nothing reaches the
                          //   refusal — `Ltx2Schedule`, which holds it, has no caller.
-  kLoraFusion,           // ltx-core loader/primitives.py:160 (LoraPathStrengthAndSDOps),
-                         //   fused by loader/fuse_loras.py
   kInt8ConvRot,          // ComfyUI-ecosystem quantization, and NOT an LTX-2 arm: the four
                          //   inference kinds upstream defines are fp8-cast / fp8-scaled-mm /
                          //   nvfp4-cast / nvfp4-prequant (quantization_factory.py:23-26).
