@@ -1207,25 +1207,123 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   return engine;
 }
 
+namespace {
+
+// GENERATED keyframe slots, refused BY WHAT IS MISSING.
+//
+// Deliberately a second anonymous namespace rather than an addition to the one
+// at the top of this file: the READER ANCHORS comment above `kKnownLoadExtras`
+// carries derived LINE NUMBERS into this file and is gated by
+// `test_ltx2_video`, so a definition inserted up there would move every anchor
+// under it and break that gate for a reason that has nothing to do with this
+// row. Everything here sits below the last anchored line.
+//
+// This resolves the request BEFORE any arm is selected, so the FP8, NVFP4 and
+// bf16 arms cannot reach the unported machinery by different routes — there is
+// one answer for the family, not one per arm.
+void CheckGeneratedKeyframes(const std::map<std::string, std::string>& extras) {
+  if (VideoExtra(extras, kLtx2GeneratedKeyframesExtra).empty()) return;
+  const int64_t count = ExtraInt(extras, kLtx2GeneratedKeyframesExtra, 0);
+
+  // ZERO IS UPSTREAM'S DEFAULT, AND IT IS OFF. `args.py:836` is `default=0` and
+  // `has_generated_keyframes` (utils/helpers.py:384-391) reads 0 as "no slots
+  // requested". A caller that plumbs the default through must get a render.
+  // Refusing on the mere presence of the key is one line shorter and wrong.
+  if (count == 0) return;
+
+  // A MALFORMED REQUEST AND AN UNPORTED ARM ARE DIFFERENT ANSWERS, and upstream
+  // gives this one first: `evenly_spaced_keyframe_positions` raises
+  // "num_keyframes must be non-negative" (utils/helpers.py:372-373) before
+  // anything looks at the checkpoint. Collapsing the two would tell a caller who
+  // typed -1 to go and read about attention masks.
+  if (count < 0) {
+    Fail("the '" + std::string(kLtx2GeneratedKeyframesExtra) + "' extra is " +
+         std::to_string(count) + ", and num_keyframes must be non-negative — upstream's own "
+         "refusal, raised by `evenly_spaced_keyframe_positions` "
+         "(ltx-pipelines/utils/helpers.py:370-381) before the checkpoint is consulted. Use 0 "
+         "to turn generated keyframes off, which is upstream's default (utils/args.py:836).");
+  }
+
+  Fail(
+      "generated keyframe slots are not served. This is upstream's "
+      "`VideoGeneratedKeyframeSlots` (ltx-core/conditioning/types/keyframe_slots.py:27-174), "
+      "reached from the CLI as `--num-generated-keyframes` (ltx-pipelines/utils/args.py:833-844) "
+      "and documented at ltx-pipelines/docs/conditioning.md:29-61 — the model GENERATES extra "
+      "frames at interior positions, which is a different feature from a SUPPLIED keyframe "
+      "image and is refused for a different reason. WHAT IS MISSING IS THE READBACK, and the "
+      "supplied arm needs none of it. The slots are the OUTPUT rather than conditioning, so "
+      "`apply_to` (keyframe_slots.py:71-150) records a `GeneratedKeyframeLayout` (:143-147, "
+      "defined at ltx_core/types.py:220-247) that locates them EXACTLY rather than assuming they "
+      "trail — items are applied in list order and each appends, so a state carrying slots AND a "
+      "supplied keyframe has no fixed trailing layout. `clear_conditioning` (ltx_core/"
+      "tools.py:88-117) then extracts them into `LatentState.generated_keyframes` as "
+      "(B, C, K, H, W) BEFORE it trims the extra tokens (tools.py:97, :115, by "
+      "`extract_generated_keyframes` at :203-230, which validates the layout against the live "
+      "token count and the target resolution), and each frame must then be decoded as a "
+      "STANDALONE one-frame clip — a K-frame causal decode would blend slots that were never "
+      "temporally adjacent (ltx_core/types.py:269-272, docs/conditioning.md:59-61). None of that "
+      "exists here, so a port that grew the sequence and stopped would generate the slots and "
+      "then throw them away, which is worse than refusing. "
+      "TWO PLAUSIBLE REASONS ARE RULED OUT, each with what ruled it out, so the next reader "
+      "re-checks the claim instead of re-deriving the refutation. FIRST, NOT the TOKEN-APPEND "
+      "machinery. Row LTX25-TOKEN-APPEND (issue #930) landed it and the LAST-frame "
+      "supplied-keyframe arm is SERVED through it today: `Ltx2ExtendKeyframesMask` and "
+      "`Ltx2ClearConditioning` grow the sequence and trim it back, and the phase loop binds a "
+      "`target_tokens` the grown count is measured against, so `apply_to`'s concatenation onto "
+      "`latent`, `denoise_mask`, `positions` and `clean_latent` (keyframe_slots.py:136-140), its "
+      "explicit [t, t+1) span with `causal_fix=False` (:152-174) and its `denoise_mask = 1` "
+      "(:118-119) all have a seam to land on. Two SMALL pieces of that seam are owed to THIS row "
+      "rather than to #930, and neither is the blocker above: the `marked=true` branch of "
+      "`Ltx2ExtendKeyframesMask` (upstream `keyframe_slots.py:121`) has no production caller yet, "
+      "and `update_attention_mask` (:123-131) has no local counterpart because `Ltx2LatentState` "
+      "carries no attention-mask field — deliberately, since the only upstream route to a "
+      "non-None mask is the IC-LoRA wrapper this engine does not mirror. SECOND, and this is the "
+      "one this campaign pinned falsely once already, WHAT IS *NOT* THE REASON: "
+      "`keyframes_abs_pos_embedding`. It is ported and applied on every render (row "
+      "LTX25-KEYFRAMES-ABS-POS, issue #658), because `_first_frame_keyframes_mask` "
+      "(ltx_core/tools.py:184-196) marks the target's first latent frame unconditionally. What "
+      "generated slots would add is MORE marked tokens — `keyframe_slots.py:121` is upstream's "
+      "only `extend_keyframes_mask(..., marked=True)` call site, against `marked=False` for "
+      "supplied content at keyframe_cond.py:84-86 — not the marker itself. "
+      "LOCAL FACTS, and the gate re-derives every one of them from "
+      "`ltx2_conditioning.h`'s DECLARATIONS with comment lines stripped, because a comment can "
+      "name a symbol the header does not declare. This clause exists because the reason above is "
+      "the part that goes stale: the refusal this one replaces named a token-append gap that "
+      "#930 had already closed, and the suite stayed GREEN through it because every assertion was "
+      "on an UPSTREAM symbol name, which no change to this tree can move. DECLARED HERE: "
+      "Ltx2ExtendKeyframesMask, Ltx2ClearConditioning, Ltx2LatentState. ABSENT HERE: "
+      "GeneratedKeyframe, generated_keyframe. "
+      "Tracked as owed by issue #920.");
+}
+
+}  // namespace
+
 VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   Impl& im = *impl_;
   std::lock_guard<std::mutex> guard(im.mutex);
 
   if (gen.output_dir.empty()) Fail("output_dir is required");
   for (const auto& kv : gen.extras) {
-    // `image_crf` is the only per-generation extra this family defines (row
-    // LTX25-IMAGE-COND). Everything else is refused rather than ignored, for the
+    // The per-generation extras this family DEFINES, and the list is the one
+    // below rather than this sentence: `image_crf` (row LTX25-IMAGE-COND), the
+    // three audio-to-video knobs (row LTX25-A2V-AUDIO-INPUT, #922) and
+    // `num_generated_keyframes` (row LTX25-GENERATED-KEYFRAMES, #920). DEFINED
+    // is not SERVED — the last one is defined so that its own refusal can name
+    // what is missing, exactly as `CheckUnservedExtras` does on the load side
+    // (#611). Everything OUTSIDE the list is refused rather than ignored, for the
     // reason `CheckKnownExtras` gives for the load side: a mistyped knob that is
     // silently dropped renders the DEFAULT and looks like the feature not
     // working — and for THIS knob the default is a refusal, so a typo would turn
     // a served request into an unexplained one.
     const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
                        kv.first == kLtx2AudioStartTimeExtra ||
-                       kv.first == kLtx2AudioMaxDurationExtra;
+                       kv.first == kLtx2AudioMaxDurationExtra ||
+                       kv.first == kLtx2GeneratedKeyframesExtra;
     if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
-           kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra);
+           kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra + ", " +
+           kLtx2GeneratedKeyframesExtra);
     }
   }
   // The two audio WINDOW knobs only mean something alongside a file. Accepting
@@ -1241,6 +1339,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
   }
+  CheckGeneratedKeyframes(gen.extras);
   if (!gen.prompt.empty() && !im.has_encoder) {
     Fail(
         "a prompt was supplied but no text tower is loaded, so it cannot condition this "
