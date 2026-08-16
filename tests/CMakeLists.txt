@@ -269,8 +269,15 @@ vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
 # (a merge of origin/main moved all nine of these by 25 lines mid-review), which
 # is why the anchors are derived from the source and compared with the recorded
 # ones rather than trusted.
+#
+# The second path is the conditioning header, and it is a DIFFERENT file from the
+# one the refusal it checks lives in. The generated-keyframe refusal states its
+# claims about this tree as a list of names, and the suite re-derives each one
+# from these declarations. Reading the claim out of the file that makes it is the
+# tautology issue #911 records, so the two files are deliberately not the same.
 target_compile_definitions(test_ltx2_video PRIVATE
-  LTX2_VIDEO_SOURCE_PATH="${CMAKE_SOURCE_DIR}/src/vllm/multimodal/ltx2_video.cpp")
+  LTX2_VIDEO_SOURCE_PATH="${CMAKE_SOURCE_DIR}/src/vllm/multimodal/ltx2_video.cpp"
+  LTX2_CONDITIONING_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_conditioning.h")
 # LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
 # PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
 # ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc

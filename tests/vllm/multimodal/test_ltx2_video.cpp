@@ -1484,6 +1484,207 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
   }
 }
 
+TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, not as a typo") {
+  // Row LTX25-GENERATED-KEYFRAMES (#920). This is the OTHER feature called
+  // "keyframe", and the distinction is the whole point of the case above:
+  //
+  //   supplied  -> `VideoConditionByKeyframeIndex`, content from the caller,
+  //                appended with `marked=False` (keyframe_cond.py:84-86)
+  //   GENERATED -> `VideoGeneratedKeyframeSlots`, content from the MODEL,
+  //                appended with `marked=True` (keyframe_slots.py:121)
+  //
+  // `extend_keyframes_mask`'s `marked` argument (conditioning/mask_utils.py:76-107)
+  // is the only difference, and `keyframe_slots.py:121` is upstream's only call
+  // site that passes True. So generated slots are the ONLY user-facing feature
+  // that puts #658's trained marker on a token other than the target's own first
+  // latent frame -- and `KeyframeInterpolationPipeline` is NOT that feature: it
+  // builds only `VideoConditionByKeyframeIndex` items through
+  // `image_conditionings_by_adding_guiding_latent` (utils/helpers.py:343-367)
+  // and does not appear in the feature's own applies-to list
+  // (ltx-pipelines/docs/conditioning.md:47-51).
+  //
+  // Upstream reaches it as `--num-generated-keyframes`, `type=int`, `default=0`
+  // (ltx-pipelines/utils/args.py:833-844), forwarded to the FIRST diffusion
+  // stage only. That is a per-CALL argument, so it is a per-generation extra
+  // here rather than a load option.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  // Phase 0 only: this case is about the REQUEST being resolved, and the
+  // zero-is-off arm has to complete a render to prove it. The upsampler is a
+  // second, unrelated refusal.
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  auto refusal = [&](const char* value, const char* dir) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = value;
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("num_generated_keyframes=" << value << " must be refused, never dropped");
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a positive count names the READBACK, and rules the other reasons out") {
+    const std::string msg = refusal("2", "gk2");
+    INFO(msg);
+    // The upstream symbols, so a later reader can go and check whether the
+    // reason still holds rather than re-deriving it. This is the bar the
+    // LAST-frame refusal set and the one six refusals in this campaign failed.
+    CHECK(msg.find("VideoGeneratedKeyframeSlots") != std::string::npos);
+    CHECK(msg.find("keyframe_slots.py") != std::string::npos);
+    // The BLOCKER: the readback, which the SUPPLIED arm needs none of.
+    CHECK(msg.find("GeneratedKeyframeLayout") != std::string::npos);
+    CHECK(msg.find("generated_keyframes") != std::string::npos);
+    CHECK(msg.find("extract_generated_keyframes") != std::string::npos);
+    // The two RULED-OUT reasons, each of which a reader would otherwise reach
+    // for first. Both must be present and both must be marked as ruled out.
+    CHECK(msg.find("RULED OUT") != std::string::npos);
+    CHECK(msg.find("update_attention_mask") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
+    CHECK(msg.find("#930") != std::string::npos);
+    const bool names_the_served_arm = msg.find("last-frame") != std::string::npos ||
+                                      msg.find("LAST-frame") != std::string::npos;
+    CHECK(names_the_served_arm);
+    // The refuted reason may be NAMED -- it is worth telling a reader the marker
+    // was ruled out -- but never as the thing that is missing. Same guard the
+    // LAST-frame case carries.
+    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
+      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+      CHECK(msg.find("#658") != std::string::npos);
+    }
+  }
+  SUBCASE("its claims about THIS tree are re-derived from this tree") {
+    // THE ASSERTION THIS REPAIR EXISTS FOR, and it is a different assertion from
+    // every one above.
+    //
+    // The refusal this one replaces named the token-append machinery as its
+    // first blocker. That was true when it was written and FALSE by the time it
+    // reached review: `c7cb59fbb` (row LTX25-TOKEN-APPEND, #930) landed the
+    // append seam, served the LAST-frame arm through it, and turned the clear
+    // step from an identity into a real trim. Nothing went red. Every assertion
+    // in the case above is on an UPSTREAM symbol name -- `update_attention_mask`,
+    // `clear_conditioning` -- and no change to THIS tree can move one, so the
+    // suite could not see it. A reviewer's mutation confirmed the hole directly:
+    // replacing the local-cause sentence with a self-declared falsehood, leaving
+    // the upstream names alone, kept the suite GREEN at 18/18.
+    //
+    // So the message states its local claims in a form the gate can re-derive,
+    // and re-derives them from `ltx2_conditioning.h` -- a DIFFERENT file from the
+    // one the message lives in, which is what stops the check from being the
+    // tautology .agents/issue-index.md #911 records (reading a span out of the
+    // file it validates reports everything fresh).
+    //
+    // Comment lines are stripped before the scan. Without that the ABSENT half
+    // is answered by prose: this very header's comment at `Ltx2ExtendKeyframesMask`
+    // names upstream's `VideoGeneratedKeyframeSlots`, so an unstripped search for
+    // `GeneratedKeyframe` finds a hit and the check silently inverts.
+    const std::string msg = refusal("2", "gkclaims");
+    INFO(msg);
+    const std::vector<std::string> header_lines =
+        SplitLines(ReadSourceFile(LTX2_CONDITIONING_HEADER_PATH));
+    REQUIRE(header_lines.size() > 100);
+    std::string declarations;
+    for (const std::string& line : header_lines) {
+      const size_t first = line.find_first_not_of(" \t");
+      if (first != std::string::npos && line.compare(first, 2, "//") == 0) continue;
+      declarations += line;
+      declarations += '\n';
+    }
+    // The header must still be mostly declarations after stripping, or a
+    // reformat that turned it into one comment block would answer ABSENT for
+    // free. Positive control on the instrument itself.
+    REQUIRE_MESSAGE(declarations.find("struct Ltx2LatentState") != std::string::npos,
+                    "comment stripping removed the declarations it was meant to keep");
+
+    // The claimed names are read OUT OF THE MESSAGE, never listed here: a list
+    // here would be a second place the claim lives, and the two would drift.
+    auto names_after = [&](const std::string& marker) {
+      std::vector<std::string> out;
+      const size_t at = msg.find(marker);
+      REQUIRE_MESSAGE(at != std::string::npos,
+                      "the refusal no longer carries its '" << marker << "' clause");
+      const size_t start = at + marker.size();
+      const size_t stop = msg.find('.', start);
+      REQUIRE(stop != std::string::npos);
+      std::string list = msg.substr(start, stop - start);
+      size_t from = 0;
+      while (from <= list.size()) {
+        const size_t comma = list.find(',', from);
+        std::string name = list.substr(from, comma == std::string::npos ? std::string::npos
+                                                                        : comma - from);
+        const size_t b = name.find_first_not_of(" \t");
+        const size_t e = name.find_last_not_of(" \t");
+        if (b != std::string::npos) out.push_back(name.substr(b, e - b + 1));
+        if (comma == std::string::npos) break;
+        from = comma + 1;
+      }
+      return out;
+    };
+
+    const std::vector<std::string> declared = names_after("DECLARED HERE: ");
+    const std::vector<std::string> absent = names_after("ABSENT HERE: ");
+    // A count floor, because an empty list satisfies every "for each" below and
+    // reports a pass over nothing.
+    CHECK(declared.size() >= 3);
+    CHECK(absent.size() >= 2);
+    for (const std::string& name : declared) {
+      INFO("claimed DECLARED: " << name);
+      CHECK_MESSAGE(declarations.find(name) != std::string::npos,
+                    "the refusal claims ltx2_conditioning.h declares '"
+                        << name << "', and it does not. The message is stale about THIS tree");
+    }
+    for (const std::string& name : absent) {
+      INFO("claimed ABSENT: " << name);
+      CHECK_MESSAGE(declarations.find(name) == std::string::npos,
+                    "the refusal claims ltx2_conditioning.h has no '"
+                        << name
+                        << "', and it does. If the readback landed, this refusal is no longer "
+                           "true and must be rewritten or removed");
+    }
+  }
+  SUBCASE("and it is NOT the generic unknown-extra message") {
+    // THE ASSERTION THIS ROW EXISTS FOR. Without it the case above passes
+    // against the message the tree already has, because "unknown per-generation
+    // extra 'num_generated_keyframes'. This family defines: image_crf" contains
+    // no upstream symbol at all -- and a refusal that says the family does not
+    // define the key sends the reader looking for a typo instead of for the
+    // unported machinery. That is the distinction `CheckUnservedExtras` was
+    // written for on the load side (#611).
+    const std::string msg = refusal("1", "gk1");
+    INFO(msg);
+    CHECK(msg.find("unknown per-generation extra") == std::string::npos);
+  }
+  SUBCASE("zero is upstream's DEFAULT and must not refuse") {
+    // args.py:836 is `default=0`, and `has_generated_keyframes`
+    // (utils/helpers.py:384-391) reads 0 as off. A caller that plumbs the
+    // default through must get a render, not a refusal. This is the half a
+    // naive port breaks -- "the key is present, so refuse" is one line shorter
+    // and wrong.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/gk0");
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 9);
+    CHECK(result.width == 32);
+    CHECK(result.height == 32);
+  }
+  SUBCASE("a negative count gets upstream's OWN reason, not the unported one") {
+    // `evenly_spaced_keyframe_positions` raises "num_keyframes must be
+    // non-negative" (utils/helpers.py:372-373) before anything looks at the
+    // checkpoint. A malformed request and an unported arm are different
+    // answers, and collapsing them would tell a caller who typed `-1` to go
+    // read about attention masks.
+    const std::string msg = refusal("-1", "gkneg");
+    INFO(msg);
+    CHECK(msg.find("non-negative") != std::string::npos);
+    CHECK(msg.find("update_attention_mask") == std::string::npos);
+  }
+}
+
 TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER weights are read") {
   // The arm row LTX25-IMAGE-COND (#644) opened. Two separate claims are made
   // here and they are NOT the same claim:
