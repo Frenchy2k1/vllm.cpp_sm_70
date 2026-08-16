@@ -11,7 +11,7 @@ the agent-facing parity inventory with upstream file references see
 **Legend.** ✅ supported and gated. ◐ partial, usable with named gaps. ☐ not yet.
 n/a means the feature does not apply to that engine's design.
 
-Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `237ad9b96`,
+Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `b10451`,
 MLX-LM as of 2026-07. Competitor columns describe what those projects ship, and
 are our reading of their documented behavior, not measurements.
 
@@ -66,7 +66,7 @@ are our reading of their documented behavior, not measurements.
 
 | Format | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
-| NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ✅ in GGUF, not safetensors (#979). Was wrongly ☐: `GGML_TYPE_NVFP4 = 40` (`ggml.h:430`), CUDA MMQ and the ModelOpt repacking converter are UPSTREAM at pin `237ad9b96`, the sm_121a GEMMs fork-local |
+| NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ✅ in GGUF, not safetensors (#979). Was wrongly ☐: `GGML_TYPE_NVFP4 = 40` (`ggml.h:430`), CUDA MMQ and the ModelOpt repacking converter are UPSTREAM at pin `b10451`, the sm_121a GEMMs fork-local |
 | NVFP4 dense sinks take vLLM's dense Marlin, not the single-expert MoE route | ✅ `VT_MARLIN_DENSE` (single projection, `efa6e40d`) + `VT_MARLIN_DENSE_PAIR` (fused shared-expert gate_up), both default-ON; the pair sink measured +1.31% at c8 / +1.38% at c4 on 35B-A3B, SACRED 315/315 + 235/235 | ☐ | ☐ | ☐ |
 | Dense W4A16 MLP runs ONE merged `gate_up` Marlin GEMM (vLLM's `MergedColumnParallelLinear` topology) | ✅ `VT_DENSE_MARLIN_GATEUP`, **default ON** (opt out `=0`): the A/B measured +2.12% c1 / +1.70% c8 on the 27B, arms separated, tokens identical (#365). Replaces the split pair's 193 Marlin calls/step vs the oracle's 129 | ✅ | ☐ | ☐ |
 | NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |
@@ -247,7 +247,7 @@ both refuse, naming what is missing.
 | Backend | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
-| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
+| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
@@ -263,14 +263,14 @@ Qwen3-1.7B-NVFP4A16). That is a kernel-level result, not a token-exact
 model-level gate.
 
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact,
-6/6 prompts vs the vLLM 0.25.0 oracle, every op of that model dispatched
-natively with **zero provider declines**. Qwen3.6-27B runs too, both GDN
-recurrences and the fused attention preamble native: **decode 4.36 tok/s vs
-llama.cpp's 4.35, parity met narrowly**, and **prefill 21.5x** (GB10). A load
-keeps **one** copy of the weights, not two, and is 1.54x faster warm: 27B peak
-RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 natively registered
-ops of 112 (8 are GDN), the rest on the portable CPU tier; quant/MoE/MLA have
-none at all.
+6/6 prompts vs the vLLM 0.25.0 oracle, every op dispatched natively with **zero
+provider declines**. Qwen3.6-27B runs too, both GDN recurrences and the fused
+attention preamble native: **decode 4.36 tok/s vs llama.cpp's 4.35, parity met
+narrowly**, denominator SUPERSEDED (#1003), and prefill **21.5x**, a SELF-ratio
+(GB10). A load keeps **one** copy of the weights, not two, and is 1.54x faster
+warm: 27B peak RSS 100.8 -> **53.4 GiB**. Still partial at 25 natively
+registered ops of 112 (8 GDN), the rest on the portable CPU tier; quant/MoE/MLA
+have none.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations
