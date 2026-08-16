@@ -175,6 +175,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | LTX-2.5 Conv VAE decode arithmetic width | LTX-2.5 video VAE | `test_ltx2_vae` "the decode's convolution accumulates in f32", entering through `Ltx2VideoDecodeStreaming`; widening the accumulator to `double`, or deleting the production call site, each turns it RED | **f32**, the width `F.conv3d` uses at f32 AND bf16 (MEASURED). Was f64 at 8 sites ([#1008](https://github.com/mudler/vllm.cpp/issues/1008)). Conv sums BLOCKED per input channel, as torch's. STORAGE stays f32; bf16 owed |
 | LTX-2.5 retake (`RetakePipeline`, regenerate a time window) | LTX-2.5 DiT + video VAE encoder | `test_ltx2_retake` 4/4 (69 assertions) and 4 `test_ltx2_video` cases entering through `Generate`; mask, conform and the four-way plan pinned to upstream `fd4ded7f` | `--pipeline-kind retake` on `ltx2-gen`. Source is a `frame_%06d.ppm` DIRECTORY; a container is REFUSED (no demuxer). Geometry comes from the clip. A folder has no audio, so the soundtrack is generated |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
+| MTP speculation DEPTH (`num_speculative_tokens` > 1) | Qwen3.5/3.6 `mtp.*` heads | k=1..4 through the loader, greedy tokens unmoved, two witnesses per arm: the draft decode forwards the propose RAN, and whether the DELIVERED draft row varied with depth. `test_mtp_depth` 5/5, 63 assertions | Default stays k=1. NO speed claim at k>1. Drafts are proposed and verified, never ACCEPTED, and neither witness proves per-column provenance. Both await the owed DGX gate (#81) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
 
@@ -223,7 +224,7 @@ both refuse, naming what is missing.
 
 | Speculator | vllm.cpp | vLLM | SGLang |
 |---|---|---|---|
-| MTP (multi-token prediction) | ✅ token-identical, ~4% faster at c1 | ✅ | ✅ |
+| MTP (multi-token prediction) | ✅ token-identical, ~4% faster at c1, depth `k` configurable with default 1 | ✅ | ✅ |
 | Draft model | ◐ CPU brick | ✅ | ✅ |
 | Medusa | ☐ spike only | ✅ | ✅ |
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |

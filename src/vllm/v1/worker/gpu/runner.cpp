@@ -1783,6 +1783,24 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
     if (kr > 0 && !chunked_prefilling[static_cast<size_t>(i)]) {
       spec_drafts_proposed_ += kr;
       spec_drafts_accepted_ += (ns > 1 ? ns - 1 : 0);
+      // SPEC-MTP-K-GT-1 (#81): the same accounting split by DEPTH. The rejection
+      // sampler accepts a PREFIX of the draft, so with `ns - 1` drafts accepted
+      // the draft at 0-based depth d was accepted exactly when `d < ns - 1`.
+      // #81's M1 asks for per-depth acceptance, and it is the only signal an
+      // acceptance-driven depth policy could read: the aggregate ratio cannot
+      // tell "every request accepted its first draft" from "one request accepted
+      // three". The vectors stay EMPTY when nothing speculates.
+      if (static_cast<int32_t>(spec_drafts_proposed_by_depth_.size()) < kr) {
+        spec_drafts_proposed_by_depth_.resize(static_cast<size_t>(kr), 0);
+        spec_drafts_accepted_by_depth_.resize(static_cast<size_t>(kr), 0);
+      }
+      const int32_t accepted_drafts = ns > 1 ? ns - 1 : 0;
+      for (int32_t d = 0; d < kr; ++d) {
+        spec_drafts_proposed_by_depth_[static_cast<size_t>(d)] += 1;
+        if (d < accepted_drafts) {
+          spec_drafts_accepted_by_depth_[static_cast<size_t>(d)] += 1;
+        }
+      }
       // PER-BLOCK acceptance trace (VT_SPEC_TRACE=1), off by default. The
       // aggregate proposed/accepted totals cannot distinguish a diffuse
       // per-block difference from one displaced block, which is exactly the
@@ -2152,14 +2170,68 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
         input_batch_.token_id(i, seq_len);
   }
 
-  const std::vector<int32_t> drafts = MtpProposePrefill(
+  // SPEC-MTP-K-GT-1 (#81): the depth THIS step drafts at. Resolved here, once,
+  // and passed down as a value rather than read from spec_config_ inside the
+  // propose loop, so a scheduler-supplied depth (upstream decides it at
+  // scheduler.py:1122-1126) has one place to come from. Today it is the
+  // configured k, and no depth policy exists.
+  const int k = num_spec();
+  VT_CHECK(k >= 1, "propose_drafts: a configured speculator must draft >= 1");
+  VT_CHECK(!draft_attn_kv_.empty() && draft_attn_kv_[0].block_size > 0,
+           "propose_drafts: the draft KV group has no block geometry");
+
+  const MtpDraftProposal proposal = MtpProposeDrafts(
       *draft_model_, exec_state_.attn_meta, draft_attn_kv_[0],
       exec_state_.spec_hidden.tensor, exec_state_.step.input_token_ids,
       exec_state_.step.positions, idx_mapping,
       input_batch_.last_sampled_tokens, next_prefill, num_sampled, num_rejected,
-      /*max_num_reqs=*/num_reqs, queue_);
+      /*max_num_reqs=*/num_reqs, /*num_speculative_tokens=*/k,
+      /*max_model_len=*/input_batch_.max_model_len,
+      /*block_size=*/static_cast<int>(draft_attn_kv_[0].block_size), queue_);
+  const std::vector<int32_t>& drafts = proposal.draft_tokens;
+  VT_CHECK(drafts.size() ==
+               static_cast<size_t>(num_reqs) * static_cast<size_t>(k),
+           "propose_drafts: the MTP propose must return k drafts per request");
+  // SPEC-MTP-K-GT-1 (#81): the WORK witness, recorded here because this is the
+  // only place that knows both the configured k and the forwards the propose
+  // actually ran. The check above is a SHAPE check and cannot stand in for it:
+  // a propose that ran one forward and padded all k columns passes it, emits the
+  // same greedy tokens, and grows the per-depth counters to size k. The exact
+  // relation these two counters carry is
+  // `spec_mtp_draft_decode_forwards_ == spec_mtp_propose_calls_ * (k - 1)`,
+  // which no draft-list shape can produce. Counted on every reaching call,
+  // including the discarded-row case below, because the forwards ran either way.
+  ++spec_mtp_propose_calls_;
+  spec_mtp_draft_decode_forwards_ += proposal.num_draft_decode_forwards;
 
-  // Stash the per-request draft (k=1: one token/request) for the out-of-band pull.
+  // SPEC-MTP-K-GT-1 (#81): the RESULT witness, and the reason it is computed
+  // HERE rather than inside the propose. The equality above counts the forwards
+  // a propose RAN, and says nothing about whether their results reached this
+  // array. A propose that runs all k-1 forwards, throws the sampled tokens away
+  // and writes its step-0 draft into every column satisfies that equality
+  // exactly, and was measured green on the whole depth suite. Read at the
+  // CONSUMER, on the bytes the proposer handed over, such a row is a pure
+  // function of its own first column and this counter stays 0 at every k. The
+  // accessor in runner.h states what it does NOT prove: per-column provenance,
+  // which the DGX gate owes. A non-zero acceptance count at depth does not show
+  // it either, because a padded row is accepted at column 1 whenever the
+  // target's greedy continuation repeats its own token. Only an acceptance-RATE
+  // comparison against a padded control separates the two.
+  for (int i = 0; i < num_reqs; ++i) {
+    const size_t base = static_cast<size_t>(i) * static_cast<size_t>(k);
+    bool varied = false;
+    for (int j = 1; j < k && !varied; ++j) {
+      varied = drafts[base + static_cast<size_t>(j)] != drafts[base];
+    }
+    if (varied) {
+      ++spec_mtp_proposals_with_varied_drafts_;
+      break;
+    }
+  }
+
+  // Stash each request's k drafts, in draft order, for the out-of-band pull. The
+  // DraftTokenIds seam already carries variable-length drafts (the n-gram
+  // proposer returns 0..k), so nothing downstream changes shape with depth.
   // A discarded (still-prefilling) row gets no draft — an empty list clears its
   // spec tokens (scheduler.update_draft_token_ids skips prefill-chunk requests).
   DraftTokenIds out;
@@ -2171,7 +2243,10 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
         exec_state_.discard[static_cast<size_t>(i)]) {
       out.draft_token_ids.push_back({});
     } else {
-      out.draft_token_ids.push_back({drafts[static_cast<size_t>(i)]});
+      const size_t base = static_cast<size_t>(i) * static_cast<size_t>(k);
+      out.draft_token_ids.emplace_back(
+          drafts.begin() + static_cast<std::ptrdiff_t>(base),
+          drafts.begin() + static_cast<std::ptrdiff_t>(base) + k);
     }
   }
   pending_drafts_ = std::move(out);

@@ -828,6 +828,12 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
       mtp_layers = text->value("mtp_num_hidden_layers", int64_t{1});
     }
   }
+  // SPEC-MTP-K-GT-1 (#81): the resolved k is SERVED, at any depth. Depth above 1
+  // was refused on this line between commits, because the propose path carried
+  // only upstream's k=1 early exit (autoregressive/speculator.py:236-238) and
+  // would have billed the user for a depth it drafted one token for. The
+  // multi-step propose (MtpProposeDrafts) landed the loop behind that early
+  // exit, so the refusal is GONE rather than widened.
   return vllm::SpeculativeConfig::ResolveMtp(static_cast<int>(mtp_layers),
                                              cli.num_speculative_tokens);
 }
@@ -946,16 +952,33 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
   return static_cast<int>(fitted);
 }
 
+// SPEC-MTP-K-GT-1 (#81): the in-memory mirror of FromModelDir's
+// `maybe_attach_mtp`. A caller holding weights in memory had no way to supply
+// the `mtp.*` draft head, so an in-memory speculative engine could only run with
+// a NULL drafter -- which a depth gate must never mistake for working
+// speculation. Attaching before the LoadedEngine body runs is what matters: the
+// constructor asks `model_->supports_mtp_draft()` and calls BuildMtpDraft in its
+// member-initialiser list, so a later attach would be too late.
+std::unique_ptr<LoadedModel> AttachMtp(std::unique_ptr<LoadedModel> model,
+                                       std::optional<Qwen3_5MTPWeights> mtp) {
+  if (mtp.has_value()) model->AttachMtpDraftWeights(std::move(*mtp));
+  return model;
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
-                           tok::Tokenizer tokenizer, const EngineParams& params)
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::optional<Qwen3_5MTPWeights> mtp_weights)
     : LoadedEngine(std::move(config),
-                   MakeQwen3_5MoeLoadedModel(std::move(weights)),
+                   AttachMtp(MakeQwen3_5MoeLoadedModel(std::move(weights)),
+                             std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
 
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
-                           tok::Tokenizer tokenizer, const EngineParams& params)
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::optional<Qwen3_5MTPWeights> mtp_weights)
     : LoadedEngine(std::move(config),
-                   MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                   AttachMtp(MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                             std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
 
 LoadedEngine::LoadedEngine(HfConfig config,

@@ -1042,6 +1042,10 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# SPEC-MTP-K-GT-1 (#81): the MTP speculation-DEPTH config contract — the k=1
+# default, the upstream divisibility rule, and that a configured k above 1 is
+# carried rather than silently degraded.
+vllm_cpp_add_test(test_speculative_mtp_depth vllm/config/test_speculative_mtp_depth.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): get_limit_per_prompt precedence —
 # language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
@@ -1089,8 +1093,14 @@ vllm_cpp_add_test(test_pooling_runner
   vllm/v1/worker/gpu/pool/test_pooling_runner.cpp)
 vllm_cpp_add_test(test_gdn_metadata_builder vllm/v1/attention/test_gdn_metadata_builder.cpp)
 vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cpp)
+# SPEC-MTP-K-GT-1 (#81): MTP speculation DEPTH through the production loader —
+# the configured k reaches the propose path, or is refused by name.
+vllm_cpp_add_test(test_mtp_depth vllm/v1/spec_decode/test_mtp_depth.cpp)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
 vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp)
+# SPEC-MTP-K-GT-1 (#81): the draft-DECODE half of the autoregressive propose —
+# the step-1 entry state, the between-step advance, and both max_model_len clamps.
+vllm_cpp_add_test(test_prepare_decode_inputs vllm/v1/spec_decode/test_prepare_decode_inputs.cpp)
 vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
