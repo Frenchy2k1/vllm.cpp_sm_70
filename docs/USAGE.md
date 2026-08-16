@@ -3070,6 +3070,49 @@ python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2
 cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
 ```
 
+## Streaming routed experts from disk (capacity mode)
+
+A mixture-of-experts checkpoint larger than the box can hold can be run by
+keeping the routed-expert weights on disk and paging slices into a bounded
+resident cache. It is **off by default** and it is a **capacity** feature, not a
+throughput one: it targets single-user and low-concurrency use, and at high
+concurrency every step touches most of the experts, so there is nothing left to
+save.
+
+```sh
+VT_MOE_EXPERT_STREAM=1 \
+VT_MOE_EXPERT_STREAM_SLOTS=8000 \
+  ./build/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+                   --prompt "The capital of France is" --max-tokens 16
+```
+
+It applies to CPU keep-quant expert towers. On a device platform the expert
+slice is already device-resident and is served unchanged, and turning streaming
+on also disables the default-on grouped-MoE path, which stages the whole tower
+and therefore cannot stream. The engine says that once on stderr rather than
+silently doing no streaming.
+
+**Read the statistics line before you believe any number you measure with it.**
+Every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default 16, `0` silences it) the
+engine prints:
+
+```text
+[expert-stream] steps=64 hits=141230 misses=37312 evictions=29312 fills=37312 bytes=92876505088 exhausted=0 advised=37312
+```
+
+Two of those fields decide whether the run is measuring anything at all:
+
+- `steps` must advance. If it stays at 0 the decode step boundary is not being
+  reached and the cache will stop serving as soon as it fills.
+- `exhausted` must stay 0. Anything above 0 means slices were refused and read
+  from the memory mapping instead, which is the slow path streaming exists to
+  replace. The usual cause is a budget smaller than one step's working set:
+  raise `VT_MOE_EXPERT_STREAM_SLOTS`.
+
+A run whose `steps` is 0 or whose `exhausted` is large is not a measurement of
+streaming, whatever the startup line said. See
+[`docs/ENVIRONMENT.md`](ENVIRONMENT.md) for every knob and its parsing rules.
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams can emit SSE **comment** frames (`:\n\n`) while
