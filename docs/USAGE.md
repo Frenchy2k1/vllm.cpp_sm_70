@@ -656,10 +656,56 @@ both numbers in the message — a resampled-wrong, upmixed or silence-padded tak
 renders a finished clip conditioned on audio nobody supplied. This needs an
 audio VAE that carries encoder weights; a decoder-only one refuses by name.
 
-`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
-64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
-half resolution). Omitting all three renders the recipe default, which is
-1024x1536 at 121 frames and is a much larger request than it looks.
+#### The supported resolution envelope
+
+**`--width` and `--height` are enforced, and an unsupported value is refused by
+name.** Both must be multiples of the VAE's spatial factor (32) times the worst
+downscale the recipe's phases apply — so **64 on the distilled two-stage recipe**,
+whose first phase runs at half resolution, and **32 on a one-stage recipe**. Those
+are upstream's own two numbers (`assert_resolution`,
+`ltx-pipelines utils/helpers.py:540-551`), reached by upstream's derivation rather
+than hardcoded, so a recipe that downscaled further would tighten the divisor with
+it. The refusal names the offending axis — width, height, or both — the divisor,
+and a size you can actually pass: the nearest legal one at or below the request,
+or, when an axis is smaller than the divisor and no such size exists, the
+smallest legal size there is.
+
+Until 2026-08-15 nothing enforced this and the engine floored instead: a
+two-stage request of width 80 rendered 64 and returned success, and a one-stage
+request of width 100 rendered 96 ([#919](https://github.com/mudler/vllm.cpp/issues/919)).
+
+**`--frames` is NOT enforced, and it rounds.** A frame count is floored onto the
+VAE's temporal grid, `(frames - 1) / 8 * 8 + 1`, so 100 frames renders 97. This
+mirrors upstream, which floors an explicit `num_frames` identically
+(`ltx_core/types.py:113`) and validates it nowhere: its `snap_frames_to_grid`
+helper is called from the auto-duration path and from the dubbing pipeline, and
+that pipeline takes no frame count at all — it snaps one read from a reference
+video's container. No frame count a caller supplies is snapped or checked, in
+either project. Pass a value of the form `8k + 1` to get exactly what you asked
+for. The rounding is observable either way: `result.frame_count`, `result.width`
+and `result.height` report what was actually rendered, not what was requested.
+
+Omitting all three renders the recipe default, which is 1024x1536 at 121 frames
+and is a much larger request than it looks.
+
+**What is legal is not what fits.** The first two rows below are a property of
+this port and are enforced. The rest are scale markers, and the last two are
+measurements of one box rather than limits of the code:
+
+| | Value |
+|---|---|
+| Legal sizes | any multiple of 64 (two-stage) or 32 (one-stage), on both axes |
+| Legal frame counts | any; non-`8k + 1` values floor onto the temporal grid |
+| Upstream's default output | 1024x1536 at 121 frames (`utils/constants.py:42-76`) |
+| Upstream's HQ preset output | 1088x1920 at 121 frames (`utils/constants.py:95-98`) |
+| **Measured to complete on one GB10** | **320x192 at 25 frames** |
+| Measured NOT to complete | 448x256 at 25 frames — the denoise finishes, then the decode loses about 59 GB in 24 s |
+
+That gap between the legal envelope and the measured one is a decode problem, not
+a resolution cap: there is no maximum-size check anywhere in this path, and the
+60 GB is **not attributed** — the decode's own heap peak at that size is 361.72
+MiB, some 170x too small to account for it. See the note below on what bounds a
+render, and `.agents/specs/ltx25-tiled-decode.md`.
 
 `--upsampler` is what the distilled recipe's second phase needs. Without it that
 phase refuses rather than skipping: its three-step refinement is what makes the
