@@ -311,6 +311,10 @@ vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
 target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX25-DECODE-THREADS (issue #1009): the two threading cases reach
+# vt::cpu::Threadpool::SwapForTesting and the pool's work-stealing cursor, which
+# live under src/ like every other CPU-threading A/B in tests/vt/.
+target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # LTX25-TILED-DECODE (issue #644): the tiling algebra, the AUTO layout and the
 # STREAMING tiled decode, gated against upstream ltx_core executed at reduced
 # dimensions. Its own target so the decode arms — which run the reduced decoder 18
