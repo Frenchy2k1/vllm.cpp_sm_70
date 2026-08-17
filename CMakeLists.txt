@@ -1234,6 +1234,9 @@ add_library(vllm STATIC
   # translation units, reached through vllm's INTERFACE --whole-archive option.
   src/vt/cpu/cpu_conv2d.cpp
   src/vt/cpu/cpu_conv1d_depthwise.cpp
+  # BigVGAN / DAC vocoder 1-D convolutions (#672). Self-registering, reached the
+  # same --whole-archive way as the conformer kernels above.
+  src/vt/cpu/cpu_conv1d_general.cpp
   src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
@@ -1630,6 +1633,9 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu
+    # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
+    # convolution in the tree on any device.
+    src/vt/cuda/cuda_conv1d_general.cu
     src/vt/cuda/cuda_attention_cross.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.

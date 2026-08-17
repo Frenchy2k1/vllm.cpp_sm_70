@@ -298,6 +298,18 @@ add_executable(ltx2-gen ltx2_gen/main.cpp)
 target_link_libraries(ltx2-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(ltx2-gen)
 
+# vocoder-conv-ab: the CPU-vs-device A/B for the BigVGAN / DAC vocoder
+# convolution chain (#672), SAME BINARY with `VLLM_CPP_VOCODER_DEVICE` as the
+# only variable. A benchmarks/ source rather than an examples/ one, and so out of
+# the ABI-client rule's scope by the same reading `vulkan_gemm_ab.cpp` lands on
+# (surface-coverage-2026-08-07.md, "Out of the gated examples/ tree"): it links
+# `vllm::vllm` and calls the vocoder core directly, because the thing being timed
+# is the seam and not a model. NOT gated on CUDA — the CPU arm is half the A/B.
+add_executable(vocoder-conv-ab ${CMAKE_SOURCE_DIR}/benchmarks/vocoder_conv_ab.cpp)
+target_link_libraries(vocoder-conv-ab PRIVATE vllm::vllm)
+target_include_directories(vocoder-conv-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_set_warnings(vocoder-conv-ab)
+
 # vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar
 # GEMM, SAME BINARY with VT_VULKAN_COOPMAT as the only variable. Built only in a
 # Vulkan build, because it links the Vulkan context directly to report which

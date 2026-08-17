@@ -416,6 +416,48 @@ a silent fallback cannot post a plausible number:
   on the gate clip, so turn it on only where encoder latency matters more than exact
   reproduction of the default output.
 
+Every build — not only a Vulkan one — additionally gets `vocoder-conv-ab`, the
+same-binary A/B for the shared 1-D BigVGAN vocoder convolution chain that
+MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and IndexTTS-2.5 all
+decode through. `VLLM_CPP_VOCODER_DEVICE` is the only variable, and the binary
+prints the arm it RESOLVED rather than the one that was asked for, so a silent
+fallback to the host cannot post a plausible pair of timings:
+
+```sh
+VLLM_CPP_VOCODER_DEVICE=cpu  ./build/vocoder-conv-ab --frames 96 --reps 3
+VLLM_CPP_VOCODER_DEVICE=cuda ./build/vocoder-conv-ab --frames 96 --reps 3
+```
+
+It runs the four upsample stages at the shipped decoder's real channel counts and
+strides, and prints a per-stage checksum so two arms that report the same time can
+still be told apart if one of them computed something else. The transposed
+convolution it times is 88.5 % of MiniMax-Music3's acoustic-half profile.
+
+### Running the vocoder convolutions on the GPU
+
+`VLLM_CPP_VOCODER_DEVICE=cuda` routes `vt::Conv1d` and `vt::ConvTranspose1d` to
+their CUDA providers for every model that decodes through the shared vocoder
+core. It needs a CUDA build; asking for it without one throws by name rather than
+falling back silently, because a silent fallback means an operator who asked for
+a device never learns they did not get one.
+
+The knob is not CUDA-specific. It accepts any device name `vt` knows (`cpu`,
+`cuda`, `metal`, `vulkan`, `xpu`, `rocm`, `tenstorrent`) and refuses one whose
+device carries no registered provider in the build in front of it, so a Metal or
+Vulkan provider becomes reachable here by being registered and nothing else.
+
+The default is `cpu`, and deliberately so — not because the device arm is
+approximate. The two providers are **byte-identical**: one f64 accumulator per
+output element walked in the same order on both, with the host pinned
+`-ffp-contract=off` and the device kernel pinned with `__dmul_rn`/`__dadd_rn`, so
+`tests/vt/test_ops_conv1d_general.cpp` gates them with `memcmp` rather than a
+tolerance (8 cases / 385 assertions on Jetson Thor sm_110, against 8 / 347 on a
+CPU-only box — the 38-assertion difference IS the device arm). It stays opt-in
+because flipping four shipped audio models onto a device arm needs its own
+re-gate against each one's committed goldens, which is owed to the row that
+wires it ([#672](https://github.com/mudler/vllm.cpp/issues/672),
+[.agents/specs/minimax-music3.md](../.agents/specs/minimax-music3.md) §13).
+
 ### Quantized checkpoints: which weight forms load
 ### How long a load takes, and how to see where it goes
 

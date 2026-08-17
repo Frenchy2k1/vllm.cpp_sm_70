@@ -422,6 +422,60 @@ TEST_CASE("vocoder1d Conv1d is bit-identical under CATASTROPHIC CANCELLATION") {
   }
 }
 
+TEST_CASE("vocoder1d ConvTranspose1d is bit-identical under CATASTROPHIC CANCELLATION") {
+  // The transposed op had no cancellation case until #672 moved its body behind
+  // `vt::ConvTranspose1d`, and it needs one for the same measured reason the
+  // other two do: with well-scaled taps a double accumulator stored through a
+  // float cannot show a reduction-order change at all, so the five ordinary
+  // shapes above stay green under a reassociated sweep.
+  //
+  // The engineered cancellation is on the INPUT-CHANNEL axis, because that is
+  // the axis a GATHER transcription of the scatter has to get right — and the
+  // CUDA provider this row adds is exactly such a transcription. Input channels
+  // 0 and 1 carry +2^40 and -2^40 at every position and share a weight row, so
+  // the serial `ic` walk cancels them on its first two visits and accumulates
+  // the remaining 30 channels exactly; any order that separates them carries
+  // 2^40 through the small terms and quantises them at ~1.2e-4, far above the
+  // float store's ULP at that magnitude.
+  const int64_t in_channels = 32, in_len = 96, out_channels = 32;
+  const int64_t kernel = 8, stride = 4, padding = 2, groups = 1;
+  const float kBig = 1099511627776.0F;  // 2^40, exactly representable
+  std::vector<float> in = Spread(static_cast<size_t>(in_channels * in_len), 0x5A5Au);
+  std::vector<float> w =
+      Spread(static_cast<size_t>(in_channels * out_channels * kernel), 0xA5A5u);
+  for (int64_t t = 0; t < in_len; ++t) {
+    in[static_cast<size_t>(0 * in_len + t)] = kBig;
+    in[static_cast<size_t>(1 * in_len + t)] = -kBig;
+  }
+  for (int64_t oc = 0; oc < out_channels; ++oc) {
+    for (int64_t k = 0; k < kernel; ++k) {
+      w[static_cast<size_t>((1 * out_channels + oc) * kernel + k)] =
+          w[static_cast<size_t>((0 * out_channels + oc) * kernel + k)];
+    }
+  }
+
+  const int64_t work = out_channels * in_channels * in_len * kernel;
+  REQUIRE_MESSAGE(work >= vllm::host_parallel::kMinParallelWork,
+                  "case is under the size guard; work=" << work);
+
+  int64_t want_len = 0;
+  const std::vector<float> want =
+      SerialConvTranspose1d(in, in_channels, in_len, w, /*bias=*/nullptr, out_channels, kernel,
+                            stride, padding, groups, &want_len);
+  for (const int threads : kThreadCounts) {
+    vt::cpu::Threadpool pool(threads);
+    vt::cpu::Threadpool* previous = vt::cpu::Threadpool::SwapForTesting(&pool);
+    int64_t got_len = 0;
+    const std::vector<float> got =
+        vllm::vocoder1d::ConvTranspose1d(in, in_channels, in_len, w, /*bias=*/nullptr,
+                                         out_channels, kernel, stride, padding, groups, &got_len);
+    vt::cpu::Threadpool::SwapForTesting(previous);
+    CHECK(got_len == want_len);
+    RequireBitIdentical(got, want, std::string("ConvTranspose1d cancellation threads=") +
+                                       std::to_string(threads));
+  }
+}
+
 TEST_CASE("host_parallel size guard runs the body inline below the threshold") {
   // The guard is a scheduling decision, so what is gated is that it partitions
   // the SAME rows exactly once each either side of it — not which side it
