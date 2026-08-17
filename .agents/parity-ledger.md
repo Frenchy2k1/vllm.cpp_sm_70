@@ -37,6 +37,12 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | scope | audit + regression gate: the runner replays steady-state decode inside a captured CUDA graph; any host-sync/malloc the decode emits on the capture stream trips `cudaErrorStreamCaptureImplicit` and dies. Audit: all existing host syncs are warmup-only. Gate: `vt_sm70_fa2_graph_replay_parity()` runs Begin->EndCapture->instantiate->launch and REQUIRES replay==eager |
 | acceptance | V100: graph-replay max relative dev **0.000e+00** (bit-identical); `test_sm70_fa2_decode` 5/5 SUCCESS |
 
+## Multi-device phase 2 — per-device CUDA backend affinity · GREEN
+
+| commit | `e14374dc` |
+| change | `CudaDeviceScope` (RAII; no-op when device==current → single-GPU byte-identical) applied to every device-touching CudaBackend method; a `Device{kCUDA,i}` backend now allocates/creates streams/launches on GPU i |
+| acceptance | `test_cuda_backend`: GPU {0,1,2,3} → alloc device {0,1,2,3} (cudaPointerGetAttributes), Memset/Copy on each queue round-trips; 7/7 cases, 58 assertions, SUCCESS (4×V100 sm_70) |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
