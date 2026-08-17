@@ -49,6 +49,12 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | change | real `ncclCommInitAll` over all local GPUs (single process, 4×V100) → one NcclCommunicator per device; the transport (providers) is now actually rnew durable. Per-rank collectives driven from a host thread each (NCCL ours blocking) + per-device affinity |
 | acceptance | `test_nccl_group` (VLLM_CPP_NCCL-gated): AllReduce(kSum)→10 on every rank, AllGather→ordered [1000..1003]; 1/1 SUCCESS on the 4×V100 |
 
+## Multi-device phase 4 — TP loader slice · GREEN
+
+| commit | `fc58ae0b` |
+| change | `vt_cuda_loader_slice_selfcheck`: dense [K,N] weight sliced by `vllm::TpShard` per rank, each shard memcpied onto ITS device (per-op affinity), the W slices reconstructing the full weight — the placement side a tp>1 weight loader uses |
+| acceptance | 4×V100: group selfcheck + TP seam + loader slice all pass (3/3) |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
