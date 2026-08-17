@@ -2183,7 +2183,7 @@ bool Sm70FaEligible(const PagedAttentionArgs& a, int64_t d, int64_t nkv) {
   if constexpr (!(std::is_same_v<TQ, __half> && std::is_same_v<TKV, __half> &&
                   std::is_same_v<Tout, float>)) return false;
   if (!std::is_arithmetic_v<decltype(d)>) return false;
-  if ((d != 64 && d != 128) || nkv <= 0) return false;  // real head widths
+  if ((d != 64 && d != 128 && d != 192 && d != 256) || nkv <= 0) return false;  // head widths
   if (a.logits_soft_cap != 0.f || !a.causal) return false;
   if (a.window_size.has_value()) return false;
   const DeviceCaps& caps = GetDeviceCaps();
@@ -2275,7 +2275,7 @@ bool Sm70PrefillTakeover(cudaStream_t c, Tensor& out, const Tensor& query,
   const char* e = std::getenv("VT_SM70_FA2_PREFILL");
   if (e && e[0] == '0') return false;
   if constexpr (!(std::is_same_v<TQ, __half> && std::is_same_v<TKV, __half>)) return false;
-  if ((d != 64 && d != 128) || nkv <= 0 || block_size <= 0) return false;
+  if ((d != 64 && d != 128 && d != 192 && d != 256) || nkv <= 0 || block_size <= 0) return false;
   if (args.logits_soft_cap != 0.f || !args.causal) return false;
   if (args.window_size.has_value()) return false;
   // The kernel reads q_start[r+1] (the final cumulative element); if the
