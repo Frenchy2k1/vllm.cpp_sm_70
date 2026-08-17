@@ -39,6 +39,13 @@ Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
    = 8 exact / 0 diverged).
 4. **Decoder binaries** built+verified on the box: `test_qwen36_paged_engine`
    (57 MB), `test_qwen2_paged_engine` (57 MB), `test_op_parity`.
+5. **sm70 expert GEMM (brick H) — GREEN.** The A3B-35B expert decode now
+   runs a Volta **fp16-WMMA** grouped kernel (`MoeGroupedGemmNvfp4WmmaF16`,
+   fp32 acc, bf16→fp16 saturation-clamped) instead of the CUDA-core naive fill.
+   The 35B engine gate with this path default stays **token-exact 315/315**
+   (real 35B activations, incl. 6-concurrent × 16-token greedy). Marlin was
+   sm_75+ and bf16-WMMA sm_80+ (Volta has no bf16 MMA), so Volta tensor cores
+   are now engaged on the expert path too.
 
 ## Known near-tie / caveats
 

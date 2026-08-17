@@ -18,6 +18,13 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | analysis | tok6 near-tie: golden native `198`, emulation `271`. Emulation side is produced because the sm_70 build lacks `VT_CUTLASS_NVFP4` (sm_90+) — that guard is intentional (engine gate throws without it). sm_70 hand W4A4 kernel output is the legitimate answer on this silicon. |
 | verdict | acceptable at semantic/near-tie; native side obtain 1 only on an sm_90+ production build. NOT to be closed by a special-case. |
 
+## sm70 fp16-WMMA expert GEMM (brick H) · GREEN
+
+| impl | `MoeGroupedGemmNvfp4WmmaF16` (fp16 mma.sync m16n16k16, fp32 acc) + decode launcher, `VT_SM70_MOE_WMMA` (default ON) |
+| route | A3B-35B expert decode previously ran the CUDA-core naive fill (Marlin sm_75+, bf16-WMMA sm_80+; Volta has no bf16 MMA). Brick makes experts ride Volta fp16 tensor cores; bf16->fp16 saturates at ±65504 (fp16 5-bit exponent, prevents inf near-tie poison) |
+| acceptance | `test_qwen36_paged_engine` (35B-A3B-NVFP4, real activations, incl 6 concurrent x 16 tokens) with brick default ON: **315/315 token-exact, Status SUCCESS** (2026-08-12, V100) |
+| A/B | `VT_SM70_MOE_WMMA=0` returns the naive fill (the pre-brick baseline) |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
