@@ -183,7 +183,19 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "--audio-skip-step and --audio-stg-blocks are upstream\'s own flags; absent, each\n"
       "takes the checkpoint generation\'s own value. --audio-stg-blocks is comma\n"
       "separated and a block index outside the DiT\'s layer count is refused rather\n"
-      "than clamped. The accelerator is REFUSED by name on this pipeline.\n");
+      "than clamped. The accelerator is REFUSED by name on this pipeline.\n\n"
+      "GUIDANCE ON A VIDEO RENDER. --pipeline-kind one_stage runs upstream's guided\n"
+      "denoiser: FOUR DiT forwards per step (conditional, unconditional, perturbed,\n"
+      "and one with the audio<->video cross attention off), combined per modality in\n"
+      "x0 space. --video-cfg-guidance-scale, --video-stg-guidance-scale,\n"
+      "--video-rescale-scale, --video-skip-step, --video-stg-blocks,\n"
+      "--a2v-guidance-scale and --v2a-guidance-scale are upstream's own flags and\n"
+      "take the checkpoint generation's value when absent. The unconditional forward\n"
+      "needs a NEGATIVE conditioning: either a text tower plus --negative-prompt, or\n"
+      "--negative-prompt-embeds with --negative-audio-prompt-embeds. Absent both, a\n"
+      "cfg scale other than 1.0 is refused by name. --pipeline-kind\n"
+      "distilled_two_stage and retake distil their guidance INTO the weights and\n"
+      "refuse every one of these flags rather than applying it.\n");
   std::exit(code);
 }
 
@@ -204,6 +216,13 @@ int main(int argc, char** argv) {
   // upstream's `default_1_stage_t2a_arg_parser` (utils/args.py:1070-1120).
   std::string negative_prompt, audio_cfg_scale, audio_stg_scale, audio_rescale;
   std::string audio_skip_step, audio_stg_blocks;
+
+  // THE VIDEO GUIDER (row LTX25-GUIDED-VIDEO, #1092): the other half of the same
+  // parser, `default_1_stage_arg_parser` (utils/args.py:947-1066). `--negative-
+  // prompt` above is shared by both, which is why it is not repeated here.
+  std::string video_cfg_scale, video_stg_scale, video_rescale, video_skip_step;
+  std::string video_stg_blocks, a2v_scale, v2a_scale;
+  std::string negative_embeds, negative_audio_embeds;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -238,6 +257,13 @@ int main(int argc, char** argv) {
     else if (f == "--model-version") SetExtra("model_version", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--pipeline-kind") SetExtra("pipeline_kind", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--upsampler") SetExtra("upsampler_path", Need(argc, argv, ++i, f.c_str()));
+    else if (f == "--negative-prompt-embeds") {
+      negative_embeds = Need(argc, argv, ++i, f.c_str());
+      SetExtra("negative_prompt_embeds_path", negative_embeds);
+    } else if (f == "--negative-audio-prompt-embeds") {
+      negative_audio_embeds = Need(argc, argv, ++i, f.c_str());
+      SetExtra("negative_audio_prompt_embeds_path", negative_audio_embeds);
+    }
     // Kept although the library REFUSES this extra by name (#611): the duration
     // head is unported, and forwarding the flag gets the caller that named
     // refusal instead of "unknown option", which says nothing about why.
@@ -295,6 +321,20 @@ int main(int argc, char** argv) {
       audio_skip_step = Need(argc, argv, ++i, "--audio-skip-step");
     else if (f == "--audio-stg-blocks")
       audio_stg_blocks = Need(argc, argv, ++i, "--audio-stg-blocks");
+    else if (f == "--video-cfg-guidance-scale")
+      video_cfg_scale = Need(argc, argv, ++i, "--video-cfg-guidance-scale");
+    else if (f == "--video-stg-guidance-scale")
+      video_stg_scale = Need(argc, argv, ++i, "--video-stg-guidance-scale");
+    else if (f == "--video-rescale-scale")
+      video_rescale = Need(argc, argv, ++i, "--video-rescale-scale");
+    else if (f == "--video-skip-step")
+      video_skip_step = Need(argc, argv, ++i, "--video-skip-step");
+    else if (f == "--video-stg-blocks")
+      video_stg_blocks = Need(argc, argv, ++i, "--video-stg-blocks");
+    else if (f == "--a2v-guidance-scale")
+      a2v_scale = Need(argc, argv, ++i, "--a2v-guidance-scale");
+    else if (f == "--v2a-guidance-scale")
+      v2a_scale = Need(argc, argv, ++i, "--v2a-guidance-scale");
     else if (f == "--regenerate-video")
       regen_video = Need(argc, argv, ++i, "--regenerate-video");
     else if (f == "--regenerate-audio")
@@ -376,7 +416,17 @@ int main(int argc, char** argv) {
                          std::make_pair("audio_stg_guidance_scale", &audio_stg_scale),
                          std::make_pair("audio_rescale_scale", &audio_rescale),
                          std::make_pair("audio_skip_step", &audio_skip_step),
-                         std::make_pair("audio_stg_blocks", &audio_stg_blocks)}) {
+                         std::make_pair("audio_stg_blocks", &audio_stg_blocks),
+                         // THE VIDEO GUIDER (#1092). Per-generation for the same
+                         // reason the audio row is, and refused whole on a recipe
+                         // whose guidance is distilled into the weights.
+                         std::make_pair("video_cfg_guidance_scale", &video_cfg_scale),
+                         std::make_pair("video_stg_guidance_scale", &video_stg_scale),
+                         std::make_pair("video_rescale_scale", &video_rescale),
+                         std::make_pair("video_skip_step", &video_skip_step),
+                         std::make_pair("video_stg_blocks", &video_stg_blocks),
+                         std::make_pair("a2v_guidance_scale", &a2v_scale),
+                         std::make_pair("v2a_guidance_scale", &v2a_scale)}) {
     if (kv.second->empty()) continue;
     gen_keys.emplace_back(kv.first);
     gen_values.push_back(*kv.second);
