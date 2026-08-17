@@ -366,6 +366,88 @@ extern "C" int vt_cuda_tp_seam_selfcheck(void) {
   return bad.load();
 }
 
+// The LOADER slice (the last rrrollout brick minus the runner): a dense weight
+// [K,N] sliced by vllm::TpShard per rank and placed on that rank's device
+// exactly as a tp>1 weight loader would (per-shard memcpy onto device r). Each
+// rank's returned slice must equal the original's columns [begin,end), and the
+// W slices concatenated must reconstruct the full weight. No collective here —
+// this is the placement side of TP.
+extern "C" int vt_cuda_loader_slice_selfcheck(void) {
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  constexpr int64_t K = 8, N = 64;  // [K,N] row-major; N divisible by W
+  const int64_t per = N / W;
+
+  // Full weight: deterministic f32.
+  std::vector<float> full((size_t)(K * N));
+  for (int64_t i = 0; i < K; ++i)
+    for (int64_t j = 0; j < N; ++j)
+      full[(size_t)(i * N + j)] = 0.5f + (float)((i * 7 + j * 13) % 11);
+
+  std::atomic<int> bad{0};
+  std::vector<std::vector<float>> slices(static_cast<size_t>(W));
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r, g]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      vllm::TensorParallel tp{g->Rank(r)};
+      const vllm::ShardRange cs = vllm::TpShard(&tp, N);
+      if (tp.tp_size() != W || cs.begin != per * r || cs.size() != per) {
+        bad.store(1, std::memory_order_relaxed);
+        return;
+      }
+      NcclDevScope scope(r);
+      cudaStream_t st = nullptr;
+      float* d = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&d, (size_t)(K * per) * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        if (st) { cudaFree(d); cudaStreamDestroy(st); }
+        return;
+      }
+      // The rank's slice host view: full[…][begin..begin+per).
+      std::vector<float> hslice((size_t)(K * per));
+      for (int64_t i = 0; i < K; ++i)
+        for (int64_t c = 0; c < per; ++c)
+          hslice[(size_t)(i * per + c)] = full[(size_t)(i * N + (cs.begin + c))];
+      cudaMemcpyAsync(d, hslice.data(), (size_t)(K * per) * sizeof(float),
+                      cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      std::vector<float> back((size_t)(K * per), 0.f);
+      cudaMemcpyAsync(back.data(), d, (size_t)(K * per) * sizeof(float),
+                      cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      for (size_t i = 0; i < back.size(); ++i) {
+        if (std::fabs(back[i] - hslice[i]) > 1e-6f) {
+          fprintf(stderr, "vt loader-slice: rank %d elem %zu %.3f want %.3f\n",
+                  r, i, (double)back[i], (double)hslice[i]);
+          bad.store(1, std::memory_order_relaxed);
+        }
+      }
+      slices[(size_t)r] = std::move(back);
+      cudaFree(d); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  // Full reconstruction: cat slices_[r] per row.
+  std::vector<float> rebuilt((size_t)(K * N), 0.f);
+  for (int r = 0; r < W; ++r)
+    for (int64_t i = 0; i < K; ++i)
+      for (int64_t c = 0; c < per; ++c)
+        rebuilt[(size_t)(i * N + (r * per + c))] = slices[(size_t)r][(size_t)(i * per + c)];
+  for (size_t i = 0; i < full.size(); ++i) {
+    if (std::fabs(full[i] - rebuilt[i]) > 1e-6f) {
+      fprintf(stderr, "vt loader-slice: reconstruction %zu %.3f want %.3f\n",
+              i, (double)rebuilt[i], (double)full[i]);
+      bad.store(1, std::memory_order_relaxed);
+    }
+  }
+  delete g;
+  return bad.load();
+}
+
 }  // namespace
 }  // namespace vt
 #endif  // VT_NCCL

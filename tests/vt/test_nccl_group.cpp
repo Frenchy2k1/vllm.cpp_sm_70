@@ -13,6 +13,7 @@
 
 extern "C" int vt_cuda_nccl_group_selfcheck(void);
 extern "C" int vt_cuda_tp_seam_selfcheck(void);
+extern "C" int vt_cuda_loader_slice_selfcheck(void);
 
 TEST_CASE("in-process NCCL collectives across the discrete GPUs (multi-device)") {
   const int rc = vt_cuda_nccl_group_selfcheck();
@@ -23,10 +24,19 @@ TEST_CASE("in-process NCCL collectives across the discrete GPUs (multi-device)")
   CHECK(rc == 0);
 }
 
-TEST_CASE("W2 TP seam over NCCL (TpShard + row-parallel all-reduce per rank)") {
+TEST_CASE("W2 TP seam over the NCCL group (TpShard/TensorParallel row-reduce per rank)") {
   const int rc = vt_cuda_tp_seam_selfcheck();
   if (rc == 2) {
     MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); TP seam skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("TP loader slice: per-rank shard placed on the addressed GPU, reconstructs the full weight") {
+  const int rc = vt_cuda_loader_slice_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); loader slice skipped");
     return;
   }
   CHECK(rc == 0);
