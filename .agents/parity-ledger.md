@@ -25,6 +25,12 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | acceptance | `test_qwen36_paged_engine` (35B-A3B-NVFP4, real activations, incl 6 concurrent x 16 tokens) with brick default ON: **315/315 token-exact, Status SUCCESS** (2026-08-12, V100) |
 | A/B | `VT_SM70_MOE_WMMA=0` returns the naive fill (the pre-brick baseline) |
 
+## sm70 wider-head paged attention (superset) · GREEN
+
+| commit | `59c0d05a` |
+| change | decode/prefill 192|256 instantiations + dispatch; gate widened to {64,128,192,256} |
+| acceptance | `test_sm70_fa2_decode` on V100: decode vs reference reldev 2.00e-5 (D=192), 1.74e-5 (D=256); op-parity 7.99e-6; prefill parity OK; suite 4/4 (tol 3e-2) |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
