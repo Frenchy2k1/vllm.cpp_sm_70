@@ -3629,6 +3629,69 @@ A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See
 [`docs/ENVIRONMENT.md`](ENVIRONMENT.md) for every knob and its parsing rules.
 
+### `--device cuda` refuses a checkpoint it cannot hold
+
+Streaming is a **host** capability. The GGUF mapping is borrowed in place on the
+CPU path, so a routed-expert tower costs no resident bytes, which is the whole
+reason a 369.96 GiB checkpoint serves on a 119.631 GiB box. A weight-staging
+device has no such lane: it copies every tower into device memory, one
+`cudaMalloc` per stacked `[E*N,K]` tower.
+
+For `Qwen3.8-2.4T-A95B UD-Q1_0` that is 276 towers of 1,275,068,416 bytes plus
+three of 2,818,572,288, so 335.62 GiB in total, against a pool `cudaMemGetInfo`
+reports as
+128,452,956,160 bytes (119.631 GiB). Until that lane exists
+([#1124](https://github.com/mudler/vllm.cpp/issues/1124)), the engine **refuses
+at load** and names what is missing:
+
+```text
+device 'cuda' cannot serve this GGUF: staging its weights needs at least N bytes
+(X GiB) of device memory across T tensors, the largest single allocation being M
+bytes (Y GiB, '<tensor>'), and this device's memory pool is B bytes (Z GiB).
+THE MISSING PART: ... there is no device-side expert slot store and no device
+streaming lane ... Use device=cpu, which serves this checkpoint today, or a
+checkpoint that fits the pool.
+```
+
+It used to load for 26 minutes, report ready, and then die on the first request
+with `vt cuda: cudaMalloc: out of memory` from inside the engine's busy loop
+([#1123](https://github.com/mudler/vllm.cpp/issues/1123)).
+
+The refusal is keyed on the measured condition and not on the device or the file
+format, so **a GGUF that fits the pool still loads on `--device cuda`**. Three
+things it deliberately does not do:
+
+- it never fires on a platform that does not stage weights, so every
+  `--device cpu` load is unchanged;
+- it never fires when no budget is known. Today exactly one platform stages
+  weights (CUDA) and exactly one probes a budget (CUDA, with `cudaMemGetInfo`),
+  so **every NVIDIA GPU this build runs on — discrete or GB10 — gets both the
+  probe and the refusal**, while ROCm, Vulkan and Metal answer
+  `needs_weight_staging() == false`: they read the GGUF mapping where it already
+  lies, so there is no staging allocation to fail and nothing for this check to
+  decide. What is owed there is the `Backend::DeviceMemoryInfo` probe CUDA does
+  not implement ([#1126](https://github.com/mudler/vllm.cpp/issues/1126)), which
+  is a different capability;
+- it counts **weights only**. The KV cache, activations, scratch pools and the
+  driver context are not in the bound, so a checkpoint just under the pool
+  passes this check and can still fail later;
+- it can also count a little **too much**: a tensor present in the file that this
+  load will not stage — the MTP / `nextn` block on a load with no speculator, 8.33
+  GiB of the measured 369.96 GiB checkpoint — is still in the sum, so a budget in
+  that narrow window refuses a weight set that would have fitted. Raise
+  `VT_DEVICE_WEIGHT_BUDGET_BYTES` if you land in it
+  ([#1136](https://github.com/mudler/vllm.cpp/issues/1136)).
+
+`VT_DEVICE_WEIGHT_BUDGET_BYTES` moves the budget: lower it when something else
+lives in the pool, or raise it (or set `0`) to suppress the refusal and get the
+late failure back. It does not make the model fit.
+
+**The instrument matters here.** `nvidia-smi
+--query-gpu=memory.total,memory.free,memory.used` answers `[N/A], [N/A], [N/A]`
+on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
+honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
+(125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams can emit SSE **comment** frames (`:\n\n`) while
