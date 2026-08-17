@@ -19,7 +19,8 @@ extern "C" int vt_cuda_nccl_group_selfcheck(void);
 extern "C" int vt_cuda_tp_seam_selfcheck(void);
 extern "C" int vt_cuda_loader_slice_selfcheck(void);
 extern "C" int vt_cuda_sharded_forward_selfcheck(void);
-extern "C" int vt_cuda_tp_request_group(int tp_size);
+extern "C" void* vt_cuda_tp_acquire(int tp_size);
+extern "C" void vt_cuda_tp_release(void* handle);
 
 TEST_CASE("in-process NCCL collectives across the discrete GPUs (multi-device)") {
   const int rc = vt_cuda_nccl_group_selfcheck();
@@ -48,15 +49,16 @@ TEST_CASE("TP loader slice: per-rank shard placed on the addressed GPU, reconstr
   CHECK(rc == 0);
 }
 
-TEST_CASE("engine bridge: request a NCCL-backed TP group for tp>1 (world-validated)") {
+TEST_CASE("engine bridge: acquire a retained NCCL TP group for tp>1, null at tp1") {
   // tp1 must stay the null/no-op path.
-  CHECK(vt_cuda_tp_request_group(1) == 0);
+  CHECK(vt_cuda_tp_acquire(1) == nullptr);
 #ifdef VLLM_CPP_CUDA
   int devs = 0;
   REQUIRE(cudaGetDeviceCount(&devs) == cudaSuccess);
-  const int rc = vt_cuda_tp_request_group(devs);  // a real W=ngpu group must create
-  if (devs < 2) { MESSAGE("single-GPU; group probe skipped"); return; }
-  CHECK(rc > 0);
+  if (devs < 2) { MESSAGE("single-GPU; bridge skipped"); return; }
+  void* h = vt_cuda_tp_acquire(devs);   // a real W=ngpu retained group
+  REQUIRE(h != nullptr);
+  vt_cuda_tp_release(h);                // and the runner can release it
 #endif
 }
 

@@ -228,18 +228,20 @@ vt::CudaCommGroup::~CudaCommGroup() {
 }  // namespace vt
 
 // ---------------------------------------------------------------------------
-// Engine bridge: a real NCCL-backed TensorParallel for tp>1, else a null (tp1,
-// byte-identical) group. The runner calls this once at init so the model's
-// ForwardDense/loader see a non-null, REAL communicator when tensor-parallel is
-// requested — the missing link between "the seam works" and "tp>1 runs".
+// Engine bridge (retained): a real NCCL-backed group for tp>1, else null (tp1,
+// byte-identical path). The runner acquires once at init and holds the opaque
+// handle for the model's lifetime, then wraps a rank communicator into a
+// vllm::TensorParallel per layer. Release frees the group.
 // ---------------------------------------------------------------------------
-extern "C" int vt_cuda_tp_request_group(int tp_size) {
-  if (tp_size <= 1) return 0;  // tp1: leave the model on the null path
-  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();  // real process-local group
-  if (!g) return -1;
-  if (g->world_size() != tp_size) { delete g; return -3; }
-  delete g;  // the runner would retain this (here: only validate creation)
-  return 1;
+extern "C" void* vt_cuda_tp_acquire(int tp_size) {
+  if (tp_size <= 1) return nullptr;  // tp1: keep the null/tp1 byte-identical path
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return nullptr;
+  if (g->world_size() != tp_size) { delete g; return nullptr; }
+  return reinterpret_cast<void*>(g);  // retained; caller owns until release
+}
+extern "C" void vt_cuda_tp_release(void* handle) {
+  delete static_cast<vt::CudaCommGroup*>(handle);
 }
 #endif  // VT_NCCL
 
