@@ -483,6 +483,10 @@ const char* OpNameImpl(OpId op) {
       return "Conv2d";
     case OpId::kDepthwiseConv1d:
       return "DepthwiseConv1d";
+    case OpId::kConv1d:
+      return "Conv1d";
+    case OpId::kConvTranspose1d:
+      return "ConvTranspose1d";
     case OpId::kAttentionRelPos:
       return "AttentionRelPos";
     case OpId::kCount:

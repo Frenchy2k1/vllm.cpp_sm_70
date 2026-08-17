@@ -1767,6 +1767,12 @@ vllm_cpp_add_test(test_ops_conv2d vt/test_ops_conv2d.cpp)
 target_include_directories(test_ops_conv2d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_conv1d_depthwise vt/test_ops_conv1d_depthwise.cpp)
 target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# BigVGAN / DAC vocoder 1-D convolutions (#672): vt::Conv1d + vt::ConvTranspose1d
+# against a verbatim copy of the pre-op vocoder1d host loop, plus a CPU-vs-CUDA
+# BYTE-equality arm that skips loudly on a CPU box. The four consumers' own
+# end-to-end bit-identity gate is tests/vllm/models/test_host_parallel.cpp.
+vllm_cpp_add_test(test_ops_conv1d_general vt/test_ops_conv1d_general.cpp)
+target_include_directories(test_ops_conv1d_general PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)

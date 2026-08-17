@@ -404,6 +404,25 @@ enum class OpId : uint8_t {
   // (nemotron_h.py:220 ckpt_names=("up_proj","down_proj","")). See vt::MoeRelu2.
   // Appended before kCount so no existing op's id shifts.
   kMoeRelu2,
+  // --- BigVGAN / DAC vocoder 1-D convolutions (#672,
+  // .agents/specs/minimax-music3.md §11.4). The GENERAL grouped `nn.Conv1d` and
+  // the transposed `nn.ConvTranspose1d` that the three `vocoder1d` consumers
+  // (MiniMax-Music3, MiniMax-H3's audio VAE, IndexTTS-2.5, plus LTX-2.5's audio
+  // VAE) are built from. Two reasons these are new ids rather than parameters of
+  // kDepthwiseConv1d:
+  //   * `vt` had NO transposed 1-D convolution of any kind. kCausalConv1dFwd is
+  //     causal/stateful/SiLU-folded and kDepthwiseConv1d is centre-padded and
+  //     depthwise; neither can express a scatter that GROWS the time axis.
+  //   * the ACCUMULATOR WIDTH differs and is part of the contract, not an
+  //     implementation detail. kDepthwiseConv1d accumulates in f32 and its
+  //     byte-exactness gate pins that; these two accumulate in f64, because f64
+  //     is what every committed `vocoder1d` golden was taken with. Widening or
+  //     narrowing either one moves a shipped model's numerics, so these are
+  //     SIBLINGS and kDepthwiseConv1d is untouched.
+  // See vt::Conv1d / vt::ConvTranspose1d below for the exact contracts.
+  // Appended before kCount so no existing op's id shifts.
+  kConv1d,
+  kConvTranspose1d,
   kCount
 };
 
@@ -620,6 +639,34 @@ struct DepthwiseConv1dArgs {
   int64_t stride = 1;
   int64_t padding = 0;
   int64_t dilation = 1;
+};
+
+// --- BigVGAN / DAC vocoder 1-D convolution args (#672). --------------------
+
+// torch `nn.Conv1d` arguments, the GENERAL grouped form. Field names mirror the
+// constructor keywords 1:1. `groups == 1` is the dense conv the vocoder's
+// conv_pre/conv_post/1x1 projections use; `groups == C_in == C_out` is the
+// depthwise form the alias-free low-pass filter uses.
+//
+// NOT to be confused with DepthwiseConv1dArgs, which drives the conformer's
+// f32-accumulate depthwise op — see OpId::kConv1d for why the two are siblings.
+struct Conv1dArgs {
+  int64_t stride = 1;
+  int64_t padding = 0;  // ZERO padding on BOTH sides; out-of-range taps skipped
+  int64_t dilation = 1;
+  int64_t groups = 1;
+};
+
+// torch `nn.ConvTranspose1d` arguments. Mirrors the constructor keywords 1:1.
+// `padding` here CROPS (torch's "dilation * (kernel_size - 1) - padding"
+// implicit zero-padding on both sides), and `output_padding` appends to the
+// right only.
+struct ConvTranspose1dArgs {
+  int64_t stride = 1;
+  int64_t padding = 0;
+  int64_t output_padding = 0;
+  int64_t dilation = 1;
+  int64_t groups = 1;
 };
 
 // Transformer-XL relative-position self-attention args — the conformer
@@ -1089,6 +1136,12 @@ using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Te
 using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*weight*/, const Tensor* /*bias*/,
                                    const DepthwiseConv1dArgs&);
+// BigVGAN / DAC vocoder 1-D convolutions (#672).
+using Conv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv1dArgs&);
+using ConvTranspose1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                   const Tensor& /*weight*/, const Tensor* /*bias*/,
+                                   const ConvTranspose1dArgs&);
 using AttentionRelPosFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*query*/,
                                    const Tensor& /*key*/, const Tensor& /*value*/,
                                    const Tensor& /*rel_key*/, const Tensor* /*bias_u*/,
@@ -2566,6 +2619,97 @@ void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
 // x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
 void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, const DepthwiseConv1dArgs& args);
+
+// --- BigVGAN / DAC vocoder 1-D convolutions (#672, spec
+// .agents/specs/minimax-music3.md §11.4). ------------------------------------
+//
+// These two are the whole convolution vocabulary of `vllm::vocoder1d`, the
+// shared 1-D BigVGAN core that MiniMax-Music3's vocoder, MiniMax-H3's audio VAE,
+// LTX-2.5's audio VAE and IndexTTS-2.5 all decode through
+// (include/vllm/model_executor/models/vocoder1d.h). The transposed one is 88.5 %
+// of MiniMax-Music3's acoustic-half profile and `vt` had no op of any kind that
+// could express it, which is why the whole stage had no device kernel to route
+// to.
+//
+// Upstream mirror: `torch.nn.functional.conv1d` / `conv_transpose1d` as the
+// checkpoints instantiate them —
+//   * MiniMax-Music3 `minimax_music3_vocoder.py:42,44,55,89,98`
+//     (`nn.Conv1d` at :42/:44/:89/:98, `nn.ConvTranspose1d` at :55),
+//   * LTX-2.5 `audio_vae/vocoder.py:104-184` (the alias-free resample pair) and
+//     its BigVGAN conv_pre/conv_post,
+//   * MiniMax-H3's DAC audio VAE (`dac_alias_free_resample.py`).
+//
+//   Conv1d              out    [N, Cout, Lout]
+//                       x      [N, Cin,  Lin ]
+//                       weight [Cout, Cin/groups, K]        (torch's layout)
+//                       bias   optional rank-1 [Cout]
+//     Lout = (Lin + 2*padding - dilation*(K-1) - 1)/stride + 1
+//
+//   ConvTranspose1d     out    [N, Cout, Lout]
+//                       x      [N, Cin,  Lin ]
+//                       weight [Cin, Cout/groups, K]        (torch's layout —
+//                              note dim 0 is the INPUT channel here)
+//                       bias   optional rank-1 [Cout]
+//     Lout = (Lin-1)*stride - 2*padding + dilation*(K-1) + 1 + output_padding
+//
+// `groups` must divide both Cin and Cout. Zero padding is realised by SKIPPING
+// out-of-range taps.
+//
+// THE NUMERIC CONTRACT, which is the load-bearing part.
+//
+// (1) Every output element owns ONE f64 accumulator. Not f32. The host
+//     reference these replace accumulated in double
+//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), every
+//     committed golden under `tests/parity/goldens/` for all four consumers was
+//     taken through it, and a narrower accumulator would move four shipped
+//     models at once. This is a DELIBERATE divergence from torch, which
+//     accumulates an f32 conv in f32; it is recorded rather than silently
+//     inherited because `.agents/porting.md` "Mirror the memory format" cuts
+//     both ways and a WIDER accumulator is exactly the class of divergence a
+//     token gate cannot see. Cost: the activations and weights stay f32 in
+//     memory, so nothing moves more bytes; only the register width differs.
+//
+// (2) THE VISIT ORDER IS PINNED, not merely the value.
+//     Conv1d accumulates over (ic ascending, k ascending) with the bias seeded
+//     FIRST — `acc = bias; for ic: for k: acc += x*w`.
+//     ConvTranspose1d accumulates over (ic ascending, then input position t
+//     ascending, taking the single tap k with `t*stride + k*dilation == p`) with
+//     the bias added LAST. That is the exact sequence of additions the host
+//     scatter performed into each destination cell, which is what lets the
+//     gather-form kernels here be BIT-IDENTICAL to it rather than merely close.
+//
+// (3) ConvTranspose1d SKIPS an input whose value compares equal to 0.0, exactly
+//     as the host loop did. That is not an optimisation that may be dropped: it
+//     decides the sign of a zero output cell, because (-0.0) + (+0.0) == +0.0
+//     while (-0.0) alone is -0.0.
+//
+// Parallelism partitions OUTPUT elements only, so results do not depend on the
+// thread count or the launch geometry. Gated in
+// tests/vt/test_ops_conv1d_general.cpp against a verbatim copy of the pre-op
+// host loop, and in tests/vllm/models/test_host_parallel.cpp end to end.
+//
+// (4) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE, not merely close.
+//     Both are one f64 accumulator per output element walked in the order
+//     above; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56)
+//     and the device kernel uses `__dmul_rn`/`__dadd_rn`, so every operation on
+//     both arms is an IEEE double multiply or add with round-to-nearest-even on
+//     the same values in the same sequence. The gate asserts `memcmp` equality,
+//     not a tolerance.
+//
+// x/weight/bias/out are f32 only. f16/bf16 are REFUSED with a message naming
+// the gap rather than silently widened — no consumer has them and no golden
+// covers them (owed: .agents/specs/minimax-music3.md §11.4).
+void Conv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv1dArgs& args);
+
+void ConvTranspose1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const ConvTranspose1dArgs& args);
+
+// Output length for the given input length and args — the single definition of
+// torch's shape arithmetic, so a caller sizing an output buffer and the op
+// validating it can never disagree. Returns <= 0 when the geometry is empty.
+int64_t Conv1dOutLength(int64_t in_len, int64_t kernel, const Conv1dArgs& args);
+int64_t ConvTranspose1dOutLength(int64_t in_len, int64_t kernel, const ConvTranspose1dArgs& args);
 
 // P3 — Transformer-XL relative-position ENCODER self-attention. No KV cache, no
 // paging, no RoPE, non-causal: every existing vt attention path is a decoder
