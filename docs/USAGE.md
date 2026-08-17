@@ -1988,11 +1988,16 @@ claimed. Ask for a short duration and few `num_inference_steps` while you are
 checking that it works.
 
 The part that dominates is *not* the one you would guess. The 8.6B language
-model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
-the DiT do not — they are scalar host loops with a double accumulator, written
-that way in W2-W5 so their reduction order is reproducible against torch, and
-they run single-threaded. In one 0.1 s request the depth decoder alone is the
-majority of the wall clock.
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder does
+not — it is a scalar host loop with a double accumulator, written that way in
+W2/W3 so its reduction order is reproducible against torch. In one 0.1 s request
+the depth decoder alone is the majority of the wall clock.
+
+At a *real* duration the DiT is the whole story instead, which is why it is the
+stage that moved first: a 45 s clip at the default 30 inference steps runs the
+DiT 660 times (30 steps x 2 CFG branches x 11 windows) for roughly 634 TFLOP
+against about 29 TFLOP for the entire autoregressive half. On the host loops
+that is measured in hours. `--speech-device 1` puts it on the accelerator.
 
 #### What runs on the device, and what does not
 
@@ -2005,20 +2010,34 @@ direction that matters.
 |---|---|
 | 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
 | guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
+| **2.4B fp32 flow-matching DiT** (every denoise step, both CFG branches) | **device**, weights staged ONCE |
 | 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
-| condition mix, 2.4B fp32 flow-matching DiT, scheduler | **host**, scalar loops |
+| condition mix (once per window), scheduler, CFG mix, Euler step | **host** |
 | DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
 
 The language model reaches the device because it is already routed through the
 shared `Qwen3DenseModel` forward that five text registrations ride — nothing was
 forked for it, and the only thing this option changes is which queue that
-forward is handed and where its KV cache is allocated. The other stages do not,
-for two different reasons, and both are owed rather than hidden:
+forward is handed and where its KV cache is allocated.
 
-* the depth decoder and the DiT are host `std::vector<float>` reference loops
-  under `-ffp-contract=off`, kept that way so their reduction order stays
-  reproducible against torch. Moving them means routing them through the shared
-  `vt` GEMM seam with device-resident weights, not adding a flag;
+The DiT reaches it the same way: through shared `vt` ops only
+(`MatmulBT`, `LayerNorm`, `AttentionCross`, `RopeFromCache`, `SiluAndMul`,
+`Add`), with **no new kernel**. Its 9.7 GB of fp32 weights are uploaded once per
+request, before the window loop, and the host copy is released as each tensor
+lands — a 45 s clip runs that forward 660 times, so a per-step or even
+per-window upload would cost more than the compute it enables. `fp32 stays
+fp32`: the acoustic half is float32 because upstream chose float32 for it, and
+this arm mirrors that rather than buying speed with a narrower dtype.
+
+The remaining stages do not move, for two different reasons, and both are owed
+rather than hidden:
+
+* the depth decoder and the condition mix are host `std::vector<float>`
+  reference loops under `-ffp-contract=off`, and they run at
+  `ArCompute::kBFloat16` — every op's *result* is rounded to bf16, which is what
+  upstream stores. Routing them through an f32 GEMM would silently drop that
+  rounding, so mirroring them needs bf16 storage, which is a dtype decision with
+  its own numeric evidence rather than a transcription;
 * the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
   1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
   are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
@@ -2026,10 +2045,16 @@ for two different reasons, and both are owed rather than hidden:
   this stage would need, so it is named here rather than hand-rolled outside the
   seam.
 
-Because the host stages are unchanged, the CPU arm is **bit-identical** to the
-one every Music3 correctness gate was taken on, and the device arm's output
-differs from it exactly where the language model's own arithmetic differs — one
-stage, not five.
+Because the host stages are unchanged — and because `--speech-device 0` takes
+the same `DitForward` it always did, source byte for source byte — the CPU arm
+is **bit-identical** to the one every Music3 correctness gate was taken on. The
+device arm's output differs from it exactly where the language model's and the
+DiT's own arithmetic differ: two stages, not six, and neither difference is a
+shape or an ordering defect. The DiT's device forward is gated against the same
+upstream goldens at the same tolerance as the host one; nothing was widened for
+it, and `VLLM_CPP_MUSIC3_DEVICE=1` runs that comparison on either arm
+(`tests/parity/test_minimax_music3_acoustic_real.cpp`, with
+`VLLM_CPP_MUSIC3_DIT=1`).
 
 **The two arms do not produce the same song, and that is structural.** The
 autoregressive stage has no greedy path upstream: it ends every draw in a seeded
