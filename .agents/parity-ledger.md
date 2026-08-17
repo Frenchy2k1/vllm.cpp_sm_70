@@ -55,6 +55,12 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | change | `vt_cuda_loader_slice_selfcheck`: dense [K,N] weight sliced by `vllm::TpShard` per rank, each shard memcpied onto ITS device (per-op affinity), the W slices reconstructing the full weight — the placement side a tp>1 weight loader uses |
 | acceptance | 4×V100: group selfcheck + TP seam + loader slice all pass (3/3) |
 
+## Multi-device phase 5 — runner-forward primitive · GREEN
+
+| commit | `8d303584` |
+| change | `vt_cuda_sharded_forward_selfcheck`: y=Wx sharded (each rank a K-slice of columns on ITS device), per-rank real device GEMM, NCCL group all-reduce → full y == unsharded single-GPU ref. Fixed local-vs-global x indexing |
+| acceptance | 4×V100: collectives + TP-seam + loader-slice + runner-forward all pass (4/4) |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
