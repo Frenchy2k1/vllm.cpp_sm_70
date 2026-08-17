@@ -43,6 +43,12 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | change | `CudaDeviceScope` (RAII; no-op when device==current → single-GPU byte-identical) applied to every device-touching CudaBackend method; a `Device{kCUDA,i}` backend now allocates/creates streams/launches on GPU i |
 | acceptance | `test_cuda_backend`: GPU {0,1,2,3} → alloc device {0,1,2,3} (cudaPointerGetAttributes), Memset/Copy on each queue round-trips; 7/7 cases, 58 assertions, SUCCESS (4×V100 sm_70) |
 
+## Multi-device phase 3 — in-process NCCL collectives primitive · GREEN
+
+| commit | `b4901998` |
+| change | real `ncclCommInitAll` over all local GPUs (single process, 4×V100) → one NcclCommunicator per device; the transport (providers) is now actually rnew durable. Per-rank collectives driven from a host thread each (NCCL ours blocking) + per-device affinity |
+| acceptance | `test_nccl_group` (VLLM_CPP_NCCL-gated): AllReduce(kSum)→10 on every rank, AllGather→ordered [1000..1003]; 1/1 SUCCESS on the 4×V100 |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
