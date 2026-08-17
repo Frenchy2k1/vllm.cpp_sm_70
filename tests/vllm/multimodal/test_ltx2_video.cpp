@@ -362,6 +362,110 @@ TEST_CASE("ltx2 video: an auto-detected load renders frames, a WAV and a mux arg
   CHECK(joined.find(result.mux_output_path) != std::string::npos);
 }
 
+// ─── the UNQUANTIZED DiT, reached from the production entry point ───────────
+//
+// AGENTS.md §"Nothing lands dead": the bf16 arm is not done because
+// `Ltx2LoadDitFromSafetensors` accepts the file; it is done because
+// `LoadVideoEngine` — what `include/vllm.h`'s `vllm_video_engine_load`, the
+// server and `ltx2-gen` all reach — loads it on its DEFAULT configuration and
+// renders through it. A loader unit test constructing the checkpoint by hand
+// would prove the branch works and NOT that anything reaches it.
+//
+// The value claim is the loader suite's ("the UNQUANTIZED bf16 DiT materializes
+// onto the same contract", bit-exact over every contract weight). This case owns
+// the reachability half, and its floor is the same as the FP8 render's: frames
+// at the size the result claims, carrying more than one byte value, plus a
+// waveform that is not digital silence.
+TEST_CASE("ltx2 video: an UNQUANTIZED bf16 DiT loads through the ENGINE and renders") {
+  Workspace ws;
+  // Rewrite the workspace's DiT with no quantized weight and no scale sidecar,
+  // which is the shape the shipped dev transformer is in. Everything else about
+  // the fixture — the VAEs, the upsampler, the embeds — is untouched, so the
+  // ONLY difference from the FP8 case above is the DiT's dtype.
+  ltx2_fixture::ReducedDitOptions bf16;
+  bf16.unquantized = true;
+  ltx2_fixture::WriteReducedDit(ltx2_fixture::ReducedDitParams(), ws.paths.dit, bf16);
+
+  // The file really is unquantized, asserted before the engine sees it: a
+  // fixture flag that silently did nothing would make everything below a second
+  // run of the FP8 case.
+  {
+    const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(ws.paths.dit);
+    int64_t quantized = 0, bf16_tensors = 0, sidecars = 0;
+    for (const std::string& name : file.Names()) {
+      const std::string& dtype = file.Get(name).dtype;
+      if (dtype == "U8" || dtype == "F8_E4M3") ++quantized;
+      if (dtype == "BF16") ++bf16_tensors;
+      if (name.size() >= 6 && name.compare(name.size() - 6, 6, "_scale") == 0) ++sidecars;
+    }
+    INFO("quantized = " << quantized << " bf16 = " << bf16_tensors
+                        << " sidecars = " << sidecars);
+    CHECK(quantized == 0);
+    CHECK(sidecars == 0);
+    CHECK(bf16_tensors > 0);
+  }
+
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  CHECK(engine->family() == vllm::multimodal::kLtx2VideoFamily);
+
+  // The geometry the engine RESOLVED from the unquantized file. A bf16 header
+  // carries no packed width to double, so a loader that still halved or doubled
+  // one would land here rather than in the pixels.
+  const auto* ltx2 = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const vllm::Ltx2DitParams reference = ltx2_fixture::ReducedDitParams();
+  CHECK(ltx2->dit_params().num_layers == reference.num_layers);
+  CHECK(ltx2->dit_params().inner_dim() == reference.inner_dim());
+  CHECK(ltx2->dit_params().audio_inner_dim() == reference.audio_inner_dim());
+  CHECK(ltx2->dit_params().in_channels == reference.in_channels);
+  CHECK(ltx2->dit_params().audio_in_channels == reference.audio_in_channels);
+
+  const std::string out_dir = ws.root + "/out_bf16";
+  const vllm::multimodal::VideoResult result = engine->Generate(FixtureGen(out_dir));
+  CHECK(result.frame_count == 9);
+  CHECK(result.width == 32);
+  CHECK(result.height == 32);
+
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    const std::string bytes = ReadAll(out_dir + name);
+    int w = 0, h = 0;
+    size_t at = 0;
+    ParsePpmHeader(bytes, &w, &h, &at);
+    INFO("frame ", f);
+    CHECK(w == static_cast<int>(result.width));
+    CHECK(h == static_cast<int>(result.height));
+    CHECK(bytes.size() == at + static_cast<size_t>(w) * h * 3);
+    size_t distinct = 0;
+    bool seen[256] = {false};
+    for (size_t i = at; i < bytes.size(); ++i) {
+      const unsigned char v = static_cast<unsigned char>(bytes[i]);
+      if (!seen[v]) {
+        seen[v] = true;
+        ++distinct;
+      }
+    }
+    CHECK_MESSAGE(distinct > 1, "frame ", f, " is a single flat value, which is what an "
+                                "all-NaN decode serializes as");
+  }
+
+  const std::string wav = ReadAll(result.audio_path);
+  REQUIRE(wav.size() > 44);
+  CHECK(wav.compare(0, 4, "RIFF") == 0);
+  int64_t nonzero = 0;
+  for (size_t i = 44; i + 1 < wav.size(); i += 2) {
+    int16_t sample = 0;
+    std::memcpy(&sample, wav.data() + i, sizeof(sample));
+    if (sample != 0) ++nonzero;
+  }
+  CHECK_MESSAGE(nonzero > 0, "the waveform is digital silence, which is what a NaN decode writes");
+}
+
 TEST_CASE("ltx2 video: a MULTI-CHUNK render numbers its frames globally, and clears the last one") {
   // The fixture above is 9 frames — ONE temporal chunk — so the render path's
   // `chunk.first_frame + f` (ltx2_video.cpp, the streaming sink) was never driven
@@ -2620,6 +2724,67 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     CHECK_FALSE(ck.params.use_keyframes_abs_pos_embedding);
     CHECK(ck.weights.keyframes_abs_pos_embedding.data == nullptr);
     MESSAGE("shipped NVFP4 DiT loaded inside the contract, unported=" << ck.unported.size());
+  }
+
+  // THE FULL (dev) TRANSFORMER — the arm issue #1148 could not read at all.
+  //
+  // HEADER ONLY, DELIBERATELY. `SafetensorsFile::Open` mmaps, and
+  // `Ltx2ParseDitParamsFromCheckpoint` touches the 677,616-byte JSON header and
+  // no payload, so this subcase costs kilobytes. A full
+  // `Ltx2LoadDitFromSafetensors` on this file materializes ~42 GB of host bf16,
+  // which is not something the CPU gate can hold, so the real-weights
+  // MATERIALIZATION stays owed and is recorded as such in the row's spec rather
+  // than skipped quietly. What this DOES establish is that `PlanDit` resolves
+  // the real file — 4349 tensors, 4059 BF16 / 290 F32, zero scale sidecars — to
+  // `kNone` and recovers LTX-2.5's geometry from shapes that were never packed.
+  SUBCASE("the FULL bf16 dev DiT resolves onto the L2 contract") {
+    const std::string path =
+        root + "/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors";
+    const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+    vllm::Ltx2DitQuant quant = vllm::Ltx2DitQuant::kFp8;  // never the expected value
+    const vllm::Ltx2DitParams from_shapes =
+        vllm::Ltx2ParseDitParamsFromCheckpoint(file, &quant);
+    CHECK(quant == vllm::Ltx2DitQuant::kNone);
+    CHECK(from_shapes.num_layers == 48);
+    CHECK(from_shapes.inner_dim() == 4096);
+    CHECK(from_shapes.audio_inner_dim() == 2048);
+    CHECK(from_shapes.in_channels == 128);
+    CHECK(from_shapes.audio_in_channels == 128);
+    CHECK(from_shapes.use_prompt_adaln_single);
+    // TRAINED here, unlike the first-party NVFP4 copy which declares the flag and
+    // carries no tensor: the dev file stores `keyframes_abs_pos_embedding` as
+    // BF16 [1, 4096].
+    CHECK(from_shapes.use_keyframes_abs_pos_embedding);
+    CHECK_FALSE(from_shapes.ff_bias);
+    CHECK(from_shapes.audio_ff_bias);
+
+    // Not one U8 and not one F8_E4M3 anywhere, which is what made the old
+    // refusal fire. Counted from the file rather than asserted from the row.
+    int64_t u8 = 0, f8 = 0, bf16 = 0, f32 = 0, sidecars = 0;
+    for (const std::string& name : file.Names()) {
+      const std::string& dtype = file.Get(name).dtype;
+      if (dtype == "U8") ++u8;
+      if (dtype == "F8_E4M3") ++f8;
+      if (dtype == "BF16") ++bf16;
+      if (dtype == "F32") ++f32;
+      if (name.size() >= 6 && name.compare(name.size() - 6, 6, "_scale") == 0) ++sidecars;
+    }
+    CHECK(u8 == 0);
+    CHECK(f8 == 0);
+    CHECK(sidecars == 0);
+    CHECK(bf16 == 4059);
+    CHECK(f32 == 290);
+
+    // And the declared config describes the SAME weight contract as the shapes,
+    // which is the check the engine performs before adopting it.
+    CHECK(vllm::Ltx2ReadCheckpointModelVersion(file) == "2.5.0");
+    const nlohmann::json config = vllm::Ltx2ReadCheckpointConfig(file);
+    const vllm::Ltx2DitParams declared = vllm::Ltx2AdoptDeclaredDitParams(
+        config, from_shapes, "the dev bf16 DiT's own __metadata__[\"config\"]");
+    CHECK(declared.double_precision_rope);
+    CHECK(declared.av_ca_timestep_scale_multiplier == 1000);
+    MESSAGE("shipped dev bf16 DiT: quant=kNone, " << file.Names().size()
+            << " tensors, " << bf16 << " BF16 / " << f32 << " F32");
   }
 }
 

@@ -363,6 +363,23 @@ inline constexpr const char* kLtx2DitCheckpointPrefix = "model.diffusion_model."
 // Which quantization the DiT file actually uses, DETECTED from the tensors
 // rather than from a filename.
 enum class Ltx2DitQuant {
+  // NOT QUANTIZED — every weight is stored at the model dtype and the file
+  // carries no scale sidecar at all. This is upstream's ORDINARY case rather
+  // than a third scheme: `single_gpu_model_builder.py:51-57` (@ `fd4ded7f`)
+  // lists float32/float64/float16/bfloat16 as the dtypes `build(..., dtype=)`
+  // may cast and calls uint8-NVFP4 and float8 "quantized payloads" that must
+  // not be rewritten, so the two quantized arms are the exception and this is
+  // the baseline they are an exception to.
+  //
+  // It is what `Lightricks/LTX-2.5` ships as the FULL (dev) transformer, which
+  // `packages/ltx-pipelines/CLAUDE.md:17-30` names as the model for
+  // `TI2VidOneStagePipeline`, `T2AOneStagePipeline`, `TI2VidTwoStagesPipeline`,
+  // `TI2VidTwoStagesHQPipeline`, `A2VidPipelineTwoStage` and
+  // `KeyframeInterpolationPipeline` — most of the arms this port carries.
+  // Refusing it left every one of them runnable only against a DISTILLED
+  // checkpoint, which is a different sampling regime and renders plausibly
+  // (issue #1148, and #1137 for the missing class check).
+  kNone,
   kFp8,    // F8_E4M3 weight + F32 scalar `<name>_scale`   (vonkaiser 22b-distilled-fp8)
   kNvfp4,  // U8 packed + F8_E4M3 `<name>_scale` + F32 `<name>_scale_2`
 };
