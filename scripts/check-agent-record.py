@@ -299,14 +299,22 @@ MATRICES = {
     # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
     # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
     # gate.
-    # 83 since 2026-08-16: +`BACKEND-GATE-CUDA-LLAMACPP` (#979), the llama.cpp
-    # floor on a CURRENT CUDA card. Neither existing llama.cpp row covers it:
-    # `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
-    # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to Pascal/Volta/Turing,
-    # where vLLM has no entry at all. The four-way Qwen3.8-27B campaign needs
-    # it because llama.cpp is the ONLY comparator that runs the Q4_K_M arm:
-    # vLLM removed GGUF from its tree at our pin. INVENTORIED, no run.
-    "BACKEND": (AGENTS / "backend-matrix.md", 83),
+     # 83 since 2026-08-16: +`BACKEND-GATE-CUDA-LLAMACPP` (#979), the llama.cpp
+     # floor on a CURRENT CUDA card. Neither existing llama.cpp row covers it:
+     # `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
+     # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to Pascal/Volta/Turing,
+     # where vLLM has no entry at all. The four-way Qwen3.8-27B campaign needs
+     # it because llama.cpp is the ONLY comparator that runs the Q4_K_M arm:
+     # vLLM removed GGUF from its tree at our pin. INVENTORIED, no run.
+     # 84 since 2026-08-12: +`BACKEND-TENSTORRENT-TRACE-RUNNER`, feasibility
+     # spike for wiring the landed #354 graph-capture foundation into a
+     # capturable forward region (decode host-free region? capture tok/s cost?
+     # ttnn program-cache warm-up?). No code; decision record only.
+     # 85 since 2026-08-13: +`BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, the plan
+     # row decomposing the host-free decode forward (R1 RmsNorm+RoPE, R2
+     # QkvSplit+RAC, R3 PA decode, R4 capture wire) that the trace-runner
+     # spike revealed as the real prerequisite for decode capture.
+    "BACKEND": (AGENTS / "backend-matrix.md", 85),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

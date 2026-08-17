@@ -1622,6 +1622,10 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT-MISTRAL`: `ACTIVE`: Mistral-7B-v0.3 gated on a Blackhole P150, 16/16 prompts (12/16 strict token-exact, 4/16 inside the near-tie band, 0 forward-divergent), max gap 0.062 nats. `MistralForCausalLM` is allowlisted by exact match, so `Mistral3ForConditionalGeneration` (#387, unported) still falls through. Correctness only -- no speed claim.
 
+`BACKEND-TENSTORRENT-TRACE-RUNNER`: `SPIKE`: NO-GO for T=1 decode capture. Measured `to_vector` abort. Decode capture moved to `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`. Prefill capture still unaudited.
+
+`BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`

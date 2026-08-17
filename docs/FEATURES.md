@@ -265,6 +265,7 @@ both refuse, naming what is missing.
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
+| Tenstorrent host-free decode | ◐ env-gated `VT_TT_HOST_FREE_DECODE`; implementer P150 79-replay/5.8x. Default inert. New batch after capture refused. Engine golden owed | ☐ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,
