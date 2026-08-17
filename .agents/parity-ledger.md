@@ -31,6 +31,12 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | change | decode/prefill 192|256 instantiations + dispatch; gate widened to {64,128,192,256} |
 | acceptance | `test_sm70_fa2_decode` on V100: decode vs reference reldev 2.00e-5 (D=192), 1.74e-5 (D=256); op-parity 7.99e-6; prefill parity OK; suite 4/4 (tol 3e-2) |
 
+## sm70 y-dg-sync coverage (CUDA-graph capture safety) · GREEN
+
+| commit | `cd5b2782` |
+| scope | audit + regression gate: the runner replays steady-state decode inside a captured CUDA graph; any host-sync/malloc the decode emits on the capture stream trips `cudaErrorStreamCaptureImplicit` and dies. Audit: all existing host syncs are warmup-only. Gate: `vt_sm70_fa2_graph_replay_parity()` runs Begin->EndCapture->instantiate->launch and REQUIRES replay==eager |
+| acceptance | V100: graph-replay max relative dev **0.000e+00** (bit-identical); `test_sm70_fa2_decode` 5/5 SUCCESS |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
