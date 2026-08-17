@@ -7384,7 +7384,7 @@ TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISS
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
   const std::string wav = WriteWav(ws.root + "/take.wav", 2, kFixtureAudioRate, 2.0);
 
-  // ── no distilled adapter, refused at LOAD (utils/args.py:1140-1153) ────────
+  // ── no distilled adapter, refused at LOAD (utils/args.py:1140-1155) ────────
   {
     vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
     mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
@@ -7397,10 +7397,21 @@ TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISS
       INFO("message = " << message);
       CHECK(message.find("distilled LoRA") != std::string::npos);
       CHECK(message.find("lora_path") != std::string::npos);
-      CHECK(message.find("args.py:1140-1153") != std::string::npos);
-      // The divergence this refusal cannot repair is named in the same breath,
-      // so a reader who hits it is told where it is tracked.
-      CHECK(message.find("1118") != std::string::npos);
+      CHECK(message.find(":1140-1155") != std::string::npos);
+      // THE ANCHOR IS THE SHARED PARSER, not this pipeline's own stage 2. The
+      // refusal is keyed on `requires_distilled_lora` so that every recipe off
+      // `default_2_stage_arg_parser` inherits it, and it used to hard-code
+      // `a2vid_two_stage.py`'s line numbers — which named the caller's pipeline
+      // in one sentence and cited a different one in the next as soon as
+      // `ti2vid_two_stage` arrived (#1151).
+      CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+      // AND IT NO LONGER ADVERTISES #1118, which closed at `4ae0f54ab`. The
+      // message used to end by telling the caller this engine fuses once at
+      // load so stage 1 sees the adapter too; `Ltx2PhaseRecipe::loras` made
+      // every clause of that false. A refusal that describes a divergence which
+      // no longer exists is worse than one that says nothing (#1151).
+      CHECK(message.find("1118") == std::string::npos);
+      CHECK(message.find("fuses once at load") == std::string::npos);
     }
     // THE CONTROL: the same load on the DEFAULT kind is fine without an adapter,
     // so this is the recipe's requirement and not a new global one.
@@ -7530,7 +7541,7 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   //
   // WHY STRENGTH 0 IS THE CONTROL and not "no adapter": `requires_distilled_lora`
   // refuses an a2vid load carrying no `lora_path` at all (upstream's
-  // `--distilled-lora required=True`, utils/args.py:1140-1153), so the base-
+  // `--distilled-lora required=True`, utils/args.py:1140-1155), so the base-
   // weights arm has to be spelled some other way. Strength 0 fuses a ZERO delta,
   // and that it reproduces the base model is already gated independently by
   // "ltx2 video: the IC-LoRA strength reaches the PIXELS, and 0 is a no-op".
@@ -7628,4 +7639,389 @@ TEST_CASE("ltx2 a2vid: the rebind leaves the DiT where the NEXT generation expec
   // DiT unfused after the first render would make the second render's stage 2
   // run on base weights, and these would differ.
   CHECK(a == b);
+}
+
+// ─── LTX25-TI2VID-RECIPE (#1093) ─────────────────────────────────────────────
+
+namespace {
+
+// A `ti2vid_two_stage` engine on the shipped fixture. Two load-side
+// requirements: the spatial upsampler stage 2 needs, which `ConditioningParams`
+// supplies, and the distilled adapter upstream's `--distilled-lora
+// required=True` demands (utils/args.py:1140-1155).
+//
+// NO `audio_path`, and its absence is the point rather than an omission. This
+// pipeline GENERATES its soundtrack; `a2vid_two_stage` denoises video around a
+// take the caller supplies and sets `requires_audio_input` for it.
+vllm::multimodal::VideoModelParams Ti2VidParams(const ltx2_fixture::Paths& paths,
+                                                const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "ti2vid_two_stage";
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+// `steps = 2`, because stage 1's schedule is DERIVED from the step count
+// (ti2vid_two_stages.py:243-245) and two sigma intervals exercise the loop. The
+// STG block list is the fixture's, not this row's: the reduced DiT has TWO
+// blocks and the params row this recipe resolves names block 28.
+vllm::multimodal::VideoGenParams Ti2VidGen(const std::string& out_dir, int64_t size = 64) {
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.steps = 2;
+  gen.height = size;
+  gen.width = size;
+  OneStageFixtureGuidance(&gen);
+  return gen;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 ti2vid: the pipeline renders through vllm.h, guided on the UNADAPTED stage 1") {
+  // THE REACHABILITY CLAIM, and it is the point of this case rather than a note
+  // beside it. Entry point: `LoadVideoEngine` with a documented value of the
+  // documented `pipeline_kind` LOAD extra plus `lora_path`, then `Generate`.
+  // Nothing here constructs a recipe, a guider, a phase or a modality by hand.
+  // Deleting the `ti2vid_two_stage` dispatch row in `ResolveLtx2PipelineRecipe`
+  // REDs this case at the LOAD, which is what separates measuring a capability
+  // from measuring a class (.agents/reachability.md).
+  //
+  // `ltx2-gen --pipeline-kind ti2vid_two_stage --lora-path ... --upsampler-path
+  // ...` is the same two calls through the ABI, as a thin client that includes
+  // no internal header.
+  //
+  // AND #928 DOES NOT EXCLUDE THE HTTP ROUTE HERE, unlike on `a2vid_two_stage`.
+  // That recipe needs `audio_path`, a PER-GENERATION extra, and
+  // `VideoGenParamsFromRequest` writes none. All three knobs THIS recipe needs —
+  // `pipeline_kind`, `lora_path`, `upsampler_path` — are LOAD extras, which a
+  // server supplies through `--video-extra KEY=VALUE`, and `requires_audio_input`
+  // is false, which the recipe case gates.
+  //
+  // That is a statement about the REQUEST SURFACE and not a second reach claim:
+  // no case here drives the HTTP route end to end, so it is not measured and is
+  // not asserted.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(Ti2VidParams(ws.paths, lora));
+  REQUIRE(engine != nullptr);
+  auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  CHECK(ltx->pipeline_kind() == "ti2vid_two_stage");
+
+  const vllm::multimodal::VideoResult result = engine->Generate(Ti2VidGen(ws.root + "/ti2v"));
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+  CHECK(result.frame_count == 9);
+  // The soundtrack is GENERATED and decoded through the vocoder, so it comes
+  // back at the BWE arm's rate rather than at the audio VAE's — which is the
+  // observable difference from `a2vid_two_stage`, where upstream hands back the
+  // caller's own waveform (a2vid_two_stage.py:301-303).
+  CHECK(result.sample_rate > 0);
+
+  // ── stage 1 ran upstream's GUIDED denoiser, on all four arms ───────────────
+  //
+  // AN EVALUATION COUNT CANNOT SEE THIS. A denoiser call is ONE evaluation
+  // whether guidance ran or not, so only the FORWARD counters — actual
+  // `Ltx2DitForward` calls — distinguish a guided stage 1 from a
+  // `SimpleDenoiser` one. The trace's guided fields are recorded at step 0 of
+  // phase 0, which is this recipe's stage 1, and its guider is the params
+  // table's video row (cfg 3.0, stg 1.0, rescale 0.7, modality 3.0), so all four
+  // passes run and the rescale branch — the one term that is NOT invariant
+  // between x0 and velocity space — is live on the DEFAULT path.
+  REQUIRE_MESSAGE(t.video_guided, "stage 1 did not go through the guided seam at all");
+  CHECK(t.video_cond_forwards == 1);
+  CHECK(t.video_uncond_forwards == 1);
+  CHECK(t.video_perturbed_forwards == 1);
+  CHECK(t.video_modality_forwards == 1);
+  CHECK(t.video_guidance_cfg_scale == 3.0);
+  CHECK(t.video_guidance_stg_scale == 1.0);
+  CHECK(t.video_guidance_rescale_scale == 0.7);
+  CHECK(t.video_guidance_modality_scale == 3.0);
+  CHECK(t.dit_forwards > t.dit_evaluations);
+
+  // ── the four arms are combined in X0 SPACE, not velocity space ────────────
+  //
+  // `_guided_denoise` converts each pass to x0 BEFORE it combines them
+  // (ltx-core utils.py:39-52, `sample - velocity * sigma`). Every LINEAR term is
+  // invariant under that change of variable, so cfg, stg and modality cannot
+  // see the difference; the RESCALE branch is not invariant, and
+  // `rescale_scale` defaults to 0.7 here, so a space error lands on the default
+  // path (#1039, #1092).
+  //
+  // A MAGNITUDE ASSERTION CANNOT GATE IT. On a reduced fixture
+  // `std(cond)/std(pred)` is 1.0 to 1e-5 in BOTH spaces. `x0 == latent -
+  // sigma*velocity` is an equation between three RECORDED tensors instead: exact
+  // in x0 space, and in velocity space `x0` IS the velocity, so the residual
+  // becomes the whole sample and `|x0 - velocity|` collapses to exactly 0 —
+  // which is what the RED prints.
+  const size_t n = t.video_first_latent.size();
+  REQUIRE(n > 0);
+  const size_t tokens = t.video_first_timesteps.size();
+  REQUIRE(tokens > 0);
+  const size_t width = n / tokens;
+  REQUIRE(width * tokens == n);
+  // THE FIXTURE CAN DECIDE THIS AT ALL: the two candidate tensors coincide when
+  // the sample is zero. A REQUIRE, because nothing below discriminates once it
+  // fails.
+  double latent_span = 0.0;
+  for (const float x : t.video_first_latent) {
+    latent_span = std::max(latent_span, std::abs(static_cast<double>(x)));
+  }
+  REQUIRE_MESSAGE(latent_span > 1e-3, "the step-0 sample is zero, so the two candidate tensors "
+                                      "coincide and nothing below discriminates");
+
+  struct Ti2VidArm {
+    const char* name;
+    const std::vector<float>& velocity;
+    const std::vector<float>& x0;
+  };
+  const Ti2VidArm arms[] = {
+      {"cond", t.video_first_cond_velocity, t.video_first_cond},
+      {"uncond", t.video_first_uncond_velocity, t.video_first_uncond},
+      {"perturbed", t.video_first_perturbed_velocity, t.video_first_perturbed},
+      {"modality", t.video_first_modality_velocity, t.video_first_modality},
+  };
+  for (const Ti2VidArm& arm : arms) {
+    INFO("arm = " << std::string(arm.name));
+    REQUIRE(arm.velocity.size() == n);
+    REQUIRE(arm.x0.size() == n);
+    // PER ARM, because a zeroed velocity makes `to_denoised` the identity on
+    // THIS arm alone and would satisfy the equation while proving nothing.
+    double velocity_span = 0.0;
+    for (const float x : arm.velocity) {
+      velocity_span = std::max(velocity_span, std::abs(static_cast<double>(x)));
+    }
+    REQUIRE_MESSAGE(velocity_span > 1e-6, "this arm's velocity is zero, so the equation below "
+                                          "holds for a reason that is not the one it tests");
+    // `x0 = latent - sigma_token * velocity` (model.py:590-604), with the
+    // PER-TOKEN timestep and not the schedule scalar.
+    double residual = 0.0;
+    double against_velocity = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double sigma = static_cast<double>(t.video_first_timesteps[i / width]);
+      const double expected = static_cast<double>(t.video_first_latent[i]) -
+                              sigma * static_cast<double>(arm.velocity[i]);
+      residual = std::max(residual, std::abs(static_cast<double>(arm.x0[i]) - expected));
+      against_velocity = std::max(
+          against_velocity,
+          std::abs(static_cast<double>(arm.x0[i]) - static_cast<double>(arm.velocity[i])));
+    }
+    INFO("max|x0 - (latent - sigma*v)| = " << residual);
+    INFO("max|x0 - velocity| = " << against_velocity);
+    CHECK(residual < 1e-4);
+    CHECK(against_velocity > 1e-6);
+  }
+}
+
+TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
+  // THE DIVERGENCE THIS ROW RESOLVED, gated through the production entry point
+  // rather than on the recipe struct — the recipe case proves the field is SET,
+  // and this one proves it is CONSUMED (#1013).
+  //
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `tokens = math.prod(latent.shape[2:]) if latent is not None else
+  // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
+  // = 4096 (`:11`, `:29`). `ti2vid_two_stages.py:243-245` passes NO latent;
+  // `ti2vid_two_stages_hq.py:267` — our `res2s_two_stage` — passes
+  // `latent=empty_latent` and is the ONE upstream site that does.
+  //
+  // A 2x2 OVER (recipe, geometry), because neither half alone is load-bearing.
+  // The equalities alone pass on a build that hard-codes 4096 for everything;
+  // the inequalities alone pass on today's `target_tokens`-everywhere tree. Only
+  // the pair says that the anchor is per-phase AND selected correctly.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  // Two geometries whose stage-1 target grids differ. Both divide 64, which is
+  // `Ltx2AssertResolution`'s divisor on a `spatial_downscale = 2` recipe.
+  const int64_t kSmall = 64;
+  const int64_t kLarge = 128;
+
+  // TWO NUMBERS OUT OF EACH RENDER, AND THE SECOND ONE IS WHAT KEEPS THE
+  // TRAJECTORY HALF OF THIS CASE HONEST. The recomputations at the end run at
+  // the step count the RENDER used. Restating that count as a literal down
+  // there decouples it from `gen.steps`: lowering the render to 2 steps would
+  // then leave every assertion in this case green while making the trajectory
+  // claim vacuous, which is precisely the degeneracy the comment beside
+  // `gen.steps` warns about.
+  struct Rendered {
+    int64_t schedule_tokens;
+    int64_t steps;
+  };
+
+  auto rendered_for = [&](const char* kind, int64_t size,
+                          const std::string& tag) -> Rendered {
+    vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = Ti2VidGen(ws.root + "/" + tag, size);
+    // THREE STEPS, NOT THE FIXTURE'S TWO, and the reason is measured below: the
+    // scheduler's `stretch` pins sigma[0] at 1.0 and the LAST non-zero sigma at
+    // `terminal` = 0.1 (schedulers.py:48-55), so a 2-step schedule is
+    // {1, 0.1, 0} for EVERY token count and the anchor cannot reach the
+    // trajectory at all. Three steps is the shortest schedule with an interior
+    // sigma for the shift to move. Lowering this number is REFUSED rather than
+    // deprecated: it comes back out of this lambda and the trajectory
+    // assertions recompute at it, so 2 here reds them by name.
+    gen.steps = 3;
+    // `ti2vid_two_stage` resolves `stg_blocks = [28]` (constants.py:86-87) and
+    // this fixture's DiT has TWO blocks, so its perturbed pass is refused by
+    // name unless the request names a block that exists. The HQ preset ships
+    // `stg_blocks = []` beside `stg_scale = 0.0` (constants.py:105, :113), asks
+    // for no perturbed pass at all, and FIXES its stage-2 guidance — so giving
+    // it the same override is refused outright. `Ti2VidGen` carries the
+    // override, so the control has to take it back off.
+    if (std::string(kind) != "ti2vid_two_stage") {
+      gen.extras.erase(vllm::multimodal::kLtx2VideoStgBlocksExtra);
+      gen.extras.erase(vllm::multimodal::kLtx2AudioStgBlocksExtra);
+    }
+    (void)engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // Written only on the branch that CALLS `Ltx2SigmaSchedule`, so a phase
+    // carrying frozen sigmas leaves it 0. Stage 2 of both recipes does, which is
+    // why what lands here is stage 1's.
+    REQUIRE(t.schedule_tokens > 0);
+    return Rendered{t.schedule_tokens, gen.steps};
+  };
+
+  const Rendered ti_small_r = rendered_for("ti2vid_two_stage", kSmall, "ti_small");
+  const Rendered ti_large_r = rendered_for("ti2vid_two_stage", kLarge, "ti_large");
+  const Rendered hq_small_r = rendered_for("res2s_two_stage", kSmall, "hq_small");
+  const Rendered hq_large_r = rendered_for("res2s_two_stage", kLarge, "hq_large");
+
+  const int64_t ti_small = ti_small_r.schedule_tokens;
+  const int64_t ti_large = ti_large_r.schedule_tokens;
+  const int64_t hq_small = hq_small_r.schedule_tokens;
+  const int64_t hq_large = hq_large_r.schedule_tokens;
+
+  // The step count the four renders ACTUALLY ran at, read back out of them
+  // rather than restated below. All four have to agree, or "the step count" is
+  // not one number and nothing below can be recomputed at it.
+  const int64_t rendered_steps = ti_small_r.steps;
+  REQUIRE(ti_large_r.steps == rendered_steps);
+  REQUIRE(hq_small_r.steps == rendered_steps);
+  REQUIRE(hq_large_r.steps == rendered_steps);
+
+  MESSAGE("ti2vid: " << ti_small << " / " << ti_large << "   res2s: " << hq_small << " / "
+                     << hq_large);
+
+  // ── this arm's schedule is RESOLUTION-INDEPENDENT, at upstream's constant ──
+  const int64_t anchor = vllm::Ltx2SchedulerParams{}.default_number_of_tokens;
+  CHECK(anchor == 4096);  // schedulers.py:11 — pinned, not read back from the build
+  CHECK_MESSAGE(ti_small == anchor,
+                "stage 1's sigma shift was fitted on " << ti_small << " tokens, but upstream "
+                    "passes no latent (ti2vid_two_stages.py:243-245) and gets " << anchor);
+  CHECK(ti_large == anchor);
+
+  // ── and the HQ arm's is NOT, which is what stops the above being a constant ─
+  CHECK_MESSAGE(hq_small != hq_large,
+                "the res_2s arm reported the same anchor at two resolutions, so this fixture "
+                "cannot tell the two branches apart and the equalities above prove nothing");
+  CHECK(hq_small != anchor);
+  CHECK(hq_large != anchor);
+
+  // ── and the two anchors really do produce DIFFERENT sigmas ────────────────
+  //
+  // The strongest half: a claim about the trajectory rather than about the
+  // counter that reports it. `sigma_shift = tokens*mm + b` (schedulers.py:35-39),
+  // so two token counts give two schedules — unless the shift arithmetic has
+  // been flattened, in which case selecting the anchor would be inert and every
+  // assertion above would still pass.
+  // AT `rendered_steps`, NOT AT A LITERAL. The step count comes back out of the
+  // renders above, so this comparison cannot drift away from what they sampled.
+  // A literal here would let someone lower `gen.steps` and keep this green.
+  const std::vector<float> at_anchor = vllm::Ltx2SigmaSchedule(rendered_steps, anchor);
+  const std::vector<float> at_target = vllm::Ltx2SigmaSchedule(rendered_steps, hq_small);
+  REQUIRE(at_anchor.size() == at_target.size());
+  CHECK_MESSAGE(at_anchor != at_target,
+                "the 4096 anchor and the target grid produce the SAME schedule on this fixture, "
+                "so nothing above measures which one was taken");
+
+  // AND THE RENDER'S STEP COUNT IS LOAD-BEARING, WHICH IS WORTH AN ASSERTION
+  // RATHER THAN A COMMENT. `stretch` renormalises so that sigma[0] is 1.0 and
+  // the LAST non-zero sigma is exactly `terminal` = 0.1 (schedulers.py:48-55).
+  // A 2-step schedule has only those two non-zero entries, so it is {1, 0.1, 0}
+  // for EVERY token count and the shift is entirely absorbed. This case was
+  // written at the fixture's usual 2 steps and went RED here, on this line's
+  // ancestor — the counters were already correct and the trajectory claim was
+  // vacuous.
+  //
+  // TWO ASSERTIONS, BECAUSE THEY FAIL FOR DIFFERENT REASONS. The first names
+  // the render's own step count, so lowering `gen.steps` to make this case
+  // faster fails HERE, by name, rather than silently turning the comparison
+  // above into a value against itself. The second pins the degeneracy itself,
+  // so it fails if a scheduler change ever makes a 2-step schedule
+  // token-dependent and this whole paragraph stops being true.
+  CHECK_MESSAGE(rendered_steps > 2,
+                "the renders above ran at " << rendered_steps << " steps, and a schedule that "
+                "short is {1, 0.1, 0} for EVERY token count (schedulers.py:48-55), so the "
+                "trajectory comparison above compares a value with itself");
+  CHECK_MESSAGE(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor) ==
+                    vllm::Ltx2SigmaSchedule(/*steps=*/2, hq_small),
+                "a 2-step schedule now DOES depend on the token count, so the stretch no longer "
+                "pins both of its non-zero sigmas and the comment above is wrong");
+  CHECK(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor).size() == 3u);
+
+  // `Ltx2SigmaSchedule` reads 0 as "take the default", so the concrete 4096 the
+  // engine now passes and the sentinel are the same schedule. Pinned because the
+  // engine deliberately passes the concrete value, so that the trace reports an
+  // anchor rather than a sentinel.
+  CHECK(vllm::Ltx2SigmaSchedule(rendered_steps, 0) == at_anchor);
+}
+
+TEST_CASE("ltx2 ti2vid: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
+  // `--distilled-lora` is `required=True` (utils/args.py:1140-1155) on the
+  // parser ti2vid_two_stages.py:319 selects, and stage 2's three-sigma
+  // refinement (`:178`) is what that adapter was trained for. Without it the
+  // render FINISHES: a clip of the right size, frame count and sample rate, with
+  // a distilled schedule run on undistilled weights.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
+  mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    FAIL_CHECK("a ti2vid load with no distilled LoRA must be refused");
+  } catch (const std::exception& e) {
+    const std::string message = e.what();
+    INFO("message = " << message);
+    // It names the PIPELINE that was asked for, which is what makes the refusal
+    // actionable rather than generic.
+    CHECK(message.find("ti2vid_two_stage") != std::string::npos);
+    CHECK(message.find("distilled LoRA") != std::string::npos);
+    CHECK(message.find("lora_path") != std::string::npos);
+    // ...and the anchor it cites is the SHARED parser, not `a2vid_two_stage.py`.
+    // This recipe is the second user of `requires_distilled_lora`, so it is the
+    // first caller the old hard-coded anchors would have pointed at the wrong
+    // pipeline's source (#1151).
+    CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py") == std::string::npos);
+  }
+
+  // THE CONTROL: the same load WITH the adapter renders, so the case is about
+  // the requirement and not about any load failure.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(Ti2VidParams(ws.paths, lora)));
+  // THE SECOND CONTROL: the DEFAULT kind is fine without an adapter, so this is
+  // this recipe's requirement and not a new global one.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths)));
+
+  // ── and NO audio take is demanded, which `a2vid_two_stage` does ────────────
+  //
+  // The two recipes come off the same parser and share `requires_distilled_lora`,
+  // so a recipe written by copying that one would inherit `requires_audio_input`
+  // and refuse every render. There is no `--audio-path` on this pipeline:
+  // ti2vid_two_stages.py:159-181 takes `images`, not a waveform.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(Ti2VidParams(ws.paths, lora));
+  CHECK_NOTHROW((void)engine->Generate(Ti2VidGen(ws.root + "/no_take")));
 }

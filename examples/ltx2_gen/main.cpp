@@ -206,10 +206,22 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "makes both required and stage 2 is a refinement the base weights were never\n"
       "distilled for; --upsampler is needed for stage 2 as on any two-stage recipe.\n"
       "The guidance flags above reach stage 1 and are IGNORED by stage 2, which runs\n"
-      "no guider at all -- unlike distilled_two_stage, which refuses them. ONE\n"
-      "divergence you cannot fix from the command line: upstream puts the distilled\n"
-      "adapter on stage 2 alone and leaves stage 1 on the base weights, and this\n"
-      "engine fuses adapters once at load, so stage 1 sees it too (issue 1118).\n");
+      "no guider at all -- unlike distilled_two_stage, which refuses them. The\n"
+      "distilled adapter rides stage 2 ALONE, as upstream does: stage 1 runs the base\n"
+      "weights and the engine rebinds the DiT at the phase boundary.\n\n"
+      "TWO-STAGE TEXT/IMAGE-TO-VIDEO is the plain two-stage arm.\n"
+      "--pipeline-kind ti2vid_two_stage selects it: stage 1 generates at HALF the\n"
+      "requested resolution under full CFG on the UNADAPTED model, on a schedule\n"
+      "derived from the step count, and stage 2 upsamples 2x and refines with the\n"
+      "distilled three-sigma schedule and no guider. --lora is REQUIRED at load, as\n"
+      "upstream's --distilled-lora is, and --upsampler is needed for stage 2. There\n"
+      "is NO --audio-path here: the soundtrack is generated, and the audio.wav you get\n"
+      "back is STAGE 1's, because upstream refines the picture only and discards\n"
+      "stage 2's audio. --width and --height describe the FINAL output and must\n"
+      "divide 64, since stage 1 halves them. Upstream runs this on the FULL\n"
+      "(non-distilled) transformer; pointing it at a distilled checkpoint renders a\n"
+      "plausible clip on a trajectory those weights were never trained for, and\n"
+      "nothing in the output says so.\n");
   std::exit(code);
 }
 

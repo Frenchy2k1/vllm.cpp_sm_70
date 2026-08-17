@@ -3269,8 +3269,8 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Twenty** pairs
-resolve, derived from `ResolveLtx2PipelineRecipe`:
+schedule or guidance scale renders a video instead of failing. **Twenty-four**
+pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 
 | `pipeline_kind` | resolving `model_version` | what it also needs |
 |---|---|---|
@@ -3282,6 +3282,7 @@ resolve, derived from `ResolveLtx2PipelineRecipe`:
 | `retake` | 2, 2.5 | a source clip as a `frame_%06d.ppm` directory |
 | `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
 | `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
+| `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3370,7 +3371,7 @@ Three things this kind demands, each refused by name rather than defaulted:
 | What | Why | Where upstream says so |
 |---|---|---|
 | `--audio-path` on **every** request | the pipeline is "denoise video around this take"; without one the soundtrack is generated and the clip looks finished | `--audio-path` is `required=True`, `a2vid_two_stage.py:312-317` |
-| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1153` |
+| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1155` |
 | `--upsampler` | stage 2's input is the upsampled stage-1 latent | `a2vid_two_stage.py:261` |
 
 `--audio-start-time` and `--audio-max-duration` window the take; the window
@@ -3421,6 +3422,73 @@ is a per-generation extra and `/v1/videos` forwards none
 ([#928](https://github.com/mudler/vllm.cpp/issues/928)), so every request to such
 a server is refused for the missing take. This kind is reachable from the C API
 and from `ltx2-gen`, and not over HTTP.
+
+### `ti2vid_two_stage`: the plain two-stage pipeline
+
+`TI2VidTwoStagesPipeline` — upstream's ordinary text/image-to-video two-stage
+arm. Stage 1 generates at HALF the requested resolution under classifier-free
+guidance on the **unadapted** model; stage 2 upsamples the latent 2x and refines
+it with the distilled adapter on a frozen three-sigma schedule and no guider.
+
+```sh
+ltx2-gen \
+  --pipeline-kind ti2vid_two_stage \
+  --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
+  --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
+  --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
+  --prompt 'a hot-air balloon over a wheat field at dawn' \
+  --height 704 --width 1216 --num-frames 121 --steps 30 \
+  --output-dir out/
+```
+
+`--lora-path` is **required** and the load is refused without it, mirroring
+`--distilled-lora required=True`. The adapter is the same
+`ltx-2.5-22b-distilled-lora-450-bf16.safetensors` the audio-to-video section
+pins by content above. There is **no** `--audio-path`: this pipeline generates
+its soundtrack, and the take that leaves is **stage 1's** — stage 2 refines the
+picture only and its audio is discarded, which is upstream's own behaviour.
+
+Height and width describe the FINAL output and must divide 64, because stage 1
+halves them and the result still has to land on the VAE's 32-pixel grid. A size
+that does not divide is refused rather than rounded.
+
+**Against the neighbouring kinds.** It is not `distilled_two_stage`, which
+builds one stage set, freezes stage 1's sigmas and gives 2.5 the ancestral
+stepper. It is not `res2s_two_stage`, which puts the adapter on **both** stages
+and runs the second-order sampler at 15 steps. And it differs from
+`a2vid_two_stage` in three fields: no take is required, the audio guider is the
+parameter table's row rather than the positive-only default, and the soundtrack
+comes from stage 1.
+
+**One behaviour is unique to this kind.** Its stage-1 sigma shift is fitted on
+the scheduler's fixed 4096-token anchor rather than on the target latent grid,
+because upstream calls `execute(steps=...)` with no latent. Every other derived
+arm in this engine still fits on the target grid, which for six of upstream's
+seven scheduler calls is a divergence
+([#1150](https://github.com/mudler/vllm.cpp/issues/1150)); `res2s_two_stage` is
+the one arm where the target grid is correct.
+
+**Which weights this was gated against: reduced CPU fixtures, and nothing else.**
+Upstream runs this pipeline on the FULL model
+(`ltx-2.5-22b-dev-transformer-bf16.safetensors`, 42,018,190,584 bytes, 4349
+tensors, 21.004 B parameters, pure BF16, `model_version` `2.5.0`), which is on
+the NAS and header-verified, and which `LTX25-BF16-DIT`
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)) made loadable. **What
+is owed is the run**: a comparison against upstream's own render on the same
+checkpoint, prompt and seed. Nothing here has been measured against it. Do
+**not** substitute a distilled transformer to try the arm out — the distilled
+scales are trained into those weights, so a CFG-guided stage 1 on top samples a
+trajectory they were never trained for and renders a plausible clip with nothing
+in its size, frame count, sample rate or errors to show it
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
+
+All three knobs this arm needs are LOAD extras, so a server supplies them with
+`--video-extra pipeline_kind=ti2vid_two_stage` and the same for `lora_path` and
+`upsampler_path`. Unlike `a2vid_two_stage` it needs no per-generation extra, so
+[#928](https://github.com/mudler/vllm.cpp/issues/928) does not stand in the way
+of `/v1/videos`. That is a statement about the request surface: the gated path
+is `vllm_video_engine_load` plus `vllm_video_generate`, which is what `ltx2-gen`
+drives, and no test here exercises the HTTP route end to end.
 
 ### Retake: regenerating a time window of an existing clip
 

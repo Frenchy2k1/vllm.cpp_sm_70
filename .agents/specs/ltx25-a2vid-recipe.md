@@ -112,7 +112,7 @@ Recipe-level fields:
 | `video_output_phase` / `audio_output_phase` | 1 | `:299` decodes `video_state.latent` after stage 2 |
 | `allow_request_latents` | false | `:229-297` construct every `ModalitySpec` from pipeline state; no request latent surface exists |
 | `requires_audio_input` | true | `--audio-path` `required=True` at `:312-317` |
-| `requires_distilled_lora` | true | `--distilled-lora` `required=True` at `utils/args.py:1140-1153` |
+| `requires_distilled_lora` | true | `--distilled-lora` `required=True` at `utils/args.py:1140-1155` |
 
 **Which versions.** All four this table KEYS — `2`, `2.3`, `2.4`, `2.5` —
 mirroring the `t2a_one_stage` rows and for the same reason:
