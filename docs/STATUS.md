@@ -46,6 +46,25 @@ Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
    (real 35B activations, incl. 6-concurrent × 16-token greedy). Marlin was
    sm_75+ and bf16-WMMA sm_80+ (Volta has no bf16 MMA), so Volta tensor cores
    are now engaged on the expert path too.
+6. **Wider-head paged attention — GREEN.** Decode/prefill head_dim widened to
+   {64,128,192,256}; V100 dev-vs-ref 2.00e-5 (192) / 1.74e-5 (256); suite 5/5? no —
+   `test_sm70_fa2_decode` 5/5 SUCCESS. Commit `59c0d05a`.
+7. **y-dg-sync (graph-capture safety) — GREEN.** sm70 decode proven replayed
+   inside a CUDA graph bit-identically to eager (dev 0.000e+00); gates out any
+   host-sync leak into the captured steady-state decode. Commit `cd5b2782`.
+
+## Multi-device / TP status (2026-08-12)
+
+- vllm.cpp engine is a **single-worker, tp_size==1** runner: `qwen3_*` model
+  class treats tp_size as a no-op ("tp_size==1 ⇒ whole tensors + all-reduce
+  identity"). TP in the fork that ran -tp4 on the V100 was **upstream 1Cat-vLLM**,
+  not this engine.
+- NCCL TP transport exists (`vt/cuda/nccl_communicator.cu`, PORTED 1:1) but is
+  build-gated `VLLM_CPP_NCCL` (our build is **OFF**) and is infrastructure only,
+  not wired into a multi-worker runner.
+- **Next phase: multi-device TP on sm70.** Volta is NOT the blocker (NCCL +
+  per-shard sm70 kernels are fine); the work is a real build (enable
+  `VLLM_CPP_NCCL`, NCCL lib on the box, runner slice/all-reduce wiring).
 
 ## Known near-tie / caveats
 
@@ -58,6 +77,10 @@ Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
 
 ## Next
 
-1. GEMM-family op-consumer hookup out of the paged decode head (Phase-4).
-2. Wider-head `fused_mma_forward_paged` superset; y-dg-sync coverage.
-3. Ada semantic oracle (`oracle-ada`, `55596792…`) when an Ada host is available.
+1. **Multi-device TP on sm70 (in progress).** Enable `VLLM_CPP_NCCL` in the
+   build, bring NCCL onto the box, wire the runner slice + all-reduce/all-gather
+   so -tp>1 works across the 4×V100. Volta-gen networks fine; the kernels are
+   already per-shard.
+2. Ada semantic oracle: `oracle-ada` at `55596792…` (Dockerfile updated for the
+   24.04 PEP-668 base AND the cu128 torch pin — driver-capped, no driver change)
+   when an Ada host is available.
