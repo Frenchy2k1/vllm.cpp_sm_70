@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/weight_offloader.h"
+#include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
@@ -57,15 +59,97 @@ namespace fs = std::filesystem;
 // a failure to serve the named device PROPAGATES instead of falling back to
 // CPU (mirror of vLLM never substituting an explicitly named device,
 // vllm/config/device.py:61-66).
-vt::Queue SelectQueueForModel(std::string_view architecture,
-                              vllm::Device device) {
+namespace {
+
+// The auto arm of the resolution below, WITHOUT creating a queue. Extracted so
+// the queue selector and the load-time device-fit refusal (issue #1123) read one
+// description of "which device will this model run on" rather than two that can
+// drift. May throw, exactly as `CurrentPlatform()` can, and every caller keeps
+// the try/catch the original code had around it.
+vt::DeviceType AutoAcceleratorDeviceType(std::string_view architecture) {
+  const vllm::platforms::Platform& plat = vllm::platforms::CurrentPlatform();
+  const vt::DeviceType dev = plat.device_type();
+  // A PARTIAL backend (Metal today: 15 of 75 ops) must be able to decline a
+  // model whose kernels it has not registered. The default answer is `true`,
+  // so CUDA and CPU selection is byte-unchanged.
+  if (dev != vt::DeviceType::kCPU &&
+      (architecture.empty() || plat.supports_model_architecture(architecture))) {
+    return dev;
+  }
+  return vt::DeviceType::kCPU;
+}
+
+// The AUTO arm, resolved by ATTEMPTING the queue. One implementation, so
+// `ResolveModelDeviceType` and `SelectQueueForModel` cannot answer differently.
+//
+// Asking `CurrentPlatform()` alone is not enough, and #1136 measured why. This
+// arm has always fallen back to CPU when `CreateQueue()` throws — "a platform can
+// be registered while CreateQueue still fails, and CPU must remain reachable" —
+// so on such a box a platform query answers `kCUDA` while the load runs on the
+// CPU queue. The load-time device-fit refusal reads the query, and it therefore
+// refused a checkpoint by naming a device nothing was going to run on, removing a
+// load that previously served on CPU. Whether `CreateQueue()` fails is knowable
+// only by calling it, so it is called here, once, and the queue goes to whichever
+// caller wants one.
+struct AutoDeviceResolution {
+  vt::DeviceType device = vt::DeviceType::kCPU;
+  // Set exactly when `device != kCPU`: the queue whose creation PROVED it.
+  std::optional<vt::Queue> queue;
+};
+
+AutoDeviceResolution ResolveAutoDevice(std::string_view architecture) {
+  AutoDeviceResolution out;
+  try {
+    const vt::DeviceType dev = AutoAcceleratorDeviceType(architecture);
+    if (dev != vt::DeviceType::kCPU) {
+      // Order matters: `device` is set only AFTER the queue exists, so a throw
+      // leaves the CPU answer rather than a device nothing can serve.
+      vt::Queue q = vt::GetBackend(dev).CreateQueue();
+      out.queue = q;
+      out.device = dev;
+    }
+  } catch (const std::exception&) {
+    // No usable accelerator; CPU, which is what this arm has always returned.
+  }
+  return out;
+}
+
+}  // namespace
+
+vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
+                                      vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(device));
-    const vt::DeviceType resolved = LoadedEngine::ResolveExplicitDeviceType(
+    // Propagates for an explicitly named absent device, which is the refusal
+    // vllm/config/device.py:61-66 mirrors and must not be swallowed here.
+    return LoadedEngine::ResolveExplicitDeviceType(
         device, named_platform == nullptr
                     ? std::nullopt
                     : std::optional{named_platform->device_type()});
+  }
+  AutoDeviceResolution resolved = ResolveAutoDevice(architecture);
+  // The queue was created only to learn whether it CAN be created. `vt::Queue` is
+  // a NON-OWNING handle (a raw `cudaStream_t`) with no destructor, so dropping the
+  // value would leak the stream.
+  //
+  // Through the FREE `vt::DestroyQueue`, not `Backend::DestroyQueue`: that is what
+  // this file's only other queue teardown does (`load_queue`, below), it is what
+  // `vt/backend.h` asks of new code so device index and queue cleanup are never
+  // ambient, and it adds the `Synchronize` and the handle/id clearing the method
+  // does not. The CREATE side deliberately stays `GetBackend(...).CreateQueue()`,
+  // because that is the call this arm has always made and switching it would move
+  // the production queue-selection path onto the drop-in resource ABI — a
+  // behaviour change, which this repair is not.
+  if (resolved.queue.has_value()) vt::DestroyQueue(*resolved.queue);
+  return resolved.device;
+}
+
+vt::Queue SelectQueueForModel(std::string_view architecture,
+                              vllm::Device device) {
+  if (device != vllm::Device::kAuto) {
+    const vt::DeviceType resolved =
+        ResolveModelDeviceType(architecture, device);
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -83,24 +167,14 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
   // the single line that stood between the Metal backend and running a model.
   // It now asks the PLATFORM seam, which is the tree's own answer to "which
   // device is this process running on": CurrentPlatform() walks
-  // {kCUDA, kXPU, kVULKAN, kMETAL, kCPU} and returns the first whose backend
-  // actually probed a device (src/vllm/platforms/platform.cpp:38-40), so on a
-  // CUDA box this selects EXACTLY the queue the old code did, byte for byte,
-  // and on the M4 it selects Metal. The try/catch stays: a platform can be
+  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU} and returns the
+  // first whose backend actually probed a device
+  // (src/vllm/platforms/platform.cpp:91-98), so on a CUDA box this selects
+  // EXACTLY the queue the old code did, byte for byte, and on the M4 it selects
+  // Metal. The try/catch stays, now inside `ResolveAutoDevice`: a platform can be
   // registered while CreateQueue still fails, and CPU must remain reachable.
-  try {
-    const vllm::platforms::Platform& plat = vllm::platforms::CurrentPlatform();
-    const vt::DeviceType dev = plat.device_type();
-    // A PARTIAL backend (Metal today: 15 of 75 ops) must be able to decline a
-    // model whose kernels it has not registered. The default answer is `true`,
-    // so CUDA and CPU selection is byte-unchanged.
-    if (dev != vt::DeviceType::kCPU &&
-        (architecture.empty() || plat.supports_model_architecture(architecture))) {
-      return vt::GetBackend(dev).CreateQueue();
-    }
-  } catch (const std::exception&) {
-    // No usable accelerator; fall through to CPU.
-  }
+  AutoDeviceResolution resolved = ResolveAutoDevice(architecture);
+  if (resolved.queue.has_value()) return *resolved.queue;
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 
@@ -1313,7 +1387,36 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // Resolve before tokenizer/weight work so unsupported architecture errors
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
-    (void)ModelRegistry::Resolve(config);
+    const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
+    // device, here, before any weight I/O and before the tokenizer.
+    //
+    // `Qwen3.8-2.4T-A95B UD-Q1_0` (369.96 GiB) reached a serving state on
+    // `--device cuda` on a 119.631 GiB GB10 after 26 minutes and then died on
+    // the FIRST forward with `vt cuda: cudaMalloc: out of memory`. The load
+    // succeeds because a keep-quant expert tower is BORROWED from this mapping
+    // and costs zero anonymous bytes; the forward dies because a
+    // weight-staging device copies each tower into device memory
+    // (`ResidentWeight`, qwen3_5.cpp:1011 -- 276 towers of 1,275,068,416
+    // bytes plus 3 of 2,818,572,288, so 335.62 GiB). Loading for 26 minutes and dying
+    // mid-stream is the worst of the available behaviours.
+    //
+    // Placed AFTER Resolve so an unsupported-architecture error keeps its
+    // priority and the error ordering this branch documents is unchanged, and
+    // BEFORE the tokenizer and the weights because everything after this point
+    // is the cost the refusal exists to avoid paying. The predicate lives in
+    // `gguf_device_fit.h`; it decides nothing on a platform that does not stage
+    // weights (every CPU load) and nothing when no budget is known.
+    {
+      const platforms::Platform& target = platforms::GetPlatform(
+          ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      const DeviceWeightFit fit = CheckDeviceWeightFit(
+          gguf, vt::DeviceTypeName(target.device_type()),
+          target.needs_weight_staging(),
+          DeviceWeightBudgetBytes(
+              target.residency_policy().device_memory_total_bytes));
+      if (fit.refuse) throw std::runtime_error(fit.message);
+    }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
     // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
     // branch's inline `IsDenseArch` split is superseded by
