@@ -1,98 +1,56 @@
-# vllm.cpp status
+# Milestone-0 Status — Parity pin (sm70-support)
 
-This page records the current lifecycle state of the public product surfaces.
-Use [Features](FEATURES.md) for supported capabilities and
-[Benchmarks](BENCHMARKS.md) for measured performance. Model-specific commands,
-checkpoints, and limitations are in the [model guides](models/README.md).
+Date: 2026-08-12
+Branch: `sm70-support`
+Silicon: 4× **Tesla V100-DGXS-32GB, compute_cap 7.0** (`192.168.10.20`, Ubuntu 24.04.4) — sm70 premise confirmed directly via `nvidia-smi --query-gpu=name,compute_cap`.
 
-The internal matrices remain the detailed records for contributors:
+## The two-oracle contract (plan §2.5)
 
-- [Engine and serving matrix](../.agents/engine-matrix.md)
-- [Model matrix](../.agents/model-matrix.md)
-- [Backend matrix](../.agents/backend-matrix.md)
-- [Kernel matrix](../.agents/kernel-matrix.md)
-- [Feature matrix](../.agents/feature-matrix.md)
+| Lane | Reference | Model / route | Grade |
+|---|---|---|---|
+| same-silicon | 1Cat-vLLM 1.2.2 (V100) | `Qwen3.6-27B-AWQ`, TP4 | SEMANTIC / near-tie (AWQ INT4 ≠ NVFP4) |
+| semantic | pinned vLLM 0.26.0 `55596792…` (Ada) | `Qwen2.5-3B-Instruct` (`oracle-ada`) | SEMANTIC, never STRICT |
+| impl token-exact | this repo | `nvidia/Qwen3.6-35B-A3B-NVFP4` @ `491c2f1e…` | same-model engine gate |
+| impl token-exact | this repo | `unsloth/Qwen3.6-27B-NVFP4` @ `890bdef7…` | dense forward gate |
 
-Git history, row specs, the [parity ledger](../.agents/parity-ledger.md), and
-[completed state events](../.agents/completed/state-events/) retain the dated
-implementation and verification record.
+Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
+**different quant routes** — parity is graded at the semantic / near-tie level
+(token-string greedy + per-position argmax), **not** bit-exact logits.
 
-## Parity pin
+## Measured results (all on the V100, this session)
 
-The primary reference is vLLM 0.26.0.dev0 at `555967922`, with transformers
-5.14.1. The [upstream sync record](../.agents/upstream-sync.md) owns the exact
-pin, comparison scope, and changes since the previous reference.
+1. **35B engine gate — GREEN.** `test_qwen36_paged_engine`, full paged
+   LLMEngine stack (`FromModelDir` → prefill → KV → decoder → Sampler) greedily
+   decodes the pinned 35B-A3B-NVFP4 and reproduces the golden **token-for-token**:
+   `315/315` assertions pass, `Status: SUCCESS!`.
+2. **27B dense forward gate — prefill-exact, tok6 near-tie.** `test_op_parity
+   -tc="qwen27 dense logits*"` on `unsloth/Qwen3.6-27B-NVFP4`:
+   - per-position prefill `argmax_match = 9/9` (dense `ForwardDense` == oracle);
+   - greedy `6/16` then the **tok6 near-tie** — emulation side (`271` "\\n\\n")
+     vs the golden's native side (`198` "\\n"). The production W4A4 GEMM
+     (`VT_CUTLASS_NVFP4`, sm_90+) that would select the native side is absent by
+     design in the sm_70 build; on sm_70 our hand W4A4 kernel is the legitimate
+     answer. Recorded as a near-tie, not a defect.
+3. **27B-AWQ oracle capture — deterministic.** 8-prompt × 3-run greedy battery
+   (T=0, `enable_thinking:false`) from the live 1Cat server:
+   `tests/parity/goldens/qwen36_27b_awq_oracle/{trace,meta,prompt_ids}.*`
+   committed `39d89189`, `24/24` rows identical across runs (no near-ties in
+   battery). Comparator: `.agents/compare-oracle-impl.py` (smoke: oracle-vs-itself
+   = 8 exact / 0 diverged).
+4. **Decoder binaries** built+verified on the box: `test_qwen36_paged_engine`
+   (57 MB), `test_qwen2_paged_engine` (57 MB), `test_op_parity`.
 
-Correctness claims use the pinned oracle and the gate named by the owning row.
-Measurements against an older pin remain attributed in
-[Benchmarks](BENCHMARKS.md); they do not become current measurements after a
-pin advance.
+## Known near-tie / caveats
 
-## Capability status
+- 27B tok6 tie (`198` vs `271`): native side requires the production CUTLASS
+  build; sm_70 hand kernel yields the emulation side. Do not "fix" by special-casing.
+- Quant routes differ by design: AWQ(INT4) oracle vs NVFP4 impl — compare
+  semantically, never logit-exact.
+- Decoder dequant/upload is a slow single-thread host-side path (perf item, not
+  correctness).
 
-The project uses these lifecycle terms:
+## Next
 
-| State | Meaning |
-|---|---|
-| Correctness-complete | The declared correctness gate passes against the pinned oracle |
-| Speed-pending | Correctness passes, but one or more performance axes remain open |
-| Partial | A usable path exists with named missing behavior or evidence |
-| Build-only | The target compiles, but this project has no runtime proof on that hardware |
-| Hardware-blocked | The required hardware is not currently available for the gate |
-| Inventoried | The gap has a stable record but no accepted implementation |
-
-### User-facing surfaces
-
-| Surface | Current state | Open gate or limitation |
-|---|---|---|
-| Text generation | Correctness-complete on the gated model paths | Performance remains checkpoint-, model-, backend-, and concurrency-dependent |
-| OpenAI server | Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending | Some vLLM endpoints, pooling paths, and multimodal server paths remain incomplete |
-| C ABI and C++ library | Available | The C ABI is the stable public embedding surface; internal C++ headers are not ABI-stable |
-| Continuous batching, chunked prefill, prefix caching, and recompute | Available on the documented engine paths | Some hybrid-cache modes and scheduling policies still need broader gates |
-| Quantized inference | Available for the formats and backends listed in Features | Block-wise FP8 matches the CPU reference on seven GB10 shapes, but has no model token gate or speed result; unsupported format/backend pairs refuse or fall back as documented (#1437) |
-| Speculative decoding | Partial | DFlash2's CORRECTNESS GATES have READ against vLLM at PR head `66e5414c`: 4/4 prompts token-exact, 45/47 draft blocks byte-identical, and acceptance IDENTICAL per prompt on both engines -- the acceptance figure being a corollary of the draft result on that capture rather than a second measurement. That pull request has since MERGED, so the gate head is one merge behind vLLM's main and re-reading the gates there is owed (#1561). The block-count cross-check behind those figures rests on a boundary case that is committed but whose mutation was never run, so it is unproven (#1314). The published Q4_K_M GGUF drafter now loads for real through the command-line client and drafts. Greedy only, still no throughput number, and a GGUF drafter is dequantized to bf16 at load, so the small file saves disk and not memory (#1314) A preference-ordered DRAFTER CHAIN has its FIELD but no behaviour (`SPEC-DRAFTER-CHAIN`, #1522): `--speculative-config` now accepts `vllm_cpp.drafter_chain`, an additive list of speculator entries that is parsed, validated and refused by name, and a well-formed chain is refused at the loader before any weight I/O because nothing resolves one yet. With the field absent every document vLLM accepts keeps its meaning KEY FOR KEY; the one visible delta is that the accepted-key list quoted in an unknown-key refusal now also names `vllm_cpp`. |
-| Image, video, audio, speech, music, and diffusion models | Partial by model | LTX-2.5 validates declared checkpoint class; its video VAE convolution routes through `vt::Conv3d`, but the CUDA arm has not run on a GPU and other decode stages remain on the host (#1007, #1451, #1452). The DFR pipeline and its temporal rounds are gated on reduced-dimension fixtures only, because no `keyframe_slot_sft` base is published, and the unclamped tiling arm is ungated (#986, #1137, #1493). MiniMax-Music3 synthesises 20 s at 30 steps in 449.969 s on one Jetson Thor after its attention kernel took FlashAttention-2's query-tile decomposition: same binary, alternated arms, wall 1.3234x, the DiT bucket 1.6461x and `dit.attn` itself 8.607x, the DiT falling from 62.4 % of the run to 50.2 %, with all six gate mutations red and the six consumer suites green on the device (#672, #1512, #1555). The LTX-2.5 DiT self-attention now routes to the flash-tiled op; one forward at 768x448/49f measures 7.680 s on GB10 (n=19), but the same-binary A/B is `PENDING` because the naive arm never ran, and there is no pixel gate at production geometry. That routing serves the bf16 stream the model renders in; the f32 L2 parity arm is reduced-dimension only and now refuses by name at production geometry rather than running slowly (#1549, #1612) |
-| Prompt tokenization | Correctness-complete on the gated tokenizer families; the merge loop is no longer quadratic in pretoken length, fixed (#1365) | 320 of 320 ids match HF `tokenizers` 0.22.2 on both goldens. A merge naming a token absent from its vocabulary is refused at load, `tokenizer.json` and GGUF alike. No byte-length bound before tokenization (#1541) |
-| Distributed execution | Inventoried or partial by lane | Tensor, pipeline, data, and expert parallel coverage is not a general shipped promise |
-| LoRA and adapters | Partial | The standalone implementation is not a general server-integrated capability |
-
-The [Features table](FEATURES.md) is the current keyed capability projection.
-It lists each supported architecture, quantization format, backend, and serving
-feature once. The [Usage index](USAGE.md) links each runnable workflow.
-
-### Backends and releases
-
-| Surface | Current state | Open gate or limitation |
-|---|---|---|
-| CPU | Correctness and continuous-integration reference | Performance depends on architecture and quantization; current comparisons are in Benchmarks |
-| CUDA GB10 (`sm_121a`) | Runtime-gated | Other CUDA architectures can be build-supported without a runtime gate |
-| CUDA Thor (`sm_110`) | Runtime proof exists for the documented portable path | Fast fp8, fp4, CUTLASS, Marlin, and FlashAttention paths are not implied |
-| Metal | Partial runtime support on Apple Silicon | Only the operations and models listed in Features are covered |
-| Vulkan | Partial runtime support | The documented OPT and Qwen gates define the proved scope |
-| ROCm | Build and focused community test evidence | Model and oracle runtime gates remain open |
-| Tenstorrent Blackhole | Active, partial runtime support | Host-free decode fidelity rerun passed (#1476 fixed); the paged-engine golden re-adjudication (#1488) and the performance path remain open |
-| Intel XPU | Hardware-blocked | No accepted runtime gate |
-
-The eight v0.0.2 server bundles are published; Windows v0.0.3-pre.1 remains
-pending. The
-[release reference](RELEASES.md) owns artifact names, checksums, provenance,
-and verification instructions. Windows ZIP downloads do not exist while the
-hosted runtime, merged-SHA dry run, prerelease publication, and 32-asset audit
-remain pending.
-<!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
-
-## Not supported yet
-
-The following areas do not have a general supported path:
-
-- automatic memory sizing and a complete preflight memory bound;
-- external LMCache-compatible KV transport as a fully gated deployment path;
-- complete tensor, pipeline, expert, and data parallel execution;
-- every vLLM model, endpoint, plugin group, and structured-output mode;
-- every quantization format on every backend;
-- runtime proof for every architecture that the build accepts;
-- complete end-to-end multimodal serving for every registered multimodal model.
-
-An absent item is not an implied refusal or promise. Check the
-[Feature matrix](../.agents/feature-matrix.md) and
-[Engine matrix](../.agents/engine-matrix.md) for inventoried work and its owner.
+1. GEMM-family op-consumer hookup out of the paged decode head (Phase-4).
+2. Wider-head `fused_mma_forward_paged` superset; y-dg-sync coverage.
+3. Ada semantic oracle (`oracle-ada`, `55596792…`) when an Ada host is available.
