@@ -236,6 +236,69 @@ environment:
     `EngineCore failed to start`. Export **`CC=/usr/bin/gcc`** alongside the documented
     `ninja` PATH fix and it runs. The `vllm-oracle` symlink still points at the 0.25.0
     rollback rather than the pin (issue #375, open).
+  - **★ `CC=/usr/bin/gcc` is STALE for the reimaged host, and the correction is to
+    run the oracle IN A CONTAINER (2026-08-17, `SPEC-MTP-K-GT-1`).** The bullet above
+    is right about the failure and wrong about the cure on this host. Measured on
+    `kairos-17dd`: there is no `gcc`, no `cc`, no `clang`, no `ninja` and no `nvcc`
+    anywhere on the host, and `/usr/include` carries neither `stdio.h` nor
+    `python3.12/Python.h`, so there are no glibc headers and no crt objects either.
+    Exporting `CC=/usr/bin/gcc` therefore names a file that does not exist. Triton
+    3.7.1 in the pinned venv ships only `ptxas`/`cuobjdump`/`nvdisasm`, no C
+    compiler, so nothing in the venv supplies one.
+    **What this looks like if you do not know it:** the weights load, the engine
+    then dies `RuntimeError: Failed to find C compiler`, and vLLM reports
+    `Engine core initialization failed. See root cause above. Failed core proc(s): {}`.
+    That is an INSTRUMENT failure wearing the shape of a verdict about the model.
+    Do NOT reach for `enforce_eager` to get past it: it is forbidden as a
+    denominator, and it would silently change the thing being measured.
+    **The cure**, and the shape `~/rs35b/run_oracle.sh` already used: run the host
+    venv inside `nvidia/cuda:13.0.1-devel-ubuntu24.04` with
+    `python3 python3-dev ninja-build build-essential libnuma1` installed, `-v
+    $HOME:$HOME`, `CC=/usr/bin/gcc` and `/usr/local/cuda/bin` on `PATH`. The image
+    ships python **3.12.3**, which matches the venv's `pyvenv.cfg` exactly, so the
+    HOST venv resolves inside the container. Bake the toolchain into an image
+    (`~/mtpgate/Dockerfile.oracle`, `mtpgate-oracle:1`) rather than `apt-get`ing it
+    per leg: a leg that must reach the network to start can fail for a reason that
+    has nothing to do with the measurement. Assert `gcc` and `ninja` INSIDE the
+    container before the model loads, so a broken image aborts by name instead of
+    four minutes later as an engine error. Container egress WAS available on
+    2026-08-17; the box has been recorded without it before, which is the argument
+    for baking rather than installing.
+    **★ AND THE PINNED ORACLE CANNOT CURRENTLY LOAD A 27B HERE AT ALL: it eats the
+    WHOLE MACHINE in the step after `torch.compile`, and `gpu_memory_utilization`
+    does NOT control it.** Measured the same day, once the toolchain fix let an
+    oracle get that far for the first time. At `gpu_memory_utilization=0.75` the
+    engine held about **110 GiB of HOST RAM** while `nvidia-smi` reported only
+    26 GiB on the device, hung 45 minutes at loadavg **260** with **0 GiB
+    available**, and `sshd` stopped completing a banner exchange while the box
+    still answered ICMP. Killing the container took it from 118 of 119 GiB used to
+    4 of 119 in under ten seconds.
+    **The obvious attribution to that 0.75 was tested and REFUTED.** A second run
+    at **0.30**, with a 5-second host-memory sampler running, collapsed the same
+    way: `avail_mb` 87683 at 09:00:47 and **0** at 09:02:25, loadavg 1.19 to 39.90.
+    Weight loading finished with 66 GiB free and `torch.compile` finished with
+    88 GiB free, so the collapse is neither of those. It is the step immediately
+    AFTER compilation and it is insensitive to the KV-pool fraction, which points
+    at the profiling forward and the graph capture (`max_num_batched_tokens=8192`,
+    `cudagraph_capture_sizes: [1, 2, 4, 8]`, every allocation host-backed here).
+    **That last part is a hypothesis with a located step, not a result.** Vary
+    those one at a time with the sampler running and believe nothing without an
+    A/B. **The 0.75 run THRASHED for 42 minutes and survived (`boot_id` and
+    `uptime` unchanged); the 0.30 run REBOOTED THE BOX** — `boot_id` moved
+    `5bbdc432…` to `bd5c6e7a…` and `journalctl --list-boots` shows boot `-1`
+    ending 09:10:15Z against boot `0` beginning 09:13:55Z. So a lower fraction is
+    NOT a safety margin: assume the box is at risk on every attempt. Always run a
+    `MemAvailable` sampler beside any load here; `nvidia-smi` is blind to all of
+    it, and the sampler is what turned a 45-minute mystery into a timestamped
+    100-second collapse. While sshd was answering intermittently one connection
+    returned `Permission denied (publickey)`; that is a memory-pressure artefact,
+    not a credential problem, and the same key worked seconds after the reboot.
+    **A cleanup trap is not a stop button.** Both DGX drivers used
+    `trap cleanup EXIT INT TERM` where `cleanup` resets the clocks and RETURNS, so
+    `SIGTERM` reset the clocks and the script then started its NEXT leg on a box
+    with no memory left. Put an `exit` on the signal path, and `docker kill` the
+    current named container inside the handler: `timeout` signals `docker run`, and
+    the container outlives it.
   - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
     DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
     install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import

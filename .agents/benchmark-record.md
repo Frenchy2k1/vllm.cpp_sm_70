@@ -22255,3 +22255,127 @@ and cannot hold a 370 GiB checkpoint, and three earlier attempts on that box wer
 OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. Tracked under
 `## Owed` in [`expert-streaming.md`](specs/expert-streaming.md). No new
 performance number is claimed by the repair that produced this retraction.
+
+## SPEC-MTP-K-GT-1 — the k>1 depth arms re-measured in ONE uncontended window (throughput VOID lifted); the vLLM leg failed on a HOST TOOLCHAIN gap, not on the model (2026-08-17, `row/SPEC-MTP-K-GT-1-DGX`, GB10 sm_121, #81 M1)
+
+Third DGX pass. `dgx.casa` was clean for the first time in three passes: no
+compute apps, no containers, mutex free, 115 GiB of 119 available, loadavg 0.16.
+
+**Window 1 (`WINDOW_RC=0`, 07:15:27Z to 07:47:55Z, boot_id `5bbdc432`).** All
+three device preconditions passed on the acquire, clocks pinned at 2100, trap
+reset them. Seven arms, every one exit 0:
+
+| Leg | Exit | loadavg at start |
+|---|---|---|
+| `ours_off` | 0 | 0.16 |
+| `ours_on_k2` | 0 | 1.86 |
+| `ours_on_k3` | 0 | 1.77 |
+| `ours_on_k4` | 0 | 1.53 |
+| `padded_k2` | 0 | 1.19 |
+| `padded_k3` | 0 | 1.61 |
+| `padded_k4` | 0 | 1.86 |
+
+`ours_on_k2` per-depth: `SPEC_DEPTH 0 proposed=197 accepted=173 rate=0.878173`,
+`SPEC_DEPTH 1 proposed=197 accepted=144 rate=0.730964`.
+
+**This LIFTS the VOID the first pass carried on `padded_k3`/`padded_k4`
+throughput.** That void existed because those arms started at loadavg 10.77 and
+20.41 while the real arms ran at 1.5 to 2.9, so the two sides were not
+comparable. Here all seven ran inside one window in a band of 0.16 to 1.86.
+
+**The ON/OFF divergence reproduced EXACTLY on independently generated streams**:
+1718 divergent positions, 18 adjudicable (first per arm and prompt), 3 distinct
+probe points; prompt 0 position 12 `79733`→`279`, prompt 1 position 1 `25`→`7318`
+at k=2, prompt 2 position 69 `15336`→`1727`, prompt 3 identical throughout. It is
+deterministic across sessions and boots, not a flake.
+
+**The adjudication and all four oracle legs FAILED, and neither failure is a
+verdict about the model.** The reimaged host carries NO C compiler: no `gcc`,
+`cc`, `clang`, `ninja` or `nvcc` anywhere, `/usr/include` without `stdio.h` or
+`python3.12/Python.h`, no crt objects, and a Triton 3.7.1 shipping only `ptxas`,
+`cuobjdump` and `nvdisasm`. Triton's JIT therefore died AFTER the weights loaded
+and vLLM reported `Engine core initialization failed. See root cause above.
+Failed core proc(s): {}`. A reader who did not open the traceback would have
+scored four `ORACLE_EXIT=1` legs as "the oracle cannot run this configuration".
+`enforce_eager` would have walked past it and was NOT used: it is forbidden as a
+denominator and this is the denominator. A second, independent caller defect hit
+the OFF leg only, which passed an empty `k` and died on `int('')`.
+
+**Window 2 proved the repair and then lost the box.** Queued at 07:35:04Z with
+`flock -w 21600`, BLOCKED on the mutex rather than jumping it, acquired 07:47:55Z
+in the same second window 1 released. Running the pinned venv inside a container
+carrying the toolchain gave `TOOLCHAIN gcc=13 ninja=1.11.1 CC=/usr/bin/gcc
+python=Python 3.12.3`, oracle identity `0.23.1rc1.dev1511+g555967922`, 6/6 arms
+loaded, and the engine passed the point that killed every window 1 leg into
+`torch.compile` (`Dynamo bytecode transform time: 20.80 s`). At approximately
+07:56Z the host stopped completing an SSH banner exchange while still answering
+ICMP, and had not returned when this entry was written.
+
+**The cause was then MEASURED.** The box returned at 08:38Z after about 42
+minutes and had NOT rebooted: `uptime` read `up 11:28` and `boot_id` was still
+`5bbdc432`, so this is the thrash case, not the documented OOM-reboot. It came
+back at `load average: 260.22` with 118 of 119 GiB used and 0 available, our
+container still up and still holding the mutex, 26147 MiB on the device, clocks
+still pinned. It was not progressing: `torch.compile` finished at 07:53:41 in
+122.46 s and the log did not advance for the 45 minutes after, stuck in the
+memory-profiling and KV-sizing step that follows. Its own timeout had fired,
+`ADJUDICATE_EXIT=124`, and `timeout` had signalled `docker run` while the
+CONTAINER outlived it.
+
+Killing our own container took the host from 118 of 119 GiB used to 4 of 119 in
+under ten seconds. **The engine was holding roughly 110 GiB of HOST RAM while
+`nvidia-smi` showed 26 GiB on the device.** That much is measured and stands.
+
+**The attribution to `gpu_memory_utilization=0.75` was then TESTED AND REFUTED.**
+`adjudicate.py` exposes `--gpu-mem-util` as an argument, so a third window ran the
+byte-identical instrument at **0.30**, with a 5-second host-memory sampler that
+window 2 had lacked. It collapsed the same way: `avail_mb` 87683 at 09:00:47 and
+**0** at 09:02:25, loadavg 1.19 to 39.90. Weight loading finished with 66 GiB
+free (`Loading weights took 170.12 seconds`) and `torch.compile` finished with
+88 GiB free (`took 118.96 s in total`), so the collapse is in NEITHER. Lowering
+the fraction bought a later start and changed nothing.
+
+What the A/B did buy is a tighter localisation: the step immediately AFTER
+compilation, insensitive to the KV-pool fraction, which points at the profiling
+forward and graph capture (`max_num_batched_tokens=8192`,
+`cudagraph_capture_sizes: [1, 2, 4, 8]`, all host-backed on GB10). **That is a
+hypothesis with a located step, not a result.** Vary those one at a time with the
+sampler running. No oracle leg in any pass has reached KV-cache allocation here,
+so nothing about this step had been exercised on this box before.
+
+**And the 0.30 run REBOOTED the box, which the 0.75 run did not.** Evidenced
+rather than inferred: `boot_id` moved `5bbdc432...` to `bd5c6e7a...` and
+`journalctl --list-boots` shows boot `-1` ending 09:10:15Z against boot `0`
+beginning 09:13:55Z. The lower fraction therefore did not merely fail to help,
+it did not prevent the worst outcome either: 0.75 thrashed 42 minutes and
+survived, 0.30 took the machine down. Treat every attempt here as at risk.
+
+State after the reboot, verified: mutex FREE, no containers, no compute apps,
+115 GiB available, loadavg 0.71, clocks at the boot default 208 MHz, 0 of our
+processes, and everything under `~/mtpgate/final/` intact.
+
+**A trap defect, found by watching it fail.** `SIGTERM` to the driver reset the
+clocks and the driver then started its NEXT leg on a box with no memory left,
+because `trap cleanup EXIT INT TERM` runs `cleanup` and returns without exiting.
+The chain needed `SIGKILL` and the container needed stopping separately. Both DGX
+drivers share this shape.
+
+Only our own processes were signalled. Final state verified: no matching
+processes, no containers, `fuser $HOME/gpu.lock` with no holders so the mutex is
+FREE, no compute apps, clocks reset (`nvidia-smi -rgc` reporting `All done.`),
+115 GiB available, loadavg falling 260 to 42.
+
+**Padded control, PAID at every depth in that one window.** Margin fixed at 0.10
+absolute before the run. Real depth-1 acceptance 0.730964 (k=2), 0.682635 (k=3),
+0.750000 (k=4); depth-2 0.538922 (k=3), 0.617647 (k=4); depth-3 0.507353 (k=4).
+Control 0.000000 at every depth >= 1 while its depth-0 rate MATCHES the real arm
+(0.892 to 0.925 against 0.868 to 0.878), which is what a control isolating
+columns >= 1 must look like. All six margins clear by +0.5074 to +0.7500.
+`compare.py`: **`CHECKS_RUN=21 CHECKS_FAILED=11 VERDICT=FAIL`** — 10 pass (three
+per-depth counter checks, six control margins, one token-production check), 3
+fail on the unadjudicated ON/OFF divergence and 8 on `arm missing` from the
+oracle that never produced a file.
+
+**No parity number is claimed and the token gate is still unclaimed.**
+`our-ON == our-OFF` remains FALSE and unattributed. Owed detail lives under
+`## Owed` in [`mtp-k-gt-1.md`](specs/mtp-k-gt-1.md).
