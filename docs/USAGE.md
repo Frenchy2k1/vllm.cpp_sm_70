@@ -862,8 +862,10 @@ existing key in place, so `--lora a --lora b` leaves one `lora_path` extra
 holding `b`, silently fuses `b`, and exits 0. Pass one adapter.
 
 The C ABI cannot reach it either, and that is the wider half of the finding:
-`ltx2_video.cpp:813` is the ONLY `dit_options.loras.push_back` in the tree and it
-runs at most once, under `if (!lora_path.empty())`. So `loras.size()` is 0 or 1
+`Ltx2VideoEngine::Load` carries the ONLY `dit_options.loras.push_back` in the
+tree and it runs at most once, under `if (!lora_path.empty())` — named by symbol
+rather than by line, because the line moved with #1118 and a stale anchor is what
+this paragraph already had to correct once. So `loras.size()` is 0 or 1
 on every production path — CLI, `vllm_video_engine_load` and the server alike —
 and the more-than-one refusal is reached only by `test_ltx2_lora`. It is correct
 code guarding a state nothing can currently construct, which is the shape
@@ -3301,14 +3303,40 @@ Three things this kind demands, each refused by name rather than defaulted:
 defaults to the clip's own duration. A take shorter than the clip is refused
 rather than padded, and a longer one keeps its leading frames.
 
-**One divergence, and it is not repairable from the request.** Upstream fuses
-the distilled adapter into stage 2 alone and leaves stage 1 on the base weights;
-this engine fuses adapters once at load, so stage 1 sees it too. Expect frames
-that differ from the ones upstream renders for the same checkpoint, take and
-seed. Nothing in the shape of the output shows it — the clip comes back at the
-size, frame count and sample rate you asked for, and no error is raised — so the
-only instrument that sees this is a side-by-side render against upstream.
-Tracked as [#1118](https://github.com/mudler/vllm.cpp/issues/1118).
+**The distilled adapter rides stage 2 alone**, as upstream's does: stage 1 is
+built with `loras=tuple(loras)` (`a2vid_two_stage.py:107`) and stage 2 with
+`(*tuple(loras), *tuple(distilled_lora))` (`:114`), and
+`ltx-pipelines/CLAUDE.md:48` states the convention for TI2Vid, A2Vid and
+Keyframe alike. Until 2026-08-17 this page recorded the opposite as an
+unrepairable divergence, because adapters fused once at load and every phase saw
+them; [#1118](https://github.com/mudler/vllm.cpp/issues/1118) closed that. The
+engine still holds ONE DiT — upstream does too, since both of its
+`from_checkpoint` calls name the same `model_paths.transformer()` — and
+re-materializes the adapter's target tensors at the phase boundary instead of
+keeping a second weight set.
+
+**What that costs you, per render.** Moving one DiT between the two states is
+paid in wall-clock rather than in memory: a two-stage render does **two**
+rebinds, one at each phase boundary, and each re-opens `--lora` and reads every
+`lora_A`/`lora_B` factor pair before re-materializing the tensors they target.
+The adapter above is 8,899,889,568 bytes, so this is not free, and the DiT is
+left in stage 2's state so the next render pays the same two. **No number is
+published for it** — this recipe is gated on reduced fixtures and nothing has
+timed the boundary on real weights. Upstream spends memory here instead, holding
+two `DiffusionStage`s over one checkpoint, which does not fit one GB10.
+
+**The adapter `--lora` wants**, pinned by content rather than by name, because a
+LoRA repository can be re-quantized in place under an unchanged filename:
+`ltx-2.5-22b-distilled-lora-450-bf16.safetensors`, 8,899,889,568 bytes, 3320
+BF16 tensors forming 1660 `lora_A`/`lora_B` pairs,
+`__metadata__` `lora_rank` and `lora_alpha` both `450` and `model_version`
+`2.5.0`. This is upstream's `distilled_lora`, the one `--distilled-lora`
+(`required=True`) names. It is **not** the IC-LoRA
+(`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`, 327,322,640
+bytes), which is a different adapter for a different arm. Nothing here checks
+which one you passed: `requires_distilled_lora` refuses a load carrying **no**
+`--lora`, and that is the whole of it, so the two are told apart by the header
+facts above and not by the engine.
 
 The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
 `video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored
