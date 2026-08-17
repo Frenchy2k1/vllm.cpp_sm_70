@@ -247,7 +247,7 @@ both refuse, naming what is missing.
 | xgrammar backend | ✅ | ✅ | ✅ | ☐ |
 | Jump-forward decoding | ✅ opt-in | ☐ | ✅ | ☐ |
 | Tool-call parsers | ✅ 38 families | ✅ | ✅ | ◐ |
-| Reasoning-content parsers | ✅ 10 | ✅ | ✅ | ☐ |
+| Reasoning-content parsers | ✅ 12 | ✅ | ✅ | ☐ |
 | Muse Glimmer ATEM parsers (`muse_glimmer`) | ◐ UNIT-GATED ON STRINGS; **CHANNEL SCOPING FAILS AT SERVER DEFAULTS**: no `adjust_request` seam, so `skip_special_tokens: true` strips the framing. OPEN GAP, [spec](../.agents/specs/muse-glimmer.md) §6.7 | ✅ | ☐ | ☐ |
 | Custom logits processors | ◐ CPU-verified | ✅ | ✅ | ☐ |
 
