@@ -384,7 +384,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 823 833 834 896 992 1008 1043 1134 1159 1264 1305 1347 1349
+// 823 833 834 896 992 1008 1056 1147 1172 1277 1318 1360 1362
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -1010,7 +1010,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // ── the adapter a two-stage pipeline cannot run without (#1117) ───────────
   //
   // `--distilled-lora` is `required=True` on the parser `A2VidPipelineTwoStage`
-  // selects (utils/args.py:1140-1153, reached through `default_2_stage_arg_parser`
+  // selects (utils/args.py:1140-1155, reached through `default_2_stage_arg_parser`
   // at `:1123` from a2vid_two_stage.py:311), and the reason is what stage 2 is:
   // a THREE-sigma refinement (`:164`) that only the distilled weights can
   // complete. Run it on a checkpoint carrying no adapter and it returns a clip
@@ -1020,25 +1020,38 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // the next recipe off this parser inherits it — `ti2vid_two_stages` (#1093)
   // and `keyframe_interpolation` (#1096) are both already waiting.
   //
-  // WHAT THIS CANNOT MIRROR, and it is filed rather than left here:
-  // `stage_2_loras = (*loras, *distilled_lora)` (`:114`) puts the adapter on
-  // stage 2 ALONE, against `loras=tuple(loras)` for stage 1 (`:107`). This
-  // engine fuses at load into ONE weight set, so the adapter reaches both
-  // phases. Owed by https://github.com/mudler/vllm.cpp/issues/1118.
+  // WHAT THIS FLAG SAYS is only that the load must CARRY an adapter. WHICH
+  // PHASE RUNS IT is `Ltx2PhaseRecipe::loras`, and it is no longer missing:
+  // this block used to close with "this engine fuses at load into ONE weight
+  // set, so the adapter reaches both phases. Owed by #1118". #1118 is CLOSED,
+  // by `4ae0f54ab` (row LTX25-PHASE-LORA), which added that field and
+  // `Ltx2RebindDitLoras` and gave every recipe off this parser a stage 1 on the
+  // base weights — `loras=tuple(loras)` (a2vid_two_stage.py:107,
+  // ti2vid_two_stages.py:140) against `(*loras, *distilled_lora)` (`:114`,
+  // `:151`). Rewritten rather than deleted, because a reader who finds the old
+  // wording in git history needs to know it came true. #1151.
+  //
+  // THE ANCHOR BELOW IS THE PARSER, NOT ONE PIPELINE'S STAGE 2, and that is the
+  // second half of #1151. This refusal is keyed on the flag precisely so the
+  // next recipe inherits it, so a message hard-coding `a2vid_two_stage.py`'s
+  // line numbers would name the caller's own pipeline in one sentence and cite
+  // a different pipeline's source in the next. `utils/args.py:1140-1155` is
+  // `default_2_stage_arg_parser`'s own `--distilled-lora required=True`, which
+  // is what every one of these pipelines selects.
   if (im.recipe.requires_distilled_lora &&
       VideoExtra(params.extras, kLtx2LoraPathExtra).empty()) {
     Fail("the '" + im.pipeline_kind +
          "' pipeline needs a distilled LoRA and none was supplied. Upstream's "
-         "`--distilled-lora` is `required=True` on the parser this pipeline selects "
-         "(ltx-pipelines utils/args.py:1140-1153) and its stage 2 is a three-sigma "
-         "refinement (a2vid_two_stage.py:164) that the base weights were never distilled "
-         "for. Supply it through the '" +
+         "`--distilled-lora` is `required=True` on `default_2_stage_arg_parser`, which "
+         "this pipeline selects (ltx-pipelines utils/args.py:1123, :1140-1155), and its "
+         "second stage is a three-sigma refinement on STAGE_2_DISTILLED_SIGMAS "
+         "(utils/constants.py:19-23) that the base weights were never distilled for. "
+         "Supply it through the '" +
          std::string(kLtx2LoraPathExtra) +
          "' load extra. Refused rather than rendered, because a distilled schedule on "
          "undistilled weights returns a clip of the right size, frame count and sample rate. "
-         "NOTE the divergence this cannot express: upstream fuses that adapter into stage 2 "
-         "ALONE (a2vid_two_stage.py:114 against :107) and this engine fuses once at load, so "
-         "stage 1 sees it too — https://github.com/mudler/vllm.cpp/issues/1118.");
+         "The adapter runs on the phases the recipe's `loras` scope names, which for these "
+         "pipelines is stage 2 alone.");
   }
   im.max_phase = ExtraInt(params.extras, kLtx2MaxPhaseExtra, -1);
   if (im.max_phase >= static_cast<int64_t>(im.recipe.phases.size())) {
@@ -3439,7 +3452,25 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // build that no longer exists. Bound here so the ordinary mutation moves
       // both. (It does not defend against an edit to the call argument only;
       // nothing local can, and that residual is recorded in the row's spec.)
-      const int64_t schedule_tokens = target_tokens;
+      //
+      // WHICH anchor, though, is the phase's to say. `LTX2Scheduler.execute`
+      // takes an OPTIONAL latent, and upstream selects between the target grid
+      // and the fixed `default_number_of_tokens` = 4096 by passing one or not
+      // (schedulers.py:31). Six of upstream's seven call sites pass none;
+      // `ti2vid_two_stages_hq.py:267` is the one that does. See
+      // `Ltx2PhaseScheduleTokens`, whose default is this engine's long-standing
+      // `target_tokens` and whose divergence from upstream's majority is #1150.
+      //
+      // Resolved to a CONCRETE count rather than passing 0 for "take the
+      // default". `Ltx2SigmaSchedule` treats the two identically
+      // (ltx2_pipeline.cpp's `tokens > 0 ? tokens : default`), and the concrete
+      // form keeps the one-local property below true for BOTH branches: the
+      // trace then reports 4096 rather than a sentinel, so a gate can assert the
+      // anchor by equality instead of by absence.
+      const int64_t schedule_tokens =
+          phase.schedule_tokens == Ltx2PhaseScheduleTokens::kSchedulerDefault
+              ? Ltx2SchedulerParams{}.default_number_of_tokens
+              : target_tokens;
       sigmas = Ltx2SigmaSchedule(steps, schedule_tokens);
       im.trace.schedule_tokens = schedule_tokens;
     } else if (gen.steps > 0 && !recipe.allow_request_sigmas) {

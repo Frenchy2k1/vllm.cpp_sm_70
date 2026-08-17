@@ -145,7 +145,7 @@ reach claim excludes it rather than overstating it.
 **Which upstream list our one slot IS.** For this recipe the supplied adapter is
 upstream's `distilled_lora`, which is what `requires_distilled_lora`
 (`ltx2_pipeline.h:692`) already declares by mirroring `--distilled-lora
-required=True` (`utils/args.py:1140-1153`). Upstream's separate user `loras`
+required=True` (`utils/args.py:1140-1155`). Upstream's separate user `loras`
 list, which rides BOTH stages, has no spelling here and cannot until the
 adapter arity refusal lifts. Owed below.
 
@@ -477,7 +477,7 @@ shift.
 
   The first IS the file this row needs: the a2vid recipe's single `lora_path`
   slot is upstream's `distilled_lora` (`--distilled-lora required=True`,
-  `utils/args.py:1140-1153`), which is what `requires_distilled_lora` mirrors.
+  `utils/args.py:1140-1155`), which is what `requires_distilled_lora` mirrors.
 
   The full/dev transformer that upstream's stage 1 runs has since completed too,
   at `ltx-2.5/lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors`,

@@ -656,6 +656,55 @@ enum class Ltx2PhaseLoraScope {
   kNoAdapters,
 };
 
+// WHICH token count the sigma SHIFT is fitted on, for a phase whose schedule is
+// derived rather than frozen.
+//
+// `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+// `tokens = math.prod(latent.shape[2:]) if latent is not None else
+// default_number_of_tokens`. So upstream selects between two anchors by passing
+// a latent or not, and `default_number_of_tokens` is `MAX_SHIFT_ANCHOR` = 4096
+// (`schedulers.py:11`, `:29`).
+//
+// SEVEN CALL SITES AT `fd4ded7f`, AND SIX OF THEM PASS NO LATENT. The
+// population is `grep -rn '\.execute(' packages/ltx-pipelines/src/ltx_pipelines/`
+// and it is small enough to list in full:
+//
+//   ti2vid_one_stage.py:207      no latent      our `one_stage` x4
+//   t2a_one_stage.py:141         no latent      our `t2a_one_stage`
+//   retake.py:287                no latent      our `retake`, non-distilled arm
+//   a2vid_two_stage.py:226       no latent      our `a2vid_two_stage` stage 1
+//   ti2vid_two_stages.py:244     no latent      our `ti2vid_two_stage` stage 1
+//   keyframe_interpolation.py:200 no latent     unported (#1096)
+//   ti2vid_two_stages_hq.py:267  latent=empty_latent   our `res2s_two_stage`
+//
+// So the LATENT-DERIVED anchor is upstream's exception, not its rule — which is
+// the opposite of how this engine has always behaved, since `ltx2_video.cpp`
+// passes `target_tokens` on every phase. That divergence is
+// https://github.com/mudler/vllm.cpp/issues/1150 and it is REAL rather than a
+// rounding: at the recipe default geometry the target latent is 6144 tokens,
+// giving a shift of 2.78 against upstream's 2.05, so every sigma in the
+// schedule moves while the frame count, the shapes and the sample rate do not.
+//
+// THE DEFAULT IS TODAY'S BEHAVIOUR AND NOT UPSTREAM'S MAJORITY, deliberately.
+// Flipping it would re-sample `one_stage` at four version keys,
+// `a2vid_two_stage` stage 1 and `retake`, all shipped and gated, and rewrite
+// their goldens — on a finding made inside a row scoped to add one recipe. #1150
+// owns that flip and this enum is the seam it uses. The preserving default also
+// cannot fail SILENTLY: an arm moves only where a line says so, whereas under
+// the flip an arm nobody remembered to pin would move with nothing naming it.
+//
+// Read in exactly one place, the phase loop's schedule block, and only on the
+// branch that derives a schedule at all. A phase carrying explicit `sigmas`
+// never reaches it.
+enum class Ltx2PhaseScheduleTokens {
+  // `math.prod(latent.shape[2:])` of THIS phase's target grid, which is
+  // `ti2vid_two_stages_hq.py:267`'s `latent=empty_latent`. The default.
+  kTargetLatent,
+  // `default_number_of_tokens`, i.e. 4096 — what the six call sites above get
+  // by passing no latent at all.
+  kSchedulerDefault,
+};
+
 struct Ltx2PhaseRecipe {
   std::string name;
   Ltx2MultiModalGuiderParams video_guidance;
@@ -672,6 +721,8 @@ struct Ltx2PhaseRecipe {
   // recipe that refuses an override can reach it.
   Ltx2PhaseDenoiser denoiser = Ltx2PhaseDenoiser::kGuided;
   bool use_official_sigma_schedule = true;
+  // See `Ltx2PhaseScheduleTokens`. Only consulted when `sigmas` is empty.
+  Ltx2PhaseScheduleTokens schedule_tokens = Ltx2PhaseScheduleTokens::kTargetLatent;
   // The adapter set this phase runs. Read in exactly one place — the phase
   // loop's rebind, immediately before the phase's first DiT forward — and
   // honoured by `Ltx2RebindDitLoras`, which re-materializes only the tensors an
@@ -726,7 +777,7 @@ struct Ltx2PipelineRecipe {
   // sites, for the reason `audio_only` gives above. The second one already has a
   // second user waiting: `ti2vid_two_stages` (#1093) and
   // `keyframe_interpolation` (#1096) both select a parser where
-  // `--distilled-lora` is `required=True` (utils/args.py:1140-1153).
+  // `--distilled-lora` is `required=True` (utils/args.py:1140-1155).
   //
   // WITHOUT THE TAKE the render still finishes. It returns a clip of the right
   // size, the right frame count and the right sample rate, with the soundtrack
@@ -735,7 +786,7 @@ struct Ltx2PipelineRecipe {
   // input.
   bool requires_audio_input = false;
   // `--distilled-lora` is `required=True` on the two-stage parser this pipeline
-  // selects (utils/args.py:1140-1153, `default_2_stage_arg_parser` at `:1123`),
+  // selects (utils/args.py:1140-1155, `default_2_stage_arg_parser` at `:1123`),
   // and stage 2's three-sigma refinement (`:164`) is what that adapter was
   // trained for. A recipe that fixes this flag cannot render on a checkpoint
   // carrying no adapter without running a distilled schedule on undistilled
@@ -846,6 +897,29 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //                                  ANCESTRAL stepper on 2.5, where A2Vid passes
 //                                  no `stepper` and gets `EulerDiffusionStep()`
 //                                  (utils/blocks.py:526-527)
+//   ("ti2vid_two_stage",   "2")    Lightricks ti2vid_two_stages.py:61,159 (row
+//   ("ti2vid_two_stage",   "2.3")  LTX25-TI2VID-RECIPE, #1093). Upstream's PLAIN
+//   ("ti2vid_two_stage",   "2.4")  two-stage pipeline: stage 1 is the FULL model
+//   ("ti2vid_two_stage",   "2.5")  under CFG at half resolution on a scheduler-
+//                                  DERIVED schedule (:243-245) with the
+//                                  distilled adapter withheld (:140), stage 2
+//                                  spatially upsamples (:272) and refines on the
+//                                  frozen STAGE_2_DISTILLED_SIGMAS (:178) with
+//                                  the adapter (:151) and no guider (:290). It
+//                                  is NOT `distilled_two_stage`, which builds
+//                                  ONE stage set (distilled.py:131), freezes
+//                                  stage 1's sigmas and samples 2.5 with the
+//                                  ANCESTRAL stepper; nor `res2s_two_stage`,
+//                                  which puts the adapter on BOTH stages at
+//                                  0.25/0.5 and runs the second-order sampler.
+//                                  Four keys for the a2vid reason: `main()`
+//                                  takes whatever `resolve_cli_params()` read
+//                                  off the checkpoint (:318-319). ALONE among
+//                                  the derived arms it fits its sigma shift on
+//                                  the 4096 anchor rather than the target grid,
+//                                  because `execute(steps=...)` passes no latent
+//                                  (schedulers.py:31) — see
+//                                  `Ltx2PhaseScheduleTokens`
 //   ("t2a_one_stage",      "2")    Lightricks t2a_one_stage.py:43,109 (row
 //   ("t2a_one_stage",      "2.3")  LTX25-T2A-ONE-STAGE, #1005). The one_stage
 //   ("t2a_one_stage",      "2.4")  rows' own schedule with `audio_only` set:

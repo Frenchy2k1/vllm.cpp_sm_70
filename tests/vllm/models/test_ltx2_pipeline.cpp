@@ -3468,7 +3468,7 @@ TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled on
   CHECK_FALSE(a2v.negative_prompt.empty());
   CHECK_FALSE(distilled.allow_negative_prompt);
   CHECK_FALSE(a2v.allow_request_latents);
-  // `--audio-path` (:312-317) and `--distilled-lora` (utils/args.py:1140-1153)
+  // `--audio-path` (:312-317) and `--distilled-lora` (utils/args.py:1140-1155)
   // are BOTH `required=True`, and neither has a value this port can invent.
   CHECK(a2v.requires_audio_input);
   CHECK(a2v.requires_distilled_lora);
@@ -3516,4 +3516,248 @@ TEST_CASE("ltx2 a2vid: all four generations resolve and nothing else does") {
   // upstream FILE name rather than the pipeline kind would type.
   CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2vid", "2.5"));
   CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("a2v_two_stage", "2.5"));
+}
+
+TEST_CASE("ltx2 ti2vid: the recipe is the PLAIN two-stage pipeline, not the HQ one") {
+  // `TI2VidTwoStagesPipeline` (ti2vid_two_stages.py:61 @ fd4ded7f). Row
+  // LTX25-TI2VID-RECIPE, issue #1093.
+  //
+  // THIS PIPELINE SITS BETWEEN TWO ARMS THAT ALREADY SHIP, and every field that
+  // separates it from either renders whether it is right or wrong: a wrong
+  // stepper, a wrong sigma set, a wrong adapter placement and a wrong audio
+  // phase all produce a finished clip of the right size, frame count and sample
+  // rate. So each assertion below carries a CONTROL drawn from the recipe it
+  // would otherwise be confused with, and no assertion can pass by two values
+  // happening to coincide.
+  const vllm::Ltx2PipelineRecipe ti2v =
+      vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe res2s =
+      vllm::ResolveLtx2PipelineRecipe("res2s_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe a2v =
+      vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe one = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(ti2v.phases.size() == 2u);
+
+  // ── stage 1 (ti2vid_two_stages.py:223-269) ────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s1 = ti2v.phases[0];
+  CHECK(s1.name == "stage_1");
+  // `width // 2, height // 2` (:223-229), which is also what makes
+  // `assert_resolution(is_two_stage=True)` (:184) the 64-divisor arm here.
+  CHECK(s1.spatial_downscale == 2);
+  CHECK(ti2v.max_spatial_downscale() == 2);
+  CHECK(s1.input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+  // `self._scheduler.execute(steps=num_inference_steps)` (:243-245): DERIVED at
+  // run time, against `distilled_two_stage`'s frozen 9-sigma stage 1.
+  CHECK(s1.sigmas.empty());
+  CHECK(s1.use_official_sigma_schedule);
+  CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control
+
+  // THE SCHEDULE ANCHOR, and the one field this arm could not be written with
+  // before this row. That same `execute` call passes NO latent, so
+  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
+  // recipe below — is the ONE upstream site that passes `latent=empty_latent`,
+  // and it is the control here precisely because it is the exception. Six other
+  // call sites side with this row; that the engine still derives from the
+  // target grid on three shipped arms is #1150.
+  CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // The default is today's behaviour, so nothing that predates this row moved.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+
+  // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :266-267
+  // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
+  // as `create_initial_state` wrote it, which with no initial latent is all
+  // zeros, and a zero-initialised denoise still returns a finite clip.
+  CHECK(s1.noise_scale == 1.0);
+  // NEITHER `self.stage_1(...)` (:247-269) NOR `self.stage_2(...)` (:289-308)
+  // passes `stepper` or `loop`, so `DiffusionStage.__call__`'s own defaults
+  // apply — `euler_denoising_loop` and `EulerDiffusionStep()`
+  // (utils/blocks.py:524-527). Two steppers reach this arm through nothing and
+  // both are asserted beside it: `distilled.py:76-84` selects the ANCESTRAL one
+  // on this very generation, and the HQ pipeline hands BOTH its stages
+  // `Res2sDiffusionStep()` (ti2vid_two_stages_hq.py:258).
+  CHECK(s1.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(distilled.phases[0].stepper == vllm::Ltx2StepperKind::kEulerAncestral);
+  CHECK(res2s.phases[0].stepper == vllm::Ltx2StepperKind::kRes2s);
+  CHECK(s1.stepper_eta == 0.0);
+  CHECK(s1.noise_seed_offset == 0);
+  // `loras=tuple(loras)` (:140) against stage 2's `(*tuple(loras),
+  // *distilled_lora)` (:151) — stage 1 runs the UNADAPTED model, which is this
+  // pipeline's identity and the reason #1118 blocked it. The control is stage 2
+  // below; the mirror-image control is `res2s_two_stage`, which upstream fuses
+  // on BOTH stages (ti2vid_two_stages_hq.py:154, :165).
+  CHECK(s1.loras == vllm::Ltx2PhaseLoraScope::kNoAdapters);
+  CHECK(res2s.phases[0].loras == vllm::Ltx2PhaseLoraScope::kAllAdapters);
+  // `FactoryGuidedDenoiser` (:248) with a negative context on both streams
+  // (:251-258). On the default path it is a no-op against the HQ arm's
+  // `GuidedDenoiser`: `main()` passes plain `MultiModalGuiderParams`
+  // (:343-358), never a factory, so both reduce to `_guided_denoise`
+  // (utils/denoisers.py:61-211).
+  CHECK(s1.denoiser == vllm::Ltx2PhaseDenoiser::kGuided);
+  // `:319` selects `default_2_stage_arg_parser`, which carries the six video
+  // guider flags (utils/args.py:947-1006), so an override is legal.
+  CHECK(s1.allow_guidance_override);
+  // The video guider is the params table's row, shared with `one_stage` so a
+  // change to the table moves both...
+  CHECK(s1.video_guidance.cfg_scale == one.phases[0].video_guidance.cfg_scale);
+  CHECK(s1.video_guidance.stg_scale == one.phases[0].video_guidance.stg_scale);
+  CHECK(s1.video_guidance.rescale_scale == one.phases[0].video_guidance.rescale_scale);
+  CHECK(s1.video_guidance.modality_scale == one.phases[0].video_guidance.modality_scale);
+  CHECK(s1.video_guidance.stg_blocks == one.phases[0].video_guidance.stg_blocks);
+  // ...and the values themselves, so this case still says which arm it is on if
+  // both were changed together. `rescale_scale = 0.7` is what makes the x0-space
+  // question live on the DEFAULT path (guiders.py:268-271, #1039/#1092).
+  CHECK(s1.video_guidance.cfg_scale == 3.0);
+  CHECK(s1.video_guidance.stg_scale == 1.0);
+  CHECK(s1.video_guidance.rescale_scale == 0.7);
+  CHECK(s1.video_guidance.modality_scale == 3.0);
+
+  // THE AUDIO GUIDER IS THE TABLE'S ROW HERE, AND ON `a2vid_two_stage` IT IS
+  // NOT. That is not an inconsistency between two rows of this table; it is the
+  // difference between two pipelines. A2Vid's audio stream is the caller's
+  // FROZEN take, so it builds a default `MultiModalGuiderParams()`
+  // (a2vid_two_stage.py:237-239). This pipeline GENERATES its soundtrack, and
+  // :255-258 hands the audio guider factory the real params, which `main()`
+  // fills from six `--audio-*` / `--v2a-guidance-scale` flags at :351-358.
+  // Copying a2vid's line here would silently drop audio CFG 7.0 on a stream
+  // that is being sampled, so both polarities are asserted.
+  CHECK(s1.audio_guidance.cfg_scale == one.phases[0].audio_guidance.cfg_scale);
+  CHECK(s1.audio_guidance.cfg_scale == 7.0);
+  CHECK(s1.audio_guidance.DoUnconditionalGeneration());
+  CHECK(a2v.phases[0].audio_guidance.cfg_scale == 1.0);  // the control
+  CHECK_FALSE(a2v.phases[0].audio_guidance.DoUnconditionalGeneration());
+
+  // ── stage 2 (ti2vid_two_stages.py:271-308) ────────────────────────────────
+  const vllm::Ltx2PhaseRecipe& s2 = ti2v.phases[1];
+  CHECK(s2.name == "stage_2");
+  CHECK(s2.spatial_downscale == 1);
+  // `self.upsampler(video_state.latent[:1])` (:272).
+  CHECK(s2.input_transform == vllm::Ltx2PhaseInputTransform::kSpatialUpsample);
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` (:178) — a DEFAULT
+  // ARGUMENT, so the schedule is frozen for this phase even though stage 1's is
+  // not. Byte for byte the distilled recipe's stage 2 (utils/constants.py:19-23).
+  CHECK(s2.sigmas == distilled.phases[1].sigmas);
+  CHECK_FALSE(s2.use_official_sigma_schedule);
+  REQUIRE(s2.sigmas.size() == 4u);
+  // `noise_scale=stage_2_sigmas[0].item()` on BOTH modality specs (:300, :305) —
+  // the upsampled latent is only valid at the noise level this stage starts from.
+  CHECK(s2.noise_scale == s2.sigmas.front());
+  CHECK(s2.stepper == vllm::Ltx2StepperKind::kEuler);
+  CHECK(res2s.phases[1].stepper == vllm::Ltx2StepperKind::kRes2s);  // the control
+  // `SimpleDenoiser(v_context_p, a_context_p)` (:290) takes no params at all.
+  CHECK(s2.denoiser == vllm::Ltx2PhaseDenoiser::kSimple);
+  // ...AND the override is still ALLOWED, which is the pair `allow_guidance_
+  // override` alone cannot express: the flags DO exist on this pipeline's
+  // parser, so a request carrying one is legal — it reaches stage 1's guider
+  // and nothing else. `kSimple` above is what makes it inert here. The control
+  // on the other polarity is `distilled_two_stage`, whose parser never adds the
+  // flags (utils/args.py:1188) so both of its phases REFUSE.
+  CHECK(s2.allow_guidance_override);
+  CHECK_FALSE(distilled.phases[1].allow_guidance_override);
+  // Left at the default: `(*tuple(loras), *distilled_lora)` (:151) is every
+  // adapter this engine holds.
+  CHECK(s2.loras == vllm::Ltx2PhaseLoraScope::kAllAdapters);
+  CHECK_FALSE(s2.video_guidance.DoUnconditionalGeneration());
+  CHECK_FALSE(s2.video_guidance.DoPerturbedGeneration());
+
+  // ── the recipe (ti2vid_two_stages.py:159-181, :310-312) ───────────────────
+  // `default_2_stage_arg_parser` sets the request geometry to the FINAL output
+  // (utils/args.py:1128); stage 1 runs at half through `spatial_downscale`.
+  CHECK(ti2v.height == a2v.height);
+  CHECK(ti2v.width == a2v.width);
+  CHECK(ti2v.num_frames == a2v.num_frames);
+  CHECK(ti2v.frame_rate == a2v.frame_rate);
+  CHECK(ti2v.num_inference_steps == one.num_inference_steps);
+  CHECK(ti2v.default_image_crf == one.default_image_crf);
+  CHECK(ti2v.video_output_phase == 1);
+
+  // THE FIELD MOST LIKELY TO BE "FIXED" TO 1, and :287-288 is upstream's own
+  // comment saying why not: "Stage 2 refines video only; discard its audio."
+  // `video_state, _ = self.stage_2(...)` at :289 IS the discard, and :311's
+  // `self.audio_decoder(audio_state.latent)` reads the name :247 bound. Writing
+  // 1 here would decode a soundtrack that is finite, the right length, at the
+  // right sample rate, and the wrong take. `res2s_two_stage` carries 0 for the
+  // identical reason; `a2vid_two_stage` carries 1 and is the control that stops
+  // this passing because every two-stage recipe happens to say 0.
+  CHECK(ti2v.audio_output_phase == 0);
+  CHECK(res2s.audio_output_phase == 0);
+  CHECK(a2v.audio_output_phase == 1);
+  CHECK_FALSE(ti2v.audio_only);
+
+  // Stage 1's schedule IS the step count (:244), so `--num-inference-steps` is
+  // honoured; stage 2 carries its own explicit sigmas and is unaffected either
+  // way, exactly as upstream's two parameters are.
+  CHECK(ti2v.allow_request_sigmas);
+  CHECK_FALSE(ti2v.fixed_num_inference_steps);
+  CHECK_FALSE(distilled.allow_request_sigmas);  // the control
+  // `:162` takes a negative prompt and :194-202 encodes `[prompt,
+  // negative_prompt]` into the two guider factories' `negative_context`.
+  CHECK(ti2v.allow_negative_prompt);
+  CHECK(ti2v.negative_prompt == one.negative_prompt);
+  CHECK_FALSE(ti2v.negative_prompt.empty());
+  CHECK_FALSE(distilled.allow_negative_prompt);  // the control
+  // No `__call__` parameter carries an initial latent (:159-181): stage 1's
+  // video spec has none and stage 2's is the upsampler's output.
+  CHECK_FALSE(ti2v.allow_request_latents);
+  // `--distilled-lora` is `required=True` on the parser :319 selects
+  // (utils/args.py:1140-1155), and stage 2's three-sigma refinement is what that
+  // adapter was trained for.
+  CHECK(ti2v.requires_distilled_lora);
+  // ...but there is NO `--audio-path` on this pipeline: the soundtrack is
+  // generated, not supplied. This is the field that separates the recipe from
+  // `a2vid_two_stage`, which sets both flags, so asserting only the first would
+  // pass on a copy of that recipe.
+  CHECK_FALSE(ti2v.requires_audio_input);
+  CHECK(a2v.requires_audio_input);  // the control
+  CHECK(a2v.requires_distilled_lora);
+  CHECK_FALSE(one.requires_distilled_lora);
+  CHECK_FALSE(distilled.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 ti2vid: all four generations resolve and nothing else does") {
+  // FOUR ROWS, mirroring `a2vid_two_stage` and `t2a_one_stage` line for line and
+  // for the same reason: `main()` calls `resolve_cli_params()` (:318) and hands
+  // the result to `default_2_stage_arg_parser(params=params, ...)` (:319) — the
+  // same two calls a2vid_two_stage.py:310-311 makes — so the generation comes
+  // off the checkpoint. There is no "which generations support this pipeline"
+  // question upstream, so restricting these rows would be a local invention.
+  for (const char* version : {"2", "2.3", "2.4", "2.5"}) {
+    INFO("version = ", std::string(version));
+    CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", version));
+    const vllm::Ltx2PipelineRecipe r =
+        vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", version);
+    REQUIRE(r.phases.size() == 2u);
+    CHECK(r.requires_distilled_lora);
+    CHECK_FALSE(r.requires_audio_input);
+    CHECK(r.phases[0].spatial_downscale == 2);
+    CHECK(r.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+    CHECK(r.phases[0].loras == vllm::Ltx2PhaseLoraScope::kNoAdapters);
+    CHECK(r.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+    CHECK(r.audio_output_phase == 0);
+  }
+  // The 2.4 and 2.5 rows take Lightricks' negative prompt and the older two take
+  // vLLM-Omni's, which is the split every four-key row makes: the negative
+  // prompt travels with the GENERATION, not with the pipeline.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2").negative_prompt ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2").negative_prompt);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.5").negative_prompt !=
+        vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2").negative_prompt);
+
+  // A version the table does not carry is REFUSED by name, never defaulted onto
+  // a neighbouring generation's guidance scales.
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", "2.6"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage", ""));
+  // ...and so are the near-miss spellings. `ti2vid_two_stages` is upstream's
+  // FILE name, which is PLURAL, and is exactly what a reader who knows
+  // ti2vid_two_stages.py rather than this table would type; the tree's kinds are
+  // singular (`a2vid_two_stage`, `res2s_two_stage`, `distilled_two_stage`).
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stages", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid", "2.5"));
+  CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("ti2vid_two_stage_hq", "2.5"));
 }
