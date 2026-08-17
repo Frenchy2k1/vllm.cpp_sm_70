@@ -66,6 +66,17 @@ Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
   per-shard sm70 kernels are fine); the work is a real build (enable
   `VLLM_CPP_NCCL`, NCCL lib on the box, runner slice/all-reduce wiring).
 
+### Multi-device — Phase 1 DONE (2026-08-12)
+- **NCCL transport compiled into the sm70 build.** `VLLM_CPP_NCCL=ON`, NCCL from
+  the conda torch's bundled `nvidia/nccl` (`libnccl.so` symlink + header).
+  `nccl_communicator.cu` compiles to the REAL `vt::Communicator` (VT_NCCL=1),
+  links into `libvllm.a`; `test_sm70_fa2_decode` still 5/5 SUCCESS (single
+  device unchanged).
+- Phase 2 (next): per-op `cudaSetDevice` affinity so a device-i backend
+  allocates/launches on GPU i (the code flagged CREAMSKILL gap in
+  `cuda_backend.cu`); Phase 3: runner slice + AllReduce/AllGather wiring for
+  tp>1 across the 4×V100.
+
 ## Known near-tie / caveats
 
 - 27B tok6 tie (`198` vs `271`): native side requires the production CUTLASS
