@@ -11,10 +11,15 @@
 // symbol, so this test target is gated in tests/CMakeLists.txt.
 #include <doctest/doctest.h>
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime.h>
+#endif
+
 extern "C" int vt_cuda_nccl_group_selfcheck(void);
 extern "C" int vt_cuda_tp_seam_selfcheck(void);
 extern "C" int vt_cuda_loader_slice_selfcheck(void);
 extern "C" int vt_cuda_sharded_forward_selfcheck(void);
+extern "C" int vt_cuda_tp_request_group(int tp_size);
 
 TEST_CASE("in-process NCCL collectives across the discrete GPUs (multi-device)") {
   const int rc = vt_cuda_nccl_group_selfcheck();
@@ -41,6 +46,18 @@ TEST_CASE("TP loader slice: per-rank shard placed on the addressed GPU, reconstr
     return;
   }
   CHECK(rc == 0);
+}
+
+TEST_CASE("engine bridge: request a NCCL-backed TP group for tp>1 (world-validated)") {
+  // tp1 must stay the null/no-op path.
+  CHECK(vt_cuda_tp_request_group(1) == 0);
+#ifdef VLLM_CPP_CUDA
+  int devs = 0;
+  REQUIRE(cudaGetDeviceCount(&devs) == cudaSuccess);
+  const int rc = vt_cuda_tp_request_group(devs);  // a real W=ngpu group must create
+  if (devs < 2) { MESSAGE("single-GPU; group probe skipped"); return; }
+  CHECK(rc > 0);
+#endif
 }
 
 TEST_CASE("runner forward: device-sharded GEMM + group all-reduce == single-GPU forward") {
