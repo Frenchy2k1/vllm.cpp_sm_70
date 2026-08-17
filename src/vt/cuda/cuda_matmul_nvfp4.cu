@@ -131,6 +131,20 @@ bool MoeDecodeEnabled() {
   return on;
 }
 
+// sm70 (brick H) gate: fp16-WMMA grouped-expert decode path, default ON.
+// Selects ONLY on sm_major==7 (Volta fp16 tensor cores); sm_80+ keeps the bf16
+// WMMA path (reference-identical). Also honours the shared decode/production
+// toggle below (VT_MOE_DECODE=0 -> prefill-tuned tile everywhere, same A/B).
+// Set VT_SM70_MOE_WMMA=0 to force the naive CUDA-core expert fill for A/B.
+bool SmWmmaF16DecodeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_SM70_MOE_WMMA");
+    return e == nullptr || (e[0] != '0');
+  }();
+  const DeviceCaps& caps = GetDeviceCaps();
+  return on && caps.valid && caps.sm_major == 7 && MoeDecodeEnabled();
+}
+
 // f32 load/store overloads: bf16 converts on the way in/out, math is f32.
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
@@ -786,6 +800,121 @@ __global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t
 #endif
 }
 
+// sm70 (Volta) fp16-WMMA grouped-expert GEMM (brick H). Volta tensor cores are
+// fp16-only (mma.sync.aligned.m16n16k16 __half); the Ampere+ bf16-WMMA path
+// above is sm_80+ (and Marlin is sm_75+), so on sm_70 the NVFP4-expert decode
+// otherwise runs only the CUDA-core naive kernel. This is the fp16 analog:
+// activations are bf16 in the fp4 path -> fp16 with a SATURATION clamp (fp16
+// exponent is 5 bits; an unclamped large value would become inf and poison a
+// near-tie), accumulator stays fp32, epilogue fp32. Deterministic, range-sane.
+// Host gate (SmWmmaF16DecodeEnabled) admits only sm_major==7 so sm_80+ keeps
+// the bf16-path (the reference-identical choice).
+inline __device__ __half Sm70Bf16ToSatHalf(__nv_bfloat16 v) {
+  float f = __bfloat162float(v);
+  f = f > 65504.0f ? 65504.0f : (f < -65504.0f ? -65504.0f : f);
+  return __float2half_rn(f);
+}
+inline __device__ __half Sm70F16ToF16(float f) {
+  f = f > 65504.0f ? 65504.0f : (f < -65504.0f ? -65504.0f : f);
+  return __float2half_rn(f);
+}
+
+template <typename Tin, typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
+__global__ void MoeGroupedGemmNvfp4WmmaF16(
+    Tout* out, const Tin* act, const int32_t* sp, const int32_t* sr,
+    const int64_t* packed_ptrs, const int64_t* scale_ptrs, const float* scale2s,
+    const int32_t* tile_expert, const int32_t* tile_row0, const int32_t* tile_rows,
+    int64_t n_cols, int64_t k_dim) {
+#if __CUDA_ARCH__ >= 700
+  const int rcount = tile_rows[blockIdx.y];
+  if (rcount == 0) return;
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
+  constexpr int MF = WMPER / 16, NF = WNPER / 16;
+  __shared__ __half As[BM * BK];
+  __shared__ __half Ws[BN * BK];
+  __shared__ float Cs[BM * BN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int e = tile_expert[blockIdx.y];
+  const int row0 = tile_row0[blockIdx.y];
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+  const int64_t packed_cols = k_dim / 2, groups = k_dim / 16;
+  const auto* packed = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(packed_ptrs[e]));
+  const auto* scale = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(scale_ptrs[e]));
+  const float scale2 = scale2s[e];
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MF][NF];
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) wmma::fill_fragment(acc[mi][ni], 0.0f);
+
+  for (int64_t kt = 0; kt < k_dim; kt += BK) {
+    for (int idx = tid; idx < BM * BK; idx += kThreads) {
+      const int r = idx / BK, c = idx % BK;
+      __half v = __float2half_rn(0.0f);
+      if (r < rcount && kt + c < k_dim) {
+        const int64_t srow = sr[row0 + r];
+        v = Sm70Bf16ToSatHalf(static_cast<__nv_bfloat16>(act[srow * k_dim + kt + c]));
+      }
+      As[idx] = v;
+    }
+    for (int idx = tid; idx < BN * (BK / 2); idx += kThreads) {
+      const int nl = idx / (BK / 2), bc = idx % (BK / 2), kl = 2 * bc;
+      const int64_t gn = col0 + nl;
+      if (gn < n_cols && kt + kl < k_dim) {
+        const uint8_t b = packed[gn * packed_cols + kt / 2 + bc];
+        const float gs = F8E4M3ToF32Dev(scale[gn * groups + (kt + kl) / 16]) * scale2;
+        float w_lo, w_hi;
+        DecodeFp4Byte(b, gs, w_lo, w_hi);
+        Ws[nl * BK + kl] = Sm70F16ToF16(w_lo);
+        Ws[nl * BK + kl + 1] = Sm70F16ToF16(w_hi);
+      } else {
+        Ws[nl * BK + kl] = __float2half_rn(0.0f);
+        Ws[nl * BK + kl + 1] = __float2half_rn(0.0f);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af[MF];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> bf[NF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], &As[(wm * WMPER + mi * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni)
+        wmma::load_matrix_sync(bf[ni], &Ws[(wn * WNPER + ni * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni) wmma::mma_sync(acc[mi][ni], af[mi], bf[ni], acc[mi][ni]);
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni)
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc[mi][ni], BN, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gc = col0 + c;
+    if (r < rcount && gc < n_cols) Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc,
+                                         Cs[idx]);
+  }
+#else
+  __trap();
+#endif
+}
+
 // Persistent scratch for the MoE expert-grouping counting-sort + ragged tile map
 // (grown on demand, kept alive) so the decode path never pays the per-call
 // cudaMallocAsync/cudaFreeAsync — at conc-8 the grouped GEMM runs ~80x/step, and
@@ -865,7 +994,55 @@ void LaunchGroupedWmma(cudaStream_t s, Tensor& out, const Tensor& act, const Ten
   MoeGroupedGemmNvfp4Wmma<Tin, Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
       out.Ptr<Tout>(), act.Ptr<Tin>(), sp, sr, packed_ptrs.Ptr<int64_t>(),
       scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), tile_expert, tile_row0, tile_rows, n, k);
+  MoeGroupedGemmNvfp4Wmma<Tin, Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
+      out.Ptr<Tout>(), act.Ptr<Tin>(), sp, sr, packed_ptrs.Ptr<int64_t>(),
+      scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), tile_expert, tile_row0, tile_rows, n, k);
   Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (wmma)");
+}
+
+// sm70 (brick H) fp16 grouped-expert launcher: same host grouping (counting-sort
+// + ragged tile map) as the bf16 LaunchGroupedWmma, but drives the fp16-WMMA
+// kernel (Volta mma.sync m16n16k16). Admitted only by SmWmmaF16DecodeEnabled()
+// on sm_major==7. BM=16 decode tile (vLLM BLOCK_SIZE_M=16 small-M discipline).
+template <typename Tin, typename Tout, int BM, int WARPS_M, int WARPS_N>
+void LaunchGroupedWmmaFp16(cudaStream_t s, Tensor& out, const Tensor& act,
+                           const Tensor& expert_ids, const Tensor* row_map,
+                           const Tensor& packed_ptrs, const Tensor& scale_ptrs,
+                           const Tensor& scale2s, int64_t p, int64_t n, int64_t k,
+                           int64_t e_count) {
+  constexpr int BN = 64, BK = 32;
+  const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
+  const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
+  int32_t* scratch = EnsureMoeScratch(n_i32);
+  int32_t* count = scratch;
+  int32_t* offset = count + e_count;
+  int32_t* cursor = offset + e_count;
+  int32_t* sp = cursor + e_count;
+  int32_t* sr = sp + p;
+  int32_t* tile_expert = sr + p;
+  int32_t* tile_row0 = tile_expert + max_tiles;
+  int32_t* tile_rows = tile_row0 + max_tiles;
+
+  Check(cudaMemsetAsync(count, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset count");
+  Check(cudaMemsetAsync(cursor, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset cursor");
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
+  const int hb = 256;
+  MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
+  MoeOffsetsKernel<<<1, 1, 0, s>>>(count, offset, static_cast<int>(e_count));
+  MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
+                                                                          cursor, sp, sr, p);
+  MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
+                                   static_cast<int>(e_count), BM, max_tiles);
+
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(max_tiles));
+  MoeGroupedGemmNvfp4WmmaF16<Tin, Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
+      out.Ptr<Tout>(), act.Ptr<Tin>(), sp, sr, packed_ptrs.Ptr<int64_t>(),
+      scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), tile_expert, tile_row0, tile_rows, n, k);
+  Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (fp16 wmma)");
 }
 
 template <typename Tin, typename Tout>
@@ -873,6 +1050,18 @@ void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor&
                    const Tensor* row_map, const Tensor& packed_ptrs, const Tensor& scale_ptrs,
                    const Tensor& scale2s, int64_t p, int64_t n, int64_t k, int64_t e_count) {
   const int64_t y = p < 65535 ? p : 65535;  // grid.y max; kernel strides over p
+  // sm70 (brick H): Volta has no bf16 MMA, so the sm_80+ bf16-WMMA branch below
+  // cannot serve the NVFP4-expert decode; use the fp16-WMMA grouped kernel so
+  // the authenticated same-silicon expert GEMM rides Volta tensor cores. gated
+  // to sm_major==7 + decode-p, keeps the naive CUDA-core fill as A/B reference.
+  if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
+    if (SmWmmaF16DecodeEnabled() && p <= kMoeDecodeMaxP) {
+      LaunchGroupedWmmaFp16<Tin, Tout, kMoeDecodeBM, 1, 2>(s, out, act, expert_ids, row_map,
+                                                           packed_ptrs, scale_ptrs, scale2s, p,
+                                                           n, k, e_count);
+      return;
+    }
+  }
   if (p < kTileMinRows) {
     constexpr int kBlock = 256;
     const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(y));
