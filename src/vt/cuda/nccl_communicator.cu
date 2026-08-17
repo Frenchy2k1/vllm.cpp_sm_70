@@ -448,6 +448,92 @@ extern "C" int vt_cuda_loader_slice_selfcheck(void) {
   return bad.load();
 }
 
+// Row-by-row matvec over THIS rank's column shards: partial[o] += sum_k(x[k]*W[o][k]).
+__global__ void NvKemmRankPartial(const float* x, const float* w_shard,
+                                  float* partial, int O, int k_per) {
+  const int o = blockIdx.x * blockDim.x + threadIdx.x;
+  if (o >= O) return;
+  float s = 0.f;
+  for (int k = 0; k < k_per; ++k) s += x[k] * w_shard[o * k_per + k];
+  partial[o] = s;
+}
+
+// RUNNER-FORWARD primitive: y = Wx sharded across the W GPUs (each rank owns a
+// K-slice of columns on ITS device), each rank computes its PARTIAL on-device,
+// and the group all-reduce sums partials so every rank holds the full y — the
+// row-parallel reduce the engine forward runs per layer. Compared to the
+// unsharded single-GPU reference.
+extern "C" int vt_cuda_sharded_forward_selfcheck(void) {
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  constexpr int64_t O = 8, K = 16;  // [O,K]; W must divide K
+  const int64_t k_per = K / W;
+
+  std::vector<float> Wf((size_t)(O * K)), xf((size_t)K);
+  for (int64_t k = 0; k < K; ++k) xf[(size_t)k] = 1.0f + (float)(k % 3);
+  for (int64_t o = 0; o < O; ++o)
+    for (int64_t k = 0; k < K; ++k)
+      Wf[(size_t)(o * K + k)] = 0.5f + (float)((o * 5 + k * 3) % 7);
+
+  std::vector<float> yref((size_t)O);
+  for (int64_t o = 0; o < O; ++o) {
+    double s = 0.0;
+    for (int64_t k = 0; k < K; ++k) s += (double)xf[(size_t)k] * (double)Wf[(size_t)(o * K + k)];
+    yref[(size_t)o] = (float)s;
+  }
+
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r, g]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t kc = k_per * r;
+      cudaStream_t st = nullptr;
+      float *dx = nullptr, *dW = nullptr, *dpart = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, (size_t)K * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dW, (size_t)(O * k_per) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dpart, (size_t)O * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree(dW); cudaFree(dpart); if (st) cudaStreamDestroy(st);
+        return;
+      }
+      std::vector<float> xs((size_t)K, 0.f);
+      for (int64_t k = 0; k < K; ++k)
+        xs[(size_t)k] = (k >= kc && k < kc + k_per) ? xf[(size_t)k] : 0.f;
+      std::vector<float> ws((size_t)(O * k_per));
+      for (int64_t o = 0; o < O; ++o)
+        for (int64_t k = 0; k < k_per; ++k)
+          ws[(size_t)(o * k_per + k)] = Wf[(size_t)(o * K + (kc + k))];
+      cudaMemcpyAsync(dx, xs.data(), (size_t)K * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dW, ws.data(), (size_t)(O * k_per) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      NvKemmRankPartial<<<(unsigned)((O + 31) / 32), 32, 0, st>>>(dx + kc, dW, dpart, (int)O, (int)k_per);
+      Queue qr;
+      qr.device = Device{DeviceType::kCUDA, r};
+      qr.handle = st;
+      g->Rank(r)->AllReduce(qr, dpart, (size_t)O, DType::kF32, ReduceOp::kSum);
+      std::vector<float> back((size_t)O, 0.f);
+      cudaMemcpyAsync(back.data(), dpart, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      for (int64_t o = 0; o < O; ++o) {
+        if (std::fabs(back[(size_t)o] - yref[(size_t)o]) > 1e-5) {
+          fprintf(stderr, "vt sharded-forward: rank %d y[%lld]=%.3f want %.3f\n",
+                  r, (long long)o, (double)back[(size_t)o], (double)yref[(size_t)o]);
+          bad.store(1, std::memory_order_relaxed);
+        }
+      }
+      cudaFree(dx); cudaFree(dW); cudaFree(dpart); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
 }  // namespace
 }  // namespace vt
 #endif  // VT_NCCL
