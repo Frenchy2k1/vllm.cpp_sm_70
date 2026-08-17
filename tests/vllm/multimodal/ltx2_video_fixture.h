@@ -1425,6 +1425,12 @@ inline void WritePromptEmbeds(const std::string& path, const std::string& tag, i
 // The whole set, as an engine would be pointed at it.
 struct Paths {
   std::string dit, video_vae, audio_vae, upsampler, video_embeds, audio_embeds;
+  // The NEGATIVE half of the embeds fallback (row LTX25-GUIDED-VIDEO, #1092).
+  // Written from DIFFERENT tags than the positive pair, deliberately: a negative
+  // conditioning equal to the positive one makes `cond - uncond` identically
+  // zero, so the classifier-free term would vanish and every assertion about it
+  // would pass for the wrong reason.
+  std::string negative_video_embeds, negative_audio_embeds;
   // Phase L13: the text tower, and the Gemma config the shipped encoder does not
   // carry. Written by every fixture; POINTING the engine at them is opt-in,
   // because a load that materializes a tower is not what most cases here gate.
@@ -1446,6 +1452,8 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   p.upsampler = dir + "/upsampler.safetensors";
   p.video_embeds = dir + "/video_prompt_embeds.f32";
   p.audio_embeds = dir + "/audio_prompt_embeds.f32";
+  p.negative_video_embeds = dir + "/negative_video_prompt_embeds.f32";
+  p.negative_audio_embeds = dir + "/negative_audio_prompt_embeds.f32";
   p.encoder = dir + "/text_encoder.safetensors";
   p.encoder_config = dir + "/gemma_config.json";
   WriteReducedTextEncoder(dit, p.encoder);
@@ -1456,6 +1464,12 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   WriteReducedUpsampler(ReducedUpsamplerConfig(dit.in_channels), p.upsampler);
   WritePromptEmbeds(p.video_embeds, "ltx2.embeds.video", prompt_tokens, dit.cross_attention_dim);
   WritePromptEmbeds(p.audio_embeds, "ltx2.embeds.audio", prompt_tokens,
+                    dit.audio_cross_attention_dim);
+  // `.negative` tags, so the two halves differ. `Param` seeds from the NAME, so
+  // these are as deterministic as the positive pair and independent of it.
+  WritePromptEmbeds(p.negative_video_embeds, "ltx2.embeds.video.negative", prompt_tokens,
+                    dit.cross_attention_dim);
+  WritePromptEmbeds(p.negative_audio_embeds, "ltx2.embeds.audio.negative", prompt_tokens,
                     dit.audio_cross_attention_dim);
   return p;
 }

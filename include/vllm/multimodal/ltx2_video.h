@@ -459,6 +459,53 @@ inline constexpr char kLtx2AudioRescaleScaleExtra[] = "audio_rescale_scale";
 inline constexpr char kLtx2AudioSkipStepExtra[] = "audio_skip_step";
 inline constexpr char kLtx2AudioStgBlocksExtra[] = "audio_stg_blocks";
 
+// THE VIDEO GUIDER, row LTX25-GUIDED-VIDEO (#1092). The same row of flags on the
+// other stream, from the same parser (`default_1_stage_arg_parser`,
+// utils/args.py:947-1066). ABSENT MEANS the params table's own value: 3.0 / 1.0 /
+// 0.7 / 3.0 and block 28 on the 2.3-and-later lineage
+// (utils/constants.py:40-88).
+//
+// THE MODALITY KNOBS EXIST HERE AND NOT ON THE T2A ROW ABOVE, and the asymmetry
+// is upstream's rather than an oversight on either side. Text-to-audio has no
+// video stream, so `t2a_one_stage.py:200-202` pins `modality_scale = 1.0` and
+// exposes no flag. A joint render has both streams and the parser exposes
+// `--a2v-guidance-scale` and `--v2a-guidance-scale`, which are the video and
+// audio guiders' `modality_scale` respectively (utils/args.py:987-996 and its
+// audio counterpart). Reaching either turns on a fourth DiT forward per step.
+//
+// EVERY ONE OF THESE IS REFUSED on a phase whose recipe sets
+// `allow_guidance_override = false` — the distilled two-stage and retake
+// recipes, whose guidance is distilled INTO the weights. Honouring an override
+// there would sample a trajectory the weights were never trained for, which is
+// the same argument `fixed_num_inference_steps` already makes for the schedule.
+inline constexpr char kLtx2VideoCfgScaleExtra[] = "video_cfg_guidance_scale";
+inline constexpr char kLtx2VideoStgScaleExtra[] = "video_stg_guidance_scale";
+inline constexpr char kLtx2VideoRescaleScaleExtra[] = "video_rescale_scale";
+inline constexpr char kLtx2VideoSkipStepExtra[] = "video_skip_step";
+inline constexpr char kLtx2VideoStgBlocksExtra[] = "video_stg_blocks";
+inline constexpr char kLtx2A2vGuidanceScaleExtra[] = "a2v_guidance_scale";
+inline constexpr char kLtx2V2aGuidanceScaleExtra[] = "v2a_guidance_scale";
+
+// THE NEGATIVE CONDITIONING FOR AN ENGINE WITH NO TEXT TOWER, and a LOCAL
+// ADAPTATION recorded as one.
+//
+// Upstream has no embeds surface at all: every pipeline encodes
+// `[prompt, negative_prompt]` in ONE `PromptEncoder` call
+// (ti2vid_one_stage.py:166-174) and takes `.video_encoding` / `.audio_encoding`
+// from each half. `prompt_embeds_path` and the `audio_prompt_embeds_path` extra
+// are this port's own affordance for running the DiT without a 12B tower; these
+// two are the SAME affordance applied to the second of upstream's two
+// encodings, not a new concept.
+//
+// They are supplied together with each other, and only alongside the positive
+// pair. Without them and without a tower, a guider that asks for the
+// unconditional pass is REFUSED BY NAME rather than served the positive context
+// twice — which would make `(cfg_scale - 1) * (cond - uncond)` identically zero
+// and produce an unguided render wearing a guided render's configuration.
+inline constexpr char kLtx2NegativePromptEmbedsExtra[] = "negative_prompt_embeds_path";
+inline constexpr char kLtx2NegativeAudioPromptEmbedsExtra[] =
+    "negative_audio_prompt_embeds_path";
+
 // WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
 //
 // Every field is read off the exact f32 buffers `Ltx2ModalityInput::context`
@@ -772,6 +819,65 @@ struct Ltx2ConditioningTrace {
   std::vector<float> t2a_first_denoised;
   std::vector<float> t2a_first_next_latent;
   double t2a_first_sigma = 0.0;
+
+  // ── the GUIDED VIDEO denoise, row LTX25-GUIDED-VIDEO (#1092) ──────────────
+  //
+  // Everything the FIRST step of the FIRST phase produced, and nothing else. One
+  // step decides every question below, and recording every step would hold a
+  // whole real trajectory in memory.
+  //
+  // WHY THE VELOCITIES SIT BESIDE THE X0 TENSORS. "Which space was this combined
+  // in" is an equation between three tensors — `x0 == latent - sigma*velocity` —
+  // and cannot be answered from the x0 tensor alone. It is exact in x0 space and
+  // off by the whole sample in velocity space, which is what makes it a gate
+  // rather than a tolerance. Recorded PER ARM, because a claim about "every
+  // pass" made from one recorded pass is a claim about a quarter of them:
+  // #1039's first gate covered the conditional arm alone and three mutations
+  // survived it.
+  bool video_guided = false;
+  int64_t video_cond_forwards = 0;
+  int64_t video_uncond_forwards = 0;
+  int64_t video_perturbed_forwards = 0;
+  int64_t video_modality_forwards = 0;
+  // Read off the mask handed to the DiT, not copied from the guider params: a
+  // perturbation that is BUILT and not HANDED OVER leaves the params untouched
+  // and the render finite.
+  std::vector<int64_t> video_perturbed_blocks;
+  std::vector<int64_t> video_audio_perturbed_blocks;
+  bool video_modality_skipped_a2v = false;
+  bool video_modality_skipped_v2a = false;
+  // The guidance phase 0 resolved, after the request overrides. The gate replays
+  // `Ltx2MultiModalGuidance` over the recorded arms with these, so a build that
+  // resolved different params fails the replay instead of agreeing with itself.
+  double video_guidance_cfg_scale = 0.0;
+  double video_guidance_stg_scale = 0.0;
+  double video_guidance_rescale_scale = 0.0;
+  double video_guidance_modality_scale = 0.0;
+  std::vector<float> video_first_latent;
+  std::vector<float> video_first_cond_velocity;
+  std::vector<float> video_first_cond;
+  std::vector<float> video_first_uncond_velocity;
+  std::vector<float> video_first_uncond;
+  std::vector<float> video_first_perturbed_velocity;
+  std::vector<float> video_first_perturbed;
+  std::vector<float> video_first_modality_velocity;
+  std::vector<float> video_first_modality;
+  // The guider's output BEFORE `post_process_latent`, which is what
+  // `Ltx2MultiModalGuidance` returned and what the replay must reproduce
+  // exactly.
+  std::vector<float> video_first_denoised;
+  // And AFTER it, which is what the stepper was handed. Two fields rather than
+  // one, because `post_process_latent` is the identity whenever no token is
+  // conditioned and a single field could not say which of the two a build passed
+  // on.
+  std::vector<float> video_first_stepper_input;
+  std::vector<float> video_first_next_latent;
+  double video_first_sigma = 0.0;
+  // The PER-TOKEN timesteps step 0 ran at, so the invariant is checked with the
+  // same sigma `ToDenoised` used rather than with the schedule scalar — they
+  // differ exactly where a token is conditioned, which is where getting it wrong
+  // re-noises a keyframe.
+  std::vector<float> video_first_timesteps;
 
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,

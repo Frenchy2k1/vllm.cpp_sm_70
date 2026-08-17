@@ -879,6 +879,12 @@ add_library(vllm STATIC
   # runs the DiT with `video = nullptr`, and keeping that call in one file is
   # what makes "does anything else pass a video stream" a readable question.
   src/vllm/model_executor/models/ltx2_t2a.cpp
+  # LTX-2.5 (ROW LTX25-GUIDED-VIDEO, issue #1092): `_guided_denoise` — the pass
+  # assembly four unported pipelines are each blocked on, and the piece the
+  # VIDEO denoise loop never had. Its own TU because upstream has its own file
+  # (ltx-pipelines utils/denoisers.py) and because ltx2_pipeline.cpp, where the
+  # guiders live, is a concurrent-edit lock.
+  src/vllm/model_executor/models/ltx2_denoisers.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
