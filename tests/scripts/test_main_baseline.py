@@ -111,6 +111,8 @@ ALL_GREEN_JOBS = [
         "cuda-fat-build",
         "device-leakage",
         "vulkan-spirv-freshness",
+        "windows-msvc-cpu",
+        "windows-msvc-vulkan",
         "sanitize-cpu (address,undefined)",
         "sanitize-cpu (thread)",
     )
@@ -211,7 +213,12 @@ class VerdictTests(unittest.TestCase):
             tuple(sorted(baseline.EXPECTED_JOBS)),
             baseline.expected_jobs_from_workflow(),
         )
-        self.assertEqual(len(baseline.EXPECTED_JOBS), 9)
+        # 9 until 2026-08-17, then 11: `windows-msvc-cpu` and
+        # `windows-msvc-vulkan` joined the lane (#503). The literal is here so
+        # that DROPPING a job cannot be spelled as an edit to one list -- the
+        # equality above is satisfied by narrowing both sides together, and this
+        # is not.
+        self.assertEqual(len(baseline.EXPECTED_JOBS), 11)
 
     def test_an_unfinished_job_is_pending_not_failed(self) -> None:
         """Fail-closed is right; calling it a FAILURE is a wrong label."""
@@ -710,6 +717,85 @@ class WorkflowLaneTests(unittest.TestCase):
             block,
             "continue-on-error makes needs.<job>.result report success; use the API",
         )
+
+    def test_the_windows_proofs_run_on_the_baseline_lane_and_not_on_push(self) -> None:
+        """#503: `main` could establish neither green nor red under MSVC.
+
+        Both jobs were `if: github.event_name == 'pull_request'`, so the
+        schedule/dispatch lane never DEFINED them -- and a job that is not
+        defined for an event is not `skipped`, it is absent, so it appeared in
+        no list `main-baseline.py` prints. The verdict read GREEN because it
+        graded a set that excluded them. Measured on the deliberate baseline run
+        32044993401 (`conclusion=success`): both jobs `skipped`. #1068 then
+        stopped `main` compiling under MSVC and surfaced on an unrelated
+        contributor's pull request rather than on `main`.
+
+        RESOLVED per event, not grepped, for the reason `resolve_boolean`
+        exists: `always()` and `github.event_name != 'push'` both admit the
+        baseline lane and both are wrong, and only the `push` half separates
+        them from the intended condition. The `push` assertion is not a style
+        preference -- that lane's jobs cancel one another by construction (26 of
+        40 runs in the window this suite measures) and 55 pushes/day times two
+        `windows-2022` runners buys nothing a baseline does not already have.
+        """
+        for name in ("windows-msvc-cpu", "windows-msvc-vulkan"):
+            block = job_block(self.text, name)
+            conditions = re.findall(r"(?m)^    if: (.+)$", block)
+            self.assertEqual(len(conditions), 1, f"{name} must have exactly one if:")
+            for event in EVENTS:
+                with self.subTest(job=name, event=event):
+                    self.assertEqual(
+                        resolve_boolean(conditions[0], event),
+                        event != "push",
+                        f"{name} must run on {event}" if event != "push"
+                        else f"{name} must not run on push",
+                    )
+
+    def test_the_windows_proofs_are_covered_by_the_published_verdict(self) -> None:
+        """Running is half of it; the verdict has to GRADE them.
+
+        `baseline-summary` waits on its `needs:` list and `EXPECTED_JOBS` is
+        read from it, so a job that runs on the lane but is absent from both
+        would fail without moving the verdict -- the `continue-on-error` shape
+        of #274 reached by omission instead of by a masked conclusion.
+        """
+        needs = job_block(self.text, baseline.SUMMARY_JOB)
+        for name in ("windows-msvc-cpu", "windows-msvc-vulkan"):
+            with self.subTest(job=name):
+                self.assertIn(f"      - {name}\n", needs)
+                self.assertIn(name, baseline.EXPECTED_JOBS)
+
+    def test_a_red_windows_proof_makes_the_baseline_red(self) -> None:
+        """The consequence, executed rather than asserted about the workflow.
+
+        This is the state on the day it lands: #584 fast-fails
+        `test_openai_api_server.exe` with 0xC0000409 on every run of both lanes,
+        so the first baseline that can see them is RED. That is the correct
+        first verdict -- it was GREEN before only because it never ran them.
+        """
+        jobs = [
+            entry for entry in ALL_GREEN_JOBS if entry["name"] != "windows-msvc-cpu"
+        ] + [job("windows-msvc-cpu", "failure")]
+        item = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(item.green)
+        self.assertIn("windows-msvc-cpu", item.failing)
+        self.assertEqual(item.missing, [], "it ran; it is failing, not absent")
+
+    def test_a_windows_proof_skipped_back_off_the_lane_is_red_not_green(self) -> None:
+        """The exact regression #503 is about, as an executable statement.
+
+        Reverting the `if:` makes the API report the job `skipped`, which
+        `NOT_RUN_CONCLUSIONS` deliberately reads as absent rather than as a
+        pass. Before this row that absence discharged no expectation because
+        there was no expectation, and the verdict printed GREEN.
+        """
+        jobs = [
+            entry for entry in ALL_GREEN_JOBS if entry["name"] != "windows-msvc-vulkan"
+        ] + [job("windows-msvc-vulkan", "skipped")]
+        item = baseline.verdict(RUN_31448896841, jobs)
+        self.assertFalse(item.green)
+        self.assertIn("windows-msvc-vulkan", item.missing)
+        self.assertNotIn("windows-msvc-vulkan", item.failing)
 
     def test_sanitize_cpu_stays_continue_on_error_for_the_push_and_pr_lanes(self) -> None:
         """Out of scope for this row: it is the closing step of the hardening
