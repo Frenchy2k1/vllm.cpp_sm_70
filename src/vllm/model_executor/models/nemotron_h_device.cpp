@@ -52,7 +52,9 @@
 //      `layer_norm_epsilon` and `norm_eps` and NO `rms_norm_eps`, which
 //      `hf_config.cpp:551` defaults to **0.0** — a silent eps=0 normalization.
 //   3. Its default path calls `vt::RopeNeox` unconditionally
-//      (dense_attn_block.h:496). NemotronH has no positional embedding at all
+//      (dense_attn_block.h:497 — this read `:496`, which is the COMMENT line
+//      above the call; corrected here per the A2-P spec §2.3 and issue #941).
+//      NemotronH has no positional embedding at all
 //      (`kNemotronHAttentionHasNoRope`; nemotron_h.py:473-486 @ 555967922).
 //
 // The tree's own idiom for exactly this case is a MODEL-LOCAL block —
@@ -60,23 +62,42 @@
 // `gemma3.cpp:108`, `glm4.cpp:80`, `gemma4.cpp:206`, none of them allowlisted.
 // `NemotronHAttnBlock` below follows it and documents its deltas.
 //
-// ─── G-SAFE IS UNTOUCHED ────────────────────────────────────────────────────
+// ─── G-SAFE: A2-R DID NOT TOUCH IT, A2-P NARROWS IT ─────────────────────────
 //
-// Nothing in this file consumes `attn_kv`, `gdn_state`, `gdn_meta`,
-// `gdn_state_slots` or `num_reqs`. This arm is NON-PAGED and SINGLE-REQUEST: it
+// `NemotronHDeviceForward` (A2-R, below) consumes NONE of `attn_kv`,
+// `gdn_state`, `gdn_meta`, `gdn_state_slots` or `num_reqs`. It is NON-PAGED: it
 // recomputes Q/K/V over the whole sequence every call, exactly as the host
-// reference does. So it does not create the capability the interlock at
-// `nemotron_h_registry.cpp:161-170` guards, and all three of that interlock's
-// clauses stay exactly as they are. A2-P narrows them; A2-R does not.
+// reference does, so it does not create the capability the interlock guards.
+//
+// `NemotronHPagedForward` (A2-P, at the bottom of this file) DOES create it. It
+// writes this step's K/V into the runner's pages and reads attention back out
+// of them, and it gathers and scatters the recurrent rows the runner allocated.
+// So the interlock at `nemotron_h_registry.cpp` loses its `attn_kv` and
+// `gdn_state` clauses in the same change, and keeps `num_reqs <= 1` — which
+// A2-B removes, not A2-P.
 #include "vllm/model_executor/models/nemotron_h_forward.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
+
+// A2-P (#810): `ModelForwardInput`. The paged forward takes the runner's step
+// input WHOLE, as `ForwardKimiLinearForCausalLM` does
+// (kimi_linear_registry.cpp:101), rather than decomposing it into a
+// twelve-argument signature that the two non-paged seams above could not
+// express anyway — neither of them can see `gdn_meta`, `gdn_state_slots`,
+// `num_reqs` or `pure_decode` at all.
+#include "vllm/model_executor/models/model_registry.h"
+// `HostLogits` — the ONE carrier both non-paged seams already return through
+// (nemotron_h_registry.cpp:185). A2-P still returns host logits because
+// `lm_head` is NVFP4 and its device arm is A2-Q2b's; see the spec's §3.5.
+#include "vllm/model_executor/models/qwen3_5_common.h"
 
 // The SHARED device glue: Dev, DBuf, MakeTensor, Reshape and — the reason this
 // header rather than dense_device_glue.h — `ResidentWeight`, the lazy
@@ -1003,6 +1024,642 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
   }
   return NemotronHHostLmHead(host, params, gathered,
                              static_cast<int64_t>(want.size()), host_queue);
+}
+
+// ═══ A2-P: the PAGED forward ════════════════════════════════════════════════
+//
+// .agents/specs/nemotron-h-a2p-paged-forward.md, issue #810. What is new here,
+// and nowhere above, is that the caches OUTLIVE THE CALL. Everything above
+// rebuilds K/V and the recurrent state from scratch on every invocation, which
+// is why the G-SAFE interlock had to refuse a runner step outright.
+
+namespace {
+
+// The NemotronH twin of `detail::ValidateGdnStateCacheLayout`
+// (qwen3_5.cpp:428-441), and it refuses BY NAME rather than sharing that one:
+// the Qwen3.5 helper is keyed on a `[slots,Hv,Dv,Dk]` GDN recurrent state and
+// has no conv-state opinion at all, while this architecture's pages are the
+// Mamba2 pair `MakeNemotronHKVCache` declares (nemotron_h_registry.cpp:263-270)
+// and must be checked against `NemotronHParams`, never against `HfConfig` —
+// re-deriving a per-layer signal from the HF config IS issue #810.
+//
+// This runs before a single byte is read. A mis-shaped state cache reaches
+// `vt::GdnStateGather` with a plausible pointer and returns finite garbage; the
+// token gate cannot see it and neither can the numeric one, because both arms
+// would read the same wrong rows.
+int64_t ValidateNemotronHStateCacheLayout(const std::vector<GdnStateCache>& caches,
+                                          const NemotronHParams& params,
+                                          DType want_ssm_dtype) {
+  const int64_t Cd = params.conv_dim();
+  const int64_t Kw = params.conv_kernel;
+  const int64_t Hh = params.mamba_num_heads;
+  const int64_t P = params.mamba_head_dim;
+  const int64_t N = params.ssm_state_size;
+  int64_t slots = -1;
+  for (const GdnStateCache& c : caches) {
+    VT_CHECK(c.conv_state.rank == 3 && c.ssm_state.rank == 4,
+             "NemotronH paged forward: the recurrent pages must be conv rank-3 "
+             "[slots, conv_dim, conv_kernel-1] and SSM rank-4 [slots, heads, "
+             "head_dim, state_size] -- the shapes MakeNemotronHKVCache declares");
+    VT_CHECK(c.conv_state.shape[1] == Cd && c.conv_state.shape[2] >= Kw - 1,
+             "NemotronH paged forward: conv page geometry does not match "
+             "conv_dim x (conv_kernel-1)");
+    VT_CHECK(c.ssm_state.shape[1] == Hh && c.ssm_state.shape[2] == P &&
+                 c.ssm_state.shape[3] == N,
+             "NemotronH paged forward: SSM page geometry does not match "
+             "mamba_num_heads x mamba_head_dim x ssm_state_size");
+    // ★ §4.4: the persistent CONV page is the CACHE dtype (bf16 on this
+    // checkpoint), never widened to f32 to satisfy a kernel precondition. The
+    // f32 the conv kernel wants is the TRANSIENT working row the gather
+    // produces, which is what `ops.cpp:1641-1642` names as the alternative to a
+    // compressed-state backend arm. Widening the page is the too-wide dtype
+    // AGENTS.md names and every gate this row owns is blind to it.
+    VT_CHECK(c.conv_state.dtype == DType::kBF16 || c.conv_state.dtype == DType::kF16 ||
+                 c.conv_state.dtype == DType::kF32,
+             "NemotronH paged forward: the conv page must be a float cache dtype");
+    VT_CHECK(c.ssm_state.dtype == want_ssm_dtype,
+             "NemotronH paged forward: the SSM page dtype does not match "
+             "`mamba_ssm_cache_dtype` -- it is resolved INDEPENDENTLY of the "
+             "model dtype (mamba_utils.py:96-107) and collapsing it to the "
+             "activation dtype is a silent precision loss a token gate absorbs");
+    VT_CHECK(c.conv_state.shape[0] == c.ssm_state.shape[0],
+             "NemotronH paged forward: conv/SSM slot counts disagree");
+    if (slots < 0) {
+      slots = c.conv_state.shape[0];
+    } else {
+      VT_CHECK(c.conv_state.shape[0] == slots,
+               "NemotronH paged forward: all recurrent layers must share one "
+               "state slot count");
+    }
+  }
+  return slots;
+}
+
+// Read a `NemotronHOwned` back out as f32, whatever dtype it holds. The inverse
+// of `NemotronHOwned::FromF32`, needed because the host mixer hands its
+// `final_states` back in the SSM cache dtype and `vt::GdnStateScatter` takes an
+// f32 working buffer.
+std::vector<float> OwnedToF32(const NemotronHOwned& w) {
+  const int64_t n = w.Numel();
+  std::vector<float> out(static_cast<size_t>(n));
+  if (w.dtype == DType::kF32) {
+    std::memcpy(out.data(), w.bytes.data(), out.size() * sizeof(float));
+  } else {
+    const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+    for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  }
+  return out;
+}
+
+// ─── the per-step device inputs ─────────────────────────────────────────────
+//
+// Uploaded ONCE per step and shared by all 6 attention layers and all 23
+// recurrent layers, mirroring `dense_attn::BuildStepInputs`
+// (dense_attn_block.h:266) — minus its `cos_sin` / `rope_row_idx` members,
+// which this architecture has no use for.
+struct NemotronHPagedStep {
+  DBuf slot_mapping;      // i64 [T]         attn_meta.slot_mapping
+  DBuf block_table;       // i32 [R, cols]   attn_meta.block_table_tensor
+  DBuf seq_lens;          // i32 [R]
+  DBuf query_start_loc;   // i32 [R+1]
+  DBuf state_idx;         // i32 [R]         the recurrent slot per request
+  DBuf state_has_initial; // i32 [R]         the fresh-vs-continuing mask
+};
+
+NemotronHPagedStep BuildNemotronHPagedStep(Dev d, const ModelForwardInput& input,
+                                           int64_t T, int64_t state_slots) {
+  const v1::CommonAttentionMetadata& am = input.attn_meta;
+  const v1::GDNAttentionMetadata& gm = input.gdn_meta;
+  const int64_t R = input.num_reqs;
+  VT_CHECK(R >= 1, "NemotronH paged forward: num_reqs must be >= 1");
+  VT_CHECK(static_cast<int64_t>(am.slot_mapping.size()) == T,
+           "NemotronH paged forward: attn_meta.slot_mapping must carry one slot "
+           "per token");
+  VT_CHECK(static_cast<int64_t>(am.seq_lens.size()) == R,
+           "NemotronH paged forward: attn_meta.seq_lens must carry one entry per "
+           "request");
+  VT_CHECK(static_cast<int64_t>(am.query_start_loc.size()) == R + 1,
+           "NemotronH paged forward: attn_meta.query_start_loc must be [num_reqs+1]");
+  const int64_t cols = am.block_table_num_cols;
+  VT_CHECK(cols >= 1 && static_cast<int64_t>(am.block_table_tensor.size()) >= R * cols,
+           "NemotronH paged forward: attn_meta.block_table_tensor is smaller than "
+           "num_reqs x block_table_num_cols");
+
+  // ★ THE DECODE/PREFILL CLASSIFICATION, and it is decode-FIRST.
+  // `mamba_mixer2.py:758-767` splits every tensor as
+  // `[num_decode_tokens, num_prefill_tokens]`, and `mamba_attn.py:523-532`
+  // splits the state indices the same way. A2-P implements the ordering even
+  // though at `num_reqs == 1` exactly one side is non-empty, because
+  // retrofitting an ordering convention under A2-B is how the two halves come
+  // to disagree (spec §4.2).
+  const int64_t nd = gm.num_decodes;
+  const int64_t np = gm.num_prefills;
+  VT_CHECK(nd + np == R,
+           "NemotronH paged forward: the GDN metadata's decode+prefill request "
+           "counts do not sum to num_reqs");
+  VT_CHECK(gm.num_decode_tokens + gm.num_prefill_tokens == T,
+           "NemotronH paged forward: the GDN metadata's token counts do not sum "
+           "to the step's token count");
+  VT_CHECK(gm.non_spec_state_indices_tensor.has_value() &&
+               static_cast<int64_t>(gm.non_spec_state_indices_tensor->size()) == R,
+           "NemotronH paged forward: the GDN metadata carries no per-request "
+           "recurrent state index (block table column 0, mamba_attn.py:513-518). "
+           "Speculative decoding is not ported for this architecture (#810 W5)");
+  VT_CHECK(gm.non_spec_query_start_loc.has_value() &&
+               static_cast<int64_t>(gm.non_spec_query_start_loc->size()) == R + 1,
+           "NemotronH paged forward: the GDN metadata carries no non-spec query "
+           "offsets, so the recurrent half cannot find each request's tokens");
+  VT_CHECK(gm.num_spec_decodes == 0,
+           "NemotronH paged forward: speculative rows are not ported (the MTP "
+           "head is #517 W5); refusing rather than decoding the drafts as "
+           "ordinary tokens");
+
+  // ★ §4.1: INDEX THROUGH THE VECTORS EVEN AT ONE REQUEST. A forward that
+  // hardcodes slot 0 passes every gate A2-P owns and then fails silently under
+  // A2-B, and the mutation that would catch it cannot fire because there is
+  // nothing to mutate.
+  std::vector<int32_t> idx(static_cast<size_t>(R));
+  std::vector<int32_t> init(static_cast<size_t>(R));
+  for (int64_t r = 0; r < R; ++r) {
+    const int32_t s = (*gm.non_spec_state_indices_tensor)[static_cast<size_t>(r)];
+    VT_CHECK(s >= 0 && s < state_slots,
+             "NemotronH paged forward: recurrent state slot out of range for the "
+             "allocated state cache");
+    idx[static_cast<size_t>(r)] = s;
+    if (r < nd) {
+      // A DECODE always continues an existing sequence, which is exactly why
+      // upstream leaves `has_initial_state` None on a decode-only step
+      // (gdn_attn.py:405, mirrored at gdn_attn.cpp:314).
+      init[static_cast<size_t>(r)] = 1;
+    } else {
+      VT_CHECK(gm.prefill_has_initial_state.has_value() &&
+                   static_cast<int64_t>(gm.prefill_has_initial_state->size()) == np,
+               "NemotronH paged forward: a prefill request carries no "
+               "has_initial_state mask (mamba_attn.py:554-556)");
+      init[static_cast<size_t>(r)] =
+          (*gm.prefill_has_initial_state)[static_cast<size_t>(r - nd)] != 0 ? 1 : 0;
+    }
+  }
+
+  NemotronHPagedStep sdi{
+      DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
+      DBuf(d, DType::kI32, {R, cols}, am.block_table_tensor.data()),
+      DBuf(d, DType::kI32, {R}, am.seq_lens.data()),
+      DBuf(d, DType::kI32, {R + 1}, am.query_start_loc.data()),
+      DBuf(d, DType::kI32, {R}, idx.data()),
+      DBuf(d, DType::kI32, {R}, init.data()),
+  };
+  // `idx` / `init` are locals and every DBuf copy above is ASYNC (see UploadAs
+  // for the same hazard and the same remedy). Waiting here costs nothing this
+  // unit measures: A2-P records no throughput number on any axis (spec §5).
+  d.b.Synchronize(d.q);
+  return sdi;
+}
+
+// ─── the paged attention block ──────────────────────────────────────────────
+//
+// `NemotronHAttnBlock` with exactly one thing replaced: the dense causal
+// `vt::Attention` over the whole `[T,·]` becomes a WRITE into the runner's
+// pages followed by a READ back out of them. Everything else — the three
+// separate projections, the absent RoPE, the absent q/k norm, the `Dh^-0.5`
+// scale, the residency seam — is byte-for-byte the same block, which is what
+// makes the two directly comparable in the per-block numeric gate.
+//
+// Upstream does the same two steps as two separate ops in the same order:
+// `unified_kv_cache_update(key, value, ...)` then
+// `unified_attention_with_output(...)` (layers/attention/attention.py:544-561),
+// over `reshape_and_cache_flash(...)` (v1/attention/backends/flash_attn.py:1122-1131).
+DBuf NemotronHAttnBlockPaged(Dev d, const NemotronHAttentionWeights& w,
+                             const NemotronHParams& params, const Tensor& normed,
+                             int64_t T, DType adt, const PagedKvCache& kv,
+                             const v1::CommonAttentionMetadata& meta,
+                             NemotronHPagedStep& sdi) {
+  const int64_t H = params.hidden_size;
+  const int64_t Hq = params.num_attention_heads;
+  const int64_t Hkv = params.num_key_value_heads;
+  const int64_t Dh = params.head_dim;
+  const int64_t qdim = params.q_proj_out_features();
+  const int64_t kvdim = params.kv_proj_out_features();
+
+  VT_CHECK(!params.attention_bias,
+           "NemotronH paged forward: attention_bias is not ported (the "
+           "checkpoint has attention_bias=false and ships no q/k/v/o bias)");
+  VT_CHECK(!params.sliding_window.has_value(),
+           "NemotronH paged forward: per-layer sliding_window is not ported "
+           "(this checkpoint ships sliding_window=null)");
+  VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
+           "NemotronH paged forward: the paged KV page geometry does not match "
+           "num_key_value_heads x head_dim");
+
+  RequireDeviceWeight(w.q_proj, "mixer.q_proj", adt, {qdim, H});
+  RequireDeviceWeight(w.k_proj, "mixer.k_proj", adt, {kvdim, H});
+  RequireDeviceWeight(w.v_proj, "mixer.v_proj", adt, {kvdim, H});
+  RequireDeviceWeight(w.o_proj, "mixer.o_proj", adt, {H, qdim});
+  VT_CHECK(w.q_proj.nk && w.k_proj.nk && w.v_proj.nk && w.o_proj.nk,
+           "NemotronH paged forward: an attention projection is not in the "
+           "[out, in] torch-Linear orientation vt::MatmulBT consumes");
+
+  Tensor wq = ResidentWeight(d, w.q_proj);
+  Tensor wk = ResidentWeight(d, w.k_proj);
+  Tensor wv = ResidentWeight(d, w.v_proj);
+  Tensor wo = ResidentWeight(d, w.o_proj);
+
+  DBuf q(d, adt, {T, qdim});
+  DBuf k(d, adt, {T, kvdim});
+  DBuf v(d, adt, {T, kvdim});
+  vt::MatmulBT(d.q, q.t(), normed, wq);
+  vt::MatmulBT(d.q, k.t(), normed, wk);
+  vt::MatmulBT(d.q, v.t(), normed, wv);
+
+  // NO RoPE, and this gap is the port. `NemotronHAttentionDecoderLayer.forward`
+  // accepts `positions` (nemotron_h.py:516) and never uses it; `input.positions`
+  // is read by nothing in this file for the same reason.
+
+  Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
+  Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
+  Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
+
+  // The "auto" ReshapeAndCache copy requires `cache dtype == k/v dtype`
+  // (ops.cpp, and qwen3_5.h:47-49 records the same constraint), so down-cast
+  // this step's K/V to the page's dtype and nothing else. The QUERY is not
+  // cast: the attention kernel converts the cache reads up and accumulates in
+  // f32 either way, so casting the query would only lose precision the page
+  // never asked for.
+  DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
+  DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
+  Tensor kw = k3;
+  Tensor vw = v3;
+  if (kv.dtype != adt) {
+    if (kv.dtype == DType::kBF16) {
+      vt::CastBf16(d.q, kcast.t(), k3);
+      vt::CastBf16(d.q, vcast.t(), v3);
+    } else if (kv.dtype == DType::kF32) {
+      vt::CastF32(d.q, kcast.t(), k3);
+      vt::CastF32(d.q, vcast.t(), v3);
+    } else {
+      VT_CHECK(false,
+               "NemotronH paged forward: the paged KV page dtype is neither the "
+               "model dtype nor a dtype this arm can cast to (bf16/f32). The "
+               "fp8 KV scheme the checkpoint ships k_scale/v_scale for is a "
+               "SEPARATE decision with its own gate and is not selected here");
+    }
+    kw = kcast.t();
+    vw = vcast.t();
+  }
+
+  Tensor k_cache = KvSlice(kv, d.q.device, 0);
+  Tensor v_cache = KvSlice(kv, d.q.device, 1);
+  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, sdi.slot_mapping.t());
+
+  DBuf attn(d, adt, {T, Hq, Dh});
+  {
+    vt::PagedAttentionArgs pa;
+    // `self.scaling = self.head_dim**-0.5` (nemotron_h.py:440), evaluated in
+    // f64 before the narrowing so this arm and the host reference feed the
+    // kernel a bit-identical scale.
+    pa.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(Dh)));
+    pa.causal = meta.causal;
+    // Host-resident grid bounds, so the prefill launchers size their query-tile
+    // grid without a per-layer D2H copy plus stream synchronize. `meta` outlives
+    // this call — it is the runner's own step metadata.
+    pa.query_start_loc_host = meta.query_start_loc.data();
+    pa.max_seq_len = meta.max_seq_len;
+    vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, sdi.block_table.t(),
+                       sdi.seq_lens.t(), sdi.query_start_loc.t(), pa);
+  }
+
+  DBuf out(d, adt, {T, H});
+  {
+    Tensor at = Reshape(attn.t(), {T, qdim});
+    vt::MatmulBT(d.q, out.t(), at, wo);
+  }
+  return out;
+}
+
+// ─── the recurrent half ─────────────────────────────────────────────────────
+//
+// One Mamba2 layer's state I/O around the HOST mixer. The COMPUTE stays on
+// `NemotronHMamba2Mixer` because the block is entered through an FP8 W8A8
+// `in_proj` and is not splittable (this file's header note; A2-Q1 owns that
+// arm, issue #940), and the A2-P spec's §1.1 puts "any change to the FP8 mamba
+// projections" explicitly out of scope. What A2-P owns is the CARRY, and it is
+// the whole difference between a decode that continues a sequence and one that
+// silently restarts it.
+//
+// ★ THE ZEROING OBLIGATION (gdn_attn.h:126-139) IS DISCHARGED BY THE GATHER,
+// AND THAT IS DELIBERATE. The recurrence kernels read the state buffer
+// UNCONDITIONALLY, so a request whose mask is 0 must be handed ZEROS, not the
+// previous tenant's rows. `vt::GdnStateGather` fuses indexing, the
+// cache-dtype -> f32 widening and that zeroing into one launch, which is
+// upstream's own `torch.where(has_initial_states_p[...], ssm_state[...], 0)`
+// (mamba_mixer2.py:854-866).
+//
+// The mixer is then told `has_initial = true` in EVERY case, including a fresh
+// request. That is not a shortcut, and getting it wrong in the other direction
+// is what would make the trap invisible:
+//
+//   * it is EXACT. With a zeroed state row, `has_initial_state = 1` and
+//     `has_initial_state = 0` compute the identical answer — the conv kernel's
+//     out-of-window read is `v = 0.0f` when the flag is clear and
+//     `v = old_row[...]` when it is set (cpu_ops.cpp CausalConv1dFwdKernel), and
+//     `old_row` is zeros. The SSD scan is the same: upstream always passes the
+//     gathered-and-zeroed `initial_states` rather than passing None.
+//   * coupling the mixer's flag to the mask instead would make the ZEROING
+//     UNOBSERVABLE — the mixer would ignore a stale row it was handed — and
+//     mutation P-M4 (drop the zeroing) would survive green. The gate would then
+//     be blind to the loudest silent-wrong-answer path in this unit (spec §3.3,
+//     R4).
+struct NemotronHRecurrentIo {
+  // The compact f32 working rows, [R, ...]. f32 by op contract on both sides:
+  // `vt::GdnStateGather` requires an f32 working buffer, and the conv kernel
+  // reads its state as f32 unless the backend advertises a compressed-state
+  // arm. The PAGE stays at its cache dtype throughout (§4.4).
+  DBuf conv;  // f32 [R, conv_dim, conv_kernel-1]
+  DBuf ssm;   // f32 [R, heads, head_dim, state_size]
+};
+
+NemotronHRecurrentIo GatherNemotronHState(Dev d, const GdnStateCache& cache,
+                                          const NemotronHParams& params, int64_t R,
+                                          NemotronHPagedStep& sdi) {
+  const int64_t Cd = params.conv_dim();
+  const int64_t Kw = params.conv_kernel;
+  const int64_t Hh = params.mamba_num_heads;
+  const int64_t P = params.mamba_head_dim;
+  const int64_t N = params.ssm_state_size;
+  NemotronHRecurrentIo io{DBuf(d, DType::kF32, {R, Cd, Kw - 1}),
+                          DBuf(d, DType::kF32, {R, Hh, P, N})};
+  Tensor hinit = sdi.state_has_initial.t();
+  vt::GdnStateGather(d.q, io.conv.t(), cache.conv_state, sdi.state_idx.t(), &hinit);
+  vt::GdnStateGather(d.q, io.ssm.t(), cache.ssm_state, sdi.state_idx.t(), &hinit);
+  return io;
+}
+
+void ScatterNemotronHState(Dev d, const GdnStateCache& cache, NemotronHRecurrentIo& io,
+                           NemotronHPagedStep& sdi) {
+  // `cache` is the runner's page and is updated IN PLACE. The mutable copies are
+  // views over the same storage; `GdnStateScatter` writes only the rows named by
+  // `state_idx` and leaves every other slot byte-identical, which is the
+  // property that keeps two concurrent sequences from overwriting each other
+  // once A2-B lifts the request count.
+  Tensor conv_page = cache.conv_state;
+  Tensor ssm_page = cache.ssm_state;
+  vt::GdnStateScatter(d.q, conv_page, io.conv.t(), sdi.state_idx.t());
+  vt::GdnStateScatter(d.q, ssm_page, io.ssm.t(), sdi.state_idx.t());
+}
+
+}  // namespace
+
+ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
+                                    const NemotronHParams& params,
+                                    const ModelForwardInput& input,
+                                    NemotronHTrace* trace) {
+  VT_CHECK(host.materialized,
+           "NemotronH paged forward: host weights are not materialized");
+  const DType adt = host.act_dtype;
+  VT_CHECK(adt == DType::kBF16 || adt == DType::kF32,
+           "NemotronH paged forward: the model dtype must be bf16 or f32");
+  VT_CHECK(!params.tie_word_embeddings,
+           "NemotronH paged forward: tie_word_embeddings is false in the "
+           "released checkpoint and the tied arm is not ported");
+
+  const int64_t H = params.hidden_size;
+  const int64_t V = params.vocab_size;
+  const int64_t L = params.num_hidden_layers();
+  const int64_t T = static_cast<int64_t>(input.token_ids.size());
+  const int64_t R = input.num_reqs;
+  VT_CHECK(T > 0, "NemotronH paged forward: empty token sequence");
+  VT_CHECK(static_cast<int64_t>(host.layers.size()) == L,
+           "NemotronH paged forward: host layer count != layers_block_type length");
+
+  // The caches, matched to the two groups `MakeNemotronHKVCache` publishes in
+  // exactly the order it publishes them: the full-attention group over the GQA
+  // layers first, the Mamba2 recurrent group second
+  // (nemotron_h_registry.cpp:235-270).
+  const std::vector<int64_t> attn_layers = params.LayerIndices(NemotronHBlock::kAttention);
+  const std::vector<int64_t> mamba_layers = params.LayerIndices(NemotronHBlock::kMamba);
+  VT_CHECK(input.attn_kv.size() == attn_layers.size(),
+           "NemotronH paged forward: the runner supplied a different number of "
+           "paged KV layers than this model has full-attention layers");
+  VT_CHECK(input.gdn_state.size() == mamba_layers.size(),
+           "NemotronH paged forward: the runner supplied a different number of "
+           "recurrent state layers than this model has Mamba2 layers");
+
+  const DType ssm_dtype = NemotronHSsmCacheDType(params, adt);
+  const int64_t state_slots =
+      ValidateNemotronHStateCacheLayout(input.gdn_state, params, ssm_dtype);
+  VT_CHECK(input.gdn_state_slots == 0 || input.gdn_state_slots == state_slots,
+           "NemotronH paged forward: the runner's declared recurrent slot count "
+           "disagrees with the allocated pages");
+
+  vt::Queue& queue = input.queue;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+
+  // The host mixers and `lm_head` need a CPU queue. When the runner is already
+  // on the host that IS `input.queue`, and the paged path is then end-to-end on
+  // one queue; on a device queue this is the same bounce A2-R documents at the
+  // top of this file, and every later unit deletes one pair of it.
+  vt::Queue host_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Queue& hq = queue.device.type == vt::DeviceType::kCPU ? queue : host_queue;
+
+  NemotronHPagedStep sdi = BuildNemotronHPagedStep(d, input, T, state_slots);
+
+  RequireDeviceWeight(host.embeddings, "backbone.embeddings.weight", adt, {V, H});
+  RequireDeviceWeight(host.norm_f, "backbone.norm_f.weight", adt, {H});
+  DBuf residual(d, adt, {T, H});
+  {
+    std::vector<int32_t> ids = input.token_ids;
+    for (int32_t id : ids) {
+      VT_CHECK(id >= 0 && id < V, "NemotronH paged forward: token id out of range");
+    }
+    DBuf it(d, DType::kI32, {T}, ids.data());
+    d.b.Synchronize(d.q);  // `ids` is a local; see UploadAs.
+    Tensor tab = ResidentWeight(d, host.embeddings);
+    vt::Embedding(d.q, residual.t(), tab, it.t());
+  }
+
+  vt::RmsNormArgs nargs;
+  nargs.eps = static_cast<float>(params.layer_norm_epsilon);
+  nargs.gemma = false;
+
+  if (trace != nullptr && trace->capture) {
+    trace->normed.assign(static_cast<size_t>(L), {});
+    trace->mixer.assign(static_cast<size_t>(L), {});
+    trace->hidden.assign(static_cast<size_t>(L), {});
+  }
+
+  size_t attn_i = 0;
+  size_t mamba_i = 0;
+  DBuf carry(d, adt, {T, H});
+  for (int64_t l = 0; l < L; ++l) {
+    const NemotronHLayerWeights& lw = host.layers[static_cast<size_t>(l)];
+    VT_CHECK(lw.block == params.layers_block_type[static_cast<size_t>(l)],
+             "NemotronH paged forward: host layer block kind disagrees with "
+             "layers_block_type");
+    RequireDeviceWeight(lw.norm, "layer norm", adt, {H});
+
+    DBuf normed(d, adt, {T, H});
+    {
+      Tensor wt = ResidentWeight(d, lw.norm);
+      if (l == 0) {
+        vt::RmsNorm(d.q, normed.t(), residual.t(), wt, nargs, nullptr);
+      } else {
+        Tensor rt = residual.t();
+        Tensor xt = carry.t();
+        Tensor ot = normed.t();
+        AddRmsNorm(d, ot, xt, wt, rt, nargs, params.layer_norm_epsilon);
+      }
+    }
+
+    const bool moe_on_device =
+        lw.block == NemotronHBlock::kMoe && adt == DType::kBF16 && MoeIsNvfp4(lw.moe) &&
+        vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
+    const bool needs_host = lw.block != NemotronHBlock::kAttention && !moe_on_device;
+    std::vector<float> nvec;
+    if (needs_host || (trace != nullptr && trace->capture)) {
+      nvec = DownloadF32(d, normed, adt, T * H);
+    }
+
+    std::vector<float> mvec;
+    if (lw.block == NemotronHBlock::kAttention) {
+      carry = NemotronHAttnBlockPaged(d, lw.attn, params, normed.t(), T, adt,
+                                      input.attn_kv[attn_i], input.attn_meta, sdi);
+      ++attn_i;
+      if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
+// DSR-ALLOW(A2-P): TYPES, not behaviour -- the same guarded call A2-Q2a introduced at :936. The SELECTION above is already a runtime op-table query; only the call site needs the build guard, because the symbol does not EXIST without the guarded region.
+#ifdef VT_MARLIN_NVFP4
+    } else if (moe_on_device) {
+      carry = NemotronHMoeBlockDevice(d, lw.moe, params, normed.t(), T);
+      if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
+#endif
+    } else if (lw.block == NemotronHBlock::kMamba) {
+      // ── the CARRY. This is the unit. ──
+      const GdnStateCache& cache = input.gdn_state[mamba_i];
+      NemotronHRecurrentIo io = GatherNemotronHState(d, cache, params, R, sdi);
+      const int64_t conv_row = params.conv_dim() * (params.conv_kernel - 1);
+      const int64_t ssm_row =
+          params.mamba_num_heads * params.mamba_head_dim * params.ssm_state_size;
+      std::vector<float> conv_all = DownloadF32(d, io.conv, DType::kF32, R * conv_row);
+      std::vector<float> ssm_all = DownloadF32(d, io.ssm, DType::kF32, R * ssm_row);
+
+      // At `num_reqs == 1` this loop runs once, and it is written as a loop for
+      // the reason §4.1 gives: the indexing machinery lands here, only the
+      // count is one.
+      mvec.assign(static_cast<size_t>(T * H), 0.0F);
+      for (int64_t r = 0; r < R; ++r) {
+        NemotronHMambaState state;
+        state.conv.assign(
+            conv_all.begin() + static_cast<std::ptrdiff_t>(r * conv_row),
+            conv_all.begin() + static_cast<std::ptrdiff_t>((r + 1) * conv_row));
+        state.ssm = NemotronHOwned::FromF32(
+            std::vector<float>(
+                ssm_all.begin() + static_cast<std::ptrdiff_t>(r * ssm_row),
+                ssm_all.begin() + static_cast<std::ptrdiff_t>((r + 1) * ssm_row)),
+            ssm_dtype,
+            {params.mamba_num_heads, params.mamba_head_dim, params.ssm_state_size});
+        // See the block comment above `NemotronHRecurrentIo`: ALWAYS true, over
+        // a row the gather has already zeroed when the mask said fresh.
+        state.has_initial = true;
+        // The RECURRENT half's own query offsets. In the non-spec path this is
+        // `m.query_start_loc` verbatim (gdn_attn.cpp, the non-spec branch), so
+        // at `num_reqs == 1` it is the same vector the attention half uses — but
+        // reading the recurrent metadata for the recurrent split is what stays
+        // correct when A2-B introduces a mixed batch.
+        const std::vector<int32_t>& qsl = *input.gdn_meta.non_spec_query_start_loc;
+        const int64_t t0 = qsl[static_cast<size_t>(r)];
+        const int64_t t1 = qsl[static_cast<size_t>(r + 1)];
+        VT_CHECK(t1 > t0 && t1 <= T,
+                 "NemotronH paged forward: a request's query range is empty or "
+                 "runs past the step's tokens");
+        const std::vector<float> rows(
+            nvec.begin() + static_cast<std::ptrdiff_t>(t0 * H),
+            nvec.begin() + static_cast<std::ptrdiff_t>(t1 * H));
+        const std::vector<float> got = NemotronHMamba2Mixer(
+            lw.mamba, params, rows, t1 - t0, adt, hq, &state);
+        std::copy(got.begin(), got.end(),
+                  mvec.begin() + static_cast<std::ptrdiff_t>(t0 * H));
+        std::copy(state.conv.begin(), state.conv.end(),
+                  conv_all.begin() + static_cast<std::ptrdiff_t>(r * conv_row));
+        const std::vector<float> ssm_out = OwnedToF32(state.ssm);
+        VT_CHECK(static_cast<int64_t>(ssm_out.size()) == ssm_row,
+                 "NemotronH paged forward: the mixer returned an SSM state of "
+                 "the wrong extent");
+        std::copy(ssm_out.begin(), ssm_out.end(),
+                  ssm_all.begin() + static_cast<std::ptrdiff_t>(r * ssm_row));
+      }
+
+      io.conv = UploadAs(d, conv_all, DType::kF32, {R, params.conv_dim(),
+                                                    params.conv_kernel - 1});
+      io.ssm = UploadAs(d, ssm_all, DType::kF32,
+                        {R, params.mamba_num_heads, params.mamba_head_dim,
+                         params.ssm_state_size});
+      ScatterNemotronHState(d, cache, io, sdi);
+      ++mamba_i;
+      carry = UploadAs(d, mvec, adt, {T, H});
+    } else {
+      switch (lw.block) {
+        case NemotronHBlock::kMoe:
+          mvec = NemotronHMoeMixer(lw.moe, params, nvec, T, adt, hq);
+          break;
+        case NemotronHBlock::kMlp:
+          mvec = NemotronHMlpMixer(lw.mlp, params, nvec, T, adt, hq);
+          break;
+        case NemotronHBlock::kMamba:
+        case NemotronHBlock::kAttention:
+          break;  // handled above
+      }
+      carry = UploadAs(d, mvec, adt, {T, H});
+    }
+
+    if (trace != nullptr && trace->capture) {
+      trace->normed[static_cast<size_t>(l)] = std::move(nvec);
+      std::vector<float> h = DownloadF32(d, residual, adt, T * H);
+      for (size_t i = 0; i < h.size(); ++i) h[i] += mvec[i];
+      trace->mixer[static_cast<size_t>(l)] = std::move(mvec);
+      trace->hidden[static_cast<size_t>(l)] = std::move(h);
+    }
+  }
+  VT_CHECK(attn_i == attn_layers.size() && mamba_i == mamba_layers.size(),
+           "NemotronH paged forward: the layer loop did not consume every paged "
+           "KV layer and every recurrent state layer exactly once");
+
+  DBuf final_normed(d, adt, {T, H});
+  {
+    Tensor wt = ResidentWeight(d, host.norm_f);
+    Tensor rt = residual.t();
+    Tensor xt = carry.t();
+    Tensor ot = final_normed.t();
+    AddRmsNorm(d, ot, xt, wt, rt, nargs, params.layer_norm_epsilon);
+  }
+  const std::vector<float> fvec = DownloadF32(d, final_normed, adt, T * H);
+  if (trace != nullptr && trace->capture) trace->final_normed = fvec;
+
+  // The gather-before-lm_head rows, then the HOST projection. `lm_head` is
+  // NVFP4 W4A16 g16 and its device arm is A2-Q2b's, so this forward returns
+  // HOST logits and `scripts/runner-routing-allowlist.txt` is NARROWED rather
+  // than removed (spec §3.5). An EMPTY `logits_indices` is the runner's
+  // VT_LOGITS_GATHER=0 path and means "every row", which is also what the two
+  // non-paged seams mean by it — so this branch serves both gather settings and
+  // no runner step can escape the paged path on that flag.
+  std::vector<int64_t> want;
+  if (input.logits_indices.empty()) {
+    want.resize(static_cast<size_t>(T));
+    for (int64_t i = 0; i < T; ++i) want[static_cast<size_t>(i)] = i;
+  } else {
+    for (int32_t idx : input.logits_indices) {
+      VT_CHECK(idx >= 0 && idx < T,
+               "NemotronH paged forward: logits index out of range");
+      want.push_back(idx);
+    }
+  }
+  std::vector<float> gathered(want.size() * static_cast<size_t>(H));
+  for (size_t r = 0; r < want.size(); ++r) {
+    std::memcpy(gathered.data() + r * static_cast<size_t>(H),
+                fvec.data() + static_cast<size_t>(want[r]) * static_cast<size_t>(H),
+                static_cast<size_t>(H) * sizeof(float));
+  }
+  return HostLogits(NemotronHHostLmHead(host, params, gathered,
+                                        static_cast<int64_t>(want.size()), hq),
+                    params.vocab_size);
 }
 
 }  // namespace vllm

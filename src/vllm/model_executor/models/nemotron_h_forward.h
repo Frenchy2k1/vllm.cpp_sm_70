@@ -52,11 +52,24 @@
 // `dense_attn::ResidentWeight`. See the residency note on NemotronHOwned below
 // for why the quantized weights deliberately stay behind.
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+// A2-P (#810): `ForwardLogits`, `PagedKvCache` and `GdnStateCache` — the three
+// runner-owned types the paged forward consumes. This is the SHARED header the
+// runner itself allocates them through (runner.cpp:906-916, :970-978), never a
+// NemotronH-local restatement of their layout.
+#include "vllm/model_executor/models/qwen3_5.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 
 namespace vllm {
+
+// A2-P: the paged forward takes `ModelForwardInput` WHOLE, mirroring
+// `KimiLinearModel::ForwardPaged(input, weights)` (kimi_linear_registry.cpp:101)
+// — the only in-tree instance of exactly this fold. A forward declaration is
+// enough for a by-reference parameter and keeps `model_registry.h` (which
+// includes the MTP and multimodal surfaces) out of every consumer of this
+// header.
+struct ModelForwardInput;
 
 // NemotronH's attention carries NO positional embedding of any kind. This is not
 // an omission to be repaired later: `models/nemotron_h.py` @ 555967922 contains
@@ -528,5 +541,48 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
                                           const std::vector<int32_t>& logits_indices,
                                           vt::Queue& dev_queue, vt::Queue& host_queue,
                                           NemotronHTrace* trace = nullptr);
+
+// ─── A2-P: the PAGED forward (#810, .agents/specs/nemotron-h-a2p-paged-forward.md)
+//
+// THE DIFFERENCE FROM EVERY FORWARD ABOVE, in one sentence: this one reads and
+// writes the RUNNER'S caches instead of rebuilding them. `NemotronHForward` and
+// `NemotronHDeviceForward` recompute Q/K/V over the whole sequence on every call
+// (nemotron_h.cpp:657-659) and start each call from FRESH recurrent state, so a
+// server past decode step 1 would produce fluent WRONG tokens. This forward
+// writes each step's K/V into `input.attn_kv` at `input.attn_meta.slot_mapping`
+// and reads attention back out of those pages, and it gathers the conv/SSM rows
+// out of `input.gdn_state` at the step's state indices and scatters the updated
+// rows back. That is what makes a multi-step decode correct, and it is what
+// narrows the G-SAFE interlock at `nemotron_h_registry.cpp:161`.
+//
+// SINGLE REQUEST. `input.num_reqs <= 1` stays refused by that interlock until
+// A2-B: nothing here reorders a batch or splits decodes from prefills across
+// requests. The per-request INDEXING machinery is nonetheless real — the state
+// slot comes from the metadata's state-index vector and the block table, never
+// from a hardcoded 0 (spec §4.1) — because a forward that hardcodes slot 0
+// passes every gate A2-P owns and then fails silently under A2-B.
+//
+// WHAT STILL RUNS ON THE HOST, and why it is not this unit's to move:
+//   * the 23 Mamba2 blocks. Their `in_proj` is FP8 W8A8 static and the block is
+//     not splittable, so the compute stays on `NemotronHMamba2Mixer` (A2-Q1 owns
+//     the device arm, issue #940). A2-P carries the STATE — gather from the
+//     device page, run the host mixer over it, scatter back — which is exactly
+//     what the spec's §1.1 means by "the paged wiring can land against them".
+//   * `lm_head`, NVFP4 W4A16 g16, refused on a non-CPU queue at
+//     nemotron_h.cpp:1031-1034. A2-Q2b owns it, so this forward still returns
+//     HOST logits and `scripts/runner-routing-allowlist.txt` is NARROWED rather
+//     than removed (spec §3.5).
+//   * a MoE block whose experts are not NVFP4, or a build with no Marlin arm.
+//     A2-Q2a's device arm is taken whenever it is available.
+//
+// Runs on WHATEVER queue the runner hands it. On CUDA that is the device path;
+// on a CPU queue every op below is registered too, which is what lets the
+// multi-step gate run without a GPU. `positions` is deliberately unread:
+// NemotronH has NO positional embedding of any kind
+// (`kNemotronHAttentionHasNoRope`).
+ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
+                                    const NemotronHParams& params,
+                                    const ModelForwardInput& input,
+                                    NemotronHTrace* trace = nullptr);
 
 }  // namespace vllm
