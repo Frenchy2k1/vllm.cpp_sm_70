@@ -15,6 +15,7 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_op_parity(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose);
+extern "C" int vt_sm70_fa2_graph_replay_parity(float tol_rel, int verbose);
 
 TEST_CASE("sm70 fa2 decode fast path matches the reference (kernel parity)") {
   // fp16-WMMA vs fp32-fma rounding -> sub-percent rel deviation expected.
@@ -44,6 +45,22 @@ TEST_CASE("sm70 fa2 prefill matches the engine's paged prefill op (routing parit
   const int rc = vt_sm70_fa2_prefill_op_parity(/*tol_rel=*/3e-2f, /*verbose=*/1);
   if (rc == 2) {
     MESSAGE("not an sm_70 CUDA device: prefill op-parity skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("sm70 fa2 decode is CUDA-graph-capture safe (y-dg-sync replay parity)") {
+  // The runner replays the steady-state decode inside a captured CUDA graph.
+  // This gate runs the decode launcher through BeginCapture->EndCapture->
+  // cudaGraphLaunch and requires replay == eager (same kernel, same inputs).
+  // Any host-sync/malloc the decode chain would issue on the capture stream
+  // trips cudaErrorStreamCapture* -> rc==1 => the regression this gate exists
+  // to catch. Deterministic inputs; captured and eager runs are bit-identical
+  // kernel execution, so a tight rel tolerance (1e-5) is legitimate.
+  const int rc = vt_sm70_fa2_graph_replay_parity(/*tol_rel=*/1e-5f, /*verbose=*/1);
+  if (rc == 2) {
+    MESSAGE("not an sm_70 CUDA device: graph-replay parity skipped");
     return;
   }
   CHECK(rc == 0);

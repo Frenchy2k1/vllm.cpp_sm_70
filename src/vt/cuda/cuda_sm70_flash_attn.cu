@@ -527,8 +527,135 @@ extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
       }
     }
   }
-  if (verbose) fprintf(stdout, "  prefill self-check: %s\\n", bad ? "MISMATCH" : "parity OK");
+if (verbose) fprintf(stdout, "  prefill self-check: %s\\n", bad ? "MISMATCH" : "parity OK");
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dbt); cudaFree(dsl); cudaFree(dqs); cudaFree(do_);
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
+// y-dg-sync coverage: the sm70 decode consumer must stay CUDA-graph-capture
+// safe. The runner replays the steady-state decode inside a captured graph; any
+// host-side synchronization (cudaStreamSynchronize/cudaDeviceSynchronize/cudaMalloc)
+// issued on the capture stream would trip cudaErrorStreamCaptureImplicit and
+// abort replay. This gate replays a decode through
+//   cudaStreamBeginCapture -> graph launder -> cudaStreamEndCapture -> cudaGraphLaunch
+// and requires replay == eager (same kernel, same inputs). A sync leak inside
+// the decode chain fails the capture and this returns 1 (the FUTURE regression
+// that the gate exists to catch). Returns 2 when not on sm_70.
+extern "C" int vt_sm70_fa2_graph_replay_parity(float tol_rel, int verbose) {
+  const DeviceCaps caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
+
+  // All locals declared up front so the error paths cannot jump across an
+  // initialized declaration (-Werror: goto-crosses-init).
+  cudaError_t err = cudaSuccess;
+  cudaStream_t st = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  __half *q_d = nullptr, *k_d = nullptr, *v_d = nullptr;
+  int32_t *bt_d = nullptr, *sl_d = nullptr;
+  float *eager = nullptr, *replay = nullptr;
+  std::vector<float> he, hr;
+  double max_rel = 0.0;
+  int bad = 0;
+
+  const int64_t nr = 3, hq = 1, nkv = 1, d = 64, bn = 16;
+  const int64_t seqs[3] = {20, 33, 17};
+  int64_t maxblocks = 1;
+  for (int64_t r = 0; r < nr; ++r) {
+    const int64_t nb = (seqs[r] + bn - 1) / bn;
+    if (nb > maxblocks) maxblocks = nb;
+  }
+  const int64_t pages = nr * maxblocks;
+  const int64_t kc_hd = d, kc_pg = nkv * d, kc_blk = bn * nkv * d;
+  const int64_t vc_hd = d, vc_pg = nkv * d, vc_blk = bn * nkv * d;
+  const float scale = 0.125f;
+
+  const size_t kv_elems = (size_t)pages * (size_t)kc_blk;
+  const size_t out_bytes = (size_t)nr * hq * d * sizeof(float);
+  std::vector<unsigned short> hk16(kv_elems), hv16(kv_elems);
+  std::vector<unsigned short> hq16((size_t)nr * hq * d);
+  for (size_t i = 0; i < kv_elems; ++i) {
+    hk16[i] = __half_as_ushort(__float2half_rn(0.37f * (float)((i * 13 + 7) % 19) + 0.11f));
+    hv16[i] = __half_as_ushort(__float2half_rn(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f));
+  }
+  for (size_t i = 0; i < hq16.size(); ++i)
+    hq16[i] = __half_as_ushort(__float2half_rn(0.61f * (float)((i * 3 + 1) % 11) + 0.31f));
+
+  std::vector<int32_t> hbt((size_t)nr * maxblocks);
+  for (int64_t r = 0; r < nr; ++r)
+    for (int64_t b = 0; b < maxblocks; ++b)
+      hbt[(size_t)r * maxblocks + b] = (int32_t)(r * maxblocks + b);
+  std::vector<int32_t> hsl(seqs, seqs + nr);
+
+  err = cudaMalloc((void**)&q_d, (size_t)nr * hq * d * sizeof(__half));
+  err = (err ?: cudaMalloc((void**)&k_d, kv_elems * sizeof(__half)));
+  err = (err ?: cudaMalloc((void**)&v_d, kv_elems * sizeof(__half)));
+  err = (err ?: cudaMalloc((void**)&bt_d, (size_t)nr * maxblocks * sizeof(int32_t)));
+  err = (err ?: cudaMalloc((void**)&sl_d, (size_t)nr * sizeof(int32_t)));
+  err = (err ?: cudaMalloc((void**)&eager, out_bytes));
+  err = (err ?: cudaMalloc((void**)&replay, out_bytes));
+  if (err != cudaSuccess) { fprintf(stderr, "graph-replay: alloc: %s\n", cudaGetErrorString(err)); goto cleanup; }
+  cudaMemcpy(q_d, hq16.data(), (size_t)nr * hq * d * sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(k_d, hk16.data(), kv_elems * sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(v_d, hv16.data(), kv_elems * sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(bt_d, hbt.data(), (size_t)nr * maxblocks * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(sl_d, hsl.data(), (size_t)nr * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+  err = cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  if (err != cudaSuccess) { fprintf(stderr, "graph-graph: stream create: %s\n", cudaGetErrorString(err)); goto cleanup; }
+
+  // Eager decode on the dedicated (non-blocking) stream.
+  vt_sm70_fa2_decode(eager, q_d, k_d, v_d, bt_d, sl_d, nr, hq, nkv, d, bn,
+                     maxblocks, /*bt_col=*/1, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg,
+                     vc_hd, scale, st);
+  if (cudaStreamSynchronize(st) != cudaSuccess) { fprintf(stderr, "graph-graph: eager sync failed\n"); goto cleanup; }
+
+  // Captured decode: the record path begins on the CUDA graph. Any host-sync /
+  // malloc the decode launcher would inject into the capture stream fails the
+  // capture with cudaErrorStreamCaptureImplicit -> rc==1 (the regression gate).
+  err = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "y-dg-sync: begin-capture failed: %s (host-sync leak in decode)\n", cudaGetErrorString(err));
+    goto cleanup;
+  }
+  vt_sm70_fa2_decode(replay, q_d, k_d, v_d, bt_d, sl_d, nr, hq, nkv, d, bn,
+                     maxblocks, 1, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd,
+                     scale, st);
+  err = cudaStreamEndCapture(st, &graph);
+  if (err != cudaSuccess) { fprintf(stderr, "y-dg-sync: end-capture failed: %s\n", cudaGetErrorString(err)); goto cleanup; }
+  exec = nullptr;
+  err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  if (graph) { cudaGraphDestroy(graph); graph = nullptr; }
+  if (err != cudaSuccess) {
+    fprintf(stderr, "graph dg-sync: instantiate: %s\n", cudaGetErrorString(err));
+    goto cleanup;
+  }
+  err = cudaGraphLaunch(exec, st);
+  if (err == cudaSuccess) err = cudaStreamSynchronize(st);
+  if (exec) { cudaGraphExecDestroy(exec); exec = nullptr; }
+  if (err != cudaSuccess) { fprintf(stderr, "graph dg-sync: replay launch/sync: %s\n", cudaGetErrorString(err)); goto cleanup; }
+
+  he.assign(out_bytes / 4, 0.f);
+  hr.assign(out_bytes / 4, 0.f);
+  cudaMemcpy(he.data(), eager, out_bytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(hr.data(), replay, out_bytes, cudaMemcpyDeviceToHost);
+  for (size_t i = 0; i < he.size(); ++i) {
+    const double denom = he[i] > 1.0 ? he[i] : 1.0;
+    max_rel = std::fmax(max_rel, std::fabs((double)he[i] - (double)hr[i]) / denom);
+  }
+  bad = (max_rel > (double)tol_rel) ? 1 : 0;
+
+ cleanup:
+  if (st) cudaStreamDestroy(st);
+  cudaFree(q_d); cudaFree(k_d); cudaFree(v_d); cudaFree(bt_d); cudaFree(sl_d);
+  cudaFree(eager); cudaFree(replay);
+  if (verbose) fprintf(stdout, "  graph-replay parity: max relative dev %.3e (tol %.1e)\n", max_rel, (double)tol_rel);
+  if (err == cudaErrorStreamCaptureImplicit) {
+    fprintf(stderr, "y-dg-sync: decode captured a host-sync violation\n");
+    return 1;
+  }
+  if (err != cudaSuccess) return 1;
   return bad;
 }
 
