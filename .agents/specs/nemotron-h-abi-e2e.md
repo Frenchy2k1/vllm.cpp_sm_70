@@ -617,6 +617,24 @@ The reasoning follows from the rules rather than from taste:
 if it is taken it owes a one-line reason at the buffer and its cost **stated in
 bytes per token** in §10. A silent widening is not one of the options.
 
+> **★ CORRECTED BY A2-P (2026-08-17), and the correction is the point.** This
+> section's R4 warned that giving `vt::CausalConv1dFwd` a bf16 conv-state arm
+> was unplanned work an implementer might be tempted to trade away. **That work
+> had already landed six days before this section was written** — `908bad0ac`
+> on 2026-08-09, `src/vt/ops.cpp:1644-1650`, admitting a bf16 conv state on any
+> backend whose `SupportsCompressedConvState()` answers true (CUDA, Vulkan and
+> ROCm all do). A `grep` for that predicate would have refuted the blocker at
+> the time. See
+> [`nemotron-h-a2p-paged-forward.md`](nemotron-h-a2p-paged-forward.md) §4.4.
+>
+> A2-P therefore takes neither branch this section anticipated. The persistent
+> conv page stays **bf16**, exactly as `MakeNemotronHKVCache` declares it, and
+> the f32 the conv kernel wants is the TRANSIENT working row `vt::GdnStateGather`
+> produces — which is what `ops.cpp:1641-1642` names as the alternative to a
+> compressed-state backend arm, and which the CPU leg needs anyway. **No page is
+> widened, and no `f32` escape is taken, so no bytes-per-token cost is owed.**
+> Re-measure a stated blocker at your own base.
+
 ---
 
 ## 3. RED-first, and why the existing gate cannot be trusted

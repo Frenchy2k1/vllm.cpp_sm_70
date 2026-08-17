@@ -784,6 +784,27 @@ vllm_cpp_add_test(test_nemotron_h_moe_device
 target_include_directories(test_nemotron_h_moe_device PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 
+# A2-P (#810, .agents/specs/nemotron-h-a2p-paged-forward.md): the PAGED forward,
+# gated through the PRODUCTION entry point. Every case builds a real
+# NemotronHLoadedModel from a synthetic checkpoint, hands it to a real
+# GPUModelRunner, and drives execute_model / sample_tokens — so the paged
+# forward is reached at runner.cpp:1465 through ModelRegistry::Forward, never
+# through a fabricated ModelForwardInput. That is the difference AGENTS.md
+# §"Nothing lands dead" is about: before this change NemotronHDeviceForward had
+# ONE non-declaration call site in the whole tree and it was a test.
+#
+# The multi-step arm is the only one that can see a DROPPED CARRY (with one leg
+# and fresh state the recurrent half is unobservable — nemotron_h_forward.h
+# says so outright), the per-block numeric arm is the only one that can see a
+# dropped mechanism whose argmax is unchanged, and the page dtypes are asserted
+# directly because a too-WIDE page is numerically correct and invisible to both.
+# CPU-only, no checkpoint, no speed claim: the A3 end-to-end token gate against
+# the released checkpoint is the on-box binding gate.
+vllm_cpp_add_test(test_nemotron_h_paged_forward
+  vllm/models/test_nemotron_h_paged_forward.cpp)
+target_include_directories(test_nemotron_h_paged_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole

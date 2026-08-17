@@ -812,25 +812,26 @@ TEST_CASE(
                        std::runtime_error);
 }
 
-// ★ G-SAFE (#810, .agents/specs/nemotron-h-abi-e2e.md §0) — THE SAFETY
-// INTERLOCK, gated.
+// ★ G-SAFE (#810) — THE SAFETY INTERLOCK, gated, and NARROWED BY A2-P
+// (.agents/specs/nemotron-h-a2p-paged-forward.md §1, §6).
 //
-// #810 A1 makes `GPUModelRunner::initialize_kv_cache` allocate the recurrent
-// half from the MambaSpec the model published, which removes the refusal that
-// was the ONLY thing stopping a NemotronH engine from being built. From that
-// commit on, `vllm_engine_load` succeeds and a scheduler step reaches
-// `ForwardNemotronHForCausalLM` — which is the HOST reference: it consumes
-// three of `ModelForwardInput`'s eighteen fields and ignores `attn_kv`,
-// `gdn_state`, `gdn_meta`, `gdn_state_slots` and `num_reqs`. Decode step 2
-// onward would run with fresh recurrent state and no KV, and a batch would be
-// treated as one concatenated causal sequence: fluent output, WRONG tokens, no
-// error. That is strictly worse than the loud failure A1 removes.
+// #810 A1 made `GPUModelRunner::initialize_kv_cache` allocate the recurrent half
+// from the MambaSpec the model published, which removed the refusal that was
+// the ONLY thing stopping a NemotronH engine from being built. From that commit
+// on `vllm_engine_load` succeeds and a scheduler step reaches
+// `ForwardNemotronHForCausalLM`, so A1 installed a three-clause interlock:
+// `attn_kv.empty() && gdn_state.empty() && num_reqs <= 1`.
 //
-// So the same change installs a by-name refusal for exactly those steps, and
-// this case is what keeps it armed. It must RED if the refusal is replaced by a
-// fall-through. The interlock is NARROWED, never deleted, until A2 lands the
-// device/paged forward that consumes those fields.
-TEST_CASE("NemotronH: the PAGED/BATCHED step REFUSES by name (G-SAFE #810)") {
+// A2-P CONSUMES the first two clauses, and this case is rewritten with them.
+// `NemotronHPagedForward` now writes each step's K/V into the runner's pages and
+// gathers and scatters the recurrent rows, so the presence of those caches is no
+// longer a reason to refuse — it is what SELECTS the paged path. What the two
+// subcases below now assert is exactly that narrowing: a single-request step
+// carrying paged caches must NO LONGER report the paged refusal.
+//
+// `num_reqs <= 1` STAYS, and it is what the third subcase keeps armed. A2-B
+// removes it. It must RED if the refusal is replaced by a fall-through.
+TEST_CASE("NemotronH: the BATCHED step REFUSES by name and the paged clauses are consumed (G-SAFE #810)") {
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
@@ -865,36 +866,52 @@ TEST_CASE("NemotronH: the PAGED/BATCHED step REFUSES by name (G-SAFE #810)") {
   std::vector<vllm::PagedKvCache> no_attn_kv;
   std::vector<vllm::GdnStateCache> no_gdn_state;
 
-  SUBCASE("paged attention KV supplied") {
+  SUBCASE("paged attention KV supplied is NO LONGER refused as unported") {
+    // CONSUMED BY A2-P. This used to report "the PAGED/BATCHED decode path is
+    // not ported"; a paged path exists now, so a single-request step carrying
+    // paged KV falls through the interlock and reaches the #775 type check
+    // instead (this `model` is a ForeignLoadedModel). Asserting the ABSENCE of
+    // the old message is what makes the narrowing gated rather than assumed.
     std::vector<vllm::PagedKvCache> attn_kv(1);
     const auto input = make_input(attn_kv, no_gdn_state, /*num_reqs=*/1);
     CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
-                         doctest::Contains("NemotronHForCausalLM"),
+                         doctest::Contains("was not produced by"),
                          std::runtime_error);
-    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
-                         doctest::Contains("PAGED/BATCHED decode path"),
-                         std::runtime_error);
-    // The message must name the missing piece and where it is owed, so the next
-    // reader is not sent to the weight loader or to the runner's allocation.
-    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
-                         doctest::Contains("#810"), std::runtime_error);
+    bool saw_paged_refusal = false;
+    try {
+      reg.factory->forward(model, input);
+    } catch (const std::exception& e) {
+      saw_paged_refusal = std::string(e.what()).find("PAGED") != std::string::npos;
+    }
+    CHECK_FALSE(saw_paged_refusal);
   }
 
-  SUBCASE("recurrent state supplied") {
+  SUBCASE("recurrent state supplied is NO LONGER refused as unported") {
     std::vector<vllm::GdnStateCache> gdn_state(1);
     const auto input = make_input(no_attn_kv, gdn_state, /*num_reqs=*/1);
     CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
-                         doctest::Contains("PAGED/BATCHED decode path"),
+                         doctest::Contains("was not produced by"),
                          std::runtime_error);
   }
 
   SUBCASE("a multi-request batch") {
-    // The gap a token gate cannot see: two concatenated requests decoded as one
-    // causal sequence produce fluent, plausible, wrong output.
+    // THE SURVIVING CLAUSE. The gap a token gate cannot see: two concatenated
+    // requests decoded as one causal sequence produce fluent, plausible, wrong
+    // output. A2-B removes this; until then it must refuse by name, and the
+    // message must name the architecture, the missing piece and where it is
+    // owed, so the next reader is not sent to the weight loader or to the
+    // runner's allocation.
     const auto input = make_input(no_attn_kv, no_gdn_state, /*num_reqs=*/2);
     CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
-                         doctest::Contains("PAGED/BATCHED decode path"),
+                         doctest::Contains("NemotronHForCausalLM"),
                          std::runtime_error);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("BATCHED decode is not ported"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("A2-B"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("#810"), std::runtime_error);
   }
 
   SUBCASE("the non-paged single-request seam stays alive BELOW the guard") {

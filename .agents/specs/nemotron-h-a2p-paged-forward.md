@@ -794,11 +794,53 @@ lifecycle write.
 
 ## 10. Now
 
-**State at this commit:** spec only. No product code, no lifecycle change. Per
-the governing spec's §1.4 the implementation is a separate PR by a different
-agent and the reviewer is a third.
+**State at this commit: A2-P's PRODUCT CODE HAS LANDED, and its A3 end-to-end
+token gate has NOT RUN.** `ForwardNemotronHForCausalLM` selects
+`NemotronHPagedForward` whenever the runner supplies paged KV and recurrent
+state (`nemotron_h_registry.cpp`), G-SAFE is narrowed to `num_reqs <= 1`, and
+`scripts/runner-routing-allowlist.txt` is narrowed rather than removed because
+A2-Q2b has not landed and the forward still returns host logits (§3.5's
+"otherwise" branch, decided on evidence: `nemotron_h.cpp:1031-1034` still
+refuses the NVFP4 `lm_head` on a non-CPU queue at `origin/main`).
 
-**A2-P is claimable now.** Its one prior blocker is cleared and re-verified
+**What is gated:** `tests/vllm/models/test_nemotron_h_paged_forward.cpp`,
+12 cases / 3256 assertions on CPU, every runner-driven case entering through a
+real `GPUModelRunner` and `ModelRegistry::Forward`. All nine §5.6 mutations RED,
+each with its edit proven applied, its compile exit and error count printed, a
+binary sha distinct from baseline, a non-zero case count, and the tree restored
+byte-identically afterwards.
+
+**What is NOT gated, and it is the row's stop condition:** the §5.4 A3
+end-to-end token gate, and the §5.7 sm_121a leg with it.
+
+**The cause is CONTENTION, and it is measured rather than inferred**, which is
+what decides §8.1's branch. `dgx.casa` answered at 07:21 with 74 of 119 GB
+available and loadavg 1.34, then stopped answering SSH entirely
+(banner-exchange timeout) for the next hour. When it answered again its uptime
+was 11h28m — **the same boot**, so it did not reboot — at **loadavg 211.44 with
+3 GB of 119 available**, falling to loadavg 20 and 115 GB free minutes later as
+another job finished. A 20.1 GiB checkpoint cannot load into 3 GB, and starting
+a heavy job beside a saturated box is how this project has OOM-REBOOTED it.
+
+§8.1 makes `NEEDS_DECISION` the answer only when the gate cannot run for a
+reason OTHER than contention. This was contention, so the result recorded is the
+other one §"Gates" allows: **pending a named external resource**, written into
+`docs/BENCHMARKS.md` rather than left as silence. **A2-P is not DONE until that
+gate is green**, and no `## Outcome` is written here until it is.
+
+**The one measured surprise, and it is a finding rather than a pass.** The §5.1
+token arms could NOT see the recurrent carry on the synthetic fixture: with both
+the conv and the SSM state zeroed on every step, the paged decode still emitted
+`26,17,4,20,2,23`, byte-identical to the reference, and mutations P-M1, P-M2,
+P-M4 and P-M9 all survived the first pass. At that geometry the residual stream
+is dominated by the MoE block (`routed_scaling_factor` 2.5) and the argmax over
+32 vocabulary entries does not move. §8.1 says what that is — a coverage hole
+owing a direct assertion, not a pass — so two NUMERIC cases were added: a decode
+step's per-layer output against the reference's last row, and a fresh prefill
+over a DIRTY state slot against a fresh reference. With those, all nine
+mutations RED.
+
+**A2-P was claimable, and the claim history is:** Its one prior blocker is cleared and re-verified
 rather than inherited: the governing spec's R3 named #496 W2 (the CUDA Mamba2 SSD
 arm) as A2's hard dependency, and it landed at `43a6c5518` —
 `kMamba2ChunkScan`, `kMamba2StateUpdate`, `kCausalConv1dFwd` and
@@ -820,6 +862,22 @@ obligation, which is the silent-wrong-answer path in this unit; and §2.3, so
 nobody routes this architecture through a block that ropes.
 
 ## 11. Owed
+
+- **The §5.4 A3 end-to-end token gate**, and the §5.7 sm_121a leg with it. Owned
+  by this row, tracked on [#810](https://github.com/mudler/vllm.cpp/issues/810).
+  Nothing about the released checkpoint is claimed until it runs.
+- **`examples/nemotron_h_gen`** (§3.6) and the `docs/USAGE.md` weights block that
+  rides with it. Not written: the ABI surface it would exercise
+  (`vllm_engine_load` + `vllm_complete_tokens`) is the same surface the A3 gate
+  drives, so writing the example before that gate can run would ship a client
+  for a path nobody has watched produce a token. Owned by this row, tracked on
+  [#810](https://github.com/mudler/vllm.cpp/issues/810).
+- **The device `lm_head`** stays A2-Q2b's, which is why
+  `scripts/runner-routing-allowlist.txt` is narrowed rather than removed and why
+  this forward returns `HostLogits`.
+- **The FP8 mamba blocks** compute on the host. A2-Q1 owns the device arm
+  ([#940](https://github.com/mudler/vllm.cpp/issues/940)); A2-P carries their
+  STATE and deliberately changes no projection.
 
 - [#941](https://github.com/mudler/vllm.cpp/issues/941) — item 1 (correct the
   governing spec's seam claim) is answered by §2.3 of this file. Item 2 (a
