@@ -382,6 +382,11 @@ DitPlan PlanDit(const SafetensorsFile& file) {
   plan.prefix = prefixed != 0 ? prefix : std::string();
 
   bool saw_u8 = false, saw_f8 = false;
+  // Every dtype the file stores in a NON-sidecar tensor, so the refusal below
+  // can name what the file holds rather than only what it lacks. `std::set` for
+  // the deterministic order: a refusal that lists dtypes in header order would
+  // read differently for two files carrying the same set.
+  std::set<std::string> weight_dtypes;
   const std::string marker_suffix = kLtx2TorchaoNvfp4MarkerSuffix;
   for (const std::string& n : names) {
     const std::string bare = n.substr(plan.prefix.size());
@@ -390,6 +395,7 @@ DitPlan PlanDit(const SafetensorsFile& file) {
     }
     if (IsScaleSidecar(bare)) continue;
     const StTensor& t = file.Get(n);
+    weight_dtypes.insert(t.dtype);
     std::vector<int64_t> shape = t.shape;
     if (t.dtype == "U8") {
       saw_u8 = true;
@@ -411,12 +417,51 @@ DitPlan PlanDit(const SafetensorsFile& file) {
         "The two arms use different scale sidecars, so a mixed file would be loaded "
         "half one way and half the other.");
   }
-  if (!saw_u8 && !saw_f8) {
-    Fail(
-        "the DiT checkpoint carries no quantized weights at all (no U8 and no "
-        "F8_E4M3). A bf16 DiT is not what phase L6 loads; use the L2 path.");
+  if (saw_u8) {
+    plan.quant = Ltx2DitQuant::kNvfp4;
+  } else if (saw_f8) {
+    plan.quant = Ltx2DitQuant::kFp8;
+  } else {
+    // NOT QUANTIZED, which is upstream's ORDINARY case rather than a third
+    // scheme: `_DTYPE_CASTABLE` (single_gpu_model_builder.py:51-57 @
+    // `fd4ded7f`) is float32/float64/float16/bfloat16, and everything outside it
+    // is what that file calls a "quantized payload". `Lightricks/LTX-2.5` ships
+    // the FULL transformer this way — 4349 tensors, 4059 BF16 and 290 F32, not
+    // one `_scale` name — and `packages/ltx-pipelines/CLAUDE.md:17-30` marks it
+    // as the model for six pipelines, four of them landed here.
+    //
+    // THIS BRANCH USED TO REFUSE, and the refusal said "use the L2 path" while
+    // being reached FROM the L2 path — `Ltx2LoadDitFromSafetensors` calls this
+    // function on its first line, as do `Ltx2ParseDitParamsFromCheckpoint`,
+    // `Ltx2StreamDitToDevice` and `Ltx2RebindDitLoras` — so it sent every reader
+    // in a circle (issue #1148). Nothing behind it needed writing:
+    // `MaterializeDitTensor`'s BF16 branch is the one every bias on the FP8 arm
+    // already takes, and no consumer branches on `quant`.
+    //
+    // What survives is the honest half of that refusal. A file whose weights are
+    // in a dtype this loader cannot read is still refused, BY NAME, and F16 is a
+    // real case rather than a hypothetical: upstream's castable set lists
+    // torch.float16 beside bfloat16, so such a checkpoint is legal there and
+    // has no materialization here.
+    bool readable = false;
+    for (const std::string& d : weight_dtypes) {
+      if (d == "BF16" || d == "F32") readable = true;
+    }
+    if (!readable) {
+      std::string held;
+      for (const std::string& d : weight_dtypes) {
+        held += std::string(held.empty() ? "" : ", ") + d;
+      }
+      Fail("the DiT checkpoint carries no weight this loader can read. Its tensors are " +
+           (held.empty() ? std::string("(none)") : held) +
+           ", and the four encodings this loader materializes are BF16 and F32 (stored as "
+           "they are), F8_E4M3 with an F32 '<name>_scale' (the FP8 arm), and U8 with an "
+           "F8_E4M3 '<name>_weight_scale' plus an F32 '<name>_weight_scale_2' (the NVFP4 "
+           "arm). Refusing by name rather than reinterpreting the bytes, which would be "
+           "finite, correctly shaped and wrong.");
+    }
+    plan.quant = Ltx2DitQuant::kNone;
   }
-  plan.quant = saw_u8 ? Ltx2DitQuant::kNvfp4 : Ltx2DitQuant::kFp8;
   return plan;
 }
 

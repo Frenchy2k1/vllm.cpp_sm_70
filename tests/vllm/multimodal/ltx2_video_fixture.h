@@ -459,6 +459,12 @@ struct ReducedDitOptions {
   std::string model_version = "2.5.0";
   bool declare_config = true;
   bool declare_model_version = true;
+  // Write the file with NO quantized weight and NO scale sidecar anywhere: every
+  // tensor the FP8 shape would store F8_E4M3 is stored BF16 instead. That is the
+  // shape `Lightricks/LTX-2.5` ships the FULL (dev) transformer in — 4059 BF16
+  // and 290 F32, zero `_scale` names, measured from its own header on
+  // 2026-08-17 — and it is the arm issue #1148 refused at load.
+  bool unquantized = false;
   nlohmann::json transformer_overrides = nlohmann::json::object();
   ReducedConnectorOptions connector;
 };
@@ -476,7 +482,7 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
     for (const int64_t d : spec.shape) numel *= d;
     const std::string full = prefix + spec.name;
     const bool table = spec.name.find("scale_shift_table") != std::string::npos;
-    const bool quantizable = spec.shape.size() == 2 && !table &&
+    const bool quantizable = !options.unquantized && spec.shape.size() == 2 && !table &&
                              spec.name.size() > 7 &&
                              spec.name.compare(spec.name.size() - 7, 7, ".weight") == 0;
     std::vector<float> values = Param("ltx2.dit." + spec.name, numel, 0.08);
@@ -513,8 +519,11 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
         // tensor of this family is F8_E4M3 with an F32 sidecar, `learnable_registers`
         // INCLUDED (`...learnable_registers` + `...learnable_registers_scale`).
         // That is not the DiT's rule — there the scale-shift tables stay F32 —
-        // so it is stated from the file rather than inherited.
-        const bool quantizable = spec.shape.size() == 2;
+        // so it is stated from the file rather than inherited. On the
+        // `unquantized` arm this family follows the DiT's own dtype the same way
+        // the shipped dev transformer does: its 258 connector tensors are BF16
+        // with no sidecar, exactly like every other weight in that file.
+        const bool quantizable = !options.unquantized && spec.shape.size() == 2;
         if (quantizable) {
           constexpr float kScale = 0.5F;
           for (float& v : values) v /= kScale;

@@ -3549,6 +3549,93 @@ and exists only for the f32 parity forward.
 a time so peak residency is the device copy plus one tensor, and it stages at
 load because host-resident weights measure 20 to 30 percent slower there.
 
+### The DiT is not always quantized, and the FULL model never is
+
+**`--dit` accepts an UNQUANTIZED bf16 transformer as of 2026-08-17**
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)). Until then `PlanDit`
+refused any DiT carrying neither `U8` nor `F8_E4M3`, and the file it refused is
+the one most of these pipelines need: upstream's table
+(`packages/ltx-pipelines/CLAUDE.md:17-30` @ `fd4ded7f`) marks `Full` or
+`Full + distilled LoRA` for `TI2VidOneStagePipeline`, `T2AOneStagePipeline`,
+`TI2VidTwoStagesPipeline`, `TI2VidTwoStagesHQPipeline`, `A2VidPipelineTwoStage`
+and `KeyframeInterpolationPipeline`. `one_stage`, `t2a_one_stage`,
+`res2s_two_stage` and `a2vid_two_stage` are all reachable here, so all four
+could previously only run against a *distilled* checkpoint — a different
+sampling regime that renders plausibly and says nothing.
+
+Nothing about the arm is a new decoder. Unquantized is upstream's ordinary case:
+`_DTYPE_CASTABLE` (`single_gpu_model_builder.py:51-57` @ `fd4ded7f`) is
+float32/float64/float16/bfloat16, and uint8-NVFP4 and float8 are what that file
+calls "quantized payloads". `Ltx2DitCheckpoint::quant` reports which of the
+three the file was, and a BF16 weight is stored as it is, so the memory format
+is what the checkpoint chose.
+
+**A dtype this loader cannot read is still refused, by name.** The refusal now
+lists the dtypes the file holds and the four encodings the loader materializes
+(BF16, F32, F8_E4M3 with an F32 `<name>_scale`, and U8 with an F8_E4M3
+`<name>_weight_scale` plus an F32 `<name>_weight_scale_2`). An `F16` DiT is the
+live case: upstream's castable set lists `torch.float16` and this port has no
+F16 materialization. The message it replaced said "use the L2 path", which was
+advice a reader could not follow — `Ltx2LoadDitFromSafetensors` *is* the L2 path
+and calls the refusing function on its first line.
+
+**The full model costs ~42 GB resident.** It is 21.004 B parameters at two
+bytes, not a widening: no path in this loader turns a bf16 weight into anything
+else, and `widen_to_f32` stays opt-in. That does not fit one GB10 beside a
+24 GB text tower, so the arm has been gated on reduced fixtures and on the real
+file's *header*; a full materialization and a render on real weights are still
+owed ([#1048](https://github.com/mudler/vllm.cpp/issues/1048)).
+
+### LTX-2.5 DiT weights: which file, and how to tell them apart
+
+Repo [`Lightricks/LTX-2.5`](https://huggingface.co/Lightricks/LTX-2.5) at
+revision `6c7e5e573ac1667efc83407806fe9b0b93730e60`, read from
+`/api/models/Lightricks/LTX-2.5` on 2026-08-17. Sizes below come from the same
+API's tree listing.
+
+| Arm | File under `diffusion_models/` | Bytes | sha256 |
+|---|---|---:|---|
+| unquantized bf16, FULL (dev) | `ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 | `792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584` (the local copy; see below) |
+| unquantized bf16, distilled | `ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 | not obtainable here |
+| NVFP4 (`nvfp4-prequant`), distilled | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 | not obtainable here |
+| `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
+| `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
+
+**The hub will not give you a content hash for this repo, and it does not say
+so.** `Lightricks/LTX-2.5` is gated — an unauthenticated `resolve` returns
+`Access to model Lightricks/LTX-2.5 is restricted` — and the tree API answers an
+unauthenticated caller with an `lfs.oid` that is **one character repeated 64
+times**, for every LFS file in the repo. It is the right length, it is
+lowercase hex, and `len(oid) == 64` passes. All 14 LFS files share it, which is
+the only cheap tell. So a pinning script that reads that field records five
+different checkpoints under one fabricated digest and reports success. Pinning
+the other four by content needs an authenticated fetch and is owed
+([#1048](https://github.com/mudler/vllm.cpp/issues/1048)); the dev row above is
+the sha256 of the copy on this project's NAS, computed locally, and it has not
+been compared against the published artifact because there is nothing here to
+compare it to.
+
+**The two bf16 transformers are exactly the same SIZE**, and the file name is
+the only cheap thing that separates them. Both are 4349 tensors, both carry the
+same four `__metadata__` keys with `model_version` `2.5.0`. So a mislabelled or
+re-downloaded copy cannot be caught by `ls -l`, and nothing here validates the
+checkpoint *class* at load
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)): pointing
+`--pipeline-kind res2s_two_stage` at the distilled file renders in the wrong
+sampling regime with no diagnostic.
+
+Read from the FULL model's own header on 2026-08-17, by parsing its
+677,616-byte JSON prologue and no payload: 4349 tensors, every one
+`model.diffusion_model.`-prefixed, **4059 BF16 and 290 F32**, zero names ending
+in `_scale`, `_scale_2` or `torchao_nvfp4`, 48 blocks,
+`keyframes_abs_pos_embedding` present and TRAINED as `BF16 [1, 4096]`, the 290
+F32 tensors being exactly the six `*scale_shift_table*` families, and the data
+end plus the 8-byte length plus the header equal to the file size.
+
+The `vonkaiser/LTX-2.5-FP8-NVFP4` FP8 DiT is a separate repo and is pinned where
+the FP8 recipes name it; it carries no `__metadata__` at all, which is why those
+recipes need `--dit-config`.
+
 The gate needs the three checkpoint headers, a vLLM checkout and an LTX-2
 checkout (the two nibble-order authorities); it reads a few hundred bytes at
 their own offsets and never a payload:
