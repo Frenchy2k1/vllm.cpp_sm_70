@@ -28,6 +28,7 @@ These change how the engine runs and have no CLI flag (or complement one).
 | `VT_SERVER_MAX_PROMPT_CHARS` | `200000` characters | Rejects chat-completion prompts larger than this many characters. Set `0` to disable the prompt-size guard |
 | `VT_SERVER_SSE_PING_S` | `0` (off) | Seconds between SSE comment keepalives (`:\n\n`) on silent streams; `<=0` disables. OFF is the default because vLLM's streaming endpoints emit no comment frame at all, and some SSE clients — including vLLM's own `vllm bench serve` — cannot resynchronise after one, silently counting the request FAILED while the server completes it. Set a positive value (clamped to 600) only behind a proxy whose inactivity timeout would otherwise drop a long prefill, and expect strict clients to break. See [#931](https://github.com/mudler/vllm.cpp/issues/931) |
 | `VT_SERVER_MAX_NEW_TOKENS` | `4096` | Clamps the requested generation length to this many new tokens. Set `0` to disable the cap |
+| `VT_TT_HOST_FREE_DECODE` | unset (host-hybrid decode) | Experimental Tenstorrent-only decode-capture mode: residual-RMS + RoPE stay on device at decode shapes, the dense decode graph captures, and `cur_pos` advances on-device inside the trace. Default decode is unchanged without it. An implementer P150 run completed 79 replays; the operator gate and the full-engine golden are still owed A second concurrent request (a padded batch-size change) REFUSES under this flag rather than returning wrong tokens; see #1105 |
 | `VT_BENCH_PRETOKENIZE` | `1` (on) | Makes `vllm-bench` encode every prompt before its benchmark clock and admit token IDs, matching the pinned vLLM comparison frontend. Exact `0` restores timed string admission for same-binary A/B; unset, `1`, and invalid spellings keep the safe default-on behavior |
 | `VT_VULKAN_DEVICE` | first suitable device | Forces the Vulkan physical device index. Required on a multi-GPU host to pin the intended device |
 | `VT_KV_CACHE_F32` | off (native KV dtype) | Forces the KV cache to fp32. A precision/diagnostic lever, at the cost of double the KV memory |
@@ -187,6 +188,7 @@ Read-only observability; none change output.
 |---|---|---|
 | `VT_DFLASH_GRAPH_STATS` | unset | Print DFlash draft-step CUDA-graph capture/replay counts to stderr |
 | `VT_OP_PROVIDER_STATS` | off | Print per-op provider (which backend served each op) statistics |
+| `VT_TT_TRACE_DEBUG` | unset | `=1` prints the Tenstorrent capture bisection traces to stderr: op entries (`[TT-OP]`), host readbacks (`to_vector`/`EnsureHostBytes`), device->device copies/zero-fills, and rope cos/sin cache lookups — all gated to fire only while a mesh-trace capture is active. Read-only diagnostics for the host-free decode investigation; byte-identical output when unset |
 | `VT_OP_PROVIDER_DISABLE` | (none) | Comma-separated provider names to disable, forcing fallback (diagnostic) |
 | `VT_SERVER_PREFILL_PROGRESS` | off | `=1` prints chunked-prefill progress to stderr, rate-limited to roughly 2 Hz per request. `=0` explicitly disables it even when `VT_SERVER_VERBOSE=1` |
 | `VT_GDN_VALIDATE` | off | Run the GDN validation/cross-check path (slower; for kernel debugging) |

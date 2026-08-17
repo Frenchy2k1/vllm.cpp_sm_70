@@ -1145,6 +1145,32 @@ class TenstorrentMistralRowIsCounted(unittest.TestCase):
         )
 
 
+class TenstorrentTraceRunnerRowIsCounted(TenstorrentMistralRowIsCounted):
+    """The BACKEND ratchet bump to 84 is backed by a real row (#1105)."""
+
+    ROW = "BACKEND-TENSTORRENT-TRACE-RUNNER"
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("tenstorrent-trace-runner.md", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/1105", index)
+
+
+class TenstorrentHostFreeForwardRowIsCounted(TenstorrentMistralRowIsCounted):
+    """The BACKEND ratchet bump to 85 is backed by a real row (#1105)."""
+
+    ROW = "BACKEND-TENSTORRENT-HOST-FREE-FORWARD"
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("tenstorrent-host-free-forward.md", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/1105", index)
+
+
 class CudaLlamacppRowIsCounted(TenstorrentMistralRowIsCounted):
     """The BACKEND ratchet bump to 83 is backed by a real row (#979).
 

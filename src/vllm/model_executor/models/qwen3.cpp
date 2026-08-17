@@ -32,6 +32,7 @@
 // overlaps the host-side alloc syncs with GPU compute; it is kept as byte-safe
 // hygiene + code sharing, not a measured TTFT lever. The real dense-TTFT lever
 // is the RoPE cos|sin cache below.
+#include <chrono>
 #include "vllm/model_executor/models/qwen3.h"
 
 #include <algorithm>
@@ -55,6 +56,7 @@
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vt/tenstorrent/tenstorrent_device.h"  // WarmRopeCosSin (item-5 TT-only)
 #include "vt/recipes.h"
 
 namespace vllm {
@@ -76,6 +78,13 @@ using v1::CommonAttentionMetadata;
 // / forward-body machinery below composes them via `using namespace dense_attn`,
 // so the Qwen3-dense (0.6B/4B) forward is byte-identical (same vt:: op order).
 using namespace dense_attn;
+
+// TT-only dump. The getenv is paid only on kTENSTORRENT so a CUDA replay
+// step does not walk the environment twice.
+bool TtDumpKv(const Dev& d) {
+  return d.q.device.type == vt::DeviceType::kTENSTORRENT &&
+         std::getenv("VT_TT_DUMP_KV") != nullptr;
+}
 
 // Dense SwiGLU MLP (qwen3.py::Qwen3MLP=Qwen2MLP): merged gate_up_proj ->
 // SiluAndMul -> down_proj. `dh2` is the post-norm hidden [T,H] bf16.
@@ -456,6 +465,14 @@ std::vector<float> Qwen3DenseModel::Forward(
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
+  if (TtDumpKv(d)) {
+    int argmax = 0;
+    for (int64_t i = 1; i < n_out * config.vocab_size; ++i)
+      if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(argmax)])
+        argmax = static_cast<int>(i);
+    fprintf(stderr, "[TT-DUMP-LOGITS] Forward eager argmax=%d first5=[%f,%f,%f,%f,%f]\n",
+            argmax, logits[0], logits[1], logits[2], logits[3], logits[4]);
+  }
   return logits;
 }
 
@@ -468,6 +485,16 @@ ForwardLogits Qwen3DenseModel::ForwardDevice(
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
                              config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
+  if (TtDumpKv(d)) {
+    std::vector<float> logits_dump(static_cast<size_t>(n_out * config.vocab_size));
+    dlogits.Download(d, logits_dump.data());
+    int argmax = 0;
+    for (size_t i = 1; i < logits_dump.size(); ++i)
+      if (logits_dump[i] > logits_dump[static_cast<size_t>(argmax)])
+        argmax = static_cast<int>(i);
+    fprintf(stderr, "[TT-DUMP-LOGITS] ForwardDevice eager argmax=%d first5=[%f,%f,%f,%f,%f]\n",
+            argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+  }
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }
 
@@ -561,11 +588,19 @@ struct Qwen3DenseDecodeGraph::Impl {
               b.SupportsGraphCapture();
   }
   ~Impl() {
-    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
+    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr) {
+      std::string extra;
+      if (replay_steps > 0) {
+        extra = "; replay branch avg " +
+                std::to_string(static_cast<double>(replay_ns) / 1e6 /
+                               static_cast<double>(replay_steps)) +
+                " ms/step over " + std::to_string(replay_steps) + " steps";
+      }
       std::fprintf(stderr,
                    "[Qwen3DenseDecodeGraph] dense decode graph: %lld total replays "
-                   "across %zu captured size(s)\n",
-                   static_cast<long long>(replays), slots.size());
+                   "across %zu captured size(s)%s\n",
+                   static_cast<long long>(replays), slots.size(), extra.c_str());
+    }
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots)
       if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
@@ -615,6 +650,10 @@ struct Qwen3DenseDecodeGraph::Impl {
   std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
+  // Steady-state timing (VT_DECODE_GRAPH_STATS): wall time of the replay
+  // branch (warm copies + ReplayGraph; excludes the caller's logits readback).
+  int64_t replay_ns = 0;
+  int64_t replay_steps = 0;
 };
 
 Qwen3DenseDecodeGraph::Qwen3DenseDecodeGraph(const Qwen3DenseWeights& weights,
@@ -644,6 +683,16 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   if (!impl_->enabled || S < 0) {
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv,
                           impl_->weights, impl_->config, kNoGather);
+    if (TtDumpKv(d)) {
+      std::vector<float> logits_dump(static_cast<size_t>(vocab));
+      lg.Download(d, logits_dump.data());
+      int argmax = 0;
+      for (int64_t i = 1; i < vocab; ++i)
+        if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
+          argmax = static_cast<int>(i);
+      fprintf(stderr, "[TT-DUMP-LOGITS] eager path argmax=%d first5=[%f,%f,%f,%f,%f]\n",
+              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+    }
     return WrapDeviceLogits(d, std::move(lg), B, vocab);
   }
 
@@ -655,11 +704,81 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   CommonAttentionMetadata pam;
   BuildPaddedDecodeAttn(S, token_ids, positions, attn_meta, ptok, ppos, pam);
 
+  // Debug: dump attention metadata for comparison
+  if (TtDumpKv(d)) {
+    fprintf(stderr, "[TT-DUMP-META] S=%lld B=%lld\n", (long long)S, (long long)B);
+    fprintf(stderr, "[TT-DUMP-META] real: num_reqs=%d num_tokens=%d slot0=%lld seq_len0=%d bt_cols=%d\n",
+            attn_meta.num_reqs, attn_meta.num_actual_tokens,
+            attn_meta.slot_mapping.empty() ? -1LL : (long long)attn_meta.slot_mapping[0],
+            attn_meta.seq_lens.empty() ? -1 : attn_meta.seq_lens[0],
+            attn_meta.block_table_num_cols);
+    fprintf(stderr, "[TT-DUMP-META] pad:  num_reqs=%d num_tokens=%d slot0=%lld seq_len0=%d bt_cols=%d\n",
+            pam.num_reqs, pam.num_actual_tokens,
+            pam.slot_mapping.empty() ? -1LL : (long long)pam.slot_mapping[0],
+            pam.seq_lens.empty() ? -1 : pam.seq_lens[0],
+            pam.block_table_num_cols);
+    fprintf(stderr, "[TT-DUMP-META] real pos0=%d pad pos0=%d\n",
+            positions.empty() ? -1 : positions[0],
+            ppos.empty() ? -1 : ppos[0]);
+  }
+
   // A block-table column-count change reallocates the persistent block_table (the
   // captured H2D copy's source address moves) -> invalidate this slot's graph and
   // re-warm/re-capture.
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam);
+  // HOST-FREE-FORWARD item 5 (TT only): populate the persistent device
+  // rope cos/sin tensors for THIS step's UNPADDED positions (the same T-row
+  // `positions` vector the captured RopeNeox reads via StepInputs), outside
+  // capture, so the captured rope cache-HITs on content. Not ppos.
+  if (d.q.device.type == vt::DeviceType::kTENSTORRENT) {
+    vt::tenstorrent::WarmRopeCosSin(
+        positions.data(), static_cast<int64_t>(positions.size()),
+        impl_->config.num_attention_heads,
+        impl_->config.num_key_value_heads, impl_->config.rotary_dim,
+        static_cast<double>(impl_->config.rope_theta));
+    // ITEM 5 (RAC): stage the persistent device idx/page-table tensors for
+    // the PADDED slot mapping the captured ReshapeAndCache will see. The
+    // kernel keys its cache on si.slot_mapping's host buffer; si builds from
+    // attn_meta (pam here) so this is the same buffer content.
+    // ITEM 5: prime paged-KV device shadows for EVERY layer (MUST run before
+    // WarmRacIdx, which builds the persistent sharded input from the shadows).
+    for (const auto& kv : attn_kv) {
+      const int64_t max_slot = pam.slot_mapping.empty() ? 0
+          : *std::max_element(pam.slot_mapping.begin(), pam.slot_mapping.end());
+      const int64_t used = (max_slot < 0) ? 1
+          : std::max<int64_t>(1, max_slot / kv.block_size + 1);
+      const size_t half = static_cast<size_t>(kv.block_size * kv.num_kv_heads *
+                                               kv.head_size) * vt::SizeOf(kv.dtype);
+      char* base = static_cast<char*>(kv.data);
+      vt::tenstorrent::WarmPagedKvShadow(
+          base, base + half, kv.num_blocks, kv.block_size,
+          kv.num_kv_heads, kv.head_size, used);
+    }
+    // R2: seed the on-device-advanced cur_pos BEFORE WarmRacIdx, so the RAC
+    // path can alias update_idxs to it (eliminating the per-replay
+    // update_idxs copy_to_device — the toxic ~38-replay hang class).
+    if (!pam.seq_lens.empty()) {
+      vt::tenstorrent::WarmDecodePos(
+          pam.seq_lens.data(), static_cast<int64_t>(pam.num_reqs));
+    }
+    vt::tenstorrent::WarmRacIdx(
+        pam.slot_mapping.data(), pam.slot_mapping.data(),
+        static_cast<int64_t>(pam.slot_mapping.size()),
+        attn_kv.empty() ? 32 : attn_kv[0].block_size,
+        pam.block_table_tensor.data(),
+        static_cast<int64_t>(pam.block_table_num_cols),
+        pam.seq_lens.data());
+    // ITEM 5 (PA): warm persistent page_table + cur_pos device tensors.
+    if (!pam.block_table_tensor.empty() && !pam.seq_lens.empty()) {
+      vt::tenstorrent::WarmPaMeta(
+          pam.block_table_tensor.data(),
+          static_cast<int64_t>(pam.num_reqs),
+          static_cast<int64_t>(pam.block_table_num_cols),
+          static_cast<int64_t>(pam.block_table_num_cols), 1,
+          pam.seq_lens.data());
+    }
+  }
   s.fa_cols = cols;
   if (cols_changed && s.graph != nullptr) {
     b.DestroyGraph(s.graph);
@@ -668,13 +787,67 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     s.warm = false;
   }
 
-  // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
-  // persistent hidden buffer, then relaunch the captured layer region.
-  if (s.captured) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  // Fast path: this size's graph is captured. On TT, refresh the persistent
+  // decode-ids tensor (allocation-free) and replay — the embedding itself is
+  // INSIDE the captured region, so a replay step performs zero eager device
+  // allocations (eager alloc/free churn around a live trace hung the device
+  // ~60 replays in). CUDA keeps the outside-the-graph EmbedInto.
+  // VT_TT_RECAPTURE_EVERY=N (TT only): destroy and re-capture the graph every
+  // N replays. WORKAROUND for the deterministic ~38-replay completion hang on
+  // this tt-metal build: a replayed mesh trace stops completing (futex wait
+  // in the post-replay readback) after ~38 replays of one trace id,
+  // independent of interleaved eager-copy count and readback count.
+  // Re-capturing resets the per-trace device state; the eager re-warm step
+  // and capture step run with NO live trace (DestroyGraph releases it), so
+  // eager allocations are legal there.
+  bool do_replay = s.captured;
+  if (do_replay && d.q.device.type == vt::DeviceType::kTENSTORRENT) {
+    const char* rc_env = std::getenv("VT_TT_RECAPTURE_EVERY");
+    const int rc_n = rc_env != nullptr ? std::atoi(rc_env) : 0;
+    if (rc_n > 0 && s.replays >= rc_n) {
+      if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
+        std::fprintf(stderr,
+                     "[TT-STEP] recapture: destroying graph after %lld replays "
+                     "(every %d)\n",
+                     static_cast<long long>(s.replays), rc_n);
+      b.DestroyGraph(s.graph);
+      s.graph = nullptr;
+      s.captured = false;
+      s.warm = false;
+      do_replay = false;
+    }
+  }
+  if (do_replay) {
+    const auto replay_t0 = std::chrono::steady_clock::now();
+    if (d.q.device.type == vt::DeviceType::kTENSTORRENT) {
+      vt::tenstorrent::WarmDecodeIds(
+          s.token_ids.data(), static_cast<int64_t>(s.token_ids.size()));
+    } else {
+      EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    }
+    if (TtDumpKv(d)) {
+      std::vector<float> pre(static_cast<size_t>(vocab));
+      s.logits->Download(d, pre.data());
+      fprintf(stderr, "[TT-DUMP-LOGITS] pre-replay first5=[%f,%f,%f,%f,%f]\n",
+              pre[0], pre[1], pre[2], pre[3], pre[4]);
+    }
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;
+    impl_->replay_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - replay_t0)
+                            .count();
+    ++impl_->replay_steps;
+    if (TtDumpKv(d)) {
+      std::vector<float> logits_dump(static_cast<size_t>(vocab));
+      s.logits->Download(d, logits_dump.data());
+      int argmax = 0;
+      for (int64_t i = 1; i < vocab; ++i)
+        if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
+          argmax = static_cast<int>(i);
+      fprintf(stderr, "[TT-DUMP-LOGITS] replay step argmax=%d first5=[%f,%f,%f,%f,%f]\n",
+              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+    }
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -682,10 +855,36 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   // this size by the previous (eager) step. CAPTURE the layer region once,
   // instantiate the graph, then launch it.
   if (s.warm) {
-    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    const bool tt_dev = d.q.device.type == vt::DeviceType::kTENSTORRENT;
+    if (tt_dev) {
+      // Stage ids for the captured embedding (outside capture).
+      vt::tenstorrent::WarmDecodeIds(
+          s.token_ids.data(), static_cast<int64_t>(s.token_ids.size()));
+    } else {
+      EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    }
     b.BeginCapture(impl_->queue);
+    if (tt_dev) {
+      // Capture-safe embedding over the persistent ids tensor, writing the
+      // persistent hidden shadow the layer region reads.
+      Tensor dtab = ResidentWeight(d, impl_->weights.embed_tokens,
+                                   {impl_->config.vocab_size,
+                                    impl_->config.hidden_size});
+      vt::tenstorrent::EmbedDeviceIdsInto(
+          s.hidden->ptr(), S, impl_->config.hidden_size, dtab.data,
+          impl_->config.vocab_size, impl_->config.hidden_size,
+          static_cast<int64_t>(s.token_ids.size()));
+    }
     DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
                             impl_->weights, impl_->config, kNoGather);
+    // R2: advance cur_pos on-device (plus_one) INSIDE the captured trace, at
+    // the END of the body (after all reads of cur_pos in sdpa_decode/RAC).
+    // The NEXT replay sees cur_pos+1 — eliminating the per-replay cur_pos /
+    // update_idxs copy_to_device (the toxic ~38-replay hang class).
+    if (tt_dev && !pam.seq_lens.empty()) {
+      vt::tenstorrent::CaptureDecodePosAdvance(
+          static_cast<int64_t>(pam.num_reqs));
+    }
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
@@ -698,6 +897,16 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     b.ReplayGraph(impl_->queue, s.graph);
     s.replays = 1;
     ++impl_->replays;
+    if (TtDumpKv(d)) {
+      std::vector<float> logits_dump(static_cast<size_t>(vocab));
+      s.logits->Download(d, logits_dump.data());
+      int argmax = 0;
+      for (int64_t i = 1; i < vocab; ++i)
+        if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
+          argmax = static_cast<int>(i);
+      fprintf(stderr, "[TT-DUMP-LOGITS] capture step argmax=%d first5=[%f,%f,%f,%f,%f]\n",
+              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+    }
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -708,6 +917,17 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
                           impl_->weights, impl_->config, kNoGather);
+  // Debug: dump logits first 5 values
+  if (TtDumpKv(d)) {
+    std::vector<float> logits_dump(static_cast<size_t>(vocab));
+    lg.Download(d, logits_dump.data());
+    int argmax = 0;
+    for (int64_t i = 1; i < vocab; ++i)
+      if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
+        argmax = static_cast<int>(i);
+    fprintf(stderr, "[TT-DUMP-LOGITS] cold step argmax=%d first5=[%f,%f,%f,%f,%f]\n",
+            argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+  }
   s.warm = true;
   s.captured = false;
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
