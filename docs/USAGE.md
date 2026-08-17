@@ -3491,8 +3491,12 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
-This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
-(those stay lab-only until a CUDA token-exact gate can land them).
+GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
+so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
+test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
+restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
+until a CUDA token-exact gate can land them).
 
 ## LTX-2.5 text conditioning
 
