@@ -68,9 +68,17 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | acceptance | box sm_70: `test_nccl_group` 10/10, `test_sm70_fa2_decode` 5/5, `test_cuda_backend` 7/7 (58), `test_qwen36_paged_engine` 35B case token-equality 149/149. The 27B/35B paged-engine guards (`qwen27/36`) require `VLLM_CPP_TRITON=ON` + cutlass build — this box build has TRITON=OFF, so those throw as build guards (unchanged by this edit), not as a regression |
 | next | real multi-GPU token-equal gate still requires the attention row/col shard step (new sharded-attention primitive) → head → runner attach |
 
-| commit | `8d303584` |
-| change | `vt_cuda_sharded_forward_selfcheck`: y=Wx sharded (each rank a K-slice of columns on ITS device), per-rank real device GEMM, NCCL group all-reduce → full y == unsharded single-GPU ref. Fixed local-vs-global x indexing |
-| acceptance | 4×V100: collectives + TP-seam + loader-slice + runner-forward all pass (4/4) |
+## Multi-device phase 7 — KV/GQA-shard attention primitive · GREEN
+
+| commit | `c643c311` |
+| change | `vt_cuda_attn_kv_shard_run` + kernel `AttnKvShardPartial`: softmax num/den are both additive over the kv dimension, so a rank owning a kv-head slice computes partial exp(v) and exp-sum on ITS device; group AllReduceSum reduces both, out = num/den. Full [T,Hq,D] query on every rank. Returns 0 on full-kv host reference parity |
+| acceptance | box sm_70: `test_nccl_group` 11/11 incl. model-free KV-split test (T=3,Hq=4,Hkv=8) == single-GPU softmax attention |
+
+## Multi-device phase 8 — lm_head column-shard + AllGather primitive · GREEN
+
+| commit | `87e78ce` |
+| change | `vt_cuda_lm_head_shard_run` + `LmHeadShardPartial`: vocab-column-parallel head, each rank computes [T,per] partial logits on ITS device, group AllGather concatenates the disjoint-vocab slices into full [T,V] (rank-major → token-major reassembly). Returns 0 vs full-vocab host reference |
+| acceptance | `test_nccl_group` 12/12, 479 assertions on the box |
 
 ## 27B-AWQ oracle capture · deterministic
 

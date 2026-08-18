@@ -109,32 +109,39 @@ test now committed + 10/10 green — see below).
   the shard's `[out,in]` f32 layout, then run the group-sharded dense-MLP per
   token over the in-process NCCL group, writing the reduced `[T,H]` bf16 back.
   tp1 (null) never enters → resident tensor-core path byte-identical; non-NCCL
-  builds fault loudly. Box regression: nccl 10/10, fa2 5/5, backend 7/7
+builds fault loudly. Box regression: nccl 10/10, fa2 5/5, backend 7/7
   (58), qwen36 paged-engine 35B case token-equality 149/149 green.
-  (The 27B/35B :p  outcomes with the guard `qwen27/36 paged-engine require
-  `VLLM_CPP_TRITON=ON` + cutlass; this box build has TRITON=OFF, so the
-  environments gate measures the build — unchanged by this edit.)
+  (The 27B/35B paged-engine gates require `VLLM_CPP_TRITON=ON` + cutlass; this
+  box build has TRITON=OFF, so those gates measure the build — unchanged.)
+- `c643c311` **KV/GQA-shard attention primitive** (`vt_cuda_attn_kv_shard_run`):
+  KV-column split across ranks; softmax num/den both additive over kv, the group
+  AllReduceSum reduces both → out = num/den. `test_nccl_group` 11/11 incl. a
+  model-free KV-split (T=3,Hq=4,Hkv=8) == single-GPU softmax test.
+- `87ee78ce` **lm_head column-shard + AllGather primitive**
+  (`vt_cuda_lm_head_shard_run`): per-rank [T,per] partial logits, group AllGather
+  → full [T,vocab]. `test_nccl_group` 12/12, 479 assertions.
 
 ## The remaining work (TP step 2 → end-to-end tp>1 decode)
 
-Authoritative spec: `.agents/specs/tp-rollout.md`. The current work (steps 1–9
-above) is all PRIMITIVES + threading + guards. The real multi-GPU decode still
-needs:
+Authoritative spec: `.agents/specs/tp-rollout.md`. The three row/col-parallel
+PRIMITIVE bricks (dense-MLP, attention-KV, lm_head) are committed + green on
+the box; the forward/runner still guard `tp>1` (fail-loudly per do-not-break).
+The real multi-GPU decode still needs the WIRING:
 
-1. **`DenseMlpBlock` tp>1 branch** (the next commit): replace the `tp>1 → throw`
-   with: decode the resident fp4/bf16 `gate_proj_fp4|up|down_proj` (host decode
-   now exists) → per-rank `TpShard` slice → `vt_cuda_mlp_shard_run`/`_bf16` →
-   write the reduced `[T,H]` back. tp1 keeps the resident fp4 tensor-core path
-   (byte-identical by construction: tp null → branch never entered).
-2. **Attention + KV/GQA shard** per rank (`qkv` col / `o` row-reduce; GQA KV
-   split) — the other row/col-parallel block in `RunDenseLayerPaged`.
-3. **Head (lm_head)** column-shard + `AllGather` into full logits.
-4. **Runner attach**: `LoadedEngine` / the server create acquires
-   `vt_cuda_tp_acquire(VLLM_TP || device_count)` and threads a per-rank
-   `TensorParallel` into the model; `tp>1` runs per-rank workers.
+1. **`DenseMlpBlock` tp>1 branch** — DONE (`66f48f80`): host-decode fp4/bf16
+   gate/up/down → `vt_cuda_mlp_shard_run`/`_bf16` per token → reduced `[T,H]`.
+   tp1 keeps the resident fp4 tensor-core path (tp null → branch never entered).
+2. **Attention + KV/GQA shard** — primitive DONE (`c643c311` `vt_cuda_attn_kv
+   _shard_run` kv-split + AllReduceSum); the paged-KV per-rank slice wiring in
+   `RunDenseLayerPaged` (GQA KV-split open question) remains.
+3. **Head (lm_head)** column-shard + `AllGather` — primitive DONE (`87ee78ce`);
+   hook into the engine head path remains.
+4. **Runner attach**: `LoadedEngine` / server acquires `vt_cuda_tp_acquire(
+   VLLM_TP || device_count)` and threads a per-rank `TensorParallel` into the
+   model; `tp>1` runs per-rank workers.
 5. **Token-equal gate**: a tp==tp1 check on a real model (e.g., the Qwen3.8-27B
    once loaded, or the 27B/35B) — the gate that must pass before tp>1 is
-   "claimed."
+   "claimed." UNREACHED until the wiring lands.
 
 After Qwen3.5 dense (and MoE) reach token-equal, the spec's "all Forwards
 threading" phase: add the null-default `tp` to the ~58 other hand-rolled arch
