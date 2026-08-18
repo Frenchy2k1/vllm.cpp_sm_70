@@ -35,6 +35,7 @@
 
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Gdn/FullAttn weights, TensorResolver
+#include "vllm/model_executor/models/tensor_parallel.h"   // vllm::TensorParallel (TP forward param)
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -322,7 +323,7 @@ class Qwen3_5DenseModel {
                                     const std::vector<GdnStateCache>& gdn_state,
                                     const Qwen3_5DenseWeights& weights,
                                     const HfConfig& config, vt::Queue& queue,
-                                    const std::vector<int32_t>& logits_indices = {});
+                                    const std::vector<int32_t>& logits_indices = {}, const vllm::TensorParallel* tp = nullptr);
 
   // DEVICE-resident variant of Forward (sampler-on-device hot path): same contract
   // as Forward but returns the lm_head output as a pool-backed DEVICE buffer
@@ -335,7 +336,7 @@ class Qwen3_5DenseModel {
       const std::vector<PagedKvCache>& attn_kv,
       const std::vector<GdnStateCache>& gdn_state,
       const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {}, const vllm::TensorParallel* tp = nullptr);
 
   // ForwardDevice + the DRAFTER hidden-state tap (SPEC-MTP I5c). Byte-identical
   // logits to ForwardDevice, and additionally moves the full [num_actual_tokens, H]
@@ -349,7 +350,7 @@ class Qwen3_5DenseModel {
       const std::vector<GdnStateCache>& gdn_state,
       const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
       Qwen3_5MTPHiddenStates* hidden_out,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {}, const vllm::TensorParallel* tp = nullptr);
 
   // ForwardDevice + the DFlash multi-layer aux hidden taps (SPEC-DFLASH D1,
   // DF-AUX-TAPS). Byte-identical logits to ForwardDevice; additionally captures
@@ -366,7 +367,7 @@ class Qwen3_5DenseModel {
       const std::vector<GdnStateCache>& gdn_state,
       const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
       Qwen3_5AuxTaps* aux_out,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {}, const vllm::TensorParallel* tp = nullptr);
 
   // Dense single-sequence reference forward (M0.9 anchor). Runs the whole model
   // for a single non-paged sequence and returns logits [T, vocab] f32 (T =
