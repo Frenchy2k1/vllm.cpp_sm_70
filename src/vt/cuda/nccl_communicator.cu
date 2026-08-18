@@ -569,6 +569,87 @@ __global__ void DenseMlpRankPartial(const float* x, int H, const float* gate,
   out[o] = acc;
 }
 
+
+// Reusable real-shape dense-MLP shard over the in-process NCCL group. Computes
+//   out[o] = sum_i silu(gate_i^T x) * (up_i^T x) * down[o,i]
+// with rank r owning I/W of the I intermediate on its device (gate/up column
+// slices, down row slice) and the group AllReduceSum over [O] partial. The
+// engine DenseMlpBlock tp>1 hook calls this with the layer H/I/O + decoded fp4
+// slices. Returns 0 on parity with the on-host reference, 1 mismatch, 2 on
+// fewer than 2 GPUs (or NCCL unbuilt; caller keeps its tp1 path).
+extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
+                                     const float* x, const float* gate,
+                                     const float* up, const float* down,
+                                     float* out) {
+  if (O <= 0 || H <= 0 || I <= 0) return 1;
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  if (I % W != 0) { delete g; return 1; }
+  const int64_t per = I / W;
+
+  // host reference.
+  std::vector<float> ref((size_t)O, 0.f);
+  for (int o = 0; o < O; ++o) {
+    double a = 0.0;
+    for (int i = 0; i < I; ++i) {
+      float gv = 0.f, uv = 0.f;
+      for (int k = 0; k < H; ++k) { gv += x[k] * gate[i * (size_t)H + k]; uv += x[k] * up[i * (size_t)H + k]; }
+      const float sg = 1.f / (1.f + std::exp(-(double)gv));
+      a += (double)((gv * sg) * uv) * down[o * (size_t)I + i];
+    }
+    ref[o] = (float)a;
+  }
+
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      cudaStream_t st = nullptr;
+      float *dx=nullptr,*dgu=nullptr,*dd=nullptr,*dout=nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, (size_t)H * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dgu, (size_t)(2 * I * H) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dd, (size_t)(O * I) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dout, (size_t)O * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); if (st) cudaStreamDestroy(st);
+        return;
+      }
+      std::vector<float> gu((size_t)(2 * I * H), 0.f);
+      for (int64_t i = ib; i < ib + per; ++i)
+        for (int k = 0; k < H; ++k) {
+          gu[(size_t)(i * H + k)] = gate[i * (size_t)H + k];
+          gu[(size_t)(((I + i) * H + k))] = up[i * (size_t)H + k];
+        }
+      std::vector<float> dmask((size_t)(O * I), 0.f);
+      for (int o = 0; o < O; ++o) for (int64_t i = ib; i < ib + per; ++i) dmask[o * I + i] = down[o * I + i];
+      cudaMemcpyAsync(dx, x, (size_t)H * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dgu, gu.data(), (size_t)(2 * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dd, dmask.data(), (size_t)(O * I) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      DenseMlpRankPartial<<<(unsigned)((O + 31) / 32), 32, 0, st>>>(
+          dx, H, dgu, dgu + (size_t)(I * H), dd, dout, (int)per, (int)ib, (int)I, (int)O);
+      Queue q; q.device = Device{DeviceType::kCUDA, r}; q.handle = st;
+      g->Rank(r)->AllReduce(q, dout, (size_t)O, DType::kF32, ReduceOp::kSum);
+      std::vector<float> back((size_t)O, 0.f);
+      cudaMemcpyAsync(back.data(), dout, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      if (r == 0) { for (int o = 0; o < O; ++o) out[o] = back[(size_t)o]; }
+      for (int o = 0; o < O; ++o)
+        if (std::fabs(back[(size_t)o] - ref[(size_t)o]) > 1e-3f) bad.store(1, std::memory_order_relaxed);
+      cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
 extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void) {
   vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
   if (!g) return 2;
