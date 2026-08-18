@@ -36,6 +36,7 @@ never append.
 | [#534](https://github.com/mudler/vllm.cpp/issues/534) | `SERVE-ASYNC-LLM` | Punch-list item 9 (`ROAD-V1-C6`) directs a depth-2 throughput lever the project refuted (`6ea7856`) and a `runner_supports_async` flip that landed (`a0013a2`) 10 days before the item was written; the one real residual is `ENG-PRIORITY-SCHED`'s priority-vs-FCFS gate, which does not exist | bug |
 | [#168](https://github.com/mudler/vllm.cpp/issues/168) | `BACKEND-CUDA-SM110` | Jetson AGX Thor (sm_110): 32B NVFP4, Tekken tokenizer blocker | feature |
 | [#433](https://github.com/mudler/vllm.cpp/issues/433) | `BACKEND-GATE-CPU-LLAMACPP` | No x86_64 arm: the closed CPU floor is Arm/i8mm-only and every lever that closed it is Arm-specific | perf |
+| [#529](https://github.com/mudler/vllm.cpp/issues/529) | `BACKEND-GATE-CPU-LLAMACPP` | `test_cpu_x86_llamacpp_floor` fails on a BUSY host, so preflight can fail itself: the contended-leg test asserts exit 2 but the unpinned real-loadavg quiet window exits 4 first | bug |
 | [#199](https://github.com/mudler/vllm.cpp/issues/199) | `BACKEND-METAL-MLX` | macOS MLX build fails on `-Werror` in MLX headers | bug |
 | [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
 | [#132](https://github.com/mudler/vllm.cpp/issues/132) | `BACKEND-ROCM` | ROCm `-O0` RmsNorm CLR HostcallListener teardown deadlock | bug |
@@ -101,6 +102,7 @@ never append.
 | [#314](https://github.com/mudler/vllm.cpp/issues/314) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE` glue half: `glm4`/`phi3` still hand-call add+RMSNorm instead of `vt::FusedChain` (split out of #299, which closed the merged-GEMM half only) | bug |
 | [#337](https://github.com/mudler/vllm.cpp/issues/337) | `ROAD-V1-C1` | `FUSION-DENSE-MIGRATE`: the five dgx SACRED paged-engine gates are OWED after the merged-GEMM fold (`test_{commandr,glm4,minicpm,minicpm3,phi3}_paged_engine` SKIP on a CPU box) | bug |
 | [#338](https://github.com/mudler/vllm.cpp/issues/338) | `ROAD-V1-C1` | MiniCPM/MiniCPM3 hard-code SiLU: upstream `MiniCPMMLP` (`minicpm.py:219-226`) selects `FatreluAndMul` on `hidden_act == "fatrelu"` and raises otherwise; our `parse_config` never reads `hidden_act` | bug |
+| [#527](https://github.com/mudler/vllm.cpp/issues/527) | `ROAD-V1-C2-LOCAL-BF16` | Punch-list item 14 directs work that landed 2026-07-27 (`deed7c2a1`, default-ON `1718bf155`), on a 497-`cudaStreamSynchronize` premise the same commit refuted | bug |
 | [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
 | [#238](https://github.com/mudler/vllm.cpp/issues/238) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprobs_mode`: three of four modes are runtime-refused stubs | bug |
 | [#264](https://github.com/mudler/vllm.cpp/issues/264) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprob_token_ids`: generative scoring over an explicit token set is unported | feature |
