@@ -53,29 +53,45 @@ Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
    inside a CUDA graph bit-identically to eager (dev 0.000e+00); gates out any
    host-sync leak into the captured steady-state decode. Commit `cd5b2782`.
 
-## Multi-device / TP status (2026-08-12)
+## Multi-device / TP status (2026-08-18)
 
-- vllm.cpp engine is a **single-worker, tp_size==1** runner: `qwen3_*` model
-  class treats tp_size as a no-op ("tp_size==1 ⇒ whole tensors + all-reduce
-  identity"). TP in the fork that ran -tp4 on the V100 was **upstream 1Cat-vLLM**,
-  not this engine.
-- NCCL TP transport exists (`vt/cuda/nccl_communicator.cu`, PORTED 1:1) but is
-  build-gated `VLLM_CPP_NCCL` (our build is **OFF**) and is infrastructure only,
-  not wired into a multi-worker runner.
-- **Next phase: multi-device TP on sm70.** Volta is NOT the blocker (NCCL +
-  per-shard sm70 kernels are fine); the work is a real build (enable
-  `VLLM_CPP_NCCL`, NCCL lib on the box, runner slice/all-reduce wiring).
+The sm_70 TP rollout is COMPLETE through the end-to-end dense token gate:
 
-### Multi-device — Phase 1 DONE (2026-08-12)
-- **NCCL transport compiled into the sm70 build.** `VLLM_CPP_NCCL=ON`, NCCL from
-  the conda torch's bundled `nvidia/nccl` (`libnccl.so` symlink + header).
-  `nccl_communicator.cu` compiles to the REAL `vt::Communicator` (VT_NCCL=1),
-  links into `libvllm.a`; `test_sm70_fa2_decode` still 5/5 SUCCESS (single
-  device unchanged).
-- Phase 2 (next): per-op `cudaSetDevice` affinity so a device-i backend
-  allocates/launches on GPU i (the code flagged CREAMSKILL gap in
-  `cuda_backend.cu`); Phase 3: runner slice + AllReduce/AllGather wiring for
-  tp>1 across the 4×V100.
+- The engine remains a **single-worker, tp_size==1** runner by default; the whole
+  multi-device path is ADDITIVE (a null-default `tp` threads every forward, so the
+  single-GPU engine is byte-identical). The distributed path runs when a caller
+  passes a `TensorParallel` with tp_size>1.
+- **NCCL TP transport (`VLLM_CPP_NCCL=ON`)** compiled into the sm70 build
+  (VT_NCCL=1) with the conda torch's bundled `nvidia/nccl`.
+- **Per-device affinity DONE**: `CudaDeviceScope` on every device-touching
+  `CudaBackend` method — a `Device{kCUDA,i}` backend operates on GPU i
+  (`test_cuda_backend` 7/7).
+- **In-process collectives DONE**: `ncclCommInitAll` in one process,
+  `vt::CudaCommGroup` + `vllm::{TensorParallel,TpShard,TpAllReduceSum}` seam,
+  loader slice, runner forward; `test_nccl_group` 10/10.
+
+### Multi-device — TP step-2 DONE (2026-08-18): per-rank dense decode + token gate
+Three row/col-parallel PRIMITIVES + wiring, all committed + green:
+1. **DenseMtpBlock tp>1** (`66f48f80`): host-decode fp4/bf16 gate/up/down →
+   `vt_cuda_mlp_shard_run`/`_bf16` per token → reduced `[T,H]`.
+2. **KV/GQA-shard attention** (`c643c311`+`9e246680`): softmax num/den both
+   additive over kv — rank owns a kv-head slice, AllReduceSum reduces both,
+   out = num/den; causal `[S,Hkv,D]` window.
+3. **lm_head column-shard + AllGather** (`87ee78ce`): vocab-column-parallel,
+   per-rank `[T,per]` partial logits, AllGather → `[T,vocab]`.
+4. **Wiring + device-boundary fix** (`40bad253`): FullAttn/DenseMtpBlock thread
+   tp; KV-head-split attention outputs the COMPLETE softmax per rank so o_proj
+   stays a full GEMM. Fixed `ncclCommInitAll`/`Destroy` re-binding the calling
+   thread's CUDA device (invalid-resource-handle) — both shard entries +
+   `CudaCommGroup::Create` now save/restore the caller device.
+- **REAL token-equal gate REACHED**: `test_op_parity -tc="qwen27 dense logits
+  tp==tp1*"` on the actual 27B NVFP4 gives **4-GPU dense == tp1
+  (8 tokens identical), SUCCESS** (the gate the spec marked UNREACHED).
+
+Regression: `test_nccl_group` 12/12 (479), fa2 5/5, backend 7/7, 35B engine
+token-equality 149/149 — tp1 path byte-identical.
+Deferred: per-rank **paged-KV** in the `RunDenseLayerPaged` decode path, MoE
+(A3B) expert TP.
 
 ## Known near-tie / caveats
 
@@ -88,10 +104,10 @@ Cross-route caveat, fixed: the 27B-AWQ oracle and the NVFP4 fast paths are
 
 ## Next
 
-1. **Multi-device TP on sm70 (in progress).** Enable `VLLM_CPP_NCCL` in the
-   build, bring NCCL onto the box, wire the runner slice + all-reduce/all-gather
-   so -tp>1 works across the 4×V100. Volta-gen networks fine; the kernels are
-   already per-shard.
+1. ~~**Multi-device TP on sm70 (in progress).**~~ **DONE** — TP step-2 dense
+   decode wired + real tp==tp1 token gate reached (2026-08-18). Volta-gen
+   networks fine; kernels already per-shard. Remaining stretch: per-rank
+   paged-KV in `RunDenseLayerPaged`, MoE (A3B) expert TP (both deferred).
 2. Ada semantic oracle: `oracle-ada` at `55596792…` (Dockerfile updated for the
    24.04 PEP-668 base AND the cu128 torch pin — driver-capped, no driver change)
    when an Ada host is available.
