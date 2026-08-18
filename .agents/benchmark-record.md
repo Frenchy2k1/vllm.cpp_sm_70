@@ -23384,3 +23384,68 @@ on the same day.
 The case counts moved on both suites, so neither run is a filter that matched
 nothing. The red assertion-count is 113 rather than 114 because the `REQUIRE` on
 `last_selected` aborted the case before its last `CHECK`.
+
+## KERNEL-MOE-ROUTER-WARP — first DEVICE run of a kernel that had never been compiled; kernel-level 1.363x ESTABLISHED, step-level NOT SEPARABLE; and the canonical 35B grid is STALE (2026-08-12, `row/A-35B-RESIDUAL`, base `origin/main` `bbc482a2`, source `6c3be5c3`, GB10 sm_121a, #378)
+
+Ran under punch-list item 5 of [roadmap-v1-completion.md](specs/roadmap-v1-completion.md) §3
+(`ROAD-V1-A`, "close the 35B c1/c2 residual"). Two findings, one of them a record correction
+that matters more than the measurement.
+
+**1. The warp-shuffle MoE router had NOT landed.** The premise this task was dispatched on —
+that the router landed and took 35B c1/c4 to ~0.98x — is false in both halves. `git
+merge-base --is-ancestor` says none of `9f7afa7a`, `cce81c7e`, `be6a1f57`, `4f4ee725` is an
+ancestor of `bbc482a2`, and `git log -S` on `MoeRouterTopKWarpKernel`,
+`MoeRouterWarpEnabled`, `VT_MOE_ROUTER_WARP`, `MoeRouterWarpTreeSum` and `moe_router_warp`
+returns **0 commits on main** for every one of them. The work sits on a local-only branch
+`row/KERNEL-MOE-ROUTER-WARP`, never pushed to origin, no PR, 9 commits behind main, and
+`cce81c7e` states outright that the `.cu` was never compiled or run. The tree never claimed
+otherwise: `KERNEL-MOE-ROUTER-WARP` appears in no matrix and no doc on main. So the 35B
+residual was, in this part, a **landing** problem and not an optimisation problem.
+
+The `~0.98x / 0.87x / 0.92x` figures in the dispatch appear to be the **`SPEC-DSPARK`** row
+(`0.870x-0.981x` -> `0.986x-0.995x`, #442) — speculative decoding, a different row — not the
+router and not the 35B grid.
+
+**2. The canonical 35B grid on record is STALE.** `docs/BENCHMARKS.md` carries "CANONICAL
+2026-08-11 @`348c265d`: 0.918x-0.972x (c1 0.9708, c2 0.9293, c4 0.9719, c8 0.9183, c16
+0.9264, c32 0.9377)". `348c265d` is an ancestor of main, but **136 `src/`+`include/` commits
+have landed since**, including `972a152c` *"perf(35B): shared-expert down_proj emits bf16 —
+one CastF32 per layer-step gone (+2.05% c8)"*, which merged **1 h 36 min after** the grid was
+captured and reports +2.05% c8 / +0.79% c4 measured, bit-identical. Holding the vLLM arm
+fixed that implies c8 ~0.937 and c4 ~0.980 today — an **estimate, not a measurement**. So the
+honest answer to "where is the 35B gap today" is: **nobody knows, and a regrid is owed**; the
+last measured value is stale in our favour by at least one landed lever. No axis is claimed
+closed and none is claimed open beyond what `348c265d` measured.
+
+**3. The router, measured for the first time.** Full method, gate table and caveats in
+[moe-router-topk-single-warp.md](specs/moe-router-topk-single-warp.md) §12. Summary:
+
+- It **compiles** — not previously known. Correctness holds everywhere: gates 1/2/3/6 green,
+  35B `test_qwen36_paged_engine` **315/315 on both arms of the same binary**, plus six more
+  green legs during the A/B. Gate-1 mutation RED re-proven (76 assertions, 2 cases).
+- Which kernel ran is proven **by name** in `nsys --cuda-graph-trace=node`:
+  `MoeRouterTopKWarpKernel<__nv_bfloat16,(int)8>` (VPT=8 = E=256) in the ON arm with no block
+  kernel present, and the converse under `VT_MOE_ROUTER_WARP=0`. 1280 calls in every leg.
+- **Kernel-level, 3 reps/arm order-alternated, one flock:** warp 10.422 ms (10.307/10.529)
+  vs block 14.201 ms (14.141/14.275) — **-3.779 ms, -26.6%, 1.363x, bands non-overlapping.**
+- **Step-level: NOT SEPARABLE, not claimed.** Total GPU-busy read 1601.890 vs 1619.395 ms
+  (ratio 0.9892) but the *unchanged* kernels — identical code, identical 155,310 launches —
+  differ 13.726 ms between arms with a 24.140 ms spread across the six legs, **6.4x the
+  3.779 ms effect**. The window is prefill+decode aggregated, which dilutes 40 router
+  calls/step across ~1600 ms. Sized against #378's 16.1863 ms/step decode GPU-busy the saving
+  is **0.083-0.118 ms/step = ~0.5-0.75% of decode GPU-busy**, i.e. **below** #378's ~1.5%
+  estimate: the warp kernel closes ~79% of the gap to `topkGating` (12.98 -> 8.14 us/call
+  mean vs 6.85), not all of it.
+- Therefore **no default-flip credit** under spec gate 7, and #378 cannot close `ROAD-V1-A`
+  alone — as its own §10 already said.
+
+**Denominator note.** No vLLM arm was run here, so no ratio-vs-vLLM is asserted. The pinned
+oracle source is at the pin (`5559679229bc`, asserted by commit), but the shared
+`~/venvs/vllm-oracle` symlink currently resolves to `vllm-oracle-v0.25.0-stage`, **not** the
+pin; it was left untouched for other sessions. Any denominator taken through that symlink is
+the 0.25.0 rollback — the caveat #378 already carries.
+
+**Next traceable hypotheses:** a decode-only profiler window to turn the 0.5-0.75% estimate
+into a measurement; then the gate-GEMM epilogue fold and batching the 40 per-step launches.
+No ceiling is declared. **Owed:** gate 5 `compute-sanitizer memcheck`; the 35B canonical
+regrid on current main; a vLLM denominator re-measured against the pin.
