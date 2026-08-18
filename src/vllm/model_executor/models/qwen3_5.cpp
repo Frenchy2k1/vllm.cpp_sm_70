@@ -30,6 +30,23 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+
+// Multi-device (TP step-2) dense-MLP shard entry points. Compiled under VT_NCCL
+// (src/vt/cuda/nccl_communicator.cu); same primitives test_nccl_group.cpp
+// links against. The tp>1 DenseMlpBlock branch below calls these to run the
+// per-rank distributed silu-mul MLP (host-parity in-process group) and faults
+// loudly when the collective transport is absent.
+#ifdef VT_NCCL
+extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
+                                        const uint8_t* scale8, const float* scale2,
+                                        float* out);
+extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I, const float* x,
+                                       const float* gate, const float* up,
+                                       const float* down, float* out);
+extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I, const uint16_t* x16,
+                                           const uint16_t* gu16, const uint16_t* dn16,
+                                           float* out);
+#endif  // VT_NCCL
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -7299,11 +7316,123 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                    const Tensor& dh, int64_t T,
                    const vllm::TensorParallel* tp = nullptr) {
   const int64_t I = cfg.intermediate_size;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense MLP: tp>1 per-rank gate/up/down shard not yet hooked (shard primitive landed; wiring next)");
+  const int64_t H = cfg.hidden_size;  // dense in/out width == hidden size
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
+  // Multi-device (tp>1): the real per-rank shard. Host-decode the resident
+  // fp4/bf16 weights into the shard's [out,in] f32 layout, then run the group
+  // sharded dense-MLP per token (one token x [H] -> one reduced token the group
+  // sums on rank 0), writing the reduced [T,H] bf16 back. tp1 (null) never enters
+  // so the resident tensor-core path below stays byte-identical. Requires the
+  // VT_NCCL transport (the group primitive + host decode) to be built.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    // Host-decode (or bf16->f32) the resident gate/up/down into the shard's
+    // gate/up [I,H] + down [O,I] layout (O = H = hidden width).
+    std::vector<float> gate_host((size_t)I * (size_t)H, 0.f);
+    std::vector<float> up_host((size_t)I * (size_t)H, 0.f);
+    std::vector<float> down_host((size_t)H * (size_t)I, 0.f);
+    if (fp4) {
+      // Decoder demands a per-row scale2 array (indexed by n); the resident
+      // Nvfp4Weight holds a single per-tensor scalar, so broadcast it per row.
+      const auto row_scales = [](const Nvfp4Weight& wn) {
+        std::vector<float> s(static_cast<size_t>(wn.n), wn.scale2);
+        return s;
+      };
+      const auto dec = [&](const Nvfp4Weight& wn, std::vector<float>& dst,
+                           int n_rows, int n_k) {
+        std::vector<float> s2 = row_scales(wn);
+        return vt_host_decode_nvfp4_f32(n_rows, n_k, wn.packed.bytes.data(),
+                                         wn.scale.bytes.data(), s2.data(), dst.data());
+      };
+      if (dec(w.gate_proj_fp4, gate_host, (int)I, (int)H) != 0 ||
+          dec(w.up_proj_fp4, up_host, (int)I, (int)H) != 0 ||
+          dec(w.down_proj_fp4, down_host, (int)H, (int)I) != 0)
+        throw std::runtime_error("qwen3_5 dense MLP: tp>1 fp4 host-decode failed");
+    }
+    // The reduced [O] is authoritative on group rank 0 (shard's AllReduce). Copy
+    // the device hidden D2H, run the sharded MLP per token, write the reduced
+    // [T,H] bf16 back on the caller's device.
+    DBuf red(d, DType::kBF16, {T, H});
+    std::vector<uint16_t> hid((size_t)T * H);
+    d.b.Copy(d.q, hid.data(), (const void*)dh.data,
+             (size_t)T * H * sizeof(uint16_t));
+    d.b.Synchronize(d.q);
+    std::vector<uint8_t> host((size_t)T * H * 2);
+    for (int64_t t = 0; t < T; ++t) {
+      std::vector<float> o((size_t)H);
+      int rc;
+      if (fp4) {
+        std::vector<float> x((size_t)H);
+        for (int64_t h = 0; h < H; ++h)
+          x[(size_t)h] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
+        rc = vt_cuda_mlp_shard_run((int)H, (int)H, (int)I, x.data(),
+                                   gate_host.data(), up_host.data(),
+                                   down_host.data(), o.data());
+} else if (!w.gate_up_proj.Empty()) {
+        // BF16 RawNK merged gate_up + separate down (synthetic/plain path):
+        // pass the resident bf16 bytes straight to the bf16 shard (it does its
+        // own bf16->f32). The resident copy (if host bytes were released) is
+        // read through the device Tensor; host bytes otherwise.
+        const auto host_data = [&](const OwnedTensor& w) {
+          if (w.HasHostBytes())
+            return reinterpret_cast<const uint8_t*>(w.bytes.data());
+          return reinterpret_cast<const uint8_t*>(ResidentWeight(d, w).data);
+        };
+        const auto* gu_b = host_data(w.gate_up_proj);  // RawNK [2I, H]
+        const auto* dn_b = host_data(w.down_proj);     // RawNK [H, I] = [O, I]
+        rc = vt_cuda_mlp_shard_run_bf16(
+            (int)H, (int)H, (int)I, reinterpret_cast<const uint16_t*>(hid.data() + t * H),
+            reinterpret_cast<const uint16_t*>(gu_b), reinterpret_cast<const uint16_t*>(dn_b),
+            o.data());
+      } else {
+        // Split Matmul-B [in,out] projection fallback (synthetic/nk=false): the
+        // matrix-multiply B layout is [K=in, N=out] (gate/up [H,I], down [I,H]),
+        // so transpose into the shard's [out,in] orientation before sharding.
+        const auto row = [&](const OwnedTensor& w) -> const uint8_t* {
+          if (w.HasHostBytes())
+            return reinterpret_cast<const uint8_t*>(w.bytes.data());
+          return reinterpret_cast<const uint8_t*>(ResidentWeight(d, w).data);
+        };
+        std::vector<float> gu((size_t)(2 * I) * H);
+        for (int64_t i = 0; i < H; ++i) {  // in H rows
+          const uint8_t* gp = row(w.gate_proj) + (size_t)i * I * 2;
+          const uint8_t* up = row(w.up_proj) + (size_t)i * I * 2;
+          for (int64_t o = 0; o < I; ++o) {
+            gu[(size_t)(o * H + i)] = vt::BF16ToF32(((const uint16_t*)gp)[o]);
+            gu[(size_t)((I + o) * H + i)] = vt::BF16ToF32(((const uint16_t*)up)[o]);
+          }
+        }
+        std::vector<float> dn((size_t)(H * I));
+        for (int64_t i = 0; i < I; ++i)
+          for (int64_t o = 0; o < H; ++o)
+            dn[(size_t)(o * I + i)] =
+                vt::BF16ToF32(((const uint16_t*)(row(w.down_proj) + (size_t)i * H * 2))[o]);
+        std::vector<float> x((size_t)H);
+        for (int64_t h = 0; h < H; ++h)
+          x[(size_t)h] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
+        rc = vt_cuda_mlp_shard_run((int)H, (int)H, (int)I, x.data(),
+                                   &gu[0], &gu[(size_t)(I * H)], dn.data(), o.data());
+      }
+      if (rc == 2)
+        throw std::runtime_error(
+            "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
+      if (rc != 0)
+        throw std::runtime_error(
+            "qwen3_5 dense MLP: tp>1 shard mismatched host reference");
+      auto* row16 = reinterpret_cast<uint16_t*>(host.data() + (size_t)(t * H * 2));
+      for (int64_t h = 0; h < H; ++h) row16[(size_t)h] = vt::F32ToBF16(o[(size_t)h]);
+    }
+    d.b.Copy(d.q, red.ptr(), (const void*)host.data(),
+              (size_t)T * H * sizeof(uint16_t));
+    d.b.Synchronize(d.q);
+    return red;
+#else
+    throw std::runtime_error(
+        "qwen3_5 dense MLP: tp>1 requires an NCCL build (VLLM_CPP_NCCL)");
+#endif  // VT_NCCL
+  }
 #ifdef VT_CUTLASS_NVFP4
   // vLLM's production topology is one MergedColumnParallelLinear gate_up_proj,
   // not two independently-scaled linears. Its CT loader takes max(input
