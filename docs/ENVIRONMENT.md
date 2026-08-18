@@ -270,7 +270,7 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_RESIDENT_NATIVE` | unset | Prefer native FP8 resident packs when set |
 | `VT_ATTN_PREFILL_FLASH_SHAREDK` | on | ROCm Gemma-4 prefill: scoreless SharedK flash path (prod default). `0` forces DecodeGqa baseline for A/B |
 | `VT_ATTN_PREFILL_FLASH_WMMA` | off | Lab-only ROCm flash WMMA QK path; leave off for prod |
-| `VT_ATTN_PREFILL_SHAREDK_WMMA` | on | ROCm SharedK fused with rocWMMA QK on sliding d=256 (and global-Q d=512). `0` forces scalar SharedK |
+| `VT_ATTN_PREFILL_SHAREDK_WMMA` | on | ROCm SharedK fused with rocWMMA QK on sliding d=256 only. d=512 stays scalar SharedK (shipping f58b WMMA spills). `0` forces scalar SharedK |
 | `VT_GEMMA4_PREFILL_PEER_ACT` | on | Prefill MoE: run ExpertGeGLU on the expert GPU and peer activations only (not full weight PeerCopy). `0` restores weight PeerCopy |
 | `VT_GEMMA4_GPU0_HEADROOM_GB` | `12` | GiB kept free on GPU0 when packing resident experts (decode vs long-prefill trade). Lab dual R9700 + 49k KV: `8` survives 16k+ prefill; `6` OOMs ~11k |
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
