@@ -1168,6 +1168,22 @@ vllm_cpp_add_test(test_expert_stream_latch
 vllm_cpp_add_test(test_weight_residency_reach
   vllm/entrypoints/test_weight_residency_reach.cpp)
 target_include_directories(test_weight_residency_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
+# only thing that proves the FLAG arrives: `test_weight_residency_reach` already
+# drives `vllm_engine_load` with the same JSON string, so a test that called the
+# ABI here would re-prove the ABI. `$<TARGET_FILE:vllm-cli>` resolves at generate
+# time, after every directory is processed; the build ORDER dependency is declared
+# in the top-level CMakeLists, where the `vllm-cli` target already exists.
+# Registered UNCONDITIONALLY, and with examples off it leaves `VLLM_CLI_BINARY`
+# undefined: the suite then exits 77 and CTest reports it Skipped, which is what
+# `SKIP_RETURN_CODE` above is for. Registering it only under the option would hide
+# the gate's absence instead of reporting it.
+vllm_cpp_add_test(test_cli_offload_config
+  vllm/entrypoints/test_cli_offload_config.cpp)
+if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_cli_offload_config
+    PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
 vllm_cpp_add_test(test_expert_slot_cache vllm/model_executor/test_expert_slot_cache.cpp)
