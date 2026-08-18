@@ -932,6 +932,110 @@ extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int Hkv, int D,
   return bad.load();
 }
 
+
+// ---------------------------------------------------------------------------
+// lm_head/shard primitive (TP step-2, the logits head). The head is a
+// vocab-column-parallel linear: each rank owns a contiguous slice of the vocab
+// rows of lm_head [V,H], computes its partial logits [T,per] on ITS device, then
+// the group AllGather concatenates the per-rank vocab slices into the FULL
+// [T,V] logits on every rank (disjoint columns -> a concatenating gather,
+// mirroring vLLM's TensorParallel lm_head AllGather). Returns 0 on parity with
+// the full-vocab host reference, 1 mismatch, 2 on <2 GPUs (NCCL unbuilt).
+// ---------------------------------------------------------------------------
+__global__ void LmHeadShardPartial(const float* dx, const float* dw, float* dlog,
+                                    int M, int D, int pervoc) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // [M*pervoc] this rank
+  const int total = M * pervoc;
+  if (idx >= total) return;
+  const int mv = idx % pervoc, m = idx / pervoc;
+  const float* xm = dx + (size_t)m * D;
+  const float* wr = dw + (size_t)mv * D;  // this rank's vocab-row slice
+  float acc = 0.f;
+  for (int d = 0; d < D; ++d) acc += xm[d] * wr[d];
+  dlog[idx] = acc;
+}
+
+extern "C" int vt_cuda_lm_head_shard_run(int T, int H, int V,
+                                          const float* x, const float* w, float* out) {
+  if (T <= 0 || H <= 0 || V <= 0) return 1;
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  if (V % W != 0) { delete g; return 1; }
+  const int per = V / W;
+
+  // Host reference over the full vocab.
+  std::vector<float> ref((size_t)T * V);
+  for (int m = 0; m < T; ++m)
+    for (int v = 0; v < V; ++v) {
+      double acc = 0.0;
+      for (int d = 0; d < H; ++d)
+        acc += (double)x[(size_t)m * H + d] * (double)w[(size_t)v * H + d];
+      ref[(size_t)m * V + v] = (float)acc;
+    }
+
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const size_t tx = (size_t)T * H, tl = (size_t)T * per, dl = (size_t)per * H;
+      cudaStream_t st = nullptr;
+      float *dx = nullptr, *dw = nullptr, *dlog = nullptr, *dg = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, tx * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dw, dl * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dlog, tl * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dg, (size_t)T * V * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree(dw); cudaFree(dlog); cudaFree(dg);
+        if (st) cudaStreamDestroy(st);
+        return;
+      }
+      cudaMemcpyAsync(dx, x, tx * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dw, w + (size_t)(per * r * H), dl * sizeof(float),
+                      cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      LmHeadShardPartial<<<(unsigned)((T * per + 31) / 32), 32, 0, st>>>(
+          dx, dw, dlog, T, H, per);
+      Queue qq; qq.device = Device{DeviceType::kCUDA, r}; qq.handle = st;
+      // AllGather the per-rank [T,per] shards into full [T,V] on every rank.
+      g->Rank(r)->AllGather(qq, dlog, dg, (size_t)(T * per), DType::kF32);
+      // NCCL AllGather returns rank-blocked: rank r's T*per logits at back[r*(T*per)..].
+      // Reassemble token-major [T,V] into `out` (rank 0) and compare per local vocab.
+      std::vector<float> back((size_t)T * V, 0.f);
+      cudaMemcpyAsync(back.data(), dg, (size_t)T * V * sizeof(float),
+                      cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      // back (gathered, replicated on every rank) is rank-blocked:
+      // back[p*(T*per) + m*per + v_local] for rank p, token m, local vocab v_local.
+      // Reassemble to token-major [T,V] (m*V + p*per + v_local) on each rank.
+      std::vector<float> full(T * V, 0.f);
+      for (int rp = 0; rp < W; ++rp)
+        for (int m = 0; m < T; ++m)
+          for (int v = 0; v < per; ++v)
+            full[(size_t)m * V + (rp * per + v)] =
+                back[(size_t)rp * T * per + m * per + v];
+      if (r == 0 && out != nullptr) std::copy(full.begin(), full.end(), out);
+      for (int m = 0; m < T; ++m)
+        for (int v = 0; v < V; ++v) {
+          const float got = full[(size_t)m * V + v], want = ref[(size_t)m * V + v];
+          if (std::fabs(got - want) > 1e-4f) {
+            fprintf(stderr, "vt lm_head_shard: r %d m %d v %d %.3f want %.3f\n",
+                    r, m, v, (double)got, (double)want);
+            bad.store(1, std::memory_order_relaxed);
+          }
+        }
+      cudaFree(dx); cudaFree(dw); cudaFree(dlog); cudaFree(dg); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
 }  // namespace
 }  // namespace vt
 #endif  // VT_NCCL
+
