@@ -12,6 +12,7 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #ifdef VLLM_CPP_CUDA
@@ -108,4 +109,20 @@ TEST_CASE("mlp_shard_run holds at engine-scale intermediate width") {
   CHECK(rc==0);
   // spot-check a few outputs (full O cross-check is 134M MACs: fine but keep light)
   for (int o=0;o<O;o+=257){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x[k]*gate[i*H+k];u+=x[k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[o*I+i];} CHECK(out[(size_t)o]==doctest::Approx((float)a).epsilon(5e-4));}
+}
+
+extern "C" int vt_host_decode_nvfp4_f32(int N,int K,const uint8_t* packed,const uint8_t* scale8,const float* scale2,float* out);
+TEST_CASE("host NVFP4 decode reproduces the fp4 layout (known nibbles + e4m3 scale)") {
+  constexpr int N=1,K=16;
+  std::vector<uint8_t> packed(8,0), scale8(N,0x3C);  // e4m3 0x3C = 1.5
+  std::vector<float> scale2(N,2.0f), out(N*K,0.f);
+  packed[0]=0x05;      // low nibble 5 (LUT 3) * gs; high 0 -> elems {0,1}
+  packed[7]=0xF1;      // lo=1 (0.5), hi=0xF (LUT2|? => mag 6) sign(bit3)=1 -> -6
+  int rc=vt_host_decode_nvfp4_f32(N,K,packed.data(),scale8.data(),scale2.data(),out.data());
+  CHECK(rc==0);
+  const float gs=1.5f*2.0f;                 // f8(1.5)*scale2
+  CHECK(out[0*K+0]==doctest::Approx(3.0f*gs));     // lo of byte0
+  CHECK(out[0*K+1]==doctest::Approx(0.0f));       // hi of byte0
+  CHECK(out[0*K+(16-2)]==doctest::Approx(0.5f*gs));     // byte7 lo
+  CHECK(out[0*K+(16-1)]==doctest::Approx(-6.0f*gs));    // byte7 hi (sign)
 }

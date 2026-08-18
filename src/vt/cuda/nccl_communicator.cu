@@ -35,6 +35,8 @@
 
 #if defined(VT_NCCL)
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <nccl.h>
 #endif
@@ -551,7 +553,45 @@ extern "C" int vt_cuda_sharded_forward_selfcheck(void) {
   return bad.load();
 }
 
-// Dense-body shard (tp-rollout step 2 primitive): per-rank column-slice of the
+// ---------------------------------------------------------------------------
+// Host NVFP4 decode (the DenseMlpBlock tp>1 shard feed). Mirrors the kernel's
+// F8E4M3 + DecodeFp4Byte (E2M1 LUT, bf16-RNE-rounded product) exactly.
+// Returns the dequant fp32 [N, K] for one fp4 weight (packed[N,K/2],
+// f8-scale[N,K/16], per-row scale2); dk = group count. Deterministic host math.
+// ---------------------------------------------------------------------------
+static inline float HostF8E4M3ToF32(uint8_t byte) {
+  const int sign = (byte >> 7) & 1;
+  const int exp = (byte >> 3) & 0xFu;
+  const int mant = byte & 0x7u;
+  const float s = sign ? -1.0f : 1.0f;
+  if (exp == 0xFu && mant == 0x7u) return std::nanf("");
+  if (exp == 0u) return s * (static_cast<float>(mant) / 512.0f);
+  return s * std::ldexp(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
+}
+// float -> bf16 (RNE) -> float: equals __bfloat162float(__float2bfloat16(v)).
+static inline float HostRoundBf16(float v) {
+  uint32_t u = 0; std::memcpy(&u, &v, 4);
+  // RNE: add 0x7fff + (lsb of low half) then truncate the low 16 bits.
+  const uint32_t b = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+  float r; std::memcpy(&r, &b, 4); return r;
+}
+static constexpr float kHostE2M1[8] = {0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f};
+extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
+                                        const uint8_t* scale8, const float* scale2,
+                                        float* out) {
+  if (N < 0 || K <= 0 || K == 1) return 1;
+  const int halves = K / 2, groups = K / 16;
+  for (int n = 0; n < N; ++n)
+    for (int j = 0; j < halves; ++j) {
+      const uint8_t b = packed[n * halves + j];
+      const float gs = HostF8E4M3ToF32(scale8[n * groups + (2*j) / 16]) * scale2[n];
+      const int lo = b & 0xFu, hi = b >> 4;
+      out[n * K + 2 * j]     = HostRoundBf16(kHostE2M1[lo & 7] * ((lo & 8) ? -1.f : 1.f) * gs);
+      out[n * K + 2 * j + 1]  = HostRoundBf16(kHostE2M1[hi & 7] * ((hi & 8) ? -1.f : 1.f) * gs);
+    }
+  return 0;
+}
+// ---------------------------------------------------------------------------
 // merged gate/up, one thread per output row, row-parallel over the group reduce.
 __global__ void DenseMlpRankPartial(const float* x, int H, const float* gate,
                                     const float* up, const float* downfull,
