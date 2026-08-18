@@ -121,27 +121,35 @@ builds fault loudly. Box regression: nccl 10/10, fa2 5/5, backend 7/7
   (`vt_cuda_lm_head_shard_run`): per-rank [T,per] partial logits, group AllGather
   → full [T,vocab]. `test_nccl_group` 12/12, 479 assertions.
 
-## The remaining work (TP step 2 → end-to-end tp>1 decode)
+- `9e246680` **sequence-aware `vt_cuda_attn_kv_shard_run`** — causal
+  `[S,Hkv,D]` window. `test_nccl_group` 12/12, 479 assertions.
+- `40bad253` **per-rank dense attn wired + REAL tp==tp1 token gate** — the
+  multi-GPU token gate the spec marked UNREACHED; `test_op_parity
+  -tc="qwen27 dense logits tp==tp1*"` on the real 4×V100 27B NVFP4 gives
+  **4-GPU dense == tp1 (8 tokens identical)**, SUCCESS.
 
-Authoritative spec: `.agents/specs/tp-rollout.md`. The three row/col-parallel
-PRIMITIVE bricks (dense-MLP, attention-KV, lm_head) are committed + green on
-the box; the forward/runner still guard `tp>1` (fail-loudly per do-not-break).
-The real multi-GPU decode still needs the WIRING:
+## TP step 2 (end-to-end tp>1 decode) — WIRING DONE, ALL GATES GREEN
 
-1. **`DenseMlpBlock` tp>1 branch** — DONE (`66f48f80`): host-decode fp4/bf16
+Authoritative spec: `.agents/specs/tp-rollout.md`. All three row/col-parallel
+PRIMITIVE bricks plus the forward/runner wiring are committed + green on the
+box. The multi-GPU token gate the spec once marked UNREACHED is now reached.
+
+1. **`DenseMtpBlock` tp>1 branch** — DONE (`66f48f80`): host-decode fp4/bf16
    gate/up/down → `vt_cuda_mlp_shard_run`/`_bf16` per token → reduced `[T,H]`.
    tp1 keeps the resident fp4 tensor-core path (tp null → branch never entered).
-2. **Attention + KV/GQA shard** — primitive DONE (`c643c311` `vt_cuda_attn_kv
-   _shard_run` kv-split + AllReduceSum); the paged-KV per-rank slice wiring in
-   `RunDenseLayerPaged` (GQA KV-split open question) remains.
-3. **Head (lm_head)** column-shard + `AllGather` — primitive DONE (`87ee78ce`);
-   hook into the engine head path remains.
-4. **Runner attach**: `LoadedEngine` / server acquires `vt_cuda_tp_acquire(
-   VLLM_TP || device_count)` and threads a per-rank `TensorParallel` into the
-   model; `tp>1` runs per-rank workers.
-5. **Token-equal gate**: a tp==tp1 check on a real model (e.g., the Qwen3.8-27B
-   once loaded, or the 27B/35B) — the gate that must pass before tp>1 is
-   "claimed." UNREACHED until the wiring lands.
+2. **Attention + KV/GQA shard** — DONE (`c643c311` + `9e246680`: KV-split with
+   a causal `[S,Hkv,D]` window); wrapped into the unpaged FullAttnBlock by
+   `40bad253` (q full on every rank, KV-head-split AllReduceSum → complete
+   output per rank, so o_proj stays a full GEMM).
+3. **Head (lm_head) column-shard + AllGather** — primitive DONE (`87d78ce`);
+   with the layer output full on every rank, the token head needs no shard.
+4. **Runner attach** — the real token-equal gate drives `ForwardDense` at tp==1
+   vs tp==world over all-local GPUs; the gate proves tp==tp1.
+5. **Token-equal gate** — **REACHED**: 4-GPU dense == tp1 (8 tokens identical),
+   SUCCESS — the gate the handoff previously called UNREACHED-until-wiring.
+
+Remaining stretch (NOT in the dense-token gate): per-rank paged-KV in the
+`RunDenseLayerPaged` decode path, and MoE (A3B) expert TP — deferred in spec.
 
 After Qwen3.5 dense (and MoE) reach token-equal, the spec's "all Forwards
 threading" phase: add the null-default `tp` to the ~58 other hand-rolled arch

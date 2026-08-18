@@ -70,15 +70,21 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 
 ## Multi-device phase 7 — KV/GQA-shard attention primitive · GREEN
 
-| commit | `c643c311` |
-| change | `vt_cuda_attn_kv_shard_run` + kernel `AttnKvShardPartial`: softmax num/den are both additive over the kv dimension, so a rank owning a kv-head slice computes partial exp(v) and exp-sum on ITS device; group AllReduceSum reduces both, out = num/den. Full [T,Hq,D] query on every rank. Returns 0 on full-kv host reference parity |
-| acceptance | box sm_70: `test_nccl_group` 11/11 incl. model-free KV-split test (T=3,Hq=4,Hkv=8) == single-GPU softmax attention |
+| commit | `c643c311` · `9e246680` |
+| change | `vt_cuda_attn_kv_shard_run` + kernel `AttnKvShardPartial`: softmax num/den are both additive over the kv dimension, so a rank owning a kv-head slice computes partial exp(v) and exp-sum on its device; group AllReduceSum reduces both, out = num/den. Full [T,Hq,D] query on every rank; `9e246680` adds a causal [S,Hkv,D] sequence window (score 0 past the query row). Returns 0 on full-kv causal host reference parity |
+| acceptance | `test_nccl_group` 12/12 incl. model-free sequence-split tests == single-GPU softmax attention |
 
 ## Multi-device phase 8 — lm_head column-shard + AllGather primitive · GREEN
 
 | commit | `87e78ce` |
 | change | `vt_cuda_lm_head_shard_run` + `LmHeadShardPartial`: vocab-column-parallel head, each rank computes [T,per] partial logits on ITS device, group AllGather concatenates the disjoint-vocab slices into full [T,V] (rank-major → token-major reassembly). Returns 0 vs full-vocab host reference |
 | acceptance | `test_nccl_group` 12/12, 479 assertions on the box |
+
+## Multi-device phase 9 — per-rank dense attn wired + REAL tp==tp1 token gate · GREEN
+
+| commit | `40bad253` |
+| change | FullAttnBlock/DenseMtpBlock tp>1 → KV-head-shard attention (complete output on every rank → o_proj stays a full GEMM); RunDenseLayer + ForwardDense thread tp. Fixed a device-boundary bug: ncclCommInitAll/Destroy re-bind the calling thread's CUDA device (invalid-resource-handle on the next OpProvider dispatch); both shard entries + Create now save/restore the caller device |
+| acceptance | `test_op_parity -tc="qwen27 dense logits tp==tp1*"` on real 27B NVFP4: **4-GPU dense == tp1 (8 tokens identical)**, SUCCESS. `test_nccl_group` 12/12. The spec's "UNREACHED" token gate is now reached |
 
 ## 27B-AWQ oracle capture · deterministic
 
