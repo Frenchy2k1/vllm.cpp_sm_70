@@ -402,6 +402,7 @@ vllm_cpp_add_test(test_fp8_block_quant
   vllm/model_executor/layers/test_fp8_block_quant.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
 # GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
@@ -1686,6 +1687,7 @@ target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src
 # resident), never freed, so a device pointer baked into a captured pure-decode CUDA
 # graph stays valid — the fix for the 35B c2+ online-serving illegal-memory-access.
 # The device proof is the DGX serving harness; this pins the never-free guarantee.
+vllm_cpp_add_test(test_breakable_graph vt/test_breakable_graph.cpp)
 vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
 target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
