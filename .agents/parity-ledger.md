@@ -61,6 +61,17 @@ Rows record a measured oracle-vs-impl comparison and its verdict. A row is
 | change | `vt_cuda_sharded_forward_selfcheck`: y=Wx sharded (each rank a K-slice of columns on ITS device), per-rank real device GEMM, NCCL group all-reduce → full y == unsharded single-GPU ref. Fixed local-vs-global x indexing |
 | acceptance | 4×V100: collectives + TP-seam + loader-slice + runner-forward all pass (4/4) |
 
+## Multi-device phase 6 — DenseMtpBlock tp>1 per-rank shard · GREEN
+
+| commit | `66f48f80` |
+| change | `DenseMtpBlock` tp>1 branch replaces the throw: host-decode the resident fp4 (bf16-raw/split) gate/up/down into the shard's `[out,in]` f32 layout, run the group-sharded dense-MLP per token over the in-process NCCL group, write the reduced `[T,H]` bf16 back. tp1 (null) never enters → resident tensor-core path byte-identical |
+| acceptance | box sm_70: `test_nccl_group` 10/10, `test_sm70_fa2_decode` 5/5, `test_cuda_backend` 7/7 (58), `test_qwen36_paged_engine` 35B case token-equality 149/149. The 27B/35B paged-engine guards (`qwen27/36`) require `VLLM_CPP_TRITON=ON` + cutlass build — this box build has TRITON=OFF, so those throw as build guards (unchanged by this edit), not as a regression |
+| next | real multi-GPU token-equal gate still requires the attention row/col shard step (new sharded-attention primitive) → head → runner attach |
+
+| commit | `8d303584` |
+| change | `vt_cuda_sharded_forward_selfcheck`: y=Wx sharded (each rank a K-slice of columns on ITS device), per-rank real device GEMM, NCCL group all-reduce → full y == unsharded single-GPU ref. Fixed local-vs-global x indexing |
+| acceptance | 4×V100: collectives + TP-seam + loader-slice + runner-forward all pass (4/4) |
+
 ## 27B-AWQ oracle capture · deterministic
 
 | lane | 1Cat-vLLM 1.2.2 on V100 (`192.168.10.20:8000`, model `qwen3.6-27b-awq-mtp`) |
