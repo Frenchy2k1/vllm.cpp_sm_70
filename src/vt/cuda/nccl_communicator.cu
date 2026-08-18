@@ -773,6 +773,27 @@ extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void) {
   return bad.load();
 }
 
+// Assemble the engine-facing slice for a bf16-represented dense MLP and shard it:
+// split the [2I,H] merged gate+up (upper I rows = gate, lower I = up), the
+// [H( out),I] down, convert bf16 bit-exact to f32, run the shard. This is the
+// assembly the DenseMlpBlock tp>1 branch uses; verified model-free here.
+extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I,
+                                          const uint16_t* x16, const uint16_t* gu16,
+                                          const uint16_t* down16, float* out) {
+  if (O <= 0 || H <= 0 || I <= 0) return 1;
+  const auto bf = [](uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; std::memcpy(&f, &u, 4); return f; };
+  std::vector<float> x((size_t)H), gate((size_t)(I * H)), up((size_t)(I * H)), down((size_t)(O * I));
+  for (int i = 0; i < H; ++i) x[(size_t)i] = bf(x16[i]);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < H; ++k) {
+      gate[(size_t)(i * H + k)] = bf(gu16[(size_t)(i * H + k)]);        // rows [0,I)
+      up[(size_t)(i * H + k)] = bf(gu16[(size_t)(((I + i) * H + k))]);  // rows [I,2I)
+    }
+  for (int o = 0; o < O; ++o)
+    for (int i = 0; i < I; ++i) down[(size_t)(o * I + i)] = bf(down16[(size_t)(o * I + i)]);
+  return vt_cuda_mlp_shard_run(O, H, I, x.data(), gate.data(), up.data(), down.data(), out);
+}
+
 }  // namespace
 }  // namespace vt
 #endif  // VT_NCCL

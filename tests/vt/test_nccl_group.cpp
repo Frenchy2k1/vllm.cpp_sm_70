@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #ifdef VLLM_CPP_CUDA
@@ -125,4 +126,30 @@ TEST_CASE("host NVFP4 decode reproduces the fp4 layout (known nibbles + e4m3 sca
   CHECK(out[0*K+1]==doctest::Approx(0.0f));       // hi of byte0
   CHECK(out[0*K+(16-2)]==doctest::Approx(0.5f*gs));     // byte7 lo
   CHECK(out[0*K+(16-1)]==doctest::Approx(-6.0f*gs));    // byte7 hi (sign)
+}
+
+extern "C" int vt_cuda_mlp_shard_run_bf16(int O,int H,int I,const uint16_t* x,const uint16_t* gu,const uint16_t* down,float* out);
+TEST_CASE("bf16 dense-MLP assembly: split [2I,H] gate/up + down, shard == host ref") {
+  constexpr int O=8,H=12,I=24;   // I%4==0
+  // float ground truth first, then its bf16 bits as the as-"assembly" input.
+  std::vector<float> xf(H), gf(I*H), uf(I*H), df(O*I);
+  for (int k=0;k<H;++k) xf[k]=0.5f+0.15f*(float)(k%5);
+  for (int i=0;i<I;++i)for(int k=0;k<H;++k){gf[i*H+k]=0.01f*((i*3+k)%710)+0.1f; uf[i*H+k]=0.01f*((i*7+k)%1130)+0.2f;}
+  for (int o=0;o<O;++o)for(int i=0;i<I;++i) df[o*I+i]=0.02f*((o*5+i*3)%1920)+0.3f;
+  std::vector<uint16_t> x16(H), gu16(2*I*H), down16(O*I);
+  auto bfu=[](float f){uint32_t u=0;std::memcpy(&u,&f,4);return (uint16_t)(u>>16);};
+  for (int k=0;k<H;++k) x16[k]=bfu(xf[k]);
+  for (size_t i=0;i<(size_t)I;i++) for (int k=0;k<H;++k){gu16[i*H+k]=bfu(gf[i*H+k]);gu16[(I+i)*H+k]=bfu(uf[i*H+k]);}
+  for (size_t i=0;i<(size_t)(O*I);++i) down16[i]=bfu(df[i]);
+  std::vector<float> out(O,0.f);
+  int rc=vt_cuda_mlp_shard_run_bf16(O,H,I,x16.data(),gu16.data(),down16.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); bf16 shard skipped");return;}
+  CHECK(rc==0);
+  // host reference on the bf16-rounded weights (replicate the assembly).
+  std::vector<float> x_(H),gate_(I*H),up_(I*H),down_(O*I);
+  auto bff=[](uint16_t b){uint32_t u=(uint32_t)b<<16;float f;std::memcpy(&f,&u,4);return f;};
+  for (int k=0;k<H;++k) x_[k]=bff(x16[k]);
+  for (int i=0;i<I;++i)for(int k=0;k<H;++k){gate_[i*H+k]=bff(gu16[i*H+k]);up_[i*H+k]=bff(gu16[(I+i)*H+k]);}
+  for (int o=0;o<O;++o)for(int i=0;i<I;++i) down_[o*I+i]=bff(down16[o*I+i]);
+  for (int o=0;o<O;++o){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x_[k]*gate_[i*H+k];u+=x_[k]*up_[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down_[o*I+i];} CHECK(out[(size_t)o]==doctest::Approx((float)a).epsilon(2e-4));}
 }
