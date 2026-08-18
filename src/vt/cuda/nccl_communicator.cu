@@ -193,11 +193,19 @@ CudaCommGroup::CudaCommGroup() : impl_(nullptr), world_(0) {}
 CudaCommGroup* CudaCommGroup::Create() {
   int ngpu = 0;
   if (cudaGetDeviceCount(&ngpu) != cudaSuccess || ngpu < 2) return nullptr;
+  // ncclCommInitAll sets the CALLING thread's current device and does not
+  // restore it, which would corrupt any later stream/launch the caller makes
+  // (invalid-resource-handle). Save + restore so a shard call is a no-op on the
+  // caller's device binding (the per-rank collectives run on their own threads).
+  int caller_dev = 0;
+  const bool saved = cudaGetDevice(&caller_dev) == cudaSuccess;
   std::vector<int> devs(ngpu);
   for (int i = 0; i < ngpu; ++i) devs[i] = i;
   std::vector<ncclComm_t> comms(ngpu);
-  if (ncclCommInitAll(comms.data(), ngpu, devs.data()) != ncclSuccess)
-    return nullptr;
+  const ncclResult_t init_rc =
+      ncclCommInitAll(comms.data(), ngpu, devs.data());
+  if (saved) (void)cudaSetDevice(caller_dev);
+  if (init_rc != ncclSuccess) return nullptr;
 
   auto* impl = new CudaCommGroupImpl;
   impl->world = ngpu;
@@ -621,6 +629,13 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
                                      const float* x, const float* gate,
                                      const float* up, const float* down,
                                      float* out) {
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
   if (O <= 0 || H <= 0 || I <= 0) return 1;
   vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
   if (!g) return 2;
@@ -866,6 +881,18 @@ __global__ void AttnKvShardPartial(const float* dq, const float* dk,
 extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int S, int Hkv, int D,
                                           const float* q, const float* k, const float* v,
                                           float* out) {
+  // The NCCL group work can re-bind the CALLING thread's current device (and
+  // ncclCommDestroy too); a CUDA op the caller launches right after (e.g.
+  // SigmoidGateBf16 via the OpProvider path, which has no device scope) would
+  // then hit invalid-resource-handle. Save + restore the whole entry via RAII so
+  // the call is a no-op on the caller's thread device.
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
   if (T <= 0 || Hq <= 0 || Hkv <= 0 || S <= 0 || D <= 0) return 1;
   vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
   if (!g) return 2;

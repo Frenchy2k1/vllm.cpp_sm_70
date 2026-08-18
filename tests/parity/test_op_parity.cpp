@@ -25,10 +25,14 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/tensor_parallel.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vt/backend.h"
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime_api.h>
+#endif
 #include "vt/ops.h"
 
 namespace fs = std::filesystem;
@@ -2406,6 +2410,82 @@ TEST_CASE("qwen27 dense logits diagnostic (dgx-only, CUDA)") {
   Queue q = b.CreateQueue();
   RunQwen27Logits(b, q, dir, m);
   b.DestroyQueue(q);
+}
+
+// Multi-device token-equal gate (tp==tp1): the KV-head-shard + dense-MLP-shard
+// primitives rest on the invariant that a FullAttnBlock/DenseMtpBlock tp>1
+// forward equals the tp1 forward token-for-token. On the shared box the shard
+// group covers all local GPUs; we run the real 27B dense ForwardDense greedy
+// twice — tp1 (null) and a tp thunk with world_size>1 (the shard primitives
+// create their OWN group internally, so the passed `tp` only enables the >1
+// branch; the collectives happen inside vt_cuda_attn_kv_shard_run /
+// vt_cuda_mlp_shard_run) — and require DEVICE-identical greedy tokens.
+struct TpThunkComm : vt::Communicator {
+  int w_ = 0;
+  int rank() const override { return 0; }
+  int world_size() const override { return w_; }
+  void AllReduce(vt::Queue&, void*, size_t, vt::DType, vt::ReduceOp) override {}
+  void AllGather(vt::Queue&, const void*, void*, size_t, vt::DType) override {}
+  void Send(vt::Queue&, const void*, size_t, vt::DType, int) override {}
+  void Recv(vt::Queue&, void*, size_t, vt::DType, int) override {}
+};
+
+TEST_CASE("qwen27 dense logits tp==tp1 token gate (dgx-only, CUDA, multi-GPU)") {
+  bool has_cuda = true;
+  try { vt::GetBackend(DeviceType::kCUDA); }
+  catch (const std::runtime_error&) { has_cuda = false; }
+  if (!has_cuda) { MESSAGE("no CUDA backend; skipping tp==tp1 gate"); return; }
+  const fs::path dir = fs::path(PARITY_GOLDENS_DIR) / "qwen36_logits_27b";
+  if (!fs::exists(dir / "manifest.json")) { MESSAGE("27B logits golden absent; skipping tp==tp1 gate"); return; }
+  const std::string snap = Find27BSnapshot();
+  if (snap.empty()) { MESSAGE("SKIP: 27B NVFP4 snapshot not present"); return; }
+  const fs::path st = fs::path(snap) / "model.safetensors";
+  if (!fs::exists(st)) { MESSAGE("SKIP: model.safetensors absent"); return; }
+#ifdef VLLM_CPP_CUDA
+  int ngpu = 0;
+  if (cudaGetDeviceCount(&ngpu) != cudaSuccess) { MESSAGE("cudaGetDeviceCount failed"); return; }
+#else
+  int ngpu = 1;
+#endif
+  if (ngpu < 2) { MESSAGE("SKIP: needs >=2 CUDA GPUs (have " << ngpu << ")"); return; }
+
+  MESSAGE("tp==tp1 gate: loading 27B (W4A4 fp4-resident) on " << ngpu << " GPUs...");
+  const vllm::HfConfig cfg = vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(st.string()));
+  const vllm::Qwen3_5DenseWeights weights = vllm::LoadQwen3_5Dense(shards, cfg);
+
+  json m = json::parse(std::ifstream(dir / "manifest.json"));
+  auto ids_t = LoadTensor(dir, m["tensors"]["token_ids"]);
+  const int32_t* idp = ids_t.tensor.Ptr<int32_t>();
+  std::vector<int32_t> base(idp, idp + ids_t.tensor.shape[0]);
+  std::vector<int32_t> pos(base.size());
+  for (size_t i = 0; i < pos.size(); ++i) pos[i] = static_cast<int32_t>(i);
+  const int vocab = static_cast<int>(cfg.vocab_size);
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  const auto run_greedy = [&](const vllm::TensorParallel* tp) {
+    std::vector<int32_t> ids = base, ps = pos;
+    std::vector<float> lg = vllm::Qwen3_5DenseModel::ForwardDense(ids, ps, weights, cfg, q, tp);
+    std::vector<int32_t> gen;
+    constexpr int kSteps = 8;
+    for (int s = 0; s < kSteps; ++s) {
+      const int32_t nxt = ArgmaxRow(&lg[static_cast<size_t>(ids.size() - 1) * vocab], vocab);
+      gen.push_back(nxt);
+      ids.push_back(nxt); ps.push_back(static_cast<int32_t>(ps.size()));
+      if (s + 1 < kSteps) lg = vllm::Qwen3_5DenseModel::ForwardDense(ids, ps, weights, cfg, q, tp);
+    }
+    return gen;
+  };
+  const std::vector<int32_t> t1 = run_greedy(nullptr);
+  TpThunkComm th; th.w_ = ngpu;
+  vllm::TensorParallel tpGroup{&th};
+  const std::vector<int32_t> tw = run_greedy(&tpGroup);
+  b.DestroyQueue(q);
+  REQUIRE(t1 == tw);
+  MESSAGE("tp==tp1 token gate: " << ngpu << "-GPU dense == tp1 (" << t1.size()
+          << " tokens identical)");
 }
 
 // vLLM 0.25.0's MergedColumnParallelLinear BA path dispatches BF16 x/weight
