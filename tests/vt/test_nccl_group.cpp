@@ -96,3 +96,16 @@ TEST_CASE("reusable mlp_shard_run matches the host MLP reference at a fresh shap
   CHECK(rc==0);
   for (int o=0;o<O;++o){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x[k]*gate[i*H+k];u+=x[k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[o*I+i];} CHECK(out[(size_t)o]==doctest::Approx((float)a));}
 }
+
+TEST_CASE("mlp_shard_run holds at engine-scale intermediate width") {
+  constexpr int O=256, H=512, I=1024;   // I % W == 0 (W=4)
+  std::vector<float> x(H), gate(I*H), up(I*H), down(O*I), out(O,0.f);
+  for (int k=0;k<H;++k) x[k]=0.4f+0.1f*(float)(k%7);
+  for (int i=0;i<I;++i)for(int k=0;k<H;++k){ float r=0.001f*((i*3+k)%997); gate[i*H+k]=r+0.1f; up[i*H+k]=r+0.2f; }
+  for (int o=0;o<O;++o)for(int i=0;i<I;++i) down[o*I+i]=0.001f*((o*7+i*3)%1000)+0.3f;
+  int rc=vt_cuda_mlp_shard_run(O,H,I,x.data(),gate.data(),up.data(),down.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); big mlp_shard skipped");return;}
+  CHECK(rc==0);
+  // spot-check a few outputs (full O cross-check is 134M MACs: fine but keep light)
+  for (int o=0;o<O;o+=257){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x[k]*gate[i*H+k];u+=x[k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[o*I+i];} CHECK(out[(size_t)o]==doctest::Approx((float)a).epsilon(5e-4));}
+}

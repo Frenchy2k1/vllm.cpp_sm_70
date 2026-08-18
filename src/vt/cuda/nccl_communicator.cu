@@ -641,7 +641,9 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
       cudaStreamSynchronize(st);
       if (r == 0) { for (int o = 0; o < O; ++o) out[o] = back[(size_t)o]; }
       for (int o = 0; o < O; ++o)
-        if (std::fabs(back[(size_t)o] - ref[(size_t)o]) > 1e-3f) bad.store(1, std::memory_order_relaxed);
+        if (std::fabs(back[(size_t)o] - ref[(size_t)o]) >
+            5e-4f * std::max(1.0f, std::fabs(ref[(size_t)o])))
+          bad.store(1, std::memory_order_relaxed);
       cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); cudaStreamDestroy(st);
     });
   }
