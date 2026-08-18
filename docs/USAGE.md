@@ -2200,6 +2200,44 @@ arm — `VLLM_CPP_MUSIC3_DEVICE=1` selects the device one, unset is the CPU one 
 at the same bounds, with the same negative control. Numbers for both are in
 [BENCHMARKS](BENCHMARKS.md).
 
+#### Where the time actually goes: `VLLM_CPP_MUSIC3_PROFILE`
+
+The table above says which stage runs where. It does not say what each one
+*costs*, and at a real duration that is the only question anyone asks. Set
+
+```sh
+VLLM_CPP_MUSIC3_PROFILE=1 minimax-music3-gen --model ... --duration 20 --steps 30 --device 1
+```
+
+and the engine prints a `MUSIC3_PROFILE` table to **stderr** when the request
+finishes: one row per stage with seconds, a call count, and its share of the
+request, then the resident-set size at each stage boundary.
+
+Read it as follows.
+
+* `leaf` rows partition the request and are the ones that add up. `span` rows
+  enclose leaves — `ar.TOTAL_loop`, `denoise.TOTAL` — and are printed for
+  context but never summed, so the table cannot claim more work than the run
+  contained.
+* `cnt` rows carry no time at all. They are the counts a split has to state to
+  be readable: frames, windows, requested steps.
+* `unattributed` is the glue between the leaves — chunk slicing, the overlap
+  blend, the Euler step, the WAV assembly. It is printed rather than spread
+  silently over the measured stages, so a bracket in the wrong place shows up as
+  a number instead of as a plausible share somewhere else.
+* the `calls` column on `denoise.dit_device` counts *steps*, not forwards: one
+  bracket covers both classifier-free-guidance branches, so the forward count is
+  twice it.
+
+It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
+other value, including a near miss like `y`, leaves it off — an operator who
+mistypes gets a run with no table rather than a run whose meaning quietly
+changed. With it off, no clock is read and no `/proc` file is opened.
+
+This is an attribution instrument, not a benchmark harness: it takes no GPU
+clock window, so its rows are a within-run **split** and must not be quoted as
+per-kernel or cross-box figures.
+
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
 (846.6 s vs 835.1 s) and 5.4 % faster on a ten-frame one (1430.4 s vs 1512.1 s).
