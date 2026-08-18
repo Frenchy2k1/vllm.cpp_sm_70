@@ -8670,7 +8670,9 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 std::vector<float> Qwen3_5DenseModel::ForwardDense(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue) {
+    vt::Queue& queue, const vllm::TensorParallel* tp) { (void)tp;
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 sharded ForwardDense not yet wired (MLP shard primitive landed; attention/KV next)");
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
