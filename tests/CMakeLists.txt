@@ -1139,6 +1139,11 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# SPEC-DSPARK-QWEN3-ROUTING (#1193): REACHABILITY of that classification — the
+# loader's own ResolveSpecConfig reads the draft's config.json and refuses the
+# DeepSeek-V4 DSpark lane by name, instead of trusting the CLI method string.
+vllm_cpp_add_test(test_dspark_draft_routing
+  vllm/entrypoints/test_dspark_draft_routing.cpp)
 # #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
 # refused by name, and an upstream key this engine does not implement is refused
 # with the missing part named, instead of being silently dropped.
