@@ -240,6 +240,7 @@ both refuse, naming what is missing.
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
 | DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; T=1+k verify CAPTURED. Cross-engine ratio UNSETTLED (**0.834x** matched-and-warm); Marlin MoE CLEARED as the residual | ✅ | ◐ |
+| DSpark draft routing (which draft the loader takes) | ◐ `Qwen3DSparkModel`, `Gemma4DSparkModel` and (BEYOND-PIN, vllm#52197) `DSparkDraftModel` + `qwen3` take the Qwen3 lane; DeepSeek-V4 DSpark is REFUSED by name ([spec](../.agents/specs/dspark-qwen3-routing.md)) | ◐ at the pinned `555967922` that pair routes to DeepSeek-V4; ✅ only since vllm#52197, merged 2026-08-17 | not assessed |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
