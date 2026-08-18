@@ -948,6 +948,31 @@ Resource axes on the same series: cold start to first `/health` **53 s vs
 the latter with the caveat that vLLM's figure is set by
 `--gpu-memory-utilization 0.85` pre-reserving KV on a unified-memory box.
 
+**Its quantized arms are not gated.** Three rows enter `READY` on
+[#821](https://github.com/mudler/vllm.cpp/issues/821)
+([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ`,
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM`. `AGENTS.md` makes
+the quantized arms a standing requirement, and these are the arms a user can run:
+17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
+
+Nothing is implemented. No production path accepts a second `clip` GGUF projector
+beside the language file. The artifact published as `unsloth/Qwen3.8-27B-NVFP4`
+is a compressed-tensors `mixed-precision` checkpoint with **zero `*.input_scale`
+tensors**, which is why the reported load dies. And the Q4_K_M file ships the MTP
+drafter as block 64, so a loader reading `block_count` as decoder depth builds a
+65-layer model out of a 64-layer checkpoint.
+
+**Both token gates are `PENDING` on named external authorities, and this page
+claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,
+whose pin is recorded `gateable = no` with
+[#857](https://github.com/mudler/vllm.cpp/issues/857) owing the measurement. The
+NVFP4 arm's oracle is the pinned vLLM, which builds and imports inside an `rc`
+lease but has never been shown to RUN a model there
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)).
+
+Neither blocker is these rows' to clear, and neither stops the CPU-side work: ten
+of the sixteen declared tests need no GPU and no lease.
+
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
 **spiked-only**, per the [model matrix](../.agents/model-matrix.md).
