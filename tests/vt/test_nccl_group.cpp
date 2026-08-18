@@ -129,6 +129,7 @@ TEST_CASE("host NVFP4 decode reproduces the fp4 layout (known nibbles + e4m3 sca
 }
 
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O,int H,int I,const uint16_t* x,const uint16_t* gu,const uint16_t* down,float* out);
+extern "C" int vt_cuda_attn_kv_shard_run(int T,int Hq,int Hkv,int D,const float* q,const float* k,const float* v,float* out);
 TEST_CASE("bf16 dense-MLP assembly: split [2I,H] gate/up + down, shard == host ref") {
   constexpr int O=8,H=12,I=24;   // I%4==0
   // float ground truth first, then its bf16 bits as the as-"assembly" input.
@@ -152,4 +153,24 @@ TEST_CASE("bf16 dense-MLP assembly: split [2I,H] gate/up + down, shard == host r
   for (int i=0;i<I;++i)for(int k=0;k<H;++k){gate_[i*H+k]=bff(gu16[i*H+k]);up_[i*H+k]=bff(gu16[(I+i)*H+k]);}
   for (int o=0;o<O;++o)for(int i=0;i<I;++i) down_[o*I+i]=bff(down16[o*I+i]);
   for (int o=0;o<O;++o){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x_[k]*gate_[i*H+k];u+=x_[k]*up_[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down_[o*I+i];} CHECK(out[(size_t)o]==doctest::Approx((float)a).epsilon(2e-4));}
+}
+
+TEST_CASE("attention KV/GQA-shard: KV split across ranks == single-GPU softmax attention") {
+  constexpr int T=3,Hq=4,Hkv=8,D=16;  // Hkv%W==0 on a 2/4-GPU box
+  std::vector<float> q(T*Hq*D),k(Hkv*D),v(Hkv*D);
+  for (size_t i=0;i<q.size();++i) q[i]=0.1f*((int)(i%13))-0.3f;
+  for (int kh=0;kh<Hkv;++kh) for (int d=0;d<D;++d){ k[kh*D+d]=0.05f*((kh*3+d)%9)-0.1f; v[kh*D+d]=0.2f*((kh*5+d)%7)+0.1f;}
+  std::vector<float> out((size_t)T*Hq*D,0.f);
+  int rc=vt_cuda_attn_kv_shard_run(T,Hq,Hkv,D,q.data(),k.data(),v.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); attn kv-shard skipped");return;}
+  CHECK(rc==0);
+  // host full-kv softmax attention reference.
+  const float scale=1.0F/std::sqrt((float)D);
+  std::vector<float> ref(T*Hq*D,0.f),dref(T*Hq,0.f);
+  for (int t=0;t<T;++t)for(int hq=0;hq<Hq;++hq){
+    const float* qt=q.data()+(size_t)(t*Hq+hq)*D; double dn=0.0;
+    for (int kh=0;kh<Hkv;++kh){ const float* kp=k.data()+(size_t)kh*D; float s=0; for(int d=0;d<D;++d)s+=qt[d]*kp[d]; dn+=std::exp((double)(s*scale));}
+    for (int kh=0;kh<Hkv;++kh){ const float* kp=k.data()+(size_t)kh*D,*vp=v.data()+(size_t)kh*D; float s=0; for(int d=0;d<D;++d)s+=qt[d]*kp[d]; double e=std::exp((double)(s*scale)); for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*vp[d]/dn);}
+  }
+  for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
 }
