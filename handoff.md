@@ -13,7 +13,9 @@ resident in VRAM. **Milestone achieved + held**: 27B dense 241/241 + 35B engine
 
 ## Repository / branch
 
-- Path: `/shared/local/Programing/vllm.cpp` (branch `sm70-support`)
+- Path (canonical, this session): `/home/nvidia/Dev/vllm.cpp.qwen`, branch
+  `row/tp-3-stretch` (= `sm70-support` tip `2a1f79b8`). (Historical ports of
+  this handoff name `/shared/local/Programing/vllm.cpp` and `~/vllm.cpp-w0`.)
 - Upstream: `origin` = `https://github.com/mudler/vllm.cpp`
 - Branch base: branched at `6db04e7`; a full **merge of `origin/main` (269 commits)
   landed as `796e6e65`** (doc-only conflicts: our `docs/STATUS.md` kept,
@@ -137,16 +139,26 @@ box. The multi-GPU token gate the spec once marked UNREACHED is now reached.
 1. **`DenseMtpBlock` tp>1 branch** — DONE (`66f48f80`): host-decode fp4/bf16
    gate/up/down → `vt_cuda_mlp_shard_run`/`_bf16` per token → reduced `[T,H]`.
    tp1 keeps the resident fp4 tensor-core path (tp null → branch never entered).
-2. **Attention + KV/GQA shard** — DONE (`c643c311` + `9e246680`: KV-split with
-   a causal `[S,Hkv,D]` window); wrapped into the unpaged FullAttnBlock by
-   `40bad253` (q full on every rank, KV-head-split AllReduceSum → complete
-   output per rank, so o_proj stays a full GEMM).
+2. **Attention + KV shard** — DONE (`c643c311` + `9e246680`: KV-split with a
+   causal `[S,Hkv,D]` window); wrapped into the unpaged FullAttnBlock by
+   `40bad253` (q full on every rank, per-rank KV-slice partial softmax,
+   AllReduceSum → complete output per rank, so o_proj stays a full GEMM).
+   **INTEGRITY NOTE (2026-08-19):** this primitive currently computes a
+   *gather-over-all-kv-heads* — it runs `for (int kh = 0; kh < Hkv; ++kh)` in
+   both `AttnKvHostRef` (nccl_communicator.cu:824) and `AttnKvShardPartial`
+   (:854) — which is NOT the GQA the tp1 `AttentionKernel` uses
+   (`g = h/(hq/hk)`, cuda_ops.cu:1468). The dense tp==tp1 gate passes only
+   because greedy argmax is robust to the difference: **it is a WEAK baseline,
+   not proof of byte-exact parity.** Fixing the dense primitive to GQA-exact is
+   a tracked follow-up; the NEW paged shard (below) is GQA-exact by design.
 3. **Head (lm_head) column-shard + AllGather** — primitive DONE (`87d78ce`);
    with the layer output full on every rank, the token head needs no shard.
 4. **Runner attach** — the real token-equal gate drives `ForwardDense` at tp==1
    vs tp==world over all-local GPUs; the gate proves tp==tp1.
-5. **Token-equal gate** — **REACHED**: 4-GPU dense == tp1 (8 tokens identical),
-   SUCCESS — the gate the handoff previously called UNREACHED-until-wiring.
+5. **Token-equal gate** — **REACHED (weak)**: 4-GPU dense == tp1 (8 tokens
+   identical), SUCCESS. **Caveat (2026-08-19):** the tp>1 attention primitive
+   uses gather-over-all-kv-heads, which ≠ tp1 GQA; the gate passes on greedy
+   argmax robustness only. See the KNOWN-DISCREPANCY section below.
 
 Remaining stretch (NOT in the dense-token gate): per-rank paged-KV in the
 `RunDenseLayerPaged` decode path, and MoE (A3B) expert TP — deferred in spec.
@@ -160,11 +172,108 @@ threading" phase: add the null-default `tp` to the ~58 other hand-rolled arch
 - **tp1 is the load-bearing path** and must stay byte-identical at every TP
   commit (guard: tp null / tp_size==1 → original resident path; tp>1 either
   sharded-correct or throws — never silently tp1 math).
+  **On `tp>1` attention specifically (2026-08-19): "sharded-correct" now means
+  GQA-exact — each q-head attends to exactly one kv-head `g = hq/qpk` — not the
+  all-kv-heads gather the current dense primitive does. Do not copy the gather
+  loop into any new attention path.**
 - `run_pipeline_gate.py` is always fresh-fetched (reviewer parity, never
   marked pass from git); `--required-token-exact` makes a no-match fail.
 - `test_sm70_fa2_decode` and the 35B/27B engine are the sm70 no-regression
   gates; keep them green when touching attention/GEMM.
 - No flashy test names; the suite must stay fast + safe.
+
+## KNOWN DISCREPANCY — dense tp>1 attention is gather, not GQA (2026-08-19)
+
+**Do not treat the dense tp==tp1 gate (8 tokens) as byte-exact proof.** The
+tp>1 attention primitive (`vt_cuda_attn_kv_shard_run`, `AttnKvHostRef` +
+`AttnKvShardPartial` in `nccl_communicator.cu:824,854`) sums over **all** kv
+heads:
+```
+for kh in [0,Hkv): e = exp( (q·k[s,kh])*scale ); den+=e; num+=e*v[s,kh,d0]
+out = num/den
+```
+The tp1 `AttentionKernel` (cuda_ops.cu:1468) is standard GQA:
+```
+g = h / (hq/hk);  // one kv head per q head; softmax over positions only
+```
+Experiment (27B-shaped layer Hq=24/Hkv=4/Dh=256, random normed q/k/v):
+`max|gqa − gather| = 4.86`, `frac |Δ| > 1e-3 = 0.998`. **Different math.** The
+gather kernel and its on-host self-check reference agree with each other but
+are both wrong relative to true GQA. This is a REAL, LATENT correctness gap in
+the dense tp>1 path; it is masked only by greedy-argmax robustness.
+
+**Correct design (adopted for the paged shard, and the fix target for dense):**
+per `(t,hq,d0)`, `g = hq/qpk` (qpk = Hq/Hkv). If `g` is in this rank's kv slice
+`[hk0, hk0+per)`, compute the full single-kv-head softmax over positions
+(no sum over kh); else contribute 0. AllReduceSum across ranks → because each
+q-head's softmax is computed on exactly one rank, the reduce gathers a
+complete output with **no global num/den divide**, and the result is
+token-exact to unsharded `vt::Attention` by construction.
+
+**Owed:** file the dense-gather bug (issue-index row + spec `## Owed`) and fix
+the dense primitive. Blocked on the repo (no `gh`, no tokens) → record in
+`.agents/issue-index.md`; highest existing issue is #1152.
+
+## Current session (2026-08-19) box state
+
+- Canonical checkout: `/home/nvidia/Dev/vllm.cpp.qwen`, branch
+  `row/tp-3-stretch` (= `sm70-support` tip `2a1f79b8`). `~/vllm.cpp-w0` is an
+  old dirty checkout whose committed tree is byte-identical (only
+  STATUS.md/parity-ledger differ).
+- Build tree: `build-sm70` (CUDA arch 70, TRITON=OFF, `-DVLLM_CPP_NCCL=ON`).
+  cmake/ninja/PyYAML live in `~/miniconda3/envs/1cat-vllm-sm70` — export
+  `PATH=$ENV/bin:$PATH` before build/gate runs.
+- **GPU constraint (user, 2026-08-19): only GPU 2 and 3 are usable** for
+  experiments/tests (0 and 1 are owned by other tasks). Steer every GPU run
+  with `CUDA_VISIBLE_DEVICES=2,3` → world=2. 27B `Hkv=4`→`per=2`; 35B `Hkv=2`→
+  world=2 (`per=1`).
+- **Merge state:** branch is 63 ahead / 61 behind `origin/main` (`6792dc43`),
+  diverged at `dd8a3b0e`; `origin/main` is NOT an ancestor of HEAD. Merge
+  (deferred to landing) has 3 conflicts — `parity-ledger.md`, `docs/STATUS.md`,
+  `qwen3_5.cpp`; main's qwen3_5.cpp change does **not** touch this increment's
+  edit regions (FullAttnBlockPaged/MoeBlock/RunDenseLayerPaged/Forward).
+- **Gate debt:** 20 failures, all pre-existing campaign debt; stale-base
+  (cleared by merge) vs real record debt (11 empty-body `docs:` commits, 4
+  oldest sm70 commits missing trailers, 8 doc-checkpoint). Branch is local-only
+  (never pushed) → history rewrite is safe.
+
+## Paged tp==tp1 gate — localized, fixed, running (2026-08-19)
+
+The paged tp==tp1 token gate (`test_op_parity -tc="qwen27 paged logits
+tp==tp1*"`, the real 27B, world=2 on GPUs 2/3) initially **hung** in the tp>1
+arm's prefill `Forward`. Markers proved the GQA attention branch is *not* the
+cause: layer 0 (GDN, replicated) completes in ~1ms and the first full-attn GQA
+branch runs at layer 15 in ~50ms. The stall is in **`DenseMlpBlock`'s tp>1
+path**, which ran `vt_cuda_mlp_shard_run` **per token** — one fresh
+`CudaCommGroup` + a full O×I×H host double reference **per token per layer**.
+At 27B (O=H=5120, I=17408) that is ~1.7e14 double-FMA/token/layer → hours;
+it looked like a hang but is just catastrophically slow.
+
+**Fix (this segment):** a **batched** `vt_cuda_mlp_shard_run_b(T,O,H,I,verify,
+x,gate,up,down,out)` in `nccl_communicator.cu` + a `DenseMlpRankPartialBatch`
+kernel (one thread per (t,o); rank owns an I/W intermediate slice). The whole
+[T,H] batch runs in ONE group / ONE `[T,O]` AllReduce; fp4 weights are
+host-decoded once per layer. `verify=0` (production) is compute-only — the
+engine's token-vs-tp1 comparison is the real correctness check; `verify=1`
+runs the (parallelised) host-parity selfcheck. `DenseMlpBlock` tp>1 now calls
+it once (was a per-token loop). Non-fp4 tp>1 throws loudly. Selfchecks added:
+fresh shape (verify=1) + 27B production shape (T=9, H=5120, I=17408, verify=0,
+spot-checked vs host ref). `test_nccl_group` **16/16, 2092/2092**.
+
+**Gate status: GREEN (2026-08-19).** ~2h run completed EXIT=0:
+`paged tp==tp1 token gate: 2-GPU == tp1 (9 tokens: 6511 314 9564 369 19241
+13 271 248068 271)` — 2 assertions passed. Gate size `REQUIRE` corrected to
+`1+kDecodes` (=9 tokens). All TEMP diagnostic markers
+(`[pgmlp]`/`[pglyr]`/`[pgpre]`/`[pgtp]`/`[gqa]`/`[mlp]`, `PgMarkMs`,
+`PagedTpMark`) removed afterward; no-regression sweep on the cleaned tree:
+nccl 16/16 (2092), fa2 5/5, backend 7/7 (42), dense tp==tp1 (8 tokens) — all
+SUCCESS.
+
+**Edit-tool gotcha (cost repeated clobbering this session):** a bare
+`PUT <N>:` followed by a `+` body **replaces** line N (behaves like
+`PUT N.=N:`), it does not insert. To insert without deleting the anchor use
+`PUT <N:` (before) or `PUT >N:` (after). Every marker insertion must be
+re-read to confirm it did not eat the anchor's following lines.
 
 ## Quick commands (resume)
 
@@ -181,5 +290,15 @@ cd /shared/local/Programing/vllm.cpp && git status && git log --oneline -20
 - Is in-process (`ncclCommInitAll`, one process world=N) the intended multi-GPU
   topology vs. vLLM's multi-process unique-id broadcast? (Current primitive
   path is in-process; the transport is also ported for multi-process ranks.)
-- GQA KV-split for the decode's page layout (deferred until step 2 is running).
-- MoE (A3B) expert TP (separate, after the dense tp>1 path is token-equal).
+- GQA KV-split for the decode's page layout — **ANSWERED 2026-08-19**: use the
+  GQA-exact decomposition above (`g = hq/qpk`, per-rank single-kv-head softmax,
+  AllReduceSum, no num/den). Stage the paged `[S,Hkv,D]` KV to host → call a
+  paged GQA-exact shard; correctness first, perf out of scope for the token
+  milestone. Hkv divisibility: world divides Hkv (27B Hkv=4 @ world=2 → per=2;
+  35B Hkv=2 @ world=2 per=1); for W>Hkv use kv-head replication / zero-fill.
+- MoE (A3B) expert TP: weight-parallel is the vLLM default — every rank holds
+  all experts; per-expert gate/up column-shard, down row-shard, AllReduceSum
+  combine; `tp` must thread through the MoE `ForwardDense` (currently takes no
+  `tp`), paged path currently throws on tp>1 (`qwen3_5.cpp:8733-8737`).
+- Whether to also back-fix the dense tp>1 attention to GQA-exact (see KNOWN
+  DISCREPANCY). Tracked as owed; filed once `gh`/a token is available.

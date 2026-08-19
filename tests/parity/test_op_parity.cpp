@@ -28,6 +28,8 @@
 #include "vllm/model_executor/models/tensor_parallel.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/attention/backends/gdn_attn.h"
+#include "vllm/v1/attention/backend.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vt/backend.h"
 #ifdef VLLM_CPP_CUDA
@@ -2486,6 +2488,193 @@ TEST_CASE("qwen27 dense logits tp==tp1 token gate (dgx-only, CUDA, multi-GPU)") 
   REQUIRE(t1 == tw);
   MESSAGE("tp==tp1 token gate: " << ngpu << "-GPU dense == tp1 (" << t1.size()
           << " tokens identical)");
+}
+// PAGED qwen3.6-27B tp==tp1 token gate. Drives Qwen3_5DenseModel::Forward (the
+// paged hybrid path: 16 full-attn + 48 GDN layers over device paged KV + GDN
+// recurrent state) and compares the greedy tokens under a tp>1 group against the
+// tp1 (nullptr) reference. Unlike the dense gate (ForwardDense, which
+// re-forwards the growing sequence), this is the STATEFUL paged path: one 9-token
+// prefill + 8 single-token decodes over persistent device pools.
+//
+// Why it is both green and meaningful:
+//   * tp1 paged (nullptr) is the proven production path (35B paged engine gate
+//     315/315; test_qwen35_paged_forward 4/4 — FullAttnBlockPaged + GdnBlockPaged
+//     + paged KV all run on sm70). The tp1 arm is unchanged by my edits.
+//   * tp>1 full-attn = the NEW branch in FullAttnBlockPaged: per-rank GQA
+//     KV-head split over the paged cache (host-staged [S,Hkv,D] K/V, per-query
+//     key_end causal mask, NCCL AllReduceSum — vt_cuda_attn_gqa_shard_run).
+//     tp>1 dense-MLP = the proven per-rank shard (vt_cuda_mlp_shard_run) the
+//     dense gate already exercises (129s, 8 tokens identical).
+//   * GDN layers are REPLICATED on every rank (no tp), so their state is
+//     byte-identical across arms; only the full-attn + dense-MLP ops shard.
+// Prefill (T=9) and each decode (T=1) route through the tp>1 branch
+// (key_end[t]=(S-T)+t+1), so both the multi-token causal prefill and the
+// single-token decode are TP-sharded and must reproduce tp1 byte-for-byte.
+//
+// Memory: the pool is tiny because GDN state is one recurrent slot per SEQUENCE
+// (harness-controlled slot count), not per KV block. At 4 slots, 27B weights
+// (~22GB) + pool (~0.6GB) fit one 32GB V100. block_size=8 across 3 blocks so
+// the sequence (17 tokens) spans multiple KV blocks, exercising the paged
+// block-stride reads (incl. the V-half block stride) in the tp>1 gather.
+struct PagedTpPool {
+  void* full_attn = nullptr;   // n_full layers, [blocks, 2, bs, Hkv, Dh] bf16
+  void* gdn_ssm = nullptr;     // n_gdn layers, [slots, Hv, Dv, Dk] f32
+  void* gdn_conv = nullptr;    // n_gdn layers, [slots, conv_dim, Kw-1] bf16
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+};
+
+PagedTpPool BuildPagedTpPool(vt::Backend& b, vt::Queue& q, const vllm::HfConfig& c,
+                             int64_t kblocks, int64_t bs, int64_t slots) {
+  const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+  const int64_t Hv = c.linear_num_value_heads, Dv = c.linear_value_head_dim;
+  const int64_t Dk = c.linear_key_head_dim, Kw = c.linear_conv_kernel_dim;
+  const int64_t Hk = c.linear_num_key_heads;
+  const int64_t conv_dim = 2 * Hk * Dk + Hv * Dv;
+  int64_t n_full = 0, n_gdn = 0;
+  for (const auto& lt : c.layer_types)
+    (lt == "linear_attention" ? n_gdn : n_full) += 1;
+  const int64_t fa_bytes = kblocks * 2 * bs * Hkv * Dh * 2;   // bf16
+  const int64_t ssm_bytes = slots * Hv * Dv * Dk * 4;         // f32
+  const int64_t conv_bytes = slots * conv_dim * (Kw - 1) * 2; // bf16
+  PagedTpPool p;
+  p.full_attn = b.Alloc(static_cast<size_t>(n_full) * fa_bytes);
+  p.gdn_ssm = b.Alloc(static_cast<size_t>(n_gdn) * ssm_bytes);
+  p.gdn_conv = b.Alloc(static_cast<size_t>(n_gdn) * conv_bytes);
+  b.Memset(q, p.full_attn, 0, static_cast<size_t>(n_full) * fa_bytes);
+  b.Memset(q, p.gdn_ssm, 0, static_cast<size_t>(n_gdn) * ssm_bytes);
+  b.Memset(q, p.gdn_conv, 0, static_cast<size_t>(n_gdn) * conv_bytes);
+  const Device d{DeviceType::kCUDA, 0};
+  int64_t fi = 0, gi = 0;
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    if (c.layer_types[static_cast<size_t>(l)] == "linear_attention") {
+      vllm::GdnStateCache gs;
+      gs.ssm_state = vt::Tensor::Contiguous(
+          static_cast<char*>(p.gdn_ssm) + gi * ssm_bytes, vt::DType::kF32, d,
+          {slots, Hv, Dv, Dk});
+      gs.conv_state = vt::Tensor::Contiguous(
+          static_cast<char*>(p.gdn_conv) + gi * conv_bytes, vt::DType::kBF16, d,
+          {slots, conv_dim, Kw - 1});
+      p.gdn_state.push_back(gs);
+      ++gi;
+    } else {
+      vllm::PagedKvCache kv;
+      kv.data = static_cast<char*>(p.full_attn) + fi * fa_bytes;
+      kv.dtype = vt::DType::kBF16;
+      kv.num_blocks = kblocks;
+      kv.block_size = bs;
+      kv.num_kv_heads = Hkv;
+      kv.head_size = Dh;
+      p.attn_kv.push_back(kv);
+      ++fi;
+    }
+  }
+  b.Synchronize(q);
+  return p;
+}
+
+TEST_CASE("qwen27 paged logits tp==tp1 token gate (CUDA, multi-GPU, NVFP4 snapshot)") {
+  bool has_cuda = true;
+  try { vt::GetBackend(DeviceType::kCUDA); }
+  catch (const std::runtime_error&) { has_cuda = false; }
+  if (!has_cuda) { MESSAGE("no CUDA backend; skipping paged tp==tp1 gate"); return; }
+  const std::string snap = Find27BSnapshot();
+  if (snap.empty()) { MESSAGE("SKIP: 27B NVFP4 snapshot not present"); return; }
+  const fs::path st = fs::path(snap) / "model.safetensors";
+  if (!fs::exists(st)) { MESSAGE("SKIP: model.safetensors absent"); return; }
+#ifdef VLLM_CPP_CUDA
+  int ngpu = 0;
+  if (cudaGetDeviceCount(&ngpu) != cudaSuccess) { MESSAGE("cudaGetDeviceCount failed"); return; }
+#else
+  int ngpu = 1;
+#endif
+  if (ngpu < 2) { MESSAGE("SKIP: paged tp==tp1 needs >=2 CUDA GPUs (have " << ngpu << ")"); return; }
+
+  MESSAGE("paged tp==tp1 gate: loading 27B (W4A4 fp4-resident) on " << ngpu << " GPUs...");
+  const vllm::HfConfig cfg = vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(st.string()));
+  const vllm::Qwen3_5DenseWeights weights = vllm::LoadQwen3_5Dense(shards, cfg);
+  const int vocab = static_cast<int>(cfg.vocab_size);
+
+  // 9-token base prompt (the 27B logits-golden ids) + 8 single-token decodes.
+  std::vector<int32_t> base = {760, 6511, 314, 9338, 369, 11751, 11, 321, 279};
+  const int64_t N0 = static_cast<int64_t>(base.size());
+  constexpr int kDecodes = 8;
+  const int64_t bs = 8;
+  const int64_t max_len = N0 + kDecodes;          // 17 tokens
+  const int64_t kblocks = (max_len + bs - 1) / bs;  // 3 blocks (spans block boundary)
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  vllm::v1::GDNAttentionMetadataBuilder gdn_build;
+
+  const auto run_paged_greedy = [&](const vllm::TensorParallel* tp) {
+    PagedTpPool pool = BuildPagedTpPool(b, q, cfg, kblocks, bs, /*slots=*/4);
+    std::vector<int32_t> gen;
+    // Prefill: T=N0, slots 0..N0-1, block_table {0,1,2}.
+    {
+      vllm::v1::CommonAttentionMetadata am;
+      am.num_reqs = 1;
+      am.num_actual_tokens = static_cast<int>(N0);
+      am.query_start_loc = {0, static_cast<int32_t>(N0)};
+      am.query_start_loc_cpu = am.query_start_loc;
+      am.seq_lens = {static_cast<int32_t>(N0)};
+      am.seq_lens_cpu = am.seq_lens;
+      am.num_computed_tokens_cpu = {0};
+      am.max_query_len = static_cast<int>(N0);
+      am.max_seq_len = static_cast<int>(N0);
+      am.block_table_num_cols = static_cast<int>(kblocks);
+      am.block_table_tensor = {0, 1, 2};
+      for (int64_t i = 0; i < N0; ++i) am.slot_mapping.push_back(i);
+      am.causal = true;
+      const vllm::v1::GDNAttentionMetadata gm = gdn_build.build(0, am);
+      std::vector<int32_t> pos(N0);
+      std::vector<float> lg = vllm::Qwen3_5DenseModel::Forward(
+          base, pos, am, gm, pool.attn_kv, pool.gdn_state, weights, cfg, q, {}, tp);
+      gen.push_back(ArgmaxRow(&lg[static_cast<size_t>(N0 - 1) * vocab], vocab));
+    }
+    // Decode: single-token steps over the persistent pools.
+    for (int s = 0; s < kDecodes; ++s) {
+      const int64_t L = N0 + s + 1;  // context length after this token
+      const int32_t tok = gen[s];
+      vllm::v1::CommonAttentionMetadata am;
+      am.num_reqs = 1;
+      am.num_actual_tokens = 1;
+      am.query_start_loc = {0, 1};
+      am.query_start_loc_cpu = am.query_start_loc;
+      am.seq_lens = {static_cast<int32_t>(L)};
+      am.seq_lens_cpu = am.seq_lens;
+      am.num_computed_tokens_cpu = {static_cast<int32_t>(N0 + s)};
+      am.max_query_len = 1;
+      am.max_seq_len = static_cast<int>(L);
+      am.block_table_num_cols = static_cast<int>(kblocks);
+      am.block_table_tensor = {0, 1, 2};
+      am.slot_mapping = {L - 1};  // absolute slot of the new token (block (L-1)/8)
+      am.causal = true;
+      const vllm::v1::GDNAttentionMetadata gm = gdn_build.build(0, am);
+      std::vector<float> lg = vllm::Qwen3_5DenseModel::Forward(
+          {tok}, {static_cast<int32_t>(L - 1)}, am, gm, pool.attn_kv,
+          pool.gdn_state, weights, cfg, q, {}, tp);
+      gen.push_back(ArgmaxRow(&lg[0], vocab));
+    }
+    b.Free(pool.full_attn);
+    b.Free(pool.gdn_ssm);
+    b.Free(pool.gdn_conv);
+    return gen;
+  };
+  const std::vector<int32_t> t1 = run_paged_greedy(nullptr);
+  TpThunkComm th; th.w_ = ngpu;
+  vllm::TensorParallel tpGroup{&th};
+  const std::vector<int32_t> tw = run_paged_greedy(&tpGroup);
+  b.DestroyQueue(q);
+  REQUIRE(t1.size() == static_cast<size_t>(1 + kDecodes));
+  REQUIRE(t1 == tw);
+  std::string toks;
+  for (size_t i = 0; i < t1.size(); ++i)
+    toks += (i ? " " : "") + std::to_string(t1[i]);
+  MESSAGE("paged tp==tp1 token gate: " << ngpu << "-GPU == tp1 (" << t1.size()
+          << " tokens: " << toks << ")");
 }
 
 // vLLM 0.25.0's MergedColumnParallelLinear BA path dispatches BF16 x/weight

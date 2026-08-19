@@ -43,14 +43,21 @@ extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
 extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I, const float* x,
                                        const float* gate, const float* up,
                                        const float* down, float* out);
+extern "C" int vt_cuda_mlp_shard_run_b(int T, int O, int H, int I, int verify,
+                                       const float* x, const float* gate,
+                                       const float* up, const float* down,
+                                       float* out);
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I, const uint16_t* x16,
                                            const uint16_t* gu16, const uint16_t* dn16,
                                            float* out);
 extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int S, int Hkv, int D,
                                           const float* q, const float* k,
                                           const float* v, float* out);
+extern "C" int vt_cuda_attn_gqa_shard_run(int T, int Hq, int Hkv, int S, int D,
+                                          const int* key_end, const float* q,
+                                          const float* k, const float* v,
+                                          float* out);
 #endif  // VT_NCCL
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -60,7 +67,6 @@ extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int S, int Hkv, int D,
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <optional>
 #include <vector>
@@ -5350,7 +5356,8 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
 DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
                         const Tensor& h, const StepDevInputs& sdi,
                         const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                        int64_t T, const Tensor* h_fp8 = nullptr) {
+                        int64_t T, const Tensor* h_fp8 = nullptr,
+                        const vllm::TensorParallel* tp = nullptr) {
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
   const int64_t Dh = cfg.head_dim;
@@ -5500,6 +5507,98 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dsl = sdi.seq_lens.t();
   Tensor dqsl = sdi.query_start_loc.t();
   vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, dslot);
+  // Multi-device (tp>1): GQA-EXACT KV-head-split attention (vt_cuda_attn_gqa_shard_run
+  // — see nccl_communicator.cu). Per query head hq the ONE owning kv head is
+  // g=hq/(Hq/Hkv); each rank owns a contiguous [hk0,hk0+per) kv-head slice and
+  // computes the full single-kv-head softmax for the heads it owns (0 elsewhere);
+  // the num/den AllReduceSum yields the COMPLETE GQA output identically on every
+  // rank, so attn_out [T,Hq,Dh] is full and the o_proj gate is the normal full
+  // GEMM below. tp1 (null) keeps the proven vt::PagedAttention path byte-identical.
+  //
+  // Unlike the dense path (self-attention, K/V == the new-token kn3/v3), the
+  // paged K/V is the FULL history staged in the device paged cache; we D2H-gather
+  // it to a contiguous host [S,Hkv,Dh] f32 stream the primitive consumes. This is
+  // the reference (host-parity in-process group) path — correct, not fast; the
+  // paged tp==tp1 gate is the target. Slow-but-correct, perf out of scope.
+  if (tp != nullptr && tp->tp_size() > 1) {
+    const int64_t S = meta.seq_lens_cpu[0];  // context length after this step
+#ifdef VT_NCCL
+    if (meta.num_reqs != 1)
+      throw std::runtime_error(
+          "qwen3_5 FullAttnPaged: tp>1 stages a single contiguous K/V stream and "
+          "supports a single request; refusing to silently mis-shard a batched step");
+    const int64_t bs = kv.block_size;
+    const size_t sof = vt::SizeOf(kv.dtype);
+    const size_t bd = static_cast<size_t>(Hkv) * static_cast<size_t>(Dh);  // [Hkv,D] elems
+    const size_t blklen = static_cast<size_t>(bs) * bd;                     // per-block elems
+    const size_t tot = static_cast<size_t>(S) * bd;                          // [S,Hkv,D] elems
+    const char* kbase = static_cast<const char*>(kv.data);
+    const char* vbase = kbase + static_cast<size_t>(bs) * bd * sof;  // V half of K|V
+    const int32_t* bt = meta.block_table_tensor.data();
+    std::vector<float> kh(tot), vh(tot);
+    std::vector<uint16_t> kh16, vh16;
+    if (kv.dtype == DType::kBF16) { kh16.resize(tot); vh16.resize(tot); }
+    for (int64_t p = 0; p < S; ++p) {
+      const int32_t bl = bt[p / bs];
+      const size_t bpos = static_cast<size_t>(p % bs);
+      const char* ksrc =
+          kbase + (static_cast<size_t>(bl) * 2u + 0u) * blklen * sof + bpos * bd * sof;
+      const char* vsrc =
+          vbase + static_cast<size_t>(bl) * 2u * blklen * sof + bpos * bd * sof;
+      if (kv.dtype == DType::kBF16) {
+        d.b.Copy(d.q, kh16.data() + static_cast<size_t>(p) * bd, ksrc, bd * 2);
+        d.b.Copy(d.q, vh16.data() + static_cast<size_t>(p) * bd, vsrc, bd * 2);
+      } else {
+        d.b.Copy(d.q, kh.data() + static_cast<size_t>(p) * bd, ksrc, bd * sizeof(float));
+        d.b.Copy(d.q, vh.data() + static_cast<size_t>(p) * bd, vsrc, bd * sizeof(float));
+      }
+    }
+    if (kv.dtype == DType::kBF16) {
+      for (size_t i = 0; i < tot; ++i) {
+        const uint32_t kb = static_cast<uint32_t>(kh16[i]) << 16;
+        const uint32_t vb = static_cast<uint32_t>(vh16[i]) << 16;
+        std::memcpy(&kh[i], &kb, 4);
+        std::memcpy(&vh[i], &vb, 4);
+      }
+    }
+    // Query f32 contiguous [T,Hq,D] (qn3 is bf16 on the FA2 decode path — widen
+    // losslessly; the primitive consumes f32 q).
+    const int64_t qn = T * Hq * Dh;
+    std::vector<float> qh((size_t)qn);
+    if (qn3.dtype == DType::kBF16) {
+      std::vector<uint16_t> q16((size_t)qn);
+      d.b.Copy(d.q, q16.data(), qn3.data, qn * 2);
+      d.b.Synchronize(d.q);
+      for (int64_t i = 0; i < qn; ++i) {
+        const uint32_t bits = static_cast<uint32_t>(q16[i]) << 16;
+        std::memcpy(&qh[i], &bits, 4);
+      }
+    } else {
+      d.b.Copy(d.q, qh.data(), qn3.data, qn * sizeof(float));
+      d.b.Synchronize(d.q);
+    }
+    // Causal key count per query token: absolute position of query t in the
+    // single request = (S - T) + t, so it sees (S - T) + t + 1 keys. Decode
+    // (T=1) -> S; prefill (T=S) -> t+1.
+    std::vector<int> key_end((size_t)T);
+    for (int64_t t = 0; t < T; ++t) key_end[(size_t)t] = (int)((S - T) + t + 1);
+    std::vector<float> oh((size_t)qn, 0.f);
+    const int rc = vt_cuda_attn_gqa_shard_run(
+        (int)T, (int)Hq, (int)Hkv, (int)S, (int)Dh, key_end.data(), qh.data(),
+        kh.data(), vh.data(), oh.data());
+    if (rc == 2)
+      throw std::runtime_error("qwen3_5 FullAttnPaged: tp>1 requires >=2 GPUs (fault loudly)");
+    if (rc != 0)
+      throw std::runtime_error("qwen3_5 FullAttnPaged: tp>1 GQA KV-shard mismatched host reference");
+    DBuf attn_out(d, DType::kF32, {T, Hq, Dh});
+    d.b.Copy(d.q, attn_out.ptr(), oh.data(), qn * sizeof(float));
+    d.b.Synchronize(d.q);
+    return SigmoidGateOProjD(d, Reshape(attn_out.t(), {T, Hq * Dh}),
+                             Reshape(gatef.t(), {T, Hq * Dh}), w, fp4);  // [T,H]
+#else
+    throw std::runtime_error("qwen3_5 FullAttnPaged: tp>1 requires an NCCL build (VLLM_CPP_NCCL)");
+#endif  // VT_NCCL
+  }
 
   // bf16 attention out on an FA2 path (FA2 writes bf16; the sigmoid
   // gate upcast is exact) — f32 everywhere else, byte-identical to today.
@@ -7351,15 +7450,15 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                    const vllm::TensorParallel* tp = nullptr) {
   const int64_t I = cfg.intermediate_size;
   const int64_t H = cfg.hidden_size;  // dense in/out width == hidden size
-  // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
-  // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
   // Multi-device (tp>1): the real per-rank shard. Host-decode the resident
-  // fp4/bf16 weights into the shard's [out,in] f32 layout, then run the group
-  // sharded dense-MLP per token (one token x [H] -> one reduced token the group
-  // sums on rank 0), writing the reduced [T,H] bf16 back. tp1 (null) never enters
-  // so the resident tensor-core path below stays byte-identical. Requires the
-  // VT_NCCL transport (the group primitive + host decode) to be built.
+  // fp4/bf16 weights into the shard's [out,in] f32 layout, then run the whole
+  // [T,H] token batch in ONE group (one NCCL create, one kernel launch per
+  // rank, one [T,O] AllReduce) -- the batched shard, not the unrunnable
+  // per-token loop (one fresh group + full host reference per token). tp1
+  // (null) never enters so the resident tensor-core path below stays
+  // byte-identical. Requires the VT_NCCL transport (the group primitive +
+  // host decode) to be built.
   if (tp != nullptr && tp->tp_size() > 1) {
 #ifdef VT_NCCL
     // Host-decode (or bf16->f32) the resident gate/up/down into the shard's
@@ -7385,81 +7484,37 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
           dec(w.down_proj_fp4, down_host, (int)H, (int)I) != 0)
         throw std::runtime_error("qwen3_5 dense MLP: tp>1 fp4 host-decode failed");
     }
-    // The reduced [O] is authoritative on group rank 0 (shard's AllReduce). Copy
-    // the device hidden D2H, run the sharded MLP per token, write the reduced
-    // [T,H] bf16 back on the caller's device.
+    if (!fp4)
+      throw std::runtime_error(
+          "qwen3_5 dense MLP: tp>1 batched shard supports the fp4-resident "
+          "path only (bf16/split-Matmul-B resident weights are not "
+          "host-decodable here); the per-token shard path it replaced is "
+          "unrunnable at production shape");
+    // The reduced [T,O] is authoritative on group rank 0 (the batched shard's
+    // AllReduce). Copy the device hidden D2H, run the whole [T,H] batch in ONE
+    // group, write the reduced [T,H] bf16 back on the caller's device.
     DBuf red(d, DType::kBF16, {T, H});
     std::vector<uint16_t> hid((size_t)T * H);
     d.b.Copy(d.q, hid.data(), (const void*)dh.data,
              (size_t)T * H * sizeof(uint16_t));
     d.b.Synchronize(d.q);
-    std::vector<uint8_t> host((size_t)T * H * 2);
-    for (int64_t t = 0; t < T; ++t) {
-      std::vector<float> o((size_t)H);
-      int rc;
-      if (fp4) {
-        std::vector<float> x((size_t)H);
-        for (int64_t h = 0; h < H; ++h)
-          x[(size_t)h] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
-        rc = vt_cuda_mlp_shard_run((int)H, (int)H, (int)I, x.data(),
-                                   gate_host.data(), up_host.data(),
-                                   down_host.data(), o.data());
-} else if (!w.gate_up_proj.Empty()) {
-        // BF16 RawNK merged gate_up + separate down (synthetic/plain path):
-        // pass the resident bf16 bytes straight to the bf16 shard (it does its
-        // own bf16->f32). The resident copy (if host bytes were released) is
-        // read through the device Tensor; host bytes otherwise.
-        const auto host_data = [&](const OwnedTensor& w) {
-          if (w.HasHostBytes())
-            return reinterpret_cast<const uint8_t*>(w.bytes.data());
-          return reinterpret_cast<const uint8_t*>(ResidentWeight(d, w).data);
-        };
-        const auto* gu_b = host_data(w.gate_up_proj);  // RawNK [2I, H]
-        const auto* dn_b = host_data(w.down_proj);     // RawNK [H, I] = [O, I]
-        rc = vt_cuda_mlp_shard_run_bf16(
-            (int)H, (int)H, (int)I, reinterpret_cast<const uint16_t*>(hid.data() + t * H),
-            reinterpret_cast<const uint16_t*>(gu_b), reinterpret_cast<const uint16_t*>(dn_b),
-            o.data());
-      } else {
-        // Split Matmul-B [in,out] projection fallback (synthetic/nk=false): the
-        // matrix-multiply B layout is [K=in, N=out] (gate/up [H,I], down [I,H]),
-        // so transpose into the shard's [out,in] orientation before sharding.
-        const auto row = [&](const OwnedTensor& w) -> const uint8_t* {
-          if (w.HasHostBytes())
-            return reinterpret_cast<const uint8_t*>(w.bytes.data());
-          return reinterpret_cast<const uint8_t*>(ResidentWeight(d, w).data);
-        };
-        std::vector<float> gu((size_t)(2 * I) * H);
-        for (int64_t i = 0; i < H; ++i) {  // in H rows
-          const uint8_t* gp = row(w.gate_proj) + (size_t)i * I * 2;
-          const uint8_t* up = row(w.up_proj) + (size_t)i * I * 2;
-          for (int64_t o = 0; o < I; ++o) {
-            gu[(size_t)(o * H + i)] = vt::BF16ToF32(((const uint16_t*)gp)[o]);
-            gu[(size_t)((I + o) * H + i)] = vt::BF16ToF32(((const uint16_t*)up)[o]);
-          }
-        }
-        std::vector<float> dn((size_t)(H * I));
-        for (int64_t i = 0; i < I; ++i)
-          for (int64_t o = 0; o < H; ++o)
-            dn[(size_t)(o * I + i)] =
-                vt::BF16ToF32(((const uint16_t*)(row(w.down_proj) + (size_t)i * H * 2))[o]);
-        std::vector<float> x((size_t)H);
-        for (int64_t h = 0; h < H; ++h)
-          x[(size_t)h] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
-        rc = vt_cuda_mlp_shard_run((int)H, (int)H, (int)I, x.data(),
-                                   &gu[0], &gu[(size_t)(I * H)], dn.data(), o.data());
-      }
-      if (rc == 2)
-        throw std::runtime_error(
-            "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
-      if (rc != 0)
-        throw std::runtime_error(
-            "qwen3_5 dense MLP: tp>1 shard mismatched host reference");
-      auto* row16 = reinterpret_cast<uint16_t*>(host.data() + (size_t)(t * H * 2));
-      for (int64_t h = 0; h < H; ++h) row16[(size_t)h] = vt::F32ToBF16(o[(size_t)h]);
-    }
-    d.b.Copy(d.q, red.ptr(), (const void*)host.data(),
-              (size_t)T * H * sizeof(uint16_t));
+    std::vector<float> xb((size_t)T * H);
+    for (size_t n = 0; n < (size_t)T * H; ++n)
+      xb[n] = vt::BF16ToF32(hid[n]);
+    std::vector<float> ob((size_t)T * H, 0.f);
+    const int rc = vt_cuda_mlp_shard_run_b(
+        (int)T, (int)H, (int)H, (int)I, /*verify=*/0, xb.data(),
+        gate_host.data(), up_host.data(), down_host.data(), ob.data());
+    if (rc == 2)
+      throw std::runtime_error(
+          "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
+    if (rc != 0)
+      throw std::runtime_error(
+          "qwen3_5 dense MLP: tp>1 batched shard failed (mismatch/bad shape)");
+    std::vector<uint16_t> red16((size_t)T * H);
+    for (size_t n = 0; n < (size_t)T * H; ++n)
+      red16[n] = vt::F32ToBF16(ob[n]);
+    d.b.Copy(d.q, red.ptr(), red16.data(), (size_t)T * H * sizeof(uint16_t));
     d.b.Synchronize(d.q);
     return red;
 #else
@@ -7762,7 +7817,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     VT_CHECK(attn_kv != nullptr,
              "paged dense layer: full-attn layer needs a PagedKvCache");
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
-                              *attn_kv, T);
+                              *attn_kv, T, nullptr, tp);
   }();
   DumpStage("block_out", attn);
 
@@ -7771,7 +7826,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   DumpStage("post_attn_norm", dh2);
 
-hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
+  hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
   DumpStage("mlp_out", hidden);
 }
 
@@ -9184,7 +9239,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const std::vector<float>* mrope_cos_sin = nullptr,
                                const std::vector<int32_t>* aux_layer_ids = nullptr,
                                const Tensor* aux_out = nullptr,
-                               StepDevInputs* persistent_sdi = nullptr) {
+                               StepDevInputs* persistent_sdi = nullptr,
+                               const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -9250,7 +9306,7 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
-                       gdn_meta, kv, gs, T);
+                       gdn_meta, kv, gs, T, tp);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -9321,7 +9377,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const std::vector<int32_t>& logits_indices,
                              const Tensor* hidden_tap = nullptr,
                              const std::vector<int32_t>* aux_layer_ids = nullptr,
-                             const Tensor* aux_out = nullptr) {
+                             const Tensor* aux_out = nullptr,
+                             const vllm::TensorParallel* tp = nullptr) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -9330,7 +9387,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
-                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
+                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out,
+                            /*persistent_sdi=*/nullptr, tp);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
@@ -9339,16 +9397,17 @@ std::vector<float> Qwen3_5DenseModel::Forward(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
-  (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) {
+  // tp>1: per-rank GQA-exact KV-head-split attention in the paged full-attn layers
+  // (FullAttnBlockPaged) + the proven per-rank dense-MLP shard (RunDenseLayerPaged
+  // -> DenseMlpBlock). GDN layers are replicated on every rank. tp1 (null) keeps the
+  // proven paged path byte-identical.
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
-                                  logits_indices);
+                                  logits_indices, /*hidden_tap=*/nullptr,
+                                  /*aux_layer_ids=*/nullptr, /*aux_out=*/nullptr,
+                                  tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
