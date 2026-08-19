@@ -157,16 +157,21 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 sm_80 and sm_100a were compiled end to end `-Werror` 0-warn on
 #                 dgx as the per-major representatives; the same-major siblings
 #                 (86/87/89, 103a) share the identical portable bodies. sm_70
-#                 (Volta, dropped by nvcc 13) and sm_75 (Turing, no bf16 tensor
-#                 cores → the portable bf16-WMMA path will not compile) are NOT
-#                 build-supported — they need a real fp16/non-tensor-core kernel
-#                 body, a scoped follow-up. See backend-matrix.md
-#                 BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and §W10.
+#                 (Volta, BACKEND-CUDA-SM070) is BUILD-SUPPORTED and carries the
+#                 branch's NVFP4 W4A16 decode GEMM + sm70 FA2 decode fast paths
+#                 (fp16 mma.sync; no bf16/fp8), compiled per the
+#                 sm70-nvfp4-gemm / sm70-fa2-v1 feature-table rows. It additionally
+#                 requires a CUDA < 13 toolkit — CUDA 13.0 dropped offline
+#                 compilation for architectures below 7.5, and 12.9.x is the last
+#                 12.x — which vt_cuda_check_arch_toolchain() enforces at configure.
+#                 sm_75 (Turing, no bf16 tensor cores) remains NOT build-supported.
+#                 See backend-matrix.md BACKEND-CUDA-SM0{70,80,86,87,89}/SM10{0,3,3}
+#                 and §W10.
 # Cross-family fat lists use release-W1 per-source gencode: portable TUs receive
 # every requested target while feature TUs receive their exact feature-table
 # intersection. The ten-SM archive gate below proves both the commands and the
 # linked cubins. See .agents/specs/release-binary-matrix.md W1.
-set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121)")
+set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121; '70'=Volta/V100 (NVFP4 GEMM + FA2 fast paths) and requires nvcc < 13)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"
   OFF)
@@ -488,6 +493,11 @@ if(VLLM_CPP_CUDA)
   # cutlass-nvfp4 / cutlass-fp8 / Marlin / FA2 for the archs that DO support them.
   # Mirrors vLLM's cuda_archs_loose_intersection idiom; see the module header.
   include(cmake/CudaArchFeatures.cmake)
+  # W0: Volta (sm_70) needs nvcc < 13; reject the combination before any
+  # compile so the failure names the toolkit floor instead of nvcc's cryptic
+  # "Unsupported gpu architecture".
+  vt_cuda_check_arch_toolchain("${VLLM_CPP_CUDA_ARCHITECTURES}"
+    "${CMAKE_CUDA_COMPILER_VERSION}")
   message(STATUS "CUDA target architectures: ${VLLM_CPP_CUDA_ARCHITECTURES}")
   vt_cuda_feature_archs(VT_FP4_MMA_ARCHS       "fp4-mma")
   vt_cuda_feature_archs(VT_CUTLASS_NVFP4_ARCHS "cutlass-nvfp4")
@@ -497,6 +507,8 @@ if(VLLM_CPP_CUDA)
   vt_cuda_feature_archs(VT_SCALEDMM_C3X_SM100_ARCHS "scaledmm-c3x-sm100")
   vt_cuda_feature_archs(VT_MARLIN_NVFP4_ARCHS  "marlin-nvfp4")
   vt_cuda_feature_archs(VT_FA2_ARCHS           "fa2")
+  vt_cuda_feature_archs(VT_SM70_NVFP4_GEMM_ARCHS "sm70-nvfp4-gemm")
+  vt_cuda_feature_archs(VT_SM70_FA2_V100_ARCHS  "sm70-fa2-v1")
   vt_cuda_report_feature("fp4-mma"       "${VT_FP4_MMA_ARCHS}")
   vt_cuda_report_feature("cutlass-nvfp4" "${VT_CUTLASS_NVFP4_ARCHS}")
   vt_cuda_report_feature("cutlass-nvfp4-sm100" "${VT_CUTLASS_NVFP4_SM100_ARCHS}")
@@ -505,6 +517,8 @@ if(VLLM_CPP_CUDA)
   vt_cuda_report_feature("scaledmm-c3x-sm100" "${VT_SCALEDMM_C3X_SM100_ARCHS}")
   vt_cuda_report_feature("marlin-nvfp4"  "${VT_MARLIN_NVFP4_ARCHS}")
   vt_cuda_report_feature("fa2"           "${VT_FA2_ARCHS}")
+  vt_cuda_report_feature("sm70-nvfp4-gemm" "${VT_SM70_NVFP4_GEMM_ARCHS}")
+  vt_cuda_report_feature("sm70-fa2-v1"     "${VT_SM70_FA2_V100_ARCHS}")
   # The native block-scaled fp4xfp4 MMA (cuda_matmul_nvfp4.cu) needs the
   # architecture-specific sm_12xa target. Advertise it to the code so the host
   # launcher enables the native path only when it was actually compiled in.
@@ -2287,6 +2301,29 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
     list(APPEND _VT_CUDA_FEATURE_SOURCES
       src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu)
+  endif()
+  if(VT_SM70_NVFP4_GEMM_ARCHS)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_sm70_nvfp4_gemm.cu)
+    vt_cuda_set_source_gencode("${VT_SM70_NVFP4_GEMM_ARCHS}"
+      src/vt/cuda/cuda_sm70_nvfp4_gemm.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES
+      src/vt/cuda/cuda_sm70_nvfp4_gemm.cu)
+  endif()
+  if(VT_SM70_FA2_V100_ARCHS)
+    # The adoption branch in cuda_paged_attn.cu calls vt_sm70_fa2_decode, which
+    # only exists when this feature's TUs are compiled. Signal the library so
+    # LaunchDecode is byte-identical to the reference on every OTHER arch.
+    target_compile_definitions(vllm PRIVATE VLLM_CPP_HAS_SM70_FA2=1)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_flash_attn_v100.cu)
+    set_source_files_properties(src/vt/cuda/cuda_flash_attn_v100.cu PROPERTIES
+      COMPILE_OPTIONS "-isystem;${CMAKE_SOURCE_DIR}/third_party")
+    vt_cuda_set_source_gencode("${VT_SM70_FA2_V100_ARCHS}"
+      src/vt/cuda/cuda_flash_attn_v100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_flash_attn_v100.cu)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_sm70_flash_attn.cu)
+    vt_cuda_set_source_gencode("${VT_SM70_FA2_V100_ARCHS}"
+      src/vt/cuda/cuda_sm70_flash_attn.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_sm70_flash_attn.cu)
   endif()
   if(_MARLIN_SRCS)
     vt_cuda_set_source_gencode("${VT_MARLIN_NVFP4_ARCHS}" ${_MARLIN_SRCS})

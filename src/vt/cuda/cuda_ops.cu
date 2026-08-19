@@ -2343,19 +2343,15 @@ __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* ke
 // and it is why this path is gated at a bf16 tolerance rather than the f32 path's
 // 2e-5. f32 inputs therefore stay on DFlashAttnChunkKernel, whose f32 tolerance
 // this could not hold.
-__device__ __forceinline__ void MmaBf16M16N8K16(float* c, const unsigned* a, const unsigned* b) {
 #if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void MmaBf16M16N8K16(float* c, const unsigned* a, const unsigned* b) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-#else
-  (void)c;
-  (void)a;
-  (void)b;
-#endif
 }
+#endif
 
 constexpr int kMmaWarps = 4;   // warps per block (4 * 16 = 64 query rows per block)
 constexpr int kMmaQ = 16;      // query rows per warp = the MMA's M

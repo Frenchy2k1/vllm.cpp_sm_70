@@ -1003,6 +1003,7 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(names, [
             "fp4-mma", "cutlass-nvfp4", "cutlass-nvfp4-sm100", "cutlass-fp8",
             "scaledmm-c3x-sm90", "scaledmm-c3x-sm100", "marlin-nvfp4", "fa2",
+            "sm70-nvfp4-gemm", "sm70-fa2-v1",
         ])
         mutant = copy.deepcopy(manifest)
         mutant["backend"]["resolved_features"][0]["compiled_sms"] = ["121a"]

@@ -93,6 +93,7 @@ JOBS_31448896841 = [
     job("build-test-vulkan", "success"),
     job("cuda-arch-features", "success"),
     job("cuda-fat-build", "success"),
+    job("cuda-sm70-build", "success"),
     job("device-leakage", "success"),
     job("vulkan-spirv-freshness", "success"),
     job("pr-size", "skipped"),
@@ -109,6 +110,7 @@ ALL_GREEN_JOBS = [
         "build-test-vulkan",
         "cuda-arch-features",
         "cuda-fat-build",
+        "cuda-sm70-build",
         "device-leakage",
         "vulkan-spirv-freshness",
         "windows-msvc-cpu",
@@ -214,11 +216,12 @@ class VerdictTests(unittest.TestCase):
             baseline.expected_jobs_from_workflow(),
         )
         # 9 until 2026-08-17, then 11: `windows-msvc-cpu` and
-        # `windows-msvc-vulkan` joined the lane (#503). The literal is here so
-        # that DROPPING a job cannot be spelled as an edit to one list -- the
+        # `windows-msvc-vulkan` joined the lane (#503), then 12 with the
+        # Volta `cuda-sm70-build` lane. The literal is here so that DROPPING a
+        # job cannot be spelled as an edit to one list -- the
         # equality above is satisfied by narrowing both sides together, and this
         # is not.
-        self.assertEqual(len(baseline.EXPECTED_JOBS), 11)
+        self.assertEqual(len(baseline.EXPECTED_JOBS), 12)
 
     def test_an_unfinished_job_is_pending_not_failed(self) -> None:
         """Fail-closed is right; calling it a FAILURE is a wrong label."""

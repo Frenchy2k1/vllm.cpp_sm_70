@@ -57,7 +57,10 @@ def valid_commands() -> list[dict[str, str]]:
 
 class FatGencodeContract(unittest.TestCase):
     def run_checker(
-        self, entries: list[dict[str, str]], archive_sms: tuple[str, ...] = ALL
+        self,
+        entries: list[dict[str, str]],
+        archive_sms: tuple[str, ...] = ALL,
+        extra_args: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -76,6 +79,7 @@ class FatGencodeContract(unittest.TestCase):
                     str(commands),
                     "--cuobjdump-list",
                     str(listing),
+                    *extra_args,
                 ],
                 text=True,
                 capture_output=True,
@@ -116,6 +120,71 @@ class FatGencodeContract(unittest.TestCase):
 
     def test_archive_rejects_undeclared_sm(self) -> None:
         result = self.run_checker(valid_commands(), ALL + ("999",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("undeclared", result.stdout + result.stderr)
+
+
+class Sm70LaneAudit(unittest.TestCase):
+    """The Volta (`--archs 70`) lane demands its portable TUs plus the sm70
+    feature TUs (the W4A16 NVFP4 GEMM and the FA2 fragment-core + paged
+    decode) that legitimately compile for sm_70, and refuses a fast-path TU
+    that is not sm70-capable (fp8/sm12x) sneaking into a 70 compile."""
+
+    portable = (
+        "src/vt/cuda/cuda_matmul_nvfp4.cu",
+        "src/vt/cuda/cuda_paged_attn.cu",
+        "src/vt/cuda/cuda_sm70_nvfp4_gemm.cu",
+        "src/vt/cuda/cuda_flash_attn_v100.cu",
+        "src/vt/cuda/cuda_sm70_flash_attn.cu",
+    )
+
+    def run_70(self, entries, archive_sms=("70",)) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "compile_commands.json"
+            commands.write_text(json.dumps(entries), encoding="utf-8")
+            listing = root / "cuobjdump.txt"
+            listing.write_text(
+                "\n".join(f"Fatbin elf code: sm_{sm}" for sm in archive_sms),
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(CHECKER),
+                    "--archs", "70",
+                    "--compile-commands",
+                    str(commands),
+                    "--cuobjdump-list",
+                    str(listing),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+    def test_portable_only_70_build_passes(self) -> None:
+        entries = [command(source, ("70",)) for source in self.portable]
+        result = self.run_70(entries)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_portable_sm_fails(self) -> None:
+        entries = [command("src/vt/cuda/cuda_matmul_nvfp4.cu", ("70", "80"))]
+        result = self.run_70(entries)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cuda_matmul_nvfp4.cu", result.stdout + result.stderr)
+
+    def test_non_sm70_capable_feature_tu_in_70_build_fails(self) -> None:
+        # sm70 has no fp8/bf16-mma path, so an fp8 feature TU cannot compile
+        # for 70 — it must be refused if it sneaks into a 70 compile.
+        entries = [command("src/vt/cuda/cuda_nvfp4_sm12x.cu", ("70",))]
+        result = self.run_70(entries)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cuda_nvfp4_sm12x.cu", result.stdout + result.stderr)
+
+    def test_70_archive_rejects_extra_sm(self) -> None:
+        entries = [command("src/vt/cuda/cuda_paged_attn.cu", ("70",))]
+        result = self.run_70(entries, ("70", "80"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("undeclared", result.stdout + result.stderr)
 

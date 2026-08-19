@@ -331,6 +331,11 @@ cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON   # NVIDIA GB10
 cmake --build build-cuda -j
 ```
 
+```sh
+cmake -S . -B build-v100 -DVLLM_CPP_CUDA_ARCHITECTURES=70   # Tesla V100 (sm_70), nvcc < 13
+cmake --build build-v100 -j   # NVFP4 W4A16 GEMM + FA2 decode fast paths
+```
+
 Triton-AOT cubins for the fast GDN path are vendored, so Python and Triton are needed only to
 regenerate them, never to build or run them; a CUDA build ships them. Metal is auto-detected on
 Apple hosts; Vulkan is opt-in with `-DVLLM_CPP_VULKAN=ON`. Every CMake option, per-backend recipe,
