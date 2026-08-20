@@ -173,7 +173,6 @@ constexpr int kVtXq256WideBlockM = 8;          // query rows staged per block
 constexpr int kVtXq256WideThreadsPerRow = kVtXqWarpSize;
 constexpr int kVtXqPageIdsCapacity = kVtXqBlockN / 16;
 constexpr int kVtXqD = 256;
-constexpr int kVtXqQKPanelDim = 64;            // d-panels: 256/64 = 4
 constexpr int kVtXqPVPanelDim = 128;           // d-panels: 256/128 = 2
 constexpr int kVtXqPaddedQStride = 264;        // padded to dodge smem banking
 constexpr int kVtXqPaddedKVStride = 136;
@@ -637,7 +636,6 @@ const float row_sum = __shfl_sync(mask, thread_sum, 0, kVtXqWarpSize);
           __syncthreads();
           if (tid < GROUP_SIZE * kVtXq256WideThreadsPerRow) {
             const int row = tid / kVtXq256WideThreadsPerRow;
-            const int thread_in_row = tid % kVtXq256WideThreadsPerRow;
             const float* sS_row_f = sS + row * kVtXqBlockN + kv_tile;
 #pragma unroll
             for (int token = 0; token < kVtXqBlockN; ++token) {
@@ -1650,7 +1648,7 @@ extern "C" void vt_sm70_fa2_prefill(
       }
     };
     static BmWorkspace bws;
-    const int32_t mtot = []() {
+    const int32_t mtot = [num_reqs, q_start]() {
       int32_t m = 0;
       cudaMemcpy(&m, q_start + num_reqs, sizeof(int32_t), cudaMemcpyDeviceToHost);
       return m;
@@ -1720,7 +1718,7 @@ extern "C" void vt_sm70_fa2_prefill(
 // call degrades to the sequential kernel for the whole batch — capture-safe.
 namespace {
 struct DecodeXqWorkspace {
-  float* tmp_out = nullptr;    // [B, hq, Pmax, 256]
+  float* tmp = nullptr;         // [B, hq, Pmax, 256]
   float* max_logits = nullptr;  // [B, hq, Pmax]
   float* exp_sums = nullptr;    // [B, hq, Pmax]
   size_t bytes = 0;
