@@ -8986,6 +8986,37 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
   }
 }
 
+// QWEN38-PER-CHANNEL-GDN W8A16 keep-quant eager stage: the quantized load
+// never satisfies IsPlainBf16Qwen3_5Dense, so PrepareBf16Resident does not run
+// for it; stage the raw fp8 packed bytes + per-column f32 scale of every keep
+// owner here instead, so the FIRST forward doesn't upload each tower in one
+// step and blow the card. No-op when every keep owner is Empty (devices
+// without the W8A16 op / CPU / other dtypes).
+void Qwen3_5DenseModel::PrepareFp8wResident(
+    const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const auto fp8w = [&d](const Fp8PerChannelWeight& w) {
+    if (!w.Empty()) {
+      (void)ResidentWeight(d, w.packed);
+      (void)ResidentWeight(d, w.scale);
+    }
+  };
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    if (layer.is_linear_attention) {
+      fp8w(layer.gdn.in_proj_qkvz_fp8w);
+      fp8w(layer.gdn.out_proj_fp8w);
+    } else {
+      fp8w(layer.attn.q_proj_fp8w);
+      fp8w(layer.attn.k_proj_fp8w);
+      fp8w(layer.attn.v_proj_fp8w);
+      fp8w(layer.attn.o_proj_fp8w);
+    }
+    fp8w(layer.mlp.gate_proj_fp8w);
+    fp8w(layer.mlp.up_proj_fp8w);
+    fp8w(layer.mlp.down_proj_fp8w);
+  }
+}
+
 std::vector<float> Qwen3_5Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,

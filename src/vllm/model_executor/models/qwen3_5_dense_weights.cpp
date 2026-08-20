@@ -143,6 +143,18 @@ void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
   (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
 }
 
+// QWEN38-PER-CHANNEL-GDN keep-quant W8A16 eager stage: upload the raw fp8
+// packed bytes + per-column f32 scale of every keep owner to the device at
+// load, then free their host pages. The quantized load never satisfies
+// IsPlainBf16Qwen3_5Dense, so the bf16 path above never runs for it; this runs
+// instead so the FIRST forward doesn't upload each tower in one step and blow
+// the card. No-op (all Empty) on devices without the W8A16 op and on CPU.
+void StageAndReleaseKeepFp8w(Qwen3_5DenseWeights& weights, vt::Queue& queue) {
+  Qwen3_5DenseModel::PrepareFp8wResident(weights, queue);
+  vt::GetBackend(queue.device.type).Synchronize(queue);
+  (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
+}
+
 // VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
 // divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
 // GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift.
@@ -966,6 +978,14 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
       if (direct_device) StageAndReleaseLoadedDense(w, *load_queue);
     }
   }
+  // QWEN38-PER-CHANNEL-GDN keep-quant W8A16: the quantized load never satisfies
+  // IsPlainBf16Qwen3_5Dense (so StageAndReleaseLoadedDense above is never
+  // entered), yet the keep owners must be staged to device up front or the
+  // FIRST forward uploads every tower in one step and blows the card. Stage
+  // the raw keep bytes + per-column scales eagerly when the W8A16 op is
+  // present, and free their host pages on the same path.
+  const bool load_is_direct = DirectDeviceLoadEligible(load_queue);
+  if (keep_fp8w && load_is_direct) StageAndReleaseKeepFp8w(w, *load_queue);
   return w;
 }
 

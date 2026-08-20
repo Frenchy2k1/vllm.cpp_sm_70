@@ -297,6 +297,15 @@ class Qwen3_5DenseModel {
   static void PrepareBf16Resident(const Qwen3_5DenseWeights& weights,
                                   vt::Queue& queue);
 
+  // QWEN38-PER-CHANNEL-GDN W8A16 keep-quant: eagerly upload the raw fp8 packed
+  // bytes + per-column f32 scale of every keep owner to the device at load.
+  // The quantized load never satisfies IsPlainBf16Qwen3_5Dense, so
+  // PrepareBf16Resident does not run for it; without this, the FIRST forward
+  // uploads every tower in one step and the card overflows. No-op when every
+  // keep owner is Empty (devices without the W8A16 op / CPU / other dtypes).
+  static void PrepareFp8wResident(const Qwen3_5DenseWeights& weights,
+                                  vt::Queue& queue);
+
   // PERF-27B-LMHEAD-FP4 (issue #213). Build the resident form of the packed
   // `lm_head_fp4` THIS backend's logits GEMM consumes: the Marlin W4A16 repack
   // on CUDA (PRE-CAPTURE), else the dequantized bf16 [K,N] operand. Inert when
