@@ -286,7 +286,17 @@ struct ModelForwardInput {
   // graph-captured and ours was not. DEFAULT 0 => the predicate reduces exactly
   // to today's pure-decode shape, so every non-spec caller is byte-identical.
   int64_t num_speculative_tokens = 0;
-  // ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, moved off
+  // BACKEND-DISTRIBUTED-TP TP-W2 (the runner-attach seam): the multi-GPU
+  // tensor-parallel group for THIS forward. The runner acquires the NCCL group
+  // ONCE (tp_size = visible CUDA devices), wraps its per-rank communicator into
+  // a `vllm::TensorParallel`, and points THIS at it when tp_size>1. nullptr (the
+  // default) on every tp<=1 / non-NCCL / non-TP run, so every existing
+  // aggregate-initializer caller is UNCHANGED and every forward is
+  // byte-identical (tensor_parallel.h: null ⇒ tp_size()==1 ⇒ every collective a
+  // no-op). The tp-aware registered forwards hand it down to the per-layer
+  // routes that already take `const vllm::TensorParallel*`.
+  const TensorParallel* tp = nullptr;
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): the GRAPH-ELIGIBILITY PREDICATE, moved off
   // `pure_decode` and onto the step's ACTUAL uniform query length.
   //
   // The runner computes it once per step through

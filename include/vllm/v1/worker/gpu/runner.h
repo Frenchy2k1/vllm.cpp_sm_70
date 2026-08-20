@@ -67,6 +67,10 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+// BACKEND-DISTRIBUTED-TP TP-W2 (runner attach): the vllm::TensorParallel member
+// layout — a plain {vt::Communicator*} handle, so pulling the type here costs
+// only the light vt/communicator.h include tree.
+#include "vllm/model_executor/models/tensor_parallel.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d hidden tap + draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft + aux taps
@@ -530,6 +534,23 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model_;
   std::vector<PagedKvCache> draft_attn_kv_;
   vt::Queue queue_;
+  // ── BACKEND-DISTRIBUTED-TP TP-W2 (runner-attach, the missing engine seam) ────
+  // The multi-GPU NCCL group this runner retains for its LIFETIME. Acquired ONCE
+  // in the ctors (attach_tp_group, before any forward) when tp_size>1; released
+  // in the dtor via vt_cuda_tp_release. `tp_` wraps THIS rank's communicator
+  // (vt::CudaCommGroup::Rank(queue device index)) into the vllm::TensorParallel
+  // the registered forwards read through `ModelForwardInput::tp`.
+  //
+  // NULL/INERT ON THE TP1 PATH: vt_cuda_tp_acquire returns nullptr for
+  // tp_size<=1 (and on non-NCCL / NCCL-init-failure builds), so both stay at
+  // their defaults and every existing single-GPU step is BYTE-IDENTICAL — the
+  // field default (null), the `forward_input.tp` expression (null), and the
+  // model's own tensor_parallel() (never set) all agree.
+  void* tp_group_ = nullptr;  // opaque owner (vt::CudaCommGroup*); null => tp1
+  vllm::TensorParallel tp_;   // this rank's comm; null comm => tp_size()==1
+  // Acquire the group + wrap this rank's communicator; no-op on tp<=1 /
+  // non-NCCL builds. Safe to call once per runner (delegating ctors).
+  void attach_tp_group();
   InputBatch input_batch_;
   Sampler sampler_;
   // ARCH-ONE-SURFACE ROW 6 (mirror of gpu/model_runner.py:368-369

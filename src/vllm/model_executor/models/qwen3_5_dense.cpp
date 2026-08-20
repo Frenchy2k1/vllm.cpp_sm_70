@@ -141,6 +141,15 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
   const detail::DeviceTokenIdsScope device_ids_scope(
       input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
 
+  // BACKEND-DISTRIBUTED-TP TP-W2 (runner attach): `input.tp` is the per-rank
+  // tensor-parallel group the runner attached (non-null ONLY when tp_size>1).
+  // Every route below ends in a tp-aware dense entry point (qwen3_5.cpp), so
+  // hand it through: tp<=1 (null) keeps each step byte-identical, and a tp>1
+  // group reaches the entry points' honest "not yet landed" refusal (never a
+  // silent tp1 run). The decode-graph branch must NOT serve tp>1 either — it
+  // would capture tp1 math — so it is additionally gated on tp==null.
+  const vllm::TensorParallel* tp = input.tp;
+
   // SPEC-MTP I5d-pre hidden-state tap. When the spec verify forward requests the
   // drafter's [T,H] post-final-norm hidden (I5d), route to the EXISTING
   // ForwardDeviceTap: byte-identical logits to ForwardDevice, plus the hidden
@@ -150,7 +159,7 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
     return Qwen3_5DenseModel::ForwardDeviceTap(
         input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
         input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-        input.hidden_tap, input.logits_indices);
+        input.hidden_tap, input.logits_indices, tp);
   }
 
   // SPEC-DFLASH D1 (DF-AUX-TAPS): non-null routes to ForwardDeviceMultiTap
@@ -213,6 +222,8 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
         static_cast<int64_t>(input.logits_indices.size()) ==
             input.attn_meta.num_actual_tokens));
   if (DenseDecodeGraphEnabled() && uniform_decode && graph_cuda &&
+      tp == nullptr &&  // tp>1: a capture would run tp1 math — take the honest
+                        // per-rank refusal below instead (never a silent tp1)
       input.num_reqs <= kMaxDecodeGraphBatch) {
     if (!qwen.decode_graph()) {
       qwen.decode_graph() = std::make_unique<Qwen3_5DenseDecodeGraph>(
@@ -232,19 +243,19 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
     return Qwen3_5DenseModel::ForwardDeviceMultiTap(
         input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
         input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-        input.aux_tap, input.logits_indices);
+        input.aux_tap, input.logits_indices, tp);
   }
   if (input.gather_logits) {
     return Qwen3_5DenseModel::ForwardDevice(
         input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
         input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-        input.logits_indices);
+        input.logits_indices, tp);
   }
   return HostLogits(
       Qwen3_5DenseModel::Forward(
           input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
           input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-          input.logits_indices),
+          input.logits_indices, tp),
       input.config.vocab_size);
 }
 

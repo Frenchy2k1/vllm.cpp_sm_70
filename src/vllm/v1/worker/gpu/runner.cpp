@@ -44,6 +44,23 @@
 #ifdef VLLM_CPP_CUDA
 #include "vt/cuda/combine_tokens.h"  // W3 device combine/scatter (removes the sync)
 #endif
+// BACKEND-DISTRIBUTED-TP TP-W2 (runner attach): the NCCL group bridge — the
+// device-count helper and the per-rank communicator accessor. Only reachable
+// under VT_NCCL (which implies a CUDA+NCCL build); everything else keeps the
+// whole attach path compiled out so a CPU-only / non-NCCL build is identical.
+#if defined(VT_NCCL)
+#include "vt/cuda/cuda_comm_group.h"  // vt::CudaCommGroup::Rank (per-rank Communicator)
+#include "vt/cuda/cuda_dropin.h"      // vt::cuda::DeviceCount
+#endif
+
+// BACKEND-DISTRIBUTED-TP engine bridge, defined in src/vt/cuda/
+// nccl_communicator.cu under VT_NCCL (extern "C"). vt_cuda_tp_acquire returns
+// the opaque retained vt::CudaCommGroup* (nullptr for tp_size<=1 or NCCL init
+// failure — keeping the tp1 path byte-identical), vt_cuda_tp_release frees it.
+#if defined(VT_NCCL)
+extern "C" void* vt_cuda_tp_acquire(int tp_size);
+extern "C" void vt_cuda_tp_release(void* handle);
+#endif
 
 namespace vllm::v1 {
 
@@ -377,6 +394,38 @@ std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
 }
 }  // namespace
 
+// ── BACKEND-DISTRIBUTED-TP TP-W2 (runner attach) ──────────────────────────────
+// Acquire the multi-GPU NCCL group ONCE for this runner's lifetime and wrap THIS
+// rank's communicator into the vllm::TensorParallel the registered forwards read
+// through `ModelForwardInput::tp`. The group's rank-set is all visible CUDA
+// devices (ncclCommInitAll), so this rank = queue_.device.index. Every failure
+// arm (tp_size<=1, no NCCL, NCCL init failure, out-of-range device) leaves
+// tp_group_/tp_ null → the tp1 byte-identical path. The model's TP-W1 carrier
+// (LoadedModel::tensor_parallel) is set only when a group was attached — tp1
+// never touches it.
+void GPUModelRunner::attach_tp_group() {
+#if defined(VT_NCCL)
+  if (tp_group_ != nullptr) return;  // already attached (delegating ctor)
+  const int ngpu = vt::cuda::DeviceCount();
+  void* group = vt_cuda_tp_acquire(ngpu);
+  if (group == nullptr) return;  // tp<=1 / NCCL init failed: keep the tp1 path
+  vt::Communicator* comm =
+      static_cast<vt::CudaCommGroup*>(group)->Rank(queue_.device.index);
+  if (comm == nullptr) {  // device index outside the group: degrade to tp1
+    vt_cuda_tp_release(group);
+    return;
+  }
+  tp_group_ = group;
+  tp_.comm = comm;
+  // LoadedModel's borrowed TP carrier (model_registry.h): the runner is the
+  // named owner; set only on the tp>1 path so tp1 leaves the model untouched.
+  model_->set_tensor_parallel(&tp_);
+#else
+  // Non-NCCL build: no group can be attached; everything above is compiled out
+  // and tp stays the byte-identical null.
+#endif
+}
+
 GPUModelRunner::GPUModelRunner(
     const HfConfig& config, LoadedModel& model,
     const KVCacheConfig& kv_cache_config, vt::Queue queue, int max_num_reqs,
@@ -414,6 +463,9 @@ GPUModelRunner::GPUModelRunner(
     pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
   }
   initialize_kv_cache(kv_cache_config);
+  // BACKEND-DISTRIBUTED-TP TP-W2: attach the multi-GPU group once (tp>1 only).
+  // Runs before the first forward; the dtor releases it.
+  attach_tp_group();
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
 
@@ -455,6 +507,10 @@ GPUModelRunner::GPUModelRunner(
     pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
   }
   initialize_kv_cache(kv_cache_config);
+  // BACKEND-DISTRIBUTED-TP TP-W2: attach the multi-GPU group once (tp>1 only).
+  // The two weight-overload ctors delegate here, so every construction path
+  // reaches exactly one attach.
+  attach_tp_group();
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
 
@@ -1556,6 +1612,13 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // (cudagraph_dispatcher.py:37). 0 when speculation is off, which makes
       // the predicate reduce to today's pure-decode shape.
       .num_speculative_tokens = num_spec(),
+      // BACKEND-DISTRIBUTED-TP TP-W2 (runner attach): the per-rank
+      // tensor-parallel group this runner attached once in the ctor. Non-null
+      // ONLY when a >1-GPU NCCL group is live; on every tp<=1 / non-NCCL build
+      // it is null and the registered forward takes the unchanged
+      // byte-identical path (tensor_parallel.h: null ⇒ tp_size()==1 ⇒ no
+      // collectives).
+      .tp = tp_group_ != nullptr ? &tp_ : nullptr,
       // W6 (#1374): the eligibility answer itself. 0 == no captured decode graph
       // in this tree serves this step.
       .uniform_query_len = uniform_qlen.value_or(0),
@@ -2793,6 +2856,19 @@ GPUModelRunner::~GPUModelRunner() {
   if (async_copy_queue_.id != 0) {
     vt::DestroyQueue(async_copy_queue_);
   }
+  // BACKEND-DISTRIBUTED-TP TP-W2: release the retained NCCL group acquired in
+  // attach_tp_group (null on the tp1 path; compiled out without NCCL). The
+  // model holds only a BORROWED pointer, invalidated right after this.
+#if defined(VT_NCCL)
+  if (tp_group_ != nullptr) {
+    vt_cuda_tp_release(tp_group_);
+    tp_group_ = nullptr;
+    // Invalidate the model's borrowed carrier too — no forward runs past this
+    // point, so the null is belt-and-braces, but it keeps the invariant
+    // "non-null tensor_parallel() implies a live runner-owned group".
+    model_->set_tensor_parallel(nullptr);
+  }
+#endif
   // W4 device mirror. Freed here rather than leaked like the scratch pool: these
   // are per-runner, and a serving process can construct more than one runner.
   if (async_device_inputs_ != nullptr) {
