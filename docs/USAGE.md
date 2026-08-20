@@ -804,6 +804,13 @@ architectures a build actually targets is a separate question, answered under
 "Confirming which CUDA architecture a build targets" above. Tracked as
 [#1332](https://github.com/mudler/vllm.cpp/issues/1332).
 
+**Volta (sm_70) is now a real FLASH_ATTN-capable device.** A build that carries
+the sm70 FA2 fast path (`sm70-fa2-v1`, see `CudaArchFeaturesTest.cmake`) admits
+compute capability 7.0 and serves FLASH_ATTN; a build without it refuses Volta
+exactly as the reference does. So on a V100 the "accepted on a floor" asymmetry
+above is resolved by what was compiled, not by a fixed minimum: the flag is the
+same `VLLM_CPP_HAS_SM70_FA2` the decode/prefill kernels gate on.
+
 Selecting a backend by name is not exposed yet; the engine always resolves one.
 
 ### Architectures that resolve but refuse to run

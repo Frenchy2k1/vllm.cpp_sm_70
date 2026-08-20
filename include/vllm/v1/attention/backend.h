@@ -398,8 +398,17 @@ class FlashAttentionBackend final : public AttentionBackend {
   // flash_attn.py:200-202. SEE THE WARNING ON THE BASE CLASS: this is the exact
   // predicate that returned true on a GB10 whose FA2 fatbin had no sm_121 code
   // (issue #1332). It is upstream's, and it is not a runnability check.
+  //
+  // sm_70 (Volta) is admitted ONLY when this build carries the sm70 FA2 fast
+  // path (VLLM_CPP_HAS_SM70_FA2, i.e. the `sm70-fa2-v1` feature cell resolved
+  // the arch) — the flag the decode/prefill kernels themselves gate on. Without
+  // it the server must refuse Volta exactly as upstream does (major>=8 only),
+  // because there would be no Volta FLASH_ATTN kernel body to run.
   bool supports_compute_capability(
       const platforms::DeviceCapability& capability) const override {
+#ifdef VLLM_CPP_HAS_SM70_FA2
+    if (capability.major == 7 && capability.minor >= 0) return true;  // sm70 FA2 (sm70-fa2-v1)
+#endif
     return capability.major > 8 || (capability.major == 8 && capability.minor >= 0);
   }
   bool supports_sliding_window() const override { return true; }   // :98-100
