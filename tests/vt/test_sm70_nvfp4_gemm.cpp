@@ -38,11 +38,24 @@ TEST_CASE("sm70 nvfp4-w4a16 tactic is registered and selectable for sm70") {
 // SIMT decode, fused greedy-argmax vs CPU max, and the k%128 decline path.
 extern "C" int vt_sm70_nvfp4_selfcheck(void);
 
+extern "C" int vt_sm70_nvfp4_microbench(void);
+
 TEST_CASE("sm70 nvfp4-w4a16 device self-check (SIMT + fused-argmax + decline)") {
   const int rc = vt_sm70_nvfp4_selfcheck();
   if (rc == 2) {
     MESSAGE("not an sm_70 CUDA device: device self-check skipped");
     return;
   }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("sm70 nvfp4-w4a16 kernel throughput microbench (effective GB/s, informational)") {
+  const int rc = vt_sm70_nvfp4_microbench();
+  if (rc == 2) {
+    MESSAGE("not an sm_70 CUDA device: microbench skipped");
+    return;
+  }
+  // The microbench prints GB/s; it has no pass/fail claim of its own (a
+  // benchmark is a number, not an assertion). A nonzero return is a run error.
   CHECK(rc == 0);
 }

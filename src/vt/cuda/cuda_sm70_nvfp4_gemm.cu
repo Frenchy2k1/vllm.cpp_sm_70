@@ -1215,4 +1215,84 @@ extern "C" int vt_sm70_nvfp4_selfcheck(void) {
   return 0;
 }
 
+// Kernel-level throughput microbenchmark: times LaunchSm70Nvfp4W4a16 on the
+// per-rank decode shapes used by a real 27B TP-2 serve (the 1Cat
+// benchmark_sm70_nvfp4_gemm_micro case table), at the M decode bands. Effective
+// bandwidth = weight bytes the kernel must read per decode step (packed 4-bit
+// codes + scales) / elapsed. This is the "GB/s on our kernels" harness the
+// reference microbenches cannot produce (those import vllm._sm70_ops / Marlin,
+// not vllm.cpp). Returns 0, or 2 when not an sm_70 device (skip).
+extern "C" int vt_sm70_nvfp4_microbench(void) {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
+
+  static const struct { const char* name; int k; int n; } shapes[] = {
+      {"linear_attn_in_proj_qkvz", 8192, 5120},
+      {"out_proj_all",             5120, 3072},
+      {"full_attn_qkv_proj",       7168, 5120},
+      {"mlp_gate_up_proj",         17408, 5120},
+      {"mlp_down_proj",            5120, 8704},
+  };
+  static const int m_bands[] = {1, 2, 4, 8};
+
+  uint64_t s = 0xabcd;
+  auto rnd = [&]() -> uint32_t { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; };
+  auto f2h = [](float f) -> __half { return __float2half_rn(f); };
+  const int max_m = 8, max_k = 17408;
+
+  cudaStream_t st = 0;
+  Sm70Nvfp4W4a16Args args{};
+  args.stream = st; args.gscale = 1.0f; args.argmax_val = nullptr; args.argmax_idx = nullptr;
+
+  // One x buffer reused (rows=max_m), fresh per (shape,m) so host traffic is
+  // outside the timed region. Weight codes/scales allocated once per shape.
+  std::vector<__half> x((size_t)max_m * max_k);
+  for (auto& v : x) v = f2h(0.01f * (float)(rnd() % 2000) - 10.f);
+
+  cudaEvent_t t0, t1;
+  cudaEventCreate(&t0); cudaEventCreate(&t1);
+  fprintf(stderr, "  [sm70-nvfp4-microbench]  effective weight-read GB/s at M bands\n");
+
+  for (const auto& sh : shapes) {
+    std::vector<uint8_t> codes((size_t)sh.n * (sh.k >> 1)), scales((size_t)sh.n * (sh.k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd();
+    for (auto& v : scales) v = (uint8_t)rnd();
+    const double bytes = (double)codes.size() + (double)scales.size();  // per decode step
+
+    void *dc = nullptr, *dsc = nullptr;
+    cudaMalloc(&dc, codes.size()); cudaMalloc(&dsc, scales.size());
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dsc, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+
+    char label[48];
+    snprintf(label, sizeof(label), "%-24s k=%d n=%d", sh.name, sh.k, sh.n);
+    for (int mi = 0; mi < (int)(sizeof(m_bands) / sizeof(m_bands[0])); ++mi) {
+      const int m = m_bands[mi];
+      void* dx = nullptr; void* dy = nullptr;
+      cudaMalloc(&dx, (size_t)m * sh.k * sizeof(__half));
+      cudaMalloc(&dy, (size_t)m * sh.n * sizeof(__half));
+      cudaMemcpy(dx, x.data(), (size_t)m * sh.k * sizeof(__half), cudaMemcpyHostToDevice);
+      args.m = m; args.n = sh.n; args.k = sh.k; args.out = dy; args.x = dx;
+      args.codes = dc; args.scales = dsc;
+
+      // warmup
+      for (int w = 0; w < 30; ++w) LaunchSm70Nvfp4W4a16(caps, &args);
+      cudaDeviceSynchronize();
+      constexpr int kRep = 400;
+      cudaEventRecord(t0, st);
+      for (int r = 0; r < kRep; ++r) LaunchSm70Nvfp4W4a16(caps, &args);
+      cudaEventRecord(t1, st);
+      cudaDeviceSynchronize();
+      float ms = 0.f; cudaEventElapsedTime(&ms, t0, t1);
+      const double gbs = (bytes * kRep) / (ms * 1e-3) / 1e9;
+      fprintf(stderr, "    M=%-2d %-36s %8.1f GB/s (%.2f ms/call)\n",
+              m, label, gbs, ms / kRep);
+      cudaFree(dx); cudaFree(dy);
+    }
+    cudaFree(dc); cudaFree(dsc);
+  }
+  cudaEventDestroy(t0); cudaEventDestroy(t1);
+  return 0;
+}
+
 }  // namespace vt::cuda
