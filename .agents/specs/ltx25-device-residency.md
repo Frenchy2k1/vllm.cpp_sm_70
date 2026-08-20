@@ -636,7 +636,8 @@ its phase table lands, and W5 owes one when its wall is accepted.
 |---|---|---|
 | [#1264](https://github.com/mudler/vllm.cpp/issues/1264) | this row: the staged campaign spec | closed by this row landing |
 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | W0 | **closed, for a run that FINISHES.** The render writes a phase table on the shipped default and the ABI names it through `vllm_video_last_phase_log` (v23). Read the row below it before quoting that as "the render is instrumented" |
-| **a table on a run that does NOT finish** | [#1413](https://github.com/mudler/vllm.cpp/issues/1413), stage W0-live | **owed, and W0 does not narrow it.** `WritePhaseLog` has exactly two call sites (`ltx2_video.cpp:2259` audio-only, `:4677` video) and both sit immediately before a successful `return`, three lines after `im.trace.completed = true`. Nineteen `VT_CHECK` sites throw out of `Ltx2VideoEngine::Generate` above them and that body contains no `try` and no `catch`; `vllm_video_generate`'s own two catches set an error and return, and `engine->last_phase_log` is assigned on the success path only. **So a render that is killed, aborted by a lease governor, refused by a guard, or still running leaves no `phase-log.json` at all** — not a truncated one, not an empty one, nothing. The mutation is the demonstration: deleting the video call site removes the file entirely and the W0 gate goes red on `REQUIRE(probe.good())`. That matters here more than anywhere, because the runs this campaign has are the ones that died: [#1375](https://github.com/mudler/vllm.cpp/issues/1375) is `child exit=-15` at 0 frames, and [`ltx25-decode-speed.md`](ltx25-decode-speed.md)'s two rungs are `EXIT=137` and `EXIT=1` at 0 frames. A reader who takes "the render writes a phase table" at face value will expect a 2.5 h render that is killed at 2.4 h to leave a table naming where it was. It leaves none. #1413 closes the LIVE half — a line per phase boundary and per DiT forward, so a killed run is legible from its stderr; a signal handler that flushed a PARTIAL table on abort is a separate change with its own re-entrancy argument and is not owed by either |
+| [#1413](https://github.com/mudler/vllm.cpp/issues/1413) | W0-live | **closed by `## W0-live` below.** W0's table is written by the success path only, and nothing at all is emitted while a render runs, so an aborted render and a working one both report nothing and the ~162 s DiT forward of [#1375](https://github.com/mudler/vllm.cpp/issues/1375) has no in-process counter |
+| **a table on a run that does NOT finish** | [#1413](https://github.com/mudler/vllm.cpp/issues/1413), stage W0-live | **the LIVE half is closed by this change; a PARTIAL TABLE on abort is still owed and has no issue.** `WritePhaseLog` has exactly two call sites (`ltx2_video.cpp:2259` audio-only, `:4677` video) and both sit immediately before a successful `return`, three lines after `im.trace.completed = true`. Nineteen `VT_CHECK` sites throw out of `Ltx2VideoEngine::Generate` above them and that body contains no `try` and no `catch`; `vllm_video_generate`'s own two catches set an error and return, and `engine->last_phase_log` is assigned on the success path only. **So a render that is killed, aborted by a lease governor, refused by a guard, or still running leaves no `phase-log.json` at all** — not a truncated one, not an empty one, nothing. The mutation is the demonstration: deleting the video call site removes the file entirely and the W0 gate goes red on `REQUIRE(probe.good())`. That matters here more than anywhere, because the runs this campaign has are the ones that died: [#1375](https://github.com/mudler/vllm.cpp/issues/1375) is `child exit=-15` at 0 frames, and [`ltx25-decode-speed.md`](ltx25-decode-speed.md)'s two rungs are `EXIT=137` and `EXIT=1` at 0 frames. A reader who takes "the render writes a phase table" at face value will expect a 2.5 h render that is killed at 2.4 h to leave a table naming where it was. It leaves none. #1413 CLOSED the live half, in `## W0-live` below — a line per phase boundary and per DiT forward, so a killed run is legible from its stderr; a signal handler that flushed a PARTIAL table on abort is a separate change with its own re-entrancy argument and is not owed by either |
 | the phase table's DEVICE column | W1, and it needs [#1126](https://github.com/mudler/vllm.cpp/issues/1126) first | **owed, and a LEASE WILL NOT CLOSE IT.** The column is defined as the driver's live in-use bytes, read per phase through `vt::Backend::DeviceMemoryInfo`. It reports the `-1` no-probe sentinel in W0's artifact, and there are TWO reasons stacked, only one of which is a scheduling problem. **(1)** The render W0 could take was the CPU arm, where the sentinel is correct — `dgx:gpu0` was busy with two queued jobs and `orin:gpu0`, the one free device, holds no LTX-2.5 checkpoints. **(2)** The one that matters: **`CudaBackend` does not override `DeviceMemoryInfo` at all**, which is [#1126](https://github.com/mudler/vllm.cpp/issues/1126), and `grep -rn 'DeviceMemoryInfo' src/vt include/vt` returns exactly the base declaration at `include/vt/backend.h:94` and one override, `src/vt/rocm/rocm_backend.hip:358`. So a CUDA render on `dgx:gpu0` would print `-1` in every row of this column too, and it would print it for a reason no lease can fix. **What the column cannot report today, stated as three things:** how many device bytes the DiT staging leaves resident; whether the denoise grows device residency across steps; and whether the ~59 GiB #1014 asks about is device-class at all. **Why W0 did not just wire it:** `include/vllm/platforms/interface.h:68-72` records that CUDA's absence from that seam is load-bearing — `Gemma4MoE`'s device-expert LRU is the seam's only consumer and is DEAD on CUDA. Narrowed, because the broad form of this sentence is wrong: the bf16 arm `EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548`) is dead for a SECOND, independent reason — it refuses at `:571` on `vt::HasMatmulBTAlphaBeta`, implemented only by ROCm ([#1205](https://github.com/mudler/vllm.cpp/issues/1205)) — so the override alone would not wake it. The arm the override WOULD wake is the FP8-native one, `EnsureGemma4Fp8NativeOnDevice` (`:611-628`), which reaches `MakeRoom` behind no device gate but the probe, with a 2048 MiB fill-only budget by default (`:416-432`). One named arm, not every CUDA model — and still a behaviour change with its own measurement. That is #1126's change to make, not an instrument's. **What W1 does instead, until #1126 lands:** sample `nvidia-smi --query-compute-apps=used_memory` per phase beside the table — the fallback this spec's W6 row already names, and the one instrument GB10 answers, since `--query-gpu=memory.used` returns `[N/A]` there. On GB10 the peak HOST column is not a poor substitute either: the pool is unified, so host resident bytes and device bytes are the same 119 GiB arena, and that column does report |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | W0 (contract) + W1 (closes) | contract half **met** — the table is a file beside the frames rather than a console line, and it is retrievable from this repo at `benchmarks/demo/`. The closing half is W1's |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | W1 | owed; its `utilization.gpu` positive control is still unrecorded in this tree |
@@ -650,6 +651,7 @@ its phase table lands, and W5 owes one when its wall is accepted.
 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | W6 | owed, conditional |
 | [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | O1 | owed |
 | [#1202](https://github.com/mudler/vllm.cpp/issues/1202) | deferred behind W1 | owed, with a number: 2.3% of one pass |
+| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | W0 (its own gate) | **owed, and RED on `main` rather than on any branch.** `CHECK(leaves >= 0.95 * wall)` in `ltx2 video: a render through the ABI emits a phase table that SUMS to wall` is a RATIO, and the un-named residue is 4.80% to 6.32% of `wall` across twelve runs on one x86 box - so the 95% floor sits INSIDE the measurement's own range at the 64x64 / 9-frame fixture scale, and the case decides by coin flip, mostly red. With this lane's four files reverted so the binary is main at `89261c955`, six runs read 94.32%, 95.20%, 93.74%, 94.20%, 94.69%, 94.19%; the W0-live merge reads 93.82%, 93.68%, 94.34%, 94.62%, 94.39%, and 94.12% with `VLLM_RENDER_PROGRESS=0`, which exonerates the live emitter. Box contention is NOT the cause and main's one green disproves it: that run had `wall=0.579684s`, more than double the others, because the box was loaded - a SLOWER render passes. The tolerance was argued for the 21.004 B render, where the residue is a far smaller fraction of the wall. Naming the un-named time, or bounding `unaccounted_seconds` beside the ratio so the assertion says the same thing at both scales, is gate semantics and owes its own row |
 | [#1164](https://github.com/mudler/vllm.cpp/issues/1164) | W7 decision point | not owed here — owned by `ENG-CUDAGRAPH-DIFFUSION`; this row owns its unblock order |
 
 **[#1009](https://github.com/mudler/vllm.cpp/issues/1009) is not owed. It
@@ -1113,3 +1115,156 @@ which is where this spec's `### Decisions taken here` already said they would be
   is the only leaf whose sole reader is the DFR case, because every other render
   in `test_ltx2_video` pins `max_phase = 0`, where the input transform is never
   the spatial upsample.
+
+## W0-live — the lane that runs while the render is alive (#1413)
+
+W0 above landed the table. This section is the half of #1010 that table does not
+reach, filed separately as
+[#1413](https://github.com/mudler/vllm.cpp/issues/1413) so the two are
+attributable to the two changes that made them.
+
+### The gap, in one sentence each
+
+**The table is written by the success path only.** `WritePhaseLog` is reached
+after `im.trace.completed = true`, so a render that is killed, aborted by a lease
+governor, or still running writes nothing. That is not a corner: #1375 is
+`ABORT[92] PROJECTED OVERRUN`, `child exit=-15`, **0 frames**; the spike's rung 1
+is `EXIT=137`, 0 frames; rung 2 is `EXIT=1`, 0 frames. The instrument reports on
+the runs that finish, and the runs the campaign has are the ones that do not.
+
+**Nothing at all is emitted while the render runs.** `PhaseLog::Open` and
+`PhaseLog::Close` record and print nothing, and `VLLM_RENDER_PHASE_LOG_STDERR`
+fires inside `WriteJson`, i.e. on the success path again. Between
+`ltx2-gen: family=...` and `wrote N frames` a 2.5-hour render is silent, so
+**working and hung are byte-identical from outside**, and hours of GPU lease have
+been spent telling them apart.
+
+**The unit that costs the wall has no counter.** `denoise` is one leaf. #1375
+measures **~162 s per DiT forward** at 21.004 B with **60 forwards structural**
+(30 steps x 2 CFG legs — `cfg_scale != 1.0` forces the unconditional branch at
+`ltx2_pipeline.cpp:521-523`). ~2.7 h inside one leaf that reports one number, at
+the end, if the run survives to write it.
+
+### Why an external sampler is not the fallback
+
+It was tried and it does not work. #1375 records `phase=OTHER` throughout,
+because **`eu-stack` unwinds zero frames inside the `rc` worker container**;
+`dit_runs=0` is that blind counter and is not evidence of absence. The 162 s is a
+wall-clock interval between GPU busy/idle edges, not a profile, and #1375's own
+"What is NOT established" names an in-process phase marker as the way to
+attribute it. This lane is that marker.
+
+### The shape, and why it is this shape
+
+Two emitters, both on stderr, both on the shipped default.
+
+1. **A boundary line on open and on close.** `+name` when a phase opens,
+   `-name` when it closes with its duration and its peak host bytes. The open
+   line is the load-bearing one: it means **the last line printed names the phase
+   that is currently running**, which is the whole difference between a hang and
+   work. A close-only emitter would have printed nothing for the 3002 s
+   conditioning stretch, because that stretch never closed.
+
+2. **A tick per DiT forward**, carrying the recipe phase, the sampler step
+   `k/N`, the cumulative forward index, elapsed, and `last=` — the seconds since
+   the previous tick of the same unit. That `last=` is the per-forward cost
+   #1375 could only obtain as an interval between GPU edges, and it is now a
+   number the process itself reports, per forward, on every run including the
+   ones that die.
+
+   **The tick fires BEFORE the forward, not after.** After is the obvious
+   placement and it is wrong here: the line a reader most needs is the one naming
+   the forward that is in flight when the run stops. The cost of that choice is
+   stated rather than hidden — the last forward of a completed render has no
+   `last=` line of its own, and its cost is inside the `-denoise` boundary line.
+
+**Cadence.** 60 tick lines and ~50 boundary lines over 2.7 h. Not chatty enough
+to drown a log; not quiet enough that a 162 s forward reads as a hang. That 60
+is #1375's config and it moved while this lane was in review:
+[#1092](https://github.com/mudler/vllm.cpp/issues/1092) gave
+`Ltx2DitForwardDevice` its `perturbations` argument, so the device-resident arm
+runs up to four forwards per step rather than two and the same geometry emits
+up to 120 ticks. Neither number is printed and neither had to be re-derived:
+the forward counter carries no denominator by the paragraph below, and the step
+fraction reads this recipe phase's own `sigmas`.
+
+**No denominator on the forward counter, deliberately.** 60 = 30 x 2 is true of
+the config #1375 measured and it is not structural in this code: the sampler
+decides how many denoiser calls happen and `Ltx2GuidedDenoise` decides how many
+forwards each call is (one to four — cond, uncond, ptb, mod). The **step**
+counter carries the honest fraction `k/N`, because `sigmas.size() - 1` is exact
+and in scope. Printing `forward 24/60` would be an instrument guessing, and this
+row exists because guessing is what the campaign has been doing.
+
+### Not behind a flag, and the reason is measured
+
+`VT_H3_PROGRESS` is the existing shape for this in the tree
+(`minimax_h3.cpp:776-793`): per-step forward seconds, on stderr, for the
+MiniMax-H3 denoise loop. It is **opt-in**, and that is exactly why no LTX-2.5 run
+has one — the runs whose profile is needed are the long ones, on a leased box, by
+somebody who did not know they would need the number until afterwards. The
+failure this closes happened on default settings.
+
+`VLLM_RENDER_PROGRESS=0` silences it, in the same measurement-lane shape
+`VLLM_RENDER_PHASE_SAMPLER` and `VLLM_LTX2_POOL_DRAIN` already take here: it
+exists so an A/B over what the emitter itself costs runs on ONE binary. It is
+never a configuration and nothing in the tree sets it.
+
+### Cost
+
+One `std::fprintf` to stderr per phase boundary and per DiT forward, flushed,
+under the process-wide phase mutex the 100 ms sampler also takes — so a tick is a
+held global lock plus a flushed write rather than a bare `fprintf`, which at ~110
+lines per render is a footnote and is written down rather than left in a profile.
+On the 21.004 B geometry that is ~110 writes against 2.7 h of wall. There is **no
+per-token and no per-tile emission**: the VAE decode's tile loop and the frame
+writer's inner loop are untouched, and the decode's per-chunk boundary lines are
+bounded by the chunk count, which is bounded by the frame count.
+
+**`VLLM_RENDER_PROGRESS=0` costs one `getenv` per process, and that took a second
+edit to become true.** `ProgressEnabled()` caches the read and `Tick` returns on
+its first line, but the `detail` argument is built by the CALLER and was built
+unconditionally: a `std::string` from a literal, three `std::to_string`s and four
+concatenations, per DiT forward. Against a 162 s forward the magnitude is
+nothing; the sentence was still false as written, and a cost claim that is false
+in the small is the shape that gets quoted in the large. The call site now asks
+`phase::ProgressEnabled()` before it formats anything, which is why that function
+is declared in the header instead of living in an anonymous namespace.
+
+### Gate
+
+`ltx2 video: a render through the ABI PRINTS its progress while it runs`, in
+`tests/vllm/multimodal/test_ltx2_video.cpp`. It captures **real stderr** with
+`dup`/`dup2` across `vllm_video_engine_load` and `vllm_video_generate` — not a
+test-only sink — so what it asserts is exactly what a user sees on default
+settings, and there is no seam that could be armed in the test and absent in
+production. It asserts:
+
+* the boundary lines for `load.dit`, `denoise`, `decode.video` and
+  `artifacts.frames` appear, each with a matching `+` and `-`;
+* `+denoise` precedes every `dit forward` tick and `-denoise` follows every one
+  of them, which is what says the ticks are inside the phase they claim;
+* at least two ticks, with **strictly increasing** forward indices — the step
+  count moves;
+* every tick from the second onward carries `last=`;
+* `t=` is non-decreasing over the whole capture.
+
+The strictly-increasing assertion is the non-vacuous half. An emitter that
+printed a constant `forward 1` would satisfy "the marker appears" and would
+report nothing, which is the failure mode the spike's sampler already had.
+
+### Owed out of W0-live
+
+* **A capture from a real 21.004 B render.** Every number in this section about
+  what the lane prints at that scale is derived from #1375's measured 162 s, not
+  observed. W1's lease closes it, and the format is fixed here so that run does
+  not have to negotiate one.
+* **The last forward of a completed render has no `last=` line**, by the
+  before-the-forward placement argued above. Its cost is inside `-denoise` and a
+  reader who needs it per-forward has n-1 samples, not n.
+* **`GenerateAudioOnly` emits boundary lines and no ticks**, because the t2a arm
+  reaches the same `Evaluate`. Unverified: no t2a case captures stderr.
+* **Nothing writes a partial table on abort.** This lane makes the *phases*
+  visible on a killed run; it does not make `phase-log.json` appear for one. A
+  signal handler that flushed the table is a separate change with its own
+  re-entrancy argument, and it is not this one.

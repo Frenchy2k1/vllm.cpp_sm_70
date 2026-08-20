@@ -3996,6 +3996,39 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // owed a leased run rather than left implied.
       const Ltx2X0Model x0_model = [&](const Ltx2ModalityInput* v, const Ltx2ModalityInput* a,
                                        const Ltx2DitPerturbation* p) {
+        // W0-live (#1413): THE tick, and it fires BEFORE the forward rather than
+        // after it. At #1375's measured ~162 s per forward on the 21.004 B model
+        // this line is the only output the process produces for minutes at a
+        // time, so it has to name the forward that is IN FLIGHT — otherwise a run
+        // killed inside forward 37 says 36 and a reader has to guess whether the
+        // missing one ran. The cost of that choice: the last forward of a
+        // completed render has no line of its own, and its duration is inside the
+        // `- denoise` boundary line.
+        //
+        // NO DENOMINATOR ON THE FORWARD COUNTER, deliberately. 60 = 30 x 2 is
+        // true of the config #1375 measured and is not structural here: the
+        // sampler decides how many denoiser calls happen and `Ltx2GuidedDenoise`
+        // decides how many forwards each call is (one to four — cond, uncond,
+        // ptb, mod, denoisers.py:100-137). The STEP fraction is exact, because
+        // `sigmas` is this recipe phase's own schedule; note that the res_2s
+        // substep passes a literal 0 and its terminal evaluation passes
+        // `n_full_steps`, so on that arm the step number is the DENOISER's index
+        // and not a monotone loop counter. The forward counter is the monotone
+        // one, which is why the progress claim rests on it.
+        //
+        // GUARDED AT THE CALL SITE, not only inside `Tick`. `Tick` returns on
+        // its first line when the lane is off, but `detail` is already built by
+        // then: one `std::string` from a literal, three `std::to_string`s and
+        // four concatenations, per forward. Negligible against 162 s and not
+        // zero, and the spec claims `VLLM_RENDER_PROGRESS=0` costs one `getenv`
+        // per process — which is true only with this `if` here.
+        if (::vllm::multimodal::phase::ProgressEnabled()) {
+          ::vllm::multimodal::phase::Tick(
+              "dit forward", im.trace.dit_forwards + 1,
+              "phase " + std::to_string(phase_index) + " step " +
+                  std::to_string(step_index + 1) + "/" +
+                  std::to_string(static_cast<int64_t>(sigmas.size()) - 1));
+        }
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
                                                 im.compute_dtype, /*cache=*/nullptr, p)

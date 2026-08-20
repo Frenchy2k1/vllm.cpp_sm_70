@@ -3323,6 +3323,431 @@ TEST_CASE("ltx2 phase log: the last Close stops the sampler") {
   log.Reset();
 }
 
+// ─── W0-live: the lane that runs WHILE the render is alive (issue #1413) ─────
+//
+// WHAT THIS GATES, and why the table above does not already gate it. That case
+// reads `phase-log.json`, which `Ltx2VideoEngine::Generate` writes after
+// `im.trace.completed = true` — the SUCCESS PATH ONLY. A render that is killed,
+// aborted by a lease governor, or still running writes no table at all, and that
+// is the population this campaign actually has: #1375 is `ABORT[92] PROJECTED
+// OVERRUN` / `child exit=-15` / 0 frames, and `ltx25-decode-speed.md`'s two
+// rungs are `EXIT=137` / 0 frames and `EXIT=1` / 0 frames. An instrument that
+// reports on completion reported on none of them.
+//
+// So the deliverable here is different in kind: a line emitted AS EACH PHASE
+// STARTS, so that the last line printed names the phase that is currently
+// running. That is the whole difference between a working render and a hung one,
+// which were byte-identical from outside for 2.5 hours at a time, and it is the
+// difference a close-only emitter would still not make — the 3002 s conditioning
+// stretch never closed.
+//
+// AND IT CAPTURES REAL STDERR, with `dup`/`dup2`, rather than installing a
+// test-only sink. A sink would be a seam that could be armed here and absent in
+// production, which is the exact defect class `.agents/reachability.md` is
+// about; what is asserted below is what a user sees on the shipped default with
+// nothing set.
+//
+// THE NON-VACUOUS HALF is the strictly-increasing forward index. An emitter that
+// printed a constant `dit forward 1` would satisfy "the marker appears" and would
+// report nothing — which is what the spike's external sampler did, and why
+// #1375's `dit_runs=0` is not evidence of absence. The count has to MOVE.
+//
+// Nothing between the redirect and its restore may assert: a doctest `REQUIRE`
+// that aborted the case in there would leave the process with stderr pointed at
+// a temporary file for every case that follows.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 video: a render through the ABI PRINTS its progress while it runs") {
+  Workspace ws;
+  const std::string audio_embeds = ws.paths.audio_embeds;
+  const std::string max_phase = "0";
+  const char* keys[] = {vllm::multimodal::kLtx2AudioPromptEmbedsExtra,
+                        vllm::multimodal::kLtx2MaxPhaseExtra};
+  const char* values[] = {audio_embeds.c_str(), max_phase.c_str()};
+
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = ws.paths.dit.c_str();
+  mp.video_vae_path = ws.paths.video_vae.c_str();
+  mp.audio_vae_path = ws.paths.audio_vae.c_str();
+  mp.prompt_embeds_path = ws.paths.video_embeds.c_str();
+  mp.extra_keys = keys;
+  mp.extra_values = values;
+  mp.n_extras = 2;
+  mp.device = 0;
+
+  const std::string out_dir = ws.root + "/progress_out";
+  vllm_video_params gen = vllm_video_params_default();
+  gen.width = 64;
+  gen.height = 64;
+  gen.num_frames = 9;
+  gen.seed = 7;
+  gen.has_seed = 1;
+  gen.output_dir = out_dir.c_str();
+
+  vllm_video_engine* engine = nullptr;
+  vllm_video_result result;
+  std::memset(&result, 0, sizeof(result));
+  vllm_status loaded = VLLM_OK;
+  vllm_status generated = VLLM_OK;
+  std::string engine_error;
+  std::string captured;
+
+  // The LOAD is inside the capture as well as the generation: the timeline
+  // starts at the load because the DiT staging is minutes at 22B, and a lane
+  // that only spoke after the load would be silent for the phase #1021 is about.
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    loaded = vllm_video_engine_load(&mp, &engine);
+    if (loaded == VLLM_OK && engine != nullptr) {
+      generated = vllm_video_generate(engine, &gen, &result);
+    }
+    if (vllm_last_error() != nullptr) engine_error = vllm_last_error();
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+
+  INFO(engine_error);
+  REQUIRE(loaded == VLLM_OK);
+  REQUIRE(engine != nullptr);
+  REQUIRE(generated == VLLM_OK);
+
+  // ── the lines ────────────────────────────────────────────────────────────
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  MESSAGE("captured " << lines.size() << " [render] lines of " << captured.size()
+                      << " bytes of stderr");
+  REQUIRE_MESSAGE(!lines.empty(),
+                  "the render printed NOTHING while it ran; a working render and a hung one "
+                  "are still the same observation (#1413)");
+
+  // Every line carries the elapsed clock, and it never goes backwards. A `t=`
+  // that reset would mean two timelines interleaved in one capture.
+  double previous_t = -1.0;
+  for (const std::string& line : lines) {
+    INFO(line);
+    const size_t at = line.find(" t=");
+    REQUIRE_MESSAGE(at != std::string::npos, "a progress line carries no elapsed clock");
+    const double t = std::atof(line.c_str() + at + 3);
+    CHECK(t >= previous_t);
+    previous_t = t;
+  }
+
+  // ── the boundaries, opened AND closed ────────────────────────────────────
+  //
+  // The OPEN marker is the one that matters and it is asserted by name: a close
+  // marker alone names only phases that finished, and every render this row
+  // exists for stopped inside a phase that never did.
+  auto index_of = [&lines](const std::string& needle) -> long {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+    }
+    return -1;
+  };
+  // MATCH THE WHOLE NAME FIELD, NOT A PREFIX OF IT. The emitter writes the name
+  // with `%-24s`, so every phase shorter than 24 characters is followed by at
+  // least one space, and `"- denoise "` cannot match `- denoise.step`. Written as
+  // a helper because a prefix match here is not a stylistic point: W0's anchor
+  // scopes added `denoise.step` and `decode.video.chunk` beneath the two leaves
+  // this case asserts against, and a bare `find("- denoise")` then resolved to
+  // the FIRST sub-scope close, several lines before the forwards it was supposed
+  // to bracket. The case failed on seven true statements about the wrong line.
+  auto phase_line = [&index_of](const char* sign, const std::string& name) -> long {
+    return index_of(std::string(sign) + " " + name + " ");
+  };
+  for (const std::string name : {"load.dit", "denoise", "decode.video", "artifacts.frames"}) {
+    // `std::string`, never `const char*`: doctest stringifies a streamed `char*`
+    // as a BOOL, so a failure here would have printed "no '1' line".
+    CHECK_MESSAGE(phase_line("+", name) >= 0, "no OPEN line for phase '" << name << "'");
+    CHECK_MESSAGE(phase_line("-", name) >= 0, "no CLOSE line for phase '" << name << "'");
+    CHECK_MESSAGE(phase_line("-", name) > phase_line("+", name),
+                  "phase '" << name << "' closed before it opened");
+  }
+
+  // A close line reports what the phase cost, which is the number a reader takes
+  // off a killed run's log without waiting for a table that will never be
+  // written.
+  const long dit_close = phase_line("-", "load.dit");
+  REQUIRE(dit_close >= 0);
+  CHECK_MESSAGE(lines[static_cast<size_t>(dit_close)].find(" dur=") != std::string::npos,
+                "a phase closed without saying what it cost: "
+                    << lines[static_cast<size_t>(dit_close)]);
+
+  // ── the per-forward counter, and the proof that it MOVES ─────────────────
+  std::vector<long> forward_indices;
+  std::vector<size_t> forward_lines;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const size_t at = lines[i].find("dit forward ");
+    if (at == std::string::npos) continue;
+    forward_indices.push_back(std::atol(lines[i].c_str() + at + 12));
+    forward_lines.push_back(i);
+  }
+  REQUIRE_MESSAGE(forward_indices.size() >= 2,
+                  "the denoise loop printed " << forward_indices.size()
+                                              << " forward lines; #1375 measures ~162 s per "
+                                                 "forward and 60 of them is structural, so a "
+                                                 "loop that prints once is a loop that hangs");
+  for (size_t i = 1; i < forward_indices.size(); ++i) {
+    INFO(lines[forward_lines[i]]);
+    CHECK_MESSAGE(forward_indices[i] > forward_indices[i - 1],
+                  "the forward counter did not move: " << forward_indices[i - 1] << " then "
+                                                       << forward_indices[i]);
+    // `last=` is the per-forward cost #1375 could only get as a wall-clock
+    // interval between GPU busy/idle edges. Absent on the first tick by
+    // construction, required on every one after it.
+    CHECK_MESSAGE(lines[forward_lines[i]].find(" last=") != std::string::npos,
+                  "a forward tick carries no per-forward cost: " << lines[forward_lines[i]]);
+  }
+  // The sampler step, as a FRACTION. Without the denominator a reader knows the
+  // render moved and not whether it is a tenth or nine tenths of the way.
+  //
+  // Two statements rather than one `&&`: doctest's expression decomposer
+  // static-asserts "Expression Too Complex Please Rewrite As Binary Comparison"
+  // on a conjunction, so the compound form does not build — and a mutation that
+  // fails to build reads exactly like a passing test.
+  const std::string first_tick = lines[forward_lines[0]];
+  CHECK_MESSAGE(first_tick.find(" step ") != std::string::npos,
+                "a forward tick names no sampler step: " << first_tick);
+  CHECK_MESSAGE(first_tick.find("/") != std::string::npos,
+                "the sampler step carries no /N denominator, so a reader knows the render "
+                "moved and not whether it is a tenth or nine tenths of the way: "
+                    << first_tick);
+
+  // ── the ticks are INSIDE the phase they claim ────────────────────────────
+  const long denoise_open = phase_line("+", "denoise");
+  const long denoise_close = phase_line("-", "denoise");
+  REQUIRE(denoise_open >= 0);
+  REQUIRE(denoise_close >= 0);
+  for (size_t i = 0; i < forward_lines.size(); ++i) {
+    const long at = static_cast<long>(forward_lines[i]);
+    // Two comparisons, never one `&&`: doctest static-asserts on a conjunction.
+    CHECK_MESSAGE(at > denoise_open,
+                  "a DiT forward tick was printed BEFORE the denoise phase opened: "
+                      << lines[forward_lines[i]]);
+    CHECK_MESSAGE(at < denoise_close,
+                  "a DiT forward tick was printed AFTER the denoise phase closed: "
+                      << lines[forward_lines[i]]);
+  }
+
+  vllm_video_result_free(&result);
+  vllm_video_engine_free(engine);
+}
+#endif  // !_WIN32
+
+// ─── the tick's OWN contract: emitted at the call, not at the return ────────
+//
+// WHY THIS CASE EXISTS. The case above renders through the ABI and asserts that
+// the ticks appear, that the counter moves and that they sit inside `denoise`.
+// It cannot see the decision the design rests on. On a render that COMPLETES,
+// calling `Tick` before the forward and calling it after produce the same lines,
+// the same intervals and the same ordering against the phase boundaries — moving
+// the production call below the forward leaves that case green. The two
+// placements differ only on a run that dies mid-unit, and no gate here can stage
+// a `SIGKILL` inside `Ltx2DitForwardDevice` through `vllm.h`.
+//
+// So this pins the half that IS testable, which is the half the production
+// placement rests on: `Tick` reaches the real fd 2 and FLUSHES before the
+// caller's next statement runs. If the line were buffered, or emitted lazily, or
+// deferred to the end of the phase, then announcing a unit before starting it
+// would buy nothing — the announcement would die in the buffer with the process.
+// Below, a fake unit of work writes its own marker to the same stream, and the
+// tick has to be there first every time.
+//
+// AND THE SHAPE THAT MATTERS IS THE LAST ONE. The loop announces unit 4 and then
+// stops without finishing it, which is what a killed render looks like from
+// stderr: the log's last word is the unit that was in flight. Under an
+// after-the-work emitter that capture would end at unit 3, and #1375 would still
+// be un-attributed.
+//
+// Nothing between the redirect and its restore may assert, for the reason the
+// case above gives: a `REQUIRE` that aborted in there would leave every later
+// case writing stderr into a temporary file.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 phase log: a live tick is FLUSHED BEFORE the work it announces") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+
+  const int kFinished = 3;  // units 1..3 complete; unit 4 is announced and never does
+  std::string captured;
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    for (int k = 1; k <= kFinished; ++k) {
+      phase::Tick("unit", k, "step " + std::to_string(k) + "/4");
+      // The work. It writes its own marker to the SAME stream, so the ordering
+      // question is answered by the bytes rather than by a clock.
+      std::fprintf(stderr, "[work] unit %d finished\n", k);
+      std::fflush(stderr);
+    }
+    // Announced, then the "process dies" here. No marker follows.
+    phase::Tick("unit", kFinished + 1, "step 4/4");
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+  log.Reset();
+
+  MESSAGE("captured " << captured.size() << " bytes of stderr from the tick contract case");
+  REQUIRE_MESSAGE(!captured.empty(), "phase::Tick emitted nothing at all");
+
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+      if (line.rfind("[work] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  auto index_of = [&lines](const std::string& needle) -> long {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return static_cast<long>(i);
+    }
+    return -1;
+  };
+
+  // Each announcement precedes the work it announces. `std::string` and never a
+  // `char*` in a stream: doctest stringifies a streamed `char*` as a bool.
+  for (int k = 1; k <= kFinished; ++k) {
+    const std::string tick = "unit " + std::to_string(k) + " ";
+    const std::string work = "[work] unit " + std::to_string(k) + " finished";
+    const long at_tick = index_of(tick);
+    const long at_work = index_of(work);
+    CHECK_MESSAGE(at_tick >= 0, "no tick line for unit " << k);
+    CHECK_MESSAGE(at_work >= 0, "no work marker for unit " << k);
+    CHECK_MESSAGE(at_tick < at_work,
+                  "the tick for unit " << k << " was not flushed before the work it announces");
+  }
+
+  // The killed-run shape: unit 4 was announced, never finished, and the capture
+  // still names it — and names it LAST.
+  const long announced = index_of("unit 4 ");
+  CHECK_MESSAGE(announced >= 0,
+                "the unit that was in flight when the run stopped is missing from the log, "
+                "which is what an after-the-work emitter produces");
+  CHECK_MESSAGE(index_of("[work] unit 4 finished") < 0,
+                "the case did not stage an unfinished unit, so it proves nothing");
+  REQUIRE(!lines.empty());
+  CHECK_MESSAGE(lines.back().find("unit 4 ") != std::string::npos,
+                "the last line of the capture is not the unit in flight: " << lines.back());
+
+  // `last=` is the per-unit interval, absent on the first tick by construction
+  // and present on every one after it.
+  const long first = index_of("unit 1 ");
+  REQUIRE(first >= 0);
+  CHECK(lines[static_cast<size_t>(first)].find(" last=") == std::string::npos);
+  const long second = index_of("unit 2 ");
+  REQUIRE(second >= 0);
+  CHECK_MESSAGE(lines[static_cast<size_t>(second)].find(" last=") != std::string::npos,
+                "the second tick of a unit carries no interval: "
+                    << lines[static_cast<size_t>(second)]);
+}
+#endif  // !_WIN32
+
+// ─── `last=` belongs to ONE generation ───────────────────────────────────────
+//
+// The per-unit tick clock is keyed by unit NAME and lives in the `PhaseLog`, so
+// its lifetime is a decision rather than an accident. `Begin` and `Reset` clear
+// it. `SetRender` — the call a driver makes between two generations in one
+// process — did not, so the second render's first DiT forward would have carried
+// a `last=` measuring the gap between two renders. That number is shaped exactly
+// like one very slow forward, on the lane whose entire deliverable is per-forward
+// seconds, in a process (a server) that renders more than once.
+//
+// The wait is what makes this refutable. Without it the stale interval would be
+// microseconds and indistinguishable from a fresh one; 150 ms of sleep between
+// the two renders means an uncleared clock reports a number nobody could mistake
+// for a forward.
+#if !defined(_WIN32)
+TEST_CASE("ltx2 phase log: a SECOND render's first tick carries no interval from the first") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Begin();
+
+  std::string captured;
+  {
+    std::FILE* cap = std::tmpfile();
+    REQUIRE(cap != nullptr);
+    std::fflush(stderr);
+    const int saved = ::dup(STDERR_FILENO);
+    REQUIRE(saved >= 0);
+    REQUIRE(::dup2(::fileno(cap), STDERR_FILENO) >= 0);
+
+    log.SetRender(1);
+    phase::Tick("dit forward", 1, "render one");
+    phase::Tick("dit forward", 2, "render one");
+    // The gap between two generations, long enough to be unmistakable.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    log.SetRender(2);
+    phase::Tick("dit forward", 1, "render two");
+
+    std::fflush(stderr);
+    const int restored = ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    std::rewind(cap);
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    std::fclose(cap);
+    REQUIRE(restored >= 0);
+  }
+  log.Reset();
+
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(captured);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind("[render] ", 0) == 0) lines.push_back(line);
+    }
+  }
+  MESSAGE("captured " << lines.size() << " tick lines across two renders");
+  REQUIRE(lines.size() == 3);
+
+  // THE INSTRUMENT'S OWN PRECONDITION: the second tick of render one DOES carry
+  // an interval, so "no `last=`" below is a cleared clock and not a lane that is
+  // switched off. `VLLM_RENDER_PROGRESS=0` would have failed the size check above
+  // rather than passing this one silently.
+  REQUIRE_MESSAGE(lines[1].find(" last=") != std::string::npos,
+                  "the second tick of the FIRST render carries no interval, so this case cannot "
+                  "observe whether the clock is cleared: " << lines[1]);
+  CHECK_MESSAGE(lines[2].find(" last=") == std::string::npos,
+                "the first tick of the SECOND render carries an interval spanning the gap since "
+                "the first render ended, which reads as one very slow forward: " << lines[2]);
+}
+#endif  // !_WIN32
+
 // ─── the SHIPPED checkpoints, when the box has them ─────────────────────────
 //
 // Everything above runs over a reduced fixture, which proves the composition and
