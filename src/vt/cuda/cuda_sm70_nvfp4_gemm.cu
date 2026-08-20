@@ -399,6 +399,181 @@ __global__ void Sm70Nvfp4Qpn(const uint8_t* __restrict__ qcodes,
   }
 }
 
+// ---------------------------------------------------------------------------
+// 1) Accumulator ILP (NACC) twin — mirrors skinny_nvfp4_qpn2@1394-1445 (the
+//    v100-skinny SPLITK/NACC kernel; NACC/ILP "-30.7 % vs qpn1" claim in the
+//    comment block at SK:~1376). The four k8-slice mma.sync of each group
+//    accumulate into c[0], c[1 % NACC], c[2 % NACC], c[3 % NACC] so NACC==2
+//    interleaves two independent fp32 accumulator chains (consecutive mma
+//    issue into alternating registers); the reduce @1442-1445 folds the
+//    a>0 chains into c[0] before the original epilogue. NACC==1 degenerates
+//    to the single-accumulator order. MT keeps the M-dispatch (MT=1 -> the
+//    M 4..8 band; the two-tile instantiation is the MT2 variant below).
+// ---------------------------------------------------------------------------
+template <int MT, int NACC>
+__global__ void Sm70Nvfp4QpnNacc(const uint8_t* __restrict__ qcodes,
+                                 const uint8_t* __restrict__ qscales,
+                                 const __half* __restrict__ x,
+                                 __half* __restrict__ y, int N, int K, int M,
+                                 float gscale) {
+  constexpr int WARPS = 4;
+  __shared__ float cs[WARPS][MT * 256];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / WARPS;
+  const int g0 = warp * Gq;
+  const uint2* cb = reinterpret_cast<const uint2*>(qcodes) + (size_t)tile * G * 32 + lane;
+  const uint8_t* sb = qscales + (size_t)tile * G * 32 + lane;
+
+  const __half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float c[MT][NACC][8];
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int a = 0; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][a][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+    const __half2 sc2 = __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+    __half2 b[8];
+    dequant8_k2(q2.x, sc2, b + 0);
+    dequant8_k2(q2.y, sc2, b + 4);
+    const unsigned* B = reinterpret_cast<const unsigned*>(b);
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      const int ar = t * 8 + r;
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (ar < M) {
+        const __half* xrow = x + (size_t)ar * K;
+        a01 = *reinterpret_cast<const uint4*>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4*>(xrow + g * 16 + 8);
+      }
+      const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      // SK@1436-1439: slice-split the chains, alternating accumulators.
+      MMA_8N8K4(c[t][0], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t][1 % NACC], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t][2 % NACC], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t][3 % NACC], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int a = 1; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][0][i] += c[t][a][i];
+
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t * 8 + row) * 32 + qp * 8 + col] = c[t][0][i];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < MT * 256; e += blockDim.x) {
+    const float v = cs[0][e] + cs[1][e] + cs[2][e] + cs[3][e];
+    const int row = e >> 5, col = e & 31;
+    if (row < M) y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2) MT=2 two-tile variant — mirrors skinny_fp8_qpn8_mt2@1676-1729 (FP8 twin;
+//    README: M=16 558.5 vs 301.9 GB/s, the two-tile-per-weight-stream win).
+//    For M in 9..16 the pass covers TWO 8-row tiles (rows t*8+r and
+//    t*8+8+r): the SAME B-fragment registers serve both tiles' mma batches
+//    (one code/scale read per group, two mma batches), exactly the qpn8_mt2
+//    c[2][NACC][8] dataflow (guard per tile: rr = r + 8t < M). Reduce only
+//    rows < M at the store. Same prepack layout as all QPN kernels.
+// ---------------------------------------------------------------------------
+template <int NACC>
+__global__ void Sm70Nvfp4QpnMt2(const uint8_t* __restrict__ qcodes,
+                                const uint8_t* __restrict__ qscales,
+                                const __half* __restrict__ x,
+                                __half* __restrict__ y, int N, int K, int M,
+                                float gscale) {
+  constexpr int WARPS = 4;
+  __shared__ float cs[WARPS][512];
+
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / WARPS;
+  const int g0 = warp * Gq;
+  const uint2* cb = reinterpret_cast<const uint2*>(qcodes) + (size_t)tile * G * 32 + lane;
+  const uint8_t* sb = qscales + (size_t)tile * G * 32 + lane;
+
+  const __half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float c[2][NACC][8];
+#pragma unroll
+  for (int t = 0; t < 2; t++)
+#pragma unroll
+    for (int a = 0; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][a][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint2 q2 = __ldcs(cb + (size_t)g * 32);
+    const __half2 sc2 = __hmul2(fp8e4m3_to_half2(__ldg(sb + (size_t)g * 32)), gm2);
+    __half2 b[8];
+    dequant8_k2(q2.x, sc2, b + 0);
+    dequant8_k2(q2.y, sc2, b + 4);
+    const unsigned* B = reinterpret_cast<const unsigned*>(b);
+    // One B-fragment load per group; both row-tiles issue against it.
+#pragma unroll
+    for (int t = 0; t < 2; t++) {
+      const int ar = r + (t << 3);
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (ar < M) {
+        const __half* xrow = x + (size_t)ar * K;
+        a01 = *reinterpret_cast<const uint4*>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4*>(xrow + g * 16 + 8);
+      }
+      const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      // SK@1725-1732: chain-slice into c[t][..%NACC] (NACC carried as in 1).
+      MMA_8N8K4(c[t][0], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t][1 % NACC], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t][2 % NACC], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t][3 % NACC], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < 2; t++)
+#pragma unroll
+    for (int a = 1; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][0][i] += c[t][a][i];
+
+#pragma unroll
+  for (int t = 0; t < 2; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t * 8 + row) * 32 + qp * 8 + col] = c[t][0][i];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < 512; e += blockDim.x) {
+    const float v = cs[0][e] + cs[1][e] + cs[2][e] + cs[3][e];
+    const int row = e >> 5, col = e & 31;
+    if (row < M) y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
+  }
+}
+
 // Fragment-order prepack (device; byte-equal to the fork's python build):
 //   qcodes[(tile*G + g)*32*8 + lane*8] = 8 bytes of korder-ordered, pair-
 //   interleaved nibbles; qscales[(tile*G+g)*32 + lane] = the group scale.
@@ -707,9 +882,12 @@ if (m <= 3) {
     return cudaGetLastError() == cudaSuccess;
   }
 
-  // QPN band: M 4..16 via the Volta mma.m8n8k4 tensor cores, fed from the
+// QPN band: M 4..16 via the Volta mma.m8n8k4 tensor cores, fed from the
     // fragment-order prepack (byte-equal CT permutation, rebuilt per call into
-    // a cached scratch; n%32 and k%64 are the tensor geometry).
+    // a cached scratch; n%32 and k%64 are the tensor geometry). M 4..8 runs
+    // the NACC accumulator-ILP twin (1), M 9..16 the MT=2 two-tile one-
+    // weight-stream variant (2) — both reuse the SAME B-fragment registers;
+    // the original Sm70Nvfp4Qpn<MT> stays as the fallback reference.
     if (m >= 4 && m <= 16 && (n % 32) == 0 && (k % 64) == 0) {
       static uint8_t* s_qc = nullptr;
       static uint8_t* s_qs = nullptr;
@@ -727,9 +905,9 @@ if (m <= 3) {
       Sm70Nvfp4PackQpn<<<dim3((unsigned)tiles, (unsigned)G), 32, 0, stream>>>(
           codes, scales, s_qc, s_qs, k);
       if (m <= 8)
-        Sm70Nvfp4Qpn<1><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
+        Sm70Nvfp4QpnNacc<1, 2><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
       else
-        Sm70Nvfp4Qpn<2><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
+        Sm70Nvfp4QpnMt2<2><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
       if (check_enabled && !RunSelfCheck(args, self)) return false;
       return cudaGetLastError() == cudaSuccess;
     }
@@ -921,6 +1099,43 @@ extern "C" int vt_sm70_nvfp4_selfcheck(void) {
           2.0e-2 * std::max(1.0, std::fabs((double)ref[i]))) { bad = true; break; }
     }
     fprintf(stderr, " [selfcheck] case D (QPN M8xN64) parity OK=%d\n", bad ? 0 : 1);
+    cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds);
+    if (bad) return 1;
+  }
+
+  // Case F: QPN MT=2 band — M=16 n=64 k=512 (m>8 -> the two-tile-per-weight-
+  // stream Sm70Nvfp4QpnMt2<2> kernel). Covers the v100-skinny qpn8_mt2 win
+  // (one B-fragment read feeds both 8-row tiles); dev vs CpuReference.
+  {
+    const int m = 16, n = 64, k = 512;
+    uint64_t s = 0xf7aa;
+    std::vector<__half> x((size_t)m * k), y((size_t)m * n);
+    std::vector<uint8_t> codes((size_t)n * (k >> 1)), scales((size_t)n * (k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd(s);
+    for (auto& v : scales) v = (uint8_t)rnd(s);
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 2000) - 10.f);
+    void* dx; void* dc; void* ds; void* dy;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, y.size() * sizeof(__half));
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&ds, scales.size());
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    args.m = m; args.n = n; args.k = k; args.out = dy; args.x = dx;
+    args.codes = dc; args.scales = ds;
+    args.argmax_val = nullptr; args.argmax_idx = nullptr;
+    const bool ok = LaunchSm70Nvfp4W4a16(caps, &args);
+    cudaDeviceSynchronize();
+    if (!ok) { cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); return 1; }
+    cudaMemcpy(y.data(), dy, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    const auto ref = CpuReference(m, n, k, x, codes, scales, args.gscale);
+    bool bad = false;
+    for (size_t i = 0; i < y.size(); ++i) {
+      if (std::fabs((double)__half2float(y[i]) - (double)ref[i]) >
+          2.0e-2 * std::max(1.0, std::fabs((double)ref[i]))) { bad = true; break; }
+    }
+    fprintf(stderr, " [selfcheck] case F (QPN MT2 M16xN64) parity OK=%d\n", bad ? 0 : 1);
     cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds);
     if (bad) return 1;
   }
