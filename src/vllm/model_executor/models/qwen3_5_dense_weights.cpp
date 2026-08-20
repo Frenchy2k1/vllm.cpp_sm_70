@@ -580,7 +580,8 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
 FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
                                    const TensorExists& has,
                                    const std::string& base,
-                                   const Fp8BlockQuantConfig& block) {
+                                   const Fp8BlockQuantConfig& block,
+                                   bool keep_fp8w = false) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
   // Three forms, not two. `modelopt_mixed` checkpoints quantize this tower to
@@ -594,8 +595,14 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
   // BEFORE the per-tensor one, because a block-wise weight is also `F8_E4M3`
   // and therefore entered the per-tensor arm, which then asked for a
   // `weight_scale` the checkpoint spells `weight_scale_inv` (#1166).
+  // FIVE forms. QWEN38-PER-CHANNEL-GDN: when keep_fp8w (the load target runs
+  // the Volta W8A16 GEMM) the per-channel arm keeps the raw fp8 bytes in a
+  // Fp8PerChannelWeight keep owner instead of dequantizing to bf16, exactly
+  // like the GDN in/out projections. The keep owner is populated INSTEAD of
+  // the bf16 `plain`.
   const auto load_projection = [&](const std::string& name, Nvfp4Weight& fp4,
                                    Fp8BlockWeight& fp8_block, Fp8Weight& fp8,
+                                   Fp8PerChannelWeight& fp8w,
                                    OwnedTensor& plain) {
     if (IsNvfp4Projection(has, name)) {
       fp4 = LoadNvfp4AnyNaming(get, has, name);
@@ -609,9 +616,14 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
       // QWEN38-PER-CHANNEL-GDN: the attn q/k/v/o projections of the
       // 3.8-27B-NVFP4 checkpoint use the same F8_E4M3 + per-output-channel
       // BF16 [N,1] layout as the GDN in/out projections (no input_scale
-      // anywhere in the checkpoint), so they take the same rung: per-column
-      // fp8->bf16 dequant into the bf16 raw-NK owner the plain arm reads.
-      plain = dense_loaders::LoadFp8PerChannelBf16RawNK(get, name);
+      // anywhere in the checkpoint), so they take the same rung: keep the raw
+      // fp8 bytes (1 B/elem) under keep_fp8w, else per-column dequant into the
+      // bf16 raw-NK owner the plain arm reads.
+      if (keep_fp8w) {
+        fp8w = dense_loaders::LoadFp8PerChannelRawNK(get, name);
+      } else {
+        plain = dense_loaders::LoadFp8PerChannelBf16RawNK(get, name);
+      }
     } else if (dtype == "F8_E4M3") {
       fp8 = LoadFp8RawShared(get, name);
     } else {
@@ -619,13 +631,13 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
     }
   };
   load_projection(sa + "q_proj", a.q_proj_fp4, a.q_proj_fp8_block, a.q_proj_fp8,
-                  a.q_proj);
+                  a.q_proj_fp8w, a.q_proj);
   load_projection(sa + "k_proj", a.k_proj_fp4, a.k_proj_fp8_block, a.k_proj_fp8,
-                  a.k_proj);
+                  a.k_proj_fp8w, a.k_proj);
   load_projection(sa + "v_proj", a.v_proj_fp4, a.v_proj_fp8_block, a.v_proj_fp8,
-                  a.v_proj);
+                  a.v_proj_fp8w, a.v_proj);
   load_projection(sa + "o_proj", a.o_proj_fp4, a.o_proj_fp8_block, a.o_proj_fp8,
-                  a.o_proj);
+                  a.o_proj_fp8w, a.o_proj);
   a.q_norm = LoadModelBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadModelBf16Direct(get, sa + "k_norm.weight");
   return a;
@@ -819,7 +831,7 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     layer.gdn = LoadGdnDense(get, has, base, block, keep_fp8w);
   } else if (layer_type == "full_attention") {
     layer.is_linear_attention = false;
-    layer.attn = LoadAttnDense(get, has, base, block);
+    layer.attn = LoadAttnDense(get, has, base, block, keep_fp8w);
   } else {
     VT_CHECK(false, "qwen3_5 dense: unknown layer_type " + layer_type);
   }

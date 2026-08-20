@@ -595,6 +595,18 @@ struct FullAttnLayerWeights {
   Fp8BlockWeight v_proj_fp8_block;  // [N=Hkv*Dh,  K=H]
   Fp8BlockWeight o_proj_fp8_block;  // [N=H,       K=Hq*Dh]
 
+  // QWEN38-PER-CHANNEL-GDN keep-quant FP8 W8A16 owners: the q/k/v/o projections
+  // of Qwen3.8-27B-NVFP4 ship F8_E4M3 + per-output-column BF16 scale (no
+  // input_scale), the same layout as the GDN in/out. On a device with the Volta
+  // W8A16 GEMM the raw bytes are kept here (1 B/elem) instead of the bf16
+  // dequant (2 B/elem), via the same keep_fp8w gate as in_proj_qkvz_fp8w; every
+  // other platform keeps the bf16 `*_proj` owners / per-tensor fp8. The forward
+  // routes them through vt::MatmulFp8W8a16 in ProjectFullAttnQkv.
+  Fp8PerChannelWeight q_proj_fp8w;  // [N=2*Hq*Dh, K=H]
+  Fp8PerChannelWeight k_proj_fp8w;  // [N=Hkv*Dh,  K=H]
+  Fp8PerChannelWeight v_proj_fp8w;  // [N=Hkv*Dh,  K=H]
+  Fp8PerChannelWeight o_proj_fp8w;  // [N=H,       K=Hq*Dh]
+
   // CUDA resident for the FP8 (W8A8) analog of QKVParallelLinear (VT_FP8_MERGED
   // _QKV, opt-in). The checkpoint owns logical Q/K/V shards separately with a
   // shared per-tensor input_scale but per-projection weight_scale; production

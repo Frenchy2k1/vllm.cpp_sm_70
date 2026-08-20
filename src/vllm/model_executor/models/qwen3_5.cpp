@@ -2435,6 +2435,21 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w);
 
 bool FuseSigmoidGateQuantEnabled();
 
+// Device-resident keep-quant FP8 W8A16 projection operand (the
+// Fp8PerChannelWeight container: raw i8 [N,K] fp8 bytes + f32 [N] per-output
+// column scale), uploaded ONCE lazily through the shared OwnedTensor resident
+// machinery and reused every forward step — mirrors ResidentNvfp4 / Fp8W8a16.
+// Defined here (before the full-attention projections that route it) so
+// ProjectFullAttnQkv and SigmoidGateOProjD can dereference the packed/scale
+// members.
+struct Fp8W8a16Dev {
+  Tensor packed;  // i8  [N, K]  raw e4m3fn bytes
+  Tensor scale;   // f32 [N]     per-output-column
+};
+Fp8W8a16Dev ResidentFp8W8a16(Dev d, const Fp8PerChannelWeight& w) {
+  return Fp8W8a16Dev{ResidentWeight(d, w.packed), ResidentWeight(d, w.scale)};
+}
+
 // Full-attention sigmoid output gate (attn*sigmoid(gate)) folded into the o_proj.
 // attn2d/gate2d are [T, Hq*Dh] (attn f32 or bf16; gate f32). When the o_proj is
 // true-W4A4 fp4 (the 27B path) on CUDA, FUSE the gate into the fp4 activation
@@ -2472,8 +2487,31 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
                                  direct_scale ? &as.t() : nullptr);
   }
 #endif
-  DBuf gated(d, DType::kBF16, {T, K});
+DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // QWEN38-PER-CHANNEL-GDN keep-quant W8A16 (fp8 per-output-column) first,
+  // when the keep owner is populated and the Volta op is registered. The act
+  // is `gated` RAW [T, Hq*Dh] (the W8A16 op wants [M,K] untransposed), the
+  // keep container [N=H, K=Hq*Dh]; this is the 1 B/elem resident arm that
+  // makes the fp8 o_proj fit a 32 GiB card.
+  if (!w.o_proj_fp8w.Empty() &&
+      vt::OpRegistered(vt::OpId::kMatmulFp8W8a16, d.q.device.type)) {
+    // The W8A16 op wants the act UNTRANSPOSED [T, Hq*Dh] (out[M,N] =
+    // act[M,K] . fp8[N,K] . scale[N], K == fp8.shape[1]); the bf16/fp8/fp4
+    // arms below pass gated.t() only because they route MatmulBT-view
+    // helpers. The transpose is NEVER applied to the keep operand.
+    VT_CHECK(gated.t().dtype == DType::kBF16,
+             "qwen3_5 fp8 W8A16 full-attn o_proj: bf16 activations required "
+             "(the sm70 keep-quant GEMM is a bf16-in/b16-out decode)");
+    VT_CHECK(w.o_proj_fp8w.k == gated.t().shape[1],
+             "qwen3_5 fp8 W8A16 full-attn o_proj: invalid keep container "
+             "[n,k] (K must match act input dim)");
+    Fp8W8a16Dev fw = ResidentFp8W8a16(d, w.o_proj_fp8w);
+    DBuf out(d, DType::kBF16,
+             std::vector<int64_t>{gated.t().shape[0], w.o_proj_fp8w.n});
+    vt::MatmulFp8W8a16(d.q, out.t(), gated.t(), fw.packed, fw.scale);
+    return out;
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
   // the same dtype every other arm of this o_proj returns.
   if (!w.o_proj_fp8_block.Empty()) {
@@ -2622,10 +2660,32 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
 #endif
   const DType q_out_dt =
       (Bf16GemmOutEnabled() && out.fp4) ? DType::kBF16 : DType::kF32;
-  const auto project = [&](const Nvfp4Weight& fp4_weight,
+const auto project = [&](const Nvfp4Weight& fp4_weight,
                            const Fp8Weight& fp8_weight,
                            const Fp8BlockWeight& block_weight,
+                           const Fp8PerChannelWeight& fp8w_weight,
                            const OwnedTensor& plain_weight) -> DBuf {
+    // QWEN38-PER-CHANNEL-GDN keep-quant W8A16 FIRST (the fp8 per-output-column
+    // sibling of the GDN towers). The keep owner is populated INSTEAD of the
+    // bf16 `plain` when the load target runs the Volta W8A16 GEMM
+    // (qwen3_5_dense_weights.cpp keep_fp8w), so the bf16 owner is EMPTY on that
+    // path and this op-route is the only one that can serve the projection.
+    // bf16 out == the fp4-bf16 arm's dtype, which the attention consumers
+    // already accept.
+    if (!fp8w_weight.Empty() &&
+        vt::OpRegistered(vt::OpId::kMatmulFp8W8a16, d.q.device.type)) {
+      VT_CHECK(h.dtype == DType::kBF16,
+               "qwen3_5 fp8 W8A16 full-attn: bf16 activations required (the "
+               "sm70 keep-quant GEMM is a bf16-in/b16-out decode)");
+      VT_CHECK(fp8w_weight.k == h.shape[1],
+               "qwen3_5 fp8 W8A16 full-attn: invalid keep container [n,k] "
+               "(K must match act input dim)");
+Fp8W8a16Dev fw = ResidentFp8W8a16(d, fp8w_weight);
+      DBuf out(d, DType::kBF16,
+               std::vector<int64_t>{h.shape[0], fp8w_weight.n});
+      vt::MatmulFp8W8a16(d.q, out.t(), h, fw.packed, fw.scale);
+      return out;
+    }
     // MODEL-FP8-BLOCK-LINEAR (#1189 M4). FIRST, and exclusive: M3's loader
     // fills the block field and leaves the bf16, per-tensor fp8 and fp4 ones
     // EMPTY (qwen3_5_dense_weights.cpp), so a non-empty block weight IS the
@@ -2638,12 +2698,12 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
     }
     if (fuse_qkv) {
       return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
-                                    fp4_weight, q_out_dt, qkv_sf_sw_p);
+                                   fp4_weight, q_out_dt, qkv_sf_sw_p);
     }
     if (fp8) {
       return h_fp8 != nullptr
                  ? MatmulFp8CutlassPreQuantD(d, *h_fp8, fp8_weight,
-                                              DType::kF32)
+                                             DType::kF32)
                  : MatmulFp8CutlassD(d, h, fp8_weight, DType::kF32);
     }
     if (out.fp4) {
@@ -2658,11 +2718,14 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                            : MatmulF32D(d, h, plain_weight);
   };
   out.q_owner.emplace(
-      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj_fp8_block, w.q_proj));
+      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj_fp8_block, w.q_proj_fp8w,
+              w.q_proj));
   out.k_owner.emplace(
-      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj_fp8_block, w.k_proj));
+      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj_fp8_block, w.k_proj_fp8w,
+              w.k_proj));
   out.v_owner.emplace(
-      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj_fp8_block, w.v_proj));
+      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj_fp8_block, w.v_proj_fp8w,
+              w.v_proj));
   out.qgate = out.q_owner->t();
   out.key = out.k_owner->t();
   out.value = out.v_owner->t();
@@ -3817,20 +3880,6 @@ struct GdnQkvzOutput {
   Tensor mixed;  // [T, conv_dim]; inner-contiguous, row stride may be padded
   Tensor z;      // [T, value_dim]; inner-contiguous, row stride may be padded
 };
-
-// Device-resident keep-quant FP8 W8A16 in_proj operand (the
-// Fp8PerChannelWeight container: raw i8 [N,K] fp8 bytes + f32 [N] per-output-
-// column scale), uploaded ONCE lazily through the shared OwnedTensor resident
-// machinery and reused every forward step — mirrors ResidentNvfp4 /
-// ResidentFp8Qkv exactly.
-struct Fp8W8a16Dev {
-  Tensor packed;  // i8  [N, K]  raw e4m3fn bytes
-  Tensor scale;   // f32 [N]     per-output-column
-};
-
-Fp8W8a16Dev ResidentFp8W8a16(Dev d, const Fp8PerChannelWeight& w) {
-  return Fp8W8a16Dev{ResidentWeight(d, w.packed), ResidentWeight(d, w.scale)};
-}
 
 // GDN out_proj: keep-quant FP8 W8A16 (the sm70 decode arm) when the keep
 // container is populated AND the op is registered, else the existing
