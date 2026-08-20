@@ -643,10 +643,12 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
   return a;
 }
 
-// Dense SwiGLU MLP: gate/up/down all W4A4-quantized -> fp4-resident (§5 6a).
+// Dense SwiGLU MLP: gate/up/down all W4A4-quantized -> fp4-resident (§5 6a),
+// FP8-block, per-channel-FP8 (keep-quant W8A16) or bf16.
 DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
                              const std::string& base,
-                             const Fp8BlockQuantConfig& block) {
+                             const Fp8BlockQuantConfig& block,
+                             bool keep_fp8w = false) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights m;
   if (IsNvfp4Projection(has, mlp + "gate_proj")) {
@@ -666,6 +668,30 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
         get, mlp + "up_proj", block.block_n, block.block_k);
     m.down_proj_fp8_block = dense_loaders::LoadFp8BlockRaw(
         get, mlp + "down_proj", block.block_n, block.block_k);
+  } else if (dense_loaders::IsFp8PerChannelProjection(has, get,
+                                                      mlp + "gate_proj")) {
+    // QWEN38-PER-CHANNEL-GDN: the 3.8-27B-NVFP4 dense-MLP gate/up/down use the
+    // same F8_E4M3 + per-output-channel BF16 [N,1] layout as the GDN/attn
+    // towers. On a device with the W8A16 GEMM the raw bytes are kept (1
+    // B/elem, the same keep_fp8w gate); otherwise the per-column dequant
+    // populates the bf16 owners (the fp8-resident/bf16 default). Without this
+    // branch the per-channel MLP fell through to LoadMergedBf16RawNK and
+    // DIED on the [N,1] BF16 scale.
+    if (keep_fp8w) {
+      m.gate_proj_fp8w = dense_loaders::LoadFp8PerChannelRawNK(
+          get, mlp + "gate_proj");
+      m.up_proj_fp8w = dense_loaders::LoadFp8PerChannelRawNK(
+          get, mlp + "up_proj");
+      m.down_proj_fp8w = dense_loaders::LoadFp8PerChannelRawNK(
+          get, mlp + "down_proj");
+    } else {
+      m.gate_proj = dense_loaders::LoadFp8PerChannelBf16RawNK(
+          get, mlp + "gate_proj");
+      m.up_proj = dense_loaders::LoadFp8PerChannelBf16RawNK(
+          get, mlp + "up_proj");
+      m.down_proj = dense_loaders::LoadFp8PerChannelBf16RawNK(
+          get, mlp + "down_proj");
+    }
   } else {
     m.gate_up_proj = dense_loaders::LoadMergedBf16RawNK(
         get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
@@ -835,7 +861,7 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
   } else {
     VT_CHECK(false, "qwen3_5 dense: unknown layer_type " + layer_type);
   }
-  layer.mlp = LoadDenseMlp(get, has, base, block);
+  layer.mlp = LoadDenseMlp(get, has, base, block, keep_fp8w);
   return layer;
 }
 
@@ -1036,7 +1062,11 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
       tensor.ReleaseHost();
     }
   };
-  const auto release_gdn = [&release](GdnLayerWeights& gdn) {
+  const auto release_fp8w = [&release](Fp8PerChannelWeight& w) {
+    release(w.packed);
+    release(w.scale);
+  };
+  const auto release_gdn = [&release, &release_fp8w](GdnLayerWeights& gdn) {
     release(gdn.in_proj_qkv);
     release(gdn.in_proj_z);
     release(gdn.in_proj_qkvz);
@@ -1048,14 +1078,20 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     release(gdn.dt_bias);
     release(gdn.norm_weight);
     release(gdn.out_proj);
+    release_fp8w(gdn.in_proj_qkvz_fp8w);
+    release_fp8w(gdn.out_proj_fp8w);
   };
-  const auto release_attn = [&release](FullAttnLayerWeights& attn) {
+  const auto release_attn = [&release, &release_fp8w](FullAttnLayerWeights& attn) {
     release(attn.q_proj);
     release(attn.k_proj);
     release(attn.v_proj);
     release(attn.o_proj);
     release(attn.q_norm);
     release(attn.k_norm);
+    release_fp8w(attn.q_proj_fp8w);
+    release_fp8w(attn.k_proj_fp8w);
+    release_fp8w(attn.v_proj_fp8w);
+    release_fp8w(attn.o_proj_fp8w);
   };
 
   release(weights.embed_tokens);
@@ -1072,6 +1108,9 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     release(layer.mlp.up_proj);
     release(layer.mlp.gate_up_proj);
     release(layer.mlp.down_proj);
+    release_fp8w(layer.mlp.gate_proj_fp8w);
+    release_fp8w(layer.mlp.up_proj_fp8w);
+    release_fp8w(layer.mlp.down_proj_fp8w);
   }
   return released;
 }

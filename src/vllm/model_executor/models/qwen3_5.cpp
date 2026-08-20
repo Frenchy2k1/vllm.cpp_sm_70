@@ -7824,7 +7824,39 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // gate/up output bf16 (VT_BF16_GEMM_OUT, rank-1 lever) — matches vLLM bf16 dtype,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
-  const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  // QWEN38-PER-CHANNEL-GDN keep-quant W8A16 (fp8 per-output-column) exclusive
+  // and first — the keep owners are populated INSTEAD of the bf16/nvfp4/block
+  // ones on a device with the Volta GEMM. Raw act [M,K]: gate/up read `dh`
+  // ([T,H]), down reads the silu(gate)*up bf16 `act` ([T,I]); the W8A16 op
+  // wants [M,K] untransposed, so no .t() anywhere in this arm.
+  if (!w.gate_proj_fp8w.Empty() &&
+      vt::OpRegistered(vt::OpId::kMatmulFp8W8a16, d.q.device.type)) {
+    VT_CHECK(dh.dtype == DType::kBF16,
+             "qwen3_5 fp8 W8A16 dense MLP: bf16 activations required (the "
+             "sm70 keep-quant GEMM is a bf16-in/b16-out decode)");
+    const auto keep_gateup = [&](const Fp8PerChannelWeight& gw) -> DBuf {
+      VT_CHECK(gw.k == dh.shape[1],
+               "qwen3_5 fp8 W8A16 dense MLP: gate/up keep container [n,k] "
+               "K must match act input dim");
+      Fp8W8a16Dev fw = ResidentFp8W8a16(d, gw);
+      DBuf o(d, DType::kBF16, std::vector<int64_t>{dh.shape[0], gw.n});
+      vt::MatmulFp8W8a16(d.q, o.t(), dh, fw.packed, fw.scale);
+      return o;
+    };
+    DBuf gate = keep_gateup(w.gate_proj_fp8w);
+    DBuf up = keep_gateup(w.up_proj_fp8w);
+    DBuf act(d, DType::kBF16, {T, I});
+    vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());
+    VT_CHECK(w.down_proj_fp8w.k == act.t().shape[1],
+             "qwen3_5 fp8 W8A16 dense MLP: down keep container [n,k] K must "
+             "match act input dim");
+    Fp8W8a16Dev dw = ResidentFp8W8a16(d, w.down_proj_fp8w);
+    DBuf out(d, DType::kBF16,
+             std::vector<int64_t>{act.t().shape[0], w.down_proj_fp8w.n});
+    vt::MatmulFp8W8a16(d.q, out.t(), act.t(), dw.packed, dw.scale);
+    return out;  // [T,H] bf16
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4). The dense SwiGLU MLP's three
   // projections, exclusive and first. bf16 out on all three -- upstream's
   // `out_dtype` is the model dtype (fp8.py:284) and `vt::MoeSiluMul` is

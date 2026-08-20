@@ -82,6 +82,17 @@ struct DenseMlpWeights {
   // never built. Empty on every non-block owner.
   Fp8BlockMergedResident gate_up_fp8_block_merged;
 
+  // QWEN38-PER-CHANNEL-GDN keep-quant FP8 W8A16 owners: the dense-MLP
+  // gate/up/down projections of Qwen3.8-27B-NVFP4 ship F8_E4M3 +
+  // per-output-channel BF16 scale (the same per-channel layout as the GDN and
+  // full-attn towers), kept raw (1 B/elem) on a device with the Volta W8A16
+  // GEMM via the keep_fp8w gate. Every other platform keeps the bf16
+  // owners / nvfp4 / block fp8 as today. DenseMlpBlock routes them through
+  // vt::MatmulFp8W8a16.
+  Fp8PerChannelWeight gate_proj_fp8w;  // [N=I, K=H]
+  Fp8PerChannelWeight up_proj_fp8w;    // [N=I, K=H]
+  Fp8PerChannelWeight down_proj_fp8w;  // [N=H, K=I]
+
   // CUDA resident for vLLM's MergedColumnParallelLinear gate_up_proj. The
   // checkpoint stores gate/up separately; production concatenates their packed
   // rows and linear block scales once, then keeps only the combined packed
