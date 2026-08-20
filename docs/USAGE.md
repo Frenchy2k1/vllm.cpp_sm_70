@@ -1049,6 +1049,92 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
 Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 `--audio-prompt-embeds` to condition from files instead.
 
+### Where the render spent its wall: `phase-log.json`
+
+Every completed LTX-2.5 render writes **`<workdir>/phase-log.json`** beside the
+frames, on the shipped default and behind no flag, and `ltx2-gen` prints its
+path on the line after `wrote N frames`. An embedder gets the same path from
+`vllm_video_last_phase_log(engine)` (ABI v23) rather than by guessing a filename.
+
+**"Completed" is the whole of it, and it is worth reading literally.** The table
+is written by the success path and by nothing else: the two write sites sit
+immediately before a successful return, and every guard above them throws past
+them. A render that is killed, that a lease governor aborts, that refuses on a
+guard, or that is still running leaves **no `phase-log.json` at all** — not a
+truncated one and not an empty one — and `vllm_video_last_phase_log` returns
+`NULL`. A 2.5-hour render stopped at 2.4 hours tells you nothing about where it
+was. Making a running or killed render legible is
+[#1413](https://github.com/mudler/vllm.cpp/issues/1413), and it is a separate
+lane from this file.
+
+It is a flat, non-overlapping timeline of named phases — the DiT load, the two
+VAE loads, the text tower and the connector, the denoise, the video and audio
+decodes, the frame and WAV writers — each carrying a start and end measured from
+the load, a duration, a **peak host byte** count and a **peak device byte**
+count. These fields say how complete it is, and how far it carries:
+
+| Field | What it means |
+|---|---|
+| `wall_seconds` | from the engine load to the end of this generation |
+| `sum_leaf_seconds` | the named phases, which do not overlap |
+| `unaccounted_seconds` | the difference — time inside no named phase |
+| `sum_rule` | which records the sum adds: `span=false` **and** `nested=false` |
+| `sampler_enabled` | whether the 100 ms sampler ran, or the peaks are boundary-only |
+| `notice` | **NOT A BENCHMARK**, and why — carried in the file rather than in a document a later reader would have to know to look for |
+
+Some phases are **decomposed rather than partitioned**. `denoise` carries one
+`denoise.step` per denoiser evaluation, `decode.video` carries
+`decode.video.chunk` per streamed chunk, `decode.audio` carries
+`decode.audio.mel` and `decode.audio.vocoder`, and a two-stage recipe's
+`phase.prepare` carries `phase.upsample_latent`. Those records are marked
+`nested`, are printed for the reader, and are **excluded from
+`sum_leaf_seconds`** — they are inside a leaf that is already counted, so adding
+them would make `unaccounted_seconds` the residue of double counting instead of
+time nobody named.
+
+A nested record is also what makes a phase NAME checkable. A leaf that claims to
+cover the denoise must enclose its own `denoise.step` records; one that stops
+short of the loop, or that hands the back half of it to a neighbouring name, no
+longer does. The three phases that carry a render each carry such an anchor for
+that reason.
+
+**Do not read a duration here as a measurement of this machine.** Every number
+is wall clock under whatever else the box was doing, which the file does not
+record: on one contended host the same binary at the same geometry has moved
+from 0.147 s to 4.463 s of wall between two runs a minute apart, and the rank of
+its two largest phases has reversed between such runs. The ratio
+`sum_leaf_seconds / wall_seconds` is stable across all of them; the seconds are
+not.
+
+`unaccounted_seconds` is emitted rather than distributed over the phases,
+because a table whose parts do not add up has a phase nobody named, and a
+plausible-looking table is worse than an obviously incomplete one. On a
+completed 64x64/9-frame render it is under 2% of wall.
+
+`peak_device_bytes` is the **driver's** in-use figure through the backend's
+`DeviceMemoryInfo`, and it is `-1` where no probe answers. It is not zero there,
+because a byte count of zero and a byte count nobody took are different facts.
+
+**Today it answers `-1` on CUDA as well as on the CPU**, and that is worth
+knowing before you read a table full of `-1` as a finding: `CudaBackend` does
+not implement `DeviceMemoryInfo`
+([#1126](https://github.com/mudler/vllm.cpp/issues/1126)); ROCm is the only
+backend that does. On a unified-memory board such as GB10 the `peak_host_bytes`
+column is not a poor substitute — host and device are one pool there, and
+`nvidia-smi --query-gpu=memory.used` reports `[N/A]` on that board while
+`--query-compute-apps=used_memory` answers.
+
+Two environment variables, both measurement lanes rather than configuration:
+`VLLM_RENDER_PHASE_LOG_STDERR=1` also prints the table as a fixed-width block —
+including when the file itself cannot be written, which is the case that lane
+exists for — and `VLLM_RENDER_PHASE_SAMPLER=0` stops the 100 ms sampler thread,
+which narrows the per-phase peaks to what the phase boundaries saw and removes
+nothing else.
+
+The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
+staging is minutes paid at the front of every render. A process that loads a
+second engine starts a new timeline, so the table describes the last load.
+
 Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
 binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
 required and is not the default, because omitting it resolves the checkpoint's
@@ -3324,11 +3410,16 @@ something else this port does not.
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 21`,
-`include/vllm.h:273`; **46** exported functions, the count of `^VLLM_API `
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 23`,
+`include/vllm.h:329`; **47** exported functions, the count of `^VLLM_API `
 declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
-This line read `19` and `36` until 2026-08-17; both numbers were last true
-several ABI additions ago, and neither is derived by any gate.
+This line read `19` and `36` until 2026-08-17 and `21`, `273` and `46` until the
+W0 phase log added `vllm_video_last_phase_log`; every one of those numbers was
+last true several ABI additions ago, and none of the three is derived by any
+gate — the version, the line and the count each drift independently, and the
+line number drifts on an edit that adds no ABI at all. The version moved twice
+in one day: `mmproj_path` took v22 and the phase log, written as v22 on its own
+branch, landed as v23.
 
 On native Windows/MSVC, the shared-library packaging lane keeps the runtime DLL
 name at `vllm` and gives the import/static archive the distinct name
@@ -3382,6 +3473,11 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v16 | Absolute KV-cache memory sizing |
 | v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 | v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
+| v19 | Per-modality multimodal input limits |
+| v20 | Speech and music generation through `vllm_speech_*` / `vllm_synthesize` |
+| v21 | Device selection on the speech lane (`vllm_speech_model_params.device`, `vllm_speech_engine_device`) |
+| v22 | A second GGUF for the multimodal projector (`vllm_model_params.mmproj_path`) |
+| v23 | The render phase table: `vllm_video_last_phase_log` names the `phase-log.json` a completed `vllm_video_generate` wrote |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
