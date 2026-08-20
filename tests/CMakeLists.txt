@@ -1258,6 +1258,14 @@ target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_
 # other suite.
 vllm_cpp_add_test(test_expert_stream_device_slot vllm/model_executor/test_expert_stream_device_slot.cpp)
 target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE W0f (#1299): which branch `ResidentWeight` takes on a
+# staging platform whose kernels can dereference host storage. Its own binary for
+# the same reason as its sibling above -- it registers a fake backend and a fake
+# platform in the process-global kXPU slot, which must not leak into any other
+# suite -- and separately because the two disagree about the backend's
+# UnifiedMemory(), which is a process-global registration and not a per-case flag.
+vllm_cpp_add_test(test_resident_weight_host_addressable vllm/model_executor/test_resident_weight_host_addressable.cpp)
+target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime

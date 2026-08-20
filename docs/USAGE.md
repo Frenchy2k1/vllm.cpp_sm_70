@@ -4546,7 +4546,8 @@ VT_MOE_EXPERT_STREAM_SLOTS=4000 \
 ### Which device can serve it
 
 `--device cpu` serves this today, and that is the arm every published number for
-this checkpoint was measured on.
+this checkpoint was measured on. `--device cuda` now decodes it on a probed
+integrated part; see the six limits below before you rely on that.
 
 `--device cuda` refuses at load, by design, when the weights cannot be staged
 into device memory (issue
@@ -4560,7 +4561,19 @@ staged at all — their slices are read from the host slot store in place — so
 what has to fit is the NON-expert remainder plus the slot arena rather than the
 whole file.
 
-Four limits, stated plainly rather than left to be discovered.
+The lane alone was not enough to produce a token. With it on, the checkpoint
+loaded on `--device cuda` and then exhausted the machine inside its first
+forward — zero decode steps, seven attempts, every one identical (issue
+[#1299](https://github.com/mudler/vllm.cpp/issues/1299)) — because the DENSE
+weights were resident twice: once as the host buffer and once as the device
+staging copy, which on a part where device memory IS host memory comes out of the
+same RAM. `VT_QWEN35_ALIAS_HOST_WEIGHTS` (default **on**, `docs/ENVIRONMENT.md`)
+removes the second copy by handing the kernels the host bytes directly, and it is
+what makes the CUDA arm decode at all. Set it to `0` for the same-binary A/B back
+to the staging behaviour.
+
+**It now decodes: 32/32 steps, at peak RSS 97.75 GiB of a 119.631 GiB box.**
+Six limits, stated plainly rather than left to be discovered.
 
 * **The device has to be probed capable, and most are not.** The condition is
   `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
@@ -4597,23 +4610,34 @@ Four limits, stated plainly rather than left to be discovered.
   file, against the residency this process resolved, and a file that mixes a kept
   tower with a staged one keeps the whole bound as well (issue
   [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
-* **The load now succeeds and the generation does not, so there is still no
-  speed claim.** The measurement ran on the one machine that answers true
-  (GB10, 2026-08-18) and it split: `--device cuda` loads this checkpoint in
-  255-272 s, which it could not do before, and then exhausts the machine inside
-  its first forward without emitting a token
-  ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)). The slot arena is
-  measurably not the cause — a 64-slot 0.15 GiB arena fails exactly where an
-  8000-slot 18.55 GiB one does — so raising or lowering
-  `VT_MOE_EXPERT_STREAM_SLOTS` will not get you a token. **Use `--device cpu`
-  for this checkpoint today.** That arm serves it at a steady **11.05 s/token
-  at 4000 slots**, which is the count both recipes in this section set and the
-  only count that figure holds for. The same binary at 8000 slots measured a
-  39.98-45.40 s/token median over two runs, and the second of them consumed all
-  30,625 MiB of the box's swap, so **more slots is not a free knob here**: the
-  extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
-  mapping is served out of. Read `docs/BENCHMARKS.md` before assuming the GPU is
-  the faster arm here.
+* **The correctness gate does NOT pass.** The 32 ids match the CPU arm for six
+  tokens and diverge at the seventh. Both continuations are coherent, and the
+  margins around it are measured and small: at that step the CPU arm's own
+  second-ranked token is exactly the one the CUDA arm emitted, behind by 1.4% of
+  the winning logit, and one step later the margin is 0.1%. **What CAUSES the
+  divergence is NOT identified.** The host-weight alias is EXCLUDED, measured ON
+  GB10 — same shapes, same algorithm, bit-identical output from a `cudaMalloc`
+  operand and from a 256-aligned host one — but excluding one cause is not
+  identifying another, and that the two arms simply run different GEMM kernels
+  over a near-tie is a standing hypothesis rather than a reading. Treat the CUDA
+  arm as unverified against the CPU arm until that gate is settled, and **use
+  `--device cpu` for this checkpoint today**: it is the arm every published
+  number here was measured on.
+* **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
+  `VOID`, because a speed number behind a failing correctness gate is not a
+  result. The CPU arm serves this checkpoint at a steady **11.05 s/token at 4000
+  slots**, which is the count both recipes in this section set and the only count
+  that figure holds for. Device access to host-resident weights on that part also has
+  a recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
+  way, so a CUDA arm slower than the CPU arm remains a real possible outcome.
+* **More slots is not a free knob, and the reason is the page cache rather than
+  the arena.** The same binary at 8000 slots measured a 39.98-45.40 s/token
+  median over two runs, and the second consumed all 30,625 MiB of the box's swap:
+  the extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
+  mapping is served out of. The arena is also measurably not what exhausted the
+  box in [#1299](https://github.com/mudler/vllm.cpp/issues/1299) — a 64-slot
+  0.15 GiB arena failed exactly where an 8000-slot 18.55 GiB one did — so this
+  knob was never the lever there either.
 
 ### The same thing as config, and which one wins
 
