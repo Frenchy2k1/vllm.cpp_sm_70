@@ -5206,12 +5206,13 @@ config document: `VT_GGUF_PREFAULT=0`, `VT_MOE_EXPERT_STREAM=1` and
 `VT_MOE_EXPERT_STREAM_SLOTS=4000`. The two forms are the same switches, and a
 variable beats a config field wherever both are set.
 
-They also ran a different binary. Every figure below comes from
+They also ran a different binary. Every W0e and W0f figure below comes from
 `benchmarks/expert_stream_device_w0e.cpp`, a purpose-built C ABI client that
 reports the token ids, a per-step timestamp and the expert-stream counters
-together, which no shipped command does. The command above starts `vllm-server`
-over the same engine. At seconds per token, the server's HTTP and SSE framing
-sits far below the run-to-run spread recorded below.
+together, which no shipped command does. The 16 August 2026 run is the one
+exception: it served through `vllm-server`, as the command above does. At
+seconds per token, the server's HTTP and SSE framing sits far below the
+run-to-run spread recorded below.
 
 ### What the load costs
 
