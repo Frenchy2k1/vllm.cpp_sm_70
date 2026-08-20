@@ -143,11 +143,13 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
 
   // BACKEND-DISTRIBUTED-TP TP-W2 (runner attach): `input.tp` is the per-rank
   // tensor-parallel group the runner attached (non-null ONLY when tp_size>1).
-  // Every route below ends in a tp-aware dense entry point (qwen3_5.cpp), so
-  // hand it through: tp<=1 (null) keeps each step byte-identical, and a tp>1
-  // group reaches the entry points' honest "not yet landed" refusal (never a
-  // silent tp1 run). The decode-graph branch must NOT serve tp>1 either — it
-  // would capture tp1 math — so it is additionally gated on tp==null.
+  // Every eager route below ends in a tp-aware dense entry point (qwen3_5.cpp)
+  // that threads it into the PROVEN per-layer sharded traversal, so hand it
+  // through: tp<=1 (null) keeps each step byte-identical, and a tp>1 group runs
+  // the per-rank sharded dense forward ON-device (exit-all-reduced, token-equal
+  // to tp1; verified by the 27B tp==tp1 gate). The decode-graph branch must NOT
+  // serve tp>1 — a capture would record tp1 math — so it is additionally gated
+  // on tp==null; its eager fallback is the tp1 path (unreachable at tp>1).
   const vllm::TensorParallel* tp = input.tp;
 
   // SPEC-MTP I5d-pre hidden-state tap. When the spec verify forward requests the

@@ -9318,6 +9318,10 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
 // thread never disturbs the persistent embedding. All per-step-varying inputs are
 // read from HOST vector args (positions / metadata), whose host->device copies
 // are capturable on GB10; the driver keeps them persistent + mutates in place.
+// BACKEND-DISTRIBUTED-TP TP-W3: a non-null `tp` routes into the PROVEN per-layer
+// sharded traversal (RunDenseLayerPaged → DenseMlpBlock / FullAttnBlockPaged, the
+// same blocks the 27B dense tp==tp1 gate runs); the graph caller always passes
+// nullptr (its capture gate refuses tp>1), so capture/replay stays tp1 math.
 // Every per-call scratch is pool-backed (DevicePool) or resident/StreamScratch-
 // pooled (the cutlass/emulation fp4 GEMMs, cublas lm_head) so a cold pre-warm at
 // this size makes the capture region do ZERO cudaMalloc.
@@ -9334,7 +9338,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const std::vector<float>* mrope_cos_sin = nullptr,
                                const std::vector<int32_t>* aux_layer_ids = nullptr,
                                const Tensor* aux_out = nullptr,
-                               StepDevInputs* persistent_sdi = nullptr) {
+                               StepDevInputs* persistent_sdi = nullptr,
+                               const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -9400,7 +9405,7 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
-                       gdn_meta, kv, gs, T);
+                       gdn_meta, kv, gs, T, tp);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -9460,6 +9465,9 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 // dense-graph driver's eager fallback / cold-shape pre-warm step (one contiguous
 // stream, no capture). Returns [n_out,vocab] f32 (n_out == num_reqs when gathered,
 // else T). Shared op sequence with the graph so eager output == replay output.
+// TP-W3: a non-null `tp` is handed to DenseForwardLayers (→ the per-layer sharded
+// blocks); the graph driver's eager fallback passes nullptr (only reachable at
+// tp==null), so its op sequence is unchanged.
 static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const std::vector<int32_t>& positions,
                              const CommonAttentionMetadata& attn_meta,
@@ -9471,7 +9479,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const std::vector<int32_t>& logits_indices,
                              const Tensor* hidden_tap = nullptr,
                              const std::vector<int32_t>* aux_layer_ids = nullptr,
-                             const Tensor* aux_out = nullptr) {
+                             const Tensor* aux_out = nullptr,
+                             const vllm::TensorParallel* tp = nullptr) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -9480,7 +9489,7 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
-                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
+                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out, tp);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
@@ -9489,16 +9498,20 @@ std::vector<float> Qwen3_5DenseModel::Forward(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
-  (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  // BACKEND-DISTRIBUTED-TP TP-W3: a tp>1 group routes into the PROVEN per-layer
+  // sharded traversal — the same `tp` the DenseMlpBlock / FullAttnBlockPaged
+  // paged blocks already consume (exit-all-reduced: every rank computes the full
+  // [n_out,vocab], lm_head stays full-width, results token-identical to tp1).
+  // tp==null (the tp1 runner) takes the identical op sequence as before; the
+  // sharded blocks throw their own specific NCCL message without VT_NCCL.
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
-                                  logits_indices);
+                                  logits_indices, /*hidden_tap=*/nullptr,
+                                  /*aux_layer_ids=*/nullptr,
+                                  /*aux_out=*/nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -10033,16 +10046,17 @@ ForwardLogits Qwen3_5DenseModel::ForwardDevice(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
-  (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  // TP-W3: a tp>1 group routes into the proven per-layer sharded traversal (the
+  // same `tp` DenseMlpBlock / FullAttnBlockPaged consume); tp==null is the
+  // byte-identical tp1 op sequence. See Forward above.
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
-                                  logits_indices);
+                                  logits_indices, /*hidden_tap=*/nullptr,
+                                  /*aux_layer_ids=*/nullptr,
+                                  /*aux_out=*/nullptr, tp);
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
@@ -10053,12 +10067,10 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
     Qwen3_5MTPHiddenStates* hidden_out,
-    const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
-  (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
+    const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) {
+  // TP-W3: a tp>1 group routes into the proven per-layer sharded traversal; the
+  // hidden tap is the full-width exit-all-reduced stream, identical on every
+  // rank. tp==null is the byte-identical tp1 op sequence. See Forward above.
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
@@ -10066,7 +10078,9 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
   const Tensor tap_view = tap.t();
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
-                                  logits_indices, &tap_view);
+                                  logits_indices, &tap_view,
+                                  /*aux_layer_ids=*/nullptr,
+                                  /*aux_out=*/nullptr, tp);
   if (hidden_out != nullptr) {
     hidden_out->tensor = tap.t();
     hidden_out->storage = tap.ReleaseShared();
@@ -10080,18 +10094,17 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceMultiTap(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-    Qwen3_5AuxTaps* aux_out, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
-  (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
+    Qwen3_5AuxTaps* aux_out, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  // TP-W3: a tp>1 group routes into the proven per-layer sharded traversal; the
+  // aux taps are the full-width exit-all-reduced streams, identical on every
+  // rank. tp==null is the byte-identical tp1 op sequence. See Forward above.
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   if (aux_out == nullptr) {
     return ForwardDevice(token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                         gdn_state, weights, config, queue, logits_indices);
+                         gdn_state, weights, config, queue, logits_indices, tp);
   }
   ValidateAuxTapLayerIds(aux_out->layer_ids, config.num_hidden_layers);
   const int64_t taps = static_cast<int64_t>(aux_out->layer_ids.size());
@@ -10100,7 +10113,7 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceMultiTap(
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
                                   logits_indices, /*hidden_tap=*/nullptr,
-                                  &aux_out->layer_ids, &aux_view);
+                                  &aux_out->layer_ids, &aux_view, tp);
   aux_out->tensor = aux.t();
   aux_out->storage = aux.ReleaseShared();
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
