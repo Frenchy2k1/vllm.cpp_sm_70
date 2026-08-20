@@ -1702,12 +1702,12 @@ extern "C" int vt_sm70_nvfp4_microbench(void) {
       {"mlp_gate_up_proj",         17408, 5120},
       {"mlp_down_proj",            5120, 8704},
   };
-  static const int m_bands[] = {1, 2, 4, 8};
+  static const int m_bands[] = {1, 2, 4, 8, 12, 16};
 
   uint64_t s = 0xabcd;
   auto rnd = [&]() -> uint32_t { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; };
   auto f2h = [](float f) -> __half { return __float2half_rn(f); };
-  const int max_m = 8, max_k = 17408;
+  const int max_m = 16, max_k = 17408;
 
   cudaStream_t st = 0;
   Sm70Nvfp4W4a16Args args{};
