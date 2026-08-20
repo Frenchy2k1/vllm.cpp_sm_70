@@ -192,6 +192,12 @@ wall drops from the **5139 s (85.7 min) marker-span baseline to 2935 s (49
 min)**; dense tp==tp1 gate green (112 s) — no regression. The token-exact
 levers are confirmed: the f32 values feeding the kernel are unchanged, only
 their host-thread scheduling is.
+**Mutation proof + sweep (2026-08-20, GPUs 2,3):** value-corrupting mutation
+at the paged tp>1 GQA call site (`oh[0]+=1000`) → gate RED (token 2+ diverges,
+EXIT=1); guard-disabling is vacuous (fall-through is correct when the paged
+cache is replicated per rank) → recorded, not run; restored byte-for-byte
+(blob-verified), rebuilt, gate GREEN (known 9 tokens). Sweep: fa2 5/5,
+cuda_backend 7/7, nccl 16/16, paged green, dense tp==tp1 green (112 s).
 
 
 ## Working agreements / do-not-break

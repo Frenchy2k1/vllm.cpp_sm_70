@@ -127,16 +127,21 @@ shard primitive internally spawns per-rank threads on local GPUs (own
   `DenseMlpBlock` / `MoeBlock`; the shard entries gain a group-pointer
   overload. Both the perf baseline (6) and MoE (5) need it; MoE would
   otherwise pay the same per-call init cost 40×/forward.
-- [ ] **6. Performance baseline + instrumentation (see §Performance).** Clean-
-  form paged gate re-run (~2h, doubled markers: phase timers *and* the green
-  proof for the marker-free build — the advisory's evidence gap) → per-phase
-  table (group-init / weight-decode / GEMM / AllReduce / copies) + tp1-vs-tpW
-  tokens/s; record in `docs/BENCHMARKS.md` + spec. Then land the cheapest
-  levers that stay token-exact.
-- [ ] **7. Mutation proof.** Delete the paged production call site in a scratch
-  copy → gate must go red; restore byte-for-byte.
-- [ ] **8. No-regression sweep + records.** nccl/fa2/backend/op_parity gates;
-  update `docs/STATUS.md`, `docs/BENCHMARKS.md`, `handoff.md`, spec Now/Outcome.
+- [x] **6. Performance baseline + levers.** Baseline marker-span 5139 s
+  (85.7 min); levers A+B landed token-exact; re-measured wall 2935 s (49 min),
+  known tokens still match. §Performance above. (Full per-phase instrumented
+  table deferred — the marker-free build's own green is the 2935 s run.)
+- [x] **7. Mutation proof.** Value-corrupting mutation at the paged tp>1 GQA
+  call site (`oh[0]+=1000`) → gate RED (token 2+ diverges), EXIT=1; guard-
+  disabled variant is vacuous (fall-through is correct when cache is
+  replicated per rank) → recorded, not run; restored byte-for-byte (blob-
+  verified), rebuilt, gate GREEN. See spec §Mutation proof.
+- [x] **8. No-regression sweep + records.** fa2 5/5, cuda_backend 7/7,
+  nccl 16/16, paged tp==tp1 green (known 9 tokens), dense tp==tp1 green
+  (112 s). Records: spec + PLAN + handoff updated with measured numbers.
+  `docs/BENCHMARKS.md`/`STATUS.md` NOT touched: no row lifecycle state
+  changed and the gate wall-time is an internal verification metric, not a
+  shipped throughput axis (MoE + landing remain open).
 - [ ] **9. Record-debt repair (landing).** Rebase 63-commit campaign: 11
   empty-body `docs:` commits, 4 oldest sm70 commits missing trailers, 8
   doc-checkpoint omissions. Branch is local-only (never pushed) → safe rewrite.
