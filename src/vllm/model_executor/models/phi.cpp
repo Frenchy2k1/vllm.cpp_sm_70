@@ -74,7 +74,8 @@ DBuf BiasedProj(Dev d, const OwnedTensor& weight, const OwnedTensor& bias,
 // Phi NON-gated GELU MLP (phi.py::PhiMLP): fc1 (+bias) -> gelu_new -> fc2 (+bias).
 // `dhn` is the input-LayerNormed hidden [T,H] bf16 (the SAME norm attention reads).
 DBuf PhiMlpBlock(Dev d, const PhiMlpWeights& w, int64_t ffn, int64_t H,
-                 const Tensor& dhn, int64_t T) {
+                 const Tensor& dhn, int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   DBuf h = BiasedProj(d, w.fc1, w.fc1_bias, dhn, T, ffn);
   vt::GeluTanh(d.q, h.t(), h.t());  // gelu_new (NewGELU tanh-approx), in place
   return BiasedProj(d, w.fc2, w.fc2_bias, h.t(), T, H);
@@ -87,7 +88,8 @@ DBuf PhiMlpBlock(Dev d, const PhiMlpWeights& w, int64_t ffn, int64_t H,
 DBuf PhiAttnBlock(Dev d, const PhiAttnWeights& w, const Tensor& rope_cache,
                   const HfConfig& cfg, const Tensor& dhn, const StepInputs& si,
                   const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                  int64_t T) {
+                  int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -150,7 +152,7 @@ DBuf PhiAttnBlock(Dev d, const PhiAttnWeights& w, const Tensor& rope_cache,
 void RunLayer(Dev d, const PhiLayerWeights& layer, const Tensor& rope_cache,
               const HfConfig& cfg, float eps, int64_t ffn, DBuf& hidden,
               const StepInputs& si, const CommonAttentionMetadata& meta,
-              const PagedKvCache& kv, int64_t T) {
+              const PagedKvCache& kv, int64_t T, const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
 
   // ONE input LayerNorm (weight+bias) -> feeds BOTH attn and MLP.
@@ -158,8 +160,8 @@ void RunLayer(Dev d, const PhiLayerWeights& layer, const Tensor& rope_cache,
   LayerNormInto(d, normed, hidden.t(), layer.input_layernorm,
                 layer.input_layernorm_bias, eps, H);
 
-  DBuf attn = PhiAttnBlock(d, layer.attn, rope_cache, cfg, normed.t(), si, meta, kv, T);
-  DBuf mlp = PhiMlpBlock(d, layer.mlp, ffn, H, normed.t(), T);
+  DBuf attn = PhiAttnBlock(d, layer.attn, rope_cache, cfg, normed.t(), si, meta, kv, T, tp);
+  DBuf mlp = PhiMlpBlock(d, layer.mlp, ffn, H, normed.t(), T, tp);
 
   // Parallel re-join: hidden = residual + attn + mlp (phi.py:201).
   vt::Add(d.q, hidden.t(), hidden.t(), attn.t());
@@ -180,7 +182,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv, const PhiWeights& weights,
                  const HfConfig& config, float eps, int64_t ffn,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -202,7 +205,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], rope_cache, config, eps, ffn,
-             hidden, si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             hidden, si, attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   DBuf dnorm(d, DType::kBF16, {T, H});
   LayerNormInto(d, dnorm, hidden.t(), weights.final_norm, weights.final_norm_bias,
@@ -250,12 +253,12 @@ std::vector<float> PhiModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const PhiWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = PhiLayerNormEps(config);
   const int64_t ffn = PhiFfnDim(config);
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, eps, ffn, logits_indices);
+                             config, eps, ffn, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -266,12 +269,12 @@ ForwardLogits PhiModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const PhiWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = PhiLayerNormEps(config);
   const int64_t ffn = PhiFfnDim(config);
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, eps, ffn, logits_indices);
+                             config, eps, ffn, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

@@ -619,6 +619,7 @@ struct MoeBlockWeights {
   ResidentSlot resident_fused;   // MoeFusedResident   (fp4 fused)
   ResidentSlot resident_bf16;    // MoeBf16Resident    (bf16 fast)
   ResidentSlot resident_marlin;  // MoeMarlinResident  (Marlin grouped)
+  ResidentSlot resident_tp_host; // MoeTpHostResident (tp>1 host f32 decode; ONE live layer at a time)
 };
 
 // One decoder layer: input/post norms + one attention variant + the MoE block.

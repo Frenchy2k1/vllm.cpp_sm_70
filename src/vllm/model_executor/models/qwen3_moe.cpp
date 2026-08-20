@@ -69,7 +69,7 @@ using namespace dense_attn;
 void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
                  Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
                  const StepInputs& si, const CommonAttentionMetadata& meta,
-                 const PagedKvCache& kv, int64_t T) {
+                 const PagedKvCache& kv, int64_t T, const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -81,7 +81,7 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
     vt::RmsNorm(d.q, dhn.t(), hidden, w_in, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
-  DBuf attn = AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T);
+  DBuf attn = AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T, tp);
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
@@ -94,7 +94,7 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
   // Sparse-MoE block (router + top-k experts, NO shared expert — guarded on
   // shared_expert_intermediate_size==0 inside MoeBlock). RunMoeBlock returns an
   // owning device [T,H] bf16 buffer; it becomes the new residual-stream delta.
-  MoeBlockOutput moe = RunMoeBlock(d.q, layer.moe, cfg, dh2.t(), T);
+  MoeBlockOutput moe = RunMoeBlock(d.q, layer.moe, cfg, dh2.t(), T, tp);
   hidden = moe.tensor;
   hidden_hold = std::move(moe.storage);
 }
@@ -171,7 +171,8 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const CommonAttentionMetadata& attn_meta,
                    const std::vector<PagedKvCache>& attn_kv,
                    const Qwen3MoeWeights& weights, const HfConfig& config,
-                   const std::vector<int32_t>& logits_indices) {
+                   const std::vector<int32_t>& logits_indices,
+                   const TensorParallel* tp = nullptr) {
   // ONE decode step, for the same reason the Qwen3.5 layer driver marks one:
   // this model composes the SAME MoE block (RunMoeBlock), so its experts reach
   // the same slot cache, and a cache whose step never ends protects every entry
@@ -199,7 +200,7 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunMoeLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden,
-                hidden_hold, res, si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+                hidden_hold, res, si, attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // Final RMSNorm over the fused stream (res += hidden; std norm), then lm_head.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -244,12 +245,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Qwen3MoeWeights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   DBuf hidden(d, DType::kBF16, {T, config.hidden_size});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, attn_kv, weights,
-                       config, logits_indices);
+                       config, logits_indices, tp);
 }
 
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -343,10 +345,10 @@ std::vector<float> Qwen3MoeModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Qwen3MoeWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -357,10 +359,10 @@ ForwardLogits Qwen3MoeModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Qwen3MoeWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

@@ -114,7 +114,9 @@ DBuf BiasedProj(Dev d, const OwnedTensor& weight, const OwnedTensor& bias,
 // merged qkv is exactly [3*H, H] and q/k/v are three equal H-wide slices.
 DBuf OPTAttnBlock(Dev d, const OPTAttnWeights& w, const HfConfig& cfg, const Tensor& dhn,
                   const OPTStepInputs& si, const CommonAttentionMetadata& meta,
-                  const PagedKvCache& kv, int64_t T) {
+                  const PagedKvCache& kv, int64_t T,
+                  const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -159,7 +161,9 @@ DBuf OPTAttnBlock(Dev d, const OPTAttnWeights& w, const HfConfig& cfg, const Ten
 
 // OPT's plain MLP (opt.py:188-190): fc1 + bias -> ReLU -> fc2 + bias. No gating.
 DBuf OPTMlpBlock(Dev d, const OPTMlpWeights& w, const OPTConfigExtras& extras,
-                 const HfConfig& cfg, const Tensor& dhn, int64_t T) {
+                 const HfConfig& cfg, const Tensor& dhn, int64_t T,
+                 const TensorParallel* tp = nullptr) {
+  (void)tp;
   DBuf h = BiasedProj(d, w.fc1, w.fc1_bias, dhn, T, extras.ffn_dim);
   vt::Relu(d.q, h.t(), h.t());  // in place
   return BiasedProj(d, w.fc2, w.fc2_bias, h.t(), T, cfg.hidden_size);
@@ -186,7 +190,8 @@ void LayerNormInto(Dev d, DBuf& out, const Tensor& x, const OwnedTensor& weight,
 // does), so there is no `res` DBuf to maintain across layers.
 void RunLayer(Dev d, const OPTLayerWeights& layer, const OPTConfigExtras& extras,
               const HfConfig& cfg, DBuf& hidden, const OPTStepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
 
   // ---- self attention ------------------------------------------------------
@@ -198,7 +203,7 @@ void RunLayer(Dev d, const OPTLayerWeights& layer, const OPTConfigExtras& extras
     // POST-LN (350m): attention consumes the RAW residual stream.
     d.b.Copy(d.q, normed.ptr(), hidden.ptr(), hidden.bytes());
   }
-  DBuf attn = OPTAttnBlock(d, layer.attn, cfg, normed.t(), si, meta, kv, T);
+  DBuf attn = OPTAttnBlock(d, layer.attn, cfg, normed.t(), si, meta, kv, T, tp);
   vt::Add(d.q, attn.t(), attn.t(), hidden.t());  // residual + hidden_states
   if (extras.do_layer_norm_before) {
     hidden = std::move(attn);
@@ -215,7 +220,7 @@ void RunLayer(Dev d, const OPTLayerWeights& layer, const OPTConfigExtras& extras
   } else {
     d.b.Copy(d.q, normed2.ptr(), hidden.ptr(), hidden.bytes());
   }
-  DBuf mlp = OPTMlpBlock(d, layer.mlp, extras, cfg, normed2.t(), T);
+  DBuf mlp = OPTMlpBlock(d, layer.mlp, extras, cfg, normed2.t(), T, tp);
   vt::Add(d.q, mlp.t(), mlp.t(), hidden.t());
   if (extras.do_layer_norm_before) {
     hidden = std::move(mlp);
@@ -242,7 +247,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv, const OPTWeights& weights,
-                 const HfConfig& config, const std::vector<int32_t>& logits_indices) {
+                 const HfConfig& config, const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -273,7 +279,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], extras, config, hidden, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // Decoder-level final LayerNorm (present only under the pre-LN placement
   // without _remove_final_layer_norm — opt.py:289-290).
@@ -331,10 +337,10 @@ std::vector<float> OPTModel::Forward(const std::vector<int32_t>& token_ids,
                                      const std::vector<PagedKvCache>& attn_kv,
                                      const OPTWeights& weights, const HfConfig& config,
                                      vt::Queue& queue,
-                                     const std::vector<int32_t>& logits_indices) {
+                                     const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -347,10 +353,10 @@ ForwardLogits OPTModel::ForwardDevice(const std::vector<int32_t>& token_ids,
                                       const std::vector<PagedKvCache>& attn_kv,
                                       const OPTWeights& weights, const HfConfig& config,
                                       vt::Queue& queue,
-                                      const std::vector<int32_t>& logits_indices) {
+                                      const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, config.vocab_size);
 }

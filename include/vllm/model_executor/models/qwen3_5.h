@@ -32,6 +32,7 @@
 //  see the struct below.)
 
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/tensor_parallel.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -238,7 +239,8 @@ class Qwen3_5Model {
   static std::vector<float> ForwardDense(const std::vector<int32_t>& token_ids,
                                          const std::vector<int32_t>& positions,
                                          const Qwen3_5MoeWeights& weights,
-                                         const HfConfig& config, vt::Queue& queue);
+                                         const HfConfig& config, vt::Queue& queue,
+                                         const vllm::TensorParallel* tp = nullptr);
 
   // Eager (load-time) Marlin NVFP4 repack of every layer's routed experts +
   // dense shared-expert/lm_head projections, so the first request pays no

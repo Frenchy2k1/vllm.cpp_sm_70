@@ -516,13 +516,15 @@ class KimiLinearModel {
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // W7 — the REAL DBuf-resident device COMPUTE forward. Composes the whole
   // 27-layer KDA/NoPE-MLA + 256-expert-MoE hybrid over POOLED f32 DBufs through
@@ -538,7 +540,8 @@ class KimiLinearModel {
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // ─── PAGED-INCREMENTAL DECODE (§18 lever e) ──────────────────────────────────
   // The paged-incremental twin of ForwardDeviceCompute: instead of re-running the
@@ -557,7 +560,8 @@ class KimiLinearModel {
   static ForwardLogits ForwardPrefillIncremental(
       const std::vector<int32_t>& prompt, const std::vector<int32_t>& positions,
       const KimiLinearWeights& weights, vt::Queue& queue, KimiDecodeCache& cache,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // ForwardDecodeStepIncremental: advances ONE token from the carried `cache` — the
   // KDA layers via the recurrence (vt::KdaGatedDeltaRule, T==1) from the carried
@@ -566,7 +570,8 @@ class KimiLinearModel {
   // [1,vocab] logits of the new token. `cache.seq_len` advances by one.
   static ForwardLogits ForwardDecodeStepIncremental(
       int32_t token, int64_t position, const KimiLinearWeights& weights,
-      vt::Queue& queue, KimiDecodeCache& cache);
+      vt::Queue& queue, KimiDecodeCache& cache,
+      const vllm::TensorParallel* tp = nullptr);
 
   // ─── ROW 7 — THE SHARED-PAGED-RUNNER FOLD (§20.3, ARCH-ONE-SURFACE req 4) ────
   // The born-on-the-runner PRODUCTION forward: the whole 27-layer hybrid over the
@@ -584,7 +589,8 @@ class KimiLinearModel {
   // reference. Returns DEVICE-RESIDENT [rows,vocab] logits for the on-GPU
   // sampler (the third MUST-route seam).
   static ForwardLogits ForwardPaged(const ModelForwardInput& input,
-                                    const KimiLinearWeights& weights);
+                                    const KimiLinearWeights& weights,
+                                    const vllm::TensorParallel* tp = nullptr);
 };
 
 // KV-cache spec builder. The HETEROGENEOUS per-layer topology (spike §3): ONE MLA

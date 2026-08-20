@@ -102,7 +102,8 @@ ForwardLogits KimiLinearModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   // §13: the FULL model loads bf16-resident (host f32 would OOM the 119 GiB pool), so
   // the resident path drops the host.materialized precondition and ALWAYS routes to
   // the bf16 device COMPUTE (there are no host f32 weights to compose off).
@@ -117,7 +118,7 @@ ForwardLogits KimiLinearModel::ForwardDevice(
   if (resident || KimiDeviceComputeEnabled()) {
     return KimiLinearModel::ForwardDeviceCompute(token_ids, positions, attn_meta,
                                                  attn_kv, weights, queue,
-                                                 logits_indices);
+                                                 logits_indices, tp);
   }
 
   // Compose the [rows,vocab] f32 logits via the landed CPU reference (the whole
@@ -127,7 +128,8 @@ ForwardLogits KimiLinearModel::ForwardDevice(
   // paged caches the W7 device compute consumes; the reference manages its own
   // fresh single-sequence context, so they are unused on this seam.
   std::vector<float> flat = KimiLinearModel::Forward(
-      token_ids, positions, attn_meta, attn_kv, weights, queue, logits_indices);
+      token_ids, positions, attn_meta, attn_kv, weights, queue, logits_indices,
+      tp);
 
   const int64_t vocab = weights.params.vocab_size;
   const int64_t rows = vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;

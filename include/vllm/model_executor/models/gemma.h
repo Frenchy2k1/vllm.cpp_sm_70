@@ -84,14 +84,16 @@ class GemmaModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const GemmaWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const GemmaWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 };
 
 void ParseGemmaForCausalLMConfig(const HfConfig& config);

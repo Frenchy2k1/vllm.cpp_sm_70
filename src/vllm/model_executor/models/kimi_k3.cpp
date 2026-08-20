@@ -55,7 +55,9 @@ std::vector<float> KimiK3Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiK3Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  (void)tp;  // REFUSE-by-name skeleton: no forward body to thread tp into
   (void)token_ids;
   (void)positions;
   (void)attn_meta;
@@ -71,7 +73,9 @@ ForwardLogits KimiK3Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiK3Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  (void)tp;  // REFUSE-by-name skeleton: no forward body to thread tp into
   (void)token_ids;
   (void)positions;
   (void)attn_meta;

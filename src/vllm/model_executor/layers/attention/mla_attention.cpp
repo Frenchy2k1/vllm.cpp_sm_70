@@ -270,7 +270,8 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                               const Tensor& hidden, const Tensor& positions,
                               Tensor& kv_cache, const Tensor& slot_mapping,
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
-                              Tensor& out) {
+                              Tensor& out, const vllm::TensorParallel* tp) {
+  (void)tp;  // W2: parameter-only seam; sharded KV panic/shard math lands later.
   dims.Validate();
   const int64_t T = hidden.shape[0];
   const int64_t H = dims.hidden_size, N = dims.num_heads;

@@ -1338,7 +1338,9 @@ std::vector<float> LagunaModel::Forward(
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const LagunaWeights& weights,
     const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  (void)tp;
   (void)attn_meta;
   (void)attn_kv;   // reference forward recomputes attention (paged path = W4)
   (void)config;
@@ -1547,12 +1549,13 @@ ForwardLogits LagunaModel::ForwardDevice(
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const LagunaWeights& weights,
     const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   // The device path reuses the host reference until the W4 device assembly lands
   // (mirrors ds4's ForwardDevice-after-Forward staging).
   return HostLogits(
       LagunaModel::Forward(token_ids, positions, attn_meta, attn_kv, weights,
-                           config, queue, logits_indices),
+                           config, queue, logits_indices, tp),
       weights.params.vocab_size);
 }
 

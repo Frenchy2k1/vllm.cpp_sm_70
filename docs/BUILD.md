@@ -90,12 +90,18 @@ cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=90a \
 # Ampere consumer (RTX 3090 = 86), Ada (89), Jetson Orin (87)
 cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=86 \
   -DVLLM_CPP_CUTLASS_FETCH=ON
+
+# Volta (Tesla V100, sm_70): portable kernels only, needs nvcc < 13
+cmake -S . -B build-cuda-sm70 -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=70 -DVLLM_CPP_TRITON=OFF
 ```
 
 Of these, only `sm_87` (Orin) and `sm_110` (Thor) have been run on real
 hardware. `sm_80/86/89`, `sm_90a` and `sm_100a/103a` are build-verified: they
 compile `-Werror`-clean and emit the expected SASS, but no board here has
-executed them. See [STATUS.md](STATUS.md) for what that label means and
+executed them. `sm_70` (Volta) is build-verified by the `cuda-sm70-build` CI
+lane (CUDA 12.9.1) with portable kernels only, and is not runtime-proven.
+See [STATUS.md](STATUS.md) for what that label means and
 `.agents/specs/cuda-arch-ampere-fastpath.md` for the per-arch detail. Reports
 from those boards are welcome.
 
@@ -221,7 +227,7 @@ defaults.
 | Option | Default | Purpose |
 |---|---|---|
 | `VLLM_CPP_CUDA` | `AUTO` | Build the CUDA backend: `ON`, `OFF`, or `AUTO` (on when a CUDA toolchain is found) |
-| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
+| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`, plus `70` (Volta/V100 — portable kernels only, requires nvcc < 13). The `a` suffix is required for the native fp4 MMA |
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed |
 | `VLLM_CPP_TENSTORRENT` | `AUTO` (= `OFF`) | Build the Tenstorrent backend. Opt-in with `-DVLLM_CPP_TENSTORRENT=ON`; requires TT-Metalium and TT-NN and fails configure if either package is missing |
@@ -248,7 +254,8 @@ defaults.
 | CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
 | CUDA | Hopper, sm_90a | Build-supported; the fast GDN (Triton-AOT) path is build-verified, not runtime-proven here |
-| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a) | Build-supported; the fast GDN path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
+| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a) | Build-supported; the fast GDN path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_75 unsupported (no bf16 tensor cores) |
+| CUDA | Volta, sm_70 (Tesla V100) | Build-supported (W0): portable kernels only — every fast-path feature resolves empty; requires a CUDA 12.x toolkit (CUDA 13.0 dropped sm_70; 12.9.1 is the last 12.x). Build evidence: the `cuda-sm70-build` CI lane (nvidia/cuda:12.9.1-devel-ubuntu24.04). No runtime proof yet (hardware-gated) |
 | CUDA | Jetson Thor, sm_110 | Runtime-verified: the portable bf16 path ran the Llama-3.2-1B greedy gate token-exact on real silicon. Community reports add a 32B NVFP4A16 serving through the portable dequant-GEMM, and CUDA 13.2 passing the CUDA gates. fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY for `110` |
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
 | Vulkan | Portable GPU | `opt-125m` is strict token-exact; Qwen3.6-27B decode matches llama.cpp Vulkan on GB10. See [BENCHMARKS.md](BENCHMARKS.md) for the measured scope |

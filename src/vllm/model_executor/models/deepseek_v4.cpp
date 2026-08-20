@@ -1977,7 +1977,9 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
                                              const V4Backend& be,
-                                             std::vector<float>* mtp_residual_out = nullptr) {
+                                             std::vector<float>* mtp_residual_out = nullptr,
+                                             const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only wave: tp==nullptr (tp1) is the inert no-op path
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -2555,7 +2557,9 @@ std::vector<float> DeepseekV4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  (void)tp;  // delegates to the free DeepseekV4Forward{Gguf,Host} compositors (non-family)
   (void)attn_meta;
   (void)attn_kv;
   // GGUF source: consume the keep-quant tower (memory-bounded — no ~1 TiB f32
@@ -2621,7 +2625,8 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   (void)attn_meta;
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
@@ -2629,7 +2634,8 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   std::vector<float> flat = ForwardComposeImpl(
       weights.host, weights.params, token_ids, positions, logits_indices,
       V4Miswire::kNone, /*trace=*/nullptr,
-      V4Backend{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr});
+      V4Backend{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr},
+      /*mtp_residual_out=*/nullptr, tp);
   const int64_t vocab = weights.params.vocab_size;
   const int64_t rows =
       vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;

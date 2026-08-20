@@ -77,7 +77,8 @@ class Qwen3MoeModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Qwen3MoeWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // DEVICE-resident variant (sampler-on-device hot path): same contract as
   // Forward but returns the lm_head output as a device buffer with no full-logits
@@ -87,7 +88,8 @@ class Qwen3MoeModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Qwen3MoeWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 };
 
 // BF16 full-attention-MoE decode CUDA-graph driver (W7) — the Qwen3-Coder sibling

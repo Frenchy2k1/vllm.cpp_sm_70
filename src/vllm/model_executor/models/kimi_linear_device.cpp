@@ -678,7 +678,9 @@ DBuf MlaSoftmaxIsland(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
 // ─── (1) KDA linear-attention layer (device + one host-fallback island) ───────
 // Grounding kimi_linear_forward.cpp:101-190 (the W2 reference this must match).
 DBuf KdaLayerDevice(const Dev& d, const KdaLayerHostWeights& w, const Tensor& dh,
-                    const KimiLinearParams& p, int64_t T) {
+                    const KimiLinearParams& p, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only wave: tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nh = p.kda_num_heads;
   const int64_t hd = p.kda_head_dim;
@@ -742,7 +744,9 @@ DBuf KdaLayerDevice(const Dev& d, const KdaLayerHostWeights& w, const Tensor& dh
 // ─── (2) NoPE-MLA full-attention layer (device projections + host attn core) ──
 // Grounding kimi_linear_forward.cpp:193-260.
 DBuf MlaLayerDevice(const Dev& d, const MlaLayerHostWeights& w, const Tensor& dh,
-                    const KimiLinearParams& p, int64_t T) {
+                    const KimiLinearParams& p, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nah = p.num_attention_heads;
   const int64_t qn = p.qk_nope_head_dim;
@@ -795,7 +799,9 @@ DBuf MlaLayerDevice(const Dev& d, const MlaLayerHostWeights& w, const Tensor& dh
 // ─── (3) sigmoid noaux_tc MoE block (device router+experts+combine) ───────────
 // Grounding kimi_linear_forward.cpp:263-350 + deepseek_v2.cpp:331-472 MoeBlock.
 DBuf MoeBlockDevice(const Dev& d, const MoeHostWeights& w, const Tensor& dh,
-                    const KimiLinearParams& p, int64_t T) {
+                    const KimiLinearParams& p, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t E = p.num_experts;
   const int64_t k = p.num_experts_per_token;
@@ -866,7 +872,9 @@ DBuf MoeBlockDevice(const Dev& d, const MoeHostWeights& w, const Tensor& dh,
 
 // ─── (4) dense layer-0 SwiGLU MLP (ON DEVICE) ─────────────────────────────────
 DBuf DenseMlpDevice(const Dev& d, const MlpHostWeights& w, const Tensor& dh,
-                    const KimiLinearParams& p, int64_t T) {
+                    const KimiLinearParams& p, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   return SwiGluDevice(d, w.gate_proj, w.up_proj, w.down_proj, dh, p.hidden_size,
                       p.intermediate_size, T);
 }
@@ -888,7 +896,8 @@ ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
 // ForwardBody). Returns the DEVICE-RESIDENT [rows,vocab] f32 logits DBuf.
 DBuf DeviceForwardBody(const Dev& d, const KimiLinearWeights& weights,
                        const std::vector<int32_t>& token_ids,
-                       const std::vector<int32_t>& logits_indices) {
+                       const std::vector<int32_t>& logits_indices,
+                       const vllm::TensorParallel* tp = nullptr) {
   const KimiLinearHostWeights& host = weights.host;
   const KimiLinearParams& p = weights.params;
   const int64_t H = p.hidden_size;
@@ -917,12 +926,12 @@ DBuf DeviceForwardBody(const Dev& d, const KimiLinearWeights& weights,
     const KimiLinearLayerHostWeights& lw = host.layers[static_cast<size_t>(l)];
     DBuf dhn(d, DType::kF32, {T, H});
     AddRmsNorm(d, dhn, hcur, WF32(d, lw.input_layernorm, {H}), res, eps);
-    DBuf attn = lw.is_kda ? KdaLayerDevice(d, lw.kda, dhn.t(), p, T)
-                          : MlaLayerDevice(d, lw.mla, dhn.t(), p, T);
+    DBuf attn = lw.is_kda ? KdaLayerDevice(d, lw.kda, dhn.t(), p, T, tp)
+                          : MlaLayerDevice(d, lw.mla, dhn.t(), p, T, tp);
     DBuf dh2(d, DType::kF32, {T, H});
     AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
-    DBuf mlp = lw.is_moe ? MoeBlockDevice(d, lw.moe, dh2.t(), p, T)
-                         : DenseMlpDevice(d, lw.dense, dh2.t(), p, T);
+    DBuf mlp = lw.is_moe ? MoeBlockDevice(d, lw.moe, dh2.t(), p, T, tp)
+                         : DenseMlpDevice(d, lw.dense, dh2.t(), p, T, tp);
     auto* held = new DBuf(std::move(mlp));
     hcur = held->t();
     hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
@@ -984,7 +993,9 @@ DBuf SwiGluDeviceBf16(const Dev& d, const OwnedTensor& gate, const OwnedTensor& 
 }
 
 DBuf KdaLayerDeviceBf16(const Dev& d, const KdaResidentWeights& w, const Tensor& dh,
-                        const KimiLinearParams& p, int64_t T) {
+                        const KimiLinearParams& p, int64_t T,
+                        const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nh = p.kda_num_heads;
   const int64_t hd = p.kda_head_dim;
@@ -1042,7 +1053,9 @@ DBuf KdaLayerDeviceBf16(const Dev& d, const KdaResidentWeights& w, const Tensor&
 }
 
 DBuf MlaLayerDeviceBf16(const Dev& d, const MlaResidentWeights& w, const Tensor& dh,
-                        const KimiLinearParams& p, int64_t T) {
+                        const KimiLinearParams& p, int64_t T,
+                        const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nah = p.num_attention_heads;
   const int64_t qn = p.qk_nope_head_dim;
@@ -1085,7 +1098,9 @@ DBuf MlaLayerDeviceBf16(const Dev& d, const MlaResidentWeights& w, const Tensor&
 }
 
 DBuf MoeBlockDeviceBf16(const Dev& d, const MoeResidentWeights& w, const Tensor& dh,
-                        const KimiLinearParams& p, int64_t T) {
+                        const KimiLinearParams& p, int64_t T,
+                        const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t E = p.num_experts;
   const int64_t k = p.num_experts_per_token;
@@ -1157,14 +1172,17 @@ DBuf MoeBlockDeviceBf16(const Dev& d, const MoeResidentWeights& w, const Tensor&
 }
 
 DBuf DenseMlpDeviceBf16(const Dev& d, const MlpResidentWeights& w, const Tensor& dh,
-                        const KimiLinearParams& p, int64_t T) {
+                        const KimiLinearParams& p, int64_t T,
+                        const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   return SwiGluDeviceBf16(d, w.gate_proj, w.up_proj, w.down_proj, dh, p.hidden_size,
                           p.intermediate_size, T);
 }
 
 DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
                            const std::vector<int32_t>& token_ids,
-                           const std::vector<int32_t>& logits_indices) {
+                           const std::vector<int32_t>& logits_indices,
+                           const vllm::TensorParallel* tp = nullptr) {
   const KimiLinearResidentWeights& rw = weights.resident;
   const KimiLinearParams& p = weights.params;
   const int64_t H = p.hidden_size;
@@ -1204,16 +1222,16 @@ DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
     AddRmsNormS(d, dhn, hcur, lw.input_layernorm, H, res, eps, sdt);
     if (round_res) RoundDevBf16(d, res);
     DBuf attn = ToStream(d,
-                         lw.is_kda ? KdaLayerDeviceBf16(d, lw.kda, dhn.t(), p, T)
-                                   : MlaLayerDeviceBf16(d, lw.mla, dhn.t(), p, T),
+                         lw.is_kda ? KdaLayerDeviceBf16(d, lw.kda, dhn.t(), p, T, tp)
+                                   : MlaLayerDeviceBf16(d, lw.mla, dhn.t(), p, T, tp),
                          sdt);
     if (round_res) RoundDevBf16(d, attn);
     DBuf dh2(d, sdt, {T, H});
     AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps, sdt);
     if (round_res) RoundDevBf16(d, res);
     DBuf mlp = ToStream(d,
-                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
+                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T, tp)
+                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T, tp),
                         sdt);
     if (round_res) RoundDevBf16(d, mlp);
     auto* held = new DBuf(std::move(mlp));
@@ -1419,7 +1437,9 @@ DBuf MlaSoftmaxIslandInc(const Dev& d, DBuf& dq, const std::vector<float>& cache
 // through `cache`.
 DBuf KdaLayerDeviceBf16Inc(const Dev& d, const KdaResidentWeights& w, const Tensor& dh,
                            const KimiLinearParams& p, int64_t T, KimiKdaLayerCache& cache,
-                           bool is_prefill, bool use_chunk) {
+                           bool is_prefill, bool use_chunk,
+                           const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nh = p.kda_num_heads;
   const int64_t hd = p.kda_head_dim;
@@ -1479,7 +1499,9 @@ DBuf KdaLayerDeviceBf16Inc(const Dev& d, const KdaResidentWeights& w, const Tens
 // runs over the growing cache (query_len=T, key_len=base_pos+T).
 DBuf MlaLayerDeviceBf16Inc(const Dev& d, const MlaResidentWeights& w, const Tensor& dh,
                            const KimiLinearParams& p, int64_t T, int64_t base_pos,
-                           KimiMlaLayerCache& cache) {
+                           KimiMlaLayerCache& cache,
+                           const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nah = p.num_attention_heads;
   const int64_t qn = p.qk_nope_head_dim;
@@ -1540,7 +1562,8 @@ DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& wei
                                       const std::vector<int32_t>& token_ids,
                                       int64_t base_pos, KimiDecodeCache& cache,
                                       bool is_prefill,
-                                      const std::vector<int32_t>& logits_indices) {
+                                      const std::vector<int32_t>& logits_indices,
+                                      const vllm::TensorParallel* tp = nullptr) {
   const KimiLinearResidentWeights& rw = weights.resident;
   const KimiLinearParams& p = weights.params;
   const int64_t H = p.hidden_size;
@@ -1584,17 +1607,17 @@ DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& wei
         d,
         lw.is_kda ? KdaLayerDeviceBf16Inc(d, lw.kda, dhn.t(), p, T,
                                           cache.kda[static_cast<size_t>(kda_idx++)],
-                                          is_prefill, use_chunk)
+                                          is_prefill, use_chunk, tp)
                   : MlaLayerDeviceBf16Inc(d, lw.mla, dhn.t(), p, T, base_pos,
-                                          cache.mla[static_cast<size_t>(mla_idx++)]),
+                                          cache.mla[static_cast<size_t>(mla_idx++)], tp),
         sdt);
     if (round_res) RoundDevBf16(d, attn);
     DBuf dh2(d, sdt, {T, H});
     AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps, sdt);
     if (round_res) RoundDevBf16(d, res);
     DBuf mlp = ToStream(d,
-                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T),
+                        lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T, tp)
+                                  : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T, tp),
                         sdt);
     if (round_res) RoundDevBf16(d, mlp);
     auto* held = new DBuf(std::move(mlp));
@@ -1738,7 +1761,9 @@ KimiPagedSeg KimiSegment(const v1::GDNAttentionMetadata& gm, int64_t T) {
 // each [proj, K-1] — vLLM's `conv_state.chunk(3)` (kimi_gdn_linear_attn.py:331).
 DBuf KdaLayerPagedBf16(const Dev& d, const KdaResidentWeights& w, const Tensor& dh,
                        const KimiLinearParams& p, int64_t T, const KimiPagedSeg& seg,
-                       const GdnStateCache& state) {
+                       const GdnStateCache& state,
+                       const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nh = p.kda_num_heads;
   const int64_t hd = p.kda_head_dim;
@@ -2035,7 +2060,9 @@ void BuildKimiMlaStep(const Dev& d, const std::vector<int32_t>& positions,
 DBuf MlaLayerPagedExact(const Dev& d, const MlaResidentWeights& w, const Tensor& dh,
                         const KimiLinearParams& p, int64_t T,
                         const v1::CommonAttentionMetadata& am,
-                        const PagedKvCache& kv, const KimiMlaStep& step) {
+                        const PagedKvCache& kv, const KimiMlaStep& step,
+                        const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only; tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t nah = p.num_attention_heads;
   const int64_t qn = p.qk_nope_head_dim;
@@ -2166,7 +2193,8 @@ DBuf MlaLayerPagedExact(const Dev& d, const MlaResidentWeights& w, const Tensor&
 // its OWN ConcatAndCacheMla write.
 DBuf MlaLayerPagedFa2(const Dev& d, const MlaResidentWeights& w, const Tensor& dh_f32,
                       const KimiLinearParams& p, int64_t T, const PagedKvCache& kv,
-                      KimiMlaStep& step, const DBuf& kv_a_ln_bf16) {
+                      KimiMlaStep& step, const DBuf& kv_a_ln_bf16,
+                      const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = p.hidden_size;
   const int64_t nah = p.num_attention_heads;
   const int64_t qn = p.qk_nope_head_dim;
@@ -2209,7 +2237,7 @@ DBuf MlaLayerPagedFa2(const Dev& d, const MlaResidentWeights& w, const Tensor& d
   DBuf attn_bf16(d, DType::kBF16, {T, H});
   Tensor attn_t = attn_bf16.t();
   mla::ForwardMlaAttentionBlock(d, dm, mw, dh_bf16.t(), step.positions, cache_t,
-                                step.slot_mapping, step.meta, step.impl, attn_t);
+                                step.slot_mapping, step.meta, step.impl, attn_t, tp);
   DBuf attn(d, DType::kF32, {T, H});
   Tensor attn_f = attn.t();
   vt::CastF32(d.q, attn_f, attn_bf16.t());
@@ -2219,7 +2247,8 @@ DBuf MlaLayerPagedFa2(const Dev& d, const MlaResidentWeights& w, const Tensor& d
 // The whole paged-runner device forward — DeviceForwardBodyBf16Incremental's
 // skeleton with the paged KDA/MLA layer forms and the runner's own metadata.
 DBuf DeviceForwardBodyBf16Paged(const Dev& d, const KimiLinearWeights& weights,
-                                const ModelForwardInput& in) {
+                                const ModelForwardInput& in,
+                                const vllm::TensorParallel* tp = nullptr) {
   const KimiLinearResidentWeights& rw = weights.resident;
   const KimiLinearParams& p = weights.params;
   const int64_t H = p.hidden_size;
@@ -2296,11 +2325,11 @@ DBuf DeviceForwardBodyBf16Paged(const Dev& d, const KimiLinearWeights& weights,
     DBuf attn = [&]() -> DBuf {
       if (lw.is_kda) {
         return KdaLayerPagedBf16(d, lw.kda, dhn.t(), p, T, seg,
-                                 in.gdn_state[static_cast<size_t>(kda_idx++)]);
+                                 in.gdn_state[static_cast<size_t>(kda_idx++)], tp);
       }
       const PagedKvCache& kv = in.attn_kv[static_cast<size_t>(mla_idx++)];
       if (!fa2) return MlaLayerPagedExact(d, lw.mla, dhn.t(), p, T, in.attn_meta,
-                                          kv, step);
+                                          kv, step, tp);
       std::unique_ptr<DBuf>& ln = kv_a_ln_bf16[static_cast<size_t>(l)];
       if (!ln) {
         DBuf lnf(d, DType::kF32,
@@ -2311,13 +2340,13 @@ DBuf DeviceForwardBodyBf16Paged(const Dev& d, const KimiLinearWeights& weights,
             std::vector<int64_t>{static_cast<int64_t>(lw.mla.kv_a_layernorm.size())});
         vt::CastBf16(d.q, ln->t(), lnf.t());
       }
-      return MlaLayerPagedFa2(d, lw.mla, dhn.t(), p, T, kv, step, *ln);
+      return MlaLayerPagedFa2(d, lw.mla, dhn.t(), p, T, kv, step, *ln, tp);
     }();
     DBuf dh2(d, DType::kF32, {T, H});
     AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps,
                 DType::kF32);
-    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
-                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
+    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T, tp)
+                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T, tp);
     auto* held = new DBuf(std::move(mlp));
     hcur = held->t();
     hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
@@ -2438,7 +2467,8 @@ ForwardLogits KimiLinearModel::ForwardDeviceCompute(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   // §13: the FULL model loads as bf16-resident (host f32 would OOM the pool), so
   // route through the bf16 device forward whenever resident weights are present; the
   // f32 host path stays for the tiny-config unit gate.
@@ -2456,8 +2486,8 @@ ForwardLogits KimiLinearModel::ForwardDeviceCompute(
   (void)attn_meta;
   (void)attn_kv;
   Dev d{vt::GetBackend(queue.device.type), queue};
-  DBuf dlogits = bf16 ? DeviceForwardBodyBf16(d, weights, token_ids, logits_indices)
-                      : DeviceForwardBody(d, weights, token_ids, logits_indices);
+  DBuf dlogits = bf16 ? DeviceForwardBodyBf16(d, weights, token_ids, logits_indices, tp)
+                      : DeviceForwardBody(d, weights, token_ids, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }
@@ -2466,7 +2496,8 @@ ForwardLogits KimiLinearModel::ForwardDeviceCompute(
 ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
     const std::vector<int32_t>& prompt, const std::vector<int32_t>& positions,
     const KimiLinearWeights& weights, vt::Queue& queue, KimiDecodeCache& cache,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   (void)positions;  // NoPE-MLA + recurrence: causal masking is by cache length, no RoPE
   VT_CHECK(weights.resident.resident,
            "KimiLinear ForwardPrefillIncremental: bf16-resident weights required (§13)");
@@ -2479,7 +2510,7 @@ ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
   cache.seq_len = 0;
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DeviceForwardBodyBf16Incremental(d, weights, prompt, /*base_pos=*/0, cache,
-                                                  /*is_prefill=*/true, logits_indices);
+                                                  /*is_prefill=*/true, logits_indices, tp);
   cache.seq_len = static_cast<int64_t>(prompt.size());
   cache.prefilled = true;
   const int64_t n_out = dlogits.t().shape[0];
@@ -2488,16 +2519,17 @@ ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
 
 // ─── ROW 7 — the shared-paged-runner fold (§20.3) — public entry ───────────────
 ForwardLogits KimiLinearModel::ForwardPaged(const ModelForwardInput& input,
-                                            const KimiLinearWeights& weights) {
+                                            const KimiLinearWeights& weights,
+                                            const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(input.queue.device.type), input.queue};
-  DBuf dlogits = DeviceForwardBodyBf16Paged(d, weights, input);
+  DBuf dlogits = DeviceForwardBodyBf16Paged(d, weights, input, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }
 
 ForwardLogits KimiLinearModel::ForwardDecodeStepIncremental(
     int32_t token, int64_t position, const KimiLinearWeights& weights, vt::Queue& queue,
-    KimiDecodeCache& cache) {
+    KimiDecodeCache& cache, const vllm::TensorParallel* tp) {
   (void)position;  // causal masking is by cache.seq_len; NoPE so no positional term
   VT_CHECK(cache.prefilled,
            "KimiLinear ForwardDecodeStepIncremental: call ForwardPrefillIncremental first");
@@ -2507,7 +2539,7 @@ ForwardLogits KimiLinearModel::ForwardDecodeStepIncremental(
   const std::vector<int32_t> li = {0};  // the single decoded token's logits
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DeviceForwardBodyBf16Incremental(d, weights, ids, /*base_pos=*/cache.seq_len,
-                                                  cache, /*is_prefill=*/false, li);
+                                                  cache, /*is_prefill=*/false, li, tp);
   cache.seq_len += 1;
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);

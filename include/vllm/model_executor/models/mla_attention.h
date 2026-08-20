@@ -94,6 +94,7 @@
 
 #include "vllm/model_executor/layers/attention/mla_chunked_context.h"
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev / DBuf / MakeTensor
+#include "vllm/model_executor/models/tensor_parallel.h"    // TensorParallel (W2)
 #include "vllm/v1/attention/backend.h"                     // MLACommonMetadata
 #include "vt/ops.h"
 
@@ -279,7 +280,8 @@ void ForwardMlaAttentionBlock(dense_attn::Dev d, const MlaBlockDims& dims,
                               const MlaBlockWeights& w, const vt::Tensor& hidden,
                               const vt::Tensor& positions, vt::Tensor& kv_cache,
                               const vt::Tensor& slot_mapping, const MlaBlockMetadata& meta,
-                              v1::TritonMLAImpl& impl, vt::Tensor& out);
+                              v1::TritonMLAImpl& impl, vt::Tensor& out,
+                              const vllm::TensorParallel* tp = nullptr);
 
 // The `kv_b_proj` up-projection callback W5 left OPEN (`MlaUpProjectFn`,
 // mla_chunked_context.h:228). Binds the model's `kv_b_proj` weight and the block

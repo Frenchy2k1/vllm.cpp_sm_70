@@ -151,7 +151,8 @@ class Qwen3DenseModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // DEVICE-resident variant (sampler-on-device hot path): same contract as
   // Forward but returns the lm_head output as a device buffer with no full-logits
@@ -161,7 +162,8 @@ class Qwen3DenseModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // POOLING forward (ARCH-ONE-SURFACE ROW 6): the same embed + layer stack,
   // stopping after the final RMSNorm (+ the logits_indices gather) with NO
@@ -177,7 +179,8 @@ class Qwen3DenseModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // The `inputs_embeds` ENTRY (MODEL-MUSIC-MUSIC3 W2, #672) — additive, and the
   // door the Qwen3 family already has everywhere except here.
@@ -213,7 +216,8 @@ class Qwen3DenseModel {
       const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {},
-      std::vector<float>* out_hidden = nullptr);
+      std::vector<float>* out_hidden = nullptr,
+      const vllm::TensorParallel* tp = nullptr);
 };
 
 // SHARED pure-dense decode CUDA-graph driver — the sibling of Qwen3MoeDecodeGraph

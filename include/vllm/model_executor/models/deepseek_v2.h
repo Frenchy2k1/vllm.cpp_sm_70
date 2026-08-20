@@ -298,14 +298,16 @@ class DeepseekV2Model {
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const DeepseekV2Weights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // DEVICE-resident logits variant (the sampler-on-device hot path).
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const DeepseekV2Weights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 };
 
 // ─── MLA campaign W9: the decode CUDA-graph sibling ─────────────────────────

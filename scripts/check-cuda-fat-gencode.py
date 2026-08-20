@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Audit W1 per-source CUDA gencode and the linked ten-SM archive."""
+"""Audit W1 per-source CUDA gencode and the linked archive.
+
+The default audit covers the linked ten-SM archive (ALL_SMS). Pass --archs to
+audit a different requested set — e.g. --archs 70 for the W0 Volta lane, where
+every fast-path feature resolves EMPTY and only the portable TUs are expected.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,22 @@ from pathlib import Path
 
 
 ALL_SMS = ("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a")
-SM12X = ("120a", "121a")
+# The requested target set. Defaults to the ten-SM archive; --archs replaces it.
+_arch_targets = ALL_SMS
+_SM12X_FAMILY = ("120a", "121a")
+_FA2_FAMILY = ("80", "86", "87", "89", "120a", "121a")
+
+
+def _sm12x_targets() -> tuple[str, ...]:
+    return tuple(sm for sm in _arches_for_family(_SM12X_FAMILY))
+
+
+def _fa2_targets() -> tuple[str, ...]:
+    return tuple(sm for sm in _arches_for_family(_FA2_FAMILY))
+
+
+def _arches_for_family(family: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sm for sm in _arch_targets if sm in family)
 
 
 def _feature_table_archs(feature: str) -> tuple[str, ...]:
@@ -35,8 +55,6 @@ def _feature_table_archs(feature: str) -> tuple[str, ...]:
     if not archs:
         raise SystemExit(f"{table}: feature {feature!r} declares no architectures")
     return archs
-FA2_SMS = ("80", "86", "87", "89", "120a", "121a")
-
 REQUIRED_SOURCES = (
     "src/vt/cuda/cuda_matmul_nvfp4.cu",
     "src/vt/cuda/cuda_nvfp4_sm12x.cu",
@@ -76,7 +94,7 @@ def expected_sms(source: str) -> tuple[str, ...]:
     if name == "cuda_scaled_mm_c3x_sm100.cu":
         return ("100a",)
     if "flash_attn/" in source or name == "cuda_flash_attn_fa2.cu":
-        return FA2_SMS
+        return _fa2_targets()
     # Marlin is DERIVED from the feature table (#394); the nvfp4/fp8 CUTLASS
     # sources below are genuinely sm12x-only and stay literal. Collapsing the
     # two into one branch would silently widen those to Marlin's arch set.
@@ -96,8 +114,19 @@ def expected_sms(source: str) -> tuple[str, ...]:
         or name == "cuda_matmul_fp8_cutlass.cu"
         or name == "cuda_matmul_fp8_block_cutlass.cu"
     ):
-        return SM12X
-    return ALL_SMS
+        return _sm12x_targets()
+    return _arch_targets
+
+
+def _required_sources() -> list[str]:
+    """REQUIRED_SOURCES narrowed to TUs the requested target set actually
+    compiles. In a `--archs 70` (Volta) build every fast-path feature resolves
+    EMPTY, so the sm12x/cutlass/marlin/fa2 TUs are absent by construction and
+    must NOT be demanded — but if one of them nonetheless appears in the
+    compile database with any gencode, the per-source check below rejects it
+    (its expected set is empty for this target)."""
+    targets = set(_arch_targets)
+    return [source for source in REQUIRED_SOURCES if targets & set(expected_sms(source))]
 
 
 def command_sms(command: str) -> tuple[str, ...]:
@@ -125,7 +154,7 @@ def validate_compile_commands(path: Path) -> list[str]:
         commands[source] = str(command)
 
     errors: list[str] = []
-    for required in REQUIRED_SOURCES:
+    for required in _required_sources():
         if required not in commands:
             errors.append(f"missing CUDA compile command for {required}")
     for source, command in sorted(commands.items()):
@@ -140,8 +169,8 @@ def validate_compile_commands(path: Path) -> list[str]:
 
 def validate_archive_listing(listing: str) -> list[str]:
     actual = set(ARCHIVE_RE.findall(listing))
-    missing = [sm for sm in ALL_SMS if sm not in actual]
-    extra = sorted(actual.difference(ALL_SMS))
+    missing = [sm for sm in _arch_targets if sm not in actual]
+    extra = sorted(actual.difference(_arch_targets))
     errors: list[str] = []
     if missing:
         errors.append(f"archive is missing CUDA SMs: {','.join(missing)}")
@@ -153,10 +182,26 @@ def validate_archive_listing(listing: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compile-commands", type=Path, required=True)
+    parser.add_argument(
+        "--archs",
+        default=",".join(ALL_SMS),
+        help="Requested CUDA target set, CMake form, comma or semicolon "
+        "separated (default: the ten-SM archive). e.g. '70' audits a Volta "
+        "portable-kernels-only build.",
+    )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--library", type=Path)
     source.add_argument("--cuobjdump-list", type=Path)
     args = parser.parse_args()
+
+    global _arch_targets
+    _arch_targets = tuple(
+        arch.strip().replace(".", "", 1)
+        for arch in re.split(r"[;,]", args.archs)
+        if arch.strip()
+    )
+    if not _arch_targets:
+        parser.error("--archs must name at least one architecture")
 
     errors = validate_compile_commands(args.compile_commands)
     if args.library is not None:
@@ -180,7 +225,11 @@ def main() -> int:
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
         return 1
-    print("CUDA fat gencode audit: all ten SMs and per-source intersections OK")
+    print(
+        "CUDA fat gencode audit: all {} SMs and per-source intersections OK".format(
+            ",".join(_arch_targets)
+        )
+    )
     return 0
 
 

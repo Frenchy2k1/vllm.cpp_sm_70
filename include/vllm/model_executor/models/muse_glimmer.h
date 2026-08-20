@@ -356,13 +356,15 @@ class MuseGlimmerModel {
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // W4 WIRING: the MULTIMODAL entry. Takes the ALREADY-MERGED input embeddings
   // (bf16 bits, [T, hidden] row-major) instead of token ids, exactly as upstream's
@@ -381,7 +383,8 @@ class MuseGlimmerModel {
       const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 };
 
 // The perception-encoder geometry, bridged from the resolved model config to the

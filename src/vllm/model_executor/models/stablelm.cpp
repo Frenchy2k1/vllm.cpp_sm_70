@@ -53,7 +53,8 @@ void LayerNormInto(Dev d, DBuf& out, const Tensor& x, const OwnedTensor& weight,
 // StableLM SwiGLU MLP (merged gate_up -> SiluAndMul -> down). `dh2` is the
 // post-norm hidden [T,H] bf16.
 DBuf StablelmMlpBlock(Dev d, const StablelmMlpWeights& w, const HfConfig& cfg,
-                      const Tensor& dh2, int64_t T) {
+                      const Tensor& dh2, int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
@@ -75,7 +76,8 @@ DBuf StablelmMlpBlock(Dev d, const StablelmMlpWeights& w, const HfConfig& cfg,
 DBuf StablelmAttnBlock(Dev d, const StablelmAttnWeights& w, const Tensor& rope_cache,
                        const HfConfig& cfg, const Tensor& dhn, const StepInputs& si,
                        const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                       int64_t T) {
+                       int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -145,7 +147,8 @@ DBuf StablelmAttnBlock(Dev d, const StablelmAttnWeights& w, const Tensor& rope_c
 // full residual stream lives in `hidden`; there is no separate accumulator.
 void RunLayer(Dev d, const StablelmLayerWeights& layer, const Tensor& rope_cache,
               const HfConfig& cfg, float eps, DBuf& hidden, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
 
   // ---- self attention: residual = h; h = LN(h); h = attn(h); h = residual + h --
@@ -153,7 +156,7 @@ void RunLayer(Dev d, const StablelmLayerWeights& layer, const Tensor& rope_cache
   LayerNormInto(d, normed, hidden.t(), layer.input_layernorm,
                 layer.input_layernorm_bias, eps, H);
   DBuf attn = StablelmAttnBlock(d, layer.attn, rope_cache, cfg, normed.t(), si, meta,
-                                kv, T);
+                                kv, T, tp);
   vt::Add(d.q, attn.t(), attn.t(), hidden.t());  // residual + hidden_states
   hidden = std::move(attn);
 
@@ -161,7 +164,7 @@ void RunLayer(Dev d, const StablelmLayerWeights& layer, const Tensor& rope_cache
   DBuf normed2(d, DType::kBF16, {T, H});
   LayerNormInto(d, normed2, hidden.t(), layer.post_attention_layernorm,
                 layer.post_attention_layernorm_bias, eps, H);
-  DBuf mlp = StablelmMlpBlock(d, layer.mlp, cfg, normed2.t(), T);
+  DBuf mlp = StablelmMlpBlock(d, layer.mlp, cfg, normed2.t(), T, tp);
   vt::Add(d.q, mlp.t(), mlp.t(), hidden.t());  // residual + mlp
   hidden = std::move(mlp);
 }
@@ -180,7 +183,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const StablelmWeights& weights, const HfConfig& config,
-                 float eps, const std::vector<int32_t>& logits_indices) {
+                 float eps, const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -202,7 +206,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], rope_cache, config, eps,
-             hidden, si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             hidden, si, attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   DBuf dnorm(d, DType::kBF16, {T, H});
   LayerNormInto(d, dnorm, hidden.t(), weights.final_norm, weights.final_norm_bias,
@@ -248,11 +252,11 @@ std::vector<float> StablelmModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const StablelmWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = StablelmLayerNormEps(config);
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, eps, logits_indices);
+                             config, eps, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -263,11 +267,11 @@ ForwardLogits StablelmModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const StablelmWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = StablelmLayerNormEps(config);
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, eps, logits_indices);
+                             config, eps, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

@@ -124,7 +124,9 @@ DBuf Gemma2AttnBlock(Dev d, const Gemma2AttnWeights& w, const HfConfig& cfg,
                      const Tensor& dhn, const StepInputs& si,
                      const CommonAttentionMetadata& meta, const PagedKvCache& kv,
                      int64_t T, double rope_base, float attn_scale,
-                     float attn_logit_softcap, std::optional<int64_t> sliding_window) {
+                     float attn_logit_softcap, std::optional<int64_t> sliding_window,
+                     const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -210,7 +212,9 @@ DBuf Gemma2AttnBlock(Dev d, const Gemma2AttnWeights& w, const HfConfig& cfg,
 // Gemma-2 GeGLU MLP (gemma2.py::Gemma2MLP): merged gate_up -> GeluAndMul(tanh) ->
 // down. `dh2` is the pre-FF-normed hidden [T,H] bf16.
 DBuf Gemma2MlpBlock(Dev d, const Gemma2MlpWeights& w, const HfConfig& cfg,
-                    const Tensor& dh2, int64_t T) {
+                    const Tensor& dh2, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam
@@ -235,7 +239,8 @@ DBuf Gemma2MlpBlock(Dev d, const Gemma2MlpWeights& w, const HfConfig& cfg,
 void RunLayer(Dev d, const Gemma2LayerWeights& layer, const HfConfig& cfg,
               const Gemma2Layout& g, int64_t l, DBuf& hidden, DBuf& res,
               const StepInputs& si, const CommonAttentionMetadata& meta,
-              const PagedKvCache& kv, int64_t T) {
+              const PagedKvCache& kv, int64_t T,
+              const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const vt::RmsNormArgs gemma{eps, true};
@@ -254,7 +259,8 @@ void RunLayer(Dev d, const Gemma2LayerWeights& layer, const HfConfig& cfg,
   std::optional<int64_t> window;
   if (sliding) window = g.sliding_window;
   DBuf attn = Gemma2AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T,
-                              g.rope_theta, g.attn_scale, g.attn_logit_softcap, window);
+                              g.rope_theta, g.attn_scale, g.attn_logit_softcap, window,
+                              tp);
 
   // post_attention_layernorm: SANDWICH sublayer-output post-norm — norm(attn) with
   // NO residual add. NOT-FUSABLE onto kFusedAddRmsNorm (that recipe's step0 is a
@@ -272,7 +278,7 @@ void RunLayer(Dev d, const Gemma2LayerWeights& layer, const HfConfig& cfg,
   else
     vt::RmsNorm(d.q, dh2.t(), attn_n.t(), w_pf, gemma, &res.t());
 
-  DBuf mlp = Gemma2MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DBuf mlp = Gemma2MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
 
   // post_feedforward_layernorm: SANDWICH sublayer-output post-norm — norm(mlp) with
   // NO residual add. NOT-FUSABLE (same reason as post_attention). STANDALONE. (Tier-B2)
@@ -295,7 +301,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Gemma2Weights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -325,7 +332,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, g, l, hidden, res, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // final norm: fused residual-add + GemmaRMSNorm (residual-carrying) via the catalog.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -379,10 +386,11 @@ std::vector<float> Gemma2Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma2Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -393,10 +401,11 @@ ForwardLogits Gemma2Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma2Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

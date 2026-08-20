@@ -165,7 +165,8 @@ mla::MlaBlockWeights ResidentMla(Dev d, const MiniCPM3MlaWeights& w,
 // MiniCPM3 dense SwiGLU MLP (minicpm.py::MiniCPMMLP): merged gate_up MatmulBT ->
 // SiluAndMul -> down MatmulBT.
 DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const Tensor& h, int64_t T,
-              int64_t H, int64_t I) {
+              int64_t H, int64_t I, const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
   // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
   // inline path ran — the seam's Apply IS {ResidentWeight; MatmulBT[2I,H];
@@ -187,7 +188,8 @@ DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const Tensor& h, int64_t T,
 // as MiniCPM.
 void RunLayer(Dev d, const MiniCPM3LayerWeights& layer, const MiniCPM3Params& p,
               double residual_scale, DBuf& res, const MlaStep& step,
-              Tensor& kv_cache, v1::TritonMLAImpl& impl, int64_t T) {
+              Tensor& kv_cache, v1::TritonMLAImpl& impl, int64_t T,
+              const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = p.hidden_size;
   const float eps = p.rms_norm_eps;
 
@@ -199,7 +201,7 @@ void RunLayer(Dev d, const MiniCPM3LayerWeights& layer, const MiniCPM3Params& p,
   Tensor attn_t = attn.t();
   const mla::MlaBlockWeights mw = ResidentMla(d, layer.attn, p.mla, *step.rope_cache);
   mla::ForwardMlaAttentionBlock(d, p.mla, mw, normed.t(), step.positions, kv_cache,
-                                step.slot_mapping, step.meta, impl, attn_t);
+                                step.slot_mapping, step.meta, impl, attn_t, tp);
   DBuf scaled(d, DType::kBF16, {T, H});
   vt::MulScalar(d.q, scaled.t(), attn.t(), residual_scale);
   vt::Add(d.q, res.t(), res.t(), scaled.t());
@@ -208,7 +210,7 @@ void RunLayer(Dev d, const MiniCPM3LayerWeights& layer, const MiniCPM3Params& p,
   DBuf normed2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, normed2.t(), res.t(), w_post, vt::RmsNormArgs{eps, false});
 
-  DBuf mlp = MlpBlock(d, layer.mlp, normed2.t(), T, H, p.intermediate_size);
+  DBuf mlp = MlpBlock(d, layer.mlp, normed2.t(), T, H, p.intermediate_size, tp);
   vt::MulScalar(d.q, scaled.t(), mlp.t(), residual_scale);
   vt::Add(d.q, res.t(), res.t(), scaled.t());
 }
@@ -227,7 +229,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& am,
                  const std::vector<PagedKvCache>& attn_kv,
                  const MiniCPM3Weights& weights,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 const vllm::TensorParallel* tp = nullptr) {
   const MiniCPM3Params& p = weights.params;
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
@@ -266,7 +269,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     Tensor kv_cache = MakeTensor(kv.data, kv.dtype, d.q.device,
                                  {kv.num_blocks, kv.block_size, head_size});
     RunLayer(d, weights.layers[static_cast<size_t>(l)], p, residual_scale, res, step,
-             kv_cache, impl, T);
+             kv_cache, impl, T, tp);
   }
 
   // Final RMSNorm then hidden /= scale_width before the tied lm_head
@@ -315,10 +318,12 @@ std::vector<float> MiniCPM3Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const MiniCPM3Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
+                  logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * weights.params.vocab_size);
   dlogits.Download(d, logits.data());
@@ -329,10 +334,12 @@ ForwardLogits MiniCPM3Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const MiniCPM3Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
+                  logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }

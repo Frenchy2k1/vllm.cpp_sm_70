@@ -58,7 +58,9 @@ void LayerNormInto(Dev d, DBuf& out, const Tensor& x, const OwnedTensor& weight,
 // Command-R SwiGLU MLP (merged gate_up -> SiluAndMul -> down). `dhn` is the
 // input-LayerNormed hidden [T,H] bf16 (the SAME norm output attention reads).
 DBuf CommandrMlpBlock(Dev d, const CommandrMlpWeights& w, const HfConfig& cfg,
-                      const Tensor& dhn, int64_t T) {
+                      const Tensor& dhn, int64_t T,
+                      const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
@@ -83,7 +85,8 @@ DBuf CommandrMlpBlock(Dev d, const CommandrMlpWeights& w, const HfConfig& cfg,
 DBuf CommandrAttnBlock(Dev d, const CommandrAttnWeights& w, const Tensor& rope_cache,
                        const HfConfig& cfg, const Tensor& dhn, const StepInputs& si,
                        const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                       int64_t T) {
+                       int64_t T, const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -151,7 +154,8 @@ DBuf CommandrAttnBlock(Dev d, const CommandrAttnWeights& w, const Tensor& rope_c
 //   residual = h; n = LayerNorm(h); h = residual + attn(n) + mlp(n).
 void RunLayer(Dev d, const CommandrLayerWeights& layer, const Tensor& rope_cache,
               const HfConfig& cfg, float eps, DBuf& hidden, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
 
   // ONE input LayerNorm (weight-only, no bias) -> feeds BOTH attn and MLP.
@@ -159,8 +163,8 @@ void RunLayer(Dev d, const CommandrLayerWeights& layer, const Tensor& rope_cache
   LayerNormInto(d, normed, hidden.t(), layer.input_layernorm, eps, H);
 
   DBuf attn = CommandrAttnBlock(d, layer.attn, rope_cache, cfg, normed.t(), si, meta,
-                                kv, T);
-  DBuf mlp = CommandrMlpBlock(d, layer.mlp, cfg, normed.t(), T);
+                                kv, T, tp);
+  DBuf mlp = CommandrMlpBlock(d, layer.mlp, cfg, normed.t(), T, tp);
 
   // Parallel re-join: hidden = residual + attn + mlp (commandr.py:271).
   vt::Add(d.q, hidden.t(), hidden.t(), attn.t());
@@ -181,7 +185,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const CommandrWeights& weights, const HfConfig& config,
-                 float eps, const std::vector<int32_t>& logits_indices) {
+                 float eps, const std::vector<int32_t>& logits_indices,
+                 const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -203,7 +208,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], rope_cache, config, eps,
-             hidden, si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             hidden, si, attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   DBuf dnorm(d, DType::kBF16, {T, H});
   LayerNormInto(d, dnorm, hidden.t(), weights.final_norm, eps, H);
@@ -249,11 +254,12 @@ std::vector<float> CommandrModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const CommandrWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = CommandrLayerNormEps(config);
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, eps, logits_indices);
+                             config, eps, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -264,11 +270,12 @@ ForwardLogits CommandrModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const CommandrWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = CommandrLayerNormEps(config);
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, eps, logits_indices);
+                             config, eps, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

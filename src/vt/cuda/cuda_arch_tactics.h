@@ -56,6 +56,9 @@ enum class TacticFamily : int {
   kFp8Cutlass,
   // Vendored FlashAttention-2 prefill/decode (cuda_flash_attn_fa2.cu).
   kFlashAttn,
+  // Volta W4A16 NVFP4 decode GEMM (cuda_sm70_nvfp4_gemm.cu): SIMT band,
+  // M <= 3, byte-exact per the compressed-tensors NVFP4 layout.
+  kSm70Nvfp4W4a16,
   kCount
 };
 
@@ -76,7 +79,29 @@ struct Nvfp4Fp4MmaArgs {
   int64_t k = 0;
 };
 
-// A tactic answers two questions: can it run on THIS device, and how does it
+// Per-family launch payload for kSm70Nvfp4W4a16. The NVFP4 (compressed-
+// tensors) W4A16 decode layout, bit-compatible with the v100-skinny SIMT
+// kernels: `codes` holds packed E2M1 nibbles n x k/2, `scales` holds one
+// fp8-e4m3 group scale byte per (row, 16-col) block, `gscale` is the global
+// tensor scale folded in by the kernel.
+struct Sm70Nvfp4W4a16Args {
+  void* stream = nullptr;  // cudaStream_t, erased to keep this header CUDA-free
+  void* out = nullptr;     // fp16, m x n row-major
+  const void* x = nullptr;          // fp16 activations, m x k row-major
+  const void* codes = nullptr;      // u8 nibbles, n x k/2 row-major
+  const void* scales = nullptr;     // u8 e4m3 group scales, n x k/16
+  float gscale = 1.0f;              // global scale
+  int64_t m = 0;
+  int64_t n = 0;
+  int64_t k = 0;
+  // Fused greedy-argmax (M == 1 only): when set, the SIMT band writes the
+  // per-column-max identity instead of (or in addition to) the fp16 row. Each
+  // grid block of 8 columns writes one (val, idx) entry -- the full-row
+  // winner is the caller's cross-block max-reduce (as the v100-skinny
+  // `gemm_simt_argmax` contract). May be null (plain decode).
+  void* argmax_val = nullptr;   // [n / 8] fp16 entries (CUDA-free: void*)
+  int* argmax_idx = nullptr;      // [n / 8] entries
+};
 // launch. `supports` must be side-effect free and cheap (it runs per launch).
 // `launch` returns false when it declined the shape, so the launcher falls back
 // to its portable path exactly as before.

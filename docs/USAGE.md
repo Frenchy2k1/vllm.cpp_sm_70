@@ -128,7 +128,12 @@ grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
 Which fast paths a given architecture compiles is decided by the CUDA feature
 table, not by the arch string alone. `110` (Jetson Thor) builds the portable
 kernels plus the vendored Marlin NVFP4 W4A16 GEMM; the CUTLASS FP4/FP8 paths and
-`fp4-mma` stay off there because no kernel body exists for it. `cmake -P
+table, not by the arch string alone. `110` (Jetson Thor) builds the portable
+kernels plus the vendored Marlin NVFP4 W4A16 GEMM; the CUTLASS FP4/FP8 paths and
+`fp4-mma` stay off there because no kernel body exists for it. `70` (Tesla V100,
+Volta) builds the NVFP4 W4A16 decode GEMM (`sm70-nvfp4-gemm`) and the FA2
+fragment-core + paged decode (`sm70-fa2-v1`); it needs a CUDA `< 13` toolkit
+(nvcc 13 dropped `sm_70` codegen). `cmake -P
 cmake/CudaArchFeaturesTest.cmake` prints the resolution for any target list
 without a GPU or a CUDA toolkit.
 

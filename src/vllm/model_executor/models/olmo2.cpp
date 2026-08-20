@@ -56,7 +56,8 @@ using namespace dense_attn;
 // SiluAndMul -> down MatmulBT. `h` is the RAW residual hidden [T,H] bf16 (NO pre-FF
 // norm — post-norm placement). bf16-only.
 DBuf Olmo2MlpBlock(Dev d, const Olmo2MlpWeights& w, const HfConfig& cfg,
-                   const Tensor& h, int64_t T) {
+                   const Tensor& h, int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
@@ -82,7 +83,9 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
                     const Tensor& h, const StepInputs& si,
                     const CommonAttentionMetadata& meta, const PagedKvCache& kv,
                     int64_t T, bool use_yarn, const Tensor* yarn_cache,
-                    std::optional<int64_t> sliding_window) {
+                    std::optional<int64_t> sliding_window,
+                    const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -221,13 +224,14 @@ void RunLayer(Dev d, const Olmo2LayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, const StepInputs& si,
               const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
               bool use_yarn, const Tensor* yarn_cache,
-              std::optional<int64_t> sliding_window) {
+              std::optional<int64_t> sliding_window,
+              const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   // Attention sub-block on the RAW residual (NO input norm).
   DBuf attn = Olmo2AttnBlock(d, layer.attn, cfg, hidden.t(), si, meta, kv, T,
-                             use_yarn, yarn_cache, sliding_window);
+                             use_yarn, yarn_cache, sliding_window, tp);
   // post_attention_layernorm (STANDALONE): attn_n = norm(attn).
   Tensor w_pa = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf attn_n(d, DType::kBF16, {T, H});
@@ -236,7 +240,7 @@ void RunLayer(Dev d, const Olmo2LayerWeights& layer, const HfConfig& cfg,
   vt::Add(d.q, hidden.t(), hidden.t(), attn_n.t());
 
   // MLP sub-block on the RAW residual (NO pre-FF norm).
-  DBuf mlp = Olmo2MlpBlock(d, layer.mlp, cfg, hidden.t(), T);
+  DBuf mlp = Olmo2MlpBlock(d, layer.mlp, cfg, hidden.t(), T, tp);
   // post_feedforward_layernorm (STANDALONE): mlp_n = norm(mlp).
   Tensor w_pf = ResidentWeight(d, layer.post_feedforward_layernorm, {H});
   DBuf mlp_n(d, DType::kBF16, {T, H});
@@ -260,7 +264,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv, const Olmo2Weights& weights,
-                 const HfConfig& config, const std::vector<int32_t>& logits_indices) {
+                 const HfConfig& config, const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -311,7 +316,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     }
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, si,
              attn_meta, attn_kv[static_cast<size_t>(l)], T, use_yarn,
-             use_yarn ? &yarn_cache : nullptr, sliding_window);
+             use_yarn ? &yarn_cache : nullptr, sliding_window, tp);
   }
 
   // Final standalone RMSNorm over the residual stream (olmo2.py:342), then lm_head.
@@ -362,11 +367,11 @@ std::vector<float> Olmo2Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Olmo2Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
       ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config,
-                  logits_indices);
+                  logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -377,11 +382,11 @@ ForwardLogits Olmo2Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Olmo2Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
       ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config,
-                  logits_indices);
+                  logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

@@ -262,7 +262,8 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const Qwen3DenseWeights& weights, const HfConfig& config,
                    const std::vector<int32_t>& logits_indices,
                    bool return_hidden = false,
-                   std::optional<DBuf>* out_hidden = nullptr) {
+                   std::optional<DBuf>* out_hidden = nullptr,
+                   const TensorParallel* tp = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -285,7 +286,7 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // Final RMSNorm over the fused stream (res += hidden; std norm), then lm_head.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -370,7 +371,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& logits_indices,
                  bool return_hidden = false,
                  const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr,
-                 std::optional<DBuf>* out_hidden = nullptr) {
+                 std::optional<DBuf>* out_hidden = nullptr,
+                 const TensorParallel* tp = nullptr) {
   const int64_t H = config.hidden_size;
   const int64_t T = inputs_embeds_bf16 != nullptr
                         ? static_cast<int64_t>(inputs_embeds_bf16->size()) / H
@@ -389,7 +391,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     EmbedInto(d, hidden, token_ids, weights, config);
   }
   return ForwardLayers(d, hidden.t(), positions, attn_meta, attn_kv, weights, config,
-                       logits_indices, return_hidden, out_hidden);
+                       logits_indices, return_hidden, out_hidden, tp);
 }
 
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -482,10 +484,12 @@ std::vector<float> Qwen3DenseModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, /*return_hidden=*/false,
+                             /*inputs_embeds_bf16=*/nullptr,
+                             /*out_hidden=*/nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -504,10 +508,12 @@ ForwardLogits Qwen3DenseModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, /*return_hidden=*/false,
+                             /*inputs_embeds_bf16=*/nullptr,
+                             /*out_hidden=*/nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   if (TtDumpKv(d)) {
     std::vector<float> logits_dump(static_cast<size_t>(n_out * config.vocab_size));
@@ -526,7 +532,7 @@ ForwardLogits Qwen3DenseModel::ForwardHidden(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   // ARCH-ONE-SURFACE ROW 6: the POOLING forward — the same embed + layer stack
   // as Forward/ForwardDevice, stopping after the final RMSNorm (+ gather) with
   // NO lm_head, mirroring an as_embedding_model conversion whose output layer
@@ -535,7 +541,9 @@ ForwardLogits Qwen3DenseModel::ForwardHidden(
   // embedding batch is one prefill (no per-step decode loop to keep resident).
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dhidden = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices, /*return_hidden=*/true);
+                             config, logits_indices, /*return_hidden=*/true,
+                             /*inputs_embeds_bf16=*/nullptr,
+                             /*out_hidden=*/nullptr, tp);
   const int64_t n_out = dhidden.t().shape[0];
   const int64_t H = config.hidden_size;
   ForwardLogits fl;
@@ -550,7 +558,8 @@ std::vector<float> Qwen3DenseModel::ForwardEmbeds(
     const std::vector<uint16_t>& inputs_embeds_bf16, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices, std::vector<float>* out_hidden) {
+    const std::vector<int32_t>& logits_indices, std::vector<float>* out_hidden,
+    const TensorParallel* tp) {
   // MODEL-MUSIC-MUSIC3 W2. The layer stack, the final RMSNorm, the gather and
   // the lm_head are the SAME ones Forward runs — only the first step differs,
   // and it differs exactly as `Qwen3Model.forward(inputs_embeds=...)` does.
@@ -558,7 +567,8 @@ std::vector<float> Qwen3DenseModel::ForwardEmbeds(
   std::optional<DBuf> dhidden;
   DBuf dlogits = ForwardBody(d, /*token_ids=*/{}, positions, attn_meta, attn_kv, weights,
                              config, logits_indices, /*return_hidden=*/false,
-                             &inputs_embeds_bf16, out_hidden != nullptr ? &dhidden : nullptr);
+                             &inputs_embeds_bf16, out_hidden != nullptr ? &dhidden : nullptr,
+                             tp);
   const int64_t n_out = dlogits.t().shape[0];
   if (out_hidden != nullptr) {
     VT_CHECK(dhidden.has_value(), "qwen3 dense: the hidden rows were not produced");

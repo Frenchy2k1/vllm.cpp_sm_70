@@ -805,6 +805,50 @@ jobs:
             -DVLLM_CPP_SERVER=OFF
           VLLM_CPP_DEFAULT_BUILD_DIR=build-cuda-default \
             python3 -m unittest tests.scripts.test_triton_default_definitions
+  cuda-sm70-build:
+    # The Volta (sm_70) build. nvcc 13 dropped sm_70 offline compilation, so
+    # unlike every other CUDA lane this one is pinned to the last toolkit that
+    # speaks Volta: CUDA 12.9.1 (final 12.x release). No GPU is attached; the
+    # job proves the whole src/vt/cuda tree compiles clean for sm_70 and the
+    # resolved Volta fast-path cells (sm70-nvfp4-gemm, sm70-fa2-v1) are built
+    # and audited by check-cuda-fat-gencode.py --archs 70. Runtime/correctness
+    # evidence for the V100 stays hardware-gated.
+    permissions:
+      contents: read
+    needs: [last-gated-commit]
+    if: always() && github.event.action != 'closed' && (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch')
+    concurrency:
+      group: ci-cuda-sm70-build-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils ca-certificates cmake g++ git ninja-build python3
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v4
+      - name: Configure single-arch sm_70 static library
+        run: |
+          cmake -S . -B build-cuda-sm70 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DVLLM_CPP_CUDA=ON \
+            -DVLLM_CPP_CUDA_ARCHITECTURES='70' \
+            -DVLLM_CPP_TRITON=OFF \
+            -DVLLM_CPP_BUILD_TESTS=OFF \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF
+      - name: Build sm_70 and audit exact per-source gencode
+        run: |
+          cmake --build build-cuda-sm70 --target vllm --parallel 2
+          python3 scripts/check-cuda-fat-gencode.py \
+            --archs 70 \
+            --compile-commands build-cuda-sm70/compile_commands.json \
+            --library build-cuda-sm70/libvllm.a
   vulkan-spirv-freshness:
     # The Vulkan backend commits its SPIR-V (src/vt/vulkan/vulkan_spirv.h) instead
     # of compiling shaders at build time, so the build needs no shader toolchain on
@@ -1223,6 +1267,7 @@ jobs:
       - agent-record
       - cuda-arch-features
       - cuda-fat-build
+      - cuda-sm70-build
       - vulkan-spirv-freshness
       - build-test-vulkan
       - device-leakage

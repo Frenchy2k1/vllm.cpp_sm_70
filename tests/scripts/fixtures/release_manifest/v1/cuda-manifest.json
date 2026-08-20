@@ -94,6 +94,14 @@
           "121a"
         ],
         "name": "fa2"
+      },
+      {
+        "compiled_sms": [],
+        "name": "sm70-nvfp4-gemm"
+      },
+      {
+        "compiled_sms": [],
+        "name": "sm70-fa2-v1"
       }
     ]
   },

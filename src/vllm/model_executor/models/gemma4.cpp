@@ -209,7 +209,9 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
                      int64_t T, int64_t Dh, bool rope_full,
                      const Tensor& ones_dh, const Tensor* prop_cache,
                      std::optional<int64_t> sliding_window,
-                     double rope_theta_sliding) {
+                     double rope_theta_sliding,
+                     const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = g.hidden;
   const int64_t Hq = g.num_q_heads;
   const int64_t Hkv = w.num_kv_heads > 0 ? w.num_kv_heads : g.num_kv_heads;
@@ -346,7 +348,9 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 
 // GeGLU MLP (gemma4.py::Gemma4MLP).
 DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
-                    const Tensor& dh2, int64_t T) {
+                    const Tensor& dh2, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   // Dense GeGLU: TLS reuse of large gate_up [T,2I] + act [T,I] across layers.
   Tensor wgu = ResidentWeight(d, w.gate_up_proj);
   struct MlpTls {
@@ -399,7 +403,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& logits_indices,
                  const std::vector<uint16_t>* inputs_embeds_override = nullptr,
                  const std::vector<int32_t>* ple_token_ids = nullptr,
-                 std::vector<std::vector<float>>* hidden_states_out = nullptr) {
+                 std::vector<std::vector<float>>* hidden_states_out = nullptr,
+                 const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = inputs_embeds_override != nullptr
                         ? static_cast<int64_t>(positions.size())
                         : static_cast<int64_t>(token_ids.size());
@@ -611,7 +616,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
     DBuf attn = Gemma4AttnBlock(d, w, g, dhn.t(), si, attn_meta, kv, T, Dh, full,
                                 ones_dh, full ? &prop_cache.t() : nullptr, window,
-                                g.rope_theta_sliding);
+                                g.rope_theta_sliding, tp);
 
     Tensor w_pa = ResidentWeight(d, w.post_attention_layernorm, {H});
     // h1 = rmsnorm(attn) + hidden  (one kernel)
@@ -622,7 +627,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
     Tensor w_pf = ResidentWeight(d, w.pre_feedforward_layernorm, {H});
     vt::RmsNorm(d.q, dh2.t(), h1.t(), w_pf, plain);
-    DBuf mlp = Gemma4MlpBlock(d, w.mlp, H, I, dh2.t(), T);
+    DBuf mlp = Gemma4MlpBlock(d, w.mlp, H, I, dh2.t(), T, tp);
 
     if (layer_prof) d.b.Synchronize(d.q);
     const auto t2 = layer_prof ? clock::now() : clock::time_point{};
@@ -749,10 +754,11 @@ std::vector<float> Gemma4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, nullptr, nullptr, nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -763,11 +769,13 @@ Gemma4HiddenStatesResult Gemma4Model::ForwardHiddenStates(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   Gemma4HiddenStatesResult out;
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices, nullptr, nullptr, &out.hidden_states);
+                             config, logits_indices, nullptr, nullptr,
+                             &out.hidden_states, tp);
   const int64_t n_out = dlogits.t().shape[0];
   out.logits.resize(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, out.logits.data());
@@ -780,10 +788,11 @@ ForwardLogits Gemma4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, nullptr, nullptr, nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }
@@ -793,14 +802,15 @@ std::vector<float> Gemma4Model::ForwardMm(
     const std::vector<int32_t>& ple_token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   // token_ids is unused when inputs_embeds_override is set (T comes from
   // positions); pass an empty vector so the mm seam never dereferences it.
   const std::vector<int32_t> no_tokens;
   DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, attn_kv, weights,
                              config, logits_indices, &inputs_embeds_bf16,
-                             &ple_token_ids);
+                             &ple_token_ids, nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());

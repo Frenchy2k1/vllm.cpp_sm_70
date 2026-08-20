@@ -197,6 +197,40 @@ function(vt_cuda_archs_denormalize OUT_VAR IN_ARCHS)
   set(${OUT_VAR} "${_out}" PARENT_SCOPE)
 endfunction()
 
+# vt_cuda_check_arch_toolchain(<ARCHS> <TOOLKIT_VERSION>)
+#   Reject a requested CUDA architecture that the linked nvcc toolkit cannot
+#   compile. sm_70 (Volta) is the one requested target with a hard toolchain
+#   floor: CUDA 13.0 removed offline compilation for architectures below 7.5,
+#   so a 70 build under nvcc >= 13 dies inside nvcc with an unhelpful
+#   "Unsupported gpu architecture" error. Firing HERE (configure, before any
+#   compile) turns that into an actionable one and pins the fact that the
+#   CUDA 12.x line (12.9.x is the last) is the only toolchain that can emit
+#   sm_70 SASS. ARCHS is the raw `VLLM_CPP_CUDA_ARCHITECTURES` value; the
+#   linked toolkit version comes from CMAKE_CUDA_COMPILER_VERSION.
+#   Asserted in cmake/CudaArchFeaturesTest.cmake (PROBE mode, no toolkit).
+function(vt_cuda_check_arch_toolchain IN_ARCHS TOOLKIT_VERSION)
+  if(NOT IN_ARCHS OR NOT TOOLKIT_VERSION)
+    return()
+  endif()
+  set(_has_volta OFF)
+  foreach(_arch IN LISTS IN_ARCHS)
+    string(STRIP "${_arch}" _arch)
+    if(_arch STREQUAL "70" OR _arch STREQUAL "7.0")
+      set(_has_volta ON)
+      break()
+    endif()
+  endforeach()
+  if(_has_volta AND TOOLKIT_VERSION VERSION_GREATER_EQUAL 13.0)
+    message(FATAL_ERROR
+      "VLLM_CPP_CUDA_ARCHITECTURES includes '70' (Volta / Tesla V100), but this "
+      "build uses nvcc ${TOOLKIT_VERSION}. CUDA 13.0 removed offline "
+      "compilation for architectures below 7.5; the CUDA 12.x series is the "
+      "LAST toolchain that supports sm_70 (12.9.1 is the final 12.x). "
+      "Configure with an nvcc < 13 toolkit, e.g. the "
+      "nvidia/cuda:12.9.1-devel-ubuntu24.04 CI image, or drop '70'.")
+  endif()
+endfunction()
+
 # vt_cuda_gencode_options(<OUT> <CMAKE CUDA arch list>)
 #   Convert an explicit CMake-form architecture list into source-scoped nvcc
 #   gencode options. W1 disables CMake's target-wide CUDA_ARCHITECTURES emission
@@ -346,7 +380,15 @@ set(VT_CUDA_FEATURE_TABLE
   # the Ampere sm_8x cells are DERIVED+BUILD-VERIFIED (testing-welcome) — compiled
   # + cuobjdump-proven sm_8x cubins, NO Ampere board ran them here. A green build
   # is never a runtime claim. See .agents/specs/cuda-arch-ampere-fastpath.md WA-1.
-  "fa2|8.0,8.6,8.7,8.9,12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)")
+  "fa2|8.0,8.6,8.7,8.9,12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)"
+  # Volta W4A16 NVFP4 decode GEMM (cuda_sm70_nvfp4_gemm.cu), Phase-2 brick A.
+  # upstream: none (Volta removed upstream); source: dnv2003/v100-skinny SIMT.
+  "sm70-nvfp4-gemm|7.0|sm70 W4A16 NVFP4 SIMT decode (M<=3; QPN/WMMA next)"
+  # Volta FA2 fragment core, vendored (third_party/flash_attn_v100/; upstream
+  # 1Cat-vLLM flash-attention-v100). sm_70-only by construction. The attention
+  # kernels (ATen-decoupled port) come in the follow-up; this cell gates the
+  # vendored core's compile en that arch.
+  "sm70-fa2-v1|7.0|Volta FA2 fragment core (cuda_flash_attn_v100.cu)")
 
 # vt_cuda_feature_archs(<OUT_ARCHS> <FEATURE>)
 #   Resolves FEATURE against the requested VLLM_CPP_CUDA_ARCHITECTURES and sets

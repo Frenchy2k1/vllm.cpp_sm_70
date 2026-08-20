@@ -109,7 +109,9 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
                      const Tensor& dhn, const StepInputs& si,
                      const CommonAttentionMetadata& meta, const PagedKvCache& kv,
                      int64_t T, double rope_base, float attn_scale,
-                     std::optional<int64_t> sliding_window) {
+                     std::optional<int64_t> sliding_window,
+                     const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -205,7 +207,9 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
 // Gemma-3 GeGLU MLP (gemma3.py::Gemma3MLP): merged gate_up -> GeluAndMul(tanh) ->
 // down. `dh2` is the pre-FF-normed hidden [T,H] bf16.
 DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
-                    const Tensor& dh2, int64_t T) {
+                    const Tensor& dh2, int64_t T,
+                    const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam
@@ -230,7 +234,8 @@ DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
 void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
               const Gemma3Layout& g, int64_t l, DBuf& hidden, DBuf& res,
               const StepInputs& si, const CommonAttentionMetadata& meta,
-              const PagedKvCache& kv, int64_t T) {
+              const PagedKvCache& kv, int64_t T,
+              const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const vt::RmsNormArgs gemma{eps, true};
@@ -252,7 +257,7 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
   std::optional<int64_t> window;
   if (sliding) window = g.sliding_window;
   DBuf attn = Gemma3AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T,
-                              rope_base, g.attn_scale, window);
+                              rope_base, g.attn_scale, window, tp);
 
   // post_attention_layernorm (STANDALONE GemmaRMSNorm, sandwich): attn = norm(attn).
   // NOT-FUSABLE onto kFusedAddRmsNorm — a sublayer-output post-norm with NO residual
@@ -270,7 +275,7 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
     vt::RmsNorm(d.q, dh2.t(), attn_n.t(), w_pf, gemma, &res.t());
 
   // GeGLU MLP
-  DBuf mlp = Gemma3MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DBuf mlp = Gemma3MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
 
   // post_feedforward_layernorm (STANDALONE GemmaRMSNorm, sandwich): hidden=norm(mlp).
   // NOT-FUSABLE (no residual add). STANDALONE. (Tier-B2)
@@ -294,7 +299,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Gemma3Weights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -326,7 +332,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, g, l, hidden, res, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // Final GemmaRMSNorm over the fused stream (res += hidden; gemma norm) via catalog.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -378,10 +384,11 @@ std::vector<float> Gemma3Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma3Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -392,10 +399,11 @@ ForwardLogits Gemma3Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Gemma3Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

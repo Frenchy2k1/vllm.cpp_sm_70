@@ -42,7 +42,8 @@ using namespace dense_attn;
 // Phi-3 SwiGLU MLP (pre-fused gate_up_proj): merged gate_up MatmulBT -> SiluAndMul
 // -> down MatmulBT. `dh2` is the post-norm hidden [T,H] bf16.
 DBuf Phi3MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
-                  const Tensor& dh2, int64_t T) {
+                  const Tensor& dh2, int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
@@ -67,7 +68,8 @@ DBuf Phi3MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
 DBuf Phi3AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const Tensor& rope_cache,
                    const HfConfig& cfg, const Tensor& dhn, const StepInputs& si,
                    const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                   int64_t T) {
+                   int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -133,7 +135,8 @@ DBuf Phi3AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const Tensor& rope_cac
 // fused add+RMSNorm -> MLP. `hidden` is the delta, `res` the residual accumulator.
 void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const Tensor& rope_cache,
               const HfConfig& cfg, DBuf& hidden, DBuf& res, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -141,13 +144,13 @@ void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const Tensor& rope_cac
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
 
-  DBuf attn = Phi3AttnBlock(d, layer.attn, rope_cache, cfg, dhn.t(), si, meta, kv, T);
+  DBuf attn = Phi3AttnBlock(d, layer.attn, rope_cache, cfg, dhn.t(), si, meta, kv, T, tp);
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
 
-  hidden = Phi3MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  hidden = Phi3MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
 }
 
 void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>& idx,
@@ -163,7 +166,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv, const Phi3Weights& weights,
-                 const HfConfig& config, const std::vector<int32_t>& logits_indices) {
+                 const HfConfig& config, const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -190,7 +194,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, dw.layers[static_cast<size_t>(l)], rope_cache, config, hidden, res,
-             si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             si, attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   Tensor w_fn = ResidentWeight(d, dw.final_norm, {H});
   DBuf dnorm(d, DType::kBF16, {T, H});
@@ -236,10 +240,10 @@ std::vector<float> Phi3Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Phi3Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -250,10 +254,10 @@ ForwardLogits Phi3Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Phi3Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
-                             config, logits_indices);
+                             config, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

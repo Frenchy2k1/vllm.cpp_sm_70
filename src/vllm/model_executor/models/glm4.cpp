@@ -53,7 +53,8 @@ using namespace dense_attn;
 // GLM-4 dense SwiGLU MLP (glm4.py Glm4MLP=LlamaMLP): merged gate_up MatmulBT ->
 // SiluAndMul -> down MatmulBT. `dh2` is the post-norm hidden [T,H] bf16. bf16-only.
 DBuf Glm4MlpBlock(Dev d, const Glm4MlpWeights& w, const HfConfig& cfg,
-                  const Tensor& dh2, int64_t T) {
+                  const Tensor& dh2, int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
@@ -80,7 +81,8 @@ DBuf Glm4MlpBlock(Dev d, const Glm4MlpWeights& w, const HfConfig& cfg,
 DBuf Glm4AttnBlock(Dev d, const Glm4AttnWeights& w, const HfConfig& cfg,
                    const Tensor& dhn, const StepInputs& si,
                    const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                   int64_t T) {
+                   int64_t T, const TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -163,7 +165,8 @@ DBuf Glm4AttnBlock(Dev d, const Glm4AttnWeights& w, const HfConfig& cfg,
 // `hidden` (bf16 [T,H]) is the sublayer delta; `res` (bf16 [T,H]) the residual.
 void RunLayer(Dev d, const Glm4LayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -173,7 +176,7 @@ void RunLayer(Dev d, const Glm4LayerWeights& layer, const HfConfig& cfg,
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
 
   // self-attention
-  DBuf attn = Glm4AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T);
+  DBuf attn = Glm4AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T, tp);
 
   // post_self_attn_layernorm (STANDALONE, sandwich): attn_n = norm(attn)
   Tensor w_psa = ResidentWeight(d, layer.post_self_attn_layernorm, {H});
@@ -186,7 +189,7 @@ void RunLayer(Dev d, const Glm4LayerWeights& layer, const HfConfig& cfg,
   vt::RmsNorm(d.q, dh2.t(), attn_n.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
 
   // MLP
-  DBuf mlp = Glm4MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  DBuf mlp = Glm4MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
 
   // post_mlp_layernorm (STANDALONE, sandwich): hidden = norm(mlp)  (next delta)
   Tensor w_pm = ResidentWeight(d, layer.post_mlp_layernorm, {H});
@@ -209,7 +212,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv, const Glm4Weights& weights,
-                 const HfConfig& config, const std::vector<int32_t>& logits_indices) {
+                 const HfConfig& config, const std::vector<int32_t>& logits_indices,
+                 const TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -239,7 +243,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // Final RMSNorm over the fused stream (res += hidden; std norm), then lm_head.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -289,11 +293,11 @@ std::vector<float> Glm4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Glm4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
       ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config,
-                  logits_indices);
+                  logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
@@ -304,11 +308,11 @@ ForwardLogits Glm4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
     const Glm4Weights& weights, const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
       ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, config,
-                  logits_indices);
+                  logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }

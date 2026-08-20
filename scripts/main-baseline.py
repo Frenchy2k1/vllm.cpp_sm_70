@@ -82,6 +82,7 @@ EXPECTED_JOBS = (
     "build-test-vulkan",
     "cuda-arch-features",
     "cuda-fat-build",
+    "cuda-sm70-build",
     "device-leakage",
     "sanitize-cpu",
     "vulkan-spirv-freshness",

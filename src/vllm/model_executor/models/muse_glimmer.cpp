@@ -133,7 +133,9 @@ DBuf MuseGlimmerAttnBlock(Dev d, const MuseGlimmerAttnWeights& w,
                           const MuseGlimmerTextParams& t, const MuseGlimmerLayout& g,
                           const Tensor& dhn, const Tensor& ones_head,
                           const StepInputs& si, const CommonAttentionMetadata& meta,
-                          const PagedKvCache& kv, int64_t T, bool use_rope) {
+                          const PagedKvCache& kv, int64_t T, bool use_rope,
+                          const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   const int64_t H = t.hidden_size;
   const int64_t Hq = t.num_attention_heads;
   const int64_t Hkv = t.num_key_value_heads;
@@ -260,7 +262,8 @@ DBuf MuseGlimmerAttnBlock(Dev d, const MuseGlimmerAttnWeights& w,
 // ...GeluMethod sibling; Muse asserts `silu` at config parse and uses this one.
 DBuf MuseGlimmerMlpBlock(Dev d, const MuseGlimmerMlpWeights& w,
                          const MuseGlimmerTextParams& t, const Tensor& dh2,
-                         int64_t T) {
+                         int64_t T, const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;
   DBuf act =
       layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, t.intermediate_size).Apply(d, dh2);
   Tensor wd = ResidentWeight(d, w.down_proj);
@@ -279,7 +282,8 @@ DBuf MuseGlimmerMlpBlock(Dev d, const MuseGlimmerMlpWeights& w,
 void RunLayer(Dev d, const MuseGlimmerLayerWeights& layer,
               const MuseGlimmerTextParams& t, const MuseGlimmerLayout& g, int64_t l,
               DBuf& hidden, DBuf& res, const Tensor& ones_head, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = t.hidden_size;
   const vt::RmsNormArgs pre{g.pre_eps, /*gemma=*/true};
   const vt::RmsNormArgs post{g.post_eps, /*gemma=*/true};
@@ -294,7 +298,7 @@ void RunLayer(Dev d, const MuseGlimmerLayerWeights& layer,
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, pre, &res.t());
 
   DBuf attn = MuseGlimmerAttnBlock(d, layer.attn, t, g, dhn.t(), ones_head, si, meta,
-                                   kv, T, g.UsesRope(l));
+                                   kv, T, g.UsesRope(l), tp);
 
   // post_attention_layernorm: SANDWICH sublayer-output post-norm at `post_norm_eps`
   // (:1239) with NO residual add — NOT fusable onto kFusedAddRmsNorm (that recipe's
@@ -313,7 +317,7 @@ void RunLayer(Dev d, const MuseGlimmerLayerWeights& layer,
   else
     vt::RmsNorm(d.q, dh2.t(), attn_n.t(), w_pf, pre, &res.t());
 
-  DBuf mlp = MuseGlimmerMlpBlock(d, layer.mlp, t, dh2.t(), T);
+  DBuf mlp = MuseGlimmerMlpBlock(d, layer.mlp, t, dh2.t(), T, tp);
 
   // post_feedforward_layernorm: STANDALONE post-norm at `post_norm_eps` (:1245).
   Tensor w_pff = ResidentWeight(d, layer.post_feedforward_layernorm, {H});
@@ -343,7 +347,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<PagedKvCache>& attn_kv,
                  const MuseGlimmerWeights& weights,
                  const std::vector<int32_t>& logits_indices,
-                 const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr) {
+                 const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr,
+                 const vllm::TensorParallel* tp = nullptr) {
   const MuseGlimmerTextParams& t = weights.params.text;
   const int64_t T = inputs_embeds_bf16 != nullptr
                         ? static_cast<int64_t>(positions.size())
@@ -401,7 +406,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 
   for (int64_t l = 0; l < t.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], t, g, l, hidden, res,
-             ones_head.t(), si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             ones_head.t(), si, attn_meta, attn_kv[static_cast<size_t>(l)], T, tp);
 
   // Final norm (:1296): residual-add + RMSNorm with the weight applied as `w`, NOT
   // `1+w` — MuseGlimmerRMSNorm's default weight_offset is 0 and only the four
@@ -467,10 +472,12 @@ std::vector<float> MuseGlimmerModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
+                  logits_indices, nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * weights.params.text.vocab_size);
   dlogits.Download(d, logits.data());
@@ -481,10 +488,12 @@ ForwardLogits MuseGlimmerModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights,
+                  logits_indices, nullptr, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, weights.params.text.vocab_size);
 }
@@ -494,13 +503,14 @@ std::vector<float> MuseGlimmerModel::ForwardMm(
     const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   // `token_ids` is unused on this branch (T comes from `positions`); pass an empty
   // vector so the mm seam never dereferences it.
   const std::vector<int32_t> no_tokens;
   DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, attn_kv, weights,
-                             logits_indices, &inputs_embeds_bf16);
+                             logits_indices, &inputs_embeds_bf16, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * weights.params.text.vocab_size);
   dlogits.Download(d, logits.data());

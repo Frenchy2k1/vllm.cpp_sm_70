@@ -172,7 +172,8 @@ class OPTModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const OPTWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 
   // DEVICE-resident variant (sampler-on-device hot path): same contract as
   // Forward but returns the lm_head output as a device buffer with no
@@ -182,7 +183,8 @@ class OPTModel {
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const OPTWeights& weights,
       const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const vllm::TensorParallel* tp = nullptr);
 };
 
 // Per-family config hook (mirrors ParseQwen3ForCausalLMConfig). Unlike the Qwen

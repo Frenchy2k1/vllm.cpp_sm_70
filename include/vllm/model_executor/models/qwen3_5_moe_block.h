@@ -43,6 +43,7 @@ struct MoeBlockOutput {
 // reference path. `config.shared_expert_intermediate_size == 0` (Coder) skips
 // the shared expert (SEAM GAP #3); `> 0` (the 35B) runs it unchanged.
 MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
-                           const HfConfig& config, const vt::Tensor& dh, int64_t T);
+                           const HfConfig& config, const vt::Tensor& dh, int64_t T,
+                           const TensorParallel* tp = nullptr);
 
 }  // namespace vllm

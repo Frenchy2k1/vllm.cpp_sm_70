@@ -463,7 +463,9 @@ std::vector<float> KimiLinearModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
+  (void)tp;  // CPU host reference: no per-rank sharding seam (device lane threads tp)
   // The CPU reference manages its own (fresh, single-sequence) recurrent + latent
   // context, so the runner's paged-KV / positions / queue are unused here — the
   // device runner path (paged KV, het-KV groups, on-GPU sampling) is ForwardDevice

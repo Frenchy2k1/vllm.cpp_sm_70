@@ -284,7 +284,8 @@ mla::MlaBlockWeights ResidentMla(Dev d, const DeepseekV2MlaWeights& w,
 // `DeepseekV2MLP.forward` (deepseek_v2.py:270-274): merged gate_up GEMM ->
 // SiluAndMul -> down GEMM. Identical op shape to the Qwen3-dense MlpBlock.
 DBuf DenseMlp(Dev d, const DeepseekV2DenseMlp& w, const Tensor& dh, int64_t T,
-              int64_t H, int64_t I) {
+              int64_t H, int64_t I, const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing-only wave: tp==nullptr (tp1) is the inert no-op path
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
   // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
   // inline path ran; this single fold covers BOTH the dense-layer MLP and the
@@ -334,7 +335,8 @@ bool GroupedMoeEligible(Dev d, const DeepseekV2MoeWeights& w) {
 // `DeepseekV2MoE.forward` (deepseek_v2.py:395-424) + the FusedMoE runner's
 // routed/shared composition (moe_runner.py:392-407).
 DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
-              const Tensor& dh, int64_t T) {
+              const Tensor& dh, int64_t T, const vllm::TensorParallel* tp = nullptr) {
+  (void)tp;  // plumbing only: tp==nullptr (tp1) is the inert no-op path
   const int64_t H = p.hidden_size;
   const int64_t E = p.n_routed_experts;
   const int64_t top_k = p.num_experts_per_tok;
@@ -484,7 +486,7 @@ DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
 void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params& p,
               Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
               const MlaStep& step, Tensor& kv_cache, v1::TritonMLAImpl& impl,
-              int64_t T) {
+              int64_t T, const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = p.hidden_size;
   const float eps = p.rms_norm_eps;
 
@@ -500,7 +502,7 @@ void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params
   Tensor attn_t = attn.t();
   const mla::MlaBlockWeights mw = ResidentMla(d, layer.attn, p, *step.rope_cache);
   mla::ForwardMlaAttentionBlock(d, p.mla, mw, dhn.t(), step.positions, kv_cache,
-                                step.slot_mapping, step.meta, impl, attn_t);
+                                step.slot_mapping, step.meta, impl, attn_t, tp);
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
@@ -511,8 +513,8 @@ void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params
   }
 
   // `self.mlp(hidden_states)` — MoE or dense, per first_k_dense_replace (:1214).
-  DBuf mlp = layer.is_moe ? MoeBlock(d, layer.moe, p, dh2.t(), T)
-                          : DenseMlp(d, layer.dense, dh2.t(), T, H, p.intermediate_size);
+  DBuf mlp = layer.is_moe ? MoeBlock(d, layer.moe, p, dh2.t(), T, tp)
+                          : DenseMlp(d, layer.dense, dh2.t(), T, H, p.intermediate_size, tp);
   // The MLP output becomes the new residual-stream delta; keep its storage alive
   // until the next producer replaces it.
   auto* held = new DBuf(std::move(mlp));
@@ -576,7 +578,8 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const CommonAttentionMetadata& am,
                    const std::vector<PagedKvCache>& attn_kv,
                    const DeepseekV2Weights& weights,
-                   const std::vector<int32_t>& logits_indices) {
+                   const std::vector<int32_t>& logits_indices,
+                   const vllm::TensorParallel* tp = nullptr) {
   const DeepseekV2Params& p = weights.params;
   const int64_t T = hidden_in.shape[0];
   const int64_t H = p.hidden_size;
@@ -610,7 +613,7 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     Tensor kv_cache = MakeTensor(kv.data, kv.dtype, d.q.device,
                                  {kv.num_blocks, kv.block_size, head_size});
     RunLayer(d, weights.layers[static_cast<size_t>(l)], p, hidden, hidden_hold, res,
-             step, kv_cache, impl, T);
+             step, kv_cache, impl, T, tp);
   }
 
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -652,12 +655,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const CommonAttentionMetadata& am,
                  const std::vector<PagedKvCache>& attn_kv,
                  const DeepseekV2Weights& weights,
-                 const std::vector<int32_t>& logits_indices) {
+                 const std::vector<int32_t>& logits_indices,
+                 const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   DBuf hidden(d, DType::kBF16, {T, weights.params.hidden_size});
   EmbedInto(d, hidden, token_ids, weights);
   return ForwardLayers(d, hidden.t(), positions, am, attn_kv, weights,
-                       logits_indices);
+                       logits_indices, tp);
 }
 
 ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -839,10 +843,11 @@ std::vector<float> DeepseekV2Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV2Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * weights.params.vocab_size);
   dlogits.Download(d, logits.data());
@@ -853,10 +858,11 @@ ForwardLogits DeepseekV2Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV2Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits =
-      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
+      ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices, tp);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }

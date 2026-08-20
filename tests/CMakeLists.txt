@@ -1578,6 +1578,12 @@ if(TARGET vllm_shared)
         -P "${CMAKE_SOURCE_DIR}/cmake/VerifyExports.cmake")
   endif()
 endif()
+vllm_cpp_add_test(test_sm70_nvfp4_gemm vt/test_sm70_nvfp4_gemm.cpp)
+# The tactic registry header lives under src/ (not the public include/ tree);
+# host TUs that reach it get the src root explicitly.
+target_include_directories(test_sm70_nvfp4_gemm PRIVATE "${CMAKE_SOURCE_DIR}/src")
+vllm_cpp_add_test(test_sm70_fa2_decode vt/test_sm70_fa2_decode.cpp)
+target_include_directories(test_sm70_fa2_decode PRIVATE "${CMAKE_SOURCE_DIR}/src")
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)
 vllm_cpp_add_test(test_dropin_abi vt/test_dropin_abi.cpp)
 target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1678,6 +1684,12 @@ vllm_cpp_add_test(test_reference_tier vt/test_reference_tier.cpp)
 vllm_cpp_add_test(test_communicator vt/test_communicator.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test_communicator PRIVATE Threads::Threads)
+# Multi-device (TP) phase 3: the REAL in-process NCCL collective across the
+# box's discrete GPUs (ncclCommInitAll + AllReduce/AllGather on per-device
+# NcclCommunicator). Only built+linked when the NCCL transport is on.
+if(VLLM_CPP_NCCL)
+  vllm_cpp_add_test(test_nccl_group vt/test_nccl_group.cpp)
+endif()
 # Scale-out W2 (scale-out-distributed.md §W2): the tensor-parallel CORRECTNESS
 # gate with NO GPU — sharded-matmul + RowParallel all-reduce == the unsharded
 # tp=1 forward, through the ACTUAL W2 helpers (TpShard/TpAllReduceSum) over the
