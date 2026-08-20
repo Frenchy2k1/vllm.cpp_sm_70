@@ -28,14 +28,19 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
+#include "vt/ops.h"
 
 namespace vt::cuda {
 namespace {
@@ -1192,10 +1197,184 @@ bool LaunchSm70Fp8W8A16(const void* argsPtr) {
   return cudaGetLastError() == cudaSuccess;
 }
 
+// ---------------------------------------------------------------------------
+// vt::MatmulFp8W8a16 CUDA arm. The op is bf16-domain (the model activation and
+// the out tensor are bf16, the keep container's per-column scale is f32 —
+// exactly the Fp8PerChannelWeight the loader stores); the decode kernel above
+// is fp16-domain (`__half` fragments + per-column bf16-side epilogue). This
+// arm bridges the two with three small elementwise staging passes, so the
+// single kernel keeps its verified bit-exact band untouched:
+//   act bf16 [m,k]  -> fp16 [m,k]  (every call; the activation changes per
+//                                   step, so NO identity cache — only the
+//                                   size-cached staging buffer)
+//   scale f32 [n]   -> fp16 [n]    (identity-cached on (scale pointer, n),
+//                                   exactly like the wcodes repack cache: the
+//                                   resident weight's scale never changes)
+//   kernel fp16 out -> bf16 [m,n]  (every call)
+// All buffers are static size-cached (cudaMalloc only on growth), so nothing
+// allocates inside stream capture once the decode shapes are fixed — the same
+// capture discipline as the launcher's own repack scratch.
+//
+// M > 16 (prefill) leaves the M<=16 decode band and is served by a naive
+// same-math kernel reading bf16 + f32 directly (fp32 accumulate, bf16 store),
+// so a big batch can never decline into uninitialized output.
+// ---------------------------------------------------------------------------
+__global__ void Bf16ToFp16Kernel(__half* __restrict__ dst, const __nv_bfloat16* __restrict__ src,
+                                 int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
+    dst[i] = __float2half_rn(__bfloat162float(src[i]));
+}
+
+__global__ void F32ToFp16Kernel(__half* __restrict__ dst, const float* __restrict__ src,
+                                int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
+    dst[i] = __float2half_rn(src[i]);
+}
+
+__global__ void Fp16ToBf16Kernel(__nv_bfloat16* __restrict__ dst, const __half* __restrict__ src,
+                                 int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
+    dst[i] = __float2bfloat16_rn(__half2float(src[i]));
+}
+
+// fp8-e4m3fn byte -> f32 on device, bit-identical to the host Fp8ByteToF32
+// above (sign/exp/mant decode, NaN -> 0, denormal / 512, else ldexp).
+__device__ __forceinline__ float DecodeFp8E4m3(unsigned char byte) {
+  const unsigned sign = byte & 0x80u;
+  const unsigned exp = (byte >> 3) & 0xFu;
+  const unsigned mant = byte & 0x7u;
+  const float sm = sign ? -1.0f : 1.0f;
+  if (exp == 0xFu && mant == 0x7u) return 0.f;  // NaN: weights never hold it
+  if (exp == 0u) return sm * (static_cast<float>(mant) * (1.0f / 512.0f));
+  return sm * ldexpf(1.0f + static_cast<float>(mant) * (1.0f / 8.0f),
+                     static_cast<int>(exp) - 7);
+}
+
+// Whole-tensor naive reference for M > 16 (the decode band is M<=16): same
+// contract as the op — out[m,n] = sum_k bf16(x[m,k])*f32(f8(w[n,k]))*scale[n],
+// fp32 accumulation, bf16 store. No allocation; grid-stride over [m,n].
+__global__ void MatmulFp8W8a16Naive(__nv_bfloat16* __restrict__ out,
+                                    const __nv_bfloat16* __restrict__ x,
+                                    const uint8_t* __restrict__ w,
+                                    const float* __restrict__ scale, int64_t m, int64_t n,
+                                    int64_t k) {
+  const int64_t total = m * n;
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; e < total;
+       e += step) {
+    const int64_t row = e / n, col = e % n;
+    const float scv = scale[col];
+    float acc = 0.0f;
+    for (int64_t kk = 0; kk < k; ++kk)
+      acc += __bfloat162float(x[row * k + kk]) * DecodeFp8E4m3(w[col * k + kk]);
+    out[e] = __float2bfloat16_rn(acc * scv);
+  }
+}
+
+void Check(cudaError_t err, const char* what) {
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("vt cuda: matmul_fp8_w8a16: ") + what + ": " +
+                             cudaGetErrorString(err));
+  }
+}
+
+void MatmulFp8W8a16KernelCuda(Queue& q, Tensor& out, const Tensor& act,
+                              const Tensor& fp8_packed, const Tensor& scale_f32) {
+  const int64_t m = act.shape[0], n = fp8_packed.shape[0], k = fp8_packed.shape[1];
+  if (m == 0 || n == 0) return;
+  cudaStream_t stream = static_cast<cudaStream_t>(q.handle);
+  const auto* dx = static_cast<const __nv_bfloat16*>(act.data);
+  const auto* dw = static_cast<const uint8_t*>(fp8_packed.data);
+  const auto* dscale = static_cast<const float*>(scale_f32.data);
+  auto* dy = static_cast<__nv_bfloat16*>(out.data);
+
+  // The decode path is the kernel's VALIDATED 8-warp band only: the kernel's
+  // own self-check gates M=8/n=64/k=1024 (K%128==0), and this op gate re-
+  // validates M=1..16 at K%128==0. The K%128!=0 4-warp band is NOT covered by
+  // either gate, so it is never handed to the kernel — it takes the exact
+  // same-math naive fallback below instead of risking silent wrong numbers.
+  const bool decode = m <= 16 && (n % 32) == 0 && (k % 64) == 0 && (k % 128) == 0;
+  const size_t yelems = static_cast<size_t>(m) * static_cast<size_t>(n);
+  if (!decode) {
+    const int blocks = static_cast<int>((yelems + 255) / 256);
+    MatmulFp8W8a16Naive<<<blocks, 256, 0, stream>>>(dy, dx, dw, dscale, m, n, k);
+    Check(cudaGetLastError(), "launch (naive)");
+    return;
+  }
+
+  // bf16 -> fp16 activation staging; the buffer is size-cached (grow-only,
+  // identity-cached exactly like the kernel's repack scratch, so stream
+  // capture never allocates once the decode shape is fixed).
+  static __half* s_f16x = nullptr;
+  static size_t s_f16x_cap = 0;
+  const size_t xelems = static_cast<size_t>(m) * static_cast<size_t>(k);
+  if (xelems > s_f16x_cap) {
+    cudaFree(s_f16x);
+    cudaMalloc(&s_f16x, xelems * sizeof(__half));
+    s_f16x_cap = xelems;
+  }
+  const int xblocks = static_cast<int>((xelems + 255) / 256);
+  Bf16ToFp16Kernel<<<xblocks, 256, 0, stream>>>(s_f16x, dx, static_cast<int64_t>(xelems));
+
+  // f32 [n] per-column scale -> fp16 [n], repacked ONLY when the resident
+  // weight identity changes (pointer + n), exactly like the wcodes repack
+  // cache in LaunchSm70Fp8W8A16 above.
+  static const float* s_sc = nullptr;
+  static int s_scn = 0;
+  static __half* s_scd = nullptr;
+  static size_t s_sccap = 0;
+  if (dscale != s_sc || n != s_scn) {
+    if (static_cast<size_t>(n) > s_sccap) {
+      cudaFree(s_scd);
+      cudaMalloc(&s_scd, static_cast<size_t>(n) * sizeof(__half));
+      s_sccap = static_cast<size_t>(n);
+    }
+    const int sblocks = static_cast<int>((n + 255) / 256);
+    F32ToFp16Kernel<<<sblocks, 256, 0, stream>>>(s_scd, dscale, n);
+    s_sc = dscale;
+    s_scn = n;
+  }
+
+  // fp16 [m,n] out staging, size-capped like the activation buffer.
+  static __half* s_f16y = nullptr;
+  static size_t s_f16y_cap = 0;
+  if (yelems > s_f16y_cap) {
+    cudaFree(s_f16y);
+    cudaMalloc(&s_f16y, yelems * sizeof(__half));
+    s_f16y_cap = yelems;
+  }
+
+  struct A {
+    const uint8_t* wcodes;
+    const __half* wscale;
+    const __half* x;
+    __half* y;
+    int m, n, k;
+    cudaStream_t stream;
+  };
+  const A a{dw, s_scd, s_f16x, s_f16y, static_cast<int>(m), static_cast<int>(n),
+            static_cast<int>(k), stream};
+  // The decode-gate preconditions (M<=16, N%32==0, K%64==0, K%128==0) were
+  // checked above; a decline here is a launch error and must be loud, never a
+  // silent partial write.
+  VT_CHECK(LaunchSm70Fp8W8A16(&a),
+           "matmul_fp8_w8a16: LaunchSm70Fp8W8A16 declined a validated W8A16 shape");
+
+  const int yblocks = static_cast<int>((yelems + 255) / 256);
+  Fp16ToBf16Kernel<<<yblocks, 256, 0, stream>>>(dy, s_f16y, static_cast<int64_t>(yelems));
+  Check(cudaGetLastError(), "launch");
+}
+
 struct Registrar {
   Registrar() {
     const ArchTactic tactic = {"nvfp4-w4a16/sm70-simt", &Sm70Nvfp4Supports, &LaunchSm70Nvfp4W4a16};
     RegisterArchTactic(TacticFamily::kSm70Nvfp4W4a16, tactic);
+    RegisterOp(OpId::kMatmulFp8W8a16, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulFp8W8a16Fn>(&MatmulFp8W8a16KernelCuda)));
   }
 };
 static Registrar g_registrar;

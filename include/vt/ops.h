@@ -140,6 +140,9 @@ enum class OpId : uint8_t {
   kMatmulNvfp4Cutlass,
   kMatmulFp8Cutlass,
   kMatmulFp8CublasLt,
+  // Keep-quant FP8 W8A16 (fp8 per-column weights, bf16 activations) — the
+  // sm70 decode GEMM surface (LaunchSm70Fp8W8A16). See MatmulFp8W8a16 below.
+  kMatmulFp8W8a16,
   kQuantFp8Static,
   kSwizzleBlockscale,
   kMoeGroupedGemmNvfp4,
@@ -935,6 +938,10 @@ using MatmulFp8CutlassFn =
 // The trailing bool is `claims_splitk1_premise` — see MatmulFp8CublasLt below.
 using MatmulFp8CublasLtFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float, bool);
+// Keep-quant FP8 W8A16 (fp8 per-column weights, bf16 activations, f32
+// per-column scale): out[m,n] = Σ_k bf16(act[m,k])·f32(w8[n,k])·scale[n].
+using MatmulFp8W8a16Fn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&);
 // Same operands as MatmulFp8CublasLtFn, but the trailing scalar alpha becomes a
 // device f32 [N] vector — one folded alpha per OUTPUT COLUMN.
 using MatmulFp8CublasLtAlphaVecFn =
@@ -1787,6 +1794,22 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
 // the two-launch arm, whose GEMM IS MatmulFp8CublasLt.
 void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                                const Tensor& alpha_vec, bool claims_splitk1_premise = false);
+
+// MatmulFp8W8a16 — keep-quant FP8 W8A16 dense GEMM (the sm70 decode arm; the
+// per-channel fp8 sibling of the per-tensor W8A8 ops above). The weight is the
+// keep-quant Fp8PerChannelWeight container: raw fp8-e4m3fn bytes + one f32
+// scale per OUTPUT COLUMN (no group scales, no alpha folding):
+//   out[m,n] = Σ_k bf16(act[m,k]) · f32(w8[n,k]) · scale[n]
+// f32 accumulation. act [M,K] bf16, fp8_packed [N,K] i8 raw e4m3fn bytes
+// (K contiguous), scale_f32 [N] f32, out [M,N] bf16 (the kernel's epilogue;
+// f32 admitted = the bf16-rounded value widened, like the cutlass f32-output
+// cast). CUDA = LaunchSm70Fp8W8A16's VALIDATED 8-warp band (M<=16, N%32==0,
+// K%128==0; larger M or the ungated K%128!=0 4-warp band is served by the
+// same-math naive fallback so prefill cannot misroute); CPU = the dequant
+// reference (Fp8ToF32) — the numeric oracle. No allocation during stream
+// capture (identity-cached repackages).
+void MatmulFp8W8a16(Queue& q, Tensor& out, const Tensor& act, const Tensor& fp8_packed,
+                    const Tensor& scale_f32);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

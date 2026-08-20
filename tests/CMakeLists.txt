@@ -1582,6 +1582,9 @@ vllm_cpp_add_test(test_sm70_nvfp4_gemm vt/test_sm70_nvfp4_gemm.cpp)
 # The tactic registry header lives under src/ (not the public include/ tree);
 # host TUs that reach it get the src root explicitly.
 target_include_directories(test_sm70_nvfp4_gemm PRIVATE "${CMAKE_SOURCE_DIR}/src")
+# The vt::MatmulFp8W8a16 keep-quant W8A16 op gate (CPU reference + CUDA
+# decode-band arms vs the case-G model-math oracle). Runs with the sm70 family.
+vllm_cpp_add_test(test_ops_matmul_fp8_w8a16 vt/test_ops_matmul_fp8_w8a16.cpp)
 vllm_cpp_add_test(test_sm70_fa2_decode vt/test_sm70_fa2_decode.cpp)
 target_include_directories(test_sm70_fa2_decode PRIVATE "${CMAKE_SOURCE_DIR}/src")
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)

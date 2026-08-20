@@ -346,6 +346,8 @@ const char* OpNameImpl(OpId op) {
       return "MatmulFp8Cutlass";
     case OpId::kMatmulFp8CublasLt:
       return "MatmulFp8CublasLt";
+    case OpId::kMatmulFp8W8a16:
+      return "MatmulFp8W8a16";
     case OpId::kQuantFp8Static:
       return "QuantFp8Static";
     case OpId::kSwizzleBlockscale:

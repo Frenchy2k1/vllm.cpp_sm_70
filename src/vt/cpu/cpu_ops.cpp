@@ -735,6 +735,36 @@ void MatmulFp8CutlassKernel(Queue&, Tensor& out, const Tensor& a_fp8, const Tens
   });
 }
 
+// MatmulFp8W8a16 CPU kernel — the keep-quant FP8 W8A16 numeric oracle:
+//   out[m,n] = Σ_k bf16(act[m,k]) · f32(f8(w[n,k])) · scale[n]
+// f32 accumulation, one f32 scale per output column (NO group scales). The
+// activation byte is widened through its bf16 value (LoadF32), the weight byte
+// through Fp8ToF32, exactly like the sm70 decode kernel's per-element decode;
+// the difference from the CUDA arm is only the K-reduction order (matmul
+// tolerance, not a value claim). This is the reference the op gate measures the
+// CUDA kernel against. Same shape as MatmulFp8CutlassKernel: the row is decoded
+// once per M and reused across N.
+void MatmulFp8W8a16Kernel(Queue&, Tensor& out, const Tensor& act, const Tensor& fp8_packed,
+                          const Tensor& scale_f32) {
+  const int64_t m = act.shape[0], k = fp8_packed.shape[1], n = fp8_packed.shape[0];
+  const auto* bp = fp8_packed.Ptr<uint8_t>();
+  const auto* sp = scale_f32.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    std::vector<float> arow(static_cast<size_t>(k));
+    for (int64_t i = r0; i < r1; ++i) {
+      for (int64_t kk = 0; kk < k; ++kk)
+        arow[static_cast<size_t>(kk)] = LoadF32(act, i * k + kk);
+      for (int64_t col = 0; col < n; ++col) {
+        const float scv = sp[col];
+        float acc = 0.0F;
+        for (int64_t kk = 0; kk < k; ++kk)
+          acc += arow[static_cast<size_t>(kk)] * Fp8ToF32(bp[col * k + kk]);
+        StoreF32(out, i * n + col, acc * scv);
+      }
+    }
+  });
+}
+
 // Fused fp8 RMSNorm -> static per-tensor quant (mirror vLLM Inductor
 // fused_add_rms_norm_static_fp8_quant, rms_quant_fusion.py:124). Same reduction
 // order as RmsNormKernel; the fp8 is taken from the SAME bf16-rounded normed value
@@ -3329,6 +3359,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<QuantFp8GroupFn>(&QuantFp8GroupKernel)));
     RegisterOp(OpId::kMatmulFp8Cutlass, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulFp8CutlassFn>(&MatmulFp8CutlassKernel)));
+    RegisterOp(OpId::kMatmulFp8W8a16, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFp8W8a16Fn>(&MatmulFp8W8a16Kernel)));
     RegisterOp(OpId::kMatmulFp8BlockScaled, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<MatmulFp8BlockScaledFn>(&MatmulFp8BlockScaledKernel)));

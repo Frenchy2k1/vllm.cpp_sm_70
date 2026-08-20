@@ -810,6 +810,33 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
   reinterpret_cast<MatmulFp8CublasLtFn>(GetOp(OpId::kMatmulFp8CublasLt, q.device.type))(
       q, out, a_fp8, b_fp8, alpha, claims_splitk1_premise);
 }
+void MatmulFp8W8a16(Queue& q, Tensor& out, const Tensor& act, const Tensor& fp8_packed,
+                    const Tensor& scale_f32) {
+  VT_CHECK(out.rank == 2 && act.rank == 2 && fp8_packed.rank == 2,
+           "matmul_fp8_w8a16: out/act/fp8_packed must be rank-2");
+  const int64_t m = act.shape[0], k = act.shape[1], n = fp8_packed.shape[0];
+  VT_CHECK(fp8_packed.shape[1] == k,
+           "matmul_fp8_w8a16: fp8_packed must be [N, K] (K matches act)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n,
+           "matmul_fp8_w8a16: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kBF16 || out.dtype == DType::kF32,
+           "matmul_fp8_w8a16: out must be bf16 or f32");
+  VT_CHECK(act.dtype == DType::kBF16,
+           "matmul_fp8_w8a16: act must be bf16 (the W8A16 keep-quant path)");
+  VT_CHECK(fp8_packed.dtype == DType::kI8,
+           "matmul_fp8_w8a16: fp8_packed must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(scale_f32.rank == 1 && scale_f32.shape[0] == n,
+           "matmul_fp8_w8a16: scale_f32 must be [N] (one scale per output column)");
+  VT_CHECK(scale_f32.dtype == DType::kF32 && scale_f32.IsContiguous(),
+           "matmul_fp8_w8a16: scale_f32 must be contiguous f32");
+  VT_CHECK(out.IsContiguous() && act.IsContiguous() && fp8_packed.IsContiguous(),
+           "matmul_fp8_w8a16: contiguous tensors required");
+  VT_CHECK(out.device == q.device && act.device == q.device &&
+               fp8_packed.device == q.device && scale_f32.device == q.device,
+           "matmul_fp8_w8a16: device mismatch (act/fp8_packed/scale_f32/out/queue)");
+  reinterpret_cast<MatmulFp8W8a16Fn>(GetOp(OpId::kMatmulFp8W8a16, q.device.type))(
+      q, out, act, fp8_packed, scale_f32);
+}
 void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                                const Tensor& alpha_vec, bool claims_splitk1_premise) {
   // Same operand contract as MatmulFp8CublasLt, plus the per-column alpha.

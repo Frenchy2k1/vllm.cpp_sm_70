@@ -3818,6 +3818,20 @@ struct GdnQkvzOutput {
   Tensor z;      // [T, value_dim]; inner-contiguous, row stride may be padded
 };
 
+// Device-resident keep-quant FP8 W8A16 in_proj operand (the
+// Fp8PerChannelWeight container: raw i8 [N,K] fp8 bytes + f32 [N] per-output-
+// column scale), uploaded ONCE lazily through the shared OwnedTensor resident
+// machinery and reused every forward step — mirrors ResidentNvfp4 /
+// ResidentFp8Qkv exactly.
+struct Fp8W8a16Dev {
+  Tensor packed;  // i8  [N, K]  raw e4m3fn bytes
+  Tensor scale;   // f32 [N]     per-output-column
+};
+
+Fp8W8a16Dev ResidentFp8W8a16(Dev d, const Fp8PerChannelWeight& w) {
+  return Fp8W8a16Dev{ResidentWeight(d, w.packed), ResidentWeight(d, w.scale)};
+}
+
 // Input projections (mixed_qkv | z), shared by the dense and paged GDN blocks.
 // Packed 27B owner: ONE BF16 GEMM + logical views when merged is selected,
 // else two split GEMMs sliced from the same owner. Legacy owners: W8A8 cutlass
@@ -3828,7 +3842,44 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                              int64_t conv_dim, int64_t value_dim, DType indt,
                              DType outdt, const Tensor* h_fp8) {
   GdnQkvzOutput out;
-  if (!w.in_proj_qkvz.Empty()) {
+  if (!w.in_proj_qkvz.Empty() || !w.in_proj_qkvz_fp8w.Empty()) {
+    // W8A8 keep-quant W8A16 arm FIRST (the biggest memory tower). The keep-
+    // quant container is populated INSTEAD of the bf16 `in_proj_qkvz` owner
+    // when the target device has the Volta FP8 W8A16 GEMM (qwen3_5_weights.h),
+    // so the bf16 owner below is EMPTY on that path and the op-route is the
+    // only one that can serve the projection. Exactly the output aliasing of
+    // the bf16 merged arm: the GEMM writes one [T, conv_dim+value_dim] bf16
+    // buffer and mixed/z are last-dim views of it.
+    if (!w.in_proj_qkvz_fp8w.Empty() &&
+        vt::OpRegistered(vt::OpId::kMatmulFp8W8a16, d.q.device.type)) {
+      VT_CHECK(h.dtype == DType::kBF16,
+               "qwen3_5 fp8 W8A16 GDN qkvz: bf16 activations required (the "
+               "sm70 keep-quant GEMM is a bf16-in/b16-out decode)");
+      VT_CHECK(w.in_proj_qkvz_fp8w.n == conv_dim + value_dim &&
+                   w.in_proj_qkvz_fp8w.k == h.shape[1],
+               "qwen3_5 fp8 W8A16 GDN qkvz: invalid keep container [n,k]");
+      Fp8W8a16Dev fw = ResidentFp8W8a16(d, w.in_proj_qkvz_fp8w);
+      out.packed_owner.emplace(d, DType::kBF16,
+                               std::vector<int64_t>{h.shape[0], conv_dim + value_dim});
+      vt::MatmulFp8W8a16(d.q, out.packed_owner->t(), h, fw.packed, fw.scale);
+      Tensor packed = out.packed_owner->t();
+      out.mixed = packed.Slice(1, 0, conv_dim);
+      Tensor z_raw = packed.Slice(1, conv_dim, conv_dim + value_dim);
+      // The W8A16 GEMM already emitted the z gate's dtype (bf16); a non-bf16
+      // gate is widened with the cutlass-eps CastF32 (mirror of the merged
+      // fp8 arm's cast rule).
+      if (z_raw.dtype == outdt) {
+        out.z = z_raw;
+      } else {
+        VT_CHECK(outdt == DType::kF32 && z_raw.dtype == DType::kBF16,
+                 "qwen3_5 fp8 W8A16 GDN qkvz: unsupported z output dtype");
+        out.z_owner.emplace(d, DType::kF32,
+                            std::vector<int64_t>{packed.shape[0], value_dim});
+        vt::CastF32(d.q, out.z_owner->t(), z_raw);
+        out.z = out.z_owner->t();
+      }
+      return out;
+    }
     VT_CHECK(w.in_proj_qkvz.nk && w.in_proj_qkvz.rank == 2 &&
                  w.in_proj_qkvz.shape[0] == conv_dim + value_dim &&
                  w.in_proj_qkvz.shape[1] == h.shape[1],
