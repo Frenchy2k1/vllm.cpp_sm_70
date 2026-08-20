@@ -544,12 +544,18 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   } else if (dense_loaders::IsFp8PerChannelProjection(has, get,
                                                      la + "out_proj")) {
     // QWEN38-PER-CHANNEL-GDN: the 3.8-27B-NVFP4 GDN output projection shares
-    // the in-projections' per-output-channel BF16 layout, so it takes the same
-    // rung: per-column fp8->bf16 dequant into the bf16 [N, value_dim] raw
-    // owner, which ProjectGdnOut already reads (fp8-resident/bf16 per the
-    // populated-field check). The layer-0 load would die on the [5120,1]
-    // BF16 scale without this branch.
-    g.out_proj = dense_loaders::LoadFp8PerChannelBf16RawNK(get, la + "out_proj");
+    // the in-projections' per-output-channel BF16 layout. On a device with the
+    // W8A16 GEMM the raw bytes are kept (1 B/elem, the same keep_fp8w gate as
+    // in_proj_qkvz_fp8w) and MatmulGdnOutProjBf16D routes them through the op;
+    // otherwise the per-column fp8->bf16 dequant populates the bf16 [hidden,
+    // value_dim] raw owner (the fp8-resident/bf16 default every other device
+    // reads). The layer-0 load would die on the [5120,1] BF16 scale without
+    // this branch.
+    if (keep_fp8w) {
+      g.out_proj_fp8w = dense_loaders::LoadFp8PerChannelRawNK(get, la + "out_proj");
+    } else {
+      g.out_proj = dense_loaders::LoadFp8PerChannelBf16RawNK(get, la + "out_proj");
+    }
   } else if (get(la + "out_proj.weight").dtype == "F8_E4M3") {
     // Same rule as the in_proj shards above, and for the same measured reason:
     // the bf16 arm dequantizes this tower and then runs it as a cuBLAS `gemvx`,

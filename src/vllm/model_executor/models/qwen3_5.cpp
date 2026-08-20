@@ -3832,6 +3832,45 @@ Fp8W8a16Dev ResidentFp8W8a16(Dev d, const Fp8PerChannelWeight& w) {
   return Fp8W8a16Dev{ResidentWeight(d, w.packed), ResidentWeight(d, w.scale)};
 }
 
+// GDN out_proj: keep-quant FP8 W8A16 (the sm70 decode arm) when the keep
+// container is populated AND the op is registered, else the existing
+// bf16-domain chain byte-identically. `gated_bf16` is the [T, value_dim] raw
+// activation: the W8A16 op wants it UNTRANSPOSED [M,K] (out[M,N] =
+// act[M,K]·fp8_w[N,K]·scale[N]), while the bf16/fp8/fp4 arms each pass
+// `gated_bf16.t()` because they route through MatmulBT-view helpers. So the
+// transpose is applied ONLY in the fallback chain, never to the W8A16 operand.
+// Container is [N=H_w, K=value_dim] from LoadFp8PerChannelRawNK (nk=true); the
+// fp8-resident path keeps 1 B/elem instead of the bf16 dequant's 2.
+DBuf MatmulGdnOutProjBf16D(Dev d, const DBuf& gated_bf16,
+                           const GdnLayerWeights& w, int64_t value_hidden) {
+  if (!w.out_proj_fp8w.Empty() &&
+      vt::OpRegistered(vt::OpId::kMatmulFp8W8a16, d.q.device.type)) {
+    VT_CHECK(gated_bf16.t().dtype == DType::kBF16,
+             "qwen3_5 fp8 W8A16 GDN out_proj: bf16 activations required (the "
+             "sm70 keep-quant GEMM is a bf16-in/b16-out decode)");
+    VT_CHECK(w.out_proj_fp8w.n == value_hidden &&
+                 w.out_proj_fp8w.k == gated_bf16.t().shape[1],
+             "qwen3_5 fp8 W8A16 GDN out_proj: invalid keep container [n,k]");
+    Fp8W8a16Dev fw = ResidentFp8W8a16(d, w.out_proj_fp8w);
+    DBuf out(d, DType::kBF16,
+             std::vector<int64_t>{gated_bf16.t().shape[0], value_hidden});
+    vt::MatmulFp8W8a16(d.q, out.t(), gated_bf16.t(), fw.packed, fw.scale);
+    return out;
+  }
+  // Model-Fp8-block-linear (#1189 M4): exclusive and first; bf16 out, as every
+  // other arm of this out_proj returns.
+  if (!w.out_proj_fp8_block.Empty()) {
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+                                                        w.out_proj_fp8_block,
+                                                        DType::kBF16);
+  }
+  return !w.out_proj_fp8.Empty()
+             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+         : !w.out_proj_fp4.Empty()
+             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
+             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+}
+
 // Input projections (mixed_qkv | z), shared by the dense and paged GDN blocks.
 // Packed 27B owner: ONE BF16 GEMM + logical views when merged is selected,
 // else two split GEMMs sliced from the same owner. Legacy owners: W8A8 cutlass
@@ -4204,20 +4243,10 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
-  // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
-  // §3.6), else bf16 (default / GGUF).
-  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
-  // other arm of this out_proj returns.
-  if (!w.out_proj_fp8_block.Empty()) {
-    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
-                                                        w.out_proj_fp8_block,
-                                                        DType::kBF16);
-  }
-  return !w.out_proj_fp8.Empty()
-             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
-         : !w.out_proj_fp4.Empty()
-             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+  // MODULE-FP8-BLOCK-LINEAR (#1189 M4) + legacy cutlass/fp4/bf16 arms route
+  // through the shared helper; Qwen3.8 keep-quant FP8-W8A16 (fp8 per-column)
+  // resolves FIRST there, and everything else falls through byte-identically.
+  return MatmulGdnOutProjBf16D(d, gated_bf16, w, cfg.hidden_size);  // [T,H]
 }
 
 // PERSISTENT per-step input device buffers (decode host-tax #2): the flattened
@@ -4681,18 +4710,9 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
-  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
-  // other arm of this out_proj returns.
-  if (!w.out_proj_fp8_block.Empty()) {
-    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
-                                                        w.out_proj_fp8_block,
-                                                        DType::kBF16);
-  }
-  return !w.out_proj_fp8.Empty()
-             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
-         : !w.out_proj_fp4.Empty()
-             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+  // All out_proj arms route through the shared helper (keep-quant W8A16 first,
+  // then block-fp8 / cutlass-fp8 / fp4 / bf16 byte-identically).
+  return MatmulGdnOutProjBf16D(d, gated_bf16, w, cfg.hidden_size);  // [T,H]
 }
 
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
@@ -5139,20 +5159,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
-  // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
-  // §3.6), else bf16 (default / GGUF).
-  // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
-  // other arm of this out_proj returns.
-  if (!w.out_proj_fp8_block.Empty()) {
-    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
-                                                        w.out_proj_fp8_block,
-                                                        DType::kBF16);
-  }
-  return !w.out_proj_fp8.Empty()
-             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
-         : !w.out_proj_fp4.Empty()
-             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+  // MODULE-FP8-BLOCK-LINEAR (#1189 M4) + legacy cutlass/fp4/bf16 arms route
+  // through the shared helper; Qwen3.8 keep-quant FP8-W8A16 (fp8 per-column)
+  // resolves FIRST there, and everything else falls through byte-identically.
+  return MatmulGdnOutProjBf16D(d, gated_bf16, w, cfg.hidden_size);  // [T,H]
 }
 
 // --- Dense full_attention block. qwen36-forward-notes.md §5; pinned

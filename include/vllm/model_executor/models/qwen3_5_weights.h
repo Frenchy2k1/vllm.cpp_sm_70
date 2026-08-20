@@ -494,6 +494,14 @@ struct GdnLayerWeights {
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
 
+  // QWEN38-PER-CHANNEL-GDN out_proj: keep-quant FP8 W8A16 owner, populated
+  // INSTEAD of the bf16 `out_proj` above when the load device has the Volta
+  // W8A16 GEMM (the same keep_fp8w gate as in_proj_qkvz_fp8w). MatmulGdnOutProjBf16D
+  // routes through the op (raw act [T,value_dim], fp8 [N=H, K=value_dim], scale
+  // [H]) when present; the bf16 owner stays the default elsewhere. Keeps the
+  // tower at 1 byte/elem instead of the bf16 2.
+  Fp8PerChannelWeight out_proj_fp8w;
+
   // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise FP8 GDN projections. The
   // target checkpoint lists the GDN small tensors under
   // `modules_to_not_convert`, so these stay empty for it; the rung exists
