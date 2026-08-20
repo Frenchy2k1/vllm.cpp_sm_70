@@ -731,13 +731,24 @@ dense loader: 'model.layers.0.self_attn.q_proj.weight_scale' ships shape
 [12288, 1] (12288 elements), not the ONE element a per-tensor scale is
 ```
 
-The two layouts this refuses in practice are per-output-channel FP8, which
-stores one scale per output row, and block-wise FP8, which stores a grid. Both
-used to load. The reader took the first four bytes and used them as the scale
-of the whole matrix, which is a finite plausible number and therefore fluent
-plausible wrong output rather than a failure. Issue
-[#1181](https://github.com/mudler/vllm.cpp/issues/1181) has the detail, and the
-per-output-channel arm itself is not implemented yet.
+The two layouts this refused are per-output-channel FP8, which stores one scale
+per output row, and block-wise FP8, which stores a grid. Both used to load: the
+reader took the first four bytes and used them as the scale of the whole matrix,
+which is a finite plausible number and therefore fluent plausible wrong output
+rather than a failure. Issue [#1181](https://github.com/mudler/vllm.cpp/issues/1181)
+has that history.
+
+**The per-output-channel arm is now implemented, but ONLY for the Qwen3.8 dense
+GDN/attention projections that genuinely ship it** (`linear_attn.{in_proj_qkv,in_proj_z,out_proj}`
+and `self_attn.{q,k,v,o}_proj` on `unsloth/Qwen3.8-27B-NVFP4`, each `F8_E4M3`
+weight with a `BF16 [out,1]` scale). The loader detects that exact shape+dtype
+pair and dequantizes the weight at load through the fp8→bf16 per-column
+conversion (`DequantFp8ChannelToBf16`, the same the Gemma-4 MoE arm uses), so
+every output column of the GEMM is scaled by its own channel scale. The arm
+fires ONLY on a genuine `BF16` `[out,1]` scale; a per-tensor `F32` scale still
+takes the unchanged per-tensor arm, and the shape-led `is_fp8`/dtype guard
+cannot shadow it. Other per-output-channel or block-wise FP8 checkpoints remain
+refused by name, since the same msread lookup would be wrong there.
 
 `lm_head` is not affected. It has always read a per-output-channel scale
 correctly, as the table above records.

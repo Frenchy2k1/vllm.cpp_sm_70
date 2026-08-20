@@ -500,6 +500,20 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
         get, la + "in_proj_qkv", block.block_n, block.block_k);
     g.in_proj_z_fp8_block = dense_loaders::LoadFp8BlockRaw(
         get, la + "in_proj_z", block.block_n, block.block_k);
+  } else if (dense_loaders::IsFp8PerChannelProjection(has, get,
+                                                     la + "in_proj_qkv")) {
+    // QWEN38-PER-CHANNEL-GDN (option A, `.agents/specs/qwen38-per-channel-gdn-loader.md`):
+    // Qwen3.8-27B-NVFP4 (unsloth @7d6f8d4d) ships the GDN in-projections as
+    // FP8_E4M3 [N,H] + a per-output-channel BF16 [N,1] weight_scale — the
+    // layout ReadF32Scalar refuses by design (a [10240,1] array read as one
+    // f32 is a fluent-wrong-token scale). Dequant to the merged bf16 [qkv,z]
+    // operand instead: the per-column scale is applied per output column
+    // (fp8->bf16 x channel scale, via DequantFp8ChannelToBf16) in the GDN
+    // in_proj GEMM — the model-op numeric, zero input_scale involved. The
+    // merged leaf then runs exactly as the bf16 27B arm above does (one
+    // vt::MatmulBT on [conv_dim+value_dim, H], nk=true).
+    g.in_proj_qkvz = dense_loaders::LoadMergedFp8PerChannelBf16RawNK(
+        get, {la + "in_proj_qkv", la + "in_proj_z"});
   } else if (qkv_probe.dtype == "F8_E4M3") {
     g.in_proj_qkv_fp8 = LoadFp8RawShared(get, la + "in_proj_qkv");
     g.in_proj_z_fp8 = LoadFp8RawShared(get, la + "in_proj_z");
@@ -517,6 +531,15 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
                                   get(la + "out_proj.weight").dtype, block)) {
     g.out_proj_fp8_block = dense_loaders::LoadFp8BlockRaw(
         get, la + "out_proj", block.block_n, block.block_k);
+  } else if (dense_loaders::IsFp8PerChannelProjection(has, get,
+                                                     la + "out_proj")) {
+    // QWEN38-PER-CHANNEL-GDN: the 3.8-27B-NVFP4 GDN output projection shares
+    // the in-projections' per-output-channel BF16 layout, so it takes the same
+    // rung: per-column fp8->bf16 dequant into the bf16 [N, value_dim] raw
+    // owner, which ProjectGdnOut already reads (fp8-resident/bf16 per the
+    // populated-field check). The layer-0 load would die on the [5120,1]
+    // BF16 scale without this branch.
+    g.out_proj = dense_loaders::LoadFp8PerChannelBf16RawNK(get, la + "out_proj");
   } else if (get(la + "out_proj.weight").dtype == "F8_E4M3") {
     // Same rule as the in_proj shards above, and for the same measured reason:
     // the bf16 arm dequantizes this tower and then runs it as a cuBLAS `gemvx`,
@@ -566,6 +589,13 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
     if (IsFp8BlockProjection(has, name, dtype, block)) {
       fp8_block = dense_loaders::LoadFp8BlockRaw(get, name, block.block_n,
                                                  block.block_k);
+    } else if (dense_loaders::IsFp8PerChannelProjection(has, get, name)) {
+      // QWEN38-PER-CHANNEL-GDN: the attn q/k/v/o projections of the
+      // 3.8-27B-NVFP4 checkpoint use the same F8_E4M3 + per-output-channel
+      // BF16 [N,1] layout as the GDN in/out projections (no input_scale
+      // anywhere in the checkpoint), so they take the same rung: per-column
+      // fp8->bf16 dequant into the bf16 raw-NK owner the plain arm reads.
+      plain = dense_loaders::LoadFp8PerChannelBf16RawNK(get, name);
     } else if (dtype == "F8_E4M3") {
       fp8 = LoadFp8RawShared(get, name);
     } else {
