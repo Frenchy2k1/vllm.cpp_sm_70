@@ -831,6 +831,16 @@ sharded fast path; a family that does not yet thread the group refuses tp>1
 loudly rather than running tp1 math. `VT_SM70_FA2_DECODE` (default on) and
 `VT_TP_DIAG` (default off) control the sm70 adoption and the sharded trace.
 
+**Distributed serving is not wired yet.** The tp==tp1 token gate runs the
+sharded math over replicated weights and proves numeric equality on 2×V100, but
+a real multi-GPU **server** does not distribute the checkpoint to a second
+device: the runner acquires the NCCL group, yet the weight loader narrows to rank
+0 only (a second device holds no shard), so a tp>1 `*server*` request would
+deadlock a collective. A server started with more than one visible CUDA device
+now refuses loudly at startup, naming the missing per-rank loader, the per-rank
+device load, and the per-device forward. tp1 (`CUDA_VISIBLE_DEVICES` to one
+device) is the fully-tested serve path.
+
 Selecting a backend by name is not exposed yet; the engine always resolves one.
 
 ### Architectures that resolve but refuse to run

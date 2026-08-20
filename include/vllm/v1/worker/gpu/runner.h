@@ -546,10 +546,20 @@ class GPUModelRunner final : public ModelRunnerBase {
   // their defaults and every existing single-GPU step is BYTE-IDENTICAL — the
   // field default (null), the `forward_input.tp` expression (null), and the
   // model's own tensor_parallel() (never set) all agree.
+  //
+  // TP-SERVE (the loud refusal): a runner whose attach finds a LIVE multi-rank
+  // group (world_size > 1) THROWS a named std::runtime_error from
+  // attach_tp_group BEFORE `tp_group_` is stored, and releases the group. The
+  // single-queue server has no per-rank weight load and no per-rank forward
+  // drive, so a tp>1 step would deadlock the collective (request received,
+  // never completed, exit=1); the named refusal is the alternative the parity
+  // gate itself is not (it exercises replicated-weight in-process primitives).
+  // tp1 / null never reach the branch, keeping the tp==1 token gate green.
   void* tp_group_ = nullptr;  // opaque owner (vt::CudaCommGroup*); null => tp1
   vllm::TensorParallel tp_;   // this rank's comm; null comm => tp_size()==1
-  // Acquire the group + wrap this rank's communicator; no-op on tp<=1 /
-  // non-NCCL builds. Safe to call once per runner (delegating ctors).
+  // Acquire the group + wrap this rank's communicator; tp<=1 / non-NCCL builds
+  // no-op; a real multi-rank group is REFUSED here (named exception). Safe to
+  // call once per runner (delegating ctors).
   void attach_tp_group();
   InputBatch input_batch_;
   Sampler sampler_;

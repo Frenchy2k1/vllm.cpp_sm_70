@@ -409,9 +409,42 @@ void GPUModelRunner::attach_tp_group() {
   const int ngpu = vt::cuda::DeviceCount();
   void* group = vt_cuda_tp_acquire(ngpu);
   if (group == nullptr) return;  // tp<=1 / NCCL init failed: keep the tp1 path
-  vt::Communicator* comm =
-      static_cast<vt::CudaCommGroup*>(group)->Rank(queue_.device.index);
-  if (comm == nullptr) {  // device index outside the group: degrade to tp1
+  // ── TP-SERVE (the named refusal, replacing a silent hang) ──────────────────
+  // The parity gate proves the per-rank shard ARITHMETIC (tensor_parallel.h
+  // TpShard/TpAllReduceSum + the in-process group primitives that split compute
+  // over the nccl group), but a REAL multi-GPU SERVE never reaches those
+  // primitives the way the gate does. The engine loads the model on THIS
+  // runner's single queue/device only (FromModelDir/FromLoadedDir bind one
+  // queue), there is exactly ONE queue (queue_.device.index) in this server,
+  // and the
+  // paged full-attention tp>1 block answers pure-decode steps only — a tp>1
+  // chat PREFILL throws "pending wave" inside qwen3_5.cpp. A tp>1 step here
+  // would therefore run with no per-rank weights on the other rank's device
+  // and no per-rank forward to reach the collectives: the reported symptom is
+  // a request that is received and never completes (and exit=1). REFUSE AT
+  // CONSTRUCTION instead — loudly, naming the missing pieces — so the server
+  // fails fast with a named diagnosis on a 2-GPU host rather than hanging or
+  // dying mid-request. tp1 (and the null group) never reach this branch.
+  vt::CudaCommGroup* cg = static_cast<vt::CudaCommGroup*>(group);
+  const int world = cg->world_size();
+  if (world > 1) {
+    // Read `world` (a local) before releasing the group — cg must not be
+    // touched after vt_cuda_tp_release frees it.
+    vt_cuda_tp_release(group);
+    throw std::runtime_error(
+        "vllm.cpp distributed serving tp>1 (world_size=" +
+        std::to_string(world) +
+        "): distributed weight load not yet wired — tp>1 requires the "
+        "per-rank loader (TpShard at the dense-weight-load chokepoint) + the "
+        "runner's per-rank device load + per-device forward, and the paged "
+        "full-attention tp>1 block currently serves pure-decode steps only "
+        "(prefill throws in qwen3_5.cpp). The tp==tp1 parity gate passes "
+        "through replicated-weight in-process shard primitives that no real "
+        "server path reaches; a tp>1 step would deadlock the collective. "
+        "Refusing loudly instead");
+  }
+  vt::Communicator* comm = cg->Rank(queue_.device.index);
+  if (comm == nullptr) {  // device index < group size: degrade to tp1
     vt_cuda_tp_release(group);
     return;
   }
