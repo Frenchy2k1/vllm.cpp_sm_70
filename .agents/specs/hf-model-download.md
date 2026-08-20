@@ -805,13 +805,48 @@ which form.
   one-off manual measurement of a live https session, recorded there. Row
   `ENG-HF-MODEL-DOWNLOAD`, issue
   [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
-- **The container image was not BUILT in the W5 session.**
-  `docker/Dockerfile` gained `libssl3` and
-  `scripts/validate-container-image.py` gained the hub-reach audit, and the
-  audit's classifier is pinned by 11 unit tests, but no image was built and no
-  container was booted. The first container build after this change is the
-  first execution of that audit. Row `ENG-HF-MODEL-DOWNLOAD`, issue
-  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **DISCHARGED, AND THE MEASUREMENT WAS RED: the container image was not BUILT
+  in the W5 session, and when it finally was, the fetch did not work.**
+  W5 shipped `libssl3` in `docker/Dockerfile` and the hub-reach audit in
+  `scripts/validate-container-image.py` with its classifier pinned by 11 unit
+  tests, but no image was built and no container was booted, so the audit had
+  never executed against a real image. It executed for the first time on
+  20 August 2026 and REFUSED the image: `hub reach: this image cannot speak
+  HTTPS: the binary printed the build-option message containing 'cannot speak
+  HTTPS', so VLLM_CPP_HF_DOWNLOAD resolved OFF or no TLS library was found at
+  build time`.
+  The cause was that W5 added the RUNTIME half and not the BUILD half.
+  `builder-toolchain` installed `binutils build-essential ca-certificates cmake
+  curl file git ninja-build python3` and no `libssl-dev`, so configure logged
+  `Could NOT find OpenSSL (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`
+  and took the documented downgrade, and `ldd` on the shipped `vllm-server`
+  named only `libstdc++ libm libgcc_s libc` while the image carried a `libssl3`
+  nothing linked. `builder-cuda` and the `cuda_x86` and `cuda_arm64` release
+  jobs had the same list, so the PUBLISHED CUDA archives were in the same state.
+  The build was never the risk W5 thought it was deferring; the build was the
+  only thing that could see this. Every static gate stayed green.
+  Repaired by [#1517](https://github.com/mudler/vllm.cpp/issues/1517), which
+  names `libssl-dev` in both builder stages and in the five apt-based release
+  lanes, and adds `scripts/check-build-runtime-deps.py` so a runtime that
+  advertises a capability its builder cannot compile is refused.
+  The repair was measured as a BUILT PAIR on 20 August 2026, x86_64, one tree,
+  one variable, both images built from `d189f66dd` and both deleted afterwards:
+
+  | | RED control, no `libssl-dev` | GREEN, the shipped file |
+  |---|---|---|
+  | configure | `Could NOT find OpenSSL ... (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`, then `HTTPS support is disabled` and `no transport layer security is available` | `Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.13")`, then `HuggingFace download: HTTPS through OpenSSL 3.0.13 (system, dynamic)` |
+  | `ldd vllm-server` | `libstdc++ libm libgcc_s libc` | the same plus `libssl.so.3` and `libcrypto.so.3` |
+  | `validate-container-image.py` | exit 1, `hub reach: this image cannot speak HTTPS` | exit 0, `hub reach: verified, the hub answered with an authorization status for does-not-exist/nope; the TLS session completed` |
+  | `docker run --model does-not-exist/nope` | `this build cannot speak HTTPS, so it cannot reach https://huggingface.co/` | `HuggingFace refused repository 'does-not-exist/nope' with HTTP 401 ... Set HF_TOKEN` |
+
+  The control needed its own BuildKit cache mount id. Sharing the lane's mount
+  made the second configure read the FIRST build's `CMakeCache.txt`, report
+  OpenSSL found with an empty version, and die at generate on a missing
+  `OpenSSL::SSL` target instead of taking the downgrade. That is
+  [#1521](https://github.com/mudler/vllm.cpp/issues/1521), filed and not fixed
+  in this flow. Row `ENG-HF-MODEL-DOWNLOAD`, issues
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280) and
+  [#1517](https://github.com/mudler/vllm.cpp/issues/1517).
 - **A static-musl fetch, through BoringSSL.** `-DVLLM_CPP_BUILD_BORINGSSL=ON`
   is implemented and available, and the `linux-x86_64-musl-cpu-static` lane
   does not use it because it fetches from the network at configure time. It has
