@@ -1,0 +1,6 @@
+modelRoles: 
+  designer: sglang/deepseek-ai/DeepSeek-V4-Flash-0731:xhigh
+  tiny: sglang/deepseek-ai/DeepSeek-V4-Flash-0731:off
+  advisor: sglang/deepseek-ai/DeepSeek-V4-Flash-0731:xhigh
+  plan: sglang/deepseek-ai/DeepSeek-V4-Flash-0731:xhigh
+  default: sglang/deepseek-ai/DeepSeek-V4-Flash-0731:high
