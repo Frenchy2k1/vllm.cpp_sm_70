@@ -75,7 +75,12 @@ DBuf BiasedProj(Dev d, const OwnedTensor& weight, const OwnedTensor& bias,
 // `dhn` is the input-LayerNormed hidden [T,H] bf16 (the SAME norm attention reads).
 DBuf PhiMlpBlock(Dev d, const PhiMlpWeights& w, int64_t ffn, int64_t H,
                  const Tensor& dhn, int64_t T, const TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: gelu_new + fc1/fc2 biases — the dense-MLP shard primitive is silu
+  // and bias-free.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "phi: tp>1 not-yet-sharded (gelu_new + biased projections have no "
+        "direct shard primitive); refusing to run tp1 math");
   DBuf h = BiasedProj(d, w.fc1, w.fc1_bias, dhn, T, ffn);
   vt::GeluTanh(d.q, h.t(), h.t());  // gelu_new (NewGELU tanh-approx), in place
   return BiasedProj(d, w.fc2, w.fc2_bias, h.t(), T, H);
@@ -89,7 +94,12 @@ DBuf PhiAttnBlock(Dev d, const PhiAttnWeights& w, const Tensor& rope_cache,
                   const HfConfig& cfg, const Tensor& dhn, const StepInputs& si,
                   const CommonAttentionMetadata& meta, const PagedKvCache& kv,
                   int64_t T, const TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: Phi's biased qkv/dense + gelu MLP family — the paged KV shard is
+  // bias-free causal GQA; refuse rather than silently run tp1 attention math.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "phi: tp>1 not-yet-sharded (biased attention/MLP have no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;

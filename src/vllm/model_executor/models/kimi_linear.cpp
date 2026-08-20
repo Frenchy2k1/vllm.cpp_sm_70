@@ -104,6 +104,12 @@ ForwardLogits KimiLinearModel::ForwardDevice(
     const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices,
     const vllm::TensorParallel* tp) {
+  // tp>1: Kimi-Linear's KDA/NoPE-MLA + recurrence attention is a custom fused
+  // pattern (no GQA KV heads) the paged KV shard primitive cannot express.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "kimi_linear: tp>1 not-yet-sharded (KDA/NoPE-MLA attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   // §13: the FULL model loads bf16-resident (host f32 would OOM the 119 GiB pool), so
   // the resident path drops the host.materialized precondition and ALWAYS routes to
   // the bf16 device COMPUTE (there are no host f32 weights to compose off).

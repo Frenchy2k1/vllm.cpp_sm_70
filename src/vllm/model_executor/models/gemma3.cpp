@@ -111,7 +111,12 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
                      int64_t T, double rope_base, float attn_scale,
                      std::optional<int64_t> sliding_window,
                      const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: Gemma-3 attention is optionally sliding-windowed + query-pre-scaled —
+  // the paged KV shard primitive is plain causal 1/sqrt(D).
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma3: tp>1 not-yet-sharded (sliding-window / pre-scaled attention has "
+        "no direct shard primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -209,7 +214,11 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
 DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
                     const Tensor& dh2, int64_t T,
                     const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: GeLU (tanh) gate MLP — the dense-MLP shard primitive is silu-only.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma3: tp>1 not-yet-sharded (GeLU tanh gate MLP has no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam

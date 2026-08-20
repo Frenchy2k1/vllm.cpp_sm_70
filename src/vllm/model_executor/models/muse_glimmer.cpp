@@ -134,8 +134,14 @@ DBuf MuseGlimmerAttnBlock(Dev d, const MuseGlimmerAttnWeights& w,
                           const Tensor& dhn, const Tensor& ones_head,
                           const StepInputs& si, const CommonAttentionMetadata& meta,
                           const PagedKvCache& kv, int64_t T, bool use_rope,
-                          const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+const vllm::TensorParallel* tp = nullptr) {
+  // tp>1: Muse-Glimmer attention is sliding-windowed on RoPE layers + carries
+  // an output gate and a configurable attn_scale — the paged KV shard
+  // primitive is plain causal, scale 1/sqrt(D), ungated.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "muse_glimmer: tp>1 not-yet-sharded (sliding-window/gated attention has "
+        "no direct shard primitive); refusing to run tp1 math");
   const int64_t H = t.hidden_size;
   const int64_t Hq = t.num_attention_heads;
   const int64_t Hkv = t.num_key_value_heads;
@@ -263,7 +269,12 @@ DBuf MuseGlimmerAttnBlock(Dev d, const MuseGlimmerAttnWeights& w,
 DBuf MuseGlimmerMlpBlock(Dev d, const MuseGlimmerMlpWeights& w,
                          const MuseGlimmerTextParams& t, const Tensor& dh2,
                          int64_t T, const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: the family's attention is sliding-window/gated — the layer row is
+  // refused there before the MLP ever runs; this guard names the MLP too.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "muse_glimmer: tp>1 not-yet-sharded (sliding-window/gated attention has "
+        "no direct shard primitive); refusing to run tp1 math");
   DBuf act =
       layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, t.intermediate_size).Apply(d, dh2);
   Tensor wd = ResidentWeight(d, w.down_proj);

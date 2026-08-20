@@ -723,3 +723,48 @@ Before changing a row from `☐` to `✅` in the `Spike` column, its spec must r
   gates, and `nsys` trace plan where performance is affected;
 - an implementation split small enough for one agent/branch, with prerequisite
   `MODEL-*` or kernel/backend IDs and no duplicate owner.
+
+## tp-shard (BACKEND-DISTRIBUTED-TP breadth wave)
+
+Per-family record of the tp>1 route of the dense forward families
+(`BACKEND-DISTRIBUTED-TP` TP-W3/W4, branch `row/BACKEND-DISTRIBUTED-TP-CLEAN`).
+`sharded` = the family's tp>1 runs the per-rank shard primitives from
+`src/vt/cuda/nccl_communicator.cu` (the SM70 2xV100 gate-proven warp) and is
+token-equal to tp1; `not-yet + throw` = tp>1 raises a named
+`<family>: tp>1 not-yet-sharded (...)` exception BEFORE any tp1 math may run.
+In BOTH cases the tp==nullptr (single-GPU) line is byte-identical: every shard
+branch is `if (tp != nullptr && tp->tp_size() > 1) { ... return/throw; }`
+preceding the untouched tp1 body, and a null tp never reaches a collective.
+
+| ID (`MODEL-TEXT-*`) | Family / file | tp>1 status | Primitives used | tp1 byte-identity reason |
+|---|---|---|---|---|
+| `qwen3-qwen3-for-causal-lm` | Qwen3 dense (`qwen3.cpp`) | not-yet + throw | — (shared `dense_attn::AttnBlock` is full-weight; its o_proj reduce is not a real shard — wiring needs the seam header this wave does not edit) | null guard precedes; existing tp1 op sequence unchanged |
+| `qwen3-moe-qwen3-moe-for-causal-lm` | Qwen3 MoE (`qwen3_moe.cpp`) | not-yet + throw | — (same shared-AttnBlock reason; MoE itself is the 35B `RunMoeBlock`) | null guard precedes; existing tp1 op sequence unchanged |
+| `commandr-cohere-for-causal-lm` | Command-R (`commandr.cpp`) | **sharded** | `vt_cuda_mlp_shard_run_bf16` (intermediate-split SwiGLU exit-reduced), `vt_cuda_attn_kv_shard_paged_run` (KV-head-split pure-decode) | guard precedes the unchanged tensor-core MLP/attn; null ⇒ the shared body runs as-is |
+| `deepseek-v2-deepseek-v2-for-causal-lm` | DeepSeek-V2 (`deepseek_v2.cpp`) | not-yet + throw | — (MLA attention has no direct shard primitive) | null guard precedes; existing tp1 op sequence unchanged |
+| `deepseek-v4-deepseek-v4-for-causal-lm` | DeepSeek-V4 (`deepseek_v4.cpp`) | not-yet + throw | — (hybrid MLA/sparse tower has no direct shard primitive) | null guard precedes; existing tp1 op sequence unchanged |
+| `gemma-gemma-for-causal-lm` | Gemma-1 (`gemma.cpp`) | not-yet + throw | — (GeLU tanh gate MLP is silu-shard-incompatible) | null guard precedes; unchanged tp1 body |
+| `gemma2-gemma2-for-causal-lm` | Gemma-2 (`gemma2.cpp`) | not-yet + throw | — (logit-softcap / sliding-window attn, GeGLU MLP) | null guard precedes; unchanged tp1 body |
+| `gemma3-gemma3-for-causal-lm` | Gemma-3 (`gemma3.cpp`) | not-yet + throw | — (sliding-window / pre-scaled attn, GeGLU MLP) | null guard precedes; unchanged tp1 body |
+| `gemma4-gemma4-for-conditional-generation` | Gemma-4 (`gemma4.cpp`) | not-yet + throw | — (heterogeneous/shared-KV attn, GeGLU MLP) | null guard precedes; unchanged tp1 body |
+| `glm4-glm4-for-causal-lm` | GLM-4 (`glm4.cpp`) | **sharded** | `vt_cuda_mlp_shard_run_bf16`, `vt_cuda_attn_kv_shard_paged_run` | guard precedes; unchanged tp1 body (qkv bias/rope stay pre-shard local work) |
+| `kimi-k3-kimi-k3-for-conditional-generation` | Kimi K3 (`kimi_k3.cpp`) | not-yet + throw (existing always-refuse forward) | — (skeleton forward refuses the whole family) | refusal is unconditional; tp1 never runs |
+| `kimi-linear-kimi-linear-for-causal-lm` | Kimi-Linear (`kimi_linear{,_device,_forward}.cpp`) | not-yet + throw | — (KDA/NoPE-MLA recurrence has no direct shard primitive) | null guard precedes at every public entry; unchanged tp1 lanes |
+| `laguna-laguna-for-causal-lm` | Laguna (`laguna.cpp`) | not-yet + throw | — (custom per-head out-gate attention) | null guard precedes; unchanged tp1 reference |
+| `minicpm-mini-cpmfor-causal-lm` | MiniCPM (`minicpm.cpp`) | **sharded** | `vt_cuda_mlp_shard_run_bf16`, `vt_cuda_attn_kv_shard_paged_run` | guard precedes; unchanged tp1 body |
+| `minicpm3-mini-cpm3-for-causal-lm` | MiniCPM3 (`minicpm3.cpp`) | not-yet + throw | — (MLA attention has no direct shard primitive) | null guard precedes; unchanged tp1 body |
+| `muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer (`muse_glimmer.cpp`) | not-yet + throw | — (sliding-window/gated attention, custom attn_scale) | null guard precedes; unchanged tp1 body |
+| `olmo2-olmo2-for-causal-lm` | OLMo-2 (`olmo2.cpp`) | not-yet + throw | — (YaRN / sliding-window attention) | null guard precedes; unchanged tp1 body |
+| `opt-opt-for-causal-lm` | OPT (`opt.cpp`) | not-yet + throw | — (ReLU + biased projections) | null guard precedes; unchanged tp1 body |
+| `phi-phi-for-causal-lm` | Phi-1/2 (`phi.cpp`) | not-yet + throw | — (gelu_new + biased projections) | null guard precedes; unchanged tp1 body |
+| `phi3-phi3-for-causal-lm` | Phi-3 (`phi3.cpp`) | **sharded** | `vt_cuda_mlp_shard_run_bf16`, `vt_cuda_attn_kv_shard_paged_run` | guard precedes; unchanged tp1 body |
+| `stablelm-stablelm-for-causal-lm` | StableLM (`stablelm.cpp`) | **sharded** | `vt_cuda_mlp_shard_run_bf16`, `vt_cuda_attn_kv_shard_paged_run` | guard precedes; unchanged tp1 body |
+
+Shared wiring: `src/vllm/model_executor/models/tp_shard_host.h` — the extern
+declarations mirror `qwen3_5.cpp`'s (VT_NCCL-only; a non-NCCL build keeps a
+named `TpNcclAbsent` throw), `TpPagedAttentionHost` reproduces the
+`FullAttnBlockPaged` pure-decode host round-trip (head-split cache +
+num/den AllReduceSum, full [T,Hq,Dh] out), and `TpSwiGluHost` reproduces the
+`DenseMlpBlock` per-token reduced SwiGLU (Each rank owns I/W of the
+intermediate; group AllReduceSum exit). The qwen3_5 dense + MoE rows were
+already genuine (`TP-W3`, gate-proven on 2×V100) and are untouched here.

@@ -24,6 +24,7 @@
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared device glue
 #include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
+#include "vllm/model_executor/models/tp_shard_host.h"      // TP >1 host shards
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
@@ -43,9 +44,19 @@ using namespace dense_attn;
 // -> down MatmulBT. `dh2` is the post-norm hidden [T,H] bf16.
 DBuf Phi3MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
                   const Tensor& dh2, int64_t T, const TensorParallel* tp = nullptr) {
-  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
+  // Multi-device (tp>1): the real per-rank SwiGLU shard (intermediate-split,
+  // exit group-reduced [T,H] — token-identical to tp1). tp1 (null) never
+  // enters, so the resident tensor-core path below stays byte-identical.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    return shard_host::TpSwiGluHost(d, "phi3", w.gate_up_proj, w.down_proj,
+                                    dh2, T, H, I);
+#else
+    shard_host::TpNcclAbsent("phi3");
+#endif
+  }
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
   // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
   // inline path ran — the seam's Apply IS {ResidentWeight; MatmulBT[2I,H];
@@ -111,6 +122,24 @@ DBuf Phi3AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const Tensor& rope_cac
     vt::CastF32(d.q, vcast.t(), v3);
     kw = kcast.t();
     vw = vcast.t();
+  }
+  // Multi-device (tp>1): the KV-head-split paged shard (per-rank cache
+  // slices + num/den AllReduceSum -> full [T,Hq,Dh] on every rank); the o_proj
+  // below stays the full-weight GEMM. tp1 (null) never enters here, so the
+  // proven paged path below is byte-identical.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    DBuf attn_tp = shard_host::TpPagedAttentionHost(
+        d, "phi3", q3, kw, vw, kv, meta, T, Hq, Hkv, Dh);
+    DBuf attn_bf(d, DType::kBF16, {T, Hq * Dh});
+    vt::CastBf16(d.q, attn_bf.t(), Reshape(attn_tp.t(), {T, Hq * Dh}));
+    Tensor wo_tp = ResidentWeight(d, w.o_proj);
+    DBuf o_tp(d, DType::kBF16, {T, H});
+    vt::MatmulBT(d.q, o_tp.t(), attn_bf.t(), wo_tp);
+    return o_tp;
+#else
+    shard_host::TpNcclAbsent("phi3");
+#endif
   }
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);

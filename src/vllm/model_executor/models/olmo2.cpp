@@ -57,7 +57,12 @@ using namespace dense_attn;
 // norm — post-norm placement). bf16-only.
 DBuf Olmo2MlpBlock(Dev d, const Olmo2MlpWeights& w, const HfConfig& cfg,
                    const Tensor& h, int64_t T, const TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: Olmo-2 attention is YaRN/sliding-window (no direct shard prim); the
+  // whole family refuses rather than run tp1 attention math.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "olmo2: tp>1 not-yet-sharded (YaRN / sliding-window attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
@@ -85,7 +90,12 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
                     int64_t T, bool use_yarn, const Tensor* yarn_cache,
                     std::optional<int64_t> sliding_window,
                     const TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: YaRN rope + optional sliding-window break the plain-causal paged
+  // shard contract (and the full-width q/k norm is not the per-rank head shape).
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "olmo2: tp>1 not-yet-sharded (YaRN / sliding-window attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;

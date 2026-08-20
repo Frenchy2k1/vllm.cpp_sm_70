@@ -1979,7 +1979,12 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const V4Backend& be,
                                              std::vector<float>* mtp_residual_out = nullptr,
                                              const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;  // plumbing-only wave: tp==nullptr (tp1) is the inert no-op path
+  // tp>1: DeepSeek-V4's hybrid MLA/sparse-core tower has no direct shard
+  // primitive; refuse by name rather than run tp1 math on the group.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "deepseek_v4: tp>1 not-yet-sharded (hybrid MLA/sparse attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -2559,7 +2564,11 @@ std::vector<float> DeepseekV4Model::Forward(
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices,
     const vllm::TensorParallel* tp) {
-  (void)tp;  // delegates to the free DeepseekV4Forward{Gguf,Host} compositors (non-family)
+  // tp>1: the hybrid MLA/sparse tower has no direct shard primitive.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "deepseek_v4: tp>1 not-yet-sharded (hybrid MLA/sparse attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   (void)attn_meta;
   (void)attn_kv;
   // GGUF source: consume the keep-quant tower (memory-bounded — no ~1 TiB f32

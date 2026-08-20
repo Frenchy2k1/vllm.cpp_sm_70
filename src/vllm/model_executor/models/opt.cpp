@@ -116,7 +116,12 @@ DBuf OPTAttnBlock(Dev d, const OPTAttnWeights& w, const HfConfig& cfg, const Ten
                   const OPTStepInputs& si, const CommonAttentionMetadata& meta,
                   const PagedKvCache& kv, int64_t T,
                   const TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: OPT's attention/MLP carry biases and the MLP is ReLU — neither has a
+  // direct shard primitive (the paged KV shard is causal GQA, no bias).
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "opt: tp>1 not-yet-sharded (biased projections + ReLU MLP have no "
+        "direct shard primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -163,7 +168,12 @@ DBuf OPTAttnBlock(Dev d, const OPTAttnWeights& w, const HfConfig& cfg, const Ten
 DBuf OPTMlpBlock(Dev d, const OPTMlpWeights& w, const OPTConfigExtras& extras,
                  const HfConfig& cfg, const Tensor& dhn, int64_t T,
                  const TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: ReLU + fc1/fc2 biases — the dense-MLP shard primitive is silu and
+  // bias-free.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "opt: tp>1 not-yet-sharded (ReLU + biased projections have no direct "
+        "shard primitive); refusing to run tp1 math");
   DBuf h = BiasedProj(d, w.fc1, w.fc1_bias, dhn, T, extras.ffn_dim);
   vt::Relu(d.q, h.t(), h.t());  // in place
   return BiasedProj(d, w.fc2, w.fc2_bias, h.t(), T, cfg.hidden_size);

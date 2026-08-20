@@ -70,6 +70,13 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
                  Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
                  const StepInputs& si, const CommonAttentionMetadata& meta,
                  const PagedKvCache& kv, int64_t T, const TensorParallel* tp = nullptr) {
+  // tp>1: this family's attention is the SHARED dense_attn::AttnBlock (a seam
+  // header this wave does not edit) — full-weight o_proj, no per-rank paged
+  // shard. Refuse before any attention math; never silent tp1.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "qwen3 moe: tp>1 not-yet-sharded (shared dense_attn::AttnBlock is "
+        "full-weight, no per-rank paged shard wired); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 

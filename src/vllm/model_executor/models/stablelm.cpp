@@ -27,6 +27,7 @@
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared device glue
 #include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
+#include "vllm/model_executor/models/tp_shard_host.h"      // TP >1 host shards
 #include "vt/backend.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
@@ -54,9 +55,20 @@ void LayerNormInto(Dev d, DBuf& out, const Tensor& x, const OwnedTensor& weight,
 // post-norm hidden [T,H] bf16.
 DBuf StablelmMlpBlock(Dev d, const StablelmMlpWeights& w, const HfConfig& cfg,
                       const Tensor& dh2, int64_t T, const TensorParallel* tp = nullptr) {
-  (void)tp;
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
+  // Multi-device (tp>1): the real per-rank SwiGLU shard (each group rank owns
+  // I/W of the intermediate; the exit is group-reduced [T,H] — token-identical
+  // to tp1). tp1 (null) never enters, so the resident tensor-core path below
+  // stays byte-identical.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    return shard_host::TpSwiGluHost(d, "stablelm", w.gate_up_proj, w.down_proj,
+                                    dh2, T, H, I);
+#else
+    shard_host::TpNcclAbsent("stablelm");
+#endif
+  }
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
   // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
   // inline path ran — folds StableLM onto the qwen3.cpp MlpBlock exemplar so it
@@ -123,6 +135,25 @@ DBuf StablelmAttnBlock(Dev d, const StablelmAttnWeights& w, const Tensor& rope_c
     vt::CastF32(d.q, vcast.t(), v3);
     kw = kcast.t();
     vw = vcast.t();
+  }
+  // Multi-device (tp>1): the ground-truth KV-head-split paged shard — each
+  // rank stores its Hkv-head slice of the cache and the num/den AllReduceSum
+  // yields the COMPLETE softmax output identically on every rank. Returns the
+  // full [T,Hq,Dh] attention; the o_proj below stays the full-weight GEMM.
+  // tp1 (null) never enters, so the proven paged path below is byte-identical.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    DBuf attn_tp = shard_host::TpPagedAttentionHost(
+        d, "stablelm", q3, kw, vw, kv, meta, T, Hq, Hkv, Dh);
+    DBuf attn_bf(d, DType::kBF16, {T, Hq * Dh});
+    vt::CastBf16(d.q, attn_bf.t(), Reshape(attn_tp.t(), {T, Hq * Dh}));
+    Tensor wo_tp = ResidentWeight(d, w.o_proj);
+    DBuf o_tp(d, DType::kBF16, {T, H});
+    vt::MatmulBT(d.q, o_tp.t(), attn_bf.t(), wo_tp);
+    return o_tp;
+#else
+    shard_host::TpNcclAbsent("stablelm");
+#endif
   }
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);

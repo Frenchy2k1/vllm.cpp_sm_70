@@ -166,7 +166,12 @@ mla::MlaBlockWeights ResidentMla(Dev d, const MiniCPM3MlaWeights& w,
 // SiluAndMul -> down MatmulBT.
 DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const Tensor& h, int64_t T,
               int64_t H, int64_t I, const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: MiniCPM3's MLA attention has no direct shard primitive (the paged KV
+  // shard is plain GQA), so the family refuses; never silent tp1 attention.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "minicpm3: tp>1 not-yet-sharded (MLA attention has no direct shard "
+        "primitive); refusing to run tp1 math");
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
   // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
   // inline path ran — the seam's Apply IS {ResidentWeight; MatmulBT[2I,H];
@@ -190,6 +195,13 @@ void RunLayer(Dev d, const MiniCPM3LayerWeights& layer, const MiniCPM3Params& p,
               double residual_scale, DBuf& res, const MlaStep& step,
               Tensor& kv_cache, v1::TritonMLAImpl& impl, int64_t T,
               const vllm::TensorParallel* tp = nullptr) {
+  // tp>1: the MLA attention half has no direct shard primitive; refuse by name
+  // (the MlpBlock guard above would catch the MLP alone, but the MLA attention
+  // runs first — guard the whole layer here).
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "minicpm3: tp>1 not-yet-sharded (MLA attention has no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = p.hidden_size;
   const float eps = p.rms_norm_eps;
 

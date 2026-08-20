@@ -103,6 +103,14 @@ DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
               const Tensor& dh2, int64_t /*T*/,
               const TensorParallel* tp = nullptr) {
   const int64_t I = cfg.intermediate_size;
+  // tp>1: the qwen3 dense forward's per-layer blocks are the SHARED
+  // dense_attn::AttnBlock (a seam header this wave does not edit); its
+  // full-weight o_proj reduce and the packaged MLP reduce are not a real
+  // shard, so refuse by name instead of running wrong math on the group.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "qwen3 dense: tp>1 not-yet-sharded (shared dense_attn::AttnBlock is "
+        "full-weight, no per-rank paged shard wired); refusing to run tp1 math");
   // gate_up is a MergedColumnParallelLinear (sharded on I, no comm); down is a
   // RowParallelLinear whose per-rank partial [T,H] products are all-reduced below
   // (linear.py:1766). tp_size==1 ⇒ whole tensors + the all-reduce is a no-op, so
@@ -124,6 +132,13 @@ void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const StepInputs& si,
               const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
               const TensorParallel* tp = nullptr) {
+  // tp>1: this family's attention is the SHARED dense_attn::AttnBlock (a seam
+  // header this wave does not edit) — the full-weight o_proj reduce is not a
+  // real shard. Refuse before any attention math; never silent tp1.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "qwen3 dense: tp>1 not-yet-sharded (shared dense_attn::AttnBlock is "
+        "full-weight, no per-rank paged shard wired); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 

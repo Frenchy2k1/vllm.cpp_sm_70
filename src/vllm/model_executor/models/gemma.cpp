@@ -43,7 +43,12 @@ DBuf GemmaAttnBlock(Dev d, const GemmaAttnWeights& w, const HfConfig& cfg,
                     const Tensor& dhn, const StepInputs& si,
 const CommonAttentionMetadata& meta, const PagedKvCache& kv,
     int64_t T, const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: Gemma-1 has no direct shard primitives (GeGLU MLP, GemmaRMSNorm); a
+  // named refuse beats running the full-weight tp1 math on the group.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma: tp>1 not-yet-sharded (GeGLU gate-up MLP has no silu shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -125,7 +130,11 @@ const CommonAttentionMetadata& meta, const PagedKvCache& kv,
 DBuf GemmaMlpBlock(Dev d, const GemmaMlpWeights& w, const HfConfig& cfg,
                    const Tensor& dh2, int64_t T,
                    const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: GeLU (tanh) gate MLP — the dense-MLP shard primitive is silu-only.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma: tp>1 not-yet-sharded (GeLU tanh gate MLP has no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam

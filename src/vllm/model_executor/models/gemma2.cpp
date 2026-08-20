@@ -126,7 +126,12 @@ DBuf Gemma2AttnBlock(Dev d, const Gemma2AttnWeights& w, const HfConfig& cfg,
                      int64_t T, double rope_base, float attn_scale,
                      float attn_logit_softcap, std::optional<int64_t> sliding_window,
                      const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: Gemma-2 attention is logit-soft-capped and optionally sliding-windowed
+  // — the paged KV shard primitive is plain causal with no softcap/window.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma2: tp>1 not-yet-sharded (logit-softcap / sliding-window attention "
+        "has no direct shard primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -214,7 +219,11 @@ DBuf Gemma2AttnBlock(Dev d, const Gemma2AttnWeights& w, const HfConfig& cfg,
 DBuf Gemma2MlpBlock(Dev d, const Gemma2MlpWeights& w, const HfConfig& cfg,
                     const Tensor& dh2, int64_t T,
                     const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: GeLU (tanh) gate MLP — the dense-MLP shard primitive is silu-only.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma2: tp>1 not-yet-sharded (GeLU tanh gate MLP has no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam

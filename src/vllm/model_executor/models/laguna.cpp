@@ -1340,7 +1340,12 @@ std::vector<float> LagunaModel::Forward(
     const HfConfig& config, vt::Queue& queue,
     const std::vector<int32_t>& logits_indices,
     const vllm::TensorParallel* tp) {
-  (void)tp;
+  // tp>1: Laguna's dual-RoPE per-head softplus out-gate attention is a custom
+  // fused pattern the paged KV shard primitive cannot express; refuse.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "laguna: tp>1 not-yet-sharded (custom per-head out-gate attention has "
+        "no direct shard primitive); refusing to run tp1 math");
   (void)attn_meta;
   (void)attn_kv;   // reference forward recomputes attention (paged path = W4)
   (void)config;

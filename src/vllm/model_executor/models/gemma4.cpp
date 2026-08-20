@@ -211,7 +211,13 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
                      std::optional<int64_t> sliding_window,
                      double rope_theta_sliding,
                      const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: Gemma-4 attention is heterogeneous per-layer (YOCO KV sharing,
+  // sliding window, proportional rope) — the paged KV shard primitive is
+  // plain causal GQA with homogeneous per-rank heads.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma4: tp>1 not-yet-sharded (heterogeneous/shared-KV attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   const int64_t H = g.hidden;
   const int64_t Hq = g.num_q_heads;
   const int64_t Hkv = w.num_kv_heads > 0 ? w.num_kv_heads : g.num_kv_heads;
@@ -350,7 +356,11 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
                     const Tensor& dh2, int64_t T,
                     const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;
+  // tp>1: GeLU (tanh) gate MLP — the dense-MLP shard primitive is silu-only.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "gemma4: tp>1 not-yet-sharded (GeLU tanh gate MLP has no direct shard "
+        "primitive); refusing to run tp1 math");
   // Dense GeGLU: TLS reuse of large gate_up [T,2I] + act [T,I] across layers.
   Tensor wgu = ResidentWeight(d, w.gate_up_proj);
   struct MlpTls {

@@ -2498,6 +2498,10 @@ ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
     const KimiLinearWeights& weights, vt::Queue& queue, KimiDecodeCache& cache,
     const std::vector<int32_t>& logits_indices,
     const vllm::TensorParallel* tp) {
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "kimi_linear: tp>1 not-yet-sharded (KDA/NoPE-MLA attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   (void)positions;  // NoPE-MLA + recurrence: causal masking is by cache length, no RoPE
   VT_CHECK(weights.resident.resident,
            "KimiLinear ForwardPrefillIncremental: bf16-resident weights required (§13)");
@@ -2521,6 +2525,11 @@ ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
 ForwardLogits KimiLinearModel::ForwardPaged(const ModelForwardInput& input,
                                             const KimiLinearWeights& weights,
                                             const vllm::TensorParallel* tp) {
+  // tp>1: KDA/NoPE-MLA has no direct shard primitive; refuse by name.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "kimi_linear: tp>1 not-yet-sharded (KDA/NoPE-MLA attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   Dev d{vt::GetBackend(input.queue.device.type), input.queue};
   DBuf dlogits = DeviceForwardBodyBf16Paged(d, weights, input, tp);
   const int64_t n_out = dlogits.t().shape[0];
@@ -2530,6 +2539,10 @@ ForwardLogits KimiLinearModel::ForwardPaged(const ModelForwardInput& input,
 ForwardLogits KimiLinearModel::ForwardDecodeStepIncremental(
     int32_t token, int64_t position, const KimiLinearWeights& weights, vt::Queue& queue,
     KimiDecodeCache& cache, const vllm::TensorParallel* tp) {
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "kimi_linear: tp>1 not-yet-sharded (KDA/NoPE-MLA attention has no "
+        "direct shard primitive); refusing to run tp1 math");
   (void)position;  // causal masking is by cache.seq_len; NoPE so no positional term
   VT_CHECK(cache.prefilled,
            "KimiLinear ForwardDecodeStepIncremental: call ForwardPrefillIncremental first");

@@ -285,7 +285,12 @@ mla::MlaBlockWeights ResidentMla(Dev d, const DeepseekV2MlaWeights& w,
 // SiluAndMul -> down GEMM. Identical op shape to the Qwen3-dense MlpBlock.
 DBuf DenseMlp(Dev d, const DeepseekV2DenseMlp& w, const Tensor& dh, int64_t T,
               int64_t H, int64_t I, const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;  // plumbing-only wave: tp==nullptr (tp1) is the inert no-op path
+  // tp>1: DeepSeek-V2's MLA attention has no direct shard primitive; the
+  // family refuses rather than run tp1 math on the group.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "deepseek_v2: tp>1 not-yet-sharded (MLA attention has no direct shard "
+        "primitive); refusing to run tp1 math");
   // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
   // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
   // inline path ran; this single fold covers BOTH the dense-layer MLP and the
@@ -336,7 +341,11 @@ bool GroupedMoeEligible(Dev d, const DeepseekV2MoeWeights& w) {
 // routed/shared composition (moe_runner.py:392-407).
 DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
               const Tensor& dh, int64_t T, const vllm::TensorParallel* tp = nullptr) {
-  (void)tp;  // plumbing only: tp==nullptr (tp1) is the inert no-op path
+  // tp>1: DeepSeek-V2 runs MLA attention — no direct shard primitive here.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "deepseek_v2: tp>1 not-yet-sharded (MLA attention has no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = p.hidden_size;
   const int64_t E = p.n_routed_experts;
   const int64_t top_k = p.num_experts_per_tok;
@@ -487,9 +496,14 @@ void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params
               Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
               const MlaStep& step, Tensor& kv_cache, v1::TritonMLAImpl& impl,
               int64_t T, const vllm::TensorParallel* tp = nullptr) {
+  // tp>1: MLA attention runs first — refuse the layer here so the guard fires
+  // before any attention math.
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error(
+        "deepseek_v2: tp>1 not-yet-sharded (MLA attention has no direct shard "
+        "primitive); refusing to run tp1 math");
   const int64_t H = p.hidden_size;
   const float eps = p.rms_norm_eps;
-
   Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   if (FusedChainAdoptEnabled()) {
