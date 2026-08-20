@@ -568,15 +568,29 @@ device carries no registered provider in the build in front of it, so a Metal or
 Vulkan provider becomes reachable here by being registered and nothing else.
 
 The default is `cpu`, and deliberately so — not because the device arm is
-approximate. The two providers are **byte-identical**: one f64 accumulator per
-output element walked in the same order on both, with the host pinned
-`-ffp-contract=off` and the device kernel pinned with `__dmul_rn`/`__dadd_rn`, so
-`tests/vt/test_ops_conv1d_general.cpp` gates them with `memcmp` rather than a
-tolerance (8 cases / 385 assertions on Jetson Thor sm_110, against 8 / 347 on a
-CPU-only box — the 38-assertion difference IS the device arm). It stays opt-in
-because flipping four shipped audio models onto a device arm needs its own
-re-gate against each one's committed goldens, which is owed to the row that
-wires it ([#672](https://github.com/mudler/vllm.cpp/issues/672),
+approximate. The two providers are **byte-identical by construction**: one f32
+accumulator per output element walked in the same order on both, with the host
+pinned `-ffp-contract=off` and the device kernel pinned with
+`__fmul_rn`/`__fadd_rn`, so `tests/vt/test_ops_conv1d_general.cpp` gates them
+with `memcmp` rather than a tolerance (8 cases / 385 assertions on Jetson Thor
+sm_110, against 8 / 347 on a CPU-only box — the 38-assertion difference IS the
+device arm).
+
+**That `memcmp` has NOT been re-run since the accumulator narrowed.** Both arms
+were f64 until [#1474](https://github.com/mudler/vllm.cpp/issues/1474) moved
+them to f32, the width torch accumulates a float convolution in; that row had no
+CUDA toolkit and no GPU lease, so the Thor numbers above predate the narrowing
+and the current device arm is UNVERIFIED rather than measured
+([.agents/specs/vt-conv1d-f32-accumulator.md](../.agents/specs/vt-conv1d-f32-accumulator.md)
+§7). The same row changes the waveform bytes four shipped audio models emit:
+MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and IndexTTS-2.5 all
+decode through these convolutions, so a rendered file will not be bit-identical
+to one produced before it. Every committed golden holds on its existing
+tolerance and no tolerance moved.
+
+It stays opt-in because flipping four shipped audio models onto a device arm
+needs its own re-gate against each one's committed goldens, which is owed to the
+row that wires it ([#672](https://github.com/mudler/vllm.cpp/issues/672),
 [.agents/specs/minimax-music3.md](../.agents/specs/minimax-music3.md) §13).
 
 ### Quantized checkpoints: which weight forms load
