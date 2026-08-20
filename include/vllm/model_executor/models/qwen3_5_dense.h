@@ -242,7 +242,7 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::function<bool(const std::string&)>& has,
     const std::string& layer_type, int64_t layer_idx,
     const std::string& backbone_prefix,
-    const Fp8BlockQuantConfig& block);
+    const Fp8BlockQuantConfig& block, bool keep_fp8w = false);
 
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::function<bool(const std::string&)>& has,

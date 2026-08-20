@@ -753,17 +753,20 @@ refused by name, since the same msread lookup would be wrong there.
 `lm_head` is not affected. It has always read a per-output-channel scale
 correctly, as the table above records.
 
-**The sm70 W8A16 keep-quant arm is a separate rung beside that dequant.** On
-Volta (no fp8 GEMM) the per-channel arm above dequantizes the fp8 bytes to bf16
-at load, which DOUBLES the resident bytes of every per-channel-FP8 projection
-(measured: the GDN in-proj tower alone 6.72 -> 13.44 GiB — the 
+**The sm70 W8A16 keep-quant arm is now live for the GDN in-proj.** On Volta (no
+fp8 GEMM) the per-channel arm above dequantizes the fp8 bytes to bf16 at load,
+which DOUBLES the resident bytes of every per-channel-FP8 projection (measured:
+the GDN in-proj tower alone 6.72 -> 13.44 GiB — the 
 single-card overflow at a Qwen3.8-27B-NVFP4 load + first prefill). The
 `Fp8PerChannelWeight` container + `LoadFp8PerChannelRawNK` /
 `LoadMergedFp8PerChannelRawNK` rungs keep the bytes raw (1 B/elem, scale as a
 lossless f32 widen) for a W8A16 mma (`LaunchSm70Fp8W8A16`, ported from
-v100-skinny qpn8). Both rungs are byte-neutral until the forward routes them:
-today every per-channel-FP8 projection still takes the bf16 dequant, which is
-why a Qwen3.8-27B-NVFP4 single-GPU serve is the routed-on-ow gate.
+v100-skinny qpn8). The op is registered (`vt::OpId::kMatmulFp8W8a16`); a
+device with it loads the GDN in-proj keep-quant (via `keep_fp8w`) and routes
+through the op at `ProjectGdnQkvz`, while CPU and other devices keep the bf16
+dequant byte-identical. The remaining per-channel towers (attn q/k/v/o, GDN
+out_proj, the last-8 MLP fp8 layers) are the same pattern and are still owed —
+until they land, a Qwen3.8-27B-NVFP4 single-card serve is the sm70 gate.
 
 ### One load refusal that is about this code, not your checkpoint
 

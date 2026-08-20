@@ -20,6 +20,7 @@
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/op_provider.h"
 #include "vt/unaligned.h"
 
 namespace vllm {
@@ -476,7 +477,8 @@ bool IsFp8BlockProjection(const TensorExists& has, const std::string& proj,
 
 GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
                              const std::string& base,
-                             const Fp8BlockQuantConfig& block) {
+                             const Fp8BlockQuantConfig& block,
+                             bool keep_fp8w = false) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
@@ -508,12 +510,20 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
     // layout ReadF32Scalar refuses by design (a [10240,1] array read as one
     // f32 is a fluent-wrong-token scale). Dequant to the merged bf16 [qkv,z]
     // operand instead: the per-column scale is applied per output column
-    // (fp8->bf16 x channel scale, via DequantFp8ChannelToBf16) in the GDN
+// fp8->bf16 x channel scale, via DequantFp8ChannelToBf16) in the GDN
     // in_proj GEMM — the model-op numeric, zero input_scale involved. The
     // merged leaf then runs exactly as the bf16 27B arm above does (one
     // vt::MatmulBT on [conv_dim+value_dim, H], nk=true).
-    g.in_proj_qkvz = dense_loaders::LoadMergedFp8PerChannelBf16RawNK(
-        get, {la + "in_proj_qkv", la + "in_proj_z"});
+    // On a device with the W8A16 GEMM the raw bytes are kept instead (1 B/elem,
+    // `keep_fp8w` set by LoadQwen3_5Dense from the op table), which is the
+    // training where dequantizing would DOUBLE the resident tower.
+    if (keep_fp8w) {
+      g.in_proj_qkvz_fp8w = dense_loaders::LoadMergedFp8PerChannelRawNK(
+          get, {la + "in_proj_qkv", la + "in_proj_z"});
+    } else {
+      g.in_proj_qkvz = dense_loaders::LoadMergedFp8PerChannelBf16RawNK(
+          get, {la + "in_proj_qkv", la + "in_proj_z"});
+    }
   } else if (qkv_probe.dtype == "F8_E4M3") {
     g.in_proj_qkv_fp8 = LoadFp8RawShared(get, la + "in_proj_qkv");
     g.in_proj_z_fp8 = LoadFp8RawShared(get, la + "in_proj_z");
@@ -785,7 +795,8 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const TensorExists& has,
     const std::string& layer_type, int64_t layer_idx,
-    const std::string& backbone_prefix, const Fp8BlockQuantConfig& block) {
+    const std::string& backbone_prefix, const Fp8BlockQuantConfig& block,
+    bool keep_fp8w) {
   // FIX-PROBE-CANNOT-SAY-NO (#1258): every dense-layer path funnels through this
   // overload, so one check here covers the production loader, both resolver-only
   // seams, and whatever probe a caller supplies next.
@@ -799,7 +810,7 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
       LoadModelBf16Direct(get, base + "post_attention_layernorm.weight");
   if (layer_type == "linear_attention") {
     layer.is_linear_attention = true;
-    layer.gdn = LoadGdnDense(get, has, base, block);
+    layer.gdn = LoadGdnDense(get, has, base, block, keep_fp8w);
   } else if (layer_type == "full_attention") {
     layer.is_linear_attention = false;
     layer.attn = LoadAttnDense(get, has, base, block);
@@ -881,6 +892,15 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   const Fp8BlockQuantConfig block = ReadFp8BlockQuantConfig(config);
 
   Qwen3_5DenseWeights w;
+  // QWEN38-PER-CHANNEL-GDN W8A16: keep the per-channel fp8 projections raw (1
+  // B/elem) instead of the bf16 dequant (2 B/elem, the measured 6.72->13.44
+  // GiB GDN-tower doubling) when the load target runs the Volta W8A16 GEMM.
+  // The keep container routes through LaunchSm70Fp8W8a16 at forward; the bf16
+  // operand stays the default on every other device. `load_queue` carries the
+  // device (null for CPU/synthetic — keep defaults).
+  const bool keep_fp8w =
+      load_queue != nullptr &&
+      vt::OpRegistered(vt::OpId::kMatmulFp8W8a16, load_queue->device.type);
   w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
   w.final_norm = LoadModelBf16Direct(get, backbone + "norm.weight");
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
@@ -896,7 +916,7 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
         get, has, config.layer_types[static_cast<size_t>(l)], l, backbone,
-        block));
+        block, keep_fp8w));
     if (direct_device) {
       direct_device = IsPlainBf16Qwen3_5Dense(w);
       if (direct_device) StageAndReleaseLoadedDense(w, *load_queue);
