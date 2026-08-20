@@ -889,25 +889,44 @@ if (m <= 3) {
     // weight-stream variant (2) — both reuse the SAME B-fragment registers;
     // the original Sm70Nvfp4Qpn<MT> stays as the fallback reference.
     if (m >= 4 && m <= 16 && (n % 32) == 0 && (k % 64) == 0) {
-      static uint8_t* s_qc = nullptr;
-      static uint8_t* s_qs = nullptr;
-      static size_t s_cap = 0;
+      // The fragment-order prepack is a pure function of the weights: repack
+      // ONLY when the weight identity (source pointer + geometry) changes, so
+      // per-decode-step calls reuse the resident fragment-order scratch instead
+      // of re-reading codes+scales and rewriting it every step. This is the
+      // v100-skinny "prepack at load, never per call" rule (kernel_matched_bench
+      // mandates the same); it is the difference between the M<=2 roofline rate
+      // and the M>=4 band. The cache is process/device-global and single-stream
+      // safe (the engine drives one stream); a caller that mutates a weight
+      // buffer in place between calls must touch a DIFFERENT pointer (fresh
+      // load) so the identity miss triggers a repack -- never a stale reuse.
+      struct RepackCache {
+        const uint8_t* codes = nullptr;
+        const uint8_t* scales = nullptr;
+        int n = 0, k = 0;
+        uint8_t* qc = nullptr;
+        uint8_t* qs = nullptr;
+        size_t cap = 0;
+      };
+      static RepackCache rc;
       const size_t tiles = (size_t)n / 32;
       const size_t G = (size_t)(k / 16);
       const size_t need = tiles * G * 32 * 8 + tiles * G * 32;
-      if (need > s_cap) {
-        cudaFree(s_qc);
-        cudaFree(s_qs);
-        cudaMalloc(&s_qc, tiles * G * 32 * 8);
-        cudaMalloc(&s_qs, tiles * G * 32);
-        s_cap = need;
+      if (codes != rc.codes || scales != rc.scales || n != rc.n || k != rc.k) {
+        if (need > rc.cap) {
+          cudaFree(rc.qc);
+          cudaFree(rc.qs);
+          cudaMalloc(&rc.qc, tiles * G * 32 * 8);
+          cudaMalloc(&rc.qs, tiles * G * 32);
+          rc.cap = need;
+        }
+        Sm70Nvfp4PackQpn<<<dim3((unsigned)tiles, (unsigned)G), 32, 0, stream>>>(
+            codes, scales, rc.qc, rc.qs, k);
+        rc.codes = codes; rc.scales = scales; rc.n = n; rc.k = k;
       }
-      Sm70Nvfp4PackQpn<<<dim3((unsigned)tiles, (unsigned)G), 32, 0, stream>>>(
-          codes, scales, s_qc, s_qs, k);
       if (m <= 8)
-        Sm70Nvfp4QpnNacc<1, 2><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
+        Sm70Nvfp4QpnNacc<1, 2><<<n / 32, 128, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
       else
-        Sm70Nvfp4QpnMt2<2><<<n / 32, 128, 0, stream>>>(s_qc, s_qs, x, y, n, k, m, args.gscale);
+        Sm70Nvfp4QpnMt2<2><<<n / 32, 128, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
       if (check_enabled && !RunSelfCheck(args, self)) return false;
       return cudaGetLastError() == cudaSuccess;
     }
