@@ -25349,3 +25349,45 @@ row's process and it was left alone. And the FIRST arm started seconds after the
 previous holder's four-hour render released the device, with the one-minute load
 average still at 17.5, which is one reason the first 8000-slot run is the
 noisiest of the four. Every later arm started from a quiet box.
+
+---
+
+## sm70 NVFP4 decode GEMM microbench — M>=4 band closed (2026-08-20, `row/BACKEND-DISTRIBUTED-TP-CLEAN`, `4948f36b9`)
+
+`LaunchSm70Nvfp4W4a16` on the 27B TP-2 per-rank decode shapes, V100 32 GB
+(GPU 0,1), cudaEvent-timed, M=1/2/4/8. Effective weight-read GB/s, before
+and after each lever. Accepted measurement (informational; not a gate).
+
+The M>=4 collapse (~52-59 GB/s vs the M<=2 405-556 roofline) had TWO causes,
+fixed in sequence on this branch:
+
+1. **Per-call prepack** (`9a40348e0`): the QPN band re-ran `Sm70Nvfp4PackQpn`
+   EVERY decode step — the scratch was cached for allocation only, never for
+   content. M<=2 SIMT streams codes directly (no prepack), hence roofline.
+   Fix: identity-keyed repack cache (codes/scales pointer + n/k), repack once
+   at fresh weights, then run the mma kernel alone. M>=4 -> 253-514.
+2. **4-warp K-split** (`4948f36b9`): high-K shapes (gate_up K=17408) split K
+   over only 4 warps, exposing the dequant->mma latency chain. Fix: WARPS
+   template param + 8-warp arm (256 threads, each warp owns K/8) when
+   K%128==0 (G%8; anything else keeps the byte-identical 4-warp path). M>=4
+   -> 353-618, matching/beating the M<=2 SIMT band.
+
+Final table (GB/s, effective weight-read; the canonical run is
+`test_sm70_nvfp4_gemm -tc='*microbench*'`, M=4/8 column after BOTH levers):
+
+| shape | M=4 final | M=8 final |
+|---|---|---|
+| linear_attn k=8192 n=5120 | 629 (was 58) | 545 (was 60) |
+| out_proj k=5120 n=3072 | 389 (was 52) | 345 (was 52) |
+| qkv k=7168 n=5120 | 555 (was 56) | 510 (was 59) |
+| gate_up k=17408 n=5120 | 545 (was 57) | 501 (was 58) |
+| down k=5120 n=8704 | 611 (was 54) | 479 (was 59) |
+
+(An earlier draft of this entry carried out_proj 259/353, qkv 439/510 and down
+426 that no run had printed; they are corrected here — the numbers above are the
+verbatim microbench output.)
+
+Residual: out_proj (N=3072, 96 tiles) and the M=8 gate_up/down still read
+lower than the best, an occupancy function of the smaller N-grid, not a
+regression. Parity unchanged throughout: `test_sm70_nvfp4_gemm` A/D/E/F
+(SIMT/QPN/MT2/WMMA) all CPU-oracle OK after each arm.

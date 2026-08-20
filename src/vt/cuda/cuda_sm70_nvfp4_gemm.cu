@@ -410,13 +410,12 @@ __global__ void Sm70Nvfp4Qpn(const uint8_t* __restrict__ qcodes,
 //    to the single-accumulator order. MT keeps the M-dispatch (MT=1 -> the
 //    M 4..8 band; the two-tile instantiation is the MT2 variant below).
 // ---------------------------------------------------------------------------
-template <int MT, int NACC>
+template <int MT, int NACC, int WARPS>
 __global__ void Sm70Nvfp4QpnNacc(const uint8_t* __restrict__ qcodes,
                                  const uint8_t* __restrict__ qscales,
                                  const __half* __restrict__ x,
                                  __half* __restrict__ y, int N, int K, int M,
                                  float gscale) {
-  constexpr int WARPS = 4;
   __shared__ float cs[WARPS][MT * 256];
 
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -481,7 +480,9 @@ __global__ void Sm70Nvfp4QpnNacc(const uint8_t* __restrict__ qcodes,
     }
   __syncthreads();
   for (int e = threadIdx.x; e < MT * 256; e += blockDim.x) {
-    const float v = cs[0][e] + cs[1][e] + cs[2][e] + cs[3][e];
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < WARPS; w++) v += cs[w][e];
     const int row = e >> 5, col = e & 31;
     if (row < M) y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
   }
@@ -496,13 +497,12 @@ __global__ void Sm70Nvfp4QpnNacc(const uint8_t* __restrict__ qcodes,
 //    c[2][NACC][8] dataflow (guard per tile: rr = r + 8t < M). Reduce only
 //    rows < M at the store. Same prepack layout as all QPN kernels.
 // ---------------------------------------------------------------------------
-template <int NACC>
+template <int NACC, int WARPS>
 __global__ void Sm70Nvfp4QpnMt2(const uint8_t* __restrict__ qcodes,
                                 const uint8_t* __restrict__ qscales,
                                 const __half* __restrict__ x,
                                 __half* __restrict__ y, int N, int K, int M,
                                 float gscale) {
-  constexpr int WARPS = 4;
   __shared__ float cs[WARPS][512];
 
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -568,7 +568,9 @@ __global__ void Sm70Nvfp4QpnMt2(const uint8_t* __restrict__ qcodes,
     }
   __syncthreads();
   for (int e = threadIdx.x; e < 512; e += blockDim.x) {
-    const float v = cs[0][e] + cs[1][e] + cs[2][e] + cs[3][e];
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < WARPS; w++) v += cs[w][e];
     const int row = e >> 5, col = e & 31;
     if (row < M) y[(size_t)row * N + (size_t)tile * 32 + col] = __float2half(v);
   }
@@ -923,10 +925,23 @@ if (m <= 3) {
             codes, scales, rc.qc, rc.qs, k);
         rc.codes = codes; rc.scales = scales; rc.n = n; rc.k = k;
       }
-      if (m <= 8)
-        Sm70Nvfp4QpnNacc<1, 2><<<n / 32, 128, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
-      else
-        Sm70Nvfp4QpnMt2<2><<<n / 32, 128, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
+      // WARPS=8 (256 threads) only when K gives a whole group split per warp:
+      // G=K/16, Gq=G/WARPS, so 8 warps need G%8==0 -> K%128==0 (the harness
+      // shapes are all K%128-divisible, so a truncated Gq would be silent).
+      // K%128==0 shapes get the extra-warp K-split (each warp owns K/WARPS);
+      // everything else keeps 4 warps (the byte-identical prior path).
+      const bool w8 = (k % 128) == 0;
+      if (m <= 8) {
+        if (w8)
+          Sm70Nvfp4QpnNacc<1, 2, 8><<<n / 32, 256, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
+        else
+          Sm70Nvfp4QpnNacc<1, 2, 4><<<n / 32, 128, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
+      } else {
+        if (w8)
+          Sm70Nvfp4QpnMt2<2, 8><<<n / 32, 256, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
+        else
+          Sm70Nvfp4QpnMt2<2, 4><<<n / 32, 128, 0, stream>>>(rc.qc, rc.qs, x, y, n, k, m, args.gscale);
+      }
       if (check_enabled && !RunSelfCheck(args, self)) return false;
       return cudaGetLastError() == cudaSuccess;
     }

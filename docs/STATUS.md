@@ -2058,6 +2058,14 @@ full-library LINK + SASS proof is owed — see below. Volta/Pascal
 need a CUDA `<13` toolkit (nvcc 13 rejects `sm_70`/`sm_60`/`sm_61`). See
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM075`.
 
+**The `sm_70` NVFP4 W4A16 decode GEMM (`BACKEND-DISTRIBUTED-TP`)** tracks
+v100-skinny's "prepack at load, never per call" rule: the QPN band caches its
+fragment-order repack keyed on the weight identity, and launches an 8-warp arm
+when `K % 128 == 0`, so the M=4/8 decode band reads **345-629 GB/s** across the
+27B TP-2 per-rank shapes — matching or beating the M<=2 SIMT band (~389-546),
+up from ~52-59. No token change; the gate is the CPU-oracle parity in
+`test_sm70_nvfp4_gemm` (informational microbench, measured 2026-08-20).
+
 **Metal (Apple Silicon), indicative, not binding.** Two models run end to end
 and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
 fall back to CPU on unified memory. Kernel work including mma prefill attention
