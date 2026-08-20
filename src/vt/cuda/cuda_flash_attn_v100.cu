@@ -1,13 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: BSD-3-Clause
 // sm70 FA2 fragment-core build gate (Phase 2, brick E).
 //
 // Vendors and compiles the *Volta WMMA fragment abstraction* from 1Cat-vLLM's
-// flash-attention-v100 (Apache-2.0; the torch-free device layer that FA2-on-
-// Volta builds on: `volta::fragment<...>` fragments + loads + MMA, sm_70 only
-// by construction, `#error` above 7.0). The full paged attention kernels
-// (flash_decode_paged / fused_mha_forward_paged) are ATen-bound at their host
-// launchers; decoupling those raw host pointers — the actual numerical
-// attention body — is the next phase of this brick and is NOT claimed here.
+// flash-attention-v100 (BSD-3-Clause, copyright (c) 2025 D.Skryabin — see
+// third_party/flash_attn_v100/COPYING-flash-attn-v100 — the torch-free device
+// layer that FA2-on-Volta builds on: `volta::fragment<...>` fragments + loads +
+// MMA, sm_70 only by construction, `#error` above 7.0). The full paged
+// attention kernels (cuda_sm70_flash_attn.cu) use the same vendored core; this
+// TU only instantiates the fragment abstraction so a build fails if the
+// abstraction breaks for Volta.
 //
 // This cell only ever compiles for sm_70 (feature `sm70-fa2-v1`); the TU's
 // content is a compile-time instantiations of the vendored core so a build
