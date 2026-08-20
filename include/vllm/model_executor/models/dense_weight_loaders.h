@@ -384,6 +384,135 @@ inline OwnedTensor LoadFp8PerChannelBf16RawNK(const TensorResolver& get,
 // shard must be F8_E4M3 + BF16 [N_i, 1] (strict, as LoadFp8PerChannelBf16RawNK
 // above) and share one input width; the single owned bf16 [sum N_i, K] raw-NK
 // operand is what the MergedColumnParallel GEMM (vt::MatmulBT) reads.
+// LoadFp8PerChannelBf16RawNK / LoadMergedFp8PerChannelBf16RawNK below keep the
+// fp8 bytes RAW (1 byte/elem) for the Volta W8A16 arm, alongside these bf16
+// forms, so a device with no fp8 GEMM is guaranteed the bf16 operand and a
+// sm70 build can route the raw owner through LaunchSm70Fp8W8A16 instead.
+
+// One F8_E4M3 + BF16 [out,1] projection -> raw keep-quant Fp8PerChannelWeight
+// (i8 [N,K] fp8 bytes verbatim + f32 [N] scale widened losslessly from the BF16
+// per-column vector). Half the resident bytes of the bf16 dequant below. The
+// strict per-channel validation is shared with the bf16 arm (same wrong layouts
+// refused by shape/dtype); the source pages are released once.
+inline Fp8PerChannelWeight LoadFp8PerChannelRawNK(const TensorResolver& get,
+                                                  const std::string& proj) {
+  const StTensor& w = get(proj + ".weight");
+  VT_CHECK(w.dtype == "F8_E4M3",
+           "dense loader: '" + proj + ".weight' ships dtype " + w.dtype +
+               ", not the F8_E4M3 a per-channel FP8 weight is");
+  VT_CHECK(w.shape.size() == 2,
+           "dense loader: '" + proj + ".weight' ships shape " +
+               ShapeString(w.shape) + ", not the 2-D [out_features, "
+               "in_features] a per-channel FP8 weight is");
+  const int64_t out_dim = w.shape[0];
+  const int64_t in_dim = w.shape[1];
+  const StTensor& s = get(proj + ".weight_scale");
+  VT_CHECK(s.dtype == "BF16",
+           "dense loader: '" + proj + ".weight_scale' ships dtype " + s.dtype +
+               ", not the BF16 a per-output-channel FP8 scale is");
+  VT_CHECK(s.shape.size() == 2 && s.shape[0] == out_dim && s.shape[1] == 1,
+           "dense loader: '" + proj + ".weight_scale' ships shape " +
+               ShapeString(s.shape) + ", not the [" +
+               std::to_string(out_dim) +
+               ", 1] a per-output-channel FP8 scale is");
+  VT_CHECK(s.data != nullptr && s.nbytes >= static_cast<size_t>(out_dim) * 2,
+           "dense loader: '" + proj + ".weight_scale' does not carry " +
+               std::to_string(out_dim * 2) + " readable bytes");
+  Fp8PerChannelWeight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim});
+  r.packed.nk = true;
+  std::memcpy(r.packed.bytes.data(), w.data, r.packed.bytes.size());
+  MaybeReleaseSourcePages(w.data, w.nbytes);
+  r.scale = MakeOwned(vt::DType::kF32, {out_dim});
+  std::vector<uint16_t> scale;
+  scale.reserve(static_cast<size_t>(out_dim));
+  // staged aligned copy (issue #627: the scale bytes sit at an arbitrary mmap
+  // offset); bf16 -> f32 lossless widen.
+  scale.resize(static_cast<size_t>(out_dim));
+  std::memcpy(scale.data(), s.data, scale.size() * sizeof(uint16_t));
+  auto* s32 = reinterpret_cast<float*>(r.scale.bytes.data());
+  for (int64_t i = 0; i < out_dim; ++i)
+    s32[i] = vt::BF16ToF32(scale[static_cast<size_t>(i)]);
+  MaybeReleaseSourcePages(s.data, s.nbytes);
+  return r;
+}
+
+// N-concatenate per-output-channel FP8 shards along the output rows into one
+// keep-quant Fp8PerChannelWeight (fp8 bytes raw + f32 [sum N_i] scale). The
+// row-concat of packed bytes is lossless along N (column count / grouping is
+// untouched). Strict per-shard validation identical to the bf16 merged form.
+inline Fp8PerChannelWeight LoadMergedFp8PerChannelRawNK(
+    const TensorResolver& get, const std::vector<std::string>& names) {
+  VT_CHECK(!names.empty(),
+           "dense loader: merged per-channel FP8 projection requires at least "
+           "one shard");
+  int64_t in_dim = -1;
+  int64_t out_dim = 0;
+  std::vector<const StTensor*> weights;
+  std::vector<const StTensor*> scales;
+  weights.reserve(names.size());
+  scales.reserve(names.size());
+  for (const std::string& proj : names) {
+    const StTensor& w = get(proj + ".weight");
+    VT_CHECK(w.dtype == "F8_E4M3",
+             "dense loader: '" + proj + ".weight' ships dtype " + w.dtype +
+                 ", not the F8_E4M3 a per-channel FP8 weight is");
+    VT_CHECK(w.shape.size() == 2,
+             "dense loader: '" + proj + ".weight' ships shape " +
+                 ShapeString(w.shape) + ", not the 2-D [out_features, "
+                 "in_features] a per-channel FP8 weight is");
+    if (in_dim < 0) in_dim = w.shape[1];
+    VT_CHECK(w.shape[1] == in_dim,
+             "dense loader: merged per-channel FP8 shards must share input "
+             "width");
+    out_dim += w.shape[0];
+    const StTensor& s = get(proj + ".weight_scale");
+    VT_CHECK(s.dtype == "BF16",
+             "dense loader: '" + proj + ".weight_scale' ships dtype " +
+                 s.dtype + ", not the BF16 a per-output-channel FP8 scale is");
+    VT_CHECK(s.shape.size() == 2 && s.shape[0] == w.shape[0] &&
+                 s.shape[1] == 1,
+             "dense loader: '" + proj + ".weight_scale' ships shape " +
+                 ShapeString(s.shape) + ", not the [" +
+                 std::to_string(w.shape[0]) +
+                 ", 1] a per-output-channel FP8 scale is");
+    VT_CHECK(s.data != nullptr &&
+                 s.nbytes >= static_cast<size_t>(w.shape[0]) * 2,
+             "dense loader: '" + proj + ".weight_scale' does not carry " +
+                 std::to_string(w.shape[0] * 2) + " readable bytes");
+    weights.push_back(&w);
+    scales.push_back(&s);
+  }
+  Fp8PerChannelWeight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim});
+  r.packed.nk = true;
+  auto* dst = r.packed.bytes.data();
+  size_t row_offset = 0;
+  r.scale = MakeOwned(vt::DType::kF32, {out_dim});
+  auto* s32 = reinterpret_cast<float*>(r.scale.bytes.data());
+  std::vector<uint16_t> scale;
+  for (size_t i = 0; i < names.size(); ++i) {
+    const StTensor& w = *weights[i];
+    const StTensor& s = *scales[i];
+    std::memcpy(dst + row_offset * static_cast<size_t>(in_dim), w.data,
+                w.nbytes);
+    scale.resize(static_cast<size_t>(w.shape[0]));
+    std::memcpy(scale.data(), s.data, scale.size() * sizeof(uint16_t));
+    for (int64_t r2 = 0; r2 < w.shape[0]; ++r2)
+      s32[row_offset + static_cast<size_t>(r2)] =
+          vt::BF16ToF32(scale[static_cast<size_t>(r2)]);
+    row_offset += static_cast<size_t>(w.shape[0]);
+    MaybeReleaseSourcePages(w.data, w.nbytes);
+    MaybeReleaseSourcePages(s.data, s.nbytes);
+  }
+  VT_CHECK(row_offset == static_cast<size_t>(out_dim),
+           "dense loader: merged per-channel fp8 byte accounting mismatch");
+  return r;
+}
 inline OwnedTensor LoadMergedFp8PerChannelBf16RawNK(
     const TensorResolver& get, const std::vector<std::string>& names) {
   VT_CHECK(!names.empty(),

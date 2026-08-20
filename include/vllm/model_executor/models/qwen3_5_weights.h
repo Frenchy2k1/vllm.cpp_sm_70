@@ -353,6 +353,39 @@ struct Fp8Weight {
   mutable std::shared_ptr<void> d_packed;
 };
 
+// Keep-quant per-output-channel FP8 (W8A16) weight — the compressed-tensors
+// FP8_DYNAMIC projection Qwen3.8-27B-NVFP4 ships (F8_E4M3 [N,K] + BF16 [N,1]
+// per-output-column scale, no input_scale) — held RAW so a Volta card can run
+// it at 1 byte/elem instead of the loader's bf16 dequant (2 bytes/elem).
+// The bf16 dequant of the GDN in-proj tower alone measures 6.72 -> 13.44 GiB
+// (the exact overflow on a single 32 GiB card); this keeps the bytes on disk
+// and dequantizes in the W8A16 mma kernel (LaunchSm70Fp8W8A16), scale applied
+// per output column in the epilogue.
+//
+// This is a SIBLING of Fp8Weight / Fp8BlockWeight, deliberately: this scheme
+// has no input_scale (activation is dynamic-token), and its weight scale is a
+// 1-D BF16 per-row vector, not a scalar or a coarse block grid — so making it
+// share a struct would force every existing `alpha`/per-tensor reader into a
+// silent which-arm branch. A distinct type makes a wrong call site fail to
+// COMPILE. The shape mirrors Nvfp4Weight: raw packed + its scale + lazy device
+// handles.
+//
+// `scale` is bf16 on disk ([N,1]); kept as a 1-D f32 [N] after a lossless
+// bf16->f32 widen at load (the W8A8 kernel reads a per-column f32, and a
+// [N,1] BF16 grid read as f32 would be the #1181 fluent-wrong-token class).
+struct Fp8PerChannelWeight {
+  OwnedTensor packed;  // i8 [N, K]  one fp8-e4m3fn byte per element, raw
+  OwnedTensor scale;   // f32 [N]    per-output-column (widened from BF16 [N,1])
+  int64_t n = 0;       // out_features
+  int64_t k = 0;       // in_features
+  bool Empty() const { return packed.Empty(); }
+
+  // Lazily-populated device-resident copies (CUDA forward only). The shared_ptr
+  // deleter frees through the vt Backend.
+  mutable std::shared_ptr<void> d_packed;
+  mutable std::shared_ptr<void> d_scale;
+};
+
 // Block-wise (fine-grained) FP8 weight — MODEL-FP8-BLOCK-WEIGHT, #1189 M3, spec
 // `.agents/specs/model-fp8-block-weight.md`. One fp8-e4m3fn scale per
 // `block_n` x `block_k` tile of the weight, the layout `Qwen/Qwen3.8-27B-FP8`
@@ -447,6 +480,14 @@ struct GdnLayerWeights {
   // this owner. 35B (FP8 qkv/z) / GGUF / synthetic paths retain the legacy
   // fields above and leave this empty.
   OwnedTensor in_proj_qkvz;
+  // Keep-quant per-output-channel FP8 merged GDN in-proj (Qwen3.8-27B-NVFP4).
+  // Populated INSTEAD of dequantizing `in_proj_qkvz` to bf16 when the target
+  // device has the Volta FP8 W8A16 GEMM (LaunchSm70Fp8W8A16); the bf16 owner
+  // above then stays EMPTY for this projection and the forward runs the raw
+  // operand through the W8A16 mma (see ProjectGdnQkvz). Empty on every other
+  // platform/checkpoint. Keeps the GDN in-proj tower at 1 byte/elem instead of
+  // the bf16 2 (measured 6.72 -> 13.44 GiB — the single-card overflow driver).
+  Fp8PerChannelWeight in_proj_qkvz_fp8w;
   OwnedTensor conv1d_weight;  // bf16 [conv_dim, K]  (bf16, NOT transposed)
   OwnedTensor a_log;          // f32  [Hv]
   OwnedTensor dt_bias;        // f32  [Hv]

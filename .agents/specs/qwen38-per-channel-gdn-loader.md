@@ -43,6 +43,22 @@ developer opening it).
   CUDA kernel + loader rung + forward consumer), gated device-vs-CPU with the
   same 2e-2 relative oracle as the W4A16 cases.
 
+## Owed
+
+Continuation of the W8A16 device arm, in dependency order. Each is named here so
+a staged landing is not a silent one:
+
+1. **Forward routing is OWED** (the W8A16 kernel + keep-quant container + loader
+   rungs below can land with zero behavior change — CPU/synthetic/devices
+   without the op keep the bf16 dequant).
+   - `LaunchSm70Fp8W8A16` is exposed from the kernel TU but NOT yet consumed by
+     the model forward. Until the routing lands, the per-channel fp8 projections
+     are still dequantized to bf16 at load and a single 32 GiB card still
+     overflows (the exact overflow this arm exists to fix).
+   - Owning row/worktree: `row/BACKEND-DISTRIBUTED-TP-CLEAN`, issue
+     `BACKEND-DISTRIBUTED-TP` (the qwen3.8-fit ask).
+   - Gate it device-vs-CPU (token-exact) before it is real.
+
 ## Gates
 
 - `test_sm70_nvfp4_gemm` (existing) stays green.
