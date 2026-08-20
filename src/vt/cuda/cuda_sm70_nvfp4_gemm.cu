@@ -1764,4 +1764,95 @@ extern "C" int vt_sm70_nvfp4_microbench(void) {
   return 0;
 }
 
+// Kernel-level throughput microbenchmark for the FP8 W8A16 keep-quant decode
+// arm, the byte-for-byte twin of vt_sm70_nvfp4_microbench above: same 27B TP-2
+// per-rank decode shapes and M bands, same cudaEvent timing / 400-rep loop.
+// Effective bandwidth = weight bytes the kernel must read per decode step
+// (raw fp8 e4m3 codes at 1 B/elem + the bf16 per-output-column scale) crushed
+// by the elapsed time. This is the GB/s the "1 byte/elem resident" W8A16 claim
+// actually delivers on sm_70 silicon; the parity microbench (case G) measures
+// correctness, and this measures the throughput that a 32 GiB card single-
+// serve depends on. Returns 0, or 2 when not an sm_70 device (skip).
+extern "C" int vt_sm70_fp8w8a16_microbench(void) {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
+
+  static const struct { const char* name; int k; int n; } shapes[] = {
+      {"linear_attn_in_proj_qkvz", 8192, 5120},
+      {"out_proj_all",             5120, 3072},
+      {"full_attn_qkv_proj",       7168, 5120},
+      {"mlp_gate_up_proj",         17408, 5120},
+      {"mlp_down_proj",            5120, 8704},
+  };
+  static const int m_bands[] = {1, 2, 4, 8};
+
+  uint64_t s = 0xabcd;
+  auto rnd = [&]() -> uint32_t { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; };
+  auto f2h = [](float f) -> __half { return __float2half_rn(f); };
+  const int max_m = 8, max_k = 17408;
+
+  cudaStream_t st = 0;
+
+  // One x buffer reused (rows=max_m); weight codes once per shape. bf16 x is
+  // what the keep-quant arm truly reads (the op bridges bf16->fp16 outside the
+  // timed kernel); this times the kernel alone on the fp16 operand.
+  std::vector<__half> x((size_t)max_m * max_k);
+  for (auto& v : x) v = f2h(0.01f * (float)(rnd() % 2000) - 10.f);
+
+  cudaEvent_t t0, t1;
+  cudaEventCreate(&t0); cudaEventCreate(&t1);
+  fprintf(stderr, "  [sm70-fp8w8a16-microbench]  effective weight-read GB/s at M bands\n");
+
+  for (const auto& sh : shapes) {
+    std::vector<uint8_t> codes((size_t)sh.n * sh.k);           // raw e4m3 [N,K]
+    std::vector<__half> wscale((size_t)sh.n);                  // per-output scale
+    for (auto& v : codes) v = (uint8_t)rnd();
+    for (auto& v : wscale) v = f2h(0.5f + (float)(rnd() % 1000) / 1000.f);
+    const double bytes = (double)codes.size() + (double)wscale.size() * sizeof(__half);  // /step
+
+    void* dc = nullptr; void* dsc = nullptr;
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&dsc, wscale.size() * sizeof(__half));
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dsc, wscale.data(), wscale.size() * sizeof(__half), cudaMemcpyHostToDevice);
+
+    char label[48];
+    snprintf(label, sizeof(label), "%-24s k=%d n=%d", sh.name, sh.k, sh.n);
+    for (int mi = 0; mi < (int)(sizeof(m_bands) / sizeof(m_bands[0])); ++mi) {
+      const int m = m_bands[mi];
+      void* dx = nullptr; void* dy = nullptr;
+      cudaMalloc(&dx, (size_t)m * sh.k * sizeof(__half));
+      cudaMalloc(&dy, (size_t)m * sh.n * sizeof(__half));
+      cudaMemcpy(dx, x.data(), (size_t)m * sh.k * sizeof(__half), cudaMemcpyHostToDevice);
+
+      struct Fp8A {
+        const uint8_t* wcodes; const __half* wscale; const __half* x; __half* y;
+        int m, n, k; cudaStream_t stream;
+      };
+      static Fp8A a{};
+      a.wcodes = static_cast<const uint8_t*>(dc);
+      a.wscale = static_cast<const __half*>(dsc);
+      a.x = static_cast<const __half*>(dx);
+      a.y = static_cast<__half*>(dy);
+      a.m = m; a.n = sh.n; a.k = sh.k; a.stream = st;
+
+      for (int w = 0; w < 30; ++w) LaunchSm70Fp8W8A16(&a);
+      cudaDeviceSynchronize();
+      constexpr int kRep = 400;
+      cudaEventRecord(t0, st);
+      for (int r = 0; r < kRep; ++r) LaunchSm70Fp8W8A16(&a);
+      cudaEventRecord(t1, st);
+      cudaDeviceSynchronize();
+      float ms = 0.f; cudaEventElapsedTime(&ms, t0, t1);
+      const double gbs = (bytes * kRep) / (ms * 1e-3) / 1e9;
+      fprintf(stderr, "    M=%-2d %-36s %8.1f GB/s (%.2f ms/call)\n",
+              m, label, gbs, ms / kRep);
+      cudaFree(dx); cudaFree(dy);
+    }
+    cudaFree(dc); cudaFree(dsc);
+  }
+  cudaEventDestroy(t0); cudaEventDestroy(t1);
+  return 0;
+}
+
 }  // namespace vt::cuda

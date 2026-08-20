@@ -40,6 +40,8 @@ extern "C" int vt_sm70_nvfp4_selfcheck(void);
 
 extern "C" int vt_sm70_nvfp4_microbench(void);
 
+extern "C" int vt_sm70_fp8w8a16_microbench(void);
+
 TEST_CASE("sm70 nvfp4-w4a16 device self-check (SIMT + fused-argmax + decline)") {
   const int rc = vt_sm70_nvfp4_selfcheck();
   if (rc == 2) {
@@ -57,5 +59,16 @@ TEST_CASE("sm70 nvfp4-w4a16 kernel throughput microbench (effective GB/s, inform
   }
   // The microbench prints GB/s; it has no pass/fail claim of its own (a
   // benchmark is a number, not an assertion). A nonzero return is a run error.
+  CHECK(rc == 0);
+}
+
+TEST_CASE("sm70 fp8-w8a16 kernel throughput microbench (effective GB/s, informational)") {
+  const int rc = vt_sm70_fp8w8a16_microbench();
+  if (rc == 2) {
+    MESSAGE("not an sm_70 CUDA device: microbench skipped");
+    return;
+  }
+  // Same contract as the W4A16 sibling: GB/s is informational; a nonzero
+  // return is a run error.
   CHECK(rc == 0);
 }
