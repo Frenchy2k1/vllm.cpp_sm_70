@@ -9489,7 +9489,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
-                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out, tp);
+                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out,
+                            /*persistent_sdi=*/nullptr, tp);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
