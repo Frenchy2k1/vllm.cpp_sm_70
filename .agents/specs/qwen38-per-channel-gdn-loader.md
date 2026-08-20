@@ -31,6 +31,17 @@ developer opening it).
   per-channel BF16 scale and applies the scale in the GDN in_proj GEMM epilogue
   (the same per-column-alpha machinery the fp8 tower already uses), token-gated
   against the CPU oracle like the other arms.
+- **W8A16 device arm (this is what makes it FIT a single 32 GiB card)**: the
+  loader currently `DequantFp8ChannelToBf16`s every fp8 projection, DOUBLING its
+  device-resident bytes (measured 6.72 -> 13.44 GiB for the GDN tower alone) —
+  the exact overflow measured at `Qwen3.8-27B-NVFP4` load + first prefill
+  (32393/32768 MiB, `cudaMalloc: out of memory`). Keep the fp8 bytes raw in the
+  container and run them through a QPN-style W8A16 mma.m8n8k8 kernel (reference:
+  v100-skinny `skinny_fp8_qpn8` / `skinny_fp8_qpn8_mt2`
+  `@kernels/skinny_kernels.cu:1576-1772`, raw natural-k fp8 bytes, per-output
+  scale) so resident cost is 1 byte/elem. This is a shared seam (new op +
+  CUDA kernel + loader rung + forward consumer), gated device-vs-CPU with the
+  same 2e-2 relative oracle as the W4A16 cases.
 
 ## Gates
 

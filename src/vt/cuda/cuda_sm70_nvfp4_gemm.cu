@@ -576,6 +576,143 @@ __global__ void Sm70Nvfp4QpnMt2(const uint8_t* __restrict__ qcodes,
   }
 }
 
+// ---------------------------------------------------------------------------
+// FP8 W8A16 (fp8 e4m3 weights, fp16 activations) — the "keep-quant" decode
+// arm that makes a per-channel-FP8 Qwen3.8 progression FIT a 32 GiB card.
+//
+// The dense loader today DequantFp8ChannelToBf16's every fp8 projection
+// (qwen3_5_dense_weights.cpp:592-598, 503-542), DOUBLING its device-resident
+// bytes (measured: the GDN tower alone 6.72 -> 13.44 GiB). This is the exact
+// overflow seen at Qwen3.8 load + first prefill (32393/32768 MiB,
+// `cudaMalloc: out of memory`). Keeping the fp8 bytes raw — 1 byte/elem — and
+// dequantizing in-kernel is the v100-skinny `skinny_fp8_qpn8` /
+// `skinny_fp8_qpn8_mt2` dataflow (kernels/skinny_kernels.cu:1576-1772): the
+// SAME mma.m8n8k4 fragment order as the NVFP4 QPN band, one fp8 byte per
+// element (16/lane/group vs the fp4's 8), per-OUTPUT-COLUMN scale.
+//
+// Fragment layout mirrors the precedent QPN prepack (overlined qcodes index
+// (tile*G+g)*32 + lane): fp8 stores one byte per weight, so the packed buffer
+// holds 16 bytes per lane per 16-k group. The prepack applies the fp4 kernel's
+// SAME korder permutation (skinny kernels.cu:1525 "the SAME prepack permutation
+// serves both codecs"); the decoder that cancels it is `fp8x8_to_half2x4` (the
+// (i, i+4) interleave). Its e4m3 expansion carries a 2^-8 (1/256) fold the
+// epilogue restores with the per-column scale: out = sum x*fp8(w)*scale[n].
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void fp8x8_to_half2x4(const uint2 q, __half2 out[4]) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const unsigned b0 = (q.x >> (8 * i)) & 0xFFu;
+    const unsigned b1 = (q.y >> (8 * i)) & 0xFFu;
+    const unsigned h0 = ((b0 & 0x80u) << 8) | ((b0 & 0x7Fu) << 7);
+    const unsigned h1 = ((b1 & 0x80u) << 8) | ((b1 & 0x7Fu) << 7);
+    const unsigned p = h0 | (h1 << 16);
+    out[i] = *reinterpret_cast<const __half2 *>(&p);
+  }
+}
+
+// fp8 fragment-order prepack. The B-fragment byte order the mma expects is the
+// same `korder[16]` permutation the fp4 prepack applies (kernels/skinny
+// kernels.cu:1525 "the SAME prepack permutation (korder) serves both codecs").
+// The fp8 decoder that feeds this prepacked layout is the slow
+// `fp8x8_to_half2x4` (the (i, i+4) interleave that cancels the prepack's
+// permutation); the fast variant wants natural k and is NOT used here.
+__global__ void Sm70Fp8PackQpn(const uint8_t* __restrict__ wcodes,
+                               uint8_t* __restrict__ qcodes, int K) {
+  constexpr unsigned short korder[16] = {0, 2, 4, 6, 1, 3, 5, 7,
+                                         8, 10, 12, 14, 9, 11, 13, 15};
+  const int tile = blockIdx.x, g = blockIdx.y, lane = threadIdx.x;
+  const int G = K >> 4;
+  const int col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int row = tile * 32 + col;
+  const uint8_t* crow = wcodes + (size_t)row * K + g * 16;
+  uint8_t* dst = qcodes + (size_t)(tile * G + g) * 32 * 16 + lane * 16;
+#pragma unroll
+  for (int j = 0; j < 16; j++) dst[j] = crow[korder[j]];
+}
+
+template <int MT, int NACC, int WARPS>
+__global__ void Sm70Fp8QpnDense(const uint8_t* __restrict__ qcodes,
+                                const __half* __restrict__ wscale,
+                                const __half* __restrict__ x,
+                                __half* __restrict__ y, int N, int K, int M) {
+  __shared__ float cs[WARPS][MT * 256];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int qp = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = K >> 4, Gq = G / WARPS;
+  const int g0 = warp * Gq;
+  const uint4* cb = reinterpret_cast<const uint4*>(qcodes) + (size_t)tile * G * 32 + lane;
+  // Per-output-column scale: each lane writes EIGHT tile columns
+  // (qp*8+col2 for the i accumulators), each with its OWN wscale entry, so the
+  // scale CANNOT fold into the B fragment. It applies in the epilogue keyed on
+  // the real store column (col3 = e & 31), in fp32 after the warp sum — the
+  // same "2^-8 restores in the epilogue" rule as the qpn8 reference, per column
+  // rather than per tile.
+
+  float c[MT][NACC][8];
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int a = 0; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][a][i] = 0.f;
+
+#pragma unroll 4
+  for (int g = g0; g < g0 + Gq; g++) {
+    const uint4 q4 = __ldcs(cb + (size_t)g * 32);
+    __half2 b[8];
+    fp8x8_to_half2x4(make_uint2(q4.x, q4.y), b + 0);
+    fp8x8_to_half2x4(make_uint2(q4.z, q4.w), b + 4);
+    const unsigned* B = reinterpret_cast<const unsigned*>(b);
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      const int ar = t * 8 + r;
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (ar < M) {
+        const __half* xrow = x + (size_t)ar * K;
+        a01 = *reinterpret_cast<const uint4*>(xrow + g * 16);
+        a23 = *reinterpret_cast<const uint4*>(xrow + g * 16 + 8);
+      }
+      const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      MMA_8N8K4(c[t][0], A0[0], A0[1], B[0], B[1]);
+      MMA_8N8K4(c[t][1 % NACC], A0[2], A0[3], B[2], B[3]);
+      MMA_8N8K4(c[t][2 % NACC], A1[0], A1[1], B[4], B[5]);
+      MMA_8N8K4(c[t][3 % NACC], A1[2], A1[3], B[6], B[7]);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int a = 1; a < NACC; a++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) c[t][0][i] += c[t][a][i];
+
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col2 = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      cs[warp][(t * 8 + row) * 32 + qp * 8 + col2] = c[t][0][i];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < MT * 256; e += blockDim.x) {
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < WARPS; w++) v += cs[w][e];
+    const int row = e >> 5, col3 = e & 31;
+    if (row < M) {
+      // Per-output-column scale; the decoder's 2^-8 fold restores here with
+      // the scale in one fp32 multiply (model op: `x * fp8(w) * scale`).
+      const float scv = __half2float(__ldg(wscale + (size_t)tile * 32 + col3));
+      y[(size_t)row * N + (size_t)tile * 32 + col3] = __float2half(v * scv * 256.f);
+    }
+  }
+}
+
 // Fragment-order prepack (device; byte-equal to the fork's python build):
 //   qcodes[(tile*G + g)*32*8 + lane*8] = 8 bytes of korder-ordered, pair-
 //   interleaved nibbles; qscales[(tile*G+g)*32 + lane] = the group scale.
@@ -717,6 +854,18 @@ __global__ void Sm70Nvfp4SimtArgmax(const uint8_t* __restrict__ codes,
 float E2m1ToFloat(unsigned char c) {
   const unsigned short hb = (unsigned short)(((c & 0x8u) << 12) | ((c & 0x7u) << 9));
   return __half2float(__ushort_as_half(hb)) / 16384.0f;
+}
+
+// IEEE fp8-e4m3fn byte -> f32 (bit-matches vllm::F8E4M3ToF32: 1 sign, 4 exp,
+// 3 mant, bias 7, NaN only at 0x7F/0xFF).
+float Fp8ByteToF32(unsigned char byte) {
+  const uint8_t sign = byte & 0x80u;
+  const unsigned exp = (byte >> 3) & 0xFu;
+  const unsigned mant = byte & 0x7u;
+  const float sm = sign ? -1.0f : 1.0f;
+  if (exp == 0xFu && mant == 0x7u) return 0.f;  // NaN: weights never hold it
+  if (exp == 0u) return sm * ((float)mant * (1.0f / 512.0f));
+  return sm * (float)std::ldexp(1.0 + (double)mant * (1.0 / 8.0), (int)exp - 7);
 }
 
 // The exact device weight: code_half * (fp8scale16 * (gscale*16384)16)10.
@@ -987,6 +1136,62 @@ if (m <= 3) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// FP8 W8A16 launcher: keeps the raw fp8 weight bytes + per-output-column scale
+// resident (1 byte/elem) and runs the QPN-family dense kernel. `wscale` is the
+// [N] bf16 per-column scale the loader stores beside the fp8 bytes.
+// ---------------------------------------------------------------------------
+bool LaunchSm70Fp8W8A16(const void* argsPtr) {
+  struct A {
+    const uint8_t* wcodes;  // [N][K] raw e4m3
+    const __half* wscale;   // [N] per-output-column (bf16)
+    const __half* x;
+    __half* y;
+    int m, n, k;
+    cudaStream_t stream;
+  };
+  const A& a = *static_cast<const A*>(argsPtr);
+  if (a.m <= 0 || a.n <= 0 || a.k <= 0 || (a.n % 32) || (a.k & 63)) return false;
+  if (a.m > 16) return false;
+
+  // Fragment-order fp8 prepack into a size-cached scratch, repacked ONLY when
+  // the weight identity (wcodes pointer + n + k) changes — the W8A16 purpose is
+  // to run the mma on packed bytes, and a per-decode-step repack would re-read
+  // the raw weights every step (the exact NVFP4-band regression the identity
+  // cache in LaunchSm70Nvfp4W4a16 was built to remove). In a resident serving
+  // model the weights are fixed for the process; the per-rank weight buffers
+  // are touched with fresh pointers at load only.
+  static const uint8_t* s_wc = nullptr;
+  static int s_n = 0, s_k = 0;
+  static uint8_t* s_qc = nullptr;
+  static size_t s_cap = 0;
+  const int G = a.k >> 4;
+  const size_t tiles = (size_t)a.n / 32;
+  const size_t needQ = tiles * G * 32 * 16;
+  if (a.wcodes != s_wc || a.n != s_n || a.k != s_k) {
+    if (needQ > s_cap) {
+      cudaFree(s_qc);
+      cudaMalloc(&s_qc, needQ);
+      s_cap = needQ;
+    }
+    Sm70Fp8PackQpn<<<dim3((unsigned)tiles, (unsigned)G), 32, 0, a.stream>>>(
+        a.wcodes, s_qc, a.k);
+    s_wc = a.wcodes; s_n = a.n; s_k = a.k;
+  }
+  const int warp = (a.k % 128) == 0 ? 8 : 4;  // G%WARPS exact
+  if (a.m <= 8)
+    warp == 8 ? Sm70Fp8QpnDense<1, 2, 8><<<a.n / 32, 256, 0, a.stream>>>(
+                    s_qc, a.wscale, a.x, a.y, a.n, a.k, a.m)
+              : Sm70Fp8QpnDense<1, 2, 4><<<a.n / 32, 128, 0, a.stream>>>(
+                    s_qc, a.wscale, a.x, a.y, a.n, a.k, a.m);
+  else
+    warp == 8 ? Sm70Fp8QpnDense<2, 2, 8><<<a.n / 32, 256, 0, a.stream>>>(
+                    s_qc, a.wscale, a.x, a.y, a.n, a.k, a.m)
+              : Sm70Fp8QpnDense<2, 2, 4><<<a.n / 32, 128, 0, a.stream>>>(
+                    s_qc, a.wscale, a.x, a.y, a.n, a.k, a.m);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 struct Registrar {
   Registrar() {
     const ArchTactic tactic = {"nvfp4-w4a16/sm70-simt", &Sm70Nvfp4Supports, &LaunchSm70Nvfp4W4a16};
@@ -1243,8 +1448,59 @@ extern "C" int vt_sm70_nvfp4_selfcheck(void) {
     fprintf(stderr, " [selfcheck] case C decline ok=%d goti=%d gotv=%f\n",
             declined ? 1 : 0, goti, (double)__half2float(gotv));
     cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); cudaFree(dv); cudaFree(di);
-    // declined AND the argmax buffers are untouched (still sentinels -77 / -99)
+// declined AND the argmax buffers are untouched (still sentinels -77 / -99)
     if (!declined || goti != -77 || std::fabs((double)__half2float(gotv) + 99.0) > 1e-3) return 1;
+  }
+
+  // Case G: FP8 W8A16 dense (keep-quant fp8 per-column) — M=8 n=64 k=1024
+  // (n%32==0, k%64==0 -> Sm70Fp8QpnDense<1,2,8>, k%128==0 -> 8 warps). Device
+  // vs the fp8 per-column model-op oracle: sum_k x * fp8(w[n][k]) * scale[n].
+  {
+    const int m = 8, n = 64, k = 1024;
+    uint64_t s = 0x8a33;
+    std::vector<__half> x((size_t)m * k), y((size_t)m * n), wscale((size_t)n);
+    std::vector<uint8_t> wc((size_t)n * k);
+    for (auto& v : wc) v = (uint8_t)rnd(s);
+    for (auto& v : wc) { if (v == 0x7Fu) v = 0x7Eu; if (v == 0xFFu) v = 0xFEu; }
+    for (auto& v : wscale) v = f2h(0.01f * (float)(1 + rnd(s) % 50));
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 100) - 0.5f);
+    void* dx; void* dy; void* dwc; void* dsc;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, y.size() * sizeof(__half));
+    cudaMalloc(&dwc, wc.size());
+    cudaMalloc(&dsc, wscale.size() * sizeof(__half));
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dwc, wc.data(), wc.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dsc, wscale.data(), wscale.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    struct A { const uint8_t* wc; const __half* ws; const __half* x; __half* y; int m, n, k; cudaStream_t st; };
+    A a{static_cast<const uint8_t*>(dwc), static_cast<const __half*>(dsc),
+        static_cast<const __half*>(dx), static_cast<__half*>(dy), m, n, k, st};
+    const bool ok = LaunchSm70Fp8W8A16(&a);
+    cudaDeviceSynchronize();
+    if (!ok) { cudaFree(dx); cudaFree(dy); cudaFree(dwc); cudaFree(dsc); return 1; }
+    cudaMemcpy(y.data(), dy, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+bool bad = false;
+    for (int mm = 0; mm < m && !bad; ++mm)
+      for (int nn = 0; nn < n && !bad; ++nn) {
+        const float scv = __half2float(wscale[(size_t)nn]);
+        double acc = 0.0;
+        for (int kk = 0; kk < k; ++kk) {
+          // Device math: B fragment holds fp8/256 rounded to fp16 (the
+          // fp8x8_to_half2x4 decoder), A is fp16, mma sums fp32 products;
+          // then the epilogue multiplies by scv*256 (the 2^-8 restore).
+          const __half bh = __float2half_rn(Fp8ByteToF32(wc[(size_t)nn * k + kk]) / 256.f);
+          const float bf = __half2float(bh);
+          acc += (double)__half2float(x[(size_t)mm * k + kk]) * (double)bf;
+        }
+        const double expect = acc * (double)scv * 256.0;
+        const double got = (double)__half2float(y[(size_t)mm * n + nn]);
+        if (std::fabs(got - expect) > 2.0e-2 * std::max(1.0, std::fabs(expect))) {
+          bad = true;
+        }
+      }
+    fprintf(stderr, " [selfcheck] case G (FP8 W8A16 M8xN64) parity OK=%d\n", bad ? 0 : 1);
+    cudaFree(dx); cudaFree(dy); cudaFree(dwc); cudaFree(dsc);
+    if (bad) return 1;
   }
   return 0;
 }
