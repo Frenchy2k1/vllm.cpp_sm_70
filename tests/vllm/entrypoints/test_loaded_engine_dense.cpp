@@ -587,26 +587,34 @@ TEST_CASE("loaded_engine: FromModelDir resolves an explicit absent device BEFORE
 TEST_CASE(
     "loaded_engine: refuses a pinned --max-model-len the KV pool cannot hold") {
   // _check_enough_kv_cache_memory (kv_cache_utils.py:751-788): the caller asked
-  // for 4096 tokens of context out of a 1 x 32-token pool.
+  // for 4096 tokens of context out of a 1 x 32-token pool. 47272: the null
+  // block is held back first, so this 1-block pool has zero usable KV and is
+  // refused by name ("No available memory") before the size comparison.
   const HfConfig c = MakeDenseConfig();
   EngineParams params;
-  params.num_blocks = 1;  // 1 x 32 = 32 tokens of KV
+  params.num_blocks = 1;  // 1 x 32 = 32 tokens of KV, all reserved by the null
+  // block
   params.max_model_len = 4096;
 
   CHECK_THROWS_WITH_AS(
       LoadedEngine(c, MakeDenseWeights(c), FreshFixture(), params),
-      doctest::Contains("larger than the available KV cache memory"),
+      doctest::Contains("No available memory for the cache blocks"),
       std::invalid_argument);
 
-  // The message carries upstream's remediation and ours, so the user is left
-  // with an action rather than a number.
+  // A 2-block pool has one usable 32-token block: the 4096 ask is refused by
+  // size, and the message carries upstream's remediation plus ours, so the
+  // user is left with an action rather than a number.
   try {
+    params.num_blocks = 2;
     LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
     FAIL("expected the KV sizing check to refuse this configuration");
   } catch (const std::invalid_argument& e) {
     const std::string msg = e.what();
+    CHECK(msg.find("larger than the available KV cache memory") !=
+          std::string::npos);
     CHECK(msg.find("max seq len (4096)") != std::string::npos);
-    CHECK(msg.find("estimated maximum model length is 32") != std::string::npos);
+    CHECK(msg.find("estimated maximum model length is 32") !=
+          std::string::npos);
     CHECK(msg.find("--num-blocks") != std::string::npos);
   }
 }
@@ -634,26 +642,39 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "loaded_engine: a pinned --max-model-len the pool CAN hold is served "
-    "unchanged") {
+    "loaded_engine: a pinned --max-model-len needs the USABLE pool, 47272") {
+  // 47272 boundary: the BlockPool holds back one block as the null block
+  // (block_pool.cpp:53-57), so with 1 block the usable pool is empty and a
+  // pinned 32-token length is refused as an empty pool; with 2 blocks it
+  // holds exactly one usable 32-token block and the same length is served
+  // unchanged.
   const HfConfig c = MakeDenseConfig();
-  EngineParams params;
-  params.num_blocks = 1;                // 32 tokens of KV
-  params.max_model_len = kMaxModelLen;  // exactly one pool
-  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
-  CHECK(eng.max_model_len() == kMaxModelLen);
+  EngineParams one_block;
+  one_block.num_blocks = 1;  // usable pool = 1 - 1 (null) = 0
+  one_block.max_model_len = kMaxModelLen;
+  CHECK_THROWS_WITH_AS(
+      LoadedEngine(c, MakeDenseWeights(c), FreshFixture(), one_block),
+      doctest::Contains("No available memory for the cache blocks"),
+      std::invalid_argument);
+
+  EngineParams two_blocks;
+  two_blocks.num_blocks = 2;  // 32 usable tokens after the null block
+  two_blocks.max_model_len = kMaxModelLen;
+  LoadedEngine ok(c, MakeDenseWeights(c), FreshFixture(), two_blocks);
+  CHECK(ok.max_model_len() == kMaxModelLen);
 }
 
 TEST_CASE(
-    "loaded_engine: an unpinned max_model_len auto-fits down to the KV pool") {
-  // _auto_fit_max_model_len (kv_cache_utils.py:1967-2027): the checkpoint claims
-  // 4096 tokens of context and the pool holds 32, so 32 is what gets served —
-  // and the admission check then rejects anything longer instead of the
-  // scheduler wedging on it.
+    "loaded_engine: an unpinned max_model_len auto-fits down to the USABLE "
+    "KV pool") {
+  // _auto_fit_max_model_len (kv_cache_utils.py:1967-2027) + 47272: the
+  // checkpoint claims 4096 tokens of context and the 2-block pool holds one
+  // usable 32-token block, so 32 is what gets served — and the admission check
+  // then rejects anything longer instead of the scheduler wedging on it.
   HfConfig c = MakeDenseConfig();
   c.max_position_embeddings = 4096;
   EngineParams params;
-  params.num_blocks = 1;  // 32 tokens
+  params.num_blocks = 2;  // 32 usable tokens after the null block
   LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
   CHECK(eng.max_model_len() == kMaxModelLen);
 }
@@ -674,7 +695,7 @@ TEST_CASE("loaded_engine: an over-long prompt is REFUSED, not left waiting") {
   HfConfig c = MakeDenseConfig();
   c.max_position_embeddings = 4096;
   EngineParams params;
-  params.num_blocks = 1;  // 32 tokens of KV -> max_model_len auto-fits to 32
+  params.num_blocks = 2;  // 32 usable tokens after the null block (47272)
   LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
   REQUIRE(eng.max_model_len() == kMaxModelLen);
 
