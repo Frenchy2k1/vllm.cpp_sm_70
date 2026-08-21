@@ -1588,6 +1588,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_postconv.hip
     src/vt/rocm/rocm_gdn_scan.hip
     src/vt/rocm/rocm_gdn_fused.hip
+    src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
@@ -1608,6 +1609,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_postconv.hip
       src/vt/rocm/rocm_gdn_scan.hip
       src/vt/rocm/rocm_gdn_fused.hip
+      src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()

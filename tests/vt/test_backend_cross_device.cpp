@@ -2134,6 +2134,103 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
   }
 }
 
+TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
+  // Port of upstream's tests/kernels/quantization/test_rocm_skinny_gemms.py
+  // ::test_rocm_wvsplitk_kernel @ pin 55596792 (review sweep on #506: the first
+  // version of this case had aggregate-NMSE tolerance that ten completely
+  // wrong elements would still pass, every K a multiple of the 512 stride so
+  // the K-tail path never ran, and no guard-boundary shapes at all).
+  //
+  // Preserved from upstream: the NKM factor list (the applicable subset — see
+  // below), the xavier on/off scaling, and the ELEMENTWISE tolerance
+  // atol = eps_bf16 * sqrt(K), rtol = 1e-2 (torch.testing.assert_close
+  // semantics). Deferred with reason: fp16 (our port is bf16-only), bias
+  // (the vt::MatmulBT seam has no bias operand), padded strides (our dispatch
+  // requires contiguous rows — a documented precondition), and the fp8/rc
+  // kernel variants (not ported). The (n,k,m) upstream triple = (tokens, K,
+  // features) here.
+  struct Shape { int64_t tok, k, feat; const char* why; };
+  const Shape shapes[] = {
+      // the upstream sweep (token counts 1-4 = our template arms)
+      {1, 32, 16, "upstream"}, {1, 64, 64, "upstream"}, {2, 256, 256, "upstream"},
+      {3, 1024, 1024, "upstream"}, {4, 4096, 4096, "upstream"},
+      // K-tail: K % 512 != 0 exercises the `if (k_ >= K) break` remainder path
+      {4, 4096 + 16, 4096, "k-tail"}, {1, 9216, 512, "upstream"},
+      // guard boundaries (must stay CORRECT via the BLAS fallback)
+      {2, 256, 8, "features<=8 declines (upstream m>8)"},
+      {2, 256, 254, "even below bound: takes skinny"},
+      {2, 256, 255, "odd features decline (YTILE=2 OOB class)"},
+      {2, 254, 256, "K%8!=0 declines"},
+  };
+  const double kEpsBf16 = 0.0078125;  // 2^-8
+  for (const Shape& sh : shapes) {
+    for (bool xnorm : {false, true}) {
+      CAPTURE(sh.why);
+      CAPTURE(sh.tok);
+      CAPTURE(sh.k);
+      CAPTURE(sh.feat);
+      CAPTURE(xnorm);
+      const int64_t M = sh.tok, N = sh.feat, K = sh.k;
+      const size_t an = static_cast<size_t>(M) * K, bn = static_cast<size_t>(N) * K;
+      const double xavier = xnorm ? std::sqrt(2.0 / static_cast<double>(K)) : 1.0;
+      std::vector<float> a = RandomVec(an, 991, -1.0f, 1.0f);
+      std::vector<float> b = RandomVec(bn, 992, -1.0f, 1.0f);
+      for (float& x : a) x = static_cast<float>(x * xavier);
+      for (float& x : b) x = static_cast<float>(x * xavier);
+      const std::vector<uint16_t> a_bf = Bf16Bits(a), b_bf = Bf16Bits(b);
+
+      std::vector<uint16_t> ref(static_cast<size_t>(M) * N, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint16_t> ca = a_bf, cb = b_bf;
+        Tensor ta = Tensor::Contiguous(ca.data(), DType::kBF16, cd, {M, K});
+        Tensor tb = Tensor::Contiguous(cb.data(), DType::kBF16, cd, {N, K});
+        Tensor to = Tensor::Contiguous(ref.data(), DType::kBF16, cd, {M, N});
+        vt::MatmulBT(cq, to, ta, tb);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMatmulBT, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        // Sentinel-padded output: the dispatch must never write past M*N
+        // elements (the odd-features OOB class from the review).
+        const size_t out_elems = static_cast<size_t>(M) * N;
+        const size_t guard_elems = 128;
+        DevBufBytes da(dev, q, an * 2), db(dev, q, bn * 2),
+            dout(dev, q, (out_elems + guard_elems) * 2);
+        std::vector<uint16_t> fill(out_elems + guard_elems, 0xDEAD);
+        dout.Upload(fill.data());
+        da.Upload(a_bf.data());
+        db.Upload(b_bf.data());
+        Tensor ta = Tensor::Contiguous(da.ptr(), DType::kBF16, d, {M, K});
+        Tensor tb = Tensor::Contiguous(db.ptr(), DType::kBF16, d, {N, K});
+        Tensor to = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+        vt::MatmulBT(q, to, ta, tb);
+        std::vector<uint16_t> got(out_elems + guard_elems);
+        dout.Download(got.data());
+        // Elementwise tolerance (upstream assert_close), never aggregate NMSE.
+        const double atol = kEpsBf16 * std::sqrt(static_cast<double>(K));
+        for (size_t i = 0; i < out_elems; ++i) {
+          uint32_t ug = static_cast<uint32_t>(got[i]) << 16, ur = static_cast<uint32_t>(ref[i]) << 16;
+          float gf, rf;
+          std::memcpy(&gf, &ug, 4);
+          std::memcpy(&rf, &ur, 4);
+          CHECK(std::fabs(gf - rf) <= atol + 1e-2 * std::fabs(rf));
+        }
+        // The guard band must be untouched by ANY path (skinny or BLAS).
+        for (size_t i = out_elems; i < out_elems + guard_elems; ++i)
+          CHECK(got[i] == 0xDEAD);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
 TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
   // The "paged attention" case above hand-builds a contiguous KV cache; the
   // real model path writes it with ReshapeAndCache and reads it back. This
