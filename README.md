@@ -42,7 +42,7 @@
   number is available yet.
 - **2026-08** **LTX-2.5 gains its video and audio pipeline surface.** Text-to-audio, retake,
   audio-to-video, keyframe interpolation, and one-stage and two-stage video recipes are wired and
-  fixture-gated. A full-model render is still pending.
+  fixture-gated.
 - **2026-08** **v0.0.2 ships eight server archives.** Download CPU, CUDA, Vulkan, Metal, and MLX
   builds from [GitHub Releases](https://github.com/mudler/vllm.cpp/releases/tag/v0.0.2).
 - **2026-08** **MiniMax-H3 generates video with audio.** All tasks run through `POST /v1/videos`;
