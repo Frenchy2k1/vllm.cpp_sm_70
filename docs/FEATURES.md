@@ -52,7 +52,7 @@ are our reading of their documented behavior, not measurements.
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
 | Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
-| fp8 KV cache | ◐ CPU only | ✅ | ✅ | ✅ |
+| fp8 KV cache | ◐ e4m3 store + read dequant on CPU and CUDA (#1593); nothing serves it yet: no runner block sizing and no `--kv-cache-dtype`. Metal/ROCm refused by name. CUDA gate UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
 | External KV provider ABI (LMCache) | ☐ | ✅ | ◐ | ☐ |
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
