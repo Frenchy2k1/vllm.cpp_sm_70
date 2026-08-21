@@ -79,6 +79,7 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | Compressed-tensors `mixed-precision` (`config_groups`, ordered regex `targets`) | ◐ scheme read from the config, never from a dtype probe; an arm with no loader is REFUSED BY NAME. On `unsloth/Qwen3.8-27B-NVFP4` the W4A4 group loads, the FP8 W8A8 group and the `kv_cache_scheme` are refused (#821) | ✅ | ✅ | ☐ |
+| ModelOpt `MIXED_PRECISION`: STATIC per-tensor FP8 + W4A16_NVFP4 | ☐ UNTRIED. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` carries 208 `input_scale`, `F32` scalar `weight_scale` and `"dynamic": false`, so the three `unsloth` blockers are absent (#1574) | ✅ | ✅ | ☐ |
 | fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
 | Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ RUNS on CPU (#1189 M4/M6): 10 projections as 7 GEMMs, `gate_up`+QKV merged. CUDA sm120: N,K %128==0 only; 7 shapes MATCH CPU ref on GB10, no token gate (#1437) ([spec](../.agents/specs/vt-matmul-fp8-block-cuda.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
