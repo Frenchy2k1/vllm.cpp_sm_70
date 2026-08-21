@@ -35,6 +35,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
+#include "vllm/model_executor/models/tensor_parallel.h"  // vllm::TensorParallel (TP forward param)
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -179,7 +180,8 @@ class Qwen3_5Model {
                                     const std::vector<GdnStateCache>& gdn_state,
                                     const Qwen3_5MoeWeights& weights,
                                     const HfConfig& config, vt::Queue& queue,
-                                    const std::vector<int32_t>& logits_indices = {});
+                                    const std::vector<int32_t>& logits_indices = {},
+                                    const vllm::TensorParallel* tp = nullptr);
 
   // DEVICE-resident variant of Forward (the sampler-on-device hot path). Same
   // contract/args as Forward, but returns the lm_head output as a pool-backed

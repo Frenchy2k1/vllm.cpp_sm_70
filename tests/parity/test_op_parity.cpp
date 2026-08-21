@@ -2677,6 +2677,128 @@ TEST_CASE("qwen27 paged logits tp==tp1 token gate (CUDA, multi-GPU, NVFP4 snapsh
           << " tokens: " << toks << ")");
 }
 
+// PAGED qwen3.6-35B-A3B MoE tp==tp1 token gate (Phase 5). Drives
+// Qwen3_5Model::Forward (the paged hybrid MoE path: 10 full-attn + 30 GDN
+// layers, each followed by the 256-expert sparse-MoE block) and compares the
+// greedy tokens under a tp>1 group against the tp1 (nullptr) reference,
+// mirroring the proven 27B dense paged gate (above) arm-for-arm.
+//
+//   * tp>1 full-attn = the same FullAttnBlockPaged per-rank GQA KV-head split
+//     the 27B gate exercises (here Hkv=2, per-rank 1 head at world=2).
+//   * tp>1 MoE expert block = the NEW per-rank expert-MLP shard
+//     (vt_cuda_moe_shard_run_b): rank r owns the intermediate slice of EVERY
+//     expert (gate/up column slice, down row slice); one NCCL AllReduceSum over
+//     the [P,H] partial. GDN + router + shared expert + combine replicate on
+//     every rank (byte-identical inputs -> byte-identical output).
+//   * The tp1 reference arm runs the production fused Marlin fp4 path (f32
+//     host-decode weights, exact fp4 decode); the tp>1 expert shard computes
+//     from the fp4->f32 host-decoded weights with fp32 GEMMs + AllReduceSum.
+//     The 27B dense gate already proved this fp32-shard vs fp4-Marlin pairing
+//     stays token-exact; this gate re-proves it over the 40-layer MoE block.
+//   * The host-decode needs the resident fp4 host bytes, which the production
+//     Marlin build frees unless VT_MOE_HOST_FREE=0 (the gate's documented
+//     same-binary A/B toggle; device compute unchanged).
+// 9-token prefill + 8 single-token decodes over persistent device pools, 17
+// tokens spanning 3 KV blocks (block-stride reads).
+TEST_CASE("qwen36 moe paged logits tp==tp1 token gate (CUDA, multi-GPU, NVFP4 snapshot)") {
+  bool has_cuda = true;
+  try { vt::GetBackend(DeviceType::kCUDA); }
+  catch (const std::runtime_error&) { has_cuda = false; }
+  if (!has_cuda) { MESSAGE("no CUDA backend; skipping moe paged tp==tp1 gate"); return; }
+  const std::string snap = Find35BSnapshot();
+  if (snap.empty()) { MESSAGE("SKIP: 35B NVFP4 snapshot not present"); return; }
+  int ngpu = 0;
+  if (cudaGetDeviceCount(&ngpu) != cudaSuccess) { MESSAGE("cudaGetDeviceCount failed"); return; }
+  if (ngpu < 2) { MESSAGE("SKIP: moe paged tp==tp1 needs >=2 CUDA GPUs (have " << ngpu << ")"); return; }
+
+  MESSAGE("moe paged tp==tp1 gate: loading 35B A3B (W4A4 fp4-resident) on " << ngpu << " GPUs...");
+  const vllm::HfConfig cfg = vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
+  std::vector<vllm::SafetensorsFile> shards;
+  for (int n = 1; n <= 3; ++n) {
+    auto s = OpenShard(snap, n);
+    if (!s) { MESSAGE("SKIP: 35B shard " << n << " not found"); return; }
+    shards.push_back(std::move(*s));
+  }
+  const vllm::Qwen3_5MoeWeights weights = vllm::LoadQwen3_5Moe(shards, cfg);
+  const int vocab = static_cast<int>(cfg.vocab_size);
+
+  std::vector<int32_t> base = {760, 6511, 314, 9338, 369, 11751, 11, 321, 279};
+  const int64_t N0 = static_cast<int64_t>(base.size());
+  constexpr int kDecodes = 8;
+  const int64_t bs = 8;
+  const int64_t max_len = N0 + kDecodes;
+  const int64_t kblocks = (max_len + bs - 1) / bs;
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  vllm::v1::GDNAttentionMetadataBuilder gdn_build;
+
+  const auto run_paged_greedy = [&](const vllm::TensorParallel* tp) {
+    PagedTpPool pool = BuildPagedTpPool(b, q, cfg, kblocks, bs, /*slots=*/4);
+    std::vector<int32_t> gen;
+    {
+      vllm::v1::CommonAttentionMetadata am;
+      am.num_reqs = 1;
+      am.num_actual_tokens = static_cast<int>(N0);
+      am.query_start_loc = {0, static_cast<int32_t>(N0)};
+      am.query_start_loc_cpu = am.query_start_loc;
+      am.seq_lens = {static_cast<int32_t>(N0)};
+      am.seq_lens_cpu = am.seq_lens;
+      am.num_computed_tokens_cpu = {0};
+      am.max_query_len = static_cast<int>(N0);
+      am.max_seq_len = static_cast<int>(N0);
+      am.block_table_num_cols = static_cast<int>(kblocks);
+      am.block_table_tensor = {0, 1, 2};
+      for (int64_t i = 0; i < N0; ++i) am.slot_mapping.push_back(i);
+      am.causal = true;
+      const vllm::v1::GDNAttentionMetadata gm = gdn_build.build(0, am);
+      std::vector<int32_t> pos(N0);
+      std::vector<float> lg = vllm::Qwen3_5Model::Forward(
+          base, pos, am, gm, pool.attn_kv, pool.gdn_state, weights, cfg, q, {}, tp);
+      gen.push_back(ArgmaxRow(&lg[static_cast<size_t>(N0 - 1) * vocab], vocab));
+    }
+    for (int s = 0; s < kDecodes; ++s) {
+      const int64_t L = N0 + s + 1;
+      const int32_t tok = gen[s];
+      vllm::v1::CommonAttentionMetadata am;
+      am.num_reqs = 1;
+      am.num_actual_tokens = 1;
+      am.query_start_loc = {0, 1};
+      am.query_start_loc_cpu = am.query_start_loc;
+      am.seq_lens = {static_cast<int32_t>(L)};
+      am.seq_lens_cpu = am.seq_lens;
+      am.num_computed_tokens_cpu = {static_cast<int32_t>(N0 + s)};
+      am.max_query_len = 1;
+      am.max_seq_len = static_cast<int>(L);
+      am.block_table_num_cols = static_cast<int>(kblocks);
+      am.block_table_tensor = {0, 1, 2};
+      am.slot_mapping = {L - 1};
+      am.causal = true;
+      const vllm::v1::GDNAttentionMetadata gm = gdn_build.build(0, am);
+      std::vector<float> lg = vllm::Qwen3_5Model::Forward(
+          {tok}, {static_cast<int32_t>(L - 1)}, am, gm, pool.attn_kv,
+          pool.gdn_state, weights, cfg, q, {}, tp);
+      gen.push_back(ArgmaxRow(&lg[0], vocab));
+    }
+    b.Free(pool.full_attn);
+    b.Free(pool.gdn_ssm);
+    b.Free(pool.gdn_conv);
+    return gen;
+  };
+  const std::vector<int32_t> t1 = run_paged_greedy(nullptr);
+  TpThunkComm th; th.w_ = ngpu;
+  vllm::TensorParallel tpGroup{&th};
+  const std::vector<int32_t> tw = run_paged_greedy(&tpGroup);
+  b.DestroyQueue(q);
+  REQUIRE(t1.size() == static_cast<size_t>(1 + kDecodes));
+  REQUIRE(t1 == tw);
+  std::string toks;
+  for (size_t i = 0; i < t1.size(); ++i)
+    toks += (i ? " " : "") + std::to_string(t1[i]);
+  MESSAGE("moe paged tp==tp1 token gate: " << ngpu << "-GPU == tp1 (" << t1.size()
+          << " tokens: " << toks << ")");
+}
+
 // vLLM 0.25.0's MergedColumnParallelLinear BA path dispatches BF16 x/weight
 // through default_unquantized_gemm -> torch.nn.functional.linear and returns
 // BF16. This pins the exact GB10 result bits at the real [M,5120] x [96,5120]
