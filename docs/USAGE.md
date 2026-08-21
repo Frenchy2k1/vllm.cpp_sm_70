@@ -170,6 +170,9 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
+  expert blocks (Q8_0, Q4_K, Q5_K, Q6_K) instead of being dequantized to
+  bf16 at load time.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.
