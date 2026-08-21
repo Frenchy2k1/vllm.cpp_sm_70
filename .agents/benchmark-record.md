@@ -25565,3 +25565,225 @@ decision. And still owed, now that the alias is excluded on the target silicon:
 WHAT the step-7 divergence is. Excluding one cause is not identifying another,
 and the next traceable hypothesis is a per-operation two-arm comparison of the
 step-7 forward, first differing tensor named.
+
+## MUSIC3-E2E-ON-MAIN — five merges priced end to end, and the vocoder device arm answered on an idle box (2026-08-20, `row/MUSIC3-E2E-ON-MAIN`, arms `d0598a255` and `a50c57d69`, `thor:gpu0` sm_110, #672 / #1512 / #1516)
+
+### What was measured
+
+`minimax-music3-gen` end to end on the real 28.5 GB `MiniMaxAI/MiniMax-Music3`
+diffusers checkpoint, instrumented with `VLLM_CPP_MUSIC3_PROFILE=1`
+(`src/vllm/model_executor/models/music3_profile.h`, off by default). Seventeen
+runs in one job: three engagement controls at `--duration 0.24 --steps 2`, a
+four-cell matrix at `--duration 4 --steps 4 --seed 7` over three alternated
+rounds, and both vocoder arms at the developer's `--duration 20 --steps 30`.
+
+It takes **no GPU clock window** (`.agents/benchmarking.md`). Every figure is a
+within-run split or a same-box A/B and none is quotable as a per-kernel or a
+cross-box number. It is not a parity ratio: no oracle ran.
+
+### The lease
+
+`rc` job **`c206ec87-65eb-4d0d-93ad-05538325e66e`** on **`thor:gpu0`**,
+`--max-runtime 480m`, submitter `claude/music3-e2e-main`. Worker
+`rc-worker-m4d7t`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, NVIDIA Thor
+capability (11,0), driver 595.78, 169 GB free on the overlay root, `/workspace`
+the CIFS NAS. No `ssh`, no `rc hold`, no `$GPU_LOCK`: the lease is the whole of
+the serialisation, which is what `.agents/specs/minimax-music3.md` §13.10 did not
+have and why its numbers are VOID.
+
+`uptime` **3.27 with 0 logins** at job start, which is this box's idle floor
+(§18.8a read 3.29 on the same worker). 4.8-16 across the timed runs, and the
+peaks are our own 14-thread host vocoder: the load rises inside a
+`vocoder.decode_window` and falls between runs. `dgx:gpu0` carried another
+session throughout and `thor:gpu0` carried nobody.
+
+### The arms
+
+| | OLD | NEW |
+|---|---|---|
+| commit | `d0598a255427d2ddc3235ce26cd714c1224c4b8e` (`main` before PR #1330) | `a50c57d69b5c9077d1aaddef4457497789a1207d` (`origin/main`) |
+| checked-out sha asserted | yes, `FATAL_WRONG_SHA` guard | yes |
+| clone | own `git clone`, `FATAL_CLONE` guard | own clone |
+| build dir | `/tmp/b-old` | `/tmp/b-new` |
+| build time | 291 s | 303 s |
+| `minimax-music3-gen` sha256 | `91387d74e27cdf64492dd2632ad1162febd606bd4d3eef5f5f87df4ffca4bfa2` | `e2742d4ab471159feec407cc72ddfd430baada0ad931fff8599b35daa192d9bb` |
+
+`CMAKE_BUILD_TYPE=Release`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, `ninja -j 6`, both
+inside the lease, after `apt` installed `cuda-nvcc-13-0 cuda-cudart-dev-13-0
+libcublas-dev-13-0` (nvcc 13.0.88). `diff -rq` reports 73 files differing under
+`src/` and 49 under `include/`.
+
+**The sha256 pair is NOT the arms-differ evidence, and that is
+[#1516](https://github.com/mudler/vllm.cpp/issues/1516).** `minimax-music3-gen`
+is a 72 744-byte ABI client of the SHARED `vllm::shared`
+(`examples/CMakeLists.txt:425-426`, `CMakeLists.txt:2633`); both arms are that
+size to the byte, no `CMAKE_SKIP_BUILD_RPATH` is set, and two build directories
+give two RPATH strings whatever the source says.
+
+**What separates the arms is the bucket SET.** `Music3SelectDepthArm`
+(`minimax_music3_llm.cpp:569-586`) brackets its staging as `ar.depth_staging`
+only when it stages, and the loop takes the device path iff the arm is engaged
+(`:469-476`). Three controls, `--duration 0.24 --steps 2`, 56 depth forwards
+each:
+
+| control | `ar.depth_staging` | `ar.depth_forward` | denoise | wall |
+|---|---|---|---|---|
+| OLD `--device 1` | absent | 5.982 s | `dit_device` 0.472 | 22.001 s |
+| NEW `--device 1` | **0.917 s** | **0.352 s** | `dit_device` 0.478 | 19.440 s |
+| NEW `--device 0` | absent | 5.814 s | `dit_host` **196.691 s** | 286.569 s |
+
+One binary cannot emit two different bucket sets. `Music3DepthDeviceForwardCount()`
+(`minimax_music3_depth_device.cpp:154`) would have been the direct instrument and
+is readable only from `test_minimax_music3_ar`, so it is unavailable to any
+production run.
+
+### Staging
+
+| check | result |
+|---|---|
+| source filesystem | `findmnt /workspace` -> `//192.168.68.102/Data[/rc] cifs` |
+| path actually read | `findmnt -T /tmp/ckpt` -> `overlay overlay /` |
+| copy completed | `SRC_BYTES=28517617303` = `DST_BYTES=28517617303`, hard fail on mismatch |
+| against the recorded count | `EXPECT_BYTES=28517617303`, equal |
+| staging cost | `STAGE_SECONDS=999`, 28.5 MB/s off CIFS |
+| local read ceiling | `cat` of all 28.518 GB: 6 s = **4752 MB/s** |
+| what the loader paid | `load.ar_weights` 5.37-6.21 s, `load.acoustic_weights` 1.93-2.13 s |
+
+§15.6 measured 780.015 s cold-CIFS and 5.689 s local for `load.ar_weights`; this
+job reads 5.37 s, so the staging result reproduces and no load figure implies
+more than the control.
+
+### The matrix — 4 s / 4 steps / 100 frames / seed 7, three alternated rounds
+
+`--device 1` on every run. `VLLM_CPP_VOCODER_DEVICE` unset resolves to `kCPU`
+(`vocoder1d.cpp:96-98`) and is the shipped default; `=cuda` is the opt-in arm.
+Medians of three, raw triples beneath.
+
+| bucket | OLD·host | OLD·cuda | NEW·host | NEW·cuda |
+|---|---|---|---|---|
+| wall clock | **166.038** | **165.449** | **48.070** | **52.684** |
+| | 166.038/165.610/167.042 | 166.039/165.011/165.449 | 48.193/48.070/47.918 | 52.435/52.684/52.795 |
+| `ar.depth_forward` (808) | 80.728 | 81.070 | 4.272 | 4.305 |
+| | 80.118/80.728/81.694 | 81.513/80.734/81.070 | 4.247/4.289/4.272 | 4.305/4.312/4.294 |
+| `vocoder.decode_window` (1, 344 latents) | 54.091 | 53.580 | 15.078 | 19.288 |
+| | 54.091/54.042/54.646 | 53.580/53.593/53.553 | 15.107/15.078/14.897 | 19.218/19.288/19.306 |
+| `ar.lm_decode_step` (100) | 12.338 | 12.349 | 9.517 | 9.516 |
+| `denoise.dit_device` (4) | 5.060 | 5.060 | 5.048 | 5.050 |
+| `ar.depth_staging` | — | — | 0.908 | 0.915 |
+| WAV sha256 | `8a997f193b589adac37abe0a77ad029e` | same | `9b7d0a2a92aa3388010349fd70742fb6` | same |
+| RMS / peak | 0.01943 / 0.23248 | same | 0.02940 / 0.38700 | same |
+
+The loudest round is kept: round 3's OLD·host is the slowest leg in the set at
+167.042 s and stays in the median.
+
+**The instrument reproduces §16.6b**, whose AFTER arm `4568c6e71` read wall
+163.00 s, `ar.depth_forward` 78.316 s, `vocoder.decode_window` 53.605 s and
+`ar.lm_decode_step` 12.339 s. OLD·cuda here reads 165.449 / 81.070 / 53.580 /
+12.349 across two different commits, two jobs and two prompts.
+
+### The developer's configuration — 20 s / 30 steps / 500 frames / 4 windows
+
+One run per vocoder arm on NEW, checkpoint staged, beside the recorded §15.7
+figure which was taken on CIFS on pre-#1238 code.
+
+| bucket | recorded §15.7 | NEW·cuda | NEW·host |
+|---|---|---|---|
+| wall | **3269.789** | 624.127 | **595.899** |
+| `denoise.dit_device` | 370.746 / 120 | 370.634 / 120 | **370.556 / 120** |
+| `vocoder.decode_window` | 421.670 / 4 | 150.060 / 4 | **122.169 / 4** |
+| `ar.lm_decode_step` | 83.629 / 500 | 56.082 / 500 | 56.174 / 500 |
+| `ar.depth_forward` | 1710.456 / 7014 | 21.055 / 4008 | 21.099 / 4008 |
+| `ar.depth_projection` | 49.580 / 7014 | 7.090 / 3507 | 6.966 / 3507 |
+| `ar.semantic_guide_and_draw` | 1.725 / 501 | 3.635 / 501 | 3.701 / 501 |
+| `ar.depth_head_and_draw` | 3.300 / 3507 | 3.733 / 3507 | 3.489 / 3507 |
+| `load.ar_weights` | 397.909 | 5.369 | 5.442 |
+| `load.acoustic_weights` | 210.482 | 2.035 | 1.979 |
+| `unattributed` | 5.540 | 0.331 | 0.331 |
+| WAV sha256 | — | `55856deb3b5b727a4ca4fcc473e01a56` | same |
+| audio | 20.016 s | 20.016 s, RMS 0.07155, peak 0.63320 | same |
+
+### The results
+
+| claim | before | after | ratio |
+|---|---|---|---|
+| wall, 4 s, host vocoder both sides | 166.038 s | 48.070 s | **3.45x** |
+| wall, 4 s, CUDA vocoder both sides | 165.449 s | 52.684 s | **3.14x** |
+| wall, 4 s, each side's best arm | 165.449 s | 48.070 s | **3.44x** |
+| `ar.depth_forward`, 808 calls both sides | 80.728 s | 4.272 s | **18.90x** |
+| `vocoder.decode_window`, host arm, 344 latents | 54.091 s | 15.078 s | **3.59x** |
+| `vocoder.decode_window`, CUDA arm, 344 latents | 53.580 s | 19.288 s | **2.78x** |
+| wall, 20 s / 30 steps, as measured | 3269.789 s | 595.899 s | **5.49x** |
+| wall, 20 s / 30 steps, both loads excluded | 2661.398 s | 587.951 s | **4.53x** |
+| `denoise.dit_device`, 120 calls both sides | 370.746 s | 370.556 s | **1.000x** |
+
+The 20 s pair crosses two jobs AND two storage states, so both the raw ratio and
+the load-excluded one are given and neither alone is quoted as the answer.
+
+**The vocoder CUDA arm still LOSES.** At 344 latents it is 0.782x of the host arm
+on NEW and 1.010x on OLD; at ~689 latents x 4 windows it is 0.814x. The f32
+accumulator is worth **2.78x on the device arm**, so §13.10's fp64 suspicion was
+correct and Thor's fp64 rate was a large term; the arm loses because #1356 and
+#1474 together moved the host kernel 3.59x. Taken on an idle box under one lease,
+which is what §13.10's VOID axis lacked.
+
+**The device vocoder is byte-identical to the host vocoder end to end**, at f64
+and at f32: six OLD runs wrote one WAV hash, six NEW runs wrote one WAV hash, and
+the 20 s pair wrote one hash across both arms. This is the re-measurement §18.9
+carries as owed for §13.4's `memcmp` against the tiled host kernel.
+
+### Where the time goes on current main
+
+`--device 1`, default host vocoder, staged, 20 s / 30 steps, wall 595.899 s:
+
+| rank | bucket | seconds | % | calls |
+|---|---|---|---|---|
+| 1 | **`denoise.dit_device`** | **370.556** | **62.24** | 120 |
+| 2 | `vocoder.decode_window` | 122.169 | 20.52 | 4 |
+| 3 | `ar.lm_decode_step` | 56.174 | 9.44 | 500 |
+| 4 | `ar.depth_forward` | 21.099 | 3.54 | 4008 |
+| 5 | `ar.depth_projection` | 6.966 | 1.17 | 3507 |
+| 6 | `load.ar_weights` | 5.442 | 0.91 | 1 |
+| 7 | `ar.semantic_guide_and_draw` | 3.701 | 0.62 | 501 |
+| 8 | `ar.depth_head_and_draw` | 3.489 | 0.59 | 3507 |
+
+§15.2 read the same bucket at 0.34 % and wrote "the GPU is not the problem, and
+no further DiT work will move this number". The DiT did not get slower — 370.6 s
+against 370.7 s over an identical 120 calls — everything around it got faster.
+
+### Four things that did not behave as the record predicts
+
+1. **The untiled host vocoder is 54.091 s here and 97.4463 s in §18.8a's kernel
+   bench, at the same 344 latents through the same call.** A 1.80x instrument
+   disagreement. Neither is withdrawn: this one is e2e on the real checkpoint,
+   that one is a two-binary A/B internally consistent across a 17x span of work.
+   Hypothesis, labelled as one: synthetic pseudo-random weights can drive an f64
+   dependent accumulate chain into subnormals in a way a trained checkpoint does
+   not. No counter was read on either side. **Consequence: the 1.364x-1.439x
+   tiling figure must not be multiplied onto an e2e bucket**, and the 3.59x above
+   is tiling AND f32 together, not decomposable from these data.
+2. **`ar.lm_decode_step` fell 1.30x at 4 s and 1.49x at 20 s across unchanged
+   call counts**, and nothing in the five merges touches the LM decode. §16.6b
+   recorded 1.21x of the same shape with a smaller-working-set hypothesis; it
+   recurs, larger, still unmeasured.
+3. **Two host remainders got SLOWER**: `ar.semantic_guide_and_draw` 1.725 ->
+   3.701 s over 501 unchanged calls, `ar.depth_head_and_draw` 3.300 -> 3.489 over
+   3507. 1.2 % of the run, named rather than absorbed.
+4. **Round 1's two OLD runs agree to 1 ms on wall** (166.038, 166.039) while
+   every bucket inside them differs. Two runs, not one; recorded because an equal
+   wall clock is the tell §16.6a taught this lane to distrust, and here the
+   bucket table is what refutes it.
+
+### Reproduce
+
+```sh
+rc run -d thor:gpu0 --max-runtime 480m --as claude/music3-e2e-main -- \
+  bash -c "bash /workspace/music3-e2e/run.sh 2>&1 | tee /workspace/music3-e2e/log-<ts>.txt"
+```
+
+The recipe is `/workspace/music3-e2e/run.sh` on the shared NAS; the raw log is
+`/workspace/music3-e2e/log-20260820T221735Z.txt`, 1080 lines, carrying every
+bucket table for all seventeen runs. The checkpoint is `/workspace/music3/ckpt`
+and the lyrics `/workspace/music3/lyrics.txt`; `ar.prompt_tokens` is **282** on
+every run here, against §15.8's 223, so the prompt is not the one §16.6b used and
+`ar.lm_prefill` is the only bucket that difference reaches.
