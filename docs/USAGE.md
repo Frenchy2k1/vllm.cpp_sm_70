@@ -276,6 +276,20 @@ thread count they actually got beside the count that was asked for.
   a family can move -- for MiniMax-Music3 the language model, the RVQ depth
   decoder and the flow-matching transformer -- and there is no per-stage switch
   and no environment variable that turns one of them on by itself.
+- `nemotron_h`, `laguna` and `qwen3_vl` finish their forward on the host and
+  hand the runner a host logits buffer, while the sampler itself runs on device
+  (`scripts/runner-routing-allowlist.txt` lists them and names what removes each
+  entry). On a unified-memory device — GB10 and other integrated CUDA devices,
+  integrated Vulkan, and CPU — those logits are sampled where they are. On a
+  discrete GPU they are staged into device memory once per step, into a buffer
+  that is reused and only ever grows, so you pay one host-to-device transfer of
+  `rows x vocab x 4` bytes per step on these three models and on no others.
+  Before [#1313](https://github.com/mudler/vllm.cpp/issues/1313) the host
+  address was handed to the sampling kernel directly, which is valid only on a
+  unified-memory device; an illegal-address abort during sampling on a discrete
+  GPU on an older build was this. The discrete arm is gated at the seam
+  (`tests/vllm/v1/sample/test_host_buffer_staging.cpp`) and has no hardware run
+  behind it, because every GPU on the project's fleet reports unified memory.
 - `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
   means the tokenizer file names a merge whose left token, right token, or
   joined result is missing from its own vocabulary. Both `tokenizer.json` and a
