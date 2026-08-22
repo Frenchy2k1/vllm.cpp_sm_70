@@ -1972,61 +1972,89 @@ inside a red-lane repair would have made the repair unreviewable. This follows
 how the unaligned-read class was handled — named site in #674/PR #688, residue
 filed as #772 — rather than widening silently.
 
-## 7. Now
+## Now
 
-**State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
-re-review.** The `MIXED_PRECISION` resolver landed at `1bc5ef82c` (#561) and the
-W3 scaffold at `c6b240edd` (#576); both are merged into this branch, and their
-spec sections (§4's three W1 subsections, §5c/§5d/§5e) are main's, carried here
-byte for byte. The Mamba2 SSD kernel work W1 landed earlier at `47960a009`
-(#496), so `include/vt/ops.h` carries main's
-`kMamba2ChunkScan`/`kMamba2StateUpdate`/`kRmsNormGatedGroup` first and appends
-`kMoeRelu2` after them; no existing op id shifted. W2 (the non-gated `relu²`
-expert, §6a) was reviewed PASS at `e2d68404`, repaired for that review's six
-findings at `dd7a6477d`, and this branch is its land-prep: re-merged onto
-`origin/main` and fully re-gated. A second fresh review (PR #586 @ `f6a7f8709`)
-returned **PASS** — it established that the repair delta changes zero executable
-lines — with four RECORD findings, all repaired on
-`row/MODEL-NEMOTRON-H-W2-RECORDS`: two stale `activation.py:33` anchors
-(`include/vt/ops.h`, this spec), M7's assertion count (§6a), §4's W2 seam text
-contradicting §6a, and an overstated bit-identity comment in `cuda_moe.cu`
-(#591). That repair touches comments and this spec only; no executable line
-moved. `tests/vt/test_ops_moe_nongated_relu2.cpp:12` already carried the
-corrected anchors and needed no change.
+**State at this commit: the row STAYS `INVENTORIED`, and what changes is that
+its text stops being false.** Nothing in this change touches `src/`, `include/`,
+`tests/` or `scripts/`. The matrix row still described `main` as of 2026-08-12,
+having gone untouched while A2-R (`598226e96`), A2-P (`a6df72777`), A2-Q2a and
+the A3 driver (`c83b96934`) all landed on top of it. This reconcile corrects
+that description and records the A3 measurement against the tree it was taken
+on. It deliberately does NOT move the lifecycle state: see the gate paragraph
+below, which is why the move is not this change's to make.
 
-The row stays `INVENTORIED`; this commit changes no lifecycle state, so it owes
-no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a records
-the pinned oracle loading and running the checkpoint on GB10 with three greedy
-goldens committed, so W6 has a denominator whenever it is reached.
+**The `KERNEL-SSM-MAMBA` block the row carried is FALSE and was measured so.**
+[#496](https://github.com/mudler/vllm.cpp/issues/496) landed its host arm at
+`47960a009` and its CUDA arm at `43a6c5518`. The kernel is
+`src/vt/cuda/cuda_mamba2_ssd.cuh`, a 692-line header included at
+`cuda_gdn.cu:48` and registered as `kMamba2ChunkScan` at `cuda_gdn.cu:6669`
+rather than a translation unit of its own, so a `src/vt/*mamba*` FILE GLOB finds
+nothing and reads as absence. That glob is the search the row's text rested on.
+`src/vllm/model_executor/models/nemotron_h.cpp::NemotronHMamba2Mixer` calls
+`vt::Mamba2ChunkScan` today. Of the three things the row said "exist nowhere
+locally", the non-gated `relu²` MoE (`4d0c399e1`) and ModelOpt
+`MIXED_PRECISION` loading (`1bc5ef82c`) both exist; only the MTP head (W5) is
+still genuinely owed.
 
-**W4 has LANDED** (`ce8c8bf67`, #718), and the WEIGHT LOADER §7 named as "the
-next brick" is built and gated on `row/MODEL-NEMOTRON-H-LOADER` — **§6d is the
-authority on it**. The forward no longer refuses on a checkpoint load: 18487 of
-18487 tensors are accounted (18217 materialized in their shipped formats, 270
-deferred by name to W5), the real 20.1 GiB checkpoint runs at **17.70 GiB peak
-RSS**, and its first greedy token matches the pinned oracle's committed golden on
-**3 of 3** prompts.
+**Why no state move rides here.** The earlier draft of this section moved the
+row to `PARTIAL` on the strength of the A3 gate. That argument rested on the
+gate's pass being a property of a branch that was about to land, and the premise
+expired when it landed: the pass belongs to the tree measured, not to `main`
+today. A state move needs a gate result measured on `main`, and none exists. Two
+things remain true and are recorded rather than acted on: no file under
+`.agents/claims/` claims `MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm`, so
+`scripts/check-agent-record.py` would refuse `ACTIVE` regardless; and the row's
+code and test anchors are now exact, so whoever re-runs the gate has the
+contract `PARTIAL` requires already written down.
 
-**Next action:** the loader needs a **FRESH REVIEW** — never the agent that wrote
-it. The two claims it changes rather than adds, and which a review should mutate,
-are (a) `NemotronHOwned::View`'s refusal of a non-dense weight, which is the only
-thing standing between a packed NVFP4 buffer and a plausible-garbage GEMM operand,
-and (b) the expert-major reorder in `NemotronHMoeMixer`, whose result-neutrality
-is claimed from the disjointness of the output slots rather than measured.
+**The end-to-end token gate PASSES, and it passes on a branch that is not
+`main`.** On GB10 the A3 96-token gate reads `TOKEN MATCH: 96/96 over 3
+prompt(s) (full rows=3, short rows=0, mode=decode)` and `STRICT PASS`, against
+the pinned oracle `vllm=0.23.1rc1.dev1511+g555967922` on
+`nemotron-3.5-lightning-30b-nvfp4` at revision
+`29f2d1746d8f41e316523194b19018707749b1b1`.
 
-Then W5 (the MTP head, whose 270 tensors the loader already names as owed), W6
-(the e2e token gate against the committed goldens, now unblocked — it has weights),
-and W7 (GGUF). Carried forward, not resolved: the two OWED GPU items in §6a
-(`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
-NemotronH MoE block on GB10) — the loader now produces exactly those g16 tensors,
-so the first of them is reachable — and the OWED GGUF k-quant arm (§5b).
+It is the DEVICE leg. Three things say so, and the third is the one that
+matters. The binary is `libvllm 0.0.3+cuda`, and `cfg.log` records `fp4-mma`,
+`cutlass-nvfp4` and `cutlass-fp8` as `ENABLED for [121a]`. The run logs
+`Asynchronous scheduling is enabled (max_concurrent_batches=2)`, which is
+precisely the path where `ModelForwardInput::device_token_ids` is non-null; on
+the host queue it is always null and the [#1157](https://github.com/mudler/vllm.cpp/issues/1157)
+defect cannot occur at all. And the same binary on the same checkpoint, with
+ONLY `nemotron_h_device.cpp` reverted to the fix's parent, scores `4/24 (full
+rows=0, short rows=3)` and bails at 8 generated tokens. A host-leg run would
+have been unmoved by that revert. **The delta is the proof; the pass on its own
+is not.** Evidence: `/usr/local/nas_share/rc/nh1157/` — `gate_fixed.out`,
+`gate_red.out`, `cfg.log`, `build.log`.
 
-**Reported, outside this task's authority to fix.** `test_op_parity` is RED on
-this row's base for a reason belonging to MODEL-MUSIC-MUSIC3 (#672); §6d's gate
-evidence has the diagnosis.
+**The pass belongs to the tree it was measured on, which is now on `main` --
+and that is still not a pass on `main`.**
+[#1221](https://github.com/mudler/vllm.cpp/pull/1221) MERGED on 2026-08-18 as
+`0ea5d249f`, which is `main`'s last touch of `nemotron_h_device.cpp`, so the
+`device_token_ids` repair the 96/96 depended on is no longer pending. The 96/96
+was taken on that branch tree, `main` has advanced many commits since, and no
+run against current `main` exists. Naming the SHA a measurement belongs to is
+the point: an evidence line that names a tree it was not measured on has cost
+this repository before. This spec therefore records a measured result and its
+tree, and it does NOT record `main` as gated. One config caveat travels with the
+run: `--gpu-memory-utilization 0.92` did not size the KV pool, which fell back
+to 256 blocks ([#83](https://github.com/mudler/vllm.cpp/issues/83)).
 
-The row stays `INVENTORIED`: the loader changes no lifecycle state, because the
-forward is still the HOST reference and nothing runs on the paged runner (W6).
+**No throughput, latency or memory number exists for this architecture and none
+is claimed.** The wall times in `gate_fixed.out` — 264.4s to load, 327-343s per
+32-token prompt — are a correctness run on a path whose `lm_head` and 46 FP8
+mamba projections still execute host-side. They are not benchmarks, they are not
+a denominator, and nothing may carry them into `docs/BENCHMARKS.md` as a
+performance figure.
+
+**Next action:** re-run the A3 gate against `main`. #1221 has landed, so
+nothing is blocked on a merge any more; what is missing is a gate result
+measured on a `main` tree, which is the only thing that can move this row off
+`INVENTORIED`. Then W5 (the MTP head, whose 270 tensors the loader already names
+as owed) and W7 (GGUF k-quants). A2-Q2b (the device `lm_head`) is what removes
+`nemotron_h` from `scripts/runner-routing-allowlist.txt`; A2-B is what removes
+the `input.num_reqs <= 1` refusal.
+
 
 ## 8. Stop conditions
 
@@ -2055,3 +2083,44 @@ forward is still the HOST reference and nothing runs on the paged runner (W6).
   The entry stays rather than being deleted because #847's row in the
   append-only `.agents/issue-index.md` names no owning row, so a spec must keep
   claiming it; GitHub holds the closed state. Do not read it as open work.
+
+- [#1080](https://github.com/mudler/vllm.cpp/issues/1080) — `scripts/check-doc-checkpoint.py:153`
+  matches a spec's live-position section with `^##\s+Now\s*$`, and specs in this
+  tree write it as `## N. Now`, so `spec_now_errors` reports "has no `## Now`
+  section" about a section that is present and current. It fires only when a row
+  moves lifecycle state. THIS spec was one of them and is repaired in flow here —
+  `## 7. Now` becomes `## Now` — because this change is what makes it the spec a
+  moving row links, and the next lifecycle move on this row would otherwise red on
+  a section it is looking straight at. Re-measured at `b626be75a` AFTER that
+  repair: **15 specs still write the numbered spelling** — `gate-audit-branch-evidence`,
+  `ltx25-a2v-audio-input`, `ltx25-image-conditioning`, `ltx25-t2a-one-stage`,
+  `ltx25-token-append`, `ltx2-device-staged-view-uaf`, `mamba2-ssd`,
+  `nas-mount-path`, `nemotron-h-a2p-paged-forward`, `nemotron-h-a2q1-fp8-mamba`,
+  `nemotron-h-a2q2b-realckpt-lmhead`, `nemotron-h-a2q2-nvfp4-moe-lmhead`,
+  `nemotron-h-abi-e2e`, `offload-docs-refusal`, `registry-downcast-sweep`. The
+  population GREW since #1080 was filed against twelve, which is the argument for
+  the checker-semantics fix over a rename sweep: a rename repairs today's files and
+  the next spec written to the numbered spelling reintroduces it. Either close needs
+  its own spec and a red-before test, so neither rides in a records reconcile.
+  `tests/scripts/` covers `NOW_SECTION` nowhere, which is how the mismatch survived.
+
+- [#1217](https://github.com/mudler/vllm.cpp/issues/1217) — the runner hands
+  `ModelForwardInput::device_token_ids` to whatever model a step routes to, and
+  nothing enforces that a forward which ignores the field is never given one. This
+  architecture's paged forward was the SECOND model cut from that divergence
+  (Kimi-Linear was the first), which is what [#1157](https://github.com/mudler/vllm.cpp/issues/1157)
+  turned out to be. It is owed to `MODEL-NEMOTRON-H-ABI-A2P`. **The record for it
+  landed on `main` on 2026-08-18, in
+  [#1221](https://github.com/mudler/vllm.cpp/pull/1221) as `0ea5d249f`.** Both
+  writes are in this tree at this head. `.agents/issue-index.md:404` carries the
+  index row and names `MODEL-NEMOTRON-H-ABI-A2P` as its owning row.
+  [`nemotron-h-a2p-paged-forward.md:901`](nemotron-h-a2p-paged-forward.md) lists
+  the issue as the first bullet under that spec's `## 11. Owed`. The earlier
+  reason to withhold the index row was that #1221 was still open. Two branches
+  would then append the same key, and the union driver would merge them into a
+  DUPLICATE. That reason expired with the merge, and appending a row now would
+  create the duplicate it was written to avoid. **This reconcile therefore owes
+  nothing for #1217.** The issue stays open as a seam defect owned by
+  `MODEL-NEMOTRON-H-ABI-A2P`, and it is not why this row's end-to-end gate is
+  unrecorded on `main`. `## Now` gives that reason: the `STRICT PASS` 96/96 was
+  measured on the #1221 branch tree, and no run against current `main` exists.
