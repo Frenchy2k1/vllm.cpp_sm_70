@@ -183,6 +183,10 @@ __device__ inline float LoadKv(const __nv_bfloat16* p, int64_t i, float scale) {
   (void)scale;
   return Load(p, i);
 }
+__device__ inline float LoadKv(const __half* p, int64_t i, float scale) {
+  (void)scale;
+  return Load(p, i);
+}
 __device__ inline float LoadKv(const uint8_t* p, int64_t i, float scale) {
   return Fp8E4M3ToF32Dev(p[i]) * scale;
 }
@@ -2160,7 +2164,7 @@ extern "C" void vt_sm70_fa2_ref_decode(
       static_cast<const __half*>(v), block_table, seq_lens, d_qsl,
       num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
       vc_blk, vc_pg, vc_hd, scale, /*softcap=*/0.f, /*causal=*/true,
-      /*window_left=*/1, /*window_right=*/1);
+      /*window_left=*/1, /*window_right=*/1, /*k_scale=*/1.0f, /*v_scale=*/1.0f);
   Check(cudaGetLastError(), "sm70 fa2 oracle decode");
   cudaFree(d_qsl);
 }
@@ -2216,7 +2220,8 @@ bool Sm70FaValidate(cudaStream_t s, float* out, const Tensor& query,
       block_table.stride[0], block_table.stride[1],
       k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
       v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      scale, /*softcap=*/0.f, /*causal=*/true, /*wl=*/1, /*wr=*/1);
+      scale, /*softcap=*/0.f, /*causal=*/true, /*wl=*/1, /*wr=*/1,
+      /*k_scale=*/1.0f, /*v_scale=*/1.0f);
   vt_sm70_fa2_decode(out, query.Ptr<__half>(), k_cache.Ptr<__half>(),
                      v_cache.Ptr<__half>(), block_table.Ptr<int32_t>(),
                      seq_lens.Ptr<int32_t>(), num_tokens, hq, nkv, d, block_size,
