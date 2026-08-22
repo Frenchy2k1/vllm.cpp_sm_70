@@ -303,6 +303,11 @@ struct Args {
   // JSON object vLLM takes (e.g. '{"method":"mtp","num_speculative_tokens":1}').
   // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
   std::string speculative_config;
+  // TP_PLAN W7: --tensor-parallel-size N. Default 1 == the byte-identical tp1
+  // path. N > 1 (tp>1 distributed serve) is REFUSED at parse with the named
+  // forward seam, because the runner's per-rank forward is W5 (still open). A
+  // loud named refusal beats a silent tp1 degrade — the honest serving answer.
+  int tensor_parallel_size = 1;
   // ── Multimodal input limits (ENG-MM-INPUT-PIPELINE wave L2, #607) ─────────
   // --language-model-only (arg_utils.py:555,1276,1691) and --limit-mm-per-prompt
   // (arg_utils.py:556,1279,1692), the two flags 43 of the 157 official recipes
@@ -406,6 +411,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--kv-transfer-config '<json>']\n"
          "               [--offload-config '<json>']\n"
          "               [--speculative-config '<json>']\n"
+         "               [--tensor-parallel-size N]\n"
          "               [--[no-]language-model-only]\n"
          "               [--limit-mm-per-prompt '<json>']\n"
          "               [--speech-model <checkpoint-dir>] "
@@ -595,6 +601,19 @@ Args ParseArgs(int argc, char** argv) {
       a.offload_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--tensor-parallel-size") {
+      // TP_PLAN W7: parse + validate at construction (mirrors vLLM validating
+      // tensor_parallel_size at config build). 1 is the byte-identical tp1
+      // path; N > 1 is the tp>1 distributed serve, which this tree refuses
+      // loudly (the runner's per-rank forward is W5, still open). This keeps
+      // G3's "world==1 no change, tp>1 rejected" honest at the entry point.
+      const int n = std::stoi(NextArg(argc, argv, i, argv[0]));
+      if (n < 1) {
+        std::cerr << "server: --tensor-parallel-size must be >= 1 (got " << n
+                  << ")\n";
+        Usage(argv[0], 2);
+      }
+      a.tensor_parallel_size = n;
     } else if (flag == "--language-model-only" ||
                flag == "--no-language-model-only") {
       // arg_utils.py:1276 over a bool field, which _compute_kwargs gives
@@ -1144,6 +1163,10 @@ int VllmServerMain(int argc, char** argv) {
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
+    // TP_PLAN W7: --tensor-parallel-size N (1 default => byte-identical tp1).
+    // The runner's lane construction at engine load reads it and refuses N>1
+    // (G1) until per-rank forward (W5) lands.
+    engine_params.tensor_parallel_size = args.tensor_parallel_size;
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
     // #607 L2: the multimodal input limits go onto the ENGINE, not into a
     // server-local variable, so the C ABI and this server resolve one limit the

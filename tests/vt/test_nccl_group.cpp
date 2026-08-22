@@ -25,6 +25,7 @@ extern "C" int vt_cuda_tp_seam_selfcheck(void);
 extern "C" int vt_cuda_loader_slice_selfcheck(void);
 extern "C" int vt_cuda_sharded_forward_selfcheck(void);
 extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void);
+extern "C" int vt_cuda_bridge_rank_lanes_selfcheck(void);
 extern "C" int vt_cuda_mlp_shard_run(int O,int H,int I,const float* x,const float* gate,const float* up,const float* down,float* out);
 extern "C" void* vt_cuda_tp_acquire(int tp_size);
 extern "C" void vt_cuda_tp_release(void* handle);
@@ -69,6 +70,20 @@ TEST_CASE("engine bridge: acquire a retained NCCL TP group for tp>1, null at tp1
 #endif
 }
 
+TEST_CASE("TP_PLAN W4-pre: per-rank lane build over a retained NCCL group, tp<=1 inert") {
+  // 1 rank never builds a group (the runner's tp1 path stays inert).
+  CHECK(vt_cuda_bridge_rank_lanes_selfcheck() != 1);  // 2 (skip) or 0, never a lane build failure
+#ifdef VLLM_CPP_CUDA
+  int devs = 0;
+  REQUIRE(cudaGetDeviceCount(&devs) == cudaSuccess);
+  if (devs < 2) { MESSAGE("single-GPU; W4-pre construction skipped"); return; }
+  // On a 2-GPU host the selfcheck builds every rank lane (tp_size==W, rank==r)
+  // and asserts each lane's TpShard window is live + distinct — NO forward math,
+  // so the engine's world>1 serve guard stays untouched.
+  CHECK(vt_cuda_bridge_rank_lanes_selfcheck() == 0);
+#endif
+}
+
 TEST_CASE("dense-body shard: merged gate/up column-slice + down row-parallel reduce == MLP single-GPU") {
   const int rc = vt_cuda_dense_mlp_shard_selfcheck();
   if (rc == 2) {
@@ -93,6 +108,13 @@ TEST_CASE("reusable mlp_shard_run matches the host MLP reference at a fresh shap
   for (int k=0;k<H;++k) x[k]=0.5f+(float)(k%3);
   for (int i=0;i<I;++i)for(int k=0;k<H;++k){gate[i*H+k]=0.1f*((i*3+k)%7)+0.05f;up[i*H+k]=0.05f*((i*5+k*2)%9)+0.2f;}
   for (int o=0;o<O;++o)for(int i=0;i<I;++i) down[o*I+i]=0.02f*((o*7+i*3)%11)+0.4f;
+#ifdef VLLM_CPP_CUDA
+  int devs = -1; (void)cudaGetDeviceCount(&devs);
+  if (devs >= 2 && I % devs != 0) {  // world must divide I for an exact shard
+    MESSAGE("world does not divide I=16; fresh-shape shard skipped");
+    return;
+  }
+#endif
   int rc=vt_cuda_mlp_shard_run(O,H,I,x.data(),gate.data(),up.data(),down.data(),out.data());
   if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL unbuilt); mlp_shard_run skipped");return;}
   CHECK(rc==0);
@@ -100,11 +122,18 @@ TEST_CASE("reusable mlp_shard_run matches the host MLP reference at a fresh shap
 }
 
 TEST_CASE("mlp_shard_run holds at engine-scale intermediate width") {
-  constexpr int O=256, H=512, I=1024;   // I % W == 0 (W=4)
+  constexpr int O=256, H=512, I=1024;   // I % W == 0 (W=2, W=4)
   std::vector<float> x(H), gate(I*H), up(I*H), down(O*I), out(O,0.f);
   for (int k=0;k<H;++k) x[k]=0.4f+0.1f*(float)(k%7);
   for (int i=0;i<I;++i)for(int k=0;k<H;++k){ float r=0.001f*((i*3+k)%997); gate[i*H+k]=r+0.1f; up[i*H+k]=r+0.2f; }
   for (int o=0;o<O;++o)for(int i=0;i<I;++i) down[o*I+i]=0.001f*((o*7+i*3)%1000)+0.3f;
+#ifdef VLLM_CPP_CUDA
+  int devs = -1; (void)cudaGetDeviceCount(&devs);
+  if (devs >= 2 && I % devs != 0) {
+    MESSAGE("world does not divide I=1024; engine-scale shard skipped");
+    return;
+  }
+#endif
   int rc=vt_cuda_mlp_shard_run(O,H,I,x.data(),gate.data(),up.data(),down.data(),out.data());
   if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); big mlp_shard skipped");return;}
   CHECK(rc==0);
@@ -211,6 +240,10 @@ TEST_CASE("MoE expert shard: per-expert return, replicated router, exit reduce =
   // host reference (the tp==tp1 MoE shape).
   constexpr int T=3,H=8,E=6,I=16;   // I%4==0
   constexpr int top_k=2;
+#ifdef VLLM_CPP_CUDA
+  int devs = -1; (void)cudaGetDeviceCount(&devs);
+  if (devs >= 2 && I % devs != 0) { MESSAGE("world not divide I=16; moe skipped"); return; }
+#endif
   std::vector<float> x(T*H), gate(E*I*H), up(E*I*H), down(E*I*H);
   for (size_t i=0;i<x.size();++i) x[i]=0.3f+0.1f*((int)(i%7));
   for (int e=0;e<E;++e)for(int i=0;i<I;++i)for(int h=0;h<H;++h){
@@ -240,6 +273,10 @@ TEST_CASE("MoE expert shard: 35B-A3B geometry (H=2048,I=512,E=8,top=8,T=9)") {
   // Reproduce the real-model shapes where the tp>1 MoE shard feeds a ForwardDense
   // decode: hidden 2048, moe_intermediate 512, 8 experts x 8 per token, 9 tokens.
   constexpr int T=9,H=2048,I=512,E=256,top_k=8;
+#ifdef VLLM_CPP_CUDA
+  int devs = -1; (void)cudaGetDeviceCount(&devs);
+  if (devs >= 2 && I % devs != 0) { MESSAGE("world not divide I=512; 35B moe skipped"); return; }
+#endif
   std::vector<float> x(T*H), gate(E*I*H), up(E*I*H), down(E*I*H);
   for (size_t i=0;i<x.size();++i) x[i]=0.03f+0.001f*((int)(i%37));
   for (int e=0;e<E;++e)for(int i=0;i<I;++i)for(int h=0;h<H;++h){
@@ -269,6 +306,10 @@ TEST_CASE("MoE expert shard: 35B-A3B geometry (H=2048,I=512,E=8,top=8,T=9)") {
 
 TEST_CASE("lm_head column-shard: vocab split across ranks + AllGather == full-vocab logits") {
   constexpr int T=4,H=16,V=64;  // V%W==0 on 2/4-GPU box
+#ifdef VLLM_CPP_CUDA
+  int devs = -1; (void)cudaGetDeviceCount(&devs);
+  if (devs >= 2 && V % devs != 0) { MESSAGE("world not divide V=64; lm_head skipped"); return; }
+#endif
   std::vector<float> x(T*H),w(V*H);
   for (size_t i=0;i<x.size();++i) x[i]=0.05f*((int)(i%11))-0.2f;
   for (int v=0;v<V;++v) for (int d=0;d<H;++d) w[v*H+d]=0.01f*((v*3+d)%19)-0.4f;

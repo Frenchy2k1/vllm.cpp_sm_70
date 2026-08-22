@@ -18,6 +18,10 @@
 //      row (matches the standalone dense argmax).
 #include "vllm/v1/worker/gpu/runner.h"
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -407,6 +411,54 @@ NewRequestData MakeFaNewReq(const std::string& id, std::vector<int32_t> prompt,
 //   (b) a `page_size_padded` spec — a value the old HF-config arithmetic could
 //       not produce under ANY config — is honoured, which is only possible if
 //       the allocator actually asked the spec.
+TEST_CASE("TP_PLAN W4-pre: per-rank lanes ctor stores lanes, tp1 stays inert") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+#ifdef VLLM_CPP_CUDA
+  int devs = 0;
+  REQUIRE(cudaGetDeviceCount(&devs) == cudaSuccess);
+  // On a >=2-GPU NCCL host ANY single-lane runner construction reaches the G1
+  // serve refusal (world>1) — that is the honest baseline this plan keeps
+  // until W5. Assert the runner REFUSES there (construction never runs tp1
+  // quietly on a multi-GPU host; G1 is the gate, not silently-degraded tp1).
+  if (devs >= 2) {
+    bool refused = false;
+    try {
+      GPUModelRunner multi(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                           kMaxModelLen, /*max_num_batched_tokens=*/64);
+    } catch (const std::runtime_error&) {
+      refused = true;  // the named G1 TP-SERVE refusal
+    }
+    CHECK(refused);
+    MESSAGE("multi-GPU host: runner construction correctly hits the G1 refusal");
+    return;
+  }
+#endif
+  // <2 GPUs (or CPU host): the lane-inert tp1 path is exercisable.
+  const vt::Queue single = Q();
+  GPUModelRunner a(c, w, MakeKvConfig(c), single, /*max_num_reqs=*/8,
+                   kMaxModelLen, /*max_num_batched_tokens=*/64);
+  GPUModelRunner b(c, w, MakeKvConfig(c), std::vector<vt::Queue>{single},
+                   /*max_num_reqs=*/8, kMaxModelLen,
+                   /*max_num_batched_tokens=*/64);
+  CHECK(a.tp_lane_count() == 1);
+  CHECK(b.tp_lane_count() == 1);
+
+  // An EMPTY lanes list is the tp1 identity (never a zero-lane runner).
+  GPUModelRunner e(c, w, MakeKvConfig(c), std::vector<vt::Queue>{},
+                   /*max_num_reqs=*/8, kMaxModelLen,
+                   /*max_num_batched_tokens=*/64);
+  CHECK(e.tp_lane_count() == 1);
+
+  // A multi-lane list IS stored/lane-counted on the tp1 host (W5 consumes it).
+  GPUModelRunner multi(c, w, MakeKvConfig(c),
+                       std::vector<vt::Queue>{Q(), Q(), Q()},
+                       /*max_num_reqs=*/8, kMaxModelLen,
+                       /*max_num_batched_tokens=*/64);
+  CHECK(multi.tp_lane_count() == 3);
+}
+
 TEST_CASE("runner: attention cache page size comes from the KV spec") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);

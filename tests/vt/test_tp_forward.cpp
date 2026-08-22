@@ -23,12 +23,14 @@
 #include <vector>
 
 #include "vllm/model_executor/models/tensor_parallel.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vt/backend.h"
 #include "vt/communicator.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 using vllm::TensorParallel;
 using vllm::TpAllReduceSum;
 using vllm::TpShard;
@@ -198,4 +200,119 @@ TEST_CASE("tp=1 TensorParallel is inert: TpShard is the whole tensor, all-reduce
   // A nullptr TensorParallel* (the production single-GPU default) is also inert.
   TpAllReduceSum(nullptr, q, t);
   CHECK(buf == before);
+}
+
+// TP_PLAN.md W4: the per-rank weight loader slice (the refusal's first named
+// gap). Proves that the REAL `dense_loaders::LoadMergedBf16RawNK` gated on a
+// tp=2 TensorParallel yields EACH rank its own TpShard row window of a merged
+// BF16 gate|up projection, and that the two rank slices concatenated reproduce
+// the full merged tensor exactly. A fake TensorResolver supplies the two
+// [N=8,K] BF16 on-disk shards; no GPU, deterministic, in-process (the parity
+// gate's proven shape). This is the loader half of "distributed weight load";
+// the runner's per-rank device upload is the separate W4-pre wave.
+TEST_CASE("TP_PLAN W4: per-rank merged-BF16 loader slice == full concat (no GPU)") {
+  constexpr int64_t kOut = 8, kIn = 4;   // kOut divisible by tp=2, no fusion
+  constexpr int kTp = 2;
+
+  // Two on-disk torch Linear shards [N,K] BF16: below_shard "gate", "up".
+  auto make_bf16 = [](uint8_t seed, int64_t n, int64_t k) {
+    std::vector<uint8_t> bytes(static_cast<size_t>(n * k * 2));
+    uint32_t s = seed;
+    for (size_t i = 0; i < bytes.size(); i += 2) {
+      s = s * 1664525u + 1013904223u;
+      uint16_t half = static_cast<uint16_t>(s >> 16);
+      bytes[i] = static_cast<uint8_t>(half & 0xff);
+      bytes[i + 1] = static_cast<uint8_t>(half >> 8);
+    }
+    return bytes;
+  };
+  const std::vector<uint8_t> gate_bytes = make_bf16(1, kOut, kIn);
+  const std::vector<uint8_t> up_bytes = make_bf16(2, kOut, kIn);
+
+  // A stable owning resolver: the HashMap (by string) keeps the StTensor alive
+  // for the duration of the load. Each weight needs a contiguous data pointer.
+  std::vector<uint8_t> gate_storage = gate_bytes, up_storage = up_bytes;
+  vllm::StTensor gate_t, up_t;
+  auto resolver_fn = [&](const std::string& name) -> const vllm::StTensor& {
+    if (name == "gate_proj.weight") {
+      gate_t.dtype = "BF16";
+      gate_t.shape = {kOut, kIn};
+      gate_t.data = gate_storage.data();
+      gate_t.nbytes = gate_storage.size();
+      return gate_t;
+    }
+    up_t.dtype = "BF16";
+    up_t.shape = {kOut, kIn};
+    up_t.data = up_storage.data();
+    up_t.nbytes = up_storage.size();
+    return up_t;
+  };
+  const vllm::TensorResolver resolver = resolver_fn;
+
+  // Full (tp=1) merged gate|up tensor: rows [gate 8][up 8], i.e. [16, K].
+  const vllm::OwnedTensor full =
+      vllm::dense_loaders::LoadMergedBf16RawNK(resolver, {"gate_proj.weight", "up_proj.weight"});
+  REQUIRE(!full.Empty());
+  REQUIRE(full.shape[0] == 2 * kOut);
+  REQUIRE(full.shape[1] == kIn);
+
+  // Per-rank (tp=2): rank r owns rows [r*8, (r+1)*8) of EACH shard (TpShard of
+  // the per-constituent width), concatenated -> the full-width rank slice of the
+  // merged tensor. The loader's TpShard is over the CONSTITUENT width (8), so
+  // each rank slice is [16/2, K] = [8, 4].
+  std::vector<vllm::OwnedTensor> rank_merged(static_cast<size_t>(kTp));
+  CpuCommGroup group(kTp);
+  std::vector<std::thread> threads;
+  for (int r = 0; r < kTp; ++r) {
+    threads.emplace_back([&, r] {
+      TensorParallel tp{&group.Rank(r)};
+      rank_merged[static_cast<size_t>(r)] =
+          vllm::dense_loaders::LoadMergedBf16RawNK(
+              resolver, {"gate_proj.weight", "up_proj.weight"}, &tp);
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  // Each rank slice has width kOut (one shard each) — this already proves the
+  // per-rank loader does not materialize the full merged tensor per rank.
+  for (int r = 0; r < kTp; ++r) {
+    REQUIRE(rank_merged[static_cast<size_t>(r)].shape[0] == kOut);
+    REQUIRE(rank_merged[static_cast<size_t>(r)].shape[1] == kIn);
+  }
+
+  // Constituent-wise sharding (TpShard over the per-constituent width kOut):
+  // the merged tensor rows are [gate(8)][up(8)]. Rank r owns gate rows
+  // [r*kOut/2,(r+1)*kOut/2) then up rows [r*kOut/2,(r+1)*kOut/2) — i.e. its
+  // rank-half of EACH constituent, concatenated.
+  const int64_t half = kOut / kTp;  // 4
+  const auto slice_eq = [&](int r) {
+    const vllm::OwnedTensor& m = rank_merged[static_cast<size_t>(r)];
+    for (int cid = 0; cid < 2; ++cid) {           // constituent: gate=0, up=1
+      const int64_t row0 = cid * kOut + r * half; // full-tensor row offset
+      for (int64_t row = 0; row < half; ++row)
+        for (int64_t c = 0; c < kIn; ++c) {
+          const size_t src = static_cast<size_t>((row0 + row) * kIn + c);
+          const size_t dst = static_cast<size_t>((cid * half + row) * kIn + c);
+          const uint16_t a = static_cast<uint16_t>(full.bytes.data()[src * 2]) |
+                             (static_cast<uint16_t>(full.bytes.data()[src * 2 + 1]) << 8);
+          const uint16_t b = static_cast<uint16_t>(m.bytes.data()[dst * 2]) |
+                             (static_cast<uint16_t>(m.bytes.data()[dst * 2 + 1]) << 8);
+          CHECK(a == b);
+        }
+    }
+  };
+  slice_eq(0);
+  slice_eq(1);
+
+  SUBCASE("RED line: a rank slice is NOT the full merged tensor (dropping the shard is wrong)") {
+    for (int r = 0; r < kTp; ++r) {
+      const vllm::OwnedTensor& m = rank_merged[static_cast<size_t>(r)];
+      bool differs = m.shape[0] != 2 * kOut || m.bytes.size() != full.bytes.size();
+      if (!differs) {
+        for (size_t i = 0; i < full.bytes.size(); ++i)
+          if (m.bytes.data()[i] != full.bytes.data()[i]) { differs = true; break; }
+      }
+      CHECK(differs);
+    }
+  }
 }

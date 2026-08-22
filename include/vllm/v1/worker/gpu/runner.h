@@ -153,6 +153,35 @@ class GPUModelRunner final : public ModelRunnerBase {
                  std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
                  std::vector<PagedKvCache> draft_kv = {});
 
+  // TP_PLAN W4-pre: construct the runner's per-rank lanes. On the tp1 path
+  // (`per_rank_queues.empty()` or a one-element list), this is exactly the
+  // single-queue ctor above (byte-identical). On a real multi-device host the
+  // lanes feed `attach_tp_group`, which sizes the retained NCCL group from
+  // these lanes (not the global DeviceCount) and ranks each lane's communicator
+  // by its own device index. The engine's "world>1" serve refusal (G1) is
+  // UNCHANGED until W5 wires per-rank forward — constructing gives a runner the
+  // lanes, it does not yet serve tp>1.
+  GPUModelRunner(const HfConfig& config, LoadedModel& model,
+                 const KVCacheConfig& kv_cache_config,
+                 std::vector<vt::Queue> per_rank_queues,
+                 int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+                 std::optional<vllm::SpeculativeConfig> spec_config =
+                     std::nullopt,
+                 std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
+                 std::vector<PagedKvCache> draft_kv = {});
+
+  // TP_PLAN W4-pre: per-rank-lane LOADED-MODEL convenience overload used by
+  // the weight-lane runners below. Same lane semantics as the LoadedModel&
+  // lanes ctor; the weight-lane delegates here after borrowing.
+  GPUModelRunner(const HfConfig& config, std::unique_ptr<LoadedModel> owned_model,
+                 const KVCacheConfig& kv_cache_config,
+                 std::vector<vt::Queue> per_rank_queues,
+                 int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+                 std::optional<vllm::SpeculativeConfig> spec_config =
+                     std::nullopt,
+                 std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
+                 std::vector<PagedKvCache> draft_kv = {});
+
   // Construct the runner over a model (config + weights) and allocate the KV
   // caches from `kv_cache_config` (initialize_kv_cache). `queue` selects the
   // device (CPU at T0; CUDA dgx-pending). The InputBatch is sized from
@@ -161,6 +190,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   // outlive the runner (held by reference, mirroring upstream self.model).
   GPUModelRunner(const HfConfig& config, const Qwen3_5MoeWeights& weights,
                  const KVCacheConfig& kv_cache_config, vt::Queue queue,
+                 int max_num_reqs, int max_model_len,
+                 int max_num_batched_tokens);
+
+  // TP_PLAN W4-pre: per-rank-lane MoE overload. Delegates to the single-queue
+  // MoE ctor via the LoadedModel& lanes ctor; a per_rank_queues list of >1 is
+  // stored (tp_lane_count()>1) and feeds attach_tp_group at tp>1, while the
+  // tp1 path (empty/one-lane) stays byte-identical. G1 serve refusal unchanged.
+  GPUModelRunner(const HfConfig& config, const Qwen3_5MoeWeights& weights,
+                 const KVCacheConfig& kv_cache_config,
+                 std::vector<vt::Queue> per_rank_queues,
                  int max_num_reqs, int max_model_len,
                  int max_num_batched_tokens);
 
@@ -175,7 +214,20 @@ class GPUModelRunner final : public ModelRunnerBase {
                  int max_num_reqs, int max_model_len,
                  int max_num_batched_tokens);
 
+  // TP_PLAN W4-pre: per-rank-lane DENSE overload (same delegation + lane
+  // semantics as the MoE overload above).
+  GPUModelRunner(const HfConfig& config, const Qwen3_5DenseWeights& weights,
+                 const KVCacheConfig& kv_cache_config,
+                 std::vector<vt::Queue> per_rank_queues,
+                 int max_num_reqs, int max_model_len,
+                 int max_num_batched_tokens);
+
   ~GPUModelRunner();
+
+  // TP_PLAN W4-pre: number of per-rank lanes this runner was given (1 on every
+  // pre-W5 construction site => tp1 / byte-identical). Public so the W4-pre
+  // construction gate can assert lane accounting.
+  int tp_lane_count() const;
 
   // ModelRunnerBase (the MRV2 execute_model / sample_tokens split).
   std::optional<ModelRunnerOutput> execute_model(
@@ -534,6 +586,12 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model_;
   std::vector<PagedKvCache> draft_attn_kv_;
   vt::Queue queue_;
+  // TP_PLAN W4-pre: the per-rank queues this runner operates. On the tp1 path
+  // this holds the single queue_ (default); on a multi-device host it holds one
+  // queue per chosen TP lane. `attach_tp_group` sizes its NCCL group from this
+  // list (not DeviceCount) and each lane's comm is ranked by its own device
+  // index.
+  std::vector<vt::Queue> tp_queues_;
   // ── BACKEND-DISTRIBUTED-TP TP-W2 (runner-attach, the missing engine seam) ────
   // The multi-GPU NCCL group this runner retains for its LIFETIME. Acquired ONCE
   // in the ctors (attach_tp_group, before any forward) when tp_size>1; released

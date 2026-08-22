@@ -406,7 +406,11 @@ std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
 void GPUModelRunner::attach_tp_group() {
 #if defined(VT_NCCL)
   if (tp_group_ != nullptr) return;  // already attached (delegating ctor)
-  const int ngpu = vt::cuda::DeviceCount();
+  // The group spans the per-rank lanes when this runner was given them (a
+  // W7 `-tp`-configured serve), else all visible devices. tp1 (empty /
+  // one-lane, the byte-identical default) never reaches the guard below.
+  const int lanes = static_cast<int>(tp_queues_.size());
+  const int ngpu = lanes > 1 ? lanes : vt::cuda::DeviceCount();
   void* group = vt_cuda_tp_acquire(ngpu);
   if (group == nullptr) return;  // tp<=1 / NCCL init failed: keep the tp1 path
   // ── TP-SERVE (the named refusal, replacing a silent hang) ──────────────────
@@ -478,6 +482,9 @@ GPUModelRunner::GPUModelRunner(
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
+  // TP_PLAN W4-pre: the default is exactly ONE lane (the queue_) — tp1 stays
+  // byte-identical. The lanes ctor widens this after delegating.
+  tp_queues_ = {queue};
   // SPEC-MTP I5e: the async input-combine splices the device-resident
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
@@ -502,6 +509,36 @@ GPUModelRunner::GPUModelRunner(
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
 
+// TP_PLAN W4-pre lanes ctor: delegates to the single-queue ctor with the FIRST
+// lane as the primary queue_, then widens `tp_queues_` to the full per-rank
+// list. On the tp1 path (`per_rank_queues` empty or a one-element list) this is
+// byte-identical to the single-queue ctor (tp_queues_ stays {queue_},
+// tp_lane_count()==1, attach_tp_group sees world<=1 and no-op). On a real
+// multi-device host attach sizes/ranks from these lanes; the G1 serve refusal
+// is unchanged until W5.
+GPUModelRunner::GPUModelRunner(
+    const HfConfig& config, LoadedModel& model,
+    const KVCacheConfig& kv_cache_config,
+    std::vector<vt::Queue> per_rank_queues,
+    int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+    std::optional<vllm::SpeculativeConfig> spec_config,
+    std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model,
+    std::vector<PagedKvCache> draft_kv)
+    : GPUModelRunner(config, model, kv_cache_config,
+                     per_rank_queues.empty() ? vt::Queue{}
+                                             : per_rank_queues[0],
+                     max_num_reqs, max_model_len, max_num_batched_tokens,
+                     std::move(spec_config), std::move(draft_model),
+                     std::move(draft_kv)) {
+  if (per_rank_queues.empty()) return;            // tp1: leave the single lane
+  tp_queues_ = std::move(per_rank_queues);
+  queue_ = tp_queues_[0];  // primary lane == first per-rank queue
+}
+
+int GPUModelRunner::tp_lane_count() const {
+  return static_cast<int>(tp_queues_.size());
+}
+
 GPUModelRunner::GPUModelRunner(
     const HfConfig& config, std::unique_ptr<LoadedModel> owned_model,
     const KVCacheConfig& kv_cache_config, vt::Queue queue, int max_num_reqs,
@@ -522,6 +559,9 @@ GPUModelRunner::GPUModelRunner(
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
+  // TP_PLAN W4-pre: the default is exactly ONE lane (the queue_) — tp1 stays
+  // byte-identical. The lanes ctor widens this after delegating.
+  tp_queues_ = {queue};
   // SPEC-MTP I5e: the async input-combine splices the device-resident
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
@@ -564,6 +604,50 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
     : GPUModelRunner(config, BorrowQwen3_5DenseLoadedModel(weights),
                      kv_cache_config, queue, max_num_reqs, max_model_len,
                      max_num_batched_tokens) {}
+
+GPUModelRunner::GPUModelRunner(const HfConfig& config,
+                               const Qwen3_5MoeWeights& weights,
+                               const KVCacheConfig& kv_cache_config,
+                               std::vector<vt::Queue> per_rank_queues,
+                               int max_num_reqs,
+                               int max_model_len, int max_num_batched_tokens)
+    : GPUModelRunner(config, BorrowQwen3_5MoeLoadedModel(weights),
+                     kv_cache_config, std::move(per_rank_queues),
+                     max_num_reqs, max_model_len,
+                     max_num_batched_tokens) {}
+
+GPUModelRunner::GPUModelRunner(const HfConfig& config,
+                               const Qwen3_5DenseWeights& weights,
+                               const KVCacheConfig& kv_cache_config,
+                               std::vector<vt::Queue> per_rank_queues,
+                               int max_num_reqs,
+                               int max_model_len, int max_num_batched_tokens)
+    : GPUModelRunner(config, BorrowQwen3_5DenseLoadedModel(weights),
+                     kv_cache_config, std::move(per_rank_queues),
+                     max_num_reqs, max_model_len,
+                     max_num_batched_tokens) {}
+
+// The owned-model lanes ctor: delegates to the single-queue owned-model ctor
+// with the FIRST lane as the primary queue_, then widens tp_queues_ (same lane
+// semantics as the LoadedModel& lanes ctor; tp1 stays byte-identical).
+GPUModelRunner::GPUModelRunner(
+    const HfConfig& config, std::unique_ptr<LoadedModel> owned_model,
+    const KVCacheConfig& kv_cache_config,
+    std::vector<vt::Queue> per_rank_queues,
+    int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+    std::optional<vllm::SpeculativeConfig> spec_config,
+    std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model,
+    std::vector<PagedKvCache> draft_kv)
+    : GPUModelRunner(config, std::move(owned_model), kv_cache_config,
+                     per_rank_queues.empty() ? vt::Queue{}
+                                             : per_rank_queues[0],
+                     max_num_reqs, max_model_len, max_num_batched_tokens,
+                     std::move(spec_config), std::move(draft_model),
+                     std::move(draft_kv)) {
+  if (per_rank_queues.empty()) return;
+  tp_queues_ = std::move(per_rank_queues);
+  queue_ = tp_queues_[0];
+}
 
 GPUModelRunner::CacheBuffer::CacheBuffer(vt::Device device, vt::Queue& queue,
                                          size_t bytes,

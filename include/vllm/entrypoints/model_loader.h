@@ -221,6 +221,11 @@ struct EngineParams {
   // "no config" state distinct from "the default config" would be a second
   // spelling of the same thing, and upstream has one.
   vllm::MultiModalConfig multimodal;
+
+  // TP_PLAN W7: tensor-parallel size (--tensor-parallel-size N). Default 1 ==
+  // byte-identical tp1. Threaded to the runner's per-rank lane construction;
+  // N>1 is refused loudly (G1) until the per-rank forward (W5) lands.
+  int tensor_parallel_size = 1;
 };
 
 // The shared queue-selection seam used by every LoadedEngine construction

@@ -1779,7 +1779,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     }
     vllm::SetWeightOffloader(std::move(choice.offloader));
   }
-  // ARCH-ONE-SURFACE ROW 8: resolve an EXPLICIT device selection up front,
+// ARCH-ONE-SURFACE ROW 8: resolve an EXPLICIT device selection up front,
   // BEFORE any path/config/weight I/O — the mirror of vLLM resolving
   // DeviceConfig at config-creation time, ahead of the model load
   // (vllm/engine/arg_utils.py:1878 builds DeviceConfig first;
@@ -1795,6 +1795,20 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
         params.device, named_platform == nullptr
                            ? std::nullopt
                            : std::optional{named_platform->device_type()});
+  }
+  // TP_PLAN W7: tp>1 distributed serve is REFUSED at construction (G1), naming
+  // the open seam, rather than silently running tp1 math on a multi-GPU host.
+  // tp=1 (the default) is byte-identical and never reaches this branch.
+  if (params.tensor_parallel_size > 1) {
+    throw std::runtime_error(
+        "vllm.cpp: --tensor-parallel-size " +
+        std::to_string(params.tensor_parallel_size) +
+        " (tp>1 distributed serving) is not yet wired: the runner's per-rank "
+        "device load + per-device forward (TP_PLAN W5) are pending; refusing "
+        "loudly rather than silently serving tp=1 (total tok/s saved: none — "
+        "this is a correctness seam, not a throughput knob). Use "
+        "--tensor-parallel-size 1 (the default) for the byte-identical single-"
+        "device path.");
   }
   const fs::path dir(model_dir);
 

@@ -344,6 +344,9 @@ extern "C" int vt_cuda_tp_seam_selfcheck(void) {
   if (!g) return 2;
   const int W = g->world_size();
   constexpr int64_t kDim = 64;   // intermediate dim (divisible by W up to 64)
+  // kDim is fixed; a running world that does not divide it (kDim%W != 0) has
+  // no exact split — SKIP like the <2-GPU path, never a false RED.
+  if (kDim % W != 0) { delete g; return 2; }
   constexpr int64_t kOut = 8;    // row-parallel full-row width
   const float total = static_cast<float>(W * (W + 1) / 2);
   std::atomic<int> bad{0};
@@ -408,6 +411,13 @@ extern "C" int vt_cuda_loader_slice_selfcheck(void) {
   if (!g) return 2;
   const int W = g->world_size();
   constexpr int64_t K = 8, N = 64;  // [K,N] row-major; N divisible by W
+  // TpShard uses an exact-even split (per = dim / world, then world*per rows).
+  // A hardcoded N that the running world does NOT divide (e.g. N=64 at W=3)
+  // has no whole-tensor reconstruction by construction — SKIP at that world
+  // (the "<2 GPUs" skip path), never report a mismatch: the reconstruction
+  // and per-rank windows are single-by-construction here. 2-GPU (N%2==0) is
+  // green byte-exact. Returns 2 (world-not-divisible / unbuilt) to skip.
+  if (N % W != 0) { delete g; return 2; }
   const int64_t per = N / W;
 
   // Full weight: deterministic f32.
@@ -499,6 +509,7 @@ extern "C" int vt_cuda_sharded_forward_selfcheck(void) {
   if (!g) return 2;
   const int W = g->world_size();
   constexpr int64_t O = 8, K = 16;  // [O,K]; W must divide K
+  if (K % W != 0) { delete g; return 2; }   // fixed K not divisible: skip
   const int64_t k_per = K / W;
 
   std::vector<float> Wf((size_t)(O * K)), xf((size_t)K);
@@ -558,6 +569,41 @@ extern "C" int vt_cuda_sharded_forward_selfcheck(void) {
         }
       }
       cudaFree(dx); cudaFree(dW); cudaFree(dpart); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
+// RNCCL-bridge per-rank construction gate (TP_PLAN Step 2 / W4-pre). Mirrors
+// EXACTLY what GPUModelRunner::attach_tp_group will do once its guard is the
+// real forward: acquire the retained group for the visible rank set, wrap EACH
+// rank's communicator into its own vllm::TensorParallel (TensorParallel uses
+// vllm::TpShard / TpAllReduceSum), and assert that on every rank the wrapper
+// reports tp_size()==W and rank()==r. This is the "2 ranks built, NCCL group
+// init completes, no deadlock" construction gate — NO forward math, so the
+// engine's world>1 serve guard stays untouched. 0 == all lanes built + ranked
+// correctly; 1 = a lane failed to build / mis-ranked; 2 = fewer than 2 CUDA
+// devices or NCCL unbuilt (a tp<=1 host never reaches this).
+extern "C" int vt_cuda_bridge_rank_lanes_selfcheck(void) {
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  if (W < 2) { delete g; return 2; }  // tp<=1 host: not a TP construction gate
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r, g]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      vllm::TensorParallel tp{g->Rank(r)};
+      if (tp.tp_size() != W || tp.rank() != r) { bad.store(1); return; }
+      // Each lane's TpShard window over a divisible width is live and distinct.
+      const int64_t kDim = 16 * W;  // divisible by W
+      const vllm::ShardRange cs = vllm::TpShard(&tp, kDim);
+      if (cs.begin != (kDim / W) * r || cs.size() != kDim / W) bad.store(1);
     });
   }
   for (auto& t : threads) t.join();
@@ -716,6 +762,7 @@ extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void) {
   if (!g) return 2;
   const int W = g->world_size();
   constexpr int O = 16, H = 32, I = 32;   // I % W == 0
+  if (I % W != 0) { delete g; return 2; }   // fixed I not divisible: skip
   const int64_t per = I / W;
 
   std::vector<float> x(H), gate(I * H), up(I * H), down(O * I);
