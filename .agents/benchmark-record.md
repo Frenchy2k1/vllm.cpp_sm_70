@@ -19,6 +19,71 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## A2-Q2b — NemotronH host re-expansion, attributed per tensor group, per decode token (2026-08-19, `row/A2-Q2b-lmhead-nvfp4`, #810)
+
+**Why this was measured at all.** The row was dispatched on the claim that
+NemotronH decode re-expands ~1.24e9 elements (~2.49 GB) per token on the host,
+and that `lm_head` (guessed at 131072 x 4096 = 537e6 elements, ~43%) is a large
+share of it. That was arithmetic, not measurement, and the brief said so. This
+entry replaces it with a count.
+
+**Instrument.** A shape-keyed tally at `NemotronHOwned::DenseBf16`
+(`nemotron_h.cpp:395`), the SINGLE seam every host dequant in this architecture
+passes through, dumped per forward call from `ForwardNemotronHForCausalLM`.
+Shape is an unambiguous key on this checkpoint, so no call-site labelling was
+needed. Driven by `examples/nemotron_h_gen` against the real 21 GB checkpoint
+(revision `29f2d1746d8f41e316523194b19018707749b1b1`) on `mudler-ubuntu-box`,
+CPU host arm, engine load 302.4 s, peak RSS 19.2 GiB. The instrument was scratch
+and was reverted; the run logs are the evidence.
+
+**The decode step (T=1, `top_k` 6, 23 MoE layers, 369 dequant calls):**
+
+| group | shape | calls | elements | per call | % |
+|---|---|---|---|---|---|
+| routed expert `up_proj` | `[1856, 2688]` | 138 | 688 472 064 | 4 988 928 | 22.36% |
+| routed expert `down_proj` | `[2688, 1856]` | 138 | 688 472 064 | 4 988 928 | 22.36% |
+| shared expert `down_proj` | `[2688, 3712]` | 23 | 229 490 688 | 9 977 856 | 7.45% |
+| shared expert `up_proj` | `[3712, 2688]` | 23 | 229 490 688 | 9 977 856 | 7.45% |
+| `lm_head` | `[131072, 2688]` | 1 | 352 321 536 | 352 321 536 | 11.44% |
+| mamba `out_proj` (FP8) | `[2688, 4096]` | 23 | 253 231 104 | 11 010 048 | 8.23% |
+| mamba `in_proj` (FP8) | `[10304, 2688]` | 23 | 637 034 496 | 27 697 152 | 20.69% |
+| **TOTAL** | | **369** | **3 078 512 640** | | **100%** |
+
+`138 == 6 x 23` exactly, which is what identifies this as the decode shape
+rather than a prefill aggregate. The T=5 prefill of the same run reported 1115
+calls / 6 800 252 928 elements, and is recorded here only so the two are not
+confused: the per-token figure is the T=1 one.
+
+**Three findings.**
+
+1. The dispatching estimate was wrong in both numbers, in the same direction.
+   `hidden_size` is 2688, not 4096, so `lm_head` is 352 321 536 elements, and
+   its share of the population the brief meant is 28.35%, not 43%.
+2. **The 1.24e9 figure names a REGIME, not a total.** It is not the host arm's
+   3 078 512 640. It is `mamba + lm_head` = 1 242 587 136 = 2.485 GB, the
+   residue after A2-Q2a moved the MoE arm to the device, matching to four
+   significant figures. Anyone quoting 1.24e9 is quoting the post-A2-Q2a state.
+3. **`lm_head` is the LAST one.** Against the A2-D1 three-leg discriminator on
+   `dgx:gpu0` (`/workspace/a2d1-discriminate/20260819T200231Z`: device mamba ON
+   1.554 s/token, 108.2x vs vLLM, GPU busy 10.18%; OFF 10.319 s/token, 718.1x,
+   GPU busy 7.86%), the mamba arm is worth 6.64x on its own. `lm_head` is on the
+   host in all three legs. Once the mamba arm lands, `lm_head` is 352 321 536 of
+   352 321 536, i.e. 100% of the host re-expansion left in a decode step.
+
+**Also load-bearing, and not visible in the percentages:** `lm_head` is the
+largest SINGLE re-expansion in the model by 12.7x (352.3e6 elements in ONE call
+against 27.7e6 for mamba `in_proj`), so it allocates a 704.6 MB transient bf16
+buffer once per step. On a unified-memory box where `gpu_memory_utilization`
+does not bound host RAM and the kernel reboots rather than OOM-kills, that
+single transient is the one that matters.
+
+**What this does NOT measure.** Time. The element counts are portable; the
+seconds are not, and the box that produced these counts is not a gate host. No
+speed claim is made from this entry, and the device `lm_head` arm's own numeric
+gate is PENDING a `dgx:gpu0` window.
+
+---
+
 ## ENG-EXPERT-STREAM-DEVICE W0a — a GB10 kernel CAN dereference the host slot arena (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0`, #1124)
 
 **W0a is the probe the whole W0 mechanism rests on, and it answered

@@ -360,6 +360,22 @@ struct NemotronHHostWeights {
   // meaningful — both arms end in the identical host projection, so any token
   // difference is attributable to the 6 device attention blocks.
   NemotronHOwned lm_head;  // [vocab_size, hidden_size]
+  // ── A2-Q2b (#810): the DEVICE lm_head's Marlin resident ────────────────────
+  //
+  // The repacked NVFP4 operands for `lm_head`, built once on first device
+  // forward and reused on every step. It lives HERE, on the weights, for the
+  // reason issue #237 added `ResidentSlot` at all: state keyed on the ADDRESS
+  // of a weight outlives the engine that built it, and a second engine in the
+  // same process can inherit device pointers the first one freed. That is
+  // issue #984, which the shared `dense_nvfp4_gemm.h` cache still has; A2-Q2a
+  // declined to inherit it for the MoE arena (`moe_marlin` above) and this
+  // slot is the same decision for `lm_head`, taken explicitly per that spec's
+  // §4.3 rather than by default.
+  //
+  // Opaque `shared_ptr<void>`: the resident type is a CUDA-path detail of
+  // nemotron_h_device.cpp, and holding it here would drag Marlin's headers
+  // into every consumer of this one.
+  ResidentSlot lm_head_marlin;
   // False until a loader materializes the enumerated tensors. The forward
   // refuses by name on false rather than computing on zeros.
   bool materialized = false;
@@ -526,6 +542,18 @@ std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
 // the identical projection, a token difference between them is attributable to
 // the device attention blocks and the device residual stream alone. A second
 // copy of this projection would quietly destroy that property.
+// A2-Q2b: the DEVICE twins of `NemotronHHostLmHead` below, argument for
+// argument. `...Eligible` is the same predicate the production paged forward
+// branches on, exposed so a gate can assert it DISCRIMINATES rather than
+// assuming it; a predicate that is constantly false disables the whole arm and
+// still passes every "the host arm was used" assertion.
+bool NemotronHDeviceLmHeadEligible(const NemotronHHostWeights& host, vt::DType adt,
+                                   vt::Queue& dev_queue);
+std::vector<float> NemotronHDeviceLmHead(const NemotronHHostWeights& host,
+                                         const NemotronHParams& params,
+                                         const std::vector<float>& gathered_normed,
+                                         int64_t num_rows, vt::Queue& dev_queue);
+
 std::vector<float> NemotronHHostLmHead(const NemotronHHostWeights& host,
                                        const NemotronHParams& params,
                                        const std::vector<float>& gathered_normed,

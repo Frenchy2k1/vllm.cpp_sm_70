@@ -185,7 +185,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | Single-request paged decode runs. Batched decode refuses when `num_reqs > 1`. The token gate remains pending, `lm_head` and FP8 Mamba2 projections run on the host, and GGUF is unavailable. See the [Nemotron-3.5-Lightning model recipe](../models/nemotron-3-5-lightning.md) and [benchmark state](../BENCHMARKS.md). |
+| `NemotronHForCausalLM` | Single-request paged decode runs. Batched decode refuses when `num_reqs > 1`. The token gate remains pending, `lm_head` reaches the device on the paged forward (A2-Q2b, implemented and unmeasured) while the FP8 Mamba2 projections still run on the host, and GGUF is unavailable. See the [Nemotron-3.5-Lightning model recipe](../models/nemotron-3-5-lightning.md) and [benchmark state](../BENCHMARKS.md). |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.

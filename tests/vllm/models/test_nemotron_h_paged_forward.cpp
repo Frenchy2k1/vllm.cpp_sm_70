@@ -1508,3 +1508,141 @@ TEST_CASE("NemotronH paged: the recurrent state index comes from the block table
   REQUIRE(gd.non_spec_state_indices_tensor->size() == 1);
   CHECK((*gd.non_spec_state_indices_tensor)[0] == assigned);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. A2-Q2b (#810) — THE CPU-REACHABLE HALF OF THE DEVICE `lm_head` CHANGE.
+//
+//     A2-Q2b's device arm is `MarlinW4A16Selects`-gated and therefore CUDA-only:
+//     no case in the tree can enter it on this box, and its reachability
+//     deletion mutation is PENDING a `dgx:gpu0` window. But that row ALSO
+//     refactored the part of `NemotronHPagedForward` that every CPU step runs —
+//     the gathered-row count and the download that feeds both the trace and the
+//     host projection — and this file is the vehicle that already drives that
+//     function through a real `GPUModelRunner`. So the refactor is gated HERE,
+//     rather than by a hand-built `NemotronHHostWeights` in a unit test, which
+//     `AGENTS.md` §"Nothing lands dead" is explicit does not count.
+//
+//     WHAT THIS CASE CANNOT SEE, said out loud: the redundant SECOND download
+//     of `final_normed` that A2-Q2b's first submission introduced is not
+//     observable from outside the function — both copies are of the same
+//     unchanged buffer and produce the same bytes. It is repaired structurally
+//     (one `DownloadF32` call reached on any path) and no assertion here
+//     pretends to catch it. What IS asserted is the property that made the
+//     duplicate possible: the trace's copy and the projection's operand must be
+//     the SAME bytes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// NO COMMA IN THIS NAME: doctest `-tc` splits filters on commas, so a comma
+// here turns a targeted run into `0 cases ran` + `SUCCESS!`.
+TEST_CASE("NemotronH paged: the logit rows are counted from logits_indices and never from num_reqs") {
+  setenv("VT_KV_CACHE_F32", "1", 1);
+  Fixture fx("float32");
+  const vllm::ModelRegistration& reg = fx.model->registration();
+  KVCacheConfig kv = reg.factory->make_kv_cache(fx.cfg, kBlockSize, kNumBlocks);
+  GPUModelRunner runner(fx.cfg, *fx.model, kv, Q(), /*max_num_reqs=*/2, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  const std::vector<int32_t> prompt{1, 7, 3, 9, 2, 14, 5, 11, 0, 6, 8, 4};
+  const int64_t T = static_cast<int64_t>(prompt.size());
+
+  // One prefill through the runner, purely to BUILD the step metadata and the
+  // block table. Nothing below fabricates a `ModelForwardInput`.
+  std::vector<NewRequestData> reqs;
+  reqs.push_back(MakeNewReq("R0", prompt, {0, 1}, /*state_slot=*/0));
+  std::map<std::string, int> sched;
+  sched["R0"] = static_cast<int>(prompt.size());
+  SchedulerOutput s1 = NewStep(std::move(reqs), std::move(sched));
+  CHECK_FALSE(runner.execute_model(s1).has_value());
+  (void)runner.sample_tokens(std::nullopt);
+
+  auto& pages = const_cast<std::vector<vllm::GdnStateCache>&>(runner.gdn_state());
+  // The recurrent pages are advanced IN PLACE, so a replayed prefill would carry
+  // the prompt twice. Both runs below start from zeroed state (same surgery, and
+  // same justification, as the per-layer case above).
+  auto zero_recurrent = [&pages]() {
+    for (vllm::GdnStateCache& c : pages)
+      for (vt::Tensor* p : {&c.conv_state, &c.ssm_state}) {
+        int64_t n = 1;
+        for (int r = 0; r < p->rank; ++r) n *= p->shape[r];
+        std::memset(p->data, 0, static_cast<size_t>(n) * vt::SizeOf(p->dtype));
+      }
+  };
+
+  vt::Queue hq = Q();
+  std::vector<int32_t> positions(static_cast<size_t>(T), 0);
+
+  // ★ THREE gathered rows against ONE request. `num_reqs` is 1 and
+  // `logits_indices.size()` is 3, so the two numbers CANNOT be confused for
+  // each other by accident here — which is the point. A2-Q2b named the gathered
+  // count `n_out` precisely because the surrounding function already binds `R`
+  // to the REQUEST count, and this asserts that the returned row count follows
+  // the gather rather than the batch.
+  const std::vector<int32_t> logits_indices{1, 4, static_cast<int32_t>(T - 1)};
+  const int64_t kWantRows = static_cast<int64_t>(logits_indices.size());
+  REQUIRE(kWantRows != 1);  // or this case cannot tell the two apart
+
+  auto run = [&](bool capture, NemotronHTrace* tr) {
+    zero_recurrent();
+    vllm::ModelForwardInput input{
+        .token_ids = prompt,
+        .positions = positions,
+        .attn_meta = runner.last_attn_meta(),
+        .gdn_meta = runner.last_gdn_meta(),
+        .attn_kv = const_cast<std::vector<vllm::PagedKvCache>&>(runner.attn_kv()),
+        .gdn_state = pages,
+        .config = fx.cfg,
+        .queue = hq,
+        .logits_indices = logits_indices,
+        .num_reqs = 1};
+    if (tr != nullptr) tr->capture = capture;
+    return vllm::NemotronHPagedForward(fx.host, fx.params, input, tr);
+  };
+
+  NemotronHTrace tr;
+  const vllm::ForwardLogits traced = run(/*capture=*/true, &tr);
+
+  // ── (a) THE ARM. On a CPU queue the device projection is not selectable, so
+  //        this step takes the HOST arm — stated as an assertion because every
+  //        other claim below is about the host arm's operands.
+  CHECK_FALSE(vllm::NemotronHDeviceLmHeadEligible(fx.host, fx.host.act_dtype, hq));
+  CHECK_FALSE(traced.on_device());
+
+  // ── (b) THE ROW COUNT, from the gather and not from the batch.
+  CHECK(traced.rows == kWantRows);
+  CHECK(traced.vocab == kVocab);
+  REQUIRE(traced.host.size() == static_cast<size_t>(kWantRows) * kVocab);
+
+  // ── (c) THE TRACE'S COPY AND THE PROJECTION'S OPERAND ARE THE SAME BYTES.
+  //        `final_normed` is downloaded ONCE and serves both consumers. Feeding
+  //        the trace's copy back through the very entry point the production
+  //        fallback calls must reproduce the returned logits EXACTLY — not to a
+  //        band, bit for bit, because it is the same function over the same f32
+  //        values. A second, independently taken download would still pass this;
+  //        a trace taken from a DIFFERENT buffer, or at a different point in the
+  //        graph, would not.
+  REQUIRE(tr.final_normed.size() == static_cast<size_t>(T) * kHidden);
+  std::vector<float> gathered(static_cast<size_t>(kWantRows) * kHidden);
+  for (size_t r = 0; r < logits_indices.size(); ++r)
+    std::memcpy(gathered.data() + r * kHidden,
+                tr.final_normed.data() + static_cast<size_t>(logits_indices[r]) * kHidden,
+                static_cast<size_t>(kHidden) * sizeof(float));
+  const std::vector<float> from_trace =
+      vllm::NemotronHHostLmHead(fx.host, fx.params, gathered, kWantRows, hq);
+  REQUIRE(from_trace.size() == traced.host.size());
+  CHECK(std::memcmp(from_trace.data(), traced.host.data(),
+                    from_trace.size() * sizeof(float)) == 0);
+
+  // ── (d) THE DOWNLOAD IS CONDITIONAL AND THE ANSWER IS NOT. A2-Q2b put the
+  //        trace download behind `capture` so the device arm pays no T*H
+  //        device-to-host copy per step. The host arm must be unaffected: same
+  //        logits, bit for bit, with the trace off.
+  const vllm::ForwardLogits untraced = run(/*capture=*/false, nullptr);
+  CHECK(untraced.rows == kWantRows);
+  REQUIRE(untraced.host.size() == traced.host.size());
+  CHECK(std::memcmp(untraced.host.data(), traced.host.data(),
+                    untraced.host.size() * sizeof(float)) == 0);
+  MESSAGE("A2-Q2b CPU arm: " << kWantRows << " gathered rows x " << kVocab
+                             << " vocab, trace operand byte-identical to the "
+                                "projection operand");
+  unsetenv("VT_KV_CACHE_F32");
+}
