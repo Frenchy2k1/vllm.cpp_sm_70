@@ -1190,3 +1190,21 @@ about magnitudes. **Two greedy prompts are not a token-exactness claim.**
   other member of the same class in the same case (`bdiff <= 1e-5`) and
   deliberately leaves this one to its own derivation. A repair owes a measured
   floor or a precision argument, never a bigger constant.
+
+- [#1566](https://github.com/mudler/vllm.cpp/issues/1566) — **the perception
+  encoder is an UNREACHED staged slice, so everything W3 built is dead code
+  today.** `MuseGlimmerVisionForward` is reached only from
+  `MuseGlimmerEncodePixelGroups` (`muse_glimmer_mm.cpp:191`) and
+  `MuseGlimmerGenerateGreedyViaRegistry` (`:276`), and neither has a caller in
+  `src/`, in `examples/` or in `include/vllm.h` — only in `tests/`.
+  `muse_glimmer_registry.cpp:13-14` states it: *"The perception encoder is still
+  W3, so an image or video prompt is a pending brick."* §3's W4 and W5 own the
+  wiring. Until they land, every change inside the tower is the staged-slice
+  exception in `.agents/reachability.md` and has to name this issue in its commit
+  body and its pull request body. The first one that does is
+  [#1545](https://github.com/mudler/vllm.cpp/issues/1545), which routes the
+  tower's 50 attention layers off the correctness-grade kernel
+  ([muse-glimmer-vision-attn-flash.md](muse-glimmer-vision-attn-flash.md)). The
+  issue exists because the model's umbrella
+  [#268](https://github.com/mudler/vllm.cpp/issues/268) is closed, so there was
+  nothing open left to name.
