@@ -68,6 +68,10 @@ per-rank forward dispatch (W4-pre remainder / W5) remain open and unfeigned.
 - [ ] **G5 forward equality** (W5): a TP2 forward of the 27B dense decoder over
       2 GPUs == tp1 token-exact on the same prompt (greedy). Covers dense +
       full-attn mating / KV — trust the existing SacredGate shape.
+      **tp1 baseline measured 2026-08-22** (committed binary, GPU1, real
+      Qwen3.8-27B-NVFP4 snapshot 7d6f8d4d...): prompt `"The capital of France
+      is"` → `" Paris.\nThe capital of Germany is Berlin.\nThe"` (10 tok,
+      temp 0). TP2 must equal this byte-for-byte.
 - [ ] **G6 prefill** (W6): the tp>1 full-attn **prefill** (batched, variS)
       completes and == tp1; tp>1 pure-decode from E4 already equals. Dense
       prefill heads the "pending wave" throw and is replaced.

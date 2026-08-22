@@ -66,3 +66,13 @@ refusal (`runner.cpp:434`).
   tp2==tp1 token run on the same lattice config.
 - Record the build/run recipe, revisions, model snapshot hash, and both raw
   output token streams (not a diff of a diff).
+
+## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
+
+Served the real Qwen3.8-27B-NVFP4 (snapshot
+`7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`) tp=1 on GPU1
+(`CUDA_VISIBLE_DEVICES=1`, `--tensor-parallel-size 1`), greedy temp 0:
+prompt `"The capital of France is"` → **`" Paris.\nThe capital of Germany is
+Berlin.\n"The` (10 tokens). G5's tp2 forward must reproduce this byte-for-byte;
+the tp>1 path on the same checkpoint refuses at construction with the named W5
+message. Capture tp=2 against THIS baseline, never a re-derived probe.
