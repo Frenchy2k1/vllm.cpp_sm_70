@@ -26544,3 +26544,176 @@ reading like a passing test, and neither could, because the harness counts diff
 hunks and prints the compile return code before any test output. With the gate
 finally routing nothing, `declines` reads 1 where 0 is required at eight sites
 including an aborting `REQUIRE`.
+## LTX25-DIT-ATTN-FLASH — the DiT self-attention was on the correctness-grade kernel; one arm measured, the box died before the other (2026-08-21, `row/LTX25-DIT-ATTN-FLASH`, #1549)
+
+**Read this before re-running the lever.** The change is landed and its LTX
+correctness gates are green on GB10. What is NOT done is the same-binary A/B: the
+naive arm never ran. Two later corrections are folded in below and both narrow
+what this entry claims. The 6.23x ratio carried two undisclosed confounds and
+reads **~6.0x** once one of them is priced. And the shared-memory cap-raise this
+row once carried is **reverted**, so its `test_ops_attention` evidence is
+withdrawn from this entry — the row never needed it, because LTX renders bf16 at
+head_dim 128 and that tile is 32,768 B, inside the 49,152 B a launch gets without
+any opt-in at all.
+
+### Provenance
+
+| | |
+|---|---|
+| lease | `6c724dfd-a5e8-4832-b4fb-d0fd7d6eb458`, `dgx:gpu0` (GB10, sm_121a) |
+| source | `30dce3a1d`, staged as `/workspace/ltx25-attnflash/src.tar.gz` |
+| build | in-lease, `-DVLLM_CPP_CUDA=ON`, cutlass-nvfp4 / cutlass-fp8 / FlashAttention-2 all `ENABLED for [121a]`, `ninja -j 4` |
+| artifacts | `/workspace/ltx25-attnflash/out/20260821T092516Z/` |
+| geometry | `768x448`, 49 frames, seed 20260820, full 21.00B bf16 checkpoint, `one_stage` |
+| tokens | `(768/32) * (448/32) * ((49-1)/8 + 1)` = **2352** video tokens |
+| statistic | per-forward `last=` from the engine's own progress lines, never the governor |
+
+### Correctness, taken BEFORE any speed number was read
+
+| gate | result |
+|---|---|
+| `test_ltx2_device` on CUDA | 22/22 cases, **749/749** assertions, SUCCESS |
+| CUDA-vs-host f32 | video `8.9407e-08`, audio `4.47035e-08`, against the committed `2e-5` |
+| CUDA-vs-CPU-backend bf16 | `0` on both streams |
+
+**WITHDRAWN — the `test_ops_attention` row that used to head this table.** The
+lease also ran it at 10/10 and 88,439 assertions, and this entry no longer claims
+anything from that run, because the code it exercised is no longer in the tree:
+the row's shared-memory cap-raise is reverted in full. Two of that case's three
+arms would not have supported the claim in any event. f32 head_dim 128 (65,536 B)
+did launch and was genuinely repaired by the raise — but LTX never runs it, since
+the model's stream dtype in production is bf16. f32 head_dim 256 asks 131,072 B
+against GB10's queried 101,376 B opt-in ceiling, so it **never fitted at all**;
+the launcher fell back to `AttentionDenseFast`, which is BIT-IDENTICAL to the
+flash kernel by contract, and all 20,480 of that arm's assertions passed **with
+flash never launching at 256 once**. A numeric comparison cannot distinguish the
+two — that IS the contract — so the case measured a fallback and reported it as a
+launch. Both facts are kept here rather than deleted, because the next reader of
+this lever will otherwise re-derive them.
+
+**Why the surviving rows and the render below are unaffected by that revert.** The
+measured binary carried the opt-in call, but it was a **no-op on every launch
+these numbers came from**: LTX's bf16 head_dim-128 video tile is
+`2 * 64 * 128 * 2` = 32,768 B and the audio tile 16,384 B, and the helper returns
+immediately below 49,152 B without touching the kernel. Removing a call that
+never fired cannot move a number. The advertised head_dim bound is a real and
+separate defect, owned by #1578.
+
+**The swap is NOT bit-identical on CUDA** and this record does not claim it is.
+`AttentionDenseFast` groups the head_dim partial sums across 32 lanes where the
+naive kernel uses a 256-thread block, so the same f32 online softmax associates
+differently. The measured deviation is f32 round-off scale and sits 224x inside
+the gate, and the gate was not widened to admit it. Caveat: that case runs the
+fixture's reduced dimensions, so it bounds the arithmetic change and not the
+change at head_dim 128.
+
+### Reachability, on the real model rather than a fixture
+
+`VT_OP_PROVIDER_STATS=1` makes each op announce itself once when it first
+resolves. In the full 21.00B render at `768x448/49f`, in `arm-flash.log`:
+
+| announce | count |
+|---|---|
+| `op=21 device=1` — `kAttentionDenseFlash` on CUDA | **1** |
+| `op=18 device=1` — `kAttention` on CUDA | **0** |
+| `op=19 device=1` — `kAttentionCross` on CUDA | 1 |
+
+`op=18` never resolving at all is the two-sided half. It also confirms the
+cross-attentions were on `vt::AttentionCross` (already flash-tiled) the whole
+time, so only the two self-attentions per block were ever slow.
+
+### The flash arm
+
+n=19, forwards 2 through 20 of phase 0:
+
+```
+7.109 7.173 7.267 7.392 7.430 7.460 7.598 7.656 7.658 7.680
+7.688 7.754 7.764 7.798 7.814 7.832 7.848 7.908 8.196
+```
+
+| n | median | mean | min | max | spread |
+|---|---|---|---|---|---|
+| 19 | **7.680 s** | 7.633 s | 7.109 s | 8.196 s | 14.2% |
+
+### What is NOT measured, and why
+
+**The naive arm never ran.** At forward 20 the `rc` worker was lost;
+`rc devices` then read `dgx:gpu0 unhealthy (no contact)`, and still did 43
+minutes later.
+
+**The cause is UNPROVEN. Do not record it as an OOM.** No memory trace was taken,
+the worker's log ends mid-forward, and the box did not return to be asked.
+Host-RAM exhaustion is the leading hypothesis only because GB10 shares host RAM
+with the GPU and an unconstrained job has OOM-rebooted this box before — a prior,
+not evidence. What IS established is that `job/ab.sh` as first written carried no
+memory guard, no sample cap and no memory trace, unlike the sibling campaign's
+`runguard.py`, so the run could neither avoid the failure nor say what it was.
+That is a defect in this row's harness, not a finding about the change, and the
+next attempt is instrumented to answer it.
+
+So **~6.0x is a cross-run comparison**, not an A/B: 47.84 s came from binary
+`f25b0561` in an earlier lease and 7.680 s from a different binary in this one.
+That is precisely the weaker form the same-binary rule exists to replace, and the
+A/B gate reads `PENDING` rather than satisfied.
+
+**TWO CONFOUNDS, both of which inflate the ratio, and neither was disclosed when
+this entry first read 6.23x.**
+
+*The denominator carried a stack sampler and this arm did not.* It ran under
+`job/runguard.py --stack-period 12` (`render.log:1`), which samples `eu-stack -p`
+and therefore `ptrace`-stops every thread. Its own `stacks.txt` prices that:
+**523 samples, median inter-sample delta 12.40 s against a 12.0 s period**, so
+~0.40 s median and 1.50 s maximum of stopped process per sample. At that cadence
+~3.9 samples fall inside each 47.84 s forward, ~1.54 s, **~3.2% of the
+denominator**. Correcting only the denominator: **46.3 s / 7.680 s = 6.03x**.
+
+*The two arms used different prompts.* `render.log:1` shows the denominator's
+~70-word prompt; the flash arm's harness uses one short sentence.
+`src/vllm/multimodal/ltx2_video.cpp:2253` sets `context_tokens = encoded.seq`
+UNPADDED, so the DiT's cross-attentions see a different number of keys in each
+arm. Corroborated rather than inferred: `conditioning.tower` is **45.013 s** in
+the denominator against **28.426 s** in the flash arm. Same sign as the sampler —
+it makes the denominator's forward more expensive for a reason that is not the
+self-attention kernel — and it is not quantified.
+
+**Quote ~6.0x.** The defensible statement is the range **6.03x to 6.23x** with the
+sampler correction named and the prompt confound uncorrected and pushing the same
+way. The pair that would replace all of this is still `PENDING`.
+
+The arithmetic that predicted this is worth keeping either way. The naive kernel
+launches one 256-thread block per (query, head) with no K/V tiling: 2352 tokens x
+32 heads = 75,264 blocks each looping 2352 keys = 1.77e8 block-key iterations per
+call, over 48 layers. At the 5.70 ns per block-key iteration nsys measured for
+this same kernel on this same box (multimodal-speed §7), that is 48.4 s against a
+measured 47.84 s.
+
+### The flash arm's artifacts do not record what was run
+
+`arm-flash.log` opens at `[render] + load` with no command line, `wd-flash/` is
+empty, and no `phase-log.json` was written. The only description of the run was
+`/mnt/nas_share/rc/ltx25-attnflash/job/ab.sh` — a mutable path on a share, whose
+mtime is **25 minutes after the run finished** — so the geometry, prompt, seed and
+sample cap behind 7.680 s cannot be verified from the run's own evidence. The
+47.84 s denominator has its full command line as line 1 of its `render.log`; this
+arm has nothing. That asymmetry is why the two confounds above had to be
+established from a `conditioning.tower` duration.
+
+### Reproduce
+
+The harness is now committed as **`scripts/ltx25-dit-attn-flash-ab.sh`**, so a
+revision of it is immutable and citable, and it writes its own sha256 into
+`PROVENANCE` and its full resolved invocation — harness sha256, binary sha256,
+source SHA, geometry, seed, prompt, command line — into line 1 of each arm's own
+log. Stage that file into the lease's `/workspace` and run it:
+
+```sh
+rc run -d dgx:gpu0 --max-runtime 4h -- \
+  bash -lc 'bash /workspace/ltx25-attnflash/job/ltx25-dit-attn-flash-ab.sh'
+```
+
+It caps each arm at 13 samples (`WANT_SAMPLES`), holds a 12 GiB `MemAvailable`
+floor, writes a per-arm memory trace to `watch-<arm>.tsv`, caches the built binary
+keyed on the source SHA so a resumed run does not re-spend the 18-minute compile,
+and runs the **naive arm first**. The previous order took the cheap arm first and
+lost the box before the expensive one, which is how a two-arm measurement became
+a one-arm one.

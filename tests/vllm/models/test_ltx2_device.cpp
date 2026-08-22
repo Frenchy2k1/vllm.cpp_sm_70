@@ -42,6 +42,7 @@
 #include <nlohmann/json.hpp>
 
 #include "support/max_abs_diff.h"
+#include "support/test_env.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
@@ -1492,4 +1493,137 @@ TEST_CASE("ltx2 device: a malformed perturbation is REFUSED with the HOST arm's 
   mod_only.audio_cross_attn_skip_all = true;
   CHECK_NOTHROW((void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio,
                                            vt::DType::kF32, /*cache=*/nullptr, &mod_only));
+}
+
+// ---------------------------------------------------------------------------
+// REACHABILITY — the DiT self-attention must actually ENTER the fast op
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not vt::Attention") {
+  // WHY THIS CASE EXISTS (#1549). Until 2026-08-21 the device DiT self-attention
+  // called `vt::Attention`, which on CUDA is `vt::cuda::AttentionKernel` — the
+  // kernel whose own header calls itself "Correctness-grade (M0.9)". One DiT
+  // forward at 768x448/49f measured 47.84 s on GB10 because of it. NOTHING in
+  // this tree could see that: the output was right so every golden above passed,
+  // the op was registered so no refusal fired, and `GetOpProviderStats` counted
+  // the naive selection as the success it genuinely was. The only symptom was a
+  // wall clock, and a diffusion render has no reference wall clock.
+  //
+  // So the gate for this change cannot be numerical. It has to be a DISPATCH
+  // observation, and this is it.
+  //
+  // TWO-SIDED, because either half alone is passable by a defect:
+  //
+  //   POSITIVE   `kAttentionDenseFlash` must be selected once per self-attention
+  //              per block per batch row. A count of zero means the swap did not
+  //              happen or the branch was never entered.
+  //   NEGATIVE   `kAttention` must be selected ZERO times across the whole
+  //              forward. This is the half that makes it a ROUTING proof rather
+  //              than an ADDITION proof: LTX's cross-attentions use
+  //              `kAttentionCross`, so after the swap the DiT has no remaining
+  //              `kAttention` caller at all. A second, unswapped self-attention
+  //              path added later turns this half red.
+  //
+  // The EXACT count is asserted, not a floor. A floor below the real count is a
+  // mute switch: it stays green while one of the two streams silently stops
+  // routing here.
+  //
+  // ENTRY POINT. `Ltx2DitForwardDevice` is the production device forward —
+  // `src/vllm/multimodal/ltx2_video.cpp::Ltx2DitForwardDevice` at :4246, inside
+  // the denoise loop, calls exactly this function. This case does not construct a
+  // `vt::Attention` call by hand; a test that did would prove the op works and
+  // nothing about whether the model reaches it.
+  //
+  // CPU BACKEND, and that is not a weakening. `GetOp` is the dispatch point on
+  // every backend, so the ROUTING is observable without a GPU; what a GPU gates
+  // is the kernel behind it. On CPU both ops resolve to the same registered
+  // function (`src/vt/cpu/cpu_ops.cpp:3750-3761`, the `kAttention` /
+  // `kAttentionDenseFast` / `kAttentionDenseFlash` registrations), which is
+  // exactly why the golden cases above stay byte-unchanged by this swap and why
+  // this case has to ask the provider rather than the numbers.
+  //
+  // UNMASKED inputs on purpose: a MASKED self-attention carries a bias and
+  // legitimately routes to `kAttentionCross` (the dispatch condition is
+  // `context == nullptr && a.bias == nullptr`). Masked is a different question
+  // and is not this case's.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, /*masked=*/false);
+  REQUIRE(m.video.batch == m.audio.batch);
+
+  // SCOPE GUARDS, because both of these are PROCESS state and this case has
+  // `REQUIRE`s in it. A failed `REQUIRE` unwinds out of the case, and a `throw`
+  // from either forward does the same; on the straight-line version the counting
+  // instrument stayed enabled and the knob stayed set for the other 21 cases in
+  // this binary, which would make an unrelated case's failure depend on which
+  // case failed first.
+  struct StatsGuard {
+    ~StatsGuard() { vt::EnableOpProviderCallStats(false); }
+  } stats_guard;
+  struct KnobGuard {
+    ~KnobGuard() { vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN"); }
+  } knob_guard;
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+
+  const vllm::Ltx2DitOutputs out =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  // The forward must have actually computed something, or every count below is a
+  // count of a forward that did nothing.
+  REQUIRE(MaxAbsOf(out.video) > 1e-6);
+  REQUIRE(MaxAbsOf(out.audio) > 1e-6);
+
+  const vt::OpProviderStats flash =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  const vt::OpProviderStats naive =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+
+  // Two self-attentions per block — `attn1` on the video stream and
+  // `audio_attn1` on the audio one — each looping the batch rows.
+  const unsigned long long want =
+      static_cast<unsigned long long>(2 * p.num_layers * m.video.batch);
+  MESSAGE("kAttentionDenseFlash selections = " << flash.selections << " (want " << want
+                                               << "), kAttention selections = "
+                                               << naive.selections);
+  CHECK(flash.selections == want);
+  CHECK(naive.selections == 0);
+
+  // The A/B knob is the same-binary control this row's measurement runs on, so
+  // it is gated too: `=0` must put every one of those calls BACK on the naive op.
+  // A knob that silently did nothing would leave the A/B measuring one arm twice,
+  // which is the failure mode a same-binary A/B exists to avoid.
+  // Through the shared shim, not a private `#ifdef _WIN32` branch: `setenv` and
+  // `unsetenv` are POSIX and MSVC has neither, and issue #603 exists because
+  // three files had already grown their own copy. `check-windows-portability.py`
+  // cannot see an unguarded `::setenv` in a test translation unit (#1107), so
+  // nothing would have caught a private branch here either.
+  vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", "0");
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  const vllm::Ltx2DitOutputs off =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  const vt::OpProviderStats flash_off =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  const vt::OpProviderStats naive_off =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+  CHECK(flash_off.selections == 0);
+  CHECK(naive_off.selections == want);
+  // And the two arms must agree BYTE-FOR-BYTE on CPU, where `kAttention` and
+  // `kAttentionDenseFlash` are the same registered function. This is the CPU half
+  // of the numerics claim, stated as an equality rather than a tolerance because
+  // on this backend nothing else is defensible. The CUDA half is NOT bit-identical
+  // and is gated by the host-vs-device parity case above, at its own tolerance.
+  REQUIRE(off.video.size() == out.video.size());
+  REQUIRE(off.audio.size() == out.audio.size());
+  CHECK(std::equal(off.video.begin(), off.video.end(), out.video.begin()));
+  CHECK(std::equal(off.audio.begin(), off.audio.end(), out.audio.begin()));
+  // `stats_guard` disables the counting instrument on the way out, on this path
+  // and on every unwinding one.
 }

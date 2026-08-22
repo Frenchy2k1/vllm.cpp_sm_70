@@ -54,6 +54,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -418,7 +419,64 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       vt::AttentionArgs args;
       args.scale = scale;
       args.causal = false;
-      vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      // The FAST dense op, not `vt::Attention` (#1549). `vt::Attention` is frozen
+      // on `vt::cuda::AttentionKernel`, which its own header calls
+      // "Correctness-grade (M0.9)": one 256-thread block per (query, head), a
+      // 256-wide shared-memory tree reduction per key, and no K/V tiling, so K
+      // and V are re-read from global once per (query, head). At 768x448/49f the
+      // video stream is 2352 tokens x 32 heads = 75,264 blocks each looping 2352
+      // keys, x 48 layers, and ONE DiT forward measured 47.84 s on GB10. That
+      // freeze is deliberate and correct — it is what keeps text decode
+      // byte-identical (cuda_ops.cu:3119-3121) — but it means the fast kernels
+      // are SEPARATE OPS a caller opts into BY NAME, with no shape routing and no
+      // fallback notice. A model that never opts in gets correct output at
+      // roughly 500x the cost and nothing anywhere says so.
+      //
+      // BOTH LTX STREAMS FIT THIS OP AT THE PRODUCTION DTYPE, and it is worth
+      // writing the arithmetic down rather than citing the advertised bound. The
+      // flash kernel's K/V tile is `2 * kFlashBc(64) * head_dim * sizeof(Tin)`
+      // and it never opts into more than the 49,152 B of dynamic shared memory
+      // every CUDA architecture guarantees. At the stream dtype this model
+      // actually renders in — bf16, per the VT_CHECK in
+      // `Ltx2StreamDitToDevice` — that is 32,768 B for the video stream's
+      // head_dim 128 and 16,384 B for the audio stream's 64. Both fit, so no
+      // cap-raise is needed here and #1549 does not make one; the op's
+      // ADVERTISED head_dim domain is a separate defect owned by #1578.
+      //
+      // The f32 arm is the L2 parity reference, not a serving path, and at
+      // head_dim 128 its tile is 65,536 B and does NOT fit. It is exercised at
+      // the fixture's reduced dimensions, where it does fit; at production
+      // geometry it now REFUSES rather than running slowly. It refuses LOUDLY in
+      // either world -- today a throw from `Check(cudaGetLastError(),
+      // "attention-dense-flash launch")` at cuda_ops.cu:3352, which names the op
+      // but not the head_dim, and once #1578 lands a VT_CHECK that names the
+      // head_dim too. Never silently, which is why this is a disclosure and not
+      // a blocker. Recorded under `## Owed` in
+      // .agents/specs/ltx25-dit-attn-flash.md and tracked by #1612.
+      //
+      // The square-problem contract holds here by construction: this branch is
+      // entered only when `context == nullptr`, which is exactly when `s == tq`
+      // above.
+      //
+      // NOT bit-identical to `vt::Attention` on CUDA: the warp kernel groups the
+      // head_dim partial sums across 32 lanes instead of a 256-thread block, so
+      // the same f32 online softmax associates differently. It IS byte-identical
+      // on CPU, where both ops resolve to the same registered kernel. The binding
+      // gate is the CUDA host-vs-device parity case in test_ltx2_device.cpp.
+      const char* off = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
+      if (off != nullptr && off[0] == '0') {
+        // VT-ATTN-NAIVE: the OFF arm of a same-binary A/B, not a serving path.
+        // The default is `vt::AttentionDenseFlash` in the else branch below, and
+        // this call exists so both arms of the 47.84 s / 7.680 s measurement run
+        // from ONE build — the shape `VT_FA2_DENSE` (cuda_ops.cu) already takes.
+        // Deleting it would not remove a naive call from production; it would
+        // remove the control that proves the fast one is what runs.
+        //
+        // Read FRESH rather than cached, so a test can flip it inside one process.
+        vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else {
+        vt::AttentionDenseFlash(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      }
     } else {
       vt::AttentionCrossArgs args;
       args.scale = scale;
