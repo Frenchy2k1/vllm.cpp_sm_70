@@ -50,6 +50,10 @@ per-rank forward dispatch (W4-pre remainder / W5) remain open and unfeigned.
       produces a `vllm-server` that links `libnccl.so.2`.  → DONE (verified)
 - [ ] **G1 refusal** (baseline): under 2 GPUs the server exits with the named
       TP-SERVE refuse (not a hang). Final on at start, removed by W7.
+      **MEASURED (2026-08-22)**: with the refusal env-bypassed for a probe, a
+      real tp2 server boots but STALLS on the first generate (curl timeout,
+      GPU 0% both ranks) — the deadlock the refusal predicts is real, confirms
+      the seam.
 - [ ] **G2 parity** (exists): `tests/vt/test_tp_forward.cpp` — 3 cases, 133/133
       (was 60/60; +W4 loader-slice case). Sharded+AR == tp1, W4 slice are real.
       Must stay green across every wave.

@@ -1166,6 +1166,14 @@ bool LaunchSm70Fp8W8A16(const void* argsPtr) {
   // cache in LaunchSm70Nvfp4W4a16 was built to remove). In a resident serving
   // model the weights are fixed for the process; the per-rank weight buffers
   // are touched with fresh pointers at load only.
+  //
+  // NOTE: this cache MUST stay a single grow-only slot, not an LRU of many
+  // slots. The server runs decode through a CUDA graph; a cudaMalloc issued
+  // DURING graph capture is a capture-invalid operation that makes
+  // cudaGetLastError() non-success and the launch "decline" (a live failure
+  // time-measured at runtime when an LRU tried to size multiple slots). The
+  // grow-only slot allocates exactly once, in warmup, before capture begins,
+  // and only ever repacks in place after that.
   static const uint8_t* s_wc = nullptr;
   static int s_n = 0, s_k = 0;
   static uint8_t* s_qc = nullptr;

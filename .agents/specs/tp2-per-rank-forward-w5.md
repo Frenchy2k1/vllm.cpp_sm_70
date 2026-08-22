@@ -67,6 +67,19 @@ refusal (`runner.cpp:434`).
 - Record the build/run recipe, revisions, model snapshot hash, and both raw
   output token streams (not a diff of a diff).
 
+## Red-first evidence (measured 2026-08-22, scratch probe)
+
+With `VT_TP_ALLOW=1` (a scratch env-gated probe added to `attach_tp_group` +
+`FromModelDir`, default OFF) a REAL `vllm-server --tp 2` on Qwen3.8-27B-NVFP4
+(GPUs 1,2) BOOTS and LISTENS, stages 17 GiB on GPU1 and ~0.5 GiB on GPU2, then
+**stalls on the first generate**: curl 120s timeout, no response, GPU 0% util
+on both ranks; the server stays alive. The output never arrives — the
+single-queue runner feeds ONE rank, and the collective the other rank must
+join never runs. This is the refusal's "a tp>1 step would deadlock the
+collective" claim, now MEASURED, not theoretical. `VT_TP_ALLOW` remains a
+scratch scaffold (never a production knob); production defaults keep the loud
+refusal until the W5 forward lands and the tp2==tp1 token gate passes.
+
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
 Served the real Qwen3.8-27B-NVFP4 (snapshot
