@@ -70,15 +70,22 @@ refusal (`runner.cpp:434`).
 ## Red-first evidence (measured 2026-08-22, scratch probe)
 
 With `VT_TP_ALLOW=1` (a scratch env-gated probe added to `attach_tp_group` +
-`FromModelDir`, default OFF) a REAL `vllm-server --tp 2` on Qwen3.8-27B-NVFP4
-(GPUs 1,2) BOOTS and LISTENS, stages 17 GiB on GPU1 and ~0.5 GiB on GPU2, then
-**stalls on the first generate**: curl 120s timeout, no response, GPU 0% util
-on both ranks; the server stays alive. The output never arrives — the
-single-queue runner feeds ONE rank, and the collective the other rank must
-join never runs. This is the refusal's "a tp>1 step would deadlock the
-collective" claim, now MEASURED, not theoretical. `VT_TP_ALLOW` remains a
-scratch scaffold (never a production knob); production defaults keep the loud
-refusal until the W5 forward lands and the tp2==tp1 token gate passes.
+`FromModelDir`, default OFF, since REVERTED) a REAL `vllm-server --tp 2` on
+Qwen3.8-27B-NVFP4 (GPUs 1,2) BOOTS and LISTENS, stages 17 GiB on GPU1 and
+~0.5 GiB on GPU2, then the first generate never completes: curl times out with
+zero bytes, GPU 0% on BOTH ranks, no exception on the SYNC runner, no request
+log line, and `num_requests_running=0 / waiting=0` in `/metrics`. This is
+NOT the prefill throw (`qwen3_5.cpp` line ~5534, which a sync runner would
+propagate) and NOT a slow-but-running primitive: the request is accepted at
+the HTTP edge but NEVER reaches the scheduler/forward — `execute_model` is not
+observed to run. The guard's "a tp>1 step answers pure-decode only ... prefill
+throws" is real but INCOMPLETE: the observed block sits EARLIER, in the
+engine→runner handoff when a tp2 group is attached. The precise open seam is
+the per-lane forward dispatch from the runner for an attached tp>1 group,
+which this probe proves is NOT yet reached by any real request. This is the
+measured red; `VT_TP_ALLOW` stays a scratch scaffold (never a production
+knob); production defaults keep the loud refusal until the tp2==tp1 gate
+passes.
 
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
