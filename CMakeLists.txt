@@ -2361,6 +2361,10 @@ if(VLLM_CPP_CUDA)
     vt_cuda_set_source_gencode("${VT_SM70_FA2_V100_ARCHS}"
       src/vt/cuda/cuda_flash_attn_v100.cu)
     list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_flash_attn_v100.cu)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_sm70_flash_attn.cu)
+    vt_cuda_set_source_gencode("${VT_SM70_FA2_V100_ARCHS}"
+      src/vt/cuda/cuda_sm70_flash_attn.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_sm70_flash_attn.cu)
   endif()
   if(_MARLIN_SRCS)
     vt_cuda_set_source_gencode("${VT_MARLIN_NVFP4_ARCHS}" ${_MARLIN_SRCS})

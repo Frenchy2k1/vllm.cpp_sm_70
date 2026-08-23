@@ -1712,6 +1712,8 @@ vllm_cpp_add_test(test_sm70_nvfp4_gemm vt/test_sm70_nvfp4_gemm.cpp)
 # The tactic registry header lives under src/ (not the public include/ tree);
 # host TUs that reach it get the src root explicitly.
 target_include_directories(test_sm70_nvfp4_gemm PRIVATE "${CMAKE_SOURCE_DIR}/src")
+vllm_cpp_add_test(test_sm70_fa2_decode vt/test_sm70_fa2_decode.cpp)
+target_include_directories(test_sm70_fa2_decode PRIVATE "${CMAKE_SOURCE_DIR}/src")
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)
 vllm_cpp_add_test(test_dropin_abi vt/test_dropin_abi.cpp)
 target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
