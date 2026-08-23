@@ -130,6 +130,7 @@ TEST_CASE("host NVFP4 decode reproduces the fp4 layout (known nibbles + e4m3 sca
 
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O,int H,int I,const uint16_t* x,const uint16_t* gu,const uint16_t* down,float* out);
 extern "C" int vt_cuda_attn_kv_shard_run(int T,int Hq,int Hkv,int D,const float* q,const float* k,const float* v,float* out);
+extern "C" int vt_cuda_lm_head_shard_run(int T,int H,int V,const float* x,const float* w,float* out);
 TEST_CASE("bf16 dense-MLP assembly: split [2I,H] gate/up + down, shard == host ref") {
   constexpr int O=8,H=12,I=24;   // I%4==0
   // float ground truth first, then its bf16 bits as the as-"assembly" input.
@@ -173,4 +174,19 @@ TEST_CASE("attention KV/GQA-shard: KV split across ranks == single-GPU softmax a
     for (int kh=0;kh<Hkv;++kh){ const float* kp=k.data()+(size_t)kh*D,*vp=v.data()+(size_t)kh*D; float s=0; for(int d=0;d<D;++d)s+=qt[d]*kp[d]; double e=std::exp((double)(s*scale)); for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*vp[d]/dn);}
   }
   for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
+}
+
+TEST_CASE("lm_head column-shard: vocab split across ranks + AllGather == full-vocab logits") {
+  constexpr int T=4,H=16,V=64;  // V%W==0 on 2/4-GPU box
+  std::vector<float> x(T*H),w(V*H);
+  for (size_t i=0;i<x.size();++i) x[i]=0.05f*((int)(i%11))-0.2f;
+  for (int v=0;v<V;++v) for (int d=0;d<H;++d) w[v*H+d]=0.01f*((v*3+d)%19)-0.4f;
+  std::vector<float> out((size_t)T*V,0.f);
+  int rc=vt_cuda_lm_head_shard_run(T,H,V,x.data(),w.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); lm_head shard skipped");return;}
+  CHECK(rc==0);
+  // full-vocab host reference
+  std::vector<float> ref(T*V);
+  for (int m=0;m<T;++m) for (int v=0;v<V;++v){ double a=0; for(int d=0;d<H;++d) a+=(double)x[m*H+d]*(double)w[v*H+d]; ref[m*V+v]=(float)a;}
+  for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-4));
 }
