@@ -86,16 +86,24 @@ earlier ones):
    threads parked on futex/pipe — the engine thread enters `execute_model`
    once and NEVER returns.
 
-So the block is INSIDE the tp2 forward, and the request genuinely reaches it.
-This is exactly the refusal's "a tp>1 step would deadlock the collective"
-claim — and now the missing piece is specific: the runner drives lane 0's
-queue_ ONLY (`tp_queues_[0]`), so lane 1's per-rank forward never runs and the
-sharded collectives (TpAllReduceSum / TpPagedAttentionHost) have no second
-participant. The honest remaining work is the runner's PER-LANE FORWARD
-DISPATCH: drive `tp_queues_[r]`'s forward on every rank so each joins the
-group's collectives, which is the W5 body. `VT_TP_ALLOW` stays a scratch
-scaffold (never a production knob); production defaults keep the loud refusal
-until the tp2==tp1 token gate passes.
+So the block is INSIDE `execute_model`, on a host-only path, BEFORE the forward
+is entered at all. Two decisive observations: (1) an instrumented `Forward`
+entry (qwen3_5.cpp) with the same `VT_ENGINE_STEP_LOG` gate never printed
+while `core-step begin` did — the stall is in the runner between the step and
+`ModelRegistry::Forward`, not in the model forward; (2) GPU 0% on all ranks
+and no CUDA/NCCL thread busy — no kernel, no shard primitive, no
+fan-out thread was ever launched. The block is a lane-0-local host-side wait
+in the runner's step-input assembly (the region between `execute_model` entry
+and line ~1823 `ModelRegistry::Forward`), ahead of any collective.
+
+Per-lane forward dispatch is a possible eventual fix but is NOT the diagnosis:
+the stall never reaches the primitives that dispatch would feed. The next
+implementer's first move should be instrumenting the runner body between the
+step entry and `ModelRegistry::Forward` (the `prepare_inputs` /
+`MakeCommonAttentionMetadata` / `forward_input` assembly) to find the exact
+host wait, non multi-lane dispatch. `VT_TP_ALLOW` is a scratch scaffold (never
+a production knob); production keeps the loud refusal until a tp>1 step
+returns and the tp2==tp1 gate passes.
 
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
