@@ -2278,6 +2278,10 @@ bool Sm70PrefillTakeover(cudaStream_t c, Tensor& out, const Tensor& query,
   if ((d != 64 && d != 128) || nkv <= 0 || block_size <= 0) return false;
   if (args.logits_soft_cap != 0.f || !args.causal) return false;
   if (args.window_size.has_value()) return false;
+  // The kernel reads q_start[r+1] (the final cumulative element); if the
+  // engine's query_start_loc doesn't carry num_reqs+1 entries, fall back
+  // cleanly instead of an OOB read.
+  if (query_start_loc.shape[0] < num_reqs + 1) return false;
   const DeviceCaps& caps = GetDeviceCaps();
   if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return false;
 
