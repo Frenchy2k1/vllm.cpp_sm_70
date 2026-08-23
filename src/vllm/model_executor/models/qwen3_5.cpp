@@ -7296,8 +7296,11 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
 // gate). h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device). Reused by the dense
 // forward below; the gate/up/down weights are W4A4-materialized-to-bf16 at load.
 DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
-                   const Tensor& dh, int64_t T) {
+                   const Tensor& dh, int64_t T,
+                   const vllm::TensorParallel* tp = nullptr) {
   const int64_t I = cfg.intermediate_size;
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense MLP: tp>1 per-rank gate/up/down shard not yet hooked (shard primitive landed; wiring next)");
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
@@ -7559,7 +7562,8 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
                         const CommonAttentionMetadata& attn_meta,
                         const GDNAttentionMetadata& gdn_meta,
                         const PagedKvCache* attn_kv,
-                        const GdnStateCache* gdn_state, int64_t T) {
+                        const GdnStateCache* gdn_state, int64_t T,
+                        const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7603,7 +7607,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   DumpStage("post_attn_norm", dh2);
 
-  hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
   DumpStage("mlp_out", hidden);
 }
 
