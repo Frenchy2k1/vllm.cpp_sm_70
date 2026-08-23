@@ -265,8 +265,8 @@ extern "C" void vt_sm70_fa2_prefill(
     int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
     int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale,
     cudaStream_t stream) {
-  const int td = (int)d;
-  if (td != 64 && td != 128) return;
+const int td = (int)d;
+  if (td != 64 && td != 128 && td != 192 && td != 256) return;
   const dim3 grid((unsigned)num_reqs, (unsigned)hq);
 #define VT_PREFILL_LAUNCH(TD)                                                          \
   do {                                                                                 \
@@ -279,7 +279,9 @@ extern "C" void vt_sm70_fa2_prefill(
         vc_blk, vc_pg, vc_hd, scale);                                                    \
   } while (0)
   if (td == 64) VT_PREFILL_LAUNCH(64);
-  else          VT_PREFILL_LAUNCH(128);
+  else if (td == 128) VT_PREFILL_LAUNCH(128);
+  else if (td == 192) VT_PREFILL_LAUNCH(192);
+  else                VT_PREFILL_LAUNCH(256);
 #undef VT_PREFILL_LAUNCH
 }
 
@@ -291,7 +293,7 @@ extern "C" void vt_sm70_fa2_decode(
     int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
     int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale, cudaStream_t stream) {
   const int td = (int)d;
-  if (td != 64 && td != 128) return;  // caller-side gate; do not launch garbage
+  if (td != 64 && td != 128 && td != 192 && td != 256) return;  // caller-side gate
   const dim3 grid((unsigned)num_reqs, (unsigned)hq);
 #define VT_DECODE_LAUNCH(TD)                                                        \
   do {                                                                               \
@@ -304,7 +306,9 @@ extern "C" void vt_sm70_fa2_decode(
         vc_blk, vc_pg, vc_hd, scale, 0.f);                                             \
   } while (0)
   if (td == 64) VT_DECODE_LAUNCH(64);
-  else          VT_DECODE_LAUNCH(128);
+  else if (td == 128) VT_DECODE_LAUNCH(128);
+  else if (td == 192) VT_DECODE_LAUNCH(192);
+  else                VT_DECODE_LAUNCH(256);
 #undef VT_DECODE_LAUNCH
 }
 
@@ -328,13 +332,15 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
   // oracle). Device-synced before the host diff so a kernel-mode fault reports
   // as a run error, not a stale-buffer comparison.
   struct Cfg { int64_t nr, hq, nkv, d; int64_t seqs[8]; };
-  const Cfg cfgs[3] = {
+  const Cfg cfgs[5] = {
       {3, 1, 1, 64, {20, 17, 33, 0, 0, 0, 0, 0}},
       {2, 8, 2, 64, {9, 25, 0, 0, 0, 0, 0, 0}},
       {2, 4, 1, 128, {25, 17, 0, 0, 0, 0, 0, 0}},  // D=128 (Llama/Mistral width)
+      {2, 2, 1, 192, {19, 23, 0, 0, 0, 0, 0, 0}},  // D=192 (wider head)
+      {3, 1, 1, 256, {21, 13, 29, 0, 0, 0, 0, 0}},  // D=256 (wider head)
   };
   double worst = 0.0;
-  const int ncfg = 3;
+  const int ncfg = 5;
   for (int ci = 0; ci < ncfg; ++ci) {
     const Cfg& c = cfgs[ci];
     const int64_t d = c.d, bn = 16;
