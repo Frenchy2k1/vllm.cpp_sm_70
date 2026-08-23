@@ -178,16 +178,22 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 sm_80 and sm_100a were compiled end to end `-Werror` 0-warn on
 #                 dgx as the per-major representatives; the same-major siblings
 #                 (86/87/89, 103a) share the identical portable bodies. sm_70
-#                 (Volta, dropped by nvcc 13) and sm_75 (Turing, no bf16 tensor
-#                 cores → the portable bf16-WMMA path will not compile) are NOT
-#                 build-supported — they need a real fp16/non-tensor-core kernel
-#                 body, a scoped follow-up. See backend-matrix.md
-#                 BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and §W10.
+#                 (Volta) is BUILD-SUPPORTED the same way (BACKEND-CUDA-SM070,
+#                 W0): single-arch PORTABLE-KERNELS-ONLY, every fast-path cell
+#                 resolves EMPTY. It additionally requires a CUDA < 13 toolkit —
+#                 CUDA 13.0 dropped offline compilation for architectures below
+#                 7.5, and 12.9.x is the last 12.x — which
+#                 vt_cuda_check_arch_toolchain() enforces at configure time.
+#                 sm_75 (Turing, no bf16 tensor cores → the portable bf16-WMMA
+#                 path will not compile) remains NOT build-supported; both need
+#                 a real fp16/non-tensor-core kernel body, a scoped follow-up.
+#                 See backend-matrix.md
+#                 BACKEND-CUDA-SM0{70,80,86,87,89}/SM10{0,3}/SM110 and §W10.
 # Cross-family fat lists use release-W1 per-source gencode: portable TUs receive
 # every requested target while feature TUs receive their exact feature-table
 # intersection. The ten-SM archive gate below proves both the commands and the
 # linked cubins. See .agents/specs/release-binary-matrix.md W1.
-set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121)")
+set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121; '70'=Volta/V100, portable-kernels-only and requires nvcc < 13)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"
   OFF)
@@ -509,6 +515,11 @@ if(VLLM_CPP_CUDA)
   # cutlass-nvfp4 / cutlass-fp8 / Marlin / FA2 for the archs that DO support them.
   # Mirrors vLLM's cuda_archs_loose_intersection idiom; see the module header.
   include(cmake/CudaArchFeatures.cmake)
+  # W0: Volta (sm_70) needs nvcc < 13; reject the combination before any
+  # compile so the failure names the toolkit floor instead of nvcc's cryptic
+  # "Unsupported gpu architecture".
+  vt_cuda_check_arch_toolchain("${VLLM_CPP_CUDA_ARCHITECTURES}"
+    "${CMAKE_CUDA_COMPILER_VERSION}")
   message(STATUS "CUDA target architectures: ${VLLM_CPP_CUDA_ARCHITECTURES}")
   vt_cuda_feature_archs(VT_FP4_MMA_ARCHS       "fp4-mma")
   vt_cuda_feature_archs(VT_CUTLASS_NVFP4_ARCHS "cutlass-nvfp4")

@@ -109,6 +109,7 @@ ALL_GREEN_JOBS = [
         "build-test-vulkan",
         "cuda-arch-features",
         "cuda-fat-build",
+        "cuda-sm70-build",
         "device-leakage",
         "vulkan-spirv-freshness",
         "windows-msvc-cpu",

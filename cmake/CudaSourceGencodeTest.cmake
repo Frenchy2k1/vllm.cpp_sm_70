@@ -31,6 +31,22 @@ expect_gencode("${_sm100}" "-gencode=arch=compute_100a,code=sm_100a")
 expect_gencode("${_fa2}"
   "-gencode=arch=compute_80,code=sm_80;-gencode=arch=compute_86,code=sm_86;-gencode=arch=compute_87,code=sm_87;-gencode=arch=compute_89,code=sm_89;-gencode=arch=compute_120a,code=sm_120a;-gencode=arch=compute_121a,code=sm_121a")
 
+# --- SM70 / VOLTA (BACKEND-CUDA-SM070, W0) ----------------------------------
+# The portable TUs must emit plain sm_70 SASS on request: no 'a' suffix exists
+# for Volta, and the gencode formatter has to leave other targets alone when 70
+# shares a (heterogeneous) fat build.
+expect_gencode("70"
+  "-gencode=arch=compute_70,code=sm_70")
+expect_gencode("70;121a"
+  "-gencode=arch=compute_70,code=sm_70;-gencode=arch=compute_121a,code=sm_121a")
+# A 70-inclusive target list must NOT light any fast-path feature; the portable
+# '70' arch coexists with the sm_12x features resolving for the sm_12x leg only.
+set(VLLM_CPP_CUDA_ARCHITECTURES "70;121a")
+vt_cuda_feature_archs(_fp4 "fp4-mma")
+expect_gencode("${_fp4}" "-gencode=arch=compute_121a,code=sm_121a")
+vt_cuda_feature_archs(_fa2 "fa2")
+expect_gencode("${_fa2}" "-gencode=arch=compute_121a,code=sm_121a")
+
 get_filename_component(_root "${_here}/.." ABSOLUTE)
 file(READ "${_root}/CMakeLists.txt" _root_cmake)
 foreach(_required IN ITEMS
