@@ -420,8 +420,8 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
 extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
   const DeviceCaps& caps = GetDeviceCaps();
   if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
-  const int64_t num_reqs = 2, hq = 2, nkv = 1, d = 64, bs = 16, maxblocks = 2;
-  const int q1[2] = {4, 6}, s1[2] = {20, 24};
+  const int64_t num_reqs = 2, hq = 4, nkv = 2, d = 64, bs = 16, maxblocks = 4;
+  const int q1[2] = {40, 12}, s1[2] = {56, 20};  // GQA + multi-slice + tails
   const int64_t pages = num_reqs * maxblocks;
   const size_t kv = (size_t)pages * (bs * nkv * d);
   const int64_t kc_hd = d, kc_pg = nkv * d, kc_blk = bs * nkv * d;
@@ -435,7 +435,7 @@ extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
     hk[i] = f2h(0.37f * (float)((i * 13 + 7) % 19) + 0.11f);
     hv[i] = f2h(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f);
   }
-  std::vector<int32_t> hbt((size_t)num_reqs * maxblocks), hsl{20, 24}, hql{4, 6}, hqs{0, 4};
+  std::vector<int32_t> hbt((size_t)num_reqs * maxblocks), hsl{56, 20}, hql{40, 12}, hqs{0, 40};
   for (int64_t r = 0; r < num_reqs; ++r)
     for (int64_t b = 0; b < maxblocks; ++b) hbt[(size_t)r * maxblocks + b] = (int32_t)(r * maxblocks + b);
 
