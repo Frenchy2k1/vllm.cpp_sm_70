@@ -389,7 +389,8 @@ class Qwen3_5DenseModel {
                                          const std::vector<int32_t>& positions,
                                          const Qwen3_5DenseWeights& weights,
                                          const HfConfig& config,
-                                         vt::Queue& queue);
+                                         vt::Queue& queue,
+                                         const vllm::TensorParallel* tp = nullptr);
 };
 
 // M3-b — single-image, single-sequence GREEDY image->text generation on the
