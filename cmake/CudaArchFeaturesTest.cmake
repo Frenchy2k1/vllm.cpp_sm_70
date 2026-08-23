@@ -285,6 +285,15 @@ expect_feature("70;80" "fa2" "80")
 # Pinned so the 12x marlin cell stays untouched by the Volta request.
 expect_feature("70;120a" "marlin-nvfp4" "120a")
 
+# --- SM70 W4A16 GEMM FEATURE CELL (Phase 2 brick A) --------------------------
+# The cell is 7.0-only (the TU is compiled for Volta alone); expected empty on
+# every other family so no other arch silently gains a body it did not build.
+expect_feature("70" "sm70-nvfp4-gemm" "70")
+expect_feature("121a" "sm70-nvfp4-gemm" "")
+expect_feature("120a" "sm70-nvfp4-gemm" "")
+expect_feature("70;121a" "sm70-nvfp4-gemm" "70")
+expect_feature("70;80" "sm70-nvfp4-gemm" "70")
+
 # --- SM70 TOOLCHAIN GATE (nvcc < 13 only) ----------------------------------
 # CUDA 13.0 removed offline compilation for architectures below 7.5, so a `70`
 # request must be refused on nvcc >= 13 at configure time and allowed on the
