@@ -2355,6 +2355,10 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_sm70_nvfp4_gemm.cu)
   endif()
   if(VT_SM70_FA2_V100_ARCHS)
+    # The adoption branch in cuda_paged_attn.cu calls vt_sm70_fa2_decode, which
+    # only exists when this feature's TUs are compiled. Signal the library so
+    # LaunchDecode is byte-identical to the reference on every OTHER arch.
+    target_compile_definitions(vllm PRIVATE VLLM_CPP_HAS_SM70_FA2=1)
     target_sources(vllm PRIVATE src/vt/cuda/cuda_flash_attn_v100.cu)
     set_source_files_properties(src/vt/cuda/cuda_flash_attn_v100.cu PROPERTIES
       COMPILE_OPTIONS "-isystem;${CMAKE_SOURCE_DIR}/third_party")
