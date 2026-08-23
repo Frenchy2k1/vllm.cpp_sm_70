@@ -27,7 +27,6 @@
 
 namespace vt::cuda {
 
-constexpr int kF2D = 64;       // head dim served
 constexpr int kF2Keys = 16;    // 16-key tile (m16n16k16 N)
 constexpr int kF2Threads = 32;
 
@@ -140,13 +139,14 @@ __global__ void Sm70Fa2DecodeAttn(
 // Honest scope: fp16 Q/KV, D==64, causal, request q_len <= 64 (else decline).
 constexpr int kPFMaxQ = 64;
 
+template <int TD>
 __global__ void Sm70FaPrefillAttn(
     float* out, const __half* query, const __half* k_cache, const __half* v_cache,
     const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_lens,
     const int32_t* q_start, int64_t num_reqs, int64_t hq, int64_t nkv, int64_t d,
     int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
     int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale) {
-  if (d != kF2D) return;
+  if (d != TD) return;
   const int64_t r = blockIdx.x;
   const int64_t h = blockIdx.y;
   if (r >= num_reqs || h >= hq) return;
@@ -158,32 +158,32 @@ __global__ void Sm70FaPrefillAttn(
   const int64_t qbase = q_start[r];   // global query-token row of req r
 
   extern __shared__ __half ps[];
-  __half* sq = ps;                 // [16][64] q-slice
-  __half* sk = sq + 16 * kF2D;     // [16][64] key tile
-  __half* sv = sk + 16 * kF2D;     // [16][64] v tile
-  __half* sb = sv + 16 * kF2D;     // [16][16] B transpose
+  __half* sq = ps;                 // [16][TD] q-slice
+  __half* sk = sq + 16 * TD;      // [16][TD] key tile
+  __half* sv = sk + 16 * TD;      // [16][TD] v tile
+  __half* sb = sv + 16 * TD;      // [16][16] B transpose
   __half* sa16 = sb + 16 * 16;      // [16][16] A tile (16-wide rows, for wmma)
   float* ss = reinterpret_cast<float*>(sa16 + 16 * 16);  // [16][16] scores
   float* acc = ss + 16 * 16;       // [16][64] running acc (current slice)
-  float* mrow = acc + 16 * kF2D;   // [16]
+  float* mrow = acc + 16 * (TD);   // [16]
   float* lrow = mrow + 16;         // [16]
 
   for (int qs = 0; qs < qlen; qs += 16) {
     const int nrows = (qlen - qs) < 16 ? (qlen - qs) : 16;
     // load q-slice A (rows 0..nrows-1 valid, rest zero)
-    for (int e = threadIdx.x; e < 16 * kF2D; e += blockDim.x) sq[e] = __ushort_as_half(0);
+    for (int e = threadIdx.x; e < 16 * TD; e += blockDim.x) sq[e] = __ushort_as_half(0);
     for (int e = threadIdx.x; e < nrows * d; e += blockDim.x) {
       const int rr = e / (int)d, cc = e % (int)d;
-      sq[rr * kF2D + cc] = query[((qbase + qs + rr) * hq + h) * d + cc];
+      sq[rr * TD + cc] = query[((qbase + qs + rr) * hq + h) * d + cc];
     }
-    for (int e = threadIdx.x; e < 16 * kF2D; e += blockDim.x) acc[e] = 0.f;
+    for (int e = threadIdx.x; e < 16 * TD; e += blockDim.x) acc[e] = 0.f;
     for (int e = threadIdx.x; e < 16; e += blockDim.x) { mrow[e] = -CUDART_INF_F; lrow[e] = 0.f; }
     __syncthreads();
     // -- key stream over all keys [0, seqlen) --
     for (int64_t jb = 0; jb < (int64_t)seqlen; jb += kF2Keys) {
       const int nkeys = (int)(((int)seqlen - (int)jb) < kF2Keys ? ((int)seqlen - (int)jb) : kF2Keys);
-      for (int e = threadIdx.x; e < 16 * kF2D; e += blockDim.x) sk[e] = __ushort_as_half(0);
-      for (int e = threadIdx.x; e < 16 * kF2D; e += blockDim.x) sv[e] = __ushort_as_half(0);
+      for (int e = threadIdx.x; e < 16 * TD; e += blockDim.x) sk[e] = __ushort_as_half(0);
+      for (int e = threadIdx.x; e < 16 * TD; e += blockDim.x) sv[e] = __ushort_as_half(0);
       for (int e = threadIdx.x; e < nkeys * d; e += blockDim.x) {
         const int key = (int)jb + (e / d);
         const int cc = e % d;
@@ -200,7 +200,7 @@ __global__ void Sm70FaPrefillAttn(
         // A16: row-major 16x16 with stride 16: [r][k] = query row r col p*16+k.
         for (int e = threadIdx.x; e < 16 * 16; e += blockDim.x) {
           const int rr = e / 16, kk = e % 16;
-          sa16[e] = (rr < nrows) ? sq[rr * kF2D + (p * 16 + kk)] : __ushort_as_half(0);
+          sa16[e] = (rr < nrows) ? sq[rr * TD + (p * 16 + kk)] : __ushort_as_half(0);
         }
         // B transpose: [k][key] = sk[key][p*16 + k].
         for (int e = threadIdx.x; e < 16 * 16; e += blockDim.x) {
@@ -231,15 +231,15 @@ __global__ void Sm70FaPrefillAttn(
         }
         float mnew = fmaxf(mx, tm);
         float corr = expf(mx - mnew);
-        for (int e = threadIdx.x; e < kF2D; e += blockDim.x) acc[rr * kF2D + e] *= corr;
+        for (int e = threadIdx.x; e < TD; e += blockDim.x) acc[rr * TD + e] *= corr;
         ls *= corr;
         for (int ccelf = 0; ccelf < 16; ++ccelf) {
           const int kf = (int)jb + ccelf;
           if (kf <= absq) {
             float w = expf(ss[rr * 16 + ccelf] * scale - mnew);
             ls += w;
-            for (int e = threadIdx.x; e < kF2D; e += blockDim.x)
-              acc[rr * kF2D + e] += w * __half2float(sv[ccelf * d + e]);
+            for (int e = threadIdx.x; e < TD; e += blockDim.x)
+              acc[rr * TD + e] += w * __half2float(sv[ccelf * d + e]);
           }
         }
         __syncwarp();
@@ -265,14 +265,22 @@ extern "C" void vt_sm70_fa2_prefill(
     int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
     int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale,
     cudaStream_t stream) {
-  const int smem = (4 * 16 * kF2D + 16 * 16) /*sq,sk,sv,sb,sa16 halves*/ * 2 +
-                   (16 * 16 + 16 * kF2D + 32) /*ss,acc,mrow,lrow*/ * 4;
+  const int td = (int)d;
+  if (td != 64 && td != 128) return;
   const dim3 grid((unsigned)num_reqs, (unsigned)hq);
-  Sm70FaPrefillAttn<<<grid, kF2Threads, smem, stream>>>(
-      out, static_cast<const __half*>(query), static_cast<const __half*>(k),
-      static_cast<const __half*>(v), block_table, seq_lens, q_lens, q_start,
-      num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
-      vc_blk, vc_pg, vc_hd, scale);
+#define VT_PREFILL_LAUNCH(TD)                                                          \
+  do {                                                                                 \
+    const int smem = (3 * 16 * (TD) /*sq,sk,sv*/ + 2 * 16 * 16 /*sb,sa16*/) * 2 +      \
+                     (16 * 16 + 16 * (TD) /*ss,acc*/ + 32) * 4;                        \
+    Sm70FaPrefillAttn<(TD)><<<grid, kF2Threads, smem, stream>>>(                       \
+        out, static_cast<const __half*>(query), static_cast<const __half*>(k),         \
+        static_cast<const __half*>(v), block_table, seq_lens, q_lens, q_start,         \
+        num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,      \
+        vc_blk, vc_pg, vc_hd, scale);                                                    \
+  } while (0)
+  if (td == 64) VT_PREFILL_LAUNCH(64);
+  else          VT_PREFILL_LAUNCH(128);
+#undef VT_PREFILL_LAUNCH
 }
 
 // ---- host entries (extern "C", raw pointers, no torch) ----
@@ -431,7 +439,7 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
 extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
   const DeviceCaps& caps = GetDeviceCaps();
   if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
-  const int64_t num_reqs = 2, hq = 4, nkv = 2, d = 64, bs = 16, maxblocks = 4;
+  const int64_t num_reqs = 2, hq = 4, nkv = 2, d = 128, bs = 16, maxblocks = 4;
   const int q1[2] = {40, 12}, s1[2] = {56, 20};  // GQA + multi-slice + tails
   const int64_t pages = num_reqs * maxblocks;
   const size_t kv = (size_t)pages * (bs * nkv * d);
