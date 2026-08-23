@@ -1,0 +1,20 @@
+{
+  "oracle": "1Cat-vLLM 1.2.2",
+  "model": "qwen3.6-27b-awq-mtp",
+  "quant": "AWQ/INT4",
+  "temperature": 0.0,
+  "thinking": false,
+  "runs": 3,
+  "max_tokens": 32,
+  "n_prompts": 8,
+  "prompts": [
+    "Define HTTP in one sentence.",
+    "Write a Python function fibonacci(n).",
+    "Say exactly: oracle-ok",
+    "List the first five powers of two.",
+    "Translate 'good morning' to French.",
+    "What is the capital of France?",
+    "Implement a for loop in C that prints 1..10.",
+    "In one word, is the sky blue?"
+  ]
+}
