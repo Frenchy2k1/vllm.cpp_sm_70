@@ -2447,6 +2447,102 @@ setenv("VT_SM70_FA2_DECODE", "0", 1);
   return (worst <= (double)tol_rel) ? 0 : 1;
 }
 
+// op-level prefill parity (brick G adoption proof): the SAME prefill tensors
+// run through the engine's generic prefill launcher (LaunchPrefillFlash<half>)
+// and through vt_sm70_fa2_prefill; diffs the outputs. 0 ok /1 mismatch /2 not
+// sm_70. Mirrors the decode op-parity driver.
+extern "C" void vt_sm70_fa2_prefill(
+    float* out, const void* query, const void* k, const void* v,
+    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_lens,
+    const int32_t* q_start, int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d,
+    int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
+    int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale,
+    cudaStream_t stream);
+
+template <typename TQ, typename TKV, typename Tout>
+void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                        const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                        const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t hq,
+                        int64_t d, int64_t num_reqs, int64_t num_kv_heads, int64_t block_size);
+
+extern "C" int vt_sm70_fa2_prefill_op_parity(float tol_rel, int verbose) {
+  const DeviceCaps& caps = GetDeviceCaps();
+  if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
+  const int64_t nr = 2, hq = 4, nkv = 2, d = 128, bs = 16, mxb = 4;
+  const int ql[2] = {6, 10}, sl[2] = {40, 20};
+  const int qs[3] = {0, 6, 16};
+  const int64_t pages = nr * mxb;
+  const size_t kv = (size_t)pages * (bs * nkv * d);
+  const size_t qn = (size_t)(ql[0] + ql[1]);
+  const Device dev{DeviceType::kCUDA, 0};
+  const int64_t kc_hd = d, kc_pg = nkv * d, kc_blk = bs * nkv * d;
+
+  auto f2h = [](float f){ return __float2half_rn(f); };
+  std::vector<__half> q16(qn * hq * d), k16(kv), v16(kv);
+  for (size_t i = 0; i < q16.size(); ++i) q16[i] = f2h(0.61f * (float)((i * 3 + 1) % 11) + 0.31f);
+  for (size_t i = 0; i < kv; ++i) {
+    k16[i] = f2h(0.37f * (float)((i * 13 + 7) % 19) + 0.11f);
+    v16[i] = f2h(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f);
+  }
+  std::vector<int32_t> bt((size_t)nr * mxb), sl_(sl, sl + 2), ql_(ql, ql + 2), qs_(qs, qs + 3);
+  for (int64_t r = 0; r < nr; ++r)
+    for (int64_t b = 0; b < mxb; ++b) bt[(size_t)r * mxb + b] = (int32_t)(r * mxb + b);
+
+  __half *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
+  int32_t *d_bt = nullptr, *d_sl = nullptr, *d_ql = nullptr, *d_qs = nullptr;
+  float *d_mine = nullptr, *d_ref = nullptr;
+  cudaMalloc((void**)&d_q, q16.size() * sizeof(__half));
+  cudaMalloc((void**)&d_k, kv * sizeof(__half));
+  cudaMalloc((void**)&d_v, kv * sizeof(__half));
+  cudaMalloc((void**)&d_bt, bt.size() * sizeof(int32_t));
+  cudaMalloc((void**)&d_sl, sl_.size() * sizeof(int32_t));
+  cudaMalloc((void**)&d_ql, ql_.size() * sizeof(int32_t));
+  cudaMalloc((void**)&d_qs, qs_.size() * sizeof(int32_t));
+  if (cudaMalloc((void**)&d_mine, qn * hq * d * sizeof(float)) != cudaSuccess) return 1;
+  if (cudaMalloc((void**)&d_ref, qn * hq * d * sizeof(float)) != cudaSuccess) return 1;
+  cudaMemcpy(d_q, q16.data(), q16.size() * sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_k, k16.data(), kv * sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v, v16.data(), kv * sizeof(__half), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_bt, bt.data(), bt.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_sl, sl_.data(), sl_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ql, ql_.data(), ql_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_qs, qs_.data(), qs_.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+  Tensor tq = Tensor::Contiguous(d_q, DType::kF16, dev, {(int64_t)qn, hq, d});
+  Tensor tk = Tensor::Contiguous(d_k, DType::kF16, dev, {(int64_t)pages, (int64_t)bs, nkv, d});
+  Tensor tv = Tensor::Contiguous(d_v, DType::kF16, dev, {(int64_t)pages, (int64_t)bs, nkv, d});
+  Tensor tbt = Tensor::Contiguous(d_bt, DType::kI32, dev, {nr, mxb});
+  Tensor tsl = Tensor::Contiguous(d_sl, DType::kI32, dev, {nr});
+  Tensor tqs = Tensor::Contiguous(d_qs, DType::kI32, dev, {nr + 1});
+  Tensor tm = Tensor::Contiguous(d_mine, DType::kF32, dev, {(int64_t)qn, hq, d});
+  Tensor tr = Tensor::Contiguous(d_ref, DType::kF32, dev, {(int64_t)qn, hq, d});
+
+  PagedAttentionArgs args;
+  args.scale = 0.125f;
+  cudaStream_t st = 0;
+  // engine's generic prefill (reference)
+  LaunchPrefillFlash<__half, __half, float>(st, tr, tq, tk, tv, tbt, tsl, tqs,
+                                            args, hq, d, nr, nkv, bs);
+  // mine (fp16 sm70 WMMA prefill)
+  vt_sm70_fa2_prefill(d_mine, d_q, d_k, d_v, d_bt, d_sl, d_ql, d_qs,
+                      nr, hq, nkv, d, bs, mxb, /*bt_col=*/1,
+                      kc_blk, kc_pg, kc_hd, kc_blk, kc_pg, kc_hd, 0.125f, st);
+  cudaDeviceSynchronize();
+  std::vector<float> a(qn * hq * d), b(qn * hq * d);
+  cudaMemcpy(a.data(), d_mine, a.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(b.data(), d_ref, b.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  double worst = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const double denom = b[i] > 1.0 ? b[i] : 1.0;
+    worst = std::max(worst, std::fabs((double)a[i] - (double)b[i]) / denom);
+  }
+  if (verbose) fprintf(stdout, "  prefill op-parity: worst reldev %.3e\n", worst);
+  cudaFree((void*)d_q); cudaFree((void*)d_k); cudaFree((void*)d_v); cudaFree((void*)d_bt);
+  cudaFree((void*)d_sl); cudaFree((void*)d_ql); cudaFree((void*)d_qs);
+  cudaFree((void*)d_mine); cudaFree((void*)d_ref);
+  return (worst <= (double)tol_rel) ? 0 : 1;
+}
+
 // Per-request query-tile layout, built DIRECTLY on the device from the device
 // query_start_loc — the exact loop the host used to run after a D2H copy+sync.
 // Each request r contributes ceil(qlen_r / tile_m) tiles {r, ts}; ts steps by
