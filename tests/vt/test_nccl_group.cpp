@@ -27,6 +27,7 @@ extern "C" int vt_cuda_sharded_forward_selfcheck(void);
 extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void);
 extern "C" int vt_cuda_bridge_rank_lanes_selfcheck(void);
 extern "C" int vt_cuda_mlp_shard_run(int O,int H,int I,const float* x,const float* gate,const float* up,const float* down,float* out);
+extern "C" int vt_cuda_attn_kv_shard_paged_run(int T,int Hq,int Hkv,int D,int block,int bt_cols,int num_blocks,int kv_dtype,const float* q,const float* kv_new,const int64_t* slot_mapping,const int32_t* block_table,const int32_t* seq_lens,void* kv0,float* out);
 extern "C" void* vt_cuda_tp_acquire(int tp_size);
 extern "C" void vt_cuda_tp_release(void* handle);
 
@@ -228,6 +229,56 @@ int rc=vt_cuda_attn_kv_shard_run(S,Hq,S,Hkv,D,q.data(),k.data(),v.data(),out.dat
     const float* qt=q.data()+(size_t)(t*Hq+hq)*D; double dn=0.0;
     for (int s=0;s<=t;++s)for (int kh=0;kh<Hkv;++kh){ const float* kp=k.data()+(size_t)(s*Hkv+kh)*D; float a=0; for(int d=0;d<D;++d)a+=qt[d]*kp[d]; dn+=std::exp((double)(a*scale));}
     for (int s=0;s<=t;++s)for (int kh=0;kh<Hkv;++kh){ const float* kp=k.data()+(size_t)(s*Hkv+kh)*D,*vp=v.data()+(size_t)(s*Hkv+kh)*D; float a=0; for(int d=0;d<D;++d)a+=qt[d]*kp[d]; double e=std::exp((double)(a*scale)); for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*vp[d]/dn);}
+  }
+  for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
+}
+
+// The W5 prefill question: does v3_cuda_attn_kv_shard_paged_run's per-token
+// causal window (seq_lens[t] + repeated block-table row) already serve the
+// MULTI-TOKEN prefill shape token-exact to full-KV tp1? Not, a real prefill
+// kernel is still owed. One request, T tokens, each attends to its causal
+// prefix; buffer is [2*T*Hkv*D] flattened: K plane first (K(t,h) at
+// (t*2Hkv+h)*D), then V plane at base = T*Hkv*D (V(t,h) at base+(t*2Hkv+h)*D).
+TEST_CASE("paged KV shard: causal PREFILL (multi-token, single request) == tp1 ref") {
+  constexpr int T=6,Hq=4,Hkv=4,D=16, block=4, bt_cols=2, num_blocks=2;
+  const size_t base=(size_t)T*Hkv*D, qz=(size_t)T*Hq*D;
+  std::vector<float> q(qz), kv(2*base);
+  for (size_t i=0;i<qz;++i) q[i]=0.1f*((int)(i%13))-0.3f;
+  for (size_t i=0;i<kv.size();++i) kv[i]=0.05f*((int)(i%9))-0.2f;
+  // Per-token causal window = prefix length; seq_lens[t]=t+1. Contiguous slots.
+  std::vector<int64_t> slot_mapping((size_t)T);
+  for (int t=0;t<T;++t) slot_mapping[(size_t)t]=t;
+  std::vector<int32_t> block_table((size_t)T*bt_cols);
+  for (int t=0;t<T;++t){ block_table[(size_t)t*bt_cols+0]=0; block_table[(size_t)t*bt_cols+1]=1; }
+  std::vector<int32_t> seq_lens((size_t)T);
+  for (int t=0;t<T;++t) seq_lens[t]=(int32_t)(t+1);
+  std::vector<float> out(qz,0.f);
+  // kv0 is the registry key (must be non-null); kv_new is the fresh KV written
+  // into the per-rank persistent cache on the first call.
+  const int kv_key_slot = 0;
+  void* kv0 = const_cast<int*>(&kv_key_slot);
+  int rc=vt_cuda_attn_kv_shard_paged_run(T,Hq,Hkv,D,block,bt_cols,num_blocks,1,
+      q.data(),kv.data(),slot_mapping.data(),block_table.data(),seq_lens.data(),
+      kv0,out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); paged prefill skipped");return;}
+  CHECK(rc==0);
+  const float scale=1.0F/std::sqrt((float)D);
+  // Host tp1 reference: token t attends the causal prefix s in [0,t]; the
+  // softmax is over ALL (s, kh) score pairs (each with its own exp weight),
+  // and v weighted by that per-pair exp / den — mirroring the kernel's scatter.
+  std::vector<float> ref(qz,0.f);
+  for (int t=0;t<T;++t) for (int hq=0;hq<Hq;++hq){
+    const float* qt=q.data()+(size_t)(t*Hq+hq)*D;
+    std::vector<double> sc((size_t)(t+1)*Hkv);
+    for (int s=0;s<=t;++s) for(int kh=0;kh<Hkv;++kh){
+      double a=0; const float* kp=kv.data()+(size_t)(s*2*Hkv+kh)*D;
+      for(int d=0;d<D;++d){ a+=(double)qt[d]*(double)kp[d]; } sc[(size_t)s*Hkv+kh]=a*scale;}
+    double maxv=-1e30; for(double z:sc) if(z>maxv)maxv=z;
+    double dn=0.0; for(double z:sc) dn+=std::exp(z-maxv);
+    for (int s=0;s<=t;++s) for(int kh=0;kh<Hkv;++kh){
+      double e=std::exp(sc[(size_t)s*Hkv+kh]-maxv)/dn;
+      const float* vp=kv.data()+base+(size_t)(s*2*Hkv+kh)*D;
+      for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*(double)vp[d]); }
   }
   for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
 }
