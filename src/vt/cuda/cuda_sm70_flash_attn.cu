@@ -159,90 +159,107 @@ extern "C" void vt_sm70_fa2_ref_decode(
 // diff in this nvcc TU's host code. Returns 0 on parity within tolerance, 1 on
 // materialized mismatch, -1 on launch/alloc error. Deterministic inputs.
 extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
-  const int64_t num_reqs = 3, hq = 1, num_kv = 1, d = 64, bn = 16;
-  const int64_t maxblocks = 3;  // >= ceil(seq/bn) for every request
-  const int64_t pages = num_reqs * maxblocks;
-  const int64_t kc_hd = d, kc_pg = num_kv * d, kc_blk = bn * num_kv * d;
-  const int64_t vc_hd = d, vc_pg = num_kv * d, vc_blk = bn * num_kv * d;
-  const float scale = 0.125f;  // ~ 1/sqrt(64)
+  // Two configs: a single query head (hq=1, kv=1, g=0 only) and a GQA config
+  // (hq=8, num_kv=2 -> the group index g = h/(hq/num_kv) takes 0 and 1, so the
+  // per-group k/v offsets g*kc/vc_hd get exercised on-device against the
+  // oracle). Device-synced before the host diff so a kernel-mode fault reports
+  // as a run error, not a stale-buffer comparison.
+  struct Cfg { int64_t nr, hq, nkv; int64_t seqs[8]; };
+  const Cfg cfgs[2] = {
+      {3, 1, 1, {20, 17, 33, 0, 0, 0, 0, 0}},
+      {2, 8, 2, {9, 25, 0, 0, 0, 0, 0, 0}},
+  };
+  double worst = 0.0;
+  for (int ci = 0; ci < 2; ++ci) {
+    const Cfg& c = cfgs[ci];
+    const int64_t d = 64, bn = 16;
+    int64_t maxblocks = 1;
+    for (int64_t r = 0; r < c.nr; ++r) {
+      const int64_t nb = (c.seqs[r] + bn - 1) / bn;
+      if (nb > maxblocks) maxblocks = nb;
+    }
+    const int64_t pages = c.nr * maxblocks;
+    const int64_t kc_hd = d, kc_pg = c.nkv * d, kc_blk = bn * c.nkv * d;
+    const int64_t vc_hd = d, vc_pg = c.nkv * d, vc_blk = bn * c.nkv * d;
+    const float scale = 0.125f;  // ~ 1/sqrt(64)
 
-  // ---- fill host buffers deterministically ----
-  const size_t kv_elems = (size_t)pages * kc_blk;
-  std::vector<unsigned short> hk16(kv_elems), hv16(kv_elems);
-  std::vector<unsigned short> hq16((size_t)num_reqs * hq * d);
-  for (size_t i = 0; i < kv_elems; ++i) {
-    hk16[i] = (unsigned short)(((i * 13 + 7) % 19) + 1);           // 1..19 bits
-    hv16[i] = (unsigned short)(((i * 7 + 3) % 13) + 2);
-  }
-  for (size_t i = 0; i < hq * (size_t)num_reqs * d; ++i)
-    hq16[i] = (unsigned short)(((i * 3 + 1) % 11) + 1);
+    const size_t kv_elems = (size_t)pages * kc_blk;
+    std::vector<unsigned short> hk16(kv_elems), hv16(kv_elems);
+    std::vector<unsigned short> hq16((size_t)c.nr * c.hq * d);
+    for (size_t i = 0; i < kv_elems; ++i) {
+      hk16[i] = (unsigned short)(((i * 13 + 7) % 19) + 1);
+      hv16[i] = (unsigned short)(((i * 7 + 3) % 13) + 2);
+    }
+    for (size_t i = 0; i < hq16.size(); ++i)
+      hq16[i] = (unsigned short)(((i * 3 + 1) % 11) + 1);
 
-  // device alloc
-  __half *q_d, *k_d, *v_d;
-  int32_t *bt_d, *sl_d;
-  float *mine, *ref;
-  cudaError_t err = cudaSuccess;
-  err = cudaMalloc((void**)&q_d, (size_t)num_reqs * hq * d * sizeof(__half));
-  err = (err ?: cudaMalloc((void**)&k_d, kv_elems * sizeof(__half)));
-  err = (err ?: cudaMalloc((void**)&v_d, kv_elems * sizeof(__half)));
-  err = (err ?: cudaMalloc((void**)&bt_d, (size_t)num_reqs * maxblocks * sizeof(int32_t)));
-  err = (err ?: cudaMalloc((void**)&sl_d, (size_t)num_reqs * sizeof(int32_t)));
-  err = (err ?: cudaMalloc((void**)&mine, (size_t)num_reqs * hq * d * sizeof(float)));
-  err = (err ?: cudaMalloc((void**)&ref, (size_t)num_reqs * hq * d * sizeof(float)));
-  if (err != cudaSuccess) {
-    fprintf(stderr, "sm70 fa2 self-check: alloc: %s\n", cudaGetErrorString(err));
+    __half *q_d = nullptr, *k_d = nullptr, *v_d = nullptr;
+    int32_t *bt_d = nullptr, *sl_d = nullptr;
+    float *mine = nullptr, *ref = nullptr;
+    cudaError_t err = cudaSuccess;
+    err = cudaMalloc((void**)&q_d, (size_t)c.nr * c.hq * d * sizeof(__half));
+    err = (err ?: cudaMalloc((void**)&k_d, kv_elems * sizeof(__half)));
+    err = (err ?: cudaMalloc((void**)&v_d, kv_elems * sizeof(__half)));
+    err = (err ?: cudaMalloc((void**)&bt_d, (size_t)c.nr * maxblocks * sizeof(int32_t)));
+    err = (err ?: cudaMalloc((void**)&sl_d, (size_t)c.nr * sizeof(int32_t)));
+    err = (err ?: cudaMalloc((void**)&mine, (size_t)c.nr * c.hq * d * sizeof(float)));
+    err = (err ?: cudaMalloc((void**)&ref, (size_t)c.nr * c.hq * d * sizeof(float)));
+    if (err != cudaSuccess) {
+      fprintf(stderr, "sm70 fa2 self-check cfg%d: alloc: %s\n", ci, cudaGetErrorString(err));
+      cudaFree((void*)q_d); cudaFree((void*)k_d); cudaFree((void*)v_d);
+      cudaFree((void*)bt_d); cudaFree((void*)sl_d); cudaFree((void*)mine); cudaFree((void*)ref);
+      return -1;
+    }
+    cudaMemcpy(q_d, hq16.data(), (size_t)c.nr * c.hq * d * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(k_d, hk16.data(), kv_elems * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(v_d, hv16.data(), kv_elems * sizeof(__half), cudaMemcpyHostToDevice);
+
+    std::vector<int32_t> hbt((size_t)c.nr * maxblocks);
+    for (int64_t r = 0; r < c.nr; ++r)
+      for (int64_t b = 0; b < maxblocks; ++b)
+        hbt[(size_t)r * maxblocks + b] = (int32_t)(r * maxblocks + b);
+    std::vector<int32_t> hsl(c.seqs, c.seqs + c.nr);
+    cudaMemcpy(bt_d, hbt.data(), (size_t)c.nr * maxblocks * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(sl_d, hsl.data(), (size_t)c.nr * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    const int32_t bt_col = 1;
+    cudaStream_t st = 0;
+    vt_sm70_fa2_decode(mine, q_d, k_d, v_d, bt_d, sl_d, c.nr, c.hq, c.nkv, d, bn,
+                       maxblocks, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd,
+                       scale, st);
+    vt_sm70_fa2_ref_decode(ref, q_d, k_d, v_d, bt_d, sl_d, c.nr, c.hq, c.nkv, d, bn,
+                           maxblocks, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg,
+                           vc_hd, scale, st);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "sm70 fa2 self-check cfg%d: launch/sync: %s\n", ci, cudaGetErrorString(err));
+      cudaFree((void*)q_d); cudaFree((void*)k_d); cudaFree((void*)v_d);
+      cudaFree((void*)bt_d); cudaFree((void*)sl_d); cudaFree((void*)mine); cudaFree((void*)ref);
+      return -1;
+    }
+
+    std::vector<float> hmine((size_t)c.nr * c.hq * d), href((size_t)c.nr * c.hq * d);
+    cudaMemcpy(hmine.data(), mine, (size_t)c.nr * c.hq * d * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(href.data(), ref, (size_t)c.nr * c.hq * d * sizeof(float), cudaMemcpyDeviceToHost);
+
+    double max_reldev = 0.0;
+    for (size_t i = 0; i < hmine.size(); ++i) {
+      const double denom = href[i] > 1.0 ? href[i] : 1.0;
+      const double rel = std::fabs((double)hmine[i] - href[i]) / denom;
+      if (rel > max_reldev) max_reldev = rel;
+    }
+    if (worst < max_reldev) worst = max_reldev;
+    if (verbose)
+      fprintf(stdout, "  cfg%d (reqs=%lld hq=%lld kv=%lld): max reldev %.3e\n",
+              ci, (long long)c.nr, (long long)c.hq, (long long)c.nkv, max_reldev);
+
     cudaFree((void*)q_d); cudaFree((void*)k_d); cudaFree((void*)v_d);
     cudaFree((void*)bt_d); cudaFree((void*)sl_d); cudaFree((void*)mine); cudaFree((void*)ref);
-    return -1;
   }
-  cudaMemcpy(q_d, hq16.data(), (size_t)num_reqs * hq * d * sizeof(__half),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(k_d, hk16.data(), kv_elems * sizeof(__half), cudaMemcpyHostToDevice);
-  cudaMemcpy(v_d, hv16.data(), kv_elems * sizeof(__half), cudaMemcpyHostToDevice);
-
-  // block table: token r -> page id r*maxblocks + block
-  std::vector<int32_t> hbt((size_t)num_reqs * maxblocks);
-  for (int64_t r = 0; r < num_reqs; ++r)
-    for (int64_t b = 0; b < maxblocks; ++b) hbt[(size_t)r * maxblocks + b] = (int32_t)(r * maxblocks + b);
-  std::vector<int32_t> hsl{20, 17, 33};
-  cudaMemcpy(bt_d, hbt.data(), (size_t)num_reqs * maxblocks * sizeof(int32_t), cudaMemcpyHostToDevice);
-  cudaMemcpy(sl_d, hsl.data(), (size_t)num_reqs * sizeof(int32_t), cudaMemcpyHostToDevice);
-
-  const int32_t bt_col = 1;
-  cudaStream_t st = 0;
-  vt_sm70_fa2_decode(mine, q_d, k_d, v_d, bt_d, sl_d, num_reqs, hq, num_kv, d, bn,
-                     maxblocks, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd,
-                     scale, st);
-  vt_sm70_fa2_ref_decode(ref, q_d, k_d, v_d, bt_d, sl_d, num_reqs, hq, num_kv, d, bn,
-                          maxblocks, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd,
-                          scale, st);
-  err = cudaGetLastError();
-
-  std::vector<float> hmine((size_t)num_reqs * hq * d), href((size_t)num_reqs * hq * d);
-  if (err == cudaSuccess) {
-    cudaMemcpy(hmine.data(), mine, (size_t)num_reqs * hq * d * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(href.data(), ref, (size_t)num_reqs * hq * d * sizeof(float), cudaMemcpyDeviceToHost);
-    err = cudaGetLastError();
-  }
-  if (err != cudaSuccess) {
-    fprintf(stderr, "sm70 fa2 self-check: run: %s\n", cudaGetErrorString(err));
-    cudaFree((void*)q_d); cudaFree((void*)k_d); cudaFree((void*)v_d);
-    cudaFree((void*)bt_d); cudaFree((void*)sl_d); cudaFree((void*)mine); cudaFree((void*)ref);
-    return -1;
-  }
-
-  double max_reldev = 0.0;
-  for (size_t i = 0; i < hmine.size(); ++i) {
-    const double denom = href[i] > 1.0 ? href[i] : 1.0;
-    const double rel = std::fabs((double)hmine[i] - href[i]) / denom;
-    if (rel > max_reldev) max_reldev = rel;
-  }
-  cudaFree((void*)q_d); cudaFree((void*)k_d); cudaFree((void*)v_d);
-  cudaFree((void*)bt_d); cudaFree((void*)sl_d); cudaFree((void*)mine); cudaFree((void*)ref);
-
-  if (verbose) fprintf(stdout, "sm70 fa2 self-check: max rel dev vs reference = %.3e (tol %.2e)\n",
-                       max_reldev, (double)tol_rel);
-  return (max_reldev <= (double)tol_rel) ? 0 : 1;
+  if (verbose)
+    fprintf(stdout, "sm70 fa2 self-check: worst max rel dev = %.3e (tol %.2e)\n",
+            worst, (double)tol_rel);
+  return (worst <= (double)tol_rel) ? 0 : 1;
 }
 
 } // namespace vt::cuda
